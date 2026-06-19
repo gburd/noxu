@@ -353,6 +353,35 @@ pub struct BinEntry {
 }
 
 impl BinStub {
+    /// TREE-F1: the single user-facing liveness predicate for a BIN slot.
+    ///
+    /// A slot is LIVE for reads/scans iff it is neither `known_deleted` nor
+    /// TTL-expired.  This mirrors the two ways JE makes a slot read as ABSENT:
+    ///   * `IN.findEntry` (IN.java:3197) returns -1 for a `known_deleted`
+    ///     exact match;
+    ///   * `CursorImpl.isProbablyExpired` / `lockAndGetCurrent`
+    ///     (CursorImpl.java:2062-2064) skip `isEntryKnownDeleted` (and
+    ///     expired) slots while stepping.
+    ///
+    /// KD slots legitimately exist in live BINs during BIN-delta
+    /// reconstitution until the compressor reclaims them; the maintenance
+    /// paths (compressor / recovery undo) iterate them on purpose and do NOT
+    /// use this predicate.
+    #[inline]
+    pub fn slot_is_live(&self, idx: usize) -> bool {
+        match self.entries.get(idx) {
+            Some(e) => {
+                !(e.known_deleted
+                    || (e.expiration_time != 0
+                        && noxu_util::ttl::is_expired(
+                            e.expiration_time,
+                            self.expiration_in_hours,
+                        )))
+            }
+            None => false,
+        }
+    }
+
     // ========================================================================
     // Key prefix compression helpers
     // IN.computeKeyPrefix / IN.recalcSuffixes / IN.getKey
@@ -1854,18 +1883,17 @@ impl Tree {
                 // CursorImpl.isProbablyExpired(): if an exact match
                 // was found, check whether the entry's TTL has already elapsed.
                 // If it has, treat the slot as not found so callers skip it.
+                //
+                // TREE-F1: also treat a known_deleted slot as ABSENT on an
+                // exact lookup, mirroring the tail of IN.findEntry
+                // (IN.java:3197): `if (ret >= 0 && exact &&
+                // isEntryKnownDeleted(ret & 0xffff)) return -1;`.  KD slots
+                // legitimately exist in live BINs during BIN-delta
+                // reconstitution until the compressor reclaims them.
                 let found = if found {
                     if let TreeNode::Bottom(bin) = &*guard {
                         let idx = (raw_idx & 0x7FFF) as usize;
-                        if let Some(entry) = bin.entries.get(idx) {
-                            !(entry.expiration_time != 0
-                                && noxu_util::ttl::is_expired(
-                                    entry.expiration_time,
-                                    bin.expiration_in_hours,
-                                ))
-                        } else {
-                            found
-                        }
+                        bin.slot_is_live(idx)
                     } else {
                         found
                     }
@@ -1942,19 +1970,12 @@ impl Tree {
                             None => bin.find_entry_compressed(key),
                         };
                         if exact {
-                            // Honour TTL: expired entries are treated as absent.
-                            let live = bin
-                                .entries
-                                .get(idx)
-                                .map(|e| {
-                                    !(e.expiration_time != 0
-                                        && noxu_util::ttl::is_expired(
-                                            e.expiration_time,
-                                            bin.expiration_in_hours,
-                                        ))
-                                })
-                                .unwrap_or(false);
-                            if live {
+                            // TREE-F1: a slot is reported as found only when
+                            // live (not known_deleted, not TTL-expired) — the
+                            // same predicate used by Tree::search and the
+                            // cursor scan.  Mirrors IN.findEntry (IN.java:3197)
+                            // and CursorImpl.isProbablyExpired.
+                            if bin.slot_is_live(idx) {
                                 let e = &bin.entries[idx];
                                 (true, e.data.clone(), e.lsn.as_u64(), idx)
                             } else {
@@ -2117,10 +2138,17 @@ impl Tree {
             if guard.is_bin() {
                 let result = match &*guard {
                     TreeNode::Bottom(bin) => {
-                        let (idx, _exact) = match &self.key_comparator {
+                        let (mut idx, _exact) = match &self.key_comparator {
                             Some(cmp) => bin.find_entry_cmp(key, cmp.as_ref()),
                             None => bin.find_entry_compressed(key),
                         };
+                        // TREE-F1: skip non-live slots (known_deleted /
+                        // TTL-expired) at/after the floor index, mirroring the
+                        // cursor getNext skip (CursorImpl.java:2062-2064).
+                        while idx < bin.entries.len() && !bin.slot_is_live(idx)
+                        {
+                            idx += 1;
+                        }
                         if idx < bin.entries.len() {
                             let full_key =
                                 bin.get_full_key(idx).unwrap_or_default();
@@ -2203,6 +2231,13 @@ impl Tree {
                         Some(cmp) => bin.find_entry_cmp(key, cmp.as_ref()),
                         None => bin.find_entry_compressed(key),
                     };
+                    // TREE-F1: skip non-live slots (known_deleted /
+                    // TTL-expired) at/after the floor index
+                    // (CursorImpl.java:2062-2064).
+                    let mut idx = idx;
+                    while idx < bin.entries.len() && !bin.slot_is_live(idx) {
+                        idx += 1;
+                    }
                     if idx < bin.entries.len() {
                         let full_key =
                             bin.get_full_key(idx).unwrap_or_default();
@@ -3353,6 +3388,20 @@ impl Tree {
                 if n == 0 {
                     return None;
                 }
+                // TREE-F1: return the first LIVE slot, skipping known_deleted
+                // slots (CursorImpl.java:2062-2064).  If the leftmost BIN is
+                // entirely KD during the reconstitution window the cursor's
+                // get_first falls through to its cross-BIN advance.
+                if let TreeNode::Bottom(b) = &*guard {
+                    match (0..b.entries.len()).find(|&i| b.slot_is_live(i)) {
+                        Some(i) => {
+                            return Some(SearchResult::with_values(
+                                true, i as i32, false,
+                            ));
+                        }
+                        None => return None,
+                    }
+                }
                 return Some(SearchResult::with_values(true, 0, false));
             }
 
@@ -3386,6 +3435,21 @@ impl Tree {
                 let n = guard.get_n_entries();
                 if n == 0 {
                     return None;
+                }
+                // TREE-F1: return the last LIVE slot, skipping known_deleted
+                // slots (CursorImpl.java:2062-2064).
+                if let TreeNode::Bottom(b) = &*guard {
+                    match (0..b.entries.len())
+                        .rev()
+                        .find(|&i| b.slot_is_live(i))
+                    {
+                        Some(i) => {
+                            return Some(SearchResult::with_values(
+                                true, i as i32, false,
+                            ));
+                        }
+                        None => return None,
+                    }
                 }
                 return Some(SearchResult::with_values(
                     true,
@@ -4681,6 +4745,13 @@ impl Tree {
                     TreeNode::Bottom(b) => {
                         // Return entries with full (decompressed) keys so that
                         // callers always work with complete keys.
+                        //
+                        // TREE-F1: KD slots are NOT filtered here — the BIN's
+                        // slot indices are returned verbatim so the cursor can
+                        // skip KD slots itself (CursorImpl getNext loop;
+                        // CursorImpl.java:2062-2064) and continue to the next
+                        // BIN when an edge BIN is entirely KD during the
+                        // BIN-delta reconstitution window.
                         let full_entries: Vec<BinEntry> = (0..b.entries.len())
                             .map(|i| BinEntry {
                                 key: b.get_full_key(i).unwrap_or_default(),
@@ -10613,6 +10684,39 @@ mod key_prefixing_tests {
 mod split_special_tests {
     use super::*;
 
+    /// Test helper: descend the tree to the BIN that holds (or would hold)
+    /// `key`, returning its arc.  Mirrors the read-path descent used by
+    /// `Tree::search`; sufficient for unit tests that need to mutate a slot.
+    fn find_bin_arc_for_key(
+        node_arc: &Arc<RwLock<TreeNode>>,
+        key: &[u8],
+    ) -> Option<Arc<RwLock<TreeNode>>> {
+        let mut current = node_arc.clone();
+        loop {
+            let next = {
+                let g = current.read();
+                match &*g {
+                    TreeNode::Bottom(_) => return Some(current.clone()),
+                    TreeNode::Internal(n) => {
+                        if n.entries.is_empty() {
+                            return None;
+                        }
+                        let mut idx = 0usize;
+                        for (i, e) in n.entries.iter().enumerate() {
+                            if i == 0 || e.key.as_slice() <= key {
+                                idx = i;
+                            } else {
+                                break;
+                            }
+                        }
+                        n.entries.get(idx)?.child.clone()?
+                    }
+                }
+            };
+            current = next;
+        }
+    }
+
     /// Count total leaf (BIN) nodes in the tree by DFS.
     fn count_bins(node: &Arc<RwLock<TreeNode>>) -> usize {
         let g = node.read();
@@ -10798,5 +10902,120 @@ mod split_special_tests {
                 "random key {k} must be findable after insert"
             );
         }
+    }
+
+    /// TREE-F1: a `known_deleted` BIN slot must read as ABSENT on an exact
+    /// lookup and must be SKIPPED by scans, matching JE.
+    ///
+    /// JE contract:
+    /// * `IN.findEntry` (IN.java:3197): an exact match that lands on a
+    ///   known-deleted slot returns -1 (ABSENT).
+    /// * `CursorImpl.lockAndGetCurrent` (CursorImpl.java:2062-2064): a
+    ///   step that lands on `isEntryKnownDeleted(index)` returns null, so
+    ///   the `getNext` loop advances past it (the slot is skipped).
+    ///
+    /// KD slots legitimately exist in live BINs during BIN-delta
+    /// reconstitution (`mutate_to_full_bin` applies delta KD slots) until
+    /// the compressor reclaims them.  We reach that state directly here by
+    /// marking a slot known_deleted in the BIN arc, then assert the
+    /// user-facing read/scan paths do not surface it.
+    #[test]
+    fn test_tree_f1_known_deleted_slot_is_absent_and_skipped() {
+        let tree = Tree::new(1, 8);
+        // Insert enough keys to populate a BIN with several live slots.
+        for i in 0..6u32 {
+            let key = format!("kd{i:04}").into_bytes();
+            tree.insert(key, vec![i as u8], Lsn::new(1, i)).unwrap();
+        }
+
+        // Pick a middle key and mark its slot known_deleted directly in the
+        // BIN, modelling a delta-applied tombstone the compressor has not yet
+        // reclaimed.
+        let kd_key = b"kd0003".to_vec();
+        {
+            let root = tree.get_root().expect("root");
+            let bin_arc = find_bin_arc_for_key(&root, &kd_key).expect("bin");
+            let mut g = bin_arc.write();
+            if let TreeNode::Bottom(b) = &mut *g {
+                let idx = (0..b.entries.len())
+                    .find(|&i| {
+                        b.get_full_key(i).as_deref() == Some(kd_key.as_slice())
+                    })
+                    .expect("kd key slot");
+                b.entries[idx].known_deleted = true;
+            } else {
+                panic!("expected BIN");
+            }
+        }
+
+        // (a) exact lookup via Tree::search must report NOT found.
+        let sr = tree.search(&kd_key);
+        assert!(
+            !sr.map(|r| r.is_exact_match()).unwrap_or(false),
+            "TREE-F1: Tree::search must report a known_deleted slot as absent \
+             (IN.findEntry IN.java:3197)"
+        );
+
+        // (a) exact lookup via Tree::search_with_data must report NOT found.
+        let sf = tree.search_with_data(&kd_key).expect("slot fetch");
+        assert!(
+            !sf.found,
+            "TREE-F1: Tree::search_with_data must report a known_deleted slot \
+             as absent (IN.findEntry IN.java:3197)"
+        );
+
+        // Live neighbours must still be found.
+        for live in [b"kd0002".to_vec(), b"kd0004".to_vec()] {
+            assert!(
+                tree.search(&live).map(|r| r.is_exact_match()).unwrap_or(false),
+                "live neighbour must remain findable"
+            );
+        }
+
+        // (b) a scan-facing BIN dump (descend_to_edge_bin / get_next_bin /
+        // get_prev_bin) returns slots verbatim WITH the known_deleted flag
+        // set, so the cursor can skip them (CursorImpl.java:2062-2064).  The
+        // contract here is: the KD slot is never reported as a LIVE entry.
+        let root = tree.get_root().expect("root");
+        let edge = Tree::descend_to_edge_bin(&root, true).expect("edge bin");
+        assert!(
+            !edge.iter().any(|e| e.key == kd_key && !e.known_deleted),
+            "TREE-F1: scan must not surface a known_deleted slot as live \
+             (CursorImpl.java:2062-2064)"
+        );
+        for anchor in [b"kd0000".to_vec(), b"kd0005".to_vec()] {
+            for entries in
+                [tree.get_next_bin(&anchor), tree.get_prev_bin(&anchor)]
+                    .into_iter()
+                    .flatten()
+            {
+                assert!(
+                    !entries
+                        .iter()
+                        .any(|e| e.key == kd_key && !e.known_deleted),
+                    "TREE-F1: get_next_bin/get_prev_bin must not surface a \
+                     known_deleted slot as live"
+                );
+            }
+        }
+
+        // first_entry_at_or_after must skip a KD slot at the boundary.
+        if let Some((k, _, _)) = tree.first_entry_at_or_after(&kd_key) {
+            assert_ne!(
+                k, kd_key,
+                "TREE-F1: first_entry_at_or_after must skip a known_deleted \
+                 slot (CursorImpl.java:2062-2064)"
+            );
+        }
+
+        // The compressor KD-iteration path must STILL see the slot — the fix
+        // only changes the user-facing read predicate, not the maintenance
+        // iteration that exists to reclaim KD slots.
+        let kd_bins = tree.collect_bins_with_known_deleted();
+        assert!(
+            !kd_bins.is_empty(),
+            "TREE-F1: collect_bins_with_known_deleted must still observe the \
+             KD slot so the compressor can reclaim it"
+        );
     }
 }

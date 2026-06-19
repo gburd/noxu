@@ -1611,26 +1611,47 @@ impl CursorImpl {
                     use noxu_tree::tree::TreeNode;
                     tree.get_root().and_then(|r| {
                         let bin_arc = Self::descend_to_bin(r)?;
-                        let (key, data, lsn) = {
+                        let (key, data, idx, lsn) = {
                             let g = bin_arc.read();
                             match &*g {
                                 TreeNode::Bottom(bin) => {
                                     if bin.entries.is_empty() {
                                         return None;
                                     }
+                                    // TREE-F1: first LIVE slot, skipping
+                                    // known_deleted slots
+                                    // (CursorImpl.java:2062-2064).
+                                    let i = (0..bin.entries.len())
+                                        .find(|&i| bin.slot_is_live(i));
+                                    let Some(i) = i else {
+                                        // Edge BIN is entirely KD: anchor on
+                                        // its last key so retrieve_next can
+                                        // cross to the next live BIN.
+                                        let anchor = bin
+                                            .get_full_key(bin.entries.len() - 1)
+                                            .unwrap_or_default();
+                                        return Some((
+                                            anchor,
+                                            Vec::new(),
+                                            -1i32,
+                                            0u64,
+                                            bin_arc.clone(),
+                                        ));
+                                    };
                                     (
-                                        bin.get_full_key(0).unwrap_or_default(),
-                                        bin.entries[0]
+                                        bin.get_full_key(i).unwrap_or_default(),
+                                        bin.entries[i]
                                             .data
                                             .clone()
                                             .unwrap_or_default(),
-                                        bin.entries[0].lsn.as_u64(),
+                                        i as i32,
+                                        bin.entries[i].lsn.as_u64(),
                                     )
                                 }
                                 _ => return None,
                             }
                         };
-                        Some((key, data, 0i32, lsn, bin_arc))
+                        Some((key, data, idx, lsn, bin_arc))
                     })
                 }
             } else {
@@ -1640,6 +1661,17 @@ impl CursorImpl {
 
         match result {
             Some((key, data, idx, lsn, bin_arc)) => {
+                if idx < 0 {
+                    // TREE-F1: edge BIN was entirely known_deleted.  Anchor on
+                    // its edge key (PendingDeleted-style) and delegate to
+                    // retrieve_next, which crosses BINs skipping KD slots,
+                    // mirroring CursorImpl.getFirst falling into getNext.
+                    self.current_key = Some(key);
+                    self.current_index = 0;
+                    self.state = CursorState::PendingDeleted;
+                    self.update_bin_pin(Some(bin_arc));
+                    return self.retrieve_next(GetMode::Next);
+                }
                 self.lock_ln(lsn)?;
                 self.current_key = Some(key);
                 self.current_data = Some(data);
@@ -1688,7 +1720,7 @@ impl CursorImpl {
                     use noxu_tree::tree::TreeNode;
                     tree.get_root().and_then(|r| {
                         let bin_arc = Self::descend_to_last_bin(r)?;
-                        let (key, data, last_idx, lsn) = {
+                        let (key, data, idx, lsn) = {
                             let g = bin_arc.read();
                             match &*g {
                                 TreeNode::Bottom(bin) => {
@@ -1696,22 +1728,41 @@ impl CursorImpl {
                                     if n == 0 {
                                         return None;
                                     }
-                                    let last_idx = n - 1;
+                                    // TREE-F1: last LIVE slot, skipping
+                                    // known_deleted slots
+                                    // (CursorImpl.java:2062-2064).
+                                    let i = (0..n)
+                                        .rev()
+                                        .find(|&i| bin.slot_is_live(i));
+                                    let Some(i) = i else {
+                                        // Edge BIN entirely KD: anchor on its
+                                        // first key so retrieve_next can cross
+                                        // backward to the previous live BIN.
+                                        let anchor = bin
+                                            .get_full_key(0)
+                                            .unwrap_or_default();
+                                        return Some((
+                                            anchor,
+                                            Vec::new(),
+                                            -1i32,
+                                            0u64,
+                                            bin_arc.clone(),
+                                        ));
+                                    };
                                     (
-                                        bin.get_full_key(last_idx)
-                                            .unwrap_or_default(),
-                                        bin.entries[last_idx]
+                                        bin.get_full_key(i).unwrap_or_default(),
+                                        bin.entries[i]
                                             .data
                                             .clone()
                                             .unwrap_or_default(),
-                                        last_idx as i32,
-                                        bin.entries[last_idx].lsn.as_u64(),
+                                        i as i32,
+                                        bin.entries[i].lsn.as_u64(),
                                     )
                                 }
                                 _ => return None,
                             }
                         };
-                        Some((key, data, last_idx, lsn, bin_arc))
+                        Some((key, data, idx, lsn, bin_arc))
                     })
                 }
             } else {
@@ -1721,6 +1772,16 @@ impl CursorImpl {
 
         match result {
             Some((key, data, idx, lsn, bin_arc)) => {
+                if idx < 0 {
+                    // TREE-F1: rightmost BIN entirely known_deleted.  Anchor
+                    // and delegate to retrieve_next (Prev), which crosses
+                    // BINs skipping KD slots.
+                    self.current_key = Some(key);
+                    self.current_index = 0;
+                    self.state = CursorState::PendingDeleted;
+                    self.update_bin_pin(Some(bin_arc));
+                    return self.retrieve_next(GetMode::Prev);
+                }
                 self.lock_ln(lsn)?;
                 self.current_key = Some(key);
                 self.current_data = Some(data);
@@ -2010,17 +2071,27 @@ impl CursorImpl {
                     };
                     let g = arc_clone.read();
                     if let TreeNode::Bottom(bin) = &*g {
-                        if retry_next >= 0
-                            && retry_next < bin.entries.len() as i32
-                        {
-                            let idx = retry_next as usize;
+                        // TREE-F1: skip known_deleted (and TTL-expired) slots
+                        // (CursorImpl.java:2062-2064) using the shared live
+                        // predicate.
+                        let mut scan = retry_next;
+                        while scan >= 0 && scan < bin.entries.len() as i32 {
+                            let idx = scan as usize;
+                            if !bin.slot_is_live(idx) {
+                                scan += if forward { 1 } else { -1 };
+                                continue;
+                            }
+                            break;
+                        }
+                        if scan >= 0 && scan < bin.entries.len() as i32 {
+                            let idx = scan as usize;
                             entry = Some((
                                 bin.get_full_key(idx).unwrap_or_default(),
                                 bin.entries[idx]
                                     .data
                                     .clone()
                                     .unwrap_or_default(),
-                                retry_next,
+                                scan,
                                 bin.entries[idx].lsn.as_u64(),
                             ));
                         } else {
@@ -2039,17 +2110,30 @@ impl CursorImpl {
                 {
                     let g = bin_arc.read();
                     if let TreeNode::Bottom(bin) = &*g {
-                        if next_index >= 0
-                            && next_index < bin.entries.len() as i32
-                        {
-                            let idx = next_index as usize;
+                        // TREE-F1: skip known_deleted slots while advancing,
+                        // mirroring CursorImpl.getNext /
+                        // CursorImpl.lockAndGetCurrent
+                        // (CursorImpl.java:2062-2064): a step landing on a
+                        // non-live slot (known_deleted or TTL-expired) is
+                        // skipped, using the shared live predicate.
+                        let mut scan = next_index;
+                        while scan >= 0 && scan < bin.entries.len() as i32 {
+                            let idx = scan as usize;
+                            if !bin.slot_is_live(idx) {
+                                scan += if forward { 1 } else { -1 };
+                                continue;
+                            }
+                            break;
+                        }
+                        if scan >= 0 && scan < bin.entries.len() as i32 {
+                            let idx = scan as usize;
                             entry = Some((
                                 bin.get_full_key(idx).unwrap_or_default(),
                                 bin.entries[idx]
                                     .data
                                     .clone()
                                     .unwrap_or_default(),
-                                next_index,
+                                scan,
                                 bin.entries[idx].lsn.as_u64(),
                             ));
                         } else {
@@ -2083,10 +2167,22 @@ impl CursorImpl {
                         {
                             let g = bin_arc.read();
                             if let TreeNode::Bottom(bin) = &*g {
-                                if next_index >= 0
-                                    && next_index < bin.entries.len() as i32
+                                // TREE-F1: skip known_deleted slots
+                                // (CursorImpl.java:2062-2064).
+                                let mut scan = next_index;
+                                while scan >= 0
+                                    && scan < bin.entries.len() as i32
                                 {
-                                    let idx = next_index as usize;
+                                    let idx = scan as usize;
+                                    if !bin.slot_is_live(idx) {
+                                        scan += if forward { 1 } else { -1 };
+                                        continue;
+                                    }
+                                    break;
+                                }
+                                if scan >= 0 && scan < bin.entries.len() as i32
+                                {
+                                    let idx = scan as usize;
                                     entry = Some((
                                         bin.get_full_key(idx)
                                             .unwrap_or_default(),
@@ -2094,7 +2190,7 @@ impl CursorImpl {
                                             .data
                                             .clone()
                                             .unwrap_or_default(),
-                                        next_index,
+                                        scan,
                                         bin.entries[idx].lsn.as_u64(),
                                     ));
                                     new_bin_arc = Some(arc_to_save);
@@ -2150,86 +2246,119 @@ impl CursorImpl {
         }
 
         // Current BIN exhausted — cross to adjacent BIN.
-        let anchor_key: Vec<u8> = match &self.current_key {
+        let mut anchor_key: Vec<u8> = match &self.current_key {
             Some(k) => k.clone(),
             None => return Ok(OperationStatus::NotFound),
         };
 
-        let adjacent_entries: Option<Vec<BinEntry>> = {
-            let db = self.db_impl.read();
-            if let Some(tree) = db.get_real_tree() {
-                if forward {
-                    tree.get_next_bin(&anchor_key)
+        // TREE-F1: a crossed-into BIN may contain known_deleted slots (and,
+        // during the BIN-delta reconstitution window, may be entirely KD).
+        // Mirror the CursorImpl.getNext loop (CursorImpl.java:2546 +
+        // lockAndGetCurrent:2062-2064): pick the first/last LIVE slot,
+        // skipping KD slots, and keep crossing BINs until a live slot is
+        // found or the key space is exhausted.
+        const MAX_BIN_CROSSINGS: usize = 1 << 20;
+        for _ in 0..MAX_BIN_CROSSINGS {
+            let adjacent_entries: Option<Vec<BinEntry>> = {
+                let db = self.db_impl.read();
+                if let Some(tree) = db.get_real_tree() {
+                    if forward {
+                        tree.get_next_bin(&anchor_key)
+                    } else {
+                        tree.get_prev_bin(&anchor_key)
+                    }
                 } else {
-                    tree.get_prev_bin(&anchor_key)
+                    None
                 }
-            } else {
-                None
-            }
-        };
+            };
 
-        match adjacent_entries {
-            Some(entries) if !entries.is_empty() => {
-                let (raw_key, raw_data, idx, lsn) = if forward {
-                    let e = entries.into_iter().next().unwrap();
-                    (e.key, e.data.unwrap_or_default(), 0i32, e.lsn.as_u64())
+            let entries = match adjacent_entries {
+                Some(e) if !e.is_empty() => e,
+                _ => {
+                    // Reached the end of the key space (no adjacent BIN).
+                    // T-F2: for a SERIALIZABLE forward scan, acquire RangeRead
+                    // on the per-database EOF sentinel so concurrent inserts
+                    // of keys past the current last key are blocked until
+                    // this transaction commits.
+                    if forward {
+                        self.lock_eof_for_scan()?;
+                    }
+                    return Ok(OperationStatus::NotFound);
+                }
+            };
+
+            // Pick the first (forward) / last (backward) LIVE slot; the slot
+            // index equals the position in the returned vec because
+            // descend_to_edge_bin returns slots verbatim.
+            let live_pos = if forward {
+                entries.iter().position(|e| !e.known_deleted)
+            } else {
+                entries.iter().rposition(|e| !e.known_deleted)
+            };
+
+            let Some(pos) = live_pos else {
+                // This BIN is entirely known_deleted — re-anchor on its edge
+                // key and continue crossing to the next BIN.
+                let edge_key = if forward {
+                    entries.last().map(|e| e.key.clone())
                 } else {
-                    let last_idx = (entries.len() - 1) as i32;
-                    let e = entries.into_iter().last().unwrap();
-                    (
-                        e.key,
-                        e.data.unwrap_or_default(),
-                        last_idx,
-                        e.lsn.as_u64(),
-                    )
+                    entries.first().map(|e| e.key.clone())
                 };
-                if is_dup {
-                    let s = self.apply_dup_filter(
-                        raw_key,
-                        raw_data,
-                        idx,
-                        lsn,
-                        mode,
-                        current_primary_key.as_deref(),
-                        forward,
-                    )?;
-                    return Ok(s);
+                match edge_key {
+                    Some(k) => {
+                        anchor_key = k;
+                        continue;
+                    }
+                    None => return Ok(OperationStatus::NotFound),
                 }
-                self.lock_ln(lsn)?;
-                // Crossed into a new BIN — update the cursor pin.
-                let new_key_ref = raw_key.clone();
-                let bin_arc = {
-                    let db = self.db_impl.read();
-                    db.get_real_tree().and_then(|tree| {
-                        tree.get_root().and_then(|r| {
-                            Self::find_bin_for_key(
-                                r,
-                                &new_key_ref,
-                                tree.get_comparator(),
-                            )
-                        })
+            };
+
+            let idx = pos as i32;
+            let e = &entries[pos];
+            let raw_key = e.key.clone();
+            let raw_data = e.data.clone().unwrap_or_default();
+            let lsn = e.lsn.as_u64();
+
+            if is_dup {
+                let s = self.apply_dup_filter(
+                    raw_key,
+                    raw_data,
+                    idx,
+                    lsn,
+                    mode,
+                    current_primary_key.as_deref(),
+                    forward,
+                )?;
+                return Ok(s);
+            }
+            self.lock_ln(lsn)?;
+            // Crossed into a new BIN — update the cursor pin.
+            let new_key_ref = raw_key.clone();
+            let bin_arc = {
+                let db = self.db_impl.read();
+                db.get_real_tree().and_then(|tree| {
+                    tree.get_root().and_then(|r| {
+                        Self::find_bin_for_key(
+                            r,
+                            &new_key_ref,
+                            tree.get_comparator(),
+                        )
                     })
-                };
-                self.current_key = Some(raw_key);
-                self.current_data = Some(raw_data);
-                self.current_lsn = lsn;
-                self.rehydrate_current_data();
-                self.current_index = idx;
-                self.update_bin_pin(bin_arc);
-                Ok(OperationStatus::Success)
-            }
-            _ => {
-                // Reached the end of the key space (no adjacent BIN).
-                // T-F2: for a SERIALIZABLE forward scan, acquire RangeRead
-                // on the per-database EOF sentinel so concurrent inserts of
-                // keys past the current last key are blocked until this
-                // transaction commits.
-                if forward {
-                    self.lock_eof_for_scan()?;
-                }
-                Ok(OperationStatus::NotFound)
-            }
+                })
+            };
+            self.current_key = Some(raw_key);
+            self.current_data = Some(raw_data);
+            self.current_lsn = lsn;
+            self.rehydrate_current_data();
+            self.current_index = idx;
+            self.update_bin_pin(bin_arc);
+            return Ok(OperationStatus::Success);
         }
+        // Crossing budget exhausted (pathological all-KD key space).
+        if forward {
+            self.lock_eof_for_scan()?;
+        }
+        Ok(OperationStatus::NotFound)
     }
 
     /// Applies sorted-dup filtering rules after moving to `(raw_key, raw_data,
@@ -4152,6 +4281,119 @@ mod tests {
             "CC-1 Prev-after-split: backward scan must cross the split \
              boundary with no skip/repeat; got {:?}",
             visited
+        );
+    }
+
+    /// TREE-F1: a known_deleted BIN slot must read as ABSENT on an exact get
+    /// and must be SKIPPED by a cursor scan, matching JE.
+    ///
+    /// JE: IN.findEntry (IN.java:3197) reports a KD exact match as -1;
+    /// CursorImpl.lockAndGetCurrent (CursorImpl.java:2062-2064) returns null
+    /// for a KD slot so the getNext loop skips it.  KD slots legitimately
+    /// appear in live BINs during BIN-delta reconstitution; we reach that
+    /// state by marking a slot known_deleted directly in the tree.
+    #[test]
+    fn test_tree_f1_cursor_skips_known_deleted_slot() {
+        use noxu_tree::tree::TreeNode;
+        let db = create_test_database();
+        // Insert six keys.
+        {
+            let mut c = CursorImpl::new(db.clone(), 1);
+            for i in 0u32..6 {
+                let key = format!("k{i:02}").into_bytes();
+                c.put(&key, b"v", PutMode::Overwrite).unwrap();
+            }
+        }
+
+        let kd_key = b"k02".to_vec();
+
+        // Mark k02's slot known_deleted directly in the tree BIN.
+        {
+            let db_guard = db.read();
+            let tree_arc = db_guard.get_real_tree_arc().expect("tree");
+            let tree = tree_arc.read().unwrap();
+            let mut node = tree.get_root().expect("root");
+            loop {
+                let next = {
+                    let g = node.read();
+                    match &*g {
+                        TreeNode::Bottom(_) => None,
+                        TreeNode::Internal(n) => {
+                            let mut idx = 0usize;
+                            for (i, e) in n.entries.iter().enumerate() {
+                                if i == 0
+                                    || e.key.as_slice() <= kd_key.as_slice()
+                                {
+                                    idx = i;
+                                } else {
+                                    break;
+                                }
+                            }
+                            n.entries[idx].child.clone()
+                        }
+                    }
+                };
+                match next {
+                    Some(c) => node = c,
+                    None => break,
+                }
+            }
+            let mut g = node.write();
+            if let TreeNode::Bottom(b) = &mut *g {
+                let idx = (0..b.entries.len())
+                    .find(|&i| {
+                        b.get_full_key(i).as_deref() == Some(kd_key.as_slice())
+                    })
+                    .expect("k02 slot");
+                b.entries[idx].known_deleted = true;
+            } else {
+                panic!("expected BIN");
+            }
+        }
+
+        // (a) exact get must return NotFound (not stale data).
+        let mut c = CursorImpl::new(db.clone(), 2);
+        let st = c.search(&kd_key, None, SearchMode::Set).unwrap();
+        assert_eq!(
+            st,
+            OperationStatus::NotFound,
+            "TREE-F1: exact get on a known_deleted slot must return NotFound \
+             (IN.findEntry IN.java:3197)"
+        );
+
+        // (b) a full forward scan must NOT yield the known_deleted key.
+        let mut cur = CursorImpl::new(db.clone(), 3);
+        let mut visited: Vec<Vec<u8>> = Vec::new();
+        let mut s = cur.get_first().unwrap();
+        while s == OperationStatus::Success {
+            visited.push(cur.get_current_key().unwrap().to_vec());
+            s = cur.retrieve_next(GetMode::Next).unwrap();
+        }
+        assert!(
+            !visited.contains(&kd_key),
+            "TREE-F1: forward scan must skip the known_deleted slot \
+             (CursorImpl.java:2062-2064); visited={:?}",
+            visited
+        );
+        let expected: Vec<Vec<u8>> = ["k00", "k01", "k03", "k04", "k05"]
+            .iter()
+            .map(|s| s.as_bytes().to_vec())
+            .collect();
+        assert_eq!(visited, expected, "forward scan order with KD skipped");
+
+        // (b) a full backward scan must also skip the KD slot.
+        let mut cur = CursorImpl::new(db, 4);
+        let mut back: Vec<Vec<u8>> = Vec::new();
+        let mut s = cur.get_last().unwrap();
+        while s == OperationStatus::Success {
+            back.push(cur.get_current_key().unwrap().to_vec());
+            s = cur.retrieve_next(GetMode::Prev).unwrap();
+        }
+        assert!(
+            !back.contains(&kd_key),
+            "TREE-F1: backward scan must skip the known_deleted slot; \
+             visited={:?}",
+            back
         );
     }
 }
