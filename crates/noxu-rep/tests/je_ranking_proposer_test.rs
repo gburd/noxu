@@ -127,6 +127,19 @@ fn test_phase2_arb_one_node() {
         promise(NODE_NAME, 200, 1),
     ]);
     assert_eq!(r.unwrap().node_name, NODE_NAME);
+
+    // DEVIATION (DTVLSN ranking deferred): JE testPhase2ArbOneNode ALSO asserts
+    // the two cases where the lone arbiter advertises a STRICTLY HIGHER DTVLSN
+    // than the single real node — JE returns null (no master safely electable,
+    // because the node is too far behind). Those cases require DTVLSN-based
+    // election ranking, which is an authorized deferral (see
+    // known-limitations: "DTVLSN-based election ranking ... not yet ported").
+    // They are intentionally NOT asserted here. This test covers the
+    // arbiter-exclusion invariant (an arb never wins) via the priority-based
+    // ranking that IS implemented; the DTVLSN-null cases will be added when
+    // DTVLSN ranking lands. NOTE: this exercises a test-local helper modelling
+    // the arb-exclusion rule, not production run_election (which enforces the
+    // same exclusion via its F22 guard).
 }
 
 // --------------------------------------------------------------------------

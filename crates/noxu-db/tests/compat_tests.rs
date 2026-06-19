@@ -313,11 +313,15 @@ fn read_uncommitted_sees_dirty_write() {
         .get(&mut key, &mut data, Get::Search, Some(LockMode::ReadUncommitted))
         .unwrap();
     assert_eq!(status, OperationStatus::Success);
-    // ReadUncommitted may see either the dirty or committed value depending on
-    // whether the BIN slot has been updated; the important thing is it does not block.
-    assert!(
-        data.data() == b"dirty" || data.data() == b"baseline",
-        "ReadUncommitted must return some value without blocking"
+    // JE DirtyReadTest.testReadUncommitted: a READ_UNCOMMITTED reader sees the
+    // SPECIFIC uncommitted value. The write barrier guarantees the writer's
+    // uncommitted `put("dirty")` is in the in-memory BIN before this read
+    // (cursor_impl::put applies synchronously, pre-commit), so the dirty value
+    // is deterministically visible — assert it exactly, not a disjunction.
+    assert_eq!(
+        data.data(),
+        b"dirty",
+        "ReadUncommitted must see the specific uncommitted value (JE DirtyReadTest)"
     );
     cursor.close().unwrap();
 

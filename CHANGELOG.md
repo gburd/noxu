@@ -16,6 +16,28 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Testing (Margo JE test-accuracy review — txn/bind/rep/XA)
+
+- Verdict: the transaction, binding, collections, persist, XA, and
+  implemented-replication tests port nearly identically to JE — the
+  lock-manager / deadlock / isolation / phantom suites are faithful or STRONGER
+  (full 25×25 conflict+upgrade matrices, T-F2 next-key phantom suite). C7
+  (RMW), C8 (4-locker/intersecting deadlock), F1/F3, COL-KEYSET-1,
+  PERSIST-COMP-1 all verified faithful and passing. No UNJUSTIFIED divergences.
+  Two WEAKENED items corrected:
+- Tightened `read_uncommitted_sees_dirty_write`: JE `DirtyReadTest` asserts the
+  READ_UNCOMMITTED reader sees the SPECIFIC uncommitted value; the impl makes
+  it deterministic (synchronous in-memory put before commit, gated by a write
+  barrier), so the assertion is now `assert_eq!(data, "dirty")` rather than the
+  over-loose `"dirty" || "baseline"` disjunction.
+- Documented `je_ranking_proposer_test::test_phase2_arb_one_node`: JE also
+  asserts the lone-arbiter-higher-DTVLSN → no-master cases; those require
+  DTVLSN-based election ranking (an authorized deferral) and are now explicitly
+  noted as skipped-pending-DTVLSN, with a note that the test exercises a
+  test-local arb-exclusion helper (production `run_election` enforces the same
+  via its F22 guard).
+
+
 ### Testing (Keith JE test-accuracy review — W1/W2/D1/M1)
 
 - Verdict: the storage-engine core is faithfully ported at ~100% on the
