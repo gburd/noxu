@@ -434,97 +434,14 @@ fn verify_bin_stub(
 // Public verification entry points
 // ============================================================================
 
-/// Verify the environment.
-///
-/// Performs structural verification of the environment when a tree reference
-/// is available via `verify_tree()`.  This entry point operates without a
-/// live tree reference and therefore validates only configuration-level
-/// invariants; call `verify_tree()` directly to walk a B-tree.
-///
-///
-///
-/// # Arguments
-///
-/// * `config` - Configuration controlling what to verify.
-///
-/// # Returns
-///
-/// Verify all databases in the environment for structural integrity.
-///
-/// **Stub — not yet implemented.** This function always returns a passing
-/// `VerifyResult` without performing any verification work. The `verify_btree`,
-/// `verify_log`, `verify_data_checksums`, and `repair` fields of `VerifyConfig`
-/// are accepted but have no effect. Do not rely on the result for production
-/// integrity checking.
-///
-/// See `docs/src/operations/known-limitations.md` for the current status.
-///
-/// # Arguments
-///
-/// * `config` - Configuration controlling what to verify.
-///
-/// # Returns
-///
-/// A `VerifyResult` containing any errors found and verification statistics.
-pub fn verify_environment(config: &VerifyConfig) -> VerifyResult {
-    log::warn!(
-        "verify_environment called but verification is not yet implemented; \
-         the result does not reflect a real integrity check"
-    );
-    if config.verbose {
-        log::info!("Starting environment verification");
-        log::info!("  B-tree: {}", config.verify_btree);
-        log::info!("  Log: {}", config.verify_log);
-        log::info!("  Checksums: {}", config.verify_data_checksums);
-        log::info!("  Repair: {}", config.repair);
-    }
-
-    VerifyResult {
-        errors: Vec::new(),
-        warnings: Vec::new(),
-        databases_verified: 0,
-        records_verified: 0,
-        passed: true,
-    }
-}
-
-/// Verify a specific database by name.
-///
-/// **Stub — not yet implemented.** This function always returns a passing
-/// `VerifyResult` without performing any verification work. Do not rely on
-/// the result for production integrity checking.
-///
-/// When a live tree reference is available, call `verify_tree()` directly to
-/// perform full structural verification (key-range checks, LSN validity).
-/// This entry point validates database-level metadata without a tree handle.
-///
-/// See `docs/src/operations/known-limitations.md` for the current status.
-///
-/// # Arguments
-///
-/// * `db_name` - Name of the database to verify.
-/// * `config` - Configuration controlling what to verify.
-///
-/// # Returns
-///
-/// A `VerifyResult` containing any errors found and verification statistics.
-pub fn verify_database(db_name: &str, config: &VerifyConfig) -> VerifyResult {
-    log::warn!(
-        "verify_database({db_name}) called but verification is not yet implemented; \
-         the result does not reflect a real integrity check"
-    );
-    if config.verbose {
-        log::info!("Verifying database: {}", db_name);
-    }
-
-    VerifyResult {
-        errors: Vec::new(),
-        warnings: Vec::new(),
-        databases_verified: 1,
-        records_verified: 0,
-        passed: true,
-    }
-}
+// NOTE: the former standalone `verify_environment(&VerifyConfig)` and
+// `verify_database(&str, &VerifyConfig)` entry points were removed: they
+// could not perform real verification without a live `EnvironmentImpl` /
+// `DatabaseImpl` handle, so they returned a fake passing result. The real
+// entry points are `noxu_db::Environment::verify` and
+// `noxu_db::Database::verify`, which route through `verify_database_impl`
+// (below) → `verify_tree`. This mirrors `DbVerify` / `Environment.verify`,
+// which always operate on an opened environment.
 
 /// Verify a `DatabaseImpl`'s B-tree structural integrity.
 ///
@@ -772,29 +689,6 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_environment_stub() {
-        let config = VerifyConfig::default();
-        let result = verify_environment(&config);
-        assert!(result.passed);
-        assert_eq!(result.errors.len(), 0);
-    }
-
-    #[test]
-    fn test_verify_environment_with_custom_config() {
-        let config = VerifyConfig::new().with_repair(true).with_max_errors(10);
-        let result = verify_environment(&config);
-        assert!(result.passed);
-    }
-
-    #[test]
-    fn test_verify_database_stub() {
-        let config = VerifyConfig::default();
-        let result = verify_database("testdb", &config);
-        assert!(result.passed);
-        assert_eq!(result.databases_verified, 1);
-    }
-
-    #[test]
     fn test_verify_result_display_passed() {
         let result = VerifyResult {
             errors: Vec::new(),
@@ -967,6 +861,116 @@ mod tests {
                 result.errors
             );
             assert_eq!(result.databases_verified, 1);
+        }
+    }
+
+    /// verify_tree must DETECT a real structural fault, not silently pass.
+    ///
+    /// Builds a populated tree, then corrupts one non-deleted BIN slot to
+    /// carry a NULL LSN. `VerifyUtils.verifyBIN()` flags this; the
+    /// former standalone `verify_environment` / `verify_database` stubs would
+    /// have returned `passed = true` for the same corruption (the bug this
+    /// removal fixes).
+    #[test]
+    fn test_verify_tree_detects_null_lsn() {
+        use noxu_dbi::{
+            CursorImpl, DatabaseConfig, DatabaseId, DatabaseImpl, DbType,
+            PutMode,
+        };
+        use noxu_log::{FileManager, LogManager};
+        use noxu_sync::RwLock;
+        use noxu_tree::tree::TreeNode;
+        use std::sync::Arc;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let fm = Arc::new(
+            FileManager::new(dir.path(), false, 64 * 1024 * 1024, 100).unwrap(),
+        );
+        let lm =
+            Arc::new(LogManager::new(Arc::clone(&fm), 3, 1024 * 1024, 65536));
+
+        let db_id = DatabaseId::new(3);
+        let config = DatabaseConfig::default();
+        let db_impl = DatabaseImpl::new(
+            db_id,
+            "corrupt_test".to_string(),
+            DbType::User,
+            &config,
+        );
+        let db = Arc::new(RwLock::new(db_impl));
+
+        {
+            let mut cursor = CursorImpl::with_log_manager(
+                Arc::clone(&db),
+                1,
+                Arc::clone(&lm),
+            );
+            cursor.put(b"alpha", b"1", PutMode::Overwrite).unwrap();
+            cursor.put(b"beta", b"2", PutMode::Overwrite).unwrap();
+            cursor.put(b"gamma", b"3", PutMode::Overwrite).unwrap();
+        }
+
+        let guard = db.read();
+        let t = guard
+            .get_real_tree()
+            .expect("invariant: populated db has a real tree");
+
+        // Corrupt the first reachable BIN: set one live slot's LSN to NULL.
+        let corrupted = corrupt_first_bin_slot(&t, NULL_LSN);
+        assert!(corrupted, "test setup: expected at least one BIN slot");
+
+        let cfg = VerifyConfig::default();
+        let result = verify_tree(&t, "corrupt_test", &cfg);
+        assert!(
+            !result.passed,
+            "verifier must detect the NULL-LSN corruption, got passed=true"
+        );
+        assert!(
+            result.errors.iter().any(|e| matches!(
+                e,
+                VerifyError::BtreeError { description, .. }
+                    if description.contains("NULL LSN")
+            )),
+            "expected a NULL-LSN BtreeError, got: {:?}",
+            result.errors
+        );
+
+        // Helper: descend from the root to the first BIN and corrupt slot 0.
+        fn corrupt_first_bin_slot(
+            tree: &noxu_tree::Tree,
+            null_lsn: noxu_util::Lsn,
+        ) -> bool {
+            fn recurse(
+                node: &Arc<noxu_tree::NodeRwLock<TreeNode>>,
+                null_lsn: noxu_util::Lsn,
+            ) -> bool {
+                let mut guard = node.write();
+                match &mut *guard {
+                    TreeNode::Bottom(bin) => {
+                        if let Some(entry) = bin.entries.first_mut() {
+                            entry.known_deleted = false;
+                            entry.lsn = null_lsn;
+                            return true;
+                        }
+                        false
+                    }
+                    TreeNode::Internal(in_node) => {
+                        for e in &in_node.entries {
+                            if let Some(child) = &e.child
+                                && recurse(child, null_lsn)
+                            {
+                                return true;
+                            }
+                        }
+                        false
+                    }
+                }
+            }
+            match tree.get_root() {
+                Some(root) => recurse(&root, null_lsn),
+                None => false,
+            }
         }
     }
 }
