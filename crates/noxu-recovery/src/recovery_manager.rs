@@ -403,6 +403,16 @@ impl RecoveryManager {
         // ------------------------------------------------------------------
         // Phase 2: Redo — replay dirty INs (bottom-up) and committed LNs
         // ------------------------------------------------------------------
+        //
+        // DEVIATION (REC-F2): JE runs undo BEFORE redo per tree group
+        // (RecoveryManager.buildTree / undoLNs then redoLNs, ~line 1967:
+        // "Because we undo before we redo, the record may not be in the
+        // tree").  Noxu keeps redo-then-undo.  This is safe because the
+        // LN-redo apply (tree.redo_insert) carries JE's redo currency guard
+        // (RecoveryManager.redo() ~2512/2544): a slot is replaced only when
+        // logrecLsn > treeLsn.  An out-of-order replay therefore cannot
+        // revert committed data regardless of phase order, so reordering to
+        // match JE exactly is not required for correctness here.
         self.set_progress(RecoveryProgress::ReplayLNs);
         self.run_redo(scanner, &analysis, tree.as_deref_mut())?;
 
@@ -1647,13 +1657,14 @@ impl RecoveryManager {
         }
         match rec.operation {
             LnOperation::Insert | LnOperation::Update => {
-                // Insert the logged version.  `tree.redo_insert` updates the slot
-                // if the key already exists, which gives us the "logrecLsn >
-                // treeLsn → replace" semantics from the.  If the tree already
-                // holds a *newer* entry for this key (another committed write
-                // that arrived after the log was scanned), the overwrite is
-                // still safe here because recovery runs before any new
-                // transactions are admitted.
+                // Insert the logged version.  `tree.redo_insert` applies the
+                // JE redo currency check (RecoveryManager.redo() ~2512/2544):
+                // it replaces the slot ONLY when the logged LSN is strictly
+                // greater than the existing slot LSN (`logrecLsn > treeLsn`),
+                // and skips otherwise.  This makes redo genuinely idempotent:
+                // an out-of-order (older-LSN) replay can never revert a
+                // committed value or reset a slot LSN backward, regardless of
+                // whether redo or undo runs first.
                 //
                 // Recovery alloc optimisation: pass &[u8] slices directly instead of
                 // materialising two intermediate Vec<u8> (rec.key.to_vec() +

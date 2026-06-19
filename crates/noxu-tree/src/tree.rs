@@ -776,6 +776,36 @@ impl BinStub {
         }
     }
 
+    /// Returns the LSN of the slot matching `full_key`, if one exists.
+    ///
+    /// Used by the recovery LN-redo apply to enforce JE's currency check
+    /// (`RecoveryManager.redo()` line ~2512): a logged LN is applied only
+    /// when `logrecLsn > treeLsn`.  Returns `None` when the key is absent
+    /// (always apply).  Uses the same lookup variant the matching insert
+    /// path uses so the comparison is over the right slot.
+    pub fn redo_slot_lsn(
+        &self,
+        full_key: &[u8],
+        cmp: Option<&dyn Fn(&[u8], &[u8]) -> std::cmp::Ordering>,
+        key_prefixing: bool,
+    ) -> Option<Lsn> {
+        let (idx, found) = match cmp {
+            Some(c) => self.find_entry_cmp(full_key, c),
+            None if key_prefixing => self.find_entry_compressed(full_key),
+            None => {
+                // insert_raw path: full keys stored verbatim.
+                match self
+                    .entries
+                    .binary_search_by(|e| e.key.as_slice().cmp(full_key))
+                {
+                    Ok(idx) => (idx, true),
+                    Err(idx) => (idx, false),
+                }
+            }
+        };
+        if found { Some(self.entries[idx].lsn) } else { None }
+    }
+
     /// Raw insert (no prefix compression) for databases with
     /// `key_prefixing = false`.
     ///
@@ -3123,6 +3153,28 @@ impl Tree {
             let mut guard = node_arc.write();
             match &mut *guard {
                 TreeNode::Bottom(bin) => {
+                    // REC-F2: JE redo currency check
+                    // (RecoveryManager.redo() line ~2512/2544).  A logged LN
+                    // is applied only when logrecLsn > treeLsn.  If the slot
+                    // already holds an equal-or-newer LSN, skip the overwrite
+                    // so an out-of-order (older-LSN) redo cannot revert
+                    // committed data or reset the slot LSN backward.  This
+                    // makes redo genuinely idempotent regardless of
+                    // redo/undo phase order.  Deletes never reach this path
+                    // (redo_ln routes Delete through tree.delete), so the JE
+                    // "lsnCmp == 0 && isDeletion -> set KD" sub-case does not
+                    // apply here.
+                    let cmp_ref = key_comparator.map(|c| {
+                        c.as_ref()
+                            as &dyn Fn(&[u8], &[u8]) -> std::cmp::Ordering
+                    });
+                    if let Some(slot_lsn) =
+                        bin.redo_slot_lsn(key, cmp_ref, key_prefixing)
+                        && lsn <= slot_lsn
+                    {
+                        // Tree already holds an equal-or-newer version.
+                        return Ok(false);
+                    }
                     let is_new = if let Some(cmp) = key_comparator {
                         // Comparator path: fall back to owned-Vec variant.
                         let (_idx, new) = bin.insert_cmp(
@@ -5526,6 +5578,47 @@ mod tests {
         assert!(tree.is_empty());
         assert_eq!(tree.get_database_id(), 1);
         assert_eq!(tree.get_root_splits(), 0);
+    }
+
+    #[test]
+    fn test_redo_insert_older_lsn_does_not_overwrite_newer_slot() {
+        // REC-F2 reproduce-first: redo() must be idempotent w.r.t. slot
+        // currency.  JE RecoveryManager.redo() (line ~2512/2544) only
+        // replaces a slot when logrecLsn > treeLsn.  A later redo of an
+        // OLDER committed LN for the same key must NOT revert the slot to
+        // the older value or reset the slot LSN backward.
+        let tree = Tree::new(1, 128);
+        let key = b"k".to_vec();
+
+        // Install the newer version at LSN X (e.g. the BIN-logged value).
+        let newer = Lsn::new(5, 500);
+        tree.redo_insert(&key, b"new", newer).unwrap();
+
+        // Replay an OLDER committed LN at Y < X for the same key.
+        let older = Lsn::new(2, 200);
+        tree.redo_insert(&key, b"old", older).unwrap();
+
+        // The newer value and LSN must survive.
+        let got = tree.search_with_data(&key).expect("key present");
+        assert!(got.found);
+        assert_eq!(
+            got.data.as_deref(),
+            Some(&b"new"[..]),
+            "older-LSN redo reverted committed data"
+        );
+        assert_eq!(
+            got.lsn,
+            newer.as_u64(),
+            "older-LSN redo reset slot LSN backward"
+        );
+
+        // A redo at a strictly NEWER LSN must still replace (replace-only
+        // when log_lsn > slot_lsn, matching JE lsnCmp > 0).
+        let newest = Lsn::new(9, 900);
+        tree.redo_insert(&key, b"newest", newest).unwrap();
+        let got = tree.search_with_data(&key).expect("key present");
+        assert_eq!(got.data.as_deref(), Some(&b"newest"[..]));
+        assert_eq!(got.lsn, newest.as_u64());
     }
 
     #[test]
