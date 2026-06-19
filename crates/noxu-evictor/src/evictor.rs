@@ -619,42 +619,73 @@ impl Evictor {
                             }
                         }
                         Some(_zero) => {
-                            // CLN-F2: partialEviction freed 0 bytes (no LN data
-                            // left to strip).  The BIN is clean, unpinned and
+                            // partialEviction freed 0 bytes (no clean LN data
+                            // left to strip).  The BIN is unpinned and
                             // cursor-free (strip_lns_from_node returns None
-                            // otherwise).  Mirror JE processTarget's
-                            // fall-through (Evictor.java ~2755-2795): BIN-delta
-                            // mutation is documented-skipped (EVICTOR_MUTATE_
-                            // BINS), so we give a dirty BIN a second chance in
-                            // the pri2 dirty-LRU, and otherwise FULLY evict the
-                            // BIN (remove it + credit its node bytes) instead of
-                            // unconditionally putting it back.
-                            if self.use_dirty_lru
-                                && info.is_dirty()
-                                && !from_pri2
-                            {
-                                // JE ~2762-2768: dirty & not in pri2 ->
-                                // moveToPri2LRU (give a second chance).
-                                self.pri2.lock().add_front(node_id);
-                                self.stats.increment(
-                                    &self.stats.nodes_moved_to_pri2_lru,
-                                );
-                            } else if info.is_dirty()
-                                && !self.flush_dirty_node_to_log(node_id)
-                            {
-                                // Dirty BIN we must log first, but it became
-                                // busy/pinned -> put back, do not credit bytes.
-                                if from_pri2 {
-                                    self.pri2.lock().add_back(node_id);
+                            // otherwise).  Mirror JE processTarget
+                            // (Evictor.java ~2755-2795): BIN-delta mutation is
+                            // documented-skipped (EVICTOR_MUTATE_BINS), then a
+                            // dirty BIN gets a one-time pri2 second chance,
+                            // else the node is evicted.
+                            //
+                            // CLN-F2 regression fix (vs. 29119ca): split the
+                            // CLEAN and DIRTY strip-0 cases.
+                            //
+                            //  * CLEAN strip-0 BIN  -> FULLY evict (remove +
+                            //    credit node bytes).  This is the CLN-F2 goal
+                            //    and matches JE's fall-through to
+                            //    evict(target,parent,index) (Evictor.java
+                            //    ~2786-2795) once the dirty/off-heap
+                            //    second-chance guards do not apply.
+                            //
+                            //  * DIRTY strip-0 BIN  -> if useDirtyLRUSet is in
+                            //    effect (Evictor.java ~2758-2766: dirty &&
+                            //    !isInPri2LRU -> moveToPri2LRU) give it a
+                            //    one-time pri2 second chance; otherwise PUT IT
+                            //    BACK (the pre-CLN-F2 behaviour) so a later
+                            //    pass can strip it once its slots are clean.
+                            //
+                            // Why dirty strip-0 does NOT full-evict here:
+                            // 29119ca routed every dirty strip-0 BIN to pri2,
+                            // but under EVICTOR_LRU_ONLY the dirty-LRU set is
+                            // not drained (the evict_batch phase machine
+                            // returns at phase 1 and never reaches phase 2),
+                            // so the BIN was parked forever and its bytes were
+                            // never reclaimed -- cache_usage stuck (F2 regress
+                            // ion).  A dirty BIN's *useful* memory is its LN
+                            // value heap, which strip_lns only frees once the
+                            // slots are clean (a checkpoint logs+cleans them).
+                            // Putting the dirty BIN back lets the next pass
+                            // strip the now-clean slots and actually free that
+                            // heap -- the behaviour that held before 29119ca
+                            // and that this test depends on.
+                            if info.is_dirty() {
+                                if self.use_dirty_lru
+                                    && !self.lru_only
+                                    && !from_pri2
+                                {
+                                    // JE ~2762-2768: dirty & not in pri2 ->
+                                    // moveToPri2LRU (one-time second chance).
+                                    self.pri2.lock().add_front(node_id);
+                                    self.stats.increment(
+                                        &self.stats.nodes_moved_to_pri2_lru,
+                                    );
                                 } else {
-                                    self.primary_policy.put_back(node_id);
+                                    // Pre-CLN-F2 behaviour: put the dirty BIN
+                                    // back (no byte credit) so a later pass can
+                                    // strip its now-clean slots.
+                                    if from_pri2 {
+                                        self.pri2.lock().add_back(node_id);
+                                    } else {
+                                        self.primary_policy.put_back(node_id);
+                                    }
+                                    self.stats
+                                        .increment(&self.stats.nodes_put_back);
                                 }
-                                self.stats
-                                    .increment(&self.stats.nodes_put_back);
                             } else {
-                                // JE ~2789-2795: evict(target, parent, index)
-                                // -- remove the BIN from the tree and reclaim
-                                // its node-level heap.
+                                // JE ~2786-2795: clean strip-0 BIN ->
+                                // evict(target, parent, index): remove the BIN
+                                // and reclaim its node-level heap (CLN-F2).
                                 let freed = node_size_fn(node_id);
                                 result.bytes_evicted += freed;
                                 result.nodes_evicted += 1;
