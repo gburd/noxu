@@ -53,6 +53,28 @@ listed in [References](#references).
   the currency guard removes the hazard so reordering is not required.  The
   false "idempotent" doc comments were corrected to match the implemented
   guard.
+### Fixed (tree/cursor — runtime read/scan now honors `known_deleted`, TREE-F1)
+
+- **Exact lookups and cursor scans no longer surface `known_deleted` BIN
+  slots.** A `known_deleted` slot legitimately exists in a live BIN during
+  BIN-delta reconstitution (`mutate_to_full_bin` applies delta KD slots) until
+  the compressor reclaims it. The runtime `*Stub` read/scan paths checked TTL
+  expiry but ignored `known_deleted`, so a `get` or cursor scan in that window
+  could return a deleted record — a wrong-results bug.
+  - `Tree::search` / `Tree::search_with_data` now report a `known_deleted`
+    slot as ABSENT on an exact match, mirroring the tail of JE
+    `IN.findEntry` (`IN.java:3197`): `if (ret >= 0 && exact &&
+    isEntryKnownDeleted(ret & 0xffff)) return -1;`.
+  - `Tree::first_entry_at_or_after(_with_index)`, `Tree::get_first_node`,
+    `Tree::get_last_node`, and the `CursorImpl` within-BIN / cross-BIN advance
+    (`get_first`, `get_last`, `retrieve_next`) now skip non-live slots,
+    mirroring JE `CursorImpl.lockAndGetCurrent` (`CursorImpl.java:2062-2064`),
+    which returns `null` for `isEntryKnownDeleted(index)` so the `getNext`
+    loop steps past it — including crossing entirely-KD edge BINs.
+  - A single shared liveness predicate `BinStub::slot_is_live` (KD + TTL) is
+    used at every user-facing read/scan site. The compressor / recovery KD
+    iteration paths (`collect_bins_with_known_deleted`, `prune_empty_bin`,
+    recovery undo) are unchanged and still observe KD slots on purpose.
 
 ## [6.0.0] - 2026-06-19
 
