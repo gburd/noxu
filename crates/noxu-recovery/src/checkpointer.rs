@@ -607,8 +607,20 @@ impl Checkpointer {
                 LogEntryType::CkptEnd,
                 &buf,
                 Provisional::No,
-                true,  // flush_required — ensure both entries reach disk
-                false, // fsync_required
+                true, // flush_required
+                // REC-F1: fsync the CkptEnd entry before returning.  JE
+                // Checkpointer.doCheckpoint (~line 895):
+                //   lastCheckpointEnd = logManager.logForceFlush(
+                //       endEntry, true /*fsyncRequired*/, ...);
+                // "We must flush and fsync to ensure that cleaned files are
+                // not referenced. This also ensures that this checkpoint is
+                // not wasted if we crash."  The fsync MUST precede the
+                // cleaner.after_checkpoint() barrier advance below (and JE
+                // fsyncs inside doCheckpoint before
+                // updateFilesAtCheckpointEnd), so ALL callers — close,
+                // daemon, and bytes-triggered wakeup_after_write — get a
+                // durable CkptEnd, not just close.
+                true, // fsync_required
             )
             .map_err(|e| {
                 RecoveryError::CheckpointError(format!(
@@ -1381,6 +1393,42 @@ mod tests {
             "second end ({:?}) must follow second start ({:?})",
             r2.end_lsn,
             r2.start_lsn
+        );
+    }
+
+    /// REC-F1 reproduce-first: every `do_checkpoint` path must make the
+    /// `CkptEnd` entry durable with an fsync BEFORE the cleaner barrier is
+    /// advanced.  JE Checkpointer.doCheckpoint (~line 895) calls
+    /// `logManager.logForceFlush(endEntry, true /*fsyncRequired*/, ...)`
+    /// with the comment "We must flush and fsync to ensure that cleaned
+    /// files are not referenced. This also ensures that this checkpoint is
+    /// not wasted if we crash."  Without the fsync, an auto/daemon
+    /// checkpoint advances the safe-to-delete barrier off a non-durable
+    /// checkpoint — a crash can then lose committed/migrated data.
+    #[test]
+    fn test_do_checkpoint_fsyncs_ckpt_end() {
+        use noxu_log::{FileManager, LogManager};
+        use std::sync::Arc;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let fm = Arc::new(
+            FileManager::new(dir.path(), false, 64 * 1024 * 1024, 100).unwrap(),
+        );
+        let lm =
+            Arc::new(LogManager::new(Arc::clone(&fm), 3, 1024 * 1024, 65536));
+
+        let checkpointer = Checkpointer::new(CheckpointConfig::default())
+            .with_log_manager(Arc::clone(&lm));
+
+        let before = lm.fsync_count();
+        checkpointer.do_checkpoint("daemon").unwrap();
+        let after = lm.fsync_count();
+
+        assert!(
+            after > before,
+            "do_checkpoint must fsync the CkptEnd entry (JE logForceFlush \
+             fsyncRequired=true); fsync_count before={before} after={after}"
         );
     }
 

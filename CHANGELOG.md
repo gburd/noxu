@@ -16,6 +16,44 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Fixed (recovery durability — REC-F1/REC-F2)
+
+- **REC-F1: checkpoint `CkptEnd` is now fsync'd on every path.**
+  `Checkpointer::do_checkpoint` logged the `CkptEnd` entry with
+  `flush_required=true, fsync_required=false`, which only reaches the OS page
+  cache (no `fdatasync`).  `do_checkpoint` then advances the cleaner's
+  safe-to-delete file barrier via `cleaner.after_checkpoint(...)` — off a
+  non-durable checkpoint.  Only `EnvironmentImpl::close` followed with an
+  explicit `flush_sync()`; the daemon checkpoint and the bytes-triggered
+  `wakeup_after_write` checkpoint did not, so a crash after an auto/daemon
+  checkpoint could reference cleaned files and lose committed/migrated data.
+  `CkptEnd` is now logged with `fsync_required=true`, mirroring JE
+  `Checkpointer.doCheckpoint` (~line 895):
+  `logManager.logForceFlush(endEntry, true /*fsyncRequired*/, ...)` — "We
+  must flush and fsync to ensure that cleaned files are not referenced. This
+  also ensures that this checkpoint is not wasted if we crash."  The fsync
+  precedes the cleaner barrier advance on all three callers (close, daemon,
+  bytes-triggered).  This adds one `fdatasync` per checkpoint; JE pays the
+  same cost deliberately for durability.
+
+- **REC-F2: LN-redo apply now enforces JE's redo currency guard.**
+  The LN-redo path (`Tree::redo_insert` →
+  `redo_insert_recursive_inner`) unconditionally overwrote
+  `entries[idx].lsn`/`.data` with no comparison to the existing slot LSN.
+  Combined with IN-redo installing a BIN slot at the BIN's logged LSN X, a
+  later LN-redo of an older committed LN at LSN Y < X for the same key could
+  overwrite the slot with the older value and reset the slot LSN backward —
+  reverting committed data.  The apply now skips the overwrite when the
+  existing slot LSN is greater-than-or-equal to the logged LSN (replace only
+  when `log_lsn > slot_lsn`), matching JE `RecoveryManager.redo()`
+  (~line 2512/2544): `lsnCmp = compareTo(logrecLsn, treeLsn); if (lsnCmp > 0)
+  replace`.  This makes `redo_ln`/`redo_insert` genuinely idempotent
+  regardless of redo/undo phase order.  Noxu keeps its redo-then-undo
+  ordering (JE undoes before redo, RecoveryManager.buildTree ~line 1967);
+  the currency guard removes the hazard so reordering is not required.  The
+  false "idempotent" doc comments were corrected to match the implemented
+  guard.
+
 ## [6.0.0] - 2026-06-19
 
 ### Changed (BREAKING) (engine — remove fake-passing verify stubs)
