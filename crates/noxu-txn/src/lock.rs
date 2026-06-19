@@ -169,6 +169,23 @@ impl Lock {
         }
     }
 
+    /// As `steal_lock`, but only preempts owners for which `preemptable_fn`
+    /// returns true (JE `LockImpl.stealLock` skips non-preemptable owners).
+    pub fn steal_lock_preemptable<F: Fn(i64) -> bool>(
+        &mut self,
+        locker_id: i64,
+        preemptable_fn: &F,
+    ) -> Vec<i64> {
+        match self {
+            Lock::Thin(thin) => {
+                thin.steal_lock_preemptable(locker_id, preemptable_fn)
+            }
+            Lock::Full(full) => {
+                full.steal_lock_preemptable(locker_id, preemptable_fn)
+            }
+        }
+    }
+
     /// Remove a waiter from the waiter list.
     pub fn flush_waiter(&mut self, locker_id: i64) {
         match self {

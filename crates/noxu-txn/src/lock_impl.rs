@@ -249,10 +249,23 @@ impl LockImpl {
     /// Remove all owners except the given one (lock stealing for HA).
     /// Returns the list of locker IDs that were preempted.
     pub fn steal_lock(&mut self, locker_id: i64) -> Vec<i64> {
+        self.steal_lock_preemptable(locker_id, &|_| true)
+    }
+
+    /// As `steal_lock`, but only removes owners for which `preemptable_fn`
+    /// returns true.  JE `LockImpl.stealLock` skips owners whose locker is
+    /// non-preemptable (`thisLocker.getPreemptable()`, LockImpl.java:543/557).
+    /// Returns the locker IDs that were actually preempted (removed).
+    pub fn steal_lock_preemptable<F: Fn(i64) -> bool>(
+        &mut self,
+        locker_id: i64,
+        preemptable_fn: &F,
+    ) -> Vec<i64> {
         let mut preempted = Vec::new();
 
         if let Some(ref owner) = self.first_owner
             && owner.locker_id != locker_id
+            && preemptable_fn(owner.locker_id)
         {
             preempted.push(owner.locker_id);
             self.first_owner = None;
@@ -260,7 +273,8 @@ impl LockImpl {
 
         if let Some(ref mut set) = self.owner_set {
             set.retain(|info| {
-                if info.locker_id != locker_id {
+                if info.locker_id != locker_id && preemptable_fn(info.locker_id)
+                {
                     preempted.push(info.locker_id);
                     false
                 } else {

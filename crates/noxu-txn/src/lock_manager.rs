@@ -126,6 +126,14 @@ pub struct LockManager {
     /// Closes the second F12 residual (May 2026 audit follow-up).  Lockers
     /// without a registered label are reported as `"locker:<id>"`.
     locker_labels: RwLock<HashMap<i64, &'static str>>,
+
+    /// Set of locker IDs that are NOT preemptable (importunate lockers must
+    /// not have their locks stolen).  JE tracks this per-`Locker` via
+    /// `getPreemptable()`; the lock manager needs it to decide, during an
+    /// importunate steal, whether a remaining owner blocks the steal
+    /// (LockManager.java:556 — "Lock holder is non-preemptable, wait again").
+    /// A locker absent from this set is preemptable (the default).
+    non_preemptable: RwLock<HashSet<i64>>,
 }
 
 /// Internal statistics tracking.
@@ -179,6 +187,7 @@ impl LockManager {
             share_registry: RwLock::new(HashMap::new()),
             waiter_graph: Mutex::new(HashMap::new()),
             locker_labels: RwLock::new(HashMap::new()),
+            non_preemptable: RwLock::new(HashSet::new()),
         }
     }
 
@@ -541,6 +550,58 @@ impl LockManager {
         Ok(grant)
     }
 
+    /// Importunate lock acquisition for HA replay (`ReplayTxn`).
+    ///
+    /// JE `LockManager.waitForLock`: an importunate locker that would block
+    /// steals the lock from preemptable owners instead of waiting
+    /// (`if (isImportunate) { result = stealLock(...); if (result.success)
+    /// break; continue; }`, LockManager.java:552-557), and deadlock
+    /// detection is skipped for it (LockManager.java:472).
+    ///
+    /// Strategy: attempt non-blocking; if granted, done.  Otherwise steal
+    /// from preemptable owners and re-attempt (`stealLockInternal`,
+    /// LockManager.java:1599).  If the steal grants the lock, done.  If a
+    /// remaining owner is non-preemptable the steal fails, so fall back to a
+    /// normal blocking wait (mirroring JE's `continue` — wait for the
+    /// non-preemptable holder to release, then retry).
+    pub fn lock_importunate_with_timeout(
+        &self,
+        lsn: u64,
+        locker_id: i64,
+        lock_type: LockType,
+        non_blocking: bool,
+        timeout_ms: u64,
+    ) -> Result<LockGrantType, TxnError> {
+        if lock_type == LockType::None {
+            return Ok(LockGrantType::NoneNeeded);
+        }
+        if lock_type == LockType::Restart {
+            return Err(TxnError::RangeRestart);
+        }
+
+        // Try a normal non-blocking attempt first (jumpAheadOfWaiters=false,
+        // as JE Locker.lock always passes — Locker.java:503).
+        match self.lock(lsn, locker_id, lock_type, true, false) {
+            Ok(grant) => return Ok(grant),
+            Err(TxnError::LockNotAvailable { .. }) => {
+                // Blocked: steal from preemptable owners and re-attempt.
+                if self.steal_lock_in_wait(lsn, locker_id, lock_type) {
+                    return Ok(LockGrantType::New);
+                }
+                // A remaining owner is non-preemptable; fall back to a normal
+                // blocking wait (JE `continue`).
+            }
+            Err(e) => return Err(e),
+        }
+
+        if non_blocking {
+            return Err(TxnError::LockNotAvailable { lsn });
+        }
+        self.lock_with_timeout(
+            lsn, locker_id, lock_type, false, false, timeout_ms,
+        )
+    }
+
     /// Releases a lock on the given LSN for the given locker.
     ///
     /// Promotes compatible waiters to owners, signals their condvars so they
@@ -666,6 +727,51 @@ impl LockManager {
         Ok(())
     }
 
+    /// Importunate lock steal performed inside the wait loop, mirroring JE
+    /// `LockManager.stealLockInternal` (LockManager.java:1599): flush this
+    /// locker's waiter entry, remove all preemptable owners, then re-attempt
+    /// the lock.  Non-preemptable owners (other importunate lockers) are left
+    /// in place, so the re-attempt may still fail — returning `false` tells
+    /// the wait loop to keep waiting (LockManager.java:556 `continue`).
+    ///
+    /// Returns `true` iff the lock is now held by `locker_id`.
+    fn steal_lock_in_wait(
+        &self,
+        lsn: u64,
+        locker_id: i64,
+        lock_type: LockType,
+    ) -> bool {
+        // Only preempt owners that are not marked non-preemptable.
+        let non_preemptable: Option<HashSet<i64>> = {
+            let np = self.non_preemptable.read().unwrap();
+            if np.is_empty() { None } else { Some(np.clone()) }
+        };
+        let preemptable_fn = move |owner_id: i64| -> bool {
+            match &non_preemptable {
+                Some(np) => !np.contains(&owner_id),
+                None => true,
+            }
+        };
+        let shares = self.build_shares_fn(locker_id);
+
+        let table_idx = self.get_table_index(lsn);
+        let mut table = self.lock_tables[table_idx].lock();
+        let lock = table.entry(lsn).or_insert_with(Lock::new_thin);
+
+        // flushWaiter: our waiter entry may still be present.
+        lock.flush_waiter(locker_id);
+        // stealLock: remove all preemptable owners.
+        let _preempted =
+            lock.steal_lock_preemptable(locker_id, &preemptable_fn);
+        // Re-attempt as a non-blocking, jump-ahead request.
+        let result = lock.lock_with_sharing(
+            lock_type, locker_id, true,  // non_blocking
+            false, // jump_ahead_of_waiters
+            &shares,
+        );
+        result.success
+    }
+
     /// Returns true if the given locker owns a write lock on the LSN.
     ///
     ///
@@ -773,6 +879,21 @@ impl LockManager {
     ///
     pub fn unregister_locker_sharing(&self, locker_id: i64) {
         self.share_registry.write().unwrap().remove(&locker_id);
+    }
+
+    /// Marks `locker_id` as non-preemptable (its locks cannot be stolen).
+    ///
+    /// Called for importunate lockers (HA `ReplayTxn`).  JE tracks this per
+    /// `Locker` via `getPreemptable()`; the lock manager mirrors it so the
+    /// importunate steal in the wait loop can honor a non-preemptable owner
+    /// (LockManager.java:556).
+    pub fn register_non_preemptable(&self, locker_id: i64) {
+        self.non_preemptable.write().unwrap().insert(locker_id);
+    }
+
+    /// Clears the non-preemptable mark for `locker_id`.
+    pub fn unregister_non_preemptable(&self, locker_id: i64) {
+        self.non_preemptable.write().unwrap().remove(&locker_id);
     }
 
     /// Returns true if `a` and `b` are in the same lock-sharing group.
@@ -1129,6 +1250,65 @@ mod tests {
         }
 
         assert_eq!(lm.n_total_locks(), 0);
+    }
+
+    /// TXN-F3 regression: an importunate locker steals a held, conflicting
+    /// lock from a preemptable owner instead of waiting/timing out.  JE
+    /// `LockManager.waitForLock`: `if (isImportunate) { result =
+    /// stealLock(...); if (result.success) break; }` (LockManager.java:552).
+    #[test]
+    fn test_importunate_steals_conflicting_lock() {
+        const LSN: u64 = 4242;
+        let lm = LockManager::new();
+
+        // Owner 1 (preemptable) holds a Write lock.
+        assert_eq!(
+            lm.lock(LSN, 1, LockType::Write, false, false).unwrap(),
+            LockGrantType::New
+        );
+        assert!(lm.is_owned_write_lock(LSN, 1));
+
+        // Importunate locker 2 requests a conflicting Write lock.  Use a
+        // non_blocking=false call with a SHORT timeout: pre-fix this would
+        // either time out (LockTimeout) or block; post-fix the steal grants
+        // it immediately.
+        let grant = lm
+            .lock_importunate_with_timeout(LSN, 2, LockType::Write, false, 200)
+            .expect("importunate locker must steal the conflicting lock");
+        assert!(matches!(grant, LockGrantType::New | LockGrantType::Existing));
+
+        // The steal preempted owner 1; locker 2 now holds the write lock.
+        assert!(lm.is_owned_write_lock(LSN, 2));
+        assert!(!lm.is_owned_write_lock(LSN, 1));
+    }
+
+    /// A non-preemptable owner blocks the steal: the importunate request
+    /// falls back to a normal wait and times out rather than stealing.
+    /// JE: "Lock holder is non-preemptable, wait again" (LockManager.java:556).
+    #[test]
+    fn test_importunate_cannot_steal_non_preemptable() {
+        const LSN: u64 = 4343;
+        let lm = LockManager::new();
+
+        // Owner 1 is non-preemptable (another importunate locker).
+        lm.register_non_preemptable(1);
+        assert_eq!(
+            lm.lock(LSN, 1, LockType::Write, false, false).unwrap(),
+            LockGrantType::New
+        );
+
+        // Importunate locker 2 cannot steal; with a short timeout it must
+        // time out, and owner 1 keeps the lock.
+        let r = lm.lock_importunate_with_timeout(
+            LSN,
+            2,
+            LockType::Write,
+            false,
+            100,
+        );
+        assert!(matches!(r, Err(TxnError::LockTimeout { .. })));
+        assert!(lm.is_owned_write_lock(LSN, 1));
+        assert!(!lm.is_owned_write_lock(LSN, 2));
     }
 
     #[test]

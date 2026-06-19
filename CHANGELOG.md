@@ -111,6 +111,26 @@ listed in [References](#references).
   the restart scan (mirroring how `try_lock` delegates to
   `try_lock_with_sharing`).
 
+### Fixed (txn — importunate lock steal in the wait path, TXN-F3, rep-only)
+
+- **Importunate (HA `ReplayTxn`) lock requests now steal a held conflicting
+  lock instead of being conflated with `jumpAheadOfWaiters`.** `Txn::lock`
+  passed `self.importunate` into the `jump_ahead_of_waiters` slot of
+  `lock_with_timeout`, but jumping ahead of *waiters* never removes a
+  conflicting *owner* — so an importunate replay would block / time out
+  against a non-importunate owner. JE: normal `Locker.lock` always passes
+  `jumpAheadOfWaiters=false` (Locker.java:503); importunate is handled inside
+  `LockManager.waitForLock` by `if (isImportunate) { result =
+  stealLock(...) }` (LockManager.java:552), letting HA replay preempt a
+  preemptable owner. `Txn::lock` now passes `false` for jump-ahead and routes
+  importunate requests through a new `lock_importunate_with_timeout`, which
+  steals from preemptable owners (mirroring `stealLockInternal`,
+  LockManager.java:1599) and re-attempts. A non-preemptable owner (another
+  importunate locker, tracked in a new non-preemptable registry) blocks the
+  steal, falling back to a normal wait (JE's `continue`, LockManager.java:556).
+  `LockImpl::steal_lock` gained a `steal_lock_preemptable` variant honoring
+  `getPreemptable()` (LockImpl.java:543).
+
 ## [6.0.0] - 2026-06-19
 
 ### Changed (BREAKING) (engine — remove fake-passing verify stubs)
