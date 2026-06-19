@@ -325,6 +325,16 @@ impl LockManager {
 
         let table_idx = self.get_table_index(lsn);
 
+        // Snapshot the sharing registry before entering the lock-table
+        // critical section so `LockImpl::try_lock_with_sharing` can consult
+        // `sharesLocksWith` on every acquisition.  JE `LockImpl.tryLock`
+        // checks `!locker.sharesLocksWith(ownerLocker) &&
+        // !ownerLocker.sharesLocksWith(locker)` (LockImpl.java:647-648) on
+        // EVERY lock request, letting siblings (two ThreadLockers on the
+        // same thread, or a HandleLocker + its buddy txn) co-own a lock
+        // without conflict.
+        let shares = self.build_shares_fn(locker_id);
+
         // --- Phase 1: attempt to acquire the lock under the shard mutex. ---
         //
         // "Attempt to lock without any initial wait."
@@ -332,11 +342,12 @@ impl LockManager {
             let mut table = self.lock_tables[table_idx].lock();
             let lock = table.entry(lsn).or_insert_with(Lock::new_thin);
 
-            let result = lock.lock(
+            let result = lock.lock_with_sharing(
                 lock_type,
                 locker_id,
                 non_blocking,
                 jump_ahead_of_waiters,
+                &shares,
             );
 
             if result.success {
@@ -542,15 +553,7 @@ impl LockManager {
         // check in LockImpl::release_with_sharing can honor sharesLocksWith
         // (JE rangeInsertConflict) without holding the registry across the
         // table borrow.
-        let my_group =
-            self.share_registry.read().unwrap().get(&locker_id).copied();
-        let registry = &self.share_registry;
-        let shares_fn = |owner: i64| -> bool {
-            match my_group {
-                Some(g) => registry.read().unwrap().get(&owner) == Some(&g),
-                None => false,
-            }
-        };
+        let shares_fn = self.build_shares_fn(locker_id);
         let mut table = self.lock_tables[table_idx].lock();
 
         if let Some(lock) = table.get_mut(&lsn) {
@@ -604,15 +607,7 @@ impl LockManager {
         let mut released = 0usize;
         // Snapshot this locker's share group for the RANGE_INSERT restart-wake
         // check (JE rangeInsertConflict / sharesLocksWith).
-        let my_group =
-            self.share_registry.read().unwrap().get(&locker_id).copied();
-        let registry = &self.share_registry;
-        let shares_fn = |owner: i64| -> bool {
-            match my_group {
-                Some(g) => registry.read().unwrap().get(&owner) == Some(&g),
-                None => false,
-            }
-        };
+        let shares_fn = self.build_shares_fn(locker_id);
         for table in &self.lock_tables {
             let mut table = table.lock();
             // Collect target LSNs first to avoid mutating the map
@@ -792,15 +787,43 @@ impl LockManager {
         }
     }
 
-    /// Like `lock_with_timeout()` but also performs a `sharesLocksWith` check
-    /// for every conflict that would otherwise block.
+    /// Builds the `sharesLocksWith` predicate for `locker_id`, used by every
+    /// acquisition (`lock_with_timeout`) and release (`release`) so that
+    /// `LockImpl` can skip conflict detection between cooperating lockers.
+    /// `shares(owner_id)` returns true iff `owner_id` is in `locker_id`'s
+    /// sharing group.  JE: `LockImpl.tryLock` / `rangeInsertConflict` consult
+    /// `sharesLocksWith` (LockImpl.java:647-648, 719).
     ///
-    /// `LockManager.lock()` / `LockImpl.tryLock()` — skips conflict
-    /// detection when both lockers are in the same sharing group.
+    /// The registry HashMap is cloned only when `locker_id` actually belongs
+    /// to a sharing group; the common path (BasicLockers, most internal ops)
+    /// shares with no one and returns a closure that allocates nothing.
+    fn build_shares_fn(&self, locker_id: i64) -> impl Fn(i64) -> bool + use<> {
+        let requester_group: Option<i64> =
+            self.share_registry.read().unwrap().get(&locker_id).copied();
+        let registry_snapshot: Option<hashbrown::HashMap<i64, i64>> =
+            if requester_group.is_some() {
+                Some(self.share_registry.read().unwrap().clone())
+            } else {
+                None
+            };
+        move |owner_id: i64| -> bool {
+            match (requester_group, &registry_snapshot) {
+                (Some(req_group), Some(reg)) => {
+                    reg.get(&owner_id).copied() == Some(req_group)
+                }
+                _ => false,
+            }
+        }
+    }
+
+    /// Deprecated alias for `lock_with_timeout()`.
     ///
-    /// This method is used by the locker implementations when they call the
-    /// lock manager; the plain `lock()` / `lock_with_timeout()` path uses the
-    /// registry automatically.
+    /// TXN-F2 fix: the plain `lock()` / `lock_with_timeout()` path now
+    /// consults the sharing registry on every acquisition (JE
+    /// `LockImpl.tryLock` checks `sharesLocksWith`, LockImpl.java:647-648),
+    /// so a separate sharing entry point is redundant.  Kept as a thin
+    /// forwarder so existing callers keep compiling; new code should call
+    /// `lock` / `lock_with_timeout` directly.
     pub fn lock_with_sharing(
         &self,
         lsn: u64,
@@ -809,17 +832,16 @@ impl LockManager {
         non_blocking: bool,
         jump_ahead_of_waiters: bool,
     ) -> Result<LockGrantType, TxnError> {
-        self.lock_with_sharing_and_timeout(
+        self.lock(
             lsn,
             locker_id,
             lock_type,
             non_blocking,
             jump_ahead_of_waiters,
-            self.lock_timeout_ms.load(Ordering::Relaxed),
         )
     }
 
-    /// Full `lock_with_sharing` with explicit timeout.
+    /// Deprecated alias for `lock_with_timeout()`; see `lock_with_sharing`.
     pub fn lock_with_sharing_and_timeout(
         &self,
         lsn: u64,
@@ -829,193 +851,14 @@ impl LockManager {
         jump_ahead_of_waiters: bool,
         timeout_ms: u64,
     ) -> Result<LockGrantType, TxnError> {
-        if lock_type == LockType::None {
-            return Ok(LockGrantType::NoneNeeded);
-        }
-        if lock_type == LockType::Restart {
-            return Err(TxnError::RangeRestart);
-        }
-
-        self.stats.lock_requests.fetch_add(1, Ordering::Relaxed);
-        let table_idx = self.get_table_index(lsn);
-
-        // Snapshot the sharing registry before entering the lock-table critical
-        // section.  This avoids capturing `self` in the closure below while
-        // also holding a mutable borrow of `self.lock_tables[table_idx]`.
-        let requester_group: Option<i64> = {
-            let reg = self.share_registry.read().unwrap();
-            reg.get(&locker_id).copied()
-        };
-        // Only clone the registry when the requester is actually in a sharing
-        // group — avoids a HashMap allocation on every lock call for the common
-        // path where requester_group is None (BasicLockers, most internal ops).
-        let registry_snapshot: Option<hashbrown::HashMap<i64, i64>> =
-            if requester_group.is_some() {
-                Some(self.share_registry.read().unwrap().clone())
-            } else {
-                None
-            };
-        let shares = move |owner_id: i64| -> bool {
-            if let (Some(req_group), Some(reg)) =
-                (requester_group, &registry_snapshot)
-            {
-                reg.get(&owner_id).copied() == Some(req_group)
-            } else {
-                false
-            }
-        };
-
-        // Phase 1: attempt under shard mutex.
-        let (initial_grant, owner_ids, notify_pair) = {
-            let mut table = self.lock_tables[table_idx].lock();
-            let lock = table.entry(lsn).or_insert_with(Lock::new_thin);
-
-            let result = lock.lock_with_sharing(
-                lock_type,
-                locker_id,
-                non_blocking,
-                jump_ahead_of_waiters,
-                &shares,
-            );
-
-            if result.success {
-                return Ok(result.lock_grant);
-            }
-            if result.lock_grant == LockGrantType::Denied {
-                return Err(TxnError::LockNotAvailable { lsn });
-            }
-
-            self.stats.lock_waits.fetch_add(1, Ordering::Relaxed);
-            let owner_ids = lock.get_owner_ids();
-            let pair: WaiterNotify =
-                Arc::new((Mutex::new(false), Condvar::new()));
-            lock.set_waiter_notify(locker_id, pair.clone());
-            (result.lock_grant, owner_ids, pair)
-        };
-
-        // Register in the incremental waits-for graph (same as lock_with_timeout).
-        self.record_wait(locker_id, &owner_ids);
-
-        // Phase 2: deadlock check.
-        if let Some(deadlock_err) = self
-            .check_deadlock_for_waiter(lsn, locker_id, lock_type, &owner_ids)
-        {
-            // H-2: shard before waiter_graph.
-            self.flush_and_clear_waiter(table_idx, lsn, locker_id);
-            return Err(deadlock_err);
-        }
-
-        // Phase 3: condvar wait — mirrors lock_with_timeout exactly.
-        // TXN-1 fix (2026-06-16): the previous code only checked for deadlock
-        // on timed_out.timed_out() and used STALE owner_ids captured at Phase 1.
-        // JE LockManager.waitForLock checks deadlock every loop iteration with
-        // fresh owner IDs; mirror that here.
-        let start = std::time::Instant::now();
-        let (mutex, condvar) = &*notify_pair;
-        let mut granted_guard = mutex.lock();
-
-        loop {
-            if *granted_guard {
-                break;
-            }
-            let remaining_ms = if timeout_ms == 0 {
-                0
-            } else {
-                let elapsed = start.elapsed().as_millis() as u64;
-                if elapsed >= timeout_ms {
-                    drop(granted_guard);
-                    // H-2: shard before waiter_graph.
-                    self.flush_and_clear_waiter(table_idx, lsn, locker_id);
-                    return Err(TxnError::LockTimeout {
-                        timeout_ms,
-                        lsn,
-                        owner: format!(
-                            "[{}] on LSN {lsn}",
-                            self.format_lockers(&owner_ids)
-                        ),
-                        requested_type: lock_type,
-                        requester: self.format_locker(locker_id),
-                    });
-                }
-                timeout_ms - elapsed
-            };
-            let slice_ms =
-                if remaining_ms == 0 { 50 } else { remaining_ms.min(50) };
-
-            let timed_out = condvar
-                .wait_for(&mut granted_guard, Duration::from_millis(slice_ms))
-                .timed_out();
-
-            if *granted_guard {
-                break;
-            }
-
-            // Re-run deadlock detection after every wakeup with fresh owner
-            // IDs — mirrors JE LockManager.waitForLock (unconditional per
-            // iteration). The previous code only fired on timed_out.timed_out()
-            // and used stale owner_ids from Phase 1.
-            drop(granted_guard);
-            {
-                let cur_owner_ids = {
-                    let table = self.lock_tables[table_idx].lock();
-                    table
-                        .get(&lsn)
-                        .map(|l| l.get_owner_ids())
-                        .unwrap_or_default()
-                };
-                if let Some(deadlock_err) = self.check_deadlock_for_waiter(
-                    lsn,
-                    locker_id,
-                    lock_type,
-                    &cur_owner_ids,
-                ) {
-                    // H-2: shard before waiter_graph.
-                    self.flush_and_clear_waiter(table_idx, lsn, locker_id);
-                    return Err(deadlock_err);
-                }
-            }
-            granted_guard = mutex.lock();
-
-            if *granted_guard {
-                break;
-            }
-
-            if timed_out
-                && timeout_ms > 0
-                && start.elapsed().as_millis() as u64 >= timeout_ms
-            {
-                drop(granted_guard);
-                // H-2: shard before waiter_graph.
-                self.flush_and_clear_waiter(table_idx, lsn, locker_id);
-                self.stats.lock_timeouts.fetch_add(1, Ordering::Relaxed);
-                return Err(TxnError::LockTimeout {
-                    timeout_ms,
-                    lsn,
-                    owner: format!(
-                        "[{}] on LSN {lsn}",
-                        self.format_lockers(&owner_ids)
-                    ),
-                    requested_type: lock_type,
-                    requester: self.format_locker(locker_id),
-                });
-            }
-
-            // Spurious wakeup or slice expired; loop.
-        }
-
-        drop(granted_guard);
-        self.clear_wait(locker_id);
-
-        // See lock_with_timeout for the WaitRestart rationale.
-        let grant = match initial_grant {
-            LockGrantType::WaitNew => LockGrantType::New,
-            LockGrantType::WaitPromotion => LockGrantType::Promotion,
-            LockGrantType::WaitRestart => {
-                return Err(TxnError::RangeRestart);
-            }
-            other => other,
-        };
-        Ok(grant)
+        self.lock_with_timeout(
+            lsn,
+            locker_id,
+            lock_type,
+            non_blocking,
+            jump_ahead_of_waiters,
+            timeout_ms,
+        )
     }
 
     // ========================================================================

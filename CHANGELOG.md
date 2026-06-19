@@ -75,6 +75,26 @@ listed in [References](#references).
     used at every user-facing read/scan site. The compressor / recovery KD
     iteration paths (`collect_bins_with_known_deleted`, `prune_empty_bin`,
     recovery undo) are unchanged and still observe KD slots on purpose.
+### Fixed (txn — locker lock-sharing on the acquisition path, TXN-F2)
+
+- **`LockManager::lock` / `lock_with_timeout` now consult the lock-sharing
+  registry on every acquisition.** Previously the production acquisition path
+  (used by every locker: `ThreadLocker`, `HandleLocker`, `BasicLocker`,
+  `Txn`) called `LockImpl::lock`, which hard-wired sharing off
+  (`try_lock_with_sharing(..., &|_| false)`). The `lock_with_sharing*` family
+  that *did* honor the registry was only ever reached from its own unit test.
+  `ThreadLocker::new` and `HandleLocker::with_buddy` faithfully populate the
+  registry, but acquisition never read it — so two `ThreadLocker`s on the same
+  thread (e.g. two cursors under auto-commit) or a `HandleLocker` + its buddy
+  txn requesting conflicting locks on the same LSN would self-deadlock or
+  spuriously `LockTimeout`, which JE never does. JE `LockImpl.tryLock` checks
+  `!locker.sharesLocksWith(ownerLocker) && !ownerLocker.sharesLocksWith(locker)`
+  on **every** acquisition (LockImpl.java:647-648). The production path now
+  builds the `sharesLocksWith` predicate from the registry and routes through
+  `LockImpl::lock_with_sharing`; the `lock_with_sharing` /
+  `lock_with_sharing_and_timeout` methods are now thin deprecated forwarders.
+  This also corrects a doc-bug (TXN-F6) that claimed the plain `lock()` path
+  already used the registry — now true.
 
 ## [6.0.0] - 2026-06-19
 

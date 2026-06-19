@@ -300,4 +300,35 @@ mod tests {
         // Same thread should have same ID
         assert_eq!(id1, id2);
     }
+
+    /// TXN-F2 regression: two ThreadLockers on the SAME thread share locks
+    /// (LockManager registers them in the same sharing group, keyed by
+    /// thread id).  JE `LockImpl.tryLock` consults
+    /// `locker.sharesLocksWith(ownerLocker)` on EVERY acquisition
+    /// (LockImpl.java:647-648), so a conflicting (Write/Write) request from a
+    /// sibling ThreadLocker must be co-granted, not blocked.
+    ///
+    /// Before the fix, `LockManager::lock` hard-wired sharing off, so the
+    /// second locker self-conflicted: with non_blocking it was denied
+    /// (LockNotAvailable); with blocking it self-deadlocked / timed out.
+    #[test]
+    fn test_two_thread_lockers_same_thread_share_write_lock() {
+        let lm = Arc::new(LockManager::new());
+        let mut a = ThreadLocker::new(1, lm.clone());
+        let mut b = ThreadLocker::new(2, lm);
+        // Same thread => same sharing group.
+        assert_eq!(a.get_thread_id(), b.get_thread_id());
+
+        // First write lock: granted.
+        let ra = a.lock(100, LockType::Write, false).unwrap();
+        assert!(ra.is_granted());
+
+        // Sibling write lock on the SAME LSN.  non_blocking=true so a
+        // regression surfaces as an immediate LockNotAvailable instead of a
+        // 5s timeout hang.  With sharing honored, this must be GRANTED.
+        let rb = b
+            .lock(100, LockType::Write, true)
+            .expect("sibling ThreadLocker must co-own the write lock");
+        assert!(rb.is_granted());
+    }
 }
