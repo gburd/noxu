@@ -111,10 +111,22 @@ impl ExclusiveLatch {
     /// Does nothing if not held by the current thread.
     ///
     /// Equivalent of `release_if_owner()` — releases only if held by this thread.
+    ///
+    /// # Safety precondition (caller-enforced)
+    ///
+    /// This force-unlocks the underlying mutex based only on a thread-id check.
+    /// The caller MUST ensure that **no live [`ExclusiveLatchGuard`] for this
+    /// latch is still in scope** when calling this — otherwise the guard's drop
+    /// will unlock a second time (double-unlock UB). This method exists for the
+    /// poison-recovery path where the guard has already been forgotten/dropped
+    /// (e.g. a panic unwound through the critical section). In normal code,
+    /// prefer dropping the guard.
     pub fn release_if_owner(&self) {
         if self.is_owner() {
             self.owner.store(0, Ordering::Relaxed);
-            // SAFETY: We verified ownership above
+            // SAFETY: ownership verified above; caller guarantees no live guard
+            // remains (see the safety precondition on this method) so this is
+            // the only outstanding unlock.
             unsafe { self.inner.force_unlock() };
         }
     }
