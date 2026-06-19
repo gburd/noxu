@@ -16,6 +16,27 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Changed (BREAKING) (engine — remove fake-passing verify stubs)
+
+- **Removed `noxu_engine::verify_environment(&VerifyConfig)` and
+  `noxu_engine::verify_database(&str, &VerifyConfig)`** (and their `lib.rs`
+  re-exports). Both were stubs that logged a warning and returned an empty
+  *passing* `VerifyResult` without performing any integrity check — a caller
+  received `passed = true` for a corrupt database. They could not do real work:
+  structural verification requires a live `EnvironmentImpl` / `DatabaseImpl`
+  handle, which these signatures (a bare `&str` / no env handle) do not provide.
+  The real, already-wired entry points are unchanged: `Environment::verify` and
+  `Database::verify` (noxu-db), which route through
+  `noxu_engine::verify_database_impl` → `verify_tree` and perform a genuine
+  live-tree structural walk (child accessibility, key-range containment,
+  non-deleted-slot LSN validity). This mirrors JE `DbVerify` /
+  `Environment.verify`, which always operate on an opened environment. Callers
+  of the removed functions (none existed outside their own stub tests) should
+  use `Environment::verify` / `Database::verify`. Added
+  `test_verify_tree_detects_null_lsn` proving the verifier detects a real
+  structural fault (a non-deleted BIN slot carrying a NULL LSN) rather than
+  silently passing.
+
 ### Fixed (cleaner — two-pass gate keys on the utilization uncertainty band, CFG-TWOPASS-1)
 
 - **`CLEANER_TWO_PASS_GAP` / `CLEANER_TWO_PASS_THRESHOLD` are now wired and gate

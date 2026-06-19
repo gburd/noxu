@@ -98,8 +98,7 @@ pub use engine_config::EngineConfig;
 pub use env_stats::EnvironmentStats;
 pub use error::{EngineError, Result};
 pub use verify::{
-    VerifyConfig, VerifyError, VerifyResult, verify_database,
-    verify_database_impl, verify_environment, verify_tree,
+    VerifyConfig, VerifyError, VerifyResult, verify_database_impl, verify_tree,
 };
 
 #[cfg(test)]
