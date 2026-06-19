@@ -62,8 +62,15 @@ impl UtilizationTracker {
         let summary = tracked.get_summary_mut();
         if count_as_ln {
             summary.obsolete_ln_count += 1;
-            summary.obsolete_ln_size += size;
-            summary.obsolete_ln_size_counted += 1;
+            // CLN-F3: the size is OPTIONAL when tracking obsolete LNs — only
+            // accumulate it (and the counted tally that feeds the avg-LN-size
+            // estimator) when a real size was supplied.
+            // JE: BaseUtilizationTracker.countObsoleteNode ~184-189
+            // ("The size is optional when tracking obsolete LNs.").
+            if size > 0 {
+                summary.obsolete_ln_size += size;
+                summary.obsolete_ln_size_counted += 1;
+            }
         } else {
             summary.obsolete_in_count += 1;
         }
@@ -199,6 +206,35 @@ mod tests {
         assert_eq!(tracked.get_summary().obsolete_ln_size, 50);
         assert_eq!(tracked.get_summary().obsolete_ln_size_counted, 1);
         assert_eq!(tracked.obsolete_offset_count(), 1);
+    }
+
+    /// CLN-F3: when an obsolete LN is tracked with size 0 ("the size is
+    /// optional"), the count is incremented but the size and counted tallies
+    /// that feed the avg-LN-size estimator must stay unchanged.
+    ///
+    /// JE: BaseUtilizationTracker.countObsoleteNode (~184-189) guards
+    /// `obsoleteLNSize`/`obsoleteLNSizeCounted` on `size > 0`.
+    #[test]
+    fn test_track_obsolete_ln_size_zero_does_not_count_size() {
+        let mut tracker = UtilizationTracker::new(true);
+        tracker.track_obsolete(1, 100, 0, true);
+
+        let tracked = tracker.get_tracked_summary(1).unwrap();
+        assert_eq!(
+            tracked.get_summary().obsolete_ln_count,
+            1,
+            "count still increments for a size-0 obsolete LN"
+        );
+        assert_eq!(
+            tracked.get_summary().obsolete_ln_size,
+            0,
+            "CLN-F3: size must NOT accumulate when size <= 0"
+        );
+        assert_eq!(
+            tracked.get_summary().obsolete_ln_size_counted,
+            0,
+            "CLN-F3: counted must NOT increment when size <= 0"
+        );
     }
 
     #[test]

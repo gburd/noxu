@@ -604,21 +604,65 @@ impl Evictor {
                     // lock.  `None` means the node is busy or pinned — put
                     // it back instead of blocking.
                     match self.strip_lns_from_node(node_id) {
-                        Some(freed_bytes) => {
-                            if freed_bytes > 0 {
-                                result.bytes_evicted += freed_bytes as u64;
-                                self.stats
-                                    .increment(&self.stats.nodes_stripped);
-                                self.stats.increment(&self.stats.lns_evicted);
-                            }
+                        Some(freed_bytes) if freed_bytes > 0 => {
+                            // Stripped some LN bytes -> strippedPutBack.
+                            // JE processTarget ~2722-2726: if partialEviction
+                            // freed bytes, keep the BIN resident (warm descent
+                            // path) and put it back.
+                            result.bytes_evicted += freed_bytes as u64;
+                            self.stats.increment(&self.stats.nodes_stripped);
+                            self.stats.increment(&self.stats.lns_evicted);
                             if from_pri2 {
                                 self.pri2.lock().add_back(node_id);
                             } else {
                                 self.primary_policy.put_back(node_id);
                             }
                         }
+                        Some(_zero) => {
+                            // CLN-F2: partialEviction freed 0 bytes (no LN data
+                            // left to strip).  The BIN is clean, unpinned and
+                            // cursor-free (strip_lns_from_node returns None
+                            // otherwise).  Mirror JE processTarget's
+                            // fall-through (Evictor.java ~2755-2795): BIN-delta
+                            // mutation is documented-skipped (EVICTOR_MUTATE_
+                            // BINS), so we give a dirty BIN a second chance in
+                            // the pri2 dirty-LRU, and otherwise FULLY evict the
+                            // BIN (remove it + credit its node bytes) instead of
+                            // unconditionally putting it back.
+                            if self.use_dirty_lru
+                                && info.is_dirty()
+                                && !from_pri2
+                            {
+                                // JE ~2762-2768: dirty & not in pri2 ->
+                                // moveToPri2LRU (give a second chance).
+                                self.pri2.lock().add_front(node_id);
+                                self.stats.increment(
+                                    &self.stats.nodes_moved_to_pri2_lru,
+                                );
+                            } else if info.is_dirty()
+                                && !self.flush_dirty_node_to_log(node_id)
+                            {
+                                // Dirty BIN we must log first, but it became
+                                // busy/pinned -> put back, do not credit bytes.
+                                if from_pri2 {
+                                    self.pri2.lock().add_back(node_id);
+                                } else {
+                                    self.primary_policy.put_back(node_id);
+                                }
+                                self.stats
+                                    .increment(&self.stats.nodes_put_back);
+                            } else {
+                                // JE ~2789-2795: evict(target, parent, index)
+                                // -- remove the BIN from the tree and reclaim
+                                // its node-level heap.
+                                let freed = node_size_fn(node_id);
+                                result.bytes_evicted += freed;
+                                result.nodes_evicted += 1;
+                                self.stats.increment(&self.stats.nodes_evicted);
+                            }
+                        }
                         None => {
-                            // Node busy or pinned — put back without any
+                            // Node busy or pinned -- put back without any
                             // memory-budget change.
                             if from_pri2 {
                                 self.pri2.lock().add_back(node_id);
@@ -1655,16 +1699,19 @@ mod tests {
 
     #[test]
     fn test_evict_batch_partial_evict_path() {
-        // H-9: PartialEvict now actually strips LN data via
-        // strip_lns_from_node().  Without a tree wired, that returns 0
-        // bytes (the test's mock evictor has no tree).  The call-path
-        // is still exercised: the evictor visits each node, decides
-        // PartialEvict, attempts to strip, and puts the node back.
-        // bytes_evicted is 0 because nothing was actually freed (no
-        // tree, no slot data to drop) — this is the correct outcome
-        // and is what changed from the pre-H-9 behavior, where the
-        // evictor lied about freeing bytes that were never actually
-        // dropped.
+        // CLN-F2: a clean, unpinned, cursor-free BIN whose LN strip frees 0
+        // bytes (nothing left to strip) now FALLS THROUGH to full eviction
+        // -- the BIN is removed and its node bytes are credited -- instead of
+        // being unconditionally put back.
+        //
+        // Mock evictor has no tree, so strip_lns_from_node returns Some(0):
+        // the BIN is clean (dirty=false), so it is fully evicted.
+        // JE: Evictor.processTarget fall-through (Evictor.java ~2755-2795).
+        //
+        // PRE-FIX (origin/main): this asserted nodes_evicted == 0 and
+        // bytes_evicted == 0 (always put_back).  The unconditional put-back
+        // was the CLN-F2 bug: a BIN node could never be reclaimed under
+        // pressure.
         let (_c, e) = make_evictor(1500, 1000, 10);
         for i in 1..=3u64 {
             e.note_ins_added(i, CacheMode::Default);
@@ -1674,16 +1721,50 @@ mod tests {
             &static_info_fn(false, true, true, 0),
             &size_512,
         );
-        assert_eq!(r.nodes_evicted, 0);
-        // bytes_evicted is 0 in this no-tree mock; pre-H-9 it was 3*512
-        // because the evictor counted node_size_fn without freeing.
-        assert_eq!(r.bytes_evicted, 0);
+        assert_eq!(
+            r.nodes_evicted, 3,
+            "CLN-F2: clean BIN with nothing to strip must be FULLY evicted"
+        );
+        assert_eq!(
+            r.bytes_evicted,
+            3 * 512,
+            "CLN-F2: full BIN eviction credits node_size_fn bytes"
+        );
         let s = e.get_stats();
-        // nodes_stripped is also 0 because strip_lns_from_node returned 0
-        // (no tree).  The path was exercised; the increment is gated on
-        // freed > 0.
+        assert_eq!(s.get(&s.nodes_evicted), 3);
+        // nodes_stripped stays 0: strip freed 0 bytes (no tree wired).
         assert_eq!(s.get(&s.nodes_stripped), 0);
-        assert_eq!(e.get_lru_sizes().0, 3);
+        // The BINs are gone from the primary LRU, not put back.
+        assert_eq!(e.get_lru_sizes().0, 0);
+    }
+
+    /// CLN-F2: a DIRTY BIN with nothing to strip must NOT be fully evicted by
+    /// the normal path -- it gets a second chance in the pri2 dirty-LRU when
+    /// `use_dirty_lru` is enabled (JE processTarget ~2762-2768).
+    #[test]
+    fn test_evict_batch_partial_evict_dirty_bin_moves_to_pri2() {
+        let counter = Arc::new(AtomicI64::new(1500));
+        // lru_only=false -> use_dirty_lru defaults to true.
+        let e = Evictor::new(
+            Arbiter::new(1000, Arc::clone(&counter), 100, 200),
+            3,
+            false,
+        );
+        for i in 1..=3u64 {
+            e.note_ins_added(i, CacheMode::Default);
+        }
+        let r = e.evict_batch(
+            EvictionSource::Daemon,
+            &static_info_fn(true, true, true, 0), // dirty BIN
+            &size_512,
+        );
+        assert_eq!(
+            r.nodes_evicted, 0,
+            "CLN-F2: dirty BIN must not be fully evicted on the first chance"
+        );
+        let s = e.get_stats();
+        assert_eq!(s.get(&s.nodes_moved_to_pri2_lru), 3);
+        assert_eq!(e.get_lru_sizes(), (0, 3));
     }
 
     #[test]

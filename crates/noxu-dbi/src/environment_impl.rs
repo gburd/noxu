@@ -665,6 +665,12 @@ impl EnvironmentImpl {
             // X-7: wire the shared db-tree registry so the cleaner
             // dispatches secondary-LN liveness checks to the correct tree.
             .with_tree_registry(Arc::clone(&db_trees_registry));
+            // CLN-F1: wire the minFileUtilization second-tier threshold so the
+            // faithful getBestFile decision can clean a single below-threshold
+            // file even when the aggregate gate passes.
+            c = c.with_min_file_utilization(
+                cfg.cleaner_min_file_utilization as u32,
+            );
             // Wire the live UtilizationTracker so that do_clean can build
             // the merged fileSummaryMap autonomously without needing manual
             // add_file_to_clean calls.

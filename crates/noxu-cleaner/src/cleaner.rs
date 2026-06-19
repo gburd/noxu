@@ -146,6 +146,13 @@ pub struct Cleaner {
     /// Files below this utilization are candidates for cleaning.
     min_utilization: u32,
 
+    /// CLN-F1: minFileUtilization second-tier threshold (0-50%).
+    ///
+    /// JE `EnvironmentParams.CLEANER_MIN_FILE_UTILIZATION`: when the aggregate
+    /// gate (`predictedMinUtil < minUtilization`) fails, a single file whose
+    /// max-gradual utilization is below this value is still cleaned.
+    min_file_utilization: u32,
+
     /// Minimum file count before cleaning starts.
     ///
     /// The cleaner won't run until at least this many files exist.
@@ -310,6 +317,7 @@ impl Cleaner {
             running: AtomicBool::new(false),
             shutdown: Arc::new(AtomicBool::new(false)),
             min_utilization: min_utilization.min(100),
+            min_file_utilization: 5,
             min_file_count,
             min_age,
             n_runs: AtomicU64::new(0),
@@ -352,6 +360,7 @@ impl Cleaner {
             running: AtomicBool::new(false),
             shutdown: Arc::new(AtomicBool::new(false)),
             min_utilization: min_utilization.min(100),
+            min_file_utilization: 5,
             min_file_count,
             min_age,
             n_runs: AtomicU64::new(0),
@@ -404,6 +413,7 @@ impl Cleaner {
             running: AtomicBool::new(false),
             shutdown: Arc::new(AtomicBool::new(false)),
             min_utilization: min_utilization.min(100),
+            min_file_utilization: 5,
             min_file_count,
             min_age,
             n_runs: AtomicU64::new(0),
@@ -451,6 +461,7 @@ impl Cleaner {
             running: AtomicBool::new(false),
             shutdown: Arc::new(AtomicBool::new(false)),
             min_utilization: min_utilization.min(100),
+            min_file_utilization: 5,
             min_file_count,
             min_age,
             n_runs: AtomicU64::new(0),
@@ -511,6 +522,14 @@ impl Cleaner {
     /// `threshold` of 0 resolves to `minUtilization - 5` at gate time.
     pub fn with_two_pass_params(self, gap: i32, threshold: i32) -> Self {
         self.file_selector.lock().set_two_pass_params(gap, threshold);
+        self
+    }
+
+    /// CLN-F1: set the `minFileUtilization` second-tier threshold (0-50%).
+    ///
+    /// JE `EnvironmentParams.CLEANER_MIN_FILE_UTILIZATION` (default 5%).
+    pub fn with_min_file_utilization(mut self, pct: u32) -> Self {
+        self.min_file_utilization = pct.min(50);
         self
     }
 
@@ -701,6 +720,7 @@ impl Cleaner {
                     self.min_age as u32,
                     force,
                     first_active_txn_file,
+                    self.min_file_utilization as i32,
                 ) {
                     None => break, // no more files
                     Some(pair) => pair,
@@ -2558,6 +2578,7 @@ mod tests {
             0,  // min_age
             false,
             Some(3), // first_active_txn_file
+            5,       // min_file_utilization_pct
         );
         // Should select a file <= 3.
         assert!(

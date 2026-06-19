@@ -130,6 +130,64 @@ listed in [References](#references).
   steal, falling back to a normal wait (JE's `continue`, LockManager.java:556).
   `LockImpl::steal_lock` gained a `steal_lock_preemptable` variant honoring
   `getPreemptable()` (LockImpl.java:543).
+### Fixed (cleaner — faithful multi-tier file selection, CLN-F1)
+
+- **File selection now applies the utilization threshold as JE's AGGREGATE
+  multi-tier gate instead of a per-file exclusion** (`noxu-cleaner`
+  `file_selector.rs`). The production `select_file_for_cleaning` previously
+  collapsed `UtilizationCalculator.getBestFile`'s decision into a per-file
+  filter (`avg_util >= min_utilization -> skip`), and dropped
+  `cleaner_min_file_utilization` on the floor. This caused both under-cleaning
+  (the aggregate was below threshold but the best file's own util was above it,
+  so it was skipped and the log grew) and over-cleaning (any sub-threshold file
+  was cleaned even when the aggregate said cleaning was not warranted). The
+  candidate loop now tracks the lowest-avg `bestFile` and lowest-max-gradual
+  `bestGradualFile` over ALL eligible files with no per-file exclusion, and the
+  decision is JE-faithful: tier 1 `predictedMinUtil < minUtilization ->
+  bestFile`; tier 2 `bestGradualFileMaxUtil < minFileUtilization ->
+  bestGradualFile`; tier 4 forced -> bestFile (UtilizationCalculator.java
+  ~344-425). `compute_predicted_min_util` now returns the true AGGREGATE
+  utilization (summed obsolete / summed total, honouring in-progress files)
+  rather than the per-file minimum (FileSummary.java:292). `cleaner_min_file_
+  utilization` is wired end-to-end (config -> `Cleaner::with_min_file_
+  utilization` -> selection second tier). Reproduction tests:
+  `test_clnf1_aggregate_below_threshold_selects_high_util_best_file` (was
+  skipped pre-fix) and `test_clnf1_aggregate_above_threshold_cleans_nothing`
+  (over-cleaned pre-fix).
+
+### Fixed (evictor — BIN nodes can now be fully evicted, CLN-F2)
+
+- **A clean, unpinned, cursor-free BIN whose LN strip frees 0 bytes now falls
+  through to full eviction** (`noxu-evictor` `evictor.rs`). The `PartialEvict`
+  decision was terminal: `evict_batch` always put the BIN back, so a BIN node's
+  heap could never be reclaimed and the tree's structural footprint could not
+  shrink under pressure. The arm now mirrors `Evictor.processTarget`
+  (Evictor.java ~2712-2795): if partial eviction frees bytes -> strippedPutBack;
+  if it frees 0 bytes -> give a dirty BIN a second chance in the pri2 dirty-LRU,
+  otherwise FULLY evict it (credit `node_size_fn` + `nodes_evicted`). The
+  existing pin/cursor/dirty guards are preserved (`strip_lns_from_node` returns
+  `None` for a pinned or cursor-referenced BIN -> put back). Reproduction:
+  `test_evict_batch_partial_evict_path` now asserts full eviction (was always
+  put-back) plus `test_evict_batch_partial_evict_dirty_bin_moves_to_pri2`.
+
+### Fixed (cleaner — obsolete-LN size guard, CLN-F3)
+
+- **`UtilizationTracker::track_obsolete` only accumulates the LN size and
+  counted tally when `size > 0`** (`noxu-cleaner` `utilization_tracker.rs`),
+  matching `BaseUtilizationTracker.countObsoleteNode` (~184-189: "the size is
+  optional when tracking obsolete LNs"). Previously both incremented
+  unconditionally, which would corrupt the average-LN-size estimator if ever
+  called with `size <= 0` (latent: the sole production caller passes a real
+  size). Test: `test_track_obsolete_ln_size_zero_does_not_count_size`.
+
+### Removed (cleaner — dead reinvented heuristic, CLN-F6)
+
+- **Deleted `FileSelector::check_for_required_util`** and its test-only callers
+  (`noxu-cleaner`). It was a previously-flagged reinvented "required-util
+  shortfall" heuristic (`new_req = actual + (actual - target)`) with no
+  production caller — the faithful two-pass path is `Cleaner::two_pass_check` +
+  `FileSelector::remove_file_from_cleaning`. Removed to prevent future
+  mis-wiring.
 
 ## [6.0.0] - 2026-06-19
 
