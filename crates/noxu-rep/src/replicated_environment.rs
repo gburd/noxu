@@ -1467,7 +1467,32 @@ impl ReplicatedEnvironment {
                 .insert(replica_name.clone(), Arc::clone(&queue));
         }
 
-        let runner = Arc::new(FeederRunner::new(Arc::clone(&channel), 1));
+        // REP-9 Part 1: wire an ack sink so the FeederRunner forwards every
+        // inbound replica ack to `env.record_ack(vlsn, replica_name)`, which
+        // reaches BOTH the AckTracker (commit-blocking quorum) and the
+        // matching `Feeder::acked_vlsn` (DTVLSN ranking).  Without this the
+        // ack reached only the runner's private `known_replica_vlsn`.  The
+        // sink holds a `Weak<Self>` so it never extends the env's lifetime;
+        // if `self_weak` was never initialised we fall back to the plain
+        // (sink-less) runner — `record_ack` is still reachable from tests.
+        let runner = match self.self_weak.get().and_then(Weak::upgrade) {
+            Some(env_arc) => {
+                let weak = Arc::downgrade(&env_arc);
+                let sink: crate::stream::feeder::AckSink =
+                    Arc::new(move |name: &str, vlsn: u64| {
+                        if let Some(env) = weak.upgrade() {
+                            env.record_ack(vlsn, name);
+                        }
+                    });
+                Arc::new(FeederRunner::new_with_ack_sink(
+                    Arc::clone(&channel),
+                    1,
+                    replica_name.clone(),
+                    sink,
+                ))
+            }
+            None => Arc::new(FeederRunner::new(Arc::clone(&channel), 1)),
+        };
         let runner_clone = Arc::clone(&runner);
         let replica_clone = replica_name.clone();
 
@@ -2198,8 +2223,27 @@ impl ReplicatedEnvironment {
         if qualifies {
             self.ack_tracker.record_ack(vlsn, replica_name);
         }
+        // REP-9 Part 1: advance the matching `Feeder::acked_vlsn` high-water
+        // mark (read by `update_dtvlsn_from_feeders` and exposed via
+        // `get_acked_vlsn`).  The production `FeederRunner` previously updated
+        // only its private `known_replica_vlsn`, so the DTVLSN ranking never
+        // saw production progress (JE `Feeder.getReplicaTxnEndVLSN`).  We
+        // record the high-water for *any* replica (electable or not); the
+        // electable filter is reapplied when DTVLSN/quorum is computed.
+        for feeder in self.feeders.read().iter() {
+            if feeder.get_replica_name() == replica_name {
+                feeder.record_ack(vlsn);
+                break;
+            }
+        }
         // Recompute the DTVLSN from feeder progress whenever an ack lands.
         self.update_dtvlsn_from_feeders();
+        // REP-9: wake any committer parked in `await_replica_acks`. Its
+        // satisfaction predicate is the high-water feeder count, not an
+        // exact-VLSN registration, so we must notify unconditionally (the
+        // AckTracker's own `record_ack` only notifies when the exact VLSN was
+        // registered, which the per-frame feeder acks generally are not).
+        self.ack_tracker.notify_waiters();
     }
 
     /// Returns the current Durable Transaction VLSN (D7, JE RepNode.getDTVLSN).
