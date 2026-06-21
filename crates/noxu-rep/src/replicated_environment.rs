@@ -2121,7 +2121,18 @@ impl ReplicatedEnvironment {
         entry_type: u8,
         data: Vec<u8>,
     ) {
-        self.vlsn_index.register(vlsn, file_number, file_offset);
+        // Register VLSN -> LSN, dispatching entry type so lastSync /
+        // lastTxnEnd advance (REP-5; JE VLSNRange.getUpdateForNewMapping).
+        // An unknown type byte falls back to extend-only registration.
+        match noxu_log::LogEntryType::from_type_num(entry_type) {
+            Some(et) => self.vlsn_index.register_with_type(
+                vlsn,
+                file_number,
+                file_offset,
+                et,
+            ),
+            None => self.vlsn_index.register(vlsn, file_number, file_offset),
+        }
         // Pull path: shared peer_scanner serves replicas connecting via
         // PeerFeederService (catch_up_from_peer).
         self.peer_scanner.push(vlsn, entry_type, data.clone());
@@ -2172,8 +2183,13 @@ impl ReplicatedEnvironment {
             ));
         }
 
-        // Register the VLSN in the index.
-        self.vlsn_index.register(vlsn, 0, 0);
+        // Register the VLSN in the index, dispatching entry type so
+        // lastSync/lastTxnEnd advance (REP-5; JE
+        // VLSNRange.getUpdateForNewMapping).
+        match noxu_log::LogEntryType::from_type_num(entry_type) {
+            Some(et) => self.vlsn_index.register_with_type(vlsn, 0, 0, et),
+            None => self.vlsn_index.register(vlsn, 0, 0),
+        }
 
         // Push into the peer log scanner so downstream replicas can
         // receive this entry via the PEER_FEEDER service.
@@ -2781,10 +2797,13 @@ impl ReplicaAckCoordinator for ReplicatedEnvironment {
             return 0;
         }
         let next_vlsn = self.vlsn_index.get_latest_vlsn() + 1;
-        self.vlsn_index.register(
+        // A recovered XA commit is a commit log entry; dispatch as TxnCommit
+        // so lastTxnEnd/lastSync advance (REP-5).
+        self.vlsn_index.register_with_type(
             next_vlsn,
             lsn.file_number(),
             lsn.file_offset(),
+            noxu_log::LogEntryType::TxnCommit,
         );
         log::debug!(
             "alloc_vlsn_for_recovered_commit: allocated vlsn={} for lsn={:?}",
@@ -2819,10 +2838,13 @@ impl ReplicaAckCoordinator for ReplicatedEnvironment {
         if vlsn == 0 || !self.is_master() {
             return;
         }
-        self.vlsn_index.register(
+        // The pre-allocated VLSN is for a TxnCommit WAL entry; dispatch the
+        // type so lastTxnEnd/lastSync advance (REP-5).
+        self.vlsn_index.register_with_type(
             vlsn,
             commit_lsn.file_number(),
             commit_lsn.file_offset(),
+            noxu_log::LogEntryType::TxnCommit,
         );
         log::debug!(
             "register_recovered_commit_vlsn: registered vlsn={} for commit_lsn={:?}",
