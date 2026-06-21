@@ -12,6 +12,15 @@ pub enum EnvironmentFailureReason {
     EnvNotFound,
     /// Log file checksum error.
     LogChecksum,
+    /// A committed transaction was found after a corrupted log entry.
+    ///
+    /// Recovery has been stopped; the user may need to truncate the log
+    /// (e.g. via a `DbTruncateLog`-style tool). Some valid data may be lost
+    /// if the log is truncated for recovery. Invalidates the environment.
+    ///
+    /// Faithful to JE `EnvironmentFailureReason.FOUND_COMMITTED_TXN`
+    /// (EnvironmentFailureReason.java:29, [#18307]).
+    FoundCommittedTxn,
     /// Log file not found.
     LogFileNotFound,
     /// Error reading log file.
@@ -80,6 +89,11 @@ impl std::fmt::Display for EnvironmentFailureReason {
                 "environment directory not found"
             }
             EnvironmentFailureReason::LogChecksum => "log file checksum error",
+            EnvironmentFailureReason::FoundCommittedTxn => {
+                "a committed transaction was found after a corrupted log \
+                 entry; recovery stopped (the log may need truncation, some \
+                 valid data may be lost)"
+            }
             EnvironmentFailureReason::LogFileNotFound => "log file not found",
             EnvironmentFailureReason::LogRead => "error reading log file",
             EnvironmentFailureReason::LogWrite => "error writing log file",
@@ -196,6 +210,7 @@ mod tests {
             EnvironmentFailureReason::EnvLocked,
             EnvironmentFailureReason::EnvNotFound,
             EnvironmentFailureReason::LogChecksum,
+            EnvironmentFailureReason::FoundCommittedTxn,
             EnvironmentFailureReason::LogFileNotFound,
             EnvironmentFailureReason::LogRead,
             EnvironmentFailureReason::LogWrite,

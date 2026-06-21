@@ -16,6 +16,33 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Fixed (recovery / log integrity — L-14)
+
+- **L-14: refuse to silently truncate the log when a committed transaction
+  exists AFTER a mid-file corruption point.**  Previously, every checksum
+  failure during end-of-log discovery was treated as a benign torn-tail
+  write and the log was silently truncated at the first bad entry — even
+  when durable, committed data existed beyond the corruption (real media
+  corruption).  The `noxu.haltOnCommitAfterChecksumException`
+  (`HALT_ON_COMMIT_AFTER_CHECKSUMEXCEPTION`) param existed but was inert.
+  Now, when the param is enabled, a checksum failure triggers a forward
+  scan past the corruption for a `TxnCommit` entry; if one is found,
+  recovery REFUSES to mount the truncated log and surfaces the fatal
+  `EnvironmentFailureReason::FoundCommittedTxn` (newly added; the
+  environment is invalidated).  The common case (torn tail with no committed
+  txn after the corruption) keeps the truncate-and-continue behavior.  The
+  no-truncate guard also ensures the committed data is not physically
+  destroyed when the halt fires.  Faithful to JE
+  `LastFileReader.readNextEntry`/`findCommittedTxn`
+  (`LastFileReader.java`:313/394, [#18307]) and
+  `EnvironmentFailureReason.FOUND_COMMITTED_TXN`
+  (`EnvironmentFailureReason.java`:29).  Implemented in both
+  `noxu-log::last_file_reader` (the JE-shaped reader) and the production
+  recovery path `noxu-dbi::file_manager_scanner::find_end_of_log`; the param
+  is wired from `EnvironmentConfig` through `DbiConfig` into the scanner.
+  New internal API: `NoxuLogError::FoundCommittedTxn` and
+  `EnvironmentFailureReason::FoundCommittedTxn` (non-breaking adds).
+
 ## [6.1.0] - 2026-06-19
 
 ### Fixed (evictor — CLN-F2 regression)

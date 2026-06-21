@@ -49,11 +49,52 @@ fn subslice_range(parent: &[u8], child: &[u8]) -> std::ops::Range<usize> {
 /// - `scan_backward` — reverse-order scan (implemented as forward + reverse).
 pub struct FileManagerLogScanner {
     file_manager: Arc<FileManager>,
+
+    /// When true, a checksum failure during `find_end_of_log` triggers a
+    /// forward scan for a `TxnCommit` past the corruption; if one is found,
+    /// `find_end_of_log` HALTS (returns a sentinel that recovery surfaces as
+    /// `EnvironmentFailureReason::FoundCommittedTxn`) instead of silently
+    /// truncating.  Wired from `noxu.haltOnCommitAfterChecksumException`.
+    ///
+    /// Faithful to JE `LastFileReader.readNextEntry`/`findCommittedTxn`
+    /// (LastFileReader.java:313/394, [#18307]).
+    halt_on_commit_after_checksum: bool,
+
+    /// Set by `find_end_of_log` when `halt_on_commit_after_checksum` is on and
+    /// a `TxnCommit` is found past a mid-file corruption point. Holds
+    /// `(corrupt_lsn, commit_lsn)`.
+    found_committed_txn: Option<(Lsn, Lsn)>,
 }
 
 impl FileManagerLogScanner {
     pub fn new(file_manager: Arc<FileManager>) -> Self {
-        Self { file_manager }
+        Self {
+            file_manager,
+            halt_on_commit_after_checksum: false,
+            found_committed_txn: None,
+        }
+    }
+
+    /// Enable halt-on-committed-txn-after-checksum during `find_end_of_log`.
+    ///
+    /// Recovery passes `cfg.halt_on_commit_after_checksum_exception` here.
+    pub fn with_halt_on_commit(mut self, halt: bool) -> Self {
+        self.halt_on_commit_after_checksum = halt;
+        self
+    }
+
+    /// Take the `(corrupt_lsn, commit_lsn)` recorded by `find_end_of_log`
+    /// when a committed txn was found past a mid-file corruption point.
+    ///
+    /// Recovery checks this after `find_end_of_log`/`recover_all` and, if
+    /// `Some`, surfaces a fatal `EnvironmentFailureReason::FoundCommittedTxn`
+    /// instead of accepting the silently-truncated log.
+    ///
+    /// Faithful to JE `LastFileReader.readNextEntry` throwing
+    /// `EnvironmentFailureException(FOUND_COMMITTED_TXN, ...)`
+    /// (LastFileReader.java:313).
+    pub fn take_found_committed_txn(&mut self) -> Option<(Lsn, Lsn)> {
+        self.found_committed_txn.take()
     }
 
     /// Load a log file as a [`Bytes`] buffer for sequential scanning.
@@ -419,6 +460,95 @@ impl FileManagerLogScanner {
         Some((entry_size, log_entry))
     }
 
+    /// [#18307] Scan FORWARD from a mid-file corruption point looking for a
+    /// `TxnCommit` (entry type 30). Faithful to JE
+    /// `LastFileReader.findCommittedTxn` (LastFileReader.java:394).
+    ///
+    /// `corrupt_offset` is the byte offset of the entry whose checksum failed
+    /// (or which was otherwise unparseable). We first SKIP it by its claimed
+    /// header item_size (JE case 2), then keep reading:
+    /// - a CRC-valid `TxnCommit` → return `Some(lsn)` (JE case 5, HALT),
+    /// - a second checksum/parse failure → `None` (JE case 2/3, truncate),
+    /// - clean EOF with no commit → `None` (JE case 4, truncate).
+    fn find_committed_txn_after(
+        file_bytes: &Bytes,
+        corrupt_offset: usize,
+        file_num: u32,
+    ) -> Option<Lsn> {
+        let data: &[u8] = file_bytes;
+
+        // JE: skipData(currentEntryHeader.getItemSize()). Read the corrupt
+        // entry's header to learn its claimed size and step over it. If the
+        // header itself is unreadable, there is nothing to scan → truncate.
+        if corrupt_offset + MIN_HEADER_SIZE > data.len() {
+            return None;
+        }
+        let chdr = &data[corrupt_offset..corrupt_offset + MIN_HEADER_SIZE];
+        let cflags = chdr[5];
+        let citem = u32::from_le_bytes([chdr[10], chdr[11], chdr[12], chdr[13]])
+            as usize;
+        if citem > MAX_SANE_ITEM_SIZE {
+            return None;
+        }
+        let cvlsn = (cflags & 0x08) != 0 || (cflags & 0x20) != 0;
+        let chdr_size = if cvlsn { MAX_HEADER_SIZE } else { MIN_HEADER_SIZE };
+        let mut offset = corrupt_offset + chdr_size + citem;
+
+        // 30 == LogEntryType::TxnCommit.
+        const LOG_TXN_COMMIT: u8 = 30;
+
+        while offset < data.len() {
+            if offset + MIN_HEADER_SIZE > data.len() {
+                return None;
+            }
+            let hdr = &data[offset..offset + MIN_HEADER_SIZE];
+            // Zero-fill tail or unparseable type byte → case 4, truncate.
+            if hdr[4] == 0 {
+                return None;
+            }
+            let entry_type_num = hdr[4];
+            let flags = hdr[5];
+            let item_size =
+                u32::from_le_bytes([hdr[10], hdr[11], hdr[12], hdr[13]])
+                    as usize;
+            if item_size > MAX_SANE_ITEM_SIZE {
+                return None;
+            }
+            let vlsn_present = (flags & 0x08) != 0 || (flags & 0x20) != 0;
+            let header_size =
+                if vlsn_present { MAX_HEADER_SIZE } else { MIN_HEADER_SIZE };
+            let entry_size = header_size + item_size;
+            if offset + entry_size > data.len() {
+                return None;
+            }
+
+            // Validate CRC; a second checksum failure is JE case 2/3 →
+            // truncate at the first corruption.
+            let stored = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+            if stored != 0 {
+                let entry_bytes = &data[offset..offset + entry_size];
+                let computed = ChecksumValidator::compute_range(
+                    entry_bytes,
+                    CHECKSUM_BYTES,
+                    entry_size - CHECKSUM_BYTES,
+                );
+                if computed != stored {
+                    return None;
+                }
+            }
+
+            // Case 5: a CRC-valid committed txn after the corruption.
+            if entry_type_num == LOG_TXN_COMMIT {
+                return Some(Lsn::new(file_num, offset as u32));
+            }
+
+            offset += entry_size;
+        }
+
+        // Case 4: reached EOF without finding a commit.
+        None
+    }
+
     /// Scan forward through all log files collecting `PositionedEntry` items
     /// whose LSN falls in `[start_lsn, end_lsn)`.
     ///
@@ -602,6 +732,36 @@ impl LogScanner for FileManagerLogScanner {
                 }
             }
 
+            // L-14 [#18307]: the scan stopped at `offset` because
+            // parse_entry_from_bytes returned None — either a clean zero-fill
+            // tail (benign) or a CHECKSUM failure / corruption mid-file. The
+            // common case is a benign torn-tail write, and we truncate-and-
+            // continue below. BUT if `haltOnCommitAfterChecksumException` is
+            // set, scan FORWARD past the corruption for a TxnCommit; if one is
+            // found we must REFUSE to silently truncate (real media
+            // corruption with committed data beyond it). We record the LSNs
+            // so recovery surfaces EnvironmentFailureReason::FoundCommittedTxn.
+            //
+            // Faithful to JE LastFileReader.readNextEntry/findCommittedTxn
+            // (LastFileReader.java:313/394).
+            if self.halt_on_commit_after_checksum
+                && offset < file_bytes.len()
+                && self.found_committed_txn.is_none()
+                && let Some(commit_lsn) = Self::find_committed_txn_after(
+                    &file_bytes,
+                    offset,
+                    file_num,
+                )
+            {
+                let corrupt_lsn = Lsn::new(file_num, offset as u32);
+                log::warn!(
+                    "recovery: committed txn at LSN {commit_lsn} found AFTER \
+                     corruption at LSN {corrupt_lsn}; halting recovery \
+                     (haltOnCommitAfterChecksumException enabled)"
+                );
+                self.found_committed_txn = Some((corrupt_lsn, commit_lsn));
+            }
+
             if let Some(valid_offset) = last_valid_offset {
                 let end_offset = valid_offset + last_entry_size;
                 last_used_lsn = Lsn::new(file_num, valid_offset as u32);
@@ -637,10 +797,15 @@ impl LogScanner for FileManagerLogScanner {
                 // higher-numbered orphan files, so a half-written entry cannot
                 // be misread on a later scan and no log-entry gap remains.
                 // Only when there is something to truncate, and only R/W.
+                //
+                // L-14: do NOT truncate if a committed txn was found past the
+                // corruption point — destroying it would lose durable data.
+                // Recovery halts on found_committed_txn instead.
                 let has_torn_tail = end_offset < file_bytes.len();
                 let has_orphan_files =
                     file_nums.last().copied() != Some(file_num);
-                if (has_torn_tail || has_orphan_files)
+                if self.found_committed_txn.is_none()
+                    && (has_torn_tail || has_orphan_files)
                     && !self.file_manager.is_read_only()
                     && let Err(e) = self
                         .file_manager
@@ -1001,5 +1166,145 @@ mod tests {
             !found,
             "corrupted entry must not appear in scan results (C-3 regression)"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // L-14 [#18307]: findCommittedTxn — refuse to silently truncate when a
+    // committed txn exists AFTER a mid-file corruption point.
+    // Faithful to JE LastFileReader.readNextEntry/findCommittedTxn
+    // (LastFileReader.java:313/394).
+    // ------------------------------------------------------------------
+
+    /// Helper: write `n` commit entries, return their LSNs.
+    fn write_commits(lm: &LogManager, txn_ids: &[i64]) -> Vec<Lsn> {
+        let mut lsns = Vec::new();
+        for &txn_id in txn_ids {
+            let e = TxnEndEntry::new_commit(txn_id, NULL_LSN, 0, 0, NULL_VLSN);
+            let mut buf = BytesMut::with_capacity(e.log_size());
+            e.write_to_log(&mut buf);
+            let lsn = lm
+                .log(
+                    LogEntryType::TxnCommit,
+                    &buf,
+                    Provisional::No,
+                    true,
+                    false,
+                )
+                .unwrap();
+            lsns.push(lsn);
+        }
+        lm.flush_sync().unwrap();
+        lsns
+    }
+
+    /// Corrupt one payload byte of the entry at `lsn` on disk.
+    fn corrupt_entry_payload(dir: &std::path::Path, lsn: Lsn) {
+        use noxu_log::entry_header::MIN_HEADER_SIZE;
+        use std::io::{Seek, SeekFrom, Write as _};
+        let path = dir.join(format!("{:08x}.ndb", lsn.file_number()));
+        let mut f =
+            std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let off = lsn.file_offset() as u64 + MIN_HEADER_SIZE as u64 + 1;
+        f.seek(SeekFrom::Start(off)).unwrap();
+        f.write_all(&[0xDE]).unwrap();
+        f.sync_all().unwrap();
+    }
+
+    /// Layout: [commit][CORRUPT commit][commit]. With halt_on_commit ENABLED,
+    /// find_end_of_log must scan forward past the corruption, find the trailing
+    /// committed txn, record found_committed_txn, and NOT physically truncate.
+    ///
+    /// FAILS pre-fix (silently truncates; found_committed_txn is None).
+    #[test]
+    fn test_l14_halts_on_committed_txn_after_corruption() {
+        let dir = TempDir::new().unwrap();
+        let (fm, lm) = make_manager(dir.path());
+        let lsns = write_commits(&lm, &[1, 2, 3]);
+        drop(lm);
+
+        let valid_len_before = fm.get_file_length(0).unwrap();
+
+        // Corrupt the MIDDLE entry (committed txns follow it).
+        corrupt_entry_payload(dir.path(), lsns[1]);
+
+        let mut scanner = FileManagerLogScanner::new(Arc::clone(&fm))
+            .with_halt_on_commit(true);
+        let _ = scanner.find_end_of_log();
+
+        let found = scanner.take_found_committed_txn();
+        assert!(
+            found.is_some(),
+            "L-14: a committed txn after mid-file corruption must be detected"
+        );
+        let (corrupt_lsn, commit_lsn) = found.unwrap();
+        assert_eq!(corrupt_lsn, lsns[1], "corruption point is the 2nd entry");
+        assert_eq!(commit_lsn, lsns[2], "committed txn is the 3rd entry");
+
+        // Must NOT have truncated the file (would lose the committed data).
+        assert_eq!(
+            fm.get_file_length(0).unwrap(),
+            valid_len_before,
+            "L-14: must not truncate when a committed txn follows corruption"
+        );
+    }
+
+    /// With halt_on_commit DISABLED (default), the same corruption keeps the
+    /// common-case truncate-and-continue behavior: no detection, file is
+    /// truncated at the first valid entry.
+    #[test]
+    fn test_l14_disabled_truncates_as_before() {
+        let dir = TempDir::new().unwrap();
+        let (fm, lm) = make_manager(dir.path());
+        let lsns = write_commits(&lm, &[1, 2, 3]);
+        drop(lm);
+
+        corrupt_entry_payload(dir.path(), lsns[1]);
+
+        // Default scanner (halt disabled).
+        let mut scanner = FileManagerLogScanner::new(Arc::clone(&fm));
+        let _ = scanner.find_end_of_log();
+
+        assert!(
+            scanner.take_found_committed_txn().is_none(),
+            "halt disabled: no found_committed_txn"
+        );
+        // The torn-tail truncate keeps only the first valid entry.
+        assert_eq!(
+            fm.get_file_length(0).unwrap(),
+            lsns[1].file_offset() as u64,
+            "halt disabled: file truncated at first corruption"
+        );
+    }
+
+    /// Common case (JE case 4): corruption at the tail with NO committed txn
+    /// after it. Even with halt enabled, truncate-and-continue applies.
+    #[test]
+    fn test_l14_torn_tail_no_commit_does_not_halt() {
+        use std::io::Write;
+        let dir = TempDir::new().unwrap();
+        let (fm, lm) = make_manager(dir.path());
+        let lsns = write_commits(&lm, &[1]);
+        drop(lm);
+        let valid_len = lsns[0].file_offset() as u64
+            + (fm.get_file_length(0).unwrap() - lsns[0].file_offset() as u64);
+        // Append non-zero garbage (a torn tail, no commit after it).
+        {
+            let path = dir.path().join("00000000.ndb");
+            let mut f =
+                std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(&[0xABu8; 64]).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        let mut scanner = FileManagerLogScanner::new(Arc::clone(&fm))
+            .with_halt_on_commit(true);
+        let _ = scanner.find_end_of_log();
+
+        assert!(
+            scanner.take_found_committed_txn().is_none(),
+            "torn tail with no commit after: must not halt"
+        );
+        // Garbage is truncated.
+        assert_eq!(fm.get_file_length(0).unwrap(), valid_len);
     }
 }

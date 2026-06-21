@@ -725,6 +725,41 @@ impl<F: LogFileAccess> FileReader<F> {
             .map(|h| h.replicated)
             .unwrap_or(false)
     }
+
+    /// Get the file-relative offset of the next entry to read (forward mode).
+    ///
+    /// After a successful read this points just past the entry that was
+    /// returned; after a checksum failure it points just past the corrupt
+    /// entry (header + claimed item_size).  Used by
+    /// `LastFileReader::find_committed_txn` to skip the bad entry.
+    pub fn next_entry_offset(&self) -> u64 {
+        self.next_entry_offset
+    }
+
+    /// Get the item (payload) size of the current entry header, if any.
+    ///
+    /// Mirrors JE `currentEntryHeader.getItemSize()`.
+    pub fn current_item_size(&self) -> usize {
+        self.current_entry_header.as_ref().map(|h| h.item_size).unwrap_or(0)
+    }
+
+    /// Resume scanning at `offset` within the current file after a checksum
+    /// failure, clearing the end-of-log flag.
+    ///
+    /// JE's `findCommittedTxn` calls `skipData(itemSize)` (FileReader.java:805)
+    /// to step over the corrupt entry, then keeps calling
+    /// `readNextEntryAllowExceptions`.  In this reader the corrupt entry's
+    /// header was already parsed (so `next_entry_offset` points past it), but
+    /// the payload was never consumed and `eof` was set.  Re-seek the buffer
+    /// to `offset` and clear `eof` so forward scanning can continue.
+    pub fn resume_forward_at(&mut self, offset: u64) -> Result<()> {
+        assert!(self.forward, "resume_forward_at is forward-mode only");
+        self.eof = false;
+        self.next_entry_offset = offset;
+        self.current_entry_offset = offset;
+        // Re-fill the read buffer starting at `offset`.
+        self.fill_buffer_at(offset)
+    }
 }
 
 #[cfg(test)]

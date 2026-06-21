@@ -33,6 +33,15 @@ pub struct LastFileReader<F: LogFileAccess> {
 
     /// File number being scanned
     file_num: u32,
+
+    /// If true, on a checksum error during end-of-log discovery, scan forward
+    /// for a committed transaction and HALT (via
+    /// [`NoxuLogError::FoundCommittedTxn`]) instead of silently truncating.
+    ///
+    /// Mirrors JE's `HALT_ON_COMMIT_AFTER_CHECKSUMEXCEPTION`
+    /// (`noxu.haltOnCommitAfterChecksumException`); recovery reads the config
+    /// param and calls [`LastFileReader::set_halt_on_commit_after_checksum`].
+    halt_on_commit_after_checksum: bool,
 }
 
 impl<F: LogFileAccess> LastFileReader<F> {
@@ -68,6 +77,7 @@ impl<F: LogFileAccess> LastFileReader<F> {
             last_valid_offset: 0,
             last_entry_type: 0,
             file_num,
+            halt_on_commit_after_checksum: false,
         })
     }
 
@@ -118,6 +128,23 @@ impl<F: LogFileAccess> LastFileReader<F> {
     /// When entries of this type are encountered, their LSN will be recorded.
     pub fn set_target_type(&mut self, entry_type: u8) {
         self.trackable_entries.insert(entry_type);
+    }
+
+    /// Enable/disable halt-on-committed-txn-after-checksum behavior.
+    ///
+    /// Recovery wires this from the config param
+    /// `noxu.haltOnCommitAfterChecksumException`
+    /// (`HALT_ON_COMMIT_AFTER_CHECKSUMEXCEPTION`). When enabled, a checksum
+    /// failure during end-of-log discovery triggers a forward scan for a
+    /// `TxnCommit` entry; if one is found, [`read_next_entry`] returns the
+    /// fatal [`NoxuLogError::FoundCommittedTxn`] rather than silently
+    /// truncating.
+    ///
+    /// Faithful to JE `LastFileReader.readNextEntry` (LastFileReader.java:313).
+    ///
+    /// [`read_next_entry`]: LastFileReader::read_next_entry
+    pub fn set_halt_on_commit_after_checksum(&mut self, halt: bool) {
+        self.halt_on_commit_after_checksum = halt;
     }
 
     /// Get the last LSN seen for a tracked entry type.
@@ -195,11 +222,42 @@ impl<F: LogFileAccess> LastFileReader<F> {
                     Ok(false)
                 }
             }
-            Err(NoxuLogError::Checksum { lsn: _, .. }) => {
-                // Checksum error - this is expected at end of log
-                // The last_valid_offset points to the last good entry
-                // next_unproven_offset points to the bad entry
-                // Stop reading and report false
+            Err(NoxuLogError::Checksum { lsn, .. }) => {
+                // Checksum error during end-of-log discovery.
+                //
+                // The COMMON case is a benign torn-tail write: the last good
+                // entry is at `last_valid_offset`, the corrupt entry at
+                // `next_unproven_offset`, and we truncate-and-continue
+                // (return Ok(false)).
+                //
+                // BUT if `haltOnCommitAfterChecksumException` is set, this may
+                // be REAL media corruption mid-file with committed data
+                // BEYOND it.  Scan forward for a TxnCommit; if found, REFUSE
+                // to silently truncate — surface the fatal FoundCommittedTxn
+                // error so recovery can invalidate the env instead of
+                // discarding durable, committed data.
+                //
+                // Faithful to JE LastFileReader.readNextEntry
+                // (LastFileReader.java:313): on ChecksumException, when
+                // HALT_ON_COMMIT_AFTER_CHECKSUMEXCEPTION is set, call
+                // findCommittedTxn() and, if it returns true, throw
+                // EnvironmentFailureException(FOUND_COMMITTED_TXN, ...).
+                let corrupt_lsn = lsn;
+                if self.halt_on_commit_after_checksum {
+                    log::warn!(
+                        "LastFileReader: checksum failure at LSN {corrupt_lsn} \
+                         during end-of-log scan; haltOnCommit enabled, \
+                         scanning forward for committed txn"
+                    );
+                    if let Some(commit_lsn) = self.find_committed_txn()? {
+                        return Err(NoxuLogError::FoundCommittedTxn {
+                            corrupt_lsn,
+                            commit_lsn,
+                        });
+                    }
+                }
+                // Common case (torn tail, no committed txn after corruption):
+                // truncate-and-continue.
                 Ok(false)
             }
             Err(e) => {
@@ -208,14 +266,101 @@ impl<F: LogFileAccess> LastFileReader<F> {
             }
         }
     }
+
+    /// [#18307] Find a committed transaction AFTER the corrupted log entry.
+    ///
+    /// Returns `Some(commit_lsn)` if a `TxnCommit` entry is found beyond the
+    /// corruption point with no intervening checksum failure; `None`
+    /// otherwise (the common torn-tail case, where the caller truncates).
+    ///
+    /// Faithful to JE `LastFileReader.findCommittedTxn`
+    /// (LastFileReader.java:394). The JE cases:
+    /// - Case 2/3: skip the bad entry by its claimed item_size; if the NEXT
+    ///   read also hits a checksum error, return `None` (truncate at the
+    ///   first corruption).
+    /// - Case 4: scan to EOF, see no commit → return `None` (truncate).
+    /// - Case 5: see a `TxnCommit` → return `Some(lsn)` (caller HALTS).
+    fn find_committed_txn(&mut self) -> Result<Option<Lsn>> {
+        // JE: skipData(currentEntryHeader.getItemSize()). The corrupt entry's
+        // header was parsed before the checksum failed, so the reader's
+        // `next_entry_offset` already points just past it (header + claimed
+        // item_size). Resume forward scanning there, clearing the EOF flag
+        // that the checksum failure set.
+        let resume_offset = self.reader.next_entry_offset();
+        // Re-seek and clear eof. A failure to re-seek (e.g. past end of file)
+        // is treated as "nothing after the corruption" → truncate.
+        if self.reader.resume_forward_at(resume_offset).is_err() {
+            return Ok(None);
+        }
+
+        // 30 == LogEntryType::TxnCommit (entry_type.rs).
+        const LOG_TXN_COMMIT: u8 = 30;
+
+        loop {
+            match self.reader.read_next_entry() {
+                Ok(true) => {
+                    // Case 5: a committed txn after the corruption.
+                    if let Some(header) = self.reader.get_current_entry_header()
+                        && header.entry_type == LOG_TXN_COMMIT
+                    {
+                        return Ok(Some(self.reader.get_current_entry_lsn()));
+                    }
+                }
+                // Case 4: clean EOF, no commit found → truncate.
+                Ok(false) => return Ok(None),
+                // Case 2/3: a second checksum failure → truncate at the first
+                // corruption point.
+                Err(NoxuLogError::Checksum { .. })
+                | Err(NoxuLogError::UnexpectedEof { .. }) => {
+                    return Ok(None);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checksum::ChecksumValidator;
+    use crate::entry_header::CHECKSUM_BYTES;
+    use crate::file_reader::LogEntryHeader as FrHeader;
     use crate::file_reader::LogFileAccess;
     use std::collections::HashMap;
     use std::io;
+
+    /// Build a raw 14-byte-header entry with a correct CRC32 checksum.
+    ///
+    /// Mirrors what the LogManager writes; checksum covers
+    /// `[CHECKSUM_BYTES .. header_size + payload.len()]`.
+    fn build_valid_entry(entry_type: u8, payload: &[u8]) -> Vec<u8> {
+        let header_size = FrHeader::MIN_HEADER_SIZE;
+        let total = header_size + payload.len();
+        let mut buf = vec![0u8; total];
+        buf[4] = entry_type;
+        buf[5] = 0; // flags: no VLSN
+        buf[10..14].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        buf[header_size..].copy_from_slice(payload);
+        let crc = ChecksumValidator::compute_range(
+            &buf,
+            CHECKSUM_BYTES,
+            total - CHECKSUM_BYTES,
+        );
+        buf[0..4].copy_from_slice(&crc.to_le_bytes());
+        buf
+    }
+
+    /// Build an entry with a deliberately WRONG checksum (simulated media
+    /// corruption mid-file). The header item_size is correct so a reader can
+    /// skip past it by item_size.
+    fn build_corrupt_entry(entry_type: u8, payload: &[u8]) -> Vec<u8> {
+        let mut buf = build_valid_entry(entry_type, payload);
+        // Corrupt the payload so the stored checksum no longer matches.
+        let last = buf.len() - 1;
+        buf[last] ^= 0xFF;
+        buf
+    }
 
     /// Mock file access for testing.
     struct MockFileAccess {
@@ -449,5 +594,82 @@ mod tests {
         let result = reader.read_next_entry();
         // After exhausting the file, should return Ok(false) or an error
         assert!(matches!(result, Ok(false)) || result.is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // L-14: findCommittedTxn — refuse to silently truncate when a committed
+    // txn exists AFTER a mid-file corruption point.
+    // Faithful to JE LastFileReader.readNextEntry/findCommittedTxn
+    // (LastFileReader.java:313/394, [#18307]).
+    // ------------------------------------------------------------------
+
+    /// Layout: [valid type-0 entry][CORRUPT entry][valid TxnCommit (type 30)].
+    /// With halt_on_commit enabled, scanning to the corruption point must
+    /// scan FORWARD, find the committed txn, and return the FATAL
+    /// FoundCommittedTxn error rather than silently truncating.
+    ///
+    /// FAILS pre-fix (returns Ok(false), silently truncating).
+    #[test]
+    fn test_l14_found_committed_txn_after_corruption_halts() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&build_valid_entry(0, b"good"));
+        data.extend_from_slice(&build_corrupt_entry(0, b"bad!"));
+        // 30 == LogEntryType::TxnCommit
+        data.extend_from_slice(&build_valid_entry(30, b"commit"));
+
+        let mut mock = MockFileAccess::new();
+        mock.add_file(0, data);
+        let mut reader = LastFileReader::new(mock, 256).unwrap();
+        reader.set_halt_on_commit_after_checksum(true);
+
+        // First entry reads fine.
+        assert!(matches!(reader.read_next_entry(), Ok(true)));
+        // Second entry is corrupt; findCommittedTxn scans forward, finds the
+        // TxnCommit, and surfaces the fatal error.
+        let result = reader.read_next_entry();
+        assert!(
+            matches!(result, Err(NoxuLogError::FoundCommittedTxn { .. })),
+            "expected FoundCommittedTxn, got {result:?}"
+        );
+    }
+
+    /// Common case (JE case 4): corruption at the tail with NO committed txn
+    /// after it. Even with halt_on_commit enabled, this must keep the
+    /// truncate-and-continue behavior (return Ok(false)).
+    #[test]
+    fn test_l14_torn_tail_no_commit_truncates_when_enabled() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&build_valid_entry(0, b"good"));
+        data.extend_from_slice(&build_corrupt_entry(0, b"bad!"));
+        // After the corruption: only non-commit entries (type 0).
+        data.extend_from_slice(&build_valid_entry(0, b"more"));
+
+        let mut mock = MockFileAccess::new();
+        mock.add_file(0, data);
+        let mut reader = LastFileReader::new(mock, 256).unwrap();
+        reader.set_halt_on_commit_after_checksum(true);
+
+        assert!(matches!(reader.read_next_entry(), Ok(true)));
+        // No commit after the corruption: truncate-and-continue (Ok(false)).
+        assert!(matches!(reader.read_next_entry(), Ok(false)));
+    }
+
+    /// With halt_on_commit DISABLED (the default), a committed txn after the
+    /// corruption is IGNORED and the common-case torn-tail truncate applies.
+    #[test]
+    fn test_l14_disabled_keeps_truncate_even_with_commit_after() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&build_valid_entry(0, b"good"));
+        data.extend_from_slice(&build_corrupt_entry(0, b"bad!"));
+        data.extend_from_slice(&build_valid_entry(30, b"commit"));
+
+        let mut mock = MockFileAccess::new();
+        mock.add_file(0, data);
+        let mut reader = LastFileReader::new(mock, 256).unwrap();
+        // halt_on_commit defaults to false; do not enable it.
+
+        assert!(matches!(reader.read_next_entry(), Ok(true)));
+        // Param disabled: truncate-and-continue (Ok(false)), no scan-forward.
+        assert!(matches!(reader.read_next_entry(), Ok(false)));
     }
 }

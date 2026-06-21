@@ -436,7 +436,10 @@ impl EnvironmentImpl {
             // DbTree.dbIdToDb (a Map<DatabaseId, DatabaseImpl>) during the analysis
             // phase, then RecoveryManager.recoverDatabases() hands the recovered
             // DbTree to each DatabaseImpl.
-            let mut scanner = FileManagerLogScanner::new(Arc::clone(&fm));
+            let mut scanner = FileManagerLogScanner::new(Arc::clone(&fm))
+                .with_halt_on_commit(
+                    cfg.halt_on_commit_after_checksum_exception,
+                );
             let mut rmgr = RecoveryManager::new();
             // Multi-DB recovery: discover every db_id in the log and build
             // a Tree for each one. During the analysis phase, each LN/BIN is
@@ -458,6 +461,25 @@ impl EnvironmentImpl {
                         });
                     }
                 };
+
+            // L-14 [#18307]: if end-of-log discovery found a committed txn
+            // AFTER a mid-file corruption point (and the
+            // haltOnCommitAfterChecksumException param was enabled), REFUSE
+            // to mount the silently-truncated log — surface the fatal
+            // FoundCommittedTxn reason. Faithful to JE LastFileReader
+            // throwing EnvironmentFailureException(FOUND_COMMITTED_TXN, ...)
+            // (LastFileReader.java:313).
+            if let Some((corrupt_lsn, commit_lsn)) =
+                scanner.take_found_committed_txn()
+            {
+                return Err(DbiError::RecoveryFailure {
+                    reason: format!(
+                        "{}: corrupt entry at LSN {corrupt_lsn}, committed \
+                         txn at LSN {commit_lsn}",
+                        crate::env_failure_reason::EnvironmentFailureReason::FoundCommittedTxn
+                    ),
+                });
+            }
 
             // Wave 3-2: capture in-doubt prepared (XA) transactions so
             // the XA layer can surface them via xa_recover() and resolve
