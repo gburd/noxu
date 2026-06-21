@@ -1372,6 +1372,43 @@ impl TreeNode {
         }
     }
 
+    /// Faithful in-memory heap footprint of this node, in bytes.
+    ///
+    /// JE `IN.getBudgetedMemorySize()` (IN.java) returns the running
+    /// `inMemorySize` that `MemoryBudget` tracks for the node: the fixed
+    /// IN/BIN struct overhead plus, per slot, the fixed entry overhead and the
+    /// variable key (and embedded-LN data for BINs) bytes.  This is the single
+    /// source of truth for both the live tree accounting and the evictor's
+    /// detach credit (EV-13) — keeping it on `TreeNode` avoids the formula
+    /// drifting between `noxu-tree` and `noxu-evictor`.
+    ///
+    /// Rust has a fixed struct layout (unlike JE's `Sizeof`-measured JVM
+    /// constants) so `size_of` is exact for the fixed overheads; the variable
+    /// part mirrors JE's per-slot `entryKeys`/embedded-data accounting.
+    pub fn budgeted_memory_size(&self) -> u64 {
+        use std::mem::size_of;
+        match self {
+            TreeNode::Bottom(b) => {
+                (size_of::<BinStub>()
+                    + b.entries.len() * size_of::<BinEntry>()
+                    + b.key_prefix.len()
+                    + b.entries
+                        .iter()
+                        .map(|e| {
+                            e.key.len()
+                                + e.data.as_ref().map(|d| d.len()).unwrap_or(0)
+                        })
+                        .sum::<usize>()) as u64
+            }
+            TreeNode::Internal(n) => {
+                (size_of::<InNodeStub>()
+                    + n.entries.len() * size_of::<InEntry>()
+                    + n.entries.iter().map(|e| e.key.len()).sum::<usize>())
+                    as u64
+            }
+        }
+    }
+
     /// Binary search for a key in this node.
     ///
     /// For BIN nodes the search is prefix-aware: if the BIN has a key prefix,
@@ -4270,6 +4307,107 @@ impl Tree {
         true
     }
 
+    /// Detach the resident child node `node_id` from its parent IN, dropping
+    /// the strong `Arc` so the node is actually freed from memory, and return
+    /// the heap bytes reclaimed (0 if not found / not detachable).
+    ///
+    /// This is the faithful port of JE `IN.detachNode(idx, updateLsn, newLsn)`
+    /// (IN.java ~4019) as called from `Evictor.evict` (Evictor.java ~3035):
+    /// `evict` measures `target.getBudgetedMemorySize()` and then
+    /// `parent.detachNode(index, ...)` does `setTarget(idx, null)` to drop the
+    /// child reference and `getInMemoryINs().remove(child)` to drop it from
+    /// the INList.
+    ///
+    /// EV-13: before this method existed, the evictor credited
+    /// `node_size_fn(node_id)` bytes back to the budget and removed the node
+    /// from the LRU lists, but the parent's `InEntry.child` still held a
+    /// strong `Arc` — so the node was never dropped from the heap.  The budget
+    /// over-credited (claimed bytes freed that were not), `cache_usage`
+    /// drifted below reality, and the evictor under-fired.  Detaching here
+    /// drops the `Arc` for real and credits exactly the measured size.
+    ///
+    /// The detach happens **under the parent IN write latch** (JE detaches
+    /// under the parent's latch), so no concurrent descender can re-cache the
+    /// child between measurement and detach.  The slot (key + LSN) is kept —
+    /// only the in-memory `child` target is cleared — matching JE's
+    /// `setTarget(idx, null)` which leaves the `ChildReference` LSN intact so
+    /// the node can be re-fetched from the log later.
+    ///
+    /// Returns `0` if the node is not a resident child of any IN (e.g. it is
+    /// the root, already detached, or was pinned and could not be latched).
+    pub fn detach_node_by_id(&self, node_id: u64) -> u64 {
+        let root = match self.get_root() {
+            Some(r) => r,
+            None => return 0,
+        };
+
+        // The root has no parent IN to detach from (JE evicts the root via a
+        // separate evictRoot path; we keep the root resident here).
+        let root_id = {
+            let g = root.read();
+            match &*g {
+                TreeNode::Internal(n) => n.node_id,
+                TreeNode::Bottom(b) => b.node_id,
+            }
+        };
+        if root_id == node_id {
+            return 0;
+        }
+
+        // Locate the parent IN and the child slot index.
+        let (parent_arc, child_index) =
+            match Self::find_parent_of_node_id(&root, node_id) {
+                Some(p) => p,
+                None => return 0,
+            };
+
+        // ---- Measure + detach UNDER THE PARENT WRITE LATCH ----
+        // Holding parent.write() excludes all descenders (they take
+        // parent.read() hand-over-hand), so the child cannot be re-cached or
+        // re-pinned between the measurement and the detach.  Mirrors JE
+        // detachNode running under the parent latch held by Evictor.evict.
+        let mut parent_guard = parent_arc.write();
+        let TreeNode::Internal(p) = &mut *parent_guard else {
+            return 0; // parent is not an IN (concurrent restructure)
+        };
+        let entry = match p.entries.get_mut(child_index) {
+            Some(e) => e,
+            None => return 0,
+        };
+        let child = match entry.child.take() {
+            Some(c) => c,     // child Arc removed from the slot
+            None => return 0, // already detached
+        };
+
+        // Measure the child's real heap footprint while we still hold it.
+        // JE: long evictedBytes = target.getBudgetedMemorySize().
+        let freed = child.read().budgeted_memory_size();
+
+        // Mark the parent dirty: the slot's in-memory target changed (JE
+        // detachNode sets dirty when updateLsn; we conservatively mark dirty
+        // so the parent is re-logged with the now-non-resident slot).
+        p.dirty = true;
+
+        // Drop the strong Arc explicitly so the node is freed now (the slot's
+        // `child` is already None).  If any other resident path still held a
+        // strong reference this would not free — but the tree is the sole
+        // strong owner of a cached child, so this drops the last strong ref.
+        drop(parent_guard);
+        drop(child);
+
+        // JE: getInMemoryINs().remove(child) — drop it from the evictor LRU.
+        self.note_removed(node_id);
+
+        // NOTE: the live tree-memory counter (`memory_counter`) is the SAME
+        // `Arc<AtomicI64>` the evictor's Arbiter uses as `cache_usage`.  The
+        // evictor decrements it once via `Arbiter::release_memory(bytes)` for
+        // the full eviction batch, so detach must NOT decrement here too —
+        // that would double-credit and drive `cache_usage` below reality
+        // (the very drift EV-13 fixes, in the other direction).  We only
+        // measure-and-free; the caller does the single counter update.
+        freed
+    }
+
     /// Check whether a BIN node is a candidate for slot compression and,
     /// if so, trigger `compress_bin`.
     ///
@@ -6063,6 +6201,179 @@ mod tests {
             counter.load(Ordering::Relaxed),
             0,
             "F8: delete must subtract key + data + 48, returning the counter              to its pre-insert value (no data_len leak)"
+        );
+    }
+
+    /// EV-13 (pass-post): a full-node detach must ACTUALLY drop the child
+    /// `Arc` from the parent IN, not merely credit bytes.  Before the fix the
+    /// evictor credited `node_size_fn(node_id)` and removed the node from the
+    /// LRU list, but the parent's `InEntry.child` still held a strong `Arc`,
+    /// so the node was never freed (phantom free) and the budget over-credited.
+    ///
+    /// This test proves: after `detach_node_by_id` the held child `Arc` is the
+    /// LAST strong reference (strong_count == 1), the parent slot's `child` is
+    /// `None`, and the returned bytes equal the node's measured heap size.
+    ///
+    /// JE ref: `IN.detachNode` (`setTarget(idx, null)`) / `Evictor.evict`.
+    #[test]
+    fn test_ev13_detach_actually_frees_child() {
+        // Tiny fanout forces a root split so we get a real IN parent with BIN
+        // children that the evictor would target.
+        let tree = Tree::new(7, 4);
+        for i in 0u8..12 {
+            tree.insert(
+                vec![b'a' + i],
+                vec![i; 8],
+                Lsn::new(1, u32::from(i) + 1),
+            )
+            .unwrap();
+        }
+
+        // Find a BIN child of the root IN (the eviction target) + its parent.
+        let root = tree.get_root().expect("tree must have a root");
+        let (parent_arc, child_idx, bin_id, expected_bytes) = {
+            let rg = root.read();
+            let TreeNode::Internal(n) = &*rg else {
+                panic!("root must be an IN after split");
+            };
+            // Pick the first slot whose child is a resident BIN.
+            let (idx, child) = n
+                .entries
+                .iter()
+                .enumerate()
+                .find_map(|(i, e)| e.child.as_ref().map(|c| (i, c.clone())))
+                .expect("root must have a resident child");
+            let (id, bytes) = {
+                let cg = child.read();
+                (
+                    match &*cg {
+                        TreeNode::Bottom(b) => b.node_id,
+                        TreeNode::Internal(n2) => n2.node_id,
+                    },
+                    cg.budgeted_memory_size(),
+                )
+            };
+            (Arc::clone(&root), idx, id, bytes)
+        };
+
+        // Hold an external strong reference to the child so we can observe its
+        // strong_count drop when detach releases the parent's reference.
+        let child_arc = {
+            let pg = parent_arc.read();
+            let TreeNode::Internal(n) = &*pg else { unreachable!() };
+            Arc::clone(n.entries[child_idx].child.as_ref().unwrap())
+        };
+        // Two strong refs now: the parent slot + our test handle.
+        assert_eq!(
+            Arc::strong_count(&child_arc),
+            2,
+            "precondition: parent slot + test handle hold the child"
+        );
+
+        let freed = tree.detach_node_by_id(bin_id);
+
+        // 1. Bytes credited equal the measured heap size (no phantom credit).
+        assert_eq!(
+            freed, expected_bytes,
+            "detach must credit the node's real measured heap size"
+        );
+        // 2. The parent slot's child is now None (JE setTarget(idx, null)).
+        {
+            let pg = parent_arc.read();
+            let TreeNode::Internal(n) = &*pg else { unreachable!() };
+            assert!(
+                n.entries[child_idx].child.is_none(),
+                "EV-13: parent slot must be detached (child == None)"
+            );
+            // The slot itself (key + LSN) is retained for re-fetch.
+            assert!(
+                !n.entries[child_idx].lsn.is_null(),
+                "detach keeps the slot LSN so the node can be re-fetched"
+            );
+        }
+        // 3. Our handle is now the ONLY strong reference -> the parent really
+        //    dropped its Arc; the node is freed when we drop `child_arc`.
+        //    Before EV-13 this would be 2 (parent still held it) = phantom free.
+        assert_eq!(
+            Arc::strong_count(&child_arc),
+            1,
+            "EV-13: detach must drop the parent's strong Arc (no phantom free)"
+        );
+    }
+
+    /// EV-13: detach must NOT decrement the memory counter itself (the evictor
+    /// owns that bookkeeping via `Arbiter::release_memory`).  A double credit
+    /// would drive `cache_usage` below reality.
+    #[test]
+    fn test_ev13_detach_does_not_touch_counter() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        let mut tree = Tree::new(8, 4);
+        let counter = Arc::new(AtomicI64::new(0));
+        tree.set_memory_counter(Arc::clone(&counter));
+        for i in 0u8..12 {
+            tree.insert(
+                vec![b'a' + i],
+                vec![i; 8],
+                Lsn::new(1, u32::from(i) + 1),
+            )
+            .unwrap();
+        }
+        let before = counter.load(Ordering::Relaxed);
+
+        // Grab a BIN child id.
+        let root = tree.get_root().unwrap();
+        let bin_id = {
+            let rg = root.read();
+            let TreeNode::Internal(n) = &*rg else { unreachable!() };
+            let child = n
+                .entries
+                .iter()
+                .find_map(|e| e.child.clone())
+                .expect("resident child");
+            match &*child.read() {
+                TreeNode::Bottom(b) => b.node_id,
+                TreeNode::Internal(n2) => n2.node_id,
+            }
+        };
+
+        let freed = tree.detach_node_by_id(bin_id);
+        assert!(freed > 0, "detach must free a resident child");
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            before,
+            "EV-13: detach must not change the counter (evictor credits once)"
+        );
+    }
+
+    /// EV-13: detaching the root or an unknown id is a no-op returning 0.
+    #[test]
+    fn test_ev13_detach_root_or_missing_is_noop() {
+        let tree = Tree::new(9, 4);
+        for i in 0u8..12 {
+            tree.insert(
+                vec![b'a' + i],
+                vec![i; 8],
+                Lsn::new(1, u32::from(i) + 1),
+            )
+            .unwrap();
+        }
+        let root_id = {
+            let rg = tree.get_root().unwrap();
+            let g = rg.read();
+            match &*g {
+                TreeNode::Internal(n) => n.node_id,
+                TreeNode::Bottom(b) => b.node_id,
+            }
+        };
+        assert_eq!(
+            tree.detach_node_by_id(root_id),
+            0,
+            "root has no parent IN -> detach is a no-op"
+        );
+        assert_eq!(
+            tree.detach_node_by_id(u64::MAX),
+            0,
+            "unknown node id -> detach is a no-op"
         );
     }
 
