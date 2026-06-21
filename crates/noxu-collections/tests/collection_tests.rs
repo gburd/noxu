@@ -45,7 +45,9 @@ fn setup_env_and_db() -> (TempDir, Environment, Database) {
         .open_database(
             None,
             "testdb",
-            &DatabaseConfig::new().with_allow_create(true),
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true),
         )
         .unwrap();
     (td, env, db)
@@ -63,7 +65,9 @@ fn setup_transactional_env_and_db() -> (TempDir, Environment, Database) {
         .open_database(
             None,
             "testdb",
-            &DatabaseConfig::new().with_allow_create(true),
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true),
         )
         .unwrap();
     (td, env, db)

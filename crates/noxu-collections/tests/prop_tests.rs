@@ -13,7 +13,8 @@ fn temp_env_and_db() -> (TempDir, Environment, Database) {
     let env_config = EnvironmentConfig::new(temp_dir.path().to_path_buf())
         .with_allow_create(true);
     let env = Environment::open(env_config).unwrap();
-    let db_config = DatabaseConfig::new().with_allow_create(true);
+    let db_config =
+        DatabaseConfig::new().with_allow_create(true).with_transactional(true);
     let db = env.open_database(None, "testdb", &db_config).unwrap();
     (temp_dir, env, db)
 }
