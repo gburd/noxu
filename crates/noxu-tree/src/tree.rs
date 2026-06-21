@@ -59,6 +59,31 @@ pub const BIN_LEVEL: i32 = MAIN_LEVEL | 1;
 pub const EXACT_MATCH: i32 = 1 << 16;
 pub const INSERT_SUCCESS: i32 = 1 << 17;
 
+/// Per-slot fixed memory overhead for a BIN entry, in bytes (DBI-23).
+///
+/// This is the heap footprint of one `BinEntry` *struct* as it lives inside
+/// the BIN's `Vec<BinEntry>` buffer — NOT counting the variable-length key and
+/// data bytes, which are separate heap allocations counted on top of this.
+///
+/// Faithful to JE `IN.getEntryInMemorySize` + the per-slot `entryStates` /
+/// LSN-array overhead folded into `IN.computeMemorySize` (IN.java ~4632):
+/// JE measures the slot's fixed cost with `Sizeof` on the JVM; Rust has a
+/// fixed struct layout so `size_of::<BinEntry>()` is exact.  The previous
+/// magic constant `48` *undercounted* every BIN slot (a `BinEntry` is 64
+/// bytes), so the live budget read below real heap and the evictor under-fired.
+///
+/// Derived (not hard-coded) so a layout change to `BinEntry` is tracked
+/// automatically — see `bin_stub_conformance` for the drift guard.
+pub const BIN_ENTRY_OVERHEAD: usize = std::mem::size_of::<BinEntry>();
+
+/// Per-slot fixed memory overhead for an IN entry, in bytes (DBI-23).
+///
+/// Heap footprint of one `InEntry` struct inside the IN's `Vec<InEntry>`
+/// buffer (key bytes counted separately).  JE `IN.getEntryInMemorySize` for
+/// an upper IN plus the per-slot state/LSN/target overhead from
+/// `IN.computeMemorySize`.
+pub const IN_ENTRY_OVERHEAD: usize = std::mem::size_of::<InEntry>();
+
 /// Type alias for the key comparator used by sorted-duplicate databases.
 ///
 /// The comparator takes two full (uncompressed) keys and returns their
@@ -1912,6 +1937,39 @@ impl Tree {
         }
     }
 
+    /// Sum the real in-memory heap footprint of every resident node in the
+    /// tree (DBI-23 oracle / reconciliation), in bytes.
+    ///
+    /// Walks all resident IN/BIN nodes and adds each node's
+    /// `budgeted_memory_size` (JE `IN.getBudgetedMemorySize`).  This is the
+    /// authoritative "real heap" figure the incrementally-maintained
+    /// `memory_counter` is meant to approximate; an engine can call it to
+    /// reconcile counter drift, and the DBI-23 test uses it as the oracle the
+    /// live counter must stay within tolerance of.
+    pub fn total_budgeted_memory(&self) -> u64 {
+        let mut total = 0u64;
+        if let Some(root) = self.get_root() {
+            Self::total_budgeted_memory_recursive(&root, &mut total);
+        }
+        total
+    }
+
+    fn total_budgeted_memory_recursive(
+        node_arc: &Arc<RwLock<TreeNode>>,
+        total: &mut u64,
+    ) {
+        let guard = node_arc.read();
+        *total += guard.budgeted_memory_size();
+        if let TreeNode::Internal(n) = &*guard {
+            let children: Vec<Arc<RwLock<TreeNode>>> =
+                n.entries.iter().filter_map(|e| e.child.clone()).collect();
+            drop(guard);
+            for child in children {
+                Self::total_budgeted_memory_recursive(&child, total);
+            }
+        }
+    }
+
     /// Search for a BIN that should contain the given key.
     ///
     /// This is the core tree traversal operation. It walks from root to BIN
@@ -2470,7 +2528,8 @@ impl Tree {
 
                 // Count the first entry.
                 if let Some(counter) = &self.memory_counter {
-                    let delta = (key_len + data_len + 48) as i64;
+                    let delta =
+                        (key_len + data_len + BIN_ENTRY_OVERHEAD) as i64;
                     counter.fetch_add(delta, Ordering::Relaxed);
                 }
                 return Ok(true);
@@ -2501,7 +2560,7 @@ impl Tree {
         // IN.updateMemorySize(delta) → MemoryBudget.updateTreeMemoryUsage(delta).
         // LN_OVERHEAD = 48 bytes (approximate fixed overhead per entry).
         if result && let Some(counter) = &self.memory_counter {
-            let delta = (key_len + data_len + 48) as i64;
+            let delta = (key_len + data_len + BIN_ENTRY_OVERHEAD) as i64;
             counter.fetch_add(delta, Ordering::Relaxed);
         }
 
@@ -2599,7 +2658,8 @@ impl Tree {
                 *root_guard = Some(root_arc);
 
                 if let Some(counter) = &self.memory_counter {
-                    let delta = (key_len + data_len + 48) as i64;
+                    let delta =
+                        (key_len + data_len + BIN_ENTRY_OVERHEAD) as i64;
                     counter.fetch_add(delta, Ordering::Relaxed);
                 }
                 return Ok(true);
@@ -2620,7 +2680,7 @@ impl Tree {
         )?;
 
         if result && let Some(counter) = &self.memory_counter {
-            let delta = (key_len + data_len + 48) as i64;
+            let delta = (key_len + data_len + BIN_ENTRY_OVERHEAD) as i64;
             counter.fetch_add(delta, Ordering::Relaxed);
         }
 
@@ -3608,7 +3668,7 @@ impl Tree {
             None => return false,
         };
 
-        // F8 consistency: insert accounts key + data + 48; delete must
+        // F8 consistency: insert accounts key + data + BIN_ENTRY_OVERHEAD; delete must
         // subtract the SAME (data_len was previously omitted, leaking
         // data_len from the cache counter on every delete and biasing the
         // evictor's over-budget view). Peek the data length before deleting.
@@ -3627,7 +3687,7 @@ impl Tree {
         // Update the memory counter when an entry is removed.
         // IN.updateMemorySize(-delta) → MemoryBudget.updateTreeMemoryUsage(-delta).
         if deleted && let Some(counter) = &self.memory_counter {
-            let delta = (key.len() + data_len + 48) as i64;
+            let delta = (key.len() + data_len + BIN_ENTRY_OVERHEAD) as i64;
             counter.fetch_sub(delta, Ordering::Relaxed);
         }
 
@@ -4298,9 +4358,9 @@ impl Tree {
         // Preserve the memory-counter bookkeeping that `self.delete` performed
         // (IN.updateMemorySize(-delta) → MemoryBudget.updateTreeMemoryUsage).
         // The pruned slot's key plus the fixed per-entry overhead matches the
-        // `delete` accounting (key.len() + 48).
+        // `delete` accounting (key.len() + BIN_ENTRY_OVERHEAD).
         if let Some(counter) = &self.memory_counter {
-            let delta = (removed_key_len + 48) as i64;
+            let delta = (removed_key_len + BIN_ENTRY_OVERHEAD) as i64;
             counter.fetch_sub(delta, Ordering::Relaxed);
         }
 
@@ -6191,8 +6251,8 @@ mod tests {
         assert!(after_insert > 0, "insert must increase the counter");
         assert_eq!(
             after_insert,
-            (key.len() + data.len() + 48) as i64,
-            "insert accounts key + data + 48"
+            (key.len() + data.len() + BIN_ENTRY_OVERHEAD) as i64,
+            "insert accounts key + data + per-slot BinEntry overhead"
         );
 
         let deleted = tree.delete(&key);
@@ -6200,7 +6260,7 @@ mod tests {
         assert_eq!(
             counter.load(Ordering::Relaxed),
             0,
-            "F8: delete must subtract key + data + 48, returning the counter              to its pre-insert value (no data_len leak)"
+            "F8: delete must subtract key + data + BIN_ENTRY_OVERHEAD, returning the counter              to its pre-insert value (no data_len leak)"
         );
     }
 
@@ -6374,6 +6434,67 @@ mod tests {
             tree.detach_node_by_id(u64::MAX),
             0,
             "unknown node id -> detach is a no-op"
+        );
+    }
+
+    /// DBI-23 (pass-post): the live `memory_counter` must APPROXIMATE the real
+    /// in-memory heap of the tree, not the old `key + data + 48` lower bound.
+    ///
+    /// JE keeps `inMemorySize` (`IN.getBudgetedMemorySize`) in lock-step with
+    /// the per-node `computeMemorySize`; the over-budget arbiter sees the real
+    /// figure so eviction fires at the right time.  The previous Noxu live
+    /// path undercounted each BIN slot (48 vs the 64-byte `BinEntry` struct)
+    /// and never accounted the node-struct fixed overhead, so the counter ran
+    /// below real heap and the evictor under-fired.
+    ///
+    /// We assert the live counter is within tolerance of
+    /// `total_budgeted_memory` (the authoritative walk-and-sum oracle).  The
+    /// only gap is the per-node fixed struct overhead (BinStub/InNodeStub),
+    /// which is a small fraction for non-trivial entries — the fix closes the
+    /// dominant per-slot gap.
+    #[test]
+    fn test_dbi23_live_counter_approximates_real_heap() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        let mut tree = Tree::new(42, 32);
+        let counter = Arc::new(AtomicI64::new(0));
+        tree.set_memory_counter(Arc::clone(&counter));
+
+        // Insert N entries with realistic key+data sizes.
+        let n = 400u32;
+        for i in 0..n {
+            let key = format!("key-{i:08}").into_bytes(); // 12 bytes
+            let data = vec![0u8; 64]; // 64 bytes
+            tree.insert(key, data, Lsn::new(1, i + 1)).unwrap();
+        }
+
+        let live = counter.load(Ordering::Relaxed) as u64;
+        let real = tree.total_budgeted_memory();
+
+        // The live counter must NOT be the old lower bound.  Old formula per
+        // slot was key + data + 48; the per-slot struct alone is 64, plus the
+        // node-struct overhead the old path ignored entirely.  Assert the live
+        // counter is at least the per-slot-correct portion and within 20% of
+        // the real walked heap.
+        let old_lower_bound: u64 = (0..n)
+            .map(|i| {
+                let key_len = format!("key-{i:08}").len();
+                (key_len + 64 + 48) as u64 // old: key + data + 48
+            })
+            .sum();
+
+        assert!(
+            live > old_lower_bound,
+            "DBI-23: live counter ({live}) must exceed the old key+data+48 \
+             lower bound ({old_lower_bound})"
+        );
+
+        // Within tolerance of real heap (the residual gap is the per-node
+        // fixed struct overhead, intentionally not tracked incrementally).
+        let lower = real * 80 / 100;
+        assert!(
+            live >= lower && live <= real,
+            "DBI-23: live counter ({live}) must approximate real heap ({real}) \
+             within tolerance [{lower}, {real}]"
         );
     }
 

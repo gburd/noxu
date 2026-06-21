@@ -296,6 +296,12 @@ pub struct EnvironmentImpl {
     /// MemoryBudget.updateTreeMemoryUsage(delta) path.
     cache_usage: Arc<AtomicI64>,
 
+    /// Per-category memory budget (DBI-20/21).  Its `tree` category is backed
+    /// by `cache_usage` (the same `Arc` the arbiter reads), and it adds live
+    /// `lock` / `txn` / `admin` categories so the over-budget view can account
+    /// total memory, not just tree nodes.  JE `EnvironmentImpl.memoryBudget`.
+    memory_budget: Arc<crate::memory_budget::MemoryBudget>,
+
     /// Optional VLSN counter installed by `ReplicatedEnvironment::with_environment`.
     ///
     /// When `Some`, `log_txn_commit` atomically increments this counter and
@@ -698,6 +704,14 @@ impl EnvironmentImpl {
             evict_bytes,
             critical_threshold,
         );
+
+        // DBI-20/21: the real per-category memory budget.  Its tree category
+        // shares `cache_usage` with the arbiter; lock / txn / admin categories
+        // are added on top so total memory (not just tree nodes) is visible.
+        let memory_budget = Arc::new(crate::memory_budget::MemoryBudget::new(
+            arbiter_budget,
+            Arc::clone(&cache_usage),
+        ));
         // Build optional off-heap cache from config ( MAX_OFF_HEAP_MEMORY).
         let off_heap_cache = Arc::new(noxu_evictor::OffHeapCache::new(
             cfg.max_off_heap_memory > 0,
@@ -1083,6 +1097,7 @@ impl EnvironmentImpl {
             ),
             utilization_tracker,
             cache_usage,
+            memory_budget,
             replication_vlsn_counter: Mutex::new(None),
         };
 
@@ -1846,6 +1861,16 @@ impl EnvironmentImpl {
     /// actually drives usage down.
     pub fn get_cache_usage(&self) -> i64 {
         self.evictor.get_arbiter().get_cache_usage()
+    }
+
+    /// The per-category memory budget (DBI-20/21).  Tree category is shared
+    /// with the arbiter's `cache_usage`; lock / txn / admin categories can be
+    /// fed by their owning subsystems so the over-budget view sees total
+    /// memory.  JE `EnvironmentImpl.getMemoryBudget()`.
+    pub fn get_memory_budget(
+        &self,
+    ) -> &Arc<crate::memory_budget::MemoryBudget> {
+        &self.memory_budget
     }
     ///
     /// Returns `None` for read-only environments.
