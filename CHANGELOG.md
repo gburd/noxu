@@ -71,6 +71,17 @@ listed in [References](#references).
   `noxu_txn::{TxnChain, CompareSlot, RevertInfo}` are no longer exposed (no
   external users).
 
+### Removed (dead code / noxu-dbi — DBI-30)
+
+- **DBI-30: deleted the dead `in_list.rs` (`INList`).**  The `INList` held a
+  set of `node_ids` (not IN references), had no iterator and no
+  memory-recalc, and had ZERO real callers (workspace grep: every reference
+  outside the module was a JE-concept comment; the production cache tracking
+  runs through the tree's `in_list_listener` + `rebuild_in_list` feeding the
+  evictor).  Its only consumers were 6 in-module tests of itself.  Removed;
+  not re-exported by the umbrella `noxu` crate.  Internal-API change
+  (pre-1.0): `noxu_dbi::INList` is no longer exposed (no external users).
+
 ### Fixed (disk-ordered cursor / cleaner — CLN-7)
 
 - **CLN-7: the cleaner can no longer delete a log file while a
