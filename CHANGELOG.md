@@ -122,6 +122,34 @@ listed in [References](#references).
   `DbTree.setLastDbId` / `TxnManager.setLastTxnId`. Test
   `ids_do_not_restart_at_one_after_recovery`.
 
+### Fixed (recovery — checkpointer breadth: REC-D, REC-F)
+
+- **REC-D: the checkpoint byte/time intervals are now threaded from config
+  into the runnable gate instead of using a hardcoded 10 MiB.**  The
+  `Checkpointer` runnable gate (`is_runnable`) and the write-trigger
+  (`wakeup_after_write`) consult `checkpoint_bytes_interval`, which the
+  environment now wires from `CHECKPOINTER_BYTES_INTERVAL` (default 20 MB) via
+  the new `Checkpointer::with_bytes_interval` call in
+  `EnvironmentImpl::new_with_config_inner` (previously only the
+  decorative `CheckpointConfig.bytes_interval` was set — a field the gate never
+  read — so the gate always used the 10 MiB default).  The time interval
+  (`CHECKPOINTER_WAKEUP_INTERVAL`) is wired via
+  `Checkpointer::with_time_interval`, and `is_runnable` now follows JE
+  `getWakeupPeriod`/`isRunnable` precedence: the byte interval takes precedence
+  when non-zero, and the time branch (with the `lastUsedLsn != lastCheckpointEnd`
+  idle-guard) applies only when the byte interval is 0.  The env checkpointer
+  daemon now gates its periodic checkpoint on `is_runnable(false)` so an idle
+  environment is no longer checkpointed every wakeup.  Cite
+  `Checkpointer.java` ctor / `getWakeupPeriod` / `isRunnable`.
+- **REC-F: an idle environment with cleaner-pending files now triggers an
+  automatic idle checkpoint, reclaiming cleaned files instead of waiting for
+  the next write-driven/forced checkpoint.**  `Checkpointer::is_runnable` now
+  returns true when the wired cleaner reports files pending reclaim
+  (`Cleaner::is_checkpoint_needed` → `FileSelector::is_checkpoint_needed`: any
+  CLEANED or CHECKPOINTED file mid-barrier), mirroring JE
+  `Checkpointer.wakeupAfterNoWrites` / `needCheckpointForCleanedFiles` →
+  `FileSelector.isCheckpointNeeded`.  Cite `Checkpointer.java`
+  `wakeupAfterNoWrites` / `isRunnable` and `FileSelector.isCheckpointNeeded`.
 
 ## [6.1.0] - 2026-06-19
 

@@ -791,6 +791,16 @@ impl EnvironmentImpl {
                 CheckpointConfig::new()
                     .bytes_interval(cfg.checkpointer_bytes_interval),
             )
+            // REC-D: thread the configured CHECKPOINTER_BYTES_INTERVAL into
+            // the runnable gate. Without this the gate used the hardcoded
+            // 10 MiB default regardless of config. JE Checkpointer ctor reads
+            // EnvironmentParams.CHECKPOINTER_BYTES_INTERVAL into
+            // logSizeBytesInterval, which isRunnable() consults.
+            .with_bytes_interval(cfg.checkpointer_bytes_interval)
+            // REC-D: wire the time interval (CHECKPOINTER_WAKEUP_INTERVAL) so
+            // the bytes-OR-time runnable gate matches JE getWakeupPeriod
+            // (bytes takes precedence when non-zero).
+            .with_time_interval(cfg.checkpointer_wakeup_interval_ms)
             .with_log_manager(Arc::clone(lm))
             .with_tree(Arc::clone(&primary_tree), 1)
             // Stage-1: wire the db_trees_registry so the checkpointer flushes
@@ -834,6 +844,15 @@ impl EnvironmentImpl {
                         ckpt_clone.wait_for_shutdown_or_timeout(interval);
                         if ckpt_clone.is_shutdown() {
                             break;
+                        }
+                        // REC-D / REC-F: gate the daemon checkpoint on
+                        // is_runnable so an idle environment is not
+                        // checkpointed every wakeup (wasted I/O), while a
+                        // cleaner with files pending reclaim still triggers an
+                        // idle checkpoint. JE Checkpointer.doCheckpoint returns
+                        // early when !isRunnable(config).
+                        if !ckpt_clone.is_runnable(false) {
+                            continue;
                         }
                         // Ignore checkpoint errors in the daemon — the
                         // environment may be closing or a concurrent

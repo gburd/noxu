@@ -206,7 +206,21 @@ pub struct Checkpointer {
     /// Bytes-written threshold that triggers an immediate checkpoint.
     ///
     /// Default: 10 MiB (10 * 1024 * 1024).  Set to 0 to disable.
+    ///
+    /// REC-D: wired from `CHECKPOINTER_BYTES_INTERVAL` (default 20 MB) by the
+    /// environment via `with_bytes_interval`. JE Checkpointer ctor:
+    /// `logSizeBytesInterval = configManager.getLong(CHECKPOINTER_BYTES_INTERVAL)`.
     checkpoint_bytes_interval: u64,
+    /// Time-based checkpoint interval in milliseconds (0 = time-based
+    /// checkpoints disabled, bytes-only).
+    ///
+    /// REC-D: wired from `CHECKPOINTER_WAKEUP_INTERVAL` by the environment via
+    /// `with_time_interval`. JE `getWakeupPeriod`: bytes-OR-time, with the
+    /// byte interval taking precedence when non-zero. The daemon paces its
+    /// own sleep at this interval; `is_runnable` consults it only when the
+    /// byte interval is disabled (matches JE `isRunnable` useTimeInterval
+    /// branch, which fires only when `logSizeBytesInterval == 0`).
+    checkpoint_time_interval_ms: u64,
     /// Optional utilization tracker for persisting file summaries.
     ///
     /// When set, `persist_file_summaries()` iterates tracked summaries and
@@ -266,6 +280,7 @@ impl Checkpointer {
             db_trees_registry: None,
             bytes_since_checkpoint: AtomicU64::new(0),
             checkpoint_bytes_interval: 10 * 1024 * 1024, // 10 MiB default
+            checkpoint_time_interval_ms: 0, // time-based disabled by default
             utilization_tracker: None,
             cleaner: None,
             txn_manager: None,
@@ -278,6 +293,16 @@ impl Checkpointer {
     ///
     pub fn with_bytes_interval(mut self, bytes: u64) -> Self {
         self.checkpoint_bytes_interval = bytes;
+        self
+    }
+
+    /// Set the time-based checkpoint interval (milliseconds).
+    ///
+    /// REC-D: wired from `CHECKPOINTER_WAKEUP_INTERVAL`. JE `getWakeupPeriod`
+    /// computes bytes-OR-time with bytes taking precedence; `isRunnable`
+    /// consults the time interval only when the byte interval is 0.
+    pub fn with_time_interval(mut self, millis: u64) -> Self {
+        self.checkpoint_time_interval_ms = millis;
         self
     }
 
@@ -396,26 +421,53 @@ impl Checkpointer {
     /// checkpoint on every wakeup tick even on a fully idle environment
     /// (wasted I/O). Returns true if:
     ///   - `force`, OR
+    ///   - REC-F: the cleaner has files pending reclaim
+    ///     (`needCheckpointForCleanedFiles()` → `isCheckpointNeeded()`), even
+    ///     with no writes — so an idle env still reclaims cleaned files, OR
     ///   - bytes written since the last checkpoint >= the byte interval, OR
-    ///   - the time interval elapsed AND something was written since the last
-    ///     checkpoint (`bytes_since_checkpoint > 0` — JE's `lastUsedLsn !=
+    ///   - (only when the byte interval is disabled) the time interval elapsed
+    ///     AND something was written since the last checkpoint
+    ///     (`bytes_since_checkpoint > 0` — JE's `lastUsedLsn !=
     ///     lastCheckpointEnd` idle-guard).
+    ///
+    /// JE ref: `Checkpointer.isRunnable` — order is force, then
+    /// `wakeupAfterNoWrites && needCheckpointForCleanedFiles()`, then the
+    /// bytes-OR-time interval (bytes takes precedence; the time branch only
+    /// runs when `logSizeBytesInterval == 0`).
     pub fn is_runnable(&self, force: bool) -> bool {
         if force {
             return true;
         }
-        let bytes_since = self.bytes_since_checkpoint.load(Ordering::Relaxed);
-        if self.checkpoint_bytes_interval != 0
-            && bytes_since >= self.checkpoint_bytes_interval
-        {
+        // REC-F: wake for cleaner-pending files even on an idle environment.
+        // JE `isRunnable`: `if (wakeupAfterNoWrites && needCheckpointForCleanedFiles())
+        // return true;`.  Noxu folds `wakeupAfterNoWrites` into the cleaner
+        // query directly — `needs_checkpoint_for_cleaned_files()` is true iff
+        // the cleaner reports CLEANED/FULLY_PROCESSED files pending reclaim.
+        if self.needs_checkpoint_for_cleaned_files() {
             return true;
         }
-        // Time-cadence branch: the caller (the daemon) only invokes this once
-        // per wakeup interval, so reaching here means the time interval has
-        // elapsed. JE's idle-guard (`lastUsedLsn != lastCheckpointEnd`) maps to
-        // "something was written since the last checkpoint" — i.e.
-        // bytes_since > 0. Skip the checkpoint entirely on an idle environment.
+        let bytes_since = self.bytes_since_checkpoint.load(Ordering::Relaxed);
+        if self.checkpoint_bytes_interval != 0 {
+            // Bytes interval takes precedence (JE getWakeupPeriod): when it is
+            // non-zero the time branch is never consulted.
+            return bytes_since >= self.checkpoint_bytes_interval;
+        }
+        // Time-cadence branch (only reached when the byte interval is 0): the
+        // caller (the daemon) only invokes this once per wakeup interval, so
+        // reaching here means the time interval has elapsed. JE's idle-guard
+        // (`lastUsedLsn != lastCheckpointEnd`) maps to "something was written
+        // since the last checkpoint" — i.e. bytes_since > 0. Skip the
+        // checkpoint entirely on an idle environment.
         bytes_since > 0
+    }
+
+    /// REC-F: whether the cleaner has files pending reclaim that a checkpoint
+    /// would unblock.  Mirrors JE `Checkpointer.needCheckpointForCleanedFiles`
+    /// → `cleaner.getFileSelector().isCheckpointNeeded()` (any CLEANED or
+    /// FULLY_PROCESSED files exist).  Returns `false` when no cleaner is
+    /// wired.
+    fn needs_checkpoint_for_cleaned_files(&self) -> bool {
+        self.cleaner.as_ref().map(|c| c.is_checkpoint_needed()).unwrap_or(false)
     }
 
     /// Test-only: bump `bytes_since_checkpoint` without triggering a
@@ -1547,25 +1599,49 @@ mod tests {
     /// NULL_LSN (never checkpointed) and `true` after setting a non-NULL LSN.
     #[test]
     fn test_is_runnable_idle_guard() {
-        // Finding 9 regression: the daemon must NOT checkpoint an idle
-        // environment every wakeup. is_runnable(false) is false until bytes
-        // are written; force is always true.
+        // The daemon must NOT checkpoint an idle environment every wakeup.
+        // is_runnable(false) is false until the relevant interval trips; force
+        // is always true.
+        //
+        // REC-D: when the byte interval is set (non-zero) it takes precedence
+        // (JE getWakeupPeriod / isRunnable: useTimeInterval stays 0), so a
+        // sub-interval write is NOT runnable — only crossing the byte interval
+        // is.
         let cp = Checkpointer::new(CheckpointConfig::default())
             .with_bytes_interval(1024);
         // Idle: nothing written since the last checkpoint.
         assert!(!cp.is_runnable(false), "idle env must not be runnable");
         // Force always runs (JE config.getForce()).
         assert!(cp.is_runnable(true), "force must always be runnable");
-        // After a sub-interval write, the time-cadence idle-guard makes it
-        // runnable (something was written), even below the byte interval.
+        // A sub-interval write is NOT runnable when a byte interval is set
+        // (bytes takes precedence over time per JE isRunnable).
         cp.note_bytes_for_test(100);
         assert!(
-            cp.is_runnable(false),
-            "runnable once something was written since the last checkpoint"
+            !cp.is_runnable(false),
+            "sub-interval write must not be runnable when a byte interval is set \
+             (REC-D: bytes takes precedence over the time branch)"
         );
-        // Above the byte interval is also runnable.
+        // Crossing the byte interval is runnable.
         cp.note_bytes_for_test(2000);
         assert!(cp.is_runnable(false));
+    }
+
+    /// REC-D: when the byte interval is DISABLED (0) the time branch applies
+    /// — any write since the last checkpoint makes the daemon runnable on its
+    /// next wakeup (JE isRunnable useTimeInterval branch with the
+    /// `lastUsedLsn != lastCheckpointEnd` idle-guard).
+    #[test]
+    fn test_is_runnable_time_branch_when_bytes_disabled() {
+        let cp = Checkpointer::new(CheckpointConfig::default())
+            .with_bytes_interval(0); // bytes disabled → time-based
+        // Idle: nothing written → not runnable (idle-guard).
+        assert!(!cp.is_runnable(false), "idle time-based env must not run");
+        // Any write makes it runnable on the next wakeup tick.
+        cp.note_bytes_for_test(1);
+        assert!(
+            cp.is_runnable(false),
+            "time branch: a write since the last checkpoint makes it runnable"
+        );
     }
 
     #[test]
@@ -1914,5 +1990,100 @@ mod tests {
         }
         assert!(levels.lock().unwrap().is_empty(), "guard must clear map");
         assert!(!flag.load(Ordering::Acquire));
+    }
+
+    // -----------------------------------------------------------------------
+    // REC-D: the configured bytes-interval must reach the runnable gate
+    // (not the hardcoded 10 MiB default).
+    // -----------------------------------------------------------------------
+
+    /// REC-D fail-pre/pass-post: a Checkpointer built with a configured
+    /// bytes-interval must use THAT value in `is_runnable`, not the hardcoded
+    /// 10 MiB.  JE Checkpointer ctor:
+    /// `logSizeBytesInterval = configManager.getLong(CHECKPOINTER_BYTES_INTERVAL)`
+    /// and `isRunnable` compares the bytes-since-checkpoint against it.
+    ///
+    /// Fail-pre: before REC-D the env wired only `CheckpointConfig.bytes_interval`
+    /// (a field `is_runnable` never reads) while the gate used the hardcoded
+    /// `checkpoint_bytes_interval = 10 MiB`.  A 1 KiB configured interval would
+    /// NOT trip the gate at 1 KiB of writes.  Pass-post: `with_bytes_interval`
+    /// threads the configured value into the gate.
+    #[test]
+    fn test_rec_d_configured_bytes_interval_drives_runnable() {
+        // Configure a 1 KiB interval (far below the old 10 MiB default).
+        let cp = Checkpointer::new(CheckpointConfig::default())
+            .with_bytes_interval(1024);
+
+        // Just below the configured interval: not runnable.
+        cp.note_bytes_for_test(1000);
+        assert!(
+            !cp.is_runnable(false),
+            "REC-D: 1000 bytes < configured 1 KiB interval must not be runnable"
+        );
+
+        // Cross the configured interval: runnable.  (With the old hardcoded
+        // 10 MiB default this would stay false until 10 MiB of writes.)
+        cp.note_bytes_for_test(100);
+        assert!(
+            cp.is_runnable(false),
+            "REC-D: crossing the configured 1 KiB interval must be runnable; \
+             the gate must use the configured interval, not 10 MiB"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // REC-F: an idle environment with cleaner-pending files must trigger a
+    // checkpoint (JE wakeupAfterNoWrites / needCheckpointForCleanedFiles).
+    // -----------------------------------------------------------------------
+
+    /// REC-F fail-pre/pass-post: with no bytes written since the last
+    /// checkpoint, `is_runnable(false)` must still return true when the
+    /// cleaner reports files pending reclaim (CLEANED set non-empty).
+    ///
+    /// JE `Checkpointer.isRunnable`:
+    /// `if (wakeupAfterNoWrites && needCheckpointForCleanedFiles()) return true;`
+    /// where `needCheckpointForCleanedFiles()` →
+    /// `cleaner.getFileSelector().isCheckpointNeeded()`.
+    ///
+    /// Fail-pre: before REC-F `is_runnable` consulted only bytes; an idle env
+    /// with cleaned-but-unreclaimed files returned false, so reclamation
+    /// stalled until the next write-driven checkpoint.
+    #[test]
+    fn test_rec_f_idle_env_with_cleaner_pending_is_runnable() {
+        use noxu_cleaner::Cleaner;
+        use std::sync::Arc;
+
+        let cleaner = Arc::new(Cleaner::new(50, 1, 0));
+
+        let cp = Checkpointer::new(CheckpointConfig::default())
+            .with_bytes_interval(1024)
+            .with_cleaner(Arc::clone(&cleaner));
+
+        // Idle environment: nothing written since the last checkpoint, no
+        // cleaned files yet.
+        assert!(
+            !cp.is_runnable(false),
+            "REC-F precondition: idle env with no pending files must not be runnable"
+        );
+
+        // Simulate the cleaner cleaning a file: it moves to the CLEANED state
+        // (cleaned-but-not-checkpointed).  A checkpoint is now needed to
+        // advance the deletion barrier.
+        {
+            let mut selector = cleaner.get_file_selector().lock();
+            selector.add_file_to_clean(7);
+            selector.mark_file_cleaned(7);
+        }
+
+        assert!(
+            cleaner.is_checkpoint_needed(),
+            "REC-F: cleaner must report a checkpoint is needed for the CLEANED file"
+        );
+        // Still no bytes written, but the idle-reclaim trigger fires.
+        assert!(
+            cp.is_runnable(false),
+            "REC-F: idle env with cleaner-pending files must be runnable \
+             (JE wakeupAfterNoWrites / needCheckpointForCleanedFiles)"
+        );
     }
 }

@@ -695,6 +695,20 @@ impl FileSelector {
         !self.to_be_cleaned.is_empty() || self.is_force_cleaning()
     }
 
+    /// REC-F: whether any cleaned-but-not-yet-reclaimed files exist, meaning a
+    /// checkpoint is needed before they can be deleted.
+    ///
+    /// JE `FileSelector.isCheckpointNeeded`:
+    /// `getNumberOfFiles(CLEANED) > 0 || getNumberOfFiles(FULLY_PROCESSED) > 0`.
+    /// Noxu's three-state barrier splits JE's FULLY_PROCESSED across the
+    /// `cleaned`, `checkpointed`, and `safe_to_delete` sets; a checkpoint is
+    /// needed whenever a file is still mid-barrier (`cleaned` or
+    /// `checkpointed`) — once it reaches `safe_to_delete` no further
+    /// checkpoint is required, it just awaits deletion.
+    pub fn is_checkpoint_needed(&self) -> bool {
+        !self.cleaned.is_empty() || !self.checkpointed.is_empty()
+    }
+
     pub fn is_being_cleaned(&self, file_number: u32) -> bool {
         self.being_cleaned.contains(&file_number)
     }
@@ -1047,6 +1061,41 @@ mod tests {
         let stats = selector.get_stats();
         assert_eq!(stats.cleaned, 0);
         assert_eq!(stats.checkpointed, 1);
+    }
+
+    /// REC-F: `is_checkpoint_needed` mirrors JE `isCheckpointNeeded` — true
+    /// while a file is mid-barrier (CLEANED or CHECKPOINTED), false once it is
+    /// safe-to-delete or untracked.
+    #[test]
+    fn test_rec_f_is_checkpoint_needed() {
+        let mut selector = FileSelector::new();
+        assert!(
+            !selector.is_checkpoint_needed(),
+            "empty selector: no checkpoint needed"
+        );
+
+        // CLEANED: a checkpoint is needed to advance the barrier.
+        selector.add_file_to_clean(1);
+        selector.select_from_queue();
+        selector.mark_file_cleaned(1);
+        assert!(
+            selector.is_checkpoint_needed(),
+            "REC-F: CLEANED file needs a checkpoint"
+        );
+
+        // CHECKPOINTED: still needs one more checkpoint to reach safe_to_delete.
+        selector.mark_file_checkpointed(1);
+        assert!(
+            selector.is_checkpoint_needed(),
+            "REC-F: CHECKPOINTED file still needs a checkpoint"
+        );
+
+        // FULLY_PROCESSED (safe_to_delete): no further checkpoint needed.
+        selector.mark_file_fully_processed(1);
+        assert!(
+            !selector.is_checkpoint_needed(),
+            "REC-F: safe-to-delete file needs no further checkpoint"
+        );
     }
 
     #[test]
