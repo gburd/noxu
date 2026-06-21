@@ -695,7 +695,15 @@ impl Checkpointer {
                 checkpoint_id,
                 invoker,
                 start_lsn,
-                None, // root_lsn  (REC-P/T-F3 documented deferral)
+                // REC-P / REC-B: root_lsn is intentionally always None.  JE
+                // records the mapping-tree root here (Checkpointer.flushRoot
+                // → CheckpointEnd.rootLsn), but Noxu's catalog is an in-memory
+                // HashMap rebuilt from NameLN WAL entries during recovery
+                // (REC-B authorized divergence), so there is no mapping tree
+                // to flush and no root LSN to record.  Per-DB utilization is
+                // persisted via persist_file_summaries (FileSummaryLN), not a
+                // mapping-tree MapLN flush.
+                None, // root_lsn
                 first_active_lsn,
                 // REC-S: real id maxima (were hardcoded 0).
                 last_local_node_id,

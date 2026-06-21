@@ -169,6 +169,22 @@ listed in [References](#references).
   no longer regresses or collides across restarts.  Cite
   `Checkpointer.setCheckpointId`.
 
+### Removed (recovery — dead checkpointer plumbing: REC-P)
+
+- **REC-P: deleted the dead `DirtyINMap` MapLN-flush plumbing
+  (`map_lns_to_flush` field, `add_map_ln_to_flush`, `get_map_lns_to_flush`)
+  that the checkpointer never called.**  JE's checkpoint flushes per-DB
+  utilization `MapLN`s and the mapping-tree root (`DirtyINMap.flushMapLNs` /
+  `Checkpointer.flushRoot`), but Noxu's catalog is an in-memory
+  `HashMap<DatabaseId, DatabaseImpl>` rebuilt from `NameLN` WAL entries during
+  recovery (REC-B, authorized divergence), so there is no `_jeNameTree`
+  B-tree to flush and no root LSN to record — `CheckpointEnd.root_lsn` is
+  intentionally always `None` (now documented at the `do_checkpoint` call
+  site and in the `dirty_in_map` module docs).  Per-DB utilization is still
+  persisted, but via `Checkpointer::persist_file_summaries` (`FileSummaryLN`),
+  not a mapping-tree MapLN flush.  MapLN persistence proper is the cleaner
+  workstream's concern and was deliberately NOT implemented here.
+
 ## [6.1.0] - 2026-06-19
 
 ### Fixed (evictor — CLN-F2 regression)

@@ -1,7 +1,21 @@
 //! Dirty IN tracking for checkpoint.
 //!
+//! # REC-P / REC-B: no MapLN flush, `root_lsn` stays `None`
+//!
+//! JE's checkpoint also flushes per-DB utilization `MapLN`s and the
+//! mapping-tree root (`DirtyINMap.flushMapLNs` / `Checkpointer.flushRoot`,
+//! recording the new root in `CheckpointEnd.rootLsn`).  Noxu's catalog is a
+//! plain in-memory `HashMap<DatabaseId, DatabaseImpl>` rebuilt from `NameLN`
+//! WAL entries during recovery (REC-B, authorized design divergence), NOT a
+//! `_jeNameTree` B-tree, so there is no mapping tree to flush and no root LSN
+//! to record — `CheckpointEnd.root_lsn` is intentionally always `None`
+//! (see `Checkpointer::do_checkpoint`).  The dead `map_lns_to_flush` plumbing
+//! that mirrored `DirtyINMap.flushMapLNs` was removed in REC-P because the
+//! checkpointer never called it.  Per-DB `FileSummaryLN` utilization records
+//! ARE persisted, but via `Checkpointer::persist_file_summaries` (driven by
+//! the `UtilizationTracker`), not through this map.
 
-use hashbrown::{HashMap, HashSet};
+use hashbrown::HashMap;
 use std::collections::BTreeMap;
 
 /// Checkpoint state machine.
@@ -56,8 +70,6 @@ pub struct DirtyINMap {
     >,
     /// Total entries across all levels.
     num_entries: usize,
-    /// Database IDs whose MapLNs need flushing.
-    map_lns_to_flush: HashSet<i64>,
     /// Current checkpoint state.
     ckpt_state: CkptState,
 }
@@ -68,7 +80,6 @@ impl DirtyINMap {
         Self {
             level_map: BTreeMap::new(),
             num_entries: 0,
-            map_lns_to_flush: HashSet::new(),
             ckpt_state: CkptState::None,
         }
     }
@@ -148,19 +159,6 @@ impl DirtyINMap {
         self.num_entries == 0
     }
 
-    /// Adds a database ID whose MapLN needs to be flushed.
-    ///
-    /// MapLNs are special leaf nodes in the database name mapping tree that
-    /// need to be flushed during checkpoint.
-    pub fn add_map_ln_to_flush(&mut self, db_id: i64) {
-        self.map_lns_to_flush.insert(db_id);
-    }
-
-    /// Returns the set of database IDs whose MapLNs need flushing.
-    pub fn get_map_lns_to_flush(&self) -> &HashSet<i64> {
-        &self.map_lns_to_flush
-    }
-
     /// Sets the checkpoint state.
     pub fn set_ckpt_state(&mut self, state: CkptState) {
         self.ckpt_state = state;
@@ -175,7 +173,6 @@ impl DirtyINMap {
     pub fn clear(&mut self) {
         self.level_map.clear();
         self.num_entries = 0;
-        self.map_lns_to_flush.clear();
         self.ckpt_state = CkptState::None;
     }
 }
@@ -322,20 +319,6 @@ mod tests {
     }
 
     #[test]
-    fn test_add_map_ln_to_flush() {
-        let mut map = DirtyINMap::new();
-
-        map.add_map_ln_to_flush(100);
-        map.add_map_ln_to_flush(200);
-        map.add_map_ln_to_flush(100); // Duplicate
-
-        let map_lns = map.get_map_lns_to_flush();
-        assert_eq!(map_lns.len(), 2);
-        assert!(map_lns.contains(&100));
-        assert!(map_lns.contains(&200));
-    }
-
-    #[test]
     fn test_checkpoint_state() {
         let mut map = DirtyINMap::new();
 
@@ -354,18 +337,15 @@ mod tests {
 
         map.add_dirty_in(CheckpointReference::new(1, 100, false, 0));
         map.add_dirty_in(CheckpointReference::new(2, 100, false, 1));
-        map.add_map_ln_to_flush(100);
         map.set_ckpt_state(CkptState::DirtyMapComplete);
 
         assert_eq!(map.get_num_entries(), 2);
-        assert_eq!(map.get_map_lns_to_flush().len(), 1);
         assert_eq!(map.get_ckpt_state(), CkptState::DirtyMapComplete);
 
         map.clear();
 
         assert_eq!(map.get_num_entries(), 0);
         assert!(map.is_empty());
-        assert_eq!(map.get_map_lns_to_flush().len(), 0);
         assert_eq!(map.get_ckpt_state(), CkptState::None);
         assert_eq!(map.get_lowest_level(), None);
     }
