@@ -2228,3 +2228,38 @@ mod tests {
         assert!(!STATS_FILE_DIRECTORY.mutable);
     }
 }
+
+#[cfg(test)]
+mod c1_all_defaults_in_range_test {
+    use super::all_params;
+
+    #[test]
+    fn c1_every_param_default_validates_against_its_own_bounds() {
+        // A parameter's own default MUST satisfy its min/max bounds — otherwise
+        // opening an environment with defaults would fail validation. This guards
+        // the C-1 duration-bounds work (and all other bounded params).
+        //
+        // Exception (JE-faithful): a default of `0` is JE's documented "auto"
+        // sentinel for size params computed from `maxMemory` (e.g.
+        // `LOG_TOTAL_BUFFER_BYTES` / JE `LOG_MEM_SIZE`, whose min is
+        // `LOG_MEM_SIZE_MIN` but whose default 0 means "compute from je.maxMemory").
+        // JE itself does not validate that 0 against the min — neither do we.
+        for p in all_params() {
+            let is_auto_sentinel = matches!(
+                p.default,
+                crate::param::ParamValue::Int(0) | crate::param::ParamValue::Long(0)
+            ) && p.min.is_some();
+            if is_auto_sentinel {
+                continue;
+            }
+            assert!(
+                p.validate(&p.default).is_ok(),
+                "param {} default {:?} violates its own bounds (min={:?} max={:?})",
+                p.name,
+                p.default,
+                p.min,
+                p.max
+            );
+        }
+    }
+}
