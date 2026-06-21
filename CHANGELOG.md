@@ -82,6 +82,20 @@ listed in [References](#references).
   not re-exported by the umbrella `noxu` crate.  Internal-API change
   (pre-1.0): `noxu_dbi::INList` is no longer exposed (no external users).
 
+### Removed (dead code / noxu-evictor — EV-20)
+
+- **EV-20: deleted the dead duplicate `lru_list.rs` (`LruList`).**  `LruList`
+  was a slab-backed intrusive doubly-linked-list LRU that duplicated the
+  live LRU implementation now living in `policies/lru.rs` (`LruPolicy`,
+  backed by `slab::SlabList`).  The evictor runs `EvictionPolicy` trait
+  objects (`LruPolicy` etc.), never `LruList`; the only consumer of `LruList`
+  was the JE TCK port `tests/je_lru_test.rs`.  That test was re-pointed at the
+  live `LruPolicy` (mapping `pop_lru` -> `evict_candidate`, etc.) so its
+  JE-LRUTest conformance coverage now exercises the implementation that runs;
+  the one `LruList`-specific dual-priority test was dropped.  Internal-API
+  change (pre-1.0): `noxu_evictor::LruList` is no longer exposed (no external
+  users).
+
 ### Fixed (disk-ordered cursor / cleaner — CLN-7)
 
 - **CLN-7: the cleaner can no longer delete a log file while a
