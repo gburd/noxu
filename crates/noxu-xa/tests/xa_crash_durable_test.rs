@@ -43,7 +43,9 @@ fn open_xa(dir: &std::path::Path) -> (XaEnvironment, Database) {
         .open_database(
             None,
             "wave3_2_db",
-            &DatabaseConfig::new().with_allow_create(true),
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true),
         )
         .unwrap();
     let xa = XaEnvironment::new(env);

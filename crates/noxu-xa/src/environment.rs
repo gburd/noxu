@@ -697,7 +697,9 @@ mod tests {
     #[test]
     fn test_full_2pc() {
         let (xa, _dir) = make_xa_env();
-        let db_config = DatabaseConfig::new().with_allow_create(true);
+        let db_config = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
         let db = xa.inner().open_database(None, "test", &db_config).unwrap();
 
         let xid = Xid::new(1, b"gtrid1", b"bqual1").unwrap();
@@ -729,7 +731,9 @@ mod tests {
     #[test]
     fn test_rollback() {
         let (xa, _dir) = make_xa_env();
-        let db_config = DatabaseConfig::new().with_allow_create(true);
+        let db_config = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
         let db = xa.inner().open_database(None, "test", &db_config).unwrap();
 
         let xid = Xid::new(1, b"gtrid2", b"bqual2").unwrap();
@@ -797,7 +801,9 @@ mod tests {
     #[test]
     fn test_one_phase_commit() {
         let (xa, _dir) = make_xa_env();
-        let db_config = DatabaseConfig::new().with_allow_create(true);
+        let db_config = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
         let db = xa.inner().open_database(None, "test", &db_config).unwrap();
 
         let xid = Xid::new(1, b"onephase", b"branch").unwrap();
@@ -836,7 +842,9 @@ mod tests {
     #[test]
     fn test_recover_returns_prepared() {
         let (xa, _dir) = make_xa_env();
-        let db_config = DatabaseConfig::new().with_allow_create(true);
+        let db_config = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
         let db = xa.inner().open_database(None, "test", &db_config).unwrap();
 
         let xid = Xid::new(1, b"recover", b"test").unwrap();
@@ -870,7 +878,9 @@ mod tests {
     #[test]
     fn test_recover_pagination_no_duplicates() {
         let (xa, _dir) = make_xa_env();
-        let db_config = DatabaseConfig::new().with_allow_create(true);
+        let db_config = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
         let _db = xa.inner().open_database(None, "test", &db_config).unwrap();
 
         // Prepare two branches.

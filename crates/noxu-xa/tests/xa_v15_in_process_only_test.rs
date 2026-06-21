@@ -42,7 +42,9 @@ fn make_xa_with_log(dir: &std::path::Path) -> (XaEnvironment, Database) {
         .open_database(
             None,
             "v15_inproc",
-            &DatabaseConfig::new().with_allow_create(true),
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true),
         )
         .unwrap();
     let xa = XaEnvironment::new(env).with_prepared_log().unwrap();
@@ -58,7 +60,9 @@ fn make_xa_no_log(dir: &std::path::Path) -> (XaEnvironment, Database) {
         .open_database(
             None,
             "v15_inproc",
-            &DatabaseConfig::new().with_allow_create(true),
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true),
         )
         .unwrap();
     let xa = XaEnvironment::new(env);

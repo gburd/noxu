@@ -382,7 +382,9 @@ mod tests {
             .open_database(
                 None,
                 "list",
-                &DatabaseConfig::new().with_allow_create(true),
+                &DatabaseConfig::new()
+                    .with_allow_create(true)
+                    .with_transactional(true),
             )
             .unwrap();
         (td, env, db)
@@ -563,7 +565,9 @@ mod tests {
                 .open_database(
                     None,
                     "reopen",
-                    &DatabaseConfig::new().with_allow_create(true),
+                    &DatabaseConfig::new()
+                        .with_allow_create(true)
+                        .with_transactional(true),
                 )
                 .unwrap();
             let list: StoredList<'_, String, _> =
@@ -584,7 +588,9 @@ mod tests {
                 .open_database(
                     None,
                     "reopen",
-                    &DatabaseConfig::new().with_allow_create(true),
+                    &DatabaseConfig::new()
+                        .with_allow_create(true)
+                        .with_transactional(true),
                 )
                 .unwrap();
             let list: StoredList<'_, String, _> =

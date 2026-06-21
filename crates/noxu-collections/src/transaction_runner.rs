@@ -392,7 +392,9 @@ mod tests {
             .open_database(
                 None,
                 "runner_map",
-                &DatabaseConfig::new().with_allow_create(true),
+                &DatabaseConfig::new()
+                    .with_allow_create(true)
+                    .with_transactional(true),
             )
             .unwrap();
 
@@ -423,7 +425,9 @@ mod tests {
             .open_database(
                 None,
                 "runner_abort",
-                &DatabaseConfig::new().with_allow_create(true),
+                &DatabaseConfig::new()
+                    .with_allow_create(true)
+                    .with_transactional(true),
             )
             .unwrap();
 

@@ -41,7 +41,9 @@ impl TestEnv {
             .with_allow_create(true)
             .with_transactional(true);
         let env = Environment::open(env_config).unwrap();
-        let db_config = DatabaseConfig::new().with_allow_create(true);
+        let db_config = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
         let db = env.open_database(None, "protocol_test", &db_config).unwrap();
         let xa = XaEnvironment::new(env);
         Self { xa, db, _dir: dir }
