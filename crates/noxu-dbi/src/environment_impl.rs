@@ -804,7 +804,12 @@ impl EnvironmentImpl {
             use noxu_recovery::checkpointer::{CheckpointConfig, Checkpointer};
             let mut builder = Checkpointer::new(
                 CheckpointConfig::new()
-                    .bytes_interval(cfg.checkpointer_bytes_interval),
+                    .bytes_interval(cfg.checkpointer_bytes_interval)
+                    // T-17: thread the configurable BIN-delta percent
+                    // (TREE_BIN_DELTA / BIN_DELTA_PERCENT) into the
+                    // count-based delta-vs-full decision
+                    // (BinStub::should_log_delta / JE BIN.shouldLogDelta).
+                    .bin_delta_percent(cfg.tree_bin_delta_percent as i32),
             )
             // REC-D: thread the configured CHECKPOINTER_BYTES_INTERVAL into
             // the runnable gate. Without this the gate used the hardcoded

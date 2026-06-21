@@ -90,6 +90,11 @@ pub struct DbiEnvConfig {
     pub tree_max_embedded_ln: u32,
     pub tree_max_delta: u8,
     pub tree_bin_delta: bool,
+    /// BIN-delta percent threshold (JE `TREE_BIN_DELTA` / `BIN_DELTA_PERCENT`,
+    /// 0–75, default 25).  Controls the count-based delta-vs-full decision in
+    /// `BinStub::should_log_delta`.  Distinct from the `tree_bin_delta` bool
+    /// (enable/disable) and from `tree_max_delta` (JE `TREE_MAX_DELTA`).
+    pub tree_bin_delta_percent: u8,
     pub tree_min_memory: u64,
     pub tree_compact_max_key_length: u32,
 
@@ -273,6 +278,7 @@ impl Default for DbiEnvConfig {
             tree_max_embedded_ln: 16,
             tree_max_delta: 25,
             tree_bin_delta: true,
+            tree_bin_delta_percent: 25,
             tree_min_memory: 0,
             tree_compact_max_key_length: 16,
             // INCompressor

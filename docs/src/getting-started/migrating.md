@@ -522,13 +522,19 @@ txn.abort(); // database registration is rolled back
 
 ### C-5: BIN delta log behaviour changes in checkpoint traces
 
-`BIN::should_log_delta()` gained three JE-equivalent guard clauses:
+`BIN::should_log_delta()` is now a faithful port of JE `BIN.shouldLogDelta`
+(BIN.java:1892).  The delta-vs-full decision is COUNT-based (the number of
+delta slots vs `nEntries * binDeltaPercent / 100`, integer math) using the
+configurable `TREE_BIN_DELTA` percent (0–75, default 25, set via
+`EnvironmentConfig::set_tree_bin_delta_percent`) — not the former dirty-fraction
+heuristic against a hardcoded 0.25.  It also carries three JE-equivalent guard
+clauses:
 
 1. BINs already in delta form always re-log as a delta (no change for
    users; previously a spurious full BIN could be written).
 2. After `compress()` removes a dirty slot (`prohibit_next_delta = true`),
    the next checkpoint writes a full BIN instead of a delta.
-3. A BIN whose full version has never been written (`last_full_version ==
+3. A BIN whose full version has never been written (`last_full_lsn ==
    NULL_LSN`) always writes a full BIN.
 
 On-disk format is unchanged; recovery is strictly safer.  Checkpoint
