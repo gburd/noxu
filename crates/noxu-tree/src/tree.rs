@@ -5006,7 +5006,7 @@ impl Tree {
     ) -> Vec<(i32, Arc<RwLock<TreeNode>>)> {
         let mut result: Vec<(i32, Arc<RwLock<TreeNode>>)> = Vec::new();
         if let Some(root) = self.get_root() {
-            Self::collect_dirty_upper_ins_recursive(&root, 0, &mut result);
+            Self::collect_dirty_upper_ins_recursive(&root, &mut result);
         }
         result.sort_by_key(|(level, _)| *level);
         result
@@ -5014,7 +5014,6 @@ impl Tree {
 
     fn collect_dirty_upper_ins_recursive(
         node_arc: &Arc<RwLock<TreeNode>>,
-        depth: i32,
         out: &mut Vec<(i32, Arc<RwLock<TreeNode>>)>,
     ) {
         let guard = node_arc.read();
@@ -5024,17 +5023,23 @@ impl Tree {
             }
             TreeNode::Internal(n) => {
                 let is_dirty = n.dirty;
-                let level = depth;
+                // REC-AA: return the node's ACTUAL tree level (n.level, in
+                // MAIN_LEVEL|n units), not a root-relative depth.  The level
+                // must be on the same scale as a BIN's `level` (BIN_LEVEL =
+                // MAIN_LEVEL|1) so that the checkpointer's flush-level
+                // computation and the evictor's `node_level < flush_level`
+                // comparison are meaningful.  With a root-relative depth the
+                // root had the SMALLEST value (0) and the IN above the BINs
+                // the LARGEST, inverting the provisional/non-provisional
+                // boundary; with n.level the root has the largest level, as JE
+                // expects.
+                let level = n.level;
                 let children: Vec<Arc<RwLock<TreeNode>>> =
                     n.entries.iter().filter_map(|e| e.child.clone()).collect();
                 drop(guard);
                 // Recurse into children first (bottom-up ordering).
                 for child in &children {
-                    Self::collect_dirty_upper_ins_recursive(
-                        child,
-                        depth + 1,
-                        out,
-                    );
+                    Self::collect_dirty_upper_ins_recursive(child, out);
                 }
                 // Add this node after children (so parent comes after all descendants).
                 if is_dirty {

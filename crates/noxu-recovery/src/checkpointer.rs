@@ -206,7 +206,21 @@ pub struct Checkpointer {
     /// Bytes-written threshold that triggers an immediate checkpoint.
     ///
     /// Default: 10 MiB (10 * 1024 * 1024).  Set to 0 to disable.
+    ///
+    /// REC-D: wired from `CHECKPOINTER_BYTES_INTERVAL` (default 20 MB) by the
+    /// environment via `with_bytes_interval`. JE Checkpointer ctor:
+    /// `logSizeBytesInterval = configManager.getLong(CHECKPOINTER_BYTES_INTERVAL)`.
     checkpoint_bytes_interval: u64,
+    /// Time-based checkpoint interval in milliseconds (0 = time-based
+    /// checkpoints disabled, bytes-only).
+    ///
+    /// REC-D: wired from `CHECKPOINTER_WAKEUP_INTERVAL` by the environment via
+    /// `with_time_interval`. JE `getWakeupPeriod`: bytes-OR-time, with the
+    /// byte interval taking precedence when non-zero. The daemon paces its
+    /// own sleep at this interval; `is_runnable` consults it only when the
+    /// byte interval is disabled (matches JE `isRunnable` useTimeInterval
+    /// branch, which fires only when `logSizeBytesInterval == 0`).
+    checkpoint_time_interval_ms: u64,
     /// Optional utilization tracker for persisting file summaries.
     ///
     /// When set, `persist_file_summaries()` iterates tracked summaries and
@@ -266,6 +280,7 @@ impl Checkpointer {
             db_trees_registry: None,
             bytes_since_checkpoint: AtomicU64::new(0),
             checkpoint_bytes_interval: 10 * 1024 * 1024, // 10 MiB default
+            checkpoint_time_interval_ms: 0, // time-based disabled by default
             utilization_tracker: None,
             cleaner: None,
             txn_manager: None,
@@ -278,6 +293,16 @@ impl Checkpointer {
     ///
     pub fn with_bytes_interval(mut self, bytes: u64) -> Self {
         self.checkpoint_bytes_interval = bytes;
+        self
+    }
+
+    /// Set the time-based checkpoint interval (milliseconds).
+    ///
+    /// REC-D: wired from `CHECKPOINTER_WAKEUP_INTERVAL`. JE `getWakeupPeriod`
+    /// computes bytes-OR-time with bytes taking precedence; `isRunnable`
+    /// consults the time interval only when the byte interval is 0.
+    pub fn with_time_interval(mut self, millis: u64) -> Self {
+        self.checkpoint_time_interval_ms = millis;
         self
     }
 
@@ -396,26 +421,53 @@ impl Checkpointer {
     /// checkpoint on every wakeup tick even on a fully idle environment
     /// (wasted I/O). Returns true if:
     ///   - `force`, OR
+    ///   - REC-F: the cleaner has files pending reclaim
+    ///     (`needCheckpointForCleanedFiles()` → `isCheckpointNeeded()`), even
+    ///     with no writes — so an idle env still reclaims cleaned files, OR
     ///   - bytes written since the last checkpoint >= the byte interval, OR
-    ///   - the time interval elapsed AND something was written since the last
-    ///     checkpoint (`bytes_since_checkpoint > 0` — JE's `lastUsedLsn !=
+    ///   - (only when the byte interval is disabled) the time interval elapsed
+    ///     AND something was written since the last checkpoint
+    ///     (`bytes_since_checkpoint > 0` — JE's `lastUsedLsn !=
     ///     lastCheckpointEnd` idle-guard).
+    ///
+    /// JE ref: `Checkpointer.isRunnable` — order is force, then
+    /// `wakeupAfterNoWrites && needCheckpointForCleanedFiles()`, then the
+    /// bytes-OR-time interval (bytes takes precedence; the time branch only
+    /// runs when `logSizeBytesInterval == 0`).
     pub fn is_runnable(&self, force: bool) -> bool {
         if force {
             return true;
         }
-        let bytes_since = self.bytes_since_checkpoint.load(Ordering::Relaxed);
-        if self.checkpoint_bytes_interval != 0
-            && bytes_since >= self.checkpoint_bytes_interval
-        {
+        // REC-F: wake for cleaner-pending files even on an idle environment.
+        // JE `isRunnable`: `if (wakeupAfterNoWrites && needCheckpointForCleanedFiles())
+        // return true;`.  Noxu folds `wakeupAfterNoWrites` into the cleaner
+        // query directly — `needs_checkpoint_for_cleaned_files()` is true iff
+        // the cleaner reports CLEANED/FULLY_PROCESSED files pending reclaim.
+        if self.needs_checkpoint_for_cleaned_files() {
             return true;
         }
-        // Time-cadence branch: the caller (the daemon) only invokes this once
-        // per wakeup interval, so reaching here means the time interval has
-        // elapsed. JE's idle-guard (`lastUsedLsn != lastCheckpointEnd`) maps to
-        // "something was written since the last checkpoint" — i.e.
-        // bytes_since > 0. Skip the checkpoint entirely on an idle environment.
+        let bytes_since = self.bytes_since_checkpoint.load(Ordering::Relaxed);
+        if self.checkpoint_bytes_interval != 0 {
+            // Bytes interval takes precedence (JE getWakeupPeriod): when it is
+            // non-zero the time branch is never consulted.
+            return bytes_since >= self.checkpoint_bytes_interval;
+        }
+        // Time-cadence branch (only reached when the byte interval is 0): the
+        // caller (the daemon) only invokes this once per wakeup interval, so
+        // reaching here means the time interval has elapsed. JE's idle-guard
+        // (`lastUsedLsn != lastCheckpointEnd`) maps to "something was written
+        // since the last checkpoint" — i.e. bytes_since > 0. Skip the
+        // checkpoint entirely on an idle environment.
         bytes_since > 0
+    }
+
+    /// REC-F: whether the cleaner has files pending reclaim that a checkpoint
+    /// would unblock.  Mirrors JE `Checkpointer.needCheckpointForCleanedFiles`
+    /// → `cleaner.getFileSelector().isCheckpointNeeded()` (any CLEANED or
+    /// FULLY_PROCESSED files exist).  Returns `false` when no cleaner is
+    /// wired.
+    fn needs_checkpoint_for_cleaned_files(&self) -> bool {
+        self.cleaner.as_ref().map(|c| c.is_checkpoint_needed()).unwrap_or(false)
     }
 
     /// Test-only: bump `bytes_since_checkpoint` without triggering a
@@ -643,7 +695,15 @@ impl Checkpointer {
                 checkpoint_id,
                 invoker,
                 start_lsn,
-                None, // root_lsn  (REC-P/T-F3 documented deferral)
+                // REC-P / REC-B: root_lsn is intentionally always None.  JE
+                // records the mapping-tree root here (Checkpointer.flushRoot
+                // → CheckpointEnd.rootLsn), but Noxu's catalog is an in-memory
+                // HashMap rebuilt from NameLN WAL entries during recovery
+                // (REC-B authorized divergence), so there is no mapping tree
+                // to flush and no root LSN to record.  Per-DB utilization is
+                // persisted via persist_file_summaries (FileSummaryLN), not a
+                // mapping-tree MapLN flush.
+                None, // root_lsn
                 first_active_lsn,
                 // REC-S: real id maxima (were hardcoded 0).
                 last_local_node_id,
@@ -844,6 +904,50 @@ impl Checkpointer {
     /// Get the next checkpoint ID (without incrementing).
     pub fn peek_next_checkpoint_id(&self) -> u64 {
         self.next_checkpoint_id.load(Ordering::SeqCst)
+    }
+
+    /// REC-G: seed the checkpoint-interval baselines from a recovered
+    /// checkpoint, so the FIRST post-recovery checkpoint interval is measured
+    /// from the recovered `CkptEnd` rather than from process start.
+    ///
+    /// Without this, `last_checkpoint_start`/`_end` start at `NULL_LSN` and
+    /// `bytes_since_checkpoint` at 0 after recovery, so the bytes/time gate
+    /// would treat all log written before the crash as "since the last
+    /// checkpoint" — firing a redundant checkpoint immediately, or (for the
+    /// time branch) measuring the interval from the wrong baseline.
+    ///
+    /// JE ref: `Checkpointer.initIntervals(lastCheckpointStart,
+    /// lastCheckpointEnd, lastCheckpointMillis)` — called from
+    /// `RecoveryManager.recover()` after the recovery scan completes.  Noxu
+    /// passes the recovered `checkpoint_start_lsn` / `checkpoint_end_lsn`
+    /// (NULL_LSN when the log had no prior checkpoint, matching JE).
+    pub fn init_intervals(
+        &self,
+        last_checkpoint_start: Lsn,
+        last_checkpoint_end: Lsn,
+    ) {
+        *self.last_checkpoint_start.lock() = last_checkpoint_start;
+        *self.last_checkpoint_end.lock() = last_checkpoint_end;
+        // A freshly-recovered environment has written nothing since the
+        // recovered checkpoint; reset the byte accumulator so the gate does
+        // not immediately fire on pre-crash log volume.
+        self.bytes_since_checkpoint.store(0, Ordering::Relaxed);
+    }
+
+    /// REC-H: continue the checkpoint-ID sequence after recovery instead of
+    /// restarting at 1.  The next checkpoint will use `last_checkpoint_id + 1`.
+    ///
+    /// The ID is a debug/log tag (not a correctness key), but it should not
+    /// regress or collide across restarts.  Seeded from the recovered
+    /// `CkptEnd.id`.
+    ///
+    /// JE ref: `Checkpointer.setCheckpointId(lastCheckpointId)` — "can only be
+    /// done after recovery"; JE stores `checkpointId = lastCheckpointId` and
+    /// `incrementProgress`/`generateCheckpointId` advances from there.  Noxu's
+    /// `do_checkpoint` does `fetch_add(1)`, so we seed `next_checkpoint_id =
+    /// last_checkpoint_id + 1` to make the next emitted ID strictly greater.
+    pub fn set_checkpoint_id(&self, last_checkpoint_id: u64) {
+        self.next_checkpoint_id.store(last_checkpoint_id + 1, Ordering::SeqCst);
     }
 
     /// Flush all dirty BINs to the log (public, unit-result API).
@@ -1078,16 +1182,32 @@ impl Checkpointer {
                 .unwrap_or_else(|e| e.into_inner());
             levels.clear();
             for (db_id, tree_arc) in &trees_to_flush {
-                let max_level = tree_arc
-                    .read()
-                    .ok()
-                    .and_then(|guard| {
-                        let dirty_ins = guard.collect_dirty_upper_ins(*db_id);
-                        dirty_ins.iter().map(|(lvl, _)| *lvl).max()
-                    })
-                    .unwrap_or(0);
-                if max_level > 0 {
-                    levels.insert(*db_id, max_level);
+                // REC-AA: the recorded highest flush level is
+                // `max(dirty-upper-IN-level) + 1`, bounded by the root level
+                // — JE DirtyINMap.updateFlushLevels flushes at least one level
+                // ABOVE the highest dirty node (`(ckptFlushExtraLevel || isBIN)
+                // && !isRoot` → `level += 1`) so the lower level is logged
+                // provisionally and recovery skips reprocessing it.  The `+1`
+                // is bounded by the root level (`!isRoot` guard) so we never
+                // claim to flush above the tree root — a node AT the root level
+                // is the non-provisional anchor and must NOT itself be marked
+                // coverable.
+                let flush_level = tree_arc.read().ok().and_then(|guard| {
+                    let dirty_ins = guard.collect_dirty_upper_ins(*db_id);
+                    let max_dirty =
+                        dirty_ins.iter().map(|(lvl, _)| *lvl).max()?;
+                    // Root level bounds the +1.  The root is the
+                    // highest-level resident node.
+                    let root_level = guard
+                        .get_root()
+                        .map(|r| r.read().level())
+                        .unwrap_or(max_dirty);
+                    Some((max_dirty + 1).min(root_level))
+                });
+                if let Some(level) = flush_level
+                    && level > 0
+                {
+                    levels.insert(*db_id, level);
                 }
             }
         }
@@ -1547,25 +1667,49 @@ mod tests {
     /// NULL_LSN (never checkpointed) and `true` after setting a non-NULL LSN.
     #[test]
     fn test_is_runnable_idle_guard() {
-        // Finding 9 regression: the daemon must NOT checkpoint an idle
-        // environment every wakeup. is_runnable(false) is false until bytes
-        // are written; force is always true.
+        // The daemon must NOT checkpoint an idle environment every wakeup.
+        // is_runnable(false) is false until the relevant interval trips; force
+        // is always true.
+        //
+        // REC-D: when the byte interval is set (non-zero) it takes precedence
+        // (JE getWakeupPeriod / isRunnable: useTimeInterval stays 0), so a
+        // sub-interval write is NOT runnable — only crossing the byte interval
+        // is.
         let cp = Checkpointer::new(CheckpointConfig::default())
             .with_bytes_interval(1024);
         // Idle: nothing written since the last checkpoint.
         assert!(!cp.is_runnable(false), "idle env must not be runnable");
         // Force always runs (JE config.getForce()).
         assert!(cp.is_runnable(true), "force must always be runnable");
-        // After a sub-interval write, the time-cadence idle-guard makes it
-        // runnable (something was written), even below the byte interval.
+        // A sub-interval write is NOT runnable when a byte interval is set
+        // (bytes takes precedence over time per JE isRunnable).
         cp.note_bytes_for_test(100);
         assert!(
-            cp.is_runnable(false),
-            "runnable once something was written since the last checkpoint"
+            !cp.is_runnable(false),
+            "sub-interval write must not be runnable when a byte interval is set \
+             (REC-D: bytes takes precedence over the time branch)"
         );
-        // Above the byte interval is also runnable.
+        // Crossing the byte interval is runnable.
         cp.note_bytes_for_test(2000);
         assert!(cp.is_runnable(false));
+    }
+
+    /// REC-D: when the byte interval is DISABLED (0) the time branch applies
+    /// — any write since the last checkpoint makes the daemon runnable on its
+    /// next wakeup (JE isRunnable useTimeInterval branch with the
+    /// `lastUsedLsn != lastCheckpointEnd` idle-guard).
+    #[test]
+    fn test_is_runnable_time_branch_when_bytes_disabled() {
+        let cp = Checkpointer::new(CheckpointConfig::default())
+            .with_bytes_interval(0); // bytes disabled → time-based
+        // Idle: nothing written → not runnable (idle-guard).
+        assert!(!cp.is_runnable(false), "idle time-based env must not run");
+        // Any write makes it runnable on the next wakeup tick.
+        cp.note_bytes_for_test(1);
+        assert!(
+            cp.is_runnable(false),
+            "time branch: a write since the last checkpoint makes it runnable"
+        );
     }
 
     #[test]
@@ -1914,5 +2058,283 @@ mod tests {
         }
         assert!(levels.lock().unwrap().is_empty(), "guard must clear map");
         assert!(!flag.load(Ordering::Acquire));
+    }
+
+    // -----------------------------------------------------------------------
+    // REC-D: the configured bytes-interval must reach the runnable gate
+    // (not the hardcoded 10 MiB default).
+    // -----------------------------------------------------------------------
+
+    /// REC-D fail-pre/pass-post: a Checkpointer built with a configured
+    /// bytes-interval must use THAT value in `is_runnable`, not the hardcoded
+    /// 10 MiB.  JE Checkpointer ctor:
+    /// `logSizeBytesInterval = configManager.getLong(CHECKPOINTER_BYTES_INTERVAL)`
+    /// and `isRunnable` compares the bytes-since-checkpoint against it.
+    ///
+    /// Fail-pre: before REC-D the env wired only `CheckpointConfig.bytes_interval`
+    /// (a field `is_runnable` never reads) while the gate used the hardcoded
+    /// `checkpoint_bytes_interval = 10 MiB`.  A 1 KiB configured interval would
+    /// NOT trip the gate at 1 KiB of writes.  Pass-post: `with_bytes_interval`
+    /// threads the configured value into the gate.
+    #[test]
+    fn test_rec_d_configured_bytes_interval_drives_runnable() {
+        // Configure a 1 KiB interval (far below the old 10 MiB default).
+        let cp = Checkpointer::new(CheckpointConfig::default())
+            .with_bytes_interval(1024);
+
+        // Just below the configured interval: not runnable.
+        cp.note_bytes_for_test(1000);
+        assert!(
+            !cp.is_runnable(false),
+            "REC-D: 1000 bytes < configured 1 KiB interval must not be runnable"
+        );
+
+        // Cross the configured interval: runnable.  (With the old hardcoded
+        // 10 MiB default this would stay false until 10 MiB of writes.)
+        cp.note_bytes_for_test(100);
+        assert!(
+            cp.is_runnable(false),
+            "REC-D: crossing the configured 1 KiB interval must be runnable; \
+             the gate must use the configured interval, not 10 MiB"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // REC-F: an idle environment with cleaner-pending files must trigger a
+    // checkpoint (JE wakeupAfterNoWrites / needCheckpointForCleanedFiles).
+    // -----------------------------------------------------------------------
+
+    /// REC-F fail-pre/pass-post: with no bytes written since the last
+    /// checkpoint, `is_runnable(false)` must still return true when the
+    /// cleaner reports files pending reclaim (CLEANED set non-empty).
+    ///
+    /// JE `Checkpointer.isRunnable`:
+    /// `if (wakeupAfterNoWrites && needCheckpointForCleanedFiles()) return true;`
+    /// where `needCheckpointForCleanedFiles()` →
+    /// `cleaner.getFileSelector().isCheckpointNeeded()`.
+    ///
+    /// Fail-pre: before REC-F `is_runnable` consulted only bytes; an idle env
+    /// with cleaned-but-unreclaimed files returned false, so reclamation
+    /// stalled until the next write-driven checkpoint.
+    #[test]
+    fn test_rec_f_idle_env_with_cleaner_pending_is_runnable() {
+        use noxu_cleaner::Cleaner;
+        use std::sync::Arc;
+
+        let cleaner = Arc::new(Cleaner::new(50, 1, 0));
+
+        let cp = Checkpointer::new(CheckpointConfig::default())
+            .with_bytes_interval(1024)
+            .with_cleaner(Arc::clone(&cleaner));
+
+        // Idle environment: nothing written since the last checkpoint, no
+        // cleaned files yet.
+        assert!(
+            !cp.is_runnable(false),
+            "REC-F precondition: idle env with no pending files must not be runnable"
+        );
+
+        // Simulate the cleaner cleaning a file: it moves to the CLEANED state
+        // (cleaned-but-not-checkpointed).  A checkpoint is now needed to
+        // advance the deletion barrier.
+        {
+            let mut selector = cleaner.get_file_selector().lock();
+            selector.add_file_to_clean(7);
+            selector.mark_file_cleaned(7);
+        }
+
+        assert!(
+            cleaner.is_checkpoint_needed(),
+            "REC-F: cleaner must report a checkpoint is needed for the CLEANED file"
+        );
+        // Still no bytes written, but the idle-reclaim trigger fires.
+        assert!(
+            cp.is_runnable(false),
+            "REC-F: idle env with cleaner-pending files must be runnable \
+             (JE wakeupAfterNoWrites / needCheckpointForCleanedFiles)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // REC-G: init_intervals seeds the interval baselines from a recovered
+    // checkpoint (JE Checkpointer.initIntervals).
+    // -----------------------------------------------------------------------
+
+    /// REC-G fail-pre/pass-post: after recovery the checkpointer's interval
+    /// baselines must equal the recovered CkptEnd LSNs, not NULL_LSN.
+    ///
+    /// Fail-pre: a freshly-constructed Checkpointer has
+    /// `last_checkpoint_start`/`_end` == NULL_LSN, so the first post-recovery
+    /// interval is measured from process start.  Pass-post: `init_intervals`
+    /// seeds them from the recovered CkptEnd.
+    ///
+    /// JE ref: `Checkpointer.initIntervals(lastCheckpointStart,
+    /// lastCheckpointEnd, lastCheckpointMillis)`.
+    #[test]
+    fn test_rec_g_init_intervals_seeds_baselines() {
+        let cp = Checkpointer::new(CheckpointConfig::default());
+        // Fail-pre baseline: fresh checkpointer starts at NULL_LSN.
+        assert_eq!(cp.get_last_checkpoint_start(), noxu_util::NULL_LSN);
+        assert_eq!(cp.get_last_checkpoint_end(), noxu_util::NULL_LSN);
+
+        // Simulate recovery surfacing a CkptEnd at (start=4:400, end=5:500).
+        let recovered_start = Lsn::new(4, 400);
+        let recovered_end = Lsn::new(5, 500);
+        // Pretend the env wrote some pre-crash bytes before recovery.
+        cp.note_bytes_for_test(9999);
+
+        cp.init_intervals(recovered_start, recovered_end);
+
+        assert_eq!(
+            cp.get_last_checkpoint_start(),
+            recovered_start,
+            "REC-G: baseline start must equal recovered CkptEnd start"
+        );
+        assert_eq!(
+            cp.get_last_checkpoint_end(),
+            recovered_end,
+            "REC-G: baseline end must equal recovered CkptEnd end"
+        );
+        // The byte accumulator is reset so pre-crash volume does not
+        // immediately trip the runnable gate.
+        assert!(
+            !cp.is_runnable(false),
+            "REC-G: byte accumulator must reset on init_intervals"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // REC-H: set_checkpoint_id continues the sequence after recovery
+    // (JE Checkpointer.setCheckpointId).
+    // -----------------------------------------------------------------------
+
+    /// REC-H fail-pre/pass-post: after recovery the next checkpoint ID must
+    /// continue from the recovered CkptEnd id, not restart at 1.
+    ///
+    /// Fail-pre: a fresh Checkpointer's first checkpoint id is 1, colliding
+    /// with pre-crash ids.  Pass-post: `set_checkpoint_id(recovered_id)` makes
+    /// the next emitted id `recovered_id + 1`.
+    ///
+    /// JE ref: `Checkpointer.setCheckpointId(lastCheckpointId)`.
+    #[test]
+    fn test_rec_h_set_checkpoint_id_continues_sequence() {
+        let cp = Checkpointer::new(CheckpointConfig::default());
+        // Fail-pre: a fresh checkpointer would issue id 1.
+        assert_eq!(cp.peek_next_checkpoint_id(), 1);
+
+        // Recovery found a CkptEnd with id 42.
+        cp.set_checkpoint_id(42);
+        assert_eq!(
+            cp.peek_next_checkpoint_id(),
+            43,
+            "REC-H: next checkpoint id must be recovered_id + 1"
+        );
+
+        // The next checkpoint must use 43, not 1.
+        let result = cp.do_checkpoint("post_recovery").unwrap();
+        assert_eq!(
+            result.checkpoint_id, 43,
+            "REC-H: post-recovery checkpoint id must continue the sequence"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // REC-AA: the highest-flush-level is max(dirty-upper-IN-level) + 1,
+    // bounded by the root level (JE DirtyINMap.updateFlushLevels).
+    // -----------------------------------------------------------------------
+
+    /// REC-AA fail-pre/pass-post: the per-tree highest flush level recorded
+    /// for eviction coordination must be `max(dirty-upper-IN-level) + 1`
+    /// (bounded by the root level), so a BIN evicted during the checkpoint is
+    /// logged `Provisional::Yes` (covered by a non-provisional ancestor).
+    ///
+    /// Fail-pre: before REC-AA `collect_dirty_upper_ins` returned a
+    /// root-relative depth (root=0) instead of the node's tree level, so the
+    /// flush-levels map held tiny depths (1, 2) while the evictor compared the
+    /// BIN's real `BIN_LEVEL` (`MAIN_LEVEL|1`); `BIN_LEVEL < 2` is always false
+    /// → every BIN was logged `Provisional::No`, and the JE `+1` adjustment
+    /// was absent entirely.
+    ///
+    /// Pass-post: levels are real tree levels, the recorded flush level is
+    /// `max_dirty_upper_in_level + 1` bounded by the root, and a BIN at
+    /// `BIN_LEVEL` gets `Provisional::Yes`.
+    ///
+    /// JE ref: `DirtyINMap.updateFlushLevels` (`(ckptFlushExtraLevel || isBIN)
+    /// && !isRoot` → `level += 1`) / `Checkpointer.flushDirtyNodes`.
+    #[test]
+    fn test_rec_aa_flush_level_is_max_dirty_plus_one() {
+        use noxu_log::FileManager;
+        use noxu_tree::tree::{BIN_LEVEL, Tree};
+        use noxu_util::lsn::Lsn;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let fm = Arc::new(
+            FileManager::new(dir.path(), false, 64 * 1024 * 1024, 100).unwrap(),
+        );
+        let lm =
+            Arc::new(LogManager::new(Arc::clone(&fm), 3, 1024 * 1024, 65536));
+
+        // Fanout 4 + 20 inserts forces root splits → a 3-level tree
+        // (root at MAIN_LEVEL|3, upper INs at |2, BINs at BIN_LEVEL=|1), with
+        // dirty upper INs from the splits.
+        let tree = Tree::new(1, 4);
+        for i in 0u32..20 {
+            let key = format!("key{:04}", i).into_bytes();
+            let data = format!("data{}", i).into_bytes();
+            tree.insert(key, data, Lsn::new(1, 100 + i)).unwrap();
+        }
+        let root_level = tree.get_root().unwrap().read().level();
+        let dirty_uppers = tree.collect_dirty_upper_ins(1);
+        assert!(
+            !dirty_uppers.is_empty(),
+            "precondition: the split tree must have dirty upper INs"
+        );
+        let max_dirty = dirty_uppers.iter().map(|(l, _)| *l).max().unwrap();
+        // Levels must be real tree levels, not depths (REC-AA fail-pre would
+        // have tiny depths here).
+        assert!(
+            max_dirty >= (noxu_tree::MAIN_LEVEL | 2),
+            "upper-IN levels must be real tree levels (>= MAIN_LEVEL|2), got {max_dirty}"
+        );
+
+        let tree_arc = Arc::new(RwLock::new(tree));
+        let cp = Checkpointer::new(CheckpointConfig::default())
+            .with_log_manager(Arc::clone(&lm))
+            .with_tree(Arc::clone(&tree_arc), 1);
+
+        // Mark a checkpoint in progress and run the upper-IN flush, which
+        // populates checkpoint_flush_levels with the REC-AA value.
+        cp.checkpoint_in_progress.store(true, Ordering::Release);
+        cp.flush_upper_ins_internal().unwrap();
+
+        let recorded = cp
+            .checkpoint_flush_levels
+            .lock()
+            .unwrap()
+            .get(&1u64)
+            .copied()
+            .expect("db 1 must have a recorded flush level");
+
+        let expected = (max_dirty + 1).min(root_level);
+        assert_eq!(
+            recorded, expected,
+            "REC-AA: flush level must be max(dirty-upper-IN-level)+1 bounded by root"
+        );
+
+        // A BIN at BIN_LEVEL must be covered (Provisional::Yes): the recorded
+        // flush level is strictly above it.
+        assert!(
+            BIN_LEVEL < recorded,
+            "BIN_LEVEL ({BIN_LEVEL}) must be < recorded flush level ({recorded})"
+        );
+        assert_eq!(
+            cp.get_eviction_provisional(1, BIN_LEVEL),
+            Provisional::Yes,
+            "REC-AA: a BIN below the flush level must be Provisional::Yes"
+        );
+
+        cp.checkpoint_in_progress.store(false, Ordering::Release);
+        cp.checkpoint_flush_levels.lock().unwrap().clear();
     }
 }

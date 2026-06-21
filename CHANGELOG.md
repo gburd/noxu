@@ -122,6 +122,87 @@ listed in [References](#references).
   `DbTree.setLastDbId` / `TxnManager.setLastTxnId`. Test
   `ids_do_not_restart_at_one_after_recovery`.
 
+### Fixed (recovery — checkpointer breadth: REC-D, REC-F)
+
+- **REC-D: the checkpoint byte/time intervals are now threaded from config
+  into the runnable gate instead of using a hardcoded 10 MiB.**  The
+  `Checkpointer` runnable gate (`is_runnable`) and the write-trigger
+  (`wakeup_after_write`) consult `checkpoint_bytes_interval`, which the
+  environment now wires from `CHECKPOINTER_BYTES_INTERVAL` (default 20 MB) via
+  the new `Checkpointer::with_bytes_interval` call in
+  `EnvironmentImpl::new_with_config_inner` (previously only the
+  decorative `CheckpointConfig.bytes_interval` was set — a field the gate never
+  read — so the gate always used the 10 MiB default).  The time interval
+  (`CHECKPOINTER_WAKEUP_INTERVAL`) is wired via
+  `Checkpointer::with_time_interval`, and `is_runnable` now follows JE
+  `getWakeupPeriod`/`isRunnable` precedence: the byte interval takes precedence
+  when non-zero, and the time branch (with the `lastUsedLsn != lastCheckpointEnd`
+  idle-guard) applies only when the byte interval is 0.  The env checkpointer
+  daemon now gates its periodic checkpoint on `is_runnable(false)` so an idle
+  environment is no longer checkpointed every wakeup.  Cite
+  `Checkpointer.java` ctor / `getWakeupPeriod` / `isRunnable`.
+- **REC-F: an idle environment with cleaner-pending files now triggers an
+  automatic idle checkpoint, reclaiming cleaned files instead of waiting for
+  the next write-driven/forced checkpoint.**  `Checkpointer::is_runnable` now
+  returns true when the wired cleaner reports files pending reclaim
+  (`Cleaner::is_checkpoint_needed` → `FileSelector::is_checkpoint_needed`: any
+  CLEANED or CHECKPOINTED file mid-barrier), mirroring JE
+  `Checkpointer.wakeupAfterNoWrites` / `needCheckpointForCleanedFiles` →
+  `FileSelector.isCheckpointNeeded`.  Cite `Checkpointer.java`
+  `wakeupAfterNoWrites` / `isRunnable` and `FileSelector.isCheckpointNeeded`.
+- **REC-G: the checkpointer's interval baselines are now seeded from the
+  recovered `CkptEnd` after recovery instead of starting fresh.**  The new
+  `Checkpointer::init_intervals(last_checkpoint_start, last_checkpoint_end)`
+  is called from `EnvironmentImpl::new_with_config_inner` with the recovered
+  `RecoveryInfo::checkpoint_start_lsn` / `checkpoint_end_lsn`, so the FIRST
+  post-recovery checkpoint interval is measured from the recovered checkpoint
+  rather than from process start (and the byte accumulator is reset so
+  pre-crash log volume does not immediately trip the gate).  No-op when the
+  log had no prior checkpoint.  Cite `Checkpointer.initIntervals`.
+- **REC-H: the checkpoint-ID sequence now continues after recovery instead of
+  restarting at 1.**  The recovered `CkptEnd.id` is surfaced through the new
+  `RecoveryInfo::recovered_checkpoint_id` (captured in
+  `RecoveryManager::find_last_checkpoint` and re-confirmed in the analysis
+  pass), and `EnvironmentImpl` calls the new
+  `Checkpointer::set_checkpoint_id(recovered_id)` so the next checkpoint uses
+  `recovered_id + 1`.  The ID is a debug/log tag (not a correctness key) but
+  no longer regresses or collides across restarts.  Cite
+  `Checkpointer.setCheckpointId`.
+
+### Removed (recovery — dead checkpointer plumbing: REC-P)
+
+- **REC-P: deleted the dead `DirtyINMap` MapLN-flush plumbing
+  (`map_lns_to_flush` field, `add_map_ln_to_flush`, `get_map_lns_to_flush`)
+  that the checkpointer never called.**  JE's checkpoint flushes per-DB
+  utilization `MapLN`s and the mapping-tree root (`DirtyINMap.flushMapLNs` /
+  `Checkpointer.flushRoot`), but Noxu's catalog is an in-memory
+  `HashMap<DatabaseId, DatabaseImpl>` rebuilt from `NameLN` WAL entries during
+  recovery (REC-B, authorized divergence), so there is no `_jeNameTree`
+  B-tree to flush and no root LSN to record — `CheckpointEnd.root_lsn` is
+  intentionally always `None` (now documented at the `do_checkpoint` call
+  site and in the `dirty_in_map` module docs).  Per-DB utilization is still
+  persisted, but via `Checkpointer::persist_file_summaries` (`FileSummaryLN`),
+  not a mapping-tree MapLN flush.  MapLN persistence proper is the cleaner
+  workstream's concern and was deliberately NOT implemented here.
+
+### Fixed (recovery/tree/eviction — highest-flush-level: REC-AA)
+
+- **REC-AA: the per-tree highest-flush-level used for eviction–checkpoint
+  coordination now uses real tree levels and the JE `+1` adjustment, so a BIN
+  evicted during a checkpoint is correctly logged provisionally.**  Two bugs
+  were compounded: `Tree::collect_dirty_upper_ins` returned a root-relative
+  *depth* (root = 0) instead of the node's real tree level, so the
+  checkpointer's flush-levels map held tiny depths (1, 2) while the evictor
+  compared a BIN's real `BIN_LEVEL` (`MAIN_LEVEL|1`) — `BIN_LEVEL < 2` is
+  always false, so eviction-provisional NEVER fired for real BINs; and the JE
+  `+1` (flush one level ABOVE the bottom BIN so BINs are provisional) was
+  absent.  `collect_dirty_upper_ins` now returns the node's actual `level`
+  (fixing an inverted provisional/non-provisional boundary in the upper-IN
+  flush too — the root is now the max level, logged `Provisional::No`), and
+  the checkpointer records `max(dirty-upper-IN-level) + 1` bounded by the root
+  level.  Coordinates with the CC-4 per-tree eviction-provisional logic
+  (`get_eviction_provisional`).  Cite `DirtyINMap.updateFlushLevels` /
+  `Checkpointer.flushDirtyNodes`.
 
 ## [6.1.0] - 2026-06-19
 

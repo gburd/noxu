@@ -1390,6 +1390,14 @@ impl Cleaner {
         self.file_selector.lock().get_checkpoint_state()
     }
 
+    /// REC-F: whether the cleaner has files pending reclaim that a checkpoint
+    /// would unblock.  Mirrors JE
+    /// `Cleaner.getFileSelector().isCheckpointNeeded()` (used by
+    /// `Checkpointer.needCheckpointForCleanedFiles`).
+    pub fn is_checkpoint_needed(&self) -> bool {
+        self.file_selector.lock().is_checkpoint_needed()
+    }
+
     /// Notify the cleaner that a checkpoint has completed.
     ///
     /// Called by the checkpointer after `do_checkpoint()` succeeds.  This

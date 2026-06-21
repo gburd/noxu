@@ -400,6 +400,12 @@ impl RecoveryManager {
         self.stats.committed_txns = analysis.committed_count() as u64;
         self.stats.aborted_txns = analysis.aborted_count() as u64;
 
+        // REC-H: prefer the analysis-pass checkpoint ID (latest CkptEnd) when
+        // present; otherwise keep the one find_last_checkpoint already set.
+        if let Some(id) = analysis.last_checkpoint_id {
+            self.info.recovered_checkpoint_id = Some(id);
+        }
+
         // ------------------------------------------------------------------
         // Phase 2: Redo — replay dirty INs (bottom-up) and committed LNs
         // ------------------------------------------------------------------
@@ -528,6 +534,12 @@ impl RecoveryManager {
 
         self.stats.committed_txns = analysis.committed_count() as u64;
         self.stats.aborted_txns = analysis.aborted_count() as u64;
+
+        // REC-H: prefer the analysis-pass checkpoint ID (latest CkptEnd) when
+        // present; otherwise keep the one find_last_checkpoint already set.
+        if let Some(id) = analysis.last_checkpoint_id {
+            self.info.recovered_checkpoint_id = Some(id);
+        }
 
         // ------------------------------------------------------------------
         // verifyThread.finish(): join the background verifier before redo.
@@ -940,6 +952,9 @@ impl RecoveryManager {
         let mut first_active_from_end = NULL_LSN;
         let mut root_lsn = NULL_LSN;
         let mut partial_start_lsn = NULL_LSN;
+        // REC-H: the recovered checkpoint ID, so the checkpointer can continue
+        // the sequence instead of restarting at 1.
+        let mut ckpt_id_from_end: Option<u64> = None;
 
         if let Some(pe) = scanner.find_last_checkpoint_entry()
             && let LogEntry::CkptEnd(rec) = &pe.entry
@@ -947,6 +962,7 @@ impl RecoveryManager {
             ckpt_end_lsn = pe.lsn;
             ckpt_start_lsn_from_end = rec.checkpoint_start_lsn;
             first_active_from_end = rec.first_active_lsn;
+            ckpt_id_from_end = Some(rec.id);
             if rec.root_lsn != NULL_LSN {
                 root_lsn = rec.root_lsn;
             }
@@ -982,6 +998,8 @@ impl RecoveryManager {
         self.info.first_active_lsn = first_active_from_end;
         self.info.use_root_lsn = root_lsn;
         self.info.partial_checkpoint_start_lsn = partial_start_lsn;
+        // REC-H: surface the recovered checkpoint ID for sequence continuation.
+        self.info.recovered_checkpoint_id = ckpt_id_from_end;
 
         // Tell the rollback tracker where the checkpoint start is so that
         // rollback periods before it can be ignored.
@@ -1170,6 +1188,8 @@ impl RecoveryManager {
                         result_ref.checkpoint_start_lsn =
                             rec.checkpoint_start_lsn;
                         result_ref.first_active_lsn = rec.first_active_lsn;
+                        // REC-H: capture the latest checkpoint ID.
+                        result_ref.last_checkpoint_id = Some(rec.id);
                         if rec.root_lsn != NULL_LSN {
                             result_ref.use_root_lsn = rec.root_lsn;
                         }
@@ -2325,6 +2345,13 @@ mod tests {
         // checkpoint_end_lsn and checkpoint_start_lsn should be populated
         assert_ne!(info.checkpoint_end_lsn, NULL_LSN);
         assert_ne!(info.checkpoint_start_lsn, NULL_LSN);
+        // REC-H: the recovered checkpoint ID must be surfaced for sequence
+        // continuation (JE Checkpointer.setCheckpointId).
+        assert_eq!(
+            info.recovered_checkpoint_id,
+            Some(1),
+            "REC-H: recovered_checkpoint_id must equal the recovered CkptEnd id"
+        );
     }
 
     #[test]

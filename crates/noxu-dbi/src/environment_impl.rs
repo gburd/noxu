@@ -420,6 +420,13 @@ impl EnvironmentImpl {
         let mut recovered_max_node_id: u64 = 0;
         let mut recovered_max_db_id: u64 = 0;
         let mut recovered_max_txn_id: u64 = 0;
+        // REC-G / REC-H: checkpoint baselines recovered from the WAL, applied
+        // to the checkpointer once it is built so the first post-recovery
+        // checkpoint interval and ID continue from the recovered CkptEnd
+        // instead of resetting to NULL_LSN / 1.
+        let mut recovered_ckpt_start: noxu_util::Lsn = NULL_LSN;
+        let mut recovered_ckpt_end: noxu_util::Lsn = NULL_LSN;
+        let mut recovered_ckpt_id: Option<u64> = None;
 
         // Initialize the WAL (LogManager) for writable environments.
         // Read-only environments don't need to write log entries.
@@ -506,6 +513,14 @@ impl EnvironmentImpl {
             // the XA layer can surface them via xa_recover() and resolve
             // them via xa_commit / xa_rollback.
             recovered_prepared = recovery_info.recovered_prepared_txns.clone();
+            // REC-G / REC-H: capture checkpoint baselines BEFORE recovery_info
+            // is partially moved below.  `checkpoint_end` carries the recovered
+            // CkptEnd whose `.get_id()` continues the checkpoint-ID sequence;
+            // the start/end LSNs seed the interval baselines.  All are
+            // NULL_LSN / None when the log had no prior checkpoint.
+            recovered_ckpt_start = recovery_info.checkpoint_start_lsn;
+            recovered_ckpt_end = recovery_info.checkpoint_end_lsn;
+            recovered_ckpt_id = recovery_info.recovered_checkpoint_id;
             recovered_prepared_lns = recovery_info.prepared_txn_lns;
             // X-14 / X-1: stash VLSN rebuild data.
             recovery_vlsns = recovery_info.recovered_vlsns;
@@ -791,6 +806,16 @@ impl EnvironmentImpl {
                 CheckpointConfig::new()
                     .bytes_interval(cfg.checkpointer_bytes_interval),
             )
+            // REC-D: thread the configured CHECKPOINTER_BYTES_INTERVAL into
+            // the runnable gate. Without this the gate used the hardcoded
+            // 10 MiB default regardless of config. JE Checkpointer ctor reads
+            // EnvironmentParams.CHECKPOINTER_BYTES_INTERVAL into
+            // logSizeBytesInterval, which isRunnable() consults.
+            .with_bytes_interval(cfg.checkpointer_bytes_interval)
+            // REC-D: wire the time interval (CHECKPOINTER_WAKEUP_INTERVAL) so
+            // the bytes-OR-time runnable gate matches JE getWakeupPeriod
+            // (bytes takes precedence when non-zero).
+            .with_time_interval(cfg.checkpointer_wakeup_interval_ms)
             .with_log_manager(Arc::clone(lm))
             .with_tree(Arc::clone(&primary_tree), 1)
             // Stage-1: wire the db_trees_registry so the checkpointer flushes
@@ -814,6 +839,22 @@ impl EnvironmentImpl {
             Arc::new(builder)
         });
 
+        // REC-G / REC-H: seed the checkpointer's interval baselines and
+        // checkpoint-ID sequence from the recovered CkptEnd, so the first
+        // post-recovery checkpoint continues from the recovered state instead
+        // of measuring from process start / restarting the ID at 1.  No-op
+        // when the log had no prior checkpoint (NULL_LSN / None).  JE:
+        // RecoveryManager.recover() calls Checkpointer.initIntervals(...) and
+        // setCheckpointId(...) after the recovery scan.
+        if let Some(ckpt) = &checkpointer {
+            // REC-G
+            ckpt.init_intervals(recovered_ckpt_start, recovered_ckpt_end);
+            // REC-H
+            if let Some(id) = recovered_ckpt_id {
+                ckpt.set_checkpoint_id(id);
+            }
+        }
+
         // Start the background checkpointer daemon thread.
         //
         // Mirrors the evictor pattern: the thread holds an Arc clone of the
@@ -834,6 +875,15 @@ impl EnvironmentImpl {
                         ckpt_clone.wait_for_shutdown_or_timeout(interval);
                         if ckpt_clone.is_shutdown() {
                             break;
+                        }
+                        // REC-D / REC-F: gate the daemon checkpoint on
+                        // is_runnable so an idle environment is not
+                        // checkpointed every wakeup (wasted I/O), while a
+                        // cleaner with files pending reclaim still triggers an
+                        // idle checkpoint. JE Checkpointer.doCheckpoint returns
+                        // early when !isRunnable(config).
+                        if !ckpt_clone.is_runnable(false) {
+                            continue;
                         }
                         // Ignore checkpoint errors in the daemon — the
                         // environment may be closing or a concurrent
