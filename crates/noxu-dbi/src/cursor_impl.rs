@@ -2674,6 +2674,7 @@ impl CursorImpl {
                     &current_key,
                     Some(data),
                     self.locker_id,
+                    old_lsn,
                 )?;
                 self.finalize_write_lock(
                     old_lsn,
@@ -2716,8 +2717,12 @@ impl CursorImpl {
                 if self.key_exists_in_view(key) {
                     return Ok(OperationStatus::KeyExist);
                 }
-                let new_lsn =
-                    self.log_ln_write(key, Some(data), self.locker_id)?;
+                let new_lsn = self.log_ln_write(
+                    key,
+                    Some(data),
+                    self.locker_id,
+                    old_lsn,
+                )?;
                 self.finalize_write_lock(
                     old_lsn,
                     new_lsn,
@@ -2749,8 +2754,12 @@ impl CursorImpl {
                 // Write lock on old_lsn already conflicts with RangeRead.
                 self.lock_range_insert(key, old_lsn)?;
                 self.lock_write_before_log(old_lsn, key)?;
-                let new_lsn =
-                    self.log_ln_write(key, Some(data), self.locker_id)?;
+                let new_lsn = self.log_ln_write(
+                    key,
+                    Some(data),
+                    self.locker_id,
+                    old_lsn,
+                )?;
                 self.finalize_write_lock(
                     old_lsn,
                     new_lsn,
@@ -2795,13 +2804,18 @@ impl CursorImpl {
                     .current_key
                     .clone()
                     .ok_or(DbiError::CursorNotInitialized)?;
-                let del_lsn =
-                    self.log_ln_write(&old_key, None, self.locker_id)?;
+                let del_lsn = self.log_ln_write(
+                    &old_key,
+                    None,
+                    self.locker_id,
+                    noxu_util::NULL_LSN.as_u64(),
+                )?;
                 self.apply_tree_delete(old_key, del_lsn);
                 let new_lsn = self.log_ln_write(
                     &two_part_key,
                     Some(b""),
                     self.locker_id,
+                    noxu_util::NULL_LSN.as_u64(),
                 )?;
                 self.apply_tree_insert(two_part_key.clone(), vec![], new_lsn);
                 self.current_key = Some(two_part_key);
@@ -2831,6 +2845,7 @@ impl CursorImpl {
                     &two_part_key,
                     Some(b""),
                     self.locker_id,
+                    exists_old_lsn,
                 )?;
                 self.finalize_write_lock(
                     exists_old_lsn,
@@ -2896,8 +2911,12 @@ impl CursorImpl {
         // old_lsn is NULL_LSN: the existence check confirmed the pair is absent.
         let old_lsn = noxu_util::NULL_LSN.as_u64();
         self.lock_write_before_log(old_lsn, &two_part_key)?;
-        let new_lsn =
-            self.log_ln_write(&two_part_key, Some(b""), self.locker_id)?;
+        let new_lsn = self.log_ln_write(
+            &two_part_key,
+            Some(b""),
+            self.locker_id,
+            old_lsn,
+        )?;
         self.finalize_write_lock(
             old_lsn,
             new_lsn,
@@ -2919,11 +2938,19 @@ impl CursorImpl {
     ///
     /// Returns the LSN assigned to the entry, or NULL_LSN if no log manager
     /// is configured (e.g., read-only or test cursor).
+    ///
+    /// `old_lsn` is the LSN of the record's prior version in its BIN slot (the
+    /// before-image / abort LSN), or `NULL_LSN` for a brand-new insert.  It is
+    /// used both as the LnLogEntry's `abort_lsn` and to decide obsolete
+    /// counting (TXN-1 / L-6).  Callers must pass the slot's real prior LSN
+    /// (from `get_slot_before_image`), NOT the cursor's possibly-stale
+    /// `current_lsn`, which may belong to a different key.
     fn log_ln_write(
         &self,
         key: &[u8],
         data: Option<&[u8]>,
         txn_id: i64,
+        old_lsn: u64,
     ) -> Result<Lsn, DbiError> {
         // Deferred-write databases skip WAL logging entirely.
         // Data is flushed to disk only at eviction or checkpoint.
@@ -2971,21 +2998,74 @@ impl CursorImpl {
             LogEntryType::DeleteLN
         };
 
-        // Pass the previous slot LSN as old_lsn so the UtilizationTracker
-        // marks the previous version obsolete (the: countObsoleteNode with oldLsn).
-        let old_lsn_opt = if self.current_lsn != noxu_util::NULL_LSN.as_u64() {
-            Some(Lsn::from_u64(self.current_lsn))
+        // JE LN.log (LN.java:685): decide whether to count the prior slot
+        // version (Rc, at current_lsn) obsolete AT WRITE TIME.  Rc is NOT
+        // counted obsolete at write when:
+        //   (a) currLsn == abortLsn  -> the prior version IS the txn's abort
+        //       version, which is counted obsolete at COMMIT (TXN-1), or
+        //   (b) the DB is immediately-obsolete (dup DB) -> already counted
+        //       inexact at logging, or
+        //   (c) this is an insertion (currLsn == NULL) -> nothing prior, or
+        //   (d) the prior version is embedded (omitted: see note below).
+        //
+        // For an auto-commit op there is no txn / abort version, so Rc is
+        // counted obsolete at write.  For a transactional op, the FIRST write
+        // to a record has currLsn == abortLsn (defer to commit); a SUBSEQUENT
+        // write within the same txn already holds a write lock at currLsn, so
+        // currLsn != abortLsn and Rc is counted obsolete now.
+        let db_id_u32 = db_id as u32;
+        let has_prior = old_lsn != noxu_util::NULL_LSN.as_u64();
+        let is_immediately_obsolete_db =
+            self.db_impl.read().is_ln_immediately_obsolete();
+        let curr_ne_abort = match &self.txn_ref {
+            // Transactional: the prior version differs from the abort version
+            // only once abort info is already recorded for old_lsn (i.e.
+            // this is a SUBSEQUENT write to the record by this txn).  On the
+            // first write the lock was just acquired (never_locked) and the
+            // prior version IS the abort version -> defer to commit.
+            Some(txn) => txn
+                .lock()
+                .map(|g| g.write_lock_abort_recorded(old_lsn))
+                .unwrap_or(false),
+            // Auto-commit: abortLsn is NULL, so currLsn != abortLsn.
+            None => true,
+        };
+        let count_prior_obsolete_now =
+            has_prior && curr_ne_abort && !is_immediately_obsolete_db;
+        let old_obsolete = if count_prior_obsolete_now {
+            Some(noxu_log::ObsoleteLsn::exact(
+                Lsn::from_u64(old_lsn),
+                Some(db_id_u32),
+                0, // prior-version size unknown at this point
+                true,
+            ))
         } else {
             None
         };
 
-        lm.log_with_old_lsn(
+        // L-6: the NEW entry is immediately obsolete (counted obsolete at
+        // write time) when it is a deletion or an LN in a DB where all LNs
+        // are immediately obsolete (dup DBs).
+        // JE LNLogEntry.isImmediatelyObsolete:
+        //   ln.isDeleted() || embeddedLN || dbImpl.isLNImmediatelyObsolete()
+        // The embeddedLN arm is omitted here: the `embedded_ln` field on the
+        // LnLogEntry is currently hard-coded `true` (a separate fidelity gap),
+        // so it cannot be used to decide immediate-obsolescence without
+        // marking every LN obsolete.  Once real BIN-embedding is tracked the
+        // arm can be restored.  ponytail: omit unreliable embedded arm,
+        // restore when LnLogEntry.embedded_ln reflects true embedding.
+        let is_deleted = data.is_none();
+        let immediately_obsolete = is_deleted || is_immediately_obsolete_db;
+
+        lm.log_tracked(
             entry_type,
             &buf,
             Provisional::No,
             false,
             false,
-            old_lsn_opt,
+            Some(db_id_u32),
+            old_obsolete,
+            immediately_obsolete,
         )
         .map_err(DbiError::from)
     }
@@ -3038,7 +3118,8 @@ impl CursorImpl {
             // BIN post-physical-removal can detect contention via
             // `contest_synthetic_key_for_missing_read`.
             self.lock_synthetic_key_for_delete(&tree_key)?;
-            let del_lsn = self.log_ln_write(&tree_key, None, self.locker_id)?;
+            let del_lsn =
+                self.log_ln_write(&tree_key, None, self.locker_id, old_lsn)?;
             self.finalize_write_lock(
                 old_lsn,
                 del_lsn,
