@@ -611,7 +611,10 @@ fn database_txn_cursor_on_non_txn_db_rejected() {
         .with_transactional(true);
     let env = noxu_db::Environment::open(env_cfg).unwrap();
 
-    let db_cfg = DatabaseConfig::new().with_allow_create(true);
+    // This DB is deliberately NON-transactional (in a transactional env) to
+    // verify the TXN-6 guard rejects a transaction handle on it.
+    let db_cfg =
+        DatabaseConfig::new().with_allow_create(true).with_transactional(false);
     // Non-transactional database (Noxu defaults to non-transactional unless
     // `with_transactional(true)` is set).
     let db = env.open_database(None, "non_txn_db", &db_cfg).unwrap();

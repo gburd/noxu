@@ -30,6 +30,7 @@ fn test_put_get_single_dup() {
     let env = open_env(&dir);
     let db_cfg = DatabaseConfig::new()
         .with_allow_create(true)
+        .with_transactional(true)
         .with_sorted_duplicates(true)
         .with_transactional(true);
     let db = env.open_database(None, "test", &db_cfg).unwrap();
@@ -53,6 +54,7 @@ fn test_put_multiple_dups_same_key() {
     let env = open_env(&dir);
     let db_cfg = DatabaseConfig::new()
         .with_allow_create(true)
+        .with_transactional(true)
         .with_sorted_duplicates(true)
         .with_transactional(true);
     let db = env.open_database(None, "test", &db_cfg).unwrap();
@@ -82,6 +84,7 @@ fn test_dup_sorted_order() {
     let env = open_env(&dir);
     let db_cfg = DatabaseConfig::new()
         .with_allow_create(true)
+        .with_transactional(true)
         .with_sorted_duplicates(true)
         .with_transactional(true);
     let db = env.open_database(None, "test", &db_cfg).unwrap();
@@ -122,6 +125,7 @@ fn test_get_next_dup_stops_at_key_boundary() {
     let env = open_env(&dir);
     let db_cfg = DatabaseConfig::new()
         .with_allow_create(true)
+        .with_transactional(true)
         .with_sorted_duplicates(true)
         .with_transactional(true);
     let db = env.open_database(None, "test", &db_cfg).unwrap();
@@ -173,6 +177,7 @@ fn test_get_next_no_dup_advances_to_next_key() {
     let env = open_env(&dir);
     let db_cfg = DatabaseConfig::new()
         .with_allow_create(true)
+        .with_transactional(true)
         .with_sorted_duplicates(true)
         .with_transactional(true);
     let db = env.open_database(None, "test", &db_cfg).unwrap();
@@ -228,6 +233,7 @@ fn test_dup_delete_specific_value() {
     let env = open_env(&dir);
     let db_cfg = DatabaseConfig::new()
         .with_allow_create(true)
+        .with_transactional(true)
         .with_sorted_duplicates(true)
         .with_transactional(true);
     let db = env.open_database(None, "test", &db_cfg).unwrap();
@@ -273,6 +279,7 @@ fn test_dup_count() {
     let env = open_env(&dir);
     let db_cfg = DatabaseConfig::new()
         .with_allow_create(true)
+        .with_transactional(true)
         .with_sorted_duplicates(true)
         .with_transactional(true);
     let db = env.open_database(None, "test", &db_cfg).unwrap();
@@ -299,6 +306,7 @@ fn test_dup_cursor_txn_isolation() {
     let env = open_env(&dir);
     let db_cfg = DatabaseConfig::new()
         .with_allow_create(true)
+        .with_transactional(true)
         .with_sorted_duplicates(true)
         .with_transactional(true);
     let db = env.open_database(None, "test", &db_cfg).unwrap();
@@ -324,6 +332,7 @@ fn test_dup_database_recovery() {
     let dir = TempDir::new().unwrap();
     let db_cfg = DatabaseConfig::new()
         .with_allow_create(true)
+        .with_transactional(true)
         .with_sorted_duplicates(true)
         .with_transactional(true);
 
@@ -370,6 +379,7 @@ fn test_get_prev_dup() {
     let env = open_env(&dir);
     let db_cfg = DatabaseConfig::new()
         .with_allow_create(true)
+        .with_transactional(true)
         .with_sorted_duplicates(true)
         .with_transactional(true);
     let db = env.open_database(None, "test", &db_cfg).unwrap();
@@ -409,6 +419,7 @@ fn test_put_no_dup_data_rejects_exact_duplicate() {
     let env = open_env(&dir);
     let db_cfg = DatabaseConfig::new()
         .with_allow_create(true)
+        .with_transactional(true)
         .with_sorted_duplicates(true)
         .with_transactional(true);
     let db = env.open_database(None, "test", &db_cfg).unwrap();
@@ -451,6 +462,7 @@ fn test_database_count_includes_all_dups() {
     let env = open_env(&dir);
     let db_cfg = DatabaseConfig::new()
         .with_allow_create(true)
+        .with_transactional(true)
         .with_sorted_duplicates(true)
         .with_transactional(true);
     let db = env.open_database(None, "test", &db_cfg).unwrap();
@@ -496,6 +508,7 @@ fn test_database_delete_removes_all_dups() {
     let env = open_env(&dir);
     let db_cfg = DatabaseConfig::new()
         .with_allow_create(true)
+        .with_transactional(true)
         .with_sorted_duplicates(true)
         .with_transactional(true);
     let db = env.open_database(None, "test", &db_cfg).unwrap();
@@ -601,7 +614,7 @@ mod prop_sorted_dup_oracle {
             let dir = TempDir::new().unwrap();
             let env = open_env(&dir);
             let db_cfg = DatabaseConfig::new()
-                .with_allow_create(true)
+                .with_allow_create(true).with_transactional(true)
                 .with_sorted_duplicates(true)
         .with_transactional(true);
             let db = env

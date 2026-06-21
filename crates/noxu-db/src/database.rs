@@ -1149,7 +1149,7 @@ impl Database {
     /// # use std::path::PathBuf;
     /// # fn main() -> noxu_db::Result<()> {
     /// # let env = Environment::open(EnvironmentConfig::new(PathBuf::from("/tmp/t")).with_allow_create(true))?;
-    /// # let db = env.open_database(None, "d", &DatabaseConfig::new().with_allow_create(true))?;
+    /// # let db = env.open_database(None, "d", &DatabaseConfig::new().with_allow_create(true).with_transactional(true))?;
     /// for result in db.iter(None)? {
     ///     let (key, val) = result?;
     ///     println!("{:?} => {:?}", key, val);
@@ -1185,7 +1185,7 @@ impl Database {
     /// # use std::path::PathBuf;
     /// # fn main() -> noxu_db::Result<()> {
     /// # let env = Environment::open(EnvironmentConfig::new(PathBuf::from("/tmp/t")).with_allow_create(true))?;
-    /// # let db = env.open_database(None, "d", &DatabaseConfig::new().with_allow_create(true))?;
+    /// # let db = env.open_database(None, "d", &DatabaseConfig::new().with_allow_create(true).with_transactional(true))?;
     /// let lo = b"key010";
     /// let hi = b"key020";
     /// for result in db.range(None, lo.as_ref()..=hi.as_ref())? {
@@ -1708,7 +1708,9 @@ mod tests {
             .with_transactional(true);
         let env = Environment::open(env_config).unwrap();
 
-        let db_config = DatabaseConfig::new().with_allow_create(true);
+        let db_config = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
         let db = env.open_database(None, "testdb", &db_config).unwrap();
 
         (temp_dir, env, db)
@@ -1938,8 +1940,10 @@ mod tests {
             .with_allow_create(true);
         let env = Environment::open(env_config).unwrap();
 
-        let db_config =
-            DatabaseConfig::new().with_allow_create(true).with_read_only(true);
+        let db_config = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true)
+            .with_read_only(true);
         let db = env.open_database(None, "readonly_db", &db_config).unwrap();
 
         let key = DatabaseEntry::from_bytes(b"key1");
@@ -1958,7 +1962,9 @@ mod tests {
             .with_allow_create(true);
         let env = Environment::open(env_config).unwrap();
 
-        let db_config = DatabaseConfig::new().with_allow_create(true);
+        let db_config = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
         let db1 = env.open_database(None, "db1", &db_config).unwrap();
         let db2 = env.open_database(None, "db2", &db_config).unwrap();
 
@@ -2179,8 +2185,10 @@ mod tests {
             .with_allow_create(true);
         let env = Environment::open(env_config).unwrap();
 
-        let db_config =
-            DatabaseConfig::new().with_allow_create(true).with_read_only(true);
+        let db_config = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true)
+            .with_read_only(true);
         let db = env.open_database(None, "ro_db", &db_config).unwrap();
 
         let key = DatabaseEntry::from_bytes(b"k");

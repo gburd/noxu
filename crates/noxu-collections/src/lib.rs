@@ -53,7 +53,7 @@
 //! use noxu_db::{DatabaseConfig, Environment, EnvironmentConfig};
 //!
 //! let env = Environment::open(env_config)?;
-//! let db_config = DatabaseConfig::new().with_allow_create(true);
+//! let db_config = DatabaseConfig::new().with_allow_create(true).with_transactional(true);
 //! let db  = env.open_database(None, "users", &db_config)?;
 //!
 //! let map: StoredMap<i32, String, _, _> =

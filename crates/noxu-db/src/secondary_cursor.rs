@@ -693,13 +693,16 @@ mod tests {
             .with_transactional(true);
         let env = Environment::open(env_config).unwrap();
 
-        let db_config = DatabaseConfig::new().with_allow_create(true);
+        let db_config = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
         let primary_db =
             env.open_database(None, "primary", &db_config).unwrap();
         let primary = Arc::new(Mutex::new(primary_db));
 
         let sec_db_config = DatabaseConfig::new()
             .with_allow_create(true)
+            .with_transactional(true)
             .with_sorted_duplicates(true);
         let sec_db =
             env.open_database(None, "secondary", &sec_db_config).unwrap();

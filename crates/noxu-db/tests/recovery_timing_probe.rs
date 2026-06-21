@@ -37,7 +37,7 @@ fn open_db(env: &noxu_db::Environment) -> noxu_db::Database {
     env.open_database(
         None,
         "probe",
-        &DatabaseConfig::new().with_allow_create(true),
+        &DatabaseConfig::new().with_allow_create(true).with_transactional(true),
     )
     .unwrap()
 }

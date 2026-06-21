@@ -170,7 +170,7 @@ where
     /// # }
     /// # let td = TempDir::new().unwrap();
     /// # let env = Environment::open(EnvironmentConfig::new(td.path().to_path_buf()).with_allow_create(true)).unwrap();
-    /// # let db = env.open_database(None, "u", &DatabaseConfig::new().with_allow_create(true)).unwrap();
+    /// # let db = env.open_database(None, "u", &DatabaseConfig::new().with_allow_create(true).with_transactional(true)).unwrap();
     /// let mut primary: PrimaryIndex<u64, User> = PrimaryIndex::new(&db);
     /// let dept_idx = primary.open_secondary_index(|u: &User| Some(u.department.clone()));
     /// ```
@@ -776,7 +776,9 @@ mod tests {
         let env_config = EnvironmentConfig::new(temp_dir.path().to_path_buf())
             .with_allow_create(true);
         let env = Environment::open(env_config).unwrap();
-        let db_config = DatabaseConfig::new().with_allow_create(true);
+        let db_config = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
         let db = env.open_database(None, "users", &db_config).unwrap();
         (temp_dir, env, db)
     }

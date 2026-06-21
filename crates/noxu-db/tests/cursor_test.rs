@@ -19,7 +19,8 @@ fn open_env_and_db(dir: &TempDir) -> (noxu_db::Environment, noxu_db::Database) {
         .with_allow_create(true)
         .with_transactional(true);
     let env = noxu_db::Environment::open(env_config).unwrap();
-    let db_config = DatabaseConfig::new().with_allow_create(true);
+    let db_config =
+        DatabaseConfig::new().with_allow_create(true).with_transactional(true);
     let db = env.open_database(None, "cursor_test_db", &db_config).unwrap();
     (env, db)
 }
@@ -509,7 +510,8 @@ fn open_env_and_db_named(
         .with_allow_create(true)
         .with_transactional(true);
     let env = noxu_db::Environment::open(env_config).unwrap();
-    let db_config = DatabaseConfig::new().with_allow_create(true);
+    let db_config =
+        DatabaseConfig::new().with_allow_create(true).with_transactional(true);
     let db = env.open_database(None, name, &db_config).unwrap();
     (env, db)
 }

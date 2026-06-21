@@ -40,7 +40,8 @@ fn main() {
         .with_allow_create(true)
         .with_transactional(true);
     let env = noxu_db::Environment::open(env_config).expect("open env");
-    let db_config = DatabaseConfig::new().with_allow_create(true);
+    let db_config =
+        DatabaseConfig::new().with_allow_create(true).with_transactional(true);
     let db = env.open_database(None, "test", &db_config).expect("open db");
 
     match mode.as_str() {
@@ -330,7 +331,9 @@ fn main() {
                 .with_log_file_max_bytes(65_536); // 64 KiB — forces flip quickly
             let env =
                 noxu_db::Environment::open(env_config).expect("open env flip");
-            let db_config = DatabaseConfig::new().with_allow_create(true);
+            let db_config = DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true);
             let db = env
                 .open_database(None, "test", &db_config)
                 .expect("open db flip");

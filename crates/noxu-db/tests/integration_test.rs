@@ -1779,6 +1779,7 @@ fn open_pri_sec(
             "secondary",
             &DatabaseConfig::new()
                 .with_allow_create(true)
+                .with_transactional(true)
                 .with_sorted_duplicates(true),
         )
         .unwrap();
@@ -2161,6 +2162,7 @@ fn sec_multi_key_creator_multiple_keys_per_record() {
             "sec_mk",
             &DatabaseConfig::new()
                 .with_allow_create(true)
+                .with_transactional(true)
                 .with_sorted_duplicates(true),
         )
         .unwrap();
@@ -2249,6 +2251,7 @@ fn sec_auto_populate_on_open() {
             "sec_pop",
             &DatabaseConfig::new()
                 .with_allow_create(true)
+                .with_transactional(true)
                 .with_sorted_duplicates(true),
         )
         .unwrap();
@@ -2330,6 +2333,7 @@ fn sec_num_recs_put_get_round_trip() {
             "sec_nr",
             &DatabaseConfig::new()
                 .with_allow_create(true)
+                .with_transactional(true)
                 .with_sorted_duplicates(true),
         )
         .unwrap();

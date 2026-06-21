@@ -1355,7 +1355,9 @@ mod tests {
     }
 
     fn open_primary(env: &Environment, name: &str) -> Database {
-        let config = DatabaseConfig::new().with_allow_create(true);
+        let config = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
         env.open_database(None, name, &config).unwrap()
     }
 
@@ -1367,6 +1369,7 @@ mod tests {
         // v1.6 sorted-dup secondaries: inner index DB must allow dups.
         let sec_db_config = DatabaseConfig::new()
             .with_allow_create(true)
+            .with_transactional(true)
             .with_sorted_duplicates(true);
         let sec_db = env.open_database(None, name, &sec_db_config).unwrap();
         let sec_config = SecondaryConfig::new()
@@ -1591,6 +1594,7 @@ mod tests {
         // Open secondary with allow_populate=true.
         let sec_db_config = DatabaseConfig::new()
             .with_allow_create(true)
+            .with_transactional(true)
             .with_sorted_duplicates(true);
         let sec_db =
             env.open_database(None, "secondary_pop", &sec_db_config).unwrap();

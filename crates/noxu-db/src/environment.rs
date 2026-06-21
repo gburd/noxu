@@ -1682,7 +1682,9 @@ mod tests {
         let (_temp_dir, config) = temp_env_config();
         let env = Environment::open(config).unwrap();
 
-        let db_config = DatabaseConfig::new().with_allow_create(true);
+        let db_config = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
         let _db = env.open_database(None, "testdb", &db_config).unwrap();
 
         let result = env.close();
@@ -1694,7 +1696,9 @@ mod tests {
         let (_temp_dir, config) = temp_env_config();
         let env = Environment::open(config).unwrap();
 
-        let db_config = DatabaseConfig::new().with_allow_create(true);
+        let db_config = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
         let db = env.open_database(None, "testdb", &db_config).unwrap();
         assert_eq!(db.get_database_name(), "testdb");
         assert!(db.is_valid());
@@ -1705,7 +1709,9 @@ mod tests {
         let (_temp_dir, config) = temp_env_config();
         let env = Environment::open(config).unwrap();
 
-        let db_config = DatabaseConfig::new().with_allow_create(true);
+        let db_config = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
         let _db1 = env.open_database(None, "testdb", &db_config).unwrap();
         let result = env.open_database(None, "testdb", &db_config);
         assert!(result.is_err());
@@ -1726,7 +1732,9 @@ mod tests {
         let (_temp_dir, config) = temp_env_config();
         let env = Environment::open(config).unwrap();
 
-        let db_config = DatabaseConfig::new().with_allow_create(true);
+        let db_config = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
         let result = env.open_database(None, "", &db_config);
         assert!(result.is_err());
     }
@@ -1736,7 +1744,9 @@ mod tests {
         let (_temp_dir, config) = temp_env_config();
         let env = Environment::open(config).unwrap();
 
-        let db_config = DatabaseConfig::new().with_allow_create(true);
+        let db_config = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
         let db = env.open_database(None, "testdb", &db_config).unwrap();
         db.close().unwrap();
 
@@ -1750,7 +1760,9 @@ mod tests {
         let (_temp_dir, config) = temp_env_config();
         let env = Environment::open(config).unwrap();
 
-        let db_config = DatabaseConfig::new().with_allow_create(true);
+        let db_config = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
         let _db = env.open_database(None, "testdb", &db_config).unwrap();
 
         let result = env.remove_database(None, "testdb");
@@ -1771,7 +1783,9 @@ mod tests {
         let (_temp_dir, config) = temp_env_config();
         let env = Environment::open(config).unwrap();
 
-        let db_config = DatabaseConfig::new().with_allow_create(true);
+        let db_config = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
         let db = env.open_database(None, "oldname", &db_config).unwrap();
         db.close().unwrap();
 
@@ -1787,7 +1801,9 @@ mod tests {
         let (_temp_dir, config) = temp_env_config();
         let env = Environment::open(config).unwrap();
 
-        let db_config = DatabaseConfig::new().with_allow_create(true);
+        let db_config = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
         let db = env.open_database(None, "testdb", &db_config).unwrap();
         db.close().unwrap();
 
@@ -1799,7 +1815,9 @@ mod tests {
         let (_temp_dir, config) = temp_env_config();
         let env = Environment::open(config).unwrap();
 
-        let db_config = DatabaseConfig::new().with_allow_create(true);
+        let db_config = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
         let _db = env.open_database(None, "testdb", &db_config).unwrap();
 
         let result = env.rename_database(None, "testdb", "newname");
@@ -1820,7 +1838,9 @@ mod tests {
         let (_temp_dir, config) = temp_env_config();
         let env = Environment::open(config).unwrap();
 
-        let db_config = DatabaseConfig::new().with_allow_create(true);
+        let db_config = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
         let db1 = env.open_database(None, "db1", &db_config).unwrap();
         let db2 = env.open_database(None, "db2", &db_config).unwrap();
         db1.close().unwrap();
@@ -1835,7 +1855,9 @@ mod tests {
         let (_temp_dir, config) = temp_env_config();
         let env = Environment::open(config).unwrap();
 
-        let db_config = DatabaseConfig::new().with_allow_create(true);
+        let db_config = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
         let _db1 = env.open_database(None, "db1", &db_config).unwrap();
         let _db2 = env.open_database(None, "db2", &db_config).unwrap();
 
@@ -1963,7 +1985,9 @@ mod tests {
         let env = Environment::open(config).unwrap();
         env.close().unwrap();
 
-        let db_config = DatabaseConfig::new().with_allow_create(true);
+        let db_config = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
         assert!(env.open_database(None, "test", &db_config).is_err());
         assert!(env.remove_database(None, "test").is_err());
         assert!(env.rename_database(None, "a", "b").is_err());
@@ -1997,7 +2021,9 @@ mod tests {
         let (_temp_dir, config) = temp_env_config();
         let env = Environment::open(config).unwrap();
 
-        let mut db_config = DatabaseConfig::new().with_allow_create(true);
+        let mut db_config = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
         db_config.set_node_max_entries(64);
         let db = env.open_database(None, "testdb_entries", &db_config).unwrap();
         assert!(db.is_valid());
@@ -2073,7 +2099,9 @@ mod tests {
         let (_temp_dir, config) = temp_env_config();
         let env = Environment::open(config).unwrap();
 
-        let db_config = DatabaseConfig::new().with_allow_create(true);
+        let db_config = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
         let db = env.open_database(None, "mydb", &db_config).unwrap();
         // db is open — mark it closed via the internal API.
         env.mark_database_closed("mydb");
@@ -2295,7 +2323,9 @@ mod tests {
             .with_transactional(true);
         let env = Environment::open(ro_config).unwrap();
 
-        let db_cfg = DatabaseConfig::new().with_allow_create(true);
+        let db_cfg = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
         let result = env.open_database(None, "new", &db_cfg);
         assert!(
             result.is_err(),

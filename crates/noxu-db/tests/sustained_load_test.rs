@@ -60,7 +60,9 @@ fn open_env(dir: &TempDir) -> (noxu_db::Environment, noxu_db::Database) {
         .open_database(
             None,
             "test",
-            &DatabaseConfig::new().with_allow_create(true),
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true),
         )
         .expect("db open");
     (env, db)
@@ -290,7 +292,9 @@ fn test_cleaner_reduces_log_files_under_load() {
         .open_database(
             None,
             "test",
-            &DatabaseConfig::new().with_allow_create(true),
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true),
         )
         .expect("db open");
 

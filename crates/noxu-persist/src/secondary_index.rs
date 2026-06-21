@@ -202,7 +202,7 @@ impl<SK: Ord + Clone, PK: Ord + Clone> SecondaryMap<SK, PK> {
 /// # }
 /// # let td = TempDir::new().unwrap();
 /// # let env = Environment::open(EnvironmentConfig::new(td.path().to_path_buf()).with_allow_create(true)).unwrap();
-/// # let db = env.open_database(None, "users", &DatabaseConfig::new().with_allow_create(true)).unwrap();
+/// # let db = env.open_database(None, "users", &DatabaseConfig::new().with_allow_create(true).with_transactional(true)).unwrap();
 /// let mut primary: PrimaryIndex<u64, User> = PrimaryIndex::new(&db);
 /// let dept_idx: SecondaryIndex<String, u64, User> =
 ///     primary.open_secondary_index(|u: &User| Some(u.department.clone()));
@@ -624,7 +624,9 @@ mod tests {
             .open_database(
                 None,
                 "emp",
-                &DatabaseConfig::new().with_allow_create(true),
+                &DatabaseConfig::new()
+                    .with_allow_create(true)
+                    .with_transactional(true),
             )
             .unwrap();
         (td, env, db)
