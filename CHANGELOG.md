@@ -57,6 +57,20 @@ listed in [References](#references).
   (`test_find_entry_on_internal_node`, `test_find_entry_internal_nonexact_returns_floor`,
   and the split tests).
 
+### Removed (dead code / noxu-txn — TXN-7)
+
+- **TXN-7: deleted the dead, mis-transliterated `txn_chain.rs`.**  The
+  `TxnChain` container (plus `CompareSlot` and `RevertInfo`) was a passive
+  data holder that did NOT implement JE's backward-log-walk `TxnChain`: it
+  inverted the slot-dedup direction, identified slots by BIN node-id instead
+  of DB-id + comparator-key, and had ZERO production callers (the live undo
+  path runs through `noxu-recovery`).  It was dead AND wrong, so it was
+  removed rather than left as a misleading reference.  A correct
+  backward-log-walk version will be reintroduced by the future HA
+  syncup-rollback workstream if/when needed.  Internal-API change (pre-1.0):
+  `noxu_txn::{TxnChain, CompareSlot, RevertInfo}` are no longer exposed (no
+  external users).
+
 ### Fixed (disk-ordered cursor / cleaner — CLN-7)
 
 - **CLN-7: the cleaner can no longer delete a log file while a

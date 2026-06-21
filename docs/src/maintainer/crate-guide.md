@@ -109,7 +109,6 @@ Key files:
 - `src/transaction.rs` — `Transaction`: locker hierarchy, undo records, commit/abort
 - `src/locker.rs` — `Locker` trait, `BasicLocker`, `ThreadLocker`, `HandleLocker`
 - `src/group_commit.rs` — `GroupCommit`: fsync batching for concurrent commits
-- `src/txn_chain.rs` — `TxnChain` + `CompareSlot` + `RevertInfo` for partial rollback
 
 ## Phase 4 — Internals
 

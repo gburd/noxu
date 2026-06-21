@@ -36,8 +36,12 @@ replica must roll back to VLSN `to` before it can rejoin. This occurs when
 the master's term changes and the replica has entries that were never
 committed in the new term.
 
-The `TxnChain` mechanism handles partial rollback within a running replica
-stream.
+Partial rollback within a running replica stream (rolling back uncommitted
+entries after a term change, without a full network restore) is **not yet
+implemented**.  An earlier `TxnChain` container was removed (TXN-7) because it
+did not perform JE's backward-log-walk and was unused; a correct
+syncup-rollback path will be added when the HA syncup workstream lands.  Until
+then, a replica that cannot fast-forward falls back to a full network restore.
 
 ## Recovery from Restore
 
