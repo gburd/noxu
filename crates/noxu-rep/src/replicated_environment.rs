@@ -1353,6 +1353,18 @@ impl ReplicatedEnvironment {
         self.vlsn_index.get_latest_vlsn()
     }
 
+    /// Test-only: clone the env's SHARED VLSN index `Arc`.
+    ///
+    /// REP-6: the replica receive loop (`become_replica` ->
+    /// `EnvironmentLogWriter`) must feed THIS index — the one
+    /// `get_vlsn_range`, `flush_to_disk`, and election ranking read — not a
+    /// throwaway. Tests use this to build a writer the same way
+    /// `become_replica` does and assert the shared index advances.
+    #[cfg(feature = "test-harness")]
+    pub fn vlsn_index_arc(&self) -> Arc<crate::vlsn::vlsn_index::VlsnIndex> {
+        Arc::clone(&self.vlsn_index)
+    }
+
     /// Return the list of replica names that currently have a `Feeder`
     /// tracker on this (master) node.
     ///
@@ -1796,8 +1808,16 @@ impl ReplicatedEnvironment {
         // replicated entries via EnvironmentLogWriter.
         if let Some(env) = self.env_impl.lock().unwrap().clone() {
             if let Some(log_mgr) = env.get_log_manager() {
-                let vlsn_index =
-                    Arc::new(crate::vlsn::vlsn_index::VlsnIndex::new(10));
+                // REP-6: feed the env's SHARED, persisted VLSN index (the one
+                // flush_to_disk persists and get_vlsn_range / election ranking
+                // read) into the replica receive loop — NOT a throwaway. Using
+                // a fresh index would leave the persisted vlsn.idx, the
+                // reported VLSN range, and the DTVLSN-ranking own_vlsn lagging
+                // the actually-received stream, widening catch-up (or forcing
+                // an unnecessary network restore) after a clean restart.
+                // JE: the replica's VLSNIndex IS the environment's persisted
+                // index (see VLSNIndex).
+                let vlsn_index = Arc::clone(&self.vlsn_index);
 
                 // Resolve the master's socket address from the GroupService.
                 let master_addr_opt: Option<SocketAddr> = self
