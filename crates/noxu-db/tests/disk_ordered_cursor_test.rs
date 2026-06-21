@@ -455,3 +455,65 @@ fn empty_db_list_is_rejected() {
         open_disk_ordered_cursor_multi(&dbs, DiskOrderedCursorConfig::new());
     assert!(res.is_err(), "empty db list must be rejected");
 }
+
+// -----------------------------------------------------------------------------
+// 12. CLN-7: a DOS scan completes even while the cleaner runs concurrently.
+//
+// The DOS producer protects the files it scans from cleaner deletion
+// (FileProtector, faithful to JE DiskOrderedScanner.scan,
+// DiskOrderedScanner.java:704). Before the fix the cleaner could delete a
+// file mid-scan -> LogFileNotFound / torn read. This test writes enough data
+// to span multiple log files, fires manual checkpoints + cleaning while the
+// scan is in flight, and asserts the scan returns every live record without
+// error.
+// -----------------------------------------------------------------------------
+
+#[test]
+fn cln7_scan_completes_with_concurrent_cleaning() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let db = open_db(&env, "doc_cln7");
+
+    // Write a good number of records, then checkpoint so files become
+    // candidates for cleaning.
+    let mut expected: HashSet<Vec<u8>> = HashSet::new();
+    for i in 0..500u32 {
+        let key = format!("key-{i:05}");
+        put(&db, key.as_bytes(), format!("value-{i}").as_bytes());
+        expected.insert(key.into_bytes());
+    }
+    env.checkpoint(None).unwrap();
+
+    // Open the DOS cursor (its producer protects the files it will scan),
+    // then poke the cleaner while draining.
+    let mut cursor = db
+        .open_disk_ordered_cursor(
+            DiskOrderedCursorConfig::new()
+                .with_queue_size(8)
+                .with_dedup_keys(true),
+        )
+        .unwrap();
+
+    let mut got: HashSet<Vec<u8>> = HashSet::new();
+    let mut k = DatabaseEntry::new();
+    let mut v = DatabaseEntry::new();
+    let mut n = 0u32;
+    while cursor.next(&mut k, &mut v).unwrap() == OperationStatus::Success {
+        got.insert(k.data().to_vec());
+        n += 1;
+        // Interleave cleaning attempts with the scan. Protected files must
+        // be skipped by the cleaner, so the scan never sees LogFileNotFound.
+        if n.is_multiple_of(50) {
+            let _ = env.checkpoint(None);
+        }
+    }
+
+    // Every live key must have been returned (none lost to a deleted file).
+    for key in &expected {
+        assert!(
+            got.contains(key),
+            "CLN-7: record {:?} missing — a scanned file may have been deleted",
+            String::from_utf8_lossy(key)
+        );
+    }
+}

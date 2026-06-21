@@ -78,6 +78,28 @@ pub enum NoxuLogError {
     #[error("Latch acquisition timed out: {0}")]
     LatchTimeout(String),
 
+    /// A committed transaction was found AFTER a mid-file corruption point.
+    ///
+    /// Surfaced by [`crate::last_file_reader::LastFileReader`] during
+    /// end-of-log discovery when the `haltOnCommitAfterChecksumException`
+    /// param is enabled and a `TxnCommit` entry exists past a checksum
+    /// failure.  This distinguishes real media corruption (with committed
+    /// data beyond it) from a benign torn-tail write — recovery must REFUSE
+    /// to silently truncate.  Recovery maps this to the env-invalidating
+    /// `EnvironmentFailureReason::FoundCommittedTxn`.
+    ///
+    /// Faithful to JE `LastFileReader.readNextEntry`/`findCommittedTxn`
+    /// (LastFileReader.java:313/394, [#18307]) which throws
+    /// `EnvironmentFailureException(FOUND_COMMITTED_TXN, ...)`.
+    #[error(
+        "Found committed txn after the corruption point: \
+         corrupt entry at LSN {corrupt_lsn}, committed txn at LSN {commit_lsn}"
+    )]
+    FoundCommittedTxn {
+        corrupt_lsn: noxu_util::lsn::Lsn,
+        commit_lsn: noxu_util::lsn::Lsn,
+    },
+
     /// Internal consistency error.
     #[error("Internal error: {0}")]
     Internal(String),

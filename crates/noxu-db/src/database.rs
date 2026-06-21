@@ -92,6 +92,10 @@ pub struct Database {
     /// Cached cleaner throttle — acquired once at open, None when no cleaner.
     /// Used by put() for write-path backpressure without locking env_impl.
     cleaner_throttle: Option<Arc<noxu_cleaner::CleanerThrottle>>,
+    /// Cached cleaner file protector — acquired once at open, None when no
+    /// cleaner.  Passed to a `DiskOrderedCursor` producer so it can protect
+    /// the files it scans from cleaner deletion mid-scan (CLN-7).
+    file_protector: Option<Arc<noxu_cleaner::FileProtector>>,
     /// Cached transaction manager — acquired once at open.
     ///
     /// Used by [`Self::with_auto_txn`] to allocate a synthetic auto-commit
@@ -444,6 +448,7 @@ impl Database {
             lock_manager,
             log_manager,
             cleaner_throttle,
+            file_protector,
             txn_manager,
             env_invalid,
         ) = {
@@ -451,9 +456,10 @@ impl Database {
             let lm = Arc::clone(env.get_lock_manager());
             let logm = env.get_log_manager();
             let ct = env.get_cleaner_throttle();
+            let fp = env.get_file_protector();
             let txnm = Arc::clone(env.get_txn_manager());
             let inv = env.is_invalid_flag();
-            (lm, logm, ct, txnm, inv)
+            (lm, logm, ct, fp, txnm, inv)
         };
         Database {
             name,
@@ -467,6 +473,7 @@ impl Database {
             log_manager,
             env_invalid,
             cleaner_throttle,
+            file_protector,
             txn_manager,
             no_sync,
             write_no_sync,
@@ -1613,6 +1620,15 @@ impl Database {
         &self,
     ) -> Option<&std::sync::Arc<noxu_log::LogManager>> {
         self.log_manager.as_ref()
+    }
+
+    /// Cached cleaner `FileProtector` for this database's environment, used by
+    /// the disk-ordered-cursor producer to protect the files it scans from
+    /// cleaner deletion (CLN-7).  `None` when the environment has no cleaner.
+    pub(crate) fn cached_file_protector(
+        &self,
+    ) -> Option<std::sync::Arc<noxu_cleaner::FileProtector>> {
+        self.file_protector.clone()
     }
 
     /// Public-ish accessor used by the disk-ordered-cursor helper to
