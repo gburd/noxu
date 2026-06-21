@@ -9,10 +9,13 @@
 
 use std::sync::Arc;
 
-use noxu_log::LogWriteObserver;
+use noxu_log::{
+    LogWriteObserver, ObsoleteKind as LogObsoleteKind, ObsoleteLsn,
+};
 use noxu_sync::Mutex;
 
 use crate::UtilizationTracker;
+use crate::utilization_tracker::ObsoleteKind;
 
 /// An `Arc<Mutex<UtilizationTracker>>` wrapper that implements `LogWriteObserver`.
 ///
@@ -42,27 +45,49 @@ impl LogWriteObserver for UtilizationTrackerObserver {
         entry_size: u32,
         is_ln: bool,
         is_in: bool,
+        db_id: Option<u32>,
     ) {
-        self.tracker.lock().count_new_log_entry(
+        self.tracker.lock().count_new_log_entry_db(
             file_num,
             entry_size as i32,
             is_ln,
             is_in,
+            db_id,
         );
     }
 
-    fn count_obsolete(
-        &self,
-        file_num: u32,
-        offset: u32,
-        entry_size: u32,
-        is_ln: bool,
-    ) {
-        self.tracker.lock().track_obsolete(
-            file_num,
-            offset,
-            entry_size as i32,
-            is_ln,
-        );
+    fn count_obsolete(&self, obsolete: ObsoleteLsn) {
+        let kind = match obsolete.kind {
+            LogObsoleteKind::Exact => ObsoleteKind::Exact,
+            LogObsoleteKind::Inexact => ObsoleteKind::Inexact,
+            LogObsoleteKind::DupsAllowed => ObsoleteKind::DupsAllowed,
+        };
+        let file_num = obsolete.lsn.file_number();
+        let offset = obsolete.lsn.file_offset();
+        let mut tracker = self.tracker.lock();
+        match kind {
+            ObsoleteKind::Exact => tracker.count_obsolete_node(
+                file_num,
+                offset,
+                obsolete.size,
+                obsolete.is_ln,
+                obsolete.db_id,
+            ),
+            ObsoleteKind::Inexact => tracker.count_obsolete_node_inexact(
+                file_num,
+                offset,
+                obsolete.size,
+                obsolete.is_ln,
+                obsolete.db_id,
+            ),
+            ObsoleteKind::DupsAllowed => tracker
+                .count_obsolete_node_dups_allowed(
+                    file_num,
+                    offset,
+                    obsolete.size,
+                    obsolete.is_ln,
+                    obsolete.db_id,
+                ),
+        }
     }
 }

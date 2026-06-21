@@ -50,7 +50,7 @@ use crate::file_manager::FileManager;
 use crate::fsync_manager::FsyncManager;
 use crate::log_buffer_pool::LogBufferPool;
 use crate::provisional::Provisional;
-use crate::write_observer::LogWriteObserver;
+use crate::write_observer::{LogWriteObserver, ObsoleteKind, ObsoleteLsn};
 use noxu_sync::Mutex;
 use noxu_util::lsn::{Lsn, NULL_LSN};
 use std::sync::Arc;
@@ -216,6 +216,35 @@ impl LogManager {
         self.write_observer = Some(observer);
     }
 
+    /// Counts a batch of obsolete LSNs (TXN-1: the prior versions of records
+    /// a committing transaction overwrote).
+    ///
+    /// JE `LogManager.countObsoleteNodesPreCommit` (the
+    /// `obsoleteWriteLockInfo` loop): for each write-lock whose abort version
+    /// is reclaimable, calls `countObsoleteNode(abortLsn, null, abortLogSize,
+    /// db)` under the log write latch.  Here the same accounting fires
+    /// through the installed observer so it lands in the per-FILE and per-DB
+    /// summaries.
+    ///
+    /// Each tuple is `(abort_lsn, db_id, abort_log_size)`.  The caller is
+    /// responsible for applying JE's `maybeCountObsoleteLSN` filters
+    /// (NULL/known-deleted/already-counted) and de-duplicating by abort LSN.
+    pub fn count_obsolete_commit_lsns(
+        &self,
+        infos: &[(Lsn, Option<u32>, i32)],
+    ) {
+        if let Some(obs) = &self.write_observer {
+            for &(lsn, db_id, size) in infos {
+                if lsn.is_null() {
+                    continue;
+                }
+                // Prior versions overwritten by a committed txn are LNs;
+                // counted via the exact variant (JE countObsoleteNode).
+                obs.count_obsolete(ObsoleteLsn::exact(lsn, db_id, size, true));
+            }
+        }
+    }
+
     /// Returns `true` if an I/O failure has permanently invalidated this log.
     ///
     /// C-2: once set, all subsequent `log()` and `flush_sync()` calls return
@@ -259,13 +288,58 @@ impl LogManager {
         fsync_required: bool,
         old_lsn: Option<Lsn>,
     ) -> Result<Lsn> {
+        // Legacy shim: treat as an exact, db-unknown obsolete of the same
+        // node kind as the entry being written.
+        let old = old_lsn.map(|lsn| ObsoleteLsn {
+            lsn,
+            db_id: None,
+            size: 0,
+            is_ln: entry_type.is_ln_type(),
+            kind: ObsoleteKind::Exact,
+        });
         self.log_internal(
             entry_type,
             payload,
             provisional,
             flush_required,
             fsync_required,
-            old_lsn,
+            old,
+            None,
+            false,
+            None,
+        )
+    }
+
+    /// Logs an entry with full utilization-tracking metadata.
+    ///
+    /// This is the JE-faithful write path: the caller supplies the owning DB
+    /// id for the new entry (CLN-9 per-DB axis) and an optional
+    /// [`ObsoleteLsn`] describing the superseded version, including which
+    /// `countObsolete*` variant to apply (CLN-10).
+    ///
+    /// Cite: `LogManager.serialLogWork` -> `UtilizationTracker.countNewLogEntry`
+    /// plus `countObsoleteNode` / `countObsoleteNodeInexact` /
+    /// `countObsoleteNodeDupsAllowed`.
+    pub fn log_tracked(
+        &self,
+        entry_type: LogEntryType,
+        payload: &[u8],
+        provisional: Provisional,
+        flush_required: bool,
+        fsync_required: bool,
+        new_db_id: Option<u32>,
+        old_obsolete: Option<ObsoleteLsn>,
+        immediately_obsolete: bool,
+    ) -> Result<Lsn> {
+        self.log_internal(
+            entry_type,
+            payload,
+            provisional,
+            flush_required,
+            fsync_required,
+            old_obsolete,
+            new_db_id,
+            immediately_obsolete,
             None,
         )
     }
@@ -307,6 +381,8 @@ impl LogManager {
             fsync_required,
             None,
             None,
+            false,
+            None,
         )
     }
 
@@ -337,6 +413,8 @@ impl LogManager {
             flush_required,
             fsync_required,
             None,
+            None,
+            false,
             Some(vlsn),
         )
     }
@@ -348,7 +426,9 @@ impl LogManager {
         provisional: Provisional,
         flush_required: bool,
         fsync_required: bool,
-        old_lsn: Option<Lsn>,
+        old_obsolete: Option<ObsoleteLsn>,
+        new_db_id: Option<u32>,
+        immediately_obsolete: bool,
         opt_vlsn: Option<u64>,
     ) -> Result<Lsn> {
         // C-2: refuse all writes once a prior I/O error has invalidated the log.
@@ -473,16 +553,12 @@ impl LogManager {
             // Utilization tracking — called under the LWL, matching the
             // serialLogWork() tracker calls.
             if let Some(obs) = &self.write_observer {
-                // Mark old version obsolete (the: countObsoleteNode).
-                if let Some(old) = old_lsn
-                    && !old.is_null()
+                // Mark old version obsolete (the: countObsoleteNode /
+                // Inexact / DupsAllowed, depending on the caller).
+                if let Some(old) = old_obsolete
+                    && !old.lsn.is_null()
                 {
-                    obs.count_obsolete(
-                        old.file_number(),
-                        old.file_offset(),
-                        0, // size unknown at this point
-                        entry_type.is_ln_type(),
-                    );
+                    obs.count_obsolete(old);
                 }
                 // Count the new entry (the: countNewLogEntry).
                 obs.count_new_entry(
@@ -491,7 +567,24 @@ impl LogManager {
                     entry_size as u32,
                     entry_type.is_ln_type(),
                     entry_type.is_in_type(),
+                    new_db_id,
                 );
+                // L-6: an immediately-obsolete LN (deleted LN, embedded LN,
+                // or an LN in a dup DB) is counted obsolete at write time via
+                // the INEXACT variant — its own just-assigned LSN, no offset
+                // tracked.  JE serialLogWork: when
+                // `entry.isImmediatelyObsolete(db)`, it calls
+                // `countObsoleteNodeInexact(lsn, type, size, db)` for the new
+                // entry.
+                if immediately_obsolete {
+                    obs.count_obsolete(ObsoleteLsn {
+                        lsn: current_lsn,
+                        db_id: new_db_id,
+                        size: entry_size as i32,
+                        is_ln: entry_type.is_ln_type(),
+                        kind: ObsoleteKind::Inexact,
+                    });
+                }
             }
 
             // Obtain a write buffer that can hold entry_size bytes.

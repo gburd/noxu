@@ -457,6 +457,13 @@ impl Txn {
             let commit_lsn =
                 self.log_entry(LogEntryType::TxnCommit, &payload, false)?;
 
+            // TXN-1: the prior versions of every record this txn overwrote
+            // become reclaimable on commit.  Count each write-lock's abort
+            // LSN obsolete through the tracker.
+            // JE Txn.getObsoleteLsnInfo -> LogManager counts each
+            // obsoleteWriteLockInfo via countObsoleteNode under the LWL.
+            self.count_obsolete_abort_lsns();
+
             if let Some(ref hook) = self.post_commit_hook {
                 hook(commit_lsn);
             }
@@ -734,6 +741,52 @@ impl Txn {
                     lm.log(entry_type, payload, Provisional::No, flush, fsync)?;
                 Ok(lsn)
             }
+        }
+    }
+
+    /// TXN-1: counts the abort versions of this txn's write locks obsolete.
+    ///
+    /// JE `Txn.getObsoleteLsnInfo` + `maybeCountObsoleteLSN`: for each write
+    /// lock, the prior (abort) version becomes reclaimable on commit and is
+    /// counted obsolete via `countObsoleteNode`, EXCEPT when it was already
+    /// counted at logging time.  The filters applied here:
+    ///
+    /// - skip NULL abort LSN or `abort_known_deleted` (nothing reclaimable);
+    /// - skip `abort_data.is_some()` (embedded — already counted at logging);
+    /// - de-duplicate by abort LSN (a txn may touch the same record twice).
+    ///
+    /// ponytail: the JE `db.isLNImmediatelyObsolete()` filter (dup-DB LNs
+    /// already counted at logging) is omitted because the txn layer has no
+    /// `DatabaseImpl` handle — only a `database_id`.  For a dup DB this can
+    /// double-count the abort LSN obsolete, which only makes a file *more*
+    /// cleanable (never deletes live data); it is conservative.  Restore the
+    /// filter when the txn can resolve `database_id -> isLNImmediatelyObsolete`.
+    fn count_obsolete_abort_lsns(&self) {
+        let Some(lm) = &self.log_manager else {
+            return;
+        };
+        let mut seen: HashSet<u64> = HashSet::new();
+        let mut infos: Vec<(Lsn, Option<u32>, i32)> = Vec::new();
+        for wli in self.write_locks.values() {
+            if wli.abort_lsn == NULL_LSN.as_u64() || wli.abort_known_deleted {
+                continue;
+            }
+            if wli.abort_data.is_some() {
+                // Embedded abort version — already counted obsolete at
+                // logging time. (JE maybeCountObsoleteLSN: abortData != null.)
+                continue;
+            }
+            if !seen.insert(wli.abort_lsn) {
+                continue;
+            }
+            infos.push((
+                Lsn::from_u64(wli.abort_lsn),
+                Some(wli.database_id as u32),
+                wli.abort_log_size,
+            ));
+        }
+        if !infos.is_empty() {
+            lm.count_obsolete_commit_lsns(&infos);
         }
     }
 
@@ -1294,6 +1347,20 @@ impl Txn {
             wli.never_locked = false;
             wli.database_id = database_id;
         }
+    }
+
+    /// Returns true if this txn already recorded abort info for the write
+    /// lock at `lsn` (i.e. `never_locked == false`).
+    ///
+    /// TXN-1: the cursor calls this at LN-write time to apply JE's
+    /// `currLsn != abortLsn` predicate (LN.java:685).  On the FIRST write to
+    /// a record the lock is freshly acquired (`never_locked == true`) and the
+    /// prior version IS the abort version — counted obsolete at COMMIT.  On a
+    /// SUBSEQUENT write the WriteLockInfo already carries abort info
+    /// (`never_locked == false`), so the prior version differs from the abort
+    /// version and is counted obsolete now, at write time.
+    pub fn write_lock_abort_recorded(&self, lsn: u64) -> bool {
+        self.write_locks.get(&lsn).map(|w| !w.never_locked).unwrap_or(false)
     }
 
     /// Returns the number of read locks held.
@@ -1890,6 +1957,94 @@ mod tests {
         );
         let lm = Arc::new(LogManager::new(fm, 3, 1024 * 1024, 4096));
         (lm, dir)
+    }
+
+    /// TXN-1: a recording observer that captures every obsolete LSN fired
+    /// through the log write path, so the commit-time abort-LSN counting can
+    /// be asserted.
+    #[derive(Default)]
+    struct RecordingObserver {
+        obsolete: std::sync::Mutex<Vec<(u64, Option<u32>, i32)>>,
+    }
+    impl noxu_log::LogWriteObserver for RecordingObserver {
+        fn count_new_entry(
+            &self,
+            _f: u32,
+            _o: u32,
+            _s: u32,
+            _ln: bool,
+            _in: bool,
+            _db: Option<u32>,
+        ) {
+        }
+        fn count_obsolete(&self, ob: noxu_log::ObsoleteLsn) {
+            self.obsolete.lock().unwrap().push((
+                ob.lsn.as_u64(),
+                ob.db_id,
+                ob.size,
+            ));
+        }
+    }
+
+    /// TXN-1: `Txn::commit` counts each write-lock's abort LSN obsolete,
+    /// applying JE's `maybeCountObsoleteLSN` filters and de-duplicating.
+    ///
+    /// JE `Txn.getObsoleteLsnInfo` -> `LogManager` counts each
+    /// `obsoleteWriteLockInfo` via `countObsoleteNode`.
+    #[test]
+    fn test_commit_counts_abort_lsns_obsolete() {
+        use noxu_log::FileManager;
+        let dir = tempfile::TempDir::new().unwrap();
+        let fm = Arc::new(
+            FileManager::new(dir.path(), false, 10_000_000, 100).unwrap(),
+        );
+        let mut lm_inner = LogManager::new(fm, 3, 1024 * 1024, 4096);
+        let observer = Arc::new(RecordingObserver::default());
+        lm_inner.set_write_observer(observer.clone());
+        let lm = Arc::new(lm_inner);
+
+        let lock_manager = Arc::new(LockManager::new());
+        let mut txn = Txn::with_log_manager(7, lock_manager, lm);
+
+        // Three write locks on three records.  Record A has a real,
+        // reclaimable abort version; B is a fresh insert (abort_known_deleted);
+        // C has an embedded abort version (abort_data Some -> already counted).
+        txn.note_log_entry(1000);
+        txn.lock(1000, LockType::Write, false).unwrap();
+        txn.set_write_lock_abort_info(
+            1000, /*abort_lsn=*/ 500, None, None, false, 9,
+        );
+        txn.lock(2000, LockType::Write, false).unwrap();
+        txn.set_write_lock_abort_info(
+            2000,
+            NULL_LSN.as_u64(),
+            None,
+            None,
+            true,
+            9,
+        );
+        txn.lock(3000, LockType::Write, false).unwrap();
+        txn.set_write_lock_abort_info(
+            3000,
+            /*abort_lsn=*/ 700,
+            None,
+            Some(vec![1, 2, 3]),
+            false,
+            9,
+        );
+
+        txn.commit().unwrap();
+
+        let obsolete = observer.obsolete.lock().unwrap();
+        // Only record A's abort LSN (500) is counted: B is known-deleted, C is
+        // embedded (already counted at logging).
+        assert_eq!(
+            obsolete.len(),
+            1,
+            "only the one reclaimable abort version should be counted; got {obsolete:?}"
+        );
+        assert_eq!(obsolete[0].0, 500, "abort LSN of record A");
+        assert_eq!(obsolete[0].1, Some(9), "per-DB axis carries the db id");
     }
 
     /// commit() on a txn that has logged entries must write a TxnCommit record

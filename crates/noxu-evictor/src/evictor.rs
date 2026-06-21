@@ -891,9 +891,32 @@ impl Evictor {
         let mut buf = bytes::BytesMut::with_capacity(entry.log_size());
         entry.write_to_log(&mut buf);
 
-        if let Ok(logged_lsn) =
-            lm.log(LogEntryType::BIN, &buf, provisional, false, false)
-        {
+        // L-10: logging a new full BIN supersedes the previous full version.
+        // Count the old full-BIN LSN obsolete (IN type, exact) so the cleaner
+        // sees the reclaimable space.  JE IN.logInternal counts the prior
+        // full version obsolete via countObsoleteNode.
+        let prev_full = bin.last_full_lsn;
+        let old_obsolete = if !prev_full.is_null() {
+            Some(noxu_log::ObsoleteLsn::exact(
+                prev_full,
+                Some(db_id as u32),
+                0,     // IN obsolete size must be 0
+                false, // is_ln = false (this is an IN/BIN)
+            ))
+        } else {
+            None
+        };
+
+        if let Ok(logged_lsn) = lm.log_tracked(
+            LogEntryType::BIN,
+            &buf,
+            provisional,
+            false,
+            false,
+            Some(db_id as u32),
+            old_obsolete,
+            false,
+        ) {
             bin.clear_dirty_after_full_log(logged_lsn);
             self.stats.increment(&self.stats.dirty_nodes_evicted);
         }

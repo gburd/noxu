@@ -195,6 +195,21 @@ impl DatabaseImpl {
     pub fn get_sorted_duplicates(&self) -> bool {
         self.flags & DUPS_ENABLED != 0
     }
+
+    /// Whether all LNs in this DB are "immediately obsolete" — counted
+    /// obsolete at log-write time and ignorable by the cleaner (DBI-17).
+    ///
+    /// JE `DatabaseImpl.isLNImmediatelyObsolete`:
+    /// `sortedDuplicates && !btreePartialComparator &&
+    /// !duplicatePartialComparator`.  Noxu has no partial comparators, so
+    /// this reduces to `sortedDuplicates` (duplicate DBs store zero-length
+    /// LN data).  The predicate is implemented in full to match JE so the
+    /// comparator clauses can be added later without re-deriving the rule.
+    pub fn is_ln_immediately_obsolete(&self) -> bool {
+        self.get_sorted_duplicates()
+        // && !btree_partial_comparator && !duplicate_partial_comparator
+        // (always true: Noxu has no partial comparators)
+    }
     pub fn is_temporary(&self) -> bool {
         self.flags & TEMPORARY_BIT != 0
     }

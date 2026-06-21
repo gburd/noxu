@@ -973,6 +973,216 @@ fn utilization_tracker_is_populated_after_writes() {
     );
 }
 
+/// Reproduce-first (OBSOLETE-ACCOUNTING / CLN-9/10 + L-10): overwriting
+/// every record makes the prior versions obsolete in BOTH the per-file
+/// FileSummary AND the per-DB DbFileSummary, and the per-DB axis records the
+/// db that owns the bytes.
+///
+/// FAIL-PRE (on main): the `LogWriteObserver` carries no db_id, so the
+/// per-DB `DbFileSummary` map has NO live producer — `get_db_file_summary`
+/// would return `None` even after many overwrites.  Per-file obsolete
+/// counting worked, but the per-DB axis (CLN-9) did not exist, and there was
+/// only one obsolete-counting method (CLN-10).
+///
+/// PASS-POST: each auto-commit overwrite counts the prior version obsolete
+/// (exact, with db_id), so both the per-file and per-DB obsolete counters
+/// climb and `get_db_file_summary(db_id, file)` is populated.
+#[test]
+fn overwrites_count_prior_versions_obsolete_per_db() {
+    let dir = TempDir::new().unwrap();
+    let env = EnvironmentImpl::new(dir.path(), false, true).unwrap();
+    let lm = env.get_log_manager().expect("writable env has LogManager");
+
+    let mut cfg = DatabaseConfig::new();
+    cfg.set_allow_create(true);
+    let db_arc = env.open_database("obsolete_test", &cfg).unwrap();
+    let db_id = db_arc.read().get_id().id() as u32;
+
+    let mut cursor = CursorImpl::with_log_manager(db_arc, 1, lm);
+
+    const N: u8 = 20;
+    // Initial write of N records (auto-commit).
+    for i in 0u8..N {
+        cursor.put(&[i], b"v0", PutMode::Overwrite).unwrap();
+    }
+    // Overwrite every record 3 times.  Each overwrite supersedes the prior
+    // version, which must be counted obsolete.
+    for round in 1u8..=3 {
+        for i in 0u8..N {
+            let v = [b'v', round];
+            cursor.put(&[i], &v, PutMode::Overwrite).unwrap();
+        }
+    }
+    cursor.close().unwrap();
+
+    let tracker = env.get_utilization_tracker().unwrap().lock();
+
+    // Per-file: the obsolete LN count across all tracked files must equal the
+    // number of superseded versions: N records * 3 overwrite rounds = 60.
+    let total_obsolete_ln: i32 = tracker
+        .get_tracked_files()
+        .values()
+        .map(|t| t.get_summary().obsolete_ln_count)
+        .sum();
+    assert_eq!(
+        total_obsolete_ln,
+        (N as i32) * 3,
+        "each of the {N} records overwritten 3 times must produce 60 \
+         obsolete prior versions in the per-file summaries"
+    );
+
+    // Per-DB axis (CLN-9): the DbFileSummary for this db must exist and have
+    // recorded the obsolete LNs.  On main this map has no producer.
+    let per_db_obsolete: i32 = tracker
+        .get_tracked_files()
+        .keys()
+        .filter_map(|&file| tracker.get_db_file_summary(db_id, file))
+        .map(|s| s.obsolete_ln_count)
+        .sum();
+    assert_eq!(
+        per_db_obsolete,
+        (N as i32) * 3,
+        "CLN-9: the per-DB DbFileSummary must record the same obsolete LN \
+         count (the per-DB axis has a live producer)"
+    );
+}
+
+/// End-to-end (OBSOLETE-ACCOUNTING): overwriting every record makes the
+/// original file's utilization drop toward zero, so the cleaner can reclaim
+/// it.
+///
+/// Fill file 0 with records, then overwrite each record repeatedly so the new
+/// versions roll into later files.  Every prior version in file 0 is counted
+/// obsolete, so file 0's obsolete bytes approach its total bytes (utilization
+/// -> ~0).
+///
+/// FAIL-PRE (on main): the obsolete LSN passed at the write site was the
+/// cursor's stale `current_lsn` (belonging to a different key), so file 0's
+/// obsolete count did not track the real superseded versions — utilization
+/// stayed high and the file was never selected for cleaning.
+#[test]
+fn overwriting_all_records_makes_original_file_cleanable() {
+    use noxu_dbi::DbiEnvConfig;
+
+    let dir = TempDir::new().unwrap();
+    // Small log files so the records spread across several files and the
+    // overwrites roll past file 0.
+    let cfg = DbiEnvConfig {
+        transactional: true,
+        log_file_max_bytes: 4096,
+        run_cleaner: false,
+        run_checkpointer: false,
+        run_in_compressor: false,
+        ..DbiEnvConfig::default()
+    };
+    let env = EnvironmentImpl::from_dbi_config(dir.path(), &cfg).unwrap();
+    let lm = env.get_log_manager().expect("writable env has LogManager");
+
+    let mut db_cfg = DatabaseConfig::new();
+    db_cfg.set_allow_create(true);
+    let db_arc = env.open_database("cleanable", &db_cfg).unwrap();
+    let mut cursor = CursorImpl::with_log_manager(db_arc, 1, lm);
+
+    // Phase 1: write enough records to fill file 0 and spill into file 1+.
+    const N: u16 = 60;
+    for i in 0u16..N {
+        let key = format!("key{i:04}");
+        cursor
+            .put(key.as_bytes(), b"initial-value-payload", PutMode::Overwrite)
+            .unwrap();
+    }
+
+    // Snapshot file 0's totals after the initial fill.
+    let (file0_total, file0_obsolete_before) = {
+        let t = env.get_utilization_tracker().unwrap().lock();
+        let s = t.get_tracked_summary(0).expect("file 0 must be tracked");
+        (s.get_summary().total_ln_count, s.get_summary().obsolete_ln_count)
+    };
+    assert!(file0_total > 0, "file 0 must hold LN records after the fill");
+
+    // Phase 2: overwrite every record several times so all of file 0's
+    // versions are superseded by versions in later files.
+    for round in 0u16..5 {
+        for i in 0u16..N {
+            let key = format!("key{i:04}");
+            let val = format!("round{round}-value-payload");
+            cursor
+                .put(key.as_bytes(), val.as_bytes(), PutMode::Overwrite)
+                .unwrap();
+        }
+    }
+    cursor.close().unwrap();
+
+    // File 0's obsolete LN count must now cover (nearly) all of its records:
+    // every initial version was superseded.  Utilization (active / total)
+    // drops toward zero, making the file cleanable.
+    let t = env.get_utilization_tracker().unwrap().lock();
+    let s = t.get_tracked_summary(0).unwrap();
+    let obsolete_after = s.get_summary().obsolete_ln_count;
+    assert!(
+        obsolete_after > file0_obsolete_before,
+        "file 0 obsolete count must rise after overwrites"
+    );
+    // Nearly every record originally in file 0 is now obsolete (allow a
+    // one-record boundary slack: a record straddling the file 0/1 flip may
+    // have its only surviving version counted against the later file).
+    assert!(
+        obsolete_after >= file0_total - 1,
+        "nearly every record originally in file 0 ({file0_total}) must be \
+         obsolete after overwriting all keys; got {obsolete_after}"
+    );
+}
+
+/// L-6: a deleted LN is counted obsolete at WRITE time (the logged deletion
+/// is immediately obsolete — it can be ignored by the cleaner).
+///
+/// JE `LNLogEntry.isImmediatelyObsolete`: `ln.isDeleted() || ...` -> the
+/// write path counts the new entry obsolete via `countObsoleteNodeInexact`.
+///
+/// FAIL-PRE (on main): the DeleteLN write path never counted the deletion
+/// entry obsolete, so the deletion records accumulated as "active" bytes the
+/// cleaner could not reclaim.
+#[test]
+fn deleted_ln_is_counted_obsolete_at_write() {
+    let dir = TempDir::new().unwrap();
+    let env = EnvironmentImpl::new(dir.path(), false, true).unwrap();
+    let lm = env.get_log_manager().expect("writable env has LogManager");
+
+    let mut cfg = DatabaseConfig::new();
+    cfg.set_allow_create(true);
+    let db_arc = env.open_database("del_test", &cfg).unwrap();
+    let mut cursor = CursorImpl::with_log_manager(db_arc, 1, lm);
+
+    // Insert then delete a record.
+    cursor.put(b"k", b"v", PutMode::Overwrite).unwrap();
+    cursor.search(b"k", Some(b"v"), SearchMode::Set).unwrap();
+    let obsolete_before: i32 = {
+        let t = env.get_utilization_tracker().unwrap().lock();
+        t.get_tracked_files()
+            .values()
+            .map(|s| s.get_summary().obsolete_ln_count)
+            .sum()
+    };
+    cursor.delete().unwrap();
+    cursor.close().unwrap();
+
+    let obsolete_after: i32 = {
+        let t = env.get_utilization_tracker().unwrap().lock();
+        t.get_tracked_files()
+            .values()
+            .map(|s| s.get_summary().obsolete_ln_count)
+            .sum()
+    };
+    // The delete must produce at least one new obsolete LN: the deletion
+    // entry itself (immediately obsolete, inexact) plus the superseded live
+    // version.
+    assert!(
+        obsolete_after > obsolete_before,
+        "deleting a record must count at least one obsolete LN at write time \
+         (L-6); before={obsolete_before}, after={obsolete_after}"
+    );
+}
+
 // ============================================================================
 // X-11: log_flush_no_sync_interval_ms daemon
 // ============================================================================
