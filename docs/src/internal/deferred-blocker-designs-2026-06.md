@@ -288,3 +288,41 @@ proves non-replicated envs still write 14-byte headers with no VLSN bits set.
     is wired into the checkpointer via `with_txn_manager()` and
     `get_first_active_lsn()` is queried; the result is discarded until P-2 lands.
     See `wave-gb-dbtree-recovery.md` for the P-2 redesign prerequisites.
+
+## EV-14 / EV-27 — evictor-completeness MED deferrals (2026-06)
+
+The evictor-completeness MED wave fixed the load-bearing safety guards
+EV-6 (skip upper INs with cached children), EV-7 (skip root INs), and the
+write-path back-pressure EV-15 (synchronous critical eviction in writer
+threads). Two lower-priority items in the same wave are deferred:
+
+- **EV-14 — `evictRoot` (user-DB root eviction): DEFERRED.** JE
+  `Evictor.evictRoot` (Evictor.java:3050) CAN evict a *non-internal* DB's
+  root IN under specific conditions: it logs the dirty root first, calls
+  `rootRef.setLsn(newLsn)` to update the `DbTree` root reference, then
+  `rootRef.clearTarget()` and increments `nRootNodesEvicted`. Noxu's
+  `root_nodes_evicted` stat is consequently dead (the root is never evicted).
+  This is **lower priority than EV-6/EV-7**, which *prevent* a wrong eviction
+  that EV-13's detach made dangerous; EV-14 merely *enables* an additional
+  (rare) eviction. Implementing it faithfully requires a separate root-LRU
+  selection path (`RootEvictor`), logging the root before clearing it, and a
+  version-aware `DbTree` root-LSN update — a focused change, not a tail-end
+  tweak. Until it lands, `decide_eviction`'s EV-7 guard keeps **every** root
+  resident (the simplest faithful rule), so the engine is correct but slightly
+  more memory-conservative than JE for very large single-DB working sets whose
+  root could otherwise be evicted. The `root_nodes_evicted` stat stays at 0.
+
+- **EV-27 — off-heap budget subtraction: NO CHANGE NEEDED (off-by-default,
+  not net-negative).** The triage note suggested removing a "net-negative
+  budget subtraction" so enabling off-heap can't hurt. On inspection there is
+  no such net-negative path: `OffHeapCache` is a self-contained write-back
+  tier with its own mmap/LRU budget and **never touches the on-heap arbiter
+  counter**; every method is gated on `is_enabled()`. The only on-heap
+  interaction is `EnvironmentImpl` partitioning the cache ceiling at open:
+  `arbiter_budget = cache_bytes - log_buf_total - off_heap_reserved`
+  (environment_impl.rs). `off_heap_reserved = cfg.max_off_heap_memory`, which
+  **defaults to 0** (dbi_config.rs:249), so with off-heap off-by-default the
+  subtraction is a no-op. When off-heap IS enabled the subtraction is the
+  *correct* partitioning (JE treats `cache_size` as the ceiling for the sum of
+  the on-heap + off-heap + log-buffer pools). There is therefore nothing to
+  remove; off-heap is genuinely inert by default and harmless when enabled.

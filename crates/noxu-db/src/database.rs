@@ -104,6 +104,11 @@ pub struct Database {
     /// deadlock messages) and the auto-commit op gets full abort-undo
     /// semantics on any error path.  Closes the F12 residuals.
     txn_manager: Arc<TxnManager>,
+    /// EV-15: cached evictor — acquired once at open, drives per-write
+    /// synchronous critical eviction (write back-pressure) without locking
+    /// env_impl.  Mirrors JE `EnvironmentImpl.criticalEviction` being called
+    /// before every cursor operation.
+    evictor: Arc<noxu_dbi::Evictor>,
     /// If true, auto-commit writes skip the log flush entirely (: TXN_NO_SYNC).
     no_sync: bool,
     /// If true, auto-commit writes flush to OS but skip fdatasync (: TXN_WRITE_NO_SYNC).
@@ -451,6 +456,7 @@ impl Database {
             file_protector,
             txn_manager,
             env_invalid,
+            evictor,
         ) = {
             let env = env_impl.lock();
             let lm = Arc::clone(env.get_lock_manager());
@@ -459,7 +465,8 @@ impl Database {
             let fp = env.get_file_protector();
             let txnm = Arc::clone(env.get_txn_manager());
             let inv = env.is_invalid_flag();
-            (lm, logm, ct, fp, txnm, inv)
+            let ev = env.get_evictor();
+            (lm, logm, ct, fp, txnm, inv, ev)
         };
         Database {
             name,
@@ -475,6 +482,7 @@ impl Database {
             cleaner_throttle,
             file_protector,
             txn_manager,
+            evictor,
             no_sync,
             write_no_sync,
             secondaries: Arc::new(RwLock::new(Vec::new())),
@@ -681,6 +689,11 @@ impl Database {
         self.check_open()?;
         self.reject_txn_on_non_txnal_db(txn.is_some())?;
         self.check_writable()?;
+        // EV-15: per-write synchronous critical eviction (write back-pressure).
+        // JE EnvironmentImpl.criticalEviction is called before every cursor
+        // operation; when the cache is critically over budget this writer
+        // thread evicts a bounded batch itself before allocating more.
+        self.evictor.do_critical_eviction();
         observe_span!(
             "db_put",
             db_name = self.name.as_str(),
@@ -982,6 +995,8 @@ impl Database {
         self.check_open()?;
         self.reject_txn_on_non_txnal_db(txn.is_some())?;
         self.check_writable()?;
+        // EV-15: per-write synchronous critical eviction (write back-pressure).
+        self.evictor.do_critical_eviction();
         observe_span!(
             "db_delete",
             db_name = self.name.as_str(),

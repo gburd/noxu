@@ -2095,6 +2095,18 @@ impl EnvironmentImpl {
         self.evictor.do_evict(EvictionSource::Manual).bytes_evicted as usize
     }
 
+    /// EV-15: per-operation synchronous critical eviction (write back-pressure).
+    ///
+    /// JE `EnvironmentImpl.criticalEviction` (EnvironmentImpl.java:3012) is
+    /// called from application threads before every cursor operation; it
+    /// forwards to `Evictor.doCriticalEviction`, which makes the calling
+    /// thread itself evict when the cache is *critically* over budget so a
+    /// writer filling the cache blocks before continuing.  Returns bytes
+    /// evicted (0 when no critical eviction was needed).
+    pub fn critical_eviction(&self) -> u64 {
+        self.evictor.do_critical_eviction()
+    }
+
     /// Returns the number of open databases.
     pub fn n_databases(&self) -> usize {
         self.db_map.read().len()

@@ -102,6 +102,30 @@ pub trait NodeEvictionInfo {
     fn is_bin(&self) -> bool;
     fn is_resident(&self) -> bool;
     fn ref_count(&self) -> usize;
+
+    /// True when this is an upper IN (level >= 2 / non-BIN) that still has
+    /// at least one resident (cached) child (`InEntry.child.is_some()`).
+    ///
+    /// JE `IN.hasCachedChildren` / the `NON_EVICTABLE_IN` skip in
+    /// `Evictor.processTarget` (Evictor.java:2652-2656): a UIN with cached
+    /// children must not be evicted — detaching it would orphan its resident
+    /// children (their parent pointer would dangle).  Defaults to `false` for
+    /// BINs and for synthetic test infos.
+    fn has_cached_children(&self) -> bool {
+        false
+    }
+
+    /// True when this node is the root IN of its tree.
+    ///
+    /// JE `IN.isRoot()` / the root-protection skip in
+    /// `Evictor.processTarget` (Evictor.java:2663-2671): JE never evicts the
+    /// root of the internal ID/NAME databases, and `evictRoot` handles user-DB
+    /// roots through a separate path.  Noxu takes the simplest faithful rule —
+    /// never evict a root IN — so the root stays resident.  Defaults to
+    /// `false`.
+    fn is_root(&self) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -125,6 +149,22 @@ pub fn decide_eviction(
     use_dirty_lru: bool,
 ) -> EvictionDecision {
     if !info.is_resident() {
+        return EvictionDecision::Skip;
+    }
+    // EV-6 (JE Evictor.processTarget, Evictor.java:2652-2656,
+    // IN.hasCachedChildren / NON_EVICTABLE_IN): an upper IN that has resident
+    // (cached) children must NOT be evicted.  A childless UIN may be selected
+    // for the LRU and then acquire cached children before the evicting thread
+    // latches it; skip it so EV-13's detach can't orphan a resident child.
+    if !info.is_bin() && info.has_cached_children() {
+        return EvictionDecision::Skip;
+    }
+    // EV-7 (JE Evictor.processTarget, Evictor.java:2663-2671, IN.isRoot()):
+    // never evict a root IN.  JE disallows eviction of the ID/NAME DB roots
+    // here and routes user-DB roots through a separate evictRoot path; the
+    // simplest faithful rule is to keep every root resident (EV-14 / evictRoot
+    // is deferred — see do_evict).
+    if info.is_root() {
         return EvictionDecision::Skip;
     }
     if info.ref_count() > 0 {
@@ -1089,6 +1129,35 @@ impl Evictor {
         &self.arbiter
     }
 
+    /// EV-15: synchronous critical eviction, called from application (writer)
+    /// threads on the operation path to apply write back-pressure.
+    ///
+    /// JE `Evictor.doCriticalEviction` (Evictor.java:2054) is invoked from
+    /// `EnvironmentImpl.criticalEviction` for every cursor operation: when the
+    /// cache is *critically* over budget (`Arbiter.needCriticalEviction`), the
+    /// calling thread itself runs `doEvict(CRITICAL)` so a writer that is
+    /// filling the cache blocks to evict before continuing — preventing
+    /// unbounded overshoot between the background daemon's wakeups.
+    ///
+    /// Bounded like JE: a single `do_evict` batch runs (its inner loop is
+    /// already capped by `max_batch_size` and `still_needs_eviction`), then the
+    /// caller proceeds even if the cache is still over budget.  Returns the
+    /// number of bytes evicted (0 when no critical eviction was needed).
+    pub fn do_critical_eviction(&self) -> u64 {
+        if self.is_shutdown() {
+            return 0;
+        }
+        // JE doCriticalEviction guards on isOverBudget() then
+        // needCriticalEviction(); the daemon takes the burden whenever it can,
+        // so application threads only block when the overage is critical.
+        if self.arbiter.is_over_budget()
+            && self.arbiter.need_critical_eviction()
+        {
+            return self.do_evict(EvictionSource::Critical).bytes_evicted;
+        }
+        0
+    }
+
     /// Name of the primary eviction algorithm.
     pub fn primary_algorithm_name(&self) -> &'static str {
         self.primary_policy.name()
@@ -1165,6 +1234,10 @@ struct RealNodeInfo {
     dirty: bool,
     is_bin: bool,
     pin_count: usize,
+    /// EV-6: upper IN has at least one resident child (`InEntry.child`).
+    has_cached_children: bool,
+    /// EV-7: this node is the tree root.
+    is_root: bool,
 }
 impl NodeEvictionInfo for RealNodeInfo {
     fn is_dirty(&self) -> bool {
@@ -1178,6 +1251,12 @@ impl NodeEvictionInfo for RealNodeInfo {
     }
     fn ref_count(&self) -> usize {
         self.pin_count
+    }
+    fn has_cached_children(&self) -> bool {
+        self.has_cached_children
+    }
+    fn is_root(&self) -> bool {
+        self.is_root
     }
 }
 
@@ -1217,12 +1296,19 @@ struct NodeFull {
 /// tree-traversal count from up to three O(n) walks to one.
 fn find_node_full(tree: &Tree, node_id: u64) -> Option<NodeFull> {
     let root_arc = tree.get_root()?;
-    find_node_full_recursive(&root_arc, node_id)
+    // EV-7: capture the root's node_id so the walk can flag the root IN as
+    // non-evictable (JE IN.isRoot()).
+    let root_id = match &*root_arc.read() {
+        TreeNode::Internal(n) => n.node_id,
+        TreeNode::Bottom(b) => b.node_id,
+    };
+    find_node_full_recursive(&root_arc, node_id, root_id)
 }
 
 fn find_node_full_recursive(
     node_arc: &Arc<NodeRwLock<TreeNode>>,
     target_id: u64,
+    root_id: u64,
 ) -> Option<NodeFull> {
     let guard = node_arc.read();
     match &*guard {
@@ -1234,6 +1320,9 @@ fn find_node_full_recursive(
                 dirty: b.dirty || b.dirty_count() > 0,
                 is_bin: true,
                 pin_count: b.cursor_count.max(0) as usize,
+                // A BIN has no cached IN children; EV-6 only guards upper INs.
+                has_cached_children: false,
+                is_root: b.node_id == root_id,
             };
             // Size formula (BIN): struct overhead + per-slot fixed overhead +
             // variable key and embedded-LN data bytes.
@@ -1252,10 +1341,16 @@ fn find_node_full_recursive(
         }
         TreeNode::Internal(n) => {
             if n.node_id == target_id {
+                // EV-6: an upper IN with any resident child must stay
+                // resident (JE IN.hasCachedChildren / NON_EVICTABLE_IN).
+                let has_cached_children =
+                    n.entries.iter().any(|e| e.child.is_some());
                 let info = RealNodeInfo {
                     dirty: n.dirty,
                     is_bin: false,
                     pin_count: 0,
+                    has_cached_children,
+                    is_root: n.node_id == root_id,
                 };
                 // Size formula (IN): struct overhead + per-entry fixed overhead
                 // + variable key bytes.
@@ -1274,7 +1369,8 @@ fn find_node_full_recursive(
                 .collect();
             drop(guard);
             for child in children {
-                if let Some(full) = find_node_full_recursive(&child, target_id)
+                if let Some(full) =
+                    find_node_full_recursive(&child, target_id, root_id)
                 {
                     return Some(full);
                 }
@@ -1485,6 +1581,71 @@ mod tests {
         );
     }
 
+    // EV-6 / EV-7: a richer info that also sets has_cached_children / is_root.
+    struct GuardInfo {
+        bin: bool,
+        has_children: bool,
+        root: bool,
+    }
+    impl NodeEvictionInfo for GuardInfo {
+        fn is_dirty(&self) -> bool {
+            false
+        }
+        fn is_bin(&self) -> bool {
+            self.bin
+        }
+        fn is_resident(&self) -> bool {
+            true
+        }
+        fn ref_count(&self) -> usize {
+            0
+        }
+        fn has_cached_children(&self) -> bool {
+            self.has_children
+        }
+        fn is_root(&self) -> bool {
+            self.root
+        }
+    }
+
+    /// EV-6 (JE Evictor.processTarget IN.hasCachedChildren /
+    /// NON_EVICTABLE_IN, Evictor.java:2652-2656): an upper IN with a resident
+    /// child must be SKIPPED, not evicted.  With EV-13's detach live, evicting
+    /// it would orphan the resident child.  Neutering the guard turns this
+    /// into Evict and fails the assert.
+    #[test]
+    fn test_decide_ev6_upper_in_with_children_skipped() {
+        let upper_with_children =
+            GuardInfo { bin: false, has_children: true, root: false };
+        assert_eq!(
+            decide_eviction(&upper_with_children, false, true),
+            EvictionDecision::Skip,
+            "EV-6: upper IN with resident children must be skipped"
+        );
+        // A childless upper IN is still evictable (sanity: the guard is
+        // specific to the has-children case).
+        let upper_no_children =
+            GuardInfo { bin: false, has_children: false, root: false };
+        assert_eq!(
+            decide_eviction(&upper_no_children, false, true),
+            EvictionDecision::Evict,
+            "childless upper IN is still evictable"
+        );
+    }
+
+    /// EV-7 (JE Evictor.processTarget IN.isRoot(), Evictor.java:2663-2671): a
+    /// root IN must be SKIPPED.  Neutering the guard turns this into Evict and
+    /// fails the assert.
+    #[test]
+    fn test_decide_ev7_root_skipped() {
+        let root_in = GuardInfo { bin: false, has_children: false, root: true };
+        assert_eq!(
+            decide_eviction(&root_in, false, true),
+            EvictionDecision::Skip,
+            "EV-7: root IN must be skipped"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // EvictResult
     // -----------------------------------------------------------------------
@@ -1554,6 +1715,139 @@ mod tests {
         let e = Evictor::new(arbiter, 100, false);
         assert_eq!(e.primary_algorithm_name(), "LRU");
         assert_eq!(e.scan_algorithm_name(), "LRU");
+    }
+
+    /// EV-15 (JE Evictor.doCriticalEviction, Evictor.java:2054): a writer
+    /// thread calling `do_critical_eviction` only evicts when the cache is
+    /// *critically* over budget (Arbiter.needCriticalEviction), and when it
+    /// does it drives a bounded synchronous evict that lowers usage.
+    #[test]
+    fn test_ev15_critical_eviction_bounded_and_gated() {
+        use noxu_util::Lsn;
+        use std::sync::{Arc, RwLock};
+
+        // Build a tree with several childless non-root upper INs that can be
+        // fully evicted (max_entries=2 => deep right-spine).
+        let tree_inner = noxu_tree::tree::Tree::new(7, 2);
+        for i in 0u16..16 {
+            tree_inner
+                .insert(
+                    i.to_be_bytes().to_vec(),
+                    vec![i as u8],
+                    Lsn::new(1, u32::from(i) + 1),
+                )
+                .unwrap();
+        }
+        // Detach every BIN so each upper IN directly above it becomes
+        // childless and hence EV-6-evictable; THEN collect those now-childless
+        // upper INs (intermediate INs still have a resident IN child and stay
+        // EV-6-protected, so we must register only the evictable leaves to
+        // keep the bounded batch deterministic).
+        fn collect_bins(
+            node: &Arc<noxu_tree::NodeRwLock<TreeNode>>,
+            bins: &mut Vec<u64>,
+        ) {
+            let g = node.read();
+            match &*g {
+                TreeNode::Bottom(b) => bins.push(b.node_id),
+                TreeNode::Internal(n) => {
+                    let cs: Vec<_> = n
+                        .entries
+                        .iter()
+                        .filter_map(|e| e.child.clone())
+                        .collect();
+                    drop(g);
+                    for c in cs {
+                        collect_bins(&c, bins);
+                    }
+                }
+            }
+        }
+        fn collect_childless_uins(
+            node: &Arc<noxu_tree::NodeRwLock<TreeNode>>,
+            is_root: bool,
+            uins: &mut Vec<u64>,
+        ) {
+            let g = node.read();
+            let TreeNode::Internal(n) = &*g else {
+                return;
+            };
+            if !is_root && n.entries.iter().all(|e| e.child.is_none()) {
+                uins.push(n.node_id);
+            }
+            let children: Vec<_> =
+                n.entries.iter().filter_map(|e| e.child.clone()).collect();
+            drop(g);
+            for c in children {
+                collect_childless_uins(&c, false, uins);
+            }
+        }
+
+        let tree_arc = Arc::new(RwLock::new(tree_inner));
+        let bins = {
+            let t = tree_arc.read().unwrap();
+            let root = t.get_root().expect("root");
+            let mut bins = Vec::new();
+            collect_bins(&root, &mut bins);
+            bins
+        };
+        {
+            let t = tree_arc.read().unwrap();
+            for bin_id in &bins {
+                t.detach_node_by_id(*bin_id);
+            }
+        }
+        let uins = {
+            let t = tree_arc.read().unwrap();
+            let root = t.get_root().expect("root");
+            let mut uins = Vec::new();
+            collect_childless_uins(&root, true, &mut uins);
+            uins
+        };
+        assert!(!uins.is_empty(), "fixture: need childless upper INs to evict");
+
+        let usage = Arc::new(AtomicI64::new(0));
+        // max=1000, critical_threshold=200: critical when usage-max > 200.
+        let evictor = Evictor::new(
+            Arbiter::new(1000, Arc::clone(&usage), 100, 200),
+            4, // small batch => bounded eviction
+            true,
+        )
+        .with_tree(tree_arc, 7);
+        for in_id in &uins {
+            evictor.note_ins_added(*in_id, CacheMode::Default);
+        }
+
+        // Not over budget => no critical eviction.
+        usage.store(500, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            evictor.do_critical_eviction(),
+            0,
+            "EV-15: under budget must not evict"
+        );
+
+        // Over budget but NOT critical (1100-1000=100 <= 200) => still no
+        // synchronous eviction (the daemon takes the burden).
+        usage.store(1100, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            evictor.do_critical_eviction(),
+            0,
+            "EV-15: non-critical overage defers to the daemon"
+        );
+
+        // Critically over budget (10000-1000=9000 > 200) => the calling
+        // thread evicts a bounded batch itself, lowering usage.
+        usage.store(10_000, std::sync::atomic::Ordering::Relaxed);
+        let before = usage.load(std::sync::atomic::Ordering::Relaxed);
+        let freed = evictor.do_critical_eviction();
+        let after = usage.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            freed > 0,
+            "EV-15: critical pressure must drive synchronous eviction"
+        );
+        assert!(after < before, "EV-15: usage must drop after eviction");
+        // Bounded: at most max_batch_size (4) nodes per call, so usage does
+        // not have to fall under budget in one shot — the writer proceeds.
     }
 
     #[test]
@@ -2205,89 +2499,114 @@ mod tests {
         );
     }
 
-    /// Demonstrate that `node_size_fn` in `do_evict` is served from the
-    /// O(1) size cache (no fallback to the 1024-byte sentinel) by checking
-    /// that `bytes_evicted` equals the size formula for the evicted IN node,
-    /// not the sentinel value 1024.
+    /// Demonstrate that the `Evict` decision path in `do_evict` actually
+    /// detaches a node and credits its real measured size (EV-13), not the
+    /// 1024-byte sentinel fallback.
     ///
-    /// **Why an IN node?**  BIN nodes always take the `PartialEvict` path
-    /// (which calls `strip_lns_from_node`, not `node_size_fn`).  Only IN
-    /// nodes reach the `Evict` path that calls `node_size_fn`.  We put the
-    /// root IN into pri2 so that the dirty-IN guard (`MoveDirtyToPri2`) does
-    /// not fire — nodes in pri2 are always evicted, regardless of dirty flag.
-    ///
-    /// If the cache is broken and the fallback sentinel (1024) fires,
-    /// `bytes_evicted` would equal 1024 instead of the real size formula.
+    /// **Why a non-root, childless upper IN?**  After EV-6 / EV-7 the only
+    /// upper IN the evictor will fully evict is one that is (a) not the root
+    /// and (b) has no resident children.  BIN nodes take the `PartialEvict`
+    /// path.  We build a deep tree (`max_entries=2` forces a deep right-spine
+    /// where every IN below the root is a non-root upper IN), detach a chosen
+    /// upper IN's BIN child to make it childless, then evict it.  The
+    /// `node_size_fn` detach-and-measure callback returns the real heap size,
+    /// which must not equal the 1024 sentinel.
     #[test]
     fn test_do_evict_bytes_matches_node_size_not_sentinel() {
         use noxu_util::Lsn;
-        use std::mem::size_of;
         use std::sync::atomic::AtomicI64;
         use std::sync::{Arc, RwLock};
 
-        let tree_inner = noxu_tree::tree::Tree::new(99, 128);
-        {
+        // max_entries=2 => deep right-spine; every IN below the root is a
+        // non-root upper IN.
+        let tree_inner = noxu_tree::tree::Tree::new(99, 2);
+        for i in 0u16..16 {
             tree_inner
-                .insert(b"k1".to_vec(), b"vvv".to_vec(), Lsn::new(1, 1))
-                .unwrap();
-            tree_inner
-                .insert(b"k2".to_vec(), b"wwwww".to_vec(), Lsn::new(1, 2))
+                .insert(
+                    i.to_be_bytes().to_vec(),
+                    vec![i as u8],
+                    Lsn::new(1, u32::from(i) + 1),
+                )
                 .unwrap();
         }
 
-        // The root is an IN (the tree always wraps BINs in an IN root).
-        // Compute the expected size using the explicit IN formula.
-        let (root_in_id, expected_size) = {
-            let root_arc = tree_inner.get_root().expect("root");
-            let guard = root_arc.read();
-            match &*guard {
-                TreeNode::Internal(n) => {
-                    let id = n.node_id;
-                    let sz = (size_of::<InNodeStub>()
-                        + n.entries.len() * size_of::<InEntry>()
-                        + n.entries.iter().map(|e| e.key.len()).sum::<usize>())
-                        as u64;
-                    (id, sz)
-                }
-                _ => {
-                    // Tree structure changed; skip instead of failing.
-                    return;
+        // Find a NON-ROOT upper IN that has at least one BIN child, and grab
+        // that child's id so we can detach it (making the upper IN childless
+        // and thus EV-6-eligible).
+        fn find_nonroot_upper_in_with_bin_child(
+            node: &Arc<noxu_tree::NodeRwLock<TreeNode>>,
+            is_root: bool,
+        ) -> Option<(u64, u64)> {
+            let g = node.read();
+            let TreeNode::Internal(n) = &*g else {
+                return None;
+            };
+            // If this is a non-root upper IN whose first child is a BIN,
+            // return (this_in_id, bin_child_id).
+            if !is_root {
+                for e in &n.entries {
+                    if let Some(child) = &e.child {
+                        let cg = child.read();
+                        if let TreeNode::Bottom(b) = &*cg {
+                            return Some((n.node_id, b.node_id));
+                        }
+                    }
                 }
             }
+            // Otherwise recurse into children.
+            let children: Vec<_> =
+                n.entries.iter().filter_map(|e| e.child.clone()).collect();
+            drop(g);
+            for c in children {
+                if let Some(found) =
+                    find_nonroot_upper_in_with_bin_child(&c, false)
+                {
+                    return Some(found);
+                }
+            }
+            None
+        }
+
+        let (upper_in_id, bin_child_id) = {
+            let root = tree_inner.get_root().expect("root");
+            match find_nonroot_upper_in_with_bin_child(&root, true) {
+                Some(pair) => pair,
+                // Tree shape changed; skip rather than fail.
+                None => return,
+            }
         };
-        assert_ne!(
-            expected_size, 1024,
-            "sentinel must not coincide with the real IN size"
-        );
+
+        // Detach the BIN child so the upper IN becomes childless (passes
+        // EV-6).  This is the same operation the evictor performs; here we
+        // drive it manually to set up the test fixture.
+        let detached = tree_inner.detach_node_by_id(bin_child_id);
+        assert!(detached > 0, "fixture: BIN child must detach");
 
         let tree = Arc::new(RwLock::new(tree_inner));
-        // Budget: usage > max so eviction fires immediately.
-        let usage = Arc::new(AtomicI64::new(expected_size as i64 * 10));
-        let arbiter =
-            Arbiter::new(expected_size as i64, Arc::clone(&usage), 100, 200);
-        let evictor =
-            Evictor::new(arbiter, 10, false).with_tree(Arc::clone(&tree), 99);
+        let usage = Arc::new(AtomicI64::new(100_000));
+        let evictor = Evictor::new(
+            Arbiter::new(100, Arc::clone(&usage), 100, 200),
+            10,
+            true, // lru_only: straight to the Evict decision
+        )
+        .with_tree(Arc::clone(&tree), 99);
 
-        // Register the root IN in pri2 only (not primary).  If we added it
-        // to primary first, the dirty-IN guard in decide_eviction would try
-        // to move it to pri2 again, triggering a duplicate-insert assertion.
-        // pri2 nodes are evicted regardless of dirty flag, which is exactly
-        // the Evict path we need to exercise node_size_fn.
-        evictor.pri2_insert_for_test(root_in_id);
-
+        evictor.note_ins_added(upper_in_id, CacheMode::Default);
         let result = evictor.do_evict(EvictionSource::Daemon);
 
-        // The sentinel fallback is 1024.  If the cache is working,
-        // bytes_evicted should equal expected_size (the IN size formula),
-        // not 1024.
+        // The childless non-root upper IN was evicted via the real EV-13
+        // detach path, crediting its measured heap size (never the 1024
+        // sentinel, since detach returned > 0).
         assert_eq!(
-            result.bytes_evicted, expected_size,
-            "bytes_evicted ({}) must equal formula size ({}), not sentinel 1024",
-            result.bytes_evicted, expected_size
+            result.nodes_evicted, 1,
+            "childless non-root upper IN must be evicted"
         );
-        // The IN was evicted (flushed to log is a no-op for INs without
-        // a log manager wired).
-        assert_eq!(result.nodes_evicted, 1);
+        assert!(
+            result.bytes_evicted > 0 && result.bytes_evicted != 1024,
+            "bytes_evicted ({}) must be the measured detach size, not the \
+             1024 sentinel",
+            result.bytes_evicted
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2643,5 +2962,135 @@ mod tests {
         drop(evictor);
         // After evictor drops, only our local Arc remains.
         assert_eq!(Arc::strong_count(&ckpt), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // EV-6 / EV-7: prevent-wrong-eviction integration tests (real tree)
+    //
+    // EV-13 made full-node eviction DETACH the node from its parent. These
+    // tests prove the load-bearing safety guards: an upper IN with a resident
+    // child (EV-6) and a root IN (EV-7) are NOT detached when registered for
+    // eviction.  Removing either guard turns the decision into Evict and the
+    // node is detached, failing the resident-child / resident-root assert.
+    // -----------------------------------------------------------------------
+
+    /// EV-6 (JE Evictor.processTarget IN.hasCachedChildren /
+    /// NON_EVICTABLE_IN, Evictor.java:2652-2656): register the root IN (an
+    /// upper IN whose BIN children are resident) for eviction; after
+    /// `do_evict` the IN's child slots must still hold their `Arc` (not
+    /// detached).  Fail-pre if the EV-6 guard is neutered.
+    #[test]
+    fn test_ev6_upper_in_with_resident_child_not_detached() {
+        use noxu_util::Lsn;
+        use std::sync::{Arc, RwLock};
+
+        // Two inserts => root IN with a resident BIN child.
+        let tree_inner = noxu_tree::tree::Tree::new(1, 128);
+        tree_inner
+            .insert(b"k1".to_vec(), b"v1".to_vec(), Lsn::new(1, 1))
+            .unwrap();
+        tree_inner
+            .insert(b"k2".to_vec(), b"v2".to_vec(), Lsn::new(1, 2))
+            .unwrap();
+
+        let (in_id, had_child) = {
+            let root = tree_inner.get_root().expect("root");
+            let g = root.read();
+            match &*g {
+                TreeNode::Internal(n) => {
+                    (n.node_id, n.entries.iter().any(|e| e.child.is_some()))
+                }
+                // If the root is a single BIN the test premise is gone; skip.
+                TreeNode::Bottom(_) => return,
+            }
+        };
+        assert!(had_child, "premise: root IN must have a resident child");
+
+        let tree = Arc::new(RwLock::new(tree_inner));
+        let usage = Arc::new(std::sync::atomic::AtomicI64::new(9999));
+        // lru_only so the IN goes straight to the Evict decision path.
+        let evictor = Evictor::new(
+            Arbiter::new(100, Arc::clone(&usage), 100, 200),
+            100,
+            true,
+        )
+        .with_tree(Arc::clone(&tree), 1);
+
+        evictor.note_ins_added(in_id, CacheMode::Default);
+        let result = evictor.do_evict(EvictionSource::Daemon);
+
+        // The upper IN must NOT have been evicted/detached.
+        assert_eq!(
+            result.nodes_evicted, 0,
+            "EV-6: upper IN with resident children must not be evicted"
+        );
+        // Its child slot must still hold the Arc (not detached).
+        let still_has_child = {
+            let t = tree.read().unwrap();
+            let root = t.get_root().expect("root still resident");
+            let g = root.read();
+            match &*g {
+                TreeNode::Internal(n) => {
+                    n.entries.iter().any(|e| e.child.is_some())
+                }
+                TreeNode::Bottom(_) => false,
+            }
+        };
+        assert!(
+            still_has_child,
+            "EV-6: resident child must remain attached (not orphaned)"
+        );
+    }
+
+    /// EV-7 (JE Evictor.processTarget IN.isRoot(), Evictor.java:2663-2671):
+    /// register the root IN for eviction; after `do_evict` the root must
+    /// still be resident.  Fail-pre if the EV-7 guard is neutered (with EV-6
+    /// also off, the root would be detached/evicted).
+    #[test]
+    fn test_ev7_root_in_not_evicted() {
+        use noxu_util::Lsn;
+        use std::sync::{Arc, RwLock};
+
+        let tree_inner = noxu_tree::tree::Tree::new(1, 128);
+        tree_inner
+            .insert(b"k1".to_vec(), b"v1".to_vec(), Lsn::new(1, 1))
+            .unwrap();
+        tree_inner
+            .insert(b"k2".to_vec(), b"v2".to_vec(), Lsn::new(1, 2))
+            .unwrap();
+
+        let root_in_id = {
+            let root = tree_inner.get_root().expect("root");
+            let g = root.read();
+            match &*g {
+                TreeNode::Internal(n) => n.node_id,
+                TreeNode::Bottom(b) => b.node_id,
+            }
+        };
+
+        let tree = Arc::new(RwLock::new(tree_inner));
+        let usage = Arc::new(std::sync::atomic::AtomicI64::new(9999));
+        let evictor = Evictor::new(
+            Arbiter::new(100, Arc::clone(&usage), 100, 200),
+            100,
+            true,
+        )
+        .with_tree(Arc::clone(&tree), 1);
+
+        // Put the root IN into pri2 directly: pri2 nodes bypass the
+        // dirty/move-to-pri2 path and reach the Evict decision unconditionally
+        // (the same trick the sentinel-size test uses), isolating the EV-7
+        // is_root guard as the only thing that can prevent eviction.
+        evictor.pri2_insert_for_test(root_in_id);
+        let result = evictor.do_evict(EvictionSource::Daemon);
+
+        assert_eq!(
+            result.nodes_evicted, 0,
+            "EV-7: root IN must not be evicted"
+        );
+        assert!(
+            tree.read().unwrap().is_root_resident(),
+            "EV-7: root must remain resident after eviction attempt"
+        );
     }
 }
