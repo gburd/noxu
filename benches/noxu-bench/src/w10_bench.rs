@@ -20,7 +20,7 @@ fn open_env(dir: &Path) -> (Environment, Database) {
         .open_database(
             None,
             "bench",
-            &DatabaseConfig::new().with_allow_create(true),
+            &DatabaseConfig::new().with_allow_create(true).with_transactional(true),
         )
         .unwrap();
     (env, db)
