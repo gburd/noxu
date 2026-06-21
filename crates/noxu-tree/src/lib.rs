@@ -91,6 +91,7 @@ pub use versioned_ln::make_versioned_ln;
 pub use tree::{
     BinEntry, BinStub, InEntry, InNodeStub, InRedoResult, KeyComparatorFn,
     SlotFetch, Tree, TreeNode, TreeStats, generate_node_id,
+    peek_next_node_id_counter, seed_node_id_counter,
 };
 
 // Re-export from in_node

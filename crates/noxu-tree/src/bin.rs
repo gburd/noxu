@@ -74,14 +74,16 @@ pub struct InNode {
     node_id: u64,
 }
 
-/// Monotonic counter for BIN node IDs (mirrors NodeSequence).
-static NEXT_BIN_NODE_ID: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(1);
-
+/// Monotonic counter for BIN node IDs.
+///
+/// L-30: routed through the single tree-wide node-id source
+/// (`crate::tree::generate_node_id`) so BIN node-ids share the same counter
+/// the env seeds post-recovery (`NodeSequence.getNextLocalNodeId`).  The
+/// former private `NEXT_BIN_NODE_ID` static reset to 1 on every restart and
+/// bypassed the recovered max — a node-id reuse hazard.
 impl InNode {
     pub fn new(db_id: u64, level: i32, max_entries: usize) -> Self {
-        let node_id =
-            NEXT_BIN_NODE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let node_id = crate::tree::generate_node_id();
         Self {
             db_id,
             level,

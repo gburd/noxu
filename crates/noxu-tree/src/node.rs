@@ -4,8 +4,6 @@
 //! Node is an abstract base class. In Rust, we use an enum for the
 //! closed set of node types, plus utilities for node ID generation.
 
-use std::sync::atomic::{AtomicI64, Ordering};
-
 /// Sentinel value representing a null/uninitialized node ID.
 pub const NULL_NODE_ID: i64 = -1;
 
@@ -109,39 +107,13 @@ impl std::fmt::Display for NodeType {
     }
 }
 
-/// Global counter for generating unique node IDs.
-///
-/// Node IDs are unique within an environment instance (not persisted across
-/// environment open/close). They start at 1 and increment monotonically.
-static NEXT_NODE_ID: AtomicI64 = AtomicI64::new(1);
-
-/// Generates a new unique node ID.
-///
-/// Node IDs are used to identify nodes in memory. They are not the same as
-/// LSNs (which identify the on-disk location). Node IDs are transient and
-/// start from 1 each time the environment is opened.
-///
-/// # Returns
-/// A unique positive i64 node ID
-pub fn generate_node_id() -> i64 {
-    NEXT_NODE_ID.fetch_add(1, Ordering::Relaxed)
-}
-
-/// Resets the node ID counter to 1.
-///
-/// This is used during environment initialization or in testing.
-/// In production, this is called when an environment is opened.
-pub fn reset_node_id_counter() {
-    NEXT_NODE_ID.store(1, Ordering::Relaxed);
-}
-
-/// Returns the next node ID that would be generated (without incrementing).
-///
-/// Used for testing and diagnostics.
-pub fn peek_next_node_id() -> i64 {
-    NEXT_NODE_ID.load(Ordering::Relaxed)
-}
-
+// L-30: the former private i64 node-id generator (`NEXT_NODE_ID` /
+// `generate_node_id` / `reset_node_id_counter` / `peek_next_node_id`) lived
+// here but was dead production code (never exported from `lib.rs`, used only
+// by this module's own tests).  It was a SECOND independent node-id source
+// that reset to 1 on every restart.  Node-ids now come from the single
+// tree-wide counter `crate::tree::generate_node_id`, which the env seeds
+// post-recovery (`NodeSequence.getNextLocalNodeId`).
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,48 +199,7 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_node_id() {
-        reset_node_id_counter();
-
-        let id1 = generate_node_id();
-        let id2 = generate_node_id();
-        let id3 = generate_node_id();
-
-        assert_eq!(id1, 1);
-        assert_eq!(id2, 2);
-        assert_eq!(id3, 3);
-        assert!(id1 != NULL_NODE_ID);
-    }
-
-    #[test]
-    fn test_reset_node_id_counter() {
-        reset_node_id_counter();
-        assert_eq!(generate_node_id(), 1);
-        assert_eq!(generate_node_id(), 2);
-
-        reset_node_id_counter();
-        assert_eq!(generate_node_id(), 1);
-    }
-
-    #[test]
-    fn test_peek_next_node_id() {
-        reset_node_id_counter();
-
-        let next = peek_next_node_id();
-        assert_eq!(next, 1);
-
-        generate_node_id();
-        let next2 = peek_next_node_id();
-        assert_eq!(next2, 2);
-
-        // Peek doesn't increment
-        let next3 = peek_next_node_id();
-        assert_eq!(next3, 2);
-    }
-
-    #[test]
     fn test_null_node_id_constant() {
         assert_eq!(NULL_NODE_ID, -1);
-        assert!(generate_node_id() != NULL_NODE_ID);
     }
 }

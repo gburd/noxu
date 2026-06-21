@@ -229,6 +229,17 @@ pub struct Checkpointer {
     /// Safe only after Stage 1 (all user-database BINs are checkpointed);
     /// `None` for unit tests without a full environment.
     txn_manager: Option<Arc<TxnManager>>,
+    /// REC-S: id sources read at checkpoint time to write the real last
+    /// node/db/txn id values into `CheckpointEnd` (instead of zeros).
+    ///
+    /// JE `Checkpointer.doCheckpoint` writes `getLastLocalNodeId` /
+    /// `getLastLocalDbId` / `getLastLocalTxnId` into the `CheckpointEnd`.
+    /// `next_db_id` mirrors the env's db-id counter (last db-id = value-1);
+    /// the last txn-id is read from `txn_manager.get_last_local_txn_id()`;
+    /// the last node-id comes from the single tree-wide node counter
+    /// (`noxu_tree::peek_next_node_id_counter`, L-30).  `None` keeps the old
+    /// zero behaviour for unit tests without a full environment.
+    next_db_id: Option<Arc<std::sync::atomic::AtomicI64>>,
 }
 
 impl Checkpointer {
@@ -258,6 +269,7 @@ impl Checkpointer {
             utilization_tracker: None,
             cleaner: None,
             txn_manager: None,
+            next_db_id: None,
         }
     }
 
@@ -334,6 +346,24 @@ impl Checkpointer {
     /// skip committed LNs not captured in any BIN.
     pub fn with_txn_manager(mut self, txn_manager: Arc<TxnManager>) -> Self {
         self.txn_manager = Some(txn_manager);
+        self
+    }
+
+    /// REC-S: wire the env's db-id counter so `do_checkpoint` writes the real
+    /// last node/db/txn id values into `CheckpointEnd` instead of zeros.
+    ///
+    /// `next_db_id` is the env's `AtomicI64` (last allocated db-id =
+    /// `next_db_id - 1`).  The last txn-id is read from the wired
+    /// `txn_manager`; the last node-id from the tree-wide node counter.
+    ///
+    /// JE `Checkpointer.doCheckpoint` reads `envImpl.getNodeSequence()
+    /// .getLastLocalNodeId()`, `getDbTree().getLastLocalDbId()`, and
+    /// `getTxnManager().getLastLocalTxnId()` into the `CheckpointEnd`.
+    pub fn with_id_sources(
+        mut self,
+        next_db_id: Arc<std::sync::atomic::AtomicI64>,
+    ) -> Self {
+        self.next_db_id = Some(next_db_id);
         self
     }
 
@@ -582,19 +612,46 @@ impl Checkpointer {
         // LSN for future P-2 use; suppress unused warning.)
         let _ = &self.txn_manager;
 
+        // REC-S: read the env's current last node/db/txn ids and write the
+        // REAL values into CheckpointEnd (instead of the old hardcoded zeros)
+        // so recovery folds them into use_max_* and the env seeds its
+        // sequences past them on restart.  JE Checkpointer.doCheckpoint writes
+        // getLastLocalNodeId / getLastLocalDbId / getLastLocalTxnId.
+        //   - last node-id: the tree-wide node counter (L-30); the next id to
+        //     be handed out is `peek_next_node_id_counter()`, so the last
+        //     allocated id is that minus 1 (saturating).
+        //   - last db-id: the env's next_db_id minus 1.
+        //   - last txn-id: txn_manager.get_last_local_txn_id().
+        let last_local_node_id: u64 =
+            noxu_tree::tree::peek_next_node_id_counter().saturating_sub(1);
+        let last_local_db_id: u64 = self
+            .next_db_id
+            .as_ref()
+            .map(|n| {
+                n.load(std::sync::atomic::Ordering::Relaxed).saturating_sub(1)
+                    as u64
+            })
+            .unwrap_or(0);
+        let last_local_txn_id: u64 = self
+            .txn_manager
+            .as_ref()
+            .map(|t| t.get_last_local_txn_id().max(0) as u64)
+            .unwrap_or(0);
+
         let end_lsn = if let Some(lm) = &self.log_manager {
             let ckpt_end = CheckpointEnd::new(
                 checkpoint_id,
                 invoker,
                 start_lsn,
-                None, // root_lsn  (P1/P2 will fill this)
+                None, // root_lsn  (REC-P/T-F3 documented deferral)
                 first_active_lsn,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,     // ID sequence values (P1/P2 will fill these)
+                // REC-S: real id maxima (were hardcoded 0).
+                last_local_node_id,
+                0, // last_replicated_node_id (HA: deferred)
+                last_local_db_id,
+                0, // last_replicated_db_id (HA: deferred)
+                last_local_txn_id,
+                0,     // last_replicated_txn_id (HA: deferred)
                 false, // cleaned_files_to_delete
             );
             let mut buf = Vec::with_capacity(ckpt_end.log_size());
