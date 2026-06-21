@@ -24,12 +24,7 @@ bytes = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
-criterion = { workspace = true }
 tempfile = "3"
-
-[[bench]]
-name = "tree_bench"
-harness = false
 
 [lints]
 workspace = true

@@ -28,7 +28,7 @@ intended logic, it is a bug.
 | `static final` constant | `const` | `MAX_ENTRIES` → `MAX_ENTRIES: u32` |
 | Package name | crate name | `je.tree` → `noxu-tree` |
 | the corresponding Noxu type | `noxu_X::Foo` | `DatabaseImpl` → `noxu_dbi::DatabaseImpl` |
-| Nested class | separate module or inner struct | `IN.Entry` → `bin::BinEntry` |
+| Nested class | separate module or inner struct | `IN.Entry` → `tree::BinEntry` |
 | Exception hierarchy | `NoxuError` enum variants | `DatabaseException` → `NoxuError::Database` |
 
 ### Preserved Names
@@ -110,7 +110,7 @@ The 10 Noxu enhancements not present in standalone Noxu are:
 | Auto-Backup (BackupManager) | `noxu-dbi/src/backup_manager.rs` |
 | Enhanced Verify (VerifyCheckpointInterval) | `noxu-recovery/src/recovery_manager.rs` |
 | ScanFilter + ScanResult | `noxu-db/src/scan_filter.rs` |
-| Per-slot BIN timestamps (TTL) | `noxu-tree/src/bin.rs` (modification_times, creation_times) |
+| Per-slot BIN timestamps (TTL) | `noxu-tree/src/tree.rs` (`BinStub`: modification_times, creation_times) |
 | ExtinctionScanner daemon | `noxu-cleaner/src/extinction_scanner.rs` |
 
 These are sourced from `_/nosql/` rather than `_/je/`.

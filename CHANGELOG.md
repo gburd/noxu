@@ -34,6 +34,29 @@ listed in [References](#references).
   index / split key, and slot ordering + per-slot LSN after insert.  The
   stub agrees with the oracle on all properties.
 
+### Removed (dead code / noxu-tree — T-1 part 2)
+
+- **T-1: deleted the shelved faithful `bin::Bin` and `in_node::InNode`
+  transliterations (~6.9k LOC).**  These JE-transliterated node types ran
+  beside the live runtime `tree::BinStub` / `tree::InNodeStub` but had ZERO
+  production callers (confirmed by a workspace-wide grep — only their own
+  in-module tests, `tests/bin_in_test.rs`, `tests/je_in_test.rs`,
+  `tests/prop_tests.rs` sections 4 & 6, and `benches/tree_bench.rs` used
+  them).  A shelved parallel implementation is a drift liability (TREE-F1);
+  with the runtime stub now pinned to a JE-faithful oracle by
+  `tests/bin_stub_conformance.rs`, the faithful copies are pure liability and
+  were removed.  Internal-API change (pre-1.0): the crate no longer exposes
+  `noxu_tree::bin`, `noxu_tree::in_node`, `noxu_tree::InNode`,
+  `noxu_tree::InError`, or `noxu_tree::DEFAULT_MAX_ENTRIES` (none had external
+  users).  The level constants (`BIN_LEVEL`, `MAIN_LEVEL`, etc.) and search
+  flags (`EXACT_MATCH`, `INSERT_SUCCESS`) are still re-exported from
+  `noxu_tree`, now sourced from `tree` instead of `in_node`.  Deleted tests
+  (`bin_in_test.rs`, `je_in_test.rs`) and the `tree_bench` benchmark
+  exclusively exercised the removed types; the runtime `InNodeStub`
+  IN-level behavior remains covered by tree.rs in-module tests
+  (`test_find_entry_on_internal_node`, `test_find_entry_internal_nonexact_returns_floor`,
+  and the split tests).
+
 ### Fixed (disk-ordered cursor / cleaner — CLN-7)
 
 - **CLN-7: the cleaner can no longer delete a log file while a

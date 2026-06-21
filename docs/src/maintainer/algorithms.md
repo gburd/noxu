@@ -4,7 +4,8 @@ Every named algorithm in Noxu DB, with source locations and academic references.
 
 ## B+tree — Latch-Coupling Search and Update
 
-**Source**: `crates/noxu-tree/src/tree.rs`, `bin.rs`, `in_node.rs`
+**Source**: `crates/noxu-tree/src/tree.rs` (the runtime `BinStub` /
+`InNodeStub` node types live here alongside the `Tree` operations)
 
 Standard B+tree with latch coupling traversal:
 

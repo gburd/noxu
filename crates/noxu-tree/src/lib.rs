@@ -24,7 +24,6 @@
 //! - `node`  -  Base node types and ID generation
 //! - `child_reference`  -  Reference from parent to child node
 //! - `in_node`  -  Internal Node (core B-tree node)
-//! - `bin`  -  Bottom Internal Node (leaf-level IN)
 //! - `ln`  -  Leaf Node (data records)
 //! - `tree`  -  B+tree operations (search, insert, split)
 //!
@@ -59,10 +58,8 @@ pub mod bin_boundary;
 pub mod bin_reference;
 pub mod storage_size;
 
-// Tree nodes - implemented by other agents
-pub mod bin;
+// Tree nodes
 pub mod bin_delta_bloom_filter;
-pub mod in_node;
 
 // Leaf nodes - implemented by other agents
 pub mod file_summary_ln;
@@ -94,10 +91,12 @@ pub use tree::{
     peek_next_node_id_counter, seed_node_id_counter,
 };
 
-// Re-export from in_node
-pub use in_node::{
-    BIN_LEVEL, DBMAP_LEVEL, DEFAULT_MAX_ENTRIES, EXACT_MATCH, INSERT_SUCCESS,
-    InError, InNode, LEVEL_MASK, MAIN_LEVEL, MIN_LEVEL,
+// Tree node level constants and search-result flags.  These are defined in
+// `tree` (the runtime implementation); the former `in_node` definitions were
+// removed with the shelved faithful `InNode` (T-1).
+pub use tree::{
+    BIN_LEVEL, DBMAP_LEVEL, EXACT_MATCH, INSERT_SUCCESS, LEVEL_MASK,
+    MAIN_LEVEL, MIN_LEVEL,
 };
 
 // Re-export foundation types

@@ -83,10 +83,15 @@ Key files:
 
 The B+tree. Key files:
 
-- `src/tree.rs` — `Tree`: root management, `get/put/delete`, dirty node collection
-- `src/bin.rs` — `Bin` (BIN node): slots, key prefix, modification_times, delta tracking
+- `src/tree.rs` — `Tree`: root management, `get/put/delete`, dirty node
+  collection.  Also home to the runtime B-tree node types `BinStub` (BIN node:
+  slots, key prefix, modification_times, delta tracking) and `InNodeStub` (IN
+  upper node: child pointers).  These stubs are the implementation that runs;
+  a property-based conformance test (`tests/bin_stub_conformance.rs`) pins
+  `BinStub` to a JE-faithful oracle so the leaf-level semantics cannot drift
+  (the former shelved faithful `bin::Bin` / `in_node::InNode` transliterations
+  were removed under T-1).
 - `src/ln.rs` — `Ln` (LN leaf node): key/value pair
-- `src/in_node.rs` — `InNode` (IN upper node): child pointers
 
 Critical: `Tree::set_comparator()` / `take_comparator()` for `TwoPartKeyComparator`.
 
