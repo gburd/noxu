@@ -195,3 +195,24 @@ for `PemFiles`/`PemBytes` identities so the server can verify the peer.
 `TcpServiceDispatcher`.  Full end-to-end enforcement requires callers to
 use `TlsTcpChannelListener::bind_with_tls_and_allowlist` directly.
 See `docs/src/internal/auth-mtls-design-2026-05.md`.
+
+## Lock storage: a side table, not embedded in the BIN slot (TXN-11)
+
+**Decision**: Locks are stored in a sharded `HashMap<LSN, Lock>` keyed by record LSN,
+not embedded in the BIN slot the way JE embeds a `ThinLockImpl` in the IN.
+
+**Why**: Noxu's BIN slots (`BinEntry`) do not carry lock state — the lock table is a
+separate structure in `noxu-txn`, consistent with the lock-based-isolation-not-in-tree
+architecture. This is a consequence of keeping the tree (`noxu-tree`) free of any
+`noxu-txn` dependency.
+
+**What is preserved**: the JE thin-lock *memory win* IS reproduced — `Lock = Thin(ThinLockImpl)
+| Full(LockImpl)` starts thin (single owner, no waiters) and inflates to full only on the
+second owner or first waiter, and an unlocked record costs **zero** lock-table memory (the
+entry is removed on last release). So the cheap-uncontended / inflate-on-contention /
+zero-standing-cost properties match JE; only the storage *locus* (side table vs in-slot) differs.
+
+**Trade-off**: each *currently held* lock costs a hash-table entry rather than an in-slot
+field, and the lock is not co-located with the BIN. For the common case (few locks held at
+once relative to the resident node count) this is immaterial. This is an **authorized
+deviation**, not a fidelity gap.

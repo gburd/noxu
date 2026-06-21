@@ -503,6 +503,7 @@ impl Database {
         data: &mut DatabaseEntry,
     ) -> Result<OperationStatus> {
         self.check_open()?;
+        self.reject_txn_on_non_txnal_db(txn.is_some())?;
         observe_span!(
             "db_get",
             db_name = self.name.as_str(),
@@ -580,6 +581,7 @@ impl Database {
         opts: &ReadOptions,
     ) -> Result<OperationStatus> {
         self.check_open()?;
+        self.reject_txn_on_non_txnal_db(txn.is_some())?;
         // Wave 1C audit cleanup (database Low "asymmetric observability
         // between *_with_options paths and the basic ones"): mirror
         // the span / counter / timer instrumentation that
@@ -677,6 +679,7 @@ impl Database {
         data: &DatabaseEntry,
     ) -> Result<OperationStatus> {
         self.check_open()?;
+        self.reject_txn_on_non_txnal_db(txn.is_some())?;
         self.check_writable()?;
         observe_span!(
             "db_put",
@@ -917,6 +920,7 @@ impl Database {
         data: &DatabaseEntry,
     ) -> Result<OperationStatus> {
         self.check_open()?;
+        self.reject_txn_on_non_txnal_db(txn.is_some())?;
         self.check_writable()?;
 
         // Audit database F11 (Wave 2C-4): reject `None`-data keys on
@@ -976,6 +980,7 @@ impl Database {
         key: &DatabaseEntry,
     ) -> Result<OperationStatus> {
         self.check_open()?;
+        self.reject_txn_on_non_txnal_db(txn.is_some())?;
         self.check_writable()?;
         observe_span!(
             "db_delete",
@@ -1105,13 +1110,7 @@ impl Database {
         // non-transactional database.  JE throws IllegalArgumentException
         // in DatabaseTest.testCursor when a Transaction is supplied to
         // a non-txnal DB (wave-11-G, database_txn_cursor_on_non_txn_db_rejected).
-        if txn.is_some() && !self.config.transactional {
-            return Err(NoxuError::IllegalArgument(
-                "cannot open a transactional cursor on a \
-                 non-transactional database"
-                    .to_string(),
-            ));
-        }
+        self.reject_txn_on_non_txnal_db(txn.is_some())?;
         let read_only = config.map(|c| c.read_uncommitted).unwrap_or(false)
             || self.config.read_only;
 
@@ -1587,6 +1586,22 @@ impl Database {
     /// writes return `EnvironmentFailure` after an fsync error or explicit
     /// `EnvironmentImpl::invalidate()` call rather than silently succeeding
     /// on stale BIN data.
+    /// TXN-6 (JE invariant): a transactional handle must not be used against a
+    /// non-transactional database.  JE `LockerFactory.getWritableLocker`/
+    /// `getReadableLocker` throw `IllegalArgumentException` on EVERY operation
+    /// (not just cursor-open) when a `Transaction` is supplied to a non-txnal DB.
+    /// Shared by get/put/delete/get_with_options/put_with_options/open_cursor.
+    fn reject_txn_on_non_txnal_db(&self, has_txn: bool) -> Result<()> {
+        if has_txn && !self.config.transactional {
+            return Err(NoxuError::IllegalArgument(
+                "a transaction cannot be used with a \
+                 non-transactional database"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     fn check_open(&self) -> Result<()> {
         // Check environment validity first — explicit invalidation.
         if self.env_invalid.load(Ordering::Acquire) {
