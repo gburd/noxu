@@ -66,6 +66,15 @@ pub struct EnvironmentMutableConfig {
     ///
     /// `Some(0)` clears any previously-configured timeout.
     pub txn_timeout_ms: Option<u64>,
+
+    /// Cleaner minimum-utilization threshold (0-100%).  `None` means
+    /// unchanged.
+    ///
+    /// Mutable at runtime (`noxu.cleaner.minUtilization` has
+    /// `mutable = true`); a change is pushed to the running cleaner. Mirrors
+    /// JE `EnvironmentConfig.CLEANER_MIN_UTILIZATION` re-read via
+    /// `EnvConfigObserver`.
+    pub cleaner_min_utilization: Option<u32>,
 }
 
 impl EnvironmentMutableConfig {
@@ -147,6 +156,12 @@ impl EnvironmentMutableConfig {
     /// `None` to leave it unchanged.
     pub fn with_txn_timeout_ms(mut self, ms: Option<u64>) -> Self {
         self.txn_timeout_ms = ms;
+        self
+    }
+
+    /// Sets the cleaner minimum-utilization threshold (0-100%).
+    pub fn with_cleaner_min_utilization(mut self, pct: u32) -> Self {
+        self.cleaner_min_utilization = Some(pct);
         self
     }
 }

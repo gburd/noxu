@@ -22,7 +22,7 @@ use noxu_sync::Mutex;
 use noxu_txn::TxnManager;
 use noxu_util::lsn::NULL_LSN;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 /// Bundled context for calling `process_pending` from within the
@@ -148,7 +148,10 @@ pub struct Cleaner {
     /// Minimum utilization threshold (0-100%).
     ///
     /// Files below this utilization are candidates for cleaning.
-    min_utilization: u32,
+    ///
+    /// `AtomicU32` so a runtime `setMutableConfig` can push a new
+    /// `je.cleaner.minUtilization` (DBI-10 / `EnvConfigObserver`).
+    min_utilization: AtomicU32,
 
     /// CLN-F1: minFileUtilization second-tier threshold (0-50%).
     ///
@@ -320,7 +323,7 @@ impl Cleaner {
             stats: Arc::new(CleanerStats::new()),
             running: AtomicBool::new(false),
             shutdown: Arc::new(AtomicBool::new(false)),
-            min_utilization: min_utilization.min(100),
+            min_utilization: AtomicU32::new(min_utilization.min(100)),
             min_file_utilization: 5,
             min_file_count,
             min_age,
@@ -363,7 +366,7 @@ impl Cleaner {
             stats: Arc::new(CleanerStats::new()),
             running: AtomicBool::new(false),
             shutdown: Arc::new(AtomicBool::new(false)),
-            min_utilization: min_utilization.min(100),
+            min_utilization: AtomicU32::new(min_utilization.min(100)),
             min_file_utilization: 5,
             min_file_count,
             min_age,
@@ -416,7 +419,7 @@ impl Cleaner {
             stats: Arc::new(CleanerStats::new()),
             running: AtomicBool::new(false),
             shutdown: Arc::new(AtomicBool::new(false)),
-            min_utilization: min_utilization.min(100),
+            min_utilization: AtomicU32::new(min_utilization.min(100)),
             min_file_utilization: 5,
             min_file_count,
             min_age,
@@ -464,7 +467,7 @@ impl Cleaner {
             stats: Arc::new(CleanerStats::new()),
             running: AtomicBool::new(false),
             shutdown: Arc::new(AtomicBool::new(false)),
-            min_utilization: min_utilization.min(100),
+            min_utilization: AtomicU32::new(min_utilization.min(100)),
             min_file_utilization: 5,
             min_file_count,
             min_age,
@@ -540,6 +543,20 @@ impl Cleaner {
     pub fn with_txn_manager(mut self, txn_manager: Arc<TxnManager>) -> Self {
         self.txn_manager = Some(txn_manager);
         self
+    }
+
+    /// Returns the current minimum-utilization threshold (0-100%).
+    pub fn get_min_utilization(&self) -> u32 {
+        self.min_utilization.load(Ordering::Relaxed)
+    }
+
+    /// Pushes a new minimum-utilization threshold at runtime.
+    ///
+    /// DBI-10 / JE `EnvConfigObserver`: a `setMutableConfig` change to
+    /// `je.cleaner.minUtilization` must reach the running cleaner. Clamped to
+    /// 0-100 like the constructors.
+    pub fn set_min_utilization(&self, pct: u32) {
+        self.min_utilization.store(pct.min(100), Ordering::Relaxed);
     }
 
     /// Returns true if a `TxnManager` has been wired (CLN-4 first-active-txn
@@ -720,7 +737,7 @@ impl Cleaner {
                 let mut selector = self.file_selector.lock();
                 match selector.select_file_for_cleaning(
                     &current_summary_map,
-                    self.min_utilization,
+                    self.min_utilization.load(Ordering::Relaxed),
                     self.min_age as u32,
                     force,
                     first_active_txn_file,
@@ -1548,7 +1565,7 @@ mod tests {
     fn test_new_cleaner() {
         let cleaner = Cleaner::new(50, 5, 60);
         assert!(!cleaner.is_running());
-        assert_eq!(cleaner.min_utilization, 50);
+        assert_eq!(cleaner.min_utilization.load(Ordering::Relaxed), 50);
         assert_eq!(cleaner.min_file_count, 5);
         assert_eq!(cleaner.min_age, 60);
         assert_eq!(cleaner.get_run_count(), 0);
@@ -1557,7 +1574,7 @@ mod tests {
     #[test]
     fn test_cleaner_with_max_utilization() {
         let cleaner = Cleaner::new(150, 5, 60); // Over 100
-        assert_eq!(cleaner.min_utilization, 100); // Should be clamped
+        assert_eq!(cleaner.min_utilization.load(Ordering::Relaxed), 100); // Should be clamped
     }
 
     #[test]
@@ -1919,7 +1936,7 @@ mod tests {
     #[test]
     fn test_min_utilization_zero() {
         let cleaner = Cleaner::new(0, 0, 0);
-        assert_eq!(cleaner.min_utilization, 0);
+        assert_eq!(cleaner.min_utilization.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -2048,7 +2065,7 @@ mod tests {
                 .unwrap(),
         );
         let cleaner = Cleaner::with_file_manager(75, 3, 120, fm);
-        assert_eq!(cleaner.min_utilization, 75);
+        assert_eq!(cleaner.min_utilization.load(Ordering::Relaxed), 75);
         assert_eq!(cleaner.min_file_count, 3);
         assert_eq!(cleaner.min_age, 120);
         assert!(cleaner.file_manager.is_some());
@@ -2161,7 +2178,7 @@ mod tests {
             Arc::clone(&lm),
         );
 
-        assert_eq!(cleaner.min_utilization, 60);
+        assert_eq!(cleaner.min_utilization.load(Ordering::Relaxed), 60);
         assert_eq!(cleaner.min_file_count, 2);
         assert_eq!(cleaner.min_age, 90);
         assert!(cleaner.file_manager.is_some(), "file_manager must be set");

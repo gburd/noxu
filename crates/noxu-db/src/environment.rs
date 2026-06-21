@@ -990,6 +990,9 @@ impl Environment {
             run_evictor: Some(self.config.run_evictor),
             lock_timeout_ms: Some(self.config.lock_timeout_ms),
             txn_timeout_ms: Some(self.config.txn_timeout_ms),
+            cleaner_min_utilization: Some(
+                self.config.cleaner_min_utilization as u32,
+            ),
         })
     }
 
@@ -1033,6 +1036,17 @@ impl Environment {
             // original timeout.  Tracked under transaction-env F7
             // residual; pushing into running txns requires a TxnManager
             // API change beyond Wave 2C-4.
+        }
+        // DBI-10 / JE EnvConfigObserver: push the mutable cleaner
+        // minUtilization to the running cleaner (noxu.cleaner.minUtilization
+        // has mutable=true). Mirrors how JE's Cleaner re-reads
+        // CLEANER_MIN_UTILIZATION on envConfigUpdate.
+        if let Some(pct) = cfg.cleaner_min_utilization {
+            self.config.cleaner_min_utilization = pct.min(100) as u8;
+            let env_impl = self.env_impl.lock();
+            if let Some(cleaner) = env_impl.get_cleaner() {
+                cleaner.set_min_utilization(pct);
+            }
         }
         self.config.txn_no_sync = cfg.txn_no_sync;
         self.config.txn_write_no_sync = cfg.txn_write_no_sync;
@@ -1422,7 +1436,12 @@ impl Environment {
         self.check_open()?;
         let env_impl = self.env_impl.lock();
         let all_dbs = env_impl.get_all_database_impls();
-        drop(env_impl);
+        // Lock the live utilization tracker for the checkLsns half
+        // (VerifyUtils.checkLsns): live tree LSNs must be DISJOINT from the
+        // obsolete LSNs recorded in the UtilizationProfile/tracker. Held
+        // across the loop (no clone); read-only envs have no tracker.
+        let tracker_guard =
+            env_impl.get_utilization_tracker().map(|t| t.lock());
 
         let mut merged = noxu_engine::VerifyResult::new();
         for db_arc in &all_dbs {
@@ -1438,6 +1457,14 @@ impl Environment {
             }
             for w in result.warnings {
                 merged.add_warning(w);
+            }
+            // CLN-2 / VerifyUtils.checkLsns: assert live-tree LSNs are
+            // disjoint from the obsolete set.
+            if let Some(ref t) = tracker_guard {
+                noxu_engine::check_lsns_against_tracker(&guard, t, &mut merged);
+                if merged.error_count() >= config.max_errors as usize {
+                    return Ok(merged);
+                }
             }
         }
         Ok(merged)
@@ -2524,5 +2551,145 @@ mod tests {
 
         env.close().unwrap();
         drop(tmp);
+    }
+
+    /// CLN-2 / VerifyUtils.checkLsns wired into Environment::verify.
+    ///
+    /// A healthy env (live tree LSNs disjoint from the obsolete set) passes
+    /// verify; after seeding one live LSN into the obsolete tracker the same
+    /// verify FAILS with the "Obsolete LSN set contains valid LSN" error.
+    #[test]
+    fn test_verify_checklsns_detects_live_in_obsolete() {
+        use crate::database_entry::DatabaseEntry;
+        let (_tmp, config) = temp_env_config();
+        let env = Environment::open(config).unwrap();
+
+        let db_config = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
+        let db = env.open_database(None, "cln2db", &db_config).unwrap();
+        db.put(
+            None,
+            &DatabaseEntry::from_bytes(b"alpha"),
+            &DatabaseEntry::from_bytes(b"1"),
+        )
+        .unwrap();
+        db.put(
+            None,
+            &DatabaseEntry::from_bytes(b"beta"),
+            &DatabaseEntry::from_bytes(b"2"),
+        )
+        .unwrap();
+        db.put(
+            None,
+            &DatabaseEntry::from_bytes(b"gamma"),
+            &DatabaseEntry::from_bytes(b"3"),
+        )
+        .unwrap();
+
+        let cfg = noxu_engine::VerifyConfig::default();
+
+        // Healthy: live LSNs disjoint from obsolete -> verify passes.
+        let healthy = env.verify(&cfg).unwrap();
+        assert!(
+            healthy.is_passed(),
+            "healthy env must pass checkLsns: {:?}",
+            healthy.errors
+        );
+
+        // Grab a real live LSN from the db's tree.
+        let live_lsn = {
+            let guard = db.db_impl.read();
+            let tree = guard
+                .get_real_tree()
+                .expect("invariant: populated db has a real tree");
+            noxu_engine::gather_tree_lsns(&tree)
+                .into_iter()
+                .next()
+                .expect("invariant: at least one live LSN")
+        };
+
+        // Seed the bug: record that exact live LSN as obsolete in the live
+        // tracker (mislabels live data obsolete -> the cleaner would delete
+        // live data).
+        {
+            let env_impl = env.env_impl.lock();
+            let tracker = env_impl
+                .get_utilization_tracker()
+                .expect("invariant: rw env has a tracker");
+            tracker.lock().count_obsolete_node(
+                live_lsn.file_number(),
+                live_lsn.file_offset(),
+                10,
+                true,
+                None,
+            );
+        }
+
+        // Now verify must DETECT the overlap.
+        let bad = env.verify(&cfg).unwrap();
+        assert!(
+            !bad.is_passed(),
+            "verify must detect live LSN in obsolete set"
+        );
+        assert!(
+            bad.errors.iter().any(|e| matches!(
+                e,
+                noxu_engine::VerifyError::DataInconsistency { description }
+                    if description.contains("Obsolete LSN set contains valid LSN")
+            )),
+            "expected checkLsns error, got: {:?}",
+            bad.errors
+        );
+
+        drop(db);
+        env.close().unwrap();
+    }
+
+    /// DBI-10 / JE EnvConfigObserver + MemoryBudget.envConfigUpdate: a runtime
+    /// cache-size change must reach the live evictor Arbiter's max-memory.
+    #[test]
+    fn test_set_mutable_config_pushes_cache_size_to_arbiter() {
+        let (_tmp, config) = temp_env_config();
+        let mut env = Environment::open(config).unwrap();
+
+        let new_cache = 256 * 1024 * 1024_usize; // 256 MiB
+        let mc = EnvironmentMutableConfig::new().with_cache_size(new_cache);
+        env.set_mutable_config(mc).unwrap();
+
+        let arbiter_max = env.env_impl.lock().get_arbiter_max_memory();
+        assert_eq!(
+            arbiter_max, new_cache as i64,
+            "Arbiter max-memory must reflect the new cache size"
+        );
+        env.close().unwrap();
+    }
+
+    /// DBI-10 / JE EnvConfigObserver: a runtime cleaner minUtilization change
+    /// must reach the running cleaner (noxu.cleaner.minUtilization is
+    /// mutable). FAILS on main (no propagation); PASSES after the push.
+    #[test]
+    fn test_set_mutable_config_pushes_cleaner_min_utilization() {
+        let (_tmp, config) = temp_env_config();
+        let mut env = Environment::open(config).unwrap();
+
+        let cleaner = env
+            .env_impl
+            .lock()
+            .get_cleaner()
+            .expect("invariant: transactional env has a cleaner");
+        let before = cleaner.get_min_utilization();
+
+        let new_pct = if before == 70 { 40 } else { 70 };
+        let mc = EnvironmentMutableConfig::new()
+            .with_cleaner_min_utilization(new_pct);
+        env.set_mutable_config(mc).unwrap();
+
+        assert_eq!(
+            cleaner.get_min_utilization(),
+            new_pct,
+            "running cleaner must reflect the new minUtilization"
+        );
+        env.close().unwrap();
     }
 }

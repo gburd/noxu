@@ -6,7 +6,8 @@ use noxu_dbi::DatabaseImpl;
 use noxu_tree::NodeRwLock as RwLock;
 use noxu_tree::Tree;
 use noxu_tree::tree::{BinStub, InNodeStub, TreeNode};
-use noxu_util::NULL_LSN;
+use noxu_util::{Lsn, NULL_LSN};
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 
@@ -477,6 +478,77 @@ pub fn verify_database_impl(
                 passed: true,
             }
         }
+    }
+}
+
+// ============================================================================
+// checkLsns: live-tree-LSN <-> UtilizationProfile overlap check (CLN-2)
+// ============================================================================
+
+/// Gather the set of LIVE LSNs referenced by a B-tree.
+///
+/// Mirrors JE's `GatherLSNs` `TreeNodeProcessor` driven by a
+/// `SortedLSNTreeWalker` in `VerifyUtils.checkLsns()`: every non-NULL child
+/// LSN reachable from the root is collected. Here we collect the LN LSNs
+/// recorded in each live (non-known-deleted) BIN slot.
+pub fn gather_tree_lsns(tree: &Tree) -> HashSet<Lsn> {
+    let mut lsns = HashSet::new();
+    if let Some(root) = tree.get_root() {
+        gather_node_lsns(&root, &mut lsns);
+    }
+    lsns
+}
+
+fn gather_node_lsns(node_arc: &Arc<RwLock<TreeNode>>, lsns: &mut HashSet<Lsn>) {
+    let guard = node_arc.read();
+    match &*guard {
+        TreeNode::Internal(in_node) => {
+            for entry in &in_node.entries {
+                if let Some(child) = &entry.child {
+                    gather_node_lsns(child, lsns);
+                }
+            }
+        }
+        TreeNode::Bottom(bin) => {
+            for entry in &bin.entries {
+                // JE GatherLSNs.processLSN skips DbLsn.NULL_LSN.
+                if !entry.known_deleted && entry.lsn != NULL_LSN {
+                    lsns.insert(entry.lsn);
+                }
+            }
+        }
+    }
+}
+
+/// Compare the live LSNs of a `DatabaseImpl`'s tree against the obsolete set
+/// recorded in the `UtilizationTracker`, adding a `DataInconsistency` error
+/// for each live LSN wrongly recorded as obsolete.
+///
+/// Faithful port of `VerifyUtils.checkLsns()`: a live tree LSN must NOT be in
+/// the obsolete set (JE: "Obsolete LSN set contains valid LSN" ->
+/// `LOG_INTEGRITY` `EnvironmentFailureException`). The disjointness test
+/// itself lives in `noxu_cleaner::check_lsns`; this function bridges the
+/// engine-side tree walk to it.
+pub fn check_lsns_against_tracker(
+    db_impl: &DatabaseImpl,
+    tracker: &noxu_cleaner::UtilizationTracker,
+    result: &mut VerifyResult,
+) {
+    let tree = match db_impl.get_real_tree() {
+        Some(t) => t,
+        None => return,
+    };
+    let live = gather_tree_lsns(&tree);
+    let check = noxu_cleaner::check_lsns(live, tracker);
+    for lsn in check.obsolete_contains_live {
+        result.add_error(VerifyError::DataInconsistency {
+            description: format!(
+                "Obsolete LSN set contains valid LSN {} in database '{}' \
+                 (VerifyUtils.checkLsns: live tree LSN recorded obsolete)",
+                lsn,
+                db_impl.get_name()
+            ),
+        });
     }
 }
 
