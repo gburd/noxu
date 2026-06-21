@@ -16,6 +16,86 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Added (drift-guard / noxu-tree — T-1)
+
+- **T-1: conformance drift-guard for the runtime `BinStub`.**  `noxu-tree`
+  carried two parallel BIN implementations: the JE-transliterated `bin::Bin` /
+  `in_node::InNode` (faithful but only exercised by their own tests) and the
+  runtime `tree::BinStub` / `tree::InNodeStub` (the implementation that
+  actually runs).  The risk is silent DRIFT — TREE-F1 was exactly such a bug,
+  where the faithful `find_entry` had the `known_deleted` exact-match check
+  and the runtime stub did not.  A new property-based test
+  (`crates/noxu-tree/tests/bin_stub_conformance.rs`, 256 random cases per
+  property) pins the runtime `BinStub` to a compact, inline JE-faithful BIN
+  oracle on the key operations: `find_entry` (exact / indicate-duplicate /
+  insertion-point), the `known_deleted`-reads-as-absent semantics (the
+  TREE-F1 case), `compute_key_prefix` (with and without an excluded index,
+  faithful to JE `IN.computeKeyPrefix`'s `nEntries <= 1` guard), the split
+  index / split key, and slot ordering + per-slot LSN after insert.  The
+  stub agrees with the oracle on all properties.
+
+### Removed (dead code / noxu-tree — T-1 part 2)
+
+- **T-1: deleted the shelved faithful `bin::Bin` and `in_node::InNode`
+  transliterations (~6.9k LOC).**  These JE-transliterated node types ran
+  beside the live runtime `tree::BinStub` / `tree::InNodeStub` but had ZERO
+  production callers (confirmed by a workspace-wide grep — only their own
+  in-module tests, `tests/bin_in_test.rs`, `tests/je_in_test.rs`,
+  `tests/prop_tests.rs` sections 4 & 6, and `benches/tree_bench.rs` used
+  them).  A shelved parallel implementation is a drift liability (TREE-F1);
+  with the runtime stub now pinned to a JE-faithful oracle by
+  `tests/bin_stub_conformance.rs`, the faithful copies are pure liability and
+  were removed.  Internal-API change (pre-1.0): the crate no longer exposes
+  `noxu_tree::bin`, `noxu_tree::in_node`, `noxu_tree::InNode`,
+  `noxu_tree::InError`, or `noxu_tree::DEFAULT_MAX_ENTRIES` (none had external
+  users).  The level constants (`BIN_LEVEL`, `MAIN_LEVEL`, etc.) and search
+  flags (`EXACT_MATCH`, `INSERT_SUCCESS`) are still re-exported from
+  `noxu_tree`, now sourced from `tree` instead of `in_node`.  Deleted tests
+  (`bin_in_test.rs`, `je_in_test.rs`) and the `tree_bench` benchmark
+  exclusively exercised the removed types; the runtime `InNodeStub`
+  IN-level behavior remains covered by tree.rs in-module tests
+  (`test_find_entry_on_internal_node`, `test_find_entry_internal_nonexact_returns_floor`,
+  and the split tests).
+
+### Removed (dead code / noxu-txn — TXN-7)
+
+- **TXN-7: deleted the dead, mis-transliterated `txn_chain.rs`.**  The
+  `TxnChain` container (plus `CompareSlot` and `RevertInfo`) was a passive
+  data holder that did NOT implement JE's backward-log-walk `TxnChain`: it
+  inverted the slot-dedup direction, identified slots by BIN node-id instead
+  of DB-id + comparator-key, and had ZERO production callers (the live undo
+  path runs through `noxu-recovery`).  It was dead AND wrong, so it was
+  removed rather than left as a misleading reference.  A correct
+  backward-log-walk version will be reintroduced by the future HA
+  syncup-rollback workstream if/when needed.  Internal-API change (pre-1.0):
+  `noxu_txn::{TxnChain, CompareSlot, RevertInfo}` are no longer exposed (no
+  external users).
+
+### Removed (dead code / noxu-dbi — DBI-30)
+
+- **DBI-30: deleted the dead `in_list.rs` (`INList`).**  The `INList` held a
+  set of `node_ids` (not IN references), had no iterator and no
+  memory-recalc, and had ZERO real callers (workspace grep: every reference
+  outside the module was a JE-concept comment; the production cache tracking
+  runs through the tree's `in_list_listener` + `rebuild_in_list` feeding the
+  evictor).  Its only consumers were 6 in-module tests of itself.  Removed;
+  not re-exported by the umbrella `noxu` crate.  Internal-API change
+  (pre-1.0): `noxu_dbi::INList` is no longer exposed (no external users).
+
+### Removed (dead code / noxu-evictor — EV-20)
+
+- **EV-20: deleted the dead duplicate `lru_list.rs` (`LruList`).**  `LruList`
+  was a slab-backed intrusive doubly-linked-list LRU that duplicated the
+  live LRU implementation now living in `policies/lru.rs` (`LruPolicy`,
+  backed by `slab::SlabList`).  The evictor runs `EvictionPolicy` trait
+  objects (`LruPolicy` etc.), never `LruList`; the only consumer of `LruList`
+  was the JE TCK port `tests/je_lru_test.rs`.  That test was re-pointed at the
+  live `LruPolicy` (mapping `pop_lru` -> `evict_candidate`, etc.) so its
+  JE-LRUTest conformance coverage now exercises the implementation that runs;
+  the one `LruList`-specific dual-priority test was dropped.  Internal-API
+  change (pre-1.0): `noxu_evictor::LruList` is no longer exposed (no external
+  users).
+
 ### Fixed (disk-ordered cursor / cleaner — CLN-7)
 
 - **CLN-7: the cleaner can no longer delete a log file while a

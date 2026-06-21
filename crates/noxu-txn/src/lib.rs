@@ -113,6 +113,3 @@ pub use group_commit::{GroupCommit, GroupCommitMaster, GroupCommitReplica};
 
 mod txn_manager;
 pub use txn_manager::{NULL_TXN_ID, TxnManager, TxnStats};
-
-mod txn_chain;
-pub use txn_chain::{CompareSlot, RevertInfo, TxnChain};

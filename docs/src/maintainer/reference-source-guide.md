@@ -18,7 +18,7 @@ repository root if you have local copies. Do NOT modify them.
 
 | Crate | Module path | Key source files |
 |---|---|---|
-| `noxu-tree` | `noxu_tree::` | `in_node.rs`, `bin.rs`, `tree.rs`, `node.rs` |
+| `noxu-tree` | `noxu_tree::` | `tree.rs` (runtime `BinStub` / `InNodeStub`), `node.rs` |
 | `noxu-log` | `noxu_log::` | `file_manager.rs`, `log_manager.rs`, `log_buffer.rs`, `fsync_manager.rs` |
 | `noxu-txn` | `noxu_txn::` | `txn.rs`, `lock_manager.rs`, `locker.rs`, `group_commit.rs` |
 | `noxu-dbi` | `noxu_dbi::` | `environment_impl.rs`, `database_impl.rs`, `cursor_impl.rs` |

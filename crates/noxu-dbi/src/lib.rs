@@ -14,7 +14,7 @@
 //! Database internals for Noxu DB.
 //!
 //! internal implementations including
-//! EnvironmentImpl, DatabaseImpl, CursorImpl, DbTree, MemoryBudget, INList.
+//! EnvironmentImpl, DatabaseImpl, CursorImpl, DbTree, MemoryBudget.
 
 pub mod backup_manager;
 pub mod cursor_impl;
@@ -32,7 +32,6 @@ mod environment_impl;
 mod error;
 mod file_manager_scanner;
 mod get_mode;
-mod in_list;
 mod memory_budget;
 mod node_sequence;
 mod operation;
@@ -61,7 +60,6 @@ pub use env_state::EnvState;
 pub use environment_impl::EnvironmentImpl;
 pub use error::{DbiError, Result};
 pub use get_mode::GetMode;
-pub use in_list::INList;
 pub use memory_budget::{MemoryBudget, MemoryBudgetStats, MemoryOverhead};
 pub use node_sequence::NodeSequence;
 pub use operation::Operation;
