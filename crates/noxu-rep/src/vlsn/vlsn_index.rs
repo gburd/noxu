@@ -13,6 +13,7 @@
 //! replica-never-exceeds-master) live in `crates/noxu-rep/tests/prop_tests.rs`
 //! (Wave 11-E).
 
+use noxu_log::LogEntryType;
 use noxu_sync::RwLock;
 
 use super::vlsn_bucket::VlsnBucket;
@@ -58,7 +59,49 @@ impl VlsnIndex {
     /// the new VLSN.
     ///
     /// / `VLSNTracker.track()`.
+    ///
+    /// This extend-only variant advances `first`/`last` but does NOT advance
+    /// `lastSync`/`lastTxnEnd` (it has no entry type to dispatch on). Callers
+    /// that know the streamed entry's `LogEntryType` should use
+    /// [`Self::put_with_type`] so the sync/commit boundaries advance — see
+    /// REP-5 and JE `VLSNTracker.track` -> `VLSNRange.getUpdateForNewMapping`.
     pub fn put(&self, vlsn: u64, file_number: u32, file_offset: u32) {
+        self.insert(vlsn, file_number, file_offset, None);
+    }
+
+    /// Register a new VLSN->LSN mapping, dispatching `lastSync`/`lastTxnEnd`
+    /// by the entry's `LogEntryType`.
+    ///
+    /// JE-faithful production path: `VLSNIndex.put(LogItem)` reads the entry
+    /// type from the log-item header and calls
+    /// `tracker.track(vlsn, lsn, entryType)`, which routes through
+    /// `VLSNRange.getUpdateForNewMapping(vlsn, entryTypeNum)`
+    /// (VLSNIndex.java:496-505, VLSNTracker.java:279-361). The dispatch keeps
+    /// `lastSync` (sync-point VLSN) and `lastTxnEnd` (commit/abort VLSN)
+    /// distinct, so a running node's reported sync/commit boundaries advance
+    /// instead of staying at NULL_VLSN.
+    pub fn put_with_type(
+        &self,
+        vlsn: u64,
+        file_number: u32,
+        file_offset: u32,
+        entry_type: LogEntryType,
+    ) {
+        self.insert(vlsn, file_number, file_offset, Some(entry_type));
+    }
+
+    /// Shared bucket-insert + range-update used by both `put` and
+    /// `put_with_type`. When `entry_type` is `Some`, the range update
+    /// dispatches `lastSync`/`lastTxnEnd` via
+    /// `VlsnRange::update_for_new_mapping`; otherwise it only extends
+    /// `first`/`last`.
+    fn insert(
+        &self,
+        vlsn: u64,
+        file_number: u32,
+        file_offset: u32,
+        entry_type: Option<LogEntryType>,
+    ) {
         assert!(vlsn > 0, "Cannot register NULL_VLSN (0)");
 
         let mut buckets = self.buckets.write();
@@ -86,7 +129,10 @@ impl VlsnIndex {
             buckets.sort_unstable_by_key(|b| b.get_first_vlsn());
         }
 
-        range.extend(vlsn);
+        match entry_type {
+            Some(et) => range.update_for_new_mapping(vlsn, et),
+            None => range.extend(vlsn),
+        }
     }
 
     /// Alias for `put`  -  register a new VLSN->LSN mapping.
@@ -94,6 +140,17 @@ impl VlsnIndex {
     /// Provided for compatibility with callers that use -style naming.
     pub fn register(&self, vlsn: u64, file_number: u32, file_offset: u32) {
         self.put(vlsn, file_number, file_offset);
+    }
+
+    /// Alias for `put_with_type` — register a typed VLSN->LSN mapping.
+    pub fn register_with_type(
+        &self,
+        vlsn: u64,
+        file_number: u32,
+        file_offset: u32,
+        entry_type: LogEntryType,
+    ) {
+        self.put_with_type(vlsn, file_number, file_offset, entry_type);
     }
 
     /// Look up the LSN for a VLSN.

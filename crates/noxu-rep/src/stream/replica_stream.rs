@@ -117,10 +117,17 @@ impl LogWriter for EnvironmentLogWriter {
             })?;
 
         // Register VLSN → LSN in the replica's VLSN index so that
-        // FeederRunner/ack tracking can correlate positions.
+        // FeederRunner/ack tracking can correlate positions.  Dispatch the
+        // entry type so `lastSync`/`lastTxnEnd` advance (REP-5; JE
+        // VLSNRange.getUpdateForNewMapping).
         // vlsn=0 is reserved as NULL_VLSN; skip it.
         if vlsn > 0 {
-            self.vlsn_index.put(vlsn, lsn.file_number(), lsn.file_offset());
+            self.vlsn_index.put_with_type(
+                vlsn,
+                lsn.file_number(),
+                lsn.file_offset(),
+                log_entry_type,
+            );
         }
 
         log::trace!(
