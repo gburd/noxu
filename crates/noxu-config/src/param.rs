@@ -263,7 +263,38 @@ impl ConfigParam {
                     });
                 }
             }
-            (ParamType::Duration, ParamValue::Duration(_)) => {}
+            (ParamType::Duration, ParamValue::Duration(v)) => {
+                // C-1: enforce duration min/max bounds, mirroring JE's
+                // DurationConfigParam range validation (EnvironmentParams).
+                if let Some(ParamValue::Duration(min)) = &self.min
+                    && v < min
+                {
+                    return Err(ConfigError::OutOfRange {
+                        name: self.name,
+                        value: value.to_string(),
+                        min: format!("{} ms", min.as_millis()),
+                        max: self
+                            .max
+                            .as_ref()
+                            .map(|m| m.to_string())
+                            .unwrap_or_default(),
+                    });
+                }
+                if let Some(ParamValue::Duration(max)) = &self.max
+                    && v > max
+                {
+                    return Err(ConfigError::OutOfRange {
+                        name: self.name,
+                        value: value.to_string(),
+                        min: self
+                            .min
+                            .as_ref()
+                            .map(|m| m.to_string())
+                            .unwrap_or_default(),
+                        max: format!("{} ms", max.as_millis()),
+                    });
+                }
+            }
             (ParamType::String, ParamValue::String(_) | ParamValue::Str(_)) => {
             }
             _ => {
@@ -581,5 +612,30 @@ mod tests {
         };
         assert!(format!("{}", e3).contains("95"));
         assert!(format!("{}", e3).contains("90"));
+    }
+}
+
+#[cfg(test)]
+mod c1_duration_bounds_tests {
+    use super::*;
+    use crate::params::LOG_FSYNC_TIME_LIMIT;
+    use std::time::Duration;
+
+    #[test]
+    fn c1_duration_param_rejects_out_of_range() {
+        // LOG_FSYNC_TIME_LIMIT is bounded [0 .. 30s] (JE fsyncTimeLimit max 30s).
+        // A value within range validates; an absurd one is rejected (C-1).
+        assert!(
+            LOG_FSYNC_TIME_LIMIT
+                .validate(&ParamValue::Duration(Duration::from_secs(5)))
+                .is_ok(),
+            "5s is within [0,30s]"
+        );
+        assert!(
+            LOG_FSYNC_TIME_LIMIT
+                .validate(&ParamValue::Duration(Duration::from_secs(3600)))
+                .is_err(),
+            "C-1: 1h must be rejected (exceeds the 30s max)"
+        );
     }
 }

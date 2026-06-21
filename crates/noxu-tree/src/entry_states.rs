@@ -1,8 +1,14 @@
 //! Slot state bit flags for BIN entries.
 //!
-//!
 //! Each slot in a BIN (Bottom Internal Node) has associated state flags
 //! that track metadata about the entry (deleted, dirty, embedded, etc.).
+//!
+//! **Provenance (T-7):** the bit layout below is bit-exact to the NoSQL-DB
+//! (`kvmain`) fork's `EntryStates`, NOT to the base BDB-JE `EntryStates.java`
+//! (the fork added/renamed several bits — e.g. the embedded-LN and no-data bits).
+//! Where the doc comments cite "JE `EntryStates.java`" they describe the
+//! *conceptual* JE meaning; the concrete bit VALUES follow the kvmain fork.
+//! This is a FORK-OK deviation (kvmain-aligned), not a base-JE divergence.
 
 /// Known deleted bit - slot is known to be deleted (obsolete).
 pub const KNOWN_DELETED_BIT: u8 = 0x01;

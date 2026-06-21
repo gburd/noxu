@@ -54,12 +54,8 @@ pub mod tracking_info;
 pub mod tree_location;
 
 // Foundation utility modules
-pub mod bin_boundary;
-pub mod bin_reference;
-pub mod storage_size;
 
 // Tree nodes
-pub mod bin_delta_bloom_filter;
 
 // Leaf nodes - implemented by other agents
 pub mod file_summary_ln;

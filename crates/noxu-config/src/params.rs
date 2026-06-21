@@ -169,8 +169,8 @@ pub static ENV_LATCH_TIMEOUT: ConfigParam = ConfigParam {
     name: "noxu.env.latchTimeout",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_secs(5 * 60)), // 5 min
-    min: None,
-    max: None,
+    min: Some(ParamValue::Duration(Duration::ZERO)),
+    max: Some(ParamValue::Duration(Duration::from_secs(75 * 60))),
     mutable: false,
     for_replication: false,
 };
@@ -180,8 +180,8 @@ pub static ENV_TTL_CLOCK_TOLERANCE: ConfigParam = ConfigParam {
     name: "noxu.env.ttlClockTolerance",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_secs(2 * 3600)), // 2 h
-    min: None,
-    max: None,
+    min: Some(ParamValue::Duration(Duration::ZERO)),
+    max: Some(ParamValue::Duration(Duration::from_secs(24 * 3600))),
     mutable: false,
     for_replication: false,
 };
@@ -191,8 +191,8 @@ pub static ENV_TTL_MAX_TXN_TIME: ConfigParam = ConfigParam {
     name: "noxu.env.ttlMaxTxnTime",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_secs(24 * 3600)), // 24 h
-    min: None,
-    max: None,
+    min: Some(ParamValue::Duration(Duration::ZERO)),
+    max: Some(ParamValue::Duration(Duration::from_secs(30 * 24 * 3600))),
     mutable: false,
     for_replication: false,
 };
@@ -202,8 +202,8 @@ pub static ENV_TTL_LN_PURGE_DELAY: ConfigParam = ConfigParam {
     name: "noxu.env.ttlLnPurgeDelay",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_secs(5)),
-    min: None,
-    max: None,
+    min: Some(ParamValue::Duration(Duration::ZERO)),
+    max: Some(ParamValue::Duration(Duration::from_secs(24 * 3600))),
     mutable: false,
     for_replication: false,
 };
@@ -353,8 +353,8 @@ pub static ENV_BACKGROUND_SLEEP_INTERVAL: ConfigParam = ConfigParam {
     name: "noxu.env.backgroundSleepInterval",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_millis(1)),
-    min: None,
-    max: None,
+    min: Some(ParamValue::Duration(Duration::ZERO)),
+    max: Some(ParamValue::Duration(Duration::from_secs(75 * 60))),
     mutable: true,
     for_replication: false,
 };
@@ -511,8 +511,8 @@ pub static LOG_DETECT_FILE_DELETE_INTERVAL: ConfigParam = ConfigParam {
     name: "noxu.log.detectFileDeleteInterval",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_millis(1000)),
-    min: None,
-    max: None,
+    min: Some(ParamValue::Duration(Duration::ZERO)),
+    max: Some(ParamValue::Duration(Duration::from_secs(75 * 60))),
     mutable: false,
     for_replication: false,
 };
@@ -522,8 +522,8 @@ pub static LOG_FSYNC_TIMEOUT: ConfigParam = ConfigParam {
     name: "noxu.log.fsyncTimeout",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_millis(500)),
-    min: None,
-    max: None,
+    min: Some(ParamValue::Duration(Duration::ZERO)),
+    max: Some(ParamValue::Duration(Duration::from_secs(75 * 60))),
     mutable: false,
     for_replication: false,
 };
@@ -533,8 +533,8 @@ pub static LOG_FSYNC_TIME_LIMIT: ConfigParam = ConfigParam {
     name: "noxu.log.fsyncTimeLimit",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_secs(5)),
-    min: None,
-    max: None,
+    min: Some(ParamValue::Duration(Duration::ZERO)),
+    max: Some(ParamValue::Duration(Duration::from_secs(30))),
     mutable: false,
     for_replication: false,
 };
@@ -548,8 +548,8 @@ pub static LOG_GROUP_COMMIT_INTERVAL: ConfigParam = ConfigParam {
     name: "noxu.log.groupCommitInterval",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_millis(1)),
-    min: None,
-    max: None,
+    min: Some(ParamValue::Duration(Duration::ZERO)),
+    max: Some(ParamValue::Duration(Duration::from_secs(75 * 60))),
     mutable: false,
     for_replication: false,
 };
@@ -571,8 +571,8 @@ pub static LOG_FLUSH_SYNC_INTERVAL: ConfigParam = ConfigParam {
     name: "noxu.log.flushSyncInterval",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_secs(20)),
-    min: None,
-    max: None,
+    min: Some(ParamValue::Duration(Duration::ZERO)),
+    max: Some(ParamValue::Duration(Duration::from_secs(75 * 60))),
     mutable: true,
     for_replication: false,
 };
@@ -582,8 +582,8 @@ pub static LOG_FLUSH_NO_SYNC_INTERVAL: ConfigParam = ConfigParam {
     name: "noxu.log.flushNoSyncInterval",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_secs(5)),
-    min: None,
-    max: None,
+    min: Some(ParamValue::Duration(Duration::ZERO)),
+    max: Some(ParamValue::Duration(Duration::from_secs(75 * 60))),
     mutable: true,
     for_replication: false,
 };
@@ -667,8 +667,8 @@ pub static OLD_REP_LOG_FLUSH_TASK_INTERVAL: ConfigParam = ConfigParam {
     name: "noxu.rep.logFlushTaskInterval",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_secs(5 * 60)), // 5 min
-    min: None,
-    max: None,
+    min: Some(ParamValue::Duration(Duration::ZERO)),
+    max: Some(ParamValue::Duration(Duration::from_secs(75 * 60))),
     mutable: true,
     for_replication: true,
 };
@@ -690,8 +690,8 @@ pub static VERIFY_MAX_TARDINESS: ConfigParam = ConfigParam {
     name: "noxu.env.verifyMaxTardiness",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_secs(5 * 60)), // 5 min
-    min: None,
-    max: None,
+    min: Some(ParamValue::Duration(Duration::ZERO)),
+    max: Some(ParamValue::Duration(Duration::from_secs(24 * 3600))),
     mutable: true,
     for_replication: false,
 };
@@ -709,8 +709,8 @@ pub static VERIFY_LOG_READ_DELAY: ConfigParam = ConfigParam {
     name: "noxu.env.verifyLogReadDelay",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_millis(100)),
-    min: None,
-    max: None,
+    min: Some(ParamValue::Duration(Duration::ZERO)),
+    max: Some(ParamValue::Duration(Duration::from_secs(60))),
     mutable: true,
     for_replication: false,
 };
@@ -762,8 +762,8 @@ pub static VERIFY_BTREE_BATCH_DELAY: ConfigParam = ConfigParam {
     name: "noxu.env.verifyBtreeBatchDelay",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_millis(10)),
-    min: None,
-    max: None,
+    min: Some(ParamValue::Duration(Duration::ZERO)),
+    max: Some(ParamValue::Duration(Duration::from_secs(60))),
     mutable: true,
     for_replication: false,
 };
@@ -857,8 +857,8 @@ pub static COMPRESSOR_WAKEUP_INTERVAL: ConfigParam = ConfigParam {
     name: "noxu.compressor.wakeupInterval",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_secs(5)),
-    min: None,
-    max: None,
+    min: Some(ParamValue::Duration(Duration::ZERO)),
+    max: Some(ParamValue::Duration(Duration::from_secs(75 * 60))),
     mutable: false,
     for_replication: false,
 };
@@ -878,8 +878,8 @@ pub static COMPRESSOR_LOCK_TIMEOUT: ConfigParam = ConfigParam {
     name: "noxu.compressor.lockTimeout",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_millis(500)),
-    min: None,
-    max: None,
+    min: Some(ParamValue::Duration(Duration::ZERO)),
+    max: Some(ParamValue::Duration(Duration::from_secs(75 * 60))),
     mutable: false,
     for_replication: false,
 };
@@ -913,8 +913,8 @@ pub static EVICTOR_KEEP_ALIVE: ConfigParam = ConfigParam {
     name: "noxu.evictor.keepAlive",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_secs(10 * 60)), // 10 min
-    min: None,
-    max: None,
+    min: Some(ParamValue::Duration(Duration::ZERO)),
+    max: Some(ParamValue::Duration(Duration::from_secs(24 * 3600))),
     mutable: true,
     for_replication: false,
 };
@@ -924,8 +924,8 @@ pub static EVICTOR_TERMINATE_TIMEOUT: ConfigParam = ConfigParam {
     name: "noxu.env.terminateTimeout",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_secs(10)),
-    min: None,
-    max: None,
+    min: Some(ParamValue::Duration(Duration::ZERO)),
+    max: Some(ParamValue::Duration(Duration::from_secs(75 * 60))),
     mutable: true,
     for_replication: false,
 };
@@ -1039,8 +1039,8 @@ pub static OFFHEAP_KEEP_ALIVE: ConfigParam = ConfigParam {
     name: "noxu.offHeap.keepAlive",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_secs(10 * 60)), // 10 min
-    min: None,
-    max: None,
+    min: Some(ParamValue::Duration(Duration::ZERO)),
+    max: Some(ParamValue::Duration(Duration::from_secs(24 * 3600))),
     mutable: true,
     for_replication: false,
 };
@@ -1075,8 +1075,8 @@ pub static CHECKPOINTER_WAKEUP_INTERVAL: ConfigParam = ConfigParam {
     name: "noxu.checkpointer.wakeupInterval",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::ZERO),
-    min: None,
-    max: None,
+    min: Some(ParamValue::Duration(Duration::ZERO)),
+    max: Some(ParamValue::Duration(Duration::from_secs(75 * 60))),
     mutable: false,
     for_replication: false,
 };
@@ -1138,8 +1138,8 @@ pub static CLEANER_WAKEUP_INTERVAL: ConfigParam = ConfigParam {
     name: "noxu.cleaner.wakeupInterval",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_secs(10)),
-    min: None,
-    max: None,
+    min: Some(ParamValue::Duration(Duration::ZERO)),
+    max: Some(ParamValue::Duration(Duration::from_secs(75 * 60))),
     mutable: true,
     for_replication: false,
 };
@@ -1167,8 +1167,8 @@ pub static CLEANER_LOCK_TIMEOUT: ConfigParam = ConfigParam {
     name: "noxu.cleaner.lockTimeout",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_millis(500)),
-    min: None,
-    max: None,
+    min: Some(ParamValue::Duration(Duration::ZERO)),
+    max: Some(ParamValue::Duration(Duration::from_secs(75 * 60))),
     mutable: true,
     for_replication: false,
 };
@@ -1224,8 +1224,8 @@ pub static DOS_PRODUCER_QUEUE_TIMEOUT: ConfigParam = ConfigParam {
     name: "noxu.env.diskOrderedScanLockTimeout",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_secs(10)),
-    min: None,
-    max: None,
+    min: Some(ParamValue::Duration(Duration::ZERO)),
+    max: Some(ParamValue::Duration(Duration::from_secs(75 * 60))),
     mutable: true,
     for_replication: false,
 };
@@ -1357,8 +1357,8 @@ pub static LOCK_TIMEOUT: ConfigParam = ConfigParam {
     name: "noxu.lock.timeout",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_millis(500)),
-    min: None,
-    max: None,
+    min: Some(ParamValue::Duration(Duration::ZERO)),
+    max: Some(ParamValue::Duration(Duration::from_secs(75 * 60))),
     mutable: false,
     for_replication: false,
 };
@@ -1376,8 +1376,8 @@ pub static LOCK_DEADLOCK_DETECT_DELAY: ConfigParam = ConfigParam {
     name: "noxu.lock.deadlockDetectDelay",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::ZERO),
-    min: None,
-    max: None,
+    min: Some(ParamValue::Duration(Duration::ZERO)),
+    max: Some(ParamValue::Duration(Duration::from_secs(75 * 60))),
     mutable: false,
     for_replication: false,
 };
@@ -1395,8 +1395,8 @@ pub static TXN_TIMEOUT: ConfigParam = ConfigParam {
     name: "noxu.txn.timeout",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::ZERO),
-    min: None,
-    max: None,
+    min: Some(ParamValue::Duration(Duration::ZERO)),
+    max: Some(ParamValue::Duration(Duration::from_secs(75 * 60))),
     mutable: false,
     for_replication: false,
 };
@@ -1442,8 +1442,8 @@ pub static STARTUP_DUMP_THRESHOLD: ConfigParam = ConfigParam {
     name: "noxu.env.startupThreshold",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_secs(5 * 60)), // 5 min
-    min: None,
-    max: None,
+    min: Some(ParamValue::Duration(Duration::ZERO)),
+    max: Some(ParamValue::Duration(Duration::from_secs(24 * 3600))),
     mutable: false,
     for_replication: false,
 };
@@ -1481,8 +1481,8 @@ pub static STATS_COLLECT_INTERVAL: ConfigParam = ConfigParam {
     name: "noxu.stats.collect.interval",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_secs(60)), // 1 min
-    min: None,
-    max: None,
+    min: Some(ParamValue::Duration(Duration::ZERO)),
+    max: Some(ParamValue::Duration(Duration::from_secs(24 * 3600))),
     mutable: true,
     for_replication: false,
 };
@@ -1674,8 +1674,8 @@ pub static ENV_NETWORK_RESTORE_LOCK_TIMEOUT: ConfigParam = ConfigParam {
     name: "noxu.env.networkRestoreLockTimeout",
     param_type: crate::param::ParamType::Duration,
     default: ParamValue::Duration(Duration::from_secs(2 * 60)), // 2 min
-    min: None,
-    max: None,
+    min: Some(ParamValue::Duration(Duration::ZERO)),
+    max: Some(ParamValue::Duration(Duration::from_secs(75 * 60))),
     mutable: false,
     for_replication: false,
 };
@@ -2226,5 +2226,40 @@ mod tests {
         assert!(!LOCK_N_LOCK_TABLES.mutable);
         assert!(!TXN_SERIALIZABLE_ISOLATION.mutable);
         assert!(!STATS_FILE_DIRECTORY.mutable);
+    }
+}
+
+#[cfg(test)]
+mod c1_all_defaults_in_range_test {
+    use super::all_params;
+
+    #[test]
+    fn c1_every_param_default_validates_against_its_own_bounds() {
+        // A parameter's own default MUST satisfy its min/max bounds — otherwise
+        // opening an environment with defaults would fail validation. This guards
+        // the C-1 duration-bounds work (and all other bounded params).
+        //
+        // Exception (JE-faithful): a default of `0` is JE's documented "auto"
+        // sentinel for size params computed from `maxMemory` (e.g.
+        // `LOG_TOTAL_BUFFER_BYTES` / JE `LOG_MEM_SIZE`, whose min is
+        // `LOG_MEM_SIZE_MIN` but whose default 0 means "compute from je.maxMemory").
+        // JE itself does not validate that 0 against the min — neither do we.
+        for p in all_params() {
+            let is_auto_sentinel = matches!(
+                p.default,
+                crate::param::ParamValue::Int(0) | crate::param::ParamValue::Long(0)
+            ) && p.min.is_some();
+            if is_auto_sentinel {
+                continue;
+            }
+            assert!(
+                p.validate(&p.default).is_ok(),
+                "param {} default {:?} violates its own bounds (min={:?} max={:?})",
+                p.name,
+                p.default,
+                p.min,
+                p.max
+            );
+        }
     }
 }
