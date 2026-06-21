@@ -321,6 +321,16 @@ pub struct BinStub {
     ///
     /// `IN.cursorSet.size()` used by `Evictor.selectIN()`.
     pub cursor_count: i32,
+    /// When true, the NEXT log of this BIN must be a full BIN, not a delta.
+    ///
+    /// Set after a dirty slot is removed (a delta would silently lose that
+    /// removal) and cleared after a full BIN is written.  This is the
+    /// delta-chain bound: it forces a periodic full BIN so a delta never
+    /// references stale state.
+    ///
+    /// `IN.prohibitNextDelta` / `IN.setProhibitNextDelta` (IN.java:5013) /
+    /// `IN.getProhibitNextDelta`.
+    pub prohibit_next_delta: bool,
 }
 
 /// Entry in a BIN node.
@@ -760,6 +770,59 @@ impl BinStub {
         self.entries.iter().filter(|e| e.dirty).count()
     }
 
+    /// Decide whether to log this BIN as a delta (true) or a full BIN (false).
+    ///
+    /// Faithful port of JE `BIN.shouldLogDelta()` (BIN.java:1892).  The
+    /// decision is COUNT-based (number of would-be delta slots vs a percent of
+    /// `nEntries`), NOT a dirty-fraction-vs-hardcoded-0.25 heuristic:
+    ///
+    /// ```text
+    /// if (isBINDelta()) { return true; }          // already a delta
+    /// if (isDeltaProhibited()) return false;       // prohibit / no prior full
+    /// numDeltas = getNDeltas();
+    /// if (numDeltas <= 0) return false;            // empty delta is invalid
+    /// deltaLimit = (getNEntries() * binDeltaPercent) / 100;  // INTEGER math
+    /// return numDeltas <= deltaLimit;
+    /// ```
+    ///
+    /// `numDeltas` (JE `getNDeltas`) is the count of slots that would appear in
+    /// the delta — i.e. the dirty slots since the last full BIN — which here is
+    /// `dirty_count()`.  `binDeltaPercent` is the CONFIGURABLE `TREE_BIN_DELTA`
+    /// param (JE `DatabaseImpl.getBinDeltaPercent()`, default 25), threaded in
+    /// by the checkpointer — NOT a hardcoded constant.
+    ///
+    /// `isDeltaProhibited()` (BIN.java:1867) is
+    /// `getProhibitNextDelta() || isDeferredWriteMode() || lastFullLsn == NULL`.
+    /// Deferred-write mode is not modelled in the runtime stub; the other two
+    /// terms are.
+    ///
+    /// JE ref: `BIN.shouldLogDelta` (BIN.java:1892), `BIN.isDeltaProhibited`
+    /// (BIN.java:1867).
+    pub fn should_log_delta(&self, bin_delta_percent: i32) -> bool {
+        // Already a delta: re-log as a delta.  JE asserts !prohibitNextDelta
+        // and lastFullLsn != NULL here.
+        if self.is_delta {
+            return self.last_full_lsn != NULL_LSN && !self.prohibit_next_delta;
+        }
+
+        // isDeltaProhibited(): cheapest checks first.
+        if self.prohibit_next_delta || self.last_full_lsn == NULL_LSN {
+            return false;
+        }
+
+        // numDeltas = getNDeltas(): the dirty slots that would be in the delta.
+        let num_deltas = self.dirty_count() as i32;
+
+        // A delta with zero items is not valid.
+        if num_deltas <= 0 {
+            return false;
+        }
+
+        // Configured BinDeltaPercent limit — INTEGER math, exactly as JE.
+        let delta_limit = (self.entries.len() as i32 * bin_delta_percent) / 100;
+        num_deltas <= delta_limit
+    }
+
     /// Comparator-aware binary search: finds `full_key` using `cmp`.
     ///
     /// Unlike `find_entry_compressed` (which uses suffix-based lexicographic
@@ -1154,6 +1217,7 @@ impl BinStub {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         };
         // Recompute key prefix from the full keys just loaded.
         // `IN.recalcKeyPrefix()` called after materializing from log.
@@ -1274,6 +1338,11 @@ impl BinStub {
         }
         self.last_full_lsn = logged_at;
         self.dirty = false;
+        // A full BIN captures all current state, so the delta-chain bound is
+        // cleared: the next log may once again be a delta.
+        // JE `IN.afterLog` clears the prohibit flag after a full log
+        // (IN.java:5557 `bin.setProhibitNextDelta(false)`).
+        self.prohibit_next_delta = false;
     }
 
     /// Clear per-slot dirty flags after a successful delta log write.
@@ -2331,6 +2400,7 @@ impl Tree {
                     // (JE BIN.java default; matches tree.rs:980 and read_from_log).
                     expiration_in_hours: true,
                     cursor_count: 0,
+                    prohibit_next_delta: false,
                 })));
 
                 // Upper IN at level 2; slot 0 uses an empty key (virtual root key).
@@ -2467,6 +2537,7 @@ impl Tree {
                     // invariant (JE BIN.java default; matches tree.rs:980).
                     expiration_in_hours: true,
                     cursor_count: 0,
+                    prohibit_next_delta: false,
                 })));
 
                 let root_arc =
@@ -2839,6 +2910,7 @@ impl Tree {
                     // expirationInHours via setExpirationInHours(hours).
                     expiration_in_hours: bin_expiration_in_hours,
                     cursor_count: 0,
+                    prohibit_next_delta: false,
                 };
                 // St-H6 debug guard: the sibling must carry the same flag as
                 // the splitting BIN so that in_hours-resolution entries are
@@ -3989,6 +4061,14 @@ impl Tree {
                         while j > 0 {
                             j -= 1;
                             if b.entries[j].known_deleted {
+                                // JE `IN.deleteEntry` (IN.java:3466): removing a
+                                // DIRTY slot must prohibit the next delta — a
+                                // delta only carries dirty slots, so the removal
+                                // would otherwise be silently lost.  Force a
+                                // full BIN on the next log.
+                                if b.entries[j].dirty {
+                                    b.prohibit_next_delta = true;
+                                }
                                 b.entries.remove(j);
                                 b.dirty = true;
                             }
@@ -5864,6 +5944,7 @@ mod tests {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         });
         assert!(bin.is_bin());
         assert_eq!(bin.level(), BIN_LEVEL);
@@ -5907,6 +5988,7 @@ mod tests {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         });
 
         // Search for existing key
@@ -6043,6 +6125,7 @@ mod tests {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         });
         tree.set_root(bin);
         assert!(tree.get_root().is_some());
@@ -6395,6 +6478,7 @@ mod tests {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         });
         assert!(!bin_node.is_dirty());
         bin_node.set_dirty(true);
@@ -6431,6 +6515,7 @@ mod tests {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         });
         assert_eq!(bin_node.get_generation(), 0);
         bin_node.set_generation(42);
@@ -6482,6 +6567,7 @@ mod tests {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         });
         assert_eq!(bin_node.log_size(), bin_node.write_to_bytes().len());
 
@@ -6520,6 +6606,7 @@ mod tests {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         });
         let bytes = node.write_to_bytes();
         // First 8 bytes = node_id big-endian.
@@ -6545,6 +6632,7 @@ mod tests {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         });
         let with_entry = TreeNode::Bottom(BinStub {
             node_id: 2,
@@ -6566,6 +6654,7 @@ mod tests {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         });
         assert!(
             with_entry.log_size() > empty.log_size(),
@@ -6590,6 +6679,7 @@ mod tests {
             parent: None, // set below
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         })));
 
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
@@ -7024,6 +7114,7 @@ mod tests {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         })));
 
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
@@ -7069,6 +7160,7 @@ mod tests {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         })));
 
         assert!(
@@ -7093,6 +7185,7 @@ mod tests {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         })));
         let bin_b = Arc::new(RwLock::new(TreeNode::Bottom(BinStub {
             node_id: generate_node_id(),
@@ -7107,6 +7200,7 @@ mod tests {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         })));
 
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
@@ -7209,6 +7303,7 @@ mod tests {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         };
 
         let delta_entries = vec![
@@ -7280,6 +7375,7 @@ mod tests {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         };
         let n_before = base.entries.len();
         Tree::apply_delta_to_bin(&mut base, vec![]);
@@ -7328,6 +7424,7 @@ mod tests {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         };
 
         // The delta has a new entry "bb" and overwrites "aa".
@@ -7361,6 +7458,7 @@ mod tests {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         };
 
         Tree::mutate_to_full_bin(&mut delta, base);
@@ -7407,6 +7505,7 @@ mod tests {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         };
         assert!(!Tree::bin_is_delta(&bin));
         bin.is_delta = true;
@@ -7447,6 +7546,7 @@ mod tests {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         };
 
         Tree::mutate_to_full_bin_from_log(&mut bin, &lm);
@@ -7490,6 +7590,7 @@ mod tests {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         };
 
         Tree::mutate_to_full_bin_from_log(&mut delta, &lm);
@@ -7549,6 +7650,7 @@ mod tests {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         };
 
         let payload = full_bin.serialize_full();
@@ -7596,6 +7698,7 @@ mod tests {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         };
 
         Tree::mutate_to_full_bin_from_log(&mut delta, &lm);
@@ -7691,6 +7794,7 @@ mod tests {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         };
         source.recompute_key_prefix();
         // Verify the source has the expected prefix before serializing.
@@ -7742,6 +7846,7 @@ mod tests {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         };
 
         let payload = source.serialize_full();
@@ -8014,6 +8119,7 @@ mod tests {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         };
 
         bin.insert_with_prefix(b"record:aaa".to_vec(), Lsn::new(1, 1), None);
@@ -8043,6 +8149,7 @@ mod tests {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         };
 
         let keys = [
@@ -8084,6 +8191,7 @@ mod tests {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         };
 
         for k in
@@ -8164,6 +8272,7 @@ mod tests {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         };
 
         for k in [b"myapp:user:1".as_ref(), b"myapp:user:2".as_ref()] {
@@ -8555,6 +8664,7 @@ mod tests {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         })));
 
         // Wire a minimal parent IN so compress_bin can prune if needed.
@@ -8629,6 +8739,7 @@ mod tests {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         })));
 
         let tree = Tree::new(1, 128);
@@ -8665,6 +8776,7 @@ mod tests {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         })));
 
         let tree = Tree::new(1, 128);
@@ -8711,6 +8823,7 @@ mod tests {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         })));
 
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
@@ -8772,6 +8885,7 @@ mod tests {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         })));
 
         let tree = Tree::new(1, 128);
@@ -8819,6 +8933,7 @@ mod tests {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         })));
 
         let tree = Tree::new(1, 128);
@@ -8891,6 +9006,7 @@ mod tests {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         })));
 
         // Parent IN with two children: the BIN above plus a placeholder sibling.
@@ -8914,6 +9030,7 @@ mod tests {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         })));
 
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
@@ -9048,6 +9165,7 @@ mod tests {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         })));
 
         let tree = Tree::new(1, 128);
@@ -9108,6 +9226,7 @@ mod tests {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         })));
 
         let tree = Tree::new(1, 128);
@@ -9179,6 +9298,7 @@ mod tests {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         })));
 
         // Wire up a parent so compress_bin can run normally.
@@ -9354,6 +9474,7 @@ mod tests {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         })));
 
         let sibling_arc = Arc::new(RwLock::new(TreeNode::Bottom(BinStub {
@@ -9376,6 +9497,7 @@ mod tests {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         })));
 
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
@@ -9489,6 +9611,7 @@ mod tests {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         })));
 
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
@@ -9673,6 +9796,7 @@ mod tests {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         };
         bin.insert_with_prefix(b"key".to_vec(), lsn, Some(b"val".to_vec()));
         assert_eq!(bin.dirty_count(), 1, "new slot should be dirty");
@@ -9702,6 +9826,7 @@ mod tests {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         };
         bin.insert_with_prefix(
             b"key".to_vec(),
@@ -9744,6 +9869,7 @@ mod tests {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         };
         let bytes = bin.serialize_full();
         let node_id = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
@@ -9796,6 +9922,7 @@ mod tests {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         };
         let bytes = bin.serialize_delta();
         let node_id = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
@@ -9856,7 +9983,133 @@ mod tests {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         }
+    }
+
+    // ========================================================================
+    // T-17: BinStub::should_log_delta — faithful JE BIN.shouldLogDelta
+    // (BIN.java:1892).  These pin the COUNT-based decision against the
+    // CONFIGURABLE percent (not a dirty-fraction-vs-hardcoded-0.25 heuristic),
+    // plus the isBINDelta fast path, the numDeltas<=0 guard, and the
+    // isDeltaProhibited / lastFullLsn==NULL bound.
+    // ========================================================================
+
+    /// Build a full (non-delta) BIN with `n` slots, the first `dirty` of them
+    /// marked dirty, and a non-NULL last_full_lsn (so a delta is permitted).
+    fn bin_with_dirty(n: usize, dirty: usize) -> BinStub {
+        let mut bin = make_bin_for_delta_tests(
+            (0..n)
+                .map(|i| {
+                    (
+                        format!("{:04}", i).into_bytes(),
+                        Lsn::new(1, i as u32 + 1),
+                        Some(vec![i as u8]),
+                    )
+                })
+                .collect(),
+        );
+        bin.last_full_lsn = Lsn::new(1, 1); // a prior full exists
+        for e in bin.entries.iter_mut().take(dirty) {
+            e.dirty = true;
+        }
+        bin
+    }
+
+    /// COUNT-based + CONFIGURABLE percent: with percent=10 and 100 slots, the
+    /// delta limit is 100*10/100 = 10.  10 dirty slots → delta; 11 dirty → full.
+    ///
+    /// This is the core T-17 reproduction: the OLD checkpointer decision used
+    /// `dirty/total <= 0.25` (hardcoded), so 11/100 = 11% ≤ 25% → it would have
+    /// (wrongly) logged a DELTA.  The faithful count-based decision against the
+    /// configurable percent=10 logs a FULL BIN.
+    #[test]
+    fn should_log_delta_is_count_based_and_configurable() {
+        // Exactly at the limit → delta.
+        assert!(
+            bin_with_dirty(100, 10).should_log_delta(10),
+            "numDeltas(10) <= limit(100*10/100=10) must be a delta"
+        );
+        // One over the limit → full BIN (FAILS on main: 11/100=11% <= 25%).
+        assert!(
+            !bin_with_dirty(100, 11).should_log_delta(10),
+            "numDeltas(11) > limit(10) must be a FULL BIN under percent=10"
+        );
+        // The SAME BIN under the default percent=25 (limit 25) is a delta:
+        // proves the percent is honoured, not hardcoded.
+        assert!(
+            bin_with_dirty(100, 11).should_log_delta(25),
+            "numDeltas(11) <= limit(25) must be a delta under percent=25"
+        );
+        // Integer (truncating) math, exactly as JE: 7 slots, percent=25 →
+        // limit = 7*25/100 = 1.  1 dirty → delta, 2 dirty → full.
+        assert!(bin_with_dirty(7, 1).should_log_delta(25));
+        assert!(!bin_with_dirty(7, 2).should_log_delta(25));
+    }
+
+    /// isBINDelta fast path: a BIN already in delta form always re-logs as a
+    /// delta (JE: `if (isBINDelta()) return true;`).
+    #[test]
+    fn should_log_delta_bin_delta_fast_path() {
+        let mut bin = bin_with_dirty(100, 90); // 90% dirty: way over any limit
+        bin.is_delta = true;
+        // Even with a tiny percent that the dirty count blows past, an
+        // already-delta BIN re-logs as a delta.
+        assert!(
+            bin.should_log_delta(1),
+            "isBINDelta() must short-circuit to true regardless of percent"
+        );
+    }
+
+    /// numDeltas <= 0 guard: a BIN with no dirty slots logs a full BIN (an
+    /// empty delta is invalid).
+    #[test]
+    fn should_log_delta_zero_dirty_is_full() {
+        assert!(!bin_with_dirty(100, 0).should_log_delta(25));
+    }
+
+    /// isDeltaProhibited bound: lastFullLsn == NULL (never logged full) and
+    /// prohibit_next_delta both force a full BIN.
+    #[test]
+    fn should_log_delta_prohibited_forces_full() {
+        // No prior full BIN.
+        let mut bin = bin_with_dirty(100, 5); // would be a delta otherwise
+        bin.last_full_lsn = NULL_LSN;
+        assert!(
+            !bin.should_log_delta(25),
+            "lastFullLsn==NULL must force a full BIN"
+        );
+
+        // prohibit_next_delta set (e.g. a dirty slot was removed by compress).
+        let mut bin = bin_with_dirty(100, 5);
+        bin.prohibit_next_delta = true;
+        assert!(
+            !bin.should_log_delta(25),
+            "prohibit_next_delta must force a full BIN"
+        );
+    }
+
+    /// The prohibit flag is cleared after a full BIN is logged
+    /// (JE IN.afterLog: setProhibitNextDelta(false)), so the NEXT log may once
+    /// again be a delta — this is the periodic-full chain bound.
+    #[test]
+    fn full_log_clears_prohibit_next_delta() {
+        let mut bin = bin_with_dirty(100, 5);
+        bin.prohibit_next_delta = true;
+        assert!(!bin.should_log_delta(25), "prohibited → full");
+        bin.clear_dirty_after_full_log(Lsn::new(2, 5));
+        assert!(
+            !bin.prohibit_next_delta,
+            "full log must clear prohibit_next_delta"
+        );
+        // Re-dirty a few slots; now a delta is allowed again.
+        for e in bin.entries.iter_mut().take(5) {
+            e.dirty = true;
+        }
+        assert!(
+            bin.should_log_delta(25),
+            "after a full log, a small delta is allowed again"
+        );
     }
 
     // ========================================================================
@@ -10200,6 +10453,7 @@ mod tests {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         };
         // Two non-dirty slots with embedded data, one dirty slot.
         bin.entries.push(BinEntry {
@@ -10354,6 +10608,7 @@ fn test_split_child_sibling_inherits_expiration_in_hours() {
         parent: None,
         expiration_in_hours: true, // hours-granularity entries
         cursor_count: 0,
+        prohibit_next_delta: false,
     })));
 
     let root = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
@@ -10479,6 +10734,7 @@ mod in_redo_tests {
             parent: None,
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         };
         for i in 0..n {
             bin.entries.push(BinEntry {

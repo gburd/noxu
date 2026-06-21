@@ -275,6 +275,7 @@ impl Environment {
             tree_max_embedded_ln: config.tree_max_embedded_ln,
             tree_max_delta: config.tree_max_delta,
             tree_bin_delta: config.tree_bin_delta,
+            tree_bin_delta_percent: config.tree_bin_delta_percent,
             tree_min_memory: config.tree_min_memory,
             tree_compact_max_key_length: config.tree_compact_max_key_length,
             // INCompressor

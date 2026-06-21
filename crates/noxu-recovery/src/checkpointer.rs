@@ -38,6 +38,11 @@ pub struct CheckpointConfig {
     pub bytes_interval: u64,
     /// Milliseconds between checkpoints (0 = disabled).
     pub time_interval: u64,
+    /// BIN-delta percent threshold (JE `TREE_BIN_DELTA` / `BIN_DELTA_PERCENT`,
+    /// 0–75, default 25).  A BIN is logged as a delta only when its delta-slot
+    /// count is `<= nEntries * bin_delta_percent / 100`.  See
+    /// `BinStub::should_log_delta` / JE `DatabaseImpl.getBinDeltaPercent()`.
+    pub bin_delta_percent: i32,
 }
 
 impl CheckpointConfig {
@@ -69,6 +74,12 @@ impl CheckpointConfig {
         self.time_interval = millis;
         self
     }
+
+    /// Set the BIN-delta percent threshold (`TREE_BIN_DELTA`, 0–75).
+    pub fn bin_delta_percent(mut self, percent: i32) -> Self {
+        self.bin_delta_percent = percent;
+        self
+    }
 }
 
 impl Default for CheckpointConfig {
@@ -78,6 +89,8 @@ impl Default for CheckpointConfig {
             minimize_recovery_time: false,
             bytes_interval: 20_000_000, // 20MB default
             time_interval: 0, // Time-based checkpoints disabled by default
+            // JE BIN_DELTA_PERCENT default (TREE_BIN_DELTA, 0–75).
+            bin_delta_percent: 25,
         }
     }
 }
@@ -970,8 +983,10 @@ impl Checkpointer {
     /// covering all databases; Noxu achieves the same effect by iterating the
     /// `db_trees_registry` and calling the per-tree BIN-flush logic for each.
     ///
-    /// For each dirty BIN the TREE_BIN_DELTA threshold (25 %) decides:
-    /// - dirty_count / total ≤ 0.25 → write `BINDelta` entry (delta path)
+    /// For each dirty BIN `BinStub::should_log_delta(bin_delta_percent)`
+    /// (faithful JE `BIN.shouldLogDelta`, BIN.java:1892) decides:
+    /// - delta-slot count `<= nEntries * bin_delta_percent / 100` (and no
+    ///   prohibit / a prior full exists) → write `BINDelta` entry (delta path)
     /// - otherwise                  → write full `BIN` entry (full path)
     ///
     /// Also calls `persist_file_summaries()` to ensure utilization data is
@@ -1013,7 +1028,12 @@ impl Checkpointer {
         }
 
         for (db_id, tree_arc) in trees_to_flush {
-            let r = Self::flush_one_tree_bins(db_id, &tree_arc, lm)?;
+            let r = Self::flush_one_tree_bins(
+                db_id,
+                &tree_arc,
+                lm,
+                self.config.bin_delta_percent,
+            )?;
             result.full_bins_flushed += r.full_bins_flushed;
             result.delta_ins_flushed += r.delta_ins_flushed;
         }
@@ -1033,6 +1053,7 @@ impl Checkpointer {
         db_id: u64,
         tree_arc: &Arc<RwLock<Tree>>,
         lm: &Arc<LogManager>,
+        bin_delta_percent: i32,
     ) -> Result<FlushResult> {
         let mut result = FlushResult::default();
 
@@ -1046,8 +1067,9 @@ impl Checkpointer {
             tree_guard.collect_dirty_bins(db_id)
         };
 
-        // TREE_BIN_DELTA: if dirty fraction ≤ 25 % write a delta.
-        const TREE_BIN_DELTA: f64 = 0.25;
+        // The delta-vs-full decision per BIN is made by
+        // `BinStub::should_log_delta(bin_delta_percent)` below — faithful JE
+        // `BIN.shouldLogDelta` (count-based + configurable percent).
 
         for (_node_db_id, bin_arc) in dirty_bins {
             // Acquire write lock to serialize + clear dirty flags.
@@ -1058,7 +1080,6 @@ impl Checkpointer {
                 _ => continue, // not a BIN (defensive)
             };
 
-            let total = b.entries.len();
             let dirty = b.dirty_count();
 
             // X-8: skip nodes that the evictor already flushed and cleared
@@ -1068,9 +1089,12 @@ impl Checkpointer {
                 continue;
             }
 
-            let use_delta = total > 0
-                && (dirty as f64 / total as f64) <= TREE_BIN_DELTA
-                && b.last_full_lsn != NULL_LSN; // need a previous full to delta from
+            // TREE_BIN_DELTA decision — faithful JE `BIN.shouldLogDelta`
+            // (BIN.java:1892): COUNT-based (numDeltas = dirty slots) against the
+            // CONFIGURABLE percent limit, with the isBINDelta fast path, the
+            // numDeltas<=0 guard, and the isDeltaProhibited / lastFullLsn==NULL
+            // bound — all encapsulated in `BinStub::should_log_delta`.
+            let use_delta = b.should_log_delta(bin_delta_percent);
 
             if use_delta {
                 // --- BIN-delta path ---
@@ -1734,6 +1758,7 @@ mod tests {
             // a non-zero expiration_time.
             expiration_in_hours: true,
             cursor_count: 0,
+            prohibit_next_delta: false,
         };
         let node = NodeRwLock::new(TreeNode::Bottom(bin));
 

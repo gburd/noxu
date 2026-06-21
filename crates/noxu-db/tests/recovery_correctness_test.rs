@@ -473,7 +473,7 @@ fn equality_bindelta_updates() {
                 .unwrap();
             }
             // Update a small fraction repeatedly to trigger the BINDelta path
-            // (dirty_count / total <= 25% → delta).
+            // (delta-slot count <= nEntries * percent / 100 → delta; T-17).
             for round in 1u32..5 {
                 for i in 0u32..5 {
                     let k = format!("delta_{i:06}");
@@ -1214,15 +1214,15 @@ fn delta_test_compress_recovers_surviving_set() {
 ///   recover                      -> committed keys present
 ///                                   (reconstituteBIN clears stale KD)
 ///
-/// Authorized deviation (delta threshold): the Noxu checkpointer hardcodes
-/// the BIN-delta dirty threshold at 25% (`checkpointer.rs` const
-/// `TREE_BIN_DELTA = 0.25`) and does not read the config param, so JE's
-/// `BIN_DELTA_PERCENT = 75` cannot be set. To make a delta-carrying-KD
-/// checkpoint while staying under 25% per BIN, the KD churn and the committed
-/// mutation are applied to small subsets (rather than 50% of slots). The
-/// asserted property is unchanged: the checkpoint writes BIN-deltas that
-/// carry known-deleted slots, and recovery reconstitutes them so that every
-/// committed key is present (stale KD cleared).
+/// T-17 note (delta threshold): the checkpointer now reads the configurable
+/// BIN-delta percent (`tree_bin_delta_percent` / JE `BIN_DELTA_PERCENT`,
+/// default 25) and makes the delta-vs-full decision COUNT-based via
+/// `BinStub::should_log_delta` (faithful JE `BIN.shouldLogDelta`,
+/// BIN.java:1892).  This test keeps its per-BIN dirty churn small so a delta
+/// is logged under the default percent=25; the asserted property is
+/// unchanged: the checkpoint writes BIN-deltas that carry known-deleted slots,
+/// and recovery reconstitutes them so that every committed key is present
+/// (stale KD cleared).
 #[test]
 fn delta_test_known_deleted_replays() {
     let dir = TempDir::new().unwrap();

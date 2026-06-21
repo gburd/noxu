@@ -52,6 +52,7 @@ fn make_bin_bytes(
         parent: None,
         expiration_in_hours: true,
         cursor_count: 0,
+        prohibit_next_delta: false,
     };
     bin.serialize_full()
 }

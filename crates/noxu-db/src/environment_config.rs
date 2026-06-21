@@ -354,6 +354,11 @@ pub struct EnvironmentConfig {
     /// Mirrors `TREE_BIN_DELTA` / default true.
     pub tree_bin_delta: bool,
 
+    /// BIN-delta percent threshold (0–75): a BIN is logged as a delta only
+    /// when its delta-slot count is `<= nEntries * percent / 100`.
+    /// Mirrors JE `TREE_BIN_DELTA` / `BIN_DELTA_PERCENT` (int, default 25).
+    pub tree_bin_delta_percent: u8,
+
     /// Minimum memory per B-tree node in bytes.  0 = no minimum.
     /// Mirrors `TREE_MIN_MEMORY` / default 0.
     pub tree_min_memory: u64,
@@ -851,6 +856,7 @@ impl EnvironmentConfig {
             tree_max_embedded_ln: 16,
             tree_max_delta: 25,
             tree_bin_delta: true,
+            tree_bin_delta_percent: 25,
             tree_min_memory: 0,
             tree_compact_max_key_length: 16,
             // INCompressor
@@ -1274,6 +1280,12 @@ impl EnvironmentConfig {
     }
     pub fn set_tree_bin_delta(&mut self, v: bool) -> &mut Self {
         self.tree_bin_delta = v;
+        self
+    }
+
+    /// Set the BIN-delta percent threshold (0–75, JE `BIN_DELTA_PERCENT`).
+    pub fn set_tree_bin_delta_percent(&mut self, pct: u8) -> &mut Self {
+        self.tree_bin_delta_percent = pct;
         self
     }
     pub fn set_tree_min_memory(&mut self, bytes: u64) -> &mut Self {
