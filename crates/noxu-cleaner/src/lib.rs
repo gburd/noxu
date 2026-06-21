@@ -36,6 +36,7 @@ pub mod tracked_file_summary;
 pub mod utilization_profile;
 pub mod utilization_tracker;
 pub mod utilization_tracker_observer;
+pub mod verify_utils;
 
 // Re-exports
 pub use cleaner::{CleanResult, Cleaner};
@@ -64,3 +65,4 @@ pub use tracked_file_summary::TrackedFileSummary;
 pub use utilization_profile::UtilizationProfile;
 pub use utilization_tracker::{ObsoleteKind, UtilizationTracker};
 pub use utilization_tracker_observer::UtilizationTrackerObserver;
+pub use verify_utils::{CheckLsnsResult, check_lsns, obsolete_lsn_set};

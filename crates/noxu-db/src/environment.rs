@@ -1422,7 +1422,12 @@ impl Environment {
         self.check_open()?;
         let env_impl = self.env_impl.lock();
         let all_dbs = env_impl.get_all_database_impls();
-        drop(env_impl);
+        // Lock the live utilization tracker for the checkLsns half
+        // (VerifyUtils.checkLsns): live tree LSNs must be DISJOINT from the
+        // obsolete LSNs recorded in the UtilizationProfile/tracker. Held
+        // across the loop (no clone); read-only envs have no tracker.
+        let tracker_guard =
+            env_impl.get_utilization_tracker().map(|t| t.lock());
 
         let mut merged = noxu_engine::VerifyResult::new();
         for db_arc in &all_dbs {
@@ -1438,6 +1443,14 @@ impl Environment {
             }
             for w in result.warnings {
                 merged.add_warning(w);
+            }
+            // CLN-2 / VerifyUtils.checkLsns: assert live-tree LSNs are
+            // disjoint from the obsolete set.
+            if let Some(ref t) = tracker_guard {
+                noxu_engine::check_lsns_against_tracker(&guard, t, &mut merged);
+                if merged.error_count() >= config.max_errors as usize {
+                    return Ok(merged);
+                }
             }
         }
         Ok(merged)
@@ -2524,5 +2537,98 @@ mod tests {
 
         env.close().unwrap();
         drop(tmp);
+    }
+
+    /// CLN-2 / VerifyUtils.checkLsns wired into Environment::verify.
+    ///
+    /// A healthy env (live tree LSNs disjoint from the obsolete set) passes
+    /// verify; after seeding one live LSN into the obsolete tracker the same
+    /// verify FAILS with the "Obsolete LSN set contains valid LSN" error.
+    #[test]
+    fn test_verify_checklsns_detects_live_in_obsolete() {
+        use crate::database_entry::DatabaseEntry;
+        let (_tmp, config) = temp_env_config();
+        let env = Environment::open(config).unwrap();
+
+        let db_config = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
+        let db = env.open_database(None, "cln2db", &db_config).unwrap();
+        db.put(
+            None,
+            &DatabaseEntry::from_bytes(b"alpha"),
+            &DatabaseEntry::from_bytes(b"1"),
+        )
+        .unwrap();
+        db.put(
+            None,
+            &DatabaseEntry::from_bytes(b"beta"),
+            &DatabaseEntry::from_bytes(b"2"),
+        )
+        .unwrap();
+        db.put(
+            None,
+            &DatabaseEntry::from_bytes(b"gamma"),
+            &DatabaseEntry::from_bytes(b"3"),
+        )
+        .unwrap();
+
+        let cfg = noxu_engine::VerifyConfig::default();
+
+        // Healthy: live LSNs disjoint from obsolete -> verify passes.
+        let healthy = env.verify(&cfg).unwrap();
+        assert!(
+            healthy.is_passed(),
+            "healthy env must pass checkLsns: {:?}",
+            healthy.errors
+        );
+
+        // Grab a real live LSN from the db's tree.
+        let live_lsn = {
+            let guard = db.db_impl.read();
+            let tree = guard
+                .get_real_tree()
+                .expect("invariant: populated db has a real tree");
+            noxu_engine::gather_tree_lsns(&tree)
+                .into_iter()
+                .next()
+                .expect("invariant: at least one live LSN")
+        };
+
+        // Seed the bug: record that exact live LSN as obsolete in the live
+        // tracker (mislabels live data obsolete -> the cleaner would delete
+        // live data).
+        {
+            let env_impl = env.env_impl.lock();
+            let tracker = env_impl
+                .get_utilization_tracker()
+                .expect("invariant: rw env has a tracker");
+            tracker.lock().count_obsolete_node(
+                live_lsn.file_number(),
+                live_lsn.file_offset(),
+                10,
+                true,
+                None,
+            );
+        }
+
+        // Now verify must DETECT the overlap.
+        let bad = env.verify(&cfg).unwrap();
+        assert!(
+            !bad.is_passed(),
+            "verify must detect live LSN in obsolete set"
+        );
+        assert!(
+            bad.errors.iter().any(|e| matches!(
+                e,
+                noxu_engine::VerifyError::DataInconsistency { description }
+                    if description.contains("Obsolete LSN set contains valid LSN")
+            )),
+            "expected checkLsns error, got: {:?}",
+            bad.errors
+        );
+
+        drop(db);
+        env.close().unwrap();
     }
 }
