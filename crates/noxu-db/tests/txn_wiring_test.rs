@@ -25,7 +25,7 @@ fn open_db(env: &Environment, name: &str) -> Database {
     env.open_database(
         None,
         name,
-        &DatabaseConfig::new().with_allow_create(true),
+        &DatabaseConfig::new().with_allow_create(true).with_transactional(true),
     )
     .unwrap()
 }

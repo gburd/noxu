@@ -13,7 +13,8 @@ fn open_env_and_db(dir: &TempDir) -> (noxu_db::Environment, noxu_db::Database) {
         .with_allow_create(true)
         .with_transactional(true);
     let env = noxu_db::Environment::open(env_config).unwrap();
-    let db_config = DatabaseConfig::new().with_allow_create(true);
+    let db_config =
+        DatabaseConfig::new().with_allow_create(true).with_transactional(true);
     let db = env.open_database(None, "test", &db_config).unwrap();
     (env, db)
 }
@@ -247,7 +248,8 @@ fn test_multiple_databases_isolated() {
     let env_config = EnvironmentConfig::new(dir.path().to_path_buf())
         .with_allow_create(true);
     let env = noxu_db::Environment::open(env_config).unwrap();
-    let db_config = DatabaseConfig::new().with_allow_create(true);
+    let db_config =
+        DatabaseConfig::new().with_allow_create(true).with_transactional(true);
 
     let db1 = env.open_database(None, "db1", &db_config).unwrap();
     let db2 = env.open_database(None, "db2", &db_config).unwrap();
@@ -272,7 +274,8 @@ fn test_get_database_names() {
     let env_config = EnvironmentConfig::new(dir.path().to_path_buf())
         .with_allow_create(true);
     let env = noxu_db::Environment::open(env_config).unwrap();
-    let db_config = DatabaseConfig::new().with_allow_create(true);
+    let db_config =
+        DatabaseConfig::new().with_allow_create(true).with_transactional(true);
 
     let _db1 = env.open_database(None, "alpha", &db_config).unwrap();
     let _db2 = env.open_database(None, "beta", &db_config).unwrap();
@@ -1151,7 +1154,9 @@ fn open_seq_env_db(dir: &TempDir) -> (noxu_db::Environment, noxu_db::Database) {
         .open_database(
             None,
             "seqdb",
-            &DatabaseConfig::new().with_allow_create(true),
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true),
         )
         .unwrap();
     (env, db)
@@ -1763,7 +1768,8 @@ fn open_pri_sec(
         .with_transactional(true);
     let env = noxu_db::Environment::open(env_config).unwrap();
 
-    let db_config = DatabaseConfig::new().with_allow_create(true);
+    let db_config =
+        DatabaseConfig::new().with_allow_create(true).with_transactional(true);
     let primary_db = env.open_database(None, "primary", &db_config).unwrap();
     let primary = Arc::new(Mutex::new(primary_db));
 
@@ -2142,7 +2148,9 @@ fn sec_multi_key_creator_multiple_keys_per_record() {
         .open_database(
             None,
             "pri_mk",
-            &DatabaseConfig::new().with_allow_create(true),
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true),
         )
         .unwrap();
     let primary = Arc::new(Mutex::new(primary_db));
@@ -2211,7 +2219,9 @@ fn sec_auto_populate_on_open() {
         .open_database(
             None,
             "pri_pop",
-            &DatabaseConfig::new().with_allow_create(true),
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true),
         )
         .unwrap();
     let primary = Arc::new(Mutex::new(primary_db));
@@ -2307,7 +2317,9 @@ fn sec_num_recs_put_get_round_trip() {
         .open_database(
             None,
             "pri_nr",
-            &DatabaseConfig::new().with_allow_create(true),
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true),
         )
         .unwrap();
     let primary = Arc::new(Mutex::new(primary_db));
@@ -2907,7 +2919,9 @@ fn recovery_concurrent_writes_all_survive_reopen() {
             .open_database(
                 None,
                 "test",
-                &DatabaseConfig::new().with_allow_create(true),
+                &DatabaseConfig::new()
+                    .with_allow_create(true)
+                    .with_transactional(true),
             )
             .unwrap();
 
@@ -3030,7 +3044,9 @@ fn recovery_multi_db_both_databases_survive_reopen() {
             .with_allow_create(true)
             .with_transactional(true);
         let env = noxu_db::Environment::open(env_config).unwrap();
-        let db_cfg = DatabaseConfig::new().with_allow_create(true);
+        let db_cfg = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
         let db_alpha = env.open_database(None, "alpha", &db_cfg).unwrap();
         let db_beta = env.open_database(None, "beta", &db_cfg).unwrap();
 
@@ -3055,7 +3071,9 @@ fn recovery_multi_db_both_databases_survive_reopen() {
             .with_allow_create(true)
             .with_transactional(true);
         let env = noxu_db::Environment::open(env_config).unwrap();
-        let db_cfg = DatabaseConfig::new().with_allow_create(true);
+        let db_cfg = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
         let db_alpha = env.open_database(None, "alpha", &db_cfg).unwrap();
         let db_beta = env.open_database(None, "beta", &db_cfg).unwrap();
 
@@ -3100,7 +3118,8 @@ fn utilization_tracker_write_path_produces_log_entries_on_disk() {
         .with_allow_create(true)
         .with_transactional(true);
     let env = noxu_db::Environment::open(env_config).unwrap();
-    let db_cfg = DatabaseConfig::new().with_allow_create(true);
+    let db_cfg =
+        DatabaseConfig::new().with_allow_create(true).with_transactional(true);
     let db = env.open_database(None, "util_test", &db_cfg).unwrap();
 
     // Write 20 records, delete 10 — each operation produces a log entry that

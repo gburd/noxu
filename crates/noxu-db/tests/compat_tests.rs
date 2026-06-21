@@ -27,7 +27,8 @@ fn open(dir: &TempDir) -> (noxu_db::Environment, noxu_db::Database) {
         .with_allow_create(true)
         .with_transactional(true);
     let env = noxu_db::Environment::open(env_config).unwrap();
-    let db_config = DatabaseConfig::new().with_allow_create(true);
+    let db_config =
+        DatabaseConfig::new().with_allow_create(true).with_transactional(true);
     let db = env.open_database(None, "test", &db_config).unwrap();
     (env, db)
 }
@@ -41,7 +42,8 @@ fn open_named(
         .with_allow_create(true)
         .with_transactional(true);
     let env = noxu_db::Environment::open(env_config).unwrap();
-    let db_config = DatabaseConfig::new().with_allow_create(true);
+    let db_config =
+        DatabaseConfig::new().with_allow_create(true).with_transactional(true);
     let db = env.open_database(None, name, &db_config).unwrap();
     (env, db)
 }
@@ -266,7 +268,8 @@ fn read_uncommitted_sees_dirty_write() {
         .with_allow_create(true)
         .with_transactional(true);
     let env = Arc::new(noxu_db::Environment::open(env_config).unwrap());
-    let db_config = DatabaseConfig::new().with_allow_create(true);
+    let db_config =
+        DatabaseConfig::new().with_allow_create(true).with_transactional(true);
     let db = Arc::new(env.open_database(None, "test", &db_config).unwrap());
 
     // Insert a committed baseline value.
@@ -523,7 +526,9 @@ fn recovery_across_checkpoint_boundary() {
             .with_transactional(true)
             .with_checkpointer_bytes_interval(1); // force frequent checkpoints
         let env = noxu_db::Environment::open(env_config).unwrap();
-        let db_cfg = DatabaseConfig::new().with_allow_create(true);
+        let db_cfg = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
         let db = env.open_database(None, "test", &db_cfg).unwrap();
 
         // Batch 1: written before the first automatic checkpoint.
@@ -554,7 +559,9 @@ fn recovery_across_checkpoint_boundary() {
             .with_allow_create(true)
             .with_transactional(true);
         let env = noxu_db::Environment::open(env_config).unwrap();
-        let db_cfg = DatabaseConfig::new().with_allow_create(true);
+        let db_cfg = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
         let db = env.open_database(None, "test", &db_cfg).unwrap();
 
         for i in 0u32..BATCH1 {
@@ -912,7 +919,8 @@ fn read_committed_allows_non_repeatable_read() {
         .with_allow_create(true)
         .with_transactional(true);
     let env = Arc::new(noxu_db::Environment::open(env_cfg).unwrap());
-    let db_cfg = DatabaseConfig::new().with_allow_create(true);
+    let db_cfg =
+        DatabaseConfig::new().with_allow_create(true).with_transactional(true);
     let db = Arc::new(env.open_database(None, "test", &db_cfg).unwrap());
 
     // Establish initial value.
@@ -992,7 +1000,8 @@ fn serializable_isolation_repeatable_read() {
         .with_allow_create(true)
         .with_transactional(true);
     let env = Arc::new(noxu_db::Environment::open(env_cfg).unwrap());
-    let db_cfg = DatabaseConfig::new().with_allow_create(true);
+    let db_cfg =
+        DatabaseConfig::new().with_allow_create(true).with_transactional(true);
     let db = Arc::new(env.open_database(None, "test", &db_cfg).unwrap());
 
     {
@@ -1068,7 +1077,8 @@ fn multiple_databases_fully_isolated() {
         .with_allow_create(true)
         .with_transactional(true);
     let env = noxu_db::Environment::open(env_cfg).unwrap();
-    let db_cfg = DatabaseConfig::new().with_allow_create(true);
+    let db_cfg =
+        DatabaseConfig::new().with_allow_create(true).with_transactional(true);
     let db_a = env.open_database(None, "A", &db_cfg).unwrap();
     let db_b = env.open_database(None, "B", &db_cfg).unwrap();
 
@@ -1247,7 +1257,8 @@ fn environment_stats_non_negative_after_writes() {
         .with_allow_create(true)
         .with_transactional(true);
     let env = noxu_db::Environment::open(env_cfg).unwrap();
-    let db_cfg = DatabaseConfig::new().with_allow_create(true);
+    let db_cfg =
+        DatabaseConfig::new().with_allow_create(true).with_transactional(true);
     let db = env.open_database(None, "test", &db_cfg).unwrap();
 
     for i in 0u32..20 {

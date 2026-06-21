@@ -33,7 +33,8 @@ fn setup() -> (TempDir, noxu_db::Environment, noxu_db::Database) {
         .with_allow_create(true)
         .with_transactional(true);
     let env = noxu_db::Environment::open(env_config).unwrap();
-    let db_config = DatabaseConfig::new().with_allow_create(true);
+    let db_config =
+        DatabaseConfig::new().with_allow_create(true).with_transactional(true);
     let db = env.open_database(None, "test", &db_config).unwrap();
     (dir, env, db)
 }
@@ -644,7 +645,9 @@ fn test_64_thread_concurrent_readers() {
         env.open_database(
             None,
             "test",
-            &DatabaseConfig::new().with_allow_create(true),
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true),
         )
         .unwrap(),
     );
@@ -737,7 +740,9 @@ fn test_32r32w_concurrent() {
         env.open_database(
             None,
             "test",
-            &DatabaseConfig::new().with_allow_create(true),
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true),
         )
         .unwrap(),
     );
@@ -850,7 +855,9 @@ fn test_200_thread_disjoint_writers() {
         env.open_database(
             None,
             "test",
-            &DatabaseConfig::new().with_allow_create(true),
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true),
         )
         .unwrap(),
     );
@@ -976,7 +983,9 @@ fn test_serializable_prevents_phantom_insert() {
         .open_database(
             None,
             "phantom_test",
-            &DatabaseConfig::new().with_allow_create(true),
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true),
         )
         .unwrap();
 
@@ -1068,7 +1077,9 @@ fn test_default_isolation_allows_phantom_insert() {
         .open_database(
             None,
             "phantom_rr_test",
-            &DatabaseConfig::new().with_allow_create(true),
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true),
         )
         .unwrap();
 
@@ -1128,7 +1139,9 @@ fn test_read_committed_allows_phantom_insert() {
         .open_database(
             None,
             "phantom_rc_test",
-            &DatabaseConfig::new().with_allow_create(true),
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true),
         )
         .unwrap();
 
@@ -1186,7 +1199,9 @@ fn test_serializable_scan_then_insert_same_txn_no_panic() {
         .open_database(
             None,
             "scan_insert_same_txn",
-            &DatabaseConfig::new().with_allow_create(true),
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true),
         )
         .unwrap();
 

@@ -58,7 +58,9 @@ fn open_env() -> (TempDir, Environment, noxu_db::Database) {
         .open_database(
             None,
             "stress",
-            &DatabaseConfig::new().with_allow_create(true),
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true),
         )
         .unwrap();
     (dir, env, db)

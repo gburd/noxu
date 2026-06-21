@@ -50,7 +50,9 @@ fn concurrent_reads_during_inserts_no_false_not_found() {
         env.open_database(
             None,
             "rw",
-            &DatabaseConfig::new().with_allow_create(true),
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true),
         )
         .unwrap(),
     );

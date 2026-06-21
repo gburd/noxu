@@ -52,7 +52,7 @@ fn open_db(env: &noxu_db::Environment) -> noxu_db::Database {
     env.open_database(
         None,
         "testdb",
-        &DatabaseConfig::new().with_allow_create(true),
+        &DatabaseConfig::new().with_allow_create(true).with_transactional(true),
     )
     .unwrap()
 }
@@ -729,7 +729,9 @@ fn stage1_user_db_data_survives_checkpoint_and_recovery() {
             .open_database(
                 None,
                 "stage1_recovery_db",
-                &DatabaseConfig::new().with_allow_create(true),
+                &DatabaseConfig::new()
+                    .with_allow_create(true)
+                    .with_transactional(true),
             )
             .unwrap();
 
@@ -783,7 +785,9 @@ fn stage1_user_db_data_survives_checkpoint_and_recovery() {
         .open_database(
             None,
             "stage1_recovery_db",
-            &DatabaseConfig::new().with_allow_create(true),
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true),
         )
         .unwrap();
 
@@ -819,14 +823,18 @@ fn stage1_multiple_user_databases_survive_checkpoint_and_recovery() {
             .open_database(
                 None,
                 "stage1_db_a",
-                &DatabaseConfig::new().with_allow_create(true),
+                &DatabaseConfig::new()
+                    .with_allow_create(true)
+                    .with_transactional(true),
             )
             .unwrap();
         let db_b = env
             .open_database(
                 None,
                 "stage1_db_b",
-                &DatabaseConfig::new().with_allow_create(true),
+                &DatabaseConfig::new()
+                    .with_allow_create(true)
+                    .with_transactional(true),
             )
             .unwrap();
 
@@ -859,14 +867,18 @@ fn stage1_multiple_user_databases_survive_checkpoint_and_recovery() {
         .open_database(
             None,
             "stage1_db_a",
-            &DatabaseConfig::new().with_allow_create(true),
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true),
         )
         .unwrap();
     let rdb_b = env2
         .open_database(
             None,
             "stage1_db_b",
-            &DatabaseConfig::new().with_allow_create(true),
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true),
         )
         .unwrap();
 
@@ -914,7 +926,9 @@ fn stage1_checkpoint_stats_show_user_db_bins_flushed() {
         .open_database(
             None,
             "stage1_stats_db",
-            &DatabaseConfig::new().with_allow_create(true),
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true),
         )
         .unwrap();
 
@@ -992,7 +1006,9 @@ fn stage2_txn_manager_records_first_active_lsn() {
             .open_database(
                 None,
                 "stage2_lsn_db",
-                &DatabaseConfig::new().with_allow_create(true),
+                &DatabaseConfig::new()
+                    .with_allow_create(true)
+                    .with_transactional(true),
             )
             .unwrap();
 
@@ -1028,7 +1044,9 @@ fn stage2_txn_manager_records_first_active_lsn() {
         .open_database(
             None,
             "stage2_lsn_db",
-            &DatabaseConfig::new().with_allow_create(true),
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true),
         )
         .unwrap();
 
