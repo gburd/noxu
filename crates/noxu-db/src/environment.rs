@@ -990,6 +990,9 @@ impl Environment {
             run_evictor: Some(self.config.run_evictor),
             lock_timeout_ms: Some(self.config.lock_timeout_ms),
             txn_timeout_ms: Some(self.config.txn_timeout_ms),
+            cleaner_min_utilization: Some(
+                self.config.cleaner_min_utilization as u32,
+            ),
         })
     }
 
@@ -1033,6 +1036,17 @@ impl Environment {
             // original timeout.  Tracked under transaction-env F7
             // residual; pushing into running txns requires a TxnManager
             // API change beyond Wave 2C-4.
+        }
+        // DBI-10 / JE EnvConfigObserver: push the mutable cleaner
+        // minUtilization to the running cleaner (noxu.cleaner.minUtilization
+        // has mutable=true). Mirrors how JE's Cleaner re-reads
+        // CLEANER_MIN_UTILIZATION on envConfigUpdate.
+        if let Some(pct) = cfg.cleaner_min_utilization {
+            self.config.cleaner_min_utilization = pct.min(100) as u8;
+            let env_impl = self.env_impl.lock();
+            if let Some(cleaner) = env_impl.get_cleaner() {
+                cleaner.set_min_utilization(pct);
+            }
         }
         self.config.txn_no_sync = cfg.txn_no_sync;
         self.config.txn_write_no_sync = cfg.txn_write_no_sync;
@@ -2629,6 +2643,53 @@ mod tests {
         );
 
         drop(db);
+        env.close().unwrap();
+    }
+
+    /// DBI-10 / JE EnvConfigObserver + MemoryBudget.envConfigUpdate: a runtime
+    /// cache-size change must reach the live evictor Arbiter's max-memory.
+    #[test]
+    fn test_set_mutable_config_pushes_cache_size_to_arbiter() {
+        let (_tmp, config) = temp_env_config();
+        let mut env = Environment::open(config).unwrap();
+
+        let new_cache = 256 * 1024 * 1024_usize; // 256 MiB
+        let mc = EnvironmentMutableConfig::new().with_cache_size(new_cache);
+        env.set_mutable_config(mc).unwrap();
+
+        let arbiter_max = env.env_impl.lock().get_arbiter_max_memory();
+        assert_eq!(
+            arbiter_max, new_cache as i64,
+            "Arbiter max-memory must reflect the new cache size"
+        );
+        env.close().unwrap();
+    }
+
+    /// DBI-10 / JE EnvConfigObserver: a runtime cleaner minUtilization change
+    /// must reach the running cleaner (noxu.cleaner.minUtilization is
+    /// mutable). FAILS on main (no propagation); PASSES after the push.
+    #[test]
+    fn test_set_mutable_config_pushes_cleaner_min_utilization() {
+        let (_tmp, config) = temp_env_config();
+        let mut env = Environment::open(config).unwrap();
+
+        let cleaner = env
+            .env_impl
+            .lock()
+            .get_cleaner()
+            .expect("invariant: transactional env has a cleaner");
+        let before = cleaner.get_min_utilization();
+
+        let new_pct = if before == 70 { 40 } else { 70 };
+        let mc = EnvironmentMutableConfig::new()
+            .with_cleaner_min_utilization(new_pct);
+        env.set_mutable_config(mc).unwrap();
+
+        assert_eq!(
+            cleaner.get_min_utilization(),
+            new_pct,
+            "running cleaner must reflect the new minUtilization"
+        );
         env.close().unwrap();
     }
 }
