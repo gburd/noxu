@@ -185,14 +185,6 @@ pub struct ReplicatedEnvironment {
     /// are behind this node (peer-to-peer log distribution, HA style).
     peer_scanner: Arc<PeerLogScanner>,
 
-    /// Monotonic sequence used by `await_replica_acks` to assign unique
-    /// keys to in-flight commits awaiting replica acknowledgment.  In
-    /// production this should track the real master VLSN; until F11
-    /// closes the VLSN<->commit linkage, the coordinator uses a
-    /// synthetic sequence so that ack tracking is unique per commit.
-    /// See finding F1 in the 2026 review.
-    commit_ack_seq: std::sync::atomic::AtomicU64,
-
     /// Durable Transaction VLSN (D7, JE RepNode.dtvlsn): the highest VLSN
     /// known to have been replicated to a *majority* of the electable
     /// replicas. On a master it is computed from feeder ack/heartbeat progress
@@ -481,7 +473,6 @@ impl ReplicatedEnvironment {
             io_shutdown: AtomicBool::new(false),
             restore_registered: AtomicBool::new(restore_registered_init),
             peer_scanner,
-            commit_ack_seq: std::sync::atomic::AtomicU64::new(1),
             dtvlsn: std::sync::atomic::AtomicU64::new(0),
             election_state,
             self_weak: OnceLock::new(),
@@ -1467,7 +1458,32 @@ impl ReplicatedEnvironment {
                 .insert(replica_name.clone(), Arc::clone(&queue));
         }
 
-        let runner = Arc::new(FeederRunner::new(Arc::clone(&channel), 1));
+        // REP-9 Part 1: wire an ack sink so the FeederRunner forwards every
+        // inbound replica ack to `env.record_ack(vlsn, replica_name)`, which
+        // reaches BOTH the AckTracker (commit-blocking quorum) and the
+        // matching `Feeder::acked_vlsn` (DTVLSN ranking).  Without this the
+        // ack reached only the runner's private `known_replica_vlsn`.  The
+        // sink holds a `Weak<Self>` so it never extends the env's lifetime;
+        // if `self_weak` was never initialised we fall back to the plain
+        // (sink-less) runner — `record_ack` is still reachable from tests.
+        let runner = match self.self_weak.get().and_then(Weak::upgrade) {
+            Some(env_arc) => {
+                let weak = Arc::downgrade(&env_arc);
+                let sink: crate::stream::feeder::AckSink =
+                    Arc::new(move |name: &str, vlsn: u64| {
+                        if let Some(env) = weak.upgrade() {
+                            env.record_ack(vlsn, name);
+                        }
+                    });
+                Arc::new(FeederRunner::new_with_ack_sink(
+                    Arc::clone(&channel),
+                    1,
+                    replica_name.clone(),
+                    sink,
+                ))
+            }
+            None => Arc::new(FeederRunner::new(Arc::clone(&channel), 1)),
+        };
         let runner_clone = Arc::clone(&runner);
         let replica_clone = replica_name.clone();
 
@@ -2198,8 +2214,27 @@ impl ReplicatedEnvironment {
         if qualifies {
             self.ack_tracker.record_ack(vlsn, replica_name);
         }
+        // REP-9 Part 1: advance the matching `Feeder::acked_vlsn` high-water
+        // mark (read by `update_dtvlsn_from_feeders` and exposed via
+        // `get_acked_vlsn`).  The production `FeederRunner` previously updated
+        // only its private `known_replica_vlsn`, so the DTVLSN ranking never
+        // saw production progress (JE `Feeder.getReplicaTxnEndVLSN`).  We
+        // record the high-water for *any* replica (electable or not); the
+        // electable filter is reapplied when DTVLSN/quorum is computed.
+        for feeder in self.feeders.read().iter() {
+            if feeder.get_replica_name() == replica_name {
+                feeder.record_ack(vlsn);
+                break;
+            }
+        }
         // Recompute the DTVLSN from feeder progress whenever an ack lands.
         self.update_dtvlsn_from_feeders();
+        // REP-9: wake any committer parked in `await_replica_acks`. Its
+        // satisfaction predicate is the high-water feeder count, not an
+        // exact-VLSN registration, so we must notify unconditionally (the
+        // AckTracker's own `record_ack` only notifies when the exact VLSN was
+        // registered, which the per-frame feeder acks generally are not).
+        self.ack_tracker.notify_waiters();
     }
 
     /// Returns the current Durable Transaction VLSN (D7, JE RepNode.getDTVLSN).
@@ -2294,6 +2329,34 @@ impl ReplicatedEnvironment {
             }
         }
         // DTVLSN unchanged.
+    }
+
+    /// REP-9: count qualifying (electable) feeders whose acked high-water VLSN
+    /// is `>= commit_vlsn`.  This is the Rust equivalent of JE
+    /// `FeederManager.getNumCurrentAckFeeders(commitVLSN)` — the durability
+    /// quorum is satisfied when this count reaches the required ack count.
+    /// Only Electable replicas qualify (D6, JE
+    /// `DurabilityQuorum.replicaAcksQualify`).
+    fn count_ack_feeders_ge(&self, commit_vlsn: u64) -> u32 {
+        let group = self.get_rep_group();
+        let mut count = 0u32;
+        for feeder in self.feeders.read().iter() {
+            let qualifies = group
+                .get_node(&feeder.get_replica_name())
+                .map(|n| n.node_type == crate::node_type::NodeType::Electable)
+                .unwrap_or(false);
+            // A feeder counts only if it has acked a *real* VLSN at or above
+            // the commit VLSN.  `acked_vlsn == 0` is the NULL sentinel (no ack
+            // yet) and must never satisfy a commit, even when `commit_vlsn`
+            // itself is 0 (no replicated commit logged) — mirrors JE
+            // `getReplicaTxnEndVLSN()` returning NULL_VLSN for a fresh feeder,
+            // which is not `>=` any commit VLSN.
+            let acked = feeder.get_acked_vlsn();
+            if qualifies && acked > 0 && acked >= commit_vlsn {
+                count += 1;
+            }
+        }
+        count
     }
 
     /// Set the state change listener.
@@ -2651,35 +2714,57 @@ impl ReplicaAckCoordinator for ReplicatedEnvironment {
             return Ok(0);
         }
 
-        let commit_seq = self
-            .commit_ack_seq
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.ack_tracker.register(commit_seq, needed);
+        // REP-9 Part 2: the commit's VLSN is the key.  The master assigns a
+        // VLSN when it logs the TxnCommit (via the shared `wal_vlsn_counter`
+        // bumped in `EnvironmentImpl::log_txn_commit`), immediately before
+        // this gate runs.  The latest assigned VLSN therefore IS this
+        // commit's VLSN (the trait contract: "implementations are responsible
+        // for assigning the commit VLSN internally").  We wait until a quorum
+        // of qualifying electable replicas have acked a VLSN >= the commit
+        // VLSN — faithful to JE `FeederManager.getNumCurrentAckFeeders`, which
+        // counts feeders whose `getReplicaTxnEndVLSN() >= commitVLSN` (a
+        // high-water `>=` test, NOT an exact-VLSN match).
+        //
+        // ponytail: reads the global high-water VLSN, so a concurrent later
+        // commit can make this gate wait on a slightly higher VLSN than its
+        // own. That is strictly SAFE (waiting for >= a newer VLSN never
+        // returns early) and only marginally less precise; thread the
+        // per-txn VLSN through the trait if exact per-commit granularity is
+        // ever needed.
+        let commit_vlsn = self.wal_vlsn_counter.load(Ordering::Acquire);
 
-        // Block on the ack condvar until satisfied, the timeout elapses, or
-        // shutdown is signalled — no spin-poll (JE FeederTxns.TxnInfo uses a
-        // per-transaction CountDownLatch.await; the AckTracker condvar is the
-        // shared-mutex equivalent). record_ack notifies us as acks arrive.
-        let satisfied =
-            self.ack_tracker.wait_until_satisfied(commit_seq, timeout, || {
-                self.is_shutdown()
-            });
+        // Register on the AckTracker too: this is what `record_ack` notifies,
+        // so the condvar wakes us as acks land.  The satisfaction decision
+        // itself is the high-water feeder count below.
+        self.ack_tracker.register(commit_vlsn, needed);
+
+        // Block on the ack condvar until a quorum of electable feeders hold
+        // the commit VLSN, the timeout elapses, or shutdown is signalled — no
+        // spin-poll (JE FeederTxns.TxnInfo uses a per-transaction
+        // CountDownLatch.await; the AckTracker condvar is the shared-mutex
+        // equivalent). record_ack notifies us as acks arrive.
+        let satisfied = self.ack_tracker.wait_for_predicate(
+            timeout,
+            || self.count_ack_feeders_ge(commit_vlsn) >= needed,
+            || self.is_shutdown(),
+        );
         if satisfied {
-            self.ack_tracker.cleanup_through(commit_seq);
+            self.ack_tracker.cleanup_through(commit_vlsn);
             return Ok(needed);
         }
         if self.is_shutdown() {
-            self.ack_tracker.cleanup_through(commit_seq);
+            self.ack_tracker.cleanup_through(commit_vlsn);
             return Err(AckWaitError {
                 kind: AckWaitErrorKind::Shutdown,
                 needed,
                 received: 0,
             });
         }
-        // Timed out: tear down the registration and report the partial ack
-        // count so the caller can surface InsufficientReplicas.
-        let received = self.ack_tracker.received_count(commit_seq).unwrap_or(0);
-        self.ack_tracker.cleanup_through(commit_seq);
+        // Timed out: report the partial ack count (qualifying electable
+        // feeders holding the commit VLSN) so the caller can surface
+        // InsufficientReplicas.
+        let received = self.count_ack_feeders_ge(commit_vlsn);
+        self.ack_tracker.cleanup_through(commit_vlsn);
         Err(AckWaitError { kind: AckWaitErrorKind::Timeout, needed, received })
     }
 

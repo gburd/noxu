@@ -155,6 +155,53 @@ impl AckTracker {
         }
     }
 
+    /// REP-9: park on the ack-signal condvar until `predicate()` returns true,
+    /// `timeout` elapses, or `should_abort()` returns true. Returns true iff
+    /// `predicate` was satisfied. This is the high-water-mark equivalent of
+    /// `wait_until_satisfied` for callers that count acks themselves via the
+    /// per-replica high-water marks (JE
+    /// `FeederManager.getNumCurrentAckFeeders(commitVLSN)` counts feeders with
+    /// `getReplicaTxnEndVLSN() >= commitVLSN`, not an exact-VLSN match).
+    pub fn wait_for_predicate<P, A>(
+        &self,
+        timeout: Duration,
+        predicate: P,
+        should_abort: A,
+    ) -> bool
+    where
+        P: Fn() -> bool,
+        A: Fn() -> bool,
+    {
+        let deadline = Instant::now() + timeout;
+        // The condvar guards the pending-ack map; we only use it as a parking
+        // lot signalled by `record_ack`. Hold the lock across the wait so a
+        // notify cannot be missed between the predicate check and the park.
+        let mut guard = self.pending_acks.lock();
+        loop {
+            if predicate() {
+                return true;
+            }
+            if should_abort() {
+                return false;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return predicate();
+            }
+            let _ = self.ack_signal.wait_for(&mut guard, deadline - now);
+        }
+    }
+
+    /// REP-9: wake any committer parked in `wait_for_predicate` /
+    /// `wait_until_satisfied`.  Used by `env.record_ack` after it advances a
+    /// feeder high-water mark, because satisfaction is now decided by the
+    /// per-replica high-water count (not an exact-VLSN registration), so a
+    /// `record_ack` for a VLSN with no exact registration must still wake
+    /// waiters whose `commit_vlsn` predicate has just become true.
+    pub fn notify_waiters(&self) {
+        self.ack_signal.notify_all();
+    }
+
     /// Check if a VLSN has sufficient acks.
     pub fn is_satisfied(&self, vlsn: u64) -> bool {
         let pending = self.pending_acks.lock();

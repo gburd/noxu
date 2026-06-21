@@ -336,7 +336,20 @@ pub struct FeederRunner {
     /// the owning [`Feeder`] state struct, but also tracked here for quick
     /// access).
     known_replica_vlsn: Mutex<u64>,
+    /// REP-9: name of the replica this runner serves, and a sink that
+    /// forwards each inbound ack `(replica_name, acked_vlsn)` to the owning
+    /// environment's `record_ack`.  Without this, production acks reached
+    /// only the private `known_replica_vlsn` and never the `AckTracker`
+    /// (commit-blocking quorum) or `Feeder::acked_vlsn` (DTVLSN ranking).
+    /// Mirrors JE `FeederTxns.noteReplicaAck` being driven from the feeder
+    /// input loop.
+    replica_name: String,
+    ack_sink: Option<AckSink>,
 }
+
+/// REP-9: callback invoked by `FeederRunner::run` for each inbound ack,
+/// forwarding `(replica_name, acked_vlsn)` to `env.record_ack`.
+pub type AckSink = Arc<dyn Fn(&str, u64) + Send + Sync>;
 
 impl FeederRunner {
     /// Create a new `FeederRunner`.
@@ -345,7 +358,32 @@ impl FeederRunner {
     /// * `channel` - The channel to the replica.
     /// * `vlsn_start` - The VLSN from which to begin streaming.
     pub fn new(channel: Arc<dyn Channel>, vlsn_start: u64) -> Self {
-        Self { channel, vlsn_start, known_replica_vlsn: Mutex::new(0) }
+        Self {
+            channel,
+            vlsn_start,
+            known_replica_vlsn: Mutex::new(0),
+            replica_name: String::new(),
+            ack_sink: None,
+        }
+    }
+
+    /// REP-9: like [`Self::new`] but wires an ack sink so each inbound ack is
+    /// forwarded to the owning environment (`env.record_ack(vlsn, name)`),
+    /// bridging the production feeder path to the `AckTracker` and the
+    /// `Feeder::acked_vlsn` that the DTVLSN computation reads.
+    pub fn new_with_ack_sink(
+        channel: Arc<dyn Channel>,
+        vlsn_start: u64,
+        replica_name: String,
+        ack_sink: AckSink,
+    ) -> Self {
+        Self {
+            channel,
+            vlsn_start,
+            known_replica_vlsn: Mutex::new(0),
+            replica_name,
+            ack_sink: Some(ack_sink),
+        }
     }
 
     /// Return the last VLSN acknowledged by the replica.
@@ -385,9 +423,18 @@ impl FeederRunner {
                         let vlsn = u64::from_le_bytes(
                             ack_bytes[..8].try_into().unwrap(),
                         );
-                        let mut guard = self.known_replica_vlsn.lock();
-                        if vlsn > *guard {
-                            *guard = vlsn;
+                        {
+                            let mut guard = self.known_replica_vlsn.lock();
+                            if vlsn > *guard {
+                                *guard = vlsn;
+                            }
+                        }
+                        // REP-9 Part 1: forward the ack to the owning env so
+                        // it reaches the AckTracker (commit-blocking quorum)
+                        // AND Feeder::acked_vlsn (DTVLSN ranking). JE drives
+                        // FeederTxns.noteReplicaAck from this same loop.
+                        if let Some(sink) = &self.ack_sink {
+                            sink(&self.replica_name, vlsn);
                         }
                     }
                     // Continue without sleeping — more acks may be waiting.
