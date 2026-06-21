@@ -898,6 +898,50 @@ impl Checkpointer {
         self.next_checkpoint_id.load(Ordering::SeqCst)
     }
 
+    /// REC-G: seed the checkpoint-interval baselines from a recovered
+    /// checkpoint, so the FIRST post-recovery checkpoint interval is measured
+    /// from the recovered `CkptEnd` rather than from process start.
+    ///
+    /// Without this, `last_checkpoint_start`/`_end` start at `NULL_LSN` and
+    /// `bytes_since_checkpoint` at 0 after recovery, so the bytes/time gate
+    /// would treat all log written before the crash as "since the last
+    /// checkpoint" — firing a redundant checkpoint immediately, or (for the
+    /// time branch) measuring the interval from the wrong baseline.
+    ///
+    /// JE ref: `Checkpointer.initIntervals(lastCheckpointStart,
+    /// lastCheckpointEnd, lastCheckpointMillis)` — called from
+    /// `RecoveryManager.recover()` after the recovery scan completes.  Noxu
+    /// passes the recovered `checkpoint_start_lsn` / `checkpoint_end_lsn`
+    /// (NULL_LSN when the log had no prior checkpoint, matching JE).
+    pub fn init_intervals(
+        &self,
+        last_checkpoint_start: Lsn,
+        last_checkpoint_end: Lsn,
+    ) {
+        *self.last_checkpoint_start.lock() = last_checkpoint_start;
+        *self.last_checkpoint_end.lock() = last_checkpoint_end;
+        // A freshly-recovered environment has written nothing since the
+        // recovered checkpoint; reset the byte accumulator so the gate does
+        // not immediately fire on pre-crash log volume.
+        self.bytes_since_checkpoint.store(0, Ordering::Relaxed);
+    }
+
+    /// REC-H: continue the checkpoint-ID sequence after recovery instead of
+    /// restarting at 1.  The next checkpoint will use `last_checkpoint_id + 1`.
+    ///
+    /// The ID is a debug/log tag (not a correctness key), but it should not
+    /// regress or collide across restarts.  Seeded from the recovered
+    /// `CkptEnd.id`.
+    ///
+    /// JE ref: `Checkpointer.setCheckpointId(lastCheckpointId)` — "can only be
+    /// done after recovery"; JE stores `checkpointId = lastCheckpointId` and
+    /// `incrementProgress`/`generateCheckpointId` advances from there.  Noxu's
+    /// `do_checkpoint` does `fetch_add(1)`, so we seed `next_checkpoint_id =
+    /// last_checkpoint_id + 1` to make the next emitted ID strictly greater.
+    pub fn set_checkpoint_id(&self, last_checkpoint_id: u64) {
+        self.next_checkpoint_id.store(last_checkpoint_id + 1, Ordering::SeqCst);
+    }
+
     /// Flush all dirty BINs to the log (public, unit-result API).
     ///
     /// Calls the internal flush logic and discards the detailed `FlushResult`,
@@ -2084,6 +2128,89 @@ mod tests {
             cp.is_runnable(false),
             "REC-F: idle env with cleaner-pending files must be runnable \
              (JE wakeupAfterNoWrites / needCheckpointForCleanedFiles)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // REC-G: init_intervals seeds the interval baselines from a recovered
+    // checkpoint (JE Checkpointer.initIntervals).
+    // -----------------------------------------------------------------------
+
+    /// REC-G fail-pre/pass-post: after recovery the checkpointer's interval
+    /// baselines must equal the recovered CkptEnd LSNs, not NULL_LSN.
+    ///
+    /// Fail-pre: a freshly-constructed Checkpointer has
+    /// `last_checkpoint_start`/`_end` == NULL_LSN, so the first post-recovery
+    /// interval is measured from process start.  Pass-post: `init_intervals`
+    /// seeds them from the recovered CkptEnd.
+    ///
+    /// JE ref: `Checkpointer.initIntervals(lastCheckpointStart,
+    /// lastCheckpointEnd, lastCheckpointMillis)`.
+    #[test]
+    fn test_rec_g_init_intervals_seeds_baselines() {
+        let cp = Checkpointer::new(CheckpointConfig::default());
+        // Fail-pre baseline: fresh checkpointer starts at NULL_LSN.
+        assert_eq!(cp.get_last_checkpoint_start(), noxu_util::NULL_LSN);
+        assert_eq!(cp.get_last_checkpoint_end(), noxu_util::NULL_LSN);
+
+        // Simulate recovery surfacing a CkptEnd at (start=4:400, end=5:500).
+        let recovered_start = Lsn::new(4, 400);
+        let recovered_end = Lsn::new(5, 500);
+        // Pretend the env wrote some pre-crash bytes before recovery.
+        cp.note_bytes_for_test(9999);
+
+        cp.init_intervals(recovered_start, recovered_end);
+
+        assert_eq!(
+            cp.get_last_checkpoint_start(),
+            recovered_start,
+            "REC-G: baseline start must equal recovered CkptEnd start"
+        );
+        assert_eq!(
+            cp.get_last_checkpoint_end(),
+            recovered_end,
+            "REC-G: baseline end must equal recovered CkptEnd end"
+        );
+        // The byte accumulator is reset so pre-crash volume does not
+        // immediately trip the runnable gate.
+        assert!(
+            !cp.is_runnable(false),
+            "REC-G: byte accumulator must reset on init_intervals"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // REC-H: set_checkpoint_id continues the sequence after recovery
+    // (JE Checkpointer.setCheckpointId).
+    // -----------------------------------------------------------------------
+
+    /// REC-H fail-pre/pass-post: after recovery the next checkpoint ID must
+    /// continue from the recovered CkptEnd id, not restart at 1.
+    ///
+    /// Fail-pre: a fresh Checkpointer's first checkpoint id is 1, colliding
+    /// with pre-crash ids.  Pass-post: `set_checkpoint_id(recovered_id)` makes
+    /// the next emitted id `recovered_id + 1`.
+    ///
+    /// JE ref: `Checkpointer.setCheckpointId(lastCheckpointId)`.
+    #[test]
+    fn test_rec_h_set_checkpoint_id_continues_sequence() {
+        let cp = Checkpointer::new(CheckpointConfig::default());
+        // Fail-pre: a fresh checkpointer would issue id 1.
+        assert_eq!(cp.peek_next_checkpoint_id(), 1);
+
+        // Recovery found a CkptEnd with id 42.
+        cp.set_checkpoint_id(42);
+        assert_eq!(
+            cp.peek_next_checkpoint_id(),
+            43,
+            "REC-H: next checkpoint id must be recovered_id + 1"
+        );
+
+        // The next checkpoint must use 43, not 1.
+        let result = cp.do_checkpoint("post_recovery").unwrap();
+        assert_eq!(
+            result.checkpoint_id, 43,
+            "REC-H: post-recovery checkpoint id must continue the sequence"
         );
     }
 }

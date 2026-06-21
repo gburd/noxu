@@ -150,6 +150,24 @@ listed in [References](#references).
   `Checkpointer.wakeupAfterNoWrites` / `needCheckpointForCleanedFiles` →
   `FileSelector.isCheckpointNeeded`.  Cite `Checkpointer.java`
   `wakeupAfterNoWrites` / `isRunnable` and `FileSelector.isCheckpointNeeded`.
+- **REC-G: the checkpointer's interval baselines are now seeded from the
+  recovered `CkptEnd` after recovery instead of starting fresh.**  The new
+  `Checkpointer::init_intervals(last_checkpoint_start, last_checkpoint_end)`
+  is called from `EnvironmentImpl::new_with_config_inner` with the recovered
+  `RecoveryInfo::checkpoint_start_lsn` / `checkpoint_end_lsn`, so the FIRST
+  post-recovery checkpoint interval is measured from the recovered checkpoint
+  rather than from process start (and the byte accumulator is reset so
+  pre-crash log volume does not immediately trip the gate).  No-op when the
+  log had no prior checkpoint.  Cite `Checkpointer.initIntervals`.
+- **REC-H: the checkpoint-ID sequence now continues after recovery instead of
+  restarting at 1.**  The recovered `CkptEnd.id` is surfaced through the new
+  `RecoveryInfo::recovered_checkpoint_id` (captured in
+  `RecoveryManager::find_last_checkpoint` and re-confirmed in the analysis
+  pass), and `EnvironmentImpl` calls the new
+  `Checkpointer::set_checkpoint_id(recovered_id)` so the next checkpoint uses
+  `recovered_id + 1`.  The ID is a debug/log tag (not a correctness key) but
+  no longer regresses or collides across restarts.  Cite
+  `Checkpointer.setCheckpointId`.
 
 ## [6.1.0] - 2026-06-19
 

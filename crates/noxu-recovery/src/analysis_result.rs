@@ -172,6 +172,10 @@ pub struct AnalysisResult {
     /// (`NULL_LSN` if none found).
     pub checkpoint_end_lsn: Lsn,
 
+    /// REC-H: the ID of the last `CkptEnd` found during analysis (`None` if
+    /// none).  Used to continue the checkpoint-ID sequence after recovery.
+    pub last_checkpoint_id: Option<u64>,
+
     /// LSN of the first active transaction at the last checkpoint
     /// (`NULL_LSN` if no checkpoint).
     pub first_active_lsn: Lsn,
@@ -215,6 +219,7 @@ impl AnalysisResult {
             max_txn_id: 0,
             checkpoint_start_lsn: NULL_LSN,
             checkpoint_end_lsn: NULL_LSN,
+            last_checkpoint_id: None,
             first_active_lsn: NULL_LSN,
             use_root_lsn: NULL_LSN,
             recovered_db_names: hashbrown::HashMap::new(),

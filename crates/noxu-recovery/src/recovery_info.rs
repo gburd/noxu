@@ -40,6 +40,13 @@ pub struct RecoveryInfo {
     /// The checkpoint end record itself.
     pub checkpoint_end: Option<CheckpointEnd>,
 
+    /// REC-H: the ID of the recovered checkpoint (`CkptEnd.id`), used to
+    /// continue the checkpoint-ID sequence after recovery instead of
+    /// restarting at 1.  `None` when the log had no prior checkpoint.  The ID
+    /// is a debug/log tag, not a correctness key, but it should not regress or
+    /// collide across restarts.  JE: `Checkpointer.setCheckpointId`.
+    pub recovered_checkpoint_id: Option<u64>,
+
     /// ID sequence values recovered from checkpoint.
     pub use_max_node_id: u64,
     pub use_min_replicated_node_id: i64,
@@ -107,6 +114,7 @@ impl RecoveryInfo {
             use_root_lsn: NULL_LSN,
             partial_checkpoint_start_lsn: NULL_LSN,
             checkpoint_end: None,
+            recovered_checkpoint_id: None,
             use_max_node_id: 0,
             use_min_replicated_node_id: 0,
             use_max_db_id: 0,
