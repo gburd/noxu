@@ -16,6 +16,24 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Added (drift-guard / noxu-tree — T-1)
+
+- **T-1: conformance drift-guard for the runtime `BinStub`.**  `noxu-tree`
+  carried two parallel BIN implementations: the JE-transliterated `bin::Bin` /
+  `in_node::InNode` (faithful but only exercised by their own tests) and the
+  runtime `tree::BinStub` / `tree::InNodeStub` (the implementation that
+  actually runs).  The risk is silent DRIFT — TREE-F1 was exactly such a bug,
+  where the faithful `find_entry` had the `known_deleted` exact-match check
+  and the runtime stub did not.  A new property-based test
+  (`crates/noxu-tree/tests/bin_stub_conformance.rs`, 256 random cases per
+  property) pins the runtime `BinStub` to a compact, inline JE-faithful BIN
+  oracle on the key operations: `find_entry` (exact / indicate-duplicate /
+  insertion-point), the `known_deleted`-reads-as-absent semantics (the
+  TREE-F1 case), `compute_key_prefix` (with and without an excluded index,
+  faithful to JE `IN.computeKeyPrefix`'s `nEntries <= 1` guard), the split
+  index / split key, and slot ordering + per-slot LSN after insert.  The
+  stub agrees with the oracle on all properties.
+
 ### Fixed (disk-ordered cursor / cleaner — CLN-7)
 
 - **CLN-7: the cleaner can no longer delete a log file while a
