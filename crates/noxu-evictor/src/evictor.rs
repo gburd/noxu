@@ -771,6 +771,8 @@ impl Evictor {
     pub fn do_evict(&self, source: EvictionSource) -> EvictResult {
         if let Some(tree_arc) = self.current_tree() {
             let tree_clone = Arc::clone(&tree_arc);
+            // EV-13: a second handle for the detach-and-measure callback.
+            let tree_detach = Arc::clone(&tree_arc);
 
             // St-H2: one unified O(tree) walk per candidate instead of two.
             // The size discovered during the info walk is cached here and
@@ -791,11 +793,36 @@ impl Evictor {
                     sc.borrow_mut().insert(node_id, full.size);
                     Some(Box::new(full.info))
                 };
+            // EV-13: this is the DETACH-and-measure callback (JE
+            // `parent.detachNode(index, ...)` from `Evictor.evict`).  The
+            // evictor calls it only on a committed full eviction (the Evict
+            // decision, and the CLN-F2 clean strip-0 BIN path).  It detaches
+            // the node from its parent IN under the parent write latch,
+            // dropping the strong `Arc` so the node is freed for real, and
+            // returns the measured heap bytes reclaimed.
+            //
+            // Before EV-13 this only drained a cached size: the node was
+            // credited as freed but the parent still held the `Arc`, so the
+            // heap was never reclaimed and `cache_usage` drifted below
+            // reality (the evictor under-fired).
             let node_size_fn = move |node_id: u64| -> u64 {
-                // O(1): drain the size deposited by node_info_fn above.
-                // Falls back to 1024 only if node_info_fn did not run for
-                // this id (should not occur in normal operation).
-                sc.borrow_mut().remove(&node_id).unwrap_or(1024)
+                // Drain the cached size first so the RefCell never leaks the
+                // entry even when detach short-circuits.
+                let cached = sc.borrow_mut().remove(&node_id);
+                let freed = tree_detach
+                    .read()
+                    .ok()
+                    .map(|t| t.detach_node_by_id(node_id))
+                    .unwrap_or(0);
+                if freed > 0 {
+                    // Detached and freed for real — credit the measured size.
+                    freed
+                } else {
+                    // Not a detachable child (root / already gone / pinned).
+                    // Fall back to the cached size rather than over-crediting
+                    // a node we did not free; 1024 only if no walk ran.
+                    cached.unwrap_or(1024)
+                }
             };
             self.do_evict_with_callbacks(source, &node_info_fn, &node_size_fn)
         } else {
