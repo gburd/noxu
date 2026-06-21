@@ -58,10 +58,13 @@ pub use disk_ordered_cursor_impl::{
 pub use env_failure_reason::EnvironmentFailureReason;
 pub use env_state::EnvState;
 pub use environment_impl::EnvironmentImpl;
+// EV-15: re-export the evictor so noxu-db can cache an Arc<Evictor> for
+// per-write critical eviction without taking a direct noxu-evictor dependency.
 pub use error::{DbiError, Result};
 pub use get_mode::GetMode;
 pub use memory_budget::{MemoryBudget, MemoryBudgetStats, MemoryOverhead};
 pub use node_sequence::NodeSequence;
+pub use noxu_evictor::Evictor;
 pub use operation::Operation;
 pub use operation_status::OperationStatus;
 pub use put_mode::PutMode;

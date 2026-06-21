@@ -8,6 +8,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- **EV-15: writer threads now apply synchronous critical-eviction
+  back-pressure.** `Arbiter::need_critical_eviction` was test-only — in
+  production a writer filling the cache never blocked to evict, so the cache
+  could overshoot the budget unboundedly between the background daemon's
+  wakeups. Added `Evictor::do_critical_eviction` (JE
+  `Evictor.doCriticalEviction`, Evictor.java:2054) and
+  `EnvironmentImpl::critical_eviction` (JE `EnvironmentImpl.criticalEviction`,
+  EnvironmentImpl.java:3012); `Database::put` / `Database::delete` now call it
+  before the operation. When the cache is *critically* over budget the calling
+  writer thread itself evicts a bounded batch (capped by `max_batch_size` /
+  `still_needs_eviction`) and then proceeds even if still over budget —
+  matching JE's bounded critical eviction. The `eviction_pressure_test`
+  integration suite confirms the cache stays bounded.
+
 - **EV-6: an upper IN with cached (resident) children is no longer evicted.**
   Since EV-13 made full-node eviction actually detach the node from its
   parent, evicting an upper IN that still has resident children would orphan

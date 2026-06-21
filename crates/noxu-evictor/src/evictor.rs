@@ -1129,6 +1129,35 @@ impl Evictor {
         &self.arbiter
     }
 
+    /// EV-15: synchronous critical eviction, called from application (writer)
+    /// threads on the operation path to apply write back-pressure.
+    ///
+    /// JE `Evictor.doCriticalEviction` (Evictor.java:2054) is invoked from
+    /// `EnvironmentImpl.criticalEviction` for every cursor operation: when the
+    /// cache is *critically* over budget (`Arbiter.needCriticalEviction`), the
+    /// calling thread itself runs `doEvict(CRITICAL)` so a writer that is
+    /// filling the cache blocks to evict before continuing — preventing
+    /// unbounded overshoot between the background daemon's wakeups.
+    ///
+    /// Bounded like JE: a single `do_evict` batch runs (its inner loop is
+    /// already capped by `max_batch_size` and `still_needs_eviction`), then the
+    /// caller proceeds even if the cache is still over budget.  Returns the
+    /// number of bytes evicted (0 when no critical eviction was needed).
+    pub fn do_critical_eviction(&self) -> u64 {
+        if self.is_shutdown() {
+            return 0;
+        }
+        // JE doCriticalEviction guards on isOverBudget() then
+        // needCriticalEviction(); the daemon takes the burden whenever it can,
+        // so application threads only block when the overage is critical.
+        if self.arbiter.is_over_budget()
+            && self.arbiter.need_critical_eviction()
+        {
+            return self.do_evict(EvictionSource::Critical).bytes_evicted;
+        }
+        0
+    }
+
     /// Name of the primary eviction algorithm.
     pub fn primary_algorithm_name(&self) -> &'static str {
         self.primary_policy.name()
@@ -1686,6 +1715,139 @@ mod tests {
         let e = Evictor::new(arbiter, 100, false);
         assert_eq!(e.primary_algorithm_name(), "LRU");
         assert_eq!(e.scan_algorithm_name(), "LRU");
+    }
+
+    /// EV-15 (JE Evictor.doCriticalEviction, Evictor.java:2054): a writer
+    /// thread calling `do_critical_eviction` only evicts when the cache is
+    /// *critically* over budget (Arbiter.needCriticalEviction), and when it
+    /// does it drives a bounded synchronous evict that lowers usage.
+    #[test]
+    fn test_ev15_critical_eviction_bounded_and_gated() {
+        use noxu_util::Lsn;
+        use std::sync::{Arc, RwLock};
+
+        // Build a tree with several childless non-root upper INs that can be
+        // fully evicted (max_entries=2 => deep right-spine).
+        let tree_inner = noxu_tree::tree::Tree::new(7, 2);
+        for i in 0u16..16 {
+            tree_inner
+                .insert(
+                    i.to_be_bytes().to_vec(),
+                    vec![i as u8],
+                    Lsn::new(1, u32::from(i) + 1),
+                )
+                .unwrap();
+        }
+        // Detach every BIN so each upper IN directly above it becomes
+        // childless and hence EV-6-evictable; THEN collect those now-childless
+        // upper INs (intermediate INs still have a resident IN child and stay
+        // EV-6-protected, so we must register only the evictable leaves to
+        // keep the bounded batch deterministic).
+        fn collect_bins(
+            node: &Arc<noxu_tree::NodeRwLock<TreeNode>>,
+            bins: &mut Vec<u64>,
+        ) {
+            let g = node.read();
+            match &*g {
+                TreeNode::Bottom(b) => bins.push(b.node_id),
+                TreeNode::Internal(n) => {
+                    let cs: Vec<_> = n
+                        .entries
+                        .iter()
+                        .filter_map(|e| e.child.clone())
+                        .collect();
+                    drop(g);
+                    for c in cs {
+                        collect_bins(&c, bins);
+                    }
+                }
+            }
+        }
+        fn collect_childless_uins(
+            node: &Arc<noxu_tree::NodeRwLock<TreeNode>>,
+            is_root: bool,
+            uins: &mut Vec<u64>,
+        ) {
+            let g = node.read();
+            let TreeNode::Internal(n) = &*g else {
+                return;
+            };
+            if !is_root && n.entries.iter().all(|e| e.child.is_none()) {
+                uins.push(n.node_id);
+            }
+            let children: Vec<_> =
+                n.entries.iter().filter_map(|e| e.child.clone()).collect();
+            drop(g);
+            for c in children {
+                collect_childless_uins(&c, false, uins);
+            }
+        }
+
+        let tree_arc = Arc::new(RwLock::new(tree_inner));
+        let bins = {
+            let t = tree_arc.read().unwrap();
+            let root = t.get_root().expect("root");
+            let mut bins = Vec::new();
+            collect_bins(&root, &mut bins);
+            bins
+        };
+        {
+            let t = tree_arc.read().unwrap();
+            for bin_id in &bins {
+                t.detach_node_by_id(*bin_id);
+            }
+        }
+        let uins = {
+            let t = tree_arc.read().unwrap();
+            let root = t.get_root().expect("root");
+            let mut uins = Vec::new();
+            collect_childless_uins(&root, true, &mut uins);
+            uins
+        };
+        assert!(!uins.is_empty(), "fixture: need childless upper INs to evict");
+
+        let usage = Arc::new(AtomicI64::new(0));
+        // max=1000, critical_threshold=200: critical when usage-max > 200.
+        let evictor = Evictor::new(
+            Arbiter::new(1000, Arc::clone(&usage), 100, 200),
+            4, // small batch => bounded eviction
+            true,
+        )
+        .with_tree(tree_arc, 7);
+        for in_id in &uins {
+            evictor.note_ins_added(*in_id, CacheMode::Default);
+        }
+
+        // Not over budget => no critical eviction.
+        usage.store(500, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            evictor.do_critical_eviction(),
+            0,
+            "EV-15: under budget must not evict"
+        );
+
+        // Over budget but NOT critical (1100-1000=100 <= 200) => still no
+        // synchronous eviction (the daemon takes the burden).
+        usage.store(1100, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            evictor.do_critical_eviction(),
+            0,
+            "EV-15: non-critical overage defers to the daemon"
+        );
+
+        // Critically over budget (10000-1000=9000 > 200) => the calling
+        // thread evicts a bounded batch itself, lowering usage.
+        usage.store(10_000, std::sync::atomic::Ordering::Relaxed);
+        let before = usage.load(std::sync::atomic::Ordering::Relaxed);
+        let freed = evictor.do_critical_eviction();
+        let after = usage.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            freed > 0,
+            "EV-15: critical pressure must drive synchronous eviction"
+        );
+        assert!(after < before, "EV-15: usage must drop after eviction");
+        // Bounded: at most max_batch_size (4) nodes per call, so usage does
+        // not have to fall under budget in one shot — the writer proceeds.
     }
 
     #[test]
