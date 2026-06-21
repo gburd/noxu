@@ -62,5 +62,5 @@ pub use packed_offsets::PackedOffsets;
 pub use throttle::CleanerThrottle;
 pub use tracked_file_summary::TrackedFileSummary;
 pub use utilization_profile::UtilizationProfile;
-pub use utilization_tracker::UtilizationTracker;
+pub use utilization_tracker::{ObsoleteKind, UtilizationTracker};
 pub use utilization_tracker_observer::UtilizationTrackerObserver;

@@ -50,7 +50,7 @@ use crate::file_manager::FileManager;
 use crate::fsync_manager::FsyncManager;
 use crate::log_buffer_pool::LogBufferPool;
 use crate::provisional::Provisional;
-use crate::write_observer::LogWriteObserver;
+use crate::write_observer::{LogWriteObserver, ObsoleteKind, ObsoleteLsn};
 use noxu_sync::Mutex;
 use noxu_util::lsn::{Lsn, NULL_LSN};
 use std::sync::Arc;
@@ -259,13 +259,55 @@ impl LogManager {
         fsync_required: bool,
         old_lsn: Option<Lsn>,
     ) -> Result<Lsn> {
+        // Legacy shim: treat as an exact, db-unknown obsolete of the same
+        // node kind as the entry being written.
+        let old = old_lsn.map(|lsn| ObsoleteLsn {
+            lsn,
+            db_id: None,
+            size: 0,
+            is_ln: entry_type.is_ln_type(),
+            kind: ObsoleteKind::Exact,
+        });
         self.log_internal(
             entry_type,
             payload,
             provisional,
             flush_required,
             fsync_required,
-            old_lsn,
+            old,
+            None,
+            None,
+        )
+    }
+
+    /// Logs an entry with full utilization-tracking metadata.
+    ///
+    /// This is the JE-faithful write path: the caller supplies the owning DB
+    /// id for the new entry (CLN-9 per-DB axis) and an optional
+    /// [`ObsoleteLsn`] describing the superseded version, including which
+    /// `countObsolete*` variant to apply (CLN-10).
+    ///
+    /// Cite: `LogManager.serialLogWork` -> `UtilizationTracker.countNewLogEntry`
+    /// plus `countObsoleteNode` / `countObsoleteNodeInexact` /
+    /// `countObsoleteNodeDupsAllowed`.
+    pub fn log_tracked(
+        &self,
+        entry_type: LogEntryType,
+        payload: &[u8],
+        provisional: Provisional,
+        flush_required: bool,
+        fsync_required: bool,
+        new_db_id: Option<u32>,
+        old_obsolete: Option<ObsoleteLsn>,
+    ) -> Result<Lsn> {
+        self.log_internal(
+            entry_type,
+            payload,
+            provisional,
+            flush_required,
+            fsync_required,
+            old_obsolete,
+            new_db_id,
             None,
         )
     }
@@ -307,6 +349,7 @@ impl LogManager {
             fsync_required,
             None,
             None,
+            None,
         )
     }
 
@@ -337,6 +380,7 @@ impl LogManager {
             flush_required,
             fsync_required,
             None,
+            None,
             Some(vlsn),
         )
     }
@@ -348,7 +392,8 @@ impl LogManager {
         provisional: Provisional,
         flush_required: bool,
         fsync_required: bool,
-        old_lsn: Option<Lsn>,
+        old_obsolete: Option<ObsoleteLsn>,
+        new_db_id: Option<u32>,
         opt_vlsn: Option<u64>,
     ) -> Result<Lsn> {
         // C-2: refuse all writes once a prior I/O error has invalidated the log.
@@ -473,16 +518,12 @@ impl LogManager {
             // Utilization tracking — called under the LWL, matching the
             // serialLogWork() tracker calls.
             if let Some(obs) = &self.write_observer {
-                // Mark old version obsolete (the: countObsoleteNode).
-                if let Some(old) = old_lsn
-                    && !old.is_null()
+                // Mark old version obsolete (the: countObsoleteNode /
+                // Inexact / DupsAllowed, depending on the caller).
+                if let Some(old) = old_obsolete
+                    && !old.lsn.is_null()
                 {
-                    obs.count_obsolete(
-                        old.file_number(),
-                        old.file_offset(),
-                        0, // size unknown at this point
-                        entry_type.is_ln_type(),
-                    );
+                    obs.count_obsolete(old);
                 }
                 // Count the new entry (the: countNewLogEntry).
                 obs.count_new_entry(
@@ -491,6 +532,7 @@ impl LogManager {
                     entry_size as u32,
                     entry_type.is_ln_type(),
                     entry_type.is_in_type(),
+                    new_db_id,
                 );
             }
 

@@ -105,3 +105,4 @@ pub use log_manager::{LogManager, LogManagerStats};
 pub use loggable::Loggable;
 pub use provisional::Provisional;
 pub use write_observer::LogWriteObserver;
+pub use write_observer::{ObsoleteKind, ObsoleteLsn};
