@@ -1182,16 +1182,32 @@ impl Checkpointer {
                 .unwrap_or_else(|e| e.into_inner());
             levels.clear();
             for (db_id, tree_arc) in &trees_to_flush {
-                let max_level = tree_arc
-                    .read()
-                    .ok()
-                    .and_then(|guard| {
-                        let dirty_ins = guard.collect_dirty_upper_ins(*db_id);
-                        dirty_ins.iter().map(|(lvl, _)| *lvl).max()
-                    })
-                    .unwrap_or(0);
-                if max_level > 0 {
-                    levels.insert(*db_id, max_level);
+                // REC-AA: the recorded highest flush level is
+                // `max(dirty-upper-IN-level) + 1`, bounded by the root level
+                // — JE DirtyINMap.updateFlushLevels flushes at least one level
+                // ABOVE the highest dirty node (`(ckptFlushExtraLevel || isBIN)
+                // && !isRoot` → `level += 1`) so the lower level is logged
+                // provisionally and recovery skips reprocessing it.  The `+1`
+                // is bounded by the root level (`!isRoot` guard) so we never
+                // claim to flush above the tree root — a node AT the root level
+                // is the non-provisional anchor and must NOT itself be marked
+                // coverable.
+                let flush_level = tree_arc.read().ok().and_then(|guard| {
+                    let dirty_ins = guard.collect_dirty_upper_ins(*db_id);
+                    let max_dirty =
+                        dirty_ins.iter().map(|(lvl, _)| *lvl).max()?;
+                    // Root level bounds the +1.  The root is the
+                    // highest-level resident node.
+                    let root_level = guard
+                        .get_root()
+                        .map(|r| r.read().level())
+                        .unwrap_or(max_dirty);
+                    Some((max_dirty + 1).min(root_level))
+                });
+                if let Some(level) = flush_level
+                    && level > 0
+                {
+                    levels.insert(*db_id, level);
                 }
             }
         }
@@ -2220,5 +2236,105 @@ mod tests {
             result.checkpoint_id, 43,
             "REC-H: post-recovery checkpoint id must continue the sequence"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // REC-AA: the highest-flush-level is max(dirty-upper-IN-level) + 1,
+    // bounded by the root level (JE DirtyINMap.updateFlushLevels).
+    // -----------------------------------------------------------------------
+
+    /// REC-AA fail-pre/pass-post: the per-tree highest flush level recorded
+    /// for eviction coordination must be `max(dirty-upper-IN-level) + 1`
+    /// (bounded by the root level), so a BIN evicted during the checkpoint is
+    /// logged `Provisional::Yes` (covered by a non-provisional ancestor).
+    ///
+    /// Fail-pre: before REC-AA `collect_dirty_upper_ins` returned a
+    /// root-relative depth (root=0) instead of the node's tree level, so the
+    /// flush-levels map held tiny depths (1, 2) while the evictor compared the
+    /// BIN's real `BIN_LEVEL` (`MAIN_LEVEL|1`); `BIN_LEVEL < 2` is always false
+    /// → every BIN was logged `Provisional::No`, and the JE `+1` adjustment
+    /// was absent entirely.
+    ///
+    /// Pass-post: levels are real tree levels, the recorded flush level is
+    /// `max_dirty_upper_in_level + 1` bounded by the root, and a BIN at
+    /// `BIN_LEVEL` gets `Provisional::Yes`.
+    ///
+    /// JE ref: `DirtyINMap.updateFlushLevels` (`(ckptFlushExtraLevel || isBIN)
+    /// && !isRoot` → `level += 1`) / `Checkpointer.flushDirtyNodes`.
+    #[test]
+    fn test_rec_aa_flush_level_is_max_dirty_plus_one() {
+        use noxu_log::FileManager;
+        use noxu_tree::tree::{BIN_LEVEL, Tree};
+        use noxu_util::lsn::Lsn;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let fm = Arc::new(
+            FileManager::new(dir.path(), false, 64 * 1024 * 1024, 100).unwrap(),
+        );
+        let lm =
+            Arc::new(LogManager::new(Arc::clone(&fm), 3, 1024 * 1024, 65536));
+
+        // Fanout 4 + 20 inserts forces root splits → a 3-level tree
+        // (root at MAIN_LEVEL|3, upper INs at |2, BINs at BIN_LEVEL=|1), with
+        // dirty upper INs from the splits.
+        let tree = Tree::new(1, 4);
+        for i in 0u32..20 {
+            let key = format!("key{:04}", i).into_bytes();
+            let data = format!("data{}", i).into_bytes();
+            tree.insert(key, data, Lsn::new(1, 100 + i)).unwrap();
+        }
+        let root_level = tree.get_root().unwrap().read().level();
+        let dirty_uppers = tree.collect_dirty_upper_ins(1);
+        assert!(
+            !dirty_uppers.is_empty(),
+            "precondition: the split tree must have dirty upper INs"
+        );
+        let max_dirty = dirty_uppers.iter().map(|(l, _)| *l).max().unwrap();
+        // Levels must be real tree levels, not depths (REC-AA fail-pre would
+        // have tiny depths here).
+        assert!(
+            max_dirty >= (noxu_tree::MAIN_LEVEL | 2),
+            "upper-IN levels must be real tree levels (>= MAIN_LEVEL|2), got {max_dirty}"
+        );
+
+        let tree_arc = Arc::new(RwLock::new(tree));
+        let cp = Checkpointer::new(CheckpointConfig::default())
+            .with_log_manager(Arc::clone(&lm))
+            .with_tree(Arc::clone(&tree_arc), 1);
+
+        // Mark a checkpoint in progress and run the upper-IN flush, which
+        // populates checkpoint_flush_levels with the REC-AA value.
+        cp.checkpoint_in_progress.store(true, Ordering::Release);
+        cp.flush_upper_ins_internal().unwrap();
+
+        let recorded = cp
+            .checkpoint_flush_levels
+            .lock()
+            .unwrap()
+            .get(&1u64)
+            .copied()
+            .expect("db 1 must have a recorded flush level");
+
+        let expected = (max_dirty + 1).min(root_level);
+        assert_eq!(
+            recorded, expected,
+            "REC-AA: flush level must be max(dirty-upper-IN-level)+1 bounded by root"
+        );
+
+        // A BIN at BIN_LEVEL must be covered (Provisional::Yes): the recorded
+        // flush level is strictly above it.
+        assert!(
+            BIN_LEVEL < recorded,
+            "BIN_LEVEL ({BIN_LEVEL}) must be < recorded flush level ({recorded})"
+        );
+        assert_eq!(
+            cp.get_eviction_provisional(1, BIN_LEVEL),
+            Provisional::Yes,
+            "REC-AA: a BIN below the flush level must be Provisional::Yes"
+        );
+
+        cp.checkpoint_in_progress.store(false, Ordering::Release);
+        cp.checkpoint_flush_levels.lock().unwrap().clear();
     }
 }

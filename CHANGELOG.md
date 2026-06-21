@@ -185,6 +185,25 @@ listed in [References](#references).
   not a mapping-tree MapLN flush.  MapLN persistence proper is the cleaner
   workstream's concern and was deliberately NOT implemented here.
 
+### Fixed (recovery/tree/eviction — highest-flush-level: REC-AA)
+
+- **REC-AA: the per-tree highest-flush-level used for eviction–checkpoint
+  coordination now uses real tree levels and the JE `+1` adjustment, so a BIN
+  evicted during a checkpoint is correctly logged provisionally.**  Two bugs
+  were compounded: `Tree::collect_dirty_upper_ins` returned a root-relative
+  *depth* (root = 0) instead of the node's real tree level, so the
+  checkpointer's flush-levels map held tiny depths (1, 2) while the evictor
+  compared a BIN's real `BIN_LEVEL` (`MAIN_LEVEL|1`) — `BIN_LEVEL < 2` is
+  always false, so eviction-provisional NEVER fired for real BINs; and the JE
+  `+1` (flush one level ABOVE the bottom BIN so BINs are provisional) was
+  absent.  `collect_dirty_upper_ins` now returns the node's actual `level`
+  (fixing an inverted provisional/non-provisional boundary in the upper-IN
+  flush too — the root is now the max level, logged `Provisional::No`), and
+  the checkpointer records `max(dirty-upper-IN-level) + 1` bounded by the root
+  level.  Coordinates with the CC-4 per-tree eviction-provisional logic
+  (`get_eviction_provisional`).  Cite `DirtyINMap.updateFlushLevels` /
+  `Checkpointer.flushDirtyNodes`.
+
 ## [6.1.0] - 2026-06-19
 
 ### Fixed (evictor — CLN-F2 regression)
