@@ -1736,6 +1736,19 @@ impl EnvironmentImpl {
         self.cleaner.as_ref().map(|c| Arc::clone(&c.throttle))
     }
 
+    /// Returns the cleaner's shared `FileProtector`, if a cleaner exists.
+    ///
+    /// A `DiskOrderedCursor` producer uses this to protect the log files it
+    /// scans from being deleted by the cleaner mid-scan (CLN-7).  Faithful to
+    /// JE `DiskOrderedScanner.scan` calling
+    /// `env.getFileProtector().protectActiveFiles(...)`
+    /// (DiskOrderedScanner.java:704) before walking the log.
+    pub fn get_file_protector(
+        &self,
+    ) -> Option<Arc<noxu_cleaner::FileProtector>> {
+        self.cleaner.as_ref().map(|c| Arc::clone(c.get_file_protector()))
+    }
+
     /// Returns the checkpointer, if one was created.
     ///
     /// Returns `None` for read-only environments.

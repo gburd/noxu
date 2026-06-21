@@ -130,7 +130,11 @@ pub struct Cleaner {
     file_selector: Arc<Mutex<FileSelector>>,
 
     /// File protector for preventing deletion of files in use.
-    file_protector: FileProtector,
+    ///
+    /// `Arc` so other subsystems (e.g. a `DiskOrderedCursor` producer) can
+    /// share the SAME protector instance the cleaner consults before
+    /// deleting a file — see [`Cleaner::file_protector`].
+    file_protector: Arc<FileProtector>,
 
     /// Cleaner statistics.
     stats: Arc<CleanerStats>,
@@ -312,7 +316,7 @@ impl Cleaner {
     ) -> Self {
         Self {
             file_selector: Arc::new(Mutex::new(FileSelector::new())),
-            file_protector: FileProtector::new(),
+            file_protector: Arc::new(FileProtector::new()),
             stats: Arc::new(CleanerStats::new()),
             running: AtomicBool::new(false),
             shutdown: Arc::new(AtomicBool::new(false)),
@@ -355,7 +359,7 @@ impl Cleaner {
     ) -> Self {
         Self {
             file_selector: Arc::new(Mutex::new(FileSelector::new())),
-            file_protector: FileProtector::new(),
+            file_protector: Arc::new(FileProtector::new()),
             stats: Arc::new(CleanerStats::new()),
             running: AtomicBool::new(false),
             shutdown: Arc::new(AtomicBool::new(false)),
@@ -408,7 +412,7 @@ impl Cleaner {
     ) -> Self {
         Self {
             file_selector: Arc::new(Mutex::new(FileSelector::new())),
-            file_protector: FileProtector::new(),
+            file_protector: Arc::new(FileProtector::new()),
             stats: Arc::new(CleanerStats::new()),
             running: AtomicBool::new(false),
             shutdown: Arc::new(AtomicBool::new(false)),
@@ -456,7 +460,7 @@ impl Cleaner {
     ) -> Self {
         Self {
             file_selector: Arc::new(Mutex::new(FileSelector::new())),
-            file_protector: FileProtector::new(),
+            file_protector: Arc::new(FileProtector::new()),
             stats: Arc::new(CleanerStats::new()),
             running: AtomicBool::new(false),
             shutdown: Arc::new(AtomicBool::new(false)),
@@ -1473,8 +1477,12 @@ impl Cleaner {
         deleted
     }
 
-    /// Returns a reference to the file protector.
-    pub fn get_file_protector(&self) -> &FileProtector {
+    /// Returns a reference to the shared file protector `Arc`.
+    ///
+    /// Shared so other subsystems (e.g. the `DiskOrderedCursor` producer)
+    /// can protect the files they scan via the same instance the cleaner
+    /// consults before deletion.
+    pub fn get_file_protector(&self) -> &Arc<FileProtector> {
         &self.file_protector
     }
 

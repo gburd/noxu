@@ -16,6 +16,26 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Fixed (disk-ordered cursor / cleaner — CLN-7)
+
+- **CLN-7: the cleaner can no longer delete a log file while a
+  `DiskOrderedCursor` is scanning it.**  Previously the disk-ordered-scan
+  (DOS) producer walked the log files in ascending order with NO file
+  protection, so a concurrent cleaner could delete a file mid-scan —
+  `LogFileNotFound` / torn read.  The producer now snapshots the file-number
+  set it will scan and calls `FileProtector::protect_file(f,
+  "DiskOrderedCursor")` for each before walking, releasing protection on
+  every exit path (normal completion, cancel, shutdown, or panic) via an
+  RAII guard.  The cleaner already skips `is_protected` files
+  (`cleaner.rs` ~1340/1460), so the protected files are now safe for the
+  scan's duration.  Faithful to JE `DiskOrderedScanner.scan`
+  (`DiskOrderedScanner.java`:704/718) calling
+  `env.getFileProtector().protectActiveFiles(...)` before the walk and
+  `removeFileProtection(...)` in a `finally`.  The cleaner's `FileProtector`
+  is now an `Arc` shared through the env (`get_file_protector()`) and cached
+  on `Database`, then threaded into the DOS producer (internal API; non-
+  breaking).
+
 ### Fixed (recovery / log integrity — L-14)
 
 - **L-14: refuse to silently truncate the log when a committed transaction

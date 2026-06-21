@@ -47,6 +47,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use bytes::Bytes;
+use noxu_cleaner::FileProtector;
 use noxu_log::LogManager;
 use noxu_recovery::{LnOperation, LogEntry, LogScanner, PositionedEntry};
 
@@ -183,6 +184,7 @@ impl DiskOrderedCursorImpl {
         log_manager: Option<Arc<LogManager>>,
         target_db_ids: Vec<DatabaseId>,
         opts: DiskOrderedCursorOptions,
+        file_protector: Option<Arc<FileProtector>>,
     ) -> Result<Self> {
         let queue_size = opts.queue_size.max(1);
         let (tx, rx) = mpsc::sync_channel::<DocItem>(queue_size);
@@ -200,7 +202,15 @@ impl DiskOrderedCursorImpl {
                     .name("noxu-disk-ordered-cursor".to_string());
                 let h = builder
                     .spawn(move || {
-                        produce(lm, target, opts_p, tx_p, cancel_p, budget_p)
+                        produce(
+                            lm,
+                            target,
+                            opts_p,
+                            tx_p,
+                            cancel_p,
+                            budget_p,
+                            file_protector,
+                        )
                     })
                     .map_err(|e| {
                         DbiError::OperationFailed(format!(
@@ -317,6 +327,36 @@ fn clone_dbi_err(e: &DbiError) -> DbiError {
     }
 }
 
+/// RAII guard that protects a snapshot of log files from cleaner deletion
+/// for the duration of a disk-ordered scan, releasing protection on drop
+/// (normal exit, early return, cancel, or panic).
+///
+/// Faithful to JE `DiskOrderedScanner.scan`
+/// (DiskOrderedScanner.java:704/718): `protectActiveFiles(...)` before the
+/// walk and `removeFileProtection(...)` in a `finally`.
+struct DosFileProtectionGuard {
+    protector: Arc<FileProtector>,
+    files: Vec<u32>,
+}
+
+impl DosFileProtectionGuard {
+    /// Protect `files` via `protector`. Returns the guard (drop releases).
+    fn protect(protector: Arc<FileProtector>, files: Vec<u32>) -> Self {
+        for &f in &files {
+            protector.protect_file(f, "DiskOrderedCursor");
+        }
+        Self { protector, files }
+    }
+}
+
+impl Drop for DosFileProtectionGuard {
+    fn drop(&mut self) {
+        for &f in &self.files {
+            self.protector.unprotect_file(f);
+        }
+    }
+}
+
 /// Producer thread body.
 ///
 /// Walks every log file in ascending order, scans entries via
@@ -329,6 +369,7 @@ fn produce(
     tx: SyncSender<DocItem>,
     cancel: Arc<AtomicBool>,
     budget: Arc<MemoryBudget>,
+    file_protector: Option<Arc<FileProtector>>,
 ) {
     let target_set: HashSet<u64> =
         target_db_ids.iter().map(|d| d.as_i64() as u64).collect();
@@ -344,6 +385,15 @@ fn produce(
             return;
         }
     };
+
+    // CLN-7 [#DiskOrderedScanner.java:704]: snapshot the file-number set we
+    // will scan and PROTECT every one from cleaner deletion before walking.
+    // The cleaner's delete path checks `is_protected` (cleaner.rs ~1340/1460)
+    // and skips protected files, so this prevents a LogFileNotFound / torn
+    // read when the cleaner runs concurrently. The guard releases protection
+    // on every exit path (return / cancel / shutdown / panic).
+    let _protection_guard = file_protector
+        .map(|p| DosFileProtectionGuard::protect(p, file_nums.clone()));
 
     let mut dedup: Option<HashSet<Vec<u8>>> =
         opts.dedup_keys.then(HashSet::new);
@@ -421,6 +471,7 @@ mod tests {
             None,
             vec![DatabaseId::new(1)],
             DiskOrderedCursorOptions::default(),
+            None,
         )
         .unwrap();
         assert_eq!(doc.next_entry().unwrap(), None);
@@ -434,6 +485,7 @@ mod tests {
             None,
             vec![DatabaseId::new(1)],
             DiskOrderedCursorOptions::default(),
+            None,
         )
         .unwrap();
         doc.shutdown();
@@ -480,5 +532,91 @@ mod tests {
         drop(_g);
         let res = h.join().unwrap();
         assert!(!res, "reserve should return false when cancel fires");
+    }
+
+    // ------------------------------------------------------------------
+    // CLN-7: the DOS producer protects the files it scans from cleaner
+    // deletion, releasing protection on every exit path (RAII).
+    // Faithful to JE DiskOrderedScanner.scan (DiskOrderedScanner.java:704/718).
+    // ------------------------------------------------------------------
+
+    /// The guard protects every file on construction and unprotects every
+    /// file on drop — mid-scan the files are `is_protected`, so the cleaner
+    /// (which checks `is_protected`) skips them.
+    ///
+    /// FAILS pre-fix: without the guard, is_protected is false during the
+    /// scan and the cleaner could delete the file out from under the scan.
+    #[test]
+    fn test_cln7_dos_guard_protects_then_releases() {
+        let protector = Arc::new(FileProtector::new());
+        let files = vec![0u32, 1, 2];
+
+        // Before: nothing protected.
+        for &f in &files {
+            assert!(!protector.is_protected(f));
+        }
+
+        {
+            let _guard = DosFileProtectionGuard::protect(
+                Arc::clone(&protector),
+                files.clone(),
+            );
+            // Mid-scan: every file the producer will scan is protected, so
+            // the cleaner's is_protected check skips them.
+            for &f in &files {
+                assert!(
+                    protector.is_protected(f),
+                    "CLN-7: file {f} must be protected during the scan"
+                );
+            }
+        }
+
+        // After the guard drops (scan complete / cancel / panic): released.
+        for &f in &files {
+            assert!(
+                !protector.is_protected(f),
+                "CLN-7: file {f} must be unprotected after the scan"
+            );
+        }
+    }
+
+    /// Protection is released even on an early return / panic in the scan
+    /// body, because Drop runs unconditionally.
+    #[test]
+    fn test_cln7_dos_guard_releases_on_panic() {
+        let protector = Arc::new(FileProtector::new());
+        let p2 = Arc::clone(&protector);
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let _guard = DosFileProtectionGuard::protect(p2, vec![5u32]);
+                panic!("simulated producer panic mid-scan");
+            }));
+        assert!(result.is_err(), "the closure should have panicked");
+        assert!(
+            !protector.is_protected(5),
+            "CLN-7: protection must be released even on panic"
+        );
+    }
+
+    /// Nested protection (cleaner already holds a protection on the same
+    /// file) is reference-counted: the DOS guard only removes its own level,
+    /// so a file the cleaner is also using stays protected.
+    #[test]
+    fn test_cln7_dos_guard_refcounts_with_cleaner() {
+        let protector = Arc::new(FileProtector::new());
+        // Cleaner protects file 7 for its own processing.
+        protector.protect_file(7, "CleanerProcessing");
+        assert_eq!(protector.get_protection_count(7), 1);
+
+        {
+            let _guard = DosFileProtectionGuard::protect(
+                Arc::clone(&protector),
+                vec![7u32],
+            );
+            assert_eq!(protector.get_protection_count(7), 2);
+        }
+        // DOS guard released its level; cleaner's protection remains.
+        assert_eq!(protector.get_protection_count(7), 1);
+        assert!(protector.is_protected(7));
     }
 }

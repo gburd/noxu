@@ -325,6 +325,7 @@ impl Database {
                     || config.count_only,
                 dedup_keys: config.dedup_keys,
             },
+            self.cached_file_protector(),
         )?;
         // Validate the database is open and reserve the dbs binding to
         // satisfy the borrow checker (forces &self to live for 'env).
@@ -402,6 +403,7 @@ pub fn open_disk_ordered_cursor_multi<'env>(
                 || config.count_only,
             dedup_keys: config.dedup_keys,
         },
+        databases[0].cached_file_protector(),
     )?;
 
     Ok(DiskOrderedCursor::from_impl(inner))
