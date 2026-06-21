@@ -62,6 +62,47 @@ listed in [References](#references).
   is wired from `EnvironmentConfig` through `DbiConfig` into the scanner.
   New internal API: `NoxuLogError::FoundCommittedTxn` and
   `EnvironmentFailureReason::FoundCommittedTxn` (non-breaking adds).
+### Fixed (replication — REP-9: ack-durability quorum wiring)
+
+- **REP-9 (HIGH): the ack-durability quorum is now wired end-to-end, so
+  `SIMPLE_MAJORITY` / `ALL` replicated commits succeed promptly once a quorum
+  of electable replicas ack — they no longer spuriously time out and return
+  `InsufficientReplicas{available:0}` even when every replica had acked.** The
+  quorum *math* was already correct (electable-only, D6); the defect was pure
+  WIRING — the ack path had two disconnected halves with mismatched key spaces:
+  - `await_replica_acks` (the commit-blocking gate) registered and waited on a
+    *synthetic* `commit_seq` (a standalone `AtomicU64`), while inbound replica
+    acks arrive keyed by **VLSN**.
+  - The production feeder `FeederRunner::run` stored each ack only in its own
+    private `known_replica_vlsn` mutex — it never called `env.record_ack`, never
+    advanced `Feeder::acked_vlsn`, and never touched the `AckTracker`. So no
+    production ack reached the quorum gate, and `update_dtvlsn_from_feeders`
+    never advanced (the election DTVLSN-ranking silently degraded to
+    VLSN-only).
+
+  The fix (two parts):
+  - **Part 1 (bridge production acks):** `FeederRunner` now carries an optional
+    ack sink wired by `spawn_feeder_runner`; each inbound ack is forwarded to
+    `env.record_ack(vlsn, replica_name)`, which now also advances the matching
+    `Feeder::acked_vlsn` high-water mark and wakes the commit gate. This
+    bridges acks to **both** the `AckTracker` (commit quorum) and the
+    `Feeder::acked_vlsn` that the DTVLSN computation reads. Mirrors JE
+    `FeederTxns.noteReplicaAck` being driven from the feeder input loop.
+  - **Part 2 (key the wait under the commit VLSN):** `await_replica_acks` now
+    reads the commit's VLSN from the shared `wal_vlsn_counter` (assigned by
+    `EnvironmentImpl::log_txn_commit` immediately before the gate runs) and is
+    satisfied when a quorum of qualifying electable feeders hold an acked VLSN
+    `>= commit_vlsn` — a high-water `>=` test faithful to JE
+    `FeederManager.getNumCurrentAckFeeders(commitVLSN)`, not an exact-VLSN
+    match. The dead synthetic `commit_ack_seq` counter is removed.
+
+  Refs: JE `FeederTxns` (`setupForAcks`/`noteReplicaAck`),
+  `FeederManager.getNumCurrentAckFeeders`, `Durability.ReplicaAckPolicy`
+  (`ALL` / `SIMPLE_MAJORITY` / `NONE`). New regression test
+  `rep9_ack_wiring_test.rs` proves fail-before / pass-after: a
+  `SIMPLE_MAJORITY` commit acked via the production feeder path returns `Ok`
+  promptly (blocked the full timeout before), `NONE` still short-circuits, and
+  `get_dtvlsn` advances after production acks.
 
 ## [6.1.0] - 2026-06-19
 
