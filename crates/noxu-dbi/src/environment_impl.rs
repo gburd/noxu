@@ -45,9 +45,15 @@ pub struct EnvironmentImpl {
     is_transactional: bool,
 
     /// Node ID and transient LSN generator.
-    node_sequence: NodeSequence,
+    ///
+    /// `Arc`-shared so the checkpointer can read the current max node-id at
+    /// checkpoint time (REC-S) without re-plumbing ownership.
+    node_sequence: Arc<NodeSequence>,
     /// Next database ID.
-    next_db_id: AtomicI64,
+    ///
+    /// `Arc`-shared so the checkpointer can read the current max db-id at
+    /// checkpoint time (REC-S).
+    next_db_id: Arc<AtomicI64>,
 
     /// The lock manager (shared across all lockers/txns).
     lock_manager: Arc<LockManager>,
@@ -370,6 +376,15 @@ impl EnvironmentImpl {
         ));
         let txn_manager = Arc::new(TxnManager::new(lock_manager.clone()));
 
+        // REC-S/REC-C/L-30: the env's three id sequences.  Created here as
+        // Arc so the checkpointer can read the current maxima at checkpoint
+        // time (REC-S) and so they can be seeded from the recovered maxima
+        // after recovery (REC-C).  Node-ids come from the single tree-wide
+        // counter (L-30); `node_sequence` tracks the env's last_local_node_id
+        // for the CheckpointEnd id field.
+        let node_sequence = Arc::new(NodeSequence::new());
+        let next_db_id = Arc::new(AtomicI64::new(1));
+
         // Ensure the environment directory exists (create if needed).
         if !env_home.exists() {
             std::fs::create_dir_all(&env_home).map_err(|e| {
@@ -399,6 +414,12 @@ impl EnvironmentImpl {
         // X-14 / X-1: VLSN pairs and rollback matchpoint from recovery.
         let mut recovery_vlsns: Vec<(u64, u64)> = Vec::new();
         let mut recovery_rollback_matchpoint: Option<u64> = None;
+        // REC-C: id maxima recovered from the log (CheckpointEnd id fields +
+        // live scan).  Used to seed the env's sequences so post-restart
+        // allocation never reuses an id present in the recovered log.
+        let mut recovered_max_node_id: u64 = 0;
+        let mut recovered_max_db_id: u64 = 0;
+        let mut recovered_max_txn_id: u64 = 0;
 
         // Initialize the WAL (LogManager) for writable environments.
         // Read-only environments don't need to write log entries.
@@ -491,6 +512,15 @@ impl EnvironmentImpl {
             recovery_rollback_matchpoint =
                 recovery_info.rollback_matchpoint_lsn;
 
+            // REC-C: capture the id maxima the recovery pass computed so we
+            // can seed the env's sequences below.  JE applies these as a
+            // recovery contract: DbTree.setLastDbId, TxnManager.setLastTxnId,
+            // NodeSequence.initRealNodeId / setLastNodeId — so post-restart
+            // allocation never reuses an id present in the recovered log.
+            recovered_max_node_id = recovery_info.use_max_node_id;
+            recovered_max_db_id = recovery_info.use_max_db_id;
+            recovered_max_txn_id = recovery_info.use_max_txn_id;
+
             // Install all recovered trees keyed by db_id so that
             // open_database() can transplant each into the matching DatabaseImpl.
             // Per-database tree population from
@@ -569,6 +599,37 @@ impl EnvironmentImpl {
             Some((lm, ut)) => (Some(lm), Some(ut)),
             None => (None, None),
         };
+
+        // REC-C / L-30: seed the env's three id sequences from the maxima the
+        // recovery pass recovered from the log, so a freshly allocated
+        // db-id / txn-id / node-id is always strictly greater than every id
+        // present in the recovered log.  Without this the counters restart at
+        // 1 and a prepared-XA txn-id or an un-reopened db-id can be reused
+        // after restart (catalog / in-doubt-XA corruption).
+        //
+        // JE recovery contract: DbTree.setLastDbId / TxnManager.setLastTxnId /
+        // NodeSequence.initRealNodeId (initRealNodeId seeds the node-id
+        // counter from CheckpointEnd.lastLocalNodeId).
+        if !read_only {
+            // db-id: ensure next_db_id > max recovered db-id.
+            let want_db = (recovered_max_db_id as i64).saturating_add(1);
+            if next_db_id.load(Ordering::Relaxed) < want_db {
+                next_db_id.store(want_db, Ordering::Relaxed);
+            }
+            // txn-id: the helper already ensures next_txn_id > id.
+            if recovered_max_txn_id > 0 {
+                txn_manager.set_last_txn_id(recovered_max_txn_id as i64);
+            }
+            // node-id: seed the env's NodeSequence and the single tree-wide
+            // node-id counter (L-30) past the recovered max.
+            if recovered_max_node_id > 0 {
+                node_sequence.set_last_node_id(
+                    NodeSequence::FIRST_REPLICATED_NODE_ID,
+                    recovered_max_node_id as i64,
+                );
+                noxu_tree::seed_node_id_counter(recovered_max_node_id);
+            }
+        }
 
         // Primary shared tree (db_id=1) used for LN migration by the cleaner
         // and as the backing store for the checkpointer.
@@ -746,6 +807,10 @@ impl EnvironmentImpl {
             // compute the real first_active_lsn for CkptEnd.  Safe now that
             // Stage 1 checkpoints ALL user-database BINs.
             builder = builder.with_txn_manager(Arc::clone(&txn_manager));
+            // REC-S: wire the db-id counter so do_checkpoint writes the real
+            // last node/db/txn ids into CheckpointEnd (txn-id via the wired
+            // txn_manager, node-id via the tree-wide counter).
+            builder = builder.with_id_sources(Arc::clone(&next_db_id));
             Arc::new(builder)
         });
 
@@ -919,8 +984,8 @@ impl EnvironmentImpl {
             state: RwLock::new(EnvState::Init),
             is_read_only: read_only,
             is_transactional: transactional,
-            node_sequence: NodeSequence::new(),
-            next_db_id: AtomicI64::new(1),
+            node_sequence: Arc::clone(&node_sequence),
+            next_db_id: Arc::clone(&next_db_id),
             lock_manager,
             txn_manager,
             db_map,
@@ -1634,6 +1699,13 @@ impl EnvironmentImpl {
     /// Returns a reference to the node sequence generator.
     pub fn get_node_sequence(&self) -> &NodeSequence {
         &self.node_sequence
+    }
+
+    /// Returns the next database ID that would be allocated (without
+    /// allocating it).  Used by tests to assert that post-recovery allocation
+    /// never reuses a db-id present in the recovered log.
+    pub fn peek_next_db_id(&self) -> i64 {
+        self.next_db_id.load(Ordering::Relaxed)
     }
 
     /// Returns a clone of the shared LogManager, if any.

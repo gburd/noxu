@@ -5631,12 +5631,53 @@ pub enum InRedoResult {
 }
 
 /// Global node ID counter for generating unique node IDs.
+///
+/// This is the SINGLE source of node-ids for the whole tree subsystem.  The
+/// BIN constructor (`bin.rs`) and `node.rs` route through `generate_node_id`
+/// so that, after crash recovery, a freshly allocated node-id is always
+/// strictly greater than every node-id present in the recovered log.
+///
+/// JE ref: `NodeSequence.getNextLocalNodeId` (a single per-env counter) and
+/// `IN.nodeId` allocation; `NodeSequence.initRealNodeId` seeds the counter
+/// from the recovered `CheckpointEnd.lastLocalNodeId`.  The env seeds this
+/// counter post-recovery via `seed_node_id_counter`.
 static NODE_ID_COUNTER: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
 
 /// Generates a unique node ID.
 pub fn generate_node_id() -> u64 {
     NODE_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Returns the node-id that would be generated next (without allocating it).
+///
+/// Used by recovery seeding and by tests to assert no node-id reuse after a
+/// restart.
+pub fn peek_next_node_id_counter() -> u64 {
+    NODE_ID_COUNTER.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Seeds the node-id counter so the next generated id is `> last_node_id`.
+///
+/// Called by `EnvironmentImpl` after recovery with the recovered
+/// `use_max_node_id`, mirroring `NodeSequence.initRealNodeId` /
+/// `setLastNodeId`: post-restart allocation must never reuse a node-id that
+/// is already in the log.  Monotonic: never lowers the counter.
+pub fn seed_node_id_counter(last_node_id: u64) {
+    let want_next = last_node_id.saturating_add(1);
+    // Bump only if our current next is below the recovered floor.
+    let mut cur = NODE_ID_COUNTER.load(std::sync::atomic::Ordering::SeqCst);
+    while cur < want_next {
+        match NODE_ID_COUNTER.compare_exchange_weak(
+            cur,
+            want_next,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        ) {
+            Ok(_) => break,
+            Err(observed) => cur = observed,
+        }
+    }
 }
 
 #[cfg(test)]

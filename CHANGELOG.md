@@ -103,6 +103,25 @@ listed in [References](#references).
   `SIMPLE_MAJORITY` commit acked via the production feeder path returns `Ok`
   promptly (blocked the full timeout before), `NONE` still short-circuits, and
   `get_dtvlsn` advances after production acks.
+### Fixed (recovery — ID-sequence recovery seeding, REC-C/REC-S/L-30)
+
+- **The max node/db/txn IDs are now persisted in `CheckpointEnd` and seeded into
+  the environment's ID sequences after recovery** (`noxu-recovery`, `noxu-dbi`,
+  `noxu-tree`, `noxu-txn`). Previously `CheckpointEnd` wrote the six
+  last-local/replicated node/db/txn ID fields as zero (REC-S) and recovery never
+  applied the computed `use_max_*` to the env sequences (REC-C), so after a restart
+  `next_db_id`/`next_txn_id`/node-id allocation began fresh — a recovered prepared-XA
+  transaction id or an un-reopened database id could be REUSED. Fix: the checkpointer
+  writes the real `next_db_id-1` / `txn_manager.get_last_local_txn_id()` /
+  `peek_next_node_id_counter()` into `CheckpointEnd`; after recovery the env seeds
+  `next_db_id = max(_, use_max_db_id+1)`, `TxnManager::set_last_txn_id(use_max_txn_id)`,
+  and `node_sequence.set_last_node_id(use_max_node_id)`. The three former per-process
+  node-id statics (tree `NODE_ID_COUNTER`, `node.rs` `NEXT_NODE_ID`, `bin.rs`
+  `NEXT_BIN_NODE_ID`) were consolidated into one seedable counter routed through
+  `generate_node_id` (L-30). Mirrors JE `NodeSequence.initRealNodeId` /
+  `DbTree.setLastDbId` / `TxnManager.setLastTxnId`. Test
+  `ids_do_not_restart_at_one_after_recovery`.
+
 
 ## [6.1.0] - 2026-06-19
 
