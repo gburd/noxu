@@ -154,6 +154,7 @@ fn empty_stub() -> BinStub {
         expiration_in_hours: true,
         cursor_count: 0,
         prohibit_next_delta: false,
+        lsn_rep: noxu_tree::tree::LsnRep::Empty,
     }
 }
 
@@ -227,7 +228,7 @@ proptest! {
                 "slot {} key diverged", i
             );
             prop_assert_eq!(
-                stub.entries[i].lsn,
+                stub.get_lsn(i),
                 oracle.lsn(i),
                 "slot {} lsn diverged", i
             );

@@ -37,7 +37,6 @@ fn make_bin_bytes(
         level: noxu_tree::BIN_LEVEL,
         entries: vec![BinEntry {
             key: key.to_vec(),
-            lsn: entry_lsn,
             data: Some(data.to_vec()),
             known_deleted: false,
             dirty: false,
@@ -53,6 +52,7 @@ fn make_bin_bytes(
         expiration_in_hours: true,
         cursor_count: 0,
         prohibit_next_delta: false,
+        lsn_rep: noxu_tree::tree::LsnRep::from_lsns(&[entry_lsn]),
     };
     bin.serialize_full()
 }

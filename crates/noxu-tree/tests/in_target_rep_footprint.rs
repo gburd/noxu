@@ -20,7 +20,7 @@ use std::mem::size_of;
 use std::sync::Arc;
 
 use noxu_tree::tree::TreeNode;
-use noxu_tree::{ChildArc, InEntry, InNodeStub, TargetRep};
+use noxu_tree::{ChildArc, InEntry, InNodeStub, LsnRep, TargetRep};
 use noxu_util::Lsn;
 use parking_lot::RwLock;
 
@@ -28,11 +28,10 @@ const MAIN_LEVEL: i32 = 0x20000;
 
 fn empty_in(n: usize) -> InNodeStub {
     let entries = (0..n)
-        .map(|i| InEntry {
-            key: vec![(i % 256) as u8, (i / 256) as u8],
-            lsn: Lsn::from_u64(100 + i as u64),
-        })
+        .map(|i| InEntry { key: vec![(i % 256) as u8, (i / 256) as u8] })
         .collect();
+    let lsns: Vec<Lsn> =
+        (0..n).map(|i| Lsn::from_u64(100 + i as u64)).collect();
     InNodeStub {
         node_id: 1,
         level: MAIN_LEVEL | 2,
@@ -41,6 +40,7 @@ fn empty_in(n: usize) -> InNodeStub {
         dirty: false,
         generation: 0,
         parent: None,
+        lsn_rep: LsnRep::from_lsns(&lsns),
     }
 }
 
@@ -159,4 +159,94 @@ fn child_mapping_survives_insert_remove() {
     n.remove_entry(2);
     assert!(n.get_child(2).is_none());
     assert!(Arc::ptr_eq(&n.get_child(3).unwrap(), &c3), "c3 shifted 4->3");
+}
+
+// ===========================================================================
+// T-3: LsnRep packed-LSN footprint (IN.entryLsnByteArray, IN.java:251-289).
+// ===========================================================================
+
+/// Build a BIN whose N slots all share file number 7 (a same-file-number
+/// node, the common case for a recently-written BIN).
+fn bin_same_file(n: usize) -> noxu_tree::BinStub {
+    let mut bin = noxu_tree::BinStub {
+        node_id: 1,
+        level: noxu_tree::BIN_LEVEL,
+        entries: Vec::new(),
+        key_prefix: Vec::new(),
+        dirty: false,
+        is_delta: false,
+        last_full_lsn: noxu_util::NULL_LSN,
+        last_delta_lsn: noxu_util::NULL_LSN,
+        generation: 0,
+        parent: None,
+        expiration_in_hours: true,
+        cursor_count: 0,
+        prohibit_next_delta: false,
+        lsn_rep: LsnRep::Empty,
+    };
+    for i in 0..n {
+        let k = (i as u32).to_be_bytes().to_vec();
+        bin.insert_with_prefix(k, Lsn::new(7, 1000 + i as u32), None);
+    }
+    bin
+}
+
+/// A BIN whose LSNs share a file number packs to ~4 bytes/slot via the
+/// Compact rep, vs 8 bytes/slot for a raw `Lsn` field.  `INLongRep` /
+/// `IN.entryLsnByteArray` (4 = `BYTES_PER_LSN_ENTRY`).
+#[test]
+fn lsn_same_file_packs_compact() {
+    let n = 64usize;
+    let bin = bin_same_file(n);
+    // 64 slots * 4 bytes = 256 bytes, vs 64 * 8 = 512 for raw u64 LSNs.
+    assert_eq!(
+        bin.lsn_rep.memory_size(),
+        n * 4,
+        "same-file-number node packs to 4 bytes/slot"
+    );
+    assert!(
+        bin.lsn_rep.memory_size() < n * 8,
+        "packed LSN footprint must be < the raw u64-per-slot footprint"
+    );
+    // LSNs still read back exactly.
+    for i in 0..n {
+        assert_eq!(bin.get_lsn(i), Lsn::new(7, 1000 + i as u32));
+    }
+}
+
+/// An all-NULL-LSN node uses the EmptyRep (0 heap bytes), matching JE's
+/// `entryLsnByteArray == null` initial state.
+#[test]
+fn lsn_all_null_uses_empty_rep() {
+    let bin = bin_same_file(0);
+    assert!(matches!(bin.lsn_rep, LsnRep::Empty));
+    assert_eq!(bin.lsn_rep.memory_size(), 0, "all-NULL node costs 0 LSN bytes");
+}
+
+/// Numerically prove the per-node footprint reduction vs the pre-T-3 layout
+/// where every `BinEntry` carried an 8-byte `lsn: Lsn` field.
+#[test]
+fn lsn_footprint_smaller_than_pre_compaction() {
+    use std::mem::size_of;
+    let n = 128usize;
+    let bin = bin_same_file(n);
+    let node = TreeNode::Bottom(bin);
+    let post = node.budgeted_memory_size();
+
+    // Pre-compaction model: BinEntry was 8 bytes wider (the Lsn field) and
+    // there was no node-level LsnRep.
+    let pre =
+        post + (n as u64) * size_of::<Lsn>() as u64 - node_lsn_rep_bytes(&node);
+
+    assert!(
+        post < pre,
+        "T-3: post-compaction footprint ({post}) must be < pre ({pre})"
+    );
+}
+
+fn node_lsn_rep_bytes(node: &TreeNode) -> u64 {
+    match node {
+        TreeNode::Bottom(b) => b.lsn_rep.memory_size() as u64,
+        TreeNode::Internal(n) => n.lsn_rep.memory_size() as u64,
+    }
 }

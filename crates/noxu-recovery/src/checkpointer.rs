@@ -1759,6 +1759,7 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: noxu_tree::tree::LsnRep::Empty,
         };
         let node = NodeRwLock::new(TreeNode::Bottom(bin));
 
