@@ -216,3 +216,77 @@ zero-standing-cost properties match JE; only the storage *locus* (side table vs 
 field, and the lock is not co-located with the BIN. For the common case (few locks held at
 once relative to the resident node count) this is immaterial. This is an **authorized
 deviation**, not a fidelity gap.
+
+## Diverged-tail replica syncup rollback (REP-1)
+
+**Status**: the *durable rollback machinery* (REP-1 STEPS 1-4) is implemented and
+faithful; the *live replica-feeder matchpoint protocol* (STEP 5) is partially
+implemented — the decision core is done and unit-tested, the networked driver is
+the remaining piece.
+
+**What this is**: when a replica reconnects to a (possibly new) master, the two
+must reconcile by finding the latest common log entry (the *matchpoint*) and, if
+the replica has applied entries past it (a *diverged tail*, e.g. after a failed
+election), ROLLING THOSE BACK to the matchpoint before resuming the stream from
+`matchpoint + 1`. Port of JE `ReplicaFeederSyncup` / `FeederReplicaSyncup`.
+
+### Done (STEPS 1-4) — durable rollback machinery
+
+These make recovery-time self-rollback faithful and are the substrate the live
+syncup uses:
+
+1. **RollbackStart/RollbackEnd entries** carry `matchpointVLSN` + `activeTxnIds`
+   (RollbackStart) and `matchpointLSN` (RollbackEnd), matching JE
+   `RollbackStart.java` / `RollbackEnd.java`. On-disk format change for the HA
+   rollback entries (see CHANGELOG).
+2. **`RollbackTracker.RollbackPeriod.containsLN`** gates rollback on
+   `activeTxnIds`, so a committed/aborted txn's LNs in the window are excluded
+   (JE `RollbackTracker.RollbackPeriod`).
+3. **`TxnChain`** reverts each rolled-back LN to its *immediately previous
+   version* (intra- or inter-txnal), split at the matchpoint, instead of
+   skipping it (JE `txn/TxnChain.java`, `RecoveryManager.rollbackUndo`). The
+   recovery undo path drives it.
+4. **Invisible re-marking + fsync** during recovery for open-ended (crash-mid-
+   rollback) periods, with the entry checksum cloaking the invisible bit (JE
+   `RollbackTracker.singlePassSetInvisible` / `recoveryEndFsyncInvisible`,
+   `LogEntryHeader.turnOffInvisible`).
+
+### Done (STEP 5, decision core) — `stream/syncup.rs`
+
+- **`find_matchpoint`** (JE `ReplicaFeederSyncup.findMatchpoint`): the matchpoint
+  search — highest VLSN both nodes hold with a matching record at the same LSN,
+  scanning the replica's sync points backward from `lastSync`. Pure function over
+  a `SyncupView` (the replica's VLSN index + the feeder's `EntryRequest`
+  responses).
+- **`verify_rollback`** (JE `ReplicaFeederSyncup.verifyRollback` truth table):
+  decides `RollbackToMatchpoint` / `HardRecovery` / `NetworkRestore` from the
+  matchpoint, `lastTxnEnd`, `lastSync` and `numPassedCommits`.
+
+### Remaining (STEP 5, live driver)
+
+To turn the decision core into a live syncup, the replica stream driver
+(`stream/replica_stream.rs` + `stream/peer_feeder.rs`) needs:
+
+1. **Wire protocol** extension: `EntryRequest(vlsn)` / `EntryNotFound` /
+   `AlternateMatchpoint(vlsn)` messages (JE `BaseProtocol`) so the replica can
+   ask the feeder for the record at each candidate VLSN and the feeder can
+   counter-offer the highest VLSN it holds.
+2. **`ReplicaSyncupReader`**: a backward log reader on the replica that yields,
+   for each sync-point VLSN, its LSN + record fingerprint + `numPassedCommits`
+   (the `SyncupView::entry` substrate against real log records — the VLSN index
+   alone does not store per-VLSN sync flags or checksums, matching JE which
+   re-reads the log).
+3. **Live `replay.rollback(matchpointVLSN, matchpointLSN)`**: execute the
+   rollback against the *running* engine — truncate the in-memory B-tree and the
+   log to the matchpoint, writing a `RollbackStart`/`RollbackEnd` pair (so a
+   crash mid-rollback recovers via STEPS 1-4) and marking the divergent tail
+   invisible. The recovery-time X-1 self-rollback (`recovery_rollback_matchpoint`
+   → `vlsn_index.truncate_after`) is the equivalent at restart; the live path
+   shares STEPS 1-4's durable entries and invisible-marking.
+4. **`vlsnIndex.truncateFromTail(startVLSN, matchpointLSN)`** then resume
+   streaming from `matchpoint + 1`.
+
+`negotiate_syncup` (currently a range CanServe/NeedsRestore check) is extended by
+the decision core; the live driver replaces the range check with
+`find_matchpoint` + `verify_rollback` once the wire protocol and syncup reader
+land.
