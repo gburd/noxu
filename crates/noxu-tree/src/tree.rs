@@ -503,6 +503,19 @@ pub struct InNodeStub {
 /// T-4: the resident-child pointer that used to live here (`Option<Arc>`) was
 /// hoisted to the node-level `InNodeStub.targets` (`INTargetRep`); access the
 /// child for slot `i` via `InNodeStub::get_child(i)` / `set_child` / etc.
+///
+/// DEFERRED heap compactions (the per-slot `key`/`lsn` axes — see
+/// `docs/src/operations/known-limitations.md`, heap-footprint-compaction row):
+///   * T-3 (`INLongRep`): pack the per-slot `lsn` (8 bytes) at the node's
+///     minimum byte-width.  Blocked on `NULL_LSN == u64::MAX`: JE `INLongRep`
+///     requires non-negative values and would force 8-byte width for any node
+///     with one NULL slot.  The faithful scope is JE's `baseFileNumber`
+///     -relative `entryLsnByteArray` + reserved transient-offset encoding.
+///   * T-2 (`INKeyRep.MaxKeySize`): pack all-small (`<= TREE_COMPACT_MAX_KEY
+///     _LENGTH`, default 16) post-prefix keys into one fixed-width `byte[]`
+///     instead of a per-slot `Vec<u8>` (24-byte header + heap alloc each).
+///     Most invasive — touches every key access (find_entry / prefix / split /
+///     serialize) — and would wire the currently-inert config param (T-5).
 #[derive(Debug, Clone)]
 pub struct InEntry {
     /// Key for this entry.

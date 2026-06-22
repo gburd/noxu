@@ -21,3 +21,17 @@ All notable changes to Noxu DB are documented here. The format is based on
   serialization is unchanged (child pointers were never serialized). Saves 8
   bytes/slot plus the eliminated per-node child array for non-resident upper
   INs.
+
+### Deferred
+
+- **T-3 (`INLongRep` per-slot LSN byte-width packing) — deferred.** A faithful
+  port is blocked on `NULL_LSN == u64::MAX`: JE `INLongRep` requires
+  non-negative values and would force 8-byte width for any node holding a
+  single NULL slot (common for not-yet-logged slots), defeating the win. The
+  actual scope to port is JE's `baseFileNumber`-relative `entryLsnByteArray`
+  plus a reserved transient-offset encoding.
+- **T-2 (`INKeyRep.MaxKeySize` compact key array) and T-5
+  (`TREE_COMPACT_MAX_KEY_LENGTH` wiring) — deferred.** Most invasive of the
+  three (touches every key access: find_entry / prefix / split / serialize).
+  Per-slot keys remain `Vec<u8>`; `TREE_COMPACT_MAX_KEY_LENGTH` stays
+  accepted-but-inert. See `docs/src/operations/known-limitations.md`.
