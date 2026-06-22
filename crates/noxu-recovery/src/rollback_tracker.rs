@@ -25,6 +25,13 @@ use noxu_util::{Lsn, NULL_LSN};
 ///
 /// The rollback period spans from matchpoint_lsn to rollback_start_lsn.
 /// Any transactional LNs in that range should be undone during recovery.
+///
+/// `active_txn_ids` mirrors JE `RollbackPeriod.activeTxnIds`: the set of
+/// unfinished transactions logged in the `RollbackStart` entry. It is the
+/// gate used by [`RollbackPeriod::contains_ln`] (JE
+/// `RollbackPeriod.containsLN`) so that a *committed or aborted* transaction's
+/// LNs in the window are NOT reverted — only LNs of transactions still active
+/// at the matchpoint are.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RollbackPeriod {
     /// The matchpoint LSN (start of rollback period).
@@ -33,16 +40,44 @@ pub struct RollbackPeriod {
     pub rollback_start_lsn: Lsn,
     /// The rollback end LSN (if completed, NULL_LSN if incomplete).
     pub rollback_end_lsn: Lsn,
+    /// Ids of the transactions that were active (unfinished) at the
+    /// matchpoint and are being rolled back. Populated from the
+    /// `RollbackStart` entry (`RollbackStart.getActiveTxnIds()`).
+    pub active_txn_ids: Vec<i64>,
 }
 
 impl RollbackPeriod {
-    /// Create a new rollback period.
+    /// Create a new rollback period with no active-txn set.
+    ///
+    /// Used by callers that only know the LSN bracket (e.g. a `RollbackEnd`
+    /// seen before its `RollbackStart`, or unit tests). The active-txn set is
+    /// filled in when the matching `RollbackStart` is registered.
     pub fn new(
         matchpoint_lsn: Lsn,
         rollback_start_lsn: Lsn,
         rollback_end_lsn: Lsn,
     ) -> Self {
-        Self { matchpoint_lsn, rollback_start_lsn, rollback_end_lsn }
+        Self {
+            matchpoint_lsn,
+            rollback_start_lsn,
+            rollback_end_lsn,
+            active_txn_ids: Vec::new(),
+        }
+    }
+
+    /// Create a rollback period with a known active-txn set.
+    pub fn with_active_txns(
+        matchpoint_lsn: Lsn,
+        rollback_start_lsn: Lsn,
+        rollback_end_lsn: Lsn,
+        active_txn_ids: Vec<i64>,
+    ) -> Self {
+        Self {
+            matchpoint_lsn,
+            rollback_start_lsn,
+            rollback_end_lsn,
+            active_txn_ids,
+        }
     }
 
     /// Check if this period is complete (has a RollbackEnd entry).
@@ -56,6 +91,26 @@ impl RollbackPeriod {
     /// matchpoint_lsn < lsn < rollback_start_lsn
     pub fn contains(&self, lsn: Lsn) -> bool {
         lsn > self.matchpoint_lsn && lsn < self.rollback_start_lsn
+    }
+
+    /// Check if a transactional LN at `lsn` belonging to `txn_id` falls within
+    /// this rollback period AND belongs to a transaction that was active at
+    /// the matchpoint.
+    ///
+    /// Port of JE `RollbackTracker.RollbackPeriod.containsLN`:
+    ///
+    /// ```java
+    /// boolean containsLN(long lsn, long txnId) {
+    ///     return contains(lsn) && activeTxnIds.contains(txnId);
+    /// }
+    /// ```
+    ///
+    /// A committed or aborted transaction is NOT in `active_txn_ids`, so its
+    /// LNs are excluded from rollback even when they fall inside the LSN
+    /// window. Only LNs of transactions still unfinished at the matchpoint are
+    /// reverted.
+    pub fn contains_ln(&self, lsn: Lsn, txn_id: i64) -> bool {
+        self.contains(lsn) && self.active_txn_ids.contains(&txn_id)
     }
 
     /// Check if this period precedes (comes before) the given LSN.
@@ -106,9 +161,45 @@ impl RollbackTracker {
         matchpoint_lsn: Lsn,
         rollback_start_lsn: Lsn,
     ) {
-        let period =
-            RollbackPeriod::new(matchpoint_lsn, rollback_start_lsn, NULL_LSN);
-        self.pending_rollback_starts.insert(matchpoint_lsn.as_u64(), period);
+        self.register_rollback_start_with_txns(
+            matchpoint_lsn,
+            rollback_start_lsn,
+            Vec::new(),
+        );
+    }
+
+    /// Register a RollbackStart entry along with the set of active txn ids it
+    /// carries (JE `RollbackStart.getActiveTxnIds()`).
+    ///
+    /// The active-txn set drives [`RollbackPeriod::contains_ln`]: only LNs of
+    /// these transactions are reverted; LNs of transactions that committed or
+    /// aborted before the matchpoint are left in place.
+    pub fn register_rollback_start_with_txns(
+        &mut self,
+        matchpoint_lsn: Lsn,
+        rollback_start_lsn: Lsn,
+        active_txn_ids: Vec<i64>,
+    ) {
+        let key = matchpoint_lsn.as_u64();
+        // If a RollbackEnd for this matchpoint was already seen during the
+        // backward scan, complete it; otherwise open a pending period.
+        if let Some(mut period) = self.pending_rollback_starts.remove(&key) {
+            period.rollback_start_lsn = rollback_start_lsn;
+            period.active_txn_ids = active_txn_ids;
+            if period.rollback_end_lsn != NULL_LSN {
+                self.add_completed_period(period);
+            } else {
+                self.pending_rollback_starts.insert(key, period);
+            }
+        } else {
+            let period = RollbackPeriod::with_active_txns(
+                matchpoint_lsn,
+                rollback_start_lsn,
+                NULL_LSN,
+                active_txn_ids,
+            );
+            self.pending_rollback_starts.insert(key, period);
+        }
     }
 
     /// Register a RollbackEnd entry seen during backward scan.
@@ -190,6 +281,37 @@ impl RollbackTracker {
         &self.rollback_periods
     }
 
+    /// Check whether a transactional LN at `lsn` for transaction `txn_id`
+    /// should be reverted by a rollback period (JE
+    /// `RollbackPeriod.containsLN`). Checks completed periods first, then
+    /// open-ended (crash-mid-rollback) periods.
+    ///
+    /// Returns `true` only if `lsn` is inside some period's window AND
+    /// `txn_id` was active at that period's matchpoint. A committed/aborted
+    /// transaction's LNs are therefore excluded.
+    pub fn contains_ln(&self, lsn: Lsn, txn_id: i64) -> bool {
+        self.find_period_for_ln(lsn, txn_id).is_some()
+    }
+
+    /// Return the rollback period whose `contains_ln(lsn, txn_id)` holds, if
+    /// any. Used by the undo path to obtain the matchpoint and active-txn set
+    /// for reverting the LN to its previous version (STEP 3, TxnChain).
+    pub fn find_period_for_ln(
+        &self,
+        lsn: Lsn,
+        txn_id: i64,
+    ) -> Option<&RollbackPeriod> {
+        self.rollback_periods
+            .iter()
+            .find(|p| p.contains_ln(lsn, txn_id))
+            .or_else(|| {
+                self.pending_rollback_starts.values().find(|p| {
+                    p.rollback_start_lsn != NULL_LSN
+                        && p.contains_ln(lsn, txn_id)
+                })
+            })
+    }
+
     /// Check if there are incomplete rollbacks (RollbackStart without RollbackEnd).
     pub fn has_incomplete_rollbacks(&self) -> bool {
         !self.pending_rollback_starts.is_empty()
@@ -222,7 +344,11 @@ impl RollbackTracker {
         lsn: Lsn,
         entry: &noxu_log::entry::RollbackStartEntry,
     ) {
-        self.register_rollback_start(entry.matchpoint_lsn, lsn);
+        self.register_rollback_start_with_txns(
+            entry.matchpoint_lsn,
+            lsn,
+            entry.active_txn_ids.clone(),
+        );
     }
 
     /// Record a RollbackEnd entry from the analysis phase.
@@ -702,8 +828,9 @@ mod tests {
 
         let mut tracker = RollbackTracker::new();
         let start_entry = RollbackStartEntry::new(
-            make_lsn(1, 50),  // active_txn_start
-            make_lsn(1, 100), // matchpoint_lsn
+            noxu_util::vlsn::Vlsn::new(7), // matchpoint_vlsn
+            make_lsn(1, 100),              // matchpoint_lsn
+            vec![42, 43],                  // active_txn_ids
         );
         let start_lsn = make_lsn(1, 400);
         tracker.record_rollback_start(start_lsn, &start_entry);
@@ -712,7 +839,7 @@ mod tests {
         assert_eq!(tracker.period_count(), 0);
         assert!(tracker.is_active());
 
-        let end_entry = RollbackEndEntry::new(start_lsn);
+        let end_entry = RollbackEndEntry::new(make_lsn(1, 100), start_lsn);
         let end_lsn = make_lsn(1, 500);
         tracker.record_rollback_end(end_lsn, &end_entry);
 
@@ -722,6 +849,71 @@ mod tests {
         assert!(!tracker.is_in_rollback_period(make_lsn(1, 50)));
         // LSN 400 is the boundary (rollback_start) — not inside
         assert!(!tracker.is_in_rollback_period(make_lsn(1, 400)));
+        // containsLN: an active txn's LN inside the window IS reverted...
+        assert!(tracker.contains_ln(make_lsn(1, 200), 42));
+        assert!(tracker.contains_ln(make_lsn(1, 250), 43));
+        // ...but a txn NOT in the active set is excluded.
+        assert!(!tracker.contains_ln(make_lsn(1, 200), 99));
+    }
+
+    /// STEP 2 (REC-T) headline: `containsLN` must EXCLUDE a committed/aborted
+    /// transaction's LNs even when they fall inside the rollback LSN window.
+    ///
+    /// Port of JE `RollbackTracker.RollbackPeriod.containsLN`:
+    ///   `contains(lsn) && activeTxnIds.contains(txnId)`.
+    ///
+    /// A transaction that committed before the matchpoint is NOT in
+    /// `activeTxnIds`, so its records must survive the rollback. Before the
+    /// fix, the tracker only knew the LSN window and would have reverted
+    /// every LN in it — corrupting a durably-committed transaction.
+    #[test]
+    fn test_contains_ln_excludes_committed_txn() {
+        let mut tracker = RollbackTracker::new();
+
+        // Rollback window (matchpoint=100, start=400), only txn 7 is active.
+        tracker.register_rollback_start_with_txns(
+            make_lsn(1, 100),
+            make_lsn(1, 400),
+            vec![7],
+        );
+        tracker.register_rollback_end(make_lsn(1, 100), make_lsn(1, 500));
+        assert_eq!(tracker.period_count(), 1);
+
+        let in_window = make_lsn(1, 250);
+        // Active txn 7's LN in the window is rolled back.
+        assert!(
+            tracker.contains_ln(in_window, 7),
+            "active txn LN in window must be reverted"
+        );
+        // Committed txn 8 (not in activeTxnIds) is excluded, even though its
+        // LN is inside the same LSN window.
+        assert!(
+            !tracker.contains_ln(in_window, 8),
+            "committed txn LN must NOT be reverted"
+        );
+        // The plain window check still says "in window" — the difference is
+        // entirely the activeTxnIds gate.
+        assert!(tracker.is_in_rollback_period(in_window));
+
+        // find_period_for_ln returns the period for the active txn only.
+        assert!(tracker.find_period_for_ln(in_window, 7).is_some());
+        assert!(tracker.find_period_for_ln(in_window, 8).is_none());
+    }
+
+    /// STEP 2: an open-ended (crash-mid-rollback) period still gates on
+    /// activeTxnIds via `contains_ln`.
+    #[test]
+    fn test_contains_ln_open_ended_period() {
+        let mut tracker = RollbackTracker::new();
+        tracker.register_rollback_start_with_txns(
+            make_lsn(1, 100),
+            make_lsn(1, 400),
+            vec![11],
+        );
+        // No RollbackEnd (open-ended).
+        assert!(tracker.has_incomplete_rollbacks());
+        assert!(tracker.contains_ln(make_lsn(1, 200), 11));
+        assert!(!tracker.contains_ln(make_lsn(1, 200), 12));
     }
 
     // ── X-15: open-ended rollback interval ─────────────────────────────

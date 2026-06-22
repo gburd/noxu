@@ -1212,9 +1212,14 @@ impl RecoveryManager {
                 // HA rollback markers
                 // ----------------------------------------------------------
                 LogEntry::RollbackStart(rec) => {
-                    // RollbackTracker.register(RollbackStart, lsn)
-                    rollback_tracker
-                        .register_rollback_start(rec.matchpoint_lsn, rec.lsn);
+                    // RollbackTracker.register(RollbackStart, lsn) carrying
+                    // the active-txn set so containsLN can exclude
+                    // committed/aborted txns from rollback (STEP 2).
+                    rollback_tracker.register_rollback_start_with_txns(
+                        rec.matchpoint_lsn,
+                        rec.lsn,
+                        rec.active_txn_ids,
+                    );
                 }
                 LogEntry::RollbackEnd(rec) => {
                     // RollbackTracker.register(RollbackEnd, lsn)
@@ -2962,8 +2967,10 @@ mod tests {
         scanner.push(
             rollback_start_lsn,
             LogEntry::RollbackStart(RollbackStartRecord {
+                matchpoint_vlsn: noxu_util::NULL_VLSN,
                 matchpoint_lsn: matchpoint,
                 lsn: rollback_start_lsn,
+                active_txn_ids: Vec::new(),
             }),
         );
         // RollbackEnd
@@ -3441,8 +3448,10 @@ mod tests {
         scanner.push(
             lsn(1, 300),
             LogEntry::RollbackStart(RollbackStartRecord {
+                matchpoint_vlsn: noxu_util::NULL_VLSN,
                 matchpoint_lsn: lsn(1, 50),
                 lsn: lsn(1, 300),
+                active_txn_ids: Vec::new(),
             }),
         );
         scanner.push(

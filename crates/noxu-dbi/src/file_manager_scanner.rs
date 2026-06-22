@@ -362,6 +362,31 @@ impl FileManagerLogScanner {
                 }
             }
 
+            // HA rollback markers (REP-1) ─────────────────────────────
+            LogEntryType::RollbackStart => {
+                let e = noxu_log::entry::RollbackStartEntry::read_from_log(
+                    &payload,
+                )
+                .ok()?;
+                Some(LogEntry::RollbackStart(
+                    noxu_recovery::RollbackStartRecord {
+                        matchpoint_vlsn: e.matchpoint_vlsn,
+                        matchpoint_lsn: e.matchpoint_lsn,
+                        lsn: NULL_LSN, // Filled in by caller.
+                        active_txn_ids: e.active_txn_ids,
+                    },
+                ))
+            }
+            LogEntryType::RollbackEnd => {
+                let e =
+                    noxu_log::entry::RollbackEndEntry::read_from_log(&payload)
+                        .ok()?;
+                Some(LogEntry::RollbackEnd(noxu_recovery::RollbackEndRecord {
+                    matchpoint_lsn: e.matchpoint_lsn,
+                    lsn: NULL_LSN, // Filled in by caller.
+                }))
+            }
+
             // Everything else (FileHeader, Trace, MapLN, etc.) ─
             _ => None,
         }
@@ -658,6 +683,12 @@ impl FileManagerLogScanner {
                                     r.lsn = entry_lsn;
                                 }
                                 LogEntry::TxnPrepare(r) => {
+                                    r.lsn = entry_lsn;
+                                }
+                                LogEntry::RollbackStart(r) => {
+                                    r.lsn = entry_lsn;
+                                }
+                                LogEntry::RollbackEnd(r) => {
                                     r.lsn = entry_lsn;
                                 }
                                 _ => {}
