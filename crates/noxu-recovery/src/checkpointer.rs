@@ -534,15 +534,28 @@ impl Checkpointer {
 
         for (file_number, tracked) in tracked_files {
             let summary = tracked.get_summary();
-            let obsolete_count =
-                (summary.obsolete_ln_count + summary.obsolete_in_count) as i64;
+            // C7: persist the full FileSummary breakdown (LN/IN totals +
+            // obsolete + maxLNSize) AND the packed obsolete-offset list, so
+            // the on-disk FileSummaryLN is as faithful as the in-memory
+            // TrackedFileSummary.  JE: FileSummaryLN.writeToLog ->
+            // baseSummary.writeToLog (11 ints) + obsoleteOffsets.writeToLog.
+            let mut packed = noxu_cleaner::PackedOffsets::new();
+            packed.pack(tracked.get_obsolete_offsets());
             let entry = FileSummaryLnEntry::new(
                 *file_number as u64,
-                summary.total_count as i64,
-                summary.total_size as i64,
-                obsolete_count,
-                summary.obsolete_ln_size as i64,
-                summary.obsolete_ln_size_counted > 0,
+                summary.total_count,
+                summary.total_size,
+                summary.total_in_count,
+                summary.total_in_size,
+                summary.total_ln_count,
+                summary.total_ln_size,
+                summary.max_ln_size,
+                summary.obsolete_in_count,
+                summary.obsolete_ln_count,
+                summary.obsolete_ln_size,
+                summary.obsolete_ln_size_counted,
+                packed.get_count() as u32,
+                packed.get_data().to_vec(),
             );
             let mut buf = bytes::BytesMut::with_capacity(entry.log_size());
             entry.write_to_log(&mut buf);

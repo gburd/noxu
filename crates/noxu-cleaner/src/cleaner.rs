@@ -5,6 +5,7 @@
 
 use crate::FileSelector;
 use crate::cleaner_stat::CleanerStats;
+use crate::file_summary::FileSummary;
 use crate::file_processor::{
     BinLookupResult, FileProcessResult, FileProcessor, LogEntry, LogEntryType,
     MigrateLnResult, SharedTreeLookup, TreeLookup,
@@ -599,6 +600,37 @@ impl Cleaner {
     ) -> Self {
         self.utilization_tracker = Some(tracker);
         self
+    }
+
+    /// CLN-4: seed the in-memory `UtilizationProfile` from the per-file
+    /// summaries that recovery rebuilt from persisted `FileSummaryLN` WAL
+    /// entries (the latest record per file wins).  This lets the cleaner see
+    /// real utilization IMMEDIATELY after restart, rather than re-warming the
+    /// profile from new live writes (the old CLN-6 limitation).
+    ///
+    /// JE: `UtilizationProfile.populateCache` reads the FileSummaryLN records
+    /// back from the file-summary DB into `fileSummaryMap` at recovery; the
+    /// cleaner's `getFileSummaryMap` then sees them.  Here recovery hands us
+    /// the already-rebuilt map and we install it as the profile's cache.
+    pub fn seed_profile(
+        &self,
+        summaries: hashbrown::HashMap<u32, FileSummary>,
+    ) {
+        if summaries.is_empty() {
+            return;
+        }
+        let mut profile = self.utilization_profile.lock();
+        profile.populate(summaries);
+        // The seeded data reflects the on-disk state, not an unflushed change.
+        profile.clear_modified();
+    }
+
+    /// CLN-4 verification helper: returns a snapshot of the profile's cached
+    /// per-file summary (NOT merged with the live tracker).  Used by tests to
+    /// assert that after a restart the cleaner sees the persisted obsolete
+    /// bytes without first re-warming from new writes.
+    pub fn get_profile_summary(&self, file_number: u32) -> Option<FileSummary> {
+        self.utilization_profile.lock().get_file_summary(file_number).cloned()
     }
 
     /// Main cleaning entry point - performs cleaning of up to n_files.
