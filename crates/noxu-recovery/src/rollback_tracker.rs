@@ -281,6 +281,30 @@ impl RollbackTracker {
         &self.rollback_periods
     }
 
+    /// Snapshot of pending (open-ended, no `RollbackEnd`) periods that have a
+    /// valid `rollback_start_lsn`. Used by the undo pass to build TxnChains
+    /// for crash-mid-rollback periods too.
+    pub fn pending_periods(&self) -> Vec<RollbackPeriod> {
+        self.pending_rollback_starts
+            .values()
+            .filter(|p| p.rollback_start_lsn != NULL_LSN)
+            .cloned()
+            .collect()
+    }
+
+    /// Whether `txn_id` appears in the `active_txn_ids` of ANY rollback
+    /// period. Such a transaction's LNs are reverted to the matchpoint via the
+    /// TxnChain; its pre-matchpoint LNs are preserved ("remaining locked
+    /// nodes") and must NOT be fully undone as if it were an ordinary
+    /// uncommitted txn.
+    pub fn is_rollback_active_txn(&self, txn_id: i64) -> bool {
+        self.rollback_periods.iter().any(|p| p.active_txn_ids.contains(&txn_id))
+            || self
+                .pending_rollback_starts
+                .values()
+                .any(|p| p.active_txn_ids.contains(&txn_id))
+    }
+
     /// Check whether a transactional LN at `lsn` for transaction `txn_id`
     /// should be reverted by a rollback period (JE
     /// `RollbackPeriod.containsLN`). Checks completed periods first, then

@@ -770,6 +770,223 @@ impl RecoveryManager {
         Ok(())
     }
 
+    /// Build per-transaction `TxnChain`s for every rollback period, so the
+    /// undo pass can revert each in-window LN to its *previous version*
+    /// (intra- or inter-txnal) instead of skipping it.
+    ///
+    /// Port of the recovery side of JE `RollbackTracker.Scanner.rollback` ->
+    /// `target.getChain(txnId, undoLsn, envImpl)` which lazily constructs a
+    /// `TxnChain` per transaction. Here we build all chains up front (recovery
+    /// rollback periods are small) keyed by `(matchpoint, txn_id)`.
+    ///
+    /// For each period we scan its window `(matchpoint, rollback_start)`,
+    /// collect the LNs of the period's `active_txn_ids` (`containsLN` gate),
+    /// group by txn id, and build a [`TxnChain`] using the owning tree's key
+    /// comparator.
+    fn build_rollback_chains(
+        &self,
+        scanner: &dyn LogScanner,
+        trees: &HashMap<u64, noxu_tree::Tree>,
+    ) -> HashMap<(u64, i64), crate::TxnChain> {
+        use noxu_tree::tree::KeyComparatorFn;
+        let mut chains: HashMap<(u64, i64), crate::TxnChain> = HashMap::new();
+
+        // Gather every period (completed + open-ended). For each, collect the
+        // active-txn LNs in its window.
+        let periods: Vec<crate::RollbackPeriod> = self
+            .rollback_tracker
+            .get_rollback_periods()
+            .iter()
+            .cloned()
+            .chain(self.rollback_tracker.pending_periods())
+            .collect();
+
+        for period in &periods {
+            if period.rollback_start_lsn == NULL_LSN
+                || period.active_txn_ids.is_empty()
+            {
+                continue;
+            }
+            // Scan from the start of the log up to the RollbackStart and
+            // collect ALL of each active txn's LNs (not just the in-window
+            // ones). JE's TxnChain walks the txn's ENTIRE logrec chain
+            // (lastLoggedLsn -> NULL via prevLsn); the matchpoint only decides
+            // rolled-back (lsn > matchpoint) vs preserved (lsn <= matchpoint).
+            // The pre-matchpoint versions are exactly what an in-window logrec
+            // reverts to, so they must be in the chain.
+            let chain_scan =
+                scanner.scan_forward(NULL_LSN, period.rollback_start_lsn);
+
+            // Group active-txn LNs by txn id.
+            let mut per_txn: HashMap<i64, Vec<(Lsn, LnRecord)>> =
+                HashMap::new();
+            for pe in &chain_scan {
+                if let LogEntry::Ln(rec) = &pe.entry {
+                    let Some(txn_u) = rec.txn_id else { continue };
+                    let txn_id = txn_u as i64;
+                    if period.active_txn_ids.contains(&txn_id) {
+                        per_txn
+                            .entry(txn_id)
+                            .or_default()
+                            .push((pe.lsn, rec.clone()));
+                    }
+                }
+            }
+
+            for (txn_id, logrecs) in per_txn {
+                // Use the owning DB's comparator (all logrecs of one slot are
+                // same-db; CompareSlot orders by db id first). Pick the
+                // comparator from the first logrec's db; same-db keys only.
+                let db_id = logrecs[0].1.db_id;
+                let cmp_fn: Option<KeyComparatorFn> =
+                    trees.get(&db_id).and_then(|t| t.get_comparator().cloned());
+                let chain = match cmp_fn {
+                    Some(c) => crate::TxnChain::build(
+                        logrecs,
+                        period.matchpoint_lsn,
+                        &|a, b| c(a, b),
+                    ),
+                    None => crate::TxnChain::build(
+                        logrecs,
+                        period.matchpoint_lsn,
+                        &|a, b| a.cmp(b),
+                    ),
+                };
+                chains.insert((period.matchpoint_lsn.as_u64(), txn_id), chain);
+            }
+        }
+        chains
+    }
+
+    /// Single-tree variant of [`Self::build_rollback_chains`] for the
+    /// single-database `run_undo` path. Only LNs of `db_id` are considered
+    /// (the single tree under recovery); the supplied comparator is used.
+    fn build_single_tree_chains(
+        &self,
+        scanner: &dyn LogScanner,
+        db_id: u64,
+        cmp: Option<&noxu_tree::tree::KeyComparatorFn>,
+        chains: &mut HashMap<(u64, i64), crate::TxnChain>,
+    ) {
+        let periods: Vec<crate::RollbackPeriod> = self
+            .rollback_tracker
+            .get_rollback_periods()
+            .iter()
+            .cloned()
+            .chain(self.rollback_tracker.pending_periods())
+            .collect();
+
+        for period in &periods {
+            if period.rollback_start_lsn == NULL_LSN
+                || period.active_txn_ids.is_empty()
+            {
+                continue;
+            }
+            let chain_scan =
+                scanner.scan_forward(NULL_LSN, period.rollback_start_lsn);
+            let mut per_txn: HashMap<i64, Vec<(Lsn, LnRecord)>> =
+                HashMap::new();
+            for pe in &chain_scan {
+                if let LogEntry::Ln(rec) = &pe.entry {
+                    let Some(txn_u) = rec.txn_id else { continue };
+                    let txn_id = txn_u as i64;
+                    if rec.db_id == db_id
+                        && period.active_txn_ids.contains(&txn_id)
+                    {
+                        per_txn
+                            .entry(txn_id)
+                            .or_default()
+                            .push((pe.lsn, rec.clone()));
+                    }
+                }
+            }
+            for (txn_id, logrecs) in per_txn {
+                let chain = match cmp {
+                    Some(c) => crate::TxnChain::build(
+                        logrecs,
+                        period.matchpoint_lsn,
+                        &|a, b| c(a, b),
+                    ),
+                    None => crate::TxnChain::build(
+                        logrecs,
+                        period.matchpoint_lsn,
+                        &|a, b| a.cmp(b),
+                    ),
+                };
+                chains.insert((period.matchpoint_lsn.as_u64(), txn_id), chain);
+            }
+        }
+    }
+
+    /// Apply a single [`crate::RevertInfo`] to the tree: revert the LN at
+    /// `key` to the version it names. Mirrors JE `RecoveryManager.rollbackUndo`
+    /// -> `undo(... revertLsn, revertKD, revertPD, revertKey, revertData ...)`.
+    ///
+    /// - `revert_kd` (revert-to-known-deleted): the rolled-back logrec was the
+    ///   first write of the slot; delete the slot.
+    /// - `revert_pd` (revert-to-pending-deleted): the previous version is
+    ///   itself a delete; delete the slot.
+    /// - otherwise restore the previous version's data (embedded
+    ///   `revert_data`, or read from the log at `revert_lsn`).
+    fn apply_revert_info(
+        tree: &mut noxu_tree::Tree,
+        scanner: &dyn LogScanner,
+        rec: &LnRecord,
+        ri: &crate::RevertInfo,
+    ) {
+        if ri.revert_kd || ri.revert_pd {
+            tree.delete(&rec.key);
+            return;
+        }
+        if let Some(data) = &ri.revert_data {
+            let key = ri
+                .revert_key
+                .clone()
+                .unwrap_or_else(|| rec.key.clone())
+                .to_vec();
+            if let Err(e) = tree.insert(key, data.to_vec(), ri.revert_lsn) {
+                log::error!(
+                    "noxu-recovery: rollback revert (embedded) failed at \
+                     revert_lsn={:?}, db={}: {e:?}",
+                    ri.revert_lsn,
+                    rec.db_id,
+                );
+            }
+            return;
+        }
+        // Non-embedded previous version: read the before-image from the log.
+        if ri.revert_lsn == NULL_LSN {
+            tree.delete(&rec.key);
+            return;
+        }
+        match scanner.read_at_lsn(ri.revert_lsn) {
+            Some(LogEntry::Ln(prev)) => {
+                if let Some(prev_data) = prev.data {
+                    let key = ri
+                        .revert_key
+                        .clone()
+                        .map(|k| k.to_vec())
+                        .unwrap_or_else(|| prev.key.to_vec());
+                    if let Err(e) =
+                        tree.insert(key, prev_data.to_vec(), ri.revert_lsn)
+                    {
+                        log::error!(
+                            "noxu-recovery: rollback revert (non-embedded) \
+                             failed at revert_lsn={:?}, db={}: {e:?}",
+                            ri.revert_lsn,
+                            rec.db_id,
+                        );
+                    }
+                } else {
+                    tree.delete(&rec.key);
+                }
+            }
+            _ => {
+                tree.delete(&rec.key);
+            }
+        }
+    }
+
     /// Multi-DB undo pass.
     fn run_undo_all(
         &mut self,
@@ -782,8 +999,16 @@ impl RecoveryManager {
         if last_used == NULL_LSN {
             return Ok(());
         }
-        // Fast path: no uncommitted transactions → skip entire backward scan.
-        if !analysis.has_active_txns() {
+
+        // Build per-txn TxnChains for rollback periods (REP-1 STEP 3) so the
+        // in-window LNs can be REVERTED to their previous version rather than
+        // skipped. Done even when there are no analysis-active txns, because a
+        // rollback period's txns may already be terminal in the analysis.
+        let rollback_chains = self.build_rollback_chains(scanner, trees);
+
+        // Fast path: no uncommitted transactions AND no rollback work → skip
+        // the entire backward scan.
+        if !analysis.has_active_txns() && rollback_chains.is_empty() {
             return Ok(());
         }
         let stop = if first_active == NULL_LSN {
@@ -791,6 +1016,7 @@ impl RecoveryManager {
         } else {
             first_active
         };
+        let mut rollback_chains = rollback_chains;
         let entries = scanner.scan_backward(last_used, stop);
         for pe in &entries {
             if let LogEntry::Ln(rec) = &pe.entry {
@@ -799,7 +1025,32 @@ impl RecoveryManager {
                     Some(id) => id,
                     None => continue,
                 };
+                // REP-1 STEP 3: if this LN is in a rollback period and belongs
+                // to a rolled-back (active-at-matchpoint) txn, REVERT it to
+                // its previous version via the TxnChain instead of skipping.
+                if let Some(period) = self
+                    .rollback_tracker
+                    .find_period_for_ln(pe.lsn, txn_id as i64)
+                {
+                    let key = (period.matchpoint_lsn.as_u64(), txn_id as i64);
+                    if let Some(chain) = rollback_chains.get_mut(&key)
+                        && let Some(ri) = chain.pop()
+                        && let Some(t) = trees.get_mut(&rec.db_id)
+                    {
+                        Self::apply_revert_info(t, scanner, rec, &ri);
+                        self.stats.lns_undone += 1;
+                    }
+                    continue;
+                }
+                // In a rollback window but NOT an active-at-matchpoint txn
+                // (committed/aborted): leave it in place (containsLN gate).
                 if self.rollback_tracker.is_in_rollback_period(pe.lsn) {
+                    continue;
+                }
+                // A rollback-active txn's pre-matchpoint LNs are preserved
+                // (TxnChain.remainingLockedNodes): do NOT fully undo them as
+                // if the txn were an ordinary uncommitted txn.
+                if self.rollback_tracker.is_rollback_active_txn(txn_id as i64) {
                     continue;
                 }
                 if analysis.is_committed(txn_id) {
@@ -1857,7 +2108,23 @@ impl RecoveryManager {
 
         // Fast path: no uncommitted transactions → skip entire backward scan.
         // This is the common case after a clean shutdown.
-        if !analysis.has_active_txns() {
+        // Build rollback chains first so a rollback period is processed even
+        // when there are no analysis-active txns (REP-1 STEP 3).
+        let single_db_id = tree.as_deref().map(|t| t.get_database_id());
+        let single_cmp =
+            tree.as_deref().and_then(|t| t.get_comparator().cloned());
+        let mut rollback_chains: HashMap<(u64, i64), crate::TxnChain> =
+            HashMap::new();
+        if let Some(db_id) = single_db_id {
+            self.build_single_tree_chains(
+                scanner,
+                db_id,
+                single_cmp.as_ref(),
+                &mut rollback_chains,
+            );
+        }
+
+        if !analysis.has_active_txns() && rollback_chains.is_empty() {
             return Ok(());
         }
 
@@ -1887,11 +2154,32 @@ impl RecoveryManager {
                     None => continue,
                 };
 
-                // Skip entries in a rollback period (handled by HA).
+                // REP-1 STEP 3: revert in-rollback-period active-txn LNs to
+                // their previous version via the TxnChain instead of skipping.
+                if let Some(period) = self
+                    .rollback_tracker
+                    .find_period_for_ln(pe.lsn, txn_id as i64)
+                {
+                    let key = (period.matchpoint_lsn.as_u64(), txn_id as i64);
+                    if let Some(chain) = rollback_chains.get_mut(&key)
+                        && let Some(ri) = chain.pop()
+                        && let Some(t) = tree.as_deref_mut()
+                        && t.get_database_id() == rec.db_id
+                    {
+                        Self::apply_revert_info(t, scanner, rec, &ri);
+                        self.stats.lns_undone += 1;
+                    }
+                    continue;
+                }
+                // In a rollback window but committed/aborted txn: leave alone.
                 if self.rollback_tracker.is_in_rollback_period(pe.lsn) {
                     continue;
                 }
-
+                // Preserve a rollback-active txn's pre-matchpoint LNs
+                // (TxnChain.remainingLockedNodes).
+                if self.rollback_tracker.is_rollback_active_txn(txn_id as i64) {
+                    continue;
+                }
                 // Skip committed transactions.
                 // If (committedTxnIds.containsKey(txnId)) continue;
                 if analysis.is_committed(txn_id) {
@@ -3190,6 +3478,87 @@ mod tests {
         // Verify stats
         assert_eq!(mgr.get_stats().lns_undone, 1);
         assert_eq!(mgr.get_stats().active_txns_undone, 1);
+    }
+
+    /// REP-1 STEP 3 headline (recovery integration): an intra-txnal rollback
+    /// must REVERT the in-window LN to its previous version (v1), not skip
+    /// both versions.
+    ///
+    /// Scenario: txn 7 writes key K = v1 @100, then K = v2 @200. A rollback
+    /// period (matchpoint=150, start=300) with txn 7 active rolls back the
+    /// tail. JE: the v2 logrec reverts to v1 (TxnChain), so the tree ends with
+    /// K = v1. The old skip-both behaviour would have left v2 in place (no
+    /// undo at all) — wrong.
+    ///
+    /// Cite: TxnChain.java + RecoveryManager.rollbackUndo.
+    #[test]
+    fn test_rollback_reverts_intra_txnal_to_v1_in_tree() {
+        let mut tree = make_tree();
+        // Crash state: the tree currently holds v2 (the divergent tail).
+        tree.insert(b"K".to_vec(), b"v2".to_vec(), lsn(0, 200)).unwrap();
+
+        let mut scanner = InMemoryLogScanner::new();
+        // v1 @100 (first write of K by txn 7), abort=NULL/known-deleted.
+        scanner.push(
+            lsn(0, 100),
+            LogEntry::Ln(LnRecord::new(
+                1,
+                Some(7),
+                LnOperation::Insert,
+                Bytes::from_static(b"K"),
+                Some(Bytes::from_static(b"v1")),
+                NULL_LSN,
+                true,
+            )),
+        );
+        // v2 @200 (update of K by txn 7), abort points at the pre-txn (none).
+        scanner.push(
+            lsn(0, 200),
+            LogEntry::Ln(LnRecord::new(
+                1,
+                Some(7),
+                LnOperation::Update,
+                Bytes::from_static(b"K"),
+                Some(Bytes::from_static(b"v2")),
+                NULL_LSN,
+                true,
+            )),
+        );
+        // RollbackStart: matchpoint=150 (between v1 and v2), txn 7 active.
+        scanner.push(
+            lsn(0, 300),
+            LogEntry::RollbackStart(RollbackStartRecord {
+                matchpoint_vlsn: noxu_util::NULL_VLSN,
+                matchpoint_lsn: lsn(0, 150),
+                lsn: lsn(0, 300),
+                active_txn_ids: vec![7],
+            }),
+        );
+        scanner.push(
+            lsn(0, 350),
+            LogEntry::RollbackEnd(RollbackEndRecord {
+                matchpoint_lsn: lsn(0, 150),
+                lsn: lsn(0, 350),
+            }),
+        );
+
+        let mut mgr = RecoveryManager::new();
+        mgr.recover(&mut scanner, Some(&mut tree), false).unwrap();
+
+        // The tree must now hold v1 (reverted), NOT v2 and NOT empty.
+        let res = tree.search(b"K").expect("search should not fail");
+        assert!(res.exact_parent_found, "K must still exist (reverted to v1)");
+        let fetched = tree.search_with_data(b"K").expect("slot fetch");
+        assert_eq!(
+            fetched.data.as_deref(),
+            Some(&b"v1"[..]),
+            "rollback must revert K to v1, not skip both (would be v2/None)"
+        );
+        assert_eq!(
+            mgr.get_stats().lns_undone,
+            1,
+            "exactly one logrec (v2) rolled back"
+        );
     }
 
     /// Committed delete: the redo phase removes a key from the tree.
