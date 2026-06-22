@@ -430,6 +430,10 @@ impl<F: LogFileAccess> FileReader<F> {
                 let _ = &entry_data;
                 let _ = header_size;
                 let computed = if n >= total_size {
+                    // REP-1 STEP 4 (JE LogEntryHeader.turnOffInvisible): cloak
+                    // the invisible bit (flags 0x10) before checksumming so an
+                    // entry flipped invisible in-place by rollback validates.
+                    full_entry[5] &= !0x10u8;
                     ChecksumValidator::compute_range(
                         &full_entry,
                         CHECKSUM_BYTES,

@@ -464,11 +464,24 @@ impl FileManagerLogScanner {
             u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
         if stored_checksum != 0 {
             let entry_bytes = &data[offset..offset + entry_size];
-            let computed = ChecksumValidator::compute_range(
-                entry_bytes,
-                CHECKSUM_BYTES,
-                entry_size - CHECKSUM_BYTES,
-            );
+            // REP-1 STEP 4 (JE LogEntryHeader.turnOffInvisible): cloak the
+            // invisible bit (flags 0x10) before checksumming so an entry
+            // flipped invisible in-place by recovery rollback still validates.
+            let computed = if entry_bytes[5] & 0x10 != 0 {
+                let mut cloaked = entry_bytes.to_vec();
+                cloaked[5] &= !0x10u8;
+                ChecksumValidator::compute_range(
+                    &cloaked,
+                    CHECKSUM_BYTES,
+                    entry_size - CHECKSUM_BYTES,
+                )
+            } else {
+                ChecksumValidator::compute_range(
+                    entry_bytes,
+                    CHECKSUM_BYTES,
+                    entry_size - CHECKSUM_BYTES,
+                )
+            };
             if computed != stored_checksum {
                 // Return a sentinel that the scanner loop interprets as a
                 // hard parse failure; the caller in scan_files_forward / scan
@@ -552,11 +565,22 @@ impl FileManagerLogScanner {
             let stored = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
             if stored != 0 {
                 let entry_bytes = &data[offset..offset + entry_size];
-                let computed = ChecksumValidator::compute_range(
-                    entry_bytes,
-                    CHECKSUM_BYTES,
-                    entry_size - CHECKSUM_BYTES,
-                );
+                // REP-1 STEP 4: cloak the invisible bit before checksumming.
+                let computed = if entry_bytes[5] & 0x10 != 0 {
+                    let mut cloaked = entry_bytes.to_vec();
+                    cloaked[5] &= !0x10u8;
+                    ChecksumValidator::compute_range(
+                        &cloaked,
+                        CHECKSUM_BYTES,
+                        entry_size - CHECKSUM_BYTES,
+                    )
+                } else {
+                    ChecksumValidator::compute_range(
+                        entry_bytes,
+                        CHECKSUM_BYTES,
+                        entry_size - CHECKSUM_BYTES,
+                    )
+                };
                 if computed != stored {
                     return None;
                 }

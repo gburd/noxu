@@ -546,6 +546,97 @@ impl FileManager {
         Ok(())
     }
 
+    /// Flip the invisible bit (flags 0x10) on each LSN's log-entry header,
+    /// in file order, WITHOUT recomputing the checksum.
+    ///
+    /// Port of JE `FileManager.makeInvisible` (called from
+    /// `RollbackTracker.setInvisible`). The invisible bit is excluded from the
+    /// CRC at read time (cloaked, see `LogEntryHeader.turnOffInvisible` /
+    /// `log_manager` checksum path), so flipping it in place is a single-byte
+    /// `pwrite` per entry. The flags byte is at `file_offset + FLAGS_OFFSET`
+    /// (offset 5) of each entry.
+    ///
+    /// Caller must `force` the affected files afterwards for durability
+    /// (JE `RollbackTracker.recoveryEndFsyncInvisible`).
+    pub fn make_invisible(&self, file_num: u32, offsets: &[u32]) -> Result<()> {
+        if self.read_only {
+            return Err(LogError::WriteFailed(
+                "Cannot make entries invisible in read-only mode".to_string(),
+            ));
+        }
+        if offsets.is_empty() {
+            return Ok(());
+        }
+        let path = self.file_path(file_num);
+        if !path.exists() {
+            return Ok(());
+        }
+        // Drop any cached handle so the bit flip is observed on the next read.
+        self.file_cache.lock().pop(&file_num);
+        let file = OpenOptions::new().read(true).write(true).open(&path)?;
+        // FLAGS_OFFSET within an entry header is 5 (checksum[0..4], type[4],
+        // flags[5]).
+        const FLAGS_OFFSET: u64 = 5;
+        const INVISIBLE_MASK: u8 = 0x10;
+        for &off in offsets {
+            let flags_pos = off as u64 + FLAGS_OFFSET;
+            let mut byte = [0u8; 1];
+            Self::pread_exact(&file, flags_pos, &mut byte)?;
+            byte[0] |= INVISIBLE_MASK;
+            Self::pwrite_exact(&file, flags_pos, &byte)?;
+        }
+        Ok(())
+    }
+
+    /// fsync the given set of log files (JE `FileManager.force`). Used after
+    /// `make_invisible` to make the rollback's invisible bits durable so a
+    /// crash mid-rollback does not re-apply rolled-back entries.
+    pub fn force(&self, file_nums: &[u32]) -> Result<()> {
+        if self.read_only {
+            return Ok(());
+        }
+        for &file_num in file_nums {
+            let path = self.file_path(file_num);
+            if path.exists() {
+                let f = OpenOptions::new().write(true).open(&path)?;
+                f.sync_all()?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn pread_exact(file: &File, offset: u64, buf: &mut [u8]) -> Result<()> {
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(buf, offset)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn pwrite_exact(file: &File, offset: u64, buf: &[u8]) -> Result<()> {
+        use std::os::unix::fs::FileExt;
+        file.write_all_at(buf, offset)?;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn pread_exact(file: &File, offset: u64, buf: &mut [u8]) -> Result<()> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = file.try_clone()?;
+        f.seek(SeekFrom::Start(offset))?;
+        f.read_exact(buf)?;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn pwrite_exact(file: &File, offset: u64, buf: &[u8]) -> Result<()> {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut f = file.try_clone()?;
+        f.seek(SeekFrom::Start(offset))?;
+        f.write_all(buf)?;
+        Ok(())
+    }
+
     /// Truncate the log at (`file_num`, `offset`): truncate `file_num` to
     /// `offset` and delete every higher-numbered file, in descending order to
     /// avoid a log-entry gap (JE `FileManager.truncateLog`, FileManager.java:2374,

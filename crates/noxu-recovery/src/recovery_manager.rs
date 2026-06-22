@@ -262,6 +262,18 @@ pub struct RecoveryManager {
     /// structural undo is tracked as a future follow-up.
     /// See: the 2026 review.
     pub(crate) mapping_tree_db_names: HashMap<String, u64>,
+
+    /// LSNs of entries rolled back during the undo pass whose invisible bit
+    /// must be (re-)set on disk and fsynced, because the rollback that
+    /// produced them belongs to an OPEN-ENDED period (no `RollbackEnd`) and
+    /// its invisible-marking may not have been made durable before a crash.
+    ///
+    /// Port of JE `RollbackTracker.singlePassInvisibleLsns` (collected in
+    /// `Scanner.rollback` only `if (!target.hasRollbackEnd())`). The
+    /// environment layer applies these via `FileManager.make_invisible` +
+    /// `force` after recovery (`recoveryEndFsyncInvisible`), so the redo pass
+    /// on a subsequent crash never re-applies them.
+    single_pass_invisible_lsns: Vec<Lsn>,
 }
 
 impl RecoveryManager {
@@ -278,6 +290,7 @@ impl RecoveryManager {
             undo_entries: Vec::new(),
             per_db_redo_count: HashMap::new(),
             mapping_tree_db_names: HashMap::new(),
+            single_pass_invisible_lsns: Vec::new(),
         }
     }
 
@@ -294,6 +307,7 @@ impl RecoveryManager {
             undo_entries: Vec::new(),
             per_db_redo_count: HashMap::new(),
             mapping_tree_db_names: HashMap::new(),
+            single_pass_invisible_lsns: Vec::new(),
         }
     }
 
@@ -314,6 +328,18 @@ impl RecoveryManager {
     /// Get the rollback tracker.
     pub fn get_rollback_tracker(&self) -> &RollbackTracker {
         &self.rollback_tracker
+    }
+
+    /// LSNs of rolled-back entries (from OPEN-ENDED rollback periods) whose
+    /// invisible bit must be (re-)set on disk and fsynced after recovery.
+    ///
+    /// Port of JE `RollbackTracker.singlePassInvisibleLsns` +
+    /// `recoveryEndFsyncInvisible`: the environment layer flips the invisible
+    /// bit on these LSNs (in file order) via `FileManager.make_invisible` and
+    /// `FileManager.force`, so a crash mid-rollback before the bits were
+    /// durable does not let the redo pass re-apply them.
+    pub fn invisible_lsns_to_mark(&self) -> &[Lsn] {
+        &self.single_pass_invisible_lsns
     }
 
     /// Check if using existing checkpoint.
@@ -1039,6 +1065,14 @@ impl RecoveryManager {
                     {
                         Self::apply_revert_info(t, scanner, rec, &ri);
                         self.stats.lns_undone += 1;
+                    }
+                    // REP-1 STEP 4: for an OPEN-ENDED period (no RollbackEnd),
+                    // the rollback's invisible-marking may not be durable; (re-)
+                    // mark this rolled-back LSN invisible + fsync after recovery
+                    // (JE: Scanner.rollback collects into singlePassInvisibleLsns
+                    // only `if (!target.hasRollbackEnd())`).
+                    if !period.is_complete() {
+                        self.single_pass_invisible_lsns.push(pe.lsn);
                     }
                     continue;
                 }
@@ -2168,6 +2202,10 @@ impl RecoveryManager {
                     {
                         Self::apply_revert_info(t, scanner, rec, &ri);
                         self.stats.lns_undone += 1;
+                    }
+                    // REP-1 STEP 4: open-ended period → (re-)mark invisible.
+                    if !period.is_complete() {
+                        self.single_pass_invisible_lsns.push(pe.lsn);
                     }
                     continue;
                 }
@@ -3558,6 +3596,123 @@ mod tests {
             mgr.get_stats().lns_undone,
             1,
             "exactly one logrec (v2) rolled back"
+        );
+    }
+
+    /// REP-1 STEP 4: a crash mid-rollback (OPEN-ENDED period — RollbackStart
+    /// with no RollbackEnd) must (re-)mark the rolled-back entries invisible
+    /// and report them for fsync, so a subsequent redo never re-applies them.
+    ///
+    /// Cite: RollbackTracker.singlePassSetInvisible /
+    /// recoveryEndFsyncInvisible (collected `if (!target.hasRollbackEnd())`).
+    #[test]
+    fn test_open_ended_rollback_remarks_invisible() {
+        let mut tree = make_tree();
+        tree.insert(b"K".to_vec(), b"v2".to_vec(), lsn(0, 200)).unwrap();
+
+        let mut scanner = InMemoryLogScanner::new();
+        scanner.push(
+            lsn(0, 100),
+            LogEntry::Ln(LnRecord::new(
+                1,
+                Some(7),
+                LnOperation::Insert,
+                Bytes::from_static(b"K"),
+                Some(Bytes::from_static(b"v1")),
+                NULL_LSN,
+                true,
+            )),
+        );
+        scanner.push(
+            lsn(0, 200),
+            LogEntry::Ln(LnRecord::new(
+                1,
+                Some(7),
+                LnOperation::Update,
+                Bytes::from_static(b"K"),
+                Some(Bytes::from_static(b"v2")),
+                NULL_LSN,
+                true,
+            )),
+        );
+        // RollbackStart with NO matching RollbackEnd (crash mid-rollback).
+        scanner.push(
+            lsn(0, 300),
+            LogEntry::RollbackStart(RollbackStartRecord {
+                matchpoint_vlsn: noxu_util::NULL_VLSN,
+                matchpoint_lsn: lsn(0, 150),
+                lsn: lsn(0, 300),
+                active_txn_ids: vec![7],
+            }),
+        );
+
+        let mut mgr = RecoveryManager::new();
+        mgr.recover(&mut scanner, Some(&mut tree), false).unwrap();
+
+        // The rolled-back v2 @200 must be reported for invisible re-marking.
+        let to_mark = mgr.invisible_lsns_to_mark();
+        assert_eq!(
+            to_mark,
+            &[lsn(0, 200)],
+            "open-ended period must report the rolled-back LSN for re-marking"
+        );
+    }
+
+    /// REP-1 STEP 4: a COMPLETE rollback period (RollbackStart + RollbackEnd)
+    /// has durable invisible bits, so recovery does NOT re-mark them.
+    #[test]
+    fn test_complete_rollback_does_not_remark_invisible() {
+        let mut tree = make_tree();
+        tree.insert(b"K".to_vec(), b"v2".to_vec(), lsn(0, 200)).unwrap();
+
+        let mut scanner = InMemoryLogScanner::new();
+        scanner.push(
+            lsn(0, 100),
+            LogEntry::Ln(LnRecord::new(
+                1,
+                Some(7),
+                LnOperation::Insert,
+                Bytes::from_static(b"K"),
+                Some(Bytes::from_static(b"v1")),
+                NULL_LSN,
+                true,
+            )),
+        );
+        scanner.push(
+            lsn(0, 200),
+            LogEntry::Ln(LnRecord::new(
+                1,
+                Some(7),
+                LnOperation::Update,
+                Bytes::from_static(b"K"),
+                Some(Bytes::from_static(b"v2")),
+                NULL_LSN,
+                true,
+            )),
+        );
+        scanner.push(
+            lsn(0, 300),
+            LogEntry::RollbackStart(RollbackStartRecord {
+                matchpoint_vlsn: noxu_util::NULL_VLSN,
+                matchpoint_lsn: lsn(0, 150),
+                lsn: lsn(0, 300),
+                active_txn_ids: vec![7],
+            }),
+        );
+        scanner.push(
+            lsn(0, 350),
+            LogEntry::RollbackEnd(RollbackEndRecord {
+                matchpoint_lsn: lsn(0, 150),
+                lsn: lsn(0, 350),
+            }),
+        );
+
+        let mut mgr = RecoveryManager::new();
+        mgr.recover(&mut scanner, Some(&mut tree), false).unwrap();
+
+        assert!(
+            mgr.invisible_lsns_to_mark().is_empty(),
+            "a complete rollback period must NOT be re-marked invisible"
         );
     }
 
