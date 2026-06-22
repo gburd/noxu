@@ -84,6 +84,58 @@ pub fn rollback(
 ) -> Result<RollbackOutcome> {
     use bytes::BytesMut;
 
+    // Steps 1, 3, 4 (RollbackStart + make-invisible + fsync).
+    let rollback_start_lsn = rollback_steps_1_to_4(
+        log_manager,
+        matchpoint_vlsn,
+        matchpoint_lsn,
+        active_txn_ids,
+        rollback_lsns,
+    )?;
+
+    // ----------------------------------------------------------------------
+    // Step 5: log and fsync RollbackEnd, so a later recovery can skip the
+    // re-make-invisible step (JE: "If the RollbackEnd exists, we can skip the
+    // step of re-making LNs invisible").
+    // ----------------------------------------------------------------------
+    let end_entry = RollbackEndEntry::new(matchpoint_lsn, rollback_start_lsn);
+    let mut end_buf = BytesMut::new();
+    end_entry.write_to_log(&mut end_buf);
+    let rollback_end_lsn = log_manager
+        .log(LogEntryType::RollbackEnd, &end_buf, Provisional::No, true, true)
+        .map_err(|e| {
+            RecoveryError::RollbackError(format!(
+                "logging RollbackEnd failed: {e}"
+            ))
+        })?;
+
+    Ok(RollbackOutcome {
+        rollback_start_lsn,
+        rollback_end_lsn,
+        invisible_lsns: rollback_lsns.to_vec(),
+    })
+}
+
+/// Perform JE `Replay.rollback` steps 1, 3, and 4 ONLY (log + fsync
+/// `RollbackStart`; make the rolled-back LSNs invisible; fsync them) WITHOUT
+/// step 5 (`RollbackEnd`). Returns the `RollbackStart` LSN.
+///
+/// This is the durable state a replica is in if it CRASHES mid-rollback: the
+/// `RollbackStart` and the invisible bits are on disk, but no `RollbackEnd`.
+/// On restart, recovery sees an OPEN-ENDED rollback period and completes it
+/// (re-marks the in-window LNs invisible + fsyncs them) via the STEP 4
+/// machinery (`RollbackTracker.singlePassInvisibleLsns` /
+/// `recoveryEndFsyncInvisible`). Exposed so the crash-mid-rollback test can
+/// reproduce that exact state.
+pub fn rollback_steps_1_to_4(
+    log_manager: &LogManager,
+    matchpoint_vlsn: Vlsn,
+    matchpoint_lsn: Lsn,
+    active_txn_ids: Vec<i64>,
+    rollback_lsns: &[Lsn],
+) -> Result<Lsn> {
+    use bytes::BytesMut;
+
     // ----------------------------------------------------------------------
     // Step 1: log and fsync RollbackStart.
     //
@@ -144,27 +196,7 @@ pub fn rollback(
         })?;
     }
 
-    // ----------------------------------------------------------------------
-    // Step 5: log and fsync RollbackEnd, so a later recovery can skip the
-    // re-make-invisible step (JE: "If the RollbackEnd exists, we can skip the
-    // step of re-making LNs invisible").
-    // ----------------------------------------------------------------------
-    let end_entry = RollbackEndEntry::new(matchpoint_lsn, rollback_start_lsn);
-    let mut end_buf = BytesMut::new();
-    end_entry.write_to_log(&mut end_buf);
-    let rollback_end_lsn = log_manager
-        .log(LogEntryType::RollbackEnd, &end_buf, Provisional::No, true, true)
-        .map_err(|e| {
-            RecoveryError::RollbackError(format!(
-                "logging RollbackEnd failed: {e}"
-            ))
-        })?;
-
-    Ok(RollbackOutcome {
-        rollback_start_lsn,
-        rollback_end_lsn,
-        invisible_lsns: rollback_lsns.to_vec(),
-    })
+    Ok(rollback_start_lsn)
 }
 
 #[cfg(test)]
@@ -204,7 +236,7 @@ mod tests {
             rolled_back.push(lsn);
         }
         // Matchpoint is "before" the rolled-back entries (use a low LSN).
-        let matchpoint_lsn = Lsn::new(0, 36);
+        let matchpoint_lsn = Lsn::new(0, 1);
         let outcome = rollback(
             &lm,
             Vlsn::new(5),
@@ -238,9 +270,7 @@ mod tests {
     }
 
     /// An empty rollback (no LSNs to make invisible) still writes the
-    /// Start/End pair (JE logs them even when the in-memory rollback found
-    /// nothing, though it asserts non-empty in production; the durable
-    /// markers are harmless).
+    /// Start/End pair (the durable markers are harmless).
     #[test]
     fn test_live_rollback_empty_lsns() {
         let dir = TempDir::new().unwrap();
@@ -248,5 +278,107 @@ mod tests {
         let outcome =
             rollback(&lm, Vlsn::new(1), Lsn::new(0, 36), vec![], &[]).unwrap();
         assert!(outcome.invisible_lsns.is_empty());
+    }
+
+    /// CRASH-MID-ROLLBACK (B+C integrate with STEP 4): a replica performs the
+    /// live rollback's durable steps 1, 3, 4 (RollbackStart + make-invisible +
+    /// fsync) and then CRASHES before step 5 (RollbackEnd). On restart,
+    /// recovery must see an OPEN-ENDED rollback period and the rolled-back
+    /// entries must stay invisible (the redo pass must not re-apply them).
+    ///
+    /// Port of the JE crash-mid-rollback recovery path: `RollbackTracker`
+    /// sees a `RollbackStart` with no matching `RollbackEnd`
+    /// (`hasRollbackEnd() == false`) and completes the rollback via
+    /// `singlePassInvisibleLsns` / `recoveryEndFsyncInvisible`.
+    #[test]
+    fn test_crash_mid_rollback_recovers_via_step4() {
+        use crate::rollback_tracker::RollbackTracker;
+        use noxu_log::entry::RollbackStartEntry;
+
+        let dir = TempDir::new().unwrap();
+        let lm = make_log_manager(&dir);
+
+        // Pre-rollback entries (the divergent tail), and a matchpoint LSN.
+        let matchpoint_lsn = Lsn::new(0, 1);
+        let mut rolled_back = Vec::new();
+        for i in 0..3u8 {
+            let lsn = lm
+                .log(
+                    LogEntryType::InsertLNTxn,
+                    &[i; 16],
+                    Provisional::No,
+                    true,
+                    false,
+                )
+                .unwrap();
+            rolled_back.push(lsn);
+        }
+
+        // CRASH point: perform steps 1–4 only (no RollbackEnd).
+        let rollback_start_lsn = rollback_steps_1_to_4(
+            &lm,
+            Vlsn::new(5),
+            matchpoint_lsn,
+            vec![42, 43],
+            &rolled_back,
+        )
+        .unwrap();
+
+        // The rolled-back entries are invisible on disk (STEP 4 cloak).
+        let fm = lm.file_manager();
+        const INVISIBLE_MASK: u8 = 0x10;
+        for lsn in &rolled_back {
+            let mut hdr = [0u8; 16];
+            fm.read_from_file(
+                lsn.file_number(),
+                lsn.file_offset() as u64,
+                &mut hdr,
+            )
+            .unwrap();
+            assert!(
+                hdr[5] & INVISIBLE_MASK != 0,
+                "crash-mid-rollback: entry {lsn:?} must already be invisible"
+            );
+        }
+
+        // RESTART: recovery reads the RollbackStart, finds NO RollbackEnd, and
+        // registers an OPEN-ENDED period. Re-read the RollbackStart from disk
+        // and feed the tracker exactly as run_analysis does.
+        let mut start_hdr_and_body = vec![0u8; 4096];
+        let n = fm
+            .read_from_file(
+                rollback_start_lsn.file_number(),
+                rollback_start_lsn.file_offset() as u64,
+                &mut start_hdr_and_body,
+            )
+            .unwrap();
+        assert!(n > 0);
+        // The RollbackStart body begins after the entry header. The header is
+        // 14 bytes (non-VLSN) for a log() write. Decode the entry.
+        let body = &start_hdr_and_body[14..];
+        let start_entry = RollbackStartEntry::read_from_log(body)
+            .expect("decode RollbackStart from disk");
+        assert_eq!(start_entry.matchpoint_lsn, matchpoint_lsn);
+        assert_eq!(start_entry.active_txn_ids, vec![42, 43]);
+
+        let mut tracker = RollbackTracker::new();
+        tracker.record_rollback_start(rollback_start_lsn, &start_entry);
+        // No RollbackEnd was written → the period is OPEN-ENDED.
+        assert!(
+            tracker.has_incomplete_rollbacks(),
+            "recovery must see an open-ended rollback period (no RollbackEnd)"
+        );
+        // The rolled-back LSNs are inside the (matchpoint, start) window, so
+        // recovery knows to keep them invisible / re-mark them.
+        for lsn in &rolled_back {
+            assert!(
+                tracker.is_in_rollback_period(*lsn),
+                "rolled-back {lsn:?} must be inside the open-ended period"
+            );
+            // And gated by the active txn ids (STEP 2): txn 42 is reverted,
+            // an unrelated txn is not.
+            assert!(tracker.contains_ln(*lsn, 42));
+            assert!(!tracker.contains_ln(*lsn, 999));
+        }
     }
 }
