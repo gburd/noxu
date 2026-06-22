@@ -1325,15 +1325,17 @@ fn find_node_full_recursive(
                 is_root: b.node_id == root_id,
             };
             // Size formula (BIN): struct overhead + per-slot fixed overhead +
-            // variable key and embedded-LN data bytes.
+            // variable key and embedded-LN data bytes.  T-2/T-3: keys and
+            // LSNs live in node-level reps (BinStub.keys / lsn_rep), not in
+            // BinEntry.
             let size = (size_of::<BinStub>()
                 + b.entries.len() * size_of::<BinEntry>()
+                + b.key_prefix.len()
+                + b.keys.memory_size()
+                + b.lsn_rep.memory_size()
                 + b.entries
                     .iter()
-                    .map(|e| {
-                        e.key.len()
-                            + e.data.as_ref().map(|d| d.len()).unwrap_or(0)
-                    })
+                    .map(|e| e.data.as_ref().map(|d| d.len()).unwrap_or(0))
                     .sum::<usize>()) as u64;
             let arc = Arc::clone(node_arc);
             drop(guard);
@@ -2372,7 +2374,7 @@ mod tests {
         // the initial tree shape; walk until we hit a Bottom node).
         fn find_bin_node(
             node_arc: &Arc<noxu_tree::NodeRwLock<TreeNode>>,
-        ) -> Option<(u64, Vec<(usize, usize)>)> {
+        ) -> Option<(u64, Vec<(usize, usize)>, usize)> {
             let guard = node_arc.read();
             match &*guard {
                 TreeNode::Bottom(b) => {
@@ -2382,12 +2384,16 @@ mod tests {
                         .iter()
                         .map(|e| {
                             (
-                                e.key.len(),
+                                0usize, // T-2: key bytes are in the node rep
                                 e.data.as_ref().map(|d| d.len()).unwrap_or(0),
                             )
                         })
                         .collect();
-                    Some((id, entries))
+                    // T-2/T-3: node-level key/LSN rep bytes + prefix.
+                    let rep_bytes = b.keys.memory_size()
+                        + b.lsn_rep.memory_size()
+                        + b.key_prefix.len();
+                    Some((id, entries, rep_bytes))
                 }
                 TreeNode::Internal(n) => {
                     // The first child should eventually lead to a BIN.
@@ -2398,7 +2404,7 @@ mod tests {
             }
         }
 
-        let (bin_id, bin_entries) = {
+        let (bin_id, bin_entries, bin_rep_bytes) = {
             let t = tree.read().unwrap();
             let root_arc = t.get_root().expect("tree must have a root");
             find_bin_node(&root_arc).expect("must find a BIN leaf")
@@ -2407,6 +2413,7 @@ mod tests {
         // Compute expected size using the explicit formula.
         let expected: u64 = (size_of::<BinStub>()
             + bin_entries.len() * size_of::<BinEntry>()
+            + bin_rep_bytes
             + bin_entries.iter().map(|(k, d)| k + d).sum::<usize>())
             as u64;
 

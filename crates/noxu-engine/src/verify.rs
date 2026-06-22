@@ -413,7 +413,7 @@ fn verify_bin_stub(
     // Check each slot.
     for (i, entry) in bin.entries.iter().enumerate() {
         // Non-deleted entries must have a valid LSN.
-        if !entry.known_deleted && entry.lsn == NULL_LSN {
+        if !entry.known_deleted && bin.get_lsn(i) == NULL_LSN {
             result.add_error(VerifyError::BtreeError {
                 db_name: db_name.to_string(),
                 description: format!(
@@ -509,10 +509,11 @@ fn gather_node_lsns(node_arc: &Arc<RwLock<TreeNode>>, lsns: &mut HashSet<Lsn>) {
             }
         }
         TreeNode::Bottom(bin) => {
-            for entry in &bin.entries {
+            for (i, entry) in bin.entries.iter().enumerate() {
                 // JE GatherLSNs.processLSN skips DbLsn.NULL_LSN.
-                if !entry.known_deleted && entry.lsn != NULL_LSN {
-                    lsns.insert(entry.lsn);
+                let lsn = bin.get_lsn(i);
+                if !entry.known_deleted && lsn != NULL_LSN {
+                    lsns.insert(lsn);
                 }
             }
         }
@@ -1019,9 +1020,9 @@ mod tests {
                 let mut guard = node.write();
                 match &mut *guard {
                     TreeNode::Bottom(bin) => {
-                        if let Some(entry) = bin.entries.first_mut() {
-                            entry.known_deleted = false;
-                            entry.lsn = null_lsn;
+                        if !bin.entries.is_empty() {
+                            bin.entries[0].known_deleted = false;
+                            bin.set_lsn(0, null_lsn);
                             return true;
                         }
                         false

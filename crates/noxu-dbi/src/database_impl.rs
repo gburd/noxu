@@ -400,6 +400,17 @@ impl DatabaseImpl {
         }
     }
 
+    /// T-5: thread `TREE_COMPACT_MAX_KEY_LENGTH` into the real tree so the BIN
+    /// compact-key rep (`INKeyRep.MaxKeySize`) uses the configured threshold
+    /// (`IN.getCompactMaxKeyLength`).
+    pub fn set_tree_compact_max_key_length(&mut self, len: i32) {
+        if let Some(tree_arc) = self.real_tree.as_ref()
+            && let Ok(mut tree) = tree_arc.write()
+        {
+            tree.set_compact_max_key_length(len);
+        }
+    }
+
     // Configuration
     pub fn max_tree_entries_per_node(&self) -> i32 {
         self.max_tree_entries_per_node

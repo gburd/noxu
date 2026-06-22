@@ -68,13 +68,19 @@ pub const INSERT_SUCCESS: i32 = 1 << 17;
 /// Faithful to JE `IN.getEntryInMemorySize` + the per-slot `entryStates` /
 /// LSN-array overhead folded into `IN.computeMemorySize` (IN.java ~4632):
 /// JE measures the slot's fixed cost with `Sizeof` on the JVM; Rust has a
-/// fixed struct layout so `size_of::<BinEntry>()` is exact.  The previous
-/// magic constant `48` *undercounted* every BIN slot (a `BinEntry` is 64
-/// bytes), so the live budget read below real heap and the evictor under-fired.
+/// fixed struct layout so `size_of::<BinEntry>()` is exact.
+///
+/// T-2/T-3: the per-slot `key` (`Vec<u8>` header) and `lsn` (`u64`) were
+/// hoisted out of `BinEntry` into the node-level `KeyRep`/`LsnRep`.  The
+/// `size_of::<BinEntry>()` therefore shrank; we add back the packed per-slot
+/// LSN-rep cost (`LsnRep::BYTES_PER_LSN_ENTRY`, 4 bytes) so the incremental
+/// live counter still approximates the walked heap (the key bytes are charged
+/// separately as `key.len()` at the call site, matching the compact key rep).
 ///
 /// Derived (not hard-coded) so a layout change to `BinEntry` is tracked
 /// automatically — see `bin_stub_conformance` for the drift guard.
-pub const BIN_ENTRY_OVERHEAD: usize = std::mem::size_of::<BinEntry>();
+pub const BIN_ENTRY_OVERHEAD: usize =
+    std::mem::size_of::<BinEntry>() + LsnRep::BYTES_PER_LSN_ENTRY;
 
 /// Per-slot fixed memory overhead for an IN entry, in bytes (DBI-23).
 ///
@@ -220,6 +226,17 @@ pub struct Tree {
     ///
     /// Ref: `IN.java computeKeyPrefix` ~line 2456.
     pub key_prefixing: bool,
+    /// T-5: maximum post-prefix key length (bytes) for the compact key rep
+    /// (`INKeyRep.MaxKeySize`).  A node packs all its keys into one fixed-width
+    /// byte array when every post-prefix key is `<=` this length; a longer key
+    /// inflates the node to the `Default` rep.  `<= 0` disables the compact
+    /// rep entirely.
+    ///
+    /// Default 16 (`TREE_COMPACT_MAX_KEY_LENGTH` /
+    /// `INKeyRep.MaxKeySize.DEFAULT_MAX_KEY_LENGTH`).  Wired from
+    /// `EnvironmentConfig` via `Tree::set_compact_max_key_length`
+    /// (`IN.getCompactMaxKeyLength`, IN.java:4929).
+    pub compact_max_key_length: i32,
 }
 
 /// A node in the tree.
@@ -463,6 +480,501 @@ impl TargetRep {
     }
 }
 
+/// T-3: node-level packed LSN array — `IN.entryLsnByteArray` /
+/// `IN.entryLsnLongArray` (IN.java:251-289, getLsn/setLsnInternal
+/// IN.java:1752-1935).
+///
+/// JE stores one LSN per slot.  A naive `Lsn` (u64) costs 8 bytes/slot even
+/// though most LSNs in a node share a file number and have a file offset that
+/// fits in 3 bytes.  JE's compact rep is a single `byte[]` with
+/// `BYTES_PER_LSN_ENTRY == 4` bytes per slot:
+///
+///   * `base_file_number` is the lowest file number of any non-NULL LSN in the
+///     node;
+///   * byte 0 of each slot = `file_number - base_file_number` (0..=127,
+///     `Byte.MAX_VALUE`);
+///   * bytes 1..4 = the 3-byte little-endian file offset (max
+///     `MAX_FILE_OFFSET == 0xff_fffe`).
+///
+/// The NULL_LSN blocker (Noxu `NULL_LSN == u64::MAX`) is solved EXACTLY as JE
+/// does it: NULL is NOT stored as the raw u64; the slot's 3 file-offset bytes
+/// are set to `0xff_ffff` (`THREE_BYTE_NEGATIVE_ONE`), a value `MAX_FILE_OFFSET`
+/// can never reach, and `get_lsn` maps it back to `NULL_LSN`.
+///
+/// If a file-number difference exceeds 127 or a file offset exceeds
+/// `MAX_FILE_OFFSET`, the rep mutates to `Long` (one `u64` per slot), matching
+/// JE's `mutateToLongArray` (IN.java:1924).  An all-NULL node uses `Empty`
+/// (0 bytes), matching the EMPTY_REP/initial-capacity-free state.
+#[derive(Debug)]
+pub enum LsnRep {
+    /// All slots NULL — 0 heap bytes (the `byteArray == null` initial state).
+    Empty,
+    /// `IN.entryLsnByteArray` — 4 bytes/slot, `base_file_number`-relative.
+    Compact { base_file_number: u32, bytes: Vec<u8> },
+    /// `IN.entryLsnLongArray` — 8 bytes/slot fallback after `mutateToLongArray`.
+    Long(Vec<Lsn>),
+}
+
+impl LsnRep {
+    /// `IN.BYTES_PER_LSN_ENTRY` (IN.java:151).
+    pub const BYTES_PER_LSN_ENTRY: usize = 4;
+    /// `IN.MAX_FILE_OFFSET` (IN.java:152) — max file offset the 3-byte form holds.
+    const MAX_FILE_OFFSET: u32 = 0x00ff_fffe;
+    /// `IN.THREE_BYTE_NEGATIVE_ONE` (IN.java:153) — the NULL sentinel in the
+    /// 3 file-offset bytes.
+    const THREE_BYTE_NEGATIVE_ONE: u32 = 0x00ff_ffff;
+    /// `Byte.MAX_VALUE` — max file-number difference the 1-byte offset holds.
+    const MAX_FILE_NUMBER_OFFSET: u32 = 127;
+
+    /// A rep sized for `n` slots, all NULL.  Returns `Empty` (0 bytes); the
+    /// Compact byte array is lazily allocated by the first non-NULL `set_lsn`
+    /// — `base_file_number` is unknown until then (IN.java:1820, the
+    /// `baseFileNumber == -1` first-entry case).
+    #[inline]
+    pub fn new(_n: usize) -> Self {
+        LsnRep::Empty
+    }
+
+    /// Build a rep from a per-slot `Lsn` slice (used by node construction and
+    /// split, where slots arrive together).  Equivalent to `new(lsns.len())`
+    /// followed by `set(i, lsns[i])` for each slot.
+    pub fn from_lsns(lsns: &[Lsn]) -> Self {
+        let mut rep = LsnRep::Empty;
+        let n = lsns.len();
+        for (i, &lsn) in lsns.iter().enumerate() {
+            rep.set(i, lsn, n);
+        }
+        rep
+    }
+
+    /// `IN.getLsn(idx)` (IN.java:1752).
+    pub fn get(&self, idx: usize) -> Lsn {
+        match self {
+            LsnRep::Empty => NULL_LSN,
+            LsnRep::Long(v) => v.get(idx).copied().unwrap_or(NULL_LSN),
+            LsnRep::Compact { base_file_number, bytes } => {
+                let off = idx * Self::BYTES_PER_LSN_ENTRY;
+                if off + Self::BYTES_PER_LSN_ENTRY > bytes.len() {
+                    return NULL_LSN;
+                }
+                let file_offset = Self::get_3byte(bytes, off + 1);
+                if file_offset == Self::THREE_BYTE_NEGATIVE_ONE {
+                    NULL_LSN
+                } else {
+                    let file_number = base_file_number + bytes[off] as u32;
+                    Lsn::new(file_number, file_offset)
+                }
+            }
+        }
+    }
+
+    /// `IN.setLsnInternal(idx, value)` (IN.java:1801) — set the LSN of slot
+    /// `idx`, mutating Empty→Compact→Long as necessary.  `n` is the node's
+    /// slot count (sizes a freshly-allocated Compact array).
+    pub fn set(&mut self, idx: usize, lsn: Lsn, n: usize) {
+        // Empty: first non-NULL value allocates the Compact array; a NULL set
+        // on an Empty rep is a no-op (all slots already read NULL).
+        if let LsnRep::Empty = self {
+            if lsn.is_null() {
+                return;
+            }
+            let cap = n.max(idx + 1);
+            *self = LsnRep::Compact {
+                base_file_number: lsn.file_number(),
+                bytes: vec![0u8; cap * Self::BYTES_PER_LSN_ENTRY],
+            };
+            // Mark every other slot NULL (3-byte offset = 0xffffff).
+            if let LsnRep::Compact { bytes, .. } = self {
+                for s in 0..cap {
+                    if s != idx {
+                        Self::put_3byte(
+                            bytes,
+                            s * Self::BYTES_PER_LSN_ENTRY + 1,
+                            Self::THREE_BYTE_NEGATIVE_ONE,
+                        );
+                    }
+                }
+            }
+            self.set(idx, lsn, n);
+            return;
+        }
+
+        if let LsnRep::Long(v) = self {
+            if idx >= v.len() {
+                v.resize(idx + 1, NULL_LSN);
+            }
+            v[idx] = lsn;
+            return;
+        }
+
+        // Compact path.
+        let LsnRep::Compact { base_file_number, bytes } = self else {
+            unreachable!()
+        };
+        let need = (idx + 1) * Self::BYTES_PER_LSN_ENTRY;
+        if need > bytes.len() {
+            let old = bytes.len() / Self::BYTES_PER_LSN_ENTRY;
+            bytes.resize(need, 0);
+            for s in old..(idx + 1) {
+                Self::put_3byte(
+                    bytes,
+                    s * Self::BYTES_PER_LSN_ENTRY + 1,
+                    Self::THREE_BYTE_NEGATIVE_ONE,
+                );
+            }
+        }
+        let off = idx * Self::BYTES_PER_LSN_ENTRY;
+
+        if lsn.is_null() {
+            // IN.java:1812 — file-number offset 0, file offset -1 (0xffffff).
+            bytes[off] = 0;
+            Self::put_3byte(bytes, off + 1, Self::THREE_BYTE_NEGATIVE_ONE);
+            return;
+        }
+
+        let this_file_number = lsn.file_number();
+        let this_file_offset = lsn.file_offset();
+
+        // Whether to fall back to the Long rep.
+        let mutate = this_file_offset > Self::MAX_FILE_OFFSET || {
+            if this_file_number < *base_file_number {
+                // IN.java:1827 — try to re-base downward; bail if any existing
+                // slot would then exceed the 1-byte file-number offset.
+                !Self::adjust_file_numbers(
+                    bytes,
+                    *base_file_number,
+                    this_file_number,
+                )
+            } else {
+                this_file_number - *base_file_number
+                    > Self::MAX_FILE_NUMBER_OFFSET
+            }
+        };
+
+        if mutate {
+            // IN.java:1924 mutateToLongArray.
+            let nelts = bytes.len() / Self::BYTES_PER_LSN_ENTRY;
+            let mut longs = vec![NULL_LSN; nelts.max(idx + 1)];
+            for (s, slot) in longs.iter_mut().enumerate().take(nelts) {
+                *slot = self_get_compact(*base_file_number, bytes, s);
+            }
+            longs[idx] = lsn;
+            *self = LsnRep::Long(longs);
+            return;
+        }
+
+        if this_file_number < *base_file_number {
+            *base_file_number = this_file_number;
+        }
+        bytes[off] = (this_file_number - *base_file_number) as u8;
+        Self::put_3byte(bytes, off + 1, this_file_offset);
+    }
+
+    /// `IN.adjustFileNumbers` (IN.java:1855) — re-base to a lower file number,
+    /// rewriting every existing slot's 1-byte offset.  Returns false (and
+    /// leaves `bytes` unchanged) if any slot would overflow the 1-byte offset.
+    fn adjust_file_numbers(
+        bytes: &mut [u8],
+        old_base: u32,
+        new_base: u32,
+    ) -> bool {
+        let stride = Self::BYTES_PER_LSN_ENTRY;
+        // First pass: verify none overflow.
+        let mut i = 0;
+        while i < bytes.len() {
+            if Self::get_3byte(bytes, i + 1) != Self::THREE_BYTE_NEGATIVE_ONE {
+                let cur_fn = old_base + bytes[i] as u32;
+                if cur_fn - new_base > Self::MAX_FILE_NUMBER_OFFSET {
+                    return false;
+                }
+            }
+            i += stride;
+        }
+        // Second pass: apply.
+        let mut i = 0;
+        while i < bytes.len() {
+            if Self::get_3byte(bytes, i + 1) != Self::THREE_BYTE_NEGATIVE_ONE {
+                let cur_fn = old_base + bytes[i] as u32;
+                bytes[i] = (cur_fn - new_base) as u8;
+            }
+            i += stride;
+        }
+        true
+    }
+
+    /// `INArrayRep.copy` analogue: shift LSNs when an entry is inserted at
+    /// `idx` (slots `>= idx` move up one).  Mirrors `targets.insert_shift`.
+    pub fn insert_shift(&mut self, idx: usize, n: usize) {
+        match self {
+            LsnRep::Empty => {}
+            LsnRep::Long(v) => {
+                if idx <= v.len() {
+                    v.insert(idx, NULL_LSN);
+                }
+            }
+            LsnRep::Compact { bytes, .. } => {
+                let stride = Self::BYTES_PER_LSN_ENTRY;
+                let cap = (n.max((bytes.len() / stride) + 1)) * stride;
+                bytes.resize(cap, 0);
+                let at = idx * stride;
+                // Shift the tail up by one slot.
+                bytes.copy_within(at..cap - stride, at + stride);
+                // The new slot reads NULL.
+                Self::put_3byte(bytes, at + 1, Self::THREE_BYTE_NEGATIVE_ONE);
+            }
+        }
+    }
+
+    /// `INArrayRep.copy` analogue: shift LSNs when entry `idx` is removed
+    /// (slots `> idx` move down one).  Mirrors `targets.remove_shift`.
+    pub fn remove_shift(&mut self, idx: usize) {
+        match self {
+            LsnRep::Empty => {}
+            LsnRep::Long(v) => {
+                if idx < v.len() {
+                    v.remove(idx);
+                }
+            }
+            LsnRep::Compact { bytes, .. } => {
+                let stride = Self::BYTES_PER_LSN_ENTRY;
+                let at = idx * stride;
+                if at + stride <= bytes.len() {
+                    bytes.copy_within(at + stride.., at);
+                    let newlen = bytes.len() - stride;
+                    bytes.truncate(newlen);
+                }
+            }
+        }
+    }
+
+    /// `IN.computeLsnOverhead` analogue: heap bytes of the rep itself.
+    pub fn memory_size(&self) -> usize {
+        use std::mem::size_of;
+        match self {
+            LsnRep::Empty => 0,
+            LsnRep::Compact { bytes, .. } => bytes.capacity(),
+            LsnRep::Long(v) => v.capacity() * size_of::<Lsn>(),
+        }
+    }
+
+    fn put_3byte(bytes: &mut [u8], offset: usize, value: u32) {
+        bytes[offset] = (value & 0xFF) as u8;
+        bytes[offset + 1] = ((value >> 8) & 0xFF) as u8;
+        bytes[offset + 2] = ((value >> 16) & 0xFF) as u8;
+    }
+
+    fn get_3byte(bytes: &[u8], offset: usize) -> u32 {
+        (bytes[offset] as u32)
+            | ((bytes[offset + 1] as u32) << 8)
+            | ((bytes[offset + 2] as u32) << 16)
+    }
+}
+
+/// Helper used by `LsnRep::set` during `mutateToLongArray` to read an existing
+/// Compact slot without borrowing `self` (which is mid-mutation).
+fn self_get_compact(base_file_number: u32, bytes: &[u8], idx: usize) -> Lsn {
+    let off = idx * LsnRep::BYTES_PER_LSN_ENTRY;
+    let file_offset = LsnRep::get_3byte(bytes, off + 1);
+    if file_offset == LsnRep::THREE_BYTE_NEGATIVE_ONE {
+        NULL_LSN
+    } else {
+        Lsn::new(base_file_number + bytes[off] as u32, file_offset)
+    }
+}
+
+/// `INKeyRep.MaxKeySize.DEFAULT_MAX_KEY_LENGTH` (INKeyRep.java) and the
+/// `TREE_COMPACT_MAX_KEY_LENGTH` config default.
+#[allow(non_upper_case_globals)]
+pub const INKeyRep_DEFAULT_MAX_KEY_LENGTH: i32 = 16;
+
+/// T-2: node-level key array — `INKeyRep.{Default,MaxKeySize}` (INKeyRep.java).
+///
+/// The per-slot key that used to live in `BinEntry`/`InEntry` as a `Vec<u8>`
+/// (24-byte header + a separate heap allocation per key) is hoisted here as a
+/// node-level rep.  When every (post-prefix) key in the node is `<=`
+/// `TREE_COMPACT_MAX_KEY_LENGTH` (default 16) the keys pack into ONE
+/// fixed-width byte buffer (`MaxKeySize`): `slot_width` bytes per slot, with a
+/// parallel `lengths` vector tracking the actual length of each key.  A key
+/// longer than the threshold inflates the whole node to the `Default` rep
+/// (one `Vec<u8>` per slot), matching JE's `Default.compact` /
+/// `MaxKeySize.expandToDefaultRep`.
+///
+/// As in JE, this stores the UNPREFIXED suffix (key prefixing strips the
+/// common prefix first), so the compact rep is the smaller post-prefix bytes.
+#[derive(Debug, Clone)]
+pub enum KeyRep {
+    /// `INKeyRep.Default` — one owned key per slot (any length).
+    Default(Vec<Vec<u8>>),
+    /// `INKeyRep.MaxKeySize` — all keys packed into one fixed-width buffer.
+    /// `buf.len() == slot_width * lengths.len()`; slot `i` occupies
+    /// `buf[i*slot_width .. i*slot_width + lengths[i]]`.
+    Compact { buf: Vec<u8>, slot_width: usize, lengths: Vec<u16> },
+}
+
+impl KeyRep {
+    /// An empty `Default` rep.
+    #[inline]
+    pub fn new() -> Self {
+        KeyRep::Default(Vec::new())
+    }
+
+    /// Build a `Default` rep from owned keys (callers may later `compact`).
+    #[inline]
+    pub fn from_keys(keys: Vec<Vec<u8>>) -> Self {
+        KeyRep::Default(keys)
+    }
+
+    /// Number of slots.
+    #[inline]
+    pub fn len(&self) -> usize {
+        match self {
+            KeyRep::Default(v) => v.len(),
+            KeyRep::Compact { lengths, .. } => lengths.len(),
+        }
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// `INKeyRep.get(idx)` / `getKey` — borrow the (post-prefix) key at slot
+    /// `idx` without allocating.
+    #[inline]
+    pub fn get(&self, idx: usize) -> &[u8] {
+        match self {
+            KeyRep::Default(v) => v[idx].as_slice(),
+            KeyRep::Compact { buf, slot_width, lengths } => {
+                let off = idx * slot_width;
+                &buf[off..off + lengths[idx] as usize]
+            }
+        }
+    }
+
+    /// Set the key at slot `idx`.  A key longer than a Compact rep's
+    /// `slot_width` inflates the rep to `Default` first
+    /// (`MaxKeySize.expandToDefaultRep`).
+    pub fn set(&mut self, idx: usize, key: Vec<u8>) {
+        match self {
+            KeyRep::Default(v) => v[idx] = key,
+            KeyRep::Compact { slot_width, .. } if key.len() > *slot_width => {
+                self.inflate_to_default();
+                self.set(idx, key);
+            }
+            KeyRep::Compact { buf, slot_width, lengths } => {
+                let off = idx * *slot_width;
+                buf[off..off + key.len()].copy_from_slice(&key);
+                lengths[idx] = key.len() as u16;
+            }
+        }
+    }
+
+    /// Insert a key at slot `idx`, shifting later slots up (mirrors
+    /// `Vec::insert` + `INArrayRep.copy`).
+    pub fn insert(&mut self, idx: usize, key: Vec<u8>) {
+        match self {
+            KeyRep::Default(v) => v.insert(idx, key),
+            KeyRep::Compact { slot_width, .. } if key.len() > *slot_width => {
+                self.inflate_to_default();
+                self.insert(idx, key);
+            }
+            KeyRep::Compact { buf, slot_width, lengths } => {
+                let sw = *slot_width;
+                let at = idx * sw;
+                buf.splice(at..at, std::iter::repeat_n(0u8, sw));
+                buf[at..at + key.len()].copy_from_slice(&key);
+                lengths.insert(idx, key.len() as u16);
+            }
+        }
+    }
+
+    /// Remove the key at slot `idx`, shifting later slots down.
+    pub fn remove(&mut self, idx: usize) -> Vec<u8> {
+        match self {
+            KeyRep::Default(v) => v.remove(idx),
+            KeyRep::Compact { buf, slot_width, lengths } => {
+                let sw = *slot_width;
+                let len = lengths[idx] as usize;
+                let at = idx * sw;
+                let out = buf[at..at + len].to_vec();
+                buf.drain(at..at + sw);
+                lengths.remove(idx);
+                out
+            }
+        }
+    }
+
+    /// `INKeyRep.MaxKeySize.expandToDefaultRep` — mutate a Compact rep to a
+    /// Default rep (one owned `Vec<u8>` per slot).
+    fn inflate_to_default(&mut self) {
+        if let KeyRep::Compact { .. } = self {
+            let keys: Vec<Vec<u8>> =
+                (0..self.len()).map(|i| self.get(i).to_vec()).collect();
+            *self = KeyRep::Default(keys);
+        }
+    }
+
+    /// `INKeyRep.Default.compact(parent)` (INKeyRep.java) — if every key in a
+    /// `Default` rep fits `compact_max_key_length`, pack them into a
+    /// `MaxKeySize` (`Compact`) rep.  `compact_max_key_length <= 0` disables
+    /// compaction.  No-op when already Compact.
+    pub fn compact(&mut self, compact_max_key_length: i32) {
+        if compact_max_key_length <= 0 {
+            return;
+        }
+        let KeyRep::Default(keys) = self else {
+            return; // already Compact
+        };
+        if keys.is_empty() {
+            return;
+        }
+        let max_len = keys.iter().map(|k| k.len()).max().unwrap_or(0);
+        if max_len > compact_max_key_length as usize {
+            return; // a key exceeds the threshold — stay Default
+        }
+        let slot_width = max_len.max(1);
+        let mut buf = vec![0u8; slot_width * keys.len()];
+        let mut lengths = Vec::with_capacity(keys.len());
+        for (i, k) in keys.iter().enumerate() {
+            let off = i * slot_width;
+            buf[off..off + k.len()].copy_from_slice(k);
+            lengths.push(k.len() as u16);
+        }
+        *self = KeyRep::Compact { buf, slot_width, lengths };
+    }
+
+    /// True when key-byte memory is accounted for inside this rep (Compact),
+    /// vs per-slot `Vec` allocations (Default).
+    /// `INKeyRep.accountsForKeyByteMemUsage`.
+    #[inline]
+    pub fn is_compact(&self) -> bool {
+        matches!(self, KeyRep::Compact { .. })
+    }
+
+    /// Heap bytes of the rep itself (`INKeyRep.calculateMemorySize` +
+    /// key-byte accounting).  For Default this is the `Vec<Vec<u8>>` header
+    /// plus each key's heap allocation; for Compact it is the single buffer
+    /// plus the lengths vector.
+    pub fn memory_size(&self) -> usize {
+        use std::mem::size_of;
+        match self {
+            KeyRep::Default(v) => {
+                v.capacity() * size_of::<Vec<u8>>()
+                    + v.iter().map(|k| k.capacity()).sum::<usize>()
+            }
+            KeyRep::Compact { buf, lengths, .. } => {
+                buf.capacity() + lengths.capacity() * size_of::<u16>()
+            }
+        }
+    }
+}
+
+impl Default for KeyRep {
+    fn default() -> Self {
+        KeyRep::new()
+    }
+}
+
 /// Lightweight upper-IN representation used by the tree traversal layer.
 ///
 /// `IN`: carries the dirty flag (IN_DIRTY_BIT), the LRU
@@ -496,6 +1008,12 @@ pub struct InNodeStub {
     /// Enables dirty-propagation and latch-coupling validation.
     /// `IN.parent` reference used during splits and logging.
     pub parent: Option<Weak<RwLock<TreeNode>>>,
+    /// T-3: per-node packed LSN array (`IN.entryLsnByteArray`).  The per-slot
+    /// `lsn` (8 bytes) that used to live in `InEntry` is hoisted here as a
+    /// `base_file_number`-relative 4-byte-per-slot rep, falling back to a
+    /// `u64`-per-slot `Long` rep only when a node's LSN range exceeds the
+    /// compact form.  Access via `get_lsn(slot)` / `set_lsn(slot, lsn)`.
+    pub lsn_rep: LsnRep,
 }
 
 /// Entry in an IN node.
@@ -504,24 +1022,13 @@ pub struct InNodeStub {
 /// hoisted to the node-level `InNodeStub.targets` (`INTargetRep`); access the
 /// child for slot `i` via `InNodeStub::get_child(i)` / `set_child` / etc.
 ///
-/// DEFERRED heap compactions (the per-slot `key`/`lsn` axes — see
-/// `docs/src/operations/known-limitations.md`, heap-footprint-compaction row):
-///   * T-3 (`INLongRep`): pack the per-slot `lsn` (8 bytes) at the node's
-///     minimum byte-width.  Blocked on `NULL_LSN == u64::MAX`: JE `INLongRep`
-///     requires non-negative values and would force 8-byte width for any node
-///     with one NULL slot.  The faithful scope is JE's `baseFileNumber`
-///     -relative `entryLsnByteArray` + reserved transient-offset encoding.
-///   * T-2 (`INKeyRep.MaxKeySize`): pack all-small (`<= TREE_COMPACT_MAX_KEY
-///     _LENGTH`, default 16) post-prefix keys into one fixed-width `byte[]`
-///     instead of a per-slot `Vec<u8>` (24-byte header + heap alloc each).
-///     Most invasive — touches every key access (find_entry / prefix / split /
-///     serialize) — and would wire the currently-inert config param (T-5).
+/// T-3: the per-slot `lsn` (8 bytes) that used to live here was hoisted to the
+/// node-level `InNodeStub.lsn_rep` (`IN.entryLsnByteArray`); access the LSN for
+/// slot `i` via `InNodeStub::get_lsn(i)` / `set_lsn(i, lsn)`.
 #[derive(Debug, Clone)]
 pub struct InEntry {
     /// Key for this entry.
     pub key: Vec<u8>,
-    /// LSN where child is stored.
-    pub lsn: Lsn,
 }
 
 /// Lightweight BIN representation used by the tree traversal layer.
@@ -607,16 +1114,33 @@ pub struct BinStub {
     /// `IN.prohibitNextDelta` / `IN.setProhibitNextDelta` (IN.java:5013) /
     /// `IN.getProhibitNextDelta`.
     pub prohibit_next_delta: bool,
+    /// T-3: per-node packed LSN array (`IN.entryLsnByteArray`).  The per-slot
+    /// `lsn` (8 bytes) that used to live in `BinEntry` is hoisted here as a
+    /// `base_file_number`-relative 4-byte-per-slot rep.  Access via
+    /// `get_lsn(slot)` / `set_lsn(slot, lsn)`.
+    pub lsn_rep: LsnRep,
+    /// T-2: per-node key array (`INKeyRep.{Default,MaxKeySize}`).  The per-slot
+    /// `key` (`Vec<u8>`, 24-byte header + heap alloc) that used to live in
+    /// `BinEntry` is hoisted here.  Stores the post-prefix SUFFIX (key
+    /// prefixing strips the common prefix first).  Packs into one fixed-width
+    /// buffer (`Compact`) when every suffix is `<= compact_max_key_length`,
+    /// else one `Vec<u8>` per slot (`Default`).  `keys.len()` is kept in lock
+    /// step with `entries.len()`.  Access via `get_key(slot)` /
+    /// `get_full_key(slot)`.
+    pub keys: KeyRep,
+    /// T-5: the node's compact-key threshold (`IN.getCompactMaxKeyLength`),
+    /// copied from the owning `Tree` at construction so `apply_new_prefix` can
+    /// decide whether the suffixes now fit `MaxKeySize`.  Default 16.
+    pub compact_max_key_length: i32,
 }
 
 /// Entry in a BIN node.
+///
+/// T-3: the per-slot `lsn` (8 bytes) that used to live here was hoisted to the
+/// node-level `BinStub.lsn_rep` (`IN.entryLsnByteArray`); access the LSN for
+/// slot `i` via `BinStub::get_lsn(i)` / `set_lsn(i, lsn)`.
 #[derive(Debug, Clone)]
 pub struct BinEntry {
-    /// Key for this entry.  When the owning `BinStub.key_prefix` is non-empty
-    /// this stores only the suffix (bytes after the prefix is stripped).
-    pub key: Vec<u8>,
-    /// LSN where LN is stored.
-    pub lsn: Lsn,
     /// Optional embedded data (for small records) or cached LN.
     pub data: Option<Vec<u8>>,
     /// True when this slot has been marked known-deleted (analogous to the
@@ -674,6 +1198,21 @@ impl InNodeStub {
         self.targets.take(idx)
     }
 
+    /// `IN.getLsn(idx)` (IN.java:1752) — the LSN of slot `idx` via the
+    /// node-level packed `LsnRep` (T-3).
+    #[inline]
+    pub fn get_lsn(&self, idx: usize) -> Lsn {
+        self.lsn_rep.get(idx)
+    }
+
+    /// `IN.setLsn(idx, lsn)` (IN.java:1773) — set the LSN of slot `idx` via
+    /// the node-level packed `LsnRep` (T-3).
+    #[inline]
+    pub fn set_lsn(&mut self, idx: usize, lsn: Lsn) {
+        let n = self.entries.len();
+        self.lsn_rep.set(idx, lsn, n);
+    }
+
     /// Insert an entry at `idx`, shifting the child mapping to stay aligned
     /// (`INArrayRep.copy`), then set the new slot's cached child.  Mirrors the
     /// old `entries.insert(idx, InEntry{ child: ..})` in one call.
@@ -684,7 +1223,10 @@ impl InNodeStub {
         lsn: Lsn,
         child: Option<ChildArc>,
     ) {
-        self.entries.insert(idx, InEntry { key, lsn });
+        self.entries.insert(idx, InEntry { key });
+        let n = self.entries.len();
+        self.lsn_rep.insert_shift(idx, n);
+        self.lsn_rep.set(idx, lsn, n);
         self.targets.insert_shift(idx);
         if child.is_some() {
             self.targets.set(idx, child);
@@ -692,9 +1234,10 @@ impl InNodeStub {
     }
 
     /// Remove the entry at `idx`, shifting the child mapping to stay aligned
-    /// (`INArrayRep.copy`).  Returns the removed `InEntry` (key + LSN).
+    /// (`INArrayRep.copy`).  Returns the removed `InEntry` (key).
     pub fn remove_entry(&mut self, idx: usize) -> InEntry {
         let e = self.entries.remove(idx);
+        self.lsn_rep.remove_shift(idx);
         self.targets.remove_shift(idx);
         e
     }
@@ -713,6 +1256,21 @@ impl InNodeStub {
 }
 
 impl BinStub {
+    /// `IN.getLsn(idx)` (IN.java:1752) — the LSN of slot `idx` via the
+    /// node-level packed `LsnRep` (T-3).
+    #[inline]
+    pub fn get_lsn(&self, idx: usize) -> Lsn {
+        self.lsn_rep.get(idx)
+    }
+
+    /// `IN.setLsn(idx, lsn)` (IN.java:1773) — set the LSN of slot `idx` via
+    /// the node-level packed `LsnRep` (T-3).
+    #[inline]
+    pub fn set_lsn(&mut self, idx: usize, lsn: Lsn) {
+        let n = self.entries.len();
+        self.lsn_rep.set(idx, lsn, n);
+    }
+
     /// TREE-F1: the single user-facing liveness predicate for a BIN slot.
     ///
     /// A slot is LIVE for reads/scans iff it is neither `known_deleted` nor
@@ -782,7 +1340,10 @@ impl BinStub {
     ///
     /// `IN.getKey(int idx)`.
     pub fn get_full_key(&self, idx: usize) -> Option<Vec<u8>> {
-        let suffix = self.entries.get(idx)?.key.as_slice();
+        if idx >= self.keys.len() {
+            return None;
+        }
+        let suffix = self.keys.get(idx); // T-2
         if self.key_prefix.is_empty() {
             Some(suffix.to_vec())
         } else {
@@ -792,6 +1353,36 @@ impl BinStub {
             full.extend_from_slice(suffix);
             Some(full)
         }
+    }
+
+    /// Borrow the stored (post-prefix) suffix at slot `idx` (`INKeyRep.get`).
+    #[inline]
+    pub fn get_key(&self, idx: usize) -> &[u8] {
+        self.keys.get(idx)
+    }
+
+    /// T-2: insert a new slot at `idx` keeping the parallel `entries`, `keys`,
+    /// and `lsn_rep` arrays in lock step.  `suffix` is the post-prefix key.
+    fn insert_slot(
+        &mut self,
+        idx: usize,
+        suffix: Vec<u8>,
+        lsn: Lsn,
+        data: Option<Vec<u8>>,
+    ) {
+        self.entries.insert(
+            idx,
+            BinEntry {
+                data,
+                known_deleted: false,
+                dirty: true,
+                expiration_time: 0,
+            },
+        );
+        self.keys.insert(idx, suffix); // T-2
+        let n = self.entries.len();
+        self.lsn_rep.insert_shift(idx, n); // T-3
+        self.lsn_rep.set(idx, lsn, n);
     }
 
     /// Decompress a stored suffix back to a full key.
@@ -839,7 +1430,7 @@ impl BinStub {
     /// `IN.computeKeyPrefix(int excludeIdx)`.
     pub fn compute_key_prefix(&self, exclude_idx: Option<usize>) -> Vec<u8> {
         // Need at least 2 entries to find a common prefix.
-        let n = self.entries.len();
+        let n = self.keys.len();
         if n < 2 {
             return Vec::new();
         }
@@ -899,15 +1490,19 @@ impl BinStub {
     fn apply_new_prefix(&mut self, new_prefix: Vec<u8>) {
         // Reconstruct all full keys (using old prefix), then re-encode with
         // the new prefix.
-        let full_keys: Vec<Vec<u8>> = (0..self.entries.len())
+        let full_keys: Vec<Vec<u8>> = (0..self.keys.len())
             .map(|i| self.get_full_key(i).unwrap_or_default())
             .collect();
 
         self.key_prefix = new_prefix;
 
+        // T-2: re-encode every suffix into the key rep, then re-attempt
+        // compaction (a smaller prefix may make all suffixes fit MaxKeySize).
         for (i, full_key) in full_keys.into_iter().enumerate() {
-            self.entries[i].key = self.compress_key(&full_key);
+            let suffix = self.compress_key(&full_key);
+            self.keys.set(i, suffix);
         }
+        self.keys.compact(self.compact_max_key_length);
     }
 
     /// Binary-search this BIN for `full_key` (a full, uncompressed key).
@@ -931,16 +1526,55 @@ impl BinStub {
         {
             // The key does not share the current prefix.
             // Determine insertion point using full-key comparison.
-            let pos = self.entries.partition_point(|e| {
-                self.decompress_key(&e.key).as_slice() < full_key
+            let pos = self.key_partition_point(|s| {
+                self.decompress_key(s).as_slice() < full_key
             });
             return (pos, false);
         }
         let suffix = &full_key[plen..];
-        match self.entries.binary_search_by(|e| e.key.as_slice().cmp(suffix)) {
+        // T-2: binary search over the node-level key rep (suffix space).
+        match self.key_binary_search(suffix) {
             Ok(idx) => (idx, true),
             Err(idx) => (idx, false),
         }
+    }
+
+    /// Binary search the key rep for `suffix` (suffix space, unsigned bytes).
+    /// Mirrors `Vec::binary_search_by(|e| e.key.cmp(suffix))` over the
+    /// node-level `KeyRep` (T-2).
+    #[inline]
+    fn key_binary_search(&self, suffix: &[u8]) -> Result<usize, usize> {
+        let mut lo = 0usize;
+        let mut hi = self.keys.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            match self.keys.get(mid).cmp(suffix) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => return Ok(mid),
+            }
+        }
+        Err(lo)
+    }
+
+    /// `slice::partition_point` over the node-level key rep suffixes (T-2):
+    /// the index of the first slot for which `pred(suffix)` is false.
+    #[inline]
+    fn key_partition_point(
+        &self,
+        mut pred: impl FnMut(&[u8]) -> bool,
+    ) -> usize {
+        let mut lo = 0usize;
+        let mut hi = self.keys.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if pred(self.keys.get(mid)) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
     }
 
     /// Insert or update a full (uncompressed) key in this BIN.
@@ -1000,10 +1634,10 @@ impl BinStub {
         // Compress the new key under the (possibly updated) prefix.
         let suffix = self.compress_key(&full_key);
 
-        match self.entries.binary_search_by(|e| e.key.as_slice().cmp(&suffix)) {
+        match self.key_binary_search(&suffix) {
             Ok(idx) => {
                 // Key exists — update in place.
-                self.entries[idx].lsn = lsn;
+                self.set_lsn(idx, lsn); // T-3
                 self.entries[idx].data = data;
                 // Mark slot dirty: this slot changed since the last full BIN log.
                 // `IN.setDirtyEntry(idx)`.
@@ -1014,17 +1648,7 @@ impl BinStub {
                 // New key — insert in sorted position.
                 // New slots start dirty: they have never been logged in any BIN.
                 // `IN.setDirtyEntry(idx)` called after `insertEntry`.
-                self.entries.insert(
-                    idx,
-                    BinEntry {
-                        key: suffix,
-                        lsn,
-                        data,
-                        known_deleted: false,
-                        dirty: true,
-                        expiration_time: 0,
-                    },
-                );
+                self.insert_slot(idx, suffix, lsn, data);
                 // After insertion, if there is no prefix yet, try to establish one.
                 if self.key_prefix.is_empty() && self.entries.len() >= 2 {
                     self.recompute_key_prefix();
@@ -1086,25 +1710,15 @@ impl BinStub {
 
         let suffix = self.compress_key(full_key);
 
-        match self.entries.binary_search_by(|e| e.key.as_slice().cmp(&suffix)) {
+        match self.key_binary_search(&suffix) {
             Ok(idx) => {
-                self.entries[idx].lsn = lsn;
+                self.set_lsn(idx, lsn); // T-3
                 self.entries[idx].data = data.map(|d| d.to_vec());
                 self.entries[idx].dirty = true;
                 (idx, false)
             }
             Err(idx) => {
-                self.entries.insert(
-                    idx,
-                    BinEntry {
-                        key: suffix,
-                        lsn,
-                        data: data.map(|d| d.to_vec()),
-                        known_deleted: false,
-                        dirty: true,
-                        expiration_time: 0,
-                    },
-                );
+                self.insert_slot(idx, suffix, lsn, data.map(|d| d.to_vec()));
                 if self.key_prefix.is_empty() && self.entries.len() >= 2 {
                     self.recompute_key_prefix();
                 }
@@ -1197,25 +1811,43 @@ impl BinStub {
         // still allocates but is limited to O(key_len) bytes per call and
         // avoids retaining any heap state between comparisons.
         if self.key_prefix.is_empty() {
-            match self
-                .entries
-                .binary_search_by(|e| cmp(e.key.as_slice(), full_key))
-            {
+            match self.key_binary_search_by(|s| cmp(s, full_key)) {
                 Ok(idx) => (idx, true),
                 Err(idx) => (idx, false),
             }
         } else {
             let prefix = self.key_prefix.as_slice();
-            match self.entries.binary_search_by(|e| {
-                let mut fk = Vec::with_capacity(prefix.len() + e.key.len());
+            match self.key_binary_search_by(|s| {
+                let mut fk = Vec::with_capacity(prefix.len() + s.len());
                 fk.extend_from_slice(prefix);
-                fk.extend_from_slice(&e.key);
+                fk.extend_from_slice(s);
                 cmp(&fk, full_key)
             }) {
                 Ok(idx) => (idx, true),
                 Err(idx) => (idx, false),
             }
         }
+    }
+
+    /// Comparator-driven binary search over the node-level key rep (T-2).
+    /// `cmp(stored_suffix)` returns how the stored slot compares to the
+    /// search key.
+    #[inline]
+    fn key_binary_search_by(
+        &self,
+        mut cmp: impl FnMut(&[u8]) -> std::cmp::Ordering,
+    ) -> Result<usize, usize> {
+        let mut lo = 0usize;
+        let mut hi = self.keys.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            match cmp(self.keys.get(mid)) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => return Ok(mid),
+            }
+        }
+        Err(lo)
     }
 
     /// Returns the LSN of the slot matching `full_key`, if one exists.
@@ -1236,16 +1868,13 @@ impl BinStub {
             None if key_prefixing => self.find_entry_compressed(full_key),
             None => {
                 // insert_raw path: full keys stored verbatim.
-                match self
-                    .entries
-                    .binary_search_by(|e| e.key.as_slice().cmp(full_key))
-                {
+                match self.key_binary_search(full_key) {
                     Ok(idx) => (idx, true),
                     Err(idx) => (idx, false),
                 }
             }
         };
-        if found { Some(self.entries[idx].lsn) } else { None }
+        if found { Some(self.get_lsn(idx)) } else { None }
     }
 
     /// Raw insert (no prefix compression) for databases with
@@ -1272,37 +1901,17 @@ impl BinStub {
         data: Option<Vec<u8>>,
     ) -> (usize, bool) {
         // Binary search on the stored (full) keys.
-        match self.entries.binary_search_by(|e| {
-            // When key_prefix is empty entries store full keys directly.
-            // If somehow a prefix exists (shouldn't happen for key_prefixing
-            // DBs), reconstruct. ponytail: no prefix expected here — if we
-            // see one it is a configuration bug, not a data-path concern.
-            let stored: &[u8] = if self.key_prefix.is_empty() {
-                &e.key
-            } else {
-                // fallback: compare as if prefix is empty (best effort)
-                &e.key
-            };
-            stored.cmp(full_key.as_slice())
-        }) {
+        // When key_prefix is empty entries store full keys directly; for
+        // key_prefixing=false DBs the prefix is always empty.
+        match self.key_binary_search(full_key.as_slice()) {
             Ok(idx) => {
-                self.entries[idx].lsn = lsn;
+                self.set_lsn(idx, lsn); // T-3
                 self.entries[idx].data = data;
                 self.entries[idx].dirty = true;
                 (idx, false)
             }
             Err(idx) => {
-                self.entries.insert(
-                    idx,
-                    BinEntry {
-                        key: full_key,
-                        lsn,
-                        data,
-                        known_deleted: false,
-                        dirty: true,
-                        expiration_time: 0,
-                    },
-                );
+                self.insert_slot(idx, full_key, lsn, data);
                 (idx, true)
             }
         }
@@ -1324,59 +1933,36 @@ impl BinStub {
         cmp: &dyn Fn(&[u8], &[u8]) -> std::cmp::Ordering,
     ) -> (usize, bool) {
         if self.key_prefix.is_empty() {
-            match self
-                .entries
-                .binary_search_by(|e| cmp(e.key.as_slice(), &full_key))
-            {
+            match self.key_binary_search_by(|s| cmp(s, &full_key)) {
                 Ok(idx) => {
-                    self.entries[idx].lsn = lsn;
+                    self.set_lsn(idx, lsn); // T-3
                     self.entries[idx].data = data;
                     self.entries[idx].dirty = true;
                     (idx, false)
                 }
                 Err(idx) => {
-                    self.entries.insert(
-                        idx,
-                        BinEntry {
-                            key: full_key,
-                            lsn,
-                            data,
-                            known_deleted: false,
-                            dirty: true,
-                            expiration_time: 0,
-                        },
-                    );
+                    self.insert_slot(idx, full_key, lsn, data);
                     (idx, true)
                 }
             }
         } else {
             let prefix = self.key_prefix.clone();
-            match self.entries.binary_search_by(|e| {
-                let mut fk = Vec::with_capacity(prefix.len() + e.key.len());
+            match self.key_binary_search_by(|s| {
+                let mut fk = Vec::with_capacity(prefix.len() + s.len());
                 fk.extend_from_slice(&prefix);
-                fk.extend_from_slice(&e.key);
+                fk.extend_from_slice(s);
                 cmp(&fk, &full_key)
             }) {
                 Ok(idx) => {
                     // Key exists — update in place.
-                    self.entries[idx].lsn = lsn;
+                    self.set_lsn(idx, lsn); // T-3
                     self.entries[idx].data = data;
                     self.entries[idx].dirty = true;
                     (idx, false)
                 }
                 Err(idx) => {
                     // New key — insert at sorted position (no prefix compression).
-                    self.entries.insert(
-                        idx,
-                        BinEntry {
-                            key: full_key,
-                            lsn,
-                            data,
-                            known_deleted: false,
-                            dirty: true,
-                            expiration_time: 0,
-                        },
-                    );
+                    self.insert_slot(idx, full_key, lsn, data);
                     (idx, true)
                 }
             }
@@ -1392,19 +1978,21 @@ impl BinStub {
         cmp: &dyn Fn(&[u8], &[u8]) -> std::cmp::Ordering,
     ) -> bool {
         let result = if self.key_prefix.is_empty() {
-            self.entries.binary_search_by(|e| cmp(e.key.as_slice(), full_key))
+            self.key_binary_search_by(|s| cmp(s, full_key))
         } else {
             let prefix = self.key_prefix.clone();
-            self.entries.binary_search_by(|e| {
-                let mut fk = Vec::with_capacity(prefix.len() + e.key.len());
+            self.key_binary_search_by(|s| {
+                let mut fk = Vec::with_capacity(prefix.len() + s.len());
                 fk.extend_from_slice(&prefix);
-                fk.extend_from_slice(&e.key);
+                fk.extend_from_slice(s);
                 cmp(&fk, full_key)
             })
         };
         match result {
             Ok(idx) => {
                 self.entries.remove(idx);
+                self.keys.remove(idx); // T-2
+                self.lsn_rep.remove_shift(idx); // T-3
                 self.dirty = true;
                 true
             }
@@ -1428,8 +2016,9 @@ impl BinStub {
             let full_key = self.get_full_key(i).unwrap_or_default();
             buf.extend_from_slice(&(full_key.len() as u32).to_be_bytes());
             buf.extend_from_slice(&full_key);
+            let lsn = self.get_lsn(i); // T-3
             let e = &self.entries[i];
-            buf.extend_from_slice(&e.lsn.as_u64().to_be_bytes());
+            buf.extend_from_slice(&lsn.as_u64().to_be_bytes());
             if let Some(d) = &e.data {
                 buf.push(1u8);
                 buf.extend_from_slice(&(d.len() as u32).to_be_bytes());
@@ -1462,8 +2051,9 @@ impl BinStub {
             let full_key = self.get_full_key(idx).unwrap_or_default();
             buf.extend_from_slice(&(full_key.len() as u32).to_be_bytes());
             buf.extend_from_slice(&full_key);
+            let lsn = self.get_lsn(idx); // T-3
             let e = &self.entries[idx];
-            buf.extend_from_slice(&e.lsn.as_u64().to_be_bytes());
+            buf.extend_from_slice(&lsn.as_u64().to_be_bytes());
             if let Some(d) = &e.data {
                 buf.push(1u8);
                 buf.extend_from_slice(&(d.len() as u32).to_be_bytes());
@@ -1492,6 +2082,8 @@ impl BinStub {
             u32::from_be_bytes(bytes[8..12].try_into().ok()?) as usize;
         let mut pos = 12usize;
         let mut entries = Vec::with_capacity(num_entries);
+        let mut lsns: Vec<Lsn> = Vec::with_capacity(num_entries);
+        let mut keys: Vec<Vec<u8>> = Vec::with_capacity(num_entries); // T-2
         for _ in 0..num_entries {
             // key_len(u32BE) | key | lsn(u64BE) | has_data(u8) [| data_len(u32BE) | data] | known_deleted(u8)
             if pos + 4 > bytes.len() {
@@ -1541,13 +2133,13 @@ impl BinStub {
             let known_deleted = bytes[pos] != 0;
             pos += 1;
             entries.push(BinEntry {
-                key,
-                lsn,
                 data,
                 known_deleted,
                 dirty: false, // freshly loaded from log — clean
                 expiration_time: 0,
             });
+            keys.push(key); // T-2 (full keys; recompute_key_prefix compresses)
+            lsns.push(lsn); // T-3
         }
         // Keys stored in the serialized format are full (uncompressed) keys.
         // Re-establish the key prefix after loading so that memory use and
@@ -1568,11 +2160,17 @@ impl BinStub {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::from_lsns(&lsns), // T-3
+            keys: KeyRep::from_keys(keys),     // T-2 (full keys, no prefix yet)
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         };
         // Recompute key prefix from the full keys just loaded.
         // `IN.recalcKeyPrefix()` called after materializing from log.
         if bin.entries.len() >= 2 {
             bin.recompute_key_prefix();
+        } else {
+            // Even a single-slot BIN should attempt compaction.
+            bin.keys.compact(bin.compact_max_key_length);
         }
         Some(bin)
     }
@@ -1657,21 +2255,22 @@ impl BinStub {
 
             // Apply to base: update existing slot or insert new one.
             if slot_idx < base.entries.len() {
-                base.entries[slot_idx].key = key;
-                base.entries[slot_idx].lsn = lsn;
+                base.keys.set(slot_idx, key); // T-2
+                base.set_lsn(slot_idx, lsn); // T-3
                 base.entries[slot_idx].data = data;
                 base.entries[slot_idx].known_deleted = known_deleted;
                 base.entries[slot_idx].dirty = false;
             } else {
                 // Slot index beyond current length — append.
                 base.entries.push(BinEntry {
-                    key,
-                    lsn,
                     data,
                     known_deleted,
                     dirty: false,
                     expiration_time: 0,
                 });
+                let n = base.entries.len();
+                base.keys.insert(n - 1, key); // T-2
+                base.lsn_rep.set(n - 1, lsn, n); // T-3
             }
         }
         Some(())
@@ -1742,11 +2341,12 @@ impl TreeNode {
                 (size_of::<BinStub>()
                     + b.entries.len() * size_of::<BinEntry>()
                     + b.key_prefix.len()
+                    + b.keys.memory_size() // T-2: node-level key rep bytes
+                    + b.lsn_rep.memory_size() // T-3: node-level LSN rep bytes
                     + b.entries
                         .iter()
                         .map(|e| {
-                            e.key.len()
-                                + e.data.as_ref().map(|d| d.len()).unwrap_or(0)
+                            e.data.as_ref().map(|d| d.len()).unwrap_or(0)
                         })
                         .sum::<usize>()) as u64
             }
@@ -1910,8 +2510,8 @@ impl TreeNode {
                 }
             }
             TreeNode::Bottom(b) => {
-                for entry in &b.entries {
-                    size += 2 + entry.key.len() + 8; // key_len + key + lsn
+                for i in 0..b.entries.len() {
+                    size += 2 + b.get_key(i).len() + 8; // key_len + key + lsn
                 }
             }
         }
@@ -1930,12 +2530,12 @@ impl TreeNode {
                 buf.extend_from_slice(&n.level.to_be_bytes());
                 buf.extend_from_slice(&(n.entries.len() as u32).to_be_bytes());
                 buf.push(n.dirty as u8);
-                for entry in &n.entries {
+                for (i, entry) in n.entries.iter().enumerate() {
                     buf.extend_from_slice(
                         &(entry.key.len() as u16).to_be_bytes(),
                     );
                     buf.extend_from_slice(&entry.key);
-                    buf.extend_from_slice(&entry.lsn.as_u64().to_be_bytes());
+                    buf.extend_from_slice(&n.get_lsn(i).as_u64().to_be_bytes());
                 }
             }
             TreeNode::Bottom(b) => {
@@ -1943,12 +2543,11 @@ impl TreeNode {
                 buf.extend_from_slice(&b.level.to_be_bytes());
                 buf.extend_from_slice(&(b.entries.len() as u32).to_be_bytes());
                 buf.push(b.dirty as u8);
-                for entry in &b.entries {
-                    buf.extend_from_slice(
-                        &(entry.key.len() as u16).to_be_bytes(),
-                    );
-                    buf.extend_from_slice(&entry.key);
-                    buf.extend_from_slice(&entry.lsn.as_u64().to_be_bytes());
+                for i in 0..b.entries.len() {
+                    let key = b.get_key(i);
+                    buf.extend_from_slice(&(key.len() as u16).to_be_bytes());
+                    buf.extend_from_slice(key);
+                    buf.extend_from_slice(&b.get_lsn(i).as_u64().to_be_bytes());
                 }
             }
         }
@@ -1962,37 +2561,47 @@ impl TreeNode {
 /// common wrapper to pass split slices around without code duplication.
 enum SplitEntries {
     /// Upper-IN entries plus the parallel resident-child pointers (one per
-    /// entry; `None` when the child is not cached).  T-4: children must travel
-    /// with their slots on a split, mirroring JE `IN.split` copying
-    /// `entryTargets` alongside `entryKeys`.
-    Internal(Vec<InEntry>, Vec<Option<ChildArc>>),
-    Bottom(Vec<BinEntry>),
+    /// entry; `None` when the child is not cached) and the parallel per-slot
+    /// LSNs (T-3: LSNs travel with their slots on a split, just like JE
+    /// `IN.split` copies `entryLsnByteArray`/`entryLsnLongArray`).
+    Internal(Vec<InEntry>, Vec<Option<ChildArc>>, Vec<Lsn>),
+    /// BIN entries (metadata only) plus the parallel per-slot LSNs and the
+    /// parallel FULL keys (T-2: keys live in the node-level `KeyRep`, not in
+    /// `BinEntry`, so they travel as a separate `Vec<Vec<u8>>` of full keys
+    /// through the split — the new BINs recompute their prefix from these).
+    Bottom(Vec<BinEntry>, Vec<Lsn>, Vec<Vec<u8>>),
 }
 
 impl SplitEntries {
     /// Returns the number of entries.
     fn len(&self) -> usize {
         match self {
-            SplitEntries::Internal(v, _) => v.len(),
-            SplitEntries::Bottom(v) => v.len(),
+            SplitEntries::Internal(v, _, _) => v.len(),
+            SplitEntries::Bottom(v, _, _) => v.len(),
         }
     }
 
     /// Returns the key at `index` as a slice.
     fn get_key(&self, index: usize) -> &[u8] {
         match self {
-            SplitEntries::Internal(v, _) => v[index].key.as_slice(),
-            SplitEntries::Bottom(v) => v[index].key.as_slice(),
+            SplitEntries::Internal(v, _, _) => v[index].key.as_slice(),
+            SplitEntries::Bottom(_, _, k) => k[index].as_slice(),
         }
     }
 
     /// Returns a sub-range `[lo, hi)` as a new `SplitEntries`.
     fn slice(&self, lo: usize, hi: usize) -> Self {
         match self {
-            SplitEntries::Internal(v, c) => {
-                SplitEntries::Internal(v[lo..hi].to_vec(), c[lo..hi].to_vec())
-            }
-            SplitEntries::Bottom(v) => SplitEntries::Bottom(v[lo..hi].to_vec()),
+            SplitEntries::Internal(v, c, l) => SplitEntries::Internal(
+                v[lo..hi].to_vec(),
+                c[lo..hi].to_vec(),
+                l[lo..hi].to_vec(),
+            ),
+            SplitEntries::Bottom(v, l, k) => SplitEntries::Bottom(
+                v[lo..hi].to_vec(),
+                l[lo..hi].to_vec(),
+                k[lo..hi].to_vec(),
+            ),
         }
     }
 }
@@ -2009,8 +2618,10 @@ impl SplitEntries {
 /// real end-of-tree.
 #[derive(Debug)]
 enum AdjacentBinOutcome {
-    /// A BIN was found in the requested direction.
-    Found(Vec<BinEntry>),
+    /// A BIN was found in the requested direction.  T-3: each slot carries its
+    /// `Lsn` alongside the `BinEntry` (the LSN lives in the node's packed
+    /// `LsnRep`, not in `BinEntry`, so the scan snapshot pairs them).
+    Found(Vec<(BinEntry, Lsn, Vec<u8>)>),
     /// The tree genuinely has no BIN in the requested direction.
     NoAdjacent,
     /// A concurrent split invalidated our captured path; the
@@ -2061,6 +2672,7 @@ impl Tree {
             in_list_listener: None,
             redo_capacity_hint: 0,
             key_prefixing: false, // JE default: KEY_PREFIXING_DEFAULT = false
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH, // T-5
         }
     }
 
@@ -2077,6 +2689,13 @@ impl Tree {
     /// `Evictor.addBack`/`moveBack`/`remove`.
     pub fn set_in_list_listener(&mut self, listener: Arc<dyn InListListener>) {
         self.in_list_listener = Some(listener);
+    }
+
+    /// T-5: set the compact-key threshold (`TREE_COMPACT_MAX_KEY_LENGTH` /
+    /// `IN.getCompactMaxKeyLength`).  New BINs created by this tree inherit it;
+    /// `<= 0` disables the compact key rep.  Default 16.
+    pub fn set_compact_max_key_length(&mut self, len: i32) {
+        self.compact_max_key_length = len;
     }
 
     /// Notify the listener that a node became resident (JE `Evictor.addBack`).
@@ -2128,6 +2747,7 @@ impl Tree {
             in_list_listener: None,
             redo_capacity_hint: 0,
             key_prefixing: false,
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH, // T-5
         }
     }
 
@@ -2469,8 +3089,9 @@ impl Tree {
                             // cursor scan.  Mirrors IN.findEntry (IN.java:3197)
                             // and CursorImpl.isProbablyExpired.
                             if bin.slot_is_live(idx) {
+                                let lsn = bin.get_lsn(idx); // T-3
                                 let e = &bin.entries[idx];
-                                (true, e.data.clone(), e.lsn.as_u64(), idx)
+                                (true, e.data.clone(), lsn.as_u64(), idx)
                             } else {
                                 (false, None, 0u64, 0)
                             }
@@ -2649,7 +3270,7 @@ impl Tree {
                                 .data
                                 .clone()
                                 .unwrap_or_default();
-                            let lsn = bin.entries[idx].lsn.as_u64();
+                            let lsn = bin.get_lsn(idx).as_u64(); // T-3
                             Some((full_key, data, lsn))
                         } else {
                             None
@@ -2736,7 +3357,7 @@ impl Tree {
                             bin.get_full_key(idx).unwrap_or_default();
                         let data =
                             bin.entries[idx].data.clone().unwrap_or_default();
-                        let lsn = bin.entries[idx].lsn.as_u64();
+                        let lsn = bin.get_lsn(idx).as_u64(); // T-3
                         // Obtain the Arc for the BIN node the guard came from.
                         // `ArcRwLockReadGuard::rwlock()` returns the backing Arc.
                         let bin_arc =
@@ -2805,8 +3426,6 @@ impl Tree {
                     node_id: bin_node_id,
                     level: BIN_LEVEL,
                     entries: vec![BinEntry {
-                        key,
-                        lsn,
                         data: Some(data),
                         known_deleted: false,
                         dirty: false,
@@ -2825,6 +3444,9 @@ impl Tree {
                     expiration_in_hours: true,
                     cursor_count: 0,
                     prohibit_next_delta: false,
+                    lsn_rep: LsnRep::from_lsns(&[lsn]),
+                    keys: KeyRep::from_keys(vec![key]), // T-2
+                    compact_max_key_length: self.compact_max_key_length,
                 })));
 
                 // Upper IN at level 2; slot 0 uses an empty key (virtual root key).
@@ -2834,13 +3456,13 @@ impl Tree {
                         level: MAIN_LEVEL | 2,
                         entries: vec![InEntry {
                             key: vec![], // virtual key for slot 0 in upper IN
-                            lsn,
                         }],
                         // T-4: the single resident child at slot 0.
                         targets: TargetRep::Sparse(vec![(0, bin.clone())]),
                         dirty: true,
                         generation: 0,
                         parent: None,
+                        lsn_rep: LsnRep::from_lsns(&[lsn]),
                     })));
 
                 // Wire the BIN's parent pointer back to the root IN.
@@ -2941,8 +3563,6 @@ impl Tree {
                 };
                 let mut initial_entries = Vec::with_capacity(initial_cap);
                 initial_entries.push(BinEntry {
-                    key: key.to_vec(),
-                    lsn,
                     data: data_opt.map(|d| d.to_vec()),
                     known_deleted: false,
                     dirty: false,
@@ -2964,18 +3584,22 @@ impl Tree {
                     expiration_in_hours: true,
                     cursor_count: 0,
                     prohibit_next_delta: false,
+                    lsn_rep: LsnRep::from_lsns(&[lsn]),
+                    keys: KeyRep::from_keys(vec![key.to_vec()]), // T-2
+                    compact_max_key_length: self.compact_max_key_length,
                 })));
 
                 let root_arc =
                     Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
                         node_id: generate_node_id(),
                         level: MAIN_LEVEL | 2,
-                        entries: vec![InEntry { key: vec![], lsn }],
+                        entries: vec![InEntry { key: vec![] }],
                         // T-4: the single resident child at slot 0.
                         targets: TargetRep::Sparse(vec![(0, bin.clone())]),
                         dirty: true,
                         generation: 0,
                         parent: None,
+                        lsn_rep: LsnRep::from_lsns(&[lsn]),
                     })));
 
                 {
@@ -3064,12 +3688,13 @@ impl Tree {
             Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
                 node_id: generate_node_id(),
                 level: old_root_level + 1,
-                entries: vec![InEntry { key: vec![], lsn }],
+                entries: vec![InEntry { key: vec![] }],
                 // T-4: slot 0's resident child is the old root.
                 targets: TargetRep::Sparse(vec![(0, old_root_arc.clone())]),
                 dirty: true,
                 generation: 0,
                 parent: None,
+                lsn_rep: LsnRep::from_lsns(&[lsn]),
             })));
 
         // Update the old root's parent pointer to the new root.
@@ -3193,6 +3818,13 @@ impl Tree {
             // (the engine-wide invariant for any BIN that may hold TTL data).
             TreeNode::Internal(_) => true,
         };
+        // T-2/T-5: the compact-key threshold the new sibling BIN inherits.
+        // (Only consumed when the child is a BIN; an upper-IN split produces
+        // upper-IN siblings, which have no compact key rep.)
+        let bin_compact_max_key_length: i32 = match &*child_guard {
+            TreeNode::Bottom(b) => b.compact_max_key_length,
+            TreeNode::Internal(_) => INKeyRep_DEFAULT_MAX_KEY_LENGTH,
+        };
         let (all_entries, bin_old_prefix) = match &*child_guard {
             TreeNode::Internal(n) => {
                 // T-4: capture the parallel resident-child array alongside the
@@ -3200,8 +3832,12 @@ impl Tree {
                 // split (JE `IN.split` copies `entryTargets`).
                 let children: Vec<Option<ChildArc>> =
                     (0..n.entries.len()).map(|i| n.get_child(i)).collect();
+                // T-3: capture the parallel per-slot LSNs so they travel with
+                // their slots (JE `IN.split` copies `entryLsnByteArray`).
+                let lsns: Vec<Lsn> =
+                    (0..n.entries.len()).map(|i| n.get_lsn(i)).collect();
                 (
-                    SplitEntries::Internal(n.entries.clone(), children),
+                    SplitEntries::Internal(n.entries.clone(), children, lsns),
                     Vec::new(),
                 )
             }
@@ -3209,15 +3845,23 @@ impl Tree {
                 // Decompress to full keys.
                 let full: Vec<BinEntry> = (0..b.entries.len())
                     .map(|i| BinEntry {
-                        key: b.get_full_key(i).unwrap_or_default(),
-                        lsn: b.entries[i].lsn,
                         data: b.entries[i].data.clone(),
                         known_deleted: b.entries[i].known_deleted,
                         dirty: b.entries[i].dirty,
                         expiration_time: b.entries[i].expiration_time,
                     })
                     .collect();
-                (SplitEntries::Bottom(full), b.key_prefix.clone())
+                let lsns: Vec<Lsn> =
+                    (0..b.entries.len()).map(|i| b.get_lsn(i)).collect();
+                // T-2: carry FULL keys through the split; the new BINs
+                // recompute their own prefix from them.
+                let full_keys: Vec<Vec<u8>> = (0..b.entries.len())
+                    .map(|i| b.get_full_key(i).unwrap_or_default())
+                    .collect();
+                (
+                    SplitEntries::Bottom(full, lsns, full_keys),
+                    b.key_prefix.clone(),
+                )
             }
         };
 
@@ -3276,7 +3920,7 @@ impl Tree {
         // Install the left half into `child_arc` (still under the same
         // write lock) and mark the node dirty.
         match (&mut *child_guard, &left_entries) {
-            (TreeNode::Internal(n), SplitEntries::Internal(le, lc)) => {
+            (TreeNode::Internal(n), SplitEntries::Internal(le, lc, ll)) => {
                 n.entries = le.clone();
                 // T-4: reinstall the (now-shorter) left child array.
                 n.targets = TargetRep::None;
@@ -3285,15 +3929,22 @@ impl Tree {
                         n.set_child(i, Some(child.clone()));
                     }
                 }
+                // T-3: reinstall the (now-shorter) left LSN array.
+                n.lsn_rep = LsnRep::from_lsns(ll);
             }
-            (TreeNode::Bottom(b), SplitEntries::Bottom(le)) => {
-                // Reset prefix; entries are full keys.
+            (TreeNode::Bottom(b), SplitEntries::Bottom(le, ll, lk)) => {
+                // Reset prefix; keys arrive as FULL keys (no prefix yet).
                 b.key_prefix = Vec::new();
                 // Pre-allocate at max_entries capacity so the left half
                 // does not need to reallocate on the next insert (Fix 3).
                 let mut left = Vec::with_capacity(max_entries);
                 left.extend_from_slice(le);
                 b.entries = left;
+                // T-3: reinstall the left LSN array.
+                b.lsn_rep = LsnRep::from_lsns(ll);
+                // T-2: reinstall the left key rep from the full keys (Default;
+                // recompute_key_prefix below compresses + compacts).
+                b.keys = KeyRep::from_keys(lk.clone());
                 // Recompute prefix on each half after split (only when
                 // key_prefixing is enabled for this database).
                 // JE: IN.computeKeyPrefix returns null when
@@ -3301,6 +3952,8 @@ impl Tree {
                 // Ref: IN.java computeKeyPrefix ~line 2456.
                 if key_prefixing && b.entries.len() >= 2 {
                     b.recompute_key_prefix();
+                } else {
+                    b.keys.compact(b.compact_max_key_length); // T-2
                 }
             }
             _ => return Err(TreeError::SplitRequired),
@@ -3311,7 +3964,7 @@ impl Tree {
         // Create the new right-half sibling.
         // Parent pointer will be wired in when it is inserted into the parent.
         let new_sibling = match right_entries {
-            SplitEntries::Internal(re, rc) => {
+            SplitEntries::Internal(re, rc, rl) => {
                 let mut rin = InNodeStub {
                     node_id: generate_node_id(),
                     level: child_level,
@@ -3320,6 +3973,8 @@ impl Tree {
                     dirty: true,
                     generation: 0,
                     parent: None, // set below
+                    // T-3: the right half's per-slot LSNs.
+                    lsn_rep: LsnRep::from_lsns(&rl),
                 };
                 // T-4: install the right half's resident children.
                 for (i, c) in rc.into_iter().enumerate() {
@@ -3329,9 +3984,9 @@ impl Tree {
                 }
                 Arc::new(RwLock::new(TreeNode::Internal(rin)))
             }
-            SplitEntries::Bottom(re) => {
-                // Entries are full keys; build BinStub with no prefix then
-                // recompute key prefix for the new sibling.
+            SplitEntries::Bottom(re, rl, rk) => {
+                // Entries arrive as FULL keys; build BinStub with no prefix
+                // then recompute key prefix for the new sibling.
                 // Pre-allocate at max_entries capacity so the right half
                 // does not need to reallocate on the next insert (Fix 3).
                 let mut right = Vec::with_capacity(max_entries);
@@ -3355,6 +4010,11 @@ impl Tree {
                     expiration_in_hours: bin_expiration_in_hours,
                     cursor_count: 0,
                     prohibit_next_delta: false,
+                    // T-3: the right half's per-slot LSNs.
+                    lsn_rep: LsnRep::from_lsns(&rl),
+                    // T-2: full keys (Default); recompute/compact below.
+                    keys: KeyRep::from_keys(rk),
+                    compact_max_key_length: bin_compact_max_key_length,
                 };
                 // St-H6 debug guard: the sibling must carry the same flag as
                 // the splitting BIN so that in_hours-resolution entries are
@@ -3368,6 +4028,8 @@ impl Tree {
 
                 if key_prefixing && sibling_bin.entries.len() >= 2 {
                     sibling_bin.recompute_key_prefix();
+                } else {
+                    sibling_bin.keys.compact(bin_compact_max_key_length); // T-2
                 }
                 Arc::new(RwLock::new(TreeNode::Bottom(sibling_bin)))
             }
@@ -4122,11 +4784,11 @@ impl Tree {
                             return false;
                         }
                         let suffix = bin.compress_key(key);
-                        match bin.entries.binary_search_by(|e| {
-                            e.key.as_slice().cmp(suffix.as_slice())
-                        }) {
+                        match bin.key_binary_search(suffix.as_slice()) {
                             Ok(idx) => {
                                 bin.entries.remove(idx);
+                                bin.keys.remove(idx); // T-2
+                                bin.lsn_rep.remove_shift(idx); // T-3
                                 // Mark dirty after any modification.
                                 bin.dirty = true;
                                 true
@@ -4258,10 +4920,6 @@ impl Tree {
                             match &*g {
                                 TreeNode::Bottom(b) => (0..b.entries.len())
                                     .map(|j| BinEntry {
-                                        key: b
-                                            .get_full_key(j)
-                                            .unwrap_or_default(),
-                                        lsn: b.entries[j].lsn,
                                         data: b.entries[j].data.clone(),
                                         known_deleted: b.entries[j]
                                             .known_deleted,
@@ -4277,6 +4935,26 @@ impl Tree {
                             }
                         }
                     };
+                    // T-3 / T-2: capture left's per-slot LSNs and FULL keys.
+                    let (left_full_lsns, left_full_keys): (
+                        Vec<Lsn>,
+                        Vec<Vec<u8>>,
+                    ) = {
+                        let g = left_arc.read();
+                        match &*g {
+                            TreeNode::Bottom(b) => (
+                                (0..b.entries.len())
+                                    .map(|j| b.get_lsn(j))
+                                    .collect(),
+                                (0..b.entries.len())
+                                    .map(|j| {
+                                        b.get_full_key(j).unwrap_or_default()
+                                    })
+                                    .collect(),
+                            ),
+                            _ => (Vec::new(), Vec::new()),
+                        }
+                    };
                     {
                         {
                             let mut g = right_arc.write();
@@ -4287,10 +4965,6 @@ impl Tree {
                                         .entries
                                         .len())
                                         .map(|j| BinEntry {
-                                            key: rb
-                                                .get_full_key(j)
-                                                .unwrap_or_default(),
-                                            lsn: rb.entries[j].lsn,
                                             data: rb.entries[j].data.clone(),
                                             known_deleted: rb.entries[j]
                                                 .known_deleted,
@@ -4299,15 +4973,40 @@ impl Tree {
                                                 .expiration_time,
                                         })
                                         .collect();
+                                    // T-3 / T-2: right's per-slot LSNs + keys.
+                                    let right_full_lsns: Vec<Lsn> =
+                                        (0..rb.entries.len())
+                                            .map(|j| rb.get_lsn(j))
+                                            .collect();
+                                    let right_full_keys: Vec<Vec<u8>> =
+                                        (0..rb.entries.len())
+                                            .map(|j| {
+                                                rb.get_full_key(j)
+                                                    .unwrap_or_default()
+                                            })
+                                            .collect();
                                     // Left entries are all smaller; prepend.
                                     let mut combined = left_full_entries;
                                     combined.extend(right_full);
+                                    let mut combined_lsns = left_full_lsns;
+                                    combined_lsns.extend(right_full_lsns);
+                                    let mut combined_keys = left_full_keys;
+                                    combined_keys.extend(right_full_keys);
                                     // Reset prefix and assign full keys.
                                     rb.key_prefix = Vec::new();
                                     rb.entries = combined;
+                                    // T-3: rebuild the merged LSN array.
+                                    rb.lsn_rep =
+                                        LsnRep::from_lsns(&combined_lsns);
+                                    // T-2: rebuild the merged key rep (Default;
+                                    // recompute below compresses + compacts).
+                                    rb.keys = KeyRep::from_keys(combined_keys);
                                     // Recompute prefix on merged BIN.
                                     if rb.entries.len() >= 2 {
                                         rb.recompute_key_prefix();
+                                    } else {
+                                        rb.keys
+                                            .compact(rb.compact_max_key_length);
                                     }
                                     rb.dirty = true;
                                 }
@@ -4323,6 +5022,8 @@ impl Tree {
                         let mut g = left_arc.write();
                         if let TreeNode::Bottom(lb) = &mut *g {
                             lb.entries.clear();
+                            lb.lsn_rep = LsnRep::Empty; // T-3
+                            lb.keys = KeyRep::new(); // T-2
                             lb.key_prefix = Vec::new();
                             lb.dirty = true;
                         }
@@ -4349,6 +5050,16 @@ impl Tree {
                             }
                         }
                     };
+                    // T-3: capture left's per-slot LSNs.
+                    let left_in_lsns: Vec<Lsn> = {
+                        let g = left_arc.read();
+                        match &*g {
+                            TreeNode::Internal(n) => (0..n.entries.len())
+                                .map(|j| n.get_lsn(j))
+                                .collect(),
+                            _ => Vec::new(),
+                        }
+                    };
                     let n_left = left_in_entries.len();
                     {
                         {
@@ -4362,9 +5073,20 @@ impl Tree {
                                         (0..rn.entries.len())
                                             .map(|j| rn.get_child(j))
                                             .collect();
+                                    // T-3: snapshot right's LSNs too.
+                                    let right_in_lsns: Vec<Lsn> =
+                                        (0..rn.entries.len())
+                                            .map(|j| rn.get_lsn(j))
+                                            .collect();
                                     let mut combined = left_in_entries.clone();
                                     combined.append(&mut rn.entries);
                                     rn.entries = combined;
+                                    // T-3: rebuild the merged LSN array.
+                                    let mut combined_lsns =
+                                        left_in_lsns.clone();
+                                    combined_lsns.extend(right_in_lsns);
+                                    rn.lsn_rep =
+                                        LsnRep::from_lsns(&combined_lsns);
                                     rn.targets = TargetRep::None;
                                     for (j, c) in
                                         left_children.iter().enumerate()
@@ -4402,6 +5124,7 @@ impl Tree {
                         let mut g = left_arc.write();
                         if let TreeNode::Internal(ln) = &mut *g {
                             ln.entries.clear();
+                            ln.lsn_rep = LsnRep::Empty; // T-3
                             ln.targets = TargetRep::None;
                             ln.dirty = true;
                         }
@@ -4549,6 +5272,8 @@ impl Tree {
                                     b.prohibit_next_delta = true;
                                 }
                                 b.entries.remove(j);
+                                b.keys.remove(j); // T-2
+                                b.lsn_rep.remove_shift(j); // T-3
                                 b.dirty = true;
                             }
                         }
@@ -5040,10 +5765,13 @@ impl Tree {
     ///
     /// All delta entries are considered to be the most-recently-dirtied
     /// state, exactly as in where delta slots supersede full-BIN slots.
-    pub fn apply_delta_to_bin(bin: &mut BinStub, delta_entries: Vec<BinEntry>) {
-        for delta in delta_entries {
-            // `delta.key` is a full (uncompressed) key here.
-            bin.insert_with_prefix(delta.key, delta.lsn, delta.data);
+    pub fn apply_delta_to_bin(
+        bin: &mut BinStub,
+        delta_entries: Vec<(Vec<u8>, Lsn, Option<Vec<u8>>)>,
+    ) {
+        for (full_key, lsn, data) in delta_entries {
+            // `full_key` is a full (uncompressed) key here.
+            bin.insert_with_prefix(full_key, lsn, data);
         }
         bin.dirty = true;
     }
@@ -5063,19 +5791,21 @@ impl Tree {
     /// After this call `self` is a full BIN; `base` should be discarded.
     pub fn mutate_to_full_bin(delta: &mut BinStub, mut base: BinStub) {
         // Decompress delta entries to full keys before applying.
-        let delta_full_entries: Vec<BinEntry> = (0..delta.entries.len())
-            .map(|i| BinEntry {
-                key: delta.get_full_key(i).unwrap_or_default(),
-                lsn: delta.entries[i].lsn,
-                data: delta.entries[i].data.clone(),
-                known_deleted: delta.entries[i].known_deleted,
-                dirty: delta.entries[i].dirty,
-                expiration_time: delta.entries[i].expiration_time,
+        let delta_full_entries: Vec<(Vec<u8>, Lsn, Option<Vec<u8>>)> = (0
+            ..delta.entries.len())
+            .map(|i| {
+                (
+                    delta.get_full_key(i).unwrap_or_default(),
+                    delta.get_lsn(i),
+                    delta.entries[i].data.clone(),
+                )
             })
             .collect();
         // reconstituteBIN + resetContent + setBINDelta(false).
         Self::apply_delta_to_bin(&mut base, delta_full_entries);
         delta.entries = base.entries;
+        delta.lsn_rep = base.lsn_rep; // T-3
+        delta.keys = base.keys; // T-2
         delta.key_prefix = base.key_prefix;
         delta.is_delta = false;
         delta.dirty = true;
@@ -5182,7 +5912,10 @@ impl Tree {
     ///    right of the slot we descended through.
     /// 3. When found, descend to the leftmost BIN of that sibling subtree.
     /// 4. If no such parent exists, return `None` (no next BIN).
-    pub fn get_next_bin(&self, current_key: &[u8]) -> Option<Vec<BinEntry>> {
+    pub fn get_next_bin(
+        &self,
+        current_key: &[u8],
+    ) -> Option<Vec<(BinEntry, Lsn, Vec<u8>)>> {
         let root = self.get_root()?;
         self.get_adjacent_bin(&root, current_key, true)
     }
@@ -5191,7 +5924,10 @@ impl Tree {
     /// that contains (or would contain) `current_key`.
     ///
     /// → `Tree.getNextIN(forward=false)`.
-    pub fn get_prev_bin(&self, current_key: &[u8]) -> Option<Vec<BinEntry>> {
+    pub fn get_prev_bin(
+        &self,
+        current_key: &[u8],
+    ) -> Option<Vec<(BinEntry, Lsn, Vec<u8>)>> {
         let root = self.get_root()?;
         self.get_adjacent_bin(&root, current_key, false)
     }
@@ -5231,7 +5967,7 @@ impl Tree {
         root: &Arc<RwLock<TreeNode>>,
         current_key: &[u8],
         forward: bool,
-    ) -> Option<Vec<BinEntry>> {
+    ) -> Option<Vec<(BinEntry, Lsn, Vec<u8>)>> {
         const MAX_ASCENT_ATTEMPTS: u32 = 8;
         for attempt in 0..MAX_ASCENT_ATTEMPTS {
             match self.get_adjacent_bin_attempt(root, current_key, forward) {
@@ -5378,7 +6114,7 @@ impl Tree {
     fn descend_to_edge_bin(
         node_arc: &Arc<RwLock<TreeNode>>,
         forward: bool,
-    ) -> Option<Vec<BinEntry>> {
+    ) -> Option<Vec<(BinEntry, Lsn, Vec<u8>)>> {
         // Hand-over-hand latch coupling — see Tree::search.
         let mut guard: parking_lot::ArcRwLockReadGuard<
             parking_lot::RawRwLock,
@@ -5398,14 +6134,21 @@ impl Tree {
                         // CursorImpl.java:2062-2064) and continue to the next
                         // BIN when an edge BIN is entirely KD during the
                         // BIN-delta reconstitution window.
-                        let full_entries: Vec<BinEntry> = (0..b.entries.len())
-                            .map(|i| BinEntry {
-                                key: b.get_full_key(i).unwrap_or_default(),
-                                lsn: b.entries[i].lsn,
-                                data: b.entries[i].data.clone(),
-                                known_deleted: b.entries[i].known_deleted,
-                                dirty: b.entries[i].dirty,
-                                expiration_time: b.entries[i].expiration_time,
+                        let full_entries: Vec<(BinEntry, Lsn, Vec<u8>)> = (0
+                            ..b.entries.len())
+                            .map(|i| {
+                                (
+                                    BinEntry {
+                                        data: b.entries[i].data.clone(),
+                                        known_deleted: b.entries[i]
+                                            .known_deleted,
+                                        dirty: b.entries[i].dirty,
+                                        expiration_time: b.entries[i]
+                                            .expiration_time,
+                                    },
+                                    b.get_lsn(i),
+                                    b.get_full_key(i).unwrap_or_default(),
+                                )
                             })
                             .collect();
                         Some(full_entries)
@@ -5615,12 +6358,14 @@ impl Tree {
                     buf.extend_from_slice(
                         &(n.entries.len() as u32).to_be_bytes(),
                     );
-                    for e in &n.entries {
+                    for (i, e) in n.entries.iter().enumerate() {
                         buf.extend_from_slice(
                             &(e.key.len() as u32).to_be_bytes(),
                         );
                         buf.extend_from_slice(&e.key);
-                        buf.extend_from_slice(&e.lsn.as_u64().to_be_bytes());
+                        buf.extend_from_slice(
+                            &n.get_lsn(i).as_u64().to_be_bytes(),
+                        );
                     }
                     return Some(buf);
                 }
@@ -6024,6 +6769,7 @@ impl Tree {
         }
         let mut pos = 17usize; // skip node_id(8) + level(4) + n_entries(4) + dirty(1)
         let mut entries = Vec::with_capacity(n_entries);
+        let mut lsns: Vec<Lsn> = Vec::with_capacity(n_entries);
         for _ in 0..n_entries {
             if pos + 2 > bytes.len() {
                 return None;
@@ -6044,7 +6790,8 @@ impl Tree {
                 bytes[pos..pos + 8].try_into().ok()?,
             ));
             pos += 8;
-            entries.push(InEntry { key, lsn });
+            entries.push(InEntry { key });
+            lsns.push(lsn); // T-3
         }
         Some(InNodeStub {
             node_id,
@@ -6055,6 +6802,7 @@ impl Tree {
             dirty: false,
             generation: 0,
             parent: None,
+            lsn_rep: LsnRep::from_lsns(&lsns), // T-3
         })
     }
 
@@ -6204,7 +6952,7 @@ impl Tree {
         let TreeNode::Internal(ref mut p) = *parent else {
             return InRedoResult::NotInTree;
         };
-        let tree_lsn = p.entries[slot].lsn;
+        let tree_lsn = p.get_lsn(slot); // T-3
         if tree_lsn == log_lsn {
             // Case 2: physical match — noop.
             InRedoResult::Skipped
@@ -6220,7 +6968,7 @@ impl Tree {
                 }
             }
             p.set_child(slot, Some(new_arc));
-            p.entries[slot].lsn = log_lsn;
+            p.set_lsn(slot, log_lsn); // T-3
             InRedoResult::Replaced
         } else {
             // tree_lsn > log_lsn: tree already holds a newer version.
@@ -6245,7 +6993,7 @@ impl Tree {
         let TreeNode::Internal(ref mut p) = *parent else {
             return InRedoResult::NotInTree;
         };
-        let tree_lsn = p.entries[slot].lsn;
+        let tree_lsn = p.get_lsn(slot); // T-3
         if tree_lsn == log_lsn {
             InRedoResult::Skipped
         } else if tree_lsn < log_lsn {
@@ -6257,7 +7005,7 @@ impl Tree {
                 }
             }
             p.set_child(slot, Some(new_arc));
-            p.entries[slot].lsn = log_lsn;
+            p.set_lsn(slot, log_lsn); // T-3
             InRedoResult::Replaced
         } else {
             InRedoResult::Skipped
@@ -6335,6 +7083,115 @@ pub fn seed_node_id_counter(last_node_id: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ====================================================================
+    // T-3: LsnRep packed-LSN encoding (IN.entryLsnByteArray / getLsn /
+    // setLsnInternal, IN.java:1752-1935).
+    // ====================================================================
+
+    /// All-NULL node uses the 0-byte Empty rep; reads return NULL_LSN.
+    #[test]
+    fn lsnrep_empty_is_zero_bytes() {
+        let rep = LsnRep::new(64);
+        assert!(matches!(rep, LsnRep::Empty));
+        assert_eq!(rep.memory_size(), 0);
+        assert_eq!(rep.get(0), NULL_LSN);
+        assert_eq!(rep.get(63), NULL_LSN);
+    }
+
+    /// LSNs sharing a file number pack to the Compact rep (4 bytes/slot,
+    /// base_file_number-relative) and round-trip exactly.
+    #[test]
+    fn lsnrep_compact_roundtrip_same_file() {
+        let mut rep = LsnRep::new(8);
+        for i in 0..8u32 {
+            rep.set(i as usize, Lsn::new(7, 1000 + i), 8);
+        }
+        assert!(matches!(rep, LsnRep::Compact { .. }));
+        for i in 0..8u32 {
+            assert_eq!(rep.get(i as usize), Lsn::new(7, 1000 + i));
+        }
+        // 8 slots * 4 bytes = 32 bytes, far below 8 * 8 = 64 for raw u64.
+        assert_eq!(rep.memory_size(), 8 * 4);
+    }
+
+    /// NULL_LSN is stored via the 0xffffff file-offset sentinel, NOT u64::MAX,
+    /// so a node with NULL slots still packs Compact (the blocker JE solves).
+    #[test]
+    fn lsnrep_null_does_not_force_long() {
+        let mut rep = LsnRep::new(4);
+        rep.set(0, Lsn::new(3, 50), 4);
+        rep.set(1, NULL_LSN, 4);
+        rep.set(2, Lsn::new(3, 60), 4);
+        rep.set(3, NULL_LSN, 4);
+        assert!(
+            matches!(rep, LsnRep::Compact { .. }),
+            "NULL slots must NOT force the Long rep"
+        );
+        assert_eq!(rep.get(0), Lsn::new(3, 50));
+        assert_eq!(rep.get(1), NULL_LSN);
+        assert_eq!(rep.get(2), Lsn::new(3, 60));
+        assert_eq!(rep.get(3), NULL_LSN);
+    }
+
+    /// base_file_number tracks the minimum; setting a lower file number
+    /// re-bases the whole array (adjustFileNumbers) while staying Compact.
+    #[test]
+    fn lsnrep_rebase_on_lower_file_number() {
+        let mut rep = LsnRep::new(3);
+        rep.set(0, Lsn::new(10, 5), 3);
+        rep.set(1, Lsn::new(12, 6), 3);
+        // A lower file number re-bases base_file_number to 8.
+        rep.set(2, Lsn::new(8, 7), 3);
+        assert!(matches!(rep, LsnRep::Compact { .. }));
+        assert_eq!(rep.get(0), Lsn::new(10, 5));
+        assert_eq!(rep.get(1), Lsn::new(12, 6));
+        assert_eq!(rep.get(2), Lsn::new(8, 7));
+    }
+
+    /// A file-number spread > 127 forces the Long fallback (mutateToLongArray),
+    /// still round-tripping every slot.
+    #[test]
+    fn lsnrep_mutates_to_long_on_wide_file_range() {
+        let mut rep = LsnRep::new(2);
+        rep.set(0, Lsn::new(1, 5), 2);
+        rep.set(1, Lsn::new(1000, 6), 2); // diff 999 > 127 -> Long
+        assert!(matches!(rep, LsnRep::Long(_)));
+        assert_eq!(rep.get(0), Lsn::new(1, 5));
+        assert_eq!(rep.get(1), Lsn::new(1000, 6));
+    }
+
+    /// A file offset > MAX_FILE_OFFSET (0xfffffe) forces the Long fallback.
+    #[test]
+    fn lsnrep_mutates_to_long_on_large_offset() {
+        let mut rep = LsnRep::new(2);
+        rep.set(0, Lsn::new(1, 10), 2);
+        rep.set(1, Lsn::new(1, 0x00ff_ffff), 2); // > MAX_FILE_OFFSET -> Long
+        assert!(matches!(rep, LsnRep::Long(_)));
+        assert_eq!(rep.get(1), Lsn::new(1, 0x00ff_ffff));
+    }
+
+    /// insert_shift / remove_shift keep slots aligned (INArrayRep.copy).
+    #[test]
+    fn lsnrep_insert_and_remove_shift() {
+        let mut rep = LsnRep::from_lsns(&[
+            Lsn::new(2, 1),
+            Lsn::new(2, 2),
+            Lsn::new(2, 3),
+        ]);
+        // Insert a new slot at index 1.
+        rep.insert_shift(1, 4);
+        rep.set(1, Lsn::new(2, 99), 4);
+        assert_eq!(rep.get(0), Lsn::new(2, 1));
+        assert_eq!(rep.get(1), Lsn::new(2, 99));
+        assert_eq!(rep.get(2), Lsn::new(2, 2));
+        assert_eq!(rep.get(3), Lsn::new(2, 3));
+        // Remove slot 1.
+        rep.remove_shift(1);
+        assert_eq!(rep.get(0), Lsn::new(2, 1));
+        assert_eq!(rep.get(1), Lsn::new(2, 2));
+        assert_eq!(rep.get(2), Lsn::new(2, 3));
+    }
 
     #[test]
     fn test_empty_tree() {
@@ -6512,6 +7369,9 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::new(),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         });
         assert!(bin.is_bin());
         assert_eq!(bin.level(), BIN_LEVEL);
@@ -6524,6 +7384,7 @@ mod tests {
             dirty: false,
             generation: 0,
             parent: None,
+            lsn_rep: LsnRep::Empty,
         });
         assert!(!internal.is_bin());
         assert_eq!(internal.level(), MAIN_LEVEL + 2);
@@ -6532,15 +7393,15 @@ mod tests {
     #[test]
     fn test_find_entry() {
         let mut entries = vec![];
+        let mut keys = vec![];
         for i in 0..5 {
             entries.push(BinEntry {
-                key: format!("key{}", i).into_bytes(),
-                lsn: Lsn::new(1, 100 + i),
                 data: Some(vec![]),
                 known_deleted: false,
                 dirty: false,
                 expiration_time: 0,
             });
+            keys.push(format!("key{}", i).into_bytes());
         }
 
         let bin = TreeNode::Bottom(BinStub {
@@ -6557,6 +7418,9 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::from_keys(keys),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         });
 
         // Search for existing key
@@ -6714,7 +7578,7 @@ mod tests {
             );
             // The slot itself (key + LSN) is retained for re-fetch.
             assert!(
-                !n.entries[child_idx].lsn.is_null(),
+                !n.get_lsn(child_idx).is_null(),
                 "detach keeps the slot LSN so the node can be re-fetched"
             );
         }
@@ -6837,22 +7701,24 @@ mod tests {
         let live = counter.load(Ordering::Relaxed) as u64;
         let real = tree.total_budgeted_memory();
 
-        // The live counter must NOT be the old lower bound.  Old formula per
-        // slot was key + data + 48; the per-slot struct alone is 64, plus the
-        // node-struct overhead the old path ignored entirely.  Assert the live
-        // counter is at least the per-slot-correct portion and within 20% of
-        // the real walked heap.
-        let old_lower_bound: u64 = (0..n)
+        // The live counter must reflect the per-slot cost AFTER the T-2/T-3
+        // compactions hoisted the per-slot key/LSN out of `BinEntry` into the
+        // node-level reps.  The per-slot live charge is now
+        // `key + data + size_of::<BinEntry>() + 4` (the packed LSN slot); the
+        // dominant data+key bytes are still charged in full.  Assert the live
+        // counter is at least the data-and-fixed portion (a stable floor that
+        // does NOT assume the pre-compaction 64-byte slot).
+        let new_lower_bound: u64 = (0..n)
             .map(|i| {
                 let key_len = format!("key-{i:08}").len();
-                (key_len + 64 + 48) as u64 // old: key + data + 48
+                (key_len + 64 + BIN_ENTRY_OVERHEAD) as u64
             })
             .sum();
 
         assert!(
-            live > old_lower_bound,
-            "DBI-23: live counter ({live}) must exceed the old key+data+48 \
-             lower bound ({old_lower_bound})"
+            live >= new_lower_bound,
+            "DBI-23: live counter ({live}) must be >= the per-slot-correct \
+             lower bound ({new_lower_bound})"
         );
 
         // Within tolerance of real heap (the residual gap is the per-node
@@ -6925,6 +7791,9 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::new(),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         });
         tree.set_root(bin);
         assert!(tree.get_root().is_some());
@@ -7094,10 +7963,7 @@ mod tests {
     fn test_find_entry_on_internal_node() {
         let mut entries = vec![];
         for i in 0..4 {
-            entries.push(InEntry {
-                key: format!("k{}", i).into_bytes(),
-                lsn: Lsn::new(1, 10 + i),
-            });
+            entries.push(InEntry { key: format!("k{}", i).into_bytes() });
         }
         let internal = TreeNode::Internal(InNodeStub {
             node_id: 1,
@@ -7107,6 +7973,7 @@ mod tests {
             dirty: false,
             generation: 0,
             parent: None,
+            lsn_rep: LsnRep::Empty,
         });
 
         // Exact match
@@ -7126,10 +7993,7 @@ mod tests {
     fn test_find_entry_internal_nonexact_returns_floor() {
         let mut entries = vec![];
         for i in 0..4 {
-            entries.push(InEntry {
-                key: format!("k{}", i).into_bytes(),
-                lsn: Lsn::new(1, 10 + i),
-            });
+            entries.push(InEntry { key: format!("k{}", i).into_bytes() });
         }
         let internal = TreeNode::Internal(InNodeStub {
             node_id: 1,
@@ -7139,6 +8003,7 @@ mod tests {
             dirty: false,
             generation: 0,
             parent: None,
+            lsn_rep: LsnRep::Empty,
         });
 
         // Key below every separator floors to slot 0 (leftmost child).
@@ -7276,6 +8141,9 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::new(),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         });
         assert!(!bin_node.is_dirty());
         bin_node.set_dirty(true);
@@ -7291,6 +8159,7 @@ mod tests {
             dirty: false,
             generation: 0,
             parent: None,
+            lsn_rep: LsnRep::Empty,
         });
         assert!(!in_node.is_dirty());
         in_node.set_dirty(true);
@@ -7314,6 +8183,9 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::new(),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         });
         assert_eq!(bin_node.get_generation(), 0);
         bin_node.set_generation(42);
@@ -7327,6 +8199,7 @@ mod tests {
             dirty: false,
             generation: 0,
             parent: None,
+            lsn_rep: LsnRep::Empty,
         });
         in_node.set_generation(99);
         assert_eq!(in_node.get_generation(), 99);
@@ -7341,16 +8214,12 @@ mod tests {
             level: BIN_LEVEL,
             entries: vec![
                 BinEntry {
-                    key: b"alpha".to_vec(),
-                    lsn: Lsn::new(1, 10),
                     data: Some(b"d1".to_vec()),
                     known_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
                 BinEntry {
-                    key: b"beta".to_vec(),
-                    lsn: Lsn::new(1, 20),
                     data: None,
                     known_deleted: false,
                     dirty: false,
@@ -7367,6 +8236,9 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::from_keys(vec![b"alpha".to_vec(), b"beta".to_vec()]),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         });
         assert_eq!(bin_node.log_size(), bin_node.write_to_bytes().len());
 
@@ -7375,13 +8247,14 @@ mod tests {
             node_id: 8,
             level: MAIN_LEVEL | 2,
             entries: vec![
-                InEntry { key: vec![], lsn: Lsn::new(1, 1) },
-                InEntry { key: b"mid".to_vec(), lsn: Lsn::new(1, 2) },
+                InEntry { key: vec![] },
+                InEntry { key: b"mid".to_vec() },
             ],
             targets: TargetRep::None,
             dirty: false,
             generation: 0,
             parent: None,
+            lsn_rep: LsnRep::Empty,
         });
         assert_eq!(in_node.log_size(), in_node.write_to_bytes().len());
     }
@@ -7403,6 +8276,9 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::new(),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         });
         let bytes = node.write_to_bytes();
         // First 8 bytes = node_id big-endian.
@@ -7429,13 +8305,14 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::new(),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         });
         let with_entry = TreeNode::Bottom(BinStub {
             node_id: 2,
             level: BIN_LEVEL,
             entries: vec![BinEntry {
-                key: b"longkey_here".to_vec(),
-                lsn: Lsn::new(1, 1),
                 data: None,
                 known_deleted: false,
                 dirty: false,
@@ -7451,6 +8328,9 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::from_keys(vec![b"longkey_here".to_vec()]),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         });
         assert!(
             with_entry.log_size() > empty.log_size(),
@@ -7476,16 +8356,20 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::new(),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         })));
 
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
             node_id: generate_node_id(),
             level: MAIN_LEVEL | 2,
-            entries: vec![InEntry { key: vec![], lsn: Lsn::new(1, 1) }],
+            entries: vec![InEntry { key: vec![] }],
             targets: TargetRep::Sparse(vec![(0, bin_arc.clone())]),
             dirty: false,
             generation: 0,
             parent: None,
+            lsn_rep: LsnRep::Empty,
         })));
 
         // Wire BIN's parent to root.
@@ -7772,14 +8656,13 @@ mod tests {
         {
             let mut g = empty_bin.write();
             if let TreeNode::Bottom(b) = &mut *g {
-                b.entries.push(BinEntry {
-                    key: live_key.clone(),
-                    lsn: Lsn::new(2, 1),
-                    data: Some(vec![0xAB]),
-                    known_deleted: false,
-                    dirty: true,
-                    expiration_time: 0,
-                });
+                // T-2/T-3: route through the insert helper so entries/keys/
+                // lsn_rep stay in lock step.
+                b.insert_with_prefix(
+                    live_key.clone(),
+                    Lsn::new(1, 1),
+                    Some(vec![0xAB]),
+                );
             }
         }
         let id_key = {
@@ -7799,10 +8682,11 @@ mod tests {
         let still_there = {
             let g = empty_bin.read();
             match &*g {
-                TreeNode::Bottom(b) => b
-                    .entries
-                    .iter()
-                    .any(|e| b.key_prefix.is_empty() && e.key == live_key),
+                TreeNode::Bottom(b) => {
+                    b.entries.iter().enumerate().any(|(i, _)| {
+                        b.key_prefix.is_empty() && b.get_key(i) == live_key
+                    })
+                }
                 _ => false,
             }
         };
@@ -7908,16 +8792,20 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::new(),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         })));
 
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
             node_id: generate_node_id(),
             level: MAIN_LEVEL | 2,
-            entries: vec![InEntry { key: vec![], lsn: Lsn::new(1, 1) }],
+            entries: vec![InEntry { key: vec![] }],
             targets: TargetRep::Sparse(vec![(0, bin_arc.clone())]),
             dirty: false,
             generation: 0,
             parent: None,
+            lsn_rep: LsnRep::Empty,
         })));
 
         assert!(
@@ -7937,6 +8825,7 @@ mod tests {
             dirty: false,
             generation: 0,
             parent: None,
+            lsn_rep: LsnRep::Empty,
         })));
         let other_arc = Arc::new(RwLock::new(TreeNode::Bottom(BinStub {
             node_id: generate_node_id(),
@@ -7952,6 +8841,9 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::new(),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         })));
 
         assert!(
@@ -7977,6 +8869,9 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::new(),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         })));
         let bin_b = Arc::new(RwLock::new(TreeNode::Bottom(BinStub {
             node_id: generate_node_id(),
@@ -7992,16 +8887,20 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::new(),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         })));
 
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
             node_id: generate_node_id(),
             level: MAIN_LEVEL | 2,
-            entries: vec![InEntry { key: vec![], lsn: Lsn::new(1, 1) }],
+            entries: vec![InEntry { key: vec![] }],
             targets: TargetRep::Sparse(vec![(0, bin_a)]),
             dirty: false,
             generation: 0,
             parent: None,
+            lsn_rep: LsnRep::Empty,
         })));
 
         assert!(
@@ -8066,16 +8965,12 @@ mod tests {
             level: BIN_LEVEL,
             entries: vec![
                 BinEntry {
-                    key: b"a".to_vec(),
-                    lsn: Lsn::new(1, 1),
                     data: Some(b"old_a".to_vec()),
                     known_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
                 BinEntry {
-                    key: b"c".to_vec(),
-                    lsn: Lsn::new(1, 3),
                     data: Some(b"old_c".to_vec()),
                     known_deleted: false,
                     dirty: false,
@@ -8092,50 +8987,45 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::from_keys(vec![b"a".to_vec(), b"c".to_vec()]),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         };
 
         let delta_entries = vec![
             // Update existing key "a" with new data.
-            BinEntry {
-                key: b"a".to_vec(),
-                lsn: Lsn::new(1, 10),
-                data: Some(b"new_a".to_vec()),
-                known_deleted: false,
-                dirty: false,
-                expiration_time: 0,
-            },
+            (b"a".to_vec(), Lsn::new(1, 10), Some(b"new_a".to_vec())),
             // Insert new key "b".
-            BinEntry {
-                key: b"b".to_vec(),
-                lsn: Lsn::new(1, 20),
-                data: Some(b"new_b".to_vec()),
-                known_deleted: false,
-                dirty: false,
-                expiration_time: 0,
-            },
+            (b"b".to_vec(), Lsn::new(1, 20), Some(b"new_b".to_vec())),
         ];
 
         Tree::apply_delta_to_bin(&mut base, delta_entries);
 
         assert!(base.dirty, "base must be dirty after applying delta");
 
+        // Collect the full keys for assertions (T-2: keys live in the rep).
+        let full_keys: Vec<Vec<u8>> = (0..base.entries.len())
+            .map(|i| base.get_full_key(i).unwrap_or_default())
+            .collect();
+
         // "a" must be updated.
-        let a = base.entries.iter().find(|e| e.key == b"a").unwrap();
-        assert_eq!(a.data.as_deref(), Some(b"new_a" as &[u8]));
+        let a_idx = full_keys.iter().position(|k| k == b"a").unwrap();
+        assert_eq!(
+            base.entries[a_idx].data.as_deref(),
+            Some(b"new_a" as &[u8])
+        );
 
         // "b" must be newly inserted.
-        assert!(base.entries.iter().any(|e| e.key == b"b"));
+        assert!(full_keys.iter().any(|k| k == b"b"));
 
         // "c" must still be present (untouched).
-        assert!(base.entries.iter().any(|e| e.key == b"c"));
+        assert!(full_keys.iter().any(|k| k == b"c"));
 
         // Entries must be in sorted order.
-        let keys: Vec<&[u8]> =
-            base.entries.iter().map(|e| e.key.as_slice()).collect();
-        let mut sorted = keys.clone();
+        let mut sorted = full_keys.clone();
         sorted.sort();
         assert_eq!(
-            keys, sorted,
+            full_keys, sorted,
             "entries must remain sorted after delta apply"
         );
     }
@@ -8147,8 +9037,6 @@ mod tests {
             node_id: 1,
             level: BIN_LEVEL,
             entries: vec![BinEntry {
-                key: b"x".to_vec(),
-                lsn: Lsn::new(1, 1),
                 data: None,
                 known_deleted: false,
                 dirty: false,
@@ -8164,6 +9052,9 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::from_keys(vec![b"x".to_vec()]),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         };
         let n_before = base.entries.len();
         Tree::apply_delta_to_bin(&mut base, vec![]);
@@ -8187,16 +9078,12 @@ mod tests {
             level: BIN_LEVEL,
             entries: vec![
                 BinEntry {
-                    key: b"aa".to_vec(),
-                    lsn: Lsn::new(1, 1),
                     data: Some(b"base_aa".to_vec()),
                     known_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
                 BinEntry {
-                    key: b"cc".to_vec(),
-                    lsn: Lsn::new(1, 3),
                     data: Some(b"base_cc".to_vec()),
                     known_deleted: false,
                     dirty: false,
@@ -8213,6 +9100,9 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::from_keys(vec![b"aa".to_vec(), b"cc".to_vec()]),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         };
 
         // The delta has a new entry "bb" and overwrites "aa".
@@ -8221,16 +9111,12 @@ mod tests {
             level: BIN_LEVEL,
             entries: vec![
                 BinEntry {
-                    key: b"aa".to_vec(),
-                    lsn: Lsn::new(1, 10),
                     data: Some(b"delta_aa".to_vec()),
                     known_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
                 BinEntry {
-                    key: b"bb".to_vec(),
-                    lsn: Lsn::new(1, 20),
                     data: Some(b"delta_bb".to_vec()),
                     known_deleted: false,
                     dirty: false,
@@ -8247,6 +9133,9 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::from_keys(vec![b"aa".to_vec(), b"bb".to_vec()]),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         };
 
         Tree::mutate_to_full_bin(&mut delta, base);
@@ -8258,23 +9147,29 @@ mod tests {
         );
         assert!(delta.dirty, "must be dirty after mutation");
 
+        // Collect full keys for assertions (T-2: keys live in the rep).
+        let dk: Vec<Vec<u8>> = (0..delta.entries.len())
+            .map(|i| delta.get_full_key(i).unwrap_or_default())
+            .collect();
+
         // "aa" must be the delta version.
-        let aa = delta.entries.iter().find(|e| e.key == b"aa").unwrap();
-        assert_eq!(aa.data.as_deref(), Some(b"delta_aa" as &[u8]));
+        let aa_idx = dk.iter().position(|k| k == b"aa").unwrap();
+        assert_eq!(
+            delta.entries[aa_idx].data.as_deref(),
+            Some(b"delta_aa" as &[u8])
+        );
 
         // "bb" must be present (from delta).
-        assert!(delta.entries.iter().any(|e| e.key == b"bb"));
+        assert!(dk.iter().any(|k| k == b"bb"));
 
         // "cc" must be present (from base).
-        assert!(delta.entries.iter().any(|e| e.key == b"cc"));
+        assert!(dk.iter().any(|k| k == b"cc"));
 
         // Three entries total, in sorted order.
         assert_eq!(delta.entries.len(), 3);
-        let keys: Vec<&[u8]> =
-            delta.entries.iter().map(|e| e.key.as_slice()).collect();
-        let mut sorted = keys.clone();
+        let mut sorted = dk.clone();
         sorted.sort();
-        assert_eq!(keys, sorted, "entries must be sorted after mutation");
+        assert_eq!(dk, sorted, "entries must be sorted after mutation");
     }
 
     /// is_delta flag is correctly reported by bin_is_delta().
@@ -8294,6 +9189,9 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::new(),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         };
         assert!(!Tree::bin_is_delta(&bin));
         bin.is_delta = true;
@@ -8318,8 +9216,6 @@ mod tests {
             node_id: 1,
             level: BIN_LEVEL,
             entries: vec![BinEntry {
-                key: b"key1".to_vec(),
-                lsn: Lsn::new(1, 10),
                 data: Some(b"v1".to_vec()),
                 known_deleted: false,
                 dirty: false,
@@ -8335,6 +9231,9 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::from_keys(vec![b"key1".to_vec()]),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         };
 
         Tree::mutate_to_full_bin_from_log(&mut bin, &lm);
@@ -8362,8 +9261,6 @@ mod tests {
             node_id: 2,
             level: BIN_LEVEL,
             entries: vec![BinEntry {
-                key: b"a".to_vec(),
-                lsn: Lsn::new(1, 5),
                 data: Some(b"delta_a".to_vec()),
                 known_deleted: false,
                 dirty: true,
@@ -8379,6 +9276,9 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::from_keys(vec![b"a".to_vec()]),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         };
 
         Tree::mutate_to_full_bin_from_log(&mut delta, &lm);
@@ -8413,16 +9313,12 @@ mod tests {
             level: BIN_LEVEL,
             entries: vec![
                 BinEntry {
-                    key: b"base_only".to_vec(),
-                    lsn: Lsn::new(1, 1),
                     data: Some(b"base_val".to_vec()),
                     known_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
                 BinEntry {
-                    key: b"shared_key".to_vec(),
-                    lsn: Lsn::new(1, 2),
                     data: Some(b"base_shared".to_vec()),
                     known_deleted: false,
                     dirty: false,
@@ -8439,6 +9335,12 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::from_keys(vec![
+                b"base_only".to_vec(),
+                b"shared_key".to_vec(),
+            ]),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         };
 
         let payload = full_bin.serialize_full();
@@ -8460,8 +9362,6 @@ mod tests {
             entries: vec![
                 // Overwrites "shared_key" from the base.
                 BinEntry {
-                    key: b"shared_key".to_vec(),
-                    lsn: Lsn::new(1, 20),
                     data: Some(b"delta_shared".to_vec()),
                     known_deleted: false,
                     dirty: true,
@@ -8469,8 +9369,6 @@ mod tests {
                 },
                 // New key only in the delta.
                 BinEntry {
-                    key: b"delta_only".to_vec(),
-                    lsn: Lsn::new(1, 30),
                     data: Some(b"delta_val".to_vec()),
                     known_deleted: false,
                     dirty: true,
@@ -8487,6 +9385,12 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::from_keys(vec![
+                b"shared_key".to_vec(),
+                b"delta_only".to_vec(),
+            ]),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         };
 
         Tree::mutate_to_full_bin_from_log(&mut delta, &lm);
@@ -8499,11 +9403,9 @@ mod tests {
 
         // All three distinct keys must be present.
         let find = |k: &[u8]| -> Option<Vec<u8>> {
-            delta
-                .entries
-                .iter()
-                .find(|e| delta.decompress_key(&e.key) == k)
-                .and_then(|e| e.data.clone())
+            (0..delta.entries.len())
+                .find(|&i| delta.get_full_key(i).as_deref() == Some(k))
+                .and_then(|i| delta.entries[i].data.clone())
         };
 
         assert_eq!(
@@ -8549,24 +9451,18 @@ mod tests {
             level: BIN_LEVEL,
             entries: vec![
                 BinEntry {
-                    key: b"pfx:alpha".to_vec(),
-                    lsn: Lsn::new(1, 1),
                     data: None,
                     known_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
                 BinEntry {
-                    key: b"pfx:beta".to_vec(),
-                    lsn: Lsn::new(1, 2),
                     data: None,
                     known_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
                 BinEntry {
-                    key: b"pfx:gamma".to_vec(),
-                    lsn: Lsn::new(1, 3),
                     data: None,
                     known_deleted: false,
                     dirty: false,
@@ -8583,6 +9479,13 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::from_keys(vec![
+                b"pfx:alpha".to_vec(),
+                b"pfx:beta".to_vec(),
+                b"pfx:gamma".to_vec(),
+            ]),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         };
         source.recompute_key_prefix();
         // Verify the source has the expected prefix before serializing.
@@ -8618,8 +9521,6 @@ mod tests {
             node_id: 7,
             level: BIN_LEVEL,
             entries: vec![BinEntry {
-                key: b"solo".to_vec(),
-                lsn: Lsn::new(1, 1),
                 data: None,
                 known_deleted: false,
                 dirty: false,
@@ -8635,6 +9536,9 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::from_keys(vec![b"solo".to_vec()]),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         };
 
         let payload = source.serialize_full();
@@ -8682,9 +9586,9 @@ mod tests {
         assert!(!entries.is_empty(), "next BIN must not be empty");
         // All returned keys must be strictly greater than "n0000" because they
         // are in a different (rightward) BIN.
-        for e in &entries {
+        for (_, _, k) in &entries {
             assert!(
-                e.key.as_slice() > b"n0000" as &[u8],
+                k.as_slice() > b"n0000" as &[u8],
                 "next BIN entries must all be > the search key"
             );
         }
@@ -8727,9 +9631,9 @@ mod tests {
         let entries = prev.unwrap();
         assert!(!entries.is_empty(), "prev BIN must not be empty");
         // All returned keys must be < b"p0004".
-        for e in &entries {
+        for (_, _, k) in &entries {
             assert!(
-                e.key.as_slice() < b"p0004" as &[u8],
+                k.as_slice() < b"p0004" as &[u8],
                 "prev BIN entries must all be < the current BIN"
             );
         }
@@ -8765,12 +9669,12 @@ mod tests {
         let next_from_first = tree.get_next_bin(b"s0000").unwrap();
         // The smallest key of the next BIN.
         let next_first_key =
-            next_from_first.iter().map(|e| e.key.clone()).min().unwrap();
+            next_from_first.iter().map(|(_, _, k)| k.clone()).min().unwrap();
 
         // From that key in the second BIN: prev → should overlap with first BIN.
         let prev_from_second = tree.get_prev_bin(&next_first_key).unwrap();
         let prev_first_key =
-            prev_from_second.iter().map(|e| e.key.clone()).max().unwrap();
+            prev_from_second.iter().map(|(_, _, k)| k.clone()).max().unwrap();
 
         // The max key of the "prev" result must be in the first BIN (< next boundary).
         assert!(
@@ -8858,8 +9762,8 @@ mod tests {
             match tree.get_next_bin(&anchor) {
                 None => break,
                 Some(entries) => {
-                    if let Some(first) = entries.first() {
-                        let fk = first.key.clone();
+                    if let Some((_, _, fk0)) = entries.first() {
+                        let fk = fk0.clone();
                         bin_first_keys.push(fk.clone());
                         anchor = fk;
                     } else {
@@ -8908,6 +9812,9 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::new(),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         };
 
         bin.insert_with_prefix(b"record:aaa".to_vec(), Lsn::new(1, 1), None);
@@ -8938,6 +9845,9 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::new(),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         };
 
         let keys = [
@@ -8980,6 +9890,9 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::new(),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         };
 
         for k in
@@ -9061,6 +9974,9 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::new(),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         };
 
         for k in [b"myapp:user:1".as_ref(), b"myapp:user:2".as_ref()] {
@@ -9100,8 +10016,8 @@ mod tests {
             // We approximate by reading the root's leftmost BIN directly.
             tree.get_next_bin(b"t0000")
         } {
-            for e in first_entries {
-                visited.push(e.key);
+            for (_, _, k) in first_entries {
+                visited.push(k);
             }
         }
 
@@ -9228,7 +10144,7 @@ mod tests {
         let first_key = format!("scan{:04}", 0).into_bytes();
         if let Some(entries) = tree.get_next_bin(&first_key) {
             let entry_keys: Vec<&[u8]> =
-                entries.iter().map(|e| e.key.as_slice()).collect();
+                entries.iter().map(|(_, _, k)| k.as_slice()).collect();
             for w in entry_keys.windows(2) {
                 assert!(
                     w[0] <= w[1],
@@ -9405,38 +10321,30 @@ mod tests {
     /// `known_deleted = true` must be gone and the BIN must be dirty.
     #[test]
     fn test_compress_bin_removes_deleted_slots() {
-        let lsn = Lsn::new(1, 1);
+        let _lsn = Lsn::new(1, 1);
         let bin_arc = Arc::new(RwLock::new(TreeNode::Bottom(BinStub {
             node_id: generate_node_id(),
             level: BIN_LEVEL,
             entries: vec![
                 BinEntry {
-                    key: b"a".to_vec(),
-                    lsn,
                     data: Some(b"live".to_vec()),
                     known_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
                 BinEntry {
-                    key: b"b".to_vec(),
-                    lsn,
                     data: None,
                     known_deleted: true,
                     dirty: false,
                     expiration_time: 0,
                 },
                 BinEntry {
-                    key: b"c".to_vec(),
-                    lsn,
                     data: Some(b"live2".to_vec()),
                     known_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
                 BinEntry {
-                    key: b"d".to_vec(),
-                    lsn,
                     data: None,
                     known_deleted: true,
                     dirty: false,
@@ -9453,17 +10361,26 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::from_keys(vec![
+                b"a".to_vec(),
+                b"b".to_vec(),
+                b"c".to_vec(),
+                b"d".to_vec(),
+            ]),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         })));
 
         // Wire a minimal parent IN so compress_bin can prune if needed.
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
             node_id: generate_node_id(),
             level: MAIN_LEVEL | 2,
-            entries: vec![InEntry { key: vec![], lsn }],
+            entries: vec![InEntry { key: vec![] }],
             targets: TargetRep::Sparse(vec![(0, bin_arc.clone())]),
             dirty: false,
             generation: 0,
             parent: None,
+            lsn_rep: LsnRep::Empty,
         })));
         {
             let mut g = bin_arc.write();
@@ -9503,13 +10420,11 @@ mod tests {
     /// progress and returns false.
     #[test]
     fn test_compress_bin_no_deleted_slots_returns_false() {
-        let lsn = Lsn::new(1, 1);
+        let _lsn = Lsn::new(1, 1);
         let bin_arc = Arc::new(RwLock::new(TreeNode::Bottom(BinStub {
             node_id: generate_node_id(),
             level: BIN_LEVEL,
             entries: vec![BinEntry {
-                key: b"x".to_vec(),
-                lsn,
                 data: Some(b"d".to_vec()),
                 known_deleted: false,
                 dirty: false,
@@ -9525,6 +10440,9 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::from_keys(vec![b"x".to_vec()]),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         })));
 
         let tree = Tree::new(1, 128);
@@ -9540,13 +10458,11 @@ mod tests {
     /// INCompressor.compressBin(): "if (bin.isBINDelta()) return".
     #[test]
     fn test_compress_bin_skips_delta() {
-        let lsn = Lsn::new(1, 1);
+        let _lsn = Lsn::new(1, 1);
         let bin_arc = Arc::new(RwLock::new(TreeNode::Bottom(BinStub {
             node_id: generate_node_id(),
             level: BIN_LEVEL,
             entries: vec![BinEntry {
-                key: b"k".to_vec(),
-                lsn,
                 data: None,
                 known_deleted: true,
                 dirty: false,
@@ -9562,6 +10478,9 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::from_keys(vec![b"k".to_vec()]),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         })));
 
         let tree = Tree::new(1, 128);
@@ -9586,14 +10505,12 @@ mod tests {
     /// compression empties the BIN, it must be removed from the parent IN.
     #[test]
     fn test_compress_bin_prunes_empty_bin() {
-        let lsn = Lsn::new(1, 1);
+        let _lsn = Lsn::new(1, 1);
         // Insert a live key so the tree can be searched to prune.
         let bin_arc = Arc::new(RwLock::new(TreeNode::Bottom(BinStub {
             node_id: generate_node_id(),
             level: BIN_LEVEL,
             entries: vec![BinEntry {
-                key: b"only".to_vec(),
-                lsn,
                 data: None,
                 known_deleted: true,
                 dirty: false,
@@ -9609,16 +10526,20 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::from_keys(vec![b"only".to_vec()]),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         })));
 
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
             node_id: generate_node_id(),
             level: MAIN_LEVEL | 2,
-            entries: vec![InEntry { key: vec![], lsn }],
+            entries: vec![InEntry { key: vec![] }],
             targets: TargetRep::Sparse(vec![(0, bin_arc.clone())]),
             dirty: false,
             generation: 0,
             parent: None,
+            lsn_rep: LsnRep::Empty,
         })));
         {
             let mut g = bin_arc.write();
@@ -9646,13 +10567,11 @@ mod tests {
     /// INCompressor.lazyCompress(): skip BINs with no defunct slots.
     #[test]
     fn test_maybe_compress_skips_clean_bin() {
-        let lsn = Lsn::new(1, 1);
+        let _lsn = Lsn::new(1, 1);
         let bin_arc = Arc::new(RwLock::new(TreeNode::Bottom(BinStub {
             node_id: generate_node_id(),
             level: BIN_LEVEL,
             entries: vec![BinEntry {
-                key: b"live".to_vec(),
-                lsn,
                 data: Some(b"v".to_vec()),
                 known_deleted: false,
                 dirty: false,
@@ -9668,6 +10587,9 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::from_keys(vec![b"live".to_vec()]),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         })));
 
         let tree = Tree::new(1, 128);
@@ -9684,22 +10606,18 @@ mod tests {
     /// call bin.compress() to remove them.
     #[test]
     fn test_maybe_compress_triggers_when_deleted_slots_exist() {
-        let lsn = Lsn::new(1, 1);
+        let _lsn = Lsn::new(1, 1);
         let bin_arc = Arc::new(RwLock::new(TreeNode::Bottom(BinStub {
             node_id: generate_node_id(),
             level: BIN_LEVEL,
             entries: vec![
                 BinEntry {
-                    key: b"live".to_vec(),
-                    lsn,
                     data: Some(b"v".to_vec()),
                     known_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
                 BinEntry {
-                    key: b"dead".to_vec(),
-                    lsn,
                     data: None,
                     known_deleted: true,
                     dirty: false,
@@ -9716,6 +10634,9 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::from_keys(vec![b"live".to_vec(), b"dead".to_vec()]),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         })));
 
         let tree = Tree::new(1, 128);
@@ -9729,7 +10650,7 @@ mod tests {
         match &*g {
             TreeNode::Bottom(b) => {
                 assert_eq!(b.entries.len(), 1, "only live entry must remain");
-                assert_eq!(b.entries[0].key, b"live");
+                assert_eq!(b.get_full_key(0).unwrap(), b"live");
             }
             _ => panic!("expected BIN"),
         }
@@ -9747,7 +10668,7 @@ mod tests {
     /// The parent IN entry count must not change.
     #[test]
     fn test_incompressor_live_slots_preserved_after_compress() {
-        let lsn = Lsn::new(1, 100);
+        let _lsn = Lsn::new(1, 100);
 
         // BIN with 3 entries: two live, one known-deleted.
         let bin_arc = Arc::new(RwLock::new(TreeNode::Bottom(BinStub {
@@ -9755,24 +10676,18 @@ mod tests {
             level: BIN_LEVEL,
             entries: vec![
                 BinEntry {
-                    key: b"\x00".to_vec(),
-                    lsn,
                     data: Some(b"d0".to_vec()),
                     known_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
                 BinEntry {
-                    key: b"\x01".to_vec(),
-                    lsn,
                     data: Some(b"d1".to_vec()),
                     known_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
                 BinEntry {
-                    key: b"\x02".to_vec(),
-                    lsn,
                     data: None,
                     known_deleted: true,
                     dirty: false,
@@ -9789,6 +10704,13 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::from_keys(vec![
+                b"\x00".to_vec(),
+                b"\x01".to_vec(),
+                b"\x02".to_vec(),
+            ]),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         })));
 
         // Parent IN with two children: the BIN above plus a placeholder sibling.
@@ -9796,8 +10718,6 @@ mod tests {
             node_id: generate_node_id(),
             level: BIN_LEVEL,
             entries: vec![BinEntry {
-                key: b"\x40".to_vec(),
-                lsn,
                 data: Some(b"s".to_vec()),
                 known_deleted: false,
                 dirty: false,
@@ -9813,14 +10733,17 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::from_keys(vec![b"\x40".to_vec()]),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         })));
 
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
             node_id: generate_node_id(),
             level: MAIN_LEVEL | 2,
             entries: vec![
-                InEntry { key: vec![], lsn },
-                InEntry { key: b"\x40".to_vec(), lsn },
+                InEntry { key: vec![] },
+                InEntry { key: b"\x40".to_vec() },
             ],
             targets: TargetRep::Sparse(vec![
                 (0, bin_arc.clone()),
@@ -9829,6 +10752,7 @@ mod tests {
             dirty: false,
             generation: 0,
             parent: None,
+            lsn_rep: LsnRep::Empty,
         })));
         bin_arc.write().set_parent(Some(Arc::downgrade(&root_arc)));
         sibling_arc.write().set_parent(Some(Arc::downgrade(&root_arc)));
@@ -9926,13 +10850,11 @@ mod tests {
     /// "if (in.isBINDelta()) return false".
     #[test]
     fn test_incompressor_maybe_compress_skips_bin_delta() {
-        let lsn = Lsn::new(1, 1);
+        let _lsn = Lsn::new(1, 1);
         let bin_arc = Arc::new(RwLock::new(TreeNode::Bottom(BinStub {
             node_id: generate_node_id(),
             level: BIN_LEVEL,
             entries: vec![BinEntry {
-                key: b"k".to_vec(),
-                lsn,
                 data: None,
                 known_deleted: true,
                 dirty: false,
@@ -9948,6 +10870,9 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::from_keys(vec![b"k".to_vec()]),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         })));
 
         let tree = Tree::new(1, 128);
@@ -9977,22 +10902,18 @@ mod tests {
     /// INCompressor.lazyCompress() skips BINs that have no defunct slots.
     #[test]
     fn test_incompressor_clean_bin_not_compressed() {
-        let lsn = Lsn::new(1, 1);
+        let _lsn = Lsn::new(1, 1);
         let bin_arc = Arc::new(RwLock::new(TreeNode::Bottom(BinStub {
             node_id: generate_node_id(),
             level: BIN_LEVEL,
             entries: vec![
                 BinEntry {
-                    key: b"\x00".to_vec(),
-                    lsn,
                     data: Some(b"a".to_vec()),
                     known_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
                 BinEntry {
-                    key: b"\x01".to_vec(),
-                    lsn,
                     data: Some(b"b".to_vec()),
                     known_deleted: false,
                     dirty: false,
@@ -10009,6 +10930,9 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::from_keys(vec![b"\x00".to_vec(), b"\x01".to_vec()]),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         })));
 
         let tree = Tree::new(1, 128);
@@ -10037,7 +10961,7 @@ mod tests {
     /// shorter remaining key set may expose a longer common prefix.
     #[test]
     fn test_incompressor_prefix_recomputed_after_compress() {
-        let lsn = Lsn::new(1, 1);
+        let _lsn = Lsn::new(1, 1);
 
         // Three keys all starting with "pfx:".  After deleting "pfx:a" the
         // remaining two ("pfx:b", "pfx:c") still share "pfx:" as prefix.
@@ -10047,24 +10971,18 @@ mod tests {
             level: BIN_LEVEL,
             entries: vec![
                 BinEntry {
-                    key: b"pfx:a".to_vec(),
-                    lsn,
                     data: None,
                     known_deleted: true,
                     dirty: false,
                     expiration_time: 0,
                 },
                 BinEntry {
-                    key: b"pfx:b".to_vec(),
-                    lsn,
                     data: Some(b"B".to_vec()),
                     known_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
                 BinEntry {
-                    key: b"pfx:c".to_vec(),
-                    lsn,
                     data: Some(b"C".to_vec()),
                     known_deleted: false,
                     dirty: false,
@@ -10081,17 +10999,25 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::from_keys(vec![
+                b"pfx:a".to_vec(),
+                b"pfx:b".to_vec(),
+                b"pfx:c".to_vec(),
+            ]),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         })));
 
         // Wire up a parent so compress_bin can run normally.
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
             node_id: generate_node_id(),
             level: MAIN_LEVEL | 2,
-            entries: vec![InEntry { key: vec![], lsn }],
+            entries: vec![InEntry { key: vec![] }],
             targets: TargetRep::Sparse(vec![(0, bin_arc.clone())]),
             dirty: false,
             generation: 0,
             parent: None,
+            lsn_rep: LsnRep::Empty,
         })));
         bin_arc.write().set_parent(Some(Arc::downgrade(&root_arc)));
         let tree = Tree::new(1, 128);
@@ -10220,7 +11146,7 @@ mod tests {
     /// from the parent.
     #[test]
     fn test_incompressor_node_not_empty_prevents_prune() {
-        let lsn = Lsn::new(1, 1);
+        let _lsn = Lsn::new(1, 1);
 
         // BIN with one deleted and one live entry.
         let bin_arc = Arc::new(RwLock::new(TreeNode::Bottom(BinStub {
@@ -10228,16 +11154,12 @@ mod tests {
             level: BIN_LEVEL,
             entries: vec![
                 BinEntry {
-                    key: b"\x00".to_vec(),
-                    lsn,
                     data: None,
                     known_deleted: true,
                     dirty: false,
                     expiration_time: 0,
                 },
                 BinEntry {
-                    key: b"\x01".to_vec(),
-                    lsn,
                     data: Some(b"v".to_vec()),
                     known_deleted: false,
                     dirty: false,
@@ -10254,14 +11176,15 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::from_keys(vec![b"\x00".to_vec(), b"\x01".to_vec()]),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         })));
 
         let sibling_arc = Arc::new(RwLock::new(TreeNode::Bottom(BinStub {
             node_id: generate_node_id(),
             level: BIN_LEVEL,
             entries: vec![BinEntry {
-                key: b"\x40".to_vec(),
-                lsn,
                 data: Some(b"s".to_vec()),
                 known_deleted: false,
                 dirty: false,
@@ -10277,14 +11200,17 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::from_keys(vec![b"\x40".to_vec()]),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         })));
 
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
             node_id: generate_node_id(),
             level: MAIN_LEVEL | 2,
             entries: vec![
-                InEntry { key: vec![], lsn },
-                InEntry { key: b"\x40".to_vec(), lsn },
+                InEntry { key: vec![] },
+                InEntry { key: b"\x40".to_vec() },
             ],
             targets: TargetRep::Sparse(vec![
                 (0, bin_arc.clone()),
@@ -10293,6 +11219,7 @@ mod tests {
             dirty: false,
             generation: 0,
             parent: None,
+            lsn_rep: LsnRep::Empty,
         })));
         bin_arc.write().set_parent(Some(Arc::downgrade(&root_arc)));
         sibling_arc.write().set_parent(Some(Arc::downgrade(&root_arc)));
@@ -10338,7 +11265,7 @@ mod tests {
     /// PENDING_DELETED.  compress_bin must remove all defunct slots.
     #[test]
     fn test_incompressor_known_and_pending_deleted_removed() {
-        let lsn = Lsn::new(1, 1);
+        let _lsn = Lsn::new(1, 1);
 
         let bin_arc = Arc::new(RwLock::new(TreeNode::Bottom(BinStub {
             node_id: generate_node_id(),
@@ -10346,8 +11273,6 @@ mod tests {
             entries: vec![
                 // slot 0: live
                 BinEntry {
-                    key: b"\x00".to_vec(),
-                    lsn,
                     data: Some(b"live".to_vec()),
                     known_deleted: false,
                     dirty: false,
@@ -10355,8 +11280,6 @@ mod tests {
                 },
                 // slot 1: known-deleted
                 BinEntry {
-                    key: b"\x01".to_vec(),
-                    lsn,
                     data: None,
                     known_deleted: true,
                     dirty: false,
@@ -10364,8 +11287,6 @@ mod tests {
                 },
                 // slot 2: live
                 BinEntry {
-                    key: b"\x02".to_vec(),
-                    lsn,
                     data: Some(b"also-live".to_vec()),
                     known_deleted: false,
                     dirty: false,
@@ -10373,8 +11294,6 @@ mod tests {
                 },
                 // slot 3: known-deleted
                 BinEntry {
-                    key: b"\x03".to_vec(),
-                    lsn,
                     data: None,
                     known_deleted: true,
                     dirty: false,
@@ -10391,16 +11310,25 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::from_keys(vec![
+                b"\x00".to_vec(),
+                b"\x01".to_vec(),
+                b"\x02".to_vec(),
+                b"\x03".to_vec(),
+            ]),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         })));
 
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
             node_id: generate_node_id(),
             level: MAIN_LEVEL | 2,
-            entries: vec![InEntry { key: vec![], lsn }],
+            entries: vec![InEntry { key: vec![] }],
             targets: TargetRep::Sparse(vec![(0, bin_arc.clone())]),
             dirty: false,
             generation: 0,
             parent: None,
+            lsn_rep: LsnRep::Empty,
         })));
         bin_arc.write().set_parent(Some(Arc::downgrade(&root_arc)));
 
@@ -10573,6 +11501,9 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::new(),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         };
         bin.insert_with_prefix(b"key".to_vec(), lsn, Some(b"val".to_vec()));
         assert_eq!(bin.dirty_count(), 1, "new slot should be dirty");
@@ -10581,13 +11512,11 @@ mod tests {
 
     #[test]
     fn test_update_marks_slot_dirty() {
-        let lsn = Lsn::new(1, 10);
+        let _lsn = Lsn::new(1, 10);
         let mut bin = BinStub {
             node_id: 2,
             level: BIN_LEVEL,
             entries: vec![BinEntry {
-                key: b"key".to_vec(),
-                lsn,
                 data: Some(b"old".to_vec()),
                 known_deleted: false,
                 dirty: false,
@@ -10603,6 +11532,9 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::from_keys(vec![b"key".to_vec()]),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         };
         bin.insert_with_prefix(
             b"key".to_vec(),
@@ -10620,16 +11552,12 @@ mod tests {
             level: BIN_LEVEL,
             entries: vec![
                 BinEntry {
-                    key: b"alpha".to_vec(),
-                    lsn: Lsn::new(1, 1),
                     data: Some(b"d1".to_vec()),
                     known_deleted: false,
                     dirty: true,
                     expiration_time: 0,
                 },
                 BinEntry {
-                    key: b"beta".to_vec(),
-                    lsn: Lsn::new(1, 2),
                     data: None,
                     known_deleted: true,
                     dirty: false,
@@ -10646,6 +11574,9 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::from_keys(vec![b"alpha".to_vec(), b"beta".to_vec()]),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         };
         let bytes = bin.serialize_full();
         let node_id = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
@@ -10665,24 +11596,18 @@ mod tests {
             level: BIN_LEVEL,
             entries: vec![
                 BinEntry {
-                    key: b"a".to_vec(),
-                    lsn: Lsn::new(1, 1),
                     data: Some(b"v1".to_vec()),
                     known_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
                 BinEntry {
-                    key: b"b".to_vec(),
-                    lsn: Lsn::new(1, 2),
                     data: Some(b"v2".to_vec()),
                     known_deleted: false,
                     dirty: true,
                     expiration_time: 0,
                 },
                 BinEntry {
-                    key: b"c".to_vec(),
-                    lsn: Lsn::new(1, 3),
                     data: Some(b"v3".to_vec()),
                     known_deleted: false,
                     dirty: false,
@@ -10699,6 +11624,13 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::from_keys(vec![
+                b"a".to_vec(),
+                b"b".to_vec(),
+                b"c".to_vec(),
+            ]),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         };
         let bytes = bin.serialize_delta();
         let node_id = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
@@ -10736,14 +11668,15 @@ mod tests {
     fn make_bin_for_delta_tests(
         entries: Vec<(Vec<u8>, Lsn, Option<Vec<u8>>)>,
     ) -> BinStub {
+        let lsns: Vec<Lsn> = entries.iter().map(|(_, l, _)| *l).collect();
+        let keys: Vec<Vec<u8>> =
+            entries.iter().map(|(k, _, _)| k.clone()).collect();
         BinStub {
             node_id: 1,
             level: BIN_LEVEL,
             entries: entries
                 .into_iter()
-                .map(|(key, lsn, data)| BinEntry {
-                    key,
-                    lsn,
+                .map(|(_key, _lsn, data)| BinEntry {
                     data,
                     known_deleted: false,
                     dirty: false,
@@ -10760,6 +11693,9 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::from_lsns(&lsns),
+            keys: KeyRep::from_keys(keys),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         }
     }
 
@@ -11118,6 +12054,7 @@ mod tests {
             dirty: false,
             generation: 0,
             parent: None,
+            lsn_rep: LsnRep::Empty,
         })));
         let tree = Tree::new(1, 128);
         *tree.root.write() = Some(root_arc);
@@ -11231,32 +12168,35 @@ mod tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::new(),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         };
         // Two non-dirty slots with embedded data, one dirty slot.
         bin.entries.push(BinEntry {
-            key: b"a".to_vec(),
-            lsn: Lsn::from_u64(100),
             data: Some(vec![0u8; 64]),
             known_deleted: false,
             dirty: false,
             expiration_time: 0,
         });
         bin.entries.push(BinEntry {
-            key: b"b".to_vec(),
-            lsn: Lsn::from_u64(200),
             data: Some(vec![0u8; 32]),
             known_deleted: false,
             dirty: false,
             expiration_time: 0,
         });
         bin.entries.push(BinEntry {
-            key: b"c".to_vec(),
-            lsn: Lsn::from_u64(300),
             data: Some(vec![0u8; 16]),
             known_deleted: false,
             dirty: true, // dirty slot must be skipped
             expiration_time: 0,
         });
+        // T-2: keep the key rep aligned with the pushed slots.
+        bin.keys = KeyRep::from_keys(vec![
+            b"a".to_vec(),
+            b"b".to_vec(),
+            b"c".to_vec(),
+        ]);
 
         let freed = bin.strip_lns();
         assert_eq!(freed, 64 + 32, "freed bytes must sum non-dirty slot data");
@@ -11305,14 +12245,13 @@ mod tests {
         // (empty key sorts first), the rest strictly ascending.
         for n_slots in 1usize..40 {
             let mut entries: Vec<InEntry> = Vec::with_capacity(n_slots);
-            entries.push(InEntry { key: vec![], lsn: Lsn::from_u64(0) });
+            entries.push(InEntry { key: vec![] });
             for i in 1..n_slots {
                 // Strictly-ascending two-byte keys with gaps so probes can
                 // fall between, on, before, and after them.
                 let v = (i as u16) * 4;
                 entries.push(InEntry {
                     key: vec![(v >> 8) as u8, (v & 0xFF) as u8],
-                    lsn: Lsn::from_u64(0),
                 });
             }
             for probe in 0u16..=(n_slots as u16 * 4 + 4) {
@@ -11358,15 +12297,14 @@ fn test_split_child_sibling_inherits_expiration_in_hours() {
 
     // Pre-populate the tree root for the test.
     let entries: Vec<BinEntry> = (0u8..4u8)
-        .map(|k| BinEntry {
-            key: vec![k],
-            lsn: Lsn::new(1, (k as u32) * 100 + 100),
-            data: Some(vec![k, k]),
+        .map(|_k| BinEntry {
+            data: Some(vec![_k, _k]),
             known_deleted: false,
             dirty: true,
             expiration_time: 495_630, // hours-since-epoch value, 2026
         })
         .collect();
+    let bin_keys: Vec<Vec<u8>> = (0u8..4u8).map(|k| vec![k]).collect();
     let bin = Arc::new(RwLock::new(TreeNode::Bottom(BinStub {
         node_id: 1,
         level: BIN_LEVEL,
@@ -11381,6 +12319,9 @@ fn test_split_child_sibling_inherits_expiration_in_hours() {
         expiration_in_hours: true, // hours-granularity entries
         cursor_count: 0,
         prohibit_next_delta: false,
+        lsn_rep: LsnRep::Empty,
+        keys: KeyRep::from_keys(bin_keys),
+        compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
     })));
 
     let root = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
@@ -11388,12 +12329,12 @@ fn test_split_child_sibling_inherits_expiration_in_hours() {
         level: MAIN_LEVEL | 2,
         entries: vec![InEntry {
             key: vec![], // virtual key for slot 0 (-infinity)
-            lsn: Lsn::new(1, 1),
         }],
         targets: TargetRep::Sparse(vec![(0, Arc::clone(&bin))]),
         dirty: true,
         generation: 0,
         parent: None,
+        lsn_rep: LsnRep::Empty,
     })));
     {
         let mut b = bin.write();
@@ -11505,16 +12446,18 @@ mod in_redo_tests {
             expiration_in_hours: true,
             cursor_count: 0,
             prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::new(),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         };
         for i in 0..n {
-            bin.entries.push(BinEntry {
-                key: vec![i as u8],
-                lsn: Lsn::new(1, i as u32),
-                data: Some(vec![i as u8]),
-                known_deleted: false,
-                dirty: false,
-                expiration_time: 0,
-            });
+            // T-2/T-3: route through insert so entries/keys/lsn_rep stay
+            // aligned; the serialized bytes are identical.
+            bin.insert_with_prefix(
+                vec![i as u8],
+                Lsn::new(1, (i + 1) as u32),
+                Some(vec![i as u8]),
+            );
         }
         bin.serialize_full()
     }
@@ -11581,8 +12524,8 @@ mod in_redo_tests {
         let bin = Tree::deserialize_bin(&bytes).expect("must deserialize");
         assert_eq!(bin.node_id, 99);
         assert_eq!(bin.entries.len(), 5);
-        for (i, e) in bin.entries.iter().enumerate() {
-            assert_eq!(e.key, vec![i as u8]);
+        for i in 0..bin.entries.len() {
+            assert_eq!(bin.get_full_key(i).unwrap(), vec![i as u8]);
         }
     }
 
@@ -11594,13 +12537,14 @@ mod in_redo_tests {
             node_id: 77,
             level: 0x10002,
             entries: vec![
-                InEntry { key: vec![1, 2, 3], lsn: Lsn::new(1, 10) },
-                InEntry { key: vec![4, 5, 6], lsn: Lsn::new(1, 20) },
+                InEntry { key: vec![1, 2, 3] },
+                InEntry { key: vec![4, 5, 6] },
             ],
             targets: TargetRep::None,
             dirty: false,
             generation: 0,
             parent: None,
+            lsn_rep: LsnRep::Empty,
         });
         let bytes = node.write_to_bytes();
         let restored =
@@ -11671,7 +12615,7 @@ mod key_prefixing_tests {
         assert_eq!(bin.entries.len(), 8);
         // Keys must be stored as full keys.
         assert_eq!(
-            bin.entries[0].key,
+            bin.get_full_key(0).unwrap(),
             vec![b'r', b'e', b'c', b'o', b'r', b'd', b':', 0]
         );
     }
@@ -12036,7 +12980,7 @@ mod split_special_tests {
         let root = tree.get_root().expect("root");
         let edge = Tree::descend_to_edge_bin(&root, true).expect("edge bin");
         assert!(
-            !edge.iter().any(|e| e.key == kd_key && !e.known_deleted),
+            !edge.iter().any(|(e, _, k)| k == &kd_key && !e.known_deleted),
             "TREE-F1: scan must not surface a known_deleted slot as live \
              (CursorImpl.java:2062-2064)"
         );
@@ -12049,7 +12993,7 @@ mod split_special_tests {
                 assert!(
                     !entries
                         .iter()
-                        .any(|e| e.key == kd_key && !e.known_deleted),
+                        .any(|(e, _, k)| k == &kd_key && !e.known_deleted),
                     "TREE-F1: get_next_bin/get_prev_bin must not surface a \
                      known_deleted slot as live"
                 );

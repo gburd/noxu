@@ -435,7 +435,7 @@ impl TreeLookup for RealTreeLookup {
                     // The parent slot's LSN tracks the last logged position
                     // for the child — used directly for upper INs
                     // INEntryInfo.prevFullLsn read from the log entry).
-                    n.entries.get(slot_idx).map(|e| e.lsn)
+                    n.entries.get(slot_idx).map(|_| n.get_lsn(slot_idx))
                 }
                 _ => None,
             };
@@ -569,11 +569,11 @@ impl RealTreeLookup {
         let guard = node_arc.read();
         match &*guard {
             TreeNode::Bottom(bin) => {
-                let idx = bin
-                    .entries
-                    .binary_search_by(|e| e.key.as_slice().cmp(key))
-                    .ok()?;
-                Some(bin.entries[idx].lsn)
+                let (idx, found) = bin.find_entry_compressed(key);
+                if !found {
+                    return None;
+                }
+                Some(bin.get_lsn(idx))
             }
             TreeNode::Internal(n) => {
                 let mut idx = 0usize;
@@ -602,10 +602,10 @@ impl RealTreeLookup {
         let guard = node_arc.read();
         match &*guard {
             TreeNode::Bottom(bin) => {
-                let idx = bin
-                    .entries
-                    .binary_search_by(|e| e.key.as_slice().cmp(key))
-                    .ok()?;
+                let (idx, found) = bin.find_entry_compressed(key);
+                if !found {
+                    return None;
+                }
                 bin.entries[idx].data.clone()
             }
             TreeNode::Internal(n) => {
