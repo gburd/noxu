@@ -26,6 +26,7 @@ pub mod error;
 pub mod log_scanner;
 pub mod recovery_info;
 pub mod recovery_manager;
+pub mod replay;
 pub mod rollback_tracker;
 pub mod txn_chain;
 
@@ -49,5 +50,6 @@ pub use recovery_info::RecoveryInfo;
 pub use recovery_manager::{
     RecoveryManager, RecoveryProgress, RecoveryStats, RedoAction, UndoAction,
 };
+pub use replay::{RollbackOutcome, rollback};
 pub use rollback_tracker::{RollbackPeriod, RollbackScanner, RollbackTracker};
 pub use txn_chain::{RevertInfo, TxnChain};
