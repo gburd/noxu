@@ -1054,6 +1054,14 @@ impl LogManager {
         // Step 5: Validate CRC32.
         // computes the checksum over everything after the checksum field:
         // bytes [CHECKSUM_BYTES..entry_size].
+        //
+        // REP-1 STEP 4 (JE LogEntryHeader.turnOffInvisible): cloak the
+        // invisible bit (flags 0x10) before checksumming, so an entry that was
+        // flipped invisible in-place by recovery rollback still validates
+        // against its original checksum. JE computes the checksum with the
+        // invisible bit always OFF, allowing it to be flipped without a
+        // checksum rewrite.
+        full_buf[5] &= !0x10u8;
         let computed_crc = ChecksumValidator::compute_range(
             &full_buf,
             CHECKSUM_BYTES,
@@ -1322,6 +1330,37 @@ mod tests {
         // Flush so the entry lands on disk (cold-path read).
         lm.flush_no_sync().unwrap();
 
+        let (entry_type, read_payload) = lm.read_entry(lsn).unwrap();
+        assert_eq!(entry_type, LogEntryType::Trace);
+        assert_eq!(read_payload, payload);
+    }
+
+    /// REP-1 STEP 4: flipping the invisible bit in-place via
+    /// `FileManager.make_invisible` must NOT break the entry's checksum,
+    /// because the read path cloaks the invisible bit before validating
+    /// (JE `LogEntryHeader.turnOffInvisible`). The entry must still read back
+    /// after make_invisible + force.
+    #[test]
+    fn test_make_invisible_preserves_checksum() {
+        let dir = TempDir::new().unwrap();
+        let lm = make_log_manager(&dir);
+
+        let payload = b"rolled_back_entry";
+        let lsn = lm
+            .log(LogEntryType::Trace, payload, Provisional::No, false, false)
+            .unwrap();
+        lm.flush_no_sync().unwrap();
+
+        // Sanity: reads fine before marking.
+        lm.read_entry(lsn).unwrap();
+
+        // Flip the invisible bit in place and fsync, as recovery rollback
+        // re-marking does.
+        let fm = lm.file_manager();
+        fm.make_invisible(lsn.file_number(), &[lsn.file_offset()]).unwrap();
+        fm.force(&[lsn.file_number()]).unwrap();
+
+        // The entry must STILL validate and read back (cloaked checksum).
         let (entry_type, read_payload) = lm.read_entry(lsn).unwrap();
         assert_eq!(entry_type, LogEntryType::Trace);
         assert_eq!(read_payload, payload);

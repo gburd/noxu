@@ -515,6 +515,51 @@ impl EnvironmentImpl {
                 });
             }
 
+            // REP-1 STEP 4 (JE RollbackTracker.singlePassSetInvisible /
+            // recoveryEndFsyncInvisible): (re-)mark rolled-back entries from
+            // OPEN-ENDED rollback periods invisible on disk, in file order,
+            // and fsync the affected files. A replica that crashed
+            // mid-rollback before its invisible bits were durable would
+            // otherwise re-apply the rolled-back entries on the next redo;
+            // re-marking + fsync here closes that window.
+            {
+                let mut lsns: Vec<noxu_util::Lsn> =
+                    rmgr.invisible_lsns_to_mark().to_vec();
+                if !lsns.is_empty() {
+                    // Sort into disk order (JE sorts rollbackLsns so the bit
+                    // is flipped in file order for efficiency).
+                    lsns.sort_by_key(|l| l.as_u64());
+                    let mut files_to_fsync: Vec<u32> = Vec::new();
+                    let mut i = 0;
+                    while i < lsns.len() {
+                        let file_num = lsns[i].file_number();
+                        let mut offsets: Vec<u32> = Vec::new();
+                        while i < lsns.len()
+                            && lsns[i].file_number() == file_num
+                        {
+                            offsets.push(lsns[i].file_offset());
+                            i += 1;
+                        }
+                        if let Err(e) = fm.make_invisible(file_num, &offsets) {
+                            return Err(DbiError::RecoveryFailure {
+                                reason: format!(
+                                    "failed to re-mark rolled-back entries \
+                                     invisible in file {file_num}: {e}"
+                                ),
+                            });
+                        }
+                        files_to_fsync.push(file_num);
+                    }
+                    if let Err(e) = fm.force(&files_to_fsync) {
+                        return Err(DbiError::RecoveryFailure {
+                            reason: format!(
+                                "failed to fsync invisible-marked files: {e}"
+                            ),
+                        });
+                    }
+                }
+            }
+
             // Wave 3-2: capture in-doubt prepared (XA) transactions so
             // the XA layer can surface them via xa_recover() and resolve
             // them via xa_commit / xa_rollback.

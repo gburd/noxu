@@ -9,6 +9,7 @@ pub mod output_thread;
 pub mod peer_feeder;
 pub mod reconnect;
 pub mod replica_stream;
+pub mod syncup;
 
 pub use feeder::{
     EnvironmentLogScanner, Feeder, FeederRunner, FeederState, LogScanner,
@@ -22,4 +23,8 @@ pub use reconnect::{ReconnectConfig, ReconnectOutcome, catch_up_with_retry};
 pub use replica_stream::{
     EnvironmentLogWriter, LogWriter, ReplicaReceiver, ReplicaStream,
     ReplicaStreamState,
+};
+pub use syncup::{
+    Matchpoint, RollbackDecision, SyncupView, VlsnEntry, find_matchpoint,
+    verify_rollback,
 };

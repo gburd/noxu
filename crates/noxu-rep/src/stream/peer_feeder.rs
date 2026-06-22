@@ -406,6 +406,13 @@ pub enum SyncupResult {
 
 /// Determine whether `peer_range` can serve a replica that needs
 /// log entries starting from `replica_needs`.
+///
+/// This is the range-availability check only (CanServe/NeedsRestore). The
+/// diverged-tail matchpoint search + rollback decision (REP-1 STEP 5) lives in
+/// [`crate::stream::syncup`] (`find_matchpoint` + `verify_rollback`, ported
+/// from JE `ReplicaFeederSyncup`); the live driver replaces this range check
+/// with that decision core once the syncup wire protocol + backward reader
+/// land. See `docs/src/maintainer/design-decisions.md` (REP-1).
 pub fn negotiate_syncup(
     peer_range: Option<(u64, u64)>,
     replica_needs: u64,

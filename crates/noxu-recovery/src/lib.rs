@@ -27,6 +27,7 @@ pub mod log_scanner;
 pub mod recovery_info;
 pub mod recovery_manager;
 pub mod rollback_tracker;
+pub mod txn_chain;
 
 pub use analysis_result::{
     AnalysisResult, DirtyInEntry, DirtyInKey, PreparedLnOperation,
@@ -49,3 +50,4 @@ pub use recovery_manager::{
     RecoveryManager, RecoveryProgress, RecoveryStats, RedoAction, UndoAction,
 };
 pub use rollback_tracker::{RollbackPeriod, RollbackScanner, RollbackTracker};
+pub use txn_chain::{RevertInfo, TxnChain};

@@ -229,10 +229,15 @@ pub struct TxnPrepareRecord {
 /// A rollback-start record (HA replica syncup).
 #[derive(Debug, Clone)]
 pub struct RollbackStartRecord {
+    /// Matchpoint VLSN (logical start of rollback period).
+    pub matchpoint_vlsn: noxu_util::Vlsn,
     /// Matchpoint LSN (start of rollback period).
     pub matchpoint_lsn: Lsn,
     /// LSN of this RollbackStart entry.
     pub lsn: Lsn,
+    /// Ids of the transactions active (unfinished) at the matchpoint that are
+    /// being rolled back (`RollbackStart.getActiveTxnIds()`).
+    pub active_txn_ids: Vec<i64>,
 }
 
 /// A rollback-end record (HA replica syncup).
