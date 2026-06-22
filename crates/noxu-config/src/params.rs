@@ -2247,7 +2247,8 @@ mod c1_all_defaults_in_range_test {
         for p in all_params() {
             let is_auto_sentinel = matches!(
                 p.default,
-                crate::param::ParamValue::Int(0) | crate::param::ParamValue::Long(0)
+                crate::param::ParamValue::Int(0)
+                    | crate::param::ParamValue::Long(0)
             ) && p.min.is_some();
             if is_auto_sentinel {
                 continue;

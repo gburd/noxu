@@ -340,7 +340,8 @@ fn verify_internal_node(
 
     // Walk each child entry.
     for (i, entry) in in_node.entries.iter().enumerate() {
-        let child_arc = match &entry.child {
+        let child_owned = in_node.get_child(i);
+        let child_arc = match &child_owned {
             Some(c) => c,
             None => {
                 result.add_error(VerifyError::BtreeError {
@@ -503,10 +504,8 @@ fn gather_node_lsns(node_arc: &Arc<RwLock<TreeNode>>, lsns: &mut HashSet<Lsn>) {
     let guard = node_arc.read();
     match &*guard {
         TreeNode::Internal(in_node) => {
-            for entry in &in_node.entries {
-                if let Some(child) = &entry.child {
-                    gather_node_lsns(child, lsns);
-                }
+            for child in in_node.resident_children() {
+                gather_node_lsns(&child, lsns);
             }
         }
         TreeNode::Bottom(bin) => {
@@ -1028,10 +1027,8 @@ mod tests {
                         false
                     }
                     TreeNode::Internal(in_node) => {
-                        for e in &in_node.entries {
-                            if let Some(child) = &e.child
-                                && recurse(child, null_lsn)
-                            {
+                        for child in in_node.resident_children() {
+                            if recurse(&child, null_lsn) {
                                 return true;
                             }
                         }

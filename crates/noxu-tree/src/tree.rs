@@ -237,6 +237,232 @@ pub enum TreeNode {
     Bottom(BinStub),
 }
 
+/// Type alias for a resident child pointer.
+pub type ChildArc = Arc<RwLock<TreeNode>>;
+
+/// T-4: per-node representation of the resident-child-pointer array.
+///
+/// Faithful to JE `INTargetRep` (`INTargetRep.java`), the abstract array of
+/// target pointers to an IN's cached children.  These arrays are usually
+/// sparse — most upper INs have NO resident children — so JE never stores a
+/// full per-slot `Node[]` until many children are actually cached:
+///
+///   * `None`   — `INTargetRep.None`: a shared singleton, 0 child-pointer
+///     bytes, used when no children are cached (the common case for upper
+///     INs).  `get` returns null for every slot.
+///   * `Sparse` — `INTargetRep.Sparse`: a small parallel `(index, target)[]`
+///     for 1..=`MAX_ENTRIES` cached children (JE caps at 4).  `get(j)` is a
+///     linear scan of the index array.
+///   * `Default`— `INTargetRep.Default`: the full `Vec<Option<Arc>>`, one
+///     slot per entry, used once more than `MAX_ENTRIES` children are
+///     resident.
+///
+/// A node starts `None` and grows `None → Sparse → Default`.  JE does not
+/// shrink back when entries are nulled (it only compacts on IN-stripping) to
+/// avoid transitionary rep churn; we follow the same policy — `set_child` only
+/// inflates, and `compact()` (called on eviction/stripping) collapses an
+/// empty/small `Default`/`Sparse` back toward `None`.
+#[derive(Debug)]
+pub enum TargetRep {
+    /// `INTargetRep.None` — no children cached (shared-singleton semantics).
+    None,
+    /// `INTargetRep.Sparse` — a few cached children, `(slot_index, child)`.
+    /// Invariant: `len() <= SPARSE_MAX_ENTRIES`.
+    Sparse(Vec<(u16, ChildArc)>),
+    /// `INTargetRep.Default` — full parallel array, one slot per entry.
+    Default(Vec<Option<ChildArc>>),
+}
+
+impl TargetRep {
+    /// `INTargetRep.Sparse.MAX_ENTRIES` (INTargetRep.java) — the maximum
+    /// number of cached children the `Sparse` rep holds before inflating to
+    /// `Default`.
+    pub const SPARSE_MAX_ENTRIES: usize = 4;
+
+    /// `INTargetRep.get(idx)` — the cached child for slot `idx`, or `None`.
+    #[inline]
+    pub fn get(&self, idx: usize) -> Option<&ChildArc> {
+        match self {
+            TargetRep::None => None,
+            TargetRep::Sparse(v) => {
+                v.iter().find(|(i, _)| *i as usize == idx).map(|(_, c)| c)
+            }
+            TargetRep::Default(v) => v.get(idx).and_then(|o| o.as_ref()),
+        }
+    }
+
+    /// `INTargetRep.set(idx, node, parent)` — set (or clear, when `node` is
+    /// `None`) the cached child for slot `idx`, mutating the representation
+    /// upward (`None → Sparse → Default`) as needed.
+    pub fn set(&mut self, idx: usize, node: Option<ChildArc>) {
+        match self {
+            TargetRep::None => {
+                // INTargetRep.None.set: clearing stays None; setting mutates
+                // to a Sparse rep and sets there.
+                if let Some(child) = node {
+                    *self = TargetRep::Sparse(vec![(idx as u16, child)]);
+                }
+            }
+            TargetRep::Sparse(v) => {
+                // Update existing slot in place.
+                if let Some(pos) =
+                    v.iter().position(|(i, _)| *i as usize == idx)
+                {
+                    match node {
+                        Some(child) => v[pos].1 = child,
+                        None => {
+                            v.swap_remove(pos);
+                        }
+                    }
+                    return;
+                }
+                // New child: clearing a non-present slot is a no-op.
+                let Some(child) = node else { return };
+                if v.len() < Self::SPARSE_MAX_ENTRIES {
+                    v.push((idx as u16, child));
+                    return;
+                }
+                // Full — INTargetRep.Sparse.set mutates to Default.
+                let cap = v.iter().map(|(i, _)| *i as usize).max().unwrap_or(0);
+                let cap = cap.max(idx) + 1;
+                let mut def: Vec<Option<ChildArc>> = vec![None; cap];
+                for (i, c) in v.drain(..) {
+                    def[i as usize] = Some(c);
+                }
+                def[idx] = Some(child);
+                *self = TargetRep::Default(def);
+            }
+            TargetRep::Default(v) => {
+                if idx >= v.len() {
+                    if node.is_none() {
+                        return;
+                    }
+                    v.resize_with(idx + 1, || None);
+                }
+                v[idx] = node;
+            }
+        }
+    }
+
+    /// `INTargetRep.None`-aware take: remove and return the cached child for
+    /// slot `idx`, leaving the slot empty (JE `IN.setTarget(idx, null)` plus
+    /// returning the old target).
+    pub fn take(&mut self, idx: usize) -> Option<ChildArc> {
+        match self {
+            TargetRep::None => None,
+            TargetRep::Sparse(v) => v
+                .iter()
+                .position(|(i, _)| *i as usize == idx)
+                .map(|pos| v.swap_remove(pos).1),
+            TargetRep::Default(v) => v.get_mut(idx).and_then(|o| o.take()),
+        }
+    }
+
+    /// JE `INArrayRep.copy(from, to, n, parent)` adapted to slice ops: shift
+    /// the child mapping when an entry is INSERTED at `idx` (all children at
+    /// slots `>= idx` move up by one).  Mirrors how `Vec::insert` shifts the
+    /// parallel `entries` array.
+    pub fn insert_shift(&mut self, idx: usize) {
+        match self {
+            TargetRep::None => {}
+            TargetRep::Sparse(v) => {
+                for (i, _) in v.iter_mut() {
+                    if (*i as usize) >= idx {
+                        *i += 1;
+                    }
+                }
+            }
+            TargetRep::Default(v) => {
+                if idx <= v.len() {
+                    v.insert(idx, None);
+                }
+            }
+        }
+    }
+
+    /// JE `INArrayRep.copy` adapted: shift the child mapping when the entry at
+    /// `idx` is REMOVED (all children at slots `> idx` move down by one; the
+    /// child at `idx` itself is dropped).  Mirrors `Vec::remove`.
+    pub fn remove_shift(&mut self, idx: usize) {
+        match self {
+            TargetRep::None => {}
+            TargetRep::Sparse(v) => {
+                v.retain(|(i, _)| *i as usize != idx);
+                for (i, _) in v.iter_mut() {
+                    if (*i as usize) > idx {
+                        *i -= 1;
+                    }
+                }
+            }
+            TargetRep::Default(v) => {
+                if idx < v.len() {
+                    v.remove(idx);
+                }
+            }
+        }
+    }
+
+    /// `INTargetRep.compact(parent)` — collapse toward the most compact rep:
+    /// an empty rep becomes `None`; a `Default` with `<= MAX_ENTRIES` children
+    /// becomes `Sparse` (or `None`).  Called when an IN is stripped/evicted.
+    pub fn compact(&mut self) {
+        let count = self.resident_count();
+        if count == 0 {
+            *self = TargetRep::None;
+            return;
+        }
+        if count <= Self::SPARSE_MAX_ENTRIES
+            && let TargetRep::Default(v) = self
+        {
+            let sparse: Vec<(u16, ChildArc)> = v
+                .iter()
+                .enumerate()
+                .filter_map(|(i, o)| o.as_ref().map(|c| (i as u16, c.clone())))
+                .collect();
+            *self = TargetRep::Sparse(sparse);
+        }
+    }
+
+    /// Number of resident (non-null) children.
+    pub fn resident_count(&self) -> usize {
+        match self {
+            TargetRep::None => 0,
+            TargetRep::Sparse(v) => v.len(),
+            TargetRep::Default(v) => v.iter().filter(|o| o.is_some()).count(),
+        }
+    }
+
+    /// True if no children are cached (`INTargetRep.None` or empty).
+    pub fn is_empty(&self) -> bool {
+        self.resident_count() == 0
+    }
+
+    /// Iterate every resident child (in unspecified order).
+    pub fn iter_children(&self) -> Box<dyn Iterator<Item = ChildArc> + '_> {
+        match self {
+            TargetRep::None => Box::new(std::iter::empty()),
+            TargetRep::Sparse(v) => Box::new(v.iter().map(|(_, c)| c.clone())),
+            TargetRep::Default(v) => {
+                Box::new(v.iter().filter_map(|o| o.clone()))
+            }
+        }
+    }
+
+    /// `INTargetRep.calculateMemorySize()` — heap bytes of the rep itself
+    /// (excluding the children it points at).  `None` is 0 (shared singleton),
+    /// matching `INTargetRep.None.calculateMemorySize() == 0`.
+    pub fn memory_size(&self) -> usize {
+        use std::mem::size_of;
+        match self {
+            TargetRep::None => 0,
+            TargetRep::Sparse(v) => v.capacity() * size_of::<(u16, ChildArc)>(),
+            TargetRep::Default(v) => {
+                v.capacity() * size_of::<Option<ChildArc>>()
+            }
+        }
+    }
+}
+
 /// Lightweight upper-IN representation used by the tree traversal layer.
 ///
 /// `IN`: carries the dirty flag (IN_DIRTY_BIT), the LRU
@@ -248,8 +474,18 @@ pub struct InNodeStub {
     pub node_id: u64,
     /// Level in tree.
     pub level: i32,
-    /// Child entries (key, lsn, optional child).
+    /// Child entries (key, lsn).
     pub entries: Vec<InEntry>,
+    /// T-4: per-node resident-child-pointer representation.
+    ///
+    /// `IN.entryTargets` (`INTargetRep`).  The cached child pointer is no
+    /// longer a per-`InEntry` `Option<Arc>` (which cost a pointer-sized slot
+    /// even when no child was resident); it lives here as a compact
+    /// node-level rep that starts `None` (0 child-pointer bytes — most upper
+    /// INs have no resident children), grows to `Sparse` for a few cached
+    /// children, and inflates to `Default` (the full parallel array) once
+    /// many children are resident.  See `INTargetRep.{None,Sparse,Default}`.
+    pub targets: TargetRep,
     /// Dirty flag — set whenever this node is modified.
     /// `IN.dirty` (IN_DIRTY_BIT).
     pub dirty: bool,
@@ -263,14 +499,29 @@ pub struct InNodeStub {
 }
 
 /// Entry in an IN node.
+///
+/// T-4: the resident-child pointer that used to live here (`Option<Arc>`) was
+/// hoisted to the node-level `InNodeStub.targets` (`INTargetRep`); access the
+/// child for slot `i` via `InNodeStub::get_child(i)` / `set_child` / etc.
+///
+/// DEFERRED heap compactions (the per-slot `key`/`lsn` axes — see
+/// `docs/src/operations/known-limitations.md`, heap-footprint-compaction row):
+///   * T-3 (`INLongRep`): pack the per-slot `lsn` (8 bytes) at the node's
+///     minimum byte-width.  Blocked on `NULL_LSN == u64::MAX`: JE `INLongRep`
+///     requires non-negative values and would force 8-byte width for any node
+///     with one NULL slot.  The faithful scope is JE's `baseFileNumber`
+///     -relative `entryLsnByteArray` + reserved transient-offset encoding.
+///   * T-2 (`INKeyRep.MaxKeySize`): pack all-small (`<= TREE_COMPACT_MAX_KEY
+///     _LENGTH`, default 16) post-prefix keys into one fixed-width `byte[]`
+///     instead of a per-slot `Vec<u8>` (24-byte header + heap alloc each).
+///     Most invasive — touches every key access (find_entry / prefix / split /
+///     serialize) — and would wire the currently-inert config param (T-5).
 #[derive(Debug, Clone)]
 pub struct InEntry {
     /// Key for this entry.
     pub key: Vec<u8>,
     /// LSN where child is stored.
     pub lsn: Lsn,
-    /// Cached child node (if resident).
-    pub child: Option<Arc<RwLock<TreeNode>>>,
 }
 
 /// Lightweight BIN representation used by the tree traversal layer.
@@ -385,6 +636,80 @@ pub struct BinEntry {
     ///
     /// `IN.entryExpiration`.
     pub expiration_time: u32,
+}
+
+impl InNodeStub {
+    /// `IN.getTarget(idx)` — the resident child cached for slot `idx`, cloned
+    /// (a strong `Arc`), or `None` if the child is not cached.  Routes through
+    /// the node-level `INTargetRep` (T-4).
+    #[inline]
+    pub fn get_child(&self, idx: usize) -> Option<ChildArc> {
+        self.targets.get(idx).cloned()
+    }
+
+    /// Borrow the resident child for slot `idx` without cloning.
+    #[inline]
+    pub fn child_ref(&self, idx: usize) -> Option<&ChildArc> {
+        self.targets.get(idx)
+    }
+
+    /// True if slot `idx` has no resident (cached) child.
+    /// `IN.getTarget(idx) == null`.
+    #[inline]
+    pub fn child_is_none(&self, idx: usize) -> bool {
+        self.targets.get(idx).is_none()
+    }
+
+    /// `IN.setTarget(idx, node)` — set (or clear) the cached child for slot
+    /// `idx`, mutating the `INTargetRep` upward as needed.
+    #[inline]
+    pub fn set_child(&mut self, idx: usize, node: Option<ChildArc>) {
+        self.targets.set(idx, node);
+    }
+
+    /// `IN.detachNode` helper — remove and return the cached child for slot
+    /// `idx`, leaving the slot's key/LSN intact for re-fetch.
+    #[inline]
+    pub fn take_child(&mut self, idx: usize) -> Option<ChildArc> {
+        self.targets.take(idx)
+    }
+
+    /// Insert an entry at `idx`, shifting the child mapping to stay aligned
+    /// (`INArrayRep.copy`), then set the new slot's cached child.  Mirrors the
+    /// old `entries.insert(idx, InEntry{ child: ..})` in one call.
+    pub fn insert_entry(
+        &mut self,
+        idx: usize,
+        key: Vec<u8>,
+        lsn: Lsn,
+        child: Option<ChildArc>,
+    ) {
+        self.entries.insert(idx, InEntry { key, lsn });
+        self.targets.insert_shift(idx);
+        if child.is_some() {
+            self.targets.set(idx, child);
+        }
+    }
+
+    /// Remove the entry at `idx`, shifting the child mapping to stay aligned
+    /// (`INArrayRep.copy`).  Returns the removed `InEntry` (key + LSN).
+    pub fn remove_entry(&mut self, idx: usize) -> InEntry {
+        let e = self.entries.remove(idx);
+        self.targets.remove_shift(idx);
+        e
+    }
+
+    /// All resident children (cloned `Arc`s), in unspecified order.
+    /// Replaces `entries.iter().filter_map(|e| e.child.clone())`.
+    pub fn resident_children(&self) -> Vec<ChildArc> {
+        self.targets.iter_children().collect()
+    }
+
+    /// `(slot_index, child)` of the first resident child, if any.
+    pub fn first_resident_child(&self) -> Option<(usize, ChildArc)> {
+        (0..self.entries.len())
+            .find_map(|i| self.targets.get(i).map(|c| (i, c.clone())))
+    }
 }
 
 impl BinStub {
@@ -1428,6 +1753,7 @@ impl TreeNode {
             TreeNode::Internal(n) => {
                 (size_of::<InNodeStub>()
                     + n.entries.len() * size_of::<InEntry>()
+                    + n.targets.memory_size()
                     + n.entries.iter().map(|e| e.key.len()).sum::<usize>())
                     as u64
             }
@@ -1635,7 +1961,11 @@ impl TreeNode {
 /// `BinStub` and `InNodeStub` store different entry types, so we need a
 /// common wrapper to pass split slices around without code duplication.
 enum SplitEntries {
-    Internal(Vec<InEntry>),
+    /// Upper-IN entries plus the parallel resident-child pointers (one per
+    /// entry; `None` when the child is not cached).  T-4: children must travel
+    /// with their slots on a split, mirroring JE `IN.split` copying
+    /// `entryTargets` alongside `entryKeys`.
+    Internal(Vec<InEntry>, Vec<Option<ChildArc>>),
     Bottom(Vec<BinEntry>),
 }
 
@@ -1643,7 +1973,7 @@ impl SplitEntries {
     /// Returns the number of entries.
     fn len(&self) -> usize {
         match self {
-            SplitEntries::Internal(v) => v.len(),
+            SplitEntries::Internal(v, _) => v.len(),
             SplitEntries::Bottom(v) => v.len(),
         }
     }
@@ -1651,7 +1981,7 @@ impl SplitEntries {
     /// Returns the key at `index` as a slice.
     fn get_key(&self, index: usize) -> &[u8] {
         match self {
-            SplitEntries::Internal(v) => v[index].key.as_slice(),
+            SplitEntries::Internal(v, _) => v[index].key.as_slice(),
             SplitEntries::Bottom(v) => v[index].key.as_slice(),
         }
     }
@@ -1659,8 +1989,8 @@ impl SplitEntries {
     /// Returns a sub-range `[lo, hi)` as a new `SplitEntries`.
     fn slice(&self, lo: usize, hi: usize) -> Self {
         match self {
-            SplitEntries::Internal(v) => {
-                SplitEntries::Internal(v[lo..hi].to_vec())
+            SplitEntries::Internal(v, c) => {
+                SplitEntries::Internal(v[lo..hi].to_vec(), c[lo..hi].to_vec())
             }
             SplitEntries::Bottom(v) => SplitEntries::Bottom(v[lo..hi].to_vec()),
         }
@@ -1928,7 +2258,7 @@ impl Tree {
             }
             TreeNode::Internal(n) => {
                 let children: Vec<Arc<RwLock<TreeNode>>> =
-                    n.entries.iter().filter_map(|e| e.child.clone()).collect();
+                    n.resident_children();
                 drop(guard);
                 for child in children {
                     Self::count_entries_recursive(&child, total);
@@ -1961,8 +2291,7 @@ impl Tree {
         let guard = node_arc.read();
         *total += guard.budgeted_memory_size();
         if let TreeNode::Internal(n) = &*guard {
-            let children: Vec<Arc<RwLock<TreeNode>>> =
-                n.entries.iter().filter_map(|e| e.child.clone()).collect();
+            let children: Vec<Arc<RwLock<TreeNode>>> = n.resident_children();
             drop(guard);
             for child in children {
                 Self::total_budgeted_memory_recursive(&child, total);
@@ -2079,7 +2408,7 @@ impl Tree {
                     // from slot 0 (which always qualifies because its key
                     // is the virtual -infinity key).
                     let idx = self.upper_in_floor_index(&n.entries, key);
-                    n.entries.get(idx)?.child.clone()?
+                    n.get_child(idx)?
                 }
                 TreeNode::Bottom(_) => {
                     unreachable!("is_bin() returned false above")
@@ -2171,7 +2500,7 @@ impl Tree {
                     }
                     // Slot 0 = virtual −∞; walk forward while entry.key ≤ key.
                     let idx = self.upper_in_floor_index(&n.entries, key);
-                    n.entries.get(idx)?.child.clone()?
+                    n.get_child(idx)?
                 }
                 TreeNode::Bottom(_) => {
                     unreachable!("is_bin() returned false above")
@@ -2237,7 +2566,7 @@ impl Tree {
                             return false;
                         }
                         let idx = self.upper_in_floor_index(&n.entries, key);
-                        match n.entries.get(idx).and_then(|e| e.child.clone()) {
+                        match n.get_child(idx) {
                             Some(c) => c,
                             None => return false,
                         }
@@ -2338,7 +2667,7 @@ impl Tree {
                         return None;
                     }
                     let idx = self.upper_in_floor_index(&n.entries, key);
-                    n.entries.get(idx)?.child.clone()?
+                    n.get_child(idx)?
                 }
                 TreeNode::Bottom(_) => unreachable!(),
             };
@@ -2428,7 +2757,7 @@ impl Tree {
                         return None;
                     }
                     let idx = self.upper_in_floor_index(&n.entries, key);
-                    n.entries.get(idx)?.child.clone()?
+                    n.get_child(idx)?
                 }
                 TreeNode::Bottom(_) => unreachable!(),
             };
@@ -2506,8 +2835,9 @@ impl Tree {
                         entries: vec![InEntry {
                             key: vec![], // virtual key for slot 0 in upper IN
                             lsn,
-                            child: Some(bin.clone()),
                         }],
+                        // T-4: the single resident child at slot 0.
+                        targets: TargetRep::Sparse(vec![(0, bin.clone())]),
                         dirty: true,
                         generation: 0,
                         parent: None,
@@ -2640,11 +2970,9 @@ impl Tree {
                     Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
                         node_id: generate_node_id(),
                         level: MAIN_LEVEL | 2,
-                        entries: vec![InEntry {
-                            key: vec![],
-                            lsn,
-                            child: Some(bin.clone()),
-                        }],
+                        entries: vec![InEntry { key: vec![], lsn }],
+                        // T-4: the single resident child at slot 0.
+                        targets: TargetRep::Sparse(vec![(0, bin.clone())]),
                         dirty: true,
                         generation: 0,
                         parent: None,
@@ -2736,11 +3064,9 @@ impl Tree {
             Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
                 node_id: generate_node_id(),
                 level: old_root_level + 1,
-                entries: vec![InEntry {
-                    key: vec![],
-                    lsn,
-                    child: Some(old_root_arc.clone()),
-                }],
+                entries: vec![InEntry { key: vec![], lsn }],
+                // T-4: slot 0's resident child is the old root.
+                targets: TargetRep::Sparse(vec![(0, old_root_arc.clone())]),
                 dirty: true,
                 generation: 0,
                 parent: None,
@@ -2841,11 +3167,9 @@ impl Tree {
 
         // Extract the child Arc from the parent slot.
         let child_arc = match &*parent_write_guard {
-            TreeNode::Internal(p) => p
-                .entries
-                .get(child_index)
-                .and_then(|e| e.child.clone())
-                .ok_or(TreeError::SplitRequired)?,
+            TreeNode::Internal(p) => {
+                p.get_child(child_index).ok_or(TreeError::SplitRequired)?
+            }
             TreeNode::Bottom(_) => return Err(TreeError::SplitRequired),
         };
 
@@ -2871,7 +3195,15 @@ impl Tree {
         };
         let (all_entries, bin_old_prefix) = match &*child_guard {
             TreeNode::Internal(n) => {
-                (SplitEntries::Internal(n.entries.clone()), Vec::new())
+                // T-4: capture the parallel resident-child array alongside the
+                // entries so children travel with their slots through the
+                // split (JE `IN.split` copies `entryTargets`).
+                let children: Vec<Option<ChildArc>> =
+                    (0..n.entries.len()).map(|i| n.get_child(i)).collect();
+                (
+                    SplitEntries::Internal(n.entries.clone(), children),
+                    Vec::new(),
+                )
             }
             TreeNode::Bottom(b) => {
                 // Decompress to full keys.
@@ -2944,8 +3276,15 @@ impl Tree {
         // Install the left half into `child_arc` (still under the same
         // write lock) and mark the node dirty.
         match (&mut *child_guard, &left_entries) {
-            (TreeNode::Internal(n), SplitEntries::Internal(le)) => {
+            (TreeNode::Internal(n), SplitEntries::Internal(le, lc)) => {
                 n.entries = le.clone();
+                // T-4: reinstall the (now-shorter) left child array.
+                n.targets = TargetRep::None;
+                for (i, c) in lc.iter().enumerate() {
+                    if let Some(child) = c {
+                        n.set_child(i, Some(child.clone()));
+                    }
+                }
             }
             (TreeNode::Bottom(b), SplitEntries::Bottom(le)) => {
                 // Reset prefix; entries are full keys.
@@ -2972,15 +3311,23 @@ impl Tree {
         // Create the new right-half sibling.
         // Parent pointer will be wired in when it is inserted into the parent.
         let new_sibling = match right_entries {
-            SplitEntries::Internal(re) => {
-                Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
+            SplitEntries::Internal(re, rc) => {
+                let mut rin = InNodeStub {
                     node_id: generate_node_id(),
                     level: child_level,
                     entries: re,
+                    targets: TargetRep::None,
                     dirty: true,
                     generation: 0,
                     parent: None, // set below
-                })))
+                };
+                // T-4: install the right half's resident children.
+                for (i, c) in rc.into_iter().enumerate() {
+                    if c.is_some() {
+                        rin.set_child(i, c);
+                    }
+                }
+                Arc::new(RwLock::new(TreeNode::Internal(rin)))
             }
             SplitEntries::Bottom(re) => {
                 // Entries are full keys; build BinStub with no prefix then
@@ -3036,13 +3383,13 @@ impl Tree {
         match &mut *parent_write_guard {
             TreeNode::Internal(p) => {
                 let insert_pos = child_index + 1;
-                p.entries.insert(
+                // T-4: insert the parent slot and set its cached child via the
+                // node-level INTargetRep (shifting existing children).
+                p.insert_entry(
                     insert_pos,
-                    InEntry {
-                        key: new_id_key,
-                        lsn,
-                        child: Some(new_sibling.clone()),
-                    },
+                    new_id_key,
+                    lsn,
+                    Some(new_sibling.clone()),
                 );
                 // Parent is dirty because it gained a new entry.
                 p.dirty = true;
@@ -3057,6 +3404,20 @@ impl Tree {
         {
             let mut g = new_sibling.write();
             g.set_parent(Some(Arc::downgrade(parent)));
+        }
+        // T-4: when an upper IN split, the children that moved into the new
+        // sibling must have their parent back-pointers re-wired to the
+        // sibling (JE re-parents moved targets in IN.split).
+        {
+            let sg = new_sibling.read();
+            if let TreeNode::Internal(sn) = &*sg {
+                let moved = sn.resident_children();
+                drop(sg);
+                for child in moved {
+                    let mut cg = child.write();
+                    cg.set_parent(Some(Arc::downgrade(&new_sibling)));
+                }
+            }
         }
         drop(parent_write_guard);
 
@@ -3213,11 +3574,8 @@ impl Tree {
                                 }
                             }
                         }
-                        let child = n
-                            .entries
-                            .get(idx)
-                            .and_then(|e| e.child.clone())
-                            .ok_or(TreeError::SplitRequired)?;
+                        let child =
+                            n.get_child(idx).ok_or(TreeError::SplitRequired)?;
                         (idx, n.entries.len(), child)
                     }
                     TreeNode::Bottom(_) => {
@@ -3427,11 +3785,8 @@ impl Tree {
                                 }
                             }
                         }
-                        let child = n
-                            .entries
-                            .get(idx)
-                            .and_then(|e| e.child.clone())
-                            .ok_or(TreeError::SplitRequired)?;
+                        let child =
+                            n.get_child(idx).ok_or(TreeError::SplitRequired)?;
                         (idx, n.entries.len(), child)
                     }
                     TreeNode::Bottom(_) => {
@@ -3529,8 +3884,7 @@ impl Tree {
                     return;
                 }
                 TreeNode::Internal(inner) => {
-                    let child =
-                        inner.entries.first().and_then(|e| e.child.clone());
+                    let child = inner.get_child(0);
                     drop(guard);
                     match child {
                         Some(c) => arc = c,
@@ -3578,9 +3932,7 @@ impl Tree {
             // hand-over-hand: take the child read lock before releasing
             // the parent's. Same race fix as `Tree::search`.
             let next_arc = match &*guard {
-                TreeNode::Internal(n_node) => {
-                    n_node.entries.first().and_then(|e| e.child.clone())?
-                }
+                TreeNode::Internal(n_node) => n_node.get_child(0)?,
                 _ => return None,
             };
             let next_guard = next_arc.read_arc();
@@ -3632,7 +3984,7 @@ impl Tree {
             // the parent's. Same race fix as `Tree::search`.
             let next_arc = match &*guard {
                 TreeNode::Internal(n_node) => {
-                    n_node.entries.last().and_then(|e| e.child.clone())?
+                    n_node.get_child(n_node.entries.len().saturating_sub(1))?
                 }
                 _ => return None,
             };
@@ -3734,7 +4086,7 @@ impl Tree {
                             }
                         }
                     }
-                    n.entries.get(idx).and_then(|e| e.child.clone())
+                    n.get_child(idx)
                 }
                 _ => None,
             }
@@ -3839,9 +4191,7 @@ impl Tree {
         let children: Vec<Arc<RwLock<TreeNode>>> = {
             let g = node_arc.read();
             match &*g {
-                TreeNode::Internal(n) => {
-                    n.entries.iter().filter_map(|e| e.child.clone()).collect()
-                }
+                TreeNode::Internal(n) => n.resident_children(),
                 // BINs are leaves; nothing to compress at this level.
                 TreeNode::Bottom(_) => return,
             }
@@ -3870,12 +4220,8 @@ impl Tree {
                     let g = node_arc.read();
                     match &*g {
                         TreeNode::Internal(p) => {
-                            let l =
-                                p.entries.get(i).and_then(|e| e.child.clone());
-                            let r = p
-                                .entries
-                                .get(i + 1)
-                                .and_then(|e| e.child.clone());
+                            let l = p.get_child(i);
+                            let r = p.get_child(i + 1);
                             match (l, r) {
                                 (Some(l), Some(r)) => (l, r),
                                 _ => {
@@ -3983,26 +4329,60 @@ impl Tree {
                     }
                 } else {
                     // Upper-IN merge: prepend left's InEntries into right.
-                    let left_in_entries: Vec<InEntry> = {
-                        {
-                            let g = left_arc.read();
-                            match &*g {
-                                TreeNode::Internal(n) => n.entries.clone(),
-                                _ => {
-                                    i += 1;
-                                    continue;
-                                }
+                    // T-4: capture left's resident children alongside its
+                    // entries so they travel into the merged right IN.
+                    let (left_in_entries, left_children): (
+                        Vec<InEntry>,
+                        Vec<Option<ChildArc>>,
+                    ) = {
+                        let g = left_arc.read();
+                        match &*g {
+                            TreeNode::Internal(n) => {
+                                let children = (0..n.entries.len())
+                                    .map(|j| n.get_child(j))
+                                    .collect();
+                                (n.entries.clone(), children)
+                            }
+                            _ => {
+                                i += 1;
+                                continue;
                             }
                         }
                     };
+                    let n_left = left_in_entries.len();
                     {
                         {
                             let mut g = right_arc.write();
                             match &mut *g {
                                 TreeNode::Internal(rn) => {
+                                    // Snapshot right's existing children, then
+                                    // rebuild the merged entry + target arrays
+                                    // (left half first, then right half).
+                                    let right_children: Vec<Option<ChildArc>> =
+                                        (0..rn.entries.len())
+                                            .map(|j| rn.get_child(j))
+                                            .collect();
                                     let mut combined = left_in_entries.clone();
                                     combined.append(&mut rn.entries);
                                     rn.entries = combined;
+                                    rn.targets = TargetRep::None;
+                                    for (j, c) in
+                                        left_children.iter().enumerate()
+                                    {
+                                        if let Some(child) = c {
+                                            rn.set_child(
+                                                j,
+                                                Some(child.clone()),
+                                            );
+                                        }
+                                    }
+                                    for (j, c) in
+                                        right_children.into_iter().enumerate()
+                                    {
+                                        if c.is_some() {
+                                            rn.set_child(n_left + j, c);
+                                        }
+                                    }
                                     rn.dirty = true;
                                 }
                                 _ => {
@@ -4013,17 +4393,16 @@ impl Tree {
                         }
                     }
                     // Update parent pointers for moved children.
-                    for entry in &left_in_entries {
-                        if let Some(child) = &entry.child {
-                            let mut cg = child.write();
-                            cg.set_parent(Some(Arc::downgrade(&right_arc)));
-                        }
+                    for child in left_children.into_iter().flatten() {
+                        let mut cg = child.write();
+                        cg.set_parent(Some(Arc::downgrade(&right_arc)));
                     }
                     // Clear the now-merged left IN.
                     {
                         let mut g = left_arc.write();
                         if let TreeNode::Internal(ln) = &mut *g {
                             ln.entries.clear();
+                            ln.targets = TargetRep::None;
                             ln.dirty = true;
                         }
                     }
@@ -4042,11 +4421,14 @@ impl Tree {
                             TreeNode::Internal(p) => {
                                 // Update left slot (i) to point at right_arc
                                 // (which now contains the merged entries).
-                                if let Some(slot) = p.entries.get_mut(i) {
-                                    slot.child = Some(right_arc.clone());
+                                if i < p.entries.len() {
+                                    p.set_child(i, Some(right_arc.clone()));
                                 }
                                 // Remove right slot (i+1) — it is now redundant.
-                                p.entries.remove(i + 1);
+                                // T-4: remove_entry shifts the child array too.
+                                if i + 1 < p.entries.len() {
+                                    p.remove_entry(i + 1);
+                                }
                                 p.dirty = true;
                             }
                             TreeNode::Bottom(_) => return,
@@ -4279,7 +4661,7 @@ impl Tree {
                             return false;
                         }
                         let idx = self.upper_in_floor_index(&n.entries, id_key);
-                        match n.entries.get(idx).and_then(|e| e.child.clone()) {
+                        match n.get_child(idx) {
                             Some(c) => (c, idx),
                             None => return false,
                         }
@@ -4309,12 +4691,9 @@ impl Tree {
         let pruned_bin_id;
         let removed_key_len = match &mut *parent_guard {
             TreeNode::Internal(p) => {
-                let child = match p.entries.get(child_index) {
-                    Some(e) => match &e.child {
-                        Some(c) => c.clone(),
-                        None => return false, // slot already vacated
-                    },
-                    None => return false, // slot index no longer valid
+                let child = match p.get_child(child_index) {
+                    Some(c) => c,
+                    None => return false, // slot already vacated / invalid
                 };
                 // Re-validate the child BIN under the parent latch.
                 {
@@ -4343,7 +4722,8 @@ impl Tree {
                 // Safe to prune: remove the BIN's slot from the parent IN.
                 // Mirrors the parent-slot removal `Tree.delete` performs for
                 // an empty BIN (Tree.java deleteEntry under the branch latch).
-                let removed = p.entries.remove(child_index);
+                // T-4: remove_entry shifts the node-level child array too.
+                let removed = p.remove_entry(child_index);
                 p.dirty = true;
                 removed.key.len()
             }
@@ -4430,11 +4810,12 @@ impl Tree {
         let TreeNode::Internal(p) = &mut *parent_guard else {
             return 0; // parent is not an IN (concurrent restructure)
         };
-        let entry = match p.entries.get_mut(child_index) {
-            Some(e) => e,
-            None => return 0,
-        };
-        let child = match entry.child.take() {
+        if child_index >= p.entries.len() {
+            return 0;
+        }
+        // T-4: detach the cached child via the node-level INTargetRep, leaving
+        // the slot's key/LSN intact for re-fetch (JE IN.setTarget(idx, null)).
+        let child = match p.take_child(child_index) {
             Some(c) => c,     // child Arc removed from the slot
             None => return 0, // already detached
         };
@@ -4537,11 +4918,8 @@ impl Tree {
     ) -> bool {
         let g = parent.read();
         match &*g {
-            TreeNode::Internal(p) => match p.entries.get(child_index) {
-                Some(entry) => match &entry.child {
-                    Some(stored) => Arc::ptr_eq(stored, child_arc),
-                    None => false,
-                },
+            TreeNode::Internal(p) => match p.child_ref(child_index) {
+                Some(stored) => Arc::ptr_eq(stored, child_arc),
                 None => false,
             },
             TreeNode::Bottom(_) => false,
@@ -4598,7 +4976,7 @@ impl Tree {
                         return None;
                     }
                     let idx = self.upper_in_floor_index(&n.entries, key);
-                    n.entries.get(idx)?.child.clone()?
+                    n.get_child(idx)?
                 }
                 TreeNode::Bottom(_) => {
                     unreachable!("is_bin() returned false above")
@@ -4912,11 +5290,7 @@ impl Tree {
                     // uses IN.findEntry (comparator-aware) not raw byte order.
                     let idx =
                         self.upper_in_floor_index(&n.entries, current_key);
-                    let child = match n
-                        .entries
-                        .get(idx)
-                        .and_then(|e| e.child.clone())
-                    {
+                    let child = match n.get_child(idx) {
                         Some(c) => c,
                         None => return AdjacentBinOutcome::NoAdjacent,
                     };
@@ -4948,9 +5322,7 @@ impl Tree {
                 TreeNode::Internal(p) => {
                     let n = p.entries.len();
                     let valid = p
-                        .entries
-                        .get(taken_idx)
-                        .and_then(|e| e.child.as_ref())
+                        .child_ref(taken_idx)
                         .is_some_and(|c| Arc::ptr_eq(c, &descended_child));
                     (n, valid)
                 }
@@ -4980,11 +5352,7 @@ impl Tree {
             let sibling_arc = {
                 let g = parent_arc.read();
                 match &*g {
-                    TreeNode::Internal(p) => match p
-                        .entries
-                        .get(sibling_idx)
-                        .and_then(|e| e.child.clone())
-                    {
+                    TreeNode::Internal(p) => match p.get_child(sibling_idx) {
                         Some(c) => c,
                         None => return AdjacentBinOutcome::NoAdjacent,
                     },
@@ -5049,9 +5417,9 @@ impl Tree {
             let next = match &*guard {
                 TreeNode::Internal(n) => {
                     if forward {
-                        n.entries.first()?.child.clone()?
+                        n.get_child(0)?
                     } else {
-                        n.entries.last()?.child.clone()?
+                        n.get_child(n.entries.len().saturating_sub(1))?
                     }
                 }
                 _ => return None,
@@ -5118,7 +5486,7 @@ impl Tree {
                 stats.n_entries += n.entries.len() as u64;
                 // Collect child arcs before releasing the guard.
                 let children: Vec<Arc<RwLock<TreeNode>>> =
-                    n.entries.iter().filter_map(|e| e.child.clone()).collect();
+                    n.resident_children();
                 // Release guard before recursing to avoid lock ordering issues.
                 drop(guard);
                 for child in children {
@@ -5163,7 +5531,7 @@ impl Tree {
             }
             TreeNode::Internal(n) => {
                 let children: Vec<Arc<RwLock<TreeNode>>> =
-                    n.entries.iter().filter_map(|e| e.child.clone()).collect();
+                    n.resident_children();
                 drop(guard);
                 for child in children {
                     Self::collect_dirty_bins_recursive(&child, db_id, out);
@@ -5200,7 +5568,7 @@ impl Tree {
             }
             TreeNode::Internal(n) => {
                 let children: Vec<Arc<RwLock<TreeNode>>> =
-                    n.entries.iter().filter_map(|e| e.child.clone()).collect();
+                    n.resident_children();
                 drop(guard);
                 for child in children {
                     Self::collect_bins_with_known_deleted_recursive(
@@ -5259,7 +5627,7 @@ impl Tree {
                 // Recurse into children before releasing the guard so we
                 // hold the minimum read-lock duration.
                 let children: Vec<Arc<RwLock<TreeNode>>> =
-                    n.entries.iter().filter_map(|e| e.child.clone()).collect();
+                    n.resident_children();
                 drop(guard);
                 for child in &children {
                     if let Some(bytes) =
@@ -5313,7 +5681,7 @@ impl Tree {
                 // expects.
                 let level = n.level;
                 let children: Vec<Arc<RwLock<TreeNode>>> =
-                    n.entries.iter().filter_map(|e| e.child.clone()).collect();
+                    n.resident_children();
                 drop(guard);
                 // Recurse into children first (bottom-up ordering).
                 for child in &children {
@@ -5380,7 +5748,7 @@ impl Tree {
                         return None;
                     }
                     let idx = self.upper_in_floor_index(&n.entries, key);
-                    n.entries.get(idx)?.child.clone()?
+                    n.get_child(idx)?
                 }
                 TreeNode::Bottom(_) => {
                     unreachable!("is_bin() returned false above")
@@ -5449,8 +5817,7 @@ impl Tree {
         if let TreeNode::Internal(n) = &*guard {
             // Collect child arcs while holding the guard, then drop it before
             // recursing to avoid holding multiple locks simultaneously.
-            let children: Vec<Arc<RwLock<TreeNode>>> =
-                n.entries.iter().filter_map(|e| e.child.clone()).collect();
+            let children: Vec<Arc<RwLock<TreeNode>>> = n.resident_children();
             drop(guard);
             for child in children {
                 Self::rebuild_in_list_recursive(&child, out);
@@ -5493,7 +5860,7 @@ impl Tree {
                 }
                 // Collect child arcs before dropping the guard.
                 let children: Vec<Arc<RwLock<TreeNode>>> =
-                    n.entries.iter().filter_map(|e| e.child.clone()).collect();
+                    n.resident_children();
                 drop(guard);
                 // Recursively validate every resident child.
                 for child in children {
@@ -5540,8 +5907,8 @@ impl Tree {
 
         // Check whether any child of this IN has the target node_id.
         let mut children: Vec<(usize, Arc<RwLock<TreeNode>>)> = Vec::new();
-        for (slot, entry) in n.entries.iter().enumerate() {
-            if let Some(child_arc) = &entry.child {
+        for slot in 0..n.entries.len() {
+            if let Some(child_arc) = n.child_ref(slot) {
                 // Read the child's node_id under a separate lock (acquire child
                 // while parent guard is still held — this is intentional for
                 // the ID comparison only; we release both immediately after).
@@ -5677,12 +6044,14 @@ impl Tree {
                 bytes[pos..pos + 8].try_into().ok()?,
             ));
             pos += 8;
-            entries.push(InEntry { key, lsn, child: None });
+            entries.push(InEntry { key, lsn });
         }
         Some(InNodeStub {
             node_id,
             level,
             entries,
+            // T-4: a freshly deserialized IN has no resident children.
+            targets: TargetRep::None,
             dirty: false,
             generation: 0,
             parent: None,
@@ -5850,7 +6219,7 @@ impl Tree {
                     b.parent = Some(Arc::downgrade(&parent_arc));
                 }
             }
-            p.entries[slot].child = Some(new_arc);
+            p.set_child(slot, Some(new_arc));
             p.entries[slot].lsn = log_lsn;
             InRedoResult::Replaced
         } else {
@@ -5887,7 +6256,7 @@ impl Tree {
                     n.parent = Some(Arc::downgrade(&parent_arc));
                 }
             }
-            p.entries[slot].child = Some(new_arc);
+            p.set_child(slot, Some(new_arc));
             p.entries[slot].lsn = log_lsn;
             InRedoResult::Replaced
         } else {
@@ -6151,6 +6520,7 @@ mod tests {
             node_id: 2,
             level: MAIN_LEVEL + 2,
             entries: vec![],
+            targets: TargetRep::None,
             dirty: false,
             generation: 0,
             parent: None,
@@ -6298,10 +6668,7 @@ mod tests {
             };
             // Pick the first slot whose child is a resident BIN.
             let (idx, child) = n
-                .entries
-                .iter()
-                .enumerate()
-                .find_map(|(i, e)| e.child.as_ref().map(|c| (i, c.clone())))
+                .first_resident_child()
                 .expect("root must have a resident child");
             let (id, bytes) = {
                 let cg = child.read();
@@ -6321,7 +6688,7 @@ mod tests {
         let child_arc = {
             let pg = parent_arc.read();
             let TreeNode::Internal(n) = &*pg else { unreachable!() };
-            Arc::clone(n.entries[child_idx].child.as_ref().unwrap())
+            Arc::clone(n.child_ref(child_idx).unwrap())
         };
         // Two strong refs now: the parent slot + our test handle.
         assert_eq!(
@@ -6342,7 +6709,7 @@ mod tests {
             let pg = parent_arc.read();
             let TreeNode::Internal(n) = &*pg else { unreachable!() };
             assert!(
-                n.entries[child_idx].child.is_none(),
+                n.child_is_none(child_idx),
                 "EV-13: parent slot must be detached (child == None)"
             );
             // The slot itself (key + LSN) is retained for re-fetch.
@@ -6386,9 +6753,9 @@ mod tests {
             let rg = root.read();
             let TreeNode::Internal(n) = &*rg else { unreachable!() };
             let child = n
-                .entries
-                .iter()
-                .find_map(|e| e.child.clone())
+                .resident_children()
+                .into_iter()
+                .next()
                 .expect("resident child");
             match &*child.read() {
                 TreeNode::Bottom(b) => b.node_id,
@@ -6730,13 +7097,13 @@ mod tests {
             entries.push(InEntry {
                 key: format!("k{}", i).into_bytes(),
                 lsn: Lsn::new(1, 10 + i),
-                child: None,
             });
         }
         let internal = TreeNode::Internal(InNodeStub {
             node_id: 1,
             level: MAIN_LEVEL + 2,
             entries,
+            targets: TargetRep::None,
             dirty: false,
             generation: 0,
             parent: None,
@@ -6762,13 +7129,13 @@ mod tests {
             entries.push(InEntry {
                 key: format!("k{}", i).into_bytes(),
                 lsn: Lsn::new(1, 10 + i),
-                child: None,
             });
         }
         let internal = TreeNode::Internal(InNodeStub {
             node_id: 1,
             level: MAIN_LEVEL + 2,
             entries,
+            targets: TargetRep::None,
             dirty: false,
             generation: 0,
             parent: None,
@@ -6804,7 +7171,7 @@ mod tests {
         let bin_arc = {
             let g = root_arc.read();
             match &*g {
-                TreeNode::Internal(n) => n.entries[0].child.clone().unwrap(),
+                TreeNode::Internal(n) => n.get_child(0).unwrap(),
                 _ => panic!("expected Internal root"),
             }
         };
@@ -6825,7 +7192,7 @@ mod tests {
         let bin_arc = {
             let g = root_arc.read();
             match &*g {
-                TreeNode::Internal(n) => n.entries[0].child.clone().unwrap(),
+                TreeNode::Internal(n) => n.get_child(0).unwrap(),
                 _ => panic!("expected Internal root"),
             }
         };
@@ -6845,9 +7212,7 @@ mod tests {
             let bin_arc = {
                 let g = root_arc.read();
                 match &*g {
-                    TreeNode::Internal(n) => {
-                        n.entries[0].child.clone().unwrap()
-                    }
+                    TreeNode::Internal(n) => n.get_child(0).unwrap(),
                     _ => panic!("expected Internal root"),
                 }
             };
@@ -6861,7 +7226,7 @@ mod tests {
         let bin_arc = {
             let g = root_arc.read();
             match &*g {
-                TreeNode::Internal(n) => n.entries[0].child.clone().unwrap(),
+                TreeNode::Internal(n) => n.get_child(0).unwrap(),
                 _ => panic!("expected Internal root"),
             }
         };
@@ -6878,7 +7243,7 @@ mod tests {
         let bin_arc = {
             let g = root_arc.read();
             match &*g {
-                TreeNode::Internal(n) => n.entries[0].child.clone().unwrap(),
+                TreeNode::Internal(n) => n.get_child(0).unwrap(),
                 _ => panic!("expected Internal root"),
             }
         };
@@ -6922,6 +7287,7 @@ mod tests {
             node_id: 2,
             level: MAIN_LEVEL | 2,
             entries: vec![],
+            targets: TargetRep::None,
             dirty: false,
             generation: 0,
             parent: None,
@@ -6957,6 +7323,7 @@ mod tests {
             node_id: 2,
             level: MAIN_LEVEL | 2,
             entries: vec![],
+            targets: TargetRep::None,
             dirty: false,
             generation: 0,
             parent: None,
@@ -7008,13 +7375,10 @@ mod tests {
             node_id: 8,
             level: MAIN_LEVEL | 2,
             entries: vec![
-                InEntry { key: vec![], lsn: Lsn::new(1, 1), child: None },
-                InEntry {
-                    key: b"mid".to_vec(),
-                    lsn: Lsn::new(1, 2),
-                    child: None,
-                },
+                InEntry { key: vec![], lsn: Lsn::new(1, 1) },
+                InEntry { key: b"mid".to_vec(), lsn: Lsn::new(1, 2) },
             ],
+            targets: TargetRep::None,
             dirty: false,
             generation: 0,
             parent: None,
@@ -7117,11 +7481,8 @@ mod tests {
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
             node_id: generate_node_id(),
             level: MAIN_LEVEL | 2,
-            entries: vec![InEntry {
-                key: vec![],
-                lsn: Lsn::new(1, 1),
-                child: Some(bin_arc.clone()),
-            }],
+            entries: vec![InEntry { key: vec![], lsn: Lsn::new(1, 1) }],
+            targets: TargetRep::Sparse(vec![(0, bin_arc.clone())]),
             dirty: false,
             generation: 0,
             parent: None,
@@ -7552,11 +7913,8 @@ mod tests {
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
             node_id: generate_node_id(),
             level: MAIN_LEVEL | 2,
-            entries: vec![InEntry {
-                key: vec![],
-                lsn: Lsn::new(1, 1),
-                child: Some(bin_arc.clone()),
-            }],
+            entries: vec![InEntry { key: vec![], lsn: Lsn::new(1, 1) }],
+            targets: TargetRep::Sparse(vec![(0, bin_arc.clone())]),
             dirty: false,
             generation: 0,
             parent: None,
@@ -7575,6 +7933,7 @@ mod tests {
             node_id: generate_node_id(),
             level: MAIN_LEVEL | 2,
             entries: vec![],
+            targets: TargetRep::None,
             dirty: false,
             generation: 0,
             parent: None,
@@ -7638,11 +7997,8 @@ mod tests {
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
             node_id: generate_node_id(),
             level: MAIN_LEVEL | 2,
-            entries: vec![InEntry {
-                key: vec![],
-                lsn: Lsn::new(1, 1),
-                child: Some(bin_a),
-            }],
+            entries: vec![InEntry { key: vec![], lsn: Lsn::new(1, 1) }],
+            targets: TargetRep::Sparse(vec![(0, bin_a)]),
             dirty: false,
             generation: 0,
             parent: None,
@@ -9103,11 +9459,8 @@ mod tests {
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
             node_id: generate_node_id(),
             level: MAIN_LEVEL | 2,
-            entries: vec![InEntry {
-                key: vec![],
-                lsn,
-                child: Some(bin_arc.clone()),
-            }],
+            entries: vec![InEntry { key: vec![], lsn }],
+            targets: TargetRep::Sparse(vec![(0, bin_arc.clone())]),
             dirty: false,
             generation: 0,
             parent: None,
@@ -9261,11 +9614,8 @@ mod tests {
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
             node_id: generate_node_id(),
             level: MAIN_LEVEL | 2,
-            entries: vec![InEntry {
-                key: vec![],
-                lsn,
-                child: Some(bin_arc.clone()),
-            }],
+            entries: vec![InEntry { key: vec![], lsn }],
+            targets: TargetRep::Sparse(vec![(0, bin_arc.clone())]),
             dirty: false,
             generation: 0,
             parent: None,
@@ -9469,13 +9819,13 @@ mod tests {
             node_id: generate_node_id(),
             level: MAIN_LEVEL | 2,
             entries: vec![
-                InEntry { key: vec![], lsn, child: Some(bin_arc.clone()) },
-                InEntry {
-                    key: b"\x40".to_vec(),
-                    lsn,
-                    child: Some(sibling_arc.clone()),
-                },
+                InEntry { key: vec![], lsn },
+                InEntry { key: b"\x40".to_vec(), lsn },
             ],
+            targets: TargetRep::Sparse(vec![
+                (0, bin_arc.clone()),
+                (1, sibling_arc.clone()),
+            ]),
             dirty: false,
             generation: 0,
             parent: None,
@@ -9737,11 +10087,8 @@ mod tests {
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
             node_id: generate_node_id(),
             level: MAIN_LEVEL | 2,
-            entries: vec![InEntry {
-                key: vec![],
-                lsn,
-                child: Some(bin_arc.clone()),
-            }],
+            entries: vec![InEntry { key: vec![], lsn }],
+            targets: TargetRep::Sparse(vec![(0, bin_arc.clone())]),
             dirty: false,
             generation: 0,
             parent: None,
@@ -9936,13 +10283,13 @@ mod tests {
             node_id: generate_node_id(),
             level: MAIN_LEVEL | 2,
             entries: vec![
-                InEntry { key: vec![], lsn, child: Some(bin_arc.clone()) },
-                InEntry {
-                    key: b"\x40".to_vec(),
-                    lsn,
-                    child: Some(sibling_arc.clone()),
-                },
+                InEntry { key: vec![], lsn },
+                InEntry { key: b"\x40".to_vec(), lsn },
             ],
+            targets: TargetRep::Sparse(vec![
+                (0, bin_arc.clone()),
+                (1, sibling_arc.clone()),
+            ]),
             dirty: false,
             generation: 0,
             parent: None,
@@ -10049,11 +10396,8 @@ mod tests {
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
             node_id: generate_node_id(),
             level: MAIN_LEVEL | 2,
-            entries: vec![InEntry {
-                key: vec![],
-                lsn,
-                child: Some(bin_arc.clone()),
-            }],
+            entries: vec![InEntry { key: vec![], lsn }],
+            targets: TargetRep::Sparse(vec![(0, bin_arc.clone())]),
             dirty: false,
             generation: 0,
             parent: None,
@@ -10770,6 +11114,7 @@ mod tests {
             node_id: generate_node_id(),
             level: MAIN_LEVEL | 2,
             entries: vec![], // empty — structurally invalid
+            targets: TargetRep::None,
             dirty: false,
             generation: 0,
             parent: None,
@@ -10802,7 +11147,7 @@ mod tests {
             let g = root_arc.read();
             match &*g {
                 TreeNode::Internal(n) => {
-                    let child = n.entries[0].child.as_ref().unwrap();
+                    let child = n.child_ref(0).unwrap();
                     let cg = child.read();
                     match &*cg {
                         TreeNode::Bottom(b) => b.node_id,
@@ -10960,11 +11305,7 @@ mod tests {
         // (empty key sorts first), the rest strictly ascending.
         for n_slots in 1usize..40 {
             let mut entries: Vec<InEntry> = Vec::with_capacity(n_slots);
-            entries.push(InEntry {
-                key: vec![],
-                lsn: Lsn::from_u64(0),
-                child: None,
-            });
+            entries.push(InEntry { key: vec![], lsn: Lsn::from_u64(0) });
             for i in 1..n_slots {
                 // Strictly-ascending two-byte keys with gaps so probes can
                 // fall between, on, before, and after them.
@@ -10972,7 +11313,6 @@ mod tests {
                 entries.push(InEntry {
                     key: vec![(v >> 8) as u8, (v & 0xFF) as u8],
                     lsn: Lsn::from_u64(0),
-                    child: None,
                 });
             }
             for probe in 0u16..=(n_slots as u16 * 4 + 4) {
@@ -11049,8 +11389,8 @@ fn test_split_child_sibling_inherits_expiration_in_hours() {
         entries: vec![InEntry {
             key: vec![], // virtual key for slot 0 (-infinity)
             lsn: Lsn::new(1, 1),
-            child: Some(Arc::clone(&bin)),
         }],
+        targets: TargetRep::Sparse(vec![(0, Arc::clone(&bin))]),
         dirty: true,
         generation: 0,
         parent: None,
@@ -11087,9 +11427,7 @@ fn test_split_child_sibling_inherits_expiration_in_hours() {
 
     // Right-half sibling is at slot 1.
     let sibling_arc = in_node
-        .entries
-        .get(1)
-        .and_then(|e| e.child.clone())
+        .get_child(1)
         .expect("right-half sibling should exist at slot 1");
     let sibling_guard = sibling_arc.read();
     let TreeNode::Bottom(ref sibling) = *sibling_guard else {
@@ -11256,17 +11594,10 @@ mod in_redo_tests {
             node_id: 77,
             level: 0x10002,
             entries: vec![
-                InEntry {
-                    key: vec![1, 2, 3],
-                    lsn: Lsn::new(1, 10),
-                    child: None,
-                },
-                InEntry {
-                    key: vec![4, 5, 6],
-                    lsn: Lsn::new(1, 20),
-                    child: None,
-                },
+                InEntry { key: vec![1, 2, 3], lsn: Lsn::new(1, 10) },
+                InEntry { key: vec![4, 5, 6], lsn: Lsn::new(1, 20) },
             ],
+            targets: TargetRep::None,
             dirty: false,
             generation: 0,
             parent: None,
@@ -11300,9 +11631,9 @@ mod key_prefixing_tests {
             let g = node.read();
             match &*g {
                 TreeNode::Bottom(_) => None,
-                TreeNode::Internal(n) => Some(Arc::clone(
-                    n.entries[0].child.as_ref().expect("child"),
-                )),
+                TreeNode::Internal(n) => {
+                    Some(Arc::clone(n.child_ref(0).expect("child")))
+                }
             }
         };
         match child_opt {
@@ -11443,7 +11774,7 @@ mod split_special_tests {
                                 break;
                             }
                         }
-                        n.entries.get(idx)?.child.clone()?
+                        n.get_child(idx)?
                     }
                 }
             };
@@ -11456,12 +11787,9 @@ mod split_special_tests {
         let g = node.read();
         match &*g {
             TreeNode::Bottom(_) => 1,
-            TreeNode::Internal(n) => n
-                .entries
-                .iter()
-                .filter_map(|e| e.child.as_ref())
-                .map(count_bins)
-                .sum(),
+            TreeNode::Internal(n) => {
+                n.resident_children().iter().map(count_bins).sum()
+            }
         }
     }
 
@@ -11470,12 +11798,9 @@ mod split_special_tests {
         let g = node.read();
         match &*g {
             TreeNode::Bottom(b) => b.entries.len(),
-            TreeNode::Internal(n) => n
-                .entries
-                .iter()
-                .filter_map(|e| e.child.as_ref())
-                .map(count_keys)
-                .sum(),
+            TreeNode::Internal(n) => {
+                n.resident_children().iter().map(count_keys).sum()
+            }
         }
     }
 
@@ -11485,7 +11810,7 @@ mod split_special_tests {
         match &*g {
             TreeNode::Bottom(b) => b.entries.len(),
             TreeNode::Internal(n) => {
-                let first_child = n.entries[0].child.as_ref().expect("child");
+                let first_child = n.child_ref(0).expect("child");
                 leftmost_bin_size(first_child)
             }
         }
@@ -11498,9 +11823,7 @@ mod split_special_tests {
             TreeNode::Bottom(b) => b.entries.len(),
             TreeNode::Internal(n) => {
                 let last_child = n
-                    .entries
-                    .last()
-                    .and_then(|e| e.child.as_ref())
+                    .child_ref(n.entries.len().saturating_sub(1))
                     .expect("child");
                 rightmost_bin_size(last_child)
             }

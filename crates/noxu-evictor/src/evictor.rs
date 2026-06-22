@@ -1343,8 +1343,7 @@ fn find_node_full_recursive(
             if n.node_id == target_id {
                 // EV-6: an upper IN with any resident child must stay
                 // resident (JE IN.hasCachedChildren / NON_EVICTABLE_IN).
-                let has_cached_children =
-                    n.entries.iter().any(|e| e.child.is_some());
+                let has_cached_children = !n.targets.is_empty();
                 let info = RealNodeInfo {
                     dirty: n.dirty,
                     is_bin: false,
@@ -1362,11 +1361,8 @@ fn find_node_full_recursive(
                 drop(guard);
                 return Some(NodeFull { arc, info, size });
             }
-            let children: Vec<Arc<NodeRwLock<TreeNode>>> = n
-                .entries
-                .iter()
-                .filter_map(|e| e.child.as_ref().map(Arc::clone))
-                .collect();
+            let children: Vec<Arc<NodeRwLock<TreeNode>>> =
+                n.resident_children();
             drop(guard);
             for child in children {
                 if let Some(full) =
@@ -1435,11 +1431,8 @@ fn find_node_arc_nonblocking_recursive(
                 drop(guard);
                 return Ok(Some(arc));
             }
-            let children: Vec<Arc<NodeRwLock<TreeNode>>> = n
-                .entries
-                .iter()
-                .filter_map(|e| e.child.as_ref().map(Arc::clone))
-                .collect();
+            let children: Vec<Arc<NodeRwLock<TreeNode>>> =
+                n.resident_children();
             drop(guard);
             for child in children {
                 match find_node_arc_nonblocking_recursive(&child, target_id) {
@@ -1751,11 +1744,7 @@ mod tests {
             match &*g {
                 TreeNode::Bottom(b) => bins.push(b.node_id),
                 TreeNode::Internal(n) => {
-                    let cs: Vec<_> = n
-                        .entries
-                        .iter()
-                        .filter_map(|e| e.child.clone())
-                        .collect();
+                    let cs: Vec<_> = n.resident_children();
                     drop(g);
                     for c in cs {
                         collect_bins(&c, bins);
@@ -1772,11 +1761,10 @@ mod tests {
             let TreeNode::Internal(n) = &*g else {
                 return;
             };
-            if !is_root && n.entries.iter().all(|e| e.child.is_none()) {
+            if !is_root && n.targets.is_empty() {
                 uins.push(n.node_id);
             }
-            let children: Vec<_> =
-                n.entries.iter().filter_map(|e| e.child.clone()).collect();
+            let children: Vec<_> = n.resident_children();
             drop(g);
             for c in children {
                 collect_childless_uins(&c, false, uins);
@@ -2403,7 +2391,7 @@ mod tests {
                 }
                 TreeNode::Internal(n) => {
                     // The first child should eventually lead to a BIN.
-                    let first_child = n.entries[0].child.as_ref()?.clone();
+                    let first_child = n.get_child(0)?;
                     drop(guard);
                     find_bin_node(&first_child)
                 }
@@ -2544,18 +2532,15 @@ mod tests {
             // If this is a non-root upper IN whose first child is a BIN,
             // return (this_in_id, bin_child_id).
             if !is_root {
-                for e in &n.entries {
-                    if let Some(child) = &e.child {
-                        let cg = child.read();
-                        if let TreeNode::Bottom(b) = &*cg {
-                            return Some((n.node_id, b.node_id));
-                        }
+                for child in n.resident_children() {
+                    let cg = child.read();
+                    if let TreeNode::Bottom(b) = &*cg {
+                        return Some((n.node_id, b.node_id));
                     }
                 }
             }
             // Otherwise recurse into children.
-            let children: Vec<_> =
-                n.entries.iter().filter_map(|e| e.child.clone()).collect();
+            let children: Vec<_> = n.resident_children();
             drop(g);
             for c in children {
                 if let Some(found) =
@@ -2642,9 +2627,7 @@ mod tests {
             let root = tree_inner.get_root().expect("root");
             let guard = root.read();
             match &*guard {
-                TreeNode::Internal(n) => {
-                    n.entries[0].child.as_ref().cloned().expect("BIN child")
-                }
+                TreeNode::Internal(n) => n.get_child(0).expect("BIN child"),
                 TreeNode::Bottom(_) => {
                     // Single-node tree: root IS the BIN.
                     Arc::clone(&root)
@@ -2751,9 +2734,7 @@ mod tests {
             let root = tree_inner.get_root().expect("root");
             let guard = root.read();
             match &*guard {
-                TreeNode::Internal(n) => {
-                    n.entries[0].child.as_ref().cloned().expect("BIN child")
-                }
+                TreeNode::Internal(n) => n.get_child(0).expect("BIN child"),
                 TreeNode::Bottom(_) => Arc::clone(&root),
             }
         };
@@ -2831,9 +2812,7 @@ mod tests {
             let root = tree_inner.get_root().expect("root");
             let guard = root.read();
             match &*guard {
-                TreeNode::Internal(n) => {
-                    n.entries[0].child.as_ref().cloned().expect("BIN child")
-                }
+                TreeNode::Internal(n) => n.get_child(0).expect("BIN child"),
                 TreeNode::Bottom(_) => Arc::clone(&root),
             }
         };
@@ -2889,9 +2868,7 @@ mod tests {
             let root = tree_inner.get_root().expect("root");
             let guard = root.read();
             match &*guard {
-                TreeNode::Internal(n) => {
-                    n.entries[0].child.as_ref().cloned().expect("BIN child")
-                }
+                TreeNode::Internal(n) => n.get_child(0).expect("BIN child"),
                 TreeNode::Bottom(_) => Arc::clone(&root),
             }
         };
@@ -2997,9 +2974,7 @@ mod tests {
             let root = tree_inner.get_root().expect("root");
             let g = root.read();
             match &*g {
-                TreeNode::Internal(n) => {
-                    (n.node_id, n.entries.iter().any(|e| e.child.is_some()))
-                }
+                TreeNode::Internal(n) => (n.node_id, !n.targets.is_empty()),
                 // If the root is a single BIN the test premise is gone; skip.
                 TreeNode::Bottom(_) => return,
             }
@@ -3030,9 +3005,7 @@ mod tests {
             let root = t.get_root().expect("root still resident");
             let g = root.read();
             match &*g {
-                TreeNode::Internal(n) => {
-                    n.entries.iter().any(|e| e.child.is_some())
-                }
+                TreeNode::Internal(n) => !n.targets.is_empty(),
                 TreeNode::Bottom(_) => false,
             }
         };
