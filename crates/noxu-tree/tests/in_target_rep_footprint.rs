@@ -20,7 +20,7 @@ use std::mem::size_of;
 use std::sync::Arc;
 
 use noxu_tree::tree::TreeNode;
-use noxu_tree::{ChildArc, InEntry, InNodeStub, LsnRep, TargetRep};
+use noxu_tree::{ChildArc, InEntry, InNodeStub, KeyRep, LsnRep, TargetRep};
 use noxu_util::Lsn;
 use parking_lot::RwLock;
 
@@ -183,6 +183,9 @@ fn bin_same_file(n: usize) -> noxu_tree::BinStub {
         cursor_count: 0,
         prohibit_next_delta: false,
         lsn_rep: LsnRep::Empty,
+        keys: KeyRep::new(),
+        compact_max_key_length:
+            noxu_tree::tree::INKeyRep_DEFAULT_MAX_KEY_LENGTH,
     };
     for i in 0..n {
         let k = (i as u32).to_be_bytes().to_vec();
@@ -249,4 +252,107 @@ fn node_lsn_rep_bytes(node: &TreeNode) -> u64 {
         TreeNode::Bottom(b) => b.lsn_rep.memory_size() as u64,
         TreeNode::Internal(n) => n.lsn_rep.memory_size() as u64,
     }
+}
+
+// ===========================================================================
+// T-2: KeyRep compact-key footprint (INKeyRep.MaxKeySize, INKeyRep.java).
+// ===========================================================================
+
+/// A BIN whose post-prefix keys are all small (<= TREE_COMPACT_MAX_KEY_LENGTH)
+/// uses the Compact key rep (one fixed-width buffer, no per-key `Vec`), not
+/// the Default `Vec<Vec<u8>>`.  `INKeyRep.MaxKeySize`.
+#[test]
+fn small_keys_use_compact_rep() {
+    let n = 64usize;
+    let bin = bin_same_file_with_keys(n, 8); // 8-byte keys, no prefix
+    let TreeNode::Bottom(b) = TreeNode::Bottom(bin) else { unreachable!() };
+    assert!(
+        b.keys.is_compact(),
+        "all-small-key BIN must use the Compact key rep"
+    );
+    // Compact buffer is slot_width*n + lengths; no per-key Vec headers.
+    // For 8-byte keys with no prefix, slot_width == 8.
+    assert!(
+        b.keys.memory_size() <= n * 8 + n * 2 + 16,
+        "compact key rep must be ~slot_width*n bytes, got {}",
+        b.keys.memory_size()
+    );
+}
+
+/// A key longer than TREE_COMPACT_MAX_KEY_LENGTH inflates the node to the
+/// Default rep (`MaxKeySize.expandToDefaultRep`).
+#[test]
+fn long_key_inflates_to_default() {
+    let mut bin = empty_bin();
+    // Insert small keys -> Compact after prefix recompute.
+    for i in 0..4u32 {
+        bin.insert_with_prefix(
+            format!("k{i:02}").into_bytes(),
+            Lsn::new(1, i + 1),
+            None,
+        );
+    }
+    assert!(bin.keys.is_compact(), "small keys -> Compact");
+    // Insert a key longer than the 16-byte threshold (post-prefix).
+    let long = vec![b'z'; 40];
+    bin.insert_with_prefix(long, Lsn::new(1, 99), None);
+    assert!(
+        !bin.keys.is_compact(),
+        "a key > TREE_COMPACT_MAX_KEY_LENGTH must inflate to Default"
+    );
+}
+
+/// Numerically prove the per-node footprint reduction vs the pre-T-2 layout
+/// where every `BinEntry` carried a 24-byte `Vec<u8>` header + the key's own
+/// heap allocation.
+#[test]
+fn key_footprint_smaller_than_pre_compaction() {
+    let n = 128usize;
+    let key_len = 8usize;
+    let bin = bin_same_file_with_keys(n, key_len);
+    // Compact rep: one buffer (slot_width*n) + lengths (2*n).
+    let compact = bin.keys.memory_size();
+    // Pre-T-2 Default model: n * (Vec header 24 + key bytes).
+    let pre = n * (24 + key_len);
+    assert!(
+        compact < pre,
+        "T-2: compact key rep ({compact}) must be < pre-compaction \
+         per-key-Vec layout ({pre})"
+    );
+}
+
+fn empty_bin() -> noxu_tree::BinStub {
+    noxu_tree::BinStub {
+        node_id: 1,
+        level: noxu_tree::BIN_LEVEL,
+        entries: Vec::new(),
+        key_prefix: Vec::new(),
+        dirty: false,
+        is_delta: false,
+        last_full_lsn: noxu_util::NULL_LSN,
+        last_delta_lsn: noxu_util::NULL_LSN,
+        generation: 0,
+        parent: None,
+        expiration_in_hours: true,
+        cursor_count: 0,
+        prohibit_next_delta: false,
+        lsn_rep: LsnRep::Empty,
+        keys: KeyRep::new(),
+        compact_max_key_length:
+            noxu_tree::tree::INKeyRep_DEFAULT_MAX_KEY_LENGTH,
+    }
+}
+
+/// A BIN of `n` slots, each a distinct `key_len`-byte key, no shared prefix
+/// (keys differ in the first byte), all in file number 7.
+fn bin_same_file_with_keys(n: usize, key_len: usize) -> noxu_tree::BinStub {
+    let mut bin = empty_bin();
+    for i in 0..n {
+        let mut k = vec![0u8; key_len];
+        // Vary the leading bytes so no common prefix forms.
+        k[0] = (i % 256) as u8;
+        k[1 % key_len] = (i / 256) as u8;
+        bin.insert_with_prefix(k, Lsn::new(7, 1000 + i as u32), None);
+    }
+    bin
 }

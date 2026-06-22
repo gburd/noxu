@@ -569,10 +569,10 @@ impl RealTreeLookup {
         let guard = node_arc.read();
         match &*guard {
             TreeNode::Bottom(bin) => {
-                let idx = bin
-                    .entries
-                    .binary_search_by(|e| e.key.as_slice().cmp(key))
-                    .ok()?;
+                let (idx, found) = bin.find_entry_compressed(key);
+                if !found {
+                    return None;
+                }
                 Some(bin.get_lsn(idx))
             }
             TreeNode::Internal(n) => {
@@ -602,10 +602,10 @@ impl RealTreeLookup {
         let guard = node_arc.read();
         match &*guard {
             TreeNode::Bottom(bin) => {
-                let idx = bin
-                    .entries
-                    .binary_search_by(|e| e.key.as_slice().cmp(key))
-                    .ok()?;
+                let (idx, found) = bin.find_entry_compressed(key);
+                if !found {
+                    return None;
+                }
                 bin.entries[idx].data.clone()
             }
             TreeNode::Internal(n) => {

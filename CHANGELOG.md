@@ -21,3 +21,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   compactly.  Access is via `BinStub`/`InNodeStub` `get_lsn(slot)` /
   `set_lsn(slot, lsn)`.  The on-disk `serialize_full`/`serialize_delta` bytes
   are unchanged (this is an in-memory heap optimization).
+
+- **T-2 (IN-array compact key rep) + T-5 (config wiring):** the per-slot `key`
+  (`Vec<u8>`: 24-byte header + a separate heap allocation each) on `BinEntry`
+  was hoisted to a node-level `KeyRep` (`INKeyRep.{Default,MaxKeySize}`,
+  INKeyRep.java).  When every post-prefix key in a BIN is `<=`
+  `TREE_COMPACT_MAX_KEY_LENGTH` (default 16) the keys pack into ONE fixed-width
+  byte buffer (`Compact`: `slot_width` bytes/slot + a parallel `Vec<u16>` of
+  lengths) instead of one `Vec<u8>` per slot; a longer key inflates the node
+  to the `Default` rep (`MaxKeySize.expandToDefaultRep`).  As in JE, the rep
+  stores the UNPREFIXED suffix (prefix compression runs first).  BIN key
+  access is via `BinStub::get_key(slot)` / `get_full_key(slot)`; the binary
+  search runs over the rep (`key_binary_search`).  **T-5:**
+  `TREE_COMPACT_MAX_KEY_LENGTH` is threaded from `DbiEnvConfig` through
+  `EnvironmentImpl` → `DatabaseImpl::set_tree_compact_max_key_length` →
+  `Tree::set_compact_max_key_length` (`IN.getCompactMaxKeyLength`), so the
+  threshold is configurable (default 16; `<= 0` disables the compact rep).
+  The on-disk `serialize_full`/`serialize_delta` bytes are unchanged.

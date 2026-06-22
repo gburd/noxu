@@ -1372,16 +1372,15 @@ impl CursorImpl {
                 {
                     return None;
                 }
-                let suffix = bin.compress_key(key);
-                bin.entries
-                    .iter()
-                    .position(|e| e.key.as_slice() == suffix.as_slice())
-                    .map(|i| {
-                        (
-                            bin.entries[i].data.clone().unwrap_or_default(),
-                            bin.get_lsn(i).as_u64(),
-                        )
-                    })
+                let (idx, found) = bin.find_entry_compressed(key);
+                if found {
+                    Some((
+                        bin.entries[idx].data.clone().unwrap_or_default(),
+                        bin.get_lsn(idx).as_u64(),
+                    ))
+                } else {
+                    None
+                }
             }
             _ => None,
         }
@@ -1491,15 +1490,16 @@ impl CursorImpl {
                     } else {
                         // Cheap path: suffix comparison.
                         let suffix = &key[plen..];
-                        bin.entries
-                            .iter()
-                            .enumerate()
-                            .find(|(_, e)| e.key.as_slice() >= suffix)
-                            .and_then(|(i, e)| {
+                        (0..bin.entries.len())
+                            .find(|&i| bin.get_key(i) >= suffix)
+                            .and_then(|i| {
                                 bin.get_full_key(i).map(|fk| {
                                     (
                                         fk,
-                                        e.data.clone().unwrap_or_default(),
+                                        bin.entries[i]
+                                            .data
+                                            .clone()
+                                            .unwrap_or_default(),
                                         bin.get_lsn(i).as_u64(),
                                         i,
                                     )
@@ -1521,8 +1521,8 @@ impl CursorImpl {
         // SearchGte.  No iteration: one call, one answer.
         // The first entry of the next BIN is at slot index 0.
         let next = tree.get_next_bin(key)?;
-        let (e, lsn) = next.into_iter().next()?;
-        Some((e.key, e.data.unwrap_or_default(), lsn.as_u64(), 0))
+        let (e, lsn, full_key) = next.into_iter().next()?;
+        Some((full_key, e.data.unwrap_or_default(), lsn.as_u64(), 0))
     }
 
     /// Descends from the given node to the leftmost BIN, returning its Arc.
@@ -1861,7 +1861,7 @@ impl CursorImpl {
                 } else {
                     &current_key[plen..]
                 };
-            let stored = bin.entries[idx].key.as_slice();
+            let stored = bin.get_key(idx);
             if stored != expected_suffix {
                 // Key mismatch at current_index.  This can mean either:
                 //   (a) the record was deleted (key no longer in tree), or
@@ -2260,7 +2260,7 @@ impl CursorImpl {
         // found or the key space is exhausted.
         const MAX_BIN_CROSSINGS: usize = 1 << 20;
         for _ in 0..MAX_BIN_CROSSINGS {
-            let adjacent_entries: Option<Vec<(BinEntry, Lsn)>> = {
+            let adjacent_entries: Option<Vec<(BinEntry, Lsn, Vec<u8>)>> = {
                 let db = self.db_impl.read();
                 if let Some(tree) = db.get_real_tree() {
                     if forward {
@@ -2301,9 +2301,9 @@ impl CursorImpl {
                 // This BIN is entirely known_deleted — re-anchor on its edge
                 // key and continue crossing to the next BIN.
                 let edge_key = if forward {
-                    entries.last().map(|e| e.0.key.clone())
+                    entries.last().map(|e| e.2.clone())
                 } else {
-                    entries.first().map(|e| e.0.key.clone())
+                    entries.first().map(|e| e.2.clone())
                 };
                 match edge_key {
                     Some(k) => {
@@ -2315,8 +2315,8 @@ impl CursorImpl {
             };
 
             let idx = pos as i32;
-            let (e, e_lsn) = &entries[pos];
-            let raw_key = e.key.clone();
+            let (e, e_lsn, e_key) = &entries[pos];
+            let raw_key = e_key.clone();
             let raw_data = e.data.clone().unwrap_or_default();
             let lsn = e_lsn.as_u64();
 
@@ -2491,7 +2491,7 @@ impl CursorImpl {
                         None => {
                             // BIN exhausted — cross to adjacent BIN.
                             let anchor = raw_key.clone();
-                            let adj: Option<Vec<(BinEntry, Lsn)>> = {
+                            let adj: Option<Vec<(BinEntry, Lsn, Vec<u8>)>> = {
                                 let db = self.db_impl.read();
                                 if let Some(tree) = db.get_real_tree() {
                                     if forward {
@@ -2506,20 +2506,20 @@ impl CursorImpl {
                             match adj {
                                 Some(entries) if !entries.is_empty() => {
                                     let (k, d, i, l) = if forward {
-                                        let (e, e_lsn) =
+                                        let (e, e_lsn, e_key) =
                                             entries.into_iter().next().unwrap();
                                         (
-                                            e.key,
+                                            e_key,
                                             e.data.unwrap_or_default(),
                                             0i32,
                                             e_lsn.as_u64(),
                                         )
                                     } else {
                                         let li = (entries.len() - 1) as i32;
-                                        let (e, e_lsn) =
+                                        let (e, e_lsn, e_key) =
                                             entries.into_iter().last().unwrap();
                                         (
-                                            e.key,
+                                            e_key,
                                             e.data.unwrap_or_default(),
                                             li,
                                             e_lsn.as_u64(),

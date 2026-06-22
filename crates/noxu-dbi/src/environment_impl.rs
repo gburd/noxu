@@ -310,6 +310,12 @@ pub struct EnvironmentImpl {
     /// automatically.  `None` for standalone (non-replicated) environments —
     /// those always write the 14-byte header and are byte-unchanged.
     replication_vlsn_counter: Mutex<Option<Arc<std::sync::atomic::AtomicU64>>>,
+
+    /// T-5: `TREE_COMPACT_MAX_KEY_LENGTH` (`EnvironmentParams
+    /// .TREE_COMPACT_MAX_KEY_LENGTH`).  Threaded into every BIN tree this
+    /// environment opens via `Tree::set_compact_max_key_length`
+    /// (`IN.getCompactMaxKeyLength`).  Default 16.
+    compact_max_key_length: i32,
 }
 
 impl EnvironmentImpl {
@@ -1144,6 +1150,8 @@ impl EnvironmentImpl {
             cache_usage,
             memory_budget,
             replication_vlsn_counter: Mutex::new(None),
+            // T-5: TREE_COMPACT_MAX_KEY_LENGTH from the env config.
+            compact_max_key_length: cfg.tree_compact_max_key_length as i32,
         };
 
         // Mark as open
@@ -1342,6 +1350,10 @@ impl EnvironmentImpl {
         // tree so that BIN insertions/deletions are visible to the Arbiter
         // (MemoryBudget.updateTreeMemoryUsage path).
         db_impl.set_memory_counter(Arc::clone(&self.cache_usage));
+        // T-5: thread TREE_COMPACT_MAX_KEY_LENGTH into the tree so the BIN
+        // compact-key rep uses the configured threshold
+        // (IN.getCompactMaxKeyLength).
+        db_impl.set_tree_compact_max_key_length(self.compact_max_key_length);
 
         // If recovery populated a tree for this db_id, transplant it so the
         // database starts from its recovered (crash-consistent) state rather
