@@ -34,4 +34,4 @@ pub use syncup_protocol::{
     SYNCUP_SERVICE_NAME, SyncupMsg, SyncupOutcome, feeder_syncup_handshake,
     replica_syncup_handshake,
 };
-pub use syncup_reader::SyncupLogView;
+pub use syncup_reader::{SyncupLogView, VlsnIndexView};

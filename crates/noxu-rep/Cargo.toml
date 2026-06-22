@@ -35,6 +35,7 @@ noxu-txn = { workspace = true }
 noxu-tree = { workspace = true }
 noxu-sync = { workspace = true }
 noxu-dbi = { workspace = true }
+noxu-recovery = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }
 quoracle = { workspace = true }

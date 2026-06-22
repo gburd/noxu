@@ -31,6 +31,7 @@ use noxu_log::file_manager::FileManager;
 use noxu_util::{NULL_VLSN, Vlsn};
 
 use crate::stream::syncup::{SyncupView, VlsnEntry};
+use crate::vlsn::vlsn_index::VlsnIndex;
 
 /// A scanned snapshot of one node's replicated log, indexed by VLSN.
 ///
@@ -187,6 +188,76 @@ impl SyncupView for SyncupLogView {
     }
 }
 
+// ---------------------------------------------------------------------------
+// VlsnIndexView — a SyncupView over an in-memory VlsnIndex
+// ---------------------------------------------------------------------------
+
+/// A [`SyncupView`] backed by a live [`VlsnIndex`] (VLSN → LSN) plus the
+/// index's range (`getFirst`/`getLastSync`/`getLastTxnEnd`).
+///
+/// The per-VLSN *fingerprint* is the LSN itself: two nodes hold the "same
+/// record" at a VLSN iff they assigned it the same LSN. This is the in-memory
+/// equivalent of JE `OutputWireRecord.match` for the syncup driver that works
+/// from the VLSN index without re-reading raw log bytes (used by the live
+/// `become_replica` path and the multi-node test harness, which track
+/// replication at the VLSN-index granularity). The `SyncupLogView` above is
+/// the full re-read used when raw per-record checksums are required.
+///
+/// A VLSN is treated as a *sync point* iff it is `<= lastSync` and held in the
+/// index — matching JE, where every sync point is a txn end and `lastSync`
+/// bounds the highest matchpoint candidate.
+pub struct VlsnIndexView {
+    index: Arc<VlsnIndex>,
+    first: Vlsn,
+    last_sync: Vlsn,
+    last_txn_end: Vlsn,
+}
+
+impl VlsnIndexView {
+    /// Build a view over `index`.
+    pub fn from_index(index: &Arc<VlsnIndex>) -> Self {
+        let range = index.get_range();
+        let to_vlsn =
+            |v: u64| if v == 0 { NULL_VLSN } else { Vlsn::new(v as i64) };
+        Self {
+            index: Arc::clone(index),
+            first: to_vlsn(range.get_first()),
+            last_sync: to_vlsn(range.get_last_sync()),
+            last_txn_end: to_vlsn(range.get_last_txn_end()),
+        }
+    }
+
+    fn lsn_fingerprint(&self, vlsn: i64) -> Option<(u64, u64, bool)> {
+        if vlsn <= 0 {
+            return None;
+        }
+        // Proper per-VLSN lookup (NOT the sparse snapshot): get_lsn answers
+        // for every VLSN the index holds, matching JE VLSNIndex.getLsn.
+        let (file, offset) = self.index.get_lsn(vlsn as u64)?;
+        let lsn = noxu_util::Lsn::new(file, offset).as_u64();
+        // Fingerprint == LSN: same LSN at a VLSN means the same record.
+        let is_sync = Vlsn::new(vlsn) <= self.last_sync;
+        Some((lsn, lsn, is_sync))
+    }
+}
+
+impl SyncupView for VlsnIndexView {
+    fn last_sync(&self) -> Vlsn {
+        self.last_sync
+    }
+    fn last_txn_end(&self) -> Vlsn {
+        self.last_txn_end
+    }
+    fn first_vlsn(&self) -> Vlsn {
+        self.first
+    }
+    fn entry(&self, vlsn: Vlsn) -> Option<VlsnEntry> {
+        let (lsn, fingerprint, is_sync) =
+            self.lsn_fingerprint(vlsn.sequence())?;
+        Some(VlsnEntry { lsn, fingerprint, is_sync })
+    }
+}
+
 /// Read the raw header+payload at `(file_num, offset)`.
 ///
 /// Returns `(entry_size_bytes, vlsn_opt, entry_type_byte, payload)` or `None`
@@ -206,6 +277,11 @@ fn read_raw_entry(
     if hdr[4] == 0 {
         return None; // zero-fill past last entry
     }
+    // Skip entries whose invisible bit (flags mask 0x10) is set: a rolled-back
+    // entry made invisible by Replay.rollback (STEP 4) is not a valid
+    // matchpoint candidate (JE ReplicaSyncupReader.isTargetEntry: "Skip
+    // invisible entries"). We still advance past it by returning its size.
+    let invisible = (hdr[5] & 0x10) != 0;
     let entry_type_byte = hdr[4];
     let flags = hdr[5];
     let item_size =
@@ -231,6 +307,10 @@ fn read_raw_entry(
         None
     };
     let payload = full[header_size..].to_vec();
+    // Invisible entries advance the cursor but are not yielded as VLSN
+    // entries (their VLSN is suppressed so the matchpoint search ignores
+    // them). Returning a None VLSN keeps the scan moving past them.
+    let vlsn_opt = if invisible { None } else { vlsn_opt };
     Some((entry_size, vlsn_opt, entry_type_byte, payload))
 }
 
