@@ -82,9 +82,9 @@ pub use versioned_ln::make_versioned_ln;
 
 // Tree types
 pub use tree::{
-    BinEntry, BinStub, InEntry, InNodeStub, InRedoResult, KeyComparatorFn,
-    SlotFetch, Tree, TreeNode, TreeStats, generate_node_id,
-    peek_next_node_id_counter, seed_node_id_counter,
+    BinEntry, BinStub, ChildArc, InEntry, InNodeStub, InRedoResult,
+    KeyComparatorFn, SlotFetch, TargetRep, Tree, TreeNode, TreeStats,
+    generate_node_id, peek_next_node_id_counter, seed_node_id_counter,
 };
 
 // Tree node level constants and search-result flags.  These are defined in

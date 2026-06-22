@@ -446,9 +446,7 @@ impl TreeLookup for RealTreeLookup {
             let child_arc = {
                 let parent_guard = parent_arc.read();
                 match &*parent_guard {
-                    TreeNode::Internal(n) => {
-                        n.entries.get(slot_idx).and_then(|e| e.child.clone())
-                    }
+                    TreeNode::Internal(n) => n.get_child(slot_idx),
                     _ => None,
                 }
             };
@@ -588,7 +586,7 @@ impl RealTreeLookup {
                         break;
                     }
                 }
-                let child = n.entries.get(idx)?.child.clone()?;
+                let child = n.get_child(idx)?;
                 drop(guard);
                 Self::find_bin_entry_lsn(&child, key)
             }
@@ -621,7 +619,7 @@ impl RealTreeLookup {
                         break;
                     }
                 }
-                let child = n.entries.get(idx)?.child.clone()?;
+                let child = n.get_child(idx)?;
                 drop(guard);
                 Self::find_bin_entry_data(&child, key)
             }

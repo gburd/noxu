@@ -124,7 +124,9 @@ fn open_db(dir: &Path) -> (Environment, Database) {
         .open_database(
             None,
             "bench",
-            &DatabaseConfig::new().with_allow_create(true).with_transactional(true),
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true),
         )
         .unwrap();
     (env, db)
@@ -147,7 +149,9 @@ fn open_db_group_commit(dir: &Path) -> (Environment, Database) {
         .open_database(
             None,
             "bench",
-            &DatabaseConfig::new().with_allow_create(true).with_transactional(true),
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true),
         )
         .unwrap();
     (env, db)

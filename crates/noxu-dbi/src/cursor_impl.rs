@@ -1535,9 +1535,7 @@ impl CursorImpl {
                 let is_bin = g.is_bin();
                 let child = if !is_bin {
                     match &*g {
-                        TreeNode::Internal(n) => {
-                            n.entries.first().and_then(|e| e.child.clone())
-                        }
+                        TreeNode::Internal(n) => n.get_child(0),
                         _ => None,
                     }
                 } else {
@@ -1566,7 +1564,7 @@ impl CursorImpl {
                 let child = if !is_bin {
                     match &*g {
                         TreeNode::Internal(n) => {
-                            n.entries.last().and_then(|e| e.child.clone())
+                            n.get_child(n.entries.len().saturating_sub(1))
                         }
                         _ => None,
                     }
@@ -2600,7 +2598,7 @@ impl CursorImpl {
                                     }
                                 }
                             }
-                            n.entries.get(idx).and_then(|e| e.child.clone())
+                            n.get_child(idx)
                         }
                         _ => None,
                     }
@@ -4410,7 +4408,7 @@ mod tests {
                                     break;
                                 }
                             }
-                            n.entries[idx].child.clone()
+                            n.get_child(idx)
                         }
                     }
                 };
