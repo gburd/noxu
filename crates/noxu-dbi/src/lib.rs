@@ -33,6 +33,7 @@ mod error;
 mod file_manager_scanner;
 mod get_mode;
 mod memory_budget;
+pub mod name_ln_codec;
 mod node_sequence;
 mod operation;
 mod operation_status;

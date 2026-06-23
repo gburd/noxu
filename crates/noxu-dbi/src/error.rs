@@ -18,6 +18,30 @@ pub enum DbiError {
     #[error("database already exists: {0}")]
     DatabaseExists(String),
 
+    /// DBI-14: the comparator supplied on open does not match the comparator
+    /// identity persisted in the database record, and the corresponding
+    /// override flag was not set.
+    ///
+    /// Mirrors JE's comparator mismatch semantics: a database whose keys are
+    /// ordered by a persisted comparator must be reopened with a matching
+    /// comparator, or its sort order would be silently corrupted.
+    /// (`DatabaseImpl.ComparatorReader` / `setOverrideBtreeComparator`).
+    #[error(
+        "comparator mismatch for database '{name}': persisted {kind} \
+         comparator identity {persisted:?} but configured {configured:?} \
+         (set the override flag to replace it)"
+    )]
+    ComparatorMismatch {
+        /// Database name.
+        name: String,
+        /// "btree" or "duplicate".
+        kind: &'static str,
+        /// Identity persisted in the database record (None = byte order).
+        persisted: Option<String>,
+        /// Identity supplied in this open's config (None = byte order).
+        configured: Option<String>,
+    },
+
     /// Database cannot be deleted or renamed while handles are open.
     ///
     /// Thrown when

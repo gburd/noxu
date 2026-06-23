@@ -327,6 +327,63 @@ fn default_duplicate_order_is_ascending_byte_order() {
     assert_eq!(datas, vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
 }
 
+// Reopen of a sorted-dup DB with a custom dup comparator must preserve the
+// dup order (the recovery resort path, DBI-14).
+#[test]
+fn reopen_sorted_dup_with_dup_comparator_preserves_order() {
+    let dir = TempDir::new().unwrap();
+    let dup_id = "rev_dup";
+    {
+        let e = env(&dir);
+        let dup_cmp = Comparator::new(dup_id, |a: &[u8], b: &[u8]| b.cmp(a));
+        let cfg = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true)
+            .with_sorted_duplicates(true)
+            .with_duplicate_comparator(dup_cmp);
+        let db = e.open_database(None, "dup", &cfg).unwrap();
+        for d in [b"a".as_ref(), b"c", b"b", b"e", b"d"] {
+            db.put(
+                None,
+                &DatabaseEntry::from_bytes(b"k"),
+                &DatabaseEntry::from_bytes(d),
+            )
+            .unwrap();
+        }
+        drop(db);
+        e.close().unwrap();
+    }
+
+    let e = env(&dir);
+    let dup_cmp = Comparator::new(dup_id, |a: &[u8], b: &[u8]| b.cmp(a));
+    let cfg = DatabaseConfig::new()
+        .with_allow_create(false)
+        .with_transactional(true)
+        .with_sorted_duplicates(true)
+        .with_duplicate_comparator(dup_cmp);
+    let db = e.open_database(None, "dup", &cfg).unwrap();
+    let mut cur = db.open_cursor(None, None).unwrap();
+    let mut key = DatabaseEntry::new();
+    let mut data = DatabaseEntry::new();
+    let mut datas = Vec::new();
+    let mut s = cur.get(&mut key, &mut data, Get::First, None).unwrap();
+    while s == OperationStatus::Success {
+        datas.push(data.data().to_vec());
+        s = cur.get(&mut key, &mut data, Get::Next, None).unwrap();
+    }
+    assert_eq!(
+        datas,
+        vec![
+            b"e".to_vec(),
+            b"d".to_vec(),
+            b"c".to_vec(),
+            b"b".to_vec(),
+            b"a".to_vec()
+        ],
+        "reopened sorted-dup DB must keep dup-comparator order"
+    );
+}
+
 // Sanity: identity-only equality of the public Comparator type.
 #[test]
 fn comparator_equality_is_by_identity() {

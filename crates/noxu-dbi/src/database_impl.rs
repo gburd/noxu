@@ -433,11 +433,13 @@ impl DatabaseImpl {
         self.entry_count.store(count, std::sync::atomic::Ordering::Relaxed);
         // Transfer the key comparator from the current tree (if any) to the
         // recovered tree — RecoveryManager builds trees without db-level config.
+        let mut had_comparator = false;
         if let Some(ref current_arc) = self.real_tree
             && let Ok(mut current) = current_arc.write()
             && let Some(cmp) = current.take_comparator()
         {
             tree.set_comparator(cmp);
+            had_comparator = true;
         }
         // Re-apply the key-prefixing flag to the recovered tree.  The
         // recovered Tree is built by RecoveryManager with key_prefixing=false
@@ -446,6 +448,15 @@ impl DatabaseImpl {
         // all post-recovery inserts. (JE DatabaseImpl.getKeyPrefixing is read
         // from persistent DB metadata, so it survives recovery.)
         tree.set_key_prefixing(self.flags & PREFIXING_ENABLED != 0);
+        // DBI-14: recovery redo lays keys out in unsigned-byte order (it has
+        // no access to the application comparator), so re-sort the recovered
+        // tree under the now-attached comparator.  Without this, a database
+        // with a custom B-tree comparator (or a sorted-dup DB whose composite
+        // keys diverge from byte order) would binary-search a wrongly-ordered
+        // tree after reopen.
+        if had_comparator {
+            tree.resort_under_comparator();
+        }
         self.real_tree = Some(Arc::new(RwLock::new(tree)));
     }
 

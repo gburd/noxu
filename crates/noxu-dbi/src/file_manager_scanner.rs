@@ -341,11 +341,20 @@ impl FileManagerLogScanner {
                         // mapping-tree undo pass can remove NameLNs whose
                         // creating transaction aborted.
                         let txn_id = r.txn_id.map(|id| id.unsigned_abs());
+                        // DBI-14: decode the optional comparator identities
+                        // that follow the db_id.  Pre-DBI-14 entries are
+                        // exactly 8 bytes and decode to (None, None).
+                        let (btree_comparator_id, dup_comparator_id) =
+                            crate::name_ln_codec::decode_comparator_ids(
+                                &data_bytes[8..],
+                            );
                         Some(LogEntry::NameLn(noxu_recovery::NameLnRecord {
                             name,
                             db_id,
                             is_deleted: false,
                             txn_id,
+                            btree_comparator_id,
+                            dup_comparator_id,
                         }))
                     } else {
                         None
@@ -358,6 +367,8 @@ impl FileManagerLogScanner {
                         db_id: 0,
                         is_deleted: true,
                         txn_id: None,
+                        btree_comparator_id: None,
+                        dup_comparator_id: None,
                     }))
                 }
             }
