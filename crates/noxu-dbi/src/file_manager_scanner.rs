@@ -14,16 +14,17 @@ use noxu_log::{
     FileManager,
     checksum::ChecksumValidator,
     entry::{
-        BinDeltaLogEntry, InLogEntry, LnLogEntry, TxnEndEntry, TxnPrepareEntry,
+        BinDeltaLogEntry, FileSummaryLnEntry, InLogEntry, LnLogEntry,
+        TxnEndEntry, TxnPrepareEntry,
     },
     entry_header::{CHECKSUM_BYTES, MAX_HEADER_SIZE, MIN_HEADER_SIZE},
     entry_type::LogEntryType,
     file_header::FILE_HEADER_SIZE,
 };
 use noxu_recovery::{
-    CheckpointEnd, CheckpointStart, CkptEndRecord, CkptStartRecord, InRecord,
-    LnOperation, LnRecord, LogEntry, LogScanner, PositionedEntry,
-    TxnAbortRecord, TxnCommitRecord, TxnPrepareRecord,
+    CheckpointEnd, CheckpointStart, CkptEndRecord, CkptStartRecord,
+    FileSummaryRecord, InRecord, LnOperation, LnRecord, LogEntry, LogScanner,
+    PositionedEntry, TxnAbortRecord, TxnCommitRecord, TxnPrepareRecord,
 };
 use noxu_util::{Lsn, NULL_LSN};
 
@@ -398,6 +399,29 @@ impl FileManagerLogScanner {
                 }))
             }
 
+            LogEntryType::FileSummaryLN => {
+                // CLN-4 / C7: read the persisted per-file utilization summary
+                // back so recovery can rebuild the UtilizationProfile.
+                let e = FileSummaryLnEntry::read_from_log(&payload).ok()?;
+                Some(LogEntry::FileSummary(FileSummaryRecord {
+                    file_number: e.file_number as u32,
+                    lsn: NULL_LSN, // Filled in by caller.
+                    total_count: e.total_count,
+                    total_size: e.total_size,
+                    total_in_count: e.total_in_count,
+                    total_in_size: e.total_in_size,
+                    total_ln_count: e.total_ln_count,
+                    total_ln_size: e.total_ln_size,
+                    max_ln_size: e.max_ln_size,
+                    obsolete_in_count: e.obsolete_in_count,
+                    obsolete_ln_count: e.obsolete_ln_count,
+                    obsolete_ln_size: e.obsolete_ln_size,
+                    obsolete_ln_size_counted: e.obsolete_ln_size_counted,
+                    obsolete_offset_count: e.obsolete_offset_count,
+                    obsolete_offset_data: e.obsolete_offset_data,
+                }))
+            }
+
             // Everything else (FileHeader, Trace, MapLN, etc.) ─
             _ => None,
         }
@@ -721,6 +745,9 @@ impl FileManagerLogScanner {
                                     r.lsn = entry_lsn;
                                 }
                                 LogEntry::RollbackStart(r) => {
+                                    r.lsn = entry_lsn;
+                                }
+                                LogEntry::FileSummary(r) => {
                                     r.lsn = entry_lsn;
                                 }
                                 LogEntry::RollbackEnd(r) => {

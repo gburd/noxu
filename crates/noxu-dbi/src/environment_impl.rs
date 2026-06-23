@@ -453,6 +453,13 @@ impl EnvironmentImpl {
         let mut recovered_ckpt_start: noxu_util::Lsn = NULL_LSN;
         let mut recovered_ckpt_end: noxu_util::Lsn = NULL_LSN;
         let mut recovered_ckpt_id: Option<u64> = None;
+        // CLN-4: per-file utilization summaries rebuilt from persisted
+        // FileSummaryLN records, used to seed the cleaner's profile so it
+        // sees real utilization immediately after restart.
+        let mut rebuilt_file_summaries: HashMap<
+            u32,
+            noxu_recovery::RebuiltFileSummary,
+        > = HashMap::new();
 
         // Initialize the WAL (LogManager) for writable environments.
         // Read-only environments don't need to write log entries.
@@ -593,6 +600,8 @@ impl EnvironmentImpl {
             recovered_ckpt_end = recovery_info.checkpoint_end_lsn;
             recovered_ckpt_id = recovery_info.recovered_checkpoint_id;
             recovered_prepared_lns = recovery_info.prepared_txn_lns;
+            // CLN-4: stash the rebuilt per-file utilization summaries.
+            rebuilt_file_summaries = recovery_info.rebuilt_file_summaries;
             // X-14 / X-1: stash VLSN rebuild data.
             recovery_vlsns = recovery_info.recovered_vlsns;
             recovery_rollback_matchpoint =
@@ -882,6 +891,41 @@ impl EnvironmentImpl {
             Arc::new(c)
         });
 
+        // CLN-4: seed the cleaner's UtilizationProfile from the per-file
+        // summaries recovery rebuilt from persisted FileSummaryLN records.
+        // After this the cleaner's get_file_summary_map sees real utilization
+        // IMMEDIATELY after restart (no re-warm-from-live-writes lag).
+        //
+        // JE: UtilizationProfile.populateCache installs the FileSummaryLN
+        // records into fileSummaryMap during recovery; the cleaner then reads
+        // them via getFileSummaryMap.
+        if let Some(ref c) = cleaner
+            && !rebuilt_file_summaries.is_empty()
+        {
+            let mut seed: hashbrown::HashMap<u32, noxu_cleaner::FileSummary> =
+                hashbrown::HashMap::with_capacity(rebuilt_file_summaries.len());
+            for (file, r) in &rebuilt_file_summaries {
+                seed.insert(
+                    *file,
+                    noxu_cleaner::FileSummary {
+                        total_count: r.total_count,
+                        total_size: r.total_size,
+                        total_in_count: r.total_in_count,
+                        total_in_size: r.total_in_size,
+                        total_ln_count: r.total_ln_count,
+                        total_ln_size: r.total_ln_size,
+                        max_ln_size: r.max_ln_size,
+                        obsolete_in_count: r.obsolete_in_count,
+                        obsolete_ln_count: r.obsolete_ln_count,
+                        obsolete_ln_size: r.obsolete_ln_size,
+                        obsolete_ln_size_counted: r.obsolete_ln_size_counted,
+                        ..Default::default()
+                    },
+                );
+            }
+            c.seed_profile(seed);
+        }
+
         // Build the checkpointer, wired to the LogManager and the primary
         // tree, for writable environments.  The db_id=1 convention matches
         // the default single database used by the primary tree.
@@ -929,6 +973,12 @@ impl EnvironmentImpl {
             // last node/db/txn ids into CheckpointEnd (txn-id via the wired
             // txn_manager, node-id via the tree-wide counter).
             builder = builder.with_id_sources(Arc::clone(&next_db_id));
+            // C7/CLN-4: wire the live UtilizationTracker so persist_file_summaries
+            // writes real FileSummaryLN WAL entries at each checkpoint, which
+            // recovery reads back to rebuild the profile after restart.
+            if let Some(ref tracker) = utilization_tracker {
+                builder = builder.with_utilization_tracker(Arc::clone(tracker));
+            }
             Arc::new(builder)
         });
 

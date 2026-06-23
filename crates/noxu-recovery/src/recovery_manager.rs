@@ -38,7 +38,7 @@ use crate::error::Result;
 use crate::log_scanner::{
     LnOperation, LnRecord, LogEntry, LogScanner, PositionedEntry,
 };
-use crate::recovery_info::RecoveryInfo;
+use crate::recovery_info::{RebuiltFileSummary, RecoveryInfo};
 use crate::rollback_tracker::RollbackTracker;
 use hashbrown::HashMap;
 use noxu_util::{Lsn, NULL_LSN};
@@ -485,7 +485,7 @@ impl RecoveryManager {
         // Phase 1: Analysis — build dirty-IN map and transaction sets
         // ------------------------------------------------------------------
         self.set_progress(RecoveryProgress::BuildTree);
-        let analysis = self.run_analysis(scanner)?;
+        let mut analysis = self.run_analysis(scanner)?;
 
         // Transfer analysis results into RecoveryInfo
         self.info.checkpoint_start_lsn = analysis.checkpoint_start_lsn;
@@ -528,7 +528,7 @@ impl RecoveryManager {
         // Phase 3: Undo — reverse uncommitted LNs
         // ------------------------------------------------------------------
         self.set_progress(RecoveryProgress::UndoLNs);
-        self.run_undo(scanner, &analysis, tree)?;
+        self.run_undo(scanner, &mut analysis, tree)?;
 
         // ------------------------------------------------------------------
         // XA in-doubt recovery: surface prepared txns to the env layer.
@@ -536,6 +536,12 @@ impl RecoveryManager {
         self.info.prepared_txn_lns = self.collect_prepared_txn_lns(&analysis);
         self.info.recovered_prepared_txns =
             analysis.prepared_txns.values().cloned().collect();
+
+        // CLN-4 / REC-Z: propagate the rebuilt utilization profile (seeded
+        // from persisted FileSummaryLN during analysis + the rolled-back LN
+        // versions counted obsolete during run_undo) to the env layer.
+        self.info.rebuilt_file_summaries =
+            std::mem::take(&mut analysis.rebuilt_file_summaries);
 
         // ------------------------------------------------------------------
         // Done
@@ -691,7 +697,7 @@ impl RecoveryManager {
         self.run_redo_all(scanner, &analysis, trees)?;
 
         self.set_progress(RecoveryProgress::UndoLNs);
-        self.run_undo_all(scanner, &analysis, trees)?;
+        self.run_undo_all(scanner, &mut analysis, trees)?;
 
         // X-1: record the minimum rollback matchpoint so ReplicatedEnvironment
         // can truncate the VLSN index to match the recovered B-tree state.
@@ -707,6 +713,15 @@ impl RecoveryManager {
         // DBI-14: propagate persisted comparator identities.
         self.info.recovered_db_comparators =
             analysis.recovered_db_comparators.clone();
+
+        // CLN-4: the per-file utilization profile was rebuilt INLINE during
+        // run_analysis (from persisted FileSummaryLN records + obsolete
+        // counting for LN supersessions written after each file's last
+        // FileSummaryLN).  Propagate it to the env layer, which seeds the
+        // cleaner's UtilizationProfile so the cleaner sees real utilization
+        // immediately after restart.
+        self.info.rebuilt_file_summaries =
+            std::mem::take(&mut analysis.rebuilt_file_summaries);
 
         self.set_progress(RecoveryProgress::Complete);
         Ok(self.info.clone())
@@ -1097,7 +1112,7 @@ impl RecoveryManager {
     fn run_undo_all(
         &mut self,
         scanner: &dyn LogScanner,
-        analysis: &AnalysisResult,
+        analysis: &mut AnalysisResult,
         trees: &mut HashMap<u64, noxu_tree::Tree>,
     ) -> Result<()> {
         let last_used = self.info.last_used_lsn;
@@ -1123,6 +1138,13 @@ impl RecoveryManager {
             first_active
         };
         let mut rollback_chains = rollback_chains;
+        // REC-Z: collect the LSNs of LNs reverted via the rollback TxnChain
+        // (chain.pop / apply_revert_info).  Each rolled-back LN version is now
+        // logically truncated from the log, so JE counts it obsolete
+        // (RollbackTracker.countObsolete -> countObsoleteUnconditional inexact).
+        // We merge them into analysis.rebuilt_file_summaries after the scan so
+        // the env seeds the cleaner's profile with these obsolete bytes too.
+        let mut rolled_back_obsolete: Vec<Lsn> = Vec::new();
         let entries = scanner.scan_backward(last_used, stop);
         for pe in &entries {
             if let LogEntry::Ln(rec) = &pe.entry {
@@ -1145,6 +1167,10 @@ impl RecoveryManager {
                     {
                         Self::apply_revert_info(t, scanner, rec, &ri);
                         self.stats.lns_undone += 1;
+                        // REC-Z: this LN version was rolled back (logically
+                        // truncated); count it obsolete.  JE
+                        // RollbackTracker.countObsolete(undoLsn=reader.getLastLsn()).
+                        rolled_back_obsolete.push(pe.lsn);
                     }
                     // REP-1 STEP 4: for an OPEN-ENDED period (no RollbackEnd),
                     // the rollback's invisible-marking may not be durable; (re-)
@@ -1259,6 +1285,19 @@ impl RecoveryManager {
                     }
                 }
             }
+        }
+
+        // REC-Z: merge the rolled-back LN versions into the rebuilt utilization
+        // profile as obsolete LNs (inexact: count only, no offset, size 0 —
+        // these invisible entries are never processed by the cleaner, so an
+        // offset would be wasted).  JE RollbackTracker.countObsolete uses
+        // countObsoleteUnconditional with countExact=false.
+        for lsn in &rolled_back_obsolete {
+            analysis
+                .rebuilt_file_summaries
+                .entry(lsn.file_number())
+                .or_default()
+                .obsolete_ln_count += 1;
         }
         Ok(())
     }
@@ -1437,6 +1476,15 @@ impl RecoveryManager {
         let rollback_tracker = &mut self.rollback_tracker;
         let result_ref = &mut result;
 
+        // CLN-4: collect the data to rebuild the UtilizationProfile INLINE
+        // during this single analysis pass (JE UtilizationProfile.populateCache
+        // happens during the recovery read, not a separate scan).  `fsln`:
+        // latest FileSummaryLN per file + its LSN (last-write-wins in LSN
+        // order).  `obsolete_after`: (old_file, new_lsn) pairs from LN
+        // abort_lsn pointers, resolved against `fsln` after the scan.
+        let mut fsln: HashMap<u32, (RebuiltFileSummary, Lsn)> = HashMap::new();
+        let mut obsolete_after: Vec<(u32, Lsn)> = Vec::new();
+
         let mut process = |pe: PositionedEntry| {
             let entry_lsn = pe.lsn;
             match pe.entry {
@@ -1479,6 +1527,15 @@ impl RecoveryManager {
                 LogEntry::Ln(rec) => {
                     let db_id = rec.db_id;
                     let txn_id = rec.txn_id;
+
+                    // CLN-4: a non-null abort_lsn names the prior version this
+                    // LN supersedes; remember (old_file, new_lsn) so we can
+                    // count it obsolete after the scan IFF that file's last
+                    // FileSummaryLN is prior to this LN (countObsoleteIfUncounted).
+                    if rec.abort_lsn != NULL_LSN {
+                        obsolete_after
+                            .push((rec.abort_lsn.file_number(), entry_lsn));
+                    }
 
                     // Move rec into redo_entries — no clone, no Arc bump.
                     redo_entries.push((entry_lsn, rec));
@@ -1635,10 +1692,56 @@ impl RecoveryManager {
                     // CkptStart is noted during find_last_checkpoint; we do
                     // not need to act on it again during analysis.
                 }
+
+                LogEntry::FileSummary(rec) => {
+                    // CLN-4 / C7 (populateCache): the latest FileSummaryLN per
+                    // file wins (LSN-ascending scan order).  Remember its LSN
+                    // as the file's "last logged FileSummaryLN"
+                    // (saveLastLoggedFileSummaryLN).
+                    fsln.insert(
+                        rec.file_number,
+                        (
+                            RebuiltFileSummary {
+                                total_count: rec.total_count,
+                                total_size: rec.total_size,
+                                total_in_count: rec.total_in_count,
+                                total_in_size: rec.total_in_size,
+                                total_ln_count: rec.total_ln_count,
+                                total_ln_size: rec.total_ln_size,
+                                max_ln_size: rec.max_ln_size,
+                                obsolete_in_count: rec.obsolete_in_count,
+                                obsolete_ln_count: rec.obsolete_ln_count,
+                                obsolete_ln_size: rec.obsolete_ln_size,
+                                obsolete_ln_size_counted: rec
+                                    .obsolete_ln_size_counted,
+                            },
+                            entry_lsn,
+                        ),
+                    );
+                }
             }
         };
 
         scanner.scan_forward_fn(scan_start, scan_end, &mut process);
+
+        // CLN-4: finalise the rebuilt UtilizationProfile from the inline-
+        // collected FileSummaryLN records + obsolete-after-last-FSLN counting.
+        // (RecoveryUtilizationTracker.countObsoleteIfUncounted: a prior
+        // version is counted obsolete only if its file's last FileSummaryLN
+        // precedes the superseding LN, so the FSLN did not already include it.)
+        if !fsln.is_empty() {
+            for (old_file, new_lsn) in &obsolete_after {
+                if let Some((summary, fsln_lsn)) = fsln.get_mut(old_file) {
+                    // Uncounted iff the file's last FileSummaryLN precedes the
+                    // new LN.  size left uncounted (recovery, LN not resident).
+                    if *fsln_lsn < *new_lsn {
+                        summary.obsolete_ln_count += 1;
+                    }
+                }
+            }
+            result.rebuilt_file_summaries =
+                fsln.into_iter().map(|(f, (s, _))| (f, s)).collect();
+        }
 
         Ok(result)
     }
@@ -2179,7 +2282,7 @@ impl RecoveryManager {
     fn run_undo(
         &mut self,
         scanner: &dyn LogScanner,
-        analysis: &AnalysisResult,
+        analysis: &mut AnalysisResult,
         mut tree: Option<&mut noxu_tree::Tree>,
     ) -> Result<()> {
         let last_used = self.info.last_used_lsn;
@@ -2224,6 +2327,11 @@ impl RecoveryManager {
 
         let entries = scanner.scan_backward(last_used, stop);
 
+        // REC-Z: LSNs of LNs reverted via the rollback TxnChain (logically
+        // truncated), counted obsolete after the scan.  JE
+        // RollbackTracker.countObsolete(undoLsn).
+        let mut rolled_back_obsolete: Vec<Lsn> = Vec::new();
+
         for pe in &entries {
             // Commit/Abort records seen during backward scan are already
             // accounted for in the analysis pass.  We ignore them here.
@@ -2252,6 +2360,8 @@ impl RecoveryManager {
                     {
                         Self::apply_revert_info(t, scanner, rec, &ri);
                         self.stats.lns_undone += 1;
+                        // REC-Z: this rolled-back LN version is now obsolete.
+                        rolled_back_obsolete.push(pe.lsn);
                     }
                     // REP-1 STEP 4: open-ended period → (re-)mark invisible.
                     if !period.is_complete() {
@@ -2407,6 +2517,18 @@ impl RecoveryManager {
                 // Collect for external inspection in tests.
                 self.undo_entries.push((pe.lsn, rec.clone()));
             }
+        }
+
+        // REC-Z: merge the rolled-back LN versions into the rebuilt
+        // utilization profile as obsolete LNs (inexact: count only, no offset,
+        // size 0).  JE RollbackTracker.countObsolete uses
+        // countObsoleteUnconditional with countExact=false.
+        for lsn in &rolled_back_obsolete {
+            analysis
+                .rebuilt_file_summaries
+                .entry(lsn.file_number())
+                .or_default()
+                .obsolete_ln_count += 1;
         }
 
         Ok(())
@@ -3631,7 +3753,7 @@ mod tests {
         );
 
         let mut mgr = RecoveryManager::new();
-        mgr.recover(&mut scanner, Some(&mut tree), false).unwrap();
+        let info = mgr.recover(&mut scanner, Some(&mut tree), false).unwrap();
 
         // The tree must now hold v1 (reverted), NOT v2 and NOT empty.
         let res = tree.search(b"K").expect("search should not fail");
@@ -3646,6 +3768,19 @@ mod tests {
             mgr.get_stats().lns_undone,
             1,
             "exactly one logrec (v2) rolled back"
+        );
+        // REC-Z: the rolled-back v2 @ file 0 must be counted obsolete in the
+        // rebuilt utilization profile (JE RollbackTracker.countObsolete).
+        // The env seeds the cleaner with this, so a crash that rolls back a
+        // tail of writes still leaves the cleaner aware of those dead bytes.
+        let f0 = info
+            .rebuilt_file_summaries
+            .get(&0)
+            .expect("REC-Z: file 0 must appear obsolete after the rollback");
+        assert!(
+            f0.obsolete_ln_count >= 1,
+            "REC-Z: the rolled-back LN version must be counted obsolete; got {}",
+            f0.obsolete_ln_count
         );
     }
 
