@@ -203,6 +203,20 @@ pub struct Tree {
     /// access → `moveBack`, removal → `remove`.
     pub in_list_listener: Option<Arc<dyn InListListener>>,
 
+    /// Optional log manager so an evicted root IN can be re-materialized from
+    /// its persisted `root_log_lsn` on the next access (EV-14, piece B).
+    ///
+    /// JE's `Tree` reaches the log via `database.getEnv().getLogManager()`;
+    /// `Tree.getRootINRootAlreadyLatched` calls `root.fetchTarget(...)` which
+    /// reads the root IN back from its `ChildReference` LSN when the in-memory
+    /// target is null (Tree.java:477-516, ChildReference.fetchTarget).  Noxu
+    /// has no env back-reference here, so the log manager is installed
+    /// directly (the same one-way wiring as `in_list_listener`).  When `None`
+    /// (unit tests with no environment), an evicted root cannot be re-fetched
+    /// — but `evict_root` refuses to evict without a log manager, so the root
+    /// is never made non-resident in that configuration.
+    pub log_manager: Option<Arc<noxu_log::LogManager>>,
+
     /// Capacity hint for the recovery redo path.
     ///
     /// When non-zero, the first BIN created by `redo_insert` (the first-key
@@ -2321,6 +2335,14 @@ impl TreeNode {
         }
     }
 
+    /// Returns the node id of this node.
+    pub fn node_id(&self) -> u64 {
+        match self {
+            TreeNode::Internal(n) => n.node_id,
+            TreeNode::Bottom(b) => b.node_id,
+        }
+    }
+
     /// Faithful in-memory heap footprint of this node, in bytes.
     ///
     /// JE `IN.getBudgetedMemorySize()` (IN.java) returns the running
@@ -2670,6 +2692,7 @@ impl Tree {
             key_comparator: None,
             memory_counter: None,
             in_list_listener: None,
+            log_manager: None,
             redo_capacity_hint: 0,
             key_prefixing: false, // JE default: KEY_PREFIXING_DEFAULT = false
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH, // T-5
@@ -2689,6 +2712,15 @@ impl Tree {
     /// `Evictor.addBack`/`moveBack`/`remove`.
     pub fn set_in_list_listener(&mut self, listener: Arc<dyn InListListener>) {
         self.in_list_listener = Some(listener);
+    }
+
+    /// Installs the [`noxu_log::LogManager`] so an evicted root IN can be
+    /// re-materialized from its persisted LSN on the next access (EV-14).
+    ///
+    /// JE: the tree reaches the log through `database.getEnv().getLogManager()`
+    /// for `ChildReference.fetchTarget`.  Noxu installs it directly.
+    pub fn set_log_manager(&mut self, lm: Arc<noxu_log::LogManager>) {
+        self.log_manager = Some(lm);
     }
 
     /// T-5: set the compact-key threshold (`TREE_COMPACT_MAX_KEY_LENGTH` /
@@ -2745,6 +2777,7 @@ impl Tree {
             key_comparator: Some(comparator),
             memory_counter: None,
             in_list_listener: None,
+            log_manager: None,
             redo_capacity_hint: 0,
             key_prefixing: false,
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH, // T-5
@@ -2844,8 +2877,20 @@ impl Tree {
     ///
     /// Returns a cloned `Arc` rather than a reference so the caller does not
     /// hold the inner `RwLock` guard.
+    ///
+    /// EV-14: when the in-memory root has been evicted (`evict_root`) but a
+    /// persisted version exists (`root_log_lsn` set), this re-materializes it
+    /// from the log before returning — the faithful equivalent of JE
+    /// `Tree.getRootIN` always calling `root.fetchTarget(...)`.  Returns
+    /// `None` only for a genuinely empty tree (no resident root and no
+    /// persisted root LSN).
     pub fn get_root(&self) -> Option<Arc<RwLock<TreeNode>>> {
-        self.root.read().clone()
+        if let Some(r) = self.root.read().clone() {
+            return Some(r);
+        }
+        // Root not resident: re-fetch it from `root_log_lsn` if one exists
+        // (a no-op returning None when the tree was never populated).
+        self.fetch_root_from_log()
     }
 
     /// Returns the database ID.
@@ -3097,6 +3142,8 @@ impl Tree {
             // Upper IN: find the child slot with the largest key <= search
             // key, and capture the child Arc WHILE HOLDING the guard.
             // Slot 0 has a virtual key that compares as -infinity.
+            let parent_arc =
+                parking_lot::ArcRwLockReadGuard::rwlock(&guard).clone();
             let next_arc = match &*guard {
                 TreeNode::Internal(n) => {
                     if n.entries.is_empty() {
@@ -3106,18 +3153,28 @@ impl Tree {
                     // from slot 0 (which always qualifies because its key
                     // is the virtual -infinity key).
                     let idx = self.upper_in_floor_index(&n.entries, key);
-                    n.get_child(idx)?
+                    match n.get_child(idx) {
+                        // Resident child: keep the hand-over-hand fast path.
+                        Some(c) => {
+                            let next_guard = c.read_arc();
+                            drop(guard);
+                            guard = next_guard;
+                            continue;
+                        }
+                        // EV-14/EV-13: child evicted — re-fetch it from its
+                        // slot LSN (JE ChildReference.fetchTarget).  Must
+                        // drop the parent read guard to upgrade to a write
+                        // latch inside child_at_or_fetch.
+                        None => idx,
+                    }
                 }
                 TreeNode::Bottom(_) => {
                     unreachable!("is_bin() returned false above")
                 }
             };
-            // Take the child read lock BEFORE releasing the parent's read
-            // lock — this is the actual hand-over-hand step that closes
-            // the descender-vs-splitter race for the read path.
-            let next_guard = next_arc.read_arc();
             drop(guard);
-            guard = next_guard;
+            let child = self.child_at_or_fetch(&parent_arc, next_arc)?;
+            guard = child.read_arc();
         }
     }
 
@@ -3192,22 +3249,33 @@ impl Tree {
             }
 
             // Upper IN: same hand-over-hand descent as `Tree::search`.
-            let next_arc = match &*guard {
+            let parent_arc =
+                parking_lot::ArcRwLockReadGuard::rwlock(&guard).clone();
+            let next_idx = match &*guard {
                 TreeNode::Internal(n) => {
                     if n.entries.is_empty() {
                         return None;
                     }
                     // Slot 0 = virtual −∞; walk forward while entry.key ≤ key.
                     let idx = self.upper_in_floor_index(&n.entries, key);
-                    n.get_child(idx)?
+                    match n.get_child(idx) {
+                        Some(c) => {
+                            let next_guard = c.read_arc();
+                            drop(guard);
+                            guard = next_guard;
+                            continue;
+                        }
+                        // EV-14/EV-13: re-fetch an evicted child from its LSN.
+                        None => idx,
+                    }
                 }
                 TreeNode::Bottom(_) => {
                     unreachable!("is_bin() returned false above")
                 }
             };
-            let next_guard = next_arc.read_arc();
             drop(guard);
-            guard = next_guard;
+            let child = self.child_at_or_fetch(&parent_arc, next_idx)?;
+            guard = child.read_arc();
         }
     }
 
@@ -3360,20 +3428,29 @@ impl Tree {
             }
 
             // Upper IN: same descent as search().
-            let next_arc = match &*guard {
+            let parent_arc =
+                parking_lot::ArcRwLockReadGuard::rwlock(&guard).clone();
+            let next_idx = match &*guard {
                 TreeNode::Internal(n) => {
                     if n.entries.is_empty() {
                         return None;
                     }
                     let idx = self.upper_in_floor_index(&n.entries, key);
-                    n.get_child(idx)?
+                    match n.get_child(idx) {
+                        Some(c) => {
+                            let next_guard = c.read_arc();
+                            drop(guard);
+                            guard = next_guard;
+                            continue;
+                        }
+                        None => idx, // EV-14/EV-13: re-fetch below.
+                    }
                 }
                 TreeNode::Bottom(_) => unreachable!(),
             };
-            // Take child read lock BEFORE releasing parent's.
-            let next_guard = next_arc.read_arc();
             drop(guard);
-            guard = next_guard;
+            let child = self.child_at_or_fetch(&parent_arc, next_idx)?;
+            guard = child.read_arc();
         }
     }
 
@@ -3450,22 +3527,29 @@ impl Tree {
             }
 
             // Upper IN: descend as in first_entry_at_or_after / search.
-            let next_arc = match &*guard {
+            let parent_arc =
+                parking_lot::ArcRwLockReadGuard::rwlock(&guard).clone();
+            let next_idx = match &*guard {
                 TreeNode::Internal(n) => {
                     if n.entries.is_empty() {
                         return None;
                     }
                     let idx = self.upper_in_floor_index(&n.entries, key);
-                    n.get_child(idx)?
+                    match n.get_child(idx) {
+                        Some(c) => {
+                            let next_guard = c.read_arc();
+                            drop(guard);
+                            guard = next_guard;
+                            continue;
+                        }
+                        None => idx, // EV-14/EV-13: re-fetch below.
+                    }
                 }
                 TreeNode::Bottom(_) => unreachable!(),
             };
-            // Acquire child's read lock BEFORE releasing the parent's — this
-            // closes the window where a concurrent split could restructure
-            // the path between the two observations.
-            let next_guard = next_arc.read_arc();
             drop(guard);
-            guard = next_guard;
+            let child = self.child_at_or_fetch(&parent_arc, next_idx)?;
+            guard = child.read_arc();
         }
     }
 
@@ -5627,6 +5711,25 @@ impl Tree {
         // JE: long evictedBytes = target.getBudgetedMemorySize().
         let freed = child.read().budgeted_memory_size();
 
+        // EV-14 re-fetch correctness: the parent slot LSN must point at the
+        // child's CURRENT on-disk version so `child_at_or_fetch` re-reads the
+        // right bytes (JE `IN.updateEntry(idx, newLsn)` is called whenever a
+        // child is logged; the parent slot LSN tracks the child's LSN).  The
+        // evictor only fully evicts/detaches a CLEAN BIN (it logs+clears dirty
+        // BINs via flush_dirty_node_to_log first, which sets `last_full_lsn`),
+        // so the child's authoritative LSN is its `last_full_lsn`.  Stamp it
+        // into the parent slot before dropping the child; if it is null (the
+        // child was never logged) leave the existing slot LSN intact rather
+        // than writing a null — a never-logged clean child cannot occur on
+        // the evict path, but be conservative.
+        let child_full_lsn = match &*child.read() {
+            TreeNode::Bottom(b) => b.last_full_lsn,
+            TreeNode::Internal(_) => NULL_LSN,
+        };
+        if child_full_lsn != NULL_LSN {
+            p.set_lsn(child_index, child_full_lsn);
+        }
+
         // Mark the parent dirty: the slot's in-memory target changed (JE
         // detachNode sets dirty when updateLsn; we conservatively mark dirty
         // so the parent is re-logged with the now-non-resident slot).
@@ -5650,6 +5753,224 @@ impl Tree {
         // (the very drift EV-13 fixes, in the other direction).  We only
         // measure-and-free; the caller does the single counter update.
         freed
+    }
+
+    /// Evict the root IN of this tree (EV-14).
+    ///
+    /// Faithful port of JE `Evictor.evictRoot` (Evictor.java:3050-3110) plus
+    /// the `RootEvictor.doWork` + `Tree.withRootLatchedExclusive` framing
+    /// (Evictor.java:2529-2576, Tree.java:508-517).  Unlike a normal IN, the
+    /// root has no parent slot to detach from; instead the *tree's* root
+    /// reference is the equivalent of the `RootChildReference`, so eviction:
+    ///
+    ///   1. Latches the root reference exclusively (`rootLatch.acquireExclusive`
+    ///      via `withRootLatchedExclusive`).
+    ///   2. Re-checks that the root is still resident and still evictable
+    ///      (no resident children, no pinned BIN — JE `RootEvictor.doWork`
+    ///      re-latches and re-checks `rootIN == target && rootIN.isRoot()`).
+    ///   3. If the root is dirty, LOGS it first so the on-disk version is
+    ///      current and updates `root_log_lsn` to the new LSN (JE
+    ///      `evictRoot`: `long newLsn = target.log(...); rootRef.setLsn(newLsn)`).
+    ///   4. Clears the in-memory root (`rootRef.clearTarget()` — JE leaves the
+    ///      `ChildReference` LSN intact; here `root_log_lsn` is that LSN) and
+    ///      `note_removed`s it from the evictor LRU (JE `inList.remove(target)`).
+    ///
+    /// On the next access `fetch_root_from_log` re-materializes the root from
+    /// `root_log_lsn` (JE `Tree.getRootINRootAlreadyLatched` →
+    /// `root.fetchTarget`).
+    ///
+    /// # Conditions (eviction is REFUSED, returning `None`, when)
+    ///
+    /// * there is no log manager wired (the root could never be re-fetched),
+    /// * the tree has no resident root (already evicted),
+    /// * the root has any resident child (JE only evicts a childless root —
+    ///   the `hasCachedChildren` skip in `processTarget`; a root with cached
+    ///   children would orphan them, the EV-6 invariant),
+    /// * the root is a BIN pinned by a cursor (`cursor_count > 0`),
+    /// * the root is dirty but we have no clean persisted version AND logging
+    ///   it fails, or
+    /// * the root is clean but `root_log_lsn` is null (never logged — cannot
+    ///   be re-fetched; happens only for a brand-new unlogged tree).
+    ///
+    /// Returns `Some((freed_bytes, was_dirty))` on success, where `freed_bytes`
+    /// is the root's measured heap footprint (JE
+    /// `target.getBudgetedMemorySize()`) and `was_dirty` reports whether the
+    /// root had to be logged (JE `rootEvictor.flushed`, which drives
+    /// `nDirtyNodesEvicted` and `modifyDbRoot`).
+    pub fn evict_root(&self, db_id: u64) -> Option<(u64, bool)> {
+        // A root with no re-fetch path must never be made non-resident.
+        self.log_manager.as_ref()?;
+
+        // JE `Tree.withRootLatchedExclusive(rootEvictor)`: hold the root latch
+        // exclusively across the whole evict so no descender or splitter can
+        // observe/install a half-evicted root.  Acquiring `self.root.write()`
+        // is the Noxu equivalent (it is the lock guarding the root pointer).
+        let mut root_slot = self.root.write();
+        let root_arc = root_slot.as_ref()?.clone();
+
+        // JE `RootEvictor.doWork`: re-latch the target and re-check the
+        // conditions.  We hold the node guard for the duration.
+        let node_guard = root_arc.write();
+
+        // EV-6 / JE `processTarget` hasCachedChildren skip: a root with any
+        // resident child must NOT be evicted (it would orphan the child).
+        // EV-14 only evicts an *idle* root whose children are already
+        // non-resident (or which is itself a leaf BIN).
+        let (node_id, was_dirty, freed) = match &*node_guard {
+            TreeNode::Internal(n) => {
+                if !n.resident_children().is_empty() {
+                    return None; // has cached children — keep resident
+                }
+                (n.node_id, n.dirty, node_guard.budgeted_memory_size())
+            }
+            TreeNode::Bottom(b) => {
+                if b.cursor_count > 0 {
+                    return None; // pinned by a cursor — keep resident
+                }
+                (
+                    b.node_id,
+                    b.dirty || b.dirty_count() > 0,
+                    node_guard.budgeted_memory_size(),
+                )
+            }
+        };
+
+        // If dirty, log the root first so the on-disk version is current,
+        // then record the new LSN as the root's re-fetch point (JE
+        // `evictRoot`: target.log(...) + rootRef.setLsn(newLsn)).
+        if was_dirty {
+            let lm = self.log_manager.as_ref()?; // checked above; re-borrow
+            let node_bytes = node_guard.write_to_bytes();
+            let is_bin = node_guard.is_bin();
+            let entry = noxu_log::entry::in_log_entry::InLogEntry::new(
+                db_id, NULL_LSN, // prev_full_lsn
+                NULL_LSN, // prev_delta_lsn
+                node_bytes,
+            );
+            let mut buf = bytes::BytesMut::with_capacity(entry.log_size());
+            entry.write_to_log(&mut buf);
+            let entry_type = if is_bin {
+                noxu_log::LogEntryType::BIN
+            } else {
+                noxu_log::LogEntryType::IN
+            };
+            // flush_required = true so the root's bytes are durable before we
+            // drop the in-memory copy (JE logs synchronously in evictRoot).
+            let new_lsn = match lm.log(
+                entry_type,
+                &buf,
+                noxu_log::Provisional::No,
+                true,  // flush_required
+                false, // fsync at next checkpoint
+            ) {
+                Ok(l) => l,
+                Err(_) => return None, // could not log — keep the root resident
+            };
+            *self.root_log_lsn.write() = new_lsn;
+        } else {
+            // Clean root: it must already be re-fetchable.  If it was never
+            // logged (root_log_lsn null) we cannot evict it safely.
+            if *self.root_log_lsn.read() == NULL_LSN {
+                return None;
+            }
+        }
+
+        // JE `rootRef.clearTarget()` + `inList.remove(target)`: drop the
+        // in-memory root and remove it from the evictor LRU.  The root_log_lsn
+        // is the surviving `ChildReference` LSN used to re-fetch it.
+        drop(node_guard);
+        *root_slot = None;
+        drop(root_slot);
+        self.note_removed(node_id);
+
+        Some((freed, was_dirty))
+    }
+
+    /// Re-materialize an evicted root IN from its persisted `root_log_lsn`
+    /// (EV-14, piece B).
+    /// Faithful to JE `Tree.getRootINRootAlreadyLatched` (Tree.java:477-516)
+    /// which calls `root.fetchTarget(database, null)` when the in-memory
+    /// target is null.  Idempotent and cheap when the root is already
+    /// resident: returns the resident root without touching the log.
+    ///
+    /// Returns `None` only when the tree is genuinely empty (no resident root
+    /// AND `root_log_lsn` is null) or when the re-fetch fails (no log manager,
+    /// log read error, deserialize failure) — callers then see an empty tree,
+    /// never wrong data.
+    pub fn fetch_root_from_log(&self) -> Option<Arc<RwLock<TreeNode>>> {
+        // Fast path: root already resident.
+        if let Some(r) = self.root.read().clone() {
+            return Some(r);
+        }
+        // Take the write lock and re-check (another thread may have re-fetched
+        // it while we waited — JE upgrades the root latch the same way).
+        let mut root_slot = self.root.write();
+        if let Some(r) = root_slot.as_ref() {
+            return Some(r.clone());
+        }
+        let log_lsn = *self.root_log_lsn.read();
+        let node = self.fetch_node_from_log(log_lsn)?;
+        let node_id = node.node_id();
+        let arc = Arc::new(RwLock::new(node));
+        *root_slot = Some(arc.clone());
+        drop(root_slot);
+        // JE: a fetched IN is added back to the INList (Evictor LRU).
+        self.note_added(node_id);
+        Some(arc)
+    }
+
+    /// Return the resident child Arc for slot `idx` of `parent_arc`, fetching
+    /// it from its slot LSN and installing it if it is not resident (EV-14 /
+    /// EV-13 re-fetch on descent).
+    ///
+    /// Faithful to JE `ChildReference.fetchTarget` (and `IN.fetchTarget`):
+    /// when a slot's in-memory target is null but its LSN is valid, the node
+    /// is read back from the log and cached in the slot.  Installing the
+    /// fetched child requires the parent EX-latch, so this takes the parent
+    /// write lock; the fast path (child already resident) takes only a read
+    /// lock.
+    ///
+    /// Returns `None` only when the slot index is out of range, the slot has
+    /// no valid LSN, or the log read/deserialize fails — callers then treat
+    /// the descent as terminating in an empty subtree, never wrong data.
+    fn child_at_or_fetch(
+        &self,
+        parent_arc: &Arc<RwLock<TreeNode>>,
+        idx: usize,
+    ) -> Option<ChildArc> {
+        // Fast path: child already cached (read lock only).
+        {
+            let g = parent_arc.read();
+            if let TreeNode::Internal(n) = &*g {
+                if let Some(c) = n.get_child(idx) {
+                    return Some(c);
+                }
+            } else {
+                return None; // BINs have no IN children
+            }
+        }
+        // Slow path: fetch the child from its slot LSN under the parent
+        // EX-latch (JE installs the fetched target under the IN latch).
+        let mut g = parent_arc.write();
+        let TreeNode::Internal(n) = &mut *g else {
+            return None;
+        };
+        // Re-check: another thread may have fetched it while we upgraded.
+        if let Some(c) = n.get_child(idx) {
+            return Some(c);
+        }
+        if idx >= n.entries.len() {
+            return None;
+        }
+        let child_lsn = n.get_lsn(idx);
+        let node = self.fetch_node_from_log(child_lsn)?;
+        let node_id = node.node_id();
+        let arc: ChildArc = Arc::new(RwLock::new(node));
+        n.set_child(idx, Some(arc.clone()));
+        drop(g);
+        // JE: a fetched IN is added back to the INList (Evictor LRU).
+        self.note_added(node_id);
+        Some(arc)
     }
 
     /// Check whether a BIN node is a candidate for slot compression and,
@@ -5773,13 +6094,23 @@ impl Tree {
                 ));
             }
 
-            let next_arc = match &*guard {
+            let parent_arc =
+                parking_lot::ArcRwLockReadGuard::rwlock(&guard).clone();
+            let next_idx = match &*guard {
                 TreeNode::Internal(n) => {
                     if n.entries.is_empty() {
                         return None;
                     }
                     let idx = self.upper_in_floor_index(&n.entries, key);
-                    n.get_child(idx)?
+                    match n.get_child(idx) {
+                        Some(c) => {
+                            let next_guard = c.read_arc();
+                            drop(guard);
+                            guard = next_guard;
+                            continue;
+                        }
+                        None => idx, // EV-14/EV-13: re-fetch below.
+                    }
                 }
                 TreeNode::Bottom(_) => {
                     unreachable!("is_bin() returned false above")
@@ -5790,9 +6121,9 @@ impl Tree {
             // descender-vs-splitter window: a concurrent
             // split_child(parent, ..) takes parent.write(), which
             // blocks while we still hold parent.read().
-            let next_guard = next_arc.read_arc();
             drop(guard);
-            guard = next_guard;
+            let child = self.child_at_or_fetch(&parent_arc, next_idx)?;
+            guard = child.read_arc();
         }
     }
 
@@ -5887,6 +6218,58 @@ impl Tree {
         delta.key_prefix = base.key_prefix;
         delta.is_delta = false;
         delta.dirty = true;
+    }
+
+    /// Read an IN/BIN log entry at `log_lsn` and deserialise it into a
+    /// `TreeNode`, ready to be installed as a (re-fetched) resident node.
+    ///
+    /// JE `LogManager.getLogEntry(lsn)` + `IN.readFromLog` as used by
+    /// `ChildReference.fetchTarget` (the path that re-materializes a
+    /// non-resident node from its persisted LSN on descent) and by
+    /// `Tree.getRootINRootAlreadyLatched` for the root.  The freshly-fetched
+    /// node has no resident children (`TargetRep::None`); its own children, if
+    /// any, are re-fetched on demand the same way when the descent reaches
+    /// them.
+    ///
+    /// Returns `None` if the LSN is null, the log read fails, the entry is not
+    /// an IN/BIN, or deserialisation fails (the caller treats this as "node
+    /// unavailable" rather than panicking, matching the graceful-degradation
+    /// policy of `mutate_to_full_bin_from_log`).
+    fn fetch_node_from_log(&self, log_lsn: Lsn) -> Option<TreeNode> {
+        if log_lsn == NULL_LSN {
+            return None;
+        }
+        let lm = self.log_manager.as_ref()?;
+        let (entry_type, payload) = lm.read_entry(log_lsn).ok()?;
+        // The on-disk payload is an `InLogEntry` body (db_id | prev_full_lsn
+        // | prev_delta_lsn | len | node_data).  The recovery scanner strips
+        // this header before calling `recover_in_redo`; re-fetch must do the
+        // same so `deserialize_*` sees the bare node bytes.  JE
+        // `INLogEntry.readEntry` parses the same wrapper.
+        let in_entry =
+            noxu_log::entry::in_log_entry::InLogEntry::read_from_log(&payload)
+                .ok()?;
+        let node_data = &in_entry.node_data;
+        use noxu_log::LogEntryType;
+        match entry_type {
+            LogEntryType::BIN => {
+                Self::deserialize_bin(node_data).map(TreeNode::Bottom)
+            }
+            LogEntryType::IN => {
+                Self::deserialize_upper_in(node_data).map(TreeNode::Internal)
+            }
+            // BIN-deltas are never logged as the *root* version and are
+            // reconstituted by the BIN-delta path, not here.
+            _ => {
+                log::warn!(
+                    "fetch_node_from_log: expected IN/BIN entry at LSN {:?}, \
+                     got {:?}",
+                    log_lsn,
+                    entry_type
+                );
+                None
+            }
+        }
     }
 
     /// Reconstitute a BIN-delta into a full BIN by reading the base from log.
@@ -6565,22 +6948,33 @@ impl Tree {
                 return Some(current_arc);
             }
 
-            let next_arc = match &*guard {
+            let parent_arc = current_arc.clone();
+            let next_idx = match &*guard {
                 TreeNode::Internal(n) => {
                     if n.entries.is_empty() {
                         return None;
                     }
                     let idx = self.upper_in_floor_index(&n.entries, key);
-                    n.get_child(idx)?
+                    match n.get_child(idx) {
+                        Some(c) => {
+                            let next_guard = c.read_arc();
+                            drop(guard);
+                            current_arc = c;
+                            guard = next_guard;
+                            continue;
+                        }
+                        None => idx, // EV-14/EV-13: re-fetch below.
+                    }
                 }
                 TreeNode::Bottom(_) => {
                     unreachable!("is_bin() returned false above")
                 }
             };
             // Hand-over-hand: take child guard before dropping parent.
-            let next_guard = next_arc.read_arc();
             drop(guard);
-            current_arc = next_arc;
+            let child = self.child_at_or_fetch(&parent_arc, next_idx)?;
+            let next_guard = child.read_arc();
+            current_arc = child;
             guard = next_guard;
         }
     }
