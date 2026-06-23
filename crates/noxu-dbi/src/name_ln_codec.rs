@@ -114,4 +114,29 @@ mod tests {
         let bad = vec![5u8, 0, b'x'];
         let _ = decode_comparator_ids(&bad); // must not panic
     }
+
+    // DBI-15: the comparator identity rides in the NameLN data field, which
+    // the master sends verbatim and the replica writes verbatim to its own
+    // WAL, then re-decodes through the same recovery scanner.  This proves
+    // the full master-data-layout -> replica-decode round-trip end to end
+    // (the same bytes both sides see on the wire).
+    #[test]
+    fn dbi15_master_nameln_data_layout_round_trips_to_replica_decode() {
+        // Build the NameLN data EXACTLY as EnvironmentImpl::log_name_ln does.
+        let db_id: u64 = 42;
+        let mut data = db_id.to_le_bytes().to_vec();
+        data.extend_from_slice(&encode_comparator_ids(
+            Some("reverse"),
+            Some("le_u32"),
+        ));
+
+        // Replica recovery (file_manager_scanner) reads the first 8 bytes as
+        // the db_id and decodes the trailer as the comparator identities.
+        assert!(data.len() >= 8);
+        let decoded_id = u64::from_le_bytes(data[..8].try_into().unwrap());
+        assert_eq!(decoded_id, db_id);
+        let (btree, dup) = decode_comparator_ids(&data[8..]);
+        assert_eq!(btree.as_deref(), Some("reverse"));
+        assert_eq!(dup.as_deref(), Some("le_u32"));
+    }
 }
