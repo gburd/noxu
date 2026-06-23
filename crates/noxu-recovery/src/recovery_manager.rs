@@ -300,11 +300,7 @@ pub struct RecoveryManager {
 /// if (not found && !deletion) → insert into tree
 /// if (deletion)               → delete slot (if present)
 /// ```
-pub fn apply_redo_ln(
-    tree: &mut noxu_tree::Tree,
-    rec: &LnRecord,
-    lsn: Lsn,
-) {
+pub fn apply_redo_ln(tree: &mut noxu_tree::Tree, rec: &LnRecord, lsn: Lsn) {
     // Only replay into the matching database's tree.
     // Db-id check.
     if tree.get_database_id() != rec.db_id {

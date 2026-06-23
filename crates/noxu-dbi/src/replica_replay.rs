@@ -309,8 +309,8 @@ mod tests {
     }
 
     /// Open an env, open a database, return (env, db_id, tree_arc).
-    fn open_env_with_db(
-    ) -> (Arc<EnvironmentImpl>, u64, Arc<std::sync::RwLock<noxu_tree::Tree>>)
+    fn open_env_with_db()
+    -> (Arc<EnvironmentImpl>, u64, Arc<std::sync::RwLock<noxu_tree::Tree>>)
     {
         use crate::database_config::DatabaseConfig;
         let dir = tempfile::TempDir::new().unwrap();
