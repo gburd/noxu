@@ -22,6 +22,10 @@ pub struct TrackedFileSummary {
     modified: bool,
     /// Whether to track obsolete offset details.
     track_detail: bool,
+    /// Whether this summary is allowed to be flushed/evicted during cleaning.
+    /// JE `TrackedFileSummary.allowFlush` (default true); the cleaner pins a
+    /// file it is actively processing via `getUnflushableTrackedSummary`.
+    allow_flush: bool,
 }
 
 impl TrackedFileSummary {
@@ -33,7 +37,47 @@ impl TrackedFileSummary {
             obsolete_offsets: Vec::new(),
             modified: false,
             track_detail,
+            allow_flush: true,
         }
+    }
+
+    /// Returns whether this summary may be flushed/evicted during cleaning.
+    ///
+    /// JE `TrackedFileSummary.getAllowFlush`.
+    pub fn get_allow_flush(&self) -> bool {
+        self.allow_flush
+    }
+
+    /// Allows or prohibits this summary from being flushed/evicted.
+    ///
+    /// JE `TrackedFileSummary.setAllowFlush`.
+    pub fn set_allow_flush(&mut self, allow_flush: bool) {
+        self.allow_flush = allow_flush;
+    }
+
+    /// Drops the obsolete-offset DETAIL while KEEPING the aggregate
+    /// `FileSummary` counters intact.
+    ///
+    /// This is the in-memory adaptation of JE's eviction-of-detail path. In
+    /// JE, `UtilizationTracker.evictMemory` calls
+    /// `UtilizationProfile.flushFileSummary`, which writes a `FileSummaryLN`
+    /// (persisting the aggregate counts) and then calls
+    /// `TrackedFileSummary.reset` — `reset` sets `obsoleteOffsets = null` and
+    /// `super.reset()` zeroes the in-memory `FileSummary` *because the
+    /// aggregate has just been persisted*.
+    ///
+    /// noxu's `UtilizationTracker` cannot reach `UtilizationProfile` to write
+    /// a `FileSummaryLN` from here (that would be a layering cycle), so the
+    /// in-memory budget cap is implemented by dropping only the per-LSN OFFSET
+    /// DETAIL (`obsoleteOffsets`) and KEEPING the aggregate counters that feed
+    /// the cleaner's util% file-selection. JE itself documents that the offset
+    /// detail is "an optimization for exact cleaning, not required for
+    /// correctness": dropping it only reduces exact-cleaning precision, never
+    /// the aggregate util%. Cite: `UtilizationTracker.evictMemory`,
+    /// `TrackedFileSummary.reset`.
+    pub fn discard_obsolete_detail(&mut self) {
+        self.obsolete_offsets = Vec::new();
+        self.modified = true;
     }
 
     /// Returns the file number being tracked.
@@ -110,6 +154,19 @@ impl TrackedFileSummary {
         // Base struct size + vector capacity
         std::mem::size_of::<Self>()
             + (self.obsolete_offsets.capacity() * std::mem::size_of::<u32>())
+    }
+
+    /// Returns the bytes of obsolete-offset DETAIL only, excluding the
+    /// fixed per-object overhead.
+    ///
+    /// JE budgets only the detail, not the object overhead:
+    /// `TrackedFileSummary.getMemorySize` returns `memSize`, which is bumped
+    /// only in `trackObsolete` (`TFS_LIST_*_OVERHEAD`). The class comment
+    /// states: "We only bother to budget obsolete detail, not the overhead
+    /// for this object." The budget cap (`evict_memory`) uses this value so
+    /// that dropping all detail can actually bring a file under budget.
+    pub fn detail_memory_size(&self) -> usize {
+        self.obsolete_offsets.capacity() * std::mem::size_of::<u32>()
     }
 }
 
