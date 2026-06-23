@@ -5,12 +5,12 @@
 
 use crate::FileSelector;
 use crate::cleaner_stat::CleanerStats;
-use crate::file_summary::FileSummary;
 use crate::file_processor::{
     BinLookupResult, FileProcessResult, FileProcessor, LogEntry, LogEntryType,
     MigrateLnResult, SharedTreeLookup, TreeLookup,
 };
 use crate::file_protector::FileProtector;
+use crate::file_summary::FileSummary;
 use crate::throttle::CleanerThrottle;
 use crate::utilization_profile::UtilizationProfile;
 use crate::utilization_tracker::UtilizationTracker;

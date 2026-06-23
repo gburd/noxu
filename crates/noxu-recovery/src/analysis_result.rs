@@ -19,6 +19,7 @@
 //! which LNs to undo.
 
 use crate::log_scanner::InRecord;
+use crate::recovery_info::RebuiltFileSummary;
 use hashbrown::{HashMap, HashSet};
 use noxu_util::{Lsn, NULL_LSN};
 
@@ -209,6 +210,13 @@ pub struct AnalysisResult {
     /// VLSN before writing the WAL entry).  Merged into `recovered_vlsns` by
     /// the redo pass so a second crash does not lose these VLSNs.
     pub txncommit_vlsns: Vec<(u64, u64)>,
+
+    /// CLN-4: per-file utilization summaries rebuilt INLINE during the
+    /// analysis pass from persisted FileSummaryLN records (+ obsolete counting
+    /// for LN supersessions written after each file's last FileSummaryLN).
+    /// Moved into `RecoveryInfo` after analysis to seed the cleaner's profile.
+    /// JE: UtilizationProfile.populateCache / RecoveryUtilizationTracker.
+    pub rebuilt_file_summaries: HashMap<u32, RebuiltFileSummary>,
 }
 
 impl AnalysisResult {
@@ -232,6 +240,7 @@ impl AnalysisResult {
             recovered_db_txn_ids: hashbrown::HashMap::new(),
             recovered_db_comparators: hashbrown::HashMap::new(),
             txncommit_vlsns: Vec::new(),
+            rebuilt_file_summaries: HashMap::new(),
         }
     }
 
