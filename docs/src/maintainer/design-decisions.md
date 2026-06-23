@@ -350,4 +350,4 @@ re-supply a comparator with the matching identity. A replica cannot
 reconstruct the comparison *function* from the identity alone (the same
 fn-can't-be-named limitation as on the master). If the replica opens the
 database without the matching comparator, the open fails with the same
-`ComparatorMismatch` semantics — it does not silently mis-sort.
+`ComparatorMismatch` semantics — it does not silently mis-order.
