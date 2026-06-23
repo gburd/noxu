@@ -2723,6 +2723,18 @@ impl Tree {
         self.log_manager = Some(lm);
     }
 
+    /// Drops this tree's `Arc<LogManager>` reference (EV-14 teardown).
+    ///
+    /// The env's `Drop` calls this on every tree it owns so the
+    /// `Tree -> Arc<LogManager> -> Arc<FileManager>` chain cannot keep the
+    /// FileManager (and its on-disk exclusive lock) alive past environment
+    /// close.  After this the tree can no longer re-fetch an evicted root
+    /// from the log — which is correct, because the environment is shutting
+    /// down and the tree is about to be dropped.
+    pub fn clear_log_manager(&mut self) {
+        self.log_manager = None;
+    }
+
     /// T-5: set the compact-key threshold (`TREE_COMPACT_MAX_KEY_LENGTH` /
     /// `IN.getCompactMaxKeyLength`).  New BINs created by this tree inherit it;
     /// `<= 0` disables the compact key rep.  Default 16.

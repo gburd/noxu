@@ -2504,6 +2504,23 @@ impl Drop for EnvironmentImpl {
         self.extinction_scanner.lock().unwrap().shutdown();
         self.data_eraser.lock().unwrap().shutdown();
         self.backup_manager.lock().unwrap().shutdown();
+
+        // EV-14 teardown: break the `Tree -> Arc<LogManager> -> FileManager`
+        // chain so the FileManager's on-disk exclusive lock is released on
+        // env drop, even if a Tree `Arc` momentarily outlives this struct.
+        // Without this a reopened environment (e.g. recovery tests) fails with
+        // "Environment locked".  Daemons are already joined above, so no
+        // background thread can be mid-re-fetch.
+        if let Ok(mut t) = self.primary_tree.write() {
+            t.clear_log_manager();
+        }
+        if let Ok(reg) = self.db_trees_registry.lock() {
+            for tree_arc in reg.values() {
+                if let Ok(mut t) = tree_arc.write() {
+                    t.clear_log_manager();
+                }
+            }
+        }
     }
 }
 
