@@ -1371,6 +1371,27 @@ impl ReplicatedEnvironment {
         self.vlsn_index.get_latest_vlsn()
     }
 
+    /// REP-10 (B): mint a [`CommitToken`] for the most recent commit on this
+    /// master.
+    ///
+    /// Port of `MasterTxn.getCommitToken`: returns
+    /// `new CommitToken(envUUID, commitVLSN.getSequence())`.  A client that
+    /// just performed a write on the master calls this to obtain the token it
+    /// will hand to a subsequent replica read
+    /// (`Transaction.getCommitToken`).  Returns `None` on a non-master or when
+    /// no commit VLSN exists yet (JE returns `null` when `commitVLSN.isNull`).
+    ///
+    /// The token's VLSN is the master's latest assigned VLSN — the same
+    /// `wal_vlsn_counter` high-water the ack gate keys on (the commit was
+    /// logged immediately before this call).
+    pub fn commit_token(&self) -> Option<crate::CommitToken> {
+        if !self.is_master() {
+            return None;
+        }
+        let vlsn = self.wal_vlsn_counter.load(Ordering::Acquire);
+        crate::CommitToken::new(self.config.group_name.clone(), vlsn)
+    }
+
     /// REP-1 STEP 5 (D): run a live syncup against `feeder` and, if this
     /// replica's tail diverged, ROLL IT BACK to the common matchpoint instead
     /// of falling back to a network restore.

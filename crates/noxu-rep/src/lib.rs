@@ -65,6 +65,7 @@
 // Foundation modules
 pub mod auth;
 pub mod commit_durability;
+pub mod commit_token;
 pub mod consistency;
 pub mod error;
 pub mod node_type;
@@ -128,6 +129,7 @@ pub mod test_harness;
 #[cfg(any(feature = "tls-rustls", feature = "tls-native"))]
 pub use auth::PeerAllowlist;
 pub use commit_durability::{CommitDurability, ReplicaAckPolicy};
+pub use commit_token::CommitToken;
 pub use consistency::{ConsistencyPolicy, ConsistencyTracker};
 pub use elections::phi_detector::PhiAccrualDetector;
 pub use error::{RepError, Result};

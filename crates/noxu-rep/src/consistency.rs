@@ -65,6 +65,19 @@ pub enum ConsistencyPolicy {
 }
 
 impl ConsistencyPolicy {
+    /// Build a [`ConsistencyPolicy::CommitPointConsistency`] from a
+    /// [`CommitToken`] minted by the master.
+    ///
+    /// Port of `new CommitPointConsistencyPolicy(commitToken, timeout, unit)`:
+    /// a client that did a write on the master passes the returned token to a
+    /// replica read so the read waits until the replica has replayed past it.
+    pub fn commit_point(token: &crate::CommitToken, timeout: Duration) -> Self {
+        ConsistencyPolicy::CommitPointConsistency {
+            vlsn: token.vlsn() as i64,
+            timeout,
+        }
+    }
+
     /// Checks whether the given replica state satisfies this consistency
     /// policy.
     ///
