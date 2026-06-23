@@ -296,21 +296,54 @@ EV-6 (skip upper INs with cached children), EV-7 (skip root INs), and the
 write-path back-pressure EV-15 (synchronous critical eviction in writer
 threads). Two lower-priority items in the same wave are deferred:
 
-- **EV-14 — `evictRoot` (user-DB root eviction): DEFERRED.** JE
+- **EV-14 — `evictRoot` (user-DB root eviction): IMPLEMENTED (2026-06).** JE
   `Evictor.evictRoot` (Evictor.java:3050) CAN evict a *non-internal* DB's
   root IN under specific conditions: it logs the dirty root first, calls
   `rootRef.setLsn(newLsn)` to update the `DbTree` root reference, then
-  `rootRef.clearTarget()` and increments `nRootNodesEvicted`. Noxu's
-  `root_nodes_evicted` stat is consequently dead (the root is never evicted).
-  This is **lower priority than EV-6/EV-7**, which *prevent* a wrong eviction
-  that EV-13's detach made dangerous; EV-14 merely *enables* an additional
-  (rare) eviction. Implementing it faithfully requires a separate root-LRU
-  selection path (`RootEvictor`), logging the root before clearing it, and a
-  version-aware `DbTree` root-LSN update — a focused change, not a tail-end
-  tweak. Until it lands, `decide_eviction`'s EV-7 guard keeps **every** root
-  resident (the simplest faithful rule), so the engine is correct but slightly
-  more memory-conservative than JE for very large single-DB working sets whose
-  root could otherwise be evicted. The `root_nodes_evicted` stat stays at 0.
+  `rootRef.clearTarget()` and increments `nRootNodesEvicted`. Noxu now
+  implements this as a SEPARATE path with stricter conditions than the normal
+  detach path:
+
+  - `Tree::evict_root(db_id)` (faithful to `Evictor.evictRoot` +
+    `RootEvictor.doWork` + `Tree.withRootLatchedExclusive`) runs under the
+    root latch: it logs a dirty root first and records the new
+    `root_log_lsn` (JE `target.log(...)` + `rootRef.setLsn(newLsn)`), then
+    clears the in-memory root (`rootRef.clearTarget()`) and `note_removes` it
+    (JE `inList.remove`).  It **refuses** (keeps the root resident) when there
+    is no log manager, when the root still has resident children (the JE
+    `hasCachedChildren` skip — evicting would orphan them, the EV-6
+    invariant), when a root BIN is cursor-pinned, or when a clean root was
+    never logged (no re-fetch point).
+  - `Tree::fetch_root_from_log` re-materializes an evicted root from
+    `root_log_lsn` on next access (JE `Tree.getRootIN` →
+    `ChildReference.fetchTarget`); `get_root()` now re-fetches transparently.
+    `child_at_or_fetch` re-fetches an evicted *child* IN/BIN from its parent
+    slot LSN on descent (JE `ChildReference.fetchTarget`), and
+    `detach_node_by_id` now stamps the child's `last_full_lsn` into the
+    parent slot (JE `IN.updateEntry`) so re-fetch reads the CURRENT on-disk
+    version, not a stale LSN.  (This also closes a latent EV-13 gap where a
+    detached child was lost on a subsequent search.)
+  - `decide_eviction`'s EV-7 guard is relaxed: an *idle* root (no cached
+    children) returns the new `EvictionDecision::EvictRoot` and is routed to
+    `Tree::evict_root` (JE's `if (target.isRoot())` branch in `evictBatch`,
+    Evictor.java:2400-2421); a root that still has cached children is Skipped
+    (EV-6 protection holds). Roots are **never** evicted via the normal
+    BIN/IN detach path (that would break the EV-13 detach invariants).
+
+  `root_nodes_evicted` is therefore **no longer always 0**: it increments
+  whenever an idle root is evicted via `evictRoot` (JE `nRootNodesEvicted`),
+  and `dirty_nodes_evicted` increments when the root had to be logged (JE
+  `rootEvictor.flushed`).  **Known limitation:** root eviction only fires
+  once the root is genuinely idle (all children non-resident).  The current
+  engine evictor strips LN data and rarely fully detaches whole subtrees in a
+  steady write workload, so a deeply multi-level root rarely goes idle in
+  practice; the path is exercised and proven correct deterministically by
+  `crates/noxu-evictor/tests/ev14_evict_root.rs` (real Evictor + Tree + WAL)
+  and `crates/noxu-tree/tests/evict_root_refetch.rs` (tree-level
+  evict-then-refetch round-trip). Driving root eviction under natural engine
+  pressure for arbitrarily deep trees needs the full bottom-up subtree
+  detach + intermediate-IN logging cascade, which remains an EV-13/EV-15
+  follow-on (out of EV-14 scope).
 
 - **EV-27 — off-heap budget subtraction: NO CHANGE NEEDED (off-by-default,
   not net-negative).** The triage note suggested removing a "net-negative

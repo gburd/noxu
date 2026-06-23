@@ -140,6 +140,10 @@ pub enum EvictionDecision {
     MoveDirtyToPri2,
     PartialEvict,
     Evict,
+    /// EV-14: the target is an idle root IN — evict it via the separate
+    /// `evictRoot` path (JE `if (target.isRoot())` branch in `evictBatch`,
+    /// Evictor.java:2400-2421), NOT the normal detach path.
+    EvictRoot,
 }
 
 /// Apply the `processTarget()` decision tree.
@@ -159,13 +163,19 @@ pub fn decide_eviction(
     if !info.is_bin() && info.has_cached_children() {
         return EvictionDecision::Skip;
     }
-    // EV-7 (JE Evictor.processTarget, Evictor.java:2663-2671, IN.isRoot()):
-    // never evict a root IN.  JE disallows eviction of the ID/NAME DB roots
-    // here and routes user-DB roots through a separate evictRoot path; the
-    // simplest faithful rule is to keep every root resident (EV-14 / evictRoot
-    // is deferred — see do_evict).
+    // EV-7 / EV-14 (JE Evictor.processTarget root special-casing,
+    // Evictor.java:2400-2421 + 2663-2671, IN.isRoot()): a root IN is NEVER
+    // evicted via the NORMAL detach path (that would break the EV-13 detach
+    // invariants — a root has no parent slot to detach from).  Instead JE
+    // routes a root target to the separate `evictRoot` path.  EV-14 relaxes
+    // the old "always Skip a root" rule to: an *idle* root (no cached
+    // children) is evicted via `EvictRoot`; a root that still has cached
+    // children is kept resident (EV-6 — evicting it would orphan them).
     if info.is_root() {
-        return EvictionDecision::Skip;
+        if info.has_cached_children() {
+            return EvictionDecision::Skip;
+        }
+        return EvictionDecision::EvictRoot;
     }
     if info.ref_count() > 0 {
         return EvictionDecision::PutBack;
@@ -786,6 +796,44 @@ impl Evictor {
                     result.nodes_evicted += 1;
                     self.stats.increment(&self.stats.nodes_evicted);
                 }
+
+                EvictionDecision::EvictRoot => {
+                    // EV-14: route an idle root to the separate evictRoot path
+                    // (JE evictBatch `if (target.isRoot())` ->
+                    // Tree.withRootLatchedExclusive(rootEvictor), Evictor.java
+                    // :2400-2421).  evict_root logs a dirty root first, updates
+                    // the tree root_log_lsn, and clears the in-memory root; the
+                    // root re-fetches from its LSN on next access.
+                    match self.evict_root_node(node_id) {
+                        Some((freed, was_dirty)) => {
+                            result.bytes_evicted += freed;
+                            result.nodes_evicted += 1;
+                            self.stats.increment(&self.stats.nodes_evicted);
+                            // JE nRootNodesEvicted.increment().
+                            self.stats
+                                .increment(&self.stats.root_nodes_evicted);
+                            if was_dirty {
+                                // JE: rootEvictor.flushed ->
+                                // nDirtyNodesEvicted.increment().
+                                self.stats
+                                    .increment(&self.stats.dirty_nodes_evicted);
+                            }
+                        }
+                        None => {
+                            // Root not evictable right now (no log manager,
+                            // resident children acquired after selection,
+                            // pinned, or clean-but-never-logged).  Put it back
+                            // (JE RootEvictor releases the latch and leaves the
+                            // root resident).
+                            if from_pri2 {
+                                self.pri2.lock().add_back(node_id);
+                            } else {
+                                self.primary_policy.put_back(node_id);
+                            }
+                            self.stats.increment(&self.stats.nodes_put_back);
+                        }
+                    }
+                }
             }
         }
 
@@ -872,6 +920,33 @@ impl Evictor {
                 &default_node_size,
             )
         }
+    }
+
+    /// EV-14: evict the root IN of the current tree via the separate
+    /// `Tree::evict_root` path (JE `Evictor.evictRoot`).
+    ///
+    /// The `node_id` is the candidate the LRU offered; we only proceed if it
+    /// is still the tree's resident root (JE `RootEvictor.doWork` re-checks
+    /// `rootIN == target && rootIN.isRoot()`).  Returns `Some((freed_bytes,
+    /// was_dirty))` on a successful evict, `None` if the root could not be
+    /// evicted (so the caller puts the candidate back).
+    fn evict_root_node(&self, node_id: u64) -> Option<(u64, bool)> {
+        let tree_arc = self.current_tree()?;
+        let db_id = self.db_id.load(Ordering::Relaxed);
+        let tree = tree_arc.read().ok()?;
+        // Re-check the candidate is still the resident root before evicting
+        // (JE RootEvictor re-checks rootIN == target && isRoot()).
+        let root_id = tree.get_resident_root_in().map(|r| {
+            use noxu_tree::tree::TreeNode;
+            match &*r.read() {
+                TreeNode::Internal(n) => n.node_id,
+                TreeNode::Bottom(b) => b.node_id,
+            }
+        })?;
+        if root_id != node_id {
+            return None; // not the current root any more
+        }
+        tree.evict_root(db_id)
     }
 
     /// Flush a dirty node to the WAL before evicting it.
@@ -1628,16 +1703,29 @@ mod tests {
         );
     }
 
-    /// EV-7 (JE Evictor.processTarget IN.isRoot(), Evictor.java:2663-2671): a
-    /// root IN must be SKIPPED.  Neutering the guard turns this into Evict and
-    /// fails the assert.
+    /// EV-7 / EV-14 (JE Evictor.processTarget root special-casing,
+    /// Evictor.java:2400-2421 + 2663-2671, IN.isRoot()): a root is never
+    /// evicted via the NORMAL path.  An *idle* root (no cached children) is
+    /// routed to the separate `EvictRoot` path; a root that still has cached
+    /// children is SKIPPED (EV-6 — evicting it would orphan them).
     #[test]
-    fn test_decide_ev7_root_skipped() {
-        let root_in = GuardInfo { bin: false, has_children: false, root: true };
+    fn test_decide_ev7_ev14_root_routing() {
+        // Idle root -> EvictRoot (EV-14): neutering the guard would turn this
+        // into Evict (normal detach path) and break the EV-13 invariants.
+        let idle_root =
+            GuardInfo { bin: false, has_children: false, root: true };
         assert_eq!(
-            decide_eviction(&root_in, false, true),
+            decide_eviction(&idle_root, false, true),
+            EvictionDecision::EvictRoot,
+            "EV-14: an idle root IN is evicted via the EvictRoot path"
+        );
+        // Root with cached children -> Skip (EV-6 protection holds).
+        let root_with_children =
+            GuardInfo { bin: false, has_children: true, root: true };
+        assert_eq!(
+            decide_eviction(&root_with_children, false, true),
             EvictionDecision::Skip,
-            "EV-7: root IN must be skipped"
+            "EV-6: a root with resident children must NOT be evicted"
         );
     }
 
