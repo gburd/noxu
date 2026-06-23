@@ -54,6 +54,7 @@ native-tls     = { workspace = true, optional = true }
 proptest = { workspace = true }
 tempfile = "3"
 rand = "0.8"
+bytes = { workspace = true }
 noxu-evictor = { path = "../noxu-evictor" }
 # Used only by F1 end-to-end tests that wire a noxu-db Environment to a
 # noxu-rep ReplicatedEnvironment via the ReplicaAckCoordinator trait.

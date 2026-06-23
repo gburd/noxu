@@ -1842,6 +1842,27 @@ impl EnvironmentImpl {
         self.log_manager.clone()
     }
 
+    /// REP-7: return the live in-memory B-tree for `db_id`, if the database
+    /// has been opened on this (replica) node.
+    ///
+    /// The returned `Arc<RwLock<Tree>>` is the SAME tree that opened
+    /// `Database`/`Cursor` handles read through (it is the entry the
+    /// `db_trees_registry` holds, which `open_database_inner` installs from
+    /// the database's `get_real_tree_arc()`).  The replica live-apply path
+    /// ([`crate::replica_replay::ReplicaReplay`]) write-locks this tree and
+    /// applies streamed committed LNs to it, so a read on the replica sees
+    /// the replicated data without a restart.
+    ///
+    /// JE: the replica's `Replay.applyLN` resolves the target tree via
+    /// `repNode.getReplica().getDbCache().get(dbId, repTxn)` and applies
+    /// through a `Cursor` on it; here the tree IS the cursor-backing tree.
+    pub fn replica_tree_for_db(
+        &self,
+        db_id: u64,
+    ) -> Option<Arc<std::sync::RwLock<noxu_tree::Tree>>> {
+        self.db_trees_registry.lock().ok()?.get(&(db_id as i64)).cloned()
+    }
+
     /// Wave 3-2: Returns the list of XA in-doubt prepared transactions
     /// surfaced by the most recent recovery pass.
     ///

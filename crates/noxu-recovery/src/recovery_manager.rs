@@ -276,6 +276,82 @@ pub struct RecoveryManager {
     single_pass_invisible_lsns: Vec<Lsn>,
 }
 
+/// Apply a single committed LN to a live B-tree, exactly as the crash-recovery
+/// redo pass does.
+///
+/// This is the ONE copy of the LN tree-mutation logic, shared by:
+/// - the crash-recovery redo pass ([`RecoveryManager::redo_ln`], which simply
+///   delegates here), and
+/// - the LIVE replica-apply path (REP-7; noxu-dbi `ReplicaReplay`), which
+///   applies each streamed *committed* LN to the replica's live in-memory tree
+///   so the replica can serve reads without a restart.
+///
+/// Keeping a single implementation is a crash-consistency requirement: the
+/// replica's WAL is the source of truth and a subsequent crash-recovery must
+/// reproduce the SAME tree the live-apply produced.  Forking the mutation
+/// logic between live-apply and recovery-redo would be a correctness bug.
+///
+/// Port of the JE redo currency check (`RecoveryManager.redo()` / the
+/// `redo()` helper) and the online apply in `Replay.applyLN`
+/// (`DbInternal.putForReplay` / `deleteForReplay`):
+///
+/// ```text
+/// if (logrecLsn > treeLsn)    → replace slot with logged version
+/// if (not found && !deletion) → insert into tree
+/// if (deletion)               → delete slot (if present)
+/// ```
+pub fn apply_redo_ln(tree: &mut noxu_tree::Tree, rec: &LnRecord, lsn: Lsn) {
+    // Only replay into the matching database's tree.
+    // Db-id check.
+    if tree.get_database_id() != rec.db_id {
+        return;
+    }
+    match rec.operation {
+        LnOperation::Insert | LnOperation::Update => {
+            // Insert the logged version.  `tree.redo_insert` applies the
+            // JE redo currency check (RecoveryManager.redo() ~2512/2544):
+            // it replaces the slot ONLY when the logged LSN is strictly
+            // greater than the existing slot LSN (`logrecLsn > treeLsn`),
+            // and skips otherwise.  This makes redo genuinely idempotent:
+            // an out-of-order (older-LSN) replay can never revert a
+            // committed value or reset a slot LSN backward, regardless of
+            // whether redo or undo runs first.
+            //
+            // Recovery alloc optimisation: pass &[u8] slices directly instead of
+            // materialising two intermediate Vec<u8> (rec.key.to_vec() +
+            // rec.data.to_vec()).  The compressed key suffix and the data
+            // bytes are copied into the BinEntry exactly once inside
+            // BinStub::insert_with_prefix_slice.
+            let data_slice = rec.data.as_deref().unwrap_or(&[]);
+            // Recovery design call: tree.redo_insert errors during redo
+            // are logged and we continue. The TreeError variants
+            // (SplitRequired, Lookup, MemoryAllocFailure) on a
+            // single key indicate a failure to materialise that
+            // entry, but the rest of the log replay is still
+            // valid; aborting recovery on the first failed redo
+            // would leave the entire database unrecoverable. The
+            // operator sees the failure via log::error! and can
+            // decide whether to escalate (e.g. restore from
+            // backup) based on the breadth of failures.
+            if let Err(e) = tree.redo_insert(&rec.key, data_slice, lsn) {
+                log::error!(
+                    "noxu-recovery: redo failed at lsn={lsn:?}, db={}, \
+                     op={:?}: {e:?}; recovery will continue but this \
+                     slot may be missing",
+                    rec.db_id,
+                    rec.operation,
+                );
+            }
+        }
+        LnOperation::Delete => {
+            // Bin.deleteEntry(index) / slot KD-flag set.
+            // Our tree's delete() is a no-op when the key is absent, so
+            // this is always safe.
+            tree.delete(&rec.key);
+        }
+    }
+}
+
 impl RecoveryManager {
     /// Create a new recovery manager.
     pub fn new() -> Self {
@@ -1959,56 +2035,16 @@ impl RecoveryManager {
     /// - `insert(key, data, lsn)` succeeds regardless of whether the key was
     ///   already present; the slot is updated to the logged LSN.
     /// - `delete(key)` is a no-op when the key is absent.
+    ///
+    /// REP-7: this method simply delegates to the free function
+    /// [`apply_redo_ln`] so that the LIVE replica-apply path (noxu-dbi
+    /// `ReplicaReplay`) and the crash-recovery redo path share ONE copy of
+    /// the tree-mutation logic.  A divergence between live-apply and
+    /// recovery-redo would be a crash-consistency bug (the WAL is the source
+    /// of truth and recovery must reproduce the same tree the live-apply
+    /// produced), so the two MUST NOT fork.
     fn redo_ln(tree: &mut noxu_tree::Tree, rec: &LnRecord, lsn: Lsn) {
-        // Only replay into the matching database's tree.
-        // Db-id check.
-        if tree.get_database_id() != rec.db_id {
-            return;
-        }
-        match rec.operation {
-            LnOperation::Insert | LnOperation::Update => {
-                // Insert the logged version.  `tree.redo_insert` applies the
-                // JE redo currency check (RecoveryManager.redo() ~2512/2544):
-                // it replaces the slot ONLY when the logged LSN is strictly
-                // greater than the existing slot LSN (`logrecLsn > treeLsn`),
-                // and skips otherwise.  This makes redo genuinely idempotent:
-                // an out-of-order (older-LSN) replay can never revert a
-                // committed value or reset a slot LSN backward, regardless of
-                // whether redo or undo runs first.
-                //
-                // Recovery alloc optimisation: pass &[u8] slices directly instead of
-                // materialising two intermediate Vec<u8> (rec.key.to_vec() +
-                // rec.data.to_vec()).  The compressed key suffix and the data
-                // bytes are copied into the BinEntry exactly once inside
-                // BinStub::insert_with_prefix_slice.
-                let data_slice = rec.data.as_deref().unwrap_or(&[]);
-                // Recovery design call: tree.redo_insert errors during redo
-                // are logged and we continue. The TreeError variants
-                // (SplitRequired, Lookup, MemoryAllocFailure) on a
-                // single key indicate a failure to materialise that
-                // entry, but the rest of the log replay is still
-                // valid; aborting recovery on the first failed redo
-                // would leave the entire database unrecoverable. The
-                // operator sees the failure via log::error! and can
-                // decide whether to escalate (e.g. restore from
-                // backup) based on the breadth of failures.
-                if let Err(e) = tree.redo_insert(&rec.key, data_slice, lsn) {
-                    log::error!(
-                        "noxu-recovery: redo failed at lsn={lsn:?}, db={}, \
-                         op={:?}: {e:?}; recovery will continue but this \
-                         slot may be missing",
-                        rec.db_id,
-                        rec.operation,
-                    );
-                }
-            }
-            LnOperation::Delete => {
-                // Bin.deleteEntry(index) / slot KD-flag set.
-                // Our tree's delete() is a no-op when the key is absent, so
-                // this is always safe.
-                tree.delete(&rec.key);
-            }
-        }
+        apply_redo_ln(tree, rec, lsn);
     }
 
     /// Decide whether an LN should be redone.

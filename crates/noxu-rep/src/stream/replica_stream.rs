@@ -66,6 +66,15 @@ pub struct EnvironmentLogWriter {
     log_manager: Arc<noxu_log::LogManager>,
     /// VLSN index: maps VLSN → (file_number, file_offset) on this replica.
     vlsn_index: Arc<crate::vlsn::vlsn_index::VlsnIndex>,
+    /// REP-7 (B): optional live replay-apply driver.
+    ///
+    /// When present, every entry written to the WAL is ALSO applied to the
+    /// replica's live in-memory tree (committed ops become visible; txn ops
+    /// are buffered until commit) so the replica can serve reads without a
+    /// restart.  `None` for the legacy byte-shadow-only path (e.g. when no
+    /// live `EnvironmentImpl` is wired).  Port of JE `Replay` driven from the
+    /// replica replay thread.
+    replay: Option<noxu_dbi::ReplicaReplay>,
 }
 
 impl EnvironmentLogWriter {
@@ -78,7 +87,27 @@ impl EnvironmentLogWriter {
         log_manager: Arc<noxu_log::LogManager>,
         vlsn_index: Arc<crate::vlsn::vlsn_index::VlsnIndex>,
     ) -> Self {
-        Self { log_manager, vlsn_index }
+        Self { log_manager, vlsn_index, replay: None }
+    }
+
+    /// REP-7 (B): create a writer that ALSO live-applies each entry to the
+    /// replica's in-memory tree via `replay`, so reads on the replica see
+    /// replicated data without a restart.
+    pub fn with_replay(
+        log_manager: Arc<noxu_log::LogManager>,
+        vlsn_index: Arc<crate::vlsn::vlsn_index::VlsnIndex>,
+        replay: noxu_dbi::ReplicaReplay,
+    ) -> Self {
+        Self { log_manager, vlsn_index, replay: Some(replay) }
+    }
+
+    /// REP-10 seam: shared handle to the replica's last-applied VLSN, when a
+    /// live replay driver is installed.  A future consistency policy gates
+    /// reads on this; this method only exposes it.
+    pub fn last_applied_vlsn_handle(
+        &self,
+    ) -> Option<std::sync::Arc<std::sync::atomic::AtomicU64>> {
+        self.replay.as_ref().map(|r| r.last_applied_vlsn_handle())
     }
 }
 
@@ -128,6 +157,15 @@ impl LogWriter for EnvironmentLogWriter {
                 lsn.file_offset(),
                 log_entry_type,
             );
+        }
+
+        // REP-7 (B): live-apply to the replica's in-memory tree AFTER the WAL
+        // write + VLSN-index update, so the WAL stays the source of truth and
+        // the live tree is the read-serving optimization recovery re-derives.
+        // Port of JE: the replica writes the entry to its log, then
+        // `Replay.replayEntry` applies it to the tree.
+        if let Some(replay) = self.replay.as_mut() {
+            replay.apply_entry(vlsn, entry_type, payload, lsn);
         }
 
         log::trace!(

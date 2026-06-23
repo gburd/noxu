@@ -138,7 +138,7 @@ impl FileManagerLogScanner {
     ///
     /// Returns `None` for entry types recovery does not need to process
     /// (FileHeader, Trace, etc.).
-    fn parse_payload(
+    pub(crate) fn parse_payload(
         entry_type_num: u8,
         payload: Bytes,
         vlsn: Option<u64>,

@@ -2050,12 +2050,24 @@ impl ReplicatedEnvironment {
                 let self_weak: Option<Weak<Self>> =
                     self.self_weak.get().cloned();
 
+                // REP-7 (B): clone the live EnvironmentImpl into the replica
+                // thread so the writer can drive a ReplicaReplay that applies
+                // each streamed entry to the live in-memory tree.
+                let env_for_replay = Arc::clone(&env);
+
                 let handle = std::thread::Builder::new()
                     .name(format!("noxu-replica-{}", node_name))
                     .spawn(move || {
-                        let mut writer = EnvironmentLogWriter::new(
+                        // REP-7 (B): wire the live replay-apply path so reads
+                        // on the replica see replicated data without a
+                        // restart.  JE: the replica writes each entry to its
+                        // log, then Replay.replayEntry applies it to the tree.
+                        let replay =
+                            noxu_dbi::ReplicaReplay::new(env_for_replay);
+                        let mut writer = EnvironmentLogWriter::with_replay(
                             log_mgr,
                             vlsn_index_clone,
+                            replay,
                         );
 
                         let Some(addr) = master_addr_opt else {
