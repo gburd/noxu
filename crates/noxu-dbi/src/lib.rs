@@ -38,6 +38,7 @@ mod operation;
 mod operation_status;
 mod put_mode;
 pub mod replica_ack;
+pub mod replica_replay;
 mod search_mode;
 pub mod throughput_stats;
 mod truncate_result;
@@ -58,6 +59,7 @@ pub use disk_ordered_cursor_impl::{
 pub use env_failure_reason::EnvironmentFailureReason;
 pub use env_state::EnvState;
 pub use environment_impl::EnvironmentImpl;
+pub use replica_replay::ReplicaReplay;
 // EV-15: re-export the evictor so noxu-db can cache an Arc<Evictor> for
 // per-write critical eviction without taking a direct noxu-evictor dependency.
 pub use error::{DbiError, Result};

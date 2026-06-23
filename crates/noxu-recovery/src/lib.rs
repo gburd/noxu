@@ -49,6 +49,7 @@ pub use log_scanner::{
 pub use recovery_info::RecoveryInfo;
 pub use recovery_manager::{
     RecoveryManager, RecoveryProgress, RecoveryStats, RedoAction, UndoAction,
+    apply_redo_ln,
 };
 pub use replay::{RollbackOutcome, rollback, rollback_steps_1_to_4};
 pub use rollback_tracker::{RollbackPeriod, RollbackScanner, RollbackTracker};
