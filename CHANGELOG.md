@@ -6,6 +6,18 @@ All notable changes to Noxu DB are documented here.
 
 ### Added
 
+- **REC-Z: count rolled-back LN versions obsolete during recovery.** The
+  recovery rollback path (`RecoveryManager::run_undo` / `run_undo_all`) reverts
+  in-window LNs to their previous version via the `TxnChain` but did not count
+  the rolled-back (now logically truncated) LN versions obsolete. Both undo
+  paths now collect the LSN of each LN reverted via `chain.pop()` /
+  `apply_revert_info` and merge them into the rebuilt utilization profile as
+  obsolete LNs (inexact: count only, size 0, no offset — invisible entries are
+  never processed by the cleaner). The env seeds the cleaner with this, so a
+  crash that rolls back a tail of writes leaves the cleaner aware of those dead
+  bytes. Faithful port of JE `RollbackTracker.countObsolete` ->
+  `countObsoleteUnconditional(undoLsn, null, size, dbId, countExact=false)`.
+
 - **L-5-delta: count the superseded prior BIN-delta obsolete when the
   checkpointer logs a new BIN-delta.** `Checkpointer::flush_one_tree_bins`
   takes the delta path (`should_log_delta`) for a long-lived BIN that already
