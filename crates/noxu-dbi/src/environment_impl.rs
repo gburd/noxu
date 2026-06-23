@@ -923,6 +923,33 @@ impl EnvironmentImpl {
             let mut seed: hashbrown::HashMap<u32, noxu_cleaner::FileSummary> =
                 hashbrown::HashMap::with_capacity(rebuilt_file_summaries.len());
             for (file, r) in &rebuilt_file_summaries {
+                // CLN-24: restore the cleaner's TTL expiration band from the
+                // persisted histogram so the two-pass gate sees the same
+                // expiration prediction it had before the restart, instead of
+                // an empty band.  JE: ExpirationProfile.populateCache reads the
+                // serialized histograms back into the profile's map.
+                let (expired_lower, expired_gradual) =
+                    if r.expiration_histogram.is_empty() {
+                        (0, 0)
+                    } else {
+                        let tracker =
+                            noxu_cleaner::ExpirationTracker::deserialize(
+                                *file,
+                                &r.expiration_histogram,
+                            );
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        let (lo, grad) = tracker.get_expired_bytes_band(
+                            now_ms / 3_600_000,
+                            now_ms % 3_600_000,
+                        );
+                        (
+                            lo.min(i32::MAX as i64) as i32,
+                            grad.min(i32::MAX as i64) as i32,
+                        )
+                    };
                 seed.insert(
                     *file,
                     noxu_cleaner::FileSummary {
@@ -937,6 +964,8 @@ impl EnvironmentImpl {
                         obsolete_ln_count: r.obsolete_ln_count,
                         obsolete_ln_size: r.obsolete_ln_size,
                         obsolete_ln_size_counted: r.obsolete_ln_size_counted,
+                        obsolete_expired_size: expired_lower,
+                        obsolete_expired_gradual_size: expired_gradual,
                         ..Default::default()
                     },
                 );

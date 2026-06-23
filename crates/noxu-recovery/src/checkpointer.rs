@@ -562,6 +562,17 @@ impl Checkpointer {
             // baseSummary.writeToLog (11 ints) + obsoleteOffsets.writeToLog.
             let mut packed = noxu_cleaner::PackedOffsets::new();
             packed.pack(offsets);
+            // CLN-24: attach the serialized per-file expiration histogram so
+            // the cleaner's TTL expiration prediction survives restart.  JE
+            // persists this in a separate EXPIRATION DB (FileExpirationLN);
+            // Noxu folds it into the FileSummaryLN trailer.  Built from the
+            // file's LN entries via the wired cleaner; empty when no cleaner
+            // is wired or the file has no expiring data.
+            let expiration_histogram = self
+                .cleaner
+                .as_ref()
+                .map(|c| c.serialize_expiration_histogram(*file_number))
+                .unwrap_or_default();
             let entry = FileSummaryLnEntry::new(
                 *file_number as u64,
                 summary.total_count,
@@ -577,6 +588,7 @@ impl Checkpointer {
                 summary.obsolete_ln_size_counted,
                 packed.get_count() as u32,
                 packed.get_data().to_vec(),
+                expiration_histogram,
             );
             let mut buf = bytes::BytesMut::with_capacity(entry.log_size());
             entry.write_to_log(&mut buf);

@@ -1714,6 +1714,10 @@ impl RecoveryManager {
                                 obsolete_ln_size: rec.obsolete_ln_size,
                                 obsolete_ln_size_counted: rec
                                     .obsolete_ln_size_counted,
+                                // CLN-24: carry the serialized expiration
+                                // histogram so the env layer can restore the
+                                // cleaner's TTL expiration band.
+                                expiration_histogram: rec.expiration_histogram,
                             },
                             entry_lsn,
                         ),

@@ -633,6 +633,33 @@ impl Cleaner {
         self.utilization_profile.lock().get_file_summary(file_number).cloned()
     }
 
+    /// CLN-24: returns the serialized per-file expiration histogram for
+    /// `file_number`, suitable for persisting in a `FileSummaryLN` trailer.
+    ///
+    /// Builds an `ExpirationTracker` from the file's LN entries (the same
+    /// scan `scan_file_summary` uses to populate the expiration band) and
+    /// serializes it via `ExpirationTracker::serialize`.  Returns an empty
+    /// `Vec` when no file manager is wired or the file has no expiring data.
+    ///
+    /// JE: `ExpirationProfile.putFile` stores the serialized tracker into the
+    /// EXPIRATION DB; here the checkpointer attaches it to the FileSummaryLN
+    /// so recovery can restore the cleaner's expiration prediction.
+    pub fn serialize_expiration_histogram(&self, file_number: u32) -> Vec<u8> {
+        let Some(fm) = &self.file_manager else {
+            return Vec::new();
+        };
+        let mut tracker = crate::ExpirationTracker::new(file_number);
+        let entries = self.decode_ln_entries_from_file(fm, file_number);
+        for entry in &entries {
+            if let LogEntryType::Ln { expiration_time, entry_size, .. } =
+                entry.entry_type
+            {
+                tracker.track(expiration_time, entry_size);
+            }
+        }
+        tracker.serialize()
+    }
+
     /// Main cleaning entry point - performs cleaning of up to n_files.
     ///
     /// # Arguments
