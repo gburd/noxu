@@ -6,6 +6,18 @@ All notable changes to Noxu DB are documented here.
 
 ### Added
 
+- **L-5-delta: count the superseded prior BIN-delta obsolete when the
+  checkpointer logs a new BIN-delta.** `Checkpointer::flush_one_tree_bins`
+  takes the delta path (`should_log_delta`) for a long-lived BIN that already
+  has a full version and a prior delta; the new `BINDelta` entry's
+  `prev_delta_lsn` (JE `auxOldLsn`) names the prior delta it supersedes.
+  `flush_dirty_bins_internal` now counts that prior delta LSN obsolete via the
+  wired `UtilizationTracker` (`count_obsolete_node_dups_allowed`, size 0,
+  `count_as_ln = false`) BEFORE `persist_file_summaries`, so the obsolete
+  bytes land in this checkpoint's `FileSummaryLN`. Faithful port of JE
+  `IN.java` `auxOldLsn` -> `LogManager.serialLogWork`
+  `countObsoleteNodeDupsAllowed`.
+
 - **CLN-4: cleaner relies on persisted utilization immediately after restart.**
   Recovery now reads the `FileSummaryLN` records (C7 form) back during the
   env-open analysis scan and seeds the cleaner's `UtilizationProfile`
