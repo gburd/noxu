@@ -100,6 +100,43 @@ pub struct RecoveryInfo {
     /// VLSN corresponding to this LSN so it is consistent with the
     /// recovered B-tree state.  `None` if no rollbacks were detected.
     pub rollback_matchpoint_lsn: Option<u64>,
+
+    /// CLN-4: per-file `FileSummary` rebuilt from persisted `FileSummaryLN`
+    /// records (latest per file) plus obsolete counting for log entries
+    /// written after each file's last FileSummaryLN LSN.  Consumed by
+    /// `EnvironmentImpl` to seed the cleaner's `UtilizationProfile` so the
+    /// cleaner sees real utilization immediately after restart.
+    ///
+    /// Empty when the WAL had no FileSummaryLN records (a fresh env or one
+    /// that never checkpointed).  Keyed by file number; the value carries the
+    /// 11-field `FileSummary` breakdown as `(field tuple)` via
+    /// `RebuiltFileSummary`.
+    ///
+    /// JE: `UtilizationProfile.populateCache` builds `fileSummaryMap`;
+    /// `RecoveryUtilizationTracker.transferToUtilizationTracker` adds the
+    /// recovery-counted obsolete deltas.
+    pub rebuilt_file_summaries: hashbrown::HashMap<u32, RebuiltFileSummary>,
+}
+
+/// CLN-4: a per-file utilization summary rebuilt during recovery.
+///
+/// Mirrors the `FileSummary` field layout that the cleaner uses, but lives in
+/// `noxu-recovery` to avoid forcing a `noxu-cleaner` dependency on every
+/// `RecoveryInfo` consumer.  `EnvironmentImpl` converts it into the cleaner's
+/// `FileSummary` when seeding the profile.
+#[derive(Debug, Clone, Default)]
+pub struct RebuiltFileSummary {
+    pub total_count: i32,
+    pub total_size: i32,
+    pub total_in_count: i32,
+    pub total_in_size: i32,
+    pub total_ln_count: i32,
+    pub total_ln_size: i32,
+    pub max_ln_size: i32,
+    pub obsolete_in_count: i32,
+    pub obsolete_ln_count: i32,
+    pub obsolete_ln_size: i32,
+    pub obsolete_ln_size_counted: i32,
 }
 
 impl RecoveryInfo {
@@ -126,6 +163,7 @@ impl RecoveryInfo {
             recovered_db_names: hashbrown::HashMap::new(),
             recovered_vlsns: Vec::new(),
             rollback_matchpoint_lsn: None,
+            rebuilt_file_summaries: hashbrown::HashMap::new(),
         }
     }
 }

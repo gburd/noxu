@@ -238,7 +238,7 @@ pub struct Checkpointer {
     ///
     /// When set, `persist_file_summaries()` iterates tracked summaries and
     /// writes `FileSummaryLN` WAL entries.
-    utilization_tracker: Option<Arc<std::sync::Mutex<UtilizationTracker>>>,
+    utilization_tracker: Option<Arc<Mutex<UtilizationTracker>>>,
     /// Optional cleaner reference for the post-checkpoint callback.
     ///
     /// After each successful `do_checkpoint`, the checkpointer calls
@@ -358,7 +358,7 @@ impl Checkpointer {
     /// `Checkpointer` receiving the environment's utilization tracker.
     pub fn with_utilization_tracker(
         mut self,
-        tracker: Arc<std::sync::Mutex<UtilizationTracker>>,
+        tracker: Arc<Mutex<UtilizationTracker>>,
     ) -> Self {
         self.utilization_tracker = Some(tracker);
         self
@@ -526,21 +526,42 @@ impl Checkpointer {
             return Ok(());
         };
 
-        let tracker = tracker_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let tracked_files = tracker.get_tracked_files();
-        if tracked_files.is_empty() {
-            return Ok(());
-        }
+        // Snapshot the tracked summaries into owned values, then DROP the
+        // tracker lock BEFORE writing any FileSummaryLN.  This avoids a
+        // reentrant deadlock: `lm.log()` calls the installed write observer
+        // (the same UtilizationTracker, behind the same Mutex) to
+        // countNewLogEntry for the FileSummaryLN it just wrote.  JE
+        // (UtilizationProfile.putFileSummary) likewise reads the
+        // TrackedFileSummary out and then logs the FileSummaryLN without
+        // holding the tracker latch across the log write.
+        //
+        // noxu_sync::Mutex::lock() returns the guard directly (no poison).
+        let snapshot: Vec<(u32, noxu_cleaner::FileSummary, Vec<u32>)> = {
+            let tracker = tracker_lock.lock();
+            let tracked_files = tracker.get_tracked_files();
+            if tracked_files.is_empty() {
+                return Ok(());
+            }
+            tracked_files
+                .iter()
+                .map(|(file_number, tracked)| {
+                    (
+                        *file_number,
+                        tracked.get_summary().clone(),
+                        tracked.get_obsolete_offsets().to_vec(),
+                    )
+                })
+                .collect()
+        };
 
-        for (file_number, tracked) in tracked_files {
-            let summary = tracked.get_summary();
+        for (file_number, summary, offsets) in &snapshot {
             // C7: persist the full FileSummary breakdown (LN/IN totals +
             // obsolete + maxLNSize) AND the packed obsolete-offset list, so
             // the on-disk FileSummaryLN is as faithful as the in-memory
             // TrackedFileSummary.  JE: FileSummaryLN.writeToLog ->
             // baseSummary.writeToLog (11 ints) + obsoleteOffsets.writeToLog.
             let mut packed = noxu_cleaner::PackedOffsets::new();
-            packed.pack(tracked.get_obsolete_offsets());
+            packed.pack(offsets);
             let entry = FileSummaryLnEntry::new(
                 *file_number as u64,
                 summary.total_count,
@@ -1827,7 +1848,7 @@ mod tests {
         let mut tracker = UtilizationTracker::new(true);
         tracker.count_new_log_entry(0, 128, true, false);
         tracker.track_obsolete(0, 64, 64, true);
-        let tracker_arc = Arc::new(std::sync::Mutex::new(tracker));
+        let tracker_arc = Arc::new(Mutex::new(tracker));
 
         let checkpointer = Checkpointer::new(CheckpointConfig::default())
             .with_log_manager(Arc::clone(&lm))

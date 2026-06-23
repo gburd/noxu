@@ -1184,10 +1184,126 @@ fn deleted_ln_is_counted_obsolete_at_write() {
 }
 
 // ============================================================================
-// X-11: log_flush_no_sync_interval_ms daemon
+// CLN-4 (HEADLINE): cleaner relies on persisted utilization after restart
 // ============================================================================
 
-/// X-11: Verify the LogFlushTask daemon flushes CommitNoSync data to the OS
+/// HEADLINE (CLN-4 + C7 + cleaner-relies): write+overwrite records to
+/// accumulate obsolete bytes, checkpoint (persist_file_summaries writes the
+/// FileSummaryLN records), CLOSE, REOPEN (recovery rebuilds the profile), then
+/// the cleaner IMMEDIATELY sees the obsolete bytes for file 0 WITHOUT having
+/// re-warmed from any new writes.
+///
+/// FAIL-PRE (on main): recovery never read FileSummaryLN back, so the cleaner's
+/// UtilizationProfile was empty after restart — `get_profile_summary(0)` was
+/// `None` and the cleaner was blind until live writes re-warmed it (CLN-6).
+///
+/// PASS-POST (CLN-4): recovery rebuilds the profile from the persisted
+/// FileSummaryLN (latest per file), env-open seeds the cleaner via
+/// `seed_profile`, so `get_profile_summary(0)` shows the obsolete LN bytes
+/// immediately and the file is selectable for cleaning.
+///
+/// JE: UtilizationProfile.populateCache / RecoveryUtilizationTracker.
+#[test]
+fn cleaner_sees_persisted_obsolete_immediately_after_restart() {
+    use noxu_dbi::DbiEnvConfig;
+
+    let dir = TempDir::new().unwrap();
+    let cfg = DbiEnvConfig {
+        transactional: true,
+        // Small files so the overwrites roll past file 0.
+        log_file_max_bytes: 4096,
+        run_cleaner: false,
+        run_checkpointer: false,
+        run_in_compressor: false,
+        ..DbiEnvConfig::default()
+    };
+
+    // --- Session 1: write, overwrite, checkpoint, close. ---
+    {
+        let env = EnvironmentImpl::from_dbi_config(dir.path(), &cfg).unwrap();
+        let lm = env.get_log_manager().expect("writable env has LogManager");
+        let mut db_cfg = DatabaseConfig::new();
+        db_cfg.set_allow_create(true);
+        let db_arc = env.open_database("cleanable", &db_cfg).unwrap();
+        let mut cursor = CursorImpl::with_log_manager(db_arc, 1, lm);
+
+        const N: u16 = 60;
+        for i in 0u16..N {
+            let key = format!("key{i:04}");
+            cursor
+                .put(
+                    key.as_bytes(),
+                    b"initial-value-payload",
+                    PutMode::Overwrite,
+                )
+                .unwrap();
+        }
+        // Overwrite every record several times so file 0's versions are
+        // all superseded by later files.
+        for round in 0u16..5 {
+            for i in 0u16..N {
+                let key = format!("key{i:04}");
+                let val = format!("round{round}-value-payload");
+                cursor
+                    .put(key.as_bytes(), val.as_bytes(), PutMode::Overwrite)
+                    .unwrap();
+            }
+        }
+        cursor.close().unwrap();
+
+        // File 0 must have accumulated obsolete LNs in the live tracker.
+        let obsolete_live = {
+            let t = env.get_utilization_tracker().unwrap().lock();
+            t.get_tracked_summary(0)
+                .map(|s| s.get_summary().obsolete_ln_count)
+                .unwrap_or(0)
+        };
+        assert!(
+            obsolete_live > 0,
+            "file 0 must have obsolete LNs before checkpoint; got \
+             {obsolete_live}"
+        );
+
+        // Checkpoint persists the FileSummaryLN records (C7 form).
+        env.run_checkpoint().unwrap();
+        env.close().unwrap();
+    }
+
+    // --- Session 2: reopen.  Recovery rebuilds the profile; the cleaner
+    //     sees the persisted obsolete bytes WITHOUT any new writes. ---
+    let env2 = EnvironmentImpl::from_dbi_config(dir.path(), &cfg).unwrap();
+    let cleaner =
+        env2.get_cleaner().expect("writable env has a cleaner after reopen");
+
+    // CLN-4: the cleaner's profile is seeded from the persisted FileSummaryLN
+    // BEFORE any live write.  On main this is None (profile empty / blind).
+    let seeded = cleaner.get_profile_summary(0);
+    assert!(
+        seeded.is_some(),
+        "CLN-4: after restart the cleaner's profile must be seeded from the \
+         persisted FileSummaryLN for file 0 (was None/blind on main)"
+    );
+    let summary = seeded.unwrap();
+    assert!(
+        summary.obsolete_ln_count > 0,
+        "CLN-4: the seeded profile must show file 0's obsolete LNs \
+         immediately after restart; got {}",
+        summary.obsolete_ln_count
+    );
+    // The file's utilization must be measurably below full (obsolete bytes
+    // present), so it is selectable for cleaning without re-warming.
+    assert!(
+        summary.get_obsolete_size() > 0,
+        "CLN-4: file 0 must report obsolete bytes so the cleaner can select \
+         it for cleaning right after restart"
+    );
+
+    env2.close().unwrap();
+}
+
+// ============================================================================
+// X-11: log_flush_no_sync_interval_ms daemon
+// ============================================================================
 /// page cache within the configured interval.
 ///
 /// Test strategy:

@@ -256,6 +256,39 @@ pub struct DbTreeRecord {
     pub lsn: Lsn,
 }
 
+/// A persisted per-file utilization summary record (CLN-4 / C7).
+///
+/// Carries the full `FileSummary` breakdown plus the packed obsolete-offset
+/// list, as written by `Checkpointer::persist_file_summaries` and read back
+/// during recovery to rebuild the `UtilizationProfile` so the cleaner sees
+/// real utilization immediately after restart.
+///
+/// JE: `FileSummaryLN` / `UtilizationProfile.populateCache` (the FileSummaryLN
+/// records read back from the file-summary DB into `fileSummaryMap`).
+#[derive(Debug, Clone)]
+pub struct FileSummaryRecord {
+    /// Log file number these statistics apply to.
+    pub file_number: u32,
+    /// LSN of this FileSummaryLN entry (the "last logged" LSN per file, used
+    /// by the "count obsolete only if uncounted" gate).
+    pub lsn: Lsn,
+    pub total_count: i32,
+    pub total_size: i32,
+    pub total_in_count: i32,
+    pub total_in_size: i32,
+    pub total_ln_count: i32,
+    pub total_ln_size: i32,
+    pub max_ln_size: i32,
+    pub obsolete_in_count: i32,
+    pub obsolete_ln_count: i32,
+    pub obsolete_ln_size: i32,
+    pub obsolete_ln_size_counted: i32,
+    /// Number of packed obsolete offsets.
+    pub obsolete_offset_count: u32,
+    /// Packed (delta-varint) obsolete-offset bytes.
+    pub obsolete_offset_data: Vec<u8>,
+}
+
 /// Union of all log entry types that the 3-phase recovery processes.
 ///
 /// This mirrors the set of `LogEntryType` variants that `buildTree`, `undoLNs`,
@@ -284,6 +317,8 @@ pub enum LogEntry {
     DbTree(DbTreeRecord),
     /// Database name registration (NameLN / NameLNTxn).
     NameLn(NameLnRecord),
+    /// Persisted per-file utilization summary (CLN-4 / C7).
+    FileSummary(FileSummaryRecord),
 }
 
 /// Database name registration record (NameLN).
