@@ -265,6 +265,15 @@ pub struct ReplicatedEnvironment {
     /// which `EnvironmentLogScanner` then picks up without any
     /// `replicate_entry` call from the application.
     wal_vlsn_counter: Arc<std::sync::atomic::AtomicU64>,
+
+    /// REP-10 (C): the replica-side consistency tracker, built from the
+    /// REP-7 `last_applied_vlsn` handle when the replica replay thread starts
+    /// (`become_replica`).  `None` on a master or before replay is wired.
+    ///
+    /// A read that begins on a replica with a non-`NoConsistency` policy waits
+    /// on this tracker (`begin_read_consistency`).  Port of
+    /// `RepImpl.getConsistency` / `Replica.getConsistencyTracker`.
+    consistency_tracker: StdMutex<Option<crate::ConsistencyTracker>>,
 }
 
 impl ReplicatedEnvironment {
@@ -498,6 +507,7 @@ impl ReplicatedEnvironment {
             feeder_queues: std::sync::RwLock::new(HashMap::new()),
             active_feeder_runners: StdMutex::new(HashMap::new()),
             wal_vlsn_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            consistency_tracker: StdMutex::new(None),
         };
 
         Ok(env)
@@ -1371,6 +1381,14 @@ impl ReplicatedEnvironment {
         self.vlsn_index.get_latest_vlsn()
     }
 
+    /// The replica-side replication stream state (master high-water, applied
+    /// VLSN, lag).  Used by the consistency read-gate to learn the master's
+    /// latest known commit VLSN (JE `ConsistencyTracker.masterTxnEndVLSN`,
+    /// updated by heartbeats).
+    pub fn replica_stream(&self) -> &ReplicaStream {
+        &self.replica_stream
+    }
+
     /// REP-10 (B): mint a [`CommitToken`] for the most recent commit on this
     /// master.
     ///
@@ -1390,6 +1408,76 @@ impl ReplicatedEnvironment {
         }
         let vlsn = self.wal_vlsn_counter.load(Ordering::Acquire);
         crate::CommitToken::new(self.config.group_name.clone(), vlsn)
+    }
+
+    /// REP-10 (C): the read-gate. Enforce a replica read-consistency policy
+    /// before a read transaction proceeds.
+    ///
+    /// Port of `ReplicaConsistencyPolicy.ensureConsistency` as invoked from a
+    /// replica `beginTransaction` (`RepImpl.checkConsistency` /
+    /// `Replica.getConsistencyTracker().awaitVLSN`).  Called by the replica
+    /// env's transaction-begin / read path.
+    ///
+    /// - `policy_override`: a per-transaction policy (JE
+    ///   `TransactionConfig.setConsistencyPolicy`).  When `None`, the node's
+    ///   configured default is used (`ReplicationConfig.setConsistencyPolicy`
+    ///   — [`RepConfig::consistency_policy`]).
+    ///
+    /// On a master, or when the effective policy is
+    /// [`ConsistencyPolicy::NoConsistency`], this returns immediately so
+    /// existing behaviour is unchanged unless a policy is set.  On a replica
+    /// with a non-`NoConsistency` policy it BLOCKS until the replica has
+    /// replayed far enough or the policy timeout expires (a clean
+    /// [`RepError`], never a hang).
+    pub fn begin_read_consistency(
+        &self,
+        policy_override: Option<&crate::ConsistencyPolicy>,
+    ) -> Result<()> {
+        // Resolve the effective policy: per-txn override else node default.
+        let default_policy = self.config.consistency_policy.clone();
+        let policy = policy_override.unwrap_or(&default_policy);
+
+        // NoConsistency never blocks (the master path also lands here).
+        if matches!(policy, crate::ConsistencyPolicy::NoConsistency) {
+            return Ok(());
+        }
+
+        // A non-No policy only makes sense on a replica with a live replay
+        // (its last_applied_vlsn is the wait predicate).  Without a tracker
+        // there is nothing to wait on — treat as immediately consistent
+        // rather than block forever (e.g. on the master, which is by
+        // definition fully current).
+        let tracker = self.consistency_tracker.lock().unwrap().clone();
+        let Some(tracker) = tracker else {
+            return Ok(());
+        };
+
+        // Surface the master's latest known VLSN for the time policy
+        // (heartbeat / feeder high-water).  JE ConsistencyTracker tracks this
+        // via trackHeartbeat; here we read the replica_stream high-water.
+        let master_vlsn = self.replica_stream.get_master_vlsn();
+        if master_vlsn > 0 {
+            tracker.set_master_vlsn(master_vlsn);
+        }
+
+        tracker.await_consistency(policy)
+    }
+
+    /// REP-10 (C) test seam: install a [`ConsistencyTracker`] over an existing
+    /// `last_applied_vlsn` handle, exactly as `become_replica` does when it
+    /// starts the live replay thread.
+    ///
+    /// Lets a test drive a real [`noxu_dbi::ReplicaReplay`] and exercise
+    /// [`Self::begin_read_consistency`] end-to-end without standing up TCP
+    /// feeder/receiver threads.  Not part of the production API.
+    #[cfg(any(test, feature = "test-harness"))]
+    pub fn install_consistency_tracker_for_test(
+        &self,
+        last_applied_vlsn: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) -> crate::ConsistencyTracker {
+        let tracker = crate::ConsistencyTracker::new(last_applied_vlsn);
+        *self.consistency_tracker.lock().unwrap() = Some(tracker.clone());
+        tracker
     }
 
     /// REP-1 STEP 5 (D): run a live syncup against `feeder` and, if this
@@ -2076,6 +2164,18 @@ impl ReplicatedEnvironment {
                 // each streamed entry to the live in-memory tree.
                 let env_for_replay = Arc::clone(&env);
 
+                // REP-10 (C): build the ReplicaReplay HERE (not inside the
+                // closure) so we can publish its REP-7 `last_applied_vlsn`
+                // handle to a ConsistencyTracker BEFORE the thread starts
+                // streaming.  A read on this replica then waits on the same
+                // handle the replay thread advances.  Port of
+                // RepImpl.getConsistency / Replica.getConsistencyTracker.
+                let replay = noxu_dbi::ReplicaReplay::new(env_for_replay);
+                let tracker = crate::ConsistencyTracker::new(
+                    replay.last_applied_vlsn_handle(),
+                );
+                *self.consistency_tracker.lock().unwrap() = Some(tracker);
+
                 let handle = std::thread::Builder::new()
                     .name(format!("noxu-replica-{}", node_name))
                     .spawn(move || {
@@ -2083,8 +2183,6 @@ impl ReplicatedEnvironment {
                         // on the replica see replicated data without a
                         // restart.  JE: the replica writes each entry to its
                         // log, then Replay.replayEntry applies it to the tree.
-                        let replay =
-                            noxu_dbi::ReplicaReplay::new(env_for_replay);
                         let mut writer = EnvironmentLogWriter::with_replay(
                             log_mgr,
                             vlsn_index_clone,
