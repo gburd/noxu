@@ -754,6 +754,11 @@ impl EnvironmentImpl {
 
         let mut primary_tree_inner = noxu_tree::Tree::new(1, 256);
         primary_tree_inner.set_memory_counter(Arc::clone(&cache_usage));
+        // EV-14: wire the log manager so an evicted root IN can be re-fetched
+        // from its persisted LSN (Tree::fetch_root_from_log).
+        if let Some(ref lm) = log_manager {
+            primary_tree_inner.set_log_manager(Arc::clone(lm));
+        }
         let primary_tree: Arc<std::sync::RwLock<noxu_tree::Tree>> =
             Arc::new(std::sync::RwLock::new(primary_tree_inner));
 
@@ -1509,6 +1514,11 @@ impl EnvironmentImpl {
             if let Ok(mut tree_guard) = tree_arc.write() {
                 tree_guard.set_in_list_listener(Arc::clone(&self.evictor)
                     as Arc<dyn noxu_tree::InListListener>);
+                // EV-14: wire the log manager so this DB's evicted root IN can
+                // be re-fetched from its persisted LSN on next access.
+                if let Some(ref lm) = self.log_manager {
+                    tree_guard.set_log_manager(Arc::clone(lm));
+                }
             }
             self.evictor.set_tree(tree_arc, db_id.id() as u64);
         }
