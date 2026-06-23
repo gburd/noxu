@@ -1070,6 +1070,29 @@ impl Checkpointer {
             )?;
             result.full_bins_flushed += r.full_bins_flushed;
             result.delta_ins_flushed += r.delta_ins_flushed;
+            result.obsolete_delta_lsns.extend(r.obsolete_delta_lsns);
+        }
+
+        // L-5-delta: count the superseded prior BIN-deltas (auxOldLsn)
+        // obsolete via the wired UtilizationTracker, BEFORE
+        // persist_file_summaries so the counts land in this checkpoint's
+        // FileSummaryLN.  JE: LogManager.serialLogWork counts auxOldLsn via
+        // countObsoleteNodeDupsAllowed(auxOldLsn, type, size=0, nodeDb).
+        if !result.obsolete_delta_lsns.is_empty()
+            && let Some(tracker_lock) = &self.utilization_tracker
+        {
+            let mut tracker = tracker_lock.lock();
+            for (lsn, db_id) in &result.obsolete_delta_lsns {
+                // size 0 (auxOldLsn carries no size); count_as_ln = false (an
+                // IN/BIN-delta, not an LN); dups-allowed variant (INs use it).
+                tracker.count_obsolete_node_dups_allowed(
+                    lsn.file_number(),
+                    lsn.file_offset(),
+                    0,
+                    false,
+                    Some(*db_id),
+                );
+            }
         }
 
         // Persist file utilization summaries so they survive restarts.
@@ -1132,6 +1155,12 @@ impl Checkpointer {
 
             if use_delta {
                 // --- BIN-delta path ---
+                // L-5-delta: the prior BIN-delta this one supersedes (JE
+                // `auxOldLsn = logEntry.getPrevDeltaLsn()`) becomes obsolete
+                // when we log the new delta non-provisionally.  Capture it
+                // BEFORE advancing the delta chain; counted obsolete by
+                // `flush_dirty_bins_internal` via the tracker.
+                let superseded_delta_lsn = b.last_delta_lsn;
                 let delta_bytes = b.serialize_delta();
                 let entry = BinDeltaLogEntry::new(
                     db_id,
@@ -1157,6 +1186,15 @@ impl Checkpointer {
                 b.last_delta_lsn = delta_logged_lsn; // advance chain for next delta
                 b.clear_dirty_after_delta_log();
                 result.delta_ins_flushed += 1;
+                // L-5-delta: record the superseded prior delta (auxOldLsn) for
+                // obsolete counting.  Only when non-null — a delta whose prior
+                // version was a full BIN has prev_delta_lsn == NULL (the full
+                // version stays live, referenced by the delta).
+                if superseded_delta_lsn != NULL_LSN {
+                    result
+                        .obsolete_delta_lsns
+                        .push((superseded_delta_lsn, db_id as u32));
+                }
             } else {
                 // --- Full BIN path ---
                 let full_bytes = b.serialize_full();
@@ -1377,6 +1415,14 @@ pub(crate) struct FlushResult {
     full_ins_flushed: u64,
     full_bins_flushed: u64,
     delta_ins_flushed: u64,
+    /// L-5-delta: per-DB superseded prior BIN-delta LSNs made obsolete by a
+    /// newly-logged BIN-delta (the `prev_delta_lsn` / JE `auxOldLsn`).
+    /// `flush_dirty_bins_internal` counts these obsolete via the wired
+    /// `UtilizationTracker` after the flush (it has `&self`; the per-tree
+    /// flush is a static helper without tracker access).  Tuple is
+    /// `(prev_delta_lsn, db_id)`.  JE: IN.java auxOldLsn ->
+    /// LogManager.countObsoleteNodeDupsAllowed.
+    obsolete_delta_lsns: Vec<(Lsn, u32)>,
 }
 
 #[cfg(test)]
@@ -1994,6 +2040,113 @@ mod tests {
         assert_eq!(
             result.full_bins_flushed, 0,
             "X-8: checkpointer must not write a redundant full-BIN for a BIN the evictor already flushed"
+        );
+    }
+
+    /// L-5-delta: when the checkpointer logs a BIN-delta that supersedes a
+    /// PRIOR delta (`prev_delta_lsn != NULL`), that prior delta's LSN (JE
+    /// `auxOldLsn`) must be counted obsolete via the wired UtilizationTracker
+    /// using the dups-allowed variant (size 0, count_as_ln = false), BEFORE
+    /// persist_file_summaries so it lands in this checkpoint's FileSummaryLN.
+    ///
+    /// FAIL-PRE: the prior delta LSN was never counted obsolete — the
+    /// superseded BIN-delta version leaked, and the cleaner under-counted the
+    /// obsolete bytes in that file.
+    ///
+    /// PASS-POST: the prior delta's file/offset shows one obsolete IN
+    /// (`obsolete_in_count == 1`) and the offset is tracked.
+    ///
+    /// JE: IN.java auxOldLsn -> LogManager.serialLogWork
+    /// countObsoleteNodeDupsAllowed.
+    #[test]
+    fn test_l5_delta_counts_prior_delta_obsolete() {
+        use noxu_cleaner::UtilizationTracker;
+        use noxu_log::FileManager;
+        use noxu_tree::tree::{Tree, TreeNode};
+        use noxu_util::lsn::Lsn;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let fm = Arc::new(
+            FileManager::new(dir.path(), false, 64 * 1024 * 1024, 100).unwrap(),
+        );
+        let lm =
+            Arc::new(LogManager::new(Arc::clone(&fm), 3, 1024 * 1024, 65536));
+
+        // Build a tree with a BIN holding several keys.
+        let tree = Tree::new(1, 256);
+        for i in 0u16..16 {
+            let key = format!("key{i:03}");
+            tree.insert(
+                key.into_bytes(),
+                b"v".to_vec(),
+                Lsn::new(1, i as u32 + 1),
+            )
+            .unwrap();
+        }
+        let tree_arc = Arc::new(RwLock::new(tree));
+
+        // Put the BIN into the "already has a full version AND a prior delta"
+        // state, then dirty exactly ONE slot so `should_log_delta` chooses the
+        // delta path (numDeltas=1 <= delta_limit at the default percent).  The
+        // prior delta LSN we install here is the auxOldLsn that must be
+        // counted obsolete when the new delta is logged.
+        let prior_delta_lsn = Lsn::new(3, 4096);
+        let dirty_bins = tree_arc.read().unwrap().collect_dirty_bins(1);
+        assert!(!dirty_bins.is_empty(), "precondition: dirty BINs");
+        for (_db, bin_arc) in &dirty_bins {
+            let mut guard = bin_arc.write();
+            if let TreeNode::Bottom(ref mut b) = *guard {
+                // Mark clean first, then set the prior full + prior delta
+                // chain and re-dirty exactly one slot.
+                b.clear_dirty_after_full_log(Lsn::new(2, 100));
+                b.last_delta_lsn = prior_delta_lsn;
+                b.is_delta = true;
+                b.prohibit_next_delta = false;
+                b.dirty = true;
+                if let Some(e) = b.entries.first_mut() {
+                    e.dirty = true;
+                }
+            }
+        }
+
+        let mut tracker = UtilizationTracker::new(true);
+        // Seed file 3 so the obsolete counting has a summary to update.
+        tracker.count_new_log_entry(3, 64, false, true);
+        let tracker_arc = Arc::new(Mutex::new(tracker));
+
+        let checkpointer = Checkpointer::new(CheckpointConfig::default())
+            .with_log_manager(Arc::clone(&lm))
+            .with_tree(Arc::clone(&tree_arc), 1)
+            .with_utilization_tracker(Arc::clone(&tracker_arc));
+
+        let result = checkpointer
+            .flush_dirty_bins_internal()
+            .expect("flush_dirty_bins_internal failed");
+
+        // The checkpointer must have taken the delta path (producer exists).
+        assert_eq!(
+            result.delta_ins_flushed, 1,
+            "L-5-delta: checkpointer must log exactly one BIN-delta here"
+        );
+
+        // PASS-POST: the prior delta (auxOldLsn) was counted obsolete in its
+        // file (3) as an IN, size 0, offset tracked.
+        let tracker = tracker_arc.lock();
+        let summary = tracker
+            .get_tracked_summary(prior_delta_lsn.file_number())
+            .expect("file 3 summary must exist after counting the prior delta");
+        assert_eq!(
+            summary.get_summary().obsolete_in_count,
+            1,
+            "L-5-delta: the superseded prior BIN-delta must be counted obsolete \
+             (obsolete_in_count == 1); was the auxOldLsn wiring dropped?"
+        );
+        assert!(
+            summary
+                .get_obsolete_offsets()
+                .contains(&prior_delta_lsn.file_offset()),
+            "L-5-delta: the prior delta's offset must be tracked obsolete"
         );
     }
 
