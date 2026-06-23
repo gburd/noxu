@@ -26,6 +26,14 @@
 //!  obsoleteLNSizeCounted`.  Following them is the obsolete-offset blob,
 //! length-prefixed (the Noxu `PackedOffsets` delta-varint encoding, distinct
 //! from JE's short-array encoding but round-trip equivalent).
+//!
+//! CLN-24 appends one more length-prefixed trailer after the obsolete-offset
+//! blob: the serialized per-file expiration histogram
+//! (`ExpirationTracker::serialize`).  JE keeps this in a separate EXPIRATION
+//! DB (`FileExpirationLN`); Noxu folds it into the FileSummaryLN trailer so a
+//! single record restores both utilization and the TTL expiration prediction
+//! at recovery.  The trailer is optional on read — pre-CLN-24 entries decode
+//! it as empty.
 
 use byteorder::{BigEndian, ReadBytesExt};
 use bytes::{BufMut, BytesMut};
@@ -81,6 +89,19 @@ pub struct FileSummaryLnEntry {
     pub obsolete_offset_count: u32,
     /// Packed (delta-varint) obsolete-LN offset bytes (C7 PackedOffsets).
     pub obsolete_offset_data: Vec<u8>,
+    /// Serialized per-file expiration histogram (CLN-24).
+    ///
+    /// The byte form produced by `ExpirationTracker::serialize` (JE
+    /// `ExpirationTracker.serialize` — byte 0 day/hour flag + RLE
+    /// `{interval,size}` packed pairs).  Empty when the file has no
+    /// expiring (TTL) data, or for FileSummaryLN entries written before
+    /// CLN-24 (the trailing blob is absent and reads back as empty).
+    ///
+    /// JE keeps this in a separate EXPIRATION DB (`FileExpirationLN`);
+    /// Noxu folds it into the FileSummaryLN trailer alongside the C7
+    /// breakdown so a single record carries both the utilization and the
+    /// expiration prediction the cleaner needs after restart.
+    pub expiration_histogram: Vec<u8>,
 }
 
 impl FileSummaryLnEntry {
@@ -104,6 +125,7 @@ impl FileSummaryLnEntry {
         obsolete_ln_size_counted: i32,
         obsolete_offset_count: u32,
         obsolete_offset_data: Vec<u8>,
+        expiration_histogram: Vec<u8>,
     ) -> Self {
         Self {
             file_number,
@@ -120,6 +142,7 @@ impl FileSummaryLnEntry {
             obsolete_ln_size_counted,
             obsolete_offset_count,
             obsolete_offset_data,
+            expiration_histogram,
         }
     }
 
@@ -129,7 +152,9 @@ impl FileSummaryLnEntry {
         (11 * 4) + // 11 FileSummary breakdown ints
         4 + // obsolete_offset_count
         4 + // obsolete_offset_data length prefix
-        self.obsolete_offset_data.len()
+        self.obsolete_offset_data.len() +
+        4 + // CLN-24 expiration_histogram length prefix
+        self.expiration_histogram.len()
     }
 
     /// Writes this entry to a buffer.
@@ -154,6 +179,9 @@ impl FileSummaryLnEntry {
         buf.put_u32(self.obsolete_offset_count);
         buf.put_u32(self.obsolete_offset_data.len() as u32);
         buf.put_slice(&self.obsolete_offset_data);
+        // CLN-24: length-prefixed serialized expiration histogram trailer.
+        buf.put_u32(self.expiration_histogram.len() as u32);
+        buf.put_slice(&self.expiration_histogram);
     }
 
     /// Reads an entry from a buffer.
@@ -175,6 +203,16 @@ impl FileSummaryLnEntry {
         let data_len = cursor.read_u32::<BigEndian>()? as usize;
         let mut obsolete_offset_data = vec![0u8; data_len];
         cursor.read_exact(&mut obsolete_offset_data)?;
+        // CLN-24: the expiration-histogram trailer is optional.  Pre-CLN-24
+        // entries have no trailing length prefix; treat EOF as "empty".
+        let expiration_histogram = match cursor.read_u32::<BigEndian>() {
+            Ok(hlen) => {
+                let mut h = vec![0u8; hlen as usize];
+                cursor.read_exact(&mut h)?;
+                h
+            }
+            Err(_) => Vec::new(),
+        };
         Ok(Self {
             file_number,
             total_count,
@@ -190,6 +228,7 @@ impl FileSummaryLnEntry {
             obsolete_ln_size_counted,
             obsolete_offset_count,
             obsolete_offset_data,
+            expiration_histogram,
         })
     }
 }
@@ -215,6 +254,7 @@ mod tests {
             200,
             3,
             vec![0xAC, 0x02, 0x01],
+            vec![0, 0xAC, 0x02, 0x10], // CLN-24 expiration histogram blob
         );
 
         let mut buf = BytesMut::new();
@@ -234,6 +274,8 @@ mod tests {
         // C7: the packed obsolete-offset blob round-trips verbatim.
         assert_eq!(decoded.obsolete_offset_count, 3);
         assert_eq!(decoded.obsolete_offset_data, vec![0xAC, 0x02, 0x01]);
+        // CLN-24: the expiration histogram trailer round-trips verbatim.
+        assert_eq!(decoded.expiration_histogram, vec![0, 0xAC, 0x02, 0x10]);
     }
 
     #[test]
@@ -253,6 +295,7 @@ mod tests {
             0,
             0,
             Vec::new(),
+            Vec::new(),
         );
 
         let mut buf = BytesMut::new();
@@ -262,6 +305,7 @@ mod tests {
         assert_eq!(entry, decoded);
         assert_eq!(decoded.obsolete_offset_count, 0);
         assert!(decoded.obsolete_offset_data.is_empty());
+        assert!(decoded.expiration_histogram.is_empty());
     }
 
     #[test]
@@ -281,10 +325,31 @@ mod tests {
             5,
             2,
             vec![1, 2, 3, 4],
+            vec![5, 6],
         );
-        assert_eq!(entry.log_size(), 8 + (11 * 4) + 4 + 4 + 4);
+        assert_eq!(entry.log_size(), 8 + (11 * 4) + 4 + 4 + 4 + 4 + 2);
         let mut buf = BytesMut::new();
         entry.write_to_log(&mut buf);
         assert_eq!(buf.len(), entry.log_size());
+    }
+
+    /// CLN-24: a FileSummaryLN written WITHOUT the expiration trailer (the
+    /// pre-CLN-24 on-disk form) must still decode — the missing trailer
+    /// reads back as an empty histogram.
+    #[test]
+    fn test_file_summary_ln_backward_compat_no_trailer() {
+        // Hand-build the pre-CLN-24 byte layout: 8 + 11*4 ints + offset
+        // count + length-prefixed offset blob, with NO trailing histogram.
+        let mut buf = BytesMut::new();
+        buf.put_u64(9);
+        for _ in 0..11 {
+            buf.put_i32(0);
+        }
+        buf.put_u32(0); // obsolete_offset_count
+        buf.put_u32(0); // obsolete_offset_data length
+        // (no expiration_histogram trailer)
+        let decoded = FileSummaryLnEntry::read_from_log(&buf).unwrap();
+        assert_eq!(decoded.file_number, 9);
+        assert!(decoded.expiration_histogram.is_empty());
     }
 }

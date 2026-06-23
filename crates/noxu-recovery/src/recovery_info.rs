@@ -145,6 +145,12 @@ pub struct RebuiltFileSummary {
     pub obsolete_ln_count: i32,
     pub obsolete_ln_size: i32,
     pub obsolete_ln_size_counted: i32,
+    /// CLN-24: serialized per-file expiration histogram
+    /// (`ExpirationTracker::serialize`), restored from the FileSummaryLN
+    /// trailer.  Empty when the file has no TTL data.  `EnvironmentImpl`
+    /// deserializes it to restore the cleaner's expiration band so the
+    /// two-pass gate sees the persisted TTL prediction after restart.
+    pub expiration_histogram: Vec<u8>,
 }
 
 impl RecoveryInfo {

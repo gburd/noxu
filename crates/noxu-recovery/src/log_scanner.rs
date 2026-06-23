@@ -287,6 +287,12 @@ pub struct FileSummaryRecord {
     pub obsolete_offset_count: u32,
     /// Packed (delta-varint) obsolete-offset bytes.
     pub obsolete_offset_data: Vec<u8>,
+    /// CLN-24: serialized per-file expiration histogram
+    /// (`ExpirationTracker::serialize`).  Empty when the file has no TTL data
+    /// or the FileSummaryLN predates CLN-24.  Deserialized at recovery to
+    /// restore the cleaner's expiration band (`obsolete_expired_size` /
+    /// `obsolete_expired_gradual_size`).
+    pub expiration_histogram: Vec<u8>,
 }
 
 /// Union of all log entry types that the 3-phase recovery processes.

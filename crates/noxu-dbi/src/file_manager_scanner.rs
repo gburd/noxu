@@ -419,6 +419,7 @@ impl FileManagerLogScanner {
                     obsolete_ln_size_counted: e.obsolete_ln_size_counted,
                     obsolete_offset_count: e.obsolete_offset_count,
                     obsolete_offset_data: e.obsolete_offset_data,
+                    expiration_histogram: e.expiration_histogram,
                 }))
             }
 

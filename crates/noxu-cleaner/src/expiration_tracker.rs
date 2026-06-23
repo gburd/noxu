@@ -88,6 +88,85 @@ impl ExpirationTracker {
         expired_size
     }
 
+    /// Serializes the histogram to a compact byte array (CLN-24).
+    ///
+    /// Faithful port of JE `ExpirationTracker.serialize`: byte 0 is the
+    /// `hours` flag (`1` iff any `exp % 24 != 0`, else `0`); the remainder is
+    /// a run-length-encoded series of `{interval, byteSize}` varint pairs,
+    /// ordered by expiration time.  `interval` is the delta from the previous
+    /// expiration value.  When all values are day-aligned (`hours == 0`) the
+    /// expiration values are stored in DAYS (`exp / 24`) to shrink the deltas,
+    /// matching JE's packed-integer space optimisation.
+    ///
+    /// Returns an empty `Vec` if no data has an expiration time (JE returns
+    /// `Key.EMPTY_KEY`).  The serialized byte counter per bucket mirrors JE's
+    /// `AtomicInteger` byte counters.
+    ///
+    /// JE: `ExpirationTracker.serialize` / `isExpirationInHours`.
+    pub fn serialize(&self) -> Vec<u8> {
+        if self.bins.is_empty() {
+            return Vec::new();
+        }
+        let mut exps: Vec<u64> = self.bins.keys().copied().collect();
+        exps.sort_unstable();
+        // JE: hours = true iff any exp % 24 != 0.
+        let hours = exps.iter().any(|&exp| exp % 24 != 0);
+        let mut out = Vec::with_capacity(1 + exps.len() * 4);
+        out.push(if hours { 1u8 } else { 0u8 });
+        let mut prev_exp: u32 = 0;
+        for exp in exps {
+            let size = self.bins[&exp].size as u32;
+            // JE: if !hours, store the value in days (exp / 24).  Expiration
+            // times are hours-since-epoch (< 2^32 for any realistic clock),
+            // so the u64->u32 narrowing is lossless.
+            let stored = (if hours { exp } else { exp / 24 }) as u32;
+            write_varint(&mut out, stored - prev_exp);
+            write_varint(&mut out, size);
+            prev_exp = stored;
+        }
+        out
+    }
+
+    /// Reconstructs an `ExpirationTracker` for `file_number` from the
+    /// serialized form produced by [`serialize`](Self::serialize) (CLN-24).
+    ///
+    /// The reconstructed tracker carries the same per-bucket byte counts and
+    /// the same day/hour granularity as the original, so the recovered
+    /// `get_expired_bytes_band` prediction matches what the live tracker
+    /// would have produced before the restart.  The per-bin record `count`
+    /// is not serialized (JE persists only the byte counter); it is
+    /// reconstructed as `1` per bucket.
+    ///
+    /// An empty slice yields an empty tracker (no expiring data).
+    ///
+    /// JE: `ExpirationTracker.toString(byte[])` / `getExpiredBytes(byte[],..)`
+    /// (the same `{interval,size}` packed-pair reader, day-or-hour by byte 0).
+    pub fn deserialize(file_number: u32, serialized: &[u8]) -> Self {
+        let mut t = Self::new(file_number);
+        if serialized.is_empty() {
+            return t;
+        }
+        let hours = serialized[0] == 1;
+        let mut pos = 1usize;
+        let mut prev_exp: u64 = 0;
+        while pos < serialized.len() {
+            let (delta, n1) = read_varint(&serialized[pos..]);
+            pos += n1;
+            if pos >= serialized.len() {
+                break;
+            }
+            let (size, n2) = read_varint(&serialized[pos..]);
+            pos += n2;
+            let stored = prev_exp + delta as u64;
+            prev_exp = stored;
+            // JE stores in days when !hours; convert back to hours-since-epoch
+            // (the unit ExpirationTracker tracks in).
+            let exp_hours = if hours { stored } else { stored * 24 };
+            t.track(exp_hours, size as i32);
+        }
+        t
+    }
+
     /// Returns whether every tracked bin expires on a DAY boundary (its
     /// expiration hour is a multiple of 24).  When true, JE represents the
     /// histogram in days and prorates the gradual band over a whole day
@@ -196,6 +275,42 @@ impl ExpirationTracker {
     }
 }
 
+/// LEB128-style varint writer (7 data bits + continuation bit per byte).
+///
+/// Local to the expiration serializer; the byte layout only needs to be
+/// self-consistent across `serialize`/`deserialize` (it is the record "data"
+/// in a FileSummaryLN, not an interop format).  Matches the encoding used by
+/// `packed_offsets::write_varint`.
+fn write_varint(buffer: &mut Vec<u8>, mut value: u32) {
+    loop {
+        let mut byte = (value & 0x7F) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        buffer.push(byte);
+        if value == 0 {
+            break;
+        }
+    }
+}
+
+/// LEB128-style varint reader; returns `(value, bytes_read)`.
+fn read_varint(buffer: &[u8]) -> (u32, usize) {
+    let mut value = 0u32;
+    let mut shift = 0;
+    let mut bytes_read = 0;
+    for &byte in buffer {
+        bytes_read += 1;
+        value |= ((byte & 0x7F) as u32) << shift;
+        if byte & 0x80 == 0 {
+            break;
+        }
+        shift += 7;
+    }
+    (value, bytes_read)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,6 +391,99 @@ mod tests {
         // would reach only at the END of its hour.
         let (_, up_d_mid) = day.get_expired_bytes_band(36, 0);
         assert_eq!(up_d_mid, 500, "day band at mid-day = half the bin");
+    }
+
+    /// CLN-24 roundtrip: serialize the histogram, deserialize, and assert the
+    /// reconstructed tracker yields the SAME expired-bytes band — including
+    /// the day-band proration math.
+    ///
+    /// Day-band math (the assertion the previous agent miscalculated): with
+    /// `interval = DAY` and a bin on the current day-bucket, at wall-clock
+    /// `current_time = T` hours / `sub_hour_ms` ms,
+    ///   elapsed_in_day = (T % 24) * HOUR_MS + sub_hour_ms
+    ///   gradual = lower + bin_size * elapsed_in_day / DAY_MS.
+    #[test]
+    fn test_cln24_serialize_roundtrip_days() {
+        const HOUR_MS: u64 = 3_600_000;
+        const DAY_MS: u64 = HOUR_MS * 24;
+        // Day-aligned histogram: bins on day-buckets 1, 2, 3 (hours 24,48,72).
+        let mut t = ExpirationTracker::new(7);
+        t.track(24, 1000);
+        t.track(48, 2000);
+        t.track(72, 4000);
+        assert!(!t.is_expiration_in_hours(), "all bins day-aligned");
+
+        let bytes = t.serialize();
+        // byte 0 must be the day flag (0 = days), non-empty payload follows.
+        assert_eq!(bytes[0], 0, "day-aligned histogram serializes with days");
+        assert!(bytes.len() > 1);
+
+        let r = ExpirationTracker::deserialize(7, &bytes);
+        assert_eq!(r.get_file_number(), 7);
+        assert_eq!(r.get_bin_count(), 3, "all three buckets restored");
+        assert!(!r.is_expiration_in_hours(), "granularity preserved (days)");
+        assert_eq!(r.get_total_tracked_size(), 7000);
+        // Per-bucket sizes restored.
+        assert_eq!(r.get_bins().get(&24).unwrap().size, 1000);
+        assert_eq!(r.get_bins().get(&48).unwrap().size, 2000);
+        assert_eq!(r.get_bins().get(&72).unwrap().size, 4000);
+
+        // Band MUST match the original at an arbitrary wall-clock point.
+        // Evaluate at current_time = 49 (day-bucket 2, 1h into the day),
+        // sub_hour = 30min.  day-bucket 1 (hours 24..47) is fully in a PRIOR
+        // day => lower = 1000.  day-bucket 2 (the bin at hour 48) is the
+        // current day => prorated.
+        //   elapsed_in_day = (49 % 24) * HOUR_MS + 30min
+        //                  = 1*HOUR_MS + HOUR_MS/2 = 1.5h of a 24h interval.
+        let sub = HOUR_MS / 2;
+        let (lo_orig, up_orig) = t.get_expired_bytes_band(49, sub);
+        let (lo_r, up_r) = r.get_expired_bytes_band(49, sub);
+        assert_eq!((lo_orig, up_orig), (lo_r, up_r), "band survives roundtrip");
+        // Concrete: lower = 1000 (day 1 elapsed); gradual adds day-2 (2000)
+        // prorated by 1.5h/24h.
+        let elapsed = HOUR_MS + sub; // 1.5h in ms
+        let expect_lo = 1000i64;
+        let expect_up = 1000 + 2000 * elapsed as i64 / DAY_MS as i64;
+        assert_eq!(lo_r, expect_lo, "day-1 fully obsolete");
+        assert_eq!(up_r, expect_up, "day-2 prorated over MILLIS_PER_DAY");
+    }
+
+    /// CLN-24 roundtrip: an HOUR-granularity histogram (a non-day-aligned
+    /// bin) serializes with the hours flag set and prorates over the hour.
+    #[test]
+    fn test_cln24_serialize_roundtrip_hours() {
+        let mut t = ExpirationTracker::new(3);
+        t.track(25, 1000); // 25 % 24 != 0 => hours
+        t.track(100, 500);
+        assert!(t.is_expiration_in_hours());
+
+        let bytes = t.serialize();
+        assert_eq!(
+            bytes[0], 1,
+            "hour-granular histogram serializes with hours"
+        );
+
+        let r = ExpirationTracker::deserialize(3, &bytes);
+        assert!(r.is_expiration_in_hours(), "granularity preserved (hours)");
+        assert_eq!(r.get_bin_count(), 2);
+        assert_eq!(r.get_bins().get(&25).unwrap().size, 1000);
+        assert_eq!(r.get_bins().get(&100).unwrap().size, 500);
+        // Band matches: at hour 100, 30min in: hour 25 fully obsolete (1000),
+        // hour 100 prorated by 0.5 => +250.
+        let (lo, up) = r.get_expired_bytes_band(100, 1_800_000);
+        assert_eq!(lo, 1000);
+        assert_eq!(up, 1250);
+    }
+
+    /// CLN-24: an empty histogram serializes to an empty array (JE returns
+    /// `Key.EMPTY_KEY`) and deserializes back to an empty tracker.
+    #[test]
+    fn test_cln24_serialize_empty() {
+        let t = ExpirationTracker::new(0);
+        assert!(t.serialize().is_empty());
+        let r = ExpirationTracker::deserialize(0, &[]);
+        assert_eq!(r.get_bin_count(), 0);
+        assert_eq!(r.get_total_tracked_size(), 0);
     }
 
     #[test]
