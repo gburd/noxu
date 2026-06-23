@@ -75,6 +75,43 @@ pub static UNIMPLEMENTED_ENV_PARAMS: &[UnimplementedParam] = &[
         // default = false; non-default means true
         is_non_default: |c| c.env_db_eviction,
     },
+    // ---------------------------------------------------------------------
+    // DBI-14 inert-flag sweep (2026-06-23): the following EnvironmentConfig
+    // fields have a setter+field but ZERO runtime read sites.  They are
+    // accepted-but-inert and warned here so a non-default setting is never a
+    // silent no-op.  See docs/src/operations/known-limitations.md.
+    // ---------------------------------------------------------------------
+    UnimplementedParam {
+        name: "checkpointer_min_interval_secs",
+        // default = 0; non-default means non-zero.  NOTE: this is not a JE
+        // param (JE's Checkpointer has no min-interval throttle); the
+        // checkpointer is driven by checkpointer_bytes_interval +
+        // checkpointer_wakeup_interval_ms, both of which ARE wired.
+        is_non_default: |c| c.checkpointer_min_interval_secs != 0,
+    },
+    UnimplementedParam {
+        name: "verify_schedule",
+        // default = ""; non-default means any schedule string set
+        // (background btree verifier scheduling is not implemented).
+        is_non_default: |c| !c.verify_schedule.is_empty(),
+    },
+    UnimplementedParam {
+        name: "startup_dump_threshold_ms",
+        // default = 0; startup-diagnostics dump is not implemented.
+        is_non_default: |c| c.startup_dump_threshold_ms != 0,
+    },
+    UnimplementedParam {
+        name: "dos_producer_queue_timeout_ms",
+        // default = 10_000; the DiskOrderedScan producer-queue timeout is not
+        // consulted by the disk-ordered cursor implementation.
+        is_non_default: |c| c.dos_producer_queue_timeout_ms != 10_000,
+    },
+    UnimplementedParam {
+        name: "env_dup_convert_preload_all",
+        // default = true; the JE 4->5 duplicate-DB conversion preload is N/A
+        // to Noxu's native .ndb format (no legacy dup format to convert).
+        is_non_default: |c| !c.env_dup_convert_preload_all,
+    },
 ];
 
 /// Emit a `log::warn!` for each unimplemented parameter that has been set to a
@@ -208,5 +245,31 @@ mod tests {
             .find(|p| p.name == "env_db_eviction")
             .unwrap();
         assert!((p.is_non_default)(&c));
+    }
+
+    #[test]
+    fn dbi14_sweep_params_warn_on_non_default() {
+        let mut c = env_default();
+        c.set_checkpointer_min_interval_secs(60);
+        c.set_verify_schedule("0 0 * * *".to_string());
+        c.set_startup_dump_threshold_ms(100);
+        c.set_dos_producer_queue_timeout_ms(5_000);
+        c.env_dup_convert_preload_all = false;
+        for name in [
+            "checkpointer_min_interval_secs",
+            "verify_schedule",
+            "startup_dump_threshold_ms",
+            "dos_producer_queue_timeout_ms",
+            "env_dup_convert_preload_all",
+        ] {
+            let p = UNIMPLEMENTED_ENV_PARAMS
+                .iter()
+                .find(|p| p.name == name)
+                .unwrap_or_else(|| panic!("census missing {name}"));
+            assert!(
+                (p.is_non_default)(&c),
+                "{name} should detect its non-default value"
+            );
+        }
     }
 }
