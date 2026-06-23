@@ -65,6 +65,10 @@ use crate::stream::peer_feeder::{
     PEER_FEEDER_SERVICE_NAME, PeerFeederService, PeerLogScanner,
 };
 use crate::stream::replica_stream::{EnvironmentLogWriter, ReplicaStream};
+use crate::stream::syncup::{
+    Matchpoint, RollbackDecision, find_matchpoint, verify_rollback,
+};
+use crate::stream::syncup_reader::VlsnIndexView;
 use crate::vlsn::vlsn_index::VlsnIndex;
 use crate::vlsn::vlsn_range::VlsnRange;
 use std::collections::HashMap;
@@ -111,6 +115,20 @@ const DEFAULT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
 ///     .build();
 /// let rep_env = ReplicatedEnvironment::new(config).unwrap();
 /// ```
+/// Outcome of [`ReplicatedEnvironment::syncup_with_feeder`] — the action taken
+/// by a live diverged-tail syncup. Port of the branch in JE
+/// `ReplicaFeederSyncup.execute` between a soft rollback and a network restore.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncupAction {
+    /// The divergent tail was rolled back to the matchpoint; resume streaming
+    /// from `start_vlsn` (`matchpoint + 1`). `matchpoint_vlsn == last VLSN`
+    /// means the replica was not diverged and nothing was truncated.
+    RolledBack { matchpoint_vlsn: u64, start_vlsn: u64 },
+    /// No safe rollback (no common matchpoint, or it would cross a committed
+    /// txn); the replica must do a full network restore.
+    NeedsRestore,
+}
+
 pub struct ReplicatedEnvironment {
     /// The replication configuration for this node.
     config: RepConfig,
@@ -1353,6 +1371,193 @@ impl ReplicatedEnvironment {
         self.vlsn_index.get_latest_vlsn()
     }
 
+    /// REP-1 STEP 5 (D): run a live syncup against `feeder` and, if this
+    /// replica's tail diverged, ROLL IT BACK to the common matchpoint instead
+    /// of falling back to a network restore.
+    ///
+    /// Port of the replica's side of JE `ReplicaFeederSyncup.execute`:
+    /// `findMatchpoint` → `verifyRollback` → `replay.rollback` →
+    /// `vlsnIndex.truncateFromTail` → resume streaming from `matchpoint + 1`.
+    ///
+    /// `feeder` is the master's [`crate::stream::syncup::SyncupView`] (built
+    /// from its VLSN index, or exchanged over the syncup wire protocol in
+    /// [`crate::stream::syncup_protocol`]). The decision uses the same pure
+    /// core the protocol drives: `find_matchpoint` + `verify_rollback`.
+    ///
+    /// Returns:
+    /// - [`SyncupAction::RolledBack`] — the divergent tail was truncated to
+    ///   the matchpoint; resume streaming from `start_vlsn`. The non-diverged
+    ///   case (matchpoint == last VLSN) returns `RolledBack` with an empty
+    ///   tail and is a no-op rollback.
+    /// - [`SyncupAction::NeedsRestore`] — `verify_rollback` selected
+    ///   NetworkRestore (no common matchpoint) or HardRecovery (the rollback
+    ///   would cross a committed/aborted txn); the caller must network-restore
+    ///   per JE.
+    ///
+    /// The non-diverged fast path (the replica's range is a prefix of the
+    /// feeder's) is still served by the range-check `negotiate_syncup`
+    /// (`SyncupResult::CanServe`) in the streaming path; this method is the
+    /// DIVERGED case.
+    pub fn syncup_with_feeder(
+        &self,
+        feeder: &dyn crate::stream::syncup::SyncupView,
+    ) -> Result<SyncupAction> {
+        // Build the replica's SyncupView. When a real LogManager is wired,
+        // re-read the log (SyncupLogView) so the per-VLSN fingerprint is the
+        // actual record checksum (JE ReplicaSyncupReader). Otherwise (the
+        // VLSN-index-only harness model) fall back to the index view, whose
+        // fingerprint is the LSN.
+        let log_view: Option<crate::stream::syncup_reader::SyncupLogView> =
+            self.env_impl.lock().unwrap().clone().and_then(|env| {
+                if let Some(lm) = env.get_log_manager() {
+                    // Flush so all VLSN-tagged entries are on disk before the
+                    // backward re-read (JE flushNoSync in initScan).
+                    let _ = lm.flush_sync();
+                }
+                crate::stream::syncup_reader::SyncupLogView::scan(
+                    env.get_env_home(),
+                )
+            });
+        let index_view = VlsnIndexView::from_index(&self.vlsn_index);
+        let replica_view: &dyn crate::stream::syncup::SyncupView =
+            match &log_view {
+                Some(v) => v,
+                None => &index_view,
+            };
+
+        let range = self.vlsn_index.get_range();
+        let last_sync = range.get_last_sync();
+        let last_txn_end = range.get_last_txn_end();
+        let to_vlsn = |v: u64| {
+            if v == 0 {
+                noxu_util::NULL_VLSN
+            } else {
+                noxu_util::Vlsn::new(v as i64)
+            }
+        };
+
+        // Step 1: find the matchpoint (JE findMatchpoint).
+        let matchpoint = find_matchpoint(replica_view, feeder);
+
+        // numPassedCommits: count of txn ends strictly above the matchpoint.
+        // When we re-read the log, count them exactly; otherwise rely on the
+        // numeric `lastTxnEnd <= matchpoint` test in verify_rollback (which
+        // matches JE when sync points == txn ends).
+        let num_passed_commits = match (&log_view, &matchpoint) {
+            (Some(v), Matchpoint::Found { vlsn, .. }) => {
+                v.num_passed_commits(*vlsn)
+            }
+            _ => 0,
+        };
+        let decision = verify_rollback(
+            &matchpoint,
+            to_vlsn(last_txn_end),
+            to_vlsn(last_sync),
+            num_passed_commits,
+        );
+
+        match decision {
+            RollbackDecision::RollbackToMatchpoint {
+                matchpoint_vlsn,
+                start_vlsn,
+            } => {
+                let matchpoint_lsn = match &matchpoint {
+                    Matchpoint::Found { lsn, .. } => *lsn,
+                    Matchpoint::None => 0,
+                };
+                // Collect the rolled-back LSNs (VLSNs strictly above the
+                // matchpoint). When the real log was re-read, use its EXACT
+                // per-VLSN LSNs so make-invisible flips the right header bytes
+                // (the sparse VLSN index only stores boundary/last LSNs).
+                let mp = matchpoint_vlsn.sequence().max(0) as u64;
+                let rollback_lsns: Vec<noxu_util::Lsn> = match &log_view {
+                    Some(v) => v
+                        .entries()
+                        .filter(|(vlsn, _)| (vlsn.sequence() as u64) > mp)
+                        .map(|(_, e)| noxu_util::Lsn::from_u64(e.lsn))
+                        .collect(),
+                    None => self
+                        .vlsn_index
+                        .snapshot_entries()
+                        .into_iter()
+                        .filter(|(vlsn, _, _)| *vlsn > mp)
+                        .map(|(_, file, offset)| {
+                            noxu_util::Lsn::new(file, offset)
+                        })
+                        .collect(),
+                };
+                self.execute_rollback(mp, matchpoint_lsn, &rollback_lsns)?;
+                Ok(SyncupAction::RolledBack {
+                    matchpoint_vlsn: mp,
+                    start_vlsn: start_vlsn.sequence().max(0) as u64,
+                })
+            }
+            RollbackDecision::HardRecovery { .. }
+            | RollbackDecision::NetworkRestore => {
+                Ok(SyncupAction::NeedsRestore)
+            }
+        }
+    }
+
+    /// Execute the durable + in-memory rollback to `matchpoint_vlsn`
+    /// (LSN `matchpoint_lsn`). Port of JE `Replay.rollback` +
+    /// `vlsnIndex.truncateFromTail`.
+    ///
+    /// Durable steps (RollbackStart/End + make-invisible + fsync) go through
+    /// [`noxu_recovery::rollback`] when a `LogManager` is wired; the VLSN index
+    /// is always truncated to the matchpoint so the reported range matches the
+    /// rolled-back state and streaming resumes from `matchpoint + 1`.
+    fn execute_rollback(
+        &self,
+        matchpoint_vlsn: u64,
+        matchpoint_lsn: u64,
+        rollback_lsns: &[noxu_util::Lsn],
+    ) -> Result<()> {
+        // Durable rollback (RollbackStart … make-invisible … RollbackEnd) when
+        // a live LogManager is available. The harness-level env (VLSN-index
+        // only, no LogManager) skips the on-disk steps; the index truncation
+        // below is what makes the replica converge in that model.
+        if let Some(env) = self.env_impl.lock().unwrap().clone()
+            && let Some(log_mgr) = env.get_log_manager()
+            && matchpoint_lsn != 0
+        {
+            let mp_lsn = noxu_util::Lsn::from_u64(matchpoint_lsn);
+            // active_txn_ids: the harness/VLSN-index model has no live txn
+            // table here; the durable RollbackStart records an empty set, and
+            // the per-txn gating (REP-1 STEP 2) applies during recovery when
+            // the analysis pass rebuilds the active set. A future pass can
+            // thread the live ReplayTxn ids through (JE
+            // localActiveTxns.keySet()).
+            noxu_recovery::rollback(
+                &log_mgr,
+                noxu_util::Vlsn::new(matchpoint_vlsn as i64),
+                mp_lsn,
+                Vec::new(),
+                rollback_lsns,
+            )
+            .map_err(|e| {
+                RepError::DatabaseError(format!(
+                    "live rollback to matchpoint failed: {e}"
+                ))
+            })?;
+        }
+
+        // JE vlsnIndex.truncateFromTail(startVLSN, matchpointLSN): drop the
+        // divergent VLSN tail so the reported range matches the recovered
+        // state and streaming resumes from matchpoint + 1.
+        self.vlsn_index.truncate_after(matchpoint_vlsn);
+
+        log::info!(
+            "Node '{}': live syncup rolled back to matchpoint vlsn={} \
+             (lsn={:#x}); {} tail entries truncated",
+            self.config.node_name,
+            matchpoint_vlsn,
+            matchpoint_lsn,
+            rollback_lsns.len(),
+        );
+        Ok(())
+    }
+
     /// Test-only: clone the env's SHARED VLSN index `Arc`.
     ///
     /// REP-6: the replica receive loop (`become_replica` ->
@@ -2115,6 +2320,25 @@ impl ReplicatedEnvironment {
     /// by the master after it writes a replicated log entry.
     pub fn register_vlsn(&self, vlsn: u64, file_number: u32, file_offset: u32) {
         self.vlsn_index.register(vlsn, file_number, file_offset);
+    }
+
+    /// Register a VLSN→LSN mapping with its `LogEntryType`, so `lastSync` /
+    /// `lastTxnEnd` advance (JE `VLSNRange.getUpdateForNewMapping`). Used by
+    /// the syncup driver/tests that apply VLSN-tagged entries to a real log
+    /// and need the sync/commit boundaries to track the stream.
+    pub fn register_vlsn_typed(
+        &self,
+        vlsn: u64,
+        file_number: u32,
+        file_offset: u32,
+        entry_type: noxu_log::LogEntryType,
+    ) {
+        self.vlsn_index.register_with_type(
+            vlsn,
+            file_number,
+            file_offset,
+            entry_type,
+        );
     }
 
     /// Replicate a freshly committed log entry from the master.

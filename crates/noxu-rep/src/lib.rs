@@ -155,7 +155,7 @@ pub use rep_config::RepTransportKind;
 pub use rep_group::RepGroup;
 pub use rep_node::RepNode;
 pub use rep_stats::RepStats;
-pub use replicated_environment::ReplicatedEnvironment;
+pub use replicated_environment::{ReplicatedEnvironment, SyncupAction};
 pub use state_change_listener::{StateChangeEvent, StateChangeListener};
 pub use stream::reconnect::{
     ReconnectConfig, ReconnectOutcome, catch_up_with_retry,
