@@ -1,6 +1,31 @@
 //! Database configuration.
 //!
 
+use noxu_tree::KeyComparatorFn;
+
+/// A persisted-identity + comparison-function pair threaded from the public
+/// `noxu_db::Comparator` down to `DatabaseImpl`.
+///
+/// The `identity` is the stable string persisted in the database record (the
+/// NameLN data) and re-checked at open; the `func` is the actual comparison
+/// closure threaded into the `Tree`.  JE `DatabaseImpl.btreeComparator` plus
+/// the persisted `btreeComparatorBytes` (the serialized class name).
+#[derive(Clone)]
+pub struct ConfigComparator {
+    /// Stable identity persisted in the database record.
+    pub identity: String,
+    /// The comparison closure threaded into the tree.
+    pub func: KeyComparatorFn,
+}
+
+impl std::fmt::Debug for ConfigComparator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConfigComparator")
+            .field("identity", &self.identity)
+            .finish()
+    }
+}
+
 /// Configuration for a database.
 ///
 ///
@@ -24,6 +49,19 @@ pub struct DatabaseConfig {
     ///
     ///
     pub deferred_write: bool,
+    /// User-supplied B-tree key comparator (DBI-14).
+    ///
+    /// JE `DatabaseImpl.btreeComparator`.  `None` = unsigned-byte order.
+    pub btree_comparator: Option<ConfigComparator>,
+    /// User-supplied duplicate-data comparator (DBI-14).
+    ///
+    /// JE `DatabaseImpl.duplicateComparator`.
+    pub duplicate_comparator: Option<ConfigComparator>,
+    /// JE `DatabaseConfig.overrideBtreeComparator`: replace a persisted
+    /// comparator instead of rejecting a mismatch.
+    pub override_btree_comparator: bool,
+    /// JE `DatabaseConfig.overrideDuplicateComparator`.
+    pub override_duplicate_comparator: bool,
 }
 
 impl Default for DatabaseConfig {
@@ -37,6 +75,10 @@ impl Default for DatabaseConfig {
             read_only: false,
             node_max_entries: 128,
             deferred_write: false,
+            btree_comparator: None,
+            duplicate_comparator: None,
+            override_btree_comparator: false,
+            override_duplicate_comparator: false,
         }
     }
 }

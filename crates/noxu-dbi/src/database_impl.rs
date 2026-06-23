@@ -80,6 +80,18 @@ pub struct DatabaseImpl {
     /// search, update, delete and position operations can be counted on the
     /// hot path without acquiring any mutex.
     pub throughput: Arc<ThroughputStats>,
+    /// Persisted identity of the user B-tree comparator, if any (DBI-14).
+    ///
+    /// JE persists `btreeComparatorBytes` (the serialized comparator class
+    /// name) in the database record.  Noxu persists this identity string in
+    /// the NameLN data and re-checks it on every open; a Rust `Fn` cannot be
+    /// reconstructed from a name, so the application must re-supply a matching
+    /// comparator.  `None` = unsigned-byte order.
+    btree_comparator_id: Option<String>,
+    /// Persisted identity of the user duplicate-data comparator (DBI-14).
+    ///
+    /// JE `DatabaseImpl.duplicateComparatorBytes`.
+    duplicate_comparator_id: Option<String>,
 }
 
 /// Persistent B-tree root metadata stored alongside the database record.
@@ -133,22 +145,11 @@ impl DatabaseImpl {
         }
 
         let max_entries = config.node_max_entries as usize;
-        let real_tree = if config.sorted_duplicates {
-            // Sorted-dup databases store (key, data) as two-part composite keys.
-            // A custom comparator is required: pure lexicographic ordering fails
-            // when a shorter primary key is a byte-prefix of a longer key's data.
-            let dup_cmp: KeyComparatorFn = Arc::new(|a: &[u8], b: &[u8]| {
-                dup_key_data::cmp_two_part_keys(
-                    a,
-                    b,
-                    |x, y| x.cmp(y),
-                    |x, y| x.cmp(y),
-                )
-            });
-            Tree::new_with_comparator(id.id() as u64, max_entries, dup_cmp)
-        } else {
-            Tree::new(id.id() as u64, max_entries)
-        };
+        let btree_comparator_id =
+            config.btree_comparator.as_ref().map(|c| c.identity.clone());
+        let duplicate_comparator_id =
+            config.duplicate_comparator.as_ref().map(|c| c.identity.clone());
+        let real_tree = Self::build_tree(id, max_entries, config);
         // Wire the DatabaseConfig.key_prefixing flag into the tree so the
         // BIN prefix-compression path honours it (JE DatabaseImpl.getKeyPrefixing
         // -> IN.computeKeyPrefix). Sorted-dup DBs use a custom comparator and
@@ -170,6 +171,57 @@ impl DatabaseImpl {
             deferred_write: config.deferred_write,
             entry_count: Arc::new(AtomicU64::new(0)),
             throughput: ThroughputStats::new(),
+            btree_comparator_id,
+            duplicate_comparator_id,
+        }
+    }
+
+    /// Builds the tree's key comparator from the database config
+    /// (DBI-14), mirroring JE `DatabaseImpl.resetKeyComparator`.
+    ///
+    /// * Non-duplicate DB: the tree comparator is the user B-tree comparator
+    ///   directly (or `None` → unsigned-byte order, byte-for-byte identical
+    ///   to JE's default).
+    /// * Sorted-duplicate DB: keys are stored as two-part `[key][data][len]`
+    ///   composites; the tree comparator is `cmp_two_part_keys` with the user
+    ///   B-tree comparator applied to the primary-key part (`key_cmp`) and the
+    ///   user duplicate comparator applied to the data part (`data_cmp`).  A
+    ///   custom comparator is required for dup DBs even with no user
+    ///   comparators, because raw lexicographic order over the composite is
+    ///   wrong when a short primary key is a byte-prefix of a longer key's
+    ///   data (see `dup_key_data::cmp_two_part_keys`).
+    ///
+    /// JE: `keyComparator` is "derived from dup and btree comparators".
+    fn build_tree(
+        id: DatabaseId,
+        max_entries: usize,
+        config: &DatabaseConfig,
+    ) -> Tree {
+        let btree_fn: Option<KeyComparatorFn> =
+            config.btree_comparator.as_ref().map(|c| c.func.clone());
+        if config.sorted_duplicates {
+            let dup_fn: Option<KeyComparatorFn> =
+                config.duplicate_comparator.as_ref().map(|c| c.func.clone());
+            let dup_cmp: KeyComparatorFn =
+                Arc::new(move |a: &[u8], b: &[u8]| {
+                    dup_key_data::cmp_two_part_keys(
+                        a,
+                        b,
+                        |x, y| match &btree_fn {
+                            Some(f) => f(x, y),
+                            None => x.cmp(y),
+                        },
+                        |x, y| match &dup_fn {
+                            Some(f) => f(x, y),
+                            None => x.cmp(y),
+                        },
+                    )
+                });
+            Tree::new_with_comparator(id.id() as u64, max_entries, dup_cmp)
+        } else if let Some(btree_fn) = btree_fn {
+            Tree::new_with_comparator(id.id() as u64, max_entries, btree_fn)
+        } else {
+            Tree::new(id.id() as u64, max_entries)
         }
     }
 
@@ -194,6 +246,20 @@ impl DatabaseImpl {
     // Flag methods
     pub fn get_sorted_duplicates(&self) -> bool {
         self.flags & DUPS_ENABLED != 0
+    }
+
+    /// Persisted identity of the user B-tree comparator, if any (DBI-14).
+    ///
+    /// JE `DatabaseImpl.getBtreeComparator` / `btreeComparatorBytes`.
+    pub fn btree_comparator_id(&self) -> Option<&str> {
+        self.btree_comparator_id.as_deref()
+    }
+
+    /// Persisted identity of the user duplicate-data comparator (DBI-14).
+    ///
+    /// JE `DatabaseImpl.getDuplicateComparator` / `duplicateComparatorBytes`.
+    pub fn duplicate_comparator_id(&self) -> Option<&str> {
+        self.duplicate_comparator_id.as_deref()
     }
 
     /// Whether all LNs in this DB are "immediately obsolete" — counted
@@ -495,6 +561,8 @@ impl DatabaseImpl {
             deferred_write: false, // not persisted in log record; set after open if needed
             entry_count: Arc::new(AtomicU64::new(0)),
             throughput: ThroughputStats::new(),
+            btree_comparator_id: None,
+            duplicate_comparator_id: None,
         })
     }
 }
