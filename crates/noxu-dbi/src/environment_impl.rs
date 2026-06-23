@@ -653,8 +653,21 @@ impl EnvironmentImpl {
             // on-disk log.
             // LogManager.logItem() calls envImpl.getUtilizationTracker()
             // and passes it to serialLogWork().
-            let util_tracker =
-                Arc::new(NoxuMutex::new(UtilizationTracker::new(true)));
+            //
+            // DBI-24: cap the tracker's obsolete-offset detail at
+            // CLEANER_DETAIL_MAX_MEMORY_PERCENTAGE (default 2%) of the cache
+            // size. JE: MemoryBudget.reset computes
+            //   trackerBudget = cachePortion
+            //                   * CLEANER_DETAIL_MAX_MEMORY_PERCENTAGE / 100
+            // (DbConfigManager.getInt(CLEANER_DETAIL_MAX_MEMORY_PERCENTAGE)).
+            // When the tracked detail exceeds this, evict_memory drops it
+            // (keeping aggregate counts).
+            let tracker_budget = (cfg.cache_size as i64).saturating_mul(
+                cfg.cleaner_detail_max_memory_percentage as i64,
+            ) / 100;
+            let util_tracker = Arc::new(NoxuMutex::new(
+                UtilizationTracker::with_budget(true, tracker_budget),
+            ));
             let observer = Arc::new(UtilizationTrackerObserver::new(
                 Arc::clone(&util_tracker),
             ));

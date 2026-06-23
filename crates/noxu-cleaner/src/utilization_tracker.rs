@@ -74,16 +74,41 @@ pub struct UtilizationTracker {
     tracked_bytes: i64,
     /// Whether to track obsolete offset details.
     track_detail: bool,
+    /// Maximum bytes of tracked obsolete-offset detail before `evict_memory`
+    /// starts dropping it. JE `MemoryBudget.trackerBudget`
+    /// (`= cachePortion * CLEANER_DETAIL_MAX_MEMORY_PERCENTAGE / 100`). A
+    /// value of 0 disables the cap (used by the legacy/test constructor).
+    tracker_budget: i64,
 }
 
+/// One megabyte: a tracked file holding at least this much detail is flushed
+/// immediately by `evict_memory`, regardless of the total. JE
+/// `UtilizationTracker.evictMemory` `ONE_MB`.
+const ONE_MB: i64 = 1024 * 1024;
+
 impl UtilizationTracker {
-    /// Creates a new utilization tracker.
+    /// Creates a new utilization tracker with no budget cap (detail grows
+    /// unbounded). Prefer [`Self::with_budget`] in production; this is kept
+    /// for tests and call sites that do not have a cache size to derive a
+    /// budget from.
     pub fn new(track_detail: bool) -> Self {
+        Self::with_budget(track_detail, 0)
+    }
+
+    /// Creates a new utilization tracker with an explicit byte budget for the
+    /// obsolete-offset detail.
+    ///
+    /// `tracker_budget` is JE's `MemoryBudget.trackerBudget`
+    /// (`cachePortion * CLEANER_DETAIL_MAX_MEMORY_PERCENTAGE / 100`). When the
+    /// tracked detail exceeds it, [`Self::evict_memory`] drops detail to stay
+    /// bounded. A budget of 0 disables the cap.
+    pub fn with_budget(track_detail: bool, tracker_budget: i64) -> Self {
         Self {
             tracked_files: HashMap::new(),
             db_file_summaries: HashMap::new(),
             tracked_bytes: 0,
             track_detail,
+            tracker_budget,
         }
     }
 
@@ -446,6 +471,106 @@ impl UtilizationTracker {
         self.tracked_bytes
     }
 
+    /// Returns the byte budget for tracked obsolete-offset detail (0 = no cap).
+    ///
+    /// JE `MemoryBudget.getTrackerBudget`.
+    pub fn get_tracker_budget(&self) -> i64 {
+        self.tracker_budget
+    }
+
+    /// Sets the byte budget for tracked obsolete-offset detail. Used at
+    /// env-open once the cache size is known, and when the mutable config
+    /// `CLEANER_DETAIL_MAX_MEMORY_PERCENTAGE` changes. JE recomputes
+    /// `MemoryBudget.trackerBudget` in `MemoryBudget.reset`.
+    pub fn set_tracker_budget(&mut self, tracker_budget: i64) {
+        self.tracker_budget = tracker_budget;
+    }
+
+    /// Returns the total bytes of tracked obsolete-offset detail across all
+    /// tracked files.
+    ///
+    /// JE aggregates `TrackedFileSummary.getMemorySize` over
+    /// `getTrackedFiles()` inside `UtilizationTracker.evictMemory`; this is
+    /// the same sum exposed for the budget check and for tests. Only the
+    /// per-LSN offset detail is budgeted (JE budgets `memSize`, not the
+    /// per-object overhead).
+    pub fn get_memory_usage(&self) -> i64 {
+        self.tracked_files.values().map(|t| t.detail_memory_size() as i64).sum()
+    }
+
+    /// Evicts tracked obsolete-offset detail when the tracker budget is
+    /// exceeded, keeping the aggregate counters intact. Returns the number of
+    /// detail bytes freed.
+    ///
+    /// Faithful to JE `UtilizationTracker.evictMemory`:
+    /// * A file whose detail is at least 1 MB is flushed immediately,
+    ///   regardless of the total (keeps eviction batches small).
+    /// * Otherwise the largest flushable file is the candidate; it is flushed
+    ///   only if the running total of small-file detail exceeds the budget.
+    /// * Files pinned via [`TrackedFileSummary::set_allow_flush`]`(false)`
+    ///   (JE `getUnflushableTrackedSummary` — a file the cleaner is actively
+    ///   processing) are never chosen as the budget candidate.
+    ///
+    /// "Flush" here drops only the per-LSN OFFSET DETAIL and KEEPS the
+    /// aggregate `FileSummary` counts (see
+    /// [`TrackedFileSummary::discard_obsolete_detail`] for why this diverges
+    /// from JE's persist-then-`reset`). A budget of 0 disables the cap.
+    pub fn evict_memory(&mut self) -> i64 {
+        // If not tracking detail, there is nothing to evict.
+        // JE: `if (!cleaner.trackDetail) return 0;`
+        if !self.track_detail || self.tracker_budget <= 0 {
+            return 0;
+        }
+
+        let mut total_evicted: i64 = 0;
+        let mut total_bytes: i64 = 0;
+        let mut largest_bytes: i64 = 0;
+        let mut best_file: Option<u32> = None;
+
+        // First pass: flush ≥ 1 MB files immediately; find the largest
+        // flushable small file. JE iterates `getTrackedFiles()`.
+        for (&file_num, tfs) in self.tracked_files.iter() {
+            let mem = tfs.detail_memory_size() as i64;
+            if mem >= ONE_MB {
+                continue;
+            }
+            total_bytes += mem;
+            if mem > largest_bytes && tfs.get_allow_flush() {
+                largest_bytes = mem;
+                best_file = Some(file_num);
+            }
+        }
+
+        // Drop the ≥ 1 MB files' detail (collected separately to avoid
+        // mutating while iterating above).
+        let big_files: Vec<u32> = self
+            .tracked_files
+            .iter()
+            .filter(|(_, tfs)| tfs.detail_memory_size() as i64 >= ONE_MB)
+            .map(|(&f, _)| f)
+            .collect();
+        for f in big_files {
+            if let Some(tfs) = self.tracked_files.get_mut(&f) {
+                let mem = tfs.detail_memory_size() as i64;
+                tfs.discard_obsolete_detail();
+                total_evicted += mem;
+            }
+        }
+
+        // Then, if the small-file total exceeds the budget, flush the single
+        // largest flushable file. JE flushes at most one to keep batches small.
+        if total_bytes > self.tracker_budget
+            && let Some(f) = best_file
+            && let Some(tfs) = self.tracked_files.get_mut(&f)
+        {
+            tfs.discard_obsolete_detail();
+            total_evicted += largest_bytes;
+        }
+
+        self.update_tracked_bytes();
+        total_evicted
+    }
+
     /// Returns the number of files being tracked.
     pub fn get_tracked_file_count(&self) -> usize {
         self.tracked_files.len()
@@ -757,5 +882,127 @@ mod tests {
     fn test_default() {
         let tracker = UtilizationTracker::default();
         assert_eq!(tracker.get_tracked_file_count(), 0);
+    }
+
+    /// DBI-24 HEADLINE: a tracker that falls far behind accumulates
+    /// obsolete-offset detail for many files. With a budget set, repeated
+    /// `evict_memory` (JE `UtilizationTracker.evictMemory`, called
+    /// frequently) keeps memory bounded by dropping the per-LSN OFFSET
+    /// DETAIL — while the AGGREGATE obsolete counts that drive util%
+    /// file-selection are PRESERVED.
+    ///
+    /// Fail-pre on main: there is no budget/evict path, so detail grows
+    /// unbounded. Pass-post: detail is flushed at the budget, aggregates
+    /// intact. Cite: `UtilizationTracker.evictMemory`,
+    /// `MemoryBudget.getTrackerBudget`, `TrackedFileSummary.reset`.
+    #[test]
+    fn test_evict_memory_bounds_detail_preserves_aggregates() {
+        const FILES: u32 = 200;
+        const OFFSETS_PER_FILE: u32 = 500;
+
+        // A tight budget: far smaller than the unbounded detail will be.
+        let budget = 64 * 1024;
+        let mut tracker = UtilizationTracker::with_budget(true, budget);
+
+        // Accumulate a lot of obsolete-offset detail across many files.
+        for file in 1..=FILES {
+            for i in 1..=OFFSETS_PER_FILE {
+                // size 50, count as LN; offset must be non-zero.
+                tracker.count_obsolete_node(file, i, 50, true, None);
+            }
+        }
+
+        // Snapshot the aggregate obsolete counts BEFORE eviction.
+        let mut expected_obsolete: HashMap<u32, i32> = HashMap::new();
+        let mut total_offsets_before: usize = 0;
+        for (&f, tfs) in tracker.get_tracked_files() {
+            expected_obsolete.insert(f, tfs.get_summary().obsolete_ln_count);
+            total_offsets_before += tfs.obsolete_offset_count();
+        }
+        assert_eq!(
+            total_offsets_before as u32,
+            FILES * OFFSETS_PER_FILE,
+            "all offsets tracked before eviction"
+        );
+        let usage_before = tracker.get_memory_usage();
+        assert!(
+            usage_before > budget,
+            "detail must exceed budget before eviction ({usage_before} <= {budget})"
+        );
+
+        // JE calls evictMemory repeatedly (one small file per call); loop
+        // until it stops freeing.
+        let mut iters = 0;
+        loop {
+            let freed = tracker.evict_memory();
+            iters += 1;
+            if freed == 0 {
+                break;
+            }
+            assert!(iters < 100_000, "evict_memory must converge");
+        }
+
+        // BOUNDED MEMORY: after eviction converges, the small-file detail
+        // total is within the budget (the one largest flushable file is
+        // flushed whenever the total exceeds it, so the residual is bounded).
+        let usage_after = tracker.get_memory_usage();
+        assert!(
+            usage_after <= budget,
+            "detail must be bounded by budget after eviction ({usage_after} > {budget})"
+        );
+
+        // AGGREGATES INTACT: every file's obsolete_ln_count is unchanged —
+        // dropping offset detail must NOT change the aggregate util%.
+        for (&f, &expected) in &expected_obsolete {
+            let got = tracker
+                .get_tracked_summary(f)
+                .expect("file still tracked")
+                .get_summary()
+                .obsolete_ln_count;
+            assert_eq!(
+                got, expected,
+                "file {f}: aggregate obsolete count must survive a detail flush"
+            );
+        }
+    }
+
+    /// `evict_memory` must NOT flush a file the cleaner has pinned via
+    /// `set_allow_flush(false)` (JE `getUnflushableTrackedSummary`).
+    #[test]
+    fn test_evict_memory_respects_allow_flush() {
+        let budget = 1024;
+        let mut tracker = UtilizationTracker::with_budget(true, budget);
+        for i in 1..=2000 {
+            tracker.count_obsolete_node(1, i, 50, true, None);
+        }
+        // Pin file 1 so it is never chosen as the budget candidate.
+        tracker.get_tracked_summary_mut(1).unwrap().set_allow_flush(false);
+        let offsets_before =
+            tracker.get_tracked_summary(1).unwrap().obsolete_offset_count();
+
+        // Loop; since the only file is pinned (and < 1 MB), nothing is freed.
+        for _ in 0..10 {
+            tracker.evict_memory();
+        }
+        assert_eq!(
+            tracker.get_tracked_summary(1).unwrap().obsolete_offset_count(),
+            offsets_before,
+            "a pinned (allow_flush=false) file must not be evicted"
+        );
+    }
+
+    /// A budget of 0 disables the cap (legacy `new`): detail grows unbounded.
+    #[test]
+    fn test_evict_memory_disabled_with_zero_budget() {
+        let mut tracker = UtilizationTracker::new(true); // budget 0
+        for i in 1..=1000 {
+            tracker.count_obsolete_node(1, i, 50, true, None);
+        }
+        let freed = tracker.evict_memory();
+        assert_eq!(freed, 0, "zero budget disables eviction");
+        assert_eq!(
+            tracker.get_tracked_summary(1).unwrap().obsolete_offset_count(),
+            1000
+        );
     }
 }
