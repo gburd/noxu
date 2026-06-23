@@ -704,6 +704,9 @@ impl RecoveryManager {
             analysis.prepared_txns.values().cloned().collect();
         // Propagate recovered database name→id mappings.
         self.info.recovered_db_names = analysis.recovered_db_names.clone();
+        // DBI-14: propagate persisted comparator identities.
+        self.info.recovered_db_comparators =
+            analysis.recovered_db_comparators.clone();
 
         self.set_progress(RecoveryProgress::Complete);
         Ok(self.info.clone())
@@ -804,6 +807,7 @@ impl RecoveryManager {
         for name in &aborted_names {
             analysis.recovered_db_names.remove(name);
             analysis.recovered_db_txn_ids.remove(name);
+            analysis.recovered_db_comparators.remove(name);
             log::debug!(
                 "recovery[mapping-tree-undo]: removed aborted database \
                  registration '{}'",
@@ -1595,10 +1599,20 @@ impl RecoveryManager {
                     if rec.is_deleted {
                         result_ref.recovered_db_names.remove(&rec.name);
                         result_ref.recovered_db_txn_ids.remove(&rec.name);
+                        result_ref.recovered_db_comparators.remove(&rec.name);
                     } else {
                         result_ref
                             .recovered_db_names
                             .insert(rec.name.clone(), rec.db_id);
+                        // DBI-14: remember the persisted comparator identities
+                        // so open_database can enforce mismatch semantics.
+                        result_ref.recovered_db_comparators.insert(
+                            rec.name.clone(),
+                            (
+                                rec.btree_comparator_id.clone(),
+                                rec.dup_comparator_id.clone(),
+                            ),
+                        );
                         // C-6: record the creating txn_id so that
                         // run_mapping_tree_undo_pass can undo NameLNs whose
                         // transaction aborted.
@@ -4119,6 +4133,8 @@ mod tests {
                 db_id: 7,
                 is_deleted: false,
                 txn_id: Some(42),
+                btree_comparator_id: None,
+                dup_comparator_id: None,
             }),
         );
         scanner.push(
@@ -4154,6 +4170,8 @@ mod tests {
                 db_id: 8,
                 is_deleted: false,
                 txn_id: Some(43),
+                btree_comparator_id: None,
+                dup_comparator_id: None,
             }),
         );
         scanner.push(
@@ -4200,6 +4218,8 @@ mod tests {
                 db_id: 77,
                 is_deleted: false,
                 txn_id: None,
+                btree_comparator_id: None,
+                dup_comparator_id: None,
             }),
         );
 
@@ -4211,6 +4231,8 @@ mod tests {
                 db_id: 78,
                 is_deleted: false,
                 txn_id: Some(55),
+                btree_comparator_id: None,
+                dup_comparator_id: None,
             }),
         );
         scanner.push(

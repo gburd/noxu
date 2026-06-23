@@ -71,6 +71,15 @@ pub struct EnvironmentImpl {
     /// visibility (JE `DbTree.getDbNames()` / 1-J fix).
     name_map: RwLock<HashMap<String, DatabaseId>>,
 
+    /// DBI-14: persisted comparator identities `(btree, dup)` per database
+    /// name, recovered from NameLN data.  At open, a database whose name has
+    /// a persisted identity here requires the caller to supply a comparator
+    /// with the matching identity (or set the override flag), else open
+    /// fails — mirroring JE's comparator mismatch semantics
+    /// (`DatabaseImpl.ComparatorReader`).
+    recovered_comparators:
+        RwLock<HashMap<String, (Option<String>, Option<String>)>>,
+
     /// Names of databases whose creating transaction has not yet committed.
     ///
     /// Maps database name → the `DatabaseId` that was allocated at
@@ -415,6 +424,11 @@ impl EnvironmentImpl {
         let mut recovered: HashMap<u64, noxu_tree::Tree> = HashMap::new();
         // Database name → id mappings recovered from NameLN entries.
         let mut recovered_names: HashMap<String, DatabaseId> = HashMap::new();
+        // DBI-14: persisted comparator identities recovered from NameLN data.
+        let mut recovered_comparators: HashMap<
+            String,
+            (Option<String>, Option<String>),
+        > = HashMap::new();
         // Wave 3-2: prepared (XA in-doubt) transactions surfaced by
         // recovery.  Empty for fresh / clean-shutdown environments.
         let mut recovered_prepared: Vec<noxu_recovery::PreparedTxnInfo> =
@@ -608,6 +622,10 @@ impl EnvironmentImpl {
             for (name, db_id) in recovery_info.recovered_db_names {
                 recovered_names.insert(name, DatabaseId::new(db_id as i64));
             }
+            // DBI-14: capture persisted comparator identities.
+            for (name, ids) in recovery_info.recovered_db_comparators {
+                recovered_comparators.insert(name, ids);
+            }
 
             let mut lm = LogManager::new(
                 fm,
@@ -656,6 +674,11 @@ impl EnvironmentImpl {
                     for (name, db_id) in info.recovered_db_names {
                         recovered_names
                             .insert(name, DatabaseId::new(db_id as i64));
+                    }
+                    // DBI-14: capture persisted comparator identities
+                    // (read-only reopen path).
+                    for (name, ids) in info.recovered_db_comparators {
+                        recovered_comparators.insert(name, ids);
                     }
                 }
                 for (db_id, tree) in recovery_trees {
@@ -1110,6 +1133,7 @@ impl EnvironmentImpl {
             txn_manager,
             db_map,
             name_map: RwLock::new(recovered_names),
+            recovered_comparators: RwLock::new(recovered_comparators),
             pending_names: RwLock::new(hashbrown::HashMap::new()),
             is_invalid: Arc::new(AtomicBool::new(false)),
             invalid_reason: RwLock::new(None),
@@ -1330,6 +1354,43 @@ impl EnvironmentImpl {
             return Err(DbiError::DatabaseNotFound(name.to_string()));
         }
 
+        // DBI-14: comparator mismatch check.  If this database was recovered
+        // with a persisted comparator identity, the caller must supply a
+        // comparator whose identity matches (or set the override flag), else
+        // the open fails — reinterpreting a comparator-ordered tree as
+        // byte-ordered (or under the wrong comparator) silently corrupts the
+        // sort.  Mirrors JE `DatabaseImpl.ComparatorReader` /
+        // `setOverrideBtreeComparator`.
+        if recovered_db_id.is_some()
+            && let Some((persisted_btree, persisted_dup)) =
+                self.recovered_comparators.read().get(name).cloned()
+        {
+            let cfg_btree =
+                config.btree_comparator.as_ref().map(|c| c.identity.clone());
+            let cfg_dup = config
+                .duplicate_comparator
+                .as_ref()
+                .map(|c| c.identity.clone());
+            if !config.override_btree_comparator && persisted_btree != cfg_btree
+            {
+                return Err(DbiError::ComparatorMismatch {
+                    name: name.to_string(),
+                    kind: "btree",
+                    persisted: persisted_btree,
+                    configured: cfg_btree,
+                });
+            }
+            if !config.override_duplicate_comparator && persisted_dup != cfg_dup
+            {
+                return Err(DbiError::ComparatorMismatch {
+                    name: name.to_string(),
+                    kind: "duplicate",
+                    persisted: persisted_dup,
+                    configured: cfg_dup,
+                });
+            }
+        }
+
         let db_id = if let Some(rid) = recovered_db_id {
             // Reopen: use the recovered db_id and ensure the counter is
             // at least rid + 1 so fresh creations don't reuse it.
@@ -1419,6 +1480,14 @@ impl EnvironmentImpl {
                         name,
                         db_id.id() as u64,
                         txn_id,
+                        config
+                            .btree_comparator
+                            .as_ref()
+                            .map(|c| c.identity.as_str()),
+                        config
+                            .duplicate_comparator
+                            .as_ref()
+                            .map(|c| c.identity.as_str()),
                     );
                 }
             }
@@ -1435,7 +1504,19 @@ impl EnvironmentImpl {
             if recovered_db_id.is_none()
                 && let Some(lm) = &self.log_manager
             {
-                let _ = Self::log_name_ln(lm, name, db_id.id() as u64);
+                let _ = Self::log_name_ln(
+                    lm,
+                    name,
+                    db_id.id() as u64,
+                    config
+                        .btree_comparator
+                        .as_ref()
+                        .map(|c| c.identity.as_str()),
+                    config
+                        .duplicate_comparator
+                        .as_ref()
+                        .map(|c| c.identity.as_str()),
+                );
             }
         }
 
@@ -1498,9 +1579,17 @@ impl EnvironmentImpl {
         name: &str,
         db_id: u64,
         txn_id: u64,
+        btree_comparator_id: Option<&str>,
+        dup_comparator_id: Option<&str>,
     ) -> Result<(), DbiError> {
         let key = name.as_bytes().to_vec();
-        let data = db_id.to_le_bytes().to_vec();
+        let mut data = db_id.to_le_bytes().to_vec();
+        // DBI-14: append the persisted comparator identities (empty for
+        // byte-ordered databases, preserving the pre-DBI-14 wire format).
+        data.extend_from_slice(&crate::name_ln_codec::encode_comparator_ids(
+            btree_comparator_id,
+            dup_comparator_id,
+        ));
         let entry = LnLogEntry::new(
             0,                   // db_id header field (unused for NameLN)
             Some(txn_id as i64), // txn_id: creating transaction
@@ -1537,9 +1626,16 @@ impl EnvironmentImpl {
         lm: &Arc<LogManager>,
         name: &str,
         db_id: u64,
+        btree_comparator_id: Option<&str>,
+        dup_comparator_id: Option<&str>,
     ) -> Result<(), DbiError> {
         let key = name.as_bytes().to_vec();
-        let data = db_id.to_le_bytes().to_vec();
+        let mut data = db_id.to_le_bytes().to_vec();
+        // DBI-14: append the persisted comparator identities.
+        data.extend_from_slice(&crate::name_ln_codec::encode_comparator_ids(
+            btree_comparator_id,
+            dup_comparator_id,
+        ));
         let entry = LnLogEntry::new(
             0,    // db_id header field (unused for NameLN, use 0)
             None, // txn_id: non-transactional

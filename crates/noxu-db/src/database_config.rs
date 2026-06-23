@@ -2,6 +2,68 @@
 //!
 
 use crate::cache_mode::CacheMode;
+use std::cmp::Ordering;
+use std::sync::Arc;
+
+/// A user-supplied key (or duplicate-data) comparator paired with a stable
+/// identity string.
+///
+/// JE persists the comparator's *class name* in the database record
+/// (`DatabaseImpl.comparatorToBytes(comparator, byClassName=true)`) and
+/// reconstructs the `Comparator<byte[]>` instance by class name at open
+/// (`DatabaseImpl.ComparatorReader`).  A Rust `Fn` has no portable name and
+/// cannot be reconstructed from a string, so Noxu's faithful adaptation
+/// asks the application to supply that name itself: the `identity` is the
+/// stable string persisted in the database record, and it is what the
+/// reopen-time mismatch check compares.  See
+/// `docs/src/maintainer/design-decisions.md`.
+///
+/// The `compare` closure receives the two *whole* (uncompressed) byte keys,
+/// exactly as JE's `Comparator.compare(byte[] o1, byte[] o2)`.
+#[derive(Clone)]
+pub struct Comparator {
+    identity: String,
+    compare: Arc<dyn Fn(&[u8], &[u8]) -> Ordering + Send + Sync>,
+}
+
+impl Comparator {
+    /// Builds a comparator from a stable `identity` string and a comparison
+    /// closure.  The identity is persisted in the database record and must be
+    /// re-supplied (with a matching comparator) on every subsequent open, or
+    /// the open fails — mirroring JE's class-name persistence + reconstruct
+    /// path (`DatabaseImpl.ComparatorReader`).
+    pub fn new(
+        identity: impl Into<String>,
+        compare: impl Fn(&[u8], &[u8]) -> Ordering + Send + Sync + 'static,
+    ) -> Self {
+        Self { identity: identity.into(), compare: Arc::new(compare) }
+    }
+
+    /// The stable identity persisted in the database record.
+    pub fn identity(&self) -> &str {
+        &self.identity
+    }
+
+    /// The comparison closure (cloneable `Arc`).
+    pub fn func(&self) -> Arc<dyn Fn(&[u8], &[u8]) -> Ordering + Send + Sync> {
+        Arc::clone(&self.compare)
+    }
+}
+
+// A comparator's *behaviour* cannot be compared structurally, so equality
+// and Debug key on the persisted identity only — the same value that drives
+// the reopen-time mismatch check.
+impl PartialEq for Comparator {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity == other.identity
+    }
+}
+impl Eq for Comparator {}
+impl std::fmt::Debug for Comparator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Comparator").field("identity", &self.identity).finish()
+    }
+}
 
 /// Configuration for opening a database.
 ///
@@ -36,17 +98,35 @@ pub struct DatabaseConfig {
 
     /// Override the B-tree key comparator.
     ///
-    /// **Inert as of v1.6.0**:
-    /// the public API has no setter for an actual comparator function,
-    /// so this flag has nothing to consume.  The flag and the
-    /// `ByteComparator` trait are scheduled for removal in v2.0.
-    /// Setting it to `true` does *not* change the on-disk byte order.
+    /// JE `DatabaseConfig.setOverrideBtreeComparator`: when `true`, the
+    /// comparator supplied on *this* open replaces the one persisted in the
+    /// database record, instead of being rejected as a mismatch.  When
+    /// `false` (the default), supplying a different comparator than the one
+    /// persisted is an error.
     pub override_btree_comparator: bool,
 
     /// Override the duplicate data comparator.
     ///
-    /// **Inert as of v1.6.0** — see `override_btree_comparator`.
+    /// JE `DatabaseConfig.setOverrideDuplicateComparator` — see
+    /// `override_btree_comparator`.
     pub override_duplicate_comparator: bool,
+
+    /// User-supplied B-tree key comparator (DBI-14).
+    ///
+    /// `None` (the default) uses unsigned-byte lexicographic order, byte for
+    /// byte identical to JE's default.  When `Some`, every key comparison in
+    /// the tree (search, insert, delete, split, cursor seek, range scan) uses
+    /// it.  JE `DatabaseConfig.setBtreeComparator` /
+    /// `DatabaseImpl.getBtreeComparator`.
+    pub btree_comparator: Option<Comparator>,
+
+    /// User-supplied duplicate-data comparator (DBI-14).
+    ///
+    /// Orders the *data* of duplicates sharing a primary key in a
+    /// `sorted_duplicates` database.  `None` uses unsigned-byte order.  JE
+    /// `DatabaseConfig.setDuplicateComparator` /
+    /// `DatabaseImpl.getDuplicateComparator`.
+    pub duplicate_comparator: Option<Comparator>,
 
     /// Whether this database is exclusive to a single thread.
     ///
@@ -105,6 +185,8 @@ impl DatabaseConfig {
             deferred_write: false,
             override_btree_comparator: false,
             override_duplicate_comparator: false,
+            btree_comparator: None,
+            duplicate_comparator: None,
             exclusive: false,
             node_max_entries: 0,
             replicated: false,
@@ -169,6 +251,43 @@ impl DatabaseConfig {
         override_duplicate_comparator: bool,
     ) -> &mut Self {
         self.override_duplicate_comparator = override_duplicate_comparator;
+        self
+    }
+
+    /// Sets the B-tree key comparator (DBI-14).
+    ///
+    /// JE `DatabaseConfig.setBtreeComparator`.  The comparator's identity is
+    /// persisted in the database record; on every subsequent open the same
+    /// identity must be re-supplied (or `override_btree_comparator` set), or
+    /// the open fails.
+    pub fn set_btree_comparator(
+        &mut self,
+        comparator: Comparator,
+    ) -> &mut Self {
+        self.btree_comparator = Some(comparator);
+        self
+    }
+
+    /// Sets the duplicate-data comparator (DBI-14).
+    ///
+    /// JE `DatabaseConfig.setDuplicateComparator`.
+    pub fn set_duplicate_comparator(
+        &mut self,
+        comparator: Comparator,
+    ) -> &mut Self {
+        self.duplicate_comparator = Some(comparator);
+        self
+    }
+
+    /// Builder-style B-tree comparator setter (DBI-14).
+    pub fn with_btree_comparator(mut self, comparator: Comparator) -> Self {
+        self.btree_comparator = Some(comparator);
+        self
+    }
+
+    /// Builder-style duplicate-data comparator setter (DBI-14).
+    pub fn with_duplicate_comparator(mut self, comparator: Comparator) -> Self {
+        self.duplicate_comparator = Some(comparator);
         self
     }
 

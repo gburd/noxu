@@ -195,6 +195,12 @@ pub struct AnalysisResult {
     /// transaction aborted.
     pub recovered_db_txn_ids: hashbrown::HashMap<String, u64>,
 
+    /// Database name → persisted comparator identities `(btree, dup)` from
+    /// NameLN data (DBI-14).  `None` entries mean byte-ordered.  Consumed by
+    /// `open_database` to enforce JE's comparator mismatch semantics on open.
+    pub recovered_db_comparators:
+        hashbrown::HashMap<String, (Option<String>, Option<String>)>,
+
     /// R-3: (vlsn, commit_lsn_u64) pairs from TxnCommit records whose
     /// `dtvlsn` payload field is non-zero.
     ///
@@ -224,6 +230,7 @@ impl AnalysisResult {
             use_root_lsn: NULL_LSN,
             recovered_db_names: hashbrown::HashMap::new(),
             recovered_db_txn_ids: hashbrown::HashMap::new(),
+            recovered_db_comparators: hashbrown::HashMap::new(),
             txncommit_vlsns: Vec::new(),
         }
     }

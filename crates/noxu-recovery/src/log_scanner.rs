@@ -312,6 +312,15 @@ pub struct NameLnRecord {
     /// treated as committed (no undo needed) to preserve backward compat with
     /// pre-C6 WAL files.
     pub txn_id: Option<u64>,
+    /// Persisted identity of the user B-tree comparator, if any (DBI-14).
+    ///
+    /// JE persists `btreeComparatorBytes` (the serialized comparator class
+    /// name) in the database record; Noxu persists this identity string in
+    /// the NameLN data after the 8-byte db_id.  `None` for pre-DBI-14 WAL
+    /// entries (exactly 8 data bytes) and for byte-ordered databases.
+    pub btree_comparator_id: Option<String>,
+    /// Persisted identity of the user duplicate-data comparator (DBI-14).
+    pub dup_comparator_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]

@@ -85,6 +85,14 @@ pub struct RecoveryInfo {
     /// A `None` value means the name was removed (NameLN with is_deleted=true).
     pub recovered_db_names: hashbrown::HashMap<String, u64>,
 
+    /// Database name → persisted comparator identities `(btree, dup)` (DBI-14).
+    ///
+    /// Mirrors `AnalysisResult::recovered_db_comparators`; consumed by
+    /// `EnvironmentImpl::open_database` to enforce comparator mismatch
+    /// semantics on open (JE `DatabaseImpl.ComparatorReader`).
+    pub recovered_db_comparators:
+        hashbrown::HashMap<String, (Option<String>, Option<String>)>,
+
     /// VLSN→LSN pairs replayed during the redo phase.
     ///
     /// X-14 fix: populated from every LN record that carries a non-zero
@@ -124,6 +132,7 @@ impl RecoveryInfo {
             recovered_prepared_txns: Vec::new(),
             prepared_txn_lns: hashbrown::HashMap::new(),
             recovered_db_names: hashbrown::HashMap::new(),
+            recovered_db_comparators: hashbrown::HashMap::new(),
             recovered_vlsns: Vec::new(),
             rollback_matchpoint_lsn: None,
         }

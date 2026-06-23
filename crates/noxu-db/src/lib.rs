@@ -129,7 +129,7 @@ pub use checkpoint_config::CheckpointConfig;
 pub use cursor::Cursor;
 pub use cursor_config::CursorConfig;
 pub use database::Database;
-pub use database_config::DatabaseConfig;
+pub use database_config::{Comparator, DatabaseConfig};
 pub use database_entry::DatabaseEntry;
 pub use database_stats::{BtreeStats, DatabaseStats};
 pub use db_iter::{DbIter, DbRange};

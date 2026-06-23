@@ -786,6 +786,12 @@ impl From<noxu_dbi::DbiError> for NoxuError {
             }
             DbiError::DatabaseInUse(s) => NoxuError::OperationNotAllowed(s),
             DbiError::OperationFailed(s) => NoxuError::OperationNotAllowed(s),
+            // DBI-14: surface the comparator mismatch as an operation error
+            // carrying the full diagnostic (persisted vs. configured
+            // identity).
+            ref m @ DbiError::ComparatorMismatch { .. } => {
+                NoxuError::OperationNotAllowed(m.to_string())
+            }
         }
     }
 }

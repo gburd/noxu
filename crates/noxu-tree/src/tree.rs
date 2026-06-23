@@ -2865,6 +2865,84 @@ impl Tree {
         total
     }
 
+    /// DBI-14: collect every live `(full_key, data, lsn)` triple in physical
+    /// (left-to-right) order.  Used by `resort_under_comparator` to rebuild a
+    /// tree whose slots were laid out in byte order (e.g. by recovery redo,
+    /// which has no access to the application comparator) under the real
+    /// configured comparator.
+    fn collect_all_entries(&self) -> Vec<(Vec<u8>, Vec<u8>, Lsn)> {
+        let mut out = Vec::new();
+        if let Some(root) = self.get_root() {
+            Self::collect_all_entries_recursive(&root, &mut out);
+        }
+        out
+    }
+
+    fn collect_all_entries_recursive(
+        node_arc: &Arc<RwLock<TreeNode>>,
+        out: &mut Vec<(Vec<u8>, Vec<u8>, Lsn)>,
+    ) {
+        let guard = node_arc.read();
+        match &*guard {
+            TreeNode::Bottom(b) => {
+                for i in 0..b.entries.len() {
+                    if b.entries[i].known_deleted {
+                        continue;
+                    }
+                    if let Some(fk) = b.get_full_key(i) {
+                        let data =
+                            b.entries[i].data.clone().unwrap_or_default();
+                        out.push((fk, data, b.get_lsn(i)));
+                    }
+                }
+            }
+            TreeNode::Internal(n) => {
+                let children: Vec<Arc<RwLock<TreeNode>>> =
+                    n.resident_children();
+                drop(guard);
+                for child in &children {
+                    Self::collect_all_entries_recursive(child, out);
+                }
+            }
+        }
+    }
+
+    /// DBI-14: rebuild this tree so that its on-disk byte-ordered slot layout
+    /// is re-sorted under the currently-configured key comparator.
+    ///
+    /// Recovery redo (`redo_insert`) has no access to the application's
+    /// comparator function — only the persisted identity — so it lays keys
+    /// out in unsigned-byte order.  After `set_recovered_tree` attaches the
+    /// real comparator, the slots must be re-sorted, or comparator-driven
+    /// searches would binary-search a tree ordered by the wrong relation.
+    ///
+    /// No-op when no comparator is configured (byte order already matches the
+    /// recovered layout) or when the tree is empty.  Mirrors the effect of
+    /// JE reconstructing the comparator at open and the tree always having
+    /// been built under it.
+    pub fn resort_under_comparator(&self) {
+        if self.key_comparator.is_none() {
+            return;
+        }
+        let entries = self.collect_all_entries();
+        if entries.is_empty() {
+            return;
+        }
+        // Drop the current root; re-insert every entry through the normal
+        // comparator-aware insert path so the new layout obeys the comparator.
+        *self.root.write() = None;
+        *self.root_log_lsn.write() = noxu_util::NULL_LSN;
+        for (key, data, lsn) in entries {
+            // Best-effort: a failed re-insert would be a tree-structure bug;
+            // surface it loudly in debug builds.
+            let r = self.insert(key, data, lsn);
+            debug_assert!(
+                r.is_ok(),
+                "resort_under_comparator: re-insert failed: {r:?}"
+            );
+        }
+    }
+
     fn count_entries_recursive(
         node_arc: &Arc<RwLock<TreeNode>>,
         total: &mut u64,

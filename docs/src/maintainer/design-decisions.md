@@ -298,3 +298,56 @@ non-diverged fast path; the diverged case runs `syncup_with_feeder`.
 NeedsRestore stays the fallback for `verify_rollback => NetworkRestore` (no
 common matchpoint) and `HardRecovery` (the rollback would cross a committed
 txn), per JE.
+
+## 12. Comparator Identity, Not Comparator Class Name (DBI-14 / DBI-15)
+
+JE persists a user comparator by storing its **class name** in the database
+record (`DatabaseImpl.btreeComparatorBytes` /`duplicateComparatorBytes`, written
+by `comparatorToBytes(comparator, byClassName=true)`), and reconstructs the
+`Comparator<byte[]>` instance at open by instantiating that class
+(`DatabaseImpl.ComparatorReader`). If the class is missing or fails to load,
+the open fails.
+
+A Rust comparator is an `Arc<dyn Fn(&[u8],&[u8]) -> Ordering>` — it has no
+portable name and cannot be reconstructed from a string. The faithful
+adaptation:
+
+- `noxu_db::Comparator::new(identity, closure)` pairs the closure with an
+  application-supplied **identity** string (the analogue of JE's class name).
+- That identity is persisted in the `NameLN` data field, right after the
+  8-byte db id, via `noxu_dbi::name_ln_codec`. A record that ends after the db
+  id (the pre-DBI-14 format) decodes to "no comparator", so old logs stay
+  readable.
+- On every subsequent open, if a database has a persisted comparator identity,
+  the application **must** supply a comparator whose identity matches (or set
+  `override_btree_comparator` / `override_duplicate_comparator`, the analogue
+  of JE `setOverrideBtreeComparator`). A mismatch fails the open with
+  `DbiError::ComparatorMismatch` rather than silently reinterpreting a
+  comparator-ordered tree under the wrong order — which would corrupt the
+  sort. This mirrors JE's mismatch semantics (class-not-found → open fails).
+- Recovery redo (`RecoveryManager`) has no access to the application closure —
+  only the persisted identity — so it lays keys out in unsigned-byte order.
+  After `DatabaseImpl::set_recovered_tree` attaches the real comparator,
+  `Tree::resort_under_comparator` rebuilds the tree under it. This is the
+  Rust analogue of JE always having built the tree under the reconstructed
+  comparator.
+
+### DBI-15 bound (replicated propagation)
+
+Because the comparator identity rides in the `NameLN` data field, it
+propagates to replicas automatically: the master sends the log frame, the
+replica writes the identical bytes to its own WAL
+(`stream/replica_stream.rs`), and the replica's recovery decodes the identity
+through the same `file_manager_scanner` path the master uses. No rep-side code
+change is needed — the identity flows in the existing replicated byte stream
+(the analogue of JE propagating the comparator class name via the
+NameLN/`DatabaseImpl` log entry).
+
+The bound, stated honestly: **identity flows; the replica application must
+register a matching comparator.** Just as JE requires the comparator *class* to
+be present on the replica's classpath, Noxu requires the replica application to
+re-supply a comparator with the matching identity. A replica cannot
+reconstruct the comparison *function* from the identity alone (the same
+fn-can't-be-named limitation as on the master). If the replica opens the
+database without the matching comparator, the open fails with the same
+`ComparatorMismatch` semantics — it does not silently mis-sort.

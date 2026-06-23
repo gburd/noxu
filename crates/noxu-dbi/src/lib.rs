@@ -33,6 +33,7 @@ mod error;
 mod file_manager_scanner;
 mod get_mode;
 mod memory_budget;
+pub mod name_ln_codec;
 mod node_sequence;
 mod operation;
 mod operation_status;
@@ -47,7 +48,7 @@ pub use backup_manager::{BackupDestination, BackupManager};
 pub use cursor_impl::CursorImpl;
 #[cfg(any(test, feature = "testing"))]
 pub use cursor_impl::{clear_cursor_fail_flag, set_cursor_fail_after};
-pub use database_config::DatabaseConfig;
+pub use database_config::{ConfigComparator, DatabaseConfig};
 pub use database_id::DatabaseId;
 pub use database_impl::{DatabaseImpl, DatabaseTree};
 pub use db_tree::DbTree;

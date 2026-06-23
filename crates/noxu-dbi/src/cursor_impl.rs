@@ -1453,45 +1453,30 @@ impl CursorImpl {
     ) -> Option<(Vec<u8>, Vec<u8>, u64, usize)> {
         use noxu_tree::tree::TreeNode;
 
+        // DBI-14: with a custom comparator the BIN slots are ordered by the
+        // comparator over FULL keys, not by raw suffix bytes.  Compare full
+        // keys via the comparator instead of the byte-suffix fast path so
+        // SearchGte honours the configured order.
+        let cmp = tree.get_comparator().cloned();
+
         // Step 1: scan the BIN that should contain `key`.  The read lock
         // is dropped at the end of this block before step 2 runs.
         let in_current: Option<(Vec<u8>, Vec<u8>, u64, usize)> = {
             let root = tree.get_root()?;
             // Use find_bin_for_key so range searches also work for non-leftmost BINs.
-            let bin_arc =
-                Self::find_bin_for_key(root, key, tree.get_comparator())?;
+            let bin_arc = Self::find_bin_for_key(root, key, cmp.as_ref())?;
             let guard = bin_arc.read();
             match &*guard {
                 TreeNode::Bottom(bin) => {
-                    let plen = bin.key_prefix.len();
-
-                    if plen != 0 && !key.starts_with(bin.key_prefix.as_slice())
-                    {
-                        // Seed does not share this BIN's learned prefix.
-                        // Decide by lex-comparing seed against key_prefix;
-                        // never call compress_key (which requires `starts_with`).
-                        if key < bin.key_prefix.as_slice() {
-                            // Every key in this BIN is > seed.
-                            bin.entries.first().and_then(|e| {
-                                bin.get_full_key(0).map(|fk| {
-                                    (
-                                        fk,
-                                        e.data.clone().unwrap_or_default(),
-                                        bin.get_lsn(0).as_u64(),
-                                        0usize,
-                                    )
+                    if let Some(cmp) = &cmp {
+                        // Comparator path: find the first slot whose FULL key
+                        // is >= `key` under the comparator.
+                        (0..bin.entries.len())
+                            .find(|&i| {
+                                bin.get_full_key(i).is_some_and(|fk| {
+                                    cmp(&fk, key) != std::cmp::Ordering::Less
                                 })
                             })
-                        } else {
-                            // Every key in this BIN is < seed; let step 2
-                            // handle it.
-                            None
-                        }
-                    } else {
-                        // Cheap path: suffix comparison.
-                        let suffix = &key[plen..];
-                        (0..bin.entries.len())
-                            .find(|&i| bin.get_key(i) >= suffix)
                             .and_then(|i| {
                                 bin.get_full_key(i).map(|fk| {
                                     (
@@ -1505,6 +1490,51 @@ impl CursorImpl {
                                     )
                                 })
                             })
+                    } else {
+                        let plen = bin.key_prefix.len();
+
+                        if plen != 0
+                            && !key.starts_with(bin.key_prefix.as_slice())
+                        {
+                            // Seed does not share this BIN's learned prefix.
+                            // Decide by lex-comparing seed against key_prefix;
+                            // never call compress_key (which requires `starts_with`).
+                            if key < bin.key_prefix.as_slice() {
+                                // Every key in this BIN is > seed.
+                                bin.entries.first().and_then(|e| {
+                                    bin.get_full_key(0).map(|fk| {
+                                        (
+                                            fk,
+                                            e.data.clone().unwrap_or_default(),
+                                            bin.get_lsn(0).as_u64(),
+                                            0usize,
+                                        )
+                                    })
+                                })
+                            } else {
+                                // Every key in this BIN is < seed; let step 2
+                                // handle it.
+                                None
+                            }
+                        } else {
+                            // Cheap path: suffix comparison.
+                            let suffix = &key[plen..];
+                            (0..bin.entries.len())
+                                .find(|&i| bin.get_key(i) >= suffix)
+                                .and_then(|i| {
+                                    bin.get_full_key(i).map(|fk| {
+                                        (
+                                            fk,
+                                            bin.entries[i]
+                                                .data
+                                                .clone()
+                                                .unwrap_or_default(),
+                                            bin.get_lsn(i).as_u64(),
+                                            i,
+                                        )
+                                    })
+                                })
+                        }
                     }
                 }
                 _ => None,

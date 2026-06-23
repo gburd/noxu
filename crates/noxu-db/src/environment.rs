@@ -516,6 +516,25 @@ impl Environment {
         // Audit database F7 (Wave 2C-4): plumb key_prefixing through;
         // pre-fix the outer flag was silently dropped on the floor.
         dbi_config.set_key_prefixing(config.key_prefixing);
+        // DBI-14: thread user comparators (identity + closure) through to
+        // DatabaseImpl so the tree honours them on every key comparison.
+        dbi_config.btree_comparator =
+            config.btree_comparator.as_ref().map(|c| {
+                noxu_dbi::ConfigComparator {
+                    identity: c.identity().to_string(),
+                    func: c.func(),
+                }
+            });
+        dbi_config.duplicate_comparator = config
+            .duplicate_comparator
+            .as_ref()
+            .map(|c| noxu_dbi::ConfigComparator {
+                identity: c.identity().to_string(),
+                func: c.func(),
+            });
+        dbi_config.override_btree_comparator = config.override_btree_comparator;
+        dbi_config.override_duplicate_comparator =
+            config.override_duplicate_comparator;
         if config.node_max_entries > 0 {
             dbi_config.set_node_max_entries(config.node_max_entries as i32);
         }
