@@ -196,26 +196,39 @@ for `PemFiles`/`PemBytes` identities so the server can verify the peer.
 use `TlsTcpChannelListener::bind_with_tls_and_allowlist` directly.
 See `docs/src/internal/auth-mtls-design-2026-05.md`.
 
-## Lock storage: a side table, not embedded in the BIN slot (TXN-11)
+## Lock storage: a side table keyed by LSN — identical to JE (TXN-11)
 
-**Decision**: Locks are stored in a sharded `HashMap<LSN, Lock>` keyed by record LSN,
-not embedded in the BIN slot the way JE embeds a `ThinLockImpl` in the IN.
+**Decision**: Locks are stored in a sharded `HashMap<LSN, Lock>` keyed by record LSN, in
+`noxu-txn`'s `LockManager`. This is **structurally identical to JE**, not a deviation.
 
-**Why**: Noxu's BIN slots (`BinEntry`) do not carry lock state — the lock table is a
-separate structure in `noxu-txn`, consistent with the lock-based-isolation-not-in-tree
-architecture. This is a consequence of keeping the tree (`noxu-tree`) free of any
-`noxu-txn` dependency.
+**Verification (corrects an earlier note)**: an earlier version of this entry claimed JE
+embeds a `ThinLockImpl` in the BIN/IN slot and that Noxu's side table was an authorized
+deviation. That was **factually wrong**. JE keeps *all* per-record locks — the thin lock
+included — in a side hashmap keyed by LSN:
 
-**What is preserved**: the JE thin-lock *memory win* IS reproduced — `Lock = Thin(ThinLockImpl)
-| Full(LockImpl)` starts thin (single owner, no waiters) and inflates to full only on the
-second owner or first waiter, and an unlocked record costs **zero** lock-table memory (the
-entry is removed on last release). So the cheap-uncontended / inflate-on-contention /
-zero-standing-cost properties match JE; only the storage *locus* (side table vs in-slot) differs.
+- `txn/LockManager.java:117` — `private final Map<Long,Lock>[] lockTables; // keyed by LSN`
+- `txn/LockManager.java:159` — `lockTables[i] = new HashMap<Long,Lock>();`
+- `attemptLockInternal` creates `new ThinLockImpl()` and `put`s it **into that hashmap**.
+- `TOTAL_THINLOCKIMPL_OVERHEAD` (`LockManager.java:86-89`) explicitly includes
+  `MemoryBudget.HASHMAP_ENTRY_OVERHEAD` — JE charges a thin lock the cost of a *hashmap
+  entry*, which is dispositive: the thin lock is not in a slot.
+- `tree/BIN.java` / `tree/IN.java` carry **no** `Lock`/`ThinLockImpl`/`LockImpl` field in
+  either the stock JE or the Oracle NoSQL fork.
 
-**Trade-off**: each *currently held* lock costs a hash-table entry rather than an in-slot
-field, and the lock is not co-located with the BIN. For the common case (few locks held at
-once relative to the resident node count) this is immaterial. This is an **authorized
-deviation**, not a fidelity gap.
+Noxu's `lock_tables: Vec<Mutex<HashMap<u64, Lock>>>` (`noxu-txn/src/lock_manager.rs:78`) is a
+1:1 match: `table.entry(lsn).or_insert_with(Lock::new_thin)`, thin → inflates to full on
+contention — the same side-hashmap-of-thin-locks-that-mutate-to-fat as JE.
+
+**What "thin" means**: `ThinLockImpl` is the *memory win* — a single-owner, no-waiter-list
+lock object that mutates to `LockImpl` on contention. "Thin" is the cheap object *shape*, NOT
+in-slot storage. Noxu reproduces this exactly: `Lock = Thin(ThinLockImpl) | Full(LockImpl)`
+starts thin (single owner, no waiters), inflates to full on the second owner or first waiter,
+and an unlocked record costs **zero** lock-table memory (the entry is removed on last release).
+
+**Architecture note**: keeping locks in `noxu-txn` (not in the `noxu-tree` BIN slot) also
+preserves the layering — `noxu-tree` has no `noxu-txn` dependency. Because JE's locus is the
+*same* side table, there is no fidelity tension here: the faithful design and the layered
+design coincide. TXN-11 required **no code change** — the implementation already matched JE.
 
 ## Diverged-tail replica syncup rollback (REP-1)
 
