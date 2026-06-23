@@ -128,7 +128,7 @@ pub mod test_harness;
 #[cfg(any(feature = "tls-rustls", feature = "tls-native"))]
 pub use auth::PeerAllowlist;
 pub use commit_durability::{CommitDurability, ReplicaAckPolicy};
-pub use consistency::ConsistencyPolicy;
+pub use consistency::{ConsistencyPolicy, ConsistencyTracker};
 pub use elections::phi_detector::PhiAccrualDetector;
 pub use error::{RepError, Result};
 pub use master_transfer::{
