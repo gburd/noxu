@@ -15,6 +15,8 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+## [6.4.0] - 2026-06-24
+
 ### Added (JE-fidelity backlog completion — REP / tree / cleaner / evictor / dbi)
 
 This cycle closes the remaining deferred JE-fidelity findings from the
