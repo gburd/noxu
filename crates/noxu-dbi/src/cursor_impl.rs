@@ -1202,6 +1202,16 @@ impl CursorImpl {
             // Auto-commit: detect contention via non-blocking attempt first.
             // Auto-commit cursors do not provide serializable phantom protection
             // across multiple operations; use Read regardless of isolation.
+            //
+            // Read fast-path: an auto-commit read acquires a Read lock and
+            // releases it immediately, so the lock only serves to detect a
+            // concurrent writer.  When the slot is unlocked (the common case)
+            // probe_read_uncontended confirms it with a single shard access,
+            // skipping the acquire+release pair (two shard-mutex round-trips).
+            // Behaviour-identical: no writer => not contended, snapshot valid.
+            if lm.probe_read_uncontended(lsn, self.id) {
+                return Ok(false);
+            }
             let contended =
                 match lm.lock(lsn, self.id, LockType::Read, true, false) {
                     Ok(_) => {

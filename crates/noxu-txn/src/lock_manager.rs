@@ -288,6 +288,50 @@ impl LockManager {
     ///
     ///
     #[inline]
+    /// Read fast-path probe (auto-commit / read-committed reads).
+    ///
+    /// A read-committed or auto-commit read acquires a `Read` lock and
+    /// releases it immediately, so the only thing the lock buys is detecting
+    /// whether a *writer* currently holds the slot (in which case the caller
+    /// must wait + re-read the committed value).  When the slot has no
+    /// lock-table entry at all — the overwhelmingly common case under a
+    /// read-heavy workload — the acquire+release pair is two shard-mutex
+    /// round-trips of pure overhead.
+    ///
+    /// This probe takes the shard mutex ONCE and returns `true` (uncontended)
+    /// iff there is no entry for `lsn`, or an entry exists but has no write
+    /// owner other than the requester.  In that case the caller may skip the
+    /// formal acquire+release entirely — behaviour-identical to acquiring a
+    /// Read lock and releasing it immediately, since (a) read-committed/
+    /// auto-commit never holds the read lock past the operation, and (b) the
+    /// BIN write-guard a writer must hold to mutate the slot excludes the
+    /// reader's snapshot, so "no write owner now" means the snapshot is
+    /// committed data.  Returns `false` (must take the slow path) when a write
+    /// owner or any waiter is present, so contention detection + the
+    /// re-read-after-writer path are preserved exactly.
+    ///
+    /// Only valid for the immediate-release isolation levels (read-committed,
+    /// auto-commit).  Repeatable-read / serializable hold the read lock for
+    /// the txn and MUST use the full `lock()` path.
+    pub fn probe_read_uncontended(&self, lsn: u64, requester_id: i64) -> bool {
+        let table_idx = self.get_table_index(lsn);
+        let table = self.lock_tables[table_idx].lock();
+        match table.get(&lsn) {
+            None => true, // no lock at all — unlocked, uncontended
+            Some(lock) => {
+                // A waiter means someone is contending — take the slow path
+                // so fairness/ordering is preserved.
+                if lock.n_waiters() > 0 {
+                    return false;
+                }
+                match lock.get_write_owner_locker_id() {
+                    None => true,                     // only readers own it
+                    Some(w) => w == requester_id,     // we already write-own it
+                }
+            }
+        }
+    }
+
     pub fn lock(
         &self,
         lsn: u64,
