@@ -15,6 +15,35 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Added
+
+- **`EVICTOR_ALGORITHM` config parameter (`noxu.evictor.algorithm`).** The cache
+  eviction policy is now selectable per-environment
+  (`"lru"|"clock"|"arc"|"car"|"lirs"`, default `"lru"`), wired from
+  `EnvironmentConfig` → `DbiEnvConfig` → `Evictor::with_algorithm` for both the
+  primary and scan policy slots (previously env-open hardcoded LRU). Parsed via
+  `EvictionAlgorithm::from_name`. New accessors `Environment::evictor_algorithm_name`
+  (verify the selected policy at runtime) and `Environment::cache_usage_bytes`
+  (the live arbiter-tracked budget; `get_stats().cache_usage` remains a
+  placeholder). The default stays LRU — JE-faithful.
+- **Eviction-policy cache-pressure benchmark**
+  (`benches/noxu-bench/src/bin/evictor_policy_bench.rs`): random / scan / mixed
+  workloads over a working set larger than the cache, all 5 policies, median of
+  3, on real disk. Results in `benches/results/evictor-policy-pressure.md`.
+
+### Findings
+
+- **Eviction does not reclaim memory under sustained pressure
+  (EVICTOR-RECLAIM-1).** The policy benchmark revealed that with a working set
+  larger than the cache the evictor targets ~137 k nodes per pass but evicts
+  ~1: every BIN candidate is put back (`strip_lns_from_node` does not free the
+  embedded LN heap), so cache usage stays ~1.4× over budget. The eviction
+  *policy* therefore cannot affect the resident set — all 5 policies perform
+  identically. **Default kept at LRU** (JE-faithful, no reproducible winner).
+  See `docs/src/maintainer/design-decisions.md` §13 and
+  `docs/src/operations/known-limitations.md`.
+
+
 ## [6.4.0] - 2026-06-24
 
 ### Added (JE-fidelity backlog completion — REP / tree / cleaner / evictor / dbi)

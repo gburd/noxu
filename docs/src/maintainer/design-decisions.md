@@ -364,3 +364,52 @@ reconstruct the comparison *function* from the identity alone (the same
 fn-can't-be-named limitation as on the master). If the replica opens the
 database without the matching comparator, the open fails with the same
 `ComparatorMismatch` semantics — it does not silently misorder.
+
+## 13. Eviction Algorithm Selectable, LRU Stays the Default (EVICTOR_ALGORITHM)
+
+**Decision**: The cache eviction algorithm is now selectable per-environment
+via the `noxu.evictor.algorithm` config parameter
+(`"lru"|"clock"|"arc"|"car"|"lirs"`, default `"lru"`), wired through
+`EnvironmentConfig` → `DbiEnvConfig` → `Evictor::with_algorithm` for both the
+primary and scan policy slots. **The default stays LRU.**
+
+**Why LRU stays the default**: JE's evictor is LRU, so LRU is the JE-faithful
+choice; deviating would only be justified by a policy that *wins measurably and
+reproducibly*. A cache-pressure benchmark of all five policies
+(`benches/noxu-bench/src/bin/evictor_policy_bench.rs`, 16 MiB cache, 80k × 256 B
+≈ 21 MB working set, on real disk, median of 3) found **no reproducible win**:
+
+| policy | random | scan | mixed | geomean vs LRU |
+|---|---:|---:|---:|---:|
+| lru | 912 224 | 2 626 222 | 3462 | 1.000 |
+| clock | 927 350 | 2 279 833 | 3473 | 0.960 |
+| arc | 933 049 | 2 408 167 | 3358 | 0.969 |
+| car | 1 390 661 | 3 544 132 | 3282 | 1.249 |
+| lirs | 1 372 412 | 3 357 298 | 3237 | 1.216 |
+
+The `mixed` column (slow enough that machine noise is negligible) is identical
+across all five policies (~3.3 k ops/s, ±3 %). The car/lirs `random`/`scan`
+"wins" are a machine-load artifact, not a policy effect.
+
+**The real reason the policy can't matter here**: under cache pressure, the
+evictor's end-to-end reclamation is broken — `do_evict` *targets* ~137 k nodes
+per pass but evicts ~1, putting essentially every BIN candidate back (its
+`strip_lns_from_node` partial-eviction path returns "busy/put-back"), so cache
+usage stays ~1.4× over budget (~24 MB resident vs a 16 MiB budget). The policy's
+`evict_candidate()` genuinely drives *victim selection* (it is wired and not a
+no-op at the API level), but because the chosen victim is put back rather than
+evicted, the *order* of selection is irrelevant to the resident set — so all
+five policies keep the same pages resident and run at the same speed.
+
+**Consequence**: LRU is the default (JE-faithful, honest). The other four
+policies are available via `noxu.evictor.algorithm` for re-measurement once the
+underlying partial-eviction reclamation gap (`strip_lns_from_node` /
+`EvictionDecision::PartialEvict` in `crates/noxu-evictor/src/evictor.rs`) is
+fixed. A real policy comparison is meaningless until eviction actually reclaims
+memory under pressure.
+
+**Where**: `crates/noxu-config/src/params.rs` (`EVICTOR_ALGORITHM`),
+`crates/noxu-dbi/src/dbi_config.rs` + `environment_impl.rs`,
+`crates/noxu-db/src/environment_config.rs` + `environment.rs`,
+`crates/noxu-evictor/src/policy.rs` (`EvictionAlgorithm::from_name`).
+**Evidence**: `benches/results/evictor-policy-pressure.md`.
