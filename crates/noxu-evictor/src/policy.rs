@@ -110,6 +110,20 @@ pub enum EvictionAlgorithm {
 }
 
 impl EvictionAlgorithm {
+    /// Parse an algorithm name (case-insensitive) as used by the
+    /// `noxu.evictor.algorithm` config parameter. Unknown names fall back to
+    /// the default ([`Lru`][EvictionAlgorithm::Lru]) so a typo never panics
+    /// env-open; callers that want strictness can compare the result.
+    pub fn from_name(name: &str) -> EvictionAlgorithm {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "clock" => EvictionAlgorithm::Clock,
+            "arc" => EvictionAlgorithm::Arc,
+            "car" => EvictionAlgorithm::Car,
+            "lirs" => EvictionAlgorithm::Lirs,
+            _ => EvictionAlgorithm::Lru,
+        }
+    }
+
     /// Instantiate a fresh, empty policy for this algorithm.
     pub fn new_policy(self) -> Box<dyn EvictionPolicy> {
         use crate::policies::{

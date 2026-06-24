@@ -1592,6 +1592,19 @@ pub static EVICTOR_NODES_PER_SCAN: ConfigParam = ConfigParam::int_param(
     false,      // forReplication
 );
 
+/// Cache eviction algorithm: "lru" | "clock" | "arc" | "car" | "lirs".
+///
+/// JE's evictor is LRU (`Evictor` / `LRUEvictor`); Noxu defaults to "lru" to
+/// stay JE-faithful. The other policies are scan-resistant alternatives
+/// selectable per-environment. Wired through `DbiEnvConfig.evictor_algorithm`
+/// to `Evictor::with_algorithm` (both primary and scan policy slots).
+pub static EVICTOR_ALGORITHM: ConfigParam = ConfigParam::string_param(
+    "noxu.evictor.algorithm",
+    "lru", // default (JE-faithful)
+    false, // mutable (policy is fixed at env-open)
+    false, // forReplication
+);
+
 /// Deprecated — per-pass deadlock retry count is no longer configurable.
 ///
 /// The evictor thread pool handles retry scheduling automatically.
@@ -1852,6 +1865,7 @@ pub fn all_params() -> Vec<&'static ConfigParam> {
         &CLEANER_LAZY_MIGRATION,
         // Compressor
         &COMPRESSOR_PURGE_ROOT,
+        &EVICTOR_ALGORITHM,
         // Deprecated compat evictor
         &EVICTOR_NODES_PER_SCAN,
         &EVICTOR_DEADLOCK_RETRY,
@@ -2138,6 +2152,10 @@ mod tests {
         assert!(
             names.contains(&"noxu.evictor.nodesPerScan"),
             "EVICTOR_NODES_PER_SCAN missing"
+        );
+        assert!(
+            names.contains(&"noxu.evictor.algorithm"),
+            "EVICTOR_ALGORITHM missing"
         );
         assert!(
             names.contains(&"noxu.evictor.deadlockRetry"),

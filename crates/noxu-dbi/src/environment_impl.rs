@@ -880,10 +880,21 @@ impl EnvironmentImpl {
             cfg.evictor_nodes_per_scan,
             cfg.evictor_lru_only,
         )
+        // Select the eviction algorithm (JE EVICTOR is LRU; Noxu defaults to
+        // "lru" but allows clock/arc/car/lirs via EVICTOR_ALGORITHM). Sets both
+        // the primary and scan policy slots.
+        .with_algorithm(noxu_evictor::EvictionAlgorithm::from_name(
+            &cfg.evictor_algorithm,
+        ))
         // JE EVICTOR_USE_DIRTY_LRU; with_off_heap below forces it false if the
         // off-heap cache is enabled (JE Evictor.java:1705).
         .with_use_dirty_lru(cfg.evictor_use_dirty_lru)
         .with_off_heap(Arc::clone(&off_heap_cache));
+        log::info!(
+            "evictor eviction algorithm: {} (requested {:?})",
+            evictor_builder.primary_algorithm_name(),
+            cfg.evictor_algorithm
+        );
         let evictor = Arc::new(evictor_builder);
 
         // Start the background daemon thread.  The thread loops as long as
@@ -2404,6 +2415,12 @@ impl EnvironmentImpl {
     /// or no cache is active).
     pub fn evict_memory(&self) -> usize {
         self.evictor.do_evict(EvictionSource::Manual).bytes_evicted as usize
+    }
+
+    /// The eviction algorithm name actually in effect (primary policy slot).
+    /// Used to verify `EVICTOR_ALGORITHM` wiring took effect at runtime.
+    pub fn evictor_algorithm_name(&self) -> &'static str {
+        self.evictor.primary_algorithm_name()
     }
 
     /// EV-15: per-operation synchronous critical eviction (write back-pressure).

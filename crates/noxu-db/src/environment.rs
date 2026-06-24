@@ -325,6 +325,7 @@ impl Environment {
             // Evictor
             run_evictor: config.run_evictor,
             evictor_nodes_per_scan: config.evictor_nodes_per_scan,
+            evictor_algorithm: config.evictor_algorithm.clone(),
             evictor_evict_bytes: config.evictor_evict_bytes,
             evictor_critical_percentage: config.evictor_critical_percentage,
             evictor_lru_only: config.evictor_lru_only,
@@ -1545,6 +1546,22 @@ impl Environment {
         let env_impl = self.env_impl.lock();
         let bytes = env_impl.evict_memory();
         Ok(bytes)
+    }
+
+    /// The cache eviction algorithm in effect ("LRU"|"Clock"|"ARC"|"CAR"|"LIRS").
+    /// Reflects the runtime-selected policy, used to verify `EVICTOR_ALGORITHM`
+    /// wiring took effect.
+    pub fn evictor_algorithm_name(&self) -> Result<&'static str> {
+        self.check_open()?;
+        Ok(self.env_impl.lock().evictor_algorithm_name())
+    }
+
+    /// Current cache memory in use (bytes), as tracked by the evictor arbiter.
+    /// Unlike [`get_stats`](Self::get_stats)`.cache_usage` (a placeholder), this
+    /// reflects the live tree-memory budget the evictor drives down.
+    pub fn cache_usage_bytes(&self) -> Result<i64> {
+        self.check_open()?;
+        Ok(self.env_impl.lock().get_cache_usage())
     }
     ///
     /// Called by Database::close().

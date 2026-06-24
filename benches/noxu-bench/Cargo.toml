@@ -16,6 +16,10 @@ path = "src/sustained_main.rs"
 name = "noxu-w10-bench"
 path = "src/w10_bench.rs"
 
+[[bin]]
+name = "evictor_policy_bench"
+path = "src/evictor_policy_bench.rs"
+
 [dependencies]
 noxu-db = { workspace = true }
 noxu-sync = { path = "../../crates/noxu-sync" }
