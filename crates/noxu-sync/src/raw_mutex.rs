@@ -27,12 +27,22 @@ const LOCKED_CONTENDED: u32 = 2;
 const SPIN_LIMIT: usize = 40;
 
 /// A unique, non-zero identifier for the calling thread.
+///
+/// The hash of `ThreadId` is cached in a thread-local so it is computed once
+/// per thread rather than on every lock/unlock.  (`ThreadId::as_u64()` is
+/// unstable, so we hash; hashing a fresh `DefaultHasher` per call showed up at
+/// ~2% of the write-path CPU profile — the cache removes it.)
 pub(crate) fn thread_id() -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    std::thread::current().id().hash(&mut hasher);
-    // Ensure non-zero so that 0 always means "unowned".
-    hasher.finish() | 1
+    thread_local! {
+        static TID: u64 = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            std::thread::current().id().hash(&mut hasher);
+            // Ensure non-zero so that 0 always means "unowned".
+            hasher.finish() | 1
+        };
+    }
+    TID.with(|t| *t)
 }
 
 /// Futex-based raw mutex.
