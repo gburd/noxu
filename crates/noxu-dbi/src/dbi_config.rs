@@ -151,6 +151,9 @@ pub struct DbiEnvConfig {
     // -----------------------------------------------------------------------
     pub run_evictor: bool,
     pub evictor_nodes_per_scan: usize,
+    /// Cache eviction algorithm name: "lru" | "clock" | "arc" | "car" | "lirs".
+    /// JE-faithful default "lru". Parsed via `EvictionAlgorithm::from_name`.
+    pub evictor_algorithm: String,
     pub evictor_evict_bytes: u64,
     pub evictor_critical_percentage: u32,
     pub evictor_lru_only: bool,
@@ -321,6 +324,7 @@ impl Default for DbiEnvConfig {
             // Evictor
             run_evictor: true,
             evictor_nodes_per_scan: 10,
+            evictor_algorithm: "lru".to_string(),
             evictor_evict_bytes: 512 * 1024,
             evictor_critical_percentage: 5,
             evictor_lru_only: false,

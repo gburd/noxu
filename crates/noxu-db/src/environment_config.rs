@@ -509,6 +509,10 @@ pub struct EnvironmentConfig {
     /// Mirrors `EVICTOR_NODES_PER_SCAN` / default 10.
     pub evictor_nodes_per_scan: usize,
 
+    /// Cache eviction algorithm: "lru" | "clock" | "arc" | "car" | "lirs".
+    /// Mirrors `EVICTOR_ALGORITHM` / default "lru" (JE-faithful).
+    pub evictor_algorithm: String,
+
     /// Bytes to evict from the cache per evictor pass.
     /// Mirrors `EVICTOR_EVICT_BYTES` / default 512 KiB.
     pub evictor_evict_bytes: u64,
@@ -896,6 +900,7 @@ impl EnvironmentConfig {
             checkpointer_high_priority: false,
             // Evictor
             evictor_nodes_per_scan: 10,
+            evictor_algorithm: "lru".to_string(),
             evictor_evict_bytes: 512 * 1024,
             evictor_critical_percentage: 5,
             evictor_lru_only: false,
@@ -1478,6 +1483,19 @@ impl EnvironmentConfig {
     }
     pub fn with_evictor_nodes_per_scan(mut self, n: usize) -> Self {
         self.evictor_nodes_per_scan = n;
+        self
+    }
+    /// Set the cache eviction algorithm ("lru"|"clock"|"arc"|"car"|"lirs").
+    pub fn set_evictor_algorithm(
+        &mut self,
+        algo: impl Into<String>,
+    ) -> &mut Self {
+        self.evictor_algorithm = algo.into();
+        self
+    }
+    /// Builder form of [`set_evictor_algorithm`](Self::set_evictor_algorithm).
+    pub fn with_evictor_algorithm(mut self, algo: impl Into<String>) -> Self {
+        self.evictor_algorithm = algo.into();
         self
     }
     pub fn set_evictor_evict_bytes(&mut self, bytes: u64) -> &mut Self {
