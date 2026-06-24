@@ -4,7 +4,7 @@
 use hashbrown::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use bytes::BytesMut;
 use noxu_sync::RwLock;
@@ -27,6 +27,62 @@ use noxu_recovery::RecoveryManager;
 use noxu_sync::Mutex as NoxuMutex;
 use noxu_txn::{LockManager, Txn, TxnManager};
 use noxu_util::{lsn::NULL_LSN, vlsn::NULL_VLSN};
+
+/// Interruptible-sleep signal for a daemon thread.
+///
+/// A daemon waits on [`DaemonSignal::wait_timeout`] for its poll interval;
+/// [`DaemonSignal::shutdown`] sets the flag and wakes the thread immediately
+/// (via the condvar), so `join()` returns without waiting for the current
+/// sleep interval to elapse.  This replaces the previous chunked
+/// `thread::sleep(100ms)` poll loops, which added up to one chunk of latency
+/// (~100ms per daemon) to `close()` / `drop()` and inflated the W11 recovery
+/// benchmark.  Mirrors the checkpointer's `wait_for_shutdown_or_timeout`.
+struct DaemonSignal {
+    shutdown: AtomicBool,
+    lock: Mutex<()>,
+    cv: Condvar,
+}
+
+impl DaemonSignal {
+    fn new() -> Arc<Self> {
+        Arc::new(DaemonSignal {
+            shutdown: AtomicBool::new(false),
+            lock: Mutex::new(()),
+            cv: Condvar::new(),
+        })
+    }
+
+    /// True once shutdown has been requested.
+    fn is_shutdown(&self) -> bool {
+        self.shutdown.load(Ordering::Relaxed)
+    }
+
+    /// Request shutdown and wake the daemon immediately.
+    fn shutdown(&self) {
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.shutdown.store(true, Ordering::Relaxed);
+        self.cv.notify_all();
+    }
+
+    /// Sleep up to `dur`, returning early if shutdown is requested.
+    /// Returns `true` if shutdown was requested (caller should exit).
+    fn wait_timeout(&self, dur: std::time::Duration) -> bool {
+        if self.shutdown.load(Ordering::Relaxed) {
+            return true;
+        }
+        let guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        // Re-check under the lock to avoid missing a notify between the
+        // unlocked check and acquiring the lock.
+        if self.shutdown.load(Ordering::Relaxed) {
+            return true;
+        }
+        let (_g, _timed_out) = self
+            .cv
+            .wait_timeout(guard, dur)
+            .unwrap_or_else(|e| e.into_inner());
+        self.shutdown.load(Ordering::Relaxed)
+    }
+}
 
 /// The internal representation of an environment.
 ///
@@ -227,7 +283,7 @@ pub struct EnvironmentImpl {
     /// signal the thread to exit.
     ///
     ///
-    in_compressor_shutdown: Arc<AtomicBool>,
+    in_compressor_shutdown: Arc<DaemonSignal>,
 
     /// Background INCompressor daemon thread handle.
     ///
@@ -239,7 +295,7 @@ pub struct EnvironmentImpl {
     in_compressor_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
 
     /// Cleaner daemon shutdown flag (CleanerDaemon).
-    cleaner_shutdown: Arc<AtomicBool>,
+    cleaner_shutdown: Arc<DaemonSignal>,
 
     /// Background cleaner daemon thread handle.
     cleaner_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -254,7 +310,7 @@ pub struct EnvironmentImpl {
     /// `LogManager::flush_no_sync()`.  This ensures that data committed with
     /// `CommitNoSync` durability reaches the OS page cache within the bounded
     /// interval even if no subsequent commit triggers a flush.
-    log_flush_no_sync_shutdown: Arc<AtomicBool>,
+    log_flush_no_sync_shutdown: Arc<DaemonSignal>,
 
     /// Background log-flush-no-sync daemon thread handle.
     log_flush_no_sync_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -1093,7 +1149,7 @@ impl EnvironmentImpl {
         // Start the background INCompressor daemon thread (INCompressor).
         // Controlled by cfg.run_in_compressor; wakeup interval from
         // cfg.in_compressor_wakeup_interval_ms ( COMPRESSOR_WAKEUP_INTERVAL).
-        let in_compressor_shutdown = Arc::new(AtomicBool::new(false));
+        let in_compressor_shutdown = DaemonSignal::new();
         let in_compressor_shutdown_clone = Arc::clone(&in_compressor_shutdown);
         let db_map_for_compressor = Arc::clone(&db_map);
         let compressor_interval_ms = cfg.in_compressor_wakeup_interval_ms;
@@ -1104,22 +1160,16 @@ impl EnvironmentImpl {
                 if !run_in_compressor {
                     return;
                 }
-                while !in_compressor_shutdown_clone.load(Ordering::Relaxed) {
-                    // Sleep in small chunks so shutdown is responsive (same
-                    // pattern as the cleaner daemon — avoids a full 5-second
-                    // stall on env.close() / drop, which inflates w11 recovery
-                    // benchmark elapsed time).
-                    let chunk_ms = 100u64;
-                    let mut remaining = compressor_interval_ms;
-                    while remaining > 0
-                        && !in_compressor_shutdown_clone.load(Ordering::Relaxed)
-                    {
-                        std::thread::sleep(std::time::Duration::from_millis(
-                            chunk_ms.min(remaining),
-                        ));
-                        remaining = remaining.saturating_sub(chunk_ms);
-                    }
-                    if in_compressor_shutdown_clone.load(Ordering::Relaxed) {
+                while !in_compressor_shutdown_clone.is_shutdown() {
+                    // Interruptible sleep: shutdown() wakes us immediately via
+                    // the condvar, so close()/drop() doesn't wait out the poll
+                    // interval (previously a chunked thread::sleep that added
+                    // ~100ms to teardown and inflated the W11 benchmark).
+                    if in_compressor_shutdown_clone.wait_timeout(
+                        std::time::Duration::from_millis(
+                            compressor_interval_ms,
+                        ),
+                    ) {
                         break;
                     }
                     // Iterate all open databases and compress any BINs that
@@ -1146,7 +1196,7 @@ impl EnvironmentImpl {
         // Start the background log-cleaner daemon thread (CleanerDaemon).
         // Sleeps for throttle.current_sleep_ms() between cleaning passes so
         // the sleep interval adapts to the current log write rate.
-        let cleaner_shutdown = Arc::new(AtomicBool::new(false));
+        let cleaner_shutdown = DaemonSignal::new();
         let cleaner_shutdown_clone = Arc::clone(&cleaner_shutdown);
         let cleaner_for_daemon = cleaner.as_ref().map(Arc::clone);
         let run_cleaner_daemon = cfg.run_cleaner;
@@ -1156,23 +1206,18 @@ impl EnvironmentImpl {
                 if !run_cleaner_daemon {
                     return;
                 }
-                while !cleaner_shutdown_clone.load(Ordering::Relaxed) {
+                while !cleaner_shutdown_clone.is_shutdown() {
                     let sleep_ms = if let Some(ref c) = cleaner_for_daemon {
                         let _ = c.do_clean(c.throttle.current_n_files(), false);
                         c.throttle.current_sleep_ms()
                     } else {
                         5_000 // no cleaner — sleep 5 s
                     };
-                    // Sleep in small chunks so shutdown is responsive.
-                    let chunk_ms = 100u64;
-                    let mut remaining = sleep_ms;
-                    while remaining > 0
-                        && !cleaner_shutdown_clone.load(Ordering::Relaxed)
-                    {
-                        std::thread::sleep(std::time::Duration::from_millis(
-                            chunk_ms.min(remaining),
-                        ));
-                        remaining = remaining.saturating_sub(chunk_ms);
+                    // Interruptible sleep: shutdown() wakes immediately.
+                    if cleaner_shutdown_clone.wait_timeout(
+                        std::time::Duration::from_millis(sleep_ms),
+                    ) {
+                        break;
                     }
                 }
             })
@@ -1184,7 +1229,7 @@ impl EnvironmentImpl {
         // with CommitNoSync (SyncPolicy::NoSync) is drained from the in-process
         // write buffers to the OS page cache within a bounded time.
         // If the interval is 0 the thread exits immediately (disabled path).
-        let log_flush_no_sync_shutdown = Arc::new(AtomicBool::new(false));
+        let log_flush_no_sync_shutdown = DaemonSignal::new();
         let log_flush_no_sync_shutdown_clone =
             Arc::clone(&log_flush_no_sync_shutdown);
         let flush_interval_ms = cfg.log_flush_no_sync_interval_ms;
@@ -1195,21 +1240,11 @@ impl EnvironmentImpl {
                 if flush_interval_ms == 0 {
                     return; // disabled
                 }
-                while !log_flush_no_sync_shutdown_clone.load(Ordering::Relaxed)
-                {
-                    let chunk_ms = 100u64;
-                    let mut remaining = flush_interval_ms;
-                    while remaining > 0
-                        && !log_flush_no_sync_shutdown_clone
-                            .load(Ordering::Relaxed)
-                    {
-                        std::thread::sleep(std::time::Duration::from_millis(
-                            chunk_ms.min(remaining),
-                        ));
-                        remaining = remaining.saturating_sub(chunk_ms);
-                    }
-                    if log_flush_no_sync_shutdown_clone.load(Ordering::Relaxed)
-                    {
+                while !log_flush_no_sync_shutdown_clone.is_shutdown() {
+                    // Interruptible sleep: shutdown() wakes immediately.
+                    if log_flush_no_sync_shutdown_clone.wait_timeout(
+                        std::time::Duration::from_millis(flush_interval_ms),
+                    ) {
                         break;
                     }
                     if let Some(ref lm) = lm_for_flush {
@@ -2422,19 +2457,19 @@ impl EnvironmentImpl {
         }
 
         // Signal the INCompressor daemon to stop and wait for it to exit.
-        self.in_compressor_shutdown.store(true, Ordering::Relaxed);
+        self.in_compressor_shutdown.shutdown();
         if let Some(handle) = self.in_compressor_handle.lock().unwrap().take() {
             let _ = handle.join();
         }
 
         // Signal the cleaner daemon to stop and wait for it to exit.
-        self.cleaner_shutdown.store(true, Ordering::Relaxed);
+        self.cleaner_shutdown.shutdown();
         if let Some(handle) = self.cleaner_handle.lock().unwrap().take() {
             let _ = handle.join();
         }
 
         // X-11: Signal the log-flush-no-sync daemon to stop and join.
-        self.log_flush_no_sync_shutdown.store(true, Ordering::Relaxed);
+        self.log_flush_no_sync_shutdown.shutdown();
         if let Some(handle) =
             self.log_flush_no_sync_handle.lock().unwrap().take()
         {
@@ -2531,13 +2566,13 @@ impl Drop for EnvironmentImpl {
         }
 
         // Shut down the INCompressor daemon thread.
-        self.in_compressor_shutdown.store(true, Ordering::Relaxed);
+        self.in_compressor_shutdown.shutdown();
         if let Some(handle) = self.in_compressor_handle.lock().unwrap().take() {
             let _ = handle.join();
         }
 
         // Shut down the cleaner daemon thread.
-        self.cleaner_shutdown.store(true, Ordering::Relaxed);
+        self.cleaner_shutdown.shutdown();
         if let Some(handle) = self.cleaner_handle.lock().unwrap().take() {
             let _ = handle.join();
         }
