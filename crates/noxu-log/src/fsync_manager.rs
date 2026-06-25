@@ -682,6 +682,71 @@ mod tests {
         let _ = waiter_result; // either outcome is valid
     }
 
+    /// HEADLINE fsync-error-propagation test: a leader fsync failure fails
+    /// EVERY piggybacking waiter.
+    ///
+    /// N committers race; their closures all model a failing fdatasync (EIO).
+    /// Whichever thread leads a cohort runs the failing fsync and propagates
+    /// the error to every waiter that piggybacked on it (JE `wakeupAll`, Noxu
+    /// `wakeup_all_with_error`).  The invariants under test:
+    ///   1. EVERY committer returns Err — none may return Ok on a failed fsync
+    ///      (a leader fsync failure means the commit is NOT durable).
+    ///   2. The number of actual fsync ATTEMPTS is < N (coalescing happened),
+    ///      proving at least one waiter piggybacked on a leader's failure
+    ///      rather than running its own.
+    #[test]
+    fn test_leader_fsync_failure_fails_all_piggybacking_waiters() {
+        const N: usize = 8;
+        let mgr = Arc::new(FsyncManager::new(0, 0));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(std::sync::Barrier::new(N));
+
+        let handles: Vec<_> = (0..N)
+            .map(|_| {
+                let m = Arc::clone(&mgr);
+                let at = Arc::clone(&attempts);
+                let b = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    b.wait();
+                    m.flush_and_sync(|| {
+                        // Each actual leader/timeout fsync attempt: count it,
+                        // sleep so siblings queue + piggyback, then fail.
+                        at.fetch_add(1, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(15));
+                        Err::<u64, _>(std::io::Error::other("fsync EIO"))
+                    })
+                })
+            })
+            .collect();
+
+        let mut errors = 0usize;
+        for h in handles {
+            match h.join().unwrap() {
+                Ok(_) => {
+                    panic!("a committer returned Ok despite a failed fsync")
+                }
+                Err(e) => {
+                    assert!(
+                        e.to_string().contains("fsync EIO"),
+                        "error must carry the leader's failure: {e}"
+                    );
+                    errors += 1;
+                }
+            }
+        }
+        // Invariant 1: every committer failed (no Ok on a failed fsync).
+        assert_eq!(errors, N, "every committer must observe the fsync failure");
+        // Invariant 2: coalescing happened — fewer fsync attempts than threads
+        // means at least one waiter piggybacked on a leader's failed fsync and
+        // still received the propagated error.
+        let attempts = attempts.load(Ordering::SeqCst);
+        assert!(
+            attempts < N,
+            "expected coalescing under failure (attempts {attempts} < N {N}); \
+             at least one waiter must piggyback on a failed leader fsync"
+        );
+    }
+
     /// `FsyncManager::new(0, 0)` returns Ok immediately on success.
     #[test]
     fn test_returns_ok_on_success() {

@@ -353,6 +353,54 @@ fn main() {
             }
         }
 
+        // ----------------------------------------------------------------
+        // concurrent_commit_sync: N threads each CommitSync-commit a disjoint
+        // range of keys, barrier-synchronised so their fsync requests race and
+        // exercise the group-commit coalescing path (the leader/waiter fix).
+        // After every committed transaction returns (CommitSync => durable),
+        // raise `concurrent_committed`; the parent SIGKILLs us here.  Recovery
+        // must find EVERY committed key (no committed txn lost despite the
+        // coalesced single-fsync-serves-many ordering).
+        // ----------------------------------------------------------------
+        "concurrent_commit_sync" => {
+            use std::sync::{Arc, Barrier};
+            const THREADS: u32 = 8;
+            const KEYS_PER_THREAD: u32 = 50;
+            let env = Arc::new(env);
+            let db = Arc::new(db);
+            let barrier = Arc::new(Barrier::new(THREADS as usize));
+            let handles: Vec<_> = (0..THREADS)
+                .map(|tid| {
+                    let env = Arc::clone(&env);
+                    let db = Arc::clone(&db);
+                    let barrier = Arc::clone(&barrier);
+                    thread::spawn(move || {
+                        barrier.wait();
+                        for k in 0..KEYS_PER_THREAD {
+                            // Disjoint key space per thread: tid * 1000 + k.
+                            let id = tid * 1000 + k;
+                            let txn =
+                                env.begin_transaction(None).expect("begin txn");
+                            let key =
+                                DatabaseEntry::from_bytes(&id.to_be_bytes());
+                            let val = DatabaseEntry::from_bytes(b"committed");
+                            db.put(Some(&txn), &key, &val).expect("put");
+                            // Default durability is COMMIT_SYNC => real fsync.
+                            txn.commit().expect("commit");
+                        }
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().expect("join worker thread");
+            }
+            // All committed transactions have returned => all durable.
+            flag(&dir, "concurrent_committed");
+            loop {
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+
         other => panic!("Unknown NOXU_CRASH_MODE: {other}"),
     }
 }
