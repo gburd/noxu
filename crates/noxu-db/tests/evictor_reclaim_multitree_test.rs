@@ -55,9 +55,11 @@ fn scratch_dir(tag: &str) -> std::path::PathBuf {
 fn evictor_reclaims_to_budget_across_user_dbs() {
     let dir = scratch_dir("multitree");
 
-    // 16 MiB cache, ~21 MB working set split across TWO user databases -> the
+    // 4 MiB cache, ~6 MB working set split across TWO user databases -> the
     // cache cannot hold the whole set, so eviction MUST reclaim toward budget.
-    let cache_bytes: u64 = 16 * 1024 * 1024;
+    // (Kept small enough to run under the default test timeout while still
+    // forcing real cross-DB eviction pressure.)
+    let cache_bytes: u64 = 4 * 1024 * 1024;
     let mut cfg = EnvironmentConfig::new(dir.clone());
     cfg.set_allow_create(true);
     cfg.set_transactional(true);
@@ -83,8 +85,8 @@ fn evictor_reclaims_to_budget_across_user_dbs() {
         )
         .expect("open user db b");
 
-    // ~21 MB total: 150k records * ~140 B, half in each database.
-    let n = 150_000usize;
+    // ~6 MB total: 50k records * ~140 B, half in each database.
+    let n = 50_000usize;
     let val = vec![0xABu8; 120];
     for i in 0..n {
         let k = DatabaseEntry::from_vec(format!("{:010}", i).into_bytes());
