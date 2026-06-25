@@ -649,10 +649,10 @@ fn test_fsync_manager_grouping_reduces_fsyncs() {
 
         let handle = std::thread::spawn(move || {
             b.wait();
-            mgr.fsync(|| {
+            mgr.flush_and_sync(|| {
                 sc.fetch_add(1, Ordering::SeqCst);
                 std::thread::sleep(std::time::Duration::from_millis(5));
-                Ok(())
+                Ok(0)
             })
             .unwrap();
         });
@@ -683,9 +683,9 @@ fn test_fsync_manager_flush_only_no_fsync() {
 
     let c = Arc::clone(&call_count);
     manager
-        .fsync(|| {
+        .flush_and_sync(|| {
             c.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+            Ok(0)
         })
         .unwrap();
 
@@ -714,9 +714,9 @@ fn test_fsync_manager_waiter_notified() {
 
     let t1 = std::thread::spawn(move || {
         bar1.wait();
-        mgr1.fsync(|| {
+        mgr1.flush_and_sync(|| {
             std::thread::sleep(std::time::Duration::from_millis(20));
-            Ok(())
+            Ok(0)
         })
         .unwrap();
         done1.fetch_add(1, Ordering::SeqCst);
@@ -724,7 +724,7 @@ fn test_fsync_manager_waiter_notified() {
 
     let t2 = std::thread::spawn(move || {
         bar2.wait();
-        mgr2.fsync(|| Ok(())).unwrap();
+        mgr2.flush_and_sync(|| Ok(0)).unwrap();
         done2.fetch_add(1, Ordering::SeqCst);
     });
 
@@ -743,8 +743,9 @@ fn test_fsync_manager_waiter_notified() {
 #[test]
 fn test_fsync_manager_flush_error_propagates() {
     let manager = FsyncManager::new(0, 0);
-    let result =
-        manager.fsync(|| Err(std::io::Error::other("simulated flush error")));
+    let result = manager.flush_and_sync(|| {
+        Err::<u64, _>(std::io::Error::other("simulated flush error"))
+    });
     assert!(result.is_err(), "error must be propagated to caller");
 }
 
@@ -757,9 +758,9 @@ fn test_fsync_manager_sequential_calls_each_flush() {
     for _ in 0..5 {
         let c = Arc::clone(&call_count);
         manager
-            .fsync(|| {
+            .flush_and_sync(|| {
                 c.fetch_add(1, Ordering::SeqCst);
-                Ok(())
+                Ok(0)
             })
             .unwrap();
     }
