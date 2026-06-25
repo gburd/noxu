@@ -15,6 +15,31 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+## [6.4.1] - 2026-06-25
+
+### Performance
+
+- **Read fast-path: uncontended auto-commit / read-committed reads skip the
+  per-read lock acquire+release round-trip.** A read formerly acquired a `Read`
+  lock and released it immediately (two shard-mutex round-trips) solely to
+  detect a concurrent writer. `LockManager::probe_read_uncontended` now confirms
+  "no foreign write owner, no waiters" with a single shard access and skips the
+  registration when the slot is unlocked (the common case) — behaviour-identical
+  since these isolation levels release immediately anyway; a write owner or
+  waiter falls back to the full path. Measured: single-threaded reads +29-86%,
+  concurrent read throughput improved.
+- **Thread-id hash cached in a thread-local.** `noxu_sync::thread_id()` built a
+  fresh `DefaultHasher` and hashed the thread id on every mutex/rwlock
+  lock+unlock across the whole engine (~2.3% of write-path CPU); now computed
+  once per thread.
+- **Interruptible daemon shutdown.** The in-compressor, cleaner, and log-flush
+  daemons polled their shutdown flag in 100 ms `thread::sleep` chunks, adding up
+  to ~200 ms of latency to `close()` / `drop()`. They now use a condvar-based
+  `DaemonSignal` so `shutdown()` wakes them immediately (mirrors the
+  checkpointer). Measured: env re-open 208 ms → 7.4 ms (the W11 recovery
+  benchmark was measuring teardown stall, not recovery — actual recovery was
+  always fast and scales cleanly with replay size).
+
 ### Fixed
 
 - **WAL group-commit fsync coalescing now matches JE `FSyncManager.flushAndSync`
