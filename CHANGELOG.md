@@ -15,6 +15,42 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Fixed
+
+- **WAL group-commit fsync coalescing now matches JE `FSyncManager.flushAndSync`
+  ordering (perf/group-commit-coalesce).** `LogManager::flush_sync` previously
+  drained the shared log buffer (`fill_flush_pending`, advancing the buffer
+  watermark) and `pwrite`-ed the captured ranges BEFORE entering the
+  fsync-manager leader/waiter decision. A concurrent committer that did not skip
+  at `flush_sync_if_needed`'s fast path would find an empty pending buffer (a
+  prior leader already drained it) yet still enter the fsync manager and —
+  because the prior leader's fsync window opened late — slip in between that
+  leader's `pwrite` and its `fdatasync`, becoming its own leader for a
+  *redundant* fsync. Noxu issued ~1.7-2.5× more `fdatasync` calls than JE under
+  concurrent commits as a result. The fix restructures the path to match JE
+  `flushAndSync` exactly: the leader/waiter decision
+  (`FsyncManager::flush_and_sync`, JE `mgrMutex`) is made FIRST, and ONLY the
+  leader (or a timed-out thread) performs the drain + `pwrite` (JE
+  `flushBeforeSync`) followed by the single `fdatasync` (JE `executeFSync`).
+  Waiters piggyback and do no I/O; on wake they return the leader's durable
+  result LSN so a subsequent `flush_sync_if_needed` still observes
+  `last_synced_lsn >= its lsn`. Durability is preserved exactly: a thread
+  arriving as a waiter after the leader started joins the FRESH next-waiters
+  group (never `wakeup_all`-ed by the current leader), so it becomes the next
+  leader and drains + fsyncs its own bytes — it can never piggyback on an fsync
+  that did not cover its writes. The "release LWL before I/O" invariant is kept
+  (the leader drains under the LWL briefly, then `pwrite` + `fdatasync` outside
+  it). An `fdatasync` failure still sets `io_invalid` and propagates the error
+  to every piggybacking committer. Measured fsyncs-per-commit on /scratch
+  (btrfs-on-dm-crypt, CommitSync): 8 threads × 500 commits 0.42 → 0.31
+  (~26% fewer fsyncs); 16 threads × 500 commits 0.26 → 0.18 (~31% fewer), with
+  lower wall-clock too. New coverage: `crash_worker` mode
+  `concurrent_commit_sync` + `crash_recovery_test::test_concurrent_commit_sync_survives_sigkill`
+  (N-concurrent CommitSync → SIGKILL → recover, all committed txns present),
+  `fsync_manager::test_leader_fsync_failure_fails_all_piggybacking_waiters`
+  (a failed leader fsync fails every coalesced waiter), and the
+  `group_commit_coalesce_bench` real-disk benchmark (fsyncs-per-commit gate).
+
 ### Added
 
 - **`EVICTOR_ALGORITHM` config parameter (`noxu.evictor.algorithm`).** The cache

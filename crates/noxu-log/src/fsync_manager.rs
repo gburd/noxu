@@ -5,16 +5,17 @@
 //! performance optimization.  The goal is to reduce the number of fsyncs
 //! issued by the system by having one fsync serve a batch of threads.
 //!
-//! # Algorithm (mirrors leader/waiter pattern)
+//! # Algorithm (mirrors JE FSyncManager.flushAndSync leader/waiter pattern)
 //!
-//! When a thread enters `fsync()` it finds one of two situations:
+//! When a thread enters `flush_and_sync()` it finds one of two situations:
 //!
 //! 1. **No work in progress** — the thread becomes the *leader*.  If group
 //!    commit is enabled (`grpc_threshold > 0` AND `grpc_interval_ms > 0`) the
-//!    leader may wait briefly for more waiters to accumulate.  Then it calls
-//!    the supplied fsync closure, wakes all current waiters (they piggyback on
-//!    its fsync), wakes one member of the *next* group to become the new
-//!    leader, and clears `work_in_progress`.
+//!    leader may wait briefly for more waiters to accumulate.  Then it runs the
+//!    supplied `do_work` closure (JE flushBeforeSync drain+pwrite, then
+//!    executeFSync), wakes all current waiters (they piggyback on its fsync),
+//!    wakes one member of the *next* group to become the new leader, and clears
+//!    `work_in_progress`.
 //!
 //! 2. **Work in progress** — the thread joins `next_fsync_waiters` and waits
 //!    on a `Condvar`.  When woken it checks whether its fsync was already
@@ -28,6 +29,8 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
+
+use noxu_util::{Lsn, NULL_LSN};
 
 // ── FSyncGroup ────────────────────────────────────────────────────────────────
 
@@ -54,6 +57,13 @@ struct FsyncGroupInner {
     leader_exists: bool,
     /// Recorded error message from the fsync, propagated to all waiters.
     error: Option<String>,
+    /// Result LSN (as u64) the leader durably synced on this group's behalf.
+    /// Read by piggybacking waiters so they can return the same watermark the
+    /// leader advanced.  JE has no analogue (Java waiters just return void and
+    /// re-derive durability from the shared LogManager state); Noxu carries the
+    /// post-drain `eol` explicitly so a waiter's subsequent
+    /// `flush_sync_if_needed` observes `last_synced_lsn >= its lsn`.
+    result_lsn: u64,
 }
 
 /// Return value from `FSyncGroup::wait_for_event`.
@@ -77,6 +87,7 @@ impl FSyncGroup {
                 work_done: false,
                 leader_exists: false,
                 error: None,
+                result_lsn: 0,
             }),
             condvar: Condvar::new(),
         })
@@ -131,17 +142,18 @@ impl FSyncGroup {
         }
     }
 
-    /// Wake all waiters with success.
+    /// Wake all waiters with success, recording the durable result LSN.
     ///
     /// P-1: sets `work_done_atomic` with Release ordering BEFORE acquiring
     /// `inner`, so any waiter that checks the atomic after this point returns
     /// immediately without locking.
-    fn wakeup_all(&self) {
+    fn wakeup_all(&self, result_lsn: u64) {
         // P-1: set atomic first so late-arriving waiters skip the mutex.
         self.work_done_atomic.store(true, Ordering::Release);
         let mut inner = self.inner.lock().unwrap();
         inner.work_done = true;
         inner.error = None;
+        inner.result_lsn = result_lsn;
         drop(inner);
         self.condvar.notify_all();
     }
@@ -170,6 +182,11 @@ impl FSyncGroup {
     /// Return the recorded error (if any) for this group.
     fn take_error(&self) -> Option<String> {
         self.inner.lock().unwrap().error.clone()
+    }
+
+    /// Return the durable result LSN the leader recorded for this group.
+    fn result_lsn(&self) -> u64 {
+        self.inner.lock().unwrap().result_lsn
     }
 }
 
@@ -263,19 +280,32 @@ impl FsyncManager {
         }
     }
 
-    /// Request an fsync, coalescing with concurrent callers.
+    /// Drain the log buffer and fsync, coalescing with concurrent callers.
     ///
+    /// JE faithfulness: this matches `FSyncManager.flushAndSync` EXACTLY.
+    /// The leader/waiter decision is made FIRST under `state` (JE `mgrMutex`),
+    /// and ONLY the leader (or a timed-out thread) runs `do_work` — which
+    /// performs JE's `flushBeforeSync()` (drain + pwrite) followed by
+    /// `executeFSync()` (the single fdatasync).  Waiters piggyback: they do NO
+    /// drain, NO pwrite and NO fsync; on wake they return the leader's durable
+    /// result LSN.  This is the fix for the coalescing divergence — a committer
+    /// that didn't skip at the caller's fast path now serialises on `state`
+    /// BEFORE draining, so it cannot become its own redundant leader between
+    /// another leader's pwrite and that leader's fsync.
     ///
-    ///
-    /// The caller supplies `do_fsync`, a closure that performs the actual
-    /// fsync.  This method guarantees that when it returns `Ok(())`, at least
-    /// one fsync has completed that covers the caller's preceding write.
-    pub fn fsync<F>(&self, do_fsync: F) -> std::io::Result<()>
+    /// The `do_work` closure returns the post-drain `eol` (as u64). On success
+    /// the leader records that LSN on the in-progress group so waiters return
+    /// the same watermark; the caller advances `last_synced_lsn` from the
+    /// returned `Lsn`.  An error from `do_work` (a failed pwrite or fdatasync)
+    /// is propagated to the leader AND to every piggybacking waiter (each gets
+    /// its own `Err`), matching JE: a leader fsync failure means the waiters'
+    /// commits are NOT durable.
+    pub fn flush_and_sync<F>(&self, do_work: F) -> std::io::Result<Lsn>
     where
-        F: Fn() -> std::io::Result<()>,
+        F: Fn() -> std::io::Result<u64>,
     {
         self.n_fsync_requests.fetch_add(1, Ordering::Relaxed);
-        let mut do_work = false;
+        let mut do_my_work = false;
         let mut is_leader = false;
         let mut leader_batch_size: u64 = 0;
         // Group whose waiters this leader serves (set only when is_leader).
@@ -307,7 +337,7 @@ impl FsyncManager {
             } else {
                 // Become the leader.
                 is_leader = true;
-                do_work = true;
+                do_my_work = true;
                 state.work_in_progress = true;
 
                 if self.grp_wait_on {
@@ -334,19 +364,22 @@ impl FsyncManager {
                     if let Some(msg) = group.take_error() {
                         return Err(std::io::Error::other(msg));
                     }
-                    return Ok(());
+                    // Piggyback: return the leader's durable result LSN so the
+                    // caller's subsequent flush_sync_if_needed observes
+                    // last_synced_lsn >= its lsn.
+                    return Ok(Lsn::from_u64(group.result_lsn()));
                 }
                 WaitStatus::DoLeaderFsync => {
                     // Attempt to become the new leader for this cohort.
                     let mut state = self.state.lock().unwrap();
                     if state.work_in_progress {
-                        // Another thread started a new fsync while we were being
-                        // woken up — do our own fsync as a safety measure.
-                        // (comment: "Ensure that an fsync is done before returning")
-                        do_work = true;
+                        // Another thread started new work while we were being
+                        // woken up — do our own work as a safety measure.
+                        // (JE: "Ensure that an fsync is done before returning")
+                        do_my_work = true;
                     } else {
                         is_leader = true;
-                        do_work = true;
+                        do_my_work = true;
                         state.work_in_progress = true;
 
                         if self.grp_wait_on {
@@ -361,18 +394,20 @@ impl FsyncManager {
                     }
                 }
                 WaitStatus::DoTimeoutFsync => {
-                    // Timed out — do our own fsync regardless.
-                    do_work = true;
+                    // Timed out — do our own work regardless (JE DO_TIMEOUT_FSYNC).
+                    do_my_work = true;
                     self.n_fsync_timeouts.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
 
-        // ── Phase 3: perform the fsync ────────────────────────────────────
-        if do_work {
+        // ── Phase 3: perform the drain + fsync (JE doWork block) ──────────
+        if do_my_work {
             self.n_fsyncs.fetch_add(1, Ordering::Relaxed);
             let fsync_start = std::time::Instant::now();
-            let result = do_fsync();
+            // JE: flushBeforeSync() + executeFSync() — the drain + pwrite +
+            // fdatasync now live INSIDE this leader/timeout branch (the fix).
+            let result = do_work();
             let elapsed_ms = fsync_start.elapsed().as_millis() as u64;
             self.fsync_time_ms.fetch_add(elapsed_ms, Ordering::Relaxed);
             // Count as a group commit when leader has an in-progress group
@@ -387,19 +422,31 @@ impl FsyncManager {
                 let in_prog = in_progress_group.as_ref().unwrap();
                 // Wake all threads that piggybacked on this fsync.
                 match &result {
-                    Ok(()) => in_prog.wakeup_all(),
+                    Ok(eol) => in_prog.wakeup_all(*eol),
                     Err(e) => in_prog.wakeup_all_with_error(e.to_string()),
                 }
                 // Wake one member of the next cohort to become the new leader,
-                // then clear work_in_progress — matching ordering.
+                // then clear work_in_progress — matching JE ordering.
                 let mut state = self.state.lock().unwrap();
                 state.next_fsync_waiters.wakeup_one();
                 state.work_in_progress = false;
             }
 
-            result
+            result.map(Lsn::from_u64)
         } else {
-            Ok(())
+            // Unreachable in practice: a waiter that did not do its own work
+            // returned from Phase 2 already.  Kept for total-coverage safety:
+            // consult the waiter's group result.
+            match my_group {
+                Some(g) => {
+                    if let Some(msg) = g.take_error() {
+                        Err(std::io::Error::other(msg))
+                    } else {
+                        Ok(Lsn::from_u64(g.result_lsn()))
+                    }
+                }
+                None => Ok(NULL_LSN),
+            }
         }
     }
 
@@ -497,9 +544,9 @@ mod tests {
         let mgr = FsyncManager::new(0, 0);
         let count = Arc::new(AtomicUsize::new(0));
         let c = count.clone();
-        mgr.fsync(|| {
+        mgr.flush_and_sync(|| {
             c.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+            Ok(0)
         })
         .unwrap();
         assert_eq!(count.load(Ordering::SeqCst), 1);
@@ -519,11 +566,11 @@ mod tests {
             let b = Arc::clone(&barrier);
             handles.push(std::thread::spawn(move || {
                 b.wait();
-                mgr2.fsync(|| {
+                mgr2.flush_and_sync(|| {
                     // Slow fsync so concurrent threads queue up.
                     std::thread::sleep(Duration::from_millis(20));
                     fc.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
+                    Ok(0)
                 })
                 .unwrap();
             }));
@@ -546,8 +593,9 @@ mod tests {
     #[test]
     fn test_fsync_error_propagated_to_waiters() {
         let mgr = FsyncManager::new(0, 0);
-        let result =
-            mgr.fsync(|| Err(std::io::Error::other("simulated fsync failure")));
+        let result = mgr.flush_and_sync(|| {
+            Err::<u64, _>(std::io::Error::other("simulated fsync failure"))
+        });
         assert!(result.is_err());
         assert!(
             result.unwrap_err().to_string().contains("simulated fsync failure")
@@ -566,9 +614,9 @@ mod tests {
             let m = Arc::clone(&mgr);
             let fc = Arc::clone(&fsync_count);
             handles.push(std::thread::spawn(move || {
-                m.fsync(|| {
+                m.flush_and_sync(|| {
                     fc.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
+                    Ok(0)
                 })
                 .unwrap();
             }));
@@ -592,9 +640,9 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         for _ in 0..5 {
             let c = count.clone();
-            mgr.fsync(|| {
+            mgr.flush_and_sync(|| {
                 c.fetch_add(1, Ordering::SeqCst);
-                Ok(())
+                Ok(0)
             })
             .unwrap();
         }
@@ -611,10 +659,10 @@ mod tests {
 
         let leader = std::thread::spawn(move || {
             b2.wait();
-            mgr2.fsync(|| {
+            mgr2.flush_and_sync(|| {
                 // Slow so the second thread can queue up as a waiter.
                 std::thread::sleep(Duration::from_millis(30));
-                Err(std::io::Error::other("leader fail"))
+                Err::<u64, _>(std::io::Error::other("leader fail"))
             })
         });
 
@@ -622,10 +670,10 @@ mod tests {
         barrier.wait();
         std::thread::sleep(Duration::from_millis(2));
 
-        let waiter_result = mgr.fsync(|| {
+        let waiter_result = mgr.flush_and_sync(|| {
             // This should either piggyback (NoFsyncNeeded with error) or run its
             // own fsync if it becomes leader.
-            Ok(())
+            Ok(0)
         });
 
         let leader_result = leader.join().unwrap();
@@ -635,18 +683,83 @@ mod tests {
         let _ = waiter_result; // either outcome is valid
     }
 
+    /// HEADLINE fsync-error-propagation test: a leader fsync failure fails
+    /// EVERY piggybacking waiter.
+    ///
+    /// N committers race; their closures all model a failing fdatasync (EIO).
+    /// Whichever thread leads a cohort runs the failing fsync and propagates
+    /// the error to every waiter that piggybacked on it (JE `wakeupAll`, Noxu
+    /// `wakeup_all_with_error`).  The invariants under test:
+    ///   1. EVERY committer returns Err — none may return Ok on a failed fsync
+    ///      (a leader fsync failure means the commit is NOT durable).
+    ///   2. The number of actual fsync ATTEMPTS is < N (coalescing happened),
+    ///      proving at least one waiter piggybacked on a leader's failure
+    ///      rather than running its own.
+    #[test]
+    fn test_leader_fsync_failure_fails_all_piggybacking_waiters() {
+        const N: usize = 8;
+        let mgr = Arc::new(FsyncManager::new(0, 0));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(std::sync::Barrier::new(N));
+
+        let handles: Vec<_> = (0..N)
+            .map(|_| {
+                let m = Arc::clone(&mgr);
+                let at = Arc::clone(&attempts);
+                let b = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    b.wait();
+                    m.flush_and_sync(|| {
+                        // Each actual leader/timeout fsync attempt: count it,
+                        // sleep so siblings queue + piggyback, then fail.
+                        at.fetch_add(1, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(15));
+                        Err::<u64, _>(std::io::Error::other("fsync EIO"))
+                    })
+                })
+            })
+            .collect();
+
+        let mut errors = 0usize;
+        for h in handles {
+            match h.join().unwrap() {
+                Ok(_) => {
+                    panic!("a committer returned Ok despite a failed fsync")
+                }
+                Err(e) => {
+                    assert!(
+                        e.to_string().contains("fsync EIO"),
+                        "error must carry the leader's failure: {e}"
+                    );
+                    errors += 1;
+                }
+            }
+        }
+        // Invariant 1: every committer failed (no Ok on a failed fsync).
+        assert_eq!(errors, N, "every committer must observe the fsync failure");
+        // Invariant 2: coalescing happened — fewer fsync attempts than threads
+        // means at least one waiter piggybacked on a leader's failed fsync and
+        // still received the propagated error.
+        let attempts = attempts.load(Ordering::SeqCst);
+        assert!(
+            attempts < N,
+            "expected coalescing under failure (attempts {attempts} < N {N}); \
+             at least one waiter must piggyback on a failed leader fsync"
+        );
+    }
+
     /// `FsyncManager::new(0, 0)` returns Ok immediately on success.
     #[test]
     fn test_returns_ok_on_success() {
         let mgr = FsyncManager::new(0, 0);
-        assert!(mgr.fsync(|| Ok(())).is_ok());
+        assert!(mgr.flush_and_sync(|| Ok(0)).is_ok());
     }
 
     /// FSyncGroup: `wakeup_all` sets `work_done` and records no error.
     #[test]
     fn test_fsync_group_wakeup_all() {
         let g = FSyncGroup::new();
-        g.wakeup_all();
+        g.wakeup_all(0);
         assert!(g.inner.lock().unwrap().work_done);
         assert!(g.take_error().is_none());
     }
@@ -665,7 +778,7 @@ mod tests {
     #[test]
     fn test_fsync_group_already_done() {
         let g = FSyncGroup::new();
-        g.wakeup_all();
+        g.wakeup_all(0);
         let status = g.wait_for_event(Duration::from_secs(5));
         assert_eq!(status, WaitStatus::NoFsyncNeeded);
     }
@@ -781,31 +894,45 @@ mod tests {
                     }
 
                     // Request fsync.  The closure "syncs" by advancing
-                    // flushed_lsn to the current snap_lsn.
+                    // flushed_lsn to the current snap_lsn and RETURNS that
+                    // covered LSN as the durable watermark (eol).  Under the
+                    // new contract a piggybacking waiter returns the leader's
+                    // covered LSN, so we assert on the value flush_and_sync
+                    // returns — the durable watermark this committer observes.
                     let fl2 = Arc::clone(&fl);
                     let sl2 = Arc::clone(&sl);
-                    mgr2.fsync(move || {
-                        let covered =
-                            sl2.load(std::sync::atomic::Ordering::SeqCst);
-                        let mut f =
-                            fl2.load(std::sync::atomic::Ordering::Relaxed);
-                        while f < covered {
-                            match fl2.compare_exchange(
-                                f,
-                                covered,
-                                std::sync::atomic::Ordering::SeqCst,
-                                std::sync::atomic::Ordering::Relaxed,
-                            ) {
-                                Ok(_) => break,
-                                Err(a) => f = a,
+                    let durable = mgr2
+                        .flush_and_sync(move || {
+                            let covered =
+                                sl2.load(std::sync::atomic::Ordering::SeqCst);
+                            let mut f =
+                                fl2.load(std::sync::atomic::Ordering::Relaxed);
+                            while f < covered {
+                                match fl2.compare_exchange(
+                                    f,
+                                    covered,
+                                    std::sync::atomic::Ordering::SeqCst,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                ) {
+                                    Ok(_) => break,
+                                    Err(a) => f = a,
+                                }
                             }
-                        }
-                        Ok(())
-                    })
-                    .unwrap();
+                            Ok(covered)
+                        })
+                        .unwrap();
 
-                    // Post-condition: flushed_lsn must be ≥ my_lsn.
+                    // Post-condition: the durable watermark returned to this
+                    // committer (leader's own eol, or the leader's recorded
+                    // result for a piggybacking waiter) must cover my_lsn, and
+                    // the global flushed_lsn must be ≥ my_lsn.
                     let fl_now = fl.load(std::sync::atomic::Ordering::SeqCst);
+                    assert!(
+                        durable.as_u64() >= my_lsn,
+                        "fsync-before-commit violated (returned watermark): \
+                         durable={} < commit_lsn={my_lsn}",
+                        durable.as_u64()
+                    );
                     assert!(
                         fl_now >= my_lsn,
                         "fsync-before-commit violated: \

@@ -944,3 +944,82 @@ fn test_file_flip_fsync_ordering_crash_recovery() {
         &missing[..missing.len().min(10)]
     );
 }
+
+// ---------------------------------------------------------------------------
+// Test: N-concurrent CommitSync, then SIGKILL — every committed txn survives
+// ---------------------------------------------------------------------------
+
+/// HEADLINE crash-durability test for the group-commit coalescing fix.
+///
+/// 8 worker threads each CommitSync-commit 50 disjoint keys (400 committed
+/// transactions total), barrier-synchronised so their fdatasync requests race
+/// and exercise the leader/waiter coalescing path restructured to match JE
+/// `FSyncManager.flushAndSync`.  Once every `txn.commit()` (CommitSync =>
+/// durable fsync) has returned, the worker raises `concurrent_committed` and
+/// the parent SIGKILLs it.
+///
+/// Recovery must find ALL 400 committed keys.  This is the non-negotiable
+/// durability invariant: the coalescing optimisation must never let a
+/// committed-and-returned transaction be lost on crash.  A single missing key
+/// here means a committer piggybacked on an fsync that did not cover its bytes
+/// — exactly the hazard the JE-faithful ordering is designed to prevent.
+#[test]
+fn test_concurrent_commit_sync_survives_sigkill() {
+    const THREADS: u32 = 8;
+    const KEYS_PER_THREAD: u32 = 50;
+
+    let dir = TempDir::new().unwrap();
+    let dir_path = dir.path().to_path_buf();
+
+    let mut child = std::process::Command::new(crash_worker_exe())
+        .env("NOXU_CRASH_DIR", &dir_path)
+        .env("NOXU_CRASH_MODE", "concurrent_commit_sync")
+        .spawn()
+        .expect("spawn crash_worker");
+
+    // Wait for ALL concurrent CommitSync transactions to return durably.
+    assert!(
+        wait_for_flag(
+            &dir_path,
+            "concurrent_committed",
+            Duration::from_secs(120)
+        ),
+        "worker did not finish concurrent CommitSync within timeout"
+    );
+
+    // SIGKILL — abrupt termination, no graceful shutdown.
+    child.kill().expect("SIGKILL worker");
+    child.wait().expect("wait for killed worker");
+
+    // Reopen — triggers crash recovery + structural verification.
+    let (_env, db) = reopen_db(&dir_path);
+
+    // Every committed key (tid * 1000 + k) must be present and correct.
+    let mut missing: Vec<u32> = Vec::new();
+    for tid in 0..THREADS {
+        for k in 0..KEYS_PER_THREAD {
+            let id = tid * 1000 + k;
+            let key = DatabaseEntry::from_bytes(&id.to_be_bytes());
+            let mut val = DatabaseEntry::new();
+            match db.get(None, &key, &mut val).unwrap() {
+                OperationStatus::Success => {
+                    assert_eq!(
+                        val.data(),
+                        b"committed",
+                        "key {id} has wrong value after recovery"
+                    );
+                }
+                OperationStatus::NotFound => missing.push(id),
+                other => panic!("unexpected status {other:?} for key {id}"),
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "{} of {} concurrently-committed (CommitSync) txns LOST after crash \
+         recovery — first 10: {:?}",
+        missing.len(),
+        THREADS * KEYS_PER_THREAD,
+        &missing[..missing.len().min(10)]
+    );
+}

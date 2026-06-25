@@ -26,11 +26,18 @@
 //!
 //! LWL discipline (JE LogManager.serialLogWork, DRIFT-1 fixed): the log-write
 //! latch covers ONLY LSN assignment, buffer-slot allocation, and the in-memory
-//! copy of the entry bytes. flush_sync RELEASES the LWL before pwrite64, and
-//! the fdatasync runs outside the LWL via FsyncManager leader/waiter
-//! (group-commit). Concurrent committers serialise only on the in-memory
-//! bookkeeping, not on the syscall — matching JE and closing the prior
-//! concurrency gap.
+//! copy of the entry bytes.
+//!
+//! Group-commit ordering (JE FSyncManager.flushAndSync): the leader/waiter
+//! decision happens FIRST (FsyncManager::flush_and_sync, JE mgrMutex). ONLY the
+//! elected leader (or a timed-out thread) then drains the shared buffer under
+//! the LWL (briefly), RELEASES the LWL, pwrite64s the captured ranges (JE
+//! flushBeforeSync), and issues the single fdatasync (JE executeFSync). Waiters
+//! piggyback on the leader's fsync and perform no I/O. This keeps the syscall
+//! off the LWL while ensuring one fdatasync serves a burst of concurrent
+//! committers — matching JE and closing the prior coalescing gap (a committer
+//! that did not skip at the fast path used to drain+pwrite BEFORE the manager
+//! decision and become its own redundant leader).
 //!
 //! # Read path (getLogEntryFromLogSource -> Rust LogManager::read_entry)
 //!
@@ -672,92 +679,114 @@ impl LogManager {
         Ok(lsn)
     }
 
-    /// Flushes all dirty write buffers to disk and performs an fdatasync.
+    /// Returns the total number of fdatasync calls performed by this log
+    /// manager (the `FsyncManager` leader/timeout count).
     ///
-    /// This is the durable commit path.  The implementation mirrors the
-    /// group-commit pattern (`FSyncManager`):
-    ///
-    /// 1. Acquire the LWL, drain all dirty write buffers to disk, then
-    ///    **release the LWL**.  Releasing before the fsync is the key to
-    ///    group commit: other threads can now enter `flush_sync()` and add
-    ///    their writes to the same batch.
-    /// 2. Call `fsync_manager.fsync()` **outside** the LWL.  Concurrent
-    ///    callers elect one leader; the leader does a single fdatasync and
-    ///    all waiters return together.  This turns N per-commit fsyncs into
-    ///    ≈1 fsync for a burst of N concurrent commits (identical to the
-    ///    `FSyncManager.fsync()` flow).
-    ///
-    /// Returns the total number of fdatasync calls performed by this log manager.
-    ///
-    /// Stat in `EnvironmentStats`.
+    /// Under the JE-faithful group-commit ordering one fdatasync serves a
+    /// burst of concurrent committers, so this count is well below the number
+    /// of CommitSync transactions under concurrency. Surfaced as
+    /// `EnvironmentStats.n_log_fsyncs`.
     pub fn fsync_count(&self) -> u64 {
         self.fsync_manager.fsync_count()
     }
 
     /// Flushes all dirty write buffers to disk and performs an fdatasync.
     ///
-    /// JE faithfulness (Part-2, DRIFT-1): the LWL is now held ONLY for the
-    /// `fill_flush_pending` snapshot (collect unflushed data + advance
-    /// watermarks).  The actual `pwrite` calls and the `fdatasync` both happen
-    /// OUTSIDE the LWL, matching JE `LogManager.flushAndSync`:
+    /// JE faithfulness — this method now matches the structure of JE
+    /// `FSyncManager.flushAndSync` EXACTLY: the leader/waiter decision is made
+    /// FIRST (inside `fsync_manager.flush_and_sync`, under its manager mutex),
+    /// and ONLY the leader (or a timed-out thread) performs the buffer drain,
+    /// the `pwrite`s, and the `fdatasync`.  Waiters piggyback on the leader's
+    /// fsync and do NO drain, NO pwrite and NO fsync.
     ///
-    ///   1. Under LWL: collect dirty buffer ranges via `fill_flush_pending`.
-    ///   2. Release LWL.
-    ///   3. Outside LWL: pwrite64 for each dirty range.
-    ///   4. Outside LWL: fdatasync via FsyncManager (group-commit).
+    /// This fixes the coalescing divergence (Noxu was issuing ~1.7-2.5x more
+    /// fdatasync calls than JE under concurrent commits): the old code drained
+    /// the shared buffer + pwrote BEFORE entering the fsync manager, so a
+    /// concurrent committer that didn't skip at `flush_sync_if_needed`'s fast
+    /// path would slip in between the leader's pwrite and the leader's fsync
+    /// window and become its own leader for a redundant fsync.
     ///
-    /// JE references:
-    /// - `LogManager.flushAndSync` (holds logWriteMutex only for the snapshot)
-    /// - `LogBufferPool.writeDirty` → `writeBufferToFile` → pwrite (no LWL)
-    /// - `FSyncManager.fsync` (outside LWL, group-commit coalescing)
+    /// JE mapping (`FSyncManager.flushAndSync`):
+    ///   - leader/waiter decision under `mgrMutex`  → `flush_and_sync` Phase 1
+    ///   - leader: `flushBeforeSync()` (drain + write) → `leader_work` Phase A
+    ///     (`fill_flush_pending` under LWL + `write_buffer_to_file` pwrites)
+    ///   - leader: `executeFSync()` (`syncLogEnd`)     → `leader_work` Phase B
+    ///   - waiters: `wakeupAll()` piggyback, no I/O     → return `Ok`
+    ///
+    /// Preserves Noxu's "release LWL before I/O" property: the leader drains
+    /// under the LWL (brief: snapshot + watermark advance) then releases the
+    /// LWL before the pwrite + fdatasync (matching JE, which flushes the
+    /// buffer then fsyncs outside the held region of `mgrMutex`).
     pub fn flush_sync(&self) -> Result<Lsn> {
-        // Phase 1: under LWL — snapshot dirty buffer ranges and advance
-        // flushed_len watermarks.  The watermark advance is the only
-        // operation that MUST be serialised: it prevents two concurrent
-        // flush_sync calls from writing the same bytes twice.
-        // R-1: flush_pending Vec reused across calls (clear() keeps capacity).
-        let (pending_snapshot, eol) = {
-            let mut guard = self.log_write_latch.lock();
-            guard.flush_pending.clear();
-            Self::fill_flush_pending(
-                &self.buffer_pool,
-                &mut guard.flush_pending,
-            );
-            let eol = self.file_manager.get_next_available_lsn();
-            // Take the snapshot out of the guard so we can release the LWL
-            // before doing I/O (matching JE's protocol).
-            (std::mem::take(&mut guard.flush_pending), eol)
+        // The leader closure embodies JE `flushBeforeSync()` + `executeFSync()`,
+        // run ONLY by the thread that wins the leader/waiter decision inside
+        // `fsync_manager.flush_and_sync` (or by a timed-out thread).  Returns
+        // the post-drain `eol` so the caller can advance the watermarks.
+        let leader_work = || -> std::io::Result<u64> {
+            // Phase A (JE flushBeforeSync): under LWL — snapshot dirty buffer
+            // ranges and advance flushed_len watermarks.  The watermark advance
+            // is the only operation that MUST be serialised; it prevents two
+            // drains from writing the same bytes twice.  Because the
+            // leader/waiter decision already serialised us, at most one drain
+            // runs at a time here (matching JE: flushBeforeSync runs inside
+            // doWork, after the mgrMutex decision).
+            // R-1: flush_pending Vec reused across calls (clear keeps capacity).
+            let (pending_snapshot, eol) = {
+                let mut guard = self.log_write_latch.lock();
+                guard.flush_pending.clear();
+                Self::fill_flush_pending(
+                    &self.buffer_pool,
+                    &mut guard.flush_pending,
+                );
+                let eol = self.file_manager.get_next_available_lsn();
+                (std::mem::take(&mut guard.flush_pending), eol)
+            };
+            // LWL released before I/O (Noxu invariant preserved).
+
+            // Phase A (cont.): outside LWL — pwrite64 for each dirty range.
+            for (data, file_num, offset) in &pending_snapshot {
+                self.file_manager
+                    .write_buffer_to_file(*file_num, data, *offset)
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+            }
+            // last_flush_lsn is the page-cache watermark; advancing it here (in
+            // the leader, after the pwrites land in the page cache) is correct.
+            self.last_flush_lsn.store(eol.as_u64(), Ordering::Release);
+
+            // Phase B (JE executeFSync → syncLogEnd): the single fdatasync that
+            // covers every committer whose bytes were in the drained buffer.
+            self.file_manager
+                .sync_log_end()
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            Ok(eol.as_u64())
         };
-        // LWL released — all concurrent committers (whose bytes were captured
-        // in the snapshot) are now unblocked.  They will call
-        // flush_sync_if_needed and either find last_synced_lsn already covers
-        // their LSN (coalesced) or enter fsync_manager as waiters.
 
-        // Phase 2: outside LWL — pwrite64 for each dirty range.
-        // Phase 3: outside LWL — fdatasync via FsyncManager (group-commit).
-        for (data, file_num, offset) in &pending_snapshot {
-            self.file_manager.write_buffer_to_file(*file_num, data, *offset)?;
+        // Phase 1 (JE: synchronized(mgrMutex) leader/waiter decision) +
+        // leader work + waiter piggyback, all inside flush_and_sync.
+        match self.fsync_manager.flush_and_sync(leader_work) {
+            Ok(eol) => {
+                // Durability watermark: advanced ONLY after a successful
+                // fdatasync, ONLY by the leader (inside flush_and_sync).
+                // `flush_sync_if_needed` keys its skip decision off this.  A
+                // waiter sees the leader's stored value (Release/Acquire) and
+                // returns it (see flush_and_sync), so the waiter's subsequent
+                // flush_sync_if_needed observes last_synced_lsn >= its lsn.
+                self.last_synced_lsn.store(eol.as_u64(), Ordering::Release);
+                Ok(eol)
+            }
+            Err(e) => {
+                // C-2 (the 2026 review F-3.2 / F-8.4 / F-9.4): any I/O error
+                // from fdatasync permanently invalidates the log; refuse all
+                // further writes (fsyncgate class).  The error is propagated to
+                // ALL piggybacking waiters by flush_and_sync (each waiter gets
+                // its own Err here), so every committer in the failed batch
+                // sees the failure — their commits are NOT durable.
+                self.io_invalid.store(true, Ordering::Release);
+                Err(NoxuLogError::WriteFailed(format!(
+                    "fdatasync failed, environment permanently invalidated: {e}"
+                )))
+            }
         }
-
-        let fm = &self.file_manager;
-        let fsync_result = self.fsync_manager.fsync(|| {
-            fm.sync_log_end().map_err(|e| std::io::Error::other(e.to_string()))
-        });
-        if let Err(ref e) = fsync_result {
-            // C-2 (the 2026 review F-3.2 / F-8.4 / F-9.4): any I/O
-            // error from fdatasync permanently invalidates the log; refuse
-            // all further writes (fsyncgate class).
-            self.io_invalid.store(true, Ordering::Release);
-            return Err(NoxuLogError::WriteFailed(format!(
-                "fdatasync failed, environment permanently invalidated: {e}"
-            )));
-        }
-
-        self.last_flush_lsn.store(eol.as_u64(), Ordering::Release);
-        // Durability watermark: only advanced here, after a successful
-        // fdatasync. `flush_sync_if_needed` keys its skip decision off this.
-        self.last_synced_lsn.store(eol.as_u64(), Ordering::Release);
-        Ok(eol)
     }
 
     /// Port of`LogManager.flushTo(lsn)`:
