@@ -26,11 +26,18 @@
 //!
 //! LWL discipline (JE LogManager.serialLogWork, DRIFT-1 fixed): the log-write
 //! latch covers ONLY LSN assignment, buffer-slot allocation, and the in-memory
-//! copy of the entry bytes. flush_sync RELEASES the LWL before pwrite64, and
-//! the fdatasync runs outside the LWL via FsyncManager leader/waiter
-//! (group-commit). Concurrent committers serialise only on the in-memory
-//! bookkeeping, not on the syscall — matching JE and closing the prior
-//! concurrency gap.
+//! copy of the entry bytes.
+//!
+//! Group-commit ordering (JE FSyncManager.flushAndSync): the leader/waiter
+//! decision happens FIRST (FsyncManager::flush_and_sync, JE mgrMutex). ONLY the
+//! elected leader (or a timed-out thread) then drains the shared buffer under
+//! the LWL (briefly), RELEASES the LWL, pwrite64s the captured ranges (JE
+//! flushBeforeSync), and issues the single fdatasync (JE executeFSync). Waiters
+//! piggyback on the leader's fsync and perform no I/O. This keeps the syscall
+//! off the LWL while ensuring one fdatasync serves a burst of concurrent
+//! committers — matching JE and closing the prior coalescing gap (a committer
+//! that did not skip at the fast path used to drain+pwrite BEFORE the manager
+//! decision and become its own redundant leader).
 //!
 //! # Read path (getLogEntryFromLogSource -> Rust LogManager::read_entry)
 //!
@@ -672,24 +679,13 @@ impl LogManager {
         Ok(lsn)
     }
 
-    /// Flushes all dirty write buffers to disk and performs an fdatasync.
+    /// Returns the total number of fdatasync calls performed by this log
+    /// manager (the `FsyncManager` leader/timeout count).
     ///
-    /// This is the durable commit path.  The implementation mirrors the
-    /// group-commit pattern (`FSyncManager`):
-    ///
-    /// 1. Acquire the LWL, drain all dirty write buffers to disk, then
-    ///    **release the LWL**.  Releasing before the fsync is the key to
-    ///    group commit: other threads can now enter `flush_sync()` and add
-    ///    their writes to the same batch.
-    /// 2. Call `fsync_manager.fsync()` **outside** the LWL.  Concurrent
-    ///    callers elect one leader; the leader does a single fdatasync and
-    ///    all waiters return together.  This turns N per-commit fsyncs into
-    ///    ≈1 fsync for a burst of N concurrent commits (identical to the
-    ///    `FSyncManager.fsync()` flow).
-    ///
-    /// Returns the total number of fdatasync calls performed by this log manager.
-    ///
-    /// Stat in `EnvironmentStats`.
+    /// Under the JE-faithful group-commit ordering one fdatasync serves a
+    /// burst of concurrent committers, so this count is well below the number
+    /// of CommitSync transactions under concurrency. Surfaced as
+    /// `EnvironmentStats.n_log_fsyncs`.
     pub fn fsync_count(&self) -> u64 {
         self.fsync_manager.fsync_count()
     }

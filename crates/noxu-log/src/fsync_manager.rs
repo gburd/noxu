@@ -5,16 +5,17 @@
 //! performance optimization.  The goal is to reduce the number of fsyncs
 //! issued by the system by having one fsync serve a batch of threads.
 //!
-//! # Algorithm (mirrors leader/waiter pattern)
+//! # Algorithm (mirrors JE FSyncManager.flushAndSync leader/waiter pattern)
 //!
-//! When a thread enters `fsync()` it finds one of two situations:
+//! When a thread enters `flush_and_sync()` it finds one of two situations:
 //!
 //! 1. **No work in progress** — the thread becomes the *leader*.  If group
 //!    commit is enabled (`grpc_threshold > 0` AND `grpc_interval_ms > 0`) the
-//!    leader may wait briefly for more waiters to accumulate.  Then it calls
-//!    the supplied fsync closure, wakes all current waiters (they piggyback on
-//!    its fsync), wakes one member of the *next* group to become the new
-//!    leader, and clears `work_in_progress`.
+//!    leader may wait briefly for more waiters to accumulate.  Then it runs the
+//!    supplied `do_work` closure (JE flushBeforeSync drain+pwrite, then
+//!    executeFSync), wakes all current waiters (they piggyback on its fsync),
+//!    wakes one member of the *next* group to become the new leader, and clears
+//!    `work_in_progress`.
 //!
 //! 2. **Work in progress** — the thread joins `next_fsync_waiters` and waits
 //!    on a `Condvar`.  When woken it checks whether its fsync was already
