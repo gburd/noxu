@@ -1338,11 +1338,25 @@ impl BinStub {
             return 0;
         }
         let mut freed = 0usize;
-        for entry in &mut self.entries {
-            if entry.dirty {
+        for idx in 0..self.entries.len() {
+            // JE BIN.evictLNs / LN.isEvictable (LN.java:263 returns true): an
+            // LN's in-memory value can be stripped whenever it is recoverable
+            // from the log — i.e. the slot has a valid (logged) LSN — REGARDLESS
+            // of the dirty bit.  The dirty bit governs whether the BIN's
+            // *structure* needs re-logging at the next checkpoint (BIN-delta vs
+            // full BIN), NOT whether the LN *value* is durable: a transactional
+            // commit logs the LN, so the slot's LSN points at the durable copy
+            // even while the slot is still dirty.  Gating the strip on `!dirty`
+            // (the previous behaviour) meant a freshly-written, not-yet-
+            // checkpointed record — the common case under a write/recently-read
+            // workload — could never be stripped, so eviction reclaimed almost
+            // nothing under pressure (EVICTOR-RECLAIM-1).  A slot with a NULL/
+            // transient LSN (a deferred-write LN never logged) is NOT
+            // strippable — its only copy is the in-memory value.
+            if self.get_lsn(idx) == NULL_LSN {
                 continue;
             }
-            if let Some(data) = entry.data.take() {
+            if let Some(data) = self.entries[idx].data.take() {
                 freed = freed.saturating_add(data.len());
             }
         }
@@ -12656,7 +12670,10 @@ mod tests {
             keys: KeyRep::new(),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         };
-        // Two non-dirty slots with embedded data, one dirty slot.
+        // Three slots with embedded data + VALID logged LSNs (one dirty).
+        // JE-faithful: a slot with a valid LSN is strippable regardless of the
+        // dirty bit (its value is recoverable from the log); only a NULL-LSN
+        // (never-logged / deferred-write) slot is preserved.
         bin.entries.push(BinEntry {
             data: Some(vec![0u8; 64]),
             known_deleted: false,
@@ -12672,7 +12689,7 @@ mod tests {
         bin.entries.push(BinEntry {
             data: Some(vec![0u8; 16]),
             known_deleted: false,
-            dirty: true, // dirty slot must be skipped
+            dirty: true, // dirty BUT logged -> still strippable (EVICTOR-RECLAIM-1)
             expiration_time: 0,
         });
         // T-2: keep the key rep aligned with the pushed slots.
@@ -12681,16 +12698,38 @@ mod tests {
             b"b".to_vec(),
             b"c".to_vec(),
         ]);
+        // Give all three slots VALID (non-NULL) LSNs so they are recoverable
+        // from the log and therefore strippable.
+        bin.set_lsn(0, Lsn::new(1, 100));
+        bin.set_lsn(1, Lsn::new(1, 200));
+        bin.set_lsn(2, Lsn::new(1, 300));
 
         let freed = bin.strip_lns();
-        assert_eq!(freed, 64 + 32, "freed bytes must sum non-dirty slot data");
-        assert!(bin.entries[0].data.is_none(), "non-dirty slot data dropped");
-        assert!(bin.entries[1].data.is_none(), "non-dirty slot data dropped");
-        assert!(bin.entries[2].data.is_some(), "dirty slot data preserved");
+        assert_eq!(
+            freed,
+            64 + 32 + 16,
+            "all logged slots stripped regardless of dirty (JE evictLNs)"
+        );
+        assert!(bin.entries[0].data.is_none(), "logged slot data dropped");
+        assert!(bin.entries[1].data.is_none(), "logged slot data dropped");
+        assert!(
+            bin.entries[2].data.is_none(),
+            "dirty-but-logged slot data dropped (recoverable from log)"
+        );
+
+        // A NULL-LSN slot (never logged) must be preserved — its only copy is
+        // the in-memory value.
+        bin.entries[0].data = Some(vec![0u8; 64]);
+        bin.set_lsn(0, noxu_util::NULL_LSN);
+        let freed_null = bin.strip_lns();
+        assert_eq!(freed_null, 0, "NULL-LSN (unlogged) slot must NOT be stripped");
+        assert!(
+            bin.entries[0].data.is_some(),
+            "unlogged slot data preserved"
+        );
 
         // Cursor pin prevents stripping.
-        bin.entries[0].data = Some(vec![0u8; 64]);
-        bin.entries[0].dirty = false;
+        bin.set_lsn(0, Lsn::new(1, 100));
         bin.cursor_count = 1;
         let freed_with_cursor = bin.strip_lns();
         assert_eq!(
