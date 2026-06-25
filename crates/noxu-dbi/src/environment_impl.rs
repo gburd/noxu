@@ -926,6 +926,15 @@ impl EnvironmentImpl {
             >,
         > = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
+        // EVICTOR-RECLAIM-1: wire the SAME registry into the evictor so its
+        // node lookups (strip/flush/detach/evict_root) search every database
+        // tree, not just the primary slot.  JE's evictor walks one env-wide
+        // INList covering all DBs and resolves each target's owning DB via
+        // `target.getDatabase()` (Evictor.processTarget, Evictor.java:2374).
+        // Set after construction because the registry is built here, after
+        // the evictor builder above.
+        evictor.set_db_trees_registry(Arc::clone(&db_trees_registry));
+
         // Cleaner initialization.
         // constructor (called after RecoveryManager.recover()).
         let cleaner = log_manager.as_ref().map(|lm| {
@@ -1591,14 +1600,16 @@ impl EnvironmentImpl {
             // drains.  Without this the policy lists stay empty, every
             // evict_batch phase quota is 0, and the evictor selects nothing.
             //
+            // EVICTOR-RECLAIM-1: the evictor now resolves a targeted node to
+            // its owning tree via the shared `db_trees_registry` (wired in
+            // `EnvironmentImpl::new`), so eviction reclaims memory across ALL
+            // database trees — not just the one in the primary slot.  We still
+            // set the primary slot to this tree as the first lookup target,
+            // and the registry insert above makes every other DB reachable.
+            //
             // JE: the database's INs are registered in the environment-wide
             // INList, which feeds Evictor.addBack/moveBack/remove and which
-            // evictBatch drains.
-            //
-            // ponytail: single-tree wiring — the evictor walks the last tree
-            // installed here.  The single-database case (the common one, and
-            // the F1/F2 test) is fully covered; per-database round-robin
-            // eviction across all registry trees is follow-on wave F4.
+            // evictBatch drains; processTarget resolves each IN's owning DB.
             if let Ok(mut tree_guard) = tree_arc.write() {
                 tree_guard.set_in_list_listener(Arc::clone(&self.evictor)
                     as Arc<dyn noxu_tree::InListListener>);

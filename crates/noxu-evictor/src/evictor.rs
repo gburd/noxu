@@ -233,11 +233,26 @@ pub struct Evictor {
     /// later).  JE: the global `INList` is registered with the environment at
     /// startup; here a single tree is wired for the single-database case.
     ///
-    /// ponytail: single tree slot, not the full multi-database INList. The
-    /// daemon evicts from whichever tree was installed last. Multi-database
-    /// eviction (iterate `db_trees_registry`) is follow-on wave F4.
+    /// The primary tree slot, installed via `with_tree`/`set_tree`.  Used as
+    /// the first lookup target; the full set of databases is reached via
+    /// `db_trees_registry` (see EVICTOR-RECLAIM-1).
     tree: RwLock<Option<Arc<RwLock<Tree>>>>,
     db_id: AtomicU64,
+
+    /// All database trees, keyed by db_id — the SAME registry the
+    /// checkpointer (`with_db_trees_registry`) and cleaner (`with_tree_registry`)
+    /// use.  EVICTOR-RECLAIM-1: JE walks ONE env-wide `INList` that covers
+    /// every database; `Evictor.processTarget` resolves each target IN's
+    /// owning DB via `target.getDatabase()` (Evictor.java:2374).  Noxu split
+    /// the tree per-DB, so the evictor must consult this registry to find a
+    /// targeted node in the CORRECT tree — otherwise user-DB BINs get TARGETED
+    /// (the InList listener feeds the policy from every tree) but can never be
+    /// stripped/evicted because they are absent from the single primary tree.
+    ///
+    /// `None` until `set_db_trees_registry` is called (unit tests without a
+    /// full environment fall back to the single `tree` slot).
+    db_trees_registry:
+        RwLock<Option<Arc<std::sync::Mutex<HashMap<i64, Arc<RwLock<Tree>>>>>>>,
     off_heap: Option<Arc<OffHeapCache>>,
     /// Optional checkpointer reference for CC-4: provisional-flag coordination.
     ///
@@ -288,6 +303,7 @@ impl Evictor {
             log_manager: None,
             tree: RwLock::new(None),
             db_id: AtomicU64::new(0),
+            db_trees_registry: RwLock::new(None),
             off_heap: None,
             checkpointer: None,
         }
@@ -354,6 +370,56 @@ impl Evictor {
     /// Clone the currently installed eviction tree, if any.
     fn current_tree(&self) -> Option<Arc<RwLock<Tree>>> {
         self.tree.read().expect("evictor tree lock poisoned").clone()
+    }
+
+    /// Wire the env-wide `db_trees_registry` (the SAME `Arc` the checkpointer
+    /// and cleaner hold) so the evictor can resolve a targeted node to its
+    /// owning database tree.  EVICTOR-RECLAIM-1: JE `Evictor.processTarget`
+    /// resolves `target.getDatabase()` from the single env-wide `INList`
+    /// (Evictor.java:2374); Noxu's per-DB trees require this registry to find
+    /// the owning tree.  Installed after construction because the registry is
+    /// built later in `EnvironmentImpl::new` than the evictor.
+    pub fn set_db_trees_registry(
+        &self,
+        registry: Arc<std::sync::Mutex<HashMap<i64, Arc<RwLock<Tree>>>>>,
+    ) {
+        *self
+            .db_trees_registry
+            .write()
+            .expect("evictor registry lock poisoned") = Some(registry);
+    }
+
+    /// Collect every candidate tree to search, in priority order: the primary
+    /// `tree` slot first (so single-database envs and unit tests keep their
+    /// existing fast path), then every distinct tree in `db_trees_registry`.
+    ///
+    /// Each entry is `(db_id, tree_arc)`.  The primary slot's db_id comes from
+    /// `self.db_id`; registry entries carry their own db_id key (so the
+    /// flush/root-evict paths log under the CORRECT database).  De-duplicated
+    /// by `Arc::ptr_eq` so a tree present in both the slot and the registry
+    /// is searched once.
+    ///
+    /// JE: the single env-wide `INList` is the union of all databases'
+    /// resident INs (Evictor.java:2374, `target.getDatabase()`).
+    fn candidate_trees(&self) -> Vec<(u64, Arc<RwLock<Tree>>)> {
+        let mut out: Vec<(u64, Arc<RwLock<Tree>>)> = Vec::new();
+        if let Some(t) = self.current_tree() {
+            out.push((self.db_id.load(Ordering::Relaxed), t));
+        }
+        if let Some(reg) = self
+            .db_trees_registry
+            .read()
+            .expect("evictor registry lock poisoned")
+            .as_ref()
+            && let Ok(map) = reg.lock()
+        {
+            for (db_id, tree) in map.iter() {
+                if !out.iter().any(|(_, t)| Arc::ptr_eq(t, tree)) {
+                    out.push((*db_id as u64, Arc::clone(tree)));
+                }
+            }
+        }
+        out
     }
 
     /// Wire an off-heap cache.
@@ -762,15 +828,22 @@ impl Evictor {
 
                 EvictionDecision::Evict => {
                     let mut stored_off_heap = false;
-                    let cur_tree = self.current_tree();
-                    if let (Some(oh), Some(tree_arc)) =
-                        (&self.off_heap, &cur_tree)
+                    // EVICTOR-RECLAIM-1: serialize the upper IN from whichever
+                    // tree owns it (serialize_upper_in returns None for a node
+                    // it does not contain), not only the primary slot.
+                    if let Some(oh) = &self.off_heap
                         && oh.is_enabled()
-                        && let Ok(tree_guard) = tree_arc.read()
-                        && let Some(serialized) =
-                            tree_guard.serialize_upper_in(node_id)
                     {
-                        stored_off_heap = oh.store_node(node_id, serialized);
+                        for (_db_id, tree_arc) in self.candidate_trees() {
+                            if let Ok(tree_guard) = tree_arc.read()
+                                && let Some(serialized) =
+                                    tree_guard.serialize_upper_in(node_id)
+                            {
+                                stored_off_heap =
+                                    oh.store_node(node_id, serialized);
+                                break;
+                            }
+                        }
                     }
 
                     // CC-6: flush_dirty_node_to_log uses a non-blocking
@@ -857,10 +930,17 @@ impl Evictor {
     /// `evict_batch` always calls `node_info_fn` before `node_size_fn` for
     /// the same node, and the calls are serialised within a single thread.
     pub fn do_evict(&self, source: EvictionSource) -> EvictResult {
-        if let Some(tree_arc) = self.current_tree() {
-            let tree_clone = Arc::clone(&tree_arc);
-            // EV-13: a second handle for the detach-and-measure callback.
-            let tree_detach = Arc::clone(&tree_arc);
+        // EVICTOR-RECLAIM-1: snapshot ALL database trees, not just the primary
+        // slot.  The info/size callbacks search each tree for the candidate
+        // node, mirroring JE's single env-wide INList whose targets resolve
+        // to their owning DB (Evictor.processTarget -> target.getDatabase(),
+        // Evictor.java:2374).
+        let trees = self.candidate_trees();
+        if !trees.is_empty() {
+            let trees_info: Vec<Arc<RwLock<Tree>>> =
+                trees.iter().map(|(_, t)| Arc::clone(t)).collect();
+            // EV-13: a second handle set for the detach-and-measure callback.
+            let trees_detach = trees_info.clone();
 
             // St-H2: one unified O(tree) walk per candidate instead of two.
             // The size discovered during the info walk is cached here and
@@ -875,11 +955,20 @@ impl Evictor {
 
             let node_info_fn =
                 move |node_id: u64| -> Option<Box<dyn NodeEvictionInfo>> {
-                    let guard = tree_clone.read().ok()?;
-                    let full = find_node_full(&guard, node_id)?;
-                    // Cache the size so node_size_fn needs no second tree walk.
-                    sc.borrow_mut().insert(node_id, full.size);
-                    Some(Box::new(full.info))
+                    // Walk each tree until the node is found in its owner.
+                    for tree_arc in &trees_info {
+                        let guard = match tree_arc.read() {
+                            Ok(g) => g,
+                            Err(_) => continue,
+                        };
+                        if let Some(full) = find_node_full(&guard, node_id) {
+                            // Cache the size so node_size_fn needs no second
+                            // tree walk.
+                            sc.borrow_mut().insert(node_id, full.size);
+                            return Some(Box::new(full.info));
+                        }
+                    }
+                    None
                 };
             // EV-13: this is the DETACH-and-measure callback (JE
             // `parent.detachNode(index, ...)` from `Evictor.evict`).  The
@@ -889,6 +978,12 @@ impl Evictor {
             // dropping the strong `Arc` so the node is freed for real, and
             // returns the measured heap bytes reclaimed.
             //
+            // EVICTOR-RECLAIM-1: the detach must run on the tree that OWNS the
+            // node so the parent IN re-wired by `detach_node_by_id` is in the
+            // SAME tree (a cross-tree detach would corrupt structure).  We try
+            // each tree; `detach_node_by_id` returns 0 for a node it does not
+            // contain, so the first tree returning >0 is the owner.
+            //
             // Before EV-13 this only drained a cached size: the node was
             // credited as freed but the parent still held the `Arc`, so the
             // heap was never reclaimed and `cache_usage` drifted below
@@ -897,11 +992,16 @@ impl Evictor {
                 // Drain the cached size first so the RefCell never leaks the
                 // entry even when detach short-circuits.
                 let cached = sc.borrow_mut().remove(&node_id);
-                let freed = tree_detach
-                    .read()
-                    .ok()
-                    .map(|t| t.detach_node_by_id(node_id))
-                    .unwrap_or(0);
+                let mut freed = 0u64;
+                for tree_arc in &trees_detach {
+                    if let Ok(t) = tree_arc.read() {
+                        let f = t.detach_node_by_id(node_id);
+                        if f > 0 {
+                            freed = f;
+                            break;
+                        }
+                    }
+                }
                 if freed > 0 {
                     // Detached and freed for real — credit the measured size.
                     freed
@@ -922,31 +1022,41 @@ impl Evictor {
         }
     }
 
-    /// EV-14: evict the root IN of the current tree via the separate
-    /// `Tree::evict_root` path (JE `Evictor.evictRoot`).
+    /// EV-14: evict the root IN via the separate `Tree::evict_root` path
+    /// (JE `Evictor.evictRoot`).
     ///
     /// The `node_id` is the candidate the LRU offered; we only proceed if it
-    /// is still the tree's resident root (JE `RootEvictor.doWork` re-checks
+    /// is still some tree's resident root (JE `RootEvictor.doWork` re-checks
     /// `rootIN == target && rootIN.isRoot()`).  Returns `Some((freed_bytes,
     /// was_dirty))` on a successful evict, `None` if the root could not be
     /// evicted (so the caller puts the candidate back).
+    ///
+    /// EVICTOR-RECLAIM-1: searches every database tree for the one whose
+    /// resident root matches, then calls `evict_root` on THAT tree with its
+    /// own db_id so the detach re-wires the parent in the SAME tree and the
+    /// root is re-fetchable from the correct database's persisted LSN
+    /// (JE Evictor.processTarget -> target.getDatabase(), Evictor.java:2374).
     fn evict_root_node(&self, node_id: u64) -> Option<(u64, bool)> {
-        let tree_arc = self.current_tree()?;
-        let db_id = self.db_id.load(Ordering::Relaxed);
-        let tree = tree_arc.read().ok()?;
-        // Re-check the candidate is still the resident root before evicting
-        // (JE RootEvictor re-checks rootIN == target && isRoot()).
-        let root_id = tree.get_resident_root_in().map(|r| {
-            use noxu_tree::tree::TreeNode;
-            match &*r.read() {
-                TreeNode::Internal(n) => n.node_id,
-                TreeNode::Bottom(b) => b.node_id,
+        for (db_id, tree_arc) in self.candidate_trees() {
+            let tree = match tree_arc.read() {
+                Ok(g) => g,
+                Err(_) => continue,
+            };
+            // Re-check the candidate is still THIS tree's resident root
+            // before evicting (JE RootEvictor re-checks rootIN == target &&
+            // isRoot()).
+            let root_id = tree.get_resident_root_in().map(|r| {
+                use noxu_tree::tree::TreeNode;
+                match &*r.read() {
+                    TreeNode::Internal(n) => n.node_id,
+                    TreeNode::Bottom(b) => b.node_id,
+                }
+            });
+            if root_id == Some(node_id) {
+                return tree.evict_root(db_id);
             }
-        })?;
-        if root_id != node_id {
-            return None; // not the current root any more
         }
-        tree.evict_root(db_id)
+        None // not the resident root of any tree any more
     }
 
     /// Flush a dirty node to the WAL before evicting it.
@@ -961,22 +1071,34 @@ impl Evictor {
     /// `latchNoWait`-style non-blocking latch attempt before any eviction
     /// mutation (CC-6 fix).
     fn flush_dirty_node_to_log(&self, node_id: u64) -> bool {
-        let tree_arc = match self.current_tree() {
-            Some(t) => t,
-            None => return true, // no tree — nothing to flush
-        };
-
-        let node_arc: Arc<NodeRwLock<TreeNode>> = {
-            let tree_guard = match tree_arc.read() {
-                Ok(g) => g,
-                Err(_) => return false, // tree lock poisoned; be conservative
-            };
-            // CC-6: non-blocking tree scan — if any node in the descent path
-            // is write-locked by another thread, treat the target as busy.
-            match find_node_arc_nonblocking(&tree_guard, node_id) {
-                Ok(Some(a)) => a,
-                Ok(None) => return true, // node already gone; allow eviction
-                Err(()) => return false, // descent blocked; put back
+        // EVICTOR-RECLAIM-1: search every database tree and capture the
+        // owning db_id so the BIN is logged under the CORRECT database
+        // (JE Evictor.processTarget -> target.getDatabase(), Evictor.java:2374).
+        let trees = self.candidate_trees();
+        if trees.is_empty() {
+            return true; // no tree — nothing to flush
+        }
+        let (owning_db_id, node_arc): (u64, Arc<NodeRwLock<TreeNode>>) = {
+            let mut found: Option<(u64, Arc<NodeRwLock<TreeNode>>)> = None;
+            for (db_id, tree_arc) in &trees {
+                let tree_guard = match tree_arc.read() {
+                    Ok(g) => g,
+                    Err(_) => return false, // poisoned; be conservative
+                };
+                // CC-6: non-blocking tree scan — if any node in the descent
+                // path is write-locked by another thread, treat as busy.
+                match find_node_arc_nonblocking(&tree_guard, node_id) {
+                    Ok(Some(a)) => {
+                        found = Some((*db_id, a));
+                        break;
+                    }
+                    Ok(None) => continue, // not in this tree; try the next
+                    Err(()) => return false, // descent blocked; put back
+                }
+            }
+            match found {
+                Some(pair) => pair,
+                None => return true, // not in any tree; allow eviction
             }
         };
 
@@ -1020,7 +1142,9 @@ impl Evictor {
         //
         // JE ref: Checkpointer.coordinateEvictionWithCheckpoint /
         // DirtyINMap.coordinateEvictionWithCheckpoint.
-        let db_id = self.db_id.load(Ordering::Relaxed);
+        // EVICTOR-RECLAIM-1: use the OWNING tree's db_id (resolved above), not
+        // the primary slot's, so the BIN logs against the correct database.
+        let db_id = owning_db_id;
         let provisional = self
             .checkpointer
             .as_ref()
@@ -1079,20 +1203,33 @@ impl Evictor {
     /// JE reference: `Evictor.java` `isPinned()` + `latchNoWait`-style
     /// non-blocking latch (CC-6 fix).
     fn strip_lns_from_node(&self, node_id: u64) -> Option<usize> {
-        let tree_arc = match self.current_tree() {
-            Some(t) => t,
-            None => return Some(0),
-        };
+        // EVICTOR-RECLAIM-1: search every database tree, not just the primary
+        // slot.  JE resolves the target's owning DB from the env-wide INList
+        // (Evictor.processTarget -> target.getDatabase(), Evictor.java:2374).
+        let trees = self.candidate_trees();
+        if trees.is_empty() {
+            return Some(0);
+        }
         let node_arc: Arc<NodeRwLock<TreeNode>> = {
-            let tree_guard = match tree_arc.read() {
-                Ok(g) => g,
-                Err(_) => return None, // conservative: put back
-            };
-            // CC-6: non-blocking tree scan.
-            match find_node_arc_nonblocking(&tree_guard, node_id) {
-                Ok(Some(a)) => a,
-                Ok(None) => return Some(0), // already gone
-                Err(()) => return None,     // descent blocked; put back
+            let mut found: Option<Arc<NodeRwLock<TreeNode>>> = None;
+            for (_db_id, tree_arc) in &trees {
+                let tree_guard = match tree_arc.read() {
+                    Ok(g) => g,
+                    Err(_) => return None, // conservative: put back
+                };
+                // CC-6: non-blocking tree scan.
+                match find_node_arc_nonblocking(&tree_guard, node_id) {
+                    Ok(Some(a)) => {
+                        found = Some(a);
+                        break;
+                    }
+                    Ok(None) => continue, // not in this tree; try the next
+                    Err(()) => return None, // descent blocked; put back
+                }
+            }
+            match found {
+                Some(a) => a,
+                None => return Some(0), // not in any tree; already gone
             }
         };
 

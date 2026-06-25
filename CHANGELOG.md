@@ -67,16 +67,41 @@ listed in [References](#references).
   workloads over a working set larger than the cache, all 5 policies, median of
   3, on real disk. Results in `benches/results/evictor-policy-pressure.md`.
 
-### Findings
+### Fixed
 
-- **Eviction does not reclaim memory under sustained pressure
-  (EVICTOR-RECLAIM-1).** The policy benchmark revealed that with a working set
-  larger than the cache the evictor targets ~137 k nodes per pass but evicts
-  ~1: every BIN candidate is put back (`strip_lns_from_node` does not free the
-  embedded LN heap), so cache usage stays ~1.4× over budget. The eviction
-  *policy* therefore cannot affect the resident set — all 5 policies perform
-  identically. **Default kept at LRU** (JE-faithful, no reproducible winner).
-  See `docs/src/maintainer/design-decisions.md` §13 and
+- **Eviction now reclaims to budget across all database trees
+  (EVICTOR-RECLAIM-1, fixed).** Under sustained cache pressure the evictor
+  previously reclaimed almost nothing — resident `cache_usage_bytes()` stayed
+  ~1.45× the configured budget (measured: 16 MiB cache, ~21 MB working set,
+  ~23 MB resident; `stripped~1`, `freed~0`). Two distinct defects combined:
+  1. **Split-created BINs/INs were never registered with the evictor LRU.**
+     Only the first-key root+BIN and re-fetched nodes ever called
+     `note_added`; the proactive-split path (`split_child` / `splitRoot`)
+     created new siblings/roots without it, so after a tree grew past its
+     first BIN every subsequent BIN was invisible to the evictor. The policy
+     lists held ~2 node_ids for a 158-BIN tree, so `evict_batch` had almost no
+     candidates. JE `IN.splitInternal` calls `inList.add(newSibling)`; the
+     `InListListener` is now threaded through `insert_recursive` /
+     `split_child` so a freshly-split node is registered the instant it
+     becomes resident.
+  2. **The evictor searched only a single primary tree slot.** Its
+     `strip_lns_from_node` / `flush_dirty_node_to_log` / `evict_root` / the
+     `do_evict` detach closure looked up candidates in one tree, so a second
+     database's BINs (`db_id` ≠ the primary slot) were targeted via the
+     `InListListener` but could never be found/stripped. JE walks ONE env-wide
+     `INList` covering all DBs and resolves each target IN's owning DB via
+     `target.getDatabase()` (`Evictor.processTarget`, Evictor.java:2374); the
+     evictor now consults the shared `db_trees_registry` (the same registry
+     the checkpointer and cleaner use) to find the owning tree, and operates
+     on it (correct `db_id` for logging; detach re-wires the parent in the
+     same tree). Lock-ordering safe: `candidate_trees()` snapshots the
+     registry and releases its mutex before any per-tree lock is taken.
+
+  Measured after the fix (16 MiB cache, ~21 MB working set across two user
+  DBs, `/scratch` real disk): `stripped 790`, `freed ~16 MB`, resident
+  ~0.53× budget, all records re-fetch correctly. Headline regression guard:
+  `crates/noxu-db/tests/evictor_reclaim_multitree_test.rs`. **Default eviction
+  policy stays LRU** (JE-faithful). See
   `docs/src/operations/known-limitations.md`.
 
 

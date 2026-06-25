@@ -391,22 +391,31 @@ The `mixed` column (slow enough that machine noise is negligible) is identical
 across all five policies (~3.3 k ops/s, ±3 %). The car/lirs `random`/`scan`
 "wins" are a machine-load artifact, not a policy effect.
 
-**The real reason the policy can't matter here**: under cache pressure, the
-evictor's end-to-end reclamation is broken — `do_evict` *targets* ~137 k nodes
-per pass but evicts ~1, putting essentially every BIN candidate back (its
-`strip_lns_from_node` partial-eviction path returns "busy/put-back"), so cache
-usage stays ~1.4× over budget (~24 MB resident vs a 16 MiB budget). The policy's
-`evict_candidate()` genuinely drives *victim selection* (it is wired and not a
-no-op at the API level), but because the chosen victim is put back rather than
-evicted, the *order* of selection is irrelevant to the resident set — so all
-five policies keep the same pages resident and run at the same speed.
+**Update (EVICTOR-RECLAIM-1, fixed 2026-06)**: the reclamation gap that made
+this benchmark policy-blind is now fixed. Two defects combined: split-created
+BINs/INs were never registered with the evictor LRU (so the policy lists were
+nearly empty), and the evictor searched only a single primary tree slot (so a
+second database's BINs were targeted but never found/stripped). With both
+fixed, eviction reclaims to budget (16 MiB cache, ~21 MB working set across two
+user DBs: resident drops to ~0.53× budget, `stripped 790`, `freed ~16 MB`), so
+`evict_candidate()` victim selection now genuinely affects the resident set and
+a real policy comparison is possible. The benchmark numbers below predate the
+fix and should be re-measured. **LRU stays the default (JE-faithful).** See
+`crates/noxu-db/tests/evictor_reclaim_multitree_test.rs` and the CHANGELOG.
+
+**The real reason the policy couldn't matter here (pre-fix)**: under cache
+pressure, the evictor's end-to-end reclamation was broken — `do_evict`
+*targeted* ~137 k nodes per pass but evicted ~1, putting essentially every BIN
+candidate back, so cache usage stayed ~1.4× over budget (~24 MB resident vs a
+16 MiB budget). The policy's `evict_candidate()` genuinely drove *victim
+selection* (it is wired and not a no-op at the API level), but because the
+chosen victim was put back rather than evicted, the *order* of selection was
+irrelevant to the resident set — so all five policies kept the same pages
+resident and ran at the same speed.
 
 **Consequence**: LRU is the default (JE-faithful, honest). The other four
-policies are available via `noxu.evictor.algorithm` for re-measurement once the
-underlying partial-eviction reclamation gap (`strip_lns_from_node` /
-`EvictionDecision::PartialEvict` in `crates/noxu-evictor/src/evictor.rs`) is
-fixed. A real policy comparison is meaningless until eviction actually reclaims
-memory under pressure.
+policies are available via `noxu.evictor.algorithm` for re-measurement now that
+the partial-eviction reclamation gap is fixed.
 
 **Where**: `crates/noxu-config/src/params.rs` (`EVICTOR_ALGORITHM`),
 `crates/noxu-dbi/src/dbi_config.rs` + `environment_impl.rs`,

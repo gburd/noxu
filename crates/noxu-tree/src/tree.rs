@@ -3694,6 +3694,7 @@ impl Tree {
             self.max_entries_per_node,
             self.key_comparator.as_ref(),
             self.key_prefixing,
+            self.in_list_listener.as_ref(),
         )?;
 
         // Update the memory counter for new inserts.
@@ -3906,7 +3907,17 @@ impl Tree {
             &[], // no insertion key at root-init time
             self.key_comparator.as_ref(),
             self.key_prefixing,
+            self.in_list_listener.as_ref(),
         )?;
+
+        // EVICTOR-RECLAIM-1: register the freshly-promoted root IN with the
+        // evictor's LRU (JE Tree.splitRoot adds the new root to the INList).
+        // split_child above already registers the new sibling.
+        let new_root_id = match &*new_root_arc.read() {
+            TreeNode::Internal(n) => n.node_id,
+            TreeNode::Bottom(b) => b.node_id,
+        };
+        self.note_added(new_root_id);
 
         self.root_splits.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -3944,6 +3955,7 @@ impl Tree {
         insert_key: &[u8],
         key_comparator: Option<&KeyComparatorFn>,
         key_prefixing: bool,
+        listener: Option<&Arc<dyn InListListener>>,
     ) -> Result<(), TreeError> {
         // The split is performed under `parent.write()` for the entire
         // duration. This is a deliberate choice for correctness:
@@ -4271,6 +4283,21 @@ impl Tree {
         }
         drop(parent_write_guard);
 
+        // EVICTOR-RECLAIM-1: register the freshly-split sibling with the
+        // evictor's LRU (JE IN.splitInternal calls inList.add(newSibling)).
+        // Without this, split-created BINs/INs are invisible to the evictor:
+        // the policy lists never receive them, every evict_batch phase quota
+        // is 0, and eviction reclaims nothing under pressure even though the
+        // nodes are fully resident.  Only the very first root+BIN (the
+        // first-key path) and re-fetched nodes were ever registered.
+        if let Some(l) = listener {
+            let sibling_id = match &*new_sibling.read() {
+                TreeNode::Internal(n) => n.node_id,
+                TreeNode::Bottom(b) => b.node_id,
+            };
+            l.note_ins_added(sibling_id);
+        }
+
         Ok(())
     }
 
@@ -4294,6 +4321,7 @@ impl Tree {
         max_entries: usize,
         key_comparator: Option<&KeyComparatorFn>,
         key_prefixing: bool,
+        listener: Option<&Arc<dyn InListListener>>,
     ) -> Result<bool, TreeError> {
         Self::insert_recursive_inner(
             node_arc,
@@ -4305,6 +4333,7 @@ impl Tree {
             key_prefixing,
             true, // all_left_so_far
             true, // all_right_so_far
+            listener,
         )
     }
 
@@ -4326,6 +4355,7 @@ impl Tree {
         key_prefixing: bool,
         all_left_so_far: bool,
         all_right_so_far: bool,
+        listener: Option<&Arc<dyn InListListener>>,
     ) -> Result<bool, TreeError> {
         // Determine if this is a BIN (leaf level).
         //
@@ -4470,6 +4500,7 @@ impl Tree {
                     &key,
                     key_comparator,
                     key_prefixing,
+                    listener,
                 )?;
 
                 // After the split, re-find which child now covers key.
@@ -4486,6 +4517,7 @@ impl Tree {
                     key_prefixing,
                     all_left_so_far,
                     all_right_so_far,
+                    listener,
                 );
             }
 
@@ -4504,6 +4536,7 @@ impl Tree {
                 key_prefixing,
                 all_left,
                 all_right,
+                listener,
             );
             drop(parent_guard);
             r
@@ -4669,6 +4702,11 @@ impl Tree {
                     key,
                     key_comparator,
                     key_prefixing,
+                    // Recovery redo path: the listener is not active during
+                    // log replay (the evictor is wired AFTER recovery, and
+                    // the INList is rebuilt separately).  EVICTOR-RECLAIM-1
+                    // registration happens on the live insert path.
+                    None,
                 )?;
                 return Self::redo_insert_recursive_inner(
                     node_arc,
@@ -12875,6 +12913,7 @@ fn test_split_child_sibling_inherits_expiration_in_hours() {
         &[],
         None,
         false,
+        None,
     )
     .expect("split_child should succeed");
 
