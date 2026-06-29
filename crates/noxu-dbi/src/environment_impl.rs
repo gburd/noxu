@@ -2578,10 +2578,20 @@ impl EnvironmentImpl {
 
 impl Drop for EnvironmentImpl {
     fn drop(&mut self) {
+        // Poison-safe teardown: a panic elsewhere may have poisoned any of these
+        // mutexes.  In Drop we MUST NOT unwrap() a poisoned lock — that turns a
+        // recoverable poison into a double-panic and aborts the whole process.
+        // Every lock on the teardown path recovers the guard with into_inner().
+        //
         // Shut down the evictor daemon so its thread exits cleanly when the
         // environment is dropped (e.g. in tests that don't call close()).
         self.evictor.shutdown();
-        if let Some(handle) = self.evictor_handle.lock().unwrap().take() {
+        if let Some(handle) = self
+            .evictor_handle
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
             let _ = handle.join();
         }
 
@@ -2589,26 +2599,50 @@ impl Drop for EnvironmentImpl {
         if let Some(ckpt) = &self.checkpointer {
             ckpt.request_shutdown();
         }
-        if let Some(handle) = self.checkpointer_handle.lock().unwrap().take() {
+        if let Some(handle) = self
+            .checkpointer_handle
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
             let _ = handle.join();
         }
 
         // Shut down the INCompressor daemon thread.
         self.in_compressor_shutdown.shutdown();
-        if let Some(handle) = self.in_compressor_handle.lock().unwrap().take() {
+        if let Some(handle) = self
+            .in_compressor_handle
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
             let _ = handle.join();
         }
 
         // Shut down the cleaner daemon thread.
         self.cleaner_shutdown.shutdown();
-        if let Some(handle) = self.cleaner_handle.lock().unwrap().take() {
+        if let Some(handle) = self
+            .cleaner_handle
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
             let _ = handle.join();
         }
 
         // Shut down the extended-fork background services.
-        self.extinction_scanner.lock().unwrap().shutdown();
-        self.data_eraser.lock().unwrap().shutdown();
-        self.backup_manager.lock().unwrap().shutdown();
+        self.extinction_scanner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .shutdown();
+        self.data_eraser
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .shutdown();
+        self.backup_manager
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .shutdown();
 
         // EV-14 teardown: break the `Tree -> Arc<LogManager> -> FileManager`
         // chain so the FileManager's on-disk exclusive lock is released on
