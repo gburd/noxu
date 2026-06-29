@@ -71,6 +71,18 @@ pub enum TxnError {
     #[error("range restart required")]
     RangeRestart,
 
+    /// An illegal lock-type upgrade was requested (an impossible transition in
+    /// the upgrade matrix, e.g. RangeInsert -> Read).  Normally a caller bug,
+    /// but surfaced as an error so the transaction aborts and the environment
+    /// survives instead of the process panicking.
+    #[error("illegal lock upgrade: held={held:?} requested={requested:?}")]
+    IllegalUpgrade {
+        /// The lock type currently held by the requester.
+        held: crate::LockType,
+        /// The lock type that was requested (the illegal target).
+        requested: crate::LockType,
+    },
+
     /// Transaction state error.
     #[error("transaction state error: {0}")]
     StateError(String),

@@ -408,6 +408,17 @@ impl LockManager {
                 return Ok(result.lock_grant);
             }
 
+            if result.lock_grant == LockGrantType::IllegalUpgrade {
+                // An impossible upgrade transition: surface as an error so the
+                // txn aborts and the environment survives (not a process panic).
+                return Err(TxnError::IllegalUpgrade {
+                    held: lock
+                        .get_owned_lock_type(locker_id)
+                        .unwrap_or(LockType::None),
+                    requested: lock_type,
+                });
+            }
+
             if result.lock_grant == LockGrantType::Denied {
                 // Non-blocking request was denied.
                 return Err(TxnError::LockNotAvailable { lsn });
@@ -597,6 +608,12 @@ impl LockManager {
             LockGrantType::WaitPromotion => LockGrantType::Promotion,
             LockGrantType::WaitRestart => {
                 return Err(TxnError::RangeRestart);
+            }
+            LockGrantType::IllegalUpgrade => {
+                return Err(TxnError::IllegalUpgrade {
+                    held: LockType::None,
+                    requested: lock_type,
+                });
             }
             other => other,
         };

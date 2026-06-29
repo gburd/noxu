@@ -558,7 +558,12 @@ impl Transaction {
         observe_span!("txn_abort", txn_id = self.id);
         observe_counter!("noxu_db_operations_total", "op" => "abort");
         {
-            let state = self.state.lock().unwrap();
+            // Poison-safe: abort is reachable from Drop and a prior panic
+            // on this txn may have poisoned its own locks; recover and abort.
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             match *state {
                 TransactionState::Committed => {
                     return Err(NoxuError::OperationNotAllowed(
@@ -596,7 +601,11 @@ impl Transaction {
         if let Some(inner) = &self.inner_txn {
             // Phase 1: collect undo records without releasing write locks.
             let mut undo_records =
-                inner.lock().unwrap().abort_collect_undo().unwrap_or_default();
+                inner
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .abort_collect_undo()
+                    .unwrap_or_default();
 
             // Apply undo in reverse-operation order (newest LSN first).
             //
@@ -688,17 +697,26 @@ impl Transaction {
 
             // Phase 3: release write locks — blocked readers now unblock and
             // see the restored before-image.
-            inner.lock().unwrap().release_all_locks();
+            inner
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .release_all_locks();
         }
 
-        let mut state = self.state.lock().unwrap();
+        let mut state =
+            self.state.lock().unwrap_or_else(|p| p.into_inner());
         *state = TransactionState::Aborted;
         drop(state);
 
         // C-4 / JE 1-I: run abort callbacks (transactional database
         // registration rollback).
         let callbacks: Vec<Box<dyn FnOnce() + Send>> =
-            std::mem::take(&mut *self.abort_callbacks.lock().unwrap());
+            std::mem::take(
+                &mut *self
+                    .abort_callbacks
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()),
+            );
         for cb in callbacks {
             cb();
         }
@@ -1207,7 +1225,15 @@ impl Drop for Transaction {
         // a non-terminal state at drop time, perform an actual abort
         // (release locks, apply undo, prune from active-txn registry,
         // decrement gauge) instead of just logging a warning.
-        let state = *self.state.lock().unwrap();
+        //
+        // Poison-safe: a panic elsewhere may have poisoned `state`.  In Drop we
+        // MUST NOT unwrap() a poisoned lock — that would turn a recoverable
+        // poison into a double-panic and abort the whole process.  Recover the
+        // guard with into_inner() and proceed with a best-effort abort.
+        let state = *self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if matches!(state, TransactionState::Open | TransactionState::MustAbort)
         {
             log::warn!(

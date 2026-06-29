@@ -50,10 +50,18 @@ impl ThinLockImpl {
             let upgrade = current_type.get_upgrade(request_type);
 
             if upgrade.is_illegal() {
-                panic!(
-                    "Illegal lock upgrade from {:?} to {:?}",
-                    current_type, request_type
+                // Surface an impossible upgrade as an error rather than
+                // panicking the process (mapped to TxnError::IllegalUpgrade by
+                // the LockManager so the txn aborts and the env survives).
+                log::error!(
+                    "illegal lock upgrade from {:?} to {:?} (thin lock) \
+                     — returning IllegalUpgrade instead of panicking",
+                    current_type,
+                    request_type
                 );
+                return Ok(LockAttemptResult::new(
+                    LockGrantType::IllegalUpgrade,
+                ));
             }
 
             if let Some(upgrade_type) = upgrade.get_upgrade_type() {

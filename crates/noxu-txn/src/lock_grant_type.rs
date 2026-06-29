@@ -32,6 +32,15 @@ pub enum LockGrantType {
 
     /// No lock needed (NONE type requested for dirty reads).
     NoneNeeded,
+
+    /// An illegal lock-type upgrade was requested (e.g. RangeInsert -> Read).
+    /// This represents an impossible transition in the upgrade matrix and
+    /// normally indicates a caller bug, but it is surfaced as an error (mapped
+    /// to `TxnError::IllegalUpgrade` by the LockManager) so the transaction can
+    /// abort and the environment survives, rather than panicking the process.
+    /// JE wraps the equivalent as a catchable EnvironmentFailureException
+    /// (UNEXPECTED_STATE), not a JVM abort.
+    IllegalUpgrade,
 }
 
 impl LockGrantType {

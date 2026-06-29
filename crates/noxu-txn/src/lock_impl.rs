@@ -691,13 +691,25 @@ impl LockImpl {
                         // iterating further; otherwise, we need to check for conflicts
                         // before granting the upgrade.
                         debug_assert!(upgrade.is_none()); // An owner should appear only once
-                        upgrade = Some(owner_type.get_upgrade(request_type));
-                        if upgrade
-                            .as_ref()
-                            .unwrap()
-                            .get_upgrade_type()
-                            .is_none()
-                        {
+                        let upg = owner_type.get_upgrade(request_type);
+                        if upg.is_illegal() {
+                            // An impossible transition (e.g. RangeInsert -> Read).
+                            // Surface it as an error grant rather than silently
+                            // returning Existing (which would no-op the request)
+                            // or panicking the process.  The LockManager maps
+                            // IllegalUpgrade -> TxnError::IllegalUpgrade so the
+                            // txn aborts and the environment survives.
+                            log::error!(
+                                "illegal lock upgrade from {:?} to {:?} \
+                                 (locker {})",
+                                owner_type,
+                                request_type,
+                                locker_id
+                            );
+                            return LockGrantType::IllegalUpgrade;
+                        }
+                        upgrade = Some(upg);
+                        if upg.get_upgrade_type().is_none() {
                             return LockGrantType::Existing;
                         }
                     } else {
@@ -734,13 +746,31 @@ impl LockImpl {
         if let Some(upg) = upgrade {
             // The requestor holds this lock.
             if upg.is_illegal() {
-                panic!(
-                    "Illegal lock upgrade from {:?} to {:?}",
-                    new_lock.lock_type, request_type
+                // An impossible upgrade transition (e.g. RangeInsert -> Read).
+                // This is normally a caller bug, but we surface it as an error
+                // rather than panicking the process: the LockManager maps
+                // IllegalUpgrade to TxnError::IllegalUpgrade so the txn aborts
+                // and the environment survives.  JE treats the equivalent as a
+                // catchable EnvironmentFailureException, not a JVM abort.
+                log::error!(
+                    "illegal lock upgrade from {:?} to {:?} (locker {}) \
+                     — returning IllegalUpgrade instead of panicking",
+                    new_lock.lock_type,
+                    request_type,
+                    locker_id
                 );
+                return LockGrantType::IllegalUpgrade;
             }
 
-            let upgrade_type = upg.get_upgrade_type().unwrap();
+            let upgrade_type = match upg.get_upgrade_type() {
+                Some(t) => t,
+                None => {
+                    // A non-illegal upgrade with no concrete upgrade type means
+                    // "no type change needed" (JE getUpgrade().getUpgrade() ==
+                    // null -> EXISTING).  Treat as already-held.
+                    return LockGrantType::Existing;
+                }
+            };
             if !owner_conflicts {
                 // No conflict: grant the upgrade.
                 self.update_owner_type(locker_id, upgrade_type);
@@ -905,6 +935,25 @@ mod tests {
         // Another writer tries to acquire (non-blocking)
         let result2 = lock.lock(LockType::Write, 2, true, false);
         assert_eq!(result2.grant_type, LockGrantType::Denied);
+    }
+
+    #[test]
+    fn test_illegal_upgrade_returns_grant_not_panic() {
+        // Hold a RangeInsert lock, then request Read on the same locker.
+        // (RangeInsert -> Read) is an Illegal entry in the upgrade matrix.
+        // It must surface as LockGrantType::IllegalUpgrade, NOT panic the
+        // process (so the txn can abort and the environment survives).
+        let mut lock = LockImpl::new();
+        let r1 = lock.lock(LockType::RangeInsert, 1, false, false);
+        assert_eq!(r1.grant_type, LockGrantType::New);
+
+        let r2 = lock.lock(LockType::Read, 1, false, false);
+        assert_eq!(
+            r2.grant_type,
+            LockGrantType::IllegalUpgrade,
+            "illegal upgrade must return IllegalUpgrade, not panic"
+        );
+        assert!(!r2.success, "illegal upgrade is not a successful grant");
     }
 
     #[test]

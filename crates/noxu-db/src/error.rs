@@ -822,6 +822,13 @@ impl From<noxu_txn::TxnError> for NoxuError {
             TxnError::RangeRestart => {
                 NoxuError::LockConflict("range restart".into())
             }
+            TxnError::IllegalUpgrade { held, requested } => {
+                // An impossible lock-type upgrade; surface as an aborting error
+                // rather than a panic so the environment survives.
+                NoxuError::TransactionAborted(format!(
+                    "illegal lock upgrade: held {held:?}, requested {requested:?}"
+                ))
+            }
             TxnError::InvalidTransaction { txn_id, state } => {
                 NoxuError::TransactionAborted(format!("txn {txn_id}: {state}"))
             }
