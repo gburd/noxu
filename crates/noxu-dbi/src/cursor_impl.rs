@@ -443,8 +443,14 @@ impl CursorImpl {
             old_lsn
         };
         if let Some(txn) = &self.txn_ref {
-            txn.lock()
-                .unwrap()
+            let mut guard = txn.lock().unwrap();
+            // If this txn already holds a RangeInsert next-key lock on
+            // lsn_to_lock (acquired when a PRIOR insert in this txn range-locked
+            // this key as its successor), release it first so the Write below is
+            // a fresh grant rather than an illegal (RangeInsert, Write) upgrade.
+            // See Txn::release_range_insert_for_write for why this is safe.
+            guard.release_range_insert_for_write(lsn_to_lock);
+            guard
                 .lock(lsn_to_lock, LockType::Write, false)
                 .map_err(DbiError::TxnError)?;
         } else if let Some(lm) = &self.lock_manager {

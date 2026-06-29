@@ -339,6 +339,39 @@ impl Txn {
         Lsn::from_u64(self.abort_lsn)
     }
 
+    /// If this txn holds a `RangeInsert` next-key lock on `lsn`, release it so a
+    /// subsequent `Write` request on the same LSN is a fresh grant rather than
+    /// an illegal `(RangeInsert, Write)` upgrade.
+    ///
+    /// An insert of key A takes a `RangeInsert` lock on A's successor B's LSN
+    /// (phantom prevention).  If the SAME txn then writes key B (an existing
+    /// key locked by its real LSN), it would request `Write` on the LSN it
+    /// already holds as `RangeInsert` — ILLEGAL in JE's upgrade matrix
+    /// (RANGE_INSERT is the next-key lock, not a lock on the key itself; JE
+    /// asserts this upgrade is never requested).  Noxu can co-locate them
+    /// because its next-key lock targets the successor's real LSN.  Releasing
+    /// the txn's OWN RangeInsert here is safe: it only guarded against OTHER
+    /// txns' phantom inserts at B, and the Write about to be taken provides
+    /// at-least-as-strong protection.  Returns true if a lock was released.
+    /// A plain `Read`-held lock is left alone (Read->Write is a legal
+    /// WritePromote).
+    pub fn release_range_insert_for_write(&mut self, lsn: u64) -> bool {
+        if self.write_locks.contains_key(&lsn)
+            || !self.read_locks.contains(&lsn)
+        {
+            return false;
+        }
+        if matches!(
+            self.lock_manager.get_owned_lock_type(lsn, self.id),
+            Some(LockType::RangeInsert)
+        ) && self.read_locks.remove(&lsn)
+            && self.lock_manager.release(lsn, self.id).is_ok()
+        {
+            return true;
+        }
+        false
+    }
+
     /// Commits with an explicit durability policy.
     ///
     ///
