@@ -192,8 +192,16 @@ impl LogBufferPool {
             self.write_dirty(flush_write_queue)?;
 
             if !self.bump_current(size_needed)? {
-                // Should not happen - after writing dirty buffers we should be able to bump
-                panic!("No free log buffers after flushing dirty buffers");
+                // Should not happen — after writing dirty buffers we should be
+                // able to bump. Faithful to JE LogBufferPool.bumpAndWriteDirty
+                // (LogBufferPool.java:363), which throws
+                // EnvironmentFailureException.unexpectedState rather than
+                // aborting the JVM; we return a recoverable LogError so a
+                // single wedged write does not crash the whole process.
+                return Err(LogError::Internal(
+                    "No free log buffers after flushing dirty buffers"
+                        .to_string(),
+                ));
             }
         }
 

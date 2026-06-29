@@ -15,6 +15,16 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Fixed
+
+- **Survivable-panics audit: WAL buffer-pool exhaustion no longer aborts the
+  process.** `LogBufferPool::bump_and_write_dirty` previously called
+  `panic!("No free log buffers after flushing dirty buffers")` on an internal
+  "should not happen" state, crashing the whole process from a function that
+  already returns `Result`. It now returns `LogError::Internal`, faithful to JE
+  `LogBufferPool.bumpAndWriteDirty` (LogBufferPool.java:363), which throws
+  `EnvironmentFailureException.unexpectedState` rather than aborting the JVM.
+
 ## [6.4.1] - 2026-06-25
 
 ### Performance
