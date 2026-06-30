@@ -36,6 +36,19 @@ fn main() {
     let mode =
         env::var("NOXU_CRASH_MODE").expect("NOXU_CRASH_MODE must be set");
 
+    // DST: if a seed is provided, install the storage-fault layer over posio
+    // before opening the env.  This drops not-yet-synced bytes at a
+    // seed-chosen write (torn write / dropped fsync) by exiting the process,
+    // or injects ENOSPC / corruption — a byte-precise, reproducible power
+    // loss the SIGKILL sweep cannot do.  Absent NOXU_DST_SEED the fault layer
+    // stays inactive and the worker behaves exactly as before.
+    if let Ok(seed_str) = env::var("NOXU_DST_SEED") {
+        let seed: u64 = seed_str
+            .parse()
+            .unwrap_or_else(|_| panic!("NOXU_DST_SEED must be a u64"));
+        noxu_log::faultdisk::install_seed(seed);
+    }
+
     let env_config = EnvironmentConfig::new(dir.clone())
         .with_allow_create(true)
         .with_transactional(true);

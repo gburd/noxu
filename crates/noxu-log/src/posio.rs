@@ -130,12 +130,76 @@ pub(crate) fn write_all_at(
     offset: u64,
 ) -> io::Result<()> {
     use std::os::unix::fs::FileExt;
+    // Fault layer (DST only; one relaxed atomic load in production -> no-op).
+    match crate::faultdisk::on_write(buf.len()) {
+        crate::faultdisk::WriteFault::None => {}
+        crate::faultdisk::WriteFault::DiskFull => {
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                "faultdisk: simulated ENOSPC",
+            ));
+        }
+        crate::faultdisk::WriteFault::Torn(keep) => {
+            // Write only the surviving prefix, then lose power so neither the
+            // dropped tail nor any later write reaches disk.
+            file.write_all_at(&buf[..keep], offset)?;
+            crate::faultdisk::power_cut();
+        }
+        crate::faultdisk::WriteFault::Corrupt { offset_in_buf, len } => {
+            // Write the buffer, then flip bytes on disk to model bit-rot.
+            file.write_all_at(buf, offset)?;
+            let mut flipped = buf[offset_in_buf..offset_in_buf + len].to_vec();
+            for b in &mut flipped {
+                *b = !*b;
+            }
+            file.write_all_at(&flipped, offset + offset_in_buf as u64)?;
+            return Ok(());
+        }
+    }
     file.write_all_at(buf, offset)
 }
 
 /// Writes all of `buf` at `offset` (retry loop over `seek_write`).
 #[cfg(windows)]
 pub(crate) fn write_all_at(
+    file: &File,
+    buf: &[u8],
+    offset: u64,
+) -> io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    // Fault layer (DST only; inactive in production). The torn/disk-full/
+    // corruption faults are modelled the same way as on Unix.
+    match crate::faultdisk::on_write(buf.len()) {
+        crate::faultdisk::WriteFault::None => {}
+        crate::faultdisk::WriteFault::DiskFull => {
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                "faultdisk: simulated ENOSPC",
+            ));
+        }
+        crate::faultdisk::WriteFault::Torn(keep) => {
+            win_write_all(file, &buf[..keep], offset)?;
+            crate::faultdisk::power_cut();
+        }
+        crate::faultdisk::WriteFault::Corrupt { offset_in_buf, len } => {
+            win_write_all(file, buf, offset)?;
+            let mut flipped = buf[offset_in_buf..offset_in_buf + len].to_vec();
+            for b in &mut flipped {
+                *b = !*b;
+            }
+            return win_write_all(
+                file,
+                &flipped,
+                offset + offset_in_buf as u64,
+            );
+        }
+    }
+    win_write_all(file, buf, offset)
+}
+
+/// Windows `write_all_at` core (retry loop over `seek_write`).
+#[cfg(windows)]
+fn win_write_all(
     file: &File,
     mut buf: &[u8],
     mut offset: u64,
