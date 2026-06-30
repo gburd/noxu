@@ -28,7 +28,6 @@ use noxu_db::{Database, DatabaseEntry, Get, OperationStatus, Transaction};
 
 use crate::error::{CollectionError, Result};
 use crate::internal::{decode_value, encode_value};
-use crate::stored_iterator::StoredIterator;
 
 /// A typed list-like view of a database.
 ///
@@ -327,22 +326,30 @@ where
         Ok(self.len(txn)? == 0)
     }
 
-    /// Returns a snapshot iterator over every value, in index order.
-    pub fn iter(&self, txn: Option<&Transaction>) -> Result<StoredIterator<V>> {
-        use crate::internal::{ScanDirection, StartKey, scan_records};
-        use noxu_bind::ByteArrayBinding;
-
-        let key_binding = ByteArrayBinding;
-        let items = scan_records::<Vec<u8>, V, ByteArrayBinding, VB, V, _>(
+    /// Returns a **lazy** iterator over every value, in index order
+    /// (review P1-7).
+    ///
+    /// O(1) to create; holds a live cursor and decodes one value per
+    /// `next()`.  When `txn` is `Some(&t)` the iterator borrows `t`.
+    pub fn iter<'a>(
+        &'a self,
+        txn: Option<&'a Transaction>,
+    ) -> Result<impl Iterator<Item = Result<V>> + 'a>
+    where
+        V: 'a,
+    {
+        use crate::internal::{
+            BYTE_ARRAY_BINDING, ScanDirection, StartKey, scan_iter,
+        };
+        scan_iter(
             self.db,
             txn,
             StartKey::None,
             ScanDirection::Forward,
-            &key_binding,
+            &BYTE_ARRAY_BINDING,
             &self.value_binding,
             |_k, v| v,
-        )?;
-        Ok(StoredIterator::from_vec(items))
+        )
     }
 
     /// Removes every element.

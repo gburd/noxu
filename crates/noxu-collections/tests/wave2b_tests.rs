@@ -80,11 +80,14 @@ fn stored_map_methods_take_optional_txn() {
     assert!(map.contains_key(Some(&txn), &2).unwrap());
     txn.commit().unwrap();
 
-    // Iteration variants take txn too.
+    // Iteration variants take txn too.  They are now lazy (review P1-7),
+    // so drop the iterators (closing their cursors) before committing.
     let txn = env.begin_transaction(None).unwrap();
-    let _items = map.iter(Some(&txn)).unwrap();
-    let _keys = map.keys(Some(&txn)).unwrap();
-    let _values = map.values(Some(&txn)).unwrap();
+    {
+        let _items = map.iter(Some(&txn)).unwrap();
+        let _keys = map.keys(Some(&txn)).unwrap();
+        let _values = map.values(Some(&txn)).unwrap();
+    }
     txn.commit().unwrap();
 }
 

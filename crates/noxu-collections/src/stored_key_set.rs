@@ -12,7 +12,6 @@ use noxu_db::{Database, OperationStatus, Transaction};
 
 use crate::error::{CollectionError, Result};
 use crate::internal::encode_key;
-use crate::stored_iterator::StoredIterator;
 
 /// A typed set view of database keys.
 ///
@@ -110,26 +109,31 @@ where
         Ok(self.len(txn)? == 0)
     }
 
-    /// Returns a snapshot iterator over every key.
-    pub fn iter(&self, txn: Option<&Transaction>) -> Result<StoredIterator<K>> {
-        // We don't care about values here — use `ByteArrayBinding` for
-        // the value side and discard it.  Decoding the empty payload
-        // through the byte-array binding is a single-allocation
-        // no-op.
-        use crate::internal::{ScanDirection, StartKey, scan_records};
-        use noxu_bind::ByteArrayBinding;
-
-        let value_binding = ByteArrayBinding;
-        let items = scan_records::<K, Vec<u8>, KB, ByteArrayBinding, K, _>(
+    /// Returns a **lazy** iterator over every key (review P1-7).
+    ///
+    /// O(1) to create; holds a live cursor and decodes one key per
+    /// `next()`.  When `txn` is `Some(&t)` the iterator borrows `t`.
+    pub fn iter<'a>(
+        &'a self,
+        txn: Option<&'a Transaction>,
+    ) -> Result<impl Iterator<Item = Result<K>> + 'a>
+    where
+        K: 'a,
+    {
+        // We don't care about values here — use the shared `'static`
+        // `ByteArrayBinding` for the value side and discard it.
+        use crate::internal::{
+            BYTE_ARRAY_BINDING, ScanDirection, StartKey, scan_iter,
+        };
+        scan_iter(
             self.db,
             txn,
             StartKey::None,
             ScanDirection::Forward,
             &self.key_binding,
-            &value_binding,
+            &BYTE_ARRAY_BINDING,
             |k, _v| k,
-        )?;
-        Ok(StoredIterator::from_vec(items))
+        )
     }
 
     /// Removes every element.

@@ -11,6 +11,7 @@
 
 use std::marker::PhantomData;
 
+use noxu_bind::ByteArrayBinding;
 use noxu_bind::EntryBinding;
 use noxu_db::{
     Cursor, CursorConfig, Database, DatabaseEntry, Get, OperationStatus,
@@ -18,6 +19,11 @@ use noxu_db::{
 };
 
 use crate::error::{CollectionError, Result};
+
+/// A shared `'static` byte-array binding for the discarded side of
+/// key-only / value-only lazy scans, so a [`ScanIter`] can borrow it for
+/// any iterator lifetime without keeping a local temporary alive.
+pub(crate) static BYTE_ARRAY_BINDING: ByteArrayBinding = ByteArrayBinding;
 
 /// Opens a cursor honouring the optional transaction (review P0-1/P0-2:
 /// `open_cursor` no longer takes `Option<&Transaction>`; auto-commit and
@@ -261,6 +267,189 @@ where
 
     cursor.close()?;
     Ok(out)
+}
+
+/// A lazy, cursor-backed iterator over the records of a Stored* view
+/// (review P1-7).
+///
+/// Unlike the eager [`crate::stored_iterator::StoredIterator`] (which
+/// materialises the whole keyspace into a `Vec` at construction time),
+/// this holds a live [`Cursor`] and fetches+decodes one record per
+/// `next()` call — O(1) to create and bounded memory regardless of the
+/// database size, matching `noxu_db::Database::iter`.
+///
+/// The lifetime `'a` ties the iterator to both the borrowed bindings
+/// (from the Stored* view) and — when iterating under an explicit
+/// transaction — to that transaction, so the borrow checker rejects any
+/// code that commits or drops the transaction while the iterator is
+/// still alive (the same guarantee `Cursor<'txn>` gives, review P0-1).
+pub(crate) struct ScanIter<'a, K, V, KB, VB, T, F>
+where
+    KB: EntryBinding<K>,
+    VB: EntryBinding<V>,
+    F: FnMut(K, V) -> T,
+{
+    cursor: Cursor<'a>,
+    key_binding: &'a KB,
+    value_binding: &'a VB,
+    start: Option<Vec<u8>>,
+    direction: ScanDirection,
+    project: F,
+    started: bool,
+    done: bool,
+    _marker: PhantomData<fn() -> (K, V, T)>,
+}
+
+impl<'a, K, V, KB, VB, T, F> ScanIter<'a, K, V, KB, VB, T, F>
+where
+    KB: EntryBinding<K>,
+    VB: EntryBinding<V>,
+    F: FnMut(K, V) -> T,
+{
+    fn step_op(&self) -> Get {
+        match self.direction {
+            ScanDirection::Forward => Get::Next,
+            ScanDirection::Reverse => Get::Prev,
+        }
+    }
+
+    fn initial_op(&self) -> Get {
+        match self.direction {
+            ScanDirection::Forward => Get::First,
+            ScanDirection::Reverse => Get::Last,
+        }
+    }
+
+    /// Returns `true` if `cur` is within the requested half-range
+    /// relative to the `start` lower/upper bound.
+    fn in_range(&self, cur: &[u8]) -> bool {
+        match (&self.start, self.direction) {
+            (None, _) => true,
+            (Some(bound), ScanDirection::Forward) => cur >= bound.as_slice(),
+            (Some(bound), ScanDirection::Reverse) => cur <= bound.as_slice(),
+        }
+    }
+}
+
+impl<'a, K, V, KB, VB, T, F> Iterator for ScanIter<'a, K, V, KB, VB, T, F>
+where
+    KB: EntryBinding<K>,
+    VB: EntryBinding<V>,
+    F: FnMut(K, V) -> T,
+{
+    type Item = Result<T>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        let mut key = DatabaseEntry::new();
+        let mut data = DatabaseEntry::new();
+
+        loop {
+            let op = if self.started {
+                self.step_op()
+            } else {
+                self.started = true;
+                self.initial_op()
+            };
+            match self.cursor.get(&mut key, &mut data, op, None) {
+                Err(e) => {
+                    self.done = true;
+                    return Some(Err(e.into()));
+                }
+                Ok(OperationStatus::Success) => {
+                    // Skip records before the (inclusive) start bound.
+                    let cur = key.data_opt().unwrap_or(&[]);
+                    if !self.in_range(cur) {
+                        continue;
+                    }
+                    let k = match decode_key(self.key_binding, &key) {
+                        Ok(k) => k,
+                        Err(e) => {
+                            self.done = true;
+                            return Some(Err(e));
+                        }
+                    };
+                    let v = match decode_value(self.value_binding, &data) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            self.done = true;
+                            return Some(Err(e));
+                        }
+                    };
+                    return Some(Ok((self.project)(k, v)));
+                }
+                Ok(_) => {
+                    self.done = true;
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+/// Builds a lazy [`ScanIter`] over the view's records (review P1-7).
+///
+/// O(1) to create: it only opens the cursor; records are fetched and
+/// decoded one at a time as the iterator is advanced.  `start` is an
+/// owned lower/upper bound (or `None` for a full scan) so the iterator
+/// does not borrow the caller's start buffer.
+#[allow(clippy::type_complexity)]
+pub(crate) fn scan_iter_owned_start<'a, K, V, KB, VB, T, F>(
+    db: &Database,
+    txn: Option<&'a Transaction>,
+    start: Option<Vec<u8>>,
+    direction: ScanDirection,
+    key_binding: &'a KB,
+    value_binding: &'a VB,
+    project: F,
+) -> Result<ScanIter<'a, K, V, KB, VB, T, F>>
+where
+    KB: EntryBinding<K>,
+    VB: EntryBinding<V>,
+    F: FnMut(K, V) -> T,
+{
+    let cursor = open_cursor(db, txn, None)?;
+    Ok(ScanIter {
+        cursor,
+        key_binding,
+        value_binding,
+        start,
+        direction,
+        project,
+        started: false,
+        done: false,
+        _marker: PhantomData,
+    })
+}
+
+/// Builds a lazy [`ScanIter`] over the view's records (review P1-7),
+/// taking a borrowed [`StartKey`].
+#[allow(clippy::type_complexity)]
+pub(crate) fn scan_iter<'a, K, V, KB, VB, T, F>(
+    db: &Database,
+    txn: Option<&'a Transaction>,
+    start: StartKey<'a>,
+    direction: ScanDirection,
+    key_binding: &'a KB,
+    value_binding: &'a VB,
+    project: F,
+) -> Result<ScanIter<'a, K, V, KB, VB, T, F>>
+where
+    KB: EntryBinding<K>,
+    VB: EntryBinding<V>,
+    F: FnMut(K, V) -> T,
+{
+    scan_iter_owned_start(
+        db,
+        txn,
+        start.map(|s| s.to_vec()),
+        direction,
+        key_binding,
+        value_binding,
+        project,
+    )
 }
 
 /// Marker used by the typed Stored* views to signal that the binding
