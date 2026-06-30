@@ -53,3 +53,5 @@ docs/book/
 *.perf.data
 benches/profiles/**/*.perf.data
 CHANGELOG.md.tmp
+__pycache__/
+/migrate_api.py
