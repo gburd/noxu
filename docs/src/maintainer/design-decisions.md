@@ -488,3 +488,76 @@ the partial-eviction reclamation gap is fixed.
 `crates/noxu-db/src/environment_config.rs` + `environment.rs`,
 `crates/noxu-evictor/src/policy.rs` (`EvictionAlgorithm::from_name`).
 **Evidence**: `benches/results/evictor-policy-pressure.md`.
+
+## 14. One feeder mechanism — cascade == master feed (REP-CASCADE)
+
+**Decision**: Replica-to-replica (chained / cascading) log shipping uses the
+**identical** feeder machinery the master uses to feed a replica. There is no
+separate parallel feeder path for the cascade. This matches JE / BDB-C HA
+exactly.
+
+### Noxu → JE component mapping
+
+JE has ONE feeder-source abstraction and runs the same `Feeder` loop on any
+node that holds the data — master or replica. `FeederSource.java` documents
+the source as *"a real Master OR a Replica in a Replica chain that is replaying
+log records it received from some other source."* `Feeder.initMasterFeederSource(startVLSN)`
+builds `new MasterFeederSource(repImpl, repNode.getVLSNIndex(), …)` regardless
+of node role, and the output loop pulls
+`feederSource.getWireRecord(feederVLSN, heartbeatMs)` (`Feeder.java:1282`).
+
+Noxu mirrors this 1:1:
+
+| JE class / method                                   | Noxu type / method                                          |
+|-----------------------------------------------------|-------------------------------------------------------------|
+| `FeederManager` (per-node accept loop)              | `stream::peer_feeder::PeerFeederService` (per-node service) |
+| `Feeder` (per-replica output loop)                  | `stream::feeder::FeederRunner` (`run`)                      |
+| `FeederSource` (interface)                          | `stream::feeder::LogScanner` (trait)                       |
+| `MasterFeederSource` (the log-feeding source)       | `stream::feeder::EnvironmentLogScanner`                    |
+| `FeederReader` (VLSNIndex + WAL cursor)             | `EnvironmentLogScanner` (raw VLSN-tagged WAL scan)         |
+| `FeederSource.getWireRecord(vlsn, waitTime)`        | `LogScanner::next_entry(from_vlsn)`                        |
+
+### The cascade is the identical mechanism
+
+Both the master (`ReplicatedEnvironment::become_master`) and a cascading
+replica (`ReplicatedEnvironment::become_replica` with `cascade_feeding=true`)
+register `PeerFeederService::with_wal_source(...)`. On every inbound
+downstream connection, `PeerFeederService::handle` runs ONE `FeederRunner`
+driving an `EnvironmentLogScanner` over that node's **own** WAL — the master
+serves from the master's WAL, a mid-tier replica serves from the replica's own
+WAL (which carries the entries it received + persisted via
+`EnvironmentLogWriter::log_with_vlsn`). This is JE's cascading-feeder model:
+`FeederManager` runs a `Feeder` on whatever node holds the data, and the
+`Feeder` always reads the VLSN-tagged stream from its local VLSNIndex + WAL via
+a `FeederReader`.
+
+**Proof in the suite**: `PeerFeederService` increments a `wal_feeds_served`
+counter each time it serves a connection via the WAL `FeederRunner` path; it is
+shared with the owning `ReplicatedEnvironment` and exposed as
+`ReplicatedEnvironment::wal_feeds_served()`. The headline cascade test
+(`chained_replication_test.rs`) asserts `R1.wal_feeds_served() >= 1` **and**
+`master.wal_feeds_served() >= 1`, proving R1 feeds R2 by the same mechanism the
+master feeds R1 — not via any in-memory fallback.
+
+### The in-memory queue — narrow, non-JE convenience
+
+`stream::peer_feeder::PeerLogScanner` is an in-memory
+`VecDeque<(vlsn, type, payload)>` `LogScanner`. It is retained **only** as the
+source for nodes with no live `EnvironmentImpl` wired (no WAL to scan) — e.g.
+the `replicate_entry` test convenience and `apply_entry` fan-out. It is **never**
+on a production durability path: every node opened through `with_environment`
+registers a WAL source and serves downstream from its WAL. Crucially, the
+in-memory path is **not a second feeder mechanism** — it feeds through the SAME
+`FeederRunner` loop, with `PeerScannerAdapter` (also a `LogScanner`) as the
+source instead of `EnvironmentLogScanner`. So there is one feeder loop and one
+feeder-source trait; the in-memory queue is just a second, non-durable
+*implementation* of that trait for the env-less case.
+
+**Where**: `crates/noxu-rep/src/stream/peer_feeder.rs` (`PeerFeederService`,
+`wal_feeds_served`), `crates/noxu-rep/src/stream/feeder.rs` (`FeederRunner`,
+`EnvironmentLogScanner`, `LogScanner`),
+`crates/noxu-rep/src/replicated_environment.rs` (`become_master`,
+`become_replica`, `wal_feeds_served()`).
+**JE refs**: `rep/stream/{FeederSource,MasterFeederSource,FeederReader}.java`,
+`rep/impl/node/{Feeder,FeederManager}.java`.
+**Proof**: `crates/noxu-rep/tests/chained_replication_test.rs`.

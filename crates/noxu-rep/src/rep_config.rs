@@ -178,6 +178,34 @@ pub struct RepConfig {
     /// dispatcher uses plain TCP and the operator must wire
     /// `TlsTcpChannelListener::bind_with_tls_and_allowlist` separately.
     pub tls_config: Option<crate::tls::TlsConfig>,
+
+    /// Enable chained / replica-to-replica log feeding (default `false`).
+    ///
+    /// When `true`, a node that becomes a **replica** ALSO runs a feeder
+    /// source on its `PEER_FEEDER` service, serving the VLSN-tagged log
+    /// stream from its OWN WAL to a downstream replica.  This lets a
+    /// mid-tier replica relay the stream (master → R1 → R2) instead of every
+    /// replica connecting directly to the master.
+    ///
+    /// Faithful to JE's cascading-feeder model: `FeederSource` is
+    /// documented as "a real Master OR a Replica in a Replica chain that is
+    /// replaying log records it received from some other source"
+    /// (`FeederSource.java`).  The feeder source on a replica reads its
+    /// VLSNIndex + log files exactly as `MasterFeederSource` does on the
+    /// master, so the downstream's syncup (REP-1) and live-apply (REP-7)
+    /// work unchanged against a replica-feeder source.
+    ///
+    /// **Default `false`** preserves master-direct behaviour: a replica
+    /// does not feed downstream peers unless cascade is explicitly enabled.
+    ///
+    /// **Durability bound**: a mid-tier replica does NOT count its
+    /// downstream's acks toward the master's commit-durability quorum.
+    /// JE evaluates the durability quorum at the master
+    /// (`FeederManager.getNumCurrentAckFeeders`); a chained replica only
+    /// tracks the downstream's progress for its own VLSN/lag bookkeeping.
+    /// A downstream replica is therefore never more durable than the
+    /// entries its mid-tier has itself persisted.
+    pub cascade_feeding: bool,
 }
 
 impl RepConfig {
@@ -207,6 +235,7 @@ impl RepConfig {
             transport_kind: RepTransportKind::default(),
             peer_allowlist: Vec::new(),
             tls_config: None,
+            cascade_feeding: false,
         }
     }
 
@@ -256,6 +285,7 @@ pub struct RepConfigBuilder {
     transport_kind: RepTransportKind,
     peer_allowlist: Vec<String>,
     tls_config: Option<crate::tls::TlsConfig>,
+    cascade_feeding: bool,
 }
 
 impl RepConfigBuilder {
@@ -298,6 +328,17 @@ impl RepConfigBuilder {
     /// Sets the environment home directory (serves `.ndb` files for network restore).
     pub fn env_home(mut self, path: impl Into<PathBuf>) -> Self {
         self.env_home = Some(path.into());
+        self
+    }
+
+    /// Enable chained / replica-to-replica log feeding (default `false`).
+    ///
+    /// When `true`, a node that becomes a replica also runs a feeder source
+    /// on its `PEER_FEEDER` service, serving its OWN WAL to a downstream
+    /// replica (master → R1 → R2).  See [`RepConfig::cascade_feeding`] for
+    /// the JE `FeederSource` citation and the durability bound.
+    pub fn cascade_feeding(mut self, enabled: bool) -> Self {
+        self.cascade_feeding = enabled;
         self
     }
 
@@ -399,6 +440,7 @@ impl RepConfigBuilder {
             transport_kind: self.transport_kind,
             peer_allowlist: self.peer_allowlist,
             tls_config: self.tls_config,
+            cascade_feeding: self.cascade_feeding,
         }
     }
 }

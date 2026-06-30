@@ -187,7 +187,14 @@ pub struct ReplicatedEnvironment {
 
     /// Shutdown flag shared with I/O threads so they terminate when the
     /// environment is closed.
-    io_shutdown: AtomicBool,
+    ///
+    /// Wrapped in an `Arc` so the replica receive thread (which connects to
+    /// an upstream feeder via `catch_up_from_peer`) can poll it directly and
+    /// break out of its blocking receive loop on close — otherwise a node
+    /// whose upstream stays connected (e.g. a mid-tier replica in a chain,
+    /// closed before its upstream) would never observe the close and
+    /// `close()`'s thread-join would hang.
+    io_shutdown: Arc<AtomicBool>,
 
     /// Whether the RESTORE service has been registered on the TCP dispatcher.
     ///
@@ -265,6 +272,16 @@ pub struct ReplicatedEnvironment {
     /// which `EnvironmentLogScanner` then picks up without any
     /// `replicate_entry` call from the application.
     wal_vlsn_counter: Arc<std::sync::atomic::AtomicU64>,
+
+    /// Count of downstream connections this node has served via the JE
+    /// `Feeder`/`MasterFeederSource` mechanism (`FeederRunner +
+    /// EnvironmentLogScanner` reading this node's WAL).  Shared with the
+    /// node's [`crate::stream::peer_feeder::PeerFeederService`] when a WAL
+    /// source is registered (master in `become_master`, or a cascading
+    /// replica in `become_replica`).  A non-zero value PROVES this node fed
+    /// a downstream by the SAME mechanism the master uses — the cascade does
+    /// not diverge.  See [`Self::wal_feeds_served`].
+    wal_feeds_served: Arc<std::sync::atomic::AtomicU64>,
 
     /// REP-10 (C): the replica-side consistency tracker, built from the
     /// REP-7 `last_applied_vlsn` handle when the replica replay thread starts
@@ -497,7 +514,7 @@ impl ReplicatedEnvironment {
             bound_addr,
             env_impl: StdMutex::new(None),
             io_threads: StdMutex::new(Vec::new()),
-            io_shutdown: AtomicBool::new(false),
+            io_shutdown: Arc::new(AtomicBool::new(false)),
             restore_registered: AtomicBool::new(restore_registered_init),
             peer_scanner,
             dtvlsn: std::sync::atomic::AtomicU64::new(0),
@@ -507,6 +524,7 @@ impl ReplicatedEnvironment {
             feeder_queues: std::sync::RwLock::new(HashMap::new()),
             active_feeder_runners: StdMutex::new(HashMap::new()),
             wal_vlsn_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            wal_feeds_served: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             consistency_tracker: StdMutex::new(None),
         };
 
@@ -1689,6 +1707,20 @@ impl ReplicatedEnvironment {
         self.feeders.read().iter().map(|f| f.get_replica_name()).collect()
     }
 
+    /// Number of downstream connections this node has served via the JE
+    /// `Feeder`/`MasterFeederSource` mechanism (`FeederRunner +
+    /// EnvironmentLogScanner` reading this node's OWN WAL).
+    ///
+    /// A non-zero value PROVES this node fed a downstream replica by the
+    /// SAME mechanism the master uses — a cascading replica and the master
+    /// run the identical `PeerFeederService` → `FeederRunner` →
+    /// `EnvironmentLogScanner` path (JE `FeederManager` → `Feeder` →
+    /// `MasterFeederSource`).  Used by the chained-replication test to assert
+    /// the cascade does NOT use the in-memory pull fallback.
+    pub fn wal_feeds_served(&self) -> u64 {
+        self.wal_feeds_served.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     // -----------------------------------------------------------------------
     // C-C2 — active push feeder API
     // -----------------------------------------------------------------------
@@ -2078,6 +2110,42 @@ impl ReplicatedEnvironment {
             }
         }
 
+        // --- WAL-backed PEER_FEEDER for pull-path replicas -------------------
+        //
+        // The master's writes go to its WAL (VLSN-tagged 22-byte headers) and
+        // its VLSN index, but NOT necessarily to the in-memory `peer_scanner`
+        // (e.g. `register_vlsn_typed` only updates the index).  A replica that
+        // pulls via the `PEER_FEEDER` service therefore finds an empty
+        // in-memory scanner and gets `NeedsRestore`.
+        //
+        // Re-register PEER_FEEDER with a WAL-backed source so a pulling
+        // replica receives the VLSN-tagged stream straight from the master's
+        // OWN WAL via the same `EnvironmentLogScanner` + `FeederRunner` used
+        // throughout.  Faithful to JE `MasterFeederSource(repImpl, vlsnIndex,
+        // startVLSN)`, which reads the VLSNIndex + log regardless of node
+        // role; `FeederManager` runs feeders on whatever node holds the data.
+        // (The same registration runs, gated on `cascade_feeding`, in
+        // `become_replica` so a mid-tier replica can cascade downstream.)
+        if let Some(env) = self.env_impl.lock().unwrap().clone()
+            && let Some(ref dispatcher) = self.tcp_dispatcher
+        {
+            let wal_source = crate::stream::peer_feeder::WalFeederSource::new(
+                Arc::clone(&env),
+                Arc::clone(&self.vlsn_index),
+            );
+            let svc = PeerFeederService::with_wal_source_counted(
+                Arc::clone(&self.peer_scanner),
+                wal_source,
+                Arc::clone(&self.wal_feeds_served),
+            );
+            dispatcher.register(PEER_FEEDER_SERVICE_NAME, Arc::new(svc));
+            log::debug!(
+                "Node '{}' (master): PEER_FEEDER now serves replicas from \
+                 its own WAL",
+                self.config.node_name.as_str(),
+            );
+        }
+
         // -------------------------------------------------------------------
 
         // Notify listeners
@@ -2133,6 +2201,57 @@ impl ReplicatedEnvironment {
                 // index (see VLSNIndex).
                 let vlsn_index = Arc::clone(&self.vlsn_index);
 
+                // --- Chained replication: start a WAL-backed feeder source ---
+                //
+                // When `cascade_feeding` is enabled, re-register this node's
+                // PEER_FEEDER service with a WAL-backed source so a DOWNSTREAM
+                // replica can connect and receive the VLSN-tagged log stream
+                // FROM THIS REPLICA's OWN WAL (the bytes it received + persisted
+                // via EnvironmentLogWriter::log_with_vlsn).  The feeder uses the
+                // same EnvironmentLogScanner + FeederRunner the master uses.
+                //
+                // Faithful to JE's cascading-feeder model: the same
+                // FeederManager/Feeder/FeederSource machinery runs on any node
+                // that holds the data.  `FeederSource` is documented as "a real
+                // Master OR a Replica in a Replica chain that is replaying log
+                // records it received from some other source"
+                // (`FeederSource.java`); `MasterFeederSource(repImpl, vlsnIndex,
+                // startVLSN)` reads the VLSNIndex + log regardless of role.
+                //
+                // Default OFF (master-direct) preserves current behaviour: a
+                // replica's PEER_FEEDER stays backed by the in-memory pull
+                // scanner unless cascade is explicitly enabled.
+                if self.config.cascade_feeding {
+                    if let Some(ref dispatcher) = self.tcp_dispatcher {
+                        let wal_source =
+                            crate::stream::peer_feeder::WalFeederSource::new(
+                                Arc::clone(&env),
+                                Arc::clone(&self.vlsn_index),
+                            );
+                        let svc = PeerFeederService::with_wal_source_counted(
+                            Arc::clone(&self.peer_scanner),
+                            wal_source,
+                            Arc::clone(&self.wal_feeds_served),
+                        );
+                        dispatcher
+                            .register(PEER_FEEDER_SERVICE_NAME, Arc::new(svc));
+                        log::info!(
+                            "Node '{}' (replica): cascade feeding ENABLED — \
+                             PEER_FEEDER now serves downstream replicas from \
+                             its own WAL via the SAME FeederRunner + \
+                             EnvironmentLogScanner mechanism the master uses \
+                             (JE Feeder + MasterFeederSource)",
+                            self.config.node_name.as_str(),
+                        );
+                    } else {
+                        log::warn!(
+                            "Node '{}': cascade_feeding set but no TCP \
+                             dispatcher; downstream replicas cannot connect",
+                            self.config.node_name.as_str(),
+                        );
+                    }
+                }
+
                 // Resolve the master's socket address from the GroupService.
                 let master_addr_opt: Option<SocketAddr> = self
                     .group_service
@@ -2148,7 +2267,11 @@ impl ReplicatedEnvironment {
                 let node_name = self.config.node_name.clone();
                 let master = master_name.to_string();
                 let vlsn_index_clone = Arc::clone(&vlsn_index);
-                let shutdown_flag = self.io_shutdown.load(Ordering::SeqCst);
+                // Live shutdown flag (shared Arc): the receive loop polls it
+                // so `close()` can break the blocking upstream receive and
+                // join this thread — vital for a mid-tier replica in a chain
+                // that is closed before its upstream feeder.
+                let shutdown = Arc::clone(&self.io_shutdown);
                 // Wave 9-A fix 2: capture a Weak<Self> so the I/O thread
                 // can call `bootstrap_via_dispatcher` automatically when
                 // the master signals `NeedsRestore`.  When the env was
@@ -2206,12 +2329,18 @@ impl ReplicatedEnvironment {
                         const MAX_AUTO_BOOTSTRAP_ATTEMPTS: u32 = 2;
                         let mut attempts: u32 = 0;
                         loop {
+                            // Observe close before (re)connecting so a
+                            // shutdown between catch-up attempts exits
+                            // promptly.
+                            if shutdown.load(Ordering::SeqCst) {
+                                return;
+                            }
                             log::info!(
                                 "noxu-replica-{}: connecting to master '{}' at {}",
                                 node_name, master, addr,
                             );
-                            match crate::stream::peer_feeder::catch_up_from_peer(
-                                addr, 0, &mut writer,
+                            match crate::stream::peer_feeder::catch_up_from_peer_until(
+                                addr, 0, &mut writer, &shutdown,
                             ) {
                                 Ok(true) => {
                                     log::info!(
@@ -2295,7 +2424,7 @@ impl ReplicatedEnvironment {
                                     }
                                 }
                                 Err(e) => {
-                                    if !shutdown_flag {
+                                    if !shutdown.load(Ordering::SeqCst) {
                                         log::error!(
                                             "noxu-replica-{}: error from master '{}': {e}",
                                             node_name, master,

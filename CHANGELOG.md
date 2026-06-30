@@ -123,6 +123,24 @@ listed in [References](#references).
     never incremented (a pre-existing gap, documented in
     `docs/src/operations/monitoring.md`).
 
+- **Chained / replica-to-replica log feeding (`cascade_feeding`).** A replica
+  can now feed a downstream replica (master → R1 → R2), using the IDENTICAL
+  feeder mechanism the master uses: `FeederRunner` (JE `Feeder`) reading the
+  VLSN-tagged stream from the node's own WAL via `EnvironmentLogScanner`
+  (JE `MasterFeederSource`/`FeederReader` over the VLSN index + WAL), served
+  through `PeerFeederService` (JE `FeederManager`). A replica persists+flushes
+  each received VLSN-tagged entry to its own WAL so its file length advances and
+  its downstream feeder can serve it. Gated by `cascade_feeding` (default off =
+  master-direct, unchanged). The in-memory `replicate_entry` queue is retained
+  only as the env-less convenience source (tests / non-`EnvironmentImpl`
+  callers); it is NOT a second feeder mechanism and never on a production
+  durability path — it feeds through the same `FeederRunner` loop. A
+  `wal_feeds_served` counter proves the cascade rides the WAL feeder path.
+  Ack/durability bound: the master remains the ack/quorum authority; a
+  downstream replica's ack is seen by its immediate upstream but not propagated
+  transitively to the master's commit quorum (documented). Faithful to JE
+  `Feeder`/`FeederManager`/`FeederSource`/`MasterFeederSource`/`FeederReader`.
+
 ## [6.4.2] - 2026-06-29
 
 ### Fixed

@@ -1,24 +1,59 @@
-//! Peer-to-peer log distribution — master-feeder pattern.
+//! Peer-to-peer log distribution — JE's single feeder mechanism.
 //!
-//! Each replica maintains a log range `[first_vlsn,
-//! last_vlsn]` and can act as a feeder for other replicas that need entries
-//! in that range.  This avoids routing all log-shipping traffic through the
-//! master, which would otherwise be the sole bottleneck.
+//! `PeerFeederService` is this node's service-side feeder accept loop —
+//! Noxu's [`com.sleepycat.je.rep.impl.node.FeederManager`]: it is registered
+//! once per node on the TCP dispatcher, and on every inbound connection it
+//! runs ONE [`FeederRunner`] (JE [`com.sleepycat.je.rep.impl.node.Feeder`])
+//! driving a single [`LogScanner`] (JE
+//! [`com.sleepycat.je.rep.stream.FeederSource`]).
 //!
-//! ## Architecture
+//! ## One mechanism, master OR replica (JE fidelity)
 //!
 //! ```text
-//! Master ──► FeederRunner (master feeder) ──► Replica A
-//!                                        ──► Replica B ──► PeerFeederRunner ──► Replica C
+//!   master ──PEER_FEEDER──► R1 ──PEER_FEEDER──► R2
+//!     │  FeederRunner+EnvironmentLogScanner   │  FeederRunner+EnvironmentLogScanner
+//!     └── reads master's WAL ─────────────────┴── reads R1's OWN WAL
 //! ```
 //!
-//! `PeerLogScanner` is a `LogScanner` implementation backed by an
-//! in-memory `VecDeque<(vlsn, entry_type, payload)>`.  It is populated by
-//! the local `ReplicaReceiver` as entries arrive from the master.
+//! JE `FeederSource.java` documents the source as "a real Master OR a
+//! Replica in a Replica chain that is replaying log records it received
+//! from some other source".  JE `Feeder.initMasterFeederSource(startVLSN)`
+//! builds `new MasterFeederSource(repImpl, repNode.getVLSNIndex(), …)`
+//! regardless of node role, and its output loop pulls
+//! `feederSource.getWireRecord(feederVLSN, heartbeatMs)`
+//! (`Feeder.java:1282`).  Noxu mirrors this exactly:
 //!
-//! `PeerFeederRunner` wraps a `FeederRunner` and a `PeerLogScanner`.  The
-//! `GroupService` is queried to find peers that hold the needed VLSN range,
-//! and a `FeederRunner` is spawned to stream entries to the requesting node.
+//! | JE                                   | Noxu                                  |
+//! |--------------------------------------|---------------------------------------|
+//! | `FeederManager` (per-node accept)    | [`PeerFeederService`] (per-node accept) |
+//! | `Feeder` thread + output loop        | [`FeederRunner`] (`run`)              |
+//! | `FeederSource` / `MasterFeederSource`| [`LogScanner`] / [`EnvironmentLogScanner`] |
+//! | `FeederReader` (VLSNIndex+WAL cursor)| [`EnvironmentLogScanner`]             |
+//! | `getWireRecord(vlsn, waitTime)`      | [`LogScanner::next_entry`]            |
+//!
+//! A replica cascading to a downstream replica is the IDENTICAL mechanism as
+//! the master feeding a replica — it just reads from the replica's own WAL
+//! (which carries the entries it received + persisted via
+//! [`crate::stream::replica_stream::EnvironmentLogWriter::log_with_vlsn`]).
+//! Both the master ([`ReplicatedEnvironment::become_master`]) and a
+//! cascading replica ([`ReplicatedEnvironment::become_replica`] with
+//! `cascade_feeding`) register [`PeerFeederService::with_wal_source`], so
+//! both serve downstream via `FeederRunner + EnvironmentLogScanner`.
+//!
+//! [`ReplicatedEnvironment::become_master`]: crate::ReplicatedEnvironment::become_master
+//! [`ReplicatedEnvironment::become_replica`]: crate::ReplicatedEnvironment::become_replica
+//!
+//! ## In-memory queue — non-JE convenience, NOT a production feed
+//!
+//! [`PeerLogScanner`] is a `LogScanner` backed by an in-memory
+//! `VecDeque<(vlsn, entry_type, payload)>`.  It exists ONLY as a fallback
+//! for nodes that have no live `EnvironmentImpl` wired (no WAL to scan) —
+//! e.g. the `replicate_entry` test convenience.  It is NEVER on a
+//! production durability path: every node opened through `with_environment`
+//! registers a WAL source and serves from the WAL.  It still feeds through
+//! the SAME [`FeederRunner`] loop ([`PeerScannerAdapter`] is just another
+//! `LogScanner`), so there is no second feeder mechanism — only a second,
+//! non-JE, non-durable *source* for the env-less case.
 //!
 //! ## CBVLSN
 //!
@@ -38,7 +73,7 @@ use noxu_sync::Mutex;
 use crate::error::{RepError, Result};
 use crate::net::channel::Channel;
 use crate::net::service_dispatcher::ServiceHandler;
-use crate::stream::feeder::{FeederRunner, LogScanner};
+use crate::stream::feeder::{EnvironmentLogScanner, FeederRunner, LogScanner};
 
 /// Service name registered with `TcpServiceDispatcher` for peer log feeds.
 pub const PEER_FEEDER_SERVICE_NAME: &str = "PEER_FEEDER";
@@ -74,8 +109,9 @@ pub const DEFAULT_PEER_SCANNER_MAX_BYTES: usize = 64 * 1024 * 1024;
 /// entries.
 ///
 /// Entries are pushed by the `ReplicaReceiver` as they arrive from the
-/// master (or from another peer).  The `PeerFeederRunner` consumes entries
-/// from this queue and streams them to a downstream replica.
+/// master (or from another peer).  A [`FeederRunner`] driving a
+/// [`PeerScannerAdapter`] consumes entries from this queue and streams them
+/// to a downstream replica (the in-memory, env-less convenience source).
 ///
 /// ## Bounded memory (F10)
 ///
@@ -276,7 +312,9 @@ impl LogScanner for PeerLogScanner {
 /// threads.
 ///
 /// The `ReplicaReceiver` holds an `Arc<PeerFeederSource>` and calls
-/// `push()` as entries arrive. A `PeerFeederRunner` holds another clone
+/// `push()` as entries arrive. A [`FeederRunner`] driving a
+/// [`PeerScannerAdapter`] holds another clone of the inner scanner to stream
+/// the entries to the downstream.
 /// and calls `next_entry()` to stream those entries downstream.
 pub struct PeerFeederSource(pub Arc<PeerLogScanner>);
 
@@ -339,50 +377,6 @@ impl LogScanner for PeerScannerAdapter {
 }
 
 // ---------------------------------------------------------------------------
-// PeerFeederRunner
-// ---------------------------------------------------------------------------
-
-/// Streams log entries from a `PeerLogScanner` to a downstream replica.
-///
-/// This is a thin wrapper around `FeederRunner` that uses a
-/// `PeerScannerAdapter` as the log source instead of reading from disk.
-///
-/// Corresponds to 's peer-to-peer feeder path in `FeederReplicaSyncup`.
-pub struct PeerFeederRunner {
-    inner: FeederRunner,
-    source: Arc<PeerLogScanner>,
-    start_vlsn: u64,
-}
-
-impl PeerFeederRunner {
-    /// Create a new peer feeder that streams entries from `source` to
-    /// `channel`, starting at `start_vlsn`.
-    pub fn new(
-        channel: Arc<dyn Channel>,
-        source: Arc<PeerLogScanner>,
-        start_vlsn: u64,
-    ) -> Self {
-        let inner = FeederRunner::new(channel, start_vlsn);
-        Self { inner, source, start_vlsn }
-    }
-
-    /// Run the peer feeder loop.
-    ///
-    /// Streams entries from the `PeerLogScanner` to the downstream replica.
-    /// Returns when the channel is closed or an I/O error occurs.
-    pub fn run(&self) -> Result<()> {
-        let mut adapter =
-            PeerScannerAdapter::new(Arc::clone(&self.source), self.start_vlsn);
-        self.inner.run(&mut adapter)
-    }
-
-    /// Return the last VLSN acknowledged by the downstream replica.
-    pub fn known_replica_vlsn(&self) -> u64 {
-        self.inner.known_replica_vlsn()
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Syncup helpers
 // ---------------------------------------------------------------------------
 
@@ -440,8 +434,9 @@ pub fn negotiate_syncup(
 /// 1. The downstream sends `[start_vlsn: u64 LE]` (8 bytes) — the first VLSN
 ///    it needs.
 /// 2. The server negotiates via `negotiate_syncup()`.
-/// 3. If the range is available, a `PeerFeederRunner` is spawned in a new
-///    thread and streams entries until the channel closes.
+/// 3. If the range is available, a [`FeederRunner`] (driving an
+///    [`EnvironmentLogScanner`] for the WAL path or a [`PeerScannerAdapter`]
+///    for the in-memory path) streams entries until the channel closes.
 /// 4. If the range is not available, the server responds with
 ///    `[NEEDS_RESTORE: u8 = 1]` and closes the connection.
 ///
@@ -449,12 +444,101 @@ pub fn negotiate_syncup(
 /// `ReplicaReceiver` as entries arrive from the master.
 pub struct PeerFeederService {
     source: Arc<PeerLogScanner>,
+    /// Optional WAL-backed feeder source for chained replication.
+    ///
+    /// When `Some`, the service serves the requested VLSN range from this
+    /// node's OWN WAL via an [`EnvironmentLogScanner`] driven by a
+    /// [`FeederRunner`] — the *same* machinery the master uses
+    /// ([`crate::stream::feeder`]).  This is JE's cascading-feeder model:
+    /// `FeederSource` is "a real Master OR a Replica in a Replica chain that
+    /// is replaying log records it received from some other source"
+    /// (`FeederSource.java`); `MasterFeederSource` reads the VLSNIndex + log
+    /// on whatever node hosts it.
+    ///
+    /// `None` (default) preserves the in-memory `PeerLogScanner` pull path.
+    wal_source: Option<WalFeederSource>,
+    /// Count of downstream connections served via the WAL `FeederRunner` +
+    /// `EnvironmentLogScanner` path (the JE `Feeder` + `MasterFeederSource`
+    /// mechanism).  Lets the owning [`crate::ReplicatedEnvironment`] — and
+    /// tests — PROVE that a cascading replica feeds downstream via the same
+    /// mechanism the master uses, not the in-memory pull fallback.
+    wal_feeds_served: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// WAL-backed feeder source for a chained (replica-to-replica) feed.
+///
+/// Holds a live [`EnvironmentImpl`] (whose WAL carries VLSN-tagged 22-byte
+/// headers written by [`crate::stream::replica_stream::EnvironmentLogWriter`])
+/// and the shared [`VlsnIndex`] used to negotiate the available VLSN range.
+///
+/// Faithful to JE `MasterFeederSource(repImpl, vlsnIndex, startVLSN)` — the
+/// feeder source is constructed from the environment + VLSN index regardless
+/// of whether the node is master or replica.
+#[derive(Clone)]
+pub struct WalFeederSource {
+    env: Arc<noxu_dbi::EnvironmentImpl>,
+    vlsn_index: Arc<crate::vlsn::vlsn_index::VlsnIndex>,
+}
+
+impl WalFeederSource {
+    /// Create a WAL-backed feeder source.
+    pub fn new(
+        env: Arc<noxu_dbi::EnvironmentImpl>,
+        vlsn_index: Arc<crate::vlsn::vlsn_index::VlsnIndex>,
+    ) -> Self {
+        Self { env, vlsn_index }
+    }
 }
 
 impl PeerFeederService {
-    /// Create a new service backed by `source`.
+    /// Create a new service backed by an in-memory `source` (pull path).
     pub fn new(source: Arc<PeerLogScanner>) -> Self {
-        Self { source }
+        Self {
+            source,
+            wal_source: None,
+            wal_feeds_served: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    /// Create a service that ALSO serves the chained-replication WAL feed.
+    ///
+    /// When a downstream replica connects, the service prefers the WAL
+    /// source: it negotiates the VLSN range from the [`VlsnIndex`] and, if
+    /// it can serve, streams entries from this node's WAL via an
+    /// [`EnvironmentLogScanner`] + [`FeederRunner`] (the same path the
+    /// master uses).  If the WAL cannot serve the requested range it falls
+    /// back to the in-memory `source`, then to `NEEDS_RESTORE`.
+    ///
+    /// Used by [`crate::ReplicatedEnvironment::become_replica`] when
+    /// `cascade_feeding` is enabled and a live `EnvironmentImpl` is wired.
+    pub fn with_wal_source(
+        source: Arc<PeerLogScanner>,
+        wal_source: WalFeederSource,
+    ) -> Self {
+        Self {
+            source,
+            wal_source: Some(wal_source),
+            wal_feeds_served: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    /// Like [`Self::with_wal_source`] but shares `wal_feeds_served` with the
+    /// owning [`crate::ReplicatedEnvironment`] so it (and tests) can PROVE
+    /// the node served a downstream via the JE `Feeder`/`MasterFeederSource`
+    /// path (`FeederRunner + EnvironmentLogScanner`).
+    pub fn with_wal_source_counted(
+        source: Arc<PeerLogScanner>,
+        wal_source: WalFeederSource,
+        wal_feeds_served: Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
+        Self { source, wal_source: Some(wal_source), wal_feeds_served }
+    }
+
+    /// Number of downstream connections this service has served via the JE
+    /// `Feeder`/`MasterFeederSource` path (`FeederRunner +
+    /// EnvironmentLogScanner`).  `0` means no cascade/WAL feed has run yet.
+    pub fn wal_feeds_served(&self) -> u64 {
+        self.wal_feeds_served.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -487,7 +571,70 @@ impl ServiceHandler for PeerFeederService {
         let start_vlsn =
             u64::from_le_bytes(msg[..8].try_into().expect("slice of 8 bytes"));
 
-        // 2. Negotiate: do we hold the requested VLSN range?
+        // 2a. Chained replication (cascade): if a WAL source is wired, prefer
+        //     serving the downstream from THIS node's own WAL via the same
+        //     EnvironmentLogScanner + FeederRunner the master uses.  Faithful
+        //     to JE's cascading-feeder model (see `WalFeederSource`).
+        //
+        //     The downstream sends start_vlsn=0 to mean "from the beginning";
+        //     we serve from the first VLSN our VLSNIndex holds.  We can serve
+        //     iff the requested start falls within `[first, last]` (or the
+        //     range is non-empty and start_vlsn==0).
+        if let Some(wal) = &self.wal_source {
+            let range = wal.vlsn_index.get_range();
+            let (first, last) = (range.first(), range.last());
+            let have_data = last > 0 && first > 0;
+            let effective_start =
+                if start_vlsn == 0 { first } else { start_vlsn };
+            let can_serve = have_data
+                && effective_start >= first
+                && effective_start <= last;
+            if can_serve {
+                channel.send(&[PEER_FEEDER_CAN_SERVE])?;
+                let channel_arc: Arc<dyn Channel> = Arc::from(channel);
+                // EnvironmentLogScanner starts at the log beginning and skips
+                // entries with vlsn < effective_start; the FeederRunner then
+                // streams VLSN-ordered entries exactly as the master does.
+                //
+                // JE fidelity: this is JE `Feeder` running `MasterFeederSource`
+                // — `Feeder.initMasterFeederSource(startVLSN)` builds
+                // `new MasterFeederSource(repImpl, repNode.getVLSNIndex(), …)`
+                // and the output loop pulls
+                // `feederSource.getWireRecord(feederVLSN, heartbeatMs)`
+                // (`Feeder.java:1282`).  Here `FeederRunner` IS that loop and
+                // `EnvironmentLogScanner` IS that `MasterFeederSource`
+                // (a `FeederReader` over the VLSNIndex+WAL).  A cascading
+                // replica reaches this branch with `wal.env` = its OWN env, so
+                // it feeds downstream by the IDENTICAL mechanism the master
+                // uses — reading its own WAL.
+                let mut scanner =
+                    match EnvironmentLogScanner::new(&wal.env, None) {
+                        Some(s) => s,
+                        None => {
+                            // WAL scanner unavailable (read-only env / no log):
+                            // the CAN_SERVE byte was already sent, so close the
+                            // channel; the downstream will retry / fall back.
+                            return Err(RepError::NetworkError(
+                                "PEER_FEEDER: WAL scanner unavailable".into(),
+                            ));
+                        }
+                    };
+                // Record (for the env + tests) that THIS connection was served
+                // by the JE `Feeder`/`MasterFeederSource` path — the proof
+                // that the cascade uses the same mechanism as the master.
+                self.wal_feeds_served
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let runner = FeederRunner::new(channel_arc, effective_start);
+                let _ = runner.run(&mut scanner);
+                return Ok(());
+            }
+            // WAL cannot serve the requested range: fall through to the
+            // in-memory pull path, then to NEEDS_RESTORE.  A downstream that
+            // asks for an evicted/old range that the mid-tier no longer holds
+            // must catch up via network restore or fall back to the master.
+        }
+
+        // 2. Negotiate: do we hold the requested VLSN range in memory?
         let range = self.source.log_range();
         match negotiate_syncup(range, start_vlsn) {
             SyncupResult::CanServe { start_vlsn: sv } => {
@@ -496,13 +643,18 @@ impl ServiceHandler for PeerFeederService {
 
                 // 3. Stream entries in this thread (the dispatcher already
                 //    called us from a per-connection thread).
+                //
+                //    SAME feeder loop as the WAL/cascade path: ONE
+                //    `FeederRunner` (JE `Feeder`) driving ONE `LogScanner`
+                //    (JE `FeederSource`).  Here the source is the in-memory
+                //    `PeerScannerAdapter` (non-JE convenience for env-less
+                //    nodes), not the WAL `EnvironmentLogScanner`.  There is no
+                //    second feeder mechanism — only a second source.
                 let channel_arc: Arc<dyn Channel> = Arc::from(channel);
-                let runner = PeerFeederRunner::new(
-                    channel_arc,
-                    Arc::clone(&self.source),
-                    sv,
-                );
-                let _ = runner.run();
+                let mut source =
+                    PeerScannerAdapter::new(Arc::clone(&self.source), sv);
+                let runner = FeederRunner::new(channel_arc, sv);
+                let _ = runner.run(&mut source);
                 Ok(())
             }
             SyncupResult::NeedsRestore => {
@@ -584,6 +736,48 @@ pub fn catch_up_from_peer(
     let channel_arc: Arc<dyn Channel> = Arc::from(channel);
     let receiver = ReplicaReceiver::new(channel_arc);
     receiver.run(log_writer)?;
+
+    Ok(true)
+}
+
+/// Like [`catch_up_from_peer`] but polls `shutdown` so the receive loop can
+/// exit promptly when the environment is closing (used by
+/// [`crate::ReplicatedEnvironment::become_replica`]'s I/O thread so
+/// `close()` can join it even while the upstream feeder stays connected).
+pub fn catch_up_from_peer_until(
+    peer_addr: std::net::SocketAddr,
+    start_vlsn: u64,
+    log_writer: &mut dyn crate::stream::replica_stream::LogWriter,
+    shutdown: &std::sync::atomic::AtomicBool,
+) -> Result<bool> {
+    use crate::net::service_dispatcher::connect_to_service;
+    use crate::stream::replica_stream::ReplicaReceiver;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let channel = connect_to_service(peer_addr, PEER_FEEDER_SERVICE_NAME)?;
+    channel.send(&start_vlsn.to_le_bytes())?;
+    let resp = channel.receive(Duration::from_secs(30))?.ok_or_else(|| {
+        RepError::NetworkError("no response from peer feeder".into())
+    })?;
+    if resp.is_empty() {
+        return Err(RepError::NetworkError(
+            "empty response from peer feeder".into(),
+        ));
+    }
+    match resp[0] {
+        PEER_FEEDER_CAN_SERVE => {}
+        PEER_FEEDER_NEEDS_RESTORE => return Ok(false),
+        other => {
+            return Err(RepError::ProtocolError(format!(
+                "peer feeder unknown response byte: {other:#x}"
+            )));
+        }
+    }
+
+    let channel_arc: Arc<dyn Channel> = Arc::from(channel);
+    let receiver = ReplicaReceiver::new(channel_arc);
+    receiver.run_until(log_writer, Some(shutdown))?;
 
     Ok(true)
 }
@@ -761,11 +955,13 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // PeerFeederRunner integration test
+    // In-memory source streamed via the shared FeederRunner loop
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_peer_feeder_runner_streams_to_replica() {
+    fn test_in_memory_source_streams_to_replica_via_feeder_runner() {
+        // The in-memory `PeerLogScanner` feeds through the SAME `FeederRunner`
+        // loop the WAL path uses — only the `LogScanner` source differs.
         let source = Arc::new(PeerLogScanner::new());
         for v in [10u64, 11, 12, 13, 14] {
             source.push(v, 1, format!("payload-{v}").into_bytes());
@@ -796,11 +992,11 @@ mod tests {
             })
         };
 
-        let runner =
-            PeerFeederRunner::new(Arc::clone(&sender), Arc::clone(&source), 10);
         let sender_clone = Arc::clone(&sender);
         let run_handle = std::thread::spawn(move || {
-            let _ = runner.run();
+            let mut adapter = PeerScannerAdapter::new(Arc::clone(&source), 10);
+            let runner = FeederRunner::new(sender, 10);
+            let _ = runner.run(&mut adapter);
         });
 
         // Wait for receiver to collect all 5 frames.
@@ -1190,13 +1386,12 @@ mod tests {
     }
 
     #[test]
-    fn test_peer_feeder_runner_known_replica_vlsn_initial_zero() {
+    fn test_feeder_runner_known_replica_vlsn_initial_zero() {
         use crate::net::channel::LocalChannelPair;
 
         let pair = LocalChannelPair::new();
         let channel: Arc<dyn Channel> = Arc::new(pair.channel_a);
-        let source = Arc::new(PeerLogScanner::new());
-        let runner = PeerFeederRunner::new(channel, source, 1);
+        let runner = FeederRunner::new(channel, 1);
         assert_eq!(runner.known_replica_vlsn(), 0);
     }
 

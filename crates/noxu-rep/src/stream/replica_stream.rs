@@ -135,15 +135,60 @@ impl LogWriter for EnvironmentLogWriter {
         // Write to the local WAL.  Replicated entries are non-provisional and
         // do not require an immediate fsync on every entry (the master already
         // fsynced before sending).
-        let lsn = self
-            .log_manager
-            .log(log_entry_type, payload, Provisional::No, false, false)
-            .map_err(|e| {
-                crate::error::RepError::DatabaseError(format!(
-                    "replica log write failed: {}",
-                    e
-                ))
-            })?;
+        //
+        // Chained replication: re-log the entry preserving the master's
+        // ORIGINAL VLSN via `log_with_vlsn`, so the replica's WAL carries a
+        // VLSN-tagged 22-byte header identical in shape to the master's.
+        // This makes the replica's own WAL a valid `FeederSource` for a
+        // downstream replica (an `EnvironmentLogScanner` reads the VLSN from
+        // the 22-byte header).  Faithful to JE `Replay.logReplicatedEntry`,
+        // which logs the received record preserving its VLSN so the replica's
+        // VLSNIndex + log are a feeder source for a replica chain (see
+        // `FeederSource` javadoc: "a Replica in a Replica chain that is
+        // replaying log records it received from some other source").  Plain
+        // `log()` would write a 14-byte no-VLSN header that no downstream
+        // feeder could scan.
+        //
+        // vlsn=0 is reserved as NULL_VLSN; entries without a VLSN fall back to
+        // the plain `log()` path (these are never streamed downstream).
+        //
+        // Chained replication / flush-to-OS (NOT fsync): we write the received
+        // entry with `flush_required = true, fsync_required = false`.  The
+        // flush pushes the buffered bytes out to the OS file so the entry's
+        // file length is visible to a DOWNSTREAM feeder's
+        // `EnvironmentLogScanner` (which reads `FileManager::get_file_length`)
+        // — without it the entry would sit in the in-memory `LogBuffer`, the
+        // on-disk file length would not advance, and a cascading replica would
+        // see nothing to feed.  We deliberately do NOT fsync: durability of
+        // the forwarded stream is the master's responsibility (it fsynced
+        // before sending), so the replica only needs the OS to make the bytes
+        // readable, not crash-durable.  Faithful to JE `Replay`, which flushes
+        // received entries to its log so its VLSNIndex + log are a valid
+        // `FeederSource` for a replica chain, without forcing a per-entry
+        // fsync on the replay path.
+        let lsn = if vlsn > 0 {
+            self.log_manager.log_with_vlsn(
+                log_entry_type,
+                payload,
+                vlsn,
+                /*flush_required=*/ true,
+                /*fsync_required=*/ false,
+            )
+        } else {
+            self.log_manager.log(
+                log_entry_type,
+                payload,
+                Provisional::No,
+                /*flush_required=*/ true,
+                /*fsync_required=*/ false,
+            )
+        }
+        .map_err(|e| {
+            crate::error::RepError::DatabaseError(format!(
+                "replica log write failed: {}",
+                e
+            ))
+        })?;
 
         // Register VLSN → LSN in the replica's VLSN index so that
         // FeederRunner/ack tracking can correlate positions.  Dispatch the
@@ -219,6 +264,8 @@ impl ReplicaReceiver {
     /// Each successfully received entry is passed to `log_writer`; then an
     /// ack `[vlsn: 8 bytes LE]` is sent back to the master.
     ///
+    /// Equivalent to [`Self::run_until`] with no shutdown flag.
+    ///
     /// # Anti-replay / VLSN-ordering enforcement (LOG-7)
     ///
     /// The replica MUST observe strictly-increasing VLSNs across the
@@ -241,20 +288,50 @@ impl ReplicaReceiver {
     /// stream can recover from a single bad frame; a repeated stream of
     /// unknowns will surface via the operator alerting on the error log).
     pub fn run(&self, log_writer: &mut dyn LogWriter) -> Result<()> {
-        let recv_timeout = Duration::from_secs(30);
+        self.run_until(log_writer, None)
+    }
+
+    /// Run the replica receive loop, polling an optional `shutdown` flag.
+    ///
+    /// Identical to [`Self::run`] but, when `shutdown` is `Some`, the loop
+    /// returns `Ok(())` as soon as the flag is observed `true` — including on
+    /// each receive timeout.  This lets `ReplicatedEnvironment::close()`
+    /// break a replica receive thread whose upstream feeder stays connected
+    /// (e.g. a mid-tier replica in a chain closed before its upstream), which
+    /// would otherwise block the thread-join in `close()`.  The receive
+    /// timeout is shortened to 1s so close is responsive.
+    pub fn run_until(
+        &self,
+        log_writer: &mut dyn LogWriter,
+        shutdown: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        // A short timeout when a shutdown flag is wired keeps close()
+        // responsive; without one, keep the original 30s budget.
+        let recv_timeout = if shutdown.is_some() {
+            Duration::from_secs(1)
+        } else {
+            Duration::from_secs(30)
+        };
         // LOG-7: strictly-increasing VLSN high-water mark.  0 == NULL_VLSN
         // (never assigned by the master), so "<= high-water" rejects 0
         // too once a real VLSN has arrived.
         let mut received_vlsn_high_water: u64 = 0;
 
         loop {
+            if let Some(flag) = shutdown
+                && flag.load(Ordering::SeqCst)
+            {
+                return Ok(());
+            }
             // ----------------------------------------------------------------
             // Receive the next framed entry from the feeder.
             // ----------------------------------------------------------------
             let frame = match self.channel.receive(recv_timeout) {
                 Ok(Some(f)) => f,
                 Ok(None) => {
-                    // Timeout with no data — keep waiting.
+                    // Timeout with no data — keep waiting (loop top re-checks
+                    // the shutdown flag).
                     continue;
                 }
                 Err(RepError::ChannelClosed(_)) => {
