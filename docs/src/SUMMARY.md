@@ -74,6 +74,7 @@
   - [Performance Tuning](operations/tuning.md)
   - [Backup](operations/backup.md)
   - [Recovery Procedures](operations/recovery-ops.md)
+  - [Admin Tooling (dump / load / print-log)](operations/admin-tooling.md)
   - [Operational Runbooks](operations/runbooks.md)
   - [Power-Loss Testing](operations/power-loss.md)
   - [Numerical Baseline](operations/numerical-baseline.md)

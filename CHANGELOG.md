@@ -17,6 +17,37 @@ listed in [References](#references).
 
 ### Added
 
+- **Admin tooling: `dump` / `load` / `print-log` CLI (`noxu-admin`).** A new
+  binary (`crates/noxu-db/src/bin/noxu_admin.rs`, built as `noxu-admin`)
+  provides three read-mostly utilities, faithful ports of BDB-JE
+  `com.sleepycat.je.util.DbDump` / `DbLoad` / `DbPrintLog` (+ `CmdUtil`).
+  **`dump`** opens the environment read-only, walks a database cursor, and
+  writes the classic `db_dump` text format (`VERSION=3` header,
+  `format=print`/`format=bytevalue`, `type=btree`, `dupsort=0/1`,
+  `HEADER=END`, then alternating space-prefixed key/data lines terminated by
+  `DATA=END`). Byte encoding is byte-for-byte JE `CmdUtil.formatEntry`:
+  printable ASCII (33..126) literal with backslash doubled, non-printable as
+  `\HH`, or all-hex in `bytevalue` mode — so the format is **binary-safe**
+  (round-trips non-UTF-8 keys/values losslessly). **`load`** is the inverse
+  (`DbLoad`): it parses the header and puts each key/data pair in a single
+  transaction into the (auto-created) target database; `-n` selects
+  no-overwrite mode. **`print-log`** walks the WAL via a read-only
+  `FileManager` + `LogFileReader` (no recovery; works on a closed env),
+  printing `lsn=… type=… size=…` per entry plus decoded txn id and key/data
+  sizes for LN and Txn-end entries, with `-S` for a per-type summary.
+  Argument parsing is a small hand-rolled JE-style flag parser (no new
+  dependency — the core engine keeps its dependency set minimal).
+  Headline test (`crates/noxu-db/tests/admin_cli_test.rs`): `dump | load`
+  round-trips an all-256-byte-values record, newline/backslash/NUL bytes, and
+  duplicate keys in both `print` and `bytevalue` formats; `print-log` emits
+  the TxnCommit + insert-LN entries for known writes. Also adds
+  `Database::get_sorted_duplicates()` (reads the opened `DatabaseImpl`'s real
+  dup-sort flag, mirroring JE `getConfig().getSortedDuplicates()` after
+  `DbInternal.setUseExistingConfig`). **Dup-sort caveat**: Noxu does not
+  persist the sorted-duplicates flag across a reopen, so `dump` cannot
+  auto-detect it — pass `-D` to dump a duplicates database (symmetric to JE
+  `DbLoad -c dupsort=true`). See `docs/src/operations/admin-tooling.md`.
+
 - **Disk-limit enforcement (`MAX_DISK` / `FREE_DISK`).** The `noxu.maxDisk` /
   `noxu.freeDisk` config parameters are now enforced on the user-write path,
   a faithful port of BDB-JE's disk-limit machinery
