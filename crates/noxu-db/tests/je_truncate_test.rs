@@ -36,7 +36,7 @@ fn ikey(i: u32) -> DatabaseEntry {
 fn populate(db: &noxu_db::Database, env: &noxu_db::Environment, n: u32) {
     let txn = env.begin_transaction(None).unwrap();
     for i in 0..n {
-        db.put_in(&txn, &ikey(i), &ikey(i)).unwrap();
+        db.put_in(&txn, ikey(i), ikey(i)).unwrap();
     }
     txn.commit().unwrap();
 }
@@ -109,7 +109,7 @@ fn truncate_then_write_succeeds_no_deadlock() {
     let db = open_db(&env, DB_NAME);
     let txn = env.begin_transaction(None).unwrap();
     for i in 0..10u32 {
-        db.put_in(&txn, &ikey(i), &ikey(i)).unwrap();
+        db.put_in(&txn, ikey(i), ikey(i)).unwrap();
     }
     txn.commit().unwrap();
     assert_eq!(db.count().unwrap(), 10);
@@ -177,6 +177,6 @@ fn truncate_then_get_returns_not_found() {
 
     let db = open_db(&env, DB_NAME);
     let mut out = DatabaseEntry::new();
-    let s = db.get_into(None, &ikey(0), &mut out).unwrap();
+    let s = db.get_into(None, ikey(0), &mut out).unwrap();
     assert!(!s);
 }

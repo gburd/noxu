@@ -32,7 +32,7 @@ fn open_env_db(
 
 fn collect_all_kv(db: &noxu_db::Database) -> Vec<(Vec<u8>, Vec<u8>)> {
     let mut out = Vec::new();
-    let mut c = db.open_cursor( None).unwrap();
+    let mut c = db.open_cursor(None).unwrap();
     let mut k = DatabaseEntry::new();
     let mut d = DatabaseEntry::new();
     let mut s = c.get(&mut k, &mut d, Get::First, None).unwrap();
@@ -156,9 +156,11 @@ fn sr9465_part2_delete_reinsert_redelete_abort_restores_no_dups() {
             for i in 0..NUM_RECS {
                 let k = i.to_be_bytes().to_vec();
                 let val_bytes = format!("orig-{i}").into_bytes();
-                db.put_in(&txn1,
-                    &DatabaseEntry::from_bytes(&k),
-                    &DatabaseEntry::from_bytes(&val_bytes))
+                db.put_in(
+                    &txn1,
+                    DatabaseEntry::from_bytes(&k),
+                    DatabaseEntry::from_bytes(&val_bytes),
+                )
                 .unwrap();
                 v.push((k, val_bytes));
             }
@@ -168,16 +170,18 @@ fn sr9465_part2_delete_reinsert_redelete_abort_restores_no_dups() {
 
         let txn2 = env.begin_transaction(None).unwrap();
         for (k, _) in &expected {
-            db.delete_in(&txn2, &DatabaseEntry::from_bytes(k)).unwrap();
+            db.delete_in(&txn2, DatabaseEntry::from_bytes(k)).unwrap();
         }
         for (k, _) in &expected {
-            db.put_in(&txn2,
-                &DatabaseEntry::from_bytes(k),
-                &DatabaseEntry::from_bytes(b"new"))
+            db.put_in(
+                &txn2,
+                DatabaseEntry::from_bytes(k),
+                DatabaseEntry::from_bytes(b"new"),
+            )
             .unwrap();
         }
         for (k, _) in &expected {
-            db.delete_in(&txn2, &DatabaseEntry::from_bytes(k)).unwrap();
+            db.delete_in(&txn2, DatabaseEntry::from_bytes(k)).unwrap();
         }
         txn2.abort().unwrap();
 
@@ -209,24 +213,29 @@ fn sr9752_part1_abort_after_committed_write_reverts_no_dups() {
         let (env, db) = open_env_db(&path, "sr9752p1", false);
         // Commit an initial value.
         let txn1 = env.begin_transaction(None).unwrap();
-        db.put_in(&txn1,
-            &DatabaseEntry::from_bytes(b"k"),
-            &DatabaseEntry::from_bytes(b"committed"))
+        db.put_in(
+            &txn1,
+            DatabaseEntry::from_bytes(b"k"),
+            DatabaseEntry::from_bytes(b"committed"),
+        )
         .unwrap();
         txn1.commit().unwrap();
 
         // Abort an overwrite.
         let txn2 = env.begin_transaction(None).unwrap();
-        db.put_in(&txn2,
-            &DatabaseEntry::from_bytes(b"k"),
-            &DatabaseEntry::from_bytes(b"aborted"))
+        db.put_in(
+            &txn2,
+            DatabaseEntry::from_bytes(b"k"),
+            DatabaseEntry::from_bytes(b"aborted"),
+        )
         .unwrap();
         txn2.abort().unwrap();
 
         // Pre-recovery: original value must still be visible.
         let mut out = DatabaseEntry::new();
-        let s =
-            db.get_into(None, &DatabaseEntry::from_bytes(b"k"), &mut out).unwrap();
+        let s = db
+            .get_into(None, DatabaseEntry::from_bytes(b"k"), &mut out)
+            .unwrap();
         assert!(s);
         assert_eq!(out.get_data().unwrap(), b"committed");
 
@@ -237,7 +246,8 @@ fn sr9752_part1_abort_after_committed_write_reverts_no_dups() {
     // Recovery: reopen and verify the same.
     let (env2, db2) = open_env_db(&path, "sr9752p1", false);
     let mut out2 = DatabaseEntry::new();
-    let s = db2.get_into(None, &DatabaseEntry::from_bytes(b"k"), &mut out2).unwrap();
+    let s =
+        db2.get_into(None, DatabaseEntry::from_bytes(b"k"), &mut out2).unwrap();
     assert!(s);
     assert_eq!(
         out2.get_data().unwrap(),
@@ -266,14 +276,14 @@ fn sr9752_part2_abort_after_committed_dups_reverts_with_dups() {
         let txn1 = env.begin_transaction(None).unwrap();
         let key = DatabaseEntry::from_bytes(b"k");
         for d in [b"a".as_slice(), b"b", b"c"] {
-            db.put_in(&txn1, &key, &DatabaseEntry::from_bytes(d)).unwrap();
+            db.put_in(&txn1, &key, DatabaseEntry::from_bytes(d)).unwrap();
         }
         txn1.commit().unwrap();
 
         // Abort additional dups.
         let txn2 = env.begin_transaction(None).unwrap();
         for d in [b"x".as_slice(), b"y", b"z"] {
-            db.put_in(&txn2, &key, &DatabaseEntry::from_bytes(d)).unwrap();
+            db.put_in(&txn2, &key, DatabaseEntry::from_bytes(d)).unwrap();
         }
         txn2.abort().unwrap();
 

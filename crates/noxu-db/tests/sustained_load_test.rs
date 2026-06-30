@@ -222,7 +222,7 @@ fn test_checkpoint_under_load_30s() {
                     let val = vec![b'v'; 64];
                     let k = DatabaseEntry::from_bytes(key.as_bytes());
                     let v = DatabaseEntry::from_bytes(&val);
-                    db.put( &k, &v).unwrap();
+                    db.put(&k, &v).unwrap();
                     seq += 1;
                 }
             })
@@ -309,7 +309,7 @@ fn test_cleaner_reduces_log_files_under_load() {
         let k = DatabaseEntry::from_bytes(key.as_bytes());
         let v = DatabaseEntry::from_bytes(&val);
         let t = Instant::now();
-        db.put( &k, &v).unwrap();
+        db.put(&k, &v).unwrap();
         assert!(
             t.elapsed() < stall_limit,
             "put stalled on initial write k={i}"
@@ -325,7 +325,7 @@ fn test_cleaner_reduces_log_files_under_load() {
             let k = DatabaseEntry::from_bytes(key.as_bytes());
             let v = DatabaseEntry::from_bytes(&val);
             let t = Instant::now();
-            db.put( &k, &v).unwrap();
+            db.put(&k, &v).unwrap();
             assert!(
                 t.elapsed() < stall_limit,
                 "put stalled on overwrite pass={pass} k={i}"

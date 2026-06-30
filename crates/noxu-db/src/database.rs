@@ -19,6 +19,7 @@ use crate::sequence_config::SequenceConfig;
 use crate::stats_config::StatsConfig;
 use crate::transaction::Transaction;
 use crate::write_options::WriteOptions;
+use bytes::Bytes;
 use noxu_dbi::{
     CursorImpl, DatabaseImpl, EnvironmentImpl, GetMode, PutMode, SearchMode,
     ThroughputStats,
@@ -26,7 +27,6 @@ use noxu_dbi::{
 use noxu_log::LogManager;
 use noxu_sync::{Mutex, RwLock};
 use noxu_txn::{Durability, LockManager, Txn, TxnManager, UndoRecord};
-use bytes::Bytes;
 use noxu_util::lsn::Lsn;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -52,7 +52,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 ///
 /// let key = DatabaseEntry::from_bytes(b"key1");
 /// let value = DatabaseEntry::from_bytes(b"value1");
-/// db.put(None, &key, &value).unwrap();
+/// db.put( &key, &value).unwrap();
 ///
 /// db.close().unwrap();
 /// env.close().unwrap();
@@ -1034,9 +1034,7 @@ impl Database {
                 cursor
                     .put(key_bytes, data_bytes, PutMode::NoOverwrite)
                     .map_err(NoxuError::from)
-                    .map(|s| {
-                        !matches!(s, noxu_dbi::OperationStatus::KeyExist)
-                    })
+                    .map(|s| !matches!(s, noxu_dbi::OperationStatus::KeyExist))
             })?,
         };
         if inserted {
@@ -1953,12 +1951,11 @@ mod tests {
         let key = DatabaseEntry::from_bytes(b"key1");
         let value = DatabaseEntry::from_bytes(b"value1");
 
-        let result = db.put(None, &key, &value).unwrap();
-        assert_eq!(result, OperationStatus::Success);
+        db.put(&key, &value).unwrap();
 
         let mut retrieved = DatabaseEntry::new();
-        let result = db.get(None, &key, &mut retrieved).unwrap();
-        assert_eq!(result, OperationStatus::Success);
+        let result = db.get_into(None, &key, &mut retrieved).unwrap();
+        assert!(result);
         assert_eq!(retrieved.get_data().unwrap(), b"value1");
     }
 
@@ -1969,8 +1966,8 @@ mod tests {
         let key = DatabaseEntry::from_bytes(b"nonexistent");
         let mut data = DatabaseEntry::new();
 
-        let result = db.get(None, &key, &mut data).unwrap();
-        assert_eq!(result, OperationStatus::NotFound);
+        let result = db.get_into(None, &key, &mut data).unwrap();
+        assert!(!result);
     }
 
     /// ("partial-put length
@@ -1983,13 +1980,13 @@ mod tests {
         let (_temp_dir, _env, db) = temp_env_and_db();
 
         let key = DatabaseEntry::from_bytes(b"k");
-        db.put(None, &key, &DatabaseEntry::from_bytes(b"hello world")).unwrap();
+        db.put(&key, DatabaseEntry::from_bytes(b"hello world")).unwrap();
 
         // Partial offset=6, partial_length=5 ("world"), but only 3 bytes
         // supplied.  Used to silently truncate; now rejected.
         let mut patch = DatabaseEntry::from_bytes(b"abc");
         patch.set_partial(6, 5, true);
-        let err = db.put(None, &key, &patch).unwrap_err();
+        let err = db.put(&key, &patch).unwrap_err();
         assert!(
             matches!(err, NoxuError::IllegalArgument(_)),
             "expected IllegalArgument, got {err:?}"
@@ -2003,8 +2000,8 @@ mod tests {
         // The on-disk record is unchanged because the call returned
         // before any write.
         let mut buf = DatabaseEntry::new();
-        let status = db.get(None, &key, &mut buf).unwrap();
-        assert_eq!(status, OperationStatus::Success);
+        let status = db.get_into(None, &key, &mut buf).unwrap();
+        assert!(status);
         assert_eq!(buf.get_data().unwrap(), b"hello world");
     }
 
@@ -2015,14 +2012,14 @@ mod tests {
         let (_temp_dir, _env, db) = temp_env_and_db();
 
         let key = DatabaseEntry::from_bytes(b"k");
-        db.put(None, &key, &DatabaseEntry::from_bytes(b"hello world")).unwrap();
+        db.put(&key, DatabaseEntry::from_bytes(b"hello world")).unwrap();
 
         let mut patch = DatabaseEntry::from_bytes(b"WORLD");
         patch.set_partial(6, 5, true);
-        db.put(None, &key, &patch).unwrap();
+        db.put(&key, &patch).unwrap();
 
         let mut buf = DatabaseEntry::new();
-        db.get(None, &key, &mut buf).unwrap();
+        db.get_into(None, &key, &mut buf).unwrap();
         assert_eq!(buf.get_data().unwrap(), b"hello WORLD");
     }
 
@@ -2034,11 +2031,11 @@ mod tests {
         let value1 = DatabaseEntry::from_bytes(b"value1");
         let value2 = DatabaseEntry::from_bytes(b"value2");
 
-        db.put(None, &key, &value1).unwrap();
-        db.put(None, &key, &value2).unwrap();
+        db.put(&key, &value1).unwrap();
+        db.put(&key, &value2).unwrap();
 
         let mut retrieved = DatabaseEntry::new();
-        db.get(None, &key, &mut retrieved).unwrap();
+        db.get_into(None, &key, &mut retrieved).unwrap();
         assert_eq!(retrieved.get_data().unwrap(), b"value2");
     }
 
@@ -2049,8 +2046,8 @@ mod tests {
         let key = DatabaseEntry::from_bytes(b"key1");
         let value = DatabaseEntry::from_bytes(b"value1");
 
-        let result = db.put_no_overwrite(None, &key, &value).unwrap();
-        assert_eq!(result, OperationStatus::Success);
+        let result = db.put_no_overwrite(&key, &value).unwrap();
+        assert!(result);
     }
 
     #[test]
@@ -2061,13 +2058,13 @@ mod tests {
         let value1 = DatabaseEntry::from_bytes(b"value1");
         let value2 = DatabaseEntry::from_bytes(b"value2");
 
-        db.put(None, &key, &value1).unwrap();
-        let result = db.put_no_overwrite(None, &key, &value2).unwrap();
-        assert_eq!(result, OperationStatus::KeyExists);
+        db.put(&key, &value1).unwrap();
+        let result = db.put_no_overwrite(&key, &value2).unwrap();
+        assert!(!result);
 
         // Verify original value is unchanged
         let mut retrieved = DatabaseEntry::new();
-        db.get(None, &key, &mut retrieved).unwrap();
+        db.get_into(None, &key, &mut retrieved).unwrap();
         assert_eq!(retrieved.get_data().unwrap(), b"value1");
     }
 
@@ -2078,13 +2075,13 @@ mod tests {
         let key = DatabaseEntry::from_bytes(b"key1");
         let value = DatabaseEntry::from_bytes(b"value1");
 
-        db.put(None, &key, &value).unwrap();
-        let result = db.delete(None, &key).unwrap();
-        assert_eq!(result, OperationStatus::Success);
+        db.put(&key, &value).unwrap();
+        let result = db.delete(&key).unwrap();
+        assert!(result);
 
         let mut retrieved = DatabaseEntry::new();
-        let result = db.get(None, &key, &mut retrieved).unwrap();
-        assert_eq!(result, OperationStatus::NotFound);
+        let result = db.get_into(None, &key, &mut retrieved).unwrap();
+        assert!(!result);
     }
 
     #[test]
@@ -2092,8 +2089,8 @@ mod tests {
         let (_temp_dir, _env, db) = temp_env_and_db();
 
         let key = DatabaseEntry::from_bytes(b"nonexistent");
-        let result = db.delete(None, &key).unwrap();
-        assert_eq!(result, OperationStatus::NotFound);
+        let result = db.delete(&key).unwrap();
+        assert!(!result);
     }
 
     #[test]
@@ -2104,15 +2101,15 @@ mod tests {
 
         let key1 = DatabaseEntry::from_bytes(b"key1");
         let value1 = DatabaseEntry::from_bytes(b"value1");
-        db.put(None, &key1, &value1).unwrap();
+        db.put(&key1, &value1).unwrap();
         assert_eq!(db.count().unwrap(), 1);
 
         let key2 = DatabaseEntry::from_bytes(b"key2");
         let value2 = DatabaseEntry::from_bytes(b"value2");
-        db.put(None, &key2, &value2).unwrap();
+        db.put(&key2, &value2).unwrap();
         assert_eq!(db.count().unwrap(), 2);
 
-        db.delete(None, &key1).unwrap();
+        db.delete(&key1).unwrap();
         assert_eq!(db.count().unwrap(), 1);
     }
 
@@ -2141,12 +2138,12 @@ mod tests {
         let value = DatabaseEntry::from_bytes(b"value1");
         let mut data = DatabaseEntry::new();
 
-        assert!(db.get(None, &key, &mut data).is_err());
-        assert!(db.put(None, &key, &value).is_err());
-        assert!(db.put_no_overwrite(None, &key, &value).is_err());
-        assert!(db.delete(None, &key).is_err());
+        assert!(db.get_into(None, &key, &mut data).is_err());
+        assert!(db.put(&key, &value).is_err());
+        assert!(db.put_no_overwrite(&key, &value).is_err());
+        assert!(db.delete(&key).is_err());
         assert!(db.count().is_err());
-        assert!(db.open_cursor(None, None).is_err());
+        assert!(db.open_cursor(None).is_err());
     }
 
     #[test]
@@ -2174,9 +2171,9 @@ mod tests {
         let value = DatabaseEntry::from_bytes(b"value1");
 
         // Write operations should fail
-        assert!(db.put(None, &key, &value).is_err());
-        assert!(db.put_no_overwrite(None, &key, &value).is_err());
-        assert!(db.delete(None, &key).is_err());
+        assert!(db.put(&key, &value).is_err());
+        assert!(db.put_no_overwrite(&key, &value).is_err());
+        assert!(db.delete(&key).is_err());
     }
 
     #[test]
@@ -2196,14 +2193,14 @@ mod tests {
         let value1 = DatabaseEntry::from_bytes(b"value1");
         let value2 = DatabaseEntry::from_bytes(b"value2");
 
-        db1.put(None, &key, &value1).unwrap();
-        db2.put(None, &key, &value2).unwrap();
+        db1.put(&key, &value1).unwrap();
+        db2.put(&key, &value2).unwrap();
 
         let mut retrieved1 = DatabaseEntry::new();
         let mut retrieved2 = DatabaseEntry::new();
 
-        db1.get(None, &key, &mut retrieved1).unwrap();
-        db2.get(None, &key, &mut retrieved2).unwrap();
+        db1.get_into(None, &key, &mut retrieved1).unwrap();
+        db2.get_into(None, &key, &mut retrieved2).unwrap();
 
         assert_eq!(retrieved1.get_data().unwrap(), b"value1");
         assert_eq!(retrieved2.get_data().unwrap(), b"value2");
@@ -2216,12 +2213,11 @@ mod tests {
         let empty_key = DatabaseEntry::from_bytes(b"");
         let empty_value = DatabaseEntry::from_bytes(b"");
 
-        let result = db.put(None, &empty_key, &empty_value).unwrap();
-        assert_eq!(result, OperationStatus::Success);
+        db.put(&empty_key, &empty_value).unwrap();
 
         let mut retrieved = DatabaseEntry::new();
-        let result = db.get(None, &empty_key, &mut retrieved).unwrap();
-        assert_eq!(result, OperationStatus::Success);
+        let result = db.get_into(None, &empty_key, &mut retrieved).unwrap();
+        assert!(result);
         assert_eq!(retrieved.get_data().unwrap(), b"");
     }
 
@@ -2232,10 +2228,10 @@ mod tests {
         let large_key = DatabaseEntry::from_bytes(&vec![b'k'; 1000]);
         let large_value = DatabaseEntry::from_bytes(&vec![b'v'; 10000]);
 
-        db.put(None, &large_key, &large_value).unwrap();
+        db.put(&large_key, &large_value).unwrap();
 
         let mut retrieved = DatabaseEntry::new();
-        db.get(None, &large_key, &mut retrieved).unwrap();
+        db.get_into(None, &large_key, &mut retrieved).unwrap();
         assert_eq!(retrieved.get_data().unwrap().len(), 10000);
         assert!(retrieved.get_data().unwrap().iter().all(|&b| b == b'v'));
     }
@@ -2247,10 +2243,10 @@ mod tests {
         let binary_key = DatabaseEntry::from_bytes(&[0u8, 1, 2, 255, 254, 253]);
         let binary_value = DatabaseEntry::from_bytes(&[255u8, 0, 128, 64, 32]);
 
-        db.put(None, &binary_key, &binary_value).unwrap();
+        db.put(&binary_key, &binary_value).unwrap();
 
         let mut retrieved = DatabaseEntry::new();
-        db.get(None, &binary_key, &mut retrieved).unwrap();
+        db.get_into(None, &binary_key, &mut retrieved).unwrap();
         assert_eq!(retrieved.get_data().unwrap(), &[255u8, 0, 128, 64, 32]);
     }
 
@@ -2265,15 +2261,13 @@ mod tests {
     fn test_scan_all_kv_returns_records() {
         let (_temp_dir, _env, db) = temp_env_and_db();
         db.put(
-            None,
-            &DatabaseEntry::from_vec(vec![1]),
-            &DatabaseEntry::from_vec(vec![10]),
+            DatabaseEntry::from_vec(vec![1]),
+            DatabaseEntry::from_vec(vec![10]),
         )
         .unwrap();
         db.put(
-            None,
-            &DatabaseEntry::from_vec(vec![2]),
-            &DatabaseEntry::from_vec(vec![20]),
+            DatabaseEntry::from_vec(vec![2]),
+            DatabaseEntry::from_vec(vec![20]),
         )
         .unwrap();
         let kv = db.scan_all_kv().unwrap();
@@ -2284,15 +2278,13 @@ mod tests {
     fn test_scan_all_kv_then_delete() {
         let (_temp_dir, _env, db) = temp_env_and_db();
         db.put(
-            None,
-            &DatabaseEntry::from_vec(vec![1]),
-            &DatabaseEntry::from_vec(vec![10]),
+            DatabaseEntry::from_vec(vec![1]),
+            DatabaseEntry::from_vec(vec![10]),
         )
         .unwrap();
         db.put(
-            None,
-            &DatabaseEntry::from_vec(vec![2]),
-            &DatabaseEntry::from_vec(vec![20]),
+            DatabaseEntry::from_vec(vec![2]),
+            DatabaseEntry::from_vec(vec![20]),
         )
         .unwrap();
 
@@ -2300,14 +2292,8 @@ mod tests {
         assert_eq!(kv.len(), 2);
 
         for (k, _v) in &kv {
-            let status =
-                db.delete(None, &DatabaseEntry::from_vec(k.clone())).unwrap();
-            assert_eq!(
-                status,
-                OperationStatus::Success,
-                "delete failed for key {:?}",
-                k
-            );
+            let status = db.delete(DatabaseEntry::from_vec(k.clone())).unwrap();
+            assert!(status, "delete failed for key {:?}", k);
         }
 
         let count = db.count().unwrap();
@@ -2322,9 +2308,8 @@ mod tests {
             let key_bytes = id.to_be_bytes().to_vec();
             let val_bytes = format!("user{}", id).into_bytes();
             db.put(
-                None,
-                &DatabaseEntry::from_vec(key_bytes),
-                &DatabaseEntry::from_vec(val_bytes),
+                DatabaseEntry::from_vec(key_bytes),
+                DatabaseEntry::from_vec(val_bytes),
             )
             .unwrap();
         }
@@ -2334,14 +2319,8 @@ mod tests {
         assert_eq!(records.len(), 2);
 
         for (k, _v) in records {
-            let status =
-                db.delete(None, &DatabaseEntry::from_vec(k.clone())).unwrap();
-            assert_eq!(
-                status,
-                OperationStatus::Success,
-                "delete failed for u64 key {:?}",
-                k
-            );
+            let status = db.delete(DatabaseEntry::from_vec(k.clone())).unwrap();
+            assert!(status, "delete failed for u64 key {:?}", k);
         }
         assert_eq!(db.count().unwrap(), 0);
     }
@@ -2357,8 +2336,8 @@ mod tests {
         let key_none = DatabaseEntry::new(); // no data set
         let mut data = DatabaseEntry::new();
 
-        let result = db.get(None, &key_none, &mut data).unwrap();
-        assert_eq!(result, OperationStatus::NotFound);
+        let result = db.get_into(None, &key_none, &mut data).unwrap();
+        assert!(!result);
     }
 
     /// delete() with a None-data DatabaseEntry returns NotFound.
@@ -2367,8 +2346,8 @@ mod tests {
         let (_temp_dir, _env, db) = temp_env_and_db();
         let key_none = DatabaseEntry::new();
 
-        let result = db.delete(None, &key_none).unwrap();
-        assert_eq!(result, OperationStatus::NotFound);
+        let result = db.delete(&key_none).unwrap();
+        assert!(!result);
     }
 
     /// open_cursor() with a CursorConfig that has read_uncommitted=true makes
@@ -2379,7 +2358,7 @@ mod tests {
         let (_temp_dir, _env, db) = temp_env_and_db();
 
         let config = CursorConfig::new().with_read_uncommitted(true);
-        let cursor = db.open_cursor(None, Some(&config)).unwrap();
+        let cursor = db.open_cursor(Some(&config)).unwrap();
         assert!(cursor.is_read_only());
     }
 
@@ -2388,7 +2367,7 @@ mod tests {
     #[test]
     fn test_open_cursor_no_config_writable_db_is_writable() {
         let (_temp_dir, _env, db) = temp_env_and_db();
-        let cursor = db.open_cursor(None, None).unwrap();
+        let cursor = db.open_cursor(None).unwrap();
         assert!(!cursor.is_read_only());
     }
 
@@ -2417,7 +2396,7 @@ mod tests {
 
         let key = DatabaseEntry::from_bytes(b"k");
         let val = DatabaseEntry::from_bytes(b"v");
-        let result = db.put_no_overwrite(None, &key, &val);
+        let result = db.put_no_overwrite(&key, &val);
         assert!(result.is_err());
     }
 
@@ -2434,7 +2413,7 @@ mod tests {
         noxu_dbi::set_cursor_fail_after(1); // fail on the 1st check_state (search)
         let key = DatabaseEntry::from_bytes(b"any");
         let mut data = DatabaseEntry::new();
-        let result = db.get(None, &key, &mut data);
+        let result = db.get_into(None, &key, &mut data);
         noxu_dbi::clear_cursor_fail_flag();
         assert!(result.is_err());
     }
@@ -2445,16 +2424,15 @@ mod tests {
         let (_tmp, _env, db) = temp_env_and_db();
         // Insert a key so search can succeed.
         db.put(
-            None,
-            &DatabaseEntry::from_bytes(b"k"),
-            &DatabaseEntry::from_bytes(b"v"),
+            DatabaseEntry::from_bytes(b"k"),
+            DatabaseEntry::from_bytes(b"v"),
         )
         .unwrap();
         // fail on the 2nd check (check_initialized inside get_current).
         noxu_dbi::set_cursor_fail_after(2);
         let key = DatabaseEntry::from_bytes(b"k");
         let mut data = DatabaseEntry::new();
-        let result = db.get(None, &key, &mut data);
+        let result = db.get_into(None, &key, &mut data);
         noxu_dbi::clear_cursor_fail_flag();
         assert!(result.is_err());
     }
@@ -2466,7 +2444,7 @@ mod tests {
         noxu_dbi::set_cursor_fail_after(1);
         let key = DatabaseEntry::from_bytes(b"k");
         let val = DatabaseEntry::from_bytes(b"v");
-        let result = db.put(None, &key, &val);
+        let result = db.put(&key, &val);
         noxu_dbi::clear_cursor_fail_flag();
         assert!(result.is_err());
     }
@@ -2478,7 +2456,7 @@ mod tests {
         noxu_dbi::set_cursor_fail_after(1);
         let key = DatabaseEntry::from_bytes(b"k");
         let val = DatabaseEntry::from_bytes(b"v");
-        let result = db.put_no_overwrite(None, &key, &val);
+        let result = db.put_no_overwrite(&key, &val);
         noxu_dbi::clear_cursor_fail_flag();
         assert!(result.is_err());
     }
@@ -2489,7 +2467,7 @@ mod tests {
         let (_tmp, _env, db) = temp_env_and_db();
         noxu_dbi::set_cursor_fail_after(1);
         let key = DatabaseEntry::from_bytes(b"k");
-        let result = db.delete(None, &key);
+        let result = db.delete(&key);
         noxu_dbi::clear_cursor_fail_flag();
         assert!(result.is_err());
     }
@@ -2499,15 +2477,14 @@ mod tests {
     fn test_delete_delete_map_err_via_hook() {
         let (_tmp, _env, db) = temp_env_and_db();
         db.put(
-            None,
-            &DatabaseEntry::from_bytes(b"k"),
-            &DatabaseEntry::from_bytes(b"v"),
+            DatabaseEntry::from_bytes(b"k"),
+            DatabaseEntry::from_bytes(b"v"),
         )
         .unwrap();
         // fail on the 2nd check_state (the delete() call, after search succeeds).
         noxu_dbi::set_cursor_fail_after(2);
         let key = DatabaseEntry::from_bytes(b"k");
-        let result = db.delete(None, &key);
+        let result = db.delete(&key);
         noxu_dbi::clear_cursor_fail_flag();
         assert!(result.is_err());
     }
@@ -2523,36 +2500,32 @@ mod tests {
 
         // Insert three distinct keys.
         db.put(
-            None,
-            &DatabaseEntry::from_bytes(b"a"),
-            &DatabaseEntry::from_bytes(b"1"),
+            DatabaseEntry::from_bytes(b"a"),
+            DatabaseEntry::from_bytes(b"1"),
         )
         .unwrap();
         db.put(
-            None,
-            &DatabaseEntry::from_bytes(b"b"),
-            &DatabaseEntry::from_bytes(b"2"),
+            DatabaseEntry::from_bytes(b"b"),
+            DatabaseEntry::from_bytes(b"2"),
         )
         .unwrap();
         db.put(
-            None,
-            &DatabaseEntry::from_bytes(b"c"),
-            &DatabaseEntry::from_bytes(b"3"),
+            DatabaseEntry::from_bytes(b"c"),
+            DatabaseEntry::from_bytes(b"3"),
         )
         .unwrap();
         assert_eq!(db.count().unwrap(), 3);
 
         // Overwrite an existing key — count must NOT change.
         db.put(
-            None,
-            &DatabaseEntry::from_bytes(b"a"),
-            &DatabaseEntry::from_bytes(b"updated"),
+            DatabaseEntry::from_bytes(b"a"),
+            DatabaseEntry::from_bytes(b"updated"),
         )
         .unwrap();
         assert_eq!(db.count().unwrap(), 3);
 
         // Delete one key — count decrements.
-        db.delete(None, &DatabaseEntry::from_bytes(b"b")).unwrap();
+        db.delete(DatabaseEntry::from_bytes(b"b")).unwrap();
         assert_eq!(db.count().unwrap(), 2);
     }
 
@@ -2562,9 +2535,8 @@ mod tests {
     fn test_count_unaffected_by_cursor_fail_hook() {
         let (_tmp, _env, db) = temp_env_and_db();
         db.put(
-            None,
-            &DatabaseEntry::from_bytes(b"k"),
-            &DatabaseEntry::from_bytes(b"v"),
+            DatabaseEntry::from_bytes(b"k"),
+            DatabaseEntry::from_bytes(b"v"),
         )
         .unwrap();
         noxu_dbi::set_cursor_fail_after(1);
@@ -2590,9 +2562,8 @@ mod tests {
     fn test_scan_all_kv_get_current_map_err_via_hook() {
         let (_tmp, _env, db) = temp_env_and_db();
         db.put(
-            None,
-            &DatabaseEntry::from_bytes(b"k"),
-            &DatabaseEntry::from_bytes(b"v"),
+            DatabaseEntry::from_bytes(b"k"),
+            DatabaseEntry::from_bytes(b"v"),
         )
         .unwrap();
         // fail on the 2nd check (check_initialized inside get_current, after get_first succeeds).
@@ -2607,9 +2578,8 @@ mod tests {
     fn test_scan_all_kv_retrieve_next_map_err_via_hook() {
         let (_tmp, _env, db) = temp_env_and_db();
         db.put(
-            None,
-            &DatabaseEntry::from_bytes(b"k"),
-            &DatabaseEntry::from_bytes(b"v"),
+            DatabaseEntry::from_bytes(b"k"),
+            DatabaseEntry::from_bytes(b"v"),
         )
         .unwrap();
         // fail on the 3rd check (retrieve_next, after get_first and get_current succeed).
@@ -2623,9 +2593,8 @@ mod tests {
     fn test_sync_on_open_database_succeeds() {
         let (_tmp, _env, db) = temp_env_and_db();
         db.put(
-            None,
-            &DatabaseEntry::from_bytes(b"key"),
-            &DatabaseEntry::from_bytes(b"val"),
+            DatabaseEntry::from_bytes(b"key"),
+            DatabaseEntry::from_bytes(b"val"),
         )
         .unwrap();
         assert!(db.sync().is_ok());
@@ -2656,7 +2625,7 @@ mod tests {
         for i in 0u32..20 {
             let k = DatabaseEntry::from_bytes(&i.to_be_bytes());
             let v = DatabaseEntry::from_bytes(&(i * 2).to_be_bytes());
-            db.put(None, &k, &v).unwrap();
+            db.put(&k, &v).unwrap();
         }
         let config = VerifyConfig::default();
         let result = db.verify(&config).unwrap();
@@ -2681,13 +2650,12 @@ mod tests {
         let (_tmp, _env, db) = temp_env_and_db();
         let key = DatabaseEntry::from_bytes(b"ropt_key");
         let val = DatabaseEntry::from_bytes(b"ropt_val");
-        db.put(None, &key, &val).unwrap();
+        db.put(&key, &val).unwrap();
 
         let opts = ReadOptions::new();
-        let mut out = DatabaseEntry::new();
-        let status = db.get_with_options(None, &key, &mut out, &opts).unwrap();
-        assert_eq!(status, OperationStatus::Success);
-        assert_eq!(out.get_data().unwrap(), b"ropt_val");
+        let out = db.get_with_options(None, &key, &opts).unwrap();
+        assert!(out.is_some());
+        assert_eq!(out.unwrap().as_ref(), b"ropt_val");
     }
 
     #[test]
@@ -2696,13 +2664,12 @@ mod tests {
         let (_tmp, _env, db) = temp_env_and_db();
         let key = DatabaseEntry::from_bytes(b"ru_key");
         let val = DatabaseEntry::from_bytes(b"ru_val");
-        db.put(None, &key, &val).unwrap();
+        db.put(&key, &val).unwrap();
 
         let opts = ReadOptions::read_uncommitted();
-        let mut out = DatabaseEntry::new();
-        let status = db.get_with_options(None, &key, &mut out, &opts).unwrap();
-        assert_eq!(status, OperationStatus::Success);
-        assert_eq!(out.get_data().unwrap(), b"ru_val");
+        let out = db.get_with_options(None, &key, &opts).unwrap();
+        assert!(out.is_some());
+        assert_eq!(out.unwrap().as_ref(), b"ru_val");
     }
 
     #[test]
@@ -2711,9 +2678,8 @@ mod tests {
         let (_tmp, _env, db) = temp_env_and_db();
         let key = DatabaseEntry::from_bytes(b"missing");
         let opts = ReadOptions::new();
-        let mut out = DatabaseEntry::new();
-        let status = db.get_with_options(None, &key, &mut out, &opts).unwrap();
-        assert_eq!(status, OperationStatus::NotFound);
+        let out = db.get_with_options(None, &key, &opts).unwrap();
+        assert!(out.is_none());
     }
 
     #[test]
@@ -2723,11 +2689,10 @@ mod tests {
         let key = DatabaseEntry::from_bytes(b"wopt_key");
         let val = DatabaseEntry::from_bytes(b"wopt_val");
         let opts = WriteOptions::new();
-        let status = db.put_with_options(None, &key, &val, &opts).unwrap();
-        assert_eq!(status, OperationStatus::Success);
+        db.put_with_options(None, &key, &val, &opts).unwrap();
 
         let mut out = DatabaseEntry::new();
-        db.get(None, &key, &mut out).unwrap();
+        db.get_into(None, &key, &mut out).unwrap();
         assert_eq!(out.get_data().unwrap(), b"wopt_val");
     }
 
@@ -2739,12 +2704,11 @@ mod tests {
         let val = DatabaseEntry::from_bytes(b"ttl_val");
         // TTL of 1 hour — the record is not yet expired so it should be readable
         let opts = WriteOptions::with_expiration(1);
-        let status = db.put_with_options(None, &key, &val, &opts).unwrap();
-        assert_eq!(status, OperationStatus::Success);
+        db.put_with_options(None, &key, &val, &opts).unwrap();
 
         let mut out = DatabaseEntry::new();
-        let read_status = db.get(None, &key, &mut out).unwrap();
-        assert_eq!(read_status, OperationStatus::Success);
+        let read_status = db.get_into(None, &key, &mut out).unwrap();
+        assert!(read_status);
         assert_eq!(out.get_data().unwrap(), b"ttl_val");
     }
 
@@ -2770,7 +2734,7 @@ mod tests {
         let (_tmp, _env, db) = temp_env_and_db();
         let none_key = DatabaseEntry::new();
         let val = DatabaseEntry::from_bytes(b"v");
-        let result = db.put(None, &none_key, &val);
+        let result = db.put(&none_key, &val);
         assert!(matches!(result, Err(NoxuError::IllegalArgument(_))));
     }
 
@@ -2780,7 +2744,7 @@ mod tests {
         let (_tmp, _env, db) = temp_env_and_db();
         let none_key = DatabaseEntry::new();
         let val = DatabaseEntry::from_bytes(b"v");
-        let result = db.put_no_overwrite(None, &none_key, &val);
+        let result = db.put_no_overwrite(&none_key, &val);
         assert!(matches!(result, Err(NoxuError::IllegalArgument(_))));
     }
 
@@ -2802,8 +2766,7 @@ mod tests {
         let (_tmp, _env, db) = temp_env_and_db();
         let empty_key = DatabaseEntry::from_bytes(b"");
         let val = DatabaseEntry::from_bytes(b"v");
-        let status = db.put(None, &empty_key, &val).unwrap();
-        assert_eq!(status, OperationStatus::Success);
+        db.put(&empty_key, &val).unwrap();
     }
 
     // ── X-13: env-invalidity checks propagate through check_open ──────────────
@@ -2818,7 +2781,7 @@ mod tests {
         // Write a record so there is something to read.
         let key = DatabaseEntry::from_bytes(b"k");
         let val = DatabaseEntry::from_bytes(b"v");
-        db.put(None, &key, &val).unwrap();
+        db.put(&key, &val).unwrap();
 
         // Flip io_invalid via the cached LogManager.
         let lm = db.log_manager.as_ref().expect("WAL env must have LogManager");
@@ -2826,14 +2789,14 @@ mod tests {
 
         // db.get must now fail.
         let mut out = DatabaseEntry::new();
-        let result = db.get(None, &key, &mut out);
+        let result = db.get_into(None, &key, &mut out);
         assert!(
             matches!(result, Err(NoxuError::EnvironmentFailure { .. })),
             "expected EnvironmentFailure, got {result:?}"
         );
 
         // db.put must also fail.
-        let result2 = db.put(None, &key, &val);
+        let result2 = db.put(&key, &val);
         assert!(
             matches!(result2, Err(NoxuError::EnvironmentFailure { .. })),
             "expected EnvironmentFailure on put, got {result2:?}"
@@ -2854,10 +2817,10 @@ mod tests {
         // Insert a record.
         let key = DatabaseEntry::from_bytes(b"ck");
         let val = DatabaseEntry::from_bytes(b"cv");
-        db.put(None, &key, &val).unwrap();
+        db.put(&key, &val).unwrap();
 
         // Open a cursor BEFORE invalidating.
-        let mut cursor = db.open_cursor(None, None).unwrap();
+        let mut cursor = db.open_cursor(None).unwrap();
 
         // Now directly flip the env_invalid flag.
         db.env_invalid.store(true, Ordering::Release);

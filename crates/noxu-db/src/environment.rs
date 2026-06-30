@@ -2242,7 +2242,7 @@ mod tests {
         for i in 0u32..10 {
             let k = DatabaseEntry::from_bytes(&i.to_be_bytes());
             let v = DatabaseEntry::from_bytes(&(i * 3).to_be_bytes());
-            db.put(None, &k, &v).unwrap();
+            db.put(&k, &v).unwrap();
         }
 
         let verify_cfg = VerifyConfig::default();
@@ -2623,21 +2623,18 @@ mod tests {
             .with_transactional(true);
         let db = env.open_database(None, "cln2db", &db_config).unwrap();
         db.put(
-            None,
-            &DatabaseEntry::from_bytes(b"alpha"),
-            &DatabaseEntry::from_bytes(b"1"),
+            DatabaseEntry::from_bytes(b"alpha"),
+            DatabaseEntry::from_bytes(b"1"),
         )
         .unwrap();
         db.put(
-            None,
-            &DatabaseEntry::from_bytes(b"beta"),
-            &DatabaseEntry::from_bytes(b"2"),
+            DatabaseEntry::from_bytes(b"beta"),
+            DatabaseEntry::from_bytes(b"2"),
         )
         .unwrap();
         db.put(
-            None,
-            &DatabaseEntry::from_bytes(b"gamma"),
-            &DatabaseEntry::from_bytes(b"3"),
+            DatabaseEntry::from_bytes(b"gamma"),
+            DatabaseEntry::from_bytes(b"3"),
         )
         .unwrap();
 

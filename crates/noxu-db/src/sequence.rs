@@ -195,7 +195,8 @@ impl<'db> Sequence<'db> {
         let data_entry = DatabaseEntry::from_bytes(&encoded);
 
         // putNoOverwrite so a concurrent creator wins and we just read theirs.
-        let inserted = db.put_no_overwrite(key_entry.data(), data_entry.data())?;
+        let inserted =
+            db.put_no_overwrite(key_entry.data(), data_entry.data())?;
         let final_rec = if !inserted {
             // Lost the race — read the winner's record.
             match db.get(key_entry.data())? {
@@ -419,8 +420,8 @@ impl<'db> Sequence<'db> {
             };
             let encoded = Self::encode_record(&rec);
             match txn {
-                Some(t) => self.db.put_in(t, &self.key, &encoded)?,
-                None => self.db.put(&self.key, &encoded)?,
+                Some(t) => self.db.put_in(t, &self.key, encoded)?,
+                None => self.db.put(&self.key, encoded)?,
             }
 
             // Update the local cache window using batch_start (pre-advance).

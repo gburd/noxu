@@ -50,17 +50,15 @@ fn database_put_existing_overwrite_round_trip() {
         let d = ikey(i);
 
         // Insert.
-        let s = db.put_in(&txn, &k, &d).unwrap();
-        assert_eq!(s, OperationStatus::Success);
+        db.put_in(&txn, &k, &d).unwrap();
 
         let mut out = DatabaseEntry::new();
         let s = db.get_into(Some(&txn), &k, &mut out).unwrap();
-        assert_eq!(s, OperationStatus::Success);
+        assert!(s);
         assert_eq!(out.get_data().unwrap(), d.get_data().unwrap());
 
         // Re-insert (overwrite).
-        let s = db.put_in(&txn, &k, &d).unwrap();
-        assert_eq!(s, OperationStatus::Success);
+        db.put_in(&txn, &k, &d).unwrap();
 
         // Round-trip via cursor SearchBoth.
         let mut c = db.open_cursor_in(&txn, None).unwrap();
@@ -93,12 +91,11 @@ fn database_zero_length_data_round_trip_with_recovery() {
         for i in (1..=NUM_RECS).rev() {
             let k = ikey(i);
             let d = DatabaseEntry::from_bytes(&[]);
-            let s = db.put_in(&txn, &k, &d).unwrap();
-            assert_eq!(s, OperationStatus::Success);
+            db.put_in(&txn, &k, &d).unwrap();
 
             let mut out = DatabaseEntry::new();
             let s = db.get_into(Some(&txn), &k, &mut out).unwrap();
-            assert_eq!(s, OperationStatus::Success);
+            assert!(s);
             assert!(out.get_data().is_some_and(|b| b.is_empty()));
         }
         txn.commit().unwrap();
@@ -120,7 +117,7 @@ fn database_zero_length_data_round_trip_with_recovery() {
         let k = ikey(i);
         let mut out = DatabaseEntry::new();
         let s = db.get_into(Some(&txn), &k, &mut out).unwrap();
-        assert_eq!(s, OperationStatus::Success);
+        assert!(s);
         assert!(
             out.get_data().is_some_and(|b| b.is_empty()),
             "zero-length data must survive recovery for key {i}"
@@ -145,7 +142,7 @@ fn database_delete_non_dup() {
 
     let txn = env.begin_transaction(None).unwrap();
     for i in (1..=NUM_RECS).rev() {
-        db.put_in(&txn, &ikey(i), &ikey(i)).unwrap();
+        db.put_in(&txn, ikey(i), ikey(i)).unwrap();
     }
     for i in (1..=NUM_RECS).rev() {
         let k = ikey(i);
@@ -177,21 +174,21 @@ fn database_delete_with_dups_removes_all() {
     let txn = env.begin_transaction(None).unwrap();
     const NUM_DUPS: u32 = 4;
     for i in (1..=NUM_RECS).rev() {
-        db.put_in(&txn, &ikey(i), &ikey(i)).unwrap();
+        db.put_in(&txn, ikey(i), ikey(i)).unwrap();
         for j in 0..NUM_DUPS {
-            db.put_in(&txn, &ikey(i), &ikey(i + j)).unwrap();
+            db.put_in(&txn, ikey(i), ikey(i + j)).unwrap();
         }
     }
     txn.commit().unwrap();
 
     let txn = env.begin_transaction(None).unwrap();
     for i in (1..=NUM_RECS).rev() {
-        let s = db.delete_in(&txn, &ikey(i)).unwrap();
+        let s = db.delete_in(&txn, ikey(i)).unwrap();
         assert!(s);
         let mut out = DatabaseEntry::new();
-        let s = db.get_into(Some(&txn), &ikey(i), &mut out).unwrap();
+        let s = db.get_into(Some(&txn), ikey(i), &mut out).unwrap();
         assert!(!s);
-        let s = db.delete_in(&txn, &ikey(i)).unwrap();
+        let s = db.delete_in(&txn, ikey(i)).unwrap();
         assert!(!s);
     }
     txn.commit().unwrap();
@@ -214,7 +211,7 @@ fn database_delete_abort_restores_record() {
     {
         let t = env.begin_transaction(None).unwrap();
         for i in (1..=NUM_RECS).rev() {
-            db.put_in(&t, &ikey(i), &ikey(i)).unwrap();
+            db.put_in(&t, ikey(i), ikey(i)).unwrap();
         }
         t.commit().unwrap();
     }
@@ -222,17 +219,15 @@ fn database_delete_abort_restores_record() {
 
     // Delete inside a txn, then abort.
     let txn = env.begin_transaction(None).unwrap();
-    let s = db.delete_in(&txn, &ikey(delkey)).unwrap();
+    let s = db.delete_in(&txn, ikey(delkey)).unwrap();
     assert!(s);
     txn.abort().unwrap();
 
     // After abort, the record must be readable in a fresh txn.
     let t2 = env.begin_transaction(None).unwrap();
     let mut out = DatabaseEntry::new();
-    let s = db.get_into(Some(&t2), &ikey(delkey), &mut out).unwrap();
-    assert!(s,
-        "record must reappear after delete is aborted"
-    );
+    let s = db.get_into(Some(&t2), ikey(delkey), &mut out).unwrap();
+    assert!(s, "record must reappear after delete is aborted");
     assert_eq!(out.get_data().unwrap(), ikey(delkey).get_data().unwrap());
     t2.commit().unwrap();
 }
@@ -253,9 +248,9 @@ fn database_put_duplicate_creates_distinct_dups() {
     let txn = env.begin_transaction(None).unwrap();
     let mut expected_records = 0u64;
     for i in (1..=NUM_RECS).rev() {
-        db.put_in(&txn, &ikey(i), &ikey(i)).unwrap();
+        db.put_in(&txn, ikey(i), ikey(i)).unwrap();
         expected_records += 1;
-        db.put_in(&txn, &ikey(i), &ikey(i * 2)).unwrap();
+        db.put_in(&txn, ikey(i), ikey(i * 2)).unwrap();
         expected_records += 1;
     }
     txn.commit().unwrap();
@@ -286,12 +281,12 @@ fn database_put_no_dup_data_rejects_exact_pair() {
         let k = ikey(i);
         let d = ikey(i);
         let s = c.put(&k, &d, Put::NoDupData).unwrap();
-        ;
+        assert_eq!(s, OperationStatus::Success);
         let s = c.put(&k, &d, Put::NoDupData).unwrap();
-        ;
+        assert_eq!(s, OperationStatus::KeyExists);
         let d2 = ikey(i + 1);
         let s = c.put(&k, &d2, Put::NoDupData).unwrap();
-        ;
+        assert_eq!(s, OperationStatus::Success);
     }
     drop(c);
     txn.commit().unwrap();
@@ -334,7 +329,7 @@ fn database_count_returns_record_count() {
 
     let txn = env.begin_transaction(None).unwrap();
     for i in (1..=NUM_RECS).rev() {
-        db.put_in(&txn, &ikey(i), &ikey(i)).unwrap();
+        db.put_in(&txn, ikey(i), ikey(i)).unwrap();
     }
     let c = db.count().unwrap();
     assert_eq!(c, NUM_RECS as u64);
@@ -412,25 +407,27 @@ fn database_config_is_transactional() {
     assert!(db.get_config().transactional);
 
     // Implicit-auto-commit put (txn=None) is accepted on a txn DB.
-    db.put(
-        &DatabaseEntry::from_bytes(&[0]),
-        &DatabaseEntry::from_bytes(&[0]))
-    .unwrap();
+    db.put(DatabaseEntry::from_bytes(&[0]), DatabaseEntry::from_bytes(&[0]))
+        .unwrap();
 
     // Explicit-txn put + get on the same txn handle is accepted.
-    db.put_in(&txn,
-        &DatabaseEntry::from_bytes(&[1]),
-        &DatabaseEntry::from_bytes(&[1]))
+    db.put_in(
+        &txn,
+        DatabaseEntry::from_bytes(&[1]),
+        DatabaseEntry::from_bytes(&[1]),
+    )
     .unwrap();
     let mut out = DatabaseEntry::new();
-    let s =
-        db.get_into(Some(&txn), &DatabaseEntry::from_bytes(&[1]), &mut out).unwrap();
+    let s = db
+        .get_into(Some(&txn), DatabaseEntry::from_bytes(&[1]), &mut out)
+        .unwrap();
     assert!(s);
     txn.commit().unwrap();
 
     // After commit, no-txn read sees the record.
     let mut out = DatabaseEntry::new();
-    let s = db.get_into(None, &DatabaseEntry::from_bytes(&[1]), &mut out).unwrap();
+    let s =
+        db.get_into(None, DatabaseEntry::from_bytes(&[1]), &mut out).unwrap();
     assert!(s);
 
     db.close().unwrap();
@@ -456,10 +453,8 @@ fn database_config_open_read_only_rejects_writes() {
     let cfg_rw =
         DatabaseConfig::new().with_allow_create(true).with_transactional(true);
     let db = env.open_database(None, "testDB2", &cfg_rw).unwrap();
-    db.put(
-        &DatabaseEntry::from_bytes(&[0]),
-        &DatabaseEntry::from_bytes(&[0]))
-    .unwrap();
+    db.put(DatabaseEntry::from_bytes(&[0]), DatabaseEntry::from_bytes(&[0]))
+        .unwrap();
     db.close().unwrap();
 
     // Re-open read-only.  Reads succeed.
@@ -470,19 +465,19 @@ fn database_config_open_read_only_rejects_writes() {
     assert!(db_ro.get_config().transactional);
 
     let mut out = DatabaseEntry::new();
-    let s =
-        db_ro.get_into(None, &DatabaseEntry::from_bytes(&[0]), &mut out).unwrap();
-    assert_eq!(s, OperationStatus::Success);
+    let s = db_ro
+        .get_into(None, DatabaseEntry::from_bytes(&[0]), &mut out)
+        .unwrap();
+    assert!(s);
     assert_eq!(out.data(), &[0]);
 
     // Writes fail.
-    let r = db_ro.put(
-        &DatabaseEntry::from_bytes(&[1]),
-        &DatabaseEntry::from_bytes(&[1]));
+    let r = db_ro
+        .put(DatabaseEntry::from_bytes(&[1]), DatabaseEntry::from_bytes(&[1]));
     assert!(r.is_err(), "put on read-only db must fail; got {:?}", r);
 
     // Cursor delete fails as well.
-    let mut c = db_ro.open_cursor( None).unwrap();
+    let mut c = db_ro.open_cursor(None).unwrap();
     let mut k = DatabaseEntry::new();
     let mut d = DatabaseEntry::new();
     let s = c.get(&mut k, &mut d, Get::First, None).unwrap();
@@ -556,12 +551,8 @@ fn multi_env_open_close_test_multi_open_close() {
             env.open_database(None, "MultiEnvOpenCloseTest", &db_cfg).unwrap();
         for i in 0..N_RECORDS {
             let mut out = DatabaseEntry::new();
-            let s = db.get_into(None, &ikey(i), &mut out).unwrap();
-            assert_eq!(
-                OperationStatus::Success,
-                s,
-                "k={i} should survive reopen"
-            );
+            let s = db.get_into(None, ikey(i), &mut out).unwrap();
+            assert!(s, "k={i} should survive reopen");
         }
         db.close().unwrap();
         drop(env);
@@ -634,7 +625,8 @@ fn database_put_no_overwrite_in_dup_db_txn() {
         let d2 = ikey(i << 1);
         db.put_in(&txn, &k, &d2).unwrap();
         let d3 = ikey(i << 2);
-        assert!(!(db.put_no_overwrite_in(&txn, &k, &d3).unwrap()),
+        assert!(
+            !(db.put_no_overwrite_in(&txn, &k, &d3).unwrap()),
             "key already has dups; put_no_overwrite of same key must return KeyExists"
         );
         assert!(db.delete_in(&txn, &k).unwrap());
@@ -659,16 +651,17 @@ fn database_put_no_overwrite_in_dup_db_no_txn() {
         let k = ikey(i);
         let d = ikey(i);
 
-        assert!(db.put_no_overwrite( &k, &d).unwrap());
-        assert!(!(db.put_no_overwrite( &k, &d).unwrap()));
+        assert!(db.put_no_overwrite(&k, &d).unwrap());
+        assert!(!(db.put_no_overwrite(&k, &d).unwrap()));
         let d2 = ikey(i << 1);
-        db.put( &k, &d2).unwrap();
+        db.put(&k, &d2).unwrap();
         let d3 = ikey(i << 2);
-        assert!(!(db.put_no_overwrite( &k, &d3).unwrap()),
+        assert!(
+            !(db.put_no_overwrite(&k, &d3).unwrap()),
             "key already has dups; put_no_overwrite must return KeyExists"
         );
-        assert!(db.delete( &k).unwrap());
-        assert!(db.put_no_overwrite( &k, &d3).unwrap());
+        assert!(db.delete(&k).unwrap());
+        assert!(db.put_no_overwrite(&k, &d3).unwrap());
     }
 }
 
@@ -694,14 +687,14 @@ fn database_count_with_deleted_entries() {
     let (env, db) = open_env_db(&dir, "count_del", false);
     let txn = env.begin_transaction(None).unwrap();
     for i in 0..NUM_RECS {
-        db.put_in(&txn, &ikey(i), &ikey(i)).unwrap();
+        db.put_in(&txn, ikey(i), ikey(i)).unwrap();
     }
     txn.commit().unwrap();
     assert_eq!(db.count().unwrap() as u32, NUM_RECS);
 
     let txn = env.begin_transaction(None).unwrap();
     for i in 0..(NUM_RECS / 2) {
-        db.delete_in(&txn, &ikey(i)).unwrap();
+        db.delete_in(&txn, ikey(i)).unwrap();
     }
     txn.commit().unwrap();
     assert_eq!(db.count().unwrap() as u32, NUM_RECS - NUM_RECS / 2);
@@ -714,7 +707,7 @@ fn database_count_dups_counts_each_dup() {
     let txn = env.begin_transaction(None).unwrap();
     let k = DatabaseEntry::from_bytes(b"k");
     for i in 0u32..7 {
-        db.put_in(&txn, &k, &DatabaseEntry::from_bytes(&i.to_be_bytes()))
+        db.put_in(&txn, &k, DatabaseEntry::from_bytes(&i.to_be_bytes()))
             .unwrap();
     }
     txn.commit().unwrap();
@@ -769,9 +762,11 @@ fn environment_read_only_rejects_db_name_ops() {
             .with_transactional(true);
         let db = env.open_database(None, "db1", &dbcfg).unwrap();
         let txn = env.begin_transaction(None).unwrap();
-        db.put_in(&txn,
-            &DatabaseEntry::from_bytes(&[0u8; 10]),
-            &DatabaseEntry::from_bytes(&[0u8; 10]))
+        db.put_in(
+            &txn,
+            DatabaseEntry::from_bytes(&[0u8; 10]),
+            DatabaseEntry::from_bytes(&[0u8; 10]),
+        )
         .unwrap();
         txn.commit().unwrap();
         assert_eq!(db.count().unwrap(), 1);
@@ -822,7 +817,7 @@ fn environment_checkpoint_forces_durability() {
         let db = env.open_database(None, "flush", &dbcfg).unwrap();
         let txn = env.begin_transaction(None).unwrap();
         for i in 0..NUM_RECS {
-            db.put_in(&txn, &ikey(i), &ikey(i)).unwrap();
+            db.put_in(&txn, ikey(i), ikey(i)).unwrap();
         }
         txn.commit().unwrap();
         // Note: We don't call env.checkpoint() here — it would race with
@@ -843,7 +838,8 @@ fn environment_checkpoint_forces_durability() {
     let txn = env.begin_transaction(None).unwrap();
     for i in 0..NUM_RECS {
         let mut out = DatabaseEntry::new();
-        assert!(db.get_into(Some(&txn), &ikey(i), &mut out).unwrap(),
+        assert!(
+            db.get_into(Some(&txn), ikey(i), &mut out).unwrap(),
             "key {i} must survive checkpoint + reopen"
         );
         assert_eq!(out.get_data().unwrap(), ikey(i).get_data().unwrap());
@@ -875,7 +871,7 @@ fn environment_checkpoint_after_commit_loses_data() {
         let db = env.open_database(None, "ckp_loss", &dbcfg).unwrap();
         let txn = env.begin_transaction(None).unwrap();
         for i in 0..NUM_RECS {
-            db.put_in(&txn, &ikey(i), &ikey(i)).unwrap();
+            db.put_in(&txn, ikey(i), ikey(i)).unwrap();
         }
         txn.commit().unwrap();
         // Calling checkpoint here is the trigger for the regression.
@@ -894,7 +890,8 @@ fn environment_checkpoint_after_commit_loses_data() {
     let txn = env.begin_transaction(None).unwrap();
     for i in 0..NUM_RECS {
         let mut out = DatabaseEntry::new();
-        assert!(db.get_into(Some(&txn), &ikey(i), &mut out).unwrap(),
+        assert!(
+            db.get_into(Some(&txn), ikey(i), &mut out).unwrap(),
             "key {i} must survive checkpoint + reopen"
         );
     }

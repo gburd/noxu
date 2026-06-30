@@ -72,15 +72,9 @@ fn je_atomic_put_overwrite_no_duplicates_concurrent() {
                 let val = raw / 2;
                 loop {
                     let txn = env.begin_transaction(None).unwrap();
-                    let r = db.put_in(&txn, &ikey(val), &ikey(val));
+                    let r = db.put_in(&txn, ikey(val), ikey(val));
                     match r {
-                        Ok(s) => {
-                            assert_eq!(
-                                s,
-                                OperationStatus::Success,
-                                "put(OVERWRITE) must never return non-Success \
-                                 for key {val}; got {s:?}"
-                            );
+                        Ok(()) => {
                             txn.commit().unwrap();
                             break;
                         }
@@ -132,9 +126,11 @@ fn je_atomic_put_no_overwrite_with_duplicates_concurrent() {
                 let data_val = val % 2;
                 loop {
                     let txn = env.begin_transaction(None).unwrap();
-                    let r = db.put_no_overwrite_in(&txn,
-                        &ikey(key_val),
-                        &ikey(data_val));
+                    let r = db.put_no_overwrite_in(
+                        &txn,
+                        ikey(key_val),
+                        ikey(data_val),
+                    );
                     match r {
                         Ok(_) => {
                             // Either Success (we won) or KeyExist (the
@@ -164,7 +160,7 @@ fn je_atomic_put_no_overwrite_with_duplicates_concurrent() {
     // either 1 or 2 distinct dups, never duplicates of the same data.
     use std::collections::BTreeMap;
     let mut by_key: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
-    let mut c = db.open_cursor( None).unwrap();
+    let mut c = db.open_cursor(None).unwrap();
     let mut k = DatabaseEntry::new();
     let mut d = DatabaseEntry::new();
     let mut s = c

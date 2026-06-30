@@ -17,7 +17,7 @@
 
 use noxu_db::{
     Database, DatabaseConfig, DatabaseEntry, Durability, Environment,
-    EnvironmentConfig, OperationStatus, TransactionConfig,
+    EnvironmentConfig, TransactionConfig,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -91,23 +91,22 @@ fn null_lsn_insert_race_two_auto_commit_inserts_serialise_through_lock_manager()
             bar_a.wait();
             let k = DatabaseEntry::from_data(&key_a);
             let v = DatabaseEntry::from_data(&val_a_thread);
-            db_a.put_no_overwrite( &k, &v).unwrap()
+            db_a.put_no_overwrite(&k, &v).unwrap()
         });
         let h_b = thread::spawn(move || {
             bar_b.wait();
             let k = DatabaseEntry::from_data(&key_b);
             let v = DatabaseEntry::from_data(&val_b_thread);
-            db_b.put_no_overwrite( &k, &v).unwrap()
+            db_b.put_no_overwrite(&k, &v).unwrap()
         });
 
         let r_a = h_a.join().unwrap();
         let r_b = h_b.join().unwrap();
 
-        // Exactly one must be Success; the other must be KeyExists.
-        let success_count = (r_a == OperationStatus::Success) as u8
-            + (r_b == OperationStatus::Success) as u8;
-        let key_exists_count = (r_a == OperationStatus::KeyExists) as u8
-            + (r_b == OperationStatus::KeyExists) as u8;
+        // Exactly one must be Success (inserted); the other must be
+        // KeyExists (not inserted).
+        let success_count = r_a as u8 + r_b as u8;
+        let key_exists_count = (!r_a) as u8 + (!r_b) as u8;
         assert_eq!(
             success_count, 1,
             "round {round}: exactly one thread must succeed, got A={r_a:?} B={r_b:?}"
@@ -122,11 +121,7 @@ fn null_lsn_insert_race_two_auto_commit_inserts_serialise_through_lock_manager()
         let key_lookup = DatabaseEntry::from_data(&key_bytes);
         assert!(db.get_into(None, &key_lookup, &mut got).unwrap());
         let stored = got.get_data().unwrap_or_default();
-        let winner_value = if r_a == OperationStatus::Success {
-            &val_a[..]
-        } else {
-            &val_b[..]
-        };
+        let winner_value = if r_a { &val_a[..] } else { &val_b[..] };
         assert_eq!(
             stored, winner_value,
             "round {round}: stored value must be the winner's"
@@ -173,21 +168,17 @@ fn null_lsn_insert_race_recovery_has_no_phantom_keys() {
             bar_a.wait();
             let k = DatabaseEntry::from_data(&key_a);
             let v = DatabaseEntry::from_data(&val_a_thread);
-            db_a.put_no_overwrite( &k, &v).unwrap()
+            db_a.put_no_overwrite(&k, &v).unwrap()
         });
         let h_b = thread::spawn(move || {
             bar_b.wait();
             let k = DatabaseEntry::from_data(&key_b);
             let v = DatabaseEntry::from_data(&val_b_thread);
-            db_b.put_no_overwrite( &k, &v).unwrap()
+            db_b.put_no_overwrite(&k, &v).unwrap()
         });
         let _r_a = h_a.join().unwrap();
         let _r_b = h_b.join().unwrap();
-        let winner_value = if _r_a == OperationStatus::Success {
-            val_a.clone()
-        } else {
-            val_b.clone()
-        };
+        let winner_value = if _r_a { val_a.clone() } else { val_b.clone() };
         winners.push((key_bytes, winner_value));
     }
 
@@ -215,9 +206,7 @@ fn null_lsn_insert_race_recovery_has_no_phantom_keys() {
         let key_lookup = DatabaseEntry::from_data(key_bytes);
         let mut got = DatabaseEntry::new();
         let status = db_reopen.get_into(None, &key_lookup, &mut got).unwrap();
-        assert!(status,
-            "key {key_bytes:?} must persist across reopen"
-        );
+        assert!(status, "key {key_bytes:?} must persist across reopen");
         let stored = got.get_data().unwrap_or_default().to_vec();
         assert_eq!(
             &stored, winner_value,
@@ -257,7 +246,7 @@ fn auto_commit_rollback_on_forced_failure_undoes_in_memory_write() {
     // Successful baseline: brand-new key is inserted normally.
     let key = DatabaseEntry::from_data(b"baseline");
     let val = DatabaseEntry::from_data(b"v0");
-    db.put( &key, &val).unwrap();
+    db.put(&key, &val).unwrap();
 
     let mut got = DatabaseEntry::new();
     assert!(db.get_into(None, &key, &mut got).unwrap());
@@ -267,14 +256,15 @@ fn auto_commit_rollback_on_forced_failure_undoes_in_memory_write() {
     let val_fail = DatabaseEntry::from_data(b"will_be_undone");
 
     noxu_dbi::set_cursor_fail_after(2);
-    let result = db.put( &key_fail, &val_fail);
+    let result = db.put(&key_fail, &val_fail);
     noxu_dbi::clear_cursor_fail_flag();
 
     match result {
         Err(_) => {
             let mut got = DatabaseEntry::new();
             let status = db.get_into(None, &key_fail, &mut got).unwrap();
-            assert!(!status,
+            assert!(
+                !status,
                 "auto-commit rollback must remove the in-memory tree entry; \
                  got {:?} value={:?}",
                 status,
@@ -310,23 +300,14 @@ fn auto_commit_single_thread_performance_regression_check() {
     for i in 0..N {
         let key = DatabaseEntry::from_data(&i.to_be_bytes());
         let val = DatabaseEntry::from_data(b"v");
-        let status = db.put( &key, &val).unwrap();
-        assert_eq!(
-            status,
-            OperationStatus::Success,
-            "auto-commit put {i} must succeed"
-        );
+        db.put(&key, &val).unwrap();
     }
 
     for i in 0..N {
         let key = DatabaseEntry::from_data(&i.to_be_bytes());
         let mut got = DatabaseEntry::new();
         let status = db.get_into(None, &key, &mut got).unwrap();
-        assert_eq!(
-            status,
-            OperationStatus::Success,
-            "auto-commit get {i} must succeed"
-        );
+        assert!(status, "auto-commit get {i} must succeed");
     }
 
     db.close().unwrap();
@@ -356,19 +337,19 @@ fn lock_timeout_message_uses_typed_locker_ids() {
     let db = Arc::new(open_db(&env, "typed_ids"));
 
     // Pre-seed K1 so the write lock attaches to a real LSN.
-    db.put(
-        &DatabaseEntry::from_data(b"K1"),
-        &DatabaseEntry::from_data(b"v1"))
-    .unwrap();
+    db.put(DatabaseEntry::from_data(b"K1"), DatabaseEntry::from_data(b"v1"))
+        .unwrap();
 
     // Tight lock timeout so the auto-commit thread fails quickly.
     let cfg = TransactionConfig::new().with_lock_timeout_ms(100);
     let txn = env.begin_transaction(Some(&cfg)).unwrap();
 
     // Explicit txn writes K1 → holds write lock on K1's LSN.
-    db.put_in(&txn,
-        &DatabaseEntry::from_data(b"K1"),
-        &DatabaseEntry::from_data(b"hold"))
+    db.put_in(
+        &txn,
+        DatabaseEntry::from_data(b"K1"),
+        DatabaseEntry::from_data(b"hold"),
+    )
     .unwrap();
 
     let started = Arc::new(AtomicBool::new(false));
@@ -377,8 +358,9 @@ fn lock_timeout_message_uses_typed_locker_ids() {
     let h = thread::spawn(move || {
         started_t.store(true, Ordering::SeqCst);
         db_a.put(
-            &DatabaseEntry::from_data(b"K1"),
-            &DatabaseEntry::from_data(b"a"))
+            DatabaseEntry::from_data(b"K1"),
+            DatabaseEntry::from_data(b"a"),
+        )
     });
 
     let deadline = std::time::Instant::now() + Duration::from_secs(2);

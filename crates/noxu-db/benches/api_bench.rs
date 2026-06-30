@@ -54,7 +54,7 @@ fn bench_db_put(c: &mut Criterion) {
 
     c.bench_function("db_put", |b| {
         b.iter(|| {
-            black_box(db.put(None, &key, &value).unwrap());
+            db.put(&key, &value).unwrap();
         })
     });
 }
@@ -66,12 +66,12 @@ fn bench_db_get_hit(c: &mut Criterion) {
 
     let key = DatabaseEntry::from_bytes(b"bench_key");
     let value = DatabaseEntry::from_bytes(b"bench_value_0123456789abcdef");
-    db.put(None, &key, &value).unwrap();
+    db.put(&key, &value).unwrap();
 
     c.bench_function("db_get_hit", |b| {
         let mut data = DatabaseEntry::new();
         b.iter(|| {
-            let status = db.get(None, &key, &mut data).unwrap();
+            let status = db.get_into(None, &key, &mut data).unwrap();
             black_box(status);
         })
     });
@@ -87,7 +87,7 @@ fn bench_db_get_miss(c: &mut Criterion) {
     c.bench_function("db_get_miss", |b| {
         let mut data = DatabaseEntry::new();
         b.iter(|| {
-            let status = db.get(None, &key, &mut data).unwrap();
+            let status = db.get_into(None, &key, &mut data).unwrap();
             black_box(status);
         })
     });
@@ -103,8 +103,8 @@ fn bench_db_delete(c: &mut Criterion) {
 
     c.bench_function("db_delete", |b| {
         b.iter(|| {
-            db.put(None, &key, &value).unwrap();
-            let status = db.delete(None, &key).unwrap();
+            db.put(&key, &value).unwrap();
+            let status = db.delete(&key).unwrap();
             black_box(status);
         })
     });
@@ -124,12 +124,12 @@ fn bench_cursor_forward_scan_1000(c: &mut Criterion) {
         let key = DatabaseEntry::from_vec(format!("key_{:06}", i).into_bytes());
         let val =
             DatabaseEntry::from_vec(format!("value_{:06}", i).into_bytes());
-        db.put(None, &key, &val).unwrap();
+        db.put(&key, &val).unwrap();
     }
 
     c.bench_function("cursor_forward_scan_1000", |b| {
         b.iter(|| {
-            let mut cursor = db.open_cursor(None, None).unwrap();
+            let mut cursor = db.open_cursor(None).unwrap();
             let mut key = DatabaseEntry::new();
             let mut data = DatabaseEntry::new();
             let mut count = 0u32;

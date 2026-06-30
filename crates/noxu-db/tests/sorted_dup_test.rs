@@ -37,7 +37,7 @@ fn test_put_get_single_dup() {
 
     let key = DatabaseEntry::from_bytes(b"key1");
     let data = DatabaseEntry::from_bytes(b"val1");
-    db.put( &key, &data).unwrap();
+    db.put(&key, &data).unwrap();
 
     let mut out = DatabaseEntry::new();
     let status = db.get_into(None, &key, &mut out).unwrap();
@@ -62,11 +62,11 @@ fn test_put_multiple_dups_same_key() {
     let key = DatabaseEntry::from_bytes(b"k");
     for i in 0u8..5 {
         let d = DatabaseEntry::from_bytes(&[i]);
-        db.put( &key, &d).unwrap();
+        db.put(&key, &d).unwrap();
     }
 
     // count() should report 5 dups.
-    let mut cursor = db.open_cursor( None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut kout = DatabaseEntry::from_bytes(b"k");
     let mut dout = DatabaseEntry::new();
     let s = cursor.get(&mut kout, &mut dout, Get::Search, None).unwrap();
@@ -91,10 +91,10 @@ fn test_dup_sorted_order() {
 
     let key = DatabaseEntry::from_bytes(b"alpha");
     for v in [b"c".as_ref(), b"a", b"b"] {
-        db.put( &key, &DatabaseEntry::from_bytes(v)).unwrap();
+        db.put(&key, DatabaseEntry::from_bytes(v)).unwrap();
     }
 
-    let mut cursor = db.open_cursor( None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut kout = DatabaseEntry::from_bytes(b"alpha");
     let mut dout = DatabaseEntry::new();
 
@@ -131,19 +131,22 @@ fn test_get_next_dup_stops_at_key_boundary() {
     let db = env.open_database(None, "test", &db_cfg).unwrap();
 
     db.put(
-        &DatabaseEntry::from_bytes(b"key1"),
-        &DatabaseEntry::from_bytes(b"v1"))
+        DatabaseEntry::from_bytes(b"key1"),
+        DatabaseEntry::from_bytes(b"v1"),
+    )
     .unwrap();
     db.put(
-        &DatabaseEntry::from_bytes(b"key1"),
-        &DatabaseEntry::from_bytes(b"v2"))
+        DatabaseEntry::from_bytes(b"key1"),
+        DatabaseEntry::from_bytes(b"v2"),
+    )
     .unwrap();
     db.put(
-        &DatabaseEntry::from_bytes(b"key2"),
-        &DatabaseEntry::from_bytes(b"v3"))
+        DatabaseEntry::from_bytes(b"key2"),
+        DatabaseEntry::from_bytes(b"v3"),
+    )
     .unwrap();
 
-    let mut cursor = db.open_cursor( None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut kout = DatabaseEntry::from_bytes(b"key1");
     let mut dout = DatabaseEntry::new();
 
@@ -176,24 +179,16 @@ fn test_get_next_no_dup_advances_to_next_key() {
         .with_transactional(true);
     let db = env.open_database(None, "test", &db_cfg).unwrap();
 
-    db.put(
-        &DatabaseEntry::from_bytes(b"aa"),
-        &DatabaseEntry::from_bytes(b"d1"))
-    .unwrap();
-    db.put(
-        &DatabaseEntry::from_bytes(b"aa"),
-        &DatabaseEntry::from_bytes(b"d2"))
-    .unwrap();
-    db.put(
-        &DatabaseEntry::from_bytes(b"aa"),
-        &DatabaseEntry::from_bytes(b"d3"))
-    .unwrap();
-    db.put(
-        &DatabaseEntry::from_bytes(b"bb"),
-        &DatabaseEntry::from_bytes(b"e1"))
-    .unwrap();
+    db.put(DatabaseEntry::from_bytes(b"aa"), DatabaseEntry::from_bytes(b"d1"))
+        .unwrap();
+    db.put(DatabaseEntry::from_bytes(b"aa"), DatabaseEntry::from_bytes(b"d2"))
+        .unwrap();
+    db.put(DatabaseEntry::from_bytes(b"aa"), DatabaseEntry::from_bytes(b"d3"))
+        .unwrap();
+    db.put(DatabaseEntry::from_bytes(b"bb"), DatabaseEntry::from_bytes(b"e1"))
+        .unwrap();
 
-    let mut cursor = db.open_cursor( None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut kout = DatabaseEntry::new();
     let mut dout = DatabaseEntry::new();
 
@@ -225,12 +220,12 @@ fn test_dup_delete_specific_value() {
     let db = env.open_database(None, "test", &db_cfg).unwrap();
 
     let key = DatabaseEntry::from_bytes(b"k");
-    db.put( &key, &DatabaseEntry::from_bytes(b"v1")).unwrap();
-    db.put( &key, &DatabaseEntry::from_bytes(b"v2")).unwrap();
-    db.put( &key, &DatabaseEntry::from_bytes(b"v3")).unwrap();
+    db.put(&key, DatabaseEntry::from_bytes(b"v1")).unwrap();
+    db.put(&key, DatabaseEntry::from_bytes(b"v2")).unwrap();
+    db.put(&key, DatabaseEntry::from_bytes(b"v3")).unwrap();
 
     // Position on v2 using SearchBoth and delete it.
-    let mut cursor = db.open_cursor( None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut kout = DatabaseEntry::from_bytes(b"k");
     let mut dout = DatabaseEntry::from_bytes(b"v2");
     let s = cursor.get(&mut kout, &mut dout, Get::SearchBoth, None).unwrap();
@@ -239,7 +234,7 @@ fn test_dup_delete_specific_value() {
     cursor.close().unwrap();
 
     // count() should now be 2.
-    let mut cursor2 = db.open_cursor( None).unwrap();
+    let mut cursor2 = db.open_cursor(None).unwrap();
     let mut kout2 = DatabaseEntry::from_bytes(b"k");
     let mut dout2 = DatabaseEntry::new();
     cursor2.get(&mut kout2, &mut dout2, Get::Search, None).unwrap();
@@ -272,10 +267,10 @@ fn test_dup_count() {
 
     let key = DatabaseEntry::from_bytes(b"mykey");
     for i in 0u8..7 {
-        db.put( &key, &DatabaseEntry::from_bytes(&[i])).unwrap();
+        db.put(&key, DatabaseEntry::from_bytes(&[i])).unwrap();
     }
 
-    let mut cursor = db.open_cursor( None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut kout = DatabaseEntry::from_bytes(b"mykey");
     let mut dout = DatabaseEntry::new();
     cursor.get(&mut kout, &mut dout, Get::Search, None).unwrap();
@@ -300,7 +295,7 @@ fn test_dup_cursor_txn_isolation() {
     // Write under a transaction and commit.
     let txn = env.begin_transaction(None).unwrap();
     let key = DatabaseEntry::from_bytes(b"iso_key");
-    db.put_in(&txn, &key, &DatabaseEntry::from_bytes(b"v1")).unwrap();
+    db.put_in(&txn, &key, DatabaseEntry::from_bytes(b"v1")).unwrap();
     txn.commit().unwrap();
 
     // After commit, data should be visible via a fresh auto-commit read.
@@ -329,7 +324,7 @@ fn test_dup_database_recovery() {
 
         let key = DatabaseEntry::from_bytes(b"rk");
         for v in [b"a".as_ref(), b"b", b"c", b"d"] {
-            db.put( &key, &DatabaseEntry::from_bytes(v)).unwrap();
+            db.put(&key, DatabaseEntry::from_bytes(v)).unwrap();
         }
         // Drop db first, then env — env Drop does final checkpoint + flush_sync.
         drop(db);
@@ -341,7 +336,7 @@ fn test_dup_database_recovery() {
         let env = open_env(&dir);
         let db = env.open_database(None, "recov", &db_cfg).unwrap();
 
-        let mut cursor = db.open_cursor( None).unwrap();
+        let mut cursor = db.open_cursor(None).unwrap();
         let mut kout = DatabaseEntry::new();
         let mut dout = DatabaseEntry::new();
 
@@ -371,11 +366,11 @@ fn test_get_prev_dup() {
     let db = env.open_database(None, "test", &db_cfg).unwrap();
 
     let key = DatabaseEntry::from_bytes(b"pk");
-    db.put( &key, &DatabaseEntry::from_bytes(b"x")).unwrap();
-    db.put( &key, &DatabaseEntry::from_bytes(b"y")).unwrap();
-    db.put( &key, &DatabaseEntry::from_bytes(b"z")).unwrap();
+    db.put(&key, DatabaseEntry::from_bytes(b"x")).unwrap();
+    db.put(&key, DatabaseEntry::from_bytes(b"y")).unwrap();
+    db.put(&key, DatabaseEntry::from_bytes(b"z")).unwrap();
 
-    let mut cursor = db.open_cursor( None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut kout = DatabaseEntry::new();
     let mut dout = DatabaseEntry::new();
 
@@ -412,17 +407,17 @@ fn test_put_no_dup_data_rejects_exact_duplicate() {
 
     let key = DatabaseEntry::from_bytes(b"k");
     let data = DatabaseEntry::from_bytes(b"v");
-    db.put( &key, &data).unwrap();
+    db.put(&key, &data).unwrap();
 
     // Second insert with the same (key, data) pair using NoDupData.
-    let mut cursor = db.open_cursor( None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let s = cursor.put(&key, &data, Put::NoDupData).unwrap();
-    ;
+    assert_eq!(s, OperationStatus::KeyExists);
 
     // A different data value is allowed.
     let data2 = DatabaseEntry::from_bytes(b"w");
     let s2 = cursor.put(&key, &data2, Put::NoDupData).unwrap();
-    ;
+    assert_eq!(s2, OperationStatus::Success);
 
     cursor.close().unwrap();
     let _ = env.close();
@@ -455,12 +450,12 @@ fn test_database_count_includes_all_dups() {
     // 5 dups for the same key.
     let key = DatabaseEntry::from_bytes(b"k");
     for i in 0u8..5 {
-        db.put( &key, &DatabaseEntry::from_bytes(&[i])).unwrap();
+        db.put(&key, DatabaseEntry::from_bytes(&[i])).unwrap();
     }
     // Plus 3 more (key, data) pairs under a different key.
     let key2 = DatabaseEntry::from_bytes(b"k2");
     for i in 0u8..3 {
-        db.put( &key2, &DatabaseEntry::from_bytes(&[i])).unwrap();
+        db.put(&key2, DatabaseEntry::from_bytes(&[i])).unwrap();
     }
 
     // Per BDB-JE Database.count() contract: total = 5 + 3 = 8.
@@ -471,7 +466,7 @@ fn test_database_count_includes_all_dups() {
     );
 
     // Re-inserting an existing exact (key, data) pair must not double-count.
-    db.put( &key, &DatabaseEntry::from_bytes(&[0])).unwrap();
+    db.put(&key, DatabaseEntry::from_bytes(&[0])).unwrap();
     assert_eq!(db.count().unwrap(), 8);
 
     let _ = env.close();
@@ -499,38 +494,34 @@ fn test_database_delete_removes_all_dups() {
     // scoped to the requested key).
     let target = DatabaseEntry::from_bytes(b"target");
     for v in [b"a".as_ref(), b"b", b"c", b"d"] {
-        db.put( &target, &DatabaseEntry::from_bytes(v)).unwrap();
+        db.put(&target, DatabaseEntry::from_bytes(v)).unwrap();
     }
     let keep = DatabaseEntry::from_bytes(b"keep");
     for v in [b"x".as_ref(), b"y"] {
-        db.put( &keep, &DatabaseEntry::from_bytes(v)).unwrap();
+        db.put(&keep, DatabaseEntry::from_bytes(v)).unwrap();
     }
     assert_eq!(db.count().unwrap(), 6);
 
     // Delete the whole "target" duplicate set in one call.
-    let s = db.delete( &target).unwrap();
-    assert_eq!(s, OperationStatus::Success);
+    let s = db.delete(&target).unwrap();
+    assert!(s);
 
     // No (target, *) record may remain.
     let mut out = DatabaseEntry::new();
     let s = db.get_into(None, &target, &mut out).unwrap();
-    assert_eq!(
-        s,
-        OperationStatus::NotFound,
-        "db.delete(target) must remove every dup"
-    );
+    assert!(!s, "db.delete(target) must remove every dup");
 
     // The unrelated key's dups must remain.
     let mut out = DatabaseEntry::new();
     let s = db.get_into(None, &keep, &mut out).unwrap();
-    assert_eq!(s, OperationStatus::Success);
+    assert!(s);
 
     // count() should now reflect only the surviving "keep" pairs.
     assert_eq!(db.count().unwrap(), 2);
 
     // A second delete of an absent key must report NotFound.
-    let s = db.delete( &target).unwrap();
-    assert_eq!(s, OperationStatus::NotFound);
+    let s = db.delete(&target).unwrap();
+    assert!(!s);
 
     let _ = env.close();
 }
@@ -607,26 +598,21 @@ mod prop_sorted_dup_oracle {
             let mut oracle: BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>> =
                 BTreeMap::new();
             for (k, v) in &pairs {
-                let s = db.put(
-                    &DatabaseEntry::from_bytes(k),
-                    &DatabaseEntry::from_bytes(v)).unwrap();
-                // BDB-JE: a duplicate (key, data) re-insert returns
-                // KeyExist on a sorted-dup DB; otherwise Success.
+                db.put(
+                    DatabaseEntry::from_bytes(k),
+                    DatabaseEntry::from_bytes(v),
+                )
+                .unwrap();
+                // BDB-JE: a duplicate (key, data) re-insert is a no-op on a
+                // sorted-dup DB.  The reshaped `put` returns `()` rather than
+                // the old KeyExist/Success status, so the per-put status
+                // assertion is gone; the resulting dup-set state is verified
+                // against this oracle by the cursor-scan properties below.
                 let oracle_entry = oracle.entry(k.clone()).or_default();
-                let oracle_already = !oracle_entry.insert(v.clone());
-                let expected = if oracle_already {
-                    OperationStatus::KeyExists
-                } else {
-                    OperationStatus::Success
-                };
-                prop_assert_eq!(
-                    s, expected,
-                    "put({:?},{:?}) returned unexpected status (oracle_already={})",
-                    k, v, oracle_already,
-                );
+                oracle_entry.insert(v.clone());
             }
 
-            let mut cursor = db.open_cursor( None).unwrap();
+            let mut cursor = db.open_cursor(None).unwrap();
 
             // Property 3a: Get::Search agrees with oracle.contains_key.
             for probe in &probes {

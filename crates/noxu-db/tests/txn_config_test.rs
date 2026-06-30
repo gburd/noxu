@@ -71,8 +71,7 @@ fn test_no_wait_causes_immediate_lock_failure() {
     let txn2 = env.begin_transaction(Some(&config)).unwrap();
 
     let start = Instant::now();
-    let result =
-        db.put_in(&txn2, &key, &DatabaseEntry::from_bytes(b"value2"));
+    let result = db.put_in(&txn2, &key, DatabaseEntry::from_bytes(b"value2"));
     let elapsed = start.elapsed();
 
     // Should have failed quickly (< 100ms), not after the default 500ms timeout
@@ -107,7 +106,7 @@ fn test_lock_timeout_bounds_wait_time() {
     let txn2 = env.begin_transaction(Some(&config)).unwrap();
 
     let start = Instant::now();
-    let result = db.put_in(&txn2, &key, &DatabaseEntry::from_bytes(b"v2"));
+    let result = db.put_in(&txn2, &key, DatabaseEntry::from_bytes(b"v2"));
     let elapsed = start.elapsed();
 
     // Should timeout within ~50ms (+/- some jitter)

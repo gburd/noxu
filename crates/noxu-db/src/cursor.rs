@@ -143,10 +143,7 @@ impl<'txn> Cursor<'txn> {
     ///
     /// # Errors
     /// Returns an error if the cursor or database is closed.
-    pub fn seek(
-        &mut self,
-        key: impl AsRef<[u8]>,
-    ) -> Result<Option<Bytes>> {
+    pub fn seek(&mut self, key: impl AsRef<[u8]>) -> Result<Option<Bytes>> {
         let mut key_entry = DatabaseEntry::from_bytes(key.as_ref());
         let mut data = DatabaseEntry::new();
         match self.get(&mut key_entry, &mut data, Get::Search, None)? {
@@ -608,7 +605,7 @@ mod tests {
     use std::sync::Arc;
 
     /// Creates a fresh in-memory DatabaseImpl and wraps it in a Cursor.
-    fn make_cursor(read_only: bool) -> Cursor {
+    fn make_cursor(read_only: bool) -> Cursor<'static> {
         let db_id = DatabaseId::new(1);
         let config = DbiDatabaseConfig::default();
         let db_impl =
@@ -619,7 +616,7 @@ mod tests {
     }
 
     /// Creates a cursor backed by a DatabaseImpl pre-populated with records.
-    fn make_cursor_with(records: Vec<(&[u8], &[u8])>) -> Cursor {
+    fn make_cursor_with(records: Vec<(&[u8], &[u8])>) -> Cursor<'static> {
         let db_id = DatabaseId::new(1);
         let config = DbiDatabaseConfig::default();
         let db_impl =
@@ -638,7 +635,7 @@ mod tests {
     }
 
     /// Creates a sorted-duplicate cursor pre-populated with (key, data) pairs.
-    fn make_dup_cursor_with(records: Vec<(&[u8], &[u8])>) -> Cursor {
+    fn make_dup_cursor_with(records: Vec<(&[u8], &[u8])>) -> Cursor<'static> {
         let db_id = DatabaseId::new(1);
         let mut config = DbiDatabaseConfig::default();
         config.set_sorted_duplicates(true);
@@ -1359,7 +1356,7 @@ mod tests {
 
     /// Helper: cursor whose outer state is NotInitialized but whose inner
     /// CursorImpl has been closed, so that any CursorImpl call returns an error.
-    fn make_inner_closed_cursor() -> Cursor {
+    fn make_inner_closed_cursor() -> Cursor<'static> {
         let mut c = make_cursor(false);
         c.inner.close().unwrap(); // CursorImpl is now Closed
         // outer state stays NotInitialized — check_open() will pass
@@ -1368,7 +1365,7 @@ mod tests {
 
     /// Helper: cursor whose outer state is Initialized but whose inner
     /// CursorImpl has been closed (simulate a mid-flight error scenario).
-    fn make_inner_closed_cursor_initialized() -> Cursor {
+    fn make_inner_closed_cursor_initialized() -> Cursor<'static> {
         let mut c = make_cursor(false);
         // Manually set outer state to Initialized so check_initialized() passes.
         c.state = CursorState::Initialized;

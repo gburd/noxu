@@ -8,7 +8,6 @@
 
 use noxu::{
     DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
-    OperationStatus,
 };
 use tempfile::TempDir;
 
@@ -110,13 +109,12 @@ fn smoke_core_open_put_get() {
 
     let key = DatabaseEntry::from_bytes(b"hello");
     let val = DatabaseEntry::from_bytes(b"world");
-    let status = db.put(None, &key, &val).unwrap();
-    assert_eq!(status, OperationStatus::Success);
+    db.put(&key, &val).unwrap();
 
     let key2 = DatabaseEntry::from_bytes(b"hello");
     let mut out = DatabaseEntry::new();
-    let status2 = db.get(None, &key2, &mut out).unwrap();
-    assert_eq!(status2, OperationStatus::Success);
+    let status2 = db.get_into(None, &key2, &mut out).unwrap();
+    assert!(status2);
     assert_eq!(out.get_data(), Some(b"world".as_ref()));
 }
 

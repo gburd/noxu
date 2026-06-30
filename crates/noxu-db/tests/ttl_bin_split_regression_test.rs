@@ -50,9 +50,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use noxu_db::{
-    DatabaseConfig, DatabaseEntry, EnvironmentConfig, OperationStatus,
-};
+use noxu_db::{DatabaseConfig, DatabaseEntry, EnvironmentConfig};
 use tempfile::TempDir;
 
 /// Open an env + database with the default node size (256 entries per BIN).
@@ -109,8 +107,7 @@ fn test_ttl_records_survive_bin_split_right_sibling_256() {
     // the left BIN only.  The right sibling retains expiration_in_hours = false.
     let trigger_key = DatabaseEntry::from_bytes(b"\x7f\xff");
     let trigger_val = DatabaseEntry::from_bytes(b"trigger");
-    db.put_with_options(None, &trigger_key, &trigger_val, &ttl_opts)
-        .unwrap();
+    db.put_with_options(None, &trigger_key, &trigger_val, &ttl_opts).unwrap();
 
     // Check right-sibling keys — these fail pre-fix.
     let mut missing: Vec<u8> = Vec::new();
@@ -128,7 +125,6 @@ fn test_ttl_records_survive_bin_split_right_sibling_256() {
             false => {
                 missing.push(k);
             }
-            st => panic!("get({k:02x}) returned unexpected status {st:?}"),
         }
     }
     // Trigger key must also be present.
@@ -182,7 +178,7 @@ fn test_ttl_and_no_ttl_keys_both_survive_bin_split() {
     db.put_with_options(
         None,
         &trigger_key,
-        &DatabaseEntry::from_bytes(b"t"),
+        DatabaseEntry::from_bytes(b"t"),
         &ttl_opts,
     )
     .unwrap();
@@ -194,7 +190,6 @@ fn test_ttl_and_no_ttl_keys_both_survive_bin_split() {
         match db.get_into(None, &key, &mut out).unwrap() {
             true => {}
             false => missing.push(k),
-            st => panic!("unexpected status {st:?} for key {k:02x}"),
         }
     }
 
@@ -253,7 +248,7 @@ fn test_ttl_records_survive_close_and_reopen() {
         db.put_with_options(
             None,
             &trigger_key,
-            &DatabaseEntry::from_bytes(b"t"),
+            DatabaseEntry::from_bytes(b"t"),
             &ttl_opts,
         )
         .unwrap();
@@ -287,9 +282,6 @@ fn test_ttl_records_survive_close_and_reopen() {
                 false => {
                     missing_count += 1;
                 }
-                st => panic!(
-                    "unexpected status {st:?} for key {k:02x} after recovery"
-                ),
             }
         }
 

@@ -467,7 +467,8 @@ impl FkReferrer for SecondaryHookState {
                 // Collect every child primary key indexed under fk_value.
                 let child_pris: Vec<DatabaseEntry> = {
                     let mut child_keys = Vec::new();
-                    let mut cursor = self.inner.open_cursor_internal(txn, None)?;
+                    let mut cursor =
+                        self.inner.open_cursor_internal(txn, None)?;
                     let mut sk = fk_value.clone();
                     let mut pk = DatabaseEntry::new();
                     let mut st = cursor
@@ -546,7 +547,8 @@ impl FkReferrer for SecondaryHookState {
                 // Collect (child_primary_key, child_primary_data) pairs.
                 let child_records: Vec<(DatabaseEntry, DatabaseEntry)> = {
                     let mut child = Vec::new();
-                    let mut cursor = self.inner.open_cursor_internal(txn, None)?;
+                    let mut cursor =
+                        self.inner.open_cursor_internal(txn, None)?;
                     let mut sk = fk_value.clone();
                     let mut pk = DatabaseEntry::new();
                     let mut st = cursor
@@ -566,9 +568,11 @@ impl FkReferrer for SecondaryHookState {
                             pk.get_data().unwrap_or(&[]),
                         );
                         let mut data = DatabaseEntry::new();
-                        let g = primary
-                            .lock()
-                            .get_into(txn, child_pri.data(), &mut data)?;
+                        let g = primary.lock().get_into(
+                            txn,
+                            child_pri.data(),
+                            &mut data,
+                        )?;
                         if g {
                             child.push((child_pri, data));
                         }
@@ -615,10 +619,9 @@ impl FkReferrer for SecondaryHookState {
                                     child_pri.data(),
                                     child_data.data(),
                                 )?,
-                                None => primary.lock().put(
-                                    child_pri.data(),
-                                    child_data.data(),
-                                )?,
+                                None => primary
+                                    .lock()
+                                    .put(child_pri.data(), child_data.data())?,
                             }
                         }
                     }
@@ -967,8 +970,7 @@ impl SecondaryDatabase {
 
         // Now fetch the primary record.
         let primary = self.state.primary.lock();
-        let pri_found =
-            primary.get_into(txn, pri_key_entry.data(), data)?;
+        let pri_found = primary.get_into(txn, pri_key_entry.data(), data)?;
         if !pri_found {
             // Secondary refers to a missing primary — integrity issue.
             return Err(NoxuError::SecondaryIntegrityException(format!(
@@ -1458,7 +1460,7 @@ mod tests {
         let pri_data = DatabaseEntry::from_bytes(b"Avalon");
         {
             let primary = primary.lock();
-            primary.put(None, &pri_key, &pri_data).unwrap();
+            primary.put(&pri_key, &pri_data).unwrap();
         }
 
         // Retrieve by secondary key (first byte of "Avalon" = 'A' = 0x41).
@@ -1466,9 +1468,9 @@ mod tests {
         let mut p_key = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
         let status =
-            secondary.get(None, &sec_key, &mut p_key, &mut data).unwrap();
+            secondary.get_into(None, &sec_key, &mut p_key, &mut data).unwrap();
 
-        assert_eq!(status, OperationStatus::Success);
+        assert!(status);
         assert_eq!(p_key.get_data().unwrap(), b"pk1");
         assert_eq!(data.get_data().unwrap(), b"Avalon");
     }
@@ -1489,7 +1491,7 @@ mod tests {
             let pk = DatabaseEntry::from_bytes(k);
             let pv = DatabaseEntry::from_bytes(v);
             {
-                primary.lock().put(None, &pk, &pv).unwrap();
+                primary.lock().put(&pk, &pv).unwrap();
             }
             // Auto-hook maintains secondary; no explicit update_secondary needed.
         }
@@ -1499,16 +1501,16 @@ mod tests {
         let mut p_key = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
         let status =
-            secondary.get(None, &sec_key, &mut p_key, &mut data).unwrap();
+            secondary.get_into(None, &sec_key, &mut p_key, &mut data).unwrap();
 
-        assert_eq!(status, OperationStatus::Success);
+        assert!(status);
         assert_eq!(data.get_data().unwrap(), b"Banana");
 
         // Search for non-existent secondary key.
         let missing = DatabaseEntry::from_bytes(b"Z");
         let status =
-            secondary.get(None, &missing, &mut p_key, &mut data).unwrap();
-        assert_eq!(status, OperationStatus::NotFound);
+            secondary.get_into(None, &missing, &mut p_key, &mut data).unwrap();
+        assert!(!status);
     }
 
     #[test]
@@ -1520,19 +1522,20 @@ mod tests {
         let pri_key = DatabaseEntry::from_bytes(b"pk1");
         let pri_data = DatabaseEntry::from_bytes(b"Cherry");
         {
-            primary.lock().put(None, &pri_key, &pri_data).unwrap();
+            primary.lock().put(&pri_key, &pri_data).unwrap();
             // Auto-hook maintains secondary.
         }
 
         // Delete via secondary key.
         let sec_key = DatabaseEntry::from_bytes(b"C");
-        let status = secondary.delete(None, &sec_key).unwrap();
-        assert_eq!(status, OperationStatus::Success);
+        let status = secondary.delete(&sec_key).unwrap();
+        assert!(status);
 
         // Primary record should be gone.
         let mut data = DatabaseEntry::new();
-        let get_status = primary.lock().get(None, &pri_key, &mut data).unwrap();
-        assert_eq!(get_status, OperationStatus::NotFound);
+        let get_status =
+            primary.lock().get_into(None, &pri_key, &mut data).unwrap();
+        assert!(!get_status);
     }
 
     #[test]
@@ -1546,27 +1549,29 @@ mod tests {
         let new_data = DatabaseEntry::from_bytes(b"Pineapple");
 
         {
-            primary.lock().put(None, &pri_key, &old_data).unwrap();
+            primary.lock().put(&pri_key, &old_data).unwrap();
             // Auto-hook inserts (M, pk1) into secondary.
         }
 
         // Now update the primary; the secondary key 'M' should be replaced by 'P'.
         // Auto-hook fetches old_data, deletes (M, pk1), inserts (P, pk1).
         {
-            primary.lock().put(None, &pri_key, &new_data).unwrap();
+            primary.lock().put(&pri_key, &new_data).unwrap();
         }
 
         // Old key 'M' should no longer be in the secondary.
         let old_sec = DatabaseEntry::from_bytes(b"M");
         let mut pk = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
-        let status = secondary.get(None, &old_sec, &mut pk, &mut data).unwrap();
-        assert_eq!(status, OperationStatus::NotFound);
+        let status =
+            secondary.get_into(None, &old_sec, &mut pk, &mut data).unwrap();
+        assert!(!status);
 
         // New key 'P' should be present.
         let new_sec = DatabaseEntry::from_bytes(b"P");
-        let status = secondary.get(None, &new_sec, &mut pk, &mut data).unwrap();
-        assert_eq!(status, OperationStatus::Success);
+        let status =
+            secondary.get_into(None, &new_sec, &mut pk, &mut data).unwrap();
+        assert!(status);
         assert_eq!(data.get_data().unwrap(), b"Pineapple");
     }
 
@@ -1582,12 +1587,12 @@ mod tests {
         for (k, v) in records {
             let pk = DatabaseEntry::from_bytes(k);
             let pv = DatabaseEntry::from_bytes(v);
-            primary.lock().put(None, &pk, &pv).unwrap();
+            primary.lock().put(&pk, &pv).unwrap();
             // Auto-hook maintains secondary.
         }
 
         // Iterate via SecondaryCursor and collect all secondary keys encountered.
-        let mut cursor = secondary.open_cursor(None, None).unwrap();
+        let mut cursor = secondary.open_cursor(None).unwrap();
         let mut sec_keys_seen: Vec<Vec<u8>> = Vec::new();
         let mut sec_key = DatabaseEntry::new();
         let mut p_key = DatabaseEntry::new();
@@ -1624,7 +1629,7 @@ mod tests {
         let sec_key = DatabaseEntry::from_bytes(b"A");
         let mut pk = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
-        let result = secondary.get(None, &sec_key, &mut pk, &mut data);
+        let result = secondary.get_into(None, &sec_key, &mut pk, &mut data);
         assert!(result.is_err());
 
         secondary.end_incremental_population();
@@ -1642,11 +1647,7 @@ mod tests {
         for (k, v) in records {
             primary
                 .lock()
-                .put(
-                    None,
-                    &DatabaseEntry::from_bytes(k),
-                    &DatabaseEntry::from_bytes(v),
-                )
+                .put(DatabaseEntry::from_bytes(k), DatabaseEntry::from_bytes(v))
                 .unwrap();
         }
 
@@ -1670,8 +1671,8 @@ mod tests {
         let mut pk = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
         let status =
-            secondary.get(None, &sec_key_g, &mut pk, &mut data).unwrap();
-        assert_eq!(status, OperationStatus::Success);
+            secondary.get_into(None, &sec_key_g, &mut pk, &mut data).unwrap();
+        assert!(status);
         assert_eq!(data.get_data().unwrap(), b"Grape");
     }
 
@@ -1699,7 +1700,7 @@ mod tests {
         ] {
             let pk_e = DatabaseEntry::from_bytes(pk);
             let pv_e = DatabaseEntry::from_bytes(pv);
-            primary.lock().put(None, &pk_e, &pv_e).unwrap();
+            primary.lock().put(&pk_e, &pv_e).unwrap();
             // Auto-hook maintains secondary.
         }
 

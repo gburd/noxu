@@ -65,9 +65,11 @@ fn write_committed_workload(dir: &Path, n: u32) {
     let db = open_db(&env);
     for i in 0..n {
         let txn = env.begin_transaction(None).unwrap();
-        db.put_in(&txn,
-            &DatabaseEntry::from_bytes(format!("k_{i:05}").as_bytes()),
-            &DatabaseEntry::from_bytes(format!("v_{i:05}").as_bytes()))
+        db.put_in(
+            &txn,
+            DatabaseEntry::from_bytes(format!("k_{i:05}").as_bytes()),
+            DatabaseEntry::from_bytes(format!("v_{i:05}").as_bytes()),
+        )
         .unwrap();
         txn.commit().unwrap();
     }
@@ -99,7 +101,7 @@ fn try_recover_and_scan(
             .map_err(|e| format!("open_database error: {e}"))?;
 
         let mut cursor = db
-            .open_cursor( None)
+            .open_cursor(None)
             .map_err(|e| format!("open_cursor error: {e}"))?;
         let mut map = std::collections::BTreeMap::new();
         let mut key = DatabaseEntry::new();

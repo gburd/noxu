@@ -48,7 +48,7 @@ fn kv(k: &[u8], v: &[u8]) -> (DatabaseEntry, DatabaseEntry) {
 fn put_batch(db: &noxu_db::Database, pairs: &[(&[u8], &[u8])]) {
     for (k, v) in pairs {
         let (key, val) = kv(k, v);
-        db.put( &key, &val).unwrap();
+        db.put(&key, &val).unwrap();
     }
 }
 
@@ -58,7 +58,7 @@ fn put_batch(db: &noxu_db::Database, pairs: &[(&[u8], &[u8])]) {
 fn cursor_initial_state_not_initialized() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open_env_and_db(&dir);
-    let cursor = db.open_cursor( None).unwrap();
+    let cursor = db.open_cursor(None).unwrap();
     assert_eq!(cursor.get_state(), CursorState::NotInitialized);
 }
 
@@ -66,7 +66,7 @@ fn cursor_initial_state_not_initialized() {
 fn cursor_is_valid_before_positioning() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open_env_and_db(&dir);
-    let cursor = db.open_cursor( None).unwrap();
+    let cursor = db.open_cursor(None).unwrap();
     assert!(cursor.is_valid());
 }
 
@@ -74,7 +74,7 @@ fn cursor_is_valid_before_positioning() {
 fn cursor_is_read_write_by_default() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open_env_and_db(&dir);
-    let cursor = db.open_cursor( None).unwrap();
+    let cursor = db.open_cursor(None).unwrap();
     assert!(!cursor.is_read_only());
 }
 
@@ -83,7 +83,7 @@ fn cursor_state_initialized_after_first_get() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open_env_and_db(&dir);
     put_batch(&db, &[(b"k", b"v")]);
-    let mut cursor = db.open_cursor( None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
     cursor.get(&mut key, &mut data, Get::First, None).unwrap();
@@ -94,7 +94,7 @@ fn cursor_state_initialized_after_first_get() {
 fn cursor_state_closed_after_close() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open_env_and_db(&dir);
-    let mut cursor = db.open_cursor( None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     cursor.close().unwrap();
     assert_eq!(cursor.get_state(), CursorState::Closed);
 }
@@ -105,7 +105,7 @@ fn cursor_state_closed_after_close() {
 fn cursor_first_on_empty_db_returns_not_found() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open_env_and_db(&dir);
-    let mut cursor = db.open_cursor( None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
     let status = cursor.get(&mut key, &mut data, Get::First, None).unwrap();
@@ -116,7 +116,7 @@ fn cursor_first_on_empty_db_returns_not_found() {
 fn cursor_last_on_empty_db_returns_not_found() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open_env_and_db(&dir);
-    let mut cursor = db.open_cursor( None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
     let status = cursor.get(&mut key, &mut data, Get::Last, None).unwrap();
@@ -131,7 +131,7 @@ fn cursor_first_and_last_single_record() {
     let (_env, db) = open_env_and_db(&dir);
     put_batch(&db, &[(b"only", b"value")]);
 
-    let mut cursor = db.open_cursor( None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
 
@@ -149,7 +149,7 @@ fn cursor_next_at_end_returns_not_found() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open_env_and_db(&dir);
     put_batch(&db, &[(b"a", b"1")]);
-    let mut cursor = db.open_cursor( None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
     cursor.get(&mut key, &mut data, Get::First, None).unwrap();
@@ -162,7 +162,7 @@ fn cursor_prev_at_beginning_returns_not_found() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open_env_and_db(&dir);
     put_batch(&db, &[(b"a", b"1")]);
-    let mut cursor = db.open_cursor( None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
     cursor.get(&mut key, &mut data, Get::First, None).unwrap();
@@ -176,7 +176,7 @@ fn cursor_iterates_all_keys_forward() {
     let (_env, db) = open_env_and_db(&dir);
     put_batch(&db, &[(b"a", b"1"), (b"b", b"2"), (b"c", b"3")]);
 
-    let mut cursor = db.open_cursor( None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
 
@@ -195,7 +195,7 @@ fn cursor_iterates_all_keys_backward() {
     let (_env, db) = open_env_and_db(&dir);
     put_batch(&db, &[(b"a", b"1"), (b"b", b"2"), (b"c", b"3")]);
 
-    let mut cursor = db.open_cursor( None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
 
@@ -216,7 +216,7 @@ fn cursor_search_exact_key() {
     let (_env, db) = open_env_and_db(&dir);
     put_batch(&db, &[(b"aaa", b"v1"), (b"bbb", b"v2"), (b"ccc", b"v3")]);
 
-    let mut cursor = db.open_cursor( None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut key = DatabaseEntry::from_bytes(b"bbb");
     let mut data = DatabaseEntry::new();
     let s = cursor.get(&mut key, &mut data, Get::Search, None).unwrap();
@@ -230,7 +230,7 @@ fn cursor_search_missing_key_returns_not_found() {
     let (_env, db) = open_env_and_db(&dir);
     put_batch(&db, &[(b"a", b"1"), (b"c", b"3")]);
 
-    let mut cursor = db.open_cursor( None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut key = DatabaseEntry::from_bytes(b"b");
     let mut data = DatabaseEntry::new();
     let s = cursor.get(&mut key, &mut data, Get::Search, None).unwrap();
@@ -244,7 +244,7 @@ fn cursor_search_gte_positions_at_or_after() {
     put_batch(&db, &[(b"aaa", b"v1"), (b"ccc", b"v3"), (b"eee", b"v5")]);
 
     // Search for "bbb" which doesn't exist → should land on "ccc".
-    let mut cursor = db.open_cursor( None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut key = DatabaseEntry::from_bytes(b"bbb");
     let mut data = DatabaseEntry::new();
     let s = cursor.get(&mut key, &mut data, Get::SearchGte, None).unwrap();
@@ -258,7 +258,7 @@ fn cursor_search_gte_exact_key_matches() {
     let (_env, db) = open_env_and_db(&dir);
     put_batch(&db, &[(b"a", b"1"), (b"b", b"2")]);
 
-    let mut cursor = db.open_cursor( None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut key = DatabaseEntry::from_bytes(b"a");
     let mut data = DatabaseEntry::new();
     let s = cursor.get(&mut key, &mut data, Get::SearchGte, None).unwrap();
@@ -274,7 +274,7 @@ fn cursor_current_returns_current_record() {
     let (_env, db) = open_env_and_db(&dir);
     put_batch(&db, &[(b"k1", b"v1"), (b"k2", b"v2")]);
 
-    let mut cursor = db.open_cursor( None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut key = DatabaseEntry::from_bytes(b"k1");
     let mut data = DatabaseEntry::new();
     cursor.get(&mut key, &mut data, Get::Search, None).unwrap();
@@ -293,11 +293,10 @@ fn cursor_current_returns_current_record() {
 fn cursor_put_overwrite_inserts_record() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open_env_and_db(&dir);
-    let mut cursor = db.open_cursor( None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let key = DatabaseEntry::from_bytes(b"new_key");
     let val = DatabaseEntry::from_bytes(b"new_val");
-    let s = cursor.put(&key, &val, Put::Overwrite).unwrap();
-    ;
+    let _s = cursor.put(&key, &val, Put::Overwrite).unwrap();
     cursor.close().unwrap();
 
     let mut out = DatabaseEntry::new();
@@ -311,12 +310,11 @@ fn cursor_put_no_overwrite_returns_key_exists() {
     let (_env, db) = open_env_and_db(&dir);
     let key = DatabaseEntry::from_bytes(b"k");
     let v1 = DatabaseEntry::from_bytes(b"v1");
-    db.put( &key, &v1).unwrap();
+    db.put(&key, &v1).unwrap();
 
-    let mut cursor = db.open_cursor( None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let v2 = DatabaseEntry::from_bytes(b"v2");
-    let s = cursor.put(&key, &v2, Put::NoOverwrite).unwrap();
-    ;
+    let _s = cursor.put(&key, &v2, Put::NoOverwrite).unwrap();
 }
 
 #[test]
@@ -325,16 +323,15 @@ fn cursor_put_current_updates_current_record() {
     let (_env, db) = open_env_and_db(&dir);
     let key = DatabaseEntry::from_bytes(b"k");
     let v1 = DatabaseEntry::from_bytes(b"original");
-    db.put( &key, &v1).unwrap();
+    db.put(&key, &v1).unwrap();
 
-    let mut cursor = db.open_cursor( None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut search_key = DatabaseEntry::from_bytes(b"k");
     let mut data = DatabaseEntry::new();
     cursor.get(&mut search_key, &mut data, Get::Search, None).unwrap();
 
     let new_val = DatabaseEntry::from_bytes(b"updated");
-    let s = cursor.put(&key, &new_val, Put::Current).unwrap();
-    ;
+    let _s = cursor.put(&key, &new_val, Put::Current).unwrap();
     cursor.close().unwrap();
 
     let mut out = DatabaseEntry::new();
@@ -350,9 +347,9 @@ fn cursor_delete_removes_current_record() {
     let (_env, db) = open_env_and_db(&dir);
     let key = DatabaseEntry::from_bytes(b"to_delete");
     let val = DatabaseEntry::from_bytes(b"v");
-    db.put( &key, &val).unwrap();
+    db.put(&key, &val).unwrap();
 
-    let mut cursor = db.open_cursor( None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut search_key = DatabaseEntry::from_bytes(b"to_delete");
     let mut data = DatabaseEntry::new();
     cursor.get(&mut search_key, &mut data, Get::Search, None).unwrap();
@@ -370,7 +367,7 @@ fn cursor_delete_middle_record_leaves_others() {
     let (_env, db) = open_env_and_db(&dir);
     put_batch(&db, &[(b"a", b"1"), (b"b", b"2"), (b"c", b"3")]);
 
-    let mut cursor = db.open_cursor( None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut key = DatabaseEntry::from_bytes(b"b");
     let mut data = DatabaseEntry::new();
     cursor.get(&mut key, &mut data, Get::Search, None).unwrap();
@@ -386,7 +383,7 @@ fn cursor_delete_middle_record_leaves_others() {
 fn cursor_count_zero_before_positioning() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open_env_and_db(&dir);
-    let cursor = db.open_cursor( None).unwrap();
+    let cursor = db.open_cursor(None).unwrap();
     assert_eq!(cursor.count().unwrap(), 0);
 }
 
@@ -395,7 +392,7 @@ fn cursor_count_one_after_positioning() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open_env_and_db(&dir);
     put_batch(&db, &[(b"k", b"v")]);
-    let mut cursor = db.open_cursor( None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
     cursor.get(&mut key, &mut data, Get::First, None).unwrap();
@@ -422,13 +419,14 @@ fn cursor_iterates_100_records_in_order() {
         let key = format!("{:04}", i);
         let val = format!("{}", i);
         db.put(
-            &DatabaseEntry::from_bytes(key.as_bytes()),
-            &DatabaseEntry::from_bytes(val.as_bytes()))
+            DatabaseEntry::from_bytes(key.as_bytes()),
+            DatabaseEntry::from_bytes(val.as_bytes()),
+        )
         .unwrap();
     }
 
     // Iterate forward and verify sorted order.
-    let mut cursor = db.open_cursor( None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
     let mut count = 0u32;
@@ -466,7 +464,7 @@ fn cursor_keys_returned_in_lexicographic_order() {
         ],
     );
 
-    let mut cursor = db.open_cursor( None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
     let mut keys: Vec<Vec<u8>> = Vec::new();
@@ -530,12 +528,13 @@ fn cursor_search_gte_short_seed_under_long_prefix_does_not_panic() {
         key.extend_from_slice(format!("object-{i:08}").as_bytes());
         let value = format!("payload-{i}");
         db.put(
-            &DatabaseEntry::from_bytes(&key),
-            &DatabaseEntry::from_bytes(value.as_bytes()))
+            DatabaseEntry::from_bytes(&key),
+            DatabaseEntry::from_bytes(value.as_bytes()),
+        )
         .unwrap();
     }
 
-    let mut cursor = db.open_cursor( None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut key = DatabaseEntry::from_bytes(b"K\0");
     let mut data = DatabaseEntry::new();
     let s = cursor.get(&mut key, &mut data, Get::SearchGte, None).unwrap();
@@ -569,12 +568,13 @@ fn cursor_search_gte_seed_above_all_keys_returns_not_found() {
         key.extend_from_slice(b"the-bucket\0");
         key.extend_from_slice(format!("object-{i:08}").as_bytes());
         db.put(
-            &DatabaseEntry::from_bytes(&key),
-            &DatabaseEntry::from_bytes(format!("v{i}").as_bytes()))
+            DatabaseEntry::from_bytes(&key),
+            DatabaseEntry::from_bytes(format!("v{i}").as_bytes()),
+        )
         .unwrap();
     }
 
-    let mut cursor = db.open_cursor( None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     // `b"L\0"` is lex-greater than every inserted key, which all start
     // with `b"K\0"`.  Pre-fix this would still panic in release on a
     // non-leftmost BIN whose key_prefix differs from the seed.
@@ -597,12 +597,13 @@ fn cursor_search_gte_seed_below_all_keys_returns_first() {
         key.extend_from_slice(b"bucket\0");
         key.extend_from_slice(format!("k-{i:06}").as_bytes());
         db.put(
-            &DatabaseEntry::from_bytes(&key),
-            &DatabaseEntry::from_bytes(format!("v{i}").as_bytes()))
+            DatabaseEntry::from_bytes(&key),
+            DatabaseEntry::from_bytes(format!("v{i}").as_bytes()),
+        )
         .unwrap();
     }
 
-    let mut cursor = db.open_cursor( None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     // `b"A"` < every key in the DB; SearchGte must return the smallest.
     let mut key = DatabaseEntry::from_bytes(b"A");
     let mut data = DatabaseEntry::new();
@@ -647,8 +648,9 @@ fn cursor_search_gte_walks_to_next_bin_when_chosen_bin_is_below_seed() {
     for i in 0..FANOUT_DOUBLED {
         let k = format!("k-{i:08}");
         db.put(
-            &DatabaseEntry::from_bytes(k.as_bytes()),
-            &DatabaseEntry::from_bytes(format!("v{i}").as_bytes()))
+            DatabaseEntry::from_bytes(k.as_bytes()),
+            DatabaseEntry::from_bytes(format!("v{i}").as_bytes()),
+        )
         .unwrap();
     }
 
@@ -657,7 +659,7 @@ fn cursor_search_gte_walks_to_next_bin_when_chosen_bin_is_below_seed() {
     // middle of the keyspace.  Even if the actual split point shifts,
     // the assertion is that SearchGte returns the first key strictly
     // greater than the seed.
-    let mut cursor = db.open_cursor( None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let seed = b"k-00000099a";
     let mut key = DatabaseEntry::from_bytes(seed);
     let mut data = DatabaseEntry::new();
@@ -683,12 +685,13 @@ fn cursor_search_gte_past_last_key_returns_not_found_with_many_bins() {
     for i in 0..FANOUT_DOUBLED {
         let k = format!("a-{i:08}");
         db.put(
-            &DatabaseEntry::from_bytes(k.as_bytes()),
-            &DatabaseEntry::from_bytes(format!("v{i}").as_bytes()))
+            DatabaseEntry::from_bytes(k.as_bytes()),
+            DatabaseEntry::from_bytes(format!("v{i}").as_bytes()),
+        )
         .unwrap();
     }
 
-    let mut cursor = db.open_cursor( None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut key = DatabaseEntry::from_bytes(b"z-this-is-after-everything");
     let mut data = DatabaseEntry::new();
     let s = cursor.get(&mut key, &mut data, Get::SearchGte, None).unwrap();
@@ -719,15 +722,16 @@ fn cursor_search_gte_long_prefix_seed_above_walks_to_next_bin() {
         }
         k.extend_from_slice(format!("{i:08}").as_bytes());
         db.put(
-            &DatabaseEntry::from_bytes(&k),
-            &DatabaseEntry::from_bytes(format!("v{i}").as_bytes()))
+            DatabaseEntry::from_bytes(&k),
+            DatabaseEntry::from_bytes(format!("v{i}").as_bytes()),
+        )
         .unwrap();
     }
 
     // `K\0gamma…` is lex-greater than `K\0alpha…` (the leftmost BIN's
     // prefix) and lex-less than `K\0omega…` (the rightmost BIN's prefix),
     // which puts it in case 3 against the leftmost BIN.
-    let mut cursor = db.open_cursor( None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let seed = b"K\0gamma\0";
     let mut key = DatabaseEntry::from_bytes(seed);
     let mut data = DatabaseEntry::new();
@@ -771,15 +775,16 @@ fn cursor_search_gte_in_every_inter_key_gap_agrees_with_get_next() {
     for i in 0..N {
         let k = format!("k-{i:08}");
         db.put(
-            &DatabaseEntry::from_bytes(k.as_bytes()),
-            &DatabaseEntry::from_bytes(format!("v{i}").as_bytes()))
+            DatabaseEntry::from_bytes(k.as_bytes()),
+            DatabaseEntry::from_bytes(format!("v{i}").as_bytes()),
+        )
         .unwrap();
     }
 
     // Harvest the in-order key list via Get::First + Get::Next.
     let mut keys_in_order: Vec<Vec<u8>> = Vec::with_capacity(N as usize);
     {
-        let mut cursor = db.open_cursor( None).unwrap();
+        let mut cursor = db.open_cursor(None).unwrap();
         let mut k = DatabaseEntry::new();
         let mut v = DatabaseEntry::new();
         let mut s = cursor.get(&mut k, &mut v, Get::First, None).unwrap();
@@ -795,7 +800,7 @@ fn cursor_search_gte_in_every_inter_key_gap_agrees_with_get_next() {
         let (k_a, k_b) = (&pair[0], &pair[1]);
         let mut probe = k_a.clone();
         probe.push(0); // lex-just-after k_a
-        let mut cursor = db.open_cursor( None).unwrap();
+        let mut cursor = db.open_cursor(None).unwrap();
         let mut key = DatabaseEntry::from_bytes(&probe);
         let mut data = DatabaseEntry::new();
         let s = cursor.get(&mut key, &mut data, Get::SearchGte, None).unwrap();
@@ -845,13 +850,11 @@ fn cursor_search_gte_oracle_brute_force_small_random() {
     }
 
     for k in &keys {
-        db.put(
-            &DatabaseEntry::from_bytes(k),
-            &DatabaseEntry::from_bytes(b"v"))
-        .unwrap();
+        db.put(DatabaseEntry::from_bytes(k), DatabaseEntry::from_bytes(b"v"))
+            .unwrap();
     }
 
-    let mut cursor = db.open_cursor( None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let probes: Vec<Vec<u8>> = {
         let mut p: Vec<Vec<u8>> = Vec::new();
         for k in &keys {
@@ -939,8 +942,8 @@ mod prop_full_scan_order {
 
             for k in &keys {
                 db.put(
-                    &DatabaseEntry::from_bytes(k),
-                    &DatabaseEntry::from_bytes(b"v")).unwrap();
+                    DatabaseEntry::from_bytes(k),
+                    DatabaseEntry::from_bytes(b"v")).unwrap();
             }
 
             // Forward scan: Get::First + Get::Next* must be lex-sorted and
@@ -1023,16 +1026,12 @@ fn cursor_next_dup_on_non_dup_db_returns_not_found() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open_env_and_db_named(&dir, "next_dup_non_dup");
 
-    db.put(
-        &DatabaseEntry::from_bytes(b"a"),
-        &DatabaseEntry::from_bytes(b"1"))
-    .unwrap();
-    db.put(
-        &DatabaseEntry::from_bytes(b"b"),
-        &DatabaseEntry::from_bytes(b"2"))
-    .unwrap();
+    db.put(DatabaseEntry::from_bytes(b"a"), DatabaseEntry::from_bytes(b"1"))
+        .unwrap();
+    db.put(DatabaseEntry::from_bytes(b"b"), DatabaseEntry::from_bytes(b"2"))
+        .unwrap();
 
-    let mut cursor = db.open_cursor( None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut key = DatabaseEntry::from_bytes(b"a");
     let mut data = DatabaseEntry::new();
     let s = cursor.get(&mut key, &mut data, Get::Search, None).unwrap();
@@ -1059,16 +1058,12 @@ fn cursor_prev_dup_on_non_dup_db_returns_not_found() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open_env_and_db_named(&dir, "prev_dup_non_dup");
 
-    db.put(
-        &DatabaseEntry::from_bytes(b"a"),
-        &DatabaseEntry::from_bytes(b"1"))
-    .unwrap();
-    db.put(
-        &DatabaseEntry::from_bytes(b"b"),
-        &DatabaseEntry::from_bytes(b"2"))
-    .unwrap();
+    db.put(DatabaseEntry::from_bytes(b"a"), DatabaseEntry::from_bytes(b"1"))
+        .unwrap();
+    db.put(DatabaseEntry::from_bytes(b"b"), DatabaseEntry::from_bytes(b"2"))
+        .unwrap();
 
-    let mut cursor = db.open_cursor( None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
     let s = cursor.get(&mut key, &mut data, Get::Last, None).unwrap();
@@ -1095,12 +1090,13 @@ fn cursor_search_both_on_non_dup_db_validates_data() {
     let (_env, db) = open_env_and_db_named(&dir, "search_both_non_dup");
 
     db.put(
-        &DatabaseEntry::from_bytes(b"k"),
-        &DatabaseEntry::from_bytes(b"stored"))
+        DatabaseEntry::from_bytes(b"k"),
+        DatabaseEntry::from_bytes(b"stored"),
+    )
     .unwrap();
 
     // Probe with the wrong data.
-    let mut cursor = db.open_cursor( None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut k = DatabaseEntry::from_bytes(b"k");
     let mut d = DatabaseEntry::from_bytes(b"different");
     let s = cursor.get(&mut k, &mut d, Get::SearchBoth, None).unwrap();
@@ -1129,12 +1125,10 @@ fn cursor_search_both_on_non_dup_db_missing_key_still_not_found() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open_env_and_db_named(&dir, "search_both_missing_key");
 
-    db.put(
-        &DatabaseEntry::from_bytes(b"k"),
-        &DatabaseEntry::from_bytes(b"v"))
-    .unwrap();
+    db.put(DatabaseEntry::from_bytes(b"k"), DatabaseEntry::from_bytes(b"v"))
+        .unwrap();
 
-    let mut cursor = db.open_cursor( None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut k = DatabaseEntry::from_bytes(b"missing");
     let mut d = DatabaseEntry::from_bytes(b"anything");
     let s = cursor.get(&mut k, &mut d, Get::SearchBoth, None).unwrap();
@@ -1150,13 +1144,11 @@ fn cursor_search_lte_positions_on_floor() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open_env_and_db_named(&dir, "search_lte_floor");
     for (k, v) in [(b"10", b"a"), (b"20", b"b"), (b"30", b"c")] {
-        db.put(
-            &DatabaseEntry::from_bytes(k),
-            &DatabaseEntry::from_bytes(v))
-        .unwrap();
+        db.put(DatabaseEntry::from_bytes(k), DatabaseEntry::from_bytes(v))
+            .unwrap();
     }
 
-    let mut cursor = db.open_cursor( None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut key = DatabaseEntry::from_bytes(b"25");
     let mut data = DatabaseEntry::new();
     assert_eq!(
@@ -1197,13 +1189,11 @@ fn cursor_first_dup_and_last_dup_position_within_dup_set() {
         .with_sorted_duplicates(true);
     let db = env.open_database(None, "first_last_dup", &db_config).unwrap();
     for v in [b"a", b"b", b"c"] {
-        db.put(
-            &DatabaseEntry::from_bytes(b"k"),
-            &DatabaseEntry::from_bytes(v))
-        .unwrap();
+        db.put(DatabaseEntry::from_bytes(b"k"), DatabaseEntry::from_bytes(v))
+            .unwrap();
     }
 
-    let mut cursor = db.open_cursor( None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut key = DatabaseEntry::from_bytes(b"k");
     let mut data = DatabaseEntry::new();
     // Position on the key (Search lands on the first dup), then step to the
@@ -1253,15 +1243,13 @@ fn cursor_with_txn_put_is_rolled_back_on_abort() {
     let mut cursor = db.open_cursor_in(&txn, None).unwrap();
 
     let (k, v) = kv(b"rolled-back-key", b"rolled-back-val");
-    let s = cursor.put(&k, &v, Put::Overwrite).unwrap();
-    ;
-
+    let _s = cursor.put(&k, &v, Put::Overwrite).unwrap();
     // Cursor must be closed before the txn ends.
     cursor.close().unwrap();
     txn.abort().unwrap();
 
     // Open a fresh, auto-commit cursor and confirm the put did NOT persist.
-    let mut probe = db.open_cursor( None).unwrap();
+    let mut probe = db.open_cursor(None).unwrap();
     let mut out_k = DatabaseEntry::new();
     let mut out_v = DatabaseEntry::new();
     let status = probe.get(&mut out_k, &mut out_v, Get::First, None).unwrap();
@@ -1291,7 +1279,8 @@ fn cursor_with_txn_put_invisible_via_get_after_abort() {
 
     let mut out = DatabaseEntry::new();
     let status = db.get_into(None, &k, &mut out).unwrap();
-    assert!(!status,
+    assert!(
+        !status,
         "value written through a cursor opened with Some(&txn) must vanish \
          on txn.abort() (audit C1)"
     );
@@ -1435,7 +1424,7 @@ mod secondary_cursor_txn {
         let pk = DatabaseEntry::from_bytes(b"pk1");
         let pv = DatabaseEntry::from_bytes(b"Apple");
         // Auto-hook maintains secondary via primary.put().
-        primary.lock().put( &pk, &pv).unwrap();
+        primary.lock().put(&pk, &pv).unwrap();
 
         // Open a secondary cursor under a txn with a non-default config.
         let txn = env.begin_transaction(None).unwrap();
@@ -1468,7 +1457,7 @@ mod secondary_cursor_txn {
         cursor2.close().unwrap();
         txn2.abort().unwrap();
 
-        let mut probe = secondary.open_cursor( None).unwrap();
+        let mut probe = secondary.open_cursor(None).unwrap();
         let s = probe
             .get_search_key(
                 &DatabaseEntry::from_bytes(b"A"),

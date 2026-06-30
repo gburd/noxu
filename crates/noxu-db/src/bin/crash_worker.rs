@@ -228,20 +228,22 @@ fn main() {
             let k = DatabaseEntry::from_bytes(b"K");
 
             let t1 = env.begin_transaction(None).expect("begin t1");
-            db.put_in(&t1, &k, &DatabaseEntry::from_bytes(b"v1"))
+            db.put_in(&t1, &k, DatabaseEntry::from_bytes(b"v1"))
                 .expect("t1 put");
             t1.abort().expect("t1 abort");
 
             let t3 = env.begin_transaction(None).expect("begin t3");
-            db.put_in(&t3, &k, &DatabaseEntry::from_bytes(b"v3"))
+            db.put_in(&t3, &k, DatabaseEntry::from_bytes(b"v3"))
                 .expect("t3 put");
             t3.commit().expect("t3 commit");
 
             // T2 stays open (active at crash) so the undo pass is not skipped.
             let t2 = env.begin_transaction(None).expect("begin t2");
-            db.put_in(&t2,
-                &DatabaseEntry::from_bytes(b"other"),
-                &DatabaseEntry::from_bytes(b"x"))
+            db.put_in(
+                &t2,
+                DatabaseEntry::from_bytes(b"other"),
+                DatabaseEntry::from_bytes(b"x"),
+            )
             .expect("t2 put");
             // Leak the handle so no abort/commit record is written on drop.
             std::mem::forget(t2);
@@ -268,7 +270,7 @@ fn main() {
                 let k = i.to_be_bytes();
                 let key = DatabaseEntry::from_bytes(&k);
                 let val = DatabaseEntry::from_bytes(b"v1");
-                db.put( &key, &val).expect("put v1");
+                db.put(&key, &val).expect("put v1");
             }
             env.checkpoint(Some(&CheckpointConfig::new().with_force(true)))
                 .expect("full checkpoint");
@@ -279,7 +281,7 @@ fn main() {
                 let k = i.to_be_bytes();
                 let key = DatabaseEntry::from_bytes(&k);
                 let val = DatabaseEntry::from_bytes(b"v2");
-                db.put( &key, &val).expect("put v2");
+                db.put(&key, &val).expect("put v2");
             }
             env.checkpoint(Some(&CheckpointConfig::new().with_force(true)))
                 .expect("delta checkpoint");
@@ -305,7 +307,7 @@ fn main() {
                 let k = i.to_be_bytes();
                 let key = DatabaseEntry::from_bytes(&k);
                 let val = DatabaseEntry::from_bytes(b"before_ckpt");
-                db.put( &key, &val).expect("put");
+                db.put(&key, &val).expect("put");
             }
 
             // Force a checkpoint so the BINs are flushed to the WAL.
@@ -316,7 +318,7 @@ fn main() {
             // Write 1 post-checkpoint key.
             let post_key = DatabaseEntry::from_bytes(b"post_ckpt");
             let post_val = DatabaseEntry::from_bytes(b"after_ckpt");
-            db.put( &post_key, &post_val).expect("put post");
+            db.put(&post_key, &post_val).expect("put post");
 
             flag(&dir, "phase1_done");
 

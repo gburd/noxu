@@ -21,9 +21,7 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
 
-use noxu_db::{
-    DatabaseConfig, DatabaseEntry, EnvironmentConfig, OperationStatus,
-};
+use noxu_db::{DatabaseConfig, DatabaseEntry, EnvironmentConfig};
 use tempfile::TempDir;
 
 fn open_env_and_db(dir: &TempDir) -> (noxu_db::Environment, noxu_db::Database) {
@@ -56,7 +54,7 @@ fn test_concurrent_reads_do_not_block() {
     for i in 0u8..20 {
         let k = DatabaseEntry::from_bytes(&[i]);
         let v = DatabaseEntry::from_bytes(&[i, i]);
-        db.put( &k, &v).unwrap();
+        db.put(&k, &v).unwrap();
     }
 
     let n_threads = 8;
@@ -75,7 +73,8 @@ fn test_concurrent_reads_do_not_block() {
             for i in 0u8..20 {
                 let k = DatabaseEntry::from_bytes(&[i]);
                 let mut out = DatabaseEntry::new();
-                let status = db_clone.get_into(Some(&txn), &k, &mut out).unwrap();
+                let status =
+                    db_clone.get_into(Some(&txn), &k, &mut out).unwrap();
                 assert!(status);
                 assert_eq!(out.data(), &[i, i]);
             }
@@ -115,8 +114,9 @@ fn test_uncommitted_write_blocks_reader_until_commit() {
 
     // Pre-populate with "initial" (committed).
     db.put(
-        &DatabaseEntry::from_bytes(key_bytes),
-        &DatabaseEntry::from_bytes(b"initial"))
+        DatabaseEntry::from_bytes(key_bytes),
+        DatabaseEntry::from_bytes(b"initial"),
+    )
     .unwrap();
 
     // Barrier: writer signals when it holds the write lock.
@@ -128,9 +128,11 @@ fn test_uncommitted_write_blocks_reader_until_commit() {
 
     let writer_handle = thread::spawn(move || {
         let txn = env_w.begin_transaction(None).unwrap();
-        db_w.put_in(&txn,
-            &DatabaseEntry::from_bytes(key_bytes),
-            &DatabaseEntry::from_bytes(b"new"))
+        db_w.put_in(
+            &txn,
+            DatabaseEntry::from_bytes(key_bytes),
+            DatabaseEntry::from_bytes(b"new"),
+        )
         .unwrap();
         // Notify the reader that we hold the write lock.
         b_w.wait();
@@ -145,8 +147,9 @@ fn test_uncommitted_write_blocks_reader_until_commit() {
     barrier.wait();
     let start = std::time::Instant::now();
     let mut out = DatabaseEntry::new();
-    let status =
-        db.get_into(None, &DatabaseEntry::from_bytes(key_bytes), &mut out).unwrap();
+    let status = db
+        .get_into(None, DatabaseEntry::from_bytes(key_bytes), &mut out)
+        .unwrap();
     let elapsed = start.elapsed();
 
     writer_handle.join().unwrap();
@@ -202,10 +205,8 @@ fn test_atomic_commit_all_keys_visible() {
     for i in 0..N {
         let k = format!("batch_key_{:03}", i).into_bytes();
         let v = format!("batch_val_{:03}", i).into_bytes();
-        db.put_in(&txn,
-            &DatabaseEntry::from_vec(k),
-            &DatabaseEntry::from_vec(v))
-        .unwrap();
+        db.put_in(&txn, DatabaseEntry::from_vec(k), DatabaseEntry::from_vec(v))
+            .unwrap();
     }
     txn.commit().unwrap();
 
@@ -214,9 +215,10 @@ fn test_atomic_commit_all_keys_visible() {
         let k = format!("batch_key_{:03}", i).into_bytes();
         let mut out = DatabaseEntry::new();
         let status = db
-            .get_into(None, &DatabaseEntry::from_vec(k.clone()), &mut out)
+            .get_into(None, DatabaseEntry::from_vec(k.clone()), &mut out)
             .unwrap();
-        assert!(status,
+        assert!(
+            status,
             "key {} not found after commit",
             String::from_utf8_lossy(&k)
         );
@@ -258,9 +260,11 @@ fn test_concurrent_writes_disjoint_keys() {
                 let key = format!("disjoint_{:06}", key_num).into_bytes();
                 let val = format!("val_{}", key_num).into_bytes();
                 db_clone
-                    .put_in(&txn,
-                        &DatabaseEntry::from_vec(key),
-                        &DatabaseEntry::from_vec(val))
+                    .put_in(
+                        &txn,
+                        DatabaseEntry::from_vec(key),
+                        DatabaseEntry::from_vec(val),
+                    )
                     .unwrap();
             }
             txn.commit().unwrap();
@@ -278,9 +282,10 @@ fn test_concurrent_writes_disjoint_keys() {
             let key = format!("disjoint_{:06}", key_num).into_bytes();
             let mut out = DatabaseEntry::new();
             let status = db
-                .get_into(None, &DatabaseEntry::from_vec(key.clone()), &mut out)
+                .get_into(None, DatabaseEntry::from_vec(key.clone()), &mut out)
                 .unwrap();
-            assert!(status,
+            assert!(
+                status,
                 "key {} missing after concurrent inserts",
                 String::from_utf8_lossy(&key)
             );
@@ -303,10 +308,8 @@ fn test_tree_memory_counter_increases_with_inserts() {
     for i in 0u32..100 {
         let key = format!("mem_key_{:05}", i).into_bytes();
         let val = vec![i as u8; 64]; // 64 bytes per entry
-        db.put(
-            &DatabaseEntry::from_vec(key),
-            &DatabaseEntry::from_vec(val))
-        .unwrap();
+        db.put(DatabaseEntry::from_vec(key), DatabaseEntry::from_vec(val))
+            .unwrap();
     }
 
     // Check via environment stats: the utilization tracker should reflect entries.
@@ -349,9 +352,11 @@ fn test_concurrent_inserts_then_full_scan() {
                 let key = format!("scan_{:06}", key_num).into_bytes();
                 let val = format!("v{}", key_num).into_bytes();
                 db_clone
-                    .put_in(&txn,
-                        &DatabaseEntry::from_vec(key),
-                        &DatabaseEntry::from_vec(val))
+                    .put_in(
+                        &txn,
+                        DatabaseEntry::from_vec(key),
+                        DatabaseEntry::from_vec(val),
+                    )
                     .unwrap();
             }
             txn.commit().unwrap();
@@ -398,8 +403,7 @@ fn test_utilization_tracker_counts_writes() {
     for i in 0..n {
         let k = format!("util_{:04}", i).into_bytes();
         let v = format!("vutil_{}", i).into_bytes();
-        db.put( &DatabaseEntry::from_vec(k), &DatabaseEntry::from_vec(v))
-            .unwrap();
+        db.put(DatabaseEntry::from_vec(k), DatabaseEntry::from_vec(v)).unwrap();
     }
 
     // Verify all writes are durably recorded via the public count() API.
@@ -434,7 +438,7 @@ fn test_concurrent_overlapping_writes_abort_does_not_clobber_commit() {
 
     // Seed: install a known base value.
     let base = DatabaseEntry::from_bytes(b"base");
-    db.put( &key, &base).unwrap();
+    db.put(&key, &base).unwrap();
 
     // T2: acquires write lock on the key and commits.
     // T1: tries to write the same key with a different value, but aborts.
@@ -503,7 +507,7 @@ fn test_reader_sees_before_image_after_concurrent_writer_aborts() {
     // Seed a base value.
     let key = DatabaseEntry::from_bytes(b"abort_race_key");
     let initial = DatabaseEntry::from_bytes(b"initial");
-    db.put( &key, &initial).unwrap();
+    db.put(&key, &initial).unwrap();
 
     let writer_ready = Arc::new(Barrier::new(2));
     let writer_ready2 = Arc::clone(&writer_ready);
@@ -577,7 +581,7 @@ fn test_h1_readers_not_blocked_during_large_abort() {
     // Seed an unrelated key that the concurrent reader will access.
     let sentinel_key = DatabaseEntry::from_bytes(b"__sentinel__");
     let sentinel_val = DatabaseEntry::from_bytes(b"ok");
-    db.put( &sentinel_key, &sentinel_val).unwrap();
+    db.put(&sentinel_key, &sentinel_val).unwrap();
 
     // Write N keys in a single transaction (the "large" txn to abort).
     let large_txn = env.begin_transaction(None).unwrap();
@@ -610,15 +614,14 @@ fn test_h1_readers_not_blocked_during_large_abort() {
     for _ in 0..20 {
         let t0 = Instant::now();
         let mut out = DatabaseEntry::new();
-        let status =
-            db_r.get_into(None, &sentinel_key, &mut out).expect("get must not fail");
+        let status = db_r
+            .get_into(None, &sentinel_key, &mut out)
+            .expect("get must not fail");
         let elapsed_us = t0.elapsed().as_micros();
         if elapsed_us > max_read_us {
             max_read_us = elapsed_us;
         }
-        assert!(status,
-            "sentinel key must be readable during abort"
-        );
+        assert!(status, "sentinel key must be readable during abort");
         assert_eq!(out.data(), b"ok");
         thread::sleep(Duration::from_millis(2));
     }

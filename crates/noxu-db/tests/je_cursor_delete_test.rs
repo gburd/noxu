@@ -28,16 +28,14 @@ fn open_env_db(
 
 fn put_simple(db: &noxu_db::Database, pairs: &[(&[u8], &[u8])]) {
     for (k, v) in pairs {
-        db.put(
-            &DatabaseEntry::from_bytes(k),
-            &DatabaseEntry::from_bytes(v))
-        .unwrap();
+        db.put(DatabaseEntry::from_bytes(k), DatabaseEntry::from_bytes(v))
+            .unwrap();
     }
 }
 
 fn collect_keys(db: &noxu_db::Database) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
-    let mut c = db.open_cursor( None).unwrap();
+    let mut c = db.open_cursor(None).unwrap();
     let mut k = DatabaseEntry::new();
     let mut d = DatabaseEntry::new();
     let mut s = c.get(&mut k, &mut d, Get::First, None).unwrap();
@@ -79,7 +77,7 @@ fn dbcursor_delete_records_matching_predicate() {
     let keys: Vec<Vec<u8>> = collect_keys(&db);
     for k in &keys {
         if k.first() == Some(&b'f') {
-            let s = db.delete( &DatabaseEntry::from_bytes(k)).unwrap();
+            let s = db.delete(DatabaseEntry::from_bytes(k)).unwrap();
             assert!(s);
             deleted += 1;
         }
@@ -119,7 +117,7 @@ fn dbcursor_delete_all_via_walk_empties_db() {
 
     let keys = collect_keys(&db);
     for k in &keys {
-        db.delete( &DatabaseEntry::from_bytes(k)).unwrap();
+        db.delete(DatabaseEntry::from_bytes(k)).unwrap();
     }
 
     assert_eq!(db.count().unwrap(), 0);
@@ -140,11 +138,11 @@ fn dbcursor_insert_delete_reinsert_no_overwrite_succeeds() {
     let (_env, db) = open_env_db(&dir, "ins_del_ins");
     let k = DatabaseEntry::from_bytes(b"ka");
     let v = DatabaseEntry::from_bytes(b"va");
-    db.put( &k, &v).unwrap();
+    db.put(&k, &v).unwrap();
 
     // Delete via cursor.
     {
-        let mut c = db.open_cursor( None).unwrap();
+        let mut c = db.open_cursor(None).unwrap();
         let mut sk = DatabaseEntry::from_bytes(b"ka");
         let mut sd = DatabaseEntry::new();
         let s = c.get(&mut sk, &mut sd, Get::Search, None).unwrap();
@@ -153,16 +151,12 @@ fn dbcursor_insert_delete_reinsert_no_overwrite_succeeds() {
     }
 
     // Re-insert with putNoOverwrite must succeed (slot is empty).
-    let s = db.put_no_overwrite( &k, &v).unwrap();
-    assert_eq!(
-        s,
-        OperationStatus::Success,
-        "re-insert via put_no_overwrite must succeed after delete"
-    );
+    let s = db.put_no_overwrite(&k, &v).unwrap();
+    assert!(s, "re-insert via put_no_overwrite must succeed after delete");
 
     // A second putNoOverwrite must fail (KeyExists).
-    let s = db.put_no_overwrite( &k, &v).unwrap();
-    assert_eq!(s, OperationStatus::KeyExists);
+    let s = db.put_no_overwrite(&k, &v).unwrap();
+    assert!(!s);
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -178,9 +172,9 @@ fn dbcursor_put_current_after_delete_does_not_revive() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open_env_db(&dir, "del_putcur");
     let k = DatabaseEntry::from_bytes(b"x");
-    db.put( &k, &DatabaseEntry::from_bytes(b"orig")).unwrap();
+    db.put(&k, DatabaseEntry::from_bytes(b"orig")).unwrap();
 
-    let mut c = db.open_cursor( None).unwrap();
+    let mut c = db.open_cursor(None).unwrap();
     let mut sk = DatabaseEntry::from_bytes(b"x");
     let mut sd = DatabaseEntry::new();
     c.get(&mut sk, &mut sd, Get::Search, None).unwrap();

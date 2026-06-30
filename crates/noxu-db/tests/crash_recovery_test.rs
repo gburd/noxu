@@ -21,9 +21,7 @@
 //!
 //! The worker binary path is injected by cargo as `CARGO_BIN_EXE_crash_worker`.
 
-use noxu_db::{
-    DatabaseConfig, DatabaseEntry, EnvironmentConfig, OperationStatus,
-};
+use noxu_db::{DatabaseConfig, DatabaseEntry, EnvironmentConfig};
 use std::path::Path;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -196,9 +194,6 @@ fn test_committed_writes_survive_sigkill() {
             false => {
                 missing += 1;
             }
-            other => {
-                panic!("unexpected status {other:?} for committed key {i}")
-            }
         }
     }
     assert_eq!(
@@ -266,7 +261,8 @@ fn test_uncommitted_transaction_leaves_no_trace() {
     // Sentinel must survive.
     let sentinel_key = DatabaseEntry::from_bytes(b"sentinel");
     let mut val = DatabaseEntry::new();
-    assert!(db.get_into(None, &sentinel_key, &mut val).unwrap(),
+    assert!(
+        db.get_into(None, &sentinel_key, &mut val).unwrap(),
         "sentinel key missing after recovery — committed data was lost"
     );
     assert_eq!(val.data(), b"ok");
@@ -421,7 +417,6 @@ fn test_commit_ordering_preserved_after_sigkill() {
                 );
             }
             false => missing += 1,
-            s => panic!("unexpected status {s:?} for T1 key {i}"),
         }
     }
     assert_eq!(missing, 0, "{missing} T1 keys lost after recovery");
@@ -645,9 +640,6 @@ fn open_txn_spanning_checkpoint_recovers_correctly() {
                 missing_committed += 1;
                 eprintln!("committed key missing after recovery: {k}");
             }
-            other => {
-                panic!("unexpected status {other:?} for committed key {k}")
-            }
         }
     }
     assert_eq!(
@@ -725,7 +717,8 @@ fn aborted_then_committed_same_key_recovers_committed_value() {
     let key = DatabaseEntry::from_bytes(b"K");
     let mut val = DatabaseEntry::new();
     let status = db.get_into(None, &key, &mut val).unwrap();
-    assert!(status,
+    assert!(
+        status,
         "committed key K must be present after recovery (T3's write must not \
          be clobbered by the undo of T1's aborted write of the same key)"
     );
@@ -789,7 +782,6 @@ fn in_redo_bin_flushed_by_checkpoint_survives_crash() {
             false => {
                 missing += 1;
             }
-            other => panic!("unexpected status {other:?} for key {i}"),
         }
     }
     assert_eq!(
@@ -802,7 +794,8 @@ fn in_redo_bin_flushed_by_checkpoint_survives_crash() {
     let post_key = DatabaseEntry::from_bytes(b"post_ckpt");
     let mut post_val = DatabaseEntry::new();
     let status = db.get_into(None, &post_key, &mut post_val).unwrap();
-    assert!(status,
+    assert!(
+        status,
         "post-checkpoint key must survive crash recovery (LN-redo)"
     );
     assert_eq!(post_val.data(), b"after_ckpt");
@@ -858,7 +851,6 @@ fn in_redo_bin_delta_reconstituted_survives_crash() {
             false => {
                 missing += 1;
             }
-            other => panic!("unexpected status {other:?} for key {i}"),
         }
     }
     assert_eq!(
@@ -1004,7 +996,6 @@ fn test_concurrent_commit_sync_survives_sigkill() {
                     );
                 }
                 false => missing.push(id),
-                other => panic!("unexpected status {other:?} for key {id}"),
             }
         }
     }

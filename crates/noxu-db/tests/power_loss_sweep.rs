@@ -57,9 +57,7 @@
 //!     CommitSync), this is closer to power-loss semantics than
 //!     a clean `close()`.
 
-use noxu_db::{
-    DatabaseConfig, DatabaseEntry, EnvironmentConfig, OperationStatus,
-};
+use noxu_db::{DatabaseConfig, DatabaseEntry, EnvironmentConfig};
 use std::path::Path;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -132,21 +130,13 @@ fn power_loss_sweep_thousand_iterations() {
             for i in 0u32..50 {
                 let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
                 let mut val = DatabaseEntry::new();
-                match db.get_into(None, &key, &mut val).unwrap() {
-                    true => {
-                        if val.data() == b"committed" {
-                            present[i as usize] = true;
-                        } else {
-                            return Err(format!(
-                                "key {i} has wrong value: {:?}",
-                                val.data()
-                            ));
-                        }
-                    }
-                    false => {}
-                    other => {
+                if db.get_into(None, &key, &mut val).unwrap() {
+                    if val.data() == b"committed" {
+                        present[i as usize] = true;
+                    } else {
                         return Err(format!(
-                            "unexpected status {other:?} for key {i}"
+                            "key {i} has wrong value: {:?}",
+                            val.data()
                         ));
                     }
                 }
@@ -176,10 +166,7 @@ fn power_loss_sweep_thousand_iterations() {
             for i in 1000u32..1050 {
                 let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
                 let mut val = DatabaseEntry::new();
-                if matches!(
-                    db.get_into(None, &key, &mut val).unwrap(),
-                    OperationStatus::Success
-                ) {
+                if db.get_into(None, &key, &mut val).unwrap() {
                     return Err(format!("uncommitted key {i} leaked"));
                 }
             }
@@ -270,10 +257,7 @@ fn power_loss_sweep_smoke() {
             for i in 1000u32..1050 {
                 let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
                 let mut val = DatabaseEntry::new();
-                if matches!(
-                    db.get_into(None, &key, &mut val).unwrap(),
-                    OperationStatus::Success
-                ) {
+                if db.get_into(None, &key, &mut val).unwrap() {
                     return Err(format!("uncommitted key {i} leaked"));
                 }
             }

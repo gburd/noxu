@@ -68,7 +68,7 @@ fn open_pri_sec(
         let value = DatabaseEntry::from_bytes(b"value");
         for i in 0..n as u32 {
             let k = DatabaseEntry::from_bytes(&i.to_be_bytes());
-            pri.put( &k, &value).unwrap();
+            pri.put(&k, &value).unwrap();
         }
     }
 
@@ -106,7 +106,7 @@ fn wave11n_bug3_get_search_key_then_next_dup_full_yields_all() {
     // Iterate every bucket and confirm get_search_key + get_next_dup_full
     // visits exactly the expected primary keys for that bucket.
     for bucket in 0..BUCKETS as u8 {
-        let mut cursor = secondary.open_cursor( None).unwrap();
+        let mut cursor = secondary.open_cursor(None).unwrap();
         let search = DatabaseEntry::from_bytes(&[bucket]);
         let mut p_key = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
@@ -173,7 +173,7 @@ fn wave11n_bug4_get_first_get_next_full_walk_terminates() {
     const BUCKETS: u32 = 16;
     let (_tmp, _env, _primary, secondary) = open_pri_sec(N, BUCKETS);
 
-    let mut cursor = secondary.open_cursor( None).unwrap();
+    let mut cursor = secondary.open_cursor(None).unwrap();
     let mut sec_key = DatabaseEntry::new();
     let mut p_key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();

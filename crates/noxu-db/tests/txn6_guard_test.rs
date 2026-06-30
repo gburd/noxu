@@ -3,9 +3,7 @@
 //! JE LockerFactory.getWritableLocker/getReadableLocker throw
 //! IllegalArgumentException on every op.
 
-use noxu_db::{
-    DatabaseConfig, DatabaseEntry, EnvironmentConfig, OperationStatus,
-};
+use noxu_db::{DatabaseConfig, DatabaseEntry, EnvironmentConfig};
 
 #[test]
 fn txn6_get_put_delete_reject_txn_on_non_txnal_db() {
@@ -41,7 +39,7 @@ fn txn6_get_put_delete_reject_txn_on_non_txnal_db() {
     );
 
     // None (auto-commit) must still work on the non-txnal DB.
-    assert!(db.put( &key, &val).is_ok());
+    assert!(db.put(&key, &val).is_ok());
     assert!(db.get_into(None, &key, &mut out).unwrap());
     let _ = txn.abort();
 }

@@ -111,14 +111,14 @@ fn d1b_secondary_dup_admits_multiple_primaries() {
     let pk1 = DatabaseEntry::from_bytes(b"pk1");
     let v1 = DatabaseEntry::from_bytes(b"Apple");
     // primary.put() triggers the auto-hook; no explicit update_secondary.
-    primary.lock().put( &pk1, &v1).unwrap();
+    primary.lock().put(&pk1, &v1).unwrap();
 
     // Second primary record sharing the same secondary key ('A').
     // v1.6: this MUST succeed and store a second duplicate of 'A'.
     let pk2 = DatabaseEntry::from_bytes(b"pk2");
     let v2 = DatabaseEntry::from_bytes(b"Apricot");
     // Auto-hook inserts (A, pk2) alongside (A, pk1).
-    primary.lock().put( &pk2, &v2).unwrap();
+    primary.lock().put(&pk2, &v2).unwrap();
 
     // The inner index now holds two duplicates of 'A'.
     assert_eq!(
@@ -128,7 +128,7 @@ fn d1b_secondary_dup_admits_multiple_primaries() {
     );
 
     // Iterate the cursor and confirm both primaries surface.
-    let mut cursor = sec.open_cursor( None).unwrap();
+    let mut cursor = sec.open_cursor(None).unwrap();
     let mut sec_key = DatabaseEntry::new();
     let mut p_key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
@@ -175,7 +175,7 @@ fn d1b_one_to_one_happy_path() {
     for &(pk, val) in entries {
         let pk = DatabaseEntry::from_bytes(pk);
         let v = DatabaseEntry::from_bytes(val);
-        primary.lock().put( &pk, &v).unwrap();
+        primary.lock().put(&pk, &v).unwrap();
         // Auto-hook maintains secondary.
     }
 
@@ -215,7 +215,7 @@ fn d1b_same_primary_idempotent_reinsert_ok() {
     let pk = DatabaseEntry::from_bytes(b"pk1");
     let v = DatabaseEntry::from_bytes(b"Apple");
     // primary.put() auto-maintains secondary (inserts (A, pk1)).
-    primary.lock().put( &pk, &v).unwrap();
+    primary.lock().put(&pk, &v).unwrap();
 
     // With D6, calling update_secondary for the same (sec_key, pri_key) pair
     // that the auto-hook already inserted raises SecondaryIntegrityException.
@@ -232,7 +232,7 @@ fn d1b_same_primary_idempotent_reinsert_ok() {
     let mut p_key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
     let st = sec
-        .get_into(None, &DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
+        .get_into(None, DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
         .unwrap();
     assert!(st);
     assert_eq!(p_key.get_data().unwrap(), b"pk1");
@@ -265,11 +265,11 @@ fn d1b_cursor_walks_all_duplicates_for_shared_sec_key() {
     ] {
         let pk_e = DatabaseEntry::from_bytes(pk);
         let v_e = DatabaseEntry::from_bytes(val);
-        primary.lock().put( &pk_e, &v_e).unwrap();
+        primary.lock().put(&pk_e, &v_e).unwrap();
         // Auto-hook maintains secondary.
     }
 
-    let mut cursor = sec.open_cursor( None).unwrap();
+    let mut cursor = sec.open_cursor(None).unwrap();
     let mut sec_key = DatabaseEntry::new();
     let mut p_key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
@@ -348,13 +348,13 @@ fn c3_primary_put_drives_registered_secondary() {
     // Plain `db.put` - no manual update_secondary call.
     let pk = DatabaseEntry::from_bytes(b"pk1");
     let v = DatabaseEntry::from_bytes(b"Apple");
-    primary.lock().put( &pk, &v).unwrap();
+    primary.lock().put(&pk, &v).unwrap();
 
     // The secondary must already be visible.
     let mut p_key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
     let st = sec
-        .get_into(None, &DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
+        .get_into(None, DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
         .unwrap();
     assert!(st);
     assert_eq!(p_key.get_data().unwrap(), b"pk1");
@@ -385,20 +385,36 @@ fn c3_primary_put_under_txn_rolls_back_secondary_on_abort() {
     // Same txn sees its own auto-maintained secondary write.
     let mut p_key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
-    assert!(sec.get_into(Some(&txn),
-            &DatabaseEntry::from_bytes(b"A"),
+    assert!(
+        sec.get_into(
+            Some(&txn),
+            DatabaseEntry::from_bytes(b"A"),
             &mut p_key,
             &mut data
         )
-        .unwrap());
+        .unwrap()
+    );
     txn.abort().unwrap();
 
     // After abort: primary and secondary both gone.
-    assert!(!(primary.lock().get_into(None, &pk, &mut DatabaseEntry::new()).unwrap()));
+    assert!(
+        !(primary
+            .lock()
+            .get_into(None, &pk, &mut DatabaseEntry::new())
+            .unwrap())
+    );
     let mut p_key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
-    assert!(!(sec.get_into(None, &DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
-            .unwrap()));
+    assert!(
+        !(sec
+            .get_into(
+                None,
+                DatabaseEntry::from_bytes(b"A"),
+                &mut p_key,
+                &mut data
+            )
+            .unwrap())
+    );
 }
 
 /// v1.6 (audit C3): primary `delete` automatically removes the
@@ -421,10 +437,10 @@ fn c3_primary_delete_drives_registered_secondary() {
 
     let pk = DatabaseEntry::from_bytes(b"pk1");
     let v = DatabaseEntry::from_bytes(b"Apple");
-    primary.lock().put( &pk, &v).unwrap();
+    primary.lock().put(&pk, &v).unwrap();
     assert_eq!(sec.count().unwrap(), 1);
 
-    let st = primary.lock().delete( &pk).unwrap();
+    let st = primary.lock().delete(&pk).unwrap();
     assert!(st);
     assert_eq!(sec.count().unwrap(), 0);
 }
@@ -449,24 +465,18 @@ fn c3_primary_delete_preserves_other_dups() {
 
     let pk1 = DatabaseEntry::from_bytes(b"pk1");
     let pk2 = DatabaseEntry::from_bytes(b"pk2");
-    primary
-        .lock()
-        .put( &pk1, &DatabaseEntry::from_bytes(b"Apple"))
-        .unwrap();
-    primary
-        .lock()
-        .put( &pk2, &DatabaseEntry::from_bytes(b"Apricot"))
-        .unwrap();
+    primary.lock().put(&pk1, DatabaseEntry::from_bytes(b"Apple")).unwrap();
+    primary.lock().put(&pk2, DatabaseEntry::from_bytes(b"Apricot")).unwrap();
     assert_eq!(sec.count().unwrap(), 2);
 
-    primary.lock().delete( &pk1).unwrap();
+    primary.lock().delete(&pk1).unwrap();
     assert_eq!(sec.count().unwrap(), 1);
 
     // pk2 still indexed under 'A'.
     let mut p_key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
     let st = sec
-        .get_into(None, &DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
+        .get_into(None, DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
         .unwrap();
     assert!(st);
     assert_eq!(p_key.get_data().unwrap(), b"pk2");
@@ -491,24 +501,26 @@ fn c3_primary_update_swaps_secondary_key() {
     .unwrap();
 
     let pk = DatabaseEntry::from_bytes(b"pk1");
-    primary
-        .lock()
-        .put( &pk, &DatabaseEntry::from_bytes(b"Mango"))
-        .unwrap();
-    primary
-        .lock()
-        .put( &pk, &DatabaseEntry::from_bytes(b"Pineapple"))
-        .unwrap();
+    primary.lock().put(&pk, DatabaseEntry::from_bytes(b"Mango")).unwrap();
+    primary.lock().put(&pk, DatabaseEntry::from_bytes(b"Pineapple")).unwrap();
 
     // Old sec_key 'M' must be gone.
     let mut p_key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
-    assert!(!(sec.get_into(None, &DatabaseEntry::from_bytes(b"M"), &mut p_key, &mut data)
-            .unwrap()));
+    assert!(
+        !(sec
+            .get_into(
+                None,
+                DatabaseEntry::from_bytes(b"M"),
+                &mut p_key,
+                &mut data
+            )
+            .unwrap())
+    );
 
     // New sec_key 'P' must point at pk1.
     let st = sec
-        .get_into(None, &DatabaseEntry::from_bytes(b"P"), &mut p_key, &mut data)
+        .get_into(None, DatabaseEntry::from_bytes(b"P"), &mut p_key, &mut data)
         .unwrap();
     assert!(st);
     assert_eq!(p_key.get_data().unwrap(), b"pk1");
@@ -537,19 +549,13 @@ fn c3_primary_update_same_sec_key_is_idempotent() {
     .unwrap();
 
     let pk = DatabaseEntry::from_bytes(b"pk1");
-    primary
-        .lock()
-        .put( &pk, &DatabaseEntry::from_bytes(b"Apple"))
-        .unwrap();
-    primary
-        .lock()
-        .put( &pk, &DatabaseEntry::from_bytes(b"Avocado"))
-        .unwrap();
+    primary.lock().put(&pk, DatabaseEntry::from_bytes(b"Apple")).unwrap();
+    primary.lock().put(&pk, DatabaseEntry::from_bytes(b"Avocado")).unwrap();
     assert_eq!(sec.count().unwrap(), 1);
     let mut p_key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
     let st = sec
-        .get_into(None, &DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
+        .get_into(None, DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
         .unwrap();
     assert!(st);
     assert_eq!(p_key.get_data().unwrap(), b"pk1");
@@ -598,37 +604,55 @@ fn c3_multi_key_creator_auto_maintained_on_put_and_update() {
 
     // Insert.
     let pk = DatabaseEntry::from_bytes(b"pk1");
-    primary.lock().put( &pk, &DatabaseEntry::from_bytes(b"AB")).unwrap();
+    primary.lock().put(&pk, DatabaseEntry::from_bytes(b"AB")).unwrap();
     assert_eq!(sec.count().unwrap(), 2);
     let mut p_key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
     for byte in [b"A", b"B"] {
         let st = sec
-            .get_into(None, &DatabaseEntry::from_bytes(byte), &mut p_key, &mut data)
+            .get_into(
+                None,
+                DatabaseEntry::from_bytes(byte),
+                &mut p_key,
+                &mut data,
+            )
             .unwrap();
         assert!(st);
         assert_eq!(p_key.get_data().unwrap(), b"pk1");
     }
 
     // Update (data set goes A,B → B,C).
-    primary.lock().put( &pk, &DatabaseEntry::from_bytes(b"BC")).unwrap();
+    primary.lock().put(&pk, DatabaseEntry::from_bytes(b"BC")).unwrap();
     assert_eq!(
         sec.count().unwrap(),
         2,
         "old 'A' entry must drop and 'C' must be added; 'B' stays"
     );
-    assert!(!(sec.get_into(None, &DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
-            .unwrap()));
+    assert!(
+        !(sec
+            .get_into(
+                None,
+                DatabaseEntry::from_bytes(b"A"),
+                &mut p_key,
+                &mut data
+            )
+            .unwrap())
+    );
     for byte in [b"B", b"C"] {
         let st = sec
-            .get_into(None, &DatabaseEntry::from_bytes(byte), &mut p_key, &mut data)
+            .get_into(
+                None,
+                DatabaseEntry::from_bytes(byte),
+                &mut p_key,
+                &mut data,
+            )
             .unwrap();
         assert!(st);
         assert_eq!(p_key.get_data().unwrap(), b"pk1");
     }
 
     // Delete fans out to all three sec keys produced by the current data.
-    primary.lock().delete( &pk).unwrap();
+    primary.lock().delete(&pk).unwrap();
     assert_eq!(sec.count().unwrap(), 0);
 }
 
@@ -689,22 +713,26 @@ fn d2c_foreign_key_delete_action_cascade_runtime_unsupported() {
         SecondaryDatabase::open(Arc::clone(&primary), inner, cfg).unwrap();
 
     let fk = DatabaseEntry::from_bytes(b"A");
-    foreign.lock().put( &fk, &DatabaseEntry::from_bytes(b"x")).unwrap();
+    foreign.lock().put(&fk, DatabaseEntry::from_bytes(b"x")).unwrap();
     let pk1 = DatabaseEntry::from_bytes(b"pk1");
-    primary
-        .lock()
-        .put( &pk1, &DatabaseEntry::from_bytes(b"Apple"))
-        .unwrap();
+    primary.lock().put(&pk1, DatabaseEntry::from_bytes(b"Apple")).unwrap();
     let pk2 = DatabaseEntry::from_bytes(b"pk2");
-    primary
-        .lock()
-        .put( &pk2, &DatabaseEntry::from_bytes(b"Apricot"))
-        .unwrap();
+    primary.lock().put(&pk2, DatabaseEntry::from_bytes(b"Apricot")).unwrap();
 
     // Foreign delete cascades to both child primaries.
-    assert!(foreign.lock().delete( &fk).unwrap());
-    assert!(!(primary.lock().get_into(None, &pk1, &mut DatabaseEntry::new()).unwrap()));
-    assert!(!(primary.lock().get_into(None, &pk2, &mut DatabaseEntry::new()).unwrap()));
+    assert!(foreign.lock().delete(&fk).unwrap());
+    assert!(
+        !(primary
+            .lock()
+            .get_into(None, &pk1, &mut DatabaseEntry::new())
+            .unwrap())
+    );
+    assert!(
+        !(primary
+            .lock()
+            .get_into(None, &pk2, &mut DatabaseEntry::new())
+            .unwrap())
+    );
 }
 
 /// `Nullify` action: when a foreign primary record is deleted, every
@@ -746,14 +774,11 @@ fn d2c_foreign_key_nullify_runtime_unsupported() {
         SecondaryDatabase::open(Arc::clone(&primary), inner, cfg).unwrap();
 
     let fk = DatabaseEntry::from_bytes(b"A");
-    foreign.lock().put( &fk, &DatabaseEntry::from_bytes(b"x")).unwrap();
+    foreign.lock().put(&fk, DatabaseEntry::from_bytes(b"x")).unwrap();
     let pk = DatabaseEntry::from_bytes(b"pk1");
-    primary
-        .lock()
-        .put( &pk, &DatabaseEntry::from_bytes(b"Apple"))
-        .unwrap();
+    primary.lock().put(&pk, DatabaseEntry::from_bytes(b"Apple")).unwrap();
 
-    foreign.lock().delete( &fk).unwrap();
+    foreign.lock().delete(&fk).unwrap();
 
     // Child primary still exists, but its data has been nullified.
     let mut child_data = DatabaseEntry::new();
@@ -783,23 +808,25 @@ fn fk_abort_blocks_delete_of_referenced_foreign_record() {
     let fk = DatabaseEntry::from_bytes(b"A");
     foreign
         .lock()
-        .put( &fk, &DatabaseEntry::from_bytes(b"foreign_payload"))
+        .put(&fk, DatabaseEntry::from_bytes(b"foreign_payload"))
         .unwrap();
     primary
         .lock()
         .put(
-            &DatabaseEntry::from_bytes(b"pk1"),
-            &DatabaseEntry::from_bytes(b"Apple"))
+            DatabaseEntry::from_bytes(b"pk1"),
+            DatabaseEntry::from_bytes(b"Apple"),
+        )
         .unwrap();
 
-    let result = foreign.lock().delete( &fk);
+    let result = foreign.lock().delete(&fk);
     match result {
         Err(NoxuError::ForeignConstraintViolation(msg)) => {
             assert!(msg.contains("foreign-key"));
         }
         other => panic!("expected ForeignConstraintViolation, got {other:?}"),
     }
-    assert!(foreign.lock().get_into(None, &fk, &mut DatabaseEntry::new()).unwrap(),
+    assert!(
+        foreign.lock().get_into(None, &fk, &mut DatabaseEntry::new()).unwrap(),
         "aborted FK delete must leave the foreign record intact"
     );
 }
@@ -826,23 +853,17 @@ fn fk_insert_rejects_secondary_key_absent_from_foreign_db() {
     // Foreign DB contains key "A" only.
     foreign
         .lock()
-        .put(
-            &DatabaseEntry::from_bytes(b"A"),
-            &DatabaseEntry::from_bytes(b"x"))
+        .put(DatabaseEntry::from_bytes(b"A"), DatabaseEntry::from_bytes(b"x"))
         .unwrap();
 
     // A child whose secondary key (first byte) IS in the foreign DB: allowed.
     let ok_pk = DatabaseEntry::from_bytes(b"pk_ok");
-    primary
-        .lock()
-        .put( &ok_pk, &DatabaseEntry::from_bytes(b"Apple"))
-        .unwrap();
+    primary.lock().put(&ok_pk, DatabaseEntry::from_bytes(b"Apple")).unwrap();
 
     // A child whose secondary key (first byte 'Z') is ABSENT from the foreign
     // DB: must be rejected with ForeignConstraintViolation.
     let bad_pk = DatabaseEntry::from_bytes(b"pk_bad");
-    let res =
-        primary.lock().put( &bad_pk, &DatabaseEntry::from_bytes(b"Zebra"));
+    let res = primary.lock().put(&bad_pk, DatabaseEntry::from_bytes(b"Zebra"));
     match res {
         Err(NoxuError::ForeignConstraintViolation(_)) => {}
         other => panic!(
@@ -925,19 +946,17 @@ fn fk_nullify_multi_key_nullifier_path() {
     for b in [b"A".as_ref(), b"B", b"C"] {
         foreign
             .lock()
-            .put(
-                &DatabaseEntry::from_bytes(b),
-                &DatabaseEntry::from_bytes(b"x"))
+            .put(DatabaseEntry::from_bytes(b), DatabaseEntry::from_bytes(b"x"))
             .unwrap();
     }
     let fk_a = DatabaseEntry::from_bytes(b"A");
 
     let pk1 = DatabaseEntry::from_bytes(b"pk1");
-    primary.lock().put( &pk1, &DatabaseEntry::from_bytes(b"ABC")).unwrap();
+    primary.lock().put(&pk1, DatabaseEntry::from_bytes(b"ABC")).unwrap();
 
     // Deleting foreign key A nullifies the 'A' secondary key from the child via
     // the multi-key nullifier, leaving data "BC".
-    foreign.lock().delete( &fk_a).unwrap();
+    foreign.lock().delete(&fk_a).unwrap();
     let mut child = DatabaseEntry::new();
     primary.lock().get_into(None, &pk1, &mut child).unwrap();
     assert_eq!(child.get_data().unwrap(), b"BC");
@@ -978,38 +997,49 @@ fn fk_cascade_transitive_two_levels() {
 
     root.lock()
         .put(
-            &DatabaseEntry::from_bytes(b"A"),
-            &DatabaseEntry::from_bytes(b"root"))
+            DatabaseEntry::from_bytes(b"A"),
+            DatabaseEntry::from_bytes(b"root"),
+        )
         .unwrap();
     // mid record: key="M", data="Apple" - first byte 'A' indexes the
     // root foreign-key value.
     mid.lock()
         .put(
-            &DatabaseEntry::from_bytes(b"M"),
-            &DatabaseEntry::from_bytes(b"Apple"))
+            DatabaseEntry::from_bytes(b"M"),
+            DatabaseEntry::from_bytes(b"Apple"),
+        )
         .unwrap();
     // leaf record: key="L", data="Mango" - first byte 'M' matches
     // mid's primary key, indexing the mid foreign-key value.
     leaf.lock()
         .put(
-            &DatabaseEntry::from_bytes(b"L"),
-            &DatabaseEntry::from_bytes(b"Mango"))
+            DatabaseEntry::from_bytes(b"L"),
+            DatabaseEntry::from_bytes(b"Mango"),
+        )
         .unwrap();
 
     // Cascade root → mid → leaf in one delete.
-    root.lock().delete( &DatabaseEntry::from_bytes(b"A")).unwrap();
-    assert!(!(mid.lock()
-            .get_into(None,
-                &DatabaseEntry::from_bytes(b"M"),
+    root.lock().delete(DatabaseEntry::from_bytes(b"A")).unwrap();
+    assert!(
+        !(mid
+            .lock()
+            .get_into(
+                None,
+                DatabaseEntry::from_bytes(b"M"),
                 &mut DatabaseEntry::new()
             )
-            .unwrap()));
-    assert!(!(leaf.lock()
-            .get_into(None,
-                &DatabaseEntry::from_bytes(b"L"),
+            .unwrap())
+    );
+    assert!(
+        !(leaf
+            .lock()
+            .get_into(
+                None,
+                DatabaseEntry::from_bytes(b"L"),
                 &mut DatabaseEntry::new()
             )
-            .unwrap()));
+            .unwrap())
+    );
 }
 
 /// FK Abort allows the delete when no child record references the
@@ -1030,8 +1060,8 @@ fn fk_abort_allows_delete_when_no_referrer() {
         SecondaryDatabase::open(Arc::clone(&primary), inner, cfg).unwrap();
 
     let fk = DatabaseEntry::from_bytes(b"Z");
-    foreign.lock().put( &fk, &DatabaseEntry::from_bytes(b"x")).unwrap();
-    assert!(foreign.lock().delete( &fk).unwrap());
+    foreign.lock().put(&fk, DatabaseEntry::from_bytes(b"x")).unwrap();
+    assert!(foreign.lock().delete(&fk).unwrap());
 }
 
 /// A clean (no FK fields set) `SecondaryConfig` still opens successfully -
@@ -1098,7 +1128,7 @@ fn put_under_txn(
     primary.lock().put_in(txn, &pk_e, &v_e).unwrap();
 }
 
-/// `db.put(Some(&t), ...)` + `sec.update_secondary(Some(&t), ...)` +
+/// `db.put_in(&t, ...)` + `sec.update_secondary(Some(&t), ...)` +
 /// `t.abort()` rolls back **both** the primary record and the
 /// secondary index entry.  Pre-Sprint-41⁄2 the secondary entry survived
 /// the abort because `update_secondary` was internally auto-committed.
@@ -1118,14 +1148,14 @@ fn s4h_abort_rolls_back_primary_and_secondary() {
         let mut p_key = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
         let st = sec
-            .get_into(Some(&txn),
-                &DatabaseEntry::from_bytes(b"A"),
+            .get_into(
+                Some(&txn),
+                DatabaseEntry::from_bytes(b"A"),
                 &mut p_key,
-                &mut data)
+                &mut data,
+            )
             .unwrap();
-        assert!(st,
-            "txn must see its own uncommitted secondary write"
-        );
+        assert!(st, "txn must see its own uncommitted secondary write");
     }
 
     // Now abort.
@@ -1135,9 +1165,7 @@ fn s4h_abort_rolls_back_primary_and_secondary() {
     let pk1 = DatabaseEntry::from_bytes(b"pk1");
     let mut data = DatabaseEntry::new();
     let pri_status = primary.lock().get_into(None, &pk1, &mut data).unwrap();
-    assert!(!pri_status,
-        "primary record must be rolled back by abort"
-    );
+    assert!(!pri_status, "primary record must be rolled back by abort");
 
     // And the secondary index entry must also be gone.  Pre-Sprint-41⁄2
     // this was `Success` (Apple still indexed under 'A') even though
@@ -1145,16 +1173,17 @@ fn s4h_abort_rolls_back_primary_and_secondary() {
     let mut p_key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
     let sec_status = sec
-        .get_into(None, &DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
+        .get_into(None, DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
         .unwrap();
-    assert!(!sec_status,
+    assert!(
+        !sec_status,
         "secondary index entry must be rolled back by abort \
          (Sprint 41⁄2 / audit F5: pre-fix this returned Success and \
          left a dangling index entry)"
     );
 }
 
-/// `db.put(Some(&t), ...)` + `sec.update_secondary(Some(&t), ...)` +
+/// `db.put_in(&t, ...)` + `sec.update_secondary(Some(&t), ...)` +
 /// `t.commit()` persists **both** sides.
 #[test]
 fn s4h_commit_persists_primary_and_secondary() {
@@ -1177,7 +1206,7 @@ fn s4h_commit_persists_primary_and_secondary() {
     let mut p_key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
     let sec_status = sec
-        .get_into(None, &DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
+        .get_into(None, DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
         .unwrap();
     assert!(sec_status);
     assert_eq!(p_key.get_data().unwrap(), b"pk1");
@@ -1216,7 +1245,7 @@ fn s4h_same_primary_idempotent_reinsert_under_same_txn() {
     let mut p_key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
     let st = sec
-        .get_into(None, &DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
+        .get_into(None, DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
         .unwrap();
     assert!(!st);
 }
@@ -1246,21 +1275,22 @@ fn s4h_uncommitted_secondary_write_is_not_visible_to_other_readers() {
     // for a key currently write-locked by another txn either blocks
     // until commit/abort or surfaces a typed wait error.  We assert
     // it does not silently return the uncommitted value.
-    let result = sec.get_into(None,
-        &DatabaseEntry::from_bytes(b"A"),
+    let result = sec.get_into(
+        None,
+        DatabaseEntry::from_bytes(b"A"),
         &mut DatabaseEntry::new(),
-        &mut DatabaseEntry::new());
+        &mut DatabaseEntry::new(),
+    );
     match result {
-        Ok(OperationStatus::Success) => panic!(
+        Ok(true) => panic!(
             "auto-commit reader must not see txn A's uncommitted \
              secondary write (would violate the documented isolation \
              contract)"
         ),
-        Ok(OperationStatus::NotFound) => {
+        Ok(false) => {
             // Reader skipped the locked record; acceptable per the
             // documented isolation level.
         }
-        Ok(other) => panic!("unexpected status: {other:?}"),
         Err(_e) => {
             // A typed lock-conflict error is also acceptable-some
             // configurations surface the contention rather than
@@ -1275,7 +1305,7 @@ fn s4h_uncommitted_secondary_write_is_not_visible_to_other_readers() {
     let mut p_key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
     let st = sec
-        .get_into(None, &DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
+        .get_into(None, DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
         .unwrap();
     assert!(!st);
 }
@@ -1314,7 +1344,12 @@ fn wave1b_cursor_delete_cascade_rolls_back_on_abort() {
         let mut p_key = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
         let st = sec
-            .get_into(None, &DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
+            .get_into(
+                None,
+                DatabaseEntry::from_bytes(b"A"),
+                &mut p_key,
+                &mut data,
+            )
             .unwrap();
         assert!(st);
         assert_eq!(p_key.get_data().unwrap(), b"pk1");
@@ -1335,7 +1370,7 @@ fn wave1b_cursor_delete_cascade_rolls_back_on_abort() {
                 &mut data,
             )
             .unwrap();
-        assert!(st);
+        assert_eq!(st, OperationStatus::Success);
 
         let del_st = cursor.delete().unwrap();
         assert_eq!(
@@ -1348,12 +1383,15 @@ fn wave1b_cursor_delete_cascade_rolls_back_on_abort() {
         let mut p_key2 = DatabaseEntry::new();
         let mut data2 = DatabaseEntry::new();
         let probe_st = sec
-            .get_into(Some(&txn),
-                &DatabaseEntry::from_bytes(b"A"),
+            .get_into(
+                Some(&txn),
+                DatabaseEntry::from_bytes(b"A"),
                 &mut p_key2,
-                &mut data2)
+                &mut data2,
+            )
             .unwrap();
-        assert!(!probe_st,
+        assert!(
+            !probe_st,
             "the cursor's own txn must observe the cascade as applied"
         );
 
@@ -1367,7 +1405,8 @@ fn wave1b_cursor_delete_cascade_rolls_back_on_abort() {
     let pk1 = DatabaseEntry::from_bytes(b"pk1");
     let mut data = DatabaseEntry::new();
     let pri_status = primary.lock().get_into(None, &pk1, &mut data).unwrap();
-    assert!(pri_status,
+    assert!(
+        pri_status,
         "primary record must survive the abort \
          (Wave 1B: pre-fix the cascade auto-committed and \
          destroyed the primary irrespective of the abort)"
@@ -1378,9 +1417,10 @@ fn wave1b_cursor_delete_cascade_rolls_back_on_abort() {
     let mut p_key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
     let sec_status = sec
-        .get_into(None, &DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
+        .get_into(None, DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
         .unwrap();
-    assert!(sec_status,
+    assert!(
+        sec_status,
         "secondary entry must survive the abort \
          (Wave 1B: pre-fix the cascade auto-committed and \
          destroyed the secondary irrespective of the abort)"
@@ -1433,7 +1473,7 @@ fn wave1b_cursor_delete_cascade_commits_both_sides() {
     let mut p_key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
     let sec_status = sec
-        .get_into(None, &DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
+        .get_into(None, DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
         .unwrap();
     assert!(!sec_status);
 
@@ -1447,7 +1487,7 @@ fn wave1b_cursor_delete_cascade_commits_both_sides() {
     let mut p_key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
     let sec_status = sec
-        .get_into(None, &DatabaseEntry::from_bytes(b"B"), &mut p_key, &mut data)
+        .get_into(None, DatabaseEntry::from_bytes(b"B"), &mut p_key, &mut data)
         .unwrap();
     assert!(sec_status);
     assert_eq!(p_key.get_data().unwrap(), b"pk2");
@@ -1513,7 +1553,8 @@ fn wave1b_cursor_delete_uncommitted_cascade_invisible_to_others() {
     // user explicitly aborted.
     let mut data = DatabaseEntry::new();
     let after_pri = primary.lock().get_into(None, &pk1, &mut data).unwrap();
-    assert!(after_pri,
+    assert!(
+        after_pri,
         "after abort, the primary record must be intact for every \
          observer (Wave 1B / audit F5)"
     );
@@ -1522,9 +1563,10 @@ fn wave1b_cursor_delete_uncommitted_cascade_invisible_to_others() {
     let mut p_key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
     let after_sec = sec
-        .get_into(None, &DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
+        .get_into(None, DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
         .unwrap();
-    assert!(after_sec,
+    assert!(
+        after_sec,
         "after abort, the secondary entry must be intact for every \
          observer (Wave 1B / audit F5)"
     );
@@ -1548,12 +1590,12 @@ fn wave1b_cursor_delete_auto_commit_cascade_unchanged() {
     {
         let pk = DatabaseEntry::from_bytes(b"pk1");
         let v = DatabaseEntry::from_bytes(b"Apple");
-        primary.lock().put( &pk, &v).unwrap();
+        primary.lock().put(&pk, &v).unwrap();
         // No explicit update_secondary needed (auto-hook handles it).
     }
 
     // Auto-commit cursor delete.
-    let mut cursor = sec.open_cursor( None).unwrap();
+    let mut cursor = sec.open_cursor(None).unwrap();
     let mut p_key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
     let st = cursor
@@ -1570,8 +1612,16 @@ fn wave1b_cursor_delete_auto_commit_cascade_unchanged() {
     assert!(!(primary.lock().get_into(None, &pk1, &mut data).unwrap()));
     let mut p_key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
-    assert!(!(sec.get_into(None, &DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
-            .unwrap()));
+    assert!(
+        !(sec
+            .get_into(
+                None,
+                DatabaseEntry::from_bytes(b"A"),
+                &mut p_key,
+                &mut data
+            )
+            .unwrap())
+    );
 }
 
 // ─── X-10: Secondary index abort torn-state isolation tests ───────────────
@@ -1644,9 +1694,11 @@ fn test_x10_secondary_abort_read_committed_no_torn_state() {
         let txn = env.begin_transaction(None).unwrap();
         pri_arc
             .lock()
-            .put_in(&txn,
-                &noxu_db::DatabaseEntry::from_bytes(b"K"),
-                &noxu_db::DatabaseEntry::from_bytes(b"Avalue"))
+            .put_in(
+                &txn,
+                noxu_db::DatabaseEntry::from_bytes(b"K"),
+                noxu_db::DatabaseEntry::from_bytes(b"Avalue"),
+            )
             .unwrap();
         txn.commit().unwrap();
     }
@@ -1708,9 +1760,11 @@ fn test_x10_secondary_abort_read_committed_no_torn_state() {
         let txn = env.begin_transaction(None).unwrap();
         pri_arc
             .lock()
-            .put_in(&txn,
-                &noxu_db::DatabaseEntry::from_bytes(b"K"),
-                &noxu_db::DatabaseEntry::from_bytes(b"Bvalue"))
+            .put_in(
+                &txn,
+                noxu_db::DatabaseEntry::from_bytes(b"K"),
+                noxu_db::DatabaseEntry::from_bytes(b"Bvalue"),
+            )
             .unwrap();
         txn.abort().unwrap();
     }

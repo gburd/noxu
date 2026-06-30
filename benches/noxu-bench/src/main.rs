@@ -161,7 +161,7 @@ fn populate(db: &Database, n: usize, value: &[u8]) {
     for i in 0..n {
         let k = DatabaseEntry::from_vec(format!("{:010}", i).into_bytes());
         let v = DatabaseEntry::from_bytes(value);
-        db.put(None, &k, &v).unwrap();
+        db.put( &k, &v).unwrap();
     }
 }
 

@@ -29,8 +29,8 @@
 //! confirms a plain read (no RMW) does NOT block, isolating the RMW effect.
 
 use noxu_db::{
-    DatabaseConfig, DatabaseEntry, EnvironmentConfig, OperationStatus,
-    ReadOptions, TransactionConfig,
+    DatabaseConfig, DatabaseEntry, EnvironmentConfig, ReadOptions,
+    TransactionConfig,
 };
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -64,9 +64,11 @@ fn put_committed(
     val: &[u8],
 ) {
     let txn = env.begin_transaction(None).unwrap();
-    db.put_in(&txn,
-        &DatabaseEntry::from_bytes(key),
-        &DatabaseEntry::from_bytes(val))
+    db.put_in(
+        &txn,
+        DatabaseEntry::from_bytes(key),
+        DatabaseEntry::from_bytes(val),
+    )
     .unwrap();
     txn.commit().unwrap();
 }
@@ -86,24 +88,24 @@ fn rmw_read_holds_write_lock_no_wait_writer_conflicts() {
     // Reader under read-committed performs an RMW read and holds.
     let rc = TransactionConfig::read_committed();
     let rmw_txn = env.begin_transaction(Some(&rc)).unwrap();
-    let mut val = DatabaseEntry::new();
     let status = db
         .get_with_options(
             Some(&rmw_txn),
-            &DatabaseEntry::from_bytes(b"key"),
-            &mut val,
+            DatabaseEntry::from_bytes(b"key"),
             &ReadOptions::read_modify_write(),
         )
         .unwrap();
-    assert_eq!(status, OperationStatus::Success, "RMW read must find the key");
+    assert!(status.is_some(), "RMW read must find the key");
 
     // Concurrent no_wait writer to the SAME key must conflict because the RMW
     // read acquired a WRITE lock that is held.
     let no_wait = TransactionConfig::new().with_no_wait(true);
     let writer_txn = env.begin_transaction(Some(&no_wait)).unwrap();
-    let write_result = db.put_in(&writer_txn,
-        &DatabaseEntry::from_bytes(b"key"),
-        &DatabaseEntry::from_bytes(b"v2"));
+    let write_result = db.put_in(
+        &writer_txn,
+        DatabaseEntry::from_bytes(b"key"),
+        DatabaseEntry::from_bytes(b"v2"),
+    );
     assert!(
         write_result.is_err(),
         "no_wait writer must CONFLICT while an RMW reader holds the write \
@@ -114,12 +116,12 @@ fn rmw_read_holds_write_lock_no_wait_writer_conflicts() {
     // After the RMW reader commits, a new writer must succeed.
     rmw_txn.commit().unwrap();
     let writer_txn2 = env.begin_transaction(Some(&no_wait)).unwrap();
-    let ok = db
-        .put_in(&writer_txn2,
-            &DatabaseEntry::from_bytes(b"key"),
-            &DatabaseEntry::from_bytes(b"v3"))
-        .unwrap();
-    ;
+    db.put_in(
+        &writer_txn2,
+        DatabaseEntry::from_bytes(b"key"),
+        DatabaseEntry::from_bytes(b"v3"),
+    )
+    .unwrap();
     writer_txn2.commit().unwrap();
 }
 
@@ -135,18 +137,22 @@ fn plain_read_committed_releases_lock_writer_succeeds() {
     let reader_txn = env.begin_transaction(Some(&rc)).unwrap();
     let mut val = DatabaseEntry::new();
     let _ = db
-        .get_into(Some(&reader_txn), &DatabaseEntry::from_bytes(b"key"), &mut val)
+        .get_into(
+            Some(&reader_txn),
+            DatabaseEntry::from_bytes(b"key"),
+            &mut val,
+        )
         .unwrap();
 
     // Plain read-committed releases the read lock -> no_wait writer succeeds.
     let no_wait = TransactionConfig::new().with_no_wait(true);
     let writer_txn = env.begin_transaction(Some(&no_wait)).unwrap();
-    let ok = db
-        .put_in(&writer_txn,
-            &DatabaseEntry::from_bytes(b"key"),
-            &DatabaseEntry::from_bytes(b"v2"))
-        .unwrap();
-    ;
+    db.put_in(
+        &writer_txn,
+        DatabaseEntry::from_bytes(b"key"),
+        DatabaseEntry::from_bytes(b"v2"),
+    )
+    .unwrap();
     writer_txn.commit().unwrap();
     reader_txn.commit().unwrap();
 }
@@ -179,16 +185,14 @@ fn rmw_read_blocks_concurrent_writer_until_commit() {
     let a = thread::spawn(move || {
         let rc = TransactionConfig::read_committed();
         let txn = env_a.begin_transaction(Some(&rc)).unwrap();
-        let mut val = DatabaseEntry::new();
         let s = db_a
             .get_with_options(
                 Some(&txn),
-                &DatabaseEntry::from_bytes(b"key"),
-                &mut val,
+                DatabaseEntry::from_bytes(b"key"),
                 &ReadOptions::read_modify_write(),
             )
             .unwrap();
-        assert!(s);
+        assert!(s.is_some());
 
         // Tell B the RMW write lock is held.
         lt_a.wait();
@@ -214,12 +218,14 @@ fn rmw_read_blocks_concurrent_writer_until_commit() {
         lt_b.wait();
         // Blocking writer (no no_wait): must wait for A to commit.
         let txn = env_b.begin_transaction(None).unwrap();
-        let r = db_b.put_in(&txn,
-            &DatabaseEntry::from_bytes(b"key"),
-            &DatabaseEntry::from_bytes(b"v2"));
+        let r = db_b.put_in(
+            &txn,
+            DatabaseEntry::from_bytes(b"key"),
+            DatabaseEntry::from_bytes(b"v2"),
+        );
         wd_b.store(true, std::sync::atomic::Ordering::SeqCst);
         match r {
-            Ok(OperationStatus::Success) => {
+            Ok(()) => {
                 txn.commit().unwrap();
             }
             other => {
@@ -237,7 +243,8 @@ fn rmw_read_blocks_concurrent_writer_until_commit() {
     // Final value is the writer's, proving the write went through after the
     // RMW reader released.
     let mut val = DatabaseEntry::new();
-    let s = db.get_into(None, &DatabaseEntry::from_bytes(b"key"), &mut val).unwrap();
+    let s =
+        db.get_into(None, DatabaseEntry::from_bytes(b"key"), &mut val).unwrap();
     assert!(s);
     assert_eq!(val.get_data(), Some(b"v2" as &[u8]));
 }

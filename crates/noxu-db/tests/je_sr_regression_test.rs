@@ -160,9 +160,11 @@ fn sr9522_get_search_both_works_on_non_dup_db() {
         (b"froboy", b"nine"),
     ];
     for (k, d) in pairs {
-        db.put_in(&txn,
-            &DatabaseEntry::from_bytes(k),
-            &DatabaseEntry::from_bytes(d))
+        db.put_in(
+            &txn,
+            DatabaseEntry::from_bytes(k),
+            DatabaseEntry::from_bytes(d),
+        )
         .unwrap();
     }
 
@@ -252,10 +254,8 @@ fn sr12068_db_handle_lock_released_on_close() {
     let (env, db) = open_env_and_db(&dir, "sr12068", false);
 
     // Insert one record so the database is non-empty.
-    db.put(
-        &DatabaseEntry::from_bytes(b"k"),
-        &DatabaseEntry::from_bytes(b"v"))
-    .unwrap();
+    db.put(DatabaseEntry::from_bytes(b"k"), DatabaseEntry::from_bytes(b"v"))
+        .unwrap();
     db.close().unwrap();
 
     // Now removeDatabase must not hang or report "in use".
@@ -290,9 +290,11 @@ fn sr11297_get_first_after_first_bin_emptied() {
     // even on a default node-fanout (Noxu defaults to 128 max keys per BIN).
     let txn = env.begin_transaction(None).unwrap();
     for i in 0u32..200 {
-        db.put_in(&txn,
-            &DatabaseEntry::from_bytes(&i.to_be_bytes()),
-            &DatabaseEntry::from_bytes(b"v"))
+        db.put_in(
+            &txn,
+            DatabaseEntry::from_bytes(&i.to_be_bytes()),
+            DatabaseEntry::from_bytes(b"v"),
+        )
         .unwrap();
     }
     txn.commit().unwrap();
@@ -300,7 +302,7 @@ fn sr11297_get_first_after_first_bin_emptied() {
     // Delete the first 150 keys (more than one full BIN's worth).
     let txn = env.begin_transaction(None).unwrap();
     for i in 0u32..150 {
-        db.delete_in(&txn, &DatabaseEntry::from_bytes(&i.to_be_bytes()))
+        db.delete_in(&txn, DatabaseEntry::from_bytes(&i.to_be_bytes()))
             .unwrap();
     }
     txn.commit().unwrap();
@@ -341,7 +343,7 @@ fn sr9885_cursor_delete_removes_only_positioned_dup() {
     let key = DatabaseEntry::from_bytes(b"k");
 
     for d in [b"d0".as_slice(), b"d1", b"d2", b"d3"] {
-        db.put_in(&txn, &key, &DatabaseEntry::from_bytes(d)).unwrap();
+        db.put_in(&txn, &key, DatabaseEntry::from_bytes(d)).unwrap();
     }
 
     let mut c = db.open_cursor_in(&txn, None).unwrap();
@@ -385,16 +387,14 @@ fn dup_slot_reuse_same_txn_abort_leaves_empty() {
 
     let txn = env.begin_transaction(None).unwrap();
     let k = DatabaseEntry::from_bytes(b"k");
-    db.put_in(&txn, &k, &DatabaseEntry::from_bytes(b"v0")).unwrap();
+    db.put_in(&txn, &k, DatabaseEntry::from_bytes(b"v0")).unwrap();
     db.delete_in(&txn, &k).unwrap();
-    db.put_in(&txn, &k, &DatabaseEntry::from_bytes(b"v1")).unwrap();
+    db.put_in(&txn, &k, DatabaseEntry::from_bytes(b"v1")).unwrap();
     txn.abort().unwrap();
 
     let mut out = DatabaseEntry::new();
     let s = db.get_into(None, &k, &mut out).unwrap();
-    assert!(!s,
-        "after same-txn put+delete+put+abort, slot must be empty"
-    );
+    assert!(!s, "after same-txn put+delete+put+abort, slot must be empty");
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -411,12 +411,12 @@ fn dup_slot_reuse_diff_txn_abort_restores_v0() {
 
     let txn1 = env.begin_transaction(None).unwrap();
     let k = DatabaseEntry::from_bytes(b"k");
-    db.put_in(&txn1, &k, &DatabaseEntry::from_bytes(b"v0")).unwrap();
+    db.put_in(&txn1, &k, DatabaseEntry::from_bytes(b"v0")).unwrap();
     txn1.commit().unwrap();
 
     let txn2 = env.begin_transaction(None).unwrap();
     db.delete_in(&txn2, &k).unwrap();
-    db.put_in(&txn2, &k, &DatabaseEntry::from_bytes(b"v1")).unwrap();
+    db.put_in(&txn2, &k, DatabaseEntry::from_bytes(b"v1")).unwrap();
     txn2.abort().unwrap();
 
     let mut out = DatabaseEntry::new();

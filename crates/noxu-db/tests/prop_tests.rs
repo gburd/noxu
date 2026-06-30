@@ -2,7 +2,6 @@
 
 use noxu_db::{
     Database, DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
-    OperationStatus,
 };
 use proptest::prelude::*;
 use std::collections::BTreeMap;
@@ -47,12 +46,11 @@ proptest! {
         let key_entry = DatabaseEntry::from_data(&key);
         let val_entry = DatabaseEntry::from_data(&value);
 
-        let status = db.put( &key_entry, &val_entry).unwrap();
-        prop_assert_eq!(status, OperationStatus::Success);
+        db.put(&key_entry, &val_entry).unwrap();
 
         let mut retrieved = DatabaseEntry::new();
         let status = db.get_into(None, &key_entry, &mut retrieved).unwrap();
-        prop_assert_eq!(status, OperationStatus::Success);
+        prop_assert!(status);
         prop_assert_eq!(retrieved.data(), value.as_slice());
     }
 
@@ -148,24 +146,15 @@ proptest! {
                 CrudOp::Put { key, value } => {
                     let key_e = DatabaseEntry::from_data(&key);
                     let val_e = DatabaseEntry::from_data(&value);
-                    let status = db.put( &key_e, &val_e).unwrap();
-                    prop_assert_eq!(
-                        status, OperationStatus::Success,
-                        "step {}: put({:?}) returned {:?}", i, key, status
-                    );
+                    db.put(&key_e, &val_e).unwrap();
                     oracle.insert(key, value);
                 }
                 CrudOp::Delete { key } => {
                     let key_e = DatabaseEntry::from_data(&key);
-                    let status = db.delete( &key_e).unwrap();
+                    let status = db.delete(&key_e).unwrap();
                     let oracle_had = oracle.remove(&key).is_some();
-                    let expected = if oracle_had {
-                        OperationStatus::Success
-                    } else {
-                        OperationStatus::NotFound
-                    };
                     prop_assert_eq!(
-                        status, expected,
+                        status, oracle_had,
                         "step {}: delete({:?}) status mismatch (oracle had={})",
                         i, key, oracle_had,
                     );
@@ -175,14 +164,14 @@ proptest! {
                     let mut data = DatabaseEntry::new();
                     let status = db.get_into(None, &key_e, &mut data).unwrap();
                     match (status, oracle.get(&key)) {
-                        (OperationStatus::Success, Some(expected)) => {
+                        (true, Some(expected)) => {
                             prop_assert_eq!(
                                 data.data(), expected.as_slice(),
                                 "step {}: get({:?}) returned wrong value",
                                 i, key,
                             );
                         }
-                        (OperationStatus::NotFound, None) => { /* agree */ }
+                        (false, None) => { /* agree */ }
                         (s, e) => prop_assert!(
                             false,
                             "step {}: get({:?}) disagreement: db_status={:?}, oracle={:?}",
@@ -199,8 +188,8 @@ proptest! {
             let mut data = DatabaseEntry::new();
             let key_e = DatabaseEntry::from_data(k);
             let status = db.get_into(None, &key_e, &mut data).unwrap();
-            prop_assert_eq!(
-                status, OperationStatus::Success,
+            prop_assert!(
+                status,
                 "final sweep: key {:?} missing from db", k,
             );
             prop_assert_eq!(

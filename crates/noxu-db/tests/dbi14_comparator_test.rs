@@ -23,13 +23,12 @@ fn env(dir: &TempDir) -> noxu_db::Environment {
 }
 
 fn put(db: &noxu_db::Database, k: &[u8], v: &[u8]) {
-    db.put( &DatabaseEntry::from_bytes(k), &DatabaseEntry::from_bytes(v))
-        .unwrap();
+    db.put(DatabaseEntry::from_bytes(k), DatabaseEntry::from_bytes(v)).unwrap();
 }
 
 /// Walk the whole DB in cursor (First → Next) order, returning the keys.
 fn cursor_keys(db: &noxu_db::Database) -> Vec<Vec<u8>> {
-    let mut cur = db.open_cursor( None).unwrap();
+    let mut cur = db.open_cursor(None).unwrap();
     let mut key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
     let mut out = Vec::new();
@@ -115,7 +114,7 @@ fn headline1_le_integer_comparator_diverges_from_byte_order() {
     assert_eq!(got, vec![1u32, 256, 65536]);
 
     // Seek must also honour the comparator: SearchGte 200 → 256.
-    let mut cur = db.open_cursor( None).unwrap();
+    let mut cur = db.open_cursor(None).unwrap();
     let mut key = DatabaseEntry::from_bytes(&200u32.to_le_bytes());
     let mut data = DatabaseEntry::new();
     let s = cur.get(&mut key, &mut data, Get::SearchGte, None).unwrap();
@@ -265,14 +264,12 @@ fn headline3_duplicate_comparator_orders_dup_data() {
 
     // Single key, several data values inserted out of order.
     for d in [b"a".as_ref(), b"c", b"b", b"e", b"d"] {
-        db.put(
-            &DatabaseEntry::from_bytes(b"k"),
-            &DatabaseEntry::from_bytes(d))
-        .unwrap();
+        db.put(DatabaseEntry::from_bytes(b"k"), DatabaseEntry::from_bytes(d))
+            .unwrap();
     }
 
     // Walk all duplicates of "k": data must come back in DESCENDING order.
-    let mut cur = db.open_cursor( None).unwrap();
+    let mut cur = db.open_cursor(None).unwrap();
     let mut key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
     let mut datas = Vec::new();
@@ -306,12 +303,10 @@ fn default_duplicate_order_is_ascending_byte_order() {
         .with_sorted_duplicates(true);
     let db = e.open_database(None, "dup_def", &cfg).unwrap();
     for d in [b"c".as_ref(), b"a", b"b"] {
-        db.put(
-            &DatabaseEntry::from_bytes(b"k"),
-            &DatabaseEntry::from_bytes(d))
-        .unwrap();
+        db.put(DatabaseEntry::from_bytes(b"k"), DatabaseEntry::from_bytes(d))
+            .unwrap();
     }
-    let mut cur = db.open_cursor( None).unwrap();
+    let mut cur = db.open_cursor(None).unwrap();
     let mut key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
     let mut datas = Vec::new();
@@ -340,8 +335,9 @@ fn reopen_sorted_dup_with_dup_comparator_preserves_order() {
         let db = e.open_database(None, "dup", &cfg).unwrap();
         for d in [b"a".as_ref(), b"c", b"b", b"e", b"d"] {
             db.put(
-                &DatabaseEntry::from_bytes(b"k"),
-                &DatabaseEntry::from_bytes(d))
+                DatabaseEntry::from_bytes(b"k"),
+                DatabaseEntry::from_bytes(d),
+            )
             .unwrap();
         }
         drop(db);
@@ -356,7 +352,7 @@ fn reopen_sorted_dup_with_dup_comparator_preserves_order() {
         .with_sorted_duplicates(true)
         .with_duplicate_comparator(dup_cmp);
     let db = e.open_database(None, "dup", &cfg).unwrap();
-    let mut cur = db.open_cursor( None).unwrap();
+    let mut cur = db.open_cursor(None).unwrap();
     let mut key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
     let mut datas = Vec::new();

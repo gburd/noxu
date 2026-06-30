@@ -47,9 +47,7 @@
 //! # (edit SEED below, or use the determinism test which runs a fixed seed)
 //! ```
 
-use noxu_db::{
-    DatabaseConfig, DatabaseEntry, EnvironmentConfig, OperationStatus,
-};
+use noxu_db::{DatabaseConfig, DatabaseEntry, EnvironmentConfig};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;

@@ -19,10 +19,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use noxu_db::{
-    DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
-    OperationStatus,
-};
+use noxu_db::{DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};

@@ -29,8 +29,8 @@
 //! # Example
 //!
 //! ```ignore
-//! let mut cur1 = sec_db1.open_cursor(None, None)?;
-//! let mut cur2 = sec_db2.open_cursor(None, None)?;
+//! let mut cur1 = sec_db1.open_cursor(None)?;
+//! let mut cur2 = sec_db2.open_cursor(None)?;
 //!
 //! // Position each cursor at its desired secondary key.
 //! cur1.get_search_key(&sec_key1, &mut p_key, &mut data)?;
@@ -369,7 +369,7 @@ mod tests {
             let k = DatabaseEntry::from_bytes(pk);
             let v = DatabaseEntry::from_bytes(val);
             // primary.put() auto-maintains both secondaries via registered hooks.
-            self.primary.lock().put(None, &k, &v).unwrap();
+            self.primary.lock().put(&k, &v).unwrap();
         }
     }
 
@@ -401,7 +401,7 @@ mod tests {
         fix.insert(b"pk3", b"AC");
         fix.insert(b"pk4", b"XB");
 
-        let mut cursor1 = fix.sec1.open_cursor(None, None).unwrap();
+        let mut cursor1 = fix.sec1.open_cursor(None).unwrap();
         {
             let mut p_key = DatabaseEntry::new();
             let mut data = DatabaseEntry::new();
@@ -414,7 +414,7 @@ mod tests {
                 .unwrap();
             assert_eq!(s, OperationStatus::Success);
         }
-        let mut cursor2 = fix.sec2.open_cursor(None, None).unwrap();
+        let mut cursor2 = fix.sec2.open_cursor(None).unwrap();
         {
             let mut p_key = DatabaseEntry::new();
             let mut data = DatabaseEntry::new();
@@ -466,7 +466,7 @@ mod tests {
         fix.insert(b"pk3", b"XB");
         fix.insert(b"pk1", b"AB");
 
-        let mut cursor1 = fix.sec1.open_cursor(None, None).unwrap();
+        let mut cursor1 = fix.sec1.open_cursor(None).unwrap();
         {
             let mut p_key = DatabaseEntry::new();
             let mut data = DatabaseEntry::new();
@@ -480,7 +480,7 @@ mod tests {
             assert_eq!(s, OperationStatus::Success);
         }
 
-        let mut cursor2 = fix.sec2.open_cursor(None, None).unwrap();
+        let mut cursor2 = fix.sec2.open_cursor(None).unwrap();
         {
             let mut p_key = DatabaseEntry::new();
             let mut data = DatabaseEntry::new();
@@ -514,8 +514,8 @@ mod tests {
     fn test_join_empty_cursor_returns_not_found() {
         let fix = Fixture::new();
 
-        let cursor1 = fix.sec1.open_cursor(None, None).unwrap();
-        let cursor2 = fix.sec2.open_cursor(None, None).unwrap();
+        let cursor1 = fix.sec1.open_cursor(None).unwrap();
+        let cursor2 = fix.sec2.open_cursor(None).unwrap();
 
         // Cursors not positioned (no records) → join returns NotFound.
         let pri_guard = fix.primary.lock();
@@ -533,7 +533,7 @@ mod tests {
         let fix = Fixture::new();
         fix.insert(b"mypk", b"AB");
 
-        let mut cursor1 = fix.sec1.open_cursor(None, None).unwrap();
+        let mut cursor1 = fix.sec1.open_cursor(None).unwrap();
         {
             let mut p_key = DatabaseEntry::new();
             let mut data = DatabaseEntry::new();
@@ -545,7 +545,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        let mut cursor2 = fix.sec2.open_cursor(None, None).unwrap();
+        let mut cursor2 = fix.sec2.open_cursor(None).unwrap();
         {
             let mut p_key = DatabaseEntry::new();
             let mut data = DatabaseEntry::new();
@@ -573,7 +573,7 @@ mod tests {
         let fix = Fixture::new();
         fix.insert(b"pk1", b"AB");
 
-        let mut cursor1 = fix.sec1.open_cursor(None, None).unwrap();
+        let mut cursor1 = fix.sec1.open_cursor(None).unwrap();
         {
             let mut p_key = DatabaseEntry::new();
             let mut data = DatabaseEntry::new();
@@ -585,7 +585,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        let mut cursor2 = fix.sec2.open_cursor(None, None).unwrap();
+        let mut cursor2 = fix.sec2.open_cursor(None).unwrap();
         {
             let mut p_key = DatabaseEntry::new();
             let mut data = DatabaseEntry::new();
@@ -621,7 +621,7 @@ mod tests {
         fix.insert(b"pk1", b"AA");
         fix.insert(b"pk2", b"BB");
 
-        let mut cursor1 = fix.sec1.open_cursor(None, None).unwrap();
+        let mut cursor1 = fix.sec1.open_cursor(None).unwrap();
         {
             let mut p_key = DatabaseEntry::new();
             let mut data = DatabaseEntry::new();
@@ -633,7 +633,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        let mut cursor2 = fix.sec2.open_cursor(None, None).unwrap();
+        let mut cursor2 = fix.sec2.open_cursor(None).unwrap();
         {
             let mut p_key = DatabaseEntry::new();
             let mut data = DatabaseEntry::new();
@@ -661,7 +661,7 @@ mod tests {
         let fix = Fixture::new();
         fix.insert(b"pk1", b"AB");
 
-        let mut cursor1 = fix.sec1.open_cursor(None, None).unwrap();
+        let mut cursor1 = fix.sec1.open_cursor(None).unwrap();
         {
             let mut p_key = DatabaseEntry::new();
             let mut data = DatabaseEntry::new();
@@ -690,7 +690,7 @@ mod tests {
         let fix = Fixture::new();
         fix.insert(b"pk1", b"AB");
 
-        let mut cursor1 = fix.sec1.open_cursor(None, None).unwrap();
+        let mut cursor1 = fix.sec1.open_cursor(None).unwrap();
         {
             let mut p_key = DatabaseEntry::new();
             let mut data = DatabaseEntry::new();
@@ -714,7 +714,7 @@ mod tests {
         let fix = Fixture::new();
         fix.insert(b"pk1", b"AB");
 
-        let mut cursor1 = fix.sec1.open_cursor(None, None).unwrap();
+        let mut cursor1 = fix.sec1.open_cursor(None).unwrap();
         {
             let mut p_key = DatabaseEntry::new();
             let mut data = DatabaseEntry::new();

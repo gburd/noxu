@@ -45,7 +45,7 @@ fn put(
     data: u32,
 ) {
     let txn = env.begin_transaction(None).unwrap();
-    db.put_in(&txn, &ikey(key), &ikey(data)).unwrap();
+    db.put_in(&txn, ikey(key), ikey(data)).unwrap();
     txn.commit().unwrap();
 }
 

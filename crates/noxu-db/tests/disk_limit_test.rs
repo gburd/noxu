@@ -19,7 +19,6 @@
 
 use noxu_db::{
     DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig, NoxuError,
-    OperationStatus,
 };
 use tempfile::TempDir;
 
@@ -60,7 +59,7 @@ fn disk_limit_blocks_then_resumes() {
     for i in 0..2000usize {
         let key = DatabaseEntry::from_bytes(&(i as u64).to_be_bytes());
         env.refresh_disk_limit().unwrap();
-        match db.put(&key, &val(i)) {
+        match db.put(&key, val(i)) {
             Ok(()) => {}
             Err(NoxuError::DiskLimitExceeded { used, limit }) => {
                 assert!(
@@ -83,7 +82,7 @@ fn disk_limit_blocks_then_resumes() {
     let key = DatabaseEntry::from_bytes(&(blocked_at as u64).to_be_bytes());
     assert!(
         matches!(
-            db.put( &key, &val(blocked_at)),
+            db.put(&key, val(blocked_at)),
             Err(NoxuError::DiskLimitExceeded { .. })
         ),
         "writes must stay blocked while over the limit"
@@ -101,7 +100,7 @@ fn disk_limit_blocks_then_resumes() {
     let txn = env.begin_transaction(None).unwrap();
     // The put inside the txn is itself a user write and is refused...
     assert!(matches!(
-        db.put_in(&txn, &read_key, &val(1)),
+        db.put_in(&txn, &read_key, val(1)),
         Err(NoxuError::DiskLimitExceeded { .. })
     ));
     // ...but aborting the txn still succeeds.
@@ -116,7 +115,7 @@ fn disk_limit_blocks_then_resumes() {
         // Deletes are also gated while over-limit, so we may need to clean
         // first. Try the delete; ignore a disk-limit refusal and rely on the
         // checkpoint+clean below to reclaim whole obsolete files.
-        let _ = db.delete( &key);
+        let _ = db.delete(&key);
     }
     // Checkpoint flushes the tree so cleaned files become fully obsolete, then
     // clean_log reclaims them (the cleaner refreshes the disk-limit state after
@@ -135,7 +134,7 @@ fn disk_limit_blocks_then_resumes() {
         let key =
             DatabaseEntry::from_bytes(&(10_000 + round as u64).to_be_bytes());
         env.refresh_disk_limit().unwrap();
-        match db.put(&key, &val(round)) {
+        match db.put(&key, val(round)) {
             Ok(()) => {
                 resumed = true;
                 break;
@@ -145,7 +144,7 @@ fn disk_limit_blocks_then_resumes() {
                 for i in 0..blocked_at {
                     let k =
                         DatabaseEntry::from_bytes(&(i as u64).to_be_bytes());
-                    let _ = db.delete( &k);
+                    let _ = db.delete(&k);
                 }
                 let _ = env.checkpoint(None);
                 let _ = env.clean_log();
@@ -172,7 +171,6 @@ fn disabled_by_default_never_blocks() {
     for i in 0..500usize {
         let key = DatabaseEntry::from_bytes(&(i as u64).to_be_bytes());
         env.refresh_disk_limit().unwrap();
-        let s = db.put( &key, &val(i)).unwrap();
-        ;
+        db.put(&key, val(i)).unwrap();
     }
 }

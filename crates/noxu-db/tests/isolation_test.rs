@@ -357,8 +357,7 @@ fn test_atomic_commit_all_or_nothing_visibility() {
     for i in 0u32..N {
         let k = DatabaseEntry::from_bytes(&i.to_be_bytes());
         let mut v = DatabaseEntry::new();
-        if !(db.get_into(Some(&read_txn), &k, &mut v).unwrap())
-        {
+        if !(db.get_into(Some(&read_txn), &k, &mut v).unwrap()) {
             missing += 1;
         }
     }
@@ -397,8 +396,10 @@ fn test_aborted_transaction_full_rollback() {
 
     // New key must not exist.
     let mut out2 = DatabaseEntry::new();
-    assert!(!get_val(&db, None, b"new_key", &mut out2),
-        "abort must remove newly inserted keys");
+    assert!(
+        !get_val(&db, None, b"new_key", &mut out2),
+        "abort must remove newly inserted keys"
+    );
 }
 
 fn scratch_dir(prefix: &str) -> TempDir {
@@ -463,7 +464,6 @@ fn test_32_thread_concurrent_readers() {
                             assert_eq!(v.data(), b"val");
                         }
                         false => missing += 1,
-                        other => panic!("unexpected status {other:?}"),
                     }
                 }
                 txn.commit().unwrap();
@@ -643,8 +643,7 @@ fn test_64_thread_concurrent_readers() {
                         let idx = (tid as u32 * LOOKUPS_PER_TXN + j) % KEYS;
                         let k = DatabaseEntry::from_bytes(&idx.to_be_bytes());
                         let mut v = DatabaseEntry::new();
-                        if !(db.get_into(Some(&txn), &k, &mut v).unwrap())
-                        {
+                        if !(db.get_into(Some(&txn), &k, &mut v).unwrap()) {
                             errors += 1;
                         }
                     }
@@ -875,7 +874,7 @@ fn test_200_thread_disjoint_writers() {
     );
 
     // Spot-check sorted order via cursor scan.
-    let mut cursor = db.open_cursor( None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut prev: Option<String> = None;
     let mut k = DatabaseEntry::new();
     let mut v = DatabaseEntry::new();
@@ -951,9 +950,11 @@ fn test_serializable_prevents_phantom_insert() {
     // Pre-populate: a, c  (so "bb" would be inserted between them).
     for (k, v) in &[(b"a".as_ref(), b"val_a".as_ref()), (b"c", b"val_c")] {
         let txn = env.begin_transaction(None).unwrap();
-        db.put_in(&txn,
-            &DatabaseEntry::from_bytes(k),
-            &DatabaseEntry::from_bytes(v))
+        db.put_in(
+            &txn,
+            DatabaseEntry::from_bytes(k),
+            DatabaseEntry::from_bytes(v),
+        )
         .unwrap();
         txn.commit().unwrap();
     }
@@ -964,11 +965,15 @@ fn test_serializable_prevents_phantom_insert() {
     let t1 = env.begin_transaction(Some(&ser_cfg)).unwrap();
     let mut out = DatabaseEntry::new();
     // Read "a"
-    assert!(db.get_into(Some(&t1), &DatabaseEntry::from_bytes(b"a"), &mut out).unwrap(),
+    assert!(
+        db.get_into(Some(&t1), DatabaseEntry::from_bytes(b"a"), &mut out)
+            .unwrap(),
         "T1 should read 'a'"
     );
     // Read "c" -- this acquires RangeRead on "c"'s LSN
-    assert!(db.get_into(Some(&t1), &DatabaseEntry::from_bytes(b"c"), &mut out).unwrap(),
+    assert!(
+        db.get_into(Some(&t1), DatabaseEntry::from_bytes(b"c"), &mut out)
+            .unwrap(),
         "T1 should read 'c'"
     );
 
@@ -977,9 +982,11 @@ fn test_serializable_prevents_phantom_insert() {
     // on "c"'s LSN.  T1 holds RangeRead on "c" → conflict → LockNotAvailable.
     let no_wait_cfg = TransactionConfig::new().with_no_wait(true);
     let t2 = env.begin_transaction(Some(&no_wait_cfg)).unwrap();
-    let insert_result = db.put_in(&t2,
-        &DatabaseEntry::from_bytes(b"bb"),
-        &DatabaseEntry::from_bytes(b"val_bb"));
+    let insert_result = db.put_in(
+        &t2,
+        DatabaseEntry::from_bytes(b"bb"),
+        DatabaseEntry::from_bytes(b"val_bb"),
+    );
     let _ = t2.abort();
 
     assert!(
@@ -998,9 +1005,11 @@ fn test_serializable_prevents_phantom_insert() {
     t1.commit().unwrap();
 
     let t3 = env.begin_transaction(Some(&no_wait_cfg)).unwrap();
-    let result = db.put_in(&t3,
-        &DatabaseEntry::from_bytes(b"bb"),
-        &DatabaseEntry::from_bytes(b"val_bb"));
+    let result = db.put_in(
+        &t3,
+        DatabaseEntry::from_bytes(b"bb"),
+        DatabaseEntry::from_bytes(b"val_bb"),
+    );
     assert!(
         result.is_ok(),
         "After T1 commits, insert of 'bb' must succeed; got: {result:?}"
@@ -1034,9 +1043,11 @@ fn test_default_isolation_allows_phantom_insert() {
 
     for (k, v) in &[(b"a".as_ref(), b"v".as_ref()), (b"c", b"v")] {
         let txn = env.begin_transaction(None).unwrap();
-        db.put_in(&txn,
-            &DatabaseEntry::from_bytes(k),
-            &DatabaseEntry::from_bytes(v))
+        db.put_in(
+            &txn,
+            DatabaseEntry::from_bytes(k),
+            DatabaseEntry::from_bytes(v),
+        )
         .unwrap();
         txn.commit().unwrap();
     }
@@ -1045,8 +1056,8 @@ fn test_default_isolation_allows_phantom_insert() {
     // lock_ln acquires Read (NOT RangeRead) on each key's LSN.
     let t1 = env.begin_transaction(None).unwrap(); // default = no serializable
     let mut out = DatabaseEntry::new();
-    db.get_into(Some(&t1), &DatabaseEntry::from_bytes(b"a"), &mut out).unwrap();
-    db.get_into(Some(&t1), &DatabaseEntry::from_bytes(b"c"), &mut out).unwrap();
+    db.get_into(Some(&t1), DatabaseEntry::from_bytes(b"a"), &mut out).unwrap();
+    db.get_into(Some(&t1), DatabaseEntry::from_bytes(b"c"), &mut out).unwrap();
 
     // T2: no_wait inserter inserts "bb" (between "a" and "c").
     // Under non-serializable isolation T1 holds only Read on "c".
@@ -1054,9 +1065,11 @@ fn test_default_isolation_allows_phantom_insert() {
     // So T2's RangeInsert on "c" is immediately granted.
     let no_wait_cfg = TransactionConfig::new().with_no_wait(true);
     let t2 = env.begin_transaction(Some(&no_wait_cfg)).unwrap();
-    let result = db.put_in(&t2,
-        &DatabaseEntry::from_bytes(b"bb"),
-        &DatabaseEntry::from_bytes(b"val_bb"));
+    let result = db.put_in(
+        &t2,
+        DatabaseEntry::from_bytes(b"bb"),
+        DatabaseEntry::from_bytes(b"val_bb"),
+    );
     assert!(
         result.is_ok(),
         "Under default (non-serializable) isolation, phantom insert MUST \
@@ -1092,9 +1105,11 @@ fn test_read_committed_allows_phantom_insert() {
 
     for (k, v) in &[(b"a".as_ref(), b"v".as_ref()), (b"c", b"v")] {
         let txn = env.begin_transaction(None).unwrap();
-        db.put_in(&txn,
-            &DatabaseEntry::from_bytes(k),
-            &DatabaseEntry::from_bytes(v))
+        db.put_in(
+            &txn,
+            DatabaseEntry::from_bytes(k),
+            DatabaseEntry::from_bytes(v),
+        )
         .unwrap();
         txn.commit().unwrap();
     }
@@ -1103,17 +1118,19 @@ fn test_read_committed_allows_phantom_insert() {
     let rc_cfg = TransactionConfig::read_committed();
     let t1 = env.begin_transaction(Some(&rc_cfg)).unwrap();
     let mut out = DatabaseEntry::new();
-    db.get_into(Some(&t1), &DatabaseEntry::from_bytes(b"a"), &mut out).unwrap();
-    db.get_into(Some(&t1), &DatabaseEntry::from_bytes(b"c"), &mut out).unwrap();
+    db.get_into(Some(&t1), DatabaseEntry::from_bytes(b"a"), &mut out).unwrap();
+    db.get_into(Some(&t1), DatabaseEntry::from_bytes(b"c"), &mut out).unwrap();
     // After each get(), read_committed releases the lock immediately.
     // No RangeRead is held on "c"'s LSN at this point.
 
     // T2: no_wait inserter inserts "bb" — must succeed because T1 released.
     let no_wait_cfg = TransactionConfig::new().with_no_wait(true);
     let t2 = env.begin_transaction(Some(&no_wait_cfg)).unwrap();
-    let result = db.put_in(&t2,
-        &DatabaseEntry::from_bytes(b"bb"),
-        &DatabaseEntry::from_bytes(b"val_bb"));
+    let result = db.put_in(
+        &t2,
+        DatabaseEntry::from_bytes(b"bb"),
+        DatabaseEntry::from_bytes(b"val_bb"),
+    );
     assert!(
         result.is_ok(),
         "Under READ_COMMITTED isolation phantom insert must succeed \
@@ -1149,9 +1166,11 @@ fn test_serializable_scan_then_insert_same_txn_no_panic() {
     // Pre-populate: "a", "c".
     for (k, v) in &[(b"a".as_ref(), b"v".as_ref()), (b"c", b"v")] {
         let txn = env.begin_transaction(None).unwrap();
-        db.put_in(&txn,
-            &DatabaseEntry::from_bytes(k),
-            &DatabaseEntry::from_bytes(v))
+        db.put_in(
+            &txn,
+            DatabaseEntry::from_bytes(k),
+            DatabaseEntry::from_bytes(v),
+        )
         .unwrap();
         txn.commit().unwrap();
     }
@@ -1163,11 +1182,13 @@ fn test_serializable_scan_then_insert_same_txn_no_panic() {
     let ser_cfg = TransactionConfig::new().with_serializable_isolation(true);
     let txn = env.begin_transaction(Some(&ser_cfg)).unwrap();
     let mut out = DatabaseEntry::new();
-    db.get_into(Some(&txn), &DatabaseEntry::from_bytes(b"c"), &mut out).unwrap();
+    db.get_into(Some(&txn), DatabaseEntry::from_bytes(b"c"), &mut out).unwrap();
     // Now insert "bb" (successor is "c" which we already hold RangeRead on).
-    let result = db.put_in(&txn,
-        &DatabaseEntry::from_bytes(b"bb"),
-        &DatabaseEntry::from_bytes(b"val_bb"));
+    let result = db.put_in(
+        &txn,
+        DatabaseEntry::from_bytes(b"bb"),
+        DatabaseEntry::from_bytes(b"val_bb"),
+    );
     assert!(
         result.is_ok(),
         "Same-txn scan+insert must not panic (owns_any_lock guard).  Got: {result:?}"
@@ -1203,9 +1224,11 @@ fn test_serializable_prevents_phantom_eof_insert() {
     // Pre-populate a single key "m".
     {
         let txn = env.begin_transaction(None).unwrap();
-        db.put_in(&txn,
-            &DatabaseEntry::from_bytes(b"m"),
-            &DatabaseEntry::from_bytes(b"v"))
+        db.put_in(
+            &txn,
+            DatabaseEntry::from_bytes(b"m"),
+            DatabaseEntry::from_bytes(b"v"),
+        )
         .unwrap();
         txn.commit().unwrap();
     }
@@ -1234,9 +1257,11 @@ fn test_serializable_prevents_phantom_eof_insert() {
     // RangeRead × RangeInsert = Block → LockNotAvailable (no_wait).
     let no_wait_cfg = TransactionConfig::new().with_no_wait(true);
     let t2 = env.begin_transaction(Some(&no_wait_cfg)).unwrap();
-    let insert_result = db.put_in(&t2,
-        &DatabaseEntry::from_bytes(b"z"),
-        &DatabaseEntry::from_bytes(b"val_z"));
+    let insert_result = db.put_in(
+        &t2,
+        DatabaseEntry::from_bytes(b"z"),
+        DatabaseEntry::from_bytes(b"val_z"),
+    );
     let _ = t2.abort();
 
     assert!(
@@ -1257,9 +1282,11 @@ fn test_serializable_prevents_phantom_eof_insert() {
     t1.commit().unwrap();
     let t3 = env.begin_transaction(Some(&no_wait_cfg)).unwrap();
     assert!(
-        db.put_in(&t3,
-            &DatabaseEntry::from_bytes(b"z"),
-            &DatabaseEntry::from_bytes(b"val_z"))
+        db.put_in(
+            &t3,
+            DatabaseEntry::from_bytes(b"z"),
+            DatabaseEntry::from_bytes(b"val_z")
+        )
         .is_ok(),
         "After T1 commits, 'z' insert must succeed"
     );

@@ -13,7 +13,7 @@
 
 use noxu_db::{
     CursorConfig, Database, DatabaseConfig, DatabaseEntry, EnvironmentConfig,
-    OperationStatus, SecondaryConfig, SecondaryDatabase, SecondaryKeyCreator,
+    SecondaryConfig, SecondaryDatabase, SecondaryKeyCreator,
 };
 use noxu_sync::Mutex;
 use std::sync::Arc;
@@ -113,7 +113,7 @@ fn d6_duplicate_sec_key_insert_raises_integrity_error() {
 
     // First insert via primary.put() — auto-maintains secondary.
     // This inserts (sec_key=[A], pri_key="k1") into the secondary.
-    primary.lock().put( &pk, &data).unwrap();
+    primary.lock().put(&pk, &data).unwrap();
 
     // Now force a direct second insert of the SAME (sec_key=[A], pri_key="k1")
     // pair — simulates a corrupt auto-maintenance that runs twice for the same
@@ -150,29 +150,31 @@ fn d9_overwrite_changing_sec_key_removes_old_entry() {
 
     // Insert: data starts with b'A' → sec_key=[A].
     // primary.put() auto-maintains secondary via the hook.
-    primary.lock().put( &pk, &de(b"A_v1")).unwrap();
+    primary.lock().put(&pk, de(b"A_v1")).unwrap();
 
     // Verify secondary has ([A], k1).
     let mut p_key = DatabaseEntry::new();
     let mut d = DatabaseEntry::new();
-    let s = sec.get_into(None, &de(b"A"), &mut p_key, &mut d).unwrap();
+    let s = sec.get_into(None, de(b"A"), &mut p_key, &mut d).unwrap();
     assert!(s, "initial secondary lookup");
     assert_eq!(p_key.get_data().unwrap_or(&[]), b"k1");
 
     // Overwrite: data now starts with b'B' → sec_key=[B].
     // Database::put fetches old_data before writing, then auto-maintains:
     // delete ([A], k1) + insert ([B], k1).
-    primary.lock().put( &pk, &de(b"B_v2")).unwrap();
+    primary.lock().put(&pk, de(b"B_v2")).unwrap();
 
     // Old secondary entry ([A], k1) must be gone.
-    let s_old = sec.get_into(None, &de(b"A"), &mut p_key, &mut d).unwrap();
-    assert!(!s_old,
+    let s_old = sec.get_into(None, de(b"A"), &mut p_key, &mut d).unwrap();
+    assert!(
+        !s_old,
         "D9: old secondary entry ([A], k1) must be removed after overwrite"
     );
 
     // New secondary entry ([B], k1) must exist.
-    let s_new = sec.get_into(None, &de(b"B"), &mut p_key, &mut d).unwrap();
-    assert!(s_new,
+    let s_new = sec.get_into(None, de(b"B"), &mut p_key, &mut d).unwrap();
+    assert!(
+        s_new,
         "D9: new secondary entry ([B], k1) must exist after overwrite"
     );
     assert_eq!(p_key.get_data().unwrap_or(&[]), b"k1");
@@ -195,7 +197,7 @@ fn d8_dirty_read_missing_primary_skips_record() {
     let data = de(b"A_v1"); // sec_key = [A]
 
     // Insert via primary.put() (auto-maintains secondary).
-    primary.lock().put( &pk, &data).unwrap();
+    primary.lock().put(&pk, &data).unwrap();
 
     // Manually inject a stale secondary entry for a non-existent primary.
     // We insert a secondary entry for "orphan_pk" which has no primary record.
@@ -207,7 +209,7 @@ fn d8_dirty_read_missing_primary_skips_record() {
 
     // Open a dirty-read secondary cursor.
     let dirty_cfg = CursorConfig::read_uncommitted();
-    let mut sec_cursor = sec.open_cursor( Some(&dirty_cfg)).unwrap();
+    let mut sec_cursor = sec.open_cursor(Some(&dirty_cfg)).unwrap();
     let sec_key = de(b"A");
     let mut p_key_out = DatabaseEntry::new();
     let mut data_out = DatabaseEntry::new();
@@ -256,10 +258,10 @@ fn d7_missing_sec_entry_on_delete_raises_integrity_error() {
     let data = de(b"A_v1"); // sec_key = [A]
 
     // Insert primary record (auto-hook inserts secondary entry).
-    primary.lock().put( &pk, &data).unwrap();
+    primary.lock().put(&pk, &data).unwrap();
 
     // Delete primary record (auto-hook deletes secondary entry ([A], k1)).
-    primary.lock().delete( &pk).unwrap();
+    primary.lock().delete(&pk).unwrap();
 
     // Now call update_secondary with old_data=Some (requests delete of ([A],k1))
     // but the entry was already deleted → D7: must raise SecondaryIntegrityException.

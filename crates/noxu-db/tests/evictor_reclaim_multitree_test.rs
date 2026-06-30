@@ -29,7 +29,6 @@
 
 use noxu_db::{
     Database, DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
-    OperationStatus,
 };
 
 /// Create a unique env dir on /scratch (real disk).  Falls back to the
@@ -92,7 +91,7 @@ fn evictor_reclaims_to_budget_across_user_dbs() {
         let k = DatabaseEntry::from_vec(format!("{:010}", i).into_bytes());
         let v = DatabaseEntry::from_bytes(&val);
         let db = if i % 2 == 0 { &db_a } else { &db_b };
-        db.put( &k, &v).unwrap();
+        db.put(&k, &v).unwrap();
     }
 
     let usage_before = env.cache_usage_bytes().unwrap();
@@ -159,10 +158,7 @@ fn evictor_reclaims_to_budget_across_user_dbs() {
         let db = if i % 2 == 0 { &db_a } else { &db_b };
         let mut out = DatabaseEntry::new();
         let st = db.get_into(None, &k, &mut out).unwrap();
-        assert!(st,
-            "record {} must survive eviction",
-            i
-        );
+        assert!(st, "record {} must survive eviction", i);
         assert_eq!(out.data(), &val[..], "record {} data intact", i);
     }
 

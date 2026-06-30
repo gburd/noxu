@@ -35,10 +35,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use noxu_db::{
-    DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
-    OperationStatus,
-};
+use noxu_db::{DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig};
 use std::sync::{Arc, Barrier};
 use tempfile::TempDir;
 

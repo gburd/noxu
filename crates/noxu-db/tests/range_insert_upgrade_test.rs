@@ -65,15 +65,19 @@ fn adjacent_key_writes_in_one_txn_do_not_panic() {
         // "0" and "1", so its successor is the existing "1"; then overwrite "1".
         for i in 0u8..5 {
             let new_key = DatabaseEntry::from_vec(vec![b'0' + i, b'a']);
-            db.put_in(&txn,
+            db.put_in(
+                &txn,
                 &new_key,
-                &DatabaseEntry::from_vec(format!("n{round}").into_bytes()))
+                DatabaseEntry::from_vec(format!("n{round}").into_bytes()),
+            )
             .expect("insert of interleaved new key must not panic");
             // Overwrite the successor (existing key i+1) — formerly the panic.
             let succ = DatabaseEntry::from_vec(vec![b'0' + i + 1]);
-            db.put_in(&txn,
+            db.put_in(
+                &txn,
                 &succ,
-                &DatabaseEntry::from_vec(format!("r{round}").into_bytes()))
+                DatabaseEntry::from_vec(format!("r{round}").into_bytes()),
+            )
             .expect(
                 "overwrite of the range-insert-locked successor must not panic",
             );
@@ -105,9 +109,11 @@ fn insert_then_insert_successor_same_txn() {
     {
         let txn = env.begin_transaction(None).unwrap();
         for k in [b"B".as_slice(), b"D".as_slice()] {
-            db.put_in(&txn,
-                &DatabaseEntry::from_bytes(k),
-                &DatabaseEntry::from_bytes(b"seed"))
+            db.put_in(
+                &txn,
+                DatabaseEntry::from_bytes(k),
+                DatabaseEntry::from_bytes(b"seed"),
+            )
             .unwrap();
         }
         txn.commit().unwrap();
@@ -116,23 +122,27 @@ fn insert_then_insert_successor_same_txn() {
     let txn = env.begin_transaction(None).unwrap();
     // Insert A (new): its successor is the existing key B -> range-locks B's
     // real LSN.
-    db.put_in(&txn,
-        &DatabaseEntry::from_bytes(b"A"),
-        &DatabaseEntry::from_bytes(b"va"))
+    db.put_in(
+        &txn,
+        DatabaseEntry::from_bytes(b"A"),
+        DatabaseEntry::from_bytes(b"va"),
+    )
     .expect("insert A must not panic");
     // Overwrite B (existing): write-locks B's real LSN — the SAME LSN the txn
     // holds as RangeInsert.  Formerly an illegal (RangeInsert, Write) upgrade
     // that panicked + poison-aborted the process; now a fresh legal Write.
-    db.put_in(&txn,
-        &DatabaseEntry::from_bytes(b"B"),
-        &DatabaseEntry::from_bytes(b"vb_new"))
+    db.put_in(
+        &txn,
+        DatabaseEntry::from_bytes(b"B"),
+        DatabaseEntry::from_bytes(b"vb_new"),
+    )
     .expect("overwrite of the range-insert-locked successor must not panic");
     txn.commit().expect("commit must succeed");
 
     // Verify B's new value committed.
     let txn = env.begin_transaction(None).unwrap();
     let mut out = DatabaseEntry::new();
-    db.get_into(Some(&txn), &DatabaseEntry::from_bytes(b"B"), &mut out).unwrap();
+    db.get_into(Some(&txn), DatabaseEntry::from_bytes(b"B"), &mut out).unwrap();
     assert_eq!(out.data(), b"vb_new");
     txn.commit().unwrap();
 }
@@ -145,21 +155,25 @@ fn s2_insert_then_get_successor_same_txn() {
     {
         let txn = env.begin_transaction(None).unwrap();
         for k in [b"B".as_slice(), b"D".as_slice()] {
-            db.put_in(&txn,
-                &DatabaseEntry::from_bytes(k),
-                &DatabaseEntry::from_bytes(b"seed"))
+            db.put_in(
+                &txn,
+                DatabaseEntry::from_bytes(k),
+                DatabaseEntry::from_bytes(b"seed"),
+            )
             .unwrap();
         }
         txn.commit().unwrap();
     }
     let txn = env.begin_transaction(None).unwrap();
-    db.put_in(&txn,
-        &DatabaseEntry::from_bytes(b"A"),
-        &DatabaseEntry::from_bytes(b"va"))
+    db.put_in(
+        &txn,
+        DatabaseEntry::from_bytes(b"A"),
+        DatabaseEntry::from_bytes(b"va"),
+    )
     .expect("insert A");
     // GET B (the range-insert-locked successor) in the same txn:
     let mut out = DatabaseEntry::new();
-    db.get_into(Some(&txn), &DatabaseEntry::from_bytes(b"B"), &mut out)
+    db.get_into(Some(&txn), DatabaseEntry::from_bytes(b"B"), &mut out)
         .expect("get of range-insert-locked successor must not panic/error");
     txn.commit().expect("commit");
 }

@@ -70,9 +70,11 @@ fn dup_cursor_creation_forward_walks_in_sorted_order() {
     let txn = env.begin_transaction(None).unwrap();
     for (k, dups) in &data {
         for d in dups {
-            db.put_in(&txn,
-                &DatabaseEntry::from_bytes(k),
-                &DatabaseEntry::from_bytes(d))
+            db.put_in(
+                &txn,
+                DatabaseEntry::from_bytes(k),
+                DatabaseEntry::from_bytes(d),
+            )
             .unwrap();
         }
     }
@@ -120,9 +122,11 @@ fn dup_cursor_creation_backwards_walks_in_reverse_order() {
     let txn = env.begin_transaction(None).unwrap();
     for (k, dups) in &data {
         for d in dups {
-            db.put_in(&txn,
-                &DatabaseEntry::from_bytes(k),
-                &DatabaseEntry::from_bytes(d))
+            db.put_in(
+                &txn,
+                DatabaseEntry::from_bytes(k),
+                DatabaseEntry::from_bytes(d),
+            )
             .unwrap();
         }
     }
@@ -168,8 +172,8 @@ fn dup_cursor_delete_one_dup_leaves_the_other() {
 
     let txn = env.begin_transaction(None).unwrap();
     let key = DatabaseEntry::from_bytes(b"k1");
-    db.put_in(&txn, &key, &DatabaseEntry::from_bytes(b"d1")).unwrap();
-    db.put_in(&txn, &key, &DatabaseEntry::from_bytes(b"d2")).unwrap();
+    db.put_in(&txn, &key, DatabaseEntry::from_bytes(b"d1")).unwrap();
+    db.put_in(&txn, &key, DatabaseEntry::from_bytes(b"d2")).unwrap();
 
     // Position on the first dup and delete it.
     let mut c = db.open_cursor_in(&txn, None).unwrap();
@@ -209,7 +213,7 @@ fn dup_cursor_delete_all_dups_leaves_empty() {
     let txn = env.begin_transaction(None).unwrap();
     let key = DatabaseEntry::from_bytes(b"k");
     for i in 0u8..20 {
-        db.put_in(&txn, &key, &DatabaseEntry::from_bytes(&[i])).unwrap();
+        db.put_in(&txn, &key, DatabaseEntry::from_bytes(&[i])).unwrap();
     }
     txn.commit().unwrap();
     assert_eq!(db.count().unwrap(), 20);
@@ -239,7 +243,7 @@ fn dup_cursor_delete_first_dup_via_positioned_cursor() {
     let txn = env.begin_transaction(None).unwrap();
     let key = DatabaseEntry::from_bytes(b"k");
     for i in 0u8..5 {
-        db.put_in(&txn, &key, &DatabaseEntry::from_bytes(&[i])).unwrap();
+        db.put_in(&txn, &key, DatabaseEntry::from_bytes(&[i])).unwrap();
     }
 
     // Position via SearchKey + delete (deletes only the first dup).
@@ -290,9 +294,7 @@ fn dup_cursor_put_no_dup_data_inserts_unique_pairs() {
         b"eight",
         b"nine",
     ] {
-        let s =
-            db.put_in(&txn, &key, &DatabaseEntry::from_bytes(d)).unwrap();
-        ;
+        db.put_in(&txn, &key, DatabaseEntry::from_bytes(d)).unwrap();
     }
     txn.commit().unwrap();
     assert_eq!(db.count().unwrap(), 9);
@@ -313,13 +315,11 @@ fn dup_cursor_abort_after_dup_creation_keeps_committed_only() {
 
     let txn1 = env.begin_transaction(None).unwrap();
     let key = DatabaseEntry::from_bytes(b"oneKey");
-    db.put_in(&txn1, &key, &DatabaseEntry::from_bytes(b"firstData"))
-        .unwrap();
+    db.put_in(&txn1, &key, DatabaseEntry::from_bytes(b"firstData")).unwrap();
     txn1.commit().unwrap();
 
     let txn2 = env.begin_transaction(None).unwrap();
-    db.put_in(&txn2, &key, &DatabaseEntry::from_bytes(b"secondData"))
-        .unwrap();
+    db.put_in(&txn2, &key, DatabaseEntry::from_bytes(b"secondData")).unwrap();
     txn2.abort().unwrap();
 
     let txn3 = env.begin_transaction(None).unwrap();
@@ -359,9 +359,11 @@ fn cursor_delete_first_via_walk_keeps_rest() {
 
     let txn = env.begin_transaction(None).unwrap();
     for i in 0..N {
-        db.put_in(&txn,
-            &DatabaseEntry::from_bytes(&i.to_be_bytes()),
-            &DatabaseEntry::from_bytes(b"v"))
+        db.put_in(
+            &txn,
+            DatabaseEntry::from_bytes(&i.to_be_bytes()),
+            DatabaseEntry::from_bytes(b"v"),
+        )
         .unwrap();
     }
     txn.commit().unwrap();
@@ -414,9 +416,11 @@ fn cursor_delete_last_via_walk_keeps_rest() {
 
     let txn = env.begin_transaction(None).unwrap();
     for i in 0..N {
-        db.put_in(&txn,
-            &DatabaseEntry::from_bytes(&i.to_be_bytes()),
-            &DatabaseEntry::from_bytes(b"v"))
+        db.put_in(
+            &txn,
+            DatabaseEntry::from_bytes(&i.to_be_bytes()),
+            DatabaseEntry::from_bytes(b"v"),
+        )
         .unwrap();
     }
     txn.commit().unwrap();
