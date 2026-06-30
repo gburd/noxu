@@ -1153,6 +1153,7 @@ impl EnvironmentImpl {
             let ckpt_clone = Arc::clone(ckpt);
             let interval =
                 std::time::Duration::from_millis(checkpoint_interval_ms);
+            let disk_limit_for_ckpt = Arc::clone(&disk_limit);
             std::thread::Builder::new()
                 .name("noxu-checkpointer".to_string())
                 .spawn(move || {
@@ -1163,6 +1164,13 @@ impl EnvironmentImpl {
                         if ckpt_clone.is_shutdown() {
                             break;
                         }
+                        // Periodic disk-limit refresh (JE: the manageDiskUsage
+                        // daemon updates the cached usage stats frequently
+                        // enough to prevent violating the limits by a large
+                        // amount). This is the wakeup that arms the limit as
+                        // the log grows, and clears it once space is freed.
+                        // Cheap no-op when enforcement is disabled.
+                        disk_limit_for_ckpt.refresh();
                         // REC-D / REC-F: gate the daemon checkpoint on
                         // is_runnable so an idle environment is not
                         // checkpointed every wakeup (wasted I/O), while a

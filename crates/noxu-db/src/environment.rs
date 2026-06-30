@@ -1532,6 +1532,20 @@ impl Environment {
         Ok(result.files_cleaned)
     }
 
+    /// Recomputes the cached disk-limit violation state immediately (JE:
+    /// `Cleaner.freshenLogSizeStats`).
+    ///
+    /// The background checkpointer daemon refreshes this on its interval and
+    /// the cleaner refreshes after each pass, so most callers never need this.
+    /// It is useful in tests and for tools that want the disk-limit decision
+    /// to reflect the current log size / free space right now rather than at
+    /// the next daemon wakeup.  Cheap no-op when `MAX_DISK`/`FREE_DISK` are 0.
+    pub fn refresh_disk_limit(&self) -> Result<()> {
+        self.check_open()?;
+        self.env_impl.lock().refresh_disk_limit();
+        Ok(())
+    }
+
     /// Explicitly trigger the memory evictor.
     ///
     /// Mirrors `Environment.evictMemory()` in JE (`Environment.java:1860`).
