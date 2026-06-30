@@ -141,6 +141,22 @@ listed in [References](#references).
   transitively to the master's commit quorum (documented). Faithful to JE
   `Feeder`/`FeederManager`/`FeederSource`/`MasterFeederSource`/`FeederReader`.
 
+- **DPL secondary indexes are now transactional and persistent (correctness
+  fix).** `noxu-persist` secondary indexes were a process-local in-memory map
+  updated eagerly on the primary `put`/`delete`, OUTSIDE transaction control —
+  so an aborted txn left the secondary pointing at rolled-back state (a real
+  correctness hole). They are now real `noxu_db::SecondaryDatabase`s maintained
+  within the same transaction as the primary write (the fan-out fires under the
+  user txn), so they commit/abort atomically with the primary and persist
+  across restart (no longer rebuilt from an in-memory side map). The side map,
+  the maintainer list, the one-shot `log::warn!`, and
+  `PersistError::SecondariesNotTransactional` are removed (net −208 lines).
+  BREAKING DPL API: `EntityStore::open_secondary_index(&mut primary, name,
+  serializer, extractor)` (env-aware, needs a DB name) and the
+  `#[derive(SecondaryKey)]` `open_<name>_index(&mut store, &mut primary, ...)`
+  signature; a secondary key type must impl `PrimaryKey` (byte encoding).
+  Faithful to JE `Store.openSecondaryDatabase` / `PersistKeyCreator`.
+
 ## [6.4.2] - 2026-06-29
 
 ### Fixed
