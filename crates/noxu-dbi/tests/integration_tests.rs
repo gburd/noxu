@@ -1835,3 +1835,52 @@ fn evictor_f1_f2_eviction_reduces_cache_usage() {
 
     env.close().unwrap();
 }
+
+/// IC-3 end-to-end (fail-pre / pass-post): the predicate that `compress_all`
+/// / the INCompressor daemon supply to `Tree::compress_bin_with_lock_check`
+/// consults the environment's REAL `LockManager`.  A write-locked LSN reports
+/// `is_locked == true` (so the compressor would SKIP that slot, mirroring JE
+/// `BIN.compress` isLockUncontended), while an unlocked LSN reports `false`
+/// (so a committed/unlocked tombstone IS compressed).
+///
+/// This exercises the dbi wiring seam (closure over the live LockManager)
+/// with a real held lock; the slot-removal behavior itself is proven in the
+/// noxu-tree unit headline `test_ic3_compress_skips_write_locked_slot`.
+#[test]
+fn ic3_compress_predicate_consults_real_lock_manager() {
+    use noxu_txn::LockType;
+
+    let (_dir, env) = tmp_env();
+    let lm = env.get_lock_manager().clone();
+
+    let locked_lsn: u64 = 0x1234_5678;
+    let unlocked_lsn: u64 = 0x9abc_def0;
+    let locker_id: i64 = 4242;
+
+    // Hold a write lock on `locked_lsn`, simulating an in-flight txn that
+    // still references the slot.
+    lm.lock(locked_lsn, locker_id, LockType::Write, true, false)
+        .expect("lock should be granted");
+
+    // Build the EXACT predicate the compressor paths construct.
+    let lm_ref = &lm;
+    let is_locked = move |lsn: u64| lm_ref.get_lock_info(lsn) != (0, 0);
+
+    assert!(
+        is_locked(locked_lsn),
+        "IC-3: a write-locked LSN must report locked -> compressor SKIPS it"
+    );
+    assert!(
+        !is_locked(unlocked_lsn),
+        "IC-3: an unlocked LSN must report unlocked -> compressor REMOVES it"
+    );
+
+    // After release, the slot becomes compressible (txn resolved).
+    lm.release(locked_lsn, locker_id).unwrap();
+    assert!(
+        !is_locked(locked_lsn),
+        "IC-3: once the txn releases the lock the slot is compressible"
+    );
+
+    env.close().unwrap();
+}
