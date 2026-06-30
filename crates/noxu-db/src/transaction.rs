@@ -150,20 +150,17 @@ pub struct Transaction {
 impl Transaction {
     /// Create a new unconnected transaction handle.
     ///
-    /// **Deprecated** — this constructor creates a transaction that is not
-    /// wired to a WAL, lock manager, or environment.  Commits and aborts
-    /// on such a transaction are no-ops.  Use
-    /// [`Environment::begin_transaction`][crate::environment::Environment::begin_transaction]
-    /// to obtain a fully operational handle.
+    /// **Internal** — `pub(crate)` for the no-WAL / in-memory environment
+    /// path inside `Environment::begin_transaction`.  Such a handle is not
+    /// wired to a WAL when constructed alone, so it is deliberately not part
+    /// of the public surface; downstream callers obtain a fully operational
+    /// handle via
+    /// [`Environment::begin_transaction`][crate::environment::Environment::begin_transaction].
     ///
     /// # Arguments
     /// * `id` - Unique transaction ID
     /// * `config` - Transaction configuration
-    #[deprecated(
-        since = "2.4.1",
-        note = "use Environment::begin_transaction() to obtain a fully wired transaction handle"
-    )]
-    pub fn new(id: u64, config: TransactionConfig) -> Self {
+    pub(crate) fn new(id: u64, config: TransactionConfig) -> Self {
         observe_gauge_inc!("noxu_db_active_transactions");
         Self {
             id,
@@ -191,11 +188,10 @@ impl Transaction {
     /// Called by `Environment::begin_transaction()` to wire the transaction to
     /// the environment's log manager so that commit/abort write WAL entries.
     ///
-    /// **Internal** — this method is `pub` for cross-crate wiring within the
-    /// Noxu DB engine but is not part of the v3.0 stable surface.
-    /// `LogManager` is not re-exported by `noxu-db`; downstream callers
-    /// cannot use this method without adding an internal crate dependency.
-    pub fn with_log_manager(
+    /// **Internal** — `pub(crate)` for cross-module wiring within the
+    /// Noxu DB engine; not part of the public surface.
+    /// `LogManager` is not re-exported by `noxu-db`.
+    pub(crate) fn with_log_manager(
         id: u64,
         config: TransactionConfig,
         log_manager: Arc<LogManager>,
@@ -228,7 +224,7 @@ impl Transaction {
     /// `Transaction`.
     ///
     /// **Internal** — `EnvironmentImpl` is not re-exported by `noxu-db`.
-    pub fn with_env_impl(
+    pub(crate) fn with_env_impl(
         mut self,
         env_impl: Arc<SyncMutex<EnvironmentImpl>>,
     ) -> Self {
@@ -242,7 +238,7 @@ impl Transaction {
     /// the environment's `TxnManager` / `LockManager`.
     ///
     /// **Internal** — `noxu_txn::Txn` is not re-exported by `noxu-db`.
-    pub fn with_inner_txn(mut self, txn: Arc<Mutex<Txn>>) -> Self {
+    pub(crate) fn with_inner_txn(mut self, txn: Arc<Mutex<Txn>>) -> Self {
         self.inner_txn = Some(txn);
         self
     }
@@ -321,10 +317,15 @@ impl Transaction {
 
     /// Returns a clone of the `Arc<Mutex<Txn>>` inner transaction, if any.
     ///
-    /// Used by `Database::make_cursor_for_txn()` to wire the cursor to the
-    /// same `Txn` so that write operations lock via the transaction.
+    /// Used by `Database::make_cursor_for_txn()` and the XA layer to wire a
+    /// cursor/branch to the same `Txn` so that write operations lock via the
+    /// transaction.
     ///
-    /// **Internal** — `noxu_txn::Txn` is not re-exported by `noxu-db`.
+    /// **Internal** — `#[doc(hidden)]` cross-crate wiring point.
+    /// `noxu_txn::Txn` is not re-exported by `noxu-db`, so the return type is
+    /// effectively un-nameable by downstream users; this is not part of the
+    /// stable surface.
+    #[doc(hidden)]
     pub fn get_inner_txn(&self) -> Option<Arc<Mutex<Txn>>> {
         self.inner_txn.clone()
     }
@@ -1327,7 +1328,6 @@ impl Drop for Transaction {
 }
 
 #[cfg(test)]
-#[allow(deprecated)] // tests use Transaction::new directly to test state-machine logic in isolation
 mod tests {
     use super::*;
 

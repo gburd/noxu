@@ -241,7 +241,6 @@ impl Database {
     ///
     /// In which passes the
     /// transaction's `Locker` to the new `CursorImpl`.
-    #[allow(deprecated)] // uses Transaction::get_inner_txn — internal wiring
     fn make_cursor_for_txn(&self, txn: &Transaction) -> CursorImpl {
         // Use the transaction id as the cursor's locker_id so that LN
         // log entries written under this cursor carry the txn id

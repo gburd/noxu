@@ -761,7 +761,6 @@ impl Environment {
     /// In v2.0 the parameter has been removed entirely — the
     /// type system now enforces the constraint, so what was a runtime
     /// error is now a compile error.
-    #[allow(deprecated)] // Transaction::new / with_log_manager / with_inner_txn / with_env_impl are pub(internal)
     pub fn begin_transaction(
         &self,
         config: Option<&TransactionConfig>,

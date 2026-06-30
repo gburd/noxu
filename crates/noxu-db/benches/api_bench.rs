@@ -5,7 +5,7 @@ use tempfile::TempDir;
 
 use noxu_db::{
     DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig, Get,
-    OperationStatus, Transaction, TransactionConfig,
+    OperationStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -151,30 +151,6 @@ fn bench_cursor_forward_scan_1000(c: &mut Criterion) {
 // Transaction begin / commit / abort
 // ---------------------------------------------------------------------------
 
-fn bench_txn_commit(c: &mut Criterion) {
-    c.bench_function("txn_commit", |b| {
-        b.iter(|| {
-            #[allow(deprecated)]
-            let txn =
-                Transaction::new(black_box(1), TransactionConfig::default());
-            txn.commit().unwrap();
-            black_box(());
-        })
-    });
-}
-
-fn bench_txn_abort(c: &mut Criterion) {
-    c.bench_function("txn_abort", |b| {
-        b.iter(|| {
-            #[allow(deprecated)]
-            let txn =
-                Transaction::new(black_box(1), TransactionConfig::default());
-            txn.abort().unwrap();
-            black_box(());
-        })
-    });
-}
-
 fn bench_txn_begin_via_env(c: &mut Criterion) {
     let (_dir, env) = open_env();
 
@@ -224,12 +200,7 @@ criterion_group!(
 
 criterion_group!(cursor_benches, bench_cursor_forward_scan_1000);
 
-criterion_group!(
-    txn_benches,
-    bench_txn_commit,
-    bench_txn_abort,
-    bench_txn_begin_via_env,
-);
+criterion_group!(txn_benches, bench_txn_begin_via_env,);
 
 criterion_group!(
     entry_benches,

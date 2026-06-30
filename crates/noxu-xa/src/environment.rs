@@ -330,7 +330,6 @@ impl XaResource for XaEnvironment {
         Ok(())
     }
 
-    #[allow(deprecated)] // uses Transaction::get_inner_txn — internal wiring
     fn xa_prepare(&self, xid: &Xid, flags: XaFlags) -> XaResult<PrepareResult> {
         let _ = flags;
         let mut branches = self.branches.lock().unwrap();
