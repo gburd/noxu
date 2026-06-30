@@ -800,18 +800,19 @@ impl Database {
         // the code paths uniform and to use the caller's txn for the
         // read so isolation is honoured.
         let secondaries_pre = self.live_secondaries();
-        let old_data_for_secondaries: Option<Vec<u8>> =
-            if secondaries_pre.is_empty() {
-                None
-            } else {
-                let mut existing = DatabaseEntry::new();
-                match self.get(txn, key, &mut existing)? {
-                    OperationStatus::Success => {
-                        existing.get_data().map(<[u8]>::to_vec)
-                    }
-                    _ => None,
+        let need_old_data =
+            !secondaries_pre.is_empty() || self.has_user_triggers();
+        let old_data_for_secondaries: Option<Vec<u8>> = if !need_old_data {
+            None
+        } else {
+            let mut existing = DatabaseEntry::new();
+            match self.get(txn, key, &mut existing)? {
+                OperationStatus::Success => {
+                    existing.get_data().map(<[u8]>::to_vec)
                 }
-            };
+                _ => None,
+            }
+        };
 
         match txn {
             Some(t) => {
@@ -833,6 +834,18 @@ impl Database {
                 })?;
             }
         }
+
+        // DB-TRIG: fire Trigger.put within the transaction, after the change
+        // is applied.  oldData = None for an insert, Some(prev) for an update;
+        // newData is the bytes just written.  JE
+        // `TriggerManager.runPutTriggers(locker, dbImpl, key, oldData,
+        // newData)`.
+        self.fire_put_triggers(
+            txn,
+            key_bytes,
+            old_data_for_secondaries.as_deref(),
+            data_bytes,
+        );
 
         // v1.6 (audit C3 — the associate()-style hook): drive every
         // registered secondary index under the same caller-supplied
@@ -991,6 +1004,9 @@ impl Database {
             })?,
         };
         if status == OperationStatus::Success {
+            // DB-TRIG: a successful no-overwrite put is always an insert, so
+            // oldData is None.  JE `TriggerManager.runPutTriggers`.
+            self.fire_put_triggers(txn, key_bytes, None, data_bytes);
             self.throughput.n_pri_inserts.fetch_add(1, Ordering::Relaxed);
         } else {
             self.throughput.n_pri_insert_fails.fetch_add(1, Ordering::Relaxed);
@@ -1040,7 +1056,8 @@ impl Database {
         // pair to remove.  Collected outside the cursor closure so
         // the auto-commit and explicit-txn paths share one buffer.
         let secondaries = self.live_secondaries();
-        let track_old_data = !secondaries.is_empty();
+        let track_old_data =
+            !secondaries.is_empty() || self.has_user_triggers();
         let mut deleted_old_values: Vec<Vec<u8>> = Vec::new();
 
         // v1.6 (audit C2 / Decision 2C — step 8): consult any FK
@@ -1099,6 +1116,15 @@ impl Database {
                 for hook in &secondaries {
                     hook.maintain(txn, key, Some(&old_entry), None)?;
                 }
+            }
+        }
+
+        // DB-TRIG: fire Trigger.delete within the transaction for each
+        // removed (key, data) pair, after the change is applied.  JE
+        // `TriggerManager.runDeleteTriggers(locker, dbImpl, key, oldData)`.
+        if deleted_any && self.has_user_triggers() {
+            for old_bytes in &deleted_old_values {
+                self.fire_delete_triggers(txn, key_bytes, old_bytes);
             }
         }
 
@@ -1358,6 +1384,73 @@ impl Database {
     ) -> Vec<Arc<dyn crate::secondary_database::SecondaryHook + Send + Sync>>
     {
         self.secondaries.read().iter().filter_map(|w| w.upgrade()).collect()
+    }
+
+    /// Whether any user triggers are registered on this database (DB-TRIG).
+    /// JE `DatabaseImpl.hasUserTriggers()` — the single fast-path check that
+    /// keeps the no-trigger write path free of any trigger work.
+    fn has_user_triggers(&self) -> bool {
+        self.db_impl.read().has_user_triggers()
+    }
+
+    /// Fire `Trigger.put` for every registered trigger, in registration order,
+    /// and record this database on the transaction so its commit/abort
+    /// triggers fire on resolution (DB-TRIG).
+    ///
+    /// Called after the record modification is applied, within the
+    /// transaction — JE `Cursor.putNotify` -> `TriggerManager.runPutTriggers`,
+    /// which also calls `Txn.noteTriggerDb`.
+    fn fire_put_triggers(
+        &self,
+        txn: Option<&Transaction>,
+        key: &[u8],
+        old_data: Option<&[u8]>,
+        new_data: &[u8],
+    ) {
+        let (db_id, triggers) = {
+            let db = self.db_impl.read();
+            (db.get_id().id() as u64, db.triggers().to_vec())
+        };
+        if triggers.is_empty() {
+            return;
+        }
+        let txn_id = txn.map(Transaction::get_id);
+        for trigger in &triggers {
+            trigger.put(txn_id, key, old_data, new_data);
+        }
+        // JE Txn.noteTriggerDb: remember the modified DB so commit/abort
+        // triggers fire later.  Only meaningful under an explicit txn (the
+        // auto-commit path commits immediately and has no handle to note).
+        if let Some(t) = txn {
+            t.note_trigger_db(db_id, &triggers);
+        }
+    }
+
+    /// Fire `Trigger.delete` for every registered trigger, in registration
+    /// order, and record this database on the transaction (DB-TRIG).
+    ///
+    /// JE `Cursor.deleteInternal` -> `TriggerManager.runDeleteTriggers` +
+    /// `Txn.noteTriggerDb`.
+    fn fire_delete_triggers(
+        &self,
+        txn: Option<&Transaction>,
+        key: &[u8],
+        old_data: &[u8],
+    ) {
+        let (db_id, triggers) = {
+            let db = self.db_impl.read();
+            (db.get_id().id() as u64, db.triggers().to_vec())
+        };
+        if triggers.is_empty() {
+            return;
+        }
+        let txn_id = txn.map(Transaction::get_id);
+        for trigger in &triggers {
+            trigger.delete(txn_id, key, old_data);
+        }
+        if let Some(t) = txn {
+            t.note_trigger_db(db_id, &triggers);
+        }
     }
 
     /// Registers an FK referrer that points at this primary as its
