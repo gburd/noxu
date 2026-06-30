@@ -119,7 +119,7 @@ fn test_sustained_8r8w_60s() {
                         let val = format!("seq{seq:010}");
                         let k = DatabaseEntry::from_bytes(key.as_bytes());
                         let v = DatabaseEntry::from_bytes(val.as_bytes());
-                        db.put(Some(&txn), &k, &v).unwrap();
+                        db.put_in(&txn, &k, &v).unwrap();
                     }
                     txn.commit().unwrap();
                     commit_count.fetch_add(1, Ordering::Relaxed);
@@ -142,7 +142,7 @@ fn test_sustained_8r8w_60s() {
                 let rc = TransactionConfig::read_committed();
                 while !done.load(Ordering::Relaxed) {
                     let txn = env.begin_transaction(Some(&rc)).unwrap();
-                    let mut cursor = db.open_cursor(Some(&txn), None).unwrap();
+                    let mut cursor = db.open_cursor_in(&txn, None).unwrap();
                     let mut k = DatabaseEntry::new();
                     let mut v = DatabaseEntry::new();
                     let mut n: u64 = 0;
@@ -222,7 +222,7 @@ fn test_checkpoint_under_load_30s() {
                     let val = vec![b'v'; 64];
                     let k = DatabaseEntry::from_bytes(key.as_bytes());
                     let v = DatabaseEntry::from_bytes(&val);
-                    db.put(None, &k, &v).unwrap();
+                    db.put( &k, &v).unwrap();
                     seq += 1;
                 }
             })
@@ -309,7 +309,7 @@ fn test_cleaner_reduces_log_files_under_load() {
         let k = DatabaseEntry::from_bytes(key.as_bytes());
         let v = DatabaseEntry::from_bytes(&val);
         let t = Instant::now();
-        db.put(None, &k, &v).unwrap();
+        db.put( &k, &v).unwrap();
         assert!(
             t.elapsed() < stall_limit,
             "put stalled on initial write k={i}"
@@ -325,7 +325,7 @@ fn test_cleaner_reduces_log_files_under_load() {
             let k = DatabaseEntry::from_bytes(key.as_bytes());
             let v = DatabaseEntry::from_bytes(&val);
             let t = Instant::now();
-            db.put(None, &k, &v).unwrap();
+            db.put( &k, &v).unwrap();
             assert!(
                 t.elapsed() < stall_limit,
                 "put stalled on overwrite pass={pass} k={i}"

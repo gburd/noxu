@@ -132,8 +132,8 @@ fn power_loss_sweep_thousand_iterations() {
             for i in 0u32..50 {
                 let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
                 let mut val = DatabaseEntry::new();
-                match db.get(None, &key, &mut val).unwrap() {
-                    OperationStatus::Success => {
+                match db.get_into(None, &key, &mut val).unwrap() {
+                    true => {
                         if val.data() == b"committed" {
                             present[i as usize] = true;
                         } else {
@@ -143,7 +143,7 @@ fn power_loss_sweep_thousand_iterations() {
                             ));
                         }
                     }
-                    OperationStatus::NotFound => {}
+                    false => {}
                     other => {
                         return Err(format!(
                             "unexpected status {other:?} for key {i}"
@@ -177,7 +177,7 @@ fn power_loss_sweep_thousand_iterations() {
                 let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
                 let mut val = DatabaseEntry::new();
                 if matches!(
-                    db.get(None, &key, &mut val).unwrap(),
+                    db.get_into(None, &key, &mut val).unwrap(),
                     OperationStatus::Success
                 ) {
                     return Err(format!("uncommitted key {i} leaked"));
@@ -271,7 +271,7 @@ fn power_loss_sweep_smoke() {
                 let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
                 let mut val = DatabaseEntry::new();
                 if matches!(
-                    db.get(None, &key, &mut val).unwrap(),
+                    db.get_into(None, &key, &mut val).unwrap(),
                     OperationStatus::Success
                 ) {
                     return Err(format!("uncommitted key {i} leaked"));

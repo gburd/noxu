@@ -60,9 +60,8 @@ fn disk_limit_blocks_then_resumes() {
     for i in 0..2000usize {
         let key = DatabaseEntry::from_bytes(&(i as u64).to_be_bytes());
         env.refresh_disk_limit().unwrap();
-        match db.put(None, &key, &val(i)) {
-            Ok(OperationStatus::Success) => {}
-            Ok(other) => panic!("unexpected status at {i}: {other:?}"),
+        match db.put(&key, &val(i)) {
+            Ok(()) => {}
             Err(NoxuError::DiskLimitExceeded { used, limit }) => {
                 assert!(
                     used >= limit,
@@ -84,7 +83,7 @@ fn disk_limit_blocks_then_resumes() {
     let key = DatabaseEntry::from_bytes(&(blocked_at as u64).to_be_bytes());
     assert!(
         matches!(
-            db.put(None, &key, &val(blocked_at)),
+            db.put( &key, &val(blocked_at)),
             Err(NoxuError::DiskLimitExceeded { .. })
         ),
         "writes must stay blocked while over the limit"
@@ -93,8 +92,8 @@ fn disk_limit_blocks_then_resumes() {
     // Reads must still work while over-limit (JE: read-only ops are not gated).
     let read_key = DatabaseEntry::from_bytes(&0u64.to_be_bytes());
     let mut out = DatabaseEntry::new();
-    let s = db.get(None, &read_key, &mut out).unwrap();
-    assert_eq!(s, OperationStatus::Success, "reads must work over-limit");
+    let s = db.get_into(None, &read_key, &mut out).unwrap();
+    assert!(s, "reads must work over-limit");
     assert_eq!(out.get_data().unwrap().len(), 1024);
 
     // A transaction abort must still work over-limit (JE: abort is not gated;
@@ -102,7 +101,7 @@ fn disk_limit_blocks_then_resumes() {
     let txn = env.begin_transaction(None).unwrap();
     // The put inside the txn is itself a user write and is refused...
     assert!(matches!(
-        db.put(Some(&txn), &read_key, &val(1)),
+        db.put_in(&txn, &read_key, &val(1)),
         Err(NoxuError::DiskLimitExceeded { .. })
     ));
     // ...but aborting the txn still succeeds.
@@ -117,7 +116,7 @@ fn disk_limit_blocks_then_resumes() {
         // Deletes are also gated while over-limit, so we may need to clean
         // first. Try the delete; ignore a disk-limit refusal and rely on the
         // checkpoint+clean below to reclaim whole obsolete files.
-        let _ = db.delete(None, &key);
+        let _ = db.delete( &key);
     }
     // Checkpoint flushes the tree so cleaned files become fully obsolete, then
     // clean_log reclaims them (the cleaner refreshes the disk-limit state after
@@ -136,8 +135,8 @@ fn disk_limit_blocks_then_resumes() {
         let key =
             DatabaseEntry::from_bytes(&(10_000 + round as u64).to_be_bytes());
         env.refresh_disk_limit().unwrap();
-        match db.put(None, &key, &val(round)) {
-            Ok(OperationStatus::Success) => {
+        match db.put(&key, &val(round)) {
+            Ok(()) => {
                 resumed = true;
                 break;
             }
@@ -146,7 +145,7 @@ fn disk_limit_blocks_then_resumes() {
                 for i in 0..blocked_at {
                     let k =
                         DatabaseEntry::from_bytes(&(i as u64).to_be_bytes());
-                    let _ = db.delete(None, &k);
+                    let _ = db.delete( &k);
                 }
                 let _ = env.checkpoint(None);
                 let _ = env.clean_log();
@@ -173,11 +172,7 @@ fn disabled_by_default_never_blocks() {
     for i in 0..500usize {
         let key = DatabaseEntry::from_bytes(&(i as u64).to_be_bytes());
         env.refresh_disk_limit().unwrap();
-        let s = db.put(None, &key, &val(i)).unwrap();
-        assert_eq!(
-            s,
-            OperationStatus::Success,
-            "no enforcement when both limits are 0"
-        );
+        let s = db.put( &key, &val(i)).unwrap();
+        ;
     }
 }

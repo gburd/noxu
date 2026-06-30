@@ -45,7 +45,7 @@ fn put(
     data: u32,
 ) {
     let txn = env.begin_transaction(None).unwrap();
-    db.put(Some(&txn), &ikey(key), &ikey(data)).unwrap();
+    db.put_in(&txn, &ikey(key), &ikey(data)).unwrap();
     txn.commit().unwrap();
 }
 
@@ -66,7 +66,7 @@ fn search_key_range_with_dup_tree_finds_next_key() {
     put(&env, &db, 3, 1);
 
     let txn = env.begin_transaction(None).unwrap();
-    let mut c = db.open_cursor(Some(&txn), None).unwrap();
+    let mut c = db.open_cursor_in(&txn, None).unwrap();
     let mut k = ikey(2);
     let mut d = DatabaseEntry::new();
     let s = c.get(&mut k, &mut d, Get::SearchRange, None).unwrap();
@@ -93,7 +93,7 @@ fn search_both_with_no_dup_tree_finds_existing_pair_only() {
     put(&env, &db, 1, 1);
 
     let txn = env.begin_transaction(None).unwrap();
-    let mut c = db.open_cursor(Some(&txn), None).unwrap();
+    let mut c = db.open_cursor_in(&txn, None).unwrap();
     let mut k = ikey(1);
     let mut d = ikey(2);
     let s = c.get(&mut k, &mut d, Get::SearchBoth, None).unwrap();
@@ -129,7 +129,7 @@ fn search_both_range_dup_positions_on_first_dup_at_or_after() {
     put(&env, &db, 3, 2);
 
     let txn = env.begin_transaction(None).unwrap();
-    let mut c = db.open_cursor(Some(&txn), None).unwrap();
+    let mut c = db.open_cursor_in(&txn, None).unwrap();
     let mut k = ikey(3);
     let mut d = ikey(0);
     let s = c.get(&mut k, &mut d, Get::SearchBothRange, None).unwrap();
@@ -154,7 +154,7 @@ fn search_both_range_dup_missing_key_returns_not_found() {
     put(&env, &db, 1, 1);
 
     let txn = env.begin_transaction(None).unwrap();
-    let mut c = db.open_cursor(Some(&txn), None).unwrap();
+    let mut c = db.open_cursor_in(&txn, None).unwrap();
     let mut k = ikey(99);
     let mut d = ikey(0);
     let s = c.get(&mut k, &mut d, Get::SearchBothRange, None).unwrap();
@@ -177,7 +177,7 @@ fn search_both_range_dup_data_before_target_returns_not_found() {
     put(&env, &db, 1, 0);
 
     let txn = env.begin_transaction(None).unwrap();
-    let mut c = db.open_cursor(Some(&txn), None).unwrap();
+    let mut c = db.open_cursor_in(&txn, None).unwrap();
     let mut k = ikey(1);
     let mut d = ikey(2);
     let s = c.get(&mut k, &mut d, Get::SearchBothRange, None).unwrap();
@@ -202,7 +202,7 @@ fn search_both_range_does_not_cross_key_boundary() {
     put(&env, &db, 2, 2);
 
     let txn = env.begin_transaction(None).unwrap();
-    let mut c = db.open_cursor(Some(&txn), None).unwrap();
+    let mut c = db.open_cursor_in(&txn, None).unwrap();
     let mut k = ikey(1);
     let mut d = ikey(2);
     let s = c.get(&mut k, &mut d, Get::SearchBothRange, None).unwrap();

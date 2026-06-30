@@ -1,7 +1,7 @@
 //! Regression test for the reader-vs-splitter race on the noxu-tree
 //! read paths (`Tree::search`, `get_first_node`, `get_last_node`).
 //!
-//! Before the latch-coupling fix on the read paths, a `db.get(None, key, …)`
+//! Before the latch-coupling fix on the read paths, a `db.get_into(None, key, …)`
 //! that ran concurrently with an insert that triggered a `split_child`
 //! could return `NotFound` for a key that *was* in the tree: the reader
 //! captured the target BIN's `Arc` while holding the parent's read lock,
@@ -12,7 +12,7 @@
 //! lives in the new sibling; the parent snapshot hasn't been re-read,
 //! so the reader gives up at the BIN and reports `NotFound`.
 //!
-//! This test does many concurrent `db.get(None, key, …)` calls on a
+//! This test does many concurrent `db.get_into(None, key, …)` calls on a
 //! database that another thread is actively populating. Every key the
 //! writer reports as "committed" must be visible to a subsequent reader;
 //! a race-induced false `NotFound` fails the assertion.
@@ -78,7 +78,7 @@ fn concurrent_reads_during_inserts_no_false_not_found() {
                     DatabaseEntry::from_vec(format!("k{i:06}").into_bytes());
                 let val =
                     DatabaseEntry::from_vec(format!("v{i:06}").into_bytes());
-                db.put(Some(&txn), &key, &val).unwrap();
+                db.put_in(&txn, &key, &val).unwrap();
                 txn.commit().unwrap();
                 // Publish the commit. Release ordering pairs with
                 // Acquire on the reader side so the reader sees the
@@ -89,7 +89,7 @@ fn concurrent_reads_during_inserts_no_false_not_found() {
         })
     };
 
-    // Readers: race the writer with `db.get(None, key, …)`. Pick a
+    // Readers: race the writer with `db.get_into(None, key, …)`. Pick a
     // random committed index `j < next_committed` each iteration; if
     // the get returns NotFound, that's a false negative caused by a
     // concurrent split crossing our descent.
@@ -129,8 +129,8 @@ fn concurrent_reads_during_inserts_no_false_not_found() {
                         format!("k{j:06}").into_bytes(),
                     );
                     let mut out = DatabaseEntry::new();
-                    let status = db.get(None, &key, &mut out).unwrap();
-                    if status != OperationStatus::Success {
+                    let status = db.get_into(None, &key, &mut out).unwrap();
+                    if !status {
                         misses.push(j);
                     }
                 }

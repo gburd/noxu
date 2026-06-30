@@ -90,7 +90,7 @@ fn run(threads: usize, keys: usize) -> (u64, u64, u128) {
                         format!("t{tid:02}_k{k:05}").into_bytes(),
                     );
                     let val = DatabaseEntry::from_vec(vec![b'v'; 64]);
-                    db.put(Some(&txn), &key, &val).unwrap();
+                    db.put_in(&txn, &key, &val).unwrap();
                     // Default durability is COMMIT_SYNC => real fdatasync.
                     txn.commit().unwrap();
                 }

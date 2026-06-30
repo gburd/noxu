@@ -66,7 +66,7 @@ fn f1_env_close_after_many_commits_succeeds() {
         let txn = env.begin_transaction(None).unwrap();
         let key = DatabaseEntry::from_data(format!("k{}", i).as_bytes());
         let val = DatabaseEntry::from_data(b"v");
-        db.put(Some(&txn), &key, &val).unwrap();
+        db.put_in(&txn, &key, &val).unwrap();
         txn.commit().unwrap();
     }
 
@@ -102,12 +102,12 @@ fn f2_read_uncommitted_sees_uncommitted_writes() {
     // Seed the key so there is a "before" value to read.
     let key = DatabaseEntry::from_data(b"k");
     let val_before = DatabaseEntry::from_data(b"before");
-    db.put(None, &key, &val_before).unwrap();
+    db.put( &key, &val_before).unwrap();
 
     // Writer txn: writes a new value but does NOT commit yet.
     let writer_txn = env.begin_transaction(None).unwrap();
     let val_after = DatabaseEntry::from_data(b"after");
-    db.put(Some(&writer_txn), &key, &val_after).unwrap();
+    db.put_in(&writer_txn, &key, &val_after).unwrap();
 
     // Reader txn: read-uncommitted, should see the dirty write.
     let read_cfg = TransactionConfig::new().with_read_uncommitted(true);
@@ -116,9 +116,9 @@ fn f2_read_uncommitted_sees_uncommitted_writes() {
     let mut data = DatabaseEntry::new();
     let key_lookup = DatabaseEntry::from_data(b"k");
     let status = db
-        .get(Some(&reader_txn), &key_lookup, &mut data)
+        .get_into(Some(&reader_txn), &key_lookup, &mut data)
         .expect("dirty read must not block / error");
-    assert_eq!(status, OperationStatus::Success);
+    assert!(status);
     assert_eq!(
         data.get_data(),
         Some(b"after".as_slice()),
@@ -149,7 +149,7 @@ fn f3_env_default_durability_no_sync_skips_fsync() {
     {
         let key = DatabaseEntry::from_data(b"warm");
         let val = DatabaseEntry::from_data(b"up");
-        db.put(None, &key, &val).unwrap();
+        db.put( &key, &val).unwrap();
     }
 
     let fsyncs_before = env.stat_fsync_count();
@@ -157,7 +157,7 @@ fn f3_env_default_durability_no_sync_skips_fsync() {
     let txn = env.begin_transaction(None).unwrap();
     let key = DatabaseEntry::from_data(b"k");
     let val = DatabaseEntry::from_data(b"v");
-    db.put(Some(&txn), &key, &val).unwrap();
+    db.put_in(&txn, &key, &val).unwrap();
     txn.commit().expect("commit must succeed");
 
     let fsyncs_after = env.stat_fsync_count();
@@ -182,14 +182,14 @@ fn f3_env_default_durability_sync_does_fsync() {
     // Warm up the log.
     let warm_key = DatabaseEntry::from_data(b"warm");
     let warm_val = DatabaseEntry::from_data(b"up");
-    db.put(None, &warm_key, &warm_val).unwrap();
+    db.put( &warm_key, &warm_val).unwrap();
 
     let fsyncs_before = env.stat_fsync_count();
 
     let txn = env.begin_transaction(None).unwrap();
     let key = DatabaseEntry::from_data(b"k");
     let val = DatabaseEntry::from_data(b"v");
-    db.put(Some(&txn), &key, &val).unwrap();
+    db.put_in(&txn, &key, &val).unwrap();
     txn.commit().unwrap();
 
     let fsyncs_after = env.stat_fsync_count();
@@ -215,7 +215,7 @@ fn f3_explicit_txn_durability_overrides_env_default() {
     // Warm up.
     let warm_key = DatabaseEntry::from_data(b"warm");
     let warm_val = DatabaseEntry::from_data(b"up");
-    db.put(None, &warm_key, &warm_val).unwrap();
+    db.put( &warm_key, &warm_val).unwrap();
 
     let fsyncs_before = env.stat_fsync_count();
 
@@ -223,7 +223,7 @@ fn f3_explicit_txn_durability_overrides_env_default() {
     let txn = env.begin_transaction(Some(&cfg)).unwrap();
     let key = DatabaseEntry::from_data(b"k");
     let val = DatabaseEntry::from_data(b"v");
-    db.put(Some(&txn), &key, &val).unwrap();
+    db.put_in(&txn, &key, &val).unwrap();
     txn.commit().unwrap();
 
     let fsyncs_after = env.stat_fsync_count();
@@ -245,7 +245,7 @@ use std::time::Duration;
 #[test]
 fn f12_auto_commit_write_blocks_on_explicit_txn_write_lock() {
     // Begin txn A, A.put(K, V) (write lock held).
-    // From a second thread, db.put(None, K, V2) (auto-commit write).
+    // From a second thread, db.put( K, V2) (auto-commit write).
     // The auto-commit write must block until A commits/aborts.
     let tmp = TempDir::new().unwrap();
     let env = Arc::new(open_env(&tmp, Durability::COMMIT_NO_SYNC));
@@ -259,12 +259,12 @@ fn f12_auto_commit_write_blocks_on_explicit_txn_write_lock() {
     // follow-up work.)
     let key = DatabaseEntry::from_data(b"k");
     let val0 = DatabaseEntry::from_data(b"v0");
-    db.put(None, &key, &val0).unwrap();
+    db.put( &key, &val0).unwrap();
 
     // Writer txn: take the write lock by issuing a put.
     let writer_txn = env.begin_transaction(None).unwrap();
     let val1 = DatabaseEntry::from_data(b"v1");
-    db.put(Some(&writer_txn), &key, &val1).unwrap();
+    db.put_in(&writer_txn, &key, &val1).unwrap();
 
     // Auto-commit thread tries to write the same key.
     let started = Arc::new(AtomicBool::new(false));
@@ -276,7 +276,7 @@ fn f12_auto_commit_write_blocks_on_explicit_txn_write_lock() {
         started_t.store(true, Ordering::SeqCst);
         let key = DatabaseEntry::from_data(b"k");
         let val2 = DatabaseEntry::from_data(b"v2");
-        db_t.put(None, &key, &val2).unwrap();
+        db_t.put( &key, &val2).unwrap();
         finished_t.store(true, Ordering::SeqCst);
     });
 
@@ -303,8 +303,8 @@ fn f12_auto_commit_write_blocks_on_explicit_txn_write_lock() {
     // Final value is whatever the auto-commit thread wrote.
     let mut data = DatabaseEntry::new();
     let key_lookup = DatabaseEntry::from_data(b"k");
-    let status = db.get(None, &key_lookup, &mut data).unwrap();
-    assert_eq!(status, OperationStatus::Success);
+    let status = db.get_into(None, &key_lookup, &mut data).unwrap();
+    assert!(status);
     assert_eq!(data.get_data(), Some(b"v2".as_slice()));
 
     drop(db);
@@ -321,16 +321,16 @@ fn f12_auto_commit_does_not_block_on_unrelated_key() {
 
     let k1 = DatabaseEntry::from_data(b"k1");
     let v0 = DatabaseEntry::from_data(b"v0");
-    db.put(None, &k1, &v0).unwrap();
+    db.put( &k1, &v0).unwrap();
 
     let writer_txn = env.begin_transaction(None).unwrap();
     let v1 = DatabaseEntry::from_data(b"v1");
-    db.put(Some(&writer_txn), &k1, &v1).unwrap();
+    db.put_in(&writer_txn, &k1, &v1).unwrap();
 
     // Different key — must not block.
     let k2 = DatabaseEntry::from_data(b"k2");
     let v2 = DatabaseEntry::from_data(b"v2");
-    db.put(None, &k2, &v2)
+    db.put( &k2, &v2)
         .expect("auto-commit on unrelated key must not block");
 
     writer_txn.commit().unwrap();
@@ -361,7 +361,7 @@ fn f12_explicit_txn_read_blocks_auto_commit_write() {
     // Seed K so a read can land on a real (non-NULL) LSN.
     let key = DatabaseEntry::from_data(b"k");
     let val0 = DatabaseEntry::from_data(b"v0");
-    db.put(None, &key, &val0).unwrap();
+    db.put( &key, &val0).unwrap();
 
     // Explicit txn under serializable isolation: read locks are held
     // until commit/abort.
@@ -369,8 +369,8 @@ fn f12_explicit_txn_read_blocks_auto_commit_write() {
     let reader_txn = env.begin_transaction(Some(&tcfg)).unwrap();
     let mut data = DatabaseEntry::new();
     let key_lookup = DatabaseEntry::from_data(b"k");
-    let status = db.get(Some(&reader_txn), &key_lookup, &mut data).unwrap();
-    assert_eq!(status, OperationStatus::Success);
+    let status = db.get_into(Some(&reader_txn), &key_lookup, &mut data).unwrap();
+    assert!(status);
     assert_eq!(data.get_data(), Some(b"v0".as_slice()));
 
     let finished = Arc::new(AtomicBool::new(false));
@@ -381,7 +381,7 @@ fn f12_explicit_txn_read_blocks_auto_commit_write() {
         let val1 = DatabaseEntry::from_data(b"v1");
         // Blocks on the write lock for K (conflicts with the reader's Read
         // lock). With the 30 s timeout it waits until the reader commits.
-        db_t.put(None, &key, &val1).unwrap();
+        db_t.put( &key, &val1).unwrap();
         finished_t.store(true, Ordering::SeqCst);
     });
 
@@ -500,7 +500,7 @@ mod prop_txn_visibility {
                 for k in all_keys {
                     let mut data = DatabaseEntry::new();
                     let key_e = DatabaseEntry::from_data(k);
-                    let status = db.get(None, &key_e, &mut data).unwrap();
+                    let status = db.get_into(None, &key_e, &mut data).unwrap();
                     match (status, committed.get(k)) {
                         (OperationStatus::Success, Some(want)) => {
                             prop_assert_eq!(
@@ -535,10 +535,10 @@ mod prop_txn_visibility {
                         let key_e = DatabaseEntry::from_data(&key);
                         let val_e = DatabaseEntry::from_data(&value);
                         if let Some((txn, snap)) = active.as_mut() {
-                            db.put(Some(txn), &key_e, &val_e).unwrap();
+                            db.put_in(txn, &key_e, &val_e).unwrap();
                             snap.insert(key, value);
                         } else {
-                            db.put(None, &key_e, &val_e).unwrap();
+                            db.put( &key_e, &val_e).unwrap();
                             committed.insert(key, value);
                             // Auto-commit: oracle and db should agree
                             // *immediately* after this op.
@@ -635,7 +635,7 @@ fn f5_explicit_txns_unregister_from_txn_manager() {
         let txn = env.begin_transaction(None).unwrap();
         let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
         let val = DatabaseEntry::from_bytes(b"v");
-        db.put(Some(&txn), &key, &val).unwrap();
+        db.put_in(&txn, &key, &val).unwrap();
         if i % 2 == 0 {
             txn.commit().unwrap();
         } else {
@@ -799,7 +799,7 @@ fn txn3_all_txns_drains_to_zero_commit_and_abort() {
         let txn = env.begin_transaction(None).unwrap();
         let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
         let val = DatabaseEntry::from_bytes(b"x");
-        db.put(Some(&txn), &key, &val).unwrap();
+        db.put_in(&txn, &key, &val).unwrap();
         if i % 2 == 0 {
             txn.commit().unwrap();
         } else {

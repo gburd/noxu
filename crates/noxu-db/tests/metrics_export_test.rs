@@ -70,13 +70,13 @@ fn metrics_export_emits_je_stat_set() {
         let txn = env.begin_transaction(None).unwrap();
         let k = DatabaseEntry::from_bytes(&i.to_be_bytes());
         let v = DatabaseEntry::from_bytes(&[1, 2, 3, 4]);
-        db.put(Some(&txn), &k, &v).unwrap();
+        db.put_in(&txn, &k, &v).unwrap();
         txn.commit().unwrap();
     }
     for i in 0..N {
         let k = DatabaseEntry::from_bytes(&i.to_be_bytes());
         let mut out = DatabaseEntry::new();
-        let _ = db.get(None, &k, &mut out);
+        let _ = db.get_into(None, &k, &mut out);
     }
 
     // 4. Force a checkpoint so checkpoint stats are non-zero.

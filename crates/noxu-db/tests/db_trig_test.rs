@@ -109,11 +109,11 @@ fn headline1_put_delete_old_new_within_txn() {
     let txn_id = txn.get_id();
 
     // Insert: oldData = None, newData = "v1".  JE Trigger.put insert path.
-    db.put(Some(&txn), &ent(b"k"), &ent(b"v1")).unwrap();
+    db.put_in(&txn, &ent(b"k"), &ent(b"v1")).unwrap();
     // Update: oldData = Some("v1"), newData = "v2".  JE Trigger.put update path.
-    db.put(Some(&txn), &ent(b"k"), &ent(b"v2")).unwrap();
+    db.put_in(&txn, &ent(b"k"), &ent(b"v2")).unwrap();
     // Delete: oldData = Some("v2").  JE Trigger.delete path.
-    db.delete(Some(&txn), &ent(b"k")).unwrap();
+    db.delete_in(&txn, &ent(b"k")).unwrap();
 
     txn.commit().unwrap();
 
@@ -160,7 +160,7 @@ fn headline2_put_trigger_fires_before_commit() {
     let db = e.open_database(None, "t2", &cfg).unwrap();
 
     let txn = e.begin_transaction(None).unwrap();
-    db.put(Some(&txn), &ent(b"k"), &ent(b"v")).unwrap();
+    db.put_in(&txn, &ent(b"k"), &ent(b"v")).unwrap();
 
     // Asserted AFTER the put but BEFORE commit: the put trigger has already
     // fired, and no commit trigger has fired yet.  JE fires put within the
@@ -194,7 +194,7 @@ fn headline3_abort_fires_and_rolls_back() {
 
     let txn = e.begin_transaction(None).unwrap();
     let txn_id = txn.get_id();
-    db.put(Some(&txn), &ent(b"k"), &ent(b"v")).unwrap();
+    db.put_in(&txn, &ent(b"k"), &ent(b"v")).unwrap();
     // The put trigger fired within the txn (it saw the change)...
     assert!(matches!(calls.lock().unwrap().last(), Some(Call::Put { .. })));
 
@@ -208,9 +208,7 @@ fn headline3_abort_fires_and_rolls_back() {
 
     // The data change is rolled back with the txn: the record is gone.
     let mut data = DatabaseEntry::new();
-    assert_eq!(
-        db.get(None, &ent(b"k"), &mut data).unwrap(),
-        OperationStatus::NotFound,
+    assert!(!(db.get_into(None, &ent(b"k"), &mut data).unwrap()),
         "aborted put must leave no record"
     );
 }
@@ -262,7 +260,7 @@ fn headline4_multiple_triggers_fire_in_registration_order() {
     let db = e.open_database(None, "t4", &cfg).unwrap();
 
     let txn = e.begin_transaction(None).unwrap();
-    db.put(Some(&txn), &ent(b"k"), &ent(b"v")).unwrap();
+    db.put_in(&txn, &ent(b"k"), &ent(b"v")).unwrap();
     txn.commit().unwrap();
 
     let o = order.lock().unwrap().clone();
@@ -284,18 +282,15 @@ fn headline5_no_trigger_unchanged_behaviour() {
     let db = e.open_database(None, "t5", &cfg).unwrap();
 
     let txn = e.begin_transaction(None).unwrap();
-    db.put(Some(&txn), &ent(b"k"), &ent(b"v")).unwrap();
-    db.put(Some(&txn), &ent(b"k"), &ent(b"v2")).unwrap();
-    db.delete(Some(&txn), &ent(b"k")).unwrap();
+    db.put_in(&txn, &ent(b"k"), &ent(b"v")).unwrap();
+    db.put_in(&txn, &ent(b"k"), &ent(b"v2")).unwrap();
+    db.delete_in(&txn, &ent(b"k")).unwrap();
     txn.commit().unwrap();
 
     // Data path is unaffected: a fresh put round-trips.
-    db.put(None, &ent(b"x"), &ent(b"y")).unwrap();
+    db.put( &ent(b"x"), &ent(b"y")).unwrap();
     let mut data = DatabaseEntry::new();
-    assert_eq!(
-        db.get(None, &ent(b"x"), &mut data).unwrap(),
-        OperationStatus::Success
-    );
+    assert!(db.get_into(None, &ent(b"x"), &mut data).unwrap());
     assert_eq!(data.data(), b"y");
 }
 
@@ -316,7 +311,7 @@ fn auto_commit_put_fires_with_none_txn() {
         .with_trigger(trig);
     let db = e.open_database(None, "auto", &cfg).unwrap();
 
-    db.put(None, &ent(b"k"), &ent(b"v")).unwrap();
+    db.put( &ent(b"k"), &ent(b"v")).unwrap();
 
     let c = calls.lock().unwrap().clone();
     assert_eq!(

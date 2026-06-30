@@ -45,11 +45,9 @@ fn open_env_db() -> (TempDir, noxu_db::Environment, noxu_db::Database) {
 fn put_simple(env: &noxu_db::Environment, db: &noxu_db::Database) {
     let txn = env.begin_transaction(None).unwrap();
     for (k, v) in SIMPLE_KEYS.iter().zip(SIMPLE_DATA.iter()) {
-        db.put(
-            Some(&txn),
+        db.put_in(&txn,
             &DatabaseEntry::from_bytes(k.as_bytes()),
-            &DatabaseEntry::from_bytes(v.as_bytes()),
-        )
+            &DatabaseEntry::from_bytes(v.as_bytes()))
         .unwrap();
     }
     txn.commit().unwrap();
@@ -67,7 +65,7 @@ fn db_cursor_test_simple_get_put() {
     let (_dir, env, db) = open_env_db();
     put_simple(&env, &db);
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor( None).unwrap();
     let mut k = DatabaseEntry::new();
     let mut d = DatabaseEntry::new();
 
@@ -97,7 +95,7 @@ fn db_cursor_test_simple_get_put_backwards() {
     let (_dir, env, db) = open_env_db();
     put_simple(&env, &db);
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor( None).unwrap();
     let mut k = DatabaseEntry::new();
     let mut d = DatabaseEntry::new();
 
@@ -130,7 +128,7 @@ fn db_cursor_test_cursor_advance() {
     let (_dir, env, db) = open_env_db();
     put_simple(&env, &db);
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor( None).unwrap();
     let mut k = DatabaseEntry::new();
     let mut d = DatabaseEntry::new();
 
@@ -167,7 +165,7 @@ fn db_cursor_search_test_simple_search_key() {
     let (_dir, env, db) = open_env_db();
     put_simple(&env, &db);
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor( None).unwrap();
     for (k, v) in SIMPLE_KEYS.iter().zip(SIMPLE_DATA.iter()) {
         let mut key = DatabaseEntry::from_bytes(k.as_bytes());
         let mut data = DatabaseEntry::new();
@@ -200,12 +198,12 @@ fn db_cursor_search_test_simple_delete_and_search_key() {
     let target = "quux";
     let txn = env.begin_transaction(None).unwrap();
     let s = db
-        .delete(Some(&txn), &DatabaseEntry::from_bytes(target.as_bytes()))
+        .delete_in(&txn, &DatabaseEntry::from_bytes(target.as_bytes()))
         .unwrap();
     assert_eq!(OperationStatus::Success, s);
     txn.commit().unwrap();
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor( None).unwrap();
     for k in SIMPLE_KEYS {
         let mut key = DatabaseEntry::from_bytes(k.as_bytes());
         let mut data = DatabaseEntry::new();
@@ -238,7 +236,7 @@ fn db_cursor_delete_test_simple_delete_insert() {
     let txn = env.begin_transaction(None).unwrap();
     for k in SIMPLE_KEYS {
         let s = db
-            .delete(Some(&txn), &DatabaseEntry::from_bytes(k.as_bytes()))
+            .delete_in(&txn, &DatabaseEntry::from_bytes(k.as_bytes()))
             .unwrap();
         assert_eq!(OperationStatus::Success, s);
     }
@@ -246,7 +244,7 @@ fn db_cursor_delete_test_simple_delete_insert() {
 
     // Verify empty.
     {
-        let mut cursor = db.open_cursor(None, None).unwrap();
+        let mut cursor = db.open_cursor( None).unwrap();
         let mut k = DatabaseEntry::new();
         let mut d = DatabaseEntry::new();
         let s = cursor.get(&mut k, &mut d, Get::First, None).unwrap();
@@ -257,7 +255,7 @@ fn db_cursor_delete_test_simple_delete_insert() {
     put_simple(&env, &db);
 
     // Walk and collect.
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor( None).unwrap();
     let mut k = DatabaseEntry::new();
     let mut d = DatabaseEntry::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
@@ -290,7 +288,7 @@ fn db_cursor_delete_test_large_delete_all() {
     for i in 0..N {
         let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
         let val = DatabaseEntry::from_bytes(&(i + 100).to_be_bytes());
-        db.put(Some(&txn), &key, &val).unwrap();
+        db.put_in(&txn, &key, &val).unwrap();
     }
     txn.commit().unwrap();
 
@@ -299,7 +297,7 @@ fn db_cursor_delete_test_large_delete_all() {
     let txn = env.begin_transaction(None).unwrap();
     for i in 0..N {
         let s = db
-            .delete(Some(&txn), &DatabaseEntry::from_bytes(&i.to_be_bytes()))
+            .delete_in(&txn, &DatabaseEntry::from_bytes(&i.to_be_bytes()))
             .unwrap();
         assert_eq!(OperationStatus::Success, s);
     }
@@ -362,7 +360,7 @@ fn put_dup_fixture(env: &noxu_db::Environment, db: &noxu_db::Database) {
         let key = DatabaseEntry::from_bytes(&[b'k', k, 0, 0]);
         for d in 0..DUP_N_PER_KEY {
             let data = DatabaseEntry::from_bytes(&[b'd', d]);
-            db.put(Some(&txn), &key, &data).unwrap();
+            db.put_in(&txn, &key, &data).unwrap();
         }
     }
     txn.commit().unwrap();
@@ -379,7 +377,7 @@ fn db_cursor_duplicate_test_duplicate_creation_forward() {
     let (_dir, env, db) = open_dup_env_db();
     put_dup_fixture(&env, &db);
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor( None).unwrap();
     let mut k = DatabaseEntry::new();
     let mut d = DatabaseEntry::new();
 
@@ -414,7 +412,7 @@ fn db_cursor_duplicate_test_duplicate_creation_backwards() {
     let (_dir, env, db) = open_dup_env_db();
     put_dup_fixture(&env, &db);
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor( None).unwrap();
     let mut k = DatabaseEntry::new();
     let mut d = DatabaseEntry::new();
 
@@ -464,7 +462,7 @@ fn db_cursor_duplicate_test_duplicate_count() {
     let (_dir, env, db) = open_dup_env_db();
     put_dup_fixture(&env, &db);
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor( None).unwrap();
     let mut k = DatabaseEntry::new();
     let mut d = DatabaseEntry::new();
 
@@ -509,7 +507,7 @@ fn db_cursor_duplicate_test_get_next_dup() {
     put_dup_fixture(&env, &db);
 
     for k in 0..DUP_N_KEYS {
-        let mut cursor = db.open_cursor(None, None).unwrap();
+        let mut cursor = db.open_cursor( None).unwrap();
         let mut key = DatabaseEntry::from_bytes(&[b'k', k, 0, 0]);
         let mut data = DatabaseEntry::new();
 
@@ -551,7 +549,7 @@ fn db_cursor_duplicate_test_get_next_no_dup() {
     let (_dir, env, db) = open_dup_env_db();
     put_dup_fixture(&env, &db);
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor( None).unwrap();
     let mut k = DatabaseEntry::new();
     let mut d = DatabaseEntry::new();
 
@@ -591,7 +589,7 @@ fn db_cursor_duplicate_test_get_next_no_dup() {
 fn db_cursor_duplicate_test_put_no_dup_data2() {
     let (_dir, _env, db) = open_dup_env_db();
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor( None).unwrap();
     let key = DatabaseEntry::from_bytes(b"oneKey");
     for d in 0..DUP_N_PER_KEY {
         let data = DatabaseEntry::from_bytes(&[d]);
@@ -628,7 +626,7 @@ fn db_cursor_duplicate_test_duplicate_replacement() {
     let v2 = DatabaseEntry::from_bytes(b"d2d2");
 
     {
-        let mut cursor = db.open_cursor(None, None).unwrap();
+        let mut cursor = db.open_cursor( None).unwrap();
         // First dup; NoDupData succeeds because the pair is fresh.
         let s = cursor.put(&key, &v1, Put::NoDupData).unwrap();
         assert_eq!(OperationStatus::Success, s);
@@ -642,7 +640,7 @@ fn db_cursor_duplicate_test_duplicate_replacement() {
     }
 
     // Walk the cursor and re-write each dup with its existing value.
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor( None).unwrap();
     let mut k = DatabaseEntry::new();
     let mut d = DatabaseEntry::new();
     let mut n = 0usize;
@@ -676,7 +674,7 @@ fn db_cursor_duplicate_test_duplicate_duplicates() {
     let v1 = DatabaseEntry::from_bytes(b"d1d1");
     let v2 = DatabaseEntry::from_bytes(b"d2d2");
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor( None).unwrap();
 
     // First dup pair fresh.
     assert_eq!(
@@ -712,7 +710,7 @@ fn db_cursor_duplicate_test_duplicate_duplicates() {
 
     // Verify exactly two dup pairs survived (cursor walk).
     cursor.close().unwrap();
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor( None).unwrap();
     let mut k = DatabaseEntry::new();
     let mut d = DatabaseEntry::new();
     let mut n = 0usize;

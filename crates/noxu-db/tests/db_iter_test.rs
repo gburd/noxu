@@ -28,7 +28,7 @@ fn insert_n(db: &noxu_db::Database, n: u32) {
     for i in 0..n {
         let k = DatabaseEntry::from_bytes(&i.to_be_bytes());
         let v = DatabaseEntry::from_bytes(format!("val-{i}").as_bytes());
-        db.put(None, &k, &v).unwrap();
+        db.put( &k, &v).unwrap();
     }
 }
 
@@ -53,10 +53,8 @@ fn iter_single_key() {
     let dir = TempDir::new().unwrap();
     let (env, db) = open_env_db(&dir);
     db.put(
-        None,
         &DatabaseEntry::from_bytes(b"k"),
-        &DatabaseEntry::from_bytes(b"v"),
-    )
+        &DatabaseEntry::from_bytes(b"v"))
     .unwrap();
 
     let items: Vec<_> = db.iter(None).unwrap().map(|r| r.unwrap()).collect();
@@ -142,10 +140,8 @@ fn range_empty_result() {
     // Insert keys 10..20.
     for i in 10u32..20 {
         db.put(
-            None,
             &DatabaseEntry::from_bytes(&i.to_be_bytes()),
-            &DatabaseEntry::from_bytes(b"v"),
-        )
+            &DatabaseEntry::from_bytes(b"v"))
         .unwrap();
     }
 

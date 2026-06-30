@@ -29,7 +29,7 @@
 //!
 //! // Insert some records.
 //! for i in 0u32..5 {
-//!     db.put(None, &DatabaseEntry::from_bytes(&i.to_be_bytes()), &DatabaseEntry::from_bytes(b"v"))?;
+//!     db.put(&i.to_be_bytes(), b"v")?;
 //! }
 //!
 //! // Forward scan — lazy.
@@ -56,8 +56,6 @@ use crate::database_entry::DatabaseEntry;
 use crate::error::{NoxuError, Result};
 use crate::get::Get;
 use crate::operation_status::OperationStatus;
-use crate::transaction::Transaction;
-use std::marker::PhantomData;
 use std::ops::Bound;
 
 // ── DbIter ────────────────────────────────────────────────────────────────────
@@ -78,15 +76,14 @@ use std::ops::Bound;
 /// Dropping the iterator closes the underlying cursor.  For transactional
 /// cursors this releases any shared read locks the cursor holds.
 pub struct DbIter<'txn> {
-    cursor: Cursor,
+    cursor: Cursor<'txn>,
     started: bool,
     done: bool,
-    _txn: PhantomData<&'txn Transaction>,
 }
 
 impl<'txn> DbIter<'txn> {
-    pub(crate) fn new(cursor: Cursor) -> Self {
-        Self { cursor, started: false, done: false, _txn: PhantomData }
+    pub(crate) fn new(cursor: Cursor<'txn>) -> Self {
+        Self { cursor, started: false, done: false }
     }
 }
 
@@ -131,7 +128,7 @@ impl<'txn> Iterator for DbIter<'txn> {
 /// The lifetime `'txn` ensures the iterator cannot outlive the transaction
 /// it was opened against.  See [`DbIter`] for the rationale.
 pub struct DbRange<'txn> {
-    cursor: Cursor,
+    cursor: Cursor<'txn>,
     end_bound: Bound<Vec<u8>>,
     done: bool,
     /// Whether the cursor has been positioned at the start yet.
@@ -139,12 +136,11 @@ pub struct DbRange<'txn> {
     start_key: Option<Vec<u8>>,
     /// When true, skip a record whose key exactly equals `start_key` (Excluded bound).
     exclude_start: bool,
-    _txn: PhantomData<&'txn Transaction>,
 }
 
 impl<'txn> DbRange<'txn> {
     pub(crate) fn new(
-        cursor: Cursor,
+        cursor: Cursor<'txn>,
         start_bound: Bound<Vec<u8>>,
         end_bound: Bound<Vec<u8>>,
     ) -> Self {
@@ -160,7 +156,6 @@ impl<'txn> DbRange<'txn> {
             positioned: false,
             start_key,
             exclude_start,
-            _txn: PhantomData,
         }
     }
 

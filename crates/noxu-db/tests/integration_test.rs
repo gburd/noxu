@@ -28,10 +28,10 @@ fn test_put_get_round_trip() {
     let key = DatabaseEntry::from_bytes(b"hello");
     let val = DatabaseEntry::from_bytes(b"world");
 
-    assert_eq!(db.put(None, &key, &val).unwrap(), OperationStatus::Success);
+    db.put( &key, &val).unwrap();
 
     let mut out = DatabaseEntry::new();
-    assert_eq!(db.get(None, &key, &mut out).unwrap(), OperationStatus::Success);
+    assert!(db.get_into(None, &key, &mut out).unwrap());
     assert_eq!(out.data(), b"world");
 }
 
@@ -44,14 +44,11 @@ fn test_put_delete_get() {
     let key = DatabaseEntry::from_bytes(b"key");
     let val = DatabaseEntry::from_bytes(b"val");
 
-    db.put(None, &key, &val).unwrap();
-    assert_eq!(db.delete(None, &key).unwrap(), OperationStatus::Success);
+    db.put( &key, &val).unwrap();
+    assert!(db.delete( &key).unwrap());
 
     let mut out = DatabaseEntry::new();
-    assert_eq!(
-        db.get(None, &key, &mut out).unwrap(),
-        OperationStatus::NotFound
-    );
+    assert!(!(db.get_into(None, &key, &mut out).unwrap()));
 }
 
 /// Last put wins (overwrite semantics).
@@ -64,11 +61,11 @@ fn test_put_overwrite() {
     let v1 = DatabaseEntry::from_bytes(b"v1");
     let v2 = DatabaseEntry::from_bytes(b"v2");
 
-    db.put(None, &key, &v1).unwrap();
-    db.put(None, &key, &v2).unwrap();
+    db.put( &key, &v1).unwrap();
+    db.put( &key, &v2).unwrap();
 
     let mut out = DatabaseEntry::new();
-    db.get(None, &key, &mut out).unwrap();
+    db.get_into(None, &key, &mut out).unwrap();
     assert_eq!(out.data(), b"v2");
 }
 
@@ -82,13 +79,13 @@ fn test_put_no_overwrite() {
     let v1 = DatabaseEntry::from_bytes(b"v1");
     let v2 = DatabaseEntry::from_bytes(b"v2");
 
-    db.put(None, &key, &v1).unwrap();
-    let status = db.put_no_overwrite(None, &key, &v2).unwrap();
-    assert_eq!(status, OperationStatus::KeyExists);
+    db.put( &key, &v1).unwrap();
+    let status = db.put_no_overwrite( &key, &v2).unwrap();
+    assert!(!status);
 
     // Original value unchanged
     let mut out = DatabaseEntry::new();
-    db.get(None, &key, &mut out).unwrap();
+    db.get_into(None, &key, &mut out).unwrap();
     assert_eq!(out.data(), b"v1");
 }
 
@@ -101,14 +98,12 @@ fn test_cursor_scan_sorted() {
     // Insert out of order
     for (k, v) in [(b"c", b"3"), (b"a", b"1"), (b"b", b"2")] {
         db.put(
-            None,
             &DatabaseEntry::from_bytes(k),
-            &DatabaseEntry::from_bytes(v),
-        )
+            &DatabaseEntry::from_bytes(v))
         .unwrap();
     }
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor( None).unwrap();
     let mut dummy_key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
 
@@ -134,14 +129,12 @@ fn test_cursor_scan_reverse() {
 
     for (k, v) in [(b"a", b"1"), (b"b", b"2"), (b"c", b"3")] {
         db.put(
-            None,
             &DatabaseEntry::from_bytes(k),
-            &DatabaseEntry::from_bytes(v),
-        )
+            &DatabaseEntry::from_bytes(v))
         .unwrap();
     }
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor( None).unwrap();
     let mut dummy_key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
 
@@ -170,14 +163,12 @@ fn test_cursor_search() {
         (b"cherry".as_ref(), b"c".as_ref()),
     ] {
         db.put(
-            None,
             &DatabaseEntry::from_bytes(k),
-            &DatabaseEntry::from_bytes(v),
-        )
+            &DatabaseEntry::from_bytes(v))
         .unwrap();
     }
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor( None).unwrap();
     let mut key = DatabaseEntry::from_bytes(b"banana");
     let mut data = DatabaseEntry::new();
 
@@ -195,9 +186,9 @@ fn test_cursor_delete() {
 
     let mut key = DatabaseEntry::from_bytes(b"k");
     let val = DatabaseEntry::from_bytes(b"v");
-    db.put(None, &key, &val).unwrap();
+    db.put( &key, &val).unwrap();
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor( None).unwrap();
     let mut data = DatabaseEntry::new();
 
     // Position on the record then delete via cursor
@@ -207,10 +198,7 @@ fn test_cursor_delete() {
 
     // Verify gone via Database::get
     let mut out = DatabaseEntry::new();
-    assert_eq!(
-        db.get(None, &key, &mut out).unwrap(),
-        OperationStatus::NotFound
-    );
+    assert!(!(db.get_into(None, &key, &mut out).unwrap()));
 }
 
 /// Database::count() returns the right number of records.
@@ -222,22 +210,18 @@ fn test_count() {
     assert_eq!(db.count().unwrap(), 0);
 
     db.put(
-        None,
         &DatabaseEntry::from_bytes(b"k1"),
-        &DatabaseEntry::from_bytes(b"v1"),
-    )
+        &DatabaseEntry::from_bytes(b"v1"))
     .unwrap();
     assert_eq!(db.count().unwrap(), 1);
 
     db.put(
-        None,
         &DatabaseEntry::from_bytes(b"k2"),
-        &DatabaseEntry::from_bytes(b"v2"),
-    )
+        &DatabaseEntry::from_bytes(b"v2"))
     .unwrap();
     assert_eq!(db.count().unwrap(), 2);
 
-    db.delete(None, &DatabaseEntry::from_bytes(b"k1")).unwrap();
+    db.delete( &DatabaseEntry::from_bytes(b"k1")).unwrap();
     assert_eq!(db.count().unwrap(), 1);
 }
 
@@ -255,13 +239,13 @@ fn test_multiple_databases_isolated() {
     let db2 = env.open_database(None, "db2", &db_config).unwrap();
 
     let key = DatabaseEntry::from_bytes(b"k");
-    db1.put(None, &key, &DatabaseEntry::from_bytes(b"from-db1")).unwrap();
-    db2.put(None, &key, &DatabaseEntry::from_bytes(b"from-db2")).unwrap();
+    db1.put( &key, &DatabaseEntry::from_bytes(b"from-db1")).unwrap();
+    db2.put( &key, &DatabaseEntry::from_bytes(b"from-db2")).unwrap();
 
     let mut out1 = DatabaseEntry::new();
     let mut out2 = DatabaseEntry::new();
-    db1.get(None, &key, &mut out1).unwrap();
-    db2.get(None, &key, &mut out2).unwrap();
+    db1.get_into(None, &key, &mut out1).unwrap();
+    db2.get_into(None, &key, &mut out2).unwrap();
 
     assert_eq!(out1.data(), b"from-db1");
     assert_eq!(out2.data(), b"from-db2");
@@ -410,14 +394,12 @@ fn cursor_first_returns_smallest_key() {
         [(b"dog".as_ref(), b"3".as_ref()), (b"ant", b"1"), (b"bee", b"2")]
     {
         db.put(
-            None,
             &noxu_db::DatabaseEntry::from_bytes(k),
-            &noxu_db::DatabaseEntry::from_bytes(v),
-        )
+            &noxu_db::DatabaseEntry::from_bytes(v))
         .unwrap();
     }
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor( None).unwrap();
     let mut key = noxu_db::DatabaseEntry::new();
     let mut data = noxu_db::DatabaseEntry::new();
 
@@ -440,14 +422,12 @@ fn cursor_last_returns_largest_key() {
         [(b"dog".as_ref(), b"3".as_ref()), (b"ant", b"1"), (b"bee", b"2")]
     {
         db.put(
-            None,
             &noxu_db::DatabaseEntry::from_bytes(k),
-            &noxu_db::DatabaseEntry::from_bytes(v),
-        )
+            &noxu_db::DatabaseEntry::from_bytes(v))
         .unwrap();
     }
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor( None).unwrap();
     let mut key = noxu_db::DatabaseEntry::new();
     let mut data = noxu_db::DatabaseEntry::new();
 
@@ -478,14 +458,12 @@ fn cursor_next_traverses_sorted_order() {
     ];
     for (k, v) in pairs {
         db.put(
-            None,
             &noxu_db::DatabaseEntry::from_bytes(k),
-            &noxu_db::DatabaseEntry::from_bytes(v),
-        )
+            &noxu_db::DatabaseEntry::from_bytes(v))
         .unwrap();
     }
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor( None).unwrap();
     let mut key = noxu_db::DatabaseEntry::new();
     let mut data = noxu_db::DatabaseEntry::new();
 
@@ -513,14 +491,12 @@ fn cursor_prev_traverses_reverse_sorted_order() {
     let pairs: &[(&[u8], &[u8])] = &[(b"A", b"1"), (b"B", b"2"), (b"C", b"3")];
     for (k, v) in pairs {
         db.put(
-            None,
             &noxu_db::DatabaseEntry::from_bytes(k),
-            &noxu_db::DatabaseEntry::from_bytes(v),
-        )
+            &noxu_db::DatabaseEntry::from_bytes(v))
         .unwrap();
     }
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor( None).unwrap();
     let mut key = noxu_db::DatabaseEntry::new();
     let mut data = noxu_db::DatabaseEntry::new();
 
@@ -549,14 +525,12 @@ fn cursor_search_finds_exact_key() {
         [(b"A".as_ref(), b"v1".as_ref()), (b"F", b"v2"), (b"G", b"v3")]
     {
         db.put(
-            None,
             &noxu_db::DatabaseEntry::from_bytes(k),
-            &noxu_db::DatabaseEntry::from_bytes(v),
-        )
+            &noxu_db::DatabaseEntry::from_bytes(v))
         .unwrap();
     }
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor( None).unwrap();
     let mut key = noxu_db::DatabaseEntry::from_bytes(b"F");
     let mut data = noxu_db::DatabaseEntry::new();
 
@@ -577,13 +551,11 @@ fn cursor_search_missing_key_returns_not_found() {
     let (_env, db) = open_env_and_db(&dir);
 
     db.put(
-        None,
         &noxu_db::DatabaseEntry::from_bytes(b"A"),
-        &noxu_db::DatabaseEntry::from_bytes(b"v"),
-    )
+        &noxu_db::DatabaseEntry::from_bytes(b"v"))
     .unwrap();
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor( None).unwrap();
     let mut key = noxu_db::DatabaseEntry::from_bytes(b"Z");
     let mut data = noxu_db::DatabaseEntry::new();
 
@@ -604,14 +576,12 @@ fn cursor_search_gte_finds_first_ge_key() {
     // Insert keys 1, 3, 5 (as single bytes).
     for k in [1u8, 3, 5] {
         db.put(
-            None,
             &noxu_db::DatabaseEntry::from_bytes(&[k]),
-            &noxu_db::DatabaseEntry::from_bytes(&[k]),
-        )
+            &noxu_db::DatabaseEntry::from_bytes(&[k]))
         .unwrap();
     }
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor( None).unwrap();
 
     // SearchGte(0) → first key >= 0 is 1.
     let mut key = noxu_db::DatabaseEntry::from_bytes(&[0u8]);
@@ -653,14 +623,12 @@ fn cursor_delete_removes_record_next_skips_it() {
 
     for (k, v) in [(b"A".as_ref(), b"1".as_ref()), (b"B", b"2"), (b"C", b"3")] {
         db.put(
-            None,
             &noxu_db::DatabaseEntry::from_bytes(k),
-            &noxu_db::DatabaseEntry::from_bytes(v),
-        )
+            &noxu_db::DatabaseEntry::from_bytes(v))
         .unwrap();
     }
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor( None).unwrap();
     let mut key = noxu_db::DatabaseEntry::from_bytes(b"B");
     let mut data = noxu_db::DatabaseEntry::new();
 
@@ -701,26 +669,24 @@ fn cursor_put_overwrite_and_no_overwrite() {
     let (_env, db) = open_env_and_db(&dir);
 
     db.put(
-        None,
         &noxu_db::DatabaseEntry::from_bytes(b"K"),
-        &noxu_db::DatabaseEntry::from_bytes(b"v1"),
-    )
+        &noxu_db::DatabaseEntry::from_bytes(b"v1"))
     .unwrap();
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor( None).unwrap();
 
     // NoOverwrite on existing key → KeyExists.
     let kentry = noxu_db::DatabaseEntry::from_bytes(b"K");
     let v2entry = noxu_db::DatabaseEntry::from_bytes(b"v2");
     let status =
         cursor.put(&kentry, &v2entry, noxu_db::Put::NoOverwrite).unwrap();
-    assert_eq!(status, noxu_db::OperationStatus::KeyExists);
+    ;
 
     // Overwrite on existing key → Success and value replaced.
     let v3entry = noxu_db::DatabaseEntry::from_bytes(b"v3");
     let status =
         cursor.put(&kentry, &v3entry, noxu_db::Put::Overwrite).unwrap();
-    assert_eq!(status, noxu_db::OperationStatus::Success);
+    ;
 
     // Verify value is now v3.
     let mut read_key = noxu_db::DatabaseEntry::from_bytes(b"K");
@@ -742,15 +708,13 @@ fn two_cursors_independent_positions() {
 
     for (k, v) in [(b"A".as_ref(), b"1".as_ref()), (b"B", b"2"), (b"C", b"3")] {
         db.put(
-            None,
             &noxu_db::DatabaseEntry::from_bytes(k),
-            &noxu_db::DatabaseEntry::from_bytes(v),
-        )
+            &noxu_db::DatabaseEntry::from_bytes(v))
         .unwrap();
     }
 
-    let mut c1 = db.open_cursor(None, None).unwrap();
-    let mut c2 = db.open_cursor(None, None).unwrap();
+    let mut c1 = db.open_cursor( None).unwrap();
+    let mut c2 = db.open_cursor( None).unwrap();
 
     let mut k1 = noxu_db::DatabaseEntry::new();
     let mut d1 = noxu_db::DatabaseEntry::new();
@@ -781,13 +745,11 @@ fn cursor_get_current_after_search() {
     let (_env, db) = open_env_and_db(&dir);
 
     db.put(
-        None,
         &noxu_db::DatabaseEntry::from_bytes(b"key"),
-        &noxu_db::DatabaseEntry::from_bytes(b"val"),
-    )
+        &noxu_db::DatabaseEntry::from_bytes(b"val"))
     .unwrap();
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor( None).unwrap();
     let mut key = noxu_db::DatabaseEntry::from_bytes(b"key");
     let mut data = noxu_db::DatabaseEntry::new();
 
@@ -815,14 +777,12 @@ fn cursor_next_from_uninitialized_is_first() {
 
     for (k, v) in [(b"X".as_ref(), b"1".as_ref()), (b"Y", b"2")] {
         db.put(
-            None,
             &noxu_db::DatabaseEntry::from_bytes(k),
-            &noxu_db::DatabaseEntry::from_bytes(v),
-        )
+            &noxu_db::DatabaseEntry::from_bytes(v))
         .unwrap();
     }
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor( None).unwrap();
     let mut key = noxu_db::DatabaseEntry::new();
     let mut data = noxu_db::DatabaseEntry::new();
 
@@ -842,14 +802,12 @@ fn cursor_prev_from_uninitialized_is_last() {
 
     for (k, v) in [(b"X".as_ref(), b"1".as_ref()), (b"Y", b"2")] {
         db.put(
-            None,
             &noxu_db::DatabaseEntry::from_bytes(k),
-            &noxu_db::DatabaseEntry::from_bytes(v),
-        )
+            &noxu_db::DatabaseEntry::from_bytes(v))
         .unwrap();
     }
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor( None).unwrap();
     let mut key = noxu_db::DatabaseEntry::new();
     let mut data = noxu_db::DatabaseEntry::new();
 
@@ -870,8 +828,8 @@ fn db_delete_missing_key_returns_not_found() {
     let (_env, db) = open_env_and_db(&dir);
 
     let key = noxu_db::DatabaseEntry::from_bytes(b"ghost");
-    let status = db.delete(None, &key).unwrap();
-    assert_eq!(status, noxu_db::OperationStatus::NotFound);
+    let status = db.delete( &key).unwrap();
+    assert!(!status);
 }
 
 /// put() followed by delete() followed by another delete() returns NotFound.
@@ -883,16 +841,10 @@ fn db_double_delete_second_is_not_found() {
 
     let key = noxu_db::DatabaseEntry::from_bytes(b"k");
     let val = noxu_db::DatabaseEntry::from_bytes(b"v");
-    db.put(None, &key, &val).unwrap();
+    db.put( &key, &val).unwrap();
 
-    assert_eq!(
-        db.delete(None, &key).unwrap(),
-        noxu_db::OperationStatus::Success
-    );
-    assert_eq!(
-        db.delete(None, &key).unwrap(),
-        noxu_db::OperationStatus::NotFound
-    );
+    assert!(db.delete( &key).unwrap());
+    assert!(!(db.delete( &key).unwrap()));
 }
 
 /// put_no_overwrite() succeeds for a new key, returns KeyExists on the second call,
@@ -907,18 +859,12 @@ fn db_put_no_overwrite_semantics() {
     let v1 = noxu_db::DatabaseEntry::from_bytes(b"first");
     let v2 = noxu_db::DatabaseEntry::from_bytes(b"second");
 
-    assert_eq!(
-        db.put_no_overwrite(None, &key, &v1).unwrap(),
-        noxu_db::OperationStatus::Success
-    );
-    assert_eq!(
-        db.put_no_overwrite(None, &key, &v2).unwrap(),
-        noxu_db::OperationStatus::KeyExists
-    );
+    assert!(db.put_no_overwrite( &key, &v1).unwrap());
+    assert!(!(db.put_no_overwrite( &key, &v2).unwrap()));
 
     // Original value must be unchanged.
     let mut out = noxu_db::DatabaseEntry::new();
-    db.get(None, &key, &mut out).unwrap();
+    db.get_into(None, &key, &mut out).unwrap();
     assert_eq!(out.data(), b"first");
 }
 
@@ -934,17 +880,15 @@ fn db_count_tracks_live_records() {
     // Insert 10 records.
     for i in 0u8..10 {
         db.put(
-            None,
             &noxu_db::DatabaseEntry::from_bytes(&[i]),
-            &noxu_db::DatabaseEntry::from_bytes(&[i]),
-        )
+            &noxu_db::DatabaseEntry::from_bytes(&[i]))
         .unwrap();
     }
     assert_eq!(db.count().unwrap(), 10);
 
     // Delete every other record (keys 0,2,4,6,8 → 5 deletions).
     for i in (0u8..10).step_by(2) {
-        db.delete(None, &noxu_db::DatabaseEntry::from_bytes(&[i])).unwrap();
+        db.delete( &noxu_db::DatabaseEntry::from_bytes(&[i])).unwrap();
     }
     assert_eq!(db.count().unwrap(), 5);
 }
@@ -969,11 +913,11 @@ fn db_put_overwrites_existing_value() {
     let v1 = noxu_db::DatabaseEntry::from_bytes(b"one");
     let v2 = noxu_db::DatabaseEntry::from_bytes(b"two");
 
-    db.put(None, &key, &v1).unwrap();
-    db.put(None, &key, &v2).unwrap();
+    db.put( &key, &v1).unwrap();
+    db.put( &key, &v2).unwrap();
 
     let mut out = noxu_db::DatabaseEntry::new();
-    db.get(None, &key, &mut out).unwrap();
+    db.get_into(None, &key, &mut out).unwrap();
     assert_eq!(out.data(), b"two");
 }
 
@@ -988,15 +932,15 @@ fn db_put_no_overwrite_after_delete_succeeds() {
     let v1 = noxu_db::DatabaseEntry::from_bytes(b"first");
     let v2 = noxu_db::DatabaseEntry::from_bytes(b"third");
 
-    db.put_no_overwrite(None, &key, &v1).unwrap();
-    db.delete(None, &key).unwrap();
+    db.put_no_overwrite( &key, &v1).unwrap();
+    db.delete( &key).unwrap();
 
     // After deletion, put_no_overwrite should succeed again.
-    let status = db.put_no_overwrite(None, &key, &v2).unwrap();
-    assert_eq!(status, noxu_db::OperationStatus::Success);
+    let status = db.put_no_overwrite( &key, &v2).unwrap();
+    assert!(status);
 
     let mut out = noxu_db::DatabaseEntry::new();
-    db.get(None, &key, &mut out).unwrap();
+    db.get_into(None, &key, &mut out).unwrap();
     assert_eq!(out.data(), b"third");
 }
 
@@ -1012,15 +956,13 @@ fn db_multiple_concurrent_cursors_scan_same_records() {
     // Insert 5 records.
     for i in 0u8..5 {
         db.put(
-            None,
             &noxu_db::DatabaseEntry::from_bytes(&[i]),
-            &noxu_db::DatabaseEntry::from_bytes(&[i * 10]),
-        )
+            &noxu_db::DatabaseEntry::from_bytes(&[i * 10]))
         .unwrap();
     }
 
-    let mut c1 = db.open_cursor(None, None).unwrap();
-    let mut c2 = db.open_cursor(None, None).unwrap();
+    let mut c1 = db.open_cursor( None).unwrap();
+    let mut c2 = db.open_cursor( None).unwrap();
 
     let mut k = noxu_db::DatabaseEntry::new();
     let mut d = noxu_db::DatabaseEntry::new();
@@ -1057,9 +999,9 @@ fn db_get_not_found_for_missing_key() {
 
     let mut out = noxu_db::DatabaseEntry::new();
     let status = db
-        .get(None, &noxu_db::DatabaseEntry::from_bytes(b"missing"), &mut out)
+        .get_into(None, &noxu_db::DatabaseEntry::from_bytes(b"missing"), &mut out)
         .unwrap();
-    assert_eq!(status, noxu_db::OperationStatus::NotFound);
+    assert!(!status);
 }
 
 /// scan_all_kv() + delete all: count drops to zero.
@@ -1072,10 +1014,8 @@ fn db_remove_all_records_via_scan() {
     // Insert 20 records.
     for i in 0u8..20 {
         db.put(
-            None,
             &noxu_db::DatabaseEntry::from_bytes(&[i]),
-            &noxu_db::DatabaseEntry::from_bytes(&[i]),
-        )
+            &noxu_db::DatabaseEntry::from_bytes(&[i]))
         .unwrap();
     }
     assert_eq!(db.count().unwrap(), 20);
@@ -1084,7 +1024,7 @@ fn db_remove_all_records_via_scan() {
     let records = db.scan_all_kv().unwrap();
     assert_eq!(records.len(), 20);
     for (k, _) in records {
-        db.delete(None, &noxu_db::DatabaseEntry::from_vec(k)).unwrap();
+        db.delete( &noxu_db::DatabaseEntry::from_vec(k)).unwrap();
     }
     assert_eq!(db.count().unwrap(), 0);
 }
@@ -1103,17 +1043,15 @@ fn db_large_record_set_sorted_iteration() {
         let key_bytes = i.to_be_bytes();
         let val_bytes = i.to_be_bytes();
         db.put(
-            None,
             &noxu_db::DatabaseEntry::from_bytes(&key_bytes),
-            &noxu_db::DatabaseEntry::from_bytes(&val_bytes),
-        )
+            &noxu_db::DatabaseEntry::from_bytes(&val_bytes))
         .unwrap();
     }
 
     assert_eq!(db.count().unwrap(), N as u64);
 
     // Scan and verify ascending order.
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor( None).unwrap();
     let mut key = noxu_db::DatabaseEntry::new();
     let mut data = noxu_db::DatabaseEntry::new();
 
@@ -1805,7 +1743,7 @@ fn pri_put_and_index(
     let new_data = DatabaseEntry::from_bytes(v);
     // primary.put() auto-maintains the secondary via the registered hook.
     // No explicit update_secondary call needed (would double-process).
-    primary.lock().put(None, &pk, &new_data).unwrap();
+    primary.lock().put( &pk, &new_data).unwrap();
 }
 
 /// put to primary → get from secondary returns primary_key + data.
@@ -1821,8 +1759,8 @@ fn sec_put_primary_get_by_secondary_key() {
     let sec_key = DatabaseEntry::from_bytes(b"A");
     let mut p_key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
-    let status = secondary.get(None, &sec_key, &mut p_key, &mut data).unwrap();
-    assert_eq!(status, OperationStatus::Success);
+    let status = secondary.get_into(None, &sec_key, &mut p_key, &mut data).unwrap();
+    assert!(status);
     assert_eq!(p_key.get_data().unwrap(), b"pk1");
     assert_eq!(data.get_data().unwrap(), b"Apple");
 }
@@ -1841,22 +1779,22 @@ fn sec_delete_primary_removes_secondary() {
     // Delete via secondary key 'C' (first byte of "Cherry").
     // SecondaryDatabase::delete() removes the primary record and its secondary entries.
     let sec_key = DatabaseEntry::from_bytes(b"C");
-    let del_status = secondary.delete(None, &sec_key).unwrap();
-    assert_eq!(del_status, OperationStatus::Success);
+    let del_status = secondary.delete( &sec_key).unwrap();
+    assert!(del_status);
 
     // Secondary lookup should now return NotFound.
     let mut p_key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
-    let status = secondary.get(None, &sec_key, &mut p_key, &mut data).unwrap();
-    assert_eq!(status, OperationStatus::NotFound);
+    let status = secondary.get_into(None, &sec_key, &mut p_key, &mut data).unwrap();
+    assert!(!status);
 
     // Primary record is also gone.
     let mut pri_data = DatabaseEntry::new();
     let pri_status = primary
         .lock()
-        .get(None, &DatabaseEntry::from_bytes(b"pk1"), &mut pri_data)
+        .get_into(None, &DatabaseEntry::from_bytes(b"pk1"), &mut pri_data)
         .unwrap();
-    assert_eq!(pri_status, OperationStatus::NotFound);
+    assert!(!pri_status);
 }
 
 /// Searching secondary with non-existent key returns NotFound.
@@ -1872,8 +1810,8 @@ fn sec_get_nonexistent_key_returns_not_found() {
     let sec_key = DatabaseEntry::from_bytes(b"Z");
     let mut p_key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
-    let status = secondary.get(None, &sec_key, &mut p_key, &mut data).unwrap();
-    assert_eq!(status, OperationStatus::NotFound);
+    let status = secondary.get_into(None, &sec_key, &mut p_key, &mut data).unwrap();
+    assert!(!status);
 }
 
 /// Update primary value changes secondary key mapping.
@@ -1894,17 +1832,15 @@ fn sec_update_primary_changes_secondary_key() {
     let sec_key_b = DatabaseEntry::from_bytes(b"B");
     let mut pk = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
-    let status = secondary.get(None, &sec_key_b, &mut pk, &mut data).unwrap();
-    assert_eq!(
-        status,
-        OperationStatus::NotFound,
+    let status = secondary.get_into(None, &sec_key_b, &mut pk, &mut data).unwrap();
+    assert!(!status,
         "old sec key 'B' should be removed"
     );
 
     // New sec key 'C' must be present.
     let sec_key_c = DatabaseEntry::from_bytes(b"C");
-    let status = secondary.get(None, &sec_key_c, &mut pk, &mut data).unwrap();
-    assert_eq!(status, OperationStatus::Success);
+    let status = secondary.get_into(None, &sec_key_c, &mut pk, &mut data).unwrap();
+    assert!(status);
     assert_eq!(data.get_data().unwrap(), b"Cherry");
 }
 
@@ -1919,20 +1855,20 @@ fn sec_delete_via_secondary_removes_primary() {
 
     // Delete by secondary key 'D'.
     let sec_key = DatabaseEntry::from_bytes(b"D");
-    let status = secondary.delete(None, &sec_key).unwrap();
-    assert_eq!(status, OperationStatus::Success);
+    let status = secondary.delete( &sec_key).unwrap();
+    assert!(status);
 
     // Second delete on same key returns NotFound.
-    let status2 = secondary.delete(None, &sec_key).unwrap();
-    assert_eq!(status2, OperationStatus::NotFound);
+    let status2 = secondary.delete( &sec_key).unwrap();
+    assert!(!status2);
 
     // Primary record is gone.
     let mut data = DatabaseEntry::new();
     let get_status = primary
         .lock()
-        .get(None, &DatabaseEntry::from_bytes(b"pk1"), &mut data)
+        .get_into(None, &DatabaseEntry::from_bytes(b"pk1"), &mut data)
         .unwrap();
-    assert_eq!(get_status, OperationStatus::NotFound);
+    assert!(!get_status);
 }
 
 /// SecondaryCursor::get_first/next iterates all records in secondary key order.
@@ -1954,7 +1890,7 @@ fn sec_cursor_first_next_sorted_order() {
         pri_put_and_index(&primary, &secondary, k, v, None);
     }
 
-    let mut cursor = secondary.open_cursor(None, None).unwrap();
+    let mut cursor = secondary.open_cursor( None).unwrap();
     let mut sec_key = DatabaseEntry::new();
     let mut p_key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
@@ -1998,7 +1934,7 @@ fn sec_cursor_last_prev_reverse_order() {
         pri_put_and_index(&primary, &secondary, k, v, None);
     }
 
-    let mut cursor = secondary.open_cursor(None, None).unwrap();
+    let mut cursor = secondary.open_cursor( None).unwrap();
     let mut sec_key = DatabaseEntry::new();
     let mut p_key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
@@ -2031,7 +1967,7 @@ fn sec_cursor_search_key_returns_tuple() {
         pri_put_and_index(&primary, &secondary, k, v, None);
     }
 
-    let mut cursor = secondary.open_cursor(None, None).unwrap();
+    let mut cursor = secondary.open_cursor( None).unwrap();
     let search = DatabaseEntry::from_bytes(b"B");
     let mut p_key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
@@ -2053,7 +1989,7 @@ fn sec_cursor_search_key_not_found() {
 
     pri_put_and_index(&primary, &secondary, b"pk1", b"Apple", None);
 
-    let mut cursor = secondary.open_cursor(None, None).unwrap();
+    let mut cursor = secondary.open_cursor( None).unwrap();
     let search = DatabaseEntry::from_bytes(b"Z");
     let mut p_key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
@@ -2075,7 +2011,7 @@ fn sec_cursor_search_key_range_gte() {
     pri_put_and_index(&primary, &secondary, b"pk1", b"Cherry", None);
     pri_put_and_index(&primary, &secondary, b"pk2", b"Elderberry", None);
 
-    let mut cursor = secondary.open_cursor(None, None).unwrap();
+    let mut cursor = secondary.open_cursor( None).unwrap();
     // 'D' is between C and E; GTE should return 'E' (Elderberry).
     let mut search = DatabaseEntry::from_bytes(b"D");
     let mut p_key = DatabaseEntry::new();
@@ -2114,7 +2050,7 @@ fn sec_cursor_get_current_after_position() {
 
     pri_put_and_index(&primary, &secondary, b"pk1", b"Mango", None);
 
-    let mut cursor = secondary.open_cursor(None, None).unwrap();
+    let mut cursor = secondary.open_cursor( None).unwrap();
     let mut sk = DatabaseEntry::new();
     let mut pk = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
@@ -2176,7 +2112,7 @@ fn sec_multi_key_creator_multiple_keys_per_record() {
     // Primary record: key="pk1", data=[0x41, 0x42] = "AB"
     let pk = DatabaseEntry::from_bytes(b"pk1");
     let pv = DatabaseEntry::from_bytes(b"AB");
-    primary.lock().put(None, &pk, &pv).unwrap();
+    primary.lock().put( &pk, &pv).unwrap();
     // Auto-hook maintains secondary.
 
     // Both 'A' and 'B' should map to pk1.
@@ -2185,11 +2121,9 @@ fn sec_multi_key_creator_multiple_keys_per_record() {
         let mut found_pk = DatabaseEntry::new();
         let mut found_data = DatabaseEntry::new();
         let status = secondary
-            .get(None, &sec_key, &mut found_pk, &mut found_data)
+            .get_into(None, &sec_key, &mut found_pk, &mut found_data)
             .unwrap();
-        assert_eq!(
-            status,
-            OperationStatus::Success,
+        assert!(status,
             "sec key {:?} not found",
             sec_byte
         );
@@ -2202,8 +2136,8 @@ fn sec_multi_key_creator_multiple_keys_per_record() {
     let mut pk_out = DatabaseEntry::new();
     let mut data_out = DatabaseEntry::new();
     let status =
-        secondary.get(None, &sec_key_c, &mut pk_out, &mut data_out).unwrap();
-    assert_eq!(status, OperationStatus::NotFound);
+        secondary.get_into(None, &sec_key_c, &mut pk_out, &mut data_out).unwrap();
+    assert!(!status);
 }
 
 /// auto-populate: opening secondary with allow_populate=true on an existing
@@ -2237,10 +2171,8 @@ fn sec_auto_populate_on_open() {
         primary
             .lock()
             .put(
-                None,
                 &DatabaseEntry::from_bytes(k),
-                &DatabaseEntry::from_bytes(v),
-            )
+                &DatabaseEntry::from_bytes(v))
             .unwrap();
     }
 
@@ -2270,10 +2202,8 @@ fn sec_auto_populate_on_open() {
         let sec_key = DatabaseEntry::from_bytes(sec_b);
         let mut pk = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
-        let status = secondary.get(None, &sec_key, &mut pk, &mut data).unwrap();
-        assert_eq!(
-            status,
-            OperationStatus::Success,
+        let status = secondary.get_into(None, &sec_key, &mut pk, &mut data).unwrap();
+        assert!(status,
             "sec key {:?} missing after auto-populate",
             sec_b
         );
@@ -2355,7 +2285,7 @@ fn sec_num_recs_put_get_round_trip() {
 
         let pk = DatabaseEntry::from_bytes(&pri_key_bytes);
         let pv = DatabaseEntry::from_bytes(&data_bytes);
-        primary.lock().put(None, &pk, &pv).unwrap();
+        primary.lock().put( &pk, &pv).unwrap();
         // Auto-hook maintains secondary.
     }
 
@@ -2366,8 +2296,8 @@ fn sec_num_recs_put_get_round_trip() {
         let mut p_key = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
         let status =
-            secondary.get(None, &sec_key, &mut p_key, &mut data).unwrap();
-        assert_eq!(status, OperationStatus::Success, "i={i}: sec get failed");
+            secondary.get_into(None, &sec_key, &mut p_key, &mut data).unwrap();
+        assert!(status, "i={i}: sec get failed");
         // Primary key should be i
         assert_eq!(
             p_key.get_data().unwrap(),
@@ -2381,17 +2311,15 @@ fn sec_num_recs_put_get_round_trip() {
     let mut pk_out = DatabaseEntry::new();
     let mut data_out = DatabaseEntry::new();
     let status = secondary
-        .get(
-            None,
+        .get_into(None,
             &DatabaseEntry::from_bytes(&missing_sec),
             &mut pk_out,
-            &mut data_out,
-        )
+            &mut data_out)
         .unwrap();
-    assert_eq!(status, OperationStatus::NotFound);
+    assert!(!status);
 
     // SecondaryCursor First/Next scan: collect all in order.
-    let mut cursor = secondary.open_cursor(None, None).unwrap();
+    let mut cursor = secondary.open_cursor( None).unwrap();
     let mut sk = DatabaseEntry::new();
     let mut pk = DatabaseEntry::new();
     let mut d = DatabaseEntry::new();
@@ -2399,7 +2327,7 @@ fn sec_num_recs_put_get_round_trip() {
     let mut count = 0u32;
     let mut prev_sec_key: Option<u32> = None;
     let mut status = cursor.get_first(&mut sk, &mut pk, &mut d).unwrap();
-    while status == OperationStatus::Success {
+    while status {
         let sk_val =
             u32::from_be_bytes(sk.get_data().unwrap().try_into().unwrap());
         let pk_val =
@@ -2423,7 +2351,7 @@ fn sec_num_recs_put_get_round_trip() {
     let mut count_rev = 0u32;
     let mut prev_sk_val: Option<u32> = None;
     let mut status = cursor.get_last(&mut sk, &mut pk, &mut d).unwrap();
-    while status == OperationStatus::Success {
+    while status {
         let sk_val =
             u32::from_be_bytes(sk.get_data().unwrap().try_into().unwrap());
         if let Some(prev) = prev_sk_val {
@@ -2462,7 +2390,7 @@ fn sec_num_recs_put_get_round_trip() {
             &mut DatabaseEntry::new(),
         )
         .unwrap();
-    assert_eq!(status, OperationStatus::NotFound);
+    assert!(!status);
 
     cursor.close().unwrap();
 }
@@ -2489,14 +2417,12 @@ fn cursor_search_simple_exact_match() {
 
     for (k, v) in pairs {
         db.put(
-            None,
             &DatabaseEntry::from_bytes(k),
-            &DatabaseEntry::from_bytes(v),
-        )
+            &DatabaseEntry::from_bytes(v))
         .unwrap();
     }
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor( None).unwrap();
     for (k, v) in pairs {
         let mut key = DatabaseEntry::from_bytes(k);
         let mut data = DatabaseEntry::new();
@@ -2526,14 +2452,12 @@ fn cursor_search_after_delete_returns_not_found() {
 
     for (k, v) in pairs {
         db.put(
-            None,
             &DatabaseEntry::from_bytes(k),
-            &DatabaseEntry::from_bytes(v),
-        )
+            &DatabaseEntry::from_bytes(v))
         .unwrap();
     }
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor( None).unwrap();
 
     for (k, _v) in pairs {
         // Search must succeed before deletion.
@@ -2580,14 +2504,12 @@ fn cursor_search_large_tree_exact_match() {
         let key_bytes = format!("{:08}", i).into_bytes();
         let val_bytes = i.to_be_bytes().to_vec();
         db.put(
-            None,
             &DatabaseEntry::from_vec(key_bytes),
-            &DatabaseEntry::from_vec(val_bytes),
-        )
+            &DatabaseEntry::from_vec(val_bytes))
         .unwrap();
     }
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor( None).unwrap();
     for i in 0..N_KEYS {
         let key_bytes = format!("{:08}", i).into_bytes();
         let expected_val = i.to_be_bytes().to_vec();
@@ -2627,14 +2549,12 @@ fn cursor_search_large_tree_delete_and_search() {
         let key_bytes = format!("{:08}", i).into_bytes();
         let val_bytes = i.to_be_bytes().to_vec();
         db.put(
-            None,
             &DatabaseEntry::from_vec(key_bytes),
-            &DatabaseEntry::from_vec(val_bytes),
-        )
+            &DatabaseEntry::from_vec(val_bytes))
         .unwrap();
     }
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor( None).unwrap();
 
     for i in 0..N_KEYS {
         let key_bytes = format!("{:08}", i).into_bytes();
@@ -2677,14 +2597,12 @@ fn cursor_search_range_finds_first_gte_key() {
 
     for k in [b"a".as_ref(), b"c", b"e", b"g"] {
         db.put(
-            None,
             &DatabaseEntry::from_bytes(k),
-            &DatabaseEntry::from_bytes(b"val"),
-        )
+            &DatabaseEntry::from_bytes(b"val"))
         .unwrap();
     }
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor( None).unwrap();
 
     // Exact match: SearchRange on "a" must find "a".
     let mut key = DatabaseEntry::from_bytes(b"a");
@@ -2727,7 +2645,7 @@ fn cursor_search_empty_database_returns_not_found() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open_env_and_db(&dir);
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor( None).unwrap();
     let mut key = DatabaseEntry::from_bytes(b"anything");
     let mut data = DatabaseEntry::new();
 
@@ -2747,7 +2665,7 @@ fn cursor_search_range_empty_database_returns_not_found() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open_env_and_db(&dir);
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor( None).unwrap();
     let mut key = DatabaseEntry::from_bytes(b"anything");
     let mut data = DatabaseEntry::new();
 
@@ -2777,16 +2695,14 @@ fn cursor_search_after_tree_splits_all_keys_findable() {
         let key_bytes = i.to_be_bytes().to_vec();
         let val_bytes = (i * 2).to_be_bytes().to_vec();
         db.put(
-            None,
             &DatabaseEntry::from_vec(key_bytes),
-            &DatabaseEntry::from_vec(val_bytes),
-        )
+            &DatabaseEntry::from_vec(val_bytes))
         .unwrap();
     }
 
     assert_eq!(db.count().unwrap(), N as u64);
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor( None).unwrap();
 
     for i in 0..N {
         let key_bytes = i.to_be_bytes().to_vec();
@@ -2831,7 +2747,7 @@ fn recovery_committed_records_survive_reopen() {
         for i in 0..N {
             let k = DatabaseEntry::from_vec(i.to_be_bytes().to_vec());
             let v = DatabaseEntry::from_vec((i * 3 + 7).to_be_bytes().to_vec());
-            db.put(None, &k, &v).unwrap();
+            db.put( &k, &v).unwrap();
         }
         drop(db);
         drop(env);
@@ -2848,10 +2764,8 @@ fn recovery_committed_records_survive_reopen() {
         for i in 0..N {
             let k = DatabaseEntry::from_vec(i.to_be_bytes().to_vec());
             let mut v = DatabaseEntry::new();
-            let status = db.get(None, &k, &mut v).unwrap();
-            assert_eq!(
-                status,
-                OperationStatus::Success,
+            let status = db.get_into(None, &k, &mut v).unwrap();
+            assert!(status,
                 "key {} must be present after recovery",
                 i
             );
@@ -2898,7 +2812,7 @@ fn recovery_concurrent_writes_all_survive_reopen() {
                         let v = DatabaseEntry::from_vec(
                             global_key.to_be_bytes().to_vec(),
                         );
-                        db.put(None, &k, &v).unwrap();
+                        db.put( &k, &v).unwrap();
                     }
                 })
             })
@@ -2941,10 +2855,8 @@ fn recovery_concurrent_writes_all_survive_reopen() {
         for global_key in 0..total {
             let k = DatabaseEntry::from_vec(global_key.to_be_bytes().to_vec());
             let mut v = DatabaseEntry::new();
-            let status = db.get(None, &k, &mut v).unwrap();
-            assert_eq!(
-                status,
-                OperationStatus::Success,
+            let status = db.get_into(None, &k, &mut v).unwrap();
+            assert!(status,
                 "key {} (from thread {}) must be present after recovery",
                 global_key,
                 global_key / PER_THREAD
@@ -2979,7 +2891,7 @@ fn recovery_uncommitted_transactions_are_undone_on_reopen() {
         for i in 0..N_COMMITTED {
             let k = DatabaseEntry::from_vec(i.to_be_bytes().to_vec());
             let v = DatabaseEntry::from_vec(b"committed".to_vec());
-            db.put(None, &k, &v).unwrap();
+            db.put( &k, &v).unwrap();
         }
 
         // Uncommitted writes: start a txn, write M records, then abort.
@@ -2987,7 +2899,7 @@ fn recovery_uncommitted_transactions_are_undone_on_reopen() {
         for i in N_COMMITTED..N_COMMITTED + M_UNCOMMITTED {
             let k = DatabaseEntry::from_vec(i.to_be_bytes().to_vec());
             let v = DatabaseEntry::from_vec(b"uncommitted".to_vec());
-            db.put(Some(&txn), &k, &v).unwrap();
+            db.put_in(&txn, &k, &v).unwrap();
         }
         txn.abort().unwrap(); // Explicitly abort — simulates crash scenario.
 
@@ -3010,9 +2922,7 @@ fn recovery_uncommitted_transactions_are_undone_on_reopen() {
         for i in 0..N_COMMITTED {
             let k = DatabaseEntry::from_vec(i.to_be_bytes().to_vec());
             let mut v = DatabaseEntry::new();
-            assert_eq!(
-                db.get(None, &k, &mut v).unwrap(),
-                OperationStatus::Success,
+            assert!(db.get_into(None, &k, &mut v).unwrap(),
                 "committed key {} must be present",
                 i
             );
@@ -3022,9 +2932,7 @@ fn recovery_uncommitted_transactions_are_undone_on_reopen() {
         for i in N_COMMITTED..N_COMMITTED + M_UNCOMMITTED {
             let k = DatabaseEntry::from_vec(i.to_be_bytes().to_vec());
             let mut v = DatabaseEntry::new();
-            assert_eq!(
-                db.get(None, &k, &mut v).unwrap(),
-                OperationStatus::NotFound,
+            assert!(!(db.get_into(None, &k, &mut v).unwrap()),
                 "aborted key {} must NOT be present after recovery",
                 i
             );
@@ -3058,8 +2966,8 @@ fn recovery_multi_db_both_databases_survive_reopen() {
             let k = DatabaseEntry::from_vec(i.to_be_bytes().to_vec());
             let v_alpha = DatabaseEntry::from_vec(b"alpha".to_vec());
             let v_beta = DatabaseEntry::from_vec(b"beta".to_vec());
-            db_alpha.put(None, &k, &v_alpha).unwrap();
-            db_beta.put(None, &k, &v_beta).unwrap();
+            db_alpha.put( &k, &v_alpha).unwrap();
+            db_beta.put( &k, &v_beta).unwrap();
         }
 
         drop(db_alpha);
@@ -3085,17 +2993,13 @@ fn recovery_multi_db_both_databases_survive_reopen() {
             let k = DatabaseEntry::from_vec(i.to_be_bytes().to_vec());
             let mut v = DatabaseEntry::new();
 
-            assert_eq!(
-                db_alpha.get(None, &k, &mut v).unwrap(),
-                OperationStatus::Success,
+            assert!(db_alpha.get_into(None, &k, &mut v).unwrap(),
                 "alpha: key {} missing after recovery",
                 i
             );
             assert_eq!(v.data(), b"alpha", "alpha: key {} has wrong value", i);
 
-            assert_eq!(
-                db_beta.get(None, &k, &mut v).unwrap(),
-                OperationStatus::Success,
+            assert!(db_beta.get_into(None, &k, &mut v).unwrap(),
                 "beta: key {} missing after recovery",
                 i
             );
@@ -3131,11 +3035,11 @@ fn utilization_tracker_write_path_produces_log_entries_on_disk() {
     for i in 0u8..20 {
         let k = DatabaseEntry::from_vec(vec![i]);
         let v = DatabaseEntry::from_vec(b"payload".to_vec());
-        db.put(None, &k, &v).unwrap();
+        db.put( &k, &v).unwrap();
     }
     for i in 0u8..10 {
         let k = DatabaseEntry::from_vec(vec![i]);
-        db.delete(None, &k).unwrap();
+        db.delete( &k).unwrap();
     }
 
     // Force the write buffer to disk before inspecting the directory.

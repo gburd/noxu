@@ -47,11 +47,11 @@ proptest! {
         let key_entry = DatabaseEntry::from_data(&key);
         let val_entry = DatabaseEntry::from_data(&value);
 
-        let status = db.put(None, &key_entry, &val_entry).unwrap();
+        let status = db.put( &key_entry, &val_entry).unwrap();
         prop_assert_eq!(status, OperationStatus::Success);
 
         let mut retrieved = DatabaseEntry::new();
-        let status = db.get(None, &key_entry, &mut retrieved).unwrap();
+        let status = db.get_into(None, &key_entry, &mut retrieved).unwrap();
         prop_assert_eq!(status, OperationStatus::Success);
         prop_assert_eq!(retrieved.data(), value.as_slice());
     }
@@ -64,14 +64,14 @@ proptest! {
         let key_entry = DatabaseEntry::from_data(&key);
         let val_entry = DatabaseEntry::from_data(&value);
 
-        db.put(None, &key_entry, &val_entry).unwrap();
+        db.put( &key_entry, &val_entry).unwrap();
 
-        let status = db.delete(None, &key_entry).unwrap();
-        prop_assert_eq!(status, OperationStatus::Success);
+        let status = db.delete( &key_entry).unwrap();
+        prop_assert!(status);
 
         let mut retrieved = DatabaseEntry::new();
-        let status = db.get(None, &key_entry, &mut retrieved).unwrap();
-        prop_assert_eq!(status, OperationStatus::NotFound);
+        let status = db.get_into(None, &key_entry, &mut retrieved).unwrap();
+        prop_assert!(!status);
     }
 
     // 5. Multiple puts: last put wins  -  put(key, v1), put(key, v2), get(key) returns v2.
@@ -83,12 +83,12 @@ proptest! {
         let val1_entry = DatabaseEntry::from_data(&v1);
         let val2_entry = DatabaseEntry::from_data(&v2);
 
-        db.put(None, &key_entry, &val1_entry).unwrap();
-        db.put(None, &key_entry, &val2_entry).unwrap();
+        db.put( &key_entry, &val1_entry).unwrap();
+        db.put( &key_entry, &val2_entry).unwrap();
 
         let mut retrieved = DatabaseEntry::new();
-        let status = db.get(None, &key_entry, &mut retrieved).unwrap();
-        prop_assert_eq!(status, OperationStatus::Success);
+        let status = db.get_into(None, &key_entry, &mut retrieved).unwrap();
+        prop_assert!(status);
         prop_assert_eq!(retrieved.data(), v2.as_slice());
     }
 }
@@ -148,7 +148,7 @@ proptest! {
                 CrudOp::Put { key, value } => {
                     let key_e = DatabaseEntry::from_data(&key);
                     let val_e = DatabaseEntry::from_data(&value);
-                    let status = db.put(None, &key_e, &val_e).unwrap();
+                    let status = db.put( &key_e, &val_e).unwrap();
                     prop_assert_eq!(
                         status, OperationStatus::Success,
                         "step {}: put({:?}) returned {:?}", i, key, status
@@ -157,7 +157,7 @@ proptest! {
                 }
                 CrudOp::Delete { key } => {
                     let key_e = DatabaseEntry::from_data(&key);
-                    let status = db.delete(None, &key_e).unwrap();
+                    let status = db.delete( &key_e).unwrap();
                     let oracle_had = oracle.remove(&key).is_some();
                     let expected = if oracle_had {
                         OperationStatus::Success
@@ -173,7 +173,7 @@ proptest! {
                 CrudOp::Get { key } => {
                     let key_e = DatabaseEntry::from_data(&key);
                     let mut data = DatabaseEntry::new();
-                    let status = db.get(None, &key_e, &mut data).unwrap();
+                    let status = db.get_into(None, &key_e, &mut data).unwrap();
                     match (status, oracle.get(&key)) {
                         (OperationStatus::Success, Some(expected)) => {
                             prop_assert_eq!(
@@ -198,7 +198,7 @@ proptest! {
         for (k, v) in &oracle {
             let mut data = DatabaseEntry::new();
             let key_e = DatabaseEntry::from_data(k);
-            let status = db.get(None, &key_e, &mut data).unwrap();
+            let status = db.get_into(None, &key_e, &mut data).unwrap();
             prop_assert_eq!(
                 status, OperationStatus::Success,
                 "final sweep: key {:?} missing from db", k,

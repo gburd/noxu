@@ -40,7 +40,7 @@ fn ikey(i: u32) -> DatabaseEntry {
 
 fn collect_all(db: &noxu_db::Database) -> BTreeMap<Vec<u8>, Vec<Vec<u8>>> {
     let mut out: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
-    let mut c = db.open_cursor(None, None).unwrap();
+    let mut c = db.open_cursor( None).unwrap();
     let mut k = DatabaseEntry::new();
     let mut d = DatabaseEntry::new();
     let mut s = c.get(&mut k, &mut d, Get::First, None).unwrap();
@@ -78,7 +78,7 @@ fn recovery_basic_insert_delete_modify_round_trip() {
         for i in 0..NUM_RECS {
             let k = ikey(i);
             let v = format!("v-{i}").into_bytes();
-            db.put(Some(&txn), &k, &DatabaseEntry::from_bytes(&v)).unwrap();
+            db.put_in(&txn, &k, &DatabaseEntry::from_bytes(&v)).unwrap();
             expected.insert(k.get_data().unwrap().to_vec(), v);
         }
         txn.commit().unwrap();
@@ -87,7 +87,7 @@ fn recovery_basic_insert_delete_modify_round_trip() {
         let txn = env.begin_transaction(None).unwrap();
         for i in (0..NUM_RECS).step_by(2) {
             let k = ikey(i);
-            db.delete(Some(&txn), &k).unwrap();
+            db.delete_in(&txn, &k).unwrap();
             expected.remove(k.get_data().unwrap());
         }
         txn.commit().unwrap();
@@ -98,7 +98,7 @@ fn recovery_basic_insert_delete_modify_round_trip() {
         for i in keys {
             let k = ikey(i);
             let v = format!("MOD-{i}").into_bytes();
-            db.put(Some(&txn), &k, &DatabaseEntry::from_bytes(&v)).unwrap();
+            db.put_in(&txn, &k, &DatabaseEntry::from_bytes(&v)).unwrap();
             expected.insert(k.get_data().unwrap().to_vec(), v);
         }
         txn.commit().unwrap();
@@ -113,10 +113,8 @@ fn recovery_basic_insert_delete_modify_round_trip() {
 
     for (k, v) in &expected {
         let mut out = DatabaseEntry::new();
-        let s = db.get(None, &DatabaseEntry::from_bytes(k), &mut out).unwrap();
-        assert_eq!(
-            s,
-            OperationStatus::Success,
+        let s = db.get_into(None, &DatabaseEntry::from_bytes(k), &mut out).unwrap();
+        assert!(s,
             "key {:?} missing after recovery",
             k
         );
@@ -161,11 +159,11 @@ fn recovery_duplicate_overwrite_dedups_exact() {
         let d3 = DatabaseEntry::from_bytes(b"ffffffffff");
 
         let txn = env.begin_transaction(None).unwrap();
-        db.put(Some(&txn), &key, &d1).unwrap();
-        db.put(Some(&txn), &key, &d2).unwrap();
-        db.put(Some(&txn), &key, &d3).unwrap();
+        db.put_in(&txn, &key, &d1).unwrap();
+        db.put_in(&txn, &key, &d2).unwrap();
+        db.put_in(&txn, &key, &d3).unwrap();
         // Repeat d3 — JE: idempotent, no extra dup.
-        db.put(Some(&txn), &key, &d3).unwrap();
+        db.put_in(&txn, &key, &d3).unwrap();
         txn.commit().unwrap();
         drop(db);
         drop(env);
@@ -218,8 +216,8 @@ fn run_sr8984(same_key: bool) {
         let d1 = DatabaseEntry::from_bytes(b"d1");
 
         // Initial insert + delete.
-        db.put(None, &key, &d1).unwrap();
-        db.delete(None, &key).unwrap();
+        db.put( &key, &d1).unwrap();
+        db.delete( &key).unwrap();
 
         // Re-insert: same data (Part 1) or fresh data (Part 2).
         let first_data = if same_key {
@@ -227,10 +225,10 @@ fn run_sr8984(same_key: bool) {
         } else {
             DatabaseEntry::from_bytes(b"d2")
         };
-        db.put(None, &key, &first_data).unwrap();
+        db.put( &key, &first_data).unwrap();
         for i in 3..NUM_EXTRA_DUPS {
             let v = format!("d{i}").into_bytes();
-            db.put(None, &key, &DatabaseEntry::from_bytes(&v)).unwrap();
+            db.put( &key, &DatabaseEntry::from_bytes(&v)).unwrap();
         }
 
         pre_close_count = db.count().unwrap();
@@ -251,7 +249,7 @@ fn run_sr8984(same_key: bool) {
     // when same_key=false, only the post-delete inserts (d2, d3..d149)
     // should be present — and exactly NUM_EXTRA_DUPS - 2 entries (the
     // count JE asserted).
-    let mut c = db.open_cursor(None, None).unwrap();
+    let mut c = db.open_cursor( None).unwrap();
     let mut k = DatabaseEntry::new();
     let mut d = DatabaseEntry::new();
     let s = c.get(&mut k, &mut d, Get::First, None).unwrap();
@@ -301,14 +299,14 @@ fn recovery_abort_test_inserts_three_phase_no_dups() {
         let db = open_db(&env, "abort_inserts", false);
         let t = env.begin_transaction(None).unwrap();
         for i in 0..n {
-            db.put(Some(&t), &ikey(i), &ikey(i)).unwrap();
+            db.put_in(&t, &ikey(i), &ikey(i)).unwrap();
         }
         t.commit().unwrap();
 
         // Phase 2: insert N..3N, abort.
         let t = env.begin_transaction(None).unwrap();
         for i in n..(3 * n) {
-            db.put(Some(&t), &ikey(i), &ikey(i)).unwrap();
+            db.put_in(&t, &ikey(i), &ikey(i)).unwrap();
         }
         t.abort().unwrap();
 
@@ -323,10 +321,8 @@ fn recovery_abort_test_inserts_three_phase_no_dups() {
         // Verify aborted inserts are gone.
         for i in n..(3 * n) {
             let mut out = DatabaseEntry::new();
-            let s = db.get(None, &ikey(i), &mut out).unwrap();
-            assert_eq!(
-                s,
-                OperationStatus::NotFound,
+            let s = db.get_into(None, &ikey(i), &mut out).unwrap();
+            assert!(!s,
                 "aborted insert k={i} resurrected before recovery"
             );
         }
@@ -335,7 +331,7 @@ fn recovery_abort_test_inserts_three_phase_no_dups() {
         // aborted phase to exercise slot reuse).
         let t = env.begin_transaction(None).unwrap();
         for i in (2 * n)..(4 * n) {
-            db.put(Some(&t), &ikey(i), &ikey(i)).unwrap();
+            db.put_in(&t, &ikey(i), &ikey(i)).unwrap();
         }
         t.commit().unwrap();
 
@@ -350,29 +346,23 @@ fn recovery_abort_test_inserts_three_phase_no_dups() {
 
         for i in 0..n {
             let mut out = DatabaseEntry::new();
-            let s = db.get(None, &ikey(i), &mut out).unwrap();
-            assert_eq!(
-                s,
-                OperationStatus::Success,
+            let s = db.get_into(None, &ikey(i), &mut out).unwrap();
+            assert!(s,
                 "k={i} missing post-recovery"
             );
         }
         // Aborted-only range (N..2N) must be absent.
         for i in n..(2 * n) {
             let mut out = DatabaseEntry::new();
-            let s = db.get(None, &ikey(i), &mut out).unwrap();
-            assert_eq!(
-                s,
-                OperationStatus::NotFound,
+            let s = db.get_into(None, &ikey(i), &mut out).unwrap();
+            assert!(!s,
                 "aborted-only k={i} resurrected after recovery"
             );
         }
         for i in (2 * n)..(4 * n) {
             let mut out = DatabaseEntry::new();
-            let s = db.get(None, &ikey(i), &mut out).unwrap();
-            assert_eq!(
-                s,
-                OperationStatus::Success,
+            let s = db.get_into(None, &ikey(i), &mut out).unwrap();
+            assert!(s,
                 "k={i} missing post-recovery"
             );
         }
@@ -402,22 +392,22 @@ fn recovery_basic_delete_all_no_resurrect() {
         // Insert all the data, commit.
         let t = env.begin_transaction(None).unwrap();
         for i in 0..n {
-            db.put(Some(&t), &ikey(i), &ikey(i)).unwrap();
+            db.put_in(&t, &ikey(i), &ikey(i)).unwrap();
         }
         t.commit().unwrap();
 
         // Modify half the records (overwrite), commit.
         let t = env.begin_transaction(None).unwrap();
         for i in 0..(n / 2) {
-            db.put(Some(&t), &ikey(i), &ikey(i + 1000)).unwrap();
+            db.put_in(&t, &ikey(i), &ikey(i + 1000)).unwrap();
         }
         t.commit().unwrap();
 
         // Delete all the records, commit.
         let t = env.begin_transaction(None).unwrap();
         for i in 0..n {
-            let s = db.delete(Some(&t), &ikey(i)).unwrap();
-            assert_eq!(s, OperationStatus::Success);
+            let s = db.delete_in(&t, &ikey(i)).unwrap();
+            assert!(s);
         }
         t.commit().unwrap();
 
@@ -432,10 +422,8 @@ fn recovery_basic_delete_all_no_resurrect() {
         assert_eq!(0, db.count().unwrap());
         for i in 0..n {
             let mut out = DatabaseEntry::new();
-            let s = db.get(None, &ikey(i), &mut out).unwrap();
-            assert_eq!(
-                s,
-                OperationStatus::NotFound,
+            let s = db.get_into(None, &ikey(i), &mut out).unwrap();
+            assert!(!s,
                 "deleted k={i} resurrected after recovery"
             );
         }
@@ -504,10 +492,8 @@ fn recovery_edge_test_non_txnal_db() {
             .with_transactional(false);
         let db_a = env.open_database(None, "NotTxnal", &db_cfg).unwrap();
         db_a.put(
-            None,
             &DatabaseEntry::from_bytes(b"foo"),
-            &DatabaseEntry::from_bytes(b"bar"),
-        )
+            &DatabaseEntry::from_bytes(b"bar"))
         .unwrap();
         db_a.close().unwrap();
         drop(env);
@@ -534,10 +520,8 @@ fn recovery_edge_test_non_txnal_db() {
             .with_transactional(true);
         let db_b = env.open_database(None, "Txnal", &db_cfg_txn).unwrap();
         db_b.put(
-            None,
             &DatabaseEntry::from_bytes(b"foo"),
-            &DatabaseEntry::from_bytes(b"bar"),
-        )
+            &DatabaseEntry::from_bytes(b"bar"))
         .unwrap();
         db_b.close().unwrap();
         drop(env);
@@ -591,7 +575,7 @@ fn recovery_duplicates_round_trip_across_clean_close() {
                 let kbytes = k.get_data().unwrap().to_vec();
                 for j in 0..N_DUPS {
                     let dv = (i * 1000 + j).to_be_bytes().to_vec();
-                    db.put(Some(&txn), &k, &DatabaseEntry::from_bytes(&dv))
+                    db.put_in(&txn, &k, &DatabaseEntry::from_bytes(&dv))
                         .unwrap();
                     expected.entry((d, kbytes.clone())).or_default().push(dv);
                 }
@@ -648,7 +632,7 @@ fn recovery_duplicates_with_deletion_survives_recovery() {
             let k = ikey(i);
             for j in 0..N_DUPS {
                 let dv = (i * 1000 + j).to_be_bytes().to_vec();
-                db.put(Some(&txn), &k, &DatabaseEntry::from_bytes(&dv))
+                db.put_in(&txn, &k, &DatabaseEntry::from_bytes(&dv))
                     .unwrap();
                 if i % 2 != 0 {
                     expected
@@ -660,7 +644,7 @@ fn recovery_duplicates_with_deletion_survives_recovery() {
         }
         // Delete all even-numbered keys.
         for i in (0..N_RECS).step_by(2) {
-            db.delete(Some(&txn), &ikey(i)).unwrap();
+            db.delete_in(&txn, &ikey(i)).unwrap();
         }
         txn.commit().unwrap();
         drop(db);
@@ -704,7 +688,7 @@ fn recovery_empty_checkpoint_round_trip() {
     let env = open_env(&path);
     let db = open_db(&env, "empty_ckpt", false);
     let txn = env.begin_transaction(None).unwrap();
-    let mut c = db.open_cursor(Some(&txn), None).unwrap();
+    let mut c = db.open_cursor_in(&txn, None).unwrap();
     let mut k = DatabaseEntry::new();
     let mut d = DatabaseEntry::new();
     let s = c.get(&mut k, &mut d, Get::First, None).unwrap();
@@ -733,13 +717,13 @@ fn recovery_delete_all_then_recovery_empties_db() {
         let db = open_db(&env, "del_all", false);
         let txn = env.begin_transaction(None).unwrap();
         for i in 0..N {
-            db.put(Some(&txn), &ikey(i), &DatabaseEntry::from_bytes(b"v"))
+            db.put_in(&txn, &ikey(i), &DatabaseEntry::from_bytes(b"v"))
                 .unwrap();
         }
         txn.commit().unwrap();
         let txn = env.begin_transaction(None).unwrap();
         for i in 0..N {
-            db.delete(Some(&txn), &ikey(i)).unwrap();
+            db.delete_in(&txn, &ikey(i)).unwrap();
         }
         txn.commit().unwrap();
         drop(db);
@@ -771,7 +755,7 @@ fn recovery_edge_txn_id_continues_post_recovery() {
         let db = open_db(&env, "txn_id", false);
         for i in 0..50u32 {
             let txn = env.begin_transaction(None).unwrap();
-            db.put(Some(&txn), &ikey(i), &DatabaseEntry::from_bytes(b"pre"))
+            db.put_in(&txn, &ikey(i), &DatabaseEntry::from_bytes(b"pre"))
                 .unwrap();
             txn.commit().unwrap();
         }
@@ -783,7 +767,7 @@ fn recovery_edge_txn_id_continues_post_recovery() {
     let db = open_db(&env, "txn_id", false);
     for i in 50..100u32 {
         let txn = env.begin_transaction(None).unwrap();
-        db.put(Some(&txn), &ikey(i), &DatabaseEntry::from_bytes(b"post"))
+        db.put_in(&txn, &ikey(i), &DatabaseEntry::from_bytes(b"post"))
             .unwrap();
         txn.commit().unwrap();
     }
@@ -792,8 +776,8 @@ fn recovery_edge_txn_id_continues_post_recovery() {
     let txn = env.begin_transaction(None).unwrap();
     for i in 0..50u32 {
         let mut out = DatabaseEntry::new();
-        let s = db.get(Some(&txn), &ikey(i), &mut out).unwrap();
-        assert_eq!(s, OperationStatus::Success);
+        let s = db.get_into(Some(&txn), &ikey(i), &mut out).unwrap();
+        assert!(s);
         assert_eq!(out.get_data().unwrap(), b"pre");
     }
     txn.commit().unwrap();

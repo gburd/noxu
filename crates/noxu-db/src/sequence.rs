@@ -139,9 +139,8 @@ impl<'db> Sequence<'db> {
         let key_entry = DatabaseEntry::from_bytes(&key_bytes);
 
         // ── try to read an existing record ────────────────────────────────
-        let mut data_entry = DatabaseEntry::new();
-        let found = db.get(None, &key_entry, &mut data_entry)?
-            == OperationStatus::Success;
+        let existing = db.get(key_entry.data())?;
+        let found = existing.is_some();
 
         if found {
             if config.allow_create && config.exclusive_create {
@@ -151,7 +150,9 @@ impl<'db> Sequence<'db> {
                 ));
             }
             // Decode the existing record.
-            let rec = Self::decode_record(data_entry.data())?;
+            let rec = Self::decode_record(
+                existing.as_ref().expect("invariant: found implies Some"),
+            )?;
             let cache_size = config.cache_size;
             let (cache_value, cache_last) = Self::init_cache(&rec, cache_size);
             return Ok(Sequence {
@@ -194,16 +195,17 @@ impl<'db> Sequence<'db> {
         let data_entry = DatabaseEntry::from_bytes(&encoded);
 
         // putNoOverwrite so a concurrent creator wins and we just read theirs.
-        let status = db.put_no_overwrite(None, &key_entry, &data_entry)?;
-        let final_rec = if status == OperationStatus::KeyExists {
+        let inserted = db.put_no_overwrite(key_entry.data(), data_entry.data())?;
+        let final_rec = if !inserted {
             // Lost the race — read the winner's record.
-            let mut d = DatabaseEntry::new();
-            if db.get(None, &key_entry, &mut d)? != OperationStatus::Success {
-                return Err(NoxuError::IllegalArgument(
-                    "Sequence record removed during open_sequence.".into(),
-                ));
+            match db.get(key_entry.data())? {
+                Some(d) => Self::decode_record(&d)?,
+                None => {
+                    return Err(NoxuError::IllegalArgument(
+                        "Sequence record removed during open_sequence.".into(),
+                    ));
+                }
             }
-            Self::decode_record(d.data())?
         } else {
             rec
         };
@@ -416,9 +418,10 @@ impl<'db> Sequence<'db> {
                 stored_value: state.stored_value,
             };
             let encoded = Self::encode_record(&rec);
-            let key_entry = DatabaseEntry::from_bytes(&self.key);
-            let data_entry = DatabaseEntry::from_bytes(&encoded);
-            self.db.put(txn, &key_entry, &data_entry)?;
+            match txn {
+                Some(t) => self.db.put_in(t, &self.key, &encoded)?,
+                None => self.db.put(&self.key, &encoded)?,
+            }
 
             // Update the local cache window using batch_start (pre-advance).
             // cache_value = batch_start (first value to hand out)

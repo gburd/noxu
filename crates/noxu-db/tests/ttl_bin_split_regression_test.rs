@@ -92,13 +92,7 @@ fn test_ttl_records_survive_bin_split_right_sibling_256() {
     for k in 0u8..=255u8 {
         let key = DatabaseEntry::from_bytes(&[k]);
         let val = DatabaseEntry::from_bytes(&[k, k]);
-        let st = db.put_with_options(None, &key, &val, &ttl_opts).unwrap();
-        assert_eq!(
-            st,
-            OperationStatus::Success,
-            "put key {:02x} should succeed",
-            k
-        );
+        db.put_with_options(None, &key, &val, &ttl_opts).unwrap();
     }
 
     // Insert the split-trigger key [0x7f, 0xff].
@@ -115,25 +109,23 @@ fn test_ttl_records_survive_bin_split_right_sibling_256() {
     // the left BIN only.  The right sibling retains expiration_in_hours = false.
     let trigger_key = DatabaseEntry::from_bytes(b"\x7f\xff");
     let trigger_val = DatabaseEntry::from_bytes(b"trigger");
-    let st = db
-        .put_with_options(None, &trigger_key, &trigger_val, &ttl_opts)
+    db.put_with_options(None, &trigger_key, &trigger_val, &ttl_opts)
         .unwrap();
-    assert_eq!(st, OperationStatus::Success, "trigger insert should succeed");
 
     // Check right-sibling keys — these fail pre-fix.
     let mut missing: Vec<u8> = Vec::new();
     for k in 0u8..=255u8 {
         let key = DatabaseEntry::from_bytes(&[k]);
         let mut out = DatabaseEntry::new();
-        match db.get(None, &key, &mut out).unwrap() {
-            OperationStatus::Success => {
+        match db.get_into(None, &key, &mut out).unwrap() {
+            true => {
                 assert_eq!(
                     out.data(),
                     &[k, k],
                     "get({k:02x}) returned wrong value"
                 );
             }
-            OperationStatus::NotFound => {
+            false => {
                 missing.push(k);
             }
             st => panic!("get({k:02x}) returned unexpected status {st:?}"),
@@ -143,7 +135,7 @@ fn test_ttl_records_survive_bin_split_right_sibling_256() {
     {
         let key = DatabaseEntry::from_bytes(b"\x7f\xff");
         let mut out = DatabaseEntry::new();
-        if db.get(None, &key, &mut out).unwrap() != OperationStatus::Success {
+        if !(db.get_into(None, &key, &mut out).unwrap()) {
             panic!("trigger key [0x7f, 0xff] is missing after split");
         }
     }
@@ -199,9 +191,9 @@ fn test_ttl_and_no_ttl_keys_both_survive_bin_split() {
     for k in 0u8..=255u8 {
         let key = DatabaseEntry::from_bytes(&[k]);
         let mut out = DatabaseEntry::new();
-        match db.get(None, &key, &mut out).unwrap() {
-            OperationStatus::Success => {}
-            OperationStatus::NotFound => missing.push(k),
+        match db.get_into(None, &key, &mut out).unwrap() {
+            true => {}
+            false => missing.push(k),
             st => panic!("unexpected status {st:?} for key {k:02x}"),
         }
     }
@@ -283,8 +275,8 @@ fn test_ttl_records_survive_close_and_reopen() {
         for k in 0u8..=255u8 {
             let key = DatabaseEntry::from_bytes(&[k]);
             let mut out = DatabaseEntry::new();
-            match db.get(None, &key, &mut out).unwrap() {
-                OperationStatus::Success => {
+            match db.get_into(None, &key, &mut out).unwrap() {
+                true => {
                     assert_eq!(
                         out.data(),
                         &[k],
@@ -292,7 +284,7 @@ fn test_ttl_records_survive_close_and_reopen() {
                         k
                     );
                 }
-                OperationStatus::NotFound => {
+                false => {
                     missing_count += 1;
                 }
                 st => panic!(

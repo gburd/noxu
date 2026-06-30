@@ -90,7 +90,7 @@ fn concurrent_commits_no_lost_writes() {
                         let val = DatabaseEntry::from_vec(
                             format!("v{tid:02}_{k:04}").into_bytes(),
                         );
-                        db.put(Some(&txn), &key, &val).unwrap();
+                        db.put_in(&txn, &key, &val).unwrap();
                         txn.commit().unwrap();
                     }
                 })
@@ -109,8 +109,8 @@ fn concurrent_commits_no_lost_writes() {
                     format!("t{tid:02}_k{k:04}").into_bytes(),
                 );
                 let mut out = DatabaseEntry::new();
-                let status = db.get(None, &key, &mut out).unwrap();
-                if status != OperationStatus::Success {
+                let status = db.get_into(None, &key, &mut out).unwrap();
+                if !status {
                     missing.push((tid, k));
                 }
             }
@@ -154,7 +154,7 @@ fn concurrent_commits_no_lost_writes_smoke() {
                         let val = DatabaseEntry::from_vec(
                             format!("v{tid:02}_{k:04}").into_bytes(),
                         );
-                        db.put(Some(&txn), &key, &val).unwrap();
+                        db.put_in(&txn, &key, &val).unwrap();
                         txn.commit().unwrap();
                     }
                 })
@@ -170,8 +170,8 @@ fn concurrent_commits_no_lost_writes_smoke() {
                     format!("t{tid:02}_k{k:04}").into_bytes(),
                 );
                 let mut out = DatabaseEntry::new();
-                let status = db.get(None, &key, &mut out).unwrap();
-                if status != OperationStatus::Success {
+                let status = db.get_into(None, &key, &mut out).unwrap();
+                if !status {
                     missing.push((tid, k));
                 }
             }

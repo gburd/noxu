@@ -144,9 +144,8 @@ impl<'a> JoinCursor<'a> {
             };
 
             // Fetch primary record.
-            let pri_key_entry = DatabaseEntry::from_bytes(&candidate);
-            let status = self.primary_db.get(None, &pri_key_entry, data)?;
-            if status != OperationStatus::Success {
+            let found = self.primary_db.get_into(None, &candidate, data)?;
+            if !found {
                 // Primary was concurrently deleted (read-uncommitted path); skip.
                 continue;
             }

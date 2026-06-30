@@ -47,7 +47,7 @@ fn eviction_bounds_cache_and_preserves_data() {
     for i in 0..n {
         let k = DatabaseEntry::from_vec(format!("{:010}", i).into_bytes());
         let v = DatabaseEntry::from_bytes(&val);
-        db.put(None, &k, &v).unwrap();
+        db.put( &k, &v).unwrap();
     }
 
     // Run eviction explicitly (the daemon also runs, but make it deterministic).
@@ -70,10 +70,8 @@ fn eviction_bounds_cache_and_preserves_data() {
     for i in (0..n).step_by(97) {
         let k = DatabaseEntry::from_vec(format!("{:010}", i).into_bytes());
         let mut out = DatabaseEntry::new();
-        let st = db.get(None, &k, &mut out).unwrap();
-        assert_eq!(
-            st,
-            OperationStatus::Success,
+        let st = db.get_into(None, &k, &mut out).unwrap();
+        assert!(st,
             "record {} must survive eviction",
             i
         );
@@ -96,13 +94,13 @@ fn delete_heavy_does_not_inflate_cache_usage() {
             let k = DatabaseEntry::from_vec(
                 format!("r{}-{:08}", round % 2, i).into_bytes(),
             );
-            db.put(None, &k, &DatabaseEntry::from_bytes(&val)).unwrap();
+            db.put( &k, &DatabaseEntry::from_bytes(&val)).unwrap();
         }
         for i in 0..2_000usize {
             let k = DatabaseEntry::from_vec(
                 format!("r{}-{:08}", round % 2, i).into_bytes(),
             );
-            let _ = db.delete(None, &k);
+            let _ = db.delete( &k);
         }
     }
     let _ = env.evict_memory().unwrap();
@@ -130,14 +128,14 @@ fn cursor_scan_under_eviction_returns_all_data() {
     let val = vec![7u8; 80];
     for i in 0..n {
         let k = DatabaseEntry::from_vec(format!("{:010}", i).into_bytes());
-        db.put(None, &k, &DatabaseEntry::from_bytes(&val)).unwrap();
+        db.put( &k, &DatabaseEntry::from_bytes(&val)).unwrap();
     }
     let _ = env.evict_memory().unwrap();
 
     // Scan the whole database with a cursor; every record's data must be the
     // full 80-byte value, never empty (which would mean a stripped LN was not
     // re-fetched from the log on the scan path).
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor( None).unwrap();
     let mut key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
     let mut count = 0usize;

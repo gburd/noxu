@@ -60,11 +60,11 @@ fn cursor_edge_search_on_duplicates_with_deletions() {
     let db = open_db(&env, "search_on_dups_del", true);
 
     // k1/d1, k3/d1.
-    db.put(None, &key(1), &key(1)).unwrap();
-    db.put(None, &key(3), &key(1)).unwrap();
+    db.put( &key(1), &key(1)).unwrap();
+    db.put( &key(3), &key(1)).unwrap();
     // k2/d1..d15
     for i in 1u8..=15 {
-        db.put(None, &key(2), &DatabaseEntry::from_bytes(&[i])).unwrap();
+        db.put( &key(2), &DatabaseEntry::from_bytes(&[i])).unwrap();
     }
 
     // Delete k2/d1..d7 and k2/d10..d12.  Note: in Noxu, `cursor.delete()`
@@ -74,7 +74,7 @@ fn cursor_edge_search_on_duplicates_with_deletions() {
     // deletion rather than relying on the JE delete+Next idiom.
     let txn = env.begin_transaction(None).unwrap();
     {
-        let mut c = db.open_cursor(Some(&txn), None).unwrap();
+        let mut c = db.open_cursor_in(&txn, None).unwrap();
         for di in 1u8..=7 {
             let mut k = key(2);
             let mut d = DatabaseEntry::from_bytes(&[di]);
@@ -94,7 +94,7 @@ fn cursor_edge_search_on_duplicates_with_deletions() {
     txn.commit().unwrap();
 
     // After commit: search for k2 should land on the first live dup (d8).
-    let mut rc = db.open_cursor(None, None).unwrap();
+    let mut rc = db.open_cursor( None).unwrap();
     let mut k = key(2);
     let mut d = DatabaseEntry::new();
     let s = rc.get(&mut k, &mut d, Get::Search, None).unwrap();
@@ -125,11 +125,11 @@ fn cursor_edge_search_on_duplicates_with_deletions() {
     // NotFound.
     drop(rc);
     for i in 0u8..10 {
-        db.put(None, &key(5), &DatabaseEntry::from_bytes(&[i])).unwrap();
+        db.put( &key(5), &DatabaseEntry::from_bytes(&[i])).unwrap();
     }
-    db.delete(None, &key(5)).unwrap();
+    db.delete( &key(5)).unwrap();
 
-    let mut rc = db.open_cursor(None, None).unwrap();
+    let mut rc = db.open_cursor( None).unwrap();
     let mut k = key(5);
     let mut d = DatabaseEntry::new();
     let s = rc.get(&mut k, &mut d, Get::Search, None).unwrap();
@@ -172,13 +172,11 @@ fn cursor_edge_search_both_with_one_duplicate() {
     let db = open_db(&env, "sb_one_dup", true);
 
     db.put(
-        None,
         &DatabaseEntry::from_bytes(&[1]),
-        &DatabaseEntry::from_bytes(&[1]),
-    )
+        &DatabaseEntry::from_bytes(&[1]))
     .unwrap();
 
-    let mut c = db.open_cursor(None, None).unwrap();
+    let mut c = db.open_cursor( None).unwrap();
     // SearchBothRange semantically: key exact, data >= requested.  Noxu's
     // closest match is `Get::SearchBothGte`.
     let mut k = DatabaseEntry::from_bytes(&[1]);
@@ -214,17 +212,15 @@ fn cursor_edge_prev_no_dup_with_empty_tree() {
     for k in [1u8, 2] {
         for d in [1u8, 2] {
             db.put(
-                None,
                 &DatabaseEntry::from_bytes(&[k]),
-                &DatabaseEntry::from_bytes(&[d]),
-            )
+                &DatabaseEntry::from_bytes(&[d]))
             .unwrap();
         }
     }
 
     // Delete every record via cursor.
     {
-        let mut c = db.open_cursor(None, None).unwrap();
+        let mut c = db.open_cursor( None).unwrap();
         let mut k = DatabaseEntry::new();
         let mut d = DatabaseEntry::new();
         let mut s = c.get(&mut k, &mut d, Get::First, None).unwrap();
@@ -237,7 +233,7 @@ fn cursor_edge_prev_no_dup_with_empty_tree() {
     assert_eq!(db.count().unwrap(), 0);
 
     // Now PrevNoDup on the empty tree must return NotFound, not panic.
-    let mut c = db.open_cursor(None, None).unwrap();
+    let mut c = db.open_cursor( None).unwrap();
     let mut k = DatabaseEntry::new();
     let mut d = DatabaseEntry::new();
     let s = c.get(&mut k, &mut d, Get::PrevNoDup, None).unwrap();
@@ -272,15 +268,13 @@ fn cursor_edge_read_deleted_uncommitted() {
 
     // Insert k=1.
     db.put(
-        None,
         &DatabaseEntry::from_bytes(&[1]),
-        &DatabaseEntry::from_bytes(&[1]),
-    )
+        &DatabaseEntry::from_bytes(&[1]))
     .unwrap();
 
     // T1: delete k=1, leave open.
     let txn1 = env.begin_transaction(None).unwrap();
-    let s = db.delete(Some(&txn1), &DatabaseEntry::from_bytes(&[1])).unwrap();
+    let s = db.delete_in(&txn1, &DatabaseEntry::from_bytes(&[1])).unwrap();
     assert_eq!(s, OperationStatus::Success);
 
     // T2 (no-wait): reading k=1 must fail with a lock error.
@@ -288,14 +282,14 @@ fn cursor_edge_read_deleted_uncommitted() {
     let txn2 = env.begin_transaction(Some(&no_wait)).unwrap();
 
     let mut out = DatabaseEntry::new();
-    let r = db.get(Some(&txn2), &DatabaseEntry::from_bytes(&[1]), &mut out);
+    let r = db.get_into(Some(&txn2), &DatabaseEntry::from_bytes(&[1]), &mut out);
     assert!(
         r.is_err(),
         "no-wait read on a write-locked record must fail; got {:?}",
         r
     );
 
-    let mut c2 = db.open_cursor(Some(&txn2), None).unwrap();
+    let mut c2 = db.open_cursor_in(&txn2, None).unwrap();
     let mut k = DatabaseEntry::from_bytes(&[1]);
     let mut d = DatabaseEntry::new();
     let r = c2.get(&mut k, &mut d, Get::Search, None);
@@ -311,11 +305,11 @@ fn cursor_edge_read_deleted_uncommitted() {
 
     let mut out = DatabaseEntry::new();
     let s = db
-        .get(Some(&txn2), &DatabaseEntry::from_bytes(&[1]), &mut out)
+        .get_into(Some(&txn2), &DatabaseEntry::from_bytes(&[1]), &mut out)
         .unwrap();
     assert_eq!(s, OperationStatus::NotFound);
 
-    let mut c2 = db.open_cursor(Some(&txn2), None).unwrap();
+    let mut c2 = db.open_cursor_in(&txn2, None).unwrap();
     let mut k = DatabaseEntry::from_bytes(&[1]);
     let mut d = DatabaseEntry::new();
     let s = c2.get(&mut k, &mut d, Get::Search, None).unwrap();
@@ -370,15 +364,13 @@ fn cursor_edge_no_wait_latch_release() {
 
     // Insert record (k=1, v=1) under auto-commit.
     db.put(
-        None,
         &DatabaseEntry::from_bytes(&[1]),
-        &DatabaseEntry::from_bytes(&[1]),
-    )
+        &DatabaseEntry::from_bytes(&[1]))
     .unwrap();
 
     // T1: search-lock record 1 via cursor.
     let txn1 = env.begin_transaction(None).unwrap();
-    let mut c1 = db.open_cursor(Some(&txn1), None).unwrap();
+    let mut c1 = db.open_cursor_in(&txn1, None).unwrap();
     let mut k1 = DatabaseEntry::from_bytes(&[1]);
     let mut d1 = DatabaseEntry::from_bytes(&[1]);
     let s = c1.get(&mut k1, &mut d1, Get::SearchBoth, None).unwrap();
@@ -388,7 +380,7 @@ fn cursor_edge_no_wait_latch_release() {
     // delete.  The delete must fail with a lock error.
     let no_wait = TransactionConfig::new().with_no_wait(true);
     let txn2 = env.begin_transaction(Some(&no_wait)).unwrap();
-    let mut c2 = db.open_cursor(Some(&txn2), None).unwrap();
+    let mut c2 = db.open_cursor_in(&txn2, None).unwrap();
     let mut k2 = DatabaseEntry::from_bytes(&[1]);
     let mut d2 = DatabaseEntry::from_bytes(&[1]);
     // The position step itself may already conflict; whichever step
@@ -410,7 +402,7 @@ fn cursor_edge_no_wait_latch_release() {
 
     // The record is unmodified (T2 didn't actually delete it).
     let mut out = DatabaseEntry::new();
-    let s = db.get(None, &DatabaseEntry::from_bytes(&[1]), &mut out).unwrap();
+    let s = db.get_into(None, &DatabaseEntry::from_bytes(&[1]), &mut out).unwrap();
     assert_eq!(s, OperationStatus::Success);
     assert_eq!(out.data(), &[1]);
 
@@ -442,16 +434,14 @@ fn cursor_edge_get_current_during_dup_tree_creation() {
 
     // Insert k=1, d=1 (singleton).
     db.put(
-        None,
         &DatabaseEntry::from_bytes(&[1]),
-        &DatabaseEntry::from_bytes(&[1]),
-    )
+        &DatabaseEntry::from_bytes(&[1]))
     .unwrap();
 
     // T2 reads the singleton via getFirst.
     let txn2 = env.begin_transaction(None).unwrap();
     {
-        let mut c2 = db.open_cursor(Some(&txn2), None).unwrap();
+        let mut c2 = db.open_cursor_in(&txn2, None).unwrap();
         let mut k = DatabaseEntry::new();
         let mut d = DatabaseEntry::new();
         let s = c2.get(&mut k, &mut d, Get::First, None).unwrap();
@@ -464,11 +454,9 @@ fn cursor_edge_get_current_during_dup_tree_creation() {
     // T1 inserts a second dup under the same key — promotes the slot
     // from singleton to a dup-chain.
     let txn1 = env.begin_transaction(None).unwrap();
-    db.put(
-        Some(&txn1),
+    db.put_in(&txn1,
         &DatabaseEntry::from_bytes(&[1]),
-        &DatabaseEntry::from_bytes(&[2]),
-    )
+        &DatabaseEntry::from_bytes(&[2]))
     .unwrap();
     txn1.commit().unwrap();
 
@@ -477,7 +465,7 @@ fn cursor_edge_get_current_during_dup_tree_creation() {
     // when the LN was rewritten as a DIN under a still-positioned
     // cursor).
     let txn3 = env.begin_transaction(None).unwrap();
-    let mut c3 = db.open_cursor(Some(&txn3), None).unwrap();
+    let mut c3 = db.open_cursor_in(&txn3, None).unwrap();
     let mut keys = Vec::new();
     let mut vals = Vec::new();
     let mut k = DatabaseEntry::new();

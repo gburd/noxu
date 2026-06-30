@@ -38,11 +38,11 @@ fn d3_delete_on_defunct_slot_returns_key_empty() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open_env_db(&dir);
 
-    db.put(None, &de(b"X"), &de(b"v")).unwrap();
+    db.put( &de(b"X"), &de(b"v")).unwrap();
 
     // Open two cursors, both positioned on "X".
-    let mut c1 = db.open_cursor(None, None).unwrap();
-    let mut c2 = db.open_cursor(None, None).unwrap();
+    let mut c1 = db.open_cursor( None).unwrap();
+    let mut c2 = db.open_cursor( None).unwrap();
 
     let mut k = de(b"X");
     let mut d = DatabaseEntry::new();
@@ -72,10 +72,10 @@ fn d4_put_current_on_defunct_slot_returns_key_empty() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open_env_db(&dir);
 
-    db.put(None, &de(b"X"), &de(b"v")).unwrap();
+    db.put( &de(b"X"), &de(b"v")).unwrap();
 
-    let mut c1 = db.open_cursor(None, None).unwrap();
-    let mut c2 = db.open_cursor(None, None).unwrap();
+    let mut c1 = db.open_cursor( None).unwrap();
+    let mut c2 = db.open_cursor( None).unwrap();
 
     let mut k = de(b"X");
     let mut d = DatabaseEntry::new();
@@ -105,10 +105,10 @@ fn d10_search_gte_writes_back_found_key() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open_env_db(&dir);
 
-    db.put(None, &de(b"beta"), &de(b"v1")).unwrap();
-    db.put(None, &de(b"delta"), &de(b"v2")).unwrap();
+    db.put( &de(b"beta"), &de(b"v1")).unwrap();
+    db.put( &de(b"delta"), &de(b"v2")).unwrap();
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor( None).unwrap();
     let mut k = de(b"alpha"); // search key: between nothing and "beta"
     let mut d = DatabaseEntry::new();
 
@@ -129,7 +129,7 @@ fn d11_put_no_dup_data_on_non_dup_db_errors() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open_env_db(&dir);
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor( None).unwrap();
     let k = de(b"key");
     let d = de(b"data");
 

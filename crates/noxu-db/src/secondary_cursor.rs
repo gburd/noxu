@@ -50,7 +50,7 @@ use crate::transaction::Transaction;
 /// ```
 pub struct SecondaryCursor<'a> {
     /// Cursor over the secondary index storage (sec_key -> pri_key).
-    inner: Cursor,
+    inner: Cursor<'a>,
     /// Back-reference to the owning SecondaryDatabase (for primary lookups).
     secondary_db: &'a SecondaryDatabase,
     /// Transaction handle the cursor was opened under.
@@ -88,7 +88,8 @@ impl<'a> SecondaryCursor<'a> {
         config: Option<&CursorConfig>,
     ) -> Result<Self> {
         let read_uncommitted = config.is_some_and(|c| c.read_uncommitted);
-        let inner = secondary_db.inner_db().open_cursor(txn, config)?;
+        let inner =
+            secondary_db.inner_db().open_cursor_internal(txn, config)?;
         Ok(Self {
             inner,
             secondary_db,
@@ -175,23 +176,30 @@ impl<'a> SecondaryCursor<'a> {
         // by a delete in the same txn) and so cross-txn isolation is
         // honoured.
         let mut pri_data = DatabaseEntry::new();
-        let pri_get_status = {
+        let pri_found = {
             let primary = self.secondary_db.primary_db().lock();
-            primary.get(self.txn, &pri_key, &mut pri_data)?
+            primary.get_into(self.txn, &pri_key, &mut pri_data)?
         };
 
-        if pri_get_status == OperationStatus::Success {
+        if pri_found {
             // primary.delete() auto-maintains secondary entries via the hook.
             // Do NOT call delete_all_for_primary first (would trigger D7).
         }
 
         // Delete the primary; the auto-hook removes all secondary entries.
-        let del_status = {
+        let deleted = {
             let primary = self.secondary_db.primary_db().lock();
-            primary.delete(self.txn, &pri_key)?
+            match self.txn {
+                Some(t) => primary.delete_in(t, &pri_key)?,
+                None => primary.delete(&pri_key)?,
+            }
         };
 
-        Ok(del_status)
+        Ok(if deleted {
+            OperationStatus::Success
+        } else {
+            OperationStatus::NotFound
+        })
     }
 
     // ------------------------------------------------------------------
@@ -328,8 +336,8 @@ impl<'a> SecondaryCursor<'a> {
         // isolation (Wave 1B).
         let pri_key_entry = DatabaseEntry::from_bytes(&pri_key_bytes);
         let primary = self.secondary_db.primary_db().lock();
-        let pri_status = primary.get(self.txn, &pri_key_entry, data)?;
-        if pri_status != OperationStatus::Success {
+        let pri_found = primary.get_into(self.txn, &pri_key_entry, data)?;
+        if !pri_found {
             // D8: if running in dirty-read (read-uncommitted) mode, skip
             // the record rather than raising SecondaryIntegrityException.
             // JE SecondaryCursor dirty-read primary-missing skip.
@@ -378,8 +386,8 @@ impl<'a> SecondaryCursor<'a> {
 
         let pri_key_entry = DatabaseEntry::from_bytes(&pri_key_bytes);
         let primary = self.secondary_db.primary_db().lock();
-        let pri_status = primary.get(self.txn, &pri_key_entry, data)?;
-        if pri_status != OperationStatus::Success {
+        let pri_found = primary.get_into(self.txn, &pri_key_entry, data)?;
+        if !pri_found {
             // D8: dirty-read skip (see get_search_key site for full comment).
             if self.read_uncommitted {
                 return Ok(OperationStatus::NotFound);
@@ -584,9 +592,9 @@ impl<'a> SecondaryCursor<'a> {
         // the lookup honours the caller's transaction (Wave 1B).
         let pri_key_entry = DatabaseEntry::from_bytes(&pri_key_bytes);
         let primary = self.secondary_db.primary_db().lock();
-        let pri_status = primary.get(self.txn, &pri_key_entry, data)?;
+        let pri_found = primary.get_into(self.txn, &pri_key_entry, data)?;
 
-        if pri_status != OperationStatus::Success {
+        if !pri_found {
             // D8: dirty-read (read-uncommitted) mode — skip the record
             // instead of raising SecondaryIntegrityException.  The primary
             // may have been concurrently deleted; under dirty-read we return
