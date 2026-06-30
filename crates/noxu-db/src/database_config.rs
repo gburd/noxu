@@ -2,8 +2,39 @@
 //!
 
 use crate::cache_mode::CacheMode;
+use noxu_dbi::Trigger;
 use std::cmp::Ordering;
 use std::sync::Arc;
+
+/// An ordered list of user-supplied database / transaction triggers (DB-TRIG).
+///
+/// A newtype wrapper so [`DatabaseConfig`] keeps its derived `Debug` /
+/// `PartialEq` / `Eq`: a trigger object is opaque (a closure-bearing trait
+/// object), so — like [`Comparator`] keying on its identity — equality and
+/// `Debug` here key on the triggers' *names* only.
+///
+/// JE `DatabaseConfig.triggers` (a `List<Trigger>`).  Runtime-registered only:
+/// not persisted, not replicated; applications must re-register on every open
+/// (see [`noxu_dbi::trigger`]).
+#[derive(Clone, Default)]
+pub struct Triggers(pub Vec<Arc<dyn Trigger>>);
+
+impl PartialEq for Triggers {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.len() == other.0.len()
+            && self
+                .0
+                .iter()
+                .zip(other.0.iter())
+                .all(|(a, b)| a.name() == b.name())
+    }
+}
+impl Eq for Triggers {}
+impl std::fmt::Debug for Triggers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.0.iter().map(|t| t.name())).finish()
+    }
+}
 
 /// A user-supplied key (or duplicate-data) comparator paired with a stable
 /// identity string.
@@ -128,6 +159,13 @@ pub struct DatabaseConfig {
     /// `DatabaseImpl.getDuplicateComparator`.
     pub duplicate_comparator: Option<Comparator>,
 
+    /// User-supplied database / transaction triggers (DB-TRIG), fired in
+    /// registration order.
+    ///
+    /// JE `DatabaseConfig.setTriggers` / `getTriggers`.  Runtime-registered
+    /// only: not persisted, not replicated — see [`noxu_dbi::trigger`].
+    pub triggers: Triggers,
+
     /// Whether this database is exclusive to a single thread.
     ///
     /// **Inert as of v1.6.0**: the
@@ -187,6 +225,7 @@ impl DatabaseConfig {
             override_duplicate_comparator: false,
             btree_comparator: None,
             duplicate_comparator: None,
+            triggers: Triggers::default(),
             exclusive: false,
             node_max_entries: 0,
             replicated: false,
@@ -288,6 +327,26 @@ impl DatabaseConfig {
     /// Builder-style duplicate-data comparator setter (DBI-14).
     pub fn with_duplicate_comparator(mut self, comparator: Comparator) -> Self {
         self.duplicate_comparator = Some(comparator);
+        self
+    }
+
+    /// Appends a database / transaction trigger (DB-TRIG).
+    ///
+    /// Triggers fire in the order they are added: `put` / `delete` within the
+    /// transaction after each change, and `commit` / `abort` when the
+    /// transaction resolves.  JE `DatabaseConfig.setTriggers`.
+    ///
+    /// Runtime-registered only — not persisted, not replicated; re-register on
+    /// every open (see [`noxu_dbi::trigger`]).
+    pub fn with_trigger(mut self, trigger: Arc<dyn Trigger>) -> Self {
+        self.triggers.0.push(trigger);
+        self
+    }
+
+    /// Appends a database / transaction trigger in place (DB-TRIG).  See
+    /// [`with_trigger`](DatabaseConfig::with_trigger).
+    pub fn add_trigger(&mut self, trigger: Arc<dyn Trigger>) -> &mut Self {
+        self.triggers.0.push(trigger);
         self
     }
 

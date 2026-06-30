@@ -1,7 +1,11 @@
 //! Database configuration.
 //!
 
+use std::sync::Arc;
+
 use noxu_tree::KeyComparatorFn;
+
+use crate::trigger::Trigger;
 
 /// A persisted-identity + comparison-function pair threaded from the public
 /// `noxu_db::Comparator` down to `DatabaseImpl`.
@@ -29,7 +33,7 @@ impl std::fmt::Debug for ConfigComparator {
 /// Configuration for a database.
 ///
 ///
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DatabaseConfig {
     /// Allow database creation if it doesn't exist.
     pub allow_create: bool,
@@ -62,6 +66,36 @@ pub struct DatabaseConfig {
     pub override_btree_comparator: bool,
     /// JE `DatabaseConfig.overrideDuplicateComparator`.
     pub override_duplicate_comparator: bool,
+    /// User-supplied database / transaction triggers, fired in registration
+    /// order (DB-TRIG).
+    ///
+    /// JE `DatabaseConfig.setTriggers` / `getTriggers` (a `List<Trigger>`).
+    /// Runtime-registered only: not persisted, not replicated — see
+    /// [`crate::trigger`].
+    pub triggers: Vec<Arc<dyn Trigger>>,
+}
+
+impl std::fmt::Debug for DatabaseConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DatabaseConfig")
+            .field("allow_create", &self.allow_create)
+            .field("sorted_duplicates", &self.sorted_duplicates)
+            .field("key_prefixing", &self.key_prefixing)
+            .field("temporary", &self.temporary)
+            .field("transactional", &self.transactional)
+            .field("read_only", &self.read_only)
+            .field("node_max_entries", &self.node_max_entries)
+            .field("deferred_write", &self.deferred_write)
+            .field("btree_comparator", &self.btree_comparator)
+            .field("duplicate_comparator", &self.duplicate_comparator)
+            .field("override_btree_comparator", &self.override_btree_comparator)
+            .field(
+                "override_duplicate_comparator",
+                &self.override_duplicate_comparator,
+            )
+            .field("triggers", &self.triggers.len())
+            .finish()
+    }
 }
 
 impl Default for DatabaseConfig {
@@ -79,6 +113,7 @@ impl Default for DatabaseConfig {
             duplicate_comparator: None,
             override_btree_comparator: false,
             override_duplicate_comparator: false,
+            triggers: Vec::new(),
         }
     }
 }
@@ -131,6 +166,15 @@ impl DatabaseConfig {
     /// Sets the maximum entries per node.
     pub fn set_node_max_entries(&mut self, max: i32) -> &mut Self {
         self.node_max_entries = max;
+        self
+    }
+
+    /// Appends a trigger to the registration list (DB-TRIG).
+    ///
+    /// Triggers fire in the order they are added.  JE
+    /// `DatabaseConfig.setTriggers` (Noxu allows incremental registration).
+    pub fn add_trigger(&mut self, trigger: Arc<dyn Trigger>) -> &mut Self {
+        self.triggers.push(trigger);
         self
     }
 }

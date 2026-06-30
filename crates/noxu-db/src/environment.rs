@@ -536,6 +536,10 @@ impl Environment {
         dbi_config.override_btree_comparator = config.override_btree_comparator;
         dbi_config.override_duplicate_comparator =
             config.override_duplicate_comparator;
+        // DB-TRIG: thread user triggers (runtime-registered, not persisted)
+        // through to DatabaseImpl so put/delete/commit/abort fire.  JE
+        // `DatabaseConfig.getTriggers` -> `DatabaseImpl.triggers`.
+        dbi_config.triggers = config.triggers.0.clone();
         if config.node_max_entries > 0 {
             dbi_config.set_node_max_entries(config.node_max_entries as i32);
         }

@@ -92,6 +92,15 @@ pub struct DatabaseImpl {
     ///
     /// JE `DatabaseImpl.duplicateComparatorBytes`.
     duplicate_comparator_id: Option<String>,
+    /// User-supplied database / transaction triggers (DB-TRIG), fired in
+    /// registration order.
+    ///
+    /// JE `DatabaseImpl.triggers` (the `List<Trigger>` returned by
+    /// `getTriggers()`).  Runtime-registered only — not persisted, not
+    /// replicated; see [`crate::trigger`].  Empty `Vec` = no triggers =
+    /// zero firing overhead (the `is_empty()` fast path mirrors JE
+    /// `hasUserTriggers()`).
+    triggers: Vec<Arc<dyn crate::trigger::Trigger>>,
 }
 
 /// Persistent B-tree root metadata stored alongside the database record.
@@ -173,6 +182,7 @@ impl DatabaseImpl {
             throughput: ThroughputStats::new(),
             btree_comparator_id,
             duplicate_comparator_id,
+            triggers: config.triggers.clone(),
         }
     }
 
@@ -260,6 +270,21 @@ impl DatabaseImpl {
     /// JE `DatabaseImpl.getDuplicateComparator` / `duplicateComparatorBytes`.
     pub fn duplicate_comparator_id(&self) -> Option<&str> {
         self.duplicate_comparator_id.as_deref()
+    }
+
+    /// The user-supplied triggers, in registration order (DB-TRIG).
+    ///
+    /// JE `DatabaseImpl.getTriggers()`.
+    pub fn triggers(&self) -> &[Arc<dyn crate::trigger::Trigger>] {
+        &self.triggers
+    }
+
+    /// Whether any user triggers are registered (DB-TRIG fast path).
+    ///
+    /// JE `DatabaseImpl.hasUserTriggers()` — gates the trigger-firing path so
+    /// a database with no triggers pays a single `is_empty()` check.
+    pub fn has_user_triggers(&self) -> bool {
+        !self.triggers.is_empty()
     }
 
     /// Whether all LNs in this DB are "immediately obsolete" — counted
@@ -574,6 +599,10 @@ impl DatabaseImpl {
             throughput: ThroughputStats::new(),
             btree_comparator_id: None,
             duplicate_comparator_id: None,
+            // Triggers are runtime-registered, not persisted; an instance
+            // recovered from the log starts with none until re-registered
+            // on open (DB-TRIG; see crate::trigger).
+            triggers: Vec::new(),
         })
     }
 }

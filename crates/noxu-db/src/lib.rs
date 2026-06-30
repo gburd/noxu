@@ -154,6 +154,7 @@ pub use get::Get;
 pub use join_config::JoinConfig;
 pub use join_cursor::JoinCursor;
 pub use lock_mode::LockMode;
+pub use noxu_dbi::Trigger;
 pub use noxu_engine::{
     EnvironmentStats, VerifyConfig, VerifyError, VerifyResult,
 };
