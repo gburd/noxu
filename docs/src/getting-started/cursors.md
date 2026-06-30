@@ -12,8 +12,11 @@
 >   transaction; if you are upgrading, see
 >   [Migrating from v1.4.x](migrating.md) for the lock-conflict
 >   surface that change can expose.
-> * `Get::SearchLte`, `Get::FirstDup`, and `Get::LastDup` return
->   `NoxuError::Unsupported` in v1.5; planned for v1.6.
+> * `Get::SearchLte`, `Get::FirstDup`, and `Get::LastDup` are implemented.
+>   `Get::SearchLte` positions on the largest key `<=` the search key (the
+>   floor), returning `NotFound` only when no such key exists.
+>   `Get::FirstDup` / `Get::LastDup` position on the first / last duplicate
+>   of the current key without leaving the current dup set.
 > * `Get::NextDup` and `Get::PrevDup` on a non-duplicates database
 >   return `NotFound` (consistent with the no-dups invariant).
 > * `Get::SearchBoth` on a non-duplicates database now validates the
@@ -81,8 +84,8 @@ The `Get` variants:
 | `Get::SearchRange` | Alias for `SearchGte` | ✅ |
 | `Get::Current` | Re-read the record at the current position | ✅ |
 | `Get::NextDup` / `Get::PrevDup` | Next/previous duplicate of the current key | ✅ on sorted-dup DBs; on non-dup DBs they return `NotFound` |
-| `Get::SearchLte` | Largest key <= search key | ❌ v1.5: `NoxuError::Unsupported` (planned for v1.6) |
-| `Get::FirstDup` / `Get::LastDup` | First / last duplicate of the current key | ❌ v1.5: `NoxuError::Unsupported` (planned for v1.6) |
+| `Get::SearchLte` | Largest key <= search key (the "floor"); `NotFound` when no key <= search key | ✅ |
+| `Get::FirstDup` / `Get::LastDup` | First / last duplicate of the current key (by data order), positioned WITHIN the current dup set | ✅ on sorted-dup DBs; no-op on non-dup DBs |
 
 For `Search`, `SearchGte`, and `SearchRange`, the key to search for must be placed in the key
 `DatabaseEntry` before calling `get`. After a successful `Search` the key entry holds the found
@@ -161,6 +164,46 @@ while status == OperationStatus::Success {
 }
 cursor.close()?;
 ```
+
+## Floor Search (Less-Than-Or-Equal)
+
+`Get::SearchLte` is the mirror of `SearchGte`: it positions the cursor on the
+largest key that is less than or equal to the search key (the "floor"). It is
+the primitive for "find the most recent entry at or before time T" style
+queries. The operation returns `NotFound` only when no key `<=` the search
+key exists (every key is larger, or the database is empty).
+
+```rust
+// keys {10, 20, 30}
+let mut cursor = db.open_cursor(None, None)?;
+let mut key = DatabaseEntry::from_bytes(b"25");
+let mut data = DatabaseEntry::new();
+let status = cursor.get(&mut key, &mut data, Get::SearchLte, None)?;
+// status == Success, key now holds b"20" (the floor of 25)
+cursor.close()?;
+```
+
+On a sorted-duplicates database, `SearchLte` lands on the *last* duplicate of
+the floor key (the greatest record `<=` the search key).
+
+## First / Last Duplicate
+
+For sorted-duplicates databases, `Get::FirstDup` and `Get::LastDup` reposition
+the cursor within the duplicate set of the current key, on the first or last
+duplicate by data order, without leaving the current key. The cursor must
+already be positioned on a record.
+
+```rust
+// key "k" has duplicates {a, b, c}
+let mut cursor = db.open_cursor(None, None)?;
+let mut key = DatabaseEntry::from_bytes(b"k");
+let mut data = DatabaseEntry::new();
+cursor.get(&mut key, &mut data, Get::Search, None)?;     // positioned on "k"
+cursor.get(&mut key, &mut data, Get::FirstDup, None)?;   // data == b"a"
+cursor.get(&mut key, &mut data, Get::LastDup, None)?;    // data == b"c"
+cursor.close()?;
+```
+
 
 ## Deleting via Cursor
 
