@@ -51,6 +51,12 @@ static WRITE_COUNT: AtomicU64 = AtomicU64::new(0);
 /// The installed controller (only present while DST is active).
 static CONTROLLER: Mutex<Option<FaultController>> = Mutex::new(None);
 
+/// Returns the number of writes the fault layer has seen so far (diagnostic;
+/// stable per seed, useful for sizing the target-write range).
+pub fn write_count() -> u64 {
+    WRITE_COUNT.load(Ordering::SeqCst)
+}
+
 /// Returns `true` if the fault layer is active.  One relaxed atomic load;
 /// `false` (and therefore free) in production.
 #[inline]
@@ -118,9 +124,13 @@ impl FaultController {
             3 => FaultKind::DiskFull,
             _ => FaultKind::Corruption,
         };
-        // Fire somewhere in the first ~400 writes (the worker workloads issue
-        // a few hundred); below() keeps it in range and seed-stable.
-        let target_write = prng.below(400);
+        // Fire within the first ~64 writes.  The crash-sweep workload issues
+        // ~50 committed-and-synced writes (phase 1) plus a few buffered
+        // uncommitted writes (phase 2) plus header writes, so 0..64 reliably
+        // lands the fault inside the workload (often right at a committed-txn
+        // boundary, which is the interesting power-loss point).  below() keeps
+        // it in range and seed-stable.
+        let target_write = prng.below(64);
         let magnitude = 1 + prng.below(15); // 1..=15
         FaultController { kind, target_write, magnitude, prng, fired: false }
     }

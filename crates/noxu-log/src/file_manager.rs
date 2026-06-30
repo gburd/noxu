@@ -651,8 +651,9 @@ impl FileManager {
 
     #[cfg(unix)]
     fn pwrite_exact(file: &File, offset: u64, buf: &[u8]) -> Result<()> {
-        use std::os::unix::fs::FileExt;
-        file.write_all_at(buf, offset)?;
+        // Route header writes through posio so the DST fault layer covers them
+        // too (inactive in production -> identical to a direct write_all_at).
+        crate::posio::write_all_at(file, buf, offset)?;
         Ok(())
     }
 
