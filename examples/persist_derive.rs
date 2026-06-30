@@ -152,14 +152,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     //    to the struct name "Person" since no `#[entity(name = "...")]`
     //    override was supplied.
     let mut primary: PrimaryIndex<u32, Person> = store.get_primary_index()?;
-    let ser = PersonSerializer;
+    let ser = std::sync::Arc::new(PersonSerializer);
 
     // 2. Open the secondary indexes via the auto-generated helpers.
-    //    Without the derive macro, the user would have written
-    //    `primary.open_secondary_index(|p: &Person| Some(p.email.clone()))`
-    //    by hand for each index.
-    let by_email = Person::open_by_email_index(&mut primary);
-    let by_dept = Person::open_by_dept_index(&mut primary);
+    //    The DPL secondary indexes are real, transactional `SecondaryDatabase`s
+    //    (maintained within the txn that touches the primary), so opening one
+    //    needs the `EntityStore` (for the env + a DB name) and the serializer.
+    //    Without the derive macro the user would call
+    //    `store.open_secondary_index(&mut primary, "by_email", ser, |p| ...)`.
+    let by_email =
+        Person::open_by_email_index(&mut store, &mut primary, std::sync::Arc::clone(&ser))?;
+    let by_dept =
+        Person::open_by_dept_index(&mut store, &mut primary, std::sync::Arc::clone(&ser))?;
 
     println!("\nDeclared secondary indexes: {:?}", Person::SECONDARY_INDEXES);
 
@@ -197,11 +201,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\nStoring {} people...", people.len());
     for p in &people {
-        primary.put(None, &ser, p)?;
+        primary.put(None, ser.as_ref(), p)?;
     }
 
     // 4. Look up by primary key.
-    let found = primary.get(None, &ser, &2u32)?.expect("Bob exists");
+    let found = primary.get(None, ser.as_ref(), &2u32)?.expect("Bob exists");
     println!(
         "\nLookup by id=2 → {} {} <{}>",
         found.first_name, found.last_name, found.email
@@ -209,7 +213,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 5. Look up by secondary key (email).
     let alice = by_email
-        .get(None, &ser, &primary, &"alice@example.com".to_string())?
+        .get(None, ser.as_ref(), &primary, &"alice@example.com".to_string())?
         .expect("Alice exists by email");
     println!(
         "Lookup by email=alice@... → id={} {} {}",
@@ -220,29 +224,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nPeople in dept 10:");
     let dept10 = by_dept.sub_index(&10u32);
     for pk in &dept10 {
-        let p = primary.get(None, &ser, pk)?.unwrap();
+        let p = primary.get(None, ser.as_ref(), pk)?.unwrap();
         println!("  id={} {}", p.person_id, p.first_name);
     }
 
     // 7. Update Bob's email — by_email index is auto-maintained.
-    let mut bob = primary.get(None, &ser, &2u32)?.unwrap();
+    let mut bob = primary.get(None, ser.as_ref(), &2u32)?.unwrap();
     bob.email = "bob@new.example.com".into();
-    primary.put(None, &ser, &bob)?;
+    primary.put(None, ser.as_ref(), &bob)?;
     assert!(
         by_email
-            .get(None, &ser, &primary, &"bob@example.com".into())?
+            .get(None, ser.as_ref(), &primary, &"bob@example.com".into())?
             .is_none()
     );
     assert!(
         by_email
-            .get(None, &ser, &primary, &"bob@new.example.com".into())?
+            .get(None, ser.as_ref(), &primary, &"bob@new.example.com".into())?
             .is_some()
     );
     println!("\nUpdated Bob's email; old key no longer in by_email index.");
 
     // 8. Delete via secondary index — cascades to the primary record.
     let removed =
-        by_email.delete(None, &ser, &primary, &"alice@example.com".into())?;
+        by_email.delete(None, ser.as_ref(), &primary, &"alice@example.com".into())?;
     println!(
         "\nDelete by email=alice@example.com → removed = {removed}; \
          primary count = {}",
@@ -252,7 +256,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 9. Final scan in primary-key order.
     println!("\nFinal primary scan:");
     let all: Vec<Person> =
-        primary.entities(None, &ser)?.collect::<noxu::persist::Result<_>>()?;
+        primary.entities(None, ser.as_ref())?.collect::<noxu::persist::Result<_>>()?;
     for p in &all {
         println!(
             "  id={} {} {} <{}> dept={:?}",
