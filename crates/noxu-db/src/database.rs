@@ -1306,6 +1306,19 @@ impl Database {
         &self.config
     }
 
+    /// Returns whether this database was created with sorted duplicates.
+    ///
+    /// Unlike `get_config().sorted_duplicates` — which reflects the
+    /// `DatabaseConfig` the caller *passed* to `open_database` — this reads
+    /// the property stored in the opened `DatabaseImpl`, so it is correct even
+    /// when an existing database is reopened without restating its dup-sort
+    /// flag (as `noxu-admin dump` does).  Mirrors JE
+    /// `Database.getConfig().getSortedDuplicates()` after
+    /// `DbInternal.setUseExistingConfig`.
+    pub fn get_sorted_duplicates(&self) -> bool {
+        self.db_impl.read().get_sorted_duplicates()
+    }
+
     /// Returns the underlying database ID.  Used by FK cascade guards
     /// to disambiguate `(db, key)` frames when several databases
     /// participate in a cycle.
