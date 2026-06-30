@@ -8,6 +8,8 @@
 //! `secondary_index.rs`.  If a future change to the derive output drifts
 //! from the manual path, these tests catch it.
 
+use std::sync::Arc;
+
 use noxu_db::{Environment, EnvironmentConfig};
 use noxu_persist::{
     DeleteAction, Entity, EntitySerializer, EntityStore, PersistError,
@@ -216,10 +218,14 @@ fn derived_entity_round_trip_via_store() {
             .unwrap();
     let mut primary: PrimaryIndex<u64, User> =
         store.get_primary_index().unwrap();
-    let ser = UserSerializer;
+    let ser = Arc::new(UserSerializer);
 
-    let by_email = User::open_by_email_index(&mut primary);
-    let by_dept = User::open_by_dept_index(&mut primary);
+    let by_email =
+        User::open_by_email_index(&mut store, &mut primary, Arc::clone(&ser))
+            .unwrap();
+    let by_dept =
+        User::open_by_dept_index(&mut store, &mut primary, Arc::clone(&ser))
+            .unwrap();
 
     let alice = User {
         id: 1,
@@ -240,17 +246,20 @@ fn derived_entity_round_trip_via_store() {
         name: "Carol".into(),
     };
 
-    primary.put(None, &ser, &alice).unwrap();
-    primary.put(None, &ser, &bob).unwrap();
-    primary.put(None, &ser, &carol).unwrap();
+    primary.put(None, ser.as_ref(), &alice).unwrap();
+    primary.put(None, ser.as_ref(), &bob).unwrap();
+    primary.put(None, ser.as_ref(), &carol).unwrap();
 
     // Primary read.
-    assert_eq!(primary.get(None, &ser, &1u64).unwrap(), Some(alice.clone()));
+    assert_eq!(
+        primary.get(None, ser.as_ref(), &1u64).unwrap(),
+        Some(alice.clone())
+    );
     assert_eq!(primary.count().unwrap(), 3);
 
     // Secondary by email — OneToOne.
     let found = by_email
-        .get(None, &ser, &primary, &"alice@example.com".to_string())
+        .get(None, ser.as_ref(), &primary, &"alice@example.com".to_string())
         .unwrap();
     assert_eq!(found, Some(alice));
 
@@ -264,10 +273,10 @@ fn derived_entity_round_trip_via_store() {
 
     // Delete via secondary cascades to primary and clears email index.
     let removed = by_email
-        .delete(None, &ser, &primary, &"alice@example.com".to_string())
+        .delete(None, ser.as_ref(), &primary, &"alice@example.com".to_string())
         .unwrap();
     assert!(removed);
-    assert_eq!(primary.get(None, &ser, &1u64).unwrap(), None);
+    assert_eq!(primary.get(None, ser.as_ref(), &1u64).unwrap(), None);
     assert!(!by_dept.contains(&10u64) || by_dept.sub_index(&10u64).len() == 1);
 }
 
@@ -402,12 +411,14 @@ fn derived_secondary_helper_extractor_handles_option_none() {
             .unwrap();
     let mut primary: PrimaryIndex<u64, User> =
         store.get_primary_index().unwrap();
-    let by_dept = User::open_by_dept_index(&mut primary);
-    let ser = UserSerializer;
+    let ser = Arc::new(UserSerializer);
+    let by_dept =
+        User::open_by_dept_index(&mut store, &mut primary, Arc::clone(&ser))
+            .unwrap();
 
     let nodept =
         User { id: 7, email: "x@y.z".into(), dept: None, name: "X".into() };
-    primary.put(None, &ser, &nodept).unwrap();
+    primary.put(None, ser.as_ref(), &nodept).unwrap();
 
     // Option<u64> = None → entity excluded from the index.
     assert!(by_dept.keys_index().is_empty());

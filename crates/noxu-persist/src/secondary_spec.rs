@@ -43,13 +43,13 @@
 /// | `ONE_TO_MANY` | `OneToMany` | each entity has multiple secondary keys; each secondary key is unique |
 /// | `MANY_TO_MANY` | `ManyToMany` | each entity has multiple secondary keys, multiple entities may share keys |
 ///
-/// In v1.5 noxu-persist's `SecondaryIndex` extractor signature is
+/// noxu-persist's `SecondaryIndex` extractor signature is
 /// `Fn(&E) -> Option<SK>` — one secondary key per entity — so only
 /// `OneToOne` and `ManyToOne` are fully exercised by the engine.
 /// `OneToMany` / `ManyToMany` are accepted by the derive (so the metadata
 /// round-trips cleanly) but the extractor still returns a single key; users
 /// that need multi-key extraction should register multiple secondary
-/// indexes manually until the v1.6 multi-key extractor lands.
+/// indexes manually until a multi-key extractor lands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Relate {
     /// One entity ↔ one secondary key, unique across the index.
@@ -67,12 +67,14 @@ pub enum Relate {
 ///
 /// Mirrors `com.sleepycat.persist.model.DeleteAction` from BDB-JE.
 ///
-/// In v1.5 noxu-persist DPL secondary indexes are in-memory only (see
-/// `PersistError::SecondariesNotTransactional`) and the engine does **not**
-/// enforce these actions automatically — the field is metadata only,
-/// recorded in `SecondarySpec` so callers can inspect the user's intent.
-/// The v1.6 plan persists secondaries through `noxu-db` and wires the
-/// foreign-key actions into the cascade path.
+/// DPL secondary indexes are persistent, transactional
+/// `noxu-db` `SecondaryDatabase`s, but the DPL `open_secondary_index`
+/// path does not yet wire this `on_related_entity_delete` attribute into
+/// the lower-level `noxu-db` foreign-key cascade machinery — the field is
+/// **metadata only**, recorded in `SecondarySpec` so callers can inspect
+/// the user's intent. (The `noxu-db` `SecondaryConfig` foreign-key
+/// support exists and can be used directly when FK enforcement is
+/// required; wiring the DPL attribute into it is a future item.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DeleteAction {
     /// Abort the deletion if any entity in the related store still

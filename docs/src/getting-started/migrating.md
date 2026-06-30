@@ -292,12 +292,19 @@ the 2026 review.
   Pass `None` for the historical auto-commit semantics.
 * **`SecondaryIndex::{get, delete, iter, iter_from}` take
   `txn: Option<&Transaction>` as the leading argument.**
-* **DPL secondary index updates remain non-atomic with the user txn
-  in v1.5.** A one-shot
-  `PersistError::SecondariesNotTransactional` warning logs at the
-  first such call against a primary with registered secondaries.
-  Suppress in tests with `NOXU_PERSIST_ALLOW_NON_TXN_SECONDARIES=1`.
-  Closes alongside Decision 1's sorted-dup work in v1.6.
+* **DPL secondary indexes are now transactional and persistent.** They
+  are backed by real `noxu-db` `SecondaryDatabase`s opened against the
+  primary and maintained inside the active transaction (the JE
+  `Store.openSecondaryDatabase` model). Aborting a transaction rolls the
+  primary write and the secondary index update back together; the
+  secondary survives store reopen. The former one-shot
+  `PersistError::SecondariesNotTransactional` warning and the
+  `NOXU_PERSIST_ALLOW_NON_TXN_SECONDARIES` opt-in have been removed.
+  **Breaking:** `EntityStore::open_secondary_index` now takes
+  `(primary, name, serializer, extractor)`, and the
+  `#[derive(SecondaryKey)]`-generated `open_<name>_index` helper now
+  takes `(&mut store, &mut primary, serializer)`. The secondary-key type
+  must implement `PrimaryKey`.
 
 ## Collections and bind (v1.5)
 
