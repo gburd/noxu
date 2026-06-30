@@ -195,6 +195,37 @@ listed in [References](#references).
 
 ### Fixed
 
+- **Compressor now consults the lock manager before removing a `known_deleted`
+  slot (IC-3, defended).** `Tree::compress_bin` previously removed every
+  `known_deleted` slot from a BIN without checking whether the slot was still
+  write-locked by an in-flight transaction — safe today only by an
+  undocumented-in-code invariant ("no write path ever leaves an uncommitted,
+  write-locked tombstone in a `BinStub`"), a latent landmine that a future write
+  path could trip into tree corruption (the compressor physically removing a
+  slot a live txn still references). The new
+  `Tree::compress_bin_with_lock_check(bin, is_locked: Option<&dyn Fn(u64)->bool>)`
+  takes a caller-supplied lock-state predicate and SKIPS any `known_deleted`
+  slot the predicate reports as locked, mirroring JE `BIN.compress`
+  (`BIN.java:1141-1172`), which calls `lockManager.isLockUncontended(lsn)` and
+  does `anyLocked = true; continue;` on a contended slot. The dbi layer
+  (`environment_impl.rs`: the INCompressor daemon and `compress_all`) supplies
+  `move |lsn| lock_manager.get_lock_info(lsn) != (0, 0)` — the inverse of JE's
+  `isLockUncontended` (`nWaiters == 0 && nOwners == 0`). `noxu-tree` gains **no**
+  `noxu-txn` dependency: the predicate is a `dyn Fn`, the lock knowledge lives
+  in the closure. A `NULL_LSN` slot is discarded without consulting the
+  predicate (JE: "Can discard a NULL_LSN entry without locking"). When no
+  predicate is supplied (recovery, BIN-delta replay, lock-manager-less tests)
+  behavior is unchanged — all `known_deleted` slots are removed. **Lock
+  ordering:** the predicate runs while `compress_bin` holds the BIN write
+  latch; `get_lock_info` takes a lock-table shard mutex for one short,
+  non-blocking critical section and releases it before returning, and the
+  LockManager never latches a BIN, so the only edge is BIN-latch ->
+  shard-mutex (acyclic) — no deadlock. Headline test
+  (`test_ic3_compress_skips_write_locked_slot`): a write-locked tombstone is
+  KEPT while a committed/unlocked tombstone in the same BIN is removed;
+  end-to-end (`ic3_compress_predicate_consults_real_lock_manager`): the
+  predicate the compressor builds consults the env's real `LockManager`.
+
 - **Critical: adjacent-key transactions could abort the host process
   (dynomite/dyniak report).** Two compounding defects turned a transaction that
   touches adjacent keys into a hard `process::abort()`:
