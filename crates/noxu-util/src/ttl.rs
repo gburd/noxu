@@ -4,6 +4,8 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::clock::Clock;
+
 /// Number of seconds in one hour.
 pub const SECS_PER_HOUR: u64 = 3600;
 
@@ -20,6 +22,33 @@ pub fn current_time_hours() -> u32 {
 pub fn current_time_secs() -> u32 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
         as u32
+}
+
+/// Clock-aware variant of [`is_expired`] for the DST control-flow path.
+///
+/// Identical to [`is_expired`] but reads "now" from an injectable [`Clock`]
+/// instead of [`SystemTime::now`], so a [`crate::SimClock`] makes expiry a
+/// pure function of the simulated timeline.  Used where TTL expiry is a
+/// control-flow decision under simulation; the plain [`is_expired`] (real
+/// wall clock) remains the default everywhere else.
+///
+/// `in_hours` matches [`is_expired`]: hours-since-epoch when `true`,
+/// seconds-since-epoch when `false`.
+pub fn is_expired_with(
+    clock: &dyn Clock,
+    expiration_time: u32,
+    in_hours: bool,
+) -> bool {
+    if expiration_time == 0 {
+        return false;
+    }
+    let now_secs = clock.now_unix_ms() / 1000;
+    let now = if in_hours {
+        (now_secs / SECS_PER_HOUR) as u32
+    } else {
+        now_secs as u32
+    };
+    expiration_time <= now
 }
 
 /// Returns true if the given packed expiration time has passed.
