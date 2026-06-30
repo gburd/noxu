@@ -15,7 +15,43 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+## [6.4.2] - 2026-06-29
+
 ### Fixed
+
+- **Critical: adjacent-key transactions could abort the host process
+  (dynomite/dyniak report).** Two compounding defects turned a transaction that
+  touches adjacent keys into a hard `process::abort()`:
+  1. **Illegal `RangeInsert -> Write` / `RangeInsert -> Read` lock upgrade.** A
+     new-key insert takes a `RangeInsert` next-key lock on its successor's real
+     LSN (phantom prevention). When the SAME transaction then writes or reads
+     that successor (an existing key locked by its real LSN), it requested a
+     `Write`/`Read` on the LSN it already held as `RangeInsert` — ILLEGAL in JE's
+     upgrade matrix, which formerly `panic!`ed. (JE never reaches this: its
+     next-key lock and the later access resolve to one uniform LSN locus and
+     the inserter never accesses the successor it locked; Noxu's split lock
+     locus — synthetic id for new keys, real LSN for existing keys — can reach
+     it. See design-decisions "Lock *locus*" / TXN-LOCUS.) Fixed at the source:
+     the write path releases the txn's own `RangeInsert` before requesting
+     `Write` (`Txn::release_range_insert_for_write`); the read path skips the
+     `Read`/`RangeRead` when the txn already holds `RangeInsert`
+     (`Txn::holds_range_insert`). The lock matrix is unchanged (verified
+     identical to JE `LockType.upgradeMatrix`). A defensive audit of all eight
+     cursor lock-acquisition sites confirmed the remaining seam directions are
+     covered by the existing `owns_any_lock` guards.
+  2. **Panic-in-`Drop` escalated to a process abort.** The panic in (1)
+     poisoned the transaction lock; `Transaction::Drop` → `abort()` and
+     `EnvironmentImpl::Drop` then did `lock().unwrap()` on the poisoned mutex,
+     double-panicking inside a destructor — which Rust escalates to
+     `process::abort()`. All lock acquisitions on the abort/Drop paths now
+     recover the guard via `unwrap_or_else(|p| p.into_inner())` for a
+     best-effort cleanup instead of crashing the process.
+  Also: the illegal upgrade itself now returns `TxnError::IllegalUpgrade` ->
+  `NoxuError::TransactionAborted` (defense in depth) rather than `panic!`,
+  faithful to JE treating the equivalent as a catchable
+  `EnvironmentFailureException(UNEXPECTED_STATE)` rather than a JVM abort.
+  Regression tests in `range_insert_upgrade_test` (verified failing pre-fix,
+  passing post-fix); serializable phantom protection preserved.
 
 - **Survivable-panics audit: WAL buffer-pool exhaustion no longer aborts the
   process.** `LogBufferPool::bump_and_write_dirty` previously called
@@ -24,6 +60,9 @@ listed in [References](#references).
   already returns `Result`. It now returns `LogError::Internal`, faithful to JE
   `LogBufferPool.bumpAndWriteDirty` (LogBufferPool.java:363), which throws
   `EnvironmentFailureException.unexpectedState` rather than aborting the JVM.
+  (The full audit of 33 Drop impls + all production `panic!`/`unreachable!` +
+  the decode/network/recovery surface found the codebase otherwise already
+  panic-safe.)
 
 ## [6.4.1] - 2026-06-25
 
