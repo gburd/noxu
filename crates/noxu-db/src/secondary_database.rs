@@ -867,7 +867,7 @@ impl SecondaryDatabase {
     /// Returns `true` if any record with the given secondary key exists.
     ///
     /// This avoids the cost of reading the primary record — unlike
-    /// [`Self::get`], which traverses the secondary, then the primary
+    /// [`Self::get_into`], which traverses the secondary, then the primary
     /// database.  Useful for membership probes inside hot paths.
     ///
     /// # Errors
