@@ -54,7 +54,7 @@ fn populate(db: &Database, n: usize, value: &[u8]) {
     for i in 0..n {
         let k = DatabaseEntry::from_vec(make_key(i));
         let v = DatabaseEntry::from_bytes(value);
-        db.put(None, &k, &v).unwrap();
+        db.put(&k, &v).unwrap();
     }
 }
 
@@ -70,7 +70,7 @@ fn run_w03(scale: usize, repeats: usize) {
         let mut data = DatabaseEntry::new();
         for i in 0..scale {
             let k = DatabaseEntry::from_vec(make_key(i));
-            let _ = db.get(None, &k, &mut data).unwrap();
+            let _ = db.get_into(None, &k, &mut data).unwrap();
             total += 1;
         }
     }
@@ -101,7 +101,7 @@ fn run_w04(scale: usize, repeats: usize) {
         for _ in 0..scale {
             let idx = rng.gen_range(0..scale);
             let k = DatabaseEntry::from_vec(make_key(idx));
-            let _ = db.get(None, &k, &mut data).unwrap();
+            let _ = db.get_into(None, &k, &mut data).unwrap();
             total += 1;
         }
     }
@@ -149,9 +149,9 @@ fn run_w10(scale: usize, threads: usize, repeats: usize) {
                     let k = DatabaseEntry::from_vec(make_key(idx));
                     if rng.r#gen::<bool>() {
                         let mut data = DatabaseEntry::new();
-                        let _ = db_t.get(None, &k, &mut data).unwrap();
+                        let _ = db_t.get_into(None, &k, &mut data).unwrap();
                     } else {
-                        let _ = db_t.put(None, &k, &v).unwrap();
+                        db_t.put(&k, &v).unwrap();
                     }
                     total_ref.fetch_add(1, Ordering::Relaxed);
                 }

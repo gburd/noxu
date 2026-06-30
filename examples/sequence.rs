@@ -14,7 +14,7 @@
 
 use noxu::{
     DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
-    OperationStatus, SequenceConfig,
+    SequenceConfig,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -117,8 +117,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // stored in ID order (byte-sortable).
         let key = DatabaseEntry::from_bytes(&id.to_be_bytes());
         let value = DatabaseEntry::from_bytes(item.as_bytes());
-        let status = db.put(None, &key, &value)?;
-        assert_eq!(status, OperationStatus::Success);
+        db.put(&key, &value)?;
         println!("    id={} -> {}", id, item);
     }
 
@@ -129,17 +128,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (item, id) in items.iter().zip(assigned_ids.iter()) {
         let key = DatabaseEntry::from_bytes(&id.to_be_bytes());
         let mut data = DatabaseEntry::new();
-        let status = db.get(None, &key, &mut data)?;
-        match status {
-            OperationStatus::Success => {
-                let value = std::str::from_utf8(data.data()).unwrap_or("?");
-                let matches = value == *item;
-                println!("    id={} -> {} (match={})", id, value, matches);
-            }
-            OperationStatus::NotFound => {
-                println!("    id={} -> NOT FOUND (unexpected)", id);
-            }
-            _ => {}
+        let status = db.get_into(None, &key, &mut data)?;
+        if status {
+            let value = std::str::from_utf8(data.data()).unwrap_or("?");
+            let matches = value == *item;
+            println!("    id={} -> {} (match={})", id, value, matches);
+        } else {
+            println!("    id={} -> NOT FOUND (unexpected)", id);
         }
     }
 

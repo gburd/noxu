@@ -171,8 +171,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let key = DatabaseEntry::from_bytes(vendor.name.as_bytes());
         let mut data = DatabaseEntry::new();
         vendor_binding.object_to_entry(vendor, &mut data)?;
-        let status = vendor_db.put(None, &key, &data)?;
-        assert_eq!(status, OperationStatus::Success);
+        vendor_db.put(&key, &data)?;
         println!("  {} ({}, {})", vendor.name, vendor.city, vendor.phone);
     }
 
@@ -229,8 +228,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let key = DatabaseEntry::from_bytes(item.sku.as_bytes());
         let mut data = DatabaseEntry::new();
         item_binding.object_to_entry(item, &mut data)?;
-        let status = item_db.put(None, &key, &data)?;
-        assert_eq!(status, OperationStatus::Success);
+        item_db.put(&key, &data)?;
         println!(
             "  SKU={} name='{}' vendor='{}' price={:.2} qty={}",
             item.sku,
@@ -248,8 +246,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let key = DatabaseEntry::from_bytes(b"Fresh Farms");
         let mut data = DatabaseEntry::new();
-        let status = vendor_db.get(None, &key, &mut data)?;
-        if status == OperationStatus::Success {
+        let status = vendor_db.get_into(None, &key, &mut data)?;
+        if status {
             let vendor = vendor_binding.entry_to_object(&data)?;
             println!(
                 "  name={} street={} city={} phone={}",
@@ -265,8 +263,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let key = DatabaseEntry::from_bytes(b"CARROT-001");
         let mut data = DatabaseEntry::new();
-        let status = item_db.get(None, &key, &mut data)?;
-        if status == OperationStatus::Success {
+        let status = item_db.get_into(None, &key, &mut data)?;
+        if status {
             let item = item_binding.entry_to_object(&data)?;
             println!(
                 "  sku={} name='{}' vendor='{}' price={:.2} qty={}",
@@ -284,7 +282,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // =========================================================================
     println!("\nAll inventory items (sorted by SKU):");
     {
-        let mut cursor = item_db.open_cursor(None, None)?;
+        let mut cursor = item_db.open_cursor(None)?;
         let mut key = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
 
@@ -306,7 +304,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let target_vendor = "Acme Foods";
     println!("\nItems supplied by '{}':", target_vendor);
     {
-        let mut cursor = item_db.open_cursor(None, None)?;
+        let mut cursor = item_db.open_cursor(None)?;
         let mut key = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
 
@@ -326,8 +324,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Look up the vendor details.
         let vendor_key = DatabaseEntry::from_bytes(target_vendor.as_bytes());
         let mut vendor_data = DatabaseEntry::new();
-        let vstatus = vendor_db.get(None, &vendor_key, &mut vendor_data)?;
-        if vstatus == OperationStatus::Success {
+        let vstatus =
+            vendor_db.get_into(None, &vendor_key, &mut vendor_data)?;
+        if vstatus {
             let vendor = vendor_binding.entry_to_object(&vendor_data)?;
             println!(
                 "  Vendor contact: {} — {} — {}",
@@ -341,7 +340,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // =========================================================================
     println!("\nAll vendors (sorted by name):");
     {
-        let mut cursor = vendor_db.open_cursor(None, None)?;
+        let mut cursor = vendor_db.open_cursor(None)?;
         let mut key = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
 
@@ -363,7 +362,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nRound-trip verification for all items:");
     {
         let mut verified = 0usize;
-        let mut cursor = item_db.open_cursor(None, None)?;
+        let mut cursor = item_db.open_cursor(None)?;
         let mut key = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
 

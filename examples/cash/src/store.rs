@@ -5,7 +5,6 @@ use std::time::{Duration, Instant};
 
 use noxu::{
     Database, DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
-    OperationStatus,
 };
 use parking_lot::RwLock;
 
@@ -317,8 +316,8 @@ impl CashStore {
             // Fall through to Noxu DB
             let db_key = DatabaseEntry::from_bytes(key);
             let mut db_val = DatabaseEntry::new();
-            match self.db.get(None, &db_key, &mut db_val) {
-                Ok(OperationStatus::Success) => {
+            match self.db.get_into(None, &db_key, &mut db_val) {
+                Ok(true) => {
                     if let Some(raw) = db_val.get_data() {
                         if let Some((flags, cas_token, data)) =
                             decode_value(raw)
@@ -372,7 +371,7 @@ impl CashStore {
 
         let db_key = DatabaseEntry::from_bytes(key);
         let db_val = DatabaseEntry::from_bytes(&encoded);
-        self.db.put(None, &db_key, &db_val)?;
+        self.db.put(db_key.data(), db_val.data())?;
 
         // Update TTL
         self.ttl.write().set(key.to_vec(), exptime);
@@ -484,22 +483,17 @@ impl CashStore {
 
     /// Delete a key.
     pub fn delete(&self, key: &[u8]) -> Result<bool, StoreError> {
-        let db_key = DatabaseEntry::from_bytes(key);
-        match self.db.delete(None, &db_key) {
-            Ok(OperationStatus::Success) => {
+        match self.db.delete(key) {
+            Ok(true) => {
                 self.cache.write().remove(key);
                 self.ttl.write().remove(key);
                 self.stats.delete_hits.fetch_add(1, Ordering::Relaxed);
                 Ok(true)
             }
-            Ok(OperationStatus::NotFound) => {
+            Ok(false) => {
                 // Also remove from cache in case of stale entry
                 self.cache.write().remove(key);
                 self.ttl.write().remove(key);
-                self.stats.delete_misses.fetch_add(1, Ordering::Relaxed);
-                Ok(false)
-            }
-            Ok(_) => {
                 self.stats.delete_misses.fetch_add(1, Ordering::Relaxed);
                 Ok(false)
             }
@@ -530,8 +524,7 @@ impl CashStore {
         let expired_keys = self.ttl.write().drain_expired();
         let count = expired_keys.len();
         for key in &expired_keys {
-            let db_key = DatabaseEntry::from_bytes(key);
-            let _ = self.db.delete(None, &db_key);
+            let _ = self.db.delete(key);
             self.cache.write().remove(key);
         }
         count
@@ -660,10 +653,7 @@ impl CashStore {
         // Check DB
         let db_key = DatabaseEntry::from_bytes(key);
         let mut db_val = DatabaseEntry::new();
-        matches!(
-            self.db.get(None, &db_key, &mut db_val),
-            Ok(OperationStatus::Success)
-        )
+        matches!(self.db.get_into(None, &db_key, &mut db_val), Ok(true))
     }
 
     /// Get raw value: (flags, cas_token, data, exptime_as_seconds_remaining).
@@ -702,8 +692,8 @@ impl CashStore {
         // DB fallback
         let db_key = DatabaseEntry::from_bytes(key);
         let mut db_val = DatabaseEntry::new();
-        match self.db.get(None, &db_key, &mut db_val) {
-            Ok(OperationStatus::Success) => {
+        match self.db.get_into(None, &db_key, &mut db_val) {
+            Ok(true) => {
                 let raw = db_val.get_data()?;
                 let (flags, cas_token, data) = decode_value(raw)?;
                 let expiry = self.ttl.read().get_expiry(key);

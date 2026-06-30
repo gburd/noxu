@@ -35,13 +35,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (name, color) in &fruits {
         let key = DatabaseEntry::from_bytes(name.as_bytes());
         let data = DatabaseEntry::from_bytes(color.as_bytes());
-        db.put(None, &key, &data)?;
+        db.put(&key, &data)?;
     }
 
     // --- Forward scan ---
     println!("\n=== Forward Scan (First -> Next) ===");
     {
-        let mut cursor = db.open_cursor(None, None)?;
+        let mut cursor = db.open_cursor(None)?;
         let mut key = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
 
@@ -57,7 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Reverse scan ---
     println!("\n=== Reverse Scan (Last -> Prev) ===");
     {
-        let mut cursor = db.open_cursor(None, None)?;
+        let mut cursor = db.open_cursor(None)?;
         let mut key = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
 
@@ -73,7 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Search and iterate forward from a position ---
     println!("\n=== Search for 'cherry' then iterate forward ===");
     {
-        let mut cursor = db.open_cursor(None, None)?;
+        let mut cursor = db.open_cursor(None)?;
         let mut search_key = DatabaseEntry::from_bytes(b"cherry");
         let mut data = DatabaseEntry::new();
 
@@ -101,7 +101,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Cursor-based deletion ---
     println!("\n=== Cursor delete: remove 'banana' ===");
     {
-        let mut cursor = db.open_cursor(None, None)?;
+        let mut cursor = db.open_cursor(None)?;
         let mut search_key = DatabaseEntry::from_bytes(b"banana");
         let mut data = DatabaseEntry::new();
 
@@ -118,7 +118,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Verify deletion with another scan ---
     println!("\n=== After deletion (banana should be gone) ===");
     {
-        let mut cursor = db.open_cursor(None, None)?;
+        let mut cursor = db.open_cursor(None)?;
         let mut key = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
 
