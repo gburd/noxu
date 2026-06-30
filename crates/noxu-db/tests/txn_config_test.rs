@@ -64,15 +64,14 @@ fn test_no_wait_causes_immediate_lock_failure() {
 
     // Writer 1: hold a write lock
     let txn1 = env.begin_transaction(None).unwrap();
-    db.put(Some(&txn1), &key, &val).unwrap();
+    db.put_in(&txn1, &key, &val).unwrap();
 
     // Writer 2: try to write same key with no_wait — should fail immediately
     let config = TransactionConfig::new().with_no_wait(true);
     let txn2 = env.begin_transaction(Some(&config)).unwrap();
 
     let start = Instant::now();
-    let result =
-        db.put(Some(&txn2), &key, &DatabaseEntry::from_bytes(b"value2"));
+    let result = db.put_in(&txn2, &key, DatabaseEntry::from_bytes(b"value2"));
     let elapsed = start.elapsed();
 
     // Should have failed quickly (< 100ms), not after the default 500ms timeout
@@ -100,14 +99,14 @@ fn test_lock_timeout_bounds_wait_time() {
 
     // Writer 1 holds the lock
     let txn1 = env.begin_transaction(None).unwrap();
-    db.put(Some(&txn1), &key, &val).unwrap();
+    db.put_in(&txn1, &key, &val).unwrap();
 
     // Writer 2 with 50ms lock timeout
     let config = TransactionConfig::new().with_lock_timeout_ms(50);
     let txn2 = env.begin_transaction(Some(&config)).unwrap();
 
     let start = Instant::now();
-    let result = db.put(Some(&txn2), &key, &DatabaseEntry::from_bytes(b"v2"));
+    let result = db.put_in(&txn2, &key, DatabaseEntry::from_bytes(b"v2"));
     let elapsed = start.elapsed();
 
     // Should timeout within ~50ms (+/- some jitter)

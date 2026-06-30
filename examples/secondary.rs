@@ -66,7 +66,7 @@ fn put_employee(
     let value = DatabaseEntry::from_bytes(value_str.as_bytes());
 
     // Insert into primary.
-    primary.lock().put(None, &key, &value)?;
+    primary.lock().put(&key, &value)?;
 
     // Update secondary index.  Pass `None` for the txn — this example
     // demonstrates auto-commit; see `docs/src/transactions/secondary-with-txn.md`
@@ -152,8 +152,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let eng_key = DatabaseEntry::from_bytes(b"Engineering");
     let mut p_key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
-    let status = secondary.get(None, &eng_key, &mut p_key, &mut data)?;
-    if status == OperationStatus::Success {
+    let status = secondary.get_into(None, &eng_key, &mut p_key, &mut data)?;
+    if status {
         let employee =
             std::str::from_utf8(p_key.get_data().unwrap_or(b"")).unwrap_or("?");
         let record =
@@ -163,8 +163,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\nLooking up by department 'HR':");
     let hr_key = DatabaseEntry::from_bytes(b"HR");
-    let status = secondary.get(None, &hr_key, &mut p_key, &mut data)?;
-    if status == OperationStatus::Success {
+    let status = secondary.get_into(None, &hr_key, &mut p_key, &mut data)?;
+    if status {
         let employee =
             std::str::from_utf8(p_key.get_data().unwrap_or(b"")).unwrap_or("?");
         let record =
@@ -174,7 +174,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\nLooking up by department 'Finance' (should not exist):");
     let fin_key = DatabaseEntry::from_bytes(b"Finance");
-    let status = secondary.get(None, &fin_key, &mut p_key, &mut data)?;
+    let status = secondary.get_into(None, &fin_key, &mut p_key, &mut data)?;
     println!("  Status: {:?}", status);
 
     // --- Iterate all entries via SecondaryCursor ---
@@ -182,7 +182,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "\nIterating all employees via SecondaryCursor (sorted by department):"
     );
     {
-        let mut cursor = secondary.open_cursor(None, None)?;
+        let mut cursor = secondary.open_cursor(None)?;
         let mut sec_key = DatabaseEntry::new();
         let mut cursor_p_key = DatabaseEntry::new();
         let mut cursor_data = DatabaseEntry::new();
@@ -217,7 +217,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Search for first employee in Marketing via cursor ---
     println!("\nSearching secondary cursor for 'Marketing':");
     {
-        let mut cursor2 = secondary.open_cursor(None, None)?;
+        let mut cursor2 = secondary.open_cursor(None)?;
         let mkt_key = DatabaseEntry::from_bytes(b"Marketing");
         let mut pk2 = DatabaseEntry::new();
         let mut d2 = DatabaseEntry::new();
@@ -240,18 +240,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let carol_val_str = "Engineering|Staff Engineer".to_string();
     let carol_val = DatabaseEntry::from_bytes(carol_val_str.as_bytes());
     secondary.update_secondary(None, &carol_key, Some(&carol_val), None)?;
-    let del_status = primary.lock().delete(None, &carol_key)?;
+    let del_status = primary.lock().delete(&carol_key)?;
     println!("  Primary delete status: {:?}", del_status);
 
     // Verify Carol is gone from primary.
     let mut check_data = DatabaseEntry::new();
-    let check_status = primary.lock().get(None, &carol_key, &mut check_data)?;
+    let check_status =
+        primary.lock().get_into(None, &carol_key, &mut check_data)?;
     println!("  Carol in primary after delete: {:?}", check_status);
 
     // The secondary Engineering key now maps to one fewer employee.
     println!("\nEngineering department entries after deleting Carol:");
     {
-        let mut cursor3 = secondary.open_cursor(None, None)?;
+        let mut cursor3 = secondary.open_cursor(None)?;
         let eng_search = DatabaseEntry::from_bytes(b"Engineering");
         let mut pk3 = DatabaseEntry::new();
         let mut d3 = DatabaseEntry::new();

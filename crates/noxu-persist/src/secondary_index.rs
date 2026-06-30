@@ -164,20 +164,20 @@ where
         _primary: &crate::primary_index::PrimaryIndex<PK, E>,
         sk: &SK,
     ) -> Result<Option<E>> {
-        let key = DatabaseEntry::from_vec(sk.to_bytes());
+        let key = sk.to_bytes();
         let mut p_key = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
-        let status = self.secondary.get(txn, &key, &mut p_key, &mut data)?;
-        match status {
-            OperationStatus::Success => {
-                let bytes = data.get_data().ok_or_else(|| {
-                    PersistError::SerializationError(
-                        "empty primary data from secondary join".to_string(),
-                    )
-                })?;
-                Ok(Some(self.decode_primary(bytes, serializer)?))
-            }
-            _ => Ok(None),
+        let found =
+            self.secondary.get_into(txn, &key, &mut p_key, &mut data)?;
+        if found {
+            let bytes = data.get_data().ok_or_else(|| {
+                PersistError::SerializationError(
+                    "empty primary data from secondary join".to_string(),
+                )
+            })?;
+            Ok(Some(self.decode_primary(bytes, serializer)?))
+        } else {
+            Ok(None)
         }
     }
 
@@ -225,9 +225,12 @@ where
         _primary: &crate::primary_index::PrimaryIndex<PK, E>,
         sk: &SK,
     ) -> Result<bool> {
-        let key = DatabaseEntry::from_vec(sk.to_bytes());
-        let status = self.secondary.delete(txn, &key)?;
-        Ok(status == OperationStatus::Success)
+        let key = sk.to_bytes();
+        let deleted = match txn {
+            Some(t) => self.secondary.delete_in(t, &key)?,
+            None => self.secondary.delete(&key)?,
+        };
+        Ok(deleted)
     }
 
     // -----------------------------------------------------------------------
@@ -280,7 +283,10 @@ where
         from: Option<&SK>,
     ) -> Vec<Result<(SK, E)>> {
         let mut out = Vec::new();
-        let mut cursor = match self.secondary.open_cursor(txn, None) {
+        let mut cursor = match match txn {
+            Some(t) => self.secondary.open_cursor_in(t, None),
+            None => self.secondary.open_cursor(None),
+        } {
             Ok(c) => c,
             Err(e) => {
                 out.push(Err(e.into()));
@@ -339,7 +345,7 @@ where
     /// you need a transactional read.
     pub fn keys_index(&self) -> Vec<(SK, PK)> {
         let mut out = Vec::new();
-        let mut cursor = match self.secondary.open_cursor(None, None) {
+        let mut cursor = match self.secondary.open_cursor(None) {
             Ok(c) => c,
             Err(_) => return out,
         };
@@ -368,7 +374,7 @@ where
     /// duplicate run).  Auto-commit.
     pub fn sub_index(&self, sk: &SK) -> Vec<PK> {
         let mut out = Vec::new();
-        let mut cursor = match self.secondary.open_cursor(None, None) {
+        let mut cursor = match self.secondary.open_cursor(None) {
             Ok(c) => c,
             Err(_) => return out,
         };

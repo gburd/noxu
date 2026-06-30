@@ -49,11 +49,11 @@ fn d5_insert_before_positioned_cursor_get_current_still_returns_k() {
     let (_env, db) = open_env_db(&dir);
 
     // Insert three keys; position cursor on "bravo".
-    db.put(None, &de(b"alpha"), &de(b"1")).unwrap();
-    db.put(None, &de(b"bravo"), &de(b"2")).unwrap();
-    db.put(None, &de(b"delta"), &de(b"3")).unwrap();
+    db.put(de(b"alpha"), de(b"1")).unwrap();
+    db.put(de(b"bravo"), de(b"2")).unwrap();
+    db.put(de(b"delta"), de(b"3")).unwrap();
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut k = de(b"bravo");
     let mut d = DatabaseEntry::new();
     let s = cursor.get(&mut k, &mut d, Get::Search, None).unwrap();
@@ -64,7 +64,7 @@ fn d5_insert_before_positioned_cursor_get_current_still_returns_k() {
     // "b_sub" which sorts between "alpha" and "bravo" to shift bravo's index).
     // We insert "b_aaa" which sorts before "bravo" but after "alpha", pushing
     // "bravo" from index 1 → 2.
-    db.put(None, &de(b"b_aaa"), &de(b"0")).unwrap();
+    db.put(de(b"b_aaa"), de(b"0")).unwrap();
 
     // Get::Current must still return "bravo" even though its BIN index shifted.
     let mut ck = DatabaseEntry::new();
@@ -88,11 +88,11 @@ fn d1_delete_then_next_returns_successor() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open_env_db(&dir);
 
-    db.put(None, &de(b"A"), &de(b"1")).unwrap();
-    db.put(None, &de(b"B"), &de(b"2")).unwrap();
-    db.put(None, &de(b"C"), &de(b"3")).unwrap();
+    db.put(de(b"A"), de(b"1")).unwrap();
+    db.put(de(b"B"), de(b"2")).unwrap();
+    db.put(de(b"C"), de(b"3")).unwrap();
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut k = de(b"B");
     let mut d = DatabaseEntry::new();
     let s = cursor.get(&mut k, &mut d, Get::Search, None).unwrap();
@@ -126,11 +126,11 @@ fn d1_delete_then_prev_returns_predecessor() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open_env_db(&dir);
 
-    db.put(None, &de(b"A"), &de(b"1")).unwrap();
-    db.put(None, &de(b"B"), &de(b"2")).unwrap();
-    db.put(None, &de(b"C"), &de(b"3")).unwrap();
+    db.put(de(b"A"), de(b"1")).unwrap();
+    db.put(de(b"B"), de(b"2")).unwrap();
+    db.put(de(b"C"), de(b"3")).unwrap();
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut k = de(b"B");
     let mut d = DatabaseEntry::new();
     cursor.get(&mut k, &mut d, Get::Search, None).unwrap();
@@ -160,10 +160,10 @@ fn d1_delete_last_entry_next_returns_not_found() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open_env_db(&dir);
 
-    db.put(None, &de(b"A"), &de(b"1")).unwrap();
-    db.put(None, &de(b"B"), &de(b"2")).unwrap();
+    db.put(de(b"A"), de(b"1")).unwrap();
+    db.put(de(b"B"), de(b"2")).unwrap();
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut k = de(b"B");
     let mut d = DatabaseEntry::new();
     cursor.get(&mut k, &mut d, Get::Search, None).unwrap();
@@ -181,10 +181,10 @@ fn d1_delete_first_entry_prev_returns_not_found() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open_env_db(&dir);
 
-    db.put(None, &de(b"A"), &de(b"1")).unwrap();
-    db.put(None, &de(b"B"), &de(b"2")).unwrap();
+    db.put(de(b"A"), de(b"1")).unwrap();
+    db.put(de(b"B"), de(b"2")).unwrap();
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut k = de(b"A");
     let mut d = DatabaseEntry::new();
     cursor.get(&mut k, &mut d, Get::Search, None).unwrap();
@@ -207,10 +207,10 @@ fn d1_iterate_and_delete_all_records() {
 
     let keys: &[&[u8]] = &[b"A", b"B", b"C", b"D", b"E"];
     for k in keys {
-        db.put(None, &de(k), &de(b"v")).unwrap();
+        db.put(de(k), de(b"v")).unwrap();
     }
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut k = DatabaseEntry::new();
     let mut d = DatabaseEntry::new();
     let mut status = cursor.get(&mut k, &mut d, Get::First, None).unwrap();

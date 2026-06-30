@@ -69,7 +69,7 @@ fn noxu_populate(db: &noxu_db::Database) {
     for i in 0..N {
         let k = DatabaseEntry::from_vec(key(i));
         let v = DatabaseEntry::from_bytes(VALUE);
-        db.put(None, &k, &v).unwrap();
+        db.put(&k, &v).unwrap();
     }
 }
 
@@ -153,7 +153,7 @@ fn bench_single_put(c: &mut Criterion) {
             b.iter(|| {
                 let k = DatabaseEntry::from_vec(key(counter % N));
                 let v = DatabaseEntry::from_bytes(VALUE);
-                black_box(db.put(None, &k, &v).unwrap());
+                db.put(&k, &v).unwrap();
                 counter += 1;
             });
         });
@@ -223,7 +223,7 @@ fn bench_single_get_hit(c: &mut Criterion) {
         group.bench_function("noxu", |b| {
             b.iter(|| {
                 let mut data = DatabaseEntry::new();
-                black_box(db.get(None, &k, &mut data).unwrap());
+                black_box(db.get_into(None, &k, &mut data).unwrap());
             });
         });
     }
@@ -281,7 +281,7 @@ fn bench_single_get_miss(c: &mut Criterion) {
         group.bench_function("noxu", |b| {
             b.iter(|| {
                 let mut data = DatabaseEntry::new();
-                black_box(db.get(None, &k, &mut data).unwrap());
+                black_box(db.get_into(None, &k, &mut data).unwrap());
             });
         });
     }
@@ -337,7 +337,7 @@ fn bench_seq_scan_1000(c: &mut Criterion) {
         noxu_populate(&db);
         group.bench_function("noxu", |b| {
             b.iter(|| {
-                let mut cursor = db.open_cursor(None, None).unwrap();
+                let mut cursor = db.open_cursor(None).unwrap();
                 let mut key_entry = DatabaseEntry::new();
                 let mut data = DatabaseEntry::new();
                 let mut count = 0u32;
@@ -422,7 +422,7 @@ fn bench_bulk_load_1000(c: &mut Criterion) {
                 for k in &keys {
                     let ke = DatabaseEntry::from_vec(k.clone());
                     let ve = DatabaseEntry::from_bytes(VALUE);
-                    black_box(db.put(None, &ke, &ve).unwrap());
+                    db.put(&ke, &ve).unwrap();
                 }
             },
             BatchSize::SmallInput,

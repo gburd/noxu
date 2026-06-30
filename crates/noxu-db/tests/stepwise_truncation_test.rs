@@ -88,7 +88,7 @@ fn open_db(env: &noxu_db::Environment) -> noxu_db::Database {
 }
 
 fn collect_all(db: &noxu_db::Database) -> BTreeMap<Vec<u8>, Vec<u8>> {
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut map = BTreeMap::new();
     let mut key = DatabaseEntry::new();
     let mut val = DatabaseEntry::new();
@@ -289,9 +289,8 @@ fn stepwise_truncation_basic_insert() {
             let k = format!("key_{i:04}");
             let v = format!("val_{i:04}");
             db.put(
-                None,
-                &DatabaseEntry::from_bytes(k.as_bytes()),
-                &DatabaseEntry::from_bytes(v.as_bytes()),
+                DatabaseEntry::from_bytes(k.as_bytes()),
+                DatabaseEntry::from_bytes(v.as_bytes()),
             )
             .unwrap();
         }

@@ -79,7 +79,7 @@ fn open(dir: &Path, algo: &str) -> (Environment, Database) {
 fn populate(db: &Database) {
     let val = vec![0xABu8; VALUE_LEN];
     for i in 0..N_RECORDS {
-        db.put(None, &key(i), &DatabaseEntry::from_bytes(&val)).unwrap();
+        db.put(key(i), DatabaseEntry::from_bytes(&val)).unwrap();
     }
 }
 
@@ -90,8 +90,8 @@ fn run_random(db: &Database) -> f64 {
     let start = Instant::now();
     for _ in 0..OPS_RANDOM {
         let i = rng.gen_range(0..N_RECORDS);
-        let st = db.get(None, &key(i), &mut out).unwrap();
-        debug_assert_eq!(st, OperationStatus::Success);
+        let st = db.get_into(None, key(i), &mut out).unwrap();
+        debug_assert!(st);
     }
     OPS_RANDOM as f64 / start.elapsed().as_secs_f64()
 }
@@ -101,7 +101,7 @@ fn run_scan(db: &Database) -> f64 {
     let start = Instant::now();
     let mut ops = 0usize;
     for _ in 0..SCAN_PASSES {
-        let mut cursor = db.open_cursor(None, None).unwrap();
+        let mut cursor = db.open_cursor(None).unwrap();
         // Position at the first key via SearchGte (Get::First is unreliable on
         // this build for a full forward scan; SearchGte from key 0 is the
         // pattern the existing w05_range_scan workload uses).
@@ -126,9 +126,9 @@ fn run_mixed(db: &Database) -> f64 {
     for _ in 0..OPS_MIXED {
         let i = rng.gen_range(0..N_RECORDS);
         if rng.gen_bool(0.30) {
-            db.put(None, &key(i), &DatabaseEntry::from_bytes(&val)).unwrap();
+            db.put(key(i), DatabaseEntry::from_bytes(&val)).unwrap();
         } else {
-            db.get(None, &key(i), &mut out).unwrap();
+            db.get_into(None, key(i), &mut out).unwrap();
         }
     }
     OPS_MIXED as f64 / start.elapsed().as_secs_f64()

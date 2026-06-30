@@ -38,10 +38,10 @@ fn d2_both_range_non_dup_non_matching_data_returns_not_found() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open_env_db(&dir);
 
-    db.put(None, &de(b"key1"), &de(b"data1")).unwrap();
-    db.put(None, &de(b"key2"), &de(b"data2")).unwrap();
+    db.put(de(b"key1"), de(b"data1")).unwrap();
+    db.put(de(b"key2"), de(b"data2")).unwrap();
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut k = de(b"key1");
     let mut d = de(b"WRONG_DATA"); // data does NOT match stored "data1"
 
@@ -64,9 +64,9 @@ fn d2_both_range_non_dup_exact_data_returns_success() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open_env_db(&dir);
 
-    db.put(None, &de(b"key1"), &de(b"data1")).unwrap();
+    db.put(de(b"key1"), de(b"data1")).unwrap();
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut k = de(b"key1");
     let mut d = de(b"data1"); // exact match
 
@@ -87,9 +87,9 @@ fn d2_both_range_non_dup_missing_key_returns_not_found() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open_env_db(&dir);
 
-    db.put(None, &de(b"key2"), &de(b"data2")).unwrap();
+    db.put(de(b"key2"), de(b"data2")).unwrap();
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut k = de(b"key1"); // key1 doesn't exist; key2 does
     let mut d = de(b"data2");
 

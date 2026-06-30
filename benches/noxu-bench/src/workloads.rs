@@ -26,7 +26,7 @@ pub fn w01_seq_write(db: &Database, n: usize, value: &[u8]) -> usize {
     for i in 0..n {
         let k = DatabaseEntry::from_vec(make_key(i));
         let v = DatabaseEntry::from_bytes(value);
-        db.put(None, &k, &v).unwrap();
+        db.put(&k, &v).unwrap();
     }
     n
 }
@@ -44,7 +44,7 @@ pub fn w02_rand_write(db: &Database, n: usize, value: &[u8]) -> usize {
     for i in keys {
         let k = DatabaseEntry::from_vec(make_key(i));
         let v = DatabaseEntry::from_bytes(value);
-        db.put(None, &k, &v).unwrap();
+        db.put(&k, &v).unwrap();
     }
     n
 }
@@ -60,7 +60,7 @@ pub fn w03_seq_read(db: &Database, n: usize) -> usize {
     let mut data = DatabaseEntry::new();
     for i in 0..n {
         let k = DatabaseEntry::from_vec(make_key(i));
-        let _ = db.get(None, &k, &mut data).unwrap();
+        let _ = db.get_into(None, &k, &mut data).unwrap();
     }
     n
 }
@@ -78,7 +78,7 @@ pub fn w04_rand_read(db: &Database, n: usize) -> usize {
     for _ in 0..n {
         let idx: usize = rng.gen_range(0..n);
         let k = DatabaseEntry::from_vec(make_key(idx));
-        let _ = db.get(None, &k, &mut data).unwrap();
+        let _ = db.get_into(None, &k, &mut data).unwrap();
     }
     n
 }
@@ -102,7 +102,7 @@ pub fn w05_range_scan(db: &Database, n: usize) -> usize {
         let start_idx = scan * scan_len;
         let start_bytes = make_key(start_idx);
 
-        let mut cursor = db.open_cursor(None, None).unwrap();
+        let mut cursor = db.open_cursor(None).unwrap();
         let mut start_key = DatabaseEntry::from_vec(start_bytes);
         let mut data_e = DatabaseEntry::new();
 
@@ -141,10 +141,10 @@ pub fn w06_write_heavy(db: &Database, n: usize, value: &[u8]) -> usize {
         let k = DatabaseEntry::from_vec(make_key(i % n));
         if i % 10 == 9 {
             // 10th operation is a read
-            let _ = db.get(None, &k, &mut data).unwrap();
+            let _ = db.get_into(None, &k, &mut data).unwrap();
         } else {
             // first 9 are writes
-            db.put(None, &k, &v).unwrap();
+            db.put(&k, &v).unwrap();
         }
     }
     n
@@ -164,10 +164,10 @@ pub fn w07_read_heavy(db: &Database, n: usize, value: &[u8]) -> usize {
         let k = DatabaseEntry::from_vec(make_key(i % n));
         if i % 10 == 9 {
             // 10th operation is a write
-            db.put(None, &k, &v).unwrap();
+            db.put(&k, &v).unwrap();
         } else {
             // first 9 are reads
-            let _ = db.get(None, &k, &mut data).unwrap();
+            let _ = db.get_into(None, &k, &mut data).unwrap();
         }
     }
     n
@@ -185,8 +185,8 @@ pub fn w08_delete_insert(db: &Database, n: usize, value: &[u8]) -> usize {
     let v = DatabaseEntry::from_bytes(value);
     for i in 0..n {
         let k = DatabaseEntry::from_vec(make_key(i));
-        let _ = db.delete(None, &k).unwrap();
-        db.put(None, &k, &v).unwrap();
+        let _ = db.delete(&k).unwrap();
+        db.put(&k, &v).unwrap();
     }
     2 * n
 }
@@ -214,13 +214,13 @@ pub fn w09_txn_multi(
         for delta in 0..3usize {
             let k = DatabaseEntry::from_vec(make_key((i + delta) % n));
             let mut data = DatabaseEntry::new();
-            let _ = db.get(Some(&txn), &k, &mut data).unwrap();
+            let _ = db.get_into(Some(&txn), &k, &mut data).unwrap();
         }
 
         // 2 puts at key i, i+1 (wrap around)
         for delta in 0..2usize {
             let k = DatabaseEntry::from_vec(make_key((i + delta) % n));
-            db.put(Some(&txn), &k, &v).unwrap();
+            db.put_in(&txn, &k, &v).unwrap();
         }
 
         txn.commit().unwrap();
@@ -254,7 +254,7 @@ pub fn w12_xa_2pc(
         {
             let txn = xa.get_transaction(&xid).unwrap();
             let k = DatabaseEntry::from_vec(make_key(i % n.max(1)));
-            db.put(Some(&*txn), &k, &v).unwrap();
+            db.put_in(&txn, &k, &v).unwrap();
             xa.mark_write(&xid).unwrap();
         }
 
@@ -287,7 +287,7 @@ pub fn w12_xa_1pc(
         {
             let txn = xa.get_transaction(&xid).unwrap();
             let k = DatabaseEntry::from_vec(make_key(i % n.max(1)));
-            db.put(Some(&*txn), &k, &v).unwrap();
+            db.put_in(&txn, &k, &v).unwrap();
             xa.mark_write(&xid).unwrap();
         }
 
@@ -398,7 +398,7 @@ pub fn w13_setup(
         let pri = primary.lock();
         for i in 0..n {
             let k = DatabaseEntry::from_vec(make_key(i));
-            pri.put(None, &k, &v).unwrap();
+            pri.put(&k, &v).unwrap();
         }
     }
 
@@ -426,7 +426,7 @@ pub fn w13_secondary_dup_walk(
     secondary: &SecondaryDatabase,
     n: usize,
 ) -> usize {
-    let mut cursor = secondary.open_cursor(None, None).unwrap();
+    let mut cursor = secondary.open_cursor(None).unwrap();
     let mut sec_key = DatabaseEntry::new();
     let mut p_key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();

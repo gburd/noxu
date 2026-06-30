@@ -47,9 +47,7 @@
 //! # (edit SEED below, or use the determinism test which runs a fixed seed)
 //! ```
 
-use noxu_db::{
-    DatabaseConfig, DatabaseEntry, EnvironmentConfig, OperationStatus,
-};
+use noxu_db::{DatabaseConfig, DatabaseEntry, EnvironmentConfig};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
@@ -150,24 +148,15 @@ fn recover_snapshot(dir: &Path) -> Result<BTreeMap<u32, Vec<u8>>, String> {
     for i in 0u32..50 {
         let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
         let mut val = DatabaseEntry::new();
-        match db.get(None, &key, &mut val).map_err(|e| e.to_string())? {
-            OperationStatus::Success => {
-                present.insert(i, val.data().to_vec());
-            }
-            OperationStatus::NotFound => {}
-            other => {
-                return Err(format!("unexpected status {other:?} key {i}"));
-            }
+        if db.get_into(None, &key, &mut val).map_err(|e| e.to_string())? {
+            present.insert(i, val.data().to_vec());
         }
     }
     // Uncommitted keys (1000..1050) must never be visible.
     for i in 1000u32..1050 {
         let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
         let mut val = DatabaseEntry::new();
-        if matches!(
-            db.get(None, &key, &mut val).map_err(|e| e.to_string())?,
-            OperationStatus::Success
-        ) {
+        if db.get_into(None, &key, &mut val).map_err(|e| e.to_string())? {
             return Err(format!("uncommitted key {i} leaked"));
         }
     }

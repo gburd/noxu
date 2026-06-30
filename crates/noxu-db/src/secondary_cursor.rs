@@ -36,7 +36,7 @@ use crate::transaction::Transaction;
 ///
 /// # Example
 /// ```ignore
-/// let mut cursor = secondary_db.open_cursor(None, None)?;
+/// let mut cursor = secondary_db.open_cursor(None)?;
 /// let mut sec_key = DatabaseEntry::new();
 /// let mut p_key   = DatabaseEntry::new();
 /// let mut data    = DatabaseEntry::new();
@@ -50,7 +50,7 @@ use crate::transaction::Transaction;
 /// ```
 pub struct SecondaryCursor<'a> {
     /// Cursor over the secondary index storage (sec_key -> pri_key).
-    inner: Cursor,
+    inner: Cursor<'a>,
     /// Back-reference to the owning SecondaryDatabase (for primary lookups).
     secondary_db: &'a SecondaryDatabase,
     /// Transaction handle the cursor was opened under.
@@ -88,7 +88,8 @@ impl<'a> SecondaryCursor<'a> {
         config: Option<&CursorConfig>,
     ) -> Result<Self> {
         let read_uncommitted = config.is_some_and(|c| c.read_uncommitted);
-        let inner = secondary_db.inner_db().open_cursor(txn, config)?;
+        let inner =
+            secondary_db.inner_db().open_cursor_internal(txn, config)?;
         Ok(Self {
             inner,
             secondary_db,
@@ -175,23 +176,30 @@ impl<'a> SecondaryCursor<'a> {
         // by a delete in the same txn) and so cross-txn isolation is
         // honoured.
         let mut pri_data = DatabaseEntry::new();
-        let pri_get_status = {
+        let pri_found = {
             let primary = self.secondary_db.primary_db().lock();
-            primary.get(self.txn, &pri_key, &mut pri_data)?
+            primary.get_into(self.txn, &pri_key, &mut pri_data)?
         };
 
-        if pri_get_status == OperationStatus::Success {
+        if pri_found {
             // primary.delete() auto-maintains secondary entries via the hook.
             // Do NOT call delete_all_for_primary first (would trigger D7).
         }
 
         // Delete the primary; the auto-hook removes all secondary entries.
-        let del_status = {
+        let deleted = {
             let primary = self.secondary_db.primary_db().lock();
-            primary.delete(self.txn, &pri_key)?
+            match self.txn {
+                Some(t) => primary.delete_in(t, &pri_key)?,
+                None => primary.delete(&pri_key)?,
+            }
         };
 
-        Ok(del_status)
+        Ok(if deleted {
+            OperationStatus::Success
+        } else {
+            OperationStatus::NotFound
+        })
     }
 
     // ------------------------------------------------------------------
@@ -328,8 +336,8 @@ impl<'a> SecondaryCursor<'a> {
         // isolation (Wave 1B).
         let pri_key_entry = DatabaseEntry::from_bytes(&pri_key_bytes);
         let primary = self.secondary_db.primary_db().lock();
-        let pri_status = primary.get(self.txn, &pri_key_entry, data)?;
-        if pri_status != OperationStatus::Success {
+        let pri_found = primary.get_into(self.txn, &pri_key_entry, data)?;
+        if !pri_found {
             // D8: if running in dirty-read (read-uncommitted) mode, skip
             // the record rather than raising SecondaryIntegrityException.
             // JE SecondaryCursor dirty-read primary-missing skip.
@@ -378,8 +386,8 @@ impl<'a> SecondaryCursor<'a> {
 
         let pri_key_entry = DatabaseEntry::from_bytes(&pri_key_bytes);
         let primary = self.secondary_db.primary_db().lock();
-        let pri_status = primary.get(self.txn, &pri_key_entry, data)?;
-        if pri_status != OperationStatus::Success {
+        let pri_found = primary.get_into(self.txn, &pri_key_entry, data)?;
+        if !pri_found {
             // D8: dirty-read skip (see get_search_key site for full comment).
             if self.read_uncommitted {
                 return Ok(OperationStatus::NotFound);
@@ -584,9 +592,9 @@ impl<'a> SecondaryCursor<'a> {
         // the lookup honours the caller's transaction (Wave 1B).
         let pri_key_entry = DatabaseEntry::from_bytes(&pri_key_bytes);
         let primary = self.secondary_db.primary_db().lock();
-        let pri_status = primary.get(self.txn, &pri_key_entry, data)?;
+        let pri_found = primary.get_into(self.txn, &pri_key_entry, data)?;
 
-        if pri_status != OperationStatus::Success {
+        if !pri_found {
             // D8: dirty-read (read-uncommitted) mode — skip the record
             // instead of raising SecondaryIntegrityException.  The primary
             // may have been concurrently deleted; under dirty-read we return
@@ -727,7 +735,7 @@ mod tests {
         // primary.put() already triggers update_secondary.  Don't call
         // update_secondary manually or the same (sec_key, pri_key) pair
         // will be inserted twice → D6 SecondaryIntegrityException.
-        primary.lock().put(None, &pk, &pv).unwrap();
+        primary.lock().put(&pk, &pv).unwrap();
     }
 
     #[test]
@@ -737,7 +745,7 @@ mod tests {
         insert_and_index(&primary, &secondary, b"pk1", b"Apple");
         insert_and_index(&primary, &secondary, b"pk3", b"Cherry");
 
-        let mut cursor = secondary.open_cursor(None, None).unwrap();
+        let mut cursor = secondary.open_cursor(None).unwrap();
         let mut sec_key = DatabaseEntry::new();
         let mut p_key = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
@@ -760,7 +768,7 @@ mod tests {
         insert_and_index(&primary, &secondary, b"pk2", b"Banana");
         insert_and_index(&primary, &secondary, b"pk3", b"Cherry");
 
-        let mut cursor = secondary.open_cursor(None, None).unwrap();
+        let mut cursor = secondary.open_cursor(None).unwrap();
         let mut sec_key = DatabaseEntry::new();
         let mut p_key = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
@@ -786,7 +794,7 @@ mod tests {
         insert_and_index(&primary, &secondary, b"pk1", b"Mango");
         insert_and_index(&primary, &secondary, b"pk2", b"Kiwi");
 
-        let mut cursor = secondary.open_cursor(None, None).unwrap();
+        let mut cursor = secondary.open_cursor(None).unwrap();
         let search = DatabaseEntry::from_bytes(b"M");
         let mut p_key = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
@@ -803,7 +811,7 @@ mod tests {
         let (_tmp, _env, primary, secondary) = temp_env_primary_secondary();
         insert_and_index(&primary, &secondary, b"pk1", b"Apple");
 
-        let mut cursor = secondary.open_cursor(None, None).unwrap();
+        let mut cursor = secondary.open_cursor(None).unwrap();
         let search = DatabaseEntry::from_bytes(b"Z");
         let mut p_key = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
@@ -817,7 +825,7 @@ mod tests {
     fn test_cursor_empty_database() {
         let (_tmp, _env, _primary, secondary) = temp_env_primary_secondary();
 
-        let mut cursor = secondary.open_cursor(None, None).unwrap();
+        let mut cursor = secondary.open_cursor(None).unwrap();
         let mut sec_key = DatabaseEntry::new();
         let mut p_key = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
@@ -830,7 +838,7 @@ mod tests {
     #[test]
     fn test_cursor_put_not_allowed() {
         let (_tmp, _env, _primary, secondary) = temp_env_primary_secondary();
-        let mut cursor = secondary.open_cursor(None, None).unwrap();
+        let mut cursor = secondary.open_cursor(None).unwrap();
         let key = DatabaseEntry::from_bytes(b"key");
         let data = DatabaseEntry::from_bytes(b"data");
         assert!(cursor.put(&key, &data).is_err());
@@ -839,7 +847,7 @@ mod tests {
     #[test]
     fn test_cursor_close() {
         let (_tmp, _env, _primary, secondary) = temp_env_primary_secondary();
-        let mut cursor = secondary.open_cursor(None, None).unwrap();
+        let mut cursor = secondary.open_cursor(None).unwrap();
         assert!(cursor.is_valid());
         cursor.close().unwrap();
         assert!(!cursor.is_valid());
@@ -852,7 +860,7 @@ mod tests {
         insert_and_index(&primary, &secondary, b"pk2", b"Banana");
         insert_and_index(&primary, &secondary, b"pk3", b"Cherry");
 
-        let mut cursor = secondary.open_cursor(None, None).unwrap();
+        let mut cursor = secondary.open_cursor(None).unwrap();
         let mut sec_key = DatabaseEntry::new();
         let mut p_key = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
@@ -886,7 +894,7 @@ mod tests {
         let (_tmp, _env, primary, secondary) = temp_env_primary_secondary();
         insert_and_index(&primary, &secondary, b"pk1", b"Mango");
 
-        let mut cursor = secondary.open_cursor(None, None).unwrap();
+        let mut cursor = secondary.open_cursor(None).unwrap();
         let mut sec_key = DatabaseEntry::new();
         let mut p_key = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
@@ -915,7 +923,7 @@ mod tests {
         insert_and_index(&primary, &secondary, b"pk2", b"Banana");
         insert_and_index(&primary, &secondary, b"pk3", b"Cherry");
 
-        let mut cursor = secondary.open_cursor(None, None).unwrap();
+        let mut cursor = secondary.open_cursor(None).unwrap();
         // Search key "B" — exact match for first byte of "Banana"
         let mut search_key = DatabaseEntry::from_bytes(b"B");
         let mut p_key = DatabaseEntry::new();
@@ -935,7 +943,7 @@ mod tests {
         insert_and_index(&primary, &secondary, b"pk1", b"Apple");
         insert_and_index(&primary, &secondary, b"pk3", b"Cherry");
 
-        let mut cursor = secondary.open_cursor(None, None).unwrap();
+        let mut cursor = secondary.open_cursor(None).unwrap();
         // Search for "B" — no exact match, but "C" (Cherry) is >= "B"
         let mut search_key = DatabaseEntry::from_bytes(b"B");
         let mut p_key = DatabaseEntry::new();
@@ -953,7 +961,7 @@ mod tests {
         let (_tmp, _env, primary, secondary) = temp_env_primary_secondary();
         insert_and_index(&primary, &secondary, b"pk1", b"Apple");
 
-        let mut cursor = secondary.open_cursor(None, None).unwrap();
+        let mut cursor = secondary.open_cursor(None).unwrap();
         // "Z" is beyond everything
         let mut search_key = DatabaseEntry::from_bytes(b"Z");
         let mut p_key = DatabaseEntry::new();
@@ -974,7 +982,7 @@ mod tests {
         insert_and_index(&primary, &secondary, b"pk3", b"Cherry");
         insert_and_index(&primary, &secondary, b"pk4", b"Durian");
 
-        let mut cursor = secondary.open_cursor(None, None).unwrap();
+        let mut cursor = secondary.open_cursor(None).unwrap();
         let mut sec_key = DatabaseEntry::new();
         let mut p_key = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
@@ -1007,7 +1015,7 @@ mod tests {
         let (_tmp, _env, primary, secondary) = temp_env_primary_secondary();
         insert_and_index(&primary, &secondary, b"mypk", b"Kiwi");
 
-        let mut cursor = secondary.open_cursor(None, None).unwrap();
+        let mut cursor = secondary.open_cursor(None).unwrap();
         let search = DatabaseEntry::from_bytes(b"K"); // first byte of "Kiwi"
         let mut p_key = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
@@ -1023,7 +1031,7 @@ mod tests {
     fn test_cursor_drop_closes_automatically() {
         // Verify Drop impl doesn't panic even when cursor is still valid
         let (_tmp, _env, _primary, secondary) = temp_env_primary_secondary();
-        let cursor = secondary.open_cursor(None, None).unwrap();
+        let cursor = secondary.open_cursor(None).unwrap();
         // Drop without explicit close — should not panic
         drop(cursor);
     }
@@ -1033,7 +1041,7 @@ mod tests {
         let (_tmp, _env, primary, secondary) = temp_env_primary_secondary();
         insert_and_index(&primary, &secondary, b"pk1", b"Apple");
 
-        let mut cursor = secondary.open_cursor(None, None).unwrap();
+        let mut cursor = secondary.open_cursor(None).unwrap();
         let mut sec_key = DatabaseEntry::new();
         let mut p_key = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();

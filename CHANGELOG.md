@@ -15,6 +15,54 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Changed (BREAKING — 7.0 core API reshape)
+
+- **Idiomatic-Rust public API for `noxu-db`.** The core read/write/cursor
+  surface was reshaped so the common path reads as ordinary Rust; the
+  historical out-param + `OperationStatus` + `DatabaseEntry`-everywhere shape
+  is gone from the point-operation surface. This is a source-breaking change
+  for every caller of `Database` / `Cursor` / `SecondaryDatabase`.
+  - **Reads return `Result<Option<Bytes>>`** (review P0-3). `Database::get(key)`
+    auto-commits; `Database::get_in(&txn, key)` reads under an explicit
+    transaction. The lower-level buffer-reuse / partial-read escape hatch is
+    `get_into(txn, key, &mut DatabaseEntry) -> Result<bool>`.
+    `get_with_options(txn, key, opts) -> Result<Option<Bytes>>` (dropped its
+    `&mut out` parameter). `SecondaryDatabase::get` was renamed to
+    `get_into(txn, key, &mut p_key, &mut data) -> Result<bool>`.
+  - **Writes are named auto-commit vs transactional, not a bare `Option`**
+    (review P0-2). `put(key, data) -> Result<()>` / `put_in(&txn, key, data)`;
+    `delete(key) -> Result<bool>` / `delete_in(&txn, key)`;
+    `put_no_overwrite(key, data) -> Result<bool>` / `put_no_overwrite_in(...)`.
+    `put_with_options` / `put_partial` keep an `Option<&Transaction>`.
+  - **Cursors borrow their transaction** (review P0-1).
+    `open_cursor(config) -> Cursor<'static>` for auto-commit;
+    `open_cursor_in(&txn, config) -> Cursor<'txn>`. The borrow checker now
+    rejects committing or dropping a transaction while a cursor on it is alive
+    — the old "close the cursor before commit" prose invariant is a compile
+    error. `Cursor::next`/`prev`/`seek` return `Result<Option<...>>`; the
+    lower-level `Cursor::get`/`put`/`delete` keep `OperationStatus`.
+  - **Keys and values accept `impl AsRef<[u8]>`** (review P1-3) — `b"k"`,
+    `&str`, `Vec<u8>`, `Bytes`, `DatabaseEntry`, etc.; no `DatabaseEntry`
+    wrapper required at the call site. `DatabaseEntry` remains for the
+    buffer-reuse / partial-read escape hatches. Consequence: the historical
+    "None key" (a `DatabaseEntry` with no data set, distinct from an empty
+    `b""`) can no longer be expressed, so the write path no longer rejects it
+    — an empty key is accepted (the three `*_with_none_key_returns_illegal_
+    argument` unit tests were removed; `test_put_with_explicit_empty_key_
+    accepted` is the canonical behaviour).
+- **Consumer-crate cascade.** `noxu-collections`, `noxu-persist`, `noxu-xa`,
+  the `noxu` umbrella, every example (`simple`/quickstart, `getting_started`,
+  `binding`, `cursor_scan`, `sequence`, `transactions`, `transaction_config`,
+  `secondary`, `xa_distributed`, `scale_validation`, and the `cask`/`cash`/
+  `ftdb` example crates) and every benchmark (`api_bench`, the comparison and
+  workload benches) were updated to the new signatures. The collections
+  (`StoredMap`/`StoredSet`/`StoredList`) and persist (`PrimaryIndex`/
+  `SecondaryIndex`/`EntityStore`) public surfaces keep their
+  `Option<&Transaction>` parameters and idiomatic return types — only their
+  internal wiring onto `noxu-db` changed; the DPL transactional-secondary
+  fan-out is preserved. The user guide (getting-started + transactions
+  chapters) was updated to demonstrate the new API.
+
 ### Added
 
 - **Deterministic Simulation Testing (DST) Milestone 1 — seed-reproducible

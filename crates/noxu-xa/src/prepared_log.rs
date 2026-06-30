@@ -34,22 +34,19 @@ impl PreparedLog {
     /// Record that a branch has been prepared.
     pub fn record_prepare(&self, xid: &Xid) -> Result<(), noxu_db::NoxuError> {
         let key = Self::xid_to_key(xid);
-        let k = DatabaseEntry::from_vec(key);
         // Value: current timestamp as u64 (nanos since epoch)
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64;
-        let v = DatabaseEntry::from_vec(now.to_le_bytes().to_vec());
-        self.db.put(None, &k, &v)?;
+        self.db.put(&key, now.to_le_bytes())?;
         Ok(())
     }
 
     /// Remove the prepared record (on commit, rollback, or forget).
     pub fn remove(&self, xid: &Xid) -> Result<(), noxu_db::NoxuError> {
         let key = Self::xid_to_key(xid);
-        let k = DatabaseEntry::from_vec(key);
-        let _ = self.db.delete(None, &k);
+        let _ = self.db.delete(&key);
         Ok(())
     }
 
@@ -60,8 +57,7 @@ impl PreparedLog {
     pub fn recover_all(&self) -> Result<Vec<Xid>, noxu_db::NoxuError> {
         use noxu_db::{CursorConfig, Get};
 
-        let mut cursor =
-            self.db.open_cursor(None, Some(&CursorConfig::new()))?;
+        let mut cursor = self.db.open_cursor(Some(&CursorConfig::new()))?;
         let mut xids = Vec::new();
         let mut key = DatabaseEntry::new();
         let mut val = DatabaseEntry::new();

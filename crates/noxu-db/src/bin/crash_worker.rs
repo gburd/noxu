@@ -64,7 +64,7 @@ fn main() {
                 let txn = env.begin_transaction(None).expect("begin txn");
                 let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
                 let val = DatabaseEntry::from_bytes(b"committed");
-                db.put(Some(&txn), &key, &val).expect("put");
+                db.put_in(&txn, &key, &val).expect("put");
                 txn.commit().expect("commit");
             }
             flag(&dir, "phase1_done");
@@ -74,7 +74,7 @@ fn main() {
             for i in 1000u32..1050 {
                 let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
                 let val = DatabaseEntry::from_bytes(b"uncommitted");
-                db.put(Some(&txn), &key, &val).expect("put");
+                db.put_in(&txn, &key, &val).expect("put");
             }
             flag(&dir, "phase2_started");
             loop {
@@ -87,7 +87,7 @@ fn main() {
             let txn = env.begin_transaction(None).expect("begin txn");
             let sentinel_key = DatabaseEntry::from_bytes(b"sentinel");
             let sentinel_val = DatabaseEntry::from_bytes(b"ok");
-            db.put(Some(&txn), &sentinel_key, &sentinel_val)
+            db.put_in(&txn, &sentinel_key, &sentinel_val)
                 .expect("put sentinel");
             txn.commit().expect("commit sentinel");
             flag(&dir, "sentinel_committed");
@@ -97,7 +97,7 @@ fn main() {
             for i in 0u32..50 {
                 let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
                 let val = DatabaseEntry::from_bytes(b"uncommitted");
-                db.put(Some(&txn), &key, &val).expect("put");
+                db.put_in(&txn, &key, &val).expect("put");
             }
             flag(&dir, "uncommitted_started");
             loop {
@@ -121,7 +121,7 @@ fn main() {
             for i in 0u32..25 {
                 let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
                 let val = DatabaseEntry::from_bytes(b"t1");
-                db.put(Some(&txn), &key, &val).expect("put T1");
+                db.put_in(&txn, &key, &val).expect("put T1");
             }
             txn.commit().expect("commit T1");
             flag(&dir, "t1_done");
@@ -131,7 +131,7 @@ fn main() {
             for i in 100u32..125 {
                 let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
                 let val = DatabaseEntry::from_bytes(b"t2");
-                db.put(Some(&txn), &key, &val).expect("put T2");
+                db.put_in(&txn, &key, &val).expect("put T2");
             }
             flag(&dir, "t2_started");
             drop(txn); // suppress "unused" lint — never committed
@@ -149,7 +149,7 @@ fn main() {
                 let txn = env.begin_transaction(None).expect("begin txn");
                 let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
                 let val = DatabaseEntry::from_bytes(b"parity");
-                db.put(Some(&txn), &key, &val).expect("put");
+                db.put_in(&txn, &key, &val).expect("put");
                 txn.commit().expect("commit");
             }
             flag(&dir, "writes_done");
@@ -183,7 +183,7 @@ fn main() {
                 let txn = env.begin_transaction(None).expect("begin txn");
                 let key = DatabaseEntry::from_bytes(k.as_bytes());
                 let val = DatabaseEntry::from_bytes(b"ok");
-                db.put(Some(&txn), &key, &val).expect("put");
+                db.put_in(&txn, &key, &val).expect("put");
                 txn.commit().expect("commit");
             }
             flag(&dir, "phase1_done");
@@ -194,7 +194,7 @@ fn main() {
                 let k = format!("open_{i:03}");
                 let key = DatabaseEntry::from_bytes(k.as_bytes());
                 let val = DatabaseEntry::from_bytes(b"should_not_survive");
-                db.put(Some(&txn), &key, &val).expect("put open key");
+                db.put_in(&txn, &key, &val).expect("put open key");
             }
 
             // Force a checkpoint AFTER the open txn has written its LNs, so
@@ -228,21 +228,21 @@ fn main() {
             let k = DatabaseEntry::from_bytes(b"K");
 
             let t1 = env.begin_transaction(None).expect("begin t1");
-            db.put(Some(&t1), &k, &DatabaseEntry::from_bytes(b"v1"))
+            db.put_in(&t1, &k, DatabaseEntry::from_bytes(b"v1"))
                 .expect("t1 put");
             t1.abort().expect("t1 abort");
 
             let t3 = env.begin_transaction(None).expect("begin t3");
-            db.put(Some(&t3), &k, &DatabaseEntry::from_bytes(b"v3"))
+            db.put_in(&t3, &k, DatabaseEntry::from_bytes(b"v3"))
                 .expect("t3 put");
             t3.commit().expect("t3 commit");
 
             // T2 stays open (active at crash) so the undo pass is not skipped.
             let t2 = env.begin_transaction(None).expect("begin t2");
-            db.put(
-                Some(&t2),
-                &DatabaseEntry::from_bytes(b"other"),
-                &DatabaseEntry::from_bytes(b"x"),
+            db.put_in(
+                &t2,
+                DatabaseEntry::from_bytes(b"other"),
+                DatabaseEntry::from_bytes(b"x"),
             )
             .expect("t2 put");
             // Leak the handle so no abort/commit record is written on drop.
@@ -270,7 +270,7 @@ fn main() {
                 let k = i.to_be_bytes();
                 let key = DatabaseEntry::from_bytes(&k);
                 let val = DatabaseEntry::from_bytes(b"v1");
-                db.put(None, &key, &val).expect("put v1");
+                db.put(&key, &val).expect("put v1");
             }
             env.checkpoint(Some(&CheckpointConfig::new().with_force(true)))
                 .expect("full checkpoint");
@@ -281,7 +281,7 @@ fn main() {
                 let k = i.to_be_bytes();
                 let key = DatabaseEntry::from_bytes(&k);
                 let val = DatabaseEntry::from_bytes(b"v2");
-                db.put(None, &key, &val).expect("put v2");
+                db.put(&key, &val).expect("put v2");
             }
             env.checkpoint(Some(&CheckpointConfig::new().with_force(true)))
                 .expect("delta checkpoint");
@@ -307,7 +307,7 @@ fn main() {
                 let k = i.to_be_bytes();
                 let key = DatabaseEntry::from_bytes(&k);
                 let val = DatabaseEntry::from_bytes(b"before_ckpt");
-                db.put(None, &key, &val).expect("put");
+                db.put(&key, &val).expect("put");
             }
 
             // Force a checkpoint so the BINs are flushed to the WAL.
@@ -318,7 +318,7 @@ fn main() {
             // Write 1 post-checkpoint key.
             let post_key = DatabaseEntry::from_bytes(b"post_ckpt");
             let post_val = DatabaseEntry::from_bytes(b"after_ckpt");
-            db.put(None, &post_key, &post_val).expect("put post");
+            db.put(&post_key, &post_val).expect("put post");
 
             flag(&dir, "phase1_done");
 
@@ -356,7 +356,7 @@ fn main() {
                 let txn = env.begin_transaction(None).expect("begin txn");
                 let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
                 let val = DatabaseEntry::from_bytes(&[0u8; 256]); // 256-byte values
-                db.put(Some(&txn), &key, &val).expect("put");
+                db.put_in(&txn, &key, &val).expect("put");
                 txn.commit().expect("commit");
             }
 
@@ -397,7 +397,7 @@ fn main() {
                             let key =
                                 DatabaseEntry::from_bytes(&id.to_be_bytes());
                             let val = DatabaseEntry::from_bytes(b"committed");
-                            db.put(Some(&txn), &key, &val).expect("put");
+                            db.put_in(&txn, &key, &val).expect("put");
                             // Default durability is COMMIT_SYNC => real fsync.
                             txn.commit().expect("commit");
                         }

@@ -43,12 +43,12 @@ fn open_db(env: &Environment, name: &str) -> noxu_db::Database {
 fn put(db: &noxu_db::Database, key: &[u8], data: &[u8]) {
     let k = DatabaseEntry::from_data(key);
     let v = DatabaseEntry::from_data(data);
-    db.put(None, &k, &v).unwrap();
+    db.put(&k, &v).unwrap();
 }
 
 fn delete(db: &noxu_db::Database, key: &[u8]) {
     let k = DatabaseEntry::from_data(key);
-    db.delete(None, &k).unwrap();
+    db.delete(&k).unwrap();
 }
 
 /// Drain a cursor into a `Vec<(key, data)>` of all returned records.

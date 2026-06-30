@@ -210,7 +210,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let val = format!("val:{tid:04}:{key_idx:012}");
                     let k = DatabaseEntry::from_bytes(key.as_bytes());
                     let v = DatabaseEntry::from_bytes(val.as_bytes());
-                    db.put(Some(&txn), &k, &v).unwrap();
+                    db.put_in(&txn, &k, &v).unwrap();
                     key_idx += 1;
                 }
                 txn.commit().unwrap();
@@ -269,7 +269,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ------------------------------------------------------------------
     println!("Scanning all records...");
     let t_scan = Instant::now();
-    let mut cursor = db2.open_cursor(None, None)?;
+    let mut cursor = db2.open_cursor(None)?;
     let mut k = DatabaseEntry::new();
     let mut v = DatabaseEntry::new();
     let mut count: u64 = 0;

@@ -62,10 +62,10 @@ fn recovery_open_timing_100k() {
             for k in i..end {
                 let key = format!("key_{k:08}");
                 let val = format!("val_{k:08}");
-                db.put(
-                    Some(&txn),
-                    &DatabaseEntry::from_bytes(key.as_bytes()),
-                    &DatabaseEntry::from_bytes(val.as_bytes()),
+                db.put_in(
+                    &txn,
+                    DatabaseEntry::from_bytes(key.as_bytes()),
+                    DatabaseEntry::from_bytes(val.as_bytes()),
                 )
                 .unwrap();
             }
@@ -110,13 +110,9 @@ fn recovery_open_timing_100k() {
     let db = open_db(&env);
     let mut v = DatabaseEntry::new();
     let st = db
-        .get(None, &DatabaseEntry::from_bytes(b"key_00050000"), &mut v)
+        .get_into(None, DatabaseEntry::from_bytes(b"key_00050000"), &mut v)
         .unwrap();
-    assert_eq!(
-        st,
-        noxu_db::OperationStatus::Success,
-        "expected key_00050000 to survive recovery"
-    );
+    assert!(st, "expected key_00050000 to survive recovery");
     drop(db);
     drop(env);
 }

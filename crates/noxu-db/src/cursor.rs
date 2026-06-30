@@ -7,7 +7,10 @@ use crate::get::Get;
 use crate::lock_mode::LockMode;
 use crate::operation_status::OperationStatus;
 use crate::put::Put;
+use crate::transaction::Transaction;
+use bytes::Bytes;
 use noxu_dbi::{CursorImpl, DbiError, GetMode, PutMode, SearchMode};
+use std::marker::PhantomData;
 
 /// Map a `DbiError` from a cursor inner operation to the appropriate
 /// public `NoxuError`.
@@ -41,23 +44,28 @@ pub enum CursorState {
 
 /// A database cursor for iterating over records.
 ///
-///
-///
 /// Cursors are used for operating on collections of records,
 /// for iterating over a database, and for saving handles to individual
 /// records so they can be modified after reading.
 ///
+/// The lifetime `'txn` ties the cursor to the transaction it was opened
+/// under (review P0-1): the borrow checker rejects any code that commits
+/// or drops that transaction while the cursor is still alive, turning the
+/// old "you must close the cursor before commit" prose invariant into a
+/// *compile* error. Auto-commit cursors (opened via
+/// [`crate::Database::open_cursor`]) carry no real borrow and so are
+/// effectively `Cursor<'static>`. Mirrors `heed`'s
+/// `RoCursor<'txn>`/`RwCursor<'txn>`.
+///
 /// # Example
 /// ```ignore
-/// use noxu_db::{Database, DatabaseEntry, Get};
+/// use noxu_db::{Database, Get};
 ///
 /// # fn example(db: &Database) -> Result<(), Box<dyn std::error::Error>> {
-/// let mut cursor = db.open_cursor(None, None)?;
-/// let mut key = DatabaseEntry::new();
-/// let mut data = DatabaseEntry::new();
+/// let mut cursor = db.open_cursor(None)?;
 ///
 /// // Iterate through all records
-/// while cursor.get(&mut key, &mut data, Get::Next, None)? == OperationStatus::Success {
+/// while let Some((key, data)) = cursor.next()? {
 ///     // Process key and data
 /// }
 ///
@@ -65,21 +73,85 @@ pub enum CursorState {
 /// # Ok(())
 /// # }
 /// ```
-pub struct Cursor {
+pub struct Cursor<'txn> {
     /// Underlying CursorImpl from the dbi layer.
     inner: CursorImpl,
     /// Current cursor state.
     state: CursorState,
     /// Whether this cursor is read-only.
     read_only: bool,
+    /// Ties the cursor to the transaction it was opened under so that
+    /// committing/aborting that txn while the cursor is alive is a
+    /// compile error (review P0-1).
+    _txn: PhantomData<&'txn Transaction>,
 }
 
-impl Cursor {
+impl<'txn> Cursor<'txn> {
     /// Creates a Cursor wrapping a `CursorImpl`.
     ///
     /// Called by `Database::open_cursor`.
     pub(crate) fn from_impl(inner: CursorImpl, read_only: bool) -> Self {
-        Self { inner, state: CursorState::NotInitialized, read_only }
+        Self {
+            inner,
+            state: CursorState::NotInitialized,
+            read_only,
+            _txn: PhantomData,
+        }
+    }
+
+    /// Advances the cursor to the next record and returns it, or `None`
+    /// at the end of the database (review P0-3: cursor reads return
+    /// `Result<Option<...>>` instead of an out-param + `OperationStatus`).
+    ///
+    /// The first call positions at the first record; subsequent calls step
+    /// forward. Returns `(key, value)` as owned [`Bytes`].
+    ///
+    /// # Errors
+    /// Returns an error if the cursor or database is closed.
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Result<Option<(Bytes, Bytes)>> {
+        let mut key = DatabaseEntry::new();
+        let mut data = DatabaseEntry::new();
+        match self.get(&mut key, &mut data, Get::Next, None)? {
+            OperationStatus::Success => Ok(Some((
+                Bytes::copy_from_slice(key.data()),
+                Bytes::copy_from_slice(data.data()),
+            ))),
+            _ => Ok(None),
+        }
+    }
+
+    /// Steps the cursor to the previous record and returns it, or `None`
+    /// at the start of the database (review P0-3).
+    ///
+    /// # Errors
+    /// Returns an error if the cursor or database is closed.
+    pub fn prev(&mut self) -> Result<Option<(Bytes, Bytes)>> {
+        let mut key = DatabaseEntry::new();
+        let mut data = DatabaseEntry::new();
+        match self.get(&mut key, &mut data, Get::Prev, None)? {
+            OperationStatus::Success => Ok(Some((
+                Bytes::copy_from_slice(key.data()),
+                Bytes::copy_from_slice(data.data()),
+            ))),
+            _ => Ok(None),
+        }
+    }
+
+    /// Positions the cursor on `key` and returns its value, or `None` if
+    /// the key is absent (review P0-3, P1-3).
+    ///
+    /// # Errors
+    /// Returns an error if the cursor or database is closed.
+    pub fn seek(&mut self, key: impl AsRef<[u8]>) -> Result<Option<Bytes>> {
+        let mut key_entry = DatabaseEntry::from_bytes(key.as_ref());
+        let mut data = DatabaseEntry::new();
+        match self.get(&mut key_entry, &mut data, Get::Search, None)? {
+            OperationStatus::Success => {
+                Ok(Some(Bytes::copy_from_slice(data.data())))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Retrieve a record using the cursor.
@@ -503,7 +575,7 @@ impl Cursor {
     }
 }
 
-impl Drop for Cursor {
+impl Drop for Cursor<'_> {
     fn drop(&mut self) {
         // Audit cursor F15 (Wave 2C-4): only warn for genuinely-leaked
         // cursors that were positioned on a record at drop time.
@@ -533,7 +605,7 @@ mod tests {
     use std::sync::Arc;
 
     /// Creates a fresh in-memory DatabaseImpl and wraps it in a Cursor.
-    fn make_cursor(read_only: bool) -> Cursor {
+    fn make_cursor(read_only: bool) -> Cursor<'static> {
         let db_id = DatabaseId::new(1);
         let config = DbiDatabaseConfig::default();
         let db_impl =
@@ -544,7 +616,7 @@ mod tests {
     }
 
     /// Creates a cursor backed by a DatabaseImpl pre-populated with records.
-    fn make_cursor_with(records: Vec<(&[u8], &[u8])>) -> Cursor {
+    fn make_cursor_with(records: Vec<(&[u8], &[u8])>) -> Cursor<'static> {
         let db_id = DatabaseId::new(1);
         let config = DbiDatabaseConfig::default();
         let db_impl =
@@ -563,7 +635,7 @@ mod tests {
     }
 
     /// Creates a sorted-duplicate cursor pre-populated with (key, data) pairs.
-    fn make_dup_cursor_with(records: Vec<(&[u8], &[u8])>) -> Cursor {
+    fn make_dup_cursor_with(records: Vec<(&[u8], &[u8])>) -> Cursor<'static> {
         let db_id = DatabaseId::new(1);
         let mut config = DbiDatabaseConfig::default();
         config.set_sorted_duplicates(true);
@@ -1284,7 +1356,7 @@ mod tests {
 
     /// Helper: cursor whose outer state is NotInitialized but whose inner
     /// CursorImpl has been closed, so that any CursorImpl call returns an error.
-    fn make_inner_closed_cursor() -> Cursor {
+    fn make_inner_closed_cursor() -> Cursor<'static> {
         let mut c = make_cursor(false);
         c.inner.close().unwrap(); // CursorImpl is now Closed
         // outer state stays NotInitialized — check_open() will pass
@@ -1293,7 +1365,7 @@ mod tests {
 
     /// Helper: cursor whose outer state is Initialized but whose inner
     /// CursorImpl has been closed (simulate a mid-flight error scenario).
-    fn make_inner_closed_cursor_initialized() -> Cursor {
+    fn make_inner_closed_cursor_initialized() -> Cursor<'static> {
         let mut c = make_cursor(false);
         // Manually set outer state to Initialized so check_initialized() passes.
         c.state = CursorState::Initialized;

@@ -17,7 +17,7 @@
 //! ## Quick-start
 //!
 //! ```no_run
-//! use noxu::{DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig};
+//! use noxu::{DatabaseConfig, Environment, EnvironmentConfig};
 //! use std::path::PathBuf;
 //!
 //! # fn main() -> noxu::Result<()> {
@@ -31,12 +31,13 @@
 //!     .with_transactional(true);
 //! let db = env.open_database(None, "kv", &db_config)?;
 //! let txn = env.begin_transaction(None)?;
-//! db.put(
-//!     Some(&txn),
-//!     &DatabaseEntry::from_bytes(b"hello"),
-//!     &DatabaseEntry::from_bytes(b"world"),
-//! )?;
+//! db.put_in(&txn, b"hello", b"world")?;
 //! txn.commit()?;
+//!
+//! // Reads return `Result<Option<Bytes>>`.
+//! if let Some(value) = db.get(b"hello")? {
+//!     assert_eq!(value.as_ref(), b"world");
+//! }
 //! # Ok(())
 //! # }
 //! ```

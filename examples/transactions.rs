@@ -5,10 +5,7 @@
 //! Demonstrates transactional operations: beginning transactions, committing,
 //! aborting, and verifying that only committed data persists.
 
-use noxu::{
-    DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
-    OperationStatus,
-};
+use noxu::{DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let env_dir = std::env::temp_dir().join("noxu_txn_example");
@@ -38,8 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let key =
             DatabaseEntry::from_bytes(format!("committed_{}", i).as_bytes());
         let data = DatabaseEntry::from_bytes(format!("value_{}", i).as_bytes());
-        let status = db.put(Some(&txn1), &key, &data)?;
-        assert_eq!(status, OperationStatus::Success);
+        db.put_in(&txn1, &key, &data)?;
         println!("  Put committed_{} -> value_{}", i, i);
     }
 
@@ -57,7 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let data = DatabaseEntry::from_bytes(
             format!("should_not_exist_{}", i).as_bytes(),
         );
-        db.put(Some(&txn2), &key, &data)?;
+        db.put_in(&txn2, &key, &data)?;
         println!("  Put aborted_{} -> should_not_exist_{}", i, i);
     }
 
@@ -70,8 +66,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let key =
             DatabaseEntry::from_bytes(format!("committed_{}", i).as_bytes());
         let mut data = DatabaseEntry::new();
-        let status = db.get(None, &key, &mut data)?;
-        let found = status == OperationStatus::Success;
+        let found = db.get_into(None, &key, &mut data)?;
         println!("  committed_{}: found={}", i, found);
     }
 
@@ -86,8 +81,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let key =
             DatabaseEntry::from_bytes(format!("aborted_{}", i).as_bytes());
         let mut data = DatabaseEntry::new();
-        let status = db.get(None, &key, &mut data)?;
-        let found = status == OperationStatus::Success;
+        let found = db.get_into(None, &key, &mut data)?;
         println!("  aborted_{}: found={}", i, found);
     }
 

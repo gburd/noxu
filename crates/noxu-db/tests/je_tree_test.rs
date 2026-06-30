@@ -40,19 +40,19 @@ fn split_descending_then_ascending_keys_remain_sorted() {
     let txn = env.begin_transaction(None).unwrap();
     // Insert descending: 160, 150, 140, ..., 10
     for i in (10..=160).rev().step_by(10) {
-        db.put(
-            Some(&txn),
-            &DatabaseEntry::from_bytes(&[i as u8]),
-            &DatabaseEntry::from_bytes(&[1]),
+        db.put_in(
+            &txn,
+            DatabaseEntry::from_bytes(&[i as u8]),
+            DatabaseEntry::from_bytes(&[1]),
         )
         .unwrap();
     }
     // Insert ascending: 1, 2, ..., 9
     for i in 1..10u8 {
-        db.put(
-            Some(&txn),
-            &DatabaseEntry::from_bytes(&[i]),
-            &DatabaseEntry::from_bytes(&[1]),
+        db.put_in(
+            &txn,
+            DatabaseEntry::from_bytes(&[i]),
+            DatabaseEntry::from_bytes(&[1]),
         )
         .unwrap();
     }
@@ -60,7 +60,7 @@ fn split_descending_then_ascending_keys_remain_sorted() {
 
     // Cursor walk must yield sorted keys.
     let txn = env.begin_transaction(None).unwrap();
-    let mut c = db.open_cursor(Some(&txn), None).unwrap();
+    let mut c = db.open_cursor_in(&txn, None).unwrap();
     let mut prev: Option<u8> = None;
     let mut count = 0usize;
     let mut k = DatabaseEntry::new();
@@ -103,17 +103,17 @@ fn tree_count_and_validate_keys_forward() {
     keys.dedup();
     let n = keys.len();
     for k in &keys {
-        db.put(
-            Some(&txn),
-            &DatabaseEntry::from_bytes(&k.to_be_bytes()),
-            &DatabaseEntry::from_bytes(b"v"),
+        db.put_in(
+            &txn,
+            DatabaseEntry::from_bytes(&k.to_be_bytes()),
+            DatabaseEntry::from_bytes(b"v"),
         )
         .unwrap();
     }
     txn.commit().unwrap();
 
     let txn = env.begin_transaction(None).unwrap();
-    let mut c = db.open_cursor(Some(&txn), None).unwrap();
+    let mut c = db.open_cursor_in(&txn, None).unwrap();
     let mut prev: Option<Vec<u8>> = None;
     let mut count = 0usize;
     let mut k = DatabaseEntry::new();
@@ -145,17 +145,17 @@ fn tree_count_and_validate_keys_backwards() {
     keys.dedup();
     let n = keys.len();
     for k in &keys {
-        db.put(
-            Some(&txn),
-            &DatabaseEntry::from_bytes(&k.to_be_bytes()),
-            &DatabaseEntry::from_bytes(b"v"),
+        db.put_in(
+            &txn,
+            DatabaseEntry::from_bytes(&k.to_be_bytes()),
+            DatabaseEntry::from_bytes(b"v"),
         )
         .unwrap();
     }
     txn.commit().unwrap();
 
     let txn = env.begin_transaction(None).unwrap();
-    let mut c = db.open_cursor(Some(&txn), None).unwrap();
+    let mut c = db.open_cursor_in(&txn, None).unwrap();
     let mut prev: Option<Vec<u8>> = None;
     let mut count = 0usize;
     let mut k = DatabaseEntry::new();
@@ -191,17 +191,17 @@ fn tree_ascending_insert_walks_in_order() {
     let (env, db) = open_env_db(&dir, "asc_balance");
     let txn = env.begin_transaction(None).unwrap();
     for i in 0..N_KEYS {
-        db.put(
-            Some(&txn),
-            &DatabaseEntry::from_bytes(&i.to_be_bytes()),
-            &DatabaseEntry::from_bytes(b""),
+        db.put_in(
+            &txn,
+            DatabaseEntry::from_bytes(&i.to_be_bytes()),
+            DatabaseEntry::from_bytes(b""),
         )
         .unwrap();
     }
     txn.commit().unwrap();
 
     let txn = env.begin_transaction(None).unwrap();
-    let mut c = db.open_cursor(Some(&txn), None).unwrap();
+    let mut c = db.open_cursor_in(&txn, None).unwrap();
     let mut k = DatabaseEntry::new();
     let mut d = DatabaseEntry::new();
     for i in 0..N_KEYS {
@@ -223,17 +223,17 @@ fn tree_descending_insert_walks_in_order() {
     let (env, db) = open_env_db(&dir, "desc_balance");
     let txn = env.begin_transaction(None).unwrap();
     for i in (0..N_KEYS).rev() {
-        db.put(
-            Some(&txn),
-            &DatabaseEntry::from_bytes(&i.to_be_bytes()),
-            &DatabaseEntry::from_bytes(b""),
+        db.put_in(
+            &txn,
+            DatabaseEntry::from_bytes(&i.to_be_bytes()),
+            DatabaseEntry::from_bytes(b""),
         )
         .unwrap();
     }
     txn.commit().unwrap();
 
     let txn = env.begin_transaction(None).unwrap();
-    let mut c = db.open_cursor(Some(&txn), None).unwrap();
+    let mut c = db.open_cursor_in(&txn, None).unwrap();
     let mut k = DatabaseEntry::new();
     let mut d = DatabaseEntry::new();
     for i in 0..N_KEYS {
@@ -269,10 +269,10 @@ fn key_prefix_basic_long_shared_prefix_round_trip() {
 
     let txn = env.begin_transaction(None).unwrap();
     for k in &keys {
-        db.put(
-            Some(&txn),
-            &DatabaseEntry::from_bytes(k),
-            &DatabaseEntry::from_bytes(b"v"),
+        db.put_in(
+            &txn,
+            DatabaseEntry::from_bytes(k),
+            DatabaseEntry::from_bytes(b"v"),
         )
         .unwrap();
     }
@@ -280,7 +280,7 @@ fn key_prefix_basic_long_shared_prefix_round_trip() {
 
     // Walk: must produce keys in sorted order, count == keys.len().
     let txn = env.begin_transaction(None).unwrap();
-    let mut c = db.open_cursor(Some(&txn), None).unwrap();
+    let mut c = db.open_cursor_in(&txn, None).unwrap();
     let mut walked: Vec<Vec<u8>> = Vec::new();
     let mut k = DatabaseEntry::new();
     let mut d = DatabaseEntry::new();
@@ -297,9 +297,9 @@ fn key_prefix_basic_long_shared_prefix_round_trip() {
     for k in &keys {
         let mut out = DatabaseEntry::new();
         let s = db
-            .get(Some(&txn), &DatabaseEntry::from_bytes(k), &mut out)
+            .get_into(Some(&txn), DatabaseEntry::from_bytes(k), &mut out)
             .unwrap();
-        assert_eq!(s, OperationStatus::Success);
+        assert!(s);
         assert_eq!(out.get_data().unwrap(), b"v");
     }
     drop(c);
@@ -322,17 +322,17 @@ fn key_prefix_many_sequential_round_trip() {
     for i in 0..1000u32 {
         let mut k = prefix.to_vec();
         k.extend_from_slice(&i.to_be_bytes());
-        db.put(
-            Some(&txn),
-            &DatabaseEntry::from_bytes(&k),
-            &DatabaseEntry::from_bytes(&i.to_be_bytes()),
+        db.put_in(
+            &txn,
+            DatabaseEntry::from_bytes(&k),
+            DatabaseEntry::from_bytes(&i.to_be_bytes()),
         )
         .unwrap();
     }
     txn.commit().unwrap();
 
     let txn = env.begin_transaction(None).unwrap();
-    let mut c = db.open_cursor(Some(&txn), None).unwrap();
+    let mut c = db.open_cursor_in(&txn, None).unwrap();
     let mut k = DatabaseEntry::new();
     let mut d = DatabaseEntry::new();
     for i in 0..1000u32 {

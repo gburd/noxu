@@ -11,7 +11,6 @@
 
 use noxu_db::{
     Database, DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
-    OperationStatus,
 };
 use noxu_persist::entity::{Entity, PrimaryKey};
 use noxu_persist::entity_serializer::EntitySerializer;
@@ -187,14 +186,11 @@ fn test_user_put_get_round_trip() {
     // Serialize and store
     let key = DatabaseEntry::from_bytes(&user.primary_key().to_bytes());
     let data = DatabaseEntry::from_bytes(&ser.serialize(&user).unwrap());
-    assert_eq!(db.put(None, &key, &data).unwrap(), OperationStatus::Success);
+    db.put(&key, &data).unwrap();
 
     // Retrieve and deserialize
     let mut retrieved = DatabaseEntry::new();
-    assert_eq!(
-        db.get(None, &key, &mut retrieved).unwrap(),
-        OperationStatus::Success
-    );
+    assert!(db.get_into(None, &key, &mut retrieved).unwrap());
     let decoded: User = ser.deserialize(retrieved.data()).unwrap();
     assert_eq!(decoded, user);
 }
@@ -213,17 +209,17 @@ fn test_user_update() {
 
     let key = DatabaseEntry::from_bytes(&user.primary_key().to_bytes());
     let data = DatabaseEntry::from_bytes(&ser.serialize(&user).unwrap());
-    db.put(None, &key, &data).unwrap();
+    db.put(&key, &data).unwrap();
 
     // Update
     user.age = 31;
     user.email = "alice@newdomain.com".into();
     let data = DatabaseEntry::from_bytes(&ser.serialize(&user).unwrap());
-    db.put(None, &key, &data).unwrap();
+    db.put(&key, &data).unwrap();
 
     // Verify update
     let mut retrieved = DatabaseEntry::new();
-    db.get(None, &key, &mut retrieved).unwrap();
+    db.get_into(None, &key, &mut retrieved).unwrap();
     let decoded: User = ser.deserialize(retrieved.data()).unwrap();
     assert_eq!(decoded.age, 31);
     assert_eq!(decoded.email, "alice@newdomain.com");
@@ -243,17 +239,14 @@ fn test_user_delete() {
 
     let key = DatabaseEntry::from_bytes(&user.primary_key().to_bytes());
     let data = DatabaseEntry::from_bytes(&ser.serialize(&user).unwrap());
-    db.put(None, &key, &data).unwrap();
+    db.put(&key, &data).unwrap();
 
     // Delete
-    assert_eq!(db.delete(None, &key).unwrap(), OperationStatus::Success);
+    assert!(db.delete(&key).unwrap());
 
     // Verify gone
     let mut retrieved = DatabaseEntry::new();
-    assert_eq!(
-        db.get(None, &key, &mut retrieved).unwrap(),
-        OperationStatus::NotFound
-    );
+    assert!(!(db.get_into(None, &key, &mut retrieved).unwrap()));
 }
 
 #[test]
@@ -270,10 +263,10 @@ fn test_product_with_string_key() {
 
     let key = DatabaseEntry::from_bytes(&product.primary_key().to_bytes());
     let data = DatabaseEntry::from_bytes(&ser.serialize(&product).unwrap());
-    db.put(None, &key, &data).unwrap();
+    db.put(&key, &data).unwrap();
 
     let mut retrieved = DatabaseEntry::new();
-    db.get(None, &key, &mut retrieved).unwrap();
+    db.get_into(None, &key, &mut retrieved).unwrap();
     let decoded: Product = ser.deserialize(retrieved.data()).unwrap();
     assert_eq!(decoded, product);
 }
@@ -302,14 +295,14 @@ fn test_log_entry_with_optional_fields() {
     for entry in &[&entry_with_context, &entry_without_context] {
         let key = DatabaseEntry::from_bytes(&entry.primary_key().to_bytes());
         let data = DatabaseEntry::from_bytes(&ser.serialize(entry).unwrap());
-        db.put(None, &key, &data).unwrap();
+        db.put(&key, &data).unwrap();
     }
 
     // Retrieve both
     for original in &[&entry_with_context, &entry_without_context] {
         let key = DatabaseEntry::from_bytes(&original.primary_key().to_bytes());
         let mut retrieved = DatabaseEntry::new();
-        db.get(None, &key, &mut retrieved).unwrap();
+        db.get_into(None, &key, &mut retrieved).unwrap();
         let decoded: LogEntry = ser.deserialize(retrieved.data()).unwrap();
         assert_eq!(&decoded, *original);
     }
@@ -344,7 +337,7 @@ fn test_multiple_entity_types_same_environment() {
     };
     let key = DatabaseEntry::from_bytes(&user.primary_key().to_bytes());
     let data = DatabaseEntry::from_bytes(&user_ser.serialize(&user).unwrap());
-    user_db.put(None, &key, &data).unwrap();
+    user_db.put(&key, &data).unwrap();
 
     // Store a product
     let product = Product {
@@ -356,7 +349,7 @@ fn test_multiple_entity_types_same_environment() {
     let key = DatabaseEntry::from_bytes(&product.primary_key().to_bytes());
     let data =
         DatabaseEntry::from_bytes(&product_ser.serialize(&product).unwrap());
-    product_db.put(None, &key, &data).unwrap();
+    product_db.put(&key, &data).unwrap();
 
     // Verify independent storage
     assert_eq!(user_db.count().unwrap(), 1);
@@ -386,7 +379,7 @@ fn test_sequence_generates_unique_ids_for_entities() {
 
         let key = DatabaseEntry::from_bytes(&user.primary_key().to_bytes());
         let data = DatabaseEntry::from_bytes(&ser.serialize(&user).unwrap());
-        db.put(None, &key, &data).unwrap();
+        db.put(&key, &data).unwrap();
         users.push(user);
     }
 
@@ -394,10 +387,7 @@ fn test_sequence_generates_unique_ids_for_entities() {
     for user in &users {
         let key = DatabaseEntry::from_bytes(&user.primary_key().to_bytes());
         let mut retrieved = DatabaseEntry::new();
-        assert_eq!(
-            db.get(None, &key, &mut retrieved).unwrap(),
-            OperationStatus::Success
-        );
+        assert!(db.get_into(None, &key, &mut retrieved).unwrap());
         let decoded = ser.deserialize(retrieved.data()).unwrap();
         assert_eq!(&decoded, user);
     }
@@ -620,7 +610,7 @@ fn test_entity_store_full_crud() {
     for user in [&alice, &bob] {
         let key = DatabaseEntry::from_bytes(&user.primary_key().to_bytes());
         let data = DatabaseEntry::from_bytes(&ser.serialize(user).unwrap());
-        db.put(None, &key, &data).unwrap();
+        db.put(&key, &data).unwrap();
     }
 
     assert_eq!(db.count().unwrap(), 2);
@@ -628,7 +618,7 @@ fn test_entity_store_full_crud() {
     // READ
     let key = DatabaseEntry::from_bytes(&1u64.to_bytes());
     let mut retrieved = DatabaseEntry::new();
-    db.get(None, &key, &mut retrieved).unwrap();
+    db.get_into(None, &key, &mut retrieved).unwrap();
     let read_alice: User = ser.deserialize(retrieved.data()).unwrap();
     assert_eq!(read_alice, alice);
 
@@ -643,25 +633,22 @@ fn test_entity_store_full_crud() {
         DatabaseEntry::from_bytes(&updated_alice.primary_key().to_bytes());
     let data =
         DatabaseEntry::from_bytes(&ser.serialize(&updated_alice).unwrap());
-    db.put(None, &key, &data).unwrap();
+    db.put(&key, &data).unwrap();
 
     let mut retrieved = DatabaseEntry::new();
-    db.get(None, &key, &mut retrieved).unwrap();
+    db.get_into(None, &key, &mut retrieved).unwrap();
     let reread: User = ser.deserialize(retrieved.data()).unwrap();
     assert_eq!(reread.name, "Alice Smith");
     assert_eq!(reread.age, 31);
 
     // DELETE
     let key = DatabaseEntry::from_bytes(&2u64.to_bytes());
-    db.delete(None, &key).unwrap();
+    db.delete(&key).unwrap();
     assert_eq!(db.count().unwrap(), 1);
 
     // Verify Bob is gone
     let mut retrieved = DatabaseEntry::new();
-    assert_eq!(
-        db.get(None, &key, &mut retrieved).unwrap(),
-        OperationStatus::NotFound
-    );
+    assert!(!(db.get_into(None, &key, &mut retrieved).unwrap()));
 }
 
 #[test]
@@ -679,7 +666,7 @@ fn test_many_entities() {
         };
         let key = DatabaseEntry::from_bytes(&user.primary_key().to_bytes());
         let data = DatabaseEntry::from_bytes(&ser.serialize(&user).unwrap());
-        db.put(None, &key, &data).unwrap();
+        db.put(&key, &data).unwrap();
     }
 
     assert_eq!(db.count().unwrap(), 100);
@@ -688,10 +675,7 @@ fn test_many_entities() {
     for i in 0..100u64 {
         let key = DatabaseEntry::from_bytes(&i.to_bytes());
         let mut retrieved = DatabaseEntry::new();
-        assert_eq!(
-            db.get(None, &key, &mut retrieved).unwrap(),
-            OperationStatus::Success
-        );
+        assert!(db.get_into(None, &key, &mut retrieved).unwrap());
         let decoded: User = ser.deserialize(retrieved.data()).unwrap();
         assert_eq!(decoded.id, i);
         assert_eq!(decoded.name, format!("User {}", i));

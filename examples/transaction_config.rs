@@ -36,7 +36,7 @@ fn main() {
         let txn = env.begin_transaction(None).unwrap();
         let key = DatabaseEntry::from_bytes(b"key_default");
         let val = DatabaseEntry::from_bytes(b"value_default");
-        db.put(Some(&txn), &key, &val).unwrap();
+        db.put_in(&txn, &key, &val).unwrap();
         txn.commit().unwrap();
         println!("    Written and committed key_default\n");
     }
@@ -48,7 +48,7 @@ fn main() {
         let txn = env.begin_transaction(Some(&config)).unwrap();
         let key = DatabaseEntry::from_bytes(b"key_timeout");
         let val = DatabaseEntry::from_bytes(b"value_timeout");
-        db.put(Some(&txn), &key, &val).unwrap();
+        db.put_in(&txn, &key, &val).unwrap();
         txn.commit().unwrap();
         println!("    lock_timeout_ms=100 applied successfully\n");
     }
@@ -60,7 +60,7 @@ fn main() {
         let txn = env.begin_transaction(Some(&config)).unwrap();
         let key = DatabaseEntry::from_bytes(b"key_serializable");
         let val = DatabaseEntry::from_bytes(b"value_serializable");
-        db.put(Some(&txn), &key, &val).unwrap();
+        db.put_in(&txn, &key, &val).unwrap();
         txn.commit().unwrap();
         println!("    Serializable transaction committed\n");
     }
@@ -72,7 +72,7 @@ fn main() {
         let txn = env.begin_transaction(Some(&config)).unwrap();
         let key = DatabaseEntry::from_bytes(b"key_nowait");
         let val = DatabaseEntry::from_bytes(b"value_nowait");
-        db.put(Some(&txn), &key, &val).unwrap();
+        db.put_in(&txn, &key, &val).unwrap();
         txn.commit().unwrap();
         println!("    no_wait=true transaction committed (no conflict)\n");
     }
@@ -84,7 +84,7 @@ fn main() {
         let txn = env.begin_transaction(Some(&config)).unwrap();
         let key = DatabaseEntry::from_bytes(b"key_importunate");
         let val = DatabaseEntry::from_bytes(b"value_importunate");
-        db.put(Some(&txn), &key, &val).unwrap();
+        db.put_in(&txn, &key, &val).unwrap();
         txn.commit().unwrap();
         println!("    importunate=true transaction committed\n");
     }
@@ -96,7 +96,7 @@ fn main() {
         let txn = env.begin_transaction(Some(&config)).unwrap();
         let key = DatabaseEntry::from_bytes(b"key_default");
         let mut val = DatabaseEntry::new();
-        db.get(Some(&txn), &key, &mut val).unwrap();
+        db.get_into(Some(&txn), &key, &mut val).unwrap();
         println!(
             "    Read: {:?}",
             std::str::from_utf8(val.get_data().unwrap())
@@ -112,7 +112,7 @@ fn main() {
         let txn = env.begin_transaction(Some(&config)).unwrap();
         let key = DatabaseEntry::from_bytes(b"key_txn_timeout");
         let val = DatabaseEntry::from_bytes(b"value_txn_timeout");
-        db.put(Some(&txn), &key, &val).unwrap();
+        db.put_in(&txn, &key, &val).unwrap();
         txn.commit().unwrap();
         println!("    txn_timeout_ms=5000 transaction committed\n");
     }
@@ -129,7 +129,7 @@ fn main() {
     ] {
         let key = DatabaseEntry::from_bytes(key_str.as_bytes());
         let mut val = DatabaseEntry::new();
-        db.get(None, &key, &mut val).unwrap();
+        db.get_into(None, &key, &mut val).unwrap();
         println!(
             "    {}: {:?}",
             key_str,

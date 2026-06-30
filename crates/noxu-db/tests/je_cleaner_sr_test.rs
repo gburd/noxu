@@ -77,16 +77,15 @@ fn sr10553_clean_then_scan_deleted_does_not_fail() {
     let key = test_array(0);
     for i in 0..COUNT {
         db.put(
-            None,
-            &DatabaseEntry::from_bytes(&key),
-            &DatabaseEntry::from_bytes(&test_array(i)),
+            DatabaseEntry::from_bytes(&key),
+            DatabaseEntry::from_bytes(&test_array(i)),
         )
         .unwrap();
     }
 
     // Confirm the duplicate count.
     {
-        let mut cursor = db.open_cursor(None, None).unwrap();
+        let mut cursor = db.open_cursor(None).unwrap();
         let mut k = DatabaseEntry::from_bytes(&key);
         let mut d = DatabaseEntry::new();
         let s = cursor.get(&mut k, &mut d, noxu_db::Get::Search, None).unwrap();
@@ -96,10 +95,7 @@ fn sr10553_clean_then_scan_deleted_does_not_fail() {
     }
 
     // Delete everything. Do not compress.
-    assert_eq!(
-        db.delete(None, &DatabaseEntry::from_bytes(&key)).unwrap(),
-        OperationStatus::Success
-    );
+    assert!(db.delete(DatabaseEntry::from_bytes(&key)).unwrap());
 
     // Checkpoint and clean.
     env.checkpoint(Some(&noxu_db::CheckpointConfig::new().with_force(true)))
@@ -114,7 +110,7 @@ fn sr10553_clean_then_scan_deleted_does_not_fail() {
     // (Before the SR10553 fix this threw when faulting a deleted record whose
     // file had been cleaned.)
     {
-        let mut cursor = db.open_cursor(None, None).unwrap();
+        let mut cursor = db.open_cursor(None).unwrap();
         let mut k = DatabaseEntry::new();
         let mut d = DatabaseEntry::new();
         let mut status =
@@ -175,21 +171,18 @@ fn sr12885_pending_ln_migration_with_slot_reuse_abort_keeps_data() {
     for i in 0..COUNT {
         let s = db
             .put_no_overwrite(
-                None,
-                &DatabaseEntry::from_bytes(&test_array(i)),
-                &DatabaseEntry::from_bytes(&data),
+                DatabaseEntry::from_bytes(&test_array(i)),
+                DatabaseEntry::from_bytes(&data),
             )
             .unwrap();
-        assert_eq!(s, OperationStatus::Success);
+        assert!(s);
     }
 
     // Delete all but key 0, so the first file can be cleaned but key 0 will
     // need to be migrated.
     for i in 1..COUNT {
-        let s = db
-            .delete(None, &DatabaseEntry::from_bytes(&test_array(i)))
-            .unwrap();
-        assert_eq!(s, OperationStatus::Success);
+        let s = db.delete(DatabaseEntry::from_bytes(&test_array(i))).unwrap();
+        assert!(s);
     }
 
     // Checkpoint and clean to set the migrate flag for key 0 (done while key 0
@@ -204,18 +197,14 @@ fn sr12885_pending_ln_migration_with_slot_reuse_abort_keeps_data() {
     // Using a transaction, delete then re-insert key 0, reusing the slot
     // (a new LSN). Do not abort until after the cleaner migration step.
     let txn = env.begin_transaction(None).unwrap();
-    assert_eq!(
-        db.delete(Some(&txn), &DatabaseEntry::from_bytes(&key0)).unwrap(),
-        OperationStatus::Success
-    );
-    assert_eq!(
-        db.put_no_overwrite(
-            Some(&txn),
-            &DatabaseEntry::from_bytes(&key0),
-            &DatabaseEntry::from_bytes(&data),
+    assert!(db.delete_in(&txn, DatabaseEntry::from_bytes(&key0)).unwrap());
+    assert!(
+        db.put_no_overwrite_in(
+            &txn,
+            DatabaseEntry::from_bytes(&key0),
+            DatabaseEntry::from_bytes(&data)
         )
-        .unwrap(),
-        OperationStatus::Success
+        .unwrap()
     );
 
     // Checkpoint again to perform LN migration: key 0 is locked, so it goes on
@@ -227,10 +216,7 @@ fn sr12885_pending_ln_migration_with_slot_reuse_abort_keeps_data() {
     // the current LN for key 0 is deleted.
     txn.abort().unwrap();
     let txn2 = env.begin_transaction(None).unwrap();
-    assert_eq!(
-        db.delete(Some(&txn2), &DatabaseEntry::from_bytes(&key0)).unwrap(),
-        OperationStatus::Success
-    );
+    assert!(db.delete_in(&txn2, DatabaseEntry::from_bytes(&key0)).unwrap());
 
     // Checkpoint to process pending LNs and delete the cleaned file, then
     // abort the delete so the BIN reverts to the node we needed to migrate.
@@ -243,10 +229,9 @@ fn sr12885_pending_ln_migration_with_slot_reuse_abort_keeps_data() {
     // file had been deleted without migration).
     let mut val = DatabaseEntry::new();
     let status =
-        db.get(None, &DatabaseEntry::from_bytes(&key0), &mut val).unwrap();
-    assert_eq!(
+        db.get_into(None, DatabaseEntry::from_bytes(&key0), &mut val).unwrap();
+    assert!(
         status,
-        OperationStatus::Success,
         "SR12885: surviving key 0 must fetch SUCCESS after cleaner migration \
          + slot-reuse + abort (data must not be lost to a cleaned file)"
     );

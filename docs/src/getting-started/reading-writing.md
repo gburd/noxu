@@ -2,82 +2,93 @@
 
 ## Writing Records
 
-Use `db.put` to insert or overwrite a record:
+Use `db.put` to insert or overwrite a record. Keys and values accept any
+`impl AsRef<[u8]>` — byte literals, `&str`, `Vec<u8>`, `Bytes`, etc. — so no
+`DatabaseEntry` wrapper is required:
 
 ```rust
-use noxu::{DatabaseEntry, OperationStatus};
-
-let key  = DatabaseEntry::from_bytes(b"user:alice");
-let data = DatabaseEntry::from_bytes(b"Alice Smith");
-
-let status = db.put(None, &key, &data)?;
-assert_eq!(status, OperationStatus::Success);
+db.put(b"user:alice", b"Alice Smith")?;
 ```
 
-If a record with the same key already exists, `put` overwrites it by default. The old value is lost.
+If a record with the same key already exists, `put` overwrites it by default.
+The old value is lost. `put` returns `Result<()>`: success is `Ok(())`, and any
+real failure (closed handle, read-only database, I/O error) is `Err(NoxuError)`.
 
-The first argument to `put` is an optional `Transaction`. Pass `None` for non-transactional
-writes (the operation is immediately durable) or pass a transaction handle to group multiple
-writes into a single atomic unit.
+`put` auto-commits (the write is immediately durable). To group multiple writes
+into a single atomic unit, use `put_in` with an explicit transaction:
+
+```rust
+let txn = env.begin_transaction(None)?;
+db.put_in(&txn, b"user:alice", b"Alice Smith")?;
+db.put_in(&txn, b"user:bob", b"Bob Jones")?;
+txn.commit()?;
+```
 
 ## Reading Records
 
-Use `db.get` to retrieve a record by key:
+Use `db.get` to retrieve a record by key. It returns `Result<Option<Bytes>>` —
+`Some(value)` if the key is present, `None` if absent:
 
 ```rust
-let key = DatabaseEntry::from_bytes(b"user:alice");
-let mut data = DatabaseEntry::new();
-
-match db.get(None, &key, &mut data)? {
-    OperationStatus::Success => {
-        println!("Found: {}", std::str::from_utf8(data.data())?);
+match db.get(b"user:alice")? {
+    Some(value) => {
+        println!("Found: {}", std::str::from_utf8(&value)?);
     }
-    OperationStatus::NotFound => {
+    None => {
         println!("No record for that key");
-    }
-    OperationStatus::KeyExists => {
-        // returned by put-no-overwrite; not applicable to get
-        unreachable!()
     }
 }
 ```
 
-`get` populates the `data` argument in place. On `NotFound`, `data` is left in an undefined state and should not be read.
+To read inside a transaction use `get_in`:
+
+```rust
+let txn = env.begin_transaction(None)?;
+if let Some(value) = db.get_in(&txn, b"user:alice")? {
+    println!("{}", std::str::from_utf8(&value)?);
+}
+txn.commit()?;
+```
+
+For zero-allocation buffer reuse or partial reads, the lower-level
+`get_into(txn, key, &mut DatabaseEntry)` escape hatch returns `Result<bool>`
+(`true` if found) and reads into a caller-owned buffer.
 
 ## Deleting Records
 
-Use `db.delete` to remove a record by key:
+Use `db.delete` to remove a record by key. It returns `Result<bool>` — `true`
+if a record was removed, `false` if the key was absent:
 
 ```rust
-let key = DatabaseEntry::from_bytes(b"user:alice");
-let status = db.delete(None, &key)?;
-
-match status {
-    OperationStatus::Success  => println!("Deleted"),
-    OperationStatus::NotFound => println!("Key did not exist"),
-    _ => {}
+if db.delete(b"user:alice")? {
+    println!("Deleted");
+} else {
+    println!("Key did not exist");
 }
 ```
 
-## OperationStatus
+Use `delete_in(&txn, key)` to delete inside a transaction.
 
-All read/write operations return `Result<OperationStatus>`. The `OperationStatus` enum has three variants:
+## Result shapes
 
-| Variant | Meaning |
-|---|---|
-| `Success` | The operation completed successfully |
-| `NotFound` | The key was not present in the database |
-| `KeyExists` | A `put` with no-overwrite found that the key already exists |
+The idiomatic point operations collapse the historical
+`Result<OperationStatus>` into Rust-native shapes (review P0-3):
 
-Errors (I/O failures, lock timeouts, closed handles, etc.) are returned as `Err(NoxuError)`, not as `OperationStatus` values.
+| Operation | Returns | Meaning |
+|---|---|---|
+| `get` / `get_in` | `Result<Option<Bytes>>` | `Some(value)` = found, `None` = absent |
+| `put` / `put_in` | `Result<()>` | `Ok(())` = written |
+| `delete` / `delete_in` | `Result<bool>` | `true` = removed, `false` = absent |
+| `put_no_overwrite` / `_in` | `Result<bool>` | `true` = inserted, `false` = key already existed |
+
+Errors (I/O failures, lock timeouts, closed handles, etc.) are always returned
+as `Err(NoxuError)`. The cursor API (`Cursor::get`/`put`/`delete`) still uses
+`OperationStatus` for its lower-level navigation primitives.
 
 ## A Complete Read/Write Example
 
 ```rust
-use noxu::{
-    DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
-    OperationStatus,
-};
+use noxu::{DatabaseConfig, Environment, EnvironmentConfig};
 use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -99,19 +110,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ("carol", "Carol Wu, Engineering"),
     ];
     for (key, value) in &contacts {
-        db.put(None, &DatabaseEntry::from_bytes(key.as_bytes()),
-                     &DatabaseEntry::from_bytes(value.as_bytes()))?;
+        db.put(key.as_bytes(), value.as_bytes())?;
     }
 
     // Read
-    let key = DatabaseEntry::from_bytes(b"bob");
-    let mut data = DatabaseEntry::new();
-    if db.get(None, &key, &mut data)? == OperationStatus::Success {
-        println!("{}", std::str::from_utf8(data.data())?);
+    if let Some(value) = db.get(b"bob")? {
+        println!("{}", std::str::from_utf8(&value)?);
     }
 
     // Delete
-    db.delete(None, &DatabaseEntry::from_bytes(b"carol"))?;
+    db.delete(b"carol")?;
 
     println!("{} records remain", db.count()?);
 

@@ -23,7 +23,6 @@
 
 use noxu_db::{
     Database, DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
-    OperationStatus,
 };
 use noxu_xa::{PrepareResult, XaEnvironment, XaFlags, XaResource, Xid};
 use tempfile::TempDir;
@@ -53,17 +52,14 @@ impl Harness {
         let txn = self.xa.get_transaction(xid).unwrap();
         let k = DatabaseEntry::from_bytes(key);
         let v = DatabaseEntry::from_bytes(val);
-        self.db.put(Some(&*txn), &k, &v).unwrap();
+        self.db.put_in(&txn, &k, &v).unwrap();
         self.xa.mark_write(xid).unwrap();
     }
 
     fn exists(&self, key: &[u8]) -> bool {
         let k = DatabaseEntry::from_bytes(key);
         let mut v = DatabaseEntry::new();
-        matches!(
-            self.db.get(None, &k, &mut v).unwrap(),
-            OperationStatus::Success,
-        )
+        self.db.get_into(None, &k, &mut v).unwrap()
     }
 }
 

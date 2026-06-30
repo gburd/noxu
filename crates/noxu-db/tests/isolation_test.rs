@@ -48,7 +48,7 @@ fn put_committed(
     let txn = env.begin_transaction(None).unwrap();
     let k = DatabaseEntry::from_bytes(key);
     let v = DatabaseEntry::from_bytes(val);
-    db.put(Some(&txn), &k, &v).unwrap();
+    db.put_in(&txn, &k, &v).unwrap();
     txn.commit().unwrap();
 }
 
@@ -57,9 +57,8 @@ fn get_val(
     txn: Option<&noxu_db::Transaction>,
     key: &[u8],
     buf: &mut DatabaseEntry,
-) -> OperationStatus {
-    let k = DatabaseEntry::from_bytes(key);
-    db.get(txn, &k, buf).unwrap()
+) -> bool {
+    db.get_into(txn, key, buf).unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -91,7 +90,7 @@ fn test_dirty_read_prevented_under_all_isolation_levels() {
         let txn = env_w.begin_transaction(None).unwrap();
         let k = DatabaseEntry::from_bytes(b"key");
         let v = DatabaseEntry::from_bytes(b"v2");
-        db_w.put(Some(&txn), &k, &v).unwrap();
+        db_w.put_in(&txn, &k, &v).unwrap();
         // Dirty write is in place; signal the reader.
         bwd.wait();
         // Wait for the reader to attempt and fail.
@@ -106,7 +105,7 @@ fn test_dirty_read_prevented_under_all_isolation_levels() {
     let reader_txn = env.begin_transaction(Some(&rc_config)).unwrap();
     let key = DatabaseEntry::from_bytes(b"key");
     let mut out = DatabaseEntry::new();
-    let status = db.get(Some(&reader_txn), &key, &mut out);
+    let status = db.get_into(Some(&reader_txn), &key, &mut out);
     // Either the read blocks (not using no_wait here) — but since we know the
     // implementation blocks on a WRITE-locked key, the read must block here.
     // We can't easily observe "blocking" directly.  Instead we assert that if
@@ -118,10 +117,7 @@ fn test_dirty_read_prevented_under_all_isolation_levels() {
     drop(reader_txn);
     let txn2 = env.begin_transaction(Some(&rc_config)).unwrap();
     let mut out2 = DatabaseEntry::new();
-    assert_eq!(
-        get_val(&db, Some(&txn2), b"key", &mut out2),
-        OperationStatus::Success
-    );
+    assert!(get_val(&db, Some(&txn2), b"key", &mut out2));
     assert_eq!(
         out2.data(),
         b"v2",
@@ -148,10 +144,7 @@ fn test_serializable_read_lock_blocks_writer_no_wait() {
     // Serializable reader acquires and holds a read lock on "k".
     let ser_txn = env.begin_transaction(None).unwrap(); // serializable by default
     let mut out = DatabaseEntry::new();
-    assert_eq!(
-        get_val(&db, Some(&ser_txn), b"k", &mut out),
-        OperationStatus::Success
-    );
+    assert!(get_val(&db, Some(&ser_txn), b"k", &mut out));
     assert_eq!(out.data(), b"v1");
 
     // Concurrent writer with no_wait tries to write "k" — must conflict.
@@ -159,7 +152,7 @@ fn test_serializable_read_lock_blocks_writer_no_wait() {
     let writer_txn = env.begin_transaction(Some(&no_wait_config)).unwrap();
     let k = DatabaseEntry::from_bytes(b"k");
     let v2 = DatabaseEntry::from_bytes(b"v2");
-    let write_result = db.put(Some(&writer_txn), &k, &v2);
+    let write_result = db.put_in(&writer_txn, &k, &v2);
     // Must fail: serializable read lock blocks the write.
     assert!(
         write_result.is_err(),
@@ -173,11 +166,7 @@ fn test_serializable_read_lock_blocks_writer_no_wait() {
     let writer_txn2 = env.begin_transaction(Some(&no_wait_config)).unwrap();
     let k = DatabaseEntry::from_bytes(b"k");
     let v2 = DatabaseEntry::from_bytes(b"v2");
-    assert_eq!(
-        db.put(Some(&writer_txn2), &k, &v2).unwrap(),
-        OperationStatus::Success,
-        "write must succeed after serializable reader commits"
-    );
+    db.put_in(&writer_txn2, &k, &v2).unwrap();
     writer_txn2.commit().unwrap();
 }
 
@@ -197,10 +186,7 @@ fn test_read_committed_releases_lock_allowing_concurrent_writer() {
     let rc_config = TransactionConfig::read_committed();
     let reader_txn = env.begin_transaction(Some(&rc_config)).unwrap();
     let mut out = DatabaseEntry::new();
-    assert_eq!(
-        get_val(&db, Some(&reader_txn), b"k", &mut out),
-        OperationStatus::Success
-    );
+    assert!(get_val(&db, Some(&reader_txn), b"k", &mut out));
     assert_eq!(out.data(), b"v1");
 
     // After the read operation the lock is released, so a no_wait writer
@@ -209,11 +195,7 @@ fn test_read_committed_releases_lock_allowing_concurrent_writer() {
     let writer_txn = env.begin_transaction(Some(&no_wait_config)).unwrap();
     let k = DatabaseEntry::from_bytes(b"k");
     let v2 = DatabaseEntry::from_bytes(b"v2");
-    assert_eq!(
-        db.put(Some(&writer_txn), &k, &v2).unwrap(),
-        OperationStatus::Success,
-        "no_wait writer must succeed because read-committed released the read lock"
-    );
+    db.put_in(&writer_txn, &k, &v2).unwrap();
     writer_txn.commit().unwrap();
 
     // The reader can still proceed (its own txn is still open).
@@ -221,7 +203,7 @@ fn test_read_committed_releases_lock_allowing_concurrent_writer() {
 
     // Verify the write is visible.
     let mut out2 = DatabaseEntry::new();
-    assert_eq!(get_val(&db, None, b"k", &mut out2), OperationStatus::Success);
+    assert!(get_val(&db, None, b"k", &mut out2));
     assert_eq!(out2.data(), b"v2");
 }
 
@@ -241,14 +223,14 @@ fn test_write_write_conflict_no_wait() {
     let txn_a = env.begin_transaction(None).unwrap();
     let k = DatabaseEntry::from_bytes(b"ww");
     let va = DatabaseEntry::from_bytes(b"from_a");
-    db.put(Some(&txn_a), &k, &va).unwrap();
+    db.put_in(&txn_a, &k, &va).unwrap();
 
     // Second writer (no_wait) must conflict.
     let no_wait_config = TransactionConfig::new().with_no_wait(true);
     let txn_b = env.begin_transaction(Some(&no_wait_config)).unwrap();
     let k2 = DatabaseEntry::from_bytes(b"ww");
     let vb = DatabaseEntry::from_bytes(b"from_b");
-    let result_b = db.put(Some(&txn_b), &k2, &vb);
+    let result_b = db.put_in(&txn_b, &k2, &vb);
     assert!(
         result_b.is_err(),
         "second writer must fail: first writer holds WRITE lock"
@@ -262,14 +244,11 @@ fn test_write_write_conflict_no_wait() {
     let txn_c = env.begin_transaction(Some(&no_wait_config)).unwrap();
     let k3 = DatabaseEntry::from_bytes(b"ww");
     let vc = DatabaseEntry::from_bytes(b"from_c");
-    assert_eq!(
-        db.put(Some(&txn_c), &k3, &vc).unwrap(),
-        OperationStatus::Success
-    );
+    db.put_in(&txn_c, &k3, &vc).unwrap();
     txn_c.commit().unwrap();
 
     let mut out = DatabaseEntry::new();
-    assert_eq!(get_val(&db, None, b"ww", &mut out), OperationStatus::Success);
+    assert!(get_val(&db, None, b"ww", &mut out));
     assert_eq!(out.data(), b"from_c");
 }
 
@@ -290,10 +269,7 @@ fn test_read_committed_allows_non_repeatable_read() {
 
     // First read: sees v1.
     let mut out = DatabaseEntry::new();
-    assert_eq!(
-        get_val(&db, Some(&reader), b"nr", &mut out),
-        OperationStatus::Success
-    );
+    assert!(get_val(&db, Some(&reader), b"nr", &mut out));
     assert_eq!(out.data(), b"v1");
 
     // Another transaction commits v2.
@@ -302,10 +278,7 @@ fn test_read_committed_allows_non_repeatable_read() {
     // Second read within the same read-committed transaction: must see v2
     // because the read lock was released after the first operation.
     let mut out2 = DatabaseEntry::new();
-    assert_eq!(
-        get_val(&db, Some(&reader), b"nr", &mut out2),
-        OperationStatus::Success
-    );
+    assert!(get_val(&db, Some(&reader), b"nr", &mut out2));
     assert_eq!(
         out2.data(),
         b"v2",
@@ -332,10 +305,7 @@ fn test_serializable_prevents_non_repeatable_read() {
 
     // First read: sees v1, acquires read lock.
     let mut out = DatabaseEntry::new();
-    assert_eq!(
-        get_val(&db, Some(&ser_txn), b"rr", &mut out),
-        OperationStatus::Success
-    );
+    assert!(get_val(&db, Some(&ser_txn), b"rr", &mut out));
     assert_eq!(out.data(), b"v1");
 
     // Another writer tries to commit v2 with no_wait — must fail (read lock held).
@@ -344,17 +314,14 @@ fn test_serializable_prevents_non_repeatable_read() {
     let k = DatabaseEntry::from_bytes(b"rr");
     let v2 = DatabaseEntry::from_bytes(b"v2");
     assert!(
-        db.put(Some(&w), &k, &v2).is_err(),
+        db.put_in(&w, &k, &v2).is_err(),
         "write must fail: serializable reader holds read lock"
     );
     drop(w);
 
     // Second read within the serializable transaction: still sees v1.
     let mut out2 = DatabaseEntry::new();
-    assert_eq!(
-        get_val(&db, Some(&ser_txn), b"rr", &mut out2),
-        OperationStatus::Success
-    );
+    assert!(get_val(&db, Some(&ser_txn), b"rr", &mut out2));
     assert_eq!(
         out2.data(),
         b"v1",
@@ -380,7 +347,7 @@ fn test_atomic_commit_all_or_nothing_visibility() {
     for i in 0u32..N {
         let k = DatabaseEntry::from_bytes(&i.to_be_bytes());
         let v = DatabaseEntry::from_bytes(b"batch");
-        db.put(Some(&txn), &k, &v).unwrap();
+        db.put_in(&txn, &k, &v).unwrap();
     }
     txn.commit().unwrap();
 
@@ -390,9 +357,7 @@ fn test_atomic_commit_all_or_nothing_visibility() {
     for i in 0u32..N {
         let k = DatabaseEntry::from_bytes(&i.to_be_bytes());
         let mut v = DatabaseEntry::new();
-        if db.get(Some(&read_txn), &k, &mut v).unwrap()
-            != OperationStatus::Success
-        {
+        if !(db.get_into(Some(&read_txn), &k, &mut v).unwrap()) {
             missing += 1;
         }
     }
@@ -417,26 +382,22 @@ fn test_aborted_transaction_full_rollback() {
     // Modify existing key.
     let k1 = DatabaseEntry::from_bytes(b"existing");
     let v1 = DatabaseEntry::from_bytes(b"modified");
-    db.put(Some(&txn), &k1, &v1).unwrap();
+    db.put_in(&txn, &k1, &v1).unwrap();
     // Insert new key.
     let k2 = DatabaseEntry::from_bytes(b"new_key");
     let v2 = DatabaseEntry::from_bytes(b"new_val");
-    db.put(Some(&txn), &k2, &v2).unwrap();
+    db.put_in(&txn, &k2, &v2).unwrap();
     txn.abort().unwrap();
 
     // Existing key must revert to "original".
     let mut out = DatabaseEntry::new();
-    assert_eq!(
-        get_val(&db, None, b"existing", &mut out),
-        OperationStatus::Success
-    );
+    assert!(get_val(&db, None, b"existing", &mut out));
     assert_eq!(out.data(), b"original", "abort must restore before-image");
 
     // New key must not exist.
     let mut out2 = DatabaseEntry::new();
-    assert_eq!(
-        get_val(&db, None, b"new_key", &mut out2),
-        OperationStatus::NotFound,
+    assert!(
+        !get_val(&db, None, b"new_key", &mut out2),
         "abort must remove newly inserted keys"
     );
 }
@@ -498,12 +459,11 @@ fn test_32_thread_concurrent_readers() {
                 for i in 0u32..KEYS {
                     let k = DatabaseEntry::from_bytes(&i.to_be_bytes());
                     let mut v = DatabaseEntry::new();
-                    match db.get(Some(&txn), &k, &mut v).unwrap() {
-                        OperationStatus::Success => {
+                    match db.get_into(Some(&txn), &k, &mut v).unwrap() {
+                        true => {
                             assert_eq!(v.data(), b"val");
                         }
-                        OperationStatus::NotFound => missing += 1,
-                        other => panic!("unexpected status {other:?}"),
+                        false => missing += 1,
                     }
                 }
                 txn.commit().unwrap();
@@ -558,7 +518,7 @@ fn test_8r8w_all_committed_data_visible() {
                     let k = DatabaseEntry::from_bytes(&key_idx.to_be_bytes());
                     let v = DatabaseEntry::from_bytes(b"written");
                     let txn = env.begin_transaction(None).unwrap();
-                    db.put(Some(&txn), &k, &v).unwrap();
+                    db.put_in(&txn, &k, &v).unwrap();
                     txn.commit().unwrap();
                 }
             })
@@ -582,7 +542,7 @@ fn test_8r8w_all_committed_data_visible() {
                     for i in 0u32..WRITERS * KEYS_PER_WRITER {
                         let k = DatabaseEntry::from_bytes(&i.to_be_bytes());
                         let mut v = DatabaseEntry::new();
-                        let _ = db.get(Some(&txn), &k, &mut v);
+                        let _ = db.get_into(Some(&txn), &k, &mut v);
                     }
                     txn.commit().unwrap();
                     thread::sleep(Duration::from_millis(1));
@@ -606,7 +566,7 @@ fn test_8r8w_all_committed_data_visible() {
     for i in 0u32..total {
         let k = DatabaseEntry::from_bytes(&i.to_be_bytes());
         let mut v = DatabaseEntry::new();
-        if db.get(None, &k, &mut v).unwrap() == OperationStatus::NotFound {
+        if !(db.get_into(None, &k, &mut v).unwrap()) {
             missing += 1;
         }
     }
@@ -657,7 +617,7 @@ fn test_64_thread_concurrent_readers() {
         let k = DatabaseEntry::from_bytes(&i.to_be_bytes());
         let v = DatabaseEntry::from_bytes(b"rval");
         let txn = env.begin_transaction(None).unwrap();
-        db.put(Some(&txn), &k, &v).unwrap();
+        db.put_in(&txn, &k, &v).unwrap();
         txn.commit().unwrap();
     }
 
@@ -683,9 +643,7 @@ fn test_64_thread_concurrent_readers() {
                         let idx = (tid as u32 * LOOKUPS_PER_TXN + j) % KEYS;
                         let k = DatabaseEntry::from_bytes(&idx.to_be_bytes());
                         let mut v = DatabaseEntry::new();
-                        if db.get(Some(&txn), &k, &mut v).unwrap()
-                            != OperationStatus::Success
-                        {
+                        if !(db.get_into(Some(&txn), &k, &mut v).unwrap()) {
                             errors += 1;
                         }
                     }
@@ -762,7 +720,7 @@ fn test_32r32w_concurrent() {
                     let k = DatabaseEntry::from_bytes(key.as_bytes());
                     let v = DatabaseEntry::from_bytes(b"wval");
                     let txn = env.begin_transaction(None).unwrap();
-                    db.put(Some(&txn), &k, &v).unwrap();
+                    db.put_in(&txn, &k, &v).unwrap();
                     txn.commit().unwrap();
                 }
             })
@@ -780,7 +738,7 @@ fn test_32r32w_concurrent() {
                 let rc = TransactionConfig::read_committed();
                 while !done.load(std::sync::atomic::Ordering::Relaxed) {
                     let txn = env.begin_transaction(Some(&rc)).unwrap();
-                    let mut cursor = db.open_cursor(Some(&txn), None).unwrap();
+                    let mut cursor = db.open_cursor_in(&txn, None).unwrap();
                     let mut k = DatabaseEntry::new();
                     let mut v = DatabaseEntry::new();
                     let _ =
@@ -813,7 +771,7 @@ fn test_32r32w_concurrent() {
             let key = format!("w{wid:03}:{j:04}");
             let k = DatabaseEntry::from_bytes(key.as_bytes());
             let mut v = DatabaseEntry::new();
-            if db.get(None, &k, &mut v).unwrap() == OperationStatus::NotFound {
+            if !(db.get_into(None, &k, &mut v).unwrap()) {
                 missing += 1;
             }
         }
@@ -877,7 +835,7 @@ fn test_200_thread_disjoint_writers() {
                     let k = DatabaseEntry::from_bytes(key.as_bytes());
                     let v = DatabaseEntry::from_bytes(b"dval");
                     let txn = env.begin_transaction(None).unwrap();
-                    db.put(Some(&txn), &k, &v).unwrap();
+                    db.put_in(&txn, &k, &v).unwrap();
                     txn.commit().unwrap();
                 }
             })
@@ -905,7 +863,7 @@ fn test_200_thread_disjoint_writers() {
             let key = format!("range{tid:03}:{i:04}");
             let k = DatabaseEntry::from_bytes(key.as_bytes());
             let mut v = DatabaseEntry::new();
-            if db.get(None, &k, &mut v).unwrap() == OperationStatus::NotFound {
+            if !(db.get_into(None, &k, &mut v).unwrap()) {
                 missing += 1;
             }
         }
@@ -916,7 +874,7 @@ fn test_200_thread_disjoint_writers() {
     );
 
     // Spot-check sorted order via cursor scan.
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut prev: Option<String> = None;
     let mut k = DatabaseEntry::new();
     let mut v = DatabaseEntry::new();
@@ -992,10 +950,10 @@ fn test_serializable_prevents_phantom_insert() {
     // Pre-populate: a, c  (so "bb" would be inserted between them).
     for (k, v) in &[(b"a".as_ref(), b"val_a".as_ref()), (b"c", b"val_c")] {
         let txn = env.begin_transaction(None).unwrap();
-        db.put(
-            Some(&txn),
-            &DatabaseEntry::from_bytes(k),
-            &DatabaseEntry::from_bytes(v),
+        db.put_in(
+            &txn,
+            DatabaseEntry::from_bytes(k),
+            DatabaseEntry::from_bytes(v),
         )
         .unwrap();
         txn.commit().unwrap();
@@ -1007,15 +965,15 @@ fn test_serializable_prevents_phantom_insert() {
     let t1 = env.begin_transaction(Some(&ser_cfg)).unwrap();
     let mut out = DatabaseEntry::new();
     // Read "a"
-    assert_eq!(
-        db.get(Some(&t1), &DatabaseEntry::from_bytes(b"a"), &mut out).unwrap(),
-        OperationStatus::Success,
+    assert!(
+        db.get_into(Some(&t1), DatabaseEntry::from_bytes(b"a"), &mut out)
+            .unwrap(),
         "T1 should read 'a'"
     );
     // Read "c" -- this acquires RangeRead on "c"'s LSN
-    assert_eq!(
-        db.get(Some(&t1), &DatabaseEntry::from_bytes(b"c"), &mut out).unwrap(),
-        OperationStatus::Success,
+    assert!(
+        db.get_into(Some(&t1), DatabaseEntry::from_bytes(b"c"), &mut out)
+            .unwrap(),
         "T1 should read 'c'"
     );
 
@@ -1024,10 +982,10 @@ fn test_serializable_prevents_phantom_insert() {
     // on "c"'s LSN.  T1 holds RangeRead on "c" → conflict → LockNotAvailable.
     let no_wait_cfg = TransactionConfig::new().with_no_wait(true);
     let t2 = env.begin_transaction(Some(&no_wait_cfg)).unwrap();
-    let insert_result = db.put(
-        Some(&t2),
-        &DatabaseEntry::from_bytes(b"bb"),
-        &DatabaseEntry::from_bytes(b"val_bb"),
+    let insert_result = db.put_in(
+        &t2,
+        DatabaseEntry::from_bytes(b"bb"),
+        DatabaseEntry::from_bytes(b"val_bb"),
     );
     let _ = t2.abort();
 
@@ -1047,10 +1005,10 @@ fn test_serializable_prevents_phantom_insert() {
     t1.commit().unwrap();
 
     let t3 = env.begin_transaction(Some(&no_wait_cfg)).unwrap();
-    let result = db.put(
-        Some(&t3),
-        &DatabaseEntry::from_bytes(b"bb"),
-        &DatabaseEntry::from_bytes(b"val_bb"),
+    let result = db.put_in(
+        &t3,
+        DatabaseEntry::from_bytes(b"bb"),
+        DatabaseEntry::from_bytes(b"val_bb"),
     );
     assert!(
         result.is_ok(),
@@ -1085,10 +1043,10 @@ fn test_default_isolation_allows_phantom_insert() {
 
     for (k, v) in &[(b"a".as_ref(), b"v".as_ref()), (b"c", b"v")] {
         let txn = env.begin_transaction(None).unwrap();
-        db.put(
-            Some(&txn),
-            &DatabaseEntry::from_bytes(k),
-            &DatabaseEntry::from_bytes(v),
+        db.put_in(
+            &txn,
+            DatabaseEntry::from_bytes(k),
+            DatabaseEntry::from_bytes(v),
         )
         .unwrap();
         txn.commit().unwrap();
@@ -1098,8 +1056,8 @@ fn test_default_isolation_allows_phantom_insert() {
     // lock_ln acquires Read (NOT RangeRead) on each key's LSN.
     let t1 = env.begin_transaction(None).unwrap(); // default = no serializable
     let mut out = DatabaseEntry::new();
-    db.get(Some(&t1), &DatabaseEntry::from_bytes(b"a"), &mut out).unwrap();
-    db.get(Some(&t1), &DatabaseEntry::from_bytes(b"c"), &mut out).unwrap();
+    db.get_into(Some(&t1), DatabaseEntry::from_bytes(b"a"), &mut out).unwrap();
+    db.get_into(Some(&t1), DatabaseEntry::from_bytes(b"c"), &mut out).unwrap();
 
     // T2: no_wait inserter inserts "bb" (between "a" and "c").
     // Under non-serializable isolation T1 holds only Read on "c".
@@ -1107,10 +1065,10 @@ fn test_default_isolation_allows_phantom_insert() {
     // So T2's RangeInsert on "c" is immediately granted.
     let no_wait_cfg = TransactionConfig::new().with_no_wait(true);
     let t2 = env.begin_transaction(Some(&no_wait_cfg)).unwrap();
-    let result = db.put(
-        Some(&t2),
-        &DatabaseEntry::from_bytes(b"bb"),
-        &DatabaseEntry::from_bytes(b"val_bb"),
+    let result = db.put_in(
+        &t2,
+        DatabaseEntry::from_bytes(b"bb"),
+        DatabaseEntry::from_bytes(b"val_bb"),
     );
     assert!(
         result.is_ok(),
@@ -1147,10 +1105,10 @@ fn test_read_committed_allows_phantom_insert() {
 
     for (k, v) in &[(b"a".as_ref(), b"v".as_ref()), (b"c", b"v")] {
         let txn = env.begin_transaction(None).unwrap();
-        db.put(
-            Some(&txn),
-            &DatabaseEntry::from_bytes(k),
-            &DatabaseEntry::from_bytes(v),
+        db.put_in(
+            &txn,
+            DatabaseEntry::from_bytes(k),
+            DatabaseEntry::from_bytes(v),
         )
         .unwrap();
         txn.commit().unwrap();
@@ -1160,18 +1118,18 @@ fn test_read_committed_allows_phantom_insert() {
     let rc_cfg = TransactionConfig::read_committed();
     let t1 = env.begin_transaction(Some(&rc_cfg)).unwrap();
     let mut out = DatabaseEntry::new();
-    db.get(Some(&t1), &DatabaseEntry::from_bytes(b"a"), &mut out).unwrap();
-    db.get(Some(&t1), &DatabaseEntry::from_bytes(b"c"), &mut out).unwrap();
+    db.get_into(Some(&t1), DatabaseEntry::from_bytes(b"a"), &mut out).unwrap();
+    db.get_into(Some(&t1), DatabaseEntry::from_bytes(b"c"), &mut out).unwrap();
     // After each get(), read_committed releases the lock immediately.
     // No RangeRead is held on "c"'s LSN at this point.
 
     // T2: no_wait inserter inserts "bb" — must succeed because T1 released.
     let no_wait_cfg = TransactionConfig::new().with_no_wait(true);
     let t2 = env.begin_transaction(Some(&no_wait_cfg)).unwrap();
-    let result = db.put(
-        Some(&t2),
-        &DatabaseEntry::from_bytes(b"bb"),
-        &DatabaseEntry::from_bytes(b"val_bb"),
+    let result = db.put_in(
+        &t2,
+        DatabaseEntry::from_bytes(b"bb"),
+        DatabaseEntry::from_bytes(b"val_bb"),
     );
     assert!(
         result.is_ok(),
@@ -1208,10 +1166,10 @@ fn test_serializable_scan_then_insert_same_txn_no_panic() {
     // Pre-populate: "a", "c".
     for (k, v) in &[(b"a".as_ref(), b"v".as_ref()), (b"c", b"v")] {
         let txn = env.begin_transaction(None).unwrap();
-        db.put(
-            Some(&txn),
-            &DatabaseEntry::from_bytes(k),
-            &DatabaseEntry::from_bytes(v),
+        db.put_in(
+            &txn,
+            DatabaseEntry::from_bytes(k),
+            DatabaseEntry::from_bytes(v),
         )
         .unwrap();
         txn.commit().unwrap();
@@ -1224,12 +1182,12 @@ fn test_serializable_scan_then_insert_same_txn_no_panic() {
     let ser_cfg = TransactionConfig::new().with_serializable_isolation(true);
     let txn = env.begin_transaction(Some(&ser_cfg)).unwrap();
     let mut out = DatabaseEntry::new();
-    db.get(Some(&txn), &DatabaseEntry::from_bytes(b"c"), &mut out).unwrap();
+    db.get_into(Some(&txn), DatabaseEntry::from_bytes(b"c"), &mut out).unwrap();
     // Now insert "bb" (successor is "c" which we already hold RangeRead on).
-    let result = db.put(
-        Some(&txn),
-        &DatabaseEntry::from_bytes(b"bb"),
-        &DatabaseEntry::from_bytes(b"val_bb"),
+    let result = db.put_in(
+        &txn,
+        DatabaseEntry::from_bytes(b"bb"),
+        DatabaseEntry::from_bytes(b"val_bb"),
     );
     assert!(
         result.is_ok(),
@@ -1266,10 +1224,10 @@ fn test_serializable_prevents_phantom_eof_insert() {
     // Pre-populate a single key "m".
     {
         let txn = env.begin_transaction(None).unwrap();
-        db.put(
-            Some(&txn),
-            &DatabaseEntry::from_bytes(b"m"),
-            &DatabaseEntry::from_bytes(b"v"),
+        db.put_in(
+            &txn,
+            DatabaseEntry::from_bytes(b"m"),
+            DatabaseEntry::from_bytes(b"v"),
         )
         .unwrap();
         txn.commit().unwrap();
@@ -1279,7 +1237,7 @@ fn test_serializable_prevents_phantom_eof_insert() {
     // On reaching EOF, lock_eof_for_scan acquires RangeRead on the EOF sentinel.
     let ser_cfg = TransactionConfig::new().with_serializable_isolation(true);
     let t1 = env.begin_transaction(Some(&ser_cfg)).unwrap();
-    let mut cursor = db.open_cursor(Some(&t1), None).unwrap();
+    let mut cursor = db.open_cursor_in(&t1, None).unwrap();
     let mut k = DatabaseEntry::new();
     let mut v = DatabaseEntry::new();
     // Scan to EOF.
@@ -1299,10 +1257,10 @@ fn test_serializable_prevents_phantom_eof_insert() {
     // RangeRead × RangeInsert = Block → LockNotAvailable (no_wait).
     let no_wait_cfg = TransactionConfig::new().with_no_wait(true);
     let t2 = env.begin_transaction(Some(&no_wait_cfg)).unwrap();
-    let insert_result = db.put(
-        Some(&t2),
-        &DatabaseEntry::from_bytes(b"z"),
-        &DatabaseEntry::from_bytes(b"val_z"),
+    let insert_result = db.put_in(
+        &t2,
+        DatabaseEntry::from_bytes(b"z"),
+        DatabaseEntry::from_bytes(b"val_z"),
     );
     let _ = t2.abort();
 
@@ -1324,10 +1282,10 @@ fn test_serializable_prevents_phantom_eof_insert() {
     t1.commit().unwrap();
     let t3 = env.begin_transaction(Some(&no_wait_cfg)).unwrap();
     assert!(
-        db.put(
-            Some(&t3),
-            &DatabaseEntry::from_bytes(b"z"),
-            &DatabaseEntry::from_bytes(b"val_z"),
+        db.put_in(
+            &t3,
+            DatabaseEntry::from_bytes(b"z"),
+            DatabaseEntry::from_bytes(b"val_z")
         )
         .is_ok(),
         "After T1 commits, 'z' insert must succeed"

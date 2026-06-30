@@ -21,9 +21,7 @@
 //!
 //! The worker binary path is injected by cargo as `CARGO_BIN_EXE_crash_worker`.
 
-use noxu_db::{
-    DatabaseConfig, DatabaseEntry, EnvironmentConfig, OperationStatus,
-};
+use noxu_db::{DatabaseConfig, DatabaseEntry, EnvironmentConfig};
 use std::path::Path;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -185,19 +183,16 @@ fn test_committed_writes_survive_sigkill() {
     for i in 0u32..50 {
         let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
         let mut val = DatabaseEntry::new();
-        match db.get(None, &key, &mut val).unwrap() {
-            OperationStatus::Success => {
+        match db.get_into(None, &key, &mut val).unwrap() {
+            true => {
                 assert_eq!(
                     val.data(),
                     b"committed",
                     "key {i} has wrong value after recovery"
                 );
             }
-            OperationStatus::NotFound => {
+            false => {
                 missing += 1;
-            }
-            other => {
-                panic!("unexpected status {other:?} for committed key {i}")
             }
         }
     }
@@ -211,7 +206,7 @@ fn test_committed_writes_survive_sigkill() {
     for i in 1000u32..1050 {
         let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
         let mut val = DatabaseEntry::new();
-        if db.get(None, &key, &mut val).unwrap() == OperationStatus::Success {
+        if db.get_into(None, &key, &mut val).unwrap() {
             leaked += 1;
         }
     }
@@ -266,9 +261,8 @@ fn test_uncommitted_transaction_leaves_no_trace() {
     // Sentinel must survive.
     let sentinel_key = DatabaseEntry::from_bytes(b"sentinel");
     let mut val = DatabaseEntry::new();
-    assert_eq!(
-        db.get(None, &sentinel_key, &mut val).unwrap(),
-        OperationStatus::Success,
+    assert!(
+        db.get_into(None, &sentinel_key, &mut val).unwrap(),
         "sentinel key missing after recovery — committed data was lost"
     );
     assert_eq!(val.data(), b"ok");
@@ -278,7 +272,7 @@ fn test_uncommitted_transaction_leaves_no_trace() {
     for i in 0u32..50 {
         let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
         let mut val = DatabaseEntry::new();
-        if db.get(None, &key, &mut val).unwrap() == OperationStatus::Success {
+        if db.get_into(None, &key, &mut val).unwrap() {
             leaked += 1;
         }
     }
@@ -347,7 +341,7 @@ fn test_repeated_crash_recovery_is_idempotent() {
     for i in 0u32..50 {
         let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
         let mut val = DatabaseEntry::new();
-        if db.get(None, &key, &mut val).unwrap() == OperationStatus::NotFound {
+        if !(db.get_into(None, &key, &mut val).unwrap()) {
             missing += 1;
         }
     }
@@ -360,7 +354,7 @@ fn test_repeated_crash_recovery_is_idempotent() {
     for i in 1000u32..1050 {
         let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
         let mut val = DatabaseEntry::new();
-        if db.get(None, &key, &mut val).unwrap() == OperationStatus::Success {
+        if db.get_into(None, &key, &mut val).unwrap() {
             leaked += 1;
         }
     }
@@ -414,16 +408,15 @@ fn test_commit_ordering_preserved_after_sigkill() {
     for i in 0u32..25 {
         let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
         let mut val = DatabaseEntry::new();
-        match db.get(None, &key, &mut val).unwrap() {
-            OperationStatus::Success => {
+        match db.get_into(None, &key, &mut val).unwrap() {
+            true => {
                 assert_eq!(
                     val.data(),
                     b"t1",
                     "key {i} has wrong value after recovery"
                 );
             }
-            OperationStatus::NotFound => missing += 1,
-            s => panic!("unexpected status {s:?} for T1 key {i}"),
+            false => missing += 1,
         }
     }
     assert_eq!(missing, 0, "{missing} T1 keys lost after recovery");
@@ -433,7 +426,7 @@ fn test_commit_ordering_preserved_after_sigkill() {
     for i in 100u32..125 {
         let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
         let mut val = DatabaseEntry::new();
-        if db.get(None, &key, &mut val).unwrap() == OperationStatus::Success {
+        if db.get_into(None, &key, &mut val).unwrap() {
             leaked += 1;
         }
     }
@@ -490,7 +483,7 @@ fn test_torn_write_truncated_entry_recovered() {
     for i in 0u32..50 {
         let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
         let mut val = DatabaseEntry::new();
-        if db.get(None, &key, &mut val).unwrap() == OperationStatus::NotFound {
+        if !(db.get_into(None, &key, &mut val).unwrap()) {
             missing += 1;
         }
     }
@@ -559,16 +552,16 @@ fn test_clean_close_and_sigkill_produce_identical_state() {
         let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
 
         let mut val_c = DatabaseEntry::new();
-        let status_c = db_clean.get(None, &key, &mut val_c).unwrap();
+        let status_c = db_clean.get_into(None, &key, &mut val_c).unwrap();
 
         let mut val_k = DatabaseEntry::new();
-        let status_k = db_crash.get(None, &key, &mut val_k).unwrap();
+        let status_k = db_crash.get_into(None, &key, &mut val_k).unwrap();
 
         assert_eq!(
             status_c, status_k,
             "key {i}: clean={status_c:?} crash={status_k:?} — parity violation"
         );
-        if status_c == OperationStatus::Success {
+        if status_c {
             assert_eq!(
                 val_c.data(),
                 val_k.data(),
@@ -641,14 +634,11 @@ fn open_txn_spanning_checkpoint_recovers_correctly() {
         let k = format!("committed_{i:03}");
         let key = DatabaseEntry::from_bytes(k.as_bytes());
         let mut val = DatabaseEntry::new();
-        match db.get(None, &key, &mut val).unwrap() {
-            OperationStatus::Success => {}
-            OperationStatus::NotFound => {
+        match db.get_into(None, &key, &mut val).unwrap() {
+            true => {}
+            false => {
                 missing_committed += 1;
                 eprintln!("committed key missing after recovery: {k}");
-            }
-            other => {
-                panic!("unexpected status {other:?} for committed key {k}")
             }
         }
     }
@@ -664,7 +654,7 @@ fn open_txn_spanning_checkpoint_recovers_correctly() {
         let k = format!("open_{i:03}");
         let key = DatabaseEntry::from_bytes(k.as_bytes());
         let mut val = DatabaseEntry::new();
-        if db.get(None, &key, &mut val).unwrap() == OperationStatus::Success {
+        if db.get_into(None, &key, &mut val).unwrap() {
             leaked += 1;
             eprintln!(
                 "CORRECTNESS VIOLATION: uncommitted key '{k}' survived recovery"
@@ -726,10 +716,9 @@ fn aborted_then_committed_same_key_recovers_committed_value() {
 
     let key = DatabaseEntry::from_bytes(b"K");
     let mut val = DatabaseEntry::new();
-    let status = db.get(None, &key, &mut val).unwrap();
-    assert_eq!(
+    let status = db.get_into(None, &key, &mut val).unwrap();
+    assert!(
         status,
-        OperationStatus::Success,
         "committed key K must be present after recovery (T3's write must not \
          be clobbered by the undo of T1's aborted write of the same key)"
     );
@@ -782,18 +771,17 @@ fn in_redo_bin_flushed_by_checkpoint_survives_crash() {
         let k = i.to_be_bytes();
         let key = DatabaseEntry::from_bytes(&k);
         let mut val = DatabaseEntry::new();
-        match db.get(None, &key, &mut val).unwrap() {
-            OperationStatus::Success => {
+        match db.get_into(None, &key, &mut val).unwrap() {
+            true => {
                 assert_eq!(
                     val.data(),
                     b"before_ckpt",
                     "key {i} has wrong value after crash+recovery"
                 );
             }
-            OperationStatus::NotFound => {
+            false => {
                 missing += 1;
             }
-            other => panic!("unexpected status {other:?} for key {i}"),
         }
     }
     assert_eq!(
@@ -805,10 +793,9 @@ fn in_redo_bin_flushed_by_checkpoint_survives_crash() {
     // The 1 post-checkpoint key must also survive (LN-redo).
     let post_key = DatabaseEntry::from_bytes(b"post_ckpt");
     let mut post_val = DatabaseEntry::new();
-    let status = db.get(None, &post_key, &mut post_val).unwrap();
-    assert_eq!(
+    let status = db.get_into(None, &post_key, &mut post_val).unwrap();
+    assert!(
         status,
-        OperationStatus::Success,
         "post-checkpoint key must survive crash recovery (LN-redo)"
     );
     assert_eq!(post_val.data(), b"after_ckpt");
@@ -851,8 +838,8 @@ fn in_redo_bin_delta_reconstituted_survives_crash() {
         let k = i.to_be_bytes();
         let key = DatabaseEntry::from_bytes(&k);
         let mut val = DatabaseEntry::new();
-        match db.get(None, &key, &mut val).unwrap() {
-            OperationStatus::Success => {
+        match db.get_into(None, &key, &mut val).unwrap() {
+            true => {
                 let expected =
                     if i < 5 { b"v2" as &[u8] } else { b"v1" as &[u8] };
                 assert_eq!(
@@ -861,10 +848,9 @@ fn in_redo_bin_delta_reconstituted_survives_crash() {
                     "key {i} has wrong value after crash+recovery"
                 );
             }
-            OperationStatus::NotFound => {
+            false => {
                 missing += 1;
             }
-            other => panic!("unexpected status {other:?} for key {i}"),
         }
     }
     assert_eq!(
@@ -931,8 +917,8 @@ fn test_file_flip_fsync_ordering_crash_recovery() {
     for i in 0u32..200 {
         let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
         let mut val = DatabaseEntry::new();
-        let status = db.get(None, &key, &mut val).expect("get");
-        if status != OperationStatus::Success {
+        let status = db.get_into(None, &key, &mut val).expect("get");
+        if !status {
             missing.push(i);
         }
     }
@@ -1001,16 +987,15 @@ fn test_concurrent_commit_sync_survives_sigkill() {
             let id = tid * 1000 + k;
             let key = DatabaseEntry::from_bytes(&id.to_be_bytes());
             let mut val = DatabaseEntry::new();
-            match db.get(None, &key, &mut val).unwrap() {
-                OperationStatus::Success => {
+            match db.get_into(None, &key, &mut val).unwrap() {
+                true => {
                     assert_eq!(
                         val.data(),
                         b"committed",
                         "key {id} has wrong value after recovery"
                     );
                 }
-                OperationStatus::NotFound => missing.push(id),
-                other => panic!("unexpected status {other:?} for key {id}"),
+                false => missing.push(id),
             }
         }
     }

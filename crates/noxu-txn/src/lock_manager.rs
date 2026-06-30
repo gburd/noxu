@@ -325,8 +325,8 @@ impl LockManager {
                     return false;
                 }
                 match lock.get_write_owner_locker_id() {
-                    None => true,                     // only readers own it
-                    Some(w) => w == requester_id,     // we already write-own it
+                    None => true,                 // only readers own it
+                    Some(w) => w == requester_id, // we already write-own it
                 }
             }
         }

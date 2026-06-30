@@ -4,7 +4,7 @@
 //! backed by a database record.
 
 use crate::error::Result;
-use noxu_db::{Database, DatabaseEntry, OperationStatus};
+use noxu_db::Database;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Auto-incrementing sequence for generating unique IDs.
@@ -70,27 +70,19 @@ impl<'db> Sequence<'db> {
         cache_size: u64,
     ) -> Result<Self> {
         let key = format!("seq:{}", name).into_bytes();
-        let key_entry = DatabaseEntry::from_bytes(&key);
-        let mut data_entry = DatabaseEntry::new();
 
-        let initial_value = match db.get(None, &key_entry, &mut data_entry)? {
-            OperationStatus::Success => {
-                let bytes = data_entry.data();
-                if bytes.len() >= 8 {
-                    let mut arr = [0u8; 8];
-                    arr.copy_from_slice(&bytes[..8]);
-                    u64::from_be_bytes(arr)
-                } else {
-                    1
-                }
+        let initial_value = match db.get(&key)? {
+            Some(bytes) if bytes.len() >= 8 => {
+                let mut arr = [0u8; 8];
+                arr.copy_from_slice(&bytes[..8]);
+                u64::from_be_bytes(arr)
             }
             _ => 1,
         };
 
         // Pre-allocate the first cache range and persist.
         let limit = initial_value + cache_size;
-        let limit_entry = DatabaseEntry::from_bytes(&limit.to_be_bytes());
-        db.put(None, &key_entry, &limit_entry)?;
+        db.put(&key, limit.to_be_bytes())?;
 
         Ok(Self {
             db,
@@ -128,10 +120,7 @@ impl<'db> Sequence<'db> {
             ) {
                 Ok(_) => {
                     // We won the race, persist the new limit.
-                    let key_entry = DatabaseEntry::from_bytes(&self.key);
-                    let limit_entry =
-                        DatabaseEntry::from_bytes(&new_limit.to_be_bytes());
-                    self.db.put(None, &key_entry, &limit_entry)?;
+                    self.db.put(&self.key, new_limit.to_be_bytes())?;
                     return Ok(val);
                 }
                 Err(_) => {

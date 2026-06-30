@@ -68,17 +68,14 @@ fn database_txn_put_get_delete() {
 
     let txn = env.begin_transaction(None).unwrap();
     let (k, v) = kv(1, 100);
-    assert_eq!(db.put(Some(&txn), &k, &v).unwrap(), OperationStatus::Success);
+    db.put_in(&txn, &k, &v).unwrap();
     let mut out = DatabaseEntry::new();
-    assert_eq!(
-        db.get(Some(&txn), &k, &mut out).unwrap(),
-        OperationStatus::Success
-    );
+    assert!(db.get_into(Some(&txn), &k, &mut out).unwrap());
     assert_eq!(out.data(), 100u32.to_be_bytes());
     txn.commit().unwrap();
 
     let mut out2 = DatabaseEntry::new();
-    assert_eq!(db.get(None, &k, &mut out2).unwrap(), OperationStatus::Success);
+    assert!(db.get_into(None, &k, &mut out2).unwrap());
     assert_eq!(out2.data(), 100u32.to_be_bytes());
 }
 
@@ -89,7 +86,7 @@ fn database_delete_nonexistent_returns_not_found() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open(&dir);
     let k = DatabaseEntry::from_bytes(b"absent");
-    assert_eq!(db.delete(None, &k).unwrap(), OperationStatus::NotFound);
+    assert!(!(db.delete(&k).unwrap()));
 }
 
 /// : DatabaseTest.testOverwrite
@@ -99,10 +96,10 @@ fn database_put_replaces_existing_value() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open(&dir);
     let k = DatabaseEntry::from_bytes(b"k");
-    db.put(None, &k, &DatabaseEntry::from_bytes(b"v1")).unwrap();
-    db.put(None, &k, &DatabaseEntry::from_bytes(b"v2")).unwrap();
+    db.put(&k, DatabaseEntry::from_bytes(b"v1")).unwrap();
+    db.put(&k, DatabaseEntry::from_bytes(b"v2")).unwrap();
     let mut out = DatabaseEntry::new();
-    db.get(None, &k, &mut out).unwrap();
+    db.get_into(None, &k, &mut out).unwrap();
     assert_eq!(out.data(), b"v2");
 }
 
@@ -116,12 +113,12 @@ fn database_count_after_insert_delete() {
     assert_eq!(db.count().unwrap(), 0);
     for i in 0u32..10 {
         let (k, v) = kv(i, i);
-        db.put(None, &k, &v).unwrap();
+        db.put(&k, &v).unwrap();
     }
     assert_eq!(db.count().unwrap(), 10);
     for i in 0u32..5 {
         let (k, _) = kv(i, 0);
-        db.delete(None, &k).unwrap();
+        db.delete(&k).unwrap();
     }
     assert_eq!(db.count().unwrap(), 5);
 }
@@ -133,13 +130,13 @@ fn database_put_no_overwrite_returns_key_exists() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open(&dir);
     let k = DatabaseEntry::from_bytes(b"k");
-    db.put(None, &k, &DatabaseEntry::from_bytes(b"original")).unwrap();
+    db.put(&k, DatabaseEntry::from_bytes(b"original")).unwrap();
     let status = db
-        .put_no_overwrite(None, &k, &DatabaseEntry::from_bytes(b"overwrite"))
+        .put_no_overwrite(&k, DatabaseEntry::from_bytes(b"overwrite"))
         .unwrap();
-    assert_eq!(status, OperationStatus::KeyExists);
+    assert!(!status);
     let mut out = DatabaseEntry::new();
-    db.get(None, &k, &mut out).unwrap();
+    db.get_into(None, &k, &mut out).unwrap();
     assert_eq!(out.data(), b"original");
 }
 
@@ -161,7 +158,7 @@ fn truncate_database_clears_all_records() {
     const N: u32 = 50;
     for i in 0..N {
         let (k, v) = kv(i, i * 2);
-        db.put(None, &k, &v).unwrap();
+        db.put(&k, &v).unwrap();
     }
     assert_eq!(db.count().unwrap(), N as u64);
 
@@ -182,9 +179,8 @@ fn truncate_database_clears_all_records() {
     for i in 0..N {
         let k = DatabaseEntry::from_bytes(&i.to_be_bytes());
         let mut out = DatabaseEntry::new();
-        assert_eq!(
-            db2.get(None, &k, &mut out).unwrap(),
-            OperationStatus::NotFound,
+        assert!(
+            !(db2.get_into(None, &k, &mut out).unwrap()),
             "key {i} must be absent after truncate"
         );
     }
@@ -199,7 +195,7 @@ fn truncate_then_add_records_works() {
 
     for i in 0u32..20 {
         let (k, v) = kv(i, i);
-        db.put(None, &k, &v).unwrap();
+        db.put(&k, &v).unwrap();
     }
     // F12: close before truncate.
     db.close().unwrap();
@@ -213,17 +209,14 @@ fn truncate_then_add_records_works() {
 
     for i in 100u32..110 {
         let (k, v) = kv(i, i * 3);
-        db.put(None, &k, &v).unwrap();
+        db.put(&k, &v).unwrap();
     }
     assert_eq!(db.count().unwrap(), 10);
 
     for i in 100u32..110 {
         let k = DatabaseEntry::from_bytes(&i.to_be_bytes());
         let mut out = DatabaseEntry::new();
-        assert_eq!(
-            db.get(None, &k, &mut out).unwrap(),
-            OperationStatus::Success
-        );
+        assert!(db.get_into(None, &k, &mut out).unwrap());
         assert_eq!(out.data(), (i * 3).to_be_bytes());
     }
 }
@@ -275,10 +268,10 @@ fn read_uncommitted_sees_dirty_write() {
     // Insert a committed baseline value.
     {
         let txn = env.begin_transaction(None).unwrap();
-        db.put(
-            Some(&txn),
-            &DatabaseEntry::from_bytes(b"key"),
-            &DatabaseEntry::from_bytes(b"baseline"),
+        db.put_in(
+            &txn,
+            DatabaseEntry::from_bytes(b"key"),
+            DatabaseEntry::from_bytes(b"baseline"),
         )
         .unwrap();
         txn.commit().unwrap();
@@ -294,10 +287,10 @@ fn read_uncommitted_sees_dirty_write() {
     // Writer: put dirty value, then hold the transaction open.
     let writer = thread::spawn(move || {
         let txn = env_w.begin_transaction(None).unwrap();
-        db_w.put(
-            Some(&txn),
-            &DatabaseEntry::from_bytes(b"key"),
-            &DatabaseEntry::from_bytes(b"dirty"),
+        db_w.put_in(
+            &txn,
+            DatabaseEntry::from_bytes(b"key"),
+            DatabaseEntry::from_bytes(b"dirty"),
         )
         .unwrap();
         wb.wait(); // signal: dirty write is in place
@@ -309,7 +302,7 @@ fn read_uncommitted_sees_dirty_write() {
 
     // ReadUncommitted cursor must see the dirty "dirty" value.
     let cursor_cfg = CursorConfig::read_uncommitted();
-    let mut cursor = db.open_cursor(None, Some(&cursor_cfg)).unwrap();
+    let mut cursor = db.open_cursor(Some(&cursor_cfg)).unwrap();
     let mut key = DatabaseEntry::from_bytes(b"key");
     let mut data = DatabaseEntry::new();
     let status = cursor
@@ -341,11 +334,11 @@ fn read_uncommitted_cursor_config_no_blocking() {
 
     for i in 0u32..5 {
         let (k, v) = kv(i, i * 10);
-        db.put(None, &k, &v).unwrap();
+        db.put(&k, &v).unwrap();
     }
 
     let cursor_cfg = CursorConfig::read_uncommitted();
-    let mut cursor = db.open_cursor(None, Some(&cursor_cfg)).unwrap();
+    let mut cursor = db.open_cursor(Some(&cursor_cfg)).unwrap();
     let mut key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
 
@@ -380,7 +373,7 @@ fn large_scale_insert_search_scan_257() {
 
     for i in 0u32..N {
         let (k, v) = kv(i, i * 3);
-        db.put(None, &k, &v).unwrap();
+        db.put(&k, &v).unwrap();
     }
     assert_eq!(db.count().unwrap(), N as u64);
 
@@ -388,9 +381,8 @@ fn large_scale_insert_search_scan_257() {
     for i in 0u32..N {
         let k = DatabaseEntry::from_bytes(&i.to_be_bytes());
         let mut out = DatabaseEntry::new();
-        assert_eq!(
-            db.get(None, &k, &mut out).unwrap(),
-            OperationStatus::Success,
+        assert!(
+            db.get_into(None, &k, &mut out).unwrap(),
             "key {i} must be findable after {N} inserts"
         );
         assert_eq!(
@@ -401,7 +393,7 @@ fn large_scale_insert_search_scan_257() {
     }
 
     // Full cursor scan must visit exactly N records in ascending order.
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut seen = Vec::new();
     let mut k = DatabaseEntry::new();
     let mut v = DatabaseEntry::new();
@@ -430,7 +422,7 @@ fn large_scale_10k_deep_tree_correctness() {
     // Write all records in reverse order to maximise split pressure.
     for i in (0u32..N).rev() {
         let (k, v) = kv(i, i.wrapping_mul(0x9e37_9117));
-        db.put(None, &k, &v).unwrap();
+        db.put(&k, &v).unwrap();
     }
     assert_eq!(
         db.count().unwrap(),
@@ -442,9 +434,8 @@ fn large_scale_10k_deep_tree_correctness() {
     for i in (0u32..N).step_by(100) {
         let k = DatabaseEntry::from_bytes(&i.to_be_bytes());
         let mut out = DatabaseEntry::new();
-        assert_eq!(
-            db.get(None, &k, &mut out).unwrap(),
-            OperationStatus::Success,
+        assert!(
+            db.get_into(None, &k, &mut out).unwrap(),
             "key {i} missing after 10K inserts"
         );
         let expected = i.wrapping_mul(0x9e37_9117);
@@ -468,13 +459,13 @@ fn large_scale_interleaved_insert_delete() {
 
     for i in 0u32..N {
         let (k, v) = kv(i, i * 7);
-        db.put(None, &k, &v).unwrap();
+        db.put(&k, &v).unwrap();
     }
 
     // Delete all odd keys.
     for i in (1u32..N).step_by(2) {
         let k = DatabaseEntry::from_bytes(&i.to_be_bytes());
-        assert_eq!(db.delete(None, &k).unwrap(), OperationStatus::Success);
+        assert!(db.delete(&k).unwrap());
     }
 
     let expected_count = (N / 2) as u64; // even keys remain
@@ -484,9 +475,8 @@ fn large_scale_interleaved_insert_delete() {
     for i in (0u32..N).step_by(2) {
         let k = DatabaseEntry::from_bytes(&i.to_be_bytes());
         let mut out = DatabaseEntry::new();
-        assert_eq!(
-            db.get(None, &k, &mut out).unwrap(),
-            OperationStatus::Success,
+        assert!(
+            db.get_into(None, &k, &mut out).unwrap(),
             "even key {i} must survive delete of odd keys"
         );
         assert_eq!(out.data(), (i * 7).to_be_bytes());
@@ -496,9 +486,8 @@ fn large_scale_interleaved_insert_delete() {
     for i in (1u32..N).step_by(2) {
         let k = DatabaseEntry::from_bytes(&i.to_be_bytes());
         let mut out = DatabaseEntry::new();
-        assert_eq!(
-            db.get(None, &k, &mut out).unwrap(),
-            OperationStatus::NotFound,
+        assert!(
+            !(db.get_into(None, &k, &mut out).unwrap()),
             "odd key {i} must be absent after delete"
         );
     }
@@ -534,7 +523,7 @@ fn recovery_across_checkpoint_boundary() {
         // Batch 1: written before the first automatic checkpoint.
         for i in 0u32..BATCH1 {
             let (k, v) = kv(i, i + 1000);
-            db.put(None, &k, &v).unwrap();
+            db.put(&k, &v).unwrap();
         }
 
         // Force an explicit checkpoint by reopening with tiny interval.
@@ -546,7 +535,7 @@ fn recovery_across_checkpoint_boundary() {
         // Batch 2: written after checkpoint.
         for i in BATCH1..(BATCH1 + BATCH2) {
             let (k, v) = kv(i, i + 2000);
-            db.put(None, &k, &v).unwrap();
+            db.put(&k, &v).unwrap();
         }
 
         drop(db);
@@ -567,9 +556,8 @@ fn recovery_across_checkpoint_boundary() {
         for i in 0u32..BATCH1 {
             let k = DatabaseEntry::from_bytes(&i.to_be_bytes());
             let mut out = DatabaseEntry::new();
-            assert_eq!(
-                db.get(None, &k, &mut out).unwrap(),
-                OperationStatus::Success,
+            assert!(
+                db.get_into(None, &k, &mut out).unwrap(),
                 "batch1 key {i} missing after recovery"
             );
             assert_eq!(out.data(), (i + 1000).to_be_bytes());
@@ -577,9 +565,8 @@ fn recovery_across_checkpoint_boundary() {
         for i in BATCH1..(BATCH1 + BATCH2) {
             let k = DatabaseEntry::from_bytes(&i.to_be_bytes());
             let mut out = DatabaseEntry::new();
-            assert_eq!(
-                db.get(None, &k, &mut out).unwrap(),
-                OperationStatus::Success,
+            assert!(
+                db.get_into(None, &k, &mut out).unwrap(),
                 "batch2 key {i} missing after recovery"
             );
             assert_eq!(out.data(), (i + 2000).to_be_bytes());
@@ -600,13 +587,12 @@ fn txn_abort_insert_not_visible() {
 
     let txn = env.begin_transaction(None).unwrap();
     let (k, v) = kv(42, 999);
-    db.put(Some(&txn), &k, &v).unwrap();
+    db.put_in(&txn, &k, &v).unwrap();
     txn.abort().unwrap();
 
     let mut out = DatabaseEntry::new();
-    assert_eq!(
-        db.get(None, &k, &mut out).unwrap(),
-        OperationStatus::NotFound,
+    assert!(
+        !(db.get_into(None, &k, &mut out).unwrap()),
         "aborted insert must not be visible"
     );
 }
@@ -620,17 +606,17 @@ fn txn_abort_update_restores_original_value() {
 
     // Establish initial value.
     let (k, v_orig) = kv(42, 100);
-    db.put(None, &k, &v_orig).unwrap();
+    db.put(&k, &v_orig).unwrap();
 
     // Update within a transaction, then abort.
     let txn = env.begin_transaction(None).unwrap();
-    db.put(Some(&txn), &k, &DatabaseEntry::from_bytes(&200u32.to_be_bytes()))
+    db.put_in(&txn, &k, DatabaseEntry::from_bytes(&200u32.to_be_bytes()))
         .unwrap();
     txn.abort().unwrap();
 
     // Original value must be restored.
     let mut out = DatabaseEntry::new();
-    assert_eq!(db.get(None, &k, &mut out).unwrap(), OperationStatus::Success);
+    assert!(db.get_into(None, &k, &mut out).unwrap());
     assert_eq!(
         out.data(),
         100u32.to_be_bytes(),
@@ -646,16 +632,15 @@ fn txn_abort_delete_restores_record() {
     let (env, db) = open(&dir);
 
     let (k, v) = kv(7, 777);
-    db.put(None, &k, &v).unwrap();
+    db.put(&k, &v).unwrap();
 
     let txn = env.begin_transaction(None).unwrap();
-    db.delete(Some(&txn), &k).unwrap();
+    db.delete_in(&txn, &k).unwrap();
     txn.abort().unwrap();
 
     let mut out = DatabaseEntry::new();
-    assert_eq!(
-        db.get(None, &k, &mut out).unwrap(),
-        OperationStatus::Success,
+    assert!(
+        db.get_into(None, &k, &mut out).unwrap(),
         "aborted delete must restore the record"
     );
     assert_eq!(out.data(), 777u32.to_be_bytes());
@@ -672,64 +657,67 @@ fn txn_abort_multiple_ops_restores_prior_state() {
     // Pre-state: keys 0..5 with value == key.
     for i in 0u32..5 {
         let (k, v) = kv(i, i);
-        db.put(None, &k, &v).unwrap();
+        db.put(&k, &v).unwrap();
     }
 
     let txn = env.begin_transaction(None).unwrap();
     // Insert new key 10.
-    db.put(
-        Some(&txn),
-        &DatabaseEntry::from_bytes(&10u32.to_be_bytes()),
-        &DatabaseEntry::from_bytes(&10u32.to_be_bytes()),
+    db.put_in(
+        &txn,
+        DatabaseEntry::from_bytes(&10u32.to_be_bytes()),
+        DatabaseEntry::from_bytes(&10u32.to_be_bytes()),
     )
     .unwrap();
     // Update key 2 → 99.
-    db.put(
-        Some(&txn),
-        &DatabaseEntry::from_bytes(&2u32.to_be_bytes()),
-        &DatabaseEntry::from_bytes(&99u32.to_be_bytes()),
+    db.put_in(
+        &txn,
+        DatabaseEntry::from_bytes(&2u32.to_be_bytes()),
+        DatabaseEntry::from_bytes(&99u32.to_be_bytes()),
     )
     .unwrap();
     // Delete key 4.
-    db.delete(Some(&txn), &DatabaseEntry::from_bytes(&4u32.to_be_bytes()))
-        .unwrap();
+    db.delete_in(&txn, DatabaseEntry::from_bytes(&4u32.to_be_bytes())).unwrap();
     txn.abort().unwrap();
 
     // Key 10 must not exist.
     let mut out = DatabaseEntry::new();
-    assert_eq!(
-        db.get(
+    assert!(
+        !(db.get_into(
             None,
-            &DatabaseEntry::from_bytes(&10u32.to_be_bytes()),
+            DatabaseEntry::from_bytes(&10u32.to_be_bytes()),
             &mut out
         )
-        .unwrap(),
-        OperationStatus::NotFound
+        .unwrap())
     );
     // Key 2 must have original value 2.
-    assert_eq!(
-        db.get(None, &DatabaseEntry::from_bytes(&2u32.to_be_bytes()), &mut out)
-            .unwrap(),
-        OperationStatus::Success
+    assert!(
+        db.get_into(
+            None,
+            DatabaseEntry::from_bytes(&2u32.to_be_bytes()),
+            &mut out
+        )
+        .unwrap()
     );
     assert_eq!(out.data(), 2u32.to_be_bytes());
     // Key 4 must be present with original value 4.
-    assert_eq!(
-        db.get(None, &DatabaseEntry::from_bytes(&4u32.to_be_bytes()), &mut out)
-            .unwrap(),
-        OperationStatus::Success
+    assert!(
+        db.get_into(
+            None,
+            DatabaseEntry::from_bytes(&4u32.to_be_bytes()),
+            &mut out
+        )
+        .unwrap()
     );
     assert_eq!(out.data(), 4u32.to_be_bytes());
     // Keys 0, 1, 3 must be unchanged.
     for i in [0u32, 1, 3] {
-        assert_eq!(
-            db.get(
+        assert!(
+            db.get_into(
                 None,
-                &DatabaseEntry::from_bytes(&i.to_be_bytes()),
+                DatabaseEntry::from_bytes(&i.to_be_bytes()),
                 &mut out
             )
-            .unwrap(),
-            OperationStatus::Success
+            .unwrap()
         );
         assert_eq!(out.data(), i.to_be_bytes());
     }
@@ -745,7 +733,7 @@ fn txn_abort_multiple_ops_restores_prior_state() {
 fn cursor_edge_empty_database_all_ops_not_found() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open(&dir);
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut k = DatabaseEntry::new();
     let mut v = DatabaseEntry::new();
 
@@ -767,10 +755,10 @@ fn cursor_edge_search_after_delete_returns_not_found() {
     let (_env, db) = open(&dir);
 
     let (k, v) = kv(5, 50);
-    db.put(None, &k, &v).unwrap();
-    db.delete(None, &k).unwrap();
+    db.put(&k, &v).unwrap();
+    db.delete(&k).unwrap();
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut search_k = DatabaseEntry::from_bytes(&5u32.to_be_bytes());
     let mut out = DatabaseEntry::new();
     assert_eq!(
@@ -790,16 +778,15 @@ fn cursor_edge_skip_deleted_records() {
     // Insert keys 0..10.
     for i in 0u32..10 {
         let (k, v) = kv(i, i);
-        db.put(None, &k, &v).unwrap();
+        db.put(&k, &v).unwrap();
     }
 
     // Delete first (0), last (9), and middle (5).
     for del in [0u32, 5, 9] {
-        db.delete(None, &DatabaseEntry::from_bytes(&del.to_be_bytes()))
-            .unwrap();
+        db.delete(DatabaseEntry::from_bytes(&del.to_be_bytes())).unwrap();
     }
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut k = DatabaseEntry::new();
     let mut v = DatabaseEntry::new();
     let mut seen: Vec<u32> = Vec::new();
@@ -823,9 +810,9 @@ fn cursor_edge_current_after_delete_not_found() {
     let (_env, db) = open(&dir);
 
     let (k, v) = kv(1, 10);
-    db.put(None, &k, &v).unwrap();
+    db.put(&k, &v).unwrap();
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut ck = DatabaseEntry::from_bytes(&1u32.to_be_bytes());
     let mut cv = DatabaseEntry::new();
 
@@ -836,7 +823,7 @@ fn cursor_edge_current_after_delete_not_found() {
     );
 
     // Delete key 1 through the database handle.
-    db.delete(None, &DatabaseEntry::from_bytes(&1u32.to_be_bytes())).unwrap();
+    db.delete(DatabaseEntry::from_bytes(&1u32.to_be_bytes())).unwrap();
 
     // Get::Current should now return NotFound (key is deleted).
     let status = cursor.get(&mut ck, &mut cv, Get::Current, None).unwrap();
@@ -862,14 +849,13 @@ fn cursor_search_gte_edge_cases() {
     // Keys: 10, 20, 30.
     for k in [10u32, 20, 30] {
         db.put(
-            None,
-            &DatabaseEntry::from_bytes(&k.to_be_bytes()),
-            &DatabaseEntry::from_bytes(&k.to_be_bytes()),
+            DatabaseEntry::from_bytes(&k.to_be_bytes()),
+            DatabaseEntry::from_bytes(&k.to_be_bytes()),
         )
         .unwrap();
     }
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
 
     // GTE(5) → first key >= 5 is 10.
     let mut k = DatabaseEntry::from_bytes(&5u32.to_be_bytes());
@@ -926,10 +912,10 @@ fn read_committed_allows_non_repeatable_read() {
     // Establish initial value.
     {
         let txn = env.begin_transaction(None).unwrap();
-        db.put(
-            Some(&txn),
-            &DatabaseEntry::from_bytes(b"key"),
-            &DatabaseEntry::from_bytes(b"v1"),
+        db.put_in(
+            &txn,
+            DatabaseEntry::from_bytes(b"key"),
+            DatabaseEntry::from_bytes(b"v1"),
         )
         .unwrap();
         txn.commit().unwrap();
@@ -945,10 +931,10 @@ fn read_committed_allows_non_repeatable_read() {
     let writer = thread::spawn(move || {
         b1.wait(); // wait until T1 has done its first read
         let txn = env2.begin_transaction(None).unwrap();
-        db2.put(
-            Some(&txn),
-            &DatabaseEntry::from_bytes(b"key"),
-            &DatabaseEntry::from_bytes(b"v2"),
+        db2.put_in(
+            &txn,
+            DatabaseEntry::from_bytes(b"key"),
+            DatabaseEntry::from_bytes(b"v2"),
         )
         .unwrap();
         txn.commit().unwrap();
@@ -961,7 +947,8 @@ fn read_committed_allows_non_repeatable_read() {
 
     let mut out = DatabaseEntry::new();
     // First read: must see v1.
-    db.get(Some(&txn1), &DatabaseEntry::from_bytes(b"key"), &mut out).unwrap();
+    db.get_into(Some(&txn1), DatabaseEntry::from_bytes(b"key"), &mut out)
+        .unwrap();
     assert_eq!(out.data(), b"v1", "first read must see v1");
 
     barrier_read1_done.wait(); // let writer commit v2
@@ -970,7 +957,7 @@ fn read_committed_allows_non_repeatable_read() {
     // Second read under read-committed: read lock was released after first read,
     // so T1 may see v2 if the lock is re-acquired.
     let status =
-        db.get(Some(&txn1), &DatabaseEntry::from_bytes(b"key"), &mut out);
+        db.get_into(Some(&txn1), DatabaseEntry::from_bytes(b"key"), &mut out);
     // Under semantics the second read will block waiting for write-lock
     // from the writer (already released); it should succeed with v2.
     // We accept either v1 (if lock not released) or v2 (if released) depending
@@ -1006,10 +993,10 @@ fn serializable_isolation_repeatable_read() {
 
     {
         let txn = env.begin_transaction(None).unwrap();
-        db.put(
-            Some(&txn),
-            &DatabaseEntry::from_bytes(b"key"),
-            &DatabaseEntry::from_bytes(b"v1"),
+        db.put_in(
+            &txn,
+            DatabaseEntry::from_bytes(b"key"),
+            DatabaseEntry::from_bytes(b"v1"),
         )
         .unwrap();
         txn.commit().unwrap();
@@ -1018,7 +1005,8 @@ fn serializable_isolation_repeatable_read() {
     // T1 reads key under serializable (holds read lock).
     let txn1 = env.begin_transaction(None).unwrap();
     let mut out = DatabaseEntry::new();
-    db.get(Some(&txn1), &DatabaseEntry::from_bytes(b"key"), &mut out).unwrap();
+    db.get_into(Some(&txn1), DatabaseEntry::from_bytes(b"key"), &mut out)
+        .unwrap();
     let first_read = out.data().to_vec();
     assert_eq!(first_read, b"v1");
 
@@ -1034,10 +1022,10 @@ fn serializable_isolation_repeatable_read() {
         let txn2 = env2.begin_transaction(Some(&no_wait_cfg)).unwrap();
         bs.wait();
         // This should fail because T1 holds a read lock.
-        let result = db2.put(
-            Some(&txn2),
-            &DatabaseEntry::from_bytes(b"key"),
-            &DatabaseEntry::from_bytes(b"v2"),
+        let result = db2.put_in(
+            &txn2,
+            DatabaseEntry::from_bytes(b"key"),
+            DatabaseEntry::from_bytes(b"v2"),
         );
         let _ = txn2.abort();
         result
@@ -1048,7 +1036,8 @@ fn serializable_isolation_repeatable_read() {
 
     // T1's second read must still see v1 (serializable = repeatable read).
     let mut out2 = DatabaseEntry::new();
-    db.get(Some(&txn1), &DatabaseEntry::from_bytes(b"key"), &mut out2).unwrap();
+    db.get_into(Some(&txn1), DatabaseEntry::from_bytes(b"key"), &mut out2)
+        .unwrap();
     let second_read = out2.data().to_vec();
     assert_eq!(
         second_read, b"v1",
@@ -1084,16 +1073,16 @@ fn multiple_databases_fully_isolated() {
 
     for i in 0u32..N {
         let k = DatabaseEntry::from_bytes(&i.to_be_bytes());
-        db_a.put(None, &k, &DatabaseEntry::from_bytes(b"A")).unwrap();
-        db_b.put(None, &k, &DatabaseEntry::from_bytes(b"B")).unwrap();
+        db_a.put(&k, DatabaseEntry::from_bytes(b"A")).unwrap();
+        db_b.put(&k, DatabaseEntry::from_bytes(b"B")).unwrap();
     }
 
     for i in 0u32..N {
         let k = DatabaseEntry::from_bytes(&i.to_be_bytes());
         let mut out = DatabaseEntry::new();
-        db_a.get(None, &k, &mut out).unwrap();
+        db_a.get_into(None, &k, &mut out).unwrap();
         assert_eq!(out.data(), b"A");
-        db_b.get(None, &k, &mut out).unwrap();
+        db_b.get_into(None, &k, &mut out).unwrap();
         assert_eq!(out.data(), b"B");
     }
     assert_eq!(db_a.count().unwrap(), N as u64);
@@ -1120,7 +1109,7 @@ fn recovery_1000_records_survive_reopen() {
             let k = DatabaseEntry::from_bytes(&i.to_be_bytes());
             // Value is a simple hash to detect value corruption.
             let v = DatabaseEntry::from_bytes(&(i ^ 0xdead_beef).to_be_bytes());
-            db.put(None, &k, &v).unwrap();
+            db.put(&k, &v).unwrap();
         }
     }
 
@@ -1134,9 +1123,8 @@ fn recovery_1000_records_survive_reopen() {
         for i in 0u32..N {
             let k = DatabaseEntry::from_bytes(&i.to_be_bytes());
             let mut out = DatabaseEntry::new();
-            assert_eq!(
-                db.get(None, &k, &mut out).unwrap(),
-                OperationStatus::Success,
+            assert!(
+                db.get_into(None, &k, &mut out).unwrap(),
                 "key {i} missing after recovery"
             );
             assert_eq!(
@@ -1161,13 +1149,13 @@ fn recovery_updates_are_durable() {
         // Initial writes.
         for i in 0u32..N {
             let (k, v) = kv(i, i);
-            db.put(None, &k, &v).unwrap();
+            db.put(&k, &v).unwrap();
         }
         // Updates.
         for i in 0u32..N {
             let k = DatabaseEntry::from_bytes(&i.to_be_bytes());
             let v = DatabaseEntry::from_bytes(&(i + 10_000).to_be_bytes());
-            db.put(None, &k, &v).unwrap();
+            db.put(&k, &v).unwrap();
         }
     }
 
@@ -1176,10 +1164,7 @@ fn recovery_updates_are_durable() {
         for i in 0u32..N {
             let k = DatabaseEntry::from_bytes(&i.to_be_bytes());
             let mut out = DatabaseEntry::new();
-            assert_eq!(
-                db.get(None, &k, &mut out).unwrap(),
-                OperationStatus::Success
-            );
+            assert!(db.get_into(None, &k, &mut out).unwrap());
             assert_eq!(
                 out.data(),
                 (i + 10_000).to_be_bytes(),
@@ -1199,14 +1184,10 @@ fn cursor_count_non_dup_key_is_one() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open(&dir);
 
-    db.put(
-        None,
-        &DatabaseEntry::from_bytes(b"k"),
-        &DatabaseEntry::from_bytes(b"v"),
-    )
-    .unwrap();
+    db.put(DatabaseEntry::from_bytes(b"k"), DatabaseEntry::from_bytes(b"v"))
+        .unwrap();
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut k = DatabaseEntry::from_bytes(b"k");
     let mut v = DatabaseEntry::new();
     cursor.get(&mut k, &mut v, Get::Search, None).unwrap();
@@ -1224,14 +1205,10 @@ fn cursor_put_overwrite_replaces_value() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open(&dir);
 
-    db.put(
-        None,
-        &DatabaseEntry::from_bytes(b"k"),
-        &DatabaseEntry::from_bytes(b"v1"),
-    )
-    .unwrap();
+    db.put(DatabaseEntry::from_bytes(b"k"), DatabaseEntry::from_bytes(b"v1"))
+        .unwrap();
 
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut k = DatabaseEntry::from_bytes(b"k");
     let mut v = DatabaseEntry::new();
     cursor.get(&mut k, &mut v, Get::Search, None).unwrap();
@@ -1241,7 +1218,7 @@ fn cursor_put_overwrite_replaces_value() {
     cursor.close().unwrap();
 
     let mut out = DatabaseEntry::new();
-    db.get(None, &DatabaseEntry::from_bytes(b"k"), &mut out).unwrap();
+    db.get_into(None, DatabaseEntry::from_bytes(b"k"), &mut out).unwrap();
     assert_eq!(out.data(), b"v2");
 }
 
@@ -1263,7 +1240,7 @@ fn environment_stats_non_negative_after_writes() {
 
     for i in 0u32..20 {
         let (k, v) = kv(i, i);
-        db.put(None, &k, &v).unwrap();
+        db.put(&k, &v).unwrap();
     }
 
     let stats = env.get_stats().unwrap();

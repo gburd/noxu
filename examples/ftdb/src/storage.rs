@@ -4,8 +4,7 @@ use crate::account::Account;
 use crate::error::FtdbError;
 use crate::transfer::Transfer;
 use noxu::{
-    Database, DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
-    OperationStatus, Transaction,
+    Database, DatabaseConfig, Environment, EnvironmentConfig, Transaction,
 };
 use std::path::Path;
 
@@ -44,17 +43,10 @@ impl Storage {
 
     /// Retrieves an account by ID (no explicit transaction).
     pub fn get_account(&self, id: u128) -> Result<Option<Account>, FtdbError> {
-        let key = DatabaseEntry::from_vec(id.to_le_bytes().to_vec());
-        let mut data = DatabaseEntry::new();
-        match self.accounts_db.get(None, &key, &mut data)? {
-            OperationStatus::Success => {
-                let bytes = data.get_data().unwrap_or(&[]);
-                if bytes.len() != 128 {
-                    return Ok(None);
-                }
-                Ok(Some(Account::from_bytes(bytes.try_into().unwrap())))
+        match self.accounts_db.get(id.to_le_bytes())? {
+            Some(bytes) if bytes.len() == 128 => {
+                Ok(Some(Account::from_bytes(bytes[..].try_into().unwrap())))
             }
-            OperationStatus::NotFound => Ok(None),
             _ => Ok(None),
         }
     }
@@ -65,26 +57,17 @@ impl Storage {
         txn: &Transaction,
         id: u128,
     ) -> Result<Option<Account>, FtdbError> {
-        let key = DatabaseEntry::from_vec(id.to_le_bytes().to_vec());
-        let mut data = DatabaseEntry::new();
-        match self.accounts_db.get(Some(txn), &key, &mut data)? {
-            OperationStatus::Success => {
-                let bytes = data.get_data().unwrap_or(&[]);
-                if bytes.len() != 128 {
-                    return Ok(None);
-                }
-                Ok(Some(Account::from_bytes(bytes.try_into().unwrap())))
+        match self.accounts_db.get_in(txn, id.to_le_bytes())? {
+            Some(bytes) if bytes.len() == 128 => {
+                Ok(Some(Account::from_bytes(bytes[..].try_into().unwrap())))
             }
-            OperationStatus::NotFound => Ok(None),
             _ => Ok(None),
         }
     }
 
     /// Stores an account (no explicit transaction).
     pub fn put_account(&self, account: &Account) -> Result<(), FtdbError> {
-        let key = DatabaseEntry::from_vec(account.id.to_le_bytes().to_vec());
-        let val = DatabaseEntry::from_vec(account.to_bytes().to_vec());
-        self.accounts_db.put(None, &key, &val)?;
+        self.accounts_db.put(account.id.to_le_bytes(), account.to_bytes())?;
         Ok(())
     }
 
@@ -94,9 +77,11 @@ impl Storage {
         txn: &Transaction,
         account: &Account,
     ) -> Result<(), FtdbError> {
-        let key = DatabaseEntry::from_vec(account.id.to_le_bytes().to_vec());
-        let val = DatabaseEntry::from_vec(account.to_bytes().to_vec());
-        self.accounts_db.put(Some(txn), &key, &val)?;
+        self.accounts_db.put_in(
+            txn,
+            account.id.to_le_bytes(),
+            account.to_bytes(),
+        )?;
         Ok(())
     }
 
@@ -107,17 +92,10 @@ impl Storage {
         &self,
         id: u128,
     ) -> Result<Option<Transfer>, FtdbError> {
-        let key = DatabaseEntry::from_vec(id.to_le_bytes().to_vec());
-        let mut data = DatabaseEntry::new();
-        match self.transfers_db.get(None, &key, &mut data)? {
-            OperationStatus::Success => {
-                let bytes = data.get_data().unwrap_or(&[]);
-                if bytes.len() != 128 {
-                    return Ok(None);
-                }
-                Ok(Some(Transfer::from_bytes(bytes.try_into().unwrap())))
+        match self.transfers_db.get(id.to_le_bytes())? {
+            Some(bytes) if bytes.len() == 128 => {
+                Ok(Some(Transfer::from_bytes(bytes[..].try_into().unwrap())))
             }
-            OperationStatus::NotFound => Ok(None),
             _ => Ok(None),
         }
     }
@@ -128,17 +106,10 @@ impl Storage {
         txn: &Transaction,
         id: u128,
     ) -> Result<Option<Transfer>, FtdbError> {
-        let key = DatabaseEntry::from_vec(id.to_le_bytes().to_vec());
-        let mut data = DatabaseEntry::new();
-        match self.transfers_db.get(Some(txn), &key, &mut data)? {
-            OperationStatus::Success => {
-                let bytes = data.get_data().unwrap_or(&[]);
-                if bytes.len() != 128 {
-                    return Ok(None);
-                }
-                Ok(Some(Transfer::from_bytes(bytes.try_into().unwrap())))
+        match self.transfers_db.get_in(txn, id.to_le_bytes())? {
+            Some(bytes) if bytes.len() == 128 => {
+                Ok(Some(Transfer::from_bytes(bytes[..].try_into().unwrap())))
             }
-            OperationStatus::NotFound => Ok(None),
             _ => Ok(None),
         }
     }
@@ -149,9 +120,11 @@ impl Storage {
         txn: &Transaction,
         transfer: &Transfer,
     ) -> Result<(), FtdbError> {
-        let key = DatabaseEntry::from_vec(transfer.id.to_le_bytes().to_vec());
-        let val = DatabaseEntry::from_vec(transfer.to_bytes().to_vec());
-        self.transfers_db.put(Some(txn), &key, &val)?;
+        self.transfers_db.put_in(
+            txn,
+            transfer.id.to_le_bytes(),
+            transfer.to_bytes(),
+        )?;
         Ok(())
     }
 }

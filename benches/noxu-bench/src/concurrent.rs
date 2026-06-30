@@ -63,7 +63,7 @@ pub fn run_concurrent(
                     format!("{:010}", idx).into_bytes(),
                 );
                 // Ignore NotFound — the key may have been deleted by a concurrent writer.
-                let _ = db_clone.get(None, &k, &mut data);
+                let _ = db_clone.get_into(None, &k, &mut data);
                 ops += 1;
             }
 
@@ -93,7 +93,7 @@ pub fn run_concurrent(
                     format!("{:010}", key_idx).into_bytes(),
                 );
                 let v = DatabaseEntry::from_bytes(&value);
-                let _ = db_clone.put(None, &k, &v);
+                let _ = db_clone.put(&k, &v);
                 ops += 1;
             }
 
@@ -159,7 +159,7 @@ pub fn run_concurrent_txn(
                         );
                         let v = DatabaseEntry::from_bytes(&value);
                         let txn = env.begin_transaction(None).unwrap();
-                        let _ = db.put(Some(&txn), &k, &v);
+                        let _ = db.put_in(&txn, &k, &v);
                         let _ = txn.commit();
                         ops += 1;
                     }

@@ -170,7 +170,7 @@ loop {
         let new_data = DatabaseEntry::from_bytes(&new_value);
 
         // Write back. No special flag needed because we already hold the write lock.
-        db.put(Some(&txn), &key, &new_data)?;
+        db.put_in(&txn, &key, &new_data)?;
         txn.commit()?;
         Ok(())
     })();

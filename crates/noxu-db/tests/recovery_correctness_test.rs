@@ -59,7 +59,7 @@ fn open_db(env: &noxu_db::Environment) -> noxu_db::Database {
 
 /// Collect all (key, value) pairs from `db` in sorted order.
 fn collect_all(db: &noxu_db::Database) -> BTreeMap<Vec<u8>, Vec<u8>> {
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut map = BTreeMap::new();
     let mut key = DatabaseEntry::new();
     let mut val = DatabaseEntry::new();
@@ -81,9 +81,8 @@ fn write_n_keys(db: &noxu_db::Database, start: u32, n: u32) {
         let k = format!("key_{i:06}");
         let v = format!("val_{i:06}");
         db.put(
-            None,
-            &DatabaseEntry::from_bytes(k.as_bytes()),
-            &DatabaseEntry::from_bytes(v.as_bytes()),
+            DatabaseEntry::from_bytes(k.as_bytes()),
+            DatabaseEntry::from_bytes(v.as_bytes()),
         )
         .unwrap();
     }
@@ -100,10 +99,10 @@ fn write_n_txn_committed(
     for i in start..(start + n) {
         let k = format!("txkey_{i:06}");
         let v = format!("txval_{i:06}");
-        db.put(
-            Some(&txn),
-            &DatabaseEntry::from_bytes(k.as_bytes()),
-            &DatabaseEntry::from_bytes(v.as_bytes()),
+        db.put_in(
+            &txn,
+            DatabaseEntry::from_bytes(k.as_bytes()),
+            DatabaseEntry::from_bytes(v.as_bytes()),
         )
         .unwrap();
     }
@@ -121,10 +120,10 @@ fn write_n_txn_aborted(
     for i in start..(start + n) {
         let k = format!("aborted_{i:06}");
         let v = format!("abval_{i:06}");
-        db.put(
-            Some(&txn),
-            &DatabaseEntry::from_bytes(k.as_bytes()),
-            &DatabaseEntry::from_bytes(v.as_bytes()),
+        db.put_in(
+            &txn,
+            DatabaseEntry::from_bytes(k.as_bytes()),
+            DatabaseEntry::from_bytes(v.as_bytes()),
         )
         .unwrap();
     }
@@ -213,9 +212,8 @@ fn equality_small_workload() {
                 let k = format!("key_{i:06}");
                 let v = format!("val_{i:06}");
                 db.put(
-                    None,
-                    &DatabaseEntry::from_bytes(k.as_bytes()),
-                    &DatabaseEntry::from_bytes(v.as_bytes()),
+                    DatabaseEntry::from_bytes(k.as_bytes()),
+                    DatabaseEntry::from_bytes(v.as_bytes()),
                 )
                 .unwrap();
                 expected.insert(k.into_bytes(), v.into_bytes());
@@ -242,9 +240,8 @@ fn equality_large_workload() {
                 let k = format!("key_{i:08}");
                 let v = format!("val_{i:08}");
                 db.put(
-                    None,
-                    &DatabaseEntry::from_bytes(k.as_bytes()),
-                    &DatabaseEntry::from_bytes(v.as_bytes()),
+                    DatabaseEntry::from_bytes(k.as_bytes()),
+                    DatabaseEntry::from_bytes(v.as_bytes()),
                 )
                 .unwrap();
                 expected.insert(k.into_bytes(), v.into_bytes());
@@ -279,9 +276,8 @@ fn equality_stable_bins() {
             let k = format!("stable_{i:06}");
             let v = format!("sval_{i:06}");
             db.put(
-                None,
-                &DatabaseEntry::from_bytes(k.as_bytes()),
-                &DatabaseEntry::from_bytes(v.as_bytes()),
+                DatabaseEntry::from_bytes(k.as_bytes()),
+                DatabaseEntry::from_bytes(v.as_bytes()),
             )
             .unwrap();
             expected.insert(k.into_bytes(), v.into_bytes());
@@ -297,9 +293,8 @@ fn equality_stable_bins() {
             let k = format!("post_{i:06}");
             let v = format!("pval_{i:06}");
             db.put(
-                None,
-                &DatabaseEntry::from_bytes(k.as_bytes()),
-                &DatabaseEntry::from_bytes(v.as_bytes()),
+                DatabaseEntry::from_bytes(k.as_bytes()),
+                DatabaseEntry::from_bytes(v.as_bytes()),
             )
             .unwrap();
             expected.insert(k.into_bytes(), v.into_bytes());
@@ -425,16 +420,15 @@ fn equality_deletes() {
             let k = format!("dk_{i:06}");
             let v = format!("dv_{i:06}");
             db.put(
-                None,
-                &DatabaseEntry::from_bytes(k.as_bytes()),
-                &DatabaseEntry::from_bytes(v.as_bytes()),
+                DatabaseEntry::from_bytes(k.as_bytes()),
+                DatabaseEntry::from_bytes(v.as_bytes()),
             )
             .unwrap();
         }
         // Delete even-indexed keys.
         for i in (0u32..100).step_by(2) {
             let k = format!("dk_{i:06}");
-            db.delete(None, &DatabaseEntry::from_bytes(k.as_bytes())).unwrap();
+            db.delete(DatabaseEntry::from_bytes(k.as_bytes())).unwrap();
         }
         // Odd-indexed keys survive.
         for i in (1u32..100).step_by(2) {
@@ -466,9 +460,8 @@ fn equality_bindelta_updates() {
             for i in 0u32..50 {
                 let k = format!("delta_{i:06}");
                 db.put(
-                    None,
-                    &DatabaseEntry::from_bytes(k.as_bytes()),
-                    &DatabaseEntry::from_bytes(format!("v0_{i}").as_bytes()),
+                    DatabaseEntry::from_bytes(k.as_bytes()),
+                    DatabaseEntry::from_bytes(format!("v0_{i}").as_bytes()),
                 )
                 .unwrap();
             }
@@ -479,9 +472,8 @@ fn equality_bindelta_updates() {
                     let k = format!("delta_{i:06}");
                     let v = format!("v{round}_{i}");
                     db.put(
-                        None,
-                        &DatabaseEntry::from_bytes(k.as_bytes()),
-                        &DatabaseEntry::from_bytes(v.as_bytes()),
+                        DatabaseEntry::from_bytes(k.as_bytes()),
+                        DatabaseEntry::from_bytes(v.as_bytes()),
                     )
                     .unwrap();
                 }
@@ -517,9 +509,8 @@ fn equality_eviction_workload() {
                 let k = format!("evk_{i:08}");
                 let v = format!("evv_{i:08}");
                 db.put(
-                    None,
-                    &DatabaseEntry::from_bytes(k.as_bytes()),
-                    &DatabaseEntry::from_bytes(v.as_bytes()),
+                    DatabaseEntry::from_bytes(k.as_bytes()),
+                    DatabaseEntry::from_bytes(v.as_bytes()),
                 )
                 .unwrap();
                 expected.insert(k.into_bytes(), v.into_bytes());
@@ -741,10 +732,10 @@ fn stage1_user_db_data_survives_checkpoint_and_recovery() {
             for i in 0u32..150 {
                 let k = format!("s1r_{i:06}").into_bytes();
                 let v = format!("s1v_{i:06}").into_bytes();
-                db.put(
-                    Some(&txn),
-                    &DatabaseEntry::from_bytes(&k),
-                    &DatabaseEntry::from_bytes(&v),
+                db.put_in(
+                    &txn,
+                    DatabaseEntry::from_bytes(&k),
+                    DatabaseEntry::from_bytes(&v),
                 )
                 .unwrap();
                 expected.insert(k, v);
@@ -761,10 +752,10 @@ fn stage1_user_db_data_survives_checkpoint_and_recovery() {
             for i in 150u32..300 {
                 let k = format!("s1r_{i:06}").into_bytes();
                 let v = format!("s1v_{i:06}").into_bytes();
-                db.put(
-                    Some(&txn),
-                    &DatabaseEntry::from_bytes(&k),
-                    &DatabaseEntry::from_bytes(&v),
+                db.put_in(
+                    &txn,
+                    DatabaseEntry::from_bytes(&k),
+                    DatabaseEntry::from_bytes(&v),
                 )
                 .unwrap();
                 expected.insert(k, v);
@@ -840,15 +831,13 @@ fn stage1_multiple_user_databases_survive_checkpoint_and_recovery() {
 
         for i in 0u32..100 {
             db_a.put(
-                None,
-                &DatabaseEntry::from_bytes(format!("ak_{i:04}").as_bytes()),
-                &DatabaseEntry::from_bytes(format!("av_{i:04}").as_bytes()),
+                DatabaseEntry::from_bytes(format!("ak_{i:04}").as_bytes()),
+                DatabaseEntry::from_bytes(format!("av_{i:04}").as_bytes()),
             )
             .unwrap();
             db_b.put(
-                None,
-                &DatabaseEntry::from_bytes(format!("bk_{i:04}").as_bytes()),
-                &DatabaseEntry::from_bytes(format!("bv_{i:04}").as_bytes()),
+                DatabaseEntry::from_bytes(format!("bk_{i:04}").as_bytes()),
+                DatabaseEntry::from_bytes(format!("bv_{i:04}").as_bytes()),
             )
             .unwrap();
         }
@@ -935,9 +924,8 @@ fn stage1_checkpoint_stats_show_user_db_bins_flushed() {
     // Write 100 committed keys — marks BINs dirty in the user tree.
     for i in 0u32..100 {
         db.put(
-            None,
-            &DatabaseEntry::from_bytes(format!("sk_{i:04}").as_bytes()),
-            &DatabaseEntry::from_bytes(format!("sv_{i:04}").as_bytes()),
+            DatabaseEntry::from_bytes(format!("sk_{i:04}").as_bytes()),
+            DatabaseEntry::from_bytes(format!("sv_{i:04}").as_bytes()),
         )
         .unwrap();
     }
@@ -1015,10 +1003,10 @@ fn stage2_txn_manager_records_first_active_lsn() {
         // Write one key in a transaction — this calls update_first_lsn.
         {
             let txn = env.begin_transaction(None).unwrap();
-            db.put(
-                Some(&txn),
-                &DatabaseEntry::from_bytes(b"stage2key"),
-                &DatabaseEntry::from_bytes(b"stage2val"),
+            db.put_in(
+                &txn,
+                DatabaseEntry::from_bytes(b"stage2key"),
+                DatabaseEntry::from_bytes(b"stage2val"),
             )
             .unwrap();
             txn.commit().unwrap();
@@ -1052,13 +1040,9 @@ fn stage2_txn_manager_records_first_active_lsn() {
 
     let mut val = noxu_db::DatabaseEntry::new();
     let status = db2
-        .get(None, &DatabaseEntry::from_bytes(b"stage2key"), &mut val)
+        .get_into(None, DatabaseEntry::from_bytes(b"stage2key"), &mut val)
         .unwrap();
-    assert_eq!(
-        status,
-        noxu_db::OperationStatus::Success,
-        "stage2: committed key must survive checkpoint+recovery"
-    );
+    assert!(status, "stage2: committed key must survive checkpoint+recovery");
     assert_eq!(
         val.get_data(),
         Some(b"stage2val" as &[u8]),
@@ -1154,10 +1138,10 @@ fn delta_test_compress_recovers_surviving_set() {
             for i in 0..num_recs {
                 let k = format!("ck_{i:05}");
                 let v = format!("cv_{i:05}");
-                db.put(
-                    Some(&txn),
-                    &DatabaseEntry::from_bytes(k.as_bytes()),
-                    &DatabaseEntry::from_bytes(v.as_bytes()),
+                db.put_in(
+                    &txn,
+                    DatabaseEntry::from_bytes(k.as_bytes()),
+                    DatabaseEntry::from_bytes(v.as_bytes()),
                 )
                 .unwrap();
                 expected.insert(k.into_bytes(), v.into_bytes());
@@ -1174,7 +1158,7 @@ fn delta_test_compress_recovers_surviving_set() {
             let txn = env.begin_transaction(None).unwrap();
             for i in (0..num_recs).step_by(2) {
                 let k = format!("ck_{i:05}");
-                db.delete(Some(&txn), &DatabaseEntry::from_bytes(k.as_bytes()))
+                db.delete_in(&txn, DatabaseEntry::from_bytes(k.as_bytes()))
                     .unwrap();
                 expected.remove(&format!("ck_{i:05}").into_bytes());
             }
@@ -1268,10 +1252,10 @@ fn delta_test_known_deleted_replays() {
         {
             let txn = env.begin_transaction(None).unwrap();
             for i in 0..num_recs {
-                db.put(
-                    Some(&txn),
-                    &DatabaseEntry::from_bytes(&key_of(i)),
-                    &DatabaseEntry::from_bytes(&val_of(i)),
+                db.put_in(
+                    &txn,
+                    DatabaseEntry::from_bytes(&key_of(i)),
+                    DatabaseEntry::from_bytes(&val_of(i)),
                 )
                 .unwrap();
                 expected.insert(key_of(i), val_of(i));
@@ -1290,10 +1274,10 @@ fn delta_test_known_deleted_replays() {
         {
             let txn = env.begin_transaction(None).unwrap();
             for i in (0..num_recs).step_by(40) {
-                db.put(
-                    Some(&txn),
-                    &DatabaseEntry::from_bytes(&new_key(i)),
-                    &DatabaseEntry::from_bytes(b"tombstone"),
+                db.put_in(
+                    &txn,
+                    DatabaseEntry::from_bytes(&new_key(i)),
+                    DatabaseEntry::from_bytes(b"tombstone"),
                 )
                 .unwrap();
             }
@@ -1306,10 +1290,10 @@ fn delta_test_known_deleted_replays() {
             let txn = env.begin_transaction(None).unwrap();
             for i in (0..num_recs).step_by(80) {
                 let nv = b"updated".to_vec();
-                db.put(
-                    Some(&txn),
-                    &DatabaseEntry::from_bytes(&key_of(i)),
-                    &DatabaseEntry::from_bytes(&nv),
+                db.put_in(
+                    &txn,
+                    DatabaseEntry::from_bytes(&key_of(i)),
+                    DatabaseEntry::from_bytes(&nv),
                 )
                 .unwrap();
                 expected.insert(key_of(i), nv);

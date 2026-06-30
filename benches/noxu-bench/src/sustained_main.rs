@@ -233,7 +233,7 @@ fn main() {
                 let key = DatabaseEntry::from_bytes(&key_id.to_be_bytes());
                 let mut val = DatabaseEntry::new();
                 let t0 = Instant::now();
-                match db.get(None, &key, &mut val) {
+                match db.get_into(None, &key, &mut val) {
                     Ok(_) => {
                         local_samples.push(t0.elapsed().as_nanos() as u64);
                         count.fetch_add(1, Ordering::Relaxed);
@@ -276,7 +276,7 @@ fn main() {
                 counter = counter.wrapping_add(1);
                 let _ = rng.r#gen::<u64>(); // mix in some entropy
                 let t0 = Instant::now();
-                match db.put(None, &key, &val) {
+                match db.put(&key, &val) {
                     Ok(_) => {
                         local_samples.push(t0.elapsed().as_nanos() as u64);
                         count.fetch_add(1, Ordering::Relaxed);

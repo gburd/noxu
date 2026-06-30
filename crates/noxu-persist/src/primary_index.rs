@@ -4,7 +4,9 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use noxu_db::{Database, DatabaseEntry, Mutex, OperationStatus, Transaction};
+use noxu_db::{
+    Cursor, Database, DatabaseEntry, Mutex, OperationStatus, Transaction,
+};
 
 use crate::entity::{Entity, PrimaryKey};
 use crate::entity_serializer::EntitySerializer;
@@ -118,24 +120,19 @@ where
         serializer: &S,
         key: &K,
     ) -> Result<Option<E>> {
-        let key_entry = DatabaseEntry::from_vec(key.to_bytes());
-        let mut data_entry = DatabaseEntry::new();
+        let key_bytes = key.to_bytes();
+        let db = self.db.lock();
+        let found = match txn {
+            Some(t) => db.get_in(t, &key_bytes)?,
+            None => db.get(&key_bytes)?,
+        };
 
-        let status = self.db.lock().get(txn, &key_entry, &mut data_entry)?;
-
-        match status {
-            OperationStatus::Success => {
-                let bytes = data_entry.get_data().ok_or_else(|| {
-                    PersistError::SerializationError(
-                        "empty data from database".to_string(),
-                    )
-                })?;
-                let entity = self.decode_record(bytes, serializer)?;
+        match found {
+            Some(bytes) => {
+                let entity = self.decode_record(&bytes, serializer)?;
                 Ok(Some(entity))
             }
-            OperationStatus::NotFound => Ok(None),
-            OperationStatus::KeyExists => Ok(None),
-            OperationStatus::KeyEmpty => Ok(None),
+            None => Ok(None),
         }
     }
 
@@ -206,15 +203,17 @@ where
         entity: &E,
     ) -> Result<()> {
         let key_bytes = entity.primary_key().to_bytes();
-        let key_entry = DatabaseEntry::from_vec(key_bytes);
         let payload = serializer.serialize(entity)?;
         let envelope_bytes =
             envelope::encode(E::class_version(), E::entity_name(), &payload)?;
-        let data_entry = DatabaseEntry::from_vec(envelope_bytes);
 
         // The Database::put fan-out drives every registered SecondaryDatabase
         // under the same `txn`, so secondaries are atomic with the primary.
-        self.db.lock().put(txn, &key_entry, &data_entry)?;
+        let db = self.db.lock();
+        match txn {
+            Some(t) => db.put_in(t, &key_bytes, &envelope_bytes)?,
+            None => db.put(&key_bytes, &envelope_bytes)?,
+        }
 
         Ok(())
     }
@@ -236,15 +235,18 @@ where
         entity: &E,
     ) -> Result<bool> {
         let key_bytes = entity.primary_key().to_bytes();
-        let key_entry = DatabaseEntry::from_vec(key_bytes);
         let payload = serializer.serialize(entity)?;
         let envelope_bytes =
             envelope::encode(E::class_version(), E::entity_name(), &payload)?;
-        let data_entry = DatabaseEntry::from_vec(envelope_bytes);
 
-        let status =
-            self.db.lock().put_no_overwrite(txn, &key_entry, &data_entry)?;
-        Ok(status == OperationStatus::Success)
+        let db = self.db.lock();
+        let inserted = match txn {
+            Some(t) => {
+                db.put_no_overwrite_in(t, &key_bytes, &envelope_bytes)?
+            }
+            None => db.put_no_overwrite(&key_bytes, &envelope_bytes)?,
+        };
+        Ok(inserted)
     }
 
     /// Deletes an entity by its primary key.
@@ -266,9 +268,13 @@ where
     /// # Errors
     /// Returns an error if the database operation fails.
     pub fn delete(&self, txn: Option<&Transaction>, key: &K) -> Result<bool> {
-        let key_entry = DatabaseEntry::from_vec(key.to_bytes());
-        let status = self.db.lock().delete(txn, &key_entry)?;
-        Ok(status == OperationStatus::Success)
+        let key_bytes = key.to_bytes();
+        let db = self.db.lock();
+        let deleted = match txn {
+            Some(t) => db.delete_in(t, &key_bytes)?,
+            None => db.delete(&key_bytes)?,
+        };
+        Ok(deleted)
     }
 
     /// Deletes an entity by its primary key.
@@ -306,10 +312,13 @@ where
     /// # Errors
     /// Returns an error if the database operation fails.
     pub fn contains(&self, txn: Option<&Transaction>, key: &K) -> Result<bool> {
-        let key_entry = DatabaseEntry::from_vec(key.to_bytes());
-        let mut data_entry = DatabaseEntry::new();
-        let status = self.db.lock().get(txn, &key_entry, &mut data_entry)?;
-        Ok(status == OperationStatus::Success)
+        let key_bytes = key.to_bytes();
+        let db = self.db.lock();
+        let found = match txn {
+            Some(t) => db.get_in(t, &key_bytes)?,
+            None => db.get(&key_bytes)?,
+        };
+        Ok(found.is_some())
     }
 
     /// Returns an approximate count of entities in the index.
@@ -335,10 +344,16 @@ where
     /// Returns an error if the cursor cannot be opened.
     pub fn entities<'a, S: EntitySerializer<E>>(
         &'a self,
-        txn: Option<&Transaction>,
+        txn: Option<&'a Transaction>,
         serializer: &'a S,
     ) -> Result<EntityIterator<'a, K, E, S>> {
-        let cursor = self.db.lock().open_cursor(txn, None)?;
+        let cursor = {
+            let db = self.db.lock();
+            match txn {
+                Some(t) => db.open_cursor_in(t, None)?,
+                None => db.open_cursor(None)?,
+            }
+        };
         Ok(EntityIterator {
             cursor,
             serializer,
@@ -356,11 +371,17 @@ where
     ///
     /// # Errors
     /// Returns an error if the cursor cannot be opened.
-    pub fn keys(
-        &self,
-        txn: Option<&Transaction>,
-    ) -> Result<KeyIterator<'_, K>> {
-        let cursor = self.db.lock().open_cursor(txn, None)?;
+    pub fn keys<'a>(
+        &'a self,
+        txn: Option<&'a Transaction>,
+    ) -> Result<KeyIterator<'a, K>> {
+        let cursor = {
+            let db = self.db.lock();
+            match txn {
+                Some(t) => db.open_cursor_in(t, None)?,
+                None => db.open_cursor(None)?,
+            }
+        };
         Ok(KeyIterator {
             cursor,
             started: false,
@@ -387,7 +408,7 @@ where
 ///
 ///
 pub struct EntityIterator<'a, K, E, S> {
-    cursor: noxu_db::Cursor,
+    cursor: Cursor<'a>,
     serializer: &'a S,
     /// Schema-evolution mutations cloned from the parent
     /// [`PrimaryIndex`].  Passed to
@@ -492,7 +513,7 @@ impl<K, E, S> Drop for EntityIterator<'_, K, E, S> {
 /// Iterator over primary keys using a database cursor.
 ///
 pub struct KeyIterator<'a, K> {
-    cursor: noxu_db::Cursor,
+    cursor: Cursor<'a>,
     started: bool,
     done: bool,
     _phantom: PhantomData<&'a K>,

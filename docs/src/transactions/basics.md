@@ -155,7 +155,6 @@ to include in that transaction.
 ```rust
 use noxu::{
     DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
-    OperationStatus,
 };
 use std::path::PathBuf;
 
@@ -183,7 +182,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let txn = env.begin_transaction(None)?;
 
     // Perform the write under the transaction.
-    match db.put(Some(&txn), &key, &data) {
+    match db.put_in(&txn, &key, &data) {
         Ok(_) => {
             txn.commit()?;
             println!("Write committed.");
@@ -265,7 +264,7 @@ loop {
     let result = (|| -> Result<(), NoxuError> {
         let key = DatabaseEntry::from_bytes(b"mykey");
         let data = DatabaseEntry::from_bytes(b"myvalue");
-        db.put(Some(&txn), &key, &data)?;
+        db.put_in(&txn, &key, &data)?;
         txn.commit()?;
         Ok(())
     })();
@@ -343,7 +342,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let key = DatabaseEntry::from_bytes(b"thekey");
     let data = DatabaseEntry::from_bytes(b"thedata");
 
-    match db.put(Some(&txn), &key, &data) {
+    match db.put_in(&txn, &key, &data) {
         Ok(_) => txn.commit()?,
         Err(e) => {
             txn.abort()?;
@@ -404,7 +403,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Passing None causes this write to be automatically wrapped in
     // its own transaction and committed.
-    db.put(None, &key, &data)?;
+    db.put(&key, &data)?;
 
     db.close()?;
     env.close()?;
@@ -413,7 +412,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 > **Note:** Cursors and auto-commit interoperate correctly. Opening a cursor
-> with `db.open_cursor(None, None)`
+> with `db.open_cursor(None)`
 > threads the cursor's writes through the lock manager exactly the
 > same way an explicit-txn cursor does, and auto-commit writes
 > against an unrelated key do not block on an explicit txn's locks.

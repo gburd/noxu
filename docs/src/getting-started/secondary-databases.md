@@ -144,22 +144,23 @@ let dept_key = DatabaseEntry::from_bytes(b"Engineering");
 let mut primary_key = DatabaseEntry::new();
 let mut data = DatabaseEntry::new();
 
-let status = secondary.get(None, &dept_key, &mut primary_key, &mut data)?;
-if status == OperationStatus::Success {
+let found =
+    secondary.get_into(None, &dept_key, &mut primary_key, &mut data)?;
+if found {
     let emp_name = std::str::from_utf8(primary_key.get_data().unwrap())?;
     let record = std::str::from_utf8(data.get_data().unwrap())?;
     println!("{}: {}", emp_name, record);
 }
 ```
 
-`SecondaryDatabase::get` returns the **first** primary indexed under the
+`SecondaryDatabase::get_into` returns the **first** primary indexed under the
 secondary key (the smallest primary key in cursor order). To enumerate
 every primary indexed under the same secondary key, use the cursor.
 
 ## Walking duplicates of a secondary key
 
 ```rust
-let mut cursor = secondary.open_cursor(None, None)?;
+let mut cursor = secondary.open_cursor(None)?;
 let mut sec_key = DatabaseEntry::new();
 let mut pk = DatabaseEntry::new();
 let mut data = DatabaseEntry::new();

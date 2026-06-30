@@ -88,7 +88,7 @@ All bindings implement the `EntryBinding<T>` trait with two methods:
 
 ```rust
 use noxu::bind::{EntryBinding, IntBinding};
-use noxu::{DatabaseEntry, OperationStatus};
+use noxu::DatabaseEntry;
 
 let binding = IntBinding::new();
 
@@ -96,14 +96,13 @@ let binding = IntBinding::new();
 let mut key_entry = DatabaseEntry::new();
 let value: i32 = 42;
 binding.object_to_entry(&value, &mut key_entry)?;
-db.put(None, &key_entry, &DatabaseEntry::from_bytes(b"forty-two"))?;
+db.put(&key_entry, b"forty-two")?;
 
 // Look up by integer key
 let mut search_key = DatabaseEntry::new();
 binding.object_to_entry(&42i32, &mut search_key)?;
-let mut data = DatabaseEntry::new();
-if db.get(None, &search_key, &mut data)? == OperationStatus::Success {
-    println!("{}", std::str::from_utf8(data.data())?);
+if let Some(value) = db.get(&search_key)? {
+    println!("{}", std::str::from_utf8(&value)?);
 }
 ```
 
@@ -119,7 +118,7 @@ let binding = StringBinding::new();
 
 let mut key_entry = DatabaseEntry::new();
 binding.object_to_entry(&"Alice".to_string(), &mut key_entry)?;
-db.put(None, &key_entry, &DatabaseEntry::from_bytes(b"alice's data"))?;
+db.put(&key_entry, b"alice's data")?;
 
 // Decode a string from an entry after retrieval
 let recovered: String = binding.entry_to_object(&key_entry)?;
@@ -138,7 +137,7 @@ for &temp in &temperatures {
     let mut key_entry = DatabaseEntry::new();
     binding.object_to_entry(&temp, &mut key_entry)?;
     let label = format!("{:.2}°C", temp);
-    db.put(None, &key_entry, &DatabaseEntry::from_bytes(label.as_bytes()))?;
+    db.put(&key_entry, label.as_bytes())?;
 }
 // When iterated, records appear in ascending numeric temperature order.
 ```
@@ -155,9 +154,9 @@ binding.object_to_entry(&i64::MAX, &mut key_entry)?;
 
 // ... store and retrieve ...
 
-let mut data_entry = DatabaseEntry::new();
-db.get(None, &key_entry, &mut data_entry)?;
-let recovered: i64 = binding.entry_to_object(&data_entry)?;
+let data = db.get(&key_entry)?.expect("record present");
+let recovered: i64 =
+    binding.entry_to_object(&DatabaseEntry::from_bytes(&data))?;
 ```
 
 ## Custom Encodings

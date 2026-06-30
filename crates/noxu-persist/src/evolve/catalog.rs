@@ -20,10 +20,7 @@
 //!
 //! [`Entity::class_version`]: crate::entity::Entity::class_version
 
-use noxu_db::{
-    Database, DatabaseConfig, DatabaseEntry, Environment, OperationStatus,
-    Transaction,
-};
+use noxu_db::{Database, DatabaseConfig, Environment, Transaction};
 
 use crate::error::{PersistError, Result};
 
@@ -132,18 +129,14 @@ impl ClassCatalog {
         let Some(db) = &self.db else {
             return Ok(None);
         };
-        let key = DatabaseEntry::from_vec(class_name.as_bytes().to_vec());
-        let mut data = DatabaseEntry::new();
-        match db.get(txn, &key, &mut data)? {
-            OperationStatus::Success => {
-                let bytes = data.get_data().ok_or_else(|| {
-                    PersistError::SerializationError(
-                        "catalog entry has empty data".to_string(),
-                    )
-                })?;
-                Ok(Some(CatalogEntry::decode(bytes)?))
-            }
-            _ => Ok(None),
+        let key = class_name.as_bytes();
+        let found = match txn {
+            Some(t) => db.get_in(t, key)?,
+            None => db.get(key)?,
+        };
+        match found {
+            Some(bytes) => Ok(Some(CatalogEntry::decode(&bytes)?)),
+            None => Ok(None),
         }
     }
 
@@ -166,9 +159,12 @@ impl ClassCatalog {
             format_version: CATALOG_FORMAT_VERSION,
             class_version,
         };
-        let key = DatabaseEntry::from_vec(class_name.as_bytes().to_vec());
-        let val = DatabaseEntry::from_vec(entry.encode().to_vec());
-        db.put(txn, &key, &val)?;
+        let key = class_name.as_bytes();
+        let val = entry.encode();
+        match txn {
+            Some(t) => db.put_in(t, key, val)?,
+            None => db.put(key, val)?,
+        }
         Ok(())
     }
 
@@ -184,11 +180,12 @@ impl ClassCatalog {
         let Some(db) = &self.db else {
             return Ok(false);
         };
-        let key = DatabaseEntry::from_vec(class_name.as_bytes().to_vec());
-        match db.delete(txn, &key)? {
-            OperationStatus::Success => Ok(true),
-            _ => Ok(false),
-        }
+        let key = class_name.as_bytes();
+        let deleted = match txn {
+            Some(t) => db.delete_in(t, key)?,
+            None => db.delete(key)?,
+        };
+        Ok(deleted)
     }
 
     /// Closes the catalog database.

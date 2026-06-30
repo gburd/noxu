@@ -62,7 +62,7 @@ fn open_db(env: &noxu_db::Environment) -> noxu_db::Database {
 }
 
 fn collect_all(db: &noxu_db::Database) -> BTreeMap<Vec<u8>, Vec<u8>> {
-    let mut cursor = db.open_cursor(None, None).unwrap();
+    let mut cursor = db.open_cursor(None).unwrap();
     let mut map = BTreeMap::new();
     let mut key = DatabaseEntry::new();
     let mut val = DatabaseEntry::new();
@@ -103,9 +103,8 @@ fn recover_and_collect(
 
 fn put(db: &noxu_db::Database, k: &str, v: &str) {
     db.put(
-        None,
-        &DatabaseEntry::from_bytes(k.as_bytes()),
-        &DatabaseEntry::from_bytes(v.as_bytes()),
+        DatabaseEntry::from_bytes(k.as_bytes()),
+        DatabaseEntry::from_bytes(v.as_bytes()),
     )
     .unwrap();
 }
@@ -300,7 +299,7 @@ fn reverse_split_recovers() {
         // Empty the leftmost BIN: delete the first two keys via a cursor
         // positioned at first (JE deletes getFirst twice).
         {
-            let mut c = db.open_cursor(None, None).unwrap();
+            let mut c = db.open_cursor(None).unwrap();
             let mut key = DatabaseEntry::new();
             let mut val = DatabaseEntry::new();
             for _ in 0..2 {
@@ -364,7 +363,7 @@ fn complete_removal_recovers() {
 
         // Delete it all.
         {
-            let mut c = db.open_cursor(None, None).unwrap();
+            let mut c = db.open_cursor(None).unwrap();
             let mut key = DatabaseEntry::new();
             let mut val = DatabaseEntry::new();
             let mut count = 0;

@@ -33,7 +33,7 @@ fn populate(db: &Database, n: usize) {
     for i in 0..n {
         let key = DatabaseEntry::from_vec(format!("{:010}", i).into_bytes());
         let val = DatabaseEntry::from_bytes(&value);
-        db.put(None, &key, &val).unwrap();
+        db.put(&key, &val).unwrap();
     }
 }
 
@@ -62,7 +62,7 @@ fn run_w10(
                 let k = DatabaseEntry::from_vec(
                     format!("{:010}", i % n).into_bytes(),
                 );
-                let _ = db2.get(None, &k, &mut data);
+                let _ = db2.get_into(None, &k, &mut data);
             }
             n as u64
         }));
@@ -81,7 +81,7 @@ fn run_w10(
                     format!("{:010}", wid * ops + i).into_bytes(),
                 );
                 let v = DatabaseEntry::from_bytes(&value);
-                db2.put(None, &k, &v).unwrap();
+                db2.put(&k, &v).unwrap();
             }
             *te.lock().unwrap() = Some(Instant::now());
             ops as u64

@@ -12,9 +12,91 @@
 use std::marker::PhantomData;
 
 use noxu_bind::EntryBinding;
-use noxu_db::{Database, DatabaseEntry, Get, OperationStatus, Transaction};
+use noxu_db::{
+    Cursor, CursorConfig, Database, DatabaseEntry, Get, OperationStatus,
+    Transaction,
+};
 
 use crate::error::{CollectionError, Result};
+
+/// Opens a cursor honouring the optional transaction (review P0-1/P0-2:
+/// `open_cursor` no longer takes `Option<&Transaction>`; auto-commit and
+/// transactional are now separate entry points).  The returned
+/// `Cursor<'a>` borrows the txn when present.
+pub(crate) fn open_cursor<'a>(
+    db: &Database,
+    txn: Option<&'a Transaction>,
+    config: Option<&CursorConfig>,
+) -> Result<Cursor<'a>> {
+    match txn {
+        Some(t) => Ok(db.open_cursor_in(t, config)?),
+        None => Ok(db.open_cursor(config)?),
+    }
+}
+
+/// Point read honouring the optional transaction (review P0-2/P0-3:
+/// `get` now returns `Result<Option<Bytes>>` off named entry points).
+/// Returns the value bytes, or `None` if the key is absent.
+pub(crate) fn db_get(
+    db: &Database,
+    txn: Option<&Transaction>,
+    key: &DatabaseEntry,
+) -> Result<Option<Vec<u8>>> {
+    let k = key.get_data().unwrap_or(&[]);
+    let found = match txn {
+        Some(t) => db.get_in(t, k)?,
+        None => db.get(k)?,
+    };
+    Ok(found.map(|b| b.to_vec()))
+}
+
+/// Point put honouring the optional transaction (review P0-2).
+pub(crate) fn db_put(
+    db: &Database,
+    txn: Option<&Transaction>,
+    key: &DatabaseEntry,
+    data: &DatabaseEntry,
+) -> Result<()> {
+    let k = key.get_data().unwrap_or(&[]);
+    let v = data.get_data().unwrap_or(&[]);
+    match txn {
+        Some(t) => db.put_in(t, k, v)?,
+        None => db.put(k, v)?,
+    }
+    Ok(())
+}
+
+/// No-overwrite put honouring the optional transaction (review P0-2/P0-3).
+/// Returns `true` if the key was newly inserted.
+pub(crate) fn db_put_no_overwrite(
+    db: &Database,
+    txn: Option<&Transaction>,
+    key: &DatabaseEntry,
+    data: &DatabaseEntry,
+) -> Result<bool> {
+    let k = key.get_data().unwrap_or(&[]);
+    let v = data.get_data().unwrap_or(&[]);
+    let inserted = match txn {
+        Some(t) => db.put_no_overwrite_in(t, k, v)?,
+        None => db.put_no_overwrite(k, v)?,
+    };
+    Ok(inserted)
+}
+
+/// Point delete honouring the optional transaction (review P0-2/P0-3).
+/// Returns `true` if a record was removed.
+pub(crate) fn db_delete(
+    db: &Database,
+    txn: Option<&Transaction>,
+    key: &DatabaseEntry,
+) -> Result<bool> {
+    let k = key.get_data().unwrap_or(&[]);
+    let deleted = match txn {
+        Some(t) => db.delete_in(t, k)?,
+        None => db.delete(k)?,
+    };
+    Ok(deleted)
+}
 
 /// Encodes a typed key into a fresh [`DatabaseEntry`].
 pub(crate) fn encode_key<K, KB: EntryBinding<K>>(
@@ -109,7 +191,7 @@ where
     F: FnMut(K, V) -> T,
 {
     let mut out: Vec<T> = Vec::new();
-    let mut cursor = db.open_cursor(txn, None)?;
+    let mut cursor = open_cursor(db, txn, None)?;
 
     // Position cursor on the first record we want.
     //
@@ -204,7 +286,7 @@ where
     KB: EntryBinding<K>,
     VB: EntryBinding<V>,
 {
-    let mut cursor = db.open_cursor(txn, None)?;
+    let mut cursor = open_cursor(db, txn, None)?;
     let mut key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
     let status = cursor.get(&mut key, &mut data, which, None)?;

@@ -716,7 +716,10 @@ fn stream_evolve_class(
     let txn_ref = txn.as_ref();
 
     let db_guard = db.lock();
-    let mut cursor = db_guard.open_cursor(txn_ref, None)?;
+    let mut cursor = match txn_ref {
+        Some(t) => db_guard.open_cursor_in(t, None)?,
+        None => db_guard.open_cursor(None)?,
+    };
 
     // Class-level deleter fires once we see any record that matches.
     let mut class_deleter_seen = false;
@@ -791,6 +794,7 @@ fn stream_evolve_class(
             && !listener.evolve_progress(entity_class, n_read, n_converted)
         {
             cursor.close()?;
+            drop(cursor);
             if let Some(t) = txn {
                 t.abort()?;
             }
@@ -804,6 +808,7 @@ fn stream_evolve_class(
     }
 
     cursor.close()?;
+    drop(cursor);
 
     // Update the catalog inside the same transaction so it commits or
     // aborts atomically with the data writes.

@@ -99,7 +99,7 @@ where
         value_binding: VB,
         txn: Option<&Transaction>,
     ) -> Result<Self> {
-        let mut cursor = db.open_cursor(txn, None)?;
+        let mut cursor = crate::internal::open_cursor(db, txn, None)?;
         let mut key = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
         let next = match cursor.get(&mut key, &mut data, Get::Last, None)? {
@@ -175,7 +175,7 @@ where
         let key_bytes = Self::index_to_key(index);
         let key_entry = DatabaseEntry::from_bytes(&key_bytes);
         let value_entry = encode_value(&self.value_binding, value)?;
-        self.db.put(txn, &key_entry, &value_entry)?;
+        crate::internal::db_put(self.db, txn, &key_entry, &value_entry)?;
         *next = index + 1;
         Ok(index)
     }
@@ -190,12 +190,12 @@ where
     ) -> Result<Option<V>> {
         let key_bytes = Self::index_to_key(index);
         let key_entry = DatabaseEntry::from_bytes(&key_bytes);
-        let mut data_entry = DatabaseEntry::new();
-        match self.db.get(txn, &key_entry, &mut data_entry)? {
-            OperationStatus::Success => {
+        match crate::internal::db_get(self.db, txn, &key_entry)? {
+            Some(bytes) => {
+                let data_entry = DatabaseEntry::from_bytes(&bytes);
                 Ok(Some(decode_value(&self.value_binding, &data_entry)?))
             }
-            _ => Ok(None),
+            None => Ok(None),
         }
     }
 
@@ -214,15 +214,15 @@ where
         let key_entry = DatabaseEntry::from_bytes(&key_bytes);
 
         // Read the old value so we can return it.
-        let mut data_entry = DatabaseEntry::new();
-        let val = match self.db.get(txn, &key_entry, &mut data_entry)? {
-            OperationStatus::Success => {
+        let val = match crate::internal::db_get(self.db, txn, &key_entry)? {
+            Some(bytes) => {
+                let data_entry = DatabaseEntry::from_bytes(&bytes);
                 Some(decode_value(&self.value_binding, &data_entry)?)
             }
-            _ => None,
+            None => None,
         };
         if val.is_some() {
-            self.db.delete(txn, &key_entry)?;
+            crate::internal::db_delete(self.db, txn, &key_entry)?;
             *next = index;
         }
         Ok(val)
@@ -259,12 +259,13 @@ where
         // Snapshot the removed value so we can return it.
         let target_key_bytes = Self::index_to_key(index);
         let target_key = DatabaseEntry::from_bytes(&target_key_bytes);
-        let mut target_data = DatabaseEntry::new();
-        let removed = match self.db.get(txn, &target_key, &mut target_data)? {
-            OperationStatus::Success => {
+        let removed = match crate::internal::db_get(self.db, txn, &target_key)?
+        {
+            Some(bytes) => {
+                let target_data = DatabaseEntry::from_bytes(&bytes);
                 Some(decode_value(&self.value_binding, &target_data)?)
             }
-            _ => None,
+            None => None,
         };
 
         // Shift every subsequent record down by one slot.  We read
@@ -278,20 +279,20 @@ where
             let src_key = DatabaseEntry::from_bytes(&src_key_bytes);
             let dst_key = DatabaseEntry::from_bytes(&dst_key_bytes);
 
-            let mut src_data = DatabaseEntry::new();
-            match self.db.get(txn, &src_key, &mut src_data)? {
-                OperationStatus::Success => {
-                    let payload = src_data.get_data().unwrap_or(&[]).to_vec();
-                    let dst_value = DatabaseEntry::from_vec(payload);
-                    self.db.put(txn, &dst_key, &dst_value)?;
-                    self.db.delete(txn, &src_key)?;
+            match crate::internal::db_get(self.db, txn, &src_key)? {
+                Some(bytes) => {
+                    let dst_value = DatabaseEntry::from_vec(bytes);
+                    crate::internal::db_put(
+                        self.db, txn, &dst_key, &dst_value,
+                    )?;
+                    crate::internal::db_delete(self.db, txn, &src_key)?;
                 }
-                _ => {
+                None => {
                     // Source slot is empty — remove the destination
                     // slot too so the list stays dense.  This handles
                     // the case where a concurrent writer or a
                     // previous crashed remove left a hole.
-                    self.db.delete(txn, &dst_key)?;
+                    crate::internal::db_delete(self.db, txn, &dst_key)?;
                 }
             }
         }
@@ -300,7 +301,7 @@ where
         // we never entered the loop (index == high - 1), delete the
         // target slot itself.
         if index == high.saturating_sub(1) && removed.is_some() {
-            self.db.delete(txn, &target_key)?;
+            crate::internal::db_delete(self.db, txn, &target_key)?;
         }
 
         // Decrement next_index by 1 if anything was actually removed.
@@ -349,7 +350,7 @@ where
         if self.read_only {
             return Err(CollectionError::ReadOnly);
         }
-        let mut cursor = self.db.open_cursor(txn, None)?;
+        let mut cursor = crate::internal::open_cursor(self.db, txn, None)?;
         let mut key = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
         while let OperationStatus::Success =
@@ -612,7 +613,7 @@ mod tests {
         // Write a non-8-byte key directly.
         let key = DatabaseEntry::from_bytes(b"not-an-index");
         let val = DatabaseEntry::from_bytes(b"v");
-        db.put(None, &key, &val).unwrap();
+        db.put(key.data(), val.data()).unwrap();
 
         let err = StoredList::<String, _>::open(&db, StringBinding)
             .err()

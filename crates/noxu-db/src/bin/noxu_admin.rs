@@ -422,13 +422,13 @@ fn load_dump(
 
         if no_overwrite {
             let status = db
-                .put_no_overwrite(Some(&txn), &key, &data)
+                .put_no_overwrite_in(&txn, &key, &data)
                 .map_err(|e| format!("put failed: {e}"))?;
-            if status == noxu_db::OperationStatus::KeyExists {
+            if !status {
                 eprintln!("noxu-admin: key exists (skipped): {key_trim}");
             }
         } else {
-            db.put(Some(&txn), &key, &data)
+            db.put_in(&txn, &key, &data)
                 .map_err(|e| format!("put failed: {e}"))?;
         }
         count += 1;

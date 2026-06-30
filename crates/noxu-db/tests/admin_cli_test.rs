@@ -16,10 +16,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::Command;
 
-use noxu_db::{
-    DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
-    OperationStatus,
-};
+use noxu_db::{DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig};
 
 fn admin_bin() -> &'static str {
     env!("CARGO_BIN_EXE_noxu-admin")
@@ -67,25 +64,25 @@ fn populate(dir: &Path, db_name: &str, dup_sort: bool) {
 
     let txn = env.begin_transaction(None).expect("begin");
     for (k, v) in sample_records() {
-        db.put(
-            Some(&txn),
-            &DatabaseEntry::from_bytes(&k),
-            &DatabaseEntry::from_bytes(&v),
+        db.put_in(
+            &txn,
+            DatabaseEntry::from_bytes(&k),
+            DatabaseEntry::from_bytes(&v),
         )
         .expect("put");
     }
     if dup_sort {
         // Add duplicate data for an existing key.
-        db.put(
-            Some(&txn),
-            &DatabaseEntry::from_bytes(b"alpha"),
-            &DatabaseEntry::from_bytes(b"first-dup"),
+        db.put_in(
+            &txn,
+            DatabaseEntry::from_bytes(b"alpha"),
+            DatabaseEntry::from_bytes(b"first-dup"),
         )
         .expect("put dup");
-        db.put(
-            Some(&txn),
-            &DatabaseEntry::from_bytes(b"alpha"),
-            &DatabaseEntry::from_bytes(b"first-dup-2"),
+        db.put_in(
+            &txn,
+            DatabaseEntry::from_bytes(b"alpha"),
+            DatabaseEntry::from_bytes(b"first-dup-2"),
         )
         .expect("put dup 2");
     }
@@ -412,10 +409,10 @@ fn load_no_overwrite_keeps_existing() {
             )
             .unwrap();
         let txn = env.begin_transaction(None).unwrap();
-        db.put(
-            Some(&txn),
-            &DatabaseEntry::from_bytes(b"alpha"),
-            &DatabaseEntry::from_bytes(b"PRESERVE"),
+        db.put_in(
+            &txn,
+            DatabaseEntry::from_bytes(b"alpha"),
+            DatabaseEntry::from_bytes(b"PRESERVE"),
         )
         .unwrap();
         txn.commit().unwrap();
@@ -457,8 +454,8 @@ fn load_no_overwrite_keeps_existing() {
         .unwrap();
     let key = DatabaseEntry::from_bytes(b"alpha");
     let mut val = DatabaseEntry::new();
-    let status = db.get(None, &key, &mut val).unwrap();
-    assert_eq!(status, OperationStatus::Success);
+    let status = db.get_into(None, &key, &mut val).unwrap();
+    assert!(status);
     assert_eq!(val.get_data(), Some(b"PRESERVE".as_ref()));
     drop(db);
     env.close().unwrap();

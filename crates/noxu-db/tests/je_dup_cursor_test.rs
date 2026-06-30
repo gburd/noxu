@@ -70,10 +70,10 @@ fn dup_cursor_creation_forward_walks_in_sorted_order() {
     let txn = env.begin_transaction(None).unwrap();
     for (k, dups) in &data {
         for d in dups {
-            db.put(
-                Some(&txn),
-                &DatabaseEntry::from_bytes(k),
-                &DatabaseEntry::from_bytes(d),
+            db.put_in(
+                &txn,
+                DatabaseEntry::from_bytes(k),
+                DatabaseEntry::from_bytes(d),
             )
             .unwrap();
         }
@@ -81,7 +81,7 @@ fn dup_cursor_creation_forward_walks_in_sorted_order() {
     txn.commit().unwrap();
 
     let txn = env.begin_transaction(None).unwrap();
-    let mut c = db.open_cursor(Some(&txn), None).unwrap();
+    let mut c = db.open_cursor_in(&txn, None).unwrap();
     let mut prev: Option<(Vec<u8>, Vec<u8>)> = None;
     let mut count = 0usize;
     let mut k = DatabaseEntry::new();
@@ -122,10 +122,10 @@ fn dup_cursor_creation_backwards_walks_in_reverse_order() {
     let txn = env.begin_transaction(None).unwrap();
     for (k, dups) in &data {
         for d in dups {
-            db.put(
-                Some(&txn),
-                &DatabaseEntry::from_bytes(k),
-                &DatabaseEntry::from_bytes(d),
+            db.put_in(
+                &txn,
+                DatabaseEntry::from_bytes(k),
+                DatabaseEntry::from_bytes(d),
             )
             .unwrap();
         }
@@ -133,7 +133,7 @@ fn dup_cursor_creation_backwards_walks_in_reverse_order() {
     txn.commit().unwrap();
 
     let txn = env.begin_transaction(None).unwrap();
-    let mut c = db.open_cursor(Some(&txn), None).unwrap();
+    let mut c = db.open_cursor_in(&txn, None).unwrap();
     let mut prev: Option<(Vec<u8>, Vec<u8>)> = None;
     let mut count = 0usize;
     let mut k = DatabaseEntry::new();
@@ -172,11 +172,11 @@ fn dup_cursor_delete_one_dup_leaves_the_other() {
 
     let txn = env.begin_transaction(None).unwrap();
     let key = DatabaseEntry::from_bytes(b"k1");
-    db.put(Some(&txn), &key, &DatabaseEntry::from_bytes(b"d1")).unwrap();
-    db.put(Some(&txn), &key, &DatabaseEntry::from_bytes(b"d2")).unwrap();
+    db.put_in(&txn, &key, DatabaseEntry::from_bytes(b"d1")).unwrap();
+    db.put_in(&txn, &key, DatabaseEntry::from_bytes(b"d2")).unwrap();
 
     // Position on the first dup and delete it.
-    let mut c = db.open_cursor(Some(&txn), None).unwrap();
+    let mut c = db.open_cursor_in(&txn, None).unwrap();
     let mut k = DatabaseEntry::new();
     let mut d = DatabaseEntry::new();
     let s = c.get(&mut k, &mut d, Get::First, None).unwrap();
@@ -213,19 +213,19 @@ fn dup_cursor_delete_all_dups_leaves_empty() {
     let txn = env.begin_transaction(None).unwrap();
     let key = DatabaseEntry::from_bytes(b"k");
     for i in 0u8..20 {
-        db.put(Some(&txn), &key, &DatabaseEntry::from_bytes(&[i])).unwrap();
+        db.put_in(&txn, &key, DatabaseEntry::from_bytes(&[i])).unwrap();
     }
     txn.commit().unwrap();
     assert_eq!(db.count().unwrap(), 20);
 
     let txn = env.begin_transaction(None).unwrap();
-    let s = db.delete(Some(&txn), &key).unwrap();
-    assert_eq!(s, OperationStatus::Success);
+    let s = db.delete_in(&txn, &key).unwrap();
+    assert!(s);
     txn.commit().unwrap();
     assert_eq!(db.count().unwrap(), 0);
     let mut out = DatabaseEntry::new();
-    let s = db.get(None, &key, &mut out).unwrap();
-    assert_eq!(s, OperationStatus::NotFound);
+    let s = db.get_into(None, &key, &mut out).unwrap();
+    assert!(!s);
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -243,11 +243,11 @@ fn dup_cursor_delete_first_dup_via_positioned_cursor() {
     let txn = env.begin_transaction(None).unwrap();
     let key = DatabaseEntry::from_bytes(b"k");
     for i in 0u8..5 {
-        db.put(Some(&txn), &key, &DatabaseEntry::from_bytes(&[i])).unwrap();
+        db.put_in(&txn, &key, DatabaseEntry::from_bytes(&[i])).unwrap();
     }
 
     // Position via SearchKey + delete (deletes only the first dup).
-    let mut c = db.open_cursor(Some(&txn), None).unwrap();
+    let mut c = db.open_cursor_in(&txn, None).unwrap();
     let mut k = DatabaseEntry::from_bytes(b"k");
     let mut d = DatabaseEntry::new();
     let s = c.get(&mut k, &mut d, Get::Search, None).unwrap();
@@ -294,13 +294,7 @@ fn dup_cursor_put_no_dup_data_inserts_unique_pairs() {
         b"eight",
         b"nine",
     ] {
-        let s =
-            db.put(Some(&txn), &key, &DatabaseEntry::from_bytes(d)).unwrap();
-        assert_eq!(
-            s,
-            OperationStatus::Success,
-            "data {d:?} must insert as new dup"
-        );
+        db.put_in(&txn, &key, DatabaseEntry::from_bytes(d)).unwrap();
     }
     txn.commit().unwrap();
     assert_eq!(db.count().unwrap(), 9);
@@ -321,17 +315,15 @@ fn dup_cursor_abort_after_dup_creation_keeps_committed_only() {
 
     let txn1 = env.begin_transaction(None).unwrap();
     let key = DatabaseEntry::from_bytes(b"oneKey");
-    db.put(Some(&txn1), &key, &DatabaseEntry::from_bytes(b"firstData"))
-        .unwrap();
+    db.put_in(&txn1, &key, DatabaseEntry::from_bytes(b"firstData")).unwrap();
     txn1.commit().unwrap();
 
     let txn2 = env.begin_transaction(None).unwrap();
-    db.put(Some(&txn2), &key, &DatabaseEntry::from_bytes(b"secondData"))
-        .unwrap();
+    db.put_in(&txn2, &key, DatabaseEntry::from_bytes(b"secondData")).unwrap();
     txn2.abort().unwrap();
 
     let txn3 = env.begin_transaction(None).unwrap();
-    let mut c = db.open_cursor(Some(&txn3), None).unwrap();
+    let mut c = db.open_cursor_in(&txn3, None).unwrap();
     let mut k = DatabaseEntry::new();
     let mut d = DatabaseEntry::new();
     let s = c.get(&mut k, &mut d, Get::First, None).unwrap();
@@ -367,17 +359,17 @@ fn cursor_delete_first_via_walk_keeps_rest() {
 
     let txn = env.begin_transaction(None).unwrap();
     for i in 0..N {
-        db.put(
-            Some(&txn),
-            &DatabaseEntry::from_bytes(&i.to_be_bytes()),
-            &DatabaseEntry::from_bytes(b"v"),
+        db.put_in(
+            &txn,
+            DatabaseEntry::from_bytes(&i.to_be_bytes()),
+            DatabaseEntry::from_bytes(b"v"),
         )
         .unwrap();
     }
     txn.commit().unwrap();
 
     let txn = env.begin_transaction(None).unwrap();
-    let mut c = db.open_cursor(Some(&txn), None).unwrap();
+    let mut c = db.open_cursor_in(&txn, None).unwrap();
     let mut k = DatabaseEntry::new();
     let mut d = DatabaseEntry::new();
     let s = c.get(&mut k, &mut d, Get::First, None).unwrap();
@@ -388,7 +380,7 @@ fn cursor_delete_first_via_walk_keeps_rest() {
 
     assert_eq!(db.count().unwrap() as u32, N - 1);
     let txn = env.begin_transaction(None).unwrap();
-    let mut c = db.open_cursor(Some(&txn), None).unwrap();
+    let mut c = db.open_cursor_in(&txn, None).unwrap();
     let mut k = DatabaseEntry::new();
     let mut d = DatabaseEntry::new();
     for i in 1..N {
@@ -424,17 +416,17 @@ fn cursor_delete_last_via_walk_keeps_rest() {
 
     let txn = env.begin_transaction(None).unwrap();
     for i in 0..N {
-        db.put(
-            Some(&txn),
-            &DatabaseEntry::from_bytes(&i.to_be_bytes()),
-            &DatabaseEntry::from_bytes(b"v"),
+        db.put_in(
+            &txn,
+            DatabaseEntry::from_bytes(&i.to_be_bytes()),
+            DatabaseEntry::from_bytes(b"v"),
         )
         .unwrap();
     }
     txn.commit().unwrap();
 
     let txn = env.begin_transaction(None).unwrap();
-    let mut c = db.open_cursor(Some(&txn), None).unwrap();
+    let mut c = db.open_cursor_in(&txn, None).unwrap();
     let mut k = DatabaseEntry::new();
     let mut d = DatabaseEntry::new();
     let s = c.get(&mut k, &mut d, Get::Last, None).unwrap();
@@ -445,7 +437,7 @@ fn cursor_delete_last_via_walk_keeps_rest() {
 
     assert_eq!(db.count().unwrap() as u32, N - 1);
     let txn = env.begin_transaction(None).unwrap();
-    let mut c = db.open_cursor(Some(&txn), None).unwrap();
+    let mut c = db.open_cursor_in(&txn, None).unwrap();
     let mut k = DatabaseEntry::new();
     let mut d = DatabaseEntry::new();
     let s = c.get(&mut k, &mut d, Get::Last, None).unwrap();

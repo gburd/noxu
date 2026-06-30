@@ -225,6 +225,15 @@ impl From<&str> for DatabaseEntry {
     }
 }
 
+/// Lets a `DatabaseEntry` be passed directly to the byte-oriented
+/// `Database`/`Cursor` API (review P1-3: `impl AsRef<[u8]>` is the common
+/// key/value type; `DatabaseEntry` interoperates with it).
+impl AsRef<[u8]> for DatabaseEntry {
+    fn as_ref(&self) -> &[u8] {
+        self.data()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

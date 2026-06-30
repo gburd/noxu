@@ -160,10 +160,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     //    needs the `EntityStore` (for the env + a DB name) and the serializer.
     //    Without the derive macro the user would call
     //    `store.open_secondary_index(&mut primary, "by_email", ser, |p| ...)`.
-    let by_email =
-        Person::open_by_email_index(&mut store, &mut primary, std::sync::Arc::clone(&ser))?;
-    let by_dept =
-        Person::open_by_dept_index(&mut store, &mut primary, std::sync::Arc::clone(&ser))?;
+    let by_email = Person::open_by_email_index(
+        &mut store,
+        &mut primary,
+        std::sync::Arc::clone(&ser),
+    )?;
+    let by_dept = Person::open_by_dept_index(
+        &mut store,
+        &mut primary,
+        std::sync::Arc::clone(&ser),
+    )?;
 
     println!("\nDeclared secondary indexes: {:?}", Person::SECONDARY_INDEXES);
 
@@ -245,8 +251,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nUpdated Bob's email; old key no longer in by_email index.");
 
     // 8. Delete via secondary index — cascades to the primary record.
-    let removed =
-        by_email.delete(None, ser.as_ref(), &primary, &"alice@example.com".into())?;
+    let removed = by_email.delete(
+        None,
+        ser.as_ref(),
+        &primary,
+        &"alice@example.com".into(),
+    )?;
     println!(
         "\nDelete by email=alice@example.com → removed = {removed}; \
          primary count = {}",
@@ -255,8 +265,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 9. Final scan in primary-key order.
     println!("\nFinal primary scan:");
-    let all: Vec<Person> =
-        primary.entities(None, ser.as_ref())?.collect::<noxu::persist::Result<_>>()?;
+    let all: Vec<Person> = primary
+        .entities(None, ser.as_ref())?
+        .collect::<noxu::persist::Result<_>>()?;
     for p in &all {
         println!(
             "  id={} {} {} <{}> dept={:?}",

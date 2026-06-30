@@ -3,9 +3,7 @@
 //! JE LockerFactory.getWritableLocker/getReadableLocker throw
 //! IllegalArgumentException on every op.
 
-use noxu_db::{
-    DatabaseConfig, DatabaseEntry, EnvironmentConfig, OperationStatus,
-};
+use noxu_db::{DatabaseConfig, DatabaseEntry, EnvironmentConfig};
 
 #[test]
 fn txn6_get_put_delete_reject_txn_on_non_txnal_db() {
@@ -28,20 +26,20 @@ fn txn6_get_put_delete_reject_txn_on_non_txnal_db() {
     // get/put/delete with Some(txn) must all be rejected (IllegalArgument),
     // matching JE's per-operation guard (not just cursor-open).
     assert!(
-        db.get(Some(&txn), &key, &mut out).is_err(),
+        db.get_into(Some(&txn), &key, &mut out).is_err(),
         "TXN-6: db.get(Some(txn)) on a non-txnal DB must be rejected"
     );
     assert!(
-        db.put(Some(&txn), &key, &val).is_err(),
+        db.put_in(&txn, &key, &val).is_err(),
         "TXN-6: db.put(Some(txn)) on a non-txnal DB must be rejected"
     );
     assert!(
-        db.delete(Some(&txn), &key).is_err(),
+        db.delete_in(&txn, &key).is_err(),
         "TXN-6: db.delete(Some(txn)) on a non-txnal DB must be rejected"
     );
 
     // None (auto-commit) must still work on the non-txnal DB.
-    assert!(db.put(None, &key, &val).is_ok());
-    assert_eq!(db.get(None, &key, &mut out).unwrap(), OperationStatus::Success);
+    assert!(db.put(&key, &val).is_ok());
+    assert!(db.get_into(None, &key, &mut out).unwrap());
     let _ = txn.abort();
 }

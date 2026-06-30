@@ -55,15 +55,12 @@ impl CaskStore {
     /// Get a value by key.
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>, StoreError> {
         self.stats.gets.fetch_add(1, Ordering::Relaxed);
-        let k = DatabaseEntry::from_bytes(key);
-        let mut data = DatabaseEntry::new();
-        match self.db.get(None, &k, &mut data)? {
-            OperationStatus::Success => {
+        match self.db.get(key)? {
+            Some(val) => {
                 self.stats.hits.fetch_add(1, Ordering::Relaxed);
-                let val = data.get_data().unwrap_or(&[]);
-                Ok(Some(Bytes::copy_from_slice(val)))
+                Ok(Some(val))
             }
-            _ => {
+            None => {
                 self.stats.misses.fetch_add(1, Ordering::Relaxed);
                 Ok(None)
             }
@@ -73,30 +70,19 @@ impl CaskStore {
     /// Set a key to a value.
     pub fn set(&self, key: &[u8], value: &[u8]) -> Result<(), StoreError> {
         self.stats.sets.fetch_add(1, Ordering::Relaxed);
-        let k = DatabaseEntry::from_bytes(key);
-        let v = DatabaseEntry::from_bytes(value);
-        self.db.put(None, &k, &v)?;
+        self.db.put(key, value)?;
         Ok(())
     }
 
     /// Delete a key. Returns true if the key existed.
     pub fn del(&self, key: &[u8]) -> Result<bool, StoreError> {
         self.stats.deletes.fetch_add(1, Ordering::Relaxed);
-        let k = DatabaseEntry::from_bytes(key);
-        match self.db.delete(None, &k)? {
-            OperationStatus::Success => Ok(true),
-            _ => Ok(false),
-        }
+        Ok(self.db.delete(key)?)
     }
 
     /// Check if a key exists.
     pub fn exists(&self, key: &[u8]) -> Result<bool, StoreError> {
-        let k = DatabaseEntry::from_bytes(key);
-        let mut data = DatabaseEntry::new();
-        match self.db.get(None, &k, &mut data)? {
-            OperationStatus::Success => Ok(true),
-            _ => Ok(false),
-        }
+        Ok(self.db.get(key)?.is_some())
     }
 
     /// Return all keys matching a glob pattern.
@@ -105,7 +91,7 @@ impl CaskStore {
     /// fall back to a byte-level glob match.
     pub fn keys(&self, pattern: &[u8]) -> Result<Vec<Bytes>, StoreError> {
         let mut results = Vec::new();
-        let mut cursor = self.db.open_cursor(None, None)?;
+        let mut cursor = self.db.open_cursor(None)?;
         let mut key_out = DatabaseEntry::new();
         let mut val_out = DatabaseEntry::new();
 
@@ -219,9 +205,7 @@ impl CaskStore {
         key: &[u8],
         value: &[u8],
     ) -> Result<(), StoreError> {
-        let k = DatabaseEntry::from_bytes(key);
-        let v = DatabaseEntry::from_bytes(value);
-        self.db.put(Some(txn), &k, &v)?;
+        self.db.put_in(txn, key, value)?;
         Ok(())
     }
 
@@ -231,11 +215,7 @@ impl CaskStore {
         txn: &Transaction,
         key: &[u8],
     ) -> Result<bool, StoreError> {
-        let k = DatabaseEntry::from_bytes(key);
-        match self.db.delete(Some(txn), &k)? {
-            OperationStatus::Success => Ok(true),
-            _ => Ok(false),
-        }
+        Ok(self.db.delete_in(txn, key)?)
     }
 
     /// Produce a Redis-like INFO string.

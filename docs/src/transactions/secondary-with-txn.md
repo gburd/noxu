@@ -66,13 +66,13 @@ let new_value = DatabaseEntry::from_bytes(b"Engineering|Senior Engineer");
 
 // Read the previous primary record so we know the old secondary key.
 // (Reads can be auto-commit or under the same txn; either works.)
-let old_value = primary.lock().get(None, &key)?;
+let old_value = primary.lock().get(&key)?;
 
 let txn = env.begin_transaction(None)?;
 
 // Primary put under txn — auto-maintenance walks every registered
 // secondary under the same `txn`.
-primary.lock().put(Some(&txn), &key, &new_value)?;
+primary.lock().put_in(&txn, &key, &new_value)?;
 
 txn.commit()?;
 ```
@@ -125,7 +125,7 @@ cascade or the nullification atomically.
 
 ```rust
 let txn = env.begin_transaction(None, None)?;
-match foreign.lock().delete(Some(&txn), &fk) {
+match foreign.lock().delete_in(&txn, &fk) {
     Ok(_) => txn.commit()?,
     Err(NoxuError::ForeignConstraintViolation(_)) => {
         // Abort action surfaced — roll back so we are back to the

@@ -41,13 +41,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let data_entry =
                 DatabaseEntry::from_bytes(format!("int:{}", val).as_bytes());
-            db.put(None, &key_entry, &data_entry)?;
+            db.put(&key_entry, &data_entry)?;
         }
 
         // Iterate  -  keys should come out in sorted order because IntBinding
         // produces sortable byte encodings.
         println!("  Records in sorted key order:");
-        let mut cursor = db.open_cursor(None, None)?;
+        let mut cursor = db.open_cursor(None)?;
         let mut key = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
 
@@ -65,8 +65,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         binding.object_to_entry(&search_val, &mut search_key)?;
 
         let mut result_data = DatabaseEntry::new();
-        let status = db.get(None, &search_key, &mut result_data)?;
-        if status == OperationStatus::Success {
+        if db.get_into(None, &search_key, &mut result_data)? {
             let v = std::str::from_utf8(result_data.data()).unwrap_or("?");
             println!("  Lookup key=42: {}", v);
         }
@@ -89,12 +88,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let data_entry =
                 DatabaseEntry::from_bytes(format!("id:{}", i).as_bytes());
-            db.put(None, &key_entry, &data_entry)?;
+            db.put(&key_entry, &data_entry)?;
         }
 
         // Iterate in sorted order
         println!("  Records in sorted key order:");
-        let mut cursor = db.open_cursor(None, None)?;
+        let mut cursor = db.open_cursor(None)?;
         let mut key = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
 
@@ -112,8 +111,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         binding.object_to_entry(&search_name, &mut search_key)?;
 
         let mut result_data = DatabaseEntry::new();
-        let status = db.get(None, &search_key, &mut result_data)?;
-        if status == OperationStatus::Success {
+        if db.get_into(None, &search_key, &mut result_data)? {
             let v = std::str::from_utf8(result_data.data()).unwrap_or("?");
             println!("  Lookup key='Bob': {}", v);
         }
@@ -136,12 +134,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let data_entry =
                 DatabaseEntry::from_bytes(format!("{:.2}F", temp).as_bytes());
-            db.put(None, &key_entry, &data_entry)?;
+            db.put(&key_entry, &data_entry)?;
         }
 
         // Iterate in sorted order
         println!("  Temperatures in sorted order:");
-        let mut cursor = db.open_cursor(None, None)?;
+        let mut cursor = db.open_cursor(None)?;
         let mut key = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
 
@@ -172,12 +170,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut data_entry = DatabaseEntry::new();
             binding.object_to_entry(&val, &mut data_entry)?;
 
-            db.put(None, &key_entry, &data_entry)?;
+            db.put(&key_entry, &data_entry)?;
         }
 
         // Read back and deserialize
         println!("  Round-trip verification:");
-        let mut cursor = db.open_cursor(None, None)?;
+        let mut cursor = db.open_cursor(None)?;
         let mut key = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
 

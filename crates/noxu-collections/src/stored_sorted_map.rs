@@ -229,7 +229,8 @@ where
         let key_entry = encode_key(self.inner.key_binding(), key)?;
         let bound = key_entry.get_data().unwrap_or(&[]).to_vec();
 
-        let mut cursor = self.inner.database().open_cursor(txn, None)?;
+        let mut cursor =
+            crate::internal::open_cursor(self.inner.database(), txn, None)?;
         let mut k_buf = noxu_db::DatabaseEntry::new();
         let mut d_buf = noxu_db::DatabaseEntry::new();
         let mut status =

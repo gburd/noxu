@@ -26,7 +26,6 @@
 
 use noxu_db::{
     Database, DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
-    OperationStatus,
 };
 use noxu_xa::{
     PrepareResult, XaEnvironment, XaError, XaFlags, XaResource, Xid,
@@ -110,12 +109,7 @@ fn xa_commit_after_restart_succeeds() {
         xa.xa_start(&xid, XaFlags::NOFLAGS).unwrap();
         {
             let txn = xa.get_transaction(&xid).unwrap();
-            db.put(
-                Some(&*txn),
-                &DatabaseEntry::from_bytes(key),
-                &DatabaseEntry::from_bytes(b"v"),
-            )
-            .unwrap();
+            db.put_in(&txn, key, b"v").unwrap();
         }
         xa.xa_end(&xid, XaFlags::TMSUCCESS).unwrap();
         xa.xa_prepare(&xid, XaFlags::NOFLAGS).unwrap();
@@ -136,9 +130,8 @@ fn xa_commit_after_restart_succeeds() {
 
         // After commit, the prepared write is visible.
         let mut val = DatabaseEntry::new();
-        let status =
-            db.get(None, &DatabaseEntry::from_bytes(key), &mut val).unwrap();
-        assert_eq!(status, OperationStatus::Success);
+        let status = db.get_into(None, key, &mut val).unwrap();
+        assert!(status);
         assert_eq!(val.get_data(), Some(b"v".as_slice()));
     }
 
@@ -169,12 +162,7 @@ fn xa_rollback_after_restart_succeeds() {
         xa.xa_start(&xid, XaFlags::NOFLAGS).unwrap();
         {
             let txn = xa.get_transaction(&xid).unwrap();
-            db.put(
-                Some(&*txn),
-                &DatabaseEntry::from_bytes(key),
-                &DatabaseEntry::from_bytes(b"v"),
-            )
-            .unwrap();
+            db.put_in(&txn, key, b"v").unwrap();
         }
         xa.xa_end(&xid, XaFlags::TMSUCCESS).unwrap();
         xa.xa_prepare(&xid, XaFlags::NOFLAGS).unwrap();
@@ -189,9 +177,8 @@ fn xa_rollback_after_restart_succeeds() {
 
         // Prepared write must NOT be visible.
         let mut val = DatabaseEntry::new();
-        let status =
-            db.get(None, &DatabaseEntry::from_bytes(key), &mut val).unwrap();
-        assert_eq!(status, OperationStatus::NotFound);
+        let status = db.get_into(None, key, &mut val).unwrap();
+        assert!(!status);
     }
 }
 
@@ -226,12 +213,7 @@ fn xa_forget_after_restart_clears_persistent_log() {
         xa.xa_start(&xid, XaFlags::NOFLAGS).unwrap();
         {
             let txn = xa.get_transaction(&xid).unwrap();
-            db.put(
-                Some(&*txn),
-                &DatabaseEntry::from_bytes(b"k_forget"),
-                &DatabaseEntry::from_bytes(b"v"),
-            )
-            .unwrap();
+            db.put_in(&txn, b"k_forget", b"v").unwrap();
         }
         xa.xa_end(&xid, XaFlags::TMSUCCESS).unwrap();
         xa.xa_prepare(&xid, XaFlags::NOFLAGS).unwrap();
@@ -267,12 +249,7 @@ fn xa_prepare_auto_detects_writes_without_mark_write() {
     xa.xa_start(&xid, XaFlags::NOFLAGS).unwrap();
     {
         let txn = xa.get_transaction(&xid).unwrap();
-        db.put(
-            Some(&*txn),
-            &DatabaseEntry::from_bytes(b"auto_k"),
-            &DatabaseEntry::from_bytes(b"auto_v"),
-        )
-        .unwrap();
+        db.put_in(&txn, b"auto_k", b"auto_v").unwrap();
     }
     // Deliberately DO NOT call xa.mark_write(&xid).
     xa.xa_end(&xid, XaFlags::TMSUCCESS).unwrap();
@@ -292,13 +269,8 @@ fn xa_prepare_auto_detects_writes_without_mark_write() {
     // Verify the data really was committed (not silently dropped by the
     // read-only optimisation).
     let mut val = DatabaseEntry::new();
-    let status =
-        db.get(None, &DatabaseEntry::from_bytes(b"auto_k"), &mut val).unwrap();
-    assert_eq!(
-        status,
-        OperationStatus::Success,
-        "auto-detect must preserve writes through prepare+commit"
-    );
+    let status = db.get_into(None, b"auto_k", &mut val).unwrap();
+    assert!(status, "auto-detect must preserve writes through prepare+commit");
     assert_eq!(val.get_data(), Some(b"auto_v".as_slice()));
 }
 

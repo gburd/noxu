@@ -128,12 +128,12 @@ where
     /// Returns `Ok(None)` if the key is not present in the database.
     pub fn get(&self, txn: Option<&Transaction>, key: &K) -> Result<Option<V>> {
         let key_entry = encode_key(&self.key_binding, key)?;
-        let mut data_entry = noxu_db::DatabaseEntry::new();
-        match self.db.get(txn, &key_entry, &mut data_entry)? {
-            OperationStatus::Success => {
+        match crate::internal::db_get(self.db, txn, &key_entry)? {
+            Some(bytes) => {
+                let data_entry = noxu_db::DatabaseEntry::from_bytes(&bytes);
                 Ok(Some(decode_value(&self.value_binding, &data_entry)?))
             }
-            _ => Ok(None),
+            None => Ok(None),
         }
     }
 
@@ -160,17 +160,16 @@ where
         let key_entry = encode_key(&self.key_binding, key)?;
         let value_entry = encode_value(&self.value_binding, value)?;
 
-        let old_value = {
-            let mut data_entry = noxu_db::DatabaseEntry::new();
-            match self.db.get(txn, &key_entry, &mut data_entry)? {
-                OperationStatus::Success => {
-                    Some(decode_value(&self.value_binding, &data_entry)?)
-                }
-                _ => None,
+        let old_value = match crate::internal::db_get(self.db, txn, &key_entry)?
+        {
+            Some(bytes) => {
+                let data_entry = noxu_db::DatabaseEntry::from_bytes(&bytes);
+                Some(decode_value(&self.value_binding, &data_entry)?)
             }
+            None => None,
         };
 
-        self.db.put(txn, &key_entry, &value_entry)?;
+        crate::internal::db_put(self.db, txn, &key_entry, &value_entry)?;
         Ok(old_value)
     }
 
@@ -187,18 +186,17 @@ where
 
         let key_entry = encode_key(&self.key_binding, key)?;
 
-        let old_value = {
-            let mut data_entry = noxu_db::DatabaseEntry::new();
-            match self.db.get(txn, &key_entry, &mut data_entry)? {
-                OperationStatus::Success => {
-                    Some(decode_value(&self.value_binding, &data_entry)?)
-                }
-                _ => None,
+        let old_value = match crate::internal::db_get(self.db, txn, &key_entry)?
+        {
+            Some(bytes) => {
+                let data_entry = noxu_db::DatabaseEntry::from_bytes(&bytes);
+                Some(decode_value(&self.value_binding, &data_entry)?)
             }
+            None => None,
         };
 
         if old_value.is_some() {
-            self.db.delete(txn, &key_entry)?;
+            crate::internal::db_delete(self.db, txn, &key_entry)?;
         }
         Ok(old_value)
     }
@@ -210,11 +208,7 @@ where
         key: &K,
     ) -> Result<bool> {
         let key_entry = encode_key(&self.key_binding, key)?;
-        let mut data_entry = noxu_db::DatabaseEntry::new();
-        match self.db.get(txn, &key_entry, &mut data_entry)? {
-            OperationStatus::Success => Ok(true),
-            _ => Ok(false),
-        }
+        Ok(crate::internal::db_get(self.db, txn, &key_entry)?.is_some())
     }
 
     /// Returns the number of records.
@@ -299,7 +293,7 @@ where
             return Err(CollectionError::ReadOnly);
         }
 
-        let mut cursor = self.db.open_cursor(txn, None)?;
+        let mut cursor = crate::internal::open_cursor(self.db, txn, None)?;
         let mut key = noxu_db::DatabaseEntry::new();
         let mut data = noxu_db::DatabaseEntry::new();
 
@@ -543,7 +537,7 @@ mod tests {
         for i in 1u64..=5 {
             let k = DatabaseEntry::from_vec(i.to_be_bytes().to_vec());
             let v = DatabaseEntry::from_vec(format!("v{i}").into_bytes());
-            db.put(None, &k, &v).unwrap();
+            db.put(k.data(), v.data()).unwrap();
         }
 
         // Open a typed map over the same database; iter() must see

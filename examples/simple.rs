@@ -37,8 +37,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let key = DatabaseEntry::from_bytes(key_str.as_bytes());
         let data = DatabaseEntry::from_bytes(data_str.as_bytes());
 
-        let status = db.put(None, &key, &data)?;
-        assert_eq!(status, OperationStatus::Success);
+        db.put(&key, &data)?;
     }
 
     // --- Retrieve individual records ---
@@ -46,36 +45,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in [0, 3, 7, 9] {
         let key_str = format!("key{:03}", i);
         let key = DatabaseEntry::from_bytes(key_str.as_bytes());
-        let mut data = DatabaseEntry::new();
 
-        let status = db.get(None, &key, &mut data)?;
-        match status {
-            OperationStatus::Success => {
+        match db.get(&key)? {
+            Some(value_bytes) => {
                 let value =
-                    std::str::from_utf8(data.data()).unwrap_or("<binary>");
+                    std::str::from_utf8(&value_bytes).unwrap_or("<binary>");
                 println!("  {} -> {}", key_str, value);
             }
-            OperationStatus::NotFound => {
+            None => {
                 println!("  {} -> NOT FOUND", key_str);
             }
-            _ => {}
         }
     }
 
     // --- Delete a record ---
     println!("\nDeleting key003...");
     let del_key = DatabaseEntry::from_bytes(b"key003");
-    let status = db.delete(None, &del_key)?;
-    println!("  Delete status: {:?}", status);
+    let deleted = db.delete(&del_key)?;
+    println!("  Delete status: {:?}", deleted);
 
     // Verify deletion
-    let mut data = DatabaseEntry::new();
-    let status = db.get(None, &del_key, &mut data)?;
-    println!("  Get after delete: {:?}", status);
+    let after = db.get(&del_key)?;
+    println!("  Get after delete: {:?}", after.is_some());
 
     // --- Cursor scan ---
     println!("\nForward cursor scan (all records):");
-    let mut cursor = db.open_cursor(None, None)?;
+    let mut cursor = db.open_cursor(None)?;
     let mut key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
     let mut count = 0;

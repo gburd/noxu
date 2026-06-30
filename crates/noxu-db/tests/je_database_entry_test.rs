@@ -91,10 +91,10 @@ fn database_entry_test_offset() {
     original_data.set_size(10);
     original_data.set_offset(10);
 
-    db.put(None, &original_key, &original_data).unwrap();
+    db.put(&original_key, &original_data).unwrap();
 
     let txn = env.begin_transaction(None).unwrap();
-    let mut cursor = db.open_cursor(Some(&txn), None).unwrap();
+    let mut cursor = db.open_cursor_in(&txn, None).unwrap();
     let mut found_key = DatabaseEntry::new();
     let mut found_data = DatabaseEntry::new();
     let s =
