@@ -15,15 +15,21 @@
 //! - A READ on R2's live tree returns the master's committed data — proving
 //!   R2's data matches the master's, sourced via R1.
 //!
-//! ## Faithful to JE's cascading-feeder model
+//! ## Faithful to JE's cascading-feeder model — ONE mechanism
 //!
 //! `FeederSource.java` documents the source as "a real Master OR a Replica
 //! in a Replica chain that is replaying log records it received from some
-//! other source".  `MasterFeederSource(repImpl, vlsnIndex, startVLSN)`
-//! reads the VLSNIndex + log regardless of node role; `FeederManager` runs
-//! feeders on any node that holds the data.  Here the *same*
-//! `EnvironmentLogScanner` + `FeederRunner` machinery that serves the
-//! master's WAL also serves R1's WAL to R2.
+//! other source".  `Feeder.initMasterFeederSource(startVLSN)` builds
+//! `new MasterFeederSource(repImpl, repNode.getVLSNIndex(), …)` regardless
+//! of node role, and the output loop pulls
+//! `feederSource.getWireRecord(feederVLSN, heartbeatMs)`
+//! (`Feeder.java:1282`).  `FeederManager` runs feeders on any node that
+//! holds the data.  Here the *same* `PeerFeederService` (= `FeederManager`)
+//! → `FeederRunner` (= `Feeder`) → `EnvironmentLogScanner`
+//! (= `MasterFeederSource`/`FeederReader`) machinery that serves the
+//! master's WAL also serves R1's WAL to R2.  The test ASSERTS this via
+//! `wal_feeds_served()` (see the proof block below): the cascade is NOT a
+//! separate feeder path.
 //!
 //! ## Fail-pre / pass-post
 //!
@@ -280,6 +286,36 @@ fn test_chain_master_r1_r2_read_on_r2_matches_master() {
         "R2 VLSN range must cover all {} entries; got last={}",
         records.len(),
         r2_range.last()
+    );
+
+    // ── PROOF: R1 fed R2 via the SAME mechanism the master fed R1 ──────────
+    //
+    // `wal_feeds_served()` counts connections served by the JE
+    // `Feeder`/`MasterFeederSource` path (`FeederRunner` +
+    // `EnvironmentLogScanner` reading the node's OWN WAL), incremented inside
+    // `PeerFeederService::handle`'s WAL branch.  Both the master and the
+    // cascading replica register the IDENTICAL `PeerFeederService` with a WAL
+    // source, so a non-zero count on R1 proves the cascade used the
+    // `FeederRunner` mechanism reading R1's WAL — NOT the in-memory
+    // `PeerScannerAdapter` pull fallback, and NOT a separate feeder path.
+    //
+    // JE: `FeederSource.java` ("a real Master OR a Replica in a Replica
+    // chain"), `Feeder.initMasterFeederSource` → `new MasterFeederSource(
+    // repImpl, repNode.getVLSNIndex(), …)`, `Feeder.java:1282`
+    // `feederSource.getWireRecord(feederVLSN, heartbeatMs)`.
+    assert!(
+        r1.wal_feeds_served() >= 1,
+        "R1 must have fed R2 via the WAL FeederRunner + EnvironmentLogScanner \
+         mechanism (JE Feeder + MasterFeederSource), not the in-memory pull \
+         fallback; wal_feeds_served() == {}",
+        r1.wal_feeds_served(),
+    );
+    // And the master fed R1 by the very same mechanism.
+    assert!(
+        master.wal_feeds_served() >= 1,
+        "the master must have fed R1 via the same WAL FeederRunner mechanism; \
+         wal_feeds_served() == {}",
+        master.wal_feeds_served(),
     );
 
     // ── tidy shutdown (leaf → mid-tier → master) ────────────────────────────

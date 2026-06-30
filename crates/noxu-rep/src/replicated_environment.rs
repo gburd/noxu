@@ -273,6 +273,16 @@ pub struct ReplicatedEnvironment {
     /// `replicate_entry` call from the application.
     wal_vlsn_counter: Arc<std::sync::atomic::AtomicU64>,
 
+    /// Count of downstream connections this node has served via the JE
+    /// `Feeder`/`MasterFeederSource` mechanism (`FeederRunner +
+    /// EnvironmentLogScanner` reading this node's WAL).  Shared with the
+    /// node's [`crate::stream::peer_feeder::PeerFeederService`] when a WAL
+    /// source is registered (master in `become_master`, or a cascading
+    /// replica in `become_replica`).  A non-zero value PROVES this node fed
+    /// a downstream by the SAME mechanism the master uses — the cascade does
+    /// not diverge.  See [`Self::wal_feeds_served`].
+    wal_feeds_served: Arc<std::sync::atomic::AtomicU64>,
+
     /// REP-10 (C): the replica-side consistency tracker, built from the
     /// REP-7 `last_applied_vlsn` handle when the replica replay thread starts
     /// (`become_replica`).  `None` on a master or before replay is wired.
@@ -514,6 +524,7 @@ impl ReplicatedEnvironment {
             feeder_queues: std::sync::RwLock::new(HashMap::new()),
             active_feeder_runners: StdMutex::new(HashMap::new()),
             wal_vlsn_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            wal_feeds_served: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             consistency_tracker: StdMutex::new(None),
         };
 
@@ -1696,6 +1707,20 @@ impl ReplicatedEnvironment {
         self.feeders.read().iter().map(|f| f.get_replica_name()).collect()
     }
 
+    /// Number of downstream connections this node has served via the JE
+    /// `Feeder`/`MasterFeederSource` mechanism (`FeederRunner +
+    /// EnvironmentLogScanner` reading this node's OWN WAL).
+    ///
+    /// A non-zero value PROVES this node fed a downstream replica by the
+    /// SAME mechanism the master uses — a cascading replica and the master
+    /// run the identical `PeerFeederService` → `FeederRunner` →
+    /// `EnvironmentLogScanner` path (JE `FeederManager` → `Feeder` →
+    /// `MasterFeederSource`).  Used by the chained-replication test to assert
+    /// the cascade does NOT use the in-memory pull fallback.
+    pub fn wal_feeds_served(&self) -> u64 {
+        self.wal_feeds_served.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     // -----------------------------------------------------------------------
     // C-C2 — active push feeder API
     // -----------------------------------------------------------------------
@@ -2108,9 +2133,10 @@ impl ReplicatedEnvironment {
                 Arc::clone(&env),
                 Arc::clone(&self.vlsn_index),
             );
-            let svc = PeerFeederService::with_wal_source(
+            let svc = PeerFeederService::with_wal_source_counted(
                 Arc::clone(&self.peer_scanner),
                 wal_source,
+                Arc::clone(&self.wal_feeds_served),
             );
             dispatcher.register(PEER_FEEDER_SERVICE_NAME, Arc::new(svc));
             log::debug!(
@@ -2202,16 +2228,19 @@ impl ReplicatedEnvironment {
                                 Arc::clone(&env),
                                 Arc::clone(&self.vlsn_index),
                             );
-                        let svc = PeerFeederService::with_wal_source(
+                        let svc = PeerFeederService::with_wal_source_counted(
                             Arc::clone(&self.peer_scanner),
                             wal_source,
+                            Arc::clone(&self.wal_feeds_served),
                         );
                         dispatcher
                             .register(PEER_FEEDER_SERVICE_NAME, Arc::new(svc));
                         log::info!(
                             "Node '{}' (replica): cascade feeding ENABLED — \
                              PEER_FEEDER now serves downstream replicas from \
-                             its own WAL",
+                             its own WAL via the SAME FeederRunner + \
+                             EnvironmentLogScanner mechanism the master uses \
+                             (JE Feeder + MasterFeederSource)",
                             self.config.node_name.as_str(),
                         );
                     } else {
