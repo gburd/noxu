@@ -52,6 +52,48 @@ aggressively but create more file-handle churn.
 .with_log_file_max_bytes(64 * 1024 * 1024)
 ```
 
+## Disk-space limits (`MAX_DISK` / `FREE_DISK`)
+
+Noxu DB can refuse new user writes before the disk fills, so the engine never
+runs out of space mid-write and recovery stays possible. Two independent limits
+(both faithful to BDB-JE) gate the user-write path:
+
+| Limit | Builder | Meaning | Default |
+|-------|---------|---------|---------|
+| `MAX_DISK` | `with_max_disk(bytes)` | Absolute cap on total log size (sum of all `.ndb` files). | `0` = disabled |
+| `FREE_DISK` | `with_free_disk(bytes)` | Keep at least this many bytes free on the filesystem. | `5 GiB` |
+
+```rust
+let cfg = EnvironmentConfig::new(path)
+    .with_allow_create(true)
+    .with_max_disk(50 * 1024 * 1024 * 1024)  // cap the log at 50 GiB
+    .with_free_disk(2 * 1024 * 1024 * 1024); // and keep 2 GiB free
+```
+
+A write is prohibited when **either** limit is violated:
+`availableLogSize = (maxDisk > 0) ? min(diskFree - freeDisk, maxDisk - totalLog)
+: diskFree - freeDisk`; the write is refused (with `NoxuError::DiskLimitExceeded`)
+when `availableLogSize <= 0`.
+
+Behaviour while over the limit:
+
+- **User `put`/`delete` are refused** with `DiskLimitExceeded` before anything
+  is logged — no partial write, no corruption.
+- **Reads, transaction aborts, and the cleaner/checkpointer's internal writes
+  keep working** — the cleaner must write to free space, so internal writes are
+  exempt (otherwise the environment would deadlock at the limit).
+- The limit is checked with a single cached atomic load on the write path
+  (no per-write `statvfs`); it is refreshed periodically by the checkpointer
+  daemon and after every cleaner pass.
+- Once the cleaner reclaims space, the next refresh clears the violation and
+  writes resume automatically (no reopen). Call
+  `Environment::refresh_disk_limit()` to recompute immediately.
+
+When both limits are `0` the check is inert and write throughput is unaffected.
+Leaving `FREE_DISK` at its 5 GiB default is recommended for production: it
+reserves headroom so the cleaner and recovery always have room to run. See
+[Recovery operations → Disk-full recovery](recovery-ops.md#disk-full-recovery).
+
 ## Thread pool sizing
 
 Noxu DB uses several background daemon threads.  They run at normal priority

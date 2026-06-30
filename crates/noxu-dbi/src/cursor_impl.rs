@@ -207,6 +207,16 @@ pub struct CursorImpl {
     txn_manager: Option<Arc<TxnManager>>,
     /// Throughput counters shared with all cursors on this database.
     throughput: Arc<ThroughputStats>,
+    /// Cached disk-limit tracker (JE: the env's `getDiskLimitViolation()`).
+    ///
+    /// On a user write the cursor reads the cached violation flag with a
+    /// single atomic load; if a limit is currently violated the write is
+    /// refused with `DiskLimitExceeded` before anything is logged. `None` for
+    /// cursors constructed outside a real environment (unit tests) and for
+    /// internal databases, which are exempt from the limit (JE:
+    /// `Cursor.checkUpdatesAllowed` skips the check when
+    /// `dbImpl.getDbType().isInternal()`).
+    disk_limit: Option<Arc<crate::disk_limit::DiskLimitTracker>>,
 }
 
 impl CursorImpl {
@@ -238,6 +248,7 @@ impl CursorImpl {
             txn_ref: None,
             txn_manager: None,
             throughput,
+            disk_limit: None,
         }
     }
 
@@ -267,6 +278,7 @@ impl CursorImpl {
             txn_ref: None,
             txn_manager: None,
             throughput,
+            disk_limit: None,
         }
     }
 
@@ -314,6 +326,23 @@ impl CursorImpl {
     /// `CkptEnd.first_active_lsn` (T-F3).
     pub fn with_txn_manager(mut self, txn_manager: Arc<TxnManager>) -> Self {
         self.txn_manager = Some(txn_manager);
+        self
+    }
+
+    /// Wires the disk-limit tracker so user writes are refused with
+    /// `DiskLimitExceeded` while a disk limit is violated.
+    ///
+    /// JE: a user cursor reads `dbImpl.getEnv().getDiskLimitViolation()` in
+    /// `Cursor.checkUpdatesAllowed()`.  The caller must NOT wire this for
+    /// internal databases (`DbType::is_internal()`), which are exempt so the
+    /// cleaner/checkpointer/recovery can keep writing to free space — the
+    /// correctness crux (without the exemption the env deadlocks at the
+    /// limit).
+    pub fn with_disk_limit(
+        mut self,
+        disk_limit: Arc<crate::disk_limit::DiskLimitTracker>,
+    ) -> Self {
+        self.disk_limit = Some(disk_limit);
         self
     }
 
@@ -715,6 +744,30 @@ impl CursorImpl {
     }
 
     /// Checks the cursor is not closed.
+    /// Refuses a user write while a disk-space limit is violated (JE:
+    /// `Cursor.checkUpdatesAllowed()` throwing `DiskLimitException`).
+    ///
+    /// This reads the cached violation flag (a single atomic load) and never
+    /// probes the disk. When no limit is configured the tracker is inert and
+    /// this is one branch with near-zero cost. Internal databases never have
+    /// the tracker wired (`Database::make_cursor` only attaches it for user
+    /// DBs), so the cleaner/checkpointer/recovery writes — which FREE space —
+    /// are never blocked. This exemption is the correctness crux: blocking
+    /// internal writes too would deadlock the env at the limit (it could not
+    /// write to free space).
+    #[inline]
+    fn check_disk_limit(&self) -> Result<(), DbiError> {
+        if let Some(dl) = self.disk_limit.as_ref()
+            && dl.is_violated()
+        {
+            return Err(DbiError::DiskLimitExceeded {
+                used: dl.last_total_log_size(),
+                limit: dl.effective_limit(),
+            });
+        }
+        Ok(())
+    }
+
     fn check_state(&self) -> Result<(), DbiError> {
         #[cfg(any(test, feature = "testing"))]
         if tick_fail() {
@@ -2824,6 +2877,11 @@ impl CursorImpl {
         put_mode: PutMode,
     ) -> Result<OperationStatus, DbiError> {
         self.check_state()?;
+        // Refuse the write if a disk limit is violated (JE:
+        // Cursor.checkUpdatesAllowed throws DiskLimitException). Done before
+        // anything is logged or the tree is mutated, and before delegating to
+        // put_dup so the sorted-dup path is gated too.
+        self.check_disk_limit()?;
 
         // For sorted-dup databases: encode (key, data) as a two-part composite
         // key.  The tree stores `combine(key, data)` with no slot data.
@@ -3277,6 +3335,11 @@ impl CursorImpl {
     /// * `CursorClosed` if cursor has been closed
     pub fn delete(&mut self) -> Result<OperationStatus, DbiError> {
         self.check_initialized()?;
+        // Refuse the delete if a disk limit is violated. A delete still writes
+        // a DeleteLN to the WAL, so it consumes log space and must be gated
+        // like put (JE: Cursor.checkUpdatesAllowed gates delete too). The
+        // cleaner reclaims the space later. (JE: DiskLimitException.)
+        self.check_disk_limit()?;
 
         // D3: if the slot has already been deleted by a concurrent operation,
         // return KEYEMPTY (JE CursorImpl.deleteCurrentRecord() PD-flag check).

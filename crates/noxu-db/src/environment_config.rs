@@ -1064,6 +1064,20 @@ impl EnvironmentConfig {
         self
     }
 
+    /// Builder form of [`Self::set_max_disk`] (`MAX_DISK`): absolute cap on
+    /// total log size in bytes. 0 (default) disables the cap.
+    pub fn with_max_disk(mut self, bytes: u64) -> Self {
+        self.max_disk = bytes;
+        self
+    }
+
+    /// Builder form of [`Self::set_free_disk`] (`FREE_DISK`): keep-this-much
+    /// free on the filesystem, in bytes. 0 disables the free-space reserve.
+    pub fn with_free_disk(mut self, bytes: u64) -> Self {
+        self.free_disk = bytes;
+        self
+    }
+
     // -----------------------------------------------------------------------
     // Daemon run-flag setters
     // -----------------------------------------------------------------------

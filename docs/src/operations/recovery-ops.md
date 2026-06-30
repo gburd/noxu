@@ -39,12 +39,25 @@ to the amount of data written since the last checkpoint.
 
 ## Disk-full recovery
 
-If `NoxuError::EnvironmentFailure { reason: DiskLimitExceeded, .. }` is
-returned:
+If a write returns `NoxuError::DiskLimitExceeded { used, limit }`, a disk-space
+limit (`MAX_DISK` and/or `FREE_DISK`) is currently violated and new **user**
+writes are refused so that recovery stays possible. Reads, transaction aborts,
+and the cleaner/checkpointer's own (internal) writes continue to work — the
+cleaner needs to write to free space.
 
-1. Free disk space (remove old log files outside the environment directory,
-   expand the volume, etc.).
-2. Close and reopen the environment.  The cleaner will resume and reclaim
-   additional space automatically.
+Writes resume **automatically** once space is reclaimed: the cleaner deletes
+obsolete log files on its next pass (and the checkpointer daemon refreshes the
+limit on its interval), which clears the violation. To recover faster:
+
+1. Reduce `MAX_DISK` pressure: delete obsolete records and call
+   `Environment::clean_log()` to force a cleaner pass (it reclaims whole
+   obsolete log files and refreshes the disk-limit state).
+2. For a `FREE_DISK` violation, free filesystem space (remove files outside the
+   environment directory, expand the volume).
+3. Call `Environment::refresh_disk_limit()` to recompute the violation state
+   immediately rather than waiting for the next daemon wakeup.
+
+The environment does **not** need to be closed and reopened — the limit clears
+in place. See [Sizing → Disk-space limits](sizing.md#disk-space-limits-max_disk--free_disk).
 
 ---

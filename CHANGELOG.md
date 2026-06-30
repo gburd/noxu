@@ -17,6 +17,32 @@ listed in [References](#references).
 
 ### Added
 
+- **Disk-limit enforcement (`MAX_DISK` / `FREE_DISK`).** The `noxu.maxDisk` /
+  `noxu.freeDisk` config parameters are now enforced on the user-write path,
+  a faithful port of BDB-JE's disk-limit machinery
+  (`cleaner/Cleaner.java` `recalcLogSizeStats`/`getDiskLimitViolation`,
+  `dbi/EnvironmentImpl.java` `checkDiskLimitViolation`, `Cursor.java`
+  `checkUpdatesAllowed`). A new `DiskLimitTracker` (in `noxu-dbi`) caches a
+  volatile violation flag computed from total log size (sum of `.ndb` file
+  lengths) plus filesystem free space (`fs2::available_space` / statvfs)
+  against `MAX_DISK` (absolute log-size cap) and `FREE_DISK` (keep-this-much
+  -free reserve): `availBytes = (maxDisk>0) ? min(diskFree-freeDisk,
+  maxDisk-totalLog) : diskFree-freeDisk`; a write is prohibited when
+  `availBytes <= 0`. `Cursor::put`/`delete` read the cached flag with a single
+  atomic load (no per-write statvfs) and return `NoxuError::DiskLimitExceeded`
+  BEFORE logging or mutating the tree. **Internal databases are exempt** (JE
+  `dbImpl.getDbType().isInternal()`) so the cleaner/checkpointer/recovery
+  writes — which free space — are never blocked and the env never deadlocks at
+  the limit. The flag is refreshed periodically by the checkpointer daemon and
+  after every cleaner pass (JE `Cleaner.manageDiskUsage`), and at env-open;
+  once space is reclaimed writes resume automatically. New builders
+  `EnvironmentConfig::with_max_disk` / `with_free_disk` and
+  `Environment::refresh_disk_limit()`. **Default behaviour is unchanged**:
+  `MAX_DISK` defaults to 0 (disabled); `FREE_DISK` defaults to 5 GiB (JE
+  default) and only trips below 5 GiB free; when both are 0 the tracker is
+  inert (the check is one branch, no statvfs). Headline test:
+  `crates/noxu-db/tests/disk_limit_test.rs`.
+
 - **Cursor `Get::SearchLte`, `Get::FirstDup`, `Get::LastDup`.** The three
   remaining cursor positioning modes are now implemented, faithful to
   BDB-JE / BDB `Cursor` semantics:

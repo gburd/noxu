@@ -24,6 +24,7 @@ mod database_impl;
 mod db_tree;
 mod db_type;
 pub mod dbi_config;
+pub mod disk_limit;
 pub mod disk_ordered_cursor_impl;
 pub mod dup_key_data;
 mod env_failure_reason;

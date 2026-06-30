@@ -263,6 +263,43 @@ impl FileManager {
         self.max_file_size
     }
 
+    /// Returns the environment directory holding the log files.
+    pub fn env_dir(&self) -> &Path {
+        &self.env_dir
+    }
+
+    /// Returns the total size, in bytes, of all `.ndb` log files on disk.
+    ///
+    /// This is the disk-limit "total log size" used by the disk-usage probe.
+    /// JE computes the analogous value in
+    /// `FileProtector.getLogSizeStats()` by summing `activeFiles` (plus the
+    /// last file's length); Noxu has no reserved-file machinery (the cleaner
+    /// deletes files outright rather than parking them as "reserved"), so the
+    /// total is simply the sum of every log file's length — equivalent to
+    /// JE's `activeSize` with `reservedSize == 0`.
+    pub fn total_log_size(&self) -> Result<u64> {
+        let mut total = 0u64;
+        for file_num in self.list_file_numbers()? {
+            // A file may be deleted by the cleaner between listing and stat;
+            // skip it rather than fail the whole probe.
+            if let Ok(len) = self.get_file_length(file_num) {
+                total += len;
+            }
+        }
+        Ok(total)
+    }
+
+    /// Returns the filesystem free (usable) space, in bytes, for the
+    /// environment directory.
+    ///
+    /// JE calls `Cleaner.getDiskFreeSpace()` →
+    /// `FileStoreInfo.getUsableSpace()` (a `statvfs`). Noxu uses
+    /// `fs2::available_space` (also `statvfs`-backed), which reports space
+    /// available to a non-privileged process — the same notion JE uses.
+    pub fn disk_free_space(&self) -> Result<u64> {
+        Ok(fs2::available_space(&self.env_dir)?)
+    }
+
     /// Returns the current file number being written to.
     pub fn get_current_file_num(&self) -> u32 {
         self.current_file_num.load(Ordering::Acquire)
