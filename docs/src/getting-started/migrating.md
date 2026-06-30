@@ -7,6 +7,110 @@ v1.5 (and later releases) that is likely to surface in user code.
 > [Introduction → capability matrix](../introduction.md#capability-matrix-v15--v22)
 > for the canonical "what is supported in which release" table.
 
+## v6.x → 7.0 — idiomatic-Rust API reshape + cleanups
+
+7.0 reshapes the `noxu-db` public surface to read as ordinary Rust. The core
+read/write/cursor changes are described in the
+[CHANGELOG](https://codeberg.org/gregburd/noxu) under *7.0 core API reshape*;
+this section covers the mechanical cleanups that layer on top.
+
+### Getter renames (C-GETTER)
+
+`get_x()` field getters are now `x()`. `get_` survives only where a key lookup
+happens (`Database::get`/`get_in`, cursor `get_next`/`get_first`, …).
+
+| Before | After |
+|---|---|
+| `entry.get_data()` | `entry.data_opt()` (the `Option<&[u8]>`; `entry.data()` still gives `&[u8]`) |
+| `entry.get_size()` | `entry.len()` |
+| `entry.get_offset()` | `entry.offset()` |
+| `entry.get_partial_offset()` / `get_partial_length()` | `entry.partial_offset()` / `partial_length()` |
+| `db.get_database_name()` | `db.name()` |
+| `db.get_config()` | `db.config()` |
+| `db.get_sorted_duplicates()` | `db.sorted_duplicates()` |
+| `db.get_stats(cfg)` | `db.stats(cfg)` |
+| `txn.get_id()` / `get_name()` / `get_state()` | `txn.id()` / `name()` / `state()` |
+| `txn.get_durability()` / `get_lock_timeout()` / `get_txn_timeout()` | `txn.durability()` / `lock_timeout()` / `txn_timeout()` |
+| `env.get_database_names()` / `get_home()` / `get_config()` | `env.database_names()` / `home()` / `config()` |
+| `env.get_mutable_config()` / `get_stats()` / `get_replica_ack_timeout()` | `env.mutable_config()` / `stats()` / `replica_ack_timeout()` |
+| `cursor.get_state()` | `cursor.state()` |
+| `join_cursor.get_database()` / `get_config()` | `join_cursor.database()` / `config()` |
+| `scan_result.get_include()` / `get_stop()` | `scan_result.included()` / `stops()` |
+| `seq.get_stats()` | `seq.stats()` |
+| `write_opts.get_expiration_time()` | `write_opts.expiration_time()` |
+| `env_cfg.get_exception_listener()` | `env_cfg.exception_listener()` |
+
+The redundant `DatabaseStats`/`BtreeStats`/`JoinConfig` getters over `pub`
+fields were removed — read the fields directly (e.g. `stats.btree.leaf_node_count`).
+
+### Error chains (`NoxuError`)
+
+`NoxuError` and `EnvironmentFailureReason` are now `#[non_exhaustive]`: any
+`match` on them in your code must add a wildcard arm:
+
+```rust,ignore
+match err {
+    NoxuError::NotFound => { /* … */ }
+    NoxuError::DeadlockDetected => { /* … */ }
+    // required now:
+    _ => { /* … */ }
+}
+```
+
+Sub-crate causes are no longer flattened to a string — `err.source()` now chains
+to the originating log/B-tree/comparator/DBI error (via the new
+`NoxuError::OperationFailed { msg, source }` variant). `anyhow`/`?` users get
+the real cause; classification (`is_retryable`/`is_fatal_to_environment`) and
+Display text are unchanged.
+
+### Lazy collection iterators
+
+`StoredMap`/`StoredSortedMap::iter`/`keys`/`values` (and the `StoredKeySet`/
+`StoredValueSet`/`StoredList::iter`, `iter_from`/`iter_reverse`) are now **lazy**
+(cursor-backed, O(1) to create). If you relied on the old eager snapshot
+semantics — iterating a point-in-time view that ignores mutations made after
+the iterator was created — switch to the explicit `snapshot()` /
+`keys_snapshot()` / `values_snapshot()`:
+
+```rust,ignore
+// Before (eager): iter() materialised everything.
+let snap = map.iter(None)?;
+map.put(None, &k, &v)?;            // not seen by `snap`
+
+// After: name the eagerness explicitly.
+let snap = map.snapshot(None)?;    // point-in-time, ignores the put below
+map.put(None, &k, &v)?;
+```
+
+When iterating under an explicit transaction the lazy iterator borrows the
+transaction for its whole lifetime — drop it (or finish iterating) before
+committing/aborting.
+
+### Uniform `with_*` config builders
+
+Every `EnvironmentConfig` / `DatabaseConfig` parameter now has a consuming
+`with_*` builder, so the whole config builds in one chained expression. The
+`set_*(&mut self)` setters are retained, so existing code is unaffected; you
+can now also write `EnvironmentConfig::new(path).with_run_cleaner(false)` for
+parameters that previously only had `set_*`.
+
+### Deprecated inert knobs
+
+Settable-but-inert knobs are now `#[deprecated(note = "not yet implemented …")]`
+so the compiler warns that they do nothing: `DatabaseConfig`'s `exclusive` /
+`replicated` / `cache_mode` / `bin_delta` / `use_existing_config`, and the
+per-op `WriteOptions::with_cache_mode` / `with_update_ttl` / `evict_after_write`
+and `ReadOptions::with_cache_mode` / `evict_after_read`. Remove these calls;
+they had no effect. `WriteOptions::with_ttl` is **not** deprecated — TTL is
+honoured.
+
+### Removed `Transaction` constructors
+
+`Transaction::new` and the `with_log_manager`/`with_env_impl`/`with_inner_txn`
+wiring methods are no longer public (they exposed engine internals and could
+build a non-functional handle). Obtain a transaction via
+`Environment::begin_transaction(...)`.
+
 ## v3.2 → v4.0 — XA `get_transaction` returns `Arc<Transaction>`
 
 v4.0.0 is a major release driven by a single source-incompatible change
