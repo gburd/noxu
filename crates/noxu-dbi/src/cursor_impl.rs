@@ -1124,6 +1124,127 @@ impl CursorImpl {
         }
     }
 
+    /// Positions on the largest key less-than-or-equal-to `key` (the
+    /// "floor" of the search key).
+    ///
+    /// Faithful to the BDB `DB_SET_RANGE`-then-step-back floor lookup
+    /// (the LTE mirror of `Cursor.getSearchKeyRange` / `Get.SEARCH_GTE`):
+    ///
+    /// 1. Range-search for the first key >= `key` (`SearchMode::SetRange`).
+    /// 2. If that returns a key *equal* to `key`, that is the floor — done.
+    /// 3. If it returns a key strictly *greater* than `key`, the floor is
+    ///    its predecessor, reached with one `Prev` step.
+    /// 4. If the range-search finds nothing (every key < `key`), the floor
+    ///    is the last record in the database (`get_last`).
+    ///
+    /// Returns `NotFound` only when no key <= `key` exists (the database is
+    /// empty, or `key` is smaller than every stored key).
+    ///
+    /// For sorted-dup databases the floor key may have several duplicates;
+    /// this lands on the *last* duplicate of the floor key (the largest
+    /// two-part key whose primary part is the floor), matching BDB which
+    /// positions on the greatest record <= the search key.
+    pub fn search_lte(
+        &mut self,
+        key: &[u8],
+    ) -> Result<OperationStatus, DbiError> {
+        self.check_state()?;
+
+        let is_dup = self.is_sorted_dup();
+
+        // Step 1: range-search for the ceiling (first key >= search key).
+        let gte = self.search(key, None, SearchMode::SetRange)?;
+        if gte == OperationStatus::NotFound {
+            // Step 4: every key is < search key — floor is the last record.
+            return self.get_last();
+        }
+
+        // Determine whether the ceiling's primary key equals the search key.
+        let found_pk: Vec<u8> = match &self.current_key {
+            Some(raw) if is_dup => {
+                dup_key_data::get_key(raw).unwrap_or_else(|| raw.clone())
+            }
+            Some(raw) => raw.clone(),
+            None => return Ok(OperationStatus::NotFound),
+        };
+
+        if found_pk.as_slice() == key {
+            // Step 2: exact key match.  For dups, the range-search landed on
+            // the FIRST duplicate of this key; the floor must be the LAST
+            // duplicate (greatest record <= search key), so walk to it.
+            if is_dup {
+                while self.retrieve_next(GetMode::NextDup)?
+                    == OperationStatus::Success
+                {}
+            }
+            return Ok(OperationStatus::Success);
+        }
+
+        // Step 3: ceiling > search key — floor is the predecessor record.
+        // `Prev` steps to the previous record in key order; for a dup
+        // database that is the LAST duplicate of the previous primary key
+        // (the greatest two-part key < the ceiling), which is exactly the
+        // greatest record <= the search key.
+        self.retrieve_next(GetMode::Prev)
+    }
+
+    /// Positions on the first duplicate of the current key (by data order).
+    ///
+    /// Faithful to `Cursor.getFirstDup` / the `DB_FIRST_DUP` BDB flag: the
+    /// cursor must already be positioned within a duplicate set; this moves
+    /// it to the duplicate with the smallest data value sharing the current
+    /// primary key, WITHOUT leaving that key.
+    ///
+    /// For Noxu's composite two-part-key dup model the first duplicate is the
+    /// entry with the smallest two-part key whose primary part equals the
+    /// current primary key — exactly what `search(key, Set)` positions on
+    /// (it seeks `lower_bound(key)` = `combine(key, b"")`).
+    ///
+    /// On a non-dup database the current record is the only record for its
+    /// key, so this is a no-op that re-affirms the current position.
+    pub fn get_first_dup(&mut self) -> Result<OperationStatus, DbiError> {
+        self.check_initialized()?;
+        if !self.is_sorted_dup() {
+            // Single record per key — already on the (only) first dup.
+            return Ok(OperationStatus::Success);
+        }
+        let pk = self
+            .current_key
+            .as_ref()
+            .and_then(|raw| dup_key_data::get_key(raw))
+            .ok_or(DbiError::CursorNotInitialized)?;
+        // Set positions at the first duplicate of `pk` (lower_bound seek).
+        self.search(&pk, None, SearchMode::Set)
+    }
+
+    /// Positions on the last duplicate of the current key (by data order).
+    ///
+    /// Faithful to `Cursor.getLastDup` / the `DB_LAST_DUP` BDB flag: the
+    /// cursor must already be positioned within a duplicate set; this moves
+    /// it to the duplicate with the largest data value sharing the current
+    /// primary key, WITHOUT leaving that key.
+    ///
+    /// Implemented by first seeking the first duplicate, then advancing with
+    /// `NextDup` until the dup set is exhausted; the final successful
+    /// position is the last duplicate.
+    ///
+    /// On a non-dup database this is a no-op that re-affirms the current
+    /// position.
+    pub fn get_last_dup(&mut self) -> Result<OperationStatus, DbiError> {
+        self.check_initialized()?;
+        if !self.is_sorted_dup() {
+            return Ok(OperationStatus::Success);
+        }
+        // Position on the first dup, then walk to the last.
+        if self.get_first_dup()? != OperationStatus::Success {
+            return Ok(OperationStatus::NotFound);
+        }
+        while self.retrieve_next(GetMode::NextDup)? == OperationStatus::Success
+        {
+        }
+        Ok(OperationStatus::Success)
+    }
+
     /// Acquires a read lock on a log record by LSN.
     ///
     /// `CursorImpl.lockLN(LockType.READ)`.  When no lock manager

@@ -83,34 +83,29 @@ pub enum Get {
     /// Get the record with the largest key less than or equal to the specified key.
     ///
     /// Positions the cursor at the last record with a key less than or
-    /// equal to the search key.
+    /// equal to the search key (the "floor" of the search key).  Returns
+    /// `NotFound` when no key <= the search key exists.
     ///
-    /// **Not yet implemented.**  `Cursor::get` returns
-    /// [`crate::error::NoxuError::Unsupported`] for this variant.  Tracked
-    /// for a future sprint; see
-    /// the 2026 review Finding 3.
+    /// Faithful to the BDB `DB_SET_RANGE`-then-step-back floor lookup
+    /// (the LTE mirror of `Cursor.getSearchKeyRange` / `Get.SEARCH_GTE`).
     SearchLte,
 
     /// Get the first duplicate of the current key.
     ///
     /// For duplicate databases, positions at the first duplicate of the
-    /// current key. Has no effect if not positioned on a key.
+    /// current key (smallest data value), WITHOUT leaving the current key.
+    /// The cursor must already be positioned on a record.
     ///
-    /// **Not yet implemented.**  `Cursor::get` returns
-    /// [`crate::error::NoxuError::Unsupported`] for this variant.  Tracked
-    /// for a future sprint; see
-    /// the 2026 review Finding 3.
+    /// Faithful to `Cursor.getFirstDup`.
     FirstDup,
 
     /// Get the last duplicate of the current key.
     ///
     /// For duplicate databases, positions at the last duplicate of the
-    /// current key. Has no effect if not positioned on a key.
+    /// current key (largest data value), WITHOUT leaving the current key.
+    /// The cursor must already be positioned on a record.
     ///
-    /// **Not yet implemented.**  `Cursor::get` returns
-    /// [`crate::error::NoxuError::Unsupported`] for this variant.  Tracked
-    /// for a future sprint; see
-    /// the 2026 review Finding 3.
+    /// Faithful to `Cursor.getLastDup`.
     LastDup,
 
     /// Get the next duplicate of the current key.
