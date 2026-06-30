@@ -351,6 +351,10 @@ impl DatabaseConfig {
     }
 
     /// Sets whether the database is exclusive.
+    #[deprecated(
+        note = "not yet implemented: there is no per-database thread-affinity \
+                enforcement; this setting has no effect"
+    )]
     pub fn set_exclusive(&mut self, exclusive: bool) -> &mut Self {
         self.exclusive = exclusive;
         self
@@ -399,12 +403,22 @@ impl DatabaseConfig {
     }
 
     /// Sets whether this database participates in replication.
+    #[deprecated(
+        note = "not yet implemented: replication scope is set at the \
+                environment level (noxu-rep), not per-database; this setting \
+                has no effect"
+    )]
     pub fn set_replicated(&mut self, replicated: bool) -> &mut Self {
         self.replicated = replicated;
         self
     }
 
     /// Builder-style method to set replicated.
+    #[deprecated(
+        note = "not yet implemented: replication scope is set at the \
+                environment level (noxu-rep), not per-database; this setting \
+                has no effect"
+    )]
     pub fn with_replicated(mut self, replicated: bool) -> Self {
         self.replicated = replicated;
         self
@@ -423,36 +437,62 @@ impl DatabaseConfig {
     }
 
     /// Sets the per-database cache eviction mode.
+    #[deprecated(
+        note = "not yet implemented: the per-database cache hint is not \
+                consulted by the evictor (the env-level cache mode is); this \
+                setting has no effect"
+    )]
     pub fn set_cache_mode(&mut self, cache_mode: CacheMode) -> &mut Self {
         self.cache_mode = cache_mode;
         self
     }
 
     /// Builder-style method to set cache_mode.
+    #[deprecated(
+        note = "not yet implemented: the per-database cache hint is not \
+                consulted by the evictor (the env-level cache mode is); this \
+                setting has no effect"
+    )]
     pub fn with_cache_mode(mut self, cache_mode: CacheMode) -> Self {
         self.cache_mode = cache_mode;
         self
     }
 
     /// Sets whether BIN-deltas are written to the log.
+    #[deprecated(
+        note = "not yet implemented: the engine always emits BIN-deltas where \
+                applicable; this setting has no effect"
+    )]
     pub fn set_bin_delta(&mut self, bin_delta: bool) -> &mut Self {
         self.bin_delta = bin_delta;
         self
     }
 
     /// Builder-style method to set bin_delta.
+    #[deprecated(
+        note = "not yet implemented: the engine always emits BIN-deltas where \
+                applicable; this setting has no effect"
+    )]
     pub fn with_bin_delta(mut self, bin_delta: bool) -> Self {
         self.bin_delta = bin_delta;
         self
     }
 
     /// Sets whether to reuse existing config when opening an existing database.
+    #[deprecated(
+        note = "not yet implemented: per-DB config is not persisted in a way \
+                that can be selectively re-applied; this setting has no effect"
+    )]
     pub fn set_use_existing_config(&mut self, v: bool) -> &mut Self {
         self.use_existing_config = v;
         self
     }
 
     /// Builder-style method to set use_existing_config.
+    #[deprecated(
+        note = "not yet implemented: per-DB config is not persisted in a way \
+                that can be selectively re-applied; this setting has no effect"
+    )]
     pub fn with_use_existing_config(mut self, v: bool) -> Self {
         self.use_existing_config = v;
         self
@@ -483,6 +523,11 @@ impl DatabaseConfig {
     }
 
     /// Builder-style (consuming) `exclusive` setter. See [`Self::set_exclusive`].
+    #[deprecated(
+        note = "not yet implemented: there is no per-database thread-affinity \
+                enforcement; this setting has no effect"
+    )]
+    #[allow(deprecated)]
     pub fn with_exclusive(mut self, exclusive: bool) -> Self {
         self.set_exclusive(exclusive);
         self
@@ -639,6 +684,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // exercising the (now-deprecated) inert setter
     fn test_exclusive() {
         let mut config = DatabaseConfig::new();
         assert!(!config.exclusive);

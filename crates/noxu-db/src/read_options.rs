@@ -32,6 +32,10 @@ impl ReadOptions {
     }
 
     /// Sets the cache mode.
+    #[deprecated(
+        note = "not yet implemented: cache_mode is advisory/informational and \
+                is not consulted by the engine; this setting has no effect"
+    )]
     pub fn with_cache_mode(mut self, cache_mode: CacheMode) -> Self {
         self.cache_mode = Some(cache_mode);
         self
@@ -48,6 +52,11 @@ impl ReadOptions {
     }
 
     /// Creates ReadOptions with evict-after-read cache mode.
+    #[deprecated(
+        note = "not yet implemented: cache_mode is advisory/informational and \
+                is not consulted by the engine; this constructor has no effect \
+                beyond ReadOptions::new()"
+    )]
     pub fn evict_after_read() -> Self {
         Self {
             lock_mode: LockMode::Default,
@@ -63,6 +72,7 @@ impl Default for ReadOptions {
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // tests still exercise the (now-deprecated) inert setters
 mod tests {
     use super::*;
 
