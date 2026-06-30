@@ -230,6 +230,72 @@ preserves the layering — `noxu-tree` has no `noxu-txn` dependency. Because JE'
 *same* side table, there is no fidelity tension here: the faithful design and the layered
 design coincide. TXN-11 required **no code change** — the implementation already matched JE.
 
+## Lock *locus*: synthetic-id for new keys, real-LSN for existing keys (TXN-LOCUS)
+
+**Decision**: The lock *protocol* (the `LockManager`, the conflict/upgrade matrices, the
+thin→fat inflation, deadlock detection) is a faithful 1:1 port of JE. The lock *locus* — the
+identifier a record is locked by — **deviates** from JE, and that deviation must be actively
+managed because it can reach lock states JE's structure makes unreachable.
+
+**The deviation**:
+
+- **JE** keys every per-record lock by the record's **LSN**, and JE's locking is
+  *node-id-uniform*: an existing record, a record being inserted, and a next-key lock all
+  resolve to one stable identifier through the coupled `BIN`/`LN`/lock-table subsystem.
+- **Noxu** splits the locus, because `noxu-tree` is deliberately free of any `noxu-txn`
+  dependency (the same layering choice as TXN-11) and the tree therefore exposes no
+  lock-usable record identity. As a result:
+  - a **new-key insert** write-locks a **synthetic id** —
+    `Lsn::synthetic_key_lock_id(db_id, key)` — because the new LN has no LSN until commit;
+  - an **existing-key write** locks the record's **real `old_lsn`**;
+  - the **next-key `RangeInsert`** locks the successor's **real LSN**;
+  - a **read** locks the record's **real LSN**.
+
+**Why it matters**: because new keys are locked by a synthetic id but existing keys, reads,
+and next-key locks use real LSNs, *the same logical key can be referenced by two different
+lock identities*, and a `RangeInsert` taken on an existing successor's real LSN can collide
+with a later same-txn `Write` or `Read` on that **same** real LSN. In JE this is structurally
+impossible (uniform locus + the inserter never reads/writes the successor it next-key-locked),
+so JE's upgrade matrix marks `(RangeInsert, *)` as `ILLEGAL` and *asserts* it is never
+requested. In Noxu the split locus can request exactly those illegal upgrades within one
+transaction.
+
+**Invariants JE gets for free that Noxu must maintain explicitly**: the matrix entries are
+identical to JE (`(RangeInsert, Write)`, `(RangeInsert, Read)`, `(RangeInsert, RangeRead)` =
+ILLEGAL — verified against JE `LockType.upgradeMatrix`), so the matrix is NOT changed. Instead
+the **cursor lock paths actively prevent the illegal request**, restoring JE's
+never-requested invariant by a different mechanism:
+
+- **S1 — insert A then write existing successor B** (`(RangeInsert, Write)`): the write path
+  releases the txn's own `RangeInsert` on that LSN before requesting `Write`
+  (`Txn::release_range_insert_for_write`). Safe because the `RangeInsert` only guarded against
+  *other* txns' phantoms at B, and the `Write` provides at-least-as-strong protection.
+- **S2 — insert A then read existing successor B** (`(RangeInsert, Read/RangeRead)`): the read
+  path skips the `Read`/`RangeRead` acquisition when the txn already holds `RangeInsert` on
+  that LSN (`Txn::holds_range_insert`); the stronger `RangeInsert` entry stands (a downgrade
+  would lose phantom protection, since `Read < RangeInsert`).
+- **S3–S6 — the reverse orders and the EOF sentinel** (read/write first, then the next-key
+  `RangeInsert`; or both on the per-DB EOF sentinel): already prevented by the
+  `owns_any_lock` skip in `lock_range_insert` / `lock_eof_for_scan`.
+
+**Why not match the locus exactly**: a uniform locus would require assigning a stable
+lock-usable record identity at insert time (before the LN is logged) and exposing it from
+`noxu-tree` to `noxu-txn` — breaking the tree-free-of-txn layering (the TXN-11 boundary). That
+is a large, hot-path, isolation-critical refactor with no user-visible benefit beyond making
+these invariants structural instead of explicitly maintained. It is **deliberately not done**;
+the cost is that each JE-free invariant the split locus breaks must be identified and
+re-established in the cursor path (the S1/S2 fixes, plus the pre-existing S3–S6 guards). A
+defensive audit of all eight lock-acquisition sites against the illegal-upgrade matrix
+entries (recorded in the fix commits for S1/S2) is the maintenance tool: when a new
+lock-acquisition path is added, re-run that audit.
+
+**This is the one place where the faithful-transliteration discipline is most subtle**: the
+*algorithm* is faithful (matrices, protocol), the *substrate* deviates (lock locus, like
+parking_lot vs JVM monitors), and the deviation converts some structurally-guaranteed JE
+invariants into invariants Noxu must enforce by code. Cite JE `LockType.upgradeMatrix` /
+`CursorImpl.lockNextKeyForInsert` / `LockType.isWriteLock` ("RANGE_INSERT... locks the key
+following the insertion key, not the insertion key itself").
+
 ## Diverged-tail replica syncup rollback (REP-1)
 
 **Status**: the *durable rollback machinery* (REP-1 STEPS 1-4) and the *live
