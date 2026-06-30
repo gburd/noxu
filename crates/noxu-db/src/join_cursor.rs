@@ -10,13 +10,15 @@
 //! The join algorithm is a faithful port of 's natural-join algorithm:
 //!
 //! 1. Iterate through all candidate primary keys from cursor C(0) —
-//!    in are the "duplicate" records sharing C(0)'s secondary key.
-//!    In Noxu's current one-to-one secondary model there is at most one
-//!    candidate per secondary key position.
+//!    these are the "duplicate" records sharing C(0)'s secondary key.
+//!    For sorted-dup secondaries there may be many primary keys per
+//!    secondary key; cursor C(0) walks its whole duplicate set.
 //!
 //! 2. For each candidate primary key, probe cursors C(1) through C(n) to
 //!    confirm the candidate also appears in each of their secondary keys.
-//!    The probe does **not** read the primary database.
+//!    Each probe is a `search(secKey, candidatePK, SearchMode::BOTH)`
+//!    over the dup set ( JoinCursor.retrieveNext) and does **not** read
+//!    the primary database.
 //!
 //! 3. If all probes succeed, optionally read the primary record and
 //!    return the key (and data if requested).
@@ -102,9 +104,10 @@ impl<'a> JoinCursor<'a> {
             cursors = sorted;
         }
 
-        // Collect the initial set of candidate primary keys from cursor[0].
-        //  these are all "duplicate" records with the same secondary key.
-        // In Noxu's current one-to-one secondary model there is at most one.
+        // Collect the initial set of candidate primary keys from cursor[0]:
+        // all "duplicate" records sharing cursor[0]'s secondary key.  For
+        // sorted-dup secondaries this drains the whole dup set; for non-dup
+        // secondaries it yields a single candidate.
         let mut candidates = std::collections::VecDeque::new();
         if let Some(first) = cursors.first_mut()
             && let Some(pk) = first.get_current_primary_key_only()?
@@ -375,31 +378,91 @@ mod tests {
     // Tests
     // ------------------------------------------------------------------
 
-    /// Two secondary cursors positioned at keys where only pk1 matches both.
+    /// JoinCursor over **sorted-dup secondaries** with multiple primary
+    /// keys per secondary key (the common case).  Faithful to
+    /// `JoinCursor.retrieveNext`: cursor[0] walks its duplicate set for
+    /// candidate primary keys (getCurrent + NEXT_DUP) while cursors[1..]
+    /// probe each candidate with `search(secKey, candidatePK, BOTH)`.
+    /// The result is the natural-join intersection of the primary keys
+    /// present under BOTH secondary keys.
+    ///
+    /// Data layout (first byte = sec1 key, last byte = sec2 key):
+    ///   pk1 -> "AB": sec1='A' sec2='B'
+    ///   pk2 -> "AB": sec1='A' sec2='B'   (shares both with pk1)
+    ///   pk3 -> "AC": sec1='A' sec2='C'   (only sec1='A')
+    ///   pk4 -> "XB": sec1='X' sec2='B'   (only sec2='B')
+    ///
+    /// sec1['A'] = {pk1, pk2, pk3}   sec2['B'] = {pk1, pk2, pk4}
+    /// intersection sec1['A'] AND sec2['B'] = {pk1, pk2}.
+    #[test]
+    fn test_join_sorted_dup_intersection_multiple_primaries() {
+        let fix = Fixture::new();
+        fix.insert(b"pk1", b"AB");
+        fix.insert(b"pk2", b"AB");
+        fix.insert(b"pk3", b"AC");
+        fix.insert(b"pk4", b"XB");
+
+        let mut cursor1 = fix.sec1.open_cursor(None, None).unwrap();
+        {
+            let mut p_key = DatabaseEntry::new();
+            let mut data = DatabaseEntry::new();
+            let s = cursor1
+                .get_search_key(
+                    &DatabaseEntry::from_bytes(b"A"),
+                    &mut p_key,
+                    &mut data,
+                )
+                .unwrap();
+            assert_eq!(s, OperationStatus::Success);
+        }
+        let mut cursor2 = fix.sec2.open_cursor(None, None).unwrap();
+        {
+            let mut p_key = DatabaseEntry::new();
+            let mut data = DatabaseEntry::new();
+            let s = cursor2
+                .get_search_key(
+                    &DatabaseEntry::from_bytes(b"B"),
+                    &mut p_key,
+                    &mut data,
+                )
+                .unwrap();
+            assert_eq!(s, OperationStatus::Success);
+        }
+
+        let pri_guard = fix.primary.lock();
+        let mut join = pri_guard.join(vec![cursor1, cursor2], None).unwrap();
+
+        // Collect the full intersection and compare against the hand-computed
+        // expected set {pk1, pk2}.
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        let mut key = DatabaseEntry::new();
+        let mut data = DatabaseEntry::new();
+        while join.get_next(&mut key, &mut data).unwrap()
+            == OperationStatus::Success
+        {
+            got.push(key.get_data().unwrap().to_vec());
+        }
+        got.sort();
+        let expected: Vec<Vec<u8>> = vec![b"pk1".to_vec(), b"pk2".to_vec()];
+        assert_eq!(
+            got, expected,
+            "join intersection must be exactly {{pk1, pk2}}"
+        );
+    }
+
+    /// Single-match intersection over sorted-dup secondaries.
     ///
     /// Data layout:
     ///   pk1 → b"AB"  (first byte 'A', last byte 'B')
     ///   pk2 → b"AC"  (first byte 'A', last byte 'C')
     ///   pk3 → b"XB"  (first byte 'X', last byte 'B')
     ///
-    /// sec1 (first byte) at 'A' → {pk1, pk2}  (in the one-to-one model: pk1 only)
-    /// sec2 (last byte)  at 'B' → {pk1, pk3}  (in the one-to-one model: pk1 only)
+    /// sec1 (first byte) at 'A' → {pk1, pk2}
+    /// sec2 (last byte)  at 'B' → {pk1, pk3}
     /// Intersection → {pk1}
-    ///
-    /// Decision 1B (the 2026 review):
-    /// v1.5 secondaries are one-to-one, so the second primary that
-    /// resolves to the same secondary key now returns
-    /// `NoxuError::Unsupported` from `update_secondary` rather than
-    /// silently overwriting (audit finding C4).  This test exercises a
-    /// JoinCursor over distinct primaries that share secondary keys —
-    /// the v1.6 sorted-dup feature.  Re-enable when sorted-dup
-    /// secondaries land (audit finding F7).
     #[test]
-    #[ignore = "requires v1.6 sorted-dup secondaries; see Decision 1B / audit F7"]
     fn test_join_intersection_finds_single_match() {
         let fix = Fixture::new();
-        // In the one-to-one model sec1['A'] stores the last inserted 'A' record.
-        // Insert pk1 last so it is the record held by sec1['A'] and sec2['B'].
         fix.insert(b"pk2", b"AC");
         fix.insert(b"pk3", b"XB");
         fix.insert(b"pk1", b"AB");

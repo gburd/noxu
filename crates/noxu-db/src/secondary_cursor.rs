@@ -456,9 +456,9 @@ impl<'a> SecondaryCursor<'a> {
     }
 
     /// Returns an estimate of the number of primary keys that share the
-    /// current secondary key.  In the current one-to-one secondary model
-    /// this is always 0 or 1; with duplicate support it will reflect the
-    /// actual duplicate count.
+    /// current secondary key (the duplicate count at the current position).
+    /// For sorted-dup secondaries this reflects the actual number of
+    /// duplicates; for non-dup secondaries it is 0 or 1.
     pub(crate) fn count_estimate(&mut self) -> u64 {
         self.inner.count().unwrap_or_default()
     }
@@ -466,10 +466,9 @@ impl<'a> SecondaryCursor<'a> {
     /// Advances to the next record that has the **same** secondary key as
     /// the current position (i.e. the next "duplicate").
     ///
-    /// In the current one-to-one secondary model the cursor stores exactly
-    /// one primary key per secondary key, so this always returns
-    /// `NotFound`.  When full duplicate support is added this will iterate
-    /// the duplicate set.
+    /// For sorted-dup secondaries this walks the duplicate set; for non-dup
+    /// secondaries the cursor stores exactly one primary key per secondary
+    /// key, so this returns `NotFound` after the single record.
     pub(crate) fn get_next_dup(&mut self) -> Result<OperationStatus> {
         let Some(current_sk) = self.get_current_sec_key_bytes()? else {
             return Ok(OperationStatus::NotFound);
