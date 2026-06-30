@@ -21,11 +21,12 @@ use std::sync::Arc;
 use hashbrown::HashMap;
 
 use noxu_db::{
-    Database, DatabaseConfig, DatabaseEntry, Environment, Get, OperationStatus,
-    Put, Transaction,
+    Database, DatabaseConfig, DatabaseEntry, Environment, Get, Mutex,
+    OperationStatus, Put, SecondaryConfig, SecondaryDatabase, Transaction,
 };
 
 use crate::entity::{Entity, PrimaryKey};
+use crate::entity_serializer::EntitySerializer;
 use crate::error::{PersistError, Result};
 use crate::evolve::catalog::ClassCatalog;
 use crate::evolve::envelope;
@@ -60,7 +61,17 @@ use crate::store_config::StoreConfig;
 pub struct EntityStore<'env> {
     env: &'env Environment,
     config: StoreConfig,
-    databases: HashMap<String, Database>,
+    /// Primary entity databases, shared via `Arc<Mutex<Database>>` so that a
+    /// real persistent [`SecondaryDatabase`] can be opened against the same
+    /// primary handle (its automatic-maintenance fan-out only fires for
+    /// writes through that handle).  Mirrors JE's `Store.priIndexMap` where
+    /// each primary is a `Database` the secondaries associate with.
+    databases: HashMap<String, Arc<Mutex<Database>>>,
+    /// Opened secondary index databases, keyed by their full DB name.
+    /// Kept as strong `Arc`s so the secondaries stay **registered** with
+    /// their primary (the primary holds only a `Weak`).  Mirrors JE's
+    /// `Store.secIndexMap`.
+    secondaries: HashMap<String, Arc<SecondaryDatabase>>,
     /// The persistent class-version catalog.
     ///
     /// Lazily opened on first access to avoid disturbing recovery of
@@ -125,6 +136,7 @@ impl<'env> EntityStore<'env> {
             env,
             config,
             databases: HashMap::new(),
+            secondaries: HashMap::new(),
             catalog: None,
             mutations,
             evolve_config,
@@ -179,7 +191,7 @@ impl<'env> EntityStore<'env> {
     /// # Errors
     /// Returns an error if the store is not open, the database cannot be
     /// opened/created, or the entity configuration is invalid.
-    pub fn get_primary_index<K, E>(&mut self) -> Result<PrimaryIndex<'_, K, E>>
+    pub fn get_primary_index<K, E>(&mut self) -> Result<PrimaryIndex<K, E>>
     where
         K: PrimaryKey + Ord + Send + Sync + 'static,
         E: Entity<PrimaryKey = K> + Clone + Send + Sync + 'static,
@@ -224,7 +236,7 @@ impl<'env> EntityStore<'env> {
             db_config.set_transactional(self.config.transactional);
 
             let db = self.env.open_database(None, &db_name, &db_config)?;
-            self.databases.insert(db_name.clone(), db);
+            self.databases.insert(db_name.clone(), Arc::new(Mutex::new(db)));
         }
 
         // Run open-path evolution exactly once per entity-class per store
@@ -240,7 +252,10 @@ impl<'env> EntityStore<'env> {
             .get(&db_name)
             .ok_or_else(|| PersistError::IndexNotAvailable(db_name.clone()))?;
 
-        Ok(PrimaryIndex::with_mutations(db, Arc::clone(&self.mutations)))
+        Ok(PrimaryIndex::with_mutations(
+            Arc::clone(db),
+            Arc::clone(&self.mutations),
+        ))
     }
 
     /// Open-path evolution: compares persisted class version vs the
@@ -349,36 +364,121 @@ impl<'env> EntityStore<'env> {
         Ok(())
     }
 
-    /// Gets or creates a secondary index for an entity type.
+    /// Opens (creating and populating if necessary) a persistent,
+    /// transactional secondary index for an entity type.
     ///
-    /// The caller must have already called `get_primary_index` for the entity
-    /// type and must pass the resulting `PrimaryIndex` here so the secondary
-    /// index registration can be deposited into it.
+    /// This is the Rust analogue of JE's
+    /// `Store.openSecondaryDatabase` (`com.sleepycat.persist.impl.Store`):
+    /// it opens a real [`SecondaryDatabase`] associated with the entity's
+    /// primary database, installs a [`noxu_db::SecondaryKeyCreator`] built
+    /// from the supplied serializer + extractor (the analogue of JE's
+    /// `PersistKeyCreator`), and registers it with the primary so that
+    /// every `put` / `delete` maintains the secondary **inside the active
+    /// transaction**.  Aborting a transaction rolls the primary write and
+    /// the secondary update back together.
     ///
+    /// The secondary index DB is named `"{store}_{entity}_{name}"` and is
+    /// opened with sorted duplicates (so MANY_TO_ONE secondary keys can
+    /// map to multiple primaries) and `allow_populate` (so an existing
+    /// primary is back-filled when the secondary is first created).  It is
+    /// persistent: on store reopen it survives on disk and is **not**
+    /// rebuilt from scratch.
     ///
+    /// The caller must pass the [`PrimaryIndex`] obtained from
+    /// [`Self::get_primary_index`] for the same entity, plus the
+    /// [`EntitySerializer`] used to (de)serialise the entity and a closure
+    /// extracting the secondary key from an entity.
     ///
     /// # Type Parameters
-    /// * `SK` - The secondary key type
-    /// * `K` - The primary key type
-    /// * `E` - The entity type
+    /// * `SK` - The secondary key type (must implement [`PrimaryKey`] so it
+    ///   can be byte-encoded for the on-disk index).
+    /// * `K` - The primary key type.
+    /// * `E` - The entity type.
+    /// * `S` - The entity serializer (shared via `Arc` so the key creator
+    ///   can deserialise primary records on the write path).
     ///
     /// # Errors
-    /// Returns an error if the store is not open.
-    pub fn open_secondary_index<SK, K, E, F>(
+    /// Returns an error if the store is not open or the underlying
+    /// databases cannot be opened.
+    #[allow(clippy::type_complexity)]
+    pub fn open_secondary_index<SK, K, E, S, F>(
         &mut self,
-        primary: &mut PrimaryIndex<'_, K, E>,
+        primary: &mut PrimaryIndex<K, E>,
+        name: &str,
+        serializer: Arc<S>,
         extractor: F,
     ) -> Result<SecondaryIndex<SK, K, E>>
     where
-        SK: Ord + Clone + Send + Sync + 'static,
+        SK: PrimaryKey + Ord + Send + Sync + 'static,
         K: PrimaryKey + Ord + Send + Sync + 'static,
         E: Entity<PrimaryKey = K> + Clone + Send + Sync + 'static,
+        S: EntitySerializer<E> + Send + Sync + 'static,
         F: Fn(&E) -> Option<SK> + Send + Sync + 'static,
     {
         if !self.open {
             return Err(PersistError::StoreNotOpen);
         }
-        Ok(primary.open_secondary_index(extractor))
+
+        let sec_db_name =
+            format!("{}_{}_{}", self.config.store_name, E::entity_name(), name);
+
+        // Idempotent: a second open of the same logical secondary returns a
+        // fresh typed view over the already-registered SecondaryDatabase.
+        if let Some(existing) = self.secondaries.get(&sec_db_name) {
+            return Ok(SecondaryIndex::new(
+                Arc::clone(existing),
+                Arc::clone(&self.mutations),
+            ));
+        }
+
+        let primary_shared = Arc::clone(primary.database_shared());
+
+        // Inner index DB: sorted-dup, mirrors the primary's flags.
+        let mut inner_cfg = DatabaseConfig::new();
+        let effective_allow_create =
+            self.config.allow_create || self.config.read_only;
+        inner_cfg.set_allow_create(effective_allow_create);
+        inner_cfg.set_read_only(self.config.read_only);
+        inner_cfg.set_transactional(self.config.transactional);
+        inner_cfg = inner_cfg.with_sorted_duplicates(true);
+        let inner_db =
+            self.env.open_database(None, &sec_db_name, &inner_cfg)?;
+
+        // Build the PersistKeyCreator-equivalent.  It deserialises the
+        // primary record (peeling the class-version envelope, honouring
+        // schema evolution) and extracts + encodes the secondary key.
+        let mutations = Arc::clone(&self.mutations);
+        let ser_for_creator = Arc::clone(&serializer);
+        let deserialize: Arc<dyn Fn(&[u8]) -> Result<E> + Send + Sync> =
+            Arc::new(move |bytes: &[u8]| {
+                decode_entity_record::<E, S>(
+                    bytes,
+                    ser_for_creator.as_ref(),
+                    mutations.as_ref(),
+                )
+            });
+        let extractor_arc: Arc<dyn Fn(&E) -> Option<SK> + Send + Sync> =
+            Arc::new(extractor);
+        let key_creator =
+            crate::secondary_index::ExtractorKeyCreator::<SK, K, E>::new(
+                deserialize,
+                extractor_arc,
+            );
+
+        let sec_config = SecondaryConfig::new()
+            .with_allow_create(effective_allow_create)
+            .with_allow_populate(true)
+            .with_sorted_duplicates(true)
+            .with_key_creator(Box::new(key_creator));
+
+        let secondary = Arc::new(SecondaryDatabase::open(
+            primary_shared,
+            inner_db,
+            sec_config,
+        )?);
+        self.secondaries.insert(sec_db_name, Arc::clone(&secondary));
+
+        Ok(SecondaryIndex::new(secondary, Arc::clone(&self.mutations)))
     }
 
     /// Returns the store name.
@@ -523,10 +623,21 @@ impl<'env> EntityStore<'env> {
             return Err(PersistError::StoreNotOpen);
         }
 
-        // Close all databases
+        // Close all secondary index databases first (they hold the only
+        // strong `Arc<SecondaryDatabase>` references; dropping them also
+        // unregisters their `Weak` from the primary).  Then close the
+        // primaries.
         let mut close_errors = Vec::new();
+        for (name, sec) in self.secondaries.drain() {
+            if let Err(e) = sec.close() {
+                close_errors.push(format!("{}: {}", name, e));
+            }
+        }
         for (name, db) in self.databases.drain() {
-            if let Err(e) = db.close() {
+            // The store owns the only strong ref to each primary at this
+            // point (every `PrimaryIndex` borrowed it).  Locking and
+            // closing is safe.
+            if let Err(e) = db.lock().close() {
                 close_errors.push(format!("{}: {}", name, e));
             }
         }
@@ -589,7 +700,7 @@ enum EvolveAction {
 #[allow(clippy::too_many_arguments)]
 fn stream_evolve_class(
     env: &Environment,
-    db: &Database,
+    db: &Arc<Mutex<Database>>,
     entity_class: &str,
     target_version: u16,
     mutations: &Mutations,
@@ -604,7 +715,8 @@ fn stream_evolve_class(
         if transactional { Some(env.begin_transaction(None)?) } else { None };
     let txn_ref = txn.as_ref();
 
-    let mut cursor = db.open_cursor(txn_ref, None)?;
+    let db_guard = db.lock();
+    let mut cursor = db_guard.open_cursor(txn_ref, None)?;
 
     // Class-level deleter fires once we see any record that matches.
     let mut class_deleter_seen = false;
@@ -802,6 +914,40 @@ fn mutations_apply_to(mutations: &Mutations, entity_name: &str) -> bool {
     mutations
         .renamers()
         .any(|r| r.field_name().is_none() && r.new_name() == entity_name)
+}
+
+/// Decodes a full primary record (class-version envelope + payload) into an
+/// entity, honouring class-level Renamer mutations and dispatching to
+/// [`EntitySerializer::deserialize_versioned`].  Shared by the secondary
+/// key-creator bridge ([`crate::secondary_index::ExtractorKeyCreator`]) so
+/// the secondary key is extracted with the same semantics as
+/// `PrimaryIndex::get`.
+fn decode_entity_record<E, S>(
+    bytes: &[u8],
+    serializer: &S,
+    mutations: &Mutations,
+) -> Result<E>
+where
+    E: Entity,
+    S: EntitySerializer<E>,
+{
+    let dec = envelope::decode(bytes)?;
+    let expected_tag = E::entity_name();
+    if dec.class_tag != expected_tag {
+        let renamed = mutations.renamers().any(|r| {
+            r.field_name().is_none()
+                && r.class_name() == dec.class_tag
+                && r.new_name() == expected_tag
+        });
+        if !renamed {
+            return Err(PersistError::SerializationError(format!(
+                "entity class tag mismatch: on-disk '{}' != expected '{}' \
+                 (no Renamer registered)",
+                dec.class_tag, expected_tag,
+            )));
+        }
+    }
+    serializer.deserialize_versioned(dec.payload, dec.class_version, mutations)
 }
 
 impl Drop for EntityStore<'_> {

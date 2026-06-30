@@ -13,16 +13,20 @@
 //!    historical pre-v1.5 path that all in-tree callers still use.  This
 //!    is a regression guard.
 //!
-//! 3. The v1.5 in-memory secondary-index limitation (audit #10 / #11) is
-//!    documented behaviour: when a primary `put` happens inside an
-//!    explicit txn that is later aborted, the secondary map stays
-//!    updated (the limitation), and the `PersistError::SecondariesNotTransactional`
-//!    typed error message can be observed.  v1.6 will back secondaries
-//!    with a real `Database` to make them atomic with the txn.
+//! 3. **DPL secondary indexes are now transactional** (closes audit
+//!    #10 / #11).  DPL secondaries are real, persistent
+//!    `noxu_db::SecondaryDatabase`s maintained inside the active
+//!    transaction by the primary `put` / `delete` fan-out.  When a primary
+//!    `put` happens inside a txn that is later aborted, the secondary
+//!    index update rolls back **with** the primary.  This file pins that
+//!    correctness invariant (the headline test
+//!    `secondary_index_rolls_back_with_aborted_txn`).
+
+use std::sync::Arc;
 
 use noxu_db::{Environment, EnvironmentConfig};
 use noxu_persist::{
-    Entity, EntitySerializer, EntityStore, PersistError, PrimaryIndex, Result,
+    Entity, EntitySerializer, EntityStore, PrimaryIndex, Result,
     SecondaryIndex, StoreConfig,
 };
 use tempfile::TempDir;
@@ -260,96 +264,195 @@ fn iterators_with_none_auto_commit() {
 }
 
 // ===========================================================================
-// 3. Documents v1.5 limitation (audit #10 / #11): in-memory secondaries
-//    are NOT atomic with the user transaction.
+// 3. DPL secondary indexes are TRANSACTIONAL (closes audit #10 / #11).
+//    Secondaries are real persistent `noxu_db::SecondaryDatabase`s
+//    maintained inside the active txn by the primary put/delete fan-out.
 // ===========================================================================
 
-/// In v1.5 a secondary-keyed entity has its in-memory secondary map
-/// updated immediately on `put`, regardless of the surrounding txn.
-/// On `txn.abort()` the **primary** record is rolled back, but the
-/// **secondary map stays updated** — this test pins the documented
-/// behaviour so a future change either (a) fixes it (closing audit
-/// #10 / #11 in v1.6) and updates this test to assert the fixed
-/// behaviour, or (b) explicitly preserves the limitation knowing the
-/// test exists.
+/// HEADLINE correctness proof.
 ///
-/// The new `PersistError::SecondariesNotTransactional` is emitted as a
-/// `log::warn!` once per `PrimaryIndex` when this path is taken; the
-/// test additionally suppresses the matching `debug_assert!` via the
-/// documented opt-in env var so the suite remains green in debug
-/// builds.
+/// Register a DPL entity with a secondary index; inside a transaction,
+/// put an entity (updating the secondary), then **abort**.  The secondary
+/// index must NOT contain the rolled-back entry, and neither must the
+/// primary — the secondary update is atomic with the primary write.
+///
+/// Pre-fix (in-memory side `HashMap`): the secondary kept the stale entry
+/// after abort (the bug).  Post-fix (transactional `SecondaryDatabase`):
+/// the secondary is consistent with the aborted primary.
 #[test]
-fn secondary_index_update_is_not_atomic_with_txn_v1_5() {
-    // SAFETY (single-threaded test): set the documented opt-in before any
-    // PrimaryIndex method is invoked and unset it on the way out so
-    // neighbour tests are unaffected.  cargo runs tests in parallel by
-    // default but `set_var` is process-global; using `--test-threads=1`
-    // for this file would be heavy-handed, so we rely on the env var
-    // being a no-op for tests that don't use Some(&txn) + secondaries.
-    // SAFETY: `std::env::set_var` is `unsafe` on edition 2024 because
-    // setting environment variables is process-global and racy with
-    // threads that read env vars; we accept that this is best-effort
-    // and confined to debug-assert silencing.
-    unsafe {
-        std::env::set_var("NOXU_PERSIST_ALLOW_NON_TXN_SECONDARIES", "1");
-    }
-
+fn secondary_index_rolls_back_with_aborted_txn() {
     let (_td, env) = make_txn_env();
     let mut store = make_txn_store(&env);
     let mut index: PrimaryIndex<u64, Widget> =
         store.get_primary_index().unwrap();
-    let ser = WidgetSer;
+    let ser = Arc::new(WidgetSer);
 
-    // Register a secondary index keyed by colour.
-    let by_color: SecondaryIndex<String, u64, Widget> =
-        index.open_secondary_index(|w: &Widget| Some(w.color.clone()));
+    // Open a real, transactional secondary index keyed by colour.
+    let by_color: SecondaryIndex<String, u64, Widget> = store
+        .open_secondary_index(
+            &mut index,
+            "by_color",
+            Arc::clone(&ser),
+            |w: &Widget| Some(w.color.clone()),
+        )
+        .unwrap();
 
-    // Inside an aborted txn: write a Widget with colour "rare".
+    // Inside a txn: write a Widget with colour "rare".
     let txn = env.begin_transaction(None).unwrap();
-    index.put(Some(&txn), &ser, &widget(100, "secret", "rare")).unwrap();
-    // Inside the txn the secondary already shows the new entry.
-    assert!(by_color.contains(&"rare".to_string()));
+    index
+        .put(Some(&txn), ser.as_ref(), &widget(100, "secret", "rare"))
+        .unwrap();
+    // Inside the txn the secondary already shows the new entry (the
+    // maintenance ran under `txn`).
+    assert!(
+        by_color.contains_txn(Some(&txn), &"rare".to_string()).unwrap(),
+        "inside the txn the secondary should reflect the uncommitted write"
+    );
     txn.abort().unwrap();
 
     // Primary record was rolled back.
     assert!(
-        index.get(None, &ser, &100u64).unwrap().is_none(),
+        index.get(None, ser.as_ref(), &100u64).unwrap().is_none(),
         "primary write inside an aborted txn must NOT be visible"
     );
 
-    // Secondary map is the documented v1.5 limitation: it is NOT rolled
-    // back.  The pre-existing entry stays in the in-memory BTreeMap.
-    // This test assertion intentionally pins the limitation; v1.6 will
-    // back secondaries with a real Database and this assertion will
-    // flip to `assert!(!by_color.contains(...))`.
+    // THE FIX: the secondary index is rolled back together with the
+    // primary — it must NOT contain the stale "rare" entry.
     assert!(
-        by_color.contains(&"rare".to_string()),
-        "v1.5 limitation: secondary index is in-memory and is NOT rolled \
-         back on txn.abort(); see PersistError::SecondariesNotTransactional"
+        !by_color.contains(&"rare".to_string()),
+        "secondary index must roll back with the aborted primary write \
+         (DPL secondaries are now transactional)"
     );
+    assert!(
+        by_color
+            .get(None, ser.as_ref(), &index, &"rare".to_string())
+            .unwrap()
+            .is_none(),
+        "secondary join must return None after abort"
+    );
+}
 
-    // SAFETY: edition-2024 requires unsafe for std::env::remove_var;
-    // this is test-only code that resets the env var set earlier in this test.
-    unsafe {
-        std::env::remove_var("NOXU_PERSIST_ALLOW_NON_TXN_SECONDARIES");
+/// A committed txn's secondary update IS visible after commit.
+#[test]
+fn secondary_index_visible_after_committed_txn() {
+    let (_td, env) = make_txn_env();
+    let mut store = make_txn_store(&env);
+    let mut index: PrimaryIndex<u64, Widget> =
+        store.get_primary_index().unwrap();
+    let ser = Arc::new(WidgetSer);
+
+    let by_color: SecondaryIndex<String, u64, Widget> = store
+        .open_secondary_index(
+            &mut index,
+            "by_color",
+            Arc::clone(&ser),
+            |w: &Widget| Some(w.color.clone()),
+        )
+        .unwrap();
+
+    let txn = env.begin_transaction(None).unwrap();
+    index.put(Some(&txn), ser.as_ref(), &widget(7, "lamp", "teal")).unwrap();
+    txn.commit().unwrap();
+
+    // After commit the secondary is visible to a fresh auto-commit read.
+    assert!(by_color.contains(&"teal".to_string()));
+    let found =
+        by_color.get(None, ser.as_ref(), &index, &"teal".to_string()).unwrap();
+    assert_eq!(found.map(|w| w.id), Some(7));
+}
+
+/// A secondary query after store reopen works: the secondary is
+/// persistent (survives — it is not rebuilt from scratch).
+#[test]
+fn secondary_index_persists_across_reopen() {
+    let (_td, env) = make_txn_env();
+    // Phase 1: write + index, then close the store.
+    {
+        let mut store = make_txn_store(&env);
+        let mut index: PrimaryIndex<u64, Widget> =
+            store.get_primary_index().unwrap();
+        let ser = Arc::new(WidgetSer);
+        let _by_color: SecondaryIndex<String, u64, Widget> = store
+            .open_secondary_index(
+                &mut index,
+                "by_color",
+                Arc::clone(&ser),
+                |w: &Widget| Some(w.color.clone()),
+            )
+            .unwrap();
+        index.put(None, ser.as_ref(), &widget(42, "chair", "olive")).unwrap();
+        store.close().unwrap();
+    }
+
+    // Phase 2: reopen the store + secondary; the entry must be found via
+    // the secondary key without re-inserting it.
+    {
+        let mut store = EntityStore::open(
+            &env,
+            StoreConfig::new("widgetstore")
+                .with_allow_create(true)
+                .with_transactional(true),
+        )
+        .unwrap();
+        let mut index: PrimaryIndex<u64, Widget> =
+            store.get_primary_index().unwrap();
+        let ser = Arc::new(WidgetSer);
+        let by_color: SecondaryIndex<String, u64, Widget> = store
+            .open_secondary_index(
+                &mut index,
+                "by_color",
+                Arc::clone(&ser),
+                |w: &Widget| Some(w.color.clone()),
+            )
+            .unwrap();
+        let found = by_color
+            .get(None, ser.as_ref(), &index, &"olive".to_string())
+            .unwrap();
+        assert_eq!(
+            found.map(|w| w.id),
+            Some(42),
+            "secondary index must survive store reopen (persistent)"
+        );
     }
 }
 
-/// The typed error variant carries the documented message and prints
-/// usefully.
+/// `delete_with_entity(Some(&txn), …)` cascades to the secondary inside
+/// the txn; an abort restores both primary and secondary.
 #[test]
-fn secondaries_not_transactional_error_message() {
-    let err = PersistError::SecondariesNotTransactional;
-    let msg = err.to_string();
+fn secondary_index_delete_rolls_back_with_aborted_txn() {
+    let (_td, env) = make_txn_env();
+    let mut store = make_txn_store(&env);
+    let mut index: PrimaryIndex<u64, Widget> =
+        store.get_primary_index().unwrap();
+    let ser = Arc::new(WidgetSer);
+
+    let by_color: SecondaryIndex<String, u64, Widget> = store
+        .open_secondary_index(
+            &mut index,
+            "by_color",
+            Arc::clone(&ser),
+            |w: &Widget| Some(w.color.clone()),
+        )
+        .unwrap();
+
+    // Seed (auto-commit) one Widget.
+    index.put(None, ser.as_ref(), &widget(9, "box", "cyan")).unwrap();
+    assert!(by_color.contains(&"cyan".to_string()));
+
+    // Delete inside a txn, then abort.
+    let txn = env.begin_transaction(None).unwrap();
+    index.delete_with_entity(Some(&txn), ser.as_ref(), &9u64).unwrap();
+    txn.abort().unwrap();
+
+    // Both primary and secondary are restored.
+    assert!(index.get(None, ser.as_ref(), &9u64).unwrap().is_some());
     assert!(
-        msg.contains("in-memory") && msg.contains("transaction"),
-        "error message should explain the limitation; got {msg:?}"
+        by_color.contains(&"cyan".to_string()),
+        "secondary entry must be restored when the delete txn aborts"
     );
 }
 
-/// Without secondaries registered, the warning path is never taken —
-/// `put(Some(&txn), …)` must succeed silently regardless of the
-/// `NOXU_PERSIST_ALLOW_NON_TXN_SECONDARIES` env var.
+/// Without secondaries registered, `put(Some(&txn), …)` succeeds.
 #[test]
 fn put_with_txn_without_secondaries_does_not_warn() {
     let (_td, env) = make_txn_env();
@@ -358,8 +461,6 @@ fn put_with_txn_without_secondaries_does_not_warn() {
     let ser = WidgetSer;
 
     let txn = env.begin_transaction(None).unwrap();
-    // No secondaries registered, so the warning + debug_assert path is
-    // bypassed. This must succeed even without the env-var opt-in.
     index.put(Some(&txn), &ser, &widget(50, "phi", "magenta")).unwrap();
     txn.commit().unwrap();
 

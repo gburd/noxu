@@ -3,35 +3,45 @@
 
 use std::marker::PhantomData;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
-use noxu_db::{Database, DatabaseEntry, OperationStatus, Transaction};
+use noxu_db::{Database, DatabaseEntry, Mutex, OperationStatus, Transaction};
 
 use crate::entity::{Entity, PrimaryKey};
 use crate::entity_serializer::EntitySerializer;
 use crate::error::{PersistError, Result};
 use crate::evolve::envelope;
 use crate::evolve::mutations::Mutations;
-use crate::secondary_index::{
-    SecondaryIndex, SecondaryIndexMaintainer, SecondaryRegistration,
-    make_secondary_index,
-};
 
 /// Typed access to entities by primary key.
 ///
-/// A `PrimaryIndex` wraps a `Database` handle and provides typed get, put,
-/// and delete operations for entities. The serializer is passed to each
-/// method call rather than stored in the index, allowing different
-/// serialization strategies to be used with the same index.
+/// A `PrimaryIndex` wraps a primary [`Database`] (shared via
+/// `Arc<Mutex<Database>>`) and provides typed get, put, and delete
+/// operations for entities.  The serializer is passed to each method call
+/// rather than stored in the index, allowing different serialization
+/// strategies to be used with the same index.
 ///
+/// # Secondary index maintenance
 ///
+/// Secondary indexes are real, persistent, transactional
+/// [`noxu_db::SecondaryDatabase`]s opened against this primary via
+/// [`crate::EntityStore::open_secondary_index`] (the JE
+/// `Store.openSecondaryDatabase` model).  They are maintained
+/// **automatically** by the primary database's `put` / `delete` within the
+/// active transaction — there is no in-memory side index to keep in sync
+/// and no `on_put` / `on_delete` callback list on `PrimaryIndex`.
 ///
 /// # Type Parameters
 ///
 /// * `K` - The primary key type (must implement `PrimaryKey`)
 /// * `E` - The entity type (must implement `Entity` with `PrimaryKey = K`)
-pub struct PrimaryIndex<'db, K: PrimaryKey, E: Entity<PrimaryKey = K>> {
-    db: &'db Database,
+pub struct PrimaryIndex<K: PrimaryKey, E: Entity<PrimaryKey = K>> {
+    /// The primary database, owned via a shared `Arc<Mutex<Database>>` so a
+    /// [`noxu_db::SecondaryDatabase`] can be opened against the *same*
+    /// handle and its automatic-maintenance fan-out fires on every `put` /
+    /// `delete` performed here.  Owning (rather than borrowing) the `Arc`
+    /// keeps the index independent of the `EntityStore`'s borrow, so a
+    /// secondary can be opened while the primary index is alive.
+    db: Arc<Mutex<Database>>,
     /// Schema-evolution mutations.
     ///
     /// Plumbed in from `EntityStore` via [`PrimaryIndex::with_mutations`].
@@ -43,49 +53,30 @@ pub struct PrimaryIndex<'db, K: PrimaryKey, E: Entity<PrimaryKey = K>> {
     /// `deserialize_versioned`'s default impl behave identically to
     /// `deserialize`.
     mutations: Arc<Mutations>,
-    /// Secondary index maintainers registered via `open_secondary_index`.
-    ///
-    /// Each secondary index deposits a `SecondaryRegistration` here. On every
-    /// `put` / `delete_with_entity` every maintainer is notified so the
-    /// secondary maps stay in sync with the primary store — mirroring the
-    /// `SecondaryDatabase` auto-maintenance.
-    secondaries: Vec<Box<dyn SecondaryIndexMaintainer<K, E> + Send + Sync>>,
-    /// One-shot guard: have we already warned the operator that secondary
-    /// updates are not atomic with the user transaction?  Set the first
-    /// time `put` / `delete_with_entity` is called with `Some(&txn)` while
-    /// `secondaries` is non-empty.  See
-    /// `PersistError::SecondariesNotTransactional`.
-    warned_secondaries_non_txn: AtomicBool,
     _phantom: PhantomData<(K, E)>,
 }
 
-impl<'db, K, E> PrimaryIndex<'db, K, E>
+impl<K, E> PrimaryIndex<K, E>
 where
     K: PrimaryKey + Ord + Send + Sync + 'static,
     E: Entity<PrimaryKey = K> + Clone + Send + Sync + 'static,
 {
-    /// Creates a new `PrimaryIndex` wrapping the given database.
+    /// Creates a new `PrimaryIndex` over the given shared database.
     ///
     /// The new index has no [`Mutations`] registered; field-level
     /// schema evolution will not be available on read.  Use
     /// [`Self::with_mutations`] to attach a mutations set.
-    pub fn new(db: &'db Database) -> Self {
+    pub fn new(db: Arc<Mutex<Database>>) -> Self {
         Self::with_mutations(db, Arc::new(Mutations::new()))
     }
 
-    /// Creates a new `PrimaryIndex` wrapping the given database and
+    /// Creates a new `PrimaryIndex` over the given shared database and
     /// remembering the mutations set for read-side evolution.
     pub fn with_mutations(
-        db: &'db Database,
+        db: Arc<Mutex<Database>>,
         mutations: Arc<Mutations>,
     ) -> Self {
-        Self {
-            db,
-            mutations,
-            secondaries: Vec::new(),
-            warned_secondaries_non_txn: AtomicBool::new(false),
-            _phantom: PhantomData,
-        }
+        Self { db, mutations, _phantom: PhantomData }
     }
 
     /// Returns a clone of the registered mutations Arc.
@@ -93,105 +84,17 @@ where
         &self.mutations
     }
 
-    /// Emit a one-shot operator warning when a primary write occurs inside
-    /// an explicit transaction while in-memory secondary indexes are
-    /// registered.
+    /// Returns the shared primary database handle.
     ///
-    /// In v1.5 secondary mutations are applied immediately on the primary
-    /// write regardless of the transaction's commit/abort outcome (see
-    /// `PersistError::SecondariesNotTransactional`).  The warning is rate-
-    /// limited to once per `PrimaryIndex` to keep logs sane in hot paths.
-    fn warn_secondaries_not_txn_once(&self, txn: Option<&Transaction>) {
-        if txn.is_none() || self.secondaries.is_empty() {
-            return;
-        }
-        if self
-            .warned_secondaries_non_txn
-            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-        {
-            // Construct the typed error so the message is the canonical one
-            // documented on PersistError, but emit it as a warning rather
-            // than returning it (the call still succeeds).
-            log::warn!(
-                target: "noxu_persist",
-                "{} (entity: {})",
-                PersistError::SecondariesNotTransactional,
-                E::entity_name(),
-            );
-            // The `debug_assert` makes the limitation surface in tests so
-            // callers reviewing entity wiring see the issue at runtime,
-            // matching the audit's request for a "warning in the
-            // secondary-update path".  Tests that legitimately exercise
-            // the txn + secondary path can opt out by setting
-            // `NOXU_PERSIST_ALLOW_NON_TXN_SECONDARIES=1`.
-            debug_assert!(
-                std::env::var("NOXU_PERSIST_ALLOW_NON_TXN_SECONDARIES").is_ok(),
-                "DPL: primary write inside an explicit transaction while \
-                 in-memory secondary indexes are registered (entity {}). \
-                 Set NOXU_PERSIST_ALLOW_NON_TXN_SECONDARIES=1 to silence \
-                 this debug assertion. v1.6 will back secondaries with a \
-                 real Database.",
-                E::entity_name(),
-            );
-        }
+    /// Used by [`crate::EntityStore::open_secondary_index`] to open a
+    /// [`noxu_db::SecondaryDatabase`] against the *same* primary handle
+    /// these writes go through, so automatic maintenance fires.
+    pub fn database_shared(&self) -> &Arc<Mutex<Database>> {
+        &self.db
     }
 
     // -----------------------------------------------------------------------
-    // Secondary index factory
-    // -----------------------------------------------------------------------
-
-    /// Opens (creates) a secondary index backed by the given key-extractor.
-    ///
-    /// The returned `SecondaryIndex` is automatically kept in sync with this
-    /// `PrimaryIndex`: every `put` and `delete_with_entity` updates the
-    /// secondary map.
-    ///
-    ///
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use noxu_persist::{Entity, PrimaryKey, PrimaryIndex, EntitySerializer, Result};
-    /// # use noxu_persist::secondary_index::SecondaryIndex;
-    /// # use noxu_db::{Database, DatabaseConfig, Environment, EnvironmentConfig};
-    /// # use tempfile::TempDir;
-    /// # #[derive(Clone, Debug, PartialEq)]
-    /// # struct User { id: u64, department: String }
-    /// # impl Entity for User {
-    /// #     type PrimaryKey = u64;
-    /// #     fn primary_key(&self) -> &u64 { &self.id }
-    /// #     fn entity_name() -> &'static str { "User" }
-    /// # }
-    /// # struct Ser;
-    /// # impl EntitySerializer<User> for Ser {
-    /// #     fn serialize(&self, _: &User) -> Result<Vec<u8>> { Ok(vec![]) }
-    /// #     fn deserialize(&self, _: &[u8]) -> Result<User> { unimplemented!() }
-    /// # }
-    /// # let td = TempDir::new().unwrap();
-    /// # let env = Environment::open(EnvironmentConfig::new(td.path().to_path_buf()).with_allow_create(true)).unwrap();
-    /// # let db = env.open_database(None, "u", &DatabaseConfig::new().with_allow_create(true).with_transactional(true)).unwrap();
-    /// let mut primary: PrimaryIndex<u64, User> = PrimaryIndex::new(&db);
-    /// let dept_idx = primary.open_secondary_index(|u: &User| Some(u.department.clone()));
-    /// ```
-    pub fn open_secondary_index<SK, F>(
-        &mut self,
-        extractor: F,
-    ) -> SecondaryIndex<SK, K, E>
-    where
-        SK: Ord + Clone + Send + Sync + 'static,
-        F: Fn(&E) -> Option<SK> + Send + Sync + 'static,
-    {
-        let (index, reg): (
-            SecondaryIndex<SK, K, E>,
-            SecondaryRegistration<SK, K, E>,
-        ) = make_secondary_index(extractor);
-        self.secondaries.push(Box::new(reg));
-        index
-    }
-
-    // -----------------------------------------------------------------------
-    // Read operations (unchanged from original)
+    // Read operations
     // -----------------------------------------------------------------------
 
     /// Retrieves an entity by its primary key.
@@ -218,7 +121,7 @@ where
         let key_entry = DatabaseEntry::from_vec(key.to_bytes());
         let mut data_entry = DatabaseEntry::new();
 
-        let status = self.db.get(txn, &key_entry, &mut data_entry)?;
+        let status = self.db.lock().get(txn, &key_entry, &mut data_entry)?;
 
         match status {
             OperationStatus::Success => {
@@ -283,22 +186,16 @@ where
 
     /// Stores an entity, inserting or updating as needed.
     ///
-    /// All registered secondary indexes are updated automatically.
+    /// All secondary indexes opened against this primary are maintained
+    /// **automatically and transactionally** by the underlying
+    /// [`noxu_db::Database::put`] fan-out (the JE associate()-style hook).
     ///
     /// # Transactions
     ///
-    /// Pass `Some(&txn)` to participate in an explicit transaction (the
-    /// primary-database write commits/aborts atomically with the txn).
-    /// Pass `None` for auto-commit.
-    ///
-    /// **v1.5 limitation:** registered secondary indexes are in-memory
-    /// only and are *not* atomic with the user transaction — the
-    /// secondary-map updates are applied immediately on this call
-    /// regardless of whether the caller later commits or aborts.  See
-    /// `PersistError::SecondariesNotTransactional`.  Calling this method
-    /// with `Some(&txn)` while at least one secondary index is
-    /// registered emits a one-shot `log::warn!`.  v1.6 backs secondary
-    /// indexes with a real `Database` to close this gap.
+    /// Pass `Some(&txn)` to participate in an explicit transaction.  The
+    /// primary-database write **and every secondary index update** commit /
+    /// abort atomically with the txn — aborting rolls back both.  Pass
+    /// `None` for auto-commit.
     ///
     /// # Errors
     /// Returns an error if serialization or the database operation fails.
@@ -308,12 +205,6 @@ where
         serializer: &S,
         entity: &E,
     ) -> Result<()> {
-        self.warn_secondaries_not_txn_once(txn);
-
-        // Fetch the existing entity so secondary maintainers can remove the
-        // stale secondary key mapping (mirrors old-value callback).
-        let old_entity = self.get(txn, serializer, entity.primary_key())?;
-
         let key_bytes = entity.primary_key().to_bytes();
         let key_entry = DatabaseEntry::from_vec(key_bytes);
         let payload = serializer.serialize(entity)?;
@@ -321,14 +212,9 @@ where
             envelope::encode(E::class_version(), E::entity_name(), &payload)?;
         let data_entry = DatabaseEntry::from_vec(envelope_bytes);
 
-        self.db.put(txn, &key_entry, &data_entry)?;
-
-        // Notify all secondary maintainers.
-        // NOTE: in v1.5 this happens *eagerly* and is NOT rolled back if
-        // `txn` is later aborted — see `SecondariesNotTransactional`.
-        for m in &self.secondaries {
-            m.on_put(old_entity.as_ref(), entity);
-        }
+        // The Database::put fan-out drives every registered SecondaryDatabase
+        // under the same `txn`, so secondaries are atomic with the primary.
+        self.db.lock().put(txn, &key_entry, &data_entry)?;
 
         Ok(())
     }
@@ -336,10 +222,10 @@ where
     /// Stores an entity only if the primary key does not already exist.
     ///
     /// Returns `true` if the entity was inserted, `false` if the key already
-    /// exists. Secondary indexes are updated on successful insert.
+    /// exists.  Secondary indexes are maintained automatically and
+    /// transactionally on a successful insert.
     ///
-    /// See [`PrimaryIndex::put`] for the transactional semantics; the same
-    /// v1.5 secondary-index limitation applies.
+    /// See [`PrimaryIndex::put`] for the transactional semantics.
     ///
     /// # Errors
     /// Returns an error if serialization or the database operation fails.
@@ -349,8 +235,6 @@ where
         serializer: &S,
         entity: &E,
     ) -> Result<bool> {
-        self.warn_secondaries_not_txn_once(txn);
-
         let key_bytes = entity.primary_key().to_bytes();
         let key_entry = DatabaseEntry::from_vec(key_bytes);
         let payload = serializer.serialize(entity)?;
@@ -358,17 +242,9 @@ where
             envelope::encode(E::class_version(), E::entity_name(), &payload)?;
         let data_entry = DatabaseEntry::from_vec(envelope_bytes);
 
-        let status = self.db.put_no_overwrite(txn, &key_entry, &data_entry)?;
-        let inserted = status == OperationStatus::Success;
-
-        if inserted {
-            // New insert – no old entity.
-            for m in &self.secondaries {
-                m.on_put(None, entity);
-            }
-        }
-
-        Ok(inserted)
+        let status =
+            self.db.lock().put_no_overwrite(txn, &key_entry, &data_entry)?;
+        Ok(status == OperationStatus::Success)
     }
 
     /// Deletes an entity by its primary key.
@@ -376,9 +252,11 @@ where
     /// Returns `true` if the entity was deleted, `false` if no entity with
     /// the given key existed.
     ///
-    /// **Note:** Secondary indexes are **not** updated by this method because
-    /// no entity is fetched. Use `delete_with_entity` when secondary index
-    /// maintenance is required.
+    /// Secondary indexes are maintained automatically and transactionally
+    /// by the underlying [`noxu_db::Database::delete`] fan-out — unlike the
+    /// historical in-memory design, this method now keeps secondaries
+    /// consistent without a separate fetch.  [`Self::delete_with_entity`]
+    /// remains for callers that also want the removed entity returned.
     ///
     /// # Transactions
     ///
@@ -389,40 +267,31 @@ where
     /// Returns an error if the database operation fails.
     pub fn delete(&self, txn: Option<&Transaction>, key: &K) -> Result<bool> {
         let key_entry = DatabaseEntry::from_vec(key.to_bytes());
-        let status = self.db.delete(txn, &key_entry)?;
+        let status = self.db.lock().delete(txn, &key_entry)?;
         Ok(status == OperationStatus::Success)
     }
 
-    /// Deletes an entity by its primary key, also updating secondary indexes.
+    /// Deletes an entity by its primary key.
     ///
-    /// Fetches the entity first so secondary maintainers receive the old
-    /// value. This is the preferred delete path when secondary indexes have
-    /// been registered.
+    /// Equivalent to [`Self::delete`] (secondary indexes are now maintained
+    /// automatically by the primary delete); retained for source
+    /// compatibility with the historical in-memory API where a separate
+    /// fetch was needed to notify secondary maintainers.
     ///
     /// Returns `true` if an entity was deleted, `false` if the key did not
     /// exist.
     ///
-    /// See [`PrimaryIndex::put`] for the transactional semantics; the same
-    /// v1.5 secondary-index limitation applies.
+    /// See [`PrimaryIndex::put`] for the transactional semantics.
     ///
     /// # Errors
-    /// Returns an error if the database operation fails or deserialization fails.
+    /// Returns an error if the database operation fails.
     pub fn delete_with_entity<S: EntitySerializer<E>>(
         &self,
         txn: Option<&Transaction>,
-        serializer: &S,
+        _serializer: &S,
         key: &K,
     ) -> Result<bool> {
-        self.warn_secondaries_not_txn_once(txn);
-
-        let old_entity = self.get(txn, serializer, key)?;
-        let deleted = self.delete(txn, key)?;
-        if deleted && let Some(ref e) = old_entity {
-            for m in &self.secondaries {
-                m.on_delete(e);
-            }
-        }
-        Ok(deleted)
+        self.delete(txn, key)
     }
 
     // -----------------------------------------------------------------------
@@ -439,7 +308,7 @@ where
     pub fn contains(&self, txn: Option<&Transaction>, key: &K) -> Result<bool> {
         let key_entry = DatabaseEntry::from_vec(key.to_bytes());
         let mut data_entry = DatabaseEntry::new();
-        let status = self.db.get(txn, &key_entry, &mut data_entry)?;
+        let status = self.db.lock().get(txn, &key_entry, &mut data_entry)?;
         Ok(status == OperationStatus::Success)
     }
 
@@ -450,7 +319,7 @@ where
     /// # Errors
     /// Returns an error if the database operation fails.
     pub fn count(&self) -> Result<u64> {
-        Ok(self.db.count()?)
+        Ok(self.db.lock().count()?)
     }
 
     // -----------------------------------------------------------------------
@@ -469,7 +338,7 @@ where
         txn: Option<&Transaction>,
         serializer: &'a S,
     ) -> Result<EntityIterator<'a, K, E, S>> {
-        let cursor = self.db.open_cursor(txn, None)?;
+        let cursor = self.db.lock().open_cursor(txn, None)?;
         Ok(EntityIterator {
             cursor,
             serializer,
@@ -491,7 +360,7 @@ where
         &self,
         txn: Option<&Transaction>,
     ) -> Result<KeyIterator<'_, K>> {
-        let cursor = self.db.open_cursor(txn, None)?;
+        let cursor = self.db.lock().open_cursor(txn, None)?;
         Ok(KeyIterator {
             cursor,
             started: false,
@@ -500,9 +369,13 @@ where
         })
     }
 
-    /// Returns a reference to the underlying database.
-    pub fn database(&self) -> &'db Database {
-        self.db
+    /// Returns the shared primary database handle (clone of the `Arc`).
+    ///
+    /// (Conceptually renamed from the historical `database()` returning a
+    /// bare `&Database`; the index now owns a shared
+    /// `Arc<Mutex<Database>>`.)
+    pub fn database(&self) -> Arc<Mutex<Database>> {
+        Arc::clone(&self.db)
     }
 }
 
@@ -771,7 +644,7 @@ mod tests {
         }
     }
 
-    fn setup() -> (TempDir, Environment, Database) {
+    fn setup() -> (TempDir, Environment, Arc<Mutex<Database>>) {
         let temp_dir = TempDir::new().unwrap();
         let env_config = EnvironmentConfig::new(temp_dir.path().to_path_buf())
             .with_allow_create(true);
@@ -780,7 +653,7 @@ mod tests {
             .with_allow_create(true)
             .with_transactional(true);
         let db = env.open_database(None, "users", &db_config).unwrap();
-        (temp_dir, env, db)
+        (temp_dir, env, Arc::new(Mutex::new(db)))
     }
 
     fn test_user(id: u64) -> User {
@@ -794,7 +667,7 @@ mod tests {
     #[test]
     fn test_put_and_get() {
         let (_td, _env, db) = setup();
-        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(&db);
+        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(Arc::clone(&db));
         let ser = UserSerializer;
 
         let user = test_user(1);
@@ -807,7 +680,7 @@ mod tests {
     #[test]
     fn test_get_not_found() {
         let (_td, _env, db) = setup();
-        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(&db);
+        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(Arc::clone(&db));
         let ser = UserSerializer;
 
         let found = index.get(None, &ser, &999u64).unwrap();
@@ -817,7 +690,7 @@ mod tests {
     #[test]
     fn test_put_overwrites() {
         let (_td, _env, db) = setup();
-        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(&db);
+        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(Arc::clone(&db));
         let ser = UserSerializer;
 
         let user1 = test_user(1);
@@ -838,7 +711,7 @@ mod tests {
     #[test]
     fn test_put_no_overwrite_success() {
         let (_td, _env, db) = setup();
-        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(&db);
+        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(Arc::clone(&db));
         let ser = UserSerializer;
 
         let user = test_user(1);
@@ -849,7 +722,7 @@ mod tests {
     #[test]
     fn test_put_no_overwrite_fails_on_existing() {
         let (_td, _env, db) = setup();
-        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(&db);
+        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(Arc::clone(&db));
         let ser = UserSerializer;
 
         let user = test_user(1);
@@ -871,7 +744,7 @@ mod tests {
     #[test]
     fn test_delete() {
         let (_td, _env, db) = setup();
-        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(&db);
+        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(Arc::clone(&db));
         let ser = UserSerializer;
 
         let user = test_user(1);
@@ -887,7 +760,7 @@ mod tests {
     #[test]
     fn test_delete_not_found() {
         let (_td, _env, db) = setup();
-        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(&db);
+        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(Arc::clone(&db));
 
         let deleted = index.delete(None, &999u64).unwrap();
         assert!(!deleted);
@@ -896,7 +769,7 @@ mod tests {
     #[test]
     fn test_delete_with_entity() {
         let (_td, _env, db) = setup();
-        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(&db);
+        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(Arc::clone(&db));
         let ser = UserSerializer;
 
         let user = test_user(1);
@@ -910,7 +783,7 @@ mod tests {
     #[test]
     fn test_delete_with_entity_not_found() {
         let (_td, _env, db) = setup();
-        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(&db);
+        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(Arc::clone(&db));
         let ser = UserSerializer;
 
         let deleted = index.delete_with_entity(None, &ser, &999u64).unwrap();
@@ -920,7 +793,7 @@ mod tests {
     #[test]
     fn test_contains() {
         let (_td, _env, db) = setup();
-        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(&db);
+        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(Arc::clone(&db));
         let ser = UserSerializer;
 
         assert!(!index.contains(None, &1u64).unwrap());
@@ -934,7 +807,7 @@ mod tests {
     #[test]
     fn test_count_empty() {
         let (_td, _env, db) = setup();
-        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(&db);
+        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(Arc::clone(&db));
 
         assert_eq!(index.count().unwrap(), 0);
     }
@@ -942,7 +815,7 @@ mod tests {
     #[test]
     fn test_count_with_entities() {
         let (_td, _env, db) = setup();
-        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(&db);
+        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(Arc::clone(&db));
         let ser = UserSerializer;
 
         for i in 1..=5 {
@@ -955,7 +828,7 @@ mod tests {
     #[test]
     fn test_entities_iterator() {
         let (_td, _env, db) = setup();
-        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(&db);
+        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(Arc::clone(&db));
         let ser = UserSerializer;
 
         for i in 1..=3 {
@@ -978,7 +851,7 @@ mod tests {
     #[test]
     fn test_entities_iterator_empty() {
         let (_td, _env, db) = setup();
-        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(&db);
+        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(Arc::clone(&db));
         let ser = UserSerializer;
 
         let entities: Vec<User> = index
@@ -993,7 +866,7 @@ mod tests {
     #[test]
     fn test_multiple_put_delete_cycles() {
         let (_td, _env, db) = setup();
-        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(&db);
+        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(Arc::clone(&db));
         let ser = UserSerializer;
 
         // Insert, delete, re-insert
@@ -1015,8 +888,8 @@ mod tests {
     #[test]
     fn test_database_reference() {
         let (_td, _env, db) = setup();
-        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(&db);
-        assert_eq!(index.database().get_database_name(), "users");
+        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(Arc::clone(&db));
+        assert_eq!(index.database().lock().get_database_name(), "users");
     }
 
     // --- Additional branch-coverage tests ---
@@ -1025,7 +898,7 @@ mod tests {
     #[test]
     fn test_entity_iterator_done_returns_none() {
         let (_td, _env, db) = setup();
-        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(&db);
+        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(Arc::clone(&db));
         let ser = UserSerializer;
 
         // Empty database: first `next` sets done=true, second returns None.
@@ -1038,7 +911,7 @@ mod tests {
     #[test]
     fn test_entity_iterator_exhausted() {
         let (_td, _env, db) = setup();
-        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(&db);
+        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(Arc::clone(&db));
         let ser = UserSerializer;
 
         index.put(None, &ser, &test_user(1)).unwrap();
@@ -1056,7 +929,7 @@ mod tests {
     #[test]
     fn test_key_iterator_first_call_done() {
         let (_td, _env, db) = setup();
-        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(&db);
+        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(Arc::clone(&db));
         let ser = UserSerializer;
 
         index.put(None, &ser, &test_user(1)).unwrap();
@@ -1075,7 +948,7 @@ mod tests {
     #[test]
     fn test_key_iterator_empty_db() {
         let (_td, _env, db) = setup();
-        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(&db);
+        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(Arc::clone(&db));
 
         let mut iter = index.keys(None).unwrap();
         assert!(iter.next().is_none());
@@ -1086,7 +959,7 @@ mod tests {
     #[test]
     fn test_key_iterator_done_branch() {
         let (_td, _env, db) = setup();
-        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(&db);
+        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(Arc::clone(&db));
         let ser = UserSerializer;
 
         for i in 1u64..=3 {
@@ -1106,79 +979,50 @@ mod tests {
         assert!(iter.next().is_none());
     }
 
-    /// `open_secondary_index` with `put` and `delete_with_entity` exercises
-    /// the secondary notification paths.
+    /// `delete_with_entity` removes the record (secondary maintenance is
+    /// now driven by the underlying `Database::delete` fan-out, so this
+    /// behaves like `delete`).
     #[test]
-    fn test_secondary_index_notifications_on_put_and_delete() {
+    fn test_delete_with_entity_removes_record() {
         let (_td, _env, db) = setup();
-        let mut index: PrimaryIndex<u64, User> = PrimaryIndex::new(&db);
+        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(Arc::clone(&db));
         let ser = UserSerializer;
 
-        // Open a secondary index on name.
-        let name_idx =
-            index.open_secondary_index(|u: &User| Some(u.name.clone()));
-
-        let user = test_user(10);
-        index.put(None, &ser, &user).unwrap();
-        // Secondary should now contain the name.
-        assert!(name_idx.contains(&"User10".to_string()));
-
-        // Overwrite: put triggers on_put with old_entity set.
-        let updated = User {
-            id: 10,
-            name: "UpdatedUser10".to_string(),
-            email: "u@x.com".to_string(),
-        };
-        index.put(None, &ser, &updated).unwrap();
-        assert!(!name_idx.contains(&"User10".to_string()));
-        assert!(name_idx.contains(&"UpdatedUser10".to_string()));
-
-        // delete_with_entity: fetches entity and calls on_delete.
+        index.put(None, &ser, &test_user(10)).unwrap();
         let deleted = index.delete_with_entity(None, &ser, &10u64).unwrap();
         assert!(deleted);
-        assert!(!name_idx.contains(&"UpdatedUser10".to_string()));
+        assert_eq!(index.get(None, &ser, &10u64).unwrap(), None);
     }
 
-    /// `delete_with_entity` on non-existing key: deleted=false, secondaries NOT notified.
+    /// `delete_with_entity` on a non-existing key returns false.
     #[test]
-    fn test_delete_with_entity_missing_key_no_secondary_notify() {
+    fn test_delete_with_entity_missing_key_returns_false() {
         let (_td, _env, db) = setup();
-        let mut index: PrimaryIndex<u64, User> = PrimaryIndex::new(&db);
+        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(Arc::clone(&db));
         let ser = UserSerializer;
-
-        let _name_idx =
-            index.open_secondary_index(|u: &User| Some(u.name.clone()));
 
         let deleted = index.delete_with_entity(None, &ser, &999u64).unwrap();
         assert!(!deleted);
     }
 
-    /// `put_no_overwrite` with secondary index: only fires on_put when inserted.
+    /// `put_no_overwrite` inserts only when the key is absent.
     #[test]
-    fn test_put_no_overwrite_with_secondary() {
+    fn test_put_no_overwrite_insert_then_skip() {
         let (_td, _env, db) = setup();
-        let mut index: PrimaryIndex<u64, User> = PrimaryIndex::new(&db);
+        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(Arc::clone(&db));
         let ser = UserSerializer;
 
-        let name_idx =
-            index.open_secondary_index(|u: &User| Some(u.name.clone()));
-
         let user = test_user(5);
-        let inserted = index.put_no_overwrite(None, &ser, &user).unwrap();
-        assert!(inserted);
-        assert!(name_idx.contains(&"User5".to_string()));
-
-        // Second insert with same key: not inserted, secondary unchanged.
-        let inserted2 = index.put_no_overwrite(None, &ser, &user).unwrap();
-        assert!(!inserted2);
-        assert!(name_idx.contains(&"User5".to_string()));
+        assert!(index.put_no_overwrite(None, &ser, &user).unwrap());
+        // Second insert with same key: not inserted.
+        assert!(!index.put_no_overwrite(None, &ser, &user).unwrap());
     }
 
     /// `contains` returns the correct status.
     #[test]
     fn test_contains_after_delete() {
         let (_td, _env, db) = setup();
-        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(&db);
+        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(Arc::clone(&db));
         let ser = UserSerializer;
 
         index.put(None, &ser, &test_user(7)).unwrap();
@@ -1191,7 +1035,7 @@ mod tests {
     #[test]
     fn test_count_after_delete() {
         let (_td, _env, db) = setup();
-        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(&db);
+        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(Arc::clone(&db));
         let ser = UserSerializer;
 
         for i in 1u64..=4 {
@@ -1207,7 +1051,7 @@ mod tests {
     #[test]
     fn test_entities_iterator_many() {
         let (_td, _env, db) = setup();
-        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(&db);
+        let index: PrimaryIndex<u64, User> = PrimaryIndex::new(Arc::clone(&db));
         let ser = UserSerializer;
 
         for i in 1u64..=10 {
