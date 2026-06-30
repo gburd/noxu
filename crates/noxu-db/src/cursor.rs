@@ -236,17 +236,24 @@ impl Cursor {
             //
             // Implementing these properly is tracked for a later sprint.
             Get::SearchLte => {
-                return Err(NoxuError::Unsupported(
-                    "Get::SearchLte".to_string(),
-                ));
+                // Faithful floor lookup (BDB DB_SET_RANGE then step back);
+                // see CursorImpl::search_lte and Cursor.getSearchKeyRange
+                // (the LTE mirror of Get.SEARCH_GTE).
+                let key_bytes = key.get_data().unwrap_or(&[]);
+                self.inner.search_lte(key_bytes).map_err(map_cursor_err)?
             }
             Get::FirstDup => {
-                return Err(NoxuError::Unsupported(
-                    "Get::FirstDup".to_string(),
-                ));
+                // Cursor.getFirstDup: position WITHIN the current dup set on
+                // the first duplicate (smallest data).  Must already be
+                // positioned on a record.
+                self.check_initialized()?;
+                self.inner.get_first_dup().map_err(map_cursor_err)?
             }
             Get::LastDup => {
-                return Err(NoxuError::Unsupported("Get::LastDup".to_string()));
+                // Cursor.getLastDup: position WITHIN the current dup set on
+                // the last duplicate (largest data).
+                self.check_initialized()?;
+                self.inner.get_last_dup().map_err(map_cursor_err)?
             }
         };
 
@@ -278,6 +285,7 @@ impl Cursor {
                         | Get::Search
                         | Get::SearchGte
                         | Get::SearchRange
+                        | Get::SearchLte
                         | Get::SearchBoth
                         | Get::SearchBothRange
                 ) {
@@ -552,6 +560,112 @@ mod tests {
 
         let inner = CursorImpl::new(db_arc, 0);
         Cursor::from_impl(inner, false)
+    }
+
+    /// Creates a sorted-duplicate cursor pre-populated with (key, data) pairs.
+    fn make_dup_cursor_with(records: Vec<(&[u8], &[u8])>) -> Cursor {
+        let db_id = DatabaseId::new(1);
+        let mut config = DbiDatabaseConfig::default();
+        config.set_sorted_duplicates(true);
+        let db_impl =
+            DatabaseImpl::new(db_id, "test".to_string(), DbType::User, &config);
+        let db_arc = Arc::new(RwLock::new(db_impl));
+        {
+            let mut tmp = CursorImpl::new(Arc::clone(&db_arc), 0);
+            for (k, v) in &records {
+                tmp.put(k, v, PutMode::NoDupData).unwrap();
+            }
+        }
+        let inner = CursorImpl::new(db_arc, 0);
+        Cursor::from_impl(inner, false)
+    }
+
+    // --- Get::SearchLte (floor lookup) -------------------------------
+    // Headline: keys {10,20,30}; search 25 -> 20; search 30 -> 30;
+    // search 5 -> NotFound.  Faithful to the BDB DB_SET_RANGE-then-step-back
+    // floor; see CursorImpl::search_lte and Cursor.getSearchKeyRange.
+
+    #[test]
+    fn test_search_lte_between_keys() {
+        let mut cursor =
+            make_cursor_with(vec![(b"10", b"a"), (b"20", b"b"), (b"30", b"c")]);
+        let mut key = DatabaseEntry::from_bytes(b"25");
+        let mut data = DatabaseEntry::new();
+        let s = cursor.get(&mut key, &mut data, Get::SearchLte, None).unwrap();
+        assert_eq!(s, OperationStatus::Success);
+        assert_eq!(key.get_data().unwrap(), b"20");
+        assert_eq!(data.get_data().unwrap(), b"b");
+    }
+
+    #[test]
+    fn test_search_lte_exact_key() {
+        let mut cursor =
+            make_cursor_with(vec![(b"10", b"a"), (b"20", b"b"), (b"30", b"c")]);
+        let mut key = DatabaseEntry::from_bytes(b"30");
+        let mut data = DatabaseEntry::new();
+        let s = cursor.get(&mut key, &mut data, Get::SearchLte, None).unwrap();
+        assert_eq!(s, OperationStatus::Success);
+        assert_eq!(key.get_data().unwrap(), b"30");
+        assert_eq!(data.get_data().unwrap(), b"c");
+    }
+
+    #[test]
+    fn test_search_lte_below_all_keys_not_found() {
+        let mut cursor =
+            make_cursor_with(vec![(b"10", b"a"), (b"20", b"b"), (b"30", b"c")]);
+        let mut key = DatabaseEntry::from_bytes(b"05");
+        let mut data = DatabaseEntry::new();
+        let s = cursor.get(&mut key, &mut data, Get::SearchLte, None).unwrap();
+        assert_eq!(s, OperationStatus::NotFound);
+    }
+
+    #[test]
+    fn test_search_lte_above_all_keys_floor_is_last() {
+        let mut cursor =
+            make_cursor_with(vec![(b"10", b"a"), (b"20", b"b"), (b"30", b"c")]);
+        let mut key = DatabaseEntry::from_bytes(b"99");
+        let mut data = DatabaseEntry::new();
+        let s = cursor.get(&mut key, &mut data, Get::SearchLte, None).unwrap();
+        assert_eq!(s, OperationStatus::Success);
+        assert_eq!(key.get_data().unwrap(), b"30");
+    }
+
+    // --- Get::FirstDup / Get::LastDup --------------------------------
+    // Headline: a key with dup data {a,b,c}; position on the key, then
+    // FirstDup -> a, LastDup -> c.  Faithful to Cursor.getFirstDup /
+    // Cursor.getLastDup (position WITHIN the current dup set).
+
+    #[test]
+    fn test_first_dup_and_last_dup() {
+        let mut cursor = make_dup_cursor_with(vec![
+            (b"k", b"a"),
+            (b"k", b"b"),
+            (b"k", b"c"),
+            // a second key so the floor/dup logic must not leak across keys.
+            (b"z", b"x"),
+        ]);
+        let mut key = DatabaseEntry::from_bytes(b"k");
+        let mut data = DatabaseEntry::new();
+
+        // Position somewhere in the dup set (Search lands on first dup).
+        let s = cursor.get(&mut key, &mut data, Get::Search, None).unwrap();
+        assert_eq!(s, OperationStatus::Success);
+        // Step to the middle dup so FirstDup/LastDup must actually move.
+        let s = cursor.get(&mut key, &mut data, Get::NextDup, None).unwrap();
+        assert_eq!(s, OperationStatus::Success);
+        assert_eq!(data.get_data().unwrap(), b"b");
+
+        // FirstDup -> a.
+        let s = cursor.get(&mut key, &mut data, Get::FirstDup, None).unwrap();
+        assert_eq!(s, OperationStatus::Success);
+        assert_eq!(key.get_data().unwrap(), b"k");
+        assert_eq!(data.get_data().unwrap(), b"a");
+
+        // LastDup -> c.
+        let s = cursor.get(&mut key, &mut data, Get::LastDup, None).unwrap();
+        assert_eq!(s, OperationStatus::Success);
+        assert_eq!(key.get_data().unwrap(), b"k");
+        assert_eq!(data.get_data().unwrap(), b"c");
     }
 
     #[test]

@@ -1026,9 +1026,9 @@ mod prop_full_scan_order {
 //     `Next` / `Prev`.
 //   * Finding 4 — `Get::SearchBoth` on a non-sorted-dup DB must validate the
 //     stored data against the user-supplied data, not ignore it.
-//   * Finding 3 — `Get::SearchLte` / `Get::FirstDup` / `Get::LastDup` are not
-//     yet implemented and must surface a typed `Unsupported` error rather
-//     than silently returning `NotFound`.
+//   * Finding 3 — `Get::SearchLte` / `Get::FirstDup` / `Get::LastDup` are now
+//     implemented (floor lookup + first/last duplicate positioning);
+//     pre-fix they surfaced a typed `Unsupported` error.
 
 #[test]
 fn cursor_next_dup_on_non_dup_db_returns_not_found() {
@@ -1174,94 +1174,93 @@ fn cursor_search_both_on_non_dup_db_missing_key_still_not_found() {
 }
 
 #[test]
-fn cursor_search_lte_returns_unsupported_error() {
-    // Audit Finding 3: `Get::SearchLte` is not yet implemented.  Pre-fix
-    // it fell through to the wildcard `_ => Ok(NotFound)` arm in
-    // `Cursor::get`, silently misleading callers.  It must now return a
-    // typed `NoxuError::Unsupported`.
-    use noxu_db::NoxuError;
-
+fn cursor_search_lte_positions_on_floor() {
+    // `Get::SearchLte` floor lookup: largest key <= the search key.
+    // Faithful to the BDB DB_SET_RANGE-then-step-back floor (the LTE mirror
+    // of Cursor.getSearchKeyRange / Get.SEARCH_GTE).  Headline:
+    // keys {10,20,30}; 25 -> 20; 30 -> 30; 5 -> NotFound.
     let dir = TempDir::new().unwrap();
-    let (_env, db) = open_env_and_db_named(&dir, "search_lte_unsupported");
-
-    db.put(
-        None,
-        &DatabaseEntry::from_bytes(b"a"),
-        &DatabaseEntry::from_bytes(b"1"),
-    )
-    .unwrap();
-
-    let mut cursor = db.open_cursor(None, None).unwrap();
-    let mut key = DatabaseEntry::from_bytes(b"a");
-    let mut data = DatabaseEntry::new();
-    let err = cursor
-        .get(&mut key, &mut data, Get::SearchLte, None)
-        .expect_err("Get::SearchLte must return an Unsupported error");
-    match err {
-        NoxuError::Unsupported(op) => {
-            assert!(
-                op.contains("SearchLte"),
-                "Unsupported message must name the operation; got {op:?}"
-            );
-        }
-        other => panic!("expected NoxuError::Unsupported, got {other:?}"),
+    let (_env, db) = open_env_and_db_named(&dir, "search_lte_floor");
+    for (k, v) in [(b"10", b"a"), (b"20", b"b"), (b"30", b"c")] {
+        db.put(
+            None,
+            &DatabaseEntry::from_bytes(k),
+            &DatabaseEntry::from_bytes(v),
+        )
+        .unwrap();
     }
-}
-
-#[test]
-fn cursor_first_dup_returns_unsupported_error() {
-    // Audit Finding 3 — companion to the SearchLte case.
-    use noxu_db::NoxuError;
-
-    let dir = TempDir::new().unwrap();
-    let (_env, db) = open_env_and_db_named(&dir, "first_dup_unsupported");
-
-    db.put(
-        None,
-        &DatabaseEntry::from_bytes(b"a"),
-        &DatabaseEntry::from_bytes(b"1"),
-    )
-    .unwrap();
 
     let mut cursor = db.open_cursor(None, None).unwrap();
-    let mut key = DatabaseEntry::from_bytes(b"a");
+    let mut key = DatabaseEntry::from_bytes(b"25");
     let mut data = DatabaseEntry::new();
-    cursor.get(&mut key, &mut data, Get::Search, None).unwrap();
+    assert_eq!(
+        cursor.get(&mut key, &mut data, Get::SearchLte, None).unwrap(),
+        OperationStatus::Success
+    );
+    assert_eq!(key.get_data().unwrap(), b"20");
+    assert_eq!(data.get_data().unwrap(), b"b");
 
-    let err = cursor
-        .get(&mut key, &mut data, Get::FirstDup, None)
-        .expect_err("Get::FirstDup must return an Unsupported error");
-    assert!(
-        matches!(err, NoxuError::Unsupported(ref op) if op.contains("FirstDup"))
+    let mut key = DatabaseEntry::from_bytes(b"30");
+    assert_eq!(
+        cursor.get(&mut key, &mut data, Get::SearchLte, None).unwrap(),
+        OperationStatus::Success
+    );
+    assert_eq!(key.get_data().unwrap(), b"30");
+
+    let mut key = DatabaseEntry::from_bytes(b"05");
+    assert_eq!(
+        cursor.get(&mut key, &mut data, Get::SearchLte, None).unwrap(),
+        OperationStatus::NotFound
     );
 }
 
 #[test]
-fn cursor_last_dup_returns_unsupported_error() {
-    // Audit Finding 3 — companion to the SearchLte case.
-    use noxu_db::NoxuError;
-
+fn cursor_first_dup_and_last_dup_position_within_dup_set() {
+    // `Get::FirstDup` / `Get::LastDup`: a key with dup data {a,b,c};
+    // position on the key, FirstDup -> a, LastDup -> c.  Faithful to
+    // Cursor.getFirstDup / Cursor.getLastDup (position WITHIN the current
+    // dup set, by data order).
     let dir = TempDir::new().unwrap();
-    let (_env, db) = open_env_and_db_named(&dir, "last_dup_unsupported");
-
-    db.put(
-        None,
-        &DatabaseEntry::from_bytes(b"a"),
-        &DatabaseEntry::from_bytes(b"1"),
-    )
-    .unwrap();
+    let env_config = EnvironmentConfig::new(dir.path().to_path_buf())
+        .with_allow_create(true)
+        .with_transactional(true);
+    let env = noxu_db::Environment::open(env_config).unwrap();
+    let db_config = DatabaseConfig::new()
+        .with_allow_create(true)
+        .with_transactional(true)
+        .with_sorted_duplicates(true);
+    let db = env.open_database(None, "first_last_dup", &db_config).unwrap();
+    for v in [b"a", b"b", b"c"] {
+        db.put(
+            None,
+            &DatabaseEntry::from_bytes(b"k"),
+            &DatabaseEntry::from_bytes(v),
+        )
+        .unwrap();
+    }
 
     let mut cursor = db.open_cursor(None, None).unwrap();
-    let mut key = DatabaseEntry::from_bytes(b"a");
+    let mut key = DatabaseEntry::from_bytes(b"k");
     let mut data = DatabaseEntry::new();
+    // Position on the key (Search lands on the first dup), then step to the
+    // middle dup so FirstDup/LastDup must actually move.
     cursor.get(&mut key, &mut data, Get::Search, None).unwrap();
+    cursor.get(&mut key, &mut data, Get::NextDup, None).unwrap();
+    assert_eq!(data.get_data().unwrap(), b"b");
 
-    let err = cursor
-        .get(&mut key, &mut data, Get::LastDup, None)
-        .expect_err("Get::LastDup must return an Unsupported error");
-    assert!(
-        matches!(err, NoxuError::Unsupported(ref op) if op.contains("LastDup"))
+    assert_eq!(
+        cursor.get(&mut key, &mut data, Get::FirstDup, None).unwrap(),
+        OperationStatus::Success
     );
+    assert_eq!(key.get_data().unwrap(), b"k");
+    assert_eq!(data.get_data().unwrap(), b"a");
+
+    assert_eq!(
+        cursor.get(&mut key, &mut data, Get::LastDup, None).unwrap(),
+        OperationStatus::Success
+    );
+    assert_eq!(key.get_data().unwrap(), b"k");
+    assert_eq!(data.get_data().unwrap(), b"c");
 }
 
 // ─── 14. Cursor must participate in the txn passed to open_cursor ─────────────

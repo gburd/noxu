@@ -15,6 +15,31 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Added
+
+- **Cursor `Get::SearchLte`, `Get::FirstDup`, `Get::LastDup`.** The three
+  remaining cursor positioning modes are now implemented, faithful to
+  BDB-JE / BDB `Cursor` semantics:
+  - `Get::SearchLte` (floor): positions on the largest key `<=` the search
+    key, composed from the BDB `DB_SET_RANGE`-then-step-back floor lookup
+    (the LTE mirror of `Cursor.getSearchKeyRange` / `Get.SEARCH_GTE`).
+    Returns `NotFound` only when no key `<=` the search key exists. On
+    sorted-dup DBs it lands on the last duplicate of the floor key.
+  - `Get::FirstDup` / `Get::LastDup`: position WITHIN the current duplicate
+    set on the first/last duplicate by data order
+    (`Cursor.getFirstDup` / `Cursor.getLastDup`), over Noxu's composite
+    two-part-key dup model.
+  Pre-fix these returned `NoxuError::Unsupported`.
+- **`JoinCursor` over sorted-dup secondaries.** The natural-join cursor now
+  works over sorted-dup secondary indexes with multiple primary keys per
+  secondary key (the common case): cursor[0] walks its duplicate set for
+  candidate primary keys and cursors[1..] probe each candidate with an
+  exact `(secKey, primaryKey)` `SearchMode::BOTH` lookup, returning the
+  intersection of primary keys present under all secondary keys
+  (faithful to JE `JoinCursor.retrieveNext`). The join algorithm was
+  already a faithful port; this lands the headline multi-primary
+  intersection test and removes the stale gating.
+
 ## [6.4.2] - 2026-06-29
 
 ### Fixed
