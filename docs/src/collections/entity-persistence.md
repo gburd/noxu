@@ -1,23 +1,21 @@
 # Entity Persistence (DPL)
 
-> **v1.5 capability matrix:** see
-> [Introduction → v1.5 capability matrix](../introduction.md#v15-capability-matrix).
+> **Secondary indexes are transactional and persistent.** A DPL secondary
+> index is a real, persistent `noxu-db` `SecondaryDatabase` opened against
+> the entity's primary database (the JE `Store.openSecondaryDatabase`
+> model). Secondary updates are maintained **inside the active
+> transaction** by the primary `put` / `delete` fan-out, so they commit /
+> abort atomically with the surrounding user txn and survive store reopen.
 >
-> **v1.5 limitations** are detailed in the
-> ["v1.5 limitations" section below](#v15-limitations) and in
-> the 2026 review.
-> Headlines: secondary indexes are in-memory only; secondary updates
-> are not atomic with the user txn; primary writes do thread `txn`
-> through correctly.
->
-> **v1.6 update:** the `#[derive(Entity)]`,
+> **Derive macros.** The `#[derive(Entity)]`,
 > `#[derive(PrimaryKey)]`, and `#[derive(SecondaryKey)]` proc-macros
-> are now implemented in the `noxu-persist-derive` crate (re-exported
-> from `noxu::persist`; available via the `noxu` umbrella crate). The annotation-style API documented in this
-> chapter is therefore live; the manual trait-impl path is preserved
-> as the [legacy/no-derive shape](#legacy-manual-trait-impl-path) for
-> users that need to opt out (e.g. for crate-graph reasons or to write
-> a custom `Entity` impl).
+> are implemented in the `noxu-persist-derive` crate (re-exported
+> from `noxu::persist`; available via the `noxu` umbrella crate). The
+> annotation-style API documented in this chapter is live; the manual
+> trait-impl path is preserved as the
+> [legacy/no-derive shape](#legacy-manual-trait-impl-path) for users that
+> need to opt out (e.g. for crate-graph reasons or to write a custom
+> `Entity` impl).
 
 The Direct Persistence Layer (`noxu::persist`) lets you store and retrieve
 Rust structs through a typed primary index instead of writing
@@ -194,14 +192,18 @@ let store_config = StoreConfig::new("user_store").with_allow_create(true);
 let mut store = EntityStore::open(&env, store_config)?;
 
 // Open the primary index for the User entity type.  Bind as `let mut`
-// so we can later register secondary indexes against it.
+// so we can later open secondary indexes against it.
 let mut index: PrimaryIndex<u64, User> = store.get_primary_index()?;
-let ser = UserSerializer;
+let ser = std::sync::Arc::new(UserSerializer);
 
-// Open every secondary index declared by `#[derive(SecondaryKey)]`
-// in one line each — the helpers carry the typed `SK` parameter.
-let by_email = User::open_by_email_index(&mut index);
-let by_dept  = User::open_by_dept_index(&mut index);
+// Open every secondary index declared by `#[derive(SecondaryKey)]`.
+// Each helper opens a real, persistent, transactional SecondaryDatabase
+// against the primary and takes the store, the primary index, and the
+// (shared) serializer used to (de)serialise the entity.
+let by_email =
+    User::open_by_email_index(&mut store, &mut index, ser.clone())?;
+let by_dept =
+    User::open_by_dept_index(&mut store, &mut index, ser.clone())?;
 
 // Inspect the compile-time metadata if you want to introspect schemas.
 for spec in User::SECONDARY_INDEXES {
@@ -223,23 +225,24 @@ auto-commit behaviour. This mirrors the
 // Auto-commit (no surrounding txn).
 index.put(
     None,
-    &ser,
+    ser.as_ref(),
     &User { id: 1, email: "a@b.com".into(), dept_id: Some(10), name: "Alice".into() },
 )?;
 
 // Lookup by primary key (auto-commit).
-let user: Option<User> = index.get(None, &ser, &1u64)?;
+let user: Option<User> = index.get(None, ser.as_ref(), &1u64)?;
 
-// Lookup by secondary key.  The lookup goes through the registered
-// PrimaryIndex to materialise the entity, so the call takes both, plus
-// the optional transaction.
-let alice: Option<User> = by_email.get(None, &ser, &index, &"a@b.com".into())?;
+// Lookup by secondary key.  The lookup goes through the secondary
+// database join to materialise the entity, so the call takes the
+// serializer and the primary index, plus the optional transaction.
+let alice: Option<User> =
+    by_email.get(None, ser.as_ref(), &index, &"a@b.com".into())?;
 
 // Range scan by secondary key (ManyToOne).
 let dept10: Vec<u64> = by_dept.sub_index(&10u64);
 
 // Iterate primaries in primary-key order.
-for user in index.entities(None, &ser)? {
+for user in index.entities(None, ser.as_ref())? {
     let u: User = user?;
     println!("{u:?}");
 }
@@ -251,23 +254,28 @@ To participate in an explicit transaction, pass `Some(&txn)`:
 let txn = env.begin_transaction(None)?;
 index.put(
     Some(&txn),
-    &ser,
+    ser.as_ref(),
     &User { id: 2, email: "b@c.com".into(), dept_id: None, name: "Bob".into() },
 )?;
 txn.commit()?;
 ```
 
-The `index.put` and `index.delete_with_entity` calls automatically
-update every secondary index that has been registered against this
-primary index. The plain `index.delete(txn, &pk)` does not fetch the
-entity and therefore cannot maintain secondary indexes; use
-`delete_with_entity` whenever secondary maintenance is required.
+The `index.put`, `index.put_no_overwrite`, and `index.delete` /
+`index.delete_with_entity` calls automatically maintain every secondary
+index opened against this primary, **inside the active transaction**.
+This maintenance is driven by the underlying
+`noxu-db` `Database::put` / `Database::delete` automatic-maintenance
+fan-out (the JE associate()-style hook): aborting a transaction rolls
+the primary write **and** every secondary index update back together,
+and committing makes both visible.  The secondaries are real,
+persistent `SecondaryDatabase`s — they survive store reopen and are not
+rebuilt from a side map.
 
-`SecondaryIndex` supports the same shape of operations as the Java
-Edition's `SecondaryDatabase`: `get`, `contains`, `delete`,
-`iter`, `iter_from`, `keys_index`, and `sub_index`. Many-to-one is
-modelled by having multiple primary keys map to the same secondary
-key — the underlying map is `BTreeMap<SK, BTreeSet<PK>>`.
+`SecondaryIndex` supports the same shape of operations as BDB-JE's
+`SecondaryDatabase`: `get`, `contains`, `delete`, `iter`, `iter_from`,
+`keys_index`, and `sub_index`. Many-to-one is modelled by sorted
+duplicates in the secondary index database — multiple primary keys map
+to the same secondary key.
 
 ## Schema evolution
 
@@ -420,46 +428,39 @@ For numeric primary keys you don't want to assign by hand,
 that is persisted in the same environment. `MemorySequence` is an
 in-memory variant for tests.
 
-## v1.5 limitations
+## Secondary index semantics
 
-- **Secondary indexes are in-memory only.** Entities with secondary
-  keys (registered via `User::open_<name>_index(...)` or the manual
-  `index.open_secondary_index(|e| ...)` path) maintain the
-  `secondary_key → primary_key` mapping in a process-local
-  `BTreeMap<SK, BTreeSet<PK>>`. The mapping is **not** written to the
-  underlying log and **does not survive a process restart** — it must
-  be rebuilt by re-registering the index and replaying the primaries
-  through the extractor. v1.6 will back secondaries with a real
-  `Database` so the mapping is durable.
-- **Primary-index writes can participate in transactions; secondary
-  updates currently cannot.** Calling
-  `index.put(Some(&txn), &ser, &entity)` correctly threads the txn
-  through to the primary `Database::put`, but the in-memory secondary
-  map is updated **immediately** — it is not rolled back if the
-  caller later aborts the txn. The first such call against a primary
-  with registered secondaries logs a one-shot
-  `PersistError::SecondariesNotTransactional` warning so the
-  limitation is operator-visible. v1.6 closes this gap together with
-  the durability work above.
-- **Foreign-key actions are metadata only.** The
+- **Secondary indexes are persistent.** Entities with secondary keys
+  (opened via `User::open_<name>_index(...)` or
+  `EntityStore::open_secondary_index(...)`) are backed by a real
+  `noxu-db` `SecondaryDatabase` named `"{store}_{entity}_{name}"`. The
+  `secondary_key → primary_key` mapping is written to the underlying log
+  and **survives a process restart** — it is not rebuilt from a side
+  map. (When the secondary DB is first created it is populated from the
+  existing primary records.)
+- **Secondary updates are transactional.** Calling
+  `index.put(Some(&txn), ser.as_ref(), &entity)` threads the txn through
+  to the primary `Database::put`, whose automatic-maintenance fan-out
+  maintains every associated `SecondaryDatabase` **under the same
+  txn**. Aborting the txn rolls back the primary write **and** the
+  secondary index update together; committing makes both visible.
+  `index.delete` / `index.delete_with_entity` behave identically.
+- **Foreign-key actions are metadata only at the DPL layer.** The
   `on_related_entity_delete = ABORT | CASCADE | NULLIFY` attribute is
-  recorded in `User::SECONDARY_INDEXES[].on_related_entity_delete`
-  but is **not** enforced by the engine in v1.5/v1.6 (the secondary
-  layer is in-memory and has no access to a foreign-key constraint
-  graph). v2.0 will wire the actions into the cascade path.
-- See the 2026 review
-  for the full audit context, the rationale for shipping the
-  in-memory secondaries unchanged in v1.5, and the v1.6 plan.
-- See the 2026 review
-  for the design of the v1.6 derive-macro layer.
+  recorded in `User::SECONDARY_INDEXES[].on_related_entity_delete` but is
+  **not** wired into the DPL `open_secondary_index` path; the
+  lower-level `noxu-db` `SecondaryConfig` foreign-key machinery exists
+  and can be used directly if FK enforcement is required. Wiring the DPL
+  attribute into that machinery is a future item.
 
 ## Other roadmap items
 
 - The serializer is a runtime parameter on every read/write call; it
   is not stored alongside the data. Replacing the serializer for a
   given entity type requires a schema-evolution migration.
-- `delete(txn, &pk)` cannot maintain secondary indexes; prefer
-  `delete_with_entity(txn, &ser, &pk)`.
+- `delete(txn, &pk)` and `delete_with_entity(txn, ser.as_ref(), &pk)`
+  both maintain secondary indexes (maintenance is driven by the
+  underlying `Database::delete` fan-out).
 
 ## Legacy: manual trait-impl path
 

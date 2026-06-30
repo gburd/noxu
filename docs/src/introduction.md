@@ -54,8 +54,8 @@ git tags (`v1.5.0`, `v1.6.0`, `v2.0.0`, `v2.2.1`).
 | DPL primary-index reads/writes participate in user txn | ✅ (BREAKING signature change) | ✅ | ✅ | ✅ |
 | DPL `#[derive(Entity)]` / `#[derive(PrimaryKey)]` / `#[derive(SecondaryKey)]` proc-macros (`noxu-persist-derive`) | ❌ (manual `impl` only) | ✅ (v1.6) | ✅ | ✅ |
 | DPL schema evolution (`Mutations` wired into open path; `Renamer` / `Deleter` / `Converter`; per-record class-version envelope) | ❌ | ✅ (v1.6 — BREAKING on-disk shape vs. pre-v1.6) | ✅ | ✅ |
-| DPL secondary indexes durable (survive restart) | ❌ (in-memory `BTreeMap` only) | ✅ (v1.6) | ✅ | ✅ |
-| DPL secondary updates atomic with user txn | ❌ (`PersistError::SecondariesNotTransactional` warning) | ✅ (v1.6) | ✅ | ✅ |
+| DPL secondary indexes durable (survive restart) | ❌ (in-memory `BTreeMap` only) | ✅ | ✅ | ✅ |
+| DPL secondary updates atomic with user txn | ❌ (in-memory, not txn-atomic) | ✅ | ✅ | ✅ |
 | Read-only reopen of an existing entity store (`allow_create=false`) | ❌ | ❌ | ❌ | ✅ |
 | **Replication / HA** | | | | |
 | Single-process election test, 2-node sync, FPaxos shape | preview | refined | GA | GA |
