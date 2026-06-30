@@ -19,7 +19,7 @@ pub use feeder::{
 pub use output_thread::OutputQueue;
 pub use peer_feeder::{
     PeerFeederRunner, PeerFeederSource, PeerLogScanner, PeerScannerAdapter,
-    SyncupResult, negotiate_syncup,
+    SyncupResult, WalFeederSource, negotiate_syncup,
 };
 pub use reconnect::{ReconnectConfig, ReconnectOutcome, catch_up_with_retry};
 pub use replica_stream::{

@@ -135,15 +135,45 @@ impl LogWriter for EnvironmentLogWriter {
         // Write to the local WAL.  Replicated entries are non-provisional and
         // do not require an immediate fsync on every entry (the master already
         // fsynced before sending).
-        let lsn = self
-            .log_manager
-            .log(log_entry_type, payload, Provisional::No, false, false)
-            .map_err(|e| {
-                crate::error::RepError::DatabaseError(format!(
-                    "replica log write failed: {}",
-                    e
-                ))
-            })?;
+        //
+        // Chained replication: re-log the entry preserving the master's
+        // ORIGINAL VLSN via `log_with_vlsn`, so the replica's WAL carries a
+        // VLSN-tagged 22-byte header identical in shape to the master's.
+        // This makes the replica's own WAL a valid `FeederSource` for a
+        // downstream replica (an `EnvironmentLogScanner` reads the VLSN from
+        // the 22-byte header).  Faithful to JE `Replay.logReplicatedEntry`,
+        // which logs the received record preserving its VLSN so the replica's
+        // VLSNIndex + log are a feeder source for a replica chain (see
+        // `FeederSource` javadoc: "a Replica in a Replica chain that is
+        // replaying log records it received from some other source").  Plain
+        // `log()` would write a 14-byte no-VLSN header that no downstream
+        // feeder could scan.
+        //
+        // vlsn=0 is reserved as NULL_VLSN; entries without a VLSN fall back to
+        // the plain `log()` path (these are never streamed downstream).
+        let lsn = if vlsn > 0 {
+            self.log_manager.log_with_vlsn(
+                log_entry_type,
+                payload,
+                vlsn,
+                false,
+                false,
+            )
+        } else {
+            self.log_manager.log(
+                log_entry_type,
+                payload,
+                Provisional::No,
+                false,
+                false,
+            )
+        }
+        .map_err(|e| {
+            crate::error::RepError::DatabaseError(format!(
+                "replica log write failed: {}",
+                e
+            ))
+        })?;
 
         // Register VLSN → LSN in the replica's VLSN index so that
         // FeederRunner/ack tracking can correlate positions.  Dispatch the

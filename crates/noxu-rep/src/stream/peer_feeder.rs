@@ -38,7 +38,7 @@ use noxu_sync::Mutex;
 use crate::error::{RepError, Result};
 use crate::net::channel::Channel;
 use crate::net::service_dispatcher::ServiceHandler;
-use crate::stream::feeder::{FeederRunner, LogScanner};
+use crate::stream::feeder::{EnvironmentLogScanner, FeederRunner, LogScanner};
 
 /// Service name registered with `TcpServiceDispatcher` for peer log feeds.
 pub const PEER_FEEDER_SERVICE_NAME: &str = "PEER_FEEDER";
@@ -449,12 +449,68 @@ pub fn negotiate_syncup(
 /// `ReplicaReceiver` as entries arrive from the master.
 pub struct PeerFeederService {
     source: Arc<PeerLogScanner>,
+    /// Optional WAL-backed feeder source for chained replication.
+    ///
+    /// When `Some`, the service serves the requested VLSN range from this
+    /// node's OWN WAL via an [`EnvironmentLogScanner`] driven by a
+    /// [`FeederRunner`] — the *same* machinery the master uses
+    /// ([`crate::stream::feeder`]).  This is JE's cascading-feeder model:
+    /// `FeederSource` is "a real Master OR a Replica in a Replica chain that
+    /// is replaying log records it received from some other source"
+    /// (`FeederSource.java`); `MasterFeederSource` reads the VLSNIndex + log
+    /// on whatever node hosts it.
+    ///
+    /// `None` (default) preserves the in-memory `PeerLogScanner` pull path.
+    wal_source: Option<WalFeederSource>,
+}
+
+/// WAL-backed feeder source for a chained (replica-to-replica) feed.
+///
+/// Holds a live [`EnvironmentImpl`] (whose WAL carries VLSN-tagged 22-byte
+/// headers written by [`crate::stream::replica_stream::EnvironmentLogWriter`])
+/// and the shared [`VlsnIndex`] used to negotiate the available VLSN range.
+///
+/// Faithful to JE `MasterFeederSource(repImpl, vlsnIndex, startVLSN)` — the
+/// feeder source is constructed from the environment + VLSN index regardless
+/// of whether the node is master or replica.
+#[derive(Clone)]
+pub struct WalFeederSource {
+    env: Arc<noxu_dbi::EnvironmentImpl>,
+    vlsn_index: Arc<crate::vlsn::vlsn_index::VlsnIndex>,
+}
+
+impl WalFeederSource {
+    /// Create a WAL-backed feeder source.
+    pub fn new(
+        env: Arc<noxu_dbi::EnvironmentImpl>,
+        vlsn_index: Arc<crate::vlsn::vlsn_index::VlsnIndex>,
+    ) -> Self {
+        Self { env, vlsn_index }
+    }
 }
 
 impl PeerFeederService {
-    /// Create a new service backed by `source`.
+    /// Create a new service backed by an in-memory `source` (pull path).
     pub fn new(source: Arc<PeerLogScanner>) -> Self {
-        Self { source }
+        Self { source, wal_source: None }
+    }
+
+    /// Create a service that ALSO serves the chained-replication WAL feed.
+    ///
+    /// When a downstream replica connects, the service prefers the WAL
+    /// source: it negotiates the VLSN range from the [`VlsnIndex`] and, if
+    /// it can serve, streams entries from this node's WAL via an
+    /// [`EnvironmentLogScanner`] + [`FeederRunner`] (the same path the
+    /// master uses).  If the WAL cannot serve the requested range it falls
+    /// back to the in-memory `source`, then to `NEEDS_RESTORE`.
+    ///
+    /// Used by [`crate::ReplicatedEnvironment::become_replica`] when
+    /// `cascade_feeding` is enabled and a live `EnvironmentImpl` is wired.
+    pub fn with_wal_source(
+        source: Arc<PeerLogScanner>,
+        wal_source: WalFeederSource,
+    ) -> Self {
+        Self { source, wal_source: Some(wal_source) }
     }
 }
 
@@ -487,7 +543,53 @@ impl ServiceHandler for PeerFeederService {
         let start_vlsn =
             u64::from_le_bytes(msg[..8].try_into().expect("slice of 8 bytes"));
 
-        // 2. Negotiate: do we hold the requested VLSN range?
+        // 2a. Chained replication (cascade): if a WAL source is wired, prefer
+        //     serving the downstream from THIS node's own WAL via the same
+        //     EnvironmentLogScanner + FeederRunner the master uses.  Faithful
+        //     to JE's cascading-feeder model (see `WalFeederSource`).
+        //
+        //     The downstream sends start_vlsn=0 to mean "from the beginning";
+        //     we serve from the first VLSN our VLSNIndex holds.  We can serve
+        //     iff the requested start falls within `[first, last]` (or the
+        //     range is non-empty and start_vlsn==0).
+        if let Some(wal) = &self.wal_source {
+            let range = wal.vlsn_index.get_range();
+            let (first, last) = (range.first(), range.last());
+            let have_data = last > 0 && first > 0;
+            let effective_start =
+                if start_vlsn == 0 { first } else { start_vlsn };
+            let can_serve = have_data
+                && effective_start >= first
+                && effective_start <= last;
+            if can_serve {
+                channel.send(&[PEER_FEEDER_CAN_SERVE])?;
+                let channel_arc: Arc<dyn Channel> = Arc::from(channel);
+                // EnvironmentLogScanner starts at the log beginning and skips
+                // entries with vlsn < effective_start; the FeederRunner then
+                // streams VLSN-ordered entries exactly as the master does.
+                let mut scanner =
+                    match EnvironmentLogScanner::new(&wal.env, None) {
+                        Some(s) => s,
+                        None => {
+                            // WAL scanner unavailable (read-only env / no log):
+                            // the CAN_SERVE byte was already sent, so close the
+                            // channel; the downstream will retry / fall back.
+                            return Err(RepError::NetworkError(
+                                "PEER_FEEDER: WAL scanner unavailable".into(),
+                            ));
+                        }
+                    };
+                let runner = FeederRunner::new(channel_arc, effective_start);
+                let _ = runner.run(&mut scanner);
+                return Ok(());
+            }
+            // WAL cannot serve the requested range: fall through to the
+            // in-memory pull path, then to NEEDS_RESTORE.  A downstream that
+            // asks for an evicted/old range that the mid-tier no longer holds
+            // must catch up via network restore or fall back to the master.
+        }
+
+        // 2. Negotiate: do we hold the requested VLSN range in memory?
         let range = self.source.log_range();
         match negotiate_syncup(range, start_vlsn) {
             SyncupResult::CanServe { start_vlsn: sv } => {

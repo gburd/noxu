@@ -2133,6 +2133,54 @@ impl ReplicatedEnvironment {
                 // index (see VLSNIndex).
                 let vlsn_index = Arc::clone(&self.vlsn_index);
 
+                // --- Chained replication: start a WAL-backed feeder source ---
+                //
+                // When `cascade_feeding` is enabled, re-register this node's
+                // PEER_FEEDER service with a WAL-backed source so a DOWNSTREAM
+                // replica can connect and receive the VLSN-tagged log stream
+                // FROM THIS REPLICA's OWN WAL (the bytes it received + persisted
+                // via EnvironmentLogWriter::log_with_vlsn).  The feeder uses the
+                // same EnvironmentLogScanner + FeederRunner the master uses.
+                //
+                // Faithful to JE's cascading-feeder model: the same
+                // FeederManager/Feeder/FeederSource machinery runs on any node
+                // that holds the data.  `FeederSource` is documented as "a real
+                // Master OR a Replica in a Replica chain that is replaying log
+                // records it received from some other source"
+                // (`FeederSource.java`); `MasterFeederSource(repImpl, vlsnIndex,
+                // startVLSN)` reads the VLSNIndex + log regardless of role.
+                //
+                // Default OFF (master-direct) preserves current behaviour: a
+                // replica's PEER_FEEDER stays backed by the in-memory pull
+                // scanner unless cascade is explicitly enabled.
+                if self.config.cascade_feeding {
+                    if let Some(ref dispatcher) = self.tcp_dispatcher {
+                        let wal_source =
+                            crate::stream::peer_feeder::WalFeederSource::new(
+                                Arc::clone(&env),
+                                Arc::clone(&self.vlsn_index),
+                            );
+                        let svc = PeerFeederService::with_wal_source(
+                            Arc::clone(&self.peer_scanner),
+                            wal_source,
+                        );
+                        dispatcher
+                            .register(PEER_FEEDER_SERVICE_NAME, Arc::new(svc));
+                        log::info!(
+                            "Node '{}' (replica): cascade feeding ENABLED — \
+                             PEER_FEEDER now serves downstream replicas from \
+                             its own WAL",
+                            self.config.node_name.as_str(),
+                        );
+                    } else {
+                        log::warn!(
+                            "Node '{}': cascade_feeding set but no TCP \
+                             dispatcher; downstream replicas cannot connect",
+                            self.config.node_name.as_str(),
+                        );
+                    }
+                }
+
                 // Resolve the master's socket address from the GroupService.
                 let master_addr_opt: Option<SocketAddr> = self
                     .group_service
