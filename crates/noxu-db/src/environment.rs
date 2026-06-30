@@ -1243,7 +1243,7 @@ impl Environment {
             .unwrap_or_default();
         Ok(EnvironmentStats {
             cache_size: self.config.cache_size,
-            cache_usage: 0,
+            cache_usage: env_impl.get_cache_usage().max(0) as u64,
             n_databases,
             log,
             lock,

@@ -12,7 +12,7 @@ description = "Noxu DB - An embedded transactional database engine"
 
 [features]
 default = []
-observability = ["dep:noxu-observe", "dep:tracing", "dep:metrics"]
+observability = ["dep:noxu-observe", "dep:tracing", "dep:metrics", "noxu-observe/export"]
 
 [dependencies]
 hashbrown = { workspace = true }
@@ -46,6 +46,9 @@ criterion = { workspace = true }
 proptest = { workspace = true }
 tempfile = "3"
 noxu-dbi = { workspace = true, features = ["testing"] }
+# Test recorder for the metrics-export headline test (only used with the
+# `observability` feature; the test file is fully cfg-gated).
+metrics-util = "0.19"
 
 [[bin]]
 name = "crash_worker"

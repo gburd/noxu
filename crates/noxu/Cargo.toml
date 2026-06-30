@@ -35,6 +35,8 @@ replication = ["dep:noxu-rep"]
 replication-tls-rustls = ["replication", "noxu-rep/tls-rustls"]
 replication-tls-native = ["replication", "noxu-rep/tls-native"]
 observability = ["dep:noxu-observe", "noxu-db/observability"]
+# Built-in Prometheus exposition convenience (implies observability).
+prometheus = ["observability", "noxu-observe/prometheus"]
 
 [dev-dependencies]
 tempfile = "3"

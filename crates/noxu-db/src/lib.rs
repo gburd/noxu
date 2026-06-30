@@ -51,6 +51,11 @@ pub mod unimplemented_params;
 #[cfg(feature = "observability")]
 pub use noxu_observe as observe_crate;
 
+/// Periodic metrics exporter (samples `get_stats()` to the `metrics` facade).
+/// Only available with the `observability` feature.
+#[cfg(feature = "observability")]
+pub mod metrics_export;
+
 /// Re-export of the synchronization primitive that appears in this crate's
 /// public API.  `SecondaryDatabase::open` takes the primary database wrapped
 /// in `Arc<Mutex<Database>>`; this re-export lets callers name that `Mutex`

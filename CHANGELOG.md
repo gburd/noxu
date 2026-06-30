@@ -40,6 +40,32 @@ listed in [References](#references).
   already a faithful port; this lands the headline multi-primary
   intersection test and removes the stale gating.
 
+- **Built-in metrics export (`observability` feature).** Noxu can now publish
+  its statistics continuously to the [`metrics`](https://docs.rs/metrics)
+  facade, the Rust-ecosystem analogue of BDB-JE's read-only JMX MBean export.
+  - `noxu_observe::export::{describe_export_metrics, emit}` map each
+    operationally relevant field of `EnvironmentStats` onto a recorder-agnostic
+    gauge/counter, citing the JE `StatGroup` it derives from (`EVICTOR_*`,
+    `LOGMGR_*`/`FILEMGR_*`/`FSYNCMGR_*`, `LOCK_*`, `Txn`, `Cleaner`,
+    `Checkpointer`, `THROUGHPUT_PRI_*`).
+  - `noxu_db::metrics_export::MetricsExporter` spawns a daemon that samples
+    `Environment::get_stats()` on an interval and emits to the facade — so any
+    installed recorder (Prometheus, StatsD, OpenTelemetry, …) collects the full
+    stat set `get_stats()` exposes, with no hot-path changes.
+  - Optional `noxu_observe::prometheus::install()` convenience (behind the
+    `prometheus` feature, `metrics-exporter-prometheus` with default features
+    off) returns a handle that renders the text exposition for a `/metrics`
+    scrape endpoint.
+  - **Default-off / zero-cost.** With `observability` disabled, `cargo build`
+    pulls no `metrics`/`tracing`/`prometheus`/`noxu-observe` crates (verified by
+    `cargo tree`) and the `observe_*` macros compile to nothing.
+  - `Environment::get_stats().cache_usage` is now wired to the live tree-memory
+    counter (was previously hardcoded to 0).
+  - Note: the exported `noxu_db_pri_*` throughput metrics are surfaced but read
+    0 — the engine's per-database `ThroughputStats` counters are defined yet
+    never incremented (a pre-existing gap, documented in
+    `docs/src/operations/monitoring.md`).
+
 ## [6.4.2] - 2026-06-29
 
 ### Fixed
