@@ -53,8 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let txn = env.begin_transaction(Some(&txn_config))?;
 
     let key = DatabaseEntry::from_bytes(b"thekey");
-    let mut data = DatabaseEntry::new();
-    db.get(Some(&txn), &key, &mut data)?;
+    let _ = db.get_in(&txn, &key)?;
 
     txn.commit()?;
     db.close()?;

@@ -74,7 +74,7 @@ operations.
 let config = TransactionConfig::new().with_lock_timeout_ms(100);
 let txn = env.begin_transaction(Some(&config))?;
 
-match db.put(Some(&txn), &key, &val) {
+match db.put_in(&txn, &key, &val) {
     Ok(_) => txn.commit()?,
     Err(NoxuError::LockConflict(_)) => {
         txn.abort()?;
@@ -94,7 +94,7 @@ you would rather skip an operation than wait.
 let config = TransactionConfig::new().with_no_wait(true);
 let txn = env.begin_transaction(Some(&config))?;
 // If any key is already write-locked, this returns LockNotAvailable.
-db.put(Some(&txn), &key, &val)?;
+db.put_in(&txn, &key, &val)?;
 txn.commit()?;
 ```
 
@@ -109,7 +109,7 @@ repair operations.
 // Administrative cleanup that must not be blocked
 let config = TransactionConfig::new().with_importunate(true);
 let txn = env.begin_transaction(Some(&config))?;
-db.delete(Some(&txn), &stale_key)?;
+db.delete_in(&txn, &stale_key)?;
 txn.commit()?;
 ```
 
@@ -130,7 +130,7 @@ you know a transaction will only read.
 ```rust
 let config = TransactionConfig::new().with_read_only(true);
 let txn = env.begin_transaction(Some(&config))?;
-db.get(Some(&txn), &key, &mut val)?;
+let _ = db.get_in(&txn, &key)?;
 txn.commit()?;
 ```
 
@@ -156,7 +156,7 @@ use noxu::{Durability, TransactionConfig};
 let config = TransactionConfig::new()
     .with_durability(Durability::COMMIT_WRITE_NO_SYNC);
 let txn = env.begin_transaction(Some(&config))?;
-db.put(Some(&txn), &key, &val)?;
+db.put_in(&txn, &key, &val)?;
 txn.commit()?;
 ```
 

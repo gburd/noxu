@@ -30,14 +30,11 @@ let mut data_out = DatabaseEntry::new();
 
 ## Reading Data Back
 
-After a `get` operation populates a `DatabaseEntry`, use `.data()` to access the raw bytes:
+`get` returns `Result<Option<Bytes>>`; the value bytes deref to `&[u8]`:
 
 ```rust
-let mut data = DatabaseEntry::new();
-let status = db.get(None, &key, &mut data)?;
-if status == OperationStatus::Success {
-    let bytes: &[u8] = data.data();
-    let text = std::str::from_utf8(bytes)?;
+if let Some(value) = db.get(&key)? {
+    let text = std::str::from_utf8(&value)?;
     println!("Got: {}", text);
 }
 ```

@@ -37,7 +37,7 @@ duplicate keys.
 ## Opening and Closing Cursors
 
 ```rust
-let mut cursor = db.open_cursor(None, None)?;
+let mut cursor = db.open_cursor(None)?;
 
 // ... use cursor ...
 
@@ -95,7 +95,7 @@ search key).
 ## Forward Iteration
 
 ```rust
-let mut cursor = db.open_cursor(None, None)?;
+let mut cursor = db.open_cursor(None)?;
 let mut key  = DatabaseEntry::new();
 let mut data = DatabaseEntry::new();
 
@@ -114,7 +114,7 @@ cursor.close()?;
 ## Reverse Iteration
 
 ```rust
-let mut cursor = db.open_cursor(None, None)?;
+let mut cursor = db.open_cursor(None)?;
 let mut key  = DatabaseEntry::new();
 let mut data = DatabaseEntry::new();
 
@@ -129,7 +129,7 @@ cursor.close()?;
 ## Searching for a Specific Key
 
 ```rust
-let mut cursor = db.open_cursor(None, None)?;
+let mut cursor = db.open_cursor(None)?;
 let mut search_key = DatabaseEntry::from_bytes(b"carol");
 let mut data = DatabaseEntry::new();
 
@@ -149,7 +149,7 @@ a key that is greater than or equal to the search key. This is the key primitive
 range scans:
 
 ```rust
-let mut cursor = db.open_cursor(None, None)?;
+let mut cursor = db.open_cursor(None)?;
 let mut range_key = DatabaseEntry::from_bytes(b"user:m");  // start of range
 let mut data = DatabaseEntry::new();
 
@@ -175,7 +175,7 @@ key exists (every key is larger, or the database is empty).
 
 ```rust
 // keys {10, 20, 30}
-let mut cursor = db.open_cursor(None, None)?;
+let mut cursor = db.open_cursor(None)?;
 let mut key = DatabaseEntry::from_bytes(b"25");
 let mut data = DatabaseEntry::new();
 let status = cursor.get(&mut key, &mut data, Get::SearchLte, None)?;
@@ -195,7 +195,7 @@ already be positioned on a record.
 
 ```rust
 // key "k" has duplicates {a, b, c}
-let mut cursor = db.open_cursor(None, None)?;
+let mut cursor = db.open_cursor(None)?;
 let mut key = DatabaseEntry::from_bytes(b"k");
 let mut data = DatabaseEntry::new();
 cursor.get(&mut key, &mut data, Get::Search, None)?;     // positioned on "k"
@@ -210,7 +210,7 @@ cursor.close()?;
 successfully positioned (i.e., the most recent `get` returned `Success`) before calling `delete`.
 
 ```rust
-let mut cursor = db.open_cursor(None, None)?;
+let mut cursor = db.open_cursor(None)?;
 let mut search_key = DatabaseEntry::from_bytes(b"user:bob");
 let mut data = DatabaseEntry::new();
 
