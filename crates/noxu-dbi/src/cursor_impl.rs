@@ -1181,6 +1181,17 @@ impl CursorImpl {
             } else {
                 LockType::Read
             };
+            // Locus-seam guard: if this txn already holds a RangeInsert
+            // next-key lock on `lsn` (from a prior insert in this txn whose
+            // successor is the key now being read), DO NOT request a
+            // Read/RangeRead on it — (RangeInsert, Read/RangeRead) is ILLEGAL in
+            // JE's upgrade matrix (JE never reads the successor it
+            // next-key-locked).  The existing RangeInsert lock entry stands and
+            // the read proceeds against the BIN.  This mirrors the
+            // owns_any_lock skip in lock_range_insert for the reverse order.
+            if guard.holds_range_insert(lsn) {
+                return Ok(false);
+            }
             // Try non-blocking first to detect write contention without waiting.
             let contended = match guard.lock(lsn, lock_type, true) {
                 Ok(_) => false, // granted immediately — no concurrent writer

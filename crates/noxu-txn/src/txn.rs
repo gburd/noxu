@@ -372,6 +372,22 @@ impl Txn {
         false
     }
 
+    /// Returns true if this txn currently holds a `RangeInsert` (next-key) lock
+    /// on `lsn`.  Used by the read path to skip a `Read`/`RangeRead` request on
+    /// an LSN the txn already next-key-locked: `(RangeInsert, Read)` /
+    /// `(RangeInsert, RangeRead)` is ILLEGAL in JE's upgrade matrix (JE never
+    /// reads the successor it next-key-locked, so it's unreachable there).
+    /// Noxu's split lock locus can reach it (insert A range-locks existing
+    /// successor B's real LSN, then the same txn reads B).  The existing
+    /// RangeInsert lock entry stands; the read proceeds against the BIN.
+    pub fn holds_range_insert(&self, lsn: u64) -> bool {
+        self.read_locks.contains(&lsn)
+            && matches!(
+                self.lock_manager.get_owned_lock_type(lsn, self.id),
+                Some(LockType::RangeInsert)
+            )
+    }
+
     /// Commits with an explicit durability policy.
     ///
     ///

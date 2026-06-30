@@ -145,3 +145,26 @@ fn insert_then_insert_successor_same_txn() {
     assert_eq!(out.data(), b"vb_new");
     txn.commit().unwrap();
 }
+
+/// S2 sibling: insert NEW key A (range-locks existing successor B's real LSN),
+/// then GET B in the SAME txn -> (RangeInsert, Read/RangeRead) illegal upgrade.
+#[test]
+fn s2_insert_then_get_successor_same_txn() {
+    let (_dir, env, db) = setup();
+    {
+        let txn = env.begin_transaction(None).unwrap();
+        for k in [b"B".as_slice(), b"D".as_slice()] {
+            db.put(Some(&txn), &DatabaseEntry::from_bytes(k),
+                &DatabaseEntry::from_bytes(b"seed")).unwrap();
+        }
+        txn.commit().unwrap();
+    }
+    let txn = env.begin_transaction(None).unwrap();
+    db.put(Some(&txn), &DatabaseEntry::from_bytes(b"A"),
+        &DatabaseEntry::from_bytes(b"va")).expect("insert A");
+    // GET B (the range-insert-locked successor) in the same txn:
+    let mut out = DatabaseEntry::new();
+    db.get(Some(&txn), &DatabaseEntry::from_bytes(b"B"), &mut out)
+        .expect("get of range-insert-locked successor must not panic/error");
+    txn.commit().expect("commit");
+}
