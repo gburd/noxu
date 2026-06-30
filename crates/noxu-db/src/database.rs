@@ -1986,7 +1986,7 @@ mod tests {
         // supplied.  Used to silently truncate; now rejected.
         let mut patch = DatabaseEntry::from_bytes(b"abc");
         patch.set_partial(6, 5, true);
-        let err = db.put(&key, &patch).unwrap_err();
+        let err = db.put_partial(None, &key, &patch).unwrap_err();
         assert!(
             matches!(err, NoxuError::IllegalArgument(_)),
             "expected IllegalArgument, got {err:?}"
@@ -2016,7 +2016,7 @@ mod tests {
 
         let mut patch = DatabaseEntry::from_bytes(b"WORLD");
         patch.set_partial(6, 5, true);
-        db.put(&key, &patch).unwrap();
+        db.put_partial(None, &key, &patch).unwrap();
 
         let mut buf = DatabaseEntry::new();
         db.get_into(None, &key, &mut buf).unwrap();
@@ -2727,38 +2727,15 @@ mod tests {
     // Audit database F11 — Wave 2C-4: reject None-data keys on writes.
     // ========================================================================
 
-    /// `put` with a `DatabaseEntry::new()` (no data set) returns
-    /// `IllegalArgument` instead of silently writing under an empty key.
-    #[test]
-    fn test_put_with_none_key_returns_illegal_argument() {
-        let (_tmp, _env, db) = temp_env_and_db();
-        let none_key = DatabaseEntry::new();
-        let val = DatabaseEntry::from_bytes(b"v");
-        let result = db.put(&none_key, &val);
-        assert!(matches!(result, Err(NoxuError::IllegalArgument(_))));
-    }
-
-    /// `put_no_overwrite` likewise rejects `None`-data keys.
-    #[test]
-    fn test_put_no_overwrite_with_none_key_returns_illegal_argument() {
-        let (_tmp, _env, db) = temp_env_and_db();
-        let none_key = DatabaseEntry::new();
-        let val = DatabaseEntry::from_bytes(b"v");
-        let result = db.put_no_overwrite(&none_key, &val);
-        assert!(matches!(result, Err(NoxuError::IllegalArgument(_))));
-    }
-
-    /// `put_with_options` likewise rejects `None`-data keys.
-    #[test]
-    fn test_put_with_options_with_none_key_returns_illegal_argument() {
-        use crate::write_options::WriteOptions;
-        let (_tmp, _env, db) = temp_env_and_db();
-        let none_key = DatabaseEntry::new();
-        let val = DatabaseEntry::from_bytes(b"v");
-        let opts = WriteOptions::new();
-        let result = db.put_with_options(None, &none_key, &val, &opts);
-        assert!(matches!(result, Err(NoxuError::IllegalArgument(_))));
-    }
+    // 7.0 NOTE: the three `*_with_none_key_returns_illegal_argument` tests
+    // were removed in the 7.0 API reshape (review P1-3).  The write surface
+    // now takes `key: impl AsRef<[u8]>`, so a key is *always* a byte slice;
+    // the historical "None key" (a `DatabaseEntry` with no data set, distinct
+    // from an empty `b""`) can no longer be expressed at the call site.
+    // An empty key is accepted on writes — see
+    // `test_put_with_explicit_empty_key_accepted`, which the reshape kept as
+    // the canonical behaviour.  The removed tests asserted a None-vs-empty
+    // distinction that the new signature intentionally eliminates.
 
     /// Explicit `Some(&[])` empty key is still accepted on writes.
     #[test]

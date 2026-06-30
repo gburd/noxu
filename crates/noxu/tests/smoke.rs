@@ -6,9 +6,7 @@
 //!   2. `#[derive(Entity)]` works when the user only depends on `noxu = "3"`.
 //!   3. A basic put/get round-trip works end-to-end.
 
-use noxu::{
-    DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
-};
+use noxu::{DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig};
 use tempfile::TempDir;
 
 fn temp_env() -> (TempDir, Environment) {

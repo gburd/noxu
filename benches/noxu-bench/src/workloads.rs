@@ -26,7 +26,7 @@ pub fn w01_seq_write(db: &Database, n: usize, value: &[u8]) -> usize {
     for i in 0..n {
         let k = DatabaseEntry::from_vec(make_key(i));
         let v = DatabaseEntry::from_bytes(value);
-        db.put( &k, &v).unwrap();
+        db.put(&k, &v).unwrap();
     }
     n
 }
@@ -44,7 +44,7 @@ pub fn w02_rand_write(db: &Database, n: usize, value: &[u8]) -> usize {
     for i in keys {
         let k = DatabaseEntry::from_vec(make_key(i));
         let v = DatabaseEntry::from_bytes(value);
-        db.put( &k, &v).unwrap();
+        db.put(&k, &v).unwrap();
     }
     n
 }
@@ -144,7 +144,7 @@ pub fn w06_write_heavy(db: &Database, n: usize, value: &[u8]) -> usize {
             let _ = db.get_into(None, &k, &mut data).unwrap();
         } else {
             // first 9 are writes
-            db.put( &k, &v).unwrap();
+            db.put(&k, &v).unwrap();
         }
     }
     n
@@ -164,7 +164,7 @@ pub fn w07_read_heavy(db: &Database, n: usize, value: &[u8]) -> usize {
         let k = DatabaseEntry::from_vec(make_key(i % n));
         if i % 10 == 9 {
             // 10th operation is a write
-            db.put( &k, &v).unwrap();
+            db.put(&k, &v).unwrap();
         } else {
             // first 9 are reads
             let _ = db.get_into(None, &k, &mut data).unwrap();
@@ -185,8 +185,8 @@ pub fn w08_delete_insert(db: &Database, n: usize, value: &[u8]) -> usize {
     let v = DatabaseEntry::from_bytes(value);
     for i in 0..n {
         let k = DatabaseEntry::from_vec(make_key(i));
-        let _ = db.delete( &k).unwrap();
-        db.put( &k, &v).unwrap();
+        let _ = db.delete(&k).unwrap();
+        db.put(&k, &v).unwrap();
     }
     2 * n
 }
@@ -254,7 +254,7 @@ pub fn w12_xa_2pc(
         {
             let txn = xa.get_transaction(&xid).unwrap();
             let k = DatabaseEntry::from_vec(make_key(i % n.max(1)));
-            db.put_in(&*txn, &k, &v).unwrap();
+            db.put_in(&txn, &k, &v).unwrap();
             xa.mark_write(&xid).unwrap();
         }
 
@@ -287,7 +287,7 @@ pub fn w12_xa_1pc(
         {
             let txn = xa.get_transaction(&xid).unwrap();
             let k = DatabaseEntry::from_vec(make_key(i % n.max(1)));
-            db.put_in(&*txn, &k, &v).unwrap();
+            db.put_in(&txn, &k, &v).unwrap();
             xa.mark_write(&xid).unwrap();
         }
 
@@ -398,7 +398,7 @@ pub fn w13_setup(
         let pri = primary.lock();
         for i in 0..n {
             let k = DatabaseEntry::from_vec(make_key(i));
-            pri.put( &k, &v).unwrap();
+            pri.put(&k, &v).unwrap();
         }
     }
 

@@ -276,7 +276,7 @@ fn main() {
                 counter = counter.wrapping_add(1);
                 let _ = rng.r#gen::<u64>(); // mix in some entropy
                 let t0 = Instant::now();
-                match db.put( &key, &val) {
+                match db.put(&key, &val) {
                     Ok(_) => {
                         local_samples.push(t0.elapsed().as_nanos() as u64);
                         count.fetch_add(1, Ordering::Relaxed);

@@ -93,7 +93,7 @@ pub fn run_concurrent(
                     format!("{:010}", key_idx).into_bytes(),
                 );
                 let v = DatabaseEntry::from_bytes(&value);
-                let _ = db_clone.put( &k, &v);
+                let _ = db_clone.put(&k, &v);
                 ops += 1;
             }
 
