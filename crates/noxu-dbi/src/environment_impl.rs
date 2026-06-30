@@ -76,10 +76,8 @@ impl DaemonSignal {
         if self.shutdown.load(Ordering::Relaxed) {
             return true;
         }
-        let (_g, _timed_out) = self
-            .cv
-            .wait_timeout(guard, dur)
-            .unwrap_or_else(|e| e.into_inner());
+        let (_g, _timed_out) =
+            self.cv.wait_timeout(guard, dur).unwrap_or_else(|e| e.into_inner());
         self.shutdown.load(Ordering::Relaxed)
     }
 }
@@ -2586,11 +2584,8 @@ impl Drop for EnvironmentImpl {
         // Shut down the evictor daemon so its thread exits cleanly when the
         // environment is dropped (e.g. in tests that don't call close()).
         self.evictor.shutdown();
-        if let Some(handle) = self
-            .evictor_handle
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .take()
+        if let Some(handle) =
+            self.evictor_handle.lock().unwrap_or_else(|p| p.into_inner()).take()
         {
             let _ = handle.join();
         }
@@ -2621,11 +2616,8 @@ impl Drop for EnvironmentImpl {
 
         // Shut down the cleaner daemon thread.
         self.cleaner_shutdown.shutdown();
-        if let Some(handle) = self
-            .cleaner_handle
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .take()
+        if let Some(handle) =
+            self.cleaner_handle.lock().unwrap_or_else(|p| p.into_inner()).take()
         {
             let _ = handle.join();
         }
@@ -2635,10 +2627,7 @@ impl Drop for EnvironmentImpl {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .shutdown();
-        self.data_eraser
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .shutdown();
+        self.data_eraser.lock().unwrap_or_else(|p| p.into_inner()).shutdown();
         self.backup_manager
             .lock()
             .unwrap_or_else(|p| p.into_inner())
