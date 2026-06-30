@@ -1201,6 +1201,7 @@ impl EnvironmentImpl {
         let in_compressor_shutdown = DaemonSignal::new();
         let in_compressor_shutdown_clone = Arc::clone(&in_compressor_shutdown);
         let db_map_for_compressor = Arc::clone(&db_map);
+        let lm_for_compressor = Arc::clone(&lock_manager);
         let compressor_interval_ms = cfg.in_compressor_wakeup_interval_ms;
         let run_in_compressor = cfg.run_in_compressor;
         let in_compressor_handle = std::thread::Builder::new()
@@ -1233,8 +1234,29 @@ impl EnvironmentImpl {
                         let db = db_arc.read();
                         if let Some(tree) = db.get_real_tree() {
                             let bins = tree.collect_bins_with_known_deleted();
+                            // IC-3: supply the lock-state predicate so the
+                            // compressor SKIPS any known_deleted slot still
+                            // write-locked by an in-flight txn, mirroring JE
+                            // BIN.compress's isLockUncontended(lsn) check.
+                            // `get_lock_info(lsn) != (0, 0)` is the inverse of
+                            // JE's isLockUncontended (nWaiters==0 && nOwners==0,
+                            // LockManager.java:692).
+                            //
+                            // Lock ordering: the predicate runs while
+                            // compress_bin holds the BIN write latch; it takes
+                            // a LockManager shard mutex for one short,
+                            // non-blocking critical section and releases it
+                            // before returning.  The LockManager never latches
+                            // a BIN, so the only edge is BIN-latch ->
+                            // shard-mutex (acyclic) — no deadlock.
+                            let lm = &lm_for_compressor;
+                            let is_locked =
+                                move |lsn: u64| lm.get_lock_info(lsn) != (0, 0);
                             for bin_arc in bins {
-                                tree.compress_bin(&bin_arc);
+                                tree.compress_bin_with_lock_check(
+                                    &bin_arc,
+                                    Some(&is_locked),
+                                );
                             }
                         }
                     }
@@ -2462,8 +2484,16 @@ impl EnvironmentImpl {
             if let Some(tree) = db.get_real_tree() {
                 let bins = tree.collect_bins_with_known_deleted();
                 total += bins.len();
+                // IC-3: skip slots still write-locked by an in-flight txn
+                // (JE BIN.compress isLockUncontended check).  See the
+                // INCompressor daemon above for the lock-ordering rationale.
+                let lm = &self.lock_manager;
+                let is_locked = move |lsn: u64| lm.get_lock_info(lsn) != (0, 0);
                 for bin_arc in bins {
-                    tree.compress_bin(&bin_arc);
+                    tree.compress_bin_with_lock_check(
+                        &bin_arc,
+                        Some(&is_locked),
+                    );
                 }
             }
         }

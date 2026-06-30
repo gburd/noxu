@@ -5428,6 +5428,63 @@ impl Tree {
     /// `true` if compression made progress (slots were removed or the BIN was
     /// pruned), `false` if the BIN was skipped (delta, no cursors issue, etc.).
     pub fn compress_bin(&self, bin_arc: &Arc<RwLock<TreeNode>>) -> bool {
+        self.compress_bin_with_lock_check(bin_arc, None)
+    }
+
+    /// Like [`compress_bin`](Self::compress_bin), but consults a caller-supplied
+    /// `is_locked` predicate before physically removing each `known_deleted`
+    /// slot.  If `is_locked(slot_lsn)` returns `true`, the slot is SKIPPED
+    /// (left for a later compression pass after the locking txn resolves).
+    ///
+    /// This is the faithful port of JE `BIN.compress` (BIN.java:1141-1172):
+    ///
+    /// > We have to be able to lock the LN before we can compress the entry.
+    /// > If we can't, then skip over it. ... it is more efficient to call
+    /// > `isLockUncontended` than to actually lock the LN, since we would
+    /// > release the lock immediately.
+    ///
+    /// ```text
+    /// if (lsn != DbLsn.NULL_LSN &&
+    ///     !lockManager.isLockUncontended(lsn)) {
+    ///     anyLocked = true;
+    ///     continue;
+    /// }
+    /// ```
+    ///
+    /// JE's `isLockUncontended(lsn)` (LockManager.java:692) returns
+    /// `nWaiters() == 0 && nOwners() == 0`.  Our `is_locked(lsn)` is its
+    /// inverse: the dbi layer supplies a closure over the `LockManager` that
+    /// returns `true` iff the slot's LSN has any owner or waiter
+    /// (`LockManager::get_lock_info(lsn) != (0, 0)`).  A `NULL_LSN` slot is
+    /// always discardable without locking (JE: "Can discard a NULL_LSN entry
+    /// without locking"), so we never invoke the predicate for it.
+    ///
+    /// # Layering (noxu-tree -/-> noxu-txn)
+    ///
+    /// The predicate is a `&dyn Fn(u64) -> bool`, NOT a `LockManager`
+    /// reference, so noxu-tree never depends on noxu-txn.  The lock knowledge
+    /// lives entirely in the dbi-supplied closure.
+    ///
+    /// # Lock ordering (no deadlock)
+    ///
+    /// `is_locked` is invoked while this method holds the **BIN write latch**.
+    /// The dbi closure calls `LockManager::get_lock_info`, which takes a
+    /// lock-table *shard* mutex for a single, non-blocking critical section
+    /// and releases it before returning — it never waits and never re-enters
+    /// the tree.  The LockManager has no edge back into a BIN latch (lock
+    /// acquisition descends the tree from the dbi/cursor layer, never the
+    /// reverse).  The only ordering is therefore BIN-latch -> shard-mutex,
+    /// which is acyclic; no lock cycle exists, so the predicate cannot
+    /// deadlock against the latch.
+    ///
+    /// When `is_locked` is `None` (recovery, BIN-delta replay, unit tests with
+    /// no lock manager) behavior is identical to the historical
+    /// `compress_bin`: every `known_deleted` slot is removed.
+    pub fn compress_bin_with_lock_check(
+        &self,
+        bin_arc: &Arc<RwLock<TreeNode>>,
+        is_locked: Option<&dyn Fn(u64) -> bool>,
+    ) -> bool {
         // ---- Step 1: collect metadata without holding the write lock ----
         let (is_delta, n_entries, id_key) = {
             {
@@ -5461,34 +5518,47 @@ impl Tree {
                         // BIN.compress(): walk backwards to remove
                         // deleted slots without index confusion.
                         //
-                        // ponytail: IC-3 — we remove `known_deleted` slots
-                        // without consulting the lock manager's per-record
-                        // write-lock state (JE BIN.compress inspects the
-                        // cursor/lock state).  The lock manager lives in a
-                        // DIFFERENT crate (noxu-txn); the tree layer has no
-                        // access to it, so a cross-crate write-lock check is
-                        // out of scope here.  This is SAFE in the current
-                        // design because the only slots that reach here with
-                        // `known_deleted == true` are committed deletes:
-                        //   * the dbi write path (cursor_impl.rs delete())
-                        //     PHYSICALLY removes the slot via tree.delete()
-                        //     while holding the txn write lock — it never
-                        //     leaves a write-locked `known_deleted` tombstone
-                        //     in a BinStub; and
-                        //   * the only writer of BinStub.known_deleted == true
-                        //     is BIN-delta / recovery replay, which only
-                        //     replays already-committed deletes.
-                        // The compressor daemon
-                        // (environment_impl.rs: collect_bins_with_known_deleted
-                        // → compress_bin) therefore only ever sees committed
-                        // (unlocked) defunct slots.  See
-                        // docs/src/operations/known-limitations.md (IC-3) for
-                        // the upgrade path if a future write path ever leaves
-                        // an uncommitted write-locked tombstone in a BinStub.
+                        // IC-3 — JE `BIN.compress` (BIN.java:1141-1172) does
+                        // NOT compress a slot it cannot lock: "We have to be
+                        // able to lock the LN before we can compress the
+                        // entry.  If we can't, then skip over it."  JE calls
+                        // `lockManager.isLockUncontended(lsn)` and, on a
+                        // contended slot, does `anyLocked = true; continue;`.
+                        // We mirror that here via the optional `is_locked`
+                        // predicate (supplied by the dbi layer, closing over
+                        // the LockManager — see
+                        // `compress_bin_with_lock_check`).  This removes the
+                        // previously fragile implicit invariant ("no code path
+                        // ever tombstones a slot before its txn commits"):
+                        // even if a future write path leaves an uncommitted,
+                        // write-locked `known_deleted` tombstone in a BinStub,
+                        // the predicate keeps the compressor from physically
+                        // removing a slot a live txn still references.
+                        //
+                        // When `is_locked` is `None` (recovery / BIN-delta
+                        // replay / lock-manager-less tests) behavior is
+                        // unchanged: every `known_deleted` slot is removed,
+                        // matching the historical safe-by-invariant path.
                         let mut j = b.entries.len();
                         while j > 0 {
                             j -= 1;
                             if b.entries[j].known_deleted {
+                                // IC-3 lock check (JE BIN.compress).  A
+                                // NULL_LSN slot is always discardable without
+                                // locking (JE: "Can discard a NULL_LSN entry
+                                // without locking"), so we only consult the
+                                // predicate for a non-null LSN.
+                                if let Some(is_locked) = is_locked {
+                                    let slot_lsn = b.get_lsn(j);
+                                    if !slot_lsn.is_null()
+                                        && is_locked(slot_lsn.as_u64())
+                                    {
+                                        // Slot still write-locked by an
+                                        // in-flight txn — leave it for a later
+                                        // pass (JE: anyLocked = true; continue).
+                                        continue;
+                                    }
+                                }
                                 // JE `IN.deleteEntry` (IN.java:3466): removing a
                                 // DIRTY slot must prohibit the next delta — a
                                 // delta only carries dirty slots, so the removal
@@ -10950,6 +11020,204 @@ mod tests {
         }
     }
 
+    /// IC-3 HEADLINE (fail-pre / pass-post): the compressor must SKIP a
+    /// `known_deleted` slot that is still write-locked by an in-flight txn,
+    /// while removing committed/unlocked `known_deleted` slots in the SAME
+    /// BIN.  Mirrors JE `BIN.compress` (BIN.java:1141-1172), which calls
+    /// `lockManager.isLockUncontended(lsn)` and does `continue` on a contended
+    /// slot.
+    ///
+    /// Pre-fix: `compress_bin` had no lock check, so a write-locked tombstone
+    /// would have been physically removed (the slot a live txn references is
+    /// gone -> corruption).  Post-fix: the `is_locked` predicate keeps it.
+    #[test]
+    fn test_ic3_compress_skips_write_locked_slot() {
+        // Slot 1 (key "b", lsn 1:200) is a write-locked tombstone; slot 3
+        // (key "d", lsn 1:400) is a committed/unlocked tombstone.  Slots 0
+        // and 2 are live.
+        let locked_lsn = Lsn::new(1, 200);
+        let unlocked_lsn = Lsn::new(1, 400);
+        let bin_arc = Arc::new(RwLock::new(TreeNode::Bottom(BinStub {
+            node_id: generate_node_id(),
+            level: BIN_LEVEL,
+            entries: vec![
+                BinEntry {
+                    data: Some(b"live".to_vec()),
+                    known_deleted: false,
+                    dirty: false,
+                    expiration_time: 0,
+                },
+                BinEntry {
+                    data: None,
+                    known_deleted: true, // write-locked tombstone -> KEEP
+                    dirty: false,
+                    expiration_time: 0,
+                },
+                BinEntry {
+                    data: Some(b"live2".to_vec()),
+                    known_deleted: false,
+                    dirty: false,
+                    expiration_time: 0,
+                },
+                BinEntry {
+                    data: None,
+                    known_deleted: true, // committed tombstone -> REMOVE
+                    dirty: false,
+                    expiration_time: 0,
+                },
+            ],
+            key_prefix: Vec::new(),
+            dirty: false,
+            is_delta: false,
+            last_full_lsn: NULL_LSN,
+            last_delta_lsn: NULL_LSN,
+            generation: 0,
+            parent: None,
+            expiration_in_hours: true,
+            cursor_count: 0,
+            prohibit_next_delta: false,
+            lsn_rep: LsnRep::from_lsns(&[
+                Lsn::new(1, 100),
+                locked_lsn,
+                Lsn::new(1, 300),
+                unlocked_lsn,
+            ]),
+            keys: KeyRep::from_keys(vec![
+                b"a".to_vec(),
+                b"b".to_vec(),
+                b"c".to_vec(),
+                b"d".to_vec(),
+            ]),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
+        })));
+        let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
+            node_id: generate_node_id(),
+            level: MAIN_LEVEL | 2,
+            entries: vec![InEntry { key: vec![] }],
+            targets: TargetRep::Sparse(vec![(0, bin_arc.clone())]),
+            dirty: false,
+            generation: 0,
+            parent: None,
+            lsn_rep: LsnRep::Empty,
+        })));
+        {
+            let mut g = bin_arc.write();
+            g.set_parent(Some(Arc::downgrade(&root_arc)));
+        }
+        let tree = Tree::new(1, 128);
+        *tree.root.write() = Some(root_arc);
+
+        // Predicate: only `locked_lsn` is write-locked (stub LockManager).
+        let locked_u64 = locked_lsn.as_u64();
+        let is_locked = move |lsn: u64| lsn == locked_u64;
+
+        let result =
+            tree.compress_bin_with_lock_check(&bin_arc, Some(&is_locked));
+        assert!(result, "compress removed the unlocked tombstone -> true");
+
+        let g = bin_arc.read();
+        match &*g {
+            TreeNode::Bottom(b) => {
+                // 2 live + 1 write-locked tombstone kept; the committed
+                // tombstone (lsn 1:400) removed.
+                assert_eq!(
+                    b.entries.len(),
+                    3,
+                    "write-locked tombstone must be KEPT; only the unlocked one removed"
+                );
+                let kept_locked = (0..b.entries.len()).any(|i| {
+                    b.entries[i].known_deleted && b.get_lsn(i) == locked_lsn
+                });
+                assert!(kept_locked, "the write-locked tombstone must remain");
+                let unlocked_gone =
+                    (0..b.entries.len()).all(|i| b.get_lsn(i) != unlocked_lsn);
+                assert!(
+                    unlocked_gone,
+                    "the unlocked tombstone must be removed"
+                );
+            }
+            _ => panic!("expected BIN"),
+        }
+    }
+
+    /// IC-3 (no predicate): with `is_locked = None` behavior is unchanged —
+    /// ALL `known_deleted` slots are removed (the historical safe path).
+    #[test]
+    fn test_ic3_compress_no_predicate_removes_all_tombstones() {
+        let bin_arc = Arc::new(RwLock::new(TreeNode::Bottom(BinStub {
+            node_id: generate_node_id(),
+            level: BIN_LEVEL,
+            entries: vec![
+                BinEntry {
+                    data: Some(b"live".to_vec()),
+                    known_deleted: false,
+                    dirty: false,
+                    expiration_time: 0,
+                },
+                BinEntry {
+                    data: None,
+                    known_deleted: true,
+                    dirty: false,
+                    expiration_time: 0,
+                },
+                BinEntry {
+                    data: None,
+                    known_deleted: true,
+                    dirty: false,
+                    expiration_time: 0,
+                },
+            ],
+            key_prefix: Vec::new(),
+            dirty: false,
+            is_delta: false,
+            last_full_lsn: NULL_LSN,
+            last_delta_lsn: NULL_LSN,
+            generation: 0,
+            parent: None,
+            expiration_in_hours: true,
+            cursor_count: 0,
+            prohibit_next_delta: false,
+            lsn_rep: LsnRep::from_lsns(&[
+                Lsn::new(1, 100),
+                Lsn::new(1, 200),
+                Lsn::new(1, 300),
+            ]),
+            keys: KeyRep::from_keys(vec![
+                b"a".to_vec(),
+                b"b".to_vec(),
+                b"c".to_vec(),
+            ]),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
+        })));
+        let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
+            node_id: generate_node_id(),
+            level: MAIN_LEVEL | 2,
+            entries: vec![InEntry { key: vec![] }],
+            targets: TargetRep::Sparse(vec![(0, bin_arc.clone())]),
+            dirty: false,
+            generation: 0,
+            parent: None,
+            lsn_rep: LsnRep::Empty,
+        })));
+        {
+            let mut g = bin_arc.write();
+            g.set_parent(Some(Arc::downgrade(&root_arc)));
+        }
+        let tree = Tree::new(1, 128);
+        *tree.root.write() = Some(root_arc);
+
+        let result = tree.compress_bin(&bin_arc); // None predicate path
+        assert!(result, "all tombstones removed -> true");
+        let g = bin_arc.read();
+        match &*g {
+            TreeNode::Bottom(b) => {
+                assert_eq!(b.entries.len(), 1, "only the live slot remains");
+                assert!(b.entries.iter().all(|e| !e.known_deleted));
+            }
+            _ => panic!("expected BIN"),
+        }
+    }
+
     /// compress_bin on a BIN with no deleted slots returns false.
     ///
     /// INCompressor: if no slots were removed, compression made no
@@ -12760,11 +13028,11 @@ mod tests {
         bin.entries[0].data = Some(vec![0u8; 64]);
         bin.set_lsn(0, noxu_util::NULL_LSN);
         let freed_null = bin.strip_lns();
-        assert_eq!(freed_null, 0, "NULL-LSN (unlogged) slot must NOT be stripped");
-        assert!(
-            bin.entries[0].data.is_some(),
-            "unlogged slot data preserved"
+        assert_eq!(
+            freed_null, 0,
+            "NULL-LSN (unlogged) slot must NOT be stripped"
         );
+        assert!(bin.entries[0].data.is_some(), "unlogged slot data preserved");
 
         // Cursor pin prevents stripping.
         bin.set_lsn(0, Lsn::new(1, 100));
