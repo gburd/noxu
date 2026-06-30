@@ -28,6 +28,35 @@ pub use opentelemetry;
 #[cfg(feature = "otel")]
 pub use tracing_opentelemetry;
 
+/// EnvironmentStats → `metrics` facade mapping (JE JMX-MBean-style export).
+#[cfg(feature = "export")]
+pub mod export;
+
+/// Convenience Prometheus exposition recorder.
+///
+/// Thin wrapper over [`metrics_exporter_prometheus`]. Installs a global
+/// Prometheus recorder and returns a handle whose `render` produces the text
+/// exposition for a `/metrics` scrape endpoint. This is a convenience only —
+/// any other `metrics` recorder works equally well; see the crate docs.
+#[cfg(feature = "prometheus")]
+pub mod prometheus {
+    pub use metrics_exporter_prometheus::{
+        PrometheusBuilder, PrometheusHandle,
+    };
+
+    /// Install a global Prometheus recorder and describe Noxu's metrics.
+    ///
+    /// Returns the handle to render scrape output. Errors if a global
+    /// recorder is already installed.
+    pub fn install() -> Result<PrometheusHandle, String> {
+        let handle = PrometheusBuilder::new()
+            .install_recorder()
+            .map_err(|e| e.to_string())?;
+        super::export::describe_export_metrics();
+        Ok(handle)
+    }
+}
+
 // ─── Metrics helpers ─────────────────────────────────────────────────────────
 
 /// Describe all Noxu DB metrics. Call once at application startup after
