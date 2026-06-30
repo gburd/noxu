@@ -17,6 +17,40 @@ listed in [References](#references).
 
 ### Added
 
+- **Database / transaction triggers (DB-TRIG).** A new public
+  [`Trigger`](noxu_db::Trigger) trait (`crates/noxu-dbi/src/trigger.rs`,
+  re-exported from `noxu-db`) is a faithful port of BDB-JE
+  `com.sleepycat.je.trigger.Trigger` + `TransactionTrigger`, fired by the
+  engine on data changes and transaction resolution. Register one or more on a
+  `DatabaseConfig` via `with_trigger(Arc<dyn Trigger>)` / `add_trigger(...)`
+  (JE `DatabaseConfig.setTriggers`); multiple triggers fire in **registration
+  order**.
+  - `put(txn_id, key, old_data, new_data)` fires after a successful put
+    within the transaction (`old_data = None` on insert, `Some(prev)` on
+    update); `delete(txn_id, key, old_data)` after a successful delete
+    (JE `Trigger.put` / `Trigger.delete`, fired by
+    `TriggerManager.runPutTriggers` / `runDeleteTriggers` after the actual
+    tree mutation). The trigger sees the change **before commit** and can make
+    accompanying changes under the same transaction; on abort those changes
+    roll back with the transaction.
+  - `commit(txn_id)` / `abort(txn_id)` (default no-op, mirroring JE's
+    `instanceof TransactionTrigger` check) fire on the transaction's
+    resolution, once per modified database, in registration order — JE
+    `TriggerManager.runCommitTriggers` / `runAbortTriggers` over
+    `Txn.getTriggerDbs()` (the modified-database set populated by
+    `noteTriggerDb`).
+  - **Persistence / replication adaptation (diverges from JE, by design):**
+    JE's `PersistentTrigger` serializes the trigger's *class name* into the
+    database record and re-instantiates it by name on open. A Rust closure /
+    trait object has no reconstructable name, so — exactly as the DBI-14
+    comparator API — Noxu triggers are **runtime-registered only: not
+    persisted, not replicated.** Applications must re-register triggers on
+    every `DatabaseConfig` open. This matches JE's own current state
+    (`Trigger.java`: "Only transient triggers are currently supported";
+    triggers "must be configured on each node in a rep group separately").
+  - The no-trigger write path pays a single `is_empty()` check
+    (JE `DatabaseImpl.hasUserTriggers()`); existing behaviour is unchanged.
+
 - **Admin tooling: `dump` / `load` / `print-log` CLI (`noxu-admin`).** A new
   binary (`crates/noxu-db/src/bin/noxu_admin.rs`, built as `noxu-admin`)
   provides three read-mostly utilities, faithful ports of BDB-JE
