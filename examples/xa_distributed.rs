@@ -102,7 +102,7 @@ fn main() {
     // ─── Verify ─────────────────────────────────────────────────────────────
     println!("\n[Verify]  Reading committed data...");
     let mut val = DatabaseEntry::new();
-    db1.get_into(None, &DatabaseEntry::from_bytes(b"account_alice"), &mut val)
+    db1.get_into(None, DatabaseEntry::from_bytes(b"account_alice"), &mut val)
         .unwrap();
     println!(
         "          DB1 account_alice: {:?}",
@@ -111,7 +111,7 @@ fn main() {
 
     db2.get_into(
         None,
-        &DatabaseEntry::from_bytes(b"ledger_entry_001"),
+        DatabaseEntry::from_bytes(b"ledger_entry_001"),
         &mut val,
     )
     .unwrap();
