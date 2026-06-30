@@ -17,13 +17,18 @@ use std::marker::PhantomData;
 ///
 /// `EnvironmentFailure` propagates as-is (via `From<DbiError>`) so the
 /// caller sees `NoxuError::EnvironmentFailure` rather than
-/// `NoxuError::OperationNotAllowed`. All other errors are wrapped as
-/// `OperationNotAllowed` to preserve backward compatibility.  X-13 fix.
+/// `NoxuError::OperationFailed`. All other errors are wrapped as
+/// `OperationFailed`, which preserves the originating `DbiError` as the
+/// `source()` cause chain (review P1-2) while keeping the same `Display`
+/// text the previous `OperationNotAllowed(e.to_string())` produced.  X-13 fix.
 #[inline]
 fn map_cursor_err(e: DbiError) -> NoxuError {
     match e {
         DbiError::EnvironmentFailure { .. } => NoxuError::from(e),
-        _ => NoxuError::OperationNotAllowed(e.to_string()),
+        _ => NoxuError::OperationFailed {
+            msg: e.to_string(),
+            source: Box::new(e),
+        },
     }
 }
 
