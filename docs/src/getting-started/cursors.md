@@ -204,7 +204,6 @@ cursor.get(&mut key, &mut data, Get::LastDup, None)?;    // data == b"c"
 cursor.close()?;
 ```
 
-
 ## Deleting via Cursor
 
 `cursor.delete()` removes the record at the current cursor position. The cursor must have been
