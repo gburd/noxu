@@ -26,7 +26,7 @@ use noxu_dbi::{
 };
 use noxu_log::LogManager;
 use noxu_sync::{Mutex, RwLock};
-use noxu_txn::{Durability, LockManager, Txn, TxnManager, UndoRecord};
+use noxu_txn::{Durability, LockManager, TxnManager, UndoRecord};
 use noxu_util::lsn::Lsn;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -413,6 +413,7 @@ impl Database {
     /// flushed past `write_lsn`, the fdatasync is skipped entirely, giving
     /// natural many:1 fsync coalescing under concurrent write load with no
     /// explicit group-commit configuration required.
+    #[allow(dead_code)] // unwired helper kept for the documented coalescing path
     fn auto_commit_sync(
         &self,
         txn: Option<&Transaction>,
@@ -1890,6 +1891,7 @@ impl Database {
     /// (even if zero-length); rejects `None`-data keys with a typed
     /// `IllegalArgument` so the previous put-vs-get asymmetry can no
     /// longer black-hole records under a `None` key.
+    #[allow(dead_code)] // documented empty-key contract helper, not yet wired
     fn require_key_bytes<'a>(
         key: &'a DatabaseEntry,
         op: &'static str,

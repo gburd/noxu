@@ -53,7 +53,7 @@
 
 use crate::cursor::Cursor;
 use crate::database_entry::DatabaseEntry;
-use crate::error::{NoxuError, Result};
+use crate::error::Result;
 use crate::get::Get;
 use crate::operation_status::OperationStatus;
 use std::ops::Bound;

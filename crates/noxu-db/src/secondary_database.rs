@@ -104,6 +104,7 @@ pub(crate) trait SecondaryHook {
     ) -> Result<()>;
 
     /// Returns the secondary's database name (used in diagnostics).
+    #[allow(dead_code)] // part of the SecondaryHook interface
     fn name(&self) -> String;
 }
 
@@ -130,6 +131,7 @@ pub(crate) trait FkReferrer {
     ) -> Result<()>;
 
     /// Returns the child secondary's database name (used in error messages).
+    #[allow(dead_code)] // part of the FkReferrer interface
     fn name(&self) -> String;
 }
 
@@ -1204,6 +1206,7 @@ impl SecondaryDatabase {
     /// Called when a primary record is deleted.  `txn` is forwarded to
     /// [`Self::update_secondary`] so the cleanup participates in the
     /// caller's transaction.
+    #[allow(dead_code)] // FK-cascade cleanup helper, not yet wired into delete
     pub(crate) fn delete_all_for_primary(
         &self,
         txn: Option<&Transaction>,

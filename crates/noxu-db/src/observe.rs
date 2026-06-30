@@ -2,6 +2,13 @@
 //!
 //! When the `observability` feature is enabled, these macros emit real
 //! metrics and tracing spans. When disabled, they compile to nothing.
+//!
+//! This is a deliberate, complete macro family: a few members
+//! (`observe_counter_add`, `observe_histogram`) are not yet called from
+//! anywhere in the engine but are kept so the set is uniform and ready to
+//! use. Hence the scoped `unused_macros` allow (preferred over a
+//! crate-wide allow — review P2-2).
+#![allow(unused_macros)]
 
 /// Increment a counter metric. No-op when `observability` is disabled.
 macro_rules! observe_counter {
@@ -124,12 +131,3 @@ macro_rules! observe_timer_record {
         }
     };
 }
-
-pub(crate) use observe_counter;
-pub(crate) use observe_counter_add;
-pub(crate) use observe_gauge_dec;
-pub(crate) use observe_gauge_inc;
-pub(crate) use observe_histogram;
-pub(crate) use observe_span;
-pub(crate) use observe_timer_record;
-pub(crate) use observe_timer_start;

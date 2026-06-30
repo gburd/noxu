@@ -25,7 +25,6 @@
 use crate::database::Database;
 use crate::database_entry::DatabaseEntry;
 use crate::error::{NoxuError, Result};
-use crate::operation_status::OperationStatus;
 use crate::sequence_config::SequenceConfig;
 use crate::sequence_stats::SequenceStats;
 use crate::transaction::Transaction;

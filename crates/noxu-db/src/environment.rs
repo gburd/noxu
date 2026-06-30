@@ -90,6 +90,7 @@ pub struct Environment {
 
 /// Internal database handle state.
 struct DatabaseHandle {
+    #[expect(dead_code)]
     name: String,
     #[expect(dead_code)]
     id: u64,
@@ -131,6 +132,7 @@ impl ActiveTxns {
         Self { txns: Mutex::new(HashMap::new()) }
     }
 
+    #[allow(dead_code)] // convenience wrapper; the hot path locks `txns` directly
     fn insert(&self, id: u64, state: Arc<TransactionState>) {
         self.txns.lock().insert(id, state);
     }
@@ -1582,6 +1584,7 @@ impl Environment {
     }
     ///
     /// Called by Database::close().
+    #[allow(dead_code)] // exercised by in-crate tests; close() path lives in DBI
     pub(crate) fn mark_database_closed(&self, name: &str) {
         let databases = self.databases.lock();
         if let Some(db_handle) = databases.get(name) {
@@ -1595,6 +1598,7 @@ impl Environment {
     /// `Transaction::commit` / `Transaction::abort` calling
     /// `ActiveTxns::mark_complete` directly via the shared `Arc<ActiveTxns>`.
     /// Kept for backwards compatibility with internal tests.
+    #[allow(dead_code)] // exercised by in-crate tests
     pub(crate) fn mark_transaction_complete(&self, txn_id: u64) {
         self.active_txns.mark_complete(txn_id);
     }

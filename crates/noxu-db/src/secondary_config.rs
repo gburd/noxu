@@ -452,6 +452,7 @@ impl SecondaryConfig {
     /// Returns whether an update to the primary may change the secondary key.
     ///
     ///
+    #[allow(dead_code)] // exercised by in-crate tests
     pub(crate) fn update_may_change_secondary(&self) -> bool {
         !self.immutable_secondary_key && !self.extract_from_primary_key_only
     }
@@ -462,6 +463,7 @@ impl SecondaryConfig {
     /// v1.6 still uses this helper to gate the open-time rejection of
     /// half-configured FK setups (e.g. a nullifier without
     /// `foreign_key_database_handle` set).
+    #[allow(dead_code)] // exercised by in-crate tests
     pub(crate) fn has_foreign_key_config(&self) -> bool {
         self.foreign_key_database_name.is_some()
             || self.foreign_key_database.is_some()

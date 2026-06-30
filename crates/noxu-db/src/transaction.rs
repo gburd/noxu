@@ -6,8 +6,8 @@ use crate::environment::ActiveTxns;
 use crate::error::{NoxuError, Result};
 use crate::transaction_config::TransactionConfig;
 use noxu_dbi::{
-    AckWaitErrorKind, DatabaseId, EnvironmentImpl, ReplicaAckPolicyKind,
-    SharedReplicaAckCoordinator, Trigger,
+    AckWaitErrorKind, DatabaseId, EnvironmentImpl, SharedReplicaAckCoordinator,
+    Trigger,
 };
 use noxu_log::LogManager;
 use noxu_sync::Mutex as SyncMutex;
