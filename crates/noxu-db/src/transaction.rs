@@ -7,7 +7,7 @@ use crate::error::{NoxuError, Result};
 use crate::transaction_config::TransactionConfig;
 use noxu_dbi::{
     AckWaitErrorKind, DatabaseId, EnvironmentImpl, ReplicaAckPolicyKind,
-    SharedReplicaAckCoordinator,
+    SharedReplicaAckCoordinator, Trigger,
 };
 use noxu_log::LogManager;
 use noxu_sync::Mutex as SyncMutex;
@@ -136,6 +136,15 @@ pub struct Transaction {
     /// C-4 / JE 1-I: used to finalise transactional database registrations
     /// by moving the database name from `pending_names` to `name_map`.
     commit_callbacks: Mutex<Vec<Box<dyn FnOnce() + Send>>>,
+
+    /// Databases modified under this transaction that carry user triggers,
+    /// keyed by database id so each is recorded at most once (DB-TRIG).
+    ///
+    /// JE `Txn.triggerDbs` (a `Set<DatabaseImpl>`) populated by
+    /// `TriggerManager.runTriggers` -> `noteTriggerDb`.  On `commit` / `abort`
+    /// every recorded database's triggers fire (`runCommitTriggers` /
+    /// `runAbortTriggers`), in registration order.
+    trigger_dbs: Mutex<Vec<(u64, Vec<Arc<dyn Trigger>>)>>,
 }
 
 impl Transaction {
@@ -173,6 +182,7 @@ impl Transaction {
             replica_ack_timeout: std::time::Duration::from_secs(5),
             abort_callbacks: Mutex::new(Vec::new()),
             commit_callbacks: Mutex::new(Vec::new()),
+            trigger_dbs: Mutex::new(Vec::new()),
         }
     }
 
@@ -208,6 +218,7 @@ impl Transaction {
             replica_ack_timeout: std::time::Duration::from_secs(5),
             abort_callbacks: Mutex::new(Vec::new()),
             commit_callbacks: Mutex::new(Vec::new()),
+            trigger_dbs: Mutex::new(Vec::new()),
         }
     }
 
@@ -342,6 +353,55 @@ impl Transaction {
         F: FnOnce() + Send + 'static,
     {
         self.commit_callbacks.lock().unwrap().push(Box::new(f));
+    }
+
+    /// Record that a triggered database was modified under this transaction
+    /// (DB-TRIG).
+    ///
+    /// Idempotent per database id: the first write to a given database under
+    /// this transaction records its triggers; subsequent writes are no-ops.
+    /// On `commit` / `abort` every recorded database's triggers fire in
+    /// registration order.
+    ///
+    /// JE `Txn.noteTriggerDb` (a `Set<DatabaseImpl>` populated from
+    /// `TriggerManager.runTriggers`).
+    pub(crate) fn note_trigger_db(
+        &self,
+        db_id: u64,
+        triggers: &[Arc<dyn Trigger>],
+    ) {
+        if triggers.is_empty() {
+            return;
+        }
+        let mut dbs = self.trigger_dbs.lock().unwrap();
+        if dbs.iter().any(|(id, _)| *id == db_id) {
+            return;
+        }
+        dbs.push((db_id, triggers.to_vec()));
+    }
+
+    /// Fire `TransactionTrigger.commit` for every recorded triggered database,
+    /// in registration order (DB-TRIG).  JE
+    /// `TriggerManager.runCommitTriggers`.
+    fn run_commit_triggers(&self) {
+        let dbs = std::mem::take(&mut *self.trigger_dbs.lock().unwrap());
+        for (_db_id, triggers) in dbs {
+            for trigger in triggers {
+                trigger.commit(self.id);
+            }
+        }
+    }
+
+    /// Fire `TransactionTrigger.abort` for every recorded triggered database,
+    /// in registration order (DB-TRIG).  JE
+    /// `TriggerManager.runAbortTriggers`.
+    fn run_abort_triggers(&self) {
+        let dbs = std::mem::take(&mut *self.trigger_dbs.lock().unwrap());
+        for (_db_id, triggers) in dbs {
+            for trigger in triggers {
+                trigger.abort(self.id);
+            }
+        }
     }
 
     /// Commit the transaction.
@@ -515,6 +575,11 @@ impl Transaction {
         for cb in callbacks {
             cb();
         }
+
+        // DB-TRIG: fire TransactionTrigger.commit for every database modified
+        // under this transaction, in registration order.  JE
+        // `TriggerManager.runCommitTriggers(txn)`.
+        self.run_commit_triggers();
 
         // Prune our entry from the environment's active-txns registry so
         // that `Environment::close()` can succeed (F1).  Decrement the
@@ -711,6 +776,13 @@ impl Transaction {
         for cb in callbacks {
             cb();
         }
+
+        // DB-TRIG: fire TransactionTrigger.abort for every database modified
+        // under this transaction, in registration order.  The data-change
+        // undo above has already restored the before-images, so an abort
+        // trigger observes the rolled-back state.  JE
+        // `TriggerManager.runAbortTriggers(txn)`.
+        self.run_abort_triggers();
 
         // Prune our entry from the environment's active-txns registry so
         // that `Environment::close()` can succeed (F1).
