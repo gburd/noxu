@@ -67,7 +67,7 @@ where
     where
         V: PartialEq,
     {
-        let mut cursor = self.db.open_cursor(txn, None)?;
+        let mut cursor = crate::internal::open_cursor(self.db, txn, None)?;
         let mut key = noxu_db::DatabaseEntry::new();
         let mut data = noxu_db::DatabaseEntry::new();
         let mut status =

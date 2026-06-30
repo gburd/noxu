@@ -311,7 +311,7 @@ fn stored_list_open_rejects_mixed_use_database() {
 
     let key = DatabaseEntry::from_bytes(b"not-an-index");
     let val = DatabaseEntry::from_bytes(b"v");
-    db.put(None, &key, &val).unwrap();
+    db.put(key.data(), val.data()).unwrap();
 
     let err = StoredList::<String, _>::open(&db, StringBinding)
         .err()

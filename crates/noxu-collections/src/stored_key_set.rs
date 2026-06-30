@@ -72,21 +72,20 @@ where
         // (two threads could both observe "absent" and both return true).
         // Empty value payload; `StoredKeySet` is set-of-keys.
         let empty = noxu_db::DatabaseEntry::from_bytes(b"");
-        match self.db.put_no_overwrite(txn, &key_entry, &empty)? {
-            OperationStatus::Success => Ok(true),
+        if crate::internal::db_put_no_overwrite(
+            self.db, txn, &key_entry, &empty,
+        )? {
+            Ok(true)
+        } else {
             // KeyExists => already present; Set.add returns false (unchanged).
-            _ => Ok(false),
+            Ok(false)
         }
     }
 
     /// Returns whether `key` is in the set.
     pub fn contains(&self, txn: Option<&Transaction>, key: &K) -> Result<bool> {
         let key_entry = encode_key(&self.key_binding, key)?;
-        let mut data_entry = noxu_db::DatabaseEntry::new();
-        match self.db.get(txn, &key_entry, &mut data_entry)? {
-            OperationStatus::Success => Ok(true),
-            _ => Ok(false),
-        }
+        Ok(crate::internal::db_get(self.db, txn, &key_entry)?.is_some())
     }
 
     /// Removes `key` from the set.  Returns whether the key was
@@ -96,15 +95,8 @@ where
             return Err(CollectionError::ReadOnly);
         }
         let key_entry = encode_key(&self.key_binding, key)?;
-        let mut data_entry = noxu_db::DatabaseEntry::new();
-        let present = matches!(
-            self.db.get(txn, &key_entry, &mut data_entry)?,
-            OperationStatus::Success,
-        );
-        if present {
-            self.db.delete(txn, &key_entry)?;
-        }
-        Ok(present)
+        let deleted = crate::internal::db_delete(self.db, txn, &key_entry)?;
+        Ok(deleted)
     }
 
     /// Returns the number of elements.
@@ -145,7 +137,7 @@ where
         if self.read_only {
             return Err(CollectionError::ReadOnly);
         }
-        let mut cursor = self.db.open_cursor(txn, None)?;
+        let mut cursor = crate::internal::open_cursor(self.db, txn, None)?;
         let mut key = noxu_db::DatabaseEntry::new();
         let mut data = noxu_db::DatabaseEntry::new();
         while let OperationStatus::Success =
