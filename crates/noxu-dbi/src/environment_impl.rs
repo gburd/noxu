@@ -164,6 +164,14 @@ pub struct EnvironmentImpl {
     /// Write-ahead log manager (None for read-only environments).
     log_manager: Option<Arc<LogManager>>,
 
+    /// Disk-limit violation tracker (JE: the cached disk-usage state on
+    /// `Cleaner`).  Shared (`Arc`) into every user cursor so the write path
+    /// can consult the cached violation flag with a single atomic load, and
+    /// refreshed by the env after each cleaner/checkpointer run (JE:
+    /// `Cleaner.freshenLogSizeStats`).  Inert when both `maxDisk` and
+    /// `freeDisk` are 0.
+    disk_limit: Arc<crate::disk_limit::DiskLimitTracker>,
+
     /// The cache evictor (shared with the background daemon thread).
     evictor: Arc<Evictor>,
 
@@ -771,6 +779,21 @@ impl EnvironmentImpl {
             None => (None, None),
         };
 
+        // Disk-limit tracker (JE: cached disk-usage state on Cleaner).
+        // Probes through the LogManager's FileManager; inert when both limits
+        // are 0 (the common default), in which case the write-path check is a
+        // single branch with no statvfs.  Read-only envs never write, so the
+        // tracker has no file manager and is permanently non-violating.
+        let disk_limit = Arc::new(crate::disk_limit::DiskLimitTracker::new(
+            cfg.max_disk,
+            cfg.free_disk,
+            log_manager.as_ref().map(|lm| lm.file_manager().clone()),
+        ));
+        // Compute the initial violation state before any user write is served,
+        // so an env reopened already over-limit refuses writes immediately
+        // (JE calls freshenLogSizeStats during recovery).
+        disk_limit.refresh();
+
         // REC-C / L-30: seed the env's three id sequences from the maxima the
         // recovery pass recovered from the log, so a freshly allocated
         // db-id / txn-id / node-id is always strictly greater than every id
@@ -1218,6 +1241,7 @@ impl EnvironmentImpl {
         let cleaner_shutdown_clone = Arc::clone(&cleaner_shutdown);
         let cleaner_for_daemon = cleaner.as_ref().map(Arc::clone);
         let run_cleaner_daemon = cfg.run_cleaner;
+        let disk_limit_for_cleaner = Arc::clone(&disk_limit);
         let cleaner_handle = std::thread::Builder::new()
             .name("noxu-cleaner".to_string())
             .spawn(move || {
@@ -1227,6 +1251,10 @@ impl EnvironmentImpl {
                 while !cleaner_shutdown_clone.is_shutdown() {
                     let sleep_ms = if let Some(ref c) = cleaner_for_daemon {
                         let _ = c.do_clean(c.throttle.current_n_files(), false);
+                        // JE: Cleaner.manageDiskUsage refreshes the cached disk
+                        // usage stats after each pass so writes blocked by a
+                        // disk-limit violation resume as soon as space frees.
+                        disk_limit_for_cleaner.refresh();
                         c.throttle.current_sleep_ms()
                     } else {
                         5_000 // no cleaner — sleep 5 s
@@ -1292,6 +1320,7 @@ impl EnvironmentImpl {
                 .unwrap_or_default()
                 .as_millis() as u64,
             log_manager,
+            disk_limit,
             evictor,
             evictor_handle: Mutex::new(Some(evictor_thread)),
             recovered_trees: Mutex::new(recovered),
@@ -2095,6 +2124,21 @@ impl EnvironmentImpl {
         self.log_manager.clone()
     }
 
+    /// Returns the shared disk-limit tracker (JE: cursors read the env's
+    /// cached `getDiskLimitViolation()`).  `Database` caches this Arc so the
+    /// write path can check the violation flag without locking the env.
+    pub fn get_disk_limit(&self) -> Arc<crate::disk_limit::DiskLimitTracker> {
+        Arc::clone(&self.disk_limit)
+    }
+
+    /// Recomputes the cached disk-limit violation state (JE:
+    /// `Cleaner.freshenLogSizeStats`).  Called after the cleaner/checkpointer
+    /// may have changed total log size or free space, so writes can resume as
+    /// soon as space is reclaimed.  Cheap no-op when enforcement is disabled.
+    pub fn refresh_disk_limit(&self) {
+        self.disk_limit.refresh();
+    }
+
     /// REP-7: return the live in-memory B-tree for `db_id`, if the database
     /// has been opened on this (replica) node.
     ///
@@ -2291,7 +2335,14 @@ impl EnvironmentImpl {
             }),
             Some(cleaner) => cleaner
                 .do_clean(n_files, force)
-                .map_err(|e| DbiError::EnvironmentFailure { reason: e }),
+                .map_err(|e| DbiError::EnvironmentFailure { reason: e })
+                .inspect(|_| {
+                    // The cleaner deleted log files, freeing space.  Refresh
+                    // the cached disk-limit state so writes resume as soon as
+                    // we are back within the limits (JE: Cleaner.manageDiskUsage
+                    // calls freshenLogSizeStats after deleting files).
+                    self.disk_limit.refresh();
+                }),
         }
     }
 

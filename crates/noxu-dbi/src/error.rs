@@ -88,6 +88,20 @@ pub enum DbiError {
     #[error("lock conflict: {0}")]
     LockConflict(String),
 
+    /// A disk-space limit (`MAX_DISK` / `FREE_DISK`) is currently violated and
+    /// user write operations are prohibited.
+    ///
+    /// JE: `DiskLimitException`, thrown by `Cursor.checkUpdatesAllowed()` when
+    /// `EnvironmentImpl.getDiskLimitViolation()` returns non-null.  Cleared
+    /// automatically once the cleaner/checkpointer reclaim space.
+    #[error("disk limit exceeded: used={used}, limit={limit}")]
+    DiskLimitExceeded {
+        /// Total log bytes on disk at the last refresh.
+        used: u64,
+        /// The governing limit (MAX_DISK if set, else the FREE_DISK reserve).
+        limit: u64,
+    },
+
     /// Transaction error.
     #[error("transaction error: {0}")]
     TxnError(#[from] noxu_txn::TxnError),

@@ -78,7 +78,9 @@ fn adjacent_key_writes_in_one_txn_do_not_panic() {
                 &succ,
                 &DatabaseEntry::from_vec(format!("r{round}").into_bytes()),
             )
-            .expect("overwrite of the range-insert-locked successor must not panic");
+            .expect(
+                "overwrite of the range-insert-locked successor must not panic",
+            );
             // Remove the interleaved key so next round re-inserts it new.
             db.delete(Some(&txn), &new_key).ok();
         }
@@ -140,8 +142,7 @@ fn insert_then_insert_successor_same_txn() {
     // Verify B's new value committed.
     let txn = env.begin_transaction(None).unwrap();
     let mut out = DatabaseEntry::new();
-    db.get(Some(&txn), &DatabaseEntry::from_bytes(b"B"), &mut out)
-        .unwrap();
+    db.get(Some(&txn), &DatabaseEntry::from_bytes(b"B"), &mut out).unwrap();
     assert_eq!(out.data(), b"vb_new");
     txn.commit().unwrap();
 }
@@ -154,14 +155,22 @@ fn s2_insert_then_get_successor_same_txn() {
     {
         let txn = env.begin_transaction(None).unwrap();
         for k in [b"B".as_slice(), b"D".as_slice()] {
-            db.put(Some(&txn), &DatabaseEntry::from_bytes(k),
-                &DatabaseEntry::from_bytes(b"seed")).unwrap();
+            db.put(
+                Some(&txn),
+                &DatabaseEntry::from_bytes(k),
+                &DatabaseEntry::from_bytes(b"seed"),
+            )
+            .unwrap();
         }
         txn.commit().unwrap();
     }
     let txn = env.begin_transaction(None).unwrap();
-    db.put(Some(&txn), &DatabaseEntry::from_bytes(b"A"),
-        &DatabaseEntry::from_bytes(b"va")).expect("insert A");
+    db.put(
+        Some(&txn),
+        &DatabaseEntry::from_bytes(b"A"),
+        &DatabaseEntry::from_bytes(b"va"),
+    )
+    .expect("insert A");
     // GET B (the range-insert-locked successor) in the same txn:
     let mut out = DatabaseEntry::new();
     db.get(Some(&txn), &DatabaseEntry::from_bytes(b"B"), &mut out)

@@ -83,6 +83,12 @@ pub struct Database {
     /// Cached log manager — acquired once at open, None for no-WAL envs.
     /// Eliminates per-operation `env_impl.lock()` on the hot read/write path.
     log_manager: Option<Arc<LogManager>>,
+    /// Cached disk-limit tracker (JE: the env's `getDiskLimitViolation()`).
+    /// `Some` only for user databases; internal databases are exempt from the
+    /// limit so the cleaner/checkpointer can still write to free space.
+    /// Wired into each user cursor so the write path can refuse writes while a
+    /// disk limit is violated without locking `env_impl`.
+    disk_limit: Option<Arc<noxu_dbi::disk_limit::DiskLimitTracker>>,
     /// Cached environment-invalidity flag (X-13).
     ///
     /// Cloned from `EnvironmentImpl::is_invalid_flag()` at `Database::new()`
@@ -187,14 +193,21 @@ impl Database {
     /// after a successful commit/abort (F1).
     fn make_cursor_with_locker(&self, locker_id: i64) -> CursorImpl {
         match &self.log_manager {
-            Some(lm) => CursorImpl::with_log_manager(
-                Arc::clone(&self.db_impl),
-                locker_id,
-                Arc::clone(lm),
-            )
-            .with_env_invalid(Arc::clone(&self.env_invalid))
-            .with_lock_manager(Arc::clone(&self.lock_manager))
-            .with_txn_manager(Arc::clone(&self.txn_manager)),
+            Some(lm) => {
+                let mut c = CursorImpl::with_log_manager(
+                    Arc::clone(&self.db_impl),
+                    locker_id,
+                    Arc::clone(lm),
+                )
+                .with_env_invalid(Arc::clone(&self.env_invalid))
+                .with_lock_manager(Arc::clone(&self.lock_manager))
+                .with_txn_manager(Arc::clone(&self.txn_manager));
+                // Gate user writes on the disk limit (None for internal DBs).
+                if let Some(dl) = &self.disk_limit {
+                    c = c.with_disk_limit(Arc::clone(dl));
+                }
+                c
+            }
             None => CursorImpl::new(Arc::clone(&self.db_impl), locker_id)
                 .with_env_invalid(Arc::clone(&self.env_invalid))
                 .with_lock_manager(Arc::clone(&self.lock_manager)),
@@ -468,6 +481,16 @@ impl Database {
             let ev = env.get_evictor();
             (lm, logm, ct, fp, txnm, inv, ev)
         };
+        // Disk-limit tracker: wire it only for user databases (JE exempts
+        // internal DBs in Cursor.checkUpdatesAllowed via
+        // dbImpl.getDbType().isInternal()). Internal DBs leave this None so
+        // the cleaner/checkpointer/recovery writes through them are never
+        // blocked by the limit.
+        let disk_limit = if db_impl.read().get_db_type().is_internal() {
+            None
+        } else {
+            Some(env_impl.lock().get_disk_limit())
+        };
         Database {
             name,
             id,
@@ -478,6 +501,7 @@ impl Database {
             throughput,
             lock_manager,
             log_manager,
+            disk_limit,
             env_invalid,
             cleaner_throttle,
             file_protector,

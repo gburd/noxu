@@ -776,6 +776,9 @@ impl From<noxu_dbi::DbiError> for NoxuError {
                 NoxuError::CursorClosed
             }
             DbiError::LockConflict(s) => NoxuError::LockConflict(s),
+            DbiError::DiskLimitExceeded { used, limit } => {
+                NoxuError::DiskLimitExceeded { used, limit }
+            }
             DbiError::IoError(io) => NoxuError::IoError(io),
             DbiError::TxnError(txn_err) => NoxuError::from(txn_err),
             DbiError::LogError(log_err) => {
