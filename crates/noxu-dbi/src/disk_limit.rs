@@ -241,6 +241,20 @@ mod tests {
     }
 
     #[test]
+    fn disabled_refresh_is_noop_no_probe() {
+        // When disabled, refresh() must not probe (it early-returns before
+        // touching the file manager) and is_violated() never loads the flag.
+        // This guards the "cheap when disabled" requirement: no statvfs, no
+        // directory scan on the write path.
+        let t = DiskLimitTracker::new(0, 0, None);
+        t.refresh(); // must not panic despite file_manager == None
+        assert!(!t.is_violated());
+        // Even if a stale violated flag were somehow set, is_enabled() gates it.
+        t.violated.store(true, Ordering::Relaxed);
+        assert!(!t.is_violated(), "disabled tracker never reports a violation");
+    }
+
+    #[test]
     fn both_limits_min_governs() {
         // JE row: freeDL=25 maxDL=80 diskFS=20 totalLS=50 -> avail 0 -> violated
         let t = DiskLimitTracker::new(80, 25, None);
