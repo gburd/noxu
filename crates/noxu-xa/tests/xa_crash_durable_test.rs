@@ -27,7 +27,6 @@
 
 use noxu_db::{
     Database, DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
-    OperationStatus,
 };
 use noxu_xa::{
     PrepareResult, XaEnvironment, XaError, XaFlags, XaResource, Xid,
@@ -69,12 +68,7 @@ fn prepare_crash_recover_commit_data_visible() {
         xa.xa_start(&xid, XaFlags::NOFLAGS).unwrap();
         {
             let txn = xa.get_transaction(&xid).unwrap();
-            db.put(
-                Some(&*txn),
-                &DatabaseEntry::from_bytes(key),
-                &DatabaseEntry::from_bytes(val),
-            )
-            .unwrap();
+            db.put_in(&txn, key, val).unwrap();
         }
         xa.xa_end(&xid, XaFlags::TMSUCCESS).unwrap();
         let result = xa.xa_prepare(&xid, XaFlags::NOFLAGS).unwrap();
@@ -94,9 +88,8 @@ fn prepare_crash_recover_commit_data_visible() {
         // Verify visible immediately after xa_commit (apply_recovered_prepared_lns
         // replayed the LN into the in-memory tree).
         let mut got = DatabaseEntry::new();
-        let status =
-            db.get(None, &DatabaseEntry::from_bytes(key), &mut got).unwrap();
-        assert_eq!(status, OperationStatus::Success);
+        let status = db.get_into(None, key, &mut got).unwrap();
+        assert!(status);
         assert_eq!(got.get_data(), Some(val.as_slice()));
     }
 
@@ -108,11 +101,9 @@ fn prepare_crash_recover_commit_data_visible() {
         assert!(recovered.is_empty(), "resolved XID must not reappear");
 
         let mut got = DatabaseEntry::new();
-        let status =
-            db.get(None, &DatabaseEntry::from_bytes(key), &mut got).unwrap();
-        assert_eq!(
+        let status = db.get_into(None, key, &mut got).unwrap();
+        assert!(
             status,
-            OperationStatus::Success,
             "data must survive the second crash because TxnCommit was \
              written durably"
         );
@@ -135,12 +126,7 @@ fn prepare_crash_recover_rollback_data_not_visible() {
         xa.xa_start(&xid, XaFlags::NOFLAGS).unwrap();
         {
             let txn = xa.get_transaction(&xid).unwrap();
-            db.put(
-                Some(&*txn),
-                &DatabaseEntry::from_bytes(key),
-                &DatabaseEntry::from_bytes(b"v"),
-            )
-            .unwrap();
+            db.put_in(&txn, key, b"v").unwrap();
         }
         xa.xa_end(&xid, XaFlags::TMSUCCESS).unwrap();
         xa.xa_prepare(&xid, XaFlags::NOFLAGS).unwrap();
@@ -154,9 +140,8 @@ fn prepare_crash_recover_rollback_data_not_visible() {
         xa.xa_rollback(&xid, XaFlags::NOFLAGS).unwrap();
 
         let mut got = DatabaseEntry::new();
-        let status =
-            db.get(None, &DatabaseEntry::from_bytes(key), &mut got).unwrap();
-        assert_eq!(status, OperationStatus::NotFound);
+        let status = db.get_into(None, key, &mut got).unwrap();
+        assert!(!status);
     }
 
     // Final reopen: durable.
@@ -166,9 +151,8 @@ fn prepare_crash_recover_rollback_data_not_visible() {
         assert!(recovered.is_empty());
 
         let mut got = DatabaseEntry::new();
-        let status =
-            db.get(None, &DatabaseEntry::from_bytes(key), &mut got).unwrap();
-        assert_eq!(status, OperationStatus::NotFound);
+        let status = db.get_into(None, key, &mut got).unwrap();
+        assert!(!status);
     }
 }
 
@@ -191,12 +175,7 @@ fn two_prepared_txns_crash_recover_mixed_resolution() {
         xa.xa_start(&xid_commit, XaFlags::NOFLAGS).unwrap();
         {
             let txn = xa.get_transaction(&xid_commit).unwrap();
-            db.put(
-                Some(&*txn),
-                &DatabaseEntry::from_bytes(key_c),
-                &DatabaseEntry::from_bytes(b"vc"),
-            )
-            .unwrap();
+            db.put_in(&txn, key_c, b"vc").unwrap();
         }
         xa.xa_end(&xid_commit, XaFlags::TMSUCCESS).unwrap();
         xa.xa_prepare(&xid_commit, XaFlags::NOFLAGS).unwrap();
@@ -204,12 +183,7 @@ fn two_prepared_txns_crash_recover_mixed_resolution() {
         xa.xa_start(&xid_rollback, XaFlags::NOFLAGS).unwrap();
         {
             let txn = xa.get_transaction(&xid_rollback).unwrap();
-            db.put(
-                Some(&*txn),
-                &DatabaseEntry::from_bytes(key_r),
-                &DatabaseEntry::from_bytes(b"vr"),
-            )
-            .unwrap();
+            db.put_in(&txn, key_r, b"vr").unwrap();
         }
         xa.xa_end(&xid_rollback, XaFlags::TMSUCCESS).unwrap();
         xa.xa_prepare(&xid_rollback, XaFlags::NOFLAGS).unwrap();
@@ -228,16 +202,13 @@ fn two_prepared_txns_crash_recover_mixed_resolution() {
 
         let mut val = DatabaseEntry::new();
 
-        let status_c =
-            db.get(None, &DatabaseEntry::from_bytes(key_c), &mut val).unwrap();
-        assert_eq!(status_c, OperationStatus::Success);
+        let status_c = db.get_into(None, key_c, &mut val).unwrap();
+        assert!(status_c);
         assert_eq!(val.get_data(), Some(b"vc".as_slice()));
 
         let mut val_r = DatabaseEntry::new();
-        let status_r = db
-            .get(None, &DatabaseEntry::from_bytes(key_r), &mut val_r)
-            .unwrap();
-        assert_eq!(status_r, OperationStatus::NotFound);
+        let status_r = db.get_into(None, key_r, &mut val_r).unwrap();
+        assert!(!status_r);
     }
 
     // Phase 3: durable.
@@ -246,16 +217,9 @@ fn two_prepared_txns_crash_recover_mixed_resolution() {
         let recovered = xa.xa_recover(XaFlags::STARTRSCAN).unwrap();
         assert!(recovered.is_empty());
         let mut val = DatabaseEntry::new();
-        assert_eq!(
-            db.get(None, &DatabaseEntry::from_bytes(key_c), &mut val).unwrap(),
-            OperationStatus::Success
-        );
+        assert!(db.get_into(None, key_c, &mut val).unwrap());
         let mut val_r = DatabaseEntry::new();
-        assert_eq!(
-            db.get(None, &DatabaseEntry::from_bytes(key_r), &mut val_r)
-                .unwrap(),
-            OperationStatus::NotFound
-        );
+        assert!(!db.get_into(None, key_r, &mut val_r).unwrap());
     }
 }
 
@@ -274,12 +238,7 @@ fn double_crash_before_resolution_keeps_xid_in_doubt() {
         xa.xa_start(&xid, XaFlags::NOFLAGS).unwrap();
         {
             let txn = xa.get_transaction(&xid).unwrap();
-            db.put(
-                Some(&*txn),
-                &DatabaseEntry::from_bytes(b"dc_k"),
-                &DatabaseEntry::from_bytes(b"dc_v"),
-            )
-            .unwrap();
+            db.put_in(&txn, b"dc_k", b"dc_v").unwrap();
         }
         xa.xa_end(&xid, XaFlags::TMSUCCESS).unwrap();
         xa.xa_prepare(&xid, XaFlags::NOFLAGS).unwrap();
@@ -320,12 +279,7 @@ fn prepare_after_commit_is_protocol_error() {
     xa.xa_start(&xid, XaFlags::NOFLAGS).unwrap();
     {
         let txn = xa.get_transaction(&xid).unwrap();
-        db.put(
-            Some(&*txn),
-            &DatabaseEntry::from_bytes(b"k"),
-            &DatabaseEntry::from_bytes(b"v"),
-        )
-        .unwrap();
+        db.put_in(&txn, b"k", b"v").unwrap();
     }
     xa.xa_end(&xid, XaFlags::TMSUCCESS).unwrap();
 
@@ -350,12 +304,7 @@ fn prepare_before_end_is_protocol_error() {
     xa.xa_start(&xid, XaFlags::NOFLAGS).unwrap();
     {
         let txn = xa.get_transaction(&xid).unwrap();
-        db.put(
-            Some(&*txn),
-            &DatabaseEntry::from_bytes(b"k"),
-            &DatabaseEntry::from_bytes(b"v"),
-        )
-        .unwrap();
+        db.put_in(&txn, b"k", b"v").unwrap();
     }
     // Skip xa_end on purpose.
 
@@ -381,12 +330,7 @@ fn xa_start_on_recovered_xid_is_duplicate() {
         xa.xa_start(&xid, XaFlags::NOFLAGS).unwrap();
         {
             let txn = xa.get_transaction(&xid).unwrap();
-            db.put(
-                Some(&*txn),
-                &DatabaseEntry::from_bytes(b"k"),
-                &DatabaseEntry::from_bytes(b"v"),
-            )
-            .unwrap();
+            db.put_in(&txn, b"k", b"v").unwrap();
         }
         xa.xa_end(&xid, XaFlags::TMSUCCESS).unwrap();
         xa.xa_prepare(&xid, XaFlags::NOFLAGS).unwrap();
@@ -421,12 +365,7 @@ fn resolved_xid_disappears_from_xa_recover() {
             {
                 let txn = xa.get_transaction(x).unwrap();
                 let key = format!("k{i}");
-                db.put(
-                    Some(&*txn),
-                    &DatabaseEntry::from_bytes(key.as_bytes()),
-                    &DatabaseEntry::from_bytes(b"v"),
-                )
-                .unwrap();
+                db.put_in(&txn, key.as_bytes(), b"v").unwrap();
             }
             xa.xa_end(x, XaFlags::TMSUCCESS).unwrap();
             xa.xa_prepare(x, XaFlags::NOFLAGS).unwrap();

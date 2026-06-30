@@ -53,17 +53,14 @@ impl TestEnv {
         let txn = self.xa.get_transaction(xid).unwrap();
         let k = DatabaseEntry::from_bytes(key);
         let v = DatabaseEntry::from_bytes(val);
-        self.db.put(Some(&*txn), &k, &v).unwrap();
+        self.db.put_in(&txn, &k, &v).unwrap();
         self.xa.mark_write(xid).unwrap();
     }
 
     fn exists(&self, key: &[u8]) -> bool {
         let k = DatabaseEntry::from_bytes(key);
         let mut v = DatabaseEntry::new();
-        matches!(
-            self.db.get(None, &k, &mut v).unwrap(),
-            noxu_db::OperationStatus::Success
-        )
+        self.db.get_into(None, &k, &mut v).unwrap()
     }
 }
 
@@ -683,7 +680,7 @@ fn test_readonly_with_reads() {
         let txn = env.xa.get_transaction(&x).unwrap();
         let key = DatabaseEntry::from_bytes(b"preexist");
         let mut val = DatabaseEntry::new();
-        let _status = env.db.get(Some(&*txn), &key, &mut val).unwrap();
+        let _status = env.db.get_into(Some(&txn), &key, &mut val).unwrap();
     }
     // Don't call mark_write
     env.xa.xa_end(&x, XaFlags::TMSUCCESS).unwrap();
@@ -796,7 +793,7 @@ fn test_concurrent_independent_xids() {
                         format!("conc_k{tid}").into_bytes(),
                     );
                     let val = DatabaseEntry::from_bytes(b"conc_val");
-                    env.db.put(Some(&*txn), &key, &val).unwrap();
+                    env.db.put_in(&txn, &key, &val).unwrap();
                     env.xa.mark_write(&x).unwrap();
                 }
                 env.xa.xa_end(&x, XaFlags::TMSUCCESS).unwrap();
@@ -887,7 +884,7 @@ fn test_uncommitted_data_isolated_until_commit() {
     // (the write lock blocks the reader — data is isolated)
     let k = DatabaseEntry::from_bytes(b"iso_key");
     let mut v = DatabaseEntry::new();
-    let result = env.db.get(None, &k, &mut v);
+    let result = env.db.get_into(None, &k, &mut v);
     assert!(result.is_err(), "expected lock error, got: {result:?}");
 
     env.xa.xa_end(&x, XaFlags::TMSUCCESS).unwrap();

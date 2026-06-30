@@ -710,7 +710,7 @@ mod tests {
             let txn = xa.get_transaction(&xid).unwrap();
             let key = DatabaseEntry::from_bytes(b"k1");
             let val = DatabaseEntry::from_bytes(b"v1");
-            db.put(Some(&*txn), &key, &val).unwrap();
+            db.put_in(&txn, &key, &val).unwrap();
         }
         xa.mark_write(&xid).unwrap();
         xa.xa_end(&xid, XaFlags::TMSUCCESS).unwrap();
@@ -723,8 +723,8 @@ mod tests {
         // Verify data committed
         let key = DatabaseEntry::from_bytes(b"k1");
         let mut val = DatabaseEntry::new();
-        let status = db.get(None, &key, &mut val).unwrap();
-        assert_eq!(status, noxu_db::OperationStatus::Success);
+        let status = db.get_into(None, &key, &mut val).unwrap();
+        assert!(status);
         assert_eq!(val.get_data(), Some(b"v1".as_slice()));
     }
 
@@ -743,7 +743,7 @@ mod tests {
             let txn = xa.get_transaction(&xid).unwrap();
             let key = DatabaseEntry::from_bytes(b"k2");
             let val = DatabaseEntry::from_bytes(b"v2");
-            db.put(Some(&*txn), &key, &val).unwrap();
+            db.put_in(&txn, &key, &val).unwrap();
         }
         xa.mark_write(&xid).unwrap();
         xa.xa_end(&xid, XaFlags::TMSUCCESS).unwrap();
@@ -753,8 +753,8 @@ mod tests {
         // Verify data NOT committed
         let key = DatabaseEntry::from_bytes(b"k2");
         let mut val = DatabaseEntry::new();
-        let status = db.get(None, &key, &mut val).unwrap();
-        assert_eq!(status, noxu_db::OperationStatus::NotFound);
+        let status = db.get_into(None, &key, &mut val).unwrap();
+        assert!(!status);
     }
 
     #[test]
@@ -812,7 +812,7 @@ mod tests {
             let txn = xa.get_transaction(&xid).unwrap();
             let key = DatabaseEntry::from_bytes(b"k3");
             let val = DatabaseEntry::from_bytes(b"v3");
-            db.put(Some(&*txn), &key, &val).unwrap();
+            db.put_in(&txn, &key, &val).unwrap();
         }
         xa.xa_end(&xid, XaFlags::TMSUCCESS).unwrap();
 
@@ -821,8 +821,8 @@ mod tests {
 
         let key = DatabaseEntry::from_bytes(b"k3");
         let mut val = DatabaseEntry::new();
-        let status = db.get(None, &key, &mut val).unwrap();
-        assert_eq!(status, noxu_db::OperationStatus::Success);
+        let status = db.get_into(None, &key, &mut val).unwrap();
+        assert!(status);
     }
 
     #[test]
@@ -851,12 +851,7 @@ mod tests {
         xa.xa_start(&xid, XaFlags::NOFLAGS).unwrap();
         {
             let txn = xa.get_transaction(&xid).unwrap();
-            db.put(
-                Some(&*txn),
-                &DatabaseEntry::from_bytes(b"rk"),
-                &DatabaseEntry::from_bytes(b"rv"),
-            )
-            .unwrap();
+            db.put_in(&txn, b"rk", b"rv").unwrap();
         }
         xa.mark_write(&xid).unwrap();
         xa.xa_end(&xid, XaFlags::TMSUCCESS).unwrap();
