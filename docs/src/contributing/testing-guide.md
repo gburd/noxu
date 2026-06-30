@@ -177,3 +177,78 @@ The slow test inventory (as of Wave 11-S):
 | `noxu-xa` | `test_xa_perf_concurrent_multi_cluster` | perf-benchmark |
 
 These tests are intended to run in a nightly CI job via `cargo test --workspace -- --ignored`.
+
+## Deterministic Simulation Testing (DST)
+
+DST makes crash/recovery a pure function of `(seed, workload)` so that a
+failure reproduces *exactly* from a single seed. Milestone 1 is a
+seed-reproducible **storage-fault crash gate** (`crates/noxu-db/tests/
+dst_crash_sweep.rs`).
+
+Unlike `power_loss_sweep.rs` — which SIGKILLs the crash worker at a random
+wall-clock millisecond and therefore *cannot* drop in-flight kernel buffers —
+the DST sweep drives the engine through the **FaultDisk** layer
+(`noxu_log::faultdisk`). For each seed the worker subprocess installs a fault
+controller (via the `NOXU_DST_SEED` env var) and, at a *seed-chosen write*,
+injects one of:
+
+| Fault | What happens |
+|---|---|
+| **Torn write** | Write only a prefix of the buffer, then `process::exit` (no `Drop`) — the dropped tail and every later write never reach disk. Byte-precise, reproducible power loss in-process. |
+| **Fsync drop** | Acknowledge `fsync` without flushing, then power-cut — writes the engine believed durable vanish. |
+| **Disk full** | Return `StorageFull` (`ENOSPC`) from the write. |
+| **Corruption** | Flip bytes in the just-written region (bit-rot). |
+
+The parent then reopens the env and asserts the durability invariants:
+no-lost-committed-txn (the recovered committed set is a strict prefix),
+no-uncommitted-leak, total recovery (reopen never panics), and LSN-monotone
+(no later commit kept while an earlier one is dropped).
+
+**Zero production change.** The whole fault layer is gated behind one
+process-global `AtomicBool` that production code never sets. Inactive, every
+posio call does one relaxed atomic load and takes the real path. DST is
+strictly opt-in (it is `RealClock` + real disk everywhere by default).
+
+### Running the fast subset (local dev / PR CI)
+
+```bash
+cargo test -p noxu-db --test dst_crash_sweep
+```
+
+Runs ~120 seeds in well under 60 s, exercising all four fault kinds plus
+no-fault controls, the determinism proof, and the oracle self-check.
+
+### Running the release gate
+
+The **full DST gate is required before a release**; the fast subset is enough
+for local work and PRs:
+
+```bash
+cargo test -p noxu-db --test dst_crash_sweep --release \
+    -- --ignored long_sweep --nocapture
+```
+
+Runs 10 000 seeds.
+
+### Reproducing a failing seed
+
+On any failure the sweep prints the exact seed:
+
+```text
+FAILURE: NOXU_DST_SEED=4193 -> non-prefix recovery: present keys [0,1,3] have a gap
+```
+
+Re-run that one seed against the crash worker directly — the run is
+byte-for-byte deterministic, so the same seed reproduces the same crash and the
+same recovered state:
+
+```bash
+NOXU_DST_SEED=4193 \
+NOXU_CRASH_DIR=/tmp/dst-repro \
+NOXU_CRASH_MODE=committed_then_uncommitted \
+    cargo run -p noxu-db --bin crash_worker
+```
+
+The determinism property is verified by `dst_same_seed_reproduces_exactly`,
+which runs one torn-write seed twice and asserts byte-identical recovered
+state.

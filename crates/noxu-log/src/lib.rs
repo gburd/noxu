@@ -38,6 +38,7 @@ pub mod checksum;
 pub mod entry_header;
 pub mod entry_type;
 pub mod error;
+pub mod faultdisk;
 pub mod log_item;
 pub mod log_utils;
 pub mod loggable;

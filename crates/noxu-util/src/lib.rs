@@ -38,18 +38,22 @@
 //! `#[cfg(not(target_os = "linux"))]`; on non-Linux platforms the tests run
 //! with software-only fault injection (`TcNetemGuard::active == false`).
 
+pub mod clock;
 pub mod daemon;
 pub mod lsn;
 pub mod packed;
+pub mod prng;
 pub mod stats;
 pub mod ttl;
 pub mod vlsn;
 
 // Re-export commonly used types at crate root
+pub use clock::{Clock, RealClock, SimClock};
 pub use lsn::{Lsn, NULL_LSN};
+pub use prng::Prng;
 pub use ttl::{
     SECS_PER_HOUR, current_time_hours, current_time_secs, is_expired,
-    ttl_hours_to_expiration, ttl_secs_to_expiration,
+    is_expired_with, ttl_hours_to_expiration, ttl_secs_to_expiration,
 };
 pub use vlsn::{
     FIRST_VLSN, NULL_VLSN, NULL_VLSN_SEQUENCE, UNINITIALIZED_VLSN_SEQUENCE,

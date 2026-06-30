@@ -177,6 +177,13 @@ impl<'a> FileHandleGuard<'a> {
         let file = file_guard.as_ref().ok_or_else(|| {
             LogError::Internal("FileHandle not initialized".to_string())
         })?;
+        // DST fault layer (inactive in production): a dropped fsync is
+        // acknowledged without flushing, then power is cut so the unsynced
+        // bytes vanish — modelling a disk that lies about durability.
+        if crate::faultdisk::on_fsync() {
+            drop(file_guard);
+            crate::faultdisk::power_cut();
+        }
         file.sync_all()?;
         Ok(())
     }
@@ -193,6 +200,11 @@ impl<'a> FileHandleGuard<'a> {
         let file = file_guard.as_ref().ok_or_else(|| {
             LogError::Internal("FileHandle not initialized".to_string())
         })?;
+        // DST fault layer (inactive in production): see `sync` above.
+        if crate::faultdisk::on_fsync() {
+            drop(file_guard);
+            crate::faultdisk::power_cut();
+        }
         file.sync_data()?;
         Ok(())
     }
