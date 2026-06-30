@@ -369,7 +369,33 @@ unreliable QUIC datagrams or piggybacked on TCP heartbeats.
   `replicate_entry` / `apply_entry`.
 - **Pull path (default)**: Replicas connect to the master's `PEER_FEEDER`
   service (registered on the `TcpServiceDispatcher`) and pull entries from
-  the shared `PeerLogScanner` queue (populated by `replicate_entry`).
+  the shared `PeerLogScanner` queue (populated by `replicate_entry`).  The
+  master also serves this service from its OWN WAL via an
+  `EnvironmentLogScanner` (registered in `become_master`), so a pulling
+  replica receives the master's committed VLSN-tagged entries even when they
+  were never pushed into the in-memory queue.
+- **Chained / cascading feeders (opt-in, `cascade_feeding`)**: A mid-tier
+  replica can feed a downstream replica from its OWN WAL instead of routing
+  every replica through the master.  Enable it on the builder:
+
+  ```rust,ignore
+  let cfg = RepConfig::builder("grp", "R1", "127.0.0.1")
+      .env_home(&r1_home)
+      .cascade_feeding(true) // serve a downstream replica from R1's WAL
+      .build();
+  ```
+
+  When enabled, the replica re-logs each received entry into its own WAL
+  preserving the master's VLSN (`log_with_vlsn`) and **flushes to the OS (not
+  fsync)** so a downstream `EnvironmentLogScanner` can read it; its
+  `PEER_FEEDER` is then backed by a `WalFeederSource` that streams to the
+  downstream replica with the same `FeederRunner` the master uses.  Faithful
+  to BDB-JE `MasterFeederSource`/`FeederManager`, which run a feeder on any
+  node that holds the data.  **The master remains the durability/ack
+  authority** — a downstream replica's ack is not propagated transitively to
+  the master's commit-durability quorum (see
+  [known limitations](../operations/known-limitations.md)).  Default is off;
+  with it off all replicas stream from the master directly.
 - **EnvironmentLogScanner** (active, v4.0.0): Scans master WAL files
   directly for VLSN-tagged entries (`REPLICATED_MASK | VLSN_PRESENT_MASK`).
   Entries are produced by `LogManager::log_with_vlsn` called from

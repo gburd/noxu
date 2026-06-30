@@ -187,7 +187,14 @@ pub struct ReplicatedEnvironment {
 
     /// Shutdown flag shared with I/O threads so they terminate when the
     /// environment is closed.
-    io_shutdown: AtomicBool,
+    ///
+    /// Wrapped in an `Arc` so the replica receive thread (which connects to
+    /// an upstream feeder via `catch_up_from_peer`) can poll it directly and
+    /// break out of its blocking receive loop on close — otherwise a node
+    /// whose upstream stays connected (e.g. a mid-tier replica in a chain,
+    /// closed before its upstream) would never observe the close and
+    /// `close()`'s thread-join would hang.
+    io_shutdown: Arc<AtomicBool>,
 
     /// Whether the RESTORE service has been registered on the TCP dispatcher.
     ///
@@ -497,7 +504,7 @@ impl ReplicatedEnvironment {
             bound_addr,
             env_impl: StdMutex::new(None),
             io_threads: StdMutex::new(Vec::new()),
-            io_shutdown: AtomicBool::new(false),
+            io_shutdown: Arc::new(AtomicBool::new(false)),
             restore_registered: AtomicBool::new(restore_registered_init),
             peer_scanner,
             dtvlsn: std::sync::atomic::AtomicU64::new(0),
@@ -2078,6 +2085,41 @@ impl ReplicatedEnvironment {
             }
         }
 
+        // --- WAL-backed PEER_FEEDER for pull-path replicas -------------------
+        //
+        // The master's writes go to its WAL (VLSN-tagged 22-byte headers) and
+        // its VLSN index, but NOT necessarily to the in-memory `peer_scanner`
+        // (e.g. `register_vlsn_typed` only updates the index).  A replica that
+        // pulls via the `PEER_FEEDER` service therefore finds an empty
+        // in-memory scanner and gets `NeedsRestore`.
+        //
+        // Re-register PEER_FEEDER with a WAL-backed source so a pulling
+        // replica receives the VLSN-tagged stream straight from the master's
+        // OWN WAL via the same `EnvironmentLogScanner` + `FeederRunner` used
+        // throughout.  Faithful to JE `MasterFeederSource(repImpl, vlsnIndex,
+        // startVLSN)`, which reads the VLSNIndex + log regardless of node
+        // role; `FeederManager` runs feeders on whatever node holds the data.
+        // (The same registration runs, gated on `cascade_feeding`, in
+        // `become_replica` so a mid-tier replica can cascade downstream.)
+        if let Some(env) = self.env_impl.lock().unwrap().clone()
+            && let Some(ref dispatcher) = self.tcp_dispatcher
+        {
+            let wal_source = crate::stream::peer_feeder::WalFeederSource::new(
+                Arc::clone(&env),
+                Arc::clone(&self.vlsn_index),
+            );
+            let svc = PeerFeederService::with_wal_source(
+                Arc::clone(&self.peer_scanner),
+                wal_source,
+            );
+            dispatcher.register(PEER_FEEDER_SERVICE_NAME, Arc::new(svc));
+            log::debug!(
+                "Node '{}' (master): PEER_FEEDER now serves replicas from \
+                 its own WAL",
+                self.config.node_name.as_str(),
+            );
+        }
+
         // -------------------------------------------------------------------
 
         // Notify listeners
@@ -2196,7 +2238,11 @@ impl ReplicatedEnvironment {
                 let node_name = self.config.node_name.clone();
                 let master = master_name.to_string();
                 let vlsn_index_clone = Arc::clone(&vlsn_index);
-                let shutdown_flag = self.io_shutdown.load(Ordering::SeqCst);
+                // Live shutdown flag (shared Arc): the receive loop polls it
+                // so `close()` can break the blocking upstream receive and
+                // join this thread — vital for a mid-tier replica in a chain
+                // that is closed before its upstream feeder.
+                let shutdown = Arc::clone(&self.io_shutdown);
                 // Wave 9-A fix 2: capture a Weak<Self> so the I/O thread
                 // can call `bootstrap_via_dispatcher` automatically when
                 // the master signals `NeedsRestore`.  When the env was
@@ -2254,12 +2300,18 @@ impl ReplicatedEnvironment {
                         const MAX_AUTO_BOOTSTRAP_ATTEMPTS: u32 = 2;
                         let mut attempts: u32 = 0;
                         loop {
+                            // Observe close before (re)connecting so a
+                            // shutdown between catch-up attempts exits
+                            // promptly.
+                            if shutdown.load(Ordering::SeqCst) {
+                                return;
+                            }
                             log::info!(
                                 "noxu-replica-{}: connecting to master '{}' at {}",
                                 node_name, master, addr,
                             );
-                            match crate::stream::peer_feeder::catch_up_from_peer(
-                                addr, 0, &mut writer,
+                            match crate::stream::peer_feeder::catch_up_from_peer_until(
+                                addr, 0, &mut writer, &shutdown,
                             ) {
                                 Ok(true) => {
                                     log::info!(
@@ -2343,7 +2395,7 @@ impl ReplicatedEnvironment {
                                     }
                                 }
                                 Err(e) => {
-                                    if !shutdown_flag {
+                                    if !shutdown.load(Ordering::SeqCst) {
                                         log::error!(
                                             "noxu-replica-{}: error from master '{}': {e}",
                                             node_name, master,
