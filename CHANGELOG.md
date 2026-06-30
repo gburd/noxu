@@ -17,6 +17,31 @@ listed in [References](#references).
 
 ### Added
 
+- **Deterministic Simulation Testing (DST) Milestone 1 — seed-reproducible
+  storage-fault crash gate.** A Noxu-native DST harness (JE has no analogue)
+  that makes crash/recovery a pure function of `(seed, workload)`:
+  - `noxu-util`: an injectable `Clock` trait (`now_unix_ms` / `now_nanos` /
+    `sleep`) with `RealClock` (the production default — delegates to stdlib,
+    zero behavior change) and `SimClock` (atomic tick + `advance`, time only
+    moves when the harness drives it); a seeded `Prng` (`xorshift64*`) that the
+    harness draws every fault decision from; and `ttl::is_expired_with(clock,
+    ...)` for clock-aware TTL expiry. DST is strictly opt-in.
+  - `noxu-log`: a `faultdisk` fault layer over the positioned-I/O chokepoint
+    (`posio`'s four functions) plus the fsync path, injecting per-seed **torn
+    writes** (write a prefix then power-cut so the tail + later writes never
+    reach disk), **fsync drop** (ack durability without flushing, then
+    power-cut), **disk-full** (`ENOSPC`), and **corruption** (bit-rot). Gated
+    behind one process-global `AtomicBool` never set by production code —
+    inactive = one relaxed atomic load, then the real path.
+  - `noxu-db`: `tests/dst_crash_sweep.rs` — a fast subset (~120 seeds, &lt;60s)
+    for local dev / PR CI and a `#[ignore]` `long_sweep` (10k seeds) release
+    gate, asserting no-lost-committed-txn (strict prefix) + no-uncommitted-leak
+    + total-recovery on every seed. The `crash_worker` reads `NOXU_DST_SEED`
+    and installs the fault disk; a failing seed reproduces byte-for-byte
+    (`NOXU_DST_SEED=<n>` is printed). This closes the in-process
+    kernel-buffer-drop power-loss gap the SIGKILL `power_loss_sweep` cannot
+    reach. See `docs/src/contributing/testing-guide.md`.
+
 - **Database / transaction triggers (DB-TRIG).** A new public
   [`Trigger`](noxu_db::Trigger) trait (`crates/noxu-dbi/src/trigger.rs`,
   re-exported from `noxu-db`) is a faithful port of BDB-JE
