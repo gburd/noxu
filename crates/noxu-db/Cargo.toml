@@ -54,6 +54,10 @@ metrics-util = "0.19"
 name = "crash_worker"
 path = "src/bin/crash_worker.rs"
 
+[[bin]]
+name = "noxu-admin"
+path = "src/bin/noxu_admin.rs"
+
 [[bench]]
 name = "api_bench"
 harness = false
