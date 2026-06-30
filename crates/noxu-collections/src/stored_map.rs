@@ -525,7 +525,7 @@ mod tests {
         let db = open_db(&env, "accessor");
         let map: StoredMap<'_, i32, String, _, _> =
             StoredMap::new(&db, IntBinding, StringBinding);
-        assert_eq!(map.database().get_database_name(), "accessor");
+        assert_eq!(map.database().name(), "accessor");
     }
 
     #[test]

@@ -32,14 +32,14 @@ impl ScanResult {
     /// Returns `true` for [`ScanResult::Include`] and [`ScanResult::IncludeStop`].
     ///
     ///
-    pub fn get_include(self) -> bool {
+    pub fn included(self) -> bool {
         matches!(self, ScanResult::Include | ScanResult::IncludeStop)
     }
 
     /// Returns `true` for [`ScanResult::IncludeStop`] and [`ScanResult::ExcludeStop`].
     ///
     ///
-    pub fn get_stop(self) -> bool {
+    pub fn stops(self) -> bool {
         matches!(self, ScanResult::IncludeStop | ScanResult::ExcludeStop)
     }
 }
@@ -85,26 +85,26 @@ mod tests {
 
     #[test]
     fn test_scan_result_include() {
-        assert!(ScanResult::Include.get_include());
-        assert!(!ScanResult::Include.get_stop());
+        assert!(ScanResult::Include.included());
+        assert!(!ScanResult::Include.stops());
     }
 
     #[test]
     fn test_scan_result_exclude() {
-        assert!(!ScanResult::Exclude.get_include());
-        assert!(!ScanResult::Exclude.get_stop());
+        assert!(!ScanResult::Exclude.included());
+        assert!(!ScanResult::Exclude.stops());
     }
 
     #[test]
     fn test_scan_result_include_stop() {
-        assert!(ScanResult::IncludeStop.get_include());
-        assert!(ScanResult::IncludeStop.get_stop());
+        assert!(ScanResult::IncludeStop.included());
+        assert!(ScanResult::IncludeStop.stops());
     }
 
     #[test]
     fn test_scan_result_exclude_stop() {
-        assert!(!ScanResult::ExcludeStop.get_include());
-        assert!(ScanResult::ExcludeStop.get_stop());
+        assert!(!ScanResult::ExcludeStop.included());
+        assert!(ScanResult::ExcludeStop.stops());
     }
 
     struct AlwaysInclude;

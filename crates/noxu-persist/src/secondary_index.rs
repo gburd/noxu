@@ -170,7 +170,7 @@ where
         let found =
             self.secondary.get_into(txn, &key, &mut p_key, &mut data)?;
         if found {
-            let bytes = data.get_data().ok_or_else(|| {
+            let bytes = data.data_opt().ok_or_else(|| {
                 PersistError::SerializationError(
                     "empty primary data from secondary join".to_string(),
                 )
@@ -314,7 +314,7 @@ where
         };
 
         while status == OperationStatus::Success {
-            match (key.get_data(), data.get_data()) {
+            match (key.data_opt(), data.data_opt()) {
                 (Some(sk_bytes), Some(data_bytes)) => {
                     let sk = SK::from_bytes(sk_bytes);
                     let ent = self.decode_primary(data_bytes, serializer);
@@ -356,7 +356,7 @@ where
             .get_first(&mut key, &mut p_key, &mut data)
             .unwrap_or(OperationStatus::NotFound);
         while status == OperationStatus::Success {
-            if let (Some(sk_b), Some(pk_b)) = (key.get_data(), p_key.get_data())
+            if let (Some(sk_b), Some(pk_b)) = (key.data_opt(), p_key.data_opt())
                 && let (Ok(sk), Ok(pk)) =
                     (SK::from_bytes(sk_b), PK::from_bytes(pk_b))
             {
@@ -385,7 +385,7 @@ where
             .get_search_key(&search, &mut p_key, &mut data)
             .unwrap_or(OperationStatus::NotFound);
         while status == OperationStatus::Success {
-            if let Some(pk_b) = p_key.get_data()
+            if let Some(pk_b) = p_key.data_opt()
                 && let Ok(pk) = PK::from_bytes(pk_b)
             {
                 out.push(pk);
@@ -493,7 +493,7 @@ where
         data: &DatabaseEntry,
         result: &mut DatabaseEntry,
     ) -> bool {
-        let Some(bytes) = data.get_data() else { return false };
+        let Some(bytes) = data.data_opt() else { return false };
         // The deserialize closure peels the per-record class-version
         // envelope and dispatches to `deserialize_versioned` (honouring
         // schema evolution) — identical to `PrimaryIndex::decode_record`.

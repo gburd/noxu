@@ -166,7 +166,7 @@ impl<'a> SecondaryCursor<'a> {
         }
         // p_key_entry now holds the primary key (stored as the secondary value).
         let pri_key = {
-            let bytes = p_key_entry.get_data().unwrap_or(&[]).to_vec();
+            let bytes = p_key_entry.data_opt().unwrap_or(&[]).to_vec();
             DatabaseEntry::from_bytes(&bytes)
         };
 
@@ -328,7 +328,7 @@ impl<'a> SecondaryCursor<'a> {
         }
 
         // stored_pk = the primary key (value of the secondary record).
-        let pri_key_bytes = stored_pk.get_data().unwrap_or(&[]).to_vec();
+        let pri_key_bytes = stored_pk.data_opt().unwrap_or(&[]).to_vec();
         p_key.set_data(&pri_key_bytes);
 
         // Fetch primary data under the cursor's txn so the lookup
@@ -347,7 +347,7 @@ impl<'a> SecondaryCursor<'a> {
             }
             return Err(NoxuError::SecondaryIntegrityException(format!(
                 "Secondary '{}' refers to missing primary key",
-                self.secondary_db.get_database_name()
+                self.secondary_db.name()
             )));
         }
 
@@ -381,7 +381,7 @@ impl<'a> SecondaryCursor<'a> {
         // `Cursor::get` for SearchGte already wrote the discovered key
         // back into `search_key`; copy the primary key out of the inner
         // cursor's data slot and resolve the primary record.
-        let pri_key_bytes = stored_pk.get_data().unwrap_or(&[]).to_vec();
+        let pri_key_bytes = stored_pk.data_opt().unwrap_or(&[]).to_vec();
         p_key.set_data(&pri_key_bytes);
 
         let pri_key_entry = DatabaseEntry::from_bytes(&pri_key_bytes);
@@ -394,7 +394,7 @@ impl<'a> SecondaryCursor<'a> {
             }
             return Err(NoxuError::SecondaryIntegrityException(format!(
                 "Secondary '{}' refers to missing primary key",
-                self.secondary_db.get_database_name()
+                self.secondary_db.name()
             )));
         }
 
@@ -438,7 +438,7 @@ impl<'a> SecondaryCursor<'a> {
         if status != OperationStatus::Success {
             return Ok(None);
         }
-        Ok(pri_key_entry.get_data().map(|d| d.to_vec()))
+        Ok(pri_key_entry.data_opt().map(|d| d.to_vec()))
     }
 
     /// Returns the secondary key bytes at the current cursor position.
@@ -460,7 +460,7 @@ impl<'a> SecondaryCursor<'a> {
         if status != OperationStatus::Success {
             return Ok(None);
         }
-        Ok(sec_key.get_data().map(|d| d.to_vec()))
+        Ok(sec_key.data_opt().map(|d| d.to_vec()))
     }
 
     /// Returns an estimate of the number of primary keys that share the
@@ -492,7 +492,7 @@ impl<'a> SecondaryCursor<'a> {
         if status != OperationStatus::Success {
             return Ok(OperationStatus::NotFound);
         }
-        let new_sk = sec_key.get_data().map(|d| d.to_vec()).unwrap_or_default();
+        let new_sk = sec_key.data_opt().map(|d| d.to_vec()).unwrap_or_default();
         if new_sk == current_sk {
             Ok(OperationStatus::Success)
         } else {
@@ -585,7 +585,7 @@ impl<'a> SecondaryCursor<'a> {
 
         // Step 2: the "data" from the inner cursor IS the primary key.
         let pri_key_bytes =
-            pri_key_bytes_entry.get_data().unwrap_or(&[]).to_vec();
+            pri_key_bytes_entry.data_opt().unwrap_or(&[]).to_vec();
         p_key.set_data(&pri_key_bytes);
 
         // Step 3: look up the primary record under the cursor's txn so
@@ -607,7 +607,7 @@ impl<'a> SecondaryCursor<'a> {
             }
             return Err(NoxuError::SecondaryIntegrityException(format!(
                 "Secondary '{}' refers to missing primary key",
-                self.secondary_db.get_database_name()
+                self.secondary_db.name()
             )));
         }
 
@@ -639,7 +639,7 @@ impl<'a> SecondaryCursor<'a> {
             return Ok(OperationStatus::NotFound);
         }
 
-        let new_sk = key.get_data().map(|d| d.to_vec()).unwrap_or_default();
+        let new_sk = key.data_opt().map(|d| d.to_vec()).unwrap_or_default();
         if new_sk == current_sk {
             Ok(OperationStatus::Success)
         } else {
@@ -682,7 +682,7 @@ mod tests {
             data: &DatabaseEntry,
             result: &mut DatabaseEntry,
         ) -> bool {
-            if let Some(d) = data.get_data()
+            if let Some(d) = data.data_opt()
                 && !d.is_empty()
             {
                 result.set_data(&d[..1]);
@@ -753,12 +753,12 @@ mod tests {
         let status =
             cursor.get_first(&mut sec_key, &mut p_key, &mut data).unwrap();
         assert_eq!(status, OperationStatus::Success);
-        assert_eq!(data.get_data().unwrap(), b"Apple");
+        assert_eq!(data.data_opt().unwrap(), b"Apple");
 
         let status =
             cursor.get_last(&mut sec_key, &mut p_key, &mut data).unwrap();
         assert_eq!(status, OperationStatus::Success);
-        assert_eq!(data.get_data().unwrap(), b"Cherry");
+        assert_eq!(data.data_opt().unwrap(), b"Cherry");
     }
 
     #[test]
@@ -777,7 +777,7 @@ mod tests {
         let mut status =
             cursor.get_first(&mut sec_key, &mut p_key, &mut data).unwrap();
         while status == OperationStatus::Success {
-            results.push(data.get_data().unwrap().to_vec());
+            results.push(data.data_opt().unwrap().to_vec());
             status =
                 cursor.get_next(&mut sec_key, &mut p_key, &mut data).unwrap();
         }
@@ -802,8 +802,8 @@ mod tests {
         let status =
             cursor.get_search_key(&search, &mut p_key, &mut data).unwrap();
         assert_eq!(status, OperationStatus::Success);
-        assert_eq!(data.get_data().unwrap(), b"Mango");
-        assert_eq!(p_key.get_data().unwrap(), b"pk1");
+        assert_eq!(data.data_opt().unwrap(), b"Mango");
+        assert_eq!(p_key.data_opt().unwrap(), b"pk1");
     }
 
     #[test]
@@ -869,19 +869,19 @@ mod tests {
         let status =
             cursor.get_last(&mut sec_key, &mut p_key, &mut data).unwrap();
         assert_eq!(status, OperationStatus::Success);
-        assert_eq!(data.get_data().unwrap(), b"Cherry");
+        assert_eq!(data.data_opt().unwrap(), b"Cherry");
 
         // Step back to prev
         let status =
             cursor.get_prev(&mut sec_key, &mut p_key, &mut data).unwrap();
         assert_eq!(status, OperationStatus::Success);
-        assert_eq!(data.get_data().unwrap(), b"Banana");
+        assert_eq!(data.data_opt().unwrap(), b"Banana");
 
         // Step back again
         let status =
             cursor.get_prev(&mut sec_key, &mut p_key, &mut data).unwrap();
         assert_eq!(status, OperationStatus::Success);
-        assert_eq!(data.get_data().unwrap(), b"Apple");
+        assert_eq!(data.data_opt().unwrap(), b"Apple");
 
         // No more prev
         let status =
@@ -903,7 +903,7 @@ mod tests {
         let status =
             cursor.get_first(&mut sec_key, &mut p_key, &mut data).unwrap();
         assert_eq!(status, OperationStatus::Success);
-        assert_eq!(data.get_data().unwrap(), b"Mango");
+        assert_eq!(data.data_opt().unwrap(), b"Mango");
 
         // get_current should return the same record
         let mut sec_key2 = DatabaseEntry::new();
@@ -912,8 +912,8 @@ mod tests {
         let status2 =
             cursor.get_current(&mut sec_key2, &mut p_key2, &mut data2).unwrap();
         assert_eq!(status2, OperationStatus::Success);
-        assert_eq!(data2.get_data().unwrap(), b"Mango");
-        assert_eq!(p_key2.get_data(), p_key.get_data());
+        assert_eq!(data2.data_opt().unwrap(), b"Mango");
+        assert_eq!(p_key2.data_opt(), p_key.data_opt());
     }
 
     #[test]
@@ -933,7 +933,7 @@ mod tests {
             .get_search_key_range(&mut search_key, &mut p_key, &mut data)
             .unwrap();
         assert_eq!(status, OperationStatus::Success);
-        assert_eq!(data.get_data().unwrap(), b"Banana");
+        assert_eq!(data.data_opt().unwrap(), b"Banana");
     }
 
     #[test]
@@ -953,7 +953,7 @@ mod tests {
             .get_search_key_range(&mut search_key, &mut p_key, &mut data)
             .unwrap();
         assert_eq!(status, OperationStatus::Success);
-        assert_eq!(data.get_data().unwrap(), b"Cherry");
+        assert_eq!(data.data_opt().unwrap(), b"Cherry");
     }
 
     #[test]
@@ -990,11 +990,11 @@ mod tests {
         // Forward traversal via Next
         let s = cursor.get_first(&mut sec_key, &mut p_key, &mut data).unwrap();
         assert_eq!(s, OperationStatus::Success);
-        let first_data = data.get_data().unwrap().to_vec();
+        let first_data = data.data_opt().unwrap().to_vec();
 
         let s = cursor.get_next(&mut sec_key, &mut p_key, &mut data).unwrap();
         assert_eq!(s, OperationStatus::Success);
-        let second_data = data.get_data().unwrap().to_vec();
+        let second_data = data.data_opt().unwrap().to_vec();
 
         // The two records should differ
         assert_ne!(first_data, second_data);
@@ -1002,12 +1002,12 @@ mod tests {
         // Jump to last
         let s = cursor.get_last(&mut sec_key, &mut p_key, &mut data).unwrap();
         assert_eq!(s, OperationStatus::Success);
-        assert_eq!(data.get_data().unwrap(), b"Durian");
+        assert_eq!(data.data_opt().unwrap(), b"Durian");
 
         // Prev from last
         let s = cursor.get_prev(&mut sec_key, &mut p_key, &mut data).unwrap();
         assert_eq!(s, OperationStatus::Success);
-        assert_eq!(data.get_data().unwrap(), b"Cherry");
+        assert_eq!(data.data_opt().unwrap(), b"Cherry");
     }
 
     #[test]
@@ -1023,8 +1023,8 @@ mod tests {
         let status =
             cursor.get_search_key(&search, &mut p_key, &mut data).unwrap();
         assert_eq!(status, OperationStatus::Success);
-        assert_eq!(p_key.get_data().unwrap(), b"mypk");
-        assert_eq!(data.get_data().unwrap(), b"Kiwi");
+        assert_eq!(p_key.data_opt().unwrap(), b"mypk");
+        assert_eq!(data.data_opt().unwrap(), b"Kiwi");
     }
 
     #[test]

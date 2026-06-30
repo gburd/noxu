@@ -1148,8 +1148,8 @@ impl Transaction {
             })
     }
 
-    /// Get the transaction ID.
-    pub fn get_id(&self) -> u64 {
+    /// Returns the transaction ID.
+    pub fn id(&self) -> u64 {
         self.id
     }
 
@@ -1166,7 +1166,7 @@ impl Transaction {
     /// Returns the caller-supplied transaction name, if any.
     ///
     /// Mirrors `Transaction.getName()`.
-    pub fn get_name(&self) -> Option<String> {
+    pub fn name(&self) -> Option<String> {
         self.name.lock().unwrap().clone()
     }
 
@@ -1206,14 +1206,14 @@ impl Transaction {
         }
     }
 
-    /// Get the current transaction state.
-    pub fn get_state(&self) -> TransactionState {
+    /// Returns the current transaction state.
+    pub fn state(&self) -> TransactionState {
         *self.state.lock().unwrap()
     }
 
     /// Check if the transaction is valid (in Open state).
     pub fn is_valid(&self) -> bool {
-        matches!(self.get_state(), TransactionState::Open)
+        matches!(self.state(), TransactionState::Open)
     }
 
     /// Set the lock timeout for this transaction.
@@ -1224,8 +1224,8 @@ impl Transaction {
         *self.lock_timeout_ms.lock().unwrap() = timeout_ms;
     }
 
-    /// Get the lock timeout for this transaction.
-    pub fn get_lock_timeout(&self) -> u64 {
+    /// Returns the lock timeout for this transaction.
+    pub fn lock_timeout(&self) -> u64 {
         *self.lock_timeout_ms.lock().unwrap()
     }
 
@@ -1237,13 +1237,13 @@ impl Transaction {
         *self.txn_timeout_ms.lock().unwrap() = timeout_ms;
     }
 
-    /// Get the transaction timeout for this transaction.
-    pub fn get_txn_timeout(&self) -> u64 {
+    /// Returns the transaction timeout for this transaction.
+    pub fn txn_timeout(&self) -> u64 {
         *self.txn_timeout_ms.lock().unwrap()
     }
 
-    /// Get the durability setting for this transaction.
-    pub fn get_durability(&self) -> Option<Durability> {
+    /// Returns the durability setting for this transaction.
+    pub fn durability(&self) -> Option<Durability> {
         self.durability
     }
 
@@ -1262,7 +1262,7 @@ impl Transaction {
     /// # Errors
     /// Returns error if the transaction is not Open.
     fn check_open(&self) -> Result<()> {
-        let state = self.get_state();
+        let state = self.state();
         match state {
             TransactionState::Open => Ok(()),
             TransactionState::Prepared => Err(NoxuError::OperationNotAllowed(
@@ -1335,8 +1335,8 @@ mod tests {
     fn test_new_transaction() {
         let config = TransactionConfig::default();
         let txn = Transaction::new(1, config);
-        assert_eq!(txn.get_id(), 1);
-        assert_eq!(txn.get_state(), TransactionState::Open);
+        assert_eq!(txn.id(), 1);
+        assert_eq!(txn.state(), TransactionState::Open);
         assert!(txn.is_valid());
         assert!(!txn.is_read_only());
     }
@@ -1348,14 +1348,14 @@ mod tests {
     fn test_set_name_get_name_round_trip() {
         let config = TransactionConfig::default();
         let txn = Transaction::new(1, config);
-        assert_eq!(txn.get_name(), None);
+        assert_eq!(txn.name(), None);
 
         txn.set_name("workload-import");
-        assert_eq!(txn.get_name().as_deref(), Some("workload-import"));
+        assert_eq!(txn.name().as_deref(), Some("workload-import"));
 
         // Setting again replaces.
         txn.set_name("workload-import-2");
-        assert_eq!(txn.get_name().as_deref(), Some("workload-import-2"));
+        assert_eq!(txn.name().as_deref(), Some("workload-import-2"));
     }
 
     /// `lock_count` and
@@ -1383,7 +1383,7 @@ mod tests {
         let config = TransactionConfig::default();
         let txn = Transaction::new(3, config);
         assert!(txn.commit().is_ok());
-        assert_eq!(txn.get_state(), TransactionState::Committed);
+        assert_eq!(txn.state(), TransactionState::Committed);
         assert!(!txn.is_valid());
     }
 
@@ -1405,7 +1405,7 @@ mod tests {
         let config = TransactionConfig::default();
         let txn = Transaction::new(5, config);
         assert!(txn.abort().is_ok());
-        assert_eq!(txn.get_state(), TransactionState::Aborted);
+        assert_eq!(txn.state(), TransactionState::Aborted);
         assert!(!txn.is_valid());
     }
 
@@ -1440,18 +1440,18 @@ mod tests {
     fn test_lock_timeout() {
         let config = TransactionConfig::default();
         let txn = Transaction::new(9, config);
-        assert_eq!(txn.get_lock_timeout(), 0);
+        assert_eq!(txn.lock_timeout(), 0);
         txn.set_lock_timeout(5000);
-        assert_eq!(txn.get_lock_timeout(), 5000);
+        assert_eq!(txn.lock_timeout(), 5000);
     }
 
     #[test]
     fn test_txn_timeout() {
         let config = TransactionConfig::default();
         let txn = Transaction::new(10, config);
-        assert_eq!(txn.get_txn_timeout(), 0);
+        assert_eq!(txn.txn_timeout(), 0);
         txn.set_txn_timeout(10000);
-        assert_eq!(txn.get_txn_timeout(), 10000);
+        assert_eq!(txn.txn_timeout(), 10000);
     }
 
     #[test]
@@ -1459,7 +1459,7 @@ mod tests {
         let dur = Durability::COMMIT_SYNC;
         let config = TransactionConfig::default().with_durability(dur);
         let txn = Transaction::new(11, config);
-        assert_eq!(txn.get_durability(), Some(dur));
+        assert_eq!(txn.durability(), Some(dur));
     }
 
     #[test]
@@ -1477,7 +1477,7 @@ mod tests {
         let txn = Transaction::new(13, config);
         let dur = Durability::COMMIT_NO_SYNC;
         assert!(txn.commit_with_durability(dur).is_ok());
-        assert_eq!(txn.get_state(), TransactionState::Committed);
+        assert_eq!(txn.state(), TransactionState::Committed);
     }
 
     #[test]
@@ -1488,12 +1488,12 @@ mod tests {
             let mut state = txn.state.lock().unwrap();
             *state = TransactionState::MustAbort;
         }
-        assert_eq!(txn.get_state(), TransactionState::MustAbort);
+        assert_eq!(txn.state(), TransactionState::MustAbort);
         assert!(!txn.is_valid());
 
         // Can still abort a MustAbort transaction
         assert!(txn.abort().is_ok());
-        assert_eq!(txn.get_state(), TransactionState::Aborted);
+        assert_eq!(txn.state(), TransactionState::Aborted);
     }
 
     #[test]
@@ -1518,15 +1518,15 @@ mod tests {
         let config = TransactionConfig::default();
         // Open -> Committed
         let txn1 = Transaction::new(16, config.clone());
-        assert_eq!(txn1.get_state(), TransactionState::Open);
+        assert_eq!(txn1.state(), TransactionState::Open);
         txn1.commit().unwrap();
-        assert_eq!(txn1.get_state(), TransactionState::Committed);
+        assert_eq!(txn1.state(), TransactionState::Committed);
 
         // Open -> Aborted
         let txn2 = Transaction::new(17, config);
-        assert_eq!(txn2.get_state(), TransactionState::Open);
+        assert_eq!(txn2.state(), TransactionState::Open);
         txn2.abort().unwrap();
-        assert_eq!(txn2.get_state(), TransactionState::Aborted);
+        assert_eq!(txn2.state(), TransactionState::Aborted);
     }
 
     #[test]
@@ -1534,6 +1534,6 @@ mod tests {
         let config = TransactionConfig::default();
         let txn1 = Transaction::new(100, config.clone());
         let txn2 = Transaction::new(101, config);
-        assert_ne!(txn1.get_id(), txn2.get_id());
+        assert_ne!(txn1.id(), txn2.id());
     }
 }

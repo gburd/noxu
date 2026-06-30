@@ -299,7 +299,7 @@ mod tests {
                 Employee { id, name: String::new(), department: String::new() };
             let mut key_entry = DatabaseEntry::new();
             binding.object_to_key(&emp, &mut key_entry).unwrap();
-            key_entry.get_data().unwrap().to_vec()
+            key_entry.data_opt().unwrap().to_vec()
         };
 
         let b0 = key_bytes(0);
@@ -330,7 +330,7 @@ mod tests {
             };
             let mut key_entry = DatabaseEntry::new();
             binding.object_to_key(&emp, &mut key_entry).unwrap();
-            key_entry.get_data().unwrap().to_vec()
+            key_entry.data_opt().unwrap().to_vec()
         };
 
         let vals = [i64::MIN, -1000i64, -1, 0, 1, 1000, i64::MAX];
@@ -360,7 +360,7 @@ mod tests {
             };
             let mut key_entry = DatabaseEntry::new();
             binding.object_to_key(&emp, &mut key_entry).unwrap();
-            key_entry.get_data().unwrap().to_vec()
+            key_entry.data_opt().unwrap().to_vec()
         };
 
         assert!(key_bytes("a") < key_bytes("b"));
@@ -393,7 +393,7 @@ mod tests {
             let entity = (k, String::new());
             let mut key_entry = DatabaseEntry::new();
             binding.object_to_key(&entity, &mut key_entry).unwrap();
-            key_entry.get_data().unwrap().to_vec()
+            key_entry.data_opt().unwrap().to_vec()
         };
 
         let vals = [0u32, 1, 2, 10, 100, 1000, u32::MAX];

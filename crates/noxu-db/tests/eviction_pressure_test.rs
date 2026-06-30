@@ -58,7 +58,7 @@ fn eviction_bounds_cache_and_preserves_data() {
     // it is at least bounded below the full working set (i.e. eviction did
     // something) — a non-evicting (inert) evictor would let usage grow to the
     // full ~6 MB.
-    let stats = env.get_stats().unwrap();
+    let stats = env.stats().unwrap();
     assert!(
         stats.cache_usage < 6 * 1024 * 1024,
         "eviction must bound cache_usage below the full working set; got {} bytes",
@@ -101,7 +101,7 @@ fn delete_heavy_does_not_inflate_cache_usage() {
         }
     }
     let _ = env.evict_memory().unwrap();
-    let stats = env.get_stats().unwrap();
+    let stats = env.stats().unwrap();
     // After 40k inserts + 40k deletes of a ~2k-key working set, usage must stay
     // bounded (the live set is small). A data_len leak on delete would make
     // this grow without bound across rounds.

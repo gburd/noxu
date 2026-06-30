@@ -73,7 +73,7 @@ impl WriteOptions {
     ///
     /// Returns 0 if no TTL is set.  Uses `noxu_util::ttl_hours_to_expiration`
     /// to compute the expiration time relative to now.
-    pub fn get_expiration_time(&self) -> u32 {
+    pub fn expiration_time(&self) -> u32 {
         noxu_util::ttl_hours_to_expiration(self.ttl as u32)
     }
 }

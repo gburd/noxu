@@ -318,7 +318,7 @@ impl CashStore {
             let mut db_val = DatabaseEntry::new();
             match self.db.get_into(None, &db_key, &mut db_val) {
                 Ok(true) => {
-                    if let Some(raw) = db_val.get_data() {
+                    if let Some(raw) = db_val.data_opt() {
                         if let Some((flags, cas_token, data)) =
                             decode_value(raw)
                         {
@@ -694,7 +694,7 @@ impl CashStore {
         let mut db_val = DatabaseEntry::new();
         match self.db.get_into(None, &db_key, &mut db_val) {
             Ok(true) => {
-                let raw = db_val.get_data()?;
+                let raw = db_val.data_opt()?;
                 let (flags, cas_token, data) = decode_value(raw)?;
                 let expiry = self.ttl.read().get_expiry(key);
                 let remaining = expiry

@@ -456,7 +456,7 @@ fn load_no_overwrite_keeps_existing() {
     let mut val = DatabaseEntry::new();
     let status = db.get_into(None, &key, &mut val).unwrap();
     assert!(status);
-    assert_eq!(val.get_data(), Some(b"PRESERVE".as_ref()));
+    assert_eq!(val.data_opt(), Some(b"PRESERVE".as_ref()));
     drop(db);
     env.close().unwrap();
 }

@@ -72,7 +72,7 @@ fn d5_insert_before_positioned_cursor_get_current_still_returns_k() {
     let cs = cursor.get(&mut ck, &mut cd, Get::Current, None).unwrap();
     assert_eq!(cs, OperationStatus::Success, "Get::Current after insert-shift");
     assert_eq!(
-        ck.get_data().unwrap_or(&[]),
+        ck.data_opt().unwrap_or(&[]),
         b"bravo",
         "D5: cursor must still be on 'bravo' after insert shifted its index"
     );
@@ -112,7 +112,7 @@ fn d1_delete_then_next_returns_successor() {
         "D1: Next after delete must return successor, not NotFound"
     );
     assert_eq!(
-        nk.get_data().unwrap_or(&[]),
+        nk.data_opt().unwrap_or(&[]),
         b"C",
         "D1: successor key must be 'C'"
     );
@@ -148,7 +148,7 @@ fn d1_delete_then_prev_returns_predecessor() {
         "D1: Prev after delete must return predecessor"
     );
     assert_eq!(
-        pk.get_data().unwrap_or(&[]),
+        pk.data_opt().unwrap_or(&[]),
         b"A",
         "D1: predecessor must be 'A'"
     );

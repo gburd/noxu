@@ -34,7 +34,7 @@ proptest! {
     fn prop_database_entry_clone_equality(data: Vec<u8>) {
         let entry = DatabaseEntry::from_data(&data);
         let cloned = entry.clone();
-        prop_assert_eq!(entry.get_data(), cloned.get_data());
+        prop_assert_eq!(entry.data_opt(), cloned.data_opt());
         prop_assert_eq!(entry, cloned);
     }
 

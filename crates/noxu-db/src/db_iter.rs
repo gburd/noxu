@@ -105,8 +105,8 @@ impl<'txn> Iterator for DbIter<'txn> {
                 Some(Err(e))
             }
             Ok(OperationStatus::Success) => {
-                let k = key.get_data().unwrap_or(&[]).to_vec();
-                let v = val.get_data().unwrap_or(&[]).to_vec();
+                let k = key.data_opt().unwrap_or(&[]).to_vec();
+                let v = val.data_opt().unwrap_or(&[]).to_vec();
                 Some(Ok((k, v)))
             }
             Ok(_) => {
@@ -205,8 +205,8 @@ impl<'txn> Iterator for DbRange<'txn> {
                     return Some(Err(e));
                 }
                 Ok(OperationStatus::Success) => {
-                    let k = key_entry.get_data().unwrap_or(&[]).to_vec();
-                    let v = val_entry.get_data().unwrap_or(&[]).to_vec();
+                    let k = key_entry.data_opt().unwrap_or(&[]).to_vec();
+                    let v = val_entry.data_opt().unwrap_or(&[]).to_vec();
                     if self.past_end(&k) {
                         self.done = true;
                         return None;
@@ -238,8 +238,8 @@ impl<'txn> Iterator for DbRange<'txn> {
                 Some(Err(e))
             }
             Ok(OperationStatus::Success) => {
-                let k = key_entry.get_data().unwrap_or(&[]).to_vec();
-                let v = val_entry.get_data().unwrap_or(&[]).to_vec();
+                let k = key_entry.data_opt().unwrap_or(&[]).to_vec();
+                let v = val_entry.data_opt().unwrap_or(&[]).to_vec();
                 if self.past_end(&k) {
                     self.done = true;
                     None

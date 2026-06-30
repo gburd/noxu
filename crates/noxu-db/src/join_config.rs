@@ -35,9 +35,4 @@ impl JoinConfig {
         self.no_sort = no_sort;
         self
     }
-
-    /// Returns `true` if automatic cursor sorting is disabled.
-    pub fn get_no_sort(&self) -> bool {
-        self.no_sort
-    }
 }

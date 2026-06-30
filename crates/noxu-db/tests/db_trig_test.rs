@@ -105,7 +105,7 @@ fn headline1_put_delete_old_new_within_txn() {
     let db = e.open_database(None, "t1", &cfg).unwrap();
 
     let txn = e.begin_transaction(None).unwrap();
-    let txn_id = txn.get_id();
+    let txn_id = txn.id();
 
     // Insert: oldData = None, newData = "v1".  JE Trigger.put insert path.
     db.put_in(&txn, ent(b"k"), ent(b"v1")).unwrap();
@@ -192,7 +192,7 @@ fn headline3_abort_fires_and_rolls_back() {
     let db = e.open_database(None, "t3", &cfg).unwrap();
 
     let txn = e.begin_transaction(None).unwrap();
-    let txn_id = txn.get_id();
+    let txn_id = txn.id();
     db.put_in(&txn, ent(b"k"), ent(b"v")).unwrap();
     // The put trigger fired within the txn (it saw the change)...
     assert!(matches!(calls.lock().unwrap().last(), Some(Call::Put { .. })));

@@ -33,7 +33,7 @@ fn test_lock_timeout_propagated_from_config() {
 
     let config = TransactionConfig::new().with_lock_timeout_ms(2500);
     let txn = env.begin_transaction(Some(&config)).unwrap();
-    assert_eq!(txn.get_lock_timeout(), 2500);
+    assert_eq!(txn.lock_timeout(), 2500);
     txn.abort().unwrap();
 }
 
@@ -46,7 +46,7 @@ fn test_txn_timeout_propagated_from_config() {
 
     let config = TransactionConfig::new().with_txn_timeout_ms(8000);
     let txn = env.begin_transaction(Some(&config)).unwrap();
-    assert_eq!(txn.get_txn_timeout(), 8000);
+    assert_eq!(txn.txn_timeout(), 8000);
     txn.abort().unwrap();
 }
 

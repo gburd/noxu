@@ -4,8 +4,8 @@
 
 /// Specifies the attributes of a statistics retrieval operation.
 ///
-/// Pass to [`Environment::get_stats`][crate::environment::Environment::get_stats] or
-/// [`Database::get_stats`][crate::database::Database::get_stats].
+/// Pass to [`Environment::stats`][crate::environment::Environment::stats] or
+/// [`Database::stats`][crate::database::Database::stats].
 ///
 /// # Defaults
 ///

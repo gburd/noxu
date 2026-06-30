@@ -89,7 +89,7 @@ fn dup_cursor_creation_forward_walks_in_sorted_order() {
     let mut s = c.get(&mut k, &mut d, Get::First, None).unwrap();
     while s == OperationStatus::Success {
         let cur =
-            (k.get_data().unwrap().to_vec(), d.get_data().unwrap().to_vec());
+            (k.data_opt().unwrap().to_vec(), d.data_opt().unwrap().to_vec());
         if let Some(p) = &prev {
             assert!(
                 p.0 < cur.0 || (p.0 == cur.0 && p.1 < cur.1),
@@ -141,7 +141,7 @@ fn dup_cursor_creation_backwards_walks_in_reverse_order() {
     let mut s = c.get(&mut k, &mut d, Get::Last, None).unwrap();
     while s == OperationStatus::Success {
         let cur =
-            (k.get_data().unwrap().to_vec(), d.get_data().unwrap().to_vec());
+            (k.data_opt().unwrap().to_vec(), d.data_opt().unwrap().to_vec());
         if let Some(p) = &prev {
             assert!(
                 p.0 > cur.0 || (p.0 == cur.0 && p.1 > cur.1),
@@ -181,7 +181,7 @@ fn dup_cursor_delete_one_dup_leaves_the_other() {
     let mut d = DatabaseEntry::new();
     let s = c.get(&mut k, &mut d, Get::First, None).unwrap();
     assert_eq!(s, OperationStatus::Success);
-    assert_eq!(d.get_data().unwrap(), b"d1");
+    assert_eq!(d.data_opt().unwrap(), b"d1");
     c.delete().unwrap();
 
     // Now d2 should be the only remaining dup.
@@ -189,7 +189,7 @@ fn dup_cursor_delete_one_dup_leaves_the_other() {
     let mut d = DatabaseEntry::new();
     let s = c.get(&mut k, &mut d, Get::First, None).unwrap();
     assert_eq!(s, OperationStatus::Success);
-    assert_eq!(d.get_data().unwrap(), b"d2");
+    assert_eq!(d.data_opt().unwrap(), b"d2");
     let mut k = DatabaseEntry::new();
     let mut d = DatabaseEntry::new();
     let s = c.get(&mut k, &mut d, Get::Next, None).unwrap();
@@ -260,7 +260,7 @@ fn dup_cursor_delete_first_dup_via_positioned_cursor() {
     let mut d = DatabaseEntry::new();
     let mut s = c.get(&mut k, &mut d, Get::First, None).unwrap();
     while s == OperationStatus::Success {
-        found.push(d.get_data().unwrap()[0]);
+        found.push(d.data_opt().unwrap()[0]);
         s = c.get(&mut k, &mut d, Get::Next, None).unwrap();
     }
     assert_eq!(found, vec![1, 2, 3, 4]);
@@ -328,7 +328,7 @@ fn dup_cursor_abort_after_dup_creation_keeps_committed_only() {
     let mut d = DatabaseEntry::new();
     let s = c.get(&mut k, &mut d, Get::First, None).unwrap();
     assert_eq!(s, OperationStatus::Success);
-    assert_eq!(d.get_data().unwrap(), b"firstData");
+    assert_eq!(d.data_opt().unwrap(), b"firstData");
     assert_eq!(c.count().unwrap(), 1, "only one dup must remain after abort");
     let s = c.get(&mut k, &mut d, Get::Next, None).unwrap();
     assert_eq!(s, OperationStatus::NotFound);
@@ -387,7 +387,7 @@ fn cursor_delete_first_via_walk_keeps_rest() {
         let s = c.get(&mut k, &mut d, Get::Next, None).unwrap();
         assert_eq!(s, OperationStatus::Success);
         let mut a = [0u8; 4];
-        a.copy_from_slice(k.get_data().unwrap());
+        a.copy_from_slice(k.data_opt().unwrap());
         assert_eq!(u32::from_be_bytes(a), i);
     }
     drop(c);
@@ -443,7 +443,7 @@ fn cursor_delete_last_via_walk_keeps_rest() {
     let s = c.get(&mut k, &mut d, Get::Last, None).unwrap();
     assert_eq!(s, OperationStatus::Success);
     let mut a = [0u8; 4];
-    a.copy_from_slice(k.get_data().unwrap());
+    a.copy_from_slice(k.data_opt().unwrap());
     assert_eq!(u32::from_be_bytes(a), N - 2);
     drop(c);
     txn.commit().unwrap();

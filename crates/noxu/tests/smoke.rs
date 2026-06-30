@@ -113,7 +113,7 @@ fn smoke_core_open_put_get() {
     let mut out = DatabaseEntry::new();
     let status2 = db.get_into(None, &key2, &mut out).unwrap();
     assert!(status2);
-    assert_eq!(out.get_data(), Some(b"world".as_ref()));
+    assert_eq!(out.data_opt(), Some(b"world".as_ref()));
 }
 
 #[cfg(feature = "persist")]

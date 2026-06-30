@@ -64,7 +64,7 @@ impl PreparedLog {
 
         let mut status = cursor.get(&mut key, &mut val, Get::First, None)?;
         while status == OperationStatus::Success {
-            if let Some(data) = key.get_data() {
+            if let Some(data) = key.data_opt() {
                 if let Some(xid) = Self::key_to_xid(data) {
                     xids.push(xid);
                 }

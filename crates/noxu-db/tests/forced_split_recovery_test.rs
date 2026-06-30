@@ -69,8 +69,8 @@ fn collect_all(db: &noxu_db::Database) -> BTreeMap<Vec<u8>, Vec<u8>> {
     let mut status = cursor.get(&mut key, &mut val, Get::First, None).unwrap();
     while status == OperationStatus::Success {
         map.insert(
-            key.get_data().unwrap_or(&[]).to_vec(),
-            val.get_data().unwrap_or(&[]).to_vec(),
+            key.data_opt().unwrap_or(&[]).to_vec(),
+            val.data_opt().unwrap_or(&[]).to_vec(),
         );
         status = cursor.get(&mut key, &mut val, Get::Next, None).unwrap();
     }
@@ -305,7 +305,7 @@ fn reverse_split_recovers() {
             for _ in 0..2 {
                 let s = c.get(&mut key, &mut val, Get::First, None).unwrap();
                 assert_eq!(s, OperationStatus::Success);
-                let removed = key.get_data().unwrap().to_vec();
+                let removed = key.data_opt().unwrap().to_vec();
                 assert_eq!(c.delete().unwrap(), OperationStatus::Success);
                 expected.remove(&removed);
             }
@@ -384,7 +384,7 @@ fn complete_removal_recovers() {
         // Compress, and make sure the subtree was removed (single BIN).
         let _ = env.compress().unwrap();
         let stats =
-            db.get_stats(Some(&StatsConfig::new().with_fast(false))).unwrap();
+            db.stats(Some(&StatsConfig::new().with_fast(false))).unwrap();
         assert_eq!(
             stats.btree.bottom_internal_node_count, 1,
             "complete-removal: expected exactly 1 BIN after compress, got {}",

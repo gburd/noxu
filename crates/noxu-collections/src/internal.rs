@@ -42,7 +42,7 @@ pub(crate) fn db_get(
     txn: Option<&Transaction>,
     key: &DatabaseEntry,
 ) -> Result<Option<Vec<u8>>> {
-    let k = key.get_data().unwrap_or(&[]);
+    let k = key.data_opt().unwrap_or(&[]);
     let found = match txn {
         Some(t) => db.get_in(t, k)?,
         None => db.get(k)?,
@@ -57,8 +57,8 @@ pub(crate) fn db_put(
     key: &DatabaseEntry,
     data: &DatabaseEntry,
 ) -> Result<()> {
-    let k = key.get_data().unwrap_or(&[]);
-    let v = data.get_data().unwrap_or(&[]);
+    let k = key.data_opt().unwrap_or(&[]);
+    let v = data.data_opt().unwrap_or(&[]);
     match txn {
         Some(t) => db.put_in(t, k, v)?,
         None => db.put(k, v)?,
@@ -74,8 +74,8 @@ pub(crate) fn db_put_no_overwrite(
     key: &DatabaseEntry,
     data: &DatabaseEntry,
 ) -> Result<bool> {
-    let k = key.get_data().unwrap_or(&[]);
-    let v = data.get_data().unwrap_or(&[]);
+    let k = key.data_opt().unwrap_or(&[]);
+    let v = data.data_opt().unwrap_or(&[]);
     let inserted = match txn {
         Some(t) => db.put_no_overwrite_in(t, k, v)?,
         None => db.put_no_overwrite(k, v)?,
@@ -90,7 +90,7 @@ pub(crate) fn db_delete(
     txn: Option<&Transaction>,
     key: &DatabaseEntry,
 ) -> Result<bool> {
-    let k = key.get_data().unwrap_or(&[]);
+    let k = key.data_opt().unwrap_or(&[]);
     let deleted = match txn {
         Some(t) => db.delete_in(t, k)?,
         None => db.delete(k)?,
@@ -224,7 +224,7 @@ where
     // Skip records that fall outside the requested half-range.
     if let Some(bound) = start {
         loop {
-            let cur = key.get_data().unwrap_or(&[]);
+            let cur = key.data_opt().unwrap_or(&[]);
             let in_range = match direction {
                 ScanDirection::Forward => cur >= bound,
                 ScanDirection::Reverse => cur <= bound,

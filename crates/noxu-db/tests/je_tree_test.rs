@@ -67,7 +67,7 @@ fn split_descending_then_ascending_keys_remain_sorted() {
     let mut d = DatabaseEntry::new();
     let mut s = c.get(&mut k, &mut d, Get::First, None).unwrap();
     while s == OperationStatus::Success {
-        let cur = k.get_data().unwrap()[0];
+        let cur = k.data_opt().unwrap()[0];
         if let Some(p) = prev {
             assert!(p < cur, "keys must walk in ascending order: {p} < {cur}");
         }
@@ -120,7 +120,7 @@ fn tree_count_and_validate_keys_forward() {
     let mut d = DatabaseEntry::new();
     let mut s = c.get(&mut k, &mut d, Get::First, None).unwrap();
     while s == OperationStatus::Success {
-        let cur = k.get_data().unwrap().to_vec();
+        let cur = k.data_opt().unwrap().to_vec();
         if let Some(p) = &prev {
             assert!(p < &cur, "forward walk must be sorted");
         }
@@ -162,7 +162,7 @@ fn tree_count_and_validate_keys_backwards() {
     let mut d = DatabaseEntry::new();
     let mut s = c.get(&mut k, &mut d, Get::Last, None).unwrap();
     while s == OperationStatus::Success {
-        let cur = k.get_data().unwrap().to_vec();
+        let cur = k.data_opt().unwrap().to_vec();
         if let Some(p) = &prev {
             assert!(p > &cur, "backward walk must be reverse-sorted");
         }
@@ -208,7 +208,7 @@ fn tree_ascending_insert_walks_in_order() {
         let s = c.get(&mut k, &mut d, Get::Next, None).unwrap();
         assert_eq!(s, OperationStatus::Success);
         let mut a = [0u8; 4];
-        a.copy_from_slice(k.get_data().unwrap());
+        a.copy_from_slice(k.data_opt().unwrap());
         assert_eq!(u32::from_be_bytes(a), i);
     }
     let s = c.get(&mut k, &mut d, Get::Next, None).unwrap();
@@ -240,7 +240,7 @@ fn tree_descending_insert_walks_in_order() {
         let s = c.get(&mut k, &mut d, Get::Next, None).unwrap();
         assert_eq!(s, OperationStatus::Success);
         let mut a = [0u8; 4];
-        a.copy_from_slice(k.get_data().unwrap());
+        a.copy_from_slice(k.data_opt().unwrap());
         assert_eq!(u32::from_be_bytes(a), i);
     }
     drop(c);
@@ -286,7 +286,7 @@ fn key_prefix_basic_long_shared_prefix_round_trip() {
     let mut d = DatabaseEntry::new();
     let mut s = c.get(&mut k, &mut d, Get::First, None).unwrap();
     while s == OperationStatus::Success {
-        walked.push(k.get_data().unwrap().to_vec());
+        walked.push(k.data_opt().unwrap().to_vec());
         s = c.get(&mut k, &mut d, Get::Next, None).unwrap();
     }
     let mut sorted = keys.clone();
@@ -300,7 +300,7 @@ fn key_prefix_basic_long_shared_prefix_round_trip() {
             .get_into(Some(&txn), DatabaseEntry::from_bytes(k), &mut out)
             .unwrap();
         assert!(s);
-        assert_eq!(out.get_data().unwrap(), b"v");
+        assert_eq!(out.data_opt().unwrap(), b"v");
     }
     drop(c);
     txn.commit().unwrap();
@@ -338,7 +338,7 @@ fn key_prefix_many_sequential_round_trip() {
     for i in 0..1000u32 {
         let s = c.get(&mut k, &mut d, Get::Next, None).unwrap();
         assert_eq!(s, OperationStatus::Success);
-        let key_bytes = k.get_data().unwrap();
+        let key_bytes = k.data_opt().unwrap();
         assert_eq!(&key_bytes[..prefix.len()], prefix);
         let mut a = [0u8; 4];
         a.copy_from_slice(&key_bytes[prefix.len()..]);

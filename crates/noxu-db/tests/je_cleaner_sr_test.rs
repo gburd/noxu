@@ -235,7 +235,7 @@ fn sr12885_pending_ln_migration_with_slot_reuse_abort_keeps_data() {
         "SR12885: surviving key 0 must fetch SUCCESS after cleaner migration \
          + slot-reuse + abort (data must not be lost to a cleaned file)"
     );
-    assert_eq!(val.get_data(), Some(data.as_slice()));
+    assert_eq!(val.data_opt(), Some(data.as_slice()));
 
     db.close().unwrap();
     env.close().unwrap();

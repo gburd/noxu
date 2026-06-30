@@ -6,13 +6,13 @@
 //! Periodic metrics exporter (opt-in, requires the `observability` feature).
 //!
 //! This is the Rust analogue of BDB-JE's read-only JMX MBean export: a
-//! background daemon samples [`Environment::get_stats`] on a fixed interval
+//! background daemon samples [`Environment::stats`] on a fixed interval
 //! and publishes every field to the [`metrics`](https://docs.rs/metrics)
 //! facade via [`noxu_observe::export::emit`]. Whichever recorder the
 //! application installed (Prometheus, StatsD, OpenTelemetry, …) then collects
 //! them; with no recorder installed the facade calls are cheap no-ops.
 //!
-//! Because it samples the same snapshot `get_stats()` returns, it covers the
+//! Because it samples the same snapshot `stats()` returns, it covers the
 //! entire stat set that snapshot exposes without touching any hot path.
 //!
 //! ```no_run
@@ -52,7 +52,7 @@ pub struct MetricsExporter {
 
 impl MetricsExporter {
     /// Describe Noxu's metrics, then spawn a daemon that samples
-    /// `env.get_stats()` every `interval` and emits to the `metrics` facade.
+    /// `env.stats()` every `interval` and emits to the `metrics` facade.
     ///
     /// Call after installing a recorder. If the environment is closed the
     /// daemon stops on the next sample.
@@ -60,7 +60,7 @@ impl MetricsExporter {
         noxu_observe::export::describe_export_metrics();
         let daemon =
             DaemonThread::spawn("noxu-metrics-export", interval, move || {
-                match env.get_stats() {
+                match env.stats() {
                     Ok(stats) => {
                         noxu_observe::export::emit(&stats);
                         true
@@ -75,7 +75,7 @@ impl MetricsExporter {
     /// Emit one sample immediately (in the calling thread). Useful in tests
     /// and for a synchronous scrape just before reading a recorder.
     pub fn sample_once(env: &Environment) {
-        if let Ok(stats) = env.get_stats() {
+        if let Ok(stats) = env.stats() {
             noxu_observe::export::emit(&stats);
         }
     }

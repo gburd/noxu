@@ -104,7 +104,7 @@ where
         let mut data = DatabaseEntry::new();
         let next = match cursor.get(&mut key, &mut data, Get::Last, None)? {
             OperationStatus::Success => {
-                let bytes = key.get_data().unwrap_or(&[]);
+                let bytes = key.data_opt().unwrap_or(&[]);
                 if bytes.len() != 8 {
                     let _ = cursor.close();
                     return Err(CollectionError::IllegalState(format!(

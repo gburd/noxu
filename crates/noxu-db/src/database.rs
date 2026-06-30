@@ -250,7 +250,7 @@ impl Database {
         // undo the LN). Pre-fix this was hardcoded to 0, which made
         // every txn-LN look like an auto-commit LN and caused
         // recovery to redo aborted writes.
-        let cursor = self.make_cursor_with_locker(txn.get_id() as i64);
+        let cursor = self.make_cursor_with_locker(txn.id() as i64);
         if let Some(inner) = txn.get_inner_txn() {
             cursor.with_txn(inner)
         } else {
@@ -627,8 +627,8 @@ impl Database {
                 })?;
                 // Partial get: return only the requested slice.
                 if data.is_partial() {
-                    let off = data.get_partial_offset();
-                    let len = data.get_partial_length();
+                    let off = data.partial_offset();
+                    let len = data.partial_length();
                     let end = (off + len).min(value.len());
                     let slice =
                         if off < value.len() { &value[off..end] } else { &[] };
@@ -905,9 +905,9 @@ impl Database {
         // A length mismatch is rejected with a typed error rather than
         // silently truncating (matches JE's exact-equality requirement).
         let write_bytes: Vec<u8> = if data.is_partial() {
-            let new_bytes = data.get_data().unwrap_or(&[]);
-            let off = data.get_partial_offset();
-            let len = data.get_partial_length();
+            let new_bytes = data.data_opt().unwrap_or(&[]);
+            let off = data.partial_offset();
+            let len = data.partial_length();
             if new_bytes.len() != len {
                 return Err(NoxuError::IllegalArgument(format!(
                     "partial put: data length {} does not match \
@@ -929,7 +929,7 @@ impl Database {
             patched[off..off + len].copy_from_slice(new_bytes);
             patched
         } else {
-            data.get_data().unwrap_or(&[]).to_vec()
+            data.data_opt().unwrap_or(&[]).to_vec()
         };
 
         self.put_bytes(txn, key_bytes, &write_bytes)
@@ -1398,27 +1398,27 @@ impl Database {
     /// Returns the database name.
     ///
     ///
-    pub fn get_database_name(&self) -> &str {
+    pub fn name(&self) -> &str {
         &self.name
     }
 
     /// Returns the database configuration.
     ///
     ///
-    pub fn get_config(&self) -> &DatabaseConfig {
+    pub fn config(&self) -> &DatabaseConfig {
         &self.config
     }
 
     /// Returns whether this database was created with sorted duplicates.
     ///
-    /// Unlike `get_config().sorted_duplicates` — which reflects the
+    /// Unlike `config().sorted_duplicates` — which reflects the
     /// `DatabaseConfig` the caller *passed* to `open_database` — this reads
     /// the property stored in the opened `DatabaseImpl`, so it is correct even
     /// when an existing database is reopened without restating its dup-sort
     /// flag (as `noxu-admin dump` does).  Mirrors JE
     /// `Database.getConfig().getSortedDuplicates()` after
     /// `DbInternal.setUseExistingConfig`.
-    pub fn get_sorted_duplicates(&self) -> bool {
+    pub fn sorted_duplicates(&self) -> bool {
         self.db_impl.read().get_sorted_duplicates()
     }
 
@@ -1491,7 +1491,7 @@ impl Database {
         if triggers.is_empty() {
             return;
         }
-        let txn_id = txn.map(Transaction::get_id);
+        let txn_id = txn.map(Transaction::id);
         for trigger in &triggers {
             trigger.put(txn_id, key, old_data, new_data);
         }
@@ -1521,7 +1521,7 @@ impl Database {
         if triggers.is_empty() {
             return;
         }
-        let txn_id = txn.map(Transaction::get_id);
+        let txn_id = txn.map(Transaction::id);
         for trigger in &triggers {
             trigger.delete(txn_id, key, old_data);
         }
@@ -1712,10 +1712,7 @@ impl Database {
     ///
     /// # Errors
     /// Returns an error if the database is closed.
-    pub fn get_stats(
-        &self,
-        config: Option<&StatsConfig>,
-    ) -> Result<DatabaseStats> {
+    pub fn stats(&self, config: Option<&StatsConfig>) -> Result<DatabaseStats> {
         self.check_open()?;
         let fast = config.map(|c| c.fast).unwrap_or(false);
 
@@ -1898,7 +1895,7 @@ impl Database {
         key: &'a DatabaseEntry,
         op: &'static str,
     ) -> Result<&'a [u8]> {
-        match key.get_data() {
+        match key.data_opt() {
             Some(k) => Ok(k),
             None => Err(NoxuError::IllegalArgument(format!(
                 "{op}: key DatabaseEntry has no data; \
@@ -1941,7 +1938,7 @@ mod tests {
     #[test]
     fn test_database_name() {
         let (_temp_dir, _env, db) = temp_env_and_db();
-        assert_eq!(db.get_database_name(), "testdb");
+        assert_eq!(db.name(), "testdb");
     }
 
     #[test]
@@ -1956,7 +1953,7 @@ mod tests {
         let mut retrieved = DatabaseEntry::new();
         let result = db.get_into(None, &key, &mut retrieved).unwrap();
         assert!(result);
-        assert_eq!(retrieved.get_data().unwrap(), b"value1");
+        assert_eq!(retrieved.data_opt().unwrap(), b"value1");
     }
 
     #[test]
@@ -2002,7 +1999,7 @@ mod tests {
         let mut buf = DatabaseEntry::new();
         let status = db.get_into(None, &key, &mut buf).unwrap();
         assert!(status);
-        assert_eq!(buf.get_data().unwrap(), b"hello world");
+        assert_eq!(buf.data_opt().unwrap(), b"hello world");
     }
 
     /// Companion: when data.len() == partial_length the partial put
@@ -2020,7 +2017,7 @@ mod tests {
 
         let mut buf = DatabaseEntry::new();
         db.get_into(None, &key, &mut buf).unwrap();
-        assert_eq!(buf.get_data().unwrap(), b"hello WORLD");
+        assert_eq!(buf.data_opt().unwrap(), b"hello WORLD");
     }
 
     #[test]
@@ -2036,7 +2033,7 @@ mod tests {
 
         let mut retrieved = DatabaseEntry::new();
         db.get_into(None, &key, &mut retrieved).unwrap();
-        assert_eq!(retrieved.get_data().unwrap(), b"value2");
+        assert_eq!(retrieved.data_opt().unwrap(), b"value2");
     }
 
     #[test]
@@ -2065,7 +2062,7 @@ mod tests {
         // Verify original value is unchanged
         let mut retrieved = DatabaseEntry::new();
         db.get_into(None, &key, &mut retrieved).unwrap();
-        assert_eq!(retrieved.get_data().unwrap(), b"value1");
+        assert_eq!(retrieved.data_opt().unwrap(), b"value1");
     }
 
     #[test]
@@ -2202,8 +2199,8 @@ mod tests {
         db1.get_into(None, &key, &mut retrieved1).unwrap();
         db2.get_into(None, &key, &mut retrieved2).unwrap();
 
-        assert_eq!(retrieved1.get_data().unwrap(), b"value1");
-        assert_eq!(retrieved2.get_data().unwrap(), b"value2");
+        assert_eq!(retrieved1.data_opt().unwrap(), b"value1");
+        assert_eq!(retrieved2.data_opt().unwrap(), b"value2");
     }
 
     #[test]
@@ -2218,7 +2215,7 @@ mod tests {
         let mut retrieved = DatabaseEntry::new();
         let result = db.get_into(None, &empty_key, &mut retrieved).unwrap();
         assert!(result);
-        assert_eq!(retrieved.get_data().unwrap(), b"");
+        assert_eq!(retrieved.data_opt().unwrap(), b"");
     }
 
     #[test]
@@ -2232,8 +2229,8 @@ mod tests {
 
         let mut retrieved = DatabaseEntry::new();
         db.get_into(None, &large_key, &mut retrieved).unwrap();
-        assert_eq!(retrieved.get_data().unwrap().len(), 10000);
-        assert!(retrieved.get_data().unwrap().iter().all(|&b| b == b'v'));
+        assert_eq!(retrieved.data_opt().unwrap().len(), 10000);
+        assert!(retrieved.data_opt().unwrap().iter().all(|&b| b == b'v'));
     }
 
     #[test]
@@ -2247,7 +2244,7 @@ mod tests {
 
         let mut retrieved = DatabaseEntry::new();
         db.get_into(None, &binary_key, &mut retrieved).unwrap();
-        assert_eq!(retrieved.get_data().unwrap(), &[255u8, 0, 128, 64, 32]);
+        assert_eq!(retrieved.data_opt().unwrap(), &[255u8, 0, 128, 64, 32]);
     }
 
     #[test]
@@ -2693,7 +2690,7 @@ mod tests {
 
         let mut out = DatabaseEntry::new();
         db.get_into(None, &key, &mut out).unwrap();
-        assert_eq!(out.get_data().unwrap(), b"wopt_val");
+        assert_eq!(out.data_opt().unwrap(), b"wopt_val");
     }
 
     #[test]
@@ -2709,7 +2706,7 @@ mod tests {
         let mut out = DatabaseEntry::new();
         let read_status = db.get_into(None, &key, &mut out).unwrap();
         assert!(read_status);
-        assert_eq!(out.get_data().unwrap(), b"ttl_val");
+        assert_eq!(out.data_opt().unwrap(), b"ttl_val");
     }
 
     #[test]

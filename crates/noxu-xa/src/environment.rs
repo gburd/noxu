@@ -725,7 +725,7 @@ mod tests {
         let mut val = DatabaseEntry::new();
         let status = db.get_into(None, &key, &mut val).unwrap();
         assert!(status);
-        assert_eq!(val.get_data(), Some(b"v1".as_slice()));
+        assert_eq!(val.data_opt(), Some(b"v1".as_slice()));
     }
 
     #[test]

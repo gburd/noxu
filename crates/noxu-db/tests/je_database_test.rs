@@ -55,7 +55,7 @@ fn database_put_existing_overwrite_round_trip() {
         let mut out = DatabaseEntry::new();
         let s = db.get_into(Some(&txn), &k, &mut out).unwrap();
         assert!(s);
-        assert_eq!(out.get_data().unwrap(), d.get_data().unwrap());
+        assert_eq!(out.data_opt().unwrap(), d.data_opt().unwrap());
 
         // Re-insert (overwrite).
         db.put_in(&txn, &k, &d).unwrap();
@@ -66,7 +66,7 @@ fn database_put_existing_overwrite_round_trip() {
         let mut sd = ikey(i);
         let s = c.get(&mut sk, &mut sd, Get::SearchBoth, None).unwrap();
         assert_eq!(s, OperationStatus::Success);
-        assert_eq!(sd.get_data().unwrap(), d.get_data().unwrap());
+        assert_eq!(sd.data_opt().unwrap(), d.data_opt().unwrap());
     }
     txn.commit().unwrap();
 }
@@ -96,7 +96,7 @@ fn database_zero_length_data_round_trip_with_recovery() {
             let mut out = DatabaseEntry::new();
             let s = db.get_into(Some(&txn), &k, &mut out).unwrap();
             assert!(s);
-            assert!(out.get_data().is_some_and(|b| b.is_empty()));
+            assert!(out.data_opt().is_some_and(|b| b.is_empty()));
         }
         txn.commit().unwrap();
         drop(db);
@@ -119,7 +119,7 @@ fn database_zero_length_data_round_trip_with_recovery() {
         let s = db.get_into(Some(&txn), &k, &mut out).unwrap();
         assert!(s);
         assert!(
-            out.get_data().is_some_and(|b| b.is_empty()),
+            out.data_opt().is_some_and(|b| b.is_empty()),
             "zero-length data must survive recovery for key {i}"
         );
     }
@@ -228,7 +228,7 @@ fn database_delete_abort_restores_record() {
     let mut out = DatabaseEntry::new();
     let s = db.get_into(Some(&t2), ikey(delkey), &mut out).unwrap();
     assert!(s, "record must reappear after delete is aborted");
-    assert_eq!(out.get_data().unwrap(), ikey(delkey).get_data().unwrap());
+    assert_eq!(out.data_opt().unwrap(), ikey(delkey).data_opt().unwrap());
     t2.commit().unwrap();
 }
 
@@ -363,7 +363,7 @@ fn database_config_snapshot_after_open() {
 
     // Database stores its own copy: get_config still reports the
     // values the user passed at open time.
-    let stored = db_a.get_config().clone();
+    let stored = db_a.config().clone();
     assert!(stored.allow_create);
     assert!(!stored.sorted_duplicates);
     assert!(stored.transactional);
@@ -374,7 +374,7 @@ fn database_config_snapshot_after_open() {
     let mut other = stored;
     other.sorted_duplicates = true;
     let _ = &other;
-    assert!(!db_a.get_config().sorted_duplicates);
+    assert!(!db_a.config().sorted_duplicates);
 
     db_a.close().unwrap();
     drop(env);
@@ -388,7 +388,7 @@ fn database_config_snapshot_after_open() {
 // transaction handles are accepted for puts and gets.
 //
 // Noxu adaptation: there is no `Database::is_transactional()`; we use
-// `db.get_config().transactional`.
+// `db.config().transactional`.
 // ──────────────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -404,7 +404,7 @@ fn database_config_is_transactional() {
     let cfg =
         DatabaseConfig::new().with_allow_create(true).with_transactional(true);
     let db = env.open_database(Some(&txn), "testDB2", &cfg).unwrap();
-    assert!(db.get_config().transactional);
+    assert!(db.config().transactional);
 
     // Implicit-auto-commit put (txn=None) is accepted on a txn DB.
     db.put(DatabaseEntry::from_bytes(&[0]), DatabaseEntry::from_bytes(&[0]))
@@ -461,8 +461,8 @@ fn database_config_open_read_only_rejects_writes() {
     let cfg_ro =
         DatabaseConfig::new().with_transactional(true).with_read_only(true);
     let db_ro = env.open_database(None, "testDB2", &cfg_ro).unwrap();
-    assert!(db_ro.get_config().read_only);
-    assert!(db_ro.get_config().transactional);
+    assert!(db_ro.config().read_only);
+    assert!(db_ro.config().transactional);
 
     let mut out = DatabaseEntry::new();
     let s = db_ro
@@ -730,7 +730,7 @@ fn database_close_idempotent() {
     let (env, db) = open_env_db(&dir, "close_unop", false);
     db.close().unwrap();
     let _ = db.close();
-    let names = env.get_database_names().unwrap();
+    let names = env.database_names().unwrap();
     assert!(names.iter().any(|n| n == "close_unop"));
 }
 
@@ -842,7 +842,7 @@ fn environment_checkpoint_forces_durability() {
             db.get_into(Some(&txn), ikey(i), &mut out).unwrap(),
             "key {i} must survive checkpoint + reopen"
         );
-        assert_eq!(out.get_data().unwrap(), ikey(i).get_data().unwrap());
+        assert_eq!(out.data_opt().unwrap(), ikey(i).data_opt().unwrap());
     }
     txn.commit().unwrap();
 }

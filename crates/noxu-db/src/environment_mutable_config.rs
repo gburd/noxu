@@ -7,14 +7,14 @@ use crate::durability::Durability;
 /// The subset of environment properties that can be changed after the
 /// environment has been opened.
 ///
-/// Obtain via [`Environment::get_mutable_config`][crate::environment::Environment::get_mutable_config]
+/// Obtain via [`Environment::mutable_config`][crate::environment::Environment::mutable_config]
 /// and apply via [`Environment::set_mutable_config`][crate::environment::Environment::set_mutable_config].
 ///
 /// Implements `EnvironmentMutableConfig`.
 ///
 /// # Example
 /// ```ignore
-/// let mut cfg = env.get_mutable_config()?;
+/// let mut cfg = env.mutable_config()?;
 /// cfg.cache_size = Some(256 * 1024 * 1024); // 256 MiB
 /// env.set_mutable_config(cfg)?;
 /// ```

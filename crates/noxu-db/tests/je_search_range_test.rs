@@ -32,7 +32,7 @@ fn ikey(i: u32) -> DatabaseEntry {
 }
 
 fn val_u32(e: &DatabaseEntry) -> u32 {
-    let bytes = e.get_data().unwrap();
+    let bytes = e.data_opt().unwrap();
     let mut a = [0u8; 4];
     a.copy_from_slice(bytes);
     u32::from_be_bytes(a)

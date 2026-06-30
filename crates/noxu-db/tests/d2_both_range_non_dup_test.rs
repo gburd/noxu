@@ -78,7 +78,7 @@ fn d2_both_range_non_dup_exact_data_returns_success() {
         OperationStatus::Success,
         "D2: BOTH_RANGE on non-dup DB with exact data must succeed"
     );
-    assert_eq!(k.get_data().unwrap_or(&[]), b"key1");
+    assert_eq!(k.data_opt().unwrap_or(&[]), b"key1");
 }
 
 // ── D2: BOTH_RANGE missing key → NotFound ────────────────────────────────────

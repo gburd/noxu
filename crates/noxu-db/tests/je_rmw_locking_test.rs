@@ -246,5 +246,5 @@ fn rmw_read_blocks_concurrent_writer_until_commit() {
     let s =
         db.get_into(None, DatabaseEntry::from_bytes(b"key"), &mut val).unwrap();
     assert!(s);
-    assert_eq!(val.get_data(), Some(b"v2" as &[u8]));
+    assert_eq!(val.data_opt(), Some(b"v2" as &[u8]));
 }

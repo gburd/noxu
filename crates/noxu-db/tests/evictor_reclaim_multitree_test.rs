@@ -112,7 +112,7 @@ fn evictor_reclaims_to_budget_across_user_dbs() {
     }
     let usage_after = env.cache_usage_bytes().unwrap();
 
-    let stats = env.get_stats().unwrap().evictor;
+    let stats = env.stats().unwrap().evictor;
     eprintln!(
         "EVICTOR-RECLAIM-1: budget={} before={} after={} ratio_after={:.3} \
          targeted={} stripped={} evicted={} freed_bytes={}",

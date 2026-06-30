@@ -40,7 +40,7 @@ fn collect_keys(db: &noxu_db::Database) -> Vec<Vec<u8>> {
     let mut d = DatabaseEntry::new();
     let mut s = c.get(&mut k, &mut d, Get::First, None).unwrap();
     while s == OperationStatus::Success {
-        out.push(k.get_data().unwrap_or(&[]).to_vec());
+        out.push(k.data_opt().unwrap_or(&[]).to_vec());
         s = c.get(&mut k, &mut d, Get::Next, None).unwrap();
     }
     out

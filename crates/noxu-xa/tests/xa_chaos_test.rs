@@ -164,7 +164,7 @@ fn test_xa_multi_cluster_2pc() {
         let mut val = DatabaseEntry::new();
         let status = cluster.db.get_into(None, &key, &mut val).unwrap();
         assert!(status);
-        assert_eq!(val.get_data(), Some(format!("val_{i}").as_bytes()),);
+        assert_eq!(val.data_opt(), Some(format!("val_{i}").as_bytes()),);
     }
 }
 
@@ -252,7 +252,7 @@ fn test_xa_mixed_readonly_write() {
     let mut val = DatabaseEntry::new();
     let status = c_write.db.get_into(None, &key, &mut val).unwrap();
     assert!(status);
-    assert_eq!(val.get_data(), Some(b"mixed_val".as_slice()));
+    assert_eq!(val.data_opt(), Some(b"mixed_val".as_slice()));
 }
 
 /// Many independent XA branches with different XIDs — no interference.

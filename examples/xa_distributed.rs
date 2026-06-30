@@ -106,7 +106,7 @@ fn main() {
         .unwrap();
     println!(
         "          DB1 account_alice: {:?}",
-        std::str::from_utf8(val.get_data().unwrap())
+        std::str::from_utf8(val.data_opt().unwrap())
     );
 
     db2.get_into(
@@ -117,7 +117,7 @@ fn main() {
     .unwrap();
     println!(
         "          DB2 ledger_entry:  {:?}",
-        std::str::from_utf8(val.get_data().unwrap())
+        std::str::from_utf8(val.data_opt().unwrap())
     );
 
     println!("\n=== Success: distributed transaction committed atomically ===");

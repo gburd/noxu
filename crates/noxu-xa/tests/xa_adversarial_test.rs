@@ -595,7 +595,7 @@ fn test_rollback_prepared_frees_locks_completely() {
     // Verify
     let mut val = DatabaseEntry::new();
     db.get_into(None, &key, &mut val).unwrap();
-    assert_eq!(val.get_data(), Some(b"second".as_slice()));
+    assert_eq!(val.data_opt(), Some(b"second".as_slice()));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

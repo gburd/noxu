@@ -120,7 +120,7 @@ fn null_lsn_insert_race_two_auto_commit_inserts_serialise_through_lock_manager()
         let mut got = DatabaseEntry::new();
         let key_lookup = DatabaseEntry::from_data(&key_bytes);
         assert!(db.get_into(None, &key_lookup, &mut got).unwrap());
-        let stored = got.get_data().unwrap_or_default();
+        let stored = got.data_opt().unwrap_or_default();
         let winner_value = if r_a { &val_a[..] } else { &val_b[..] };
         assert_eq!(
             stored, winner_value,
@@ -207,7 +207,7 @@ fn null_lsn_insert_race_recovery_has_no_phantom_keys() {
         let mut got = DatabaseEntry::new();
         let status = db_reopen.get_into(None, &key_lookup, &mut got).unwrap();
         assert!(status, "key {key_bytes:?} must persist across reopen");
-        let stored = got.get_data().unwrap_or_default().to_vec();
+        let stored = got.data_opt().unwrap_or_default().to_vec();
         assert_eq!(
             &stored, winner_value,
             "key {key_bytes:?}: stored value must equal the winner's value"
@@ -250,7 +250,7 @@ fn auto_commit_rollback_on_forced_failure_undoes_in_memory_write() {
 
     let mut got = DatabaseEntry::new();
     assert!(db.get_into(None, &key, &mut got).unwrap());
-    assert_eq!(got.get_data(), Some(b"v0".as_slice()));
+    assert_eq!(got.data_opt(), Some(b"v0".as_slice()));
 
     let key_fail = DatabaseEntry::from_data(b"force_fail");
     let val_fail = DatabaseEntry::from_data(b"will_be_undone");
@@ -268,14 +268,14 @@ fn auto_commit_rollback_on_forced_failure_undoes_in_memory_write() {
                 "auto-commit rollback must remove the in-memory tree entry; \
                  got {:?} value={:?}",
                 status,
-                got.get_data()
+                got.data_opt()
             );
         }
         Ok(_) => {
             let mut got = DatabaseEntry::new();
             let status = db.get_into(None, &key_fail, &mut got).unwrap();
             assert!(status);
-            assert_eq!(got.get_data(), Some(b"will_be_undone".as_slice()));
+            assert_eq!(got.data_opt(), Some(b"will_be_undone".as_slice()));
         }
     }
 

@@ -33,7 +33,7 @@ impl SecondaryKeyCreator for FirstByteCreator {
         data: &DatabaseEntry,
         result: &mut DatabaseEntry,
     ) -> bool {
-        if let Some(d) = data.get_data()
+        if let Some(d) = data.data_opt()
             && !d.is_empty()
         {
             result.set_data(&d[..1]);
@@ -157,7 +157,7 @@ fn d9_overwrite_changing_sec_key_removes_old_entry() {
     let mut d = DatabaseEntry::new();
     let s = sec.get_into(None, de(b"A"), &mut p_key, &mut d).unwrap();
     assert!(s, "initial secondary lookup");
-    assert_eq!(p_key.get_data().unwrap_or(&[]), b"k1");
+    assert_eq!(p_key.data_opt().unwrap_or(&[]), b"k1");
 
     // Overwrite: data now starts with b'B' → sec_key=[B].
     // Database::put fetches old_data before writing, then auto-maintains:
@@ -177,7 +177,7 @@ fn d9_overwrite_changing_sec_key_removes_old_entry() {
         s_new,
         "D9: new secondary entry ([B], k1) must exist after overwrite"
     );
-    assert_eq!(p_key.get_data().unwrap_or(&[]), b"k1");
+    assert_eq!(p_key.data_opt().unwrap_or(&[]), b"k1");
 }
 
 // ── D8: secondary cursor dirty-read, missing primary → skip (NotFound) ────────

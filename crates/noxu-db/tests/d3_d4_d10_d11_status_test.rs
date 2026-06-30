@@ -115,7 +115,7 @@ fn d10_search_gte_writes_back_found_key() {
     let s = cursor.get(&mut k, &mut d, Get::SearchGte, None).unwrap();
     assert_eq!(s, OperationStatus::Success);
     assert_eq!(
-        k.get_data().unwrap_or(&[]),
+        k.data_opt().unwrap_or(&[]),
         b"beta",
         "D10: SearchGte must write the found key back to the key parameter"
     );

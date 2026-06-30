@@ -184,7 +184,7 @@ where
         start_key: &K,
     ) -> Result<StoredIterator<(K, V)>> {
         let start_entry = encode_key(self.inner.key_binding(), start_key)?;
-        let bytes = start_entry.get_data().unwrap_or(&[]).to_vec();
+        let bytes = start_entry.data_opt().unwrap_or(&[]).to_vec();
         let items = scan_records(
             self.inner.database(),
             txn,
@@ -227,7 +227,7 @@ where
         key: &K,
     ) -> Result<Option<K>> {
         let key_entry = encode_key(self.inner.key_binding(), key)?;
-        let bound = key_entry.get_data().unwrap_or(&[]).to_vec();
+        let bound = key_entry.data_opt().unwrap_or(&[]).to_vec();
 
         let mut cursor =
             crate::internal::open_cursor(self.inner.database(), txn, None)?;
@@ -237,7 +237,7 @@ where
             cursor.get(&mut k_buf, &mut d_buf, noxu_db::Get::First, None)?;
         let mut result: Option<K> = None;
         while matches!(status, noxu_db::OperationStatus::Success) {
-            let cur = k_buf.get_data().unwrap_or(&[]);
+            let cur = k_buf.data_opt().unwrap_or(&[]);
             if cur > bound.as_slice() {
                 result = Some(decode_key(self.inner.key_binding(), &k_buf)?);
                 break;

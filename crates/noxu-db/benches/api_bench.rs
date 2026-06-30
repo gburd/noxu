@@ -185,7 +185,7 @@ fn bench_txn_begin_via_env(c: &mut Criterion) {
         b.iter(|| {
             let txn = env.begin_transaction(None).unwrap();
             txn.commit().unwrap();
-            black_box(txn.get_id());
+            black_box(txn.id());
         })
     });
 }
@@ -204,7 +204,7 @@ fn bench_database_entry_from_bytes(c: &mut Criterion) {
 fn bench_database_entry_get_data(c: &mut Criterion) {
     let entry = DatabaseEntry::from_bytes(b"0123456789abcdef");
     c.bench_function("database_entry_get_data", |b| {
-        b.iter(|| black_box(entry.get_data()))
+        b.iter(|| black_box(entry.data_opt()))
     });
 }
 

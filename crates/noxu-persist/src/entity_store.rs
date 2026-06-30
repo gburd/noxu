@@ -741,7 +741,7 @@ fn stream_evolve_class(
             _ => break,
         }
 
-        let data_bytes = match data_entry.get_data() {
+        let data_bytes = match data_entry.data_opt() {
             Some(b) => b.to_vec(),
             None => continue,
         };
@@ -768,7 +768,7 @@ fn stream_evolve_class(
                     &new_payload,
                 )?;
                 let new_data = DatabaseEntry::from_vec(new_envelope);
-                let key_bytes = key_entry.get_data().unwrap_or(&[]).to_vec();
+                let key_bytes = key_entry.data_opt().unwrap_or(&[]).to_vec();
                 let key_entry_w = DatabaseEntry::from_vec(key_bytes);
                 cursor.put(&key_entry_w, &new_data, Put::Current)?;
                 n_converted += 1;
@@ -782,7 +782,7 @@ fn stream_evolve_class(
                     dec.payload,
                 )?;
                 let new_data = DatabaseEntry::from_vec(new_envelope);
-                let key_bytes = key_entry.get_data().unwrap_or(&[]).to_vec();
+                let key_bytes = key_entry.data_opt().unwrap_or(&[]).to_vec();
                 let key_entry_w = DatabaseEntry::from_vec(key_bytes);
                 cursor.put(&key_entry_w, &new_data, Put::Current)?;
                 n_converted += 1;

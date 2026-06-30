@@ -254,7 +254,7 @@ fn test_get_database_names() {
     let _db1 = env.open_database(None, "alpha", &db_config).unwrap();
     let _db2 = env.open_database(None, "beta", &db_config).unwrap();
 
-    let names = env.get_database_names().unwrap();
+    let names = env.database_names().unwrap();
     assert!(names.contains(&"alpha".to_string()));
     assert!(names.contains(&"beta".to_string()));
     assert_eq!(names.len(), 2);
@@ -267,8 +267,8 @@ fn test_get_database_names() {
 #[test]
 fn dbentry_new_is_null() {
     let entry = noxu_db::DatabaseEntry::new();
-    assert_eq!(entry.get_data(), None);
-    assert_eq!(entry.get_size(), 0);
+    assert_eq!(entry.data_opt(), None);
+    assert_eq!(entry.len(), 0);
 }
 
 /// from_bytes stores the data and exposes it at offset 0 with the correct size.
@@ -277,8 +277,8 @@ fn dbentry_new_is_null() {
 fn dbentry_from_bytes_stores_data() {
     let data: Vec<u8> = vec![1u8; 10];
     let entry = noxu_db::DatabaseEntry::from_bytes(&data);
-    assert_eq!(entry.get_size(), 10);
-    assert_eq!(entry.get_data(), Some(data.as_slice()));
+    assert_eq!(entry.len(), 10);
+    assert_eq!(entry.data_opt(), Some(data.as_slice()));
 }
 
 /// set_data() on an entry replaces content; get_data() reflects new bytes.
@@ -287,12 +287,12 @@ fn dbentry_from_bytes_stores_data() {
 #[test]
 fn dbentry_set_data_replaces_content() {
     let mut entry = noxu_db::DatabaseEntry::from_bytes(b"original");
-    assert_eq!(entry.get_data(), Some(b"original".as_ref()));
+    assert_eq!(entry.data_opt(), Some(b"original".as_ref()));
 
     entry.set_data(b"replaced");
-    assert_eq!(entry.get_data(), Some(b"replaced".as_ref()));
-    assert_eq!(entry.get_size(), 8);
-    assert_eq!(entry.get_offset(), 0);
+    assert_eq!(entry.data_opt(), Some(b"replaced".as_ref()));
+    assert_eq!(entry.len(), 8);
+    assert_eq!(entry.offset(), 0);
 }
 
 /// After set_data(null equivalent via clear()) the entry is empty.
@@ -301,8 +301,8 @@ fn dbentry_set_data_replaces_content() {
 fn dbentry_clear_makes_null() {
     let mut entry = noxu_db::DatabaseEntry::from_bytes(b"data");
     entry.clear();
-    assert_eq!(entry.get_data(), None);
-    assert_eq!(entry.get_size(), 0);
+    assert_eq!(entry.data_opt(), None);
+    assert_eq!(entry.len(), 0);
 }
 
 /// Constructing with offset and size exposes only the sub-slice.
@@ -315,15 +315,15 @@ fn dbentry_offset_and_size() {
     entry.set_offset(3);
     entry.set_size(4);
     // get_data() should return bytes [3..7]
-    assert_eq!(entry.get_offset(), 3);
-    assert_eq!(entry.get_size(), 4);
-    assert_eq!(entry.get_data(), Some(&data[3..7]));
+    assert_eq!(entry.offset(), 3);
+    assert_eq!(entry.len(), 4);
+    assert_eq!(entry.data_opt(), Some(&data[3..7]));
 
     // Calling set_data resets offset to 0 and size to full length.
     let new_data: Vec<u8> = vec![42u8; 6];
     entry.set_data(&new_data);
-    assert_eq!(entry.get_offset(), 0);
-    assert_eq!(entry.get_size(), 6);
+    assert_eq!(entry.offset(), 0);
+    assert_eq!(entry.len(), 6);
 }
 
 /// Two entries with identical byte content compare equal; differing content
@@ -347,7 +347,7 @@ fn dbentry_get_data_respects_offset_and_size() {
     entry.set_offset(10);
     entry.set_size(10);
     // Should return bytes 10..20
-    let slice = entry.get_data().unwrap();
+    let slice = entry.data_opt().unwrap();
     assert_eq!(slice.len(), 10);
     for (i, &byte) in slice.iter().enumerate() {
         assert_eq!(byte, (i + 10) as u8);
@@ -363,8 +363,8 @@ fn dbentry_partial_flag_round_trip() {
 
     entry.set_partial(5, 10, true);
     assert!(entry.is_partial());
-    assert_eq!(entry.get_partial_offset(), 5);
-    assert_eq!(entry.get_partial_length(), 10);
+    assert_eq!(entry.partial_offset(), 5);
+    assert_eq!(entry.partial_length(), 10);
 
     entry.set_partial(0, 0, false);
     assert!(!entry.is_partial());
@@ -1151,14 +1151,14 @@ fn seq_stats_n_gets_and_cache_hits() {
     let seq = db.open_sequence(&key, config).unwrap();
 
     // Stats before any get: n_gets=0.
-    let s = seq.get_stats();
+    let s = seq.stats();
     assert_eq!(s.n_gets, 0);
     assert_eq!(s.range_min, i64::MIN);
     assert_eq!(s.range_max, i64::MAX);
 
     // First get — triggers a cache refill (not a cache hit).
     let v0 = seq.get(None, 1).unwrap();
-    let s = seq.get_stats();
+    let s = seq.stats();
     assert_eq!(s.n_gets, 1);
     // After one get the stored boundary has advanced.
     assert!(s.current_value > v0 || s.current_value == v0 + 1);
@@ -1166,7 +1166,7 @@ fn seq_stats_n_gets_and_cache_hits() {
     // Second and third gets — served from cache.
     seq.get(None, 1).unwrap();
     seq.get(None, 1).unwrap();
-    let s = seq.get_stats();
+    let s = seq.stats();
     assert_eq!(s.n_gets, 3);
     // At least 2 of the 3 gets were cache hits (first one was a refill).
     assert!(
@@ -1194,7 +1194,7 @@ fn seq_stats_range_fields() {
     let seq = db.open_sequence(&key, config).unwrap();
 
     seq.get(None, 1).unwrap();
-    let s = seq.get_stats();
+    let s = seq.stats();
     assert_eq!(s.range_min, -100);
     assert_eq!(s.range_max, 200);
 
@@ -1342,7 +1342,7 @@ fn seq_cache_refill_pattern() {
 
     // First get: refill (not a cache hit).
     seq.get(None, 1).unwrap();
-    let s0 = seq.get_stats();
+    let s0 = seq.stats();
     assert_eq!(s0.n_gets, 1);
     assert_eq!(s0.n_cache_hits, 0, "first get should not be a cache hit");
 
@@ -1350,7 +1350,7 @@ fn seq_cache_refill_pattern() {
     for _ in 1..cache {
         seq.get(None, 1).unwrap();
     }
-    let s1 = seq.get_stats();
+    let s1 = seq.stats();
     assert_eq!(s1.n_gets, cache as u64);
     assert_eq!(
         s1.n_cache_hits,
@@ -1678,7 +1678,7 @@ impl SecondaryKeyCreator for FirstByteCreator {
         data: &DatabaseEntry,
         result: &mut DatabaseEntry,
     ) -> bool {
-        if let Some(d) = data.get_data()
+        if let Some(d) = data.data_opt()
             && !d.is_empty()
         {
             result.set_data(&d[..1]);
@@ -1700,7 +1700,7 @@ impl SecondaryMultiKeyCreator for EachByteCreator {
         data: &DatabaseEntry,
         results: &mut Vec<DatabaseEntry>,
     ) {
-        if let Some(d) = data.get_data() {
+        if let Some(d) = data.data_opt() {
             for &byte in d {
                 results.push(DatabaseEntry::from_bytes(&[byte]));
             }
@@ -1773,8 +1773,8 @@ fn sec_put_primary_get_by_secondary_key() {
     let status =
         secondary.get_into(None, &sec_key, &mut p_key, &mut data).unwrap();
     assert!(status);
-    assert_eq!(p_key.get_data().unwrap(), b"pk1");
-    assert_eq!(data.get_data().unwrap(), b"Apple");
+    assert_eq!(p_key.data_opt().unwrap(), b"pk1");
+    assert_eq!(data.data_opt().unwrap(), b"Apple");
 }
 
 /// Delete from primary removes secondary entry; subsequent get returns NotFound.
@@ -1855,7 +1855,7 @@ fn sec_update_primary_changes_secondary_key() {
     let status =
         secondary.get_into(None, &sec_key_c, &mut pk, &mut data).unwrap();
     assert!(status);
-    assert_eq!(data.get_data().unwrap(), b"Cherry");
+    assert_eq!(data.data_opt().unwrap(), b"Cherry");
 }
 
 /// Delete via secondary database deletes the primary record.
@@ -1914,8 +1914,8 @@ fn sec_cursor_first_next_sorted_order() {
         cursor.get_first(&mut sec_key, &mut p_key, &mut data).unwrap();
     while status == OperationStatus::Success {
         got.push((
-            sec_key.get_data().unwrap().to_vec(),
-            data.get_data().unwrap().to_vec(),
+            sec_key.data_opt().unwrap().to_vec(),
+            data.data_opt().unwrap().to_vec(),
         ));
         status = cursor.get_next(&mut sec_key, &mut p_key, &mut data).unwrap();
     }
@@ -1957,7 +1957,7 @@ fn sec_cursor_last_prev_reverse_order() {
     let mut status =
         cursor.get_last(&mut sec_key, &mut p_key, &mut data).unwrap();
     while status == OperationStatus::Success {
-        got_data.push(data.get_data().unwrap().to_vec());
+        got_data.push(data.data_opt().unwrap().to_vec());
         status = cursor.get_prev(&mut sec_key, &mut p_key, &mut data).unwrap();
     }
     cursor.close().unwrap();
@@ -1988,8 +1988,8 @@ fn sec_cursor_search_key_returns_tuple() {
 
     let status = cursor.get_search_key(&search, &mut p_key, &mut data).unwrap();
     assert_eq!(status, OperationStatus::Success);
-    assert_eq!(p_key.get_data().unwrap(), b"pk1");
-    assert_eq!(data.get_data().unwrap(), b"Banana");
+    assert_eq!(p_key.data_opt().unwrap(), b"pk1");
+    assert_eq!(data.data_opt().unwrap(), b"Banana");
 
     cursor.close().unwrap();
 }
@@ -2035,7 +2035,7 @@ fn sec_cursor_search_key_range_gte() {
         .get_search_key_range(&mut search, &mut p_key, &mut data)
         .unwrap();
     assert_eq!(status, OperationStatus::Success);
-    assert_eq!(data.get_data().unwrap(), b"Elderberry");
+    assert_eq!(data.data_opt().unwrap(), b"Elderberry");
 
     // 'A' → should land on first entry 'C' (Cherry).
     let mut search2 = DatabaseEntry::from_bytes(b"A");
@@ -2043,7 +2043,7 @@ fn sec_cursor_search_key_range_gte() {
         .get_search_key_range(&mut search2, &mut p_key, &mut data)
         .unwrap();
     assert_eq!(status2, OperationStatus::Success);
-    assert_eq!(data.get_data().unwrap(), b"Cherry");
+    assert_eq!(data.data_opt().unwrap(), b"Cherry");
 
     // 'Z' → beyond all entries, NotFound.
     let mut search3 = DatabaseEntry::from_bytes(b"Z");
@@ -2077,9 +2077,9 @@ fn sec_cursor_get_current_after_position() {
     let mut data2 = DatabaseEntry::new();
     let status = cursor.get_current(&mut sk2, &mut pk2, &mut data2).unwrap();
     assert_eq!(status, OperationStatus::Success);
-    assert_eq!(sk2.get_data(), sk.get_data());
-    assert_eq!(pk2.get_data(), pk.get_data());
-    assert_eq!(data2.get_data().unwrap(), b"Mango");
+    assert_eq!(sk2.data_opt(), sk.data_opt());
+    assert_eq!(pk2.data_opt(), pk.data_opt());
+    assert_eq!(data2.data_opt().unwrap(), b"Mango");
 
     cursor.close().unwrap();
 }
@@ -2138,8 +2138,8 @@ fn sec_multi_key_creator_multiple_keys_per_record() {
             .get_into(None, &sec_key, &mut found_pk, &mut found_data)
             .unwrap();
         assert!(status, "sec key {:?} not found", sec_byte);
-        assert_eq!(found_pk.get_data().unwrap(), b"pk1");
-        assert_eq!(found_data.get_data().unwrap(), b"AB");
+        assert_eq!(found_pk.data_opt().unwrap(), b"pk1");
+        assert_eq!(found_data.data_opt().unwrap(), b"AB");
     }
 
     // 'C' should not exist.
@@ -2215,7 +2215,7 @@ fn sec_auto_populate_on_open() {
         let status =
             secondary.get_into(None, &sec_key, &mut pk, &mut data).unwrap();
         assert!(status, "sec key {:?} missing after auto-populate", sec_b);
-        assert_eq!(data.get_data().unwrap(), expected_data);
+        assert_eq!(data.data_opt().unwrap(), expected_data);
     }
 }
 
@@ -2244,7 +2244,7 @@ fn sec_num_recs_put_get_round_trip() {
             data: &DatabaseEntry,
             result: &mut DatabaseEntry,
         ) -> bool {
-            if let Some(d) = data.get_data()
+            if let Some(d) = data.data_opt()
                 && d.len() >= 8
             {
                 result.set_data(&d[4..8]);
@@ -2308,7 +2308,7 @@ fn sec_num_recs_put_get_round_trip() {
         assert!(status, "i={i}: sec get failed");
         // Primary key should be i
         assert_eq!(
-            p_key.get_data().unwrap(),
+            p_key.data_opt().unwrap(),
             &i.to_be_bytes(),
             "i={i}: wrong pri key"
         );
@@ -2339,9 +2339,9 @@ fn sec_num_recs_put_get_round_trip() {
     let mut status = cursor.get_first(&mut sk, &mut pk, &mut d).unwrap();
     while status == OperationStatus::Success {
         let sk_val =
-            u32::from_be_bytes(sk.get_data().unwrap().try_into().unwrap());
+            u32::from_be_bytes(sk.data_opt().unwrap().try_into().unwrap());
         let pk_val =
-            u32::from_be_bytes(pk.get_data().unwrap().try_into().unwrap());
+            u32::from_be_bytes(pk.data_opt().unwrap().try_into().unwrap());
         // sec_key = pri_key + KEY_OFFSET
         assert_eq!(
             sk_val,
@@ -2363,7 +2363,7 @@ fn sec_num_recs_put_get_round_trip() {
     let mut status = cursor.get_last(&mut sk, &mut pk, &mut d).unwrap();
     while status == OperationStatus::Success {
         let sk_val =
-            u32::from_be_bytes(sk.get_data().unwrap().try_into().unwrap());
+            u32::from_be_bytes(sk.data_opt().unwrap().try_into().unwrap());
         if let Some(prev) = prev_sk_val {
             assert!(
                 sk_val < prev,
@@ -2385,7 +2385,7 @@ fn sec_num_recs_put_get_round_trip() {
         let s = cursor.get_search_key(&search, &mut p_key, &mut data).unwrap();
         assert_eq!(s, OperationStatus::Success, "i={i}: search failed");
         assert_eq!(
-            p_key.get_data().unwrap(),
+            p_key.data_opt().unwrap(),
             &i.to_be_bytes(),
             "i={i}: wrong pri key from cursor search"
         );

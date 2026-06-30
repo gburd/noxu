@@ -33,7 +33,7 @@ impl SecondaryKeyCreator for DepartmentKeyCreator {
         data: &DatabaseEntry,
         result: &mut DatabaseEntry,
     ) -> bool {
-        if let Some(bytes) = data.get_data()
+        if let Some(bytes) = data.data_opt()
             && let Ok(s) = std::str::from_utf8(bytes)
             && let Some(sep) = s.find('|')
         {
@@ -155,9 +155,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let status = secondary.get_into(None, &eng_key, &mut p_key, &mut data)?;
     if status {
         let employee =
-            std::str::from_utf8(p_key.get_data().unwrap_or(b"")).unwrap_or("?");
+            std::str::from_utf8(p_key.data_opt().unwrap_or(b"")).unwrap_or("?");
         let record =
-            std::str::from_utf8(data.get_data().unwrap_or(b"")).unwrap_or("?");
+            std::str::from_utf8(data.data_opt().unwrap_or(b"")).unwrap_or("?");
         println!("  Found: {} -> {}", employee, record);
     }
 
@@ -166,9 +166,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let status = secondary.get_into(None, &hr_key, &mut p_key, &mut data)?;
     if status {
         let employee =
-            std::str::from_utf8(p_key.get_data().unwrap_or(b"")).unwrap_or("?");
+            std::str::from_utf8(p_key.data_opt().unwrap_or(b"")).unwrap_or("?");
         let record =
-            std::str::from_utf8(data.get_data().unwrap_or(b"")).unwrap_or("?");
+            std::str::from_utf8(data.data_opt().unwrap_or(b"")).unwrap_or("?");
         println!("  Found: {} -> {}", employee, record);
     }
 
@@ -194,13 +194,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
         let mut count = 0;
         while scan_status == OperationStatus::Success {
-            let dept = std::str::from_utf8(sec_key.get_data().unwrap_or(b""))
+            let dept = std::str::from_utf8(sec_key.data_opt().unwrap_or(b""))
                 .unwrap_or("?");
             let name =
-                std::str::from_utf8(cursor_p_key.get_data().unwrap_or(b""))
+                std::str::from_utf8(cursor_p_key.data_opt().unwrap_or(b""))
                     .unwrap_or("?");
             let record =
-                std::str::from_utf8(cursor_data.get_data().unwrap_or(b""))
+                std::str::from_utf8(cursor_data.data_opt().unwrap_or(b""))
                     .unwrap_or("?");
             println!("  dept={} name={} record={}", dept, name, record);
             count += 1;
@@ -223,9 +223,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut d2 = DatabaseEntry::new();
         let mkt_status = cursor2.get_search_key(&mkt_key, &mut pk2, &mut d2)?;
         if mkt_status == OperationStatus::Success {
-            let name = std::str::from_utf8(pk2.get_data().unwrap_or(b""))
+            let name = std::str::from_utf8(pk2.data_opt().unwrap_or(b""))
                 .unwrap_or("?");
-            let record = std::str::from_utf8(d2.get_data().unwrap_or(b""))
+            let record = std::str::from_utf8(d2.data_opt().unwrap_or(b""))
                 .unwrap_or("?");
             println!("  First Marketing employee: {} -> {}", name, record);
         }
@@ -259,9 +259,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let eng_status =
             cursor3.get_search_key(&eng_search, &mut pk3, &mut d3)?;
         if eng_status == OperationStatus::Success {
-            let name = std::str::from_utf8(pk3.get_data().unwrap_or(b""))
+            let name = std::str::from_utf8(pk3.data_opt().unwrap_or(b""))
                 .unwrap_or("?");
-            let record = std::str::from_utf8(d3.get_data().unwrap_or(b""))
+            let record = std::str::from_utf8(d3.data_opt().unwrap_or(b""))
                 .unwrap_or("?");
             println!("  {} -> {}", name, record);
         } else {

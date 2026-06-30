@@ -42,7 +42,9 @@ enum CursorOp {
 }
 
 impl<'a> Arbitrary<'a> for CursorOp {
-    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+    fn arbitrary(
+        u: &mut arbitrary::Unstructured<'a>,
+    ) -> arbitrary::Result<Self> {
         let choice: u8 = u.int_in_range(0..=8)?;
         match choice {
             0 => {
@@ -105,7 +107,10 @@ fuzz_target!(|ops: Vec<CursorOp>| {
                 }
             }
 
-            CursorOp::First | CursorOp::Last | CursorOp::Next | CursorOp::Prev => {
+            CursorOp::First
+            | CursorOp::Last
+            | CursorOp::Next
+            | CursorOp::Prev => {
                 // Individual cursor ops: just verify no panic.
                 let mut cursor = db.open_cursor(None, None).unwrap();
                 let mut key_entry = DatabaseEntry::new();
@@ -129,12 +134,14 @@ fuzz_target!(|ops: Vec<CursorOp>| {
                 let mut key_entry = DatabaseEntry::from_bytes(&k);
                 let mut data = DatabaseEntry::new();
 
-                let status = cursor.get(&mut key_entry, &mut data, Get::Search, None).unwrap();
+                let status = cursor
+                    .get(&mut key_entry, &mut data, Get::Search, None)
+                    .unwrap();
 
                 if oracle.contains_key(&k) {
                     assert_eq!(status, OperationStatus::Success);
                     assert_eq!(
-                        data.get_data().unwrap(),
+                        data.data_opt().unwrap(),
                         oracle.get(&k).unwrap().as_slice()
                     );
                 } else {
@@ -153,13 +160,16 @@ fuzz_target!(|ops: Vec<CursorOp>| {
                 let oracle_values: Vec<Vec<u8>> =
                     oracle.values().cloned().collect();
 
-                let mut status =
-                    cursor.get(&mut key_entry, &mut data, Get::First, None).unwrap();
+                let mut status = cursor
+                    .get(&mut key_entry, &mut data, Get::First, None)
+                    .unwrap();
                 while status == OperationStatus::Success {
-                    if let Some(d) = data.get_data() {
+                    if let Some(d) = data.data_opt() {
                         collected_values.push(d.to_vec());
                     }
-                    status = cursor.get(&mut key_entry, &mut data, Get::Next, None).unwrap();
+                    status = cursor
+                        .get(&mut key_entry, &mut data, Get::Next, None)
+                        .unwrap();
                 }
 
                 assert_eq!(
@@ -171,8 +181,10 @@ fuzz_target!(|ops: Vec<CursorOp>| {
                 );
 
                 // Values should match oracle (which is sorted by key).
-                for (i, (got, expected)) in
-                    collected_values.iter().zip(oracle_values.iter()).enumerate()
+                for (i, (got, expected)) in collected_values
+                    .iter()
+                    .zip(oracle_values.iter())
+                    .enumerate()
                 {
                     assert_eq!(
                         got, expected,
@@ -193,13 +205,16 @@ fuzz_target!(|ops: Vec<CursorOp>| {
                 let oracle_values_rev: Vec<Vec<u8>> =
                     oracle.values().rev().cloned().collect();
 
-                let mut status =
-                    cursor.get(&mut key_entry, &mut data, Get::Last, None).unwrap();
+                let mut status = cursor
+                    .get(&mut key_entry, &mut data, Get::Last, None)
+                    .unwrap();
                 while status == OperationStatus::Success {
-                    if let Some(d) = data.get_data() {
+                    if let Some(d) = data.data_opt() {
                         collected_values.push(d.to_vec());
                     }
-                    status = cursor.get(&mut key_entry, &mut data, Get::Prev, None).unwrap();
+                    status = cursor
+                        .get(&mut key_entry, &mut data, Get::Prev, None)
+                        .unwrap();
                 }
 
                 assert_eq!(
@@ -210,8 +225,10 @@ fuzz_target!(|ops: Vec<CursorOp>| {
                     oracle_values_rev.len()
                 );
 
-                for (i, (got, expected)) in
-                    collected_values.iter().zip(oracle_values_rev.iter()).enumerate()
+                for (i, (got, expected)) in collected_values
+                    .iter()
+                    .zip(oracle_values_rev.iter())
+                    .enumerate()
                 {
                     assert_eq!(
                         got, expected,

@@ -95,8 +95,8 @@ fn collect_all(db: &noxu_db::Database) -> BTreeMap<Vec<u8>, Vec<u8>> {
     let mut status = cursor.get(&mut key, &mut val, Get::First, None).unwrap();
     while status == OperationStatus::Success {
         map.insert(
-            key.get_data().unwrap_or(&[]).to_vec(),
-            val.get_data().unwrap_or(&[]).to_vec(),
+            key.data_opt().unwrap_or(&[]).to_vec(),
+            val.data_opt().unwrap_or(&[]).to_vec(),
         );
         status = cursor.get(&mut key, &mut val, Get::Next, None).unwrap();
     }

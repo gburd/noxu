@@ -12,16 +12,9 @@ pub struct DatabaseStats {
     pub btree: BtreeStats,
 }
 
-impl DatabaseStats {
-    /// Returns the B-tree statistics.
-    pub fn get_btree_stats(&self) -> &BtreeStats {
-        &self.btree
-    }
-}
-
 /// B-tree statistics for a single database.
 ///
-/// Returned by [`Database::get_stats`][crate::database::Database::get_stats].
+/// Returned by [`Database::stats`][crate::database::Database::stats].
 ///
 /// Implements `BtreeStats` with the most commonly used fields:
 ///
@@ -45,31 +38,4 @@ pub struct BtreeStats {
     pub internal_node_count: u64,
     /// Maximum depth of the main tree (root-to-BIN path length).
     pub main_tree_max_depth: u32,
-}
-
-impl BtreeStats {
-    /// Returns the total leaf-node record count (approximate).
-    pub fn get_leaf_node_count(&self) -> u64 {
-        self.leaf_node_count
-    }
-
-    /// Returns the count of known-deleted but not yet compacted slots.
-    pub fn get_deleted_leaf_node_count(&self) -> u64 {
-        self.deleted_leaf_node_count
-    }
-
-    /// Returns the number of Bottom Internal Nodes.
-    pub fn get_bottom_internal_node_count(&self) -> u64 {
-        self.bottom_internal_node_count
-    }
-
-    /// Returns the number of upper Internal Nodes.
-    pub fn get_internal_node_count(&self) -> u64 {
-        self.internal_node_count
-    }
-
-    /// Returns the maximum tree depth.
-    pub fn get_main_tree_max_depth(&self) -> u32 {
-        self.main_tree_max_depth
-    }
 }

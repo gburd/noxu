@@ -77,7 +77,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // =========================================================================
     // Show sequence statistics.
     // =========================================================================
-    let stats = seq.get_stats();
+    let stats = seq.stats();
     println!("\nSequence statistics after 10 gets:");
     println!("  n_gets:        {}", stats.n_gets);
     println!("  n_cache_hits:  {}", stats.n_cache_hits);

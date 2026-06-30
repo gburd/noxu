@@ -1816,7 +1816,7 @@ impl EnvironmentConfig {
     }
 
     /// Returns the registered `ExceptionListener`, if any.
-    pub fn get_exception_listener(&self) -> Option<Arc<dyn ExceptionListener>> {
+    pub fn exception_listener(&self) -> Option<Arc<dyn ExceptionListener>> {
         self.exception_listener.0.clone()
     }
 }

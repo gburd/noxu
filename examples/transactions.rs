@@ -26,7 +26,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Transaction 1: Insert records and COMMIT ---
     println!("\nTransaction 1: inserting committed records...");
     let txn1 = env.begin_transaction(None)?;
-    println!("  Started transaction {}", txn1.get_id());
+    println!("  Started transaction {}", txn1.id());
 
     // Note: The current simplified implementation does not actually
     // isolate operations by transaction, but we demonstrate the API
@@ -45,7 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Transaction 2: Insert records and ABORT ---
     println!("\nTransaction 2: inserting records that will be aborted...");
     let txn2 = env.begin_transaction(None)?;
-    println!("  Started transaction {}", txn2.get_id());
+    println!("  Started transaction {}", txn2.id());
 
     for i in 0..3 {
         let key =
@@ -89,11 +89,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nDemonstrating transaction state:");
     let txn3 = env.begin_transaction(None)?;
     println!("  txn3 is_valid: {}", txn3.is_valid());
-    println!("  txn3 state: {:?}", txn3.get_state());
+    println!("  txn3 state: {:?}", txn3.state());
 
     txn3.commit()?;
     println!("  After commit - is_valid: {}", txn3.is_valid());
-    println!("  After commit - state: {:?}", txn3.get_state());
+    println!("  After commit - state: {:?}", txn3.state());
 
     // Attempting to commit again should fail
     match txn3.commit() {
