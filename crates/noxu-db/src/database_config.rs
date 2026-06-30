@@ -457,6 +457,42 @@ impl DatabaseConfig {
         self.use_existing_config = v;
         self
     }
+
+    // ── Consuming (chainable) `with_*` builders (review P1-8) ──────────
+    // Generated for every (non-deprecated) `set_*` parameter so the
+    // chained-builder form works uniformly for all parameters. Each
+    // delegates to its `set_*` counterpart, reusing any validation.
+    // The struct-level `#[must_use]` already covers the returned `Self`.
+
+    /// Builder-style (consuming) `override_btree_comparator` setter. See [`Self::set_override_btree_comparator`].
+    pub fn with_override_btree_comparator(
+        mut self,
+        override_btree_comparator: bool,
+    ) -> Self {
+        self.set_override_btree_comparator(override_btree_comparator);
+        self
+    }
+
+    /// Builder-style (consuming) `override_duplicate_comparator` setter. See [`Self::set_override_duplicate_comparator`].
+    pub fn with_override_duplicate_comparator(
+        mut self,
+        override_duplicate_comparator: bool,
+    ) -> Self {
+        self.set_override_duplicate_comparator(override_duplicate_comparator);
+        self
+    }
+
+    /// Builder-style (consuming) `exclusive` setter. See [`Self::set_exclusive`].
+    pub fn with_exclusive(mut self, exclusive: bool) -> Self {
+        self.set_exclusive(exclusive);
+        self
+    }
+
+    /// Builder-style (consuming) `node_max_entries` setter. See [`Self::set_node_max_entries`].
+    pub fn with_node_max_entries(mut self, node_max_entries: u32) -> Self {
+        self.set_node_max_entries(node_max_entries);
+        self
+    }
 }
 
 impl Default for DatabaseConfig {

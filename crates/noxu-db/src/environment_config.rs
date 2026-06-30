@@ -1819,6 +1819,855 @@ impl EnvironmentConfig {
     pub fn exception_listener(&self) -> Option<Arc<dyn ExceptionListener>> {
         self.exception_listener.0.clone()
     }
+
+    // ── Consuming (chainable) `with_*` builders (review P1-8) ──────────
+    // Generated for every (non-deprecated) `set_*` parameter so the
+    // chained-builder form works uniformly for all parameters. Each
+    // delegates to its `set_*` counterpart, reusing any validation.
+    // The struct-level `#[must_use]` already covers the returned `Self`.
+
+    /// Builder-style (consuming) `env_is_locking` setter. See [`Self::set_env_is_locking`].
+    pub fn with_env_is_locking(mut self, v: bool) -> Self {
+        self.set_env_is_locking(v);
+        self
+    }
+
+    /// Builder-style (consuming) `shared_cache` setter. See [`Self::set_shared_cache`].
+    pub fn with_shared_cache(mut self, v: bool) -> Self {
+        self.set_shared_cache(v);
+        self
+    }
+
+    /// Builder-style (consuming) `env_recovery_force_checkpoint` setter. See [`Self::set_env_recovery_force_checkpoint`].
+    pub fn with_env_recovery_force_checkpoint(mut self, v: bool) -> Self {
+        self.set_env_recovery_force_checkpoint(v);
+        self
+    }
+
+    /// Builder-style (consuming) `env_recovery_force_new_file` setter. See [`Self::set_env_recovery_force_new_file`].
+    pub fn with_env_recovery_force_new_file(mut self, v: bool) -> Self {
+        self.set_env_recovery_force_new_file(v);
+        self
+    }
+
+    /// Builder-style (consuming) `halt_on_commit_after_checksum_exception` setter. See [`Self::set_halt_on_commit_after_checksum_exception`].
+    pub fn with_halt_on_commit_after_checksum_exception(
+        mut self,
+        v: bool,
+    ) -> Self {
+        self.set_halt_on_commit_after_checksum_exception(v);
+        self
+    }
+
+    /// Builder-style (consuming) `logging_level` setter. See [`Self::set_logging_level`].
+    pub fn with_logging_level(mut self, level: String) -> Self {
+        self.set_logging_level(level);
+        self
+    }
+
+    /// Builder-style (consuming) `cache_percent` setter. See [`Self::set_cache_percent`].
+    pub fn with_cache_percent(mut self, pct: u32) -> Self {
+        self.set_cache_percent(pct);
+        self
+    }
+
+    /// Builder-style (consuming) `max_off_heap_memory` setter. See [`Self::set_max_off_heap_memory`].
+    pub fn with_max_off_heap_memory(mut self, bytes: u64) -> Self {
+        self.set_max_off_heap_memory(bytes);
+        self
+    }
+
+    /// Builder-style (consuming) `run_in_compressor` setter. See [`Self::set_run_in_compressor`].
+    pub fn with_run_in_compressor(mut self, v: bool) -> Self {
+        self.set_run_in_compressor(v);
+        self
+    }
+
+    /// Builder-style (consuming) `run_checkpointer` setter. See [`Self::set_run_checkpointer`].
+    pub fn with_run_checkpointer(mut self, v: bool) -> Self {
+        self.set_run_checkpointer(v);
+        self
+    }
+
+    /// Builder-style (consuming) `run_cleaner` setter. See [`Self::set_run_cleaner`].
+    pub fn with_run_cleaner(mut self, v: bool) -> Self {
+        self.set_run_cleaner(v);
+        self
+    }
+
+    /// Builder-style (consuming) `run_evictor` setter. See [`Self::set_run_evictor`].
+    pub fn with_run_evictor(mut self, v: bool) -> Self {
+        self.set_run_evictor(v);
+        self
+    }
+
+    /// Builder-style (consuming) `run_offheap_evictor` setter. See [`Self::set_run_offheap_evictor`].
+    pub fn with_run_offheap_evictor(mut self, v: bool) -> Self {
+        self.set_run_offheap_evictor(v);
+        self
+    }
+
+    /// Builder-style (consuming) `run_verifier` setter. See [`Self::set_run_verifier`].
+    pub fn with_run_verifier(mut self, v: bool) -> Self {
+        self.set_run_verifier(v);
+        self
+    }
+
+    /// Builder-style (consuming) `env_background_read_limit_kb` setter. See [`Self::set_env_background_read_limit_kb`].
+    pub fn with_env_background_read_limit_kb(mut self, kb: u32) -> Self {
+        self.set_env_background_read_limit_kb(kb);
+        self
+    }
+
+    /// Builder-style (consuming) `env_background_write_limit_kb` setter. See [`Self::set_env_background_write_limit_kb`].
+    pub fn with_env_background_write_limit_kb(mut self, kb: u32) -> Self {
+        self.set_env_background_write_limit_kb(kb);
+        self
+    }
+
+    /// Builder-style (consuming) `env_background_sleep_interval_us` setter. See [`Self::set_env_background_sleep_interval_us`].
+    pub fn with_env_background_sleep_interval_us(mut self, us: u64) -> Self {
+        self.set_env_background_sleep_interval_us(us);
+        self
+    }
+
+    /// Builder-style (consuming) `env_check_leaks` setter. See [`Self::set_env_check_leaks`].
+    pub fn with_env_check_leaks(mut self, v: bool) -> Self {
+        self.set_env_check_leaks(v);
+        self
+    }
+
+    /// Builder-style (consuming) `env_forced_yield` setter. See [`Self::set_env_forced_yield`].
+    pub fn with_env_forced_yield(mut self, v: bool) -> Self {
+        self.set_env_forced_yield(v);
+        self
+    }
+
+    /// Builder-style (consuming) `env_fair_latches` setter. See [`Self::set_env_fair_latches`].
+    pub fn with_env_fair_latches(mut self, v: bool) -> Self {
+        self.set_env_fair_latches(v);
+        self
+    }
+
+    /// Builder-style (consuming) `env_latch_timeout_ms` setter. See [`Self::set_env_latch_timeout_ms`].
+    pub fn with_env_latch_timeout_ms(mut self, ms: u64) -> Self {
+        self.set_env_latch_timeout_ms(ms);
+        self
+    }
+
+    /// Builder-style (consuming) `env_ttl_clock_tolerance_ms` setter. See [`Self::set_env_ttl_clock_tolerance_ms`].
+    pub fn with_env_ttl_clock_tolerance_ms(mut self, ms: u64) -> Self {
+        self.set_env_ttl_clock_tolerance_ms(ms);
+        self
+    }
+
+    /// Builder-style (consuming) `env_expiration_enabled` setter. See [`Self::set_env_expiration_enabled`].
+    pub fn with_env_expiration_enabled(mut self, v: bool) -> Self {
+        self.set_env_expiration_enabled(v);
+        self
+    }
+
+    /// Builder-style (consuming) `env_db_eviction` setter. See [`Self::set_env_db_eviction`].
+    pub fn with_env_db_eviction(mut self, v: bool) -> Self {
+        self.set_env_db_eviction(v);
+        self
+    }
+
+    /// Builder-style (consuming) `adler32_chunk_size` setter. See [`Self::set_adler32_chunk_size`].
+    pub fn with_adler32_chunk_size(mut self, bytes: usize) -> Self {
+        self.set_adler32_chunk_size(bytes);
+        self
+    }
+
+    /// Builder-style (consuming) `log_file_cache_size` setter. See [`Self::set_log_file_cache_size`].
+    pub fn with_log_file_cache_size(mut self, n: usize) -> Self {
+        self.set_log_file_cache_size(n);
+        self
+    }
+
+    /// Builder-style (consuming) `log_checksum_read` setter. See [`Self::set_log_checksum_read`].
+    pub fn with_log_checksum_read(mut self, v: bool) -> Self {
+        self.set_log_checksum_read(v);
+        self
+    }
+
+    /// Builder-style (consuming) `log_verify_checksums` setter. See [`Self::set_log_verify_checksums`].
+    pub fn with_log_verify_checksums(mut self, v: bool) -> Self {
+        self.set_log_verify_checksums(v);
+        self
+    }
+
+    /// Builder-style (consuming) `log_fsync_timeout_ms` setter. See [`Self::set_log_fsync_timeout_ms`].
+    pub fn with_log_fsync_timeout_ms(mut self, ms: u64) -> Self {
+        self.set_log_fsync_timeout_ms(ms);
+        self
+    }
+
+    /// Builder-style (consuming) `log_fsync_time_limit_ms` setter. See [`Self::set_log_fsync_time_limit_ms`].
+    pub fn with_log_fsync_time_limit_ms(mut self, ms: u64) -> Self {
+        self.set_log_fsync_time_limit_ms(ms);
+        self
+    }
+
+    /// Builder-style (consuming) `log_num_buffers` setter. See [`Self::set_log_num_buffers`].
+    pub fn with_log_num_buffers(mut self, n: usize) -> Self {
+        self.set_log_num_buffers(n);
+        self
+    }
+
+    /// Builder-style (consuming) `log_total_buffer_bytes` setter. See [`Self::set_log_total_buffer_bytes`].
+    pub fn with_log_total_buffer_bytes(mut self, bytes: u64) -> Self {
+        self.set_log_total_buffer_bytes(bytes);
+        self
+    }
+
+    /// Builder-style (consuming) `log_buffer_size` setter. See [`Self::set_log_buffer_size`].
+    pub fn with_log_buffer_size(mut self, bytes: usize) -> Self {
+        self.set_log_buffer_size(bytes);
+        self
+    }
+
+    /// Builder-style (consuming) `log_fault_read_size` setter. See [`Self::set_log_fault_read_size`].
+    pub fn with_log_fault_read_size(mut self, bytes: usize) -> Self {
+        self.set_log_fault_read_size(bytes);
+        self
+    }
+
+    /// Builder-style (consuming) `log_iterator_read_size` setter. See [`Self::set_log_iterator_read_size`].
+    pub fn with_log_iterator_read_size(mut self, bytes: usize) -> Self {
+        self.set_log_iterator_read_size(bytes);
+        self
+    }
+
+    /// Builder-style (consuming) `log_iterator_max_size` setter. See [`Self::set_log_iterator_max_size`].
+    pub fn with_log_iterator_max_size(mut self, bytes: usize) -> Self {
+        self.set_log_iterator_max_size(bytes);
+        self
+    }
+
+    /// Builder-style (consuming) `log_n_data_directories` setter. See [`Self::set_log_n_data_directories`].
+    pub fn with_log_n_data_directories(mut self, n: u32) -> Self {
+        self.set_log_n_data_directories(n);
+        self
+    }
+
+    /// Builder-style (consuming) `log_mem_only` setter. See [`Self::set_log_mem_only`].
+    pub fn with_log_mem_only(mut self, v: bool) -> Self {
+        self.set_log_mem_only(v);
+        self
+    }
+
+    /// Builder-style (consuming) `log_detect_file_delete` setter. See [`Self::set_log_detect_file_delete`].
+    pub fn with_log_detect_file_delete(mut self, v: bool) -> Self {
+        self.set_log_detect_file_delete(v);
+        self
+    }
+
+    /// Builder-style (consuming) `log_detect_file_delete_interval_ms` setter. See [`Self::set_log_detect_file_delete_interval_ms`].
+    pub fn with_log_detect_file_delete_interval_ms(mut self, ms: u64) -> Self {
+        self.set_log_detect_file_delete_interval_ms(ms);
+        self
+    }
+
+    /// Builder-style (consuming) `log_flush_sync_interval_ms` setter. See [`Self::set_log_flush_sync_interval_ms`].
+    pub fn with_log_flush_sync_interval_ms(mut self, ms: u64) -> Self {
+        self.set_log_flush_sync_interval_ms(ms);
+        self
+    }
+
+    /// Builder-style (consuming) `log_flush_no_sync_interval_ms` setter. See [`Self::set_log_flush_no_sync_interval_ms`].
+    pub fn with_log_flush_no_sync_interval_ms(mut self, ms: u64) -> Self {
+        self.set_log_flush_no_sync_interval_ms(ms);
+        self
+    }
+
+    /// Builder-style (consuming) `log_use_odsync` setter. See [`Self::set_log_use_odsync`].
+    pub fn with_log_use_odsync(mut self, v: bool) -> Self {
+        self.set_log_use_odsync(v);
+        self
+    }
+
+    /// Builder-style (consuming) `log_use_write_queue` setter. See [`Self::set_log_use_write_queue`].
+    pub fn with_log_use_write_queue(mut self, v: bool) -> Self {
+        self.set_log_use_write_queue(v);
+        self
+    }
+
+    /// Builder-style (consuming) `log_write_queue_size` setter. See [`Self::set_log_write_queue_size`].
+    pub fn with_log_write_queue_size(mut self, bytes: usize) -> Self {
+        self.set_log_write_queue_size(bytes);
+        self
+    }
+
+    /// Builder-style (consuming) `log_group_commit_threshold` setter. See [`Self::set_log_group_commit_threshold`].
+    pub fn with_log_group_commit_threshold(mut self, n: usize) -> Self {
+        self.set_log_group_commit_threshold(n);
+        self
+    }
+
+    /// Builder-style (consuming) `log_group_commit_interval_ms` setter. See [`Self::set_log_group_commit_interval_ms`].
+    pub fn with_log_group_commit_interval_ms(mut self, ms: u64) -> Self {
+        self.set_log_group_commit_interval_ms(ms);
+        self
+    }
+
+    /// Builder-style (consuming) `node_max_entries` setter. See [`Self::set_node_max_entries`].
+    pub fn with_node_max_entries(mut self, n: u32) -> Self {
+        self.set_node_max_entries(n);
+        self
+    }
+
+    /// Builder-style (consuming) `node_dup_tree_max_entries` setter. See [`Self::set_node_dup_tree_max_entries`].
+    pub fn with_node_dup_tree_max_entries(mut self, n: u32) -> Self {
+        self.set_node_dup_tree_max_entries(n);
+        self
+    }
+
+    /// Builder-style (consuming) `tree_max_embedded_ln` setter. See [`Self::set_tree_max_embedded_ln`].
+    pub fn with_tree_max_embedded_ln(mut self, bytes: u32) -> Self {
+        self.set_tree_max_embedded_ln(bytes);
+        self
+    }
+
+    /// Builder-style (consuming) `tree_max_delta` setter. See [`Self::set_tree_max_delta`].
+    pub fn with_tree_max_delta(mut self, pct: u8) -> Self {
+        self.set_tree_max_delta(pct);
+        self
+    }
+
+    /// Builder-style (consuming) `tree_bin_delta` setter. See [`Self::set_tree_bin_delta`].
+    pub fn with_tree_bin_delta(mut self, v: bool) -> Self {
+        self.set_tree_bin_delta(v);
+        self
+    }
+
+    /// Builder-style (consuming) `tree_bin_delta_percent` setter. See [`Self::set_tree_bin_delta_percent`].
+    pub fn with_tree_bin_delta_percent(mut self, pct: u8) -> Self {
+        self.set_tree_bin_delta_percent(pct);
+        self
+    }
+
+    /// Builder-style (consuming) `tree_min_memory` setter. See [`Self::set_tree_min_memory`].
+    pub fn with_tree_min_memory(mut self, bytes: u64) -> Self {
+        self.set_tree_min_memory(bytes);
+        self
+    }
+
+    /// Builder-style (consuming) `tree_compact_max_key_length` setter. See [`Self::set_tree_compact_max_key_length`].
+    pub fn with_tree_compact_max_key_length(mut self, bytes: u32) -> Self {
+        self.set_tree_compact_max_key_length(bytes);
+        self
+    }
+
+    /// Builder-style (consuming) `in_compressor_wakeup_interval_ms` setter. See [`Self::set_in_compressor_wakeup_interval_ms`].
+    pub fn with_in_compressor_wakeup_interval_ms(mut self, ms: u64) -> Self {
+        self.set_in_compressor_wakeup_interval_ms(ms);
+        self
+    }
+
+    /// Builder-style (consuming) `compressor_deadlock_retry` setter. See [`Self::set_compressor_deadlock_retry`].
+    pub fn with_compressor_deadlock_retry(mut self, n: u32) -> Self {
+        self.set_compressor_deadlock_retry(n);
+        self
+    }
+
+    /// Builder-style (consuming) `compressor_lock_timeout_ms` setter. See [`Self::set_compressor_lock_timeout_ms`].
+    pub fn with_compressor_lock_timeout_ms(mut self, ms: u64) -> Self {
+        self.set_compressor_lock_timeout_ms(ms);
+        self
+    }
+
+    /// Builder-style (consuming) `compressor_purge_root` setter. See [`Self::set_compressor_purge_root`].
+    pub fn with_compressor_purge_root(mut self, v: bool) -> Self {
+        self.set_compressor_purge_root(v);
+        self
+    }
+
+    /// Builder-style (consuming) `cleaner_two_pass_gap` setter. See [`Self::set_cleaner_two_pass_gap`].
+    pub fn with_cleaner_two_pass_gap(mut self, gap: i32) -> Self {
+        self.set_cleaner_two_pass_gap(gap);
+        self
+    }
+
+    /// Builder-style (consuming) `cleaner_two_pass_threshold` setter. See [`Self::set_cleaner_two_pass_threshold`].
+    pub fn with_cleaner_two_pass_threshold(mut self, t: i32) -> Self {
+        self.set_cleaner_two_pass_threshold(t);
+        self
+    }
+
+    /// Builder-style (consuming) `cleaner_min_file_utilization` setter. See [`Self::set_cleaner_min_file_utilization`].
+    pub fn with_cleaner_min_file_utilization(mut self, pct: u8) -> Self {
+        self.set_cleaner_min_file_utilization(pct);
+        self
+    }
+
+    /// Builder-style (consuming) `cleaner_threads` setter. See [`Self::set_cleaner_threads`].
+    pub fn with_cleaner_threads(mut self, n: u32) -> Self {
+        self.set_cleaner_threads(n);
+        self
+    }
+
+    /// Builder-style (consuming) `cleaner_min_file_count` setter. See [`Self::set_cleaner_min_file_count`].
+    pub fn with_cleaner_min_file_count(mut self, n: u32) -> Self {
+        self.set_cleaner_min_file_count(n);
+        self
+    }
+
+    /// Builder-style (consuming) `cleaner_min_age` setter. See [`Self::set_cleaner_min_age`].
+    pub fn with_cleaner_min_age(mut self, checkpoints: u32) -> Self {
+        self.set_cleaner_min_age(checkpoints);
+        self
+    }
+
+    /// Builder-style (consuming) `cleaner_bytes_interval` setter. See [`Self::set_cleaner_bytes_interval`].
+    pub fn with_cleaner_bytes_interval(mut self, bytes: u64) -> Self {
+        self.set_cleaner_bytes_interval(bytes);
+        self
+    }
+
+    /// Builder-style (consuming) `cleaner_wakeup_interval_ms` setter. See [`Self::set_cleaner_wakeup_interval_ms`].
+    pub fn with_cleaner_wakeup_interval_ms(mut self, ms: u64) -> Self {
+        self.set_cleaner_wakeup_interval_ms(ms);
+        self
+    }
+
+    /// Builder-style (consuming) `cleaner_fetch_obsolete_size` setter. See [`Self::set_cleaner_fetch_obsolete_size`].
+    pub fn with_cleaner_fetch_obsolete_size(mut self, v: bool) -> Self {
+        self.set_cleaner_fetch_obsolete_size(v);
+        self
+    }
+
+    /// Builder-style (consuming) `cleaner_adjust_utilization` setter. See [`Self::set_cleaner_adjust_utilization`].
+    pub fn with_cleaner_adjust_utilization(mut self, v: bool) -> Self {
+        self.set_cleaner_adjust_utilization(v);
+        self
+    }
+
+    /// Builder-style (consuming) `cleaner_deadlock_retry` setter. See [`Self::set_cleaner_deadlock_retry`].
+    pub fn with_cleaner_deadlock_retry(mut self, n: u32) -> Self {
+        self.set_cleaner_deadlock_retry(n);
+        self
+    }
+
+    /// Builder-style (consuming) `cleaner_lock_timeout_ms` setter. See [`Self::set_cleaner_lock_timeout_ms`].
+    pub fn with_cleaner_lock_timeout_ms(mut self, ms: u64) -> Self {
+        self.set_cleaner_lock_timeout_ms(ms);
+        self
+    }
+
+    /// Builder-style (consuming) `cleaner_expunge` setter. See [`Self::set_cleaner_expunge`].
+    pub fn with_cleaner_expunge(mut self, v: bool) -> Self {
+        self.set_cleaner_expunge(v);
+        self
+    }
+
+    /// Builder-style (consuming) `cleaner_use_deleted_dir` setter. See [`Self::set_cleaner_use_deleted_dir`].
+    pub fn with_cleaner_use_deleted_dir(mut self, v: bool) -> Self {
+        self.set_cleaner_use_deleted_dir(v);
+        self
+    }
+
+    /// Builder-style (consuming) `cleaner_max_batch_files` setter. See [`Self::set_cleaner_max_batch_files`].
+    pub fn with_cleaner_max_batch_files(mut self, n: u32) -> Self {
+        self.set_cleaner_max_batch_files(n);
+        self
+    }
+
+    /// Builder-style (consuming) `cleaner_read_size` setter. See [`Self::set_cleaner_read_size`].
+    pub fn with_cleaner_read_size(mut self, bytes: usize) -> Self {
+        self.set_cleaner_read_size(bytes);
+        self
+    }
+
+    /// Builder-style (consuming) `cleaner_detail_max_memory_percentage` setter. See [`Self::set_cleaner_detail_max_memory_percentage`].
+    pub fn with_cleaner_detail_max_memory_percentage(
+        mut self,
+        pct: u32,
+    ) -> Self {
+        self.set_cleaner_detail_max_memory_percentage(pct);
+        self
+    }
+
+    /// Builder-style (consuming) `cleaner_look_ahead_cache_size` setter. See [`Self::set_cleaner_look_ahead_cache_size`].
+    pub fn with_cleaner_look_ahead_cache_size(mut self, n: usize) -> Self {
+        self.set_cleaner_look_ahead_cache_size(n);
+        self
+    }
+
+    /// Builder-style (consuming) `cleaner_foreground_proactive_migration` setter. See [`Self::set_cleaner_foreground_proactive_migration`].
+    pub fn with_cleaner_foreground_proactive_migration(
+        mut self,
+        v: bool,
+    ) -> Self {
+        self.set_cleaner_foreground_proactive_migration(v);
+        self
+    }
+
+    /// Builder-style (consuming) `cleaner_background_proactive_migration` setter. See [`Self::set_cleaner_background_proactive_migration`].
+    pub fn with_cleaner_background_proactive_migration(
+        mut self,
+        v: bool,
+    ) -> Self {
+        self.set_cleaner_background_proactive_migration(v);
+        self
+    }
+
+    /// Builder-style (consuming) `cleaner_lazy_migration` setter. See [`Self::set_cleaner_lazy_migration`].
+    pub fn with_cleaner_lazy_migration(mut self, v: bool) -> Self {
+        self.set_cleaner_lazy_migration(v);
+        self
+    }
+
+    /// Builder-style (consuming) `cleaner_expiration_enabled` setter. See [`Self::set_cleaner_expiration_enabled`].
+    pub fn with_cleaner_expiration_enabled(mut self, v: bool) -> Self {
+        self.set_cleaner_expiration_enabled(v);
+        self
+    }
+
+    /// Builder-style (consuming) `checkpointer_wakeup_interval_ms` setter. See [`Self::set_checkpointer_wakeup_interval_ms`].
+    pub fn with_checkpointer_wakeup_interval_ms(mut self, ms: u64) -> Self {
+        self.set_checkpointer_wakeup_interval_ms(ms);
+        self
+    }
+
+    /// Builder-style (consuming) `checkpointer_min_interval_secs` setter. See [`Self::set_checkpointer_min_interval_secs`].
+    pub fn with_checkpointer_min_interval_secs(mut self, secs: u64) -> Self {
+        self.set_checkpointer_min_interval_secs(secs);
+        self
+    }
+
+    /// Builder-style (consuming) `checkpointer_deadlock_retry` setter. See [`Self::set_checkpointer_deadlock_retry`].
+    pub fn with_checkpointer_deadlock_retry(mut self, n: u32) -> Self {
+        self.set_checkpointer_deadlock_retry(n);
+        self
+    }
+
+    /// Builder-style (consuming) `checkpointer_high_priority` setter. See [`Self::set_checkpointer_high_priority`].
+    pub fn with_checkpointer_high_priority(mut self, v: bool) -> Self {
+        self.set_checkpointer_high_priority(v);
+        self
+    }
+
+    /// Builder-style (consuming) `evictor_evict_bytes` setter. See [`Self::set_evictor_evict_bytes`].
+    pub fn with_evictor_evict_bytes(mut self, bytes: u64) -> Self {
+        self.set_evictor_evict_bytes(bytes);
+        self
+    }
+
+    /// Builder-style (consuming) `evictor_critical_percentage` setter. See [`Self::set_evictor_critical_percentage`].
+    pub fn with_evictor_critical_percentage(mut self, pct: u32) -> Self {
+        self.set_evictor_critical_percentage(pct);
+        self
+    }
+
+    /// Builder-style (consuming) `evictor_use_dirty_lru` setter. See [`Self::set_evictor_use_dirty_lru`].
+    pub fn with_evictor_use_dirty_lru(mut self, v: bool) -> Self {
+        self.set_evictor_use_dirty_lru(v);
+        self
+    }
+
+    /// Builder-style (consuming) `evictor_lru_only` setter. See [`Self::set_evictor_lru_only`].
+    pub fn with_evictor_lru_only(mut self, v: bool) -> Self {
+        self.set_evictor_lru_only(v);
+        self
+    }
+
+    /// Builder-style (consuming) `evictor_n_lru_lists` setter. See [`Self::set_evictor_n_lru_lists`].
+    pub fn with_evictor_n_lru_lists(mut self, n: u32) -> Self {
+        self.set_evictor_n_lru_lists(n);
+        self
+    }
+
+    /// Builder-style (consuming) `evictor_deadlock_retry` setter. See [`Self::set_evictor_deadlock_retry`].
+    pub fn with_evictor_deadlock_retry(mut self, n: u32) -> Self {
+        self.set_evictor_deadlock_retry(n);
+        self
+    }
+
+    /// Builder-style (consuming) `evictor_core_threads` setter. See [`Self::set_evictor_core_threads`].
+    pub fn with_evictor_core_threads(mut self, n: usize) -> Self {
+        self.set_evictor_core_threads(n);
+        self
+    }
+
+    /// Builder-style (consuming) `evictor_max_threads` setter. See [`Self::set_evictor_max_threads`].
+    pub fn with_evictor_max_threads(mut self, n: usize) -> Self {
+        self.set_evictor_max_threads(n);
+        self
+    }
+
+    /// Builder-style (consuming) `evictor_keep_alive_ms` setter. See [`Self::set_evictor_keep_alive_ms`].
+    pub fn with_evictor_keep_alive_ms(mut self, ms: u64) -> Self {
+        self.set_evictor_keep_alive_ms(ms);
+        self
+    }
+
+    /// Builder-style (consuming) `evictor_allow_bin_deltas` setter. See [`Self::set_evictor_allow_bin_deltas`].
+    pub fn with_evictor_allow_bin_deltas(mut self, v: bool) -> Self {
+        self.set_evictor_allow_bin_deltas(v);
+        self
+    }
+
+    /// Builder-style (consuming) `offheap_evict_bytes` setter. See [`Self::set_offheap_evict_bytes`].
+    pub fn with_offheap_evict_bytes(mut self, bytes: u64) -> Self {
+        self.set_offheap_evict_bytes(bytes);
+        self
+    }
+
+    /// Builder-style (consuming) `offheap_n_lru_lists` setter. See [`Self::set_offheap_n_lru_lists`].
+    pub fn with_offheap_n_lru_lists(mut self, n: u32) -> Self {
+        self.set_offheap_n_lru_lists(n);
+        self
+    }
+
+    /// Builder-style (consuming) `offheap_checksum` setter. See [`Self::set_offheap_checksum`].
+    pub fn with_offheap_checksum(mut self, v: bool) -> Self {
+        self.set_offheap_checksum(v);
+        self
+    }
+
+    /// Builder-style (consuming) `offheap_core_threads` setter. See [`Self::set_offheap_core_threads`].
+    pub fn with_offheap_core_threads(mut self, n: usize) -> Self {
+        self.set_offheap_core_threads(n);
+        self
+    }
+
+    /// Builder-style (consuming) `offheap_max_threads` setter. See [`Self::set_offheap_max_threads`].
+    pub fn with_offheap_max_threads(mut self, n: usize) -> Self {
+        self.set_offheap_max_threads(n);
+        self
+    }
+
+    /// Builder-style (consuming) `offheap_keep_alive_ms` setter. See [`Self::set_offheap_keep_alive_ms`].
+    pub fn with_offheap_keep_alive_ms(mut self, ms: u64) -> Self {
+        self.set_offheap_keep_alive_ms(ms);
+        self
+    }
+
+    /// Builder-style (consuming) `lock_timeout` setter. See [`Self::set_lock_timeout`].
+    pub fn with_lock_timeout(mut self, ms: u64) -> Self {
+        self.set_lock_timeout(ms);
+        self
+    }
+
+    /// Builder-style (consuming) `lock_n_lock_tables` setter. See [`Self::set_lock_n_lock_tables`].
+    pub fn with_lock_n_lock_tables(mut self, n: u32) -> Self {
+        self.set_lock_n_lock_tables(n);
+        self
+    }
+
+    /// Builder-style (consuming) `lock_deadlock_detect` setter. See [`Self::set_lock_deadlock_detect`].
+    pub fn with_lock_deadlock_detect(mut self, v: bool) -> Self {
+        self.set_lock_deadlock_detect(v);
+        self
+    }
+
+    /// Builder-style (consuming) `lock_deadlock_detect_delay_ms` setter. See [`Self::set_lock_deadlock_detect_delay_ms`].
+    pub fn with_lock_deadlock_detect_delay_ms(mut self, ms: u64) -> Self {
+        self.set_lock_deadlock_detect_delay_ms(ms);
+        self
+    }
+
+    /// Builder-style (consuming) `txn_timeout` setter. See [`Self::set_txn_timeout`].
+    pub fn with_txn_timeout(mut self, ms: u64) -> Self {
+        self.set_txn_timeout(ms);
+        self
+    }
+
+    /// Builder-style (consuming) `txn_serializable_isolation` setter. See [`Self::set_txn_serializable_isolation`].
+    pub fn with_txn_serializable_isolation(mut self, v: bool) -> Self {
+        self.set_txn_serializable_isolation(v);
+        self
+    }
+
+    /// Builder-style (consuming) `txn_deadlock_stack_trace` setter. See [`Self::set_txn_deadlock_stack_trace`].
+    pub fn with_txn_deadlock_stack_trace(mut self, v: bool) -> Self {
+        self.set_txn_deadlock_stack_trace(v);
+        self
+    }
+
+    /// Builder-style (consuming) `txn_dump_locks` setter. See [`Self::set_txn_dump_locks`].
+    pub fn with_txn_dump_locks(mut self, v: bool) -> Self {
+        self.set_txn_dump_locks(v);
+        self
+    }
+
+    /// Builder-style (consuming) `verify_schedule` setter. See [`Self::set_verify_schedule`].
+    pub fn with_verify_schedule(mut self, s: String) -> Self {
+        self.set_verify_schedule(s);
+        self
+    }
+
+    /// Builder-style (consuming) `verify_log` setter. See [`Self::set_verify_log`].
+    pub fn with_verify_log(mut self, v: bool) -> Self {
+        self.set_verify_log(v);
+        self
+    }
+
+    /// Builder-style (consuming) `verify_log_read_delay_ms` setter. See [`Self::set_verify_log_read_delay_ms`].
+    pub fn with_verify_log_read_delay_ms(mut self, ms: u64) -> Self {
+        self.set_verify_log_read_delay_ms(ms);
+        self
+    }
+
+    /// Builder-style (consuming) `verify_btree` setter. See [`Self::set_verify_btree`].
+    pub fn with_verify_btree(mut self, v: bool) -> Self {
+        self.set_verify_btree(v);
+        self
+    }
+
+    /// Builder-style (consuming) `verify_secondaries` setter. See [`Self::set_verify_secondaries`].
+    pub fn with_verify_secondaries(mut self, v: bool) -> Self {
+        self.set_verify_secondaries(v);
+        self
+    }
+
+    /// Builder-style (consuming) `verify_data_records` setter. See [`Self::set_verify_data_records`].
+    pub fn with_verify_data_records(mut self, v: bool) -> Self {
+        self.set_verify_data_records(v);
+        self
+    }
+
+    /// Builder-style (consuming) `verify_obsolete_records` setter. See [`Self::set_verify_obsolete_records`].
+    pub fn with_verify_obsolete_records(mut self, v: bool) -> Self {
+        self.set_verify_obsolete_records(v);
+        self
+    }
+
+    /// Builder-style (consuming) `verify_btree_batch_size` setter. See [`Self::set_verify_btree_batch_size`].
+    pub fn with_verify_btree_batch_size(mut self, n: u32) -> Self {
+        self.set_verify_btree_batch_size(n);
+        self
+    }
+
+    /// Builder-style (consuming) `verify_btree_batch_delay_ms` setter. See [`Self::set_verify_btree_batch_delay_ms`].
+    pub fn with_verify_btree_batch_delay_ms(mut self, ms: u64) -> Self {
+        self.set_verify_btree_batch_delay_ms(ms);
+        self
+    }
+
+    /// Builder-style (consuming) `dos_producer_queue_timeout_ms` setter. See [`Self::set_dos_producer_queue_timeout_ms`].
+    pub fn with_dos_producer_queue_timeout_ms(mut self, ms: u64) -> Self {
+        self.set_dos_producer_queue_timeout_ms(ms);
+        self
+    }
+
+    /// Builder-style (consuming) `stats_collect` setter. See [`Self::set_stats_collect`].
+    pub fn with_stats_collect(mut self, v: bool) -> Self {
+        self.set_stats_collect(v);
+        self
+    }
+
+    /// Builder-style (consuming) `stats_collect_interval_secs` setter. See [`Self::set_stats_collect_interval_secs`].
+    pub fn with_stats_collect_interval_secs(mut self, secs: u64) -> Self {
+        self.set_stats_collect_interval_secs(secs);
+        self
+    }
+
+    /// Builder-style (consuming) `stats_max_files` setter. See [`Self::set_stats_max_files`].
+    pub fn with_stats_max_files(mut self, n: u32) -> Self {
+        self.set_stats_max_files(n);
+        self
+    }
+
+    /// Builder-style (consuming) `stats_file_row_count` setter. See [`Self::set_stats_file_row_count`].
+    pub fn with_stats_file_row_count(mut self, n: u32) -> Self {
+        self.set_stats_file_row_count(n);
+        self
+    }
+
+    /// Builder-style (consuming) `stats_file_directory` setter. See [`Self::set_stats_file_directory`].
+    pub fn with_stats_file_directory(mut self, dir: PathBuf) -> Self {
+        self.set_stats_file_directory(dir);
+        self
+    }
+
+    /// Builder-style (consuming) `trace_file` setter. See [`Self::set_trace_file`].
+    pub fn with_trace_file(mut self, v: bool) -> Self {
+        self.set_trace_file(v);
+        self
+    }
+
+    /// Builder-style (consuming) `trace_console` setter. See [`Self::set_trace_console`].
+    pub fn with_trace_console(mut self, v: bool) -> Self {
+        self.set_trace_console(v);
+        self
+    }
+
+    /// Builder-style (consuming) `trace_db` setter. See [`Self::set_trace_db`].
+    pub fn with_trace_db(mut self, v: bool) -> Self {
+        self.set_trace_db(v);
+        self
+    }
+
+    /// Builder-style (consuming) `trace_file_limit_bytes` setter. See [`Self::set_trace_file_limit_bytes`].
+    pub fn with_trace_file_limit_bytes(mut self, bytes: u64) -> Self {
+        self.set_trace_file_limit_bytes(bytes);
+        self
+    }
+
+    /// Builder-style (consuming) `trace_file_count` setter. See [`Self::set_trace_file_count`].
+    pub fn with_trace_file_count(mut self, n: u32) -> Self {
+        self.set_trace_file_count(n);
+        self
+    }
+
+    /// Builder-style (consuming) `trace_level` setter. See [`Self::set_trace_level`].
+    pub fn with_trace_level(mut self, level: String) -> Self {
+        self.set_trace_level(level);
+        self
+    }
+
+    /// Builder-style (consuming) `console_logging_level` setter. See [`Self::set_console_logging_level`].
+    pub fn with_console_logging_level(mut self, level: String) -> Self {
+        self.set_console_logging_level(level);
+        self
+    }
+
+    /// Builder-style (consuming) `file_logging_level` setter. See [`Self::set_file_logging_level`].
+    pub fn with_file_logging_level(mut self, level: String) -> Self {
+        self.set_file_logging_level(level);
+        self
+    }
+
+    /// Builder-style (consuming) `trace_level_lock_manager` setter. See [`Self::set_trace_level_lock_manager`].
+    pub fn with_trace_level_lock_manager(mut self, level: String) -> Self {
+        self.set_trace_level_lock_manager(level);
+        self
+    }
+
+    /// Builder-style (consuming) `trace_level_recovery` setter. See [`Self::set_trace_level_recovery`].
+    pub fn with_trace_level_recovery(mut self, level: String) -> Self {
+        self.set_trace_level_recovery(level);
+        self
+    }
+
+    /// Builder-style (consuming) `trace_level_evictor` setter. See [`Self::set_trace_level_evictor`].
+    pub fn with_trace_level_evictor(mut self, level: String) -> Self {
+        self.set_trace_level_evictor(level);
+        self
+    }
+
+    /// Builder-style (consuming) `trace_level_cleaner` setter. See [`Self::set_trace_level_cleaner`].
+    pub fn with_trace_level_cleaner(mut self, level: String) -> Self {
+        self.set_trace_level_cleaner(level);
+        self
+    }
+
+    /// Builder-style (consuming) `startup_dump_threshold_ms` setter. See [`Self::set_startup_dump_threshold_ms`].
+    pub fn with_startup_dump_threshold_ms(mut self, ms: u64) -> Self {
+        self.set_startup_dump_threshold_ms(ms);
+        self
+    }
+
+    /// Builder-style (consuming) `exception_listener` setter. See [`Self::set_exception_listener`].
+    pub fn with_exception_listener(
+        mut self,
+        listener: Arc<dyn ExceptionListener>,
+    ) -> Self {
+        self.set_exception_listener(listener);
+        self
+    }
 }
 
 impl Default for EnvironmentConfig {
@@ -1843,6 +2692,26 @@ mod tests {
         assert!(!c.env_recovery_force_checkpoint);
         assert!(!c.env_recovery_force_new_file);
         assert!(!c.halt_on_commit_after_checksum_exception);
+    }
+
+    #[test]
+    fn test_with_builders_are_uniform_and_chainable() {
+        // review P1-8: every parameter now has a consuming `with_*` builder,
+        // including ones that previously only had `set_*`. The whole config
+        // can be built in one chained expression.
+        let c = EnvironmentConfig::new(PathBuf::from("/tmp/x"))
+            .with_allow_create(true)
+            .with_transactional(true)
+            .with_shared_cache(true) // previously set_*-only
+            .with_run_cleaner(false) // previously set_*-only
+            .with_log_num_buffers(7) // previously set_*-only
+            .with_cache_percent(42); // previously set_*-only
+        assert!(c.allow_create);
+        assert!(c.transactional);
+        assert!(c.shared_cache);
+        assert!(!c.run_cleaner);
+        assert_eq!(c.log_num_buffers, 7);
+        assert_eq!(c.cache_percent, 42);
     }
 
     #[test]
