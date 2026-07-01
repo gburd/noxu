@@ -122,6 +122,7 @@ pub mod stats_file;
 pub mod transaction;
 pub mod transaction_config;
 pub mod write_options;
+pub mod verify_daemon;
 
 // Re-export commonly used types
 pub use cache_mode::CacheMode;
