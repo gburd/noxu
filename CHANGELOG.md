@@ -17,6 +17,13 @@ listed in [References](#references).
 
 ### Added
 
+- **`startup_dump_threshold_ms` startup performance summary (`noxu-db`).**
+  When `Environment::open` takes at least the configured threshold (startup is
+  dominated by the crash-recovery analysis/redo/undo passes), Noxu now logs a
+  `warn!` startup summary with the elapsed open time and a `get_stats()`
+  snapshot so operators can see why a slow start happened. Threshold `0` (the
+  default) disables it. Removed from the `unimplemented_params` WARN registry.
+  JE ref: `EnvironmentParams.STARTUP_DUMP_THRESHOLD`.
 - **L-3 debug-build latch-ordering assertion (`noxu-latch`).** A faithful
   analogue of BDB-JE's debug-only latch-ordering enforcement
   (`LatchSupport` / per-thread `LatchTable`). `LatchContext` gains an optional

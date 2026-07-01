@@ -160,6 +160,17 @@ Per-cursor options:
 | `evict_ln` | `bool` | `false` | Evict leaf nodes after reading (cache bypass) |
 | `prefix_constraint` | `Option<Vec<u8>>` | `None` | Stop scan at prefix boundary |
 
+## Diagnostics & Observability (`EnvironmentConfig`)
+
+These `EnvironmentConfig` knobs give operators real signal about the engine.
+Logging itself is **not** configured here — Noxu routes all diagnostics through
+the Rust [`log`](https://docs.rs/log) facade / `noxu-observe` / `RUST_LOG` (the
+JE-style `logging_level` / `trace_*` knobs are deprecated no-ops).
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `startup_dump_threshold_ms` | `u64` | `0` (off) | If `Environment::open` takes at least this many ms (startup is dominated by crash recovery), log a `warn!` startup summary with the elapsed time and a stats snapshot. JE: `STARTUP_DUMP_THRESHOLD`. |
+
 ## Replication Parameters
 
 Replication is configured on `RepConfig` / `RepConfigBuilder`, not

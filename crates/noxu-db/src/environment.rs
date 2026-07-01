@@ -171,6 +171,7 @@ impl Environment {
     /// - The environment directory exists but is not writable and `read_only` is false
     /// - Invalid configuration parameters are provided
     pub fn open(config: EnvironmentConfig) -> Result<Self> {
+        let open_start = std::time::Instant::now();
         let home = config.home.clone();
 
         // Validate home directory
@@ -381,7 +382,7 @@ impl Environment {
 
         let log_manager = env_impl.get_log_manager();
         let env_impl_arc = Arc::new(Mutex::new(env_impl));
-        Ok(Environment {
+        let env = Environment {
             home,
             config,
             databases: Mutex::new(HashMap::new()),
@@ -395,12 +396,47 @@ impl Environment {
             last_checkpoint_end_lsn: Mutex::new(noxu_util::NULL_LSN),
             replica_coordinator: Mutex::new(None),
             replica_ack_timeout: Mutex::new(std::time::Duration::from_secs(5)),
-        })
+        };
+
+        // STARTUP_DUMP_THRESHOLD: if opening the environment (dominated by
+        // crash-recovery: the analysis + redo + undo passes) took longer than
+        // the configured threshold, log a one-line startup performance summary
+        // plus a stats snapshot so operators can see WHY a slow start happened.
+        // A threshold of 0 (the default) disables the dump.
+        // JE ref: EnvironmentParams.STARTUP_DUMP_THRESHOLD / EnvironmentImpl
+        // dumping the startup RecoveryInfo + EnvironmentStats when startup is
+        // slow.
+        let threshold_ms = env.config.startup_dump_threshold_ms;
+        if threshold_ms > 0 {
+            let elapsed_ms = open_start.elapsed().as_millis() as u64;
+            if Self::startup_dump_triggered(elapsed_ms, threshold_ms) {
+                match env.stats() {
+                    Ok(stats) => log::warn!(
+                        "startup dump: Environment::open took {elapsed_ms} ms \
+                         (threshold {threshold_ms} ms). Startup is dominated by \
+                         crash recovery. Stats snapshot after open: {stats:?}"
+                    ),
+                    Err(e) => log::warn!(
+                        "startup dump: Environment::open took {elapsed_ms} ms \
+                         (threshold {threshold_ms} ms); stats unavailable: {e}"
+                    ),
+                }
+            }
+        }
+
+        Ok(env)
+    }
+
+    /// STARTUP_DUMP_THRESHOLD predicate: returns `true` when the measured
+    /// `Environment::open` elapsed time (ms) meets or exceeds a non-zero
+    /// `threshold_ms`.  Extracted so the decision is unit-testable without a
+    /// log-capture harness.  A threshold of 0 disables the dump.
+    #[inline]
+    fn startup_dump_triggered(elapsed_ms: u64, threshold_ms: u64) -> bool {
+        threshold_ms > 0 && elapsed_ms >= threshold_ms
     }
 
     /// Closes the environment handle.
-    ///
-    ///
     ///
     /// # Errors
     /// Returns an error if:
@@ -1718,6 +1754,34 @@ mod tests {
         let env = Environment::open(config).unwrap();
         assert!(env.is_valid());
         assert_eq!(env.home(), temp_dir.path());
+        env.close().unwrap();
+    }
+
+    // STARTUP_DUMP_THRESHOLD (startup_dump_threshold_ms)
+    #[test]
+    fn test_startup_dump_triggered_predicate() {
+        // Disabled: threshold 0 never triggers regardless of elapsed.
+        assert!(!Environment::startup_dump_triggered(1_000_000, 0));
+        // Below threshold: no dump.
+        assert!(!Environment::startup_dump_triggered(9, 10));
+        // At threshold: dump (>=).
+        assert!(Environment::startup_dump_triggered(10, 10));
+        // Above threshold: dump.
+        assert!(Environment::startup_dump_triggered(50, 10));
+    }
+
+    #[test]
+    fn test_open_with_startup_dump_threshold_smoke() {
+        // A 1 ms threshold makes any real open exceed it, exercising the
+        // dump path (stats snapshot + warn!).  We only assert open still
+        // succeeds and the env is valid; the log line is a side effect.
+        let temp_dir = TempDir::new().unwrap();
+        let config = EnvironmentConfig::new(temp_dir.path().to_path_buf())
+            .with_allow_create(true)
+            .with_transactional(true)
+            .with_startup_dump_threshold_ms(1);
+        let env = Environment::open(config).unwrap();
+        assert!(env.is_valid());
         env.close().unwrap();
     }
 

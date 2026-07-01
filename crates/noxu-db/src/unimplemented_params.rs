@@ -103,11 +103,6 @@ pub static UNIMPLEMENTED_ENV_PARAMS: &[UnimplementedParam] = &[
         is_non_default: |c| !c.verify_schedule.is_empty(),
     },
     UnimplementedParam {
-        name: "startup_dump_threshold_ms",
-        // default = 0; startup-diagnostics dump is not implemented.
-        is_non_default: |c| c.startup_dump_threshold_ms != 0,
-    },
-    UnimplementedParam {
         name: "dos_producer_queue_timeout_ms",
         // default = 10_000; the DiskOrderedScan producer-queue timeout is not
         // consulted by the disk-ordered cursor implementation.
@@ -253,12 +248,10 @@ mod tests {
         let mut c = env_default();
         c.set_checkpointer_min_interval_secs(60);
         c.set_verify_schedule("0 0 * * *".to_string());
-        c.set_startup_dump_threshold_ms(100);
         c.set_dos_producer_queue_timeout_ms(5_000);
         for name in [
             "checkpointer_min_interval_secs",
             "verify_schedule",
-            "startup_dump_threshold_ms",
             "dos_producer_queue_timeout_ms",
         ] {
             let p = UNIMPLEMENTED_ENV_PARAMS
