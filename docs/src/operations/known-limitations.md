@@ -102,6 +102,48 @@ Recommended deployment until these are remediated:
 
 ---
 
+## Deliberately not implemented (diagnostics / perf), with reasons
+
+The following JE diagnostic, observability, and micro-optimization features are
+**intentionally not implemented**.  None affects correctness; each has a clear
+reason it is not worth porting to Noxu.  This is honest engineering: we say
+what won't be done and why.
+
+- **L-1 / L-2 — per-latch contention stats + owner-stack capture:** external
+  tools (perf, flamegraphs, tokio-console-style profilers) give better
+  latch-contention insight than in-process counters, and Noxu already exposes
+  aggregate lock stats via `get_stats()`; owner-stack capture is a JVM-only
+  debug convenience.
+- **L-7 — lazy trace-log queue:** the `log` / `tracing` crates already provide
+  async / non-blocking logging, so a bespoke in-engine trace queue is redundant.
+- **L-11 — multi-data-directory log spreading (`je.log.nDataDirectories`):**
+  use RAID / LVM / ZFS striping at the storage layer — the OS / filesystem does
+  this better than the DB, and the complexity-vs-payoff is poor.
+- **L-12 — FileCacheWarmer startup pre-read:** the kernel page cache warms
+  implicitly on access, so an explicit startup pre-read is a marginal
+  micro-optimization.
+- **L-13 — FileDeletionDetector WatchService:** JE's is built on the
+  Java-specific `java.nio` `WatchService`; it is not portable, and OS-level file
+  monitoring (inotify / FSEvents) can be run externally if needed.
+- **EV-4 — `CacheMode::DYNAMIC` environment-default mode:** a JE eviction
+  micro-optimization with diminishing returns; Noxu's LRU default is faithful
+  and correct.
+- **EV-5 / EV-8 / EV-9 / EV-12 / EV-18 — LRU second-chance / skip nuances:**
+  these are JE evictor micro-optimizations with diminishing returns; Noxu's LRU
+  is faithful and correct without them.
+- **EV-31 — off-heap stat breadth:** off-heap caching is opt-in and inert by
+  default, so the extra off-heap stats are purely informational.
+- **T-16 — `CountEstimator` sampling count:** Noxu returns EXACT record counts,
+  which is stronger than JE's sampled estimate — implementing sampling would be
+  a regression, so it is deliberately not done.
+
+(Implemented in 7.1 and moved out of this list: **L-3** debug-build
+latch-ordering assertion, **`exception_listener`**, **stats-file dump**
+`STATS_FILE_*`, **`startup_dump_threshold_ms`**, and **`env_check_leaks`** —
+see the rows in the table above.)
+
+---
+
 ## Quick-reference: `EnvironmentConfig` production defaults
 
 ```rust
