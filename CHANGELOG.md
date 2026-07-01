@@ -36,6 +36,13 @@ listed in [References](#references).
   addr}`) with a scoped `#[allow(dead_code)]`. `noxu`, `noxu-observe`,
   `noxu-xa`, `noxu-persist-derive` had no crate-wide `dead_code` allow.
 
+- **P2-3 — async usage guide in the user docs.** Added a
+  "Using Noxu from Async Code" page to the mdBook getting-started section
+  (`docs/src/getting-started/async.md`), mirroring the umbrella crate's
+  rustdoc note: Noxu is blocking by design, wrap work in
+  `tokio::task::spawn_blocking`, and never hold a `Transaction`/`Cursor`
+  across an `.await`.
+
 ## [7.0.0] - 2026-07-01
 
 ### Changed (BREAKING — 7.0 core API reshape)
