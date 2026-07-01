@@ -131,6 +131,8 @@ impl SharedLatch {
         // L-3: record the exclusive acquisition for the debug-build latch-
         // ordering assertion (no-op in release builds and for rank-0 latches).
         crate::latch_order::enter(self.context.rank, &self.context.name);
+        // JE ENV_FORCED_YIELD: test-only fairness stress (no-op unless set).
+        crate::config::maybe_yield();
         Ok(SharedLatchWriteGuard { latch: self, _guard: guard })
     }
 
@@ -150,6 +152,7 @@ impl SharedLatch {
         self.inner.try_write().map(|guard| {
             self.exclusive_owner.store(current, Ordering::Relaxed);
             crate::latch_order::enter(self.context.rank, &self.context.name);
+            crate::config::maybe_yield();
             SharedLatchWriteGuard { latch: self, _guard: guard }
         })
     }
@@ -191,6 +194,7 @@ impl SharedLatch {
             })?;
             let latch_id = self as *const Self as usize;
             increment_read_hold(latch_id);
+            crate::config::maybe_yield();
             Ok(SharedLatchGuard::Read(SharedLatchReadGuard {
                 latch_id,
                 _guard: guard,
@@ -236,6 +240,8 @@ impl Drop for SharedLatchReadGuard<'_> {
         // Decrement before the inner guard drops to keep the count accurate
         // for any code that runs between our drop and the lock release.
         decrement_read_hold(self.latch_id);
+        // JE ENV_FORCED_YIELD: yield on release too (no-op unless set).
+        crate::config::maybe_yield();
     }
 }
 
@@ -249,6 +255,8 @@ impl Drop for SharedLatchWriteGuard<'_> {
     fn drop(&mut self) {
         crate::latch_order::leave(self.latch.context.rank);
         self.latch.exclusive_owner.store(0, Ordering::Relaxed);
+        // JE ENV_FORCED_YIELD: yield on release too (no-op unless set).
+        crate::config::maybe_yield();
     }
 }
 

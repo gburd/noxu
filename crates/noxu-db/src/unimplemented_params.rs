@@ -20,8 +20,12 @@
 //!
 //! # Closing the gap (re-audit JE F-1)
 //!
-//! The 7 parameters identified in the JE re-audit (2026-05-30) are listed
-//! below.  Each has been marked reserved in its rustdoc.
+//! The parameters identified in the JE re-audit (2026-05-30) are listed
+//! below.  Each has been marked reserved in its rustdoc.  As parameters are
+//! wired to real features they are removed from this registry: `env_forced_yield`
+//! and `env_latch_timeout_ms` were wired in 7.1 (JE `ENV_FORCED_YIELD` /
+//! `ENV_LATCH_TIMEOUT`); `env_fair_latches` (JE `setFairLatches`) remains
+//! reserved (a fair-latch mode is a dedicated `noxu-sync` FIFO rewrite).
 
 use crate::environment_config::EnvironmentConfig;
 
@@ -41,19 +45,18 @@ pub struct UnimplementedParam {
 /// - A new reserved parameter is added (add an entry).
 pub static UNIMPLEMENTED_ENV_PARAMS: &[UnimplementedParam] = &[
     UnimplementedParam {
-        name: "env_forced_yield",
-        // default = false; non-default means the caller set it to true
-        is_non_default: |c| c.env_forced_yield,
-    },
-    UnimplementedParam {
         name: "env_fair_latches",
-        // default = false; non-default means the caller set it to true
+        // default = false; non-default means the caller set it to true.
+        //
+        // DEFERRED (7.1): `env_forced_yield` and `env_latch_timeout_ms` were
+        // removed from this registry when they were WIRED into `noxu-latch`
+        // (JE `ENV_FORCED_YIELD` / `ENV_LATCH_TIMEOUT`).  `env_fair_latches`
+        // (JE `setFairLatches`) is NOT wired: `noxu-sync`'s futex primitives
+        // are fundamentally non-fair and have no FIFO queue to toggle, so a
+        // faithful fair-latch mode is a dedicated latch rewrite rather than a
+        // flag flip.  It stays reserved and warned here so a non-default
+        // setting is never a silent no-op.
         is_non_default: |c| c.env_fair_latches,
-    },
-    UnimplementedParam {
-        name: "env_latch_timeout_ms",
-        // default = 300_000; non-default means any other value
-        is_non_default: |c| c.env_latch_timeout_ms != 300_000,
     },
     UnimplementedParam {
         name: "env_ttl_clock_tolerance_ms",
@@ -151,17 +154,6 @@ mod tests {
     }
 
     #[test]
-    fn env_forced_yield_warn_on_true() {
-        let mut c = env_default();
-        c.set_env_forced_yield(true);
-        let p = UNIMPLEMENTED_ENV_PARAMS
-            .iter()
-            .find(|p| p.name == "env_forced_yield")
-            .unwrap();
-        assert!((p.is_non_default)(&c));
-    }
-
-    #[test]
     fn env_fair_latches_warn_on_true() {
         let mut c = env_default();
         c.set_env_fair_latches(true);
@@ -170,28 +162,6 @@ mod tests {
             .find(|p| p.name == "env_fair_latches")
             .unwrap();
         assert!((p.is_non_default)(&c));
-    }
-
-    #[test]
-    fn env_latch_timeout_ms_warn_on_non_default() {
-        let mut c = env_default();
-        c.set_env_latch_timeout_ms(60_000); // non-default
-        let p = UNIMPLEMENTED_ENV_PARAMS
-            .iter()
-            .find(|p| p.name == "env_latch_timeout_ms")
-            .unwrap();
-        assert!((p.is_non_default)(&c));
-    }
-
-    #[test]
-    fn env_latch_timeout_ms_no_warn_on_default() {
-        let mut c = env_default();
-        c.set_env_latch_timeout_ms(300_000); // exactly the default
-        let p = UNIMPLEMENTED_ENV_PARAMS
-            .iter()
-            .find(|p| p.name == "env_latch_timeout_ms")
-            .unwrap();
-        assert!(!(p.is_non_default)(&c));
     }
 
     #[test]

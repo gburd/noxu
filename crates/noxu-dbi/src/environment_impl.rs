@@ -470,6 +470,21 @@ impl EnvironmentImpl {
         env_home: impl Into<PathBuf>,
         cfg: &DbiEnvConfig,
     ) -> Result<Self, DbiError> {
+        // JE latch knobs (ENV_LATCH_TIMEOUT / ENV_FORCED_YIELD): install the
+        // process-global latch config BEFORE any latch is constructed during
+        // env build-up.  Only touch the globals if the operator opted out of
+        // the defaults, so an env that leaves these unset preserves the exact
+        // historical latch behaviour (5 s timeout, no forced yield) —
+        // byte-identical.  `env_latch_timeout_ms == 300_000` is the unset
+        // sentinel (the JE default); `env_forced_yield == false` is the unset
+        // sentinel.  See `noxu_latch::config`.
+        if cfg.env_latch_timeout_ms != 300_000 || cfg.env_forced_yield {
+            noxu_latch::configure(
+                cfg.env_latch_timeout_ms,
+                cfg.env_forced_yield,
+            );
+        }
+
         let read_only = cfg.read_only;
         let transactional = cfg.transactional;
         let checkpoint_interval_ms = cfg.checkpointer_wakeup_interval_ms;

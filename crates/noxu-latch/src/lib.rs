@@ -25,9 +25,11 @@
 //! - Reentrancy prevention is enforced (panics on reentrant acquire)
 //! - Thread ownership tracking is always available via noxu_sync
 
+pub mod config;
 mod exclusive;
 mod shared;
 
+pub use config::{configure, forced_yield};
 pub use exclusive::{ExclusiveLatch, ExclusiveLatchGuard};
 pub use shared::{SharedLatch, SharedLatchReadGuard, SharedLatchWriteGuard};
 
@@ -66,7 +68,10 @@ impl LatchContext {
     pub fn new(name: impl Into<String>) -> Self {
         LatchContext {
             name: name.into(),
-            timeout: DEFAULT_LATCH_TIMEOUT,
+            // JE `ENV_LATCH_TIMEOUT`: read the process-global default installed
+            // by `Environment::open`.  Before any `config::configure` call this
+            // is `DEFAULT_LATCH_TIMEOUT` (5 s) — byte-identical to before.
+            timeout: config::default_timeout(),
             rank: 0,
         }
     }
