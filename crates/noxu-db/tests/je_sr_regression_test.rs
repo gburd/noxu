@@ -319,7 +319,7 @@ fn sr11297_get_first_after_first_bin_emptied() {
         "getFirst must find a surviving record even after the first BIN was emptied"
     );
     let expected = 150u32.to_be_bytes();
-    assert_eq!(k.get_data().unwrap(), &expected[..]);
+    assert_eq!(k.data_opt().unwrap(), &expected[..]);
     drop(c);
     txn.commit().unwrap();
 }
@@ -360,7 +360,7 @@ fn sr9885_cursor_delete_removes_only_positioned_dup() {
     let mut d = DatabaseEntry::new();
     let mut s = c.get(&mut k, &mut d, Get::First, None).unwrap();
     while s == OperationStatus::Success {
-        found.push(d.get_data().unwrap_or(&[]).to_vec());
+        found.push(d.data_opt().unwrap_or(&[]).to_vec());
         s = c.get(&mut k, &mut d, Get::Next, None).unwrap();
     }
     assert_eq!(
@@ -422,5 +422,5 @@ fn dup_slot_reuse_diff_txn_abort_restores_v0() {
     let mut out = DatabaseEntry::new();
     let s = db.get_into(None, &k, &mut out).unwrap();
     assert!(s);
-    assert_eq!(out.get_data().unwrap(), b"v0");
+    assert_eq!(out.data_opt().unwrap(), b"v0");
 }

@@ -5,7 +5,7 @@ use tempfile::TempDir;
 
 use noxu_db::{
     DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig, Get,
-    OperationStatus, Transaction, TransactionConfig,
+    OperationStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -151,30 +151,6 @@ fn bench_cursor_forward_scan_1000(c: &mut Criterion) {
 // Transaction begin / commit / abort
 // ---------------------------------------------------------------------------
 
-fn bench_txn_commit(c: &mut Criterion) {
-    c.bench_function("txn_commit", |b| {
-        b.iter(|| {
-            #[allow(deprecated)]
-            let txn =
-                Transaction::new(black_box(1), TransactionConfig::default());
-            txn.commit().unwrap();
-            black_box(());
-        })
-    });
-}
-
-fn bench_txn_abort(c: &mut Criterion) {
-    c.bench_function("txn_abort", |b| {
-        b.iter(|| {
-            #[allow(deprecated)]
-            let txn =
-                Transaction::new(black_box(1), TransactionConfig::default());
-            txn.abort().unwrap();
-            black_box(());
-        })
-    });
-}
-
 fn bench_txn_begin_via_env(c: &mut Criterion) {
     let (_dir, env) = open_env();
 
@@ -185,7 +161,7 @@ fn bench_txn_begin_via_env(c: &mut Criterion) {
         b.iter(|| {
             let txn = env.begin_transaction(None).unwrap();
             txn.commit().unwrap();
-            black_box(txn.get_id());
+            black_box(txn.id());
         })
     });
 }
@@ -204,7 +180,7 @@ fn bench_database_entry_from_bytes(c: &mut Criterion) {
 fn bench_database_entry_get_data(c: &mut Criterion) {
     let entry = DatabaseEntry::from_bytes(b"0123456789abcdef");
     c.bench_function("database_entry_get_data", |b| {
-        b.iter(|| black_box(entry.get_data()))
+        b.iter(|| black_box(entry.data_opt()))
     });
 }
 
@@ -224,12 +200,7 @@ criterion_group!(
 
 criterion_group!(cursor_benches, bench_cursor_forward_scan_1000);
 
-criterion_group!(
-    txn_benches,
-    bench_txn_commit,
-    bench_txn_abort,
-    bench_txn_begin_via_env,
-);
+criterion_group!(txn_benches, bench_txn_begin_via_env,);
 
 criterion_group!(
     entry_benches,

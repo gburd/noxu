@@ -120,7 +120,7 @@ fn f2_read_uncommitted_sees_uncommitted_writes() {
         .expect("dirty read must not block / error");
     assert!(status);
     assert_eq!(
-        data.get_data(),
+        data.data_opt(),
         Some(b"after".as_slice()),
         "read-uncommitted txn must see the writer's dirty value"
     );
@@ -305,7 +305,7 @@ fn f12_auto_commit_write_blocks_on_explicit_txn_write_lock() {
     let key_lookup = DatabaseEntry::from_data(b"k");
     let status = db.get_into(None, &key_lookup, &mut data).unwrap();
     assert!(status);
-    assert_eq!(data.get_data(), Some(b"v2".as_slice()));
+    assert_eq!(data.data_opt(), Some(b"v2".as_slice()));
 
     drop(db);
     Arc::try_unwrap(env).ok().unwrap().close().unwrap();
@@ -371,7 +371,7 @@ fn f12_explicit_txn_read_blocks_auto_commit_write() {
     let status =
         db.get_into(Some(&reader_txn), &key_lookup, &mut data).unwrap();
     assert!(status);
-    assert_eq!(data.get_data(), Some(b"v0".as_slice()));
+    assert_eq!(data.data_opt(), Some(b"v0".as_slice()));
 
     let finished = Arc::new(AtomicBool::new(false));
     let finished_t = Arc::clone(&finished);
@@ -395,7 +395,7 @@ fn f12_explicit_txn_read_blocks_auto_commit_write() {
             "auto-commit write completed while the explicit txn holds the \
              read lock — the write was not blocked"
         );
-        if env.get_stats().unwrap().lock.n_waiters >= 1 {
+        if env.stats().unwrap().lock.n_waiters >= 1 {
             break; // writer confirmed blocked on the lock
         }
         assert!(
@@ -629,7 +629,7 @@ fn f5_explicit_txns_unregister_from_txn_manager() {
     let env = open_env(&tmp, Durability::COMMIT_NO_SYNC);
     let db = open_db(&env, "f5");
 
-    let before = env.get_stats().unwrap().txn;
+    let before = env.stats().unwrap().txn;
 
     for i in 0u32..50 {
         let txn = env.begin_transaction(None).unwrap();
@@ -643,7 +643,7 @@ fn f5_explicit_txns_unregister_from_txn_manager() {
         }
     }
 
-    let after = env.get_stats().unwrap().txn;
+    let after = env.stats().unwrap().txn;
 
     // No active transactions leaked: the count must be back to its
     // pre-loop value (zero, in this single-threaded test).
@@ -687,7 +687,7 @@ fn txn2_serializable_counter_commit() {
     let txn = env.begin_transaction(Some(&ser_cfg)).unwrap();
 
     // While the serializable txn is live the counter must be 1.
-    let mid = env.get_stats().unwrap().txn;
+    let mid = env.stats().unwrap().txn;
     assert_eq!(
         mid.n_active_serializable, 1,
         "TXN-2 fail-pre: n_active_serializable must be 1 while serializable txn is open"
@@ -696,7 +696,7 @@ fn txn2_serializable_counter_commit() {
     txn.commit().unwrap();
 
     // After commit the counter must return to 0.
-    let after = env.get_stats().unwrap().txn;
+    let after = env.stats().unwrap().txn;
     assert_eq!(
         after.n_active_serializable, 0,
         "TXN-2: n_active_serializable must be 0 after serializable txn commits"
@@ -711,7 +711,7 @@ fn txn2_serializable_counter_abort() {
     let ser_cfg = TransactionConfig::new().with_serializable_isolation(true);
     let txn = env.begin_transaction(Some(&ser_cfg)).unwrap();
 
-    let mid = env.get_stats().unwrap().txn;
+    let mid = env.stats().unwrap().txn;
     assert_eq!(
         mid.n_active_serializable, 1,
         "TXN-2 fail-pre: n_active_serializable must be 1 while serializable txn is open"
@@ -719,7 +719,7 @@ fn txn2_serializable_counter_abort() {
 
     txn.abort().unwrap();
 
-    let after = env.get_stats().unwrap().txn;
+    let after = env.stats().unwrap().txn;
     assert_eq!(
         after.n_active_serializable, 0,
         "TXN-2: n_active_serializable must be 0 after serializable txn aborts"
@@ -734,7 +734,7 @@ fn txn2_non_serializable_counter_unaffected() {
 
     let txn = env.begin_transaction(None).unwrap();
 
-    let mid = env.get_stats().unwrap().txn;
+    let mid = env.stats().unwrap().txn;
     assert_eq!(
         mid.n_active_serializable, 0,
         "TXN-2: non-serializable txn must not increment n_active_serializable"
@@ -742,7 +742,7 @@ fn txn2_non_serializable_counter_unaffected() {
 
     txn.commit().unwrap();
 
-    let after = env.get_stats().unwrap().txn;
+    let after = env.stats().unwrap().txn;
     assert_eq!(after.n_active_serializable, 0);
 }
 
@@ -758,22 +758,22 @@ fn txn2_mixed_serializable_and_plain() {
     let s2 = env.begin_transaction(Some(&ser_cfg)).unwrap();
     let plain = env.begin_transaction(None).unwrap();
 
-    let mid = env.get_stats().unwrap().txn;
+    let mid = env.stats().unwrap().txn;
     assert_eq!(
         mid.n_active_serializable, 2,
         "TXN-2: two serializable txns must register a count of 2"
     );
 
     plain.commit().unwrap(); // plain commits: counter unchanged
-    let after_plain = env.get_stats().unwrap().txn;
+    let after_plain = env.stats().unwrap().txn;
     assert_eq!(after_plain.n_active_serializable, 2);
 
     s1.commit().unwrap();
-    let after_s1 = env.get_stats().unwrap().txn;
+    let after_s1 = env.stats().unwrap().txn;
     assert_eq!(after_s1.n_active_serializable, 1);
 
     s2.abort().unwrap();
-    let after_s2 = env.get_stats().unwrap().txn;
+    let after_s2 = env.stats().unwrap().txn;
     assert_eq!(
         after_s2.n_active_serializable, 0,
         "TXN-2: counter must be 0 after all serializable txns finish"
@@ -791,7 +791,7 @@ fn txn3_all_txns_drains_to_zero_commit_and_abort() {
     let env = open_env(&tmp, Durability::COMMIT_NO_SYNC);
     let db = open_db(&env, "txn3");
 
-    let before = env.get_stats().unwrap().txn;
+    let before = env.stats().unwrap().txn;
     assert_eq!(before.n_active, 0);
 
     // 10 commits + 10 aborts
@@ -807,7 +807,7 @@ fn txn3_all_txns_drains_to_zero_commit_and_abort() {
         }
     }
 
-    let after = env.get_stats().unwrap().txn;
+    let after = env.stats().unwrap().txn;
     assert_eq!(
         after.n_active, 0,
         "TXN-3: all_txns must be empty after all explicit txns complete"

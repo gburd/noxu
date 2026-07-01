@@ -338,7 +338,7 @@ mod tests {
         assert!(entry.is_empty());
         binding.object_to_entry(&42u32, &mut entry).unwrap();
         assert!(!entry.is_empty());
-        assert!(entry.get_data().is_some());
+        assert!(entry.data_opt().is_some());
     }
 
     // ----- Sprint 3C version-prefix tests (audit finding #19) ----------------
@@ -352,7 +352,7 @@ mod tests {
         let mut entry = DatabaseEntry::new();
         binding.object_to_entry(&42u32, &mut entry).unwrap();
 
-        let bytes = entry.get_data().unwrap();
+        let bytes = entry.data_opt().unwrap();
         assert!(
             bytes.len() >= SERDE_BINDING_HEADER_LEN,
             "encoded entry must include the 2-byte header",

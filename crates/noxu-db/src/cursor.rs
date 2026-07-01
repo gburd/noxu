@@ -17,13 +17,18 @@ use std::marker::PhantomData;
 ///
 /// `EnvironmentFailure` propagates as-is (via `From<DbiError>`) so the
 /// caller sees `NoxuError::EnvironmentFailure` rather than
-/// `NoxuError::OperationNotAllowed`. All other errors are wrapped as
-/// `OperationNotAllowed` to preserve backward compatibility.  X-13 fix.
+/// `NoxuError::OperationFailed`. All other errors are wrapped as
+/// `OperationFailed`, which preserves the originating `DbiError` as the
+/// `source()` cause chain (review P1-2) while keeping the same `Display`
+/// text the previous `OperationNotAllowed(e.to_string())` produced.  X-13 fix.
 #[inline]
 fn map_cursor_err(e: DbiError) -> NoxuError {
     match e {
         DbiError::EnvironmentFailure { .. } => NoxuError::from(e),
-        _ => NoxuError::OperationNotAllowed(e.to_string()),
+        _ => NoxuError::OperationFailed {
+            msg: e.to_string(),
+            source: Box::new(e),
+        },
     }
 }
 
@@ -199,13 +204,13 @@ impl<'txn> Cursor<'txn> {
                 // first-class input and forwarded to the inner search,
                 // which simply reports `NotFound` because no record can
                 // exist under an empty key on a writable database.
-                let key_bytes = key.get_data().unwrap_or(&[]);
+                let key_bytes = key.data_opt().unwrap_or(&[]);
                 self.inner
                     .search(key_bytes, None, SearchMode::Set)
                     .map_err(map_cursor_err)?
             }
             Get::SearchGte | Get::SearchRange => {
-                let key_bytes = key.get_data().unwrap_or(&[]);
+                let key_bytes = key.data_opt().unwrap_or(&[]);
                 self.inner
                     .search(key_bytes, None, SearchMode::SetRange)
                     .map_err(map_cursor_err)?
@@ -267,8 +272,8 @@ impl<'txn> Cursor<'txn> {
                 }
             }
             Get::SearchBoth => {
-                let key_bytes = key.get_data().unwrap_or(&[]);
-                let data_bytes = data.get_data();
+                let key_bytes = key.data_opt().unwrap_or(&[]);
+                let data_bytes = data.data_opt();
                 self.inner
                     .search(key_bytes, data_bytes, SearchMode::Both)
                     .map_err(map_cursor_err)?
@@ -277,8 +282,8 @@ impl<'txn> Cursor<'txn> {
             // public API; the inner `SearchMode::BothRange` was already
             // implemented in `noxu-dbi` but unreachable from `Cursor::get`.
             Get::SearchBothRange => {
-                let key_bytes = key.get_data().unwrap_or(&[]);
-                let data_bytes = data.get_data();
+                let key_bytes = key.data_opt().unwrap_or(&[]);
+                let data_bytes = data.data_opt();
                 self.inner
                     .search(key_bytes, data_bytes, SearchMode::BothRange)
                     .map_err(map_cursor_err)?
@@ -311,7 +316,7 @@ impl<'txn> Cursor<'txn> {
                 // Faithful floor lookup (BDB DB_SET_RANGE then step back);
                 // see CursorImpl::search_lte and Cursor.getSearchKeyRange
                 // (the LTE mirror of Get.SEARCH_GTE).
-                let key_bytes = key.get_data().unwrap_or(&[]);
+                let key_bytes = key.data_opt().unwrap_or(&[]);
                 self.inner.search_lte(key_bytes).map_err(map_cursor_err)?
             }
             Get::FirstDup => {
@@ -410,8 +415,8 @@ impl<'txn> Cursor<'txn> {
             ));
         }
 
-        let key_bytes = key.get_data().unwrap_or(&[]);
-        let data_bytes = data.get_data().unwrap_or(&[]);
+        let key_bytes = key.data_opt().unwrap_or(&[]);
+        let data_bytes = data.data_opt().unwrap_or(&[]);
 
         let put_mode = match put_type {
             Put::Overwrite => PutMode::Overwrite,
@@ -542,8 +547,8 @@ impl<'txn> Cursor<'txn> {
         self.state != CursorState::Closed
     }
 
-    /// Get the current cursor state.
-    pub fn get_state(&self) -> CursorState {
+    /// Returns the current cursor state.
+    pub fn state(&self) -> CursorState {
         self.state
     }
 
@@ -665,8 +670,8 @@ mod tests {
         let mut data = DatabaseEntry::new();
         let s = cursor.get(&mut key, &mut data, Get::SearchLte, None).unwrap();
         assert_eq!(s, OperationStatus::Success);
-        assert_eq!(key.get_data().unwrap(), b"20");
-        assert_eq!(data.get_data().unwrap(), b"b");
+        assert_eq!(key.data_opt().unwrap(), b"20");
+        assert_eq!(data.data_opt().unwrap(), b"b");
     }
 
     #[test]
@@ -677,8 +682,8 @@ mod tests {
         let mut data = DatabaseEntry::new();
         let s = cursor.get(&mut key, &mut data, Get::SearchLte, None).unwrap();
         assert_eq!(s, OperationStatus::Success);
-        assert_eq!(key.get_data().unwrap(), b"30");
-        assert_eq!(data.get_data().unwrap(), b"c");
+        assert_eq!(key.data_opt().unwrap(), b"30");
+        assert_eq!(data.data_opt().unwrap(), b"c");
     }
 
     #[test]
@@ -699,7 +704,7 @@ mod tests {
         let mut data = DatabaseEntry::new();
         let s = cursor.get(&mut key, &mut data, Get::SearchLte, None).unwrap();
         assert_eq!(s, OperationStatus::Success);
-        assert_eq!(key.get_data().unwrap(), b"30");
+        assert_eq!(key.data_opt().unwrap(), b"30");
     }
 
     // --- Get::FirstDup / Get::LastDup --------------------------------
@@ -725,25 +730,25 @@ mod tests {
         // Step to the middle dup so FirstDup/LastDup must actually move.
         let s = cursor.get(&mut key, &mut data, Get::NextDup, None).unwrap();
         assert_eq!(s, OperationStatus::Success);
-        assert_eq!(data.get_data().unwrap(), b"b");
+        assert_eq!(data.data_opt().unwrap(), b"b");
 
         // FirstDup -> a.
         let s = cursor.get(&mut key, &mut data, Get::FirstDup, None).unwrap();
         assert_eq!(s, OperationStatus::Success);
-        assert_eq!(key.get_data().unwrap(), b"k");
-        assert_eq!(data.get_data().unwrap(), b"a");
+        assert_eq!(key.data_opt().unwrap(), b"k");
+        assert_eq!(data.data_opt().unwrap(), b"a");
 
         // LastDup -> c.
         let s = cursor.get(&mut key, &mut data, Get::LastDup, None).unwrap();
         assert_eq!(s, OperationStatus::Success);
-        assert_eq!(key.get_data().unwrap(), b"k");
-        assert_eq!(data.get_data().unwrap(), b"c");
+        assert_eq!(key.data_opt().unwrap(), b"k");
+        assert_eq!(data.data_opt().unwrap(), b"c");
     }
 
     #[test]
     fn test_new_cursor() {
         let cursor = make_cursor(false);
-        assert_eq!(cursor.get_state(), CursorState::NotInitialized);
+        assert_eq!(cursor.state(), CursorState::NotInitialized);
         assert!(cursor.is_valid());
         assert!(!cursor.is_read_only());
     }
@@ -763,8 +768,8 @@ mod tests {
         let status =
             cursor.get(&mut key, &mut data, Get::Search, None).unwrap();
         assert_eq!(status, OperationStatus::Success);
-        assert_eq!(data.get_data().unwrap(), b"value1");
-        assert_eq!(cursor.get_state(), CursorState::Initialized);
+        assert_eq!(data.data_opt().unwrap(), b"value1");
+        assert_eq!(cursor.state(), CursorState::Initialized);
     }
 
     #[test]
@@ -790,8 +795,8 @@ mod tests {
 
         let status = cursor.get(&mut key, &mut data, Get::First, None).unwrap();
         assert_eq!(status, OperationStatus::Success);
-        assert_eq!(data.get_data().unwrap(), b"value1");
-        assert_eq!(cursor.get_state(), CursorState::Initialized);
+        assert_eq!(data.data_opt().unwrap(), b"value1");
+        assert_eq!(cursor.state(), CursorState::Initialized);
     }
 
     #[test]
@@ -806,7 +811,7 @@ mod tests {
 
         let status = cursor.get(&mut key, &mut data, Get::Last, None).unwrap();
         assert_eq!(status, OperationStatus::Success);
-        assert_eq!(data.get_data().unwrap(), b"value3");
+        assert_eq!(data.data_opt().unwrap(), b"value3");
     }
 
     #[test]
@@ -821,15 +826,15 @@ mod tests {
 
         let status = cursor.get(&mut key, &mut data, Get::First, None).unwrap();
         assert_eq!(status, OperationStatus::Success);
-        assert_eq!(data.get_data().unwrap(), b"value1");
+        assert_eq!(data.data_opt().unwrap(), b"value1");
 
         let status = cursor.get(&mut key, &mut data, Get::Next, None).unwrap();
         assert_eq!(status, OperationStatus::Success);
-        assert_eq!(data.get_data().unwrap(), b"value2");
+        assert_eq!(data.data_opt().unwrap(), b"value2");
 
         let status = cursor.get(&mut key, &mut data, Get::Next, None).unwrap();
         assert_eq!(status, OperationStatus::Success);
-        assert_eq!(data.get_data().unwrap(), b"value3");
+        assert_eq!(data.data_opt().unwrap(), b"value3");
 
         let status = cursor.get(&mut key, &mut data, Get::Next, None).unwrap();
         assert_eq!(status, OperationStatus::NotFound);
@@ -847,15 +852,15 @@ mod tests {
 
         let status = cursor.get(&mut key, &mut data, Get::Last, None).unwrap();
         assert_eq!(status, OperationStatus::Success);
-        assert_eq!(data.get_data().unwrap(), b"value3");
+        assert_eq!(data.data_opt().unwrap(), b"value3");
 
         let status = cursor.get(&mut key, &mut data, Get::Prev, None).unwrap();
         assert_eq!(status, OperationStatus::Success);
-        assert_eq!(data.get_data().unwrap(), b"value2");
+        assert_eq!(data.data_opt().unwrap(), b"value2");
 
         let status = cursor.get(&mut key, &mut data, Get::Prev, None).unwrap();
         assert_eq!(status, OperationStatus::Success);
-        assert_eq!(data.get_data().unwrap(), b"value1");
+        assert_eq!(data.data_opt().unwrap(), b"value1");
 
         let status = cursor.get(&mut key, &mut data, Get::Prev, None).unwrap();
         assert_eq!(status, OperationStatus::NotFound);
@@ -872,7 +877,7 @@ mod tests {
         let status =
             cursor.get(&mut key, &mut data, Get::Current, None).unwrap();
         assert_eq!(status, OperationStatus::Success);
-        assert_eq!(data.get_data().unwrap(), b"value1");
+        assert_eq!(data.data_opt().unwrap(), b"value1");
     }
 
     #[test]
@@ -894,13 +899,13 @@ mod tests {
 
         let status = cursor.put(&key, &data, Put::Overwrite).unwrap();
         assert_eq!(status, OperationStatus::Success);
-        assert_eq!(cursor.get_state(), CursorState::Initialized);
+        assert_eq!(cursor.state(), CursorState::Initialized);
 
         // Verify by reading back
         let mut out = DatabaseEntry::new();
         let s = cursor.get(&mut key, &mut out, Get::Search, None).unwrap();
         assert_eq!(s, OperationStatus::Success);
-        assert_eq!(out.get_data().unwrap(), b"value1");
+        assert_eq!(out.data_opt().unwrap(), b"value1");
     }
 
     #[test]
@@ -928,7 +933,7 @@ mod tests {
         let mut out = DatabaseEntry::new();
         let s = cursor.get(&mut key, &mut out, Get::Search, None).unwrap();
         assert_eq!(s, OperationStatus::Success);
-        assert_eq!(out.get_data().unwrap(), b"value1");
+        assert_eq!(out.data_opt().unwrap(), b"value1");
     }
 
     #[test]
@@ -946,7 +951,7 @@ mod tests {
         // Verify updated
         let mut out = DatabaseEntry::new();
         cursor.get(&mut key, &mut out, Get::Search, None).unwrap();
-        assert_eq!(out.get_data().unwrap(), b"value2");
+        assert_eq!(out.data_opt().unwrap(), b"value2");
     }
 
     #[test]
@@ -973,7 +978,7 @@ mod tests {
         // D1 fix: after delete the cursor is in PendingDeleted state, not
         // NotInitialized, so that Next/Prev can advance to the successor.
         // Ref: CursorImpl.java deleteCurrentRecord() / getNext() PD check.
-        assert_eq!(cursor.get_state(), CursorState::PendingDeleted);
+        assert_eq!(cursor.state(), CursorState::PendingDeleted);
 
         // Verify deleted
         let s = cursor.get(&mut key, &mut data, Get::Search, None).unwrap();
@@ -1024,7 +1029,7 @@ mod tests {
         assert!(cursor.is_valid());
         cursor.close().unwrap();
         assert!(!cursor.is_valid());
-        assert_eq!(cursor.get_state(), CursorState::Closed);
+        assert_eq!(cursor.state(), CursorState::Closed);
     }
 
     #[test]
@@ -1097,7 +1102,7 @@ mod tests {
         let mut status =
             cursor.get(&mut key, &mut data, Get::First, None).unwrap();
         while status == OperationStatus::Success {
-            values.push(data.get_data().unwrap().to_vec());
+            values.push(data.data_opt().unwrap().to_vec());
             status = cursor.get(&mut key, &mut data, Get::Next, None).unwrap();
         }
 
@@ -1114,7 +1119,7 @@ mod tests {
         // Next from uninitialized should return first
         let status = cursor.get(&mut key, &mut data, Get::Next, None).unwrap();
         assert_eq!(status, OperationStatus::Success);
-        assert_eq!(data.get_data().unwrap(), b"value1");
+        assert_eq!(data.data_opt().unwrap(), b"value1");
     }
 
     #[test]
@@ -1127,25 +1132,25 @@ mod tests {
         // Prev from uninitialized should return last
         let status = cursor.get(&mut key, &mut data, Get::Prev, None).unwrap();
         assert_eq!(status, OperationStatus::Success);
-        assert_eq!(data.get_data().unwrap(), b"value2");
+        assert_eq!(data.data_opt().unwrap(), b"value2");
     }
 
     #[test]
     fn test_cursor_state_transitions() {
         let mut cursor = make_cursor_with(vec![(b"key1", b"value1")]);
-        assert_eq!(cursor.get_state(), CursorState::NotInitialized);
+        assert_eq!(cursor.state(), CursorState::NotInitialized);
 
         let mut key = DatabaseEntry::from_bytes(b"key1");
         let mut data = DatabaseEntry::new();
         cursor.get(&mut key, &mut data, Get::Search, None).unwrap();
-        assert_eq!(cursor.get_state(), CursorState::Initialized);
+        assert_eq!(cursor.state(), CursorState::Initialized);
 
         cursor.delete().unwrap();
         // D1 fix: PendingDeleted after delete, not NotInitialized.
-        assert_eq!(cursor.get_state(), CursorState::PendingDeleted);
+        assert_eq!(cursor.state(), CursorState::PendingDeleted);
 
         cursor.close().unwrap();
-        assert_eq!(cursor.get_state(), CursorState::Closed);
+        assert_eq!(cursor.state(), CursorState::Closed);
     }
 
     // ========================================================================
@@ -1167,7 +1172,7 @@ mod tests {
             cursor.get(&mut key, &mut data, Get::SearchGte, None).unwrap();
         // Empty < any non-empty key → SearchGte positions at "key1".
         assert_eq!(status, OperationStatus::Success);
-        assert_eq!(data.get_data().unwrap(), b"value1");
+        assert_eq!(data.data_opt().unwrap(), b"value1");
     }
 
     /// Get::Search with empty key returns NotFound.
@@ -1263,7 +1268,7 @@ mod tests {
         let status = cursor.get(&mut key, &mut data, Get::First, None).unwrap();
         assert_eq!(status, OperationStatus::NotFound);
         // After a failed First the state must be NotInitialized.
-        assert_eq!(cursor.get_state(), CursorState::NotInitialized);
+        assert_eq!(cursor.state(), CursorState::NotInitialized);
     }
 
     /// Get::Last on empty DB resets state to NotInitialized.
@@ -1275,7 +1280,7 @@ mod tests {
 
         let status = cursor.get(&mut key, &mut data, Get::Last, None).unwrap();
         assert_eq!(status, OperationStatus::NotFound);
-        assert_eq!(cursor.get_state(), CursorState::NotInitialized);
+        assert_eq!(cursor.state(), CursorState::NotInitialized);
     }
 
     /// Get::Search not-found resets state to NotInitialized.
@@ -1287,14 +1292,14 @@ mod tests {
 
         // Position first.
         cursor.get(&mut key, &mut data, Get::Search, None).unwrap();
-        assert_eq!(cursor.get_state(), CursorState::Initialized);
+        assert_eq!(cursor.state(), CursorState::Initialized);
 
         // Now search for a missing key — state must go back to NotInitialized.
         let mut key_miss = DatabaseEntry::from_bytes(b"missing");
         let status =
             cursor.get(&mut key_miss, &mut data, Get::Search, None).unwrap();
         assert_eq!(status, OperationStatus::NotFound);
-        assert_eq!(cursor.get_state(), CursorState::NotInitialized);
+        assert_eq!(cursor.state(), CursorState::NotInitialized);
     }
 
     /// Get::SearchGte not-found resets state.
@@ -1310,7 +1315,7 @@ mod tests {
         let status =
             cursor.get(&mut key_big, &mut data, Get::SearchGte, None).unwrap();
         assert_eq!(status, OperationStatus::NotFound);
-        assert_eq!(cursor.get_state(), CursorState::NotInitialized);
+        assert_eq!(cursor.state(), CursorState::NotInitialized);
     }
 
     /// count() on a closed cursor returns an error.
@@ -1343,8 +1348,8 @@ mod tests {
         let status =
             cursor.get(&mut key, &mut data, Get::SearchGte, None).unwrap();
         assert_eq!(status, OperationStatus::Success);
-        assert_eq!(data.get_data().unwrap(), b"yellow");
-        assert_eq!(cursor.get_state(), CursorState::Initialized);
+        assert_eq!(data.data_opt().unwrap(), b"yellow");
+        assert_eq!(cursor.state(), CursorState::Initialized);
     }
 
     // ========================================================================
@@ -1537,7 +1542,7 @@ mod tests {
         let mut d = DatabaseEntry::from_bytes(b"c");
         let s = cursor.get(&mut k, &mut d, Get::SearchBothRange, None).unwrap();
         assert_eq!(s, OperationStatus::Success);
-        assert_eq!(d.get_data().unwrap(), b"d");
+        assert_eq!(d.data_opt().unwrap(), b"d");
     }
 
     /// Delete map_err closure: CursorImpl::delete returns an error when inner is closed.

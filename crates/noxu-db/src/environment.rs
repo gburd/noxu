@@ -90,6 +90,7 @@ pub struct Environment {
 
 /// Internal database handle state.
 struct DatabaseHandle {
+    #[expect(dead_code)]
     name: String,
     #[expect(dead_code)]
     id: u64,
@@ -131,6 +132,7 @@ impl ActiveTxns {
         Self { txns: Mutex::new(HashMap::new()) }
     }
 
+    #[allow(dead_code)] // convenience wrapper; the hot path locks `txns` directly
     fn insert(&self, id: u64, state: Arc<TransactionState>) {
         self.txns.lock().insert(id, state);
     }
@@ -555,7 +557,7 @@ impl Environment {
                 // SAFETY: is_transactional_create implies txn.is_some().
                 let txn_id = txn
                     .expect("invariant: txn is Some when is_transactional_create")
-                    .get_id();
+                    .id();
                 env_impl
                     .open_database_transactional(name, &dbi_config, txn_id)
             } else {
@@ -761,7 +763,6 @@ impl Environment {
     /// In v2.0 the parameter has been removed entirely — the
     /// type system now enforces the constraint, so what was a runtime
     /// error is now a compile error.
-    #[allow(deprecated)] // Transaction::new / with_log_manager / with_inner_txn / with_env_impl are pub(internal)
     pub fn begin_transaction(
         &self,
         config: Option<&TransactionConfig>,
@@ -930,7 +931,7 @@ impl Environment {
     ///
     /// # Errors
     /// Returns an error if the environment is closed
-    pub fn get_database_names(&self) -> Result<Vec<String>> {
+    pub fn database_names(&self) -> Result<Vec<String>> {
         self.check_open()?;
         let env_impl = self.env_impl.lock();
         Ok(env_impl.get_database_names())
@@ -979,21 +980,21 @@ impl Environment {
     }
 
     /// Returns the per-commit replica-ack timeout.
-    pub fn get_replica_ack_timeout(&self) -> std::time::Duration {
+    pub fn replica_ack_timeout(&self) -> std::time::Duration {
         *self.replica_ack_timeout.lock()
     }
 
     /// Returns the home directory path.
     ///
     ///
-    pub fn get_home(&self) -> &Path {
+    pub fn home(&self) -> &Path {
         &self.home
     }
 
     /// Returns the environment configuration.
     ///
     ///
-    pub fn get_config(&self) -> &EnvironmentConfig {
+    pub fn config(&self) -> &EnvironmentConfig {
         &self.config
     }
 
@@ -1002,7 +1003,7 @@ impl Environment {
     /// Mirrors `Environment.getMutableConfig()`.  The returned struct reflects the
     /// current runtime values; pass it (modified) to `set_mutable_config()` to
     /// apply changes without re-opening the environment.
-    pub fn get_mutable_config(&self) -> Result<EnvironmentMutableConfig> {
+    pub fn mutable_config(&self) -> Result<EnvironmentMutableConfig> {
         self.check_open()?;
         Ok(EnvironmentMutableConfig {
             cache_size: Some(self.config.cache_size as usize),
@@ -1220,7 +1221,7 @@ impl Environment {
     /// Returns a snapshot of environment statistics from all subsystems.
     ///
     /// Mirrors `Environment.getStats(StatsConfig)`.
-    pub fn get_stats(&self) -> Result<EnvironmentStats> {
+    pub fn stats(&self) -> Result<EnvironmentStats> {
         self.check_open()?;
         let env_impl = self.env_impl.lock();
         let n_databases = env_impl.n_databases() as u32;
@@ -1575,7 +1576,7 @@ impl Environment {
     }
 
     /// Current cache memory in use (bytes), as tracked by the evictor arbiter.
-    /// Unlike [`get_stats`](Self::get_stats)`.cache_usage` (a placeholder), this
+    /// Unlike [`stats`](Self::stats)`.cache_usage` (a placeholder), this
     /// reflects the live tree-memory budget the evictor drives down.
     pub fn cache_usage_bytes(&self) -> Result<i64> {
         self.check_open()?;
@@ -1583,6 +1584,7 @@ impl Environment {
     }
     ///
     /// Called by Database::close().
+    #[allow(dead_code)] // exercised by in-crate tests; close() path lives in DBI
     pub(crate) fn mark_database_closed(&self, name: &str) {
         let databases = self.databases.lock();
         if let Some(db_handle) = databases.get(name) {
@@ -1596,6 +1598,7 @@ impl Environment {
     /// `Transaction::commit` / `Transaction::abort` calling
     /// `ActiveTxns::mark_complete` directly via the shared `Arc<ActiveTxns>`.
     /// Kept for backwards compatibility with internal tests.
+    #[allow(dead_code)] // exercised by in-crate tests
     pub(crate) fn mark_transaction_complete(&self, txn_id: u64) {
         self.active_txns.mark_complete(txn_id);
     }
@@ -1713,7 +1716,7 @@ mod tests {
         let (temp_dir, config) = temp_env_config();
         let env = Environment::open(config).unwrap();
         assert!(env.is_valid());
-        assert_eq!(env.get_home(), temp_dir.path());
+        assert_eq!(env.home(), temp_dir.path());
         env.close().unwrap();
     }
 
@@ -1781,7 +1784,7 @@ mod tests {
             .with_allow_create(true)
             .with_transactional(true);
         let db = env.open_database(None, "testdb", &db_config).unwrap();
-        assert_eq!(db.get_database_name(), "testdb");
+        assert_eq!(db.name(), "testdb");
         assert!(db.is_valid());
     }
 
@@ -1832,7 +1835,7 @@ mod tests {
         db.close().unwrap();
 
         env.remove_database(None, "testdb").unwrap();
-        let names = env.get_database_names().unwrap();
+        let names = env.database_names().unwrap();
         assert!(!names.contains(&"testdb".to_string()));
     }
 
@@ -1872,7 +1875,7 @@ mod tests {
 
         env.rename_database(None, "oldname", "newname").unwrap();
 
-        let names = env.get_database_names().unwrap();
+        let names = env.database_names().unwrap();
         assert!(!names.contains(&"oldname".to_string()));
         assert!(names.contains(&"newname".to_string()));
     }
@@ -1932,7 +1935,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_database_names() {
+    fn test_database_names() {
         let (_temp_dir, config) = temp_env_config();
         let env = Environment::open(config).unwrap();
 
@@ -1942,7 +1945,7 @@ mod tests {
         let _db1 = env.open_database(None, "db1", &db_config).unwrap();
         let _db2 = env.open_database(None, "db2", &db_config).unwrap();
 
-        let names = env.get_database_names().unwrap();
+        let names = env.database_names().unwrap();
         assert_eq!(names.len(), 2);
         assert!(names.contains(&"db1".to_string()));
         assert!(names.contains(&"db2".to_string()));
@@ -1964,10 +1967,10 @@ mod tests {
                 .unwrap();
             txn.abort().unwrap();
             // After abort the database must not appear in the committed list.
-            let names = env.get_database_names().unwrap();
+            let names = env.database_names().unwrap();
             assert!(
                 !names.contains(&"aborted_db".to_string()),
-                "aborted database must not appear in get_database_names() \
+                "aborted database must not appear in database_names() \
                  (C-4 committed-only semantics), got: {:?}",
                 names
             );
@@ -1980,7 +1983,7 @@ mod tests {
                 .with_transactional(true),
         )
         .unwrap();
-        let names2 = env2.get_database_names().unwrap();
+        let names2 = env2.database_names().unwrap();
         assert!(
             !names2.contains(&"aborted_db".to_string()),
             "after env reopen, aborted database must not appear: {:?}",
@@ -1988,7 +1991,7 @@ mod tests {
         );
     }
 
-    /// C-4 / JE 1-I: `get_database_names()` must NOT return a database that
+    /// C-4 / JE 1-I: `database_names()` must NOT return a database that
     /// was opened inside a concurrent uncommitted transaction.
     #[test]
     fn test_get_database_names_excludes_uncommitted() {
@@ -2004,20 +2007,20 @@ mod tests {
 
         // While txn is still uncommitted, another observer must not see
         // the database in the committed-names list.
-        let names = env.get_database_names().unwrap();
+        let names = env.database_names().unwrap();
         assert!(
             !names.contains(&"pending_db".to_string()),
-            "uncommitted database must be invisible to get_database_names() \
+            "uncommitted database must be invisible to database_names() \
              (C-4 / JE 1-J): got {:?}",
             names
         );
 
         // After commit the database must appear.
         txn.commit().unwrap();
-        let names_after = env.get_database_names().unwrap();
+        let names_after = env.database_names().unwrap();
         assert!(
             names_after.contains(&"pending_db".to_string()),
-            "committed database must appear in get_database_names()"
+            "committed database must appear in database_names()"
         );
     }
 
@@ -2073,7 +2076,7 @@ mod tests {
         assert!(env.remove_database(None, "test").is_err());
         assert!(env.rename_database(None, "a", "b").is_err());
         assert!(env.begin_transaction(None).is_err());
-        assert!(env.get_database_names().is_err());
+        assert!(env.database_names().is_err());
     }
 
     // ========================================================================
@@ -2146,7 +2149,7 @@ mod tests {
         // rename_database should succeed and hit the `if let Some(handle)` false branch.
         env.rename_database(None, "ghost_db", "ghost_db_renamed").unwrap();
 
-        let names = env.get_database_names().unwrap();
+        let names = env.database_names().unwrap();
         assert!(names.contains(&"ghost_db_renamed".to_string()));
         assert!(!names.contains(&"ghost_db".to_string()));
     }
@@ -2163,14 +2166,14 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// get_config() and get_home() return the correct values.
+    /// config() and home() return the correct values.
     #[test]
     fn test_get_config_and_home() {
         let (temp_dir, config) = temp_env_config();
         let env = Environment::open(config).unwrap();
 
-        assert!(env.get_config().allow_create);
-        assert_eq!(env.get_home(), temp_dir.path());
+        assert!(env.config().allow_create);
+        assert_eq!(env.home(), temp_dir.path());
         env.close().unwrap();
     }
 
@@ -2208,7 +2211,7 @@ mod tests {
         let env = Environment::open(config).unwrap();
 
         let txn = env.begin_transaction(None).unwrap();
-        let txn_id = txn.get_id();
+        let txn_id = txn.id();
 
         // Without removing the txn, close would fail.
         // Remove it via the internal API.
@@ -2306,7 +2309,7 @@ mod tests {
     fn test_get_mutable_config_returns_current_values() {
         let (_tmp, config) = temp_env_config();
         let env = Environment::open(config).unwrap();
-        let mc = env.get_mutable_config().unwrap();
+        let mc = env.mutable_config().unwrap();
         // cache_size should be Some() with the default value.
         assert!(mc.cache_size.is_some());
         assert!(mc.run_cleaner.is_some());
@@ -2320,7 +2323,7 @@ mod tests {
         let (_tmp, config) = temp_env_config();
         let env = Environment::open(config).unwrap();
         env.close().unwrap();
-        assert!(env.get_mutable_config().is_err());
+        assert!(env.mutable_config().is_err());
     }
 
     #[test]
@@ -2330,7 +2333,7 @@ mod tests {
         let new_size: usize = 128 * 1024 * 1024; // 128 MiB
         let mc = EnvironmentMutableConfig::new().with_cache_size(new_size);
         env.set_mutable_config(mc).unwrap();
-        let updated = env.get_mutable_config().unwrap();
+        let updated = env.mutable_config().unwrap();
         assert_eq!(updated.cache_size.unwrap(), new_size);
         env.close().unwrap();
     }
@@ -2347,7 +2350,7 @@ mod tests {
         env.set_mutable_config(mc).unwrap();
         // After setting, values should be reflected (lock_timeout_ms is advisory at
         // the config layer; verify via get_mutable_config).
-        let updated = env.get_mutable_config().unwrap();
+        let updated = env.mutable_config().unwrap();
         assert_eq!(updated.lock_timeout_ms, Some(5_000));
         assert_eq!(updated.txn_timeout_ms, Some(10_000));
         env.close().unwrap();
@@ -2357,7 +2360,7 @@ mod tests {
     fn test_set_mutable_config_none_timeout_unchanged() {
         let (_tmp, config) = temp_env_config();
         let mut env = Environment::open(config).unwrap();
-        let original = env.get_mutable_config().unwrap();
+        let original = env.mutable_config().unwrap();
         // None means "unchanged".  See Wave 1C audit cleanup
         // (Transaction-Env F19/F20): the previous implementation used
         // 0 as the sentinel which prevented users from clearing a
@@ -2368,7 +2371,7 @@ mod tests {
             ..EnvironmentMutableConfig::default()
         };
         env.set_mutable_config(mc).unwrap();
-        let updated = env.get_mutable_config().unwrap();
+        let updated = env.mutable_config().unwrap();
         assert_eq!(updated.lock_timeout_ms, original.lock_timeout_ms);
         assert_eq!(updated.txn_timeout_ms, original.txn_timeout_ms);
         env.close().unwrap();
@@ -2519,7 +2522,7 @@ mod tests {
 
         let txn = env.begin_transaction(None).unwrap();
         // The transaction must have inherited COMMIT_NO_SYNC.
-        let dur = txn.get_durability().expect("durability must be set");
+        let dur = txn.durability().expect("durability must be set");
         assert_eq!(
             dur,
             crate::durability::Durability::COMMIT_NO_SYNC,

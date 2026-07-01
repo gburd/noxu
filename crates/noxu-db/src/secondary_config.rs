@@ -141,7 +141,7 @@ pub trait ForeignMultiKeyNullifier: Send + Sync {
 ///         result: &mut DatabaseEntry,
 ///     ) -> bool {
 ///         // Extract the first 4 bytes of primary data as the secondary key
-///         if let Some(d) = data.get_data() {
+///         if let Some(d) = data.data_opt() {
 ///             if d.len() >= 4 {
 ///                 result.set_data(&d[..4]);
 ///                 return true;
@@ -337,7 +337,7 @@ impl SecondaryConfig {
         // not also call [`Self::with_foreign_key_database`].  Locks
         // briefly; this is a one-time setup call.
         if self.foreign_key_database_name.is_none() {
-            let n = handle.lock().get_database_name().to_string();
+            let n = handle.lock().name().to_string();
             self.foreign_key_database_name = Some(n);
         }
         self.foreign_key_database = Some(handle);
@@ -452,6 +452,7 @@ impl SecondaryConfig {
     /// Returns whether an update to the primary may change the secondary key.
     ///
     ///
+    #[allow(dead_code)] // exercised by in-crate tests
     pub(crate) fn update_may_change_secondary(&self) -> bool {
         !self.immutable_secondary_key && !self.extract_from_primary_key_only
     }
@@ -462,6 +463,7 @@ impl SecondaryConfig {
     /// v1.6 still uses this helper to gate the open-time rejection of
     /// half-configured FK setups (e.g. a nullifier without
     /// `foreign_key_database_handle` set).
+    #[allow(dead_code)] // exercised by in-crate tests
     pub(crate) fn has_foreign_key_config(&self) -> bool {
         self.foreign_key_database_name.is_some()
             || self.foreign_key_database.is_some()
@@ -490,7 +492,7 @@ mod tests {
             data: &DatabaseEntry,
             result: &mut DatabaseEntry,
         ) -> bool {
-            if let Some(d) = data.get_data() {
+            if let Some(d) = data.data_opt() {
                 result.set_data(d);
                 true
             } else {
@@ -992,7 +994,7 @@ mod tests {
         let got =
             creator.create_secondary_key(&db, &key, &data_with, &mut result);
         assert!(got);
-        assert_eq!(result.get_data().unwrap(), b"some_data");
+        assert_eq!(result.data_opt().unwrap(), b"some_data");
 
         // Branch: data is empty/None → false
         let data_none = DatabaseEntry::new();

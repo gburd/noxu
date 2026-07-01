@@ -282,7 +282,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if s != OperationStatus::Success {
             break;
         }
-        let cur_key = String::from_utf8_lossy(k.get_data().unwrap_or_default())
+        let cur_key = String::from_utf8_lossy(k.data_opt().unwrap_or_default())
             .into_owned();
         if let Some(ref p) = prev_key
             && cur_key < *p
@@ -302,7 +302,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     env2.checkpoint(None)?;
     let dir_size_final = dir_size_bytes(&db_path);
 
-    let stats = env2.get_stats()?;
+    let stats = env2.stats()?;
     drop(db2);
     drop(env2);
 

@@ -63,6 +63,74 @@ listed in [References](#references).
   fan-out is preserved. The user guide (getting-started + transactions
   chapters) was updated to demonstrate the new API.
 
+### Changed (BREAKING — 7.0 API cleanups: getters, errors, builders, iterators)
+
+The mechanical P1/P2 cleanups that layer on the core reshape above:
+
+- **C-GETTER naming** (review P1-1). `get_x()` field getters were renamed to
+  `x()` across the public surface (`get_` is retained only where a key lookup
+  happens, e.g. `Database::get`/`get_in`, cursor `get_next`/`get_first`):
+  - `DatabaseEntry`: `get_data` → `data_opt` (the `Option<&[u8]>` accessor;
+    `data()` still returns `&[u8]`), `get_size` → `len`, `get_offset` →
+    `offset`, `get_partial_offset`/`get_partial_length` →
+    `partial_offset`/`partial_length`.
+  - `Database`: `get_database_name` → `name`, `get_config` → `config`,
+    `get_sorted_duplicates` → `sorted_duplicates`, `get_stats` → `stats`.
+  - `SecondaryDatabase`: `get_database_name` → `name`, `get_config` → `config`.
+  - `Transaction`: `get_id` → `id`, `get_name` → `name`, `get_state` → `state`,
+    `get_durability` → `durability`, `get_lock_timeout` → `lock_timeout`,
+    `get_txn_timeout` → `txn_timeout`.
+  - `Environment`: `get_database_names` → `database_names`, `get_home` →
+    `home`, `get_config` → `config`, `get_mutable_config` → `mutable_config`,
+    `get_stats` → `stats`, `get_replica_ack_timeout` → `replica_ack_timeout`.
+  - `Cursor`: `get_state` → `state`; `JoinCursor`: `get_database` → `database`,
+    `get_config` → `config`; `ScanResult`: `get_include` → `included`,
+    `get_stop` → `stops`; `Sequence`: `get_stats` → `stats`; `WriteOptions`:
+    `get_expiration_time` → `expiration_time`; `EnvironmentConfig`:
+    `get_exception_listener` → `exception_listener`. The redundant
+    `DatabaseStats`/`BtreeStats`/`JoinConfig` getters over `pub` fields were
+    removed.
+- **`NoxuError` error chains** (review P1-2). `NoxuError` and
+  `EnvironmentFailureReason` are now `#[non_exhaustive]`. A new
+  `NoxuError::OperationFailed { msg, #[source] source }` variant carries the
+  originating sub-crate error (log/B-tree/comparator/DBI) so
+  `std::error::Error::source()` chains — the previously-lossy
+  `From<DbiError>` / `From<TxnError>` / `cursor::map_cursor_err` flattening to
+  a string is gone. Display text and retryable/fatal classification are
+  unchanged.
+- **Internal wiring hidden** (review P1-6). `Transaction::with_log_manager` /
+  `with_env_impl` / `with_inner_txn` are now `pub(crate)`; `Transaction::new`
+  is `pub(crate)` (and no longer `#[deprecated]`); `Transaction::get_inner_txn`
+  is `#[doc(hidden)]`. These exposed engine-internal types
+  (`LogManager`/`EnvironmentImpl`/`Txn`) that `noxu-db` does not re-export.
+- **Lazy Stored\* iterators** (review P1-7). `StoredMap`/`StoredSortedMap`
+  `iter`/`keys`/`values` (and `StoredKeySet`/`StoredValueSet`/`StoredList`
+  `iter`, `StoredSortedMap` `iter_from`/`iter_reverse`) are now lazy,
+  cursor-backed iterators (`impl Iterator<Item = Result<…>>`) that are O(1) to
+  create and do not materialise the whole keyspace. The previous eager
+  behaviour is preserved under explicitly-named
+  `snapshot()`/`keys_snapshot()`/`values_snapshot()`.
+- **Uniform consuming `with_*` builders** (review P1-8). Every non-deprecated
+  `EnvironmentConfig` / `DatabaseConfig` parameter now has a consuming `with_*`
+  builder (returning `Self`) so the chained-builder form works for every
+  parameter, not a hand-picked subset. The `&mut`-style `set_*` setters are
+  retained.
+- **Inert config knobs deprecated** (review P1-9 / P2-4). The silently-inert
+  `DatabaseConfig` setters (`exclusive`, `replicated`, `cache_mode`,
+  `bin_delta`, `use_existing_config`) and per-op advisory setters
+  (`WriteOptions::with_cache_mode`/`with_update_ttl`/`evict_after_write`,
+  `ReadOptions::with_cache_mode`/`evict_after_read`) are now
+  `#[deprecated(note = "not yet implemented …")]` so a settable knob no longer
+  silently lies. `WriteOptions::with_ttl` is unaffected (TTL is honoured).
+  (The reserved `EnvironmentConfig` params already WARN at
+  `Environment::open`.)
+- **Polish** (review P2-1/P2-2/P2-3). Quick-start dependency doc strings now
+  say `noxu = "7"`; the crate-wide `#![allow(dead_code, unused_imports,
+  unused_macros)]` was removed from `noxu-db` and the underlying warnings
+  fixed; the umbrella crate docs gained a "Using Noxu from async code"
+  section (blocking by design; use `spawn_blocking`; do not hold a
+  `Transaction` across `.await`).
+
 ### Added
 
 - **Deterministic Simulation Testing (DST) Milestone 1 — seed-reproducible

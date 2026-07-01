@@ -887,7 +887,7 @@ fn test_200_thread_disjoint_writers() {
         {
             break;
         }
-        let cur = String::from_utf8_lossy(k.get_data().unwrap_or_default())
+        let cur = String::from_utf8_lossy(k.data_opt().unwrap_or_default())
             .into_owned();
         if let Some(ref p) = prev
             && cur < *p

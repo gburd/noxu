@@ -17,18 +17,21 @@
 
 use crate::error::Result;
 
-/// Generic snapshot-based iterator over Stored* views.
+/// Generic **eager snapshot** iterator over Stored* views.
 ///
-/// `T` is the item type, which is `(K, V)` for `iter()`, `K` for
-/// `keys()`, and `V` for `values()`.
+/// `T` is the item type, which is `(K, V)` for `snapshot()`, `K` for
+/// `keys_snapshot()`, and `V` for `values_snapshot()`.
 ///
 /// # Snapshot semantics
 ///
-/// The iterator is materialised eagerly at the call to `iter()` /
-/// `keys()` / `values()`.  Concurrent modifications made *after* the
-/// iterator has been constructed are not reflected in the iteration.
+/// The iterator is materialised eagerly at the call to `snapshot()` /
+/// `keys_snapshot()` / `values_snapshot()`.  Concurrent modifications
+/// made *after* the iterator has been constructed are not reflected in
+/// the iteration.  For a lazy, O(1)-to-create, cursor-backed iterator
+/// (the default, review P1-7) use `iter()` / `keys()` / `values()`
+/// instead.
 /// If you need transactional semantics, pass `Some(&txn)` to the
-/// `iter()` call so the snapshot scan participates in your txn and
+/// call so the snapshot scan participates in your txn and
 /// holds the appropriate locks.
 pub struct StoredIterator<T> {
     /// Items materialised at iter() construction time.

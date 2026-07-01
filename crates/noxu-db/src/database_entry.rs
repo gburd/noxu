@@ -82,11 +82,13 @@ impl DatabaseEntry {
         }
     }
 
-    /// Gets a reference to the data.
+    /// Returns a reference to the data, or `None` if the entry is unset.
     ///
-    /// Returns None if the entry is empty, otherwise returns a slice
-    /// from offset to offset+size.
-    pub fn get_data(&self) -> Option<&[u8]> {
+    /// Returns `None` if the entry has no data array at all, otherwise
+    /// returns a slice from offset to offset+size (which may be empty for
+    /// an explicit empty key).  Use [`data`](Self::data) for the common
+    /// case where an empty slice is acceptable for an unset entry.
+    pub fn data_opt(&self) -> Option<&[u8]> {
         self.data.as_ref().map(|d| {
             let start = self.offset.min(d.len());
             let end = (self.offset + self.size).min(d.len());
@@ -124,13 +126,13 @@ impl DatabaseEntry {
 
     /// Gets the data as a byte slice, returning an empty slice if no data.
     ///
-    /// Convenience method that unwraps the Option from `get_data()`.
+    /// Convenience method that unwraps the Option from `data_opt()`.
     pub fn data(&self) -> &[u8] {
-        self.get_data().unwrap_or(&[])
+        self.data_opt().unwrap_or(&[])
     }
 
-    /// Gets the size of the data.
-    pub fn get_size(&self) -> usize {
+    /// Returns the size of the data, in bytes.
+    pub fn len(&self) -> usize {
         self.size
     }
 
@@ -139,8 +141,8 @@ impl DatabaseEntry {
         self.offset = offset;
     }
 
-    /// Gets the offset within the data array.
-    pub fn get_offset(&self) -> usize {
+    /// Returns the offset within the data array.
+    pub fn offset(&self) -> usize {
         self.offset
     }
 
@@ -163,13 +165,13 @@ impl DatabaseEntry {
         self.partial
     }
 
-    /// Gets the partial offset.
-    pub fn get_partial_offset(&self) -> usize {
+    /// Returns the partial offset.
+    pub fn partial_offset(&self) -> usize {
         self.partial_offset
     }
 
-    /// Gets the partial length.
-    pub fn get_partial_length(&self) -> usize {
+    /// Returns the partial length.
+    pub fn partial_length(&self) -> usize {
         self.partial_length
     }
 
@@ -242,8 +244,8 @@ mod tests {
     fn test_new_empty() {
         let entry = DatabaseEntry::new();
         assert!(entry.is_empty());
-        assert_eq!(entry.get_size(), 0);
-        assert_eq!(entry.get_data(), None);
+        assert_eq!(entry.len(), 0);
+        assert_eq!(entry.data_opt(), None);
     }
 
     #[test]
@@ -251,24 +253,24 @@ mod tests {
         let data = b"hello";
         let entry = DatabaseEntry::from_bytes(data);
         assert!(!entry.is_empty());
-        assert_eq!(entry.get_size(), 5);
-        assert_eq!(entry.get_data(), Some(&data[..]));
+        assert_eq!(entry.len(), 5);
+        assert_eq!(entry.data_opt(), Some(&data[..]));
     }
 
     #[test]
     fn test_from_vec() {
         let data = vec![1, 2, 3, 4, 5];
         let entry = DatabaseEntry::from_vec(data.clone());
-        assert_eq!(entry.get_size(), 5);
-        assert_eq!(entry.get_data(), Some(&data[..]));
+        assert_eq!(entry.len(), 5);
+        assert_eq!(entry.data_opt(), Some(&data[..]));
     }
 
     #[test]
     fn test_set_data() {
         let mut entry = DatabaseEntry::new();
         entry.set_data(b"test");
-        assert_eq!(entry.get_size(), 4);
-        assert_eq!(entry.get_data(), Some(b"test".as_ref()));
+        assert_eq!(entry.len(), 4);
+        assert_eq!(entry.data_opt(), Some(b"test".as_ref()));
     }
 
     #[test]
@@ -276,8 +278,8 @@ mod tests {
         let mut entry = DatabaseEntry::new();
         let data = vec![10, 20, 30];
         entry.set_data_vec(data.clone());
-        assert_eq!(entry.get_size(), 3);
-        assert_eq!(entry.get_data(), Some(&data[..]));
+        assert_eq!(entry.len(), 3);
+        assert_eq!(entry.data_opt(), Some(&data[..]));
     }
 
     #[test]
@@ -285,7 +287,7 @@ mod tests {
         let mut entry = DatabaseEntry::from_bytes(b"hello world");
         entry.set_offset(6);
         entry.set_size(5);
-        assert_eq!(entry.get_data(), Some(b"world".as_ref()));
+        assert_eq!(entry.data_opt(), Some(b"world".as_ref()));
     }
 
     #[test]
@@ -295,8 +297,8 @@ mod tests {
 
         entry.set_partial(10, 20, true);
         assert!(entry.is_partial());
-        assert_eq!(entry.get_partial_offset(), 10);
-        assert_eq!(entry.get_partial_length(), 20);
+        assert_eq!(entry.partial_offset(), 10);
+        assert_eq!(entry.partial_length(), 20);
 
         entry.set_partial(0, 0, false);
         assert!(!entry.is_partial());
@@ -309,34 +311,34 @@ mod tests {
 
         entry.clear();
         assert!(entry.is_empty());
-        assert_eq!(entry.get_size(), 0);
-        assert_eq!(entry.get_data(), None);
+        assert_eq!(entry.len(), 0);
+        assert_eq!(entry.data_opt(), None);
     }
 
     #[test]
     fn test_default() {
         let entry = DatabaseEntry::default();
         assert!(entry.is_empty());
-        assert_eq!(entry.get_size(), 0);
+        assert_eq!(entry.len(), 0);
     }
 
     #[test]
     fn test_from_string() {
         let entry = DatabaseEntry::from(String::from("test"));
-        assert_eq!(entry.get_data(), Some(b"test".as_ref()));
+        assert_eq!(entry.data_opt(), Some(b"test".as_ref()));
     }
 
     #[test]
     fn test_from_str() {
         let entry = DatabaseEntry::from("hello");
-        assert_eq!(entry.get_data(), Some(b"hello".as_ref()));
+        assert_eq!(entry.data_opt(), Some(b"hello".as_ref()));
     }
 
     #[test]
     fn test_clone() {
         let entry1 = DatabaseEntry::from_bytes(b"original");
         let entry2 = entry1.clone();
-        assert_eq!(entry1.get_data(), entry2.get_data());
+        assert_eq!(entry1.data_opt(), entry2.data_opt());
     }
 
     #[test]
@@ -352,7 +354,7 @@ mod tests {
     fn test_empty_slice() {
         let entry = DatabaseEntry::from_bytes(b"");
         assert!(entry.is_empty());
-        assert_eq!(entry.get_size(), 0);
+        assert_eq!(entry.len(), 0);
     }
 
     #[test]
@@ -361,7 +363,7 @@ mod tests {
         entry.set_offset(10);
         entry.set_size(5);
         // Should return empty slice when offset is beyond data
-        assert_eq!(entry.get_data(), Some(&[][..]));
+        assert_eq!(entry.data_opt(), Some(&[][..]));
     }
 
     #[test]
@@ -369,6 +371,6 @@ mod tests {
         let mut entry = DatabaseEntry::from_bytes(b"test");
         entry.set_size(100);
         // Should cap at actual data length
-        assert_eq!(entry.get_data(), Some(b"test".as_ref()));
+        assert_eq!(entry.data_opt(), Some(b"test".as_ref()));
     }
 }

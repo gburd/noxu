@@ -48,7 +48,9 @@ fn make_key(k: u8) -> Vec<u8> {
 }
 
 impl<'a> Arbitrary<'a> for Op {
-    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+    fn arbitrary(
+        u: &mut arbitrary::Unstructured<'a>,
+    ) -> arbitrary::Result<Self> {
         let choice: u8 = u.int_in_range(0..=6)?;
         match choice {
             0 => {
@@ -123,7 +125,7 @@ fuzz_target!(|ops: Vec<Op>| {
                     Some(expected_val) => {
                         assert_eq!(status, OperationStatus::Success);
                         assert_eq!(
-                            data.get_data().unwrap(),
+                            data.data_opt().unwrap(),
                             expected_val.as_slice(),
                             "Value mismatch for key {:?}",
                             k
@@ -154,10 +156,12 @@ fuzz_target!(|ops: Vec<Op>| {
                 let mut data = DatabaseEntry::new();
 
                 // Collect from oracle for comparison.
-                let oracle_keys: Vec<Vec<u8>> = oracle.keys().cloned().collect();
+                let oracle_keys: Vec<Vec<u8>> =
+                    oracle.keys().cloned().collect();
 
-                let first_status =
-                    cursor.get(&mut key_entry, &mut data, Get::First, None).unwrap();
+                let first_status = cursor
+                    .get(&mut key_entry, &mut data, Get::First, None)
+                    .unwrap();
 
                 if oracle.is_empty() {
                     assert_eq!(first_status, OperationStatus::NotFound);
@@ -166,8 +170,9 @@ fuzz_target!(|ops: Vec<Op>| {
 
                     let mut cursor_idx = 0;
                     for _ in 0..*steps {
-                        let next_status =
-                            cursor.get(&mut key_entry, &mut data, Get::Next, None).unwrap();
+                        let next_status = cursor
+                            .get(&mut key_entry, &mut data, Get::Next, None)
+                            .unwrap();
                         if next_status == OperationStatus::NotFound {
                             break;
                         }
@@ -186,8 +191,9 @@ fuzz_target!(|ops: Vec<Op>| {
                 let mut key_entry = DatabaseEntry::new();
                 let mut data = DatabaseEntry::new();
 
-                let last_status =
-                    cursor.get(&mut key_entry, &mut data, Get::Last, None).unwrap();
+                let last_status = cursor
+                    .get(&mut key_entry, &mut data, Get::Last, None)
+                    .unwrap();
 
                 if oracle.is_empty() {
                     assert_eq!(last_status, OperationStatus::NotFound);
@@ -195,8 +201,9 @@ fuzz_target!(|ops: Vec<Op>| {
                     assert_eq!(last_status, OperationStatus::Success);
 
                     for _ in 0..*steps {
-                        let prev_status =
-                            cursor.get(&mut key_entry, &mut data, Get::Prev, None).unwrap();
+                        let prev_status = cursor
+                            .get(&mut key_entry, &mut data, Get::Prev, None)
+                            .unwrap();
                         if prev_status == OperationStatus::NotFound {
                             break;
                         }
@@ -230,7 +237,7 @@ fuzz_target!(|ops: Vec<Op>| {
         let status = db.get(None, &key_entry, &mut data).unwrap();
         assert_eq!(status, OperationStatus::Success, "Missing key {:?}", k);
         assert_eq!(
-            data.get_data().unwrap(),
+            data.data_opt().unwrap(),
             v.as_slice(),
             "Final value mismatch for key {:?}",
             k
@@ -253,18 +260,19 @@ fuzz_target!(|ops: Vec<Op>| {
     let mut data = DatabaseEntry::new();
     let mut oracle_iter = oracle.iter();
 
-    let mut status = cursor.get(&mut key_entry, &mut data, Get::First, None).unwrap();
+    let mut status =
+        cursor.get(&mut key_entry, &mut data, Get::First, None).unwrap();
     while status == OperationStatus::Success {
-        let (expected_key, expected_val) = oracle_iter
-            .next()
-            .expect("Database has more records than oracle");
+        let (expected_key, expected_val) =
+            oracle_iter.next().expect("Database has more records than oracle");
         assert_eq!(
-            data.get_data().unwrap(),
+            data.data_opt().unwrap(),
             expected_val.as_slice(),
             "Cursor iteration value mismatch"
         );
         let _ = expected_key; // Key verified implicitly via sorted order.
-        status = cursor.get(&mut key_entry, &mut data, Get::Next, None).unwrap();
+        status =
+            cursor.get(&mut key_entry, &mut data, Get::Next, None).unwrap();
     }
     assert!(
         oracle_iter.next().is_none(),

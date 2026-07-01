@@ -132,7 +132,7 @@ fn xa_commit_after_restart_succeeds() {
         let mut val = DatabaseEntry::new();
         let status = db.get_into(None, key, &mut val).unwrap();
         assert!(status);
-        assert_eq!(val.get_data(), Some(b"v".as_slice()));
+        assert_eq!(val.data_opt(), Some(b"v".as_slice()));
     }
 
     // Phase 3: reopen one more time.  The XID must NOT reappear (it was
@@ -271,7 +271,7 @@ fn xa_prepare_auto_detects_writes_without_mark_write() {
     let mut val = DatabaseEntry::new();
     let status = db.get_into(None, b"auto_k", &mut val).unwrap();
     assert!(status, "auto-detect must preserve writes through prepare+commit");
-    assert_eq!(val.get_data(), Some(b"auto_v".as_slice()));
+    assert_eq!(val.data_opt(), Some(b"auto_v".as_slice()));
 }
 
 // ---------------------------------------------------------------------------

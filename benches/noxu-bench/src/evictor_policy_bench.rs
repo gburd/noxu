@@ -184,7 +184,7 @@ fn main() {
                 // the no-op is documented in the run log.
                 if pi == 0 && wi == 0 && rep == 0 {
                     let usage = env.cache_usage_bytes().unwrap();
-                    let ev = env.get_stats().unwrap().evictor.nodes_evicted;
+                    let ev = env.stats().unwrap().evictor.nodes_evicted;
                     let working_set = (N_RECORDS * (VALUE_LEN + 16)) as i64;
                     eprintln!(
                         "  [sanity] cache_usage={usage} bytes, nodes_evicted={ev} (cache budget {CACHE_BYTES} bytes, working set ~{working_set} bytes)"

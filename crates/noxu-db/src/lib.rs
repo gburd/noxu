@@ -3,17 +3,11 @@
 // See LICENSE-APACHE and LICENSE-MIT at the root of this repository.
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-#![allow(
-    dead_code,
-    unused_macros,
-    unused_imports,
-    clippy::type_complexity,
-    clippy::too_many_arguments
-)]
+#![allow(clippy::type_complexity, clippy::too_many_arguments)]
 //! > **Internal component of the [`noxu`](https://crates.io/crates/noxu) database.**
 //! >
 //! > This crate is published only so the `noxu` umbrella crate can depend on it.
-//! > Use `noxu` (`noxu = "3"`) in applications; depend on this crate directly only
+//! > Use `noxu` (`noxu = "7"`) in applications; depend on this crate directly only
 //! > if you are extending the engine internals. Its API may change without a major
 //! > version bump.
 //!
@@ -51,7 +45,7 @@ pub mod unimplemented_params;
 #[cfg(feature = "observability")]
 pub use noxu_observe as observe_crate;
 
-/// Periodic metrics exporter (samples `get_stats()` to the `metrics` facade).
+/// Periodic metrics exporter (samples `stats()` to the `metrics` facade).
 /// Only available with the `observability` feature.
 #[cfg(feature = "observability")]
 pub mod metrics_export;

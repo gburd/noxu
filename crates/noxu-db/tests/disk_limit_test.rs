@@ -93,7 +93,7 @@ fn disk_limit_blocks_then_resumes() {
     let mut out = DatabaseEntry::new();
     let s = db.get_into(None, &read_key, &mut out).unwrap();
     assert!(s, "reads must work over-limit");
-    assert_eq!(out.get_data().unwrap().len(), 1024);
+    assert_eq!(out.data_opt().unwrap().len(), 1024);
 
     // A transaction abort must still work over-limit (JE: abort is not gated;
     // it frees, it does not consume the user write budget).

@@ -339,7 +339,7 @@ fn test_cleaner_reduces_log_files_under_load() {
     // Give the background cleaner time to run.
     thread::sleep(Duration::from_secs(3));
 
-    let stats = env.get_stats().expect("get_stats failed");
+    let stats = env.stats().expect("get_stats failed");
     assert!(
         stats.cleaner.runs > 0 || stats.cleaner.deletions > 0,
         "cleaner never ran after {KEYS} keys × {OVERWRITES} overwrites: \

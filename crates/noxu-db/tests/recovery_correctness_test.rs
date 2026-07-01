@@ -66,8 +66,8 @@ fn collect_all(db: &noxu_db::Database) -> BTreeMap<Vec<u8>, Vec<u8>> {
     let mut status = cursor.get(&mut key, &mut val, Get::First, None).unwrap();
     while status == OperationStatus::Success {
         map.insert(
-            key.get_data().unwrap_or(&[]).to_vec(),
-            val.get_data().unwrap_or(&[]).to_vec(),
+            key.data_opt().unwrap_or(&[]).to_vec(),
+            val.data_opt().unwrap_or(&[]).to_vec(),
         );
         status = cursor.get(&mut key, &mut val, Get::Next, None).unwrap();
     }
@@ -935,7 +935,7 @@ fn stage1_checkpoint_stats_show_user_db_bins_flushed() {
         .expect("checkpoint must succeed");
 
     // Read checkpoint stats.
-    let stats = env.get_stats().expect("get_stats must succeed");
+    let stats = env.stats().expect("get_stats must succeed");
     let bins_flushed = stats.checkpoint.full_bin_flush;
 
     assert!(
@@ -1044,7 +1044,7 @@ fn stage2_txn_manager_records_first_active_lsn() {
         .unwrap();
     assert!(status, "stage2: committed key must survive checkpoint+recovery");
     assert_eq!(
-        val.get_data(),
+        val.data_opt(),
         Some(b"stage2val" as &[u8]),
         "stage2: recovered value must match committed value"
     );
@@ -1102,7 +1102,7 @@ fn open_env_delta(dir: &Path) -> noxu_db::Environment {
 
 /// Cumulative `checkpoint.delta_in_flush` counter.
 fn delta_in_flush(env: &noxu_db::Environment) -> u64 {
-    env.get_stats().unwrap().checkpoint.delta_in_flush
+    env.stats().unwrap().checkpoint.delta_in_flush
 }
 
 /// JE `RecoveryDeltaTest.testCompress` (DATA-correctness half — see the

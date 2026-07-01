@@ -75,7 +75,7 @@ fn db_cursor_test_simple_get_put() {
     let mut n = 0usize;
     let mut s = cursor.get(&mut k, &mut d, Get::First, None).unwrap();
     while s == OperationStatus::Success {
-        let key = k.get_data().unwrap_or(&[]).to_vec();
+        let key = k.data_opt().unwrap_or(&[]).to_vec();
         if !prev.is_empty() {
             assert!(prev <= key, "expected sorted, got {prev:?} then {key:?}");
         }
@@ -105,7 +105,7 @@ fn db_cursor_test_simple_get_put_backwards() {
     let mut n = 0usize;
     let mut s = cursor.get(&mut k, &mut d, Get::Last, None).unwrap();
     while s == OperationStatus::Success {
-        let key = k.get_data().unwrap_or(&[]).to_vec();
+        let key = k.data_opt().unwrap_or(&[]).to_vec();
         if let Some(p) = &prev {
             assert!(*p >= key, "expected descending, got {p:?} then {key:?}");
         }
@@ -139,14 +139,14 @@ fn db_cursor_test_cursor_advance() {
     // first record).
     let s = cursor.get(&mut k, &mut d, Get::First, None).unwrap();
     assert_eq!(OperationStatus::Success, s);
-    let first_key = k.get_data().unwrap_or(&[]).to_vec();
+    let first_key = k.data_opt().unwrap_or(&[]).to_vec();
 
     // Walk the rest forward.
     let mut prev = first_key;
     let mut n = 1usize;
     let mut s = cursor.get(&mut k, &mut d, Get::Next, None).unwrap();
     while s == OperationStatus::Success {
-        let key = k.get_data().unwrap_or(&[]).to_vec();
+        let key = k.data_opt().unwrap_or(&[]).to_vec();
         assert!(prev <= key, "{prev:?} then {key:?}");
         prev = key;
         n += 1;
@@ -173,7 +173,7 @@ fn db_cursor_search_test_simple_search_key() {
         let mut data = DatabaseEntry::new();
         let s = cursor.get(&mut key, &mut data, Get::Search, None).unwrap();
         assert_eq!(OperationStatus::Success, s, "k={k}");
-        assert_eq!(v.as_bytes(), data.get_data().unwrap_or(&[]));
+        assert_eq!(v.as_bytes(), data.data_opt().unwrap_or(&[]));
     }
 
     // Unknown key.
@@ -264,7 +264,7 @@ fn db_cursor_delete_test_simple_delete_insert() {
     let mut s = cursor.get(&mut k, &mut d, Get::First, None).unwrap();
     while s == OperationStatus::Success {
         seen.insert(
-            String::from_utf8(k.get_data().unwrap_or(&[]).to_vec()).unwrap(),
+            String::from_utf8(k.data_opt().unwrap_or(&[]).to_vec()).unwrap(),
         );
         s = cursor.get(&mut k, &mut d, Get::Next, None).unwrap();
     }
@@ -388,8 +388,8 @@ fn db_cursor_duplicate_test_duplicate_creation_forward() {
     let mut s = cursor.get(&mut k, &mut d, Get::First, None).unwrap();
     while s == OperationStatus::Success {
         let cur = (
-            k.get_data().unwrap_or(&[]).to_vec(),
-            d.get_data().unwrap_or(&[]).to_vec(),
+            k.data_opt().unwrap_or(&[]).to_vec(),
+            d.data_opt().unwrap_or(&[]).to_vec(),
         );
         if let Some(p) = &prev {
             assert!(
@@ -423,8 +423,8 @@ fn db_cursor_duplicate_test_duplicate_creation_backwards() {
     let mut s = cursor.get(&mut k, &mut d, Get::Last, None).unwrap();
     while s == OperationStatus::Success {
         let cur = (
-            k.get_data().unwrap_or(&[]).to_vec(),
-            d.get_data().unwrap_or(&[]).to_vec(),
+            k.data_opt().unwrap_or(&[]).to_vec(),
+            d.data_opt().unwrap_or(&[]).to_vec(),
         );
         if let Some(p) = &prev {
             assert!(
@@ -516,7 +516,7 @@ fn db_cursor_duplicate_test_get_next_dup() {
         let s = cursor.get(&mut key, &mut data, Get::Search, None).unwrap();
         assert_eq!(OperationStatus::Success, s, "Search for k={k}");
 
-        let mut prev = data.get_data().unwrap_or(&[]).to_vec();
+        let mut prev = data.data_opt().unwrap_or(&[]).to_vec();
         let mut seen = 1usize;
         loop {
             let s =
@@ -527,11 +527,11 @@ fn db_cursor_duplicate_test_get_next_dup() {
             assert_eq!(OperationStatus::Success, s);
             // Stayed inside the same primary key.
             assert_eq!(
-                key.get_data().unwrap_or(&[]),
+                key.data_opt().unwrap_or(&[]),
                 &[b'k', k, 0, 0],
                 "NextDup must not cross key boundary",
             );
-            let cur = data.get_data().unwrap_or(&[]).to_vec();
+            let cur = data.data_opt().unwrap_or(&[]).to_vec();
             assert!(prev <= cur, "dup ordering: {prev:?} then {cur:?}");
             prev = cur;
             seen += 1;
@@ -557,7 +557,7 @@ fn db_cursor_duplicate_test_get_next_no_dup() {
 
     let s = cursor.get(&mut k, &mut d, Get::First, None).unwrap();
     assert_eq!(OperationStatus::Success, s);
-    assert_eq!(k.get_data().unwrap_or(&[]), &[b'k', 0, 0, 0]);
+    assert_eq!(k.data_opt().unwrap_or(&[]), &[b'k', 0, 0, 0]);
 
     let mut jumps = 0usize;
     let mut last_primary = 0u8;
@@ -567,7 +567,7 @@ fn db_cursor_duplicate_test_get_next_no_dup() {
             break;
         }
         assert_eq!(OperationStatus::Success, s);
-        let kb = k.get_data().unwrap_or(&[]);
+        let kb = k.data_opt().unwrap_or(&[]);
         assert_eq!(kb.len(), 4, "primary keys are 4 bytes wide");
         let primary = kb[1];
         assert!(
@@ -649,8 +649,8 @@ fn db_cursor_duplicate_test_duplicate_replacement() {
     let mut s = cursor.get(&mut k, &mut d, Get::First, None).unwrap();
     while s == OperationStatus::Success {
         // putCurrent must succeed when rewriting with the same data.
-        let cur_key = DatabaseEntry::from_bytes(k.get_data().unwrap_or(&[]));
-        let cur_data = DatabaseEntry::from_bytes(d.get_data().unwrap_or(&[]));
+        let cur_key = DatabaseEntry::from_bytes(k.data_opt().unwrap_or(&[]));
+        let cur_data = DatabaseEntry::from_bytes(d.data_opt().unwrap_or(&[]));
         let p = cursor.put(&cur_key, &cur_data, Put::Current).unwrap();
         assert_eq!(OperationStatus::Success, p, "putCurrent same-data");
         n += 1;

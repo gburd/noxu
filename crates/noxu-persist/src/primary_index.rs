@@ -442,7 +442,7 @@ impl<'a, K: PrimaryKey, E: Entity<PrimaryKey = K>, S: EntitySerializer<E>>
 
         match self.cursor.get(&mut key_entry, &mut data_entry, get_type, None) {
             Ok(OperationStatus::Success) => {
-                let bytes = match data_entry.get_data() {
+                let bytes = match data_entry.data_opt() {
                     Some(b) => b,
                     None => {
                         self.done = true;
@@ -542,7 +542,7 @@ impl<K: PrimaryKey> Iterator for KeyIterator<'_, K> {
                 // The cursor writes the current key into key_entry (Cursor::get()
                 // calls key.set_data(&k) on success.
                 // which sets key_entry as an output parameter for all positioning ops).
-                match key_entry.get_data() {
+                match key_entry.data_opt() {
                     Some(key_bytes) => Some(K::from_bytes(key_bytes)),
                     None => {
                         self.done = true;
@@ -910,7 +910,7 @@ mod tests {
     fn test_database_reference() {
         let (_td, _env, db) = setup();
         let index: PrimaryIndex<u64, User> = PrimaryIndex::new(Arc::clone(&db));
-        assert_eq!(index.database().lock().get_database_name(), "users");
+        assert_eq!(index.database().lock().name(), "users");
     }
 
     // --- Additional branch-coverage tests ---

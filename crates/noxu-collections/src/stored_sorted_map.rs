@@ -11,7 +11,7 @@ use noxu_db::{Database, Transaction};
 use crate::error::Result;
 use crate::internal::{
     ScanDirection, StartKey, cursor_endpoint, decode_key, encode_key,
-    scan_records,
+    scan_iter, scan_iter_owned_start,
 };
 use crate::stored_iterator::StoredIterator;
 use crate::stored_map::StoredMap;
@@ -115,25 +115,67 @@ where
         self.inner.clear(txn)
     }
 
-    /// Forward iterator over every (key, value) pair.
-    pub fn iter(
-        &self,
-        txn: Option<&Transaction>,
-    ) -> Result<StoredIterator<(K, V)>> {
+    /// Lazy forward iterator over every (key, value) pair (review P1-7).
+    /// See [`StoredMap::iter`](crate::StoredMap::iter) for the
+    /// laziness/lifetime contract.
+    pub fn iter<'a>(
+        &'a self,
+        txn: Option<&'a Transaction>,
+    ) -> Result<impl Iterator<Item = Result<(K, V)>> + 'a>
+    where
+        K: 'a,
+        V: 'a,
+    {
         self.inner.iter(txn)
     }
 
-    /// Forward iterator over keys.
-    pub fn keys(&self, txn: Option<&Transaction>) -> Result<StoredIterator<K>> {
+    /// Lazy forward iterator over keys.
+    pub fn keys<'a>(
+        &'a self,
+        txn: Option<&'a Transaction>,
+    ) -> Result<impl Iterator<Item = Result<K>> + 'a>
+    where
+        K: 'a,
+        V: 'a,
+    {
         self.inner.keys(txn)
     }
 
-    /// Forward iterator over values.
-    pub fn values(
+    /// Lazy forward iterator over values.
+    pub fn values<'a>(
+        &'a self,
+        txn: Option<&'a Transaction>,
+    ) -> Result<impl Iterator<Item = Result<V>> + 'a>
+    where
+        K: 'a,
+        V: 'a,
+    {
+        self.inner.values(txn)
+    }
+
+    /// Eager snapshot iterator over every (key, value) pair.
+    /// See [`StoredMap::snapshot`](crate::StoredMap::snapshot).
+    pub fn snapshot(
+        &self,
+        txn: Option<&Transaction>,
+    ) -> Result<StoredIterator<(K, V)>> {
+        self.inner.snapshot(txn)
+    }
+
+    /// Eager snapshot iterator over keys.
+    pub fn keys_snapshot(
+        &self,
+        txn: Option<&Transaction>,
+    ) -> Result<StoredIterator<K>> {
+        self.inner.keys_snapshot(txn)
+    }
+
+    /// Eager snapshot iterator over values.
+    pub fn values_snapshot(
         &self,
         txn: Option<&Transaction>,
     ) -> Result<StoredIterator<V>> {
-        self.inner.values(txn)
+        self.inner.values_snapshot(txn)
     }
 
     /// Returns the smallest key, or `None` if the database is empty.
@@ -174,35 +216,45 @@ where
         )
     }
 
-    /// Forward iterator starting at `start_key` (inclusive lower bound).
+    /// Lazy forward iterator starting at `start_key` (inclusive lower
+    /// bound).
     ///
     /// Encodes `start_key` via the key binding and walks the cursor
-    /// from the smallest key `>= encoded(start_key)`.
-    pub fn iter_from(
-        &self,
-        txn: Option<&Transaction>,
+    /// from the smallest key `>= encoded(start_key)`.  Lazy (review
+    /// P1-7); see [`iter`](Self::iter) for the lifetime contract.
+    pub fn iter_from<'a>(
+        &'a self,
+        txn: Option<&'a Transaction>,
         start_key: &K,
-    ) -> Result<StoredIterator<(K, V)>> {
+    ) -> Result<impl Iterator<Item = Result<(K, V)>> + 'a>
+    where
+        K: 'a,
+        V: 'a,
+    {
         let start_entry = encode_key(self.inner.key_binding(), start_key)?;
-        let bytes = start_entry.get_data().unwrap_or(&[]).to_vec();
-        let items = scan_records(
+        let bytes = start_entry.data_opt().unwrap_or(&[]).to_vec();
+        scan_iter_owned_start(
             self.inner.database(),
             txn,
-            Some(bytes.as_slice()),
+            Some(bytes),
             ScanDirection::Forward,
             self.inner.key_binding(),
             self.inner.value_binding(),
             |k, v| (k, v),
-        )?;
-        Ok(StoredIterator::from_vec(items))
+        )
     }
 
-    /// Reverse iterator over every (key, value) pair (largest key first).
-    pub fn iter_reverse(
-        &self,
-        txn: Option<&Transaction>,
-    ) -> Result<StoredIterator<(K, V)>> {
-        let items = scan_records(
+    /// Lazy reverse iterator over every (key, value) pair (largest key
+    /// first).  See [`iter`](Self::iter) for the lifetime contract.
+    pub fn iter_reverse<'a>(
+        &'a self,
+        txn: Option<&'a Transaction>,
+    ) -> Result<impl Iterator<Item = Result<(K, V)>> + 'a>
+    where
+        K: 'a,
+        V: 'a,
+    {
+        scan_iter(
             self.inner.database(),
             txn,
             StartKey::None,
@@ -210,8 +262,7 @@ where
             self.inner.key_binding(),
             self.inner.value_binding(),
             |k, v| (k, v),
-        )?;
-        Ok(StoredIterator::from_vec(items))
+        )
     }
 
     /// Returns the smallest key strictly greater than `key`, or `None`.
@@ -227,7 +278,7 @@ where
         key: &K,
     ) -> Result<Option<K>> {
         let key_entry = encode_key(self.inner.key_binding(), key)?;
-        let bound = key_entry.get_data().unwrap_or(&[]).to_vec();
+        let bound = key_entry.data_opt().unwrap_or(&[]).to_vec();
 
         let mut cursor =
             crate::internal::open_cursor(self.inner.database(), txn, None)?;
@@ -237,7 +288,7 @@ where
             cursor.get(&mut k_buf, &mut d_buf, noxu_db::Get::First, None)?;
         let mut result: Option<K> = None;
         while matches!(status, noxu_db::OperationStatus::Success) {
-            let cur = k_buf.get_data().unwrap_or(&[]);
+            let cur = k_buf.data_opt().unwrap_or(&[]);
             if cur > bound.as_slice() {
                 result = Some(decode_key(self.inner.key_binding(), &k_buf)?);
                 break;

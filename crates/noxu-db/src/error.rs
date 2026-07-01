@@ -34,6 +34,7 @@ use thiserror::Error;
 /// match on this to decide whether to attempt restart (`invalidates_environment
 /// = false`) or give up (`invalidates_environment = true`).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EnvironmentFailureReason {
     // ── Log / checksum ─────────────────────────────────────────────────────
     /// A checksum mismatch was detected in the log (persistent corruption).
@@ -309,6 +310,7 @@ pub trait ExceptionListener: Send + Sync {
 /// - HA / replication variants ([`NoxuError::InsufficientReplicas`],
 ///   [`NoxuError::ReplicaWrite`], [`NoxuError::RollbackRequired`]).
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum NoxuError {
     // ── Fatal / environment failure ────────────────────────────────────────
     /// A failure has occurred that may require the environment to be closed
@@ -571,6 +573,23 @@ pub enum NoxuError {
     #[error("operation not allowed: {0}")]
     OperationNotAllowed(String),
 
+    /// An operation failed in a lower-level subsystem (log, B-tree,
+    /// comparator, DBI layer).  Carries the original sub-crate error as
+    /// the [`std::error::Error::source`] so `?`/`anyhow` users can walk
+    /// the cause chain and `match` on the concrete failure, instead of
+    /// the cause being flattened into a string (review P1-2).
+    ///
+    /// The `Display` text is the same as the wrapped error's, so existing
+    /// log/message output is unchanged.
+    #[error("{msg}")]
+    OperationFailed {
+        /// Human-readable description (the wrapped error's `to_string()`).
+        msg: String,
+        /// The originating sub-crate error.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
+
     /// An illegal argument was provided to a method.
     ///
     /// Mirrors `IllegalArgumentException` (DB flavour).
@@ -781,19 +800,24 @@ impl From<noxu_dbi::DbiError> for NoxuError {
             }
             DbiError::IoError(io) => NoxuError::IoError(io),
             DbiError::TxnError(txn_err) => NoxuError::from(txn_err),
-            DbiError::LogError(log_err) => {
-                NoxuError::OperationNotAllowed(log_err.to_string())
-            }
-            DbiError::TreeError(tree_err) => {
-                NoxuError::OperationNotAllowed(tree_err.to_string())
-            }
+            DbiError::LogError(log_err) => NoxuError::OperationFailed {
+                msg: log_err.to_string(),
+                source: Box::new(log_err),
+            },
+            DbiError::TreeError(tree_err) => NoxuError::OperationFailed {
+                msg: tree_err.to_string(),
+                source: Box::new(tree_err),
+            },
             DbiError::DatabaseInUse(s) => NoxuError::OperationNotAllowed(s),
             DbiError::OperationFailed(s) => NoxuError::OperationNotAllowed(s),
             // DBI-14: surface the comparator mismatch as an operation error
             // carrying the full diagnostic (persisted vs. configured
-            // identity).
-            ref m @ DbiError::ComparatorMismatch { .. } => {
-                NoxuError::OperationNotAllowed(m.to_string())
+            // identity) as both the message and the chained `source`.
+            m @ DbiError::ComparatorMismatch { .. } => {
+                NoxuError::OperationFailed {
+                    msg: m.to_string(),
+                    source: Box::new(m),
+                }
             }
         }
     }
@@ -836,9 +860,10 @@ impl From<noxu_txn::TxnError> for NoxuError {
                 NoxuError::TransactionAborted(format!("txn {txn_id}: {state}"))
             }
             TxnError::StateError(s) => NoxuError::TransactionAborted(s),
-            TxnError::LogError(log_err) => {
-                NoxuError::OperationNotAllowed(log_err.to_string())
-            }
+            TxnError::LogError(log_err) => NoxuError::OperationFailed {
+                msg: log_err.to_string(),
+                source: Box::new(log_err),
+            },
         }
     }
 }
@@ -1241,6 +1266,28 @@ mod tests {
         let evt =
             ExceptionEvent::new("x", ExceptionSource::Checkpointer, "ckpt");
         listener.exception_event(&evt);
+    }
+
+    #[test]
+    fn test_operation_failed_preserves_source_chain() {
+        use std::error::Error;
+        // A sub-crate (DBI) error wrapped through the From<DbiError> path
+        // must (a) display the same string as before and (b) expose the
+        // original error via source() so anyhow/? users can walk the cause.
+        let dbi_err = noxu_dbi::DbiError::ComparatorMismatch {
+            name: "users".into(),
+            kind: "btree",
+            persisted: Some("a".into()),
+            configured: Some("b".into()),
+        };
+        let display_before = dbi_err.to_string();
+        let err: NoxuError = NoxuError::from(dbi_err);
+        assert!(matches!(err, NoxuError::OperationFailed { .. }));
+        // Display text is unchanged (no "operation not allowed:" prefix loss).
+        assert_eq!(err.to_string(), display_before);
+        // source() now chains to the originating sub-crate error.
+        let src = err.source().expect("source() must chain");
+        assert_eq!(src.to_string(), display_before);
     }
 
     #[test]

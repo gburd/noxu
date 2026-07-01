@@ -45,9 +45,9 @@ fn collect_all(db: &noxu_db::Database) -> BTreeMap<Vec<u8>, Vec<Vec<u8>>> {
     let mut d = DatabaseEntry::new();
     let mut s = c.get(&mut k, &mut d, Get::First, None).unwrap();
     while s == OperationStatus::Success {
-        out.entry(k.get_data().unwrap_or(&[]).to_vec())
+        out.entry(k.data_opt().unwrap_or(&[]).to_vec())
             .or_default()
-            .push(d.get_data().unwrap_or(&[]).to_vec());
+            .push(d.data_opt().unwrap_or(&[]).to_vec());
         s = c.get(&mut k, &mut d, Get::Next, None).unwrap();
     }
     for v in out.values_mut() {
@@ -79,7 +79,7 @@ fn recovery_basic_insert_delete_modify_round_trip() {
             let k = ikey(i);
             let v = format!("v-{i}").into_bytes();
             db.put_in(&txn, &k, DatabaseEntry::from_bytes(&v)).unwrap();
-            expected.insert(k.get_data().unwrap().to_vec(), v);
+            expected.insert(k.data_opt().unwrap().to_vec(), v);
         }
         txn.commit().unwrap();
 
@@ -88,7 +88,7 @@ fn recovery_basic_insert_delete_modify_round_trip() {
         for i in (0..NUM_RECS).step_by(2) {
             let k = ikey(i);
             db.delete_in(&txn, &k).unwrap();
-            expected.remove(k.get_data().unwrap());
+            expected.remove(k.data_opt().unwrap());
         }
         txn.commit().unwrap();
 
@@ -99,7 +99,7 @@ fn recovery_basic_insert_delete_modify_round_trip() {
             let k = ikey(i);
             let v = format!("MOD-{i}").into_bytes();
             db.put_in(&txn, &k, DatabaseEntry::from_bytes(&v)).unwrap();
-            expected.insert(k.get_data().unwrap().to_vec(), v);
+            expected.insert(k.data_opt().unwrap().to_vec(), v);
         }
         txn.commit().unwrap();
 
@@ -116,7 +116,7 @@ fn recovery_basic_insert_delete_modify_round_trip() {
         let s =
             db.get_into(None, DatabaseEntry::from_bytes(k), &mut out).unwrap();
         assert!(s, "key {:?} missing after recovery", k);
-        assert_eq!(out.get_data().unwrap(), v.as_slice());
+        assert_eq!(out.data_opt().unwrap(), v.as_slice());
     }
     assert_eq!(db.count().unwrap(), expected.len() as u64);
 
@@ -435,7 +435,7 @@ fn recovery_edge_test_no_log_files() {
 
     {
         let env = open_env(&path);
-        let names = env.get_database_names().unwrap();
+        let names = env.database_names().unwrap();
         assert!(names.is_empty(), "expected no dbs, got {names:?}");
         drop(env);
     }
@@ -443,7 +443,7 @@ fn recovery_edge_test_no_log_files() {
     // Reopen and re-check.  This is the JE "fake a shutdown/startup" loop.
     {
         let env = open_env(&path);
-        let names = env.get_database_names().unwrap();
+        let names = env.database_names().unwrap();
         assert!(
             names.is_empty(),
             "after reopen expected no dbs, got {names:?}",
@@ -492,7 +492,7 @@ fn recovery_edge_test_non_txnal_db() {
     {
         let env = open_env(&path);
         // names registry should already include the non-txn db
-        let names = env.get_database_names().unwrap();
+        let names = env.database_names().unwrap();
         assert!(
             names.contains(&"NotTxnal".to_string()),
             "NotTxnal db should survive clean close+reopen, got {names:?}",
@@ -520,7 +520,7 @@ fn recovery_edge_test_non_txnal_db() {
     // Phase 3: reopen again.  Both databases should be visible.
     {
         let env = open_env(&path);
-        let mut names = env.get_database_names().unwrap();
+        let mut names = env.database_names().unwrap();
         names.sort();
         assert_eq!(
             vec!["NotTxnal".to_string(), "Txnal".to_string()],
@@ -562,7 +562,7 @@ fn recovery_duplicates_round_trip_across_clean_close() {
         for (d, db) in dbs.iter().enumerate() {
             for i in 0..N_RECS {
                 let k = ikey(i);
-                let kbytes = k.get_data().unwrap().to_vec();
+                let kbytes = k.data_opt().unwrap().to_vec();
                 for j in 0..N_DUPS {
                     let dv = (i * 1000 + j).to_be_bytes().to_vec();
                     db.put_in(&txn, &k, DatabaseEntry::from_bytes(&dv))
@@ -625,7 +625,7 @@ fn recovery_duplicates_with_deletion_survives_recovery() {
                 db.put_in(&txn, &k, DatabaseEntry::from_bytes(&dv)).unwrap();
                 if i % 2 != 0 {
                     expected
-                        .entry(k.get_data().unwrap().to_vec())
+                        .entry(k.data_opt().unwrap().to_vec())
                         .or_default()
                         .push(dv);
                 }
@@ -765,7 +765,7 @@ fn recovery_edge_txn_id_continues_post_recovery() {
         let mut out = DatabaseEntry::new();
         let s = db.get_into(Some(&txn), ikey(i), &mut out).unwrap();
         assert!(s);
-        assert_eq!(out.get_data().unwrap(), b"pre");
+        assert_eq!(out.data_opt().unwrap(), b"pre");
     }
     txn.commit().unwrap();
 }

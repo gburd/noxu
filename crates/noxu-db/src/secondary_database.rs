@@ -104,6 +104,7 @@ pub(crate) trait SecondaryHook {
     ) -> Result<()>;
 
     /// Returns the secondary's database name (used in diagnostics).
+    #[allow(dead_code)] // part of the SecondaryHook interface
     fn name(&self) -> String;
 }
 
@@ -130,6 +131,7 @@ pub(crate) trait FkReferrer {
     ) -> Result<()>;
 
     /// Returns the child secondary's database name (used in error messages).
+    #[allow(dead_code)] // part of the FkReferrer interface
     fn name(&self) -> String;
 }
 
@@ -388,7 +390,7 @@ impl SecondaryHook for SecondaryHookState {
     }
 
     fn name(&self) -> String {
-        self.inner.get_database_name().to_string()
+        self.inner.name().to_string()
     }
 }
 
@@ -425,7 +427,7 @@ impl FkReferrer for SecondaryHookState {
                     })?;
                 if st == OperationStatus::Success {
                     let fk_hex = fk_value
-                        .get_data()
+                        .data_opt()
                         .map(|b| {
                             b.iter()
                                 .map(|b| format!("{b:02x}"))
@@ -437,7 +439,7 @@ impl FkReferrer for SecondaryHookState {
                             "foreign-key delete aborted: secondary '{}' \
                              still references foreign key 0x{fk_hex} \
                              (ForeignKeyDeleteAction::Abort)",
-                            self.inner.get_database_name()
+                            self.inner.name()
                         ),
                     ));
                 }
@@ -453,7 +455,7 @@ impl FkReferrer for SecondaryHookState {
                 // a cycle from spinning forever.
                 let primary = Arc::clone(&self.primary);
                 let db_id = primary.lock().db_id_for_fk_guard();
-                let fk_bytes = fk_value.get_data().unwrap_or(&[]).to_vec();
+                let fk_bytes = fk_value.data_opt().unwrap_or(&[]).to_vec();
 
                 if !FK_CASCADE_GUARD
                     .with(|c| c.borrow_mut().insert((db_id, fk_bytes.clone())))
@@ -477,12 +479,12 @@ impl FkReferrer for SecondaryHookState {
                             NoxuError::OperationNotAllowed(e.to_string())
                         })?;
                     while st == OperationStatus::Success {
-                        if sk.get_data().unwrap_or(&[])
-                            != fk_value.get_data().unwrap_or(&[])
+                        if sk.data_opt().unwrap_or(&[])
+                            != fk_value.data_opt().unwrap_or(&[])
                         {
                             break;
                         }
-                        if let Some(b) = pk.get_data() {
+                        if let Some(b) = pk.data_opt() {
                             child_keys.push(DatabaseEntry::from_bytes(b));
                         }
                         st = cursor
@@ -534,7 +536,7 @@ impl FkReferrer for SecondaryHookState {
                 // (db, key) frame.
                 let primary = Arc::clone(&self.primary);
                 let db_id = primary.lock().db_id_for_fk_guard();
-                let fk_bytes = fk_value.get_data().unwrap_or(&[]).to_vec();
+                let fk_bytes = fk_value.data_opt().unwrap_or(&[]).to_vec();
                 if !FK_CASCADE_GUARD
                     .with(|c| c.borrow_mut().insert((db_id, fk_bytes.clone())))
                 {
@@ -557,15 +559,15 @@ impl FkReferrer for SecondaryHookState {
                             NoxuError::OperationNotAllowed(e.to_string())
                         })?;
                     while st == OperationStatus::Success {
-                        if sk.get_data().unwrap_or(&[])
-                            != fk_value.get_data().unwrap_or(&[])
+                        if sk.data_opt().unwrap_or(&[])
+                            != fk_value.data_opt().unwrap_or(&[])
                         {
                             break;
                         }
                         // Fetch the child primary's data so the
                         // nullifier sees it.
                         let child_pri = DatabaseEntry::from_bytes(
-                            pk.get_data().unwrap_or(&[]),
+                            pk.data_opt().unwrap_or(&[]),
                         );
                         let mut data = DatabaseEntry::new();
                         let g = primary.lock().get_into(
@@ -638,7 +640,7 @@ impl FkReferrer for SecondaryHookState {
     }
 
     fn name(&self) -> String {
-        self.inner.get_database_name().to_string()
+        self.inner.name().to_string()
     }
 }
 
@@ -736,7 +738,7 @@ impl SecondaryDatabase {
         config: SecondaryConfig,
     ) -> Result<Self> {
         // Validate the config w.r.t. the primary's read-only flag.
-        let primary_read_only = primary.lock().get_config().read_only;
+        let primary_read_only = primary.lock().config().read_only;
         config
             .validate(primary_read_only)
             .map_err(NoxuError::IllegalArgument)?;
@@ -747,7 +749,7 @@ impl SecondaryDatabase {
         // the (sec_key) entry.  Reject otherwise — in v1.5 we used
         // Put::NoOverwrite and surfaced cross-primary collisions as
         // NoxuError::Unsupported; v1.6 stores them as duplicates.
-        if !secondary_db.get_config().sorted_duplicates {
+        if !secondary_db.config().sorted_duplicates {
             return Err(NoxuError::IllegalArgument(
                 "v1.6 secondary databases require the inner index DB to \
                  be opened with DatabaseConfig::with_sorted_duplicates(true) \
@@ -827,14 +829,14 @@ impl SecondaryDatabase {
     // ------------------------------------------------------------------
 
     /// Returns the database name of the secondary index.
-    pub fn get_database_name(&self) -> &str {
-        self.state.inner.get_database_name()
+    pub fn name(&self) -> &str {
+        self.state.inner.name()
     }
 
     /// Returns the secondary configuration.
     ///
     ///
-    pub fn get_config(&self) -> &SecondaryConfig {
+    pub fn config(&self) -> &SecondaryConfig {
         &self.state.config
     }
 
@@ -964,7 +966,7 @@ impl SecondaryDatabase {
         }
 
         // Store the primary key in the output parameter.
-        if let Some(pk) = pri_key_entry.get_data() {
+        if let Some(pk) = pri_key_entry.data_opt() {
             p_key.set_data(pk);
         }
 
@@ -975,7 +977,7 @@ impl SecondaryDatabase {
             // Secondary refers to a missing primary — integrity issue.
             return Err(NoxuError::SecondaryIntegrityException(format!(
                 "Secondary '{}' refers to missing primary key",
-                self.get_database_name()
+                self.name()
             )));
         }
 
@@ -1039,7 +1041,7 @@ impl SecondaryDatabase {
 
         // We found at least one; iterate and delete all matching primary records.
         loop {
-            let pri_key_bytes = p_key.get_data().unwrap_or(&[]).to_vec();
+            let pri_key_bytes = p_key.data_opt().unwrap_or(&[]).to_vec();
             let pri_key_entry = DatabaseEntry::from_bytes(&pri_key_bytes);
 
             // Delete the primary record.  The auto-hook registered with the
@@ -1204,6 +1206,7 @@ impl SecondaryDatabase {
     /// Called when a primary record is deleted.  `txn` is forwarded to
     /// [`Self::update_secondary`] so the cleanup participates in the
     /// caller's transaction.
+    #[allow(dead_code)] // FK-cascade cleanup helper, not yet wired into delete
     pub(crate) fn delete_all_for_primary(
         &self,
         txn: Option<&Transaction>,
@@ -1396,7 +1399,7 @@ mod tests {
             data: &DatabaseEntry,
             result: &mut DatabaseEntry,
         ) -> bool {
-            if let Some(d) = data.get_data()
+            if let Some(d) = data.data_opt()
                 && !d.is_empty()
             {
                 result.set_data(&d[..1]);
@@ -1445,7 +1448,7 @@ mod tests {
         let primary = Arc::new(Mutex::new(open_primary(&env, "primary")));
         let secondary = open_secondary(Arc::clone(&primary), &env, "secondary");
         assert!(secondary.is_valid());
-        assert_eq!(secondary.get_database_name(), "secondary");
+        assert_eq!(secondary.name(), "secondary");
     }
 
     #[test]
@@ -1471,8 +1474,8 @@ mod tests {
             secondary.get_into(None, &sec_key, &mut p_key, &mut data).unwrap();
 
         assert!(status);
-        assert_eq!(p_key.get_data().unwrap(), b"pk1");
-        assert_eq!(data.get_data().unwrap(), b"Avalon");
+        assert_eq!(p_key.data_opt().unwrap(), b"pk1");
+        assert_eq!(data.data_opt().unwrap(), b"Avalon");
     }
 
     #[test]
@@ -1504,7 +1507,7 @@ mod tests {
             secondary.get_into(None, &sec_key, &mut p_key, &mut data).unwrap();
 
         assert!(status);
-        assert_eq!(data.get_data().unwrap(), b"Banana");
+        assert_eq!(data.data_opt().unwrap(), b"Banana");
 
         // Search for non-existent secondary key.
         let missing = DatabaseEntry::from_bytes(b"Z");
@@ -1572,7 +1575,7 @@ mod tests {
         let status =
             secondary.get_into(None, &new_sec, &mut pk, &mut data).unwrap();
         assert!(status);
-        assert_eq!(data.get_data().unwrap(), b"Pineapple");
+        assert_eq!(data.data_opt().unwrap(), b"Pineapple");
     }
 
     #[test]
@@ -1602,7 +1605,7 @@ mod tests {
             cursor.get_first(&mut sec_key, &mut p_key, &mut data).unwrap();
         let mut current = status;
         while current == OperationStatus::Success {
-            if let Some(k) = sec_key.get_data() {
+            if let Some(k) = sec_key.data_opt() {
                 sec_keys_seen.push(k.to_vec());
             }
             current =
@@ -1673,7 +1676,7 @@ mod tests {
         let status =
             secondary.get_into(None, &sec_key_g, &mut pk, &mut data).unwrap();
         assert!(status);
-        assert_eq!(data.get_data().unwrap(), b"Grape");
+        assert_eq!(data.data_opt().unwrap(), b"Grape");
     }
 
     /// Note:

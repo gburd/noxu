@@ -178,12 +178,12 @@ impl<'a> JoinCursor<'a> {
     }
 
     /// Returns a reference to the primary database associated with this cursor.
-    pub fn get_database(&self) -> &Database {
+    pub fn database(&self) -> &Database {
         self.primary_db
     }
 
     /// Returns a clone of this cursor's configuration.
-    pub fn get_config(&self) -> JoinConfig {
+    pub fn config(&self) -> JoinConfig {
         self.config.clone()
     }
 
@@ -280,7 +280,7 @@ mod tests {
             data: &DatabaseEntry,
             result: &mut DatabaseEntry,
         ) -> bool {
-            if let Some(d) = data.get_data()
+            if let Some(d) = data.data_opt()
                 && !d.is_empty()
             {
                 result.set_data(&d[..1]);
@@ -301,7 +301,7 @@ mod tests {
             data: &DatabaseEntry,
             result: &mut DatabaseEntry,
         ) -> bool {
-            if let Some(d) = data.get_data()
+            if let Some(d) = data.data_opt()
                 && !d.is_empty()
             {
                 result.set_data(&d[d.len() - 1..]);
@@ -439,7 +439,7 @@ mod tests {
         while join.get_next(&mut key, &mut data).unwrap()
             == OperationStatus::Success
         {
-            got.push(key.get_data().unwrap().to_vec());
+            got.push(key.data_opt().unwrap().to_vec());
         }
         got.sort();
         let expected: Vec<Vec<u8>> = vec![b"pk1".to_vec(), b"pk2".to_vec()];
@@ -501,8 +501,8 @@ mod tests {
         let mut data = DatabaseEntry::new();
         let status = join.get_next(&mut key, &mut data).unwrap();
         assert_eq!(status, OperationStatus::Success);
-        assert_eq!(key.get_data().unwrap(), b"pk1");
-        assert_eq!(data.get_data().unwrap(), b"AB");
+        assert_eq!(key.data_opt().unwrap(), b"pk1");
+        assert_eq!(data.data_opt().unwrap(), b"AB");
 
         // No more results.
         let status2 = join.get_next(&mut key, &mut data).unwrap();
@@ -564,7 +564,7 @@ mod tests {
         let mut key = DatabaseEntry::new();
         let status = join.get_next_key(&mut key).unwrap();
         assert_eq!(status, OperationStatus::Success);
-        assert_eq!(key.get_data().unwrap(), b"mypk");
+        assert_eq!(key.data_opt().unwrap(), b"mypk");
     }
 
     /// `no_sort = true` preserves cursor order and still finds the match.
@@ -602,13 +602,13 @@ mod tests {
         let pri_guard = fix.primary.lock();
         let mut join =
             pri_guard.join(vec![cursor1, cursor2], Some(config)).unwrap();
-        assert!(join.get_config().no_sort);
+        assert!(join.config().no_sort);
 
         let mut key = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
         let status = join.get_next(&mut key, &mut data).unwrap();
         assert_eq!(status, OperationStatus::Success);
-        assert_eq!(key.get_data().unwrap(), b"pk1");
+        assert_eq!(key.data_opt().unwrap(), b"pk1");
     }
 
     /// No match when secondary keys do not overlap.
@@ -681,7 +681,7 @@ mod tests {
         let mut data = DatabaseEntry::new();
         let status = join.get_next(&mut key, &mut data).unwrap();
         assert_eq!(status, OperationStatus::Success);
-        assert_eq!(key.get_data().unwrap(), b"pk1");
+        assert_eq!(key.data_opt().unwrap(), b"pk1");
     }
 
     /// `get_database()` returns the primary database.
@@ -705,7 +705,7 @@ mod tests {
 
         let pri_guard = fix.primary.lock();
         let join = pri_guard.join(vec![cursor1], None).unwrap();
-        assert_eq!(join.get_database().get_database_name(), "primary");
+        assert_eq!(join.database().name(), "primary");
     }
 
     /// `close()` releases the cursors without panicking.

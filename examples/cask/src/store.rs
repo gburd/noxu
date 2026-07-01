@@ -102,7 +102,7 @@ impl CaskStore {
         }
 
         loop {
-            if let Some(k) = key_out.get_data()
+            if let Some(k) = key_out.data_opt()
                 && glob_match(pattern, k)
             {
                 results.push(Bytes::copy_from_slice(k));

@@ -25,7 +25,6 @@
 use crate::database::Database;
 use crate::database_entry::DatabaseEntry;
 use crate::error::{NoxuError, Result};
-use crate::operation_status::OperationStatus;
 use crate::sequence_config::SequenceConfig;
 use crate::sequence_stats::SequenceStats;
 use crate::transaction::Transaction;
@@ -135,7 +134,7 @@ impl<'db> Sequence<'db> {
             ));
         }
 
-        let key_bytes = key.get_data().unwrap_or(&[]).to_vec();
+        let key_bytes = key.data_opt().unwrap_or(&[]).to_vec();
         let key_entry = DatabaseEntry::from_bytes(&key_bytes);
 
         // ── try to read an existing record ────────────────────────────────
@@ -457,7 +456,7 @@ impl<'db> Sequence<'db> {
     /// Returns a snapshot of statistics for this handle.
     ///
     ///
-    pub fn get_stats(&self) -> SequenceStats {
+    pub fn stats(&self) -> SequenceStats {
         let state = self.state.lock().unwrap();
         SequenceStats {
             n_gets: state.n_gets,
@@ -660,7 +659,7 @@ mod tests {
         seq.get(None, 1).unwrap();
         seq.get(None, 1).unwrap();
 
-        let stats = seq.get_stats();
+        let stats = seq.stats();
         assert_eq!(stats.n_gets, 3);
         assert_eq!(stats.range_min, i64::MIN);
         assert_eq!(stats.range_max, i64::MAX);

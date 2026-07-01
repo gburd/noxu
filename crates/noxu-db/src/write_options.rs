@@ -28,6 +28,10 @@ impl WriteOptions {
     }
 
     /// Sets the cache mode.
+    #[deprecated(
+        note = "not yet implemented: cache_mode is advisory/informational and \
+                is not consulted by the engine; this setting has no effect"
+    )]
     pub fn with_cache_mode(mut self, cache_mode: CacheMode) -> Self {
         self.cache_mode = Some(cache_mode);
         self
@@ -40,12 +44,19 @@ impl WriteOptions {
     }
 
     /// Sets whether to update TTL on existing records.
+    #[deprecated(note = "not yet implemented: update_ttl is not consulted by \
+                put_with_options; this setting has no effect")]
     pub fn with_update_ttl(mut self, update_ttl: bool) -> Self {
         self.update_ttl = update_ttl;
         self
     }
 
     /// Creates WriteOptions with evict-after-write cache mode.
+    #[deprecated(
+        note = "not yet implemented: cache_mode is advisory/informational and \
+                is not consulted by the engine; this constructor has no effect \
+                beyond WriteOptions::new()"
+    )]
     pub fn evict_after_write() -> Self {
         Self { cache_mode: Some(CacheMode::EvictLn), ttl: 0, update_ttl: false }
     }
@@ -73,7 +84,7 @@ impl WriteOptions {
     ///
     /// Returns 0 if no TTL is set.  Uses `noxu_util::ttl_hours_to_expiration`
     /// to compute the expiration time relative to now.
-    pub fn get_expiration_time(&self) -> u32 {
+    pub fn expiration_time(&self) -> u32 {
         noxu_util::ttl_hours_to_expiration(self.ttl as u32)
     }
 }
@@ -85,6 +96,7 @@ impl Default for WriteOptions {
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // tests still exercise the (now-deprecated) inert setters
 mod tests {
     use super::*;
 

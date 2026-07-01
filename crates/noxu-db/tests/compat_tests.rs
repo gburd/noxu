@@ -1243,7 +1243,7 @@ fn environment_stats_non_negative_after_writes() {
         db.put(&k, &v).unwrap();
     }
 
-    let stats = env.get_stats().unwrap();
+    let stats = env.stats().unwrap();
     assert!(stats.log.n_sequential_writes > 0, "log writes must be counted");
     // Cache size must be set from config.
     assert!(stats.cache_size > 0, "cache_size must reflect configuration");

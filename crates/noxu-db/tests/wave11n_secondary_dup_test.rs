@@ -36,7 +36,7 @@ impl SecondaryKeyCreator for BucketKeyCreator {
         _data: &DatabaseEntry,
         result: &mut DatabaseEntry,
     ) -> bool {
-        let bytes = key.get_data().unwrap_or(&[]);
+        let bytes = key.data_opt().unwrap_or(&[]);
         if bytes.len() != 4 {
             return false;
         }
@@ -116,7 +116,7 @@ fn wave11n_bug3_get_search_key_then_next_dup_full_yields_all() {
         assert_eq!(s, OperationStatus::Success, "bucket={bucket}");
 
         let mut seen: Vec<u32> = Vec::new();
-        let pk_bytes = p_key.get_data().unwrap();
+        let pk_bytes = p_key.data_opt().unwrap();
         seen.push(u32::from_be_bytes([
             pk_bytes[0],
             pk_bytes[1],
@@ -135,11 +135,11 @@ fn wave11n_bug3_get_search_key_then_next_dup_full_yields_all() {
             assert_eq!(s, OperationStatus::Success);
             // Must stay inside the same bucket.
             assert_eq!(
-                sec_key_out.get_data().unwrap(),
+                sec_key_out.data_opt().unwrap(),
                 &[bucket],
                 "bucket={bucket}: get_next_dup_full crossed sec-key boundary",
             );
-            let pk_bytes = p_key.get_data().unwrap();
+            let pk_bytes = p_key.data_opt().unwrap();
             seen.push(u32::from_be_bytes([
                 pk_bytes[0],
                 pk_bytes[1],
@@ -185,9 +185,9 @@ fn wave11n_bug4_get_first_get_next_full_walk_terminates() {
         .get_first(&mut sec_key, &mut p_key, &mut data)
         .expect("get_first must not raise");
     while s == OperationStatus::Success {
-        let sk = sec_key.get_data().unwrap();
+        let sk = sec_key.data_opt().unwrap();
         assert_eq!(sk.len(), 1, "secondary keys are 1-byte bucket ids");
-        let pk = p_key.get_data().unwrap();
+        let pk = p_key.data_opt().unwrap();
         assert_eq!(pk.len(), 4, "primary keys are 4-byte u32");
         let entry = (sk[0], u32::from_be_bytes([pk[0], pk[1], pk[2], pk[3]]));
         seen.push(entry);

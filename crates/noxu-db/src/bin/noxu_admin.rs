@@ -169,7 +169,7 @@ fn run_dump(args: DumpArgs) -> Result<(), String> {
     if args.list {
         // DbDump.listDbs
         let names = env
-            .get_database_names()
+            .database_names()
             .map_err(|e| format!("cannot list databases: {e}"))?;
         let stdout = io::stdout();
         let mut w = stdout.lock();
@@ -194,7 +194,7 @@ fn run_dump(args: DumpArgs) -> Result<(), String> {
     let db = env
         .open_database(None, db_name, &db_cfg)
         .map_err(|e| format!("cannot open database '{db_name}': {e}"))?;
-    let dup_sort = db.get_sorted_duplicates() || args.dup_sort;
+    let dup_sort = db.sorted_duplicates() || args.dup_sort;
 
     // Route output to a file or stdout, both behind a BufWriter.
     let mut writer: Box<dyn Write> = match &args.out_file {

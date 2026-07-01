@@ -17,7 +17,7 @@ use noxu_db::{Database, Get, OperationStatus, Transaction};
 
 use crate::error::{CollectionError, Result};
 use crate::internal::{
-    ScanDirection, StartKey, decode_value, encode_key, encode_value,
+    ScanDirection, StartKey, decode_value, encode_key, encode_value, scan_iter,
     scan_records,
 };
 use crate::stored_iterator::StoredIterator;
@@ -229,12 +229,88 @@ where
         Ok(self.len(txn)? == 0)
     }
 
-    /// Returns a snapshot iterator over every (key, value) pair.
+    /// Returns a **lazy** iterator over every (key, value) pair, in
+    /// ascending key order.
     ///
-    /// The iterator is materialised eagerly: at the call to `iter()`
-    /// the cursor walks every record under `txn` and decodes every
-    /// pair into the returned `Vec`-backed iterator.
-    pub fn iter(
+    /// O(1) to create and bounded in memory: it holds a live cursor and
+    /// fetches+decodes one pair per `next()` call — the whole keyspace is
+    /// **not** materialised (review P1-7).  Yields `Result<(K, V)>`.
+    ///
+    /// When `txn` is `Some(&t)` the iterator borrows `t` for its whole
+    /// lifetime, so the borrow checker rejects committing/dropping `t`
+    /// while the iterator is still alive.  If you need a point-in-time
+    /// snapshot that is decoupled from later mutations, use
+    /// [`snapshot`](Self::snapshot) instead.
+    pub fn iter<'a>(
+        &'a self,
+        txn: Option<&'a Transaction>,
+    ) -> Result<impl Iterator<Item = Result<(K, V)>> + 'a>
+    where
+        K: 'a,
+        V: 'a,
+    {
+        scan_iter(
+            self.db,
+            txn,
+            StartKey::None,
+            ScanDirection::Forward,
+            &self.key_binding,
+            &self.value_binding,
+            |k, v| (k, v),
+        )
+    }
+
+    /// Returns a **lazy** iterator over keys, in ascending key order.
+    /// See [`iter`](Self::iter) for the laziness/lifetime contract.
+    pub fn keys<'a>(
+        &'a self,
+        txn: Option<&'a Transaction>,
+    ) -> Result<impl Iterator<Item = Result<K>> + 'a>
+    where
+        K: 'a,
+        V: 'a,
+    {
+        scan_iter(
+            self.db,
+            txn,
+            StartKey::None,
+            ScanDirection::Forward,
+            &self.key_binding,
+            &self.value_binding,
+            |k, _v| k,
+        )
+    }
+
+    /// Returns a **lazy** iterator over values, in ascending key order.
+    /// See [`iter`](Self::iter) for the laziness/lifetime contract.
+    pub fn values<'a>(
+        &'a self,
+        txn: Option<&'a Transaction>,
+    ) -> Result<impl Iterator<Item = Result<V>> + 'a>
+    where
+        K: 'a,
+        V: 'a,
+    {
+        scan_iter(
+            self.db,
+            txn,
+            StartKey::None,
+            ScanDirection::Forward,
+            &self.key_binding,
+            &self.value_binding,
+            |_k, v| v,
+        )
+    }
+
+    /// Returns an **eager snapshot** iterator over every (key, value) pair.
+    ///
+    /// Unlike [`iter`](Self::iter), this walks the whole database into a
+    /// `Vec` at the call site, so the returned iterator reflects the
+    /// state at the moment `snapshot` was called and is unaffected by
+    /// later mutations.  Use it when you specifically need point-in-time
+    /// semantics; prefer [`iter`](Self::iter) otherwise (it is O(1) to
+    /// create and does not allocate the entire keyspace).
+    pub fn snapshot(
         &self,
         txn: Option<&Transaction>,
     ) -> Result<StoredIterator<(K, V)>> {
@@ -250,8 +326,12 @@ where
         Ok(StoredIterator::from_vec(items))
     }
 
-    /// Returns a snapshot iterator over keys.
-    pub fn keys(&self, txn: Option<&Transaction>) -> Result<StoredIterator<K>> {
+    /// Returns an **eager snapshot** iterator over keys.
+    /// See [`snapshot`](Self::snapshot).
+    pub fn keys_snapshot(
+        &self,
+        txn: Option<&Transaction>,
+    ) -> Result<StoredIterator<K>> {
         let items = scan_records(
             self.db,
             txn,
@@ -264,8 +344,9 @@ where
         Ok(StoredIterator::from_vec(items))
     }
 
-    /// Returns a snapshot iterator over values.
-    pub fn values(
+    /// Returns an **eager snapshot** iterator over values.
+    /// See [`snapshot`](Self::snapshot).
+    pub fn values_snapshot(
         &self,
         txn: Option<&Transaction>,
     ) -> Result<StoredIterator<V>> {
@@ -417,6 +498,34 @@ mod tests {
     }
 
     #[test]
+    fn iter_is_lazy_snapshot_is_eager() {
+        // review P1-7: iter() is lazy (observes records as it walks the
+        // live cursor); snapshot() is eager (point-in-time Vec).
+        let (_td, env) = setup_env();
+        let db = open_db(&env, "lazy_vs_snapshot");
+        let map: StoredMap<'_, i32, i32, _, _> =
+            StoredMap::new(&db, IntBinding, IntBinding);
+        for k in 1..=3 {
+            map.put(None, &k, &(k * 10)).unwrap();
+        }
+
+        // Eager snapshot: taken before the mutation, must not see key 4.
+        let snap = map.snapshot(None).unwrap();
+        map.put(None, &4, &40).unwrap();
+        let snap_pairs: Vec<(i32, i32)> = snap.map(Result::unwrap).collect();
+        assert_eq!(
+            snap_pairs,
+            vec![(1, 10), (2, 20), (3, 30)],
+            "snapshot() must reflect construction-time state"
+        );
+
+        // Lazy iter: created after key 4 was inserted, sees all four.
+        let live_pairs: Vec<(i32, i32)> =
+            map.iter(None).unwrap().map(Result::unwrap).collect();
+        assert_eq!(live_pairs, vec![(1, 10), (2, 20), (3, 30), (4, 40)]);
+    }
+
+    #[test]
     fn typed_keys_and_values() {
         let (_td, env) = setup_env();
         let db = open_db(&env, "typed_kv");
@@ -525,7 +634,7 @@ mod tests {
         let db = open_db(&env, "accessor");
         let map: StoredMap<'_, i32, String, _, _> =
             StoredMap::new(&db, IntBinding, StringBinding);
-        assert_eq!(map.database().get_database_name(), "accessor");
+        assert_eq!(map.database().name(), "accessor");
     }
 
     #[test]

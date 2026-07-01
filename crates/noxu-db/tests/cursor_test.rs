@@ -59,7 +59,7 @@ fn cursor_initial_state_not_initialized() {
     let dir = TempDir::new().unwrap();
     let (_env, db) = open_env_and_db(&dir);
     let cursor = db.open_cursor(None).unwrap();
-    assert_eq!(cursor.get_state(), CursorState::NotInitialized);
+    assert_eq!(cursor.state(), CursorState::NotInitialized);
 }
 
 #[test]
@@ -87,7 +87,7 @@ fn cursor_state_initialized_after_first_get() {
     let mut key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
     cursor.get(&mut key, &mut data, Get::First, None).unwrap();
-    assert_eq!(cursor.get_state(), CursorState::Initialized);
+    assert_eq!(cursor.state(), CursorState::Initialized);
 }
 
 #[test]
@@ -96,7 +96,7 @@ fn cursor_state_closed_after_close() {
     let (_env, db) = open_env_and_db(&dir);
     let mut cursor = db.open_cursor(None).unwrap();
     cursor.close().unwrap();
-    assert_eq!(cursor.get_state(), CursorState::Closed);
+    assert_eq!(cursor.state(), CursorState::Closed);
 }
 
 // ─── 2. Empty-database behavior ───────────────────────────────────────────────
@@ -1043,7 +1043,7 @@ fn cursor_next_dup_on_non_dup_db_returns_not_found() {
         s,
         OperationStatus::NotFound,
         "Get::NextDup on non-dup DB must return NotFound; got key={:?}",
-        key.get_data()
+        key.data_opt()
     );
 }
 
@@ -1076,7 +1076,7 @@ fn cursor_prev_dup_on_non_dup_db_returns_not_found() {
         s,
         OperationStatus::NotFound,
         "Get::PrevDup on non-dup DB must return NotFound; got key={:?}",
-        key.get_data()
+        key.data_opt()
     );
 }
 
@@ -1155,15 +1155,15 @@ fn cursor_search_lte_positions_on_floor() {
         cursor.get(&mut key, &mut data, Get::SearchLte, None).unwrap(),
         OperationStatus::Success
     );
-    assert_eq!(key.get_data().unwrap(), b"20");
-    assert_eq!(data.get_data().unwrap(), b"b");
+    assert_eq!(key.data_opt().unwrap(), b"20");
+    assert_eq!(data.data_opt().unwrap(), b"b");
 
     let mut key = DatabaseEntry::from_bytes(b"30");
     assert_eq!(
         cursor.get(&mut key, &mut data, Get::SearchLte, None).unwrap(),
         OperationStatus::Success
     );
-    assert_eq!(key.get_data().unwrap(), b"30");
+    assert_eq!(key.data_opt().unwrap(), b"30");
 
     let mut key = DatabaseEntry::from_bytes(b"05");
     assert_eq!(
@@ -1200,21 +1200,21 @@ fn cursor_first_dup_and_last_dup_position_within_dup_set() {
     // middle dup so FirstDup/LastDup must actually move.
     cursor.get(&mut key, &mut data, Get::Search, None).unwrap();
     cursor.get(&mut key, &mut data, Get::NextDup, None).unwrap();
-    assert_eq!(data.get_data().unwrap(), b"b");
+    assert_eq!(data.data_opt().unwrap(), b"b");
 
     assert_eq!(
         cursor.get(&mut key, &mut data, Get::FirstDup, None).unwrap(),
         OperationStatus::Success
     );
-    assert_eq!(key.get_data().unwrap(), b"k");
-    assert_eq!(data.get_data().unwrap(), b"a");
+    assert_eq!(key.data_opt().unwrap(), b"k");
+    assert_eq!(data.data_opt().unwrap(), b"a");
 
     assert_eq!(
         cursor.get(&mut key, &mut data, Get::LastDup, None).unwrap(),
         OperationStatus::Success
     );
-    assert_eq!(key.get_data().unwrap(), b"k");
-    assert_eq!(data.get_data().unwrap(), b"c");
+    assert_eq!(key.data_opt().unwrap(), b"k");
+    assert_eq!(data.data_opt().unwrap(), b"c");
 }
 
 // ─── 14. Cursor must participate in the txn passed to open_cursor ─────────────
@@ -1361,7 +1361,7 @@ mod secondary_cursor_txn {
             data: &DatabaseEntry,
             result: &mut DatabaseEntry,
         ) -> bool {
-            if let Some(d) = data.get_data()
+            if let Some(d) = data.data_opt()
                 && !d.is_empty()
             {
                 result.set_data(&d[..1]);

@@ -38,8 +38,8 @@ fn collect_all_kv(db: &noxu_db::Database) -> Vec<(Vec<u8>, Vec<u8>)> {
     let mut s = c.get(&mut k, &mut d, Get::First, None).unwrap();
     while s == OperationStatus::Success {
         out.push((
-            k.get_data().unwrap_or(&[]).to_vec(),
-            d.get_data().unwrap_or(&[]).to_vec(),
+            k.data_opt().unwrap_or(&[]).to_vec(),
+            d.data_opt().unwrap_or(&[]).to_vec(),
         ));
         s = c.get(&mut k, &mut d, Get::Next, None).unwrap();
     }
@@ -237,7 +237,7 @@ fn sr9752_part1_abort_after_committed_write_reverts_no_dups() {
             .get_into(None, DatabaseEntry::from_bytes(b"k"), &mut out)
             .unwrap();
         assert!(s);
-        assert_eq!(out.get_data().unwrap(), b"committed");
+        assert_eq!(out.data_opt().unwrap(), b"committed");
 
         drop(db);
         drop(env);
@@ -250,7 +250,7 @@ fn sr9752_part1_abort_after_committed_write_reverts_no_dups() {
         db2.get_into(None, DatabaseEntry::from_bytes(b"k"), &mut out2).unwrap();
     assert!(s);
     assert_eq!(
-        out2.get_data().unwrap(),
+        out2.data_opt().unwrap(),
         b"committed",
         "abort + recovery must restore the previously-committed value, not the aborted overwrite"
     );

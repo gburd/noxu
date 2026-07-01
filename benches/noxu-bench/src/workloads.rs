@@ -365,7 +365,7 @@ impl SecondaryKeyCreator for W13BucketKeyCreator {
         _data: &DatabaseEntry,
         result: &mut DatabaseEntry,
     ) -> bool {
-        let bytes = key.get_data().unwrap_or(&[]);
+        let bytes = key.data_opt().unwrap_or(&[]);
         let s = std::str::from_utf8(bytes).unwrap_or("0");
         let n: u32 = s.parse::<u64>().unwrap_or(0) as u32;
         let bucket = n % W13_BUCKETS;

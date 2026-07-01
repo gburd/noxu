@@ -99,9 +99,9 @@ fn cursor_edge_search_on_duplicates_with_deletions() {
     let mut d = DatabaseEntry::new();
     let s = rc.get(&mut k, &mut d, Get::Search, None).unwrap();
     assert_eq!(s, OperationStatus::Success);
-    assert_eq!(k.get_data().unwrap(), &[2]);
+    assert_eq!(k.data_opt().unwrap(), &[2]);
     assert_eq!(
-        d.get_data().unwrap(),
+        d.data_opt().unwrap(),
         &[8],
         "Search on k=2 must skip deleted leading dups and land on d8"
     );
@@ -111,15 +111,15 @@ fn cursor_edge_search_on_duplicates_with_deletions() {
     let mut d = DatabaseEntry::new();
     let s = rc.get(&mut k, &mut d, Get::SearchGte, None).unwrap();
     assert_eq!(s, OperationStatus::Success);
-    assert_eq!(k.get_data().unwrap(), &[2]);
-    assert_eq!(d.get_data().unwrap(), &[8]);
+    assert_eq!(k.data_opt().unwrap(), &[2]);
+    assert_eq!(d.data_opt().unwrap(), &[8]);
 
     // SearchBoth on (k=2, d=8): exact match.
     let mut k = key(2);
     let mut d = DatabaseEntry::from_bytes(&[8]);
     let s = rc.get(&mut k, &mut d, Get::SearchBoth, None).unwrap();
     assert_eq!(s, OperationStatus::Success);
-    assert_eq!(d.get_data().unwrap(), &[8]);
+    assert_eq!(d.data_opt().unwrap(), &[8]);
 
     // Now insert k=5 dups, delete all, verify all searches on k=5 return
     // NotFound.
@@ -142,7 +142,7 @@ fn cursor_edge_search_on_duplicates_with_deletions() {
     // (none exist >5 in this test), or fall through.  Must NOT be a phantom.
     if s == OperationStatus::Success {
         assert_ne!(
-            k.get_data().unwrap(),
+            k.data_opt().unwrap(),
             &[5],
             "SearchGte must not surface a fully-deleted key as k=5"
         );
@@ -181,8 +181,8 @@ fn cursor_edge_search_both_with_one_duplicate() {
     let mut d = DatabaseEntry::from_bytes(&[0]); // data-1
     let s = c.get(&mut k, &mut d, Get::SearchBothRange, None).unwrap();
     assert_eq!(s, OperationStatus::Success);
-    assert_eq!(k.get_data().unwrap(), &[1]);
-    assert_eq!(d.get_data().unwrap(), &[1]);
+    assert_eq!(k.data_opt().unwrap(), &[1]);
+    assert_eq!(d.data_opt().unwrap(), &[1]);
     drop(c);
     drop(db);
     drop(env);

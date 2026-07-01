@@ -99,7 +99,7 @@ fn main() {
         db.get_into(Some(&txn), &key, &mut val).unwrap();
         println!(
             "    Read: {:?}",
-            std::str::from_utf8(val.get_data().unwrap())
+            std::str::from_utf8(val.data_opt().unwrap())
         );
         txn.commit().unwrap();
         println!("    read_committed=true transaction committed\n");
@@ -133,7 +133,7 @@ fn main() {
         println!(
             "    {}: {:?}",
             key_str,
-            std::str::from_utf8(val.get_data().unwrap())
+            std::str::from_utf8(val.data_opt().unwrap())
         );
     }
 

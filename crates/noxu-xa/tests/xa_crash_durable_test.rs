@@ -90,7 +90,7 @@ fn prepare_crash_recover_commit_data_visible() {
         let mut got = DatabaseEntry::new();
         let status = db.get_into(None, key, &mut got).unwrap();
         assert!(status);
-        assert_eq!(got.get_data(), Some(val.as_slice()));
+        assert_eq!(got.data_opt(), Some(val.as_slice()));
     }
 
     // Phase 3: reopen one more time. Data must be durably committed (TxnCommit
@@ -107,7 +107,7 @@ fn prepare_crash_recover_commit_data_visible() {
             "data must survive the second crash because TxnCommit was \
              written durably"
         );
-        assert_eq!(got.get_data(), Some(val.as_slice()));
+        assert_eq!(got.data_opt(), Some(val.as_slice()));
     }
 }
 
@@ -204,7 +204,7 @@ fn two_prepared_txns_crash_recover_mixed_resolution() {
 
         let status_c = db.get_into(None, key_c, &mut val).unwrap();
         assert!(status_c);
-        assert_eq!(val.get_data(), Some(b"vc".as_slice()));
+        assert_eq!(val.data_opt(), Some(b"vc".as_slice()));
 
         let mut val_r = DatabaseEntry::new();
         let status_r = db.get_into(None, key_r, &mut val_r).unwrap();

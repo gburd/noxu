@@ -48,7 +48,9 @@ fn make_key(k: u8) -> Vec<u8> {
 }
 
 impl<'a> Arbitrary<'a> for RecoveryOp {
-    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+    fn arbitrary(
+        u: &mut arbitrary::Unstructured<'a>,
+    ) -> arbitrary::Result<Self> {
         let choice: u8 = u.int_in_range(0..=5)?;
         match choice {
             0 => {
@@ -84,9 +86,7 @@ impl<'a> Arbitrary<'a> for RecoveryOp {
 }
 
 /// Open an environment + database at `path`. The directory must already exist.
-fn open_env_db(
-    path: &std::path::Path,
-) -> (Environment, noxu_db::Database) {
+fn open_env_db(path: &std::path::Path) -> (Environment, noxu_db::Database) {
     let env_config = EnvironmentConfig::new(path.to_path_buf())
         .with_allow_create(true)
         .with_transactional(true);
@@ -148,7 +148,7 @@ fuzz_target!(|ops: Vec<RecoveryOp>| {
                                 k
                             );
                             assert_eq!(
-                                data.get_data().unwrap(),
+                                data.data_opt().unwrap(),
                                 expected.as_slice(),
                                 "Phase 1 get: value mismatch for key {:?}",
                                 k
@@ -173,8 +173,9 @@ fuzz_target!(|ops: Vec<RecoveryOp>| {
                     let oracle_values: Vec<Vec<u8>> =
                         oracle.values().cloned().collect();
 
-                    let first_status =
-                        cursor.get(&mut key_entry, &mut data, Get::First, None).unwrap();
+                    let first_status = cursor
+                        .get(&mut key_entry, &mut data, Get::First, None)
+                        .unwrap();
 
                     if oracle.is_empty() {
                         assert_eq!(
@@ -210,8 +211,9 @@ fuzz_target!(|ops: Vec<RecoveryOp>| {
                     let mut key_entry = DatabaseEntry::new();
                     let mut data = DatabaseEntry::new();
 
-                    let last_status =
-                        cursor.get(&mut key_entry, &mut data, Get::Last, None).unwrap();
+                    let last_status = cursor
+                        .get(&mut key_entry, &mut data, Get::Last, None)
+                        .unwrap();
 
                     if oracle.is_empty() {
                         assert_eq!(
@@ -242,8 +244,9 @@ fuzz_target!(|ops: Vec<RecoveryOp>| {
                     let mut cursor = db.open_cursor(None, None).unwrap();
                     let mut key_entry = DatabaseEntry::from_bytes(&k);
                     let mut data = DatabaseEntry::new();
-                    let status =
-                        cursor.get(&mut key_entry, &mut data, Get::Search, None).unwrap();
+                    let status = cursor
+                        .get(&mut key_entry, &mut data, Get::Search, None)
+                        .unwrap();
                     if oracle.contains_key(&k) {
                         assert_eq!(
                             status,
@@ -252,7 +255,7 @@ fuzz_target!(|ops: Vec<RecoveryOp>| {
                             k
                         );
                         assert_eq!(
-                            data.get_data().unwrap(),
+                            data.data_opt().unwrap(),
                             oracle.get(&k).unwrap().as_slice(),
                             "Phase 1 search: value mismatch for key {:?}",
                             k
@@ -295,7 +298,7 @@ fuzz_target!(|ops: Vec<RecoveryOp>| {
                 k
             );
             assert_eq!(
-                data.get_data().unwrap(),
+                data.data_opt().unwrap(),
                 v.as_slice(),
                 "Phase 2 (reopen): value mismatch for committed key {:?}",
                 k
@@ -321,16 +324,17 @@ fuzz_target!(|ops: Vec<RecoveryOp>| {
         let mut status =
             cursor.get(&mut key_entry, &mut data, Get::First, None).unwrap();
         while status == OperationStatus::Success {
-            let (expected_key, expected_val) = oracle_iter
-                .next()
-                .expect("Phase 2: database has more records than oracle after reopen");
+            let (expected_key, expected_val) = oracle_iter.next().expect(
+                "Phase 2: database has more records than oracle after reopen",
+            );
             assert_eq!(
-                data.get_data().unwrap(),
+                data.data_opt().unwrap(),
                 expected_val.as_slice(),
                 "Phase 2: cursor value mismatch for key {:?}",
                 expected_key
             );
-            status = cursor.get(&mut key_entry, &mut data, Get::Next, None).unwrap();
+            status =
+                cursor.get(&mut key_entry, &mut data, Get::Next, None).unwrap();
         }
         assert!(
             oracle_iter.next().is_none(),

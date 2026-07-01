@@ -110,8 +110,8 @@ fn try_recover_and_scan(
             match cursor.get(&mut key, &mut val, noxu_db::Get::Next, None) {
                 Ok(OperationStatus::Success) => {
                     map.insert(
-                        key.get_data().unwrap_or(&[]).to_vec(),
-                        val.get_data().unwrap_or(&[]).to_vec(),
+                        key.data_opt().unwrap_or(&[]).to_vec(),
+                        val.data_opt().unwrap_or(&[]).to_vec(),
                     );
                 }
                 Ok(_) => break,

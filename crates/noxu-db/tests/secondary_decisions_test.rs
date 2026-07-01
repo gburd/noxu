@@ -35,7 +35,7 @@ impl SecondaryKeyCreator for FirstByteCreator {
         data: &DatabaseEntry,
         result: &mut DatabaseEntry,
     ) -> bool {
-        if let Some(d) = data.get_data()
+        if let Some(d) = data.data_opt()
             && !d.is_empty()
         {
             result.set_data(&d[..1]);
@@ -137,13 +137,13 @@ fn d1b_secondary_dup_admits_multiple_primaries() {
         .get_search_key(&DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
         .unwrap();
     while st == OperationStatus::Success {
-        seen.push(p_key.get_data().unwrap().to_vec());
+        seen.push(p_key.data_opt().unwrap().to_vec());
         // Step to the next dup of the same sec_key, if any.
         st = cursor.get_next(&mut sec_key, &mut p_key, &mut data).unwrap();
         if st == OperationStatus::Success {
             // Stepping with `Get::Next` advances across keys too - stop
             // when we leave 'A'.
-            if sec_key.get_data() != Some(b"A".as_ref()) {
+            if sec_key.data_opt() != Some(b"A".as_ref()) {
                 break;
             }
         }
@@ -188,7 +188,7 @@ fn d1b_one_to_one_happy_path() {
         let mut data = DatabaseEntry::new();
         let st = sec.get_into(None, &key, &mut p_key, &mut data).unwrap();
         assert!(st);
-        assert_eq!(p_key.get_data().unwrap(), expected_pk);
+        assert_eq!(p_key.data_opt().unwrap(), expected_pk);
     }
 }
 
@@ -235,7 +235,7 @@ fn d1b_same_primary_idempotent_reinsert_ok() {
         .get_into(None, DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
         .unwrap();
     assert!(st);
-    assert_eq!(p_key.get_data().unwrap(), b"pk1");
+    assert_eq!(p_key.data_opt().unwrap(), b"pk1");
 }
 
 /// v1.6 sorted-dup secondaries (Decision 1B / audit C4): cursor
@@ -279,7 +279,7 @@ fn d1b_cursor_walks_all_duplicates_for_shared_sec_key() {
         .get_search_key(&DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
         .unwrap();
     assert_eq!(st, OperationStatus::Success);
-    let mut seen: Vec<Vec<u8>> = vec![p_key.get_data().unwrap().to_vec()];
+    let mut seen: Vec<Vec<u8>> = vec![p_key.data_opt().unwrap().to_vec()];
 
     loop {
         let s = cursor
@@ -289,11 +289,11 @@ fn d1b_cursor_walks_all_duplicates_for_shared_sec_key() {
             break;
         }
         assert_eq!(
-            sec_key.get_data().unwrap(),
+            sec_key.data_opt().unwrap(),
             b"A",
             "get_next_dup_full must stay on the original sec_key"
         );
-        seen.push(p_key.get_data().unwrap().to_vec());
+        seen.push(p_key.data_opt().unwrap().to_vec());
     }
     seen.sort();
     assert_eq!(
@@ -357,8 +357,8 @@ fn c3_primary_put_drives_registered_secondary() {
         .get_into(None, DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
         .unwrap();
     assert!(st);
-    assert_eq!(p_key.get_data().unwrap(), b"pk1");
-    assert_eq!(data.get_data().unwrap(), b"Apple");
+    assert_eq!(p_key.data_opt().unwrap(), b"pk1");
+    assert_eq!(data.data_opt().unwrap(), b"Apple");
 }
 
 /// Auto-maintenance participates in the caller's transaction:
@@ -479,7 +479,7 @@ fn c3_primary_delete_preserves_other_dups() {
         .get_into(None, DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
         .unwrap();
     assert!(st);
-    assert_eq!(p_key.get_data().unwrap(), b"pk2");
+    assert_eq!(p_key.data_opt().unwrap(), b"pk2");
 }
 
 /// v1.6 (audit C3 / step 6): updating an existing primary record so
@@ -523,8 +523,8 @@ fn c3_primary_update_swaps_secondary_key() {
         .get_into(None, DatabaseEntry::from_bytes(b"P"), &mut p_key, &mut data)
         .unwrap();
     assert!(st);
-    assert_eq!(p_key.get_data().unwrap(), b"pk1");
-    assert_eq!(data.get_data().unwrap(), b"Pineapple");
+    assert_eq!(p_key.data_opt().unwrap(), b"pk1");
+    assert_eq!(data.data_opt().unwrap(), b"Pineapple");
 
     // Exactly one row in the index.
     assert_eq!(sec.count().unwrap(), 1);
@@ -558,8 +558,8 @@ fn c3_primary_update_same_sec_key_is_idempotent() {
         .get_into(None, DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
         .unwrap();
     assert!(st);
-    assert_eq!(p_key.get_data().unwrap(), b"pk1");
-    assert_eq!(data.get_data().unwrap(), b"Avocado");
+    assert_eq!(p_key.data_opt().unwrap(), b"pk1");
+    assert_eq!(data.data_opt().unwrap(), b"Avocado");
 }
 
 /// Multi-key creator with auto-maintenance: a primary record whose
@@ -581,7 +581,7 @@ fn c3_multi_key_creator_auto_maintained_on_put_and_update() {
             data: &DatabaseEntry,
             results: &mut Vec<DatabaseEntry>,
         ) {
-            if let Some(d) = data.get_data() {
+            if let Some(d) = data.data_opt() {
                 for b in d {
                     results.push(DatabaseEntry::from_bytes(&[*b]));
                 }
@@ -618,7 +618,7 @@ fn c3_multi_key_creator_auto_maintained_on_put_and_update() {
             )
             .unwrap();
         assert!(st);
-        assert_eq!(p_key.get_data().unwrap(), b"pk1");
+        assert_eq!(p_key.data_opt().unwrap(), b"pk1");
     }
 
     // Update (data set goes A,B → B,C).
@@ -648,7 +648,7 @@ fn c3_multi_key_creator_auto_maintained_on_put_and_update() {
             )
             .unwrap();
         assert!(st);
-        assert_eq!(p_key.get_data().unwrap(), b"pk1");
+        assert_eq!(p_key.data_opt().unwrap(), b"pk1");
     }
 
     // Delete fans out to all three sec keys produced by the current data.
@@ -784,7 +784,7 @@ fn d2c_foreign_key_nullify_runtime_unsupported() {
     let mut child_data = DatabaseEntry::new();
     let st = primary.lock().get_into(None, &pk, &mut child_data).unwrap();
     assert!(st);
-    assert_eq!(child_data.get_data().unwrap(), b"_");
+    assert_eq!(child_data.data_opt().unwrap(), b"_");
 }
 
 /// FK Abort happy path: deleting a foreign primary record that is
@@ -890,7 +890,7 @@ fn fk_nullify_multi_key_nullifier_path() {
             data: &DatabaseEntry,
             results: &mut Vec<DatabaseEntry>,
         ) {
-            if let Some(d) = data.get_data() {
+            if let Some(d) = data.data_opt() {
                 for b in d {
                     results.push(DatabaseEntry::from_bytes(&[*b]));
                 }
@@ -907,12 +907,12 @@ fn fk_nullify_multi_key_nullifier_path() {
             data: &mut DatabaseEntry,
             secondary_key: &DatabaseEntry,
         ) -> bool {
-            let target = secondary_key.get_data().unwrap_or(&[]);
+            let target = secondary_key.data_opt().unwrap_or(&[]);
             if target.is_empty() {
                 return false;
             }
             let stripped: Vec<u8> = data
-                .get_data()
+                .data_opt()
                 .unwrap_or(&[])
                 .iter()
                 .copied()
@@ -959,7 +959,7 @@ fn fk_nullify_multi_key_nullifier_path() {
     foreign.lock().delete(&fk_a).unwrap();
     let mut child = DatabaseEntry::new();
     primary.lock().get_into(None, &pk1, &mut child).unwrap();
-    assert_eq!(child.get_data().unwrap(), b"BC");
+    assert_eq!(child.data_opt().unwrap(), b"BC");
 }
 
 /// FK Cascade transitive: deleting a record in the root foreign
@@ -1200,7 +1200,7 @@ fn s4h_commit_persists_primary_and_secondary() {
     let mut data = DatabaseEntry::new();
     let pri_status = primary.lock().get_into(None, &pk1, &mut data).unwrap();
     assert!(pri_status);
-    assert_eq!(data.get_data().unwrap(), b"Apple");
+    assert_eq!(data.data_opt().unwrap(), b"Apple");
 
     // Secondary survives and points at the right primary.
     let mut p_key = DatabaseEntry::new();
@@ -1209,8 +1209,8 @@ fn s4h_commit_persists_primary_and_secondary() {
         .get_into(None, DatabaseEntry::from_bytes(b"A"), &mut p_key, &mut data)
         .unwrap();
     assert!(sec_status);
-    assert_eq!(p_key.get_data().unwrap(), b"pk1");
-    assert_eq!(data.get_data().unwrap(), b"Apple");
+    assert_eq!(p_key.data_opt().unwrap(), b"pk1");
+    assert_eq!(data.data_opt().unwrap(), b"Apple");
 }
 
 /// Idempotent re-insert of the same `(sec_key, pri_key)` pair under the
@@ -1352,7 +1352,7 @@ fn wave1b_cursor_delete_cascade_rolls_back_on_abort() {
             )
             .unwrap();
         assert!(st);
-        assert_eq!(p_key.get_data().unwrap(), b"pk1");
+        assert_eq!(p_key.data_opt().unwrap(), b"pk1");
     }
 
     // Open a cursor under a txn, position on the secondary entry,
@@ -1411,7 +1411,7 @@ fn wave1b_cursor_delete_cascade_rolls_back_on_abort() {
          (Wave 1B: pre-fix the cascade auto-committed and \
          destroyed the primary irrespective of the abort)"
     );
-    assert_eq!(data.get_data().unwrap(), b"Apple");
+    assert_eq!(data.data_opt().unwrap(), b"Apple");
 
     // Secondary entry is back.
     let mut p_key = DatabaseEntry::new();
@@ -1425,8 +1425,8 @@ fn wave1b_cursor_delete_cascade_rolls_back_on_abort() {
          (Wave 1B: pre-fix the cascade auto-committed and \
          destroyed the secondary irrespective of the abort)"
     );
-    assert_eq!(p_key.get_data().unwrap(), b"pk1");
-    assert_eq!(data.get_data().unwrap(), b"Apple");
+    assert_eq!(p_key.data_opt().unwrap(), b"pk1");
+    assert_eq!(data.data_opt().unwrap(), b"Apple");
 }
 
 /// Same cascade flow but committing the txn must persist the deletes
@@ -1482,7 +1482,7 @@ fn wave1b_cursor_delete_cascade_commits_both_sides() {
     let mut data = DatabaseEntry::new();
     let pri_status = primary.lock().get_into(None, &pk2, &mut data).unwrap();
     assert!(pri_status);
-    assert_eq!(data.get_data().unwrap(), b"Banana");
+    assert_eq!(data.data_opt().unwrap(), b"Banana");
 
     let mut p_key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
@@ -1490,7 +1490,7 @@ fn wave1b_cursor_delete_cascade_commits_both_sides() {
         .get_into(None, DatabaseEntry::from_bytes(b"B"), &mut p_key, &mut data)
         .unwrap();
     assert!(sec_status);
-    assert_eq!(p_key.get_data().unwrap(), b"pk2");
+    assert_eq!(p_key.data_opt().unwrap(), b"pk2");
 }
 
 /// While txn A holds an uncommitted `cursor.delete()`, an unrelated
@@ -1558,7 +1558,7 @@ fn wave1b_cursor_delete_uncommitted_cascade_invisible_to_others() {
         "after abort, the primary record must be intact for every \
          observer (Wave 1B / audit F5)"
     );
-    assert_eq!(data.get_data().unwrap(), b"Apple");
+    assert_eq!(data.data_opt().unwrap(), b"Apple");
 
     let mut p_key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
@@ -1570,8 +1570,8 @@ fn wave1b_cursor_delete_uncommitted_cascade_invisible_to_others() {
         "after abort, the secondary entry must be intact for every \
          observer (Wave 1B / audit F5)"
     );
-    assert_eq!(p_key.get_data().unwrap(), b"pk1");
-    assert_eq!(data.get_data().unwrap(), b"Apple");
+    assert_eq!(p_key.data_opt().unwrap(), b"pk1");
+    assert_eq!(data.data_opt().unwrap(), b"Apple");
 }
 
 /// Happy-path regression: the existing pattern of `open_cursor(None,
@@ -1742,7 +1742,7 @@ fn test_x10_secondary_abort_read_committed_no_torn_state() {
                 let mut data_entry = noxu_db::DatabaseEntry::new();
                 if let Ok(noxu_db::OperationStatus::Success) = cursor
                     .get_search_key(&sec_key_a, &mut pk_entry, &mut data_entry)
-                    && let Some(pri_bytes) = data_entry.get_data()
+                    && let Some(pri_bytes) = data_entry.data_opt()
                     && (pri_bytes.is_empty() || pri_bytes[0] != b'A')
                 {
                     // sec_key "A" resolved, but the atomically-fetched primary

@@ -44,29 +44,29 @@ fn database_entry_test_basic() {
 
     // Constructor that takes a byte array.
     let mut a = DatabaseEntry::from_bytes(&foo);
-    assert_eq!(foo.len(), a.get_size());
-    assert_eq!(foo.as_slice(), a.get_data().unwrap());
+    assert_eq!(foo.len(), a.len());
+    assert_eq!(foo.as_slice(), a.data_opt().unwrap());
 
     // Set the data to empty (JE: setData(null)).  Noxu has no Option,
     // but set_data(&[]) gives us the same observable state.
     a.set_data(&[]);
-    assert_eq!(0, a.get_size());
+    assert_eq!(0, a.len());
 
     // Constructor that sets the data later.
     let mut later = DatabaseEntry::new();
-    assert_eq!(0, later.get_size());
+    assert_eq!(0, later.len());
     later.set_data(&foo);
-    assert_eq!(foo.as_slice(), later.get_data().unwrap());
+    assert_eq!(foo.as_slice(), later.data_opt().unwrap());
 
     // Set offset, then reset data and offset should be reset.
     let mut off = DatabaseEntry::from_bytes(&foo);
     off.set_offset(1);
     off.set_size(1);
-    assert_eq!(1, off.get_offset());
-    assert_eq!(1, off.get_size());
+    assert_eq!(1, off.offset());
+    assert_eq!(1, off.len());
     off.set_data(&foo);
-    assert_eq!(0, off.get_offset());
-    assert_eq!(foo.len(), off.get_size());
+    assert_eq!(0, off.offset());
+    assert_eq!(foo.len(), off.len());
 }
 
 // ---------------------------------------------------------------------------
@@ -102,13 +102,13 @@ fn database_entry_test_offset() {
     assert_eq!(OperationStatus::Success, s);
 
     // Returned entries always start at offset 0 with size = stored payload.
-    assert_eq!(0, found_key.get_offset());
-    assert_eq!(0, found_data.get_offset());
-    assert_eq!(10, found_key.get_size());
-    assert_eq!(10, found_data.get_size());
+    assert_eq!(0, found_key.offset());
+    assert_eq!(0, found_data.offset());
+    assert_eq!(10, found_key.len());
+    assert_eq!(10, found_data.len());
 
-    let key_data = found_key.get_data().unwrap();
-    let val_data = found_data.get_data().unwrap();
+    let key_data = found_key.data_opt().unwrap();
+    let val_data = found_data.data_opt().unwrap();
     for i in 0..10 {
         assert_eq!((i + 10) as u8, key_data[i]);
         assert_eq!((i + 10) as u8, val_data[i]);

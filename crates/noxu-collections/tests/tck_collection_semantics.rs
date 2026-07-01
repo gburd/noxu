@@ -129,7 +129,10 @@ fn tck_collection_iterator_is_a_snapshot_of_construction_time() {
         map.put(None, &k, &(k * 10)).unwrap();
     }
 
-    let snapshot = map.iter(None).unwrap();
+    // `snapshot()` is the explicit eager, point-in-time view (review P1-7:
+    // `iter()` is now lazy and would observe the post-construction
+    // mutations; `snapshot()` is what guarantees construction-time state).
+    let snapshot = map.snapshot(None).unwrap();
 
     // Mutate after constructing the iterator.
     map.put(None, &6, &60).unwrap();

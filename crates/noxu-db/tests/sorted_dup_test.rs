@@ -42,7 +42,7 @@ fn test_put_get_single_dup() {
     let mut out = DatabaseEntry::new();
     let status = db.get_into(None, &key, &mut out).unwrap();
     assert!(status);
-    assert_eq!(out.get_data().unwrap(), b"val1");
+    assert_eq!(out.data_opt().unwrap(), b"val1");
 
     let _ = env.close();
 }
@@ -101,14 +101,14 @@ fn test_dup_sorted_order() {
     // Position at first dup for "alpha".
     let s = cursor.get(&mut kout, &mut dout, Get::Search, None).unwrap();
     assert_eq!(s, OperationStatus::Success);
-    assert_eq!(dout.get_data().unwrap(), b"a", "first dup should be 'a'");
+    assert_eq!(dout.data_opt().unwrap(), b"a", "first dup should be 'a'");
 
     // Advance through dups in order.
     cursor.get(&mut kout, &mut dout, Get::NextDup, None).unwrap();
-    assert_eq!(dout.get_data().unwrap(), b"b");
+    assert_eq!(dout.data_opt().unwrap(), b"b");
 
     cursor.get(&mut kout, &mut dout, Get::NextDup, None).unwrap();
-    assert_eq!(dout.get_data().unwrap(), b"c");
+    assert_eq!(dout.data_opt().unwrap(), b"c");
 
     // No more dups.
     let s = cursor.get(&mut kout, &mut dout, Get::NextDup, None).unwrap();
@@ -152,12 +152,12 @@ fn test_get_next_dup_stops_at_key_boundary() {
 
     // Position on key1/v1.
     cursor.get(&mut kout, &mut dout, Get::Search, None).unwrap();
-    assert_eq!(dout.get_data().unwrap(), b"v1");
+    assert_eq!(dout.data_opt().unwrap(), b"v1");
 
     // Advance to second dup of key1.
     let s = cursor.get(&mut kout, &mut dout, Get::NextDup, None).unwrap();
     assert_eq!(s, OperationStatus::Success);
-    assert_eq!(dout.get_data().unwrap(), b"v2");
+    assert_eq!(dout.data_opt().unwrap(), b"v2");
 
     // NextDup from key1/v2 should NOT return key2/v3.
     let s = cursor.get(&mut kout, &mut dout, Get::NextDup, None).unwrap();
@@ -194,14 +194,14 @@ fn test_get_next_no_dup_advances_to_next_key() {
 
     // Position on first entry of "aa".
     cursor.get(&mut kout, &mut dout, Get::First, None).unwrap();
-    assert_eq!(kout.get_data().unwrap(), b"aa");
-    assert_eq!(dout.get_data().unwrap(), b"d1");
+    assert_eq!(kout.data_opt().unwrap(), b"aa");
+    assert_eq!(dout.data_opt().unwrap(), b"d1");
 
     // NextNoDup should jump directly to "bb"/"e1".
     let s = cursor.get(&mut kout, &mut dout, Get::NextNoDup, None).unwrap();
     assert_eq!(s, OperationStatus::Success);
-    assert_eq!(kout.get_data().unwrap(), b"bb");
-    assert_eq!(dout.get_data().unwrap(), b"e1");
+    assert_eq!(kout.data_opt().unwrap(), b"bb");
+    assert_eq!(dout.data_opt().unwrap(), b"e1");
 
     cursor.close().unwrap();
     let _ = env.close();
@@ -245,9 +245,9 @@ fn test_dup_delete_specific_value() {
     );
 
     // The remaining values should be v1 and v3.
-    assert_eq!(dout2.get_data().unwrap(), b"v1");
+    assert_eq!(dout2.data_opt().unwrap(), b"v1");
     cursor2.get(&mut kout2, &mut dout2, Get::NextDup, None).unwrap();
-    assert_eq!(dout2.get_data().unwrap(), b"v3");
+    assert_eq!(dout2.data_opt().unwrap(), b"v3");
 
     cursor2.close().unwrap();
     let _ = env.close();
@@ -302,7 +302,7 @@ fn test_dup_cursor_txn_isolation() {
     let mut out = DatabaseEntry::new();
     let s = db.get_into(None, &key, &mut out).unwrap();
     assert!(s, "committed dup not visible");
-    assert_eq!(out.get_data().unwrap(), b"v1");
+    assert_eq!(out.data_opt().unwrap(), b"v1");
 
     let _ = env.close();
 }
@@ -342,8 +342,8 @@ fn test_dup_database_recovery() {
 
         let s = cursor.get(&mut kout, &mut dout, Get::First, None).unwrap();
         assert_eq!(s, OperationStatus::Success, "first entry after recovery");
-        assert_eq!(kout.get_data().unwrap(), b"rk");
-        assert_eq!(dout.get_data().unwrap(), b"a");
+        assert_eq!(kout.data_opt().unwrap(), b"rk");
+        assert_eq!(dout.data_opt().unwrap(), b"a");
 
         assert_eq!(cursor.count().unwrap(), 4, "all 4 dups survive recovery");
 
@@ -376,14 +376,14 @@ fn test_get_prev_dup() {
 
     // Position on last dup "z".
     cursor.get(&mut kout, &mut dout, Get::Last, None).unwrap();
-    assert_eq!(dout.get_data().unwrap(), b"z");
+    assert_eq!(dout.data_opt().unwrap(), b"z");
 
     // PrevDup should give "y" then "x".
     cursor.get(&mut kout, &mut dout, Get::PrevDup, None).unwrap();
-    assert_eq!(dout.get_data().unwrap(), b"y");
+    assert_eq!(dout.data_opt().unwrap(), b"y");
 
     cursor.get(&mut kout, &mut dout, Get::PrevDup, None).unwrap();
-    assert_eq!(dout.get_data().unwrap(), b"x");
+    assert_eq!(dout.data_opt().unwrap(), b"x");
 
     // No more dups backward.
     let s = cursor.get(&mut kout, &mut dout, Get::PrevDup, None).unwrap();

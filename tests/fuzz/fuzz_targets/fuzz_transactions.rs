@@ -15,7 +15,8 @@ use libfuzzer_sys::fuzz_target;
 
 use arbitrary::Arbitrary;
 use noxu_db::{
-    DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig, OperationStatus,
+    DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
+    OperationStatus,
 };
 use std::collections::HashMap;
 
@@ -55,7 +56,9 @@ fn make_key(k: u8) -> Vec<u8> {
 }
 
 impl<'a> Arbitrary<'a> for TxnOp {
-    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+    fn arbitrary(
+        u: &mut arbitrary::Unstructured<'a>,
+    ) -> arbitrary::Result<Self> {
         let choice: u8 = u.int_in_range(0..=8)?;
         match choice {
             0 => {
@@ -161,7 +164,7 @@ fuzz_target!(|ops: Vec<TxnOp>| {
                             k
                         );
                         assert_eq!(
-                            data.get_data().unwrap(),
+                            data.data_opt().unwrap(),
                             expected.as_slice(),
                             "Value mismatch for key {:?}",
                             k
@@ -189,13 +192,15 @@ fuzz_target!(|ops: Vec<TxnOp>| {
                     let key_entry = DatabaseEntry::from_bytes(&k);
                     let val_entry = DatabaseEntry::from_bytes(value);
                     // Write under the transaction.
-                    let status = db.put(Some(&txn), &key_entry, &val_entry).unwrap();
+                    let status =
+                        db.put(Some(&txn), &key_entry, &val_entry).unwrap();
                     assert_eq!(status, OperationStatus::Success);
                     txn.commit().unwrap();
 
                     // After commit the data must be readable.
                     let mut data = DatabaseEntry::new();
-                    let read_status = db.get(None, &key_entry, &mut data).unwrap();
+                    let read_status =
+                        db.get(None, &key_entry, &mut data).unwrap();
                     assert_eq!(
                         read_status,
                         OperationStatus::Success,
@@ -203,7 +208,7 @@ fuzz_target!(|ops: Vec<TxnOp>| {
                         k
                     );
                     assert_eq!(
-                        data.get_data().unwrap(),
+                        data.data_opt().unwrap(),
                         value.as_slice(),
                         "Committed put value mismatch for key {:?}",
                         k
@@ -237,7 +242,8 @@ fuzz_target!(|ops: Vec<TxnOp>| {
 
                     // After abort the visible state must equal pre-abort state.
                     let mut data = DatabaseEntry::new();
-                    let read_status = db.get(None, &key_entry, &mut data).unwrap();
+                    let read_status =
+                        db.get(None, &key_entry, &mut data).unwrap();
                     match pre_abort_value {
                         Some(ref expected) => {
                             // Key existed before; aborted write must not change it.
@@ -248,7 +254,7 @@ fuzz_target!(|ops: Vec<TxnOp>| {
                                 k
                             );
                             assert_eq!(
-                                data.get_data().unwrap(),
+                                data.data_opt().unwrap(),
                                 expected.as_slice(),
                                 "Aborted put changed existing value for key {:?}",
                                 k
@@ -289,7 +295,8 @@ fuzz_target!(|ops: Vec<TxnOp>| {
 
                     // After commit the key must be absent.
                     let mut data = DatabaseEntry::new();
-                    let read_status = db.get(None, &key_entry, &mut data).unwrap();
+                    let read_status =
+                        db.get(None, &key_entry, &mut data).unwrap();
                     assert_eq!(
                         read_status,
                         OperationStatus::NotFound,
@@ -325,7 +332,8 @@ fuzz_target!(|ops: Vec<TxnOp>| {
 
                     // Visibility must be unchanged.
                     let mut data = DatabaseEntry::new();
-                    let read_status = db.get(None, &key_entry, &mut data).unwrap();
+                    let read_status =
+                        db.get(None, &key_entry, &mut data).unwrap();
                     match pre_abort_value {
                         Some(ref expected) => {
                             assert_eq!(
@@ -335,7 +343,7 @@ fuzz_target!(|ops: Vec<TxnOp>| {
                                 k
                             );
                             assert_eq!(
-                                data.get_data().unwrap(),
+                                data.data_opt().unwrap(),
                                 expected.as_slice(),
                                 "Aborted delete changed value for key {:?}",
                                 k
@@ -387,7 +395,7 @@ fuzz_target!(|ops: Vec<TxnOp>| {
             k
         );
         assert_eq!(
-            data.get_data().unwrap(),
+            data.data_opt().unwrap(),
             v.as_slice(),
             "Final check: value mismatch for committed key {:?}",
             k
