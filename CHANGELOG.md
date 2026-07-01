@@ -17,6 +17,17 @@ listed in [References](#references).
 
 ### Added
 
+- **`exception_listener` daemon-error callback (`noxu-config` + `noxu-dbi` +
+  `noxu-db`).** A faithful analogue of JE `ExceptionListener`: register a
+  callback on `EnvironmentConfig::with_exception_listener`, and when a
+  background daemon (checkpointer / cleaner / log-flusher) hits a recoverable
+  error — previously silently swallowed — the listener's
+  `exception_event(&ExceptionEvent)` fires with the daemon source, the error
+  message, and the OS thread name. Wired through a new
+  `noxu_config::ExceptionDispatcher` shared into each daemon at spawn and
+  installed by `Environment::open` before any daemon does work; a no-op (zero
+  cost) when no listener is registered. JE ref:
+  `com.sleepycat.je.ExceptionListener`, `EnvironmentImpl` daemon catch blocks.
 - **`env_check_leaks` lock-leak detection at close (`noxu-txn` + `noxu-db`).**
   At `Environment::close`, when `env_check_leaks` is `true` (the default),
   Noxu walks the active lock table (new `LockManager::report_leaked_locks`)

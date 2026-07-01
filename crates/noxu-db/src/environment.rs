@@ -427,6 +427,44 @@ impl Environment {
         let env_impl = EnvironmentImpl::from_dbi_config(home.clone(), &dbi_cfg)
             .map_err(|e| NoxuError::environment(e.to_string()))?;
 
+        // exception_listener (JE ExceptionListener): if the application
+        // registered a listener, install a daemon exception sink that adapts
+        // the daemon's (source, message) callback into the public
+        // `ExceptionEvent`.  Installed here — before any daemon performs work
+        // (each daemon sleeps its wakeup interval first) — so no async daemon
+        // failure is missed.  Without a listener the sink is never installed
+        // and dispatch is a no-op.
+        if let Some(listener) = config.exception_listener() {
+            env_impl.set_exception_sink(std::sync::Arc::new(
+                move |source: &str, message: &str| {
+                    let src = match source {
+                        "Checkpointer" => {
+                            crate::error::ExceptionSource::Checkpointer
+                        }
+                        "Cleaner" => crate::error::ExceptionSource::Cleaner,
+                        "Evictor" => crate::error::ExceptionSource::Evictor,
+                        "INCompressor" => {
+                            crate::error::ExceptionSource::INCompressor
+                        }
+                        "Verifier" => crate::error::ExceptionSource::Verifier,
+                        other => crate::error::ExceptionSource::Unknown(
+                            other.to_string(),
+                        ),
+                    };
+                    let thread_name = std::thread::current()
+                        .name()
+                        .unwrap_or("<unnamed>")
+                        .to_string();
+                    let event = crate::error::ExceptionEvent::new(
+                        message.to_string(),
+                        src,
+                        thread_name,
+                    );
+                    listener.exception_event(&event);
+                },
+            ));
+        }
+
         let log_manager = env_impl.get_log_manager();
         let env_impl_arc = Arc::new(Mutex::new(env_impl));
 
@@ -1870,6 +1908,74 @@ mod tests {
                 env_impl.get_lock_manager().report_leaked_locks().is_empty(),
                 "a freshly opened env must have no leaked locks"
             );
+        }
+        env.close().unwrap();
+    }
+
+    // exception_listener (JE ExceptionListener)
+    #[test]
+    fn test_exception_listener_fires_on_daemon_error() {
+        use crate::error::{
+            ExceptionEvent, ExceptionListener, ExceptionSource,
+        };
+        use std::sync::Arc as StdArc;
+        use std::sync::Mutex as StdMutex;
+
+        // A listener that records every event it receives.
+        #[derive(Default)]
+        struct Recorder {
+            events: StdMutex<Vec<ExceptionEvent>>,
+        }
+        impl ExceptionListener for Recorder {
+            fn exception_event(&self, event: &ExceptionEvent) {
+                self.events.lock().unwrap().push(event.clone());
+            }
+        }
+
+        let recorder = StdArc::new(Recorder::default());
+        let (_temp_dir, config) = temp_env_config();
+        let config = config.with_exception_listener(recorder.clone());
+        let env = Environment::open(config).unwrap();
+
+        // Drive the SAME dispatch path a background daemon uses when its
+        // do_checkpoint()/do_clean() returns an error.  This exercises the
+        // full production wiring: config listener -> set_exception_sink ->
+        // ExceptionDispatcher::dispatch -> adapter -> ExceptionListener.
+        {
+            let env_impl = env.env_impl.lock();
+            let d = env_impl.exception_dispatcher();
+            assert!(
+                d.is_installed(),
+                "the registered listener must install a daemon sink"
+            );
+            d.dispatch("Cleaner", "simulated background cleaner failure");
+            d.dispatch("Checkpointer", "simulated checkpoint failure");
+        }
+
+        let events = recorder.events.lock().unwrap();
+        assert_eq!(events.len(), 2, "listener must receive both daemon errors");
+        assert_eq!(events[0].source, ExceptionSource::Cleaner);
+        assert!(events[0].message.contains("cleaner failure"));
+        assert_eq!(events[1].source, ExceptionSource::Checkpointer);
+        assert!(events[1].message.contains("checkpoint failure"));
+        drop(events);
+
+        env.close().unwrap();
+    }
+
+    #[test]
+    fn test_no_exception_listener_leaves_sink_uninstalled() {
+        let (_temp_dir, config) = temp_env_config();
+        // No listener registered (the default).
+        let env = Environment::open(config).unwrap();
+        {
+            let env_impl = env.env_impl.lock();
+            assert!(
+                !env_impl.exception_dispatcher().is_installed(),
+                "no listener means no sink installed; dispatch is a no-op"
+            );
+            // dispatch must be a safe no-op with no sink.
+            env_impl.exception_dispatcher().dispatch("Cleaner", "ignored");
         }
         env.close().unwrap();
     }
