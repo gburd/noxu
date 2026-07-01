@@ -561,3 +561,63 @@ feeder-source trait; the in-memory queue is just a second, non-durable
 **JE refs**: `rep/stream/{FeederSource,MasterFeederSource,FeederReader}.java`,
 `rep/impl/node/{Feeder,FeederManager}.java`.
 **Proof**: `crates/noxu-rep/tests/chained_replication_test.rs`.
+
+## 15. SHARED_CACHE via a process-global shared evictor singleton (7.1)
+
+**Decision**: When an `Environment` opens with `shared_cache = true` it joins a
+single **process-global** shared evictor keyed by nothing — one global per
+process — rather than a per-key or per-directory pool.
+
+**Why a process-global singleton (matching JE)**: JE's `SharedEvictor` is
+exactly this: one instance per JVM, shared by every `Environment` that sets
+`setSharedCache(true)`, with one shared `MemoryBudget`. The whole point of a
+shared cache is to bound *total* multi-environment memory to one budget, so
+there is by design one budget and one LRU across all sharing envs. Keying the
+singleton (e.g. by a pool name) would break that: two "pools" would each get
+their own budget and the sum could again exceed the intended ceiling.
+
+**Why it maps cleanly onto the existing evictor**: the EVICTOR-RECLAIM-1 work
+already made the `Evictor` (a) walk every tree in a shared `db_trees_registry`
+and (b) enforce one budget via the `Arbiter` reading one `cache_usage`
+`AtomicI64`. A shared cache is therefore just: **all sharing envs point their
+tree memory counter, their evictor `Arc`, and their tree registry at the SAME
+three shared objects.** No new eviction algorithm, no second code path — the
+same `do_evict` loop that reclaims across one env's databases reclaims across
+all sharing envs' databases.
+
+**The one budget is the first joiner's** (`SharedCacheParams` is read only when
+the singleton is created). This matches JE, where the shared `MemoryBudget` is
+sized from the first shared-cache environment's `EnvironmentConfig`; later
+joiners' `cache_size` is ignored for the shared budget.
+
+**Close-safety (no dangling trees)**: the tricky part of a process-global
+singleton touched by multiple envs on multiple threads is that a *closing* env
+must not leave its (about-to-be-freed) trees in the global LRU. On
+`close`/`Drop` the env's `SharedEvictorHandle::deregister` removes exactly that
+env's trees from the shared registry **before** the env's tree `Arc`s drop, and
+a shared env calls `deregister` (not `evictor.shutdown()`) so the shared daemon
+keeps serving the other members. A concurrent eviction scan snapshots the tree
+`Arc`s under the registry lock (`Evictor::candidate_trees`), so a scan already
+in flight holds strong references and never touches a freed node; the *next*
+scan simply no longer sees the closed env's trees. The shared evictor + its
+single daemon tear down when the last member deregisters, so the singleton is
+**resettable** — a later env re-creates a fresh one.
+
+**Test-isolation hazard + mitigation**: a process-global singleton otherwise
+leaks state across tests in the same binary. Two things bound it: (1) the
+singleton is fully torn down when the last member closes (so a well-behaved
+test that closes its envs leaves a clean slate), and (2) a `#[doc(hidden)]`
+`SharedEvictorHandle::reset_for_test` hook force-resets it, which the headline
+test calls at start.
+
+**Where**: `crates/noxu-evictor/src/shared.rs` (`SharedEvictorHandle`,
+`SharedCacheParams`), wired in `crates/noxu-dbi/src/environment_impl.rs`
+(`EnvironmentImpl::new` join, `open_database_inner` tree mirror,
+`close`/`Drop` deregister) and `crates/noxu-db/src/environment.rs` (config
+threading).
+**JE refs**: `evictor/SharedEvictor.java`, `evictor/Evictor.java`,
+`dbi/MemoryBudget.java` (shared), `EnvironmentConfig.setSharedCache`,
+`dbi/EnvironmentImpl.getEvictor`.
+**Proof**: `crates/noxu-db/tests/shared_cache_test.rs` (budget balancing +
+close-safety), `crates/noxu-evictor/tests/shuttle_shared_cache.rs` (DST shuttle
+register/deregister/scan interleavings).

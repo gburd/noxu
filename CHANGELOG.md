@@ -72,6 +72,46 @@ listed in [References](#references).
   fails-all-waiters) and the crash-recovery gates stay green. Default build is
   byte-identical.
 
+### Added (SHARED_CACHE cross-environment cache balancing — 7.1)
+
+- **`SHARED_CACHE` is now wired — cross-environment cache-budget balancing
+  (`feat(evictor,dbi,db)`).** The `noxu.sharedCache` parameter
+  (`EnvironmentConfig::with_shared_cache(true)`) was previously accepted but
+  inert: every `Environment` in a process got its own cache + memory budget.
+  Multiple environments opened with `shared_cache = true` now join a
+  **process-global shared evictor** — a faithful port of JE
+  `com.sleepycat.je.evictor.SharedEvictor` + the shared `MemoryBudget`
+  (`EnvironmentConfig.setSharedCache`). All sharing envs share ONE
+  `Arc<Evictor>`, ONE memory budget (sized from the **first** joining env's
+  `cache_size`, JE-faithful), and ONE global LRU spanning every registered
+  env's B-trees; eviction picks victims across **all** sharing envs, so total
+  resident memory stays bounded by the ONE shared budget instead of the sum of
+  the per-env budgets. Implemented on top of the existing EVICTOR-RECLAIM-1
+  multi-tree infrastructure: the shared evictor already walks every tree in a
+  shared `db_trees_registry` and enforces one budget via the `Arbiter` reading
+  one `cache_usage` counter, so a shared cache is just all sharing envs
+  pointing at the same three shared `Arc`s. On `Environment::close`/`Drop` the
+  env **deregisters** its trees from the shared LRU **before** they drop (no
+  dangling trees / use-after-close), and the shared evictor + its single
+  daemon tear down when the last member leaves (resettable, with a
+  `SharedEvictorHandle::reset_for_test` hook to bound process-global
+  test-isolation leakage). **`shared_cache = false` (the default) is entirely
+  unchanged**: a private per-env evictor + arbiter + budget counter + daemon,
+  exactly as before — the existing `eviction_pressure_test` and
+  `evictor_reclaim_multitree_test` stay green. New process-global singleton
+  lives in `crates/noxu-evictor/src/shared.rs` (`SharedEvictorHandle`,
+  `SharedCacheParams`). Headline test
+  `crates/noxu-db/tests/shared_cache_test.rs` opens two shared-cache envs,
+  loads ~2x the ONE budget across both, and proves total resident stays ~=
+  one budget (not the sum), the first joiner's budget wins, eviction spans
+  both envs, both envs' data re-fetches, and after closing one env the
+  survivor keeps reading + writing + evicting. DST shuttle coverage of the
+  register/deregister/scan interleavings (no use-after-close, no lost
+  deregistration): `crates/noxu-evictor/tests/shuttle_shared_cache.rs`
+  (`--cfg noxu_shuttle`, 5000 interleavings each). JE ref:
+  `evictor/SharedEvictor.java`, `dbi/MemoryBudget.java` (shared),
+  `EnvironmentConfig.setSharedCache`.
+
 ### Added (DST wave 2 — shuttle safety oracle + lock_manager coverage)
 
 - **`FsyncManager` shuttle safety oracle is now a green gate** (was

@@ -28,5 +28,11 @@ lru = "0.16"
 [dev-dependencies]
 tempfile = "3"
 
+# DST shuttle coverage for the SHARED_CACHE register/deregister/evict
+# interleavings: only in the graph under `--cfg noxu_shuttle`.  Default
+# builds and `cargo test` never pull shuttle in.
+[target.'cfg(noxu_shuttle)'.dev-dependencies]
+shuttle = { workspace = true }
+
 [lints]
 workspace = true

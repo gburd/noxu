@@ -50,6 +50,12 @@ pub struct DbiEnvConfig {
     /// Maximum B-tree cache size in bytes.
     pub cache_size: u64,
     pub cache_percent: u32,
+    /// SHARED_CACHE: when true, this environment joins the process-global
+    /// shared cache (one memory budget + one evictor across all sharing
+    /// environments) instead of getting a private cache.  JE
+    /// `EnvironmentConfig.setSharedCache(true)` → process-global
+    /// `SharedEvictor`.  Default false (private cache, unchanged behaviour).
+    pub shared_cache: bool,
     pub max_off_heap_memory: u64,
     pub max_disk: u64,
     pub free_disk: u64,
@@ -249,6 +255,7 @@ impl Default for DbiEnvConfig {
             // Memory
             cache_size: 64 * 1024 * 1024,
             cache_percent: 0,
+            shared_cache: false,
             max_off_heap_memory: 0,
             max_disk: 0,
             free_disk: 5 * 1024 * 1024 * 1024,
