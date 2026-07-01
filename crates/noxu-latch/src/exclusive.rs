@@ -68,6 +68,8 @@ impl ExclusiveLatch {
         // L-3: record the acquisition for the debug-build latch-ordering
         // assertion (no-op in release builds and for rank-0 latches).
         crate::latch_order::enter(self.context.rank, &self.context.name);
+        // JE ENV_FORCED_YIELD: test-only fairness stress (no-op unless set).
+        crate::config::maybe_yield();
         Ok(ExclusiveLatchGuard { latch: self, _guard: guard })
     }
 
@@ -92,6 +94,7 @@ impl ExclusiveLatch {
         self.inner.try_lock().map(|guard| {
             self.owner.store(current, Ordering::Relaxed);
             crate::latch_order::enter(self.context.rank, &self.context.name);
+            crate::config::maybe_yield();
             ExclusiveLatchGuard { latch: self, _guard: guard }
         })
     }
@@ -158,6 +161,8 @@ impl Drop for ExclusiveLatchGuard<'_> {
     fn drop(&mut self) {
         crate::latch_order::leave(self.latch.context.rank);
         self.latch.owner.store(0, Ordering::Relaxed);
+        // JE ENV_FORCED_YIELD: yield on release too (no-op unless set).
+        crate::config::maybe_yield();
     }
 }
 

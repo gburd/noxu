@@ -164,33 +164,43 @@ pub struct EnvironmentConfig {
     /// Mirrors `ENV_CHECK_LEAKS` / default true.
     pub env_check_leaks: bool,
 
-    /// Force thread yields in critical sections (useful for testing fairness).
+    /// Force thread yields at latch acquire/release points (a test-only
+    /// fairness-stress knob that helps shake out latch-ordering races).
     ///
-    /// **Reserved / not yet implemented as of v3.1.** Setting a non-default
-    /// value (true) has no effect and emits a `WARN` log at
-    /// `Environment::open` time.
+    /// **Implemented (7.1).** When `true`, `noxu-latch` injects
+    /// `std::thread::yield_now()` after each latch grant and on each latch
+    /// release; when `false` (the default) the injection point is a single
+    /// relaxed atomic load, so it is effectively free.  Wired via
+    /// `noxu_latch::configure` at `Environment::open`.
     ///
-    /// Mirrors `ENV_FORCED_YIELD` / default false.
+    /// Mirrors JE `ENV_FORCED_YIELD` / default false.
     pub env_forced_yield: bool,
 
     /// Use fair (FIFO-ordered) latches.  May reduce throughput under low
     /// contention but prevents starvation.
     ///
-    /// **Reserved / not yet implemented as of v3.1.** Setting a non-default
-    /// value (true) has no effect and emits a `WARN` log at
-    /// `Environment::open` time.
+    /// **Reserved / not implemented.** Setting a non-default value (true) has
+    /// no effect and emits a `WARN` log at `Environment::open` time.  Noxu's
+    /// latches are backed by `noxu-sync`'s futex primitives, which are
+    /// fundamentally non-fair and have no FIFO wait queue to toggle; a
+    /// faithful fair-latch mode is a dedicated latch rewrite (a ticket/FIFO
+    /// queue in `noxu-sync`), tracked separately.
     ///
-    /// Mirrors `ENV_FAIR_LATCHES` / default false.
+    /// Mirrors JE `ENV_FAIR_LATCHES` (`setFairLatches`) / default false.
     pub env_fair_latches: bool,
 
-    /// Latch acquisition timeout in milliseconds.  0 = no timeout (block
-    /// indefinitely).  In JE, a timeout causes `EnvironmentFailure`.
+    /// Latch acquisition timeout in milliseconds.  0 = no timeout (block until
+    /// acquired).  A non-zero timeout turns a latch deadlock — which would
+    /// otherwise hang — into a diagnosable `LatchTimeout` error.
     ///
-    /// **Reserved / not yet implemented as of v3.1.** Setting a non-default
-    /// value (non-zero) has no effect and emits a `WARN` log at
-    /// `Environment::open` time.  The latch layer always blocks indefinitely.
+    /// **Implemented (7.1).** Wired into `noxu-latch`'s exclusive and shared
+    /// acquire paths via `noxu_latch::configure` at `Environment::open`.  The
+    /// default `300_000` (5 min) is treated as "unset" — leaving it unchanged
+    /// preserves the historical latch behaviour byte-for-byte; setting any
+    /// other value opts in to that timeout (and `0` means block until
+    /// acquired).
     ///
-    /// Mirrors `ENV_LATCH_TIMEOUT` / default 300_000 ms (5 min).
+    /// Mirrors JE `ENV_LATCH_TIMEOUT` / default 300_000 ms (5 min).
     pub env_latch_timeout_ms: u64,
 
     /// TTL clock tolerance — records within this many milliseconds of their
