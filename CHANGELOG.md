@@ -15,6 +15,32 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Deprecated
+
+- **Moot `EnvironmentConfig` knobs deprecated (7.1, non-breaking).** A set of
+  config knobs that configure features Noxu deliberately does not have are now
+  `#[deprecated]` on their public setters (they still compile; they will be
+  removed in 8.0):
+  - `adler32_chunk_size` — Noxu uses CRC32 (crc32fast, CLMUL-accelerated) for
+    on-disk integrity, never Adler32 (weak on short messages). This knob
+    configures a checksum Noxu does not use.
+    See `docs/src/internal/checksum-selection.md`.
+  - The JE-style logging/tracing knobs — `logging_level`,
+    `console_logging_level`, `file_logging_level`, `trace_console`, `trace_db`,
+    `trace_file`, `trace_level`, `trace_file_count`, `trace_file_limit_bytes`,
+    and the per-subsystem `trace_level_lock_manager` / `_recovery` / `_evictor`
+    / `_cleaner`. Noxu routes ALL diagnostics through the Rust `log` crate /
+    `noxu-observe` / `RUST_LOG`; a second logging system would be redundant.
+    Configure logging via `RUST_LOG` or the `log` facade.
+  - `env_dup_convert_preload_all` — configures the JE 4→5 duplicate-DB on-disk
+    conversion, N/A to Noxu's native `.ndb` format (no legacy dup format to
+    convert). Marked deprecated-moot in its rustdoc (no setter to attribute).
+
+  These knobs were also removed from the `unimplemented_params` WARN registry:
+  a deprecated-moot knob announces itself at compile time via `#[deprecated]`
+  rather than pretending to be a real-but-unimplemented parameter that emits a
+  runtime `warn!`.
+
 ### Added (7.1 cleaner completions)
 
 - **CLN-14: cleaner → checkpointer `wakeupAfterNoWrites` wiring

@@ -80,6 +80,13 @@ pub static UNIMPLEMENTED_ENV_PARAMS: &[UnimplementedParam] = &[
     // fields have a setter+field but ZERO runtime read sites.  They are
     // accepted-but-inert and warned here so a non-default setting is never a
     // silent no-op.  See docs/src/operations/known-limitations.md.
+    //
+    // NOTE (7.1): `env_dup_convert_preload_all` and `adler32_chunk_size` were
+    // removed from this registry — they are not "real-but-unimplemented"
+    // knobs, they are DEPRECATED and MOOT (JE 4→5 dup conversion is N/A to the
+    // native .ndb format; Noxu uses CRC32, never Adler32).  A deprecated-moot
+    // knob announces itself via `#[deprecated]` on its setter, not a runtime
+    // WARN.  See the field rustdoc in environment_config.rs.
     // ---------------------------------------------------------------------
     UnimplementedParam {
         name: "checkpointer_min_interval_secs",
@@ -105,12 +112,6 @@ pub static UNIMPLEMENTED_ENV_PARAMS: &[UnimplementedParam] = &[
         // default = 10_000; the DiskOrderedScan producer-queue timeout is not
         // consulted by the disk-ordered cursor implementation.
         is_non_default: |c| c.dos_producer_queue_timeout_ms != 10_000,
-    },
-    UnimplementedParam {
-        name: "env_dup_convert_preload_all",
-        // default = true; the JE 4->5 duplicate-DB conversion preload is N/A
-        // to Noxu's native .ndb format (no legacy dup format to convert).
-        is_non_default: |c| !c.env_dup_convert_preload_all,
     },
 ];
 
@@ -254,13 +255,11 @@ mod tests {
         c.set_verify_schedule("0 0 * * *".to_string());
         c.set_startup_dump_threshold_ms(100);
         c.set_dos_producer_queue_timeout_ms(5_000);
-        c.env_dup_convert_preload_all = false;
         for name in [
             "checkpointer_min_interval_secs",
             "verify_schedule",
             "startup_dump_threshold_ms",
             "dos_producer_queue_timeout_ms",
-            "env_dup_convert_preload_all",
         ] {
             let p = UNIMPLEMENTED_ENV_PARAMS
                 .iter()

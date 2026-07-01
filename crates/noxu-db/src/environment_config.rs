@@ -222,10 +222,23 @@ pub struct EnvironmentConfig {
     pub env_db_eviction: bool,
 
     /// Preload all duplicate-tree data before converting dup databases.
+    ///
+    /// **Deprecated / moot (7.1):** this configures the JE 4→5 duplicate-DB
+    /// on-disk conversion, which is N/A to Noxu's native `.ndb` format — there
+    /// is no legacy duplicate format to convert.  The field is retained for
+    /// source compatibility but has no effect and will be removed in 8.0.
+    ///
     /// Mirrors `ENV_DUP_CONVERT_PRELOAD_ALL` / default true.
     pub env_dup_convert_preload_all: bool,
 
     /// Chunk size (bytes) for Adler32 checksums.  0 = disabled (use CRC32).
+    ///
+    /// **Deprecated / moot (7.1):** Noxu uses CRC32 (crc32fast,
+    /// CLMUL-accelerated) for on-disk integrity, never Adler32 (which is weak
+    /// on short messages — wrong for small log entries).  This knob configures
+    /// a checksum Noxu does not use; it has no effect and will be removed in
+    /// 8.0.  See `docs/src/internal/checksum-selection.md`.
+    ///
     /// Mirrors `ADLER32_CHUNK_SIZE` / default 0.
     pub adler32_chunk_size: usize,
 
@@ -1026,6 +1039,13 @@ impl EnvironmentConfig {
         self
     }
 
+    #[deprecated(
+        note = "moot: Noxu routes all diagnostics through the Rust `log` crate / \
+                `noxu-observe` / RUST_LOG, not a bespoke logging system. This \
+                knob has no effect. Configure logging via RUST_LOG or the `log` \
+                facade. Will be removed in 8.0."
+    )]
+    #[allow(deprecated)]
     pub fn set_logging_level(&mut self, level: String) -> &mut Self {
         self.logging_level = Some(level);
         self
@@ -1159,6 +1179,13 @@ impl EnvironmentConfig {
         self.env_db_eviction = v;
         self
     }
+    #[deprecated(
+        note = "moot: Noxu uses CRC32 (crc32fast, CLMUL-accelerated) for on-disk \
+                integrity, never Adler32 (weak on short messages). This knob \
+                configures a checksum Noxu does not use. Will be removed in 8.0. \
+                See docs/src/internal/checksum-selection.md."
+    )]
+    #[allow(deprecated)]
     pub fn set_adler32_chunk_size(&mut self, bytes: usize) -> &mut Self {
         self.adler32_chunk_size = bytes;
         self
@@ -1744,52 +1771,95 @@ impl EnvironmentConfig {
 
     // -----------------------------------------------------------------------
     // Logging / tracing setters
+    //
+    // DEPRECATED (7.1, moot): Noxu routes ALL diagnostics through the Rust
+    // `log` crate / `noxu-observe` / RUST_LOG, NOT a bespoke JE-style logging
+    // system.  Building a second logging system to honour these knobs would be
+    // redundant, so they have no effect.  Configure logging via RUST_LOG or the
+    // `log` facade.  These setters will be removed in 8.0.
     // -----------------------------------------------------------------------
 
+    #[deprecated(
+        note = "moot: configure logging via RUST_LOG / the `log` facade; Noxu \
+                has no bespoke logging system. Will be removed in 8.0."
+    )]
     pub fn set_trace_file(&mut self, v: bool) -> &mut Self {
         self.trace_file = v;
         self
     }
+    #[deprecated(
+        note = "moot: configure logging via RUST_LOG / the `log` facade. Will be removed in 8.0."
+    )]
     pub fn set_trace_console(&mut self, v: bool) -> &mut Self {
         self.trace_console = v;
         self
     }
+    #[deprecated(
+        note = "moot: configure logging via RUST_LOG / the `log` facade. Will be removed in 8.0."
+    )]
     pub fn set_trace_db(&mut self, v: bool) -> &mut Self {
         self.trace_db = v;
         self
     }
+    #[deprecated(
+        note = "moot: configure logging via RUST_LOG / the `log` facade. Will be removed in 8.0."
+    )]
     pub fn set_trace_file_limit_bytes(&mut self, bytes: u64) -> &mut Self {
         self.trace_file_limit_bytes = bytes;
         self
     }
+    #[deprecated(
+        note = "moot: configure logging via RUST_LOG / the `log` facade. Will be removed in 8.0."
+    )]
     pub fn set_trace_file_count(&mut self, n: u32) -> &mut Self {
         self.trace_file_count = n;
         self
     }
+    #[deprecated(
+        note = "moot: configure logging via RUST_LOG / the `log` facade. Will be removed in 8.0."
+    )]
     pub fn set_trace_level(&mut self, level: String) -> &mut Self {
         self.trace_level = Some(level);
         self
     }
+    #[deprecated(
+        note = "moot: configure logging via RUST_LOG / the `log` facade. Will be removed in 8.0."
+    )]
     pub fn set_console_logging_level(&mut self, level: String) -> &mut Self {
         self.console_logging_level = Some(level);
         self
     }
+    #[deprecated(
+        note = "moot: configure logging via RUST_LOG / the `log` facade. Will be removed in 8.0."
+    )]
     pub fn set_file_logging_level(&mut self, level: String) -> &mut Self {
         self.file_logging_level = Some(level);
         self
     }
+    #[deprecated(
+        note = "moot: configure logging via RUST_LOG (e.g. `noxu_txn=debug`) / the `log` facade. Will be removed in 8.0."
+    )]
     pub fn set_trace_level_lock_manager(&mut self, level: String) -> &mut Self {
         self.trace_level_lock_manager = Some(level);
         self
     }
+    #[deprecated(
+        note = "moot: configure logging via RUST_LOG (e.g. `noxu_recovery=debug`) / the `log` facade. Will be removed in 8.0."
+    )]
     pub fn set_trace_level_recovery(&mut self, level: String) -> &mut Self {
         self.trace_level_recovery = Some(level);
         self
     }
+    #[deprecated(
+        note = "moot: configure logging via RUST_LOG (e.g. `noxu_evictor=debug`) / the `log` facade. Will be removed in 8.0."
+    )]
     pub fn set_trace_level_evictor(&mut self, level: String) -> &mut Self {
         self.trace_level_evictor = Some(level);
         self
     }
+    #[deprecated(
+        note = "moot: configure logging via RUST_LOG (e.g. `noxu_cleaner=debug`) / the `log` facade. Will be removed in 8.0."
+    )]
     pub fn set_trace_level_cleaner(&mut self, level: String) -> &mut Self {
         self.trace_level_cleaner = Some(level);
         self
@@ -1860,6 +1930,11 @@ impl EnvironmentConfig {
     }
 
     /// Builder-style (consuming) `logging_level` setter. See [`Self::set_logging_level`].
+    #[deprecated(
+        note = "moot: configure logging via RUST_LOG / the `log` facade; Noxu \
+                has no bespoke logging system. Will be removed in 8.0."
+    )]
+    #[allow(deprecated)]
     pub fn with_logging_level(mut self, level: String) -> Self {
         self.set_logging_level(level);
         self
@@ -1974,6 +2049,12 @@ impl EnvironmentConfig {
     }
 
     /// Builder-style (consuming) `adler32_chunk_size` setter. See [`Self::set_adler32_chunk_size`].
+    #[deprecated(
+        note = "moot: Noxu uses CRC32, never Adler32. This knob configures a \
+                checksum Noxu does not use. Will be removed in 8.0. \
+                See docs/src/internal/checksum-selection.md."
+    )]
+    #[allow(deprecated)]
     pub fn with_adler32_chunk_size(mut self, bytes: usize) -> Self {
         self.set_adler32_chunk_size(bytes);
         self
@@ -2583,72 +2664,120 @@ impl EnvironmentConfig {
     }
 
     /// Builder-style (consuming) `trace_file` setter. See [`Self::set_trace_file`].
+    #[deprecated(
+        note = "moot: configure logging via RUST_LOG / the `log` facade. Will be removed in 8.0."
+    )]
+    #[allow(deprecated)]
     pub fn with_trace_file(mut self, v: bool) -> Self {
         self.set_trace_file(v);
         self
     }
 
     /// Builder-style (consuming) `trace_console` setter. See [`Self::set_trace_console`].
+    #[deprecated(
+        note = "moot: configure logging via RUST_LOG / the `log` facade. Will be removed in 8.0."
+    )]
+    #[allow(deprecated)]
     pub fn with_trace_console(mut self, v: bool) -> Self {
         self.set_trace_console(v);
         self
     }
 
     /// Builder-style (consuming) `trace_db` setter. See [`Self::set_trace_db`].
+    #[deprecated(
+        note = "moot: configure logging via RUST_LOG / the `log` facade. Will be removed in 8.0."
+    )]
+    #[allow(deprecated)]
     pub fn with_trace_db(mut self, v: bool) -> Self {
         self.set_trace_db(v);
         self
     }
 
     /// Builder-style (consuming) `trace_file_limit_bytes` setter. See [`Self::set_trace_file_limit_bytes`].
+    #[deprecated(
+        note = "moot: configure logging via RUST_LOG / the `log` facade. Will be removed in 8.0."
+    )]
+    #[allow(deprecated)]
     pub fn with_trace_file_limit_bytes(mut self, bytes: u64) -> Self {
         self.set_trace_file_limit_bytes(bytes);
         self
     }
 
     /// Builder-style (consuming) `trace_file_count` setter. See [`Self::set_trace_file_count`].
+    #[deprecated(
+        note = "moot: configure logging via RUST_LOG / the `log` facade. Will be removed in 8.0."
+    )]
+    #[allow(deprecated)]
     pub fn with_trace_file_count(mut self, n: u32) -> Self {
         self.set_trace_file_count(n);
         self
     }
 
     /// Builder-style (consuming) `trace_level` setter. See [`Self::set_trace_level`].
+    #[deprecated(
+        note = "moot: configure logging via RUST_LOG / the `log` facade. Will be removed in 8.0."
+    )]
+    #[allow(deprecated)]
     pub fn with_trace_level(mut self, level: String) -> Self {
         self.set_trace_level(level);
         self
     }
 
     /// Builder-style (consuming) `console_logging_level` setter. See [`Self::set_console_logging_level`].
+    #[deprecated(
+        note = "moot: configure logging via RUST_LOG / the `log` facade. Will be removed in 8.0."
+    )]
+    #[allow(deprecated)]
     pub fn with_console_logging_level(mut self, level: String) -> Self {
         self.set_console_logging_level(level);
         self
     }
 
     /// Builder-style (consuming) `file_logging_level` setter. See [`Self::set_file_logging_level`].
+    #[deprecated(
+        note = "moot: configure logging via RUST_LOG / the `log` facade. Will be removed in 8.0."
+    )]
+    #[allow(deprecated)]
     pub fn with_file_logging_level(mut self, level: String) -> Self {
         self.set_file_logging_level(level);
         self
     }
 
     /// Builder-style (consuming) `trace_level_lock_manager` setter. See [`Self::set_trace_level_lock_manager`].
+    #[deprecated(
+        note = "moot: configure logging via RUST_LOG (e.g. `noxu_txn=debug`). Will be removed in 8.0."
+    )]
+    #[allow(deprecated)]
     pub fn with_trace_level_lock_manager(mut self, level: String) -> Self {
         self.set_trace_level_lock_manager(level);
         self
     }
 
     /// Builder-style (consuming) `trace_level_recovery` setter. See [`Self::set_trace_level_recovery`].
+    #[deprecated(
+        note = "moot: configure logging via RUST_LOG (e.g. `noxu_recovery=debug`). Will be removed in 8.0."
+    )]
+    #[allow(deprecated)]
     pub fn with_trace_level_recovery(mut self, level: String) -> Self {
         self.set_trace_level_recovery(level);
         self
     }
 
     /// Builder-style (consuming) `trace_level_evictor` setter. See [`Self::set_trace_level_evictor`].
+    #[deprecated(
+        note = "moot: configure logging via RUST_LOG (e.g. `noxu_evictor=debug`). Will be removed in 8.0."
+    )]
+    #[allow(deprecated)]
     pub fn with_trace_level_evictor(mut self, level: String) -> Self {
         self.set_trace_level_evictor(level);
         self
     }
 
     /// Builder-style (consuming) `trace_level_cleaner` setter. See [`Self::set_trace_level_cleaner`].
+    #[deprecated(
+        note = "moot: configure logging via RUST_LOG (e.g. `noxu_cleaner=debug`). Will be removed in 8.0."
+    )]
+    #[allow(deprecated)]
     pub fn with_trace_level_cleaner(mut self, level: String) -> Self {
         self.set_trace_level_cleaner(level);
         self
@@ -3117,6 +3246,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // exercises deprecated-moot logging/trace setters
     fn test_set_trace_params() {
         let mut c = EnvironmentConfig::default();
         c.set_trace_file(true);
@@ -3171,6 +3301,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // exercises the deprecated set_adler32_chunk_size setter
     fn test_env_behaviour_params() {
         let mut c = EnvironmentConfig::default();
         c.set_env_check_leaks(false);
