@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use noxu_sync::{Condvar, Mutex};
+use noxu_util::dst_sync_pl::{Condvar, Mutex};
 
 use crate::LockType;
 

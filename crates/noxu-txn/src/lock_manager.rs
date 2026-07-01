@@ -26,7 +26,14 @@ use hashbrown::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use noxu_sync::{Condvar, Mutex};
+// The shard-table / waiter-graph `Mutex` and the per-waiter grant `Condvar`
+// route through the parking_lot-over-shuttle seam so the deadlock-detection
+// and grant/wakeup interleavings are schedulable by shuttle (DST wave 2).
+// The default build re-exports the real `noxu-sync` futex types, so
+// production behaviour and the on-heap layout are unchanged.  (The
+// read-mostly registry `RwLock`s below stay on `std::sync`; they are not on
+// the deadlock hot path and the shuttle tests never populate them.)
+use noxu_util::dst_sync_pl::{Condvar, Mutex};
 use noxu_util::{Clock, RealClock};
 
 use crate::lock_info::WaiterNotify;
