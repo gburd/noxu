@@ -42,7 +42,7 @@ SCALES="1K 10K 100K" scripts/run_benchmarks.sh
 | w09 | `txn_multi_1t` | Multi-record transactions, 1 thread |
 | w10_conc | `conc_8r8w_16t` | 8 readers + 8 writers, 16 threads |
 | w10_gc | `txn_group_commit` | Group commit vs no group commit |
-| w11 | `recovery` | Environment open time |
+| w11 | `recovery` | `Environment::open()` log-replay recovery time (teardown excluded from the timed region) |
 
 ## Canonical Results (Session 31, NVMe /scratch)
 

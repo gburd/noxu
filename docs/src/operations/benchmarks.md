@@ -65,10 +65,20 @@ warm-cache effects have been amortised.
 | W09 transactional 3 get + 2 put           |      8 116 |    6 297 |      0.78 | Noxu `WritePromote` upgrade path avoids lock re-acquisition |
 | W10 4r4w concurrent                       |      4 063 |    5 931 |      1.46 | JE 1.5× — better fsync coalescing on tmpfs |
 | W10 8r8w concurrent                       |      4 395 |   10 339 |      2.35 | JE 2.4× — same reason |
-| W11 recovery / re-open after clean close  |          4 |       12 |      2.89 | JE 2.9× faster — JIT-compiled log scan |
+| W11 recovery / re-open after clean close  |          4 |       12 |      2.89 | pre-fix artifact (included teardown) — see note below |
 | W12a XA full 2PC (10 000 txns, ops/s)     |      1 716 |      —   |        —  | Noxu only |
 | W12b XA single-phase commit               |      1 630 |      —   |        —  | Noxu only |
 | W12c plain transactional baseline         |      7 835 |      —   |        —  | Noxu only |
+
+> **W11 measurement note.** The `2.89` ratio above predates a harness fix:
+> the timed region used to include the re-opened environment's *teardown*
+> (close-time checkpoint, daemon shutdown, final flush), not just the
+> log-replay recovery done by `Environment::open()`. That teardown cost
+> dominated the tiny replay time at this scale, inflating the ratio and making
+> JE look ~3.8x faster than a clean recovery measurement would show. The
+> harness now stashes the re-opened handle and drops it *after* the timer
+> stops, so the number measures recovery only. Re-run the comparison for an
+> accurate W11 figure; the historical value is retained here for provenance.
 
 **Storage efficiency.** On every workload that writes records Noxu uses
 30-40 % fewer on-disk bytes per operation (~105 B/op vs ~155 B/op for a
@@ -317,6 +327,9 @@ harness output).
 * **Recovery (`w11_recovery`).**  218 ms to replay a 10 000-record
   log on NVMe.  This is the I/O-bound regime; tmpfs ran the same
   workload in ~5 ms because there was no actual disk I/O to do.
+  Note: this figure was captured before the harness fix that removed
+  environment teardown from the timed region, so it slightly overstates
+  pure replay cost; re-run for a clean recovery-only number.
 
 The matching JE NVMe run is gated on `bash benches/setup.sh` running
 successfully (it requires Maven plus internet access to download the

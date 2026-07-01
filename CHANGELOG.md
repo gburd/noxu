@@ -63,6 +63,19 @@ listed in [References](#references).
   review finding as a documented deliberate decision; no crates were
   restructured.
 
+### Fixed
+
+- **w11_recovery benchmark measurement artifact.** The `w11_recovery`
+  workload in `benches/noxu-bench/src/main.rs` timed the re-opened
+  environment's teardown (close-time checkpoint, daemon shutdown, final flush)
+  along with the actual `Environment::open()` log-replay recovery, inflating
+  the number and making JE look ~3.8x faster than a clean recovery
+  measurement. The harness now stashes the re-opened handle and drops it
+  *after* the timer stops, so w11 measures recovery only. Updated the
+  benchmark docs (`docs/src/operations/benchmarks.md`,
+  `docs/src/maintainer/benchmarking.md`) to flag the historical number as a
+  pre-fix artifact. Benchmark harness only — no engine change.
+
 ## [7.0.0] - 2026-07-01
 
 ### Changed (BREAKING — 7.0 core API reshape)
