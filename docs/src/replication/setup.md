@@ -13,9 +13,9 @@ Enable the `replication` feature in your `Cargo.toml`:
 
 ```toml
 [dependencies]
-noxu = { version = "3", features = ["replication"] }
+noxu = { version = "7", features = ["replication"] }
 # For QUIC transport:
-# noxu = { version = "3", features = ["replication"] }  # QUIC is bundled with replication
+# noxu = { version = "7", features = ["replication"] }  # QUIC is bundled with replication
 ```
 
 ## Group Topology

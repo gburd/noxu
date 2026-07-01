@@ -4,7 +4,7 @@ Add Noxu DB to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-noxu = "3"
+noxu = "7"
 ```
 
 Noxu DB has no runtime dependencies beyond the Rust standard library.
@@ -30,7 +30,7 @@ To enable optional features, e.g. replication:
 
 ```toml
 [dependencies]
-noxu = { version = "3", features = ["replication"] }
+noxu = { version = "7", features = ["replication"] }
 ```
 
 The default feature set (`collections`, `persist`, `xa`) is appropriate for
@@ -77,7 +77,7 @@ Add the following to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-noxu = "3"
+noxu = "7"
 ```
 
 For development from the repository, use a path dependency pointing at the

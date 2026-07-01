@@ -273,7 +273,7 @@ beyond a few thin wrappers; see `crates/noxu-observe/src/lib.rs`.
 ### `noxu` (umbrella)
 
 The single user-facing crate. Re-exports the entire public API of all
-component crates under one name and version. Users add `noxu = "3"` to
+component crates under one name and version. Users add `noxu = "7"` to
 their `Cargo.toml` and receive everything: core engine, collections,
 persistence layer, XA, and optionally replication and observability via
 feature flags.

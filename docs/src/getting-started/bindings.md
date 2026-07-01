@@ -16,7 +16,7 @@ Bindings are available through the `noxu` umbrella crate (enabled by default):
 
 ```toml
 [dependencies]
-noxu = "3"
+noxu = "7"
 ```
 
 Available bindings in `noxu::bind`:

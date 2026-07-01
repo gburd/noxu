@@ -15,6 +15,15 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Documentation
+
+- **P2-1 — doc version drift.** Updated the remaining `noxu = "3"` (and
+  a few stray `version = "3"` / `version = "6"`) quick-start snippets in
+  crate `lib.rs` docs and `docs/src/` to `noxu = "7"`, matching the 7.0
+  workspace version. User-copied install snippets now show the correct
+  version. (The `docs/src/internal/noxu-umbrella.md` historical record keeps
+  its point-in-time `3.0.1` references.)
+
 ## [7.0.0] - 2026-07-01
 
 ### Changed (BREAKING — 7.0 core API reshape)

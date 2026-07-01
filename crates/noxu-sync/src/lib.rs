@@ -6,7 +6,7 @@
 //! > **Internal component of the [`noxu`](https://crates.io/crates/noxu) database.**
 //! >
 //! > This crate is published only so the `noxu` umbrella crate can depend on it.
-//! > Use `noxu` (`noxu = "3"`) in applications; depend on this crate directly only
+//! > Use `noxu` (`noxu = "7"`) in applications; depend on this crate directly only
 //! > if you are extending the engine internals. Its API may change without a major
 //! > version bump.
 //!
