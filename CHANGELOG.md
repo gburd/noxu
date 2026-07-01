@@ -15,6 +15,46 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Added (DST Milestone 1.1 — clock thread-through + parking_lot-over-shuttle)
+
+- **Injectable `Clock` threaded through the remaining control-flow time sites.**
+  Extends DST M1 (which added the `Clock` trait + `RealClock`/`SimClock` to
+  `noxu-util`) so a `SimClock` can drive *all* timeout-relevant time:
+  - `FsyncManager` (`noxu-log`): the group-commit wait (`grpc_interval_ms`) and
+    the `LOG_FSYNC_TIMEOUT` recovery now read time through an injectable
+    `Clock` instead of `std::time::Instant`. New `FsyncManager::with_clock`
+    builder; `new()` still defaults to `RealClock`.
+  - `LockManager` (`noxu-txn`): the lock-wait loop's timeout math and 50 ms
+    deadlock re-detection slice read time through an injectable `Clock`. New
+    `LockManager::with_config_clock` builder; `with_config()` /
+    `with_lock_timeout()` / `new()` still default to `RealClock`.
+  - `DaemonManager` (`noxu-engine`): documented as intentionally *not* clock-
+    threaded — its wakeup interval is a config `Duration` and its shutdown path
+    is notify-driven (already proven shuttle-clean in M2), so a `SimClock`
+    would add nothing.
+
+  All injection is **additive and non-breaking**: every existing constructor is
+  unchanged and keeps defaulting to `RealClock`, so the default build has zero
+  production behavior change.
+- **`noxu_util::dst_sync_pl`: a parking_lot-over-shuttle wrapper.** Removes the
+  M2 blocker that `noxu-sync`-based modules (e.g. `lock_manager`) could not be
+  shuttle-swapped because `noxu-sync` is `parking_lot`-shaped while
+  `shuttle::sync` is `std::sync`-shaped. The wrapper presents the
+  `parking_lot` API (`lock() -> guard`, `wait_for(&mut guard, dur)`):
+  - Default build (`#[cfg(not(noxu_shuttle))]`): a transparent re-export of the
+    real `noxu-sync` primitives — zero production change; shuttle stays out of
+    the default dependency graph.
+  - `#[cfg(noxu_shuttle)]`: thin, fully-safe wrappers over `shuttle::sync`
+    (an `Option`-backed guard newtype bridges shuttle's by-value `wait`, so
+    `noxu-util` keeps `#![forbid(unsafe_code)]`).
+  - **Clock-driven timed waits under shuttle.** shuttle 0.9's `wait_timeout`
+    never times out; the wrapper's `wait_for` registers a `SimClock` deadline
+    and the harness's `advance_and_fire(clock, dur)` advances sim-time and
+    notifies due waiters so a timed wait fires *deterministically* when the
+    harness advances the clock past the deadline. A shuttle self-test
+    (`noxu-util/tests/shuttle_dst_sync_pl.rs`) proves the wrapped `Mutex` is
+    schedulable and the clock-driven timeout fires under every interleaving.
+
 ### Documentation
 
 - **P2-1 — doc version drift.** Updated the remaining `noxu = "3"` (and

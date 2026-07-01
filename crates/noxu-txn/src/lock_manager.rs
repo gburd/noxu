@@ -27,6 +27,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use noxu_sync::{Condvar, Mutex};
+use noxu_util::{Clock, RealClock};
 
 use crate::lock_info::WaiterNotify;
 use crate::{
@@ -134,6 +135,14 @@ pub struct LockManager {
     /// (LockManager.java:556 — "Lock holder is non-preemptable, wait again").
     /// A locker absent from this set is preemptable (the default).
     non_preemptable: RwLock<HashSet<i64>>,
+
+    /// Injectable clock for the wait-loop timeout / deadlock re-detection
+    /// cadence (DST M1.1).  JE reads `System.currentTimeMillis()` /
+    /// `nanoTime()` at these sites; here the elapsed math routes through an
+    /// injectable [`Clock`] so a [`noxu_util::SimClock`] makes the lock-timeout
+    /// and 50 ms re-detection slice a pure function of the simulated timeline.
+    /// Defaults to [`RealClock`] — production behavior is unchanged.
+    clock: Arc<dyn Clock>,
 }
 
 /// Internal statistics tracking.
@@ -169,6 +178,21 @@ impl LockManager {
     /// Production (`EnvironmentImpl`) passes the configured value; `0` or
     /// values are clamped to at least 1 shard.
     pub fn with_config(timeout_ms: u64, n_lock_tables: usize) -> Self {
+        Self::with_config_clock(timeout_ms, n_lock_tables, RealClock::arc())
+    }
+
+    /// Creates a `LockManager` with an injectable [`Clock`] (DST M1.1).
+    ///
+    /// Production uses [`LockManager::with_config`] (which passes
+    /// [`RealClock`]); DST harnesses pass a [`noxu_util::SimClock`] so the
+    /// lock-wait timeout and the 50 ms deadlock re-detection slice become a
+    /// pure function of the simulated timeline.  Additive: no existing caller
+    /// changes.
+    pub fn with_config_clock(
+        timeout_ms: u64,
+        n_lock_tables: usize,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
         let n_lock_tables = n_lock_tables.max(1);
         let mut lock_tables = Vec::with_capacity(n_lock_tables);
         for _ in 0..n_lock_tables {
@@ -188,6 +212,7 @@ impl LockManager {
             waiter_graph: Mutex::new(HashMap::new()),
             locker_labels: RwLock::new(HashMap::new()),
             non_preemptable: RwLock::new(HashSet::new()),
+            clock,
         }
     }
 
@@ -487,7 +512,7 @@ impl LockManager {
         //     each wakeup.  We also re-run deadlock detection on each
         //     iteration so that cycles formed after we enter the wait path
         //     are caught.
-        let start = std::time::Instant::now();
+        let start_ns = self.clock.now_nanos();
         let (mutex, condvar) = &*notify_pair;
         let mut granted_guard = mutex.lock();
 
@@ -503,7 +528,8 @@ impl LockManager {
             let remaining_ms = if timeout_ms == 0 {
                 0 // 0 means wait forever
             } else {
-                let elapsed = start.elapsed().as_millis() as u64;
+                let elapsed =
+                    self.clock.now_nanos().saturating_sub(start_ns) / 1_000_000;
                 if elapsed >= timeout_ms {
                     // Already timed out before we even slept this iteration.
                     drop(granted_guard);
@@ -570,7 +596,9 @@ impl LockManager {
             if timed_out {
                 // Check if total time is exceeded.
                 if timeout_ms > 0
-                    && start.elapsed().as_millis() as u64 >= timeout_ms
+                    && self.clock.now_nanos().saturating_sub(start_ns)
+                        / 1_000_000
+                        >= timeout_ms
                 {
                     drop(granted_guard);
                     // H-2: shard before waiter_graph.

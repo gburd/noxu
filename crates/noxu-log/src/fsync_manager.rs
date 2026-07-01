@@ -26,11 +26,11 @@
 //! replaces `state.next_fsync_waiters` with a fresh group, so waiting threads
 //! retain their `Arc` to the *old* group and can still be woken through it.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use noxu_util::dst_sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use noxu_util::dst_sync::{Arc, Condvar, Mutex, MutexGuard};
-use noxu_util::{Lsn, NULL_LSN};
+use noxu_util::{Clock, Lsn, NULL_LSN, RealClock};
 
 // ── FSyncGroup ────────────────────────────────────────────────────────────────
 
@@ -99,7 +99,16 @@ impl FSyncGroup {
     /// `inner`.  In the common post-fsync case, all N waiters see `true` and
     /// return without ever contending on the mutex — eliminating the
     /// thundering-herd mutex storm documented in Keith re-audit P-1.
-    fn wait_for_event(&self, timeout: Duration) -> WaitStatus {
+    ///
+    /// Time is read through the injectable [`Clock`] rather than
+    /// [`std::time::Instant`] (JE reads `System.nanoTime()` here) so a
+    /// [`noxu_util::SimClock`] makes the timeout decision a pure function of
+    /// the simulated timeline (DST M1.1).
+    fn wait_for_event(
+        &self,
+        clock: &dyn Clock,
+        timeout: Duration,
+    ) -> WaitStatus {
         // P-1 fast path: if the fsync is already done, return without locking.
         if self.work_done_atomic.load(Ordering::Acquire) {
             return WaitStatus::NoFsyncNeeded;
@@ -112,14 +121,15 @@ impl FSyncGroup {
             return WaitStatus::NoFsyncNeeded;
         }
 
-        let start = Instant::now();
+        let timeout_ns = timeout.as_nanos() as u64;
+        let start_ns = clock.now_nanos();
         loop {
-            // Compute remaining wait time.
-            let elapsed = start.elapsed();
-            if elapsed >= timeout {
+            // Compute remaining wait time from the injectable clock.
+            let elapsed_ns = clock.now_nanos().saturating_sub(start_ns);
+            if elapsed_ns >= timeout_ns {
                 return WaitStatus::DoTimeoutFsync;
             }
-            let remaining = timeout - elapsed;
+            let remaining = Duration::from_nanos(timeout_ns - elapsed_ns);
 
             let (guard, _timed_out) =
                 self.condvar.wait_timeout(inner, remaining).unwrap();
@@ -135,7 +145,7 @@ impl FSyncGroup {
             }
 
             // Spurious wakeup or still a plain waiter — re-check timeout.
-            if start.elapsed() >= timeout {
+            if clock.now_nanos().saturating_sub(start_ns) >= timeout_ns {
                 return WaitStatus::DoTimeoutFsync;
             }
             // else: loop and keep waiting
@@ -202,8 +212,10 @@ struct FsyncState {
     next_fsync_waiters: Arc<FSyncGroup>,
     /// Count of threads currently in `next_fsync_waiters`.
     num_next_waiters: usize,
-    /// Monotonic instant when the first thread joined the current next-group.
-    start_next_wait: Option<Instant>,
+    /// Monotonic clock tick (nanos, from the injectable [`Clock`]) when the
+    /// first thread joined the current next-group.  Was `Option<Instant>`;
+    /// switched to a clock-sourced `u64` so DST can control the grpc wait.
+    start_next_wait_ns: Option<u64>,
 }
 
 // ── FsyncManager ─────────────────────────────────────────────────────────────
@@ -248,6 +260,10 @@ pub struct FsyncManager {
     fsync_time_ms: AtomicU64,
     /// Sum of all group-commit batch sizes (waiters served per fsync).
     n_fsync_batch_size_sum: AtomicU64,
+    /// Injectable clock for the group-commit wait / fsync-timeout decisions
+    /// (DST M1.1).  Defaults to [`RealClock`] so production behavior is
+    /// unchanged; a [`noxu_util::SimClock`] lets DST drive the timeout cadence.
+    clock: Arc<dyn Clock>,
 }
 
 impl FsyncManager {
@@ -257,6 +273,20 @@ impl FsyncManager {
     /// * `grpc_threshold`   — min waiters before leader fsyncs (0 = disabled).
     /// * `grpc_interval_ms` — max ms to wait for more waiters (0 = disabled).
     pub fn new(grpc_threshold: usize, grpc_interval_ms: u64) -> Self {
+        Self::with_clock(grpc_threshold, grpc_interval_ms, RealClock::arc())
+    }
+
+    /// Create a new `FsyncManager` with an injectable [`Clock`] (DST M1.1).
+    ///
+    /// Production uses [`FsyncManager::new`] (which passes [`RealClock`]); DST
+    /// harnesses pass a [`noxu_util::SimClock`] so the group-commit wait and
+    /// the `fsync_timeout` recovery become a pure function of the simulated
+    /// timeline.  Additive: no existing caller changes.
+    pub fn with_clock(
+        grpc_threshold: usize,
+        grpc_interval_ms: u64,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
         let grp_wait_on = grpc_threshold != 0 && grpc_interval_ms != 0;
         FsyncManager {
             grpc_threshold,
@@ -268,7 +298,7 @@ impl FsyncManager {
                 work_in_progress: false,
                 next_fsync_waiters: FSyncGroup::new(),
                 num_next_waiters: 0,
-                start_next_wait: None,
+                start_next_wait_ns: None,
             }),
             leader_condvar: Condvar::new(),
             n_fsyncs: AtomicU64::new(0),
@@ -277,6 +307,7 @@ impl FsyncManager {
             n_group_commits: AtomicU64::new(0),
             fsync_time_ms: AtomicU64::new(0),
             n_fsync_batch_size_sum: AtomicU64::new(0),
+            clock,
         }
     }
 
@@ -324,7 +355,7 @@ impl FsyncManager {
                 my_group = Some(Arc::clone(&state.next_fsync_waiters));
                 state.num_next_waiters += 1;
                 if self.grp_wait_on && state.num_next_waiters == 1 {
-                    state.start_next_wait = Some(Instant::now());
+                    state.start_next_wait_ns = Some(self.clock.now_nanos());
                 }
                 // If this new waiter pushes us to the threshold, wake the
                 // leader early so it doesn't wait the full grpc_interval_ms.
@@ -356,7 +387,8 @@ impl FsyncManager {
         // ── Phase 2: if we're a waiter, block until woken ────────────────
         if need_to_wait {
             let group = my_group.as_ref().unwrap();
-            let wait_status = group.wait_for_event(self.fsync_timeout);
+            let wait_status =
+                group.wait_for_event(&*self.clock, self.fsync_timeout);
 
             match wait_status {
                 WaitStatus::NoFsyncNeeded => {
@@ -404,11 +436,13 @@ impl FsyncManager {
         // ── Phase 3: perform the drain + fsync (JE doWork block) ──────────
         if do_my_work {
             self.n_fsyncs.fetch_add(1, Ordering::Relaxed);
-            let fsync_start = std::time::Instant::now();
+            let fsync_start_ns = self.clock.now_nanos();
             // JE: flushBeforeSync() + executeFSync() — the drain + pwrite +
             // fdatasync now live INSIDE this leader/timeout branch (the fix).
             let result = do_work();
-            let elapsed_ms = fsync_start.elapsed().as_millis() as u64;
+            let elapsed_ms =
+                self.clock.now_nanos().saturating_sub(fsync_start_ns)
+                    / 1_000_000;
             self.fsync_time_ms.fetch_add(elapsed_ms, Ordering::Relaxed);
             // Count as a group commit when leader has an in-progress group
             // (meaning at least one other thread piggybacked on this fsync).
@@ -509,14 +543,14 @@ impl FsyncManager {
             return state;
         }
         if state.num_next_waiters < self.grpc_threshold {
-            let interval_ns = self.grpc_interval_ms as u128 * 1_000_000;
+            let interval_ns = self.grpc_interval_ms * 1_000_000;
             let elapsed_ns = state
-                .start_next_wait
-                .map(|t| t.elapsed().as_nanos())
+                .start_next_wait_ns
+                .map(|t| self.clock.now_nanos().saturating_sub(t))
                 .unwrap_or(0);
             if elapsed_ns < interval_ns {
                 let remaining_ns = interval_ns - elapsed_ns;
-                let wait_dur = Duration::from_nanos(remaining_ns as u64);
+                let wait_dur = Duration::from_nanos(remaining_ns);
                 // `Condvar::wait_timeout` releases the lock and re-acquires it.
                 let (new_guard, _) =
                     self.leader_condvar.wait_timeout(state, wait_dur).unwrap();
@@ -779,7 +813,7 @@ mod tests {
     fn test_fsync_group_already_done() {
         let g = FSyncGroup::new();
         g.wakeup_all(0);
-        let status = g.wait_for_event(Duration::from_secs(5));
+        let status = g.wait_for_event(&RealClock, Duration::from_secs(5));
         assert_eq!(status, WaitStatus::NoFsyncNeeded);
     }
 
@@ -795,7 +829,7 @@ mod tests {
             g2.wakeup_one();
         });
 
-        let status = g.wait_for_event(Duration::from_millis(500));
+        let status = g.wait_for_event(&RealClock, Duration::from_millis(500));
         assert_eq!(status, WaitStatus::DoLeaderFsync);
         assert!(g.inner.lock().unwrap().leader_exists);
     }
@@ -806,7 +840,7 @@ mod tests {
         let g = FSyncGroup::new();
         // Pre-set leader_exists so wakeup_one won't make us the leader.
         g.inner.lock().unwrap().leader_exists = true;
-        let status = g.wait_for_event(Duration::from_millis(20));
+        let status = g.wait_for_event(&RealClock, Duration::from_millis(20));
         assert_eq!(status, WaitStatus::DoTimeoutFsync);
     }
 

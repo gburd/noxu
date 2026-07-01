@@ -1,4 +1,18 @@
 //! Background daemon lifecycle management.
+//!
+//! # DST M1.1 note: no injectable Clock is threaded here (deliberate)
+//!
+//! The daemon wakeup interval is a *config-supplied* `Duration`
+//! (`evictor_wakeup_ms` / `cleaner_wakeup_ms` / `checkpointer_wakeup_ms`),
+//! passed straight to [`WakeHandle::wait_timeout`]; there is no hardcoded
+//! `std::time` control-flow site to virtualise.  The shutdown path's liveness
+//! is **notify-driven** (`shutdown()` sets the flag and calls
+//! `WakeHandle::notify`), not timeout-driven — which is exactly why the
+//! Milestone-2 shuttle gate (`tests/shuttle_daemon_shutdown.rs`) proves it
+//! deadlock-free without any clock injection.  A `SimClock` would add nothing
+//! the config `Duration` + the notify seam do not already give, so the Clock
+//! is intentionally NOT threaded through the daemon loops (matches the M1
+//! deferral rationale).
 
 use crate::engine_config::EngineConfig;
 use noxu_cleaner::Cleaner;

@@ -288,8 +288,8 @@ binary.
 | Protocol | Status | Why |
 |---|---|---|
 | `DaemonManager` shutdown / wakeup (`shuttle_daemon_shutdown.rs`) | **Green gate** | The shutdown wakeup is an explicit `notify()`, so liveness does not rely on a timeout — shuttle can prove deadlock-freedom. |
-| `FsyncManager` group-commit (`shuttle_fsync_manager.rs`) | **Partial** — harness-detection test green, full safety oracle `#[ignore]`d | The leader hand-off recovers a lost `wakeup_one` via `LOG_FSYNC_TIMEOUT`; shuttle's `wait_timeout` never times out, so it cannot model that recovery and reports the orphan as a deadlock. The passing test proves the gate *detects* the orphan; the ignored test carries the safety oracle, ready once the hand-off is made timeout-independent. |
-| `lock_manager` deadlock detection | **Not covered** | Uses the `parking_lot`-shaped `noxu-sync` (not the `std`-shaped `shuttle::sync`) *and* drives deadlock re-detection off `Instant::now()` + 50 ms `wait_for` slices — timeout-based control flow shuttle cannot virtualise until the Phase-1 injectable clock is threaded through it (deferred to M1.1). |
+| `FsyncManager` group-commit (`shuttle_fsync_manager.rs`) | **Partial** — harness-detection test green, full safety oracle `#[ignore]`d | The leader hand-off recovers a lost `wakeup_one` via `LOG_FSYNC_TIMEOUT`; shuttle's `wait_timeout` never times out, so it cannot model that recovery and reports the orphan as a deadlock. The passing test proves the gate *detects* the orphan; the ignored test carries the safety oracle, ready once the hand-off is made timeout-independent. **M1.1** threaded an injectable `Clock` through the fsync timeout, and the `dst_sync_pl` wrapper can now fire a clock-driven timed wait under shuttle (see below), so the oracle is *unblocked* pending the next wave. |
+| `lock_manager` deadlock detection | **Unblocked by M1.1** (not yet ported) | Previously blocked twice: the `parking_lot`-shaped `noxu-sync` could not be shuttle-swapped, *and* the deadlock re-detection ran off `Instant::now()` + 50 ms `wait_for` slices. **M1.1** removes both blockers: an injectable `Clock` now drives the timeout/re-detection cadence (`LockManager::with_config_clock`) and `noxu_util::dst_sync_pl` provides a `parking_lot`-shaped Mutex/RwLock/Condvar over shuttle. Porting the actual `lock_manager` shuttle oracle is the next wave. |
 
 > shuttle surfaced two real, latent lost-wakeups masked in production by
 > timeouts. The `DaemonManager` one (a missing predicate-before-wait in
@@ -307,6 +307,9 @@ required for local dev. It needs the `noxu_shuttle` cfg via `RUSTFLAGS`:
 RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-engine --test shuttle_daemon_shutdown
 RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-log    --test shuttle_fsync_manager
 
+# The M1.1 parking_lot-over-shuttle wrapper self-test:
+RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-util --test shuttle_dst_sync_pl
+
 # Reproduce a specific shuttle schedule (shuttle prints a failing seed and a
 # replayable schedule string on failure):
 SHUTTLE_RANDOM_SEED=12345 RUSTFLAGS="--cfg noxu_shuttle" \
@@ -319,3 +322,41 @@ The shared invariant asserts the shuttle tests check
 `FsyncedNeverDecreases`, `DurableImpliesLogged` — now checked against the real
 code at every explored interleaving. This is the "specs become the DST
 oracle" synergy: write each invariant once, check it two ways.
+
+### DST Milestone 1.1 — clock thread-through + parking_lot-over-shuttle
+
+M1 added the injectable `Clock` (`noxu_util::{Clock, RealClock, SimClock}`) but
+left two seams for M1.1, both now done:
+
+1. **Clock threaded through the remaining control-flow time sites.** A
+   `SimClock` can now drive every timeout-relevant clock read:
+   - `FsyncManager::with_clock` — the group-commit wait and `LOG_FSYNC_TIMEOUT`
+     recovery.
+   - `LockManager::with_config_clock` — the lock-wait timeout and 50 ms deadlock
+     re-detection slice.
+   - `DaemonManager` is intentionally *not* clock-threaded (config `Duration` +
+     notify-driven shutdown; nothing to virtualise).
+
+   Every existing constructor keeps defaulting to `RealClock`, so the default
+   build has **zero** production behavior change.
+
+2. **`noxu_util::dst_sync_pl`: a `parking_lot`-over-shuttle wrapper.** M2's
+   `dst_sync` only swaps `std::sync`, so only `std`-shaped modules
+   (`FsyncManager`, `DaemonManager`) could be shuttle-tested. `dst_sync_pl`
+   presents the `parking_lot` shape (`lock() -> guard`,
+   `wait_for(&mut guard, dur)`) that `noxu-sync`-based modules use:
+   - Default build: a transparent re-export of the real `noxu-sync` types —
+     zero cost, shuttle absent from the graph.
+   - `#[cfg(noxu_shuttle)]`: fully-safe wrappers over `shuttle::sync`.
+
+   **The timed-wait crux.** shuttle 0.9's `Condvar::wait_timeout` never times
+   out. The wrapper's `wait_for` registers a `SimClock` deadline; the harness
+   calls `advance_and_fire(clock, dur)` to advance simulated time and notify
+   waiters whose deadline elapsed, which then observe `timed_out() == true`. A
+   level-triggered fired-flag plus re-notification of pending fires closes the
+   notify-before-block gap, so a **clock-driven timed wait fires
+   deterministically** under shuttle+`SimClock`. This is what unblocks a
+   `lock_manager` / `FsyncManager` oracle whose liveness depends on a timeout.
+   The self-test `noxu-util/tests/shuttle_dst_sync_pl.rs` proves the wrapped
+   `Mutex` is schedulable and the clock-driven timeout fires on every explored
+   interleaving.
