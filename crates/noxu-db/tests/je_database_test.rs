@@ -532,13 +532,12 @@ fn multi_env_open_close_test_multi_open_close() {
 
     // Phase 2: repeatedly reopen read-only and read all records.
     //
-    // Adaptation: noxu's database-name registry is not persisted across a
-    // clean close+reopen (tracked via
-    // `recovery_edge_test_non_txnal_db` #[ignore]).  We re-open with
-    // `allow_create=true` to side-step that gap; the records themselves
-    // survive recovery, so the read-loop still exercises the
-    // open/close resource-leak path that JE's testMultiOpenClose was
-    // written to detect.
+    // Note: noxu's database-name registry IS persisted across a clean
+    // close+reopen (see `recovery_edge_test_non_txnal_db`, which asserts a
+    // db survives close+reopen). We open with `allow_create=true` here for
+    // simplicity; it is harmless (the db already exists). The read-loop
+    // exercises the open/close resource-leak path that JE's testMultiOpenClose
+    // was written to detect.
     for _ in 0..N_ITERS {
         let cfg = EnvironmentConfig::new(path.clone())
             .with_transactional(true)

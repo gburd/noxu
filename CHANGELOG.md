@@ -15,6 +15,55 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+A small, focused cleanup release: it removes the moot config knobs that were
+`#[deprecated]` in 7.1 (a breaking public-API removal — treated as a
+major-semantics 7.2 release since there are no external users) and truths-up
+stale `known-limitations.md` docs that claimed already-done work was deferred.
+
+### Removed
+
+- **BREAKING: moot `EnvironmentConfig` knobs deleted outright (`noxu-db`).**
+  The config knobs `#[deprecated]` in 7.1 ("will be removed in 8.0") are now
+  removed — fields, `set_*` setters, `with_*` builders, and their `Default`
+  values. They were stored-but-never-read (nothing in `DbiEnvConfig` /
+  `EnvironmentImpl` consumed them). No deprecated stubs are left (no external
+  users → a clean delete is correct). Removed:
+  - `adler32_chunk_size` — Noxu uses CRC32 (crc32fast, CLMUL-accelerated) for
+    on-disk integrity, never Adler32.
+  - The JE-style logging/tracing knobs — `logging_level`,
+    `console_logging_level`, `file_logging_level`, `trace_console`, `trace_db`,
+    `trace_file`, `trace_level`, `trace_file_count`, `trace_file_limit_bytes`,
+    and the per-subsystem `trace_level_lock_manager` / `_recovery` /
+    `_evictor` / `_cleaner`. Diagnostics route through the Rust `log` crate /
+    `noxu-observe` / `RUST_LOG`.
+  - `env_dup_convert_preload_all` — configures the JE 4→5 duplicate-DB
+    on-disk conversion, N/A to Noxu's native `.ndb` format.
+
+  Reserved-not-yet-implemented knobs (`env_fair_latches`,
+  `env_expiration_enabled`, `env_ttl_clock_tolerance_ms`, `env_db_eviction`,
+  `BIN_DELTA_BLIND_*`, ...) are **kept** — they emit a `WARN` and track real
+  deferred features.
+
+### Docs
+
+- **Truthed-up `docs/src/operations/known-limitations.md`.** Corrected stale
+  rows that claimed completed work was deferred/inert, verified against the
+  code:
+  - IN cached-node heap-footprint compactions: T-3 (`LsnRep::Compact`) and
+    T-2/T-5 (`KeyRep::Compact`) are **implemented** as in-memory cached-node
+    compactions (the on-disk `.ndb` format is unaffected — `serialize_full`
+    writes full keys via `get_full_key()` and full 8-byte LSNs via
+    `as_u64()`); `TREE_COMPACT_MAX_KEY_LENGTH` (default 16) is **wired and
+    active**. The only remaining T-3 item is optional variable-width LSN
+    packing. Moved out of the "deferred/inert" framing.
+  - `EVICTOR_MUTATE_BINS` and `TREE_COMPACT_MAX_KEY_LENGTH` corrected from
+    "accepted-but-inert" (EV-11/T-5) to wired-and-active.
+  - Removed stale comments claiming non-transactional DB names don't survive
+    recovery (`je_recovery_test.rs`, `je_database_test.rs`): they describe a
+    bygone v2.2.1 limitation; `recovery_edge_test_non_txnal_db` passes.
+  - Updated the DBI-14 knobs row and `reference/configuration.md` to say the
+    moot knobs are removed in 7.2 (not "deprecated no-ops / removed in 8.0").
+
 ## [7.1.0] - 2026-07-01
 
 ### Added
