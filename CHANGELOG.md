@@ -43,6 +43,17 @@ listed in [References](#references).
   `tokio::task::spawn_blocking`, and never hold a `Transaction`/`Cursor`
   across an `.await`.
 
+- **P2-4 — advisory cache-mode knobs documented explicitly.** The
+  user-settable `cache_mode` hints (`ReadOptions`, `WriteOptions`,
+  `DatabaseConfig`) and `update_ttl` were already `#[deprecated]` as inert in
+  7.0; this makes the advisory status explicit in the docs so the knobs don't
+  read as silently lying. Added an "Advisory status" note to the `CacheMode`
+  rustdoc (it is a live type used by the env-level evictor policy, but the
+  per-op / per-DB hints are not honored), tightened the `get_with_options` /
+  `put_with_options` doc comments to say "accepted but not yet honored," and
+  added an advisory note to the `DatabaseConfig` table in
+  `docs/src/reference/configuration.md` with a tracking note.
+
 ## [7.0.0] - 2026-07-01
 
 ### Changed (BREAKING — 7.0 core API reshape)
