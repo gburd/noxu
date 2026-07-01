@@ -1880,6 +1880,14 @@ impl Database {
         noxu_dbi::DatabaseId::new(self.id as i64)
     }
 
+    /// The env's `DOS_PRODUCER_QUEUE_TIMEOUT` (ms), read from the owning
+    /// `EnvironmentImpl` at cursor-open time (not a hot path).  Passed to the
+    /// disk-ordered-cursor producer so a lagging consumer fails the scan
+    /// instead of hanging (JE `DOS_PRODUCER_QUEUE_TIMEOUT`).
+    pub(crate) fn dos_producer_queue_timeout_ms(&self) -> u64 {
+        self.env_impl.lock().get_dos_producer_queue_timeout_ms()
+    }
+
     /// Checks if the database is writable, returns an error if not.
     fn check_writable(&self) -> Result<()> {
         if self.config.read_only {

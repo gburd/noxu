@@ -172,6 +172,10 @@ pub struct EnvironmentImpl {
     /// `freeDisk` are 0.
     disk_limit: Arc<crate::disk_limit::DiskLimitTracker>,
 
+    /// `DOS_PRODUCER_QUEUE_TIMEOUT`: max time the DiskOrderedScan producer
+    /// blocks trying to enqueue an item before failing the scan (ms).
+    dos_producer_queue_timeout_ms: u64,
+
     /// The cache evictor (shared with the background daemon thread).
     ///
     /// For a PRIVATE env this is a per-env evictor with its own daemon.  For a
@@ -1516,6 +1520,7 @@ impl EnvironmentImpl {
                 .as_millis() as u64,
             log_manager,
             disk_limit,
+            dos_producer_queue_timeout_ms: cfg.dos_producer_queue_timeout_ms,
             evictor,
             shared_evictor_handle,
             // `evictor_thread` is `None` for a shared-cache env (the shared
@@ -2353,6 +2358,14 @@ impl EnvironmentImpl {
     /// write path can check the violation flag without locking the env.
     pub fn get_disk_limit(&self) -> Arc<crate::disk_limit::DiskLimitTracker> {
         Arc::clone(&self.disk_limit)
+    }
+
+    /// `DOS_PRODUCER_QUEUE_TIMEOUT` in milliseconds (JE
+    /// `EnvironmentParams.DOS_PRODUCER_QUEUE_TIMEOUT`): the max time a
+    /// DiskOrderedScan producer blocks trying to enqueue an item before it
+    /// fails the scan.
+    pub fn get_dos_producer_queue_timeout_ms(&self) -> u64 {
+        self.dos_producer_queue_timeout_ms
     }
 
     /// Recomputes the cached disk-limit violation state (JE:

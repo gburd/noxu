@@ -40,6 +40,9 @@ pub struct DbiEnvConfig {
     /// Reserved / not yet implemented as of v3.1.
     /// Stored for future use; not read by any subsystem.
     pub env_expiration_enabled: bool,
+    /// `DOS_PRODUCER_QUEUE_TIMEOUT`: max time the DiskOrderedScan producer
+    /// will block trying to enqueue an item before failing the scan.
+    pub dos_producer_queue_timeout_ms: u64,
     /// Reserved / not yet implemented as of v3.1.
     /// Stored for future use; not read by the evictor.
     pub env_db_eviction: bool,
@@ -253,6 +256,7 @@ impl Default for DbiEnvConfig {
             env_latch_timeout_ms: 300_000,
             env_ttl_clock_tolerance_ms: 0,
             env_expiration_enabled: false,
+            dos_producer_queue_timeout_ms: 10_000,
             env_db_eviction: false,
             // Memory
             cache_size: 64 * 1024 * 1024,

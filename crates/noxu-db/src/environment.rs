@@ -288,6 +288,7 @@ impl Environment {
             env_latch_timeout_ms: config.env_latch_timeout_ms,
             env_ttl_clock_tolerance_ms: config.env_ttl_clock_tolerance_ms,
             env_expiration_enabled: config.env_expiration_enabled,
+            dos_producer_queue_timeout_ms: config.dos_producer_queue_timeout_ms,
             env_db_eviction: config.env_db_eviction,
             // Memory
             cache_size: config.cache_size,

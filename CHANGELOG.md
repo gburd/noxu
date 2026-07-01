@@ -17,6 +17,19 @@ listed in [References](#references).
 
 ### Added
 
+- **`dos_producer_queue_timeout_ms` DiskOrderedScan producer timeout
+  (`noxu-dbi` + `noxu-db`).** The DiskOrderedScan producer thread now honours
+  `EnvironmentConfig::with_dos_producer_queue_timeout_ms` (`noxu.dos.producer
+  QueueTimeout`, default 10 s): when a lagging consumer keeps the bounded
+  producer queue full past the timeout, the producer fails the scan with an
+  `OperationFailed` error instead of blocking forever. Implemented via a
+  polling `try_send` offer loop (`offer_with_timeout`) that also observes
+  cancellation promptly. Threaded `EnvironmentConfig` -> `DbiEnvConfig` ->
+  `EnvironmentImpl::get_dos_producer_queue_timeout_ms` ->
+  `DiskOrderedCursorOptions`. Removed from the `unimplemented_params` WARN
+  registry. Default 10 s and a draining consumer are byte-identical to prior
+  behaviour. JE ref: `DiskOrderedScanner` / `BlockingQueue.offer(item,
+  timeout)`, `EnvironmentParams.DOS_PRODUCER_QUEUE_TIMEOUT`.
 - **`RESERVED_DISK` disk-space reservation (`noxu-dbi` + `noxu-db`).** Beyond
   `FREE_DISK`, the new `EnvironmentConfig::with_reserved_disk(bytes)`
   (`noxu.reservedDisk`, default 0) reserves N extra bytes: a user write is
