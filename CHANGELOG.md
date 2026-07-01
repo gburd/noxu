@@ -17,6 +17,34 @@ listed in [References](#references).
 
 ### Added
 
+- **CLN-2 / `VerifyUtils.checkLsns()` — LSN↔utilization-profile overlap check
+  (`noxu-cleaner` + `noxu-engine` + `noxu-dbi` + `noxu-db`).** `Environment::verify`
+  now runs BOTH halves of JE's recovery verification. In addition to the
+  existing live-tree structural walk it performs the `checkLsns` overlap check:
+  the set of live tree LSNs must be DISJOINT from the obsolete LSNs recorded in
+  the `UtilizationTracker`. The engine gathers the live LN LSNs from each live
+  (non-known-deleted) BIN slot (`noxu_engine::gather_tree_lsns`, JE `GatherLSNs`
+  driven by a `SortedLSNTreeWalker`); the cleaner supplies the obsolete set at
+  per-LSN OFFSET granularity by rebuilding `Lsn::new(file_num, offset)` from each
+  `TrackedFileSummary`'s obsolete-offset detail (`noxu_cleaner::check_lsns` /
+  `obsolete_lsn_set`, JE `UtilizationProfile.getObsoleteDetailPacked` +
+  `DbLsn.makeLsn`); `check_lsns_against_tracker` bridges the two and reports any
+  live LSN found in the obsolete set as a `DataInconsistency` verify error (JE
+  "Obsolete LSN set contains valid LSN" → `LOG_INTEGRITY`
+  `EnvironmentFailureException`). `NULL_LSN` is ignored on both sides (JE
+  `GatherLSNs.processLSN` skips `DbLsn.NULL_LSN`). The `UtilizationTracker` is
+  threaded into the verifier via `EnvironmentImpl::get_utilization_tracker`,
+  locked once per `verify()` and held read-only across all databases. This is
+  ADDITIVE and non-breaking: `verify` is a diagnostic path and `VerifyResult`
+  already carries `errors`. The recovery suites (`recovery_correctness_test`,
+  `crash_recovery_test`) now assert LSN↔profile disjointness after every
+  recovery, so a recovery producing a correct tree but a utilization profile
+  that mislabels a live LSN as obsolete now FAILS verification. Positive and
+  negative unit tests (`noxu_cleaner::verify_utils`:
+  `test_check_lsns_healthy_passes`, `test_check_lsns_detects_live_in_obsolete`)
+  prove the check is not vacuous. JE ref:
+  `com.sleepycat.je.util.VerifyUtils.checkLsns` / `verifyUtilizationInfo`.
+
 - **`exception_listener` daemon-error callback (`noxu-config` + `noxu-dbi` +
   `noxu-db`).** A faithful analogue of JE `ExceptionListener`: register a
   callback on `EnvironmentConfig::with_exception_listener`, and when a
