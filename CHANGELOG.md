@@ -15,6 +15,79 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Added
+
+- **`exception_listener` daemon-error callback (`noxu-config` + `noxu-dbi` +
+  `noxu-db`).** A faithful analogue of JE `ExceptionListener`: register a
+  callback on `EnvironmentConfig::with_exception_listener`, and when a
+  background daemon (checkpointer / cleaner / log-flusher) hits a recoverable
+  error — previously silently swallowed — the listener's
+  `exception_event(&ExceptionEvent)` fires with the daemon source, the error
+  message, and the OS thread name. Wired through a new
+  `noxu_config::ExceptionDispatcher` shared into each daemon at spawn and
+  installed by `Environment::open` before any daemon does work; a no-op (zero
+  cost) when no listener is registered. JE ref:
+  `com.sleepycat.je.ExceptionListener`, `EnvironmentImpl` daemon catch blocks.
+- **`env_check_leaks` lock-leak detection at close (`noxu-txn` + `noxu-db`).**
+  At `Environment::close`, when `env_check_leaks` is `true` (the default),
+  Noxu walks the active lock table (new `LockManager::report_leaked_locks`)
+  and logs a `warn!` for any lock still held with an owner — an application
+  leak (a dropped `Transaction`, a cursor held open). Diagnostic only: it
+  reports the leaked `(lsn, owner_locker_ids)`, it does not force-release or
+  fail the close. Removed `env_check_leaks` from the `unimplemented_params`
+  WARN registry. JE ref: `EnvironmentImpl` leak checking.
+- **Stats-file dump (`STATS_FILE_*`, `noxu-db`).** When `stats_collect` is
+  enabled, a `noxu-stats-file` background daemon (faithful analogue of JE
+  `StatCapture`) samples the same snapshot `Environment::stats()` returns and
+  appends a CSV row to a rotating stats file (`noxu.stat.<N>.csv`) in
+  `stats_file_directory` (default: env home) every
+  `stats_collect_interval_secs`. After `stats_file_row_count` rows it rotates;
+  at most `stats_max_files` files are retained (oldest pruned). The CSV is
+  self-contained (no external recorder needed). New `noxu_db::stats_file`
+  module. JE ref: `EnvironmentParams.STATS_FILE_*`, `StatCapture`.
+- **`startup_dump_threshold_ms` startup performance summary (`noxu-db`).**
+  When `Environment::open` takes at least the configured threshold (startup is
+  dominated by the crash-recovery analysis/redo/undo passes), Noxu now logs a
+  `warn!` startup summary with the elapsed open time and a `get_stats()`
+  snapshot so operators can see why a slow start happened. Threshold `0` (the
+  default) disables it. Removed from the `unimplemented_params` WARN registry.
+  JE ref: `EnvironmentParams.STARTUP_DUMP_THRESHOLD`.
+- **L-3 debug-build latch-ordering assertion (`noxu-latch`).** A faithful
+  analogue of BDB-JE's debug-only latch-ordering enforcement
+  (`LatchSupport` / per-thread `LatchTable`). `LatchContext` gains an optional
+  ordering `rank`; a per-thread stack of held ranked latches asserts that
+  latches are acquired in strictly-increasing rank order, panicking on a
+  lock-ordering bug. Like JE's, the check is compiled out entirely in release
+  builds (`#[cfg(debug_assertions)]`) — zero release-build cost. Rank `0` (the
+  default) opts out, so existing unranked B-tree node latches are unaffected.
+  New public `noxu_latch::latch_order` module and `LatchContext::with_rank`.
+
+### Deprecated
+
+- **Moot `EnvironmentConfig` knobs deprecated (7.1, non-breaking).** A set of
+  config knobs that configure features Noxu deliberately does not have are now
+  `#[deprecated]` on their public setters (they still compile; they will be
+  removed in 8.0):
+  - `adler32_chunk_size` — Noxu uses CRC32 (crc32fast, CLMUL-accelerated) for
+    on-disk integrity, never Adler32 (weak on short messages). This knob
+    configures a checksum Noxu does not use.
+    See `docs/src/internal/checksum-selection.md`.
+  - The JE-style logging/tracing knobs — `logging_level`,
+    `console_logging_level`, `file_logging_level`, `trace_console`, `trace_db`,
+    `trace_file`, `trace_level`, `trace_file_count`, `trace_file_limit_bytes`,
+    and the per-subsystem `trace_level_lock_manager` / `_recovery` / `_evictor`
+    / `_cleaner`. Noxu routes ALL diagnostics through the Rust `log` crate /
+    `noxu-observe` / `RUST_LOG`; a second logging system would be redundant.
+    Configure logging via `RUST_LOG` or the `log` facade.
+  - `env_dup_convert_preload_all` — configures the JE 4→5 duplicate-DB on-disk
+    conversion, N/A to Noxu's native `.ndb` format (no legacy dup format to
+    convert). Marked deprecated-moot in its rustdoc (no setter to attribute).
+
+  These knobs were also removed from the `unimplemented_params` WARN registry:
+  a deprecated-moot knob announces itself at compile time via `#[deprecated]`
+  rather than pretending to be a real-but-unimplemented parameter that emits a
+  runtime `warn!`.
+
 ### Added (7.1 cleaner completions)
 
 - **CLN-14: cleaner → checkpointer `wakeupAfterNoWrites` wiring

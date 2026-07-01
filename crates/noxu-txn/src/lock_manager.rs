@@ -961,6 +961,29 @@ impl LockManager {
         total
     }
 
+    /// Enumerate locks still held (with at least one owner) at close time.
+    ///
+    /// Returns `(lsn, owner_locker_ids)` for every outstanding lock, sorted by
+    /// LSN.  Used by `env_check_leaks` (JE `EnvironmentImpl` leak checking):
+    /// at a clean `Environment::close` all user transactions have committed or
+    /// aborted and released their locks, so a non-empty result means an
+    /// application leaked a locker (e.g. dropped a `Transaction` without
+    /// commit/abort, or held a cursor open).  This is diagnostic only — it
+    /// reports, it does not force-release.
+    pub fn report_leaked_locks(&self) -> Vec<(u64, Vec<i64>)> {
+        let mut leaks: Vec<(u64, Vec<i64>)> = Vec::new();
+        for table in &self.lock_tables {
+            let table = table.lock();
+            for (lsn, lock) in table.iter() {
+                if lock.n_owners() > 0 {
+                    leaks.push((*lsn, lock.get_owner_ids()));
+                }
+            }
+        }
+        leaks.sort_unstable_by_key(|(lsn, _)| *lsn);
+        leaks
+    }
+
     // ========================================================================
     // Lock-sharing registry — `LockManager.threadLockers` analogue
     // ========================================================================
@@ -1255,6 +1278,39 @@ mod tests {
         let stats = lm.get_stats();
         assert_eq!(stats.lock_requests, 0);
         assert_eq!(stats.lock_waits, 0);
+    }
+
+    #[test]
+    fn test_report_leaked_locks() {
+        let lm = LockManager::new();
+        // No locks held: no leaks.
+        assert!(lm.report_leaked_locks().is_empty());
+
+        // Deliberately acquire two write locks for locker 42 and never release
+        // one of them.
+        lm.lock(1000, 42, LockType::Write, false, false).unwrap();
+        lm.lock(2000, 42, LockType::Write, false, false).unwrap();
+
+        let leaks = lm.report_leaked_locks();
+        assert_eq!(leaks.len(), 2, "both held locks must be reported");
+        // Sorted by LSN; each reports locker 42 as an owner.
+        assert_eq!(leaks[0].0, 1000);
+        assert_eq!(leaks[1].0, 2000);
+        assert!(leaks[0].1.contains(&42));
+        assert!(leaks[1].1.contains(&42));
+
+        // Release one: only the still-held lock is reported.
+        lm.release(1000, 42).unwrap();
+        let leaks = lm.report_leaked_locks();
+        assert_eq!(leaks.len(), 1, "released lock must not be reported");
+        assert_eq!(leaks[0].0, 2000);
+
+        // Release all for the locker: no leaks remain.
+        lm.release_all_for_locker(42);
+        assert!(
+            lm.report_leaked_locks().is_empty(),
+            "no leaks after all locks released"
+        );
     }
 
     #[test]

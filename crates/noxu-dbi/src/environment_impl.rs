@@ -400,6 +400,14 @@ pub struct EnvironmentImpl {
     /// environment opens via `Tree::set_compact_max_key_length`
     /// (`IN.getCompactMaxKeyLength`).  Default 16.
     compact_max_key_length: i32,
+
+    /// Background-daemon exception dispatcher (JE `ExceptionListener`
+    /// substrate).  A shared, late-bindable slot handed to each daemon at
+    /// spawn time; the higher layer (`noxu-db`) installs a sink via
+    /// [`set_exception_sink`](Self::set_exception_sink) right after
+    /// construction (before any daemon does work).  Daemon error sites call
+    /// `dispatch` so an application can observe recoverable async failures.
+    exception_dispatcher: noxu_config::ExceptionDispatcher,
 }
 
 impl EnvironmentImpl {
@@ -996,6 +1004,11 @@ impl EnvironmentImpl {
             (evictor, Some(handle))
         };
 
+        // Background-daemon exception dispatcher (JE ExceptionListener).
+        // Created before spawning daemons so each daemon captures a clone and
+        // can dispatch recoverable errors to the (later-installed) sink.
+        let exception_dispatcher = noxu_config::ExceptionDispatcher::new();
+
         // Build the cleaner wired to the FileManager, primary tree, and
         // LogManager for writable environments.  Read-only envs get None.
         //
@@ -1265,6 +1278,7 @@ impl EnvironmentImpl {
             let interval =
                 std::time::Duration::from_millis(checkpoint_interval_ms);
             let disk_limit_for_ckpt = Arc::clone(&disk_limit);
+            let dispatcher_for_ckpt = exception_dispatcher.clone();
             std::thread::Builder::new()
                 .name("noxu-checkpointer".to_string())
                 .spawn(move || {
@@ -1296,8 +1310,14 @@ impl EnvironmentImpl {
                         }
                         // Ignore checkpoint errors in the daemon — the
                         // environment may be closing or a concurrent
-                        // checkpoint may be in progress.
-                        let _ = ckpt_clone.do_checkpoint("daemon");
+                        // checkpoint may be in progress.  But surface a
+                        // recoverable error to the exception listener so an
+                        // application can observe async checkpoint failures
+                        // (JE ExceptionListener).
+                        if let Err(e) = ckpt_clone.do_checkpoint("daemon") {
+                            dispatcher_for_ckpt
+                                .dispatch("Checkpointer", &e.to_string());
+                        }
                     }
                 })
                 .expect("failed to spawn noxu-checkpointer thread")
@@ -1386,6 +1406,7 @@ impl EnvironmentImpl {
         let cleaner_for_daemon = cleaner.as_ref().map(Arc::clone);
         let run_cleaner_daemon = cfg.run_cleaner;
         let disk_limit_for_cleaner = Arc::clone(&disk_limit);
+        let dispatcher_for_cleaner = exception_dispatcher.clone();
         let cleaner_handle = std::thread::Builder::new()
             .name("noxu-cleaner".to_string())
             .spawn(move || {
@@ -1394,7 +1415,14 @@ impl EnvironmentImpl {
                 }
                 while !cleaner_shutdown_clone.is_shutdown() {
                     let sleep_ms = if let Some(ref c) = cleaner_for_daemon {
-                        let _ = c.do_clean(c.throttle.current_n_files(), false);
+                        if let Err(e) =
+                            c.do_clean(c.throttle.current_n_files(), false)
+                        {
+                            // Surface recoverable cleaner errors to the
+                            // exception listener (JE ExceptionListener).
+                            dispatcher_for_cleaner
+                                .dispatch("Cleaner", &e.to_string());
+                        }
                         // JE: Cleaner.manageDiskUsage refreshes the cached disk
                         // usage stats after each pass so writes blocked by a
                         // disk-limit violation resume as soon as space frees.
@@ -1424,6 +1452,7 @@ impl EnvironmentImpl {
             Arc::clone(&log_flush_no_sync_shutdown);
         let flush_interval_ms = cfg.log_flush_no_sync_interval_ms;
         let lm_for_flush = log_manager.as_ref().map(Arc::clone);
+        let dispatcher_for_flush = exception_dispatcher.clone();
         let log_flush_no_sync_handle = std::thread::Builder::new()
             .name("noxu-log-flusher".to_string())
             .spawn(move || {
@@ -1437,8 +1466,14 @@ impl EnvironmentImpl {
                     ) {
                         break;
                     }
-                    if let Some(ref lm) = lm_for_flush {
-                        let _ = lm.flush_no_sync();
+                    if let Some(ref lm) = lm_for_flush
+                        && let Err(e) = lm.flush_no_sync()
+                    {
+                        // Surface background fsync/flush errors (JE
+                        // ExceptionListener): the app can observe I/O errors
+                        // that would otherwise be silently swallowed here.
+                        dispatcher_for_flush
+                            .dispatch("LogFlusher", &e.to_string());
                     }
                 }
             })
@@ -1502,6 +1537,7 @@ impl EnvironmentImpl {
             replication_vlsn_counter: Mutex::new(None),
             // T-5: TREE_COMPACT_MAX_KEY_LENGTH from the env config.
             compact_max_key_length: cfg.tree_compact_max_key_length as i32,
+            exception_dispatcher,
         };
 
         // Mark as open
@@ -1530,6 +1566,21 @@ impl EnvironmentImpl {
         counter: Arc<std::sync::atomic::AtomicU64>,
     ) {
         *self.replication_vlsn_counter.lock().unwrap() = Some(counter);
+    }
+
+    /// Install the background-daemon exception sink (JE `ExceptionListener`).
+    ///
+    /// Called by `noxu_db::Environment::open` right after construction — before
+    /// any daemon performs work (each daemon sleeps its wakeup interval first).
+    /// Once installed, recoverable errors in the checkpointer / cleaner /
+    /// log-flusher daemons are dispatched to `sink` as `(source, message)`.
+    pub fn set_exception_sink(&self, sink: noxu_config::DaemonExceptionSink) {
+        self.exception_dispatcher.set(sink);
+    }
+
+    /// Test/diagnostic accessor: the daemon exception dispatcher.
+    pub fn exception_dispatcher(&self) -> &noxu_config::ExceptionDispatcher {
+        &self.exception_dispatcher
     }
     pub fn is_read_only(&self) -> bool {
         self.is_read_only

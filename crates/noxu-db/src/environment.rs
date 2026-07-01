@@ -22,6 +22,49 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
+/// Build an [`EnvironmentStats`] snapshot from a locked [`EnvironmentImpl`].
+///
+/// Shared by [`Environment::stats`] and the periodic stats-file dumper
+/// ([`crate::stats_file`]) so both produce byte-identical snapshots.  The
+/// caller holds the `EnvironmentImpl` lock; `log_manager` is the cached handle
+/// (avoids a second lock on the stats hot path).
+pub(crate) fn build_environment_stats(
+    env_impl: &EnvironmentImpl,
+    log_manager: Option<&LogManager>,
+    cache_size: u64,
+) -> EnvironmentStats {
+    let n_databases = env_impl.n_databases() as u32;
+    let log = log_manager
+        .map(|lm| LogStatsSnapshot::from(&lm.get_stats()))
+        .unwrap_or_default();
+    let lock =
+        LockStatsSnapshot::from(&env_impl.get_lock_manager().get_stats());
+    let txn = TxnStatsSnapshot::from(&env_impl.get_txn_manager().get_stats());
+    let throughput = env_impl.get_throughput_snapshot();
+    let evictor =
+        EvictorStatsSnapshot::from(env_impl.get_evictor().get_stats());
+    let cleaner = env_impl
+        .get_cleaner()
+        .map(|c| c.get_stats().snapshot())
+        .unwrap_or_default();
+    let checkpoint = env_impl
+        .get_checkpointer()
+        .map(|cp| cp.get_stats().snapshot())
+        .unwrap_or_default();
+    EnvironmentStats {
+        cache_size,
+        cache_usage: env_impl.get_cache_usage().max(0) as u64,
+        n_databases,
+        log,
+        lock,
+        txn,
+        throughput,
+        evictor,
+        cleaner,
+        checkpoint,
+    }
+}
+
 /// A database environment.
 ///
 ///
@@ -86,6 +129,10 @@ pub struct Environment {
     /// Per-commit timeout for replica acknowledgments.  Mirrors
     /// `noxu_rep::RepConfig::replica_ack_timeout`; defaults to 5s.
     replica_ack_timeout: Mutex<std::time::Duration>,
+    /// Background stats-file dumper (STATS_FILE_*), started at open when
+    /// `stats_collect` is enabled and a stats-file destination is configured.
+    /// `None` when stats collection is off.  Stopped (joined) at `close`.
+    stats_dumper: Mutex<Option<crate::stats_file::StatsFileDumper>>,
 }
 
 /// Internal database handle state.
@@ -171,6 +218,7 @@ impl Environment {
     /// - The environment directory exists but is not writable and `read_only` is false
     /// - Invalid configuration parameters are provided
     pub fn open(config: EnvironmentConfig) -> Result<Self> {
+        let open_start = std::time::Instant::now();
         let home = config.home.clone();
 
         // Validate home directory
@@ -379,9 +427,74 @@ impl Environment {
         let env_impl = EnvironmentImpl::from_dbi_config(home.clone(), &dbi_cfg)
             .map_err(|e| NoxuError::environment(e.to_string()))?;
 
+        // exception_listener (JE ExceptionListener): if the application
+        // registered a listener, install a daemon exception sink that adapts
+        // the daemon's (source, message) callback into the public
+        // `ExceptionEvent`.  Installed here — before any daemon performs work
+        // (each daemon sleeps its wakeup interval first) — so no async daemon
+        // failure is missed.  Without a listener the sink is never installed
+        // and dispatch is a no-op.
+        if let Some(listener) = config.exception_listener() {
+            env_impl.set_exception_sink(std::sync::Arc::new(
+                move |source: &str, message: &str| {
+                    let src = match source {
+                        "Checkpointer" => {
+                            crate::error::ExceptionSource::Checkpointer
+                        }
+                        "Cleaner" => crate::error::ExceptionSource::Cleaner,
+                        "Evictor" => crate::error::ExceptionSource::Evictor,
+                        "INCompressor" => {
+                            crate::error::ExceptionSource::INCompressor
+                        }
+                        "Verifier" => crate::error::ExceptionSource::Verifier,
+                        other => crate::error::ExceptionSource::Unknown(
+                            other.to_string(),
+                        ),
+                    };
+                    let thread_name = std::thread::current()
+                        .name()
+                        .unwrap_or("<unnamed>")
+                        .to_string();
+                    let event = crate::error::ExceptionEvent::new(
+                        message.to_string(),
+                        src,
+                        thread_name,
+                    );
+                    listener.exception_event(&event);
+                },
+            ));
+        }
+
         let log_manager = env_impl.get_log_manager();
         let env_impl_arc = Arc::new(Mutex::new(env_impl));
-        Ok(Environment {
+
+        // STATS_FILE_*: start the periodic stats-file dumper (JE StatCapture)
+        // when stats collection is enabled.  The dumper samples the same
+        // snapshot `stats()` returns and appends a rotating CSV to
+        // `stats_file_directory` (default: the env home).  Off by default
+        // (stats_collect = false).
+        let stats_dumper = if config.stats_collect {
+            let dir = config
+                .stats_file_directory
+                .clone()
+                .unwrap_or_else(|| home.clone());
+            let interval = std::time::Duration::from_secs(
+                config.stats_collect_interval_secs.max(1),
+            );
+            Some(crate::stats_file::StatsFileDumper::start(
+                Arc::clone(&env_impl_arc),
+                log_manager.clone(),
+                config.cache_size,
+                dir,
+                interval,
+                config.stats_file_row_count,
+                config.stats_max_files,
+            ))
+        } else {
+            None
+        };
+
+        let env = Environment {
             home,
             config,
             databases: Mutex::new(HashMap::new()),
@@ -395,12 +508,48 @@ impl Environment {
             last_checkpoint_end_lsn: Mutex::new(noxu_util::NULL_LSN),
             replica_coordinator: Mutex::new(None),
             replica_ack_timeout: Mutex::new(std::time::Duration::from_secs(5)),
-        })
+            stats_dumper: Mutex::new(stats_dumper),
+        };
+
+        // STARTUP_DUMP_THRESHOLD: if opening the environment (dominated by
+        // crash-recovery: the analysis + redo + undo passes) took longer than
+        // the configured threshold, log a one-line startup performance summary
+        // plus a stats snapshot so operators can see WHY a slow start happened.
+        // A threshold of 0 (the default) disables the dump.
+        // JE ref: EnvironmentParams.STARTUP_DUMP_THRESHOLD / EnvironmentImpl
+        // dumping the startup RecoveryInfo + EnvironmentStats when startup is
+        // slow.
+        let threshold_ms = env.config.startup_dump_threshold_ms;
+        if threshold_ms > 0 {
+            let elapsed_ms = open_start.elapsed().as_millis() as u64;
+            if Self::startup_dump_triggered(elapsed_ms, threshold_ms) {
+                match env.stats() {
+                    Ok(stats) => log::warn!(
+                        "startup dump: Environment::open took {elapsed_ms} ms \
+                         (threshold {threshold_ms} ms). Startup is dominated by \
+                         crash recovery. Stats snapshot after open: {stats:?}"
+                    ),
+                    Err(e) => log::warn!(
+                        "startup dump: Environment::open took {elapsed_ms} ms \
+                         (threshold {threshold_ms} ms); stats unavailable: {e}"
+                    ),
+                }
+            }
+        }
+
+        Ok(env)
+    }
+
+    /// STARTUP_DUMP_THRESHOLD predicate: returns `true` when the measured
+    /// `Environment::open` elapsed time (ms) meets or exceeds a non-zero
+    /// `threshold_ms`.  Extracted so the decision is unit-testable without a
+    /// log-capture harness.  A threshold of 0 disables the dump.
+    #[inline]
+    fn startup_dump_triggered(elapsed_ms: u64, threshold_ms: u64) -> bool {
+        threshold_ms > 0 && elapsed_ms >= threshold_ms
     }
 
     /// Closes the environment handle.
-    ///
-    ///
     ///
     /// # Errors
     /// Returns an error if:
@@ -436,7 +585,32 @@ impl Environment {
         }
 
         self.open.store(false, Ordering::Release);
+        // Stop the stats-file dumper (join its thread) before tearing down the
+        // engine, so it cannot sample a closing EnvironmentImpl.
+        if let Some(dumper) = self.stats_dumper.lock().take() {
+            dumper.stop();
+        }
         let env_impl = self.env_impl.lock();
+        // env_check_leaks (default true): at a clean close all user
+        // transactions have released their locks; any lock still held with an
+        // owner indicates an application leak (a dropped Transaction, a cursor
+        // held open, ...).  Report it (JE EnvironmentImpl leak checking).  This
+        // is diagnostic only — it warns, it does not fail the close.
+        if self.config.env_check_leaks {
+            let leaks = env_impl.get_lock_manager().report_leaked_locks();
+            if !leaks.is_empty() {
+                let total_locks: usize =
+                    leaks.iter().map(|(_, owners)| owners.len()).sum();
+                log::warn!(
+                    "env_check_leaks: {} lock(s) still held by {} locker(s) at \
+                     Environment::close — an application likely leaked a \
+                     transaction or cursor. Leaked (lsn, owners): {:?}",
+                    leaks.len(),
+                    total_locks,
+                    leaks,
+                );
+            }
+        }
         let _ = env_impl.close();
         Ok(())
     }
@@ -1225,40 +1399,11 @@ impl Environment {
     pub fn stats(&self) -> Result<EnvironmentStats> {
         self.check_open()?;
         let env_impl = self.env_impl.lock();
-        let n_databases = env_impl.n_databases() as u32;
-        // Use cached log_manager for the log stats to avoid double-locking.
-        let log = self
-            .log_manager
-            .as_ref()
-            .map(|lm| LogStatsSnapshot::from(&lm.get_stats()))
-            .unwrap_or_default();
-        let lock =
-            LockStatsSnapshot::from(&env_impl.get_lock_manager().get_stats());
-        let txn =
-            TxnStatsSnapshot::from(&env_impl.get_txn_manager().get_stats());
-        let throughput = env_impl.get_throughput_snapshot();
-        let evictor =
-            EvictorStatsSnapshot::from(env_impl.get_evictor().get_stats());
-        let cleaner = env_impl
-            .get_cleaner()
-            .map(|c| c.get_stats().snapshot())
-            .unwrap_or_default();
-        let checkpoint = env_impl
-            .get_checkpointer()
-            .map(|cp| cp.get_stats().snapshot())
-            .unwrap_or_default();
-        Ok(EnvironmentStats {
-            cache_size: self.config.cache_size,
-            cache_usage: env_impl.get_cache_usage().max(0) as u64,
-            n_databases,
-            log,
-            lock,
-            txn,
-            throughput,
-            evictor,
-            cleaner,
-            checkpoint,
-        })
+        Ok(build_environment_stats(
+            &env_impl,
+            self.log_manager.as_deref(),
+            self.config.cache_size,
+        ))
     }
 
     /// Returns the total number of fdatasync calls performed by the log manager.
@@ -1718,6 +1863,148 @@ mod tests {
         let env = Environment::open(config).unwrap();
         assert!(env.is_valid());
         assert_eq!(env.home(), temp_dir.path());
+        env.close().unwrap();
+    }
+
+    #[test]
+    fn test_env_check_leaks_reports_leaked_lock() {
+        use noxu_txn::LockType;
+        let (_temp_dir, config) = temp_env_config();
+        // env_check_leaks defaults to true.
+        assert!(config.env_check_leaks);
+        let env = Environment::open(config).unwrap();
+
+        // Deliberately leak a lock directly on the shared lock manager: a
+        // locker (id 999) acquires a write lock and never releases it. This is
+        // exactly the leak env_check_leaks is meant to surface (an application
+        // that dropped a transaction/cursor without releasing its locks).
+        {
+            let env_impl = env.env_impl.lock();
+            let lm = env_impl.get_lock_manager();
+            lm.lock(0xDEAD_BEEF, 999, LockType::Write, false, false).unwrap();
+            // The leak is observable before close.
+            let leaks = lm.report_leaked_locks();
+            assert!(
+                leaks.iter().any(|(lsn, owners)| *lsn == 0xDEAD_BEEF
+                    && owners.contains(&999)),
+                "the deliberately-leaked lock must be reported"
+            );
+        }
+
+        // close() must still succeed; env_check_leaks only warns (side effect).
+        // There are no *tracked* active transactions, so the active-txn guard
+        // does not block the close.
+        env.close().unwrap();
+    }
+
+    #[test]
+    fn test_env_check_leaks_clean_close_no_leak() {
+        let (_temp_dir, config) = temp_env_config();
+        let env = Environment::open(config).unwrap();
+        // A clean env with no outstanding locks reports zero leaks.
+        {
+            let env_impl = env.env_impl.lock();
+            assert!(
+                env_impl.get_lock_manager().report_leaked_locks().is_empty(),
+                "a freshly opened env must have no leaked locks"
+            );
+        }
+        env.close().unwrap();
+    }
+
+    // exception_listener (JE ExceptionListener)
+    #[test]
+    fn test_exception_listener_fires_on_daemon_error() {
+        use crate::error::{
+            ExceptionEvent, ExceptionListener, ExceptionSource,
+        };
+        use std::sync::Arc as StdArc;
+        use std::sync::Mutex as StdMutex;
+
+        // A listener that records every event it receives.
+        #[derive(Default)]
+        struct Recorder {
+            events: StdMutex<Vec<ExceptionEvent>>,
+        }
+        impl ExceptionListener for Recorder {
+            fn exception_event(&self, event: &ExceptionEvent) {
+                self.events.lock().unwrap().push(event.clone());
+            }
+        }
+
+        let recorder = StdArc::new(Recorder::default());
+        let (_temp_dir, config) = temp_env_config();
+        let config = config.with_exception_listener(recorder.clone());
+        let env = Environment::open(config).unwrap();
+
+        // Drive the SAME dispatch path a background daemon uses when its
+        // do_checkpoint()/do_clean() returns an error.  This exercises the
+        // full production wiring: config listener -> set_exception_sink ->
+        // ExceptionDispatcher::dispatch -> adapter -> ExceptionListener.
+        {
+            let env_impl = env.env_impl.lock();
+            let d = env_impl.exception_dispatcher();
+            assert!(
+                d.is_installed(),
+                "the registered listener must install a daemon sink"
+            );
+            d.dispatch("Cleaner", "simulated background cleaner failure");
+            d.dispatch("Checkpointer", "simulated checkpoint failure");
+        }
+
+        let events = recorder.events.lock().unwrap();
+        assert_eq!(events.len(), 2, "listener must receive both daemon errors");
+        assert_eq!(events[0].source, ExceptionSource::Cleaner);
+        assert!(events[0].message.contains("cleaner failure"));
+        assert_eq!(events[1].source, ExceptionSource::Checkpointer);
+        assert!(events[1].message.contains("checkpoint failure"));
+        drop(events);
+
+        env.close().unwrap();
+    }
+
+    #[test]
+    fn test_no_exception_listener_leaves_sink_uninstalled() {
+        let (_temp_dir, config) = temp_env_config();
+        // No listener registered (the default).
+        let env = Environment::open(config).unwrap();
+        {
+            let env_impl = env.env_impl.lock();
+            assert!(
+                !env_impl.exception_dispatcher().is_installed(),
+                "no listener means no sink installed; dispatch is a no-op"
+            );
+            // dispatch must be a safe no-op with no sink.
+            env_impl.exception_dispatcher().dispatch("Cleaner", "ignored");
+        }
+        env.close().unwrap();
+    }
+
+    // STARTUP_DUMP_THRESHOLD (startup_dump_threshold_ms)
+    #[test]
+    fn test_startup_dump_triggered_predicate() {
+        // Disabled: threshold 0 never triggers regardless of elapsed.
+        assert!(!Environment::startup_dump_triggered(1_000_000, 0));
+        // Below threshold: no dump.
+        assert!(!Environment::startup_dump_triggered(9, 10));
+        // At threshold: dump (>=).
+        assert!(Environment::startup_dump_triggered(10, 10));
+        // Above threshold: dump.
+        assert!(Environment::startup_dump_triggered(50, 10));
+    }
+
+    #[test]
+    fn test_open_with_startup_dump_threshold_smoke() {
+        // A 1 ms threshold makes any real open exceed it, exercising the
+        // dump path (stats snapshot + warn!).  We only assert open still
+        // succeeds and the env is valid; the log line is a side effect.
+        let temp_dir = TempDir::new().unwrap();
+        let config = EnvironmentConfig::new(temp_dir.path().to_path_buf())
+            .with_allow_create(true)
+            .with_transactional(true)
+            .with_startup_dump_threshold_ms(1);
+        let env = Environment::open(config).unwrap();
+        assert!(env.is_valid());
         env.close().unwrap();
     }
 

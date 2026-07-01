@@ -19,9 +19,11 @@
 //! Approximately 165 configuration parameters are defined here covering
 //! environment, logging, locking, replication, and background daemon tuning.
 
+pub mod exception_sink;
 pub mod manager;
 pub mod param;
 pub mod params;
 
+pub use exception_sink::{DaemonExceptionSink, ExceptionDispatcher};
 pub use manager::ConfigManager;
 pub use param::{ConfigParam, ParamValue};
