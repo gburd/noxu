@@ -15,6 +15,18 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Added
+
+- **L-3 debug-build latch-ordering assertion (`noxu-latch`).** A faithful
+  analogue of BDB-JE's debug-only latch-ordering enforcement
+  (`LatchSupport` / per-thread `LatchTable`). `LatchContext` gains an optional
+  ordering `rank`; a per-thread stack of held ranked latches asserts that
+  latches are acquired in strictly-increasing rank order, panicking on a
+  lock-ordering bug. Like JE's, the check is compiled out entirely in release
+  builds (`#[cfg(debug_assertions)]`) — zero release-build cost. Rank `0` (the
+  default) opts out, so existing unranked B-tree node latches are unaffected.
+  New public `noxu_latch::latch_order` module and `LatchContext::with_rank`.
+
 ### Deprecated
 
 - **Moot `EnvironmentConfig` knobs deprecated (7.1, non-breaking).** A set of

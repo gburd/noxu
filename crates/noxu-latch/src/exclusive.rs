@@ -65,6 +65,9 @@ impl ExclusiveLatch {
             ))
         })?;
         self.owner.store(current, Ordering::Relaxed);
+        // L-3: record the acquisition for the debug-build latch-ordering
+        // assertion (no-op in release builds and for rank-0 latches).
+        crate::latch_order::enter(self.context.rank, &self.context.name);
         Ok(ExclusiveLatchGuard { latch: self, _guard: guard })
     }
 
@@ -88,6 +91,7 @@ impl ExclusiveLatch {
 
         self.inner.try_lock().map(|guard| {
             self.owner.store(current, Ordering::Relaxed);
+            crate::latch_order::enter(self.context.rank, &self.context.name);
             ExclusiveLatchGuard { latch: self, _guard: guard }
         })
     }
@@ -123,6 +127,7 @@ impl ExclusiveLatch {
     /// prefer dropping the guard.
     pub fn release_if_owner(&self) {
         if self.is_owner() {
+            crate::latch_order::leave(self.context.rank);
             self.owner.store(0, Ordering::Relaxed);
             // SAFETY: ownership verified above; caller guarantees no live guard
             // remains (see the safety precondition on this method) so this is
@@ -151,6 +156,7 @@ pub struct ExclusiveLatchGuard<'a> {
 
 impl Drop for ExclusiveLatchGuard<'_> {
     fn drop(&mut self) {
+        crate::latch_order::leave(self.latch.context.rank);
         self.latch.owner.store(0, Ordering::Relaxed);
     }
 }
@@ -335,6 +341,49 @@ mod tests {
         let s = format!("{:?}", latch);
         assert!(s.contains("debug-test"));
         assert!(s.contains("locked=false"));
+    }
+
+    // -----------------------------------------------------------------------
+    // L-3: debug-build latch-ordering assertion (JE LatchSupport analogue)
+    // -----------------------------------------------------------------------
+
+    /// Two ranked latches acquired in strictly increasing rank order are fine.
+    #[test]
+    fn test_latch_order_in_order_ok() {
+        use crate::LatchContext;
+        let parent =
+            ExclusiveLatch::new(LatchContext::new("parent").with_rank(10));
+        let child =
+            ExclusiveLatch::new(LatchContext::new("child").with_rank(20));
+        let _p = parent.acquire().expect("parent");
+        let _c = child.acquire().expect("child"); // 20 > 10: OK
+    }
+
+    /// Acquiring a lower-ranked latch while holding a higher-ranked one is a
+    /// lock-ordering bug and must panic **in debug builds** (the check is
+    /// compiled out in release, exactly like JE's).
+    #[cfg(debug_assertions)]
+    #[test]
+    fn test_latch_order_out_of_order_panics_debug() {
+        use crate::LatchContext;
+        let result = std::panic::catch_unwind(|| {
+            let high = ExclusiveLatch::new(
+                LatchContext::new("lock-table").with_rank(20),
+            );
+            let low =
+                ExclusiveLatch::new(LatchContext::new("tree").with_rank(10));
+            let g_high = high.acquire().expect("high");
+            // Acquiring rank 10 while holding rank 20 violates ordering.
+            let _g_low = low.acquire();
+            drop(g_high);
+        });
+        assert!(
+            result.is_err(),
+            "L-3: out-of-order latch acquisition must panic in a debug build"
+        );
+        // The per-thread ordering stack must be balanced again after the
+        // caught panic so sibling tests on this worker are unaffected.
+        assert_eq!(crate::latch_order::held_depth(), 0);
     }
 
     // -----------------------------------------------------------------------

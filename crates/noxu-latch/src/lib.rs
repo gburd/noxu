@@ -31,6 +31,8 @@ mod shared;
 pub use exclusive::{ExclusiveLatch, ExclusiveLatchGuard};
 pub use shared::{SharedLatch, SharedLatchReadGuard, SharedLatchWriteGuard};
 
+pub mod latch_order;
+
 use std::fmt;
 use std::time::Duration;
 
@@ -39,25 +41,45 @@ pub const DEFAULT_LATCH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Context information about a latch, used for debugging and diagnostics.
 ///
-/// Stores the latch name and acquisition timeout directly.
-/// In B-tree nodes the name identifies which node the latch protects.
+/// Stores the latch name, acquisition timeout, and an optional ordering
+/// **rank** used by the debug-build latch-ordering assertion (see
+/// [`latch_order`]).
 #[derive(Debug, Clone)]
 pub struct LatchContext {
     /// Name of this latch for debugging.
     pub name: String,
     /// Timeout for acquiring this latch.
     pub timeout: Duration,
+    /// Ordering rank for the debug-build latch-ordering assertion.
+    ///
+    /// Latches must be acquired in **strictly increasing** rank order on any
+    /// one thread.  A rank of `0` (the default) opts out of the ordering check
+    /// (it neither asserts against the current top nor blocks a higher-ranked
+    /// acquire), so existing unranked latches are unaffected.  This is a
+    /// faithful analogue of JE's debug-only `Latch` level/rank
+    /// (`LatchSupport`/`LatchTable` latch-ordering enforcement).
+    pub rank: u32,
 }
 
 impl LatchContext {
     /// Creates a new latch context with the given name and default timeout.
     pub fn new(name: impl Into<String>) -> Self {
-        LatchContext { name: name.into(), timeout: DEFAULT_LATCH_TIMEOUT }
+        LatchContext {
+            name: name.into(),
+            timeout: DEFAULT_LATCH_TIMEOUT,
+            rank: 0,
+        }
     }
 
     /// Creates a new latch context with the given name and timeout.
     pub fn with_timeout(name: impl Into<String>, timeout: Duration) -> Self {
-        LatchContext { name: name.into(), timeout }
+        LatchContext { name: name.into(), timeout, rank: 0 }
+    }
+
+    /// Builder-style setter for the ordering [`rank`](Self::rank).
+    pub fn with_rank(mut self, rank: u32) -> Self {
+        self.rank = rank;
+        self
     }
 }
 

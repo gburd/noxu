@@ -128,6 +128,9 @@ impl SharedLatch {
             ))
         })?;
         self.exclusive_owner.store(current, Ordering::Relaxed);
+        // L-3: record the exclusive acquisition for the debug-build latch-
+        // ordering assertion (no-op in release builds and for rank-0 latches).
+        crate::latch_order::enter(self.context.rank, &self.context.name);
         Ok(SharedLatchWriteGuard { latch: self, _guard: guard })
     }
 
@@ -146,6 +149,7 @@ impl SharedLatch {
 
         self.inner.try_write().map(|guard| {
             self.exclusive_owner.store(current, Ordering::Relaxed);
+            crate::latch_order::enter(self.context.rank, &self.context.name);
             SharedLatchWriteGuard { latch: self, _guard: guard }
         })
     }
@@ -243,6 +247,7 @@ pub struct SharedLatchWriteGuard<'a> {
 
 impl Drop for SharedLatchWriteGuard<'_> {
     fn drop(&mut self) {
+        crate::latch_order::leave(self.latch.context.rank);
         self.latch.exclusive_owner.store(0, Ordering::Relaxed);
     }
 }
