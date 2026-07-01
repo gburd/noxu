@@ -15,6 +15,61 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Fixed
+
+- **`FsyncManager` group-commit leader-hand-off lost-wakeup (fix(noxu-log)).**
+  The leader designated the next cohort's leader with a bare
+  `Condvar::notify_one` (`FSyncGroup::wakeup_one`) that set no state under the
+  group mutex. A `notify_one` that landed after the leader captured the cohort
+  but before the next waiter reached its `wait` was lost (a notify with no
+  waiter is a no-op), orphaning the next leader until `LOG_FSYNC_TIMEOUT`
+  (default 500 ms) recovered it via its own timeout fsync. In production this
+  was a commit/shutdown *stall* up to the timeout; the commit was never lost
+  (the `DurableImpliesLogged` invariant always held), so this is a liveness
+  fix, not a durability fix. The fix is the same predicate-before-wait class as
+  the DST M2 `DaemonManager` `WakeHandle` pre-check: `wakeup_one` now arms a
+  `leader_notified` flag under the group mutex *before* `notify_one`, and
+  `wait_for_event` consumes it *before* blocking, so a designation is never
+  lost and the hand-off is timeout-independent. The documented "orphaned
+  `DoLeaderFsync` cohort" was a consequence of this single lost designation (a
+  fresh leader that captures the cohort covers it via `wakeup_all`; only a lost
+  `wakeup_one` with no fresh leader stalled the cohort), so this one
+  root-cause fix closes both documented symptoms. Durability preserved: all
+  `fsync_manager` unit tests (incl. fsync-before-commit + leader-failure-
+  fails-all-waiters) and the crash-recovery gates stay green. Default build is
+  byte-identical.
+
+### Added (DST wave 2 — shuttle safety oracle + lock_manager coverage)
+
+- **`FsyncManager` shuttle safety oracle is now a green gate** (was
+  `#[ignore]`'d in M2 because the hand-off's liveness depended on
+  `LOG_FSYNC_TIMEOUT`, which shuttle cannot model). With the lost-wakeup fix
+  above the hand-off is timeout-independent, so
+  `crates/noxu-log/tests/shuttle_fsync_manager.rs` now runs three oracle tests
+  (5000 interleavings each): `fsync_coalescing_and_coverage_hold` (the safety
+  oracle — `DurableImpliesLogged`, `FsyncedNeverDecreases`, coalescing
+  `1..=N`), `fsync_failure_fails_all_waiters` (a failed leader fsync fails
+  every waiter), and `group_commit_wait_holds_under_sim_clock` (drives the
+  group-commit timed wait via the `SimClock` `advance_and_fire` from M1.1).
+  Routes `FsyncManager`'s `Mutex`/`Condvar` through `noxu_util::dst_sync_pl`;
+  default build re-exports the real `noxu-sync` types (zero production change).
+  Reverting the lost-wakeup fix makes the oracle deadlock (verified), so the
+  gate is not blind.
+- **`lock_manager` shuttle coverage.**
+  `crates/noxu-txn/tests/shuttle_lock_manager.rs` (gated `--cfg noxu_shuttle`,
+  2000 interleavings each) routes the lock_manager's shard-table /
+  waiter-graph `Mutex` and per-waiter grant `Condvar` through
+  `noxu_util::dst_sync_pl` and exercises: a two-lock deadlock cycle aborts
+  exactly one victim and grants the other (no-deadlock-undetected +
+  victim-consistency, mapped to `noxu-spec` `lock_manager_deadlock`), and a
+  blocked waiter is always granted on release with no lost wakeup
+  (`WriteLocksExclusive`). The 50 ms deadlock re-detection slice is driven
+  deterministically by a `SimClock` via `advance_and_fire`
+  (`LockManager::with_config_clock`, M1.1). Default build re-exports the real
+  `noxu-sync` types (zero production change). `log_buffer` shuttle coverage
+  remains deferred (its segment latch is a `lock_api::RawMutex`, which shuttle
+  0.9 does not expose).
+
 ### Added (DST Milestone 1.1 — clock thread-through + parking_lot-over-shuttle)
 
 - **Injectable `Clock` threaded through the remaining control-flow time sites.**
