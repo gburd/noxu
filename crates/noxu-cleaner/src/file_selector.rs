@@ -33,7 +33,7 @@ use crate::file_summary::FileSummary;
 use crate::ln_info::LnInfo;
 use hashbrown::{HashMap, HashSet};
 use noxu_util::Lsn;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// Database ID type used in the cleaner (mirrors `DbId` as i64).
 type DbId = i64;
@@ -126,6 +126,17 @@ pub struct FileSelector {
     /// being reserved for deletion.
     /// JE: `FileSelector.anyPendingDuringCheckpoint` (~line 152).
     any_pending_during_checkpoint: bool,
+
+    /// CLN-8: operator-supplied set of files to force-clean regardless of
+    /// utilization (JE `Cleaner.forceCleanFiles` / `FilesToMigrate`).
+    ///
+    /// When non-empty, `select_file_for_cleaning_with_policy` prefers a
+    /// safe-to-clean file from this set over the utilization-selected
+    /// candidate (JE `getBestFile`'s forceCleaning/`filesToMigrate` tier),
+    /// draining the file from the set once it is selected.  A file that is
+    /// unsafe to clean (too young / in-progress / past the first-active-txn
+    /// window) stays in the set but is skipped.
+    force_clean_files: BTreeSet<u32>,
 }
 
 impl FileSelector {
@@ -145,6 +156,7 @@ impl FileSelector {
             pending_lns: HashMap::new(),
             pending_dbs: HashSet::new(),
             any_pending_during_checkpoint: false,
+            force_clean_files: BTreeSet::new(),
         }
     }
 
@@ -153,6 +165,29 @@ impl FileSelector {
     pub fn set_two_pass_params(&mut self, gap: i32, threshold: i32) {
         self.two_pass_gap = gap;
         self.two_pass_threshold = threshold;
+    }
+
+    /// CLN-8: replace the force-clean set (JE `Cleaner.forceCleanFiles`).
+    pub fn set_force_clean_files(
+        &mut self,
+        files: impl IntoIterator<Item = u32>,
+    ) {
+        self.force_clean_files = files.into_iter().collect();
+    }
+
+    /// CLN-8: add a single file to the force-clean set.
+    pub fn add_force_clean_file(&mut self, file_number: u32) {
+        self.force_clean_files.insert(file_number);
+    }
+
+    /// CLN-8: clear the force-clean set.
+    pub fn clear_force_clean_files(&mut self) {
+        self.force_clean_files.clear();
+    }
+
+    /// CLN-8: snapshot the current force-clean set (verification helper).
+    pub fn force_clean_files(&self) -> Vec<u32> {
+        self.force_clean_files.iter().copied().collect()
     }
 
     /// Returns the current required utilization threshold (`None` if none set).
@@ -450,6 +485,45 @@ impl FileSelector {
         let in_progress: HashSet<u32> =
             self.file_info.keys().copied().collect();
 
+        // CLN-8 / Tier 3: FilesToMigrate / forceCleanFiles.
+        //
+        // JE `UtilizationCalculator.getBestFile` handles an operator-supplied
+        // force-clean set (`Cleaner.forceCleanFiles` / `FilesToMigrate`) as a
+        // tier that selects a specific file REGARDLESS of its utilization,
+        // subject to the same safe-to-clean gate the utilization tiers use
+        // (age-eligible, not in-progress, tracked).  We prefer the LOWEST such
+        // file (deterministic; `BTreeSet` is ordered) and drain it from the
+        // set once selected so the set empties as files are cleaned.  An
+        // unsafe file (too young / in the first-active-txn window / already
+        // in progress) stays in the set and is skipped.
+        //
+        // JE ref: `UtilizationCalculator.getBestFile` forceCleaning tier
+        // (UtilizationCalculator.java ~174-425, the `forceCleaning`/
+        // `filesToMigrate` branch).
+        if !self.force_clean_files.is_empty() {
+            let forced_pick =
+                self.force_clean_files.iter().copied().find(|&f| {
+                    f <= last_file_to_clean
+                        && !in_progress.contains(&f)
+                        && file_summaries.get(&f).is_some_and(|s| !s.is_empty())
+                });
+            if let Some(file_num) = forced_pick {
+                self.force_clean_files.remove(&file_num);
+                // A forced file bypasses utilization AND the two-pass gate:
+                // the operator has decided it must be migrated, so there is
+                // no dry-run reprieve (required_util = None).
+                self.being_cleaned.insert(file_num);
+                self.file_info.insert(
+                    file_num,
+                    FileInfo {
+                        status: FileStatus::BeingCleaned,
+                        required_util: None,
+                    },
+                );
+                return Some((file_num, None));
+            }
+        }
+
         // CLN-F1: faithful `UtilizationCalculator.getBestFile` candidate loop
         // (UtilizationCalculator.java ~344-378).  Track:
         //   * bestFile           = lowest avg utilization, and
@@ -515,8 +589,10 @@ impl FileSelector {
 
         // Tier 1: predictedMinUtil < totalThreshold -> clean bestFile.
         // Tier 2: bestGradualFileMaxUtil < fileThreshold -> clean bestGradual.
-        // Tier 4: forceCleaning -> clean bestFile (FilesToMigrate / tier 3 is
-        //         handled separately by the TO_BE_CLEANED queue drain above).
+        // Tier 3 (CLN-8): forceCleanFiles / FilesToMigrate -> handled above,
+        //         BEFORE utilization scoring (an operator-forced file bypasses
+        //         utilization entirely).
+        // Tier 4: forceCleaning -> clean bestFile.
         let file_num = if !forced && predicted_min_util < total_threshold {
             best_file?
         } else if !forced && best_gradual_max_util < file_threshold {
@@ -1945,6 +2021,143 @@ mod tests {
         assert_eq!(
             predicted, 50,
             "CLN-F1: predictedMinUtil is the AGGREGATE util = 50%"
+        );
+    }
+
+    // ── CLN-8 acceptance tests (forceCleanFiles / FilesToMigrate) ────────────
+
+    /// A forced file is selected over a higher-utilization file, even though
+    /// the utilization tier would prefer (or reject) a different file.
+    ///
+    /// JE: `UtilizationCalculator.getBestFile` forceCleaning/`filesToMigrate`
+    /// tier picks a specific file regardless of utilization.
+    #[test]
+    fn test_cln8_forced_file_selected_over_higher_util_file() {
+        // File 1: 10% util (very obsolete) — utilization tier would pick this.
+        // File 2: 90% util (barely obsolete) — utilization tier would NEVER
+        //         pick this on its own.
+        // File 3: newest (age-excluded candidate boundary).
+        let mut map = BTreeMap::new();
+        map.insert(1u32, make_summary_sized(1000, 900)); // 10% util
+        map.insert(2u32, make_summary_sized(1000, 100)); // 90% util
+        map.insert(3u32, make_summary_sized(1000, 500)); // newest
+
+        let mut selector = FileSelector::new();
+        // Force-clean the HIGH-utilization file 2.
+        selector.set_force_clean_files([2]);
+
+        // min_age = 1 -> last_file_to_clean = 3 - 1 = 2; files 1 and 2 eligible.
+        let result = selector.select_file_for_cleaning(
+            &map, 50,    // min_utilization
+            1,     // min_age
+            false, // force
+            None,  // first_active_txn_file
+            5,     // min_file_utilization_pct
+        );
+        assert_eq!(
+            result.map(|(f, _)| f),
+            Some(2),
+            "CLN-8: a forced high-util file must be selected over the \
+             utilization-preferred low-util file"
+        );
+        // required_util must be None: a forced file bypasses the two-pass gate.
+        assert_eq!(result.and_then(|(_, r)| r), None);
+    }
+
+    /// A forced file that is UNSAFE to clean is NOT selected: (a) too young
+    /// (the newest/last file, past `last_file_to_clean`), and (b) inside the
+    /// oldest open transaction's log window (CLN-4 clamp).  It stays in the
+    /// set.
+    #[test]
+    fn test_cln8_forced_unsafe_file_not_selected() {
+        let mut map = BTreeMap::new();
+        map.insert(1u32, make_summary_sized(1000, 900)); // 10% util
+        map.insert(2u32, make_summary_sized(1000, 100)); // 90% util
+        map.insert(3u32, make_summary_sized(1000, 500)); // newest (last file)
+
+        // (a) Force the newest file (3): too young (> last_file_to_clean = 2).
+        let mut selector = FileSelector::new();
+        selector.set_force_clean_files([3]);
+        let result =
+            selector.select_file_for_cleaning(&map, 50, 1, false, None, 5);
+        // File 3 is unsafe, so it is NOT selected; selection falls through to
+        // the utilization tier (which rejects the remaining high-aggregate
+        // files here — the key assertion is that file 3 is never picked).
+        assert_ne!(
+            result.map(|(f, _)| f),
+            Some(3),
+            "CLN-8: an unsafe (too-young) forced file must NOT be selected"
+        );
+        // File 3 must remain in the force-clean set (skipped, not drained).
+        assert_eq!(
+            selector.force_clean_files(),
+            vec![3],
+            "CLN-8: an unsafe forced file stays in the set"
+        );
+
+        // (b) Force file 2 but clamp the first-active-txn window to file 2 so
+        // file 2 is inside an open transaction's log window (excluded).
+        let mut selector2 = FileSelector::new();
+        selector2.set_force_clean_files([2]);
+        let result2 = selector2.select_file_for_cleaning(
+            &map,
+            50,
+            1,
+            false,
+            Some(2), // first_active_txn_file = 2 -> last_file_to_clean = 1
+            5,
+        );
+        // Only file 1 is safe; file 2 is inside the txn window and stays.
+        assert_ne!(result2.map(|(f, _)| f), Some(2));
+        assert_eq!(
+            selector2.force_clean_files(),
+            vec![2],
+            "CLN-8: a forced file inside the first-active-txn window stays"
+        );
+    }
+
+    /// The force-clean set DRAINS as files are cleaned: each selection removes
+    /// the chosen forced file from the set, and once drained the utilization
+    /// tier takes over.
+    #[test]
+    fn test_cln8_force_clean_set_drains() {
+        let mut map = BTreeMap::new();
+        // Three high-util files (utilization tier would reject all) plus a
+        // newest boundary file.
+        map.insert(1u32, make_summary_sized(1000, 50)); // 95% util
+        map.insert(2u32, make_summary_sized(1000, 50)); // 95% util
+        map.insert(3u32, make_summary_sized(1000, 50)); // 95% util
+        map.insert(4u32, make_summary_sized(1000, 50)); // newest
+
+        let mut selector = FileSelector::new();
+        selector.set_force_clean_files([1, 2, 3]);
+        assert_eq!(selector.force_clean_files(), vec![1, 2, 3]);
+
+        // First selection: lowest forced file (1) is chosen and drained.
+        let r1 = selector.select_file_for_cleaning(&map, 50, 1, false, None, 5);
+        assert_eq!(r1.map(|(f, _)| f), Some(1));
+        assert_eq!(selector.force_clean_files(), vec![2, 3]);
+
+        // Second selection: file 2 (file 1 is now in-progress). Drained.
+        let r2 = selector.select_file_for_cleaning(&map, 50, 1, false, None, 5);
+        assert_eq!(r2.map(|(f, _)| f), Some(2));
+        assert_eq!(selector.force_clean_files(), vec![3]);
+
+        // Third selection: file 3. Set now empty.
+        let r3 = selector.select_file_for_cleaning(&map, 50, 1, false, None, 5);
+        assert_eq!(r3.map(|(f, _)| f), Some(3));
+        assert!(
+            selector.force_clean_files().is_empty(),
+            "CLN-8: the force-clean set drains as files are cleaned"
+        );
+
+        // Fourth selection: set empty; the utilization tier now runs and
+        // (all remaining eligible files are 95% util, aggregate above 50%)
+        // selects nothing.
+        let r4 = selector.select_file_for_cleaning(&map, 50, 1, false, None, 5);
+        assert_eq!(
+            r4, None,
+            "CLN-8: once drained, utilization tier resumes (no over-clean)"
         );
     }
 }

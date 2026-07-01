@@ -949,6 +949,35 @@ impl Checkpointer {
         self.shutdown.load(Ordering::Acquire)
     }
 
+    /// CLN-14: wake the checkpointer daemon promptly after a cleaning pass so
+    /// cleaned files are deleted without waiting the full wakeup interval
+    /// (default 60 s).
+    ///
+    /// The cleaner registers this via `Cleaner::set_checkpoint_wakeup_fn`; it
+    /// is invoked at the end of a successful `do_clean`.  It notifies the
+    /// daemon's sleep condvar WITHOUT setting the shutdown flag, so the daemon
+    /// thread returns early from `wait_for_shutdown_or_timeout` and re-checks
+    /// `is_runnable(false)` — which returns `true` because
+    /// `needs_checkpoint_for_cleaned_files()` now reports the just-cleaned
+    /// files pending reclaim.  The result is a prompt checkpoint that runs
+    /// `after_checkpoint()` and lets `delete_safe_files` remove the files.
+    ///
+    /// JE: `FileProcessor.doClean` calls
+    /// `envImpl.getCheckpointer().wakeupAfterNoWrites()` (Cleaner/FileProcessor),
+    /// which sets `wakeupAfterNoWrites = true` and wakes the checkpointer;
+    /// `Checkpointer.isRunnable` then returns true via
+    /// `needCheckpointForCleanedFiles()`.  Noxu folds the flag into the
+    /// cleaner query (`is_runnable`), so this method only has to wake the
+    /// sleeping daemon.
+    pub fn wakeup_after_no_writes(&self) {
+        // Notify the sleep condvar without touching the shutdown flag: the
+        // daemon wakes, sees is_shutdown() == false, and re-evaluates
+        // is_runnable(false).
+        if self.shutdown_mutex.lock().is_ok() {
+            self.shutdown_condvar.notify_all();
+        }
+    }
+
     /// Sleep for `duration` or until `request_shutdown()` is called.
     ///
     /// Used by the daemon thread in `EnvironmentImpl` instead of
@@ -1776,6 +1805,52 @@ mod tests {
             checkpointer.stats.checkpoints.load(Ordering::Relaxed),
             0,
             "no checkpoint should fire when interval is 0"
+        );
+    }
+
+    /// CLN-14: `wakeup_after_no_writes` wakes a daemon-style thread blocked in
+    /// `wait_for_shutdown_or_timeout` PROMPTLY — well under the (long) sleep
+    /// interval — without setting the shutdown flag.  This is the primitive
+    /// the cleaner's wakeup callback uses so cleaned files are deleted at the
+    /// next early checkpoint instead of after the full wakeup interval
+    /// (default 60 s).
+    ///
+    /// JE: `Checkpointer.wakeupAfterNoWrites` sets a flag and wakes the
+    /// daemon; the daemon re-checks `isRunnable` (`needCheckpointForCleanedFiles`).
+    #[test]
+    fn test_cln14_wakeup_after_no_writes_wakes_daemon_promptly() {
+        use std::time::{Duration, Instant};
+
+        let checkpointer =
+            Arc::new(Checkpointer::new(CheckpointConfig::default()));
+
+        // A daemon-style thread that sleeps for a "60 s" interval on the
+        // condvar, exactly like the EnvironmentImpl checkpointer daemon.
+        let ckpt = Arc::clone(&checkpointer);
+        let woke = Arc::new(AtomicBool::new(false));
+        let woke2 = Arc::clone(&woke);
+        let start = Instant::now();
+        let handle = std::thread::spawn(move || {
+            ckpt.wait_for_shutdown_or_timeout(Duration::from_secs(60));
+            woke2.store(true, Ordering::Release);
+            // The wake must NOT be a shutdown — the daemon would keep running.
+            assert!(
+                !ckpt.is_shutdown(),
+                "wakeup_after_no_writes must not set the shutdown flag"
+            );
+        });
+
+        // Give the daemon a moment to enter the wait, then wake it.
+        std::thread::sleep(Duration::from_millis(50));
+        checkpointer.wakeup_after_no_writes();
+
+        handle.join().unwrap();
+        let elapsed = start.elapsed();
+        assert!(woke.load(Ordering::Acquire), "daemon thread must have woken");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "CLN-14: daemon must wake promptly ({:?}), not after the 60 s interval",
+            elapsed
         );
     }
 

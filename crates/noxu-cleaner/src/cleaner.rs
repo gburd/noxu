@@ -252,7 +252,12 @@ pub struct Cleaner {
     ///
     /// JE: `FileProcessor.doClean` calls
     /// `envImpl.getCheckpointer().wakeupAfterNoWrites()` (~line 290).
-    checkpoint_wakeup_fn: Option<Arc<dyn Fn() + Send + Sync>>,
+    ///
+    /// `OnceLock` (not a plain `Option`) so the engine can wire the callback
+    /// AFTER the `Cleaner` is already `Arc`-wrapped: the checkpointer is
+    /// constructed after the cleaner, so its wakeup can only be registered
+    /// once both exist (see `set_checkpoint_wakeup_fn`).
+    checkpoint_wakeup_fn: std::sync::OnceLock<Arc<dyn Fn() + Send + Sync>>,
 
     /// Per-file expiration profile store (CLN-9).
     ///
@@ -337,7 +342,7 @@ impl Cleaner {
             extra_trees: Arc::new(std::sync::Mutex::new(HashMap::new())),
             throttle: Arc::new(CleanerThrottle::new(0)),
             txn_manager: None,
-            checkpoint_wakeup_fn: None,
+            checkpoint_wakeup_fn: std::sync::OnceLock::new(),
             expiration_profile_store: noxu_sync::Mutex::new(
                 crate::ExpirationProfileStore::new(),
             ),
@@ -380,7 +385,7 @@ impl Cleaner {
             extra_trees: Arc::new(std::sync::Mutex::new(HashMap::new())),
             throttle: Arc::new(CleanerThrottle::new(0)),
             txn_manager: None,
-            checkpoint_wakeup_fn: None,
+            checkpoint_wakeup_fn: std::sync::OnceLock::new(),
             expiration_profile_store: noxu_sync::Mutex::new(
                 crate::ExpirationProfileStore::new(),
             ),
@@ -433,7 +438,7 @@ impl Cleaner {
             extra_trees: Arc::new(std::sync::Mutex::new(HashMap::new())),
             throttle: Arc::new(CleanerThrottle::new(0)),
             txn_manager: None,
-            checkpoint_wakeup_fn: None,
+            checkpoint_wakeup_fn: std::sync::OnceLock::new(),
             expiration_profile_store: noxu_sync::Mutex::new(
                 crate::ExpirationProfileStore::new(),
             ),
@@ -481,7 +486,7 @@ impl Cleaner {
             extra_trees: Arc::new(std::sync::Mutex::new(HashMap::new())),
             throttle: Arc::new(CleanerThrottle::new(0)),
             txn_manager: None,
-            checkpoint_wakeup_fn: None,
+            checkpoint_wakeup_fn: std::sync::OnceLock::new(),
             expiration_profile_store: noxu_sync::Mutex::new(
                 crate::ExpirationProfileStore::new(),
             ),
@@ -566,6 +571,14 @@ impl Cleaner {
         self.txn_manager.is_some()
     }
 
+    /// CLN-14 verification helper: returns true once a checkpoint wakeup
+    /// callback has been registered (via `with_checkpoint_wakeup_fn` or
+    /// `set_checkpoint_wakeup_fn`).  Used to assert the engine wired the
+    /// wakeup at env open.
+    pub fn has_checkpoint_wakeup_fn(&self) -> bool {
+        self.checkpoint_wakeup_fn.get().is_some()
+    }
+
     /// Wire a checkpoint wakeup callback for CLN-14 (`wakeupAfterNoWrites`).
     ///
     /// The callback is invoked at the end of a cleaning pass when no active
@@ -575,11 +588,29 @@ impl Cleaner {
     /// JE: `FileProcessor.doClean` calls
     /// `envImpl.getCheckpointer().wakeupAfterNoWrites()` (~line 290).
     pub fn with_checkpoint_wakeup_fn(
-        mut self,
+        self,
         f: Arc<dyn Fn() + Send + Sync>,
     ) -> Self {
-        self.checkpoint_wakeup_fn = Some(f);
+        let _ = self.checkpoint_wakeup_fn.set(f);
         self
+    }
+
+    /// CLN-14: register the checkpoint wakeup callback AFTER the cleaner has
+    /// been `Arc`-wrapped.
+    ///
+    /// The engine builds the `Cleaner` before the `Checkpointer` (the
+    /// checkpointer needs the cleaner for the X-5 deletion barrier), so the
+    /// wakeup — which must call into the checkpointer — can only be wired once
+    /// both exist.  `OnceLock` makes this a `&self` operation; the first call
+    /// wins and later calls are ignored.
+    ///
+    /// JE: `EnvironmentImpl` holds both `Cleaner` and `Checkpointer`;
+    /// `FileProcessor.doClean` reaches the checkpointer via
+    /// `envImpl.getCheckpointer().wakeupAfterNoWrites()`.  Noxu keeps the
+    /// cross-subsystem edge as a callback to avoid a `noxu-cleaner` →
+    /// `noxu-recovery` dependency.
+    pub fn set_checkpoint_wakeup_fn(&self, f: Arc<dyn Fn() + Send + Sync>) {
+        let _ = self.checkpoint_wakeup_fn.set(f);
     }
 
     /// Wire the environment's live `UtilizationTracker` for autonomous file
@@ -893,8 +924,7 @@ impl Cleaner {
         // CLN-14: wakeupAfterNoWrites.
         // JE: FileProcessor.doClean ~line 290:
         //   envImpl.getCheckpointer().wakeupAfterNoWrites()
-        if let (true, Some(cb)) = (cleaning_needed, &self.checkpoint_wakeup_fn)
-        {
+        if cleaning_needed && let Some(cb) = self.checkpoint_wakeup_fn.get() {
             cb();
         }
 
@@ -1441,6 +1471,36 @@ impl Cleaner {
     pub fn add_file_to_clean(&self, file_number: u32) {
         let mut selector = self.file_selector.lock();
         selector.add_file_to_clean(file_number);
+    }
+
+    /// CLN-8: replace the set of files to force-clean regardless of
+    /// utilization (JE `Cleaner.forceCleanFiles`).
+    ///
+    /// On the next `do_clean` pass, a safe-to-clean file from this set is
+    /// preferred over the utilization-selected candidate (JE `getBestFile`'s
+    /// forceCleaning/`filesToMigrate` tier), and drained from the set once
+    /// selected.  An unsafe file (too young / in-progress / inside the oldest
+    /// open transaction's log window) stays in the set and is skipped.
+    ///
+    /// JE: `Cleaner.forceCleanFiles(Set<Long>)` populates `filesToMigrate`,
+    /// which `UtilizationCalculator.getBestFile` consults as a selection tier.
+    pub fn set_force_clean_files(&self, files: impl IntoIterator<Item = u32>) {
+        self.file_selector.lock().set_force_clean_files(files);
+    }
+
+    /// CLN-8: add a single file to the force-clean set.
+    pub fn add_force_clean_file(&self, file_number: u32) {
+        self.file_selector.lock().add_force_clean_file(file_number);
+    }
+
+    /// CLN-8: clear the force-clean set.
+    pub fn clear_force_clean_files(&self) {
+        self.file_selector.lock().clear_force_clean_files();
+    }
+
+    /// CLN-8: snapshot the current force-clean set (verification helper).
+    pub fn get_force_clean_files(&self) -> Vec<u32> {
+        self.file_selector.lock().force_clean_files()
     }
 
     /// Returns a reference to the file selector (for testing/introspection).

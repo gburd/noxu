@@ -15,6 +15,39 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Added (7.1 cleaner completions)
+
+- **CLN-14: cleaner → checkpointer `wakeupAfterNoWrites` wiring
+  (feat(noxu-dbi, noxu-recovery)).** The cleaner's `with_checkpoint_wakeup_fn`
+  callback (invoked after each successful cleaning pass) is now wired by the
+  engine to a new `Checkpointer::wakeup_after_no_writes`, which notifies the
+  checkpointer daemon's sleep condvar (without setting shutdown) so the daemon
+  wakes early and re-evaluates `is_runnable` — which already returns `true` via
+  `needs_checkpoint_for_cleaned_files()`. Previously the callback existed but
+  `noxu-dbi` never registered it, so on an idle environment cleaned files were
+  only deleted at the next scheduled checkpointer wakeup interval (default
+  60 s). Now they are reclaimed promptly. Faithful to JE
+  `FileProcessor.doClean` → `envImpl.getCheckpointer().wakeupAfterNoWrites()`.
+  Non-breaking: additive `Checkpointer::wakeup_after_no_writes` and
+  `Cleaner::set_checkpoint_wakeup_fn` / `Cleaner::has_checkpoint_wakeup_fn`; no
+  API removal, no on-disk format change.
+
+- **CLN-8: force-clean files / `FilesToMigrate` (feat(noxu-cleaner)).** Added a
+  force-clean set to the cleaner (JE `Cleaner.forceCleanFiles` /
+  `FilesToMigrate`): `Cleaner::set_force_clean_files` / `add_force_clean_file`
+  / `clear_force_clean_files` / `get_force_clean_files`, backed by a
+  `BTreeSet<u32>` on the `FileSelector`. A new third selection tier in
+  `FileSelector::select_file_for_cleaning_with_policy` — the forceCleaning /
+  `filesToMigrate` tier of JE `UtilizationCalculator.getBestFile` — prefers a
+  **safe-to-clean** file from the set (age-eligible, not in-progress, not
+  inside the oldest open transaction's log window per the CLN-4 clamp) over
+  the utilization-selected candidate, bypassing the utilization gate and the
+  two-pass dry-run, and drains it from the set once selected. An unsafe forced
+  file stays in the set and is skipped. Reachable via
+  `EnvironmentImpl::get_cleaner()`; a public `noxu-db` / `noxu-admin` control
+  path is deferred (smaller diff). Non-breaking: additive methods and an
+  additive selection tier; no API removal, no on-disk format change.
+
 ### Fixed
 
 - **`FsyncManager` group-commit leader-hand-off lost-wakeup (fix(noxu-log)).**
