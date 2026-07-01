@@ -186,6 +186,21 @@ self-contained (no external recorder needed) and is aimed at simple
 ops/monitoring; for a live metrics pipeline use `metrics_export` (the
 `observability` feature) instead.
 
+## Latch fairness & timeout (`EnvironmentConfig`)
+
+Three JE latch knobs control the low-level B-tree / log latches.  Two are
+**implemented (7.1)**; the third is **reserved** (see the note).
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `env_latch_timeout_ms` | `u64` | `300_000` (5 min) | **Implemented.** Maximum time a latch acquisition blocks before failing with a `LatchTimeout` error instead of hanging forever — turning a latch deadlock into a diagnosable error.  `0` = no timeout (block until acquired).  The default is treated as "unset": leaving it unchanged preserves the historical latch behaviour byte-for-byte; any other value opts in.  JE: `ENV_LATCH_TIMEOUT`. |
+| `env_forced_yield` | `bool` | `false` | **Implemented.** Test-only fairness stress: when `true`, `noxu-latch` injects `std::thread::yield_now()` at each latch acquire (post-grant) and release point to shake out latch-ordering races.  Zero cost when off (a single relaxed atomic load).  JE: `ENV_FORCED_YIELD`. |
+| `env_fair_latches` | `bool` | `false` | **Reserved — not implemented.** FIFO-ordered (no-barging) latch acquisition.  Noxu's latches are backed by `noxu-sync`'s futex primitives, which are fundamentally non-fair and have no FIFO wait queue to toggle; a faithful fair-latch mode is a dedicated latch rewrite.  Setting `true` emits a `WARN` and has no effect.  JE: `ENV_FAIR_LATCHES` (`setFairLatches`). |
+
+The two implemented knobs are installed process-globally at `Environment::open`
+via `noxu_latch::configure`; an environment that leaves both at their defaults
+sees exactly the pre-7.1 latch behaviour (a 5 s acquire timeout, no yields).
+
 ## Replication Parameters
 
 Replication is configured on `RepConfig` / `RepConfigBuilder`, not

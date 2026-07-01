@@ -17,6 +17,30 @@ listed in [References](#references).
 
 ### Added
 
+- **Latch fairness knobs `env_latch_timeout_ms` + `env_forced_yield` wired
+  (`noxu-latch` + `noxu-dbi`).** Two previously accepted-but-inert JE latch
+  knobs are now real features, wired non-breaking:
+  - **`env_latch_timeout_ms`** (JE `EnvironmentParams.ENV_LATCH_TIMEOUT`) —
+    the exclusive and shared latch acquire paths now fail with a
+    `LatchError::Timeout` (surfaced as `NoxuError::LatchTimeout`) if a latch
+    cannot be acquired within the configured timeout, turning a latch deadlock
+    (previously a hang) into a diagnosable error. `0` = no timeout. The default
+    `300_000` (5 min) is the "unset" sentinel that preserves the historical
+    latch behaviour byte-for-byte.
+  - **`env_forced_yield`** (JE `EnvironmentParams.ENV_FORCED_YIELD`) — a
+    test-only fairness-stress knob that injects `std::thread::yield_now()` at
+    latch acquire/release points to shake out latch-ordering races; a single
+    relaxed atomic load (effectively free) when off, which is the default.
+
+  Both are installed process-globally at `Environment::open` via a new
+  `noxu_latch::configure`; an environment that leaves both at their defaults
+  sees exactly the pre-7.1 latch behaviour (zero production change). Removed
+  both from the `unimplemented_params` WARN registry. **`env_fair_latches`**
+  (JE `setFairLatches` / `ENV_FAIR_LATCHES`) remains **reserved and
+  deliberately not faked**: Noxu's futex-based `noxu-sync` latches are
+  fundamentally non-fair with no FIFO wait queue to toggle, so a faithful
+  fair-latch mode is a dedicated latch rewrite tracked separately.
+
 - **CLN-2 / `VerifyUtils.checkLsns()` — LSN↔utilization-profile overlap check
   (`noxu-cleaner` + `noxu-engine` + `noxu-dbi` + `noxu-db`).** `Environment::verify`
   now runs BOTH halves of JE's recovery verification. In addition to the
