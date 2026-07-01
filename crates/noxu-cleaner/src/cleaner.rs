@@ -252,7 +252,12 @@ pub struct Cleaner {
     ///
     /// JE: `FileProcessor.doClean` calls
     /// `envImpl.getCheckpointer().wakeupAfterNoWrites()` (~line 290).
-    checkpoint_wakeup_fn: Option<Arc<dyn Fn() + Send + Sync>>,
+    ///
+    /// `OnceLock` (not a plain `Option`) so the engine can wire the callback
+    /// AFTER the `Cleaner` is already `Arc`-wrapped: the checkpointer is
+    /// constructed after the cleaner, so its wakeup can only be registered
+    /// once both exist (see `set_checkpoint_wakeup_fn`).
+    checkpoint_wakeup_fn: std::sync::OnceLock<Arc<dyn Fn() + Send + Sync>>,
 
     /// Per-file expiration profile store (CLN-9).
     ///
@@ -337,7 +342,7 @@ impl Cleaner {
             extra_trees: Arc::new(std::sync::Mutex::new(HashMap::new())),
             throttle: Arc::new(CleanerThrottle::new(0)),
             txn_manager: None,
-            checkpoint_wakeup_fn: None,
+            checkpoint_wakeup_fn: std::sync::OnceLock::new(),
             expiration_profile_store: noxu_sync::Mutex::new(
                 crate::ExpirationProfileStore::new(),
             ),
@@ -380,7 +385,7 @@ impl Cleaner {
             extra_trees: Arc::new(std::sync::Mutex::new(HashMap::new())),
             throttle: Arc::new(CleanerThrottle::new(0)),
             txn_manager: None,
-            checkpoint_wakeup_fn: None,
+            checkpoint_wakeup_fn: std::sync::OnceLock::new(),
             expiration_profile_store: noxu_sync::Mutex::new(
                 crate::ExpirationProfileStore::new(),
             ),
@@ -433,7 +438,7 @@ impl Cleaner {
             extra_trees: Arc::new(std::sync::Mutex::new(HashMap::new())),
             throttle: Arc::new(CleanerThrottle::new(0)),
             txn_manager: None,
-            checkpoint_wakeup_fn: None,
+            checkpoint_wakeup_fn: std::sync::OnceLock::new(),
             expiration_profile_store: noxu_sync::Mutex::new(
                 crate::ExpirationProfileStore::new(),
             ),
@@ -481,7 +486,7 @@ impl Cleaner {
             extra_trees: Arc::new(std::sync::Mutex::new(HashMap::new())),
             throttle: Arc::new(CleanerThrottle::new(0)),
             txn_manager: None,
-            checkpoint_wakeup_fn: None,
+            checkpoint_wakeup_fn: std::sync::OnceLock::new(),
             expiration_profile_store: noxu_sync::Mutex::new(
                 crate::ExpirationProfileStore::new(),
             ),
@@ -566,6 +571,14 @@ impl Cleaner {
         self.txn_manager.is_some()
     }
 
+    /// CLN-14 verification helper: returns true once a checkpoint wakeup
+    /// callback has been registered (via `with_checkpoint_wakeup_fn` or
+    /// `set_checkpoint_wakeup_fn`).  Used to assert the engine wired the
+    /// wakeup at env open.
+    pub fn has_checkpoint_wakeup_fn(&self) -> bool {
+        self.checkpoint_wakeup_fn.get().is_some()
+    }
+
     /// Wire a checkpoint wakeup callback for CLN-14 (`wakeupAfterNoWrites`).
     ///
     /// The callback is invoked at the end of a cleaning pass when no active
@@ -575,11 +588,29 @@ impl Cleaner {
     /// JE: `FileProcessor.doClean` calls
     /// `envImpl.getCheckpointer().wakeupAfterNoWrites()` (~line 290).
     pub fn with_checkpoint_wakeup_fn(
-        mut self,
+        self,
         f: Arc<dyn Fn() + Send + Sync>,
     ) -> Self {
-        self.checkpoint_wakeup_fn = Some(f);
+        let _ = self.checkpoint_wakeup_fn.set(f);
         self
+    }
+
+    /// CLN-14: register the checkpoint wakeup callback AFTER the cleaner has
+    /// been `Arc`-wrapped.
+    ///
+    /// The engine builds the `Cleaner` before the `Checkpointer` (the
+    /// checkpointer needs the cleaner for the X-5 deletion barrier), so the
+    /// wakeup — which must call into the checkpointer — can only be wired once
+    /// both exist.  `OnceLock` makes this a `&self` operation; the first call
+    /// wins and later calls are ignored.
+    ///
+    /// JE: `EnvironmentImpl` holds both `Cleaner` and `Checkpointer`;
+    /// `FileProcessor.doClean` reaches the checkpointer via
+    /// `envImpl.getCheckpointer().wakeupAfterNoWrites()`.  Noxu keeps the
+    /// cross-subsystem edge as a callback to avoid a `noxu-cleaner` →
+    /// `noxu-recovery` dependency.
+    pub fn set_checkpoint_wakeup_fn(&self, f: Arc<dyn Fn() + Send + Sync>) {
+        let _ = self.checkpoint_wakeup_fn.set(f);
     }
 
     /// Wire the environment's live `UtilizationTracker` for autonomous file
@@ -893,8 +924,7 @@ impl Cleaner {
         // CLN-14: wakeupAfterNoWrites.
         // JE: FileProcessor.doClean ~line 290:
         //   envImpl.getCheckpointer().wakeupAfterNoWrites()
-        if let (true, Some(cb)) = (cleaning_needed, &self.checkpoint_wakeup_fn)
-        {
+        if cleaning_needed && let Some(cb) = self.checkpoint_wakeup_fn.get() {
             cb();
         }
 

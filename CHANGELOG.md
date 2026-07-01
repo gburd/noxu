@@ -15,6 +15,23 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Added (7.1 cleaner completions)
+
+- **CLN-14: cleaner → checkpointer `wakeupAfterNoWrites` wiring
+  (feat(noxu-dbi, noxu-recovery)).** The cleaner's `with_checkpoint_wakeup_fn`
+  callback (invoked after each successful cleaning pass) is now wired by the
+  engine to a new `Checkpointer::wakeup_after_no_writes`, which notifies the
+  checkpointer daemon's sleep condvar (without setting shutdown) so the daemon
+  wakes early and re-evaluates `is_runnable` — which already returns `true` via
+  `needs_checkpoint_for_cleaned_files()`. Previously the callback existed but
+  `noxu-dbi` never registered it, so on an idle environment cleaned files were
+  only deleted at the next scheduled checkpointer wakeup interval (default
+  60 s). Now they are reclaimed promptly. Faithful to JE
+  `FileProcessor.doClean` → `envImpl.getCheckpointer().wakeupAfterNoWrites()`.
+  Non-breaking: additive `Checkpointer::wakeup_after_no_writes` and
+  `Cleaner::set_checkpoint_wakeup_fn` / `Cleaner::has_checkpoint_wakeup_fn`; no
+  API removal, no on-disk format change.
+
 ### Fixed
 
 - **`FsyncManager` group-commit leader-hand-off lost-wakeup (fix(noxu-log)).**

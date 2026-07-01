@@ -1126,6 +1126,23 @@ impl EnvironmentImpl {
             Arc::new(builder)
         });
 
+        // CLN-14: wire the cleaner's wakeupAfterNoWrites callback to the
+        // checkpointer.  The cleaner is built before the checkpointer (the
+        // checkpointer needs the cleaner for the X-5 deletion barrier), so
+        // the cross-subsystem edge is registered here, once both exist.
+        // After each successful cleaning pass the cleaner calls this, waking
+        // the checkpointer daemon early so cleaned files are deleted promptly
+        // instead of waiting the full checkpointer wakeup interval
+        // (default 60 s) when write activity has stopped.
+        //
+        // JE: FileProcessor.doClean -> envImpl.getCheckpointer().wakeupAfterNoWrites().
+        if let (Some(c), Some(ckpt)) = (&cleaner, &checkpointer) {
+            let ckpt_for_wakeup = Arc::clone(ckpt);
+            c.set_checkpoint_wakeup_fn(Arc::new(move || {
+                ckpt_for_wakeup.wakeup_after_no_writes();
+            }));
+        }
+
         // REC-G / REC-H: seed the checkpointer's interval baselines and
         // checkpoint-ID sequence from the recovered CkptEnd, so the first
         // post-recovery checkpoint continues from the recovered state instead
@@ -3232,5 +3249,50 @@ mod tests {
             1,
             "checkpoint should fire when threshold is crossed"
         );
+    }
+
+    /// CLN-14: after env open, the engine must have wired the cleaner's
+    /// checkpoint wakeup callback into the checkpointer, AND the wakeup must
+    /// release the checkpointer daemon PROMPTLY (not after the full wakeup
+    /// interval).  Together with the cleaner-side callback tests
+    /// (noxu-cleaner) and the daemon-wake unit test (noxu-recovery), this
+    /// proves cleaned files are deleted promptly when writes stop.
+    ///
+    /// JE: FileProcessor.doClean -> envImpl.getCheckpointer().wakeupAfterNoWrites().
+    #[test]
+    fn test_cln14_engine_wires_checkpoint_wakeup() {
+        use std::time::{Duration, Instant};
+
+        let dir = TempDir::new().unwrap();
+        let env = EnvironmentImpl::new(dir.path(), false, true).unwrap();
+
+        // The engine must have wired the wakeup callback at open.
+        let cleaner = env.get_cleaner().expect("writable env has a cleaner");
+        assert!(
+            cleaner.has_checkpoint_wakeup_fn(),
+            "CLN-14: engine must wire the cleaner's checkpoint wakeup callback"
+        );
+
+        // The callback the cleaner fires targets the checkpointer's
+        // `wakeup_after_no_writes`, which must release a daemon parked on the
+        // sleep condvar well under a 60 s interval.  Exercise it through the
+        // real checkpointer the env built.
+        let ckpt =
+            env.get_checkpointer().expect("writable env has a checkpointer");
+        let ckpt_for_wait = std::sync::Arc::clone(&ckpt);
+        let start = Instant::now();
+        let handle = std::thread::spawn(move || {
+            ckpt_for_wait.wait_for_shutdown_or_timeout(Duration::from_secs(60));
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        ckpt.wakeup_after_no_writes();
+
+        handle.join().unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "CLN-14: checkpointer daemon must wake promptly, not after 60 s"
+        );
+
+        env.close().unwrap();
     }
 }
