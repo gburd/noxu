@@ -15,6 +15,8 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+## [7.0.0] - 2026-07-01
+
 ### Changed (BREAKING — 7.0 core API reshape)
 
 - **Idiomatic-Rust public API for `noxu-db`.** The core read/write/cursor
