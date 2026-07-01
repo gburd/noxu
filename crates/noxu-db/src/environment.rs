@@ -244,6 +244,7 @@ impl Environment {
             // Memory
             cache_size: config.cache_size,
             cache_percent: config.cache_percent,
+            shared_cache: config.shared_cache,
             max_off_heap_memory: config.max_off_heap_memory,
             max_disk: config.max_disk,
             free_disk: config.free_disk,

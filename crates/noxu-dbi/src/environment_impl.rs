@@ -173,7 +173,20 @@ pub struct EnvironmentImpl {
     disk_limit: Arc<crate::disk_limit::DiskLimitTracker>,
 
     /// The cache evictor (shared with the background daemon thread).
+    ///
+    /// For a PRIVATE env this is a per-env evictor with its own daemon.  For a
+    /// SHARED_CACHE env this is the process-global shared evictor (the same
+    /// `Arc` every sharing env holds) and `evictor_handle` is `None` (the
+    /// shared daemon runs elsewhere).
     evictor: Arc<Evictor>,
+
+    /// Handle to the process-global shared evictor when `shared_cache=true`.
+    ///
+    /// `Some` only for shared-cache envs.  Its `deregister` is called on
+    /// `close`/`Drop` to remove THIS env's trees from the shared LRU before
+    /// the env's tree `Arc`s drop (no dangling trees / use-after-close), and
+    /// to tear the shared evictor down when the last member leaves.
+    shared_evictor_handle: Option<noxu_evictor::SharedEvictorHandle>,
 
     /// Background evictor daemon thread handle.
     ///
@@ -840,18 +853,15 @@ impl EnvironmentImpl {
         // Linked to the primary tree and to the Arbiter so that BIN entry
         // insertions/deletions are visible to the evictor.
         // IN.updateMemorySize(delta) → MemoryBudget.updateTreeMemoryUsage(delta).
-        let cache_usage = Arc::new(AtomicI64::new(0));
-
-        let mut primary_tree_inner = noxu_tree::Tree::new(1, 256);
-        primary_tree_inner.set_memory_counter(Arc::clone(&cache_usage));
-        // EV-14: wire the log manager so an evicted root IN can be re-fetched
-        // from its persisted LSN (Tree::fetch_root_from_log).
-        if let Some(ref lm) = log_manager {
-            primary_tree_inner.set_log_manager(Arc::clone(lm));
-        }
-        let primary_tree: Arc<std::sync::RwLock<noxu_tree::Tree>> =
-            Arc::new(std::sync::RwLock::new(primary_tree_inner));
-
+        // SHARED_CACHE: when this env opts into the process-global shared
+        // cache it joins a single Arc<Evictor> + one budget counter shared by
+        // every sharing env (JE EnvironmentConfig.setSharedCache(true) ->
+        // process-global SharedEvictor + shared MemoryBudget).  The first
+        // joiner's cache_size sizes the ONE budget (JE-faithful); later
+        // joiners' cache_size is ignored for the budget.
+        //
+        // We compute the budget/threshold FIRST (they are cheap and identical
+        // to the private path) so the shared-join params are ready.
         let cache_bytes = cfg.cache_size as i64;
         // X-12: cache_size is the TOTAL memory budget. Subtract the log
         // write-buffer pool and off-heap reservation so that the three
@@ -876,6 +886,46 @@ impl EnvironmentImpl {
         let critical_threshold = arbiter_budget
             .saturating_mul(cfg.evictor_critical_percentage as i64)
             / 100;
+
+        // Join the process-global shared cache if requested.  When shared, the
+        // returned handle carries the ONE shared cache_usage counter and the
+        // ONE shared Arc<Evictor>; when NOT shared this stays None and the
+        // env builds a private evictor exactly as before (zero change).
+        let shared_evictor_handle: Option<noxu_evictor::SharedEvictorHandle> =
+            if cfg.shared_cache {
+                Some(noxu_evictor::SharedEvictorHandle::join(
+                    noxu_evictor::SharedCacheParams {
+                        budget_bytes: arbiter_budget,
+                        evict_bytes,
+                        critical_threshold,
+                        nodes_per_scan: cfg.evictor_nodes_per_scan,
+                        lru_only: cfg.evictor_lru_only,
+                        algorithm: noxu_evictor::EvictionAlgorithm::from_name(
+                            &cfg.evictor_algorithm,
+                        ),
+                    },
+                ))
+            } else {
+                None
+            };
+
+        // The tree memory counter: the shared budget counter when shared, else
+        // a fresh per-env counter (unchanged private behaviour).
+        let cache_usage = match &shared_evictor_handle {
+            Some(h) => h.cache_usage(),
+            None => Arc::new(AtomicI64::new(0)),
+        };
+
+        let mut primary_tree_inner = noxu_tree::Tree::new(1, 256);
+        primary_tree_inner.set_memory_counter(Arc::clone(&cache_usage));
+        // EV-14: wire the log manager so an evicted root IN can be re-fetched
+        // from its persisted LSN (Tree::fetch_root_from_log).
+        if let Some(ref lm) = log_manager {
+            primary_tree_inner.set_log_manager(Arc::clone(lm));
+        }
+        let primary_tree: Arc<std::sync::RwLock<noxu_tree::Tree>> =
+            Arc::new(std::sync::RwLock::new(primary_tree_inner));
+
         let arbiter = Arbiter::new(
             arbiter_budget,
             Arc::clone(&cache_usage),
@@ -896,41 +946,55 @@ impl EnvironmentImpl {
             cfg.max_off_heap_memory,
         ));
 
-        let evictor_builder = Evictor::new(
-            arbiter,
-            cfg.evictor_nodes_per_scan,
-            cfg.evictor_lru_only,
-        )
-        // Select the eviction algorithm (JE EVICTOR is LRU; Noxu defaults to
-        // "lru" but allows clock/arc/car/lirs via EVICTOR_ALGORITHM). Sets both
-        // the primary and scan policy slots.
-        .with_algorithm(noxu_evictor::EvictionAlgorithm::from_name(
-            &cfg.evictor_algorithm,
-        ))
-        // JE EVICTOR_USE_DIRTY_LRU; with_off_heap below forces it false if the
-        // off-heap cache is enabled (JE Evictor.java:1705).
-        .with_use_dirty_lru(cfg.evictor_use_dirty_lru)
-        .with_off_heap(Arc::clone(&off_heap_cache));
-        log::info!(
-            "evictor eviction algorithm: {} (requested {:?})",
-            evictor_builder.primary_algorithm_name(),
-            cfg.evictor_algorithm
-        );
-        let evictor = Arc::new(evictor_builder);
+        // When shared, reuse the process-global Arc<Evictor> and DO NOT spawn
+        // a private daemon (the shared daemon evicts across all envs).  When
+        // private, build and own a per-env evictor + daemon exactly as before.
+        let (evictor, evictor_thread) = if let Some(h) = &shared_evictor_handle
+        {
+            // The private `arbiter` we just built is discarded for shared
+            // envs; the shared evictor owns the one shared arbiter.  Keep the
+            // off-heap wiring off the shared evictor (a shared cache does not
+            // mix per-env off-heap caches).
+            let _ = arbiter; // shared budget lives in the shared evictor
+            (h.evictor(), None)
+        } else {
+            let evictor_builder = Evictor::new(
+                arbiter,
+                cfg.evictor_nodes_per_scan,
+                cfg.evictor_lru_only,
+            )
+            // Select the eviction algorithm (JE EVICTOR is LRU; Noxu defaults
+            // to "lru" but allows clock/arc/car/lirs via EVICTOR_ALGORITHM).
+            // Sets both the primary and scan policy slots.
+            .with_algorithm(noxu_evictor::EvictionAlgorithm::from_name(
+                &cfg.evictor_algorithm,
+            ))
+            // JE EVICTOR_USE_DIRTY_LRU; with_off_heap below forces it false if
+            // the off-heap cache is enabled (JE Evictor.java:1705).
+            .with_use_dirty_lru(cfg.evictor_use_dirty_lru)
+            .with_off_heap(Arc::clone(&off_heap_cache));
+            log::info!(
+                "evictor eviction algorithm: {} (requested {:?})",
+                evictor_builder.primary_algorithm_name(),
+                cfg.evictor_algorithm
+            );
+            let evictor = Arc::new(evictor_builder);
 
-        // Start the background daemon thread.  The thread loops as long as
-        // `evictor.is_shutdown()` returns false, sleeping 5 ms between
-        // passes so it is not a CPU hog when the cache is under budget.
-        let evictor_clone = Arc::clone(&evictor);
-        let evictor_thread = std::thread::Builder::new()
-            .name("noxu-evictor".to_string())
-            .spawn(move || {
-                while !evictor_clone.is_shutdown() {
-                    evictor_clone.do_evict(EvictionSource::Daemon);
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
-            })
-            .expect("failed to spawn noxu-evictor thread");
+            // Start the background daemon thread.  The thread loops as long as
+            // `evictor.is_shutdown()` returns false, sleeping 5 ms between
+            // passes so it is not a CPU hog when the cache is under budget.
+            let evictor_clone = Arc::clone(&evictor);
+            let handle = std::thread::Builder::new()
+                .name("noxu-evictor".to_string())
+                .spawn(move || {
+                    while !evictor_clone.is_shutdown() {
+                        evictor_clone.do_evict(EvictionSource::Daemon);
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                })
+                .expect("failed to spawn noxu-evictor thread");
+            (evictor, Some(handle))
+        };
 
         // Build the cleaner wired to the FileManager, primary tree, and
         // LogManager for writable environments.  Read-only envs get None.
@@ -954,7 +1018,21 @@ impl EnvironmentImpl {
         // `target.getDatabase()` (Evictor.processTarget, Evictor.java:2374).
         // Set after construction because the registry is built here, after
         // the evictor builder above.
-        evictor.set_db_trees_registry(Arc::clone(&db_trees_registry));
+        //
+        // SHARED_CACHE: for a shared env the evictor ALREADY holds the
+        // process-global shared registry (union of all envs' trees); we must
+        // NOT overwrite it with this env's local registry.  Instead we mirror
+        // this env's trees INTO the shared registry (below and in
+        // open_database_inner) while the cleaner/checkpointer keep using the
+        // env-local `db_trees_registry` so they only ever see THIS env's
+        // trees.  For a private env, behaviour is unchanged.
+        if shared_evictor_handle.is_none() {
+            evictor.set_db_trees_registry(Arc::clone(&db_trees_registry));
+        } else if let Some(h) = &shared_evictor_handle {
+            // Mirror the primary tree into the shared LRU immediately so
+            // pre-open-database resident nodes are evictable across envs.
+            h.register_tree(Arc::clone(&primary_tree));
+        }
 
         // Cleaner initialization.
         // constructor (called after RecoveryManager.recover()).
@@ -1388,7 +1466,10 @@ impl EnvironmentImpl {
             log_manager,
             disk_limit,
             evictor,
-            evictor_handle: Mutex::new(Some(evictor_thread)),
+            shared_evictor_handle,
+            // `evictor_thread` is `None` for a shared-cache env (the shared
+            // daemon runs process-globally); `Some(handle)` for a private env.
+            evictor_handle: Mutex::new(evictor_thread),
             recovered_trees: Mutex::new(recovered),
             recovered_prepared_txns: Mutex::new(recovered_prepared),
             recovered_prepared_lns: Mutex::new(recovered_prepared_lns),
@@ -1712,7 +1793,17 @@ impl EnvironmentImpl {
                     tree_guard.set_log_manager(Arc::clone(lm));
                 }
             }
-            self.evictor.set_tree(tree_arc, db_id.id() as u64);
+            // SHARED_CACHE: a shared evictor's primary slot must NOT be
+            // overwritten per-env (it would dangle when that env closes and
+            // races with other envs).  Instead mirror this DB's tree into the
+            // process-global shared registry so the shared LRU spans it; the
+            // env's SharedEvictorHandle::deregister removes it on close.
+            // A PRIVATE env keeps the existing single-slot fast path.
+            if let Some(h) = &self.shared_evictor_handle {
+                h.register_tree(Arc::clone(&tree_arc));
+            } else {
+                self.evictor.set_tree(tree_arc, db_id.id() as u64);
+            }
         }
 
         self.db_map.write().insert(db_id, db.clone());
@@ -2593,7 +2684,19 @@ impl EnvironmentImpl {
         *state = EnvState::Closing;
 
         // Signal the evictor daemon to stop and wait for it to exit.
-        self.evictor.shutdown();
+        //
+        // SHARED_CACHE: for a shared env we must NOT call
+        // `self.evictor.shutdown()` — that would stop the process-global
+        // shared daemon and break every OTHER sharing env.  Instead we
+        // deregister THIS env's trees from the shared LRU (before its trees
+        // drop — no dangling trees) and let the shared handle tear the daemon
+        // down only when the last member leaves.  A private env owns its
+        // evictor + daemon, so it shuts down as before.
+        if let Some(h) = &self.shared_evictor_handle {
+            h.deregister();
+        } else {
+            self.evictor.shutdown();
+        }
         if let Some(handle) = self.evictor_handle.lock().unwrap().take() {
             // Best-effort join: ignore a panic in the evictor thread.
             let _ = handle.join();
@@ -2708,7 +2811,14 @@ impl Drop for EnvironmentImpl {
         //
         // Shut down the evictor daemon so its thread exits cleanly when the
         // environment is dropped (e.g. in tests that don't call close()).
-        self.evictor.shutdown();
+        //
+        // SHARED_CACHE: deregister (not shutdown) so the shared daemon keeps
+        // serving other envs; the handle's own Drop is a further safety net.
+        if let Some(h) = &self.shared_evictor_handle {
+            h.deregister();
+        } else {
+            self.evictor.shutdown();
+        }
         if let Some(handle) =
             self.evictor_handle.lock().unwrap_or_else(|p| p.into_inner()).take()
         {
