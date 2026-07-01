@@ -180,7 +180,7 @@ fn shared_cache_balances_one_budget_across_envs() {
         ka.extend_from_slice(format!("{:010}", i).as_bytes());
         let mut out = DatabaseEntry::new();
         assert!(
-            db1.get_into(None, &DatabaseEntry::from_vec(ka), &mut out).unwrap(),
+            db1.get_into(None, DatabaseEntry::from_vec(ka), &mut out).unwrap(),
             "env1 record {} survives shared eviction",
             i
         );
@@ -190,8 +190,7 @@ fn shared_cache_balances_one_budget_across_envs() {
         kb.extend_from_slice(format!("{:010}", i).as_bytes());
         let mut out2 = DatabaseEntry::new();
         assert!(
-            db2.get_into(None, &DatabaseEntry::from_vec(kb), &mut out2)
-                .unwrap(),
+            db2.get_into(None, DatabaseEntry::from_vec(kb), &mut out2).unwrap(),
             "env2 record {} survives shared eviction",
             i
         );
@@ -213,7 +212,7 @@ fn shared_cache_balances_one_budget_across_envs() {
     let mut kp = vec![b'A'];
     kp.extend_from_slice(format!("{:010}", 7usize).as_bytes());
     assert!(
-        db1.get_into(None, &DatabaseEntry::from_vec(kp), &mut probe).unwrap(),
+        db1.get_into(None, DatabaseEntry::from_vec(kp), &mut probe).unwrap(),
         "survivor env1 must still read its data after env2 closed"
     );
 
@@ -225,7 +224,7 @@ fn shared_cache_balances_one_budget_across_envs() {
     kc.extend_from_slice(format!("{:010}", 42usize).as_bytes());
     let mut out3 = DatabaseEntry::new();
     assert!(
-        db1.get_into(None, &DatabaseEntry::from_vec(kc), &mut out3).unwrap(),
+        db1.get_into(None, DatabaseEntry::from_vec(kc), &mut out3).unwrap(),
         "survivor env1 must read newly-written data after env2 closed"
     );
     assert_eq!(out3.data(), &val[..]);

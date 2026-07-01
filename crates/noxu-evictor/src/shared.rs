@@ -11,9 +11,9 @@
 //!
 //! ## Noxu mapping
 //!
-//! The existing [`Evictor`](crate::evictor::Evictor) already:
+//! The existing [`Evictor`] already:
 //! - walks *every* tree in its `db_trees_registry` (EVICTOR-RECLAIM-1), and
-//! - enforces ONE budget via the [`Arbiter`](crate::arbiter::Arbiter) reading
+//! - enforces ONE budget via the [`Arbiter`] reading
 //!   a single shared `cache_usage: Arc<AtomicI64>` counter.
 //!
 //! So a shared cache is simply: **all sharing environments point at the SAME
