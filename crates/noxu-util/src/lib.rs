@@ -40,6 +40,7 @@
 
 pub mod clock;
 pub mod daemon;
+pub mod dst_invariants;
 pub mod dst_sync;
 pub mod lsn;
 pub mod packed;

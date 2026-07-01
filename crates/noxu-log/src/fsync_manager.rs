@@ -26,10 +26,10 @@
 //! replaces `state.next_fsync_waiters` with a fresh group, so waiting threads
 //! retain their `Arc` to the *old* group and can still be woken through it.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use noxu_util::dst_sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use noxu_util::dst_sync::{Arc, Condvar, Mutex, MutexGuard};
 use noxu_util::{Lsn, NULL_LSN};
 
 // ── FSyncGroup ────────────────────────────────────────────────────────────────
