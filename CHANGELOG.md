@@ -17,6 +17,15 @@ listed in [References](#references).
 
 ### Added
 
+- **`EVICTOR_MUTATE_BINS` LN-stripping gate (`noxu-evictor` + `noxu-dbi` +
+  `noxu-db`).** The evictor's PartialEvict LN-stripping path is now gated on
+  `EnvironmentConfig::with_evictor_mutate_bins` (`noxu.evictor.mutateBins`,
+  default **true** — JE-faithful). With `false` the evictor no longer mutates
+  a BIN by stripping its LNs (`strip_lns_from_node` returns `Some(0)`); only
+  whole-node eviction / put-back applies. Threaded `EnvironmentConfig` ->
+  `DbiEnvConfig` -> `Evictor::with_mutate_bins`. Default `true` is
+  byte-identical to prior behaviour. JE ref:
+  `EnvironmentParams.EVICTOR_MUTATE_BINS`, `Evictor` `mutateBins`.
 - **`dos_producer_queue_timeout_ms` DiskOrderedScan producer timeout
   (`noxu-dbi` + `noxu-db`).** The DiskOrderedScan producer thread now honours
   `EnvironmentConfig::with_dos_producer_queue_timeout_ms` (`noxu.dos.producer

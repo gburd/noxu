@@ -1000,6 +1000,7 @@ impl EnvironmentImpl {
             // JE EVICTOR_USE_DIRTY_LRU; with_off_heap below forces it false if
             // the off-heap cache is enabled (JE Evictor.java:1705).
             .with_use_dirty_lru(cfg.evictor_use_dirty_lru)
+            .with_mutate_bins(cfg.evictor_mutate_bins)
             .with_off_heap(Arc::clone(&off_heap_cache));
             log::info!(
                 "evictor eviction algorithm: {} (requested {:?})",

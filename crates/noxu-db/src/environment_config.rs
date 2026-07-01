@@ -555,6 +555,12 @@ pub struct EnvironmentConfig {
     /// JE EVICTOR_USE_DIRTY_LRU (default true). Forced false when off-heap is enabled.
     pub evictor_use_dirty_lru: bool,
 
+    /// JE `EVICTOR_MUTATE_BINS` (default true): when true, the evictor may
+    /// strip obsolete LNs out of a BIN during eviction (PartialEvict) rather
+    /// than leaving the BIN untouched.  Mirrors `EnvironmentParams`
+    /// `EVICTOR_MUTATE_BINS`.
+    pub evictor_mutate_bins: bool,
+
     /// Number of LRU lists (increases parallelism under contention).
     /// Mirrors `EVICTOR_N_LRU_LISTS` / default 4.
     pub evictor_n_lru_lists: u32,
@@ -934,6 +940,7 @@ impl EnvironmentConfig {
             evictor_critical_percentage: 5,
             evictor_lru_only: false,
             evictor_use_dirty_lru: true,
+            evictor_mutate_bins: true,
             evictor_n_lru_lists: 4,
             evictor_deadlock_retry: 3,
             evictor_core_threads: 1,
@@ -1581,6 +1588,12 @@ impl EnvironmentConfig {
     }
     pub fn set_evictor_use_dirty_lru(&mut self, v: bool) -> &mut Self {
         self.evictor_use_dirty_lru = v;
+        self
+    }
+
+    /// Setter for [`Self::evictor_mutate_bins`] (`EVICTOR_MUTATE_BINS`).
+    pub fn set_evictor_mutate_bins(&mut self, v: bool) -> &mut Self {
+        self.evictor_mutate_bins = v;
         self
     }
 
@@ -2476,6 +2489,14 @@ impl EnvironmentConfig {
     /// Builder-style (consuming) `evictor_use_dirty_lru` setter. See [`Self::set_evictor_use_dirty_lru`].
     pub fn with_evictor_use_dirty_lru(mut self, v: bool) -> Self {
         self.set_evictor_use_dirty_lru(v);
+        self
+    }
+
+    /// Builder-style `evictor_mutate_bins` setter (`EVICTOR_MUTATE_BINS`,
+    /// default true): when true the evictor may strip obsolete LNs out of a
+    /// BIN during eviction. See [`Self::set_evictor_mutate_bins`].
+    pub fn with_evictor_mutate_bins(mut self, v: bool) -> Self {
+        self.set_evictor_mutate_bins(v);
         self
     }
 
