@@ -100,12 +100,6 @@ pub static UNIMPLEMENTED_ENV_PARAMS: &[UnimplementedParam] = &[
         // (background btree verifier scheduling is not implemented).
         is_non_default: |c| !c.verify_schedule.is_empty(),
     },
-    UnimplementedParam {
-        name: "dos_producer_queue_timeout_ms",
-        // default = 10_000; the DiskOrderedScan producer-queue timeout is not
-        // consulted by the disk-ordered cursor implementation.
-        is_non_default: |c| c.dos_producer_queue_timeout_ms != 10_000,
-    },
 ];
 
 /// Emit a `log::warn!` for each unimplemented parameter that has been set to a
@@ -202,12 +196,7 @@ mod tests {
         let mut c = env_default();
         c.set_checkpointer_min_interval_secs(60);
         c.set_verify_schedule("0 0 * * *".to_string());
-        c.set_dos_producer_queue_timeout_ms(5_000);
-        for name in [
-            "checkpointer_min_interval_secs",
-            "verify_schedule",
-            "dos_producer_queue_timeout_ms",
-        ] {
+        for name in ["checkpointer_min_interval_secs", "verify_schedule"] {
             let p = UNIMPLEMENTED_ENV_PARAMS
                 .iter()
                 .find(|p| p.name == name)

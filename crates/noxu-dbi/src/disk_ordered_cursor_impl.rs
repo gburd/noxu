@@ -76,6 +76,11 @@ pub struct DiskOrderedCursorOptions {
     pub keys_only: bool,
     /// If `true`, keep a `(db_idx, key)` HashSet and skip duplicates.
     pub dedup_keys: bool,
+    /// `DOS_PRODUCER_QUEUE_TIMEOUT`: max time (ms) the producer will block
+    /// trying to enqueue one item before failing the scan.  0 disables the
+    /// timeout (the producer blocks indefinitely, the pre-7.1 behaviour).
+    /// JE: `DiskOrderedScanner` / `BlockingQueue.offer(item, timeout)`.
+    pub producer_queue_timeout_ms: u64,
 }
 
 impl Default for DiskOrderedCursorOptions {
@@ -86,6 +91,7 @@ impl Default for DiskOrderedCursorOptions {
             lsn_batch_size: usize::MAX,
             keys_only: false,
             dedup_keys: false,
+            producer_queue_timeout_ms: 10_000,
         }
     }
 }
@@ -449,16 +455,95 @@ fn produce(
             }
 
             // Backpressure on the channel itself: send blocks when the
-            // bounded queue is full.
-            if tx.send(Ok((key_vec, data_vec))).is_err() {
-                // Receiver dropped — consumer is gone.
-                budget.release(n);
-                return;
+            // bounded queue is full.  DOS_PRODUCER_QUEUE_TIMEOUT: if the
+            // consumer stalls and the queue stays full past the configured
+            // timeout, fail the scan instead of blocking forever (JE
+            // DiskOrderedScanner / BlockingQueue.offer(item, timeout)).
+            match offer_with_timeout(
+                &tx,
+                Ok((key_vec, data_vec)),
+                opts.producer_queue_timeout_ms,
+                &cancel,
+            ) {
+                OfferResult::Sent => {}
+                OfferResult::Cancelled | OfferResult::Disconnected => {
+                    // Receiver dropped or consumer cancelled — consumer gone.
+                    budget.release(n);
+                    return;
+                }
+                OfferResult::TimedOut => {
+                    // A lagging consumer left the queue full past the timeout.
+                    // Report a terminal error to the consumer and stop.
+                    budget.release(n);
+                    let _ = tx.send(Err(DbiError::OperationFailed(format!(
+                        "disk-ordered-scan producer queue timed out after \
+                         {} ms (consumer not draining)",
+                        opts.producer_queue_timeout_ms
+                    ))));
+                    return;
+                }
             }
         }
     }
     // Falling out of the loop closes `tx` (drop on return), which the
     // consumer observes as Disconnected → end-of-log.
+}
+
+/// Outcome of [`offer_with_timeout`].
+enum OfferResult {
+    /// Item was enqueued.
+    Sent,
+    /// The consumer cancelled the scan.
+    Cancelled,
+    /// The receiver was dropped.
+    Disconnected,
+    /// The queue stayed full for longer than the configured timeout.
+    TimedOut,
+}
+
+/// Offer `item` to the bounded channel, blocking only up to
+/// `timeout_ms` (0 = block indefinitely, honouring cancellation via the
+/// bounded `send` fallback).  Polls `try_send` so cancellation and the
+/// timeout are both observed even when the consumer never drains.
+///
+/// JE `DiskOrderedScanner` uses `BlockingQueue.offer(item, timeout, unit)`
+/// and aborts the scan when it returns false (DOS_PRODUCER_QUEUE_TIMEOUT).
+fn offer_with_timeout(
+    tx: &SyncSender<DocItem>,
+    item: DocItem,
+    timeout_ms: u64,
+    cancel: &AtomicBool,
+) -> OfferResult {
+    use std::sync::mpsc::TrySendError;
+    // 0 = no timeout: keep the pre-7.1 behaviour but still poll for
+    // cancellation so shutdown() is observed promptly.
+    let deadline = if timeout_ms == 0 {
+        None
+    } else {
+        Some(std::time::Instant::now() + Duration::from_millis(timeout_ms))
+    };
+    let mut pending = item;
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            return OfferResult::Cancelled;
+        }
+        match tx.try_send(pending) {
+            Ok(()) => return OfferResult::Sent,
+            Err(TrySendError::Disconnected(_)) => {
+                return OfferResult::Disconnected;
+            }
+            Err(TrySendError::Full(returned)) => {
+                if let Some(dl) = deadline
+                    && std::time::Instant::now() >= dl
+                {
+                    return OfferResult::TimedOut;
+                }
+                pending = returned;
+                // Poll interval bounded so cancel/timeout are seen promptly.
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -532,6 +617,64 @@ mod tests {
         drop(_g);
         let res = h.join().unwrap();
         assert!(!res, "reserve should return false when cancel fires");
+    }
+
+    // DOS_PRODUCER_QUEUE_TIMEOUT: a full bounded queue that the consumer
+    // never drains causes offer_with_timeout to return TimedOut once the
+    // deadline passes (JE BlockingQueue.offer(item, timeout) -> false ->
+    // fail the scan).
+    #[test]
+    fn offer_times_out_when_consumer_stalls() {
+        // Capacity-1 channel; fill it, keep the receiver alive but idle.
+        let (tx, _rx) = mpsc::sync_channel::<DocItem>(1);
+        tx.try_send(Ok((vec![1], vec![2]))).unwrap(); // now full
+        let cancel = AtomicBool::new(false);
+        let start = std::time::Instant::now();
+        let r = offer_with_timeout(
+            &tx,
+            Ok((vec![3], vec![4])),
+            50, // 50 ms timeout
+            &cancel,
+        );
+        assert!(matches!(r, OfferResult::TimedOut), "expected TimedOut");
+        assert!(
+            start.elapsed() >= Duration::from_millis(50),
+            "must wait at least the timeout before giving up"
+        );
+    }
+
+    // A consumer that drains lets the offer succeed before the timeout.
+    #[test]
+    fn offer_succeeds_when_consumer_drains() {
+        let (tx, rx) = mpsc::sync_channel::<DocItem>(1);
+        tx.try_send(Ok((vec![1], vec![2]))).unwrap(); // full
+        let cancel = Arc::new(AtomicBool::new(false));
+        // Drain one item after a short delay so a second offer fits.
+        let drainer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            let _ = rx.recv();
+            // keep rx alive so the offer sees Full then Sent, not Disconnected
+            rx
+        });
+        let r = offer_with_timeout(&tx, Ok((vec![3], vec![4])), 5_000, &cancel);
+        assert!(matches!(r, OfferResult::Sent), "expected Sent after drain");
+        let _rx = drainer.join().unwrap();
+    }
+
+    // Cancellation is observed even while blocked on a full queue.
+    #[test]
+    fn offer_returns_cancelled_when_cancel_fires() {
+        let (tx, _rx) = mpsc::sync_channel::<DocItem>(1);
+        tx.try_send(Ok((vec![1], vec![2]))).unwrap(); // full
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel2 = Arc::clone(&cancel);
+        let h = thread::spawn(move || {
+            offer_with_timeout(&tx, Ok((vec![3], vec![4])), 60_000, &cancel2)
+        });
+        thread::sleep(Duration::from_millis(20));
+        cancel.store(true, Ordering::Release);
+        let r = h.join().unwrap();
+        assert!(matches!(r, OfferResult::Cancelled), "expected Cancelled");
     }
 
     // ------------------------------------------------------------------

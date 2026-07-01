@@ -109,6 +109,11 @@ pub struct EnvironmentConfig {
     /// Mirrors `FREE_DISK` / default 5 GiB.
     pub free_disk: u64,
 
+    /// Extra bytes reserved on top of `free_disk`: writes fail when available
+    /// free space drops below `free_disk + reserved_disk`.  Mirrors JE
+    /// `RESERVED_DISK` (`EnvironmentParams.RESERVED_DISK`) / default 0.
+    pub reserved_disk: u64,
+
     // -----------------------------------------------------------------------
     // Background daemons — run flags
     // -----------------------------------------------------------------------
@@ -550,6 +555,12 @@ pub struct EnvironmentConfig {
     /// JE EVICTOR_USE_DIRTY_LRU (default true). Forced false when off-heap is enabled.
     pub evictor_use_dirty_lru: bool,
 
+    /// JE `EVICTOR_MUTATE_BINS` (default true): when true, the evictor may
+    /// strip obsolete LNs out of a BIN during eviction (PartialEvict) rather
+    /// than leaving the BIN untouched.  Mirrors `EnvironmentParams`
+    /// `EVICTOR_MUTATE_BINS`.
+    pub evictor_mutate_bins: bool,
+
     /// Number of LRU lists (increases parallelism under contention).
     /// Mirrors `EVICTOR_N_LRU_LISTS` / default 4.
     pub evictor_n_lru_lists: u32,
@@ -832,6 +843,7 @@ impl EnvironmentConfig {
             max_off_heap_memory: 0,
             max_disk: 0,
             free_disk: 5 * 1024 * 1024 * 1024, //: 5 GiB
+            reserved_disk: 0,
             // Daemon run flags
             run_in_compressor: true,
             run_checkpointer: true,
@@ -928,6 +940,7 @@ impl EnvironmentConfig {
             evictor_critical_percentage: 5,
             evictor_lru_only: false,
             evictor_use_dirty_lru: true,
+            evictor_mutate_bins: true,
             evictor_n_lru_lists: 4,
             evictor_deadlock_retry: 3,
             evictor_core_threads: 1,
@@ -1094,6 +1107,13 @@ impl EnvironmentConfig {
         self
     }
 
+    /// Setter for [`Self::reserved_disk`] (`RESERVED_DISK`): extra bytes
+    /// reserved on top of `free_disk`. 0 (default) reserves nothing.
+    pub fn set_reserved_disk(&mut self, bytes: u64) -> &mut Self {
+        self.reserved_disk = bytes;
+        self
+    }
+
     /// Builder form of [`Self::set_max_disk`] (`MAX_DISK`): absolute cap on
     /// total log size in bytes. 0 (default) disables the cap.
     pub fn with_max_disk(mut self, bytes: u64) -> Self {
@@ -1105,6 +1125,15 @@ impl EnvironmentConfig {
     /// free on the filesystem, in bytes. 0 disables the free-space reserve.
     pub fn with_free_disk(mut self, bytes: u64) -> Self {
         self.free_disk = bytes;
+        self
+    }
+
+    /// Builder form of [`Self::set_reserved_disk`] (`RESERVED_DISK`): reserve
+    /// this many bytes on top of `free_disk`; writes fail when free space
+    /// drops below `free_disk + reserved_disk`. 0 (default) reserves nothing.
+    /// Mirrors JE `EnvironmentParams.RESERVED_DISK`.
+    pub fn with_reserved_disk(mut self, bytes: u64) -> Self {
+        self.reserved_disk = bytes;
         self
     }
 
@@ -1559,6 +1588,12 @@ impl EnvironmentConfig {
     }
     pub fn set_evictor_use_dirty_lru(&mut self, v: bool) -> &mut Self {
         self.evictor_use_dirty_lru = v;
+        self
+    }
+
+    /// Setter for [`Self::evictor_mutate_bins`] (`EVICTOR_MUTATE_BINS`).
+    pub fn set_evictor_mutate_bins(&mut self, v: bool) -> &mut Self {
+        self.evictor_mutate_bins = v;
         self
     }
 
@@ -2454,6 +2489,14 @@ impl EnvironmentConfig {
     /// Builder-style (consuming) `evictor_use_dirty_lru` setter. See [`Self::set_evictor_use_dirty_lru`].
     pub fn with_evictor_use_dirty_lru(mut self, v: bool) -> Self {
         self.set_evictor_use_dirty_lru(v);
+        self
+    }
+
+    /// Builder-style `evictor_mutate_bins` setter (`EVICTOR_MUTATE_BINS`,
+    /// default true): when true the evictor may strip obsolete LNs out of a
+    /// BIN during eviction. See [`Self::set_evictor_mutate_bins`].
+    pub fn with_evictor_mutate_bins(mut self, v: bool) -> Self {
+        self.set_evictor_mutate_bins(v);
         self
     }
 

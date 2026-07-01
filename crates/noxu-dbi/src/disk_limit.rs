@@ -64,6 +64,10 @@ pub struct DiskLimitTracker {
     max_disk: u64,
     /// `FREE_DISK`: keep-this-much-free reserve in bytes. 0 = disabled.
     free_disk: u64,
+    /// `RESERVED_DISK`: extra bytes reserved on top of `free_disk`. Writes
+    /// fail once free space drops below `free_disk + reserved_disk`. JE:
+    /// `EnvironmentParams.RESERVED_DISK`. 0 = no extra reservation.
+    reserved_disk: u64,
     /// FileManager used to probe total log size + free space. `None` for
     /// in-memory or test environments that cannot probe a filesystem.
     file_manager: Option<Arc<FileManager>>,
@@ -86,11 +90,13 @@ impl DiskLimitTracker {
     pub fn new(
         max_disk: u64,
         free_disk: u64,
+        reserved_disk: u64,
         file_manager: Option<Arc<FileManager>>,
     ) -> Self {
         DiskLimitTracker {
             max_disk,
             free_disk,
+            reserved_disk,
             file_manager,
             violated: AtomicBool::new(false),
             available_log_size: AtomicU64::new(0),
@@ -105,7 +111,7 @@ impl DiskLimitTracker {
     /// branch with no atomic contention.
     #[inline]
     pub fn is_enabled(&self) -> bool {
-        self.max_disk > 0 || self.free_disk > 0
+        self.max_disk > 0 || self.free_disk > 0 || self.reserved_disk > 0
     }
 
     /// Cheap read of the cached violation flag (JE: read volatile
@@ -162,7 +168,12 @@ impl DiskLimitTracker {
     /// machinery), and `adjustedMax == maxDisk` for the non-HA case.
     pub fn recalc(&self, total_size: u64, disk_free_space: u64) {
         // freeBytes1 = diskFreeSpace - freeLimit   (JE; signed)
-        let free_bytes1: i64 = disk_free_space as i64 - self.free_disk as i64;
+        // JE `RESERVED_DISK` is subtracted from available free space in the
+        // same direction as `FREE_DISK`: writes are refused once free space
+        // drops below `freeDisk + reservedDisk`
+        // (EnvironmentParams.RESERVED_DISK).
+        let free_reserve = self.free_disk as i64 + self.reserved_disk as i64;
+        let free_bytes1: i64 = disk_free_space as i64 - free_reserve;
 
         // availBytes (with reservedSize == protectedSize == 0):
         //   adjustedMax > 0 -> min(freeBytes1, adjustedMax - totalSize)
@@ -191,9 +202,11 @@ impl DiskLimitTracker {
         format!(
             "Disk usage is not within maxDisk or freeDisk limits and write \
              operations are prohibited: maxDisk={}, freeDisk={}, \
-             totalLogSize={}, diskFreeSpace={}, availableLogSize={}",
+             reservedDisk={}, totalLogSize={}, diskFreeSpace={}, \
+             availableLogSize={}",
             self.max_disk,
             self.free_disk,
+            self.reserved_disk,
             self.total_log_size.load(Ordering::Relaxed),
             self.disk_free_space.load(Ordering::Relaxed),
             self.available_log_size.load(Ordering::Relaxed) as i64,
@@ -209,7 +222,7 @@ mod tests {
     // exercises the JE formula across the documented cases.
     #[test]
     fn disabled_never_violates() {
-        let t = DiskLimitTracker::new(0, 0, None);
+        let t = DiskLimitTracker::new(0, 0, 0, None);
         assert!(!t.is_enabled());
         t.recalc(1_000_000, 0); // even with zero free space
         assert!(!t.is_violated());
@@ -218,7 +231,7 @@ mod tests {
     #[test]
     fn max_disk_cap() {
         // maxDisk=100, freeDisk=0, plenty of free space.
-        let t = DiskLimitTracker::new(100, 0, None);
+        let t = DiskLimitTracker::new(100, 0, 0, None);
         t.recalc(50, 1_000_000);
         assert!(!t.is_violated(), "50 < 100 cap, ok");
         t.recalc(100, 1_000_000);
@@ -233,11 +246,30 @@ mod tests {
     #[test]
     fn free_disk_reserve() {
         // freeDisk=25, no maxDisk. Mirrors JE example rows.
-        let t = DiskLimitTracker::new(0, 25, None);
+        let t = DiskLimitTracker::new(0, 25, 0, None);
         t.recalc(75, 20); // diskFS=20 < freeDisk=25 -> freeBytes1=-5 -> violated
         assert!(t.is_violated());
         t.recalc(75, 30); // diskFS=30 > 25 -> freeBytes1=5 -> ok
         assert!(!t.is_violated());
+    }
+
+    #[test]
+    fn reserved_disk_adds_to_free_reserve() {
+        // JE RESERVED_DISK: writes fail when free < freeDisk + reservedDisk.
+        // freeDisk=25, reservedDisk=10 -> effective reserve 35.
+        let t = DiskLimitTracker::new(0, 25, 10, None);
+        assert!(t.is_enabled());
+        t.recalc(0, 30); // 30 < 35 -> violated (would be OK without reserved)
+        assert!(t.is_violated(), "30 free < 25+10 reserve -> violated");
+        t.recalc(0, 40); // 40 > 35 -> ok
+        assert!(!t.is_violated(), "40 free > 25+10 reserve -> ok");
+        // reservedDisk alone (freeDisk=0) still enables + reserves.
+        let t2 = DiskLimitTracker::new(0, 0, 10, None);
+        assert!(t2.is_enabled());
+        t2.recalc(0, 5); // 5 < 10 -> violated
+        assert!(t2.is_violated());
+        t2.recalc(0, 20); // 20 > 10 -> ok
+        assert!(!t2.is_violated());
     }
 
     #[test]
@@ -246,7 +278,7 @@ mod tests {
         // touching the file manager) and is_violated() never loads the flag.
         // This guards the "cheap when disabled" requirement: no statvfs, no
         // directory scan on the write path.
-        let t = DiskLimitTracker::new(0, 0, None);
+        let t = DiskLimitTracker::new(0, 0, 0, None);
         t.refresh(); // must not panic despite file_manager == None
         assert!(!t.is_violated());
         // Even if a stale violated flag were somehow set, is_enabled() gates it.
@@ -257,12 +289,12 @@ mod tests {
     #[test]
     fn both_limits_min_governs() {
         // JE row: freeDL=25 maxDL=80 diskFS=20 totalLS=50 -> avail 0 -> violated
-        let t = DiskLimitTracker::new(80, 25, None);
+        let t = DiskLimitTracker::new(80, 25, 0, None);
         t.recalc(50, 20);
         assert!(t.is_violated());
         // freeDL=5 maxDL=80 diskFS=20 totalLS=50 -> freeB1=15, maxRoom=30,
         // avail=min(15,30)=15 -> ok
-        let t2 = DiskLimitTracker::new(80, 5, None);
+        let t2 = DiskLimitTracker::new(80, 5, 0, None);
         t2.recalc(50, 20);
         assert!(!t2.is_violated());
     }

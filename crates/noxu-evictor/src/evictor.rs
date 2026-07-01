@@ -222,6 +222,12 @@ pub struct Evictor {
     /// `with_use_dirty_lru`.
     use_dirty_lru: bool,
 
+    /// JE `EVICTOR_MUTATE_BINS` (default true): when true the evictor may
+    /// strip obsolete LNs out of a BIN during PartialEvict; when false the
+    /// BIN is left untouched (no LN stripping) and only whole-node eviction
+    /// applies.  Faithful to JE `Evictor` `mutateBins` / `EVICTOR_MUTATE_BINS`.
+    mutate_bins: bool,
+
     next_pri1_index: AtomicU64,
     next_pri2_index: AtomicU64,
 
@@ -298,6 +304,7 @@ impl Evictor {
             max_batch_size,
             lru_only,
             use_dirty_lru: !lru_only,
+            mutate_bins: true,
             next_pri1_index: AtomicU64::new(0),
             next_pri2_index: AtomicU64::new(0),
             log_manager: None,
@@ -434,6 +441,14 @@ impl Evictor {
     /// `cfg.evictor_use_dirty_lru && off_heap_disabled`.
     pub fn with_use_dirty_lru(mut self, use_dirty_lru: bool) -> Self {
         self.use_dirty_lru = use_dirty_lru;
+        self
+    }
+
+    /// JE `EVICTOR_MUTATE_BINS` (default true): when false, the evictor will
+    /// NOT strip LNs out of a BIN during eviction (PartialEvict becomes a
+    /// no-op strip that frees 0 bytes).  Faithful to `Evictor` `mutateBins`.
+    pub fn with_mutate_bins(mut self, mutate_bins: bool) -> Self {
+        self.mutate_bins = mutate_bins;
         self
     }
 
@@ -1203,6 +1218,14 @@ impl Evictor {
     /// JE reference: `Evictor.java` `isPinned()` + `latchNoWait`-style
     /// non-blocking latch (CC-6 fix).
     fn strip_lns_from_node(&self, node_id: u64) -> Option<usize> {
+        // EVICTOR_MUTATE_BINS (JE Evictor `mutateBins`, default true): when
+        // false, the evictor must NOT mutate a BIN by stripping its LNs.
+        // Return Some(0) — a "no bytes stripped" result that routes into the
+        // existing strip-0 handling (whole-node evict / put-back) rather than
+        // None (which signals a busy/pinned node to retry).
+        if !self.mutate_bins {
+            return Some(0);
+        }
         // EVICTOR-RECLAIM-1: search every database tree, not just the primary
         // slot.  JE resolves the target's owning DB from the env-wide INList
         // (Evictor.processTarget -> target.getDatabase(), Evictor.java:2374).
@@ -3076,6 +3099,62 @@ mod tests {
             result.is_none(),
             "CC-6: must return None when cursor_count > 0 under lock; got {:?}",
             result
+        );
+    }
+
+    /// EVICTOR_MUTATE_BINS gate: with mutate_bins=false the evictor must NOT
+    /// strip LNs (returns Some(0), no bytes freed); the default (true) strips.
+    /// JE Evictor `mutateBins` / EVICTOR_MUTATE_BINS.
+    #[test]
+    fn test_evictor_mutate_bins_gate() {
+        use noxu_util::Lsn;
+        use std::sync::{Arc, RwLock};
+
+        // Build a tree with a strippable (clean, logged, cursor-free) LN.
+        let build = || {
+            let t = noxu_tree::tree::Tree::new(1, 128);
+            t.insert(b"k1".to_vec(), b"value-one".to_vec(), Lsn::new(1, 1))
+                .unwrap();
+            t.insert(b"k2".to_vec(), b"value-two".to_vec(), Lsn::new(1, 2))
+                .unwrap();
+            let bin_arc = {
+                let root = t.get_root().expect("root");
+                let guard = root.read();
+                match &*guard {
+                    TreeNode::Internal(n) => n.get_child(0).expect("BIN child"),
+                    TreeNode::Bottom(_) => Arc::clone(&root),
+                }
+            };
+            let bin_id = match &*bin_arc.read() {
+                TreeNode::Bottom(b) => b.node_id,
+                _ => panic!("expected BIN"),
+            };
+            (Arc::new(RwLock::new(t)), bin_id)
+        };
+
+        // Default (mutate_bins = true): strips the LN data, frees > 0 bytes.
+        let (tree_on, bin_on) = build();
+        let usage_on = Arc::new(std::sync::atomic::AtomicI64::new(9999));
+        let ev_on =
+            Evictor::new(Arbiter::new(1000, usage_on, 100, 200), 100, true)
+                .with_tree(tree_on, 1);
+        let freed_on = ev_on.strip_lns_from_node(bin_on);
+        assert!(
+            matches!(freed_on, Some(n) if n > 0),
+            "default mutate_bins=true must strip > 0 bytes; got {freed_on:?}"
+        );
+
+        // mutate_bins = false: no stripping, Some(0) (leaves the BIN intact).
+        let (tree_off, bin_off) = build();
+        let usage_off = Arc::new(std::sync::atomic::AtomicI64::new(9999));
+        let ev_off =
+            Evictor::new(Arbiter::new(1000, usage_off, 100, 200), 100, true)
+                .with_tree(tree_off, 1)
+                .with_mutate_bins(false);
+        assert_eq!(
+            ev_off.strip_lns_from_node(bin_off),
+            Some(0),
+            "mutate_bins=false must NOT strip LNs (Some(0))"
         );
     }
 

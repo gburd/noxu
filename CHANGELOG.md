@@ -17,6 +17,38 @@ listed in [References](#references).
 
 ### Added
 
+- **`EVICTOR_MUTATE_BINS` LN-stripping gate (`noxu-evictor` + `noxu-dbi` +
+  `noxu-db`).** The evictor's PartialEvict LN-stripping path is now gated on
+  `EnvironmentConfig::with_evictor_mutate_bins` (`noxu.evictor.mutateBins`,
+  default **true** — JE-faithful). With `false` the evictor no longer mutates
+  a BIN by stripping its LNs (`strip_lns_from_node` returns `Some(0)`); only
+  whole-node eviction / put-back applies. Threaded `EnvironmentConfig` ->
+  `DbiEnvConfig` -> `Evictor::with_mutate_bins`. Default `true` is
+  byte-identical to prior behaviour. JE ref:
+  `EnvironmentParams.EVICTOR_MUTATE_BINS`, `Evictor` `mutateBins`.
+- **`dos_producer_queue_timeout_ms` DiskOrderedScan producer timeout
+  (`noxu-dbi` + `noxu-db`).** The DiskOrderedScan producer thread now honours
+  `EnvironmentConfig::with_dos_producer_queue_timeout_ms` (`noxu.dos.producer
+  QueueTimeout`, default 10 s): when a lagging consumer keeps the bounded
+  producer queue full past the timeout, the producer fails the scan with an
+  `OperationFailed` error instead of blocking forever. Implemented via a
+  polling `try_send` offer loop (`offer_with_timeout`) that also observes
+  cancellation promptly. Threaded `EnvironmentConfig` -> `DbiEnvConfig` ->
+  `EnvironmentImpl::get_dos_producer_queue_timeout_ms` ->
+  `DiskOrderedCursorOptions`. Removed from the `unimplemented_params` WARN
+  registry. Default 10 s and a draining consumer are byte-identical to prior
+  behaviour. JE ref: `DiskOrderedScanner` / `BlockingQueue.offer(item,
+  timeout)`, `EnvironmentParams.DOS_PRODUCER_QUEUE_TIMEOUT`.
+- **`RESERVED_DISK` disk-space reservation (`noxu-dbi` + `noxu-db`).** Beyond
+  `FREE_DISK`, the new `EnvironmentConfig::with_reserved_disk(bytes)`
+  (`noxu.reservedDisk`, default 0) reserves N extra bytes: a user write is
+  refused with `DiskLimitExceeded` once filesystem free space drops below
+  `FREE_DISK + RESERVED_DISK`. Wired into the existing `DiskLimitTracker`
+  gate (`crates/noxu-dbi/src/disk_limit.rs`); the reservation is subtracted
+  from available free space in the same direction as `FREE_DISK`. Default 0 is
+  byte-identical to prior behaviour (no extra reservation). JE ref:
+  `EnvironmentParams.RESERVED_DISK`, `Cleaner.recalcLogSizeStats`.
+
 - **Latch fairness knobs `env_latch_timeout_ms` + `env_forced_yield` wired
   (`noxu-latch` + `noxu-dbi`).** Two previously accepted-but-inert JE latch
   knobs are now real features, wired non-breaking:

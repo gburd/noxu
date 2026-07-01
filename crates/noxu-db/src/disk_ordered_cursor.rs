@@ -324,6 +324,7 @@ impl Database {
                     || config.bins_only
                     || config.count_only,
                 dedup_keys: config.dedup_keys,
+                producer_queue_timeout_ms: self.dos_producer_queue_timeout_ms(),
             },
             self.cached_file_protector(),
         )?;
@@ -402,6 +403,8 @@ pub fn open_disk_ordered_cursor_multi<'env>(
                 || config.bins_only
                 || config.count_only,
             dedup_keys: config.dedup_keys,
+            producer_queue_timeout_ms: databases[0]
+                .dos_producer_queue_timeout_ms(),
         },
         databases[0].cached_file_protector(),
     )?;

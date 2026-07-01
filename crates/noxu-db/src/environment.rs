@@ -133,6 +133,13 @@ pub struct Environment {
     /// `stats_collect` is enabled and a stats-file destination is configured.
     /// `None` when stats collection is off.  Stopped (joined) at `close`.
     stats_dumper: Mutex<Option<crate::stats_file::StatsFileDumper>>,
+
+    /// Background B-tree verifier daemon (`VERIFY_SCHEDULE` /
+    /// `ENV_RUN_VERIFIER`).  `Some` only when `run_verifier` is true AND a
+    /// non-empty, well-formed `verify_schedule` was supplied; `None`
+    /// otherwise (the default — no daemon, unchanged behaviour).  Stopped
+    /// (joined) at `close`.
+    verify_daemon: Mutex<Option<crate::verify_daemon::VerifyDaemon>>,
 }
 
 /// Internal database handle state.
@@ -288,6 +295,7 @@ impl Environment {
             env_latch_timeout_ms: config.env_latch_timeout_ms,
             env_ttl_clock_tolerance_ms: config.env_ttl_clock_tolerance_ms,
             env_expiration_enabled: config.env_expiration_enabled,
+            dos_producer_queue_timeout_ms: config.dos_producer_queue_timeout_ms,
             env_db_eviction: config.env_db_eviction,
             // Memory
             cache_size: config.cache_size,
@@ -296,6 +304,7 @@ impl Environment {
             max_off_heap_memory: config.max_off_heap_memory,
             max_disk: config.max_disk,
             free_disk: config.free_disk,
+            reserved_disk: config.reserved_disk,
             // Log
             log_file_max_bytes: config.log_file_max_bytes,
             log_file_cache_size: config.log_file_cache_size,
@@ -381,6 +390,7 @@ impl Environment {
             evictor_critical_percentage: config.evictor_critical_percentage,
             evictor_lru_only: config.evictor_lru_only,
             evictor_use_dirty_lru: config.evictor_use_dirty_lru,
+            evictor_mutate_bins: config.evictor_mutate_bins,
             evictor_n_lru_lists: config.evictor_n_lru_lists,
             evictor_deadlock_retry: config.evictor_deadlock_retry,
             evictor_core_threads: config.evictor_core_threads,
@@ -494,6 +504,45 @@ impl Environment {
             None
         };
 
+        // VERIFY_SCHEDULE / ENV_RUN_VERIFIER: start the background B-tree
+        // verifier daemon ONLY when the operator explicitly enabled it
+        // (run_verifier = true, default false) AND supplied a non-empty,
+        // well-formed cron schedule.  The default (run_verifier = false)
+        // spawns nothing, so behaviour is unchanged.  The daemon re-uses the
+        // same public verification walk `Environment::verify` runs (it does
+        // NOT touch verify's internals) on the shared EnvironmentImpl.  It is
+        // env-owned (not registered with the engine DaemonManager) so it
+        // cannot perturb the daemon-manager shutdown ordering.
+        // JE ref: EnvironmentParams.ENV_RUN_VERIFIER / VERIFY_SCHEDULE,
+        // com.sleepycat.je.dbi.DataVerifier.
+        let verify_daemon = if config.run_verifier
+            && !config.verify_schedule.is_empty()
+        {
+            match crate::verify_daemon::CronSchedule::parse(
+                &config.verify_schedule,
+            ) {
+                Some(schedule) => {
+                    let vconfig = noxu_engine::VerifyConfig::new()
+                        .with_btree_verification(true);
+                    Some(crate::verify_daemon::VerifyDaemon::start(
+                        Arc::clone(&env_impl_arc),
+                        schedule,
+                        vconfig,
+                    ))
+                }
+                None => {
+                    log::warn!(
+                        "verify_schedule={:?} is not a valid 5-field cron \
+                         expression; the background verifier will NOT run",
+                        config.verify_schedule,
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let env = Environment {
             home,
             config,
@@ -509,6 +558,7 @@ impl Environment {
             replica_coordinator: Mutex::new(None),
             replica_ack_timeout: Mutex::new(std::time::Duration::from_secs(5)),
             stats_dumper: Mutex::new(stats_dumper),
+            verify_daemon: Mutex::new(verify_daemon),
         };
 
         // STARTUP_DUMP_THRESHOLD: if opening the environment (dominated by
@@ -589,6 +639,11 @@ impl Environment {
         // engine, so it cannot sample a closing EnvironmentImpl.
         if let Some(dumper) = self.stats_dumper.lock().take() {
             dumper.stop();
+        }
+        // Stop the background verifier daemon (join its thread) before tearing
+        // down the engine, so it cannot walk a closing EnvironmentImpl.
+        if let Some(verifier) = self.verify_daemon.lock().take() {
+            verifier.stop();
         }
         let env_impl = self.env_impl.lock();
         // env_check_leaks (default true): at a clean close all user
