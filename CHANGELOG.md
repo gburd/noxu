@@ -24,6 +24,18 @@ listed in [References](#references).
   version. (The `docs/src/internal/noxu-umbrella.md` historical record keeps
   its point-in-time `3.0.1` references.)
 
+### Changed
+
+- **P2-2 — removed crate-wide `#![allow(dead_code)]` from public crates.**
+  Dropped the blanket `dead_code` allow from `noxu-bind`, `noxu-collections`,
+  `noxu-persist`, and `noxu-rep` so genuinely-unused items surface in CI
+  (`clippy::type_complexity` / `clippy::too_many_arguments` allows kept).
+  Removed the resulting dead items (`ScanShape`, `Phantom` in
+  `noxu-collections`; a dead `make_expected` test helper in `noxu-rep`) and
+  annotated two API-symmetry wrapper methods (`AnyServiceDispatcher::{is_running,
+  addr}`) with a scoped `#[allow(dead_code)]`. `noxu`, `noxu-observe`,
+  `noxu-xa`, `noxu-persist-derive` had no crate-wide `dead_code` allow.
+
 ## [7.0.0] - 2026-07-01
 
 ### Changed (BREAKING — 7.0 core API reshape)

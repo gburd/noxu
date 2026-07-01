@@ -148,17 +148,6 @@ pub(crate) fn decode_value<V, VB: EntryBinding<V>>(
         .map_err(|e| CollectionError::BindingError(e.to_string()))
 }
 
-/// Selects which decoded fields a scan should produce.
-#[derive(Copy, Clone, Debug)]
-pub(crate) enum ScanShape {
-    /// Decode key and value (yield `(K, V)`).
-    KeyValue,
-    /// Decode key only.
-    Key,
-    /// Decode value only.
-    Value,
-}
-
 /// Direction for a scan.
 #[derive(Copy, Clone, Debug)]
 pub(crate) enum ScanDirection {
@@ -451,14 +440,6 @@ where
         project,
     )
 }
-
-/// Marker used by the typed Stored* views to signal that the binding
-/// type parameters do not need to outlive the value itself.
-///
-/// Using `fn() -> (K, V)` keeps the marker `Send + Sync` regardless of
-/// `K` / `V` so the views can be moved across threads as long as the
-/// bindings themselves are `Send + Sync`.
-pub(crate) type Phantom<K, V> = PhantomData<fn() -> (K, V)>;
 
 /// Reads a single endpoint of the database (typically `Get::First` or
 /// `Get::Last`) and returns the decoded `(K, V)` pair.

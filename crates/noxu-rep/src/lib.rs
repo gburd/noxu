@@ -3,7 +3,7 @@
 // See LICENSE-APACHE and LICENSE-MIT at the root of this repository.
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-#![allow(dead_code, clippy::type_complexity, clippy::too_many_arguments)]
+#![allow(clippy::type_complexity, clippy::too_many_arguments)]
 //! > **Internal component of the [`noxu`](https://crates.io/crates/noxu) database.**
 //! >
 //! > This crate is published only so the `noxu` umbrella crate can depend on it.
