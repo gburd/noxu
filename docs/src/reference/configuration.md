@@ -175,6 +175,7 @@ JE-style `logging_level` / `trace_*` knobs are deprecated no-ops).
 | `stats_file_directory` | `Option<PathBuf>` | env home | Output directory for rotating stats CSV files (`noxu.stat.<N>.csv`). JE: `STATS_FILE_DIRECTORY`. |
 | `stats_file_row_count` | `u32` | `1000` | CSV data rows per stats file before rotation. JE: `STATS_FILE_ROW_COUNT`. |
 | `stats_max_files` | `u32` | `100` | Max rotated stats files retained (oldest pruned). JE: `STATS_MAX_FILES`. |
+| `env_check_leaks` | `bool` | `true` | At `Environment::close`, warn on any lock still held with an owner (leaked transaction/cursor). Diagnostic only. JE: `EnvironmentImpl` leak checking. |
 
 When `stats_collect` is enabled, a `noxu-stats-file` daemon samples the same
 snapshot `Environment::stats()` returns and appends a CSV row every

@@ -553,6 +553,26 @@ impl Environment {
             dumper.stop();
         }
         let env_impl = self.env_impl.lock();
+        // env_check_leaks (default true): at a clean close all user
+        // transactions have released their locks; any lock still held with an
+        // owner indicates an application leak (a dropped Transaction, a cursor
+        // held open, ...).  Report it (JE EnvironmentImpl leak checking).  This
+        // is diagnostic only — it warns, it does not fail the close.
+        if self.config.env_check_leaks {
+            let leaks = env_impl.get_lock_manager().report_leaked_locks();
+            if !leaks.is_empty() {
+                let total_locks: usize =
+                    leaks.iter().map(|(_, owners)| owners.len()).sum();
+                log::warn!(
+                    "env_check_leaks: {} lock(s) still held by {} locker(s) at \
+                     Environment::close — an application likely leaked a \
+                     transaction or cursor. Leaked (lsn, owners): {:?}",
+                    leaks.len(),
+                    total_locks,
+                    leaks,
+                );
+            }
+        }
         let _ = env_impl.close();
         Ok(())
     }
@@ -1805,6 +1825,52 @@ mod tests {
         let env = Environment::open(config).unwrap();
         assert!(env.is_valid());
         assert_eq!(env.home(), temp_dir.path());
+        env.close().unwrap();
+    }
+
+    #[test]
+    fn test_env_check_leaks_reports_leaked_lock() {
+        use noxu_txn::LockType;
+        let (_temp_dir, config) = temp_env_config();
+        // env_check_leaks defaults to true.
+        assert!(config.env_check_leaks);
+        let env = Environment::open(config).unwrap();
+
+        // Deliberately leak a lock directly on the shared lock manager: a
+        // locker (id 999) acquires a write lock and never releases it. This is
+        // exactly the leak env_check_leaks is meant to surface (an application
+        // that dropped a transaction/cursor without releasing its locks).
+        {
+            let env_impl = env.env_impl.lock();
+            let lm = env_impl.get_lock_manager();
+            lm.lock(0xDEAD_BEEF, 999, LockType::Write, false, false).unwrap();
+            // The leak is observable before close.
+            let leaks = lm.report_leaked_locks();
+            assert!(
+                leaks.iter().any(|(lsn, owners)| *lsn == 0xDEAD_BEEF
+                    && owners.contains(&999)),
+                "the deliberately-leaked lock must be reported"
+            );
+        }
+
+        // close() must still succeed; env_check_leaks only warns (side effect).
+        // There are no *tracked* active transactions, so the active-txn guard
+        // does not block the close.
+        env.close().unwrap();
+    }
+
+    #[test]
+    fn test_env_check_leaks_clean_close_no_leak() {
+        let (_temp_dir, config) = temp_env_config();
+        let env = Environment::open(config).unwrap();
+        // A clean env with no outstanding locks reports zero leaks.
+        {
+            let env_impl = env.env_impl.lock();
+            assert!(
+                env_impl.get_lock_manager().report_leaked_locks().is_empty(),
+                "a freshly opened env must have no leaked locks"
+            );
+        }
         env.close().unwrap();
     }
 

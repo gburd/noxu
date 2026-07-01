@@ -17,6 +17,14 @@ listed in [References](#references).
 
 ### Added
 
+- **`env_check_leaks` lock-leak detection at close (`noxu-txn` + `noxu-db`).**
+  At `Environment::close`, when `env_check_leaks` is `true` (the default),
+  Noxu walks the active lock table (new `LockManager::report_leaked_locks`)
+  and logs a `warn!` for any lock still held with an owner — an application
+  leak (a dropped `Transaction`, a cursor held open). Diagnostic only: it
+  reports the leaked `(lsn, owner_locker_ids)`, it does not force-release or
+  fail the close. Removed `env_check_leaks` from the `unimplemented_params`
+  WARN registry. JE ref: `EnvironmentImpl` leak checking.
 - **Stats-file dump (`STATS_FILE_*`, `noxu-db`).** When `stats_collect` is
   enabled, a `noxu-stats-file` background daemon (faithful analogue of JE
   `StatCapture`) samples the same snapshot `Environment::stats()` returns and

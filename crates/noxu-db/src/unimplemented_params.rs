@@ -41,11 +41,6 @@ pub struct UnimplementedParam {
 /// - A new reserved parameter is added (add an entry).
 pub static UNIMPLEMENTED_ENV_PARAMS: &[UnimplementedParam] = &[
     UnimplementedParam {
-        name: "env_check_leaks",
-        // default = true; non-default means the caller set it to false
-        is_non_default: |c| !c.env_check_leaks,
-    },
-    UnimplementedParam {
         name: "env_forced_yield",
         // default = false; non-default means the caller set it to true
         is_non_default: |c| c.env_forced_yield,
@@ -153,17 +148,6 @@ mod tests {
                 param.name,
             );
         }
-    }
-
-    #[test]
-    fn env_check_leaks_warn_on_false() {
-        let mut c = env_default();
-        c.set_env_check_leaks(false);
-        let p = UNIMPLEMENTED_ENV_PARAMS
-            .iter()
-            .find(|p| p.name == "env_check_leaks")
-            .unwrap();
-        assert!((p.is_non_default)(&c), "should detect non-default");
     }
 
     #[test]
