@@ -288,14 +288,18 @@ binary.
 | Protocol | Status | Why |
 |---|---|---|
 | `DaemonManager` shutdown / wakeup (`shuttle_daemon_shutdown.rs`) | **Green gate** | The shutdown wakeup is an explicit `notify()`, so liveness does not rely on a timeout — shuttle can prove deadlock-freedom. |
-| `FsyncManager` group-commit (`shuttle_fsync_manager.rs`) | **Partial** — harness-detection test green, full safety oracle `#[ignore]`d | The leader hand-off recovers a lost `wakeup_one` via `LOG_FSYNC_TIMEOUT`; shuttle's `wait_timeout` never times out, so it cannot model that recovery and reports the orphan as a deadlock. The passing test proves the gate *detects* the orphan; the ignored test carries the safety oracle, ready once the hand-off is made timeout-independent. **M1.1** threaded an injectable `Clock` through the fsync timeout, and the `dst_sync_pl` wrapper can now fire a clock-driven timed wait under shuttle (see below), so the oracle is *unblocked* pending the next wave. |
-| `lock_manager` deadlock detection | **Unblocked by M1.1** (not yet ported) | Previously blocked twice: the `parking_lot`-shaped `noxu-sync` could not be shuttle-swapped, *and* the deadlock re-detection ran off `Instant::now()` + 50 ms `wait_for` slices. **M1.1** removes both blockers: an injectable `Clock` now drives the timeout/re-detection cadence (`LockManager::with_config_clock`) and `noxu_util::dst_sync_pl` provides a `parking_lot`-shaped Mutex/RwLock/Condvar over shuttle. Porting the actual `lock_manager` shuttle oracle is the next wave. |
+| `FsyncManager` group-commit (`shuttle_fsync_manager.rs`) | **Green gate** (DST wave 2) | The leader hand-off previously recovered a lost `wakeup_one` via `LOG_FSYNC_TIMEOUT`, which shuttle cannot model. DST wave 2 **fixed** the lost-wakeup (a `leader_notified` predicate-before-wait flag, the same class as the `WakeHandle` pre-check), so the hand-off is timeout-independent and the full safety oracle (`DurableImpliesLogged`, `FsyncedNeverDecreases`, coalescing, failure fan-out) now runs green over 5000 interleavings. Reverting the fix makes the oracle deadlock, so the gate is not blind. |
+| `lock_manager` deadlock detection (`shuttle_lock_manager.rs`) | **Green gate** (DST wave 2) | Routes the shard-table / waiter-graph `Mutex` and per-waiter grant `Condvar` through `noxu_util::dst_sync_pl`; drives the 50 ms re-detection slice via a `SimClock` (`LockManager::with_config_clock`). Asserts no-deadlock-undetected + victim-consistency (a two-lock cycle aborts exactly one victim) and no lost wakeup on grant (`WriteLocksExclusive`), mapped to `noxu-spec` `lock_manager_deadlock`. |
+| `log_buffer` segment pin/release | **Deferred** | The segment latch is a `noxu_sync::RawMutex` (`lock_api::RawMutex` shape); shuttle 0.9 exposes no `lock_api::RawMutex`, and the `RawMutex::INIT` const requirement blocks a clean wrapper. The segment's other concurrency is raw-pointer `unsafe` shuttle would not schedule. Deferred until a raw-lock-over-shuttle shim is scheduled. |
 
 > shuttle surfaced two real, latent lost-wakeups masked in production by
-> timeouts. The `DaemonManager` one (a missing predicate-before-wait in
-> `WakeHandle::wait_timeout`, a shutdown stall up to the wakeup interval) was
-> **fixed**. The `FsyncManager` one (an orphaned hand-off cohort, recovered by
-> the fsync timeout) is documented and left to a dedicated review.
+> timeouts, both now **fixed**. The `DaemonManager` one (a missing
+> predicate-before-wait in `WakeHandle::wait_timeout`, a shutdown stall up to
+> the wakeup interval) was fixed in M2. The `FsyncManager` one (a lost
+> leader-designation `wakeup_one`, recovered by the fsync timeout — a
+> commit/shutdown stall up to `LOG_FSYNC_TIMEOUT`) was fixed in DST wave 2 with
+> a `leader_notified` predicate-before-wait flag, which also un-blocked the
+> `FsyncManager` safety oracle above.
 
 #### Running the shuttle gate
 
@@ -303,9 +307,10 @@ The shuttle gate is part of the **release** DST gate (like M1's long sweep), not
 required for local dev. It needs the `noxu_shuttle` cfg via `RUSTFLAGS`:
 
 ```bash
-# Both shuttle targets:
+# All four shuttle targets:
 RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-engine --test shuttle_daemon_shutdown
 RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-log    --test shuttle_fsync_manager
+RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-txn    --test shuttle_lock_manager
 
 # The M1.1 parking_lot-over-shuttle wrapper self-test:
 RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-util --test shuttle_dst_sync_pl

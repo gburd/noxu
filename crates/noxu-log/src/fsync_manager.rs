@@ -28,8 +28,13 @@
 
 use std::time::Duration;
 
+use noxu_util::dst_sync::Arc;
 use noxu_util::dst_sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use noxu_util::dst_sync::{Arc, Condvar, Mutex, MutexGuard};
+// The condvar-timed waits (`grpc_wait`, `wait_for_event`) route through the
+// parking_lot-over-shuttle seam so a `SimClock`-driven timed wait fires
+// deterministically under shuttle (DST M1.1 `advance_and_fire`); the default
+// build re-exports the real `noxu-sync` types, so production is unchanged.
+use noxu_util::dst_sync_pl::{Condvar, Mutex, MutexGuard};
 use noxu_util::{Clock, Lsn, NULL_LSN, RealClock};
 
 // ── FSyncGroup ────────────────────────────────────────────────────────────────
@@ -55,6 +60,17 @@ struct FsyncGroupInner {
     work_done: bool,
     /// Whether a leader has already been designated for this group.
     leader_exists: bool,
+    /// A leader-designation wakeup (`wakeup_one`) is pending for this group.
+    ///
+    /// LOST-WAKEUP FIX (DST wave 2): `wakeup_one` sets this to `true` under
+    /// `inner` BEFORE calling `Condvar::notify_one`, and `wait_for_event`
+    /// consumes it under `inner` BEFORE blocking.  Without it, a `notify_one`
+    /// that lands after the leader captured the cohort but before the next
+    /// waiter reaches its `wait` is lost (a `notify` with no waiter is a
+    /// no-op), orphaning the next leader until `LOG_FSYNC_TIMEOUT`.  This is
+    /// the same predicate-before-wait class as the `DaemonManager` WakeHandle
+    /// pre-check landed in M2, applied to the group-commit leader hand-off.
+    leader_notified: bool,
     /// Recorded error message from the fsync, propagated to all waiters.
     error: Option<String>,
     /// Result LSN (as u64) the leader durably synced on this group's behalf.
@@ -86,6 +102,7 @@ impl FSyncGroup {
             inner: Mutex::new(FsyncGroupInner {
                 work_done: false,
                 leader_exists: false,
+                leader_notified: false,
                 error: None,
                 result_lsn: 0,
             }),
@@ -114,11 +131,24 @@ impl FSyncGroup {
             return WaitStatus::NoFsyncNeeded;
         }
 
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
 
         // Fast path: already done before we even enter.
         if inner.work_done {
             return WaitStatus::NoFsyncNeeded;
+        }
+
+        // LOST-WAKEUP FIX (DST wave 2), pre-check #1: a leader-designation
+        // `wakeup_one` may have fired (under `inner`) after the leader
+        // captured this cohort but before we reached the wait.  Consuming the
+        // pending flag here — before blocking — turns that otherwise-lost
+        // `notify_one` into an immediate leader designation, so the next
+        // leader is never orphaned to the fsync timeout.  Same class as the
+        // WakeHandle predicate-before-wait pre-check.
+        if !inner.leader_exists && inner.leader_notified {
+            inner.leader_notified = false;
+            inner.leader_exists = true;
+            return WaitStatus::DoLeaderFsync;
         }
 
         let timeout_ns = timeout.as_nanos() as u64;
@@ -131,15 +161,15 @@ impl FSyncGroup {
             }
             let remaining = Duration::from_nanos(timeout_ns - elapsed_ns);
 
-            let (guard, _timed_out) =
-                self.condvar.wait_timeout(inner, remaining).unwrap();
-            inner = guard;
+            let _timed_out =
+                self.condvar.wait_for(&mut inner, remaining).timed_out();
 
             if inner.work_done {
                 return WaitStatus::NoFsyncNeeded;
             }
 
             if !inner.leader_exists {
+                inner.leader_notified = false;
                 inner.leader_exists = true;
                 return WaitStatus::DoLeaderFsync;
             }
@@ -160,7 +190,7 @@ impl FSyncGroup {
     fn wakeup_all(&self, result_lsn: u64) {
         // P-1: set atomic first so late-arriving waiters skip the mutex.
         self.work_done_atomic.store(true, Ordering::Release);
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         inner.work_done = true;
         inner.error = None;
         inner.result_lsn = result_lsn;
@@ -176,7 +206,7 @@ impl FSyncGroup {
         // They still need to acquire the mutex to read the error string, but
         // at least they can tell "something happened" without the race.
         self.work_done_atomic.store(true, Ordering::Release);
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         inner.work_done = true;
         inner.error = Some(msg);
         drop(inner);
@@ -185,18 +215,32 @@ impl FSyncGroup {
 
     /// Wake a single waiter to become the next leader.
     ///
+    /// LOST-WAKEUP FIX (DST wave 2): the designation flag is set under `inner`
+    /// BEFORE `notify_one`, so a waiter that has not yet reached its `wait`
+    /// observes it on the pre-check in `wait_for_event` and is designated
+    /// leader without ever blocking.  Without the flag the bare `notify_one`
+    /// is lost if it lands before the waiter blocks (JE recovers this via
+    /// `LOG_FSYNC_TIMEOUT`; this closes the stall window in production and
+    /// makes the hand-off timeout-independent so shuttle can prove liveness).
     fn wakeup_one(&self) {
+        let mut inner = self.inner.lock();
+        // Only arm a designation if none has been made yet for this cohort;
+        // if a leader already exists the notify is unnecessary.
+        if !inner.leader_exists {
+            inner.leader_notified = true;
+        }
+        drop(inner);
         self.condvar.notify_one();
     }
 
     /// Return the recorded error (if any) for this group.
     fn take_error(&self) -> Option<String> {
-        self.inner.lock().unwrap().error.clone()
+        self.inner.lock().error.clone()
     }
 
     /// Return the durable result LSN the leader recorded for this group.
     fn result_lsn(&self) -> u64 {
-        self.inner.lock().unwrap().result_lsn
+        self.inner.lock().result_lsn
     }
 }
 
@@ -347,7 +391,7 @@ impl FsyncManager {
 
         // ── Phase 1: decide whether to lead or wait ───────────────────────
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.lock();
 
             if state.work_in_progress {
                 // Join the next-waiters cohort.
@@ -403,7 +447,7 @@ impl FsyncManager {
                 }
                 WaitStatus::DoLeaderFsync => {
                     // Attempt to become the new leader for this cohort.
-                    let mut state = self.state.lock().unwrap();
+                    let mut state = self.state.lock();
                     if state.work_in_progress {
                         // Another thread started new work while we were being
                         // woken up — do our own work as a safety measure.
@@ -461,7 +505,7 @@ impl FsyncManager {
                 }
                 // Wake one member of the next cohort to become the new leader,
                 // then clear work_in_progress — matching JE ordering.
-                let mut state = self.state.lock().unwrap();
+                let mut state = self.state.lock();
                 state.next_fsync_waiters.wakeup_one();
                 state.work_in_progress = false;
             }
@@ -533,7 +577,7 @@ impl FsyncManager {
     /// `Condvar::wait_timeout`, and returns a fresh guard.
     fn grpc_wait<'a>(
         &'a self,
-        state: MutexGuard<'a, FsyncState>,
+        mut state: MutexGuard<'a, FsyncState>,
     ) -> MutexGuard<'a, FsyncState> {
         // Skip wait entirely when no other threads are queued yet.  This
         // eliminates the single-threaded latency penalty: a lone committer
@@ -551,10 +595,12 @@ impl FsyncManager {
             if elapsed_ns < interval_ns {
                 let remaining_ns = interval_ns - elapsed_ns;
                 let wait_dur = Duration::from_nanos(remaining_ns);
-                // `Condvar::wait_timeout` releases the lock and re-acquires it.
-                let (new_guard, _) =
-                    self.leader_condvar.wait_timeout(state, wait_dur).unwrap();
-                return new_guard;
+                // `Condvar::wait_for` releases the lock and re-acquires it
+                // (parking_lot shape: borrows the guard in place).  Under
+                // shuttle this is the `SimClock`-driven timed wait fired by
+                // `advance_and_fire`; in production it is the real futex wait.
+                self.leader_condvar.wait_for(&mut state, wait_dur);
+                return state;
             }
         }
         state
@@ -794,7 +840,7 @@ mod tests {
     fn test_fsync_group_wakeup_all() {
         let g = FSyncGroup::new();
         g.wakeup_all(0);
-        assert!(g.inner.lock().unwrap().work_done);
+        assert!(g.inner.lock().work_done);
         assert!(g.take_error().is_none());
     }
 
@@ -803,7 +849,7 @@ mod tests {
     fn test_fsync_group_wakeup_all_with_error() {
         let g = FSyncGroup::new();
         g.wakeup_all_with_error("oops".to_string());
-        assert!(g.inner.lock().unwrap().work_done);
+        assert!(g.inner.lock().work_done);
         assert_eq!(g.take_error().unwrap(), "oops");
     }
 
@@ -831,7 +877,7 @@ mod tests {
 
         let status = g.wait_for_event(&RealClock, Duration::from_millis(500));
         assert_eq!(status, WaitStatus::DoLeaderFsync);
-        assert!(g.inner.lock().unwrap().leader_exists);
+        assert!(g.inner.lock().leader_exists);
     }
 
     /// FSyncGroup: waiter times out when nobody wakes it.
@@ -839,7 +885,7 @@ mod tests {
     fn test_fsync_group_timeout() {
         let g = FSyncGroup::new();
         // Pre-set leader_exists so wakeup_one won't make us the leader.
-        g.inner.lock().unwrap().leader_exists = true;
+        g.inner.lock().leader_exists = true;
         let status = g.wait_for_event(&RealClock, Duration::from_millis(20));
         assert_eq!(status, WaitStatus::DoTimeoutFsync);
     }
