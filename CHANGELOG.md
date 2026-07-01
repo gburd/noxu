@@ -32,6 +32,22 @@ listed in [References](#references).
   `Cleaner::set_checkpoint_wakeup_fn` / `Cleaner::has_checkpoint_wakeup_fn`; no
   API removal, no on-disk format change.
 
+- **CLN-8: force-clean files / `FilesToMigrate` (feat(noxu-cleaner)).** Added a
+  force-clean set to the cleaner (JE `Cleaner.forceCleanFiles` /
+  `FilesToMigrate`): `Cleaner::set_force_clean_files` / `add_force_clean_file`
+  / `clear_force_clean_files` / `get_force_clean_files`, backed by a
+  `BTreeSet<u32>` on the `FileSelector`. A new third selection tier in
+  `FileSelector::select_file_for_cleaning_with_policy` — the forceCleaning /
+  `filesToMigrate` tier of JE `UtilizationCalculator.getBestFile` — prefers a
+  **safe-to-clean** file from the set (age-eligible, not in-progress, not
+  inside the oldest open transaction's log window per the CLN-4 clamp) over
+  the utilization-selected candidate, bypassing the utilization gate and the
+  two-pass dry-run, and drains it from the set once selected. An unsafe forced
+  file stays in the set and is skipped. Reachable via
+  `EnvironmentImpl::get_cleaner()`; a public `noxu-db` / `noxu-admin` control
+  path is deferred (smaller diff). Non-breaking: additive methods and an
+  additive selection tier; no API removal, no on-disk format change.
+
 ### Fixed
 
 - **`FsyncManager` group-commit leader-hand-off lost-wakeup (fix(noxu-log)).**

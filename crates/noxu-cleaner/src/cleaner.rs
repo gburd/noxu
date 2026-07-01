@@ -1473,6 +1473,36 @@ impl Cleaner {
         selector.add_file_to_clean(file_number);
     }
 
+    /// CLN-8: replace the set of files to force-clean regardless of
+    /// utilization (JE `Cleaner.forceCleanFiles`).
+    ///
+    /// On the next `do_clean` pass, a safe-to-clean file from this set is
+    /// preferred over the utilization-selected candidate (JE `getBestFile`'s
+    /// forceCleaning/`filesToMigrate` tier), and drained from the set once
+    /// selected.  An unsafe file (too young / in-progress / inside the oldest
+    /// open transaction's log window) stays in the set and is skipped.
+    ///
+    /// JE: `Cleaner.forceCleanFiles(Set<Long>)` populates `filesToMigrate`,
+    /// which `UtilizationCalculator.getBestFile` consults as a selection tier.
+    pub fn set_force_clean_files(&self, files: impl IntoIterator<Item = u32>) {
+        self.file_selector.lock().set_force_clean_files(files);
+    }
+
+    /// CLN-8: add a single file to the force-clean set.
+    pub fn add_force_clean_file(&self, file_number: u32) {
+        self.file_selector.lock().add_force_clean_file(file_number);
+    }
+
+    /// CLN-8: clear the force-clean set.
+    pub fn clear_force_clean_files(&self) {
+        self.file_selector.lock().clear_force_clean_files();
+    }
+
+    /// CLN-8: snapshot the current force-clean set (verification helper).
+    pub fn get_force_clean_files(&self) -> Vec<u32> {
+        self.file_selector.lock().force_clean_files()
+    }
+
     /// Returns a reference to the file selector (for testing/introspection).
     pub fn get_file_selector(&self) -> &Arc<Mutex<FileSelector>> {
         &self.file_selector
