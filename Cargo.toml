@@ -172,6 +172,11 @@ log = "0.4"
 bytes = "1"
 crc32fast = "1"
 crc32c = "0.6"
+
+# DST Milestone 2 (Phase 2a): deterministic concurrency-permutation tester.
+# Dev/test-only — pulled into the graph ONLY under `--cfg noxu_shuttle`
+# (see crates/*/Cargo.toml `[target.'cfg(noxu_shuttle)'.dependencies]`).
+shuttle = "0.9"
 byteorder = "1"
 memmap2 = "0.9"
 fs2 = "0.4"
@@ -183,6 +188,12 @@ stateright = "0.31"
 [workspace.lints.rust]
 # Treat unsafe blocks in unsafe fns as requiring explicit `unsafe { }` scoping.
 unsafe_op_in_unsafe_fn = "deny"
+# `noxu_shuttle` is the DST Milestone 2 concurrency-testing cfg (set via
+# RUSTFLAGS for the shuttle gate only); register it so default builds do not
+# warn about the `#[cfg(noxu_shuttle)]` seams in dst_sync.
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(noxu_shuttle)',
+] }
 
 [workspace.lints.clippy]
 or_fun_call = "warn"
