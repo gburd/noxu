@@ -4,54 +4,51 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 //! Shuttle concurrency-permutation tests for the `FsyncManager` group-commit
-//! (leader/waiter) protocol (DST Milestone 2, Phase 2a).
+//! (leader/waiter) protocol (DST Milestone 2, Phase 2a + wave 2).
 //!
 //! The whole file compiles to nothing unless built with `--cfg noxu_shuttle`,
 //! so the default `cargo test` and every production build are unaffected.
-//! Under the cfg, `FsyncManager`'s `Mutex`/`Condvar`/atomics resolve (through
-//! `noxu_util::dst_sync`) to shuttle-instrumented primitives, so shuttle's
-//! scheduler explores the leader/waiter/piggyback interleavings of the *real*
-//! group-commit code.
+//! Under the cfg, `FsyncManager`'s `Mutex`/`Condvar` resolve (through
+//! `noxu_util::dst_sync_pl`, the parking_lot-over-shuttle wrapper) to
+//! shuttle-instrumented primitives, so shuttle's scheduler explores the
+//! leader/waiter/piggyback interleavings of the *real* group-commit code.
 //!
-//! # A known limitation: this protocol's liveness depends on a timeout
+//! # The timeout-liveness crux (solved in DST wave 2)
 //!
-//! shuttle found a real, latent lost-wakeup in the group-commit hand-off, and
-//! shuttle's model cannot prove liveness around it.  Concretely:
+//! shuttle 0.9's `Condvar::wait_timeout` never times out.  The group-commit
+//! protocol's liveness previously depended on `LOG_FSYNC_TIMEOUT` to recover a
+//! lost leader-designation `wakeup_one` (M2 documented this as an
+//! `#[ignore]`'d oracle plus a "shuttle catches the deadlock" tripwire).
 //!
-//!   * When a leader finishes it calls `wakeup_one()` on the *next* waiter
-//!     cohort to designate a new leader.  `wakeup_one` is a bare
-//!     `Condvar::notify_one`; unlike the completion path (`wakeup_all`) it does
-//!     **not** set a "signal pending" atomic.  If that `notify_one` lands
-//!     before the next waiter reaches `wait_for_event`, the notification is
-//!     lost (a `notify` with no waiter is a no-op).
-//!   * Similarly, a waiter woken as `DoLeaderFsync` that finds
-//!     `work_in_progress` already set does its *own* fsync but does **not**
-//!     wake the rest of its cohort, orphaning them.
+//! Two DST wave-2 changes make the oracle a green gate:
 //!
-//! In production both cases are recovered by `LOG_FSYNC_TIMEOUT` (default
-//! 500 ms): the orphaned waiter's `Condvar::wait_timeout` eventually times out
-//! and it performs its own fsync (`DoTimeoutFsync`).  The commit is never lost
-//! — it is at worst delayed by the timeout.
+//!   1. **The lost-wakeup fix** (`fsync_manager.rs`): `wakeup_one` now arms a
+//!      `leader_notified` flag under the group mutex before `notify_one`, and
+//!      `wait_for_event` consumes it BEFORE blocking (the same
+//!      predicate-before-wait class as the M2 `WakeHandle` pre-check).  The
+//!      leader hand-off is now **timeout-independent** — a designation is never
+//!      lost, so no waiter is orphaned to the timeout.  This is a real
+//!      production correctness fix (it closes a commit/shutdown stall window),
+//!      not test-only scaffolding.
+//!   2. **The clock-driven timed wait** (`dst_sync_pl`): the group-commit wait
+//!      (`grpc_wait`) still uses a `Condvar` timed wait; when a test enables
+//!      group commit (`grpc_interval_ms > 0`), a driver thread advances the
+//!      shared `SimClock` with `advance_and_fire` so that timed wait fires
+//!      deterministically instead of hanging.  With `grpc` disabled (the
+//!      default committer path) the protocol is fully notify-driven and needs
+//!      no clock advance at all.
 //!
-//! shuttle's `Condvar::wait_timeout` **never times out** (it is a hard block
-//! until an explicit notify), so it cannot model that recovery: the orphaned
-//! waiter blocks forever and shuttle reports a deadlock.  This is a real
-//! property of the protocol (its liveness *does* rely on the timeout), not a
-//! harness artifact — but it means a `check_random` over the full protocol
-//! cannot be a green gate the way the notify-driven `DaemonManager` shutdown
-//! test ([`shuttle_daemon_shutdown`]) can.
+//! # Invariants (the safety oracle, mapped to `noxu-spec` wal_commit)
 //!
-//! Two things follow, and this file encodes both:
-//!
-//!   1. [`shuttle_catches_the_lost_wakeup`] (a normal, PASSING test) proves the
-//!      shuttle harness *does* detect the orphan — i.e. the gate is not blind.
-//!      It runs the real protocol under shuttle and asserts that shuttle
-//!      reports a deadlock, so if the protocol were ever made timeout-free the
-//!      test would (correctly) start failing and prompt a re-think.
-//!   2. [`fsync_coalescing_and_coverage_hold`] (marked `#[ignore]`) carries the
-//!      full safety oracle (coverage / coalescing / `FsyncedNeverDecreases`)
-//!      ready to run the moment the hand-off is made timeout-independent; until
-//!      then it is skipped because it hits the timeout-liveness deadlock above.
+//!   * **DurableImpliesLogged** — every committer's returned durable watermark
+//!     covers its own commit LSN before `flush_and_sync` returns `Ok`
+//!     (`assert_durable_covers_commit`).
+//!   * **FsyncedNeverDecreases** — the durable watermark never regresses
+//!     across the leader's fsync (`assert_fsynced_never_decreases`).
+//!   * **Coalescing** — N committers cause `1..=N` actual fsync executions
+//!     (a leader serves a batch; no redundant double-fsync, no missing fsync).
+//!   * **Failure fan-out** — a failed leader fsync fails all its waiters
+//!     (none returns `Ok` on a fsync that errored).
 //!
 //! # Running
 //!
@@ -61,73 +58,49 @@
 #![cfg(noxu_shuttle)]
 
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use noxu_log::fsync_manager::FsyncManager;
+use noxu_util::SimClock;
 use noxu_util::dst_invariants::{
     assert_durable_covers_commit, assert_fsynced_never_decreases,
 };
+use noxu_util::dst_sync_pl::{advance_and_fire, install_sim_clock};
 use shuttle::sync::Arc;
 use shuttle::sync::atomic::{AtomicU64, AtomicUsize};
 
 /// Number of interleavings shuttle explores per test.
 const ITERATIONS: usize = 5_000;
 
-/// PASSING: prove the shuttle harness detects the group-commit lost-wakeup.
+/// SAFETY ORACLE: every committer's returned durable watermark covers its own
+/// LSN, coalescing holds, and the durable watermark never regresses, under
+/// every interleaving.
 ///
-/// This is the "the oracle can fail" proof for the FsyncManager target: we run
-/// the real leader/waiter protocol under shuttle and assert that *some*
-/// interleaving is caught as a deadlock (the timeout-masked orphan described in
-/// the module docs).  `shuttle::check_random` panics on the first failing
-/// schedule, so we catch that panic and require it to be the deadlock.  If the
-/// protocol were ever made timeout-independent this test would stop seeing the
-/// deadlock and fail — a deliberate tripwire that forces us to promote
-/// [`fsync_coalescing_and_coverage_hold`] out of `#[ignore]`.
+/// Uses the notify-driven committer path (`FsyncManager::new(0, 0)`, group
+/// commit disabled) so the protocol's liveness is entirely notify-driven —
+/// with the DST wave-2 lost-wakeup fix the leader hand-off no longer depends
+/// on any timeout, so shuttle can prove both safety AND deadlock-freedom over
+/// every interleaving.  No `SimClock` advance is needed here because no timed
+/// wait is ever taken on this path.
 #[test]
-fn shuttle_catches_the_lost_wakeup() {
-    let caught = std::panic::catch_unwind(|| {
-        shuttle::check_random(
-            || {
-                let mgr = Arc::new(FsyncManager::new(0, 0));
-                let handles: Vec<_> = (0..2)
-                    .map(|_| {
-                        let mgr = Arc::clone(&mgr);
-                        shuttle::thread::spawn(move || {
-                            let _ = mgr.flush_and_sync(|| Ok(0));
-                        })
-                    })
-                    .collect();
-                for h in handles {
-                    h.join().unwrap();
-                }
-            },
-            ITERATIONS,
-        );
-    });
-    assert!(
-        caught.is_err(),
-        "shuttle should have caught the timeout-masked group-commit orphan; \
-         if the hand-off is now timeout-independent, un-ignore \
-         fsync_coalescing_and_coverage_hold and delete this tripwire"
-    );
-}
-
-/// SAFETY ORACLE (currently `#[ignore]` — see module docs): every committer's
-/// returned durable watermark covers its own LSN, coalescing holds, and the
-/// durable watermark never regresses, under every interleaving.
-///
-/// Ignored because the group-commit hand-off's liveness depends on
-/// `LOG_FSYNC_TIMEOUT`, which shuttle cannot model (it hits the deadlock proved
-/// by [`shuttle_catches_the_lost_wakeup`]).  Kept complete and ready to run the
-/// moment the hand-off is made timeout-independent.
-#[test]
-#[ignore = "group-commit liveness depends on fsync_timeout; shuttle cannot \
-            model timeouts (see module docs). Enable once the hand-off is \
-            timeout-independent."]
 fn fsync_coalescing_and_coverage_hold() {
     shuttle::check_random(
         || {
             const N: usize = 3;
-            let mgr = Arc::new(FsyncManager::new(0, 0));
+            // A SimClock is installed even though this path is notify-driven:
+            // `wait_for_event`'s timed `Condvar::wait_for` needs an installed
+            // SimClock to compute its deadline, and the FsyncManager's own
+            // clock must be the SAME instance so its timeout math agrees.
+            // With the wave-2 lost-wakeup fix the hand-off is
+            // timeout-independent, so the clock never needs advancing — the
+            // notify path always wakes waiters and no interleaving deadlocks.
+            let sim = Arc::new(SimClock::new(0));
+            install_sim_clock(Arc::clone(&sim));
+            let mgr = Arc::new(FsyncManager::with_clock(
+                0,
+                0,
+                Arc::clone(&sim) as Arc<dyn noxu_util::Clock>,
+            ));
             let next_lsn = Arc::new(AtomicU64::new(1));
             let snap_lsn = Arc::new(AtomicU64::new(0));
             let flushed_lsn = Arc::new(AtomicU64::new(0));
@@ -172,12 +145,172 @@ fn fsync_coalescing_and_coverage_hold() {
 
             let execs = fsync_execs.load(Ordering::SeqCst);
             assert!(
-                execs >= 1 && execs <= N,
+                (1..=N).contains(&execs),
                 "fsync executions {execs} out of range 1..={N}: a redundant \
                  (double) fsync or a missing one indicates a coalescing bug"
             );
             let final_flushed = flushed_lsn.load(Ordering::SeqCst);
             let highest = next_lsn.load(Ordering::SeqCst) - 1;
+            assert!(
+                final_flushed >= highest,
+                "final durable watermark {final_flushed} < highest commit \
+                 LSN {highest}: a committed write was left unsynced"
+            );
+        },
+        ITERATIONS,
+    );
+}
+
+/// FAILURE FAN-OUT: a leader fsync failure fails EVERY piggybacking waiter —
+/// none returns `Ok` on a fsync that errored — and coalescing still happens
+/// (fewer fsync attempts than committers).  Notify-driven path (group commit
+/// disabled), so deadlock-free under every interleaving with the wave-2 fix.
+#[test]
+fn fsync_failure_fails_all_waiters() {
+    shuttle::check_random(
+        || {
+            const N: usize = 3;
+            // See `fsync_coalescing_and_coverage_hold` — SimClock installed so
+            // the notify-driven `wait_for_event` timed wait has a deadline
+            // source; never advanced (hand-off is timeout-independent).
+            let sim = Arc::new(SimClock::new(0));
+            install_sim_clock(Arc::clone(&sim));
+            let mgr = Arc::new(FsyncManager::with_clock(
+                0,
+                0,
+                Arc::clone(&sim) as Arc<dyn noxu_util::Clock>,
+            ));
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let errors = Arc::new(AtomicUsize::new(0));
+
+            let handles: Vec<_> = (0..N)
+                .map(|_| {
+                    let mgr = Arc::clone(&mgr);
+                    let attempts = Arc::clone(&attempts);
+                    let errors = Arc::clone(&errors);
+                    shuttle::thread::spawn(move || {
+                        let attempts2 = Arc::clone(&attempts);
+                        let r = mgr.flush_and_sync(move || {
+                            attempts2.fetch_add(1, Ordering::SeqCst);
+                            Err::<u64, _>(std::io::Error::other("fsync EIO"))
+                        });
+                        match r {
+                            Ok(_) => panic!(
+                                "a committer returned Ok despite a failed fsync"
+                            ),
+                            Err(e) => {
+                                assert!(
+                                    e.to_string().contains("fsync EIO"),
+                                    "error must carry the leader failure: {e}"
+                                );
+                                errors.fetch_add(1, Ordering::SeqCst);
+                            }
+                        }
+                    })
+                })
+                .collect();
+
+            for h in handles {
+                h.join().unwrap();
+            }
+
+            assert_eq!(
+                errors.load(Ordering::SeqCst),
+                N,
+                "every committer must observe the fsync failure"
+            );
+            let a = attempts.load(Ordering::SeqCst);
+            assert!(
+                (1..=N).contains(&a),
+                "fsync attempts {a} out of range 1..={N} under failure"
+            );
+        },
+        ITERATIONS,
+    );
+}
+
+/// GROUP-COMMIT WAIT drives the `SimClock`-timed leader wait.
+///
+/// With group commit enabled (`grpc_threshold=2, grpc_interval_ms=5`) the
+/// leader may take the `grpc_wait` timed `Condvar` wait, which under shuttle
+/// only fires when the harness advances the shared `SimClock` past its
+/// deadline (`advance_and_fire`).  A driver thread advances simulated time
+/// until every committer has finished, so the leader's grpc wait always
+/// resolves (either the threshold is met and it is notified, or the interval
+/// elapses via the clock).  The same safety oracle
+/// (`DurableImpliesLogged` / `FsyncedNeverDecreases` / coalescing) must hold.
+#[test]
+fn group_commit_wait_holds_under_sim_clock() {
+    shuttle::check_random(
+        || {
+            const N: usize = 3;
+            let sim = Arc::new(SimClock::new(0));
+            install_sim_clock(Arc::clone(&sim));
+
+            // grpc enabled: threshold 2, interval 5 ms — the leader can take
+            // the grpc timed wait, driven by the SimClock below.
+            let mgr = Arc::new(FsyncManager::with_clock(
+                2,
+                5,
+                Arc::clone(&sim) as Arc<dyn noxu_util::Clock>,
+            ));
+            let next_lsn = Arc::new(AtomicU64::new(1));
+            let snap_lsn = Arc::new(AtomicU64::new(0));
+            let flushed_lsn = Arc::new(AtomicU64::new(0));
+            let done = Arc::new(AtomicUsize::new(0));
+
+            let handles: Vec<_> = (0..N)
+                .map(|_| {
+                    let mgr = Arc::clone(&mgr);
+                    let next_lsn = Arc::clone(&next_lsn);
+                    let snap_lsn = Arc::clone(&snap_lsn);
+                    let flushed_lsn = Arc::clone(&flushed_lsn);
+                    let done = Arc::clone(&done);
+                    shuttle::thread::spawn(move || {
+                        let my_lsn = next_lsn.fetch_add(1, Ordering::SeqCst);
+                        bump_max(&snap_lsn, my_lsn);
+
+                        let flushed_lsn2 = Arc::clone(&flushed_lsn);
+                        let snap_lsn2 = Arc::clone(&snap_lsn);
+                        let durable = mgr
+                            .flush_and_sync(move || {
+                                let covered = snap_lsn2.load(Ordering::SeqCst);
+                                let old = flushed_lsn2.load(Ordering::SeqCst);
+                                let newv = covered.max(old);
+                                flushed_lsn2.store(newv, Ordering::SeqCst);
+                                assert_fsynced_never_decreases(old, newv);
+                                Ok(covered)
+                            })
+                            .expect("no fault injected: fsync must succeed");
+
+                        assert_durable_covers_commit(durable.as_u64(), my_lsn);
+                        done.fetch_add(1, Ordering::SeqCst);
+                    })
+                })
+                .collect();
+
+            // Driver: advance simulated time (firing due grpc timed waits)
+            // until every committer has returned.  advance_and_fire re-notifies
+            // pending fires, so a fire that lands in a waiter's pre-block gap is
+            // re-delivered — guaranteeing progress.  Bounded so a genuine hang
+            // still fails the test rather than looping forever.
+            let mut steps = 0;
+            while done.load(Ordering::SeqCst) < N {
+                advance_and_fire(&sim, Duration::from_millis(10));
+                shuttle::thread::yield_now();
+                steps += 1;
+                assert!(
+                    steps < 2000,
+                    "group-commit wait never resolved (hang)"
+                );
+            }
+
+            for h in handles {
+                h.join().unwrap();
+            }
+
+            let highest = next_lsn.load(Ordering::SeqCst) - 1;
+            let final_flushed = flushed_lsn.load(Ordering::SeqCst);
             assert!(
                 final_flushed >= highest,
                 "final durable watermark {final_flushed} < highest commit \
