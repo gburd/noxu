@@ -4,9 +4,8 @@ use crate::engine_config::EngineConfig;
 use noxu_cleaner::Cleaner;
 use noxu_evictor::{EvictionSource, Evictor};
 use noxu_recovery::Checkpointer;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
-use std::thread::{self, JoinHandle};
+use noxu_util::dst_sync::atomic::{AtomicBool, Ordering};
+use noxu_util::dst_sync::{Arc, Condvar, Mutex, thread};
 use std::time::Duration;
 
 /// A wakeup handle used by daemon threads to sleep with early-exit on shutdown.
@@ -14,13 +13,18 @@ use std::time::Duration;
 /// Each daemon receives a clone of this handle. When `notify()` is called
 /// (at shutdown), the daemon wakes from its sleep immediately rather than
 /// waiting for the full interval to elapse.
+///
+/// `pub(crate)` so the DST Milestone 2 shuttle test
+/// (`tests/shuttle_daemon_shutdown.rs`, gated behind `--cfg noxu_shuttle`) can
+/// drive the real sleep/notify coordination through shuttle's scheduler.
 #[derive(Clone)]
-struct WakeHandle {
+#[doc(hidden)]
+pub struct WakeHandle {
     pair: Arc<(Mutex<bool>, Condvar)>,
 }
 
 impl WakeHandle {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self { pair: Arc::new((Mutex::new(false), Condvar::new())) }
     }
 
@@ -28,18 +32,42 @@ impl WakeHandle {
     ///
     /// Returns `true` if the wakeup was triggered by a shutdown notification,
     /// `false` if the timeout elapsed normally.
-    fn wait_timeout(&self, duration: Duration) -> bool {
+    ///
+    /// The notify flag is checked *before* blocking on the condvar: a
+    /// `notify()` that lands between the caller's previous loop iteration and
+    /// this call sets the flag under the mutex, and `notify_all` on a condvar
+    /// with no waiter is a no-op.  Without the pre-check the daemon would block
+    /// for the full `duration` despite an already-pending notify (a lost
+    /// wakeup) — in production merely a shutdown *stall* up to `duration`, but a
+    /// hang under the DST shuttle scheduler, whose `wait_timeout` never times
+    /// out.  The pre-check closes that window.  (Surfaced by the Milestone-2
+    /// shuttle gate, `tests/shuttle_daemon_shutdown.rs`.)
+    #[doc(hidden)]
+    pub fn wait_timeout(&self, duration: Duration) -> bool {
         let (lock, cvar) = &*self.pair;
         let guard = lock.lock().unwrap();
+        if *guard {
+            return true;
+        }
         let (guard, _) = cvar.wait_timeout(guard, duration).unwrap();
         *guard
     }
 
     /// Notify the sleeping daemon to wake up immediately.
-    fn notify(&self) {
+    #[doc(hidden)]
+    pub fn notify(&self) {
         let (lock, cvar) = &*self.pair;
         *lock.lock().unwrap() = true;
         cvar.notify_all();
+    }
+}
+
+#[cfg(noxu_shuttle)]
+impl WakeHandle {
+    /// Shuttle-test constructor (mirrors [`WakeHandle::new`]).
+    #[doc(hidden)]
+    pub fn new_for_shuttle() -> Self {
+        Self::new()
     }
 }
 
@@ -63,13 +91,13 @@ pub struct DaemonManager {
     checkpointer_wake: WakeHandle,
 
     /// Evictor daemon thread handle.
-    evictor_handle: Option<JoinHandle<()>>,
+    evictor_handle: Option<thread::JoinHandle<()>>,
 
     /// Cleaner daemon thread handle.
-    cleaner_handle: Option<JoinHandle<()>>,
+    cleaner_handle: Option<thread::JoinHandle<()>>,
 
     /// Checkpointer daemon thread handle.
-    checkpointer_handle: Option<JoinHandle<()>>,
+    checkpointer_handle: Option<thread::JoinHandle<()>>,
 
     /// Whether evictor is enabled.
     evictor_enabled: bool,
@@ -328,6 +356,15 @@ impl Drop for DaemonManager {
             self.shutdown();
         }
     }
+}
+
+/// DST Milestone 2 (Phase 2a) hook: expose the internal sleep/notify handle so
+/// the shuttle test (`tests/shuttle_daemon_shutdown.rs`) can drive the real
+/// daemon-loop-vs-shutdown coordination through shuttle's scheduler.  Only
+/// compiled under `--cfg noxu_shuttle`; invisible to every other build.
+#[cfg(noxu_shuttle)]
+pub mod dst_hooks {
+    pub use super::WakeHandle;
 }
 
 #[cfg(test)]

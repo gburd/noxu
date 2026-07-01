@@ -16,6 +16,11 @@ log = { workspace = true }
 thiserror = { workspace = true }
 byteorder = { workspace = true }
 
+# DST Milestone 2 (Phase 2a): only in the graph under `--cfg noxu_shuttle`.
+# Default / production builds never see shuttle — dst_sync re-exports std.
+[target.'cfg(noxu_shuttle)'.dependencies]
+shuttle = { workspace = true }
+
 [dev-dependencies]
 criterion = { workspace = true }
 crc32fast = { workspace = true }

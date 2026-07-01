@@ -27,8 +27,18 @@ noxu-sync = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }
 
+# DST Milestone 2 (Phase 2a): only in the graph under `--cfg noxu_shuttle`.
+# Lets the DaemonManager shutdown/wakeup coordination be scheduled by shuttle
+# via the noxu_util::dst_sync seam.  Default builds never pull shuttle in.
+[target.'cfg(noxu_shuttle)'.dependencies]
+shuttle = { workspace = true }
+
 [lints]
 workspace = true
 
 [dev-dependencies]
 tempfile = "3.8"
+
+[target.'cfg(noxu_shuttle)'.dev-dependencies]
+shuttle = { workspace = true }
+noxu-util = { workspace = true }

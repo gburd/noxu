@@ -158,6 +158,29 @@ The mechanical P1/P2 cleanups that layer on the core reshape above:
     kernel-buffer-drop power-loss gap the SIGKILL `power_loss_sweep` cannot
     reach. See `docs/src/contributing/testing-guide.md`.
 
+- **Deterministic Simulation Testing (DST) Milestone 2 — shuttle concurrency
+  gate.** A [`shuttle`](https://docs.rs/shuttle) concurrency-permutation gate
+  that explores thread interleavings of the **real** engine code under a seed
+  and shrinks failing schedules — complementing M1 (storage faults) and
+  `noxu-spec` (abstract protocol models):
+  - `noxu-util`: a cfg-gated `dst_sync` seam that re-exports `std::sync` +
+    `std::thread` by default and `shuttle::sync` + `shuttle::thread` under
+    `--cfg noxu_shuttle`. shuttle is a `[target.'cfg(noxu_shuttle)']`
+    dependency, so it is **not in the default dependency graph** — zero
+    production change. Plus `dst_invariants`, the shared DST oracle reusing the
+    `noxu-spec` `wal_commit` properties (`LsnMonotone`,
+    `FsyncedNeverDecreases`, `DurableImpliesLogged`) as runnable asserts.
+  - `noxu-engine`: `tests/shuttle_daemon_shutdown.rs` — a **green** shuttle gate
+    (5000 interleavings) proving the `DaemonManager` shutdown/wakeup path is
+    deadlock-free (no lost wakeup, no use-after-shutdown, correct join order).
+  - `noxu-log`: `tests/shuttle_fsync_manager.rs` — routes the `FsyncManager`
+    group-commit protocol through the seam; a passing test proves shuttle
+    *detects* the leader hand-off's timeout-masked orphan, with the full safety
+    oracle `#[ignore]`d pending a timeout-independent hand-off (shuttle cannot
+    model the `LOG_FSYNC_TIMEOUT` recovery). `lock_manager` is not yet covered
+    (parking_lot-shaped locks + `Instant`-based deadlock re-detection).
+    See `docs/src/contributing/testing-guide.md`.
+
 - **Database / transaction triggers (DB-TRIG).** A new public
   [`Trigger`](noxu_db::Trigger) trait (`crates/noxu-dbi/src/trigger.rs`,
   re-exported from `noxu-db`) is a faithful port of BDB-JE
@@ -331,6 +354,17 @@ The mechanical P1/P2 cleanups that layer on the core reshape above:
   `#[derive(SecondaryKey)]` `open_<name>_index(&mut store, &mut primary, ...)`
   signature; a secondary key type must impl `PrimaryKey` (byte encoding).
   Faithful to JE `Store.openSecondaryDatabase` / `PersistKeyCreator`.
+
+### Fixed
+
+- **`DaemonManager` shutdown lost-wakeup (surfaced by the DST M2 shuttle
+  gate).** `WakeHandle::wait_timeout` blocked on its condvar without first
+  checking the already-set notify flag. A `notify()` (from `shutdown()`) that
+  landed between a daemon's loop iteration and its next `wait_timeout` was lost
+  (a condvar notify with no waiter is a no-op), so the daemon slept for the
+  full wakeup interval before observing shutdown — a shutdown *stall* up to the
+  configured interval (default 5 s). Fixed with a predicate-before-wait guard;
+  shutdown now wakes daemons promptly regardless of the notify/wait race.
 
 ## [6.4.2] - 2026-06-29
 

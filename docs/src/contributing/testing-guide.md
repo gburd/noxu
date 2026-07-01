@@ -252,3 +252,70 @@ NOXU_CRASH_MODE=committed_then_uncommitted \
 The determinism property is verified by `dst_same_seed_reproduces_exactly`,
 which runs one torn-write seed twice and asserts byte-identical recovered
 state.
+
+### DST Milestone 2 — shuttle concurrency gate
+
+Milestone 1 (above) makes *storage faults* deterministic. Milestone 2 makes
+*thread interleavings* deterministic, using
+[`shuttle`](https://docs.rs/shuttle): a concurrency-permutation tester that
+replaces the `std::sync` synchronisation primitives and `std::thread` with
+instrumented look-alike wrappers, explores thread schedules under a seed, and *shrinks*
+any failing schedule. It finds concurrency bugs — races, deadlocks, lost
+wakeups — in the **real** engine code, complementing M1 (storage faults) and
+`noxu-spec` (abstract protocol models).
+
+#### The swap: `noxu_util::dst_sync`
+
+The concurrency-critical modules import their `Mutex` / `Condvar` / thread
+spawn from `noxu_util::dst_sync` instead of `std::sync` / `std::thread`. That
+module is a **cfg-gated re-export**:
+
+- **default / every production and released build:** `dst_sync` is a
+  transparent re-export of `std::sync` + `std::thread` — the compiler sees the
+  identical `std` types it always did. `shuttle` is a
+  `[target.'cfg(noxu_shuttle)'.dependencies]` dependency, so it is **not even
+  in the dependency graph** unless the cfg is set. **Zero production change.**
+- **under `--cfg noxu_shuttle` (dev/test only):** the same names resolve to
+  `shuttle::sync` + `shuttle::thread`, and the modules' locks become
+  schedulable by shuttle.
+
+The shuttle tests live in `crates/*/tests/shuttle_*.rs`, each guarded by
+`#![cfg(noxu_shuttle)]`, so under the default cfg they compile to an empty test
+binary.
+
+#### Which protocols are covered
+
+| Protocol | Status | Why |
+|---|---|---|
+| `DaemonManager` shutdown / wakeup (`shuttle_daemon_shutdown.rs`) | **Green gate** | The shutdown wakeup is an explicit `notify()`, so liveness does not rely on a timeout — shuttle can prove deadlock-freedom. |
+| `FsyncManager` group-commit (`shuttle_fsync_manager.rs`) | **Partial** — harness-detection test green, full safety oracle `#[ignore]`d | The leader hand-off recovers a lost `wakeup_one` via `LOG_FSYNC_TIMEOUT`; shuttle's `wait_timeout` never times out, so it cannot model that recovery and reports the orphan as a deadlock. The passing test proves the gate *detects* the orphan; the ignored test carries the safety oracle, ready once the hand-off is made timeout-independent. |
+| `lock_manager` deadlock detection | **Not covered** | Uses the `parking_lot`-shaped `noxu-sync` (not the `std`-shaped `shuttle::sync`) *and* drives deadlock re-detection off `Instant::now()` + 50 ms `wait_for` slices — timeout-based control flow shuttle cannot virtualise until the Phase-1 injectable clock is threaded through it (deferred to M1.1). |
+
+> shuttle surfaced two real, latent lost-wakeups masked in production by
+> timeouts. The `DaemonManager` one (a missing predicate-before-wait in
+> `WakeHandle::wait_timeout`, a shutdown stall up to the wakeup interval) was
+> **fixed**. The `FsyncManager` one (an orphaned hand-off cohort, recovered by
+> the fsync timeout) is documented and left to a dedicated review.
+
+#### Running the shuttle gate
+
+The shuttle gate is part of the **release** DST gate (like M1's long sweep), not
+required for local dev. It needs the `noxu_shuttle` cfg via `RUSTFLAGS`:
+
+```bash
+# Both shuttle targets:
+RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-engine --test shuttle_daemon_shutdown
+RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-log    --test shuttle_fsync_manager
+
+# Reproduce a specific shuttle schedule (shuttle prints a failing seed and a
+# replayable schedule string on failure):
+SHUTTLE_RANDOM_SEED=12345 RUSTFLAGS="--cfg noxu_shuttle" \
+    cargo test -p noxu-engine --test shuttle_daemon_shutdown
+```
+
+The shared invariant asserts the shuttle tests check
+(`noxu_util::dst_invariants`) are the same safety properties the `noxu-spec`
+`wal_commit` model checks against the abstract protocol — `LsnMonotone`,
+`FsyncedNeverDecreases`, `DurableImpliesLogged` — now checked against the real
+code at every explored interleaving. This is the "specs become the DST
+oracle" synergy: write each invariant once, check it two ways.

@@ -25,6 +25,12 @@ fs2 = { workspace = true }
 memmap2 = { workspace = true }
 lru = "0.16"
 
+# DST Milestone 2 (Phase 2a): only in the graph under `--cfg noxu_shuttle`.
+# Lets the FsyncManager group-commit protocol be scheduled by shuttle via the
+# noxu_util::dst_sync seam.  Default builds never pull shuttle in.
+[target.'cfg(noxu_shuttle)'.dependencies]
+shuttle = { workspace = true }
+
 [lints]
 workspace = true
 
@@ -32,6 +38,12 @@ workspace = true
 tempfile = "3"
 proptest = { workspace = true }
 criterion = { workspace = true }
+
+# DST Milestone 2 (Phase 2a): shuttle tests in tests/shuttle_*.rs are gated
+# behind `#![cfg(noxu_shuttle)]`, so these dev-deps only matter under that cfg.
+[target.'cfg(noxu_shuttle)'.dev-dependencies]
+shuttle = { workspace = true }
+noxu-util = { workspace = true }
 
 [[bench]]
 name = "log_bench"
