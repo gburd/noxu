@@ -15,6 +15,8 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+## [7.1.0] - 2026-07-01
+
 ### Added
 
 - **`EVICTOR_MUTATE_BINS` LN-stripping gate (`noxu-evictor` + `noxu-dbi` +
