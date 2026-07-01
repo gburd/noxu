@@ -1172,7 +1172,16 @@ impl EnvironmentImpl {
         // Checkpointer and loops with `thread::sleep(interval)` until the
         // shutdown flag is set.
         //
+        // Gated on `cfg.run_checkpointer` (default true), matching how the
+        // cleaner and INCompressor daemons honour their run flags.  Without
+        // this gate the daemon ran even when a caller set
+        // `run_checkpointer=false`, so a background checkpoint could race an
+        // explicit `Environment::checkpoint` (surfacing "Checkpoint already in
+        // progress").  Honouring the flag also makes the CLN-14 cleaner wakeup
+        // a no-op when the daemon is disabled, as intended.
+        //
         // `run()` → periodic checkpoint loop.
+        let run_checkpointer_daemon = cfg.run_checkpointer;
         let checkpointer_thread = checkpointer.as_ref().map(|ckpt| {
             let ckpt_clone = Arc::clone(ckpt);
             let interval =
@@ -1181,6 +1190,9 @@ impl EnvironmentImpl {
             std::thread::Builder::new()
                 .name("noxu-checkpointer".to_string())
                 .spawn(move || {
+                    if !run_checkpointer_daemon {
+                        return;
+                    }
                     while !ckpt_clone.is_shutdown() {
                         // Use condvar-based interruptible sleep so that
                         // request_shutdown() wakes the thread immediately.
