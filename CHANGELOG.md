@@ -17,6 +17,16 @@ listed in [References](#references).
 
 ### Added
 
+- **`RESERVED_DISK` disk-space reservation (`noxu-dbi` + `noxu-db`).** Beyond
+  `FREE_DISK`, the new `EnvironmentConfig::with_reserved_disk(bytes)`
+  (`noxu.reservedDisk`, default 0) reserves N extra bytes: a user write is
+  refused with `DiskLimitExceeded` once filesystem free space drops below
+  `FREE_DISK + RESERVED_DISK`. Wired into the existing `DiskLimitTracker`
+  gate (`crates/noxu-dbi/src/disk_limit.rs`); the reservation is subtracted
+  from available free space in the same direction as `FREE_DISK`. Default 0 is
+  byte-identical to prior behaviour (no extra reservation). JE ref:
+  `EnvironmentParams.RESERVED_DISK`, `Cleaner.recalcLogSizeStats`.
+
 - **Latch fairness knobs `env_latch_timeout_ms` + `env_forced_yield` wired
   (`noxu-latch` + `noxu-dbi`).** Two previously accepted-but-inert JE latch
   knobs are now real features, wired non-breaking:

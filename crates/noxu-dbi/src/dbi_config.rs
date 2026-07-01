@@ -59,6 +59,8 @@ pub struct DbiEnvConfig {
     pub max_off_heap_memory: u64,
     pub max_disk: u64,
     pub free_disk: u64,
+    /// `RESERVED_DISK`: extra bytes reserved on top of `free_disk`.
+    pub reserved_disk: u64,
 
     // -----------------------------------------------------------------------
     // Log
@@ -259,6 +261,7 @@ impl Default for DbiEnvConfig {
             max_off_heap_memory: 0,
             max_disk: 0,
             free_disk: 5 * 1024 * 1024 * 1024,
+            reserved_disk: 0,
             // Log
             log_file_max_bytes: 10 * 1024 * 1024,
             log_file_cache_size: 100,

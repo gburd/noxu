@@ -296,6 +296,7 @@ impl Environment {
             max_off_heap_memory: config.max_off_heap_memory,
             max_disk: config.max_disk,
             free_disk: config.free_disk,
+            reserved_disk: config.reserved_disk,
             // Log
             log_file_max_bytes: config.log_file_max_bytes,
             log_file_cache_size: config.log_file_cache_size,

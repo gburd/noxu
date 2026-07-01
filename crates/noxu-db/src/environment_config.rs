@@ -109,6 +109,11 @@ pub struct EnvironmentConfig {
     /// Mirrors `FREE_DISK` / default 5 GiB.
     pub free_disk: u64,
 
+    /// Extra bytes reserved on top of `free_disk`: writes fail when available
+    /// free space drops below `free_disk + reserved_disk`.  Mirrors JE
+    /// `RESERVED_DISK` (`EnvironmentParams.RESERVED_DISK`) / default 0.
+    pub reserved_disk: u64,
+
     // -----------------------------------------------------------------------
     // Background daemons — run flags
     // -----------------------------------------------------------------------
@@ -832,6 +837,7 @@ impl EnvironmentConfig {
             max_off_heap_memory: 0,
             max_disk: 0,
             free_disk: 5 * 1024 * 1024 * 1024, //: 5 GiB
+            reserved_disk: 0,
             // Daemon run flags
             run_in_compressor: true,
             run_checkpointer: true,
@@ -1094,6 +1100,13 @@ impl EnvironmentConfig {
         self
     }
 
+    /// Setter for [`Self::reserved_disk`] (`RESERVED_DISK`): extra bytes
+    /// reserved on top of `free_disk`. 0 (default) reserves nothing.
+    pub fn set_reserved_disk(&mut self, bytes: u64) -> &mut Self {
+        self.reserved_disk = bytes;
+        self
+    }
+
     /// Builder form of [`Self::set_max_disk`] (`MAX_DISK`): absolute cap on
     /// total log size in bytes. 0 (default) disables the cap.
     pub fn with_max_disk(mut self, bytes: u64) -> Self {
@@ -1105,6 +1118,15 @@ impl EnvironmentConfig {
     /// free on the filesystem, in bytes. 0 disables the free-space reserve.
     pub fn with_free_disk(mut self, bytes: u64) -> Self {
         self.free_disk = bytes;
+        self
+    }
+
+    /// Builder form of [`Self::set_reserved_disk`] (`RESERVED_DISK`): reserve
+    /// this many bytes on top of `free_disk`; writes fail when free space
+    /// drops below `free_disk + reserved_disk`. 0 (default) reserves nothing.
+    /// Mirrors JE `EnvironmentParams.RESERVED_DISK`.
+    pub fn with_reserved_disk(mut self, bytes: u64) -> Self {
+        self.reserved_disk = bytes;
         self
     }
 

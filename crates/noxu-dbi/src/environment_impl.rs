@@ -823,6 +823,7 @@ impl EnvironmentImpl {
         let disk_limit = Arc::new(crate::disk_limit::DiskLimitTracker::new(
             cfg.max_disk,
             cfg.free_disk,
+            cfg.reserved_disk,
             log_manager.as_ref().map(|lm| lm.file_manager().clone()),
         ));
         // Compute the initial violation state before any user write is served,
