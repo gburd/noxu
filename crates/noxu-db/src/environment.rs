@@ -22,6 +22,49 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
+/// Build an [`EnvironmentStats`] snapshot from a locked [`EnvironmentImpl`].
+///
+/// Shared by [`Environment::stats`] and the periodic stats-file dumper
+/// ([`crate::stats_file`]) so both produce byte-identical snapshots.  The
+/// caller holds the `EnvironmentImpl` lock; `log_manager` is the cached handle
+/// (avoids a second lock on the stats hot path).
+pub(crate) fn build_environment_stats(
+    env_impl: &EnvironmentImpl,
+    log_manager: Option<&LogManager>,
+    cache_size: u64,
+) -> EnvironmentStats {
+    let n_databases = env_impl.n_databases() as u32;
+    let log = log_manager
+        .map(|lm| LogStatsSnapshot::from(&lm.get_stats()))
+        .unwrap_or_default();
+    let lock =
+        LockStatsSnapshot::from(&env_impl.get_lock_manager().get_stats());
+    let txn = TxnStatsSnapshot::from(&env_impl.get_txn_manager().get_stats());
+    let throughput = env_impl.get_throughput_snapshot();
+    let evictor =
+        EvictorStatsSnapshot::from(env_impl.get_evictor().get_stats());
+    let cleaner = env_impl
+        .get_cleaner()
+        .map(|c| c.get_stats().snapshot())
+        .unwrap_or_default();
+    let checkpoint = env_impl
+        .get_checkpointer()
+        .map(|cp| cp.get_stats().snapshot())
+        .unwrap_or_default();
+    EnvironmentStats {
+        cache_size,
+        cache_usage: env_impl.get_cache_usage().max(0) as u64,
+        n_databases,
+        log,
+        lock,
+        txn,
+        throughput,
+        evictor,
+        cleaner,
+        checkpoint,
+    }
+}
+
 /// A database environment.
 ///
 ///
@@ -86,6 +129,10 @@ pub struct Environment {
     /// Per-commit timeout for replica acknowledgments.  Mirrors
     /// `noxu_rep::RepConfig::replica_ack_timeout`; defaults to 5s.
     replica_ack_timeout: Mutex<std::time::Duration>,
+    /// Background stats-file dumper (STATS_FILE_*), started at open when
+    /// `stats_collect` is enabled and a stats-file destination is configured.
+    /// `None` when stats collection is off.  Stopped (joined) at `close`.
+    stats_dumper: Mutex<Option<crate::stats_file::StatsFileDumper>>,
 }
 
 /// Internal database handle state.
@@ -382,6 +429,33 @@ impl Environment {
 
         let log_manager = env_impl.get_log_manager();
         let env_impl_arc = Arc::new(Mutex::new(env_impl));
+
+        // STATS_FILE_*: start the periodic stats-file dumper (JE StatCapture)
+        // when stats collection is enabled.  The dumper samples the same
+        // snapshot `stats()` returns and appends a rotating CSV to
+        // `stats_file_directory` (default: the env home).  Off by default
+        // (stats_collect = false).
+        let stats_dumper = if config.stats_collect {
+            let dir = config
+                .stats_file_directory
+                .clone()
+                .unwrap_or_else(|| home.clone());
+            let interval = std::time::Duration::from_secs(
+                config.stats_collect_interval_secs.max(1),
+            );
+            Some(crate::stats_file::StatsFileDumper::start(
+                Arc::clone(&env_impl_arc),
+                log_manager.clone(),
+                config.cache_size,
+                dir,
+                interval,
+                config.stats_file_row_count,
+                config.stats_max_files,
+            ))
+        } else {
+            None
+        };
+
         let env = Environment {
             home,
             config,
@@ -396,6 +470,7 @@ impl Environment {
             last_checkpoint_end_lsn: Mutex::new(noxu_util::NULL_LSN),
             replica_coordinator: Mutex::new(None),
             replica_ack_timeout: Mutex::new(std::time::Duration::from_secs(5)),
+            stats_dumper: Mutex::new(stats_dumper),
         };
 
         // STARTUP_DUMP_THRESHOLD: if opening the environment (dominated by
@@ -472,6 +547,11 @@ impl Environment {
         }
 
         self.open.store(false, Ordering::Release);
+        // Stop the stats-file dumper (join its thread) before tearing down the
+        // engine, so it cannot sample a closing EnvironmentImpl.
+        if let Some(dumper) = self.stats_dumper.lock().take() {
+            dumper.stop();
+        }
         let env_impl = self.env_impl.lock();
         let _ = env_impl.close();
         Ok(())
@@ -1261,40 +1341,11 @@ impl Environment {
     pub fn stats(&self) -> Result<EnvironmentStats> {
         self.check_open()?;
         let env_impl = self.env_impl.lock();
-        let n_databases = env_impl.n_databases() as u32;
-        // Use cached log_manager for the log stats to avoid double-locking.
-        let log = self
-            .log_manager
-            .as_ref()
-            .map(|lm| LogStatsSnapshot::from(&lm.get_stats()))
-            .unwrap_or_default();
-        let lock =
-            LockStatsSnapshot::from(&env_impl.get_lock_manager().get_stats());
-        let txn =
-            TxnStatsSnapshot::from(&env_impl.get_txn_manager().get_stats());
-        let throughput = env_impl.get_throughput_snapshot();
-        let evictor =
-            EvictorStatsSnapshot::from(env_impl.get_evictor().get_stats());
-        let cleaner = env_impl
-            .get_cleaner()
-            .map(|c| c.get_stats().snapshot())
-            .unwrap_or_default();
-        let checkpoint = env_impl
-            .get_checkpointer()
-            .map(|cp| cp.get_stats().snapshot())
-            .unwrap_or_default();
-        Ok(EnvironmentStats {
-            cache_size: self.config.cache_size,
-            cache_usage: env_impl.get_cache_usage().max(0) as u64,
-            n_databases,
-            log,
-            lock,
-            txn,
-            throughput,
-            evictor,
-            cleaner,
-            checkpoint,
-        })
+        Ok(build_environment_stats(
+            &env_impl,
+            self.log_manager.as_deref(),
+            self.config.cache_size,
+        ))
     }
 
     /// Returns the total number of fdatasync calls performed by the log manager.

@@ -170,6 +170,19 @@ JE-style `logging_level` / `trace_*` knobs are deprecated no-ops).
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `startup_dump_threshold_ms` | `u64` | `0` (off) | If `Environment::open` takes at least this many ms (startup is dominated by crash recovery), log a `warn!` startup summary with the elapsed time and a stats snapshot. JE: `STARTUP_DUMP_THRESHOLD`. |
+| `stats_collect` | `bool` | `false` | Enable the background stats-file dumper (JE `StatCapture`). |
+| `stats_collect_interval_secs` | `u64` | `300` | Sampling interval for the stats-file dumper. |
+| `stats_file_directory` | `Option<PathBuf>` | env home | Output directory for rotating stats CSV files (`noxu.stat.<N>.csv`). JE: `STATS_FILE_DIRECTORY`. |
+| `stats_file_row_count` | `u32` | `1000` | CSV data rows per stats file before rotation. JE: `STATS_FILE_ROW_COUNT`. |
+| `stats_max_files` | `u32` | `100` | Max rotated stats files retained (oldest pruned). JE: `STATS_MAX_FILES`. |
+
+When `stats_collect` is enabled, a `noxu-stats-file` daemon samples the same
+snapshot `Environment::stats()` returns and appends a CSV row every
+`stats_collect_interval_secs`; after `stats_file_row_count` rows it rotates to
+a new `noxu.stat.<N>.csv`, retaining at most `stats_max_files`.  The CSV is
+self-contained (no external recorder needed) and is aimed at simple
+ops/monitoring; for a live metrics pipeline use `metrics_export` (the
+`observability` feature) instead.
 
 ## Replication Parameters
 

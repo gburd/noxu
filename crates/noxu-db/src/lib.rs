@@ -118,6 +118,7 @@ pub mod sequence;
 pub mod sequence_config;
 pub mod sequence_stats;
 pub mod stats_config;
+pub mod stats_file;
 pub mod transaction;
 pub mod transaction_config;
 pub mod write_options;

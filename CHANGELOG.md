@@ -17,6 +17,15 @@ listed in [References](#references).
 
 ### Added
 
+- **Stats-file dump (`STATS_FILE_*`, `noxu-db`).** When `stats_collect` is
+  enabled, a `noxu-stats-file` background daemon (faithful analogue of JE
+  `StatCapture`) samples the same snapshot `Environment::stats()` returns and
+  appends a CSV row to a rotating stats file (`noxu.stat.<N>.csv`) in
+  `stats_file_directory` (default: env home) every
+  `stats_collect_interval_secs`. After `stats_file_row_count` rows it rotates;
+  at most `stats_max_files` files are retained (oldest pruned). The CSV is
+  self-contained (no external recorder needed). New `noxu_db::stats_file`
+  module. JE ref: `EnvironmentParams.STATS_FILE_*`, `StatCapture`.
 - **`startup_dump_threshold_ms` startup performance summary (`noxu-db`).**
   When `Environment::open` takes at least the configured threshold (startup is
   dominated by the crash-recovery analysis/redo/undo passes), Noxu now logs a
