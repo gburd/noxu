@@ -46,6 +46,9 @@ criterion = { workspace = true }
 proptest = { workspace = true }
 tempfile = "3"
 noxu-dbi = { workspace = true, features = ["testing"] }
+# SHARED_CACHE headline test needs SharedEvictorHandle (process-global
+# shared-evictor reset hook + member_count).
+noxu-evictor = { workspace = true }
 # Test recorder for the metrics-export headline test (only used with the
 # `observability` feature; the test file is fully cfg-gated).
 metrics-util = "0.19"
