@@ -8,6 +8,7 @@ Noxu DB has 400+ configuration parameters organized by subsystem, all set on
 | Parameter | Default | Description |
 |---|---|---|
 | `cache_size` | 60% RAM | **Total** memory budget (BIN tree + log buffers + off-heap) |
+| `shared_cache` | `false` | Join the process-global shared cache (one budget across all sharing envs) |
 | `max_off_heap_memory` | 0 | Off-heap evicted-BIN storage (subtracted from `cache_size`) |
 | `log_file_max_bytes` | 10 MiB | Trigger log file rotation |
 | `lock_timeout_ms` | 500 | Per-lock acquisition timeout |
@@ -38,6 +39,27 @@ Arbiter budget = 256 − 3 = 253 MiB.
 > by `log_num_buffers × log_buffer_size + max_off_heap_memory` to maintain
 > the same BIN tree allocation.  See
 > [`migrating.md`](../getting-started/migrating.md).
+
+## Shared cache across environments (`shared_cache`)
+
+Set `EnvironmentConfig::with_shared_cache(true)` to make an `Environment`
+join a **process-global shared cache** instead of getting a private one.
+All environments in the process that set `shared_cache = true` share:
+
+- **one memory budget** — sized from the **first** joining env's
+  `cache_size` (later joiners' `cache_size` is ignored for the shared
+  budget, matching JE);
+- **one evictor** with **one global LRU** spanning every sharing env's
+  B-trees; eviction picks victims across **all** sharing envs, so total
+  resident memory stays bounded by the ONE shared budget rather than the
+  sum of the per-env budgets.
+
+On `Environment::close` the env removes its trees from the shared LRU
+before they drop (no dangling trees), and the shared evictor tears down
+when the last member closes.  `shared_cache = false` (the default) gives
+each env an independent private cache + budget + evictor — unchanged
+behaviour.  Faithful to JE `EnvironmentConfig.setSharedCache` +
+`SharedEvictor` + the shared `MemoryBudget`.
 
 ## `CommitNoSync` background flush
 
