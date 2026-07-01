@@ -15,10 +15,20 @@ hashbrown = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }
 byteorder = { workspace = true }
+# DST M1.1: the parking_lot-over-shuttle wrapper (dst_sync_pl) re-exports the
+# real noxu-sync primitives on the default build (a zero-cost type re-export;
+# noxu-sync is a tiny leaf crate already in nearly every crate's graph).
+noxu-sync = { workspace = true }
 
 # DST Milestone 2 (Phase 2a): only in the graph under `--cfg noxu_shuttle`.
 # Default / production builds never see shuttle — dst_sync re-exports std.
 [target.'cfg(noxu_shuttle)'.dependencies]
+shuttle = { workspace = true }
+
+# DST M1.1: the parking_lot-over-shuttle wrapper self-test
+# (tests/shuttle_dst_sync_pl.rs) is gated behind `#![cfg(noxu_shuttle)]`, so
+# this dev-dep only matters under that cfg.
+[target.'cfg(noxu_shuttle)'.dev-dependencies]
 shuttle = { workspace = true }
 
 [dev-dependencies]
