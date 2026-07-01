@@ -259,7 +259,7 @@ Milestone 1 (above) makes *storage faults* deterministic. Milestone 2 makes
 *thread interleavings* deterministic, using
 [`shuttle`](https://docs.rs/shuttle): a concurrency-permutation tester that
 replaces the `std::sync` synchronisation primitives and `std::thread` with
-instrumented look-alikes, explores thread schedules under a seed, and *shrinks*
+instrumented look-alike wrappers, explores thread schedules under a seed, and *shrinks*
 any failing schedule. It finds concurrency bugs — races, deadlocks, lost
 wakeups — in the **real** engine code, complementing M1 (storage faults) and
 `noxu-spec` (abstract protocol models).
