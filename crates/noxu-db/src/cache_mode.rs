@@ -7,6 +7,19 @@
 /// Allows applications to optimize caching behavior based on
 /// access patterns.
 ///
+/// # Advisory status
+///
+/// `CacheMode` is a live type consulted internally by the evictor for the
+/// environment-level cache policy. The **user-settable** cache hints that
+/// carry a `CacheMode` — [`crate::ReadOptions::with_cache_mode`],
+/// [`crate::WriteOptions::with_cache_mode`], and
+/// [`crate::DatabaseConfig::with_cache_mode`] — are **advisory (accepted but
+/// not yet honored)**: the per-operation and per-database hints do not reach
+/// the evictor, so setting them has no effect today. Those setters are
+/// `#[deprecated]` to make the no-op explicit. Honoring per-op / per-DB cache
+/// modes is tracked for a future release; until then, treat this enum as
+/// informational at the API boundary.
+///
 ///
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum CacheMode {

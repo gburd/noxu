@@ -13,6 +13,7 @@
   - [Databases](getting-started/databases.md)
   - [Records](getting-started/records.md)
   - [Reading and Writing](getting-started/reading-writing.md)
+  - [Using Noxu from Async Code](getting-started/async.md)
   - [Cursors](getting-started/cursors.md)
   - [Disk-Ordered Cursors](getting-started/disk-ordered-cursors.md)
   - [Secondary Databases](getting-started/secondary-databases.md)

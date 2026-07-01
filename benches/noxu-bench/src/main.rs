@@ -669,11 +669,15 @@ fn main() {
         }
 
         // W11: recovery/startup time
-        // Pre-populate outside the timer; time only the re-open.
-        // Both Noxu and full 3-phase recovery (analysis + redo + undo)
-        // on Environment::open().  Any speedup vs lower per-entry
-        // log-replay overhead in Rust (no JVM startup, no classloading, no
-        // JIT warmup) and not a missing recovery step.
+        // Pre-populate outside the timer; time only the log-replay recovery
+        // done by `Environment::open()` (full 3-phase: analysis + redo + undo).
+        // The re-opened env/db are stashed and dropped *after* the timer so
+        // that environment teardown (close-time checkpoint, daemon shutdown,
+        // final flush) is NOT counted as recovery time — that teardown cost was
+        // the measurement artifact that made w11 look ~3.8x slower than JE.
+        // Any speedup vs JE is lower per-entry log-replay overhead in Rust
+        // (no JVM startup, no classloading, no JIT warmup), not a missing
+        // recovery step.
         {
             let dir = new_bench_dir(&bench_base, "bench_12", n, cleanup);
             {
@@ -682,13 +686,14 @@ fn main() {
                 drop(db_pre);
                 drop(env_pre);
             }
-            // Time only the re-open; env is closed before and after — no file-lock conflict.
+            // Time only the re-open (recovery); env is closed before, and the
+            // re-opened handle is dropped after run_timed returns.
+            let mut opened: Option<(Environment, Database)> = None;
             let r = run_timed("w11_recovery", n, 1, dir.path(), None, || {
-                let (env2, db2) = open_db(dir.path());
-                drop(db2);
-                drop(env2);
+                opened = Some(open_db(dir.path()));
                 1
             });
+            drop(opened); // teardown happens outside the timed region
             print_progress(&r);
             results.push(r);
         }

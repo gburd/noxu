@@ -3,6 +3,43 @@
 All 22 crates in the Noxu DB workspace, with purpose, key files, critical
 types, and crate purpose.
 
+## Why 22 crates instead of one crate with features?
+
+The ecosystem norm for an embedded database (`redb`, `sled`, `fjall`) is a
+single crate with feature flags for the optional parts. Noxu instead splits
+the engine into 22 workspace crates behind a thin `noxu` umbrella. This is a
+deliberate structural decision, not an accident of growth:
+
+- **Layered architecture with enforced boundaries.** The crates form a strict
+  dependency stack (foundation → log → tree → txn → dbi → engine → db →
+  higher-level APIs). A crate can only use what sits below it, so the compiler
+  enforces the layering that a single crate would leave to convention. This
+  also lets thirteen data-path crates carry `#![forbid(unsafe_code)]` while
+  isolating the few crates that genuinely need `unsafe` (`noxu-sync`,
+  `noxu-log`, `noxu-rep`, `noxu-latch`).
+- **Faithful-to-JE module boundaries.** Noxu is a port of Berkeley DB JE. Each
+  crate maps to a JE package (`com.sleepycat.je.log`, `.tree`, `.txn`,
+  `.cleaner`, `.recovery`, `.rep`, …). Keeping the boundaries aligned makes
+  auditing against the reference source mechanical: a reviewer comparing
+  `noxu-tree` against `je/src/com/sleepycat/je/tree/` does not have to first
+  untangle it from unrelated code.
+- **Independent versioning and compile isolation.** Optional subsystems
+  (`noxu-rep`, `noxu-observe`) pull in heavy dependency trees (`tokio`,
+  `quinn`, `rustls`, `tracing`, `opentelemetry`). Keeping them in separate
+  crates behind features means a user who does not enable replication never
+  compiles those dependencies, and a change to replication internals cannot
+  trigger a recompile of the core engine.
+
+**User contract: depend on the `noxu` umbrella, not the component crates.**
+The component crates are published only so the umbrella can depend on them.
+Their APIs may change without a major-version bump of that component; only the
+`noxu` umbrella's public surface follows the project's SemVer policy. Every
+component crate's `lib.rs` documents this ("Use `noxu` in applications; depend
+on this crate directly only …"). Users should add `noxu = "7"` and reach
+everything through `noxu::`, enabling optional subsystems via the umbrella's
+feature flags. See [Design Decisions § 9](design-decisions.md) for the
+related umbrella / derive-macro path decision.
+
 ## Phase 0 — Foundation
 
 ### `noxu-util`
@@ -273,7 +310,7 @@ beyond a few thin wrappers; see `crates/noxu-observe/src/lib.rs`.
 ### `noxu` (umbrella)
 
 The single user-facing crate. Re-exports the entire public API of all
-component crates under one name and version. Users add `noxu = "3"` to
+component crates under one name and version. Users add `noxu = "7"` to
 their `Cargo.toml` and receive everything: core engine, collections,
 persistence layer, XA, and optionally replication and observability via
 feature flags.

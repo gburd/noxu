@@ -125,7 +125,7 @@ set of well-understood subsystems makes correctness easier to audit.
 | `crates/noxu-rep/src/**` | Network I/O glue (TLS handshake, raw socket options) |
 | Single-line blocks in `noxu-latch`, `noxu-db`, `noxu-xa` | Each documented inline |
 
-## 9. Single Umbrella Crate (`noxu = "3"`)
+## 9. Single Umbrella Crate (`noxu = "7"`)
 
 **Decision**: All component crates are accessible through a single `noxu`
 umbrella crate. `noxu-persist-derive` emits `::noxu::persist::` paths in
@@ -140,7 +140,7 @@ user-visible umbrella namespace rather than an internal crate path.
 
 **Consequence**: By default, users of `#[derive(Entity)]`,
 `#[derive(PrimaryKey)]`, or `#[derive(SecondaryKey)]` must have
-`noxu = "3"` in their `Cargo.toml` — unless they use the escape hatch
+`noxu = "7"` in their `Cargo.toml` — unless they use the escape hatch
 described below.
 
 **v3.1.0 — Escape hatch implemented** (Wave FA): Users who depend on

@@ -15,6 +15,67 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Documentation
+
+- **P2-1 — doc version drift.** Updated the remaining `noxu = "3"` (and
+  a few stray `version = "3"` / `version = "6"`) quick-start snippets in
+  crate `lib.rs` docs and `docs/src/` to `noxu = "7"`, matching the 7.0
+  workspace version. User-copied install snippets now show the correct
+  version. (The `docs/src/internal/noxu-umbrella.md` historical record keeps
+  its point-in-time `3.0.1` references.)
+
+### Changed
+
+- **P2-2 — removed crate-wide `#![allow(dead_code)]` from public crates.**
+  Dropped the blanket `dead_code` allow from `noxu-bind`, `noxu-collections`,
+  `noxu-persist`, and `noxu-rep` so genuinely-unused items surface in CI
+  (`clippy::type_complexity` / `clippy::too_many_arguments` allows kept).
+  Removed the resulting dead items (`ScanShape`, `Phantom` in
+  `noxu-collections`; a dead `make_expected` test helper in `noxu-rep`) and
+  annotated two API-symmetry wrapper methods (`AnyServiceDispatcher::{is_running,
+  addr}`) with a scoped `#[allow(dead_code)]`. `noxu`, `noxu-observe`,
+  `noxu-xa`, `noxu-persist-derive` had no crate-wide `dead_code` allow.
+
+- **P2-3 — async usage guide in the user docs.** Added a
+  "Using Noxu from Async Code" page to the mdBook getting-started section
+  (`docs/src/getting-started/async.md`), mirroring the umbrella crate's
+  rustdoc note: Noxu is blocking by design, wrap work in
+  `tokio::task::spawn_blocking`, and never hold a `Transaction`/`Cursor`
+  across an `.await`.
+
+- **P2-4 — advisory cache-mode knobs documented explicitly.** The
+  user-settable `cache_mode` hints (`ReadOptions`, `WriteOptions`,
+  `DatabaseConfig`) and `update_ttl` were already `#[deprecated]` as inert in
+  7.0; this makes the advisory status explicit in the docs so the knobs don't
+  read as silently lying. Added an "Advisory status" note to the `CacheMode`
+  rustdoc (it is a live type used by the env-level evictor policy, but the
+  per-op / per-DB hints are not honored), tightened the `get_with_options` /
+  `put_with_options` doc comments to say "accepted but not yet honored," and
+  added an advisory note to the `DatabaseConfig` table in
+  `docs/src/reference/configuration.md` with a tracking note.
+
+- **P2-5 — documented the 22-crate-split rationale.** Added a "Why 22 crates
+  instead of one crate with features?" section to
+  `docs/src/maintainer/crate-guide.md` explaining the layered architecture,
+  faithful-to-JE module boundaries, and independent versioning that motivate
+  the split, plus the user contract to depend on the `noxu` umbrella (not the
+  component crates, whose APIs may change without a major bump). Closes the
+  review finding as a documented deliberate decision; no crates were
+  restructured.
+
+### Fixed
+
+- **w11_recovery benchmark measurement artifact.** The `w11_recovery`
+  workload in `benches/noxu-bench/src/main.rs` timed the re-opened
+  environment's teardown (close-time checkpoint, daemon shutdown, final flush)
+  along with the actual `Environment::open()` log-replay recovery, inflating
+  the number and making JE look ~3.8x faster than a clean recovery
+  measurement. The harness now stashes the re-opened handle and drops it
+  *after* the timer stops, so w11 measures recovery only. Updated the
+  benchmark docs (`docs/src/operations/benchmarks.md`,
+  `docs/src/maintainer/benchmarking.md`) to flag the historical number as a
+  pre-fix artifact. Benchmark harness only — no engine change.
+
 ## [7.0.0] - 2026-07-01
 
 ### Changed (BREAKING — 7.0 core API reshape)

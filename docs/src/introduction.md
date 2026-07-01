@@ -95,7 +95,7 @@ Add `noxu` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-noxu = "3"
+noxu = "7"
 ```
 
 Or depend on the git source directly:

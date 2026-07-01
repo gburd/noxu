@@ -13,9 +13,9 @@ no metrics crates and the instrumentation compiles to nothing.
 
 ```toml
 # Cargo.toml
-noxu-db = { version = "6", features = ["observability"] }
+noxu-db = { version = "7", features = ["observability"] }
 # Optional built-in Prometheus exposition:
-noxu-observe = { version = "6", features = ["prometheus"] }
+noxu-observe = { version = "7", features = ["prometheus"] }
 ```
 
 ```rust

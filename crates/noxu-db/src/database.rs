@@ -658,7 +658,9 @@ impl Database {
     /// - `LockMode::Rmw` — acquire write lock for read-modify-write
     /// - `LockMode::Default` — environment default isolation
     ///
-    /// `CacheMode` in `ReadOptions` is advisory (currently informational).
+    /// `CacheMode` in `ReadOptions` is advisory (accepted but not yet honored):
+    /// the per-operation hint does not reach the evictor and has no effect
+    /// today. See [`crate::CacheMode`] for the tracking note.
     ///
     /// # Arguments
     /// * `txn` - Optional transaction handle
@@ -942,7 +944,8 @@ impl Database {
     /// - `ttl` — if > 0, sets a per-record TTL expiration (hours from now); the
     ///   record will be treated as expired and invisible after the TTL elapses.
     /// - `update_ttl` — if true and the record already exists, refreshes its TTL.
-    /// - `cache_mode` — advisory cache hint (currently informational).
+    /// - `cache_mode` — advisory cache hint, accepted but not yet honored (no
+    ///   effect today; see [`crate::CacheMode`]).
     ///
     /// # Arguments
     /// * `txn` - Optional transaction handle

@@ -634,6 +634,10 @@ impl AnyServiceDispatcher {
     }
 
     /// Whether the accept loop is running.
+    ///
+    // Mirrors the inner dispatcher API for symmetry with `register`/`stop`;
+    // not yet called through the enum wrapper.
+    #[allow(dead_code)]
     pub fn is_running(&self) -> bool {
         match self {
             Self::Plain(d) => d.is_running(),
@@ -643,6 +647,10 @@ impl AnyServiceDispatcher {
     }
 
     /// The bound socket address.
+    ///
+    // Mirrors the inner dispatcher API for symmetry with `register`/`stop`;
+    // not yet called through the enum wrapper.
+    #[allow(dead_code)]
     pub fn addr(&self) -> SocketAddr {
         match self {
             Self::Plain(d) => d.addr(),

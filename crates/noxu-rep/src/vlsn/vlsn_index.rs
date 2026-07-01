@@ -418,16 +418,6 @@ mod tests {
         index.put(pos, file_num, pos as u32 * offset);
     }
 
-    /// Helper: build expected (vlsn → (file, offset)) from a slice of vlsn
-    /// values. All use the same file_num and base offset.
-    fn make_expected(
-        vlsns: &[u64],
-        file_num: u32,
-        offset: u32,
-    ) -> Vec<(u64, u32, u32)> {
-        vlsns.iter().map(|&v| (v, file_num, v as u32 * offset)).collect()
-    }
-
     ///
     /// Populate a VlsnIndex with 25 consecutive entries (file=33, offset=100)
     /// and verify:

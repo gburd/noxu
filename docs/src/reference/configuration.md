@@ -114,9 +114,18 @@ Per-database options set when opening a database:
 | `sorted_duplicates` | `bool` | `false` | Allow duplicate keys (sorted by data) |
 | `replicated` | `bool` | `false` | Participate in replication log |
 | `key_prefixing` | `bool` | `false` | Enable key prefix compression in BINs |
-| `cache_mode` | `CacheMode` | `Default` | Per-database eviction hint |
+| `cache_mode` | `CacheMode` | `Default` | Per-database eviction hint (**advisory** — accepted but not yet honored; see note below) |
 | `bin_delta` | `bool` | `true` | Write BIN-deltas instead of full BINs |
 | `use_existing_config` | `bool` | `false` | Open existing DB without reconfiguring |
+
+> **Advisory cache hints.** `DatabaseConfig::cache_mode`,
+> `ReadOptions::cache_mode`, and `WriteOptions::cache_mode` (all typed
+> `CacheMode`) are accepted for API forward-compatibility but are **not yet
+> honored** by the evictor: the per-database and per-operation hints do not
+> reach the cache today, so setting them has no effect. The corresponding
+> setters are `#[deprecated]` to make the no-op explicit. Honoring per-op /
+> per-DB cache modes is tracked for a future release. The environment-level
+> cache policy is honored.
 
 ## CursorConfig
 
