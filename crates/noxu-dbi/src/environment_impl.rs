@@ -1137,9 +1137,16 @@ impl EnvironmentImpl {
         //
         // JE: FileProcessor.doClean -> envImpl.getCheckpointer().wakeupAfterNoWrites().
         if let (Some(c), Some(ckpt)) = (&cleaner, &checkpointer) {
-            let ckpt_for_wakeup = Arc::clone(ckpt);
+            // Weak, NOT Arc: the checkpointer already holds an Arc<Cleaner>
+            // (with_cleaner, for the X-5 barrier), so an Arc here would form a
+            // cleaner<->checkpointer reference cycle that leaks both on env
+            // drop — and with them the env's file lock.  Upgrade at call time;
+            // a dropped checkpointer simply skips the wakeup.
+            let ckpt_for_wakeup = Arc::downgrade(ckpt);
             c.set_checkpoint_wakeup_fn(Arc::new(move || {
-                ckpt_for_wakeup.wakeup_after_no_writes();
+                if let Some(ckpt) = ckpt_for_wakeup.upgrade() {
+                    ckpt.wakeup_after_no_writes();
+                }
             }));
         }
 
