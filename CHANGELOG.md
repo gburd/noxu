@@ -54,6 +54,15 @@ listed in [References](#references).
   added an advisory note to the `DatabaseConfig` table in
   `docs/src/reference/configuration.md` with a tracking note.
 
+- **P2-5 — documented the 22-crate-split rationale.** Added a "Why 22 crates
+  instead of one crate with features?" section to
+  `docs/src/maintainer/crate-guide.md` explaining the layered architecture,
+  faithful-to-JE module boundaries, and independent versioning that motivate
+  the split, plus the user contract to depend on the `noxu` umbrella (not the
+  component crates, whose APIs may change without a major bump). Closes the
+  review finding as a documented deliberate decision; no crates were
+  restructured.
+
 ## [7.0.0] - 2026-07-01
 
 ### Changed (BREAKING — 7.0 core API reshape)
