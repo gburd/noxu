@@ -410,7 +410,13 @@ impl Evictor {
     /// resident INs (Evictor.java:2374, `target.getDatabase()`).
     fn candidate_trees(&self) -> Vec<(u64, Arc<RwLock<Tree>>)> {
         let mut out: Vec<(u64, Arc<RwLock<Tree>>)> = Vec::new();
+        // Dedup by the Arc's raw pointer via a HashSet (O(1) per tree) rather
+        // than the previous O(n²) `out.iter().any(Arc::ptr_eq)` scan — matters
+        // for environments with many databases.
+        let mut seen: std::collections::HashSet<*const RwLock<Tree>> =
+            std::collections::HashSet::new();
         if let Some(t) = self.current_tree() {
+            seen.insert(Arc::as_ptr(&t));
             out.push((self.db_id.load(Ordering::Relaxed), t));
         }
         if let Some(reg) = self
@@ -421,7 +427,7 @@ impl Evictor {
             && let Ok(map) = reg.lock()
         {
             for (db_id, tree) in map.iter() {
-                if !out.iter().any(|(_, t)| Arc::ptr_eq(t, tree)) {
+                if seen.insert(Arc::as_ptr(tree)) {
                     out.push((*db_id as u64, Arc::clone(tree)));
                 }
             }
@@ -945,6 +951,27 @@ impl Evictor {
     /// `evict_batch` always calls `node_info_fn` before `node_size_fn` for
     /// the same node, and the calls are serialised within a single thread.
     pub fn do_evict(&self, source: EvictionSource) -> EvictResult {
+        if self.is_shutdown() {
+            return EvictResult::zero();
+        }
+        // WRITE-PATH-AT-SCALE fix (JE-faithful): guard the periodic/critical
+        // paths on the cheap `is_over_budget()` atomic BEFORE building any
+        // candidate state.  JE's `Evictor.doEvict` checks `isOverBudget()`
+        // first (Evictor.java) and its eviction threads park when there is
+        // nothing to do; previously Noxu's 5 ms daemon poll ran the full
+        // `candidate_trees()` registry-lock + tree-clone scan unconditionally,
+        // ~200x/second, evicting nothing — stealing CPU from writers and
+        // contending on `db_trees_registry` (the write path locks it too).
+        // `Manual` (evictMemory API) and `CacheMode` eviction are proactive
+        // and always proceed (JE `Environment.evictMemory` reclaims on demand).
+        match source {
+            EvictionSource::Daemon | EvictionSource::Critical => {
+                if !self.arbiter.is_over_budget() {
+                    return EvictResult::zero();
+                }
+            }
+            EvictionSource::Manual | EvictionSource::CacheMode => {}
+        }
         // EVICTOR-RECLAIM-1: snapshot ALL database trees, not just the primary
         // slot.  The info/size callbacks search each tree for the candidate
         // node, mirroring JE's single env-wide INList whose targets resolve

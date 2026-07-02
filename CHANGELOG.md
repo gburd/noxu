@@ -15,6 +15,22 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Fixed
+
+- **Write-path-at-scale: guard the evictor daemon on the over-budget atomic
+  (JE-faithful).** `Evictor::do_evict` now checks the cheap `is_over_budget()`
+  atomic BEFORE building candidate state, for the `Daemon` and `Critical`
+  sources (JE `Evictor.doEvict` guards `isOverBudget()` first); `Manual`
+  (`evictMemory` API) and `CacheMode` eviction still proceed proactively. The
+  5 ms daemon poll previously ran the full `candidate_trees()` registry-lock +
+  tree-clone scan unconditionally (~200×/s), evicting nothing when under
+  budget — stealing CPU from writer threads and contending on
+  `db_trees_registry` (which the write path also locks). Surfaced by the AWS
+  scale benchmark (dataset > cache): Noxu was 1.3–1.8× behind JE on writes at
+  1M records with flat B/op — a per-op CPU/coordination cost, not I/O. Also
+  replaced the O(n²) `Arc::ptr_eq` dedup in `candidate_trees()` with an O(1)
+  pointer `HashSet`. Diagnostic reproducer: `noxu-db/tests/write_scale_probe.rs`.
+
 ## [7.2.0] - 2026-07-01
 
 A small, focused cleanup release: it removes the moot config knobs that were
