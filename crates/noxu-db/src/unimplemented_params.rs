@@ -79,12 +79,14 @@ pub static UNIMPLEMENTED_ENV_PARAMS: &[UnimplementedParam] = &[
     // accepted-but-inert and warned here so a non-default setting is never a
     // silent no-op.  See docs/src/operations/known-limitations.md.
     //
-    // NOTE (7.1): `env_dup_convert_preload_all` and `adler32_chunk_size` were
-    // removed from this registry — they are not "real-but-unimplemented"
-    // knobs, they are DEPRECATED and MOOT (JE 4→5 dup conversion is N/A to the
-    // native .ndb format; Noxu uses CRC32, never Adler32).  A deprecated-moot
-    // knob announces itself via `#[deprecated]` on its setter, not a runtime
-    // WARN.  See the field rustdoc in environment_config.rs.
+    // NOTE (7.2): the deprecated-moot knobs `env_dup_convert_preload_all`,
+    // `adler32_chunk_size`, and the JE-style logging/tracing knobs
+    // (`logging_level`, `trace_*`, `*_logging_level`) were DELETED outright
+    // (JE 4→5 dup conversion is N/A to the native .ndb format; Noxu uses
+    // CRC32, never Adler32; diagnostics route through the `log` crate /
+    // `noxu-observe` / RUST_LOG).  They never belonged in this registry: a
+    // moot knob is not a "real-but-unimplemented" feature.  (In 7.1 they were
+    // `#[deprecated]` stubs; 7.2 removes them.)
     // ---------------------------------------------------------------------
     UnimplementedParam {
         name: "checkpointer_min_interval_secs",

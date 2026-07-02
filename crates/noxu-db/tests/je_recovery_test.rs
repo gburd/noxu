@@ -459,12 +459,12 @@ fn recovery_edge_test_no_log_files() {
 // survives a clean close + reopen: the database is still listed, and a
 // transactional db created later is also listed.
 //
-// NOXU BUG: as of v2.2.1, a non-transactional database does NOT survive a
-// clean close + reopen — `Environment::get_database_names()` returns an
-// empty list and `open_database(None, "NotTxnal", &cfg)` (with
-// `allow_create=false`) reports `DatabaseNotFound`.  Only the transactional
-// db registration appears to be flushed to the WAL.  Tracked as a wave-10-A
-// follow-up.
+// STATUS: works. The name registry flushes the non-transactional db's
+// registration to the WAL on clean close, so `database_names()` lists it
+// after reopen and `open_database(None, "NotTxnal", &cfg)` succeeds. (This
+// test previously documented a v2.2.1 limitation where only transactional db
+// registrations were flushed; that limitation is gone — the test asserts the
+// db survives all three phases.)
 // ---------------------------------------------------------------------------
 
 #[test]

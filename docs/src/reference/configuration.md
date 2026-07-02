@@ -165,7 +165,7 @@ Per-cursor options:
 These `EnvironmentConfig` knobs give operators real signal about the engine.
 Logging itself is **not** configured here — Noxu routes all diagnostics through
 the Rust [`log`](https://docs.rs/log) facade / `noxu-observe` / `RUST_LOG` (the
-JE-style `logging_level` / `trace_*` knobs are deprecated no-ops).
+JE-style `logging_level` / `trace_*` knobs were removed in 7.2).
 
 | Field | Type | Default | Description |
 |---|---|---|---|
