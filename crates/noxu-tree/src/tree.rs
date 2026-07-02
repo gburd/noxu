@@ -4003,6 +4003,46 @@ impl Tree {
         // write lock on the child. See the earlier comment on the race
         // this avoids inside split_child.
         let mut child_guard = child_arc.write();
+
+        // Re-validate that the child still needs splitting, now that we hold
+        // its write lock. This closes a check-then-act race: the caller
+        // (`insert_recursive_inner`) tested `child.get_n_entries() >=
+        // max_entries` under a PARENT READ lock, then dropped that read lock
+        // (required — the split needs `parent.write()`) before calling
+        // `split_child`. Read locks do not exclude each other, so two
+        // descenders can both pass the fullness check on the same child, both
+        // drop the parent read lock, and both call `split_child`. They
+        // serialise here on `parent.write()`: the first splits the child
+        // (leaving it with only its left half), and by the time the second
+        // acquires this child write lock the child is no longer full — or is
+        // empty, if a concurrent INCompressor merge cleared it
+        // (`compress_node`'s `lb.entries.clear()`). Without this re-check the
+        // second caller would build a `SplitEntries` from that stale child and
+        // panic in `SplitEntries::get_key(split_index)` on an empty entries
+        // vec (tree.rs SplitEntries::get_key `v[index]`, observed as
+        // "index out of bounds: len is 0" under the 96-thread saturation
+        // benchmark; see .agent/archived-audits/bench/
+        // bug-bin-split-concurrency.md).
+        //
+        // JE performs the identical re-validation: `IN.split` re-checks
+        // `needsSplitting()` *after* latching the node it will split, so the
+        // fullness test and the split are atomic w.r.t. the node latch (see
+        // `IN.split` / `IN.needsSplitting` in IN.java; `Tree.forceSplit`
+        // latch-couples down and `IN.split` re-tests before mutating). Here
+        // the child write guard plays the role of that node latch.
+        //
+        // A no-op split returns `Ok(())` — the SAME success variant a real
+        // split returns — because the caller re-descends unconditionally
+        // after `split_child` (`return Self::insert_recursive_inner(...)`),
+        // where it re-reads the (now-current) topology and re-checks
+        // `child_full`. So a benign "already split" outcome simply leads to a
+        // correct re-descent and the insert proceeds. This does NOT widen any
+        // lock or hold `parent.write()` across the caller's read-check, so it
+        // does not re-introduce the descent over-serialisation fixed in 7.2.1.
+        if child_guard.get_n_entries() < max_entries {
+            return Ok(());
+        }
+
         let child_level = child_guard.level();
         // St-H6: capture the splitting BIN's expiration_in_hours flag BEFORE
         // drop(child_guard) so the right-half sibling inherits it.
@@ -9151,6 +9191,101 @@ mod tests {
     fn test_compress_empty_tree() {
         let tree = Tree::new(1, 4);
         tree.compress(); // must not panic
+    }
+
+    /// Deterministic regression for the BIN/IN split-path check-then-act race
+    /// (`.agent/archived-audits/bench/bug-bin-split-concurrency.md`).
+    ///
+    /// `insert_recursive_inner` checks `child.get_n_entries() >= max_entries`
+    /// under a PARENT READ lock, drops that read lock (required — the split
+    /// needs `parent.write()`), then calls `split_child`. In the drop→reacquire
+    /// window a racing thread (a second splitter, or the INCompressor merging
+    /// and CLEARING a sibling — `compress_node`'s `lb.entries.clear()`) can
+    /// leave the child no longer full, or even empty. Pre-fix, `split_child`
+    /// then built a `SplitEntries` from that stale child and
+    /// `SplitEntries::get_key(split_index)` panicked with
+    /// "index out of bounds: len is 0" on the empty entries vec.
+    ///
+    /// This test drives the exact interleaving deterministically: it builds a
+    /// level-2 tree, empties a full BIN child in place (simulating the racing
+    /// merge), then calls `split_child` on it directly. With the fix
+    /// `split_child` re-validates fullness under the child write lock and
+    /// returns `Ok(())` (a benign no-op); without the fix it panics in
+    /// `get_key`.
+    ///
+    /// JE-faithful: `IN.split` re-checks `needsSplitting()` after latching the
+    /// node it will split (IN.java IN.split / IN.needsSplitting).
+    #[test]
+    fn split_child_is_noop_when_child_no_longer_full() {
+        let max_entries = 8usize;
+        let tree = Tree::new(1, max_entries);
+
+        // Build a level-2 tree: insert enough sorted keys to force at least one
+        // split so the root becomes an Internal node with BIN children.
+        for i in 0..64u32 {
+            tree.insert(
+                format!("k{:04}", i).into_bytes(),
+                vec![i as u8],
+                Lsn::new(1, i),
+            )
+            .unwrap();
+        }
+
+        let root_arc = tree.get_root().expect("root resident");
+
+        // Pick child slot 0 (any resident BIN child works — the panic is about
+        // the child being empty at split time, not about how it got there).
+        let child_arc = {
+            let g = root_arc.read();
+            let TreeNode::Internal(n) = &*g else {
+                panic!("expected a level-2 tree (root should be Internal)");
+            };
+            n.get_child(0).expect("resident child at slot 0")
+        };
+        let child_index = 0usize;
+
+        // Simulate the racing merge: clear the child's entries in place, the
+        // way `compress_node` clears the merged-away left sibling. This is the
+        // stale state a second `split_child` (or a split racing the compressor)
+        // observes after the fullness check was already passed under the now-
+        // dropped parent read lock.
+        {
+            let mut cg = child_arc.write();
+            match &mut *cg {
+                TreeNode::Bottom(b) => {
+                    b.entries.clear();
+                    b.lsn_rep = LsnRep::Empty;
+                    b.keys = KeyRep::new();
+                }
+                TreeNode::Internal(n) => {
+                    n.entries.clear();
+                    n.lsn_rep = LsnRep::Empty;
+                    n.targets = TargetRep::None;
+                }
+            }
+            assert_eq!(cg.get_n_entries(), 0, "child must now be empty");
+        }
+
+        // Directly call the split path. Pre-fix this panics in
+        // `SplitEntries::get_key(0)` on the empty vec; post-fix it re-validates
+        // fullness under the child write lock and returns Ok(()) (no-op).
+        let res = Tree::split_child(
+            &root_arc,
+            child_index,
+            max_entries,
+            Lsn::new(1, 999),
+            SplitHint::Normal,
+            b"k0000",
+            None,  // no comparator
+            false, // key_prefixing off
+            None,  // no InListListener
+        );
+        assert!(
+            res.is_ok(),
+            "split_child on an emptied (no-longer-full) child must be a benign \
+             no-op, got {:?}",
+            res
+        );
     }
 
     /// After deleting all entries, compress() reduces BINs to 1.

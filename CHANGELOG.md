@@ -15,6 +15,31 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Fixed
+
+- **Data-corruption-class BIN/IN split-path concurrency panic (JE-faithful
+  re-validation).** `Tree::split_child` now re-checks that the child still
+  needs splitting (`child.get_n_entries() >= max_entries`) *after* acquiring
+  the child write lock, and returns a benign `Ok(())` no-op when it does not.
+  Previously `insert_recursive_inner` tested the child's fullness under a
+  PARENT READ lock, dropped that read lock (required — the split needs
+  `parent.write()`), then called `split_child` without re-validating. Read
+  locks do not exclude, so two descenders could both pass the fullness check on
+  the same child and both call `split_child`; the first split the child, and
+  the second built a `SplitEntries` from a no-longer-full (or concurrently
+  INCompressor-cleared, hence empty) child and panicked in
+  `SplitEntries::get_key(split_index)` with "index out of bounds: len is 0".
+  A panic mid-split leaves the tree partially mutated (data-corruption class).
+  JE performs the identical re-validation — `IN.split` re-checks
+  `needsSplitting()` after latching the node it will split, making the fullness
+  test and the split atomic w.r.t. the node latch (`IN.java`). The fix does NOT
+  widen locks or hold `parent.write()` across the caller's read-check, so it
+  does not re-introduce the descent over-serialisation fixed in 7.2.1. Found by
+  the 96-thread `noxu-saturation` benchmark; deterministic regression
+  `noxu-tree` `tree::tests::split_child_is_noop_when_child_no_longer_full`
+  (reproduces the exact `SplitEntries::get_key` panic pre-fix) plus the
+  end-to-end stress test `noxu-db/tests/bin_split_concurrency_regression.rs`.
+
 ## [7.2.1] - 2026-07-02
 
 ### Fixed
