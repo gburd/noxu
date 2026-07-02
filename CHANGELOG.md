@@ -15,6 +15,8 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+## [7.2.0] - 2026-07-01
+
 A small, focused cleanup release: it removes the moot config knobs that were
 `#[deprecated]` in 7.1 (a breaking public-API removal — treated as a
 major-semantics 7.2 release since there are no external users) and truths-up
