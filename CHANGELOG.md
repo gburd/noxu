@@ -15,6 +15,8 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+## [7.2.1] - 2026-07-02
+
 ### Fixed
 
 - **Write-path-at-scale: guard the evictor daemon on the over-budget atomic
