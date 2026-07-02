@@ -15,6 +15,8 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+## [7.2.2] - 2026-07-02
+
 ### Fixed
 
 - **Data-corruption-class BIN/IN split-path concurrency panic (JE-faithful
