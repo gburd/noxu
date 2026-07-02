@@ -4003,6 +4003,39 @@ impl Tree {
         // write lock on the child. See the earlier comment on the race
         // this avoids inside split_child.
         let mut child_guard = child_arc.write();
+
+        // Re-validate that the child still needs splitting, now that we hold
+        // its write lock. This closes a check-then-act race: the caller
+        // (`insert_recursive_inner`) tested `child.get_n_entries() >=
+        // max_entries` under a PARENT READ lock, then dropped that read lock
+        // (required — the split needs `parent.write()`) before calling
+        // `split_child`. Read locks do not exclude each other, so two
+        // descenders can both pass the fullness check on the same child, both
+        // drop the parent read lock, and both call `split_child`. They
+        // serialise here on `parent.write()`: the first splits the child
+        // (leaving it with only its left half — possibly empty if it also
+        // races an eviction/compaction), and the second would then build a
+        // `SplitEntries` from a child that is no longer full and panic in
+        // `SplitEntries::get_key(split_index)` on an empty entries vec
+        // (tree.rs SplitEntries::get_key `v[index]`).
+        //
+        // JE performs the identical re-validation: `IN.split` re-checks
+        // `needsSplitting()` *after* latching the node it will split, so the
+        // fullness test and the split are atomic w.r.t. the node latch (see
+        // `IN.split` / `IN.needsSplitting` in IN.java; `Tree.forceSplit`
+        // latch-couples down and `IN.split` re-tests before mutating). Here
+        // the child write guard plays the role of that node latch.
+        //
+        // A no-op split returns `Ok(())` — the SAME success variant a real
+        // split returns — because the caller re-descends unconditionally
+        // after `split_child` (`return Self::insert_recursive_inner(...)`),
+        // where it re-reads the (now-current) topology and re-checks
+        // `child_full`. So a benign "already split" outcome simply leads to a
+        // correct re-descent and the insert proceeds.
+        if child_guard.get_n_entries() < max_entries {
+            return Ok(());
+        }
+
         let child_level = child_guard.level();
         // St-H6: capture the splitting BIN's expiration_in_hours flag BEFORE
         // drop(child_guard) so the right-half sibling inherits it.
