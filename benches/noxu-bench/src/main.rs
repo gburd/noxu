@@ -115,10 +115,22 @@ fn new_bench_dir(
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
+fn bench_cache_size() -> Option<u64> {
+    // NOXU_BENCH_CACHE_SIZE: explicit cache byte budget (e.g. 300000000000 for
+    // ~300 GB).  When unset, the engine default (64 MB) is used.  Sizing the
+    // cache to the hardware (e.g. 80% of RAM) with a dataset ~2x the cache is
+    // the production-realistic eviction regime — not the pathological
+    // dataset-far-exceeds-a-tiny-default-cache micro-case.
+    std::env::var("NOXU_BENCH_CACHE_SIZE").ok().and_then(|v| v.parse().ok())
+}
+
 fn open_db(dir: &Path) -> (Environment, Database) {
-    let cfg = EnvironmentConfig::new(dir.to_path_buf())
+    let mut cfg = EnvironmentConfig::new(dir.to_path_buf())
         .with_allow_create(true)
         .with_transactional(true);
+    if let Some(c) = bench_cache_size() {
+        cfg = cfg.with_cache_size(c);
+    }
     let env = Environment::open(cfg).unwrap();
     let db = env
         .open_database(
@@ -140,10 +152,13 @@ fn open_db(dir: &Path) -> (Environment, Database) {
 /// interval (vs default 1ms) gives more threads time to pass through LWL and
 /// accumulate in the FsyncManager wait queue, maximising coalescing.
 fn open_db_group_commit(dir: &Path) -> (Environment, Database) {
-    let cfg = EnvironmentConfig::new(dir.to_path_buf())
+    let mut cfg = EnvironmentConfig::new(dir.to_path_buf())
         .with_allow_create(true)
         .with_transactional(true)
         .with_log_group_commit(4, 5);
+    if let Some(c) = bench_cache_size() {
+        cfg = cfg.with_cache_size(c);
+    }
     let env = Environment::open(cfg).unwrap();
     let db = env
         .open_database(

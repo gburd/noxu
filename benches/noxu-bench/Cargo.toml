@@ -5,9 +5,12 @@ edition.workspace = true
 publish = false
 
 [[bin]]
+name = "noxu-saturation"
+path = "src/bin/saturation.rs"
+
+[[bin]]
 name = "noxu-workload-bench"
 path = "src/main.rs"
-
 [[bin]]
 name = "noxu-sustained-baseline"
 path = "src/sustained_main.rs"
