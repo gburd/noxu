@@ -25,7 +25,35 @@ use crate::key::{create_key_prefix, get_key_prefix_length};
 use crate::search_result::SearchResult;
 use noxu_latch::{LatchContext, SharedLatch};
 use noxu_util::{Lsn, NULL_LSN};
+// DST: the tree-node latch.  Production (default cfg) is BYTE-IDENTICAL — the
+// literal `parking_lot::RwLock`, zero cost, with `parking_lot` in the dep graph
+// exactly as before.  Under `--cfg noxu_shuttle` (dev/test only) it resolves to
+// the parking_lot-shaped shuttle wrapper `noxu_util::dst_sync_pl::RwLock`, so
+// shuttle can schedule the insert / split_child / compress interleavings that
+// let the BIN-split check-then-act race (bug-bin-split-concurrency.md) escape
+// into a benchmark instead of DST.  The hand-over-hand *read* descent
+// (`root.read_arc()` → an Arc-owning read guard) is provided under the cfg by
+// `noxu_latch::dst_arc_guard` (a shuttle-only shim that noxu-tree cannot host
+// itself because it is `#![forbid(unsafe_code)]`).  Under the default cfg
+// `read_arc()`/`ArcRwLockReadGuard` are parking_lot's own zero-cost inherent
+// API — no shim in the graph.
+#[cfg(noxu_shuttle)]
+use noxu_util::dst_sync_pl::RwLock;
+#[cfg(not(noxu_shuttle))]
 use parking_lot::RwLock;
+
+// The Arc-owning read guard for the hand-over-hand descent.  Default =
+// parking_lot's own inherent type (zero-cost, byte-identical).  Under shuttle =
+// the noxu-latch DST shim (see its module docs).  The `.read_arc()` method is
+// available on `Arc<RwLock<TreeNode>>` in both: inherent on parking_lot,
+// via `noxu_latch::dst_arc_guard::ReadArc` under shuttle.
+#[cfg(not(noxu_shuttle))]
+type NodeArcReadGuard =
+    parking_lot::ArcRwLockReadGuard<parking_lot::RawRwLock, TreeNode>;
+#[cfg(noxu_shuttle)]
+type NodeArcReadGuard = noxu_latch::dst_arc_guard::ArcRwLockReadGuard<TreeNode>;
+#[cfg(noxu_shuttle)]
+use noxu_latch::dst_arc_guard::ReadArc as _;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
@@ -3102,10 +3130,7 @@ impl Tree {
         // — a guard that owns its own Arc reference, so it has no
         // borrow lifetime and can be held across loop iterations and
         // assignment.
-        let mut guard: parking_lot::ArcRwLockReadGuard<
-            parking_lot::RawRwLock,
-            TreeNode,
-        > = root.read_arc();
+        let mut guard: NodeArcReadGuard = root.read_arc();
 
         loop {
             if guard.is_bin() {
@@ -3168,8 +3193,7 @@ impl Tree {
             // Upper IN: find the child slot with the largest key <= search
             // key, and capture the child Arc WHILE HOLDING the guard.
             // Slot 0 has a virtual key that compares as -infinity.
-            let parent_arc =
-                parking_lot::ArcRwLockReadGuard::rwlock(&guard).clone();
+            let parent_arc = NodeArcReadGuard::rwlock(&guard).clone();
             let next_arc = match &*guard {
                 TreeNode::Internal(n) => {
                     if n.entries.is_empty() {
@@ -3226,16 +3250,12 @@ impl Tree {
     /// Wave-11-I — see the 2026 review.
     pub fn search_with_data(&self, key: &[u8]) -> Option<SlotFetch> {
         let root = self.get_root()?;
-        let mut guard: parking_lot::ArcRwLockReadGuard<
-            parking_lot::RawRwLock,
-            TreeNode,
-        > = root.read_arc();
+        let mut guard: NodeArcReadGuard = root.read_arc();
 
         loop {
             if guard.is_bin() {
                 // Capture the BIN Arc before inspecting entries.
-                let bin_arc =
-                    parking_lot::ArcRwLockReadGuard::rwlock(&guard).clone();
+                let bin_arc = NodeArcReadGuard::rwlock(&guard).clone();
 
                 let (found, data, lsn, slot_index) = match &*guard {
                     TreeNode::Bottom(bin) => {
@@ -3275,8 +3295,7 @@ impl Tree {
             }
 
             // Upper IN: same hand-over-hand descent as `Tree::search`.
-            let parent_arc =
-                parking_lot::ArcRwLockReadGuard::rwlock(&guard).clone();
+            let parent_arc = NodeArcReadGuard::rwlock(&guard).clone();
             let next_idx = match &*guard {
                 TreeNode::Internal(n) => {
                     if n.entries.is_empty() {
@@ -3341,15 +3360,11 @@ impl Tree {
         // for the affected key. Three attempts is generous: each
         // retry only races a single split and splits are infrequent.
         for _ in 0..3 {
-            let mut guard: parking_lot::ArcRwLockReadGuard<
-                parking_lot::RawRwLock,
-                TreeNode,
-            > = root.read_arc();
+            let mut guard: NodeArcReadGuard = root.read_arc();
             let bin_arc;
             loop {
                 if guard.is_bin() {
-                    bin_arc =
-                        parking_lot::ArcRwLockReadGuard::rwlock(&guard).clone();
+                    bin_arc = NodeArcReadGuard::rwlock(&guard).clone();
                     drop(guard);
                     break;
                 }
@@ -3415,10 +3430,7 @@ impl Tree {
         // Hand-over-hand latch coupling — see Tree::search for the
         // detailed rationale on why this closes a reader-vs-splitter
         // race window.
-        let mut guard: parking_lot::ArcRwLockReadGuard<
-            parking_lot::RawRwLock,
-            TreeNode,
-        > = self.get_root()?.read_arc();
+        let mut guard: NodeArcReadGuard = self.get_root()?.read_arc();
 
         loop {
             if guard.is_bin() {
@@ -3454,8 +3466,7 @@ impl Tree {
             }
 
             // Upper IN: same descent as search().
-            let parent_arc =
-                parking_lot::ArcRwLockReadGuard::rwlock(&guard).clone();
+            let parent_arc = NodeArcReadGuard::rwlock(&guard).clone();
             let next_idx = match &*guard {
                 TreeNode::Internal(n) => {
                     if n.entries.is_empty() {
@@ -3515,10 +3526,7 @@ impl Tree {
         // first_entry_at_or_after; the guard is held continuously across
         // is_bin() and the subsequent entry lookup so no split can
         // restructure the path between the two observations.
-        let mut guard: parking_lot::ArcRwLockReadGuard<
-            parking_lot::RawRwLock,
-            TreeNode,
-        > = self.get_root()?.read_arc();
+        let mut guard: NodeArcReadGuard = self.get_root()?.read_arc();
         loop {
             if guard.is_bin() {
                 if let TreeNode::Bottom(bin) = &*guard {
@@ -3541,9 +3549,7 @@ impl Tree {
                         let lsn = bin.get_lsn(idx).as_u64(); // T-3
                         // Obtain the Arc for the BIN node the guard came from.
                         // `ArcRwLockReadGuard::rwlock()` returns the backing Arc.
-                        let bin_arc =
-                            parking_lot::ArcRwLockReadGuard::rwlock(&guard)
-                                .clone();
+                        let bin_arc = NodeArcReadGuard::rwlock(&guard).clone();
                         return Some((full_key, data, idx, lsn, bin_arc));
                     } else {
                         return None;
@@ -3553,8 +3559,7 @@ impl Tree {
             }
 
             // Upper IN: descend as in first_entry_at_or_after / search.
-            let parent_arc =
-                parking_lot::ArcRwLockReadGuard::rwlock(&guard).clone();
+            let parent_arc = NodeArcReadGuard::rwlock(&guard).clone();
             let next_idx = match &*guard {
                 TreeNode::Internal(n) => {
                     if n.entries.is_empty() {
@@ -4828,10 +4833,7 @@ impl Tree {
     /// Descends to the leftmost BIN by
     /// always following the first child slot at each upper IN level.
     pub fn get_first_node(&self) -> Option<SearchResult> {
-        let mut guard: parking_lot::ArcRwLockReadGuard<
-            parking_lot::RawRwLock,
-            TreeNode,
-        > = self.get_root()?.read_arc();
+        let mut guard: NodeArcReadGuard = self.get_root()?.read_arc();
 
         loop {
             if guard.is_bin() {
@@ -4874,10 +4876,7 @@ impl Tree {
     /// Descends to the rightmost BIN by
     /// always following the last child slot at each upper IN level.
     pub fn get_last_node(&self) -> Option<SearchResult> {
-        let mut guard: parking_lot::ArcRwLockReadGuard<
-            parking_lot::RawRwLock,
-            TreeNode,
-        > = self.get_root()?.read_arc();
+        let mut guard: NodeArcReadGuard = self.get_root()?.read_arc();
 
         loop {
             if guard.is_bin() {
@@ -5103,6 +5102,71 @@ impl Tree {
             None => return,
         };
         Self::compress_node(&root, self.max_entries_per_node);
+    }
+
+    // ── DST BIN-split gate shims (shuttle-only) ─────────────────────────────
+    //
+    // These expose the private split / merge-clear primitives so the shuttle
+    // harness (`crates/noxu-tree/tests/shuttle_bin_split.rs`) can race them on
+    // ONE shared child — the exact check-then-act interleaving that let the
+    // BIN-split bug (`.agent/archived-audits/bench/
+    // bug-bin-split-concurrency.md`) escape into a 96-thread benchmark instead
+    // of DST.  Compiled ONLY under `--cfg noxu_shuttle`; production never sees
+    // them (zero change, verified by `cargo tree`).
+
+    /// The node capacity / split-and-merge threshold for this tree.
+    #[cfg(noxu_shuttle)]
+    pub fn shuttle_max_entries(&self) -> usize {
+        self.max_entries_per_node
+    }
+
+    /// Drive `split_child(parent, child_index)` with default (no-comparator,
+    /// no-prefix, no-listener) parameters — the same call the insert path
+    /// makes after it has dropped the parent read lock (the drop→reacquire
+    /// window where the race opens).
+    #[cfg(noxu_shuttle)]
+    pub fn shuttle_split_child(
+        parent: &Arc<RwLock<TreeNode>>,
+        child_index: usize,
+        max_entries: usize,
+        insert_key: &[u8],
+    ) -> Result<(), TreeError> {
+        Self::split_child(
+            parent,
+            child_index,
+            max_entries,
+            Lsn::new(1, 999),
+            SplitHint::Normal,
+            insert_key,
+            None,  // no comparator
+            false, // key_prefixing off
+            None,  // no InListListener
+        )
+    }
+
+    /// Simulate the racing INCompressor merge that CLEARS a child in place
+    /// (`compress_node`'s `entries.clear()` on the merged-away left sibling),
+    /// under the child's write lock — the stale state a second `split_child`
+    /// observes after the caller's fullness check was already passed under the
+    /// now-dropped parent read lock.  Returns the entry count observed BEFORE
+    /// clearing (so the harness can assert it raced a still-full child).
+    #[cfg(noxu_shuttle)]
+    pub fn shuttle_clear_child(child_arc: &Arc<RwLock<TreeNode>>) -> usize {
+        let mut cg = child_arc.write();
+        let before = cg.get_n_entries();
+        match &mut *cg {
+            TreeNode::Bottom(b) => {
+                b.entries.clear();
+                b.lsn_rep = LsnRep::Empty;
+                b.keys = KeyRep::new();
+            }
+            TreeNode::Internal(n) => {
+                n.entries.clear();
+                n.lsn_rep = LsnRep::Empty;
+                n.targets = TargetRep::None;
+            }
+        }
+        before
     }
 
     /// Recursive post-order compress helper.
@@ -5711,10 +5775,7 @@ impl Tree {
         // `get_parent_bin_for_child_ln`.
         let (parent_arc, child_index) = {
             let mut parent_arc: Arc<RwLock<TreeNode>> = root.clone();
-            let mut guard: parking_lot::ArcRwLockReadGuard<
-                parking_lot::RawRwLock,
-                TreeNode,
-            > = root.read_arc();
+            let mut guard: NodeArcReadGuard = root.read_arc();
             loop {
                 let (next_arc, idx) = match &*guard {
                     TreeNode::Internal(n) => {
@@ -6252,10 +6313,7 @@ impl Tree {
     /// the race unreachable.
     pub fn search_with_coupling(&self, key: &[u8]) -> Option<SearchResult> {
         let root = self.get_root()?;
-        let mut guard: parking_lot::ArcRwLockReadGuard<
-            parking_lot::RawRwLock,
-            TreeNode,
-        > = root.read_arc();
+        let mut guard: NodeArcReadGuard = root.read_arc();
 
         loop {
             if guard.is_bin() {
@@ -6268,8 +6326,7 @@ impl Tree {
                 ));
             }
 
-            let parent_arc =
-                parking_lot::ArcRwLockReadGuard::rwlock(&guard).clone();
+            let parent_arc = NodeArcReadGuard::rwlock(&guard).clone();
             let next_idx = match &*guard {
                 TreeNode::Internal(n) => {
                     if n.entries.is_empty() {
@@ -6641,10 +6698,7 @@ impl Tree {
             Arc<RwLock<TreeNode>>,
         )> = Vec::new();
 
-        let mut guard: parking_lot::ArcRwLockReadGuard<
-            parking_lot::RawRwLock,
-            TreeNode,
-        > = root.read_arc();
+        let mut guard: NodeArcReadGuard = root.read_arc();
         loop {
             if guard.is_bin() {
                 break;
@@ -6672,8 +6726,7 @@ impl Tree {
 
             // Record the parent and the child we are about to enter
             // — the child Arc lets the ascent validate the slot.
-            let parent_arc =
-                parking_lot::ArcRwLockReadGuard::rwlock(&guard).clone();
+            let parent_arc = NodeArcReadGuard::rwlock(&guard).clone();
             path.push((parent_arc, slot_idx, Arc::clone(&next_arc)));
 
             // Hand-over-hand: take child read lock BEFORE releasing parent.
@@ -6751,10 +6804,7 @@ impl Tree {
         forward: bool,
     ) -> Option<Vec<(BinEntry, Lsn, Vec<u8>)>> {
         // Hand-over-hand latch coupling — see Tree::search.
-        let mut guard: parking_lot::ArcRwLockReadGuard<
-            parking_lot::RawRwLock,
-            TreeNode,
-        > = node_arc.read_arc();
+        let mut guard: NodeArcReadGuard = node_arc.read_arc();
 
         loop {
             if guard.is_bin() {
@@ -7111,10 +7161,7 @@ impl Tree {
     ) -> Option<Arc<RwLock<TreeNode>>> {
         let root = self.get_root()?;
         let mut current_arc: Arc<RwLock<TreeNode>> = root.clone();
-        let mut guard: parking_lot::ArcRwLockReadGuard<
-            parking_lot::RawRwLock,
-            TreeNode,
-        > = root.read_arc();
+        let mut guard: NodeArcReadGuard = root.read_arc();
 
         loop {
             if guard.is_bin() {

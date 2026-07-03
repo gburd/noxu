@@ -291,6 +291,8 @@ binary.
 | `FsyncManager` group-commit (`shuttle_fsync_manager.rs`) | **Green gate** (DST wave 2) | The leader hand-off previously recovered a lost `wakeup_one` via `LOG_FSYNC_TIMEOUT`, which shuttle cannot model. DST wave 2 **fixed** the lost-wakeup (a `leader_notified` predicate-before-wait flag, the same class as the `WakeHandle` pre-check), so the hand-off is timeout-independent and the full safety oracle (`DurableImpliesLogged`, `FsyncedNeverDecreases`, coalescing, failure fan-out) now runs green over 5000 interleavings. Reverting the fix makes the oracle deadlock, so the gate is not blind. |
 | `lock_manager` deadlock detection (`shuttle_lock_manager.rs`) | **Green gate** (DST wave 2) | Routes the shard-table / waiter-graph `Mutex` and per-waiter grant `Condvar` through `noxu_util::dst_sync_pl`; drives the 50 ms re-detection slice via a `SimClock` (`LockManager::with_config_clock`). Asserts no-deadlock-undetected + victim-consistency (a two-lock cycle aborts exactly one victim) and no lost wakeup on grant (`WriteLocksExclusive`), mapped to `noxu-spec` `lock_manager_deadlock`. |
 | `log_buffer` segment pin/release | **Deferred** | The segment latch is a `noxu_sync::RawMutex` (`lock_api::RawMutex` shape); shuttle 0.9 exposes no `lock_api::RawMutex`, and the `RawMutex::INIT` const requirement blocks a clean wrapper. The segment's other concurrency is raw-pointer `unsafe` shuttle would not schedule. Deferred until a raw-lock-over-shuttle shim is scheduled. |
+| `SHARED_CACHE` evictor register / deregister / evict (`shuttle_shared_cache.rs`) | **Green gate** | The cross-environment shared-cache registry interleavings are scheduled through the seam. |
+| **B-tree `split_child` / `compress_node` (`shuttle_bin_split.rs`)** | **Green gate** (DST tree coverage) | Routes the tree-node latch through `noxu_util::dst_sync_pl` under the cfg (production stays byte-identical `parking_lot::RwLock`); the hand-over-hand `read_arc()` descent is backed under the cfg by `noxu_latch::dst_arc_guard` (an Arc-owning read guard the `#![forbid(unsafe_code)]` tree/util crates cannot host), so the whole tree is schedulable. shuttle races `split_child` against an INCompressor-style merge-clear (and two concurrent splitters) on ONE shared child — the drop→reacquire check-then-act window that let the BIN-split bug (`bug-bin-split-concurrency.md`) escape into a 96-thread benchmark instead of DST. Asserts no-panic + split-atomicity + key-order, mapped to `noxu-spec` `btree_latching` (`AtMostOneSplit` / `NoLostWrites`). **Not vacuous:** reverting the v7.2.2 re-check makes shuttle find the `SplitEntries::get_key` out-of-bounds panic — the identical benchmark symptom. |
 
 > shuttle surfaced two real, latent lost-wakeups masked in production by
 > timeouts, both now **fixed**. The `DaemonManager` one (a missing
@@ -307,10 +309,12 @@ The shuttle gate is part of the **release** DST gate (like M1's long sweep), not
 required for local dev. It needs the `noxu_shuttle` cfg via `RUSTFLAGS`:
 
 ```bash
-# All four shuttle targets:
+# All shuttle targets:
 RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-engine --test shuttle_daemon_shutdown
 RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-log    --test shuttle_fsync_manager
 RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-txn    --test shuttle_lock_manager
+RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-evictor --test shuttle_shared_cache
+RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-tree   --test shuttle_bin_split
 
 # The M1.1 parking_lot-over-shuttle wrapper self-test:
 RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-util --test shuttle_dst_sync_pl
@@ -327,6 +331,26 @@ The shared invariant asserts the shuttle tests check
 `FsyncedNeverDecreases`, `DurableImpliesLogged` — now checked against the real
 code at every explored interleaving. This is the "specs become the DST
 oracle" synergy: write each invariant once, check it two ways.
+
+#### Coverage scope and the road to "100%"
+
+"100% DST coverage" is defined as **all `noxu-sync` / `std::sync` /
+`parking_lot`-based concurrency protocols in the core engine** — it explicitly
+excludes the `tokio`-async replication networking in `noxu-rep`, which shuttle
+cannot model (shuttle instruments `shuttle::sync` + `shuttle::thread`, not the
+tokio runtime). Rep's async loops are covered by tokio-level tests and by
+`noxu-spec` protocol models instead.
+
+Against that scope: **6 protocols are gated** (the table above), **1 is
+hard-blocked by shuttle 0.9** (`log_buffer`'s `lock_api::RawMutex` segment
+latch has no safe shuttle 0.9 shape), and **4 are sequenced follow-ups**
+(cursor concurrency, txn commit/abort, recovery-vs-mutation, rep sync state
+machines), all now tractable because the entire tree — read and write — is
+seamable. The one gap that mattered most — the BIN-split check-then-act race
+that a benchmark had to catch instead of DST — is closed by
+`shuttle_bin_split.rs`. Maintainers with the local
+`.agent/archived-audits/dst-coverage-map.md` (gitignored) have the full
+per-subsystem breakdown.
 
 ### DST Milestone 1.1 — clock thread-through + parking_lot-over-shuttle
 

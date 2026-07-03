@@ -26,5 +26,14 @@ bytes = { workspace = true }
 proptest = { workspace = true }
 tempfile = "3"
 
+# DST tree coverage: the BIN-split concurrency shuttle gate
+# (tests/shuttle_bin_split.rs) is gated behind `#![cfg(noxu_shuttle)]`, so this
+# dev-dep only matters under that cfg.  Default builds and `cargo test` never
+# pull shuttle in.  The lib's node latch resolves to the parking_lot-shaped
+# shuttle wrapper via `noxu_util::dst_sync_pl` (a transitive dep under the cfg),
+# so no direct `shuttle` *dependency* on the lib is needed.
+[target.'cfg(noxu_shuttle)'.dev-dependencies]
+shuttle = { workspace = true }
+
 [lints]
 workspace = true
