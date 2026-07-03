@@ -2,12 +2,25 @@
 //!
 
 use hashbrown::HashMap;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock as StdRwLock};
+use std::sync::Arc;
 
 use noxu_log::LogManager;
-use noxu_sync::RwLock;
 use noxu_util::lsn::NULL_LSN;
+// DST seam (DST txn wave): route the txn-manager's locks AND atomics through the
+// shuttle seams so a shuttle gate can schedule concurrent begin/commit/abort.
+// Under the default cfg all are transparent re-exports (`all_txns` → the real
+// `noxu_sync::RwLock`, `group_commit` → the real `std::sync::RwLock`, atomics →
+// the real `std::sync::atomic`), so production is byte-identical and shuttle is
+// absent from the dep graph.
+//   * `all_txns` is parking_lot-shaped (`.read()`/`.write()` return the guard)
+//     → `dst_sync_pl::RwLock`.
+//   * `group_commit` is std-shaped (`.read().unwrap()`/`.write().unwrap()`)
+//     → `dst_sync::RwLock`.
+//   * `next_txn_id` (allocator) is the txn-id-uniqueness crux; routing the
+//     atomics through the seam makes `fetch_add` a shuttle scheduling point.
+use noxu_util::dst_sync::RwLock as StdRwLock;
+use noxu_util::dst_sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use noxu_util::dst_sync_pl::RwLock;
 
 use crate::LockManager;
 use crate::group_commit::GroupCommit;
