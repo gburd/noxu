@@ -141,15 +141,13 @@ fn stepping_cursor_vs_split_no_skip() {
             assert_eq!(status, OperationStatus::Success, "search 02 failed");
             assert_eq!(cursor.get_current_key(), Some(b"02".as_slice()));
 
-            // Thread B: insert "04" — triggers split of the full BIN.
-            let inserter = {
-                let db = db.clone();
-                shuttle::thread::spawn(move || {
-                    let mut c = CursorImpl::new(db, 3);
-                    c.put(b"04", b"v", PutMode::Overwrite)
-                        .expect("concurrent split-insert must succeed");
-                })
-            };
+            // Thread B: insert "04" — triggers split of the full BIN.  Last
+            // user of `db` in this test, so move it in (no clone).
+            let inserter = shuttle::thread::spawn(move || {
+                let mut c = CursorImpl::new(db, 3);
+                c.put(b"04", b"v", PutMode::Overwrite)
+                    .expect("concurrent split-insert must succeed");
+            });
 
             // Thread A (this thread): step once concurrently with the split,
             // collecting whatever key the step lands on, then drain the rest of
@@ -210,14 +208,12 @@ fn stepping_cursor_lower_half_vs_split_complete_scan() {
             cursor.search(b"01", Some(b"v"), SearchMode::Set).unwrap();
             assert_eq!(cursor.get_current_key(), Some(b"01".as_slice()));
 
-            let inserter = {
-                let db = db.clone();
-                shuttle::thread::spawn(move || {
-                    let mut c = CursorImpl::new(db, 3);
-                    c.put(b"04", b"v", PutMode::Overwrite)
-                        .expect("concurrent split-insert must succeed");
-                })
-            };
+            // Last user of `db` in this test, so move it in (no clone).
+            let inserter = shuttle::thread::spawn(move || {
+                let mut c = CursorImpl::new(db, 3);
+                c.put(b"04", b"v", PutMode::Overwrite)
+                    .expect("concurrent split-insert must succeed");
+            });
 
             let mut visited: BTreeSet<Vec<u8>> = BTreeSet::new();
             if cursor.retrieve_next(GetMode::Next).unwrap()
@@ -279,14 +275,12 @@ fn searching_cursor_vs_split_finds_present_key() {
                     assert_eq!(c.get_current_key(), Some(b"02".as_slice()));
                 })
             };
-            let inserter = {
-                let db = db.clone();
-                shuttle::thread::spawn(move || {
-                    let mut c = CursorImpl::new(db, 3);
-                    c.put(b"04", b"v", PutMode::Overwrite)
-                        .expect("concurrent split-insert must succeed");
-                })
-            };
+            // Last user of `db` in this test, so move it in (no clone).
+            let inserter = shuttle::thread::spawn(move || {
+                let mut c = CursorImpl::new(db, 3);
+                c.put(b"04", b"v", PutMode::Overwrite)
+                    .expect("concurrent split-insert must succeed");
+            });
 
             searcher.join().unwrap();
             inserter.join().unwrap();
