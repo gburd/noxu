@@ -63,7 +63,7 @@ fn main() {
             s.spawn(move || {
                 let v = DatabaseEntry::from_bytes(&vec![0x58u8; value_size]);
                 for i in start..end {
-                    let _ = db.put(&DatabaseEntry::from_vec(key_bytes(i)), &v);
+                    let _ = db.put(DatabaseEntry::from_vec(key_bytes(i)), &v);
                 }
             });
         }
@@ -110,7 +110,7 @@ fn write_phase(db: &Arc<Database>, nw: usize, records: u64, value_size: usize, s
                     let k = DatabaseEntry::from_vec(key_bytes(rng.gen_range(0..records)));
                     let t = Instant::now();
                     let _ = db.put(&k, &v);
-                    if ops % 16 == 0 { lats.push(t.elapsed().as_nanos() as u64); }
+                    if ops.is_multiple_of(16) { lats.push(t.elapsed().as_nanos() as u64); }
                     ops += 1;
                 }
                 total.fetch_add(ops, Ordering::Relaxed);

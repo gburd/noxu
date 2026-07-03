@@ -104,7 +104,7 @@ fn main() {
                     let k = DatabaseEntry::from_vec(key_bytes(i));
                     let _ = db.put(&k, &v);
                     n += 1;
-                    if n % 1_000_000 == 0 {
+                    if n.is_multiple_of(1_000_000) {
                         loaded.fetch_add(1_000_000, Ordering::Relaxed);
                     }
                 }
@@ -175,7 +175,7 @@ fn run_phase(
                         let _ = db.put(&k, &v);
                     }
                     // Sample latency every 64 ops to keep the vec bounded.
-                    if ops % 64 == 0 {
+                    if ops.is_multiple_of(64) {
                         lats.push(op_t.elapsed().as_nanos() as u64);
                     }
                     ops += 1;
