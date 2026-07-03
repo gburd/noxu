@@ -290,8 +290,8 @@ impl Default for DbiEnvConfig {
             log_use_odsync: false,
             log_use_write_queue: false,
             log_write_queue_size: 1024 * 1024,
-            log_group_commit_threshold: 4,
-            log_group_commit_interval_ms: 1,
+            log_group_commit_threshold: 0,
+            log_group_commit_interval_ms: 0,
             // B-tree
             node_max_entries: 128,
             node_dup_tree_max_entries: 128,

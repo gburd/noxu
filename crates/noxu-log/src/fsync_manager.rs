@@ -669,6 +669,75 @@ mod tests {
         );
     }
 
+    /// COALESCING-FACTOR REGRESSION GUARD (write-perf parity).
+    ///
+    /// Reproduces the high-concurrency regime the AWS 96-writer sweep hit
+    /// (writers arrive faster than the leader can fsync) on any core count by
+    /// making the leader's fsync artificially slow.  With the JE / extended-fork
+    /// pure-piggyback design (grpWaitOn off, the shipped default), the leader
+    /// that wins while a fsync is in progress accumulates ALL concurrent
+    /// committers into its waiter cohort and serves them in ONE fsync, so the
+    /// coalescing factor (requests / fsyncs) must be well above 1.
+    ///
+    /// This is the micro-test that would catch a coalescing regression: if the
+    /// leader/waiter piggyback breaks (e.g. a re-introduced LWL-across-fsync
+    /// serialization, or a per-committer solo-leader bug), each committer does
+    /// its own fsync and the factor collapses to ~1.
+    ///
+    /// JE cite: `FSyncManager.flushAndSync` doWork block — the leader drains +
+    /// fsyncs OUTSIDE `mgrMutex`, so concurrent committers pile into
+    /// `nextFSyncWaiters` during the fsync and the next leader serves the whole
+    /// batch (`inProgressGroup.wakeupAll()`).
+    #[test]
+    fn test_coalescing_factor_under_slow_fsync() {
+        const N: usize = 32;
+        // grpWaitOn OFF (0,0): the shipped default and the reference design.
+        let mgr = Arc::new(FsyncManager::new(0, 0));
+        let fsyncs = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(std::sync::Barrier::new(N));
+
+        let handles: Vec<_> = (0..N)
+            .map(|_| {
+                let m = Arc::clone(&mgr);
+                let fc = Arc::clone(&fsyncs);
+                let b = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    b.wait();
+                    // Small stagger-free burst: all N hammer flush_and_sync.
+                    for _ in 0..8 {
+                        m.flush_and_sync(|| {
+                            // Slow "fsync" so siblings pile into the waiter
+                            // cohort while the leader is in the syscall.
+                            fc.fetch_add(1, Ordering::SeqCst);
+                            std::thread::sleep(Duration::from_millis(5));
+                            Ok(0)
+                        })
+                        .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let requests = N * 8;
+        let actual_fsyncs = fsyncs.load(Ordering::SeqCst);
+        let factor = requests as f64 / actual_fsyncs as f64;
+        // The exact factor depends on scheduling, but with 32 threads and a
+        // 5 ms fsync the piggyback must coalesce many committers per fsync.
+        // A regression to per-committer fsync would give factor ~1.0 and
+        // actual_fsyncs ~= requests.  Require a conservative >= 2x to stay
+        // robust across CI machines while still catching a total collapse.
+        assert!(
+            factor >= 2.0,
+            "coalescing regressed: {requests} requests / {actual_fsyncs} fsyncs \
+             = {factor:.1}x (expected >= 2x from leader/waiter piggyback)"
+        );
+        // Durability sanity: at least one real fsync happened.
+        assert!(actual_fsyncs >= 1);
+    }
+
     /// Error from `do_fsync` propagates to the calling thread.
     #[test]
     fn test_fsync_error_propagated_to_waiters() {
