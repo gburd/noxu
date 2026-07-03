@@ -293,6 +293,8 @@ binary.
 | `log_buffer` segment pin/release | **Deferred** | The segment latch is a `noxu_sync::RawMutex` (`lock_api::RawMutex` shape); shuttle 0.9 exposes no `lock_api::RawMutex`, and the `RawMutex::INIT` const requirement blocks a clean wrapper. The segment's other concurrency is raw-pointer `unsafe` shuttle would not schedule. Deferred until a raw-lock-over-shuttle shim is scheduled. |
 | `SHARED_CACHE` evictor register / deregister / evict (`shuttle_shared_cache.rs`) | **Green gate** | The cross-environment shared-cache registry interleavings are scheduled through the seam. |
 | **B-tree `split_child` / `compress_node` (`shuttle_bin_split.rs`)** | **Green gate** (DST tree coverage) | Routes the tree-node latch through `noxu_util::dst_sync_pl` under the cfg (production stays byte-identical `parking_lot::RwLock`); the hand-over-hand `read_arc()` descent is backed under the cfg by `noxu_latch::dst_arc_guard` (an Arc-owning read guard the `#![forbid(unsafe_code)]` tree/util crates cannot host), so the whole tree is schedulable. shuttle races `split_child` against an INCompressor-style merge-clear (and two concurrent splitters) on ONE shared child — the drop→reacquire check-then-act window that let the BIN-split bug (`bug-bin-split-concurrency.md`) escape into a 96-thread benchmark instead of DST. Asserts no-panic + split-atomicity + key-order, mapped to `noxu-spec` `btree_latching` (`AtMostOneSplit` / `NoLostWrites`). **Not vacuous:** reverting the v7.2.2 re-check makes shuttle find the `SplitEntries::get_key` out-of-bounds panic — the identical benchmark symptom. |
+| **`TxnManager` begin/commit/abort (`shuttle_txn_commit.rs`)** | **Green gate** (DST txn/cursor coverage) | Routes `TxnManager.all_txns` through `noxu_util::dst_sync_pl`, `group_commit` + the lock-manager label registry through `noxu_util::dst_sync`, and `next_txn_id` through `noxu_util::dst_sync::atomic` (default build byte-identical). Explores concurrent begin/commit/abort; asserts **txn-id uniqueness** (no two txns share an id), **commit/abort atomicity** (exactly one of committed/aborted, never both/neither), and **`all_txns` integrity** (no lost or leaked map entry). Invariants map to `noxu-spec` `wal_commit` (monotonic allocator, 2-state committed). **Not vacuous:** replacing `next_txn_id.fetch_add` with a racy load+store makes shuttle report `duplicate txn id 1 allocated (ids=[1, 2, 1])`. |
+| **`CursorImpl` reposition vs BIN split (`shuttle_cursor.rs`)** | **Green gate** (DST txn/cursor coverage) | Routes the cursor's `db_impl` RwLock through `noxu_util::dst_sync_pl` (default build byte-identical; `dst_sync_pl::RwLock` *is* `noxu_sync::RwLock` under the default cfg, so noxu-db/env callers interoperate unchanged). The tree node latch is already seamed. shuttle races a cursor stepping/repositioning (the CC-1 split-adjustment re-anchor in `retrieve_next`) against a concurrent insert that splits the BIN under it — the concurrent analogue of the sequential CC-1 regression tests. Asserts **no-panic**, **position-valid**, and **no-skip / no-double-return** (a full forward scan across the split visits the live tail exactly once), mapped to `noxu-spec` `btree_latching` (`NoLostWrites`). **Not vacuous:** forcing the CC-1 re-anchor off makes shuttle find a schedule where the scan skips the split-migrated key `"04"` (visited `{"03"}`, expected `{"03","04"}`). |
 
 > shuttle surfaced two real, latent lost-wakeups masked in production by
 > timeouts, both now **fixed**. The `DaemonManager` one (a missing
@@ -315,6 +317,8 @@ RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-log    --test shuttle_fsync_ma
 RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-txn    --test shuttle_lock_manager
 RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-evictor --test shuttle_shared_cache
 RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-tree   --test shuttle_bin_split
+RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-txn    --test shuttle_txn_commit
+RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-dbi    --test shuttle_cursor
 
 # The M1.1 parking_lot-over-shuttle wrapper self-test:
 RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-util --test shuttle_dst_sync_pl
@@ -341,14 +345,16 @@ cannot model (shuttle instruments `shuttle::sync` + `shuttle::thread`, not the
 tokio runtime). Rep's async loops are covered by tokio-level tests and by
 `noxu-spec` protocol models instead.
 
-Against that scope: **6 protocols are gated** (the table above), **1 is
+Against that scope: **8 protocols are gated** (the table above), **1 is
 hard-blocked by shuttle 0.9** (`log_buffer`'s `lock_api::RawMutex` segment
-latch has no safe shuttle 0.9 shape), and **4 are sequenced follow-ups**
-(cursor concurrency, txn commit/abort, recovery-vs-mutation, rep sync state
-machines), all now tractable because the entire tree — read and write — is
-seamable. The one gap that mattered most — the BIN-split check-then-act race
-that a benchmark had to catch instead of DST — is closed by
-`shuttle_bin_split.rs`. Maintainers with the local
+latch has no safe shuttle 0.9 shape), and **2 are sequenced follow-ups**
+(recovery-vs-mutation, rep sync state machines), both now tractable because the
+tree, txn, and cursor seams are landed. The one gap that mattered most — the
+BIN-split check-then-act race that a benchmark had to catch instead of DST — is
+closed by `shuttle_bin_split.rs`, and the two adjacent races that could have
+hidden the same way (a torn commit/abort `all_txns` map; a cursor skipping a
+split-migrated key) are now closed by `shuttle_txn_commit.rs` /
+`shuttle_cursor.rs`. Maintainers with the local
 `.agent/archived-audits/dst-coverage-map.md` (gitignored) have the full
 per-subsystem breakdown.
 
