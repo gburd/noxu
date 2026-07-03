@@ -23,16 +23,26 @@
 //! create a potential process hang under extreme contention.
 
 use hashbrown::{HashMap, HashSet};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 // The shard-table / waiter-graph `Mutex` and the per-waiter grant `Condvar`
 // route through the parking_lot-over-shuttle seam so the deadlock-detection
 // and grant/wakeup interleavings are schedulable by shuttle (DST wave 2).
 // The default build re-exports the real `noxu-sync` futex types, so
-// production behaviour and the on-heap layout are unchanged.  (The
-// read-mostly registry `RwLock`s below stay on `std::sync`; they are not on
-// the deadlock hot path and the shuttle tests never populate them.)
+// production behaviour and the on-heap layout are unchanged.
+//
+// The read-mostly registry `RwLock`s (`locker_labels`, `non_preemptable`)
+// route through the std-shaped `dst_sync` seam (DST txn wave): `begin_txn` /
+// `commit_txn` / `abort_txn` call `register_locker_label` /
+// `unregister_locker_label`, so the txn-commit shuttle gate DOES contend on
+// them across green threads.  An un-instrumented `std::sync::RwLock` held by
+// one shuttle green thread while the scheduler switches to another that
+// blocks on it would hang shuttle's single-OS-thread executor; routing them
+// through `dst_sync` makes the acquire a schedulable point.  Under the
+// default cfg `dst_sync::RwLock` is a transparent `std::sync::RwLock`
+// re-export — production is byte-identical.
+use noxu_util::dst_sync::RwLock;
 use noxu_util::dst_sync_pl::{Condvar, Mutex};
 use noxu_util::{Clock, RealClock};
 

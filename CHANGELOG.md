@@ -17,6 +17,36 @@ listed in [References](#references).
 
 ### Added
 
+- **DST txn + cursor coverage: shuttle gates for the txn commit/abort and
+  cursor-reposition races.** Two of the four remaining "Future" gaps in the
+  DST coverage map are now closed, both proven non-vacuous.
+  - **`TxnManager` begin/commit/abort** (`noxu-txn/tests/shuttle_txn_commit.rs`).
+    `TxnManager.all_txns` routes through `noxu_util::dst_sync_pl`,
+    `group_commit` + the lock-manager locker-label registry through
+    `noxu_util::dst_sync`, and `next_txn_id` through
+    `noxu_util::dst_sync::atomic`. shuttle explores concurrent
+    begin/commit/abort and asserts txn-id uniqueness, commit/abort atomicity
+    (a txn is exactly one of committed/aborted, never both/neither), and
+    `all_txns` map integrity (no lost or leaked entry). Invariants map to the
+    `noxu-spec` `wal_commit` monotonic-allocator and 2-state-committed
+    properties. Non-vacuous: a racy load+store allocator makes shuttle report
+    `duplicate txn id 1 allocated`.
+  - **`CursorImpl` reposition vs BIN split**
+    (`noxu-dbi/tests/shuttle_cursor.rs`). The cursor's `db_impl` RwLock routes
+    through `noxu_util::dst_sync_pl`; the tree node latch is already seamed.
+    shuttle races a cursor stepping/repositioning (the CC-1 split-adjustment
+    re-anchor in `retrieve_next`) against a concurrent insert that splits the
+    BIN under it — the concurrent analogue of the sequential CC-1 regression
+    tests — and asserts no-panic, position-valid, and no-skip /
+    no-double-return (a forward scan across the split visits the live tail
+    exactly once), mapped to `noxu-spec` `btree_latching` (`NoLostWrites`).
+    Non-vacuous: forcing the CC-1 re-anchor off makes shuttle find a schedule
+    that skips the split-migrated key. Production is **byte-identical** —
+    under the default cfg `dst_sync_pl::RwLock` *is* `noxu_sync::RwLock`, so
+    every existing caller interoperates unchanged and shuttle is absent from
+    the default dependency graph. Testing-guide DST section and the DST
+    coverage map updated (8 gated protocols; 2 follow-ups remain:
+    recovery-vs-mutation, rep sync state machines).
 - **DST tree coverage: a shuttle gate for the BIN-split concurrency race.**
   The B-tree node latch now routes through the `noxu_util::dst_sync_pl` seam
   under `--cfg noxu_shuttle`, so shuttle can schedule the

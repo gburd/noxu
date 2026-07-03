@@ -32,7 +32,22 @@ use noxu_txn::{LockManager, LockType, Locker, Txn, TxnManager};
 
 use crate::dup_key_data;
 use crate::throughput_stats::ThroughputStats;
-use noxu_sync::RwLock;
+// DST cursor coverage: route the cursor's `db_impl` RwLock through the
+// parking_lot-over-shuttle seam so a shuttle gate can schedule a cursor
+// stepping/repositioning concurrently with a BIN split under it.  Under the
+// default cfg `dst_sync_pl::RwLock` is a transparent re-export of
+// `noxu_sync::RwLock` (the *identical* type), so production is byte-identical
+// and every caller passing `Arc<noxu_sync::RwLock<DatabaseImpl>>` interoperates
+// unchanged; shuttle is absent from the default dep graph.  Under
+// `--cfg noxu_shuttle` it resolves to the shuttle-instrumented lock, matching
+// the tree node latch (already seamed in noxu-tree) so both the cursor's
+// `db_impl.read()` and the concurrent split's node latches are schedulable.
+//
+// The `txn_ref` Mutex stays on `std::sync` (see the field doc): it is not on
+// the reposition-vs-split race path, and routing it would force the seam type
+// into noxu-db's `Database` (which constructs the `Arc<Mutex<Txn>>`) for no
+// coverage gain.  The cursor gate uses an auto-commit (txn_ref = None) cursor.
+use noxu_util::dst_sync_pl::RwLock;
 use noxu_util::{Lsn, vlsn::NULL_VLSN};
 
 use crate::{

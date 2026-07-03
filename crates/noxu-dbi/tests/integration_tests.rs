@@ -7,6 +7,14 @@
 //!   - DbType: all variants
 //!   - DatabaseId: creation, comparison
 
+// DST cursor coverage: this env-heavy integration test opens real temp-dir
+// environments and is not a shuttle target.  Under `--cfg noxu_shuttle` the
+// cursor's `db_impl` lock routes through the seam (a distinct type from the
+// `noxu_sync::RwLock` the `EnvironmentImpl` API returns), so this file would
+// not type-check under that cfg — and it has no business running on shuttle's
+// cooperative executor anyway.  Compile it only for the default (non-shuttle)
+// build; the shuttle cursor gate lives in `tests/shuttle_cursor.rs`.
+#![cfg(not(noxu_shuttle))]
 #![allow(clippy::field_reassign_with_default)]
 
 use std::sync::Arc;
@@ -22,7 +30,14 @@ fn tmp_env() -> (TempDir, EnvironmentImpl) {
     let env = EnvironmentImpl::new(dir.path(), false, true).unwrap();
     (dir, env)
 }
-use noxu_sync::RwLock;
+// DST cursor coverage: `CursorImpl::new` takes the cursor's `db_impl` lock
+// through the `noxu_util::dst_sync_pl` seam.  Under the default cfg that alias
+// IS `noxu_sync::RwLock` (identical type), so this changes nothing for
+// production/CI.  This whole file is gated OUT under `--cfg noxu_shuttle`
+// (see the `#![cfg(not(noxu_shuttle))]` at the top): it opens real temp-dir
+// environments and is not a shuttle target, so it does not need to build
+// against the shuttle-instrumented lock the cursor uses under that cfg.
+use noxu_util::dst_sync_pl::RwLock;
 
 // ============================================================================
 // 1. DatabaseId: creation, comparison, ordering
