@@ -36,7 +36,6 @@ mod get_mode;
 mod memory_budget;
 pub mod name_ln_codec;
 mod node_sequence;
-mod operation;
 mod operation_status;
 mod put_mode;
 pub mod replica_ack;
@@ -71,7 +70,6 @@ pub use get_mode::GetMode;
 pub use memory_budget::{MemoryBudget, MemoryBudgetStats, MemoryOverhead};
 pub use node_sequence::NodeSequence;
 pub use noxu_evictor::Evictor;
-pub use operation::Operation;
 pub use operation_status::OperationStatus;
 pub use put_mode::PutMode;
 pub use replica_ack::{
