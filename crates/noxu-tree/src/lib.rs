@@ -106,4 +106,11 @@ pub use tree_location::TreeLocation;
 
 // Re-export the RwLock used for tree nodes so downstream crates can reference
 // the same type without depending on parking_lot directly.
+//
+// DST: byte-identical `parking_lot::RwLock` in production; under
+// `--cfg noxu_shuttle` the parking_lot-shaped shuttle wrapper, matching
+// `tree::RwLock` so node arcs share one lock type.
+#[cfg(noxu_shuttle)]
+pub use noxu_util::dst_sync_pl::RwLock as NodeRwLock;
+#[cfg(not(noxu_shuttle))]
 pub use parking_lot::RwLock as NodeRwLock;
