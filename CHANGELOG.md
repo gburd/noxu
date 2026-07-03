@@ -15,6 +15,30 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Added
+
+- **DST tree coverage: a shuttle gate for the BIN-split concurrency race.**
+  The B-tree node latch now routes through the `noxu_util::dst_sync_pl` seam
+  under `--cfg noxu_shuttle`, so shuttle can schedule the
+  `insert`/`split_child`/`compress_node` interleavings — the class of
+  concurrency the v7.2.2 BIN-split check-then-act panic belonged to, which a
+  96-thread benchmark had to catch because DST could not reach the tree's
+  node-latch interleavings. New gate `noxu-tree/tests/shuttle_bin_split.rs`
+  races `split_child` against an INCompressor-style merge-clear (and two
+  concurrent splitters) on one shared child and asserts no-panic +
+  split-atomicity + key-order over 5000 interleavings each. Proven
+  non-vacuous: reverting the v7.2.2 re-check makes shuttle find the identical
+  `SplitEntries::get_key` out-of-bounds panic the benchmark hit. Production is
+  **byte-identical** — the node latch is the literal `parking_lot::RwLock`
+  under the default cfg (shuttle absent from the default dependency graph);
+  only the DST build swaps in the shuttle-instrumented wrapper. The
+  hand-over-hand `read_arc()` read-descent has no safe shuttle 0.9 equivalent
+  (an Arc-owning guard is self-referential and both crates are
+  `#![forbid(unsafe_code)]`), so the read/search cluster is
+  `#[cfg(not(noxu_shuttle))]`; the split/compress mutation path — the bug's
+  path — is what the gate covers. Testing-guide DST section and the DST
+  coverage map updated.
+
 ## [7.2.2] - 2026-07-02
 
 ### Fixed
