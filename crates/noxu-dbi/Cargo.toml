@@ -33,9 +33,22 @@ memmap2 = { workspace = true }
 # dependent crates (e.g. noxu-db).  Never enable this in production builds.
 testing = []
 
+# DST cursor coverage: only in the graph under `--cfg noxu_shuttle`.  Lets the
+# cursor's `db_impl` RwLock be scheduled by shuttle via the
+# noxu_util::dst_sync_pl seam (matching the already-seamed tree node latch), so
+# the reposition-vs-BIN-split race is deterministically explorable.  Default
+# builds never pull shuttle in.
+[target.'cfg(noxu_shuttle)'.dependencies]
+shuttle = { workspace = true }
+
 [dev-dependencies]
 proptest = { workspace = true }
 tempfile = "3"
+
+# DST cursor coverage: shuttle tests in tests/shuttle_*.rs are gated behind
+# `#![cfg(noxu_shuttle)]`, so these dev-deps only matter under that cfg.
+[target.'cfg(noxu_shuttle)'.dev-dependencies]
+shuttle = { workspace = true }
 
 [lints]
 workspace = true
