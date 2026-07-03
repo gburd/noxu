@@ -9,6 +9,10 @@ name = "noxu-saturation"
 path = "src/bin/saturation.rs"
 
 [[bin]]
+name = "noxu-write-sweep"
+path = "src/bin/write_sweep.rs"
+
+[[bin]]
 name = "noxu-workload-bench"
 path = "src/main.rs"
 [[bin]]
