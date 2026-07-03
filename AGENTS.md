@@ -131,6 +131,7 @@ make docs-serve   # Live-reload docs at http://localhost:3000
   |---|---|
   | `noxu-persist/tests/txn_threading_tests.rs` | edition-2024 `std::env::set_var` for debug-assert silencing. |
   | `benches/comparison/benches/comparison.rs` | LMDB / `heed` env open (external FFI). |
+  | `noxu-latch/src/dst_arc_guard.rs` (`#[cfg(noxu_shuttle)]`) | One `std::mem::transmute` extending a shuttle `RwLockReadGuard`'s borrow to `'static` for the tree's hand-over-hand `read_arc()` descent under DST. Sound by field-drop order (guard before the owning `Arc`), same pattern as `noxu-log`'s `FileHandleGuard`. Compiled only under `--cfg noxu_shuttle`; absent from every production build. |
 
   Every production `unsafe` block has a `// SAFETY: …` comment.
   `noxu-evictor::off_heap` was refactored to go through `memmap2`

@@ -11,7 +11,11 @@
 //! Under the cfg, the tree-node `RwLock` resolves (through
 //! `noxu_util::dst_sync_pl`, routed in `noxu-tree/src/tree.rs`) to a
 //! shuttle-instrumented lock, so shuttle's scheduler explores the
-//! `split_child` / merge-clear interleavings of the *real* split path.
+//! `split_child` / merge-clear interleavings of the *real* split path. The
+//! hand-over-hand `read_arc()` read descent is backed under shuttle by
+//! `noxu_latch::dst_arc_guard` (an Arc-owning read guard the
+//! `#![forbid(unsafe_code)]` tree/util crates cannot host themselves), so the
+//! *entire* tree — read and write paths — is schedulable.
 //!
 //! # The bug this gate closes
 //!
@@ -35,9 +39,11 @@
 //!
 //! The 96-thread saturation benchmark found this because DST could not: the
 //! tree used `parking_lot::RwLock` directly, so shuttle could not schedule the
-//! node-latch interleavings. Routing the node latch through the seam makes the
-//! split path schedulable; shuttle now drives the exact drop→reacquire race
-//! deterministically over thousands of interleavings.
+//! node-latch interleavings. Routing the node latch through the seam (with the
+//! hand-over-hand `read_arc()` descent backed under shuttle by
+//! `noxu_latch::dst_arc_guard`) makes the whole tree schedulable; shuttle now
+//! drives the exact drop→reacquire race deterministically over thousands of
+//! interleavings.
 //!
 //! # Not vacuous (the regression proof)
 //!
@@ -246,6 +252,53 @@ fn split_racing_merge_clear_never_panics() {
             assert_child_key_order(&child);
         },
         ITERATIONS,
+    );
+}
+
+/// Read descent (`search`, which uses the hand-over-hand `read_arc()` coupling
+/// backed under shuttle by `noxu_latch::dst_arc_guard`) racing a concurrent
+/// `insert`. This exercises the Arc-owning-guard shim at runtime and asserts
+/// the descent is safe under interleaving: no panic, and a key that was present
+/// before the race is always found (latch coupling means `search` never falls
+/// into the wrong half of a concurrent split). Fewer iterations — the descent
+/// is deeper, so schedules are larger.
+#[test]
+fn search_racing_insert_finds_present_key_no_panic() {
+    shuttle::check_random(
+        || {
+            const MAX: usize = 8;
+            let tree = Arc::new(build_level2_tree(MAX));
+            // A key that is definitely present after setup (k0000 is the
+            // smallest inserted key and is never deleted).
+            let present = b"k0000".to_vec();
+
+            let searcher = {
+                let tree = Arc::clone(&tree);
+                let present = present.clone();
+                shuttle::thread::spawn(move || {
+                    // Uses read_arc() hand-over-hand descent → the dst_arc_guard
+                    // shim. Must never panic and must find the present key.
+                    let sr = tree.search(&present);
+                    assert!(
+                        sr.map(|r| r.exact_parent_found).unwrap_or(false),
+                        "present key must be found during concurrent insert"
+                    );
+                })
+            };
+
+            let inserter = {
+                let tree = Arc::clone(&tree);
+                shuttle::thread::spawn(move || {
+                    // A fresh key that forces work in the same subtree.
+                    tree.insert(b"k0300".to_vec(), vec![9u8], Lsn::new(1, 300))
+                        .expect("concurrent insert");
+                })
+            };
+
+            searcher.join().unwrap();
+            inserter.join().unwrap();
+        },
+        ITERATIONS / 5,
     );
 }
 

@@ -35,6 +35,14 @@ pub use shared::{SharedLatch, SharedLatchReadGuard, SharedLatchWriteGuard};
 
 pub mod latch_order;
 
+// DST scaffolding (shuttle only): an Arc-owning read guard over the
+// `dst_sync_pl` shuttle RwLock, so noxu-tree's hand-over-hand `read_arc()`
+// descent compiles under `--cfg noxu_shuttle` without noxu-tree hosting the
+// (necessarily `unsafe`) self-referential guard itself.  Absent from every
+// production build.
+#[cfg(noxu_shuttle)]
+pub mod dst_arc_guard;
+
 use std::fmt;
 use std::time::Duration;
 

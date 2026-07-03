@@ -32,12 +32,11 @@ listed in [References](#references).
   **byte-identical** — the node latch is the literal `parking_lot::RwLock`
   under the default cfg (shuttle absent from the default dependency graph);
   only the DST build swaps in the shuttle-instrumented wrapper. The
-  hand-over-hand `read_arc()` read-descent has no safe shuttle 0.9 equivalent
-  (an Arc-owning guard is self-referential and both crates are
-  `#![forbid(unsafe_code)]`), so the read/search cluster is
-  `#[cfg(not(noxu_shuttle))]`; the split/compress mutation path — the bug's
-  path — is what the gate covers. Testing-guide DST section and the DST
-  coverage map updated.
+  hand-over-hand `read_arc()` read descent is backed under the cfg by a small
+  shuttle-only Arc-owning read guard in `noxu-latch` (`dst_arc_guard`, one
+  reviewed `transmute`, sound by field-drop order, compiled only under
+  `--cfg noxu_shuttle`), so the *entire* tree — read and write — is schedulable
+  under DST. Testing-guide DST section and the DST coverage map updated.
 
 ## [7.2.2] - 2026-07-02
 

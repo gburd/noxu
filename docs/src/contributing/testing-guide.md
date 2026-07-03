@@ -292,8 +292,7 @@ binary.
 | `lock_manager` deadlock detection (`shuttle_lock_manager.rs`) | **Green gate** (DST wave 2) | Routes the shard-table / waiter-graph `Mutex` and per-waiter grant `Condvar` through `noxu_util::dst_sync_pl`; drives the 50 ms re-detection slice via a `SimClock` (`LockManager::with_config_clock`). Asserts no-deadlock-undetected + victim-consistency (a two-lock cycle aborts exactly one victim) and no lost wakeup on grant (`WriteLocksExclusive`), mapped to `noxu-spec` `lock_manager_deadlock`. |
 | `log_buffer` segment pin/release | **Deferred** | The segment latch is a `noxu_sync::RawMutex` (`lock_api::RawMutex` shape); shuttle 0.9 exposes no `lock_api::RawMutex`, and the `RawMutex::INIT` const requirement blocks a clean wrapper. The segment's other concurrency is raw-pointer `unsafe` shuttle would not schedule. Deferred until a raw-lock-over-shuttle shim is scheduled. |
 | `SHARED_CACHE` evictor register / deregister / evict (`shuttle_shared_cache.rs`) | **Green gate** | The cross-environment shared-cache registry interleavings are scheduled through the seam. |
-| **B-tree `split_child` / `compress_node` (`shuttle_bin_split.rs`)** | **Green gate** (DST tree coverage) | Routes the tree-node latch through `noxu_util::dst_sync_pl` under the cfg (production stays byte-identical `parking_lot::RwLock`). shuttle races `split_child` against an INCompressor-style merge-clear (and two concurrent splitters) on ONE shared child — the drop→reacquire check-then-act window that let the BIN-split bug (`bug-bin-split-concurrency.md`) escape into a 96-thread benchmark instead of DST. Asserts no-panic + split-atomicity + key-order, mapped to `noxu-spec` `btree_latching` (`AtMostOneSplit` / `NoLostWrites`). **Not vacuous:** reverting the v7.2.2 re-check makes shuttle find the `SplitEntries::get_key` out-of-bounds panic — the identical benchmark symptom. |
-| B-tree read/search descent | **Deferred** | The hand-over-hand `read_arc()` latch coupling returns `parking_lot::ArcRwLockReadGuard` (an Arc-owning guard). shuttle 0.9's `RwLockReadGuard` borrows the lock; an Arc-owning wrapper is self-referential and needs `unsafe`, which `noxu-tree`/`noxu-util` `#![forbid(unsafe_code)]` disallow. The 21-method read/search cluster is `#[cfg(not(noxu_shuttle))]`; the split/compress **mutation** path (the bug's path) uses plain `.read()`/`.write()` and **is** covered. |
+| **B-tree `split_child` / `compress_node` (`shuttle_bin_split.rs`)** | **Green gate** (DST tree coverage) | Routes the tree-node latch through `noxu_util::dst_sync_pl` under the cfg (production stays byte-identical `parking_lot::RwLock`); the hand-over-hand `read_arc()` descent is backed under the cfg by `noxu_latch::dst_arc_guard` (an Arc-owning read guard the `#![forbid(unsafe_code)]` tree/util crates cannot host), so the whole tree is schedulable. shuttle races `split_child` against an INCompressor-style merge-clear (and two concurrent splitters) on ONE shared child — the drop→reacquire check-then-act window that let the BIN-split bug (`bug-bin-split-concurrency.md`) escape into a 96-thread benchmark instead of DST. Asserts no-panic + split-atomicity + key-order, mapped to `noxu-spec` `btree_latching` (`AtMostOneSplit` / `NoLostWrites`). **Not vacuous:** reverting the v7.2.2 re-check makes shuttle find the `SplitEntries::get_key` out-of-bounds panic — the identical benchmark symptom. |
 
 > shuttle surfaced two real, latent lost-wakeups masked in production by
 > timeouts, both now **fixed**. The `DaemonManager` one (a missing
@@ -342,16 +341,16 @@ cannot model (shuttle instruments `shuttle::sync` + `shuttle::thread`, not the
 tokio runtime). Rep's async loops are covered by tokio-level tests and by
 `noxu-spec` protocol models instead.
 
-Against that scope: **6 protocols are gated** (the table above), **2 are
+Against that scope: **6 protocols are gated** (the table above), **1 is
 hard-blocked by shuttle 0.9** (`log_buffer`'s `lock_api::RawMutex` segment
-latch, and the B-tree `read_arc()` Arc-owning descent guard — neither has a
-safe shuttle 0.9 shape), and **4 are sequenced follow-ups** (cursor
-concurrency, txn commit/abort, recovery-vs-mutation, rep sync state machines),
-all now tractable because the tree node latch is seamable. The one gap that
-mattered most — the BIN-split check-then-act race that a benchmark had to
-catch instead of DST — is closed by `shuttle_bin_split.rs`. Maintainers with
-the local `.agent/archived-audits/dst-coverage-map.md` (gitignored) have the
-full per-subsystem breakdown.
+latch has no safe shuttle 0.9 shape), and **4 are sequenced follow-ups**
+(cursor concurrency, txn commit/abort, recovery-vs-mutation, rep sync state
+machines), all now tractable because the entire tree — read and write — is
+seamable. The one gap that mattered most — the BIN-split check-then-act race
+that a benchmark had to catch instead of DST — is closed by
+`shuttle_bin_split.rs`. Maintainers with the local
+`.agent/archived-audits/dst-coverage-map.md` (gitignored) have the full
+per-subsystem breakdown.
 
 ### DST Milestone 1.1 — clock thread-through + parking_lot-over-shuttle
 
