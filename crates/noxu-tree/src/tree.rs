@@ -5142,6 +5142,71 @@ impl Tree {
         Self::compress_node(&root, self.max_entries_per_node);
     }
 
+    // ── DST BIN-split gate shims (shuttle-only) ─────────────────────────────
+    //
+    // These expose the private split / merge-clear primitives so the shuttle
+    // harness (`crates/noxu-tree/tests/shuttle_bin_split.rs`) can race them on
+    // ONE shared child — the exact check-then-act interleaving that let the
+    // BIN-split bug (`.agent/archived-audits/bench/
+    // bug-bin-split-concurrency.md`) escape into a 96-thread benchmark instead
+    // of DST.  Compiled ONLY under `--cfg noxu_shuttle`; production never sees
+    // them (zero change, verified by `cargo tree`).
+
+    /// The node capacity / split-and-merge threshold for this tree.
+    #[cfg(noxu_shuttle)]
+    pub fn shuttle_max_entries(&self) -> usize {
+        self.max_entries_per_node
+    }
+
+    /// Drive `split_child(parent, child_index)` with default (no-comparator,
+    /// no-prefix, no-listener) parameters — the same call the insert path
+    /// makes after it has dropped the parent read lock (the drop→reacquire
+    /// window where the race opens).
+    #[cfg(noxu_shuttle)]
+    pub fn shuttle_split_child(
+        parent: &Arc<RwLock<TreeNode>>,
+        child_index: usize,
+        max_entries: usize,
+        insert_key: &[u8],
+    ) -> Result<(), TreeError> {
+        Self::split_child(
+            parent,
+            child_index,
+            max_entries,
+            Lsn::new(1, 999),
+            SplitHint::Normal,
+            insert_key,
+            None,  // no comparator
+            false, // key_prefixing off
+            None,  // no InListListener
+        )
+    }
+
+    /// Simulate the racing INCompressor merge that CLEARS a child in place
+    /// (`compress_node`'s `entries.clear()` on the merged-away left sibling),
+    /// under the child's write lock — the stale state a second `split_child`
+    /// observes after the caller's fullness check was already passed under the
+    /// now-dropped parent read lock.  Returns the entry count observed BEFORE
+    /// clearing (so the harness can assert it raced a still-full child).
+    #[cfg(noxu_shuttle)]
+    pub fn shuttle_clear_child(child_arc: &Arc<RwLock<TreeNode>>) -> usize {
+        let mut cg = child_arc.write();
+        let before = cg.get_n_entries();
+        match &mut *cg {
+            TreeNode::Bottom(b) => {
+                b.entries.clear();
+                b.lsn_rep = LsnRep::Empty;
+                b.keys = KeyRep::new();
+            }
+            TreeNode::Internal(n) => {
+                n.entries.clear();
+                n.lsn_rep = LsnRep::Empty;
+                n.targets = TargetRep::None;
+            }
+        }
+        before
+    }
+
     /// Recursive post-order compress helper.
     ///
     /// Visits children first (post-order), then scans adjacent child
