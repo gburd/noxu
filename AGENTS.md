@@ -295,3 +295,5 @@ docs/src/
 ├── maintainer/             ← project history, algorithms, design decisions
 └── internal/               ← design reviews, audit reports, research
 ```
+
+See .agent-steering-domains.md for domain-specific steering (local).
