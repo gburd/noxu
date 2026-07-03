@@ -539,15 +539,20 @@ pub static LOG_FSYNC_TIME_LIMIT: ConfigParam = ConfigParam {
     for_replication: false,
 };
 
-/// Interval for group commit batching. 0 = no group commit.
-/// Maximum milliseconds the leader waits for more concurrent committers
-/// before issuing fdatasync.  Default 1 ms — enough to batch 4+ writers on
-/// fast NVMe without penalising single-threaded workloads (the grpc_wait
-/// short-circuits when no waiters are queued).
+/// Interval for group commit batching. 0 = no group commit (default).
+///
+/// JE faithfulness: `EnvironmentParams.LOG_GROUP_COMMIT_INTERVAL` defaults to
+/// `0 ns` (`grpWaitOn = false`) and the extended-fork `FSyncManager`
+/// (`kvmain/.../log/FSyncManager.java`) removed the leader wait entirely —
+/// coalescing is achieved purely by the leader/waiter piggyback during the
+/// fsync I/O window, which self-tunes to load (the batch window IS the fsync
+/// duration).  A non-zero interval only adds commit latency without improving
+/// the batch factor under real concurrency, so the default matches the
+/// reference: no wait.
 pub static LOG_GROUP_COMMIT_INTERVAL: ConfigParam = ConfigParam {
     name: "noxu.log.groupCommitInterval",
     param_type: crate::param::ParamType::Duration,
-    default: ParamValue::Duration(Duration::from_millis(1)),
+    default: ParamValue::Duration(Duration::ZERO),
     min: Some(ParamValue::Duration(Duration::ZERO)),
     max: Some(ParamValue::Duration(Duration::from_secs(75 * 60))),
     mutable: false,
@@ -555,13 +560,16 @@ pub static LOG_GROUP_COMMIT_INTERVAL: ConfigParam = ConfigParam {
 };
 
 /// Minimum number of queued committers before the leader fsyncs immediately
-/// (skipping the interval wait).  Default 4 — under high concurrency, once
-/// 4 threads are waiting the leader fsyncs without further delay.
+/// (skipping the interval wait).  Default 0 = disabled (JE
+/// `LOG_GROUP_COMMIT_THRESHOLD` default), matching the reference pure-piggyback
+/// design.  Group-commit waiting is active only when BOTH this and the
+/// interval are non-zero (`grpWaitOn`), an opt-in for callers who want to
+/// trade latency for a larger forced batch.
 pub static LOG_GROUP_COMMIT_THRESHOLD: ConfigParam = ConfigParam::int_param(
     "noxu.log.groupCommitThreshold",
     Some(0), // min
     None,    // max
-    4,       // default
+    0,       // default
     false,   // mutable
     false,   // forReplication
 );

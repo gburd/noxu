@@ -15,6 +15,39 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Performance
+
+- **Group-commit coalescing: restore the JE / extended-fork pure-piggyback
+  default (write-throughput parity).** The default `LOG_GROUP_COMMIT_INTERVAL`
+  and `LOG_GROUP_COMMIT_THRESHOLD` are reset to `0`/`0` (`grpWaitOn = false`),
+  matching JE's `EnvironmentParams` defaults and the extended-fork
+  `FSyncManager`, which removed the leader wait entirely. A prior change had
+  set them to `1 ms`/`4` ("enable group commit by default"); on a
+  high-core-count host that 1 ms leader wait **caps the fsync rate** (each
+  leader parks up to 1 ms before syncing) so the fsync/s ceiling holds the
+  batch factor small — the AWS 96-writer sweep measured ~9,400 writes/s at
+  ~750 fsync/s (~12 commits/fsync) while JE sustained ~187,000 writes/s
+  (~250 commits/fsync) on the same idle NVMe. With no leader wait, coalescing
+  is driven purely by the leader/waiter piggyback: concurrent committers pile
+  into `nextFSyncWaiters` *during* the in-flight leader's fsync, and the next
+  leader serves the whole accumulated cohort in one fsync — a batch window
+  that self-tunes to load (the window IS the fsync duration) with no added
+  commit latency. JE cite: `LogManager.log` calls `grpManager.flushAndSync`
+  unconditionally per commit (no `flushTo`-style skip in the core), and
+  `FSyncManager.flushAndSync`'s doWork block drains + fsyncs OUTSIDE
+  `mgrMutex`; the extended-fork `kvmain/.../log/FSyncManager.java` deletes the
+  `grpcThreshold`/`grpcInterval`/`startNextWait`/`mgrMutex.wait` block
+  altogether. Users who want a forced larger batch (trading latency) can still
+  opt in via `EnvironmentConfig::with_log_group_commit(threshold, interval_ms)`.
+  New regression guard `noxu-log` `fsync_manager::tests::
+  test_coalescing_factor_under_slow_fsync` reproduces the fsync-bound regime on
+  any core count (slow leader fsync + 32 concurrent committers) and asserts the
+  piggyback coalesces many committers per fsync (measured ~12x locally); a
+  collapse to per-committer fsync would drop the factor to ~1 and fail the
+  test. Durability is unchanged: every committer's bytes are covered by a real
+  fdatasync before its commit returns `Ok` (the `DurableImpliesLogged`
+  invariant the `shuttle_fsync_manager` oracle checks).
+
 ### Added
 
 - **DST txn + cursor coverage: shuttle gates for the txn commit/abort and

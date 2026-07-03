@@ -13,6 +13,10 @@ name = "noxu-write-sweep"
 path = "src/bin/write_sweep.rs"
 
 [[bin]]
+name = "noxu-coalesce-probe"
+path = "src/bin/coalesce_probe.rs"
+
+[[bin]]
 name = "noxu-workload-bench"
 path = "src/main.rs"
 [[bin]]
