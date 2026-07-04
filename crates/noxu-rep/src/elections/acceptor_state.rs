@@ -37,8 +37,16 @@
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+// DST rep-sync coverage: route the acceptor's `Mutex` and atomics through the
+// `noxu_util::dst_sync` seam so a shuttle gate can schedule concurrent
+// `try_promise`/`try_accept` (the Paxos vote-tally state machine).  Under the
+// default cfg these are transparent re-exports of `std::sync`, so production
+// is byte-identical and shuttle is absent from the dependency graph.  The
+// `flush_lock` serialises the load-modify-flush cycle across acceptor threads;
+// under shuttle (in-memory mode) `flush_locked` is a no-op, so no real file I/O
+// runs on the cooperative scheduler.
+use noxu_util::dst_sync::Mutex;
+use noxu_util::dst_sync::atomic::{AtomicU64, Ordering};
 
 const MAGIC: &[u8; 4] = b"PXST";
 const VERSION: u16 = 1;

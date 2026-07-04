@@ -5169,6 +5169,123 @@ impl Tree {
         before
     }
 
+    /// Drive one checkpoint dirty-BIN flush pass over this tree, faithful to
+    /// the lock/dirty sequence in `noxu_recovery::Checkpointer::
+    /// flush_one_tree_bins` — MINUS the WAL write, which needs a `LogManager`
+    /// this pure-tree shuttle harness does not build.
+    ///
+    /// The sequence this preserves (the part shuttle must schedule against a
+    /// concurrent insert):
+    ///   1. `collect_dirty_bins(db_id)` under a tree/node READ lock — the
+    ///      snapshot of dirty BIN `Arc`s at checkpoint start.
+    ///   2. per BIN: take the node WRITE lock; apply the JE X-8 early-exit
+    ///      guard (`!b.dirty && dirty_count()==0` → skip a node an evictor or
+    ///      a racing pass already flushed+cleared); otherwise "log" it by
+    ///      snapshotting its keys and calling `clear_dirty_after_full_log`
+    ///      (the real `flush_one_tree_bins` full-BIN path, sans the
+    ///      `lm.log(BIN, …)` between `serialize_full()` and
+    ///      `clear_dirty_after_full_log`).
+    ///
+    /// Returns the set of full keys captured in the flush (the keys present in
+    /// each BIN at the instant it was write-locked and cleared) — i.e. the
+    /// keys this checkpoint made durable.  A shuttle harness races this against
+    /// a concurrent insert and asserts the lost-dirty-node invariant: every
+    /// inserted key is either in this captured set (flushed) OR still dirty in
+    /// the tree afterwards (reflushed by the next checkpoint) — never silently
+    /// clean-but-unflushed.
+    ///
+    /// The whole BIN mutation-and-clear runs under the SAME node write lock a
+    /// concurrent `insert` takes, so the flush and the insert serialise on
+    /// that latch; the capture-then-clear is atomic w.r.t. a racing insert on
+    /// the same BIN.  This is exactly why JE's checkpoint is consistent: the
+    /// per-IN latch, not a global one, orders the snapshot-clear against
+    /// concurrent tree mutation.
+    #[cfg(noxu_shuttle)]
+    pub fn shuttle_checkpoint_flush_bins(&self, db_id: u64) -> Vec<Vec<u8>> {
+        // Step 1: snapshot dirty BINs under the read path (same call the
+        // checkpointer makes).
+        let dirty_bins = self.collect_dirty_bins(db_id);
+        let mut captured: Vec<Vec<u8>> = Vec::new();
+
+        // Step 2: per-BIN write-lock, X-8 guard, capture keys, clear dirty.
+        for (_node_db_id, bin_arc) in dirty_bins {
+            let mut bin_guard = bin_arc.write();
+            let b = match &mut *bin_guard {
+                TreeNode::Bottom(b) => b,
+                _ => continue,
+            };
+            let dirty = b.dirty_count();
+            // JE X-8 early exit: a node already flushed+cleared between the
+            // snapshot and this write-lock acquisition.
+            if !b.dirty && dirty == 0 {
+                continue;
+            }
+            // "Full BIN" path: capture every key (what serialize_full would
+            // have written to the WAL) BEFORE clearing dirty — atomic under
+            // the node write lock.
+            for i in 0..b.entries.len() {
+                if let Some(k) = b.get_full_key(i) {
+                    captured.push(k);
+                }
+            }
+            b.clear_dirty_after_full_log(Lsn::new(1, 1));
+        }
+        captured
+    }
+
+    /// Snapshot every full key currently present in the tree together with
+    /// whether it would be reflushed by the next checkpoint — i.e. whether its
+    /// slot is dirty OR its containing BIN is dirty.  A key that is present but
+    /// NOT dirty (slot clean AND BIN clean) has been captured by a checkpoint
+    /// full-log; a key that is present AND dirty will be picked up by the next
+    /// `collect_dirty_bins` pass.
+    ///
+    /// The shuttle recovery-vs-mutation gate uses this to assert the
+    /// LOST-DIRTY-NODE invariant: every concurrently-inserted key is EITHER in
+    /// the checkpoint's captured set OR still dirty here — never present but
+    /// silently clean-yet-unflushed (the lost-dirty-node bug, where a
+    /// checkpoint clears the dirty flag without having captured the slot).
+    ///
+    /// Walks under READ locks only (no mutation), reusing the same recursive
+    /// descent shape as `collect_dirty_bins`.
+    #[cfg(noxu_shuttle)]
+    pub fn shuttle_key_dirty_states(&self) -> Vec<(Vec<u8>, bool)> {
+        let mut out: Vec<(Vec<u8>, bool)> = Vec::new();
+        if let Some(root) = self.get_root() {
+            Self::shuttle_key_dirty_states_recursive(&root, &mut out);
+        }
+        out
+    }
+
+    #[cfg(noxu_shuttle)]
+    fn shuttle_key_dirty_states_recursive(
+        node_arc: &Arc<RwLock<TreeNode>>,
+        out: &mut Vec<(Vec<u8>, bool)>,
+    ) {
+        let guard = node_arc.read();
+        match &*guard {
+            TreeNode::Bottom(b) => {
+                let bin_dirty = b.dirty;
+                for i in 0..b.entries.len() {
+                    if let Some(k) = b.get_full_key(i) {
+                        // Reflushed next checkpoint iff the slot is dirty or
+                        // the whole BIN is dirty.
+                        let dirty = bin_dirty || b.entries[i].dirty;
+                        out.push((k, dirty));
+                    }
+                }
+            }
+            TreeNode::Internal(n) => {
+                let children: Vec<Arc<RwLock<TreeNode>>> =
+                    n.resident_children();
+                drop(guard);
+                for child in children {
+                    Self::shuttle_key_dirty_states_recursive(&child, out);
+                }
+            }
+        }
+    }
+
     /// Recursive post-order compress helper.
     ///
     /// Visits children first (post-order), then scans adjacent child

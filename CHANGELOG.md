@@ -118,7 +118,70 @@ listed in [References](#references).
 
 ### Added
 
-- **DST txn + cursor coverage: shuttle gates for the txn commit/abort and
+- **DST rep-sync coverage: a shuttle gate for the replication SYNC state
+  machines (VLSN index + Paxos acceptor vote tally).** New gate
+  `noxu-rep/tests/shuttle_rep_sync.rs`. rep's async feeder/network/election-I/O
+  loops are tokio and remain OUT of shuttle scope (covered by tokio-level
+  integration tests + `noxu-spec` protocol models); the SYNC state machines
+  use blocking primitives and ARE shuttle-schedulable:
+  - **VLSN index** (`vlsn/vlsn_index.rs`): the two `RwLock`s route through
+    `noxu_util::dst_sync_pl`. shuttle races two writers (disjoint VLSN ranges)
+    against a reader; asserts **monotonic-latest** (`get_latest_vlsn` == max
+    inserted), **no-lost-mapping** (every inserted VLSN resolves via `get_lsn`,
+    stride boundaries to their exact `(file, offset)`), and **no-torn-range**
+    (`first <= last` at every read). Mapped to `noxu-spec` `vlsn_streaming`.
+    Non-vacuous: removing the `buckets.sort_unstable_by_key` makes shuttle find
+    a lost/corrupt mapping (the `partition_point` search returns the wrong
+    bucket).
+  - **Paxos acceptor** (`elections/acceptor_state.rs`,
+    `PersistentAcceptorState`): the `Mutex` (`flush_lock`, `accepted_master`)
+    and atomics route through `noxu_util::dst_sync`; used in `in_memory()` mode
+    (no real file I/O on the cooperative scheduler). shuttle races proposers at
+    distinct terms through `try_promise`/`try_accept`; asserts
+    **PromiseHonoured** (`accepted_term <= promised_term`), promise-monotone,
+    and accept-implies-promise self-consistency. Mapped to `noxu-spec`
+    `flexible_paxos`. Non-vacuous: removing the `flush_lock` coarse-lock makes
+    shuttle find a torn load-modify-store (`accepted_term > promised_term`).
+    The gate also surfaced a **fidelity note** (recorded in the archived
+    audits): `PersistentAcceptorState` tracks the ballot as a bare `u64` term
+    (not the full JE `Proposal`), so a same-term-different-master race is
+    outside its tracked state; the gate models valid (distinct-term) executions
+    and does not assert the single-acceptor two-master property — see the audit
+    note for the design decision (restore full-proposal fidelity vs. prove
+    one-proposer-per-term upstream). Production is **byte-identical** (all
+    seams are transparent `noxu_sync`/`std::sync` re-exports under the default
+    cfg; shuttle absent from the default `cargo tree`). To keep noxu-db
+    building under the cfg (it is a rep dev-dep and constructs cursors), the
+    `Arc<RwLock<DatabaseImpl>>` seam was extended from `CursorImpl` back through
+    `noxu-dbi::EnvironmentImpl` and `noxu-db`'s `Database`/`Transaction`
+    (import swaps only, no logic change). This closes the replication-sync
+    "Future" gap in the DST coverage map.
+
+- **DST recovery coverage: a shuttle gate for the checkpoint-vs-mutation
+  (lost-dirty-node) race.** New gate
+  `noxu-tree/tests/shuttle_checkpoint_mutation.rs` races the checkpointer's
+  dirty-BIN flush pass — modelled by `Tree::shuttle_checkpoint_flush_bins`, a
+  faithful copy of `noxu_recovery::Checkpointer::flush_one_tree_bins`'s
+  full-BIN path (`collect_dirty_bins` snapshot under a read lock, then per-BIN
+  write-lock + JE X-8 early-exit guard + capture-keys + `clear_dirty_after_
+  full_log`), sans the `LogManager` WAL write this pure-tree harness cannot
+  build — against concurrent inserts that dirty and split the same BINs. The
+  flush and the insert serialise on the per-BIN node write lock (JE's per-IN
+  latch ordering, not a global one). Asserts the **lost-dirty-node** invariant:
+  every concurrently-inserted key is EITHER in the checkpoint's captured
+  (durable) set OR still dirty in the tree (reflushed by the next checkpoint) —
+  never silently clean-but-unflushed. Also asserts no-panic (no half-flushed
+  split) and per-BIN key order, and — in a second test — that two consecutive
+  checkpoints converge (a key dirtied during checkpoint N is captured by N+1;
+  nothing stays dirty forever). Mapped to the `noxu-spec` recovery/checkpoint
+  durability invariants. Proven **non-vacuous**: breaking flush atomicity
+  (clearing the dirty flag WITHOUT first capturing the slot's keys) makes
+  shuttle find a clean-but-unflushed key (seed `4701725966304036809`, key
+  `k0000a`). Production is **byte-identical** — the flush helper and the
+  `shuttle_key_dirty_states` inspector are `#[cfg(noxu_shuttle)]`, absent from
+  the default dependency graph. This closes the recovery-vs-mutation
+  "Future" gap in the DST coverage map.
+
   cursor-reposition races.** Two of the four remaining "Future" gaps in the
   DST coverage map are now closed, both proven non-vacuous.
   - **`TxnManager` begin/commit/abort** (`noxu-txn/tests/shuttle_txn_commit.rs`).

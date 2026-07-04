@@ -710,7 +710,10 @@ impl Transaction {
                 use std::collections::HashMap;
                 let mut db_handles: HashMap<
                     i64,
-                    Arc<noxu_sync::RwLock<noxu_dbi::DatabaseImpl>>,
+                    // DST: matches `get_database_by_id`'s seam-typed return
+                    // (`noxu_util::dst_sync_pl::RwLock` == `noxu_sync::RwLock`
+                    // under the default cfg).
+                    Arc<noxu_util::dst_sync_pl::RwLock<noxu_dbi::DatabaseImpl>>,
                 > = HashMap::new();
                 for undo in &undo_records {
                     let db_id_raw = undo.database_id as i64;

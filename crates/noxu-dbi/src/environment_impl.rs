@@ -7,7 +7,15 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use bytes::BytesMut;
-use noxu_sync::RwLock;
+// DST: the `Arc<RwLock<DatabaseImpl>>` this env hands out (via `open_database`,
+// `get_database_impl`, `db_map`) is passed into `CursorImpl`, whose `db_impl`
+// RwLock routes through the `noxu_util::dst_sync_pl` seam (cursor shuttle
+// gate). Route this env's RwLock-typed fields through the SAME seam so the
+// types match under `--cfg noxu_shuttle`. Under the default cfg
+// `dst_sync_pl::RwLock` *is* `noxu_sync::RwLock` (transparent re-export), so
+// production is byte-identical. (The B-tree `Arc`s use `std::sync::RwLock`
+// explicitly and are unaffected.)
+use noxu_util::dst_sync_pl::RwLock;
 
 use crate::database_impl::DatabaseImpl;
 use crate::dbi_config::DbiEnvConfig;
