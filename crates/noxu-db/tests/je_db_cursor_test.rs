@@ -445,20 +445,24 @@ fn db_cursor_duplicate_test_duplicate_creation_backwards() {
 /// Walk the fixture; at every position `cursor.count()` must report
 /// `DUP_N_PER_KEY` (every primary has the same dup-set size).
 ///
-/// TODO(bug): on a multi-primary sorted-dup DB,
-/// `Cursor::count()` over-counts whenever the cursor is positioned past
-/// the first dup of the current primary.  Empirically count returns
-/// `DUP_N_PER_KEY + offset_within_primary` (e.g. for a 5-dup primary,
-/// position 0 returns 5, position 1 returns 6, ..., position 4 returns
-/// 9).  The `backward + 1 + forward` formula in
-/// `noxu_dbi::CursorImpl::count()` double-counts the original position
-/// because, after the PrevDup walk repositions scratch on the first
-/// dup, the subsequent NextDup walk re-traverses every dup including
-/// the original.  JE returns `N_DUPLICATE_PER_KEY` at every position.
+/// Regression (F6, je-fidelity-deep-audit-2026-07 / JE
+/// `CursorImpl.java` count-of-duplicates): on a multi-primary
+/// sorted-dup DB, `Cursor::count()` used to over-count whenever the
+/// cursor was positioned past the first dup of the current primary,
+/// returning `DUP_N_PER_KEY + offset_within_primary` (e.g. for a 5-dup
+/// primary, position 0 -> 5, position 1 -> 6, ..., position 4 -> 9).
+/// The old `backward + 1 + forward` formula in
+/// `noxu_dbi::CursorImpl::count()` double-counted: after the PrevDup
+/// walk repositioned scratch on the first dup, the subsequent NextDup
+/// walk re-traversed every dup including the original.  JE bounds the
+/// count to the current key's dup-range and returns `N_DUPLICATE_PER_KEY`
+/// at every position.
 ///
-/// Fixed in Wave 11-N (Bug 1): the count formula is now `forward + 1`
-/// after the backward walk repositions scratch on the first dup; see
-/// the 2026 review.
+/// Fixed: the count formula is `forward + 1` — walk backward to the
+/// first dup (uncounted, pure repositioning), then count the forward
+/// NextDup steps and add the starting position.  This test fails with
+/// the old formula (position #1 returns 6, not 5) and passes with the
+/// fix.
 #[test]
 fn db_cursor_duplicate_test_duplicate_count() {
     let (_dir, env, db) = open_dup_env_db();
@@ -489,20 +493,23 @@ fn db_cursor_duplicate_test_duplicate_count() {
 /// exactly `DUP_N_PER_KEY` data values come back in sorted order and the
 /// next `NextDup` returns NotFound (boundary at next primary).
 ///
-/// TODO(bug): on a multi-primary sorted-dup DB,
-/// `Get::Search` positions on the smallest dup of the requested
-/// primary, but the immediately-following `Get::NextDup` returns
+/// Regression (F7, je-fidelity-deep-audit-2026-07 / JE
+/// `CursorImpl.java` getNextDuplicate): on a multi-primary sorted-dup
+/// DB, `Get::Search` positions on the smallest dup of the requested
+/// primary, but the immediately-following `Get::NextDup` used to return
 /// NotFound for every primary except the lexicographically smallest.
-/// The single-primary version of this scenario is covered by
-/// `sorted_dup_test::test_dup_sorted_order` (which passes), confirming
-/// the bug is multi-primary specific.  JE returns the next dup until
-/// the dup-set is exhausted regardless of which primary was searched.
+/// The single-primary case (`sorted_dup_test::test_dup_sorted_order`)
+/// always passed, confirming the bug was multi-primary specific.  JE
+/// advances to the next dup WITHIN the current key's dup-set and
+/// returns NotFound only at the dup-set boundary, regardless of which
+/// primary was searched.
 ///
-/// Fixed in Wave 11-N (Bug 2): `CursorImpl::search_dup` now stores the
-/// real BIN slot index of the located dup (and pins the BIN) instead
-/// of the previous hard-coded `current_index = 0`, so the subsequent
-/// `retrieve_next` increments the right slot.  See
-/// the 2026 review.
+/// Fixed: `CursorImpl::search_dup` now stores the real BIN slot index
+/// of the located dup (and pins the BIN) instead of the previous
+/// hard-coded `current_index = 0`, so the subsequent `retrieve_next`
+/// increments the right slot.  This test walks NextDup for ALL six
+/// primaries; it fails when search_dup hard-codes index 0 and passes
+/// with the real-index fix.
 #[test]
 fn db_cursor_duplicate_test_get_next_dup() {
     let (_dir, env, db) = open_dup_env_db();

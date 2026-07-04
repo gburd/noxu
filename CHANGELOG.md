@@ -101,6 +101,40 @@ listed in [References](#references).
   `--cfg noxu_shuttle`), so the *entire* tree — read and write — is schedulable
   under DST. Testing-guide DST section and the DST coverage map updated.
 
+### Fixed
+
+- **JE-fidelity cursor regression coverage (F6 / F7 / F9,
+  je-fidelity-deep-audit-2026-07).** The three cursor findings were verified
+  against BDB-JE and confirmed already correct in the code; this change adds
+  the missing regression proof and removes stale, self-contradictory
+  `TODO(bug)` framing so the audit rows can be closed.
+  - **F6 — `Cursor::count()` on a multi-primary sorted-dup DB** (JE
+    `CursorImpl.java` count-of-duplicates). `count()` bounds the walk to the
+    current primary key's dup-range (`forward + 1` after repositioning
+    scratch on the first dup), so every position reports `DUP_N_PER_KEY`
+    rather than `DUP_N_PER_KEY + offset_within_primary`. The
+    `db_cursor_duplicate_test_duplicate_count` doc is rewritten from
+    `TODO(bug)` to a regression note; the test fails with the old
+    `backward + 1 + forward` formula (position #1 returns 6) and passes with
+    the fix.
+  - **F7 — `Get::NextDup` on a multi-primary sorted-dup DB** (JE
+    `CursorImpl.java` getNextDuplicate). `search_dup` stores the real BIN
+    slot index of the located dup instead of a hard-coded `0`, so `NextDup`
+    walks the dup-set for ANY primary, not just the lexicographically
+    smallest. `db_cursor_duplicate_test_get_next_dup` doc rewritten from
+    `TODO(bug)` to a regression note.
+  - **F9 — read-uncommitted (dirty-read) locker state check** (JE
+    `CursorImpl.java:3596-3597`: "Even for dirty-read (LockType.NONE) we must
+    call Locker.lock() since it checks the locker state"). `CursorImpl::lock_ln`
+    routes the read-uncommitted path through `Txn::lock(LockType::None)` —
+    which runs `check_state()` — before its early return, so a `MustAbort` /
+    `Aborted` locker doing a dirty read is rejected instead of being handed
+    uncommitted data. New cursor-path regression
+    `isolation_test::test_read_uncommitted_get_rejected_on_must_abort_locker`
+    forces the locker into `MustAbort` and asserts a dirty `get` errors; it
+    returns `Ok(true)` (dirty data) with the early-return reverted and errors
+    with the fix.
+
 ## [7.2.2] - 2026-07-02
 
 ### Fixed

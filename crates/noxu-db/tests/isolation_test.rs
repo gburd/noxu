@@ -129,6 +129,47 @@ fn test_dirty_read_prevented_under_all_isolation_levels() {
     let _ = status;
 }
 
+/// F9 (JE `CursorImpl.lockLN`, je-fidelity-deep-audit-2026-07): a
+/// read-uncommitted (dirty-read) cursor must still run the locker
+/// state check.  JE's `lockLN` at `CursorImpl.java:3596-3597` documents
+/// "Even for dirty-read (LockType.NONE) we must call Locker.lock() since
+/// it checks the locker state and may throw LockPreemptedException."
+///
+/// A locker in `MustAbort` state doing a dirty read must be rejected, not
+/// silently handed uncommitted data.  This exercises the cursor path
+/// (`CursorImpl::lock_ln` -> `Txn::lock(LockType::None)` -> `check_state`)
+/// end-to-end through the public API; the locker-level regression lives in
+/// `noxu-txn` (`test_txn4_lock_none_on_must_abort_returns_error`).
+#[test]
+fn test_read_uncommitted_get_rejected_on_must_abort_locker() {
+    let (_dir, env, db) = setup();
+    put_committed(&env, &db, b"key", b"v1");
+
+    let ru_config = TransactionConfig::read_uncommitted();
+    let txn = env.begin_transaction(Some(&ru_config)).unwrap();
+
+    // Force the underlying locker into MustAbort (as a deadlock victim or
+    // preempted txn would be).  `get_inner_txn` is #[doc(hidden)] test-only
+    // access to the locker state.
+    {
+        let inner = txn.get_inner_txn().expect("txnal cursor has inner txn");
+        inner.lock().unwrap().set_only_abortable();
+    }
+
+    // A dirty read on a MustAbort locker must error, not return dirty data.
+    let key = DatabaseEntry::from_bytes(b"key");
+    let mut out = DatabaseEntry::new();
+    let result = db.get_into(Some(&txn), &key, &mut out);
+    assert!(
+        result.is_err(),
+        "F9: read-uncommitted get on a MustAbort locker must be rejected \
+         (JE CursorImpl.lockLN calls Locker.lock even for dirty reads); \
+         got {result:?}",
+    );
+
+    let _ = txn.abort();
+}
+
 // ---------------------------------------------------------------------------
 // 2. Serializable: read lock prevents writer (no_wait mode)
 // ---------------------------------------------------------------------------
