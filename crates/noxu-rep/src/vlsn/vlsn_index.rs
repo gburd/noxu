@@ -14,7 +14,12 @@
 //! (Wave 11-E).
 
 use noxu_log::LogEntryType;
-use noxu_sync::RwLock;
+// DST rep-sync coverage: route the VLSN index's two `RwLock`s through the
+// `noxu_util::dst_sync_pl` seam so a shuttle gate can schedule concurrent
+// `put`/`get`/`range` calls.  Under the default cfg `dst_sync_pl::RwLock` *is*
+// `noxu_sync::RwLock` (transparent re-export), so production is byte-identical
+// and shuttle is absent from the dependency graph.
+use noxu_util::dst_sync_pl::RwLock;
 
 use super::vlsn_bucket::VlsnBucket;
 use super::vlsn_range::VlsnRange;

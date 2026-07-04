@@ -63,6 +63,15 @@ noxu-db = { path = "../noxu-db" }
 # in `tests/*.rs` (integration tests link against the published crate).
 noxu-rep = { path = ".", features = ["test-harness"] }
 
+# DST rep-sync coverage: the VLSN-index + Paxos-acceptor shuttle gate
+# (tests/shuttle_rep_sync.rs) is gated behind `#![cfg(noxu_shuttle)]`, so this
+# dev-dependency (and shuttle itself) is only pulled in under the cfg; the
+# default `cargo test` and every production build never see shuttle.  The
+# VLSN index's `RwLock` and the acceptor's `Mutex`/atomics resolve to the
+# shuttle-instrumented wrappers via `noxu_util::dst_sync{,_pl}` under the cfg.
+[target.'cfg(noxu_shuttle)'.dev-dependencies]
+shuttle = { workspace = true }
+
 [lints]
 workspace = true
 

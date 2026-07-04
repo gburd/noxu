@@ -25,8 +25,14 @@ use noxu_dbi::{
     ThroughputStats,
 };
 use noxu_log::LogManager;
-use noxu_sync::{Mutex, RwLock};
+use noxu_sync::Mutex;
+// DST: `db_impl` is passed into `CursorImpl`, whose `db_impl` RwLock routes
+// through the `noxu_util::dst_sync_pl` seam (cursor shuttle gate). To keep the
+// types matching under `--cfg noxu_shuttle`, `Database`'s RwLock-typed fields
+// use the same seam. Under the default cfg `dst_sync_pl::RwLock` *is*
+// `noxu_sync::RwLock` (transparent re-export), so production is byte-identical.
 use noxu_txn::{Durability, LockManager, TxnManager, UndoRecord};
+use noxu_util::dst_sync_pl::RwLock;
 use noxu_util::lsn::Lsn;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
