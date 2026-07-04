@@ -5233,6 +5233,59 @@ impl Tree {
         captured
     }
 
+    /// Snapshot every full key currently present in the tree together with
+    /// whether it would be reflushed by the next checkpoint — i.e. whether its
+    /// slot is dirty OR its containing BIN is dirty.  A key that is present but
+    /// NOT dirty (slot clean AND BIN clean) has been captured by a checkpoint
+    /// full-log; a key that is present AND dirty will be picked up by the next
+    /// `collect_dirty_bins` pass.
+    ///
+    /// The shuttle recovery-vs-mutation gate uses this to assert the
+    /// LOST-DIRTY-NODE invariant: every concurrently-inserted key is EITHER in
+    /// the checkpoint's captured set OR still dirty here — never present but
+    /// silently clean-yet-unflushed (the lost-dirty-node bug, where a
+    /// checkpoint clears the dirty flag without having captured the slot).
+    ///
+    /// Walks under READ locks only (no mutation), reusing the same recursive
+    /// descent shape as `collect_dirty_bins`.
+    #[cfg(noxu_shuttle)]
+    pub fn shuttle_key_dirty_states(&self) -> Vec<(Vec<u8>, bool)> {
+        let mut out: Vec<(Vec<u8>, bool)> = Vec::new();
+        if let Some(root) = self.get_root() {
+            Self::shuttle_key_dirty_states_recursive(&root, &mut out);
+        }
+        out
+    }
+
+    #[cfg(noxu_shuttle)]
+    fn shuttle_key_dirty_states_recursive(
+        node_arc: &Arc<RwLock<TreeNode>>,
+        out: &mut Vec<(Vec<u8>, bool)>,
+    ) {
+        let guard = node_arc.read();
+        match &*guard {
+            TreeNode::Bottom(b) => {
+                let bin_dirty = b.dirty;
+                for i in 0..b.entries.len() {
+                    if let Some(k) = b.get_full_key(i) {
+                        // Reflushed next checkpoint iff the slot is dirty or
+                        // the whole BIN is dirty.
+                        let dirty = bin_dirty || b.entries[i].dirty;
+                        out.push((k, dirty));
+                    }
+                }
+            }
+            TreeNode::Internal(n) => {
+                let children: Vec<Arc<RwLock<TreeNode>>> =
+                    n.resident_children();
+                drop(guard);
+                for child in children {
+                    Self::shuttle_key_dirty_states_recursive(&child, out);
+                }
+            }
+        }
+    }
+
     /// Recursive post-order compress helper.
     ///
     /// Visits children first (post-order), then scans adjacent child

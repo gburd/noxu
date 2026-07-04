@@ -118,7 +118,31 @@ listed in [References](#references).
 
 ### Added
 
-- **DST txn + cursor coverage: shuttle gates for the txn commit/abort and
+- **DST recovery coverage: a shuttle gate for the checkpoint-vs-mutation
+  (lost-dirty-node) race.** New gate
+  `noxu-tree/tests/shuttle_checkpoint_mutation.rs` races the checkpointer's
+  dirty-BIN flush pass — modelled by `Tree::shuttle_checkpoint_flush_bins`, a
+  faithful copy of `noxu_recovery::Checkpointer::flush_one_tree_bins`'s
+  full-BIN path (`collect_dirty_bins` snapshot under a read lock, then per-BIN
+  write-lock + JE X-8 early-exit guard + capture-keys + `clear_dirty_after_
+  full_log`), sans the `LogManager` WAL write this pure-tree harness cannot
+  build — against concurrent inserts that dirty and split the same BINs. The
+  flush and the insert serialise on the per-BIN node write lock (JE's per-IN
+  latch ordering, not a global one). Asserts the **lost-dirty-node** invariant:
+  every concurrently-inserted key is EITHER in the checkpoint's captured
+  (durable) set OR still dirty in the tree (reflushed by the next checkpoint) —
+  never silently clean-but-unflushed. Also asserts no-panic (no half-flushed
+  split) and per-BIN key order, and — in a second test — that two consecutive
+  checkpoints converge (a key dirtied during checkpoint N is captured by N+1;
+  nothing stays dirty forever). Mapped to the `noxu-spec` recovery/checkpoint
+  durability invariants. Proven **non-vacuous**: breaking flush atomicity
+  (clearing the dirty flag WITHOUT first capturing the slot's keys) makes
+  shuttle find a clean-but-unflushed key (seed `4701725966304036809`, key
+  `k0000a`). Production is **byte-identical** — the flush helper and the
+  `shuttle_key_dirty_states` inspector are `#[cfg(noxu_shuttle)]`, absent from
+  the default dependency graph. This closes the recovery-vs-mutation
+  "Future" gap in the DST coverage map.
+
   cursor-reposition races.** Two of the four remaining "Future" gaps in the
   DST coverage map are now closed, both proven non-vacuous.
   - **`TxnManager` begin/commit/abort** (`noxu-txn/tests/shuttle_txn_commit.rs`).
