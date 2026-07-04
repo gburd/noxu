@@ -17,6 +17,18 @@ listed in [References](#references).
 
 ### Fixed
 
+- **F12 companion — `RecoveryManager::find_last_checkpoint` no longer panics on
+  an orphan `CkptStart` (no matching `CkptEnd`).** With the F12 fix,
+  `EnvironmentImpl::close()` now writes a real final checkpoint
+  (`CkptStart … CkptEnd`) as JE does. A log truncated between that `CkptStart`
+  and its `CkptEnd` (crash-mid-checkpoint) leaves an orphan `CkptStart` with
+  `ckpt_end_lsn == NULL_LSN`; the tail scan then evaluated `pe.lsn > NULL_LSN`,
+  and `Lsn::cmp` panics on NULL_LSN comparisons ("invalid comparison"). Guarded
+  with an explicit `ckpt_end_lsn == NULL_LSN` short-circuit (first `CkptStart`
+  is the partial one when no `CkptEnd` was found). Latent pre-existing bug now
+  reachable via the more-faithful close path; covered by
+  `noxu-db` `stepwise_truncation_test::stepwise_truncation_basic_insert`.
+
 - **F13 — evictor now coordinates the `Provisional` flag with an in-progress
   checkpoint (recovery-race).** The evictor's provisional-decision logic
   (`Checkpointer::get_eviction_provisional`, per-tree `maxFlushLevel` lookup)

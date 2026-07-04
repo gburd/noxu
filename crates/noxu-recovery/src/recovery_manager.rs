@@ -1383,7 +1383,19 @@ impl RecoveryManager {
             match &pe.entry {
                 LogEntry::CkptStart(_)
                     if partial_start_lsn == NULL_LSN
-                        && pe.lsn > ckpt_end_lsn =>
+                        // F12 companion guard: when NO CkptEnd was found
+                        // `ckpt_end_lsn` is NULL_LSN, and the tail scan starts
+                        // from the log start, so the FIRST CkptStart is the
+                        // partial one.  `Lsn::cmp` rejects comparisons against
+                        // NULL_LSN (panics), so we must special-case it rather
+                        // than evaluate `pe.lsn > NULL_LSN`.  This case is now
+                        // reachable because `EnvironmentImpl::close()` writes a
+                        // real final checkpoint (F12); a log truncated between
+                        // that CkptStart and its CkptEnd (crash-mid-checkpoint,
+                        // which the stepwise-truncation recovery test
+                        // exercises) leaves an orphan CkptStart with no CkptEnd.
+                        && (ckpt_end_lsn == NULL_LSN
+                            || pe.lsn > ckpt_end_lsn) =>
                 {
                     // First CkptStart after the last CkptEnd is the partial one.
                     partial_start_lsn = pe.lsn;
