@@ -2764,7 +2764,58 @@ impl EnvironmentImpl {
         }
         *state = EnvState::Closing;
 
-        // Signal the evictor daemon to stop and wait for it to exit.
+        // F12: daemon shutdown ORDER faithful to JE `EnvironmentImpl.close()`
+        // (EnvironmentImpl.java:1873 `requestShutdownDaemons()` → final
+        // checkpoint → :1915 `shutdownDaemons()`).
+        //
+        // Phase 1 — REQUEST shutdown of the non-flush daemons before the final
+        // checkpoint.  JE comment (EnvironmentImpl.java:1870-1872): "Begin
+        // shutdown of the daemons before checkpointing.  Cleaning during the
+        // checkpoint is wasted and slows down the checkpoint."  The evictor and
+        // checkpointer stay ALIVE across the final checkpoint so its dirty-node
+        // flushes still happen.
+        self.in_compressor_shutdown.shutdown();
+        self.cleaner_shutdown.shutdown();
+        self.log_flush_no_sync_shutdown.shutdown();
+
+        // Final (forced) checkpoint before WAL sync so recovery can restart
+        // from the checkpoint rather than replaying the full log.
+        // `EnvironmentImpl.close()` calling
+        // `checkpointer.doCheckpoint(CheckpointConfig.FORCE)` — run while the
+        // evictor is still alive so any dirty BIN it holds is flushed (F12).
+        if let Some(ckpt) = &self.checkpointer {
+            let _ = ckpt.do_checkpoint("close");
+        }
+
+        // Phase 2 — JOIN daemons in JE `shutdownDaemons()` order
+        // (EnvironmentImpl.java:2328-2374):
+        //   inCompressor → cleaner → checkpointer → evictor → logFlusher.
+        // "Cleaner has to be shutdown before checkpointer because former calls
+        // the latter" and "The evictors have to be shutdown last because the
+        // other daemons might create changes to the memory usage which result
+        // in a notify to eviction."
+
+        // inCompressor (already signalled above).
+        if let Some(handle) = self.in_compressor_handle.lock().unwrap().take() {
+            let _ = handle.join();
+        }
+
+        // cleaner — joined before the checkpointer because the cleaner may
+        // request a checkpoint.
+        if let Some(handle) = self.cleaner_handle.lock().unwrap().take() {
+            let _ = handle.join();
+        }
+
+        // checkpointer — its final flush must complete before the evictor
+        // stops.
+        if let Some(ckpt) = &self.checkpointer {
+            ckpt.request_shutdown();
+        }
+        if let Some(handle) = self.checkpointer_handle.lock().unwrap().take() {
+            let _ = handle.join();
+        }
+
+        // evictor LAST so final dirty-node flushes still happen.
         //
         // SHARED_CACHE: for a shared env we must NOT call
         // `self.evictor.shutdown()` — that would stop the process-global
@@ -2783,40 +2834,12 @@ impl EnvironmentImpl {
             let _ = handle.join();
         }
 
-        // Signal the checkpointer daemon to stop and wait for it to exit.
-        if let Some(ckpt) = &self.checkpointer {
-            ckpt.request_shutdown();
-        }
-        if let Some(handle) = self.checkpointer_handle.lock().unwrap().take() {
-            let _ = handle.join();
-        }
-
-        // Signal the INCompressor daemon to stop and wait for it to exit.
-        self.in_compressor_shutdown.shutdown();
-        if let Some(handle) = self.in_compressor_handle.lock().unwrap().take() {
-            let _ = handle.join();
-        }
-
-        // Signal the cleaner daemon to stop and wait for it to exit.
-        self.cleaner_shutdown.shutdown();
-        if let Some(handle) = self.cleaner_handle.lock().unwrap().take() {
-            let _ = handle.join();
-        }
-
-        // X-11: Signal the log-flush-no-sync daemon to stop and join.
-        self.log_flush_no_sync_shutdown.shutdown();
+        // X-11: log-flush-no-sync daemon (already signalled above), joined last
+        // like JE's `logFlusher.shutdown()`.
         if let Some(handle) =
             self.log_flush_no_sync_handle.lock().unwrap().take()
         {
             let _ = handle.join();
-        }
-
-        // Final (forced) checkpoint before WAL sync so recovery can restart
-        // from the checkpoint rather than replaying the full log.
-        // `EnvironmentImpl.close()` calling
-        // `checkpointer.doCheckpoint(CheckpointConfig.FORCE)`.
-        if let Some(ckpt) = &self.checkpointer {
-            let _ = ckpt.do_checkpoint("close");
         }
 
         // Flush and fsync the WAL so no buffered data is lost on close.
@@ -2890,18 +2913,29 @@ impl Drop for EnvironmentImpl {
         // recoverable poison into a double-panic and aborts the whole process.
         // Every lock on the teardown path recovers the guard with into_inner().
         //
-        // Shut down the evictor daemon so its thread exits cleanly when the
-        // environment is dropped (e.g. in tests that don't call close()).
-        //
-        // SHARED_CACHE: deregister (not shutdown) so the shared daemon keeps
-        // serving other envs; the handle's own Drop is a further safety net.
-        if let Some(h) = &self.shared_evictor_handle {
-            h.deregister();
-        } else {
-            self.evictor.shutdown();
+        // F12: teardown join order faithful to JE `shutdownDaemons()`
+        // (EnvironmentImpl.java:2328-2374): inCompressor → cleaner →
+        // checkpointer → evictor.  Drop takes no final checkpoint (this is the
+        // test/no-close teardown path), but the JOIN ORDER still matters:
+        // "Cleaner has to be shutdown before checkpointer because former calls
+        // the latter" and the evictor is joined last so any dirty node other
+        // daemons touch on the way down can still be flushed.
+
+        // Shut down the INCompressor daemon thread.
+        self.in_compressor_shutdown.shutdown();
+        if let Some(handle) = self
+            .in_compressor_handle
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
+            let _ = handle.join();
         }
+
+        // Shut down the cleaner daemon thread (before the checkpointer).
+        self.cleaner_shutdown.shutdown();
         if let Some(handle) =
-            self.evictor_handle.lock().unwrap_or_else(|p| p.into_inner()).take()
+            self.cleaner_handle.lock().unwrap_or_else(|p| p.into_inner()).take()
         {
             let _ = handle.join();
         }
@@ -2919,21 +2953,18 @@ impl Drop for EnvironmentImpl {
             let _ = handle.join();
         }
 
-        // Shut down the INCompressor daemon thread.
-        self.in_compressor_shutdown.shutdown();
-        if let Some(handle) = self
-            .in_compressor_handle
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .take()
-        {
-            let _ = handle.join();
+        // Shut down the evictor daemon LAST so its thread exits cleanly and any
+        // final dirty node is still flushable while it is alive.
+        //
+        // SHARED_CACHE: deregister (not shutdown) so the shared daemon keeps
+        // serving other envs; the handle's own Drop is a further safety net.
+        if let Some(h) = &self.shared_evictor_handle {
+            h.deregister();
+        } else {
+            self.evictor.shutdown();
         }
-
-        // Shut down the cleaner daemon thread.
-        self.cleaner_shutdown.shutdown();
         if let Some(handle) =
-            self.cleaner_handle.lock().unwrap_or_else(|p| p.into_inner()).take()
+            self.evictor_handle.lock().unwrap_or_else(|p| p.into_inner()).take()
         {
             let _ = handle.join();
         }

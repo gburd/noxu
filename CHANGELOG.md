@@ -15,6 +15,30 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Fixed
+
+- **F12 — daemon shutdown ORDER on `Environment.close()` / drop now matches JE
+  (shutdown durability).** `EnvironmentImpl::close()` previously joined the
+  evictor FIRST and ran the final forced checkpoint AFTER every daemon was
+  already dead (evictor → checkpointer → inCompressor → cleaner → final
+  checkpoint), risking dropped final dirty-BIN flushes. It now follows JE
+  `EnvironmentImpl.close()` exactly: signal the non-flush daemons first
+  (`requestShutdownDaemons`, EnvironmentImpl.java:1873 — "Begin shutdown of the
+  daemons before checkpointing. Cleaning during the checkpoint is wasted and
+  slows down the checkpoint"), run the final forced checkpoint while the
+  evictor is still alive, then JOIN in `shutdownDaemons()` order
+  (EnvironmentImpl.java:2328-2374): inCompressor → cleaner → checkpointer →
+  evictor → logFlusher. The cleaner joins before the checkpointer because "the
+  former calls the latter"; the evictor joins LAST because "the other daemons
+  might create changes to the memory usage which result in a notify to
+  eviction." The `Drop` teardown path is reordered to the same
+  inCompressor → cleaner → checkpointer → evictor join sequence. The engine's
+  `DaemonManager::shutdown()` already had the correct order; the divergence was
+  only in the production `EnvironmentImpl` path. New regression test
+  `noxu-db` `f12_daemon_shutdown_flush_test` proves committed data survives a
+  clean close with the periodic checkpointer/evictor disabled and under active
+  eviction pressure. The `shuttle_daemon_shutdown` gate stays green.
+
 ### Performance
 
 - **Group-commit coalescing: restore the JE / extended-fork pure-piggyback
