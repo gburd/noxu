@@ -91,7 +91,7 @@ fn f12_dirty_bin_flushed_on_clean_close_with_daemons_off() {
         let env = open_env_no_periodic_flush(dir.path());
         let db = open_db(&env, "f12");
         for i in 0..NUM_RECS {
-            db.put(&ikey(i), &ival(i)).unwrap();
+            db.put(ikey(i), ival(i)).unwrap();
         }
         db.close().unwrap();
         // Clean close: runs the final forced checkpoint with the evictor still
@@ -147,7 +147,7 @@ fn f12_survives_close_under_eviction_pressure() {
         let env = noxu_db::Environment::open(cfg).unwrap();
         let db = open_db(&env, "f12ep");
         for i in 0..NUM_RECS {
-            db.put(&ikey(i), &ival(i)).unwrap();
+            db.put(ikey(i), ival(i)).unwrap();
         }
         db.close().unwrap();
         env.close().unwrap();
