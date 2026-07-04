@@ -15,6 +15,74 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Fixed
+
+- **F12 companion — `RecoveryManager::find_last_checkpoint` no longer panics on
+  an orphan `CkptStart` (no matching `CkptEnd`).** With the F12 fix,
+  `EnvironmentImpl::close()` now writes a real final checkpoint
+  (`CkptStart … CkptEnd`) as JE does. A log truncated between that `CkptStart`
+  and its `CkptEnd` (crash-mid-checkpoint) leaves an orphan `CkptStart` with
+  `ckpt_end_lsn == NULL_LSN`; the tail scan then evaluated `pe.lsn > NULL_LSN`,
+  and `Lsn::cmp` panics on NULL_LSN comparisons ("invalid comparison"). Guarded
+  with an explicit `ckpt_end_lsn == NULL_LSN` short-circuit (first `CkptStart`
+  is the partial one when no `CkptEnd` was found). Latent pre-existing bug now
+  reachable via the more-faithful close path; covered by
+  `noxu-db` `stepwise_truncation_test::stepwise_truncation_basic_insert`.
+
+- **F13 — evictor now coordinates the `Provisional` flag with an in-progress
+  checkpoint (recovery-race).** The evictor's provisional-decision logic
+  (`Checkpointer::get_eviction_provisional`, per-tree `maxFlushLevel` lookup)
+  and the evictor's call to it were already present, but the checkpointer was
+  **never wired into the production evictor**: the checkpointer is constructed
+  after the evictor in `EnvironmentImpl::new` (it needs the same tree +
+  LogManager), and the evictor's `checkpointer` slot had only a consuming
+  builder, so in production it stayed empty and every evicted dirty BIN was
+  logged `Provisional::No` regardless of an in-progress checkpoint — which can
+  cause a recovery mismatch when an eviction races a checkpoint (a BIN below
+  the checkpoint's max flush level must be logged `Provisional::Yes` so
+  recovery treats it as provisional until the checkpoint's own
+  non-provisional ancestor makes it durable). The evictor's `checkpointer`
+  field is now `RwLock<Option<Weak<Checkpointer>>>` with a post-construction
+  `Evictor::set_checkpointer`, wired in `EnvironmentImpl::new` after both the
+  evictor and checkpointer exist. The reference is **`Weak`** to break the
+  `Evictor -> Checkpointer -> LogManager -> FileManager` cycle that would
+  otherwise hold the on-disk env lock past teardown ("Environment locked" on
+  reopen) — the same rationale as the CLN-14 cleaner<->checkpointer wakeup
+  edge. JE ref: `Evictor.coordinateEvictionWithCheckpoint` ->
+  `Checkpointer.coordinateEvictionWithCheckpoint` ->
+  `DirtyINMap.coordinateEvictionWithCheckpoint` (DirtyINMap.java:103-164) /
+  `getHighestFlushLevel`. New tests:
+  `noxu-evictor` `test_f13_set_checkpointer_wires_after_arc` (post-`Arc`
+  wiring + Weak, no lock leak) and `noxu-db` `f13_evict_provisional_test`
+  (eviction racing periodic checkpoints recovers all committed data across a
+  reopen). SHARED_CACHE limitation: the process-global shared evictor is not
+  wired to any single env's checkpointer (each sharing env has its own
+  checkpointer + max-flush-level), so the shared-cache path retains the
+  always-`Provisional::No` behaviour — wiring it needs a cross-env
+  coordination design and is deferred.
+
+- **F12 — daemon shutdown ORDER on `Environment.close()` / drop now matches JE
+  (shutdown durability).** `EnvironmentImpl::close()` previously joined the
+  evictor FIRST and ran the final forced checkpoint AFTER every daemon was
+  already dead (evictor → checkpointer → inCompressor → cleaner → final
+  checkpoint), risking dropped final dirty-BIN flushes. It now follows JE
+  `EnvironmentImpl.close()` exactly: signal the non-flush daemons first
+  (`requestShutdownDaemons`, EnvironmentImpl.java:1873 — "Begin shutdown of the
+  daemons before checkpointing. Cleaning during the checkpoint is wasted and
+  slows down the checkpoint"), run the final forced checkpoint while the
+  evictor is still alive, then JOIN in `shutdownDaemons()` order
+  (EnvironmentImpl.java:2328-2374): inCompressor → cleaner → checkpointer →
+  evictor → logFlusher. The cleaner joins before the checkpointer because "the
+  former calls the latter"; the evictor joins LAST because "the other daemons
+  might create changes to the memory usage which result in a notify to
+  eviction." The `Drop` teardown path is reordered to the same
+  inCompressor → cleaner → checkpointer → evictor join sequence. The engine's
+  `DaemonManager::shutdown()` already had the correct order; the divergence was
+  only in the production `EnvironmentImpl` path. New regression test
+  `noxu-db` `f12_daemon_shutdown_flush_test` proves committed data survives a
+  clean close with the periodic checkpointer/evictor disabled and under active
+  eviction pressure. The `shuttle_daemon_shutdown` gate stays green.
+
 ### Performance
 
 - **Group-commit coalescing: restore the JE / extended-fork pure-piggyback
