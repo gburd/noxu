@@ -17,6 +17,38 @@ listed in [References](#references).
 
 ### Fixed
 
+- **F13 — evictor now coordinates the `Provisional` flag with an in-progress
+  checkpoint (recovery-race).** The evictor's provisional-decision logic
+  (`Checkpointer::get_eviction_provisional`, per-tree `maxFlushLevel` lookup)
+  and the evictor's call to it were already present, but the checkpointer was
+  **never wired into the production evictor**: the checkpointer is constructed
+  after the evictor in `EnvironmentImpl::new` (it needs the same tree +
+  LogManager), and the evictor's `checkpointer` slot had only a consuming
+  builder, so in production it stayed empty and every evicted dirty BIN was
+  logged `Provisional::No` regardless of an in-progress checkpoint — which can
+  cause a recovery mismatch when an eviction races a checkpoint (a BIN below
+  the checkpoint's max flush level must be logged `Provisional::Yes` so
+  recovery treats it as provisional until the checkpoint's own
+  non-provisional ancestor makes it durable). The evictor's `checkpointer`
+  field is now `RwLock<Option<Weak<Checkpointer>>>` with a post-construction
+  `Evictor::set_checkpointer`, wired in `EnvironmentImpl::new` after both the
+  evictor and checkpointer exist. The reference is **`Weak`** to break the
+  `Evictor -> Checkpointer -> LogManager -> FileManager` cycle that would
+  otherwise hold the on-disk env lock past teardown ("Environment locked" on
+  reopen) — the same rationale as the CLN-14 cleaner<->checkpointer wakeup
+  edge. JE ref: `Evictor.coordinateEvictionWithCheckpoint` ->
+  `Checkpointer.coordinateEvictionWithCheckpoint` ->
+  `DirtyINMap.coordinateEvictionWithCheckpoint` (DirtyINMap.java:103-164) /
+  `getHighestFlushLevel`. New tests:
+  `noxu-evictor` `test_f13_set_checkpointer_wires_after_arc` (post-`Arc`
+  wiring + Weak, no lock leak) and `noxu-db` `f13_evict_provisional_test`
+  (eviction racing periodic checkpoints recovers all committed data across a
+  reopen). SHARED_CACHE limitation: the process-global shared evictor is not
+  wired to any single env's checkpointer (each sharing env has its own
+  checkpointer + max-flush-level), so the shared-cache path retains the
+  always-`Provisional::No` behaviour — wiring it needs a cross-env
+  coordination design and is deferred.
+
 - **F12 — daemon shutdown ORDER on `Environment.close()` / drop now matches JE
   (shutdown durability).** `EnvironmentImpl::close()` previously joined the
   evictor FIRST and ran the final forced checkpoint AFTER every daemon was

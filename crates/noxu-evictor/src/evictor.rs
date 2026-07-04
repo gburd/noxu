@@ -262,13 +262,29 @@ pub struct Evictor {
     off_heap: Option<Arc<OffHeapCache>>,
     /// Optional checkpointer reference for CC-4: provisional-flag coordination.
     ///
-    /// When `Some`, `flush_dirty_node_to_log` queries the checkpointer's
+    /// When set, `flush_dirty_node_to_log` queries the checkpointer's
     /// `get_eviction_provisional` to decide whether to log the evicted BIN as
     /// `Provisional::Yes` (checkpoint in progress, node below max flush level)
     /// or `Provisional::No` (no checkpoint, or node at/above max flush level).
     ///
+    /// A **`Weak`** behind a `RwLock` for two reasons:
+    ///   * The checkpointer is constructed AFTER the evictor in
+    ///     `EnvironmentImpl::new` (it needs the tree + LogManager the evictor
+    ///     also uses), so it is wired post-construction via
+    ///     [`Evictor::set_checkpointer`] once the `Evictor` is already inside an
+    ///     `Arc` — hence the interior mutability.
+    ///   * The `Checkpointer` holds `Arc<LogManager>` + `Arc<RwLock<Tree>>`,
+    ///     and `EnvironmentImpl` holds `Arc<Evictor>`; a strong reference here
+    ///     would form an `Evictor -> Checkpointer -> LogManager -> FileManager`
+    ///     cycle that keeps the on-disk env lock held past teardown ("Environment
+    ///     locked" on reopen).  `Weak` breaks the cycle — same rationale as the
+    ///     CLN-14 cleaner<->checkpointer wakeup edge in `EnvironmentImpl::new`.
+    ///
+    /// Without this wire the field stays empty in production and the evictor
+    /// always logs `Provisional::No` (F13).
+    ///
     /// JE ref: `Checkpointer.coordinateEvictionWithCheckpoint` (CC-4 fix).
-    checkpointer: Option<Arc<Checkpointer>>,
+    checkpointer: RwLock<Option<std::sync::Weak<Checkpointer>>>,
 }
 
 impl Evictor {
@@ -312,7 +328,7 @@ impl Evictor {
             db_id: AtomicU64::new(0),
             db_trees_registry: RwLock::new(None),
             off_heap: None,
-            checkpointer: None,
+            checkpointer: RwLock::new(None),
         }
     }
 
@@ -339,7 +355,9 @@ impl Evictor {
             self.db_id.load(Ordering::Relaxed),
         )
         .with_opt_off_heap(self.off_heap)
-        .with_opt_checkpointer(self.checkpointer)
+        .with_opt_checkpointer(
+            self.checkpointer.into_inner().expect("evictor ckpt lock poisoned"),
+        )
     }
 
     /// Set only the scan-resistant policy to a different algorithm.
@@ -475,9 +493,28 @@ impl Evictor {
     /// `checkpointer.get_eviction_provisional(db_id, node_level)` to choose
     /// `Provisional::Yes` or `Provisional::No` for evicted BINs, matching JE
     /// `Checkpointer.coordinateEvictionWithCheckpoint` (per-tree lookup).
-    pub fn with_checkpointer(mut self, ckpt: Arc<Checkpointer>) -> Self {
-        self.checkpointer = Some(ckpt);
+    /// Wire a checkpointer (test/builder path).  Takes a `Weak` to avoid the
+    /// `Evictor -> Checkpointer -> LogManager` teardown cycle.
+    pub fn with_checkpointer(
+        self,
+        ckpt: std::sync::Weak<Checkpointer>,
+    ) -> Self {
+        self.set_checkpointer(ckpt);
         self
+    }
+
+    /// Wire a checkpointer AFTER construction (the production path).
+    ///
+    /// The checkpointer is built later than the evictor in
+    /// `EnvironmentImpl::new`, so it is installed here once the `Evictor` is
+    /// already inside an `Arc`.  Mirrors [`Evictor::set_db_trees_registry`].
+    /// Stores a **`Weak`** to break the `Evictor -> Checkpointer -> LogManager
+    /// -> FileManager` reference cycle (an `Arc` would keep the on-disk env
+    /// lock held past teardown).  Without this wire the evictor would always
+    /// log `Provisional::No` (F13).
+    pub fn set_checkpointer(&self, ckpt: std::sync::Weak<Checkpointer>) {
+        *self.checkpointer.write().expect("evictor ckpt lock poisoned") =
+            Some(ckpt);
     }
 
     // Internal helpers for `with_algorithm` reconstruction.
@@ -499,10 +536,10 @@ impl Evictor {
         self
     }
     fn with_opt_checkpointer(
-        mut self,
-        ckpt: Option<Arc<Checkpointer>>,
+        self,
+        ckpt: Option<std::sync::Weak<Checkpointer>>,
     ) -> Self {
-        self.checkpointer = ckpt;
+        *self.checkpointer.write().expect("evictor ckpt lock poisoned") = ckpt;
         self
     }
 
@@ -1187,9 +1224,16 @@ impl Evictor {
         // EVICTOR-RECLAIM-1: use the OWNING tree's db_id (resolved above), not
         // the primary slot's, so the BIN logs against the correct database.
         let db_id = owning_db_id;
+        // Upgrade the Weak checkpointer ref (see field docs: Weak breaks the
+        // Evictor -> Checkpointer -> LogManager teardown cycle).  A dropped
+        // checkpointer (env tearing down) yields Provisional::No, which is the
+        // safe default.
         let provisional = self
             .checkpointer
+            .read()
+            .expect("evictor ckpt lock poisoned")
             .as_ref()
+            .and_then(|w| w.upgrade())
             .map(|c| c.get_eviction_provisional(db_id, bin.level))
             .unwrap_or(Provisional::No);
 
@@ -3264,19 +3308,84 @@ mod tests {
             100,
             false,
         )
-        .with_checkpointer(Arc::clone(&ckpt));
+        .with_checkpointer(Arc::downgrade(&ckpt));
 
-        // Verify the evictor holds the checkpointer: Arc strong count is 2
-        // (ckpt + evictor's internal reference).
+        // Verify the evictor holds a WEAK checkpointer ref: the strong count
+        // stays 1 (the Weak does not bump it) but the Weak upgrades while the
+        // Arc lives.  A strong ref here would form an
+        // Evictor -> Checkpointer -> LogManager teardown cycle.
         assert_eq!(
             Arc::strong_count(&ckpt),
-            2,
-            "CC-4: evictor must hold an Arc reference to the checkpointer"
+            1,
+            "CC-4/F13: evictor must hold a WEAK (not strong) checkpointer ref"
+        );
+        assert_eq!(
+            Arc::weak_count(&ckpt),
+            1,
+            "CC-4/F13: evictor must hold exactly one Weak checkpointer ref"
         );
 
         drop(evictor);
-        // After evictor drops, only our local Arc remains.
-        assert_eq!(Arc::strong_count(&ckpt), 1);
+        // After evictor drops, the Weak is gone.
+        assert_eq!(Arc::weak_count(&ckpt), 0);
+    }
+
+    /// F13: the PRODUCTION wiring path installs the checkpointer AFTER the
+    /// evictor is already inside an `Arc` (the checkpointer is built later in
+    /// `EnvironmentImpl::new`).  `set_checkpointer(&self, ...)` must therefore
+    /// work via interior mutability — the pre-F13 `checkpointer: Option<...>`
+    /// field had only a consuming builder, so the production evictor's slot
+    /// stayed `None` and every evicted BIN was logged `Provisional::No`
+    /// regardless of an in-progress checkpoint.
+    ///
+    /// JE ref: Evictor.coordinateEvictionWithCheckpoint (F13 wiring fix).
+    #[test]
+    fn test_f13_set_checkpointer_wires_after_arc() {
+        use noxu_recovery::{CheckpointConfig, Checkpointer};
+        use std::sync::Arc;
+
+        let ckpt = Arc::new(Checkpointer::new(CheckpointConfig::default()));
+        let usage = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        // Build + wrap in Arc FIRST (mirrors EnvironmentImpl::new order),
+        // THEN wire the checkpointer post-construction.
+        let evictor = Arc::new(Evictor::new(
+            Arbiter::new(1000, Arc::clone(&usage), 100, 200),
+            100,
+            false,
+        ));
+        assert_eq!(
+            Arc::weak_count(&ckpt),
+            0,
+            "F13: evictor must NOT hold the checkpointer before wiring"
+        );
+
+        evictor.set_checkpointer(Arc::downgrade(&ckpt));
+        assert_eq!(
+            Arc::weak_count(&ckpt),
+            1,
+            "F13: set_checkpointer must install a WEAK ref on an Arc'd evictor \
+             (interior mutability), else eviction always logs Provisional::No \
+             — and a strong ref would leak the env's file lock (cycle)"
+        );
+        assert_eq!(
+            Arc::strong_count(&ckpt),
+            1,
+            "F13: the wire must be Weak, not Arc, to avoid the \
+             Evictor -> Checkpointer -> LogManager teardown cycle"
+        );
+
+        // With no checkpoint in progress the decision is Provisional::No
+        // (JE: coordinateEvictionWithCheckpoint returns NO when ckptState is
+        // NONE).  This also proves the read site now routes through the wired
+        // checkpointer rather than the unconditional default.
+        assert_eq!(
+            ckpt.get_eviction_provisional(1, 1),
+            Provisional::No,
+            "F13: no checkpoint in progress => Provisional::No"
+        );
+
+        drop(evictor);
+        assert_eq!(Arc::weak_count(&ckpt), 0);
     }
 
     // -----------------------------------------------------------------------

@@ -1262,6 +1262,31 @@ impl EnvironmentImpl {
             }));
         }
 
+        // F13: wire the checkpointer into the evictor so eviction of a dirty
+        // BIN coordinates its `Provisional` flag with an in-progress
+        // checkpoint.  The checkpointer is built AFTER the evictor (it needs
+        // the tree + LogManager), so the evictor's `checkpointer` slot is still
+        // `None` at this point; without this wire the evictor would always log
+        // `Provisional::No` even for a BIN below the checkpoint's max flush
+        // level, which can cause a recovery mismatch when an eviction races an
+        // in-progress checkpoint.  For a SHARED_CACHE env the process-global
+        // evictor is shared across environments (each with its OWN
+        // checkpointer + max-flush-level), so a single per-env checkpointer
+        // cannot be wired here without a cross-env coordination design; that
+        // path retains the always-`Provisional::No` behaviour for now (see
+        // CHANGELOG F13 note).  We wire the PRIVATE per-env evictor, which is
+        // the default and the case the recovery-race affects in practice.
+        //
+        // JE ref: `Evictor.coordinateEvictionWithCheckpoint` ->
+        // `Checkpointer.coordinateEvictionWithCheckpoint` ->
+        // `DirtyINMap.coordinateEvictionWithCheckpoint` /
+        // `getHighestFlushLevel(db)`.
+        if shared_evictor_handle.is_none()
+            && let Some(ckpt) = &checkpointer
+        {
+            evictor.set_checkpointer(Arc::downgrade(ckpt));
+        }
+
         // REC-G / REC-H: seed the checkpointer's interval baselines and
         // checkpoint-ID sequence from the recovered CkptEnd, so the first
         // post-recovery checkpoint continues from the recovered state instead
