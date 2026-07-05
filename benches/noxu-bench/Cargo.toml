@@ -17,6 +17,10 @@ name = "noxu-coalesce-probe"
 path = "src/bin/coalesce_probe.rs"
 
 [[bin]]
+name = "noxu-compare"
+path = "src/bin/compare.rs"
+
+[[bin]]
 name = "noxu-workload-bench"
 path = "src/main.rs"
 [[bin]]
