@@ -176,11 +176,21 @@ pub struct DatabaseConfig {
     /// Node maximum entries (0 = use default).
     pub node_max_entries: u32,
 
-    /// Whether this database participates in replication.
+    /// Whether this database participates in replication. Default `true`.
     ///
-    /// **Inert as of v1.6.0**: the
-    /// `noxu_dbi::DatabaseConfig` has no `replicated` field; the
-    /// replication scope is set at the env level via `noxu-rep`.
+    /// **Now wired (2026-07)**: threaded to `noxu_dbi::DatabaseConfig.
+    /// replicated` and applied to `DatabaseImpl`'s replicated bit, gated by
+    /// `EnvironmentImpl::is_replicated()` (set by `noxu-rep`'s
+    /// `ReplicatedEnvironment::with_environment`). On a plain (non-`noxu-
+    /// rep`) environment this flag has no observable effect — every
+    /// database is correctly non-replicated regardless of this value,
+    /// since the environment itself is never marked replicated there.
+    /// Support for actually EXCLUDING a specific database from replication
+    /// while the environment as a whole replicates is not yet implemented
+    /// — see `docs/src/operations/known-limitations.md`; today every
+    /// database in a replicated environment ends up replicated (the
+    /// default) since nothing yet reads `Database.is_replicated()==false`
+    /// to skip replicating writes to it.
     pub replicated: bool,
 
     /// Enable key prefix compression in BIN nodes.
@@ -228,7 +238,7 @@ impl DatabaseConfig {
             triggers: Triggers::default(),
             exclusive: false,
             node_max_entries: 0,
-            replicated: false,
+            replicated: true,
             key_prefixing: false,
             cache_mode: CacheMode::Default,
             bin_delta: true, // enabled by default (JE default)

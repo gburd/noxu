@@ -105,6 +105,15 @@ pub struct EnvironmentImpl {
     is_read_only: bool,
     /// Whether transactions are enabled.
     is_transactional: bool,
+    /// Whether this environment is part of a replication group. Set once,
+    /// after construction, by `noxu-rep`'s `ReplicatedEnvironment::new` (a
+    /// plain `EnvironmentImpl` has no `noxu-rep` dependency, so this is a
+    /// plain flag rather than a constructor parameter). Gates whether
+    /// `DatabaseConfig::replicated` (default `true`) actually marks a
+    /// database as replicated at open time — in a non-replicated
+    /// environment every database is non-replicated regardless of the
+    /// config value.
+    is_replicated: std::sync::atomic::AtomicBool,
 
     /// Node ID and transient LSN generator.
     ///
@@ -1538,6 +1547,7 @@ impl EnvironmentImpl {
             state: RwLock::new(EnvState::Init),
             is_read_only: read_only,
             is_transactional: transactional,
+            is_replicated: std::sync::atomic::AtomicBool::new(false),
             node_sequence: Arc::clone(&node_sequence),
             next_db_id: Arc::clone(&next_db_id),
             lock_manager,
@@ -1642,6 +1652,22 @@ impl EnvironmentImpl {
     }
     pub fn is_transactional(&self) -> bool {
         self.is_transactional
+    }
+    /// Returns whether this environment is part of a replication group.
+    /// See [`Self::set_replicated`].
+    pub fn is_replicated(&self) -> bool {
+        self.is_replicated.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    /// Marks this environment as replicated. Called exactly once by
+    /// `noxu-rep`'s `ReplicatedEnvironment::new`, immediately after
+    /// constructing the underlying `EnvironmentImpl` and before any
+    /// database is opened, so every subsequent `open_database` sees the
+    /// correct value when resolving `DatabaseConfig::replicated`. A plain
+    /// (non-`noxu-rep`) `EnvironmentImpl` never calls this and stays
+    /// `false`, so every database in a standalone environment is correctly
+    /// non-replicated regardless of the config's `replicated` value.
+    pub fn set_replicated(&self, replicated: bool) {
+        self.is_replicated.store(replicated, std::sync::atomic::Ordering::Relaxed);
     }
     pub fn get_creation_time(&self) -> u64 {
         self.creation_time_ms
@@ -1838,6 +1864,13 @@ impl EnvironmentImpl {
 
         let mut db_impl =
             DatabaseImpl::new(db_id, name.to_string(), DbType::User, config);
+        // The config's `replicated` (default `true`) only takes effect
+        // when the owning environment is itself replicated; a plain
+        // environment never marks a database replicated regardless of the
+        // config value.
+        if self.is_replicated() {
+            db_impl.set_replicated(config.replicated);
+        }
 
         // Wire the environment's shared memory counter into the new database
         // tree so that BIN insertions/deletions are visible to the Arbiter

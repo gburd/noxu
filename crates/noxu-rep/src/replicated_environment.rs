@@ -1030,6 +1030,12 @@ impl ReplicatedEnvironment {
     /// Environment reference wiring.
     /// `EnvironmentImpl` via `RepImpl.repNode.envImpl` in HA.
     pub fn with_environment(&self, env: Arc<EnvironmentImpl>) {
+        // Mark the env replicated as the very first thing so every
+        // database opened through it (including any opened during the
+        // recovery/VLSN-index wiring below) resolves
+        // DatabaseConfig::replicated correctly.
+        env.set_replicated(true);
+
         // Register RESTORE service lazily if not already done.
         if !self.restore_registered.load(Ordering::SeqCst)
             && let Some(ref dispatcher) = self.tcp_dispatcher

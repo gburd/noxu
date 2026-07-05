@@ -165,3 +165,35 @@ fn test_default_config_new_fields() {
     assert!(!config.importunate);
     assert!(!config.local_write);
 }
+
+/// `local_write` and `read_only` may not both be true: begin_transaction
+/// must reject the combination rather than silently favoring one flag.
+#[test]
+fn test_local_write_and_read_only_rejected() {
+    let dir = TempDir::new().unwrap();
+    let (env, _db) = open_env_and_db(&dir);
+
+    let config = TransactionConfig::new()
+        .with_local_write(true)
+        .with_read_only(true);
+    let result = env.begin_transaction(Some(&config));
+    assert!(
+        result.is_err(),
+        "local_write=true + read_only=true must be rejected"
+    );
+}
+
+/// On a non-replicated environment (the only kind `noxu-db` can open on its
+/// own), `local_write` has no database to disagree with, so requesting it
+/// must not block ordinary reads/writes through the resulting transaction.
+#[test]
+fn test_local_write_is_a_no_op_on_non_replicated_environment() {
+    let dir = TempDir::new().unwrap();
+    let (env, db) = open_env_and_db(&dir);
+
+    let config = TransactionConfig::new().with_local_write(true);
+    let txn = env.begin_transaction(Some(&config)).unwrap();
+    db.put_in(&txn, b"k", b"v").unwrap();
+    assert_eq!(db.get_in(&txn, b"k").unwrap().as_deref(), Some(&b"v"[..]));
+    txn.commit().unwrap();
+}

@@ -96,12 +96,11 @@ pub static UNIMPLEMENTED_ENV_PARAMS: &[UnimplementedParam] = &[
         // checkpointer_wakeup_interval_ms, both of which ARE wired.
         is_non_default: |c| c.checkpointer_min_interval_secs != 0,
     },
-    UnimplementedParam {
-        name: "verify_schedule",
-        // default = ""; non-default means any schedule string set
-        // (background btree verifier scheduling is not implemented).
-        is_non_default: |c| !c.verify_schedule.is_empty(),
-    },
+    // NOTE (2026-07): `verify_schedule` was removed from this registry —
+    // it was WIRED into a background daemon in 7.1 (`VerifyDaemon`,
+    // `Environment::open`); this list stayed stale claiming it inert (flag-
+    // honored audit 2026-07 caught the discrepancy). See
+    // crates/noxu-db/tests/verify_daemon_test.rs for the end-to-end proof.
 ];
 
 /// Emit a `log::warn!` for each unimplemented parameter that has been set to a
@@ -197,16 +196,18 @@ mod tests {
     fn dbi14_sweep_params_warn_on_non_default() {
         let mut c = env_default();
         c.set_checkpointer_min_interval_secs(60);
-        c.set_verify_schedule("0 0 * * *".to_string());
-        for name in ["checkpointer_min_interval_secs", "verify_schedule"] {
-            let p = UNIMPLEMENTED_ENV_PARAMS
-                .iter()
-                .find(|p| p.name == name)
-                .unwrap_or_else(|| panic!("census missing {name}"));
-            assert!(
-                (p.is_non_default)(&c),
-                "{name} should detect its non-default value"
-            );
-        }
+        // NOTE: `verify_schedule` graduated out of this census in 2026-07 --
+        // it was wired into a real background daemon in 7.1 and the stale
+        // registry entry claiming it inert was removed (see the NOTE above
+        // UNIMPLEMENTED_ENV_PARAMS's closing bracket).
+        let name = "checkpointer_min_interval_secs";
+        let p = UNIMPLEMENTED_ENV_PARAMS
+            .iter()
+            .find(|p| p.name == name)
+            .unwrap_or_else(|| panic!("census missing {name}"));
+        assert!(
+            (p.is_non_default)(&c),
+            "{name} should detect its non-default value"
+        );
     }
 }

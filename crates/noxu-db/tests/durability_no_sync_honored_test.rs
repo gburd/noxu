@@ -5,8 +5,8 @@
 //! Before the fix, `with_durability(COMMIT_NO_SYNC)` set a `config.durability`
 //! field that the auto-commit path ignored (it read only the deprecated
 //! `txn_no_sync` boolean), so every auto-commit `put()` still fdatasync'd —
-//! ~1 fsync per put where JE NO_SYNC does ~0. This test locks that in via the
-//! public `stat_fsync_count()`.
+//! one fsync per put even though NO_SYNC should do none. This test locks
+//! that in via the public `stat_fsync_count()`.
 
 use noxu_db::{Durability, Environment, EnvironmentConfig};
 

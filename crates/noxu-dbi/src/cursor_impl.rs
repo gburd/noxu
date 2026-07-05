@@ -783,6 +783,45 @@ impl CursorImpl {
         Ok(())
     }
 
+    /// Refuses a write when the database's replicated-ness and the
+    /// locker's local-write setting AGREE, since that means one of them is
+    /// misconfigured relative to the other: a write is only permitted when
+    /// they DISAGREE (a replicated database written by a locker that
+    /// replicates, i.e. `is_local_write()==false`; or a non-replicated
+    /// database written by a locker configured for local writes, i.e.
+    /// `is_local_write()==true`). This is the fourth of four write-
+    /// eligibility conditions; read-only lockers and the transactional-
+    /// mismatch case are enforced earlier in the call chain
+    /// (`Database::check_writable` / `reject_txn_on_non_txnal_db`).
+    /// Vacuous outside replication: in a non-replicated environment every
+    /// `Database` has `is_replicated()==false`, so this only rejects when
+    /// `is_local_write()==true` was explicitly requested for what is (in a
+    /// non-replicated environment) always a non-replicated database —
+    /// which is never a mismatch, so the check never fires there.
+    #[inline]
+    fn check_local_write_allowed(&self) -> Result<(), DbiError> {
+        let Some(txn) = self.txn_ref.as_ref() else {
+            // No locker attached (should not happen for a live write
+            // cursor); nothing to check against.
+            return Ok(());
+        };
+        let is_replicated = self.db_impl.read().is_replicated();
+        let is_local_write = txn.lock().unwrap().is_local_write();
+        if is_replicated == is_local_write {
+            return Err(DbiError::OperationFailed(format!(
+                "Write operation is not allowed because {}",
+                if is_replicated {
+                    "the Database is replicated and the transaction is \
+                     configured as local-write"
+                } else {
+                    "the Database is not replicated and the transaction is \
+                     not configured as local-write"
+                }
+            )));
+        }
+        Ok(())
+    }
+
     fn check_state(&self) -> Result<(), DbiError> {
         #[cfg(any(test, feature = "testing"))]
         if tick_fail() {
@@ -2897,6 +2936,7 @@ impl CursorImpl {
         // anything is logged or the tree is mutated, and before delegating to
         // put_dup so the sorted-dup path is gated too.
         self.check_disk_limit()?;
+        self.check_local_write_allowed()?;
 
         // For sorted-dup databases: encode (key, data) as a two-part composite
         // key.  The tree stores `combine(key, data)` with no slot data.
@@ -3355,6 +3395,7 @@ impl CursorImpl {
         // like put (JE: Cursor.checkUpdatesAllowed gates delete too). The
         // cleaner reclaims the space later. (JE: DiskLimitException.)
         self.check_disk_limit()?;
+        self.check_local_write_allowed()?;
 
         // D3: if the slot has already been deleted by a concurrent operation,
         // return KEYEMPTY (JE CursorImpl.deleteCurrentRecord() PD-flag check).

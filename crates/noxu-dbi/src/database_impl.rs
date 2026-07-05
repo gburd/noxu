@@ -310,6 +310,20 @@ impl DatabaseImpl {
     pub fn is_replicated(&self) -> bool {
         self.flags & IS_REPLICATED_BIT != 0
     }
+    /// Called by the environment's database-open path once it has
+    /// determined whether this database should be marked replicated. Sets
+    /// exactly one of the two underlying bits (never both, which would be a
+    /// contradictory state) so `is_replicated()` reflects the resolved
+    /// value once this has been called.
+    pub fn set_replicated(&mut self, replicated: bool) {
+        if replicated {
+            self.flags |= IS_REPLICATED_BIT;
+            self.flags &= !NOT_REPLICATED_BIT;
+        } else {
+            self.flags |= NOT_REPLICATED_BIT;
+            self.flags &= !IS_REPLICATED_BIT;
+        }
+    }
 
     // Delete state
     pub fn is_deleted(&self) -> bool {

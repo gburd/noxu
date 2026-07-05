@@ -745,6 +745,7 @@ impl Environment {
         dbi_config.set_read_only(config.read_only);
         dbi_config.set_temporary(config.temporary);
         dbi_config.set_transactional(config.transactional);
+        dbi_config.set_replicated(config.replicated);
         dbi_config.deferred_write = config.deferred_write;
         // Audit database F7 (Wave 2C-4): plumb key_prefixing through;
         // pre-fix the outer flag was silently dropped on the floor.
@@ -1045,6 +1046,20 @@ impl Environment {
             ));
         }
 
+        // A local-write transaction that is also read-only is a
+        // contradiction (local-write only matters for writes), so reject
+        // the combination up front rather than silently ignoring one flag.
+        if let Some(c) = config
+            && c.local_write
+            && c.read_only
+        {
+            return Err(NoxuError::IllegalArgument(
+                "begin_transaction: local_write and read_only may not both \
+                 be true (TransactionConfig)"
+                    .to_string(),
+            ));
+        }
+
         let txn_id = self.next_txn_id.fetch_add(1, Ordering::Relaxed);
         // F3: when the caller does not supply a TransactionConfig, the
         // environment-level `Durability` default (`EnvironmentConfig::durability`,
@@ -1122,6 +1137,19 @@ impl Environment {
                 }
                 if txn_config.no_wait {
                     t.set_no_wait(true);
+                }
+                // A locker's writes default to local (non-replicated)
+                // unless the owning environment is itself replicated, in
+                // which case an explicit transaction defaults to
+                // replicating normally — the caller must opt in via
+                // TransactionConfig::with_local_write(true) for the local-
+                // only escape hatch. On a non-replicated environment the
+                // setting has no observable effect either way, so the
+                // common case (no replication at all) is unaffected.
+                if env_guard.is_replicated() {
+                    t.set_local_write(txn_config.local_write);
+                } else if txn_config.local_write {
+                    t.set_local_write(true);
                 }
                 if txn_config.lock_timeout_ms > 0 {
                     t.set_lock_timeout(txn_config.lock_timeout_ms);

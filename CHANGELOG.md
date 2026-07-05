@@ -29,6 +29,47 @@ listed in [References](#references).
   per-commit fdatasync. (This was also the mechanism behind an internal
   benchmark mis-comparison of Noxu-SYNC vs JE-NO_SYNC.)
 
+- **`verify_schedule` stale-inert registry entry.** The background
+  verifier daemon (`VerifyDaemon`, wired in 7.1) was actually working, but
+  the accepted-but-inert-parameter registry and
+  `docs/src/operations/known-limitations.md` still claimed it had "no
+  background btree verifier scheduler" — a stale-doc gap that would have
+  emitted a misleading `warn!` telling operators their working config had
+  no effect. Removed the stale entry; truthed up the docs.
+
+### Added
+
+- **`EnvironmentConfig::with_halt_on_commit_after_checksum_exception` now
+  wired end-to-end.** The scanner-level logic
+  (`FileManagerLogScanner::find_end_of_log`) already detected a committed
+  transaction following a mid-file log corruption and refused to silently
+  truncate it away, but had no public-API integration test proving the
+  wiring from `EnvironmentConfig` through to `Environment::open` actually
+  refuses to mount such a log. Added
+  `crates/noxu-db/tests/halt_on_commit_after_checksum_test.rs` covering both
+  the default (tolerate via truncate-and-continue) and flag-enabled (refuse
+  to mount) paths.
+
+- **Local-write / per-database replication write-isolation check.**
+  `TransactionConfig::with_local_write` and `DatabaseConfig::with_replicated`
+  existed as configuration but had no runtime effect anywhere — the
+  underlying replicated-bit machinery (`DatabaseImpl`'s replicated flag,
+  `EnvironmentImpl`'s replicated flag) was ported but never connected. Now:
+  `EnvironmentImpl::set_replicated`/`is_replicated` tracks whether an
+  environment is part of a replication group (set once by `noxu-rep`'s
+  `ReplicatedEnvironment::with_environment`); `DatabaseConfig::replicated`
+  (default `true`) resolves to a database's replicated bit only when its
+  owning environment is itself replicated; the cursor write path
+  (`CursorImpl::put`/`delete`) rejects a write whenever a database's
+  replicated-ness and its transaction's local-write setting agree (they
+  should normally disagree). A locker's local-write default is `true`
+  (writes are local unless configured otherwise) except for an explicit
+  transaction on a replicated environment, which defaults to `false`
+  (replicate normally) unless the caller opts in. **Partial**: `noxu-rep`
+  does not yet skip replicating a database whose `replicated` flag is
+  `false` — only the write-isolation agreement check is enforced today; see
+  `docs/src/operations/known-limitations.md`.
+
 ### Fixed
 
 - **Write-path fsync serialization (JE `FileManager` separate fsync

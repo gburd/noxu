@@ -132,6 +132,23 @@ pub struct Txn {
     /// When true, all lock requests are non-blocking (fail immediately).
     no_wait: bool,
 
+    /// Writes stay local rather than being replicated. Only meaningful in
+    /// a replicated environment; the write path permits a write through
+    /// this txn only against a database whose replicated-ness disagrees
+    /// with this flag — i.e. a locally-writing txn may only write to a
+    /// non-replicated database, and an ordinarily-replicating txn may only
+    /// write to a replicated one. The default is `true` (writes are local
+    /// unless told otherwise), which is also the only value that matters
+    /// outside replication. On a replicated environment, an explicit
+    /// transaction is instead given `false` by default (replicate
+    /// normally, the common case) unless the caller opts into local-only
+    /// writes; that resolution happens where the txn is created (it
+    /// requires knowing whether the environment is replicated, which this
+    /// struct does not track itself). Auto-commit txns have this derived
+    /// automatically from the target database's replicated flag at
+    /// creation time, so a mismatch never occurs for them.
+    local_write: bool,
+
     /// Serializable (repeatable-read) isolation level.
     ///
     /// When true, read locks are retained through commit/abort.
@@ -261,6 +278,7 @@ impl Txn {
             read_uncommitted_default: false,
             importunate: false,
             no_wait: false,
+            local_write: true,
             serializable_isolation: false,
             read_committed_isolation: false,
             undo_records: Vec::new(),
@@ -725,6 +743,34 @@ impl Txn {
     /// and fail immediately if the lock is not available.
     pub fn set_no_wait(&mut self, v: bool) {
         self.no_wait = v;
+    }
+
+    /// Sets the local-write flag. See the `local_write` field doc for the
+    /// write-path contract this enforces.
+    ///
+    /// `Txn` itself has no notion of "is my environment replicated", so its
+    /// own default (see [`Self::is_local_write`]) is the common case
+    /// (`true`); callers that DO know the environment is replicated are
+    /// responsible for calling this to override the default for an
+    /// explicit transaction that should replicate rather than write
+    /// locally.
+    pub fn set_local_write(&mut self, v: bool) {
+        self.local_write = v;
+    }
+
+    /// Returns whether this txn is configured for local (non-replicated)
+    /// writes.
+    ///
+    /// The natural default for a locker with no explicit configuration is
+    /// `true` ("writes are local unless configured otherwise") — this holds
+    /// for auto-commit lockers and for any locker in a standalone (non-
+    /// replicated) environment, where the setting has no observable effect
+    /// anyway since no database is replicated there. An explicit
+    /// transaction on a replicated environment defaults instead to `false`
+    /// (replicate normally, the common case) unless the caller opted into
+    /// local-only writes via [`Self::set_local_write`].
+    pub fn is_local_write(&self) -> bool {
+        self.local_write
     }
 
     /// Returns the first LSN written by this transaction.

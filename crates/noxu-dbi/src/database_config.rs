@@ -47,6 +47,13 @@ pub struct DatabaseConfig {
     pub transactional: bool,
     /// Database is read-only.
     pub read_only: bool,
+    /// Whether this database participates in replication. Default `true`.
+    /// Only takes effect when the owning environment is itself replicated
+    /// (`EnvironmentImpl::is_replicated()`); on a plain (non-replicated)
+    /// environment every database is non-replicated regardless of this
+    /// value, since the environment itself is never marked replicated
+    /// there.
+    pub replicated: bool,
     /// Maximum entries per node.
     pub node_max_entries: i32,
     /// Deferred write: skip WAL logging; flush only at eviction/checkpoint.
@@ -107,6 +114,7 @@ impl Default for DatabaseConfig {
             temporary: false,
             transactional: false,
             read_only: false,
+            replicated: true,
             node_max_entries: 128,
             deferred_write: false,
             btree_comparator: None,
@@ -160,6 +168,12 @@ impl DatabaseConfig {
     /// Sets the read_only flag.
     pub fn set_read_only(&mut self, read_only: bool) -> &mut Self {
         self.read_only = read_only;
+        self
+    }
+
+    /// Sets the replicated flag.
+    pub fn set_replicated(&mut self, replicated: bool) -> &mut Self {
+        self.replicated = replicated;
         self
     }
 

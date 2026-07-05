@@ -302,8 +302,14 @@ impl Database {
     where
         F: FnOnce(&mut CursorImpl) -> Result<T>,
     {
-        let auto_txn =
+        let mut auto_txn =
             self.txn_manager.begin_auto_txn(self.log_manager.clone());
+        // An auto-commit locker on a non-replicated database defaults to
+        // local-write=true (writes are local since there's nothing to
+        // replicate); on a replicated database it is local-write=false so
+        // the write replicates normally, matching how an explicit
+        // transaction on a replicated database behaves by default.
+        auto_txn.set_local_write(!self.db_impl.read().is_replicated());
         let synthetic_id = auto_txn.id_as_locker();
         let auto_txn_arc = Arc::new(std::sync::Mutex::new(auto_txn));
 
