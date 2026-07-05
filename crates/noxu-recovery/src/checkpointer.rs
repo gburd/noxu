@@ -43,6 +43,12 @@ pub struct CheckpointConfig {
     /// count is `<= nEntries * bin_delta_percent / 100`.  See
     /// `BinStub::should_log_delta` / JE `DatabaseImpl.getBinDeltaPercent()`.
     pub bin_delta_percent: i32,
+    /// Master switch for BIN-deltas at log time (JE `EVICTOR_ALLOW_BIN_DELTAS`
+    /// / `IN.beforeLog`'s `logDelta = allowDeltas && bin.shouldLogDelta()`).
+    /// When `false`, every dirty BIN is logged in full even when the
+    /// count-based `should_log_delta` decision would otherwise choose a
+    /// delta.  Default `true`.
+    pub allow_bin_deltas: bool,
 }
 
 impl CheckpointConfig {
@@ -80,6 +86,13 @@ impl CheckpointConfig {
         self.bin_delta_percent = percent;
         self
     }
+
+    /// Set the master BIN-delta switch (`EVICTOR_ALLOW_BIN_DELTAS`). When
+    /// `false`, dirty BINs are always logged in full.
+    pub fn allow_bin_deltas(mut self, allow: bool) -> Self {
+        self.allow_bin_deltas = allow;
+        self
+    }
 }
 
 impl Default for CheckpointConfig {
@@ -91,6 +104,8 @@ impl Default for CheckpointConfig {
             time_interval: 0, // Time-based checkpoints disabled by default
             // JE BIN_DELTA_PERCENT default (TREE_BIN_DELTA, 0–75).
             bin_delta_percent: 25,
+            // JE EVICTOR_ALLOW_BIN_DELTAS default (true).
+            allow_bin_deltas: true,
         }
     }
 }
@@ -1108,6 +1123,7 @@ impl Checkpointer {
                 &tree_arc,
                 lm,
                 self.config.bin_delta_percent,
+                self.config.allow_bin_deltas,
             )?;
             result.full_bins_flushed += r.full_bins_flushed;
             result.delta_ins_flushed += r.delta_ins_flushed;
@@ -1152,6 +1168,7 @@ impl Checkpointer {
         tree_arc: &Arc<RwLock<Tree>>,
         lm: &Arc<LogManager>,
         bin_delta_percent: i32,
+        allow_bin_deltas: bool,
     ) -> Result<FlushResult> {
         let mut result = FlushResult::default();
 
@@ -1192,7 +1209,13 @@ impl Checkpointer {
             // CONFIGURABLE percent limit, with the isBINDelta fast path, the
             // numDeltas<=0 guard, and the isDeltaProhibited / lastFullLsn==NULL
             // bound — all encapsulated in `BinStub::should_log_delta`.
-            let use_delta = b.should_log_delta(bin_delta_percent);
+            // The count-based TREE_BIN_DELTA decision is additionally gated
+            // by the master allow-bin-deltas switch: when deltas are
+            // disallowed, every dirty BIN is logged in full regardless of
+            // its delta-slot count (JE `IN.beforeLog`: `logDelta =
+            // allowDeltas && bin.shouldLogDelta()`).
+            let use_delta =
+                allow_bin_deltas && b.should_log_delta(bin_delta_percent);
 
             if use_delta {
                 // --- BIN-delta path ---
@@ -2238,6 +2261,85 @@ mod tests {
                 .get_obsolete_offsets()
                 .contains(&prior_delta_lsn.file_offset()),
             "L-5-delta: the prior delta's offset must be tracked obsolete"
+        );
+    }
+
+    /// EVICTOR_ALLOW_BIN_DELTAS master switch: with the identical single-
+    /// dirty-slot BIN state that `test_l5_delta_counts_prior_delta_obsolete`
+    /// shows takes the delta path, setting `allow_bin_deltas(false)` must
+    /// force a FULL BIN instead (JE `IN.beforeLog`: `logDelta = allowDeltas
+    /// && bin.shouldLogDelta()`).
+    ///
+    /// FAIL-PRE: without the `allow_bin_deltas && ...` gate, this logs a
+    /// delta (`delta_ins_flushed == 1`) and the assertion below fails.
+    #[test]
+    fn test_allow_bin_deltas_false_forces_full_bin() {
+        use noxu_cleaner::UtilizationTracker;
+        use noxu_log::FileManager;
+        use noxu_tree::tree::{Tree, TreeNode};
+        use noxu_util::lsn::Lsn;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let fm = Arc::new(
+            FileManager::new(dir.path(), false, 64 * 1024 * 1024, 100).unwrap(),
+        );
+        let lm =
+            Arc::new(LogManager::new(Arc::clone(&fm), 3, 1024 * 1024, 65536));
+
+        let tree = Tree::new(1, 256);
+        for i in 0u16..16 {
+            let key = format!("key{i:03}");
+            tree.insert(
+                key.into_bytes(),
+                b"v".to_vec(),
+                Lsn::new(1, i as u32 + 1),
+            )
+            .unwrap();
+        }
+        let tree_arc = Arc::new(RwLock::new(tree));
+
+        // Same state that would normally choose the delta path: a prior full
+        // BIN, a prior delta, and exactly one re-dirtied slot.
+        let dirty_bins = tree_arc.read().unwrap().collect_dirty_bins(1);
+        assert!(!dirty_bins.is_empty(), "precondition: dirty BINs");
+        for (_db, bin_arc) in &dirty_bins {
+            let mut guard = bin_arc.write();
+            if let TreeNode::Bottom(ref mut b) = *guard {
+                b.clear_dirty_after_full_log(Lsn::new(2, 100));
+                b.last_delta_lsn = Lsn::new(3, 4096);
+                b.is_delta = true;
+                b.prohibit_next_delta = false;
+                b.dirty = true;
+                if let Some(e) = b.entries.first_mut() {
+                    e.dirty = true;
+                }
+            }
+        }
+
+        let mut tracker = UtilizationTracker::new(true);
+        tracker.count_new_log_entry(3, 64, false, true);
+        let tracker_arc = Arc::new(Mutex::new(tracker));
+
+        // allow_bin_deltas(false): the master switch is OFF.
+        let checkpointer = Checkpointer::new(
+            CheckpointConfig::default().allow_bin_deltas(false),
+        )
+        .with_log_manager(Arc::clone(&lm))
+        .with_tree(Arc::clone(&tree_arc), 1)
+        .with_utilization_tracker(Arc::clone(&tracker_arc));
+
+        let result = checkpointer
+            .flush_dirty_bins_internal()
+            .expect("flush_dirty_bins_internal failed");
+
+        assert_eq!(
+            result.delta_ins_flushed, 0,
+            "allow_bin_deltas=false must NOT log any BIN-delta"
+        );
+        assert_eq!(
+            result.full_bins_flushed, 1,
+            "allow_bin_deltas=false must log the dirty BIN in full instead"
         );
     }
 

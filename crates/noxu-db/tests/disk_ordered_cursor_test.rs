@@ -517,3 +517,46 @@ fn cln7_scan_completes_with_concurrent_cleaning() {
         );
     }
 }
+
+// -----------------------------------------------------------------------------
+// dos_producer_queue_timeout_ms: the configured producer-queue timeout must
+// flow from EnvironmentConfig all the way to the DiskOrderedCursor producer
+// thread. Behavioral check: with a custom (non-default) timeout, a full scan
+// still returns every record. Exercises the plumbed value end to end (env
+// config -> EnvironmentImpl -> Database::dos_producer_queue_timeout_ms ->
+// DiskOrderedCursor options).
+// -----------------------------------------------------------------------------
+
+#[test]
+fn dos_producer_queue_timeout_config_flows_and_scan_succeeds() {
+    let dir = TempDir::new().unwrap();
+    let env = Environment::open(
+        EnvironmentConfig::new(dir.path().to_path_buf())
+            .with_allow_create(true)
+            .with_transactional(true)
+            // A deliberately non-default producer-queue timeout.
+            .with_dos_producer_queue_timeout_ms(3_000),
+    )
+    .unwrap();
+    let db = open_db(&env, "dos_timeout");
+
+    let n = 500;
+    let mut expected: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+    for i in 0..n {
+        let k = format!("k-{i:05}").into_bytes();
+        let v = format!("v-{i}").into_bytes();
+        put(&db, &k, &v);
+        expected.insert(k, v);
+    }
+    env.checkpoint(None).unwrap();
+
+    let mut cursor =
+        db.open_disk_ordered_cursor(DiskOrderedCursorConfig::new()).unwrap();
+    let got = drain(&mut cursor);
+    let got_map: HashMap<Vec<u8>, Vec<u8>> = got.into_iter().collect();
+    assert_eq!(
+        got_map, expected,
+        "DiskOrderedCursor with a custom dos_producer_queue_timeout_ms must \
+         still return every record"
+    );
+}

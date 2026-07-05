@@ -1214,7 +1214,11 @@ impl EnvironmentImpl {
                     // (TREE_BIN_DELTA / BIN_DELTA_PERCENT) into the
                     // count-based delta-vs-full decision
                     // (BinStub::should_log_delta / JE BIN.shouldLogDelta).
-                    .bin_delta_percent(cfg.tree_bin_delta_percent as i32),
+                    .bin_delta_percent(cfg.tree_bin_delta_percent as i32)
+                    // EVICTOR_ALLOW_BIN_DELTAS: master switch that can force
+                    // full-BIN logging even when the count-based decision
+                    // would pick a delta.
+                    .allow_bin_deltas(cfg.evictor_allow_bin_deltas),
             )
             // REC-D: thread the configured CHECKPOINTER_BYTES_INTERVAL into
             // the runnable gate. Without this the gate used the hardcoded

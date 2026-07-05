@@ -69,6 +69,15 @@ pub static UNIMPLEMENTED_ENV_PARAMS: &[UnimplementedParam] = &[
         is_non_default: |c| c.env_expiration_enabled,
     },
     UnimplementedParam {
+        name: "cleaner_expiration_enabled",
+        // default = false; non-default means true.  Part of the TTL /
+        // record-expiration family (a reserved feature Noxu does not yet
+        // implement); the cleaner does not consult expiration when
+        // selecting files, so this is inert.  Warn so a non-default
+        // setting is never a silent no-op.
+        is_non_default: |c| c.cleaner_expiration_enabled,
+    },
+    UnimplementedParam {
         name: "env_db_eviction",
         // default = false; non-default means true
         is_non_default: |c| c.env_db_eviction,
@@ -95,6 +104,16 @@ pub static UNIMPLEMENTED_ENV_PARAMS: &[UnimplementedParam] = &[
         // checkpointer is driven by checkpointer_bytes_interval +
         // checkpointer_wakeup_interval_ms, both of which ARE wired.
         is_non_default: |c| c.checkpointer_min_interval_secs != 0,
+    },
+    UnimplementedParam {
+        name: "log_n_data_directories",
+        // default = 0; non-default means the caller asked for the log to be
+        // spread across N `dataNNN/` subdirectories for I/O parallelism
+        // (L-11 in known-limitations.md).  The value is accepted and
+        // plumbed to the dbi config but no subsystem reads it to actually
+        // split the log, so a non-default setting is inert; warn so it is
+        // never a silent no-op.
+        is_non_default: |c| c.log_n_data_directories != 0,
     },
     // NOTE (2026-07): `verify_schedule` was removed from this registry —
     // it was WIRED into a background daemon in 7.1 (`VerifyDaemon`,
@@ -188,6 +207,28 @@ mod tests {
         let p = UNIMPLEMENTED_ENV_PARAMS
             .iter()
             .find(|p| p.name == "env_db_eviction")
+            .unwrap();
+        assert!((p.is_non_default)(&c));
+    }
+
+    #[test]
+    fn log_n_data_directories_warn_on_non_zero() {
+        let mut c = env_default();
+        c.set_log_n_data_directories(4);
+        let p = UNIMPLEMENTED_ENV_PARAMS
+            .iter()
+            .find(|p| p.name == "log_n_data_directories")
+            .unwrap();
+        assert!((p.is_non_default)(&c));
+    }
+
+    #[test]
+    fn cleaner_expiration_enabled_warn_on_true() {
+        let mut c = env_default();
+        c.set_cleaner_expiration_enabled(true);
+        let p = UNIMPLEMENTED_ENV_PARAMS
+            .iter()
+            .find(|p| p.name == "cleaner_expiration_enabled")
             .unwrap();
         assert!((p.is_non_default)(&c));
     }

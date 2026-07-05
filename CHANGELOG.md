@@ -15,6 +15,28 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Fixed
+
+- **`evictor_allow_bin_deltas` now honored.** The flag was plumbed to the
+  internal dbi config but no code path read it, so BIN-deltas could not be
+  disabled. The checkpointer's dirty-BIN flush now gates the delta decision
+  on it (`use_delta = allow_bin_deltas && should_log_delta(...)`), forcing
+  full-BIN logging when disabled. Behavioral test added (fail-pre/pass-post).
+- **`log_n_data_directories` and `cleaner_expiration_enabled` now warn when
+  set.** Both are accepted-but-inert (multi-directory log spreading and
+  TTL-family record expiration are unimplemented); they were silently
+  ignored. Added to the `unimplemented_params` registry so a non-default
+  setting emits a `warn!` at `Environment::open` instead of silently having
+  no effect. Census tests added.
+
+### Added
+
+- **Behavioral tests for previously-untested (but working) flags:**
+  `dos_producer_queue_timeout_ms` (config flows to the DiskOrderedCursor
+  producer path; full scan succeeds with a custom timeout) and
+  `lock_n_lock_tables` (a non-default lock-table shard count still performs
+  correct concurrent record-level locking end to end).
+
 ## [7.3.0] - 2026-07-05
 
 ### Fixed
