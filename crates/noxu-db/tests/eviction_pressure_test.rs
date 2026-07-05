@@ -150,3 +150,88 @@ fn cursor_scan_under_eviction_returns_all_data() {
     }
     assert_eq!(count, n, "scan must visit every record");
 }
+
+/// Regression: a SYNC batched bulk-load of a dataset FAR larger than the cache
+/// must complete (load + final checkpoint) in bounded time. Before the evictor
+/// log-and-evict fix, a dirty BIN that could not be LN-stripped was put back
+/// on the LRU forever (deferred to the checkpoint), so under dataset >> cache
+/// the evictor spun putting dirty BINs back while the checkpoint could not keep
+/// up — the post-load checkpoint never completed (observed: >40 min hang on a
+/// 64-core host at ~3.4x cache). The evictor now logs-and-evicts a dirty BIN
+/// once it has had its second chance, reclaiming its full memory in one pass,
+/// so eviction makes bounded progress and the checkpoint completes.
+///
+/// The watchdog thread panics the process if the operation does not finish
+/// within the bound, turning an infinite thrash into a test FAILURE.
+#[test]
+fn large_dataset_sync_load_and_checkpoint_completes() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let dir = TempDir::new().unwrap();
+    // 8 MiB cache, ~40 MiB working set (~5x cache) — small enough to run
+    // quickly in CI but large enough that eviction must fire during the load
+    // and the final checkpoint must flush a dirty set larger than the cache.
+    let mut cfg = EnvironmentConfig::new(dir.path().to_path_buf());
+    cfg.set_allow_create(true);
+    cfg.set_transactional(true);
+    cfg.set_cache_percent(0);
+    cfg.set_cache_size(8 * 1024 * 1024);
+    // COMMIT_SYNC (the default) — the durability under which the thrash was
+    // observed.
+    let env = Environment::open(cfg).expect("open env");
+    let db = env
+        .open_database(
+            None,
+            "big",
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true),
+        )
+        .expect("open db");
+
+    let done = Arc::new(AtomicBool::new(false));
+    let watch = Arc::clone(&done);
+    // Generous bound: this workload completes in a few seconds when eviction
+    // makes progress; 180s means it is thrashing (the bug).
+    let watchdog = std::thread::spawn(move || {
+        for _ in 0..180 {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            if watch.load(Ordering::Relaxed) {
+                return;
+            }
+        }
+        panic!(
+            "large-dataset SYNC load+checkpoint did not complete in 180s — \
+             evictor is thrashing (dirty BINs deferred to checkpoint forever)"
+        );
+    });
+
+    let n: u64 = 200_000; // ~40 MiB at 200B values
+    let val = vec![0x56u8; 200];
+    let mut i = 0u64;
+    while i < n {
+        let batch_end = (i + 1000).min(n);
+        let txn = env.begin_transaction(None).unwrap();
+        for j in i..batch_end {
+            db.put_in(&txn, j.to_be_bytes(), &val).unwrap();
+        }
+        txn.commit().unwrap();
+        i = batch_end;
+    }
+    // The final checkpoint is where the thrash manifested (flushing a dirty
+    // set larger than the cache while the evictor competes).
+    env.checkpoint(None).unwrap();
+    done.store(true, Ordering::Relaxed);
+    watchdog.join().unwrap();
+
+    // Sanity: a sampling of records is still readable after the pressure.
+    for k in [0u64, n / 2, n - 1] {
+        assert!(
+            db.get(k.to_be_bytes()).unwrap().is_some(),
+            "record {k} lost after large-dataset load"
+        );
+    }
+    db.close().unwrap();
+    env.close().unwrap();
+}
