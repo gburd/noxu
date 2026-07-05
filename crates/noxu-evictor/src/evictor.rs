@@ -231,7 +231,14 @@ pub struct Evictor {
     next_pri1_index: AtomicU64,
     next_pri2_index: AtomicU64,
 
-    log_manager: Option<Arc<LogManager>>,
+    /// WAL used by `flush_dirty_node_to_log` to LOG a dirty BIN before it is
+    /// detached (EVICTOR-LOG-1).  Interior-mutable so env teardown can clear
+    /// it (`clear_log_manager`), breaking the
+    /// `Tree -> Arc<dyn InListListener>(=Evictor) -> Arc<LogManager> ->
+    /// FileManager` chain that would otherwise hold the on-disk env lock past
+    /// env drop (a Tree `Arc` can momentarily outlive `EnvironmentImpl`).
+    /// Mirrors `Tree::clear_log_manager`.
+    log_manager: RwLock<Option<Arc<LogManager>>>,
     /// The B-tree the evictor walks to find/evict nodes.
     ///
     /// Interior-mutable so `EnvironmentImpl` can install the user database's
@@ -323,7 +330,7 @@ impl Evictor {
             mutate_bins: true,
             next_pri1_index: AtomicU64::new(0),
             next_pri2_index: AtomicU64::new(0),
-            log_manager: None,
+            log_manager: RwLock::new(None),
             tree: RwLock::new(None),
             db_id: AtomicU64::new(0),
             db_trees_registry: RwLock::new(None),
@@ -349,7 +356,7 @@ impl Evictor {
             primary,
             scan,
         )
-        .with_opt_log_manager(self.log_manager)
+        .with_opt_log_manager(self.log_manager.into_inner().expect("evictor lm lock poisoned"))
         .with_opt_tree(
             self.tree.into_inner().expect("evictor tree lock poisoned"),
             self.db_id.load(Ordering::Relaxed),
@@ -371,7 +378,7 @@ impl Evictor {
     /// Wire a `LogManager` so dirty nodes are flushed to the WAL before
     /// being removed from memory.
     pub fn with_log_manager(mut self, lm: Arc<LogManager>) -> Self {
-        self.log_manager = Some(lm);
+        self.log_manager = RwLock::new(Some(lm));
         self
     }
 
@@ -519,8 +526,22 @@ impl Evictor {
 
     // Internal helpers for `with_algorithm` reconstruction.
     fn with_opt_log_manager(mut self, lm: Option<Arc<LogManager>>) -> Self {
-        self.log_manager = lm;
+        self.log_manager = RwLock::new(lm);
         self
+    }
+
+    /// Drop this evictor's `Arc<LogManager>` reference (env-teardown).
+    ///
+    /// Called from `EnvironmentImpl` Drop/close after the evictor daemon is
+    /// joined, so no background flush can be in flight.  Breaks the
+    /// `Tree -> Arc<dyn InListListener>(=Evictor) -> Arc<LogManager> ->
+    /// FileManager` retention chain so the on-disk env lock is released even
+    /// when a Tree `Arc` momentarily outlives the env.  Mirrors
+    /// `Tree::clear_log_manager`.
+    pub fn clear_log_manager(&self) {
+        if let Ok(mut g) = self.log_manager.write() {
+            *g = None;
+        }
     }
     fn with_opt_tree(
         self,
@@ -845,16 +866,43 @@ impl Evictor {
                                         &self.stats.nodes_moved_to_pri2_lru,
                                     );
                                 } else {
-                                    // Pre-CLN-F2 behaviour: put the dirty BIN
-                                    // back (no byte credit) so a later pass can
-                                    // strip its now-clean slots.
-                                    if from_pri2 {
-                                        self.pri2.lock().add_back(node_id);
+                                    // JE processTarget fall-through (Evictor.java
+                                    // ~2786-2795): once the dirty BIN has had
+                                    // its pri2 second chance (from_pri2) or the
+                                    // dirty-LRU set is not in use, it is NOT
+                                    // parked again -- it is LOGGED and evicted
+                                    // so its full node memory is reclaimed in
+                                    // this pass. Deferring every dirty BIN to
+                                    // the checkpoint (the old put-back-forever
+                                    // behaviour) deadlocks under dataset >>
+                                    // cache: the evictor spins putting dirty
+                                    // BINs back while the checkpoint cannot
+                                    // keep up, and the budget never drops.
+                                    // JE's `evict()` logs the dirty node
+                                    // (target.log) then detaches it.
+                                    //
+                                    // CC-6 latch discipline: flush uses a
+                                    // non-blocking try_write + cursor_count
+                                    // re-check; `false` means busy/pinned ->
+                                    // put back without credit for a later pass.
+                                    if self.flush_dirty_node_to_log(node_id) {
+                                        let freed = node_size_fn(node_id);
+                                        result.bytes_evicted += freed;
+                                        result.nodes_evicted += 1;
+                                        self.stats.increment(
+                                            &self.stats.nodes_evicted,
+                                        );
                                     } else {
-                                        self.primary_policy.put_back(node_id);
+                                        if from_pri2 {
+                                            self.pri2.lock().add_back(node_id);
+                                        } else {
+                                            self.primary_policy
+                                                .put_back(node_id);
+                                        }
+                                        self.stats.increment(
+                                            &self.stats.nodes_put_back,
+                                        );
                                     }
-                                    self.stats
-                                        .increment(&self.stats.nodes_put_back);
                                 }
                             } else {
                                 // JE ~2786-2795: clean strip-0 BIN ->
@@ -1208,8 +1256,13 @@ impl Evictor {
 
         // Log manager check is after the safety guards so cursor-pin
         // checking is always enforced regardless of test configuration.
-        let lm = match &self.log_manager {
-            Some(lm) => Arc::clone(lm),
+        let lm = match self
+            .log_manager
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().map(Arc::clone))
+        {
+            Some(lm) => lm,
             None => return true, // no log manager (tests); allow eviction
         };
 
@@ -1340,8 +1393,6 @@ impl Evictor {
             }
             _ => return Some(0),
         };
-        let lm_ref = self.log_manager.as_deref();
-        let _ = lm_ref;
         Some(bin.strip_lns())
     }
 
@@ -1804,6 +1855,35 @@ mod tests {
         (counter, evictor)
     }
 
+    /// Test-fixture helper: stamp a synthetic full-BIN LSN into a resident
+    /// BIN so `detach_node_by_id` (which now refuses never-logged BINs,
+    /// EVICTOR-LOG-1) will accept it.  Mirrors what `flush_dirty_node_to_log`
+    /// does in production before an evict.
+    fn stamp_bin_logged(tree: &noxu_tree::tree::Tree, bin_id: u64) {
+        use noxu_tree::tree::TreeNode;
+        fn walk(
+            arc: &Arc<noxu_tree::NodeRwLock<TreeNode>>,
+            id: u64,
+        ) -> bool {
+            let mut g = arc.write();
+            match &mut *g {
+                TreeNode::Bottom(b) if b.node_id == id => {
+                    b.clear_dirty_after_full_log(noxu_util::Lsn::new(1, 999));
+                    true
+                }
+                TreeNode::Bottom(_) => false,
+                TreeNode::Internal(n) => {
+                    let children = n.resident_children();
+                    drop(g);
+                    children.iter().any(|c| walk(c, id))
+                }
+            }
+        }
+        if let Some(root) = tree.get_root() {
+            walk(&root, bin_id);
+        }
+    }
+
     // -----------------------------------------------------------------------
     // EvictionDecision / decide_eviction
     // -----------------------------------------------------------------------
@@ -2103,6 +2183,10 @@ mod tests {
         {
             let t = tree_arc.read().unwrap();
             for bin_id in &bins {
+                // EVICTOR-LOG-1: stamp a synthetic full-BIN LSN so detach is
+                // allowed (never-logged BINs are refused to avoid slot
+                // corruption).
+                stamp_bin_logged(&t, *bin_id);
                 t.detach_node_by_id(*bin_id);
             }
         }
@@ -2890,6 +2974,12 @@ mod tests {
         // Detach the BIN child so the upper IN becomes childless (passes
         // EV-6).  This is the same operation the evictor performs; here we
         // drive it manually to set up the test fixture.
+        //
+        // EVICTOR-LOG-1: `detach_node_by_id` now refuses a never-logged BIN
+        // (last_full_lsn == NULL) so it can't corrupt the parent slot.  Stamp
+        // a synthetic full-BIN LSN first (what `flush_dirty_node_to_log` does
+        // in production) so the fixture detach is allowed.
+        stamp_bin_logged(&tree_inner, bin_child_id);
         let detached = tree_inner.detach_node_by_id(bin_child_id);
         assert!(detached > 0, "fixture: BIN child must detach");
 

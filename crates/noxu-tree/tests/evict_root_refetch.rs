@@ -193,3 +193,79 @@ fn evict_root_refused_with_resident_children() {
     );
     assert!(tree.is_root_resident());
 }
+
+/// EVICTOR-LOG-1 regression: `detach_node_by_id` must REFUSE to detach a
+/// never-logged (dirty) BIN whose `last_full_lsn` is NULL.  Detaching such a
+/// BIN would leave the parent slot pointing at its prior value -- an *LN* LSN
+/// -- and the next re-fetch would try to parse that LN entry as a BIN and
+/// fail, silently losing every key in the BIN.  This was the exact mechanism
+/// behind the dataset >> cache record loss: the evictor's `log_manager` was
+/// unwired, so `flush_dirty_node_to_log` no-oped (`return true` without
+/// logging), and detach then corrupted the slot.
+///
+/// JE `Evictor.evict` only calls `parent.detachNode(...)` AFTER
+/// `target.log(...)` returns a valid LSN (Evictor.java:3027-3035); a BIN is
+/// never detached without a durable full version on disk.
+#[test]
+fn detach_refuses_never_logged_bin_then_succeeds_after_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let lm = make_log(dir.path());
+    let mut tree = Tree::new(1, 8); // 2-level: root over BINs
+    tree.set_log_manager(Arc::clone(&lm));
+
+    let n = 20u8;
+    for i in 0..n {
+        tree.insert(vec![b'a' + i], vec![i, i + 1], Lsn::new(1, u32::from(i) + 1))
+            .unwrap();
+    }
+
+    // Collect resident BIN ids; these were just inserted and never logged, so
+    // their `last_full_lsn` is NULL.
+    let root = tree.get_root().expect("root");
+    let mut ids = Vec::new();
+    if let TreeNode::Internal(nd) = &*root.read() {
+        for c in nd.resident_children() {
+            if let TreeNode::Bottom(b) = &*c.read() {
+                assert_eq!(
+                    b.last_full_lsn,
+                    noxu_util::NULL_LSN,
+                    "precondition: freshly inserted BIN is never-logged"
+                );
+                ids.push(b.node_id);
+            }
+        }
+    }
+    assert!(!ids.is_empty(), "expected at least one resident BIN");
+
+    // (a) Detach must REFUSE every never-logged BIN (return 0) and leave it
+    // resident.
+    for &id in &ids {
+        assert_eq!(
+            tree.detach_node_by_id(id),
+            0,
+            "never-logged BIN {id} must NOT be detached"
+        );
+    }
+    // Every key still readable (nothing was corrupted).
+    for i in 0..n {
+        let r = tree.search_with_data(&[b'a' + i]).expect("slot");
+        assert!(r.found, "key {} lost after refused detach", (b'a' + i) as char);
+        assert_eq!(r.data.as_deref(), Some(&[i, i + 1][..]));
+    }
+
+    // (b) After properly logging the BINs (flush_dirty_node_to_log semantics),
+    // detach succeeds and re-fetch returns CORRECT data.
+    log_and_detach_all_bins(&tree, &lm);
+    for i in 0..n {
+        let r = tree
+            .search_with_data(&[b'a' + i])
+            .unwrap_or_else(|| panic!("key {} re-fetch lost", (b'a' + i) as char));
+        assert!(r.found, "key {} must re-fetch after log+detach", (b'a' + i) as char);
+        assert_eq!(
+            r.data.as_deref(),
+            Some(&[i, i + 1][..]),
+            "key {} re-fetched WRONG data",
+            (b'a' + i) as char
+        );
+    }
+}

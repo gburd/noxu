@@ -6052,6 +6052,25 @@ impl Tree {
         if child_index >= p.entries.len() {
             return 0;
         }
+        // EVICTOR-LOG-1 safety: a BIN may only be detached once it has a
+        // durable full-BIN version on disk (`last_full_lsn != NULL`).  The
+        // parent slot LSN is stamped from `last_full_lsn` below and drives the
+        // re-fetch (`fetch_node_from_log`, which parses the entry as an
+        // InLogEntry/BIN).  If we detached a never-logged BIN the slot would
+        // keep its prior value -- an *LN* LSN -- and the re-fetch would try to
+        // parse an LN entry as a BIN and fail, silently losing the whole
+        // BIN's keys.  Callers are expected to `flush_dirty_node_to_log`
+        // first, but that can no-op (evictor without a LogManager wired / a
+        // failed log write), so enforce the invariant here at the single
+        // shared detach site rather than trusting every caller.  Peek without
+        // removing the child so it is left resident on refusal.
+        // JE: `Evictor.evict` only detaches after `target.log(...)` returns a
+        // valid LSN (Evictor.java:3027-3035).
+        if let Some(c) = p.child_ref(child_index)
+            && matches!(&*c.read(), TreeNode::Bottom(b) if b.last_full_lsn == NULL_LSN)
+        {
+            return 0; // never-logged BIN -- keep resident, do not corrupt slot
+        }
         // T-4: detach the cached child via the node-level INTargetRep, leaving
         // the slot's key/LSN intact for re-fetch (JE IN.setTarget(idx, null)).
         let child = match p.take_child(child_index) {
