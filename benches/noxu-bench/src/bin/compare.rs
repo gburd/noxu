@@ -187,8 +187,16 @@ fn do_op(
 fn load(ctx: &Ctx, load_threads: usize) {
     let per = ctx.records / load_threads as u64;
     let loaded = Arc::new(AtomicU64::new(0));
+    // Bulk-load in batched transactions (1000 puts/commit) so the load is
+    // fast even under COMMIT_SYNC (one fsync amortized over the batch),
+    // rather than one fsync per record. This is a realistic bulk-load path
+    // and keeps the load phase from dominating the run; the MEASURED profile
+    // phases below still use the configured per-op durability. JeBench loads
+    // the same way (batched txns).
+    const BATCH: u64 = 1000;
     std::thread::scope(|s| {
         for tid in 0..load_threads {
+            let env = Arc::clone(&ctx.env);
             let db = Arc::clone(&ctx.db);
             let loaded = Arc::clone(&loaded);
             let start = tid as u64 * per;
@@ -200,15 +208,32 @@ fn load(ctx: &Ctx, load_threads: usize) {
             let value_size = ctx.value_size;
             s.spawn(move || {
                 let value = vec![0x56u8; value_size];
-                for i in start..end {
-                    let _ = db.put(key_bytes(i), &value);
-                    if i % 1_000_000 == 0 {
-                        loaded.fetch_add(1_000_000, Ordering::Relaxed);
+                let mut i = start;
+                while i < end {
+                    let batch_end = (i + BATCH).min(end);
+                    if let Ok(txn) = env.begin_transaction(None) {
+                        let mut ok = true;
+                        for j in i..batch_end {
+                            if db.put_in(&txn, key_bytes(j), &value).is_err() {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        if ok {
+                            let _ = txn.commit();
+                        } else {
+                            let _ = txn.abort();
+                        }
                     }
+                    if i % 10_000_000 < BATCH {
+                        loaded.fetch_add(10_000_000, Ordering::Relaxed);
+                    }
+                    i = batch_end;
                 }
             });
         }
     });
+    let _ = loaded;
 }
 
 fn fstype(dir: &str) -> String {
