@@ -73,6 +73,37 @@ impl FileHandle {
         Ok(FileHandleGuard { handle: self, _latch_guard })
     }
 
+    /// fdatasync the file WITHOUT holding the exclusive write latch
+    /// (JE `FileManager` separate `fsyncFileSynchronizer` + Write Queue).
+    ///
+    /// The write latch (`acquire`) serialises pwrites; holding it across the
+    /// fdatasync would block every concurrent committer's pwrite for the
+    /// ~60-100us of the sync, strictly serialising the write/fsync pipeline
+    /// and capping fsync THROUGHPUT far below the device (the root cause of
+    /// the write-scaling gap vs JE — see write-perf-fix-FALSIFIED.md). JE
+    /// decouples the two: fsync takes a SEPARATE synchronizer and blocked
+    /// writes are queued, so pwrites proceed DURING an in-flight fsync.
+    ///
+    /// On Linux, `fdatasync(fd)` is safe concurrent with `pwrite(fd)` on the
+    /// same descriptor (the kernel serialises internally); we only need the
+    /// `file` Mutex briefly to borrow the `&File`, NOT the write latch. The
+    /// FsyncManager still serialises LEADERS (one fdatasync at a time), so
+    /// this does not issue overlapping fsyncs — it only stops the fsync from
+    /// blocking concurrent pwrites by the next group's drain.
+    pub fn sync_data_no_latch(&self) -> Result<()> {
+        let file_guard = self.file.lock();
+        let file = file_guard.as_ref().ok_or_else(|| {
+            LogError::Internal("FileHandle not initialized".to_string())
+        })?;
+        // DST fault layer (inactive in production).
+        if crate::faultdisk::on_fsync() {
+            drop(file_guard);
+            crate::faultdisk::power_cut();
+        }
+        file.sync_data()?;
+        Ok(())
+    }
+
     /// Attempts to acquire the latch without blocking.
     ///
     /// Returns `None` if the latch is currently held.

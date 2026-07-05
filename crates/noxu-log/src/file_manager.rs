@@ -971,10 +971,13 @@ impl FileManager {
         }
 
         let handle = self.get_file_handle(file_num)?;
-        let mut guard = handle.acquire()?;
-        // Use fdatasync (sync_data) — only log data must be durable here,
-        // not file metadata.  uses FileChannel.force(false) for this.
-        guard.sync_data()?;
+        // JE parity + write-scaling fix: fdatasync WITHOUT holding the file's
+        // exclusive write latch, so concurrent pwrites (the next group's drain)
+        // proceed during this in-flight fsync instead of serialising behind it
+        // (JE FileManager separate fsyncFileSynchronizer + Write Queue). The
+        // FsyncManager still serialises leaders, so only one fdatasync runs at
+        // a time; this only stops the fsync from blocking concurrent writes.
+        handle.sync_data_no_latch()?;
         Ok(())
     }
 
