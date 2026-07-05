@@ -1019,6 +1019,24 @@ impl EnvironmentImpl {
             .with_use_dirty_lru(cfg.evictor_use_dirty_lru)
             .with_mutate_bins(cfg.evictor_mutate_bins)
             .with_off_heap(Arc::clone(&off_heap_cache));
+            // EVICTOR-LOG-1: wire the LogManager so `flush_dirty_node_to_log`
+            // actually LOGS a dirty BIN before `detach_node_by_id` removes it
+            // and stamps the BIN's `last_full_lsn` into the parent slot.
+            // Without this the evictor field is `None`, so
+            // `flush_dirty_node_to_log` short-circuits `return true` WITHOUT
+            // logging; a dirty BIN is then detached with `last_full_lsn ==
+            // NULL`, leaving the parent slot pointing at a stale LN LSN.  A
+            // later re-fetch tries to parse that LN entry as a BIN
+            // (`InLogEntry::read_from_log`) and fails -> the whole BIN's keys
+            // are silently lost.  JE reaches the log via
+            // `database.getEnv().getLogManager()` in `Evictor.evict` ->
+            // `target.log(...)` (Evictor.java:3027); Noxu installs it
+            // directly.  The checkpointer (line ~1233) was already wired this
+            // way; the evictor was the missing sibling.
+            let evictor_builder = match &log_manager {
+                Some(lm) => evictor_builder.with_log_manager(Arc::clone(lm)),
+                None => evictor_builder,
+            };
             log::info!(
                 "evictor eviction algorithm: {} (requested {:?})",
                 evictor_builder.primary_algorithm_name(),
@@ -2903,6 +2921,15 @@ impl EnvironmentImpl {
             // Best-effort join: ignore a panic in the evictor thread.
             let _ = handle.join();
         }
+        // EVICTOR-LOG-1 teardown: drop the private evictor's `Arc<LogManager>`
+        // now that its daemon is joined, breaking the
+        // `Tree -> Arc<dyn InListListener>(=Evictor) -> Arc<LogManager> ->
+        // FileManager` chain so the on-disk env lock is released even if a
+        // Tree `Arc` outlives this struct.  Skipped for a shared evictor (it
+        // outlives this env and serves others).
+        if self.shared_evictor_handle.is_none() {
+            self.evictor.clear_log_manager();
+        }
 
         // X-11: log-flush-no-sync daemon (already signalled above), joined last
         // like JE's `logFlusher.shutdown()`.
@@ -3037,6 +3064,12 @@ impl Drop for EnvironmentImpl {
             self.evictor_handle.lock().unwrap_or_else(|p| p.into_inner()).take()
         {
             let _ = handle.join();
+        }
+        // EVICTOR-LOG-1 teardown: drop the private evictor's `Arc<LogManager>`
+        // (see the sibling in `close()`).  The daemon is joined above, so no
+        // background flush can be in flight.
+        if self.shared_evictor_handle.is_none() {
+            self.evictor.clear_log_manager();
         }
 
         // Shut down the extended-fork background services.

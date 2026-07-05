@@ -163,13 +163,13 @@ fn do_op(
         // Ordered cursor range scan: seek to a random key, read forward N.
         "cursor_scan" => {
             let start = rng.gen_range(0..records);
-            if let Ok(mut cur) = db.open_cursor(None) {
-                if cur.seek(key_bytes(start)).is_ok() {
-                    for _ in 0..32 {
-                        match cur.next() {
-                            Ok(Some(_)) => {}
-                            _ => break,
-                        }
+            if let Ok(mut cur) = db.open_cursor(None)
+                && cur.seek(key_bytes(start)).is_ok()
+            {
+                for _ in 0..32 {
+                    match cur.next() {
+                        Ok(Some(_)) => {}
+                        _ => break,
                     }
                 }
             }
