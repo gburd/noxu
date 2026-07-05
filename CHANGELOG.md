@@ -17,6 +17,22 @@ listed in [References](#references).
 
 ### Fixed
 
+- **Write-path fsync serialization (JE `FileManager` separate fsync
+  synchronizer).** `FileHandle` held a single exclusive latch across BOTH the
+  pwrite and the fdatasync, so a group-commit leader holding the latch across
+  its ~60-100 us `fdatasync` blocked every concurrent committer's pwrite for
+  that duration — strictly serializing the write/fsync pipeline. Fixed with
+  `FileHandle::sync_data_no_latch()`: the commit-path fdatasync
+  (`FileManager::sync_log_end`) no longer holds the exclusive write latch (on
+  Linux, `fdatasync(fd)` is safe concurrent with `pwrite(fd)`; the FsyncManager
+  still serializes leaders so no overlapping fsyncs). JE
+  (`FileManager.java`) decouples the two via a separate `fsyncFileSynchronizer`
+  + Write Queue. Durability unchanged — the fsync still covers every
+  committer's bytes before its commit returns Ok (crash_recovery 12/0,
+  recovery_correctness 17/0, `shuttle_fsync_manager` 3/3).
+
+### Fixed
+
 - **F12 companion — `RecoveryManager::find_last_checkpoint` no longer panics on
   an orphan `CkptStart` (no matching `CkptEnd`).** With the F12 fix,
   `EnvironmentImpl::close()` now writes a real final checkpoint
