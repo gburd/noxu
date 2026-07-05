@@ -15,6 +15,8 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+## [7.3.0] - 2026-07-05
+
 ### Fixed
 
 - **`with_durability(COMMIT_NO_SYNC / COMMIT_WRITE_NO_SYNC)` now honored on
