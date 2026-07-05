@@ -17,6 +17,28 @@ listed in [References](#references).
 
 ### Fixed
 
+- **Evictor now logs-and-evicts dirty BINs instead of deferring every one to
+  the checkpointer.** Under a dataset far larger than the cache, the evictor
+  put every dirty BIN back on the LRU and relied entirely on the checkpoint
+  to clean them; the two fought and the post-load checkpoint made almost no
+  progress (a >40-minute effective hang on a 64-core host at ~3.4x cache).
+  The evictor now logs a dirty BIN and evicts it in a single pass once it has
+  had its second chance, reclaiming its full memory immediately (matching JE
+  `Evictor.evict`). Three coupled fixes: (1) the `evict_batch` dirty-strip-0
+  fall-through logs-and-evicts rather than parking forever; (2) the evictor
+  was never wired with a `LogManager` in the production environment path, so
+  its flush silently no-op'd and detaching a never-logged BIN left the parent
+  slot pointing at a stale LN LSN (silent whole-BIN data loss) — the
+  `LogManager` is now wired; (3) that wiring introduced a
+  `Tree -> Evictor -> LogManager -> FileManager` retention chain that held the
+  on-disk file lock past env close — the evictor's log manager is now cleared
+  in teardown (mirroring the tree teardown). Defense-in-depth: `detach_node_by_id`
+  refuses to detach a never-logged BIN at the single shared detach site.
+  Regression oracle `large_dataset_sync_load_and_checkpoint_completes`
+  (~151s/hang → 10s).
+
+### Fixed
+
 - **`evictor_allow_bin_deltas` now honored.** The flag was plumbed to the
   internal dbi config but no code path read it, so BIN-deltas could not be
   disabled. The checkpointer's dirty-BIN flush now gates the delta decision
