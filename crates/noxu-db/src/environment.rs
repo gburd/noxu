@@ -849,9 +849,33 @@ impl Environment {
             db_impl_arc,
             Arc::clone(&self.env_impl),
             open_flag,
-            self.config.txn_no_sync,
-            self.config.txn_write_no_sync,
+            self.effective_no_sync(),
+            self.effective_write_no_sync(),
         ))
+    }
+
+    /// Effective `no_sync` for auto-commit: honours `with_durability(
+    /// COMMIT_NO_SYNC)` (the recommended API) as well as the deprecated
+    /// `set_txn_no_sync(true)` boolean.
+    ///
+    /// Fidelity fix: previously the auto-commit `put()` path read ONLY the
+    /// legacy `txn_no_sync` boolean, so `with_durability(COMMIT_NO_SYNC)` was
+    /// silently ignored and every auto-commit `put()` still fdatasync'd
+    /// (Noxu ~1,646 fdatasync/s where JE NO_SYNC does ~12/s). JE resolves the
+    /// commit SyncPolicy from the effective `Durability` (Txn.getCommitDurability
+    /// / EnvironmentConfig.getDurabilityFromSync). Now the durability's
+    /// `local_sync` drives the decision, with the legacy boolean as an OR.
+    fn effective_no_sync(&self) -> bool {
+        self.config.txn_no_sync
+            || self.config.durability.local_sync
+                == crate::durability::SyncPolicy::NoSync
+    }
+
+    /// Effective `write_no_sync` for auto-commit (see [`effective_no_sync`]).
+    fn effective_write_no_sync(&self) -> bool {
+        self.config.txn_write_no_sync
+            || self.config.durability.local_sync
+                == crate::durability::SyncPolicy::WriteNoSync
     }
 
     /// Removes a database.

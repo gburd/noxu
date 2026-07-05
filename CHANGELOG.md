@@ -17,6 +17,20 @@ listed in [References](#references).
 
 ### Fixed
 
+- **`with_durability(COMMIT_NO_SYNC / COMMIT_WRITE_NO_SYNC)` now honored on
+  auto-commit.** The auto-commit `put()` path decided whether to `fdatasync`
+  from only the deprecated `txn_no_sync` boolean; `with_durability(d)` set a
+  separate `config.durability` the path ignored, so `with_durability(
+  COMMIT_NO_SYNC)` was silently ignored and every auto-commit `put()` still
+  fdatasync'd (measured ~1 fdatasync/put vs JE NO_SYNC ~0). `Environment`'s
+  effective sync policy is now resolved from `config.durability.local_sync`
+  (OR the legacy boolean), matching JE's `Txn.getCommitDurability` /
+  `getDurabilityFromSync`. Regression test asserts NO_SYNC puts skip the
+  per-commit fdatasync. (This was also the mechanism behind an internal
+  benchmark mis-comparison of Noxu-SYNC vs JE-NO_SYNC.)
+
+### Fixed
+
 - **Write-path fsync serialization (JE `FileManager` separate fsync
   synchronizer).** `FileHandle` held a single exclusive latch across BOTH the
   pwrite and the fdatasync, so a group-commit leader holding the latch across
