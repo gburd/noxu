@@ -184,15 +184,15 @@ fn do_op(
     }
 }
 
-fn load(ctx: &Ctx) {
-    let per = ctx.records / ctx.threads as u64;
+fn load(ctx: &Ctx, load_threads: usize) {
+    let per = ctx.records / load_threads as u64;
     let loaded = Arc::new(AtomicU64::new(0));
     std::thread::scope(|s| {
-        for tid in 0..ctx.threads {
+        for tid in 0..load_threads {
             let db = Arc::clone(&ctx.db);
             let loaded = Arc::clone(&loaded);
             let start = tid as u64 * per;
-            let end = if tid == ctx.threads - 1 {
+            let end = if tid == load_threads - 1 {
                 ctx.records
             } else {
                 start + per
@@ -230,6 +230,12 @@ fn main() {
     let records = envp("NOXU_BENCH_RECORDS", 20_000_000);
     let threads = envp("NOXU_BENCH_THREADS", cpus() as u64) as usize;
     let seconds = envp("NOXU_BENCH_SECONDS", 30);
+    // Loader-thread count: bounded (default 8) because auto-commit writes
+    // past ~8 concurrent writers contend heavily on the lock/tree/log path
+    // (documented limitation). JeBench uses the same load-thread count for
+    // a fair comparison.
+    let load_threads =
+        envp("NOXU_BENCH_LOAD_THREADS", 8).max(1) as usize;
     let durability =
         std::env::var("NOXU_BENCH_DURABILITY").unwrap_or_else(|_| "SYNC".into());
     let profile = std::env::var("NOXU_BENCH_PROFILE")
@@ -254,7 +260,7 @@ fn main() {
     println!("  dir:        {dir}  (fs: {})", fst.split_whitespace().nth(1).unwrap_or("?"));
     println!("  cache:      {} GiB", cache / 1024 / 1024 / 1024);
     println!("  dataset:    {records} x {value_size}B ~= {} GiB (ratio {:.1}x cache)", approx / 1024 / 1024 / 1024, approx as f64 / cache as f64);
-    println!("  threads:    {threads}");
+    println!("  threads:    {threads} (load: {load_threads})");
     println!("  seconds:    {seconds} per profile");
     println!("  durability: {durability}");
     println!("  profile:    {profile}");
@@ -291,7 +297,7 @@ fn main() {
 
     println!("\n-- loading {records} records --");
     let lt = Instant::now();
-    load(&ctx);
+    load(&ctx, load_threads);
     env.checkpoint(None).unwrap();
     println!("   loaded in {:.1}s", lt.elapsed().as_secs_f64());
 
@@ -353,5 +359,10 @@ fn main() {
     // Silence unused-import warnings when only some paths are exercised.
     let _ = (Put::Overwrite, TransactionConfig::new());
     db.close().unwrap();
-    Arc::try_unwrap(env).ok().unwrap().close().unwrap();
+    // `env` is still shared via `ctx`; drop that ref, then close through the
+    // remaining handle. (Env close is idempotent-safe on the last handle.)
+    drop(ctx);
+    if let Ok(e) = Arc::try_unwrap(env) {
+        e.close().unwrap();
+    }
 }
