@@ -132,23 +132,16 @@ fn main() {
     println!("=== Noxu sustained 98/2 write/read (JSON 256-2048B, PK from sequence) ===");
     println!("  dir={dir} cache={}GiB threads={threads} seconds={seconds} dur={durability}", cache / 1024 / 1024 / 1024);
 
-    let env = Arc::new(Environment::open(
-        EnvironmentConfig::new(std::path::PathBuf::from(&dir))
-            .with_allow_create(true).with_transactional(true)
-            .with_cache_size(cache).with_durability(dur)
-            // JE LOG_GROUP_COMMIT_THRESHOLD / INTERVAL (default 0/0 = off).
-            // When set, the fsync leader waits briefly for more committers to
-            // accumulate, trading a little latency for higher coalescing on
-            // fast devices with few writers.
-            .with_log_group_commit(
-                envp("SW_GRPC_THRESHOLD", 0) as usize,
-                envp("SW_GRPC_INTERVAL_MS", 0),
-            )
-            // Background no-sync flusher: drains log buffers to the page cache
-            // ahead of the committer's fdatasync (closest existing analog to
-            // JE's Write Queue write-ahead). 0 = disabled (default).
-            .with_log_flush_no_sync_interval_ms(envp("SW_FLUSH_MS", 0)),
-    ).expect("open env"));
+    let mut sw_cfg = EnvironmentConfig::new(std::path::PathBuf::from(&dir));
+    sw_cfg.set_allow_create(true);
+    sw_cfg.set_transactional(true);
+    sw_cfg.set_cache_size(cache);
+    sw_cfg.set_durability(dur);
+    sw_cfg.set_log_group_commit_threshold(envp("SW_GRPC_THRESHOLD", 0) as usize);
+    sw_cfg.set_log_group_commit_interval_ms(envp("SW_GRPC_INTERVAL_MS", 0));
+    sw_cfg.set_log_flush_no_sync_interval_ms(envp("SW_FLUSH_MS", 0));
+    sw_cfg.set_log_fsync_pipeline_depth(envp("SW_FSYNC_DEPTH", 4) as usize);
+    let env = Arc::new(Environment::open(sw_cfg).expect("open env"));
     let db = Arc::new(env.open_database(
         None, "sustained",
         &DatabaseConfig::new().with_allow_create(true).with_transactional(true),
