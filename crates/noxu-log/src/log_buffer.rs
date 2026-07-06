@@ -23,7 +23,7 @@ use noxu_sync::RawMutex;
 use noxu_sync::lock_api::RawMutex as RawMutexTrait;
 use noxu_util::lsn::{Lsn, NULL_LSN};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -35,13 +35,26 @@ use std::time::Duration;
 /// latch_for_write/release pattern (not RAII).
 pub struct LogBuffer {
     /// The actual buffer storage.
+    ///
+    /// **Round-2 change (lock-free slot reservation):** `data` is pre-sized to
+    /// the full `capacity` ONCE at construction (and after `reinit`) and is
+    /// never grown per-write.  The number of bytes actually written is tracked
+    /// by the atomic `control.write_position`, NOT by `data.len()` (which is
+    /// always `capacity`).  This lets `allocate()` reserve a slot with a single
+    /// `fetch_add` — no `&mut self`, no buffer latch, no `Vec::resize` — so the
+    /// reservation no longer needs the nested `Mutex<LogBuffer>` +
+    /// `read_latch` acquisitions inside the LWL hot path.
     data: BytesMut,
 
-    /// LSN of the first entry in this buffer.
-    first_lsn: Lsn,
+    /// LSN of the first entry in this buffer (round-2: atomic so `register_lsn`
+    /// can run on a shared `&LogBuffer` without the `Mutex<LogBuffer>` write
+    /// lock).  Stored as the raw `Lsn::as_u64()`; `u64::MAX` (== `NULL_LSN`)
+    /// means "empty".
+    first_lsn: AtomicU64,
 
-    /// LSN of the last entry registered in this buffer.
-    last_lsn: Lsn,
+    /// LSN of the last entry registered in this buffer (round-2: atomic, see
+    /// `first_lsn`).
+    last_lsn: AtomicU64,
 
     /// Total capacity of the buffer.
     capacity: usize,
@@ -80,6 +93,18 @@ struct LogBufferControl {
     latch_held: AtomicBool,
     /// Number of writers currently pinning this buffer.
     write_pin_count: AtomicI32,
+    /// High-water mark of bytes reserved in this buffer (round-2 change).
+    ///
+    /// This is the authoritative "content length" of the buffer — the sum of
+    /// all `allocate(size)` reservations since the last `reinit`.  It replaces
+    /// the old `data.len()` (which is now always `capacity`).
+    ///
+    /// Reservation happens under the LWL (all `allocate` callers hold it), so
+    /// `fetch_add` never races another writer.  It is atomic so that the
+    /// flush/read paths (which read it WITHOUT the LWL, only under the
+    /// `read_latch` after `wait_for_zero_and_latch`) observe a consistent
+    /// value with the correct happens-before ordering.
+    write_position: AtomicUsize,
 }
 
 impl LogBufferControl {
@@ -88,17 +113,23 @@ impl LogBufferControl {
             read_latch: RawMutex::INIT,
             latch_held: AtomicBool::new(false),
             write_pin_count: AtomicI32::new(0),
+            write_position: AtomicUsize::new(0),
         }
     }
 }
 
 impl LogBuffer {
     /// Creates a new LogBuffer with the specified capacity.
+    ///
+    /// The backing `data` is pre-sized to the full `capacity` (round-2 change)
+    /// so `allocate()` never needs to grow it.  `write_position` starts at 0.
     pub fn new(capacity: usize) -> Self {
+        let mut data = BytesMut::with_capacity(capacity);
+        data.resize(capacity, 0);
         LogBuffer {
-            data: BytesMut::with_capacity(capacity),
-            first_lsn: NULL_LSN,
-            last_lsn: NULL_LSN,
+            data,
+            first_lsn: AtomicU64::new(NULL_LSN.as_u64()),
+            last_lsn: AtomicU64::new(NULL_LSN.as_u64()),
             capacity,
             control: Arc::new(LogBufferControl::new()),
             rewrite_allowed: false,
@@ -109,14 +140,18 @@ impl LogBuffer {
     /// Creates a temporary LogBuffer wrapping existing data at a specific LSN.
     ///
     /// Used by LogManager when an entry is too large for the buffer pool.
+    /// The wrapped `data` is treated as fully written, so `write_position` is
+    /// initialised to its length.
     pub fn wrap(data: BytesMut, first_lsn: Lsn) -> Self {
         let capacity = data.capacity();
+        let control = Arc::new(LogBufferControl::new());
+        control.write_position.store(data.len(), Ordering::Relaxed);
         LogBuffer {
             data,
-            first_lsn,
-            last_lsn: first_lsn,
+            first_lsn: AtomicU64::new(first_lsn.as_u64()),
+            last_lsn: AtomicU64::new(first_lsn.as_u64()),
             capacity,
-            control: Arc::new(LogBufferControl::new()),
+            control,
             rewrite_allowed: false,
             flushed_len: 0,
         }
@@ -125,15 +160,32 @@ impl LogBuffer {
     /// Reinitializes the buffer for reuse.
     ///
     /// The LWL and buffer pool latch must be held.
+    ///
+    /// `data` stays pre-sized to `capacity`; only the `write_position`
+    /// high-water mark is reset to 0 (round-2 change) so the buffer starts
+    /// empty again without reallocating.
     pub fn reinit(&mut self) {
         self.latch_for_write();
-        self.data.clear();
-        self.first_lsn = NULL_LSN;
-        self.last_lsn = NULL_LSN;
+        self.first_lsn.store(NULL_LSN.as_u64(), Ordering::Relaxed);
+        self.last_lsn.store(NULL_LSN.as_u64(), Ordering::Relaxed);
         self.rewrite_allowed = false;
         self.control.write_pin_count.store(0, Ordering::Relaxed);
+        self.control.write_position.store(0, Ordering::Relaxed);
         self.flushed_len = 0;
         self.release();
+    }
+
+    /// Returns the number of bytes written to this buffer so far.
+    ///
+    /// Round-2 change: this is the atomic `write_position` high-water mark, the
+    /// authoritative content length (the old `data.len()`, which is now always
+    /// `capacity`).  Callers must hold the LWL or the `read_latch` (the same
+    /// rule as the fields it replaces); the `Relaxed` load is sufficient
+    /// because that lock (or, for the flush/read path, the preceding
+    /// `wait_for_zero_and_latch` Acquire on `write_pin_count`) already
+    /// establishes the happens-before ordering with the writers.
+    fn content_len(&self) -> usize {
+        self.control.write_position.load(Ordering::Relaxed)
     }
 
     /// Returns the data that has not yet been flushed to disk.
@@ -142,14 +194,14 @@ impl LogBuffer {
     /// this slice to disk at `flushed_file_offset()` and then call
     /// `mark_flushed()` to advance the watermark.
     pub fn get_unflushed_data(&self) -> &[u8] {
-        &self.data[self.flushed_len..]
+        &self.data[self.flushed_len..self.content_len()]
     }
 
     /// Returns the file offset at which `get_unflushed_data()` should be written.
     ///
     /// Equals `first_lsn.file_offset() + flushed_len`.
     pub fn flushed_file_offset(&self) -> u64 {
-        self.first_lsn.file_offset() as u64 + self.flushed_len as u64
+        self.first_lsn().file_offset() as u64 + self.flushed_len as u64
     }
 
     /// Advances the flush watermark to the current buffer length.
@@ -157,38 +209,48 @@ impl LogBuffer {
     /// Must be called after a successful `write_buffer()` for the unflushed
     /// slice so that the next flush only writes new data.
     pub fn mark_flushed(&mut self) {
-        self.flushed_len = self.data.len();
+        self.flushed_len = self.content_len();
     }
 
     /// Returns the first LSN held in this buffer.
     ///
     /// The LWL or read_latch must be held.
     pub fn get_first_lsn(&self) -> Lsn {
-        self.first_lsn
+        self.first_lsn()
+    }
+
+    /// Internal accessor: current `first_lsn` from the atomic field.
+    fn first_lsn(&self) -> Lsn {
+        Lsn::from_u64(self.first_lsn.load(Ordering::Relaxed))
     }
 
     /// Registers the LSN for a buffer segment that has been allocated in this buffer.
     ///
-    /// The LWL and read_latch must be held.
-    pub fn register_lsn(&mut self, lsn: Lsn) {
-        assert!(
-            self.control.latch_held.load(Ordering::Relaxed),
-            "read_latch must be held"
-        );
-
-        if !self.last_lsn.is_null() {
+    /// The LWL must be held (round-2 change: takes `&self` and the `read_latch`
+    /// is no longer required).  `first_lsn`/`last_lsn` are atomic and are
+    /// protected against other writers and against `bump_current` by the LWL
+    /// (all of those run under it), and against `contains_lsn` readers by the
+    /// pin-count protocol — a reader's `wait_for_zero_and_latch` blocks while
+    /// this segment's pin is outstanding, which spans the whole `allocate` →
+    /// `register_lsn` → `put` window.
+    pub fn register_lsn(&self, lsn: Lsn) {
+        let last = Lsn::from_u64(self.last_lsn.load(Ordering::Relaxed));
+        if !last.is_null() {
             assert!(
-                lsn > self.last_lsn,
+                lsn > last,
                 "lsn={:?} must be > last_lsn={:?}",
                 lsn,
-                self.last_lsn
+                last
             );
         }
 
-        self.last_lsn = lsn;
+        self.last_lsn.store(lsn.as_u64(), Ordering::Relaxed);
 
-        if self.first_lsn.is_null() {
-            self.first_lsn = lsn;
+        // first_lsn is set once (on the first register in this buffer).  Only
+        // one writer runs here at a time (LWL-serialised), so a plain
+        // load-then-store is race-free.
+        if Lsn::from_u64(self.first_lsn.load(Ordering::Relaxed)).is_null() {
+            self.first_lsn.store(lsn.as_u64(), Ordering::Relaxed);
         }
     }
 
@@ -196,14 +258,18 @@ impl LogBuffer {
     ///
     /// The LWL or read_latch must be held.
     pub fn has_room(&self, num_bytes: usize) -> bool {
-        num_bytes <= (self.capacity - self.data.len())
+        num_bytes <= (self.capacity - self.content_len())
     }
 
-    /// Returns the buffer's data for read access.
+    /// Returns the buffer's written data for read access.
+    ///
+    /// Round-2 change: bounded to `content_len()` (the written high-water
+    /// mark) rather than the full pre-sized allocation, so callers still see
+    /// exactly the bytes that were logged.
     ///
     /// The LWL or read_latch must be held.
     pub fn get_data(&self) -> &[u8] {
-        &self.data
+        &self.data[..self.content_len()]
     }
 
     /// Returns the capacity of this buffer in bytes.
@@ -229,12 +295,13 @@ impl LogBuffer {
         // for a reader to read the buffer.
         self.wait_for_zero_and_latch();
 
-        let found = if !self.first_lsn.is_null()
-            && self.first_lsn.file_number() == lsn.file_number()
+        let first = self.first_lsn();
+        let found = if !first.is_null()
+            && first.file_number() == lsn.file_number()
         {
             let file_offset = lsn.file_offset();
-            let content_size = self.data.len();
-            let first_lsn_offset = self.first_lsn.file_offset();
+            let content_size = self.content_len();
+            let first_lsn_offset = first.file_offset();
             let last_content_offset = first_lsn_offset + content_size as u32;
 
             first_lsn_offset <= file_offset && last_content_offset > file_offset
@@ -277,35 +344,49 @@ impl LogBuffer {
         self.rewrite_allowed = true;
     }
 
-    /// Allocates a segment out of the buffer.
+    /// Allocates a segment out of the buffer via a lock-free atomic reservation.
     ///
-    /// The LWL and read_latch must be held.
+    /// **Round-2 change:** takes `&self` (not `&mut self`) and reserves the
+    /// slot with a single `write_position.fetch_add(size)` — NO `read_latch`,
+    /// NO `Mutex<LogBuffer>` write-lock, NO `Vec::resize`.  This removes the
+    /// nested buffer-lock acquisitions from the LWL hot path.
     ///
-    /// Returns `None` if not enough room, otherwise returns a `LogBufferSegment`
-    /// for the data.
-    pub fn allocate(&mut self, size: usize) -> Option<LogBufferSegment> {
-        assert!(
-            self.control.latch_held.load(Ordering::Relaxed),
-            "read_latch must be held"
-        );
+    /// The reservation is serialised by the LWL (every production caller holds
+    /// it), so the `fetch_add` never races another writer; it is atomic purely
+    /// so the flush/read paths observe the high-water mark with the correct
+    /// ordering.
+    ///
+    /// Returns `None` if the reservation would overflow `capacity` (the buffer
+    /// is full — the caller rolls to the next buffer or takes the oversized
+    /// direct-write path).  On overflow the reservation is undone so the
+    /// high-water mark is not corrupted.
+    pub fn allocate(&self, size: usize) -> Option<LogBufferSegment> {
+        // Reserve [off .. off+size) atomically.  Acquire/Release so the
+        // reserving thread's view is ordered; a losing (overflow) reservation
+        // is rolled back below.
+        let off = self.control.write_position.fetch_add(size, Ordering::AcqRel);
 
-        if self.has_room(size) {
-            let offset = self.data.len();
-            // Reserve space in the buffer
-            self.data.resize(offset + size, 0);
-            self.control.write_pin_count.fetch_add(1, Ordering::Relaxed);
-            // SAFETY: offset is within the buffer we just resized.
-            let data_ptr = unsafe { self.data.as_mut_ptr().add(offset) };
-            Some(LogBufferSegment {
-                data_ptr,
-                // Share the control block (latch + pin count) so the segment
-                // is independent of the LogBuffer's location in memory.
-                control: Arc::clone(&self.control),
-                size,
-            })
-        } else {
-            None
+        if off + size > self.capacity {
+            // Buffer full: undo the reservation and report no room.  Because
+            // allocate() runs under the LWL, this fetch_sub cannot race another
+            // writer's fetch_add, so the position is restored exactly.
+            self.control.write_position.fetch_sub(size, Ordering::AcqRel);
+            return None;
         }
+
+        self.control.write_pin_count.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: `off + size <= capacity` (checked above) and `data` is
+        // pre-sized to `capacity`, so `[off .. off+size)` is within the
+        // allocation.  The pin-count protocol keeps the buffer alive and
+        // un-reused while this segment is outstanding.
+        let data_ptr = unsafe { self.data.as_ptr().add(off) as *mut u8 };
+        Some(LogBufferSegment {
+            data_ptr,
+            // Share the control block (latch + pin count) so the segment
+            // is independent of the LogBuffer's location in memory.
+            control: Arc::clone(&self.control),
+            size,
+        })
     }
 
     /// Decrements the pin count (called when a segment write completes).
@@ -340,11 +421,16 @@ impl LogBuffer {
 
     /// Returns a slice of the buffer positioned at the given file offset.
     ///
+    /// Round-2 change: bounded to `content_len()` so it returns only written
+    /// bytes (the read path parses the entry size from the header within this
+    /// slice; `contains_lsn` has already verified the offset lies inside the
+    /// written region).
+    ///
     /// The LWL or read_latch must be held.
     pub fn get_bytes(&self, file_offset: u32) -> &[u8] {
         let buffer_offset =
-            (file_offset - self.first_lsn.file_offset()) as usize;
-        &self.data[buffer_offset..]
+            (file_offset - self.first_lsn().file_offset()) as usize;
+        &self.data[buffer_offset..self.content_len()]
     }
 }
 
@@ -431,7 +517,7 @@ mod tests {
 
     #[test]
     fn test_allocate_and_put() {
-        let mut buffer = LogBuffer::new(1024);
+        let buffer = LogBuffer::new(1024);
         buffer.latch_for_write();
 
         let segment = buffer.allocate(100).expect("should allocate");
@@ -454,7 +540,7 @@ mod tests {
     // (non-relocating) heap allocation, so this is sound.
     #[test]
     fn test_segment_survives_buffer_move() {
-        let mut buffer = LogBuffer::new(1024);
+        let buffer = LogBuffer::new(1024);
         buffer.latch_for_write();
         let segment = buffer.allocate(64).expect("should allocate");
         buffer.release();
@@ -477,7 +563,7 @@ mod tests {
 
     #[test]
     fn test_register_lsn() {
-        let mut buffer = LogBuffer::new(1024);
+        let buffer = LogBuffer::new(1024);
         buffer.latch_for_write();
 
         let lsn1 = Lsn::new(0, 100);
@@ -493,7 +579,7 @@ mod tests {
 
     #[test]
     fn test_has_room() {
-        let mut buffer = LogBuffer::new(100);
+        let buffer = LogBuffer::new(100);
         buffer.latch_for_write();
 
         assert!(buffer.has_room(100));
@@ -530,7 +616,7 @@ mod tests {
 
     #[test]
     fn test_contains_lsn() {
-        let mut buffer = LogBuffer::new(1024);
+        let buffer = LogBuffer::new(1024);
         buffer.latch_for_write();
 
         let seg = buffer.allocate(100).unwrap();
@@ -569,7 +655,7 @@ mod tests {
 
     #[test]
     fn test_multiple_allocations() {
-        let mut buffer = LogBuffer::new(1024);
+        let buffer = LogBuffer::new(1024);
         buffer.latch_for_write();
 
         // Allocate two segments.
@@ -592,7 +678,7 @@ mod tests {
 
     #[test]
     fn test_allocate_exactly_capacity() {
-        let mut buffer = LogBuffer::new(256);
+        let buffer = LogBuffer::new(256);
         buffer.latch_for_write();
 
         let seg = buffer.allocate(256).expect("should fill exactly");
@@ -610,7 +696,7 @@ mod tests {
 
     #[test]
     fn test_allocate_too_large_returns_none() {
-        let mut buffer = LogBuffer::new(128);
+        let buffer = LogBuffer::new(128);
         buffer.latch_for_write();
 
         let result = buffer.allocate(129);
@@ -623,7 +709,7 @@ mod tests {
 
     #[test]
     fn test_get_bytes_after_write() {
-        let mut buffer = LogBuffer::new(512);
+        let buffer = LogBuffer::new(512);
         buffer.latch_for_write();
 
         let lsn = Lsn::new(7, 2000);
@@ -670,7 +756,7 @@ mod tests {
 
         // Allocate a segment while holding the latch.
         let segment = {
-            let mut b = buf.lock().unwrap();
+            let b = buf.lock().unwrap();
             b.latch_for_write();
             let seg = b.allocate(64).expect("must allocate 64 bytes");
             b.release(); // release latch; writer can now copy data
