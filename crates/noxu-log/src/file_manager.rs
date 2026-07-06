@@ -493,10 +493,10 @@ impl FileManager {
         {
             let need_dequeue = {
                 let q = self.write_queue.lock();
-                match q.as_ref().and_then(|q| q.qw_file_num) {
-                    Some(cur) if cur < file_num => true,
-                    _ => false,
-                }
+                matches!(
+                    q.as_ref().and_then(|q| q.qw_file_num),
+                    Some(cur) if cur < file_num
+                )
             };
             if need_dequeue {
                 self.dequeue_pending_writes()?;
@@ -1741,5 +1741,153 @@ mod tests {
         manager.flip_file().unwrap();
         let listed2 = manager.list_file_numbers().unwrap();
         assert!(listed2.contains(&1), "file 1 must be visible after flip");
+    }
+
+    // ── Write Queue (JE LogEndFileDescriptor) ───────────────────────────
+
+    /// Header bytes so the created file has a valid header; the write queue
+    /// operates on data written after the header.
+    fn wq_manager() -> (TempDir, FileManager) {
+        let dir = TempDir::new().unwrap();
+        let m = FileManager::new(dir.path(), false, 10_000_000, 100).unwrap();
+        m.configure_write_queue(true, 1 << 16); // 64 KiB queue
+        m.create_file(0).unwrap();
+        (dir, m)
+    }
+
+    /// With the fsync-lock held by a simulated in-flight fsync, a
+    /// `write_to_file` ENQUEUES rather than blocking, does NO disk I/O, and a
+    /// subsequent read still returns the queued bytes (JE checkWriteCache).
+    /// After `sync_log_end` (JE force: dequeue + fdatasync) the bytes are on
+    /// disk and readable directly.
+    #[test]
+    fn wq_enqueue_when_fsync_held_then_dequeue_on_sync() {
+        let (_dir, m) = wq_manager();
+        let off = first_log_entry_offset() as u64;
+        let data = b"hello-write-queue";
+
+        // Simulate an in-flight fsync by holding the fsync-lock.
+        {
+            let _held = m.fsync_lock.lock();
+            // Write while the lock is held → must enqueue (no I/O).
+            m.write_buffer_to_file(0, data, off).unwrap();
+            // Nothing on disk yet: the file is still just the header.
+            let mut disk = vec![0u8; data.len()];
+            let handle = m.get_file_handle(0).unwrap();
+            let n = handle.acquire().unwrap().read_at(off, &mut disk).unwrap();
+            assert_eq!(n, 0, "enqueued bytes must NOT be on disk yet");
+            // But a read THROUGH the FileManager sees the queued bytes
+            // (checkWriteCache overlay).
+            let mut via = vec![0u8; data.len()];
+            let n2 = m.read_from_file(0, off, &mut via).unwrap();
+            assert_eq!(n2, data.len());
+            assert_eq!(&via, data, "read must overlay the write queue");
+        }
+
+        // fsync-lock released. sync_log_end drains the queue then fdatasyncs.
+        m.sync_log_end().unwrap();
+        let mut disk = vec![0u8; data.len()];
+        let handle = m.get_file_handle(0).unwrap();
+        let n = handle.acquire().unwrap().read_at(off, &mut disk).unwrap();
+        assert_eq!(n, data.len(), "dequeue must have written to disk");
+        assert_eq!(&disk, data);
+    }
+
+    /// When the fsync-lock is FREE, `write_to_file` takes it and writes
+    /// directly — no queueing (JE writeToFile: tryLock succeeds).
+    #[test]
+    fn wq_direct_write_when_fsync_free() {
+        let (_dir, m) = wq_manager();
+        let off = first_log_entry_offset() as u64;
+        let data = b"direct";
+        m.write_buffer_to_file(0, data, off).unwrap();
+        // No queued bytes remain.
+        assert_eq!(m.write_queue.lock().as_ref().unwrap().pos, 0);
+        let mut disk = vec![0u8; data.len()];
+        let handle = m.get_file_handle(0).unwrap();
+        let n = handle.acquire().unwrap().read_at(off, &mut disk).unwrap();
+        assert_eq!(n, data.len());
+        assert_eq!(&disk, data);
+    }
+
+    /// A queue overflow (write larger than the queue) falls back to a direct
+    /// write (JE enqueueWrite returns false -> writeToFile does the direct
+    /// write). Driven from a helper thread so the fsync-lock can be held by
+    /// the test thread to force the enqueue attempt, then released so the
+    /// writer's blocking fallback acquire succeeds.
+    #[test]
+    fn wq_overflow_falls_back_to_direct_write() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = TempDir::new().unwrap();
+        let m = Arc::new(
+            FileManager::new(dir.path(), false, 10_000_000, 100).unwrap(),
+        );
+        m.configure_write_queue(true, 1 << 12); // tiny 4 KiB queue
+        m.create_file(0).unwrap();
+        let off = first_log_entry_offset() as u64;
+        let big = vec![0xABu8; (1 << 12) + 100]; // larger than the queue
+
+        // Hold the fsync-lock so the writer's try_lock fails and it attempts
+        // to enqueue; the enqueue overflows (data > queue) and the writer
+        // falls through to the BLOCKING fsync-lock acquire for a direct write.
+        let holding = Arc::new(AtomicBool::new(true));
+        let m2 = Arc::clone(&m);
+        let big2 = big.clone();
+        let writer = std::thread::spawn(move || {
+            m2.write_buffer_to_file(0, &big2, off).unwrap();
+        });
+        // Give the writer time to attempt enqueue + overflow, then release.
+        {
+            let held = m.fsync_lock.lock();
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            drop(held);
+            holding.store(false, Ordering::Relaxed);
+        }
+        writer.join().unwrap();
+        assert!(!holding.load(Ordering::Relaxed));
+
+        // The oversized write landed directly on disk.
+        let mut disk = vec![0u8; big.len()];
+        let handle = m.get_file_handle(0).unwrap();
+        let n = handle.acquire().unwrap().read_at(off, &mut disk).unwrap();
+        assert_eq!(n, big.len());
+        assert_eq!(disk, big);
+        // Overflow counter bumped.
+        assert!(m.n_write_queue_overflow.load(Ordering::Relaxed) >= 1);
+    }
+
+    /// Non-contiguous queued write is a fatal LOG_INTEGRITY error (JE
+    /// enqueueWrite1: `curPos + qwStartingOffset != destOffset`).
+    #[test]
+    fn wq_non_contiguous_write_is_integrity_error() {
+        let (_dir, m) = wq_manager();
+        let off = first_log_entry_offset() as u64;
+        {
+            let _held = m.fsync_lock.lock();
+            m.write_buffer_to_file(0, b"aaaa", off).unwrap();
+            // Next queued write must be at off+4; a gap is an integrity error.
+            let err = m.write_buffer_to_file(0, b"bbbb", off + 100);
+            assert!(err.is_err(), "non-contiguous queued write must fail");
+        }
+    }
+
+    /// A read of the current end-of-log that starts exactly at the queue's
+    /// starting offset returns the queued bytes even when the disk copy is
+    /// short (JE checkWriteCache: bytes only in the queue).
+    #[test]
+    fn wq_read_overlay_extends_short_disk_read() {
+        let (_dir, m) = wq_manager();
+        let off = first_log_entry_offset() as u64;
+        let data = b"queued-only-bytes";
+        {
+            let _held = m.fsync_lock.lock();
+            m.write_buffer_to_file(0, data, off).unwrap();
+            let mut buf = vec![0u8; data.len()];
+            // random-read path must also overlay.
+            let n = m.read_from_file_random(0, off, &mut buf).unwrap();
+            assert_eq!(n, data.len());
+            assert_eq!(&buf, data);
+        }
     }
 }
