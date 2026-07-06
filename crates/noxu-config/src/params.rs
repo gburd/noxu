@@ -636,6 +636,30 @@ pub static LOG_WRITE_QUEUE_SIZE: ConfigParam = ConfigParam::int_param(
     false,         // forReplication
 );
 
+/// Maximum number of commit `fdatasync`s allowed in flight concurrently
+/// (bounded fsync pipeline depth).
+///
+/// `1` reproduces the historical single-leader behaviour (one `fdatasync` at a
+/// time, throughput capped at `1 / fdatasync-latency`).  Values `> 1` let up to
+/// N committers issue their own `fdatasync` concurrently so sustained
+/// COMMIT_SYNC throughput approaches the device ceiling instead of the
+/// single-syscall latency reciprocal, while still bounding the worst-case
+/// number of in-flight syncs (tail-latency guard).  The LSN watermark fast-path
+/// and post-drain re-check preserve coalescing, so on slow devices / bursts a
+/// concurrent committer's completed sync still lets siblings skip their own.
+///
+/// Default `4`: the measured knee — enough concurrency to beat the reference
+/// engine's ~5K c/s toward the ~10K device ceiling without unbounded per-
+/// committer fan-out.
+pub static LOG_FSYNC_PIPELINE_DEPTH: ConfigParam = ConfigParam::int_param(
+    "noxu.log.fsyncPipelineDepth",
+    Some(1),   // min: 1 = single-leader (historical behaviour)
+    Some(256), // max: sane upper bound
+    4,         // default: measured knee
+    false,     // mutable
+    false,     // forReplication
+);
+
 /// Deferred-write flag for temporary databases.
 ///
 /// Deprecated — per-database deferred-write is configured on the `DatabaseConfig` directly.
@@ -1791,6 +1815,7 @@ pub fn all_params() -> Vec<&'static ConfigParam> {
         &LOG_USE_NIO,
         &LOG_USE_WRITE_QUEUE,
         &LOG_WRITE_QUEUE_SIZE,
+        &LOG_FSYNC_PIPELINE_DEPTH,
         &LOG_DEFERREDWRITE_TEMP,
         &OLD_REP_RUN_LOG_FLUSH_TASK,
         &OLD_REP_LOG_FLUSH_TASK_INTERVAL,

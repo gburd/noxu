@@ -327,6 +327,7 @@ impl Environment {
             log_use_odsync: config.log_use_odsync,
             log_use_write_queue: config.log_use_write_queue,
             log_write_queue_size: config.log_write_queue_size,
+            log_fsync_pipeline_depth: config.log_fsync_pipeline_depth,
             log_group_commit_threshold: config.log_group_commit_threshold,
             log_group_commit_interval_ms: config.log_group_commit_interval_ms,
             // B-tree

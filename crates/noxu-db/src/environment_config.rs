@@ -323,6 +323,12 @@ pub struct EnvironmentConfig {
     /// Mirrors `LOG_WRITE_QUEUE_SIZE` / default 1 MiB.
     pub log_write_queue_size: usize,
 
+    /// Maximum number of commit `fdatasync`s allowed in flight concurrently
+    /// (bounded fsync pipeline depth).  `1` = single-leader (historical);
+    /// `>1` lets committers fdatasync concurrently for higher sustained
+    /// COMMIT_SYNC throughput.  Mirrors `LOG_FSYNC_PIPELINE_DEPTH` / default 4.
+    pub log_fsync_pipeline_depth: usize,
+
     /// Group-commit waiter threshold.  0 = disabled.
     /// Mirrors `LOG_GROUP_COMMIT_THRESHOLD` / default 0.
     pub log_group_commit_threshold: usize,
@@ -807,6 +813,7 @@ impl EnvironmentConfig {
             log_use_odsync: false,
             log_use_write_queue: true,
             log_write_queue_size: 1024 * 1024,
+            log_fsync_pipeline_depth: 4,
             log_group_commit_threshold: 0,
             log_group_commit_interval_ms: 0,
             // B-tree
@@ -1207,6 +1214,13 @@ impl EnvironmentConfig {
     }
     pub fn set_log_write_queue_size(&mut self, bytes: usize) -> &mut Self {
         self.log_write_queue_size = bytes;
+        self
+    }
+    /// Sets the bounded fsync pipeline depth (max concurrent commit
+    /// `fdatasync`s).  `1` = single-leader (historical behaviour); `>1` lets
+    /// committers fdatasync concurrently.  Clamped to `>= 1`.
+    pub fn set_log_fsync_pipeline_depth(&mut self, n: usize) -> &mut Self {
+        self.log_fsync_pipeline_depth = n.max(1);
         self
     }
     pub fn set_log_group_commit_threshold(&mut self, n: usize) -> &mut Self {
