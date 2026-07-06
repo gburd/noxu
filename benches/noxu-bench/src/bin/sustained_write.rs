@@ -143,7 +143,11 @@ fn main() {
             .with_log_group_commit(
                 envp("SW_GRPC_THRESHOLD", 0) as usize,
                 envp("SW_GRPC_INTERVAL_MS", 0),
-            ),
+            )
+            // Background no-sync flusher: drains log buffers to the page cache
+            // ahead of the committer's fdatasync (closest existing analog to
+            // JE's Write Queue write-ahead). 0 = disabled (default).
+            .with_log_flush_no_sync_interval_ms(envp("SW_FLUSH_MS", 0)),
     ).expect("open env"));
     let db = Arc::new(env.open_database(
         None, "sustained",
