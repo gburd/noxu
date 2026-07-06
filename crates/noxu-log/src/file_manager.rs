@@ -1412,22 +1412,34 @@ impl FileManager {
             return Ok(());
         }
 
-        // JE force(): take the fsync-lock, drain the write queue, fdatasync.
-        let _fsync = self.fsync_lock.lock();
-        if self.write_queue_enabled() {
-            // Flush any queued writes so their bytes are on disk and covered
-            // by the fdatasync below (JE `dequeuePendingWrites1()` before
-            // `ch.force(false)`).
-            self.dequeue_pending_writes1()?;
+        // JE force(): take the fsync-lock ONLY to drain the write queue (the
+        // queue is shared mutable state), then RELEASE it before the fdatasync
+        // so concurrent committers' fdatasyncs can overlap (bounded fsync
+        // pipeline).  Holding the lock across the fdatasync would reserialise
+        // every committer to one-sync-at-a-time — the exact bottleneck we are
+        // removing.  The dequeue-before-fdatasync ordering is preserved: any
+        // queued bytes are pwritten (into the page cache) under the lock, so
+        // the fdatasync below — which is idempotent and covers ALL prior
+        // page-cache writes — makes them durable.
+        {
+            let _fsync = self.fsync_lock.lock();
+            if self.write_queue_enabled() {
+                // Flush any queued writes so their bytes are in the page cache
+                // and covered by the fdatasync below (JE
+                // `dequeuePendingWrites1()` before `ch.force(false)`).
+                self.dequeue_pending_writes1()?;
+            }
         }
+        // fsync-lock released — the fdatasync runs WITHOUT it, so up to N
+        // committers can fdatasync the same fd concurrently (Linux serialises
+        // fdatasync internally; it is safe concurrent with pwrite on the same
+        // descriptor).
 
         let handle = self.get_file_handle(file_num)?;
         // JE parity + write-scaling fix: fdatasync WITHOUT holding the file's
         // exclusive write latch, so concurrent pwrites (the next group's drain)
         // proceed during this in-flight fsync instead of serialising behind it
-        // (JE FileManager separate fsyncFileSynchronizer + Write Queue). The
-        // FsyncManager still serialises leaders, so only one fdatasync runs at
-        // a time; this only stops the fsync from blocking concurrent writes.
+        // (JE FileManager separate fsyncFileSynchronizer + Write Queue).
         handle.sync_data_no_latch()?;
 
         // JE force(): flush any writes queued WHILE we were fsync'ing, so a
@@ -1436,8 +1448,9 @@ impl FileManager {
         // are NOT covered by the fdatasync we just did; a committer relying on
         // them will call flush_sync again, which drains + fsyncs them. This
         // second drain matches JE exactly (the trailing dequeuePendingWrites1
-        // in force()).
+        // in force()).  Re-acquire the fsync-lock briefly for the drain only.
         if self.write_queue_enabled() {
+            let _fsync = self.fsync_lock.lock();
             self.dequeue_pending_writes1()?;
         }
         Ok(())

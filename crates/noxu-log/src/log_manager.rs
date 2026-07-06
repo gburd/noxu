@@ -211,6 +211,28 @@ impl LogManager {
         self.fsync_manager = FsyncManager::new(threshold, interval_ms);
     }
 
+    /// Configures group commit AND the bounded fsync pipeline depth.
+    ///
+    /// `pipeline_depth` (`LOG_FSYNC_PIPELINE_DEPTH`) is the maximum number of
+    /// commit `fdatasync`s allowed in flight concurrently.  `1` reproduces the
+    /// historical single-leader behaviour (one fdatasync at a time); `>1` lets
+    /// committers fdatasync concurrently so sustained COMMIT_SYNC throughput
+    /// approaches the device ceiling instead of the single-syscall latency
+    /// reciprocal.  Coalescing is preserved: the LSN watermark fast-path and
+    /// the leader/waiter piggyback still let siblings skip redundant syncs.
+    pub fn set_group_commit_pipelined(
+        &mut self,
+        threshold: usize,
+        interval_ms: u64,
+        pipeline_depth: usize,
+    ) {
+        self.fsync_manager = FsyncManager::with_pipeline_depth(
+            threshold,
+            interval_ms,
+            pipeline_depth,
+        );
+    }
+
     /// Installs the utilization tracking observer.
     ///
     /// Called by `EnvironmentImpl::open()` after creating the `LogManager` and
@@ -726,10 +748,13 @@ impl LogManager {
             // Phase A (JE flushBeforeSync): under LWL — snapshot dirty buffer
             // ranges and advance flushed_len watermarks.  The watermark advance
             // is the only operation that MUST be serialised; it prevents two
-            // drains from writing the same bytes twice.  Because the
-            // leader/waiter decision already serialised us, at most one drain
-            // runs at a time here (matching JE: flushBeforeSync runs inside
-            // doWork, after the mgrMutex decision).
+            // drains from writing the same bytes twice.  With the bounded fsync
+            // pipeline (max_leaders > 1) several leaders may reach here
+            // concurrently, but the LWL below still serialises the DRAIN: each
+            // leader captures a disjoint [prev_flushed .. eol) range because
+            // fill_flush_pending advances each buffer's flushed_len under the
+            // buffer latch before releasing the LWL.  Only the fdatasync
+            // (Phase B) runs concurrently.
             // R-1: flush_pending Vec reused across calls (clear keeps capacity).
             let (pending_snapshot, eol) = {
                 let mut guard = self.log_write_latch.lock();
@@ -753,8 +778,29 @@ impl LogManager {
             // the leader, after the pwrites land in the page cache) is correct.
             self.last_flush_lsn.store(eol.as_u64(), Ordering::Release);
 
-            // Phase B (JE executeFSync → syncLogEnd): the single fdatasync that
-            // covers every committer whose bytes were in the drained buffer.
+            // NO post-drain coalescing skip here.  A tempting optimization is
+            // to skip our fdatasync if a concurrent leader already advanced
+            // `last_synced_lsn >= eol`.  That is UNSAFE with the Write Queue:
+            // our drained bytes may have been ENQUEUED (not yet pwritten to the
+            // page cache) if we lost the fsync_lock try_lock during the drain.
+            // A concurrent leader B that set `last_synced_lsn >= eol` need not
+            // have dequeued OUR queued bytes before its fdatasync (B's drain
+            // skipped our range once we marked it flushed under the LWL), so
+            // B's fdatasync may not cover them — skipping our own fdatasync
+            // would report durable before our bytes are on stable storage.
+            // Coalescing is instead provided SAFELY by the leader/waiter
+            // piggyback (a waiter's bytes are provably captured by its
+            // leader's drain via the pin-count barrier, and that leader's
+            // sync_log_end dequeues the queue before its fdatasync) and by the
+            // pre-drain fast-path in `flush_sync_if_needed`.
+
+            // Phase B (JE executeFSync → syncLogEnd): the fdatasync that covers
+            // every committer whose bytes were in the drained buffer.  It first
+            // dequeues any queued writes (under the fsync-lock, briefly) so our
+            // OWN drained bytes — whether pwritten directly or enqueued during
+            // the drain — are in the page cache before this fdatasync.  With
+            // the bounded pipeline, up to `max_leaders` of these run
+            // concurrently (the fdatasync itself is not under the fsync-lock).
             self.file_manager
                 .sync_log_end()
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -766,12 +812,29 @@ impl LogManager {
         match self.fsync_manager.flush_and_sync(leader_work) {
             Ok(eol) => {
                 // Durability watermark: advanced ONLY after a successful
-                // fdatasync, ONLY by the leader (inside flush_and_sync).
-                // `flush_sync_if_needed` keys its skip decision off this.  A
-                // waiter sees the leader's stored value (Release/Acquire) and
-                // returns it (see flush_and_sync), so the waiter's subsequent
+                // fdatasync (or after the coalescing re-check confirmed a
+                // concurrent leader already synced past `eol`).  With the
+                // bounded fsync pipeline several leaders complete concurrently
+                // and may finish out of LSN order, so advance MONOTONICALLY via
+                // a CAS loop (never regress): a leader with a smaller `eol`
+                // completing after one with a larger `eol` must NOT roll the
+                // durable watermark backwards.  `flush_sync_if_needed` keys its
+                // skip decision off this; a waiter returns the leader's stored
+                // value (Release/Acquire) so its subsequent
                 // flush_sync_if_needed observes last_synced_lsn >= its lsn.
-                self.last_synced_lsn.store(eol.as_u64(), Ordering::Release);
+                let new = eol.as_u64();
+                let mut cur = self.last_synced_lsn.load(Ordering::Relaxed);
+                while cur < new {
+                    match self.last_synced_lsn.compare_exchange_weak(
+                        cur,
+                        new,
+                        Ordering::Release,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => break,
+                        Err(observed) => cur = observed,
+                    }
+                }
                 Ok(eol)
             }
             Err(e) => {

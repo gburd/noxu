@@ -250,9 +250,14 @@ impl FSyncGroup {
 ///
 /// Mirrors the fields that protects with `mgrMutex`.
 struct FsyncState {
-    /// True while a leader thread is performing (or about to perform) an fsync.
-    work_in_progress: bool,
-    /// The group that newly-arriving threads join while work is in progress.
+    /// Number of leader threads currently performing (or about to perform) an
+    /// fsync.  Historically a `bool` (`work_in_progress`); widened to a counter
+    /// for the bounded fsync pipeline: up to `max_leaders` threads may be
+    /// leaders (and thus fdatasync) concurrently.  `max_leaders == 1`
+    /// reproduces the original single-leader behaviour exactly.
+    leaders_in_progress: usize,
+    /// The group that newly-arriving threads join while all leader slots are
+    /// busy.
     next_fsync_waiters: Arc<FSyncGroup>,
     /// Count of threads currently in `next_fsync_waiters`.
     num_next_waiters: usize,
@@ -284,6 +289,10 @@ pub struct FsyncManager {
     grpc_interval_ms: u64,
     /// Whether group-commit waiting is active (`grpcInterval != 0 && grpcThreshold != 0`).
     grp_wait_on: bool,
+    /// Maximum number of concurrent leaders (bounded fsync pipeline depth).
+    /// `1` = original single-leader behaviour; `>1` lets up to N committers
+    /// fdatasync concurrently (`LOG_FSYNC_PIPELINE_DEPTH`).
+    max_leaders: usize,
     /// Timeout for waiting threads before they do their own fsync.
     /// (the: `LOG_FSYNC_TIMEOUT`, default 500 ms.)
     fsync_timeout: Duration,
@@ -320,6 +329,23 @@ impl FsyncManager {
         Self::with_clock(grpc_threshold, grpc_interval_ms, RealClock::arc())
     }
 
+    /// Create a new `FsyncManager` with an explicit bounded fsync pipeline
+    /// depth (`max_leaders`).  `1` reproduces the single-leader behaviour;
+    /// `>1` lets up to N committers fdatasync concurrently.
+    pub fn with_pipeline_depth(
+        grpc_threshold: usize,
+        grpc_interval_ms: u64,
+        pipeline_depth: usize,
+    ) -> Self {
+        let mut m = Self::with_clock(
+            grpc_threshold,
+            grpc_interval_ms,
+            RealClock::arc(),
+        );
+        m.max_leaders = pipeline_depth.max(1);
+        m
+    }
+
     /// Create a new `FsyncManager` with an injectable [`Clock`] (DST M1.1).
     ///
     /// Production uses [`FsyncManager::new`] (which passes [`RealClock`]); DST
@@ -336,10 +362,13 @@ impl FsyncManager {
             grpc_threshold,
             grpc_interval_ms,
             grp_wait_on,
+            // Default single-leader; production overrides via
+            // `with_pipeline_depth` from `LOG_FSYNC_PIPELINE_DEPTH`.
+            max_leaders: 1,
             // default timeout: 500 ms.
             fsync_timeout: Duration::from_millis(500),
             state: Mutex::new(FsyncState {
-                work_in_progress: false,
+                leaders_in_progress: 0,
                 next_fsync_waiters: FSyncGroup::new(),
                 num_next_waiters: 0,
                 start_next_wait_ns: None,
@@ -393,8 +422,8 @@ impl FsyncManager {
         {
             let mut state = self.state.lock();
 
-            if state.work_in_progress {
-                // Join the next-waiters cohort.
+            if state.leaders_in_progress >= self.max_leaders {
+                // All leader slots busy — join the next-waiters cohort.
                 need_to_wait = true;
                 my_group = Some(Arc::clone(&state.next_fsync_waiters));
                 state.num_next_waiters += 1;
@@ -410,10 +439,10 @@ impl FsyncManager {
                     self.leader_condvar.notify_one();
                 }
             } else {
-                // Become the leader.
+                // A leader slot is free — become a leader.
                 is_leader = true;
                 do_my_work = true;
-                state.work_in_progress = true;
+                state.leaders_in_progress += 1;
 
                 if self.grp_wait_on {
                     state = self.grpc_wait(state);
@@ -429,7 +458,13 @@ impl FsyncManager {
         // state lock released.
 
         // ── Phase 2: if we're a waiter, block until woken ────────────────
-        if need_to_wait {
+        // Loop so a thread woken to lead (DoLeaderFsync) that finds every
+        // leader slot still full RE-WAITS instead of running an uncounted solo
+        // fsync.  Re-waiting is what makes the pipeline bound HARD: at most
+        // `max_leaders` fdatasyncs are ever in flight from the leader path
+        // (the only uncounted fsync is the DoTimeoutFsync backstop, which is
+        // the 500 ms liveness valve and fires only if the pipeline stalls).
+        while need_to_wait {
             let group = my_group.as_ref().unwrap();
             let wait_status =
                 group.wait_for_event(&*self.clock, self.fsync_timeout);
@@ -446,17 +481,32 @@ impl FsyncManager {
                     return Ok(Lsn::from_u64(group.result_lsn()));
                 }
                 WaitStatus::DoLeaderFsync => {
-                    // Attempt to become the new leader for this cohort.
+                    // Attempt to become a new leader for this cohort.
                     let mut state = self.state.lock();
-                    if state.work_in_progress {
-                        // Another thread started new work while we were being
-                        // woken up — do our own work as a safety measure.
-                        // (JE: "Ensure that an fsync is done before returning")
-                        do_my_work = true;
+                    if state.leaders_in_progress >= self.max_leaders {
+                        // All leader slots filled while we were being woken.
+                        // RE-WAIT rather than run an uncounted solo fsync: join
+                        // the current next-waiters cohort afresh and loop back
+                        // to the wait above.  This keeps the pipeline bound
+                        // hard (never more than `max_leaders` concurrent
+                        // fdatasyncs) and preserves coalescing — we will
+                        // piggyback on, or lead, the next freed slot.  A leader
+                        // finishing always `wakeup_one`s the next cohort, so we
+                        // are guaranteed to be re-woken (the fsync_timeout is
+                        // the backstop).
+                        my_group = Some(Arc::clone(&state.next_fsync_waiters));
+                        state.num_next_waiters += 1;
+                        if self.grp_wait_on && state.num_next_waiters == 1 {
+                            state.start_next_wait_ns =
+                                Some(self.clock.now_nanos());
+                        }
+                        // need_to_wait stays true → loop and wait again.
+                        continue;
                     } else {
                         is_leader = true;
                         do_my_work = true;
-                        state.work_in_progress = true;
+                        need_to_wait = false;
+                        state.leaders_in_progress += 1;
 
                         if self.grp_wait_on {
                             state = self.grpc_wait(state);
@@ -470,8 +520,14 @@ impl FsyncManager {
                     }
                 }
                 WaitStatus::DoTimeoutFsync => {
-                    // Timed out — do our own work regardless (JE DO_TIMEOUT_FSYNC).
+                    // Timed out — do our own work regardless (JE
+                    // DO_TIMEOUT_FSYNC).  This is the liveness backstop and the
+                    // only fsync outside the leader-slot accounting; it is
+                    // durability-safe (fdatasync is idempotent and covers all
+                    // prior page-cache writes) and rare (only if the pipeline
+                    // stalls past `fsync_timeout`).
                     do_my_work = true;
+                    need_to_wait = false;
                     self.n_fsync_timeouts.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -503,11 +559,14 @@ impl FsyncManager {
                     Ok(eol) => in_prog.wakeup_all(*eol),
                     Err(e) => in_prog.wakeup_all_with_error(e.to_string()),
                 }
-                // Wake one member of the next cohort to become the new leader,
-                // then clear work_in_progress — matching JE ordering.
+                // Free our leader slot, then wake one member of the next
+                // cohort so it can fill the freed slot (become a leader) —
+                // matching JE ordering (wake next, then release the slot).
+                // With max_leaders > 1 several leaders may run this
+                // concurrently; the counter is guarded by `state`.
                 let mut state = self.state.lock();
                 state.next_fsync_waiters.wakeup_one();
-                state.work_in_progress = false;
+                state.leaders_in_progress -= 1;
             }
 
             result.map(Lsn::from_u64)
@@ -1091,6 +1150,190 @@ mod tests {
             }));
         }
 
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
+    // ── Bounded fsync pipeline (LOG_FSYNC_PIPELINE_DEPTH) ──────────────────
+
+    /// N=1 (`with_pipeline_depth(_,_,1)`) is EXACTLY the historical
+    /// single-leader behaviour: at most one fsync runs at a time.  Uses a
+    /// concurrency-observing counter inside the fsync closure to assert the
+    /// peak in-flight fsync count never exceeds 1.
+    #[test]
+    fn test_pipeline_depth_one_serializes() {
+        use std::sync::atomic::AtomicUsize;
+        const N: usize = 8;
+        let mgr = Arc::new(FsyncManager::with_pipeline_depth(0, 0, 1));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(std::sync::Barrier::new(N));
+        let handles: Vec<_> = (0..N)
+            .map(|_| {
+                let m = Arc::clone(&mgr);
+                let inf = Arc::clone(&in_flight);
+                let pk = Arc::clone(&peak);
+                let b = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    b.wait();
+                    for _ in 0..4 {
+                        m.flush_and_sync(|| {
+                            let cur =
+                                inf.fetch_add(1, Ordering::SeqCst) + 1;
+                            pk.fetch_max(cur, Ordering::SeqCst);
+                            std::thread::sleep(Duration::from_millis(2));
+                            inf.fetch_sub(1, Ordering::SeqCst);
+                            Ok(0)
+                        })
+                        .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "depth=1 must serialise fsyncs (one leader at a time)"
+        );
+    }
+
+    /// N>1 lets fsyncs run CONCURRENTLY: with depth 4 and 8 threads issuing a
+    /// slow fsync, the peak in-flight count must exceed 1 (the whole point of
+    /// the bounded pipeline) yet never exceed the configured depth (the
+    /// bound).
+    #[test]
+    fn test_pipeline_depth_allows_bounded_concurrency() {
+        use std::sync::atomic::AtomicUsize;
+        const N: usize = 8;
+        const DEPTH: usize = 4;
+        let mgr = Arc::new(FsyncManager::with_pipeline_depth(0, 0, DEPTH));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(std::sync::Barrier::new(N));
+        let handles: Vec<_> = (0..N)
+            .map(|_| {
+                let m = Arc::clone(&mgr);
+                let inf = Arc::clone(&in_flight);
+                let pk = Arc::clone(&peak);
+                let b = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    b.wait();
+                    for _ in 0..20 {
+                        m.flush_and_sync(|| {
+                            let cur =
+                                inf.fetch_add(1, Ordering::SeqCst) + 1;
+                            pk.fetch_max(cur, Ordering::SeqCst);
+                            std::thread::sleep(Duration::from_millis(3));
+                            inf.fetch_sub(1, Ordering::SeqCst);
+                            Ok(0)
+                        })
+                        .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let peak = peak.load(Ordering::SeqCst);
+        assert!(
+            peak > 1,
+            "depth={DEPTH} must allow concurrent fsyncs (peak in-flight \
+             {peak} should exceed 1)"
+        );
+        assert!(
+            peak <= DEPTH,
+            "peak in-flight {peak} must never exceed the configured depth \
+             {DEPTH} (the pipeline bound)"
+        );
+    }
+
+    /// Durability at N>1: `fsync-before-commit` must STILL hold with the
+    /// bounded pipeline.  Same invariant as `test_fsync_before_commit_invariant`
+    /// but with depth 4 and monotonic-max coverage in the closure (mirroring
+    /// the LogManager CAS-advance of `last_synced_lsn`): every committer's
+    /// returned durable watermark must cover its own commit LSN even though up
+    /// to 4 fsyncs may complete out of order.
+    #[test]
+    fn test_fsync_before_commit_invariant_pipelined() {
+        use std::sync::atomic::AtomicU64;
+        const N_THREADS: usize = 8;
+        const OPS_PER_THREAD: usize = 200;
+        const DEPTH: usize = 4;
+
+        let next_lsn = Arc::new(AtomicU64::new(1));
+        let flushed_lsn = Arc::new(AtomicU64::new(0));
+        let snap_lsn = Arc::new(AtomicU64::new(0));
+        let mgr =
+            Arc::new(FsyncManager::with_pipeline_depth(0, 0, DEPTH));
+        let barrier = Arc::new(std::sync::Barrier::new(N_THREADS));
+        let mut handles = vec![];
+
+        for _ in 0..N_THREADS {
+            let mgr2 = Arc::clone(&mgr);
+            let b = Arc::clone(&barrier);
+            let nl = Arc::clone(&next_lsn);
+            let fl = Arc::clone(&flushed_lsn);
+            let sl = Arc::clone(&snap_lsn);
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+                for _ in 0..OPS_PER_THREAD {
+                    let my_lsn = nl.fetch_add(1, Ordering::SeqCst);
+                    // Advance snap_lsn (the "drained watermark") to >= my_lsn.
+                    let mut cur = sl.load(Ordering::Relaxed);
+                    while cur < my_lsn {
+                        match sl.compare_exchange(
+                            cur,
+                            my_lsn,
+                            Ordering::SeqCst,
+                            Ordering::Relaxed,
+                        ) {
+                            Ok(_) => break,
+                            Err(a) => cur = a,
+                        }
+                    }
+                    let fl2 = Arc::clone(&fl);
+                    let sl2 = Arc::clone(&sl);
+                    let durable = mgr2
+                        .flush_and_sync(move || {
+                            // "fsync": cover everything drained so far, and
+                            // monotonically advance flushed_lsn (CAS-max, as
+                            // LogManager does for last_synced_lsn under the
+                            // pipeline).
+                            let covered = sl2.load(Ordering::SeqCst);
+                            let mut f = fl2.load(Ordering::Relaxed);
+                            while f < covered {
+                                match fl2.compare_exchange(
+                                    f,
+                                    covered,
+                                    Ordering::SeqCst,
+                                    Ordering::Relaxed,
+                                ) {
+                                    Ok(_) => break,
+                                    Err(a) => f = a,
+                                }
+                            }
+                            Ok(covered)
+                        })
+                        .unwrap();
+                    assert!(
+                        durable.as_u64() >= my_lsn,
+                        "pipelined fsync-before-commit violated: \
+                         durable={} < commit_lsn={my_lsn}",
+                        durable.as_u64()
+                    );
+                    assert!(
+                        fl.load(Ordering::SeqCst) >= my_lsn,
+                        "pipelined fsync-before-commit violated: \
+                         flushed_lsn < commit_lsn={my_lsn}"
+                    );
+                }
+            }));
+        }
         for h in handles {
             h.join().unwrap();
         }

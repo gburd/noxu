@@ -85,22 +85,35 @@ impl FileHandle {
     /// writes are queued, so pwrites proceed DURING an in-flight fsync.
     ///
     /// On Linux, `fdatasync(fd)` is safe concurrent with `pwrite(fd)` on the
-    /// same descriptor (the kernel serialises internally); we only need the
-    /// `file` Mutex briefly to borrow the `&File`, NOT the write latch. The
-    /// FsyncManager still serialises LEADERS (one fdatasync at a time), so
-    /// this does not issue overlapping fsyncs — it only stops the fsync from
-    /// blocking concurrent pwrites by the next group's drain.
+    /// same descriptor (the kernel serialises internally); we dup the fd and
+    /// release the `file` Mutex before the sync, NOT the write latch. With the
+    /// bounded fsync pipeline the FsyncManager admits up to N leaders, so up to
+    /// N fdatasyncs on this handle may be in flight concurrently — each covers
+    /// all prior page-cache writes and CAS-advances the durable watermark
+    /// monotonically, so overlap is safe.
     pub fn sync_data_no_latch(&self) -> Result<()> {
-        let file_guard = self.file.lock();
-        let file = file_guard.as_ref().ok_or_else(|| {
-            LogError::Internal("FileHandle not initialized".to_string())
-        })?;
+        // Clone the underlying file descriptor (dup(2)) while briefly holding
+        // the `file` Mutex, then RELEASE the mutex before the fdatasync so
+        // concurrent committers' fdatasyncs on the same log file overlap
+        // (bounded fsync pipeline).  Holding the mutex across `sync_data()`
+        // would reserialise every fsync on this handle to one-at-a-time — the
+        // per-handle analogue of the fsync-lock bottleneck.  `dup(2)` is a
+        // ~microsecond syscall; the fdatasync it unblocks is 100-700us, so the
+        // clone cost is negligible and it lets the kernel pipeline the syncs
+        // (fdatasync is safe concurrent with pwrite on the same file on Linux).
+        let synced = {
+            let file_guard = self.file.lock();
+            let file = file_guard.as_ref().ok_or_else(|| {
+                LogError::Internal("FileHandle not initialized".to_string())
+            })?;
+            file.try_clone()?
+        };
+        // `file` Mutex released — fdatasync runs without it.
         // DST fault layer (inactive in production).
         if crate::faultdisk::on_fsync() {
-            drop(file_guard);
             crate::faultdisk::power_cut();
         }
-        file.sync_data()?;
+        synced.sync_data()?;
         Ok(())
     }
 
