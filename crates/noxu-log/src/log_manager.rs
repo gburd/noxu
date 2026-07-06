@@ -746,61 +746,88 @@ impl LogManager {
         // the post-drain `eol` so the caller can advance the watermarks.
         let leader_work = || -> std::io::Result<u64> {
             // Phase A (JE flushBeforeSync): under LWL — snapshot dirty buffer
-            // ranges and advance flushed_len watermarks.  The watermark advance
-            // is the only operation that MUST be serialised; it prevents two
-            // drains from writing the same bytes twice.  With the bounded fsync
-            // pipeline (max_leaders > 1) several leaders may reach here
-            // concurrently, but the LWL below still serialises the DRAIN: each
-            // leader captures a disjoint [prev_flushed .. eol) range because
-            // fill_flush_pending advances each buffer's flushed_len under the
-            // buffer latch before releasing the LWL.  Only the fdatasync
-            // (Phase B) runs concurrently.
+            // ranges, advance flushed_len watermarks, FORCE-pwrite each range
+            // to the page cache, THEN capture `eol`.
+            //
+            // DURABILITY-CRITICAL ORDERING (pipeline depth > 1 fix): the pwrites
+            // are done UNDER the LWL and BEFORE `eol` is captured, and they
+            // force a direct write (never enqueue into the Write Queue).  This
+            // is what makes the concurrent-leader watermark advance sound.
+            //
+            //   * The LWL serialises leaders, so a leader that captures `eol_X`
+            //     does so only after every byte below `eol_X` (its own cohort
+            //     AND every earlier leader's cohort) has been force-pwritten to
+            //     the page cache — no bytes below `eol_X` remain queued.
+            //   * fdatasync is global/idempotent: it flushes ALL dirty
+            //     page-cache pages for the fd.  So this leader's Phase-B
+            //     fdatasync (issued after the LWL is released, hence after all
+            //     bytes < `eol_X` are in the page cache) makes every byte below
+            //     `eol_X` durable — regardless of which cohort wrote it.
+            //   * Therefore advancing `last_synced_lsn` to `eol_X` after this
+            //     leader's fdatasync is correct: any offset < the published
+            //     watermark was force-pwritten (page cache) by some leader
+            //     BEFORE that leader's completed fdatasync covered it.
+            //
+            // The previous design pwrote OUTSIDE the LWL and allowed the drain
+            // to enqueue (flush_write_queue=false).  Both broke the invariant:
+            // (a) enqueue left a committer's bytes in the Write Queue, not the
+            // page cache, while a higher-eol leader published past them; and
+            // (b) even with force-write, an out-of-LWL pwrite let a higher-eol
+            // leader B fdatasync + publish eol_B BEFORE a lower-eol leader A had
+            // finished pwriting its cohort [.., eol_A), so B's fdatasync could
+            // not have covered A's not-yet-pwritten bytes — yet eol_B > eol_A
+            // was published as durable.  Pwriting under the LWL before the eol
+            // capture closes both holes.  Only the fdatasync (Phase B, the
+            // expensive syscall) runs concurrently across leaders.
             // R-1: flush_pending Vec reused across calls (clear keeps capacity).
-            let (pending_snapshot, eol) = {
+            let eol = {
                 let mut guard = self.log_write_latch.lock();
                 guard.flush_pending.clear();
                 Self::fill_flush_pending(
                     &self.buffer_pool,
                     &mut guard.flush_pending,
                 );
-                let eol = self.file_manager.get_next_available_lsn();
-                (std::mem::take(&mut guard.flush_pending), eol)
+                // Force-pwrite each dirty range to the page cache while still
+                // holding the LWL, so `eol` (captured next) names only bytes
+                // that are already in the page cache and never queued.
+                let pending = std::mem::take(&mut guard.flush_pending);
+                for (data, file_num, offset) in &pending {
+                    self.file_manager
+                        .write_buffer_to_file_forced(*file_num, data, *offset)
+                        .map_err(|e| std::io::Error::other(e.to_string()))?;
+                }
+                // Return the Vec's capacity to the guard for reuse.
+                guard.flush_pending = pending;
+                guard.flush_pending.clear();
+                self.file_manager.get_next_available_lsn()
             };
-            // LWL released before I/O (Noxu invariant preserved).
+            // LWL released; the fdatasync below runs concurrently across
+            // leaders (only the cheap page-cache pwrite was serialised).
 
-            // Phase A (cont.): outside LWL — pwrite64 for each dirty range.
-            for (data, file_num, offset) in &pending_snapshot {
-                self.file_manager
-                    .write_buffer_to_file(*file_num, data, *offset)
-                    .map_err(|e| std::io::Error::other(e.to_string()))?;
-            }
             // last_flush_lsn is the page-cache watermark; advancing it here (in
-            // the leader, after the pwrites land in the page cache) is correct.
+            // the leader, after the pwrites landed in the page cache under the
+            // LWL) is correct.
             self.last_flush_lsn.store(eol.as_u64(), Ordering::Release);
 
             // NO post-drain coalescing skip here.  A tempting optimization is
             // to skip our fdatasync if a concurrent leader already advanced
-            // `last_synced_lsn >= eol`.  That is UNSAFE with the Write Queue:
-            // our drained bytes may have been ENQUEUED (not yet pwritten to the
-            // page cache) if we lost the fsync_lock try_lock during the drain.
-            // A concurrent leader B that set `last_synced_lsn >= eol` need not
-            // have dequeued OUR queued bytes before its fdatasync (B's drain
-            // skipped our range once we marked it flushed under the LWL), so
-            // B's fdatasync may not cover them — skipping our own fdatasync
-            // would report durable before our bytes are on stable storage.
-            // Coalescing is instead provided SAFELY by the leader/waiter
-            // piggyback (a waiter's bytes are provably captured by its
-            // leader's drain via the pin-count barrier, and that leader's
-            // sync_log_end dequeues the queue before its fdatasync) and by the
-            // pre-drain fast-path in `flush_sync_if_needed`.
+            // `last_synced_lsn >= eol`.  Even though our bytes are now
+            // force-pwritten to the page cache, a concurrent leader B that set
+            // `last_synced_lsn >= eol` may have ISSUED its fdatasync BEFORE our
+            // pwrite completed (B captured a higher eol under the LWL only if
+            // our pwrite preceded it — but if B's eol < our eol, B's fdatasync
+            // need not cover our bytes).  Skipping our own fdatasync is
+            // therefore unsafe in general; keep the unconditional fdatasync.
+            // Coalescing is provided SAFELY by the leader/waiter piggyback and
+            // by the pre-drain fast-path in `flush_sync_if_needed`.
 
             // Phase B (JE executeFSync → syncLogEnd): the fdatasync that covers
-            // every committer whose bytes were in the drained buffer.  It first
-            // dequeues any queued writes (under the fsync-lock, briefly) so our
-            // OWN drained bytes — whether pwritten directly or enqueued during
-            // the drain — are in the page cache before this fdatasync.  With
-            // the bounded pipeline, up to `max_leaders` of these run
-            // concurrently (the fdatasync itself is not under the fsync-lock).
+            // every byte below `eol` (all force-pwritten to the page cache
+            // before the LWL was released above).  With the bounded pipeline,
+            // up to `max_leaders` of these run concurrently (the fdatasync
+            // itself is not under the fsync-lock).  sync_log_end still drains
+            // the Write Queue first (for any NON-commit writer's queued bytes),
+            // then fdatasyncs.
             self.file_manager
                 .sync_log_end()
                 .map_err(|e| std::io::Error::other(e.to_string()))?;

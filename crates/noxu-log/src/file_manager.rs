@@ -1074,6 +1074,34 @@ impl FileManager {
         self.write_to_file(file_num, data, file_offset, false)
     }
 
+    /// Like [`write_buffer_to_file`] but FORCES a direct positioned write and
+    /// never enqueues into the Write Queue (JE `writeToFile(..., flushWriteQueue=true)`).
+    ///
+    /// This is the durability-critical variant used by the COMMIT_SYNC drain in
+    /// `LogManager::flush_sync`.  The bounded fsync pipeline (depth > 1) lets
+    /// several leaders capture disjoint drained ranges and fdatasync
+    /// concurrently; each leader then advances the durable watermark
+    /// (`last_synced_lsn`) to the logical `eol` it captured.  For that advance
+    /// to be sound, every byte below `eol` MUST already be in the OS page cache
+    /// (pwritten, not merely queued) before the leader's fdatasync runs —
+    /// otherwise a higher-eol leader could publish a watermark that names bytes
+    /// still sitting in the Write Queue that no completed fdatasync has covered.
+    /// Forcing the direct write here (never enqueue) guarantees the drained
+    /// bytes reach the page cache synchronously, so the leader's own fdatasync
+    /// — and any concurrent higher-eol leader's fdatasync — covers them.
+    ///
+    /// The Write Queue still serves NON-commit / background writers (they use
+    /// `write_buffer_to_file`, which may enqueue to overlap with an in-flight
+    /// fsync).  Only the synchronous commit flush path force-writes.
+    pub fn write_buffer_to_file_forced(
+        &self,
+        file_num: u32,
+        data: &[u8],
+        file_offset: u64,
+    ) -> Result<()> {
+        self.write_to_file(file_num, data, file_offset, true)
+    }
+
     /// Writes `data` at `file_offset` within log file `file_num`, with the JE
     /// Write Queue interposed (JE `FileManager.writeToFile`,
     /// FileManager.java:1738-1816).

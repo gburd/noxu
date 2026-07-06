@@ -12,6 +12,52 @@ use std::sync::Arc;
 
 use crate::posio;
 
+/// Test-only fdatasync probe (durability-invariant oracle seam).
+///
+/// Two process-global atomics, both `0` in production and read with a single
+/// relaxed load on the fsync path — so this is free unless a test arms it.
+/// It exists so an integration test can (a) SLOW the fdatasync deterministically
+/// (widening the concurrent-leader window that hides the pipeline durability
+/// hole) and (b) record the highest byte-EOF any COMPLETED fdatasync has made
+/// durable, which the test compares against every returned durable watermark.
+///
+/// This is NOT a production feature; nothing outside tests ever arms it.
+pub mod fsync_probe {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Microseconds to sleep at the START of each fdatasync (0 = disabled).
+    pub(super) static DELAY_US: AtomicU64 = AtomicU64::new(0);
+    /// Highest contiguous on-disk EOF (u64 LSN) that a COMPLETED fdatasync has
+    /// covered.  A committer that returns durable at LSN `L` must satisfy
+    /// `L <= SYNCED_EOF` at the moment it returns (the oracle invariant).
+    pub static SYNCED_EOF: AtomicU64 = AtomicU64::new(0);
+    /// Number of fdatasyncs that have COMPLETED (armed only).
+    pub static COMPLETED: AtomicU64 = AtomicU64::new(0);
+    /// When set, `SYNCED_EOF` tracking is active (relaxed check on the fsync
+    /// path; still one load, still ~free).
+    pub(super) static ARMED: AtomicU64 = AtomicU64::new(0);
+
+    /// Arm the probe: sleep `delay_us` at the start of each fdatasync and
+    /// track the completed-fdatasync EOF watermark.  Test-only.
+    pub fn arm(delay_us: u64) {
+        SYNCED_EOF.store(0, Ordering::SeqCst);
+        COMPLETED.store(0, Ordering::SeqCst);
+        DELAY_US.store(delay_us, Ordering::SeqCst);
+        ARMED.store(1, Ordering::SeqCst);
+    }
+
+    /// Disarm the probe (test cleanup).
+    pub fn disarm() {
+        ARMED.store(0, Ordering::SeqCst);
+        DELAY_US.store(0, Ordering::SeqCst);
+    }
+
+    /// Whether the probe is armed.
+    pub(super) fn is_armed() -> bool {
+        ARMED.load(Ordering::Relaxed) != 0
+    }
+}
+
 /// A file handle with latch protection for thread-safe I/O.
 ///
 /// The handle holds a file descriptor and an exclusive latch.
@@ -112,6 +158,56 @@ impl FileHandle {
         // DST fault layer (inactive in production).
         if crate::faultdisk::on_fsync() {
             crate::faultdisk::power_cut();
+        }
+        // Test-only durability-oracle probe (inactive in production: one
+        // relaxed load).  Capture the on-disk EOF this fdatasync is ABOUT to
+        // make durable BEFORE the sync, sleep to widen the concurrent-leader
+        // window, then — AFTER the sync completes — publish that EOF as the
+        // highest durable offset via a monotonic max.  A committer that returns
+        // durable at LSN L must observe SYNCED_EOF >= L (see the invariant
+        // test).  Capturing pre-sync and publishing post-sync is the crux: the
+        // fdatasync makes durable exactly what was in the page cache when it
+        // started, so a smaller-EOF sync completing after a larger-EOF sync
+        // must NOT roll the durable watermark backwards — monotonic max.
+        if fsync_probe::is_armed() {
+            let pre_eol = {
+                let g = self.file.lock();
+                match g.as_ref() {
+                    Some(f) => f
+                        .metadata()
+                        .map(|m| {
+                            noxu_util::Lsn::new(self.file_num, m.len() as u32)
+                                .as_u64()
+                        })
+                        .unwrap_or(0),
+                    None => 0,
+                }
+            };
+            let delay = fsync_probe::DELAY_US
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if delay > 0 {
+                std::thread::sleep(std::time::Duration::from_micros(delay));
+            }
+            synced.sync_data()?;
+            // Publish AFTER the sync completes: monotonic max so an
+            // out-of-order (smaller-EOF) completion never regresses the durable
+            // watermark the oracle checks against.
+            let mut cur = fsync_probe::SYNCED_EOF
+                .load(std::sync::atomic::Ordering::Relaxed);
+            while cur < pre_eol {
+                match fsync_probe::SYNCED_EOF.compare_exchange_weak(
+                    cur,
+                    pre_eol,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(o) => cur = o,
+                }
+            }
+            fsync_probe::COMPLETED
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return Ok(());
         }
         synced.sync_data()?;
         Ok(())
