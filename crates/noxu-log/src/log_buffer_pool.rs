@@ -291,7 +291,7 @@ impl LogBufferPool {
     /// # Safety / locking
     /// The LWL must be held by the caller.  The `bufferPoolLatch` is acquired
     /// internally for the duration of the dirty-list traversal.
-    fn write_dirty(&mut self, _flush_write_queue: bool) -> Result<()> {
+    fn write_dirty(&mut self, flush_write_queue: bool) -> Result<()> {
         let _guard = self
             .buffer_pool_latch
             .acquire()
@@ -331,10 +331,11 @@ impl LogBufferPool {
                         buffer.release();
                         drop(buffer);
 
-                        self.file_manager.write_buffer_to_file(
+                        self.file_manager.write_to_file(
                             first_lsn.file_number(),
                             &data,
                             offset,
+                            flush_write_queue,
                         )?;
                     } else {
                         buffer.release();

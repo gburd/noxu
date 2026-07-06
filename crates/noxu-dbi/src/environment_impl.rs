@@ -594,6 +594,16 @@ impl EnvironmentImpl {
                     reason: format!("failed to init FileManager: {e}"),
                 })?,
             );
+            // Enable the JE Write Queue (LOG_USE_WRITE_QUEUE /
+            // LOG_WRITE_QUEUE_SIZE) before any writes begin. Committers blocked
+            // by an in-flight fdatasync enqueue their bytes and return; the
+            // fsyncing thread drains the queue before its fdatasync. This
+            // overlaps concurrent COMMIT_SYNC writes with in-flight fsyncs
+            // (JE FileManager.LogEndFileDescriptor).
+            fm.configure_write_queue(
+                cfg.log_use_write_queue,
+                cfg.log_write_queue_size,
+            );
 
             // Run 3-phase recovery before the first write.
             //

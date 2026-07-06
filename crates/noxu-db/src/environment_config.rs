@@ -316,7 +316,7 @@ pub struct EnvironmentConfig {
     pub log_use_odsync: bool,
 
     /// Use an asynchronous write queue between the log manager and the OS.
-    /// Mirrors `LOG_USE_WRITE_QUEUE` / default false.
+    /// Mirrors `LOG_USE_WRITE_QUEUE` / default true (JE default).
     pub log_use_write_queue: bool,
 
     /// Size of the asynchronous write queue in bytes.
@@ -805,7 +805,7 @@ impl EnvironmentConfig {
             log_flush_sync_interval_ms: 0,
             log_flush_no_sync_interval_ms: 0,
             log_use_odsync: false,
-            log_use_write_queue: false,
+            log_use_write_queue: true,
             log_write_queue_size: 1024 * 1024,
             log_group_commit_threshold: 0,
             log_group_commit_interval_ms: 0,
@@ -2585,7 +2585,7 @@ mod tests {
         assert_eq!(c.log_flush_sync_interval_ms, 0);
         assert_eq!(c.log_flush_no_sync_interval_ms, 0);
         assert!(!c.log_use_odsync);
-        assert!(!c.log_use_write_queue);
+        assert!(c.log_use_write_queue);
         assert_eq!(c.log_write_queue_size, 1024 * 1024);
         assert_eq!(c.log_group_commit_threshold, 0);
         assert_eq!(c.log_group_commit_interval_ms, 0);

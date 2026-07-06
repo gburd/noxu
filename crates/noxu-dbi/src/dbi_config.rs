@@ -288,7 +288,7 @@ impl Default for DbiEnvConfig {
             log_flush_sync_interval_ms: 0,
             log_flush_no_sync_interval_ms: 0,
             log_use_odsync: false,
-            log_use_write_queue: false,
+            log_use_write_queue: true,
             log_write_queue_size: 1024 * 1024,
             log_group_commit_threshold: 0,
             log_group_commit_interval_ms: 0,

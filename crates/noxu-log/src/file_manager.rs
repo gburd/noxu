@@ -27,6 +27,48 @@ pub const LOG_FILE_EXTENSION: &str = ".ndb";
 /// Lock file name for environment locking.
 pub const LOCK_FILE_NAME: &str = "noxu.lck";
 
+/// Holds writes that were blocked by an in-flight fsync/write and enqueued
+/// for later execution by the next thread to fsync or write (JE
+/// `LogEndFileDescriptor.queuedWrites` et al., FileManager.java:2793-2802).
+///
+/// The queue only ever holds writes for a SINGLE file, appended CONTIGUOUSLY
+/// (the WAL is append-only): `qw_starting_offset` is the on-disk offset of
+/// byte 0 in `buf`, `pos` is the current fill length, and `qw_file_num` is the
+/// destination file. Guarded by its own mutex; the latch order is fsync-lock
+/// THEN this queue mutex (JE: "Latch order is fsyncFileSynchronizer, followed
+/// by the queuedWrites mutex", FileManager.java:2788-2790).
+struct WriteQueue {
+    /// Backing buffer sized to `write_queue_size` (JE `queuedWrites`).
+    buf: Box<[u8]>,
+    /// Current fill position in `buf` (JE `queuedWritesPosition`).
+    pos: usize,
+    /// On-disk offset of `buf[0]` (JE `qwStartingOffset`).
+    qw_starting_offset: u64,
+    /// Destination file number for the queued bytes (JE `qwFileNum`, -1 =
+    /// none; we use `Option` for the -1 sentinel).
+    qw_file_num: Option<u32>,
+}
+
+impl WriteQueue {
+    fn new(size: usize) -> Self {
+        WriteQueue {
+            buf: vec![0u8; size].into_boxed_slice(),
+            pos: 0,
+            qw_starting_offset: 0,
+            qw_file_num: None,
+        }
+    }
+}
+
+/// Outcome of one non-blocking enqueue attempt (JE `enqueueWrite1` throwing
+/// `RelatchRequiredException` on overflow so the caller can dequeue + retry).
+enum EnqueueOutcome {
+    /// Bytes were queued; the caller returns with no I/O.
+    Queued,
+    /// The queue would overflow; the caller must dequeue then retry.
+    Relatch,
+}
+
 /// File mode for opening log files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileMode {
@@ -110,6 +152,34 @@ pub struct FileManager {
     pub n_random_reads: AtomicU64,
     /// Total bytes from random read operations.
     pub n_random_read_bytes: AtomicU64,
+
+    // ── Write Queue (JE LogEndFileDescriptor) ──────────────────────────────
+    /// Whether the Write Queue is enabled (JE `useWriteQueue`,
+    /// `LOG_USE_WRITE_QUEUE`). Set via [`FileManager::configure_write_queue`].
+    use_write_queue: std::sync::atomic::AtomicBool,
+    /// Size of the write queue buffer in bytes (JE `writeQueueSize`,
+    /// `LOG_WRITE_QUEUE_SIZE`, default 1 MiB). Read once when the queue is
+    /// first configured.
+    write_queue_size: AtomicU64,
+    /// Non-blocking fsync latch (JE `fsyncFileSynchronizer`, a
+    /// `ReentrantLock`). A `write_buffer_to_file` caller `try_lock`s it; if it
+    /// cannot be acquired an fsync/write is in progress and the caller
+    /// enqueues instead of blocking. `sync_log_end` acquires it blocking
+    /// before its fdatasync. Committers must NEVER hold this across a return.
+    /// Guards `write_queue` (latch order: this lock THEN the queue mutex).
+    fsync_lock: Mutex<()>,
+    /// The queued writes (JE `queuedWrites` + position/offset/fileNum),
+    /// lazily allocated when the queue is first enabled.
+    write_queue: Mutex<Option<WriteQueue>>,
+    /// Stat: bytes served to readers directly from the write queue
+    /// (JE `nBytesReadFromWriteQueue`).
+    pub n_bytes_read_from_write_queue: AtomicU64,
+    /// Stat: writes flushed from the queue by a dequeue (JE
+    /// `nWritesFromWriteQueue`).
+    pub n_writes_from_write_queue: AtomicU64,
+    /// Stat: enqueue attempts that overflowed and fell back to a direct write
+    /// (JE `nWriteQueueOverflowFailures`).
+    pub n_write_queue_overflow: AtomicU64,
 }
 
 impl FileManager {
@@ -171,6 +241,19 @@ impl FileManager {
             n_sequential_write_bytes: AtomicU64::new(0),
             n_random_reads: AtomicU64::new(0),
             n_random_read_bytes: AtomicU64::new(0),
+            // Write Queue: disabled until `configure_write_queue` is called
+            // (production wires it from `DbiEnvConfig`; tests that use
+            // `FileManager::new` directly get the direct-write path, which is
+            // the pre-Write-Queue behaviour). JE reads the config at
+            // construction; Noxu defers so the many test call sites of `new`
+            // are unaffected.
+            use_write_queue: std::sync::atomic::AtomicBool::new(false),
+            write_queue_size: AtomicU64::new(1 << 20),
+            fsync_lock: Mutex::new(()),
+            write_queue: Mutex::new(None),
+            n_bytes_read_from_write_queue: AtomicU64::new(0),
+            n_writes_from_write_queue: AtomicU64::new(0),
+            n_write_queue_overflow: AtomicU64::new(0),
         };
 
         // Lock the environment
@@ -331,6 +414,256 @@ impl FileManager {
             .store(next_available_lsn.as_u64(), Ordering::Release);
         self.current_file_num
             .store(next_available_lsn.file_number(), Ordering::Release);
+    }
+
+    /// Enables/configures the Write Queue (JE reads `LOG_USE_WRITE_QUEUE` /
+    /// `LOG_WRITE_QUEUE_SIZE` in the `FileManager` constructor,
+    /// FileManager.java:341-345). Noxu defers to a setter so the many
+    /// `FileManager::new` call sites in tests keep the direct-write path;
+    /// production calls this from `environment_impl` with the values threaded
+    /// through `DbiEnvConfig`.
+    ///
+    /// Must be called before any concurrent writes begin (during environment
+    /// open, single-threaded). `size` is clamped to JE's [4 KiB, 256 MiB]
+    /// range.
+    pub fn configure_write_queue(&self, enabled: bool, size: usize) {
+        let size = size.clamp(1 << 12, 1 << 28);
+        self.write_queue_size.store(size as u64, Ordering::Release);
+        if enabled {
+            *self.write_queue.lock() = Some(WriteQueue::new(size));
+        } else {
+            *self.write_queue.lock() = None;
+        }
+        self.use_write_queue.store(enabled, Ordering::Release);
+    }
+
+    /// Whether the Write Queue is enabled (JE `useWriteQueue`).
+    fn write_queue_enabled(&self) -> bool {
+        self.use_write_queue.load(Ordering::Acquire)
+    }
+
+    /// Enqueue a blocked write for later execution (JE
+    /// `LogEndFileDescriptor.enqueueWrite` / `enqueueWrite1`,
+    /// FileManager.java:2861-2985). The fsync-lock is NOT held here.
+    ///
+    /// Returns `Ok(true)` if the bytes were queued (caller returns with no
+    /// I/O), `Ok(false)` if the queue overflowed after up-to-two dequeue
+    /// retries (caller must fall back to a direct write).
+    ///
+    /// The queue holds a single file's CONTIGUOUS writes; a
+    /// `curPos + qwStartingOffset != destOffset` mismatch is a fatal log
+    /// integrity error (JE `EnvironmentFailureReason.LOG_INTEGRITY`).
+    fn enqueue_write(
+        &self,
+        file_num: u32,
+        data: &[u8],
+        dest_offset: u64,
+    ) -> Result<bool> {
+        // JE enqueueWrite: try enqueueWrite1 up to 2x, dequeuing between
+        // attempts on a RelatchRequiredException (overflow). Give up after 2.
+        for _ in 0..2 {
+            match self.enqueue_write1(file_num, data, dest_offset)? {
+                EnqueueOutcome::Queued => return Ok(true),
+                EnqueueOutcome::Relatch => {
+                    // Overflow: dequeue current writes (JE
+                    // `dequeuePendingWrites`, which locks the fsync-lock),
+                    // then retry.
+                    self.dequeue_pending_writes()?;
+                }
+            }
+        }
+        // Give up after two tries (JE nWriteQueueOverflowFailures).
+        self.n_write_queue_overflow.fetch_add(1, Ordering::Relaxed);
+        Ok(false)
+    }
+
+    /// One enqueue attempt (JE `enqueueWrite1`, FileManager.java:2894-2985).
+    /// The fsync-lock is NOT held; the queue mutex is taken internally.
+    fn enqueue_write1(
+        &self,
+        file_num: u32,
+        data: &[u8],
+        dest_offset: u64,
+    ) -> Result<EnqueueOutcome> {
+        // JE: the queuedWrites queue only ever holds writes for a single file.
+        // If the queue currently targets an OLDER file, dequeue it first so we
+        // can retarget (JE: `if (qwFileNum < fileNum) { dequeuePendingWrites();
+        // qwFileNum = fileNum; }`, done OUTSIDE the queuedWrites mutex because
+        // dequeuePendingWrites takes the fsync-lock).
+        {
+            let need_dequeue = {
+                let q = self.write_queue.lock();
+                match q.as_ref().and_then(|q| q.qw_file_num) {
+                    Some(cur) if cur < file_num => true,
+                    _ => false,
+                }
+            };
+            if need_dequeue {
+                self.dequeue_pending_writes()?;
+                if let Some(q) = self.write_queue.lock().as_mut() {
+                    q.qw_file_num = Some(file_num);
+                }
+            }
+        }
+
+        let mut guard = self.write_queue.lock();
+        let q = match guard.as_mut() {
+            Some(q) => q,
+            // Queue disabled between the enabled-check and here: treat as
+            // overflow so the caller does a direct write.
+            None => return Ok(EnqueueOutcome::Relatch),
+        };
+
+        let size = data.len();
+        let overflow = (q.buf.len() - q.pos) < size;
+        if overflow {
+            // JE: throw RelatchRequiredException so the caller dequeues (under
+            // the fsync-lock) then retries — we cannot dequeue here without
+            // latching out of order (fsync-lock is below the queue mutex).
+            return Ok(EnqueueOutcome::Relatch);
+        }
+
+        let cur_pos = q.pos;
+        if cur_pos == 0 {
+            // First entry in the queue sets the starting offset AND (re)targets
+            // the file (covers the fresh / just-dequeued case, JE relies on
+            // qwFileNum having been set by the caller / prior branch).
+            q.qw_starting_offset = dest_offset;
+            q.qw_file_num = Some(file_num);
+        }
+
+        // JE: non-consecutive writes are a fatal LOG_INTEGRITY error — the WAL
+        // is append-only and the queue holds a single contiguous run.
+        if q.qw_starting_offset + cur_pos as u64 != dest_offset
+            || q.qw_file_num != Some(file_num)
+        {
+            return Err(LogError::Internal(format!(
+                "write queue integrity: non-consecutive queued write \
+                 (qw_file={:?} qw_start={} pos={} dest_file={file_num} \
+                 dest_offset={dest_offset})",
+                q.qw_file_num, q.qw_starting_offset, q.pos
+            )));
+        }
+
+        q.buf[cur_pos..cur_pos + size].copy_from_slice(data);
+        q.pos += size;
+        Ok(EnqueueOutcome::Queued)
+    }
+
+    /// Flush pending queued writes, acquiring the fsync-lock first (JE
+    /// `dequeuePendingWrites`, FileManager.java:2999-3010). Used from the
+    /// overflow retry path.
+    fn dequeue_pending_writes(&self) -> Result<()> {
+        let _fsync = self.fsync_lock.lock();
+        self.dequeue_pending_writes1()
+    }
+
+    /// Flush pending queued writes; the fsync-lock MUST already be held (JE
+    /// `dequeuePendingWrites1`, FileManager.java:3015-3055). Writes the queued
+    /// bytes to their destination file with a positioned write, then resets
+    /// the queue.
+    fn dequeue_pending_writes1(&self) -> Result<()> {
+        // Snapshot the queued bytes under the queue mutex, then release it
+        // before the pwrite (the file handle acquisition may block; we must
+        // not hold the queue mutex across it). Because we hold the fsync-lock,
+        // no concurrent enqueue can advance `pos` past what we snapshot: a
+        // would-be enqueuer's `write_buffer_to_file` fails its `try_lock` and
+        // enqueues — but a fresh enqueue after we reset targets a new starting
+        // offset, and any enqueue racing THIS reset is serialised by the queue
+        // mutex (we re-check pos under the mutex below).
+        let (data, file_num, offset) = {
+            let mut guard = self.write_queue.lock();
+            let q = match guard.as_mut() {
+                Some(q) if q.pos > 0 => q,
+                _ => return Ok(()), // Nothing to see here. Move along.
+            };
+            let file_num = match q.qw_file_num {
+                Some(f) => f,
+                None => return Ok(()),
+            };
+            let data = q.buf[..q.pos].to_vec();
+            let offset = q.qw_starting_offset;
+            // Reset the queue now (JE resets queuedWritesPosition = 0 after the
+            // write, still under the queuedWrites mutex + fsync-lock). We reset
+            // BEFORE releasing the queue mutex so a concurrent enqueuer that
+            // wins the queue mutex after us starts a fresh contiguous run.
+            q.pos = 0;
+            (data, file_num, offset)
+        };
+
+        // pwrite the queued bytes to the destination file (JE
+        // getWritableFile(qwFileNum) + seek + write). Route through the
+        // file-handle write path so it is covered by the DST fault layer.
+        let handle = self.get_writable_file(file_num)?;
+        {
+            let mut fh = handle.acquire()?;
+            fh.write_at(offset, &data)?;
+        }
+        self.n_writes_from_write_queue.fetch_add(1, Ordering::Relaxed);
+        self.n_sequential_write_bytes
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Get (or create) the writable file handle for `file_num` (JE
+    /// `getWritableFile`). Must be reachable while holding the fsync-lock;
+    /// uses `file_latch` for the create path exactly as `write_buffer_to_file`
+    /// does. Reuses a cached handle when present.
+    fn get_writable_file(&self, file_num: u32) -> Result<Arc<FileHandle>> {
+        let _guard = self
+            .file_latch
+            .acquire()
+            .map_err(|e| LogError::LatchTimeout(e.to_string()))?;
+        if self.file_path(file_num).exists() {
+            self.get_file_handle(file_num)
+        } else {
+            self.create_file_internal(file_num)
+        }
+    }
+
+    /// If `[requested_offset, requested_offset+buf.len())` for `file_num`
+    /// overlaps bytes still sitting in the write queue, copy the queued bytes
+    /// into `buf` and return how many were served (JE
+    /// `LogEndFileDescriptor.checkWriteCache`, FileManager.java:2808-2860).
+    ///
+    /// A reader at the end of the log may need bytes that were enqueued (and
+    /// have since cycled out of the log buffer pool). Every end-of-log reader
+    /// must consult the queue AFTER its disk read and overlay any queued bytes
+    /// that the disk read could not have seen.
+    ///
+    /// Returns the number of bytes written into `buf` starting at `buf[0]`
+    /// that correspond to file offsets `[requested_offset, ...)`. `0` means
+    /// nothing in the queue matched.
+    fn check_write_cache(
+        &self,
+        buf: &mut [u8],
+        requested_offset: u64,
+        file_num: u32,
+    ) -> usize {
+        if !self.write_queue_enabled() {
+            return 0;
+        }
+        let guard = self.write_queue.lock();
+        let q = match guard.as_ref() {
+            Some(q) => q,
+            None => return 0,
+        };
+        if q.qw_file_num != Some(file_num) || q.pos == 0 {
+            return 0;
+        }
+        let qw_end = q.qw_starting_offset + q.pos as u64;
+        // Requested range must overlap [qw_starting_offset, qw_end).
+        if requested_offset < q.qw_starting_offset || requested_offset >= qw_end
+        {
+            return 0;
+        }
+        let src_start = (requested_offset - q.qw_starting_offset) as usize;
+        let avail = q.pos - src_start;
+        let n = avail.min(buf.len());
+        buf[..n].copy_from_slice(&q.buf[src_start..src_start + n]);
+        self.n_bytes_read_from_write_queue
+            .fetch_add(n as u64, Ordering::Relaxed);
+        n
     }
 
     /// Gets a file handle for the given file number.
@@ -738,10 +1071,73 @@ impl FileManager {
         data: &[u8],
         file_offset: u64,
     ) -> Result<()> {
+        self.write_to_file(file_num, data, file_offset, false)
+    }
+
+    /// Writes `data` at `file_offset` within log file `file_num`, with the JE
+    /// Write Queue interposed (JE `FileManager.writeToFile`,
+    /// FileManager.java:1738-1816).
+    ///
+    /// `flush_write_queue = true` forces a direct write and never enqueues (JE
+    /// `flushWriteQueue` argument, set by the file-flip drain so the OLD
+    /// file's bytes land before the file switch, FileManager.java:1778).
+    ///
+    /// Algorithm (faithful to JE writeToFile):
+    ///   1. `try_lock` the fsync-lock.
+    ///   2. If NOT acquired && write-queue enabled && !flush_write_queue →
+    ///      enqueue and RETURN with no I/O.
+    ///   3. Otherwise (acquired, or enqueue overflowed): if we did not already
+    ///      hold the fsync-lock, acquire it blocking; dequeue pending writes;
+    ///      do the positioned write; release the fsync-lock.
+    pub fn write_to_file(
+        &self,
+        file_num: u32,
+        data: &[u8],
+        file_offset: u64,
+        flush_write_queue: bool,
+    ) -> Result<()> {
         if self.read_only {
             return Err(LogError::WriteFailed(
                 "Cannot write in read-only mode".to_string(),
             ));
+        }
+
+        // JE writeToFile step 1: try to grab the fsync latch (non-blocking).
+        // If we can't get it, an fsync or write is in progress and we'd block
+        // anyway — so queue the write instead (unless a forced flush).
+        let use_wq = self.write_queue_enabled();
+        let fsync_guard = self.fsync_lock.try_lock();
+        let fsync_acquired = fsync_guard.is_some();
+
+        if !fsync_acquired && use_wq && !flush_write_queue {
+            // JE: enqueueWrite. On success the write is deferred to the next
+            // thread that fsyncs or writes; we return with NO I/O. This is the
+            // committer-decoupling that overlaps writes with in-flight fsyncs.
+            if self.enqueue_write(file_num, data, file_offset)? {
+                self.n_sequential_writes.fetch_add(1, Ordering::Relaxed);
+                self.n_sequential_write_bytes
+                    .fetch_add(data.len() as u64, Ordering::Relaxed);
+                return Ok(());
+            }
+            // enqueue overflowed (fell through 2 dequeue retries): fall to the
+            // direct-write path below, acquiring the fsync-lock blocking.
+        }
+
+        // JE writeToFile step 3: direct write under the fsync-lock. If we did
+        // not already hold it (try_lock failed), acquire it blocking now.
+        let _blocking;
+        let _held = if fsync_acquired {
+            fsync_guard
+        } else {
+            _blocking = self.fsync_lock.lock();
+            None
+        };
+
+        // JE: dequeue pending writes BEFORE our own write, so any queued bytes
+        // (which precede ours in the file) are written first, preserving
+        // on-disk order.
+        if use_wq {
+            self.dequeue_pending_writes1()?;
         }
 
         // Obtain (or create) the file handle under `file_latch`.
@@ -777,6 +1173,7 @@ impl FileManager {
             let mut guard = handle.acquire()?;
             guard.write_at(file_offset, data)?;
         }
+        // fsync-lock released here (guard drop).
 
         self.n_sequential_writes.fetch_add(1, Ordering::Relaxed);
         self.n_sequential_write_bytes
@@ -829,6 +1226,8 @@ impl FileManager {
         let handle = self.get_file_handle(file_num)?;
         let mut guard = handle.acquire()?;
         let n = guard.read_at(offset, buf)?;
+        drop(guard);
+        let n = self.overlay_write_cache(file_num, offset, buf, n);
         self.n_sequential_reads.fetch_add(1, Ordering::Relaxed);
         self.n_sequential_read_bytes.fetch_add(n as u64, Ordering::Relaxed);
         Ok(n)
@@ -847,9 +1246,44 @@ impl FileManager {
         let handle = self.get_file_handle(file_num)?;
         let mut guard = handle.acquire()?;
         let n = guard.read_at(offset, buf)?;
+        drop(guard);
+        let n = self.overlay_write_cache(file_num, offset, buf, n);
         self.n_random_reads.fetch_add(1, Ordering::Relaxed);
         self.n_random_read_bytes.fetch_add(n as u64, Ordering::Relaxed);
         Ok(n)
+    }
+
+    /// Overlay any bytes still sitting in the write queue on top of a disk
+    /// read (JE `checkWriteCache`, called from the log-source read path).
+    ///
+    /// `disk_n` is how many bytes the positioned disk read produced. If the
+    /// requested region overlaps the queue, the queued bytes are authoritative
+    /// for that overlap (they may not yet be on disk, or the disk copy may be
+    /// stale relative to a queued rewrite — though the append-only WAL never
+    /// rewrites, so they are identical when both exist). Returns the total
+    /// number of valid bytes in `buf` (max of the disk read and the queue
+    /// coverage).
+    ///
+    /// Correctness (the subtlest point of the Write Queue port): a reader at
+    /// the end of the log — recovery's tail scan, a rep syncup / feeder
+    /// end-of-log read, or an in-flight fault-in — may request bytes that a
+    /// committer enqueued and that have since cycled out of the log buffer
+    /// pool. Those bytes exist ONLY in the queue until the next fsync/write
+    /// dequeues them. Consulting the queue here makes every disk-read path see
+    /// them. `mmap_file` is exempt because it refuses the current write file,
+    /// and the queue only ever holds current-file bytes.
+    fn overlay_write_cache(
+        &self,
+        file_num: u32,
+        offset: u64,
+        buf: &mut [u8],
+        disk_n: usize,
+    ) -> usize {
+        if !self.write_queue_enabled() {
+            return disk_n;
+        }
+        let n_from_queue = self.check_write_cache(buf, offset, file_num);
+        disk_n.max(n_from_queue)
     }
 
     /// Returns the length of a log file in bytes.
@@ -956,7 +1390,15 @@ impl FileManager {
 
     /// Fsyncs the current log file to stable storage.
     ///
-    /// JE: `FileManager.syncLogEnd()` (called from `syncLogEndAndFinishFile`).
+    /// JE: `FileManager.syncLogEnd()` → `LogEndFileDescriptor.force()`
+    /// (FileManager.java:3082-3149).
+    ///
+    /// Faithful to JE `force()`: acquire the fsync-lock (blocking), DEQUEUE
+    /// any pending queued writes (real positioned writes of the queued bytes),
+    /// then fdatasync, then release. Draining the queue before the fdatasync
+    /// is what makes the enqueue path durable: a committer's enqueued bytes
+    /// are written AND covered by this fdatasync before the leader's
+    /// `flush_and_sync` returns, so no commit is ever told durable early.
     pub fn sync_log_end(&self) -> Result<()> {
         if self.read_only {
             return Ok(());
@@ -970,6 +1412,15 @@ impl FileManager {
             return Ok(());
         }
 
+        // JE force(): take the fsync-lock, drain the write queue, fdatasync.
+        let _fsync = self.fsync_lock.lock();
+        if self.write_queue_enabled() {
+            // Flush any queued writes so their bytes are on disk and covered
+            // by the fdatasync below (JE `dequeuePendingWrites1()` before
+            // `ch.force(false)`).
+            self.dequeue_pending_writes1()?;
+        }
+
         let handle = self.get_file_handle(file_num)?;
         // JE parity + write-scaling fix: fdatasync WITHOUT holding the file's
         // exclusive write latch, so concurrent pwrites (the next group's drain)
@@ -978,6 +1429,17 @@ impl FileManager {
         // FsyncManager still serialises leaders, so only one fdatasync runs at
         // a time; this only stops the fsync from blocking concurrent writes.
         handle.sync_data_no_latch()?;
+
+        // JE force(): flush any writes queued WHILE we were fsync'ing, so a
+        // writer that enqueued during the fdatasync does not leave bytes
+        // stranded in the queue targeting this (now-synced) file. These bytes
+        // are NOT covered by the fdatasync we just did; a committer relying on
+        // them will call flush_sync again, which drains + fsyncs them. This
+        // second drain matches JE exactly (the trailing dequeuePendingWrites1
+        // in force()).
+        if self.write_queue_enabled() {
+            self.dequeue_pending_writes1()?;
+        }
         Ok(())
     }
 
