@@ -222,6 +222,12 @@ fn main() {
     println!("  total ops:  {total}");
     println!("  throughput: {:.0} ops/s", total as f64 / elapsed);
     println!("  keys seq'd: {}", seq.load(Ordering::Relaxed) - 1);
+    let fsyncs = env.stat_fsync_count();
+    let writes = total - (total / 50); // ~98% are writes (commits)
+    println!(
+        "  fsyncs: {fsyncs}  commits/fsync (coalescing): {:.2}",
+        if fsyncs > 0 { writes as f64 / fsyncs as f64 } else { 0.0 }
+    );
     println!("  latency (whole run): p50={}us p90={}us p99={}us p99.9={}us max={}us",
         hist.pct(0.50), hist.pct(0.90), hist.pct(0.99), hist.pct(0.999),
         hist.max_us.load(Ordering::Relaxed));
