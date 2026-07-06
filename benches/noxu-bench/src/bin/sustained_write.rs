@@ -56,19 +56,15 @@ struct Hist {
 }
 impl Hist {
     fn new() -> Self {
-        // 0..~4s in exponential-ish buckets: bucket i covers [i^? ]; use
-        // 1us granularity up to 1ms, then coarser via index mapping.
-        Hist { buckets: (0..4096).map(|_| AtomicU64::new(0)).collect(), max_us: AtomicU64::new(0) }
+        // 1us-granularity buckets up to ~65ms (65536 buckets, ~512KB of
+        // atomics). Anything above 65ms lands in the top bucket but max_us
+        // still tracks the true max. This gives exact p50/p99/p99.9 in the
+        // sub-65ms range where a healthy commit latency lives.
+        Hist { buckets: (0..65536).map(|_| AtomicU64::new(0)).collect(), max_us: AtomicU64::new(0) }
     }
     #[inline]
     fn idx(us: u64) -> usize {
-        // 0..1024us -> 1us buckets; 1024..: log2-scaled into remaining.
-        if us < 1024 {
-            us as usize
-        } else {
-            let hi = 64 - (us.leading_zeros() as usize); // ~log2
-            (1024 + (hi.saturating_sub(10)) * 256 + (((us >> (hi - 8)) & 0xff) as usize)).min(4095)
-        }
+        (us as usize).min(65535)
     }
     #[inline]
     fn record(&self, us: u64) {
@@ -96,12 +92,12 @@ impl Hist {
         for (i, b) in self.buckets.iter().enumerate() {
             cum += b.load(Ordering::Relaxed);
             if cum >= target {
-                // invert idx -> representative us
-                return if i < 1024 {
-                    i as u64
+                // buckets are 1us-linear: index == microseconds. The top
+                // bucket (65535) means ">= 65535us"; report max in that case.
+                return if i >= 65535 {
+                    self.max_us.load(Ordering::Relaxed)
                 } else {
-                    // coarse: reconstruct approx
-                    1u64 << (((i - 1024) / 256) + 10)
+                    i as u64
                 };
             }
         }
@@ -206,8 +202,11 @@ fn main() {
                 let us = t0.elapsed().as_micros() as u64;
                 hist.record(us);
                 local += 1;
+                // Publish incrementally (cheap relaxed add) so the per-60s
+                // reporter sees real per-window throughput, not 0 until join.
+                ops.fetch_add(1, Ordering::Relaxed);
             }
-            ops.fetch_add(local, Ordering::Relaxed);
+            let _ = local;
         })
     }).collect();
 
