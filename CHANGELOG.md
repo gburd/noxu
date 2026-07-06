@@ -15,6 +15,25 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+## [7.4.0] - 2026-07-06
+
+### Performance
+
+- **WAL-append lock contention reduced (~20% higher sustained write
+  throughput).** The log-entry payload is now marshalled OUTSIDE the log-write
+  latch (faithful to JE `LogManager`'s `marshallOutsideLatch`), and log-buffer
+  slots are reserved lock-free via an atomic write position instead of a
+  `Vec::resize` under a nested buffer mutex. The LWL critical section shrinks to
+  LSN assignment + prev-offset patch + CRC + slot reservation. Measured 277 ->
+  332 MB/s at 1024 concurrent writers (NO_SYNC, local NVMe). On-disk format is
+  byte-identical; LSN ordering, isolation, and durability are unchanged
+  (crash-recovery, recovery-correctness, and `shuttle_fsync_manager` all green,
+  plus new 32/64-thread concurrent-append stress tests asserting unique +
+  monotonic LSNs and byte-identical read-back). The remaining ceiling (~11.5%
+  of device write bandwidth) is the single global LWL LSN-assignment mutex;
+  saturating device bandwidth would require sharded per-thread logs (documented
+  as future work, not in this release).
+
 ### Fixed
 
 - **Evictor now logs-and-evicts dirty BINs instead of deferring every one to
