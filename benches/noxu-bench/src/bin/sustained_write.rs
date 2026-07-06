@@ -135,7 +135,15 @@ fn main() {
     let env = Arc::new(Environment::open(
         EnvironmentConfig::new(std::path::PathBuf::from(&dir))
             .with_allow_create(true).with_transactional(true)
-            .with_cache_size(cache).with_durability(dur),
+            .with_cache_size(cache).with_durability(dur)
+            // JE LOG_GROUP_COMMIT_THRESHOLD / INTERVAL (default 0/0 = off).
+            // When set, the fsync leader waits briefly for more committers to
+            // accumulate, trading a little latency for higher coalescing on
+            // fast devices with few writers.
+            .with_log_group_commit(
+                envp("SW_GRPC_THRESHOLD", 0) as usize,
+                envp("SW_GRPC_INTERVAL_MS", 0),
+            ),
     ).expect("open env"));
     let db = Arc::new(env.open_database(
         None, "sustained",
