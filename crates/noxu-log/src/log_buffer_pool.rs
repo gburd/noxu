@@ -468,7 +468,7 @@ mod tests {
         {
             let buffer =
                 pool.get_write_buffer(50, false).expect("get_write_buffer");
-            let mut buf = buffer.lock();
+            let buf = buffer.lock();
             buf.latch_for_write();
             buf.register_lsn(Lsn::new(0, 0));
             buf.allocate(50);

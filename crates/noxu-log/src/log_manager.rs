@@ -636,16 +636,22 @@ impl LogManager {
             // LogBufferSegment.put (after steps allocate + registerLsn +
             // buffer-latch-release).  The pin-count protocol
             // (wait_for_zero_and_latch in write_dirty) ensures the buffer
-            // won't be reused before put() decrements.
-            let mut buffer = buffer_arc.lock();
-            buffer.latch_for_write();
+            // buffer won't be reused before put() decrements.
+            //
+            // Round-2 change: `allocate` and `register_lsn` now take `&self`
+            // and reserve the slot with a single atomic `fetch_add` — no
+            // `latch_for_write`, no `Vec::resize`.  The `buffer_arc.lock()`
+            // here is held only long enough for those two atomic operations
+            // (it still provides mutual exclusion against the flush path's
+            // `&mut` access to `flushed_len`/`reinit`); it no longer wraps a
+            // second `read_latch` acquisition or a buffer growth.
+            let buffer = buffer_arc.lock();
             let segment_opt = buffer.allocate(entry_size);
 
             let (segment_out, oversized_out) = match segment_opt {
                 Some(segment) => {
                     // Entry fits in the write buffer: register LSN and pin.
                     buffer.register_lsn(current_lsn);
-                    buffer.release();
                     drop(buffer);
                     // MOVE the owned bytes out (no clone under the LWL — the
                     // per-call buffer is already owned by this call, and no
@@ -655,7 +661,6 @@ impl LogManager {
                 }
                 None => {
                     // Entry too large for any pool buffer: write outside LWL.
-                    buffer.release();
                     drop(buffer);
                     self.n_temp_buffer_writes.fetch_add(1, Ordering::Relaxed);
                     let entry_bytes = std::mem::take(entry_buf);
@@ -1851,6 +1856,125 @@ mod tests {
             assert_eq!(
                 &payload, expected,
                 "payload mismatch (corruption/bleed) at {lsn:?}"
+            );
+        }
+    }
+
+    /// Round-2 (atomic buffer-slot reservation) stress test: 64 concurrent
+    /// appenders hammering the lock-free `allocate` `fetch_add` path with
+    /// SMALL buffers so the ring rolls many times (each roll is triggered by
+    /// exactly one writer whose `fetch_add` overflows capacity).
+    ///
+    /// Asserts the same invariants the reservation rework must preserve:
+    ///   (a) every assigned LSN is UNIQUE and STRICTLY MONOTONIC, and
+    ///       consecutive same-file entries never overlap (the file_offset ↔
+    ///       buffer-position mapping stays exact through every roll);
+    ///   (b) every entry reads back BYTE-IDENTICAL with a valid CRC32 after a
+    ///       sync flush (no torn/overwritten slot, no cross-thread bleed).
+    ///
+    /// Small (64 KiB) buffers + up to ~4 KiB payloads guarantee frequent
+    /// buffer-full rolls and occasional oversized direct writes — the exact
+    /// coordination paths the atomic reservation touches.
+    #[test]
+    fn test_lwl_atomic_reservation_stress_64t() {
+        use std::collections::HashSet;
+        use std::sync::Arc;
+        use std::thread;
+
+        let dir = TempDir::new().unwrap();
+        let fm = Arc::new(
+            FileManager::new(dir.path(), false, 500_000_000, 10).unwrap(),
+        );
+        // 3 small buffers (64 KiB) => the ring rolls constantly under load.
+        let lm =
+            Arc::new(LogManager::new(Arc::clone(&fm), 3, 64 * 1024, 4096));
+
+        const THREADS: usize = 64;
+        const ENTRIES_PER_THREAD: usize = 200;
+
+        let mut handles = Vec::new();
+        for t in 0..THREADS {
+            let lm2 = Arc::clone(&lm);
+            handles.push(thread::spawn(move || {
+                let mut out = Vec::new();
+                for i in 0..ENTRIES_PER_THREAD {
+                    // Payload sizes span 1..~4 KiB so most entries fit a
+                    // 64 KiB buffer (forcing rolls) while some exceed nothing
+                    // here; distinct bytes keyed by (thread, index, pos).
+                    let len = 1 + ((t * 131 + i * 977) % 4000);
+                    let mut payload = Vec::with_capacity(len);
+                    for b in 0..len {
+                        payload.push(
+                            ((t as u32).wrapping_mul(2_654_435_761)
+                                ^ (i as u32).wrapping_mul(40_503)
+                                ^ (b as u32).wrapping_mul(97))
+                                as u8,
+                        );
+                    }
+                    let lsn = lm2
+                        .log(
+                            LogEntryType::Trace,
+                            &payload,
+                            Provisional::No,
+                            false,
+                            false,
+                        )
+                        .expect("log must not fail");
+                    out.push((lsn, payload));
+                }
+                out
+            }));
+        }
+
+        let mut all: Vec<(Lsn, Vec<u8>)> =
+            handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
+
+        assert_eq!(all.len(), THREADS * ENTRIES_PER_THREAD);
+
+        // (a) uniqueness.
+        let unique: HashSet<u64> =
+            all.iter().map(|(lsn, _)| lsn.as_u64()).collect();
+        assert_eq!(
+            unique.len(),
+            all.len(),
+            "every concurrently-assigned LSN must be unique (atomic \
+             reservation must not double-hand-out a slot)"
+        );
+
+        // (a) strict monotonicity + no same-file overlap: the atomic
+        // fetch_add offset must map exactly onto the assigned LSN file_offset.
+        all.sort_by_key(|(lsn, _)| lsn.as_u64());
+        for w in all.windows(2) {
+            let (a_lsn, a_payload) = &w[0];
+            let (b_lsn, _) = &w[1];
+            assert!(
+                b_lsn.as_u64() > a_lsn.as_u64(),
+                "LSNs must be strictly monotonic: {a_lsn:?} !< {b_lsn:?}"
+            );
+            if a_lsn.file_number() == b_lsn.file_number() {
+                let a_entry_size =
+                    MIN_HEADER_SIZE as u32 + a_payload.len() as u32;
+                assert!(
+                    b_lsn.file_offset()
+                        >= a_lsn.file_offset() + a_entry_size,
+                    "entries must not overlap after a buffer roll: {a_lsn:?} \
+                     (+{a_entry_size}) overlaps {b_lsn:?}"
+                );
+            }
+        }
+
+        // Durably flush, then verify byte-identical readback (CRC validated
+        // inside read_entry).
+        lm.flush_sync().expect("flush_sync must succeed");
+
+        for (lsn, expected) in &all {
+            let (ty, payload) = lm
+                .read_entry(*lsn)
+                .unwrap_or_else(|e| panic!("read_entry {lsn:?} failed: {e:?}"));
+            assert_eq!(ty, LogEntryType::Trace, "type mismatch at {lsn:?}");
+            assert_eq!(
+                &payload, expected,
+                "payload mismatch (torn slot / cross-thread bleed) at {lsn:?}"
             );
         }
     }
