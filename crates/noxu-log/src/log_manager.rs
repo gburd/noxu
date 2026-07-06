@@ -1978,4 +1978,41 @@ mod tests {
             );
         }
     }
+
+    /// Round-2 oversized-entry path: an entry larger than a pool buffer takes
+    /// the direct-write path.  With the atomic reservation, `allocate` on the
+    /// freshly-reinit'd buffer overflows capacity, `fetch_sub`-undoes the
+    /// reservation (leaving `write_position == 0`), returns `None`, and the
+    /// entry is written directly to the file.  Verify it reads back
+    /// byte-identical and that the buffer is left reusable for a following
+    /// small entry.
+    #[test]
+    fn test_oversized_entry_direct_write_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let fm = Arc::new(
+            FileManager::new(dir.path(), false, 100_000_000, 10).unwrap(),
+        );
+        // 4 KiB buffers; a >4 KiB payload cannot fit any pool buffer.
+        let lm = LogManager::new(Arc::clone(&fm), 3, 4096, 4096);
+
+        let big: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
+        let big_lsn = lm
+            .log(LogEntryType::Trace, &big, Provisional::No, false, false)
+            .expect("oversized log must succeed via direct write");
+
+        // A small entry after the oversized one must still work (buffer left
+        // in a clean, reusable state — write_position back at 0).
+        let small_lsn = lm
+            .log(LogEntryType::Trace, b"after-big", Provisional::No, false, false)
+            .expect("small log after oversized must succeed");
+
+        assert_eq!(lm.get_stats().n_temp_buffer_writes, 1);
+
+        lm.flush_sync().expect("flush_sync");
+
+        let (_, big_back) = lm.read_entry(big_lsn).expect("read big");
+        assert_eq!(big_back, big, "oversized entry must read back identical");
+        let (_, small_back) = lm.read_entry(small_lsn).expect("read small");
+        assert_eq!(small_back, b"after-big");
+    }
 }
