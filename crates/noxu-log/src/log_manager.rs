@@ -70,20 +70,23 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 /// Groups the per-call scratch buffers that are safe to share because the LWL
 /// serialises all callers.  Storing them here eliminates per-call allocation:
 ///
-/// * `entry_buf` — H-3 fix: scratch buffer for encoding each log entry.
 /// * `flush_pending` — R-1 fix: reused list of (data, file_num, file_offset) tuples.
 ///   `flush_sync` iterates this Vec while holding the LWL, preserving capacity.
 ///   `flush_no_sync` uses `std::mem::take` (see R-2 comment).
+///
+/// (The former `entry_buf` scratch was removed when log-entry marshalling was
+/// moved OUTSIDE the LWL — the payload memcpy + header encode now happen in a
+/// per-call owned buffer BEFORE the latch is taken, JE-faithful.  A shared
+/// scratch buffer cannot live outside the latch, and keeping it forced the
+/// payload copy back under the latch, so it is gone.)
 struct LwlScratch {
-    /// Scratch buffer for encoding log entries (H-3 fix).
-    entry_buf: Vec<u8>,
     /// Reusable pending-flush list (R-1 fix).
     flush_pending: Vec<(Vec<u8>, u32, u64)>,
 }
 
 impl LwlScratch {
     fn new() -> Self {
-        LwlScratch { entry_buf: Vec::new(), flush_pending: Vec::new() }
+        LwlScratch { flush_pending: Vec::new() }
     }
 }
 
@@ -107,8 +110,7 @@ pub struct LogManager {
     /// released BEFORE pwrite64.  Background flush has no coalescing
     /// requirement; holding through I/O blocks ALL foreground commits.
     ///
-    /// H-3 fix: `entry_buf` inside `LwlScratch` is the per-call encoding
-    /// scratch buffer.  R-1 fix: `flush_pending` is the reusable flush list.
+    /// R-1 fix: `flush_pending` inside `LwlScratch` is the reusable flush list.
     log_write_latch: Mutex<LwlScratch>,
 
     /// Last flushed LSN (updated when buffers are written to the OS page
@@ -455,45 +457,60 @@ impl LogManager {
         // Full buffer: [header | payload]
         let entry_size = header_size + item_size as usize;
 
+        // ── Marshall OUTSIDE the LWL (JE-faithful) ────────────────────────
+        //
+        // JE marshalls LN/commit payloads outside `logWriteMutex`
+        // (LogEntryHeader.addPostMarshallingInfo, marshallOutsideLatch=true):
+        // only prevOffset/VLSN/checksum/LSN-assign/buffer-slot happen under the
+        // latch.  We do the same here — the header field encode and the
+        // (potentially multi-KB) payload memcpy land in a per-call OWNED
+        // buffer BEFORE taking the LWL.  This removes the payload copy from
+        // the serialised critical section entirely.
+        //
+        // The buffer is owned (not the old shared `entry_buf` scratch), so it
+        // can be MOVED into the off-latch `segment.put` / `write_buffer` step
+        // with no clone under the LWL.  The per-call allocation is the cost JE
+        // pays too (it allocates the marshalled byte buffer per entry); it is
+        // off the contended path and far cheaper than serialising the copy.
+        //
+        // Layout: [checksum:4][type:1][flags:1][prev_offset:4][item_size:4]
+        //         [vlsn:8?][payload...].  The checksum (0..4) and prev_offset
+        //         (6..10) are LSN-dependent and are filled UNDER the LWL below.
+        let mut entry_buf: Vec<u8> = vec![0u8; entry_size];
+        entry_buf[4] = entry_type.type_num(); // type
+        let mut flags: u8 = match provisional {
+            Provisional::Yes => 0x80,
+            Provisional::BeforeCkptEnd => 0x40,
+            Provisional::No => 0x00,
+        };
+        if opt_vlsn.is_some() {
+            flags |= 0x20; // REPLICATED_MASK
+            flags |= 0x08; // VLSN_PRESENT_MASK
+        }
+        entry_buf[5] = flags; // flags
+        // prev_offset at [6..10] filled UNDER the LWL (needs the assigned LSN).
+        entry_buf[10..14].copy_from_slice(&item_size.to_le_bytes()); // item_size
+        // VLSN at [14..22] when present (8-byte little-endian i64).
+        // The VLSN comes from the caller, NOT from the assigned LSN, so it is
+        // safe to write outside the latch.
+        if let Some(vlsn) = opt_vlsn {
+            entry_buf[14..22].copy_from_slice(&(vlsn as i64).to_le_bytes());
+        }
+        // payload starts after the header — the memcpy that used to run UNDER
+        // the LWL now runs here, off the contended path.
+        entry_buf[header_size..].copy_from_slice(payload);
+
         // Acquire the LWL — all LSN assignment and file position advancement
         // happens under this latch, matching serialLog/serialLogWork.
         //
-        // H-3 (the 2026 review F-1.1): we now reuse the scratch Vec<u8>
-        // embedded in the LWL guard instead of allocating a fresh
-        // `vec![0u8; entry_size]` on every call.  The Vec is cleared and
-        // resized to `entry_size` under the LWL.  Because the LWL serialises
-        // all writes, there is exactly one in-flight encoding at a time.
+        // Under the LWL we now do ONLY the LSN-dependent + serialisation work:
+        // file-flip check, LSN assign, prev_offset patch, CRC32 (covers the
+        // just-patched prev_offset + assigned VLSN, so it must stay under the
+        // latch — JE checksums under the latch too), and the buffer-slot
+        // reservation.  No payload copy, no clone.
         let (lsn, segment_out, oversized_out) = {
-            let mut lwl_guard = self.log_write_latch.lock();
-            let entry_buf = &mut lwl_guard.entry_buf;
-
-            // Reuse the scratch buffer: clear and resize to entry_size.
-            // `resize` keeps existing capacity — no allocation if already large.
-            entry_buf.clear();
-            entry_buf.resize(entry_size, 0u8);
-
-            // Fill in the header fields (checksum and prev_offset filled later).
-            // Layout: [checksum:4][type:1][flags:1][prev_offset:4][item_size:4]
-            entry_buf[4] = entry_type.type_num(); // type
-
-            let mut flags: u8 = match provisional {
-                Provisional::Yes => 0x80,
-                Provisional::BeforeCkptEnd => 0x40,
-                Provisional::No => 0x00,
-            };
-            if opt_vlsn.is_some() {
-                flags |= 0x20; // REPLICATED_MASK
-                flags |= 0x08; // VLSN_PRESENT_MASK
-            }
-            entry_buf[5] = flags; // flags
-            // prev_offset at [6..10] filled after we know it
-            entry_buf[10..14].copy_from_slice(&item_size.to_le_bytes()); // item_size
-            // VLSN at [14..22] when present (8-byte little-endian i64).
-            if let Some(vlsn) = opt_vlsn {
-                entry_buf[14..22].copy_from_slice(&(vlsn as i64).to_le_bytes());
-            }
-            // payload starts after the header
-            entry_buf[header_size..].copy_from_slice(payload);
+            let _lwl_guard = self.log_write_latch.lock();
+            let entry_buf = &mut entry_buf;
 
             // Determine whether a file flip is needed before assigning the LSN.
             // ShouldFlipFile -> calculateNextLsn -> advanceLsn
@@ -630,19 +647,20 @@ impl LogManager {
                     buffer.register_lsn(current_lsn);
                     buffer.release();
                     drop(buffer);
-                    // Clone bytes before the LWL drops (entry_buf borrows lwl_guard).
-                    // O(entry_size): same cost as the pre-H-3 per-call allocation.
-                    let entry_bytes_clone = entry_buf.clone();
-                    (Some((segment, entry_bytes_clone)), None)
+                    // MOVE the owned bytes out (no clone under the LWL — the
+                    // per-call buffer is already owned by this call, and no
+                    // later code under the latch touches it).
+                    let entry_bytes = std::mem::take(entry_buf);
+                    (Some((segment, entry_bytes)), None)
                 }
                 None => {
-                    // Entry too large for any pool buffer: clone + write outside LWL.
+                    // Entry too large for any pool buffer: write outside LWL.
                     buffer.release();
                     drop(buffer);
                     self.n_temp_buffer_writes.fetch_add(1, Ordering::Relaxed);
-                    let entry_bytes_clone = entry_buf.clone();
+                    let entry_bytes = std::mem::take(entry_buf);
                     let offset = current_lsn.file_offset() as u64;
-                    (None, Some((entry_bytes_clone, offset)))
+                    (None, Some((entry_bytes, offset)))
                 }
             };
 
@@ -1716,6 +1734,123 @@ mod tests {
                 payload.as_slice(),
                 expected_payload.as_bytes(),
                 "payload mismatch at {lsn:?}"
+            );
+        }
+    }
+
+    /// Micro-validation for the LWL append rework (feat/lwl-scaling): with
+    /// marshalling moved OUTSIDE the latch, prove the invariants that the
+    /// move must not break under concurrency:
+    ///
+    ///   (a) every assigned LSN is UNIQUE and MONOTONICALLY assigned in file
+    ///       order (recovery + replication VLSN streaming depend on this);
+    ///   (b) every entry reads back BYTE-IDENTICAL from disk (checksum valid —
+    ///       `read_entry` validates the CRC32, so a corrupt or torn entry
+    ///       surfaces as an error, not a silent mismatch);
+    ///   (c) no data corruption / cross-thread payload bleed (each thread
+    ///       writes a distinct payload keyed by (thread, index) and multi-KB
+    ///       payloads so the off-latch memcpy races are exercised).
+    ///
+    /// 32 threads, larger payloads than the smoke test above.
+    #[test]
+    fn test_lwl_marshall_outside_latch_stress() {
+        use std::collections::HashSet;
+        use std::sync::Arc;
+        use std::thread;
+
+        let dir = TempDir::new().unwrap();
+        let fm = Arc::new(
+            FileManager::new(dir.path(), false, 100_000_000, 10).unwrap(),
+        );
+        let lm =
+            Arc::new(LogManager::new(Arc::clone(&fm), 3, 1024 * 1024, 4096));
+
+        const THREADS: usize = 32;
+        const ENTRIES_PER_THREAD: usize = 40;
+
+        let mut handles = Vec::new();
+        for t in 0..THREADS {
+            let lm2 = Arc::clone(&lm);
+            handles.push(thread::spawn(move || {
+                let mut out = Vec::new();
+                for i in 0..ENTRIES_PER_THREAD {
+                    // Distinct, size-varying payload keyed by (thread, index).
+                    // Sizes span the header boundary and multi-KB so the
+                    // off-latch header-encode + payload memcpy is exercised
+                    // across many concurrent buffer allocations.
+                    let len = 1 + ((t * 37 + i * 101) % 3000);
+                    let mut payload = Vec::with_capacity(len);
+                    for b in 0..len {
+                        payload.push(
+                            ((t as u32).wrapping_mul(2_654_435_761)
+                                ^ (i as u32).wrapping_mul(40_503)
+                                ^ (b as u32))
+                                as u8,
+                        );
+                    }
+                    let lsn = lm2
+                        .log(
+                            LogEntryType::Trace,
+                            &payload,
+                            Provisional::No,
+                            false,
+                            false,
+                        )
+                        .expect("log must not fail");
+                    out.push((lsn, payload));
+                }
+                out
+            }));
+        }
+
+        let mut all: Vec<(Lsn, Vec<u8>)> =
+            handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
+
+        // (a) LSN uniqueness across all threads.
+        let unique: HashSet<u64> =
+            all.iter().map(|(lsn, _)| lsn.as_u64()).collect();
+        assert_eq!(
+            unique.len(),
+            all.len(),
+            "every concurrently-assigned LSN must be unique"
+        );
+
+        // (a) LSN monotonic assignment in file order: sorting by LSN must give
+        // strictly increasing offsets within each file with no gaps that
+        // overlap a previous entry.  We check that consecutive entries in LSN
+        // order do not overlap: next.offset >= prev.offset + prev.entry_size.
+        all.sort_by_key(|(lsn, _)| lsn.as_u64());
+        for w in all.windows(2) {
+            let (a_lsn, a_payload) = &w[0];
+            let (b_lsn, _) = &w[1];
+            assert!(
+                b_lsn.as_u64() > a_lsn.as_u64(),
+                "LSNs must be strictly monotonic: {a_lsn:?} !< {b_lsn:?}"
+            );
+            if a_lsn.file_number() == b_lsn.file_number() {
+                let a_entry_size =
+                    MIN_HEADER_SIZE as u32 + a_payload.len() as u32;
+                assert!(
+                    b_lsn.file_offset()
+                        >= a_lsn.file_offset() + a_entry_size,
+                    "entries must not overlap: {a_lsn:?} (+{a_entry_size}) \
+                     overlaps {b_lsn:?}"
+                );
+            }
+        }
+
+        // Flush all entries to disk.
+        lm.flush_sync().expect("flush_sync must succeed");
+
+        // (b)+(c) every entry reads back byte-identical with a valid checksum.
+        for (lsn, expected) in &all {
+            let (ty, payload) = lm
+                .read_entry(*lsn)
+                .unwrap_or_else(|e| panic!("read_entry {lsn:?} failed: {e:?}"));
+            assert_eq!(ty, LogEntryType::Trace, "type mismatch at {lsn:?}");
+            assert_eq!(
+                &payload, expected,
+                "payload mismatch (corruption/bleed) at {lsn:?}"
             );
         }
     }
