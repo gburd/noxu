@@ -21,6 +21,10 @@ name = "noxu-compare"
 path = "src/bin/compare.rs"
 
 [[bin]]
+name = "noxu-xbench"
+path = "src/bin/xbench.rs"
+
+[[bin]]
 name = "noxu-sustained-write"
 path = "src/bin/sustained_write.rs"
 
