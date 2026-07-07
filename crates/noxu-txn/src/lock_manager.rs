@@ -1483,6 +1483,53 @@ mod tests {
         assert!(!lm.is_owned_write_lock(LSN, 2));
     }
 
+    /// Fix 3a (lock-wait timeout): a blocked waiter must return
+    /// `TxnError::LockTimeout` within ~`timeout_ms` — it must NOT re-sleep
+    /// indefinitely under a held lock. This is the p99-bounding guarantee:
+    /// the waiter loop enforces the elapsed-time check and aborts rather than
+    /// waiting forever (JE LockManager timeout).
+    #[test]
+    fn test_lock_timeout_is_enforced_and_bounded() {
+        const LSN: u64 = 9911;
+        let lm = Arc::new(LockManager::new());
+
+        // Owner 1 holds a write lock and never releases it.
+        assert_eq!(
+            lm.lock(LSN, 1, LockType::Write, false, false).unwrap(),
+            LockGrantType::New
+        );
+
+        // Locker 2 requests a conflicting write lock with a 200 ms timeout.
+        // It must fail with LockTimeout, and the wall-clock time it waited
+        // must be bounded (< 5x the timeout) — proving it did not re-sleep
+        // indefinitely. The upper bound is generous to tolerate the 50 ms
+        // deadlock-recheck slice granularity and CI scheduling jitter.
+        let timeout_ms = 200u64;
+        let start = std::time::Instant::now();
+        let r =
+            lm.lock_with_timeout(LSN, 2, LockType::Write, false, false, timeout_ms);
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(r, Err(TxnError::LockTimeout { .. })),
+            "conflicting lock must time out, got {r:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(timeout_ms),
+            "must wait at least the timeout ({timeout_ms} ms); waited {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(timeout_ms * 5),
+            "must abort near the timeout, not re-sleep indefinitely; \
+             waited {elapsed:?} for a {timeout_ms} ms timeout"
+        );
+        // The timeout stat must have been recorded.
+        assert!(lm.get_stats().n_lock_timeouts >= 1);
+        // Owner 1 still holds the lock; locker 2 never acquired it.
+        assert!(lm.is_owned_write_lock(LSN, 1));
+        assert!(!lm.is_owned_write_lock(LSN, 2));
+    }
+
     #[test]
     fn test_statistics() {
         let lm = LockManager::new();
