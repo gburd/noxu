@@ -159,6 +159,15 @@ pub struct LogManager {
     /// Shared as an `Arc<AtomicBool>` so that `EnvironmentImpl` can hold the
     /// same allocation without a circular `Arc` reference.
     pub io_invalid: Arc<AtomicBool>,
+
+    /// Whether to validate the CRC32 of each entry read back from disk.
+    ///
+    /// Mirrors JE `LogManager.getChecksumOnRead()` (LOG_CHECKSUM_READ,
+    /// default true). Defaults to `true`; `EnvironmentImpl` overrides it
+    /// from `log_checksum_read` after construction. Disabling trades the
+    /// per-read checksum (~40% of cold-read CPU in read-heavy workloads) for
+    /// throughput.
+    checksum_on_read: bool,
 }
 
 impl LogManager {
@@ -199,7 +208,18 @@ impl LogManager {
             fsync_manager: FsyncManager::new(0, 0),
             write_observer: None,
             io_invalid: Arc::new(AtomicBool::new(false)),
+            // JE default: validate checksums on read. EnvironmentImpl
+            // overrides via set_checksum_on_read() from log_checksum_read.
+            checksum_on_read: true,
         }
+    }
+
+    /// Sets whether entry checksums are validated on read.
+    ///
+    /// Called by `EnvironmentImpl::open()` from `log_checksum_read`.
+    /// JE `LogManager.getChecksumOnRead` / LOG_CHECKSUM_READ.
+    pub fn set_checksum_on_read(&mut self, enabled: bool) {
+        self.checksum_on_read = enabled;
     }
 
     /// Reconfigures the group-commit parameters.
@@ -1113,20 +1133,25 @@ impl LogManager {
         // against its original checksum. JE computes the checksum with the
         // invisible bit always OFF, allowing it to be flipped without a
         // checksum rewrite.
+        // JE LogManager.getChecksumOnRead: skip validation entirely when
+        // LOG_CHECKSUM_READ is disabled. The invisible-bit cloak still runs
+        // so the returned bytes match the on-disk logical content.
         full_buf[5] &= !0x10u8;
-        let computed_crc = ChecksumValidator::compute_range(
-            &full_buf,
-            CHECKSUM_BYTES,
-            entry_size - CHECKSUM_BYTES,
-        );
-        if computed_crc != stored_checksum {
-            return Err(NoxuLogError::Checksum {
-                lsn,
-                message: format!(
-                    "expected {:#x}, got {:#x}",
-                    stored_checksum, computed_crc
-                ),
-            });
+        if self.checksum_on_read {
+            let computed_crc = ChecksumValidator::compute_range(
+                &full_buf,
+                CHECKSUM_BYTES,
+                entry_size - CHECKSUM_BYTES,
+            );
+            if computed_crc != stored_checksum {
+                return Err(NoxuLogError::Checksum {
+                    lsn,
+                    message: format!(
+                        "expected {:#x}, got {:#x}",
+                        stored_checksum, computed_crc
+                    ),
+                });
+            }
         }
 
         // Step 6: Validate and return the entry type and payload.
@@ -2014,5 +2039,67 @@ mod tests {
         assert_eq!(big_back, big, "oversized entry must read back identical");
         let (_, small_back) = lm.read_entry(small_lsn).expect("read small");
         assert_eq!(small_back, b"after-big");
+    }
+
+    /// Fix 2: the `checksum_on_read` knob (JE LogManager.getChecksumOnRead /
+    /// LOG_CHECKSUM_READ) must actually be honoured. With it disabled, a
+    /// corrupted-on-disk entry reads back WITHOUT a checksum error (proving
+    /// the CRC step was skipped); with it enabled (JE default), the same
+    /// corruption surfaces as `NoxuLogError::Checksum`.
+    #[test]
+    fn test_checksum_on_read_knob_honoured() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let dir = TempDir::new().unwrap();
+        let fm = Arc::new(
+            FileManager::new(dir.path(), false, 100_000_000, 10).unwrap(),
+        );
+        let payload = b"checksum-knob-payload";
+        let lsn = {
+            let lm = LogManager::new(Arc::clone(&fm), 3, 1024 * 1024, 4096);
+            let lsn = lm
+                .log(LogEntryType::Trace, payload, Provisional::No, false, false)
+                .expect("log");
+            lm.flush_sync().expect("flush_sync");
+            lsn
+        };
+
+        // Corrupt one payload byte on disk (past the fixed header) so the
+        // stored CRC no longer matches the contents.
+        let file_path =
+            dir.path().join(format!("{:08x}.ndb", lsn.file_number()));
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&file_path)
+                .expect("open log file");
+            // Corrupt a byte inside the payload region: file_offset +
+            // MAX_HEADER_SIZE lands safely inside a >0-length payload.
+            let pos = lsn.file_offset() as u64 + MAX_HEADER_SIZE as u64;
+            f.seek(SeekFrom::Start(pos)).unwrap();
+            f.write_all(&[0xFF]).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        // Default (checksum on): corruption must be detected.
+        {
+            let lm = LogManager::new(Arc::clone(&fm), 3, 1024 * 1024, 4096);
+            let res = lm.read_entry(lsn);
+            assert!(
+                matches!(res, Err(NoxuLogError::Checksum { .. })),
+                "default (checksum on) must detect corruption, got {res:?}"
+            );
+        }
+
+        // Checksum off: the CRC step is skipped, so the (corrupt) entry reads
+        // back without a checksum error.
+        {
+            let mut lm = LogManager::new(Arc::clone(&fm), 3, 1024 * 1024, 4096);
+            lm.set_checksum_on_read(false);
+            let (_, back) =
+                lm.read_entry(lsn).expect("checksum-off read must not error");
+            assert_eq!(back.len(), payload.len());
+        }
     }
 }

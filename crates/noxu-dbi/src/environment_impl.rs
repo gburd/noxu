@@ -765,6 +765,9 @@ impl EnvironmentImpl {
                 cfg.log_group_commit_threshold,
                 cfg.log_group_commit_interval_ms,
             );
+            // Wire the LOG_CHECKSUM_READ knob (JE
+            // LogManager.getChecksumOnRead). Default true matches JE.
+            lm.set_checksum_on_read(cfg.log_checksum_read);
 
             // Wire the UtilizationTracker into the LogManager write path.
             // The observer is called under the LWL for every log write so
