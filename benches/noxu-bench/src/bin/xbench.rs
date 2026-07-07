@@ -187,6 +187,11 @@ fn main() {
     );
 
     // ── Load phase (batched, NO_SYNC-fast via large txns) ──
+    // BENCH_SKIP_LOAD=1: reuse an already-loaded dataset (the orchestrator
+    // loads once per engine, then runs many measure-only passes).
+    if envs("BENCH_SKIP_LOAD", "0") == "1" {
+        println!("-- skipping load (reusing existing dataset) --");
+    } else {
     println!("-- loading {records} records --");
     let lt = Instant::now();
     let load_threads = 8usize;
@@ -219,6 +224,7 @@ fn main() {
     });
     env.checkpoint(None).unwrap();
     println!("   loaded in {:.1}s", lt.elapsed().as_secs_f64());
+    }
 
     // ── Measured phase ──
     let stop = Arc::new(AtomicBool::new(false));
