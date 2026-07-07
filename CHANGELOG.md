@@ -15,6 +15,16 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Changed
+
+- The `LOG_CHECKSUM_READ` configuration parameter is now honored on the log
+  read path. Previously the parameter and its `EnvironmentConfig` field existed
+  but were never consulted — `read_entry_from_disk` always recomputed the CRC32
+  on every cold read. The default remains `true` (checksum on read, matching
+  the reference default), so behavior is unchanged unless a user opts out;
+  setting it to `false` now actually skips the read-path CRC to trade integrity
+  checking for read throughput.
+
 ## [7.4.0] - 2026-07-06
 
 ### Performance
