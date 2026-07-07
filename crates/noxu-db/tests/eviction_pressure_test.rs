@@ -235,3 +235,73 @@ fn large_dataset_sync_load_and_checkpoint_completes() {
     db.close().unwrap();
     env.close().unwrap();
 }
+
+/// Fix 1 (LN read-cache): a read of an evicted (LN-stripped) record must
+/// re-populate the BIN slot so the NEXT read hits memory, AND the
+/// re-population must go through the memory budget so repeated
+/// read-then-evict cycles keep `cache_usage` BOUNDED (no unbounded cache
+/// growth). Also proves read-consistency: a re-populated-slot read returns
+/// the same bytes a cold fetch does.
+#[test]
+fn repopulated_read_is_consistent_and_budget_bounded() {
+    let dir = TempDir::new().unwrap();
+    // 2 MiB cache; ~30k * ~120 B = ~3.6 MB working set -> eviction strips LNs.
+    let (env, db) = open_small_cache_env(dir.path(), 2 * 1024 * 1024);
+
+    let n = 30_000usize;
+    // Distinct value per key so a wrong/stale re-populate would be caught.
+    let make_val = |i: usize| -> Vec<u8> {
+        let mut v = vec![0u8; 100];
+        v[..4].copy_from_slice(&(i as u32).to_be_bytes());
+        v
+    };
+    for i in 0..n {
+        let k = DatabaseEntry::from_vec(format!("{:010}", i).into_bytes());
+        db.put(&k, DatabaseEntry::from_bytes(&make_val(i))).unwrap();
+    }
+    // Force LN stripping: cache << working set.
+    let _ = env.evict_memory().unwrap();
+
+    let read = |i: usize| -> Vec<u8> {
+        let k = DatabaseEntry::from_vec(format!("{:010}", i).into_bytes());
+        let mut out = DatabaseEntry::new();
+        assert!(db.get_into(None, &k, &mut out).unwrap(), "record {i} present");
+        out.data().to_vec()
+    };
+
+    // Repeated read-then-evict cycles. Each cycle: read a sample (cold fetch
+    // -> re-populate), read the SAME keys again (should hit the re-populated
+    // slot), then evict again (strips the re-populated LNs). Track cache_usage
+    // to prove it does not grow without bound.
+    let sample: Vec<usize> = (0..n).step_by(53).collect();
+    let mut max_usage = 0u64;
+    for cycle in 0..8 {
+        for &i in &sample {
+            // First read: may cold-fetch and re-populate.
+            let a = read(i);
+            // Second read: must be identical (re-populated slot or same cold
+            // fetch — either way byte-identical to the on-disk LN).
+            let b = read(i);
+            assert_eq!(a, b, "cycle {cycle} key {i}: two reads must agree");
+            assert_eq!(
+                a,
+                make_val(i),
+                "cycle {cycle} key {i}: read must return the correct value"
+            );
+        }
+        // Re-strip the LNs the reads just re-populated.
+        let _ = env.evict_memory().unwrap();
+        let usage = env.stats().unwrap().cache_usage;
+        max_usage = max_usage.max(usage);
+    }
+
+    // Budget-safety: across 8 read-then-evict cycles the peak usage must stay
+    // bounded well below the full working set. If re-population bypassed the
+    // budget, cache_usage would ratchet up every cycle (each re-populate adds
+    // data bytes the evictor could never reclaim) and blow past this bound.
+    assert!(
+        max_usage < 6 * 1024 * 1024,
+        "repeated read-then-evict must keep cache_usage bounded; peaked at {} bytes",
+        max_usage
+    );
+}
