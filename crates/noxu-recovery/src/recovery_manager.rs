@@ -2208,31 +2208,49 @@ impl RecoveryManager {
 
         // After-checkpoint-start flag (JE AfterCheckpointStart).
         //
-        // JE `RecoveryManager.eligible_for_redo` applies this gate:
-        //   AfterCheckpointStart = (checkpointStartLsn == NULL_LSN ||
-        //       DbLsn.compareTo(reader.getLastLsn(), checkpointStartLsn) >= 0)
+        // JE `RecoveryManager.eligibleForRedo` gates committed / non-txnal LN
+        // redo on:
+        //   afterCheckpointStart = (checkpointStartLsn == NULL_LSN ||
+        //       getLastLsn() >= checkpointStartLsn)
+        // — i.e. it skips redoing an LN logged before the checkpoint start,
+        // relying on that record already living in a BIN reachable from the
+        // checkpointed tree.
         //
-        // Stage 4 / DRIFT-2 / T-F3: this gate is intentionally NOT enabled.
+        // This gate is intentionally NOT enabled here, and enabling it as
+        // written LOSES DATA on a multi-checkpoint clean reopen.  The reason is
+        // structural, NOT the (now-stale) "checkpointer only flushes the
+        // primary tree" claim: the checkpointer does flush every open
+        // user-database's dirty BINs.  The real blocker:
         //
-        // Enabling it safely requires that ALL committed pre-checkpoint state
-        // is represented by IN-redo (logged BINs in the analysis scan range).
-        // In Noxu, dirty_ins only contains BINs logged >= checkpointStartLsn
-        // (the current checkpoint's interval).  A BIN that was clean before
-        // the current checkpoint (already logged by a prior checkpoint and not
-        // dirtied since) is NOT in dirty_ins.  If a committed LN was written
-        // at lsn < checkpointStartLsn and its BIN was NOT re-logged in the
-        // current checkpoint, enabling the gate would silently drop that LN.
+        //   * Recovery reconstructs each tree from an EMPTY tree.  IN-redo
+        //     splices in only the INs/BINs logged at/after checkpoint_start_lsn
+        //     (the `after_ckpt` filter in run_analysis).  Unlike JE — which
+        //     follows a checkpointed parent IN's on-disk child pointer and
+        //     fetches the child BIN from the log on demand (`fetchTarget`) —
+        //     Noxu has no lazy pre-checkpoint BIN fetch.
+        //   * The checkpointer re-logs only DIRTY BINs.  A BIN that was clean
+        //     across the last checkpoint (last logged before its start LSN and
+        //     untouched since) is therefore neither re-logged nor spliced back
+        //     into the reconstructed tree.
         //
-        // To safely enable this gate, recovery must also load the checkpoint's
-        // baseline BINs from the mapping tree root (equivalent to JE loading
-        // the full mapping tree and then user-DB BINs from the checkpoint
-        // snapshot).  This requires a "load tree from checkpoint" path that
-        // does not yet exist in Noxu.  Until that path exists, the full LN
-        // scan range is required for correctness.
+        // So a committed record whose LN AND whose covering BIN were both last
+        // logged before checkpoint_start_lsn is materialised by NEITHER IN-redo
+        // NOR a gated LN-redo, and skipping its LN drops it.  The per-slot redo
+        // currency check (logrecLsn > treeLsn in redo_insert) does NOT protect
+        // this case: it only prevents reverting an EXISTING slot, never
+        // materialises a MISSING one.
         //
-        // Condition to revisit: implement checkpoint-BIN load (JE
-        // RecoveryManager reads the mapping tree from checkpointEndLsn and
-        // then reads user-DB BINs from those pointers), then re-enable here.
+        // Empirically confirmed by
+        // `recovery_correctness_test::equality_stable_bins` and
+        // `::redo_gate_multi_checkpoint_stable_bins_survive_clean_reopen`,
+        // which drop every record when the naive gate is enabled.
+        //
+        // Condition to safely enable this gate: first add a checkpoint-BIN load
+        // path — before LN redo, walk the checkpointed root's on-disk child
+        // pointers and fetch each referenced pre-checkpoint BIN from the log
+        // into the tree (the JE `fetchTarget` equivalent).  Only then is every
+        // committed pre-checkpoint slot guaranteed present, and the skip gate
+        // becomes a pure performance optimisation instead of data loss.
         let _after_ckpt_start = ckpt_start == NULL_LSN || lsn >= ckpt_start;
         let _ = _after_ckpt_start; // gate deliberately disabled, see above
 
@@ -2241,14 +2259,15 @@ impl RecoveryManager {
                 // Non-transactional LN.
                 //
                 // In standard JE, pre-checkpoint non-transactional LNs are
-                // skipped because the checkpoint's BIN records capture their
-                // committed state.  In Noxu, the checkpointer only flushes
-                // the internal `primary_tree` and does NOT flush the BINs of
-                // any open user databases.  Pre-checkpoint non-transactional
-                // LNs are therefore NOT represented in the checkpoint's BIN
-                // records.  Skipping them causes those records to vanish
-                // after a close+reopen whenever the background checkpointer
-                // thread runs between writes.
+                // skipped because the checkpoint's BIN records (reachable from
+                // the checkpointed root via on-demand child fetch) capture
+                // their committed state.  Noxu has no lazy pre-checkpoint BIN
+                // fetch and re-logs only DIRTY BINs, so a pre-checkpoint LN
+                // whose covering BIN was clean across the last checkpoint is
+                // NOT represented in the reconstructed tree.  Skipping it would
+                // cause the record to vanish after a close+reopen (see the
+                // detailed note on the disabled after-checkpoint-start gate
+                // above).
                 //
                 // St-H6 (recovery manifestation): always replay
                 // non-transactional LNs from the full scan range, same as
@@ -2260,15 +2279,15 @@ impl RecoveryManager {
             Some(txn_id) => {
                 if analysis.is_committed(txn_id) {
                     // Committed LN: always redo, regardless of whether it
-                    // precedes the checkpoint start.  Noxu's checkpointer
-                    // flushes an in-memory primary_tree that may not yet
-                    // contain all committed data from all open databases, so
-                    // the BIN entries in the checkpoint cannot be trusted as
-                    // a complete snapshot of pre-checkpoint state.  We must
-                    // replay all committed LNs from the full scan range.
-                    // `redo_ln` is idempotent (it skips if the tree already
-                    // holds a newer LSN for the key), so replaying redundantly
-                    // is always correct.
+                    // precedes the checkpoint start.  IN-redo reconstructs the
+                    // tree only from BINs logged at/after checkpoint_start_lsn
+                    // and does not lazily fetch clean pre-checkpoint BINs, so
+                    // the checkpoint's BIN entries are not a complete snapshot
+                    // of pre-checkpoint committed state.  We must replay all
+                    // committed LNs from the full scan range.  `redo_ln` is
+                    // idempotent (it skips if the tree already holds a newer
+                    // LSN for the key), so replaying redundantly is always
+                    // correct.
                     RedoAction::Apply
                 } else {
                     // Active or aborted txn → skip (undo handles active ones).
