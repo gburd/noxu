@@ -34,6 +34,7 @@ use noxu_latch::ExclusiveLatch;
 use noxu_sync::Mutex;
 use noxu_util::lsn::Lsn;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Manages a circular pool of [`LogBuffer`]s.
 ///
@@ -66,7 +67,14 @@ pub struct LogBufferPool {
 
     /// A minimum LSN property for the pool that can be checked without latching.
     /// An LSN less than min_buffer_lsn is guaranteed not to be in the pool.
-    min_buffer_lsn: Lsn,
+    ///
+    /// Stored as a shared `Arc<AtomicU64>` (the raw `Lsn::as_u64()`) so that
+    /// `LogManager::read_entry` can consult it on the read hot path WITHOUT
+    /// taking the global `buffer_pool` mutex — a read whose LSN is older than
+    /// any in-memory buffer bypasses the mutex + park loop entirely and goes
+    /// straight to the disk/page-cache read (JE `LogBufferPool.java:604`
+    /// `getReadBufferByLsn` min-LSN skip; Stage A read-path fix 2026-07).
+    min_buffer_lsn: Arc<AtomicU64>,
 
     /// Statistics counters.
     n_not_resident: u64,
@@ -107,7 +115,7 @@ impl LogBufferPool {
             num_buffers,
             buffer_size,
             buffer_pool_latch: ExclusiveLatch::named("LogBufferPool"),
-            min_buffer_lsn: Lsn::from_u64(0),
+            min_buffer_lsn: Arc::new(AtomicU64::new(0)),
             n_not_resident: 0,
             n_cache_miss: 0,
             n_no_free_buffer: 0,
@@ -118,6 +126,17 @@ impl LogBufferPool {
     /// Returns the configured log buffer size.
     pub fn get_log_buffer_size(&self) -> usize {
         self.buffer_size
+    }
+
+    /// Returns the shared "minimum buffered LSN" handle.
+    ///
+    /// A read whose LSN is strictly less than this value cannot be in any
+    /// in-memory buffer, so the caller may skip the global `buffer_pool` mutex
+    /// and read straight from disk/page-cache.  The handle is an
+    /// `Arc<AtomicU64>` so `LogManager` can clone it once at construction and
+    /// consult it on the read hot path WITHOUT locking the pool (Stage A).
+    pub fn min_buffer_lsn_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.min_buffer_lsn)
     }
 
     /// Gets the current write buffer for writing an entry of size_needed bytes.
@@ -264,7 +283,7 @@ impl LogBufferPool {
         drop(new_initial_buffer);
 
         if !new_min_lsn.is_null() {
-            self.min_buffer_lsn = new_min_lsn;
+            self.min_buffer_lsn.store(new_min_lsn.as_u64(), Ordering::Release);
         }
 
         Ok(true)
@@ -370,7 +389,7 @@ impl LogBufferPool {
         self.n_not_resident += 1;
 
         // Avoid latching if the LSN is known not to be in the pool
-        if lsn < self.min_buffer_lsn {
+        if lsn.as_u64() < self.min_buffer_lsn.load(Ordering::Acquire) {
             self.n_cache_miss += 1;
             return Ok(None);
         }
@@ -381,10 +400,34 @@ impl LogBufferPool {
             .acquire()
             .map_err(|e| LogError::LatchTimeout(e.to_string()))?;
 
-        for buffer_arc in &self.buffers {
+        // Stage A part 3: check the SETTLED (historical) buffers before the
+        // active write buffer.  The active buffer
+        // (`current_write_buffer_index`) is the one that holds writers'
+        // outstanding pins (`write_pin_count > 0`), so `contains_lsn` on it may
+        // have to wait_for_zero_and_latch (park).  Settled buffers have a zero
+        // pin count, so they latch immediately.  Most reads on a
+        // dataset>>cache workload want already-settled data, so checking those
+        // first avoids the park in the common case (JE
+        // `LogBufferPool.getReadBufferByLsn` TODO: current write buffer last).
+        let active = self.current_write_buffer_index;
+        for (i, buffer_arc) in self.buffers.iter().enumerate() {
+            if i == active {
+                continue;
+            }
             let buffer = buffer_arc.lock();
             if buffer.contains_lsn(lsn) {
                 // Buffer is latched by contains_lsn if it returns true
+                drop(buffer);
+                return Ok(Some(Arc::clone(buffer_arc)));
+            }
+            drop(buffer);
+        }
+
+        // Finally check the active write buffer (may park on its pin count).
+        {
+            let buffer_arc = &self.buffers[active];
+            let buffer = buffer_arc.lock();
+            if buffer.contains_lsn(lsn) {
                 drop(buffer);
                 return Ok(Some(Arc::clone(buffer_arc)));
             }

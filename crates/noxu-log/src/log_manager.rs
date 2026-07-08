@@ -97,6 +97,14 @@ pub struct LogManager {
     /// Pool of log buffers for staging writes before they reach the file.
     buffer_pool: Arc<Mutex<LogBufferPool>>,
 
+    /// Lock-free mirror of the pool's "minimum buffered LSN" (Stage A read
+    /// fix).  A read whose LSN is strictly below this value cannot be in any
+    /// in-memory write buffer, so `read_entry` skips the global `buffer_pool`
+    /// mutex + park loop entirely and reads straight from disk/page-cache.
+    /// Shares the pool's `Arc<AtomicU64>`, so it tracks the pool's own
+    /// `min_buffer_lsn` as buffers cycle.  JE `LogBufferPool.java:604`.
+    min_buffered_lsn: Arc<AtomicU64>,
+
     /// Serializes all log writes so entries appear in LSN order.
     /// this the "Log Write Latch" (LWL).
     ///
@@ -191,6 +199,7 @@ impl LogManager {
         );
 
         LogManager {
+            min_buffered_lsn: buffer_pool.min_buffer_lsn_handle(),
             buffer_pool: Arc::new(Mutex::new(buffer_pool)),
             log_write_latch: Mutex::new(LwlScratch::new()),
             // 0 means "nothing flushed yet". NULL_LSN = u64::MAX would make
@@ -983,9 +992,25 @@ impl LogManager {
     /// `(entry_type, payload_bytes)` for the entry at `lsn`.
     pub fn read_entry(&self, lsn: Lsn) -> Result<(LogEntryType, Vec<u8>)> {
         // ------------------------------------------------------------------
-        // Hot path: check whether the entry is still in a write buffer.
-        // ------------------------------------------------------------------
-        {
+        // Stage A fast path: skip the global buffer_pool mutex entirely when
+        // the LSN is older than any in-memory write buffer.  On a
+        // dataset>>cache read workload almost every read is for an old LSN,
+        // so this avoids the one global mutex + nested per-buffer scan + park
+        // loop that otherwise serialises all readers (JE
+        // `LogBufferPool.getReadBufferByLsn` min-LSN skip, LogBufferPool.java:604).
+        //
+        // Ordering: an entry can only be in a buffer AFTER it was appended,
+        // which advances `min_buffered_lsn` (Release in `bump_current`) no
+        // later than the append becomes visible; a reader that observes an
+        // LSN below the (Acquire-loaded) mirror therefore correctly concludes
+        // the entry is not buffered.  A stale-low read of the mirror only
+        // costs an unnecessary pool lock (still correct); it never skips a
+        // buffer that actually holds the entry.
+        let min_buffered = self.min_buffered_lsn.load(Ordering::Acquire);
+        if lsn.as_u64() >= min_buffered {
+            // ------------------------------------------------------------------
+            // Hot path: check whether the entry is still in a write buffer.
+            // ------------------------------------------------------------------
             let mut pool = self.buffer_pool.lock();
             if let Some(buf_arc) = pool.get_read_buffer_by_lsn(lsn)? {
                 let buf = buf_arc.lock();
@@ -1814,8 +1839,7 @@ mod tests {
                         payload.push(
                             ((t as u32).wrapping_mul(2_654_435_761)
                                 ^ (i as u32).wrapping_mul(40_503)
-                                ^ (b as u32))
-                                as u8,
+                                ^ (b as u32)) as u8,
                         );
                     }
                     let lsn = lm2
@@ -1861,8 +1885,7 @@ mod tests {
                 let a_entry_size =
                     MIN_HEADER_SIZE as u32 + a_payload.len() as u32;
                 assert!(
-                    b_lsn.file_offset()
-                        >= a_lsn.file_offset() + a_entry_size,
+                    b_lsn.file_offset() >= a_lsn.file_offset() + a_entry_size,
                     "entries must not overlap: {a_lsn:?} (+{a_entry_size}) \
                      overlaps {b_lsn:?}"
                 );
@@ -1911,8 +1934,7 @@ mod tests {
             FileManager::new(dir.path(), false, 500_000_000, 10).unwrap(),
         );
         // 3 small buffers (64 KiB) => the ring rolls constantly under load.
-        let lm =
-            Arc::new(LogManager::new(Arc::clone(&fm), 3, 64 * 1024, 4096));
+        let lm = Arc::new(LogManager::new(Arc::clone(&fm), 3, 64 * 1024, 4096));
 
         const THREADS: usize = 64;
         const ENTRIES_PER_THREAD: usize = 200;
@@ -1980,8 +2002,7 @@ mod tests {
                 let a_entry_size =
                     MIN_HEADER_SIZE as u32 + a_payload.len() as u32;
                 assert!(
-                    b_lsn.file_offset()
-                        >= a_lsn.file_offset() + a_entry_size,
+                    b_lsn.file_offset() >= a_lsn.file_offset() + a_entry_size,
                     "entries must not overlap after a buffer roll: {a_lsn:?} \
                      (+{a_entry_size}) overlaps {b_lsn:?}"
                 );
@@ -2028,7 +2049,13 @@ mod tests {
         // A small entry after the oversized one must still work (buffer left
         // in a clean, reusable state — write_position back at 0).
         let small_lsn = lm
-            .log(LogEntryType::Trace, b"after-big", Provisional::No, false, false)
+            .log(
+                LogEntryType::Trace,
+                b"after-big",
+                Provisional::No,
+                false,
+                false,
+            )
             .expect("small log after oversized must succeed");
 
         assert_eq!(lm.get_stats().n_temp_buffer_writes, 1);
@@ -2058,7 +2085,13 @@ mod tests {
         let lsn = {
             let lm = LogManager::new(Arc::clone(&fm), 3, 1024 * 1024, 4096);
             let lsn = lm
-                .log(LogEntryType::Trace, payload, Provisional::No, false, false)
+                .log(
+                    LogEntryType::Trace,
+                    payload,
+                    Provisional::No,
+                    false,
+                    false,
+                )
                 .expect("log");
             lm.flush_sync().expect("flush_sync");
             lsn

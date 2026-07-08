@@ -3324,6 +3324,81 @@ impl Tree {
         }
     }
 
+    /// Re-populate a BIN slot's LN data after a cold fetch from the log,
+    /// so subsequent reads of the same key hit memory instead of re-faulting
+    /// from disk (JE `IN.fetchTarget` caches the fetched LN in the slot).
+    ///
+    /// This is the read-cache half of `strip_lns`: the evictor strips a
+    /// resident LN's `data` (freeing `data.len()` heap and crediting
+    /// `data.len()` back to the shared budget via `arbiter.release_memory`),
+    /// and a later read re-fetches those bytes from the log at the slot LSN.
+    /// Without re-population every repeat read re-faults + re-CRCs the same
+    /// record from disk (the measured read gap).
+    ///
+    /// Budget-safety (CRITICAL): re-population re-grows the LN heap by exactly
+    /// `data.len()` bytes, so it charges the SAME `memory_counter` (which IS
+    /// the arbiter's shared `cache_usage`) by `data.len()` — symmetric with
+    /// the strip credit. The evictor can therefore strip the re-populated
+    /// slot again under pressure, and the cache stays bounded: charge on
+    /// re-populate == credit on strip. Only the LN `data` bytes are accounted
+    /// (the slot's key + `BIN_ENTRY_OVERHEAD` were charged at insert and were
+    /// never freed by the strip, since the slot itself stayed resident).
+    ///
+    /// Race / consistency guards (all under the BIN write latch):
+    ///   * The slot LSN must still equal `expected_lsn`. A concurrent writer
+    ///     that replaced the record bumps the slot to a new LSN + new data;
+    ///     re-populating stale bytes there would corrupt the slot, so we skip.
+    ///   * The slot `data` must still be `None`. If another reader already
+    ///     re-populated it (or a writer set it), we skip — this prevents
+    ///     double-charging the budget for the same bytes.
+    ///
+    /// Because a stripped slot's on-disk LN is immutable at `expected_lsn`,
+    /// the re-populated bytes are byte-identical to a cold fetch of the same
+    /// LSN — a read from the re-populated slot returns the same value a cold
+    /// read would.
+    ///
+    /// No-op (returns without charging) when the BIN has any open cursor
+    /// (`cursor_count > 0`), matching the strip guard so the two never race
+    /// on the same slot bytes.
+    pub fn repopulate_ln_data(
+        &self,
+        bin_arc: &Arc<RwLock<TreeNode>>,
+        slot_index: usize,
+        expected_lsn: u64,
+        data: &[u8],
+    ) {
+        // Only meaningful when this tree owns a shared budget counter; if it
+        // does not (e.g. a bare test tree), caching still helps reads but
+        // there is no budget to charge, so skip to avoid unbounded growth.
+        let counter = match &self.memory_counter {
+            Some(c) => c,
+            None => return,
+        };
+        let mut guard = bin_arc.write();
+        let bin = match &mut *guard {
+            TreeNode::Bottom(b) => b,
+            _ => return,
+        };
+        if bin.cursor_count > 0 {
+            return;
+        }
+        if slot_index >= bin.entries.len() {
+            return;
+        }
+        // The slot must still point at the LSN we fetched from, and must
+        // still be stripped (data == None). Either guard failing means a
+        // concurrent writer/reader already touched the slot — skip.
+        if bin.get_lsn(slot_index).as_u64() != expected_lsn {
+            return;
+        }
+        if bin.entries[slot_index].data.is_some() {
+            return;
+        }
+        bin.entries[slot_index].data = Some(data.to_vec());
+        // Symmetric with strip's release_memory(data.len()).
+        counter.fetch_add(data.len() as i64, Ordering::Relaxed);
+    }
+
     /// Sets the expiration time (in absolute hours since Unix epoch) for an
     /// existing key's BIN slot.
     ///

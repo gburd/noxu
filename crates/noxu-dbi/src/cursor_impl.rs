@@ -999,6 +999,7 @@ impl CursorImpl {
                     let slot = slot.unwrap();
                     let slot_data = slot.data;
                     let slot_lsn = slot.lsn;
+                    let slot_index = slot.slot_index;
                     let bin_arc = slot.bin_arc;
                     // If a writer held the write lock when we called lock_ln,
                     // our pre-fetched slot_data is stale — re-read from the BIN
@@ -1020,10 +1021,22 @@ impl CursorImpl {
                     // JE IN.fetchTarget: a found slot whose in-memory data was
                     // stripped by the evictor (data == None) must be
                     // re-fetched from the log at its LSN, not returned empty.
+                    // Stage B: after a cold fetch, re-populate the slot so the
+                    // NEXT read of this key hits memory (see
+                    // Tree::repopulate_ln_data for budget-safety).
                     let final_data = match final_data {
                         Some(d) => Some(d),
                         None if slot_lsn != 0 => {
-                            self.fetch_ln_data_from_log(slot_lsn)
+                            let fetched = self.fetch_ln_data_from_log(slot_lsn);
+                            if let Some(d) = &fetched {
+                                let db = self.db_impl.read();
+                                if let Some(tree) = db.get_real_tree() {
+                                    tree.repopulate_ln_data(
+                                        &bin_arc, slot_index, slot_lsn, d,
+                                    );
+                                }
+                            }
+                            fetched
                         }
                         none => none,
                     };
@@ -1048,7 +1061,7 @@ impl CursorImpl {
                     // Use the actual BIN slot index from search_with_data so
                     // that retrieve_next() advances to the correct next slot
                     // rather than always starting from index 1.
-                    self.current_index = slot.slot_index as i32;
+                    self.current_index = slot_index as i32;
                     self.state = CursorState::Initialized;
                     // BIN arc already obtained from the single descent.
                     self.update_bin_pin(Some(bin_arc));
@@ -1066,6 +1079,7 @@ impl CursorImpl {
                     let slot = slot.unwrap();
                     let slot_data = slot.data;
                     let slot_lsn = slot.lsn;
+                    let slot_index = slot.slot_index;
                     let bin_arc = slot.bin_arc;
                     let contended = self.lock_ln(slot_lsn)?;
                     let final_data = if contended {
@@ -1083,10 +1097,20 @@ impl CursorImpl {
                     // JE IN.fetchTarget: a found slot whose in-memory data was
                     // stripped by the evictor (data == None) must be
                     // re-fetched from the log at its LSN, not returned empty.
+                    // Stage B: re-populate the slot after a cold fetch.
                     let final_data = match final_data {
                         Some(d) => Some(d),
                         None if slot_lsn != 0 => {
-                            self.fetch_ln_data_from_log(slot_lsn)
+                            let fetched = self.fetch_ln_data_from_log(slot_lsn);
+                            if let Some(d) = &fetched {
+                                let db = self.db_impl.read();
+                                if let Some(tree) = db.get_real_tree() {
+                                    tree.repopulate_ln_data(
+                                        &bin_arc, slot_index, slot_lsn, d,
+                                    );
+                                }
+                            }
+                            fetched
                         }
                         none => none,
                     };
@@ -1094,7 +1118,7 @@ impl CursorImpl {
                     self.current_data = final_data;
                     self.current_lsn = slot_lsn;
                     // Use the actual BIN slot index (same rationale as Set branch).
-                    self.current_index = slot.slot_index as i32;
+                    self.current_index = slot_index as i32;
                     self.state = CursorState::Initialized;
                     // BIN arc already obtained from the single descent.
                     self.update_bin_pin(Some(bin_arc));
