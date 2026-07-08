@@ -1353,3 +1353,125 @@ fn delta_test_known_deleted_replays() {
          (known-deleted slot was not reconstituted correctly)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Fix 3a: write locks are released BEFORE the commit fsync (tail-latency fix).
+//
+// These tests are the DURABILITY oracle for the reordering: the committer
+// still waits on the fsync before returning success, so a CommitSync
+// transaction that returned must survive a reopen, and a dependent chain of
+// commits (each reading the value the previous one wrote after its lock was
+// released early) must recover prefix-consistently — never a later commit
+// present without the earlier commit it depends on.
+// ---------------------------------------------------------------------------
+
+/// Fix 3a — durability barrier preserved: a `CommitSync` transaction that
+/// returned `Ok` must be durable.  With the write lock released before the
+/// fsync, the ONLY thing that still proves durability is that `commit()`
+/// does not return until the fsync completes (Phase 2).  Write with explicit
+/// `CommitSync`, clean-close, reopen, and assert every returned commit is
+/// present.
+#[test]
+fn fix3a_committed_sync_txn_survives_reopen() {
+    use noxu_db::Durability;
+    let dir = TempDir::new().unwrap();
+
+    {
+        let env = open_env(dir.path());
+        let db = open_db(&env);
+        let cfg = noxu_db::TransactionConfig::new()
+            .with_durability(Durability::COMMIT_SYNC);
+        for i in 0..64u32 {
+            let txn = env.begin_transaction(Some(&cfg)).unwrap();
+            let k = format!("sync_{i:04}");
+            let v = format!("val_{i:04}");
+            db.put_in(
+                &txn,
+                DatabaseEntry::from_bytes(k.as_bytes()),
+                DatabaseEntry::from_bytes(v.as_bytes()),
+            )
+            .unwrap();
+            // commit() returns ONLY after the fsync (Fix 3a Phase 2); the
+            // write lock was already released in Phase 1.
+            txn.commit().unwrap();
+        }
+        db.close().unwrap();
+        env.close().unwrap();
+    }
+
+    let env = open_env(dir.path());
+    let db = open_db(&env);
+    let recovered = collect_all(&db);
+    for i in 0..64u32 {
+        let k = format!("sync_{i:04}");
+        let v = format!("val_{i:04}");
+        assert_eq!(
+            recovered.get(k.as_bytes()).map(|x| x.as_slice()),
+            Some(v.as_bytes()),
+            "Fix 3a: CommitSync txn {i} that returned Ok was LOST after reopen \
+             — the durability barrier (Phase 2 fsync) was not honoured"
+        );
+    }
+}
+
+/// Fix 3a — dependent-write ordering: because the write lock is released
+/// after the WAL append (Fix 3a), a second txn B can acquire the lock and
+/// commit a value that DEPENDS on A's committed value before A's fsync
+/// finishes.  Noxu's single monotonic WAL makes this safe: B's commit LSN is
+/// strictly higher than A's, and a single fdatasync makes everything up to a
+/// point durable, so B can never be durable without A.  On a clean-close
+/// reopen the recovered chain must be exactly the final value of every key —
+/// never a torn state where a later dependent write survived but its
+/// dependency did not.
+#[test]
+fn fix3a_dependent_commit_chain_recovers_consistently() {
+    let dir = TempDir::new().unwrap();
+    const CHAIN: u32 = 200;
+
+    {
+        let env = open_env(dir.path());
+        let db = open_db(&env);
+        // Chain of dependent commits on the SAME hot key: each txn reads the
+        // previous committed value, increments it, and commits.  Under Fix 3a
+        // txn N releases the write lock before its fsync, so txn N+1 can read
+        // N's value and commit while N's fsync is still in flight.
+        let key = DatabaseEntry::from_bytes(b"hot_counter");
+        {
+            let txn = env.begin_transaction(None).unwrap();
+            db.put_in(
+                &txn,
+                &key,
+                DatabaseEntry::from_bytes(&0u32.to_be_bytes()),
+            )
+            .unwrap();
+            txn.commit().unwrap();
+        }
+        for _ in 0..CHAIN {
+            let txn = env.begin_transaction(None).unwrap();
+            let mut cur = DatabaseEntry::new();
+            assert!(db.get_into(Some(&txn), b"hot_counter", &mut cur).unwrap());
+            let prev = u32::from_be_bytes(cur.data().try_into().unwrap());
+            db.put_in(
+                &txn,
+                &key,
+                DatabaseEntry::from_bytes(&(prev + 1).to_be_bytes()),
+            )
+            .unwrap();
+            txn.commit().unwrap();
+        }
+        db.close().unwrap();
+        env.close().unwrap();
+    }
+
+    let env = open_env(dir.path());
+    let db = open_db(&env);
+    let mut out = DatabaseEntry::new();
+    assert!(db.get_into(None, b"hot_counter", &mut out).unwrap());
+    let final_val = u32::from_be_bytes(out.data().try_into().unwrap());
+    assert_eq!(
+        final_val, CHAIN,
+        "Fix 3a: dependent commit chain recovered inconsistently — a later \
+         dependent write must not survive without every earlier write it \
+         depends on (single monotonic WAL invariant)"
+    );
+}

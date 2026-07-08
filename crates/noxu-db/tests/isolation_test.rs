@@ -1333,3 +1333,57 @@ fn test_serializable_prevents_phantom_eof_insert() {
     );
     t3.commit().unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Fix 3b: per-transaction no_wait mode aborts IMMEDIATELY on a lock conflict,
+// not after the 500ms default lock timeout.  This is Noxu's opt-in analogue
+// to WiredTiger's fast-abort for hot-contention workloads; the 500ms default
+// (JE-faithful) is unchanged for transactions that do not opt in.
+// ---------------------------------------------------------------------------
+
+/// A `no_wait` transaction must fail a conflicting lock request in well under
+/// the 500ms default lock timeout — proving the abort is immediate, not a
+/// timed-out wait.
+#[test]
+fn test_fix3b_no_wait_aborts_immediately_not_after_timeout() {
+    use std::time::Instant;
+    let (_dir, env, db) = setup();
+    put_committed(&env, &db, b"hot", b"v0");
+
+    // Holder acquires the WRITE lock and keeps it.
+    let holder = env.begin_transaction(None).unwrap();
+    db.put_in(
+        &holder,
+        DatabaseEntry::from_bytes(b"hot"),
+        DatabaseEntry::from_bytes(b"held"),
+    )
+    .unwrap();
+
+    // A no_wait transaction must be denied the lock IMMEDIATELY.
+    let no_wait = TransactionConfig::new().with_no_wait(true);
+    let contender = env.begin_transaction(Some(&no_wait)).unwrap();
+    let start = Instant::now();
+    let result = db.put_in(
+        &contender,
+        DatabaseEntry::from_bytes(b"hot"),
+        DatabaseEntry::from_bytes(b"contend"),
+    );
+    let elapsed = start.elapsed();
+
+    assert!(result.is_err(), "no_wait contender must fail on lock conflict");
+    assert!(
+        matches!(result.unwrap_err(), noxu_db::NoxuError::LockNotAvailable),
+        "no_wait conflict must surface as LockNotAvailable"
+    );
+    // The default lock timeout is 500ms; an immediate abort is orders of
+    // magnitude faster.  Assert well under half the default to leave ample
+    // margin for a loaded CI box while still proving we did not wait it out.
+    assert!(
+        elapsed < Duration::from_millis(200),
+        "no_wait abort took {elapsed:?} — expected an immediate abort, not a \
+         wait toward the 500ms default lock timeout"
+    );
+
+    let _ = contender.abort();
+    holder.commit().unwrap();
+}
