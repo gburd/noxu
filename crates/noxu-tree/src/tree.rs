@@ -2952,6 +2952,60 @@ impl Tree {
         self.database_id
     }
 
+    /// LSN at which this tree's root IN/BIN was last logged (`root_log_lsn`),
+    /// or `NULL_LSN` if the root was never logged.
+    ///
+    /// This is the Noxu equivalent of `Tree.getRootLsn()` (Tree.java:534,
+    /// `return root.getLsn()`): the root `ChildReference`'s LSN.  The
+    /// checkpointer records it per database in `CheckpointEnd` so that
+    /// recovery can seed the reconstructed tree (`set_root_lsn`) and lazily
+    /// fetch pre-checkpoint BINs from the checkpointed root on descent, rather
+    /// than replaying every pre-checkpoint LN.
+    pub fn get_root_lsn(&self) -> Lsn {
+        *self.root_log_lsn.read()
+    }
+
+    /// Seed the tree's root LSN without materializing the root node.
+    ///
+    /// Used by recovery to point a freshly-created (empty) tree at the
+    /// checkpointed root recorded in `CheckpointEnd`.  Leaving `root` itself
+    /// `None` means the first access (`get_root` / `redo_insert`) lazily
+    /// fetches the root from `log_lsn` via `fetch_root_from_log`, and the
+    /// descent then fetches each pre-checkpoint child BIN on demand
+    /// (`child_at_or_fetch`) — the faithful equivalent of JE seeding
+    /// `info.useRootLsn` from `CheckpointEnd.getRootLsn()`
+    /// (RecoveryManager.java:682) and reading the tree back from the log
+    /// (`readMapTreeFromLog`).
+    ///
+    /// A `NULL_LSN` seed is a no-op (nothing to fetch) — recovery then falls
+    /// back to full LN redo, which is the correct behaviour for a tree that
+    /// has no checkpointed root (e.g. an old-format `CheckpointEnd` with no
+    /// per-DB roots, or a database created after the last checkpoint).
+    ///
+    /// Requires that a `LogManager` be wired (`set_log_manager`) before the
+    /// first access, or the lazy fetch cannot read the root back.
+    pub fn set_root_lsn(&self, log_lsn: Lsn) {
+        if log_lsn == NULL_LSN {
+            return;
+        }
+        *self.root_log_lsn.write() = log_lsn;
+    }
+
+    /// Record the LSN at which the checkpointer just logged this tree's root
+    /// IN/BIN, so that `get_root_lsn` reflects the checkpointed root.
+    ///
+    /// JE `Checkpointer` logs each database's root as the non-provisional
+    /// checkpoint anchor and the root `ChildReference`'s LSN is updated to it
+    /// (analogous to `evictRoot`: `rootRef.setLsn(newLsn)`).  Noxu's
+    /// checkpointer calls this after logging the root so a subsequent
+    /// `get_root_lsn()` returns the post-flush LSN recorded in `CheckpointEnd`.
+    pub fn note_root_logged(&self, log_lsn: Lsn) {
+        if log_lsn == NULL_LSN {
+            return;
+        }
+        *self.root_log_lsn.write() = log_lsn;
+    }
+
     /// Count the total number of live (non-deleted) entries across all BINs.
     ///
     /// Used by `DatabaseImpl::set_recovered_tree()` to initialise the
@@ -3060,6 +3114,52 @@ impl Tree {
                 for child in children {
                     Self::count_entries_recursive(&child, total);
                 }
+            }
+        }
+    }
+
+    /// Force every child reachable from the (possibly checkpoint-seeded) root
+    /// to be resident, fetching each non-resident node from its slot LSN.
+    ///
+    /// After recovery seeds a tree from a checkpointed root and replays only
+    /// post-checkpoint LNs, most pre-checkpoint BINs are still non-resident
+    /// (only their on-disk LSN is known).  The runtime read/cursor path
+    /// fetches them on demand (`child_at_or_fetch`), but the tree-walk
+    /// helpers used right after recovery — `count_entries`, the structural
+    /// `verify` pass, and the next checkpoint's dirty-node scan — traverse
+    /// only *resident* children (`resident_children`).  Calling this once
+    /// after redo makes the whole recovered tree resident so those walks see
+    /// the complete tree, exactly as a full LN-redo rebuild would have.
+    ///
+    /// Cost is O(number of INs/BINs), not O(number of records): we pay one
+    /// log read per node (the same read the first cursor access would incur),
+    /// which is far cheaper than replaying every pre-checkpoint LN.  A no-op
+    /// for a tree with no seeded/non-resident nodes.
+    ///
+    /// JE analogue: `IN.fetchIN` following each `ChildReference` LSN during
+    /// `RecoveryManager.buildINs`, which leaves the recovered subtree
+    /// resident.
+    pub fn materialize_all(&self) {
+        let root = match self.get_root() {
+            Some(r) => r,
+            None => return,
+        };
+        self.materialize_recursive(&root);
+    }
+
+    fn materialize_recursive(&self, node_arc: &Arc<RwLock<TreeNode>>) {
+        // Determine the number of routing slots without holding the guard
+        // across the fetch (which needs the node write lock).
+        let n_entries = {
+            let g = node_arc.read();
+            match &*g {
+                TreeNode::Internal(n) => n.entries.len(),
+                TreeNode::Bottom(_) => return, // BINs have no IN children
+            }
+        };
+        for idx in 0..n_entries {
+            if let Some(child) = self.child_at_or_fetch(node_arc, idx) {
+                self.materialize_recursive(&child);
             }
         }
     }
@@ -3816,6 +3916,16 @@ impl Tree {
         let data_opt: Option<&[u8]> =
             if data.is_empty() { None } else { Some(data) };
 
+        // Recovery seed: if the root is not resident but a checkpointed root
+        // LSN was seeded (`set_root_lsn`), materialise it from the log FIRST,
+        // so the first-key path below does not mistake a checkpoint-seeded
+        // tree for an empty one and discard the seed.  `fetch_root_from_log`
+        // is a no-op returning None when there is no seed (genuinely empty
+        // tree), so the ordinary empty-tree path is preserved.
+        if !self.is_root_resident() && self.get_root_lsn() != NULL_LSN {
+            let _ = self.fetch_root_from_log();
+        }
+
         // First-key path: initialise a two-level tree from scratch.
         {
             let mut root_guard = self.root.write();
@@ -3898,6 +4008,7 @@ impl Tree {
             self.max_entries_per_node,
             self.key_comparator.as_ref(),
             self.key_prefixing,
+            self,
         )?;
 
         if result && let Some(counter) = &self.memory_counter {
@@ -4684,6 +4795,7 @@ impl Tree {
         max_entries: usize,
         key_comparator: Option<&KeyComparatorFn>,
         key_prefixing: bool,
+        tree: &Tree,
     ) -> Result<bool, TreeError> {
         Self::redo_insert_recursive_inner(
             node_arc,
@@ -4695,6 +4807,7 @@ impl Tree {
             key_prefixing,
             true,
             true,
+            tree,
         )
     }
 
@@ -4709,6 +4822,7 @@ impl Tree {
         key_prefixing: bool,
         all_left_so_far: bool,
         all_right_so_far: bool,
+        tree: &Tree,
     ) -> Result<bool, TreeError> {
         let parent_guard = node_arc.read();
         let is_bin = parent_guard.is_bin();
@@ -4769,33 +4883,50 @@ impl Tree {
                 TreeNode::Internal(_) => Err(TreeError::SplitRequired),
             }
         } else {
-            let (child_index, n_entries_at_level, child_arc) =
-                match &*parent_guard {
-                    TreeNode::Internal(n) => {
-                        let mut idx = 0usize;
-                        for (i, entry) in n.entries.iter().enumerate() {
-                            if i == 0 {
-                                idx = 0;
+            // Resolve the routing slot for `key` under the read guard, then
+            // release it before (possibly) fetching the child, because
+            // `child_at_or_fetch` needs the parent write lock to install a
+            // lazily-fetched child.
+            let (child_index, n_entries_at_level) = match &*parent_guard {
+                TreeNode::Internal(n) => {
+                    let mut idx = 0usize;
+                    for (i, entry) in n.entries.iter().enumerate() {
+                        if i == 0 {
+                            idx = 0;
+                        } else {
+                            let ord = match key_comparator {
+                                Some(cmp) => cmp(entry.key.as_slice(), key),
+                                None => entry.key.as_slice().cmp(key),
+                            };
+                            if ord != std::cmp::Ordering::Greater {
+                                idx = i;
                             } else {
-                                let ord = match key_comparator {
-                                    Some(cmp) => cmp(entry.key.as_slice(), key),
-                                    None => entry.key.as_slice().cmp(key),
-                                };
-                                if ord != std::cmp::Ordering::Greater {
-                                    idx = i;
-                                } else {
-                                    break;
-                                }
+                                break;
                             }
                         }
-                        let child =
-                            n.get_child(idx).ok_or(TreeError::SplitRequired)?;
-                        (idx, n.entries.len(), child)
                     }
-                    TreeNode::Bottom(_) => {
-                        return Err(TreeError::SplitRequired);
-                    }
-                };
+                    (idx, n.entries.len())
+                }
+                TreeNode::Bottom(_) => {
+                    return Err(TreeError::SplitRequired);
+                }
+            };
+            drop(parent_guard);
+
+            // Recovery lazy fetch (JE `fetchTarget` during redo): the child
+            // slot of a checkpoint-seeded IN may be non-resident — only its
+            // on-disk LSN is known.  `child_at_or_fetch` returns the cached
+            // child on the fast path and otherwise reads it back from the
+            // log, installing it under the parent write latch.  This is what
+            // materialises pre-checkpoint BINs that are reachable from the
+            // seeded root but were not re-logged by the last checkpoint
+            // (equivalent to JE `IN.fetchIN` following a `ChildReference`
+            // LSN, RecoveryManager.buildINs).  `None` means the slot has no
+            // valid LSN or the read failed — treat as a missing subtree
+            // rather than corrupt data.
+            let child_arc = tree
+                .child_at_or_fetch(node_arc, child_index)
+                .ok_or(TreeError::SplitRequired)?;
 
             let all_left = all_left_so_far && child_index == 0;
             let all_right = all_right_so_far
@@ -4812,7 +4943,6 @@ impl Tree {
                     (_, true) => SplitHint::AllRight,
                     _ => SplitHint::Normal,
                 };
-                drop(parent_guard);
                 Self::split_child(
                     node_arc,
                     child_index,
@@ -4838,10 +4968,11 @@ impl Tree {
                     key_prefixing,
                     all_left_so_far,
                     all_right_so_far,
+                    tree,
                 );
             }
 
-            let r = Self::redo_insert_recursive_inner(
+            Self::redo_insert_recursive_inner(
                 &child_arc,
                 key,
                 data,
@@ -4851,9 +4982,8 @@ impl Tree {
                 key_prefixing,
                 all_left,
                 all_right,
-            );
-            drop(parent_guard);
-            r
+                tree,
+            )
         }
     }
 
@@ -5017,6 +5147,15 @@ impl Tree {
     /// cursor layer (`cursor_impl.rs::log_ln_write`) before this is called,
     /// matching separation between LN logging and tree mutation.
     pub fn delete(&self, key: &[u8]) -> bool {
+        // Recovery seed: materialise a checkpoint-seeded root before descent
+        // so a delete-LN redo can reach (and fetch) a non-resident BIN.
+        // Without this a delete targeting a pre-checkpoint BIN that lazy
+        // fetch has not yet materialised would silently no-op, resurrecting
+        // a record the log says was removed.  No-op when the tree is
+        // genuinely empty (no seed).
+        if !self.is_root_resident() && self.get_root_lsn() != NULL_LSN {
+            let _ = self.fetch_root_from_log();
+        }
         let root = match self.get_root() {
             Some(r) => r,
             None => return false,
@@ -5035,8 +5174,12 @@ impl Tree {
             0
         };
 
-        let deleted =
-            Self::delete_recursive(&root, key, self.key_comparator.as_ref());
+        let deleted = Self::delete_recursive(
+            &root,
+            key,
+            self.key_comparator.as_ref(),
+            self,
+        );
 
         // Update the memory counter when an entry is removed.
         // IN.updateMemorySize(-delta) → MemoryBudget.updateTreeMemoryUsage(-delta).
@@ -5054,6 +5197,7 @@ impl Tree {
         node_arc: &Arc<RwLock<TreeNode>>,
         key: &[u8],
         key_comparator: Option<&KeyComparatorFn>,
+        tree: &Tree,
     ) -> bool {
         // Latch coupling, mirroring `insert_recursive`. Without this,
         // delete has the same "BIN split out from under us" race: thread
@@ -5068,7 +5212,11 @@ impl Tree {
         // semantically a lost delete.
         let parent_guard = node_arc.read();
         let is_bin = parent_guard.is_bin();
-        let child_arc = if !is_bin {
+        // For an internal node, resolve the routing slot index under the read
+        // guard; the child Arc itself is fetched below (after the guard is
+        // dropped) so a non-resident, checkpoint-seeded child can be read
+        // back from the log via `child_at_or_fetch`.
+        let child_idx = if !is_bin {
             match &*parent_guard {
                 TreeNode::Internal(n) => {
                     // Find child slot with largest key <= search key
@@ -5088,7 +5236,7 @@ impl Tree {
                             }
                         }
                     }
-                    n.get_child(idx)
+                    Some(idx)
                 }
                 _ => None,
             }
@@ -5140,16 +5288,43 @@ impl Tree {
                 _ => false,
             }
         } else {
-            // Descend with parent_guard still held; the recursion will
-            // hold its own read lock and drop ours after it returns.
-            let r = match child_arc {
-                Some(child) => {
-                    Self::delete_recursive(&child, key, key_comparator)
-                }
-                None => false,
+            // Descend into the routing child.
+            //
+            // Fast path (child resident): keep the parent read guard held
+            // across the recursive descent, preserving the latch-coupling
+            // that stops a concurrent `split_child` from moving `key` into a
+            // sibling out from under us (the lost-delete race documented
+            // above).
+            //
+            // Slow path (child non-resident, checkpoint-seeded): the child
+            // must be fetched from the log, which needs the parent WRITE
+            // lock, so we drop the read guard first.  This path is only
+            // reached during recovery redo (single-threaded) or after a root
+            // eviction, where the concurrent-split race does not apply.
+            let resident_child = match (child_idx, &*parent_guard) {
+                (Some(idx), TreeNode::Internal(n)) => n.get_child(idx),
+                _ => None,
             };
-            drop(parent_guard);
-            r
+            if let Some(child) = resident_child {
+                let r =
+                    Self::delete_recursive(&child, key, key_comparator, tree);
+                drop(parent_guard);
+                r
+            } else {
+                drop(parent_guard);
+                match child_idx {
+                    Some(idx) => match tree.child_at_or_fetch(node_arc, idx) {
+                        Some(child) => Self::delete_recursive(
+                            &child,
+                            key,
+                            key_comparator,
+                            tree,
+                        ),
+                        None => false,
+                    },
+                    None => false,
+                }
+            }
         }
     }
 
@@ -6412,6 +6587,18 @@ impl Tree {
         let node = self.fetch_node_from_log(child_lsn)?;
         let node_id = node.node_id();
         let arc: ChildArc = Arc::new(RwLock::new(node));
+        // Wire the fetched child's parent back-pointer to `parent_arc`.  The
+        // serialized node carries no parent link (it is per-in-memory-tree),
+        // so a lazily-fetched node would otherwise have `parent: None`.  That
+        // breaks any later `parent`-based navigation — notably the
+        // checkpointer's `update_parent_slot_lsn`, which finds a child's
+        // parent via this Weak to stamp the child's on-disk LSN into the
+        // parent slot.  JE's fetched IN likewise has its parent set on
+        // install (`postFetchInit` / `attachNode`).
+        {
+            let mut cg = arc.write();
+            cg.set_parent(Some(Arc::downgrade(parent_arc)));
+        }
         n.set_child(idx, Some(arc.clone()));
         drop(g);
         // JE: a fetched IN is added back to the INList (Evictor LRU).
@@ -6627,6 +6814,82 @@ impl Tree {
         bin.dirty = true;
     }
 
+    /// Parse a serialized BIN-delta (`serialize_delta` format) into full-key
+    /// entry tuples `(full_key, lsn, data, known_deleted)`.
+    ///
+    /// Unlike `apply_delta` (which overlays by slot INDEX and therefore
+    /// corrupts the base when a delta INSERTS a new key that shifts later
+    /// slots), these tuples are merged by KEY into the base full BIN during
+    /// delta-chain reconstitution (`fetch_node_from_log`), which is correct
+    /// for both updates and insertions.  Returns `None` on malformed input.
+    pub fn parse_delta_entries(
+        delta_bytes: &[u8],
+    ) -> Option<Vec<(Vec<u8>, Lsn, Option<Vec<u8>>, bool)>> {
+        if delta_bytes.len() < 12 {
+            return None;
+        }
+        let num_dirty =
+            u32::from_be_bytes(delta_bytes[8..12].try_into().ok()?) as usize;
+        let mut pos = 12usize;
+        let mut out = Vec::with_capacity(num_dirty);
+        for _ in 0..num_dirty {
+            // slot_idx(u32BE) | key_len(u32BE) | key | lsn(u64BE) |
+            //   has_data(u8) [| data_len(u32BE) | data] | known_deleted(u8)
+            if pos + 4 > delta_bytes.len() {
+                return None;
+            }
+            pos += 4; // skip slot_idx (we merge by key, not index)
+            if pos + 4 > delta_bytes.len() {
+                return None;
+            }
+            let key_len =
+                u32::from_be_bytes(delta_bytes[pos..pos + 4].try_into().ok()?)
+                    as usize;
+            pos += 4;
+            if pos + key_len > delta_bytes.len() {
+                return None;
+            }
+            let key = delta_bytes[pos..pos + key_len].to_vec();
+            pos += key_len;
+            if pos + 8 > delta_bytes.len() {
+                return None;
+            }
+            let lsn = Lsn::from_u64(u64::from_be_bytes(
+                delta_bytes[pos..pos + 8].try_into().ok()?,
+            ));
+            pos += 8;
+            if pos + 1 > delta_bytes.len() {
+                return None;
+            }
+            let has_data = delta_bytes[pos] != 0;
+            pos += 1;
+            let data = if has_data {
+                if pos + 4 > delta_bytes.len() {
+                    return None;
+                }
+                let dl = u32::from_be_bytes(
+                    delta_bytes[pos..pos + 4].try_into().ok()?,
+                ) as usize;
+                pos += 4;
+                if pos + dl > delta_bytes.len() {
+                    return None;
+                }
+                let d = delta_bytes[pos..pos + dl].to_vec();
+                pos += dl;
+                Some(d)
+            } else {
+                None
+            };
+            if pos + 1 > delta_bytes.len() {
+                return None;
+            }
+            let known_deleted = delta_bytes[pos] != 0;
+            pos += 1;
+            out.push((key, lsn, data, known_deleted));
+        }
+        Some(out)
+    }
+
     /// Reconstitute a BIN-delta into a full BIN.
     ///
     /// from the:
@@ -6691,17 +6954,139 @@ impl Tree {
         let in_entry =
             noxu_log::entry::in_log_entry::InLogEntry::read_from_log(&payload)
                 .ok()?;
-        let node_data = &in_entry.node_data;
         use noxu_log::LogEntryType;
         match entry_type {
             LogEntryType::BIN => {
-                Self::deserialize_bin(node_data).map(TreeNode::Bottom)
+                Self::deserialize_bin(&in_entry.node_data).map(|mut bin| {
+                    // `deserialize_bin` always recomputes a key prefix from
+                    // the loaded keys.  When this tree has key-prefixing
+                    // DISABLED, the insert/redo paths use the full-key
+                    // (`insert_raw`) representation and assume an EMPTY prefix
+                    // (see `BinStub::insert_raw`); a fetched BIN carrying a
+                    // non-empty computed prefix would then corrupt any later
+                    // full-key insert (the stored full key would be treated as
+                    // a suffix and re-prefixed on read).  Re-expand to an
+                    // empty prefix here to keep the invariant that
+                    // key_prefixing=false BINs have no prefix.  (JE ties the
+                    // prefix to `DatabaseImpl.getKeyPrefixing()`; Noxu enforces
+                    // it at the fetch boundary.)
+                    if !self.key_prefixing && !bin.key_prefix.is_empty() {
+                        bin.apply_new_prefix(Vec::new());
+                    }
+                    TreeNode::Bottom(bin)
+                })
             }
-            LogEntryType::IN => {
-                Self::deserialize_upper_in(node_data).map(TreeNode::Internal)
+            LogEntryType::IN => Self::deserialize_upper_in(&in_entry.node_data)
+                .map(TreeNode::Internal),
+            // A checkpoint-seeded parent slot may point at a BIN-delta LSN
+            // (the most recent on-disk version of a BIN logged as a delta).
+            // Reconstitute it into a full BIN: read the base full BIN at the
+            // delta's `prev_full_lsn` and overlay the delta slots
+            // (`reconstitute_bin_delta`, JE `BINDelta.reconstituteBIN`).  This
+            // is what lets the redo gate skip the delta's committed LNs — the
+            // seeded fetch materialises the CURRENT (post-delta) contents.
+            LogEntryType::BINDelta => {
+                // A checkpoint-seeded parent slot may point at a BIN-delta
+                // LSN (the most recent on-disk version of a BIN logged as a
+                // delta).  Reconstitute it into a full BIN by walking the
+                // ENTIRE delta chain back to its base full BIN and applying
+                // every delta oldest-first over the base.  A single BIN may
+                // have several deltas since its last full log (e.g. one
+                // checkpoint dirtied slot A, a later checkpoint dirtied slot
+                // B); each delta carries only the slots dirtied since the
+                // PREVIOUS log, so reading just the newest delta + base would
+                // drop the intermediate deltas' committed changes.  The redo
+                // gate skips those changes' LNs, so the chain MUST be applied
+                // in full here (JE `BINDelta.reconstituteBIN` follows the
+                // delta chain / the BIN tracks its full base).
+                //
+                // Chain: newest delta -> prev_delta_lsn -> ... -> (prev_delta
+                // NULL) whose prev_full_lsn is the base full BIN.
+                let mut deltas: Vec<Vec<u8>> = Vec::new();
+                let mut cur_lsn = log_lsn;
+                let mut cur_entry = in_entry;
+                let base_full_lsn;
+                loop {
+                    deltas.push(std::mem::take(&mut cur_entry.node_data));
+                    let prev_delta = cur_entry.prev_delta_lsn;
+                    if prev_delta == NULL_LSN {
+                        base_full_lsn = cur_entry.prev_full_lsn;
+                        break;
+                    }
+                    // Guard against a self-referential / cyclic chain.
+                    if prev_delta == cur_lsn {
+                        log::warn!(
+                            "fetch_node_from_log: BINDelta chain cycle at {:?}",
+                            prev_delta
+                        );
+                        return None;
+                    }
+                    let (pt, pp) = lm.read_entry(prev_delta).ok()?;
+                    if pt != LogEntryType::BINDelta {
+                        // The previous link is a full BIN (the base): stop.
+                        base_full_lsn = prev_delta;
+                        break;
+                    }
+                    cur_lsn = prev_delta;
+                    cur_entry =
+                        noxu_log::entry::in_log_entry::InLogEntry::
+                            read_from_log(&pp)
+                            .ok()?;
+                }
+                if base_full_lsn == NULL_LSN {
+                    log::warn!(
+                        "fetch_node_from_log: BINDelta at {:?} has no base \
+                         full LSN",
+                        log_lsn
+                    );
+                    return None;
+                }
+                let (base_type, base_payload) =
+                    lm.read_entry(base_full_lsn).ok()?;
+                if base_type != LogEntryType::BIN {
+                    log::warn!(
+                        "fetch_node_from_log: BINDelta base at LSN {:?} is \
+                         {:?}, expected BIN",
+                        base_full_lsn,
+                        base_type
+                    );
+                    return None;
+                }
+                let base_in =
+                    noxu_log::entry::in_log_entry::InLogEntry::read_from_log(
+                        &base_payload,
+                    )
+                    .ok()?;
+                // Apply deltas oldest-first (we collected newest-first).
+                // Merge each delta entry BY KEY (not by slot index): a delta
+                // that inserts a new key shifts later slots, so slot-index
+                // overlay (`apply_delta`) would corrupt the base.  Known-
+                // deleted tombstones are preserved so an aborted-insert slot
+                // does not resurrect.
+                let mut bin = BinStub::deserialize_full(&base_in.node_data)?;
+                if !bin.key_prefix.is_empty() {
+                    bin.apply_new_prefix(Vec::new());
+                }
+                for delta_bytes in deltas.iter().rev() {
+                    let entries = Self::parse_delta_entries(delta_bytes)?;
+                    for (full_key, lsn, data, known_deleted) in entries {
+                        let (idx, _new) = if self.key_prefixing {
+                            bin.insert_with_prefix(full_key, lsn, data)
+                        } else {
+                            bin.insert_raw(full_key, lsn, data)
+                        };
+                        bin.entries[idx].known_deleted = known_deleted;
+                    }
+                }
+                bin.is_delta = false;
+                bin.dirty = false;
+                if self.key_prefixing {
+                    bin.recompute_key_prefix();
+                } else if !bin.key_prefix.is_empty() {
+                    bin.apply_new_prefix(Vec::new());
+                }
+                Some(TreeNode::Bottom(bin))
             }
-            // BIN-deltas are never logged as the *root* version and are
-            // reconstituted by the BIN-delta path, not here.
             _ => {
                 log::warn!(
                     "fetch_node_from_log: expected IN/BIN entry at LSN {:?}, \
@@ -7539,6 +7924,60 @@ impl Tree {
         Self::find_parent_of_node_id(&root, child_node_id)
     }
 
+    /// Stamp `new_lsn` into the slot of `child_arc`'s parent IN that points at
+    /// `child_arc`, and mark the parent dirty.
+    ///
+    /// This is the Noxu equivalent of JE `IN.updateEntry(index, lsn)` /
+    /// `Tree` updating a child `ChildReference`'s LSN whenever the child is
+    /// logged.  The checkpointer calls it after logging a child BIN so that,
+    /// when the (now-dirty) parent IN is logged in the same checkpoint, it
+    /// serializes the child's CURRENT on-disk LSN — which recovery then
+    /// follows to lazily re-fetch the child (`child_at_or_fetch`).  Without
+    /// this the parent slot would carry a stale LSN (e.g. the LN LSN that
+    /// last triggered a split), and the seeded-root descent could not
+    /// materialise the child.
+    ///
+    /// Finds the parent via the child's `parent` back-pointer (O(fanout)),
+    /// not a full-tree search.  A no-op when the child has no parent (it is
+    /// the root — handled by `note_root_logged`), the parent Weak is dead, or
+    /// the child is not found in the parent's slots.
+    pub fn update_parent_slot_lsn(
+        child_arc: &Arc<RwLock<TreeNode>>,
+        new_lsn: Lsn,
+    ) {
+        if new_lsn == NULL_LSN {
+            return;
+        }
+        let (child_id, parent_weak) = {
+            let g = child_arc.read();
+            let weak = match &*g {
+                TreeNode::Bottom(b) => b.parent.clone(),
+                TreeNode::Internal(n) => n.parent.clone(),
+            };
+            (g.node_id(), weak)
+        };
+        let Some(parent_weak) = parent_weak else {
+            return;
+        };
+        let Some(parent_arc) = parent_weak.upgrade() else {
+            return;
+        };
+        let mut pg = parent_arc.write();
+        if let TreeNode::Internal(p) = &mut *pg {
+            for slot in 0..p.entries.len() {
+                let matches = p
+                    .child_ref(slot)
+                    .map(|c| c.read().node_id() == child_id)
+                    .unwrap_or(false);
+                if matches {
+                    p.set_lsn(slot, new_lsn);
+                    p.dirty = true;
+                    return;
+                }
+            }
+        }
+    }
+
     /// Recursive DFS helper for `get_parent_in_for_child_in`.
     ///
     /// Scans every entry in each Internal node.  When a child's node_id
@@ -7623,6 +8062,14 @@ impl Tree {
         delta_bytes: &[u8],
     ) -> Option<BinStub> {
         let mut base = BinStub::deserialize_full(base_bytes)?;
+        // `deserialize_full` recomputes a key prefix, so `base.keys` holds
+        // suffixes.  `apply_delta` writes FULL keys into slots by index, so we
+        // must first expand the base back to full keys (empty prefix);
+        // otherwise full keys and suffixes get mixed and the subsequent
+        // `recompute_key_prefix` double-prefixes them (corruption).
+        if !base.key_prefix.is_empty() {
+            base.apply_new_prefix(Vec::new());
+        }
         // Apply the delta slots onto the base.
         // Note: BinStub::apply_delta uses slot-index addressing into base.entries,
         // extending with new entries when the slot_idx >= base.entries.len().

@@ -253,6 +253,15 @@ pub struct EnvironmentImpl {
     /// in-memory VLSN index after crash recovery.
     pub recovery_vlsns: Vec<(u64, u64)>,
 
+    /// REC-P (lazy-fetch observability): the number of committed /
+    /// non-transactional LNs replayed during the last recovery's redo phase,
+    /// and the number the seeded-root redo gate skipped (covered by
+    /// checkpoint-seeded lazy BIN fetch).  Populated from `RecoveryInfo`;
+    /// used by tests to confirm recovery used lazy fetch rather than full LN
+    /// redo.  Both zero for a fresh environment.
+    pub recovery_lns_redone: u64,
+    pub recovery_lns_gated: u64,
+
     /// Minimum rollback matchpoint LSN from recovery (X-1).
     ///
     /// `Some(lsn_u64)` when recovery detected a completed rollback; the
@@ -558,6 +567,9 @@ impl EnvironmentImpl {
         > = HashMap::new();
         // X-14 / X-1: VLSN pairs and rollback matchpoint from recovery.
         let mut recovery_vlsns: Vec<(u64, u64)> = Vec::new();
+        // REC-P: lazy-fetch redo counters (populated from RecoveryInfo below).
+        let mut recovery_lns_redone: u64 = 0;
+        let mut recovery_lns_gated: u64 = 0;
         let mut recovery_rollback_matchpoint: Option<u64> = None;
         // REC-C: id maxima recovered from the log (CheckpointEnd id fields +
         // live scan).  Used to seed the env's sequences so post-restart
@@ -621,6 +633,23 @@ impl EnvironmentImpl {
                     cfg.halt_on_commit_after_checksum_exception,
                 );
             let mut rmgr = RecoveryManager::new();
+            // REC-P: give recovery a LogManager so it can lazily fetch
+            // checkpoint-seeded pre-checkpoint BINs during redo
+            // (`fetchTarget`-in-recovery).  This is a read-only view over the
+            // same FileManager the real LogManager (built below) will use;
+            // recovery only calls `read_entry` on it.  Wiring it enables the
+            // AfterCheckpointStart redo gate for checkpoint-seeded trees; if
+            // it were absent, recovery would leave trees unseeded and
+            // full-redo (the safe fallback).
+            {
+                let recovery_lm = Arc::new(LogManager::new(
+                    Arc::clone(&fm),
+                    cfg.log_num_buffers,
+                    cfg.log_buffer_size,
+                    cfg.log_fault_read_size,
+                ));
+                rmgr.set_log_manager(recovery_lm);
+            }
             // Multi-DB recovery: discover every db_id in the log and build
             // a Tree for each one. During the analysis phase, each LN/BIN is
             // routed to the correct database by its db_id.
@@ -723,6 +752,8 @@ impl EnvironmentImpl {
             rebuilt_file_summaries = recovery_info.rebuilt_file_summaries;
             // X-14 / X-1: stash VLSN rebuild data.
             recovery_vlsns = recovery_info.recovered_vlsns;
+            recovery_lns_redone = recovery_info.lns_redone;
+            recovery_lns_gated = recovery_info.lns_gated;
             recovery_rollback_matchpoint =
                 recovery_info.rollback_matchpoint_lsn;
 
@@ -1599,6 +1630,8 @@ impl EnvironmentImpl {
             recovered_prepared_txns: Mutex::new(recovered_prepared),
             recovered_prepared_lns: Mutex::new(recovered_prepared_lns),
             recovery_vlsns,
+            recovery_lns_redone,
+            recovery_lns_gated,
             recovery_rollback_matchpoint,
             primary_tree,
             db_trees_registry,
@@ -1692,7 +1725,8 @@ impl EnvironmentImpl {
     /// `false`, so every database in a standalone environment is correctly
     /// non-replicated regardless of the config's `replicated` value.
     pub fn set_replicated(&self, replicated: bool) {
-        self.is_replicated.store(replicated, std::sync::atomic::Ordering::Relaxed);
+        self.is_replicated
+            .store(replicated, std::sync::atomic::Ordering::Relaxed);
     }
     pub fn get_creation_time(&self) -> u64 {
         self.creation_time_ms

@@ -515,33 +515,32 @@ impl Environment {
         // cannot perturb the daemon-manager shutdown ordering.
         // JE ref: EnvironmentParams.ENV_RUN_VERIFIER / VERIFY_SCHEDULE,
         // com.sleepycat.je.dbi.DataVerifier.
-        let verify_daemon = if config.run_verifier
-            && !config.verify_schedule.is_empty()
-        {
-            match crate::verify_daemon::CronSchedule::parse(
-                &config.verify_schedule,
-            ) {
-                Some(schedule) => {
-                    let vconfig = noxu_engine::VerifyConfig::new()
-                        .with_btree_verification(true);
-                    Some(crate::verify_daemon::VerifyDaemon::start(
-                        Arc::clone(&env_impl_arc),
-                        schedule,
-                        vconfig,
-                    ))
-                }
-                None => {
-                    log::warn!(
-                        "verify_schedule={:?} is not a valid 5-field cron \
+        let verify_daemon =
+            if config.run_verifier && !config.verify_schedule.is_empty() {
+                match crate::verify_daemon::CronSchedule::parse(
+                    &config.verify_schedule,
+                ) {
+                    Some(schedule) => {
+                        let vconfig = noxu_engine::VerifyConfig::new()
+                            .with_btree_verification(true);
+                        Some(crate::verify_daemon::VerifyDaemon::start(
+                            Arc::clone(&env_impl_arc),
+                            schedule,
+                            vconfig,
+                        ))
+                    }
+                    None => {
+                        log::warn!(
+                            "verify_schedule={:?} is not a valid 5-field cron \
                          expression; the background verifier will NOT run",
-                        config.verify_schedule,
-                    );
-                    None
+                            config.verify_schedule,
+                        );
+                        None
+                    }
                 }
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
 
         let env = Environment {
             home,
@@ -1217,6 +1216,24 @@ impl Environment {
         self.check_open()?;
         let env_impl = self.env_impl.lock();
         Ok(env_impl.get_database_names())
+    }
+
+    /// Recovery lazy-fetch counters from the most recent open of this
+    /// environment: `(lns_redone, lns_gated)`.
+    ///
+    /// `lns_redone` is the number of committed / non-transactional LNs the
+    /// redo phase actually replayed; `lns_gated` is the number of
+    /// pre-checkpoint-start LNs the seeded-root redo gate skipped because
+    /// their records were materialised by lazily fetching checkpointed BINs
+    /// (`fetchTarget`-in-recovery) instead.  A large `lns_gated` relative to
+    /// `lns_redone` confirms recovery used lazy fetch rather than full LN
+    /// redo.  Both zero for a fresh environment or when no database was
+    /// checkpoint-seeded (full-redo fallback).
+    ///
+    /// Primarily an observability / test hook.
+    pub fn recovery_redo_counts(&self) -> (u64, u64) {
+        let env_impl = self.env_impl.lock();
+        (env_impl.recovery_lns_redone, env_impl.recovery_lns_gated)
     }
 
     /// Install a replica-ack coordinator on this environment.

@@ -14,8 +14,11 @@
 use noxu_db::{DatabaseConfig, Environment, EnvironmentConfig};
 
 fn scratch_dir(tag: &str) -> std::path::PathBuf {
-    let root = std::env::temp_dir()
-        .join(format!("noxu-verify-daemon-{}-{}", tag, std::process::id()));
+    let root = std::env::temp_dir().join(format!(
+        "noxu-verify-daemon-{}-{}",
+        tag,
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("create scratch dir");
     root
@@ -46,8 +49,7 @@ fn verify_daemon_runs_on_schedule_without_disrupting_ops() {
     // verify walk must not corrupt or block normal operations.
     for i in 0u32..500 {
         let key = format!("k{i:05}");
-        db.put(key.as_bytes(), format!("v{i}").as_bytes())
-            .expect("put");
+        db.put(key.as_bytes(), format!("v{i}").as_bytes()).expect("put");
     }
     // Give the daemon a moment to have woken at least once against live data.
     std::thread::sleep(std::time::Duration::from_millis(300));

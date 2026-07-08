@@ -165,8 +165,8 @@ fn cursor_scan_under_eviction_returns_all_data() {
 /// within the bound, turning an infinite thrash into a test FAILURE.
 #[test]
 fn large_dataset_sync_load_and_checkpoint_completes() {
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     let dir = TempDir::new().unwrap();
     // 8 MiB cache, ~40 MiB working set (~5x cache) — small enough to run

@@ -274,6 +274,28 @@ pub struct RecoveryManager {
     /// `force` after recovery (`recoveryEndFsyncInvisible`), so the redo pass
     /// on a subsequent crash never re-applies them.
     single_pass_invisible_lsns: Vec<Lsn>,
+
+    /// Log manager used to lazily fetch checkpoint-seeded pre-checkpoint BINs
+    /// during redo (the `fetchTarget`-in-recovery path).
+    ///
+    /// Wired onto each reconstructed tree (`Tree::set_log_manager`) before
+    /// redo so `child_at_or_fetch` / `fetch_root_from_log` can read nodes back
+    /// from the seeded root.  `None` when recovery is run without a log
+    /// manager (some unit tests): the trees are then not seeded and recovery
+    /// full-redoes, which is the safe fallback.
+    log_manager: Option<Arc<noxu_log::LogManager>>,
+
+    /// Database IDs whose tree was seeded from a checkpoint root LSN this
+    /// recovery (non-null `per_db_roots` entry AND a wired log manager).
+    ///
+    /// The `AfterCheckpointStart` redo gate (`eligible_for_redo`) skips
+    /// redoing a pre-checkpoint-start committed / non-transactional LN ONLY
+    /// for a db in this set: the record is guaranteed present in a
+    /// pre-checkpoint BIN reachable from the seeded root via lazy fetch
+    /// (`fetchTarget`).  For a db NOT in this set (no seed / v1 checkpoint /
+    /// no checkpoint) the gate stays inactive and full LN redo runs — the
+    /// safe fallback that preserves the pre-fix behaviour.
+    seeded_db_ids: std::collections::HashSet<u64>,
 }
 
 /// Apply a single committed LN to a live B-tree, exactly as the crash-recovery
@@ -367,6 +389,8 @@ impl RecoveryManager {
             per_db_redo_count: HashMap::new(),
             mapping_tree_db_names: HashMap::new(),
             single_pass_invisible_lsns: Vec::new(),
+            log_manager: None,
+            seeded_db_ids: std::collections::HashSet::new(),
         }
     }
 
@@ -384,7 +408,19 @@ impl RecoveryManager {
             per_db_redo_count: HashMap::new(),
             mapping_tree_db_names: HashMap::new(),
             single_pass_invisible_lsns: Vec::new(),
+            log_manager: None,
+            seeded_db_ids: std::collections::HashSet::new(),
         }
+    }
+
+    /// Install the [`noxu_log::LogManager`] used to lazily fetch
+    /// checkpoint-seeded pre-checkpoint BINs during redo.
+    ///
+    /// Must be called before `recover_all` / `recover` for the
+    /// `fetchTarget`-in-recovery path to be active.  Without it, recovery
+    /// leaves trees unseeded and full-redoes (safe fallback).
+    pub fn set_log_manager(&mut self, lm: Arc<noxu_log::LogManager>) {
+        self.log_manager = Some(lm);
     }
 
     // ====================================================================
@@ -546,6 +582,7 @@ impl RecoveryManager {
         // ------------------------------------------------------------------
         // Done
         // ------------------------------------------------------------------
+        self.info.lns_redone = self.stats.lns_redone;
         self.set_progress(RecoveryProgress::Complete);
 
         Ok(self.info.clone())
@@ -678,6 +715,53 @@ impl RecoveryManager {
         }
 
         // ------------------------------------------------------------------
+        // REC-P: seed each reconstructed tree from the checkpoint's per-DB
+        // root LSN so that redo can lazily fetch pre-checkpoint BINs
+        // (`fetchTarget`) instead of relying on flat IN-redo + full LN redo.
+        //
+        // This is the recovery half of the fix: the checkpointer records each
+        // open user database's tree root LSN in `CheckpointEnd.per_db_roots`;
+        // here we (1) ensure a tree exists for every seeded db_id (a tree with
+        // ONLY stable pre-checkpoint BINs has no post-checkpoint redo entries
+        // and would otherwise be absent), (2) wire the log manager so the tree
+        // can read nodes back, and (3) seed `root_log_lsn` via `set_root_lsn`.
+        // The tree's root itself stays non-resident until first access, when
+        // `fetch_root_from_log` materialises it and descent fetches each child
+        // BIN on demand.
+        //
+        // JE analogue: `envImpl.readMapTreeFromLog(info.useRootLsn)` +
+        // per-DB root recovery, then `buildINs` follows on-disk child pointers
+        // via `IN.fetchIN` (RecoveryManager.java:371, :682).
+        //
+        // Only active when a log manager is wired.  Without one the trees are
+        // left unseeded and recovery full-redoes — the safe fallback that also
+        // covers a v1 (empty per_db_roots) checkpoint.
+        if let Some(lm) = &self.log_manager {
+            for (db_id, root_lsn) in &analysis.per_db_roots {
+                if *root_lsn == NULL_LSN {
+                    continue;
+                }
+                let tree = trees
+                    .entry(*db_id)
+                    .or_insert_with(|| noxu_tree::Tree::new(*db_id, 256));
+                tree.set_log_manager(Arc::clone(lm));
+                tree.set_root_lsn(*root_lsn);
+                // Mark this db as seeded so the AfterCheckpointStart redo gate
+                // is allowed to skip its pre-checkpoint LNs (they are covered
+                // by lazy fetch from the seeded root).
+                self.seeded_db_ids.insert(*db_id);
+            }
+            // Also wire the log manager onto any tree created purely from redo
+            // entries (no seed): a redo LN into a split-off subtree may still
+            // need to fetch a seeded sibling reachable from the same root.
+            for tree in trees.values_mut() {
+                if tree.get_root_lsn() != NULL_LSN {
+                    tree.set_log_manager(Arc::clone(lm));
+                }
+            }
+        }
+
+        // ------------------------------------------------------------------
         // C-6 / JE phase B: mapping-tree undo pass.
         //
         // JE runs `undoLNs(mapLNSet)` on the mapping tree BEFORE replaying
@@ -698,6 +782,20 @@ impl RecoveryManager {
 
         self.set_progress(RecoveryProgress::UndoLNs);
         self.run_undo_all(scanner, &mut analysis, trees)?;
+
+        // REC-P: materialise every checkpoint-seeded tree so the whole
+        // recovered tree is resident before it is handed to the environment.
+        // Redo/undo only fetched the BINs they touched; the tree-walk helpers
+        // the env runs next (count_entries, structural verify, the next
+        // checkpoint's dirty-node scan) traverse only resident children, so
+        // any pre-checkpoint BIN left non-resident would be invisible to them
+        // even though it is correctly on disk.  One fetch per node (cheap vs
+        // full LN replay) leaves the tree exactly as a full redo would have.
+        for db_id in &self.seeded_db_ids {
+            if let Some(tree) = trees.get(db_id) {
+                tree.materialize_all();
+            }
+        }
 
         // X-1: record the minimum rollback matchpoint so ReplicatedEnvironment
         // can truncate the VLSN index to match the recovered B-tree state.
@@ -723,6 +821,7 @@ impl RecoveryManager {
         self.info.rebuilt_file_summaries =
             std::mem::take(&mut analysis.rebuilt_file_summaries);
 
+        self.info.lns_redone = self.stats.lns_redone;
         self.set_progress(RecoveryProgress::Complete);
         Ok(self.info.clone())
     }
@@ -875,6 +974,17 @@ impl RecoveryManager {
                     Self::redo_ln(t, rec, *lsn);
                 }
                 self.stats.lns_redone += 1;
+            } else if ckpt_start != NULL_LSN
+                && *lsn < ckpt_start
+                && self.seeded_db_ids.contains(&rec.db_id)
+                && !rec.is_invisible
+                && !self.rollback_tracker.is_in_rollback_period(*lsn)
+                && rec.txn_id.map(|t| analysis.is_committed(t)).unwrap_or(true)
+            {
+                // A committed / non-transactional pre-checkpoint-start LN of a
+                // seeded database that the redo gate skipped (its record is
+                // covered by the checkpoint-seeded lazy BIN fetch).
+                self.info.lns_gated += 1;
             }
         }
         // R-3: also include TxnCommit-derived VLSNs (recovered XA commits
@@ -1627,6 +1737,13 @@ impl RecoveryManager {
                         if rec.root_lsn != NULL_LSN {
                             result_ref.use_root_lsn = rec.root_lsn;
                         }
+                        // REC-P: capture the per-DB tree root LSNs of the
+                        // LATEST checkpoint so recovery can seed each tree
+                        // and lazily fetch pre-checkpoint BINs.  Cloned
+                        // (replacing any earlier checkpoint's roots) so only
+                        // the most recent checkpoint's seeds are used; empty
+                        // for a v1 checkpoint (→ full redo).
+                        result_ref.per_db_roots = rec.per_db_roots.clone();
                     }
                     // Always update ID counters from every CkptEnd seen —
                     // the counters are monotonically increasing max values so
@@ -2206,89 +2323,67 @@ impl RecoveryManager {
             return RedoAction::Skip;
         }
 
-        // After-checkpoint-start flag (JE AfterCheckpointStart).
+        // After-checkpoint-start redo gate (JE `AfterCheckpointStart`).
         //
-        // JE `RecoveryManager.eligibleForRedo` gates committed / non-txnal LN
-        // redo on:
+        // JE `RecoveryManager.eligibleForRedo` skips redoing an LN logged
+        // before the checkpoint start:
         //   afterCheckpointStart = (checkpointStartLsn == NULL_LSN ||
         //       getLastLsn() >= checkpointStartLsn)
-        // — i.e. it skips redoing an LN logged before the checkpoint start,
         // relying on that record already living in a BIN reachable from the
-        // checkpointed tree.
+        // checkpointed tree (fetched on demand via `IN.fetchIN`).
         //
-        // This gate is intentionally NOT enabled here, and enabling it as
-        // written LOSES DATA on a multi-checkpoint clean reopen.  The reason is
-        // structural, NOT the (now-stale) "checkpointer only flushes the
-        // primary tree" claim: the checkpointer does flush every open
-        // user-database's dirty BINs.  The real blocker:
+        // Noxu now implements the missing piece — checkpoint-seeded lazy BIN
+        // fetch during redo (`Tree::set_root_lsn` + `child_at_or_fetch`) — so
+        // this gate is SAFE, but ONLY for a database whose tree was seeded
+        // from a checkpointed root this recovery (`seeded_db_ids`).  For such
+        // a db every committed pre-checkpoint-start record is guaranteed to
+        // be present in a pre-checkpoint BIN reachable from the seeded root:
+        //   * a clean-close checkpoint flushes every dirty BIN, so the on-disk
+        //     tree rooted at the recorded root LSN is a complete snapshot of
+        //     committed (and locked-uncommitted, later-committed) state as of
+        //     checkpoint time; and
+        //   * descent from the seeded root materialises each covering BIN
+        //     lazily, so the record is in the recovered tree without replaying
+        //     its LN.
+        // Skipping the pre-checkpoint LN is then a pure performance win
+        // (the 5-min redo-on-open collapses to a lazy-fetch of the touched
+        // BINs) with no data loss.
         //
-        //   * Recovery reconstructs each tree from an EMPTY tree.  IN-redo
-        //     splices in only the INs/BINs logged at/after checkpoint_start_lsn
-        //     (the `after_ckpt` filter in run_analysis).  Unlike JE — which
-        //     follows a checkpointed parent IN's on-disk child pointer and
-        //     fetches the child BIN from the log on demand (`fetchTarget`) —
-        //     Noxu has no lazy pre-checkpoint BIN fetch.
-        //   * The checkpointer re-logs only DIRTY BINs.  A BIN that was clean
-        //     across the last checkpoint (last logged before its start LSN and
-        //     untouched since) is therefore neither re-logged nor spliced back
-        //     into the reconstructed tree.
+        // For a db NOT in `seeded_db_ids` — no checkpoint, a v1
+        // (pre-per-db-roots) checkpoint, a crash with no durable CkptEnd, a
+        // database created after the last checkpoint, or recovery run without
+        // a log manager — the gate stays INACTIVE and every committed /
+        // non-transactional LN is replayed from the full scan range.  That is
+        // the exact pre-fix behaviour and the safe fallback: `redo_insert`
+        // is idempotent (it skips a stale-LSN overwrite), so a redundant
+        // replay is always correct.
         //
-        // So a committed record whose LN AND whose covering BIN were both last
-        // logged before checkpoint_start_lsn is materialised by NEITHER IN-redo
-        // NOR a gated LN-redo, and skipping its LN drops it.  The per-slot redo
-        // currency check (logrecLsn > treeLsn in redo_insert) does NOT protect
-        // this case: it only prevents reverting an EXISTING slot, never
-        // materialises a MISSING one.
-        //
-        // Empirically confirmed by
-        // `recovery_correctness_test::equality_stable_bins` and
-        // `::redo_gate_multi_checkpoint_stable_bins_survive_clean_reopen`,
-        // which drop every record when the naive gate is enabled.
-        //
-        // Condition to safely enable this gate: first add a checkpoint-BIN load
-        // path — before LN redo, walk the checkpointed root's on-disk child
-        // pointers and fetch each referenced pre-checkpoint BIN from the log
-        // into the tree (the JE `fetchTarget` equivalent).  Only then is every
-        // committed pre-checkpoint slot guaranteed present, and the skip gate
-        // becomes a pure performance optimisation instead of data loss.
-        let _after_ckpt_start = ckpt_start == NULL_LSN || lsn >= ckpt_start;
-        let _ = _after_ckpt_start; // gate deliberately disabled, see above
+        // Regression oracles:
+        // `recovery_correctness_test::redo_gate_multi_checkpoint_stable_bins_
+        // survive_clean_reopen` and `::equality_stable_bins` — both recover
+        // ALL records with this gate active.
+        let before_ckpt_start = ckpt_start != NULL_LSN && lsn < ckpt_start;
+        let gate_active =
+            before_ckpt_start && self.seeded_db_ids.contains(&rec.db_id);
 
         match rec.txn_id {
             None => {
-                // Non-transactional LN.
-                //
-                // In standard JE, pre-checkpoint non-transactional LNs are
-                // skipped because the checkpoint's BIN records (reachable from
-                // the checkpointed root via on-demand child fetch) capture
-                // their committed state.  Noxu has no lazy pre-checkpoint BIN
-                // fetch and re-logs only DIRTY BINs, so a pre-checkpoint LN
-                // whose covering BIN was clean across the last checkpoint is
-                // NOT represented in the reconstructed tree.  Skipping it would
-                // cause the record to vanish after a close+reopen (see the
-                // detailed note on the disabled after-checkpoint-start gate
-                // above).
-                //
-                // St-H6 (recovery manifestation): always replay
-                // non-transactional LNs from the full scan range, same as
-                // committed transactional LNs.  `redo_ln` / `redo_insert` is
-                // idempotent (LSN comparison skips stale overwrites), so
-                // replaying redundantly is always correct.
-                RedoAction::Apply
+                // Non-transactional LN.  Redo unless the seeded-root gate
+                // covers it (its committed state is durable in a
+                // pre-checkpoint BIN reachable from the seeded root).
+                if gate_active { RedoAction::Skip } else { RedoAction::Apply }
             }
             Some(txn_id) => {
                 if analysis.is_committed(txn_id) {
-                    // Committed LN: always redo, regardless of whether it
-                    // precedes the checkpoint start.  IN-redo reconstructs the
-                    // tree only from BINs logged at/after checkpoint_start_lsn
-                    // and does not lazily fetch clean pre-checkpoint BINs, so
-                    // the checkpoint's BIN entries are not a complete snapshot
-                    // of pre-checkpoint committed state.  We must replay all
-                    // committed LNs from the full scan range.  `redo_ln` is
-                    // idempotent (it skips if the tree already holds a newer
-                    // LSN for the key), so replaying redundantly is always
-                    // correct.
-                    RedoAction::Apply
+                    // Committed LN.  Skip when the seeded-root gate covers a
+                    // pre-checkpoint-start LN; otherwise replay it (full-redo
+                    // fallback).  Replay is idempotent via the redo currency
+                    // check, so a redundant replay is always safe.
+                    if gate_active {
+                        RedoAction::Skip
+                    } else {
+                        RedoAction::Apply
+                    }
                 } else {
                     // Active or aborted txn → skip (undo handles active ones).
                     RedoAction::Skip
@@ -2873,6 +2968,7 @@ mod tests {
                 last_replicated_db_id: -1,
                 last_local_txn_id: 5,
                 last_replicated_txn_id: -1,
+                per_db_roots: Vec::new(),
             }),
         );
 
@@ -3012,6 +3108,7 @@ mod tests {
                 last_replicated_db_id: -1,
                 last_local_txn_id: 0,
                 last_replicated_txn_id: -1,
+                per_db_roots: Vec::new(),
             }),
         );
         // LN after checkpoint start, committed txn
@@ -3106,6 +3203,7 @@ mod tests {
                 last_replicated_db_id: -1,
                 last_local_txn_id: 0,
                 last_replicated_txn_id: -1,
+                per_db_roots: Vec::new(),
             }),
         );
 
@@ -3377,6 +3475,7 @@ mod tests {
                 last_replicated_db_id: -1,
                 last_local_txn_id: 3,
                 last_replicated_txn_id: -1,
+                per_db_roots: Vec::new(),
             }),
         );
 
@@ -3398,6 +3497,7 @@ mod tests {
                 last_replicated_db_id: -1,
                 last_local_txn_id: 10,
                 last_replicated_txn_id: -1,
+                per_db_roots: Vec::new(),
             }),
         );
 
@@ -3567,6 +3667,7 @@ mod tests {
                 last_replicated_db_id: -1,
                 last_local_txn_id: 33,
                 last_replicated_txn_id: -1,
+                per_db_roots: Vec::new(),
             }),
         );
 
@@ -4496,6 +4597,7 @@ mod tests {
                 last_replicated_db_id: 0,
                 last_local_txn_id: 0,
                 last_replicated_txn_id: 0,
+                per_db_roots: Vec::new(),
             }),
         );
 

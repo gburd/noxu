@@ -172,6 +172,12 @@ pub struct CkptEndRecord {
     pub last_replicated_db_id: i64,
     pub last_local_txn_id: u64,
     pub last_replicated_txn_id: i64,
+    /// Per-database tree root LSNs recorded at checkpoint time (`(db_id,
+    /// root_lsn)`).  Empty for a v1 (pre-per-db-roots) checkpoint; recovery
+    /// then seeds no roots and full-redoes.  Used to seed each reconstructed
+    /// tree (`Tree::set_root_lsn`) so recovery can lazily fetch pre-checkpoint
+    /// BINs instead of replaying every pre-checkpoint LN.
+    pub per_db_roots: Vec<(u64, Lsn)>,
 }
 
 /// A transaction-commit record.

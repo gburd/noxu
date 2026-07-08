@@ -155,6 +155,7 @@ fn recover_all_applies_logged_bin_ins_replayed_gt_zero() {
             last_replicated_db_id: 0,
             last_local_txn_id: 0,
             last_replicated_txn_id: 0,
+            per_db_roots: Vec::new(),
         }),
     );
 
@@ -209,6 +210,7 @@ fn recover_single_db_applies_logged_bin() {
             last_replicated_db_id: 0,
             last_local_txn_id: 0,
             last_replicated_txn_id: 0,
+            per_db_roots: Vec::new(),
         }),
     );
 
@@ -260,6 +262,7 @@ fn recover_all_applies_bins_to_multiple_databases() {
             last_replicated_db_id: 0,
             last_local_txn_id: 0,
             last_replicated_txn_id: 0,
+            per_db_roots: Vec::new(),
         }),
     );
 

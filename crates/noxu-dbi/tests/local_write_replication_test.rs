@@ -75,17 +75,17 @@ fn replicated_environment_enforces_local_write_agreement() {
     let local_db = env.open_database("local", &local_cfg).unwrap();
     assert!(!local_db.read().is_replicated());
 
-    let write_with = |db: &Arc<
-        noxu_util::dst_sync_pl::RwLock<noxu_dbi::DatabaseImpl>,
-    >,
-                       local_write: bool|
-     -> Result<noxu_dbi::OperationStatus, noxu_dbi::DbiError> {
-        let mut txn = env.begin_txn().unwrap();
-        txn.set_local_write(local_write);
-        let mut cursor = CursorImpl::new(Arc::clone(db), txn.id_as_locker())
-            .with_txn(Arc::new(Mutex::new(txn)));
-        cursor.put(b"k", b"v", PutMode::Overwrite)
-    };
+    let write_with =
+        |db: &Arc<noxu_util::dst_sync_pl::RwLock<noxu_dbi::DatabaseImpl>>,
+         local_write: bool|
+         -> Result<noxu_dbi::OperationStatus, noxu_dbi::DbiError> {
+            let mut txn = env.begin_txn().unwrap();
+            txn.set_local_write(local_write);
+            let mut cursor =
+                CursorImpl::new(Arc::clone(db), txn.id_as_locker())
+                    .with_txn(Arc::new(Mutex::new(txn)));
+            cursor.put(b"k", b"v", PutMode::Overwrite)
+        };
 
     // Ordinary (replicating) locker writing to the replicated database: OK.
     assert!(write_with(&rep_db, false).is_ok());

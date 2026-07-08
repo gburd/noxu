@@ -173,9 +173,8 @@ fn test_local_write_and_read_only_rejected() {
     let dir = TempDir::new().unwrap();
     let (env, _db) = open_env_and_db(&dir);
 
-    let config = TransactionConfig::new()
-        .with_local_write(true)
-        .with_read_only(true);
+    let config =
+        TransactionConfig::new().with_local_write(true).with_read_only(true);
     let result = env.begin_transaction(Some(&config));
     assert!(
         result.is_err(),

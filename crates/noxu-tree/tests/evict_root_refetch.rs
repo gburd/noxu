@@ -215,8 +215,12 @@ fn detach_refuses_never_logged_bin_then_succeeds_after_log() {
 
     let n = 20u8;
     for i in 0..n {
-        tree.insert(vec![b'a' + i], vec![i, i + 1], Lsn::new(1, u32::from(i) + 1))
-            .unwrap();
+        tree.insert(
+            vec![b'a' + i],
+            vec![i, i + 1],
+            Lsn::new(1, u32::from(i) + 1),
+        )
+        .unwrap();
     }
 
     // Collect resident BIN ids; these were just inserted and never logged, so
@@ -249,7 +253,11 @@ fn detach_refuses_never_logged_bin_then_succeeds_after_log() {
     // Every key still readable (nothing was corrupted).
     for i in 0..n {
         let r = tree.search_with_data(&[b'a' + i]).expect("slot");
-        assert!(r.found, "key {} lost after refused detach", (b'a' + i) as char);
+        assert!(
+            r.found,
+            "key {} lost after refused detach",
+            (b'a' + i) as char
+        );
         assert_eq!(r.data.as_deref(), Some(&[i, i + 1][..]));
     }
 
@@ -257,10 +265,14 @@ fn detach_refuses_never_logged_bin_then_succeeds_after_log() {
     // detach succeeds and re-fetch returns CORRECT data.
     log_and_detach_all_bins(&tree, &lm);
     for i in 0..n {
-        let r = tree
-            .search_with_data(&[b'a' + i])
-            .unwrap_or_else(|| panic!("key {} re-fetch lost", (b'a' + i) as char));
-        assert!(r.found, "key {} must re-fetch after log+detach", (b'a' + i) as char);
+        let r = tree.search_with_data(&[b'a' + i]).unwrap_or_else(|| {
+            panic!("key {} re-fetch lost", (b'a' + i) as char)
+        });
+        assert!(
+            r.found,
+            "key {} must re-fetch after log+detach",
+            (b'a' + i) as char
+        );
         assert_eq!(
             r.data.as_deref(),
             Some(&[i, i + 1][..]),
