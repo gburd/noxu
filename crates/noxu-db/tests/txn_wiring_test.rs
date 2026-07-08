@@ -455,7 +455,7 @@ mod prop_txn_visibility {
     #[hegel::composite]
     fn step(tc: hegel::TestCase) -> TxnStep {
         // Skew the distribution slightly toward Put so short sequences
-        // still build up state to verify: proptest weights were
+        // still build up state to verify: the step weights are
         // Begin=1, Put=4, Commit=2, Abort=1.  Emulate the weighting by
         // drawing a tag from a list where each tag repeats by its weight.
         let tag = tc.draw(generators::sampled_from(vec![

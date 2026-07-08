@@ -1,6 +1,6 @@
 //! Property-based tests for noxu-util foundation types (Hegel / hegeltest).
 
-use hegel::generators::{self, Generator};
+use hegel::generators;
 use noxu_util::lsn::{Lsn, NULL_LSN};
 use noxu_util::packed::{
     read_packed_i32, read_packed_i64, read_sorted_i32, read_sorted_i64,

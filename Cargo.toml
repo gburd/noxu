@@ -182,7 +182,6 @@ memmap2 = "0.9"
 fs2 = "0.4"
 serde = { version = "1", features = ["derive"] }
 criterion = { version = "0.5", features = ["html_reports"] }
-proptest = "1"
 hegeltest = "0.25"
 stateright = "0.31"
 
