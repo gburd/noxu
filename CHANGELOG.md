@@ -15,6 +15,12 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Testing
+
+- Ported the property-based tests for `noxu-log`, `noxu-recovery`, and
+  `noxu-cleaner` from proptest to Hegel (`hegeltest` 0.25); dropped the
+  `proptest` dev-dependency from all three crates (no other code used it).
+
 ### Fixed
 
 - **DATA-LOSS hazard: a checkpointed database could recover incompletely once

@@ -1,4 +1,4 @@
-//! Property-based tests for noxu-recovery (Wave 11-E).
+//! Property-based tests for noxu-recovery (Hegel / hegeltest).
 //!
 //! Covers replay-relevant invariants on the rollback-period tracker and the
 //! analysis-result transaction-state machine:
@@ -13,174 +13,181 @@
 //! * `RollbackPeriod::contains` is a half-open interval (matchpoint_lsn,
 //!   rollback_start_lsn).
 
+use hegel::generators;
 use noxu_recovery::analysis_result::AnalysisResult;
 use noxu_recovery::rollback_tracker::{
     RollbackPeriod, RollbackScanner, RollbackTracker,
 };
 use noxu_util::{Lsn, NULL_LSN};
-use proptest::prelude::*;
-use proptest::strategy::Strategy;
 
 // ============================================================================
-// Helper strategies.
+// Helper generators.
 // ============================================================================
 
-fn lsn_strategy() -> impl Strategy<Value = Lsn> {
-    (0u32..16, 0u32..1_000_000).prop_map(|(f, o)| Lsn::new(f, o))
+#[hegel::composite]
+fn lsn_gen(tc: hegel::TestCase) -> Lsn {
+    let f = tc.draw(generators::integers::<u32>().max_value(15));
+    let o = tc.draw(generators::integers::<u32>().max_value(999_999));
+    Lsn::new(f, o)
 }
 
-/// Strategy producing well-formed (matchpoint < start < end) triples.
-fn rollback_triple_strategy() -> impl Strategy<Value = (Lsn, Lsn, Lsn)> {
-    (0u64..1_000_000_u64, 1u64..1_000u64, 1u64..1_000u64).prop_map(
-        |(base, d1, d2)| {
-            let m = base;
-            let s = base + d1;
-            let e = s + d2;
-            (Lsn::from_u64(m), Lsn::from_u64(s), Lsn::from_u64(e))
-        },
-    )
+/// Generator producing well-formed (matchpoint < start < end) triples.
+#[hegel::composite]
+fn rollback_triple_gen(tc: hegel::TestCase) -> (Lsn, Lsn, Lsn) {
+    let base = tc.draw(generators::integers::<u64>().max_value(999_999));
+    let d1 = tc.draw(generators::integers::<u64>().min_value(1).max_value(999));
+    let d2 = tc.draw(generators::integers::<u64>().min_value(1).max_value(999));
+    let m = base;
+    let s = base + d1;
+    let e = s + d2;
+    (Lsn::from_u64(m), Lsn::from_u64(s), Lsn::from_u64(e))
 }
 
 // ============================================================================
 // 1. RollbackPeriod.contains is a strict half-open interval.
 // ============================================================================
 
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
+/// For any well-formed triple, contains(matchpoint) and contains(start)
+/// must both be false; every LSN strictly between is true.  Catches off-
+/// by-one regressions in the boundary checks.
+#[hegel::test(test_cases = 256)]
+fn prop_rollback_period_boundaries_excluded(tc: hegel::TestCase) {
+    let (mp, start, end) = tc.draw(rollback_triple_gen());
+    let p = RollbackPeriod::new(mp, start, end);
+    assert!(!p.contains(mp), "matchpoint must not be contained");
+    assert!(!p.contains(start), "start must not be contained");
+}
 
-    /// For any well-formed triple, contains(matchpoint) and contains(start)
-    /// must both be false; every LSN strictly between is true.  Catches off-
-    /// by-one regressions in the boundary checks.
-    #[test]
-    fn prop_rollback_period_boundaries_excluded(
-        (mp, start, end) in rollback_triple_strategy(),
-    ) {
-        let p = RollbackPeriod::new(mp, start, end);
-        prop_assert!(!p.contains(mp), "matchpoint must not be contained");
-        prop_assert!(!p.contains(start), "start must not be contained");
-    }
-
-    /// LSNs strictly between matchpoint and start are contained.
-    #[test]
-    fn prop_rollback_period_interior_contained(
-        (mp, start, end) in rollback_triple_strategy(),
-        bias in 1u64..1000u64,
-    ) {
-        // Pick a sample LSN strictly between mp and start (assuming start > mp + 1).
-        prop_assume!(start.as_u64() > mp.as_u64() + 1);
-        let mid_raw = mp.as_u64() + 1 + (bias % (start.as_u64() - mp.as_u64() - 1));
-        let mid = Lsn::from_u64(mid_raw);
-        let p = RollbackPeriod::new(mp, start, end);
-        prop_assert!(p.contains(mid),
-            "interior LSN {:?} must be contained in period {:?}", mid, p);
-    }
+/// LSNs strictly between matchpoint and start are contained.
+#[hegel::test(test_cases = 256)]
+fn prop_rollback_period_interior_contained(tc: hegel::TestCase) {
+    let (mp, start, end) = tc.draw(rollback_triple_gen());
+    let bias =
+        tc.draw(generators::integers::<u64>().min_value(1).max_value(999));
+    // Pick a sample LSN strictly between mp and start (assuming start > mp + 1).
+    tc.assume(start.as_u64() > mp.as_u64() + 1);
+    let mid_raw = mp.as_u64() + 1 + (bias % (start.as_u64() - mp.as_u64() - 1));
+    let mid = Lsn::from_u64(mid_raw);
+    let p = RollbackPeriod::new(mp, start, end);
+    assert!(
+        p.contains(mid),
+        "interior LSN {:?} must be contained in period {:?}",
+        mid,
+        p
+    );
 }
 
 // ============================================================================
 // 2. RollbackTracker oracle: is_in_rollback_period agrees with brute-force.
 // ============================================================================
 
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(64))]
+/// For any sequence of well-formed RollbackStart/End event pairs, the
+/// tracker's `is_in_rollback_period` agrees with a direct scan over the
+/// completed periods.  The oracle ignores incomplete pairs (which the
+/// tracker also excludes from query results until completed).
+#[hegel::test(test_cases = 64)]
+fn prop_rollback_tracker_matches_oracle(tc: hegel::TestCase) {
+    let triples = tc.draw(generators::vecs(rollback_triple_gen()).max_size(15));
+    let probe = tc.draw(lsn_gen());
 
-    /// For any sequence of well-formed RollbackStart/End event pairs, the
-    /// tracker's `is_in_rollback_period` agrees with a direct scan over the
-    /// completed periods.  The oracle ignores incomplete pairs (which the
-    /// tracker also excludes from query results until completed).
-    #[test]
-    fn prop_rollback_tracker_matches_oracle(
-        triples in prop::collection::vec(rollback_triple_strategy(), 0..16),
-        probe in lsn_strategy(),
-    ) {
-        let mut tracker = RollbackTracker::new();
-        for (mp, start, end) in &triples {
-            tracker.register_rollback_start(*mp, *start);
-            tracker.register_rollback_end(*mp, *end);
-        }
+    let mut tracker = RollbackTracker::new();
+    for (mp, start, end) in &triples {
+        tracker.register_rollback_start(*mp, *start);
+        tracker.register_rollback_end(*mp, *end);
+    }
 
-        // Oracle: probe is in some completed period iff strict-interval
-        // containment holds for any (mp, start, end) triple.
+    // Oracle: probe is in some completed period iff strict-interval
+    // containment holds for any (mp, start, end) triple.
+    let oracle = triples.iter().any(|(mp, start, _)| {
+        probe.as_u64() > mp.as_u64() && probe.as_u64() < start.as_u64()
+    });
+    assert_eq!(
+        tracker.is_in_rollback_period(probe),
+        oracle,
+        "tracker disagrees with brute-force oracle for probe={:?}, periods={:?}",
+        probe,
+        triples,
+    );
+}
+
+/// After registering N completed pairs, period_count == N (assuming the
+/// pairs use distinct matchpoints — duplicates would key-collide).
+#[hegel::test(test_cases = 64)]
+fn prop_rollback_tracker_period_count(tc: hegel::TestCase) {
+    let bases = tc.draw(
+        generators::vecs(generators::integers::<u64>().max_value(999_999))
+            .max_size(15),
+    );
+    // Deduplicate base LSNs to ensure distinct matchpoints.
+    let mut uniq: Vec<u64> = bases;
+    uniq.sort();
+    uniq.dedup();
+
+    let mut tracker = RollbackTracker::new();
+    for (i, base) in uniq.iter().enumerate() {
+        let mp = Lsn::from_u64(*base);
+        let start = Lsn::from_u64(*base + 100);
+        let end = Lsn::from_u64(*base + 200 + i as u64);
+        tracker.register_rollback_start(mp, start);
+        tracker.register_rollback_end(mp, end);
+    }
+    assert_eq!(tracker.period_count(), uniq.len());
+    assert_eq!(tracker.pending_count(), 0);
+    assert!(!tracker.has_incomplete_rollbacks());
+}
+
+/// `RollbackTracker::get_rollback_periods` returns periods sorted by
+/// matchpoint_lsn, regardless of insertion order.
+#[hegel::test(test_cases = 64)]
+fn prop_rollback_tracker_periods_sorted(tc: hegel::TestCase) {
+    let bases = tc.draw(
+        generators::vecs(generators::integers::<u64>().max_value(999_999))
+            .max_size(11),
+    );
+    let mut uniq: Vec<u64> = bases;
+    uniq.sort();
+    uniq.dedup();
+    tc.assume(uniq.len() >= 2);
+
+    // Insert in REVERSED order (which differs from the natural sort order).
+    let mut tracker = RollbackTracker::new();
+    for (i, base) in uniq.iter().rev().enumerate() {
+        let mp = Lsn::from_u64(*base);
+        let start = Lsn::from_u64(*base + 100);
+        let end = Lsn::from_u64(*base + 200 + i as u64);
+        tracker.register_rollback_start(mp, start);
+        tracker.register_rollback_end(mp, end);
+    }
+
+    let periods = tracker.get_rollback_periods();
+    for w in periods.windows(2) {
+        assert!(
+            w[0].matchpoint_lsn < w[1].matchpoint_lsn,
+            "periods not sorted: {:?} >= {:?}",
+            w[0],
+            w[1]
+        );
+    }
+}
+
+/// RollbackScanner.is_rolled_back agrees with the same oracle.  Scanner
+/// is the post-analysis structure used during redo/undo passes.
+#[hegel::test(test_cases = 64)]
+fn prop_rollback_scanner_matches_oracle(tc: hegel::TestCase) {
+    let triples = tc.draw(generators::vecs(rollback_triple_gen()).max_size(7));
+    let probes = tc.draw(generators::vecs(lsn_gen()).max_size(7));
+
+    let periods: Vec<RollbackPeriod> = triples
+        .iter()
+        .map(|(mp, start, end)| RollbackPeriod::new(*mp, *start, *end))
+        .collect();
+    let mut scanner = RollbackScanner::new(periods);
+
+    for probe in &probes {
         let oracle = triples.iter().any(|(mp, start, _)| {
             probe.as_u64() > mp.as_u64() && probe.as_u64() < start.as_u64()
         });
-        prop_assert_eq!(
-            tracker.is_in_rollback_period(probe),
-            oracle,
-            "tracker disagrees with brute-force oracle for probe={:?}, periods={:?}",
-            probe, triples,
-        );
-    }
-
-    /// After registering N completed pairs, period_count == N (assuming the
-    /// pairs use distinct matchpoints — duplicates would key-collide).
-    #[test]
-    fn prop_rollback_tracker_period_count(
-        bases in prop::collection::vec(0u64..1_000_000_u64, 0..16),
-    ) {
-        // Deduplicate base LSNs to ensure distinct matchpoints.
-        let mut uniq: Vec<u64> = bases;
-        uniq.sort();
-        uniq.dedup();
-
-        let mut tracker = RollbackTracker::new();
-        for (i, base) in uniq.iter().enumerate() {
-            let mp = Lsn::from_u64(*base);
-            let start = Lsn::from_u64(*base + 100);
-            let end = Lsn::from_u64(*base + 200 + i as u64);
-            tracker.register_rollback_start(mp, start);
-            tracker.register_rollback_end(mp, end);
-        }
-        prop_assert_eq!(tracker.period_count(), uniq.len());
-        prop_assert_eq!(tracker.pending_count(), 0);
-        prop_assert!(!tracker.has_incomplete_rollbacks());
-    }
-
-    /// `RollbackTracker::get_rollback_periods` returns periods sorted by
-    /// matchpoint_lsn, regardless of insertion order.
-    #[test]
-    fn prop_rollback_tracker_periods_sorted(
-        bases in prop::collection::vec(0u64..1_000_000_u64, 0..12),
-    ) {
-        let mut uniq: Vec<u64> = bases;
-        uniq.sort();
-        uniq.dedup();
-        prop_assume!(uniq.len() >= 2);
-
-        // Insert in REVERSED order (which differs from the natural sort order).
-        let mut tracker = RollbackTracker::new();
-        for (i, base) in uniq.iter().rev().enumerate() {
-            let mp = Lsn::from_u64(*base);
-            let start = Lsn::from_u64(*base + 100);
-            let end = Lsn::from_u64(*base + 200 + i as u64);
-            tracker.register_rollback_start(mp, start);
-            tracker.register_rollback_end(mp, end);
-        }
-
-        let periods = tracker.get_rollback_periods();
-        for w in periods.windows(2) {
-            prop_assert!(w[0].matchpoint_lsn < w[1].matchpoint_lsn,
-                "periods not sorted: {:?} >= {:?}", w[0], w[1]);
-        }
-    }
-
-    /// RollbackScanner.is_rolled_back agrees with the same oracle.  Scanner
-    /// is the post-analysis structure used during redo/undo passes.
-    #[test]
-    fn prop_rollback_scanner_matches_oracle(
-        triples in prop::collection::vec(rollback_triple_strategy(), 0..8),
-        probes in prop::collection::vec(lsn_strategy(), 0..8),
-    ) {
-        let periods: Vec<RollbackPeriod> = triples.iter()
-            .map(|(mp, start, end)| RollbackPeriod::new(*mp, *start, *end))
-            .collect();
-        let mut scanner = RollbackScanner::new(periods);
-
-        for probe in &probes {
-            let oracle = triples.iter().any(|(mp, start, _)| {
-                probe.as_u64() > mp.as_u64() && probe.as_u64() < start.as_u64()
-            });
-            prop_assert_eq!(scanner.is_rolled_back(*probe), oracle);
-        }
+        assert_eq!(scanner.is_rolled_back(*probe), oracle);
     }
 }
 
@@ -198,148 +205,159 @@ enum TxnEvent {
     Abort(u64),
 }
 
-fn txn_event_strategy(max_txn_id: u64) -> impl Strategy<Value = TxnEvent> {
-    let id = 1u64..=max_txn_id;
-    prop_oneof![
-        id.clone().prop_map(TxnEvent::SawActive),
-        (id.clone(), lsn_strategy())
-            .prop_map(|(id, lsn)| TxnEvent::Commit(id, lsn)),
-        id.prop_map(TxnEvent::Abort),
-    ]
+#[hegel::composite]
+fn txn_event_gen(tc: hegel::TestCase, max_txn_id: u64) -> TxnEvent {
+    let kind = tc.draw(generators::integers::<u8>().max_value(2));
+    let id = tc
+        .draw(generators::integers::<u64>().min_value(1).max_value(max_txn_id));
+    match kind {
+        0 => TxnEvent::SawActive(id),
+        1 => TxnEvent::Commit(id, tc.draw(lsn_gen())),
+        _ => TxnEvent::Abort(id),
+    }
 }
 
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(128))]
+/// Recovery invariant: after replaying any sequence of (active, commit,
+/// abort) events for a fixed set of txn_ids, the partition
+///   active = {txns that saw active and never committed/aborted}
+///   committed = {txns whose last seen event was Commit}
+///   aborted = {txns whose last seen event was Abort}
+/// must hold.  This is the "applying-then-aborting-uncommitted"
+/// equivalence the recovery design asserts.
+///
+/// Respects the documented precondition of `record_active_txn`
+/// (the caller must not invoke it after commit/abort — see the ignored
+/// test `prop_active_txn_after_terminal_resurrects` below).
+#[hegel::test(test_cases = 128)]
+fn prop_analysis_txn_state_partition(tc: hegel::TestCase) {
+    let events = tc.draw(generators::vecs(txn_event_gen(8)).max_size(39));
 
-    /// Recovery invariant: after replaying any sequence of (active, commit,
-    /// abort) events for a fixed set of txn_ids, the partition
-    ///   active = {txns that saw active and never committed/aborted}
-    ///   committed = {txns whose last seen event was Commit}
-    ///   aborted = {txns whose last seen event was Abort}
-    /// must hold.  This is the "applying-then-aborting-uncommitted"
-    /// equivalence the recovery design asserts.
-    ///
-    /// Respects the documented precondition of `record_active_txn`
-    /// (the caller must not invoke it after commit/abort — see the ignored
-    /// test `prop_active_txn_after_terminal_resurrects` below).
-    #[test]
-    fn prop_analysis_txn_state_partition(
-        events in prop::collection::vec(txn_event_strategy(8), 0..40),
-    ) {
-        let mut analysis = AnalysisResult::new();
+    let mut analysis = AnalysisResult::new();
 
-        // Oracle: per-txn last terminal event.
-        // None = active (saw an active record but no commit/abort)
-        // Some(true) = committed
-        // Some(false) = aborted
-        let mut oracle: std::collections::HashMap<u64, Option<bool>> =
-            Default::default();
+    // Oracle: per-txn last terminal event.
+    // None = active (saw an active record but no commit/abort)
+    // Some(true) = committed
+    // Some(false) = aborted
+    let mut oracle: std::collections::HashMap<u64, Option<bool>> =
+        Default::default();
 
-        for ev in &events {
-            match ev {
-                TxnEvent::SawActive(id) => {
-                    if matches!(oracle.get(id), Some(Some(_))) {
-                        continue; // honor record_active_txn precondition
-                    }
-                    analysis.record_active_txn(*id);
-                    oracle.entry(*id).or_insert(None);
+    for ev in &events {
+        match ev {
+            TxnEvent::SawActive(id) => {
+                if matches!(oracle.get(id), Some(Some(_))) {
+                    continue; // honor record_active_txn precondition
                 }
-                TxnEvent::Commit(id, lsn) => {
-                    analysis.record_commit(*id, *lsn);
-                    oracle.insert(*id, Some(true));
-                }
-                TxnEvent::Abort(id) => {
-                    analysis.record_abort(*id);
-                    oracle.insert(*id, Some(false));
-                }
+                analysis.record_active_txn(*id);
+                oracle.entry(*id).or_insert(None);
             }
-        }
-
-        for (id, state) in &oracle {
-            match state {
-                None => {
-                    prop_assert!(analysis.is_active(*id),
-                        "txn {} should be active, oracle says active", id);
-                    prop_assert!(!analysis.is_committed(*id));
-                    prop_assert!(!analysis.is_aborted(*id));
-                }
-                Some(true) => {
-                    prop_assert!(analysis.is_committed(*id),
-                        "txn {} should be committed", id);
-                    prop_assert!(!analysis.is_active(*id));
-                }
-                Some(false) => {
-                    prop_assert!(analysis.is_aborted(*id),
-                        "txn {} should be aborted", id);
-                    prop_assert!(!analysis.is_active(*id));
-                }
+            TxnEvent::Commit(id, lsn) => {
+                analysis.record_commit(*id, *lsn);
+                oracle.insert(*id, Some(true));
+            }
+            TxnEvent::Abort(id) => {
+                analysis.record_abort(*id);
+                oracle.insert(*id, Some(false));
             }
         }
     }
 
-    /// `record_commit` removes the txn from `active_txn_ids`.  So
-    /// has_active_txns() is true iff at least one observed txn never saw
-    /// a commit/abort.  This property is what the "skip undo phase entirely
-    /// on clean shutdown" optimization relies on.
-    ///
-    /// Note: respects the documented precondition of `record_active_txn`
-    /// ("txn neither committed nor aborted yet") by skipping SawActive
-    /// events that occur after a terminal event for the same txn.  Without
-    /// this filter the property finds a counterexample: a SawActive recorded
-    /// after a Commit re-introduces the txn into `active_txn_ids` (the
-    /// production analysis pass doesn't violate the precondition because it
-    /// processes events in chronological order).
-    #[test]
-    fn prop_analysis_has_active_iff_oracle(
-        events in prop::collection::vec(txn_event_strategy(8), 0..30),
-    ) {
-        let mut analysis = AnalysisResult::new();
-        let mut oracle: std::collections::HashMap<u64, Option<bool>> =
-            Default::default();
-
-        for ev in &events {
-            match ev {
-                TxnEvent::SawActive(id) => {
-                    // Respect the precondition.
-                    if matches!(oracle.get(id), Some(Some(_))) {
-                        continue;
-                    }
-                    analysis.record_active_txn(*id);
-                    oracle.entry(*id).or_insert(None);
-                }
-                TxnEvent::Commit(id, lsn) => {
-                    analysis.record_commit(*id, *lsn);
-                    oracle.insert(*id, Some(true));
-                }
-                TxnEvent::Abort(id) => {
-                    analysis.record_abort(*id);
-                    oracle.insert(*id, Some(false));
-                }
+    for (id, state) in &oracle {
+        match state {
+            None => {
+                assert!(
+                    analysis.is_active(*id),
+                    "txn {} should be active, oracle says active",
+                    id
+                );
+                assert!(!analysis.is_committed(*id));
+                assert!(!analysis.is_aborted(*id));
+            }
+            Some(true) => {
+                assert!(
+                    analysis.is_committed(*id),
+                    "txn {} should be committed",
+                    id
+                );
+                assert!(!analysis.is_active(*id));
+            }
+            Some(false) => {
+                assert!(
+                    analysis.is_aborted(*id),
+                    "txn {} should be aborted",
+                    id
+                );
+                assert!(!analysis.is_active(*id));
             }
         }
+    }
+}
 
-        let oracle_has_active = oracle.values().any(|v| v.is_none());
-        prop_assert_eq!(analysis.has_active_txns(), oracle_has_active);
+/// `record_commit` removes the txn from `active_txn_ids`.  So
+/// has_active_txns() is true iff at least one observed txn never saw
+/// a commit/abort.  This property is what the "skip undo phase entirely
+/// on clean shutdown" optimization relies on.
+///
+/// Note: respects the documented precondition of `record_active_txn`
+/// ("txn neither committed nor aborted yet") by skipping SawActive
+/// events that occur after a terminal event for the same txn.  Without
+/// this filter the property finds a counterexample: a SawActive recorded
+/// after a Commit re-introduces the txn into `active_txn_ids` (the
+/// production analysis pass doesn't violate the precondition because it
+/// processes events in chronological order).
+#[hegel::test(test_cases = 128)]
+fn prop_analysis_has_active_iff_oracle(tc: hegel::TestCase) {
+    let events = tc.draw(generators::vecs(txn_event_gen(8)).max_size(29));
+
+    let mut analysis = AnalysisResult::new();
+    let mut oracle: std::collections::HashMap<u64, Option<bool>> =
+        Default::default();
+
+    for ev in &events {
+        match ev {
+            TxnEvent::SawActive(id) => {
+                // Respect the precondition.
+                if matches!(oracle.get(id), Some(Some(_))) {
+                    continue;
+                }
+                analysis.record_active_txn(*id);
+                oracle.entry(*id).or_insert(None);
+            }
+            TxnEvent::Commit(id, lsn) => {
+                analysis.record_commit(*id, *lsn);
+                oracle.insert(*id, Some(true));
+            }
+            TxnEvent::Abort(id) => {
+                analysis.record_abort(*id);
+                oracle.insert(*id, Some(false));
+            }
+        }
     }
 
-    /// `max_txn_id` is monotone: it only ever grows, regardless of event
-    /// type.  This is necessary for ID-allocation reservations after recovery.
-    #[test]
-    fn prop_analysis_max_txn_id_monotone(
-        events in prop::collection::vec(txn_event_strategy(1_000), 0..30),
-    ) {
-        let mut analysis = AnalysisResult::new();
-        let mut prev_max = 0u64;
-        for ev in &events {
-            match ev {
-                TxnEvent::SawActive(id) => analysis.record_active_txn(*id),
-                TxnEvent::Commit(id, lsn) => analysis.record_commit(*id, *lsn),
-                TxnEvent::Abort(id) => analysis.record_abort(*id),
-            }
-            prop_assert!(analysis.max_txn_id >= prev_max,
-                "max_txn_id moved backwards: {} -> {}", prev_max, analysis.max_txn_id);
-            prev_max = analysis.max_txn_id;
+    let oracle_has_active = oracle.values().any(|v| v.is_none());
+    assert_eq!(analysis.has_active_txns(), oracle_has_active);
+}
+
+/// `max_txn_id` is monotone: it only ever grows, regardless of event
+/// type.  This is necessary for ID-allocation reservations after recovery.
+#[hegel::test(test_cases = 128)]
+fn prop_analysis_max_txn_id_monotone(tc: hegel::TestCase) {
+    let events = tc.draw(generators::vecs(txn_event_gen(1_000)).max_size(29));
+
+    let mut analysis = AnalysisResult::new();
+    let mut prev_max = 0u64;
+    for ev in &events {
+        match ev {
+            TxnEvent::SawActive(id) => analysis.record_active_txn(*id),
+            TxnEvent::Commit(id, lsn) => analysis.record_commit(*id, *lsn),
+            TxnEvent::Abort(id) => analysis.record_abort(*id),
         }
+        assert!(
+            analysis.max_txn_id >= prev_max,
+            "max_txn_id moved backwards: {} -> {}",
+            prev_max,
+            analysis.max_txn_id
+        );
+        prev_max = analysis.max_txn_id;
     }
 }
 

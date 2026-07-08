@@ -36,7 +36,7 @@ workspace = true
 
 [dev-dependencies]
 tempfile = "3"
-proptest = { workspace = true }
+hegeltest = { workspace = true }
 criterion = { workspace = true }
 
 # DST Milestone 2 (Phase 2a): shuttle tests in tests/shuttle_*.rs are gated
