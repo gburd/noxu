@@ -18,6 +18,35 @@ losing the most recent committed transactions in the event of an OS crash, use
 application crash as well, use `SyncPolicy::NoSync`. See
 [Non-Durable Transactions](basics.md#non-durable-transactions).
 
+### Commit Lock-Release Ordering
+
+Commit is a two-phase operation: an **append** phase writes the commit record
+to the write-ahead log buffer (which assigns the commit LSN), and a **durable**
+phase performs the fsync that makes it durable. A transaction's write locks are
+released *between* these two phases — after the commit record is in the WAL
+buffer, but before the fsync completes.
+
+The committer still blocks on the fsync in the durable phase before `commit()`
+returns, so the durability contract is unchanged: **a `Sync` commit that
+returned successfully is durable.** Releasing the write locks earlier only
+shrinks the window in which they are held from the whole fsync (100µs–2ms) to
+microseconds, which dissolves the lock convoy that otherwise forms on a hot key
+under high write contention.
+
+This is safe because Noxu uses a single write-ahead log with a monotonic
+durable point: a transaction that acquires a just-released lock and commits is
+assigned a strictly-higher LSN, and a single fsync makes everything up to a
+point durable. A later, dependent commit can therefore never become durable
+ahead of the commit it depends on — if the earlier commit is lost to a crash,
+any later commit that read its released lock is lost too, and recovery replays
+in LSN order. The framing is: *locks guard logical conflict; durability is a
+separate barrier the committer still waits on.*
+
+> This ordering is a deliberate tail-latency optimization specific to Noxu. It
+> trades a small window in which a not-yet-durable value is visible to a
+> concurrent read-committed reader (whose own commit is ordered after it in the
+> same log) for a large reduction in p99 latency under hot-key contention.
+
 ### Reduce Lock Contention
 
 - Keep transactions short. Shorter transactions hold locks for less time, reducing

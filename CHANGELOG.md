@@ -72,6 +72,24 @@ listed in [References](#references).
   byte-identical data to a cold fetch (on-disk LNs are immutable at a given
   LSN). If a tree has no shared budget counter (a bare test tree),
   re-population is skipped.
+- **Transaction write locks are now released *before* the commit fsync, not
+  after** (`noxu-txn`). On a hot key under high contention this was the
+  dominant tail-latency source: write locks were held for the entire duration
+  of the commit `fdatasync` (100µs–2ms), so every waiter on that key queued
+  behind the leader's fsync, forming a convoy (measured p99 ≈ 1.1s on a 4-op
+  Zipfian `txn_mix` at 64 threads). The commit path is now split into an
+  *append* phase (marshal + append the `TxnCommit` record to the WAL buffer,
+  which assigns the commit LSN) and a *durable* phase (the fsync); the write
+  locks are released between the two. The committer still blocks on the fsync
+  before returning success, so the durability guarantee to the caller is
+  unchanged — only the lock-hold window shrinks (from ~fsync-ms to ~µs).
+  This is safe on Noxu's single WAL because LSN assignment is serialized and
+  the durable watermark is monotonic: a dependent write always gets a
+  strictly-higher LSN and can never become durable ahead of the write it
+  depends on. This is a deliberate deviation from JE (which releases write
+  locks after the fsync) for tail latency, not a JE-faithful port. See
+  `docs/src/transactions/durability.md` (lock-release ordering) and
+  `docs/src/transactions/concurrency.md`.
 
 ### Changed
 

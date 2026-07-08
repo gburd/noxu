@@ -766,7 +766,7 @@ impl LockManager {
     ///     locker ids left behind.
     ///   - **Catastrophic per-locker abort.** When a deadlock-detector
     ///     victim is too far along to drain its own per-txn write_locks
-    ///     map (e.g. it is in the middle of `commit_inner_after_read_drain`
+    ///     map (e.g. it is in the middle of `commit_append_phase`
     ///     and the panic handler needs to clean up), this method
     ///     guarantees the lock-manager view drops the locker even if
     ///     the per-txn view is corrupt.

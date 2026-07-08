@@ -209,6 +209,27 @@ pub struct Txn {
     group_commit: Option<Arc<dyn GroupCommit>>,
 }
 
+/// Outcome of the commit *append* phase (Fix 3a): the LSN to report to the
+/// caller plus the fsync still owed by the *durable* phase.  Threading this
+/// between the two phases lets `commit_with_durability` release the write
+/// locks after the WAL append but before the fsync.
+struct PendingCommit {
+    /// LSN returned to the caller (`NULL_LSN` when nothing was logged).
+    assigned_lsn: Lsn,
+    /// The durability barrier still owed after the write locks are released.
+    pending_sync: PendingSync,
+}
+
+/// The fsync still owed by the commit *durable* phase after the WAL append.
+enum PendingSync {
+    /// Explicit txn: fsync (or GroupCommit-coalesce) up to this commit LSN.
+    Commit { commit_lsn: Lsn },
+    /// Synthetic auto-txn: no TxnCommit record; honour durability for the LN.
+    Ln { ln_lsn: Lsn },
+    /// Nothing was logged; no durability work is owed.
+    None,
+}
+
 impl Txn {
     /// Creates a new transaction without a log manager.
     ///
@@ -463,19 +484,21 @@ impl Txn {
                 );
             }
         }
-        let want_sync = matches!(durability, Durability::CommitSync);
-        // The body that can fail with `?` is wrapped in a helper
-        // so that any Err from log_entry / flush_sync_if_needed /
-        // flush_no_sync goes through the lock-drain epilogue
-        // rather than leaking write locks to environment close.
-        // The txn is also flipped to `MustAbort` on Err so a
-        // caller who ignores the error and re-calls commit() does
-        // NOT silently write a second TxnCommit record — instead
-        // they hit `check_state` and get a clear
-        // `InvalidTransaction` Err.
-        let assigned_lsn: Lsn =
-            match self.commit_inner_after_read_drain(durability, want_sync) {
-                Ok(lsn) => lsn,
+        // The commit is split into two phases so the write locks can be
+        // released between the WAL append and the fsync (Fix 3a).  Phase 1
+        // (append) can fail with `?`; on Err the epilogue drains the still-held
+        // write locks rather than leaking them to environment close, and flips
+        // the txn to `MustAbort` so a caller who ignores the error and re-calls
+        // commit() hits `check_state` (a clear `InvalidTransaction` Err)
+        // instead of silently writing a second TxnCommit record.
+        // ── Phase 1: append the commit record to the WAL buffer ──────────
+        // Marshals + appends the TxnCommit entry under the log-write latch
+        // (LSN assigned + buffer slot reserved), but does NOT yet fsync.  On
+        // any `?` failure here the write locks are still held, so the epilogue
+        // drains them and flips to MustAbort.
+        let PendingCommit { assigned_lsn, pending_sync } =
+            match self.commit_append_phase() {
+                Ok(pending) => pending,
                 Err(e) => {
                     self.release_all_locks();
                     self.state = TxnState::MustAbort;
@@ -483,9 +506,51 @@ impl Txn {
                 }
             };
         self.commit_lsn = assigned_lsn.as_u64();
-        // Release write locks AFTER the log flush (so lock holders are
-        // not visible to readers until the commit is durable). Read
-        // locks were already drained pre-flush.
+
+        // ── Fix 3a: release write locks BEFORE the commit fsync ──────────
+        //
+        // The commit record is already durably in the WAL *buffer* with a
+        // monotonically-assigned LSN (Phase 1 above); the fsync barrier is
+        // still ahead of us and we still wait on it (Phase 2 below) before
+        // returning success to the caller.  Releasing the write locks here —
+        // between WAL append and fsync — shrinks the lock-hold window from the
+        // whole fsync syscall (100µs–2ms) to microseconds, dissolving the
+        // hot-key convoy under high contention.
+        //
+        // ISOLATION + DURABILITY INVARIANT (why this is safe on Noxu's WAL):
+        //   "Locks guard *logical* conflict; durability is a *separate*
+        //    barrier the committer still waits on before returning success."
+        //
+        // A second txn may now acquire a just-released record lock and commit
+        // *before* this txn's fsync completes.  That is safe because Noxu has
+        // a single WAL with a single monotonic durable watermark
+        // (`LogManager::last_synced_lsn`, advanced only by the fsync leader
+        // after a successful fdatasync):
+        //   * LSN assignment is serialized under the log-write latch, so the
+        //     second txn's commit record gets a strictly-higher LSN than ours
+        //     (its append happens-after ours).
+        //   * A single fdatasync drains the whole buffer, so making LSN Y
+        //     durable implies every LSN < Y (including ours) is durable — the
+        //     durable point is monotonic (`flush_sync_if_needed` /
+        //     `flush_sync` in noxu-log/log_manager.rs).
+        // Therefore a dependent write can never become durable *ahead of* the
+        // write it depends on: if our commit is lost to a crash/fsync-failure,
+        // any later (higher-LSN) commit that read our released lock is lost
+        // too, and recovery replays in LSN order.  No torn/inconsistent state.
+        //
+        // Read locks were already drained pre-append.  Repeatable-read /
+        // serializable readers hold their own read locks (or a snapshot) and
+        // are unaffected.  Read-committed is the case this protects: a reader
+        // that acquires the released lock observes the new value, whose commit
+        // is ordered before the reader's own commit in the same monotonic WAL.
+        //
+        // DEVIATION FROM JE (documented, not JE-faithful): JE releases write
+        // locks AFTER the commit fsync — its `Txn.commit` calls
+        // `logCommitEntry(SYNC)` (which fsyncs inside `LogManager.log`) and
+        // only then `releaseWriteLocks()` (Txn.java).  Noxu deliberately
+        // reorders these two steps to cut tail latency on hot-contention
+        // workloads; the durability guarantee to the caller is unchanged
+        // (success is still returned only after the fsync in Phase 2).
         for lsn in self.write_locks.keys().copied().collect::<Vec<_>>() {
             if let Err(e) = self.lock_manager.release(lsn, self.id) {
                 log::error!(
@@ -496,20 +561,32 @@ impl Txn {
             }
         }
         self.write_locks.clear();
+
+        // ── Phase 2: durability barrier ─────────────────────────────────
+        // The committer STILL blocks here until the fsync makes the commit
+        // record durable — success is returned to the caller only after this.
+        // Locks are already released (above), so this wait no longer holds up
+        // any waiter on the hot key.
+        if let Err(e) = self.commit_durable_phase(durability, pending_sync) {
+            // The WAL append already succeeded but the fsync failed; the log
+            // is now invalidated (noxu-log sets `io_invalid`).  Locks are
+            // already released; flip to MustAbort and surface the error.  The
+            // commit is NOT durable and MUST NOT be reported as committed.
+            self.state = TxnState::MustAbort;
+            return Err(e);
+        }
+
         self.state = TxnState::Committed;
         Ok(assigned_lsn)
     }
 
-    /// The fallible inner section of `commit_with_durability` that
-    /// runs after the read-lock drain. Extracted so that any `?`
-    /// failure goes through `release_all_locks` rather than leaking
-    /// the still-held write locks.
-    fn commit_inner_after_read_drain(
-        &mut self,
-        durability: Durability,
-        want_sync: bool,
-    ) -> Result<Lsn, TxnError> {
-        let assigned_lsn = if self.has_logged_entries() && !self.is_auto_txn() {
+    /// Phase 1 of commit: append the TxnCommit record to the WAL buffer and
+    /// decide (via GroupCommit) whether a fsync is still owed.  Does NOT fsync
+    /// — that is [`Self::commit_durable_phase`], which runs AFTER write locks
+    /// are released (Fix 3a).  Any `?` failure leaves write locks held so the
+    /// caller's epilogue can drain them.
+    fn commit_append_phase(&mut self) -> Result<PendingCommit, TxnError> {
+        if self.has_logged_entries() && !self.is_auto_txn() {
             if let Some(ref hook) = self.pre_commit_hook {
                 hook();
             }
@@ -529,67 +606,92 @@ impl Txn {
             // LSN obsolete through the tracker.
             // JE Txn.getObsoleteLsnInfo -> LogManager counts each
             // obsoleteWriteLockInfo via countObsoleteNode under the LWL.
+            //
+            // Runs BEFORE the write locks are released (Fix 3a) so the
+            // WriteLockInfo abort-LSN set is still intact here.
             self.count_obsolete_abort_lsns();
 
             if let Some(ref hook) = self.post_commit_hook {
                 hook(commit_lsn);
             }
-
-            // Step: decide whether to fsync now or defer via GroupCommit.
-            //
-            // (extended fork): after writing the WAL entry, Txn.commit()
-            // calls GroupCommit.bufferCommit(nowNs, txn, commitVLSN).
-            // - returns true  → commit is batched; skip fsync (another
-            //                   commit will flush for us).
-            // - returns false → flush now (timeout or buffer limit reached).
-            //
-            // Without GroupCommit: fsync according to the durability policy.
-            if want_sync {
-                let should_skip_fsync = match &self.group_commit {
-                    Some(gc) if gc.is_enabled() => {
-                        // Use the txn id as a proxy for commit VLSN in
-                        // non-replicated environments (single-node
-                        // path where VLSN is not assigned for local txns).
-                        gc.buffer_commit(self.id)
-                    }
-                    _ => false,
-                };
-                if !should_skip_fsync && let Some(ref lm) = self.log_manager {
-                    // Port of(commitLsn): skip fsync
-                    // if a concurrent committer already flushed past our LSN.
-                    lm.flush_sync_if_needed(commit_lsn)
-                        .map_err(TxnError::LogError)?;
-                }
-            } else if matches!(durability, Durability::CommitWriteNoSync)
-                && let Some(ref lm) = self.log_manager
-            {
-                lm.flush_no_sync().map_err(TxnError::LogError)?;
-            }
-            // CommitNoSync: neither flush nor fsync.
-
-            commit_lsn
+            Ok(PendingCommit {
+                assigned_lsn: commit_lsn,
+                pending_sync: PendingSync::Commit { commit_lsn },
+            })
         } else if self.is_auto_txn() && self.has_logged_entries() {
-            // Auto-commit (synthetic auto-txn): no `TxnCommit` WAL
-            // entry is written, but we still honour the caller's
-            // durability policy for the LN entry that the cursor
-            // already wrote.  `last_lsn` is the LN's LSN.  Closes
-            // the first F12 residual: previously this fsync lived in
-            // `Database::auto_commit_sync`; folding it into
-            // `commit_with_durability` lets one code path serve both
-            // explicit and synthetic-auto txns.
-            let ln_lsn = Lsn::from_u64(self.last_lsn);
-            if want_sync && let Some(ref lm) = self.log_manager {
-                lm.flush_sync_if_needed(ln_lsn).map_err(TxnError::LogError)?;
-            } else if matches!(durability, Durability::CommitWriteNoSync)
-                && let Some(ref lm) = self.log_manager
-            {
-                lm.flush_no_sync().map_err(TxnError::LogError)?;
-            }
-            NULL_LSN
+            // Auto-commit (synthetic auto-txn): no `TxnCommit` WAL entry is
+            // written, but we still honour the caller's durability policy for
+            // the LN entry the cursor already wrote.  `last_lsn` is the LN's
+            // LSN.  The fsync is likewise deferred to the durable phase.
+            Ok(PendingCommit {
+                assigned_lsn: NULL_LSN,
+                pending_sync: PendingSync::Ln {
+                    ln_lsn: Lsn::from_u64(self.last_lsn),
+                },
+            })
         } else {
-            NULL_LSN
-        };
-        Ok(assigned_lsn)
+            Ok(PendingCommit {
+                assigned_lsn: NULL_LSN,
+                pending_sync: PendingSync::None,
+            })
+        }
+    }
+
+    /// Phase 2 of commit: the durability barrier.  Runs AFTER write locks are
+    /// released (Fix 3a) but BEFORE `commit_with_durability` returns success,
+    /// so the caller never observes a committed result that is not durable.
+    fn commit_durable_phase(
+        &mut self,
+        durability: Durability,
+        pending_sync: PendingSync,
+    ) -> Result<(), TxnError> {
+        let want_sync = matches!(durability, Durability::CommitSync);
+        match pending_sync {
+            PendingSync::Commit { commit_lsn } => {
+                // Step: fsync now or defer via GroupCommit.
+                //
+                // (extended fork): after writing the WAL entry, Txn.commit()
+                // calls GroupCommit.bufferCommit(nowNs, txn, commitVLSN).
+                // - returns true  → commit is batched; skip fsync (another
+                //                   commit will flush for us).
+                // - returns false → flush now (timeout or buffer limit).
+                if want_sync {
+                    let should_skip_fsync = match &self.group_commit {
+                        Some(gc) if gc.is_enabled() => {
+                            // Use the txn id as a proxy for commit VLSN in
+                            // non-replicated environments (single-node path
+                            // where VLSN is not assigned for local txns).
+                            gc.buffer_commit(self.id)
+                        }
+                        _ => false,
+                    };
+                    if !should_skip_fsync && let Some(ref lm) = self.log_manager
+                    {
+                        // Skip fsync if a concurrent committer already flushed
+                        // past our LSN (the coalescing fast path).
+                        lm.flush_sync_if_needed(commit_lsn)
+                            .map_err(TxnError::LogError)?;
+                    }
+                } else if matches!(durability, Durability::CommitWriteNoSync)
+                    && let Some(ref lm) = self.log_manager
+                {
+                    lm.flush_no_sync().map_err(TxnError::LogError)?;
+                }
+                // CommitNoSync: neither flush nor fsync.
+            }
+            PendingSync::Ln { ln_lsn } => {
+                if want_sync && let Some(ref lm) = self.log_manager {
+                    lm.flush_sync_if_needed(ln_lsn)
+                        .map_err(TxnError::LogError)?;
+                } else if matches!(durability, Durability::CommitWriteNoSync)
+                    && let Some(ref lm) = self.log_manager
+                {
+                    lm.flush_no_sync().map_err(TxnError::LogError)?;
+                }
+            }
+            PendingSync::None => {}
+        }
+        Ok(())
     }
 
     /// Sets the pre-commit hook called before writing the TxnCommit log entry.
