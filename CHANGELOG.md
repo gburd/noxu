@@ -106,6 +106,27 @@ listed in [References](#references).
   locks after the fsync) for tail latency, not a JE-faithful port. See
   `docs/src/transactions/durability.md` (lock-release ordering) and
   `docs/src/transactions/concurrency.md`.
+### Fixed
+
+- **Documented and regression-guarded the recovery redo gate**
+  (`RecoveryManager::eligible_for_redo`). A proposed optimisation to skip
+  replaying log records (LNs) logged before the last checkpoint's start LSN
+  (JE's `afterCheckpointStart` gate) was investigated and found to cause
+  **silent data loss** on a multi-checkpoint clean reopen, so it was NOT
+  enabled. Root cause: recovery reconstructs each tree from empty and splices
+  in only the BINs logged at/after `checkpoint_start_lsn`; unlike JE it has no
+  lazy fetch of an unchanged (clean) pre-checkpoint BIN via its parent pointer,
+  and the checkpointer re-logs only dirty BINs. A committed record whose LN and
+  covering BIN both predate the last checkpoint start is materialised by
+  neither IN-redo nor a gated LN-redo, and the per-slot redo currency check
+  (`logrecLsn > treeLsn`) cannot recover it. Added a regression test
+  (`recovery_correctness_test::redo_gate_multi_checkpoint_stable_bins_survive_clean_reopen`)
+  that pins the invariant, and corrected the stale in-code rationale (which
+  wrongly blamed "checkpointer only flushes the primary tree" — the Stage-1 fix
+  already made it flush every open user database's dirty BINs). Enabling the
+  gate safely requires a checkpoint-BIN load path (walk the checkpointed root's
+  child pointers and fetch each pre-checkpoint BIN from the log before LN redo,
+  the JE `fetchTarget` equivalent), which is deferred as follow-up work.
 
 ### Changed
 

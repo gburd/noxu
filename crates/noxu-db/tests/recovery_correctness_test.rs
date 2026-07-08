@@ -1475,3 +1475,100 @@ fn fix3a_dependent_commit_chain_recovers_consistently() {
          depends on (single monotonic WAL invariant)"
     );
 }
+
+// Redo-gate safety: multi-checkpoint clean reopen must not drop records whose
+// LN predates the LAST checkpoint start.
+// ---------------------------------------------------------------------------
+
+/// Regression guard for the "AfterCheckpointStart" redo gate in
+/// `RecoveryManager::eligible_for_redo`.
+///
+/// Background: on reopen, recovery reconstructs each in-memory tree from an
+/// EMPTY tree. It splices in only the INs/BINs logged at or after the last
+/// checkpoint's start LSN (`checkpoint_start_lsn`), then replays LN records.
+/// A naive optimisation would skip replaying any LN logged before
+/// `checkpoint_start_lsn` (JE's `afterCheckpointStart` gate) on the assumption
+/// that all pre-checkpoint committed state is already durable in the
+/// checkpoint's BIN snapshot.
+///
+/// That assumption does NOT hold here: the checkpointer re-logs only DIRTY
+/// BINs, and IN-redo splices in only INs logged at/after `checkpoint_start_lsn`
+/// — it does not lazily fetch an unchanged (clean) BIN from a prior checkpoint
+/// via its parent pointer. So a committed record whose LN AND whose covering
+/// BIN were both last logged BEFORE the last checkpoint start is materialised
+/// by NEITHER IN-redo NOR a gated LN-redo, and would silently vanish. The
+/// per-slot redo currency check (`logrecLsn > treeLsn`) cannot save this case:
+/// it only prevents reverting an EXISTING slot, never materialises a MISSING
+/// one.
+///
+/// This test constructs exactly that state:
+///   Checkpoint C1: write a batch of "stable_*" keys, clean-close (flushes
+///                  those BINs; their LNs are < C1_start).
+///   Checkpoint C2: reopen, write DISJOINT "post_*" keys (different BINs),
+///                  clean-close. C2 flushes only the post_* BINs; the stable_*
+///                  BINs are untouched and NOT re-logged, so they remain at
+///                  their C1 LSNs, which are < C2_start.
+///   Reopen:        recovery uses C2 as the last checkpoint. Every stable_* LN
+///                  is < C2_start. If the redo gate is enabled without also
+///                  loading the pre-C2 baseline BINs, all stable_* records are
+///                  lost.
+///
+/// The invariant: a clean-close reopen must recover ALL committed records
+/// regardless of which checkpoint interval their LN falls in. Enabling the
+/// pre-checkpoint-start skip gate without a checkpoint-BIN load path makes this
+/// assertion fail (empirically: 0 of N+M keys recovered).
+#[test]
+fn redo_gate_multi_checkpoint_stable_bins_survive_clean_reopen() {
+    let dir = TempDir::new().unwrap();
+    let mut expected = BTreeMap::new();
+
+    // Checkpoint C1: stable keys, then clean close.
+    {
+        let env = open_env(dir.path());
+        let db = open_db(&env);
+        for i in 0u32..800 {
+            let k = format!("stable_{i:06}");
+            let v = format!("sval_{i:06}");
+            db.put(
+                DatabaseEntry::from_bytes(k.as_bytes()),
+                DatabaseEntry::from_bytes(v.as_bytes()),
+            )
+            .unwrap();
+            expected.insert(k.into_bytes(), v.into_bytes());
+        }
+    } // clean close -> C1
+
+    // Checkpoint C2: disjoint keys (different BIN range), then clean close.
+    // The stable_* BINs are not touched here, so C2 does not re-log them.
+    {
+        let env = open_env(dir.path());
+        let db = open_db(&env);
+        for i in 0u32..100 {
+            let k = format!("post_{i:06}");
+            let v = format!("pval_{i:06}");
+            db.put(
+                DatabaseEntry::from_bytes(k.as_bytes()),
+                DatabaseEntry::from_bytes(v.as_bytes()),
+            )
+            .unwrap();
+            expected.insert(k.into_bytes(), v.into_bytes());
+        }
+    } // clean close -> C2
+
+    // Reopen: every stable_* LN is older than C2's start LSN. All records must
+    // still be present and correct.
+    let recovered = recover_and_collect(dir.path());
+    assert_eq!(
+        recovered.len(),
+        expected.len(),
+        "redo-gate: recovered {} records, expected {} (pre-last-checkpoint \
+         records must not be dropped on clean reopen)",
+        recovered.len(),
+        expected.len(),
+    );
+    assert_eq!(
+        recovered, expected,
+        "redo-gate: recovered set != expected committed set across two \
+         checkpoints"
+    );
+}
