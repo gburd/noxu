@@ -437,8 +437,8 @@ fn f12_explicit_txn_read_blocks_auto_commit_write() {
 
 mod prop_txn_visibility {
     use super::*;
-    use proptest::prelude::*;
-    use std::collections::BTreeMap;
+    use hegel::generators;
+    use std::collections::{BTreeMap, BTreeSet};
 
     #[derive(Debug, Clone)]
     enum TxnStep {
@@ -452,137 +452,142 @@ mod prop_txn_visibility {
         Abort,
     }
 
-    fn step_strategy() -> impl Strategy<Value = TxnStep> {
-        let key_strat = prop::collection::vec(any::<u8>(), 1..=4);
-        let val_strat = prop::collection::vec(any::<u8>(), 1..=16);
-        prop_oneof![
-            // Skew the distribution slightly toward Put so short
-            // sequences still build up state to verify.
-            1 => Just(TxnStep::Begin),
-            4 => (key_strat, val_strat)
-                .prop_map(|(key, value)| TxnStep::Put { key, value }),
-            2 => Just(TxnStep::Commit),
-            1 => Just(TxnStep::Abort),
-        ]
+    #[hegel::composite]
+    fn step(tc: hegel::TestCase) -> TxnStep {
+        // Skew the distribution slightly toward Put so short sequences
+        // still build up state to verify: proptest weights were
+        // Begin=1, Put=4, Commit=2, Abort=1.  Emulate the weighting by
+        // drawing a tag from a list where each tag repeats by its weight.
+        let tag = tc.draw(generators::sampled_from(vec![
+            "begin", "put", "put", "put", "put", "commit", "commit",
+            "abort",
+        ]));
+        match tag {
+            "begin" => TxnStep::Begin,
+            "commit" => TxnStep::Commit,
+            "abort" => TxnStep::Abort,
+            _ => {
+                let key = tc
+                    .draw(generators::binary().min_size(1).max_size(4));
+                let value = tc
+                    .draw(generators::binary().min_size(1).max_size(16));
+                TxnStep::Put { key, value }
+            }
+        }
     }
 
-    proptest! {
-        #![proptest_config(ProptestConfig {
-            cases: 64,
-            .. ProptestConfig::default()
-        })]
-
-        #[test]
-        fn txn_commit_abort_visibility_oracle(
-            steps in prop::collection::vec(step_strategy(), 1..=40),
-        ) {
-            let tmp = TempDir::new().unwrap();
-            let env = open_env(&tmp, Durability::COMMIT_NO_SYNC);
-            let db = open_db(&env, "prop_txn_visibility");
-
-            // Oracle: the *committed* state of the database.
-            let mut committed: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
-            // The active transaction together with the snapshot of
-            // `committed` taken at begin, plus the txn-local mutations
-            // applied since begin (which collapse onto `committed` on
-            // commit and are dropped on abort).
-            type ActiveTxn = (noxu_db::Transaction, BTreeMap<Vec<u8>, Vec<u8>>);
-            let mut active: Option<ActiveTxn> = None;
-            // All keys ever touched, for the post-step visibility sweep.
-            let mut all_keys: std::collections::BTreeSet<Vec<u8>> =
-                std::collections::BTreeSet::new();
-
-            let verify_committed_visibility = |db: &Database,
-                                               committed: &BTreeMap<Vec<u8>, Vec<u8>>,
-                                               all_keys: &std::collections::BTreeSet<Vec<u8>>,
-                                               step_idx: usize|
-             -> Result<(), TestCaseError> {
-                for k in all_keys {
-                    let mut data = DatabaseEntry::new();
-                    let key_e = DatabaseEntry::from_data(k);
-                    let status = db.get_into(None, &key_e, &mut data).unwrap();
-                    match (status, committed.get(k)) {
-                        (true, Some(want)) => {
-                            prop_assert_eq!(
-                                data.data(), want.as_slice(),
-                                "step {}: get({:?}) value mismatch", step_idx, k,
-                            );
-                        }
-                        (false, None) => { /* agree */ }
-                        (s, w) => prop_assert!(
-                            false,
-                            "step {}: get({:?}) visibility mismatch: db={:?}, oracle={:?}",
-                            step_idx, k, s, w,
-                        ),
-                    }
+    // Verify every key ever touched is visible at exactly the committed
+    // value (or absent if uncommitted).  Panics (fails the test) on any
+    // mismatch.
+    fn verify_committed_visibility(
+        db: &Database,
+        committed: &BTreeMap<Vec<u8>, Vec<u8>>,
+        all_keys: &BTreeSet<Vec<u8>>,
+        step_idx: usize,
+    ) {
+        for k in all_keys {
+            let mut data = DatabaseEntry::new();
+            let key_e = DatabaseEntry::from_data(k);
+            let status = db.get_into(None, &key_e, &mut data).unwrap();
+            match (status, committed.get(k)) {
+                (true, Some(want)) => {
+                    assert_eq!(
+                        data.data(),
+                        want.as_slice(),
+                        "step {}: get({:?}) value mismatch",
+                        step_idx,
+                        k,
+                    );
                 }
-                Ok(())
-            };
-
-            for (i, step) in steps.into_iter().enumerate() {
-                match step {
-                    TxnStep::Begin => {
-                        if active.is_none() {
-                            let txn = env.begin_transaction(None).unwrap();
-                            // Snapshot the committed state; mutations
-                            // accumulate here until commit/abort.
-                            let snap = committed.clone();
-                            active = Some((txn, snap));
-                        }
-                    }
-                    TxnStep::Put { key, value } => {
-                        all_keys.insert(key.clone());
-                        let key_e = DatabaseEntry::from_data(&key);
-                        let val_e = DatabaseEntry::from_data(&value);
-                        if let Some((txn, snap)) = active.as_mut() {
-                            db.put_in(txn, &key_e, &val_e).unwrap();
-                            snap.insert(key, value);
-                        } else {
-                            db.put( &key_e, &val_e).unwrap();
-                            committed.insert(key, value);
-                            // Auto-commit: oracle and db should agree
-                            // *immediately* after this op.
-                            verify_committed_visibility(
-                                &db, &committed, &all_keys, i,
-                            )?;
-                        }
-                    }
-                    TxnStep::Commit => {
-                        if let Some((txn, snap)) = active.take() {
-                            txn.commit().unwrap();
-                            committed = snap;
-                            verify_committed_visibility(
-                                &db, &committed, &all_keys, i,
-                            )?;
-                        }
-                    }
-                    TxnStep::Abort => {
-                        if let Some((txn, _snap)) = active.take() {
-                            txn.abort().unwrap();
-                            // committed unchanged
-                            verify_committed_visibility(
-                                &db, &committed, &all_keys, i,
-                            )?;
-                        }
-                    }
-                }
+                (false, None) => { /* agree */ }
+                (s, w) => panic!(
+                    "step {}: get({:?}) visibility mismatch: db={:?}, oracle={:?}",
+                    step_idx, k, s, w,
+                ),
             }
-
-            // Drain any still-active txn before final check / close.
-            if let Some((txn, _)) = active.take() {
-                txn.abort().unwrap();
-            }
-
-            // Final visibility sweep.
-            verify_committed_visibility(
-                &db, &committed, &all_keys, usize::MAX,
-            )?;
-
-            // Exercise the F1 fix: env.close() must succeed once all
-            // transactions are committed/aborted.
-            db.close().unwrap();
-            env.close().expect("env.close() must succeed after all txns settled");
         }
+    }
+
+    #[hegel::test(test_cases = 64)]
+    fn txn_commit_abort_visibility_oracle(tc: hegel::TestCase) {
+        let steps: Vec<TxnStep> =
+            tc.draw(generators::vecs(step()).min_size(1).max_size(40));
+        let tmp = TempDir::new().unwrap();
+        let env = open_env(&tmp, Durability::COMMIT_NO_SYNC);
+        let db = open_db(&env, "prop_txn_visibility");
+
+        // Oracle: the *committed* state of the database.
+        let mut committed: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+        // The active transaction together with the snapshot of
+        // `committed` taken at begin, plus the txn-local mutations
+        // applied since begin (which collapse onto `committed` on
+        // commit and are dropped on abort).
+        type ActiveTxn = (noxu_db::Transaction, BTreeMap<Vec<u8>, Vec<u8>>);
+        let mut active: Option<ActiveTxn> = None;
+        // All keys ever touched, for the post-step visibility sweep.
+        let mut all_keys: BTreeSet<Vec<u8>> = BTreeSet::new();
+
+        for (i, step) in steps.into_iter().enumerate() {
+            match step {
+                TxnStep::Begin => {
+                    if active.is_none() {
+                        let txn = env.begin_transaction(None).unwrap();
+                        // Snapshot the committed state; mutations
+                        // accumulate here until commit/abort.
+                        let snap = committed.clone();
+                        active = Some((txn, snap));
+                    }
+                }
+                TxnStep::Put { key, value } => {
+                    all_keys.insert(key.clone());
+                    let key_e = DatabaseEntry::from_data(&key);
+                    let val_e = DatabaseEntry::from_data(&value);
+                    if let Some((txn, snap)) = active.as_mut() {
+                        db.put_in(txn, &key_e, &val_e).unwrap();
+                        snap.insert(key, value);
+                    } else {
+                        db.put(&key_e, &val_e).unwrap();
+                        committed.insert(key, value);
+                        // Auto-commit: oracle and db should agree
+                        // *immediately* after this op.
+                        verify_committed_visibility(
+                            &db, &committed, &all_keys, i,
+                        );
+                    }
+                }
+                TxnStep::Commit => {
+                    if let Some((txn, snap)) = active.take() {
+                        txn.commit().unwrap();
+                        committed = snap;
+                        verify_committed_visibility(
+                            &db, &committed, &all_keys, i,
+                        );
+                    }
+                }
+                TxnStep::Abort => {
+                    if let Some((txn, _snap)) = active.take() {
+                        txn.abort().unwrap();
+                        // committed unchanged
+                        verify_committed_visibility(
+                            &db, &committed, &all_keys, i,
+                        );
+                    }
+                }
+            }
+        }
+
+        // Drain any still-active txn before final check / close.
+        if let Some((txn, _)) = active.take() {
+            txn.abort().unwrap();
+        }
+
+        // Final visibility sweep.
+        verify_committed_visibility(&db, &committed, &all_keys, usize::MAX);
+
+        // Exercise the F1 fix: env.close() must succeed once all
+        // transactions are committed/aborted.
+        db.close().unwrap();
+        env.close().expect("env.close() must succeed after all txns settled");
     }
 }
 

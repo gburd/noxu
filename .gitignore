@@ -58,4 +58,3 @@ __pycache__/
 /migrate_api.py
 
 # Hegel property-testing server cache + failure database (regenerated locally)
-.hegel/

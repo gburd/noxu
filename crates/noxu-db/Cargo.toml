@@ -43,7 +43,7 @@ targets = ["x86_64-unknown-linux-gnu"]
 
 [dev-dependencies]
 criterion = { workspace = true }
-proptest = { workspace = true }
+hegeltest = { workspace = true }
 tempfile = "3"
 noxu-dbi = { workspace = true, features = ["testing"] }
 # SHARED_CACHE headline test needs SharedEvictorHandle (process-global
