@@ -51,7 +51,7 @@ rcgen          = { workspace = true, optional = true }
 native-tls     = { workspace = true, optional = true }
 
 [dev-dependencies]
-proptest = { workspace = true }
+hegeltest = { workspace = true }
 tempfile = "3"
 rand = "0.8"
 bytes = { workspace = true }
