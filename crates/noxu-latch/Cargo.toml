@@ -16,7 +16,7 @@ noxu-sync = { workspace = true }
 log = { workspace = true }
 
 [dev-dependencies]
-proptest = { workspace = true }
+hegeltest = { workspace = true }
 
 [lints]
 workspace = true
