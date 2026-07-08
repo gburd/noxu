@@ -6813,6 +6813,82 @@ impl Tree {
         bin.dirty = true;
     }
 
+    /// Parse a serialized BIN-delta (`serialize_delta` format) into full-key
+    /// entry tuples `(full_key, lsn, data, known_deleted)`.
+    ///
+    /// Unlike `apply_delta` (which overlays by slot INDEX and therefore
+    /// corrupts the base when a delta INSERTS a new key that shifts later
+    /// slots), these tuples are merged by KEY into the base full BIN during
+    /// delta-chain reconstitution (`fetch_node_from_log`), which is correct
+    /// for both updates and insertions.  Returns `None` on malformed input.
+    pub fn parse_delta_entries(
+        delta_bytes: &[u8],
+    ) -> Option<Vec<(Vec<u8>, Lsn, Option<Vec<u8>>, bool)>> {
+        if delta_bytes.len() < 12 {
+            return None;
+        }
+        let num_dirty =
+            u32::from_be_bytes(delta_bytes[8..12].try_into().ok()?) as usize;
+        let mut pos = 12usize;
+        let mut out = Vec::with_capacity(num_dirty);
+        for _ in 0..num_dirty {
+            // slot_idx(u32BE) | key_len(u32BE) | key | lsn(u64BE) |
+            //   has_data(u8) [| data_len(u32BE) | data] | known_deleted(u8)
+            if pos + 4 > delta_bytes.len() {
+                return None;
+            }
+            pos += 4; // skip slot_idx (we merge by key, not index)
+            if pos + 4 > delta_bytes.len() {
+                return None;
+            }
+            let key_len =
+                u32::from_be_bytes(delta_bytes[pos..pos + 4].try_into().ok()?)
+                    as usize;
+            pos += 4;
+            if pos + key_len > delta_bytes.len() {
+                return None;
+            }
+            let key = delta_bytes[pos..pos + key_len].to_vec();
+            pos += key_len;
+            if pos + 8 > delta_bytes.len() {
+                return None;
+            }
+            let lsn = Lsn::from_u64(u64::from_be_bytes(
+                delta_bytes[pos..pos + 8].try_into().ok()?,
+            ));
+            pos += 8;
+            if pos + 1 > delta_bytes.len() {
+                return None;
+            }
+            let has_data = delta_bytes[pos] != 0;
+            pos += 1;
+            let data = if has_data {
+                if pos + 4 > delta_bytes.len() {
+                    return None;
+                }
+                let dl = u32::from_be_bytes(
+                    delta_bytes[pos..pos + 4].try_into().ok()?,
+                ) as usize;
+                pos += 4;
+                if pos + dl > delta_bytes.len() {
+                    return None;
+                }
+                let d = delta_bytes[pos..pos + dl].to_vec();
+                pos += dl;
+                Some(d)
+            } else {
+                None
+            };
+            if pos + 1 > delta_bytes.len() {
+                return None;
+            }
+            let known_deleted = delta_bytes[pos] != 0;
+            pos += 1;
+            out.push((key, lsn, data, known_deleted));
+        }
+        Some(out)
+    }
+
     /// Reconstitute a BIN-delta into a full BIN.
     ///
     /// from the:
@@ -6874,14 +6950,13 @@ impl Tree {
         // this header before calling `recover_in_redo`; re-fetch must do the
         // same so `deserialize_*` sees the bare node bytes.  JE
         // `INLogEntry.readEntry` parses the same wrapper.
-        let in_entry =
+        let mut in_entry =
             noxu_log::entry::in_log_entry::InLogEntry::read_from_log(&payload)
                 .ok()?;
-        let node_data = &in_entry.node_data;
         use noxu_log::LogEntryType;
         match entry_type {
             LogEntryType::BIN => {
-                Self::deserialize_bin(node_data).map(|mut bin| {
+                Self::deserialize_bin(&in_entry.node_data).map(|mut bin| {
                     // `deserialize_bin` always recomputes a key prefix from
                     // the loaded keys.  When this tree has key-prefixing
                     // DISABLED, the insert/redo paths use the full-key
@@ -6901,7 +6976,8 @@ impl Tree {
                 })
             }
             LogEntryType::IN => {
-                Self::deserialize_upper_in(node_data).map(TreeNode::Internal)
+                Self::deserialize_upper_in(&in_entry.node_data)
+                    .map(TreeNode::Internal)
             }
             // A checkpoint-seeded parent slot may point at a BIN-delta LSN
             // (the most recent on-disk version of a BIN logged as a delta).
@@ -6911,27 +6987,68 @@ impl Tree {
             // is what lets the redo gate skip the delta's committed LNs — the
             // seeded fetch materialises the CURRENT (post-delta) contents.
             LogEntryType::BINDelta => {
-                let delta_data = &in_entry.node_data;
-                let base_lsn = in_entry.prev_full_lsn;
-                if base_lsn == NULL_LSN {
-                    // A checkpoint only writes a delta when a prior full BIN
-                    // exists (`BIN.shouldLogDelta` requires `last_full_lsn !=
-                    // NULL`), so a seeded slot should never point at a
-                    // base-less delta.  Be defensive: treat as unfetchable.
+                // A checkpoint-seeded parent slot may point at a BIN-delta
+                // LSN (the most recent on-disk version of a BIN logged as a
+                // delta).  Reconstitute it into a full BIN by walking the
+                // ENTIRE delta chain back to its base full BIN and applying
+                // every delta oldest-first over the base.  A single BIN may
+                // have several deltas since its last full log (e.g. one
+                // checkpoint dirtied slot A, a later checkpoint dirtied slot
+                // B); each delta carries only the slots dirtied since the
+                // PREVIOUS log, so reading just the newest delta + base would
+                // drop the intermediate deltas' committed changes.  The redo
+                // gate skips those changes' LNs, so the chain MUST be applied
+                // in full here (JE `BINDelta.reconstituteBIN` follows the
+                // delta chain / the BIN tracks its full base).
+                //
+                // Chain: newest delta -> prev_delta_lsn -> ... -> (prev_delta
+                // NULL) whose prev_full_lsn is the base full BIN.
+                let mut deltas: Vec<Vec<u8>> = Vec::new();
+                let mut cur_lsn = log_lsn;
+                let mut cur_entry = in_entry;
+                let base_full_lsn;
+                loop {
+                    deltas.push(std::mem::take(&mut cur_entry.node_data));
+                    let prev_delta = cur_entry.prev_delta_lsn;
+                    if prev_delta == NULL_LSN {
+                        base_full_lsn = cur_entry.prev_full_lsn;
+                        break;
+                    }
+                    // Guard against a self-referential / cyclic chain.
+                    if prev_delta == cur_lsn {
+                        log::warn!(
+                            "fetch_node_from_log: BINDelta chain cycle at {:?}",
+                            prev_delta
+                        );
+                        return None;
+                    }
+                    let (pt, pp) = lm.read_entry(prev_delta).ok()?;
+                    if pt != LogEntryType::BINDelta {
+                        // The previous link is a full BIN (the base): stop.
+                        base_full_lsn = prev_delta;
+                        break;
+                    }
+                    cur_lsn = prev_delta;
+                    cur_entry =
+                        noxu_log::entry::in_log_entry::InLogEntry::
+                            read_from_log(&pp)
+                            .ok()?;
+                }
+                if base_full_lsn == NULL_LSN {
                     log::warn!(
-                        "fetch_node_from_log: BINDelta at LSN {:?} has no base \
+                        "fetch_node_from_log: BINDelta at {:?} has no base \
                          full LSN",
                         log_lsn
                     );
                     return None;
                 }
                 let (base_type, base_payload) =
-                    lm.read_entry(base_lsn).ok()?;
+                    lm.read_entry(base_full_lsn).ok()?;
                 if base_type != LogEntryType::BIN {
                     log::warn!(
                         "fetch_node_from_log: BINDelta base at LSN {:?} is \
                          {:?}, expected BIN",
-                        base_lsn,
+                        base_full_lsn,
                         base_type
                     );
                     return None;
@@ -6939,13 +7056,35 @@ impl Tree {
                 let base_in = noxu_log::entry::in_log_entry::InLogEntry::
                     read_from_log(&base_payload)
                     .ok()?;
-                Self::reconstitute_bin_delta(&base_in.node_data, delta_data)
-                    .map(|mut bin| {
-                        if !self.key_prefixing && !bin.key_prefix.is_empty() {
-                            bin.apply_new_prefix(Vec::new());
-                        }
-                        TreeNode::Bottom(bin)
-                    })
+                // Apply deltas oldest-first (we collected newest-first).
+                // Merge each delta entry BY KEY (not by slot index): a delta
+                // that inserts a new key shifts later slots, so slot-index
+                // overlay (`apply_delta`) would corrupt the base.  Known-
+                // deleted tombstones are preserved so an aborted-insert slot
+                // does not resurrect.
+                let mut bin = BinStub::deserialize_full(&base_in.node_data)?;
+                if !bin.key_prefix.is_empty() {
+                    bin.apply_new_prefix(Vec::new());
+                }
+                for delta_bytes in deltas.iter().rev() {
+                    let entries = Self::parse_delta_entries(delta_bytes)?;
+                    for (full_key, lsn, data, known_deleted) in entries {
+                        let (idx, _new) = if self.key_prefixing {
+                            bin.insert_with_prefix(full_key, lsn, data)
+                        } else {
+                            bin.insert_raw(full_key, lsn, data)
+                        };
+                        bin.entries[idx].known_deleted = known_deleted;
+                    }
+                }
+                bin.is_delta = false;
+                bin.dirty = false;
+                if self.key_prefixing {
+                    bin.recompute_key_prefix();
+                } else if !bin.key_prefix.is_empty() {
+                    bin.apply_new_prefix(Vec::new());
+                }
+                Some(TreeNode::Bottom(bin))
             }
             _ => {
                 log::warn!(
