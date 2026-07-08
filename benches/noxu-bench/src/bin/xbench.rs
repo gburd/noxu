@@ -7,7 +7,8 @@
 //!
 //! Env: BENCH_DIR BENCH_RECORDS BENCH_CACHE BENCH_VALUE BENCH_THREADS
 //!      BENCH_SECONDS BENCH_DURABILITY(SYNC|NO_SYNC) BENCH_WORKLOAD BENCH_SEED
-//!      BENCH_ISOLATION(default|serializable)
+//!      BENCH_ISOLATION(default|serializable|read_uncommitted)
+//!      BENCH_NO_WAIT(0|1)  (1 = per-txn immediate-abort-on-conflict)
 
 use noxu_db::{
     DatabaseConfig, Durability, Environment, EnvironmentConfig,
@@ -156,6 +157,7 @@ fn main() {
     let workload = envs("BENCH_WORKLOAD", "ycsb_a");
     let seed = envp("BENCH_SEED", 0xC0FFEE);
     let isolation = envs("BENCH_ISOLATION", "default");
+    let no_wait = envs("BENCH_NO_WAIT", "0") == "1";
 
     if fstype(&dir).contains("tmpfs") {
         eprintln!("ABORT: {dir} is tmpfs; use real NVMe");
@@ -168,7 +170,7 @@ fn main() {
         _ => Durability::COMMIT_SYNC,
     };
 
-    println!("=== NOXU xbench: workload={workload} records={records} cache={}GiB value={value_size} threads={threads} secs={seconds} dur={durability} iso={isolation} ===",
+    println!("=== NOXU xbench: workload={workload} records={records} cache={}GiB value={value_size} threads={threads} secs={seconds} dur={durability} iso={isolation} no_wait={no_wait} ===",
         cache / 1024 / 1024 / 1024);
 
     let mut ecfg = EnvironmentConfig::new(std::path::PathBuf::from(&dir));
@@ -248,8 +250,21 @@ fn main() {
                 let zipf = Zipf::new(records);
                 let value = vec![0x5Au8; value_size];
                 let insert_ctr = AtomicU64::new(records + tid as u64 * 100_000_000);
-                let txn_cfg = if isolation == "serializable" {
-                    Some(TransactionConfig::new().with_serializable_isolation(true))
+                // Isolation + no_wait both live on TransactionConfig; build
+                // one config if either knob is non-default.
+                let txn_cfg = if isolation != "default" || no_wait {
+                    let mut c = TransactionConfig::new();
+                    match isolation.as_str() {
+                        "serializable" => c = c.with_serializable_isolation(true),
+                        // read_uncommitted skips the record-lock probe on reads
+                        // (engine: is_read_uncommitted_default / lock_ln early return).
+                        "read_uncommitted" => c = c.with_read_uncommitted(true),
+                        _ => {}
+                    }
+                    if no_wait {
+                        c = c.with_no_wait(true);
+                    }
+                    Some(c)
                 } else {
                     None
                 };
@@ -345,7 +360,7 @@ fn main() {
     let total = ops.load(Ordering::Relaxed);
     let ab = aborts.load(Ordering::Relaxed);
     println!("RESULT engine=noxu workload={workload} iso={isolation} dur={durability} threads={threads} \
-throughput={:.0} ops/s ops={total} aborts={ab} abort_rate={:.4} \
+no_wait={no_wait} throughput={:.0} ops/s ops={total} aborts={ab} abort_rate={:.4} \
 p50={} p90={} p99={} p999={} max={}",
         total as f64 / el, ab as f64 / total.max(1) as f64,
         hist.pct(0.50), hist.pct(0.90), hist.pct(0.99), hist.pct(0.999), hist.max.load(Ordering::Relaxed));
