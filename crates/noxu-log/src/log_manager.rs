@@ -1839,8 +1839,7 @@ mod tests {
                         payload.push(
                             ((t as u32).wrapping_mul(2_654_435_761)
                                 ^ (i as u32).wrapping_mul(40_503)
-                                ^ (b as u32))
-                                as u8,
+                                ^ (b as u32)) as u8,
                         );
                     }
                     let lsn = lm2
@@ -1886,8 +1885,7 @@ mod tests {
                 let a_entry_size =
                     MIN_HEADER_SIZE as u32 + a_payload.len() as u32;
                 assert!(
-                    b_lsn.file_offset()
-                        >= a_lsn.file_offset() + a_entry_size,
+                    b_lsn.file_offset() >= a_lsn.file_offset() + a_entry_size,
                     "entries must not overlap: {a_lsn:?} (+{a_entry_size}) \
                      overlaps {b_lsn:?}"
                 );
@@ -1936,8 +1934,7 @@ mod tests {
             FileManager::new(dir.path(), false, 500_000_000, 10).unwrap(),
         );
         // 3 small buffers (64 KiB) => the ring rolls constantly under load.
-        let lm =
-            Arc::new(LogManager::new(Arc::clone(&fm), 3, 64 * 1024, 4096));
+        let lm = Arc::new(LogManager::new(Arc::clone(&fm), 3, 64 * 1024, 4096));
 
         const THREADS: usize = 64;
         const ENTRIES_PER_THREAD: usize = 200;
@@ -2005,8 +2002,7 @@ mod tests {
                 let a_entry_size =
                     MIN_HEADER_SIZE as u32 + a_payload.len() as u32;
                 assert!(
-                    b_lsn.file_offset()
-                        >= a_lsn.file_offset() + a_entry_size,
+                    b_lsn.file_offset() >= a_lsn.file_offset() + a_entry_size,
                     "entries must not overlap after a buffer roll: {a_lsn:?} \
                      (+{a_entry_size}) overlaps {b_lsn:?}"
                 );
@@ -2053,7 +2049,13 @@ mod tests {
         // A small entry after the oversized one must still work (buffer left
         // in a clean, reusable state — write_position back at 0).
         let small_lsn = lm
-            .log(LogEntryType::Trace, b"after-big", Provisional::No, false, false)
+            .log(
+                LogEntryType::Trace,
+                b"after-big",
+                Provisional::No,
+                false,
+                false,
+            )
             .expect("small log after oversized must succeed");
 
         assert_eq!(lm.get_stats().n_temp_buffer_writes, 1);
@@ -2083,7 +2085,13 @@ mod tests {
         let lsn = {
             let lm = LogManager::new(Arc::clone(&fm), 3, 1024 * 1024, 4096);
             let lsn = lm
-                .log(LogEntryType::Trace, payload, Provisional::No, false, false)
+                .log(
+                    LogEntryType::Trace,
+                    payload,
+                    Provisional::No,
+                    false,
+                    false,
+                )
                 .expect("log");
             lm.flush_sync().expect("flush_sync");
             lsn

@@ -1027,8 +1027,7 @@ impl CursorImpl {
                     let final_data = match final_data {
                         Some(d) => Some(d),
                         None if slot_lsn != 0 => {
-                            let fetched =
-                                self.fetch_ln_data_from_log(slot_lsn);
+                            let fetched = self.fetch_ln_data_from_log(slot_lsn);
                             if let Some(d) = &fetched {
                                 let db = self.db_impl.read();
                                 if let Some(tree) = db.get_real_tree() {
@@ -1102,8 +1101,7 @@ impl CursorImpl {
                     let final_data = match final_data {
                         Some(d) => Some(d),
                         None if slot_lsn != 0 => {
-                            let fetched =
-                                self.fetch_ln_data_from_log(slot_lsn);
+                            let fetched = self.fetch_ln_data_from_log(slot_lsn);
                             if let Some(d) = &fetched {
                                 let db = self.db_impl.read();
                                 if let Some(tree) = db.get_real_tree() {

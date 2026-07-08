@@ -24,7 +24,9 @@ use noxu_sync::futex::{futex_wait, futex_wake};
 use noxu_sync::lock_api::RawMutex as RawMutexTrait;
 use noxu_util::lsn::{Lsn, NULL_LSN};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{
+    AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+};
 use std::time::Duration;
 
 /// A write buffer backed by `BytesMut`.
@@ -243,12 +245,7 @@ impl LogBuffer {
     pub fn register_lsn(&self, lsn: Lsn) {
         let last = Lsn::from_u64(self.last_lsn.load(Ordering::Relaxed));
         if !last.is_null() {
-            assert!(
-                lsn > last,
-                "lsn={:?} must be > last_lsn={:?}",
-                lsn,
-                last
-            );
+            assert!(lsn > last, "lsn={:?} must be > last_lsn={:?}", lsn, last);
         }
 
         self.last_lsn.store(lsn.as_u64(), Ordering::Relaxed);
