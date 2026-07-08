@@ -84,7 +84,7 @@
 //! reads, dissolving the per-committer futex park/wake convoy (Aether
 //! consolidation).
 
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use noxu_util::dst_sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 /// A committer's request slot, allocated on the committer's stack and linked
 /// into the intrusive combining stack by raw pointer.

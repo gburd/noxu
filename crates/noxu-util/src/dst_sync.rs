@@ -50,7 +50,8 @@ mod imp {
     pub use std::thread;
     pub mod atomic {
         pub use std::sync::atomic::{
-            AtomicBool, AtomicI32, AtomicI64, AtomicU64, AtomicUsize, Ordering,
+            AtomicBool, AtomicI32, AtomicI64, AtomicPtr, AtomicU64,
+            AtomicUsize, Ordering,
         };
     }
 }
@@ -67,7 +68,8 @@ mod imp {
     pub use shuttle::thread;
     pub mod atomic {
         pub use shuttle::sync::atomic::{
-            AtomicBool, AtomicI32, AtomicI64, AtomicU64, AtomicUsize, Ordering,
+            AtomicBool, AtomicI32, AtomicI64, AtomicPtr, AtomicU64,
+            AtomicUsize, Ordering,
         };
     }
 }
