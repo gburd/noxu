@@ -80,6 +80,7 @@
   - [Power-Loss Testing](operations/power-loss.md)
   - [Numerical Baseline](operations/numerical-baseline.md)
   - [Performance Benchmarks](operations/benchmarks.md)
+  - ["Where Noxu Leads" Benchmarks](operations/lead-benchmarks.md)
   - [Known Limitations](operations/known-limitations.md)
 
 ---
