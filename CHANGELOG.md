@@ -215,6 +215,11 @@ listed in [References](#references).
 
 ### Changed
 
+- Ported the property-based tests of `noxu-bind`, `noxu-config`, and
+  `noxu-latch` from `proptest` to `hegeltest` (Hegel 0.25); each crate now
+  depends on `hegeltest` instead of `proptest` in `[dev-dependencies]`. The
+  ported tests preserve every property, range, and invariant unchanged.
+
 - The `LOG_CHECKSUM_READ` configuration parameter is now honored on the log
   read path. Previously the parameter and its `EnvironmentConfig` field existed
   but were never consulted — `read_entry_from_disk` always recomputed the CRC32

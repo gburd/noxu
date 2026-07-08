@@ -54,4 +54,5 @@ docs/book/
 benches/profiles/**/*.perf.data
 CHANGELOG.md.tmp
 __pycache__/
+/.hegel/
 /migrate_api.py

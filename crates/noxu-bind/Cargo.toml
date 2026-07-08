@@ -23,7 +23,7 @@ workspace = true
 
 [dev-dependencies]
 criterion = { workspace = true }
-proptest = { workspace = true }
+hegeltest = { workspace = true }
 
 [[bench]]
 name = "bind_bench"
