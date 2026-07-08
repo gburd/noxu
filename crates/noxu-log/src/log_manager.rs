@@ -231,15 +231,39 @@ impl LogManager {
         self.checksum_on_read = enabled;
     }
 
-    /// Reconfigures the group-commit parameters.
+    /// Reconfigures the group-commit parameters (single-leader).
     ///
     /// Can be called after construction (e.g. from `EnvironmentImpl::open()`
     /// after applying `EnvironmentConfig`).
     ///
     /// - `threshold`   : min concurrent waiters before leader fsyncs immediately (0 = disabled)
     /// - `interval_ms` : max ms the leader waits for more waiters (0 = disabled)
+    ///
+    /// Equivalent to [`LogManager::set_group_commit_pipelined`] with
+    /// `max_leaders = 1`.
     pub fn set_group_commit(&mut self, threshold: usize, interval_ms: u64) {
-        self.fsync_manager = FsyncManager::new(threshold, interval_ms);
+        self.set_group_commit_pipelined(threshold, interval_ms, 1);
+    }
+
+    /// Reconfigures the group-commit parameters with a bounded fsync pipeline.
+    ///
+    /// `max_leaders` is the maximum number of concurrent leaders (concurrent
+    /// `fdatasync`s in flight) — the bounded fsync pipeline depth.  `1` (the
+    /// default) is the historical single-leader group commit; `> 1` lets that
+    /// many `fdatasync`s overlap on the log file, trading a slightly higher
+    /// tail for throughput on devices that sustain concurrent same-file syncs.
+    /// Durability is preserved because the drain (pwrite to the page cache)
+    /// stays serialized under the log-write latch in LSN order and the durable
+    /// watermark advances by CAS-max after each completed fdatasync (see
+    /// [`LogManager::flush_sync`]).
+    pub fn set_group_commit_pipelined(
+        &mut self,
+        threshold: usize,
+        interval_ms: u64,
+        max_leaders: usize,
+    ) {
+        self.fsync_manager =
+            FsyncManager::with_pipeline(threshold, interval_ms, max_leaders);
     }
 
     /// Installs the utilization tracking observer.
@@ -776,37 +800,81 @@ impl LogManager {
         // the post-drain `eol` so the caller can advance the watermarks.
         let leader_work = || -> std::io::Result<u64> {
             // Phase A (JE flushBeforeSync): under LWL — snapshot dirty buffer
-            // ranges and advance flushed_len watermarks.  The watermark advance
-            // is the only operation that MUST be serialised; it prevents two
-            // drains from writing the same bytes twice.  Because the
-            // leader/waiter decision already serialised us, at most one drain
-            // runs at a time here (matching JE: flushBeforeSync runs inside
-            // doWork, after the mgrMutex decision).
+            // ranges, advance each buffer's flushed_len watermark, FORCE-pwrite
+            // each range to the OS page cache, THEN capture `eol`.
+            //
+            // DURABILITY-CRITICAL ORDERING (bounded fsync pipeline, N leaders):
+            // the pwrites happen UNDER the LWL and BEFORE `eol` is captured.
+            // The LWL serializes leaders, so the drain (and its pwrites) run in
+            // strict LSN order and at most one at a time; only the fdatasync
+            // (Phase B) overlaps across leaders.  This is what keeps the
+            // durable watermark a single monotonic value under N concurrent
+            // fdatasyncs:
+            //
+            //   * A leader that captures `eol_X` does so only after every byte
+            //     below `eol_X` (its own cohort AND every earlier leader's) has
+            //     been pwritten to the page cache under the LWL — the pin-count
+            //     barrier in fill_flush_pending waits for every in-flight
+            //     `segment.put` first, so no byte < eol_X is missing.
+            //   * fdatasync is global/idempotent: it flushes ALL dirty
+            //     page-cache pages for the fd.  So this leader's Phase-B
+            //     fdatasync (issued after the LWL is released, hence after all
+            //     bytes < eol_X are in the page cache) makes every byte below
+            //     eol_X durable — regardless of which cohort wrote it.
+            //   * Therefore advancing `last_synced_lsn` to `eol_X` after THIS
+            //     leader's fdatasync completes is sound: any offset below the
+            //     published watermark was pwritten (page cache) by some leader
+            //     BEFORE this leader's completed fdatasync covered it.
+            //
+            // The single-leader design (max_leaders == 1) pwrote OUTSIDE the
+            // LWL; that was safe only because one leader ran at a time.  With
+            // N concurrent fdatasyncs an out-of-LWL pwrite would let a
+            // higher-eol leader B fdatasync + publish eol_B before a lower-eol
+            // leader A finished pwriting [.., eol_A), so B's fdatasync could
+            // not have covered A's not-yet-pwritten bytes — yet eol_B > eol_A
+            // would be published as durable.  Pwriting under the LWL before the
+            // eol capture closes that hole while keeping the pwrite cheap
+            // (memcpy to the page cache; the expensive fdatasync stays
+            // concurrent).
+            //
             // R-1: flush_pending Vec reused across calls (clear keeps capacity).
-            let (pending_snapshot, eol) = {
+            let eol = {
                 let mut guard = self.log_write_latch.lock();
                 guard.flush_pending.clear();
                 Self::fill_flush_pending(
                     &self.buffer_pool,
                     &mut guard.flush_pending,
                 );
-                let eol = self.file_manager.get_next_available_lsn();
-                (std::mem::take(&mut guard.flush_pending), eol)
+                // Pwrite each dirty range to the page cache while still holding
+                // the LWL, so the `eol` captured next names only bytes that are
+                // already in the page cache (LSN-ordered, at most one drain at
+                // a time).
+                let pending = std::mem::take(&mut guard.flush_pending);
+                for (data, file_num, offset) in &pending {
+                    self.file_manager
+                        .write_buffer_to_file(*file_num, data, *offset)
+                        .map_err(|e| std::io::Error::other(e.to_string()))?;
+                }
+                // Return the Vec (with capacity) to the guard for reuse.
+                guard.flush_pending = pending;
+                guard.flush_pending.clear();
+                self.file_manager.get_next_available_lsn()
             };
-            // LWL released before I/O (Noxu invariant preserved).
+            // LWL released before the fdatasync (Noxu invariant preserved).
+            // The fdatasync below runs concurrently across up to max_leaders
+            // leaders; only the cheap page-cache pwrite above was serialized.
 
-            // Phase A (cont.): outside LWL — pwrite64 for each dirty range.
-            for (data, file_num, offset) in &pending_snapshot {
-                self.file_manager
-                    .write_buffer_to_file(*file_num, data, *offset)
-                    .map_err(|e| std::io::Error::other(e.to_string()))?;
-            }
             // last_flush_lsn is the page-cache watermark; advancing it here (in
-            // the leader, after the pwrites land in the page cache) is correct.
-            self.last_flush_lsn.store(eol.as_u64(), Ordering::Release);
+            // the leader, after the pwrites landed in the page cache under the
+            // LWL) is correct.  Use a CAS-max, not a plain store: with N
+            // concurrent leaders a lower-eol leader must never regress the
+            // page-cache watermark a higher-eol leader already published.
+            Self::advance_watermark_max(&self.last_flush_lsn, eol.as_u64());
 
-            // Phase B (JE executeFSync → syncLogEnd): the single fdatasync that
-            // covers every committer whose bytes were in the drained buffer.
+            // Phase B (JE executeFSync → syncLogEnd): the fdatasync that covers
+            // every byte below `eol` (all pwritten to the page cache before the
+            // LWL was released above).  Up to max_leaders of these run
+            // concurrently (sync_log_end does not hold the file write latch).
             self.file_manager
                 .sync_log_end()
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -818,13 +886,26 @@ impl LogManager {
         match self.fsync_manager.flush_and_sync(leader_work) {
             Ok(eol) => {
                 // Durability watermark: advanced ONLY after a successful
-                // fdatasync, ONLY by the leader (inside flush_and_sync).
-                // `flush_sync_if_needed` keys its skip decision off this.  A
-                // waiter sees the leader's stored value (Release/Acquire) and
-                // returns it (see flush_and_sync), so the waiter's subsequent
-                // flush_sync_if_needed observes last_synced_lsn >= its lsn.
-                self.last_synced_lsn.store(eol.as_u64(), Ordering::Release);
-                Ok(eol)
+                // fdatasync.  With the bounded pipeline (max_leaders > 1) up to
+                // N fdatasyncs complete concurrently, possibly out of eol order,
+                // so use a CAS-max instead of a plain store — a lower-eol
+                // leader's completion must never regress the durable watermark
+                // a higher-eol leader already published.  The advance is sound
+                // because every byte below `eol` was pwritten to the page cache
+                // (under the LWL, in LSN order) before this leader's fdatasync,
+                // and fdatasync flushes ALL of the fd's dirty pages (see the
+                // leader_work durability comment above).
+                // `flush_sync_if_needed` keys its skip decision off this; a
+                // piggybacking waiter returns the leader's stored eol so its
+                // subsequent flush_sync_if_needed observes last_synced_lsn >=
+                // its lsn.
+                Self::advance_watermark_max(
+                    &self.last_synced_lsn,
+                    eol.as_u64(),
+                );
+                Ok(Lsn::from_u64(
+                    self.last_synced_lsn.load(Ordering::Acquire),
+                ))
             }
             Err(e) => {
                 // C-2 (the 2026 review F-3.2 / F-8.4 / F-9.4): any I/O error
@@ -927,6 +1008,31 @@ impl LogManager {
         }
         self.last_flush_lsn.store(eol.as_u64(), Ordering::Release);
         Ok(eol)
+    }
+
+    /// Monotonically advance an LSN watermark to `max(current, value)` via a
+    /// CAS loop (never regresses).
+    ///
+    /// Used for `last_flush_lsn` and `last_synced_lsn` on the bounded fsync
+    /// pipeline: with `max_leaders > 1`, several leaders complete their
+    /// fdatasync concurrently and may publish out of `eol` order, so a plain
+    /// store could roll the watermark backwards.  The CAS-max keeps the durable
+    /// point a single monotonic value — the crux of the pipeline's durability
+    /// invariant.  With `max_leaders == 1` at most one leader publishes at a
+    /// time, so this degenerates to a single store.
+    fn advance_watermark_max(cell: &AtomicU64, value: u64) {
+        let mut cur = cell.load(Ordering::Relaxed);
+        while cur < value {
+            match cell.compare_exchange_weak(
+                cur,
+                value,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => cur = observed,
+            }
+        }
     }
 
     /// Collects each dirty write buffer's pending bytes into `pending`.

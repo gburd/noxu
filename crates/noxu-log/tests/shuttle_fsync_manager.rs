@@ -99,6 +99,7 @@ fn fsync_coalescing_and_coverage_hold() {
             let mgr = Arc::new(FsyncManager::with_clock(
                 0,
                 0,
+                1,
                 Arc::clone(&sim) as Arc<dyn noxu_util::Clock>,
             ));
             let next_lsn = Arc::new(AtomicU64::new(1));
@@ -178,6 +179,7 @@ fn fsync_failure_fails_all_waiters() {
             let mgr = Arc::new(FsyncManager::with_clock(
                 0,
                 0,
+                1,
                 Arc::clone(&sim) as Arc<dyn noxu_util::Clock>,
             ));
             let attempts = Arc::new(AtomicUsize::new(0));
@@ -252,6 +254,7 @@ fn group_commit_wait_holds_under_sim_clock() {
             let mgr = Arc::new(FsyncManager::with_clock(
                 2,
                 5,
+                1,
                 Arc::clone(&sim) as Arc<dyn noxu_util::Clock>,
             ));
             let next_lsn = Arc::new(AtomicU64::new(1));
@@ -314,6 +317,158 @@ fn group_commit_wait_holds_under_sim_clock() {
             assert!(
                 final_flushed >= highest,
                 "final durable watermark {final_flushed} < highest commit \
+                 LSN {highest}: a committed write was left unsynced"
+            );
+        },
+        ITERATIONS,
+    );
+}
+
+/// BOUNDED FSYNC PIPELINE: with `max_leaders > 1`, up to N leaders run their
+/// `do_work` (drain + fdatasync) concurrently, yet the durable watermark must
+/// stay a single monotonic value — every byte below any published watermark is
+/// in the page cache before that leader's fdatasync.
+///
+/// This models the real design's ordering: the DRAIN (advance the page-cache
+/// EOF and capture this leader's `eol`) runs under a mutex that stands in for
+/// the log-write latch, so drains are LSN-ordered and never overlap; only the
+/// fdatasync half overlaps.  The oracle checks, at every watermark advance,
+/// that the page cache already covers the value being published (the
+/// monotonic-watermark invariant), plus the usual coalescing / coverage /
+/// no-regression oracles — under every interleaving shuttle explores.
+#[test]
+fn bounded_pipeline_monotonic_watermark_holds() {
+    shuttle::check_random(
+        || {
+            const N: usize = 4;
+            const MAX_LEADERS: usize = 3;
+            let sim = Arc::new(SimClock::new(0));
+            install_sim_clock(Arc::clone(&sim));
+            let mgr = Arc::new(FsyncManager::with_clock(
+                0,
+                0,
+                MAX_LEADERS,
+                Arc::clone(&sim) as Arc<dyn noxu_util::Clock>,
+            ));
+            // Stands in for the log-write latch: serializes the DRAIN so
+            // pwrites (page-cache EOF advance) happen in LSN order, one at a
+            // time.  Only the fdatasync overlaps across leaders.
+            let lwl = Arc::new(shuttle::sync::Mutex::new(()));
+            // Highest LSN that has been ASSIGNED (JE next_available_lsn): a
+            // leader captures this as its `eol` under the LWL.  Crucially this
+            // can name bytes from OTHER committers whose pwrite has not yet
+            // happened — the exact condition the durability hole rides on.
+            let assigned_eof = Arc::new(AtomicU64::new(0));
+            let next_lsn = Arc::new(AtomicU64::new(1));
+            // Highest byte-EOF that some drain has pwritten to the page cache.
+            let page_cache_eof = Arc::new(AtomicU64::new(0));
+            // The single durable watermark (last_synced_lsn), CAS-max advanced.
+            let last_synced = Arc::new(AtomicU64::new(0));
+            let fsync_execs = Arc::new(AtomicUsize::new(0));
+
+            let handles: Vec<_> = (0..N)
+                .map(|_| {
+                    let mgr = Arc::clone(&mgr);
+                    let lwl = Arc::clone(&lwl);
+                    let next_lsn = Arc::clone(&next_lsn);
+                    let assigned_eof = Arc::clone(&assigned_eof);
+                    let page_cache_eof = Arc::clone(&page_cache_eof);
+                    let last_synced = Arc::clone(&last_synced);
+                    let fsync_execs = Arc::clone(&fsync_execs);
+                    shuttle::thread::spawn(move || {
+                        let my_lsn = next_lsn.fetch_add(1, Ordering::SeqCst);
+                        // Assign our LSN (advances next_available_lsn); our
+                        // bytes are NOT yet in the page cache.
+                        bump_max(&assigned_eof, my_lsn);
+
+                        let lwl2 = Arc::clone(&lwl);
+                        let pce2 = Arc::clone(&page_cache_eof);
+                        let aeof2 = Arc::clone(&assigned_eof);
+                        let execs2 = Arc::clone(&fsync_execs);
+                        let eol = mgr
+                            .flush_and_sync(move || {
+                                // DRAIN under the LWL: pwrite EVERY assigned
+                                // byte that is not yet in the page cache (the
+                                // real fill_flush_pending drains ALL dirty
+                                // buffers, not just this committer's), advancing
+                                // page_cache_eof up to the assigned EOF in LSN
+                                // order, THEN capture eol = assigned EOF.
+                                // Draining ALL unflushed bytes under the LWL is
+                                // what makes publishing `my_eol` sound even
+                                // though my_eol covers OTHER committers' LSNs:
+                                // this leader pwrites their bytes too before it
+                                // captures (and later publishes) their eol.  A
+                                // broken variant that pwrote only its OWN bytes
+                                // (or pwrote after releasing the LWL) would let
+                                // this leader publish an eol covering a sibling
+                                // whose bytes are not yet in the page cache.
+                                let my_eol = {
+                                    let _g = lwl2.lock().unwrap();
+                                    let eol = aeof2.load(Ordering::SeqCst);
+                                    // pwrite everything up to eol (all cohorts).
+                                    bump_max(&pce2, eol);
+                                    eol
+                                };
+                                // LWL released; the "fdatasync" runs
+                                // concurrently with other leaders' drains.
+                                // THE MONOTONIC-WATERMARK ORACLE, checked at
+                                // fdatasync time: an fdatasync makes durable
+                                // exactly what is in the page cache when it
+                                // runs.  For publishing `my_eol` to be sound,
+                                // the page cache must ALREADY cover my_eol at
+                                // this point (it does, because the pwrite above
+                                // ran under the LWL before this leader could
+                                // reach here).  Sampling page_cache_eof here —
+                                // possibly interleaved with other leaders' drains
+                                // by shuttle — and asserting it covers my_eol is
+                                // the strongest form of the invariant: if the
+                                // pwrite were moved outside the LWL, another
+                                // leader could capture (and be about to publish)
+                                // a higher eol whose bytes this leader has not
+                                // yet pwritten, and some interleaving would
+                                // sample page_cache_eof < that eol here.
+                                assert!(
+                                    pce2.load(Ordering::SeqCst) >= my_eol,
+                                    "monotonic-watermark violated at fdatasync: \
+                                     publishing durable {my_eol} but page cache \
+                                     only covers {}",
+                                    pce2.load(Ordering::SeqCst)
+                                );
+                                execs2.fetch_add(1, Ordering::SeqCst);
+                                Ok(my_eol)
+                            })
+                            .expect("no fault injected: fsync must succeed");
+
+                        // Caller advances the single durable watermark by
+                        // CAS-max after the successful fdatasync.
+                        let published = eol.as_u64();
+                        let old = last_synced.load(Ordering::SeqCst);
+                        bump_max(&last_synced, published);
+                        let newv = last_synced.load(Ordering::SeqCst);
+                        // FsyncedNeverDecreases across our advance.
+                        assert_fsynced_never_decreases(old, newv.max(old));
+
+                        // DurableImpliesLogged: our own commit is durable.
+                        assert_durable_covers_commit(newv, my_lsn);
+                    })
+                })
+                .collect();
+
+            for h in handles {
+                h.join().unwrap();
+            }
+
+            let execs = fsync_execs.load(Ordering::SeqCst);
+            assert!(
+                (1..=N).contains(&execs),
+                "fsync executions {execs} out of range 1..={N}: a redundant \
+                 (double) fsync or a missing one indicates a coalescing bug"
+            );
+            let final_synced = last_synced.load(Ordering::SeqCst);
+            let highest = next_lsn.load(Ordering::SeqCst) - 1;
+            assert!(
+                final_synced >= highest,
+                "final durable watermark {final_synced} < highest commit \
                  LSN {highest}: a committed write was left unsynced"
             );
         },

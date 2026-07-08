@@ -574,6 +574,25 @@ pub static LOG_GROUP_COMMIT_THRESHOLD: ConfigParam = ConfigParam::int_param(
     false,   // forReplication
 );
 
+/// Maximum number of concurrent `fdatasync`s in flight — the bounded fsync
+/// pipeline depth.  Default `1` = the historical single-leader group commit
+/// (one `fdatasync` at a time; flat tail latency, throughput capped at the
+/// single-file fsync latency).  Values `> 1` let that many `fdatasync`s overlap
+/// on the log file, closing much of the write-throughput gap on devices that
+/// sustain concurrent same-file syncs (typical NVMe does ~10k/s) at the cost of
+/// a slightly higher tail.  The drain (pwrite to the page cache) stays
+/// serialized in LSN order regardless of this value, and the durable watermark
+/// stays a single monotonic point, so durability is identical at any depth.
+/// Conservative default `1` — opt in to `2`/`4`/`8` for write-heavy workloads.
+pub static LOG_FSYNC_MAX_LEADERS: ConfigParam = ConfigParam::int_param(
+    "noxu.log.fsyncMaxLeaders",
+    Some(1),  // min (0 clamps to 1 anyway; expose 1 as the floor)
+    Some(64), // max (a sane upper bound; well past any device's useful depth)
+    1,        // default: single-leader, no behavior change
+    false,    // mutable
+    false,    // forReplication
+);
+
 /// Interval for periodic log flush with sync durability.
 pub static LOG_FLUSH_SYNC_INTERVAL: ConfigParam = ConfigParam {
     name: "noxu.log.flushSyncInterval",
@@ -1785,6 +1804,7 @@ pub fn all_params() -> Vec<&'static ConfigParam> {
         &LOG_FSYNC_TIME_LIMIT,
         &LOG_GROUP_COMMIT_INTERVAL,
         &LOG_GROUP_COMMIT_THRESHOLD,
+        &LOG_FSYNC_MAX_LEADERS,
         &LOG_FLUSH_SYNC_INTERVAL,
         &LOG_FLUSH_NO_SYNC_INTERVAL,
         &LOG_USE_ODSYNC,

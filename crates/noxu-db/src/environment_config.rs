@@ -331,6 +331,15 @@ pub struct EnvironmentConfig {
     /// Mirrors `LOG_GROUP_COMMIT_INTERVAL` / default 0.
     pub log_group_commit_interval_ms: u64,
 
+    /// Bounded fsync pipeline depth — the maximum number of concurrent
+    /// `fdatasync`s in flight on the log file.  `1` (default) = the
+    /// single-leader group commit (flat tail latency); `> 1` overlaps that
+    /// many `fdatasync`s to raise write throughput on devices that sustain
+    /// concurrent same-file syncs, at a slightly higher tail.  Durability is
+    /// identical at any depth (the drain stays LSN-ordered; the durable
+    /// watermark stays monotonic).  Mirrors `LOG_FSYNC_MAX_LEADERS` / default 1.
+    pub log_fsync_max_leaders: usize,
+
     // -----------------------------------------------------------------------
     // B-tree
     // -----------------------------------------------------------------------
@@ -809,6 +818,7 @@ impl EnvironmentConfig {
             log_write_queue_size: 1024 * 1024,
             log_group_commit_threshold: 0,
             log_group_commit_interval_ms: 0,
+            log_fsync_max_leaders: 1,
             // B-tree
             node_max_entries: 128,
             node_dup_tree_max_entries: 128,
@@ -1215,6 +1225,13 @@ impl EnvironmentConfig {
     }
     pub fn set_log_group_commit_interval_ms(&mut self, ms: u64) -> &mut Self {
         self.log_group_commit_interval_ms = ms;
+        self
+    }
+    /// Set the bounded fsync pipeline depth (max concurrent `fdatasync`s).
+    /// `1` = single-leader (default); `2`/`4`/`8` trade a slightly higher tail
+    /// for write throughput.  Clamped to `>= 1` by the `FsyncManager`.
+    pub fn set_log_fsync_max_leaders(&mut self, n: usize) -> &mut Self {
+        self.log_fsync_max_leaders = n;
         self
     }
     pub fn with_log_group_commit(
