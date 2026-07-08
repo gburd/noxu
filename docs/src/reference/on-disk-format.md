@@ -119,3 +119,43 @@ hex equivalent is shown for readability.
 > **Not binary compatible with other database formats.**
 > Noxu uses different serialization and different type codes;
 > `.ndb` files are not readable by any other database engine.
+
+## `CkptEnd` Body
+
+The `CkptEnd` (type `0x29`) body records the metadata recovery needs to
+rebuild from a checkpoint. Its fixed leading fields are (all big-endian):
+
+| Field | Bytes | Notes |
+|---|---|---|
+| checkpoint id | 8 (u64) | matches the `CkptStart` |
+| invoker len + string | 2 + N | UTF-8 invoker tag |
+| checkpoint start LSN | 8 | |
+| flags | 1 | bit 0 = has mapping-tree root LSN; bit 1 = cleaned-files-to-delete |
+| root LSN | 8 (if flag set) | mapping-tree root (always absent in Noxu — the catalog is an in-memory map, not an on-disk mapping tree) |
+| first active LSN | 8 | |
+| last-{local,replicated}-{node,db,txn} ids | 8 × 6 | ID sequence maxima |
+| timestamp | 8 + 4 | seconds (i64) + nanos (u32) |
+
+### v2 per-database roots trailer (optional)
+
+After the timestamp, a checkpoint MAY append a **per-database tree-roots
+trailer**. It is written only when at least one open user database has a
+materialisable tree root, so a checkpoint with no seedable roots is
+**byte-identical to the pre-v2 `CkptEnd`** (full backward compatibility):
+
+| Field | Bytes | Notes |
+|---|---|---|
+| marker | 1 | `0x01` introduces the trailer; absent in a v1 entry |
+| count | 4 (u32) | number of `(db_id, root_lsn)` pairs |
+| pairs | 16 × count | each: db_id (u64) + tree root LSN (u64) |
+
+Each `root_lsn` is the LSN the database's tree root IN/BIN was last logged at
+as of this checkpoint. Recovery seeds each reconstructed tree from it and
+lazily fetches pre-checkpoint BINs on demand instead of replaying every
+pre-checkpoint LN (see [Recovery Protocol](recovery.md)).
+
+**Reading rule:** a reader that finds no trailing marker byte (an old v1
+entry) yields an empty per-DB-roots set; recovery then seeds no tree and
+falls back to full LN redo. Any malformed/truncated trailer degrades to the
+same empty set — a valid checkpoint is never rejected because of a torn
+trailer.

@@ -15,6 +15,43 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Fixed
+
+- **DATA-LOSS hazard: a checkpointed database could recover incompletely once
+  the pre-checkpoint LN-redo skip gate was enabled.** Recovery rebuilt each
+  B-tree from an empty tree and reconstructed it purely from post-checkpoint
+  LN redo; it had no lazy pre-checkpoint BIN fetch, and `CheckpointEnd`
+  recorded no per-database tree roots. A committed record whose LN **and**
+  whose covering BIN were both last logged before the last checkpoint was
+  therefore materialised by neither IN-redo nor a (gated) LN-redo — so
+  enabling the `AfterCheckpointStart` redo-skip optimisation silently dropped
+  every such record (empirically 0/550 recovered). Recovery now:
+  1. records each open user database's checkpointed tree root LSN in a new
+     **optional `CheckpointEnd` v2 trailer** (`per_db_roots`);
+  2. seeds each reconstructed tree from that root before redo
+     (`Tree::set_root_lsn`) and lazily fetches pre-checkpoint BINs on descent
+     (the reference `fetchTarget`-in-recovery path), following the full
+     BIN-delta chain and merging by key; then
+  3. enables the `AfterCheckpointStart` gate **only** for a database that was
+     seeded from a checkpointed root — an unseeded database (no checkpoint, a
+     crash with no durable `CheckpointEnd`, or an old-format checkpoint with
+     no per-DB roots) keeps the safe full-redo behaviour.
+
+  This also turns the redo-on-open cost from O(records) LN replays into
+  O(nodes) lazy fetches: a checkpointed database now reopens by fetching only
+  the BINs it touches instead of replaying the whole post-checkpoint log
+  (the observed multi-minute reopen on large databases collapses to seconds).
+  `Environment::recovery_redo_counts()` exposes `(lns_redone, lns_gated)` so
+  callers can confirm recovery used lazy fetch rather than full redo.
+
+  **On-disk compatibility:** the `per_db_roots` trailer is written only when
+  non-empty, so a checkpoint with no seedable roots is byte-identical to the
+  previous (v1) `CheckpointEnd` format. A database checkpointed by an older
+  build (no per-DB roots) still recovers correctly via full LN redo — the
+  trailer is absent, no tree is seeded, and the redo gate stays inactive.
+  See `docs/src/reference/on-disk-format.md` and
+  `docs/src/reference/recovery.md`.
+
 ### Added
 
 - **Per-transaction `no_wait` / short lock-timeout mode** for hot-contention
