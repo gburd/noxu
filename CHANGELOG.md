@@ -20,6 +20,14 @@ listed in [References](#references).
 - Ported the property-based tests for `noxu-log`, `noxu-recovery`, and
   `noxu-cleaner` from proptest to Hegel (`hegeltest` 0.25); dropped the
   `proptest` dev-dependency from all three crates (no other code used it).
+- **Property tests ported from `proptest` to Hegel (hegeltest 0.25).**
+  Ported `noxu-dbi`, `noxu-rep`, and `noxu-db` property-based tests;
+  `proptest` dropped from those crates' dev-dependencies (no remaining
+  users). In the mixed `noxu-db` test files (`cursor_test.rs`,
+  `sorted_dup_test.rs`, `txn_wiring_test.rs`) only the `proptest!` blocks
+  were converted; the deterministic `#[test]`s are unchanged. The
+  hand-rolled multi-step transaction-visibility model test was ported to
+  the imperative draw-a-vec-of-ops `#[hegel::test]` form.
 
 ### Fixed
 

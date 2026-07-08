@@ -915,87 +915,89 @@ fn cursor_search_gte_oracle_brute_force_small_random() {
 //
 // Modelled on `cursor_search_gte_oracle_brute_force_small_random`: a
 // `BTreeSet<Vec<u8>>` is the oracle, ~256 keys per case is enough to span
-// multiple BINs, and proptest's shrinker minimises any failing key set.
+// multiple BINs, and Hegel's shrinker minimises any failing key set.
 
 mod prop_full_scan_order {
     use super::*;
-    use proptest::prelude::*;
+    use hegel::generators;
+    use std::collections::BTreeSet;
 
-    proptest! {
-        // 64 cases is plenty: each case inserts up to 256 records into a
-        // fresh env, which dominates the runtime; the shrinker still
-        // produces a small counterexample on failure.
-        #![proptest_config(ProptestConfig {
-            cases: 64,
-            .. ProptestConfig::default()
-        })]
+    // 64 cases is plenty: each case inserts up to 256 records into a
+    // fresh env, which dominates the runtime; the shrinker still
+    // produces a small counterexample on failure.
+    #[hegel::test(test_cases = 64)]
+    fn cursor_full_scan_order_oracle_brute_force_small_random(
+        tc: hegel::TestCase,
+    ) {
+        let key_vec: Vec<Vec<u8>> = tc.draw(
+            generators::vecs(
+                generators::binary().min_size(1).max_size(16),
+            )
+            .min_size(1)
+            .max_size(256)
+            .unique(true),
+        );
+        let keys: BTreeSet<Vec<u8>> = key_vec.into_iter().collect();
+        let dir = TempDir::new().unwrap();
+        let (_env, db) = open_env_and_db_named(&dir, "prop_full_scan");
 
-        #[test]
-        fn cursor_full_scan_order_oracle_brute_force_small_random(
-            keys in prop::collection::btree_set(
-                prop::collection::vec(any::<u8>(), 1..=16),
-                1..=256,
-            ),
-        ) {
-            let dir = TempDir::new().unwrap();
-            let (_env, db) = open_env_and_db_named(&dir, "prop_full_scan");
-
-            for k in &keys {
-                db.put(
-                    DatabaseEntry::from_bytes(k),
-                    DatabaseEntry::from_bytes(b"v")).unwrap();
-            }
-
-            // Forward scan: Get::First + Get::Next* must be lex-sorted and
-            // identical to the BTreeSet ordering.
-            let mut cursor = db.open_cursor( None).unwrap();
-            let mut got_fwd: Vec<Vec<u8>> = Vec::new();
-            let mut k = DatabaseEntry::new();
-            let mut d = DatabaseEntry::new();
-            let mut s = cursor.get(&mut k, &mut d, Get::First, None).unwrap();
-            while s == OperationStatus::Success {
-                got_fwd.push(k.data().to_vec());
-                s = cursor.get(&mut k, &mut d, Get::Next, None).unwrap();
-                // Cheap forward-progress check: avoid infinite loops if
-                // Next ever stalled on the same key.
-                if got_fwd.len() > keys.len() + 1 {
-                    prop_assert!(
-                        false,
-                        "forward scan returned more entries ({}) than were inserted ({})",
-                        got_fwd.len(), keys.len(),
-                    );
-                }
-            }
-            prop_assert_eq!(s, OperationStatus::NotFound);
-            let expected_fwd: Vec<Vec<u8>> = keys.iter().cloned().collect();
-            prop_assert_eq!(
-                &got_fwd, &expected_fwd,
-                "Get::First+Next did not return keys in lex-sorted order",
-            );
-
-            // Reverse scan: Get::Last + Get::Prev* must yield the reverse
-            // of the same ordering.
-            let mut got_rev: Vec<Vec<u8>> = Vec::new();
-            let mut s = cursor.get(&mut k, &mut d, Get::Last, None).unwrap();
-            while s == OperationStatus::Success {
-                got_rev.push(k.data().to_vec());
-                s = cursor.get(&mut k, &mut d, Get::Prev, None).unwrap();
-                if got_rev.len() > keys.len() + 1 {
-                    prop_assert!(
-                        false,
-                        "reverse scan returned more entries ({}) than were inserted ({})",
-                        got_rev.len(), keys.len(),
-                    );
-                }
-            }
-            prop_assert_eq!(s, OperationStatus::NotFound);
-            let mut expected_rev = expected_fwd;
-            expected_rev.reverse();
-            prop_assert_eq!(
-                &got_rev, &expected_rev,
-                "Get::Last+Prev did not return keys in reverse-lex order",
-            );
+        for k in &keys {
+            db.put(
+                DatabaseEntry::from_bytes(k),
+                DatabaseEntry::from_bytes(b"v"),
+            )
+            .unwrap();
         }
+
+        // Forward scan: Get::First + Get::Next* must be lex-sorted and
+        // identical to the BTreeSet ordering.
+        let mut cursor = db.open_cursor(None).unwrap();
+        let mut got_fwd: Vec<Vec<u8>> = Vec::new();
+        let mut k = DatabaseEntry::new();
+        let mut d = DatabaseEntry::new();
+        let mut s = cursor.get(&mut k, &mut d, Get::First, None).unwrap();
+        while s == OperationStatus::Success {
+            got_fwd.push(k.data().to_vec());
+            s = cursor.get(&mut k, &mut d, Get::Next, None).unwrap();
+            // Cheap forward-progress check: avoid infinite loops if
+            // Next ever stalled on the same key.
+            if got_fwd.len() > keys.len() + 1 {
+                panic!(
+                    "forward scan returned more entries ({}) than were inserted ({})",
+                    got_fwd.len(),
+                    keys.len(),
+                );
+            }
+        }
+        assert_eq!(s, OperationStatus::NotFound);
+        let expected_fwd: Vec<Vec<u8>> = keys.iter().cloned().collect();
+        assert_eq!(
+            got_fwd, expected_fwd,
+            "Get::First+Next did not return keys in lex-sorted order",
+        );
+
+        // Reverse scan: Get::Last + Get::Prev* must yield the reverse
+        // of the same ordering.
+        let mut got_rev: Vec<Vec<u8>> = Vec::new();
+        let mut s = cursor.get(&mut k, &mut d, Get::Last, None).unwrap();
+        while s == OperationStatus::Success {
+            got_rev.push(k.data().to_vec());
+            s = cursor.get(&mut k, &mut d, Get::Prev, None).unwrap();
+            if got_rev.len() > keys.len() + 1 {
+                panic!(
+                    "reverse scan returned more entries ({}) than were inserted ({})",
+                    got_rev.len(),
+                    keys.len(),
+                );
+            }
+        }
+        assert_eq!(s, OperationStatus::NotFound);
+        let mut expected_rev = expected_fwd;
+        expected_rev.reverse();
+        assert_eq!(
+            got_rev, expected_rev,
+            "Get::Last+Prev did not return keys in reverse-lex order",
+        );
     }
 }
 

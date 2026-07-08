@@ -42,7 +42,7 @@ testing = []
 shuttle = { workspace = true }
 
 [dev-dependencies]
-proptest = { workspace = true }
+hegeltest = { workspace = true }
 tempfile = "3"
 
 # DST cursor coverage: shuttle tests in tests/shuttle_*.rs are gated behind
