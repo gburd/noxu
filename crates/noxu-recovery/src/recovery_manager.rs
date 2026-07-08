@@ -1950,9 +1950,13 @@ impl RecoveryManager {
         Ok(result)
     }
 
-    /// Walks `self.redo_entries` and groups every LN whose `txn_id` matches
-    /// one of the in-doubt prepared transactions in `analysis` into a
-    /// `prepared_txn_lns` map keyed by txn_id.
+    /// Streams a targeted forward scan of the log and groups every LN whose
+    /// `txn_id` matches one of the in-doubt prepared transactions in
+    /// `analysis` into a `prepared_txn_lns` map keyed by txn_id.  Runs only
+    /// when at least one transaction is prepared (in-doubt), so the common
+    /// case does no work; when it does run it keeps ONLY prepared-txn LNs,
+    /// the minority special-case subset (the bulk committed LNs are streamed
+    /// and applied by the redo pass, never collected).
     ///
     /// Called from `recover()` / `recover_all()` after the analysis pass
     /// so that `xa_commit(xid)` can replay the prepared txn’s writes
@@ -2197,19 +2201,22 @@ impl RecoveryManager {
         // RedoDirtyNodes() / DirtyINMap.getLowestLevel() loop.
         //
         // `INLogEntry.readEntry()` / `getMainItem()` deserializes the
-        // IN from the log entry body.  We collect dirty-IN entries during
-        // analysis (stored in `self.redo_entries`-analogue, the dirty_in_map)
-        // and replay each BIN into the tree.
+        // IN from the log entry body.  Dirty-IN entries are collected during
+        // analysis into `dirty_ins` (post-checkpoint IN metadata + bytes) and
+        // each BIN is replayed into the tree here.
         //
         // H-6: deserialize IN log entries and re-insert BINs into the tree.
         // We walk the dirty-IN map bottom-up (same ordering as the
         // `processINList()`), then for each entry use `BinStub::deserialize_full`
         // or `BinStub::apply_delta` to reconstruct the node and insert it.
         //
-        // The dirty_in_map records node_id+level metadata.  The actual bytes
-        // come from `self.redo_entries` collected during analysis as `LogEntry::In`.
-        // For simplicity we scan the analysis redo_entries for In records and
-        // apply them to the tree directly (the map ordering is preserved because
+        // The dirty_in_map records node_id+level metadata; the IN bytes come
+        // from `analysis.dirty_ins` collected during the analysis pass as
+        // `LogEntry::In`.  (Unlike LN payloads — which are NOT collected and
+        // are re-read by the streaming redo pass — the dirty INs are a bounded
+        // post-checkpoint set, so keeping them in analysis is cheap.)
+        // We apply each In record to the tree directly (the map ordering is
+        // preserved because
         // analysis scanned forward and the BIN pass is level 0).
         //
         // RecoveryManager.redoDirtyNodes() +
