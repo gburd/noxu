@@ -582,6 +582,7 @@ impl RecoveryManager {
         // ------------------------------------------------------------------
         // Done
         // ------------------------------------------------------------------
+        self.info.lns_redone = self.stats.lns_redone;
         self.set_progress(RecoveryProgress::Complete);
 
         Ok(self.info.clone())
@@ -820,6 +821,7 @@ impl RecoveryManager {
         self.info.rebuilt_file_summaries =
             std::mem::take(&mut analysis.rebuilt_file_summaries);
 
+        self.info.lns_redone = self.stats.lns_redone;
         self.set_progress(RecoveryProgress::Complete);
         Ok(self.info.clone())
     }
@@ -972,6 +974,20 @@ impl RecoveryManager {
                     Self::redo_ln(t, rec, *lsn);
                 }
                 self.stats.lns_redone += 1;
+            } else if ckpt_start != NULL_LSN
+                && *lsn < ckpt_start
+                && self.seeded_db_ids.contains(&rec.db_id)
+                && !rec.is_invisible
+                && !self.rollback_tracker.is_in_rollback_period(*lsn)
+                && rec
+                    .txn_id
+                    .map(|t| analysis.is_committed(t))
+                    .unwrap_or(true)
+            {
+                // A committed / non-transactional pre-checkpoint-start LN of a
+                // seeded database that the redo gate skipped (its record is
+                // covered by the checkpoint-seeded lazy BIN fetch).
+                self.info.lns_gated += 1;
             }
         }
         // R-3: also include TxnCommit-derived VLSNs (recovered XA commits

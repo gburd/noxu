@@ -253,6 +253,15 @@ pub struct EnvironmentImpl {
     /// in-memory VLSN index after crash recovery.
     pub recovery_vlsns: Vec<(u64, u64)>,
 
+    /// REC-P (lazy-fetch observability): the number of committed /
+    /// non-transactional LNs replayed during the last recovery's redo phase,
+    /// and the number the seeded-root redo gate skipped (covered by
+    /// checkpoint-seeded lazy BIN fetch).  Populated from `RecoveryInfo`;
+    /// used by tests to confirm recovery used lazy fetch rather than full LN
+    /// redo.  Both zero for a fresh environment.
+    pub recovery_lns_redone: u64,
+    pub recovery_lns_gated: u64,
+
     /// Minimum rollback matchpoint LSN from recovery (X-1).
     ///
     /// `Some(lsn_u64)` when recovery detected a completed rollback; the
@@ -558,6 +567,9 @@ impl EnvironmentImpl {
         > = HashMap::new();
         // X-14 / X-1: VLSN pairs and rollback matchpoint from recovery.
         let mut recovery_vlsns: Vec<(u64, u64)> = Vec::new();
+        // REC-P: lazy-fetch redo counters (populated from RecoveryInfo below).
+        let mut recovery_lns_redone: u64 = 0;
+        let mut recovery_lns_gated: u64 = 0;
         let mut recovery_rollback_matchpoint: Option<u64> = None;
         // REC-C: id maxima recovered from the log (CheckpointEnd id fields +
         // live scan).  Used to seed the env's sequences so post-restart
@@ -740,6 +752,8 @@ impl EnvironmentImpl {
             rebuilt_file_summaries = recovery_info.rebuilt_file_summaries;
             // X-14 / X-1: stash VLSN rebuild data.
             recovery_vlsns = recovery_info.recovered_vlsns;
+            recovery_lns_redone = recovery_info.lns_redone;
+            recovery_lns_gated = recovery_info.lns_gated;
             recovery_rollback_matchpoint =
                 recovery_info.rollback_matchpoint_lsn;
 
@@ -1616,6 +1630,8 @@ impl EnvironmentImpl {
             recovered_prepared_txns: Mutex::new(recovered_prepared),
             recovered_prepared_lns: Mutex::new(recovered_prepared_lns),
             recovery_vlsns,
+            recovery_lns_redone,
+            recovery_lns_gated,
             recovery_rollback_matchpoint,
             primary_tree,
             db_trees_registry,

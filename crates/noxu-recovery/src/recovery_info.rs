@@ -124,6 +124,20 @@ pub struct RecoveryInfo {
     /// `RecoveryUtilizationTracker.transferToUtilizationTracker` adds the
     /// recovery-counted obsolete deltas.
     pub rebuilt_file_summaries: hashbrown::HashMap<u32, RebuiltFileSummary>,
+
+    /// REC-P (lazy-fetch observability): number of committed / non-transactional
+    /// LNs actually replayed during the redo phase.  With the seeded-root redo
+    /// gate active, pre-checkpoint LNs of a seeded database are skipped (their
+    /// records come from lazily-fetched checkpoint BINs), so this is far
+    /// smaller than the total record count.  Used by tests to prove recovery
+    /// used lazy fetch rather than full LN redo.
+    pub lns_redone: u64,
+
+    /// REC-P: number of pre-checkpoint-start LNs skipped by the
+    /// AfterCheckpointStart redo gate (i.e. covered by the checkpoint-seeded
+    /// lazy BIN fetch instead of being replayed).  Zero when no database was
+    /// seeded (full-redo fallback).
+    pub lns_gated: u64,
 }
 
 /// CLN-4: a per-file utilization summary rebuilt during recovery.
@@ -179,6 +193,8 @@ impl RecoveryInfo {
             recovered_vlsns: Vec::new(),
             rollback_matchpoint_lsn: None,
             rebuilt_file_summaries: hashbrown::HashMap::new(),
+            lns_redone: 0,
+            lns_gated: 0,
         }
     }
 }
