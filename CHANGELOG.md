@@ -15,6 +15,22 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Added
+
+- **Per-transaction `no_wait` / short lock-timeout mode** for hot-contention
+  workloads (`TransactionConfig::with_no_wait(true)` and
+  `TransactionConfig::with_lock_timeout_ms(ms)`). A `no_wait` transaction
+  aborts immediately with `LockNotAvailable` on any lock conflict instead of
+  blocking toward the lock timeout — Noxu's opt-in, lock-based analogue to an
+  immediate write-conflict abort, letting an application trade a higher abort
+  rate for a much lower tail latency on hot keys. This is a per-transaction
+  *mode*, not a default change: the environment-wide default lock timeout
+  stays 500ms (matching the reference default). A regression test
+  (`test_fix3b_no_wait_aborts_immediately_not_after_timeout`) asserts the
+  abort is immediate (well under the 500ms default), not a timed-out wait.
+  See `docs/src/transactions/durability.md` and
+  `docs/src/transactions/transaction-config.md`.
+
 ### Performance
 
 - **Read-path structural de-serialization (Stage A): the stripped-LN refill

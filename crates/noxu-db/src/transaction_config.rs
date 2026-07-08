@@ -24,9 +24,23 @@ pub struct TransactionConfig {
     pub read_only: bool,
 
     /// Don't wait for locks (fail immediately if lock unavailable).
+    ///
+    /// A `no_wait` transaction aborts with `LockNotAvailable` on the first
+    /// lock conflict rather than blocking toward the lock timeout. This is the
+    /// lock-based analogue to an immediate write-conflict abort, chosen per
+    /// transaction for hot-contention workloads to trade a higher abort rate
+    /// for a much lower tail latency. The environment-wide default lock
+    /// timeout is unaffected (it stays 500ms, matching the reference default:
+    /// a per-`Transaction` lock timeout / no-wait mode is a per-transaction
+    /// override of the environment default, not a change to it).
     pub no_wait: bool,
 
     /// Lock timeout in milliseconds (0 = use environment default).
+    ///
+    /// A per-transaction override of the environment-wide lock timeout; a
+    /// small value (e.g. `50`) shortens the wait a contended transaction
+    /// spends queued on a hot key before it aborts and retries, without
+    /// lowering the environment default for every other transaction.
     pub lock_timeout_ms: u64,
 
     /// Transaction timeout in milliseconds (0 = no timeout).

@@ -90,6 +90,13 @@ match db.put_in(&txn, &key, &val) {
 fails instantly on any lock conflict. This is ideal for try-lock patterns where
 you would rather skip an operation than wait.
 
+It is also the lock-based way to cut tail latency on hot-contention workloads:
+instead of a queue of transactions each blocking toward the lock timeout on a
+contended key, a `no_wait` transaction aborts immediately and the application
+retries. This trades a higher abort rate for a much lower p99 latency — an
+opt-in mode, chosen per transaction; the environment-wide default lock timeout
+is unchanged.
+
 ```rust
 let config = TransactionConfig::new().with_no_wait(true);
 let txn = env.begin_transaction(Some(&config))?;
