@@ -22,7 +22,8 @@
 //! If this test ever fails, the runtime stub has drifted from the JE-correct
 //! semantics — fix the STUB to match the oracle.
 
-use proptest::prelude::*;
+use std::collections::HashSet;
+use hegel::generators;
 
 use noxu_tree::tree::BinStub;
 use noxu_util::{Lsn, NULL_LSN};
@@ -188,188 +189,190 @@ fn stub_mark_known_deleted(stub: &mut BinStub, full_key: &[u8]) {
 }
 
 // ===========================================================================
-// Strategies
+// Generators
 // ===========================================================================
 
 /// Generate a set of distinct keys (1..16 bytes each, up to `max` keys),
 /// returned in arbitrary (insert) order.
-fn distinct_keys(max: usize) -> impl Strategy<Value = Vec<Vec<u8>>> {
-    prop::collection::hash_set(
-        prop::collection::vec(any::<u8>(), 1..16),
-        1..=max,
-    )
-    .prop_map(|s| s.into_iter().collect())
+#[hegel::composite]
+fn distinct_keys(tc: hegel::TestCase, max: usize) -> Vec<Vec<u8>> {
+    let set: HashSet<Vec<u8>> = tc.draw(
+        generators::hashsets(generators::binary().min_size(1).max_size(15))
+            .min_size(1)
+            .max_size(max),
+    );
+    set.into_iter().collect()
 }
 
 // ===========================================================================
 // Properties
 // ===========================================================================
 
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
+/// After inserting the same key set, the runtime stub and the oracle must
+/// agree on n_entries, slot ordering (full keys), and per-slot LSN.
+#[hegel::test(test_cases = 256)]
+fn insert_then_layout_agrees(tc: hegel::TestCase) {
+    let keys = tc.draw(distinct_keys(40));
+    let mut stub = empty_stub();
+    let mut oracle = BinOracle::new();
 
-    /// After inserting the same key set, the runtime stub and the oracle must
-    /// agree on n_entries, slot ordering (full keys), and per-slot LSN.
-    #[test]
-    fn insert_then_layout_agrees(keys in distinct_keys(40)) {
-        let max = keys.len() + 8;
-        let mut stub = empty_stub();
-        let mut oracle = BinOracle::new();
-
-        for (i, k) in keys.iter().enumerate() {
-            let lsn = Lsn::from_u64(100 + i as u64);
-            stub.insert_with_prefix(k.clone(), lsn, None);
-            oracle.insert(k.clone(), lsn);
-        }
-        let _ = max;
-
-        prop_assert_eq!(stub.entries.len(), oracle.n_entries(), "n_entries diverged");
-        for i in 0..stub.entries.len() {
-            prop_assert_eq!(
-                &stub.get_full_key(i).unwrap(),
-                oracle.key(i),
-                "slot {} key diverged", i
-            );
-            prop_assert_eq!(
-                stub.get_lsn(i),
-                oracle.lsn(i),
-                "slot {} lsn diverged", i
-            );
-        }
+    for (i, k) in keys.iter().enumerate() {
+        let lsn = Lsn::from_u64(100 + i as u64);
+        stub.insert_with_prefix(k.clone(), lsn, None);
+        oracle.insert(k.clone(), lsn);
     }
 
-    /// `find_entry` must agree for inserted keys AND arbitrary probe keys,
-    /// across all (indicate_duplicate, exact) flag combinations.
-    #[test]
-    fn find_entry_agrees(
-        keys in distinct_keys(40),
-        probes in prop::collection::vec(prop::collection::vec(any::<u8>(), 0..16), 0..20),
-    ) {
-        let mut stub = empty_stub();
-        let mut oracle = BinOracle::new();
-        for (i, k) in keys.iter().enumerate() {
-            let lsn = Lsn::from_u64(100 + i as u64);
-            stub.insert_with_prefix(k.clone(), lsn, None);
-            oracle.insert(k.clone(), lsn);
-        }
+    assert_eq!(stub.entries.len(), oracle.n_entries(), "n_entries diverged");
+    for i in 0..stub.entries.len() {
+        assert_eq!(
+            &stub.get_full_key(i).unwrap(),
+            oracle.key(i),
+            "slot {i} key diverged"
+        );
+        assert_eq!(stub.get_lsn(i), oracle.lsn(i), "slot {i} lsn diverged");
+    }
+}
 
-        for probe in keys.iter().cloned().chain(probes.into_iter()) {
-            for &dup in &[false, true] {
-                for &exact in &[false, true] {
-                    let s = stub_find(&stub, &probe, dup, exact);
-                    let o = oracle.find_entry(&probe, dup, exact);
-                    prop_assert_eq!(
-                        s, o,
-                        "find_entry({:?}, dup={}, exact={}) diverged: stub={} oracle={}",
-                        probe, dup, exact, s, o
-                    );
-                }
+/// `find_entry` must agree for inserted keys AND arbitrary probe keys,
+/// across all (indicate_duplicate, exact) flag combinations.
+#[hegel::test(test_cases = 256)]
+fn find_entry_agrees(tc: hegel::TestCase) {
+    let keys = tc.draw(distinct_keys(40));
+    let probes: Vec<Vec<u8>> = tc.draw(
+        generators::vecs(generators::binary().max_size(15)).max_size(19),
+    );
+    let mut stub = empty_stub();
+    let mut oracle = BinOracle::new();
+    for (i, k) in keys.iter().enumerate() {
+        let lsn = Lsn::from_u64(100 + i as u64);
+        stub.insert_with_prefix(k.clone(), lsn, None);
+        oracle.insert(k.clone(), lsn);
+    }
+
+    for probe in keys.iter().cloned().chain(probes.into_iter()) {
+        for &dup in &[false, true] {
+            for &exact in &[false, true] {
+                let s = stub_find(&stub, &probe, dup, exact);
+                let o = oracle.find_entry(&probe, dup, exact);
+                assert_eq!(
+                    s, o,
+                    "find_entry({probe:?}, dup={dup}, exact={exact}) diverged: stub={s} oracle={o}"
+                );
             }
         }
     }
+}
 
-    /// `compute_key_prefix` must agree (with and without an excluded index).
-    #[test]
-    fn compute_key_prefix_agrees(keys in distinct_keys(40)) {
-        let mut stub = empty_stub();
-        let mut oracle = BinOracle::new();
-        for (i, k) in keys.iter().enumerate() {
-            let lsn = Lsn::from_u64(100 + i as u64);
-            stub.insert_with_prefix(k.clone(), lsn, None);
-            oracle.insert(k.clone(), lsn);
-        }
-
-        prop_assert_eq!(
-            stub.compute_key_prefix(None),
-            oracle.compute_key_prefix(None),
-            "compute_key_prefix(None) diverged"
-        );
-        for ex in 0..stub.entries.len() {
-            prop_assert_eq!(
-                stub.compute_key_prefix(Some(ex)),
-                oracle.compute_key_prefix(Some(ex)),
-                "compute_key_prefix(Some({})) diverged", ex
-            );
-        }
+/// `compute_key_prefix` must agree (with and without an excluded index).
+#[hegel::test(test_cases = 256)]
+fn compute_key_prefix_agrees(tc: hegel::TestCase) {
+    let keys = tc.draw(distinct_keys(40));
+    let mut stub = empty_stub();
+    let mut oracle = BinOracle::new();
+    for (i, k) in keys.iter().enumerate() {
+        let lsn = Lsn::from_u64(100 + i as u64);
+        stub.insert_with_prefix(k.clone(), lsn, None);
+        oracle.insert(k.clone(), lsn);
     }
 
-    /// Split point: JE `IN.splitInternal` uses the plain midpoint `n / 2` for
-    /// the no-hint case; both implementations must place the split there and
-    /// agree on the split key (full key of the first right-half slot).
-    #[test]
-    fn split_index_agrees(keys in distinct_keys(40)) {
-        prop_assume!(keys.len() >= 2);
-        let mut stub = empty_stub();
-        let mut oracle = BinOracle::new();
-        for (i, k) in keys.iter().enumerate() {
-            let lsn = Lsn::from_u64(100 + i as u64);
-            stub.insert_with_prefix(k.clone(), lsn, None);
-            oracle.insert(k.clone(), lsn);
-        }
-        let split = stub.entries.len() / 2;
-        prop_assert_eq!(
-            stub.get_full_key(split).unwrap(),
-            oracle.key(split).to_vec(),
-            "split key at index {} diverged", split
+    assert_eq!(
+        stub.compute_key_prefix(None),
+        oracle.compute_key_prefix(None),
+        "compute_key_prefix(None) diverged"
+    );
+    for ex in 0..stub.entries.len() {
+        assert_eq!(
+            stub.compute_key_prefix(Some(ex)),
+            oracle.compute_key_prefix(Some(ex)),
+            "compute_key_prefix(Some({ex})) diverged"
         );
     }
+}
 
-    /// TREE-F1 GUARD: a known-deleted slot must read as ABSENT for exact
-    /// lookups.  The runtime stub does not filter known_deleted inside
-    /// `find_entry` (the JE-correct absence is enforced one layer up via
-    /// `slot_is_live`); this pins the stub's `slot_is_live` predicate to the
-    /// oracle's KD bit, so a future stub that forgets to filter KD slots fails.
-    #[test]
-    fn known_deleted_reads_absent(
-        keys in distinct_keys(20),
-        delete_seed in any::<u64>(),
-    ) {
-        prop_assume!(!keys.is_empty());
-        let mut stub = empty_stub();
-        let mut oracle = BinOracle::new();
-        for (i, k) in keys.iter().enumerate() {
-            let lsn = Lsn::from_u64(100 + i as u64);
-            stub.insert_with_prefix(k.clone(), lsn, None);
-            oracle.insert(k.clone(), lsn);
-        }
+/// Split point: JE `IN.splitInternal` uses the plain midpoint `n / 2` for
+/// the no-hint case; both implementations must place the split there and
+/// agree on the split key (full key of the first right-half slot).
+#[hegel::test(test_cases = 256)]
+fn split_index_agrees(tc: hegel::TestCase) {
+    let keys = tc.draw(distinct_keys(40));
+    tc.assume(keys.len() >= 2);
+    let mut stub = empty_stub();
+    let mut oracle = BinOracle::new();
+    for (i, k) in keys.iter().enumerate() {
+        let lsn = Lsn::from_u64(100 + i as u64);
+        stub.insert_with_prefix(k.clone(), lsn, None);
+        oracle.insert(k.clone(), lsn);
+    }
+    let split = stub.entries.len() / 2;
+    assert_eq!(
+        stub.get_full_key(split).unwrap(),
+        oracle.key(split).to_vec(),
+        "split key at index {split} diverged"
+    );
+}
 
-        // Mark roughly half the keys known-deleted in both.
-        let mut s = delete_seed;
-        let mut deleted: Vec<Vec<u8>> = Vec::new();
-        for k in &keys {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
-            if s & 1 == 0 {
-                stub_mark_known_deleted(&mut stub, k);
-                oracle.set_known_deleted(k);
-                deleted.push(k.clone());
-            }
-        }
+/// TREE-F1 GUARD: a known-deleted slot must read as ABSENT for exact
+/// lookups.  The runtime stub does not filter known_deleted inside
+/// `find_entry` (the JE-correct absence is enforced one layer up via
+/// `slot_is_live`); this pins the stub's `slot_is_live` predicate to the
+/// oracle's KD bit, so a future stub that forgets to filter KD slots fails.
+#[hegel::test(test_cases = 256)]
+fn known_deleted_reads_absent(tc: hegel::TestCase) {
+    let keys = tc.draw(distinct_keys(20));
+    let delete_seed = tc.draw(generators::integers::<u64>());
+    tc.assume(!keys.is_empty());
+    let mut stub = empty_stub();
+    let mut oracle = BinOracle::new();
+    for (i, k) in keys.iter().enumerate() {
+        let lsn = Lsn::from_u64(100 + i as u64);
+        stub.insert_with_prefix(k.clone(), lsn, None);
+        oracle.insert(k.clone(), lsn);
+    }
 
-        for k in &deleted {
-            // Oracle: the matched slot is known_deleted (the JE-correct
-            // "exact lookup of a KD slot is absent" precondition).
-            let oidx = (oracle.find_entry(k, false, false) & 0xffff) as usize;
-            prop_assert!(oracle.is_known_deleted(oidx),
-                "oracle: {:?} should be known_deleted", k);
-            // Runtime stub: the slot must read as NOT live.
-            let (sidx, sfound) = stub.find_entry_compressed(k);
-            prop_assert!(sfound, "stub lost slot for {:?}", k);
-            prop_assert!(!stub.slot_is_live(sidx),
-                "TREE-F1: stub slot for {:?} still reads live after KD", k);
+    // Mark roughly half the keys known-deleted in both.
+    let mut s = delete_seed;
+    let mut deleted: Vec<Vec<u8>> = Vec::new();
+    for k in &keys {
+        s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+        if s & 1 == 0 {
+            stub_mark_known_deleted(&mut stub, k);
+            oracle.set_known_deleted(k);
+            deleted.push(k.clone());
         }
+    }
 
-        // Non-deleted keys must still read live in the stub and not-KD in the
-        // oracle.
-        for k in &keys {
-            if deleted.contains(k) {
-                continue;
-            }
-            let (sidx, sfound) = stub.find_entry_compressed(k);
-            prop_assert!(sfound && stub.slot_is_live(sidx),
-                "stub: live key {:?} reads absent", k);
-            let oidx = (oracle.find_entry(k, false, false) & 0xffff) as usize;
-            prop_assert!(!oracle.is_known_deleted(oidx),
-                "oracle: live key {:?} reads deleted", k);
+    for k in &deleted {
+        // Oracle: the matched slot is known_deleted (the JE-correct
+        // "exact lookup of a KD slot is absent" precondition).
+        let oidx = (oracle.find_entry(k, false, false) & 0xffff) as usize;
+        assert!(
+            oracle.is_known_deleted(oidx),
+            "oracle: {k:?} should be known_deleted"
+        );
+        // Runtime stub: the slot must read as NOT live.
+        let (sidx, sfound) = stub.find_entry_compressed(k);
+        assert!(sfound, "stub lost slot for {k:?}");
+        assert!(
+            !stub.slot_is_live(sidx),
+            "TREE-F1: stub slot for {k:?} still reads live after KD"
+        );
+    }
+
+    // Non-deleted keys must still read live in the stub and not-KD in the
+    // oracle.
+    for k in &keys {
+        if deleted.contains(k) {
+            continue;
         }
+        let (sidx, sfound) = stub.find_entry_compressed(k);
+        assert!(
+            sfound && stub.slot_is_live(sidx),
+            "stub: live key {k:?} reads absent"
+        );
+        let oidx = (oracle.find_entry(k, false, false) & 0xffff) as usize;
+        assert!(
+            !oracle.is_known_deleted(oidx),
+            "oracle: live key {k:?} reads deleted"
+        );
     }
 }
