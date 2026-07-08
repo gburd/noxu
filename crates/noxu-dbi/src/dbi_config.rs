@@ -92,6 +92,9 @@ pub struct DbiEnvConfig {
     pub log_write_queue_size: usize,
     pub log_group_commit_threshold: usize,
     pub log_group_commit_interval_ms: u64,
+    /// Bounded fsync pipeline depth (max concurrent `fdatasync`s).  1 =
+    /// single-leader (default).  Mirrors `LOG_FSYNC_MAX_LEADERS`.
+    pub log_fsync_max_leaders: usize,
 
     // -----------------------------------------------------------------------
     // B-tree
@@ -292,6 +295,7 @@ impl Default for DbiEnvConfig {
             log_write_queue_size: 1024 * 1024,
             log_group_commit_threshold: 0,
             log_group_commit_interval_ms: 0,
+            log_fsync_max_leaders: 1,
             // B-tree
             node_max_entries: 128,
             node_dup_tree_max_entries: 128,

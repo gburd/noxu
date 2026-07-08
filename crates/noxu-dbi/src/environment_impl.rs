@@ -792,9 +792,10 @@ impl EnvironmentImpl {
                 cfg.log_buffer_size,
                 cfg.log_fault_read_size,
             );
-            lm.set_group_commit(
+            lm.set_group_commit_pipelined(
                 cfg.log_group_commit_threshold,
                 cfg.log_group_commit_interval_ms,
+                cfg.log_fsync_max_leaders,
             );
             // Wire the LOG_CHECKSUM_READ knob (JE
             // LogManager.getChecksumOnRead). Default true matches JE.

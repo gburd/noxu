@@ -54,6 +54,29 @@ listed in [References](#references).
 
 ### Added
 
+- **Bounded fsync pipeline (`noxu.log.fsyncMaxLeaders`, default `1`).** The
+  single-leader group-commit fsync (one `fdatasync` in flight at a time) capped
+  write throughput at the single-file `fdatasync` latency. Setting
+  `fsyncMaxLeaders` (a.k.a. `EnvironmentConfig` fsync pipeline depth) above `1`
+  lets that many `fdatasync`s overlap on the log file, so concurrent SYNC
+  committers approach the device's concurrent-sync ceiling (typical NVMe does
+  ~10k/s) instead of serializing behind one leader. The default is `1` (the
+  historical single-leader behavior — no change unless opted in).
+
+  Durability is preserved by construction: each leader pwrites its drained
+  range to the page cache *under the log-write latch in LSN order* before
+  capturing the `eol` its `fdatasync` will publish, and the durable watermark
+  (`last_synced_lsn`) advances by CAS-max, so a completed `fdatasync` (which
+  flushes all of the fd's dirty pages) makes every byte below its captured
+  `eol` durable regardless of which cohort wrote it, and an out-of-order
+  completion never regresses the watermark. Verified by a deterministic
+  durability oracle (`bounded_fsync_durability_test`) and a shuttle model-check
+  of the monotonic-watermark invariant under all interleavings
+  (`bounded_pipeline_monotonic_watermark_holds`).
+
+
+### Added
+
 - **Per-transaction `no_wait` / short lock-timeout mode** for hot-contention
   workloads (`TransactionConfig::with_no_wait(true)` and
   `TransactionConfig::with_lock_timeout_ms(ms)`). A `no_wait` transaction

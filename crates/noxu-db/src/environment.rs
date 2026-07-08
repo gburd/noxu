@@ -329,6 +329,7 @@ impl Environment {
             log_write_queue_size: config.log_write_queue_size,
             log_group_commit_threshold: config.log_group_commit_threshold,
             log_group_commit_interval_ms: config.log_group_commit_interval_ms,
+            log_fsync_max_leaders: config.log_fsync_max_leaders,
             // B-tree
             node_max_entries: config.node_max_entries,
             node_dup_tree_max_entries: config.node_dup_tree_max_entries,

@@ -9,22 +9,43 @@
 //!
 //! When a thread enters `flush_and_sync()` it finds one of two situations:
 //!
-//! 1. **No work in progress** — the thread becomes the *leader*.  If group
-//!    commit is enabled (`grpc_threshold > 0` AND `grpc_interval_ms > 0`) the
-//!    leader may wait briefly for more waiters to accumulate.  Then it runs the
-//!    supplied `do_work` closure (JE flushBeforeSync drain+pwrite, then
-//!    executeFSync), wakes all current waiters (they piggyback on its fsync),
-//!    wakes one member of the *next* group to become the new leader, and clears
-//!    `work_in_progress`.
+//! 1. **A leader slot is free** (fewer than `max_leaders` leaders in flight;
+//!    with the default `max_leaders == 1` this means "no work in progress") —
+//!    the thread becomes a *leader*.  If group commit is enabled
+//!    (`grpc_threshold > 0` AND `grpc_interval_ms > 0`) the leader may wait
+//!    briefly for more waiters to accumulate.  Then it runs the supplied
+//!    `do_work` closure (JE flushBeforeSync drain+pwrite, then executeFSync),
+//!    wakes all current waiters (they piggyback on its fsync), wakes one member
+//!    of the *next* group to become the next leader, and releases its leader
+//!    slot (`leaders_in_flight -= 1`).
 //!
-//! 2. **Work in progress** — the thread joins `next_fsync_waiters` and waits
-//!    on a `Condvar`.  When woken it checks whether its fsync was already
-//!    done (`NoFsyncNeeded`), whether it should become the new leader
+//! 2. **All leader slots are taken** — the thread joins `next_fsync_waiters`
+//!    and waits on a `Condvar`.  When woken it checks whether its fsync was
+//!    already done (`NoFsyncNeeded`), whether it should become the next leader
 //!    (`DoLeaderFsync`), or whether it timed out (`DoTimeoutFsync`).
 //!
 //! Each group is represented by an `Arc<FSyncGroup>`.  The leader atomically
 //! replaces `state.next_fsync_waiters` with a fresh group, so waiting threads
 //! retain their `Arc` to the *old* group and can still be woken through it.
+//!
+//! # Bounded fsync pipeline (`max_leaders`)
+//!
+//! By default (`max_leaders == 1`) at most one leader is in flight at a time —
+//! the single-leader group-commit above, exactly as before.  When configured
+//! with `max_leaders > 1`, up to N leaders may be in flight concurrently: a
+//! committer that arrives while other leaders are draining/syncing becomes an
+//! *additional* leader (rather than always joining a waiter cohort) so long as
+//! fewer than N leaders are currently in flight.  Each leader captures its own
+//! cohort and runs `do_work` (the caller's drain + fdatasync).
+//!
+//! This lets several `fdatasync` calls run against the same log file at once —
+//! the device sustains many concurrent same-file `fdatasync`s, whereas one
+//! leader at a time caps throughput at the single-file fsync latency.  The
+//! DRAIN half of `do_work` is still serialized by the caller's log-write latch
+//! (it is cheap: memcpy + `pwrite` to the page cache in LSN order); only the
+//! `fdatasync` half runs concurrently.  The durability watermark stays a single
+//! monotonic value because the caller advances it with a CAS-max after each
+//! completed `fdatasync` (see `LogManager::flush_sync` for the full proof).
 
 use std::time::Duration;
 
@@ -250,9 +271,14 @@ impl FSyncGroup {
 ///
 /// Mirrors the fields that protects with `mgrMutex`.
 struct FsyncState {
-    /// True while a leader thread is performing (or about to perform) an fsync.
-    work_in_progress: bool,
-    /// The group that newly-arriving threads join while work is in progress.
+    /// Number of leader threads currently in flight (draining + about to /
+    /// currently fsyncing).  Ranges `0..=max_leaders`.  With `max_leaders == 1`
+    /// this is the boolean `work_in_progress` of the original single-leader
+    /// design (0 = free, 1 = busy); with `max_leaders > 1` it is the bounded
+    /// pipeline depth of concurrent leaders.
+    leaders_in_flight: usize,
+    /// The group that newly-arriving threads join while all leader slots are
+    /// taken.  When a leader slot frees, the next leader captures this group.
     next_fsync_waiters: Arc<FSyncGroup>,
     /// Count of threads currently in `next_fsync_waiters`.
     num_next_waiters: usize,
@@ -282,6 +308,10 @@ pub struct FsyncManager {
     grpc_threshold: usize,
     /// Max ms the leader waits for more waiters (0 = disabled).
     grpc_interval_ms: u64,
+    /// Maximum number of leaders (concurrent `fdatasync`s) in flight at once.
+    /// `1` (default) = the original single-leader group commit; `> 1` = the
+    /// bounded fsync pipeline.  Clamped to `>= 1` at construction.
+    max_leaders: usize,
     /// Whether group-commit waiting is active (`grpcInterval != 0 && grpcThreshold != 0`).
     grp_wait_on: bool,
     /// Timeout for waiting threads before they do their own fsync.
@@ -311,35 +341,59 @@ pub struct FsyncManager {
 }
 
 impl FsyncManager {
-    /// Create a new `FsyncManager`.
+    /// Create a new `FsyncManager` (single-leader group commit).
     ///
     /// # Arguments
     /// * `grpc_threshold`   — min waiters before leader fsyncs (0 = disabled).
     /// * `grpc_interval_ms` — max ms to wait for more waiters (0 = disabled).
+    ///
+    /// `max_leaders` defaults to `1` (the historical single-leader behavior).
+    /// Use [`FsyncManager::with_pipeline`] to enable the bounded fsync pipeline.
     pub fn new(grpc_threshold: usize, grpc_interval_ms: u64) -> Self {
-        Self::with_clock(grpc_threshold, grpc_interval_ms, RealClock::arc())
+        Self::with_clock(grpc_threshold, grpc_interval_ms, 1, RealClock::arc())
+    }
+
+    /// Create a new `FsyncManager` with a bounded fsync pipeline.
+    ///
+    /// `max_leaders` is the maximum number of concurrent leaders (concurrent
+    /// `fdatasync`s) in flight at once; `1` = the single-leader group commit.
+    /// Values are clamped to `>= 1`.
+    pub fn with_pipeline(
+        grpc_threshold: usize,
+        grpc_interval_ms: u64,
+        max_leaders: usize,
+    ) -> Self {
+        Self::with_clock(
+            grpc_threshold,
+            grpc_interval_ms,
+            max_leaders,
+            RealClock::arc(),
+        )
     }
 
     /// Create a new `FsyncManager` with an injectable [`Clock`] (DST M1.1).
     ///
-    /// Production uses [`FsyncManager::new`] (which passes [`RealClock`]); DST
-    /// harnesses pass a [`noxu_util::SimClock`] so the group-commit wait and
-    /// the `fsync_timeout` recovery become a pure function of the simulated
-    /// timeline.  Additive: no existing caller changes.
+    /// Production uses [`FsyncManager::new`] / [`FsyncManager::with_pipeline`]
+    /// (which pass [`RealClock`]); DST harnesses pass a
+    /// [`noxu_util::SimClock`] so the group-commit wait and the `fsync_timeout`
+    /// recovery become a pure function of the simulated timeline.  Additive:
+    /// no existing caller changes.
     pub fn with_clock(
         grpc_threshold: usize,
         grpc_interval_ms: u64,
+        max_leaders: usize,
         clock: Arc<dyn Clock>,
     ) -> Self {
         let grp_wait_on = grpc_threshold != 0 && grpc_interval_ms != 0;
         FsyncManager {
             grpc_threshold,
             grpc_interval_ms,
+            max_leaders: max_leaders.max(1),
             grp_wait_on,
             // default timeout: 500 ms.
             fsync_timeout: Duration::from_millis(500),
             state: Mutex::new(FsyncState {
-                work_in_progress: false,
+                leaders_in_flight: 0,
                 next_fsync_waiters: FSyncGroup::new(),
                 num_next_waiters: 0,
                 start_next_wait_ns: None,
@@ -357,16 +411,27 @@ impl FsyncManager {
 
     /// Drain the log buffer and fsync, coalescing with concurrent callers.
     ///
-    /// JE faithfulness: this matches `FSyncManager.flushAndSync` EXACTLY.
-    /// The leader/waiter decision is made FIRST under `state` (JE `mgrMutex`),
-    /// and ONLY the leader (or a timed-out thread) runs `do_work` — which
-    /// performs JE's `flushBeforeSync()` (drain + pwrite) followed by
-    /// `executeFSync()` (the single fdatasync).  Waiters piggyback: they do NO
-    /// drain, NO pwrite and NO fsync; on wake they return the leader's durable
-    /// result LSN.  This is the fix for the coalescing divergence — a committer
-    /// that didn't skip at the caller's fast path now serialises on `state`
-    /// BEFORE draining, so it cannot become its own redundant leader between
-    /// another leader's pwrite and that leader's fsync.
+    /// JE faithfulness (single-leader case, `max_leaders == 1`): this matches
+    /// `FSyncManager.flushAndSync` EXACTLY.  The leader/waiter decision is made
+    /// FIRST under `state` (JE `mgrMutex`), and ONLY the leader (or a timed-out
+    /// thread) runs `do_work` — which performs JE's `flushBeforeSync()`
+    /// (drain + pwrite) followed by `executeFSync()` (the single fdatasync).
+    /// Waiters piggyback: they do NO drain, NO pwrite and NO fsync; on wake
+    /// they return the leader's durable result LSN.  This is the fix for the
+    /// coalescing divergence — a committer that didn't skip at the caller's
+    /// fast path now serialises on `state` BEFORE draining, so it cannot become
+    /// its own redundant leader between another leader's pwrite and that
+    /// leader's fsync.
+    ///
+    /// Bounded fsync pipeline (`max_leaders > 1`): an arriving committer may
+    /// become an *additional* leader (up to `max_leaders` in flight) instead of
+    /// always waiting, so several `do_work` closures — hence several
+    /// `fdatasync`s — run concurrently.  Each leader still captures its own
+    /// cohort and the waiter piggyback is unchanged; only the number of leaders
+    /// allowed in flight at once differs.  The caller's `do_work` keeps the
+    /// DRAIN serialized on its own log-write latch (LSN-ordered pwrite to the
+    /// page cache) and only the `fdatasync` overlaps, which is what makes the
+    /// monotonic durable-watermark advance sound (see `LogManager::flush_sync`).
     ///
     /// The `do_work` closure returns the post-drain `eol` (as u64). On success
     /// the leader records that LSN on the in-progress group so waiters return
@@ -393,8 +458,8 @@ impl FsyncManager {
         {
             let mut state = self.state.lock();
 
-            if state.work_in_progress {
-                // Join the next-waiters cohort.
+            if state.leaders_in_flight >= self.max_leaders {
+                // All leader slots are taken — join the next-waiters cohort.
                 need_to_wait = true;
                 my_group = Some(Arc::clone(&state.next_fsync_waiters));
                 state.num_next_waiters += 1;
@@ -410,10 +475,10 @@ impl FsyncManager {
                     self.leader_condvar.notify_one();
                 }
             } else {
-                // Become the leader.
+                // A leader slot is free — become a leader.
                 is_leader = true;
                 do_my_work = true;
-                state.work_in_progress = true;
+                state.leaders_in_flight += 1;
 
                 if self.grp_wait_on {
                     state = self.grpc_wait(state);
@@ -446,17 +511,20 @@ impl FsyncManager {
                     return Ok(Lsn::from_u64(group.result_lsn()));
                 }
                 WaitStatus::DoLeaderFsync => {
-                    // Attempt to become the new leader for this cohort.
+                    // Attempt to become a new leader for this cohort.
                     let mut state = self.state.lock();
-                    if state.work_in_progress {
-                        // Another thread started new work while we were being
-                        // woken up — do our own work as a safety measure.
-                        // (JE: "Ensure that an fsync is done before returning")
+                    if state.leaders_in_flight >= self.max_leaders {
+                        // No leader slot free (another thread took it while we
+                        // were being woken) — do our own work as a safety
+                        // measure. (JE: "Ensure that an fsync is done before
+                        // returning.")  This is a private, un-coalesced fsync;
+                        // its bytes were still drained in LSN order by an
+                        // earlier leader, so it is durability-safe.
                         do_my_work = true;
                     } else {
                         is_leader = true;
                         do_my_work = true;
-                        state.work_in_progress = true;
+                        state.leaders_in_flight += 1;
 
                         if self.grp_wait_on {
                             state = self.grpc_wait(state);
@@ -503,11 +571,14 @@ impl FsyncManager {
                     Ok(eol) => in_prog.wakeup_all(*eol),
                     Err(e) => in_prog.wakeup_all_with_error(e.to_string()),
                 }
-                // Wake one member of the next cohort to become the new leader,
-                // then clear work_in_progress — matching JE ordering.
+                // Release our leader slot and wake one member of the next
+                // cohort to become the next leader — matching JE ordering.
+                // With the bounded pipeline there may still be other leaders in
+                // flight; decrementing our own slot lets exactly one waiter
+                // step into the freed slot.
                 let mut state = self.state.lock();
                 state.next_fsync_waiters.wakeup_one();
-                state.work_in_progress = false;
+                state.leaders_in_flight -= 1;
             }
 
             result.map(Lsn::from_u64)
