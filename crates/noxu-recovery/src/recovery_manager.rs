@@ -979,10 +979,7 @@ impl RecoveryManager {
                 && self.seeded_db_ids.contains(&rec.db_id)
                 && !rec.is_invisible
                 && !self.rollback_tracker.is_in_rollback_period(*lsn)
-                && rec
-                    .txn_id
-                    .map(|t| analysis.is_committed(t))
-                    .unwrap_or(true)
+                && rec.txn_id.map(|t| analysis.is_committed(t)).unwrap_or(true)
             {
                 // A committed / non-transactional pre-checkpoint-start LN of a
                 // seeded database that the redo gate skipped (its record is
@@ -2366,19 +2363,15 @@ impl RecoveryManager {
         // survive_clean_reopen` and `::equality_stable_bins` — both recover
         // ALL records with this gate active.
         let before_ckpt_start = ckpt_start != NULL_LSN && lsn < ckpt_start;
-        let gate_active = before_ckpt_start
-            && self.seeded_db_ids.contains(&rec.db_id);
+        let gate_active =
+            before_ckpt_start && self.seeded_db_ids.contains(&rec.db_id);
 
         match rec.txn_id {
             None => {
                 // Non-transactional LN.  Redo unless the seeded-root gate
                 // covers it (its committed state is durable in a
                 // pre-checkpoint BIN reachable from the seeded root).
-                if gate_active {
-                    RedoAction::Skip
-                } else {
-                    RedoAction::Apply
-                }
+                if gate_active { RedoAction::Skip } else { RedoAction::Apply }
             }
             Some(txn_id) => {
                 if analysis.is_committed(txn_id) {

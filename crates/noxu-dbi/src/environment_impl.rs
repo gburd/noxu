@@ -1725,7 +1725,8 @@ impl EnvironmentImpl {
     /// `false`, so every database in a standalone environment is correctly
     /// non-replicated regardless of the config's `replicated` value.
     pub fn set_replicated(&self, replicated: bool) {
-        self.is_replicated.store(replicated, std::sync::atomic::Ordering::Relaxed);
+        self.is_replicated
+            .store(replicated, std::sync::atomic::Ordering::Relaxed);
     }
     pub fn get_creation_time(&self) -> u64 {
         self.creation_time_ms

@@ -14,7 +14,11 @@ use noxu_db::{DatabaseConfig, Environment, EnvironmentConfig};
 use std::time::Instant;
 
 fn scratch(tag: &str) -> std::path::PathBuf {
-    let p = std::env::temp_dir().join(format!("noxu-wsp-{}-{}", tag, std::process::id()));
+    let p = std::env::temp_dir().join(format!(
+        "noxu-wsp-{}-{}",
+        tag,
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&p);
     std::fs::create_dir_all(&p).unwrap();
     p
@@ -28,10 +32,20 @@ fn write_scale_probe() {
     const CACHE: u64 = 4 * 1024 * 1024;
     let value = vec![0xABu8; 64];
 
-    println!("\n=== write-path-at-scale probe (cache = {} MiB) ===", CACHE / 1024 / 1024);
+    println!(
+        "\n=== write-path-at-scale probe (cache = {} MiB) ===",
+        CACHE / 1024 / 1024
+    );
     println!(
         "{:>9} {:>10} {:>12} {:>12} {:>12} {:>12} {:>10} {:>10}",
-        "records", "ns/write", "binFetch", "binMiss", "evicted", "evRuns", "clnRuns", "ckpts"
+        "records",
+        "ns/write",
+        "binFetch",
+        "binMiss",
+        "evicted",
+        "evRuns",
+        "clnRuns",
+        "ckpts"
     );
 
     for &n in &[100_000usize, 500_000, 1_000_000, 2_000_000] {
@@ -44,7 +58,11 @@ fn write_scale_probe() {
         )
         .unwrap();
         let db = env
-            .open_database(None, "wsp", &DatabaseConfig::new().with_allow_create(true))
+            .open_database(
+                None,
+                "wsp",
+                &DatabaseConfig::new().with_allow_create(true),
+            )
             .unwrap();
 
         let s0 = env.stats().unwrap();
@@ -59,11 +77,15 @@ fn write_scale_probe() {
 
         let ns_per = elapsed.as_nanos() as f64 / n as f64;
         let bf = s1.evictor.bin_fetch.saturating_sub(s0.evictor.bin_fetch);
-        let bm = s1.evictor.bin_fetch_miss.saturating_sub(s0.evictor.bin_fetch_miss);
-        let ev = s1.evictor.nodes_evicted.saturating_sub(s0.evictor.nodes_evicted);
-        let er = s1.evictor.eviction_runs.saturating_sub(s0.evictor.eviction_runs);
+        let bm =
+            s1.evictor.bin_fetch_miss.saturating_sub(s0.evictor.bin_fetch_miss);
+        let ev =
+            s1.evictor.nodes_evicted.saturating_sub(s0.evictor.nodes_evicted);
+        let er =
+            s1.evictor.eviction_runs.saturating_sub(s0.evictor.eviction_runs);
         let cln = s1.cleaner.runs.saturating_sub(s0.cleaner.runs);
-        let ckp = s1.checkpoint.checkpoints.saturating_sub(s0.checkpoint.checkpoints);
+        let ckp =
+            s1.checkpoint.checkpoints.saturating_sub(s0.checkpoint.checkpoints);
 
         println!(
             "{:>9} {:>10.0} {:>12} {:>12} {:>12} {:>12} {:>10} {:>10}",

@@ -5306,7 +5306,8 @@ impl Tree {
                 _ => None,
             };
             if let Some(child) = resident_child {
-                let r = Self::delete_recursive(&child, key, key_comparator, tree);
+                let r =
+                    Self::delete_recursive(&child, key, key_comparator, tree);
                 drop(parent_guard);
                 r
             } else {
@@ -6950,7 +6951,7 @@ impl Tree {
         // this header before calling `recover_in_redo`; re-fetch must do the
         // same so `deserialize_*` sees the bare node bytes.  JE
         // `INLogEntry.readEntry` parses the same wrapper.
-        let mut in_entry =
+        let in_entry =
             noxu_log::entry::in_log_entry::InLogEntry::read_from_log(&payload)
                 .ok()?;
         use noxu_log::LogEntryType;
@@ -6975,10 +6976,8 @@ impl Tree {
                     TreeNode::Bottom(bin)
                 })
             }
-            LogEntryType::IN => {
-                Self::deserialize_upper_in(&in_entry.node_data)
-                    .map(TreeNode::Internal)
-            }
+            LogEntryType::IN => Self::deserialize_upper_in(&in_entry.node_data)
+                .map(TreeNode::Internal),
             // A checkpoint-seeded parent slot may point at a BIN-delta LSN
             // (the most recent on-disk version of a BIN logged as a delta).
             // Reconstitute it into a full BIN: read the base full BIN at the
@@ -7053,8 +7052,10 @@ impl Tree {
                     );
                     return None;
                 }
-                let base_in = noxu_log::entry::in_log_entry::InLogEntry::
-                    read_from_log(&base_payload)
+                let base_in =
+                    noxu_log::entry::in_log_entry::InLogEntry::read_from_log(
+                        &base_payload,
+                    )
                     .ok()?;
                 // Apply deltas oldest-first (we collected newest-first).
                 // Merge each delta entry BY KEY (not by slot index): a delta

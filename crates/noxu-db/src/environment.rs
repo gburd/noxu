@@ -515,33 +515,32 @@ impl Environment {
         // cannot perturb the daemon-manager shutdown ordering.
         // JE ref: EnvironmentParams.ENV_RUN_VERIFIER / VERIFY_SCHEDULE,
         // com.sleepycat.je.dbi.DataVerifier.
-        let verify_daemon = if config.run_verifier
-            && !config.verify_schedule.is_empty()
-        {
-            match crate::verify_daemon::CronSchedule::parse(
-                &config.verify_schedule,
-            ) {
-                Some(schedule) => {
-                    let vconfig = noxu_engine::VerifyConfig::new()
-                        .with_btree_verification(true);
-                    Some(crate::verify_daemon::VerifyDaemon::start(
-                        Arc::clone(&env_impl_arc),
-                        schedule,
-                        vconfig,
-                    ))
-                }
-                None => {
-                    log::warn!(
-                        "verify_schedule={:?} is not a valid 5-field cron \
+        let verify_daemon =
+            if config.run_verifier && !config.verify_schedule.is_empty() {
+                match crate::verify_daemon::CronSchedule::parse(
+                    &config.verify_schedule,
+                ) {
+                    Some(schedule) => {
+                        let vconfig = noxu_engine::VerifyConfig::new()
+                            .with_btree_verification(true);
+                        Some(crate::verify_daemon::VerifyDaemon::start(
+                            Arc::clone(&env_impl_arc),
+                            schedule,
+                            vconfig,
+                        ))
+                    }
+                    None => {
+                        log::warn!(
+                            "verify_schedule={:?} is not a valid 5-field cron \
                          expression; the background verifier will NOT run",
-                        config.verify_schedule,
-                    );
-                    None
+                            config.verify_schedule,
+                        );
+                        None
+                    }
                 }
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
 
         let env = Environment {
             home,

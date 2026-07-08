@@ -58,7 +58,12 @@ impl VerifyDaemon {
         schedule: CronSchedule,
         config: VerifyConfig,
     ) -> Self {
-        Self::start_with_tick(env_impl, schedule, config, Duration::from_secs(60))
+        Self::start_with_tick(
+            env_impl,
+            schedule,
+            config,
+            Duration::from_secs(60),
+        )
     }
 
     /// Like [`start`] but with a caller-chosen wake tick (test seam so an
@@ -78,17 +83,16 @@ impl VerifyDaemon {
         // matches the schedule.  `last_run_minute` prevents a double-run
         // within the same matching minute.
         let last_run_minute = Arc::new(AtomicU64::new(u64::MAX));
-        let daemon =
-            DaemonThread::spawn("noxu-verifier", tick, move || {
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                if should_run_now(&schedule, now, &last_run_minute) {
-                    run_once(&env_impl, &config);
-                }
-                true
-            });
+        let daemon = DaemonThread::spawn("noxu-verifier", tick, move || {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            if should_run_now(&schedule, now, &last_run_minute) {
+                run_once(&env_impl, &config);
+            }
+            true
+        });
         VerifyDaemon { daemon }
     }
 

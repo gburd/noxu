@@ -27,8 +27,11 @@ use noxu_db::{DatabaseConfig, Environment, EnvironmentConfig};
 use std::io::{Seek, SeekFrom, Write};
 
 fn scratch(tag: &str) -> std::path::PathBuf {
-    let p = std::env::temp_dir()
-        .join(format!("noxu-halt-checksum-{}-{}", tag, std::process::id()));
+    let p = std::env::temp_dir().join(format!(
+        "noxu-halt-checksum-{}-{}",
+        tag,
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&p);
     std::fs::create_dir_all(&p).unwrap();
     p

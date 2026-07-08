@@ -11,8 +11,11 @@
 use noxu_db::{Durability, Environment, EnvironmentConfig};
 
 fn scratch(tag: &str) -> std::path::PathBuf {
-    let p = std::env::temp_dir()
-        .join(format!("noxu-nosync-{}-{}", tag, std::process::id()));
+    let p = std::env::temp_dir().join(format!(
+        "noxu-nosync-{}-{}",
+        tag,
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&p);
     std::fs::create_dir_all(&p).unwrap();
     p

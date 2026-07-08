@@ -823,8 +823,18 @@ mod tests {
         // no roots (byte-identical to v1), then read it back.  Recovery must
         // see an empty per_db_roots and fall back to full redo.
         let ckpt = CheckpointEnd::new(
-            1, "recovery", Lsn::new(5, 50), None, Lsn::new(6, 60), 100, -100,
-            200, -200, 300, -300, false,
+            1,
+            "recovery",
+            Lsn::new(5, 50),
+            None,
+            Lsn::new(6, 60),
+            100,
+            -100,
+            200,
+            -200,
+            300,
+            -300,
+            false,
         );
         let mut buf = Vec::new();
         ckpt.write_to_log(&mut buf).unwrap();
@@ -837,7 +847,18 @@ mod tests {
         // A v1 entry with junk appended (e.g. from a torn write) must not fail
         // recovery; the trailer parser degrades to an empty map.
         let ckpt = CheckpointEnd::new(
-            1, "t", Lsn::new(1, 0), None, NULL_LSN, 0, 0, 0, 0, 0, 0, false,
+            1,
+            "t",
+            Lsn::new(1, 0),
+            None,
+            NULL_LSN,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            false,
         );
         let mut buf = Vec::new();
         ckpt.write_to_log(&mut buf).unwrap();
