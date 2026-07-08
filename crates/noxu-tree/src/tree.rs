@@ -3118,6 +3118,52 @@ impl Tree {
         }
     }
 
+    /// Force every child reachable from the (possibly checkpoint-seeded) root
+    /// to be resident, fetching each non-resident node from its slot LSN.
+    ///
+    /// After recovery seeds a tree from a checkpointed root and replays only
+    /// post-checkpoint LNs, most pre-checkpoint BINs are still non-resident
+    /// (only their on-disk LSN is known).  The runtime read/cursor path
+    /// fetches them on demand (`child_at_or_fetch`), but the tree-walk
+    /// helpers used right after recovery — `count_entries`, the structural
+    /// `verify` pass, and the next checkpoint's dirty-node scan — traverse
+    /// only *resident* children (`resident_children`).  Calling this once
+    /// after redo makes the whole recovered tree resident so those walks see
+    /// the complete tree, exactly as a full LN-redo rebuild would have.
+    ///
+    /// Cost is O(number of INs/BINs), not O(number of records): we pay one
+    /// log read per node (the same read the first cursor access would incur),
+    /// which is far cheaper than replaying every pre-checkpoint LN.  A no-op
+    /// for a tree with no seeded/non-resident nodes.
+    ///
+    /// JE analogue: `IN.fetchIN` following each `ChildReference` LSN during
+    /// `RecoveryManager.buildINs`, which leaves the recovered subtree
+    /// resident.
+    pub fn materialize_all(&self) {
+        let root = match self.get_root() {
+            Some(r) => r,
+            None => return,
+        };
+        self.materialize_recursive(&root);
+    }
+
+    fn materialize_recursive(&self, node_arc: &Arc<RwLock<TreeNode>>) {
+        // Determine the number of routing slots without holding the guard
+        // across the fetch (which needs the node write lock).
+        let n_entries = {
+            let g = node_arc.read();
+            match &*g {
+                TreeNode::Internal(n) => n.entries.len(),
+                TreeNode::Bottom(_) => return, // BINs have no IN children
+            }
+        };
+        for idx in 0..n_entries {
+            if let Some(child) = self.child_at_or_fetch(node_arc, idx) {
+                self.materialize_recursive(&child);
+            }
+        }
+    }
+
     /// Sum the real in-memory heap footprint of every resident node in the
     /// tree (DBI-23 oracle / reconciliation), in bytes.
     ///
@@ -6540,6 +6586,18 @@ impl Tree {
         let node = self.fetch_node_from_log(child_lsn)?;
         let node_id = node.node_id();
         let arc: ChildArc = Arc::new(RwLock::new(node));
+        // Wire the fetched child's parent back-pointer to `parent_arc`.  The
+        // serialized node carries no parent link (it is per-in-memory-tree),
+        // so a lazily-fetched node would otherwise have `parent: None`.  That
+        // breaks any later `parent`-based navigation — notably the
+        // checkpointer's `update_parent_slot_lsn`, which finds a child's
+        // parent via this Weak to stamp the child's on-disk LSN into the
+        // parent slot.  JE's fetched IN likewise has its parent set on
+        // install (`postFetchInit` / `attachNode`).
+        {
+            let mut cg = arc.write();
+            cg.set_parent(Some(Arc::downgrade(parent_arc)));
+        }
         n.set_child(idx, Some(arc.clone()));
         drop(g);
         // JE: a fetched IN is added back to the INList (Evictor LRU).
@@ -6823,13 +6881,72 @@ impl Tree {
         use noxu_log::LogEntryType;
         match entry_type {
             LogEntryType::BIN => {
-                Self::deserialize_bin(node_data).map(TreeNode::Bottom)
+                Self::deserialize_bin(node_data).map(|mut bin| {
+                    // `deserialize_bin` always recomputes a key prefix from
+                    // the loaded keys.  When this tree has key-prefixing
+                    // DISABLED, the insert/redo paths use the full-key
+                    // (`insert_raw`) representation and assume an EMPTY prefix
+                    // (see `BinStub::insert_raw`); a fetched BIN carrying a
+                    // non-empty computed prefix would then corrupt any later
+                    // full-key insert (the stored full key would be treated as
+                    // a suffix and re-prefixed on read).  Re-expand to an
+                    // empty prefix here to keep the invariant that
+                    // key_prefixing=false BINs have no prefix.  (JE ties the
+                    // prefix to `DatabaseImpl.getKeyPrefixing()`; Noxu enforces
+                    // it at the fetch boundary.)
+                    if !self.key_prefixing && !bin.key_prefix.is_empty() {
+                        bin.apply_new_prefix(Vec::new());
+                    }
+                    TreeNode::Bottom(bin)
+                })
             }
             LogEntryType::IN => {
                 Self::deserialize_upper_in(node_data).map(TreeNode::Internal)
             }
-            // BIN-deltas are never logged as the *root* version and are
-            // reconstituted by the BIN-delta path, not here.
+            // A checkpoint-seeded parent slot may point at a BIN-delta LSN
+            // (the most recent on-disk version of a BIN logged as a delta).
+            // Reconstitute it into a full BIN: read the base full BIN at the
+            // delta's `prev_full_lsn` and overlay the delta slots
+            // (`reconstitute_bin_delta`, JE `BINDelta.reconstituteBIN`).  This
+            // is what lets the redo gate skip the delta's committed LNs — the
+            // seeded fetch materialises the CURRENT (post-delta) contents.
+            LogEntryType::BINDelta => {
+                let delta_data = &in_entry.node_data;
+                let base_lsn = in_entry.prev_full_lsn;
+                if base_lsn == NULL_LSN {
+                    // A checkpoint only writes a delta when a prior full BIN
+                    // exists (`BIN.shouldLogDelta` requires `last_full_lsn !=
+                    // NULL`), so a seeded slot should never point at a
+                    // base-less delta.  Be defensive: treat as unfetchable.
+                    log::warn!(
+                        "fetch_node_from_log: BINDelta at LSN {:?} has no base \
+                         full LSN",
+                        log_lsn
+                    );
+                    return None;
+                }
+                let (base_type, base_payload) =
+                    lm.read_entry(base_lsn).ok()?;
+                if base_type != LogEntryType::BIN {
+                    log::warn!(
+                        "fetch_node_from_log: BINDelta base at LSN {:?} is \
+                         {:?}, expected BIN",
+                        base_lsn,
+                        base_type
+                    );
+                    return None;
+                }
+                let base_in = noxu_log::entry::in_log_entry::InLogEntry::
+                    read_from_log(&base_payload)
+                    .ok()?;
+                Self::reconstitute_bin_delta(&base_in.node_data, delta_data)
+                    .map(|mut bin| {
+                        if !self.key_prefixing && !bin.key_prefix.is_empty() {
+                            bin.apply_new_prefix(Vec::new());
+                        }
+                        TreeNode::Bottom(bin)
+                    })
+            }
             _ => {
                 log::warn!(
                     "fetch_node_from_log: expected IN/BIN entry at LSN {:?}, \
@@ -7667,6 +7784,60 @@ impl Tree {
         Self::find_parent_of_node_id(&root, child_node_id)
     }
 
+    /// Stamp `new_lsn` into the slot of `child_arc`'s parent IN that points at
+    /// `child_arc`, and mark the parent dirty.
+    ///
+    /// This is the Noxu equivalent of JE `IN.updateEntry(index, lsn)` /
+    /// `Tree` updating a child `ChildReference`'s LSN whenever the child is
+    /// logged.  The checkpointer calls it after logging a child BIN so that,
+    /// when the (now-dirty) parent IN is logged in the same checkpoint, it
+    /// serializes the child's CURRENT on-disk LSN — which recovery then
+    /// follows to lazily re-fetch the child (`child_at_or_fetch`).  Without
+    /// this the parent slot would carry a stale LSN (e.g. the LN LSN that
+    /// last triggered a split), and the seeded-root descent could not
+    /// materialise the child.
+    ///
+    /// Finds the parent via the child's `parent` back-pointer (O(fanout)),
+    /// not a full-tree search.  A no-op when the child has no parent (it is
+    /// the root — handled by `note_root_logged`), the parent Weak is dead, or
+    /// the child is not found in the parent's slots.
+    pub fn update_parent_slot_lsn(
+        child_arc: &Arc<RwLock<TreeNode>>,
+        new_lsn: Lsn,
+    ) {
+        if new_lsn == NULL_LSN {
+            return;
+        }
+        let (child_id, parent_weak) = {
+            let g = child_arc.read();
+            let weak = match &*g {
+                TreeNode::Bottom(b) => b.parent.clone(),
+                TreeNode::Internal(n) => n.parent.clone(),
+            };
+            (g.node_id(), weak)
+        };
+        let Some(parent_weak) = parent_weak else {
+            return;
+        };
+        let Some(parent_arc) = parent_weak.upgrade() else {
+            return;
+        };
+        let mut pg = parent_arc.write();
+        if let TreeNode::Internal(p) = &mut *pg {
+            for slot in 0..p.entries.len() {
+                let matches = p
+                    .child_ref(slot)
+                    .map(|c| c.read().node_id() == child_id)
+                    .unwrap_or(false);
+                if matches {
+                    p.set_lsn(slot, new_lsn);
+                    p.dirty = true;
+                    return;
+                }
+            }
+        }
+    }
+
     /// Recursive DFS helper for `get_parent_in_for_child_in`.
     ///
     /// Scans every entry in each Internal node.  When a child's node_id
@@ -7751,6 +7922,14 @@ impl Tree {
         delta_bytes: &[u8],
     ) -> Option<BinStub> {
         let mut base = BinStub::deserialize_full(base_bytes)?;
+        // `deserialize_full` recomputes a key prefix, so `base.keys` holds
+        // suffixes.  `apply_delta` writes FULL keys into slots by index, so we
+        // must first expand the base back to full keys (empty prefix);
+        // otherwise full keys and suffixes get mixed and the subsequent
+        // `recompute_key_prefix` double-prefixes them (corruption).
+        if !base.key_prefix.is_empty() {
+            base.apply_new_prefix(Vec::new());
+        }
         // Apply the delta slots onto the base.
         // Note: BinStub::apply_delta uses slot-index addressing into base.entries,
         // extending with new entries when the slot_idx >= base.entries.len().

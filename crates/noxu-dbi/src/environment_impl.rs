@@ -621,6 +621,23 @@ impl EnvironmentImpl {
                     cfg.halt_on_commit_after_checksum_exception,
                 );
             let mut rmgr = RecoveryManager::new();
+            // REC-P: give recovery a LogManager so it can lazily fetch
+            // checkpoint-seeded pre-checkpoint BINs during redo
+            // (`fetchTarget`-in-recovery).  This is a read-only view over the
+            // same FileManager the real LogManager (built below) will use;
+            // recovery only calls `read_entry` on it.  Wiring it enables the
+            // AfterCheckpointStart redo gate for checkpoint-seeded trees; if
+            // it were absent, recovery would leave trees unseeded and
+            // full-redo (the safe fallback).
+            {
+                let recovery_lm = Arc::new(LogManager::new(
+                    Arc::clone(&fm),
+                    cfg.log_num_buffers,
+                    cfg.log_buffer_size,
+                    cfg.log_fault_read_size,
+                ));
+                rmgr.set_log_manager(recovery_lm);
+            }
             // Multi-DB recovery: discover every db_id in the log and build
             // a Tree for each one. During the analysis phase, each LN/BIN is
             // routed to the correct database by its db_id.

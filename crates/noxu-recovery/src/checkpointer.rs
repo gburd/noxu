@@ -718,6 +718,14 @@ impl Checkpointer {
         let upper_result = self.flush_upper_ins_internal()?;
         flush_result.full_ins_flushed += upper_result.full_ins_flushed;
 
+        // Step 4c: Collect each open user database's checkpointed tree root
+        // LSN (`Tree::get_root_lsn`, updated by the flush above via
+        // `note_root_logged`).  These seed recovery lazy-fetch and are
+        // recorded in `CheckpointEnd.per_db_roots`.  JE records the analogous
+        // per-DB root via the mapping tree's MapLNs; Noxu records them
+        // directly (REC-B: catalog is an in-memory HashMap, no mapping tree).
+        let per_db_roots = self.collect_per_db_roots();
+
         // Step 5: Write CkptEnd entry to WAL.
         //
         // T-F3 is NOT yet active: first_active_lsn stays Lsn::new(0,0) (full
@@ -787,7 +795,12 @@ impl Checkpointer {
                 last_local_txn_id,
                 0,     // last_replicated_txn_id (HA: deferred)
                 false, // cleaned_files_to_delete
-            );
+            )
+            // REC-P (per-DB roots): seed recovery lazy-fetch with each open
+            // user database's checkpointed tree root LSN.  Empty when no tree
+            // has a materialisable root — recovery then falls back to full LN
+            // redo (byte-identical to the pre-per-db-roots on-disk format).
+            .with_per_db_roots(per_db_roots);
             let mut buf = Vec::with_capacity(ckpt_end.log_size());
             ckpt_end.write_to_log(&mut buf).map_err(|e| {
                 RecoveryError::CheckpointError(format!(
@@ -1064,6 +1077,50 @@ impl Checkpointer {
         self.flush_dirty_bins_internal().map(|_| ())
     }
 
+    /// Collect each open user database's checkpointed tree root LSN for
+    /// `CheckpointEnd.per_db_roots`.
+    ///
+    /// Walks the same tree set as the flush passes (primary tree, if wired,
+    /// then every registry tree) and reads `Tree::get_root_lsn` — which the
+    /// flush passes just updated via `note_root_logged` for any root logged
+    /// this checkpoint, and which otherwise carries the root's last-logged
+    /// LSN from a prior checkpoint / eviction.  Trees whose root LSN is still
+    /// `NULL_LSN` (never logged) are omitted, so recovery leaves those trees
+    /// unseeded and safely full-redoes them.
+    ///
+    /// A `db_id` may appear via both the primary tree and a registry tree; the
+    /// registry (user-data) tree is collected last and wins, because user data
+    /// lives in the registry trees (the primary tree is the cleaner's LN
+    /// migration tree and is never written by user operations).
+    fn collect_per_db_roots(&self) -> Vec<(u64, Lsn)> {
+        use std::collections::HashMap as StdHashMap;
+        let mut roots: StdHashMap<u64, Lsn> = StdHashMap::new();
+
+        let mut record = |db_id: u64, tree_arc: &Arc<RwLock<Tree>>| {
+            if let Ok(g) = tree_arc.read() {
+                let lsn = g.get_root_lsn();
+                if lsn != NULL_LSN {
+                    roots.insert(db_id, lsn);
+                }
+            }
+        };
+
+        if let Some(t) = &self.tree {
+            record(self.db_id, t);
+        }
+        if let Some(reg) = &self.db_trees_registry
+            && let Ok(guard) = reg.lock()
+        {
+            for (&db_id_i64, tree_arc) in guard.iter() {
+                record(db_id_i64 as u64, tree_arc);
+            }
+        }
+
+        let mut out: Vec<(u64, Lsn)> = roots.into_iter().collect();
+        out.sort_unstable_by_key(|(db_id, _)| *db_id);
+        out
+    }
+
     /// Internal flush all dirty BINs to the log.
     ///
     /// Flushes dirty BINs from `self.tree` (primary tree) AND from every
@@ -1182,6 +1239,17 @@ impl Checkpointer {
             tree_guard.collect_dirty_bins(db_id)
         };
 
+        // A single-level tree's root is itself a BIN.  Capture its node id so
+        // that, when it is flushed below, we can record the LSN as the tree's
+        // seed root LSN (`Tree::note_root_logged`) — the BIN equivalent of the
+        // upper-IN root capture in `flush_one_tree_upper_ins`.
+        let root_node_id: Option<u64> = tree_arc
+            .read()
+            .ok()
+            .and_then(|g| g.get_root())
+            .filter(|r| r.read().is_bin())
+            .map(|r| r.read().node_id());
+
         // The delta-vs-full decision per BIN is made by
         // `BinStub::should_log_delta(bin_delta_percent)` below — faithful JE
         // `BIN.shouldLogDelta` (count-based + configurable percent).
@@ -1195,6 +1263,7 @@ impl Checkpointer {
                 _ => continue, // not a BIN (defensive)
             };
 
+            let this_node_id = b.node_id;
             let dirty = b.dirty_count();
 
             // X-8: skip nodes that the evictor already flushed and cleared
@@ -1203,6 +1272,11 @@ impl Checkpointer {
             if !b.dirty && dirty == 0 {
                 continue;
             }
+
+            // Full BIN LSN that this checkpoint leaves on disk for this BIN,
+            // used to (a) stamp the parent IN's child slot and (b) seed a
+            // single-level tree's root.  Set in each log path below.
+            let seed_full_lsn: Lsn;
 
             // TREE_BIN_DELTA decision — faithful JE `BIN.shouldLogDelta`
             // (BIN.java:1892): COUNT-based (numDeltas = dirty slots) against the
@@ -1259,6 +1333,15 @@ impl Checkpointer {
                         .obsolete_delta_lsns
                         .push((superseded_delta_lsn, db_id as u32));
                 }
+                // The parent slot / root seed points at the DELTA LSN just
+                // written: it is the most recent on-disk version of this BIN
+                // and carries the delta's committed changes.  Recovery's
+                // `fetch_node_from_log` reconstitutes a BINDelta into a full
+                // BIN (base `last_full_lsn` + delta) on fetch, so the seeded
+                // descent materialises the CURRENT contents — not the stale
+                // pre-delta full (which would drop the delta's committed
+                // changes whose LNs the redo gate skips).
+                seed_full_lsn = delta_logged_lsn;
             } else {
                 // --- Full BIN path ---
                 let full_bytes = b.serialize_full();
@@ -1286,6 +1369,30 @@ impl Checkpointer {
                 b.last_delta_lsn = NULL_LSN; // full BIN resets delta chain
                 b.clear_dirty_after_full_log(logged_lsn);
                 result.full_bins_flushed += 1;
+                // A full BIN entry is directly re-fetchable by
+                // `fetch_node_from_log`.
+                seed_full_lsn = logged_lsn;
+            }
+
+            // Release the BIN write lock BEFORE touching the parent (the
+            // canonical lock order elsewhere is parent-then-child, so we must
+            // not hold the child while taking the parent write lock).
+            drop(bin_guard);
+
+            if seed_full_lsn != NULL_LSN {
+                // JE `IN.updateEntry`: stamp the child's current on-disk LSN
+                // into the parent IN's slot so the parent, logged next in this
+                // checkpoint, carries a pointer recovery can follow to lazily
+                // re-fetch this BIN (`child_at_or_fetch`).
+                Tree::update_parent_slot_lsn(&bin_arc, seed_full_lsn);
+
+                // Single-level tree: this BIN IS the root — seed recovery from
+                // its full LSN directly (it has no parent IN slot to stamp).
+                if Some(this_node_id) == root_node_id
+                    && let Ok(g) = tree_arc.read()
+                {
+                    g.note_root_logged(seed_full_lsn);
+                }
             }
         }
 
@@ -1381,6 +1488,12 @@ impl Checkpointer {
     }
 
     /// Flush dirty upper INs for a single tree to the WAL.
+    ///
+    /// When the tree's root IN is among the flushed nodes, records the LSN it
+    /// was logged at as the tree's `root_log_lsn` (`Tree::note_root_logged`),
+    /// so that `Tree::get_root_lsn` — read into `CheckpointEnd.per_db_roots`
+    /// — reflects the checkpointed root.  JE keeps this invariant via the
+    /// root `ChildReference`'s LSN being updated when the root is logged.
     fn flush_one_tree_upper_ins(
         db_id: u64,
         tree_arc: &Arc<RwLock<Tree>>,
@@ -1388,63 +1501,108 @@ impl Checkpointer {
     ) -> Result<FlushResult> {
         let mut result = FlushResult::default();
 
-        // Collect dirty upper INs under a read lock.
-        let dirty_ins = {
-            let tree_guard = tree_arc.read().map_err(|_| {
-                RecoveryError::CheckpointError(
-                    "tree lock poisoned during upper-IN flush".to_string(),
-                )
-            })?;
-            tree_guard.collect_dirty_upper_ins(db_id)
+        // Identify the tree's current root node so we can record the LSN it is
+        // logged at (below) as the seed for recovery lazy-fetch, and find the
+        // root level so it is logged Provisional::No.
+        let (root_node_id, root_level): (Option<u64>, i32) = {
+            let root = tree_arc.read().ok().and_then(|g| g.get_root());
+            match root {
+                Some(r) => {
+                    let g = r.read();
+                    (Some(g.node_id()), g.level())
+                }
+                None => (None, 0),
+            }
         };
 
-        if dirty_ins.is_empty() {
-            return Ok(result);
-        }
-
-        // The maximum level present is the root level; it must be logged
-        // Provisional::No.  All others use Provisional::Yes.
-        let max_level =
-            dirty_ins.iter().map(|(lvl, _)| *lvl).max().unwrap_or(0);
-
-        for (level, node_arc) in &dirty_ins {
-            let mut node_guard = node_arc.write();
-
-            if !node_guard.is_dirty() {
-                continue; // may have been cleared by a concurrent checkpoint
-            }
-
-            // Serialize the upper IN using the existing `write_to_bytes()` path.
-            let node_bytes = node_guard.write_to_bytes();
-            let provisional = if *level == max_level {
-                Provisional::No
-            } else {
-                Provisional::Yes
+        // Process levels bottom-up.  Re-collect the dirty upper-IN set at the
+        // START of each level so that a parent dirtied by stamping a child's
+        // LSN at the level below is picked up when we reach its level (JE
+        // logs INs bottom-up, dirtying parents as children are logged; the
+        // root ends up carrying every child's current on-disk LSN).  Tree
+        // depth is small, so re-collecting per level is cheap.
+        //
+        // The lowest present upper-IN level is level 2 (`MAIN_LEVEL | 2`);
+        // BINs (level `MAIN_LEVEL | 1`) were flushed by `flush_one_tree_bins`.
+        let mut level = noxu_tree::tree::MAIN_LEVEL | 2;
+        while level <= root_level {
+            let nodes_at_level: Vec<Arc<NodeRwLock<TreeNode>>> = {
+                let tree_guard = tree_arc.read().map_err(|_| {
+                    RecoveryError::CheckpointError(
+                        "tree lock poisoned during upper-IN flush".to_string(),
+                    )
+                })?;
+                tree_guard
+                    .collect_dirty_upper_ins(db_id)
+                    .into_iter()
+                    .filter(|(lvl, _)| *lvl == level)
+                    .map(|(_, arc)| arc)
+                    .collect()
             };
 
-            let entry = InLogEntry::new(
-                db_id,
-                noxu_util::NULL_LSN, // prev_full_lsn — no previous version tracking for upper INs yet
-                noxu_util::NULL_LSN, // prev_delta_lsn
-                node_bytes,
-            );
-            let mut buf = bytes::BytesMut::with_capacity(entry.log_size());
-            entry.write_to_log(&mut buf);
-            lm.log(
-                LogEntryType::IN,
-                &buf,
-                provisional,
-                false, // flush_required
-                false, // fsync_required — fsync at CkptEnd
-            )
-            .map_err(|e| {
-                RecoveryError::CheckpointError(format!(
-                    "IN WAL write failed: {e}"
-                ))
-            })?;
+            for node_arc in &nodes_at_level {
+                let mut node_guard = node_arc.write();
 
-            node_guard.set_dirty(false);
-            result.full_ins_flushed += 1;
+                if !node_guard.is_dirty() {
+                    continue; // cleared by a concurrent checkpoint
+                }
+
+                let this_node_id = node_guard.node_id();
+
+                // Serialize the upper IN using the existing `write_to_bytes()`.
+                let node_bytes = node_guard.write_to_bytes();
+                let provisional = if level == root_level {
+                    Provisional::No
+                } else {
+                    Provisional::Yes
+                };
+
+                let entry = InLogEntry::new(
+                    db_id,
+                    noxu_util::NULL_LSN, // prev_full_lsn
+                    noxu_util::NULL_LSN, // prev_delta_lsn
+                    node_bytes,
+                );
+                let mut buf = bytes::BytesMut::with_capacity(entry.log_size());
+                entry.write_to_log(&mut buf);
+                let logged_lsn = lm
+                    .log(
+                        LogEntryType::IN,
+                        &buf,
+                        provisional,
+                        false, // flush_required
+                        false, // fsync_required — fsync at CkptEnd
+                    )
+                    .map_err(|e| {
+                        RecoveryError::CheckpointError(format!(
+                            "IN WAL write failed: {e}"
+                        ))
+                    })?;
+
+                node_guard.set_dirty(false);
+                result.full_ins_flushed += 1;
+                // Release the node write lock before touching its parent
+                // (parent-then-child lock order).
+                drop(node_guard);
+
+                // JE `IN.updateEntry`: stamp this IN's current on-disk LSN into
+                // its parent's slot (dirtying the parent), so the parent —
+                // logged at the next level up — carries a pointer recovery can
+                // follow.  For the root there is no parent; record its LSN as
+                // the tree's seed root LSN instead.
+                if Some(this_node_id) == root_node_id {
+                    if let Ok(g) = tree_arc.read() {
+                        g.note_root_logged(logged_lsn);
+                    }
+                } else {
+                    Tree::update_parent_slot_lsn(node_arc, logged_lsn);
+                }
+            }
+
+            // Advance to the next level up.  Levels are `MAIN_LEVEL | n`; the
+            // numeric successor of a level is `level + 1` (the low bits hold
+            // the depth).
+            level += 1;
         }
 
         Ok(result)

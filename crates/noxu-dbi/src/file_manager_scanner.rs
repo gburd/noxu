@@ -321,6 +321,7 @@ impl FileManagerLogScanner {
                     last_replicated_db_id: e.get_last_replicated_db_id(),
                     last_local_txn_id: e.get_last_local_txn_id(),
                     last_replicated_txn_id: e.get_last_replicated_txn_id(),
+                    per_db_roots: e.get_per_db_roots().to_vec(),
                 }))
             }
 

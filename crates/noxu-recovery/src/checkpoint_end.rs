@@ -43,6 +43,25 @@ pub struct CheckpointEnd {
     last_replicated_txn_id: i64,
     /// True if there were cleaned files to delete after this checkpoint.
     cleaned_files_to_delete: bool,
+    /// Per-database tree root LSNs captured at checkpoint time (v2 field).
+    ///
+    /// Each entry is `(db_id, root_lsn)` where `root_lsn` is the LSN the
+    /// database's tree root IN/BIN was last logged at as of this checkpoint
+    /// (`Tree::get_root_lsn`, the Noxu equivalent of JE `Tree.getRootLsn()`
+    /// = `root.getLsn()`).  Recovery seeds each reconstructed tree from these
+    /// (`Tree::set_root_lsn`) so it can lazily fetch pre-checkpoint BINs
+    /// (`fetchTarget`) instead of replaying every pre-checkpoint LN.
+    ///
+    /// # On-disk backward compatibility
+    ///
+    /// This field is serialized AFTER the original (v1) trailer, guarded by a
+    /// trailing presence marker (see `write_to_log` / `read_from_log`).  A v1
+    /// `CheckpointEnd` written before this field existed has no trailing
+    /// bytes, so `read_from_log` yields an EMPTY `per_db_roots`.  Recovery
+    /// treats an empty map as "no seeded roots" and falls back to full LN
+    /// redo — the exact pre-existing (safe) behaviour.  Old readers reading a
+    /// new entry stop after the v1 trailer and ignore the extra bytes.
+    per_db_roots: Vec<(u64, Lsn)>,
 }
 
 impl CheckpointEnd {
@@ -76,6 +95,7 @@ impl CheckpointEnd {
             last_local_txn_id,
             last_replicated_txn_id,
             cleaned_files_to_delete,
+            per_db_roots: Vec::new(),
         }
     }
 
@@ -112,6 +132,7 @@ impl CheckpointEnd {
             last_local_txn_id,
             last_replicated_txn_id,
             cleaned_files_to_delete,
+            per_db_roots: Vec::new(),
         }
     }
 
@@ -168,6 +189,24 @@ impl CheckpointEnd {
         self.cleaned_files_to_delete
     }
 
+    /// Per-database tree root LSNs recorded at checkpoint time.
+    ///
+    /// Empty for a v1 (pre-per-db-roots) checkpoint or when no user database
+    /// had a materialisable root; recovery then falls back to full LN redo.
+    pub fn get_per_db_roots(&self) -> &[(u64, Lsn)] {
+        &self.per_db_roots
+    }
+
+    /// Builder-style setter for the per-database root LSNs (v2 field).
+    ///
+    /// Called by the checkpointer after flushing every open user database's
+    /// dirty INs, passing each tree's post-flush root LSN
+    /// (`Tree::get_root_lsn`).
+    pub fn with_per_db_roots(mut self, per_db_roots: Vec<(u64, Lsn)>) -> Self {
+        self.per_db_roots = per_db_roots;
+        self
+    }
+
     /// Returns the serialized size in bytes.
     ///
     /// Format:
@@ -186,6 +225,13 @@ impl CheckpointEnd {
     /// - last_replicated_txn_id: 8 bytes (i64, big-endian)
     /// - timestamp_secs: 8 bytes (i64, big-endian)
     /// - timestamp_nanos: 4 bytes (u32, big-endian)
+    ///
+    /// v2 trailer (present only when `per_db_roots` is non-empty; a v1 entry
+    /// and a v2 entry with no roots are byte-identical, preserving backward
+    /// compatibility):
+    /// - marker: 1 byte (0x01 = per_db_roots follow)
+    /// - count: 4 bytes (u32, big-endian)
+    /// - count * { db_id: 8 bytes (u64), root_lsn: 8 bytes (u64) }
     pub fn log_size(&self) -> usize {
         let mut size = 8 + 2 + self.invoker.len() + 8 + 1; // id, invoker_len, invoker, ckpt_start_lsn, flags
         if self.root_lsn.is_some() {
@@ -194,6 +240,10 @@ impl CheckpointEnd {
         size += 8; // first_active_lsn
         size += 8 * 6; // 6 ID fields (u64/i64 all 8 bytes)
         size += 8 + 4; // timestamp
+        if !self.per_db_roots.is_empty() {
+            // marker + count + 16 bytes per (db_id, root_lsn) pair
+            size += 1 + 4 + self.per_db_roots.len() * 16;
+        }
         size
     }
 
@@ -242,6 +292,18 @@ impl CheckpointEnd {
             .unwrap_or_default();
         buf.write_i64::<BigEndian>(duration.as_secs() as i64)?;
         buf.write_u32::<BigEndian>(duration.subsec_nanos())?;
+
+        // v2 trailer: per-database root LSNs.  Written only when non-empty so
+        // that a checkpoint with no seeded roots is byte-identical to a v1
+        // entry (backward compatibility — see the struct-field doc comment).
+        if !self.per_db_roots.is_empty() {
+            buf.write_u8(PER_DB_ROOTS_MARKER)?;
+            buf.write_u32::<BigEndian>(self.per_db_roots.len() as u32)?;
+            for (db_id, root_lsn) in &self.per_db_roots {
+                buf.write_u64::<BigEndian>(*db_id)?;
+                buf.write_u64::<BigEndian>(root_lsn.as_u64())?;
+            }
+        }
 
         Ok(())
     }
@@ -303,6 +365,13 @@ impl CheckpointEnd {
         let end_time = SystemTime::UNIX_EPOCH
             + std::time::Duration::new(secs as u64, nanos);
 
+        // v2 trailer: per-database root LSNs.  Absent in a v1 entry — detect
+        // it by the trailing presence marker.  Any read error here degrades
+        // gracefully to an empty map (full LN redo), never to corruption:
+        // a truncated/garbled trailer must not fail recovery of an otherwise
+        // valid checkpoint.
+        let per_db_roots = read_per_db_roots(&mut cursor, buf);
+
         Ok(Self {
             id,
             invoker,
@@ -317,8 +386,59 @@ impl CheckpointEnd {
             last_local_txn_id,
             last_replicated_txn_id,
             cleaned_files_to_delete,
+            per_db_roots,
         })
     }
+}
+
+/// Marker byte introducing the v2 per-database-roots trailer.
+const PER_DB_ROOTS_MARKER: u8 = 0x01;
+
+/// Read the optional v2 per-database-roots trailer.
+///
+/// Returns an empty vector when the trailer is absent (v1 entry), when the
+/// marker byte does not match, or when the trailer is truncated/inconsistent.
+/// Degrading to empty (→ full LN redo) is always safe; the alternative
+/// (failing recovery of a valid checkpoint) is not.
+fn read_per_db_roots(
+    cursor: &mut Cursor<&[u8]>,
+    buf: &[u8],
+) -> Vec<(u64, Lsn)> {
+    let pos = cursor.position() as usize;
+    // No trailing bytes, or not even a marker byte: v1 entry.
+    if pos >= buf.len() {
+        return Vec::new();
+    }
+    let marker = match cursor.read_u8() {
+        Ok(m) => m,
+        Err(_) => return Vec::new(),
+    };
+    if marker != PER_DB_ROOTS_MARKER {
+        return Vec::new();
+    }
+    let count = match cursor.read_u32::<BigEndian>() {
+        Ok(c) => c as usize,
+        Err(_) => return Vec::new(),
+    };
+    // Bound the allocation to what the buffer can actually hold (16 bytes per
+    // pair) so a garbled count cannot trigger a huge reservation.
+    let remaining = buf.len().saturating_sub(cursor.position() as usize);
+    if count > remaining / 16 {
+        return Vec::new();
+    }
+    let mut roots = Vec::with_capacity(count);
+    for _ in 0..count {
+        let db_id = match cursor.read_u64::<BigEndian>() {
+            Ok(v) => v,
+            Err(_) => return roots,
+        };
+        let lsn = match cursor.read_u64::<BigEndian>() {
+            Ok(v) => Lsn::from_u64(v),
+            Err(_) => return roots,
+        };
+        roots.push((db_id, lsn));
+    }
+    roots
 }
 
 #[cfg(test)]
@@ -635,5 +755,96 @@ mod tests {
         let buf = vec![0u8; 5];
         let result = CheckpointEnd::read_from_log(&buf);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_per_db_roots_round_trip() {
+        let roots = vec![
+            (1u64, Lsn::new(3, 100)),
+            (7u64, Lsn::new(9, 4096)),
+            (42u64, NULL_LSN),
+        ];
+        let ckpt = CheckpointEnd::new(
+            5,
+            "daemon",
+            Lsn::new(1, 0),
+            None,
+            NULL_LSN,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            false,
+        )
+        .with_per_db_roots(roots.clone());
+
+        let mut buf = Vec::new();
+        ckpt.write_to_log(&mut buf).unwrap();
+        assert_eq!(buf.len(), ckpt.log_size());
+
+        let restored = CheckpointEnd::read_from_log(&buf).unwrap();
+        assert_eq!(restored.get_per_db_roots(), roots.as_slice());
+    }
+
+    #[test]
+    fn test_no_per_db_roots_is_byte_identical_to_v1() {
+        // A checkpoint with no seeded roots must serialize EXACTLY like a
+        // pre-per-db-roots (v1) entry, so old and new readers agree and the
+        // trailer is truly optional.
+        let ckpt = CheckpointEnd::new(
+            9,
+            "api",
+            Lsn::new(2, 200),
+            Some(Lsn::new(4, 40)),
+            Lsn::new(6, 60),
+            11,
+            -11,
+            22,
+            -22,
+            33,
+            -33,
+            true,
+        );
+        let mut buf = Vec::new();
+        ckpt.write_to_log(&mut buf).unwrap();
+
+        // No trailing marker byte was written.
+        // (log_size accounts for exactly the v1 layout when roots are empty.)
+        assert_eq!(buf.len(), ckpt.log_size());
+        let restored = CheckpointEnd::read_from_log(&buf).unwrap();
+        assert!(restored.get_per_db_roots().is_empty());
+    }
+
+    #[test]
+    fn test_v1_entry_reads_back_with_empty_roots() {
+        // Simulate reading an OLD (v1) on-disk CheckpointEnd: serialize with
+        // no roots (byte-identical to v1), then read it back.  Recovery must
+        // see an empty per_db_roots and fall back to full redo.
+        let ckpt = CheckpointEnd::new(
+            1, "recovery", Lsn::new(5, 50), None, Lsn::new(6, 60), 100, -100,
+            200, -200, 300, -300, false,
+        );
+        let mut buf = Vec::new();
+        ckpt.write_to_log(&mut buf).unwrap();
+        let restored = CheckpointEnd::read_from_log(&buf).unwrap();
+        assert!(restored.get_per_db_roots().is_empty());
+    }
+
+    #[test]
+    fn test_garbled_trailer_degrades_to_empty() {
+        // A v1 entry with junk appended (e.g. from a torn write) must not fail
+        // recovery; the trailer parser degrades to an empty map.
+        let ckpt = CheckpointEnd::new(
+            1, "t", Lsn::new(1, 0), None, NULL_LSN, 0, 0, 0, 0, 0, 0, false,
+        );
+        let mut buf = Vec::new();
+        ckpt.write_to_log(&mut buf).unwrap();
+        // Append a bogus marker + truncated count.
+        buf.push(PER_DB_ROOTS_MARKER);
+        buf.push(0xFF); // partial u32 count
+        let restored = CheckpointEnd::read_from_log(&buf).unwrap();
+        assert!(restored.get_per_db_roots().is_empty());
     }
 }

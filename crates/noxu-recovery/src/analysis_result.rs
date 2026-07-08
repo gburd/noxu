@@ -184,6 +184,15 @@ pub struct AnalysisResult {
     /// LSN of the mapping-tree root.
     pub use_root_lsn: Lsn,
 
+    /// Per-database tree root LSNs from the last `CkptEnd` (`(db_id,
+    /// root_lsn)`).  Empty for a v1 (pre-per-db-roots) checkpoint or when no
+    /// checkpoint was found.  Used to seed each reconstructed tree
+    /// (`Tree::set_root_lsn`) before redo so recovery can lazily fetch
+    /// pre-checkpoint BINs (`fetchTarget`) rather than replaying every
+    /// pre-checkpoint LN.  Kept as the roots of the LAST `CkptEnd` seen in the
+    /// forward analysis scan (a later checkpoint supersedes an earlier one).
+    pub per_db_roots: Vec<(u64, Lsn)>,
+
     /// Database name → ID mappings accumulated from NameLN entries.
     /// Populated by `record_name_ln`; consumed by `RecoveryManager`.
     pub recovered_db_names: hashbrown::HashMap<String, u64>,
@@ -236,6 +245,7 @@ impl AnalysisResult {
             last_checkpoint_id: None,
             first_active_lsn: NULL_LSN,
             use_root_lsn: NULL_LSN,
+            per_db_roots: Vec::new(),
             recovered_db_names: hashbrown::HashMap::new(),
             recovered_db_txn_ids: hashbrown::HashMap::new(),
             recovered_db_comparators: hashbrown::HashMap::new(),
