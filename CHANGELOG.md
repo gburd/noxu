@@ -20,6 +20,9 @@ listed in [References](#references).
 - Ported the property-based tests for `noxu-log`, `noxu-recovery`, and
   `noxu-cleaner` from proptest to Hegel (`hegeltest` 0.25); dropped the
   `proptest` dev-dependency from all three crates (no other code used it).
+- **Property tests ported from `proptest` to Hegel (hegeltest 0.25).**
+  Ported `noxu-dbi`'s property-based tests; `proptest` dropped from that
+  crate's dev-dependencies (no remaining users).
 
 ### Fixed
 
