@@ -593,6 +593,26 @@ pub static LOG_FSYNC_MAX_LEADERS: ConfigParam = ConfigParam::int_param(
     false,    // forReplication
 );
 
+/// Consolidation-array Log Write Latch (Aether VLDB'10 tech 3 / Silo SOSP'13
+/// / WiredTiger `log_slot.c`).  When `true`, concurrent committers combine
+/// into one batch via a lock-free CAS-join and a single leader drives the
+/// whole batch's LSN-assign + buffer-slot reservation under ONE latch
+/// acquisition — dissolving the per-committer futex park/wake convoy on the
+/// log-write latch (the #1 measured write bottleneck: 40/46 threads block on
+/// it; `txn_mix` collapses).
+///
+/// The single WAL + single monotonic LSN are preserved (the leader assigns a
+/// contiguous LSN range in arrival order); on-disk format is byte-identical.
+/// Defaults to `false` (the classic mutex path) — opt in after validating the
+/// shuttle model on the target platform.  Immutable at runtime (chosen at
+/// environment open).
+pub static LOG_CONSOLIDATION_ARRAY: ConfigParam = ConfigParam::bool_param(
+    "noxu.log.consolidationArray",
+    false, // default: classic mutex LWL, no behaviour change
+    false, // mutable
+    false, // forReplication
+);
+
 /// Interval for periodic log flush with sync durability.
 pub static LOG_FLUSH_SYNC_INTERVAL: ConfigParam = ConfigParam {
     name: "noxu.log.flushSyncInterval",
@@ -1805,6 +1825,7 @@ pub fn all_params() -> Vec<&'static ConfigParam> {
         &LOG_GROUP_COMMIT_INTERVAL,
         &LOG_GROUP_COMMIT_THRESHOLD,
         &LOG_FSYNC_MAX_LEADERS,
+        &LOG_CONSOLIDATION_ARRAY,
         &LOG_FLUSH_SYNC_INTERVAL,
         &LOG_FLUSH_NO_SYNC_INTERVAL,
         &LOG_USE_ODSYNC,

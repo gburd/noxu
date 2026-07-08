@@ -797,6 +797,9 @@ impl EnvironmentImpl {
                 cfg.log_group_commit_interval_ms,
                 cfg.log_fsync_max_leaders,
             );
+            // Wire the LOG_CONSOLIDATION_ARRAY knob: route the LWL through the
+            // lock-free combining funnel instead of the mutex when enabled.
+            lm.set_use_consolidation_array(cfg.log_consolidation_array);
             // Wire the LOG_CHECKSUM_READ knob (JE
             // LogManager.getChecksumOnRead). Default true matches JE.
             lm.set_checksum_on_read(cfg.log_checksum_read);
