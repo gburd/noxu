@@ -2952,6 +2952,60 @@ impl Tree {
         self.database_id
     }
 
+    /// LSN at which this tree's root IN/BIN was last logged (`root_log_lsn`),
+    /// or `NULL_LSN` if the root was never logged.
+    ///
+    /// This is the Noxu equivalent of `Tree.getRootLsn()` (Tree.java:534,
+    /// `return root.getLsn()`): the root `ChildReference`'s LSN.  The
+    /// checkpointer records it per database in `CheckpointEnd` so that
+    /// recovery can seed the reconstructed tree (`set_root_lsn`) and lazily
+    /// fetch pre-checkpoint BINs from the checkpointed root on descent, rather
+    /// than replaying every pre-checkpoint LN.
+    pub fn get_root_lsn(&self) -> Lsn {
+        *self.root_log_lsn.read()
+    }
+
+    /// Seed the tree's root LSN without materializing the root node.
+    ///
+    /// Used by recovery to point a freshly-created (empty) tree at the
+    /// checkpointed root recorded in `CheckpointEnd`.  Leaving `root` itself
+    /// `None` means the first access (`get_root` / `redo_insert`) lazily
+    /// fetches the root from `log_lsn` via `fetch_root_from_log`, and the
+    /// descent then fetches each pre-checkpoint child BIN on demand
+    /// (`child_at_or_fetch`) — the faithful equivalent of JE seeding
+    /// `info.useRootLsn` from `CheckpointEnd.getRootLsn()`
+    /// (RecoveryManager.java:682) and reading the tree back from the log
+    /// (`readMapTreeFromLog`).
+    ///
+    /// A `NULL_LSN` seed is a no-op (nothing to fetch) — recovery then falls
+    /// back to full LN redo, which is the correct behaviour for a tree that
+    /// has no checkpointed root (e.g. an old-format `CheckpointEnd` with no
+    /// per-DB roots, or a database created after the last checkpoint).
+    ///
+    /// Requires that a `LogManager` be wired (`set_log_manager`) before the
+    /// first access, or the lazy fetch cannot read the root back.
+    pub fn set_root_lsn(&self, log_lsn: Lsn) {
+        if log_lsn == NULL_LSN {
+            return;
+        }
+        *self.root_log_lsn.write() = log_lsn;
+    }
+
+    /// Record the LSN at which the checkpointer just logged this tree's root
+    /// IN/BIN, so that `get_root_lsn` reflects the checkpointed root.
+    ///
+    /// JE `Checkpointer` logs each database's root as the non-provisional
+    /// checkpoint anchor and the root `ChildReference`'s LSN is updated to it
+    /// (analogous to `evictRoot`: `rootRef.setLsn(newLsn)`).  Noxu's
+    /// checkpointer calls this after logging the root so a subsequent
+    /// `get_root_lsn()` returns the post-flush LSN recorded in `CheckpointEnd`.
+    pub fn note_root_logged(&self, log_lsn: Lsn) {
+        if log_lsn == NULL_LSN {
+            return;
+        }
+        *self.root_log_lsn.write() = log_lsn;
+    }
+
     /// Count the total number of live (non-deleted) entries across all BINs.
     ///
     /// Used by `DatabaseImpl::set_recovered_tree()` to initialise the
@@ -3816,6 +3870,16 @@ impl Tree {
         let data_opt: Option<&[u8]> =
             if data.is_empty() { None } else { Some(data) };
 
+        // Recovery seed: if the root is not resident but a checkpointed root
+        // LSN was seeded (`set_root_lsn`), materialise it from the log FIRST,
+        // so the first-key path below does not mistake a checkpoint-seeded
+        // tree for an empty one and discard the seed.  `fetch_root_from_log`
+        // is a no-op returning None when there is no seed (genuinely empty
+        // tree), so the ordinary empty-tree path is preserved.
+        if !self.is_root_resident() && self.get_root_lsn() != NULL_LSN {
+            let _ = self.fetch_root_from_log();
+        }
+
         // First-key path: initialise a two-level tree from scratch.
         {
             let mut root_guard = self.root.write();
@@ -3898,6 +3962,7 @@ impl Tree {
             self.max_entries_per_node,
             self.key_comparator.as_ref(),
             self.key_prefixing,
+            self,
         )?;
 
         if result && let Some(counter) = &self.memory_counter {
@@ -4684,6 +4749,7 @@ impl Tree {
         max_entries: usize,
         key_comparator: Option<&KeyComparatorFn>,
         key_prefixing: bool,
+        tree: &Tree,
     ) -> Result<bool, TreeError> {
         Self::redo_insert_recursive_inner(
             node_arc,
@@ -4695,6 +4761,7 @@ impl Tree {
             key_prefixing,
             true,
             true,
+            tree,
         )
     }
 
@@ -4709,6 +4776,7 @@ impl Tree {
         key_prefixing: bool,
         all_left_so_far: bool,
         all_right_so_far: bool,
+        tree: &Tree,
     ) -> Result<bool, TreeError> {
         let parent_guard = node_arc.read();
         let is_bin = parent_guard.is_bin();
@@ -4769,33 +4837,50 @@ impl Tree {
                 TreeNode::Internal(_) => Err(TreeError::SplitRequired),
             }
         } else {
-            let (child_index, n_entries_at_level, child_arc) =
-                match &*parent_guard {
-                    TreeNode::Internal(n) => {
-                        let mut idx = 0usize;
-                        for (i, entry) in n.entries.iter().enumerate() {
-                            if i == 0 {
-                                idx = 0;
+            // Resolve the routing slot for `key` under the read guard, then
+            // release it before (possibly) fetching the child, because
+            // `child_at_or_fetch` needs the parent write lock to install a
+            // lazily-fetched child.
+            let (child_index, n_entries_at_level) = match &*parent_guard {
+                TreeNode::Internal(n) => {
+                    let mut idx = 0usize;
+                    for (i, entry) in n.entries.iter().enumerate() {
+                        if i == 0 {
+                            idx = 0;
+                        } else {
+                            let ord = match key_comparator {
+                                Some(cmp) => cmp(entry.key.as_slice(), key),
+                                None => entry.key.as_slice().cmp(key),
+                            };
+                            if ord != std::cmp::Ordering::Greater {
+                                idx = i;
                             } else {
-                                let ord = match key_comparator {
-                                    Some(cmp) => cmp(entry.key.as_slice(), key),
-                                    None => entry.key.as_slice().cmp(key),
-                                };
-                                if ord != std::cmp::Ordering::Greater {
-                                    idx = i;
-                                } else {
-                                    break;
-                                }
+                                break;
                             }
                         }
-                        let child =
-                            n.get_child(idx).ok_or(TreeError::SplitRequired)?;
-                        (idx, n.entries.len(), child)
                     }
-                    TreeNode::Bottom(_) => {
-                        return Err(TreeError::SplitRequired);
-                    }
-                };
+                    (idx, n.entries.len())
+                }
+                TreeNode::Bottom(_) => {
+                    return Err(TreeError::SplitRequired);
+                }
+            };
+            drop(parent_guard);
+
+            // Recovery lazy fetch (JE `fetchTarget` during redo): the child
+            // slot of a checkpoint-seeded IN may be non-resident — only its
+            // on-disk LSN is known.  `child_at_or_fetch` returns the cached
+            // child on the fast path and otherwise reads it back from the
+            // log, installing it under the parent write latch.  This is what
+            // materialises pre-checkpoint BINs that are reachable from the
+            // seeded root but were not re-logged by the last checkpoint
+            // (equivalent to JE `IN.fetchIN` following a `ChildReference`
+            // LSN, RecoveryManager.buildINs).  `None` means the slot has no
+            // valid LSN or the read failed — treat as a missing subtree
+            // rather than corrupt data.
+            let child_arc = tree
+                .child_at_or_fetch(node_arc, child_index)
+                .ok_or(TreeError::SplitRequired)?;
 
             let all_left = all_left_so_far && child_index == 0;
             let all_right = all_right_so_far
@@ -4812,7 +4897,6 @@ impl Tree {
                     (_, true) => SplitHint::AllRight,
                     _ => SplitHint::Normal,
                 };
-                drop(parent_guard);
                 Self::split_child(
                     node_arc,
                     child_index,
@@ -4838,10 +4922,11 @@ impl Tree {
                     key_prefixing,
                     all_left_so_far,
                     all_right_so_far,
+                    tree,
                 );
             }
 
-            let r = Self::redo_insert_recursive_inner(
+            Self::redo_insert_recursive_inner(
                 &child_arc,
                 key,
                 data,
@@ -4851,9 +4936,8 @@ impl Tree {
                 key_prefixing,
                 all_left,
                 all_right,
-            );
-            drop(parent_guard);
-            r
+                tree,
+            )
         }
     }
 
@@ -5017,6 +5101,15 @@ impl Tree {
     /// cursor layer (`cursor_impl.rs::log_ln_write`) before this is called,
     /// matching separation between LN logging and tree mutation.
     pub fn delete(&self, key: &[u8]) -> bool {
+        // Recovery seed: materialise a checkpoint-seeded root before descent
+        // so a delete-LN redo can reach (and fetch) a non-resident BIN.
+        // Without this a delete targeting a pre-checkpoint BIN that lazy
+        // fetch has not yet materialised would silently no-op, resurrecting
+        // a record the log says was removed.  No-op when the tree is
+        // genuinely empty (no seed).
+        if !self.is_root_resident() && self.get_root_lsn() != NULL_LSN {
+            let _ = self.fetch_root_from_log();
+        }
         let root = match self.get_root() {
             Some(r) => r,
             None => return false,
@@ -5035,8 +5128,12 @@ impl Tree {
             0
         };
 
-        let deleted =
-            Self::delete_recursive(&root, key, self.key_comparator.as_ref());
+        let deleted = Self::delete_recursive(
+            &root,
+            key,
+            self.key_comparator.as_ref(),
+            self,
+        );
 
         // Update the memory counter when an entry is removed.
         // IN.updateMemorySize(-delta) → MemoryBudget.updateTreeMemoryUsage(-delta).
@@ -5054,6 +5151,7 @@ impl Tree {
         node_arc: &Arc<RwLock<TreeNode>>,
         key: &[u8],
         key_comparator: Option<&KeyComparatorFn>,
+        tree: &Tree,
     ) -> bool {
         // Latch coupling, mirroring `insert_recursive`. Without this,
         // delete has the same "BIN split out from under us" race: thread
@@ -5068,7 +5166,11 @@ impl Tree {
         // semantically a lost delete.
         let parent_guard = node_arc.read();
         let is_bin = parent_guard.is_bin();
-        let child_arc = if !is_bin {
+        // For an internal node, resolve the routing slot index under the read
+        // guard; the child Arc itself is fetched below (after the guard is
+        // dropped) so a non-resident, checkpoint-seeded child can be read
+        // back from the log via `child_at_or_fetch`.
+        let child_idx = if !is_bin {
             match &*parent_guard {
                 TreeNode::Internal(n) => {
                     // Find child slot with largest key <= search key
@@ -5088,7 +5190,7 @@ impl Tree {
                             }
                         }
                     }
-                    n.get_child(idx)
+                    Some(idx)
                 }
                 _ => None,
             }
@@ -5140,16 +5242,42 @@ impl Tree {
                 _ => false,
             }
         } else {
-            // Descend with parent_guard still held; the recursion will
-            // hold its own read lock and drop ours after it returns.
-            let r = match child_arc {
-                Some(child) => {
-                    Self::delete_recursive(&child, key, key_comparator)
-                }
-                None => false,
+            // Descend into the routing child.
+            //
+            // Fast path (child resident): keep the parent read guard held
+            // across the recursive descent, preserving the latch-coupling
+            // that stops a concurrent `split_child` from moving `key` into a
+            // sibling out from under us (the lost-delete race documented
+            // above).
+            //
+            // Slow path (child non-resident, checkpoint-seeded): the child
+            // must be fetched from the log, which needs the parent WRITE
+            // lock, so we drop the read guard first.  This path is only
+            // reached during recovery redo (single-threaded) or after a root
+            // eviction, where the concurrent-split race does not apply.
+            let resident_child = match (child_idx, &*parent_guard) {
+                (Some(idx), TreeNode::Internal(n)) => n.get_child(idx),
+                _ => None,
             };
-            drop(parent_guard);
-            r
+            if let Some(child) = resident_child {
+                let r = Self::delete_recursive(&child, key, key_comparator, tree);
+                drop(parent_guard);
+                r
+            } else {
+                drop(parent_guard);
+                match child_idx {
+                    Some(idx) => match tree.child_at_or_fetch(node_arc, idx) {
+                        Some(child) => Self::delete_recursive(
+                            &child,
+                            key,
+                            key_comparator,
+                            tree,
+                        ),
+                        None => false,
+                    },
+                    None => false,
+                }
+            }
         }
     }
 
