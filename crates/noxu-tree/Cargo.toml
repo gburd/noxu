@@ -23,7 +23,7 @@ byteorder = { workspace = true }
 bytes = { workspace = true }
 
 [dev-dependencies]
-proptest = { workspace = true }
+hegeltest = { workspace = true }
 tempfile = "3"
 
 # DST tree coverage: the BIN-split concurrency shuttle gate

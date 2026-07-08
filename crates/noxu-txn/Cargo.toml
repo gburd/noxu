@@ -29,7 +29,7 @@ shuttle = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
-proptest = { workspace = true }
+hegeltest = { workspace = true }
 tempfile = "3"
 
 # DST wave 2: shuttle tests in tests/shuttle_*.rs are gated behind
