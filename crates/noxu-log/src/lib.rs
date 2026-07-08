@@ -58,6 +58,7 @@ pub mod log_source;
 pub(crate) mod posio;
 
 // Buffer and log management
+pub mod consolidation;
 pub mod log_buffer;
 pub mod log_buffer_pool;
 pub mod log_file_reader;

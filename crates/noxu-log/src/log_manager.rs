@@ -84,6 +84,38 @@ struct LwlScratch {
     flush_pending: Vec<(Vec<u8>, u32, u64)>,
 }
 
+/// Per-entry request handed to the consolidation-array leader (the input to
+/// the serial under-latch work).  Carries only the LSN-independent metadata
+/// the leader needs to assign a slot; the committer's owned `entry_buf` (and
+/// its CRC finalisation) never crosses into the leader — the committer patches
+/// `prev_offset` + CRC after the leader hands `SlotResult` back (JE
+/// `addPostMarshallingInfo` after the latch).
+struct SlotRequest {
+    entry_size: usize,
+    entry_type: LogEntryType,
+    old_obsolete: Option<ObsoleteLsn>,
+    new_db_id: Option<u32>,
+    immediately_obsolete: bool,
+}
+
+/// Where a reserved entry lands.
+enum SlotPlacement {
+    /// Fits in a pool write buffer: the committer will `segment.put` its bytes.
+    Buffered(crate::log_buffer::LogBufferSegment),
+    /// Too large for any pool buffer: the committer writes directly at
+    /// `file_offset`.
+    Oversized { file_offset: u64 },
+}
+
+/// Result the leader publishes back to each committer: the assigned LSN, the
+/// `prev_offset` for its header, and where its bytes go.  The committer uses
+/// `prev_offset` to patch its header and finalise the CRC OUTSIDE the funnel.
+struct SlotResult {
+    lsn: Lsn,
+    prev_offset: u32,
+    placement: SlotPlacement,
+}
+
 impl LwlScratch {
     fn new() -> Self {
         LwlScratch { flush_pending: Vec::new() }
@@ -176,6 +208,20 @@ pub struct LogManager {
     /// per-read checksum (~40% of cold-read CPU in read-heavy workloads) for
     /// throughput.
     checksum_on_read: bool,
+
+    /// Consolidation-array LWL (Aether/Silo/WT).  When `true`, `log_internal`
+    /// routes the LSN-assign + prev_offset + buffer-slot work through a
+    /// lock-free combining funnel (`consolidation.rs`) instead of the
+    /// `log_write_latch` mutex — the leader of each batch does the whole
+    /// batch's serial work, eliminating the mutex park/wake churn.  Defaults
+    /// to `false` (mutex path unchanged) until the shuttle model gates it on;
+    /// see `EnvironmentImpl` / `LOG_CONSOLIDATION_ARRAY`.
+    use_consolidation_array: bool,
+
+    /// The combining funnel that replaces the LWL mutex when
+    /// `use_consolidation_array` is set.  A single instance per log manager
+    /// (single WAL => single serialisation point).
+    lwl_array: crate::consolidation::ConsolidationArray<SlotRequest, Result<SlotResult>>,
 }
 
 impl LogManager {
@@ -220,7 +266,139 @@ impl LogManager {
             // JE default: validate checksums on read. EnvironmentImpl
             // overrides via set_checksum_on_read() from log_checksum_read.
             checksum_on_read: true,
+            // Consolidation-array LWL off by default (mutex path unchanged);
+            // EnvironmentImpl flips it on via set_use_consolidation_array().
+            use_consolidation_array: false,
+            lwl_array: crate::consolidation::ConsolidationArray::new(),
         }
+    }
+
+    /// Enables or disables the consolidation-array LWL (Aether/Silo/WT).
+    ///
+    /// When enabled, `log_internal` routes the LSN-assign + prev_offset +
+    /// buffer-slot reservation through a lock-free combining funnel instead of
+    /// the `log_write_latch` mutex.  Off by default; wired from
+    /// `LOG_CONSOLIDATION_ARRAY` by `EnvironmentImpl::open()`.
+    pub fn set_use_consolidation_array(&mut self, enabled: bool) {
+        self.use_consolidation_array = enabled;
+    }
+
+    /// The serial "under-latch" work for one entry: file-flip check, LSN
+    /// assign, `prev_offset` computation, observer/utilization tracking,
+    /// `get_write_buffer` (which may fsync + close the old file on a flip),
+    /// `set_last_position` (advance the monotonic LSN), and the buffer-slot
+    /// reservation (`allocate` + `register_lsn`).
+    ///
+    /// This is EXACTLY the work the old `log_write_latch` critical section
+    /// did, minus the committer-owned `entry_buf` touch (prev_offset patch +
+    /// CRC) which is now finalised by the committer AFTER this returns, using
+    /// the `prev_offset` handed back — JE `addPostMarshallingInfo` after the
+    /// latch.
+    ///
+    /// # Exclusion contract
+    ///
+    /// `assign_slot` takes `&self` and does NO internal locking of the LSN
+    /// state; the CALLER must guarantee single-threaded execution — either by
+    /// holding `log_write_latch` (mutex path) or by being the consolidation-
+    /// array leader (which processes its whole batch single-threaded).  Called
+    /// once per entry, in strict LSN/arrival order, so `get_next_available_lsn`
+    /// → `set_last_position` forms an uninterrupted read-modify-write of the
+    /// monotonic LSN (proof obligation #1) and `prev_offset` chains each entry
+    /// to the immediately-prior one (proof obligation #4).
+    fn assign_slot(&self, req: &SlotRequest) -> Result<SlotResult> {
+        let entry_size = req.entry_size;
+
+        // Determine whether a file flip is needed before assigning the LSN.
+        // ShouldFlipFile -> calculateNextLsn -> advanceLsn
+        let next_lsn = self.file_manager.get_next_available_lsn();
+        let current_file = next_lsn.file_number();
+
+        let flipped = {
+            let file_offset = next_lsn.file_offset() as u64;
+            file_offset + entry_size as u64 > self.file_manager.max_file_size()
+        };
+
+        let (current_lsn, file_num) = if flipped {
+            let new_file = current_file + 1;
+            let first_offset = crate::file_manager::first_log_entry_offset();
+            (Lsn::new(new_file, first_offset), new_file)
+        } else {
+            (next_lsn, current_file)
+        };
+
+        // prev_offset: offset of the last used LSN in the same file, or 0
+        // when this is the first entry in the file (the: advanceLsn).
+        let last_used = self.file_manager.get_last_used_lsn();
+        let prev_offset: u32 =
+            if last_used.is_null() || last_used.file_number() != file_num {
+                // Either first ever entry, or first entry in this new file.
+                0
+            } else {
+                last_used.file_offset()
+            };
+
+        // Utilization tracking — called in LSN-assign order (batched: once per
+        // member, in arrival order), matching the serialLogWork() tracker
+        // calls.  Unchanged from the mutex path.
+        if let Some(obs) = &self.write_observer {
+            if let Some(old) = req.old_obsolete
+                && !old.lsn.is_null()
+            {
+                obs.count_obsolete(old);
+            }
+            obs.count_new_entry(
+                current_lsn.file_number(),
+                current_lsn.file_offset(),
+                entry_size as u32,
+                req.entry_type.is_ln_type(),
+                req.entry_type.is_in_type(),
+                req.new_db_id,
+            );
+            if req.immediately_obsolete {
+                obs.count_obsolete(ObsoleteLsn {
+                    lsn: current_lsn,
+                    db_id: req.new_db_id,
+                    size: entry_size as i32,
+                    is_ln: req.entry_type.is_ln_type(),
+                    kind: ObsoleteKind::Inexact,
+                });
+            }
+        }
+
+        // Obtain a write buffer that can hold entry_size bytes.  When
+        // flipped=true this drains dirty buffers (bumpAndWriteDirty) AND
+        // fsyncs/closes the old file (syncLogEndAndFinishFile) while
+        // current_file_num still points to the old file (DRIFT-3 ordering).
+        let buffer_arc = {
+            let mut pool = self.buffer_pool.lock();
+            pool.get_write_buffer(entry_size, flipped)?
+        };
+
+        // Advance LSN bookkeeping AFTER get_write_buffer returns (DRIFT-3).
+        let new_next =
+            Lsn::new(file_num, current_lsn.file_offset() + entry_size as u32);
+        self.file_manager.set_last_position(new_next, current_lsn);
+
+        // Reserve the buffer slot: single atomic fetch_add (Round-2).  The
+        // `buffer_arc.lock()` is held only for `allocate` + `register_lsn`.
+        let buffer = buffer_arc.lock();
+        let placement = match buffer.allocate(entry_size) {
+            Some(segment) => {
+                buffer.register_lsn(current_lsn);
+                drop(buffer);
+                SlotPlacement::Buffered(segment)
+            }
+            None => {
+                // Entry too large for any pool buffer: direct write later.
+                drop(buffer);
+                self.n_temp_buffer_writes.fetch_add(1, Ordering::Relaxed);
+                SlotPlacement::Oversized {
+                    file_offset: current_lsn.file_offset() as u64,
+                }
+            }
+        };
+
+        Ok(SlotResult { lsn: current_lsn, prev_offset, placement })
     }
 
     /// Sets whether entry checksums are validated on read.
@@ -553,190 +731,94 @@ impl LogManager {
         // the LWL now runs here, off the contended path.
         entry_buf[header_size..].copy_from_slice(payload);
 
-        // Acquire the LWL — all LSN assignment and file position advancement
-        // happens under this latch, matching serialLog/serialLogWork.
+        // Route the LSN-assign + prev_offset + buffer-slot reservation
+        // through EITHER the classic `log_write_latch` mutex (default) OR the
+        // lock-free consolidation array (Aether/Silo/WT), depending on the
+        // `use_consolidation_array` flag.  Both paths call `assign_slot` with
+        // exactly one entry at a time in strict LSN/arrival order; only the
+        // *acquisition* of that serialisation point differs.
         //
-        // Under the LWL we now do ONLY the LSN-dependent + serialisation work:
-        // file-flip check, LSN assign, prev_offset patch, CRC32 (covers the
-        // just-patched prev_offset + assigned VLSN, so it must stay under the
-        // latch — JE checksums under the latch too), and the buffer-slot
-        // reservation.  No payload copy, no clone.
-        let (lsn, segment_out, oversized_out) = {
-            let _lwl_guard = self.log_write_latch.lock();
-            let entry_buf = &mut entry_buf;
-
-            // Determine whether a file flip is needed before assigning the LSN.
-            // ShouldFlipFile -> calculateNextLsn -> advanceLsn
-            let next_lsn = self.file_manager.get_next_available_lsn();
-            let current_file = next_lsn.file_number();
-
-            let flipped = {
-                let file_offset = next_lsn.file_offset() as u64;
-                file_offset + entry_size as u64
-                    > self.file_manager.max_file_size()
-            };
-
-            let (current_lsn, file_num) = if flipped {
-                let new_file = current_file + 1;
-                let first_offset =
-                    crate::file_manager::first_log_entry_offset();
-                (Lsn::new(new_file, first_offset), new_file)
-            } else {
-                (next_lsn, current_file)
-            };
-
-            // prev_offset: offset of the last used LSN in the same file, or 0
-            // when this is the first entry in the file (the: advanceLsn).
-            let last_used = self.file_manager.get_last_used_lsn();
-            let prev_offset: u32 =
-                if last_used.is_null() || last_used.file_number() != file_num {
-                    // Either first ever entry, or first entry in this new file.
-                    0
-                } else {
-                    last_used.file_offset()
-                };
-
-            // Patch prev_offset into the header buffer.
-            entry_buf[6..10].copy_from_slice(&prev_offset.to_le_bytes());
-
-            // Compute CRC32 over bytes [CHECKSUM_BYTES..entry_size].
-            // skips the first 4 bytes (the checksum field itself) when
-            // computing the checksum.
-            let crc = ChecksumValidator::compute_range(
-                entry_buf,
-                CHECKSUM_BYTES,
-                entry_size - CHECKSUM_BYTES,
-            );
-            entry_buf[0..4].copy_from_slice(&crc.to_le_bytes());
-
-            // JE faithfulness (Part-3, DRIFT-3/7): `getWriteBuffer` must be
-            // called BEFORE `advanceLsn` / `setLastPosition`.  When
-            // `flippedFile=true`, `getWriteBuffer` calls `bumpAndWriteDirty`
-            // (drains old-file dirty buffers) and then
-            // `syncLogEndAndFinishFile` (fsyncs + closes the old file) while
-            // `current_file_num` still points to the OLD file.  Only after
-            // that does `advanceLsn` advance the bookkeeping to the new file.
-            //
-            // Prior code called `set_last_position` here, advancing
-            // `current_file_num` BEFORE `get_write_buffer`, so the fsync
-            // would have targeted the (not yet created) new file instead of
-            // the old one (DRIFT-3 ordering inversion).
-            //
-            // Reference: JE `LogManager.serialLogWork` steps:
-            //   (3) getWriteBuffer(entrySize, flippedFile)  <- bumpAndWriteDirty
-            //                                                 + syncLogEndAndFinishFile
-            //   (4) advanceLsn(currentLsn, entrySize, flippedFile)  <- setLastPosition
-            //
-            // Utilization tracking — called under the LWL, matching the
-            // serialLogWork() tracker calls.
-            if let Some(obs) = &self.write_observer {
-                // Mark old version obsolete (the: countObsoleteNode /
-                // Inexact / DupsAllowed, depending on the caller).
-                if let Some(old) = old_obsolete
-                    && !old.lsn.is_null()
-                {
-                    obs.count_obsolete(old);
-                }
-                // Count the new entry (the: countNewLogEntry).
-                obs.count_new_entry(
-                    current_lsn.file_number(),
-                    current_lsn.file_offset(),
-                    entry_size as u32,
-                    entry_type.is_ln_type(),
-                    entry_type.is_in_type(),
-                    new_db_id,
-                );
-                // L-6: an immediately-obsolete LN (deleted LN, embedded LN,
-                // or an LN in a dup DB) is counted obsolete at write time via
-                // the INEXACT variant — its own just-assigned LSN, no offset
-                // tracked.  JE serialLogWork: when
-                // `entry.isImmediatelyObsolete(db)`, it calls
-                // `countObsoleteNodeInexact(lsn, type, size, db)` for the new
-                // entry.
-                if immediately_obsolete {
-                    obs.count_obsolete(ObsoleteLsn {
-                        lsn: current_lsn,
-                        db_id: new_db_id,
-                        size: entry_size as i32,
-                        is_ln: entry_type.is_ln_type(),
-                        kind: ObsoleteKind::Inexact,
-                    });
-                }
-            }
-
-            // Obtain a write buffer that can hold entry_size bytes.
-            // When flipped=true this drains dirty buffers (bumpAndWriteDirty)
-            // AND fsyncs/closes the old file (syncLogEndAndFinishFile) while
-            // current_file_num still points to the old file.
-            let buffer_arc = {
-                let mut pool = self.buffer_pool.lock();
-                pool.get_write_buffer(entry_size, flipped)?
-            };
-
-            // Advance LSN bookkeeping AFTER get_write_buffer returns.
-            // JE serialLogWork step (4): advanceLsn called after getWriteBuffer.
-            // This is the corrected ordering (DRIFT-3 fix).
-            let new_next = Lsn::new(
-                file_num,
-                current_lsn.file_offset() + entry_size as u32,
-            );
-            self.file_manager.set_last_position(new_next, current_lsn);
-            // JE faithfulness (Part-2, DRIFT-1): register LSN + allocate slot
-            // under LWL; clone bytes; then release LWL.  The bytes copy
-            // (segment.put) and direct write_buffer happen OUTSIDE the LWL.
-            //
-            // JE serialLogWork releases logWriteMutex BEFORE
-            // LogBufferSegment.put (after steps allocate + registerLsn +
-            // buffer-latch-release).  The pin-count protocol
-            // (wait_for_zero_and_latch in write_dirty) ensures the buffer
-            // buffer won't be reused before put() decrements.
-            //
-            // Round-2 change: `allocate` and `register_lsn` now take `&self`
-            // and reserve the slot with a single atomic `fetch_add` — no
-            // `latch_for_write`, no `Vec::resize`.  The `buffer_arc.lock()`
-            // here is held only long enough for those two atomic operations
-            // (it still provides mutual exclusion against the flush path's
-            // `&mut` access to `flushed_len`/`reinit`); it no longer wraps a
-            // second `read_latch` acquisition or a buffer growth.
-            let buffer = buffer_arc.lock();
-            let segment_opt = buffer.allocate(entry_size);
-
-            let (segment_out, oversized_out) = match segment_opt {
-                Some(segment) => {
-                    // Entry fits in the write buffer: register LSN and pin.
-                    buffer.register_lsn(current_lsn);
-                    drop(buffer);
-                    // MOVE the owned bytes out (no clone under the LWL — the
-                    // per-call buffer is already owned by this call, and no
-                    // later code under the latch touches it).
-                    let entry_bytes = std::mem::take(entry_buf);
-                    (Some((segment, entry_bytes)), None)
-                }
-                None => {
-                    // Entry too large for any pool buffer: write outside LWL.
-                    drop(buffer);
-                    self.n_temp_buffer_writes.fetch_add(1, Ordering::Relaxed);
-                    let entry_bytes = std::mem::take(entry_buf);
-                    let offset = current_lsn.file_offset() as u64;
-                    (None, Some((entry_bytes, offset)))
-                }
-            };
-
-            (current_lsn, segment_out, oversized_out)
+        // `assign_slot` does NOT touch this committer's `entry_buf`; it hands
+        // back `SlotResult { lsn, prev_offset, placement }`.  The committer
+        // then patches `prev_offset` + finalises the CRC on its OWN buffer
+        // OUTSIDE the serialisation point (JE `addPostMarshallingInfo` after
+        // the latch), then copies its bytes into its reserved sub-range.
+        let slot_req = SlotRequest {
+            entry_size,
+            entry_type,
+            old_obsolete,
+            new_db_id,
+            immediately_obsolete,
         };
-        // LWL released here — JE serialLogWork: logWriteMutex released BEFORE
-        // LogBufferSegment.put and BEFORE the direct write_buffer call.
-        // Concurrent committers now serialize only on in-memory bookkeeping,
-        // not on the syscall (DRIFT-1 fix, Part-2).
+        let slot = if self.use_consolidation_array {
+            use crate::consolidation::{Join, Request};
+            let request = Request::new(slot_req);
+            match self.lwl_array.join(&request) {
+                Join::Leader => {
+                    // Leader: take the log-write latch ONCE for the whole
+                    // arrived batch, then process every member single-threaded
+                    // in arrival order.  This is Aether's consolidation: N
+                    // committers cause ONE latch acquisition (by the leader),
+                    // not N — the futex park/wake convoy dissolves.  Holding
+                    // the latch here guarantees only ONE leader ever runs
+                    // `assign_slot` at a time, so a late joiner that becomes a
+                    // NEW leader (after this leader swapped the stack) still
+                    // serialises on the latch => LSN monotonicity across
+                    // batches is preserved (proof #1).  Followers NEVER touch
+                    // the latch — they spin on their result cell (no park).
+                    let _lwl_guard = self.log_write_latch.lock();
+                    self.lwl_array.run_as_leader(&request, |req| {
+                        self.assign_slot(req)
+                    })
+                }
+                Join::Follower => {
+                    // Follower: spin (no park) until the leader publishes our
+                    // slot; never dropped, never double-processed (proof #2).
+                    self.lwl_array.wait_as_follower(&request)
+                }
+            }?
+        } else {
+            // Classic mutex LWL: hold `log_write_latch` for exactly the serial
+            // work, matching serialLog/serialLogWork.
+            let _lwl_guard = self.log_write_latch.lock();
+            self.assign_slot(&slot_req)?
+        };
 
-        // Outside LWL: copy bytes into the buffer segment (JE step 8,
-        // LogBufferSegment.put outside logWriteMutex).
-        if let Some((segment, entry_bytes)) = segment_out {
-            segment.put(&entry_bytes);
-        }
-        // Outside LWL: direct write for oversized entries.
-        if let Some((entry_bytes, offset)) = oversized_out {
-            self.file_manager.write_buffer(&entry_bytes, offset)?;
+        let lsn = slot.lsn;
+        // Serialisation point released here.  Everything below runs off the
+        // contended path (JE: prevOffset + VLSN + checksum + LogBufferSegment
+        // .put all run AFTER logWriteMutex is released, addPostMarshallingInfo).
+
+        // Patch prev_offset into the header buffer (LSN-dependent, handed back
+        // by the leader/latch).  JE addPostMarshallingInfo writes prevOffset
+        // here, outside the latch.
+        entry_buf[6..10].copy_from_slice(&slot.prev_offset.to_le_bytes());
+
+        // Compute CRC32 over bytes [CHECKSUM_BYTES..entry_size].  It covers the
+        // just-patched prev_offset (LSN-dependent) + the VLSN, so it MUST be
+        // computed AFTER prev_offset is known — exactly why JE finalises the
+        // checksum in addPostMarshallingInfo after the latch, using the
+        // returned offset.  Moving it here (off the serialisation point) is
+        // the whole point of handing `prev_offset` back rather than patching
+        // the buffer under the latch.
+        let crc = ChecksumValidator::compute_range(
+            &entry_buf,
+            CHECKSUM_BYTES,
+            entry_size - CHECKSUM_BYTES,
+        );
+        entry_buf[0..4].copy_from_slice(&crc.to_le_bytes());
+
+        // Copy bytes into the reserved slot / direct-write oversized entries
+        // (JE LogBufferSegment.put outside logWriteMutex).  The pin-count
+        // protocol (wait_for_zero_and_latch in write_dirty) keeps the buffer
+        // from being reused before put() decrements the pin.
+        match slot.placement {
+            SlotPlacement::Buffered(segment) => {
+                segment.put(&entry_buf);
+            }
+            SlotPlacement::Oversized { file_offset } => {
+                self.file_manager.write_buffer(&entry_buf, file_offset)?;
+            }
         }
 
         // Flush / fsync if requested, outside the LWL (correct).
