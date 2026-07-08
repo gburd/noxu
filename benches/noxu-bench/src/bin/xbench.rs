@@ -9,6 +9,18 @@
 //!      BENCH_SECONDS BENCH_DURABILITY(SYNC|NO_SYNC) BENCH_WORKLOAD BENCH_SEED
 //!      BENCH_ISOLATION(default|serializable|read_uncommitted)
 //!      BENCH_NO_WAIT(0|1)  (1 = per-txn immediate-abort-on-conflict)
+//!      BENCH_TAIL_INTERVAL(0=off, else per-N-sec TAIL series; default 0)
+//!
+//! "Where Noxu leads" metrics (see docs/src/operations/lead-benchmarks.md):
+//!   * Tail-latency stability: RESULT emits p999/p9999/max; set
+//!     BENCH_TAIL_INTERVAL=1 for a per-second `TAIL` series so flatness is
+//!     visible over time (Noxu has no GC/compaction jitter source).
+//!   * Memory efficiency: RESULT emits cache_hit_rate, ln_fetch(_miss),
+//!     cached_bins, lru_size, ops_per_gb — hit-rate-per-GB vs MVCC engines
+//!     that spend cache on version chains.
+//!   * Write amplification: RESULT emits write_amp = physical bytes written
+//!     (log seq-write bytes; /proc/self/io as cross-check) / committed user
+//!     bytes — the metric where single-write-per-LN beats any LSM.
 
 use noxu_db::{
     DatabaseConfig, Durability, Environment, EnvironmentConfig,
@@ -144,6 +156,42 @@ impl Hist {
         }
         self.max.load(Ordering::Relaxed)
     }
+    /// Cumulative snapshot of every bucket (for interval-tail diffing).
+    fn snapshot(&self) -> Vec<u64> {
+        self.b.iter().map(|x| x.load(Ordering::Relaxed)).collect()
+    }
+}
+
+/// Percentile over the ops that landed BETWEEN two cumulative snapshots
+/// (prev→cur), i.e. one reporting interval. Bucket i == i microseconds.
+fn pct_interval(prev: &[u64], cur: &[u64], p: f64) -> u64 {
+    let total: u64 = cur.iter().zip(prev).map(|(c, p)| c - p).sum();
+    if total == 0 {
+        return 0;
+    }
+    let target = (total as f64 * p) as u64;
+    let mut cum = 0u64;
+    for i in 0..cur.len() {
+        cum += cur[i] - prev[i];
+        if cum >= target {
+            return i as u64;
+        }
+    }
+    (cur.len() - 1) as u64
+}
+
+/// Cumulative bytes this process has physically written, per the kernel
+/// (`/proc/self/io` `write_bytes`). Cross-check for the log seq-write counter.
+/// Returns 0 if unavailable (e.g. non-Linux).
+fn proc_write_bytes() -> u64 {
+    std::fs::read_to_string("/proc/self/io")
+        .ok()
+        .and_then(|s| {
+            s.lines().find_map(|l| {
+                l.strip_prefix("write_bytes:").and_then(|v| v.trim().parse().ok())
+            })
+        })
+        .unwrap_or(0)
 }
 
 fn main() {
@@ -232,8 +280,57 @@ fn main() {
     let stop = Arc::new(AtomicBool::new(false));
     let ops = Arc::new(AtomicU64::new(0));
     let aborts = Arc::new(AtomicU64::new(0));
+    // Committed user record-writes (successful puts in committed txns). Times
+    // value_size == committed user bytes, the denominator of write_amp.
+    let writes = Arc::new(AtomicU64::new(0));
+    // Committed read ops (successful gets). Denominator for the LN-cache
+    // hit-rate (1 - LN-faults-from-log / reads).
+    let reads = Arc::new(AtomicU64::new(0));
     let hist = Arc::new(Hist::new());
+    // Physical-write baselines captured just before the measured phase so
+    // write_amp reflects only measured-phase writes, not the load phase.
+    let (env_stats0, proc_wb0) = (env.stats().ok(), proc_write_bytes());
+    let log_wb0 =
+        env_stats0.as_ref().map(|s| s.log.n_sequential_write_bytes).unwrap_or(0);
+    // LN-fault baseline (log random reads = LN faulted from disk on a cache
+    // miss). n_random_reads is the LIVE cache-miss signal; the evictor
+    // ln_fetch/bin_fetch counters are declared but never incremented in the
+    // engine today (see lead-benchmarks.md "stats gaps"), so hit-rate is
+    // derived from the log random-read counter, not the evictor.
+    let rr0 = env_stats0.as_ref().map(|s| s.log.n_random_reads).unwrap_or(0);
     let start = Instant::now();
+
+    // Optional per-interval tail series (Noxu-leads flatness signal). Prints a
+    // `TAIL` line every BENCH_TAIL_INTERVAL seconds with the percentiles of
+    // ops that completed IN that interval (snapshot-diff of the histogram).
+    let tail_interval = envp("BENCH_TAIL_INTERVAL", 0);
+    let tail_reporter = if tail_interval > 0 {
+        let hist = Arc::clone(&hist);
+        let ops = Arc::clone(&ops);
+        let stop = Arc::clone(&stop);
+        Some(std::thread::spawn(move || {
+            let mut prev = hist.snapshot();
+            let mut prev_ops = 0u64;
+            let mut t = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_secs(tail_interval));
+                t += tail_interval;
+                let cur = hist.snapshot();
+                let now_ops = ops.load(Ordering::Relaxed);
+                println!("TAIL t={t} ops_s={} p50={} p99={} p999={} p9999={} max_us_bucket={}",
+                    (now_ops - prev_ops) / tail_interval,
+                    pct_interval(&prev, &cur, 0.50),
+                    pct_interval(&prev, &cur, 0.99),
+                    pct_interval(&prev, &cur, 0.999),
+                    pct_interval(&prev, &cur, 0.9999),
+                    pct_interval(&prev, &cur, 1.0));
+                prev = cur;
+                prev_ops = now_ops;
+            }
+        }))
+    } else {
+        None
+    };
 
     let handles: Vec<_> = (0..threads)
         .map(|tid| {
@@ -242,6 +339,8 @@ fn main() {
             let stop = Arc::clone(&stop);
             let ops = Arc::clone(&ops);
             let aborts = Arc::clone(&aborts);
+            let writes = Arc::clone(&writes);
+            let reads = Arc::clone(&reads);
             let hist = Arc::clone(&hist);
             let workload = workload.clone();
             let isolation = isolation.clone();
@@ -276,42 +375,47 @@ fn main() {
                 };
                 let mut local = 0u64;
                 let mut labort = 0u64;
+                // Committed record-writes this thread (per-arm; see below).
+                let mut lwrites = 0u64;
+                let mut lreads = 0u64;
                 while !stop.load(Ordering::Relaxed) {
                     let t0 = Instant::now();
                     match workload.as_str() {
                         "ycsb_a" => {
                             let k = key_bytes(zipf.next(&mut rng));
                             if rng.pct() < 50 {
-                                if let Ok(t) = begin(&env) { let _ = db.get_in(&t, k); let _ = t.commit(); }
+                                if let Ok(t) = begin(&env) { if db.get_in(&t, k).is_ok() { lreads += 1; } let _ = t.commit(); }
                             } else if let Ok(t) = begin(&env) {
-                                if db.put_in(&t, k, &value).is_ok() { if t.commit().is_err() { labort += 1; } }
+                                if db.put_in(&t, k, &value).is_ok() { if t.commit().is_err() { labort += 1; } else { lwrites += 1; } }
                                 else { let _ = t.abort(); labort += 1; }
                             }
                         }
                         "ycsb_c" => {
                             let k = key_bytes(zipf.next(&mut rng));
-                            if let Ok(t) = begin(&env) { let _ = db.get_in(&t, k); let _ = t.commit(); }
+                            if let Ok(t) = begin(&env) { if db.get_in(&t, k).is_ok() { lreads += 1; } let _ = t.commit(); }
                         }
                         "tdb_write" => {
                             let id = insert_ctr.fetch_add(1, Ordering::Relaxed);
                             if let Ok(t) = begin(&env) {
-                                if db.put_in(&t, key_bytes(id), &value).is_ok() { if t.commit().is_err() { labort += 1; } }
+                                if db.put_in(&t, key_bytes(id), &value).is_ok() { if t.commit().is_err() { labort += 1; } else { lwrites += 1; } }
                                 else { let _ = t.abort(); labort += 1; }
                             }
                         }
                         "txn_mix" => {
                             if let Ok(t) = begin(&env) {
                                 let mut ok = true;
+                                let mut puts = 0u64;
+                                let mut gets = 0u64;
                                 for j in 0..4 {
                                     let k = key_bytes(zipf.next(&mut rng));
                                     let r = match j {
-                                        0 | 1 => db.put_in(&t, k, &value).map(|_| ()),
-                                        2 => db.get_in(&t, k).map(|_| ()),
+                                        0 | 1 => db.put_in(&t, k, &value).map(|_| { puts += 1; }),
+                                        2 => db.get_in(&t, k).map(|_| { gets += 1; }),
                                         _ => db.delete_in(&t, k).map(|_| ()),
                                     };
                                     if r.is_err() { ok = false; break; }
                                 }
-                                if ok { if t.commit().is_err() { labort += 1; } } else { let _ = t.abort(); labort += 1; }
+                                if ok { if t.commit().is_err() { labort += 1; } else { lwrites += puts; lreads += gets; } } else { let _ = t.abort(); labort += 1; }
                             }
                         }
                         "hotset" => {
@@ -320,9 +424,9 @@ fn main() {
                             let k = if rng.pct() < 90 { key_bytes(rng.below(hot.max(1))) } else { key_bytes(rng.below(records)) };
                             if rng.pct() < 98 {
                                 if let Ok(t) = begin(&env) {
-                                    if db.put_in(&t, k, &value).is_ok() { if t.commit().is_err() { labort += 1; } } else { let _ = t.abort(); labort += 1; }
+                                    if db.put_in(&t, k, &value).is_ok() { if t.commit().is_err() { labort += 1; } else { lwrites += 1; } } else { let _ = t.abort(); labort += 1; }
                                 }
-                            } else if let Ok(t) = begin(&env) { let _ = db.get_in(&t, k); let _ = t.commit(); }
+                            } else if let Ok(t) = begin(&env) { if db.get_in(&t, k).is_ok() { lreads += 1; } let _ = t.commit(); }
                         }
                         "scan_under_write" => {
                             if tid % 2 == 0 {
@@ -330,14 +434,14 @@ fn main() {
                                 if let Ok(t) = begin(&env) {
                                     if let Ok(mut cur) = db.open_cursor_in(&t, None) {
                                         let _ = cur.seek(key_bytes(zipf.next(&mut rng)));
-                                        for _ in 0..100 { if cur.next().ok().flatten().is_none() { break; } }
+                                        for _ in 0..100 { if cur.next().ok().flatten().is_none() { break; } lreads += 1; }
                                     }
                                     let _ = t.commit();
                                 }
                             } else {
                                 let k = key_bytes(zipf.next(&mut rng));
                                 if let Ok(t) = begin(&env) {
-                                    if db.put_in(&t, k, &value).is_ok() { if t.commit().is_err() { labort += 1; } } else { let _ = t.abort(); labort += 1; }
+                                    if db.put_in(&t, k, &value).is_ok() { if t.commit().is_err() { labort += 1; } else { lwrites += 1; } } else { let _ = t.abort(); labort += 1; }
                                 }
                             }
                         }
@@ -349,6 +453,8 @@ fn main() {
                 }
                 let _ = local;
                 aborts.fetch_add(labort, Ordering::Relaxed);
+                writes.fetch_add(lwrites, Ordering::Relaxed);
+                reads.fetch_add(lreads, Ordering::Relaxed);
             })
         })
         .collect();
@@ -356,14 +462,59 @@ fn main() {
     std::thread::sleep(std::time::Duration::from_secs(seconds));
     stop.store(true, Ordering::Relaxed);
     for h in handles { h.join().unwrap(); }
+    if let Some(r) = tail_reporter { r.join().unwrap(); }
     let el = start.elapsed().as_secs_f64();
     let total = ops.load(Ordering::Relaxed);
     let ab = aborts.load(Ordering::Relaxed);
+    let committed_writes = writes.load(Ordering::Relaxed);
+    let committed_reads = reads.load(Ordering::Relaxed);
+
+    // ── "Where Noxu leads" metrics ──────────────────────────────────────
+    // Snapshot the engine stats once, after the measured phase.
+    let s1 = env.stats().ok();
+    // L2 memory efficiency: LN-cache hit-rate. random_reads counts LNs faulted
+    // from the log on a cache miss; a read that hits cache does no random
+    // read. hit_rate = 1 - faults/reads. (WT/RocksDB spend cache on version
+    // chains / block cache; Noxu holds exactly one version per record, so at a
+    // fixed cache it keeps more distinct records resident → higher hit-rate.)
+    let rr1 = s1.as_ref().map(|s| s.log.n_random_reads).unwrap_or(0);
+    let ln_faults = rr1.saturating_sub(rr0);
+    let cache_hit_rate = if committed_reads > 0 {
+        (1.0 - (ln_faults as f64 / committed_reads as f64)).max(0.0)
+    } else {
+        -1.0 // no reads in this workload (e.g. tdb_write) — n/a, not a false 1.0
+    };
+    let cache_gb = cache as f64 / (1024.0 * 1024.0 * 1024.0);
+    let ops_per_gb = if cache_gb > 0.0 { (total as f64 / el) / cache_gb } else { 0.0 };
+    // Resident-node counts (evictor instant stats). NOTE: lru_size/cached_bins
+    // are refreshed only by Evictor::update_lru_stats(), which the stats path
+    // does not currently call, so these often read 0 — reported for
+    // transparency; a true resident-records stat is a follow-up (see docs).
+    let (cached_bins, lru_size) = s1
+        .as_ref()
+        .map(|s| (s.evictor.cached_bins, s.evictor.lru_size))
+        .unwrap_or((0, 0));
+
+    // L3 write amplification: physical bytes written / committed user bytes.
+    // Numerator: log sequential-write bytes (Noxu writes each LN once; the
+    // cleaner reclaims but does not re-sort the dataset like an LSM). Falls
+    // back to /proc/self/io write_bytes delta if the log counter is 0.
+    let log_wb1 = s1.as_ref().map(|s| s.log.n_sequential_write_bytes).unwrap_or(0);
+    let proc_wb1 = proc_write_bytes();
+    let log_written = log_wb1.saturating_sub(log_wb0);
+    let proc_written = proc_wb1.saturating_sub(proc_wb0);
+    let user_bytes = committed_writes.saturating_mul(value_size as u64);
+    let phys_bytes = if log_written > 0 { log_written } else { proc_written };
+    let write_amp = if user_bytes > 0 { phys_bytes as f64 / user_bytes as f64 } else { 0.0 };
+
     println!("RESULT engine=noxu workload={workload} iso={isolation} dur={durability} threads={threads} \
 no_wait={no_wait} throughput={:.0} ops/s ops={total} aborts={ab} abort_rate={:.4} \
-p50={} p90={} p99={} p999={} max={}",
+p50={} p90={} p99={} p999={} p9999={} max={} \
+cache_hit_rate={:.4} committed_reads={committed_reads} ln_faults={ln_faults} cached_bins={cached_bins} lru_size={lru_size} ops_per_gb={:.0} \
+committed_writes={committed_writes} user_bytes={user_bytes} log_write_bytes={log_written} proc_write_bytes={proc_written} write_amp={:.3}",
         total as f64 / el, ab as f64 / total.max(1) as f64,
-        hist.pct(0.50), hist.pct(0.90), hist.pct(0.99), hist.pct(0.999), hist.max.load(Ordering::Relaxed));
+        hist.pct(0.50), hist.pct(0.90), hist.pct(0.99), hist.pct(0.999), hist.pct(0.9999), hist.max.load(Ordering::Relaxed),
+        cache_hit_rate, ops_per_gb, write_amp);
 
     db.close().unwrap();
     drop(db);
