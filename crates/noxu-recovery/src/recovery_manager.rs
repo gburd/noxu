@@ -227,8 +227,6 @@ pub struct RecoveryManager {
     stats: RecoveryStats,
     /// Dirty-IN map used during the redo pass.
     dirty_in_map: DirtyINMap,
-    /// Log from analysis: redo entries (collected during analysis for redo).
-    redo_entries: Vec<(Lsn, LnRecord)>,
     /// Log from analysis: undo entries (collected during backward scan).
     undo_entries: Vec<(Lsn, LnRecord)>,
     /// Per-database count of LN redo entries, built during analysis.
@@ -236,6 +234,11 @@ pub struct RecoveryManager {
     /// Used before the redo loop to call `Tree::reserve_redo_capacity` on
     /// each database tree, eliminating Vec-growth reallocations inside the
     /// BIN's entries Vec during the hot redo insert path (Fix 3).
+    ///
+    /// This is the ONLY per-LN state the analysis pass keeps: a `u64 → count`
+    /// map whose key set is also the set of db_ids that need a tree.  The LN
+    /// payloads themselves are NOT collected — the redo pass re-reads them
+    /// from the log by streaming (JE `RecoveryManager.redoLNs`).
     per_db_redo_count: HashMap<u64, usize>,
 
     /// Database name registrations (NameLN/MapLN) recovered during analysis.
@@ -384,7 +387,6 @@ impl RecoveryManager {
             rollback_tracker: RollbackTracker::new(),
             stats: RecoveryStats::default(),
             dirty_in_map: DirtyINMap::new(),
-            redo_entries: Vec::new(),
             undo_entries: Vec::new(),
             per_db_redo_count: HashMap::new(),
             mapping_tree_db_names: HashMap::new(),
@@ -403,7 +405,6 @@ impl RecoveryManager {
             rollback_tracker: RollbackTracker::new(),
             stats: RecoveryStats::default(),
             dirty_in_map: DirtyINMap::new(),
-            redo_entries: Vec::new(),
             undo_entries: Vec::new(),
             per_db_redo_count: HashMap::new(),
             mapping_tree_db_names: HashMap::new(),
@@ -569,7 +570,8 @@ impl RecoveryManager {
         // ------------------------------------------------------------------
         // XA in-doubt recovery: surface prepared txns to the env layer.
         // ------------------------------------------------------------------
-        self.info.prepared_txn_lns = self.collect_prepared_txn_lns(&analysis);
+        self.info.prepared_txn_lns =
+            self.collect_prepared_txn_lns(scanner, &analysis);
         self.info.recovered_prepared_txns =
             analysis.prepared_txns.values().cloned().collect();
 
@@ -697,18 +699,20 @@ impl RecoveryManager {
         // files_verified is available via verify_result if needed for stats.
         let _ = verify_result;
 
-        // Auto-insert trees for any db_id encountered in the redo entries.
+        // Auto-insert trees for any db_id encountered in the LN log.
         // DbTree.dbIdToDb is populated during analysis.
+        //
+        // The set of db_ids that need a tree is exactly the key set of
+        // `per_db_redo_count`, built during analysis — so we no longer need to
+        // hold every LN record just to enumerate the db_ids.
         //
         // Recovery alloc optimisation: call hint_redo_capacity on each new tree so
         // that redo_insert pre-allocates the initial BIN at
         // min(count, max_entries) capacity, eliminating Vec-resize doublings.
-        for (_lsn, rec) in &self.redo_entries {
-            let count =
-                self.per_db_redo_count.get(&rec.db_id).copied().unwrap_or(0);
+        for (&db_id, &count) in &self.per_db_redo_count {
             let tree = trees
-                .entry(rec.db_id)
-                .or_insert_with(|| noxu_tree::Tree::new(rec.db_id, 256));
+                .entry(db_id)
+                .or_insert_with(|| noxu_tree::Tree::new(db_id, 256));
             if count > 0 && tree.get_redo_capacity_hint() == 0 {
                 tree.hint_redo_capacity(count);
             }
@@ -803,7 +807,8 @@ impl RecoveryManager {
             self.rollback_tracker.safe_matchpoint_lsn().map(|lsn| lsn.as_u64());
 
         // XA in-doubt recovery: surface prepared txns to the env layer.
-        self.info.prepared_txn_lns = self.collect_prepared_txn_lns(&analysis);
+        self.info.prepared_txn_lns =
+            self.collect_prepared_txn_lns(scanner, &analysis);
         self.info.recovered_prepared_txns =
             analysis.prepared_txns.values().cloned().collect();
         // Propagate recovered database name→id mappings.
@@ -936,6 +941,86 @@ impl RecoveryManager {
             .map(|(k, v)| (k.clone(), *v))
             .collect();
     }
+    /// Stream the LN log forward and invoke `apply` for every LN that is
+    /// eligible for redo, exactly as the collect-then-redo loop did — but
+    /// WITHOUT ever materialising all LN records at once.
+    ///
+    /// Port of JE `RecoveryManager.redoLNs` (RecoveryManager.java): rather than
+    /// holding a `Vec<(Lsn, LnRecord)>` of every logged LN (O(records) memory),
+    /// JE re-reads the log via `LNFileReader` in a `while (reader.readNextEntry())`
+    /// loop and applies each eligible LN directly into the tree as it reads,
+    /// checking `eligibleForRedo(reader)` per entry.  Here the second forward
+    /// scan reuses the same streaming `scan_forward_fn` path the analysis pass
+    /// uses, and `apply` receives each eligible `(lsn, &LnRecord)` in LSN order
+    /// (analysis and redo both read the immutable-during-recovery log in
+    /// ascending LSN order, so the redo order is identical to the old
+    /// pre-collected-Vec order).
+    ///
+    /// The `LnRecord` is borrowed for the duration of the `apply` call and
+    /// dropped immediately after — apply-and-drop per entry, so peak memory is
+    /// one LN record plus the (bounded, lazily-fetched) tree, never all LNs.
+    ///
+    /// `stats.lns_read_redo` is bumped per LN; the gated-LN counter
+    /// (`info.lns_gated`) is maintained here so callers do not duplicate the
+    /// AfterCheckpointStart bookkeeping.
+    fn stream_redo_lns(
+        &mut self,
+        scanner: &dyn LogScanner,
+        analysis: &AnalysisResult,
+        mut apply: impl FnMut(&mut RecoveryStats, Lsn, &LnRecord),
+    ) {
+        let ckpt_start = analysis.checkpoint_start_lsn;
+        // Re-read the same bounded range the analysis pass scanned.  The log
+        // is immutable during recovery, so this second forward scan sees the
+        // identical set of entries in the identical order.
+        let scan_start = if analysis.first_active_lsn != NULL_LSN {
+            analysis.first_active_lsn
+        } else if ckpt_start != NULL_LSN {
+            ckpt_start
+        } else {
+            Lsn::new(0, 0)
+        };
+        let scan_end = self.info.next_available_lsn;
+
+        // Borrow the pieces of `self` the closure needs up front so the
+        // per-entry closure does not need a `&mut self` capture (the
+        // eligibility decision reads immutable rollback/seed state).
+        let stats = &mut self.stats;
+        let rollback_tracker = &self.rollback_tracker;
+        let seeded_db_ids = &self.seeded_db_ids;
+        let mut lns_gated: u64 = 0;
+
+        let mut process = |pe: PositionedEntry| {
+            let LogEntry::Ln(rec) = &pe.entry else { return };
+            let lsn = pe.lsn;
+            stats.lns_read_redo += 1;
+            let action = Self::eligible_for_redo_static(
+                rollback_tracker,
+                seeded_db_ids,
+                lsn,
+                rec,
+                ckpt_start,
+                analysis,
+            );
+            if let RedoAction::Apply = action {
+                apply(stats, lsn, rec);
+            } else if ckpt_start != NULL_LSN
+                && lsn < ckpt_start
+                && seeded_db_ids.contains(&rec.db_id)
+                && !rec.is_invisible
+                && !rollback_tracker.is_in_rollback_period(lsn)
+                && rec.txn_id.map(|t| analysis.is_committed(t)).unwrap_or(true)
+            {
+                // A committed / non-transactional pre-checkpoint-start LN of a
+                // seeded database that the redo gate skipped (its record is
+                // covered by the checkpoint-seeded lazy BIN fetch).
+                lns_gated += 1;
+            }
+        };
+        scanner.scan_forward_fn(scan_start, scan_end, &mut process);
+        self.info.lns_gated += lns_gated;
+    }
+
     fn run_redo_all(
         &mut self,
         scanner: &dyn LogScanner,
@@ -954,39 +1039,24 @@ impl RecoveryManager {
         }
         self.apply_in_redo_to_trees(scanner, analysis, trees);
 
-        let ckpt_start = analysis.checkpoint_start_lsn;
-        let redo_entries: Vec<(Lsn, LnRecord)> =
-            std::mem::take(&mut self.redo_entries);
-
         // X-14: collect VLSN→LSN pairs from replayed entries so that
         // ReplicatedEnvironment::with_environment can rebuild the VLSN index.
         let mut vlsn_pairs: Vec<(u64, u64)> = Vec::new();
 
-        for (lsn, rec) in &redo_entries {
-            self.stats.lns_read_redo += 1;
-            let action =
-                self.eligible_for_redo(*lsn, rec, ckpt_start, analysis);
-            if let RedoAction::Apply = action {
-                if let Some(curr) = rec.vlsn {
-                    vlsn_pairs.push((curr, lsn.as_u64()));
-                }
-                if let Some(t) = trees.get_mut(&rec.db_id) {
-                    Self::redo_ln(t, rec, *lsn);
-                }
-                self.stats.lns_redone += 1;
-            } else if ckpt_start != NULL_LSN
-                && *lsn < ckpt_start
-                && self.seeded_db_ids.contains(&rec.db_id)
-                && !rec.is_invisible
-                && !self.rollback_tracker.is_in_rollback_period(*lsn)
-                && rec.txn_id.map(|t| analysis.is_committed(t)).unwrap_or(true)
-            {
-                // A committed / non-transactional pre-checkpoint-start LN of a
-                // seeded database that the redo gate skipped (its record is
-                // covered by the checkpoint-seeded lazy BIN fetch).
-                self.info.lns_gated += 1;
+        // ---- Redo LNs (streaming second forward scan) ----
+        //
+        // JE RecoveryManager.redoLNs: re-read the log and apply each eligible
+        // LN directly into its tree.  No pre-collected Vec of LN records.
+        self.stream_redo_lns(scanner, analysis, |stats, lsn, rec| {
+            if let Some(curr) = rec.vlsn {
+                vlsn_pairs.push((curr, lsn.as_u64()));
             }
-        }
+            if let Some(t) = trees.get_mut(&rec.db_id) {
+                Self::redo_ln(t, rec, lsn);
+            }
+            stats.lns_redone += 1;
+        });
+
         // R-3: also include TxnCommit-derived VLSNs (recovered XA commits
         // that embedded a dtvlsn with the R-3 fix).  On a second crash these
         // VLSNs would otherwise be lost because TxnCommit records were not
@@ -997,7 +1067,6 @@ impl RecoveryManager {
         vlsn_pairs.dedup_by_key(|t| t.0);
         self.info.recovered_vlsns = vlsn_pairs;
 
-        self.redo_entries = redo_entries;
         Ok(())
     }
 
@@ -1583,17 +1652,16 @@ impl RecoveryManager {
         // of materialising the bounded range into a `Vec<PositionedEntry>`
         // (with cloned `LnRecord` / `Bytes`) just to iterate it once.
         //
-        // Consume each entry by value inside the closure to avoid
-        // `LnRecord::clone()` (which bumps the `Bytes` Arc refcount for key
-        // and data on every LN record).  Moving the LnRecord directly into
-        // `redo_entries` eliminates the `bytes::owned_clone` / `owned_drop`
-        // allocation profile cost.
-        //
         // Borrow the pieces of `self` and `result` the closure mutates up
-        // front so the closure does not need a `&mut self` capture.
+        // front so the closure does not need a `&mut self` capture.  The
+        // analysis pass keeps ONLY lightweight metadata (txn commit/abort
+        // sets, dirty-IN list, per-db LN counts, checkpoint boundaries) — it
+        // does NOT collect LN payloads.  JE `RecoveryManager.redoLNs`
+        // (RecoveryManager.java) re-reads the log to apply LNs; Noxu's redo
+        // pass streams a second forward scan (`stream_redo_lns`) rather than
+        // materialising every `(Lsn, LnRecord)` up front.
         let stats = &mut self.stats;
         let dirty_in_map = &mut self.dirty_in_map;
-        let redo_entries = &mut self.redo_entries;
         let per_db_redo_count = &mut self.per_db_redo_count;
         let rollback_tracker = &mut self.rollback_tracker;
         let result_ref = &mut result;
@@ -1659,10 +1727,13 @@ impl RecoveryManager {
                             .push((rec.abort_lsn.file_number(), entry_lsn));
                     }
 
-                    // Move rec into redo_entries — no clone, no Arc bump.
-                    redo_entries.push((entry_lsn, rec));
+                    // Do NOT collect the LN payload.  The redo pass
+                    // re-reads it by streaming a second forward scan
+                    // (JE `RecoveryManager.redoLNs`), so analysis keeps only
+                    // the cheap per-db count used to pre-warm BIN capacity.
 
                     // Track per-db count for BIN capacity pre-warming (Fix 3).
+                    // The key set also drives tree creation in the redo pass.
                     *per_db_redo_count.entry(db_id).or_insert(0) += 1;
 
                     if let Some(txn_id) = txn_id {
@@ -1879,9 +1950,13 @@ impl RecoveryManager {
         Ok(result)
     }
 
-    /// Walks `self.redo_entries` and groups every LN whose `txn_id` matches
-    /// one of the in-doubt prepared transactions in `analysis` into a
-    /// `prepared_txn_lns` map keyed by txn_id.
+    /// Streams a targeted forward scan of the log and groups every LN whose
+    /// `txn_id` matches one of the in-doubt prepared transactions in
+    /// `analysis` into a `prepared_txn_lns` map keyed by txn_id.  Runs only
+    /// when at least one transaction is prepared (in-doubt), so the common
+    /// case does no work; when it does run it keeps ONLY prepared-txn LNs,
+    /// the minority special-case subset (the bulk committed LNs are streamed
+    /// and applied by the redo pass, never collected).
     ///
     /// Called from `recover()` / `recover_all()` after the analysis pass
     /// so that `xa_commit(xid)` can replay the prepared txn’s writes
@@ -1892,6 +1967,7 @@ impl RecoveryManager {
     /// environment layer for application-level resolution.
     fn collect_prepared_txn_lns(
         &self,
+        scanner: &dyn LogScanner,
         analysis: &AnalysisResult,
     ) -> hashbrown::HashMap<u64, Vec<crate::analysis_result::PreparedLnReplay>>
     {
@@ -1901,10 +1977,24 @@ impl RecoveryManager {
         if analysis.prepared_txns.is_empty() {
             return by_txn;
         }
-        for (lsn, rec) in &self.redo_entries {
-            let Some(txn_id) = rec.txn_id else { continue };
+        // Prepared (in-doubt XA) transactions are rare, so instead of holding
+        // every LN record from analysis we do a targeted forward scan and keep
+        // ONLY the LNs of prepared txns — the minority special-case subset
+        // (JE tracks undo/prepared txn LNs specifically, not every committed
+        // LN).  The scan runs only when at least one txn is in-doubt.
+        let scan_start = if analysis.first_active_lsn != NULL_LSN {
+            analysis.first_active_lsn
+        } else if analysis.checkpoint_start_lsn != NULL_LSN {
+            analysis.checkpoint_start_lsn
+        } else {
+            Lsn::new(0, 0)
+        };
+        let scan_end = self.info.next_available_lsn;
+        let mut collect = |pe: PositionedEntry| {
+            let LogEntry::Ln(rec) = &pe.entry else { return };
+            let Some(txn_id) = rec.txn_id else { return };
             if !analysis.prepared_txns.contains_key(&txn_id) {
-                continue;
+                return;
             }
             let op = match rec.operation {
                 LnOperation::Insert => PreparedLnOperation::Insert,
@@ -1913,12 +2003,13 @@ impl RecoveryManager {
             };
             by_txn.entry(txn_id).or_default().push(PreparedLnReplay {
                 db_id: rec.db_id,
-                original_lsn: *lsn,
+                original_lsn: pe.lsn,
                 operation: op,
                 key: rec.key.to_vec(),
                 data: rec.data.as_ref().map(|b| b.to_vec()),
             });
-        }
+        };
+        scanner.scan_forward_fn(scan_start, scan_end, &mut collect);
         by_txn
     }
 
@@ -2110,19 +2201,22 @@ impl RecoveryManager {
         // RedoDirtyNodes() / DirtyINMap.getLowestLevel() loop.
         //
         // `INLogEntry.readEntry()` / `getMainItem()` deserializes the
-        // IN from the log entry body.  We collect dirty-IN entries during
-        // analysis (stored in `self.redo_entries`-analogue, the dirty_in_map)
-        // and replay each BIN into the tree.
+        // IN from the log entry body.  Dirty-IN entries are collected during
+        // analysis into `dirty_ins` (post-checkpoint IN metadata + bytes) and
+        // each BIN is replayed into the tree here.
         //
         // H-6: deserialize IN log entries and re-insert BINs into the tree.
         // We walk the dirty-IN map bottom-up (same ordering as the
         // `processINList()`), then for each entry use `BinStub::deserialize_full`
         // or `BinStub::apply_delta` to reconstruct the node and insert it.
         //
-        // The dirty_in_map records node_id+level metadata.  The actual bytes
-        // come from `self.redo_entries` collected during analysis as `LogEntry::In`.
-        // For simplicity we scan the analysis redo_entries for In records and
-        // apply them to the tree directly (the map ordering is preserved because
+        // The dirty_in_map records node_id+level metadata; the IN bytes come
+        // from `analysis.dirty_ins` collected during the analysis pass as
+        // `LogEntry::In`.  (Unlike LN payloads — which are NOT collected and
+        // are re-read by the streaming redo pass — the dirty INs are a bounded
+        // post-checkpoint set, so keeping them in analysis is cheap.)
+        // We apply each In record to the tree directly (the map ordering is
+        // preserved because
         // analysis scanned forward and the BIN pass is level 0).
         //
         // RecoveryManager.redoDirtyNodes() +
@@ -2180,14 +2274,12 @@ impl RecoveryManager {
             }
         }
 
-        // ---- Redo LNs (forward scan) ----
+        // ---- Redo LNs (streaming second forward scan) ----
         //
-        // LNFileReader(forward=true, start=firstActiveLsn) loop.
-        let ckpt_start = analysis.checkpoint_start_lsn;
-
-        // Collect so we don't borrow self mutably twice.
-        let redo_entries: Vec<(Lsn, LnRecord)> =
-            std::mem::take(&mut self.redo_entries);
+        // JE RecoveryManager.redoLNs (RecoveryManager.java): re-read the log
+        // via a forward LN reader and apply each eligible LN directly into the
+        // tree, never holding all LN records at once.  Noxu streams a second
+        // `scan_forward_fn` over the same bounded range analysis scanned.
 
         // LOG-6: VLSN-ordering tracker.
         //
@@ -2205,48 +2297,41 @@ impl RecoveryManager {
         // index can be rebuilt after crash recovery on a replicated node.
         let mut recovered_vlsn_pairs: Vec<(u64, u64)> = Vec::new();
 
-        for (lsn, rec) in &redo_entries {
-            self.stats.lns_read_redo += 1;
-
-            let action =
-                self.eligible_for_redo(*lsn, rec, ckpt_start, analysis);
-
-            if let RedoAction::Apply = action {
-                // VLSN-ordering check before we touch the tree.
-                if let Some(curr) = rec.vlsn {
-                    if let Some(prev) = last_redone_vlsn
-                        && curr <= prev
-                    {
-                        log::error!(
-                            "noxu-recovery: out-of-order VLSN during redo \
-                             at lsn={lsn:?}: current vlsn={curr} <= previous \
-                             vlsn={prev}; skipping this entry to keep the \
-                             rest of recovery viable (LOG-6)"
-                        );
-                        vlsn_violations += 1;
-                        continue;
-                    }
-                    last_redone_vlsn = Some(curr);
-                    // X-14: record the VLSN→LSN mapping for index rebuild.
-                    recovered_vlsn_pairs.push((curr, lsn.as_u64()));
+        self.stream_redo_lns(scanner, analysis, |stats, lsn, rec| {
+            // VLSN-ordering check before we touch the tree.
+            if let Some(curr) = rec.vlsn {
+                if let Some(prev) = last_redone_vlsn
+                    && curr <= prev
+                {
+                    log::error!(
+                        "noxu-recovery: out-of-order VLSN during redo \
+                         at lsn={lsn:?}: current vlsn={curr} <= previous \
+                         vlsn={prev}; skipping this entry to keep the \
+                         rest of recovery viable (LOG-6)"
+                    );
+                    vlsn_violations += 1;
+                    return;
                 }
-
-                // RecoveryManager.redoOneLN / redo().
-                //
-                // decision:
-                //   - If the key is not in the tree and this is not a
-                //     deletion → insert it (first-write redo).
-                //   - If the key is in the tree with an older LSN →
-                //     replace (update wins over checkpoint state).
-                //   - If the key is in the tree with a newer LSN → skip
-                //     (a later write already committed this key).
-                //   - Deletion → remove the slot if present.
-                if let Some(t) = tree.as_deref_mut() {
-                    Self::redo_ln(t, rec, *lsn);
-                }
-                self.stats.lns_redone += 1;
+                last_redone_vlsn = Some(curr);
+                // X-14: record the VLSN→LSN mapping for index rebuild.
+                recovered_vlsn_pairs.push((curr, lsn.as_u64()));
             }
-        }
+
+            // RecoveryManager.redoOneLN / redo().
+            //
+            // decision:
+            //   - If the key is not in the tree and this is not a
+            //     deletion → insert it (first-write redo).
+            //   - If the key is in the tree with an older LSN →
+            //     replace (update wins over checkpoint state).
+            //   - If the key is in the tree with a newer LSN → skip
+            //     (a later write already committed this key).
+            //   - Deletion → remove the slot if present.
+            if let Some(t) = tree.as_deref_mut() {
+                Self::redo_ln(t, rec, lsn);
+            }
+            stats.lns_redone += 1;
+        });
 
         if vlsn_violations > 0 {
             log::error!(
@@ -2256,9 +2341,6 @@ impl RecoveryManager {
             );
             self.stats.vlsn_ordering_violations += vlsn_violations;
         }
-
-        // Put the entries back (they may be needed for undo diagnostics).
-        self.redo_entries = redo_entries;
 
         // X-14: store the collected VLSN→LSN pairs so recover_all() can
         // publish them in RecoveryInfo for the VLSN index rebuild.
@@ -2306,8 +2388,35 @@ impl RecoveryManager {
     /// - Non-transactional LNs after ckpt start → redo.
     /// - LNs in rollback periods (invisible) → skip.
     /// - All others → skip (undo will handle active txns).
+    ///
+    /// The eligibility decision reads only the immutable rollback-period and
+    /// seeded-db state, so it is factored into a static helper
+    /// ([`Self::eligible_for_redo_static`]) that the streaming redo loop
+    /// ([`Self::stream_redo_lns`]) can call while `self` is otherwise borrowed
+    /// for the `apply` closure.
     fn eligible_for_redo(
         &self,
+        lsn: Lsn,
+        rec: &LnRecord,
+        ckpt_start: Lsn,
+        analysis: &AnalysisResult,
+    ) -> RedoAction {
+        Self::eligible_for_redo_static(
+            &self.rollback_tracker,
+            &self.seeded_db_ids,
+            lsn,
+            rec,
+            ckpt_start,
+            analysis,
+        )
+    }
+
+    /// Static form of [`Self::eligible_for_redo`] taking the borrowed pieces
+    /// of recovery state it reads (rollback periods + seeded-db set) so it can
+    /// be called from the streaming redo closure without a `&self` borrow.
+    fn eligible_for_redo_static(
+        rollback_tracker: &RollbackTracker,
+        seeded_db_ids: &std::collections::HashSet<u64>,
         lsn: Lsn,
         rec: &LnRecord,
         ckpt_start: Lsn,
@@ -2319,7 +2428,7 @@ impl RecoveryManager {
         }
 
         // Check if the entry falls inside a known rollback period.
-        if self.rollback_tracker.is_in_rollback_period(lsn) {
+        if rollback_tracker.is_in_rollback_period(lsn) {
             return RedoAction::Skip;
         }
 
@@ -2364,7 +2473,7 @@ impl RecoveryManager {
         // ALL records with this gate active.
         let before_ckpt_start = ckpt_start != NULL_LSN && lsn < ckpt_start;
         let gate_active =
-            before_ckpt_start && self.seeded_db_ids.contains(&rec.db_id);
+            before_ckpt_start && seeded_db_ids.contains(&rec.db_id);
 
         match rec.txn_id {
             None => {
@@ -2721,11 +2830,6 @@ impl RecoveryManager {
     /// Return a reference to the collected undo entries (for testing).
     pub fn undo_entries(&self) -> &[(Lsn, LnRecord)] {
         &self.undo_entries
-    }
-
-    /// Return a reference to the collected redo entries (for testing).
-    pub fn redo_entries(&self) -> &[(Lsn, LnRecord)] {
-        &self.redo_entries
     }
 }
 

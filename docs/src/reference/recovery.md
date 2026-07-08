@@ -87,10 +87,22 @@ fixup.
    re-fetched from a checkpoint-seeded parent slot, the **entire** delta
    chain since the base full is followed and merged by key — see Phase 2.)
 
-### LN-redo
+### LN-redo (streaming, JE `RecoveryManager.redoLNs`)
+
+The analysis pass (Phase 2's forward scan) records **only lightweight
+metadata** for LNs — the committed / aborted / prepared transaction sets, the
+active-transaction set, per-database LN counts (used to pre-size BINs), and
+obsolete tracking. It does **not** collect LN payloads. Redo then re-reads
+the log:
 
 1. Start from `first_active_lsn` (recorded in `CheckpointEnd`).
-2. Scan forward to the end of the log.
+2. **Stream a second forward scan** to the end of the log, applying each
+   eligible LN directly into its tree as it is read, then dropping the
+   record. This is the reference `RecoveryManager.redoLNs` methodology (a
+   `while (reader.readNextEntry())` loop that checks `eligibleForRedo` per
+   entry and applies each LN as it reads) — recovery never holds all LN
+   records at once, so peak redo memory is one LN plus the lazily-fetched
+   tree rather than O(all records). Recovery stays single-threaded.
 3. For committed transactions: **redo** their LN writes to the tree.
    `redo_ln` is idempotent: if the tree already holds an equal or newer
    LSN for the key, the write is skipped.
@@ -109,6 +121,15 @@ fixup.
    committed / non-transactional LN is replayed from the full scan range —
    the safe fallback.  `Environment::recovery_redo_counts()` reports
    `(lns_redone, lns_gated)` so callers can confirm which path ran.
+
+Recovery therefore reads the log forward **twice** — once in analysis (to
+gather metadata) and once in redo (to apply LNs) — plus the backward undo
+scan. The log is immutable during recovery, so the second forward scan sees
+the identical entries in identical LSN order; streaming redo reconstructs the
+exact same tree the earlier collect-then-redo design produced. In-doubt (XA
+prepared) transaction LNs, the minority subset the redo/undo phases need
+materialised, are gathered by a targeted scan that runs only when a
+transaction is prepared.
 
 ## Phase 4 — Undo
 

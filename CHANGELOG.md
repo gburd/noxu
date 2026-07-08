@@ -93,6 +93,31 @@ listed in [References](#references).
 
 ### Performance
 
+- **Recovery reopen is now O(post-checkpoint tail) instead of O(all
+  records).** The recovery ANALYSIS pass previously collected every logged LN
+  record into a `Vec<(Lsn, LnRecord)>` before redo started, so reopening a
+  large database materialised gigabytes of LN payloads and ran O(records) in
+  both time and memory — a 20M-record / 31GB-log database took over eight
+  minutes to reopen, single-threaded, stuck in that collection. Analysis now
+  keeps only lightweight metadata (committed/aborted/prepared txn sets, the
+  active-txn set, the dirty-IN list, per-database LN counts, and the
+  checkpoint boundaries); the redo pass streams a **second forward scan** of
+  the (immutable-during-recovery) log and applies each eligible LN directly
+  into the tree as it reads, dropping each record immediately after — peak
+  redo memory is one LN record plus the lazily-fetched tree, never all LNs.
+  This is the streaming methodology of the reference `RecoveryManager.redoLNs`
+  (a `while (reader.readNextEntry())` loop that checks `eligibleForRedo` per
+  entry and applies each LN as it reads); recovery stays single-threaded. The
+  prepared-transaction (XA in-doubt) LN subset the redo/undo phases need is
+  now collected by a targeted scan that runs only when a transaction is
+  in-doubt. Combined with the checkpoint-seeded lazy BIN fetch above, reopen
+  of a checkpointed database now reads only the post-checkpoint tail. The
+  recovered tree is byte-for-byte identical to the previous
+  collect-then-redo result (the log is immutable during recovery, so the
+  second scan sees the same entries in the same LSN order, and redo stays
+  idempotent via the LSN currency check). See
+  `docs/src/reference/recovery.md`.
+
 - **Read-path structural de-serialization (Stage A): the stripped-LN refill
   path no longer funnels every reader through one global mutex + an
   un-unparkable park loop.** With a dataset far larger than the cache the
