@@ -15,6 +15,46 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Performance
+
+- **Read-path structural de-serialization (Stage A): the stripped-LN refill
+  path no longer funnels every reader through one global mutex + an
+  un-unparkable park loop.** With a dataset far larger than the cache the
+  evictor constantly strips resident LN payloads (keeping the slot + LSN), so a
+  read that lands on a stripped slot must re-fetch the LN from the log. That
+  refill path (`LogManager::read_entry`) previously (1) took the global
+  `buffer_pool` mutex on *every* read, (2) scanned all buffers calling
+  `wait_for_zero_and_latch`, which (3) `thread::park_timeout(100ns)` — with no
+  explicit unpark, eating the full 100ns — whenever any writer
+  (checkpointer/flush) held a buffer pin. At 64 readers this serialized all
+  reads (measured: 95%+ idle CPU, most threads in `futex_wait` on that mutex).
+  Three faithful fixes:
+  - **min-buffered-LSN fast-path skip.** `read_entry` consults a lock-free
+    `Arc<AtomicU64>` mirror of the pool's oldest buffered LSN *before* taking
+    the `buffer_pool` mutex; a read whose LSN is older than any in-memory
+    buffer (the common case under dataset>>cache) skips the mutex entirely and
+    reads straight from disk/page-cache (JE `LogBufferPool.getReadBufferByLsn`
+    min-LSN skip, `LogBufferPool.java:604`).
+  - **Unparkable wait.** `wait_for_zero_and_latch` now `futex_wait`s on the
+    pin-count word and is woken by `futex_wake` the instant a writer's
+    `free`/`put` decrements the pin count to zero (JE's `parkNanos(this, 100)`
+    is explicitly unparkable; this is the faithful equivalent). The 100ns
+    timeout is kept only as a backstop. `write_pin_count` changed from
+    `AtomicI32` to `AtomicU32` (always `>= 0`) so readers can wait directly on
+    it. Missed-wakeup safe by construction: the waker changes and wakes the
+    same futex word, and `futex_wait` returns immediately if the word already
+    moved off the expected value (regression-tested by
+    `test_wait_for_zero_no_missed_wakeup`).
+  - **Settled-buffer-first scan.** `get_read_buffer_by_lsn` checks the settled
+    (zero-pin) buffers before the active write buffer, so the common read never
+    waits on the one buffer that holds writer pins.
+
+  Structural read latches (buffer/page access) are orthogonal to isolation
+  locks (record locks); this changes nothing about Noxu being lock-based (no
+  MVCC, no versions, no snapshots) and the WAL is not sharded. On-disk format
+  unchanged. crash-recovery (12), recovery-correctness (17), isolation,
+  je-rmw-locking, concurrency, and eviction-pressure suites all green.
+
 ### Changed
 
 - The `LOG_CHECKSUM_READ` configuration parameter is now honored on the log

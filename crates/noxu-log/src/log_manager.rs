@@ -97,6 +97,14 @@ pub struct LogManager {
     /// Pool of log buffers for staging writes before they reach the file.
     buffer_pool: Arc<Mutex<LogBufferPool>>,
 
+    /// Lock-free mirror of the pool's "minimum buffered LSN" (Stage A read
+    /// fix).  A read whose LSN is strictly below this value cannot be in any
+    /// in-memory write buffer, so `read_entry` skips the global `buffer_pool`
+    /// mutex + park loop entirely and reads straight from disk/page-cache.
+    /// Shares the pool's `Arc<AtomicU64>`, so it tracks the pool's own
+    /// `min_buffer_lsn` as buffers cycle.  JE `LogBufferPool.java:604`.
+    min_buffered_lsn: Arc<AtomicU64>,
+
     /// Serializes all log writes so entries appear in LSN order.
     /// this the "Log Write Latch" (LWL).
     ///
@@ -191,6 +199,7 @@ impl LogManager {
         );
 
         LogManager {
+            min_buffered_lsn: buffer_pool.min_buffer_lsn_handle(),
             buffer_pool: Arc::new(Mutex::new(buffer_pool)),
             log_write_latch: Mutex::new(LwlScratch::new()),
             // 0 means "nothing flushed yet". NULL_LSN = u64::MAX would make
@@ -983,9 +992,25 @@ impl LogManager {
     /// `(entry_type, payload_bytes)` for the entry at `lsn`.
     pub fn read_entry(&self, lsn: Lsn) -> Result<(LogEntryType, Vec<u8>)> {
         // ------------------------------------------------------------------
-        // Hot path: check whether the entry is still in a write buffer.
-        // ------------------------------------------------------------------
-        {
+        // Stage A fast path: skip the global buffer_pool mutex entirely when
+        // the LSN is older than any in-memory write buffer.  On a
+        // dataset>>cache read workload almost every read is for an old LSN,
+        // so this avoids the one global mutex + nested per-buffer scan + park
+        // loop that otherwise serialises all readers (JE
+        // `LogBufferPool.getReadBufferByLsn` min-LSN skip, LogBufferPool.java:604).
+        //
+        // Ordering: an entry can only be in a buffer AFTER it was appended,
+        // which advances `min_buffered_lsn` (Release in `bump_current`) no
+        // later than the append becomes visible; a reader that observes an
+        // LSN below the (Acquire-loaded) mirror therefore correctly concludes
+        // the entry is not buffered.  A stale-low read of the mirror only
+        // costs an unnecessary pool lock (still correct); it never skips a
+        // buffer that actually holds the entry.
+        let min_buffered = self.min_buffered_lsn.load(Ordering::Acquire);
+        if lsn.as_u64() >= min_buffered {
+            // ------------------------------------------------------------------
+            // Hot path: check whether the entry is still in a write buffer.
+            // ------------------------------------------------------------------
             let mut pool = self.buffer_pool.lock();
             if let Some(buf_arc) = pool.get_read_buffer_by_lsn(lsn)? {
                 let buf = buf_arc.lock();

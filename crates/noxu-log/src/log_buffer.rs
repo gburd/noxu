@@ -20,11 +20,11 @@
 
 use bytes::BytesMut;
 use noxu_sync::RawMutex;
+use noxu_sync::futex::{futex_wait, futex_wake};
 use noxu_sync::lock_api::RawMutex as RawMutexTrait;
 use noxu_util::lsn::{Lsn, NULL_LSN};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
-use std::thread;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 /// A write buffer backed by `BytesMut`.
@@ -92,7 +92,14 @@ struct LogBufferControl {
     /// Whether the latch is currently held.
     latch_held: AtomicBool,
     /// Number of writers currently pinning this buffer.
-    write_pin_count: AtomicI32,
+    ///
+    /// Always `>= 0` (incremented in `allocate`, decremented in `free`/`put`);
+    /// stored as `AtomicU32` so readers in `wait_for_zero_and_latch` can
+    /// `futex_wait` directly on this word and be woken the instant a writer
+    /// decrements it to zero — the unparkable analogue of JE's
+    /// `LockSupport.parkNanos(this, 100)` (LogBuffer.java:326), replacing the
+    /// un-unparkable `thread::park_timeout(100ns)` spin (Stage A read fix).
+    write_pin_count: AtomicU32,
     /// High-water mark of bytes reserved in this buffer (round-2 change).
     ///
     /// This is the authoritative "content length" of the buffer — the sum of
@@ -112,7 +119,7 @@ impl LogBufferControl {
         LogBufferControl {
             read_latch: RawMutex::INIT,
             latch_held: AtomicBool::new(false),
-            write_pin_count: AtomicI32::new(0),
+            write_pin_count: AtomicU32::new(0),
             write_position: AtomicUsize::new(0),
         }
     }
@@ -398,7 +405,17 @@ impl LogBuffer {
         // before the decrement.  The Acquire load in wait_for_zero_and_latch
         // then guarantees the reader sees the completed writes before it
         // re-uses the buffer.
-        self.control.write_pin_count.fetch_sub(1, Ordering::Release);
+        let prev = self.control.write_pin_count.fetch_sub(1, Ordering::Release);
+        // Stage A: wake any reader parked in wait_for_zero_and_latch the
+        // instant the pin count reaches zero (JE's parkNanos is unparkable;
+        // this futex_wake is Noxu's faithful equivalent).  The wake targets
+        // the same word the reader futex_waits on, so the kernel serialises
+        // the change-then-wake against a concurrent register-then-wait — no
+        // missed wakeup: a reader whose load raced this decrement sees the
+        // new (< expected) value and futex_wait returns immediately.
+        if prev == 1 {
+            futex_wake(&self.control.write_pin_count, i32::MAX as u32);
+        }
     }
 
     /// Acquires the buffer latched and with the buffer pin count equal to zero.
@@ -406,8 +423,21 @@ impl LogBuffer {
         loop {
             // C-7: Acquire pairs with the Release in free() / LogBufferSegment::put()
             // to ensure we see all completed segment writes before re-using the buffer.
-            if self.control.write_pin_count.load(Ordering::Acquire) > 0 {
-                thread::park_timeout(Duration::from_nanos(100));
+            let pins = self.control.write_pin_count.load(Ordering::Acquire);
+            if pins > 0 {
+                // Stage A: instead of the old un-unparkable
+                // `thread::park_timeout(100ns)` spin, wait ON the pin-count
+                // word.  futex_wait returns early (EAGAIN) if the count already
+                // changed away from `pins`, and is woken by free()/put()'s
+                // futex_wake when the count hits zero.  The 100ns timeout is
+                // kept as a backstop so a lost wake (e.g. on the non-Linux
+                // fallback path) still makes progress — JE keeps the same 100ns
+                // parkNanos bound.
+                futex_wait(
+                    &self.control.write_pin_count,
+                    pins,
+                    Some(Duration::from_nanos(100)),
+                );
             } else {
                 self.latch_for_write();
                 if self.control.write_pin_count.load(Ordering::Acquire) == 0 {
@@ -499,7 +529,12 @@ impl LogBufferSegment {
         // C-7: Release ensures the copy_nonoverlapping above is visible
         // to any thread that Acquire-loads the pin_count in
         // wait_for_zero_and_latch() and observes zero.
-        self.control.write_pin_count.fetch_sub(1, Ordering::Release);
+        let prev = self.control.write_pin_count.fetch_sub(1, Ordering::Release);
+        // Stage A: wake a reader parked on the pin-count word (see
+        // LogBuffer::free for the missed-wakeup argument).
+        if prev == 1 {
+            futex_wake(&self.control.write_pin_count, i32::MAX as u32);
+        }
     }
 }
 
@@ -783,5 +818,82 @@ mod tests {
         }
 
         t.join().unwrap();
+    }
+
+    /// Stage A missed-wakeup regression: a reader parked in
+    /// `wait_for_zero_and_latch` while a writer holds the pin MUST be woken
+    /// (or make progress via the 100ns backstop) when the writer's `put`
+    /// drops the pin to zero — it must never hang.  Runs many rounds where
+    /// the reader's wait and the writer's decrement race, which is exactly
+    /// the window a missed wakeup would deadlock.  A watchdog thread fails
+    /// the test if any round stalls, rather than hanging CI forever.
+    #[test]
+    fn test_wait_for_zero_no_missed_wakeup() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        const ROUNDS: usize = 2_000;
+        let progress = Arc::new(AtomicUsize::new(0));
+        let done = Arc::new(AtomicBool::new(false));
+
+        // Watchdog: if `progress` stops advancing for 10s, the reader is
+        // wedged on a missed wakeup — abort loudly.
+        let wd_progress = Arc::clone(&progress);
+        let wd_done = Arc::clone(&done);
+        let watchdog = thread::spawn(move || {
+            let mut last = 0usize;
+            let mut stalls = 0;
+            while !wd_done.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(500));
+                let now = wd_progress.load(Ordering::Relaxed);
+                if now == last {
+                    stalls += 1;
+                    assert!(
+                        stalls < 20,
+                        "wait_for_zero_and_latch wedged at round {now}: \
+                         missed wakeup"
+                    );
+                } else {
+                    stalls = 0;
+                    last = now;
+                }
+            }
+        });
+
+        let start = Instant::now();
+        for _ in 0..ROUNDS {
+            let buf = Arc::new(Mutex::new(LogBuffer::new(256)));
+            let segment = {
+                let b = buf.lock().unwrap();
+                b.latch_for_write();
+                let seg = b.allocate(64).expect("allocate");
+                b.release();
+                seg
+            };
+            // Writer: drop the pin (decrement to zero, futex_wake) on another
+            // thread, racing the reader's wait below.
+            let writer = thread::spawn(move || {
+                segment.put(&[0x5Au8; 64]);
+            });
+            // Reader: block until pin count is zero.  Must not hang.
+            {
+                let b = buf.lock().unwrap();
+                b.wait_for_zero_and_latch();
+                b.release();
+            }
+            writer.join().unwrap();
+            progress.fetch_add(1, Ordering::Relaxed);
+        }
+        done.store(true, Ordering::Relaxed);
+        watchdog.join().unwrap();
+        // Sanity: 2000 tiny rounds should finish well under the watchdog
+        // budget; a per-round 100ns-spin regression would blow this out.
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "reader progress too slow: {:?}",
+            start.elapsed()
+        );
     }
 }

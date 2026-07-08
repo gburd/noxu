@@ -67,6 +67,34 @@ The waiter graph is maintained incrementally:
 `check_for_deadlock()` detects cycles; the youngest transaction is the victim
 and receives `NoxuError::LockDeadlock`. Applications must abort and retry.
 
+## Read-Path Structural Access
+
+Structural access to buffers/pages (latches) is **orthogonal** to isolation
+(record locks): a reader takes a cheap record read-lock for isolation, while
+locating the bytes is a latch/atomic concern with no bearing on the isolation
+model. The B-tree descent (`Tree::search`) is already lock-free-parallel via
+hand-over-hand `read_arc()` shared guards, and a cache-resident LN is cloned
+under the shared read guard.
+
+When the cache is smaller than the working set, the evictor strips resident LN
+payloads (keeping the slot + its LSN), so a read landing on a stripped slot
+must re-fetch the LN from the log at that LSN
+(`LogManager::read_entry`). That refill path is de-serialized so it does not
+become a global chokepoint under many concurrent readers:
+
+- **min-buffered-LSN skip.** A read whose LSN is older than any in-memory log
+  buffer bypasses the global buffer-pool mutex entirely (consulting a lock-free
+  `AtomicU64` mirror of the pool's oldest buffered LSN) and reads straight from
+  disk/OS page cache.
+- **Unparkable pin wait.** When a read must consult a buffer that still has an
+  outstanding writer pin, it `futex_wait`s on the pin-count word and is woken
+  the instant the writer's pin drops to zero (rather than a fixed timed park).
+- **Settled-first scan.** The buffer scan checks zero-pin (settled) buffers
+  before the active write buffer, so the common read never waits on the one
+  buffer holding writer pins.
+
+None of this adds MVCC, versions, or snapshots, and the WAL is not sharded.
+
 ## Thread Safety
 
 | Handle | Safety |

@@ -16,7 +16,7 @@ use std::time::Duration;
 /// Returns `true` if we slept (or the value was already different).
 /// Returns `false` only if the timeout expired without a notification.
 #[cfg(target_os = "linux")]
-pub(crate) fn futex_wait(
+pub fn futex_wait(
     futex_word: &AtomicU32,
     expected: u32,
     timeout: Option<Duration>,
@@ -67,7 +67,7 @@ pub(crate) fn futex_wait(
 /// truncate to -1, waking at most one thread — always use `i32::MAX as u32`
 /// when the intent is "wake all".
 #[cfg(target_os = "linux")]
-pub(crate) fn futex_wake(futex_word: &AtomicU32, count: u32) {
+pub fn futex_wake(futex_word: &AtomicU32, count: u32) {
     // FUTEX_WAKE | FUTEX_PRIVATE_FLAG
     const FUTEX_WAKE_PRIVATE: i32 = 128 | 1;
     // Kernel nr_wake is signed; clamp to i32::MAX to avoid sign wrap.
@@ -90,7 +90,7 @@ pub(crate) fn futex_wake(futex_word: &AtomicU32, count: u32) {
 /// This is correct but not as efficient as futex. Threads will be woken
 /// by a combination of `park_timeout` expiry and spurious wakeups.
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn futex_wait(
+pub fn futex_wait(
     futex_word: &AtomicU32,
     expected: u32,
     timeout: Option<Duration>,
@@ -110,6 +110,6 @@ pub(crate) fn futex_wait(
 
 /// Non-Linux fallback: no-op — threads will wake via park_timeout expiry.
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn futex_wake(_futex_word: &AtomicU32, _count: u32) {
+pub fn futex_wake(_futex_word: &AtomicU32, _count: u32) {
     // On non-Linux, threads wake via timeout. This is correct but busy-waits.
 }
