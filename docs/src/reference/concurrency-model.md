@@ -93,7 +93,14 @@ become a global chokepoint under many concurrent readers:
   before the active write buffer, so the common read never waits on the one
   buffer holding writer pins.
 
-None of this adds MVCC, versions, or snapshots, and the WAL is not sharded.
+Repeat reads of a hot record are served from memory: after a cold refill the
+BIN slot is re-populated with the fetched LN bytes (JE `IN.fetchTarget`), so
+the next read hits the lock-free descend-and-clone path. Re-population is
+guarded under the BIN write latch (it skips a slot whose LSN changed, an
+already-populated slot, or a cursor-pinned BIN) and charges the same shared
+memory counter the evictor credits on strip, keeping the cache bounded under
+repeated read-then-evict cycles. None of this adds MVCC, versions, or
+snapshots, and the WAL is not sharded.
 
 ## Thread Safety
 

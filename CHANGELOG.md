@@ -55,6 +55,24 @@ listed in [References](#references).
   unchanged. crash-recovery (12), recovery-correctness (17), isolation,
   je-rmw-locking, concurrency, and eviction-pressure suites all green.
 
+- **Resident-LN read cache (Stage B): repeat reads of a hot record are served
+  from memory instead of re-faulting the log.** After a cold refill of a
+  stripped slot, the fetched LN bytes are written back into the BIN slot (JE
+  `IN.fetchTarget` caches the fetched LN), so the next read of that key hits
+  the already-lock-free descend-and-clone path and never calls `read_entry`.
+  The evictor's existing LRU/CLOCK strip policy keeps hot slots resident, so a
+  hot record is not immediately re-stripped. Budget-safe: re-population charges
+  the same shared memory counter (`cache_usage`) by exactly `data.len()`,
+  symmetric with the strip credit the evictor releases, so repeated
+  read-then-evict cycles keep the cache bounded (verified by
+  `repopulated_read_is_consistent_and_budget_bounded`). Re-population is
+  guarded under the BIN write latch: it skips if the slot LSN no longer matches
+  the fetched LSN (a writer replaced it), if the slot is already populated, or
+  if the BIN has open cursors. A read from a re-populated slot returns
+  byte-identical data to a cold fetch (on-disk LNs are immutable at a given
+  LSN). If a tree has no shared budget counter (a bare test tree),
+  re-population is skipped.
+
 ### Changed
 
 - The `LOG_CHECKSUM_READ` configuration parameter is now honored on the log
