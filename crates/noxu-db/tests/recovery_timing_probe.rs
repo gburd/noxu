@@ -116,3 +116,75 @@ fn recovery_open_timing_100k() {
     drop(db);
     drop(env);
 }
+
+/// Streaming-redo correctness oracle (NOT ignored — CI gate).
+///
+/// Recovers a dataset large enough that the old collect-then-redo path would
+/// have materialised every LN into `RecoveryManager::redo_entries` before redo
+/// started.  With the JE `RecoveryManager.redoLNs` streaming redo (analysis
+/// keeps only txn metadata + per-db counts; redo re-reads the log and applies
+/// each eligible LN directly), the analysis pass holds no LN payloads at all.
+///
+/// The runnable check: after a suppressed-checkpoint crash + reopen, EVERY
+/// committed record must be present with its exact value.  Streaming redo must
+/// recover the identical tree the collect-then-redo path produced — if the
+/// second forward scan missed or misordered an entry, a key would be absent or
+/// hold a stale value and this test fails.
+#[test]
+fn streaming_redo_recovers_every_committed_record() {
+    const M: u32 = 20_000;
+    let dir = TempDir::new().unwrap();
+    {
+        let env = open_env(dir.path());
+        let db = open_db(&env);
+        let mut i = 0u32;
+        while i < M {
+            let txn = env.begin_transaction(None).unwrap();
+            let end = (i + 500).min(M);
+            for k in i..end {
+                let key = format!("key_{k:08}");
+                let val = format!("val_{k:08}");
+                db.put_in(
+                    &txn,
+                    DatabaseEntry::from_bytes(key.as_bytes()),
+                    DatabaseEntry::from_bytes(val.as_bytes()),
+                )
+                .unwrap();
+            }
+            txn.commit().unwrap();
+            i = end;
+        }
+        // Crash: skip the close-time checkpoint so the whole tail is the redo
+        // range (streaming redo path). See probe above for the forget rationale.
+        std::mem::forget(db);
+        std::mem::forget(env);
+    }
+
+    let rec_dir = TempDir::new().unwrap();
+    for entry in std::fs::read_dir(dir.path()).unwrap() {
+        let p = entry.unwrap().path();
+        if p.extension().is_some_and(|x| x == "ndb") {
+            std::fs::copy(&p, rec_dir.path().join(p.file_name().unwrap()))
+                .unwrap();
+        }
+    }
+
+    let env = open_env(rec_dir.path());
+    let db = open_db(&env);
+    let mut v = DatabaseEntry::new();
+    for k in 0..M {
+        let key = format!("key_{k:08}");
+        let want = format!("val_{k:08}");
+        let found = db
+            .get_into(None, DatabaseEntry::from_bytes(key.as_bytes()), &mut v)
+            .unwrap();
+        assert!(found, "streaming redo dropped key {key}");
+        assert_eq!(
+            v.data(),
+            want.as_bytes(),
+            "streaming redo recovered a stale value for {key}"
+        );
+    }
+    drop(db);
+    drop(env);
+}
