@@ -177,34 +177,62 @@ struct TransactionState {
 /// previously a private `Mutex<HashMap>` that no `Transaction` could see,
 /// so `mark_transaction_complete` was dead code and `env.close()` after a
 /// commit always returned `OperationNotAllowed`.
+/// Number of registry shards. Mirrors `noxu-txn`'s `LockManager`
+/// (`DEFAULT_N_LOCK_TABLES = 64`): 64 shards spread ~470k begin/complete
+/// acquisitions/s (64 threads @ ~235k ops/s) across distinct mutexes so
+/// transactions with distinct ids no longer serialize on one global lock.
+/// JE uses a `ConcurrentHashMap` for `TxnManager.allTxns` (striped locking)
+/// for the same reason; this is the same technique with an explicit shard
+/// array, matching the in-repo `lock_manager` sharding pattern.
+const N_TXN_SHARDS: usize = 64;
+
 pub(crate) struct ActiveTxns {
-    txns: Mutex<HashMap<u64, Arc<TransactionState>>>,
+    /// One `Mutex<HashMap>` per shard. A transaction id maps to exactly one
+    /// shard via `id % N_TXN_SHARDS`, so insert/remove touch a single shard.
+    /// Aggregate queries (`len`/`is_empty`) iterate all shards.
+    shards: Box<[Mutex<HashMap<u64, Arc<TransactionState>>>]>,
 }
 
 impl ActiveTxns {
     fn new() -> Self {
-        Self { txns: Mutex::new(HashMap::new()) }
+        let shards =
+            (0..N_TXN_SHARDS).map(|_| Mutex::new(HashMap::new())).collect::<Vec<_>>();
+        Self { shards: shards.into_boxed_slice() }
     }
 
-    #[allow(dead_code)] // convenience wrapper; the hot path locks `txns` directly
+    /// The shard owning a given transaction id. Txn ids come from a
+    /// monotonic `AtomicU64` starting at 1, so `id % N` distributes them
+    /// round-robin across shards with no clustering.
+    #[inline]
+    fn shard_for(&self, id: u64) -> &Mutex<HashMap<u64, Arc<TransactionState>>> {
+        &self.shards[(id % N_TXN_SHARDS as u64) as usize]
+    }
+
+    /// Registers an active transaction. Locks only the owning shard.
     fn insert(&self, id: u64, state: Arc<TransactionState>) {
-        self.txns.lock().insert(id, state);
+        self.shard_for(id).lock().insert(id, state);
     }
 
     /// Removes the entry for the given transaction id.
     ///
     /// Called by `Transaction::commit_with_durability` and `Transaction::abort`
-    /// once the transaction has reached a terminal state.
+    /// once the transaction has reached a terminal state. Locks only the
+    /// owning shard.
     pub(crate) fn mark_complete(&self, id: u64) {
-        self.txns.lock().remove(&id);
+        self.shard_for(id).lock().remove(&id);
     }
 
+    /// Total active transactions across all shards. Used by `close()` to
+    /// detect leaked (never-committed/aborted) transactions, so it must sum
+    /// every shard.
     fn len(&self) -> usize {
-        self.txns.lock().len()
+        self.shards.iter().map(|s| s.lock().len()).sum()
     }
 
+    /// True only when every shard is empty. Used by `close()`'s leaked-txn
+    /// guard, so a single non-empty shard must make this false.
     fn is_empty(&self) -> bool {
-        self.txns.lock().is_empty()
+        self.shards.iter().all(|s| s.lock().is_empty())
     }
 }
 
@@ -1108,9 +1136,7 @@ impl Environment {
             aborted: AtomicBool::new(false),
         });
 
-        let mut active_txns = self.active_txns.txns.lock();
-        active_txns.insert(txn_id, txn_state);
-        drop(active_txns);
+        self.active_txns.insert(txn_id, txn_state);
 
         // Wire the transaction to the WAL so commit/abort write log entries.
         // Also create an inner Txn for per-record lock management.
@@ -2967,6 +2993,59 @@ mod tests {
         );
         // close() must succeed because no txns remain registered.
         env.close().unwrap();
+    }
+
+    /// Sharded `ActiveTxns` must stay correct under concurrent begin/commit
+    /// from many threads: every txn is tracked while open and pruned on
+    /// commit, so the final registry len is 0 (no lost/duplicated entries
+    /// across shards). Guards the shard-keying + aggregate-len paths.
+    #[test]
+    fn test_concurrent_registry_no_corruption() {
+        use std::sync::Arc as StdArc;
+        let (_tmp, config) = temp_env_config();
+        let env = StdArc::new(Environment::open(config).unwrap());
+        let initial = env.active_txns.len();
+
+        let threads: Vec<_> = (0..16)
+            .map(|_| {
+                let env = StdArc::clone(&env);
+                std::thread::spawn(move || {
+                    for _ in 0..200 {
+                        let txn = env.begin_transaction(None).unwrap();
+                        txn.commit().unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+
+        assert_eq!(
+            env.active_txns.len(),
+            initial,
+            "every concurrently-committed txn must be pruned from its shard",
+        );
+        assert!(env.active_txns.is_empty());
+        StdArc::try_unwrap(env).ok().unwrap().close().unwrap();
+    }
+
+    /// close()'s leaked-txn guard must still fire when the leaked txn lands
+    /// in any shard: begin without commit, forget it, and close() must
+    /// report the active txn (aggregate len across shards is non-zero).
+    #[test]
+    fn test_close_detects_leaked_txn_across_shards() {
+        let (_tmp, config) = temp_env_config();
+        let env = Environment::open(config).unwrap();
+        // Leak a txn: begin, then std::mem::forget so Drop can't prune it.
+        let txn = env.begin_transaction(None).unwrap();
+        std::mem::forget(txn);
+        assert!(!env.active_txns.is_empty());
+        let err = env.close().unwrap_err();
+        assert!(
+            matches!(err, NoxuError::OperationNotAllowed(_)),
+            "close() must refuse to close with a leaked active txn, got {err:?}",
+        );
     }
 
     // ── X-3: recovered XA commit assigns real VLSN ─────────────────────

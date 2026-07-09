@@ -17,6 +17,31 @@ listed in [References](#references).
 
 ### Performance
 
+- **Per-transaction active-txn registry is now sharded, removing the global
+  mutex on every begin/commit (JE `TxnManager.allTxns` `ConcurrentHashMap`).**
+  `Environment`'s `ActiveTxns` was a single `Mutex<HashMap<u64, …>>`, so every
+  `begin_transaction` (insert) and every commit/abort/drop (`mark_complete`
+  remove) locked one global mutex. At 64 threads / ~235k ops/s (the throughput
+  the read-only-commit fix unlocked) that is ~470k acquisitions/s on a single
+  lock — the residual read serialisation once per-read fsyncs were gone. The
+  registry now holds an array of `N_TXN_SHARDS = 64` independent
+  `Mutex<HashMap>` shards keyed by `txn_id % 64`, so transactions with distinct
+  ids (the common case, ids come from a monotonic `AtomicU64`) touch distinct
+  shards and no longer serialise. This mirrors JE, which uses a
+  `ConcurrentHashMap` (striped locking) for `TxnManager.allTxns`, and reuses
+  Noxu's own in-repo sharding convention from `noxu-txn`'s `LockManager`
+  (`DEFAULT_N_LOCK_TABLES = 64`, `lock_tables[idx]`) — no new dependency
+  (e.g. `dashmap`) and no `unsafe`. Public/semantic behaviour is identical:
+  insert on begin, remove on complete, and the aggregate queries `len()` /
+  `is_empty()` used by `Environment::close()`'s leaked-active-txn guard now sum
+  / all-check across shards so leak detection stays correct. Regression-tested
+  by `test_concurrent_registry_no_corruption` (16 threads × 200 begin/commit,
+  final len 0 — no lost or duplicated shard entries) and
+  `test_close_detects_leaked_txn_across_shards` (a forgotten txn in any shard
+  still makes `close()` refuse), alongside the existing
+  `test_drop_aborts_open_transaction`, isolation, RMW-locking, concurrency, and
+  crash/recovery suites.
+
 - **Read-only transaction commits no longer touch the WAL, log-write latch, or
   fsync group-commit (JE `Txn.hasLoggedEntries()`).** A transaction opened with
   `begin_transaction(None)` (or any config without `with_read_only(true)`) is
