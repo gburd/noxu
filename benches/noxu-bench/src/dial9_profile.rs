@@ -63,6 +63,24 @@ mod imp {
             }
         }
 
+        /// Register the calling thread with the sampler.
+        ///
+        /// off-CPU (`SamplingMode::Period`) perf events do NOT set the perf
+        /// `inherit` bit (only `FrequencyHz` does — see
+        /// dial9 perf_sampler.rs `attr.set_inherit(1)`), so child worker
+        /// threads are otherwise invisible in off-CPU mode.  Each worker must
+        /// call this at startup so the sampler opens a per-thread event fd
+        /// scoped to that worker's tid; without it off-CPU mode captures only
+        /// the thread that called `maybe_start` (the main thread).
+        ///
+        /// Safe/idempotent for `cpu` mode too (which already inherits), so the
+        /// caller can register unconditionally.
+        pub fn track_current_thread(&mut self) {
+            if let Err(e) = self.sampler.track_current_thread() {
+                eprintln!("-- dial9 track_current_thread failed: {e} --");
+            }
+        }
+
         /// Drains samples, symbolizes, and prints the top folded stacks.
         pub fn report(&mut self, top_n: usize) {
             // Aggregate by folded callchain (leaf→root symbol names).
@@ -104,11 +122,7 @@ mod imp {
                 None => names.push(format!("{ip:#x}")),
             }
         }
-        if names.is_empty() {
-            format!("{:#x}", s.ip)
-        } else {
-            names.join(";")
-        }
+        if names.is_empty() { format!("{:#x}", s.ip) } else { names.join(";") }
     }
 
     /// Trim generics + hashes from a demangled Rust symbol for readable folding.
@@ -135,5 +149,6 @@ impl Profiler {
     pub fn maybe_start(_mode: &str) -> Option<Profiler> {
         None
     }
+    pub fn track_current_thread(&mut self) {}
     pub fn report(&mut self, _top_n: usize) {}
 }

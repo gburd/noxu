@@ -448,9 +448,24 @@ impl Transaction {
     pub fn commit_with_durability(&self, durability: Durability) -> Result<()> {
         self.check_open()?;
 
+        // Did this txn actually append any LN to the WAL?  Computed once so
+        // the three write-path steps below (WAL frame, replica-ack wait,
+        // cleaner throttle) all short-circuit for a read-only-in-practice
+        // txn without re-locking the inner Txn.
+        let logged_data = self.has_logged_data();
+
         // Write TxnCommit to the WAL before marking committed.
         // Durability controls whether we fsync, flush, or just buffer.
+        //
+        // Gate on `has_logged_data()` (did this txn append any LN?), not the
+        // static `read_only` config flag.  A default (write-capable) txn that
+        // only read logged nothing, so it needs no TxnCommit frame and —
+        // crucially — no commit fsync.  JE: `Txn.commit` writes the commit
+        // entry only when `hasLoggedEntries()`.  (read-commit-contention
+        // audit, 2026-07: gating on `read_only` forced every explicit read
+        // txn through the log-write latch + fsync group-commit at SYNC.)
         if !self.read_only
+            && logged_data
             && let Some(lm) = &self.log_manager
         {
             let (fsync, flush) = match durability.local_sync {
@@ -475,6 +490,7 @@ impl Transaction {
         // typed `NoxuError::InsufficientReplicas` rather than a state
         // leak.
         let ack_err: Option<NoxuError> = if !self.read_only
+            && logged_data
             && durability.replica_ack
                 != crate::durability::ReplicaAckPolicy::None
             && let Some(coord) = &self.replica_coordinator
@@ -506,6 +522,7 @@ impl Transaction {
         // Extract the throttle Arc while holding the env lock, then
         // drop the lock BEFORE sleeping to avoid blocking other threads.
         if !self.read_only
+            && logged_data
             && let Some(ref env) = self.env_impl
         {
             let throttle = env.lock().get_cleaner_throttle();
@@ -650,7 +667,12 @@ impl Transaction {
         }
 
         // Write TxnAbort to WAL before marking aborted (no fsync needed).
+        // Skipped when the txn logged nothing (read-only-in-practice): there
+        // is no undo chain for recovery to follow, so a TxnAbort frame is
+        // pointless.  JE writes an abort entry only for txns with logged
+        // entries.  (read-commit-contention audit, 2026-07.)
         if !self.read_only
+            && self.has_logged_data()
             && let Some(lm) = &self.log_manager
         {
             self.write_txn_end(lm, false, false, false)?;
@@ -918,6 +940,13 @@ impl Transaction {
         }
 
         // Write the TxnCommit frame.
+        //
+        // NOT gated on `has_logged_data()`: a prepared txn already wrote a
+        // durable TxnPrepare frame, so recovery WILL resurrect it unless we
+        // write the resolving TxnCommit.  (The inner Txn's `prepare()`
+        // resets its `last_lsn`, so `has_logged_entries()` reads false here
+        // even though the txn did log data — the read-only fast path must
+        // never apply to a prepared branch.)
         if !self.read_only
             && let Some(lm) = &self.log_manager
         {
@@ -965,6 +994,10 @@ impl Transaction {
             }
         }
 
+        // Write the resolving TxnAbort frame.  NOT gated on
+        // `has_logged_data()` for the same reason as the commit path above:
+        // a prepared txn wrote a durable TxnPrepare frame that recovery would
+        // otherwise resurrect, so the resolving frame must always be written.
         if !self.read_only
             && let Some(lm) = &self.log_manager
         {
@@ -1254,6 +1287,37 @@ impl Transaction {
     /// Check if this is a read-only transaction.
     pub fn is_read_only(&self) -> bool {
         self.read_only
+    }
+
+    /// Returns `true` iff this transaction actually appended any data
+    /// (LN) log entries to the WAL.
+    ///
+    /// This is the *dynamic* did-it-write signal, distinct from the static
+    /// [`Self::is_read_only`] config flag.  A transaction created without
+    /// `with_read_only(true)` (the default) is write-*capable*, but if it
+    /// only performed reads it logged nothing and needs no `TxnCommit` /
+    /// `TxnAbort` frame — and, critically, no commit fsync.
+    ///
+    /// JE: `Txn.commit()` writes a commit entry only for transactions that
+    /// have logged entries (`Txn.hasLoggedEntries()` /
+    /// `lastLoggedLsn != NULL_LSN`).  A read-only-in-practice txn is a no-op
+    /// commit — no WAL write, no group-commit fsync barrier.  Gating on the
+    /// static `read_only` flag instead (the pre-fix behaviour) forced every
+    /// explicit read txn through `write_txn_end` → `log` → `flush_sync` →
+    /// `fdatasync` at `SYNC`, serialising 100%-cache-hit readers on the
+    /// log-write latch + fsync group-commit condvar (read-commit-contention
+    /// audit, 2026-07).
+    fn has_logged_data(&self) -> bool {
+        match &self.inner_txn {
+            Some(inner) => inner
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .has_logged_entries(),
+            // No inner Txn (env-less construction): it cannot have logged
+            // an LN through the engine, so there is nothing to commit
+            // durably.
+            None => false,
+        }
     }
 
     /// Get the elapsed time since transaction start.
