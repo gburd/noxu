@@ -15,6 +15,18 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Testing
+
+- **dial9 in-process profiler for xbench (`BENCH_PROFILE=cpu|offcpu`).** Integrates
+  `dial9-perf-self-profile` (Linux `perf_event_open` with frame-pointer stack
+  walking) so the benchmark driver can capture its own CPU and *off-CPU*
+  (context-switch / blocking) stacks and print the top folded call sites, without
+  external `perf`/gdb (which is unreliable over SSM-SSH). `offcpu` mode captures
+  the stack at each deschedule — revealing which lock/condvar worker threads
+  block on. Off by default; needs frame pointers
+  (`RUSTFLAGS="-C force-frame-pointers=yes"`) and `perf_event_paranoid<=2`, and
+  degrades gracefully with a diagnostic message when unavailable. Linux-only.
+
 ### Performance
 
 - **CacheMode.DEFAULT keep-hot-LN eviction (JE `Evictor.moveBack`).** The read
