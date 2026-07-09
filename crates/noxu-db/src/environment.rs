@@ -330,6 +330,7 @@ impl Environment {
             log_group_commit_threshold: config.log_group_commit_threshold,
             log_group_commit_interval_ms: config.log_group_commit_interval_ms,
             log_fsync_max_leaders: config.log_fsync_max_leaders,
+            log_consolidation_array: config.log_consolidation_array,
             // B-tree
             node_max_entries: config.node_max_entries,
             node_dup_tree_max_entries: config.node_dup_tree_max_entries,
