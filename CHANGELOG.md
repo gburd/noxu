@@ -15,6 +15,26 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Added
+
+- **Consolidation-array log-write latch (`noxu.log.consolidationArray`, default
+  off).** The global log-write latch (LWL) serialized every WAL append through
+  one mutex; under high write concurrency 40+ of 64 threads parked on it
+  (the txn_mix collapse). The consolidation array (Aether/Silo flat-combining,
+  WiredTiger log-slot join) replaces the mutex with a lock-free CAS-combine: N
+  concurrent committers combine into one batch via a single CAS, one becomes the
+  leader and assigns the whole batch a contiguous LSN range in arrival order
+  while holding the latch **once per batch** (not once per commit), and followers
+  take their assigned slot without parking. The **single WAL and single monotonic
+  LSN space are preserved** — the leader stamps LSNs in arrival order, so
+  monotonicity and the prev_offset chain hold exactly as with the mutex. Off by
+  default; enable via config or `NOXU_LOG_CONSOLIDATION_ARRAY=1`. Correctness is
+  proven by a shuttle model checking LSN monotonicity and no lost/double entries
+  under all interleavings (`shuttle_consolidation`), a 64-thread append stress
+  test, and the full crash-recovery/recovery-correctness suites with the array
+  enabled.
+
+
 ### Testing
 
 - Ported the property-based tests for `noxu-log`, `noxu-recovery`, and
