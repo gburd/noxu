@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use noxu_log::{LogEntryType, LogManager, Provisional, entry::LnLogEntry};
 use noxu_tree::{BinEntry, Tree};
 use noxu_txn::{LockManager, LockType, Locker, Txn, TxnManager};
@@ -167,7 +167,7 @@ pub struct CursorImpl {
     /// Current position: the key at the cursor's position.
     current_key: Option<Vec<u8>>,
     /// Current position: the data at the cursor's position.
-    current_data: Option<Vec<u8>>,
+    current_data: Option<Bytes>,
     /// Current position: the LSN of the record.
     current_lsn: u64,
     /// Current position: the BIN index (slot in the current BIN).
@@ -861,7 +861,7 @@ impl CursorImpl {
     /// When a `get` finds such a slot (`data == None`) we must read the LN
     /// back from the log at its `lsn` rather than return empty data. Without
     /// this, a read of an evicted record silently returns no data.
-    fn fetch_ln_data_from_log(&self, lsn: u64) -> Option<Vec<u8>> {
+    fn fetch_ln_data_from_log(&self, lsn: u64) -> Option<Bytes> {
         use noxu_log::entry::LnLogEntry;
         let lm = self.log_manager.as_ref()?;
         let lsn = noxu_util::Lsn::from_u64(lsn);
@@ -871,7 +871,10 @@ impl CursorImpl {
         }
         let is_txnal = entry_type.is_transactional();
         let ln = LnLogEntry::parse_from_slice(&bytes, is_txnal).ok()?;
-        ln.data.map(|d| d.to_vec())
+        // `ln.data` borrows from `bytes` (the log read buffer), so we must
+        // copy it into an owned Bytes here — this is the cold evictor-restripe
+        // path (LN was stripped from cache), not the resident-slot hot read.
+        ln.data.map(Bytes::copy_from_slice)
     }
 
     /// If `current_data` is empty/None but `current_lsn` is valid, the LN was
@@ -1012,7 +1015,7 @@ impl CursorImpl {
                             .and_then(|tree| {
                                 Self::get_data_from_tree(&tree, key)
                             })
-                            .map(|(d, _)| d)
+                            .map(|(d, _)| Bytes::from(d))
                             .map(Some)
                             .unwrap_or(slot_data)
                     } else {
@@ -1088,7 +1091,7 @@ impl CursorImpl {
                             .and_then(|tree| {
                                 Self::get_data_from_tree(&tree, key)
                             })
-                            .map(|(d, _)| d)
+                            .map(|(d, _)| Bytes::from(d))
                             .map(Some)
                             .unwrap_or(slot_data)
                     } else {
@@ -1149,7 +1152,9 @@ impl CursorImpl {
                                 })
                             };
                             self.current_key = Some(k);
-                            self.current_data = Some(v);
+                            // `find_range_entry` yields an owned Vec (range
+                            // path); O(1) move into the Bytes-typed field.
+                            self.current_data = Some(Bytes::from(v));
                             self.current_lsn = lsn;
                             self.rehydrate_current_data();
                             self.current_index = slot_idx as i32;
@@ -1654,7 +1659,11 @@ impl CursorImpl {
                 let (idx, found) = bin.find_entry_compressed(key);
                 if found {
                     Some((
-                        bin.entries[idx].data.clone().unwrap_or_default(),
+                        bin.entries[idx]
+                            .data
+                            .as_ref()
+                            .map(|d| d.to_vec())
+                            .unwrap_or_default(),
                         bin.get_lsn(idx).as_u64(),
                     ))
                 } else {
@@ -1762,7 +1771,8 @@ impl CursorImpl {
                                         fk,
                                         bin.entries[i]
                                             .data
-                                            .clone()
+                                            .as_ref()
+                                            .map(|d| d.to_vec())
                                             .unwrap_or_default(),
                                         bin.get_lsn(i).as_u64(),
                                         i,
@@ -1784,7 +1794,10 @@ impl CursorImpl {
                                     bin.get_full_key(0).map(|fk| {
                                         (
                                             fk,
-                                            e.data.clone().unwrap_or_default(),
+                                            e.data
+                                                .as_ref()
+                                                .map(|d| d.to_vec())
+                                                .unwrap_or_default(),
                                             bin.get_lsn(0).as_u64(),
                                             0usize,
                                         )
@@ -1806,7 +1819,8 @@ impl CursorImpl {
                                             fk,
                                             bin.entries[i]
                                                 .data
-                                                .clone()
+                                                .as_ref()
+                                                .map(|d| d.to_vec())
                                                 .unwrap_or_default(),
                                             bin.get_lsn(i).as_u64(),
                                             i,
@@ -1831,7 +1845,12 @@ impl CursorImpl {
         // The first entry of the next BIN is at slot index 0.
         let next = tree.get_next_bin(key)?;
         let (e, lsn, full_key) = next.into_iter().next()?;
-        Some((full_key, e.data.unwrap_or_default(), lsn.as_u64(), 0))
+        Some((
+            full_key,
+            e.data.as_ref().map(|d| d.to_vec()).unwrap_or_default(),
+            lsn.as_u64(),
+            0,
+        ))
     }
 
     /// Descends from the given node to the leftmost BIN, returning its Arc.
@@ -1908,7 +1927,7 @@ impl CursorImpl {
 
         let result: Option<(
             Vec<u8>,
-            Vec<u8>,
+            Bytes,
             i32,
             u64,
             std::sync::Arc<noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>>,
@@ -1942,7 +1961,7 @@ impl CursorImpl {
                                             .unwrap_or_default();
                                         return Some((
                                             anchor,
-                                            Vec::new(),
+                                            Bytes::new(),
                                             -1i32,
                                             0u64,
                                             bin_arc.clone(),
@@ -2017,7 +2036,7 @@ impl CursorImpl {
 
         let result: Option<(
             Vec<u8>,
-            Vec<u8>,
+            Bytes,
             i32,
             u64,
             std::sync::Arc<noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>>,
@@ -2053,7 +2072,7 @@ impl CursorImpl {
                                             .unwrap_or_default();
                                         return Some((
                                             anchor,
-                                            Vec::new(),
+                                            Bytes::new(),
                                             -1i32,
                                             0u64,
                                             bin_arc.clone(),
@@ -2118,11 +2137,14 @@ impl CursorImpl {
     ///
     /// * `CursorNotInitialized` if the cursor is not positioned on a record
     /// * `CursorClosed` if the cursor has been closed
-    pub fn get_current(&self) -> Result<(Vec<u8>, Vec<u8>), DbiError> {
+    pub fn get_current(&self) -> Result<(Vec<u8>, Bytes), DbiError> {
         self.check_initialized()?;
 
         let raw_key =
             self.current_key.clone().ok_or(DbiError::CursorNotInitialized)?;
+        // Zero-copy: `current_data` is `Bytes`; `.clone()` is an O(1) refcount
+        // bump, so the value flows slot -> SlotFetch -> current_data -> here
+        // with no deep copy of the value.
         let raw_data = self.current_data.clone().unwrap_or_default();
 
         // For sorted-dup databases the tree stores two-part composite keys.
@@ -2130,7 +2152,7 @@ impl CursorImpl {
         if self.is_sorted_dup()
             && let Some((pk, data)) = dup_key_data::split(&raw_key)
         {
-            return Ok((pk, data));
+            return Ok((pk, Bytes::from(data)));
         }
         Ok((raw_key, raw_data))
     }
@@ -2288,7 +2310,7 @@ impl CursorImpl {
         // set (e.g. first advance after `get_first()` in an older code path).
         // We save the discovered arc so subsequent steps use the fast path.
         use noxu_tree::tree::TreeNode;
-        let entry: Option<(Vec<u8>, Vec<u8>, i32, u64)>;
+        let entry: Option<(Vec<u8>, Bytes, i32, u64)>;
         let new_bin_arc: Option<
             std::sync::Arc<noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>>,
         >;
@@ -2691,7 +2713,7 @@ impl CursorImpl {
     fn apply_dup_filter(
         &mut self,
         mut raw_key: Vec<u8>,
-        mut raw_data: Vec<u8>,
+        mut raw_data: Bytes,
         mut idx: i32,
         mut lsn: u64,
         mode: GetMode,
@@ -2999,7 +3021,7 @@ impl CursorImpl {
                     old_data,
                 )?;
                 self.apply_tree_insert(current_key, data.to_vec(), new_lsn);
-                self.current_data = Some(data.to_vec());
+                self.current_data = Some(Bytes::copy_from_slice(data));
                 self.current_lsn = new_lsn.as_u64();
                 Ok(OperationStatus::Success)
             }
@@ -3047,7 +3069,7 @@ impl CursorImpl {
                 )?;
                 self.apply_tree_insert(key.to_vec(), data.to_vec(), new_lsn);
                 self.current_key = Some(key.to_vec());
-                self.current_data = Some(data.to_vec());
+                self.current_data = Some(Bytes::copy_from_slice(data));
                 self.current_lsn = new_lsn.as_u64();
                 self.current_index = 0;
                 self.state = CursorState::Initialized;
@@ -3084,7 +3106,7 @@ impl CursorImpl {
                 )?;
                 self.apply_tree_insert(key.to_vec(), data.to_vec(), new_lsn);
                 self.current_key = Some(key.to_vec());
-                self.current_data = Some(data.to_vec());
+                self.current_data = Some(Bytes::copy_from_slice(data));
                 self.current_lsn = new_lsn.as_u64();
                 self.current_index = 0;
                 self.state = CursorState::Initialized;
@@ -3715,7 +3737,7 @@ mod tests {
         let (ret_key, ret_data) = cursor.get_current().unwrap();
 
         assert_eq!(ret_key, key);
-        assert_eq!(ret_data, data);
+        assert_eq!(&ret_data[..], data);
     }
 
     #[test]
@@ -4109,7 +4131,7 @@ mod tests {
         // Verify original value is still there.
         cursor.search(b"key", None, SearchMode::Set).unwrap();
         let (_, data) = cursor.get_current().unwrap();
-        assert_eq!(data, b"v1");
+        assert_eq!(&data[..], b"v1");
     }
 
     /// After delete the tree no longer contains the key (search returns NotFound).
@@ -4185,7 +4207,7 @@ mod tests {
 
         let (pk, d) = cursor.get_current().unwrap();
         assert_eq!(pk, b"key");
-        assert_eq!(d, b"data");
+        assert_eq!(&d[..], b"data");
     }
 
     /// Multiple data values for the same primary key.
@@ -4206,7 +4228,7 @@ mod tests {
 
         let (pk, d) = cursor.get_current().unwrap();
         assert_eq!(pk, b"key");
-        assert_eq!(d, b"aaa", "first dup should have smallest data");
+        assert_eq!(&d[..], b"aaa", "first dup should have smallest data");
     }
 
     /// search Both: positions at the exact (key, data) pair.
@@ -4225,7 +4247,7 @@ mod tests {
         assert_eq!(s, OperationStatus::Success);
         let (pk, d) = cursor.get_current().unwrap();
         assert_eq!(pk, b"key");
-        assert_eq!(d, b"bbb");
+        assert_eq!(&d[..], b"bbb");
     }
 
     /// search Both: returns NotFound when exact pair doesn't exist.
@@ -4283,18 +4305,18 @@ mod tests {
         // Position at first dup.
         cursor.search(b"key", None, SearchMode::Set).unwrap();
         let (_, d) = cursor.get_current().unwrap();
-        assert_eq!(d, b"a");
+        assert_eq!(&d[..], b"a");
 
         let s = cursor.retrieve_next(GetMode::NextDup).unwrap();
         assert_eq!(s, OperationStatus::Success);
         let (pk, d) = cursor.get_current().unwrap();
         assert_eq!(pk, b"key");
-        assert_eq!(d, b"b");
+        assert_eq!(&d[..], b"b");
 
         let s = cursor.retrieve_next(GetMode::NextDup).unwrap();
         assert_eq!(s, OperationStatus::Success);
         let (_, d) = cursor.get_current().unwrap();
-        assert_eq!(d, b"c");
+        assert_eq!(&d[..], b"c");
 
         // No more dups for "key".
         let s = cursor.retrieve_next(GetMode::NextDup).unwrap();
@@ -4323,7 +4345,7 @@ mod tests {
         assert_eq!(s, OperationStatus::Success);
         let (pk, d) = cursor.get_current().unwrap();
         assert_eq!(pk, b"bbb");
-        assert_eq!(d, b"x");
+        assert_eq!(&d[..], b"x");
     }
 
     /// Dup delete removes only the specific (key, data) pair.
@@ -4346,7 +4368,7 @@ mod tests {
         assert_eq!(s, OperationStatus::Success);
         let (pk, d) = cursor.get_current().unwrap();
         assert_eq!(pk, b"key");
-        assert_eq!(d, b"a");
+        assert_eq!(&d[..], b"a");
 
         // "key"/"b" should be gone.
         let s = cursor.search(b"key", Some(b"b"), SearchMode::Both).unwrap();
@@ -4370,12 +4392,12 @@ mod tests {
         cursor.get_first().unwrap();
         let (pk, d) = cursor.get_current().unwrap();
         assert_eq!(pk, b"a");
-        assert_eq!(d, b"bc");
+        assert_eq!(&d[..], b"bc");
 
         cursor.retrieve_next(GetMode::Next).unwrap();
         let (pk, d) = cursor.get_current().unwrap();
         assert_eq!(pk, b"ab");
-        assert_eq!(d, b"c");
+        assert_eq!(&d[..], b"c");
     }
 
     // -----------------------------------------------------------------------

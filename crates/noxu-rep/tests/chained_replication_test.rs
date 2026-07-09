@@ -112,7 +112,7 @@ fn poll_read(
         if let Some(fetch) = tree.read().unwrap().search_with_data(key)
             && fetch.found
         {
-            return fetch.data;
+            return fetch.data.map(|d| d.to_vec());
         }
         std::thread::sleep(Duration::from_millis(50));
     }

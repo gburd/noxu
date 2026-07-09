@@ -36,7 +36,7 @@ fn make_bin_bytes(
         node_id,
         level: noxu_tree::BIN_LEVEL,
         entries: vec![BinEntry {
-            data: Some(data.to_vec()),
+            data: Some(bytes::Bytes::copy_from_slice(data)),
             known_deleted: false,
             dirty: false,
             expiration_time: 0,

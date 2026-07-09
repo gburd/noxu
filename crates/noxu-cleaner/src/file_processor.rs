@@ -606,7 +606,9 @@ impl RealTreeLookup {
                 if !found {
                     return None;
                 }
-                bin.entries[idx].data.clone()
+                // Cleaner (GC) path, not the hot read path: materialise an
+                // owned Vec from the slot's shared `Bytes`.
+                bin.entries[idx].data.as_ref().map(|d| d.to_vec())
             }
             TreeNode::Internal(n) => {
                 let mut idx = 0usize;

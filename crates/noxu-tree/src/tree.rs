@@ -23,6 +23,7 @@
 use crate::error::TreeError;
 use crate::key::{create_key_prefix, get_key_prefix_length};
 use crate::search_result::SearchResult;
+use bytes::Bytes;
 use noxu_latch::{LatchContext, SharedLatch};
 use noxu_util::{Lsn, NULL_LSN};
 // DST: the tree-node latch.  Production (default cfg) is BYTE-IDENTICAL — the
@@ -107,8 +108,20 @@ pub const INSERT_SUCCESS: i32 = 1 << 17;
 ///
 /// Derived (not hard-coded) so a layout change to `BinEntry` is tracked
 /// automatically — see `bin_stub_conformance` for the drift guard.
-pub const BIN_ENTRY_OVERHEAD: usize =
-    std::mem::size_of::<BinEntry>() + LsnRep::BYTES_PER_LSN_ENTRY;
+///
+/// Zero-copy note: the slot's `data` field is a [`bytes::Bytes`]
+/// (`size_of` 32) rather than a `Vec<u8>` (`size_of` 24).  We deliberately
+/// charge the slot's *structural* overhead as if `data` were still a
+/// `Vec<u8>` (subtract the 8-byte smart-pointer delta) so the MemoryBudget
+/// — and therefore every eviction decision it drives — is byte-for-byte
+/// identical to the pre-`Bytes` behaviour.  The budget's purpose is to track
+/// resident *data bytes* plus a *stable* per-slot structural estimate; the
+/// extra 8 bytes of the `Bytes` handle are not resident value bytes and must
+/// not perturb the eviction threshold (otherwise a fitting working set would
+/// evict more aggressively — detaching BINs a scan then cannot reach).
+pub const BIN_ENTRY_OVERHEAD: usize = std::mem::size_of::<BinEntry>()
+    + LsnRep::BYTES_PER_LSN_ENTRY
+    - (std::mem::size_of::<Bytes>() - std::mem::size_of::<Vec<u8>>());
 
 /// Per-slot fixed memory overhead for an IN entry, in bytes (DBI-23).
 ///
@@ -140,7 +153,13 @@ pub struct SlotFetch {
     /// `true` if an exact key match was found and is not expired.
     pub found: bool,
     /// Data bytes for the slot (`None` when `found` is `false`).
-    pub data: Option<Vec<u8>>,
+    ///
+    /// Zero-copy read path: this is a refcount-shared [`bytes::Bytes`], not an
+    /// owned `Vec<u8>` — cloning it out of the slot is an O(1) refcount bump,
+    /// not a deep copy of the value.  The bytes are byte-identical to what is
+    /// resident in the BIN slot; the reader shares the same allocation and
+    /// drops its handle after the op, so it never perturbs the memory budget.
+    pub data: Option<Bytes>,
     /// Raw slot LSN as `u64`; zero when `found` is `false`.
     pub lsn: u64,
     /// Slot index within the BIN.  Set to the actual BIN slot index when
@@ -1184,7 +1203,13 @@ pub struct BinStub {
 #[derive(Debug, Clone)]
 pub struct BinEntry {
     /// Optional embedded data (for small records) or cached LN.
-    pub data: Option<Vec<u8>>,
+    ///
+    /// Zero-copy read path: stored as a refcount-shared [`bytes::Bytes`] so a
+    /// read can hand a cheap refcount clone to the caller instead of deep-
+    /// copying the whole value.  `Bytes::len()` equals the resident byte
+    /// count exactly like `Vec::len()`, so every MemoryBudget charge/credit
+    /// site (which measures `data.len()`) is unaffected by the type change.
+    pub data: Option<Bytes>,
     /// True when this slot has been marked known-deleted (analogous to the
     /// KNOWN_DELETED_BIT in `IN.entryStates`).  The slot is eligible for
     /// removal by `compress_bin()`.
@@ -1424,7 +1449,7 @@ impl BinStub {
         idx: usize,
         suffix: Vec<u8>,
         lsn: Lsn,
-        data: Option<Vec<u8>>,
+        data: Option<Bytes>,
     ) {
         self.entries.insert(
             idx,
@@ -1647,6 +1672,11 @@ impl BinStub {
         lsn: Lsn,
         data: Option<Vec<u8>>,
     ) -> (usize, bool) {
+        // Zero-copy slot storage: convert the incoming owned `Vec<u8>` to a
+        // refcount-shared `Bytes` once, up front.  `Bytes::from(Vec)` is O(1)
+        // (takes ownership of the allocation, no copy).  All downstream slot
+        // stores in this fn share this handle.
+        let data = data.map(Bytes::from);
         // Is the current prefix still compatible with this key?
         let plen = self.key_prefix.len();
         let new_len = if plen > 0 {
@@ -1769,12 +1799,17 @@ impl BinStub {
         match self.key_binary_search(&suffix) {
             Ok(idx) => {
                 self.set_lsn(idx, lsn); // T-3
-                self.entries[idx].data = data.map(|d| d.to_vec());
+                self.entries[idx].data = data.map(Bytes::copy_from_slice);
                 self.entries[idx].dirty = true;
                 (idx, false)
             }
             Err(idx) => {
-                self.insert_slot(idx, suffix, lsn, data.map(|d| d.to_vec()));
+                self.insert_slot(
+                    idx,
+                    suffix,
+                    lsn,
+                    data.map(Bytes::copy_from_slice),
+                );
                 if self.key_prefix.is_empty() && self.entries.len() >= 2 {
                     self.recompute_key_prefix();
                 }
@@ -1956,9 +1991,9 @@ impl BinStub {
         lsn: Lsn,
         data: Option<Vec<u8>>,
     ) -> (usize, bool) {
+        // Zero-copy slot storage: O(1) `Vec` -> `Bytes` conversion up front.
+        let data = data.map(Bytes::from);
         // Binary search on the stored (full) keys.
-        // When key_prefix is empty entries store full keys directly; for
-        // key_prefixing=false DBs the prefix is always empty.
         match self.key_binary_search(full_key.as_slice()) {
             Ok(idx) => {
                 self.set_lsn(idx, lsn); // T-3
@@ -1988,6 +2023,8 @@ impl BinStub {
         data: Option<Vec<u8>>,
         cmp: &dyn Fn(&[u8], &[u8]) -> std::cmp::Ordering,
     ) -> (usize, bool) {
+        // Zero-copy slot storage: O(1) `Vec` -> `Bytes` conversion up front.
+        let data = data.map(Bytes::from);
         if self.key_prefix.is_empty() {
             match self.key_binary_search_by(|s| cmp(s, &full_key)) {
                 Ok(idx) => {
@@ -2179,7 +2216,7 @@ impl BinStub {
                 }
                 let d = bytes[pos..pos + data_len].to_vec();
                 pos += data_len;
-                Some(d)
+                Some(Bytes::from(d))
             } else {
                 None
             };
@@ -2299,7 +2336,7 @@ impl BinStub {
                 }
                 let d = delta_bytes[pos..pos + data_len].to_vec();
                 pos += data_len;
-                Some(d)
+                Some(Bytes::from(d))
             } else {
                 None
             };
@@ -2402,8 +2439,14 @@ impl TreeNode {
         use std::mem::size_of;
         match self {
             TreeNode::Bottom(b) => {
+                // Charge the per-slot `BinEntry` struct as if `data` were a
+                // `Vec<u8>` (subtract the 8-byte `Bytes`-vs-`Vec` delta) so
+                // the budgeted size — and the eviction it drives — matches the
+                // pre-`Bytes` behaviour; see `BIN_ENTRY_OVERHEAD`.
+                let bin_entry_struct = size_of::<BinEntry>()
+                    - (size_of::<Bytes>() - size_of::<Vec<u8>>());
                 (size_of::<BinStub>()
-                    + b.entries.len() * size_of::<BinEntry>()
+                    + b.entries.len() * bin_entry_struct
                     + b.key_prefix.len()
                     + b.keys.memory_size() // T-2: node-level key rep bytes
                     + b.lsn_rep.memory_size() // T-3: node-level LSN rep bytes
@@ -3043,8 +3086,14 @@ impl Tree {
                         continue;
                     }
                     if let Some(fk) = b.get_full_key(i) {
-                        let data =
-                            b.entries[i].data.clone().unwrap_or_default();
+                        // Not the hot read path (full-tree collect); the slot
+                        // holds `Bytes`, materialise an owned `Vec` for the
+                        // `Vec<u8>`-typed return tuple.
+                        let data = b.entries[i]
+                            .data
+                            .as_ref()
+                            .map(|d| d.to_vec())
+                            .unwrap_or_default();
                         out.push((fk, data, b.get_lsn(i)));
                     }
                 }
@@ -3372,6 +3421,10 @@ impl Tree {
                             if bin.slot_is_live(idx) {
                                 let lsn = bin.get_lsn(idx); // T-3
                                 let e = &bin.entries[idx];
+                                // Zero-copy: `e.data` is `Bytes`, so `.clone()`
+                                // is an O(1) refcount bump — no deep copy of the
+                                // value out of the resident slot (was the
+                                // per-read `Vec<u8>` deep copy, tree.rs R2).
                                 (true, e.data.clone(), lsn.as_u64(), idx)
                             } else {
                                 (false, None, 0u64, 0)
@@ -3494,7 +3547,7 @@ impl Tree {
         if bin.entries[slot_index].data.is_some() {
             return;
         }
-        bin.entries[slot_index].data = Some(data.to_vec());
+        bin.entries[slot_index].data = Some(Bytes::copy_from_slice(data));
         // Symmetric with strip's release_memory(data.len()).
         counter.fetch_add(data.len() as i64, Ordering::Relaxed);
     }
@@ -3625,9 +3678,12 @@ impl Tree {
                         if idx < bin.entries.len() {
                             let full_key =
                                 bin.get_full_key(idx).unwrap_or_default();
+                            // ponytail: range-seek path, not point-get hot
+                            // path — materialise owned Vec for Vec<u8> return.
                             let data = bin.entries[idx]
                                 .data
-                                .clone()
+                                .as_ref()
+                                .map(|d| d.to_vec())
                                 .unwrap_or_default();
                             let lsn = bin.get_lsn(idx).as_u64(); // T-3
                             Some((full_key, data, lsn))
@@ -3719,8 +3775,15 @@ impl Tree {
                     if idx < bin.entries.len() {
                         let full_key =
                             bin.get_full_key(idx).unwrap_or_default();
-                        let data =
-                            bin.entries[idx].data.clone().unwrap_or_default();
+                        // ponytail: range-seek path (SetRange), not the point-get
+                        // hot path — materialise an owned Vec for the Vec<u8>-typed
+                        // return.  Make this return Bytes too if range reads
+                        // become a measured bottleneck.
+                        let data = bin.entries[idx]
+                            .data
+                            .as_ref()
+                            .map(|d| d.to_vec())
+                            .unwrap_or_default();
                         let lsn = bin.get_lsn(idx).as_u64(); // T-3
                         // Obtain the Arc for the BIN node the guard came from.
                         // `ArcRwLockReadGuard::rwlock()` returns the backing Arc.
@@ -3794,7 +3857,7 @@ impl Tree {
                     node_id: bin_node_id,
                     level: BIN_LEVEL,
                     entries: vec![BinEntry {
-                        data: Some(data),
+                        data: Some(Bytes::from(data)),
                         known_deleted: false,
                         dirty: false,
                         expiration_time: 0,
@@ -3942,7 +4005,7 @@ impl Tree {
                 };
                 let mut initial_entries = Vec::with_capacity(initial_cap);
                 initial_entries.push(BinEntry {
-                    data: data_opt.map(|d| d.to_vec()),
+                    data: data_opt.map(Bytes::copy_from_slice),
                     known_deleted: false,
                     dirty: false,
                     expiration_time: 0,
@@ -6911,7 +6974,10 @@ impl Tree {
                 (
                     delta.get_full_key(i).unwrap_or_default(),
                     delta.get_lsn(i),
-                    delta.entries[i].data.clone(),
+                    // Delta reconstitution (recovery/checkpoint), not the hot
+                    // read path: materialise an owned Vec for the tuple that
+                    // feeds `apply_delta_to_bin`.
+                    delta.entries[i].data.as_ref().map(|d| d.to_vec()),
                 )
             })
             .collect();
@@ -7313,7 +7379,9 @@ impl Tree {
                         self.upper_in_floor_index(&n.entries, current_key);
                     let child = match n.get_child(idx) {
                         Some(c) => c,
-                        None => return AdjacentBinOutcome::NoAdjacent,
+                        None => {
+                            return AdjacentBinOutcome::NoAdjacent;
+                        }
                     };
                     (child, idx)
                 }
@@ -7374,7 +7442,9 @@ impl Tree {
                 match &*g {
                     TreeNode::Internal(p) => match p.get_child(sibling_idx) {
                         Some(c) => c,
-                        None => return AdjacentBinOutcome::NoAdjacent,
+                        None => {
+                            return AdjacentBinOutcome::NoAdjacent;
+                        }
                     },
                     _ => return AdjacentBinOutcome::NoAdjacent,
                 }
@@ -8747,7 +8817,7 @@ mod tests {
         let mut keys = vec![];
         for i in 0..5 {
             entries.push(BinEntry {
-                data: Some(vec![]),
+                data: Some(Bytes::from(vec![])),
                 known_deleted: false,
                 dirty: false,
                 expiration_time: 0,
@@ -9565,7 +9635,7 @@ mod tests {
             level: BIN_LEVEL,
             entries: vec![
                 BinEntry {
-                    data: Some(b"d1".to_vec()),
+                    data: Some(Bytes::from(b"d1".to_vec())),
                     known_deleted: false,
                     dirty: false,
                     expiration_time: 0,
@@ -10411,13 +10481,13 @@ mod tests {
             level: BIN_LEVEL,
             entries: vec![
                 BinEntry {
-                    data: Some(b"old_a".to_vec()),
+                    data: Some(Bytes::from(b"old_a".to_vec())),
                     known_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
                 BinEntry {
-                    data: Some(b"old_c".to_vec()),
+                    data: Some(Bytes::from(b"old_c".to_vec())),
                     known_deleted: false,
                     dirty: false,
                     expiration_time: 0,
@@ -10524,13 +10594,13 @@ mod tests {
             level: BIN_LEVEL,
             entries: vec![
                 BinEntry {
-                    data: Some(b"base_aa".to_vec()),
+                    data: Some(Bytes::from(b"base_aa".to_vec())),
                     known_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
                 BinEntry {
-                    data: Some(b"base_cc".to_vec()),
+                    data: Some(Bytes::from(b"base_cc".to_vec())),
                     known_deleted: false,
                     dirty: false,
                     expiration_time: 0,
@@ -10557,13 +10627,13 @@ mod tests {
             level: BIN_LEVEL,
             entries: vec![
                 BinEntry {
-                    data: Some(b"delta_aa".to_vec()),
+                    data: Some(Bytes::from(b"delta_aa".to_vec())),
                     known_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
                 BinEntry {
-                    data: Some(b"delta_bb".to_vec()),
+                    data: Some(Bytes::from(b"delta_bb".to_vec())),
                     known_deleted: false,
                     dirty: false,
                     expiration_time: 0,
@@ -10662,7 +10732,7 @@ mod tests {
             node_id: 1,
             level: BIN_LEVEL,
             entries: vec![BinEntry {
-                data: Some(b"v1".to_vec()),
+                data: Some(Bytes::from(b"v1".to_vec())),
                 known_deleted: false,
                 dirty: false,
                 expiration_time: 0,
@@ -10707,7 +10777,7 @@ mod tests {
             node_id: 2,
             level: BIN_LEVEL,
             entries: vec![BinEntry {
-                data: Some(b"delta_a".to_vec()),
+                data: Some(Bytes::from(b"delta_a".to_vec())),
                 known_deleted: false,
                 dirty: true,
                 expiration_time: 0,
@@ -10759,13 +10829,13 @@ mod tests {
             level: BIN_LEVEL,
             entries: vec![
                 BinEntry {
-                    data: Some(b"base_val".to_vec()),
+                    data: Some(Bytes::from(b"base_val".to_vec())),
                     known_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
                 BinEntry {
-                    data: Some(b"base_shared".to_vec()),
+                    data: Some(Bytes::from(b"base_shared".to_vec())),
                     known_deleted: false,
                     dirty: false,
                     expiration_time: 0,
@@ -10808,14 +10878,14 @@ mod tests {
             entries: vec![
                 // Overwrites "shared_key" from the base.
                 BinEntry {
-                    data: Some(b"delta_shared".to_vec()),
+                    data: Some(Bytes::from(b"delta_shared".to_vec())),
                     known_deleted: false,
                     dirty: true,
                     expiration_time: 0,
                 },
                 // New key only in the delta.
                 BinEntry {
-                    data: Some(b"delta_val".to_vec()),
+                    data: Some(Bytes::from(b"delta_val".to_vec())),
                     known_deleted: false,
                     dirty: true,
                     expiration_time: 0,
@@ -10851,7 +10921,9 @@ mod tests {
         let find = |k: &[u8]| -> Option<Vec<u8>> {
             (0..delta.entries.len())
                 .find(|&i| delta.get_full_key(i).as_deref() == Some(k))
-                .and_then(|i| delta.entries[i].data.clone())
+                .and_then(|i| {
+                    delta.entries[i].data.as_ref().map(|d| d.to_vec())
+                })
         };
 
         assert_eq!(
@@ -11773,7 +11845,7 @@ mod tests {
             level: BIN_LEVEL,
             entries: vec![
                 BinEntry {
-                    data: Some(b"live".to_vec()),
+                    data: Some(Bytes::from(b"live".to_vec())),
                     known_deleted: false,
                     dirty: false,
                     expiration_time: 0,
@@ -11785,7 +11857,7 @@ mod tests {
                     expiration_time: 0,
                 },
                 BinEntry {
-                    data: Some(b"live2".to_vec()),
+                    data: Some(Bytes::from(b"live2".to_vec())),
                     known_deleted: false,
                     dirty: false,
                     expiration_time: 0,
@@ -11882,7 +11954,7 @@ mod tests {
             level: BIN_LEVEL,
             entries: vec![
                 BinEntry {
-                    data: Some(b"live".to_vec()),
+                    data: Some(Bytes::from(b"live".to_vec())),
                     known_deleted: false,
                     dirty: false,
                     expiration_time: 0,
@@ -11894,7 +11966,7 @@ mod tests {
                     expiration_time: 0,
                 },
                 BinEntry {
-                    data: Some(b"live2".to_vec()),
+                    data: Some(Bytes::from(b"live2".to_vec())),
                     known_deleted: false,
                     dirty: false,
                     expiration_time: 0,
@@ -11989,7 +12061,7 @@ mod tests {
             level: BIN_LEVEL,
             entries: vec![
                 BinEntry {
-                    data: Some(b"live".to_vec()),
+                    data: Some(Bytes::from(b"live".to_vec())),
                     known_deleted: false,
                     dirty: false,
                     expiration_time: 0,
@@ -12069,7 +12141,7 @@ mod tests {
             node_id: generate_node_id(),
             level: BIN_LEVEL,
             entries: vec![BinEntry {
-                data: Some(b"d".to_vec()),
+                data: Some(Bytes::from(b"d".to_vec())),
                 known_deleted: false,
                 dirty: false,
                 expiration_time: 0,
@@ -12216,7 +12288,7 @@ mod tests {
             node_id: generate_node_id(),
             level: BIN_LEVEL,
             entries: vec![BinEntry {
-                data: Some(b"v".to_vec()),
+                data: Some(Bytes::from(b"v".to_vec())),
                 known_deleted: false,
                 dirty: false,
                 expiration_time: 0,
@@ -12256,7 +12328,7 @@ mod tests {
             level: BIN_LEVEL,
             entries: vec![
                 BinEntry {
-                    data: Some(b"v".to_vec()),
+                    data: Some(Bytes::from(b"v".to_vec())),
                     known_deleted: false,
                     dirty: false,
                     expiration_time: 0,
@@ -12320,13 +12392,13 @@ mod tests {
             level: BIN_LEVEL,
             entries: vec![
                 BinEntry {
-                    data: Some(b"d0".to_vec()),
+                    data: Some(Bytes::from(b"d0".to_vec())),
                     known_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
                 BinEntry {
-                    data: Some(b"d1".to_vec()),
+                    data: Some(Bytes::from(b"d1".to_vec())),
                     known_deleted: false,
                     dirty: false,
                     expiration_time: 0,
@@ -12362,7 +12434,7 @@ mod tests {
             node_id: generate_node_id(),
             level: BIN_LEVEL,
             entries: vec![BinEntry {
-                data: Some(b"s".to_vec()),
+                data: Some(Bytes::from(b"s".to_vec())),
                 known_deleted: false,
                 dirty: false,
                 expiration_time: 0,
@@ -12552,13 +12624,13 @@ mod tests {
             level: BIN_LEVEL,
             entries: vec![
                 BinEntry {
-                    data: Some(b"a".to_vec()),
+                    data: Some(Bytes::from(b"a".to_vec())),
                     known_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
                 BinEntry {
-                    data: Some(b"b".to_vec()),
+                    data: Some(Bytes::from(b"b".to_vec())),
                     known_deleted: false,
                     dirty: false,
                     expiration_time: 0,
@@ -12621,13 +12693,13 @@ mod tests {
                     expiration_time: 0,
                 },
                 BinEntry {
-                    data: Some(b"B".to_vec()),
+                    data: Some(Bytes::from(b"B".to_vec())),
                     known_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
                 BinEntry {
-                    data: Some(b"C".to_vec()),
+                    data: Some(Bytes::from(b"C".to_vec())),
                     known_deleted: false,
                     dirty: false,
                     expiration_time: 0,
@@ -12804,7 +12876,7 @@ mod tests {
                     expiration_time: 0,
                 },
                 BinEntry {
-                    data: Some(b"v".to_vec()),
+                    data: Some(Bytes::from(b"v".to_vec())),
                     known_deleted: false,
                     dirty: false,
                     expiration_time: 0,
@@ -12829,7 +12901,7 @@ mod tests {
             node_id: generate_node_id(),
             level: BIN_LEVEL,
             entries: vec![BinEntry {
-                data: Some(b"s".to_vec()),
+                data: Some(Bytes::from(b"s".to_vec())),
                 known_deleted: false,
                 dirty: false,
                 expiration_time: 0,
@@ -12917,7 +12989,7 @@ mod tests {
             entries: vec![
                 // slot 0: live
                 BinEntry {
-                    data: Some(b"live".to_vec()),
+                    data: Some(Bytes::from(b"live".to_vec())),
                     known_deleted: false,
                     dirty: false,
                     expiration_time: 0,
@@ -12931,7 +13003,7 @@ mod tests {
                 },
                 // slot 2: live
                 BinEntry {
-                    data: Some(b"also-live".to_vec()),
+                    data: Some(Bytes::from(b"also-live".to_vec())),
                     known_deleted: false,
                     dirty: false,
                     expiration_time: 0,
@@ -13161,7 +13233,7 @@ mod tests {
             node_id: 2,
             level: BIN_LEVEL,
             entries: vec![BinEntry {
-                data: Some(b"old".to_vec()),
+                data: Some(Bytes::from(b"old".to_vec())),
                 known_deleted: false,
                 dirty: false,
                 expiration_time: 0,
@@ -13196,7 +13268,7 @@ mod tests {
             level: BIN_LEVEL,
             entries: vec![
                 BinEntry {
-                    data: Some(b"d1".to_vec()),
+                    data: Some(Bytes::from(b"d1".to_vec())),
                     known_deleted: false,
                     dirty: true,
                     expiration_time: 0,
@@ -13240,19 +13312,19 @@ mod tests {
             level: BIN_LEVEL,
             entries: vec![
                 BinEntry {
-                    data: Some(b"v1".to_vec()),
+                    data: Some(Bytes::from(b"v1".to_vec())),
                     known_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
                 BinEntry {
-                    data: Some(b"v2".to_vec()),
+                    data: Some(Bytes::from(b"v2".to_vec())),
                     known_deleted: false,
                     dirty: true,
                     expiration_time: 0,
                 },
                 BinEntry {
-                    data: Some(b"v3".to_vec()),
+                    data: Some(Bytes::from(b"v3".to_vec())),
                     known_deleted: false,
                     dirty: false,
                     expiration_time: 0,
@@ -13321,7 +13393,7 @@ mod tests {
             entries: entries
                 .into_iter()
                 .map(|(_key, _lsn, data)| BinEntry {
-                    data,
+                    data: data.map(Bytes::from),
                     known_deleted: false,
                     dirty: false,
                     expiration_time: 0,
@@ -13821,19 +13893,19 @@ mod tests {
         // dirty bit (its value is recoverable from the log); only a NULL-LSN
         // (never-logged / deferred-write) slot is preserved.
         bin.entries.push(BinEntry {
-            data: Some(vec![0u8; 64]),
+            data: Some(Bytes::from(vec![0u8; 64])),
             known_deleted: false,
             dirty: false,
             expiration_time: 0,
         });
         bin.entries.push(BinEntry {
-            data: Some(vec![0u8; 32]),
+            data: Some(Bytes::from(vec![0u8; 32])),
             known_deleted: false,
             dirty: false,
             expiration_time: 0,
         });
         bin.entries.push(BinEntry {
-            data: Some(vec![0u8; 16]),
+            data: Some(Bytes::from(vec![0u8; 16])),
             known_deleted: false,
             dirty: true, // dirty BUT logged -> still strippable (EVICTOR-RECLAIM-1)
             expiration_time: 0,
@@ -13865,7 +13937,7 @@ mod tests {
 
         // A NULL-LSN slot (never logged) must be preserved — its only copy is
         // the in-memory value.
-        bin.entries[0].data = Some(vec![0u8; 64]);
+        bin.entries[0].data = Some(Bytes::from(vec![0u8; 64]));
         bin.set_lsn(0, noxu_util::NULL_LSN);
         let freed_null = bin.strip_lns();
         assert_eq!(
@@ -13967,7 +14039,7 @@ fn test_split_child_sibling_inherits_expiration_in_hours() {
     // Pre-populate the tree root for the test.
     let entries: Vec<BinEntry> = (0u8..4u8)
         .map(|_k| BinEntry {
-            data: Some(vec![_k, _k]),
+            data: Some(Bytes::from(vec![_k, _k])),
             known_deleted: false,
             dirty: true,
             expiration_time: 495_630, // hours-since-epoch value, 2026

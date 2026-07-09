@@ -356,7 +356,9 @@ impl Evictor {
             primary,
             scan,
         )
-        .with_opt_log_manager(self.log_manager.into_inner().expect("evictor lm lock poisoned"))
+        .with_opt_log_manager(
+            self.log_manager.into_inner().expect("evictor lm lock poisoned"),
+        )
         .with_opt_tree(
             self.tree.into_inner().expect("evictor tree lock poisoned"),
             self.db_id.load(Ordering::Relaxed),
@@ -1685,8 +1687,17 @@ fn find_node_full_recursive(
             // variable key and embedded-LN data bytes.  T-2/T-3: keys and
             // LSNs live in node-level reps (BinStub.keys / lsn_rep), not in
             // BinEntry.
+            //
+            // Zero-copy: the slot `data` field is a `bytes::Bytes` (size_of 32)
+            // rather than a `Vec<u8>` (size_of 24).  Charge the per-slot struct
+            // as if `data` were still a `Vec<u8>` (subtract the 8-byte handle
+            // delta) so this evictor node-size — and every eviction decision it
+            // drives — is byte-for-byte identical to the pre-`Bytes` behaviour.
+            // Mirrors `Tree::budgeted_memory_size` / `BIN_ENTRY_OVERHEAD`.
+            let bin_entry_struct = size_of::<BinEntry>()
+                - (size_of::<bytes::Bytes>() - size_of::<Vec<u8>>());
             let size = (size_of::<BinStub>()
-                + b.entries.len() * size_of::<BinEntry>()
+                + b.entries.len() * bin_entry_struct
                 + b.key_prefix.len()
                 + b.keys.memory_size()
                 + b.lsn_rep.memory_size()
@@ -1861,10 +1872,7 @@ mod tests {
     /// does in production before an evict.
     fn stamp_bin_logged(tree: &noxu_tree::tree::Tree, bin_id: u64) {
         use noxu_tree::tree::TreeNode;
-        fn walk(
-            arc: &Arc<noxu_tree::NodeRwLock<TreeNode>>,
-            id: u64,
-        ) -> bool {
+        fn walk(arc: &Arc<noxu_tree::NodeRwLock<TreeNode>>, id: u64) -> bool {
             let mut g = arc.write();
             match &mut *g {
                 TreeNode::Bottom(b) if b.node_id == id => {
@@ -2814,8 +2822,12 @@ mod tests {
         };
 
         // Compute expected size using the explicit formula.
+        // Zero-copy: mirror the production `find_node_full` adjustment that
+        // charges the per-slot struct as if `data` were a `Vec<u8>`.
+        let bin_entry_struct = size_of::<BinEntry>()
+            - (size_of::<bytes::Bytes>() - size_of::<Vec<u8>>());
         let expected: u64 = (size_of::<BinStub>()
-            + bin_entries.len() * size_of::<BinEntry>()
+            + bin_entries.len() * bin_entry_struct
             + bin_rep_bytes
             + bin_entries.iter().map(|(k, d)| k + d).sum::<usize>())
             as u64;

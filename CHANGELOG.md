@@ -34,6 +34,22 @@ listed in [References](#references).
   test, and the full crash-recovery/recovery-correctness suites with the array
   enabled.
 
+### Performance
+
+- **Zero-copy read path (refcount-shared value return).** A resident-record
+  read no longer deep-copies the whole value on every `get`. The BIN slot's
+  value is now stored as a refcount-shared `bytes::Bytes` (was `Vec<u8>`), so
+  the read path flows the value slot → `SlotFetch` → cursor →
+  `Database::get`/`get_bytes` with an O(1) refcount clone instead of a full
+  `Vec<u8>` deep copy per point-get (previously `Tree::search_with_data` did
+  `e.data.clone()` — a whole-value allocation + memcpy on the per-read CPU
+  budget). Returned values are byte-identical to before. The explicit
+  MemoryBudget is unchanged: it still charges/credits each slot's `data.len()`
+  (identical for `Bytes` and `Vec<u8>`), and the per-slot *structural* overhead
+  is deliberately charged as if `data` were still a `Vec<u8>` so eviction
+  behaviour is byte-for-byte identical to the pre-`Bytes` accounting. Cold
+  evictor-restripe and range/scan paths still materialise owned bytes as
+  needed. (Read-gap R2 / perf-gap synthesis item.)
 
 ### Testing
 

@@ -591,7 +591,7 @@ impl Database {
                 })?;
                 self.throughput.n_pri_searches.fetch_add(1, Ordering::Relaxed);
                 observe_timer_record!(_obs_timer, "noxu_db_operation_duration_seconds", "op" => "get");
-                Ok(Some(Bytes::from(value)))
+                Ok(Some(value))
             }
             _ => {
                 self.throughput
@@ -729,7 +729,7 @@ impl Database {
                     "noxu_db_operation_duration_seconds",
                     "op" => "get_with_options"
                 );
-                Ok(Some(Bytes::from(value)))
+                Ok(Some(value))
             }
             _ => {
                 self.throughput
@@ -1123,7 +1123,7 @@ impl Database {
         let secondaries = self.live_secondaries();
         let track_old_data =
             !secondaries.is_empty() || self.has_user_triggers();
-        let mut deleted_old_values: Vec<Vec<u8>> = Vec::new();
+        let mut deleted_old_values: Vec<Bytes> = Vec::new();
 
         // v1.6 (audit C2 / Decision 2C — step 8): consult any FK
         // referrers BEFORE the delete is applied.  An Abort action
@@ -1606,7 +1606,9 @@ impl Database {
             let (k, v) = cursor
                 .get_current()
                 .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
-            records.push((k, v));
+            // Bulk scan (not the hot point-get): materialise the shared Bytes
+            // into the Vec<u8> the public signature promises.
+            records.push((k, v.to_vec()));
 
             let status = cursor
                 .retrieve_next(GetMode::Next)
