@@ -463,7 +463,7 @@ fn cursor_impl_get_current_after_search() {
     cursor.search(b"k", Some(b"v"), SearchMode::Set).unwrap();
     let (key, data) = cursor.get_current().unwrap();
     assert_eq!(key, b"k");
-    assert_eq!(data, b"v");
+    assert_eq!(&data[..], b"v");
 }
 
 #[test]
@@ -873,7 +873,7 @@ fn cursor_put_then_search_retrieves_correct_data() {
     assert_eq!(s, OperationStatus::Success);
     let (k, v) = cursor.get_current().unwrap();
     assert_eq!(k, b"hello");
-    assert_eq!(v, b"world");
+    assert_eq!(&v[..], b"world");
 }
 
 /// After delete, search returns NotFound.

@@ -94,7 +94,11 @@ fn read_keys(
     keys.iter()
         .filter_map(|k| {
             let f = g.search_with_data(k)?;
-            if f.found { Some((k.to_vec(), f.data)) } else { None }
+            if f.found {
+                Some((k.to_vec(), f.data.map(|d| d.to_vec())))
+            } else {
+                None
+            }
         })
         .collect()
 }
