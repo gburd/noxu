@@ -799,7 +799,18 @@ impl EnvironmentImpl {
             );
             // Wire the LOG_CONSOLIDATION_ARRAY knob: route the LWL through the
             // lock-free combining funnel instead of the mutex when enabled.
-            lm.set_use_consolidation_array(cfg.log_consolidation_array);
+            //
+            // The `NOXU_LOG_CONSOLIDATION_ARRAY=1` env var force-enables it
+            // regardless of the config field, so the whole durability /
+            // crash-recovery / concurrency test corpus can be run against the
+            // consolidation path without editing each test's config builder.
+            // (Env override only forces ON; it never forces OFF, matching the
+            // conservative default-off policy.)
+            let consolidation_array = cfg.log_consolidation_array
+                || std::env::var("NOXU_LOG_CONSOLIDATION_ARRAY")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
+            lm.set_use_consolidation_array(consolidation_array);
             // Wire the LOG_CHECKSUM_READ knob (JE
             // LogManager.getChecksumOnRead). Default true matches JE.
             lm.set_checksum_on_read(cfg.log_checksum_read);

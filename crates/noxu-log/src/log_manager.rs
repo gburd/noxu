@@ -2213,6 +2213,153 @@ mod tests {
         }
     }
 
+    /// Consolidation-array LWL variant of the 64-thread reservation stress:
+    /// the SAME uniqueness / monotonicity / no-overlap / byte-identical
+    /// readback oracle, but with `set_use_consolidation_array(true)` so the
+    /// lock-free combining funnel drives LSN assignment.  Also verifies the
+    /// **prev_offset back-chain** (proof obligation #4): every entry's header
+    /// `prev_offset` field points at the file_offset of the immediately-prior
+    /// entry in the same file (0 for the first entry of a file).
+    #[test]
+    fn test_consolidation_array_stress_64t_prev_offset_chain() {
+        use std::collections::HashSet;
+        use std::sync::Arc;
+        use std::thread;
+
+        let dir = TempDir::new().unwrap();
+        let fm = Arc::new(
+            FileManager::new(dir.path(), false, 500_000_000, 10).unwrap(),
+        );
+        let mut lm = LogManager::new(Arc::clone(&fm), 3, 64 * 1024, 4096);
+        lm.set_use_consolidation_array(true);
+        let lm = Arc::new(lm);
+
+        const THREADS: usize = 64;
+        const ENTRIES_PER_THREAD: usize = 200;
+
+        let mut handles = Vec::new();
+        for t in 0..THREADS {
+            let lm2 = Arc::clone(&lm);
+            handles.push(thread::spawn(move || {
+                let mut out = Vec::new();
+                for i in 0..ENTRIES_PER_THREAD {
+                    let len = 1 + ((t * 131 + i * 977) % 4000);
+                    let mut payload = Vec::with_capacity(len);
+                    for b in 0..len {
+                        payload.push(
+                            ((t as u32).wrapping_mul(2_654_435_761)
+                                ^ (i as u32).wrapping_mul(40_503)
+                                ^ (b as u32).wrapping_mul(97))
+                                as u8,
+                        );
+                    }
+                    let lsn = lm2
+                        .log(
+                            LogEntryType::Trace,
+                            &payload,
+                            Provisional::No,
+                            false,
+                            false,
+                        )
+                        .expect("log must not fail");
+                    out.push((lsn, payload));
+                }
+                out
+            }));
+        }
+
+        let mut all: Vec<(Lsn, Vec<u8>)> =
+            handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
+
+        assert_eq!(all.len(), THREADS * ENTRIES_PER_THREAD);
+
+        // (1) uniqueness.
+        let unique: HashSet<u64> =
+            all.iter().map(|(lsn, _)| lsn.as_u64()).collect();
+        assert_eq!(
+            unique.len(),
+            all.len(),
+            "consolidation array: every assigned LSN must be unique"
+        );
+
+        // (1) strict monotonicity + no same-file overlap.
+        all.sort_by_key(|(lsn, _)| lsn.as_u64());
+        for w in all.windows(2) {
+            let (a_lsn, a_payload) = &w[0];
+            let (b_lsn, _) = &w[1];
+            assert!(
+                b_lsn.as_u64() > a_lsn.as_u64(),
+                "LSNs must be strictly monotonic: {a_lsn:?} !< {b_lsn:?}"
+            );
+            if a_lsn.file_number() == b_lsn.file_number() {
+                let a_entry_size =
+                    MIN_HEADER_SIZE as u32 + a_payload.len() as u32;
+                // (1) contiguity: within a file the next entry starts exactly
+                // where the prior one ended — no gaps (which would break the
+                // prev_offset chain), no overlap.
+                assert_eq!(
+                    b_lsn.file_offset(),
+                    a_lsn.file_offset() + a_entry_size,
+                    "entries must be contiguous within a file: {a_lsn:?} \
+                     (+{a_entry_size}) then {b_lsn:?}"
+                );
+            }
+        }
+
+        // Durably flush, then verify byte-identical readback (CRC validated
+        // inside read_entry) AND the prev_offset back-chain.
+        lm.flush_sync().expect("flush_sync must succeed");
+
+        // Expected prev_offset per entry: within each file, the file_offset of
+        // the immediately-prior entry, else 0 for a file's first entry.
+        // `all` is sorted by LSN => grouped by file, ascending offset.
+        let mut expected_prev: std::collections::HashMap<u64, u32> =
+            std::collections::HashMap::new();
+        let mut prev_in_file: Option<Lsn> = None;
+        for (lsn, _) in &all {
+            let p = match prev_in_file {
+                Some(prev) if prev.file_number() == lsn.file_number() => {
+                    prev.file_offset()
+                }
+                _ => 0,
+            };
+            expected_prev.insert(lsn.as_u64(), p);
+            prev_in_file = Some(*lsn);
+        }
+
+        for (lsn, expected) in &all {
+            let (ty, payload) = lm
+                .read_entry(*lsn)
+                .unwrap_or_else(|e| panic!("read_entry {lsn:?} failed: {e:?}"));
+            assert_eq!(ty, LogEntryType::Trace, "type mismatch at {lsn:?}");
+            assert_eq!(
+                &payload, expected,
+                "payload mismatch (torn slot / cross-thread bleed) at {lsn:?}"
+            );
+            // (4) prev_offset chain: read the raw header prev_offset field
+            // (bytes [6..10], LE) directly from the file and check it chains
+            // to the immediately-prior entry in the file.
+            let mut hdr = vec![0u8; MIN_HEADER_SIZE];
+            let n = fm
+                .read_from_file_random(
+                    lsn.file_number(),
+                    lsn.file_offset() as u64,
+                    &mut hdr,
+                )
+                .unwrap_or_else(|e| panic!("raw header {lsn:?}: {e:?}"));
+            assert_eq!(n, MIN_HEADER_SIZE, "short header read at {lsn:?}");
+            let raw_prev =
+                u32::from_le_bytes([hdr[6], hdr[7], hdr[8], hdr[9]]);
+            assert_eq!(
+                raw_prev,
+                expected_prev[&lsn.as_u64()],
+                "prev_offset chain broken at {lsn:?}: header says {} expected {}",
+                raw_prev,
+                expected_prev[&lsn.as_u64()],
+            );
+        }
+    }
+
     /// Round-2 oversized-entry path: an entry larger than a pool buffer takes
     /// the direct-write path.  With the atomic reservation, `allocate` on the
     /// freshly-reinit'd buffer overflows capacity, `fetch_sub`-undoes the
