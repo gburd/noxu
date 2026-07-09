@@ -15,6 +15,34 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Performance
+
+- **Read-only transaction commits no longer touch the WAL, log-write latch, or
+  fsync group-commit (JE `Txn.hasLoggedEntries()`).** A transaction opened with
+  `begin_transaction(None)` (or any config without `with_read_only(true)`) is
+  *write-capable*, but if it only performed reads it logged nothing. The commit
+  path previously gated the `TxnCommit` WAL frame + fsync on the **static**
+  `read_only` config flag, so every explicit read transaction drove
+  `write_txn_end → LogManager::log → flush_sync → fdatasync` at `COMMIT_SYNC` —
+  serialising 100%-cache-hit readers on the log-write latch and the fsync
+  group-commit condvar. A pure-read workload was 3-4× slower at `SYNC` than
+  `NO_SYNC` despite reading zero bytes from disk. The commit / abort /
+  cleaner-throttle / replica-ack steps now gate on the **dynamic**
+  `has_logged_entries()` signal (did this txn actually append an LN?), matching
+  JE, which writes a commit/abort entry only for transactions that logged
+  entries. A read-only-in-practice commit is now a true no-op: zero WAL bytes,
+  zero fsyncs, no LWL acquire. Local off-CPU repro (8 threads, 100% cache hit,
+  `SYNC`, ycsb_c): throughput 3,397 → 465,655 ops/s and the entire
+  `fdatasync;flush_sync;write_txn_end` blocking chain disappears from the
+  off-CPU profile (`log_write_bytes` drops from ~1.5 MB to 0). The
+  resolved-after-prepare (XA) paths deliberately still write their resolving
+  frame unconditionally — a prepared branch already logged a durable
+  `TxnPrepare` that recovery would otherwise resurrect. Isolation is unchanged
+  (read locks are still acquired and correctly released). Regression-tested by
+  `readonly_commit_no_fsync_test` (asserts 0 fsyncs for read-only `SYNC`
+  commits via `stat_fsync_count`), with the XA adversarial crash-recovery,
+  isolation, and durability suites green.
+
 ### Testing
 
 - **dial9 in-process profiler for xbench (`BENCH_PROFILE=cpu|offcpu`).** Integrates
@@ -26,6 +54,11 @@ listed in [References](#references).
   block on. Off by default; needs frame pointers
   (`RUSTFLAGS="-C force-frame-pointers=yes"`) and `perf_event_paranoid<=2`, and
   degrades gracefully with a diagnostic message when unavailable. Linux-only.
+  Off-CPU mode now captures **all** worker threads: off-CPU (`Period`) perf
+  events do not set the perf `inherit` bit (only frequency-based CPU sampling
+  does), so the sampler is shared into each worker via `Arc<Mutex<Profiler>>`
+  and every worker calls `track_current_thread()` at startup to open its own
+  per-thread event fd. Previously off-CPU mode saw only the main thread.
 
 ### Performance
 
