@@ -1719,6 +1719,19 @@ fn small_cache_env(dir: &std::path::Path) -> EnvironmentImpl {
         run_cleaner: false,
         run_checkpointer: false,
         run_in_compressor: false,
+        // Disable the background evictor daemon too: F1/F2 measure the shared
+        // cache_usage counter at a precise point (right after the insert loop)
+        // and then drive eviction manually via `env.evict_memory()`.  With the
+        // daemon running it races the insert loop and can strip/evict an
+        // arbitrary amount before the test reads `usage_before` — occasionally
+        // dragging the counter below budget and failing the precondition
+        // (`usage_before > budget`) nondeterministically.  The test already
+        // drives every eviction it asserts on by hand, so the daemon adds only
+        // race, not coverage.  (Pre-existing flake surfaced under load; the
+        // zero-copy `Bytes` slot only changed timing, not the accounting —
+        // charge==credit is byte-for-byte identical, verified in the tree/
+        // evictor budget sites.)
+        run_evictor: false,
         log_flush_no_sync_interval_ms: 0,
         // LRU-only so dirty nodes are stripped/evicted without needing a
         // checkpointer daemon to log them first.

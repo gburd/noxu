@@ -1096,17 +1096,31 @@ impl EnvironmentImpl {
             // Start the background daemon thread.  The thread loops as long as
             // `evictor.is_shutdown()` returns false, sleeping 5 ms between
             // passes so it is not a CPU hog when the cache is under budget.
-            let evictor_clone = Arc::clone(&evictor);
-            let handle = std::thread::Builder::new()
-                .name("noxu-evictor".to_string())
-                .spawn(move || {
-                    while !evictor_clone.is_shutdown() {
-                        evictor_clone.do_evict(EvictionSource::Daemon);
-                        std::thread::sleep(std::time::Duration::from_millis(5));
-                    }
-                })
-                .expect("failed to spawn noxu-evictor thread");
-            (evictor, Some(handle))
+            //
+            // Honour `run_evictor` (JE `ENV_RUN_EVICTOR`): when false, the
+            // application drives eviction itself (manual `evict_memory` /
+            // per-op critical eviction) and no background daemon is spawned.
+            // Tests that assert on the shared `cache_usage` counter at a
+            // precise point rely on this to remove the daemon race.
+            let handle = if cfg.run_evictor {
+                let evictor_clone = Arc::clone(&evictor);
+                Some(
+                    std::thread::Builder::new()
+                        .name("noxu-evictor".to_string())
+                        .spawn(move || {
+                            while !evictor_clone.is_shutdown() {
+                                evictor_clone.do_evict(EvictionSource::Daemon);
+                                std::thread::sleep(
+                                    std::time::Duration::from_millis(5),
+                                );
+                            }
+                        })
+                        .expect("failed to spawn noxu-evictor thread"),
+                )
+            } else {
+                None
+            };
+            (evictor, handle)
         };
 
         // Background-daemon exception dispatcher (JE ExceptionListener).
