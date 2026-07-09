@@ -15,6 +15,23 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Performance
+
+- **CacheMode.DEFAULT keep-hot-LN eviction (JE `Evictor.moveBack`).** The read
+  fast-path (`Tree::search_with_data`, used by every `Database::get`) now marks
+  the reached BIN as recently-accessed in the evictor LRU, matching what
+  `Tree::search` already did. Without this the LRU order went stale on the hot
+  read path, so under budget pressure the evictor could not distinguish a hot
+  Zipfian BIN from a cold one and stripped hot LNs that were re-read (and
+  re-fetched from the log) immediately — effectively JE's `EVICT_LN` mode for
+  every point read. Now hot LNs stay resident when the working set fits the
+  cache (JE `CacheMode.DEFAULT`). The evictor's `touch` was also corrected to
+  honour pri2 (dirty-staging) membership so an accessed dirty node is not
+  double-tracked. Budget bound preserved: eviction still reclaims to the
+  configured budget under pressure. Regression-tested by
+  `default_cache_mode_keeps_hot_lns_resident` plus the eviction-pressure and
+  F1/F2 budget suites.
+
 ### Added
 
 - **Consolidation-array log-write latch (`noxu.log.consolidationArray`, default

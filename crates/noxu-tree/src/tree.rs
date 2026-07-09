@@ -3406,6 +3406,21 @@ impl Tree {
                 // Capture the BIN Arc before inspecting entries.
                 let bin_arc = NodeArcReadGuard::rwlock(&guard).clone();
 
+                // CacheMode.DEFAULT (JE Evictor.moveBack via IN.fetchTarget):
+                // moving the reached BIN to the hot end of the evictor's LRU
+                // on every access is what keeps a hot LN resident.  Without
+                // this touch, the read fast-path leaves the LRU order stale,
+                // so under budget pressure the evictor cannot tell a hot
+                // Zipfian BIN from a cold one and strips hot LNs that are
+                // re-read (and re-fetched from the log) immediately — JE's
+                // EVICT_LN behaviour.  `Tree::search` already does this touch;
+                // `search_with_data` (the cursor `get`/`search` fast-path)
+                // must too, or the DEFAULT keep-hot policy is silently
+                // downgraded to EVICT_LN for every point read.
+                if let TreeNode::Bottom(bin) = &*guard {
+                    self.note_accessed(bin.node_id);
+                }
+
                 let (found, data, lsn, slot_index) = match &*guard {
                     TreeNode::Bottom(bin) => {
                         let (idx, exact) = match &self.key_comparator {
