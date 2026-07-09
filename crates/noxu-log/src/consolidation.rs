@@ -271,6 +271,13 @@ impl<Rq: Send, Rs: Send> ConsolidationArray<Rq, Rs> {
     /// so the spin is short; no mutex park/wake.  Under `noxu_shuttle` the
     /// scheduler preempts at the `done` load so every interleaving is explored.
     pub fn wait_as_follower(&self, req: &Request<Rq, Rs>) -> Rs {
+        // Adaptive backoff (flat-combining discipline): a follower waits only
+        // as long as the leader's batch pass, so a short CPU spin usually
+        // suffices. But on a fully-subscribed box (N threads on N cores) a
+        // *pure* spin starves the leader's core and collapses throughput, so
+        // after a bounded spin we yield the core to the leader, escalating to
+        // a brief sleep only on a pathologically long wait (leader preempted).
+        let mut spins: u32 = 0;
         loop {
             if req.done.load(Ordering::Acquire) {
                 // SAFETY: `done == true` (Acquire) synchronises-with the
@@ -280,9 +287,20 @@ impl<Rq: Send, Rs: Send> ConsolidationArray<Rq, Rs> {
                 let slot = unsafe { &mut *req.result.get() };
                 return slot.take().expect("done implies result present");
             }
-            std::hint::spin_loop();
             #[cfg(noxu_shuttle)]
             shuttle::thread::yield_now();
+            #[cfg(not(noxu_shuttle))]
+            {
+                if spins < 128 {
+                    std::hint::spin_loop();
+                } else {
+                    // Yield the core to the leader; never sleep on the commit
+                    // critical path (sleeping adds latency far larger than a
+                    // batch's serial pass and collapses throughput).
+                    std::thread::yield_now();
+                }
+            }
+            spins = spins.saturating_add(1);
         }
     }
 }
