@@ -50,3 +50,9 @@ noxu-xa = { path = "../../crates/noxu-xa" }
 parking_lot = { workspace = true }
 tempfile = "3"
 rand = { version = "0.8", features = ["small_rng"] }
+
+# In-process perf_event_open sampler (CPU + off-CPU/context-switch stacks) for
+# the `xbench --profile` diagnostic mode. Linux-only; needs frame pointers
+# (build with RUSTFLAGS="-C force-frame-pointers=yes") and perf_event_paranoid<=2.
+[target.'cfg(target_os = "linux")'.dependencies]
+dial9-perf-self-profile = "0.4"
