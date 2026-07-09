@@ -22,6 +22,9 @@
 //!     (log seq-write bytes; /proc/self/io as cross-check) / committed user
 //!     bytes — the metric where single-write-per-LN beats any LSM.
 
+#[path = "dial9_profile.rs"]
+mod dial9_profile;
+
 use noxu_db::{
     DatabaseConfig, Durability, Environment, EnvironmentConfig,
     TransactionConfig,
@@ -277,6 +280,10 @@ fn main() {
     }
 
     // ── Measured phase ──
+    // Optional in-process dial9 profiler (BENCH_PROFILE=cpu|offcpu). Off by
+    // default; used to diagnose read/commit-path contention without external
+    // perf/gdb. Started here so it covers only the measured phase, not load.
+    let mut profiler = dial9_profile::Profiler::maybe_start(&envs("BENCH_PROFILE", ""));
     let stop = Arc::new(AtomicBool::new(false));
     let ops = Arc::new(AtomicU64::new(0));
     let aborts = Arc::new(AtomicU64::new(0));
@@ -462,6 +469,9 @@ fn main() {
     std::thread::sleep(std::time::Duration::from_secs(seconds));
     stop.store(true, Ordering::Relaxed);
     for h in handles { h.join().unwrap(); }
+    if let Some(p) = profiler.as_mut() {
+        p.report(30);
+    }
     if let Some(r) = tail_reporter { r.join().unwrap(); }
     let el = start.elapsed().as_secs_f64();
     let total = ops.load(Ordering::Relaxed);
