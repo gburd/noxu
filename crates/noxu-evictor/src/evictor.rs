@@ -1558,11 +1558,22 @@ impl InListListener for Evictor {
     /// hot end if it is already tracked; otherwise add it (a freshly split
     /// BIN is first seen here).  `moveBack` in JE is add-if-absent.
     fn note_ins_accessed(&self, node_id: u64) {
-        if !self.primary_policy.touch(node_id)
-            && !self.scan_policy.touch(node_id)
+        if self.primary_policy.touch(node_id)
+            || self.scan_policy.touch(node_id)
         {
-            self.primary_policy.insert(node_id);
+            return;
         }
+        // Not in either LRU policy.  A dirty node parked in the pri2 staging
+        // list is still tracked (it returns to `primary` after the checkpoint
+        // logs it via `complete_checkpoint_for_node`); re-inserting it into
+        // `primary` here would double-track it and later panic when the
+        // evictor tries to `add_front` it back to pri2 (a node can live in
+        // exactly one list).  JE's `moveBack` is add-*if-absent-everywhere*,
+        // so honour the pri2 membership: an accessed dirty node stays in pri2.
+        if self.pri2.lock().contains(node_id) {
+            return;
+        }
+        self.primary_policy.insert(node_id);
     }
 
     /// JE `Evictor.remove`: node left the cache.

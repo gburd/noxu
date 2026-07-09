@@ -305,3 +305,104 @@ fn repopulated_read_is_consistent_and_budget_bounded() {
         max_usage
     );
 }
+
+/// CacheMode.DEFAULT keep-hot proof (JE Evictor.moveBack via IN.fetchTarget).
+///
+/// The regression this guards: `Tree::search_with_data` (the cursor
+/// `get`/`search` fast-path) did not move the reached BIN to the hot end of
+/// the evictor LRU on a read.  Under budget pressure the evictor therefore
+/// could not distinguish a hot Zipfian BIN from a cold one and stripped hot
+/// LNs that were re-read immediately, forcing a log re-read
+/// (`fetch_ln_data_from_log` -> CRC + parse) on every access -- i.e. JE's
+/// EVICT_LN behaviour, not DEFAULT.
+///
+/// The proof: hammer a SMALL hot set that fits the cache while a much larger
+/// cold set churns the evictor.  After warm-up, repeated hot reads must stop
+/// hitting the log -- `n_random_reads` (the log point-lookup counter added by
+/// the lead-benchmarks work) must climb only marginally during the hot-read
+/// phase.  Without the LRU touch the hot BINs are stripped between reads and
+/// `n_random_reads` climbs ~1 per hot read.
+#[test]
+fn default_cache_mode_keeps_hot_lns_resident() {
+    let dir = TempDir::new().unwrap();
+    // 6 MiB cache. Hot set ~200 keys * ~120 B = ~24 KB (fits trivially).
+    // Cold set ~60k keys * ~120 B = ~7.2 MB (> cache) so the evictor fires
+    // and MUST strip something on every pass -- the question is WHICH LNs.
+    let (env, db) = open_small_cache_env(dir.path(), 6 * 1024 * 1024);
+
+    let cold_n = 60_000usize;
+    let hot: Vec<usize> = (0..200).map(|i| i * 251).collect(); // spread
+    let val = vec![0x5au8; 100];
+    for i in 0..cold_n {
+        let k = DatabaseEntry::from_vec(format!("{:010}", i).into_bytes());
+        db.put(&k, DatabaseEntry::from_bytes(&val)).unwrap();
+    }
+
+    let read = |i: usize| {
+        let k = DatabaseEntry::from_vec(format!("{:010}", i).into_bytes());
+        let mut out = DatabaseEntry::new();
+        assert!(db.get_into(None, &k, &mut out).unwrap(), "key {i} present");
+    };
+
+    // Warm-up: read the hot keys several times so their BINs are resident and
+    // freshly at the hot end of the LRU.  Interleave a light cold sweep so the
+    // evictor runs and the LRU order is exercised.
+    for _ in 0..20 {
+        for &h in &hot {
+            read(h);
+        }
+    }
+    let _ = env.evict_memory().unwrap();
+    for _ in 0..20 {
+        for &h in &hot {
+            read(h);
+        }
+    }
+
+    // Measure phase: alternate hot-read bursts with cold pressure.  We snapshot
+    // the log random-read counter ONLY around the hot bursts, so cold-window
+    // faults (which are legitimate -- cold data is not in cache) are excluded.
+    // Ordering per round: apply cold pressure + evict FIRST, then read the hot
+    // set and measure.  With DEFAULT keep-hot the just-touched hot BINs are at
+    // the hot end of the LRU, so the eviction pass strips cold BINs and leaves
+    // the hot ones resident -> the hot burst faults ~0 times.  Without the LRU
+    // touch the hot BINs are indistinguishable from cold and get stripped, so
+    // each hot read re-faults (~1 log random read per hot read).
+    let hot_read_rounds = 30usize;
+    let mut hot_faults = 0u64;
+    for round in 0..hot_read_rounds {
+        // Cold pressure BEFORE the measured hot burst: touch a rotating cold
+        // window (these faults are expected and NOT measured) and evict.  This
+        // leaves the hot BINs as the coldest-touched-longest-ago candidates
+        // UNLESS the read path keeps them hot -- which is exactly what we test.
+        let base = (round * 997) % cold_n;
+        for j in 0..500 {
+            read((base + j) % cold_n);
+        }
+        let _ = env.evict_memory().unwrap();
+
+        // Measured hot burst: read every hot key and count log random reads
+        // attributable to just these reads.
+        let before = env.stats().unwrap().log.n_random_reads;
+        for &h in &hot {
+            read(h);
+        }
+        let after = env.stats().unwrap().log.n_random_reads;
+        hot_faults += after.saturating_sub(before);
+    }
+    let hot_reads_total = (hot_read_rounds * hot.len()) as u64;
+
+    // Keep-hot invariant: the HOT reads must almost never fault from the log.
+    // 30 rounds * 200 keys = 6000 hot reads.  With keep-hot the hot BINs stay
+    // resident so `hot_faults` is a small fraction of `hot_reads_total`
+    // (only the first touch after a rare hot-BIN eviction faults).  Without
+    // the LRU touch every hot read re-faults and `hot_faults` ~= 6000.
+    // Assert < 20% fault rate -- comfortably distinguishes keep-hot (~0-5%)
+    // from EVICT_LN (~100%).
+    assert!(
+        hot_faults < hot_reads_total / 5,
+        "keep-hot: hot reads must not re-fault from the log every access; \
+         {hot_faults} of {hot_reads_total} hot reads faulted (EVICT_LN \
+         behaviour would fault ~{hot_reads_total})"
+    );
+}
