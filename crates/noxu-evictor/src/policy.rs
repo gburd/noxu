@@ -65,14 +65,28 @@ pub trait EvictionPolicy: Send + Sync + fmt::Debug {
 /// Selects the cache eviction algorithm used by a policy slot in the
 /// [`crate::evictor::Evictor`].
 ///
-/// The default is [`Lru`][EvictionAlgorithm::Lru].
+/// The default is [`CoolHot`][EvictionAlgorithm::CoolHot].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum EvictionAlgorithm {
+    /// COOL/HOT 2-bit cooling clock (LeanStore / 2Q-A1 model) — the default.
+    ///
+    /// A node is HOT (working set) or COOL (eviction candidate) plus a
+    /// second-chance reference bit.  A node is *admitted* COOL; a second
+    /// access promotes it COOL → HOT.  The sweep prefers COOL victims and
+    /// only demotes HOT → COOL once a full pass finds none.  Scan-resistant
+    /// **by construction** (a one-touch scan fills and drains COOL without
+    /// displacing the HOT set), which is why it is the default — it holds a
+    /// θ=0.99 Zipfian hot set resident where LRU/CLOCK evict it.
+    ///
+    /// Ported from the PostgreSQL buffer-manager cooling-stage proposal; see
+    /// `crate::policies::coolhot`.
+    #[default]
+    CoolHot,
+
     /// Least Recently Used — slab doubly-linked list + HashMap index.
     ///
     /// O(1) per operation; simple and cache-friendly.  Susceptible to
     /// sequential-scan cache pollution.
-    #[default]
     Lru,
 
     /// Clock (Second Chance) — circular buffer with per-page reference bits.
@@ -112,24 +126,29 @@ pub enum EvictionAlgorithm {
 impl EvictionAlgorithm {
     /// Parse an algorithm name (case-insensitive) as used by the
     /// `noxu.evictor.algorithm` config parameter. Unknown names fall back to
-    /// the default ([`Lru`][EvictionAlgorithm::Lru]) so a typo never panics
+    /// the default ([`CoolHot`][EvictionAlgorithm::CoolHot]) so a typo never
+    /// panics
     /// env-open; callers that want strictness can compare the result.
     pub fn from_name(name: &str) -> EvictionAlgorithm {
         match name.trim().to_ascii_lowercase().as_str() {
+            "lru" => EvictionAlgorithm::Lru,
             "clock" => EvictionAlgorithm::Clock,
             "arc" => EvictionAlgorithm::Arc,
             "car" => EvictionAlgorithm::Car,
             "lirs" => EvictionAlgorithm::Lirs,
-            _ => EvictionAlgorithm::Lru,
+            "coolhot" | "cool_hot" | "cool-hot" => EvictionAlgorithm::CoolHot,
+            _ => EvictionAlgorithm::CoolHot,
         }
     }
 
     /// Instantiate a fresh, empty policy for this algorithm.
     pub fn new_policy(self) -> Box<dyn EvictionPolicy> {
         use crate::policies::{
-            ArcPolicy, CarPolicy, ClockPolicy, LirsPolicy, LruPolicy,
+            ArcPolicy, CarPolicy, ClockPolicy, CoolHotPolicy, LirsPolicy,
+            LruPolicy,
         };
         match self {
+            EvictionAlgorithm::CoolHot => Box::new(CoolHotPolicy::new()),
             EvictionAlgorithm::Lru => Box::new(LruPolicy::new()),
             EvictionAlgorithm::Clock => Box::new(ClockPolicy::new()),
             EvictionAlgorithm::Arc => Box::new(ArcPolicy::new()),

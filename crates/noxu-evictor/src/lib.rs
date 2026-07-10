@@ -80,7 +80,9 @@ pub use evictor::{
 };
 pub use evictor_stat::EvictorStats;
 pub use off_heap::{OffHeapCache, OffHeapStats};
-pub use policies::{ArcPolicy, CarPolicy, ClockPolicy, LirsPolicy, LruPolicy};
+pub use policies::{
+    ArcPolicy, CarPolicy, ClockPolicy, CoolHotPolicy, LirsPolicy, LruPolicy,
+};
 pub use policy::{EvictionAlgorithm, EvictionPolicy};
 pub use shared::{SharedCacheParams, SharedEvictorHandle};
 

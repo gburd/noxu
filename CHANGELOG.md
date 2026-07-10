@@ -17,6 +17,26 @@ listed in [References](#references).
 
 ### Performance
 
+- **COOL/HOT cooling-clock eviction policy, now the default (LeanStore / 2Q-A1).**
+  Replaces LRU as the default `EvictionAlgorithm`. Each cached node is HOT
+  (working set) or COOL (eviction candidate) plus a second-chance reference bit
+  — no per-node access counter. A demand-loaded node is admitted COOL
+  (probationary); a second access promotes it COOL→HOT. A one-touch scan
+  therefore fills and drains the COOL stage and is evicted from it without
+  displacing the HOT working set — scan resistance is intrinsic to the policy.
+  The evictor daemon (the "trickle") demotes HOT→COOL ahead of the foreground
+  sweep, bounded by predicted allocation, so the foreground finds a COOL victim
+  in one pass; the reference bit spares a recently-accessed node one cooling
+  pass, keeping the genuinely hot set resident under scan pressure. Motivation:
+  under a Zipfian read workload (θ=0.99) over a cache far smaller than the
+  dataset, LRU held the hot set poorly (~44% hit rate measured); COOL/HOT keeps
+  the hot set resident. Pluggable via `EvictionAlgorithm` (LRU/Clock/LIRS/ARC/CAR
+  still available); the explicit MemoryBudget and reclaim-to-budget behavior are
+  unchanged — only *which* node is chosen as the victim changes. Ported from the
+  PostgreSQL buffer-cache cooling-clock work; cited in the policy source.
+
+### Performance
+
 - **Per-transaction active-txn registry is now sharded, removing the global
   mutex on every begin/commit (JE `TxnManager.allTxns` `ConcurrentHashMap`).**
   `Environment`'s `ActiveTxns` was a single `Mutex<HashMap<u64, …>>`, so every
