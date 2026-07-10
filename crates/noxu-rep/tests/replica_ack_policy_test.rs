@@ -181,11 +181,19 @@ fn f1_acks_within_timeout_succeed() {
 /// and verify that `Transaction::commit_with_durability` actually
 /// blocks on replica acks. Without F1 the commit returned `Ok(())`
 /// silently; with F1 it returns `NoxuError::InsufficientReplicas`.
+///
+/// This test now writes data (a `put`) before committing so the txn is a
+/// real ack-requiring commit.  An EMPTY / read-only txn correctly returns
+/// `Ok(())` WITHOUT waiting for acks (JE-faithful: a txn that logged no
+/// entry assigns no commit VLSN and has nothing to replicate — see
+/// `Txn.commit` which invokes the commit hooks only when
+/// `updateLoggedForTxn()`, and
+/// `f1_empty_commit_returns_ok_without_acks` below which pins that).
 #[test]
 fn f1_commit_blocks_on_replica_acks() {
     use noxu_db::durability::{Durability, ReplicaAckPolicy, SyncPolicy};
     use noxu_db::error::NoxuError;
-    use noxu_db::{Environment, EnvironmentConfig};
+    use noxu_db::{DatabaseConfig, Environment, EnvironmentConfig};
     use std::path::PathBuf;
     use tempfile::TempDir;
 
@@ -194,6 +202,15 @@ fn f1_commit_blocks_on_replica_acks() {
         .with_allow_create(true)
         .with_transactional(true);
     let env = Environment::open(env_cfg).unwrap();
+    let db = env
+        .open_database(
+            None,
+            "d",
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true),
+        )
+        .unwrap();
 
     let rep_env = build_master_env("master_e2e");
     rep_env.become_master(1).unwrap();
@@ -206,6 +223,10 @@ fn f1_commit_blocks_on_replica_acks() {
     env.set_replica_ack_timeout(Duration::from_millis(200));
 
     let txn = env.begin_transaction(None).unwrap();
+    // Write a record so this is a data-logging commit that actually
+    // requires replica acks.  Without the put the txn logs nothing and
+    // correctly commits Ok without waiting (see the empty-txn test below).
+    db.put_in(&txn, b"k", b"v").unwrap();
     let durability = Durability::new(
         SyncPolicy::Sync,
         SyncPolicy::Sync,
@@ -228,6 +249,66 @@ fn f1_commit_blocks_on_replica_acks() {
     assert!(
         elapsed >= Duration::from_millis(150),
         "commit must wait for the configured timeout; waited {:?}",
+        elapsed
+    );
+
+    let _ = db.close();
+    let _ = env.close();
+    let _ = rep_env.close();
+}
+
+/// An EMPTY (read-only-in-practice) txn under `ReplicaAckPolicy::All`
+/// with 2 non-acking peers must return `Ok(())` promptly WITHOUT waiting
+/// for replica acks.
+///
+/// This pins the JE-faithful behaviour introduced by the read-only-commit
+/// fix: a txn that logged no entry (`has_logged_entries() == false`,
+/// matching JE `updateLoggedForTxn()` == `lastLoggedLsn != NULL_LSN`)
+/// assigns no commit VLSN and has nothing to replicate, so JE's
+/// `Txn.commit` never invokes `preLogCommitHook`/`postLogCommitHook` and
+/// therefore never calls `RepImpl.postLogCommitHook` →
+/// `feederTxns.awaitReplicaAcks`.  The old (pre-`da6a2008`) behaviour of
+/// blocking an empty commit on acks was the bug: replicas have nothing to
+/// ack for a txn that wrote nothing.
+#[test]
+fn f1_empty_commit_returns_ok_without_acks() {
+    use noxu_db::durability::{Durability, ReplicaAckPolicy, SyncPolicy};
+    use noxu_db::{Environment, EnvironmentConfig};
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    let env_cfg = EnvironmentConfig::new(PathBuf::from(tmp.path()))
+        .with_allow_create(true)
+        .with_transactional(true);
+    let env = Environment::open(env_cfg).unwrap();
+
+    let rep_env = build_master_env("master_empty");
+    rep_env.become_master(1).unwrap();
+    add_peers(&rep_env, 2);
+
+    env.set_replica_coordinator(rep_env.clone());
+    env.set_replica_ack_timeout(Duration::from_millis(200));
+
+    // begin + commit with NO put: the txn logs nothing.
+    let txn = env.begin_transaction(None).unwrap();
+    let durability = Durability::new(
+        SyncPolicy::Sync,
+        SyncPolicy::Sync,
+        ReplicaAckPolicy::All,
+    );
+    let started = Instant::now();
+    let res = txn.commit_with_durability(durability);
+    let elapsed = started.elapsed();
+
+    assert!(
+        res.is_ok(),
+        "an empty txn must commit Ok without acks (JE-faithful); got {:?}",
+        res
+    );
+    assert!(
+        elapsed < Duration::from_millis(50),
+        "an empty commit must NOT block on the ack timeout; waited {:?}",
         elapsed
     );
 
