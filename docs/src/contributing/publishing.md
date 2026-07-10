@@ -69,9 +69,13 @@ index the new version before the next dependent crate is published.
 
 ```bash
 # Layer 0 — no noxu-* deps
-cargo publish -p noxu-util
-sleep 60
+# NOTE: publish noxu-sync BEFORE noxu-util — noxu-util has a (non-dev) build
+# dependency on noxu-sync (it re-exports the real sync primitives), so
+# `cargo publish -p noxu-util` fails to resolve `noxu-sync = "X.Y.Z"` until
+# noxu-sync is on the index.
 cargo publish -p noxu-sync
+sleep 60
+cargo publish -p noxu-util
 sleep 60
 
 # Layer 1 — depends on layer 0
