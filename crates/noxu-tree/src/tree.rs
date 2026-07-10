@@ -3525,9 +3525,31 @@ impl Tree {
     /// LSN — a read from the re-populated slot returns the same value a cold
     /// read would.
     ///
-    /// No-op (returns without charging) when the BIN has any open cursor
-    /// (`cursor_count > 0`), matching the strip guard so the two never race
-    /// on the same slot bytes.
+    /// Why NO `cursor_count > 0` guard (REPOPULATE-1, the read-cache bug fix):
+    /// `strip_lns` skips a BIN with open cursors so eviction does not churn a
+    /// slot a cursor is actively reading. Re-population had the SAME guard —
+    /// but that was wrong. Under a skewed read workload the hottest BINs (the
+    /// ones we most want to cache) almost always have a concurrent reader
+    /// pinned, so `cursor_count > 0` held on nearly every hot re-populate and
+    /// the fetched LN was thrown away instead of cached. Every repeat read of
+    /// a hot key then re-faulted from the log, which is why the ycsb_c hit
+    /// rate sat at ~44% and was INVARIANT to cache size: a stripped hot slot
+    /// could never be re-cached while any reader was on its BIN.
+    ///
+    /// The guard is not needed for correctness here. Re-population runs under
+    /// the BIN *write* latch (`bin_arc.write()`), which serializes it against
+    /// `strip_lns` (`&mut self` = write latch) and against writers. The only
+    /// hazards are already covered without the cursor count:
+    ///   * a writer replacing the record -> caught by the `expected_lsn`
+    ///     mismatch check below;
+    ///   * a double re-populate / a writer already resident -> caught by the
+    ///     `data.is_some()` check below;
+    ///   * a concurrent reader on the same slot -> harmless: it either already
+    ///     took its O(1) `Bytes::clone()` of the old (stripped-away) handle,
+    ///     or reads the freshly written bytes, which are byte-identical to the
+    ///     immutable on-disk LN at `expected_lsn`. Writing `Some(bytes)` into
+    ///     a `data == None` slot never invalidates an outstanding `Bytes`
+    ///     clone (clones are independent refcounted handles).
     pub fn repopulate_ln_data(
         &self,
         bin_arc: &Arc<RwLock<TreeNode>>,
@@ -3547,9 +3569,11 @@ impl Tree {
             TreeNode::Bottom(b) => b,
             _ => return,
         };
-        if bin.cursor_count > 0 {
-            return;
-        }
+        // REPOPULATE-1: intentionally NO `cursor_count > 0` guard here (see the
+        // doc comment). The write latch + `expected_lsn` + `data.is_none()`
+        // checks are the complete correctness set; gating on open cursors only
+        // defeated the read cache for exactly the hot slots it was meant to
+        // help.
         if slot_index >= bin.entries.len() {
             return;
         }
@@ -9069,6 +9093,90 @@ mod tests {
             counter.load(Ordering::Relaxed),
             before,
             "EV-13: detach must not change the counter (evictor credits once)"
+        );
+    }
+
+    /// REPOPULATE-1 regression: `repopulate_ln_data` must cache a cold-fetched
+    /// LN back into a stripped slot EVEN WHEN the BIN has an open cursor
+    /// (`cursor_count > 0`).
+    ///
+    /// The shipped bug: re-populate bailed on a `cursor_count > 0` guard. Under
+    /// a skewed multi-reader workload the hot BINs almost always had a
+    /// concurrent reader pinned, so the fetched LN was discarded instead of
+    /// cached and every repeat read re-faulted from the log -- the ycsb_c hit
+    /// rate stuck at ~44% INVARIANT to cache size. This test pins the BIN
+    /// (cursor_count = 1) exactly as a concurrent reader would and asserts
+    /// re-populate still fires.
+    #[test]
+    fn test_repopulate_1_fires_with_bin_pinned() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        let mut tree = Tree::new(42, 16);
+        let counter = Arc::new(AtomicI64::new(0));
+        tree.set_memory_counter(Arc::clone(&counter));
+
+        let key = b"hot-key".to_vec();
+        let data = vec![0xabu8; 120];
+        let lsn = Lsn::new(3, 77);
+        tree.insert(key.clone(), data.clone(), lsn).unwrap();
+
+        // Locate the slot, strip its LN (data -> None, keep the LSN), and pin
+        // the BIN as a concurrent cursor would (cursor_count = 1).
+        let slot = tree.search_with_data(&key).expect("key must be found");
+        assert!(slot.found);
+        let bin_arc = slot.bin_arc.clone();
+        let slot_index = slot.slot_index;
+        assert_eq!(slot.lsn, lsn.as_u64());
+        {
+            let mut g = bin_arc.write();
+            let TreeNode::Bottom(bin) = &mut *g else {
+                panic!("expected a BIN");
+            };
+            let freed = bin.entries[slot_index].data.take();
+            assert!(freed.is_some(), "slot must have had resident data to strip");
+            counter.fetch_sub(freed.unwrap().len() as i64, Ordering::Relaxed);
+            bin.cursor_count = 1; // simulate a concurrent reader pinning the BIN
+        }
+        let after_strip = counter.load(Ordering::Relaxed);
+
+        // Re-populate with the exact on-disk bytes for the slot's LSN, WITH the
+        // BIN pinned. With the old guard this was a silent no-op.
+        tree.repopulate_ln_data(&bin_arc, slot_index, lsn.as_u64(), &data);
+
+        // The slot must now hold the fetched bytes (byte-identical) and the
+        // counter must have re-charged data.len() (symmetric with the strip).
+        {
+            let g = bin_arc.read();
+            let TreeNode::Bottom(bin) = &*g else { panic!("expected a BIN") };
+            let resident = bin.entries[slot_index]
+                .data
+                .as_ref()
+                .expect("REPOPULATE-1: slot must be re-populated despite the pin");
+            assert_eq!(
+                resident.as_ref(),
+                data.as_slice(),
+                "re-populated bytes must be byte-identical to the on-disk LN"
+            );
+        }
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            after_strip + data.len() as i64,
+            "re-populate must re-charge exactly data.len() (budget-symmetric)"
+        );
+
+        // Budget-safety: a wrong-LSN or already-resident re-populate must be a
+        // no-op (no double-charge).
+        let steady = counter.load(Ordering::Relaxed);
+        tree.repopulate_ln_data(&bin_arc, slot_index, lsn.as_u64(), &data);
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            steady,
+            "re-populate into an already-resident slot must not double-charge"
+        );
+        tree.repopulate_ln_data(&bin_arc, slot_index, lsn.as_u64() + 1, &data);
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            steady,
+            "re-populate with a mismatched expected_lsn must be a no-op"
         );
     }
 

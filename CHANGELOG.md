@@ -15,6 +15,42 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Fixed
+
+- **LN read cache retained almost nothing: `repopulate_ln_data` skipped the
+  fetched value whenever any cursor was on the BIN (`cursor_count > 0`).**
+  After the evictor strips a BIN slot's LN value (`data -> None`, LSN kept),
+  the cursor read path cold-fetches the record from the log and calls
+  `Tree::repopulate_ln_data` to cache it back into the slot so the NEXT read
+  of the key hits memory. That function had a `cursor_count > 0` guard copied
+  from `strip_lns` — but for re-population it was actively harmful: under a
+  skewed read workload the hottest BINs (exactly the ones worth caching)
+  almost always have a concurrent reader pinned, so the guard held on nearly
+  every hot re-populate and the fetched LN was discarded instead of retained.
+  Every repeat read of a hot key then re-faulted from the log. This is why the
+  measured `ycsb_c` cache hit rate sat at ~44% and was INVARIANT to cache size
+  (4GB / 8GB / 16GB all ~44% on a 20GB Zipfian theta=0.99 workload): a stripped
+  hot slot could never be re-cached while any reader was on its BIN, so no
+  amount of budget accumulated the hot set. The guard is removed from
+  re-population (it is still correct and necessary for `strip_lns`). It was
+  never needed for re-population correctness: re-population runs under the BIN
+  *write* latch (`bin_arc.write()`), which serializes it against `strip_lns`
+  (`&mut self`) and against writers; the `expected_lsn` mismatch check rejects
+  a slot a writer replaced, and the `data.is_none()` check rejects a
+  double-populate — so the budget stays symmetric (charge on re-populate ==
+  credit on strip) and a re-populated slot holds the exact, immutable on-disk
+  LN bytes for its LSN. A concurrent reader on the same slot is unaffected: it
+  either already took its O(1) `Bytes::clone()` handle or reads the identical
+  freshly-written bytes. Regression-tested deterministically by
+  `noxu_tree::tree::tests::test_repopulate_1_fires_with_bin_pinned` (strip a
+  slot, pin the BIN with `cursor_count = 1`, assert re-populate still writes
+  the bytes and re-charges exactly `data.len()`, and that a mismatched-LSN /
+  already-resident re-populate is a no-op). The prior read-cache tests
+  (`repopulated_read_is_consistent_and_budget_bounded`,
+  `default_cache_mode_keeps_hot_lns_resident`) did not catch it: they never
+  exercise a stripped slot while a cursor is pinned, which is why the bug
+  shipped.
+
 ### Performance
 
 - **COOL/HOT cooling-clock eviction policy, now the default (LeanStore / 2Q-A1).**
