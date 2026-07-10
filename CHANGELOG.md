@@ -15,6 +15,8 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+## [7.5.1] - 2026-07-10
+
 ### Fixed
 
 - **`ycsb_c` read hit rate stuck at ~44%, invariant to cache size: every cold
