@@ -1639,17 +1639,20 @@ pub static EVICTOR_NODES_PER_SCAN: ConfigParam = ConfigParam::int_param(
     false,      // forReplication
 );
 
-/// Cache eviction algorithm: "lru" | "clock" | "arc" | "car" | "lirs".
+/// Cache eviction algorithm:
+/// "coolhot" | "lru" | "clock" | "arc" | "car" | "lirs".
 ///
-/// JE's evictor is LRU (`Evictor` / `LRUEvictor`); Noxu defaults to "lru" to
-/// stay JE-faithful. The other policies are scan-resistant alternatives
-/// selectable per-environment. Wired through `DbiEnvConfig.evictor_algorithm`
-/// to `Evictor::with_algorithm` (both primary and scan policy slots).
+/// Defaults to "coolhot" — the COOL/HOT 2-bit cooling clock (LeanStore /
+/// 2Q-A1), which is scan-resistant by construction and holds a θ=0.99 Zipfian
+/// hot set resident where LRU/CLOCK evict it (the LN-cache hit-rate fix).
+/// "lru" is the legacy JE-faithful policy; the rest are alternatives.  Wired
+/// through `DbiEnvConfig.evictor_algorithm` to `Evictor::with_algorithm`
+/// (both primary and scan policy slots).
 pub static EVICTOR_ALGORITHM: ConfigParam = ConfigParam::string_param(
     "noxu.evictor.algorithm",
-    "lru", // default (JE-faithful)
-    false, // mutable (policy is fixed at env-open)
-    false, // forReplication
+    "coolhot", // default (scan-resistant; see policies::coolhot)
+    false,     // mutable (policy is fixed at env-open)
+    false,     // forReplication
 );
 
 /// Deprecated — per-pass deadlock retry count is no longer configurable.

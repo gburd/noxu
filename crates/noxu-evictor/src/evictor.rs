@@ -304,8 +304,13 @@ impl Evictor {
         max_batch_size: usize,
         lru_only: bool,
     ) -> Self {
-        let primary = EvictionAlgorithm::Lru.new_policy();
-        let scan = EvictionAlgorithm::Lru.new_policy();
+        // Default to the enum's `#[default]` algorithm (CoolHot) for both
+        // the primary and scan slots.  CoolHot is scan-resistant by
+        // construction (admission is COOL), so a one-touch scan self-evicts
+        // from the COOL stage without displacing the HOT working set — the
+        // fix for the θ=0.99 Zipfian LN-cache hit-rate collapse under LRU.
+        let primary = EvictionAlgorithm::default().new_policy();
+        let scan = EvictionAlgorithm::default().new_policy();
         Self::with_policies(arbiter, max_batch_size, lru_only, primary, scan)
     }
 
@@ -2122,12 +2127,12 @@ mod tests {
     }
 
     #[test]
-    fn test_default_algorithm_is_lru() {
+    fn test_default_algorithm_is_coolhot() {
         let usage = Arc::new(AtomicI64::new(0));
         let arbiter = Arbiter::new(1000, usage, 100, 200);
         let e = Evictor::new(arbiter, 100, false);
-        assert_eq!(e.primary_algorithm_name(), "LRU");
-        assert_eq!(e.scan_algorithm_name(), "LRU");
+        assert_eq!(e.primary_algorithm_name(), "CoolHot");
+        assert_eq!(e.scan_algorithm_name(), "CoolHot");
     }
 
     /// EV-15 (JE Evictor.doCriticalEviction, Evictor.java:2054): a writer
