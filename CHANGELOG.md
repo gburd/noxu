@@ -51,6 +51,25 @@ listed in [References](#references).
   exercise a stripped slot while a cursor is pinned, which is why the bug
   shipped.
 
+### Testing
+
+- **Corrected `noxu-rep` `f1_commit_blocks_on_replica_acks` to exercise a
+  data-writing commit.** The read-only-commit fix (`da6a2008`) correctly
+  gated the replica-ack wait on `has_logged_entries()` (JE
+  `updateLoggedForTxn()` == `lastLoggedLsn != NULL_LSN`), so an
+  empty/read-only txn no longer blocks on acks it can never receive
+  (JE `Txn.commit` invokes `pre/postLogCommitHook` — and thus
+  `RepImpl.postLogCommitHook` → `feederTxns.awaitReplicaAcks` — only when
+  the txn logged an entry). The end-to-end test still did `begin + commit`
+  with no `put`, so it began exercising the now-correct empty-commit fast
+  path and expected the old (buggy) blocking behaviour. The test now writes
+  a record before committing so it is a real ack-requiring commit that
+  correctly blocks and returns `InsufficientReplicas`; a new
+  `f1_empty_commit_returns_ok_without_acks` pins the JE-faithful behaviour
+  that an empty txn under `ReplicaAckPolicy::All` returns `Ok(())` without
+  waiting. No production behaviour changed — this is a test correction that
+  matches the shipped, JE-faithful ack-gating semantics.
+
 ### Performance
 
 - **COOL/HOT cooling-clock eviction policy, now the default (LeanStore / 2Q-A1).**
