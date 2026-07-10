@@ -15,6 +15,43 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Fixed
+
+- **`ycsb_c` read hit rate stuck at ~44%, invariant to cache size: every cold
+  LN fault issued TWO random log reads instead of one.**
+  `LogManager::read_entry_from_disk` read the fixed-size header first
+  (`MIN_HEADER_SIZE`) to learn the entry length, then re-read the whole entry
+  (header + payload) from the same offset — two `pread` random reads for every
+  cold record fault. Because the benchmark derives its cache-hit rate from the
+  `n_random_reads` counter (each disk read bumps it once), a workload whose
+  *true* LN fault rate was ~23% reported a ~54% "miss rate" (≈44% hit): every
+  genuine miss was counted twice. That doubled counter also made the reported
+  hit rate look INVARIANT to cache size — a larger cache genuinely reduced
+  faults, but the 2× inflation flattened the curve so 4 GB / 8 GB / 16 GB all
+  looked ~44% on a 20 GB Zipfian θ=0.99 workload. Local repro: at a 1 MiB
+  cache over a 14 MB dataset the reported hit rate rose from **54.7% → 77.0%**
+  and the raw `n_random_reads` for the measured phase halved (≈18.3k → ≈9.2k),
+  exactly one read per fault; with adequate warm-up an 8 MiB cache reaches
+  **~84%** — the hit rate now climbs with cache size as it should.
+  The fix ports JE's fault-read path faithfully
+  (`LogManager.getLogEntryFromLogSource` + `EnvironmentParams`
+  `LOG_FAULT_READ_SIZE`, default 2048): the first random read fetches up to
+  `LOG_FAULT_READ_SIZE` (2048) bytes, enough to hold the header *and* payload
+  of a typical small LN in one read; a second "repeat-read" happens ONLY when
+  the entry is larger than the buffer, and is counted in the (previously dead)
+  `n_repeat_fault_reads` statistic — JE's `nRepeatFaultReads`.
+  Note on the earlier diagnosis: the read-ceiling audit hypothesised a
+  charge-strip race gated by `EVICTOR_CRITICAL_PERCENTAGE = 0`
+  ("Option A: raise the default"). That was ruled out — JE's
+  `EnvironmentParams.EVICTOR_CRITICAL_PERCENTAGE` default is *also* 0 (min 0,
+  max 1000; `EnvironmentConfig.java` documents "Default 0"), Noxu's Arbiter is
+  a faithful port of that threshold semantics, and critical eviction is not
+  even invoked on the pure-read path (only `put`/`delete` call
+  `do_critical_eviction`). Raising the critical percentage would have
+  diverged from JE without addressing the real cause. The residency machinery
+  (LRU/CoolHot MRU-touch on read, `repopulate_ln_data`, strip/evict-to-budget)
+  was verified correct end-to-end; the ceiling was the double disk read.
+
 ## [7.5.0] - 2026-07-10
 
 ### Fixed

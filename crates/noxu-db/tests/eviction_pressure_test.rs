@@ -406,3 +406,39 @@ fn default_cache_mode_keeps_hot_lns_resident() {
          behaviour would fault ~{hot_reads_total})"
     );
 }
+
+/// READ-CEILING end-to-end companion: reading a key whose LN was stripped by
+/// the evictor returns the correct bytes via the single-read fault path.
+///
+/// The deterministic single-read proof lives in noxu-log
+/// (`test_small_entry_disk_fault_is_single_random_read`, which drives
+/// `read_entry_from_disk` directly and fails on the old two-read regression).
+/// This test guards the end-to-end path: after the evictor strips a resident
+/// LN, a `get` re-fetches it from the log through the fixed reader and returns
+/// byte-identical data.  (Fault *counts* are asserted at the log level, not
+/// here, because the DB read can be partly absorbed by the write buffer pool,
+/// which makes the DB-level random-read count non-deterministic.)
+#[test]
+fn stripped_ln_refetch_roundtrips() {
+    let dir = TempDir::new().unwrap();
+    let (env, db) = open_small_cache_env(dir.path(), 1024 * 1024);
+
+    let key = DatabaseEntry::from_vec(b"hot-key".to_vec());
+    let value = vec![0x5au8; 100];
+    db.put(&key, DatabaseEntry::from_bytes(&value)).unwrap();
+
+    for i in 0..20_000usize {
+        let k = DatabaseEntry::from_vec(format!("cold{:08}", i).into_bytes());
+        db.put(&k, DatabaseEntry::from_bytes(&[0u8; 100])).unwrap();
+    }
+    // Strip the LNs (drops the hot-key slot data, keeps the LSN).
+    let _ = env.evict_memory().unwrap();
+
+    let mut out = DatabaseEntry::new();
+    assert!(db.get_into(None, &key, &mut out).unwrap(), "hot key present");
+    assert_eq!(
+        out.data(),
+        &value[..],
+        "stripped LN must re-fetch byte-identical data from the log"
+    );
+}

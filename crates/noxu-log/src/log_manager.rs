@@ -63,6 +63,14 @@ use noxu_util::lsn::{Lsn, NULL_LSN};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+/// Size of the buffer used for the initial fault (point-lookup) read of a log
+/// entry from disk.  Ported from JE `EnvironmentParams.LOG_FAULT_READ_SIZE`
+/// (default 2048).  The first random read fetches this many bytes so the
+/// header *and* payload of a typical small entry (e.g. an LN) arrive in one
+/// read; a second "repeat-read" (`n_repeat_fault_reads`) happens only when the
+/// entry is larger than this buffer.
+const LOG_FAULT_READ_SIZE: usize = 2048;
+
 // ── LWL scratch state ────────────────────────────────────────────────────────────────
 
 /// State protected by the Log Write Latch (LWL).
@@ -1271,13 +1279,21 @@ impl LogManager {
     ) -> Result<(LogEntryType, Vec<u8>)> {
         let file_offset = lsn.file_offset() as u64;
 
-        // Step 1: Read the minimum header.
-        // Uses the random-read path (point lookup), not sequential scan.
-        let mut header_buf = vec![0u8; MIN_HEADER_SIZE];
+        // Step 1: Fault-read up to LOG_FAULT_READ_SIZE bytes in a single
+        // random read.  This mirrors JE `LogManager.getLogEntryFromLogSource`,
+        // which reads `LOG_FAULT_READ_SIZE` (default 2048) bytes on the first
+        // fault and only does a "repeat-read" when the entry turns out to be
+        // larger than the buffer (tracked as `nRepeatFaultReads`).  Reading
+        // just MIN_HEADER_SIZE here and then re-reading the whole entry cost
+        // TWO random reads for every cold LN fault — doubling point-read IO
+        // (and doubling the `n_random_reads` counter the benchmark derives its
+        // cache-hit rate from).  Almost all LNs are < 2 KiB, so the header +
+        // payload arrive in this one read.
+        let mut buf = vec![0u8; LOG_FAULT_READ_SIZE];
         let n = self.file_manager.read_from_file_random(
             lsn.file_number(),
             file_offset,
-            &mut header_buf,
+            &mut buf,
         )?;
         if n < MIN_HEADER_SIZE {
             return Err(NoxuLogError::UnexpectedEof {
@@ -1290,20 +1306,12 @@ impl LogManager {
         }
 
         // Step 2: Parse header fields.
-        let stored_checksum = u32::from_le_bytes([
-            header_buf[0],
-            header_buf[1],
-            header_buf[2],
-            header_buf[3],
-        ]);
-        let entry_type_num = header_buf[4];
-        let flags = header_buf[5];
-        let item_size = u32::from_le_bytes([
-            header_buf[10],
-            header_buf[11],
-            header_buf[12],
-            header_buf[13],
-        ]) as usize;
+        let stored_checksum =
+            u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        let entry_type_num = buf[4];
+        let flags = buf[5];
+        let item_size =
+            u32::from_le_bytes([buf[10], buf[11], buf[12], buf[13]]) as usize;
 
         // Sanity check item_size before allocating.
         if item_size > 100_000_000 {
@@ -1319,22 +1327,31 @@ impl LogManager {
             if vlsn_present { MAX_HEADER_SIZE } else { MIN_HEADER_SIZE };
         let entry_size = header_size + item_size;
 
-        // Step 4: Read the full entry (header + payload) in one call.
-        let mut full_buf = vec![0u8; entry_size];
-        let n = self.file_manager.read_from_file_random(
-            lsn.file_number(),
-            file_offset,
-            &mut full_buf,
-        )?;
-        if n < entry_size {
-            return Err(NoxuLogError::UnexpectedEof {
-                lsn,
-                message: format!(
-                    "short read: need {} bytes for entry, got {}",
-                    entry_size, n
-                ),
-            });
-        }
+        // Step 4: Repeat-read only if the entry is larger than the fault
+        // buffer (JE's `nRepeatFaultReads` path).  Otherwise the single read
+        // above already holds the whole entry.
+        let mut full_buf = if entry_size <= n {
+            buf.truncate(entry_size);
+            buf
+        } else {
+            self.n_repeat_fault_reads.fetch_add(1, Ordering::Relaxed);
+            let mut full_buf = vec![0u8; entry_size];
+            let n2 = self.file_manager.read_from_file_random(
+                lsn.file_number(),
+                file_offset,
+                &mut full_buf,
+            )?;
+            if n2 < entry_size {
+                return Err(NoxuLogError::UnexpectedEof {
+                    lsn,
+                    message: format!(
+                        "short read: need {} bytes for entry, got {}",
+                        entry_size, n2
+                    ),
+                });
+            }
+            full_buf
+        };
 
         // Step 5: Validate CRC32.
         // computes the checksum over everything after the checksum field:
@@ -1835,6 +1852,85 @@ mod tests {
         let (entry_type, read_back) = lm.read_entry(lsn).unwrap();
         assert_eq!(entry_type, LogEntryType::IN);
         assert_eq!(read_back, payload);
+    }
+
+    /// READ-CEILING regression: a cold disk fault for a small entry (payload
+    /// + header < LOG_FAULT_READ_SIZE) must cost EXACTLY ONE random read.
+    ///
+    /// The pre-fix `read_entry_from_disk` did two random reads for every cold
+    /// LN fault (one for the header, one for the whole entry).  That doubled
+    /// point-read IO and, because the benchmark derives its cache-hit rate
+    /// from `n_random_reads`, halved the reported hit rate (the ~44% ceiling
+    /// that was invariant to cache size).  JE reads `LOG_FAULT_READ_SIZE`
+    /// (2048) bytes up front and only repeat-reads when the entry is larger
+    /// (`nRepeatFaultReads`), so a small LN is one read.
+    #[test]
+    fn test_small_entry_disk_fault_is_single_random_read() {
+        let dir = TempDir::new().unwrap();
+        let lm = make_log_manager(&dir);
+
+        // ~120 B LN-sized payload, well under LOG_FAULT_READ_SIZE (2048).
+        let payload = vec![0x5au8; 100];
+        let lsn = lm
+            .log(
+                LogEntryType::InsertLN,
+                &payload,
+                Provisional::No,
+                false,
+                false,
+            )
+            .unwrap();
+        lm.flush_no_sync().unwrap();
+
+        // Read straight from disk (bypass the buffer-pool fast path) and count
+        // the random reads the fault actually issued.
+        let before = lm.file_manager.get_io_stats().n_random_reads;
+        let (entry_type, read_back) = lm.read_entry_from_disk(lsn).unwrap();
+        let after = lm.file_manager.get_io_stats().n_random_reads;
+
+        assert_eq!(entry_type, LogEntryType::InsertLN);
+        assert_eq!(read_back, payload);
+        assert_eq!(
+            after - before,
+            1,
+            "small-entry cold fault must be ONE random read, was {}",
+            after - before
+        );
+        // No repeat-read for a sub-2 KiB entry.
+        assert_eq!(lm.get_stats().n_repeat_fault_reads, 0);
+    }
+
+    /// Companion: an entry LARGER than LOG_FAULT_READ_SIZE takes the
+    /// repeat-read path (2 random reads) and bumps `n_repeat_fault_reads`,
+    /// exactly like JE.  This keeps the single-read fix honest: the second
+    /// read is not gone, it is now conditional on entry size.
+    #[test]
+    fn test_large_entry_disk_fault_repeat_reads() {
+        let dir = TempDir::new().unwrap();
+        let lm = make_log_manager(&dir);
+
+        // 8 KiB payload > LOG_FAULT_READ_SIZE (2048): forces the repeat-read.
+        let payload = vec![0xa5u8; 8 * 1024];
+        let lsn = lm
+            .log(LogEntryType::IN, &payload, Provisional::No, false, false)
+            .unwrap();
+        lm.flush_no_sync().unwrap();
+
+        let before = lm.file_manager.get_io_stats().n_random_reads;
+        let before_repeat = lm.get_stats().n_repeat_fault_reads;
+        let (entry_type, read_back) = lm.read_entry_from_disk(lsn).unwrap();
+        let after = lm.file_manager.get_io_stats().n_random_reads;
+        let after_repeat = lm.get_stats().n_repeat_fault_reads;
+
+        assert_eq!(entry_type, LogEntryType::IN);
+        assert_eq!(read_back, payload);
+        assert_eq!(
+            after - before,
+            2,
+            "large-entry cold fault must be TWO random reads, was {}",
+            after - before
+        );
+        assert_eq!(after_repeat - before_repeat, 1);
     }
 
     #[test]
