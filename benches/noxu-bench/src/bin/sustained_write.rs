@@ -15,13 +15,11 @@
 //!   SW_ENGINE      noxu | je-note (this binary is noxu; JE has JeSustained.java)
 //!   SW_DURABILITY  SYNC | WRITE_NO_SYNC | NO_SYNC (default SYNC)
 
-use noxu_db::{
-    DatabaseConfig, Durability, Environment, EnvironmentConfig,
-};
+use noxu_db::{DatabaseConfig, Durability, Environment, EnvironmentConfig};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 fn envp(k: &str, d: u64) -> u64 {
@@ -60,7 +58,10 @@ impl Hist {
         // atomics). Anything above 65ms lands in the top bucket but max_us
         // still tracks the true max. This gives exact p50/p99/p99.9 in the
         // sub-65ms range where a healthy commit latency lives.
-        Hist { buckets: (0..65536).map(|_| AtomicU64::new(0)).collect(), max_us: AtomicU64::new(0) }
+        Hist {
+            buckets: (0..65536).map(|_| AtomicU64::new(0)).collect(),
+            max_us: AtomicU64::new(0),
+        }
     }
     #[inline]
     fn idx(us: u64) -> usize {
@@ -72,7 +73,12 @@ impl Hist {
         // track max
         let mut cur = self.max_us.load(Ordering::Relaxed);
         while us > cur {
-            match self.max_us.compare_exchange_weak(cur, us, Ordering::Relaxed, Ordering::Relaxed) {
+            match self.max_us.compare_exchange_weak(
+                cur,
+                us,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
                 Ok(_) => break,
                 Err(c) => cur = c,
             }
@@ -106,9 +112,14 @@ impl Hist {
 }
 
 fn fstype(dir: &str) -> String {
-    std::process::Command::new("df").arg("-T").arg(dir).output().ok()
+    std::process::Command::new("df")
+        .arg("-T")
+        .arg(dir)
+        .output()
+        .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| s.lines().nth(1).map(|l| l.to_string())).unwrap_or_default()
+        .and_then(|s| s.lines().nth(1).map(|l| l.to_string()))
+        .unwrap_or_default()
 }
 
 fn main() {
@@ -116,7 +127,8 @@ fn main() {
     let cache = envp("SW_CACHE", 8 * 1024 * 1024 * 1024);
     let threads = envp("SW_THREADS", 8) as usize;
     let seconds = envp("SW_SECONDS", 1800);
-    let durability = std::env::var("SW_DURABILITY").unwrap_or_else(|_| "SYNC".into());
+    let durability =
+        std::env::var("SW_DURABILITY").unwrap_or_else(|_| "SYNC".into());
 
     if fstype(&dir).contains("tmpfs") {
         eprintln!("ABORT: {dir} is tmpfs; use real NVMe");
@@ -129,15 +141,21 @@ fn main() {
         _ => Durability::COMMIT_SYNC,
     };
 
-    println!("=== Noxu sustained 98/2 write/read (JSON 256-2048B, PK from sequence) ===");
-    println!("  dir={dir} cache={}GiB threads={threads} seconds={seconds} dur={durability}", cache / 1024 / 1024 / 1024);
+    println!(
+        "=== Noxu sustained 98/2 write/read (JSON 256-2048B, PK from sequence) ==="
+    );
+    println!(
+        "  dir={dir} cache={}GiB threads={threads} seconds={seconds} dur={durability}",
+        cache / 1024 / 1024 / 1024
+    );
 
     let mut sw_cfg = EnvironmentConfig::new(std::path::PathBuf::from(&dir));
     sw_cfg.set_allow_create(true);
     sw_cfg.set_transactional(true);
     sw_cfg.set_cache_size(cache);
     sw_cfg.set_durability(dur);
-    sw_cfg.set_log_group_commit_threshold(envp("SW_GRPC_THRESHOLD", 0) as usize);
+    sw_cfg
+        .set_log_group_commit_threshold(envp("SW_GRPC_THRESHOLD", 0) as usize);
     sw_cfg.set_log_group_commit_interval_ms(envp("SW_GRPC_INTERVAL_MS", 0));
     sw_cfg.set_log_flush_no_sync_interval_ms(envp("SW_FLUSH_MS", 0));
     // Log-buffer scaling knobs (default = engine defaults: 3 buffers x 1MiB).
@@ -151,10 +169,16 @@ fn main() {
         sw_cfg.set_log_total_buffer_bytes(bufsz * nbuf.max(3));
     }
     let env = Arc::new(Environment::open(sw_cfg).expect("open env"));
-    let db = Arc::new(env.open_database(
-        None, "sustained",
-        &DatabaseConfig::new().with_allow_create(true).with_transactional(true),
-    ).expect("open db"));
+    let db = Arc::new(
+        env.open_database(
+            None,
+            "sustained",
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true),
+        )
+        .expect("open db"),
+    );
     let env_for_close = Arc::clone(&env);
 
     let seq = Arc::new(AtomicU64::new(1)); // monotonic PK sequence
@@ -171,7 +195,10 @@ fn main() {
     let reporter = std::thread::spawn(move || {
         let mut last_ops = 0u64;
         let mut last_total = 0u64;
-        println!("{:>4} {:>12} {:>10} {:>10} {:>10} {:>10}", "min", "ops/s", "p50us", "p99us", "p999us", "maxus");
+        println!(
+            "{:>4} {:>12} {:>10} {:>10} {:>10} {:>10}",
+            "min", "ops/s", "p50us", "p99us", "p999us", "maxus"
+        );
         let mut min = 0;
         while !rep_stop.load(Ordering::Relaxed) {
             std::thread::sleep(std::time::Duration::from_secs(60));
@@ -183,50 +210,59 @@ fn main() {
             // the whole run is the flatness signal; also print interval rate).
             let _ = last_total;
             last_total = rep_hist.total();
-            println!("{:>4} {:>12} {:>10} {:>10} {:>10} {:>10}",
-                min, win_ops / 60,
-                rep_hist.pct(0.50), rep_hist.pct(0.99), rep_hist.pct(0.999),
-                rep_hist.max_us.load(Ordering::Relaxed));
+            println!(
+                "{:>4} {:>12} {:>10} {:>10} {:>10} {:>10}",
+                min,
+                win_ops / 60,
+                rep_hist.pct(0.50),
+                rep_hist.pct(0.99),
+                rep_hist.pct(0.999),
+                rep_hist.max_us.load(Ordering::Relaxed)
+            );
         }
     });
 
-    let handles: Vec<_> = (0..threads).map(|tid| {
-        let db = Arc::clone(&db);
-        let seq = Arc::clone(&seq);
-        let hist = Arc::clone(&hist);
-        let ops = Arc::clone(&ops);
-        let stop = Arc::clone(&stop);
-        std::thread::spawn(move || {
-            let mut rng = SmallRng::seed_from_u64(0x5e97 ^ tid as u64);
-            let mut local = 0u64;
-            while !stop.load(Ordering::Relaxed) {
-                let t0 = Instant::now();
-                if rng.gen_range(0..100) < 2 {
-                    // 2% read: read a recent key
-                    let hi = seq.load(Ordering::Relaxed);
-                    let k = rng.gen_range(1..=hi.max(1));
-                    let _ = db.get(k.to_be_bytes());
-                } else {
-                    // 98% write: fresh PK from the sequence, JSON value
-                    let id = seq.fetch_add(1, Ordering::Relaxed);
-                    let size = rng.gen_range(256..=2048);
-                    let val = json_value(id, size, &mut rng);
-                    let _ = db.put(id.to_be_bytes(), &val);
+    let handles: Vec<_> = (0..threads)
+        .map(|tid| {
+            let db = Arc::clone(&db);
+            let seq = Arc::clone(&seq);
+            let hist = Arc::clone(&hist);
+            let ops = Arc::clone(&ops);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut rng = SmallRng::seed_from_u64(0x5e97 ^ tid as u64);
+                let mut local = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let t0 = Instant::now();
+                    if rng.gen_range(0..100) < 2 {
+                        // 2% read: read a recent key
+                        let hi = seq.load(Ordering::Relaxed);
+                        let k = rng.gen_range(1..=hi.max(1));
+                        let _ = db.get(k.to_be_bytes());
+                    } else {
+                        // 98% write: fresh PK from the sequence, JSON value
+                        let id = seq.fetch_add(1, Ordering::Relaxed);
+                        let size = rng.gen_range(256..=2048);
+                        let val = json_value(id, size, &mut rng);
+                        let _ = db.put(id.to_be_bytes(), &val);
+                    }
+                    let us = t0.elapsed().as_micros() as u64;
+                    hist.record(us);
+                    local += 1;
+                    // Publish incrementally (cheap relaxed add) so the per-60s
+                    // reporter sees real per-window throughput, not 0 until join.
+                    ops.fetch_add(1, Ordering::Relaxed);
                 }
-                let us = t0.elapsed().as_micros() as u64;
-                hist.record(us);
-                local += 1;
-                // Publish incrementally (cheap relaxed add) so the per-60s
-                // reporter sees real per-window throughput, not 0 until join.
-                ops.fetch_add(1, Ordering::Relaxed);
-            }
-            let _ = local;
+                let _ = local;
+            })
         })
-    }).collect();
+        .collect();
 
     std::thread::sleep(std::time::Duration::from_secs(seconds));
     stop.store(true, Ordering::Relaxed);
-    for h in handles { h.join().unwrap(); }
+    for h in handles {
+        h.join().unwrap();
+    }
     reporter.join().unwrap();
 
     let elapsed = start.elapsed().as_secs_f64();
@@ -242,9 +278,14 @@ fn main() {
         "  fsyncs: {fsyncs}  commits/fsync (coalescing): {:.2}",
         if fsyncs > 0 { writes as f64 / fsyncs as f64 } else { 0.0 }
     );
-    println!("  latency (whole run): p50={}us p90={}us p99={}us p99.9={}us max={}us",
-        hist.pct(0.50), hist.pct(0.90), hist.pct(0.99), hist.pct(0.999),
-        hist.max_us.load(Ordering::Relaxed));
+    println!(
+        "  latency (whole run): p50={}us p90={}us p99={}us p99.9={}us max={}us",
+        hist.pct(0.50),
+        hist.pct(0.90),
+        hist.pct(0.99),
+        hist.pct(0.999),
+        hist.max_us.load(Ordering::Relaxed)
+    );
 
     db.close().unwrap();
     drop(env);

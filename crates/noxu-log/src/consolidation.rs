@@ -361,8 +361,8 @@ mod tests {
                                     // Monotonic assign under the latch: the
                                     // returned value strictly increases in the
                                     // order the leader stamps the batch.
-                                    let lsn = counter
-                                        .fetch_add(1, Ordering::SeqCst);
+                                    let lsn =
+                                        counter.fetch_add(1, Ordering::SeqCst);
                                     served.lock().unwrap().push(*rq);
                                     lsn
                                 })

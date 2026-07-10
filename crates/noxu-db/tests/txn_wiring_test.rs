@@ -459,18 +459,16 @@ mod prop_txn_visibility {
         // Begin=1, Put=4, Commit=2, Abort=1.  Emulate the weighting by
         // drawing a tag from a list where each tag repeats by its weight.
         let tag = tc.draw(generators::sampled_from(vec![
-            "begin", "put", "put", "put", "put", "commit", "commit",
-            "abort",
+            "begin", "put", "put", "put", "put", "commit", "commit", "abort",
         ]));
         match tag {
             "begin" => TxnStep::Begin,
             "commit" => TxnStep::Commit,
             "abort" => TxnStep::Abort,
             _ => {
-                let key = tc
-                    .draw(generators::binary().min_size(1).max_size(4));
-                let value = tc
-                    .draw(generators::binary().min_size(1).max_size(16));
+                let key = tc.draw(generators::binary().min_size(1).max_size(4));
+                let value =
+                    tc.draw(generators::binary().min_size(1).max_size(16));
                 TxnStep::Put { key, value }
             }
         }

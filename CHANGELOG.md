@@ -15,6 +15,8 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+## [7.5.0] - 2026-07-10
+
 ### Fixed
 
 - **LN read cache retained almost nothing: `repopulate_ln_data` skipped the

@@ -22,13 +22,13 @@
 //!                           txn_multi|cursor_scan|insert_only|all (default all)
 
 use noxu_db::{
-    Database, DatabaseConfig, Durability, Environment, EnvironmentConfig,
-    Put, TransactionConfig,
+    Database, DatabaseConfig, Durability, Environment, EnvironmentConfig, Put,
+    TransactionConfig,
 };
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 fn envp(k: &str, d: u64) -> u64 {
@@ -200,11 +200,8 @@ fn load(ctx: &Ctx, load_threads: usize) {
             let db = Arc::clone(&ctx.db);
             let loaded = Arc::clone(&loaded);
             let start = tid as u64 * per;
-            let end = if tid == load_threads - 1 {
-                ctx.records
-            } else {
-                start + per
-            };
+            let end =
+                if tid == load_threads - 1 { ctx.records } else { start + per };
             let value_size = ctx.value_size;
             s.spawn(move || {
                 let value = vec![0x56u8; value_size];
@@ -248,8 +245,8 @@ fn fstype(dir: &str) -> String {
 }
 
 fn main() {
-    let dir =
-        std::env::var("NOXU_BENCH_DIR").unwrap_or_else(|_| "/tmp/noxu-cmp".into());
+    let dir = std::env::var("NOXU_BENCH_DIR")
+        .unwrap_or_else(|_| "/tmp/noxu-cmp".into());
     let cache = envp("NOXU_BENCH_CACHE_SIZE", 4 * 1024 * 1024 * 1024);
     let value_size = envp("NOXU_BENCH_VALUE_SIZE", 200) as usize;
     let records = envp("NOXU_BENCH_RECORDS", 20_000_000);
@@ -259,17 +256,18 @@ fn main() {
     // past ~8 concurrent writers contend heavily on the lock/tree/log path
     // (documented limitation). JeBench uses the same load-thread count for
     // a fair comparison.
-    let load_threads =
-        envp("NOXU_BENCH_LOAD_THREADS", 8).max(1) as usize;
-    let durability =
-        std::env::var("NOXU_BENCH_DURABILITY").unwrap_or_else(|_| "SYNC".into());
-    let profile = std::env::var("NOXU_BENCH_PROFILE")
-        .unwrap_or_else(|_| "all".into());
+    let load_threads = envp("NOXU_BENCH_LOAD_THREADS", 8).max(1) as usize;
+    let durability = std::env::var("NOXU_BENCH_DURABILITY")
+        .unwrap_or_else(|_| "SYNC".into());
+    let profile =
+        std::env::var("NOXU_BENCH_PROFILE").unwrap_or_else(|_| "all".into());
 
     // Hard guard: never benchmark on tmpfs (RAM) — it would report fantasy I/O.
     let fst = fstype(&dir);
     if fst.contains("tmpfs") {
-        eprintln!("ABORT: {dir} is tmpfs (RAM-backed); use real NVMe. df: {fst}");
+        eprintln!(
+            "ABORT: {dir} is tmpfs (RAM-backed); use real NVMe. df: {fst}"
+        );
         std::process::exit(2);
     }
 
@@ -282,9 +280,16 @@ fn main() {
 
     let approx = records * (value_size as u64 + 40);
     println!("=== Noxu comprehensive benchmark ===");
-    println!("  dir:        {dir}  (fs: {})", fst.split_whitespace().nth(1).unwrap_or("?"));
+    println!(
+        "  dir:        {dir}  (fs: {})",
+        fst.split_whitespace().nth(1).unwrap_or("?")
+    );
     println!("  cache:      {} GiB", cache / 1024 / 1024 / 1024);
-    println!("  dataset:    {records} x {value_size}B ~= {} GiB (ratio {:.1}x cache)", approx / 1024 / 1024 / 1024, approx as f64 / cache as f64);
+    println!(
+        "  dataset:    {records} x {value_size}B ~= {} GiB (ratio {:.1}x cache)",
+        approx / 1024 / 1024 / 1024,
+        approx as f64 / cache as f64
+    );
     println!("  threads:    {threads} (load: {load_threads})");
     println!("  seconds:    {seconds} per profile");
     println!("  durability: {durability}");
@@ -363,7 +368,9 @@ fn main() {
                     let mut local = 0u64;
                     while !stop.load(Ordering::Relaxed) {
                         for _ in 0..64 {
-                            do_op(&assigned, &env, &db, &mut rng, records, &value);
+                            do_op(
+                                &assigned, &env, &db, &mut rng, records, &value,
+                            );
                             local += 1;
                         }
                     }
@@ -378,7 +385,12 @@ fn main() {
         }
         let el = start.elapsed().as_secs_f64();
         let total = ops.load(Ordering::Relaxed);
-        println!("{:<14} {:>14.0} {:>12}", "ALL_MIXED", total as f64 / el, total);
+        println!(
+            "{:<14} {:>14.0} {:>12}",
+            "ALL_MIXED",
+            total as f64 / el,
+            total
+        );
     }
 
     // Silence unused-import warnings when only some paths are exercised.

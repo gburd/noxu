@@ -34,7 +34,9 @@
 //! LSN` at the instant the commit returns.
 
 use noxu_log::file_handle::fsync_probe;
-use noxu_log::{FileManager, LogEntryType, LogManager, provisional::Provisional};
+use noxu_log::{
+    FileManager, LogEntryType, LogManager, provisional::Provisional,
+};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tempfile::TempDir;

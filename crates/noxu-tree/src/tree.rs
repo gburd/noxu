@@ -9132,7 +9132,10 @@ mod tests {
                 panic!("expected a BIN");
             };
             let freed = bin.entries[slot_index].data.take();
-            assert!(freed.is_some(), "slot must have had resident data to strip");
+            assert!(
+                freed.is_some(),
+                "slot must have had resident data to strip"
+            );
             counter.fetch_sub(freed.unwrap().len() as i64, Ordering::Relaxed);
             bin.cursor_count = 1; // simulate a concurrent reader pinning the BIN
         }
@@ -9147,10 +9150,9 @@ mod tests {
         {
             let g = bin_arc.read();
             let TreeNode::Bottom(bin) = &*g else { panic!("expected a BIN") };
-            let resident = bin.entries[slot_index]
-                .data
-                .as_ref()
-                .expect("REPOPULATE-1: slot must be re-populated despite the pin");
+            let resident = bin.entries[slot_index].data.as_ref().expect(
+                "REPOPULATE-1: slot must be re-populated despite the pin",
+            );
             assert_eq!(
                 resident.as_ref(),
                 data.as_slice(),

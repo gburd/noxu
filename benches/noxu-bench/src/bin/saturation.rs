@@ -17,7 +17,9 @@
 //!   NOXU_SAT_SECONDS       measured seconds per phase (default 60)
 //!   NOXU_SAT_LOAD_THREADS  parallel loader threads (default: all CPUs)
 
-use noxu_db::{Database, DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig};
+use noxu_db::{
+    Database, DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
+};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -60,10 +62,15 @@ fn main() {
 
     let approx_bytes = records * (value_size as u64 + 40);
     println!("=== Noxu saturation benchmark ===");
-    println!("  data dir:   {dir}  (fs: {})", fstype.split_whitespace().nth(1).unwrap_or("?"));
+    println!(
+        "  data dir:   {dir}  (fs: {})",
+        fstype.split_whitespace().nth(1).unwrap_or("?")
+    );
     println!("  cache:      {} GiB", cache / 1024 / 1024 / 1024);
-    println!("  records:    {records}  x {value_size}B  ~= {} GiB dataset",
-             approx_bytes / 1024 / 1024 / 1024);
+    println!(
+        "  records:    {records}  x {value_size}B  ~= {} GiB dataset",
+        approx_bytes / 1024 / 1024 / 1024
+    );
     println!("  threads:    {threads} workers, {load_threads} loaders");
     println!("  seconds:    {seconds} per phase");
 
@@ -80,7 +87,9 @@ fn main() {
         env.open_database(
             None,
             "sat",
-            &DatabaseConfig::new().with_allow_create(true).with_transactional(true),
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true),
         )
         .expect("open db"),
     );
@@ -95,7 +104,8 @@ fn main() {
             let db = Arc::clone(&db);
             let loaded = Arc::clone(&loaded);
             let start = tid as u64 * per;
-            let end = if tid == load_threads - 1 { records } else { start + per };
+            let end =
+                if tid == load_threads - 1 { records } else { start + per };
             s.spawn(move || {
                 let value = vec![0x58u8; value_size];
                 let v = DatabaseEntry::from_bytes(&value);
@@ -125,7 +135,9 @@ fn main() {
     for (label, read_pct) in
         [("100r", 100u32), ("95r5w", 95), ("50r50w", 50), ("0r100w", 0)]
     {
-        run_phase(&env, &db, label, read_pct, threads, records, value_size, seconds);
+        run_phase(
+            &env, &db, label, read_pct, threads, records, value_size, seconds,
+        );
     }
 
     // ── Transactional phase (multi-op txns under concurrency) ──────────────
@@ -158,7 +170,8 @@ fn run_phase(
             let stop = Arc::clone(&stop);
             let total = Arc::clone(&total);
             let h = s.spawn(move || -> Vec<u64> {
-                let mut rng = SmallRng::seed_from_u64(tid as u64 * 2_654_435_761 + 1);
+                let mut rng =
+                    SmallRng::seed_from_u64(tid as u64 * 2_654_435_761 + 1);
                 let value = vec![0x58u8; value_size];
                 let v = DatabaseEntry::from_bytes(&value);
                 let mut data = DatabaseEntry::new();
@@ -199,8 +212,11 @@ fn run_phase(
         let ops = total.load(Ordering::Relaxed);
         all_lats.sort_unstable();
         let p = |q: f64| -> u64 {
-            if all_lats.is_empty() { 0 } else {
-                all_lats[((all_lats.len() as f64 * q) as usize).min(all_lats.len() - 1)]
+            if all_lats.is_empty() {
+                0
+            } else {
+                all_lats[((all_lats.len() as f64 * q) as usize)
+                    .min(all_lats.len() - 1)]
             }
         };
         println!(
@@ -241,7 +257,9 @@ fn run_txn_phase(
                     // A multi-op transaction: 4 puts across the keyspace.
                     if let Ok(txn) = env.begin_transaction(None) {
                         for _ in 0..4 {
-                            let k = DatabaseEntry::from_vec(key_bytes(rng.gen_range(0..records)));
+                            let k = DatabaseEntry::from_vec(key_bytes(
+                                rng.gen_range(0..records),
+                            ));
                             let _ = db.put_in(&txn, &k, &v);
                         }
                         let _ = txn.commit();

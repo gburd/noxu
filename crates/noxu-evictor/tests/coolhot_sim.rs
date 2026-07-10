@@ -161,8 +161,7 @@ fn simulate_scan_resistance(algo: EvictionAlgorithm) -> (f64, f64) {
         }
     }
     // How many hot nodes are still resident?
-    let hot_still: usize =
-        hot.iter().filter(|h| resident.contains(h)).count();
+    let hot_still: usize = hot.iter().filter(|h| resident.contains(h)).count();
     let hot_frac = hot_still as f64 / hot.len() as f64;
     let scan_still: usize =
         (1000..(1000 + scan_len)).filter(|s| resident.contains(s)).count();

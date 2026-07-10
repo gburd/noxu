@@ -23,7 +23,8 @@ fn config_int_set_get_roundtrip(tc: hegel::TestCase) {
 /// Setting an integer parameter out of range fails validation.
 #[hegel::test]
 fn config_int_out_of_range_rejected(tc: hegel::TestCase) {
-    let val = tc.draw(generators::integers::<i32>().min_value(91).max_value(i32::MAX));
+    let val = tc
+        .draw(generators::integers::<i32>().min_value(91).max_value(i32::MAX));
     let mut mgr = ConfigManager::new();
     let result = mgr.set("noxu.maxMemoryPercent", ParamValue::Int(val), false);
     assert!(result.is_err());
@@ -47,7 +48,8 @@ fn config_long_set_get_roundtrip(tc: hegel::TestCase) {
 /// Setting a long parameter below minimum is rejected.
 #[hegel::test]
 fn config_long_below_min_rejected(tc: hegel::TestCase) {
-    let val = tc.draw(generators::integers::<i64>().min_value(0).max_value(999_999));
+    let val =
+        tc.draw(generators::integers::<i64>().min_value(0).max_value(999_999));
     let mut mgr = ConfigManager::new();
     let result = mgr.set("noxu.log.fileMax", ParamValue::Long(val), false);
     assert!(result.is_err());
@@ -75,7 +77,9 @@ fn config_type_mismatch_rejected(tc: hegel::TestCase) {
 /// Unknown parameter names are rejected.
 #[hegel::test]
 fn config_unknown_param_rejected(tc: hegel::TestCase) {
-    let name = tc.draw(generators::from_regex(r"je\.unknown\.[a-z]{1,20}").fullmatch(true));
+    let name = tc.draw(
+        generators::from_regex(r"je\.unknown\.[a-z]{1,20}").fullmatch(true),
+    );
     let mut mgr = ConfigManager::new();
     let result = mgr.set(&name, ParamValue::Bool(true), false);
     assert!(result.is_err());

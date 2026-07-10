@@ -930,12 +930,10 @@ mod prop_full_scan_order {
         tc: hegel::TestCase,
     ) {
         let key_vec: Vec<Vec<u8>> = tc.draw(
-            generators::vecs(
-                generators::binary().min_size(1).max_size(16),
-            )
-            .min_size(1)
-            .max_size(256)
-            .unique(true),
+            generators::vecs(generators::binary().min_size(1).max_size(16))
+                .min_size(1)
+                .max_size(256)
+                .unique(true),
         );
         let keys: BTreeSet<Vec<u8>> = key_vec.into_iter().collect();
         let dir = TempDir::new().unwrap();

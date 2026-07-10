@@ -221,7 +221,10 @@ pub struct LogManager {
     /// The combining funnel that replaces the LWL mutex when
     /// `use_consolidation_array` is set.  A single instance per log manager
     /// (single WAL => single serialisation point).
-    lwl_array: crate::consolidation::ConsolidationArray<SlotRequest, Result<SlotResult>>,
+    lwl_array: crate::consolidation::ConsolidationArray<
+        SlotRequest,
+        Result<SlotResult>,
+    >,
 }
 
 impl LogManager {
@@ -767,9 +770,8 @@ impl LogManager {
                     // batches is preserved (proof #1).  Followers NEVER touch
                     // the latch — they spin on their result cell (no park).
                     let _lwl_guard = self.log_write_latch.lock();
-                    self.lwl_array.run_as_leader(&request, |req| {
-                        self.assign_slot(req)
-                    })
+                    self.lwl_array
+                        .run_as_leader(&request, |req| self.assign_slot(req))
                 }
                 Join::Follower => {
                     // Follower: spin (no park) until the leader publishes our
@@ -985,9 +987,7 @@ impl LogManager {
                     &self.last_synced_lsn,
                     eol.as_u64(),
                 );
-                Ok(Lsn::from_u64(
-                    self.last_synced_lsn.load(Ordering::Acquire),
-                ))
+                Ok(Lsn::from_u64(self.last_synced_lsn.load(Ordering::Acquire)))
             }
             Err(e) => {
                 // C-2 (the 2026 review F-3.2 / F-8.4 / F-9.4): any I/O error
@@ -2348,8 +2348,7 @@ mod tests {
                 )
                 .unwrap_or_else(|e| panic!("raw header {lsn:?}: {e:?}"));
             assert_eq!(n, MIN_HEADER_SIZE, "short header read at {lsn:?}");
-            let raw_prev =
-                u32::from_le_bytes([hdr[6], hdr[7], hdr[8], hdr[9]]);
+            let raw_prev = u32::from_le_bytes([hdr[6], hdr[7], hdr[8], hdr[9]]);
             assert_eq!(
                 raw_prev,
                 expected_prev[&lsn.as_u64()],

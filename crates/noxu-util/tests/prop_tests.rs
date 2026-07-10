@@ -46,7 +46,8 @@ fn lsn_ordering_by_file(tc: hegel::TestCase) {
 #[hegel::test]
 fn lsn_ordering_by_offset(tc: hegel::TestCase) {
     let file_number = tc.draw(generators::integers::<u32>());
-    let offset_a = tc.draw(generators::integers::<u32>().max_value(u32::MAX - 1));
+    let offset_a =
+        tc.draw(generators::integers::<u32>().max_value(u32::MAX - 1));
     let offset_b = offset_a + 1;
     let lsn_a = Lsn::new(file_number, offset_a);
     let lsn_b = Lsn::new(file_number, offset_b);
@@ -63,7 +64,8 @@ fn lsn_null_is_null() {
 #[hegel::test]
 fn lsn_non_null(tc: hegel::TestCase) {
     // Lsn(u32::MAX, u32::MAX) == NULL_LSN, so exclude file_number == MAX.
-    let file_number = tc.draw(generators::integers::<u32>().max_value(u32::MAX - 1));
+    let file_number =
+        tc.draw(generators::integers::<u32>().max_value(u32::MAX - 1));
     let offset = tc.draw(generators::integers::<u32>());
     let lsn = Lsn::new(file_number, offset);
     assert!(!lsn.is_null());
@@ -94,7 +96,9 @@ fn vlsn_ordering(tc: hegel::TestCase) {
 /// For a < b (both positive), ordering is preserved.
 #[hegel::test]
 fn vlsn_ordering_strict(tc: hegel::TestCase) {
-    let a = tc.draw(generators::integers::<i64>().min_value(1).max_value(i64::MAX - 1));
+    let a = tc.draw(
+        generators::integers::<i64>().min_value(1).max_value(i64::MAX - 1),
+    );
     let b = a + 1;
     let vlsn_a = Vlsn::new(a);
     let vlsn_b = Vlsn::new(b);
@@ -104,7 +108,9 @@ fn vlsn_ordering_strict(tc: hegel::TestCase) {
 /// next() of a positive VLSN yields sequence + 1.
 #[hegel::test]
 fn vlsn_next(tc: hegel::TestCase) {
-    let seq = tc.draw(generators::integers::<i64>().min_value(1).max_value(i64::MAX - 1));
+    let seq = tc.draw(
+        generators::integers::<i64>().min_value(1).max_value(i64::MAX - 1),
+    );
     let vlsn = Vlsn::new(seq);
     assert_eq!(vlsn.next().sequence(), seq + 1);
 }

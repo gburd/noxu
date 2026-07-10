@@ -127,8 +127,7 @@ fn crud_op(tc: hegel::TestCase) -> CrudOp {
     let key = tc.draw(generators::binary().min_size(1).max_size(8));
     match tag {
         "put" => {
-            let value =
-                tc.draw(generators::binary().min_size(1).max_size(64));
+            let value = tc.draw(generators::binary().min_size(1).max_size(64));
             CrudOp::Put { key, value }
         }
         "delete" => CrudOp::Delete { key },

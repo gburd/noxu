@@ -550,9 +550,7 @@ mod prop_sorted_dup_oracle {
     use std::collections::{BTreeMap, BTreeSet};
 
     #[hegel::test(test_cases = 64)]
-    fn sorted_dup_search_oracle_brute_force_small_random(
-        tc: hegel::TestCase,
-    ) {
+    fn sorted_dup_search_oracle_brute_force_small_random(tc: hegel::TestCase) {
         // 1..=64 (key, data) inserts with 1..=8-byte keys (high
         // collision rate -> exercises the dup tree) and 1..=16-byte
         // values.
@@ -590,12 +588,10 @@ mod prop_sorted_dup_oracle {
             .with_transactional(true)
             .with_sorted_duplicates(true)
             .with_transactional(true);
-        let db =
-            env.open_database(None, "prop_sorted_dup", &db_cfg).unwrap();
+        let db = env.open_database(None, "prop_sorted_dup", &db_cfg).unwrap();
 
         // Oracle: key -> sorted set of dup data values.
-        let mut oracle: BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>> =
-            BTreeMap::new();
+        let mut oracle: BTreeMap<Vec<u8>, BTreeSet<Vec<u8>>> = BTreeMap::new();
         for (k, v) in &pairs {
             db.put(DatabaseEntry::from_bytes(k), DatabaseEntry::from_bytes(v))
                 .unwrap();
@@ -614,8 +610,7 @@ mod prop_sorted_dup_oracle {
         for probe in &probes {
             let mut k_e = DatabaseEntry::from_bytes(probe);
             let mut d_e = DatabaseEntry::new();
-            let s =
-                cursor.get(&mut k_e, &mut d_e, Get::Search, None).unwrap();
+            let s = cursor.get(&mut k_e, &mut d_e, Get::Search, None).unwrap();
             match (s, oracle.get(probe)) {
                 (OperationStatus::Success, Some(dups)) => {
                     assert_eq!(
@@ -644,9 +639,8 @@ mod prop_sorted_dup_oracle {
         for probe in &probes {
             let mut k_e = DatabaseEntry::from_bytes(probe);
             let mut d_e = DatabaseEntry::new();
-            let s = cursor
-                .get(&mut k_e, &mut d_e, Get::SearchGte, None)
-                .unwrap();
+            let s =
+                cursor.get(&mut k_e, &mut d_e, Get::SearchGte, None).unwrap();
             let want = oracle.range::<Vec<u8>, _>(probe.clone()..).next();
             match (s, want) {
                 (OperationStatus::Success, Some((wk, wd))) => {
@@ -697,13 +691,11 @@ mod prop_sorted_dup_oracle {
         // Property 3d: Get::SearchBoth on a (key, data) NOT in the
         // oracle must return NotFound.
         for (k, d) in &both_probes {
-            let oracle_has =
-                oracle.get(k).is_some_and(|dups| dups.contains(d));
+            let oracle_has = oracle.get(k).is_some_and(|dups| dups.contains(d));
             let mut k_e = DatabaseEntry::from_bytes(k);
             let mut d_e = DatabaseEntry::from_bytes(d);
-            let s = cursor
-                .get(&mut k_e, &mut d_e, Get::SearchBoth, None)
-                .unwrap();
+            let s =
+                cursor.get(&mut k_e, &mut d_e, Get::SearchBoth, None).unwrap();
             let expected = if oracle_has {
                 OperationStatus::Success
             } else {

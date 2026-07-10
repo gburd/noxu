@@ -195,8 +195,9 @@ pub(crate) struct ActiveTxns {
 
 impl ActiveTxns {
     fn new() -> Self {
-        let shards =
-            (0..N_TXN_SHARDS).map(|_| Mutex::new(HashMap::new())).collect::<Vec<_>>();
+        let shards = (0..N_TXN_SHARDS)
+            .map(|_| Mutex::new(HashMap::new()))
+            .collect::<Vec<_>>();
         Self { shards: shards.into_boxed_slice() }
     }
 
@@ -204,7 +205,10 @@ impl ActiveTxns {
     /// monotonic `AtomicU64` starting at 1, so `id % N` distributes them
     /// round-robin across shards with no clustering.
     #[inline]
-    fn shard_for(&self, id: u64) -> &Mutex<HashMap<u64, Arc<TransactionState>>> {
+    fn shard_for(
+        &self,
+        id: u64,
+    ) -> &Mutex<HashMap<u64, Arc<TransactionState>>> {
         &self.shards[(id % N_TXN_SHARDS as u64) as usize]
     }
 

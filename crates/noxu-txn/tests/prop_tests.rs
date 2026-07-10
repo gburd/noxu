@@ -104,7 +104,8 @@ fn lock_write_classification(tc: hegel::TestCase) {
 
 #[hegel::test]
 fn no_deadlock_in_linear_chain(tc: hegel::TestCase) {
-    let chain_len = tc.draw(generators::integers::<u32>().min_value(2).max_value(19));
+    let chain_len =
+        tc.draw(generators::integers::<u32>().min_value(2).max_value(19));
     let mut waits_for: HashMap<i64, HashSet<i64>> = HashMap::new();
 
     // Build chain: 1 -> 2 -> 3 -> ... -> chain_len
@@ -130,7 +131,8 @@ fn no_deadlock_in_linear_chain(tc: hegel::TestCase) {
 
 #[hegel::test]
 fn deadlock_in_ring(tc: hegel::TestCase) {
-    let ring_size = tc.draw(generators::integers::<u32>().min_value(2).max_value(19));
+    let ring_size =
+        tc.draw(generators::integers::<u32>().min_value(2).max_value(19));
     let mut waits_for: HashMap<i64, HashSet<i64>> = HashMap::new();
 
     // Build chain: 1 -> 2 -> 3 -> ... -> (ring_size - 1) -> ring_size

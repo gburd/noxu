@@ -1563,8 +1563,7 @@ impl InListListener for Evictor {
     /// hot end if it is already tracked; otherwise add it (a freshly split
     /// BIN is first seen here).  `moveBack` in JE is add-if-absent.
     fn note_ins_accessed(&self, node_id: u64) {
-        if self.primary_policy.touch(node_id)
-            || self.scan_policy.touch(node_id)
+        if self.primary_policy.touch(node_id) || self.scan_policy.touch(node_id)
         {
             return;
         }

@@ -19,7 +19,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tempfile::TempDir;
 
-fn open_env(dir: &std::path::Path, cache_bytes: u64) -> (Environment, Database) {
+fn open_env(
+    dir: &std::path::Path,
+    cache_bytes: u64,
+) -> (Environment, Database) {
     let mut cfg = EnvironmentConfig::new(dir.to_path_buf());
     cfg.set_allow_create(true);
     cfg.set_transactional(true);

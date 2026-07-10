@@ -12,7 +12,8 @@ use std::sync::Arc;
 /// After release (guard drop), re-acquisition always succeeds.
 #[hegel::test]
 fn exclusive_latch_acquire_release_cycle(tc: hegel::TestCase) {
-    let iterations = tc.draw(generators::integers::<u32>().min_value(1).max_value(19));
+    let iterations =
+        tc.draw(generators::integers::<u32>().min_value(1).max_value(19));
     let latch = ExclusiveLatch::named("prop-test");
     for _ in 0..iterations {
         {
@@ -38,7 +39,8 @@ fn exclusive_latch_try_acquire_succeeds() {
 /// Latch context name is preserved.
 #[hegel::test]
 fn exclusive_latch_preserves_name(tc: hegel::TestCase) {
-    let name = tc.draw(generators::from_regex(r"[a-zA-Z0-9_-]{1,64}").fullmatch(true));
+    let name =
+        tc.draw(generators::from_regex(r"[a-zA-Z0-9_-]{1,64}").fullmatch(true));
     let latch = ExclusiveLatch::new(LatchContext::new(name.clone()));
     assert_eq!(&latch.context().name, &name);
 }
@@ -50,7 +52,8 @@ fn exclusive_latch_preserves_name(tc: hegel::TestCase) {
 /// Multiple shared acquires succeed simultaneously from different threads.
 #[hegel::test]
 fn shared_latch_multiple_readers(tc: hegel::TestCase) {
-    let num_readers = tc.draw(generators::integers::<u32>().min_value(2).max_value(7));
+    let num_readers =
+        tc.draw(generators::integers::<u32>().min_value(2).max_value(7));
     let latch = Arc::new(SharedLatch::named("prop-shared", false));
 
     // Acquire a shared lock from the main thread
@@ -76,7 +79,8 @@ fn shared_latch_multiple_readers(tc: hegel::TestCase) {
 /// Exclusive acquisition after release always succeeds.
 #[hegel::test]
 fn shared_latch_exclusive_acquire_release(tc: hegel::TestCase) {
-    let iterations = tc.draw(generators::integers::<u32>().min_value(1).max_value(19));
+    let iterations =
+        tc.draw(generators::integers::<u32>().min_value(1).max_value(19));
     let latch = SharedLatch::named("prop-exclusive", false);
     for _ in 0..iterations {
         {
@@ -101,7 +105,8 @@ fn shared_latch_exclusive_only_mode() {
 /// SharedLatch context name is preserved.
 #[hegel::test]
 fn shared_latch_preserves_name(tc: hegel::TestCase) {
-    let name = tc.draw(generators::from_regex(r"[a-zA-Z0-9_-]{1,64}").fullmatch(true));
+    let name =
+        tc.draw(generators::from_regex(r"[a-zA-Z0-9_-]{1,64}").fullmatch(true));
     let latch = SharedLatch::new(LatchContext::new(name.clone()), false);
     assert_eq!(&latch.context().name, &name);
 }

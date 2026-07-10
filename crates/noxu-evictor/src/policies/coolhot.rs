@@ -96,11 +96,7 @@ struct CoolHotState {
 
 impl CoolHotState {
     fn new() -> Self {
-        Self {
-            list: SlabList::new(),
-            state: HashMap::new(),
-            hand: u64::MAX,
-        }
+        Self { list: SlabList::new(), state: HashMap::new(), hand: u64::MAX }
     }
 
     /// Admit a node COOL (probationary).  No-op if already tracked.
@@ -167,7 +163,8 @@ impl CoolHotState {
             if candidate == u64::MAX {
                 break;
             }
-            let st = self.state.get(&candidate).copied().unwrap_or(CoolState(0));
+            let st =
+                self.state.get(&candidate).copied().unwrap_or(CoolState(0));
 
             if st.is_hot() {
                 if force_cool {
@@ -437,7 +434,10 @@ mod tests {
         }
         p.trickle_cool(100); // consume ref bits
         let cooled = p.trickle_cool(3);
-        assert!(cooled <= 3, "trickle must respect the budget; cooled {cooled}");
+        assert!(
+            cooled <= 3,
+            "trickle must respect the budget; cooled {cooled}"
+        );
     }
 
     #[test]

@@ -79,7 +79,8 @@ fn prop_vlsn_range_first_le_last(tc: hegel::TestCase) {
 // Additional: VlsnRange with_range always satisfies first <= last.
 #[hegel::test]
 fn prop_vlsn_range_with_range_valid(tc: hegel::TestCase) {
-    let first = tc.draw(generators::integers::<u64>().min_value(1).max_value(9999));
+    let first =
+        tc.draw(generators::integers::<u64>().min_value(1).max_value(9999));
     let delta = tc.draw(generators::integers::<u64>().max_value(9999));
     let last = first.saturating_add(delta);
     let range = VlsnRange::with_range(first, last);
@@ -111,9 +112,11 @@ fn prop_vlsn_range_contains(tc: hegel::TestCase) {
 // Additional: VlsnRange merge preserves first <= last.
 #[hegel::test]
 fn prop_vlsn_range_merge_valid(tc: hegel::TestCase) {
-    let first_a = tc.draw(generators::integers::<u64>().min_value(1).max_value(4999));
+    let first_a =
+        tc.draw(generators::integers::<u64>().min_value(1).max_value(4999));
     let delta_a = tc.draw(generators::integers::<u64>().max_value(4999));
-    let first_b = tc.draw(generators::integers::<u64>().min_value(1).max_value(4999));
+    let first_b =
+        tc.draw(generators::integers::<u64>().min_value(1).max_value(4999));
     let delta_b = tc.draw(generators::integers::<u64>().max_value(4999));
     let last_a = first_a.saturating_add(delta_a);
     let last_b = first_b.saturating_add(delta_b);
@@ -199,7 +202,8 @@ fn prop_acceptor_promised_term_monotone(tc: hegel::TestCase) {
 fn prop_acceptor_promise_contract(tc: hegel::TestCase) {
     let msgs: Vec<AcceptorMsg> =
         tc.draw(generators::vecs(acceptor_msg(50)).max_size(15));
-    let probe_term = tc.draw(generators::integers::<u64>().min_value(1).max_value(200));
+    let probe_term =
+        tc.draw(generators::integers::<u64>().min_value(1).max_value(200));
     let acceptor = PersistentAcceptorState::in_memory();
     for msg in &msgs {
         match msg {
@@ -245,7 +249,8 @@ fn prop_acceptor_promise_contract(tc: hegel::TestCase) {
 fn prop_acceptor_accept_contract(tc: hegel::TestCase) {
     let msgs: Vec<AcceptorMsg> =
         tc.draw(generators::vecs(acceptor_msg(50)).max_size(15));
-    let probe_term = tc.draw(generators::integers::<u64>().min_value(1).max_value(200));
+    let probe_term =
+        tc.draw(generators::integers::<u64>().min_value(1).max_value(200));
     let probe_master_byte = tc.draw(generators::integers::<u8>());
     let acceptor = PersistentAcceptorState::in_memory();
     for msg in &msgs {

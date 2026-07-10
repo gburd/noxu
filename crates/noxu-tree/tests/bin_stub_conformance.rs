@@ -22,8 +22,8 @@
 //! If this test ever fails, the runtime stub has drifted from the JE-correct
 //! semantics — fix the STUB to match the oracle.
 
-use std::collections::HashSet;
 use hegel::generators;
+use std::collections::HashSet;
 
 use noxu_tree::tree::BinStub;
 use noxu_util::{Lsn, NULL_LSN};
@@ -238,9 +238,8 @@ fn insert_then_layout_agrees(tc: hegel::TestCase) {
 #[hegel::test(test_cases = 256)]
 fn find_entry_agrees(tc: hegel::TestCase) {
     let keys = tc.draw(distinct_keys(40));
-    let probes: Vec<Vec<u8>> = tc.draw(
-        generators::vecs(generators::binary().max_size(15)).max_size(19),
-    );
+    let probes: Vec<Vec<u8>> = tc
+        .draw(generators::vecs(generators::binary().max_size(15)).max_size(19));
     let mut stub = empty_stub();
     let mut oracle = BinOracle::new();
     for (i, k) in keys.iter().enumerate() {

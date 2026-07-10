@@ -54,9 +54,9 @@
 use std::sync::atomic::Ordering;
 
 use noxu_log::consolidation::{ConsolidationArray, Join, Request};
+use shuttle::sync::Arc;
 use shuttle::sync::Mutex;
 use shuttle::sync::atomic::{AtomicU64, AtomicUsize};
-use shuttle::sync::Arc;
 
 /// Interleavings shuttle explores per test.
 const ITERATIONS: usize = 5_000;
@@ -91,7 +91,8 @@ fn consolidation_lsn_monotonic_no_loss() {
                 Arc::new(ConsolidationArray::new());
             // Stands in for `log_write_latch`: the leader holds it for the
             // whole batch, so leaders of successive batches serialise on it.
-            let lwl = Arc::new(Mutex::new(LsnState { next: 0, last: u64::MAX }));
+            let lwl =
+                Arc::new(Mutex::new(LsnState { next: 0, last: u64::MAX }));
             // Records each committer's assignment (indexed by committer id).
             let results: Arc<Vec<Mutex<Option<Assigned>>>> =
                 Arc::new((0..N).map(|_| Mutex::new(None)).collect());
@@ -196,8 +197,7 @@ fn oracle(
     // equal the LSN before it (sentinel MAX for the first).
     all.sort_unstable_by_key(|a| a.lsn);
     for (i, a) in all.iter().enumerate() {
-        let expected_prev =
-            if i == 0 { u64::MAX } else { all[i - 1].lsn };
+        let expected_prev = if i == 0 { u64::MAX } else { all[i - 1].lsn };
         assert_eq!(
             a.prev, expected_prev,
             "prev_offset chain broken at LSN {}: prev={} expected {}",
