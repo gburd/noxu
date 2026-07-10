@@ -50,6 +50,10 @@ noxu-xa = { path = "../../crates/noxu-xa" }
 parking_lot = { workspace = true }
 tempfile = "3"
 rand = { version = "0.8", features = ["small_rng"] }
+# Tokio: BENCH-DRIVER-ONLY (the xbench BENCH_HARNESS=tokio async-client harness;
+# dispatches the sync engine's blocking ops via spawn_blocking). The engine core
+# stays sync — only this bench binary and noxu-rep use tokio.
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
 
 # In-process perf_event_open sampler (CPU + off-CPU/context-switch stacks) for
 # the `xbench --profile` diagnostic mode. Linux-only; needs frame pointers

@@ -11,6 +11,25 @@
 //!      BENCH_NO_WAIT(0|1)  (1 = per-txn immediate-abort-on-conflict)
 //!      BENCH_TAIL_INTERVAL(0=off, else per-N-sec TAIL series; default 0)
 //!
+//! Concurrency harness (BENCH-DRIVER-ONLY — does NOT make the engine async):
+//!      BENCH_HARNESS(threads|tokio; default threads)
+//!        threads: BENCH_THREADS std::thread workers (the original path; all
+//!                 prior numbers stay directly comparable).
+//!        tokio:   a multi-threaded Tokio runtime driving BENCH_THREADS logical
+//!                 client TASKS. Noxu's DB ops are BLOCKING sync calls, so each
+//!                 task dispatches its per-iteration op through
+//!                 tokio::task::spawn_blocking (the sqlx/rusqlite-with-blocking-
+//!                 driver pattern) — modelling the async-service deployment
+//!                 shape (thousands of logical clients over a bounded blocking
+//!                 pool). The engine stays sync; only the CLIENT is async.
+//!      BENCH_TOKIO_WORKERS  tokio runtime worker_threads    (default num_cpus)
+//!      BENCH_BLOCKING_POOL  tokio max_blocking_threads      (default 512)
+//!                 The blocking pool bounds concurrent in-flight DB ops; with
+//!                 more logical tasks than pool threads, ops queue (the
+//!                 realistic async back-pressure shape). Defaults to 512 rather
+//!                 than BENCH_THREADS so a 1000+-task run still bounds OS
+//!                 threads; raise it to BENCH_THREADS to remove queueing.
+//!
 //! "Where Noxu leads" metrics (see docs/src/operations/lead-benchmarks.md):
 //!   * Tail-latency stability: RESULT emits p999/p9999/max; set
 //!     BENCH_TAIL_INTERVAL=1 for a per-second `TAIL` series so flatness is
@@ -210,6 +229,215 @@ fn proc_write_bytes() -> u64 {
         .unwrap_or(0)
 }
 
+/// Per-task counters accumulated across op-iterations (flushed to the shared
+/// atomics at the end). Identical semantics for both harnesses.
+#[derive(Default)]
+struct OpDelta {
+    aborts: u64,
+    writes: u64,
+    reads: u64,
+}
+
+/// Per-task mutable state that both harnesses own one of per worker/task.
+/// For the tokio harness this is moved into spawn_blocking and returned back
+/// out each iteration (so no state is shared across the async await point).
+struct TaskState {
+    rng: Rng,
+    zipf: Zipf,
+    value: Vec<u8>,
+    insert_ctr: u64,
+    tid: usize,
+    // Prebuilt txn config (None = engine default). Cloned per task.
+    txn_cfg: Option<TransactionConfig>,
+}
+
+impl TaskState {
+    #[inline]
+    fn begin(
+        cfg: &Option<TransactionConfig>,
+        env: &Environment,
+    ) -> Result<noxu_db::Transaction, noxu_db::NoxuError> {
+        match cfg {
+            Some(c) => env.begin_transaction(Some(c)),
+            None => env.begin_transaction(None),
+        }
+    }
+}
+
+/// Run ONE op-iteration: the workload match (begin → get/put/commit) wrapped in
+/// the t0..t1 latency span, recorded into `hist`. This is the shared body BOTH
+/// harnesses call, so the workload logic is single-sourced and cannot drift.
+/// Returns the per-op counter deltas.
+///
+/// For the thread harness it is called directly on the worker thread; for the
+/// tokio harness it is called inside `spawn_blocking` (all Noxu ops are
+/// blocking sync calls). The latency span (t0..t1) covers ONLY the DB work —
+/// identical to the thread harness — so the histograms are comparable; the
+/// tokio harness's spawn_blocking / channel overhead is deliberately outside
+/// this span (it is the harness's own overhead, measured via throughput/queueing,
+/// not attributed to the op).
+fn run_one_op(
+    st: &mut TaskState,
+    env: &Environment,
+    db: &noxu_db::Database,
+    hist: &Hist,
+    workload: &str,
+    records: u64,
+) -> OpDelta {
+    let mut d = OpDelta::default();
+    // Split-borrow the per-task state up front so the workload match can hold a
+    // &mut on the RNG while immutably reading the value / txn config / zipf.
+    let TaskState { rng, zipf, value, insert_ctr, tid, txn_cfg } = st;
+    let value: &[u8] = value;
+    let tid = *tid;
+    let t0 = Instant::now();
+    match workload {
+        "ycsb_a" => {
+            let k = key_bytes(zipf.next(rng));
+            if rng.pct() < 50 {
+                if let Ok(t) = TaskState::begin(txn_cfg, env) {
+                    if db.get_in(&t, k).is_ok() {
+                        d.reads += 1;
+                    }
+                    let _ = t.commit();
+                }
+            } else if let Ok(t) = TaskState::begin(txn_cfg, env) {
+                if db.put_in(&t, k, value).is_ok() {
+                    if t.commit().is_err() {
+                        d.aborts += 1;
+                    } else {
+                        d.writes += 1;
+                    }
+                } else {
+                    let _ = t.abort();
+                    d.aborts += 1;
+                }
+            }
+        }
+        "ycsb_c" => {
+            let k = key_bytes(zipf.next(rng));
+            if let Ok(t) = TaskState::begin(txn_cfg, env) {
+                if db.get_in(&t, k).is_ok() {
+                    d.reads += 1;
+                }
+                let _ = t.commit();
+            }
+        }
+        "tdb_write" => {
+            let id = *insert_ctr;
+            *insert_ctr += 1;
+            if let Ok(t) = TaskState::begin(txn_cfg, env) {
+                if db.put_in(&t, key_bytes(id), value).is_ok() {
+                    if t.commit().is_err() {
+                        d.aborts += 1;
+                    } else {
+                        d.writes += 1;
+                    }
+                } else {
+                    let _ = t.abort();
+                    d.aborts += 1;
+                }
+            }
+        }
+        "txn_mix" => {
+            if let Ok(t) = TaskState::begin(txn_cfg, env) {
+                let mut ok = true;
+                let mut puts = 0u64;
+                let mut gets = 0u64;
+                for j in 0..4 {
+                    let k = key_bytes(zipf.next(rng));
+                    let r = match j {
+                        0 | 1 => db.put_in(&t, k, value).map(|_| {
+                            puts += 1;
+                        }),
+                        2 => db.get_in(&t, k).map(|_| {
+                            gets += 1;
+                        }),
+                        _ => db.delete_in(&t, k).map(|_| ()),
+                    };
+                    if r.is_err() {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    if t.commit().is_err() {
+                        d.aborts += 1;
+                    } else {
+                        d.writes += puts;
+                        d.reads += gets;
+                    }
+                } else {
+                    let _ = t.abort();
+                    d.aborts += 1;
+                }
+            }
+        }
+        "hotset" => {
+            // 10% of keys get 90% of ops
+            let hot = records / 10;
+            let k = if rng.pct() < 90 {
+                key_bytes(rng.below(hot.max(1)))
+            } else {
+                key_bytes(rng.below(records))
+            };
+            if rng.pct() < 98 {
+                if let Ok(t) = TaskState::begin(txn_cfg, env) {
+                    if db.put_in(&t, k, value).is_ok() {
+                        if t.commit().is_err() {
+                            d.aborts += 1;
+                        } else {
+                            d.writes += 1;
+                        }
+                    } else {
+                        let _ = t.abort();
+                        d.aborts += 1;
+                    }
+                }
+            } else if let Ok(t) = TaskState::begin(txn_cfg, env) {
+                if db.get_in(&t, k).is_ok() {
+                    d.reads += 1;
+                }
+                let _ = t.commit();
+            }
+        }
+        "scan_under_write" => {
+            if tid % 2 == 0 {
+                // scanner: forward scan of 100 records from a random start
+                if let Ok(t) = TaskState::begin(txn_cfg, env) {
+                    if let Ok(mut cur) = db.open_cursor_in(&t, None) {
+                        let _ = cur.seek(key_bytes(zipf.next(rng)));
+                        for _ in 0..100 {
+                            if cur.next().ok().flatten().is_none() {
+                                break;
+                            }
+                            d.reads += 1;
+                        }
+                    }
+                    let _ = t.commit();
+                }
+            } else {
+                let k = key_bytes(zipf.next(rng));
+                if let Ok(t) = TaskState::begin(txn_cfg, env) {
+                    if db.put_in(&t, k, value).is_ok() {
+                        if t.commit().is_err() {
+                            d.aborts += 1;
+                        } else {
+                            d.writes += 1;
+                        }
+                    } else {
+                        let _ = t.abort();
+                        d.aborts += 1;
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    hist.record(t0.elapsed().as_micros() as u64);
+    d
+}
+
 fn main() {
     let dir = envs("BENCH_DIR", "/tmp/noxu-xbench");
     let records = envp("BENCH_RECORDS", 10_000_000);
@@ -222,6 +450,13 @@ fn main() {
     let seed = envp("BENCH_SEED", 0xC0FFEE);
     let isolation = envs("BENCH_ISOLATION", "default");
     let no_wait = envs("BENCH_NO_WAIT", "0") == "1";
+    // Concurrency harness selection (bench-driver-only; engine stays sync).
+    let harness = envs("BENCH_HARNESS", "threads");
+    let num_cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1) as u64;
+    let tokio_workers = envp("BENCH_TOKIO_WORKERS", num_cpus) as usize;
+    let blocking_pool = envp("BENCH_BLOCKING_POOL", 512) as usize;
 
     if fstype(&dir).contains("tmpfs") {
         eprintln!("ABORT: {dir} is tmpfs; use real NVMe");
@@ -234,8 +469,15 @@ fn main() {
         _ => Durability::COMMIT_SYNC,
     };
 
+    let harness_desc = if harness == "tokio" {
+        format!(
+            "harness=tokio tokio_workers={tokio_workers} blocking_pool={blocking_pool}"
+        )
+    } else {
+        "harness=threads".to_string()
+    };
     println!(
-        "=== NOXU xbench: workload={workload} records={records} cache={}GiB value={value_size} threads={threads} secs={seconds} dur={durability} iso={isolation} no_wait={no_wait} ===",
+        "=== NOXU xbench: workload={workload} records={records} cache={}GiB value={value_size} threads={threads} secs={seconds} dur={durability} iso={isolation} no_wait={no_wait} {harness_desc} ===",
         cache / 1024 / 1024 / 1024
     );
 
@@ -375,232 +617,149 @@ fn main() {
         None
     };
 
-    let handles: Vec<_> = (0..threads)
-        .map(|tid| {
-            let env = Arc::clone(&env);
-            let db = Arc::clone(&db);
-            let stop = Arc::clone(&stop);
-            let ops = Arc::clone(&ops);
-            let aborts = Arc::clone(&aborts);
-            let writes = Arc::clone(&writes);
-            let reads = Arc::clone(&reads);
-            let hist = Arc::clone(&hist);
-            let workload = workload.clone();
-            let isolation = isolation.clone();
-            let profiler = profiler_shared.clone();
-            std::thread::spawn(move || {
-                // off-CPU profiling: register this worker's tid so the
-                // sampler opens a per-thread event fd for it (off-CPU perf
-                // events don't inherit to child threads).
-                if let Some(p) = &profiler {
-                    p.lock().unwrap().track_current_thread();
-                }
-                let mut rng = Rng(seed ^ (tid as u64).wrapping_mul(0x9E3779B9));
-                let zipf = Zipf::new(records);
-                let value = vec![0x5Au8; value_size];
-                let insert_ctr =
-                    AtomicU64::new(records + tid as u64 * 100_000_000);
-                // Isolation + no_wait both live on TransactionConfig; build
-                // one config if either knob is non-default.
-                let txn_cfg = if isolation != "default" || no_wait {
-                    let mut c = TransactionConfig::new();
-                    match isolation.as_str() {
-                        "serializable" => {
-                            c = c.with_serializable_isolation(true)
-                        }
-                        // read_uncommitted skips the record-lock probe on reads
-                        // (engine: is_read_uncommitted_default / lock_ln early return).
-                        "read_uncommitted" => c = c.with_read_uncommitted(true),
-                        _ => {}
-                    }
-                    if no_wait {
-                        c = c.with_no_wait(true);
-                    }
-                    Some(c)
-                } else {
-                    None
-                };
-                let begin = |env: &Environment| match &txn_cfg {
-                    Some(c) => env.begin_transaction(Some(c)),
-                    None => env.begin_transaction(None),
-                };
-                let mut local = 0u64;
-                let mut labort = 0u64;
-                // Committed record-writes this thread (per-arm; see below).
-                let mut lwrites = 0u64;
-                let mut lreads = 0u64;
-                while !stop.load(Ordering::Relaxed) {
-                    let t0 = Instant::now();
-                    match workload.as_str() {
-                        "ycsb_a" => {
-                            let k = key_bytes(zipf.next(&mut rng));
-                            if rng.pct() < 50 {
-                                if let Ok(t) = begin(&env) {
-                                    if db.get_in(&t, k).is_ok() {
-                                        lreads += 1;
-                                    }
-                                    let _ = t.commit();
-                                }
-                            } else if let Ok(t) = begin(&env) {
-                                if db.put_in(&t, k, &value).is_ok() {
-                                    if t.commit().is_err() {
-                                        labort += 1;
-                                    } else {
-                                        lwrites += 1;
-                                    }
-                                } else {
-                                    let _ = t.abort();
-                                    labort += 1;
-                                }
-                            }
-                        }
-                        "ycsb_c" => {
-                            let k = key_bytes(zipf.next(&mut rng));
-                            if let Ok(t) = begin(&env) {
-                                if db.get_in(&t, k).is_ok() {
-                                    lreads += 1;
-                                }
-                                let _ = t.commit();
-                            }
-                        }
-                        "tdb_write" => {
-                            let id = insert_ctr.fetch_add(1, Ordering::Relaxed);
-                            if let Ok(t) = begin(&env) {
-                                if db.put_in(&t, key_bytes(id), &value).is_ok()
-                                {
-                                    if t.commit().is_err() {
-                                        labort += 1;
-                                    } else {
-                                        lwrites += 1;
-                                    }
-                                } else {
-                                    let _ = t.abort();
-                                    labort += 1;
-                                }
-                            }
-                        }
-                        "txn_mix" => {
-                            if let Ok(t) = begin(&env) {
-                                let mut ok = true;
-                                let mut puts = 0u64;
-                                let mut gets = 0u64;
-                                for j in 0..4 {
-                                    let k = key_bytes(zipf.next(&mut rng));
-                                    let r = match j {
-                                        0 | 1 => {
-                                            db.put_in(&t, k, &value).map(|_| {
-                                                puts += 1;
-                                            })
-                                        }
-                                        2 => db.get_in(&t, k).map(|_| {
-                                            gets += 1;
-                                        }),
-                                        _ => db.delete_in(&t, k).map(|_| ()),
-                                    };
-                                    if r.is_err() {
-                                        ok = false;
-                                        break;
-                                    }
-                                }
-                                if ok {
-                                    if t.commit().is_err() {
-                                        labort += 1;
-                                    } else {
-                                        lwrites += puts;
-                                        lreads += gets;
-                                    }
-                                } else {
-                                    let _ = t.abort();
-                                    labort += 1;
-                                }
-                            }
-                        }
-                        "hotset" => {
-                            // 10% of keys get 90% of ops
-                            let hot = records / 10;
-                            let k = if rng.pct() < 90 {
-                                key_bytes(rng.below(hot.max(1)))
-                            } else {
-                                key_bytes(rng.below(records))
-                            };
-                            if rng.pct() < 98 {
-                                if let Ok(t) = begin(&env) {
-                                    if db.put_in(&t, k, &value).is_ok() {
-                                        if t.commit().is_err() {
-                                            labort += 1;
-                                        } else {
-                                            lwrites += 1;
-                                        }
-                                    } else {
-                                        let _ = t.abort();
-                                        labort += 1;
-                                    }
-                                }
-                            } else if let Ok(t) = begin(&env) {
-                                if db.get_in(&t, k).is_ok() {
-                                    lreads += 1;
-                                }
-                                let _ = t.commit();
-                            }
-                        }
-                        "scan_under_write" => {
-                            if tid % 2 == 0 {
-                                // scanner: forward scan of 100 records from a random start
-                                if let Ok(t) = begin(&env) {
-                                    if let Ok(mut cur) =
-                                        db.open_cursor_in(&t, None)
-                                    {
-                                        let _ = cur.seek(key_bytes(
-                                            zipf.next(&mut rng),
-                                        ));
-                                        for _ in 0..100 {
-                                            if cur
-                                                .next()
-                                                .ok()
-                                                .flatten()
-                                                .is_none()
-                                            {
-                                                break;
-                                            }
-                                            lreads += 1;
-                                        }
-                                    }
-                                    let _ = t.commit();
-                                }
-                            } else {
-                                let k = key_bytes(zipf.next(&mut rng));
-                                if let Ok(t) = begin(&env) {
-                                    if db.put_in(&t, k, &value).is_ok() {
-                                        if t.commit().is_err() {
-                                            labort += 1;
-                                        } else {
-                                            lwrites += 1;
-                                        }
-                                    } else {
-                                        let _ = t.abort();
-                                        labort += 1;
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                    hist.record(t0.elapsed().as_micros() as u64);
-                    local += 1;
-                    ops.fetch_add(1, Ordering::Relaxed);
-                }
-                let _ = local;
-                aborts.fetch_add(labort, Ordering::Relaxed);
-                writes.fetch_add(lwrites, Ordering::Relaxed);
-                reads.fetch_add(lreads, Ordering::Relaxed);
-            })
-        })
-        .collect();
+    // Build one TaskState per logical worker/task. Same construction for both
+    // harnesses so key sequences / seeds / txn config are identical.
+    let txn_cfg_template = if isolation != "default" || no_wait {
+        let mut c = TransactionConfig::new();
+        match isolation.as_str() {
+            "serializable" => c = c.with_serializable_isolation(true),
+            // read_uncommitted skips the record-lock probe on reads
+            // (engine: is_read_uncommitted_default / lock_ln early return).
+            "read_uncommitted" => c = c.with_read_uncommitted(true),
+            _ => {}
+        }
+        if no_wait {
+            c = c.with_no_wait(true);
+        }
+        Some(c)
+    } else {
+        None
+    };
+    let mk_state = |tid: usize| TaskState {
+        rng: Rng(seed ^ (tid as u64).wrapping_mul(0x9E3779B9)),
+        zipf: Zipf::new(records),
+        value: vec![0x5Au8; value_size],
+        insert_ctr: records + tid as u64 * 100_000_000,
+        tid,
+        txn_cfg: txn_cfg_template.clone(),
+    };
 
-    std::thread::sleep(std::time::Duration::from_secs(seconds));
-    stop.store(true, Ordering::Relaxed);
-    for h in handles {
-        h.join().unwrap();
+    match harness.as_str() {
+        // ── Tokio harness: BENCH_THREADS logical client TASKS on a
+        // multi-threaded runtime; each per-iteration op runs in
+        // spawn_blocking (Noxu ops are blocking sync calls) so the async
+        // workers never stall. Models the async-service shape: many logical
+        // clients over a bounded blocking pool. ──
+        "tokio" => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(tokio_workers)
+                .max_blocking_threads(blocking_pool)
+                .enable_time()
+                .build()
+                .expect("build tokio runtime");
+            rt.block_on(async {
+                let mut tasks = Vec::with_capacity(threads);
+                for tid in 0..threads {
+                    let env = Arc::clone(&env);
+                    let db = Arc::clone(&db);
+                    let stop = Arc::clone(&stop);
+                    let ops = Arc::clone(&ops);
+                    let aborts = Arc::clone(&aborts);
+                    let writes = Arc::clone(&writes);
+                    let reads = Arc::clone(&reads);
+                    let hist = Arc::clone(&hist);
+                    let workload = workload.clone();
+                    let mut state = mk_state(tid);
+                    tasks.push(tokio::spawn(async move {
+                        let (mut labort, mut lwrites, mut lreads) = (0, 0, 0);
+                        while !stop.load(Ordering::Relaxed) {
+                            // Dispatch ONE op-iteration to the blocking pool.
+                            // The TaskState is moved in and returned back out so
+                            // no per-task state is held across the await point.
+                            let env = Arc::clone(&env);
+                            let db = Arc::clone(&db);
+                            let hist = Arc::clone(&hist);
+                            let workload = workload.clone();
+                            let (st, d) = tokio::task::spawn_blocking(
+                                move || {
+                                    let d = run_one_op(
+                                        &mut state, &env, &db, &hist, &workload,
+                                        records,
+                                    );
+                                    (state, d)
+                                },
+                            )
+                            .await
+                            .expect("blocking op panicked");
+                            state = st;
+                            labort += d.aborts;
+                            lwrites += d.writes;
+                            lreads += d.reads;
+                            ops.fetch_add(1, Ordering::Relaxed);
+                        }
+                        aborts.fetch_add(labort, Ordering::Relaxed);
+                        writes.fetch_add(lwrites, Ordering::Relaxed);
+                        reads.fetch_add(lreads, Ordering::Relaxed);
+                    }));
+                }
+                // Timer: let the tasks run for `seconds`, then signal stop.
+                tokio::time::sleep(std::time::Duration::from_secs(seconds))
+                    .await;
+                stop.store(true, Ordering::Relaxed);
+                for t in tasks {
+                    t.await.expect("task panicked");
+                }
+            });
+        }
+        // ── Thread harness (default): the original std::thread path,
+        // unchanged, so all prior numbers stay directly comparable. ──
+        _ => {
+            let handles: Vec<_> = (0..threads)
+                .map(|tid| {
+                    let env = Arc::clone(&env);
+                    let db = Arc::clone(&db);
+                    let stop = Arc::clone(&stop);
+                    let ops = Arc::clone(&ops);
+                    let aborts = Arc::clone(&aborts);
+                    let writes = Arc::clone(&writes);
+                    let reads = Arc::clone(&reads);
+                    let hist = Arc::clone(&hist);
+                    let workload = workload.clone();
+                    let profiler = profiler_shared.clone();
+                    let mut state = mk_state(tid);
+                    std::thread::spawn(move || {
+                        // off-CPU profiling: register this worker's tid so the
+                        // sampler opens a per-thread event fd for it (off-CPU
+                        // perf events don't inherit to child threads).
+                        if let Some(p) = &profiler {
+                            p.lock().unwrap().track_current_thread();
+                        }
+                        let mut labort = 0u64;
+                        let mut lwrites = 0u64;
+                        let mut lreads = 0u64;
+                        while !stop.load(Ordering::Relaxed) {
+                            let d = run_one_op(
+                                &mut state, &env, &db, &hist, &workload,
+                                records,
+                            );
+                            labort += d.aborts;
+                            lwrites += d.writes;
+                            lreads += d.reads;
+                            ops.fetch_add(1, Ordering::Relaxed);
+                        }
+                        aborts.fetch_add(labort, Ordering::Relaxed);
+                        writes.fetch_add(lwrites, Ordering::Relaxed);
+                        reads.fetch_add(lreads, Ordering::Relaxed);
+                    })
+                })
+                .collect();
+
+            std::thread::sleep(std::time::Duration::from_secs(seconds));
+            stop.store(true, Ordering::Relaxed);
+            for h in handles {
+                h.join().unwrap();
+            }
+        }
     }
     if let Some(p) = profiler_shared.as_ref() {
         p.lock().unwrap().report(30);
@@ -659,7 +818,7 @@ fn main() {
     };
 
     println!(
-        "RESULT engine=noxu workload={workload} iso={isolation} dur={durability} threads={threads} \
+        "RESULT engine=noxu workload={workload} iso={isolation} dur={durability} threads={threads} harness={harness} \
 no_wait={no_wait} throughput={:.0} ops/s ops={total} aborts={ab} abort_rate={:.4} \
 p50={} p90={} p99={} p999={} p9999={} max={} \
 cache_hit_rate={:.4} committed_reads={committed_reads} ln_faults={ln_faults} cached_bins={cached_bins} lru_size={lru_size} ops_per_gb={:.0} \
