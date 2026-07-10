@@ -197,14 +197,14 @@ static inline int tdb_get(tidesdb_txn_t *txn, tidesdb_column_family_t *cf,
     int r = tidesdb_txn_get(txn, cf, k, ks, &out, &out_sz);
     /* TODO(api): confirm out is malloc'd and freed with free(); if TidesDB
      * exposes a dedicated deallocator, swap free() for it here. */
-    if (out) free(out);
+    if (out) tidesdb_free(out);
     return r;
 }
 
 /* Delete. Returns 0 on success. */
 static inline int tdb_del(tidesdb_txn_t *txn, tidesdb_column_family_t *cf,
                           const uint8_t *k, size_t ks) {
-    return tidesdb_txn_delete(txn, cf, k, ks, 0);
+    return tidesdb_txn_delete(txn, cf, k, ks);
 }
 
 /* ---- shared benchmark state ----------------------------------------- */
@@ -507,13 +507,10 @@ int main(void) {
      * value is. Adjust TDB_ISO_SERIALIZABLE below if the name differs.
      */
 #ifndef TDB_ISO_READ_COMMITTED
-#define TDB_ISO_READ_COMMITTED tdb_isolation_read_committed
+#define TDB_ISO_READ_COMMITTED TDB_ISOLATION_READ_COMMITTED
 #endif
-    /* TODO(api): replace with the real strongest-isolation constant, e.g.
-     * tdb_isolation_serializable or tdb_isolation_snapshot. Falling back to
-     * read_committed keeps the build green until confirmed. */
 #ifndef TDB_ISO_SERIALIZABLE
-#define TDB_ISO_SERIALIZABLE tdb_isolation_serializable
+#define TDB_ISO_SERIALIZABLE TDB_ISOLATION_SERIALIZABLE
 #endif
     tidesdb_isolation_level_t iso =
         (strcmp(isolation, "serializable") == 0)
@@ -557,8 +554,8 @@ int main(void) {
         /* may already exist from a prior run in a persisted dir; continue to
          * get it below. */
     }
-    tidesdb_column_family_t *cf = NULL;
-    if (tidesdb_get_column_family(db, "xbench", &cf) != 0 || !cf) {
+    tidesdb_column_family_t *cf = tidesdb_get_column_family(db, "xbench");
+    if (!cf) {
         fprintf(stderr, "tidesdb_get_column_family(xbench) failed\n");
         return 1;
     }

@@ -446,6 +446,9 @@ int main(void) {
     const char *workload  = envs("BENCH_WORKLOAD", "ycsb_a");
     uint64_t seed         = envp("BENCH_SEED", 0xC0FFEEULL);
     const char *isolation = envs("BENCH_ISOLATION", "default");
+    /* WT table type: "btree" (default row-store) or "lsm". LSM is the fairer
+     * comparison to JE/Noxu's append-only-WAL-logged B-tree (LSM-like). */
+    const char *wt_type   = envs("BENCH_WT_TYPE", "btree");
 
     if (is_tmpfs(dir)) {
         fprintf(stderr, "ABORT: %s is tmpfs; use real NVMe\n", dir);
@@ -486,11 +489,11 @@ int main(void) {
      * Both default and serializable use snapshot to match Noxu's comparable run. */
 
     printf("=== WIREDTIGER xbench: workload=%s records=%llu cache=%lluGiB "
-           "value=%zu threads=%u secs=%llu dur=%s iso=%s ===\n",
+           "value=%zu threads=%u secs=%llu dur=%s iso=%s type=%s ===\n",
            workload, (unsigned long long)records,
            (unsigned long long)(cache / 1024 / 1024 / 1024),
            value_size, threads, (unsigned long long)seconds,
-           durability, isolation);
+           durability, isolation, wt_type);
     if (strcmp(isolation, "serializable") == 0)
         printf("   note: WiredTiger max isolation is snapshot; "
                "serializable run uses snapshot.\n");
@@ -507,7 +510,14 @@ int main(void) {
     WT_SESSION *setup;
     r = conn->open_session(conn, NULL, NULL, &setup);
     if (r != 0) { fprintf(stderr, "open_session: %s\n", wiredtiger_strerror(r)); return 1; }
-    r = setup->create(setup, "table:xbench", "key_format=u,value_format=u");
+    /* Row-store (btree) vs LSM. LSM keeps u/u key/value format but adds
+     * type=lsm so writes land in an in-memory chunk + background merges. */
+    char create_cfg[256];
+    bool use_lsm = (strcmp(wt_type, "lsm") == 0);
+    snprintf(create_cfg, sizeof create_cfg,
+             "key_format=u,value_format=u%s",
+             use_lsm ? ",type=lsm" : "");
+    r = setup->create(setup, "table:xbench", create_cfg);
     if (r != 0) { fprintf(stderr, "create: %s\n", wiredtiger_strerror(r)); return 1; }
     setup->close(setup, NULL);
 
@@ -578,10 +588,10 @@ int main(void) {
     double thr = el > 0 ? (double)total / el : 0.0;
     double abort_rate = total > 0 ? (double)ab / (double)total : 0.0;
 
-    printf("RESULT engine=wiredtiger workload=%s iso=%s dur=%s threads=%u "
+    printf("RESULT engine=wiredtiger workload=%s iso=%s dur=%s type=%s threads=%u "
            "throughput=%.0f ops/s ops=%llu aborts=%llu abort_rate=%.4f "
            "p50=%llu p90=%llu p99=%llu p999=%llu max=%llu\n",
-           workload, isolation, durability, threads,
+           workload, isolation, durability, wt_type, threads,
            thr, total, ab, abort_rate,
            (unsigned long long)hist_pct(&merged, 0.50),
            (unsigned long long)hist_pct(&merged, 0.90),
