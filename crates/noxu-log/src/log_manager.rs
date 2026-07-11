@@ -886,6 +886,15 @@ impl LogManager {
     /// LWL before the pwrite + fdatasync (matching JE, which flushes the
     /// buffer then fsyncs outside the held region of `mgrMutex`).
     pub fn flush_sync(&self) -> Result<Lsn> {
+        // target_lsn = 0 → "no LSN requirement, always fsync" (direct callers
+        // with no committer LSN to check against the watermark).
+        self.flush_sync_to(0)
+    }
+
+    /// [`Self::flush_sync`] with a committer's durable-LSN requirement so the
+    /// WriteQueue re-check in `flush_and_sync` can short-circuit a waiter whose
+    /// LSN a completed fdatasync already covered (JE enqueue-and-return).
+    fn flush_sync_to(&self, target_lsn: u64) -> Result<Lsn> {
         // The leader closure embodies JE `flushBeforeSync()` + `executeFSync()`,
         // run ONLY by the thread that wins the leader/waiter decision inside
         // `fsync_manager.flush_and_sync` (or by a timed-out thread).  Returns
@@ -975,7 +984,12 @@ impl LogManager {
 
         // Phase 1 (JE: synchronized(mgrMutex) leader/waiter decision) +
         // leader work + waiter piggyback, all inside flush_and_sync.
-        match self.fsync_manager.flush_and_sync(leader_work) {
+        // The `synced_watermark` reader lets a woken waiter short-circuit when
+        // a completed fdatasync already covered `target_lsn` (JE WriteQueue
+        // enqueue-and-return): no redundant fsync, the fix for the 1:1 convoy.
+        let synced = || self.last_synced_lsn.load(Ordering::Acquire);
+        match self.fsync_manager.flush_and_sync(target_lsn, synced, leader_work)
+        {
             Ok(eol) => {
                 // Durability watermark: advanced ONLY after a successful
                 // fdatasync.  With the bounded pipeline (max_leaders > 1) up to
@@ -1055,7 +1069,9 @@ impl LogManager {
                 return Ok(Lsn::from_u64(already_synced));
             }
         }
-        self.flush_sync()
+        // Pass the committer's LSN so a woken waiter can short-circuit when a
+        // completed fdatasync already covered it (WriteQueue enqueue-and-return).
+        self.flush_sync_to(lsn.as_u64())
     }
 
     /// Flushes all dirty write buffers to the OS page cache (no fsync).
