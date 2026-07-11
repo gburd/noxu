@@ -774,10 +774,14 @@ mod tests {
         let mgr = FsyncManager::new(0, 0);
         let count = Arc::new(AtomicUsize::new(0));
         let c = count.clone();
-        mgr.flush_and_sync(0, || 0, || {
-            c.fetch_add(1, Ordering::SeqCst);
-            Ok(0)
-        })
+        mgr.flush_and_sync(
+            0,
+            || 0,
+            || {
+                c.fetch_add(1, Ordering::SeqCst);
+                Ok(0)
+            },
+        )
         .unwrap();
         assert_eq!(count.load(Ordering::SeqCst), 1);
     }
@@ -796,12 +800,16 @@ mod tests {
             let b = Arc::clone(&barrier);
             handles.push(std::thread::spawn(move || {
                 b.wait();
-                mgr2.flush_and_sync(0, || 0, || {
-                    // Slow fsync so concurrent threads queue up.
-                    std::thread::sleep(Duration::from_millis(20));
-                    fc.fetch_add(1, Ordering::SeqCst);
-                    Ok(0)
-                })
+                mgr2.flush_and_sync(
+                    0,
+                    || 0,
+                    || {
+                        // Slow fsync so concurrent threads queue up.
+                        std::thread::sleep(Duration::from_millis(20));
+                        fc.fetch_add(1, Ordering::SeqCst);
+                        Ok(0)
+                    },
+                )
                 .unwrap();
             }));
         }
@@ -855,13 +863,17 @@ mod tests {
                     b.wait();
                     // Small stagger-free burst: all N hammer flush_and_sync.
                     for _ in 0..8 {
-                        m.flush_and_sync(0, || 0, || {
-                            // Slow "fsync" so siblings pile into the waiter
-                            // cohort while the leader is in the syscall.
-                            fc.fetch_add(1, Ordering::SeqCst);
-                            std::thread::sleep(Duration::from_millis(5));
-                            Ok(0)
-                        })
+                        m.flush_and_sync(
+                            0,
+                            || 0,
+                            || {
+                                // Slow "fsync" so siblings pile into the waiter
+                                // cohort while the leader is in the syscall.
+                                fc.fetch_add(1, Ordering::SeqCst);
+                                std::thread::sleep(Duration::from_millis(5));
+                                Ok(0)
+                            },
+                        )
                         .unwrap();
                     }
                 })
@@ -892,9 +904,11 @@ mod tests {
     #[test]
     fn test_fsync_error_propagated_to_waiters() {
         let mgr = FsyncManager::new(0, 0);
-        let result = mgr.flush_and_sync(0, || 0, || {
-            Err::<u64, _>(std::io::Error::other("simulated fsync failure"))
-        });
+        let result = mgr.flush_and_sync(
+            0,
+            || 0,
+            || Err::<u64, _>(std::io::Error::other("simulated fsync failure")),
+        );
         assert!(result.is_err());
         assert!(
             result.unwrap_err().to_string().contains("simulated fsync failure")
@@ -913,10 +927,14 @@ mod tests {
             let m = Arc::clone(&mgr);
             let fc = Arc::clone(&fsync_count);
             handles.push(std::thread::spawn(move || {
-                m.flush_and_sync(0, || 0, || {
-                    fc.fetch_add(1, Ordering::SeqCst);
-                    Ok(0)
-                })
+                m.flush_and_sync(
+                    0,
+                    || 0,
+                    || {
+                        fc.fetch_add(1, Ordering::SeqCst);
+                        Ok(0)
+                    },
+                )
                 .unwrap();
             }));
         }
@@ -939,10 +957,14 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         for _ in 0..5 {
             let c = count.clone();
-            mgr.flush_and_sync(0, || 0, || {
-                c.fetch_add(1, Ordering::SeqCst);
-                Ok(0)
-            })
+            mgr.flush_and_sync(
+                0,
+                || 0,
+                || {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    Ok(0)
+                },
+            )
             .unwrap();
         }
         assert_eq!(count.load(Ordering::SeqCst), 5);
@@ -958,22 +980,30 @@ mod tests {
 
         let leader = std::thread::spawn(move || {
             b2.wait();
-            mgr2.flush_and_sync(0, || 0, || {
-                // Slow so the second thread can queue up as a waiter.
-                std::thread::sleep(Duration::from_millis(30));
-                Err::<u64, _>(std::io::Error::other("leader fail"))
-            })
+            mgr2.flush_and_sync(
+                0,
+                || 0,
+                || {
+                    // Slow so the second thread can queue up as a waiter.
+                    std::thread::sleep(Duration::from_millis(30));
+                    Err::<u64, _>(std::io::Error::other("leader fail"))
+                },
+            )
         });
 
         // Small sleep so the leader thread enters fsync() first.
         barrier.wait();
         std::thread::sleep(Duration::from_millis(2));
 
-        let waiter_result = mgr.flush_and_sync(0, || 0, || {
-            // This should either piggyback (NoFsyncNeeded with error) or run its
-            // own fsync if it becomes leader.
-            Ok(0)
-        });
+        let waiter_result = mgr.flush_and_sync(
+            0,
+            || 0,
+            || {
+                // This should either piggyback (NoFsyncNeeded with error) or run its
+                // own fsync if it becomes leader.
+                Ok(0)
+            },
+        );
 
         let leader_result = leader.join().unwrap();
         // The leader must fail.
@@ -1008,13 +1038,17 @@ mod tests {
                 let b = Arc::clone(&barrier);
                 std::thread::spawn(move || {
                     b.wait();
-                    m.flush_and_sync(0, || 0, || {
-                        // Each actual leader/timeout fsync attempt: count it,
-                        // sleep so siblings queue + piggyback, then fail.
-                        at.fetch_add(1, Ordering::SeqCst);
-                        std::thread::sleep(Duration::from_millis(15));
-                        Err::<u64, _>(std::io::Error::other("fsync EIO"))
-                    })
+                    m.flush_and_sync(
+                        0,
+                        || 0,
+                        || {
+                            // Each actual leader/timeout fsync attempt: count it,
+                            // sleep so siblings queue + piggyback, then fail.
+                            at.fetch_add(1, Ordering::SeqCst);
+                            std::thread::sleep(Duration::from_millis(15));
+                            Err::<u64, _>(std::io::Error::other("fsync EIO"))
+                        },
+                    )
                 })
             })
             .collect();
@@ -1085,26 +1119,27 @@ mod tests {
         let b_a = Arc::clone(&barrier);
         let leader = std::thread::spawn(move || {
             b_a.wait();
-            mgr_a.flush_and_sync(
-                0, // A itself always fsyncs (no target).
-                {
-                    let wm = Arc::clone(&wm_a);
-                    move || wm.load(Ordering::SeqCst)
-                },
-                {
-                    let wm = Arc::clone(&wm_a);
-                    let fc = Arc::clone(&fc_a);
-                    move || {
-                        fc.fetch_add(1, Ordering::SeqCst);
-                        // Hold the fsync so the N committers queue behind it.
-                        std::thread::sleep(Duration::from_millis(40));
-                        // This fdatasync covers everything to EOL = N+1.
-                        wm.store((N + 1) as u64, Ordering::SeqCst);
-                        Ok((N + 1) as u64)
-                    }
-                },
-            )
-            .unwrap();
+            mgr_a
+                .flush_and_sync(
+                    0, // A itself always fsyncs (no target).
+                    {
+                        let wm = Arc::clone(&wm_a);
+                        move || wm.load(Ordering::SeqCst)
+                    },
+                    {
+                        let wm = Arc::clone(&wm_a);
+                        let fc = Arc::clone(&fc_a);
+                        move || {
+                            fc.fetch_add(1, Ordering::SeqCst);
+                            // Hold the fsync so the N committers queue behind it.
+                            std::thread::sleep(Duration::from_millis(40));
+                            // This fdatasync covers everything to EOL = N+1.
+                            wm.store((N + 1) as u64, Ordering::SeqCst);
+                            Ok((N + 1) as u64)
+                        }
+                    },
+                )
+                .unwrap();
         });
 
         // N committers with target LSNs 1..=N.  Each waits behind A; when A
@@ -1304,24 +1339,28 @@ mod tests {
                     let fl2 = Arc::clone(&fl);
                     let sl2 = Arc::clone(&sl);
                     let durable = mgr2
-                        .flush_and_sync(0, || 0, move || {
-                            let covered =
-                                sl2.load(std::sync::atomic::Ordering::SeqCst);
-                            let mut f =
-                                fl2.load(std::sync::atomic::Ordering::Relaxed);
-                            while f < covered {
-                                match fl2.compare_exchange(
-                                    f,
-                                    covered,
-                                    std::sync::atomic::Ordering::SeqCst,
-                                    std::sync::atomic::Ordering::Relaxed,
-                                ) {
-                                    Ok(_) => break,
-                                    Err(a) => f = a,
+                        .flush_and_sync(
+                            0,
+                            || 0,
+                            move || {
+                                let covered = sl2
+                                    .load(std::sync::atomic::Ordering::SeqCst);
+                                let mut f = fl2
+                                    .load(std::sync::atomic::Ordering::Relaxed);
+                                while f < covered {
+                                    match fl2.compare_exchange(
+                                        f,
+                                        covered,
+                                        std::sync::atomic::Ordering::SeqCst,
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    ) {
+                                        Ok(_) => break,
+                                        Err(a) => f = a,
+                                    }
                                 }
-                            }
-                            Ok(covered)
-                        })
+                                Ok(covered)
+                            },
+                        )
                         .unwrap();
 
                     // Post-condition: the durable watermark returned to this

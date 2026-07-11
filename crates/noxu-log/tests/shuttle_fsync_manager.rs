@@ -122,15 +122,21 @@ fn fsync_coalescing_and_coverage_hold() {
                         let snap_lsn2 = Arc::clone(&snap_lsn);
                         let execs2 = Arc::clone(&fsync_execs);
                         let durable = mgr
-                            .flush_and_sync(0, || 0, move || {
-                                execs2.fetch_add(1, Ordering::SeqCst);
-                                let covered = snap_lsn2.load(Ordering::SeqCst);
-                                let old = flushed_lsn2.load(Ordering::SeqCst);
-                                let newv = covered.max(old);
-                                flushed_lsn2.store(newv, Ordering::SeqCst);
-                                assert_fsynced_never_decreases(old, newv);
-                                Ok(covered)
-                            })
+                            .flush_and_sync(
+                                0,
+                                || 0,
+                                move || {
+                                    execs2.fetch_add(1, Ordering::SeqCst);
+                                    let covered =
+                                        snap_lsn2.load(Ordering::SeqCst);
+                                    let old =
+                                        flushed_lsn2.load(Ordering::SeqCst);
+                                    let newv = covered.max(old);
+                                    flushed_lsn2.store(newv, Ordering::SeqCst);
+                                    assert_fsynced_never_decreases(old, newv);
+                                    Ok(covered)
+                                },
+                            )
                             .expect("no fault injected: fsync must succeed");
 
                         assert_durable_covers_commit(durable.as_u64(), my_lsn);
@@ -192,10 +198,16 @@ fn fsync_failure_fails_all_waiters() {
                     let errors = Arc::clone(&errors);
                     shuttle::thread::spawn(move || {
                         let attempts2 = Arc::clone(&attempts);
-                        let r = mgr.flush_and_sync(0, || 0, move || {
-                            attempts2.fetch_add(1, Ordering::SeqCst);
-                            Err::<u64, _>(std::io::Error::other("fsync EIO"))
-                        });
+                        let r = mgr.flush_and_sync(
+                            0,
+                            || 0,
+                            move || {
+                                attempts2.fetch_add(1, Ordering::SeqCst);
+                                Err::<u64, _>(std::io::Error::other(
+                                    "fsync EIO",
+                                ))
+                            },
+                        );
                         match r {
                             Ok(_) => panic!(
                                 "a committer returned Ok despite a failed fsync"
@@ -276,14 +288,20 @@ fn group_commit_wait_holds_under_sim_clock() {
                         let flushed_lsn2 = Arc::clone(&flushed_lsn);
                         let snap_lsn2 = Arc::clone(&snap_lsn);
                         let durable = mgr
-                            .flush_and_sync(0, || 0, move || {
-                                let covered = snap_lsn2.load(Ordering::SeqCst);
-                                let old = flushed_lsn2.load(Ordering::SeqCst);
-                                let newv = covered.max(old);
-                                flushed_lsn2.store(newv, Ordering::SeqCst);
-                                assert_fsynced_never_decreases(old, newv);
-                                Ok(covered)
-                            })
+                            .flush_and_sync(
+                                0,
+                                || 0,
+                                move || {
+                                    let covered =
+                                        snap_lsn2.load(Ordering::SeqCst);
+                                    let old =
+                                        flushed_lsn2.load(Ordering::SeqCst);
+                                    let newv = covered.max(old);
+                                    flushed_lsn2.store(newv, Ordering::SeqCst);
+                                    assert_fsynced_never_decreases(old, newv);
+                                    Ok(covered)
+                                },
+                            )
                             .expect("no fault injected: fsync must succeed");
 
                         assert_durable_covers_commit(durable.as_u64(), my_lsn);
@@ -540,8 +558,7 @@ fn writequeue_shortcircuit_durability_holds() {
                         let ls_sync = Arc::clone(&last_synced);
                         let ls_work = Arc::clone(&last_synced);
                         let execs2 = Arc::clone(&fsync_execs);
-                        let sc_before =
-                            ls_sync.load(Ordering::SeqCst);
+                        let sc_before = ls_sync.load(Ordering::SeqCst);
                         let durable = mgr
                             .flush_and_sync(
                                 // target_lsn: our commit LSN.
@@ -552,18 +569,14 @@ fn writequeue_shortcircuit_durability_holds() {
                                 move || ls_sync.load(Ordering::SeqCst),
                                 // fsync closure: syncs the whole log to EOL.
                                 move || {
-                                    execs2
-                                        .fetch_add(1, Ordering::SeqCst);
-                                    let eol =
-                                        aeof2.load(Ordering::SeqCst);
+                                    execs2.fetch_add(1, Ordering::SeqCst);
+                                    let eol = aeof2.load(Ordering::SeqCst);
                                     // Advance the durable watermark to the EOL
                                     // this fdatasync covered (the completed
                                     // fsync makes every assigned byte durable).
-                                    let old =
-                                        ls_work.load(Ordering::SeqCst);
+                                    let old = ls_work.load(Ordering::SeqCst);
                                     bump_max(&ls_work, eol);
-                                    let newv =
-                                        ls_work.load(Ordering::SeqCst);
+                                    let newv = ls_work.load(Ordering::SeqCst);
                                     assert_fsynced_never_decreases(
                                         old,
                                         newv.max(old),

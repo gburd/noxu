@@ -355,9 +355,7 @@ fn throttle_backlog_wiring_gates_write_path() {
         fs.add_file_to_clean(f);
     }
     t.set_backlog(fs.get_stats().to_be_cleaned as u64);
-    assert!(
-        fs.get_stats().to_be_cleaned > BACKLOG_THROTTLE_THRESHOLD as usize
-    );
+    assert!(fs.get_stats().to_be_cleaned > BACKLOG_THROTTLE_THRESHOLD as usize);
     assert!(
         t.should_throttle_writer().is_some(),
         "real cleaner backlog must engage write-path backpressure"

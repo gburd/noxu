@@ -680,17 +680,16 @@ fn main() {
                             let db = Arc::clone(&db);
                             let hist = Arc::clone(&hist);
                             let workload = workload.clone();
-                            let (st, d) = tokio::task::spawn_blocking(
-                                move || {
+                            let (st, d) =
+                                tokio::task::spawn_blocking(move || {
                                     let d = run_one_op(
-                                        &mut state, &env, &db, &hist, &workload,
-                                        records,
+                                        &mut state, &env, &db, &hist,
+                                        &workload, records,
                                     );
                                     (state, d)
-                                },
-                            )
-                            .await
-                            .expect("blocking op panicked");
+                                })
+                                .await
+                                .expect("blocking op panicked");
                             state = st;
                             labort += d.aborts;
                             lwrites += d.writes;

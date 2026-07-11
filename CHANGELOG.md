@@ -15,6 +15,25 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+## [7.5.2] - 2026-07-11
+
+### Performance
+
+- **WriteQueue watermark re-check on the commit fsync path.** A woken
+  next-leader in the group-commit path that finds a completed `fdatasync` has
+  already advanced the durable watermark past its own commit LSN now returns
+  immediately instead of leading a redundant `fdatasync` for bytes an earlier
+  leader already made durable (JE `FileManager.WriteQueue` spirit —
+  enqueue-and-return so committers don't re-sync already-durable bytes).
+  Durability is unchanged: it returns only when `last_synced_lsn` already covers
+  the commit LSN, and the short-circuiting next-leader hands off the leader
+  baton (`FSyncGroup::handoff_leader`) so the waiter cohort never stalls (a
+  deadlock the shuttle model caught and that fix resolves). Measured on NVMe
+  after the cleaner-throttle fix: `tdb_write` 64-thread SYNC ~10.0k → ~10.9k
+  ops/s. Modest — the dominant write win this cycle was the cleaner-throttle
+  fix below; this coalesces the residual redundant fsyncs. `shuttle_fsync_manager`
+  5/5 (models the re-check + handoff under all interleavings).
+
 ### Fixed
 
 - **Write throughput capped at ~7k ops/s regardless of device or fsync: the
@@ -53,6 +72,20 @@ listed in [References](#references).
   interval / files-per-pass tuning, not write-path backpressure. New tests
   cover both directions: a caught-up cleaner at a high write rate does not
   throttle, and a real backlog above the threshold does.
+
+### Testing
+
+- **Cross-engine benchmark harness additions.** The `xbench` driver gained
+  `BENCH_HARNESS=threads|tokio`: `tokio` drives the logical clients as async
+  tasks dispatching each blocking DB op via `spawn_blocking` onto a bounded
+  pool (`BENCH_TOKIO_WORKERS`, `BENCH_BLOCKING_POOL`), modelling an async
+  service fronting the synchronous engine — both harnesses share one
+  `run_one_op` body so the workload is identical. The WiredTiger driver gained
+  `BENCH_WT_TYPE=btree|lsm` for the fairer LSM-vs-B-tree comparison, and new
+  `wt_crash.c` / `tdb_crash.c` / `noxu-crash.rs` hard-`kill -9` durability
+  harnesses verify no acked commit is lost across a crash + page-cache drop
+  (used to confirm all engines hold the same fsync-per-commit ACID contract at
+  SYNC — no engine acks before durable).
 
 ## [7.5.1] - 2026-07-10
 
