@@ -324,6 +324,46 @@ fn throttle_sleep_bounded_below() {
     assert!(sleep >= 100, "sleep must be ≥ MIN_SLEEP_MS (100ms)");
 }
 
+/// Backlog-driven write-path backpressure wiring (the ~7k write-ceiling fix).
+///
+/// Mirrors what `Cleaner::do_clean` does after a pass: publish the
+/// `FileSelector.to_be_cleaned` count into the throttle. Proves the
+/// FileSelector → throttle → write-path signal end to end:
+///   * caught-up cleaner (empty queue) => no write-path throttle, even at a
+///     high write rate (the fix: fresh inserts are never slowed);
+///   * genuine backlog (queue above threshold) => backpressure engages
+///     (backpressure still works when needed).
+#[test]
+fn throttle_backlog_wiring_gates_write_path() {
+    use noxu_cleaner::throttle::BACKLOG_THROTTLE_THRESHOLD;
+
+    let t = CleanerThrottle::new(0);
+    let mut fs = FileSelector::new();
+
+    // Drive a high write rate through the daemon EWMA (old rate-gate would
+    // have fired here). Empty cleaning queue => no backlog => no throttle.
+    t.update(500_000_000, false);
+    t.set_backlog(fs.get_stats().to_be_cleaned as u64);
+    assert_eq!(fs.get_stats().to_be_cleaned, 0);
+    assert!(
+        t.should_throttle_writer().is_none(),
+        "caught-up cleaner must not throttle the write path"
+    );
+
+    // Now create a genuine backlog: queue more files than the threshold.
+    for f in 0..(BACKLOG_THROTTLE_THRESHOLD as u32 + 4) {
+        fs.add_file_to_clean(f);
+    }
+    t.set_backlog(fs.get_stats().to_be_cleaned as u64);
+    assert!(
+        fs.get_stats().to_be_cleaned > BACKLOG_THROTTLE_THRESHOLD as usize
+    );
+    assert!(
+        t.should_throttle_writer().is_some(),
+        "real cleaner backlog must engage write-path backpressure"
+    );
+}
+
 // ─── X-5: Cleaner checkpoint barrier ──────────────────────────────────────────
 
 /// X-5: after cleaning, a file must NOT move to safe_to_delete until

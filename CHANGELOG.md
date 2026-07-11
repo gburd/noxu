@@ -15,6 +15,45 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Fixed
+
+- **Write throughput capped at ~7k ops/s regardless of device or fsync: the
+  cleaner write-path throttle was gated on a fixed 1 MB/s raw write RATE, not
+  on the cleaner being behind.** `CleanerThrottle::should_throttle_writer`
+  slept every committer whenever the EWMA log write rate exceeded
+  `HIGH_WRITE_THRESHOLD_BYTES_PER_SEC` (1,000,000 bytes/s), scaling the sleep
+  1–50 ms by the overshoot factor. A 64-thread `tdb_write` SYNC workload runs
+  at ~7 MB/s aggregate — 7× the threshold — so every logged commit slept ~7 ms
+  in `Transaction::commit_with_durability` (and the auto-commit path in
+  `Database::put`), pinning throughput at ~7k ops/s on an NVMe capable of
+  GB/s. gdb on the 64-thread run confirmed 58 of 69 threads parked in
+  `hrtimer_nanosleep` (the throttle sleep), not on the fsync path — which is
+  why an earlier WriteQueue / fsync-coalescing effort and `max_leaders>1` both
+  moved the number by nothing.
+  The 1 MB/s rate gate had no JE basis. JE has **no** raw-rate write throttle;
+  its write-path backpressure is `EnvironmentImpl.checkDiskLimitViolation()`
+  (checked on the write path from `FileProcessor.doClean`,
+  `Checkpointer.checkpoint`, and `DirtyINMap.selectDirtyINsForCheckpoint`),
+  which fires only when the cleaner cannot reclaim obsolete log space fast
+  enough — a genuine *backlog* — and then *prohibits* writes rather than
+  rate-limiting them. When the cleaner keeps up (the common case, including a
+  fresh insert into empty space with nothing yet to clean), JE never
+  throttles.
+  The fix makes `should_throttle_writer` gate on the cleaner **backlog** — the
+  count of files queued for cleaning that the cleaner has not caught up on
+  (`FileSelector.to_be_cleaned`) — instead of the raw write rate. The cleaner
+  publishes its backlog into the throttle after each pass
+  (`CleanerThrottle::set_backlog`, wired in `Cleaner::do_clean` and
+  `Engine::clean_adaptive`). Below `BACKLOG_THROTTLE_THRESHOLD` (8 files) the
+  write path is never throttled; above it a graduated 1–50 ms sleep engages so
+  writers slow to let the cleaner catch up and the log does not grow
+  unboundedly — backpressure still protects against writers outrunning the
+  cleaner, it just no longer fires when the cleaner is idle or keeping up. The
+  raw-write-rate EWMA is retained but now drives only the cleaner-daemon sleep
+  interval / files-per-pass tuning, not write-path backpressure. New tests
+  cover both directions: a caught-up cleaner at a high write rate does not
+  throttle, and a real backlog above the threshold does.
+
 ## [7.5.1] - 2026-07-10
 
 ### Fixed

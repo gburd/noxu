@@ -921,6 +921,14 @@ impl Cleaner {
         let cleaning_needed = files_cleaned > 0;
         self.throttle.update(current_write_bytes, cleaning_needed);
 
+        // Publish the current cleaner backlog (files queued for cleaning but
+        // not yet caught up on) so the write path can apply backpressure ONLY
+        // when the cleaner is genuinely behind — JE-faithful gating on
+        // `EnvironmentImpl.checkDiskLimitViolation()` (the cleaner falling
+        // behind), not on a raw write rate.
+        let backlog = self.file_selector.lock().get_stats().to_be_cleaned;
+        self.throttle.set_backlog(backlog as u64);
+
         // CLN-14: wakeupAfterNoWrites.
         // JE: FileProcessor.doClean ~line 290:
         //   envImpl.getCheckpointer().wakeupAfterNoWrites()

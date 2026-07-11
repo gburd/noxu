@@ -1,11 +1,18 @@
-//! Adaptive cleaner throttle: write-rate tracking, backoff and acceleration.
+//! Adaptive cleaner throttle: cleaner-daemon sleep tuning and backlog-driven
+//! write-path backpressure.
 //!
-//! Implements `CleanerThrottle` — tracks an exponential moving average of
-//! the log write rate (bytes/second) and uses it to:
+//! Implements `CleanerThrottle`:
 //!
-//! - Compute how long the cleaner daemon should **sleep** between passes
-//!   (backs off when idle, accelerates when write pressure is high).
-//! - Recommend how many files to clean per pass.
+//! - The **cleaner daemon** sleep interval and files-per-pass are tuned from
+//!   an exponential moving average of the log write rate (backs off when idle,
+//!   accelerates under write pressure).
+//! - The **write path** backpressure ([`CleanerThrottle::should_throttle_writer`])
+//!   is gated on the cleaner *backlog* — the count of files queued for cleaning
+//!   that the cleaner has not caught up on — NOT on the raw write rate. This
+//!   mirrors JE's `EnvironmentImpl.checkDiskLimitViolation()` write-path gate,
+//!   which fires only when the cleaner cannot reclaim space fast enough. A
+//!   workload that keeps the cleaner caught up (e.g. a fresh insert into empty
+//!   space with nothing yet to clean) is never throttled.
 //!
 //! # Algorithm
 //!
@@ -41,7 +48,28 @@ pub const MIN_SLEEP_MS: u64 = 100;
 ///
 /// Implements `EnvironmentParams.CLEANER_BYTES_INTERVAL` default (10 MiB),
 /// divided by the base wakeup interval to yield a per-second figure.
+///
+/// NOTE: this drives only the *cleaner daemon* sleep interval (how often the
+/// daemon wakes to clean). It is **not** the write-path backpressure gate —
+/// see [`CleanerThrottle::should_throttle_writer`], which is gated on the
+/// cleaner *backlog*, not on raw write rate.
 pub const HIGH_WRITE_THRESHOLD_BYTES_PER_SEC: u64 = 1_000_000;
+
+/// Cleaner backlog (files queued but not yet cleaned) at or below which the
+/// write path is **never** throttled.
+///
+/// JE gates write-path backpressure on the cleaner falling behind — see
+/// `EnvironmentImpl.checkDiskLimitViolation()` (called from the write path in
+/// `FileProcessor` / `Checkpointer` / `DirtyINMap`), which is driven by the
+/// cleaner's inability to reclaim obsolete space (a real backlog), *not* by a
+/// raw bytes/sec write rate. JE has no rate throttle. We model the same
+/// gating signal with the count of files the cleaner is behind on
+/// (`FileSelector.to_be_cleaned`): a fresh insert workload with nothing yet to
+/// clean has a zero backlog and is never throttled.
+pub const BACKLOG_THROTTLE_THRESHOLD: u64 = 8;
+
+/// Maximum write-path throttle delay (ms) when the backlog is severe.
+pub const MAX_WRITE_DELAY_MS: u64 = 50;
 
 /// Write-rate (bytes/s) that adds one extra file per pass.
 ///
@@ -80,6 +108,15 @@ pub struct CleanerThrottle {
 
     /// Most-recently recommended number of files to clean per pass.
     recommended_n_files: AtomicU64,
+
+    /// Cleaner backlog: the number of log files queued for cleaning that the
+    /// cleaner has **not yet** caught up on (`FileSelector.to_be_cleaned`).
+    ///
+    /// Published by the cleaner after each pass via [`Self::set_backlog`] and
+    /// read by [`Self::should_throttle_writer`] to decide whether the write
+    /// path should apply backpressure. This is the JE-faithful gating signal
+    /// (the cleaner falling behind), replacing the old raw-write-rate gate.
+    backlog: AtomicU64,
 }
 
 impl CleanerThrottle {
@@ -92,6 +129,7 @@ impl CleanerThrottle {
             write_rate_ewma: Mutex::new(0.0),
             sleep_interval_ms: AtomicU64::new(BASE_SLEEP_MS),
             recommended_n_files: AtomicU64::new(MIN_FILES_PER_PASS as u64),
+            backlog: AtomicU64::new(0),
         }
     }
 
@@ -172,24 +210,59 @@ impl CleanerThrottle {
         *self.write_rate_ewma.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Returns a recommended write-path delay when the log write rate exceeds
-    /// `HIGH_WRITE_THRESHOLD_BYTES_PER_SEC`, or `None` if no throttling is
-    /// needed.
+    /// Publishes the current cleaner backlog — the number of log files queued
+    /// for cleaning that the cleaner has not yet caught up on
+    /// (`FileSelector.to_be_cleaned`). Called by the cleaner after each pass.
     ///
-    /// The delay scales linearly with how far above the threshold we are,
-    /// clamped to [1 ms, 50 ms].  At 2× threshold the writer sleeps ~2 ms;
-    /// at 10× threshold it sleeps ~10 ms; above 50× it sleeps 50 ms.
+    /// This is the signal [`Self::should_throttle_writer`] gates on. When the
+    /// cleaner is keeping up the backlog is zero and the write path is never
+    /// throttled.
+    pub fn set_backlog(&self, files_behind: u64) {
+        self.backlog.store(files_behind, Ordering::Relaxed);
+    }
+
+    /// Returns the most recently published cleaner backlog (files behind).
+    pub fn current_backlog(&self) -> u64 {
+        self.backlog.load(Ordering::Relaxed)
+    }
+
+    /// Returns a recommended write-path delay when the cleaner has fallen
+    /// **behind** — i.e. when the backlog of files queued for cleaning exceeds
+    /// [`BACKLOG_THROTTLE_THRESHOLD`] — or `None` when the cleaner is keeping
+    /// up (the common case, including a fresh insert workload with nothing yet
+    /// to clean).
     ///
-    /// This is the write-path counterpart to the cleaner's adaptive sleep.
-    /// equivalent logic in `CleanerThrottle.getWriteDelay()`.
+    /// # JE-faithful gating (the fix)
+    ///
+    /// This replaces the previous defect: a fixed raw-write-**rate** gate
+    /// (`rate > HIGH_WRITE_THRESHOLD_BYTES_PER_SEC`, 1 MB/s) that fired under
+    /// *any* sustained write load regardless of whether the cleaner was
+    /// behind, sleeping every committer and capping write throughput at just
+    /// above 1 MB/s on devices doing GB/s.
+    ///
+    /// JE has no raw-rate write throttle. Its write-path backpressure is
+    /// `EnvironmentImpl.checkDiskLimitViolation()` — a gate driven by the
+    /// cleaner's inability to reclaim obsolete log space (a real backlog),
+    /// checked on the write path (`FileProcessor.doClean`,
+    /// `Checkpointer.checkpoint`, `DirtyINMap.selectDirtyINsForCheckpoint`).
+    /// When the cleaner keeps up, JE does not throttle; when it genuinely
+    /// cannot keep up, JE prohibits writes. We model the same *gating signal*
+    /// — the cleaner falling behind — with the count of files queued for
+    /// cleaning (`FileSelector.to_be_cleaned`), applying a graduated sleep
+    /// (softer than JE's hard `DiskLimitException`) so writers slow to let the
+    /// cleaner catch up before the log grows unboundedly.
+    ///
+    /// The delay scales linearly with how far past the threshold the backlog
+    /// is, clamped to `[1 ms, MAX_WRITE_DELAY_MS]`.
     pub fn should_throttle_writer(&self) -> Option<std::time::Duration> {
-        let rate = self.write_rate_bytes_per_sec() as u64;
-        if rate <= HIGH_WRITE_THRESHOLD_BYTES_PER_SEC {
+        let backlog = self.backlog.load(Ordering::Relaxed);
+        if backlog <= BACKLOG_THROTTLE_THRESHOLD {
+            // Cleaner is keeping up — no backpressure.
             return None;
         }
-        // overshoot factor (1.0 at threshold, 2.0 at 2× threshold, etc.)
-        let factor = rate / HIGH_WRITE_THRESHOLD_BYTES_PER_SEC;
-        let delay_ms = factor.clamp(1, 50);
+        // Files past the threshold; 1 ms per extra file, clamped.
+        let overshoot = backlog - BACKLOG_THROTTLE_THRESHOLD;
+        let delay_ms = overshoot.clamp(1, MAX_WRITE_DELAY_MS);
         Some(std::time::Duration::from_millis(delay_ms))
     }
 }
@@ -209,6 +282,7 @@ impl std::fmt::Debug for CleanerThrottle {
                 "write_rate_bytes_per_sec",
                 &format!("{:.0}", self.write_rate_bytes_per_sec()),
             )
+            .field("backlog", &self.current_backlog())
             .finish()
     }
 }
@@ -329,6 +403,83 @@ mod tests {
         assert!(
             sleep_with_pressure <= sleep_no_pressure,
             "cleaning_needed should not increase sleep"
+        );
+    }
+
+    #[test]
+    fn test_no_backlog_no_throttle() {
+        // A fresh throttle (backlog 0) must never throttle the write path,
+        // regardless of write rate — this is the fix for the ~7k write ceiling:
+        // a fresh insert workload with nothing to clean is not slowed.
+        let t = CleanerThrottle::new(0);
+        // Even after pushing a large write rate through the daemon EWMA:
+        t.update(500_000_000, false); // ~500 MB "written", huge rate
+        assert_eq!(t.current_backlog(), 0);
+        assert!(
+            t.should_throttle_writer().is_none(),
+            "no backlog => no write-path throttle even at high write rate"
+        );
+    }
+
+    #[test]
+    fn test_backlog_at_threshold_no_throttle() {
+        let t = CleanerThrottle::new(0);
+        // Backlog exactly at the threshold: cleaner still deemed keeping up.
+        t.set_backlog(BACKLOG_THROTTLE_THRESHOLD);
+        assert!(
+            t.should_throttle_writer().is_none(),
+            "backlog at threshold must not throttle"
+        );
+    }
+
+    #[test]
+    fn test_backlog_over_threshold_throttles() {
+        let t = CleanerThrottle::new(0);
+        // Backlog past the threshold: cleaner is behind => backpressure.
+        t.set_backlog(BACKLOG_THROTTLE_THRESHOLD + 1);
+        let delay = t.should_throttle_writer();
+        assert!(delay.is_some(), "real backlog must throttle the write path");
+        assert_eq!(
+            delay.unwrap(),
+            std::time::Duration::from_millis(1),
+            "one file over threshold => 1 ms"
+        );
+    }
+
+    #[test]
+    fn test_backlog_delay_scales_and_clamps() {
+        let t = CleanerThrottle::new(0);
+        // Well past threshold => larger delay, but clamped to MAX_WRITE_DELAY_MS.
+        t.set_backlog(BACKLOG_THROTTLE_THRESHOLD + 5);
+        assert_eq!(
+            t.should_throttle_writer().unwrap(),
+            std::time::Duration::from_millis(5)
+        );
+        // Enormous backlog clamps at the max.
+        t.set_backlog(BACKLOG_THROTTLE_THRESHOLD + 10_000);
+        assert_eq!(
+            t.should_throttle_writer().unwrap(),
+            std::time::Duration::from_millis(MAX_WRITE_DELAY_MS)
+        );
+    }
+
+    #[test]
+    fn test_write_rate_does_not_gate_write_throttle() {
+        // Regression guard: the write-path throttle must be gated on backlog,
+        // NOT on raw write rate. A high EWMA rate with zero backlog => no sleep.
+        let t = CleanerThrottle::new(0);
+        for b in [10_000_000u64, 50_000_000, 100_000_000] {
+            t.update(b, false);
+        }
+        assert!(
+            t.write_rate_bytes_per_sec()
+                > HIGH_WRITE_THRESHOLD_BYTES_PER_SEC as f64,
+            "precondition: EWMA rate well above the old 1 MB/s gate"
+        );
+        assert_eq!(t.current_backlog(), 0);
+        assert!(
+            t.should_throttle_writer().is_none(),
+            "high write rate must not throttle when the cleaner is caught up"
         );
     }
 }
