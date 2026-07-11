@@ -254,6 +254,30 @@ impl FSyncGroup {
         self.condvar.notify_one();
     }
 
+    /// Re-designate a fresh next leader for this cohort after the current
+    /// designated leader decided NOT to lead (the WriteQueue short-circuit).
+    ///
+    /// DEADLOCK FIX: the completing leader designates exactly ONE next leader
+    /// via `wakeup_one`.  If that designee returns early (its `target_lsn` was
+    /// already covered by a completed fdatasync) it drops the baton — the
+    /// remaining cohort members would park forever.  This clears the stale
+    /// `leader_exists` designation and arms a new one so exactly one sibling
+    /// wakes and repeats the same short-circuit-or-lead decision.  If the
+    /// cohort has already been served by a real fsync (`work_done`) there is
+    /// nothing to hand off.
+    fn handoff_leader(&self) {
+        let mut inner = self.inner.lock();
+        if inner.work_done {
+            return;
+        }
+        // Retract our own (consumed) designation and arm a new one for the
+        // next sibling to pick up on wake / pre-check.
+        inner.leader_exists = false;
+        inner.leader_notified = true;
+        drop(inner);
+        self.condvar.notify_one();
+    }
+
     /// Return the recorded error (if any) for this group.
     fn take_error(&self) -> Option<String> {
         self.inner.lock().error.clone()
@@ -440,9 +464,37 @@ impl FsyncManager {
     /// is propagated to the leader AND to every piggybacking waiter (each gets
     /// its own `Err`), matching JE: a leader fsync failure means the waiters'
     /// commits are NOT durable.
-    pub fn flush_and_sync<F>(&self, do_work: F) -> std::io::Result<Lsn>
+    /// `target_lsn` is the committer's durable-LSN requirement (the `eol` its
+    /// commit needs on disk; `0` = "no requirement, always fsync", used by
+    /// callers with no LSN to check).  `synced_watermark` reads the current
+    /// durable watermark (`last_synced_lsn`).
+    ///
+    /// WriteQueue adaptation (JE `FileManager.writeToFile` enqueue-and-return):
+    /// a waiter that is woken to lead — or that times out — FIRST re-checks the
+    /// durable watermark.  If a COMPLETED fdatasync already covered its
+    /// `target_lsn` (`synced_watermark() > target_lsn`), it returns
+    /// immediately with NO redundant fsync — exactly like a JE committer that
+    /// found the fsync latch held, enqueued, and let the in-flight/next fsync
+    /// cover it.  Its bytes were already drained (they are in the shared log
+    /// buffer, pwritten to the page cache before the covering leader's
+    /// fdatasync), so the covering fdatasync (which syncs the whole fd to EOL)
+    /// already made them durable.  This is the fix for the 1:1 convoy: without
+    /// it, every designated next-leader issues a redundant fdatasync for bytes
+    /// an earlier leader already synced.
+    ///
+    /// DURABILITY INVARIANT: a committer only returns `Ok` when either (a) it
+    /// (or a piggyback leader) completed an fdatasync covering its LSN, or (b)
+    /// `synced_watermark() > target_lsn` — a completed fdatasync covered it.
+    /// It NEVER returns before its LSN is under the durable watermark.
+    pub fn flush_and_sync<F, S>(
+        &self,
+        target_lsn: u64,
+        synced_watermark: S,
+        do_work: F,
+    ) -> std::io::Result<Lsn>
     where
         F: Fn() -> std::io::Result<u64>,
+        S: Fn() -> u64,
     {
         self.n_fsync_requests.fetch_add(1, Ordering::Relaxed);
         let mut do_my_work = false;
@@ -511,6 +563,23 @@ impl FsyncManager {
                     return Ok(Lsn::from_u64(group.result_lsn()));
                 }
                 WaitStatus::DoLeaderFsync => {
+                    // WriteQueue re-check (JE enqueue-and-return): the fsync we
+                    // waited behind syncs the whole fd to EOL, so it may have
+                    // ALREADY covered our target_lsn.  If so, return now with
+                    // no redundant fsync — our bytes are durable.  This is what
+                    // turns the 1:1 leader-chain convoy into real coalescing:
+                    // the designated next-leader no longer re-fsyncs bytes an
+                    // earlier leader already made durable.
+                    if target_lsn != 0 && synced_watermark() > target_lsn {
+                        // DEADLOCK FIX: we were the designated next leader for
+                        // this cohort.  Before short-circuiting-and-returning
+                        // we MUST hand the baton to a sibling, or the rest of
+                        // the cohort parks forever (the completing leader only
+                        // designates ONE next leader).  Each woken sibling
+                        // repeats this same re-check.
+                        group.handoff_leader();
+                        return Ok(Lsn::from_u64(synced_watermark()));
+                    }
                     // Attempt to become a new leader for this cohort.
                     let mut state = self.state.lock();
                     if state.leaders_in_flight >= self.max_leaders {
@@ -538,6 +607,16 @@ impl FsyncManager {
                     }
                 }
                 WaitStatus::DoTimeoutFsync => {
+                    // WriteQueue re-check on timeout too: if a completed
+                    // fdatasync covered us while we were parked, return now.
+                    if target_lsn != 0 && synced_watermark() > target_lsn {
+                        // Same baton hand-off as the DoLeaderFsync path: if we
+                        // were the designated leader (or no leader was ever
+                        // designated), re-arm one so the cohort still makes
+                        // progress after we short-circuit out.
+                        group.handoff_leader();
+                        return Ok(Lsn::from_u64(synced_watermark()));
+                    }
                     // Timed out — do our own work regardless (JE DO_TIMEOUT_FSYNC).
                     do_my_work = true;
                     self.n_fsync_timeouts.fetch_add(1, Ordering::Relaxed);
@@ -695,7 +774,7 @@ mod tests {
         let mgr = FsyncManager::new(0, 0);
         let count = Arc::new(AtomicUsize::new(0));
         let c = count.clone();
-        mgr.flush_and_sync(|| {
+        mgr.flush_and_sync(0, || 0, || {
             c.fetch_add(1, Ordering::SeqCst);
             Ok(0)
         })
@@ -717,7 +796,7 @@ mod tests {
             let b = Arc::clone(&barrier);
             handles.push(std::thread::spawn(move || {
                 b.wait();
-                mgr2.flush_and_sync(|| {
+                mgr2.flush_and_sync(0, || 0, || {
                     // Slow fsync so concurrent threads queue up.
                     std::thread::sleep(Duration::from_millis(20));
                     fc.fetch_add(1, Ordering::SeqCst);
@@ -776,7 +855,7 @@ mod tests {
                     b.wait();
                     // Small stagger-free burst: all N hammer flush_and_sync.
                     for _ in 0..8 {
-                        m.flush_and_sync(|| {
+                        m.flush_and_sync(0, || 0, || {
                             // Slow "fsync" so siblings pile into the waiter
                             // cohort while the leader is in the syscall.
                             fc.fetch_add(1, Ordering::SeqCst);
@@ -813,7 +892,7 @@ mod tests {
     #[test]
     fn test_fsync_error_propagated_to_waiters() {
         let mgr = FsyncManager::new(0, 0);
-        let result = mgr.flush_and_sync(|| {
+        let result = mgr.flush_and_sync(0, || 0, || {
             Err::<u64, _>(std::io::Error::other("simulated fsync failure"))
         });
         assert!(result.is_err());
@@ -834,7 +913,7 @@ mod tests {
             let m = Arc::clone(&mgr);
             let fc = Arc::clone(&fsync_count);
             handles.push(std::thread::spawn(move || {
-                m.flush_and_sync(|| {
+                m.flush_and_sync(0, || 0, || {
                     fc.fetch_add(1, Ordering::SeqCst);
                     Ok(0)
                 })
@@ -860,7 +939,7 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         for _ in 0..5 {
             let c = count.clone();
-            mgr.flush_and_sync(|| {
+            mgr.flush_and_sync(0, || 0, || {
                 c.fetch_add(1, Ordering::SeqCst);
                 Ok(0)
             })
@@ -879,7 +958,7 @@ mod tests {
 
         let leader = std::thread::spawn(move || {
             b2.wait();
-            mgr2.flush_and_sync(|| {
+            mgr2.flush_and_sync(0, || 0, || {
                 // Slow so the second thread can queue up as a waiter.
                 std::thread::sleep(Duration::from_millis(30));
                 Err::<u64, _>(std::io::Error::other("leader fail"))
@@ -890,7 +969,7 @@ mod tests {
         barrier.wait();
         std::thread::sleep(Duration::from_millis(2));
 
-        let waiter_result = mgr.flush_and_sync(|| {
+        let waiter_result = mgr.flush_and_sync(0, || 0, || {
             // This should either piggyback (NoFsyncNeeded with error) or run its
             // own fsync if it becomes leader.
             Ok(0)
@@ -929,7 +1008,7 @@ mod tests {
                 let b = Arc::clone(&barrier);
                 std::thread::spawn(move || {
                     b.wait();
-                    m.flush_and_sync(|| {
+                    m.flush_and_sync(0, || 0, || {
                         // Each actual leader/timeout fsync attempt: count it,
                         // sleep so siblings queue + piggyback, then fail.
                         at.fetch_add(1, Ordering::SeqCst);
@@ -972,7 +1051,110 @@ mod tests {
     #[test]
     fn test_returns_ok_on_success() {
         let mgr = FsyncManager::new(0, 0);
-        assert!(mgr.flush_and_sync(|| Ok(0)).is_ok());
+        assert!(mgr.flush_and_sync(0, || 0, || Ok(0)).is_ok());
+    }
+
+    /// WRITEQUEUE SHORT-CIRCUIT (the coalescing fix).
+    ///
+    /// A committer whose `target_lsn` was ALREADY covered by a completed
+    /// fdatasync must return WITHOUT issuing a redundant fsync (JE
+    /// enqueue-and-return: the in-flight/next fsync, which syncs the whole fd
+    /// to EOL, already made its bytes durable).  Before this fix every
+    /// designated next-leader re-fsynced bytes an earlier leader had already
+    /// synced — the 1:1 convoy.
+    ///
+    /// Setup: leader A holds a slow fsync; N committers with LSNs already below
+    /// the durable watermark queue behind it.  When A completes and designates
+    /// the next leader, that waiter (and every sibling) must short-circuit on
+    /// the watermark re-check, so the total fsync count is 1 (A's), NOT 1+N.
+    #[test]
+    fn test_writequeue_shortcircuit_when_watermark_covers_target() {
+        use std::sync::atomic::AtomicU64;
+        const N: usize = 8;
+        let mgr = Arc::new(FsyncManager::new(0, 0));
+        // Durable watermark, advanced by the leader's fsync closure.
+        let watermark = Arc::new(AtomicU64::new(0));
+        let fsyncs = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(std::sync::Barrier::new(N + 1));
+
+        // Leader A: slow fsync that advances the watermark to cover everyone
+        // (target LSNs are 1..=N, so a watermark of N+1 covers all via `>`).
+        let mgr_a = Arc::clone(&mgr);
+        let wm_a = Arc::clone(&watermark);
+        let fc_a = Arc::clone(&fsyncs);
+        let b_a = Arc::clone(&barrier);
+        let leader = std::thread::spawn(move || {
+            b_a.wait();
+            mgr_a.flush_and_sync(
+                0, // A itself always fsyncs (no target).
+                {
+                    let wm = Arc::clone(&wm_a);
+                    move || wm.load(Ordering::SeqCst)
+                },
+                {
+                    let wm = Arc::clone(&wm_a);
+                    let fc = Arc::clone(&fc_a);
+                    move || {
+                        fc.fetch_add(1, Ordering::SeqCst);
+                        // Hold the fsync so the N committers queue behind it.
+                        std::thread::sleep(Duration::from_millis(40));
+                        // This fdatasync covers everything to EOL = N+1.
+                        wm.store((N + 1) as u64, Ordering::SeqCst);
+                        Ok((N + 1) as u64)
+                    }
+                },
+            )
+            .unwrap();
+        });
+
+        // N committers with target LSNs 1..=N.  Each waits behind A; when A
+        // completes, the designated next-leader (and siblings) must see
+        // watermark (= N+1) > its target and return with NO fsync.
+        let handles: Vec<_> = (1..=N)
+            .map(|i| {
+                let m = Arc::clone(&mgr);
+                let wm = Arc::clone(&watermark);
+                let fc = Arc::clone(&fsyncs);
+                let b = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    b.wait();
+                    // Small delay so A wins the leader slot first.
+                    std::thread::sleep(Duration::from_millis(5));
+                    m.flush_and_sync(
+                        i as u64,
+                        {
+                            let wm = Arc::clone(&wm);
+                            move || wm.load(Ordering::SeqCst)
+                        },
+                        move || {
+                            // If ANY committer runs its own fsync, the count
+                            // exceeds 1 and the assert below fails.
+                            fc.fetch_add(1, Ordering::SeqCst);
+                            Ok((N + 1) as u64)
+                        },
+                    )
+                    .unwrap();
+                })
+            })
+            .collect();
+
+        leader.join().unwrap();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Only A's single fsync ran; all N committers short-circuited on the
+        // watermark re-check.  (Timing-tolerant: allow a couple extra in case
+        // a committer wins the leader slot before A on a slow CI machine, but
+        // the count must be WELL below 1+N — the convoy would give ~1+N.)
+        let total = fsyncs.load(Ordering::SeqCst);
+        assert!(
+            total <= 3,
+            "WriteQueue short-circuit failed: {total} fsyncs (expected ~1, \
+             convoy would give {})",
+            N + 1
+        );
+        assert!(total >= 1, "at least A's fsync must have run");
     }
 
     /// FSyncGroup: `wakeup_all` sets `work_done` and records no error.
@@ -1122,7 +1304,7 @@ mod tests {
                     let fl2 = Arc::clone(&fl);
                     let sl2 = Arc::clone(&sl);
                     let durable = mgr2
-                        .flush_and_sync(move || {
+                        .flush_and_sync(0, || 0, move || {
                             let covered =
                                 sl2.load(std::sync::atomic::Ordering::SeqCst);
                             let mut f =
