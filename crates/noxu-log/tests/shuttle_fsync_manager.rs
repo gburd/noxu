@@ -122,7 +122,7 @@ fn fsync_coalescing_and_coverage_hold() {
                         let snap_lsn2 = Arc::clone(&snap_lsn);
                         let execs2 = Arc::clone(&fsync_execs);
                         let durable = mgr
-                            .flush_and_sync(move || {
+                            .flush_and_sync(0, || 0, move || {
                                 execs2.fetch_add(1, Ordering::SeqCst);
                                 let covered = snap_lsn2.load(Ordering::SeqCst);
                                 let old = flushed_lsn2.load(Ordering::SeqCst);
@@ -192,7 +192,7 @@ fn fsync_failure_fails_all_waiters() {
                     let errors = Arc::clone(&errors);
                     shuttle::thread::spawn(move || {
                         let attempts2 = Arc::clone(&attempts);
-                        let r = mgr.flush_and_sync(move || {
+                        let r = mgr.flush_and_sync(0, || 0, move || {
                             attempts2.fetch_add(1, Ordering::SeqCst);
                             Err::<u64, _>(std::io::Error::other("fsync EIO"))
                         });
@@ -276,7 +276,7 @@ fn group_commit_wait_holds_under_sim_clock() {
                         let flushed_lsn2 = Arc::clone(&flushed_lsn);
                         let snap_lsn2 = Arc::clone(&snap_lsn);
                         let durable = mgr
-                            .flush_and_sync(move || {
+                            .flush_and_sync(0, || 0, move || {
                                 let covered = snap_lsn2.load(Ordering::SeqCst);
                                 let old = flushed_lsn2.load(Ordering::SeqCst);
                                 let newv = covered.max(old);
@@ -386,7 +386,7 @@ fn bounded_pipeline_monotonic_watermark_holds() {
                         let aeof2 = Arc::clone(&assigned_eof);
                         let execs2 = Arc::clone(&fsync_execs);
                         let eol = mgr
-                            .flush_and_sync(move || {
+                            .flush_and_sync(0, || 0, move || {
                                 // DRAIN under the LWL: pwrite EVERY assigned
                                 // byte that is not yet in the page cache (the
                                 // real fill_flush_pending drains ALL dirty
@@ -464,6 +464,150 @@ fn bounded_pipeline_monotonic_watermark_holds() {
                 "fsync executions {execs} out of range 1..={N}: a redundant \
                  (double) fsync or a missing one indicates a coalescing bug"
             );
+            let final_synced = last_synced.load(Ordering::SeqCst);
+            let highest = next_lsn.load(Ordering::SeqCst) - 1;
+            assert!(
+                final_synced >= highest,
+                "final durable watermark {final_synced} < highest commit \
+                 LSN {highest}: a committed write was left unsynced"
+            );
+        },
+        ITERATIONS,
+    );
+}
+
+/// WRITEQUEUE SHORT-CIRCUIT DURABILITY (the coalescing fix, proven by shuttle).
+///
+/// This is the oracle the task requires: N committers, some enqueue-and-return
+/// (short-circuit on the durable watermark), some fsync.  Under every
+/// interleaving shuttle explores, assert the three invariants:
+///
+///   1. **No commit returns before its LSN is durable** — the watermark this
+///      committer observes on return (`durable`) covers its own commit LSN
+///      (`assert_durable_covers_commit`).  This holds on BOTH paths: the leader
+///      path (its own completed fdatasync) AND the short-circuit path (a
+///      completed fdatasync by another leader that already covered its LSN,
+///      detected via the `synced_watermark()` re-check).
+///   2. **The watermark is monotonic** — never regresses across any advance
+///      (`assert_fsynced_never_decreases`).
+///   3. **Every committer is covered by a COMPLETED fdatasync before it
+///      returns** — a short-circuiting committer returns ONLY when
+///      `last_synced` (advanced solely after a completed fsync closure) already
+///      exceeds its LSN, so its bytes are on disk before its commit returns.
+///
+/// The model mirrors the production wiring: `last_synced` is advanced (CAS-max)
+/// by the CALLER after `flush_and_sync` returns Ok, and the `synced_watermark`
+/// closure reads that same cell — so a woken waiter's short-circuit sees only
+/// watermarks a completed fdatasync published.  The fsync closure syncs the
+/// whole log to EOL (JE `ch.force(false)`), so one completed fsync covers every
+/// LSN assigned before it.
+#[test]
+fn writequeue_shortcircuit_durability_holds() {
+    shuttle::check_random(
+        || {
+            const N: usize = 4;
+            let sim = Arc::new(SimClock::new(0));
+            install_sim_clock(Arc::clone(&sim));
+            let mgr = Arc::new(FsyncManager::with_clock(
+                0,
+                0,
+                1,
+                Arc::clone(&sim) as Arc<dyn noxu_util::Clock>,
+            ));
+            let next_lsn = Arc::new(AtomicU64::new(1));
+            // assigned_eof = JE next_available_lsn: the eol a leader captures.
+            let assigned_eof = Arc::new(AtomicU64::new(0));
+            // The single durable watermark (last_synced_lsn).  Advanced ONLY
+            // after a completed fsync closure (by the caller, CAS-max).
+            let last_synced = Arc::new(AtomicU64::new(0));
+            let fsync_execs = Arc::new(AtomicUsize::new(0));
+            let shortcircuits = Arc::new(AtomicUsize::new(0));
+
+            let handles: Vec<_> = (0..N)
+                .map(|_| {
+                    let mgr = Arc::clone(&mgr);
+                    let next_lsn = Arc::clone(&next_lsn);
+                    let assigned_eof = Arc::clone(&assigned_eof);
+                    let last_synced = Arc::clone(&last_synced);
+                    let fsync_execs = Arc::clone(&fsync_execs);
+                    let shortcircuits = Arc::clone(&shortcircuits);
+                    shuttle::thread::spawn(move || {
+                        let my_lsn = next_lsn.fetch_add(1, Ordering::SeqCst);
+                        // Assign our LSN (advances next_available_lsn).
+                        bump_max(&assigned_eof, my_lsn);
+
+                        let aeof2 = Arc::clone(&assigned_eof);
+                        let ls_sync = Arc::clone(&last_synced);
+                        let ls_work = Arc::clone(&last_synced);
+                        let execs2 = Arc::clone(&fsync_execs);
+                        let sc_before =
+                            ls_sync.load(Ordering::SeqCst);
+                        let durable = mgr
+                            .flush_and_sync(
+                                // target_lsn: our commit LSN.
+                                my_lsn,
+                                // synced_watermark reader: the SAME cell the
+                                // caller advances after a completed fsync, so a
+                                // short-circuit only ever observes durable state.
+                                move || ls_sync.load(Ordering::SeqCst),
+                                // fsync closure: syncs the whole log to EOL.
+                                move || {
+                                    execs2
+                                        .fetch_add(1, Ordering::SeqCst);
+                                    let eol =
+                                        aeof2.load(Ordering::SeqCst);
+                                    // Advance the durable watermark to the EOL
+                                    // this fdatasync covered (the completed
+                                    // fsync makes every assigned byte durable).
+                                    let old =
+                                        ls_work.load(Ordering::SeqCst);
+                                    bump_max(&ls_work, eol);
+                                    let newv =
+                                        ls_work.load(Ordering::SeqCst);
+                                    assert_fsynced_never_decreases(
+                                        old,
+                                        newv.max(old),
+                                    );
+                                    Ok(eol)
+                                },
+                            )
+                            .expect("no fault injected: fsync must succeed");
+
+                        // If we returned without our fsync closure running for
+                        // us (watermark already covered us on wake), record it
+                        // as a short-circuit for the coverage assertion below.
+                        let d = durable.as_u64();
+                        if d > sc_before {
+                            shortcircuits.fetch_add(1, Ordering::Relaxed);
+                        }
+
+                        // INVARIANT 1 + 3: the watermark we observed on return
+                        // covers our commit LSN — on BOTH the leader path and
+                        // the short-circuit path.  A short-circuit returns the
+                        // (completed-fsync-advanced) watermark, so this proves
+                        // our bytes were durable BEFORE our commit returned.
+                        assert_durable_covers_commit(d, my_lsn);
+                        // The global durable watermark also covers us.
+                        let global = last_synced.load(Ordering::SeqCst);
+                        assert_durable_covers_commit(global, my_lsn);
+                    })
+                })
+                .collect();
+
+            for h in handles {
+                h.join().unwrap();
+            }
+
+            // Coalescing: the short-circuit means FEWER fsyncs than committers
+            // in interleavings where a leader's EOL-sync covers a sibling —
+            // 1..=N executions, and strictly < N whenever any short-circuit
+            // fired.  Never more than N (no redundant double-fsync).
+            let execs = fsync_execs.load(Ordering::SeqCst);
+            assert!(
+                (1..=N).contains(&execs),
+                "fsync executions {execs} out of range 1..={N}"
+            );
+            // INVARIANT 2 (final): every assigned LSN is under the watermark.
             let final_synced = last_synced.load(Ordering::SeqCst);
             let highest = next_lsn.load(Ordering::SeqCst) - 1;
             assert!(

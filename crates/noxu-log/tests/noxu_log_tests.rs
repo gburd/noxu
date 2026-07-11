@@ -649,7 +649,7 @@ fn test_fsync_manager_grouping_reduces_fsyncs() {
 
         let handle = std::thread::spawn(move || {
             b.wait();
-            mgr.flush_and_sync(|| {
+            mgr.flush_and_sync(0, || 0, || {
                 sc.fetch_add(1, Ordering::SeqCst);
                 std::thread::sleep(std::time::Duration::from_millis(5));
                 Ok(0)
@@ -683,7 +683,7 @@ fn test_fsync_manager_flush_only_no_fsync() {
 
     let c = Arc::clone(&call_count);
     manager
-        .flush_and_sync(|| {
+        .flush_and_sync(0, || 0, || {
             c.fetch_add(1, Ordering::SeqCst);
             Ok(0)
         })
@@ -714,7 +714,7 @@ fn test_fsync_manager_waiter_notified() {
 
     let t1 = std::thread::spawn(move || {
         bar1.wait();
-        mgr1.flush_and_sync(|| {
+        mgr1.flush_and_sync(0, || 0, || {
             std::thread::sleep(std::time::Duration::from_millis(20));
             Ok(0)
         })
@@ -724,7 +724,7 @@ fn test_fsync_manager_waiter_notified() {
 
     let t2 = std::thread::spawn(move || {
         bar2.wait();
-        mgr2.flush_and_sync(|| Ok(0)).unwrap();
+        mgr2.flush_and_sync(0, || 0, || Ok(0)).unwrap();
         done2.fetch_add(1, Ordering::SeqCst);
     });
 
@@ -743,7 +743,7 @@ fn test_fsync_manager_waiter_notified() {
 #[test]
 fn test_fsync_manager_flush_error_propagates() {
     let manager = FsyncManager::new(0, 0);
-    let result = manager.flush_and_sync(|| {
+    let result = manager.flush_and_sync(0, || 0, || {
         Err::<u64, _>(std::io::Error::other("simulated flush error"))
     });
     assert!(result.is_err(), "error must be propagated to caller");
@@ -758,7 +758,7 @@ fn test_fsync_manager_sequential_calls_each_flush() {
     for _ in 0..5 {
         let c = Arc::clone(&call_count);
         manager
-            .flush_and_sync(|| {
+            .flush_and_sync(0, || 0, || {
                 c.fetch_add(1, Ordering::SeqCst);
                 Ok(0)
             })
