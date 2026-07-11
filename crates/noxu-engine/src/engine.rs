@@ -335,6 +335,12 @@ impl Engine {
         let (sleep_ms, n_files) =
             self.cleaner.throttle.update(bytes_written, cleaning_needed);
 
+        // Publish the current backlog (files queued but not yet cleaned) so
+        // write-path backpressure fires only when the cleaner is behind.
+        let backlog =
+            self.cleaner.get_file_selector().lock().get_stats().to_be_cleaned;
+        self.cleaner.throttle.set_backlog(backlog as u64);
+
         let result = self
             .cleaner
             .do_clean(n_files, false)

@@ -516,9 +516,13 @@ impl Transaction {
             None
         };
 
-        // Apply cleaner write-path backpressure: if the log write rate exceeds
-        // the cleaner's capacity, sleep briefly to let cleaning catch up.
-        // Implements CleanerThrottle.getWriteDelay() path in Txn.commit().
+        // Apply cleaner write-path backpressure: sleep briefly ONLY when the
+        // cleaner has fallen behind (a real backlog of files queued for
+        // cleaning), so writers slow to let cleaning catch up and the log does
+        // not grow unboundedly. When the cleaner is keeping up (the common
+        // case) this returns None and no sleep occurs. JE-faithful gating on
+        // the cleaner falling behind (EnvironmentImpl.checkDiskLimitViolation),
+        // NOT on a raw write rate.
         // Extract the throttle Arc while holding the env lock, then
         // drop the lock BEFORE sleeping to avoid blocking other threads.
         if !self.read_only

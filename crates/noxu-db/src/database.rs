@@ -873,9 +873,11 @@ impl Database {
         }
 
         // Apply cleaner write-path backpressure for auto-commit (no-txn) bulk
-        // writes: if the log write rate exceeds the cleaner's capacity, sleep
-        // briefly so the cleaner can keep up.  Transactional paths handle this
-        // in Transaction::commit_with_durability() instead.
+        // writes: sleep briefly ONLY when the cleaner has fallen behind (a real
+        // backlog of files queued for cleaning), so the cleaner can catch up.
+        // When the cleaner is keeping up this returns None and no sleep occurs.
+        // Transactional paths handle this in
+        // Transaction::commit_with_durability() instead.
         if txn.is_none()
             && let Some(delay) = self
                 .cleaner_throttle
