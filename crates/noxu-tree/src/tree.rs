@@ -3342,8 +3342,11 @@ impl Tree {
             // Upper IN: find the child slot with the largest key <= search
             // key, and capture the child Arc WHILE HOLDING the guard.
             // Slot 0 has a virtual key that compares as -infinity.
-            let parent_arc = NodeArcReadGuard::rwlock(&guard).clone();
-            let next_arc = match &*guard {
+            // The parent Arc is only needed on the cold `child evicted`
+            // branch (`child_at_or_fetch` re-fetches under a write latch).
+            // On the hot resident-child path it is discarded, so clone it
+            // lazily inside that branch instead of on every level.
+            let (parent_arc, next_arc) = match &*guard {
                 TreeNode::Internal(n) => {
                     if n.entries.is_empty() {
                         return None;
@@ -3364,7 +3367,7 @@ impl Tree {
                         // slot LSN (JE ChildReference.fetchTarget).  Must
                         // drop the parent read guard to upgrade to a write
                         // latch inside child_at_or_fetch.
-                        None => idx,
+                        None => (NodeArcReadGuard::rwlock(&guard).clone(), idx),
                     }
                 }
                 TreeNode::Bottom(_) => {
@@ -3463,8 +3466,9 @@ impl Tree {
             }
 
             // Upper IN: same hand-over-hand descent as `Tree::search`.
-            let parent_arc = NodeArcReadGuard::rwlock(&guard).clone();
-            let next_idx = match &*guard {
+            // Clone the parent Arc lazily — only the cold evicted-child branch
+            // consumes it; the hot resident path discards it.
+            let (parent_arc, next_idx) = match &*guard {
                 TreeNode::Internal(n) => {
                     if n.entries.is_empty() {
                         return None;
@@ -3479,7 +3483,7 @@ impl Tree {
                             continue;
                         }
                         // EV-14/EV-13: re-fetch an evicted child from its LSN.
-                        None => idx,
+                        None => (NodeArcReadGuard::rwlock(&guard).clone(), idx),
                     }
                 }
                 TreeNode::Bottom(_) => {
