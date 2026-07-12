@@ -15,6 +15,31 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Performance
+
+- **fsync group-commit coalescing verified by direct measurement (not the
+  suspected 1:1 convoy).** The `xbench` `RESULT` line now emits the batch
+  factor and fsync stats (`n_fsyncs`, `n_fsync_requests`, `n_group_commits`,
+  `batch_factor = committed_writes / n_fsyncs`, `fsync_ms_each`,
+  `n_fsync_timeouts`) so the group-commit piggyback can be checked on any run.
+  On NVMe (btrfs), 64-thread `tdb_write` SYNC, warm steady state: **before** —
+  the reported symptom was `batch_factor ~= 1` (each commit ~= one
+  `fdatasync`), disk idle; **after (measured)** — `batch_factor = 23.2`
+  (~23 commits per `fdatasync`), `fsync_ms_each = 1.13 ms`, 0 fsync timeouts,
+  disk 36-64 % busy, ~24k ops/s. The premise is **falsified on reproducible
+  hardware**: the JE-faithful single-leader piggyback coalesces correctly; the
+  per-commit fsync round-trip is not the write ceiling. A/B confirmed two
+  non-fixes: `max_leaders=4` *hurts* (batch_factor 23 -> 4, `n_fsyncs` nearly
+  doubles, throughput ~4x lower — arriving committers become parallel leaders
+  instead of piggybacking), and a `grpc` grace-period wait lands within noise
+  of the shipped no-wait default. Benchmark-only change (instrumentation + A/B
+  env knobs `BENCH_MAX_LEADERS` / `BENCH_GC_THRESHOLD` / `BENCH_GC_INTERVAL_MS`
+  / `BENCH_CONSOLIDATION`); no production code changed. Durability proofs
+  unchanged: `shuttle_fsync_manager` 5/5, `crash_recovery_test` 12/12,
+  `recovery_correctness_test` 22/22. See
+  `docs/src/internal/fsync-group-commit-batch-factor-2026-07.md`; the
+  `batch_factor` field is intended for the 96-core EC2 re-measurement.
+
 ### Fixed
 
 - **Unbounded process-RSS growth on a pure-read workload larger than the
