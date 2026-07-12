@@ -125,3 +125,4 @@
   - [Wave GB — DbTree foundation + P-2 recovery investigation](internal/wave-gb-dbtree-recovery.md)
     - [Deferred-blocker implementation designs](internal/deferred-blocker-designs-2026-06.md)
   - [Write ceiling: the cleaner throttle (2026-07)](internal/write-ceiling-cleaner-throttle-2026-07.md)
+  - [fsync group-commit: batch factor (2026-07)](internal/fsync-group-commit-batch-factor-2026-07.md)

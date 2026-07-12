@@ -486,6 +486,20 @@ fn main() {
     ecfg.set_transactional(true);
     ecfg.set_cache_size(cache);
     ecfg.set_durability(dur);
+    // fsync group-commit A/B knobs (default = shipped values).
+    let max_leaders = envp("BENCH_MAX_LEADERS", 1) as usize;
+    if max_leaders > 1 {
+        ecfg.set_log_fsync_max_leaders(max_leaders);
+    }
+    let gc_threshold = envp("BENCH_GC_THRESHOLD", 0) as usize;
+    let gc_interval = envp("BENCH_GC_INTERVAL_MS", 0);
+    if gc_threshold > 0 && gc_interval > 0 {
+        ecfg.log_group_commit_threshold = gc_threshold;
+        ecfg.log_group_commit_interval_ms = gc_interval;
+    }
+    if envs("BENCH_CONSOLIDATION", "0") == "1" {
+        ecfg.set_log_consolidation_array(true);
+    }
     let env = Arc::new(Environment::open(ecfg).expect("open env"));
     let db = Arc::new(
         env.open_database(
@@ -805,6 +819,27 @@ fn main() {
     // back to /proc/self/io write_bytes delta if the log counter is 0.
     let log_wb1 =
         s1.as_ref().map(|s| s.log.n_sequential_write_bytes).unwrap_or(0);
+    // Group-commit coalescing: batch_factor = committed_writes / n_log_fsyncs.
+    // ~1.0 => piggyback broken (each commit ~= one fdatasync); >>1 => real
+    // coalescing. n_group_commits = batches that served >=1 waiter.
+    let n_fsyncs = s1.as_ref().map(|s| s.log.n_log_fsyncs).unwrap_or(0);
+    let n_fsync_reqs =
+        s1.as_ref().map(|s| s.log.n_fsync_requests).unwrap_or(0);
+    let n_group_commits =
+        s1.as_ref().map(|s| s.log.n_group_commits).unwrap_or(0);
+    let fsync_time_ms = s1.as_ref().map(|s| s.log.fsync_time_ms).unwrap_or(0);
+    let n_fsync_timeouts =
+        s1.as_ref().map(|s| s.log.n_fsync_timeouts).unwrap_or(0);
+    let fsync_ms_each = if n_fsyncs > 0 {
+        fsync_time_ms as f64 / n_fsyncs as f64
+    } else {
+        0.0
+    };
+    let batch_factor = if n_fsyncs > 0 {
+        committed_writes as f64 / n_fsyncs as f64
+    } else {
+        0.0
+    };
     let proc_wb1 = proc_write_bytes();
     let log_written = log_wb1.saturating_sub(log_wb0);
     let proc_written = proc_wb1.saturating_sub(proc_wb0);
@@ -821,7 +856,9 @@ fn main() {
 no_wait={no_wait} throughput={:.0} ops/s ops={total} aborts={ab} abort_rate={:.4} \
 p50={} p90={} p99={} p999={} p9999={} max={} \
 cache_hit_rate={:.4} committed_reads={committed_reads} ln_faults={ln_faults} cached_bins={cached_bins} lru_size={lru_size} ops_per_gb={:.0} \
-committed_writes={committed_writes} user_bytes={user_bytes} log_write_bytes={log_written} proc_write_bytes={proc_written} write_amp={:.3}",
+committed_writes={committed_writes} user_bytes={user_bytes} log_write_bytes={log_written} proc_write_bytes={proc_written} write_amp={:.3} \
+n_fsyncs={n_fsyncs} n_fsync_requests={n_fsync_reqs} n_group_commits={n_group_commits} batch_factor={:.2} \
+fsync_time_ms={fsync_time_ms} fsync_ms_each={fsync_ms_each:.2} n_fsync_timeouts={n_fsync_timeouts}",
         total as f64 / el,
         ab as f64 / total.max(1) as f64,
         hist.pct(0.50),
@@ -832,7 +869,8 @@ committed_writes={committed_writes} user_bytes={user_bytes} log_write_bytes={log
         hist.max.load(Ordering::Relaxed),
         cache_hit_rate,
         ops_per_gb,
-        write_amp
+        write_amp,
+        batch_factor
     );
 
     db.close().unwrap();
