@@ -213,6 +213,20 @@ pub struct Evictor {
 
     stats: EvictorStats,
     shutdown: AtomicBool,
+    /// Single-flight guard for the eviction batch.  `do_evict` /
+    /// `do_evict_with_callbacks` may be called concurrently by the background
+    /// daemon AND by application threads running foreground critical eviction
+    /// (both the write path `Database::put_bytes` and, since the read-fault
+    /// RSS-leak fix, the read path `Database::get_bytes`).  The batch is NOT
+    /// safe to run from two threads at once: two runs can both select the
+    /// same node from the policy and both `pri2.add_back`/`add_front` it,
+    /// double-adding to the intrusive `SlabList` (its `debug_assert!` on
+    /// re-add fires; in release the list corrupts).  This flag serialises the
+    /// batch: a thread that finds it already set skips its run (some other
+    /// thread is already reclaiming), matching JE where the shared `Evictor`
+    /// coordinates its threads rather than letting every caller sweep the one
+    /// `INList` simultaneously.
+    evicting: AtomicBool,
     max_batch_size: usize,
     /// When true, skip the pri2 dirty-node staging list (lru_only mode).
     lru_only: bool,
@@ -329,6 +343,7 @@ impl Evictor {
             pri2: Mutex::new(SlabList::new()),
             stats: EvictorStats::new(),
             shutdown: AtomicBool::new(false),
+            evicting: AtomicBool::new(false),
             max_batch_size,
             lru_only,
             use_dirty_lru: !lru_only,
@@ -1061,6 +1076,17 @@ impl Evictor {
                 if !self.arbiter.is_over_budget() {
                     return EvictResult::zero();
                 }
+                // Single-flight cheap early-out: if a batch is already in
+                // flight, skip BEFORE the expensive `candidate_trees()`
+                // registry-lock + tree-clone setup.  A foreground read/write
+                // doing critical eviction must not block or duplicate the
+                // daemon's in-flight sweep (the concurrent-batch double-add
+                // guarded by `evicting`).  Manual/CacheMode are proactive and
+                // still proceed to the authoritative guard in
+                // `do_evict_with_callbacks`.
+                if self.evicting.load(Ordering::Acquire) {
+                    return EvictResult::zero();
+                }
             }
             EvictionSource::Manual | EvictionSource::CacheMode => {}
         }
@@ -1418,7 +1444,30 @@ impl Evictor {
             return EvictResult::zero();
         }
 
+        // Single-flight: only one thread runs the batch at a time.  A thread
+        // that loses the race skips — another thread (daemon or a foreground
+        // critical-eviction caller) is already reclaiming, and letting two
+        // batches run concurrently double-adds nodes to the pri2 `SlabList`
+        // (see the `evicting` field doc).  Foreground callers therefore never
+        // block; they simply defer to the in-flight run.
+        if self
+            .evicting
+            .compare_exchange(
+                false,
+                true,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            return EvictResult::zero();
+        }
+
         let result = self.evict_batch(source, node_info_fn, node_size_fn);
+
+        // Release the single-flight guard before crediting the budget/stats;
+        // the batch is done touching the policy lists at this point.
+        self.evicting.store(false, Ordering::Release);
 
         // F2: decrement the shared budget counter by the bytes just freed.
         // evict_batch only *accounts* bytes_evicted; without this the counter

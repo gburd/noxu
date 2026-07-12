@@ -569,6 +569,21 @@ impl Database {
     ) -> Result<Option<Bytes>> {
         self.check_open()?;
         self.reject_txn_on_non_txnal_db(txn.is_some())?;
+        // EV-15 (read path): per-read synchronous critical eviction, matching
+        // JE `Cursor.beginMoveCursor` -> `CursorImpl.criticalEviction` which
+        // runs before EVERY cursor operation, reads included (Cursor.java
+        // :5169, CursorImpl.java:252/568/...).  Previously only the WRITE path
+        // (`put_bytes`) called this; a pure-READ workload on a dataset larger
+        // than the cache therefore had NO foreground back-pressure.  Every
+        // cold LN fault faults + re-fetches a BIN (charging the budget) with
+        // only the single background daemon to reclaim, which cannot keep pace
+        // with N reader threads -- so `cache_usage` (and RSS) grew far past
+        // the configured budget and did not plateau.  Draining a bounded
+        // eviction batch here, gated on `need_critical_eviction()` (only fires
+        // when critically over budget, so cache-resident reads pay nothing),
+        // is the JE-faithful foreground back-pressure that holds RSS at the
+        // cache size on a read-only workload.
+        self.evictor.do_critical_eviction();
         observe_span!(
             "db_get",
             db_name = self.name.as_str(),

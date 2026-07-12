@@ -6634,6 +6634,13 @@ impl Tree {
         let log_lsn = *self.root_log_lsn.read();
         let node = self.fetch_node_from_log(log_lsn)?;
         let node_id = node.node_id();
+        // MEM-FETCH-1: charge the fetched root's resident memory to the budget
+        // (see the detailed rationale in `child_at_or_fetch`; JE
+        // `IN.postFetchInit` charges every fetched node's `inMemorySize`).
+        if let Some(counter) = &self.memory_counter {
+            let sz = node.budgeted_memory_size();
+            counter.fetch_add(sz as i64, Ordering::Relaxed);
+        }
         let arc = Arc::new(RwLock::new(node));
         *root_slot = Some(arc.clone());
         drop(root_slot);
@@ -6688,6 +6695,29 @@ impl Tree {
         let child_lsn = n.get_lsn(idx);
         let node = self.fetch_node_from_log(child_lsn)?;
         let node_id = node.node_id();
+        // MEM-FETCH-1: charge the fetched node's full resident memory to the
+        // shared budget counter (JE `IN.postFetchInit` -> `commonInit` ->
+        // `initMemorySize()` + `addToMainCache()` -> `updateMemoryBudget()`
+        // -> `MemoryBudget.updateTreeMemoryUsage(+inMemorySize)`, IN.java
+        // :2951/4621/4827).  A full-BIN log entry serialises its LN VALUES
+        // inline (`BinStub::serialize_full`), so `deserialize_bin` restores a
+        // BIN whose slots already hold resident LN `data` -- tens of KB per
+        // BIN.  Previously the fetch path only added the node to the eviction
+        // policy (`note_added`) and never charged this resident data to the
+        // budget.  On a dataset >> cache read workload the evictor faults BINs
+        // back continuously; the fetched-in LN data piled up RESIDENT BUT
+        // UNCOUNTED, so the budget signal stayed far below the true heap and
+        // eviction could not hold RSS to the cache size (measured: RSS climbed
+        // unbounded to many GB while `cache_usage` read ~budget).  Worse, when
+        // eviction later stripped such a BIN it credited `release_memory` for
+        // bytes the counter never charged, driving `cache_usage` below
+        // reality.  Charging on install closes both gaps: the budget now sees
+        // the fetched data, eviction fires against it, and strip/detach
+        // credits are symmetric with a real prior charge.
+        if let Some(counter) = &self.memory_counter {
+            let sz = node.budgeted_memory_size();
+            counter.fetch_add(sz as i64, Ordering::Relaxed);
+        }
         let arc: ChildArc = Arc::new(RwLock::new(node));
         // Wire the fetched child's parent back-pointer to `parent_arc`.  The
         // serialized node carries no parent link (it is per-in-memory-tree),
@@ -7063,6 +7093,20 @@ impl Tree {
         match entry_type {
             LogEntryType::BIN => {
                 Self::deserialize_bin(&in_entry.node_data).map(|mut bin| {
+                    // MEM-FETCH-1 / JE `IN.postFetchInit(db, fetchedLsn)`
+                    // (IN.java:2902) -> `setLastLoggedLsn(fetchedLsn)`
+                    // (IN.java:5197): a BIN read back from a FULL-BIN log
+                    // entry has its `lastFullVersion` set to the LSN it was
+                    // fetched from (the `getLastFullLsn() == NULL` case,
+                    // IN.java:5199-5201).  Without this a re-fetched BIN
+                    // carries `last_full_lsn == NULL_LSN`, so the evictor's
+                    // `detach_node_by_id` never-logged guard refuses to evict
+                    // it while `node_size_fn` still credits the eviction to
+                    // `cache_usage` (fallback path) -- the budget drops but
+                    // the BIN stays resident, an unbounded RSS leak on the
+                    // cold-LN-fault read path.  The fetched-from LSN IS this
+                    // BIN's durable full-BIN version, so stamp it here.
+                    bin.last_full_lsn = log_lsn;
                     // `deserialize_bin` always recomputes a key prefix from
                     // the loaded keys.  When this tree has key-prefixing
                     // DISABLED, the insert/redo paths use the full-key
@@ -7185,6 +7229,14 @@ impl Tree {
                 }
                 bin.is_delta = false;
                 bin.dirty = false;
+                // MEM-FETCH-1 / JE `BINDeltaLogEntry.readEntry()` sets
+                // `lastFullVersion` to the base full-BIN LSN of the
+                // reconstituted delta (IN.java:323-332, :5553
+                // `bin.setLastFullLsn(item.lsn)`).  Stamp the base full LSN so
+                // this re-fetched BIN has a durable full version and the
+                // evictor's `detach_node_by_id` never-logged guard can later
+                // evict it (same leak fix as the full-BIN branch above).
+                bin.last_full_lsn = base_full_lsn;
                 if self.key_prefixing {
                     bin.recompute_key_prefix();
                 } else if !bin.key_prefix.is_empty() {

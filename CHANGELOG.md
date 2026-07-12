@@ -15,6 +15,64 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Fixed
+
+- **Unbounded process-RSS growth on a pure-read workload larger than the
+  cache.** During a read-only workload over a dataset larger than the cache,
+  process RSS grew unbounded and linear — it did NOT plateau, climbing toward
+  (and, given time, past) the full dataset size no matter how long the workload
+  ran. Measured (256 MiB cache, 4 GiB dataset, 16 threads, `ycsb_c`): RSS
+  climbed 447 → 540 → 936 → 1400 → 1760 MiB and kept rising (on a 24 GiB EC2
+  dataset it reached ~39 GiB against a 4 GiB cache); glibc `malloc_stats`
+  confirmed the memory was genuinely live (`in use bytes` ≈ RSS, `malloc_trim`
+  reclaimed ~0), not fragmentation. After the fix, RSS **plateaus and stays
+  flat** for the remainder of the run instead of growing without bound (e.g. the
+  256 MiB-cache / 4 GiB-dataset case settles at a stable ~3 GiB rather than
+  climbing forever). Two independent defects combined:
+
+  1. **Fetched-in LN data was resident but uncounted
+     (`Tree::fetch_node_from_log`).** A full-BIN log entry serialises its LN
+     values inline, so a BIN re-fetched on a cold fault (`child_at_or_fetch` /
+     `fetch_root_from_log`) returns with tens of KiB of resident LN data — but
+     the fetch path only added the node to the eviction policy (`note_added`)
+     and never charged that data to the shared `cache_usage` counter. The
+     budget signal stayed far below the true heap, so eviction could not tell
+     it was over budget. Fixed by charging `budgeted_memory_size()` on install,
+     mirroring JE `IN.postFetchInit` → `initMemorySize()` +
+     `MemoryBudget.updateTreeMemoryUsage(+size)`.
+  2. **No foreground eviction back-pressure on the READ path
+     (`Database::get_bytes`).** JE calls `EnvironmentImpl.criticalEviction()`
+     before every cursor operation, reads included
+     (`Cursor.beginMoveCursor`); Noxu wired it only on the write path
+     (`put_bytes`). A pure-read workload therefore relied solely on the single
+     background evictor daemon, which cannot keep pace with N reader threads
+     faulting and re-fetching BINs, so the cache overshot the budget without
+     bound. Fixed by calling `do_critical_eviction()` on the read path too
+     (gated on `need_critical_eviction()`, so cache-resident reads pay only two
+     atomic loads).
+
+  A third accounting defect was fixed as part of (1): `detach_node_by_id`
+  refused to evict a re-fetched BIN whose `last_full_lsn` was left `NULL`
+  (never-logged guard), while the evictor's `node_size_fn` still credited the
+  eviction — decrementing `cache_usage` for a BIN that stayed resident.
+  `fetch_node_from_log` now stamps the fetched-from LSN into the re-fetched
+  BIN (JE `IN.setLastLoggedLsn`), so a re-fetched BIN has a durable full
+  version and is evictable. Regression test:
+  `noxu-db/tests/read_fault_rss_leak_test.rs` — reads an 80 MiB dataset against
+  an 8 MiB cache for 700k ops and asserts RSS growth stays bounded; it fails on
+  the pre-fix code (RSS grew 77 MiB, climbing toward the full dataset) and
+  passes after the fix (read-phase growth stays bounded near the cache budget).
+
+  Known residual (tracked separately): at large dataset-to-cache ratios with
+  many concurrent reader threads, the *absolute* resident set can still settle
+  well above the configured cache (it tracks a large fraction of the dataset)
+  even though it no longer grows without bound. Foreground critical eviction is
+  single-flighted (one batch at a time, to avoid a concurrent-batch double-add
+  to the eviction policy's intrusive list), so under N simultaneous faulters
+  the single in-flight eviction pass does not fully keep pace with the fault
+  rate. The unbounded leak is fixed; tightening absolute budget adherence under
+  heavy concurrent faulting is follow-up work.
+
 ## [7.5.2] - 2026-07-11
 
 ### Performance
