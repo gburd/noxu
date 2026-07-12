@@ -25,6 +25,10 @@ name = "noxu-xbench"
 path = "src/bin/xbench.rs"
 
 [[bin]]
+name = "noxu-recover"
+path = "src/bin/recover.rs"
+
+[[bin]]
 name = "noxu-sustained-write"
 path = "src/bin/sustained_write.rs"
 

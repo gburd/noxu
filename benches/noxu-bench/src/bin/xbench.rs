@@ -823,18 +823,14 @@ fn main() {
     // ~1.0 => piggyback broken (each commit ~= one fdatasync); >>1 => real
     // coalescing. n_group_commits = batches that served >=1 waiter.
     let n_fsyncs = s1.as_ref().map(|s| s.log.n_log_fsyncs).unwrap_or(0);
-    let n_fsync_reqs =
-        s1.as_ref().map(|s| s.log.n_fsync_requests).unwrap_or(0);
+    let n_fsync_reqs = s1.as_ref().map(|s| s.log.n_fsync_requests).unwrap_or(0);
     let n_group_commits =
         s1.as_ref().map(|s| s.log.n_group_commits).unwrap_or(0);
     let fsync_time_ms = s1.as_ref().map(|s| s.log.fsync_time_ms).unwrap_or(0);
     let n_fsync_timeouts =
         s1.as_ref().map(|s| s.log.n_fsync_timeouts).unwrap_or(0);
-    let fsync_ms_each = if n_fsyncs > 0 {
-        fsync_time_ms as f64 / n_fsyncs as f64
-    } else {
-        0.0
-    };
+    let fsync_ms_each =
+        if n_fsyncs > 0 { fsync_time_ms as f64 / n_fsyncs as f64 } else { 0.0 };
     let batch_factor = if n_fsyncs > 0 {
         committed_writes as f64 / n_fsyncs as f64
     } else {

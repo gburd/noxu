@@ -1452,12 +1452,7 @@ impl Evictor {
         // block; they simply defer to the in-flight run.
         if self
             .evicting
-            .compare_exchange(
-                false,
-                true,
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            )
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
             return EvictResult::zero();

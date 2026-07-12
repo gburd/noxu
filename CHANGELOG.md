@@ -15,6 +15,8 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+## [7.5.3] - 2026-07-12
+
 ### Performance
 
 - **fsync group-commit coalescing verified by direct measurement (not the
