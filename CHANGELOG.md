@@ -15,6 +15,44 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Fixed
+
+- **`Durability` convenience constants diverged from JE (silent HA semantic
+  drift).** `Durability::COMMIT_SYNC`, `COMMIT_NO_SYNC`, and
+  `COMMIT_WRITE_NO_SYNC` did not match `com.sleepycat.je.Durability`. JE defines
+  all three with `replicaSync = NO_SYNC` and `replicaAck = SIMPLE_MAJORITY`;
+  Noxu had `COMMIT_SYNC` with `replicaSync = Sync`, `COMMIT_WRITE_NO_SYNC` with
+  `replicaSync = WriteNoSync`, and — most seriously — `COMMIT_NO_SYNC` with
+  `replicaAck = None`. The last was a silent durability *downgrade* in an HA
+  deployment: a `COMMIT_NO_SYNC` transaction on a master waited for **zero**
+  replica acknowledgments instead of the majority JE guarantees
+  (`Transaction::commit` gates the ack-wait on `durability.replica_ack`). The
+  `COMMIT_SYNC` / `COMMIT_WRITE_NO_SYNC` drift made replicas perform a
+  synchronous fsync JE never required (a latency regression). Local (non-
+  replicated) commit behavior was unaffected — `local_sync` was already correct
+  in all three and the ack-wait only engages when a replica coordinator is
+  wired. All three constants now match JE exactly, with tests asserting the JE
+  values. Also corrected `SyncPolicy::NoSync`'s doc comment, which
+  contradicted itself ("OS buffers only" vs. "application buffers"): `NoSync`
+  keeps the commit in the in-memory log buffer (lost on process crash);
+  `WriteNoSync` writes to OS buffers (survives process crash, lost on power
+  loss).
+
+### Documentation
+
+- **Explicit Berkeley DB Java Edition attribution + `NOTICE` file.** The
+  README acknowledgements now name Oracle Berkeley DB Java Edition 7.5.11 as
+  the reference implementation Noxu's architecture and API track, and a new
+  top-level `NOTICE` file records the Apache-2.0 attribution and the provenance
+  methodology (what was translated from JE source, reimplemented from JE
+  documentation, or original to Noxu), per Apache-2.0 §4 for the JE-derived
+  portions. Added an honest project-status note to the README: the 7.5.x
+  version tracks the JE release whose architecture it follows and is not a
+  claim of feature parity or production maturity, with pointers to the known
+  limitations (TTL, replication wire auth) and capability matrix. Corrected
+  stale `3.0.2` version references throughout the README and introduction to
+  the current 7.5.3.
+
 ## [7.5.3] - 2026-07-12
 
 ### Performance

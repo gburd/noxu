@@ -1,0 +1,59 @@
+Noxu DB
+Copyright 2026 Greg Burd
+
+This product is an independent Rust implementation of the architecture of
+Oracle Berkeley DB Java Edition (BDB JE), version 7.5.11.
+
+  Berkeley DB Java Edition
+  Copyright (c) 2002, 2020 Oracle and/or its affiliates.
+  Originally developed by Sleepycat Software.
+  Licensed under the Apache License, Version 2.0.
+  https://github.com/berkeleydb/je
+
+================================================================================
+Relationship to Berkeley DB Java Edition (provenance)
+================================================================================
+
+Noxu DB's value proposition is fidelity to BDB JE's design. Its public API,
+engine architecture, algorithms, method structure, and much of its documented
+behavior deliberately track JE 7.5.11. To make the provenance explicit:
+
+  * Translated from JE source structure: the algorithm shapes, method
+    decomposition, invariants, and many doc-comment contents of the core engine
+    (log/file manager, IN/BIN/LN tree with key prefixing and BIN-deltas,
+    evictor with memory budget, cleaner with per-file utilization,
+    checkpoint-based multi-phase recovery, record-level lock manager with
+    deadlock detection) follow JE's Java expression closely. Where Noxu code
+    corresponds to a JE site, the source method is cited in comments.
+
+  * Reimplemented from JE documentation / behavior (not line-for-line): the
+    public API surface (Environment / Database / Cursor / Transaction, the
+    operation-based Get/Put model, secondary databases, join/disk-ordered
+    cursors, sequences, DPL persistence, collections bindings) mirrors JE's
+    documented contracts.
+
+  * Original to Noxu (not derived from JE): the on-disk log format (`.ndb`),
+    the internal sync primitives (`noxu-sync`), memory-mapped log I/O, the
+    replication transport and election protocol (Flexible Paxos, Phi Accrual
+    failure detection, QUIC/rustls), the executable Stateright protocol
+    specifications, the observability stack, and the additional cache-eviction
+    policies (CLOCK / LIRS / ARC / CAR). These carry no inherited JE hardening.
+
+Because portions of this work are derived from the Apache-2.0-licensed BDB JE
+source, this NOTICE file is provided in accordance with Section 4 of the
+Apache License, Version 2.0. The BDB JE copyright and license notices above
+are retained on that basis.
+
+Noxu DB is not affiliated with, endorsed by, or supported by Oracle. "Berkeley
+DB", "Sleepycat", and "Oracle" are trademarks of their respective owners and
+are used here only to describe the reference implementation.
+
+================================================================================
+Third-party dependencies
+================================================================================
+
+Noxu DB links the following external crates under their respective licenses
+(see each crate's repository for full terms): parking_lot, thiserror, log,
+bytes, crc32fast, byteorder, memmap2, fs2, hashbrown, lock_api, lru, libc,
+serde; and, under optional replication/observability features: tokio, quinn,
+rustls / native-tls, tracing, metrics, opentelemetry.

@@ -21,11 +21,14 @@ pub enum SyncPolicy {
     /// Sync but less durable in case of OS crash.
     WriteNoSync,
 
-    /// No write or fsync on commit (OS buffers only).
+    /// No fsync on commit; the commit record is written only to the log
+    /// buffer in application memory (not to the OS).
     ///
-    /// Maximum performance, minimum durability. Data remains in application
-    /// buffers until background writer flushes it. Not durable in case of
-    /// application crash.
+    /// Maximum performance, minimum durability. The commit stays in the
+    /// in-memory log buffer until a later write flushes it to the OS, so a
+    /// process crash before that flush loses the commit. (Contrast
+    /// [`SyncPolicy::WriteNoSync`], which does write to OS buffers and so
+    /// survives a process crash, losing data only on OS/power failure.)
     NoSync,
 }
 
@@ -91,24 +94,34 @@ impl Durability {
         Self { local_sync, replica_sync, replica_ack }
     }
 
-    /// Maximum durability: Sync on master and replicas, all replicas acknowledge.
+    /// Convenience constant matching JE `Durability.COMMIT_SYNC`: the master
+    /// fsyncs on commit, replicas do not fsync, and a simple majority must
+    /// acknowledge. (JE `Durability.java`: `SYNC` / `NO_SYNC` /
+    /// `SIMPLE_MAJORITY`.)
     pub const COMMIT_SYNC: Self = Self {
         local_sync: SyncPolicy::Sync,
-        replica_sync: SyncPolicy::Sync,
+        replica_sync: SyncPolicy::NoSync,
         replica_ack: ReplicaAckPolicy::SimpleMajority,
     };
 
-    /// No sync on commit, maximum performance.
+    /// Convenience constant matching JE `Durability.COMMIT_NO_SYNC`: neither
+    /// the master nor replicas fsync on commit, but a simple majority must
+    /// still acknowledge. (JE `Durability.java`: `NO_SYNC` / `NO_SYNC` /
+    /// `SIMPLE_MAJORITY`.) The acknowledgment guarantee is preserved even
+    /// though the sync policy is relaxed.
     pub const COMMIT_NO_SYNC: Self = Self {
         local_sync: SyncPolicy::NoSync,
         replica_sync: SyncPolicy::NoSync,
-        replica_ack: ReplicaAckPolicy::None,
+        replica_ack: ReplicaAckPolicy::SimpleMajority,
     };
 
-    /// Write but no sync on commit, good balance of performance and durability.
+    /// Convenience constant matching JE `Durability.COMMIT_WRITE_NO_SYNC`: the
+    /// master writes to OS buffers without fsync, replicas do not fsync, and a
+    /// simple majority must acknowledge. (JE `Durability.java`:
+    /// `WRITE_NO_SYNC` / `NO_SYNC` / `SIMPLE_MAJORITY`.)
     pub const COMMIT_WRITE_NO_SYNC: Self = Self {
         local_sync: SyncPolicy::WriteNoSync,
-        replica_sync: SyncPolicy::WriteNoSync,
+        replica_sync: SyncPolicy::NoSync,
         replica_ack: ReplicaAckPolicy::SimpleMajority,
     };
 }
@@ -162,25 +175,30 @@ mod tests {
 
     #[test]
     fn test_durability_commit_sync() {
+        // JE Durability.COMMIT_SYNC = (SYNC, NO_SYNC, SIMPLE_MAJORITY).
         let d = Durability::COMMIT_SYNC;
         assert_eq!(d.local_sync, SyncPolicy::Sync);
-        assert_eq!(d.replica_sync, SyncPolicy::Sync);
+        assert_eq!(d.replica_sync, SyncPolicy::NoSync);
         assert_eq!(d.replica_ack, ReplicaAckPolicy::SimpleMajority);
     }
 
     #[test]
     fn test_durability_commit_no_sync() {
+        // JE Durability.COMMIT_NO_SYNC = (NO_SYNC, NO_SYNC, SIMPLE_MAJORITY):
+        // the majority-ack guarantee is retained even with sync relaxed.
         let d = Durability::COMMIT_NO_SYNC;
         assert_eq!(d.local_sync, SyncPolicy::NoSync);
         assert_eq!(d.replica_sync, SyncPolicy::NoSync);
-        assert_eq!(d.replica_ack, ReplicaAckPolicy::None);
+        assert_eq!(d.replica_ack, ReplicaAckPolicy::SimpleMajority);
     }
 
     #[test]
     fn test_durability_commit_write_no_sync() {
+        // JE Durability.COMMIT_WRITE_NO_SYNC = (WRITE_NO_SYNC, NO_SYNC,
+        // SIMPLE_MAJORITY).
         let d = Durability::COMMIT_WRITE_NO_SYNC;
         assert_eq!(d.local_sync, SyncPolicy::WriteNoSync);
-        assert_eq!(d.replica_sync, SyncPolicy::WriteNoSync);
+        assert_eq!(d.replica_sync, SyncPolicy::NoSync);
         assert_eq!(d.replica_ack, ReplicaAckPolicy::SimpleMajority);
     }
 
@@ -194,7 +212,7 @@ mod tests {
     fn test_durability_equality() {
         let d1 = Durability::new(
             SyncPolicy::Sync,
-            SyncPolicy::Sync,
+            SyncPolicy::NoSync,
             ReplicaAckPolicy::SimpleMajority,
         );
         let d2 = Durability::COMMIT_SYNC;

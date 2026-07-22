@@ -102,7 +102,7 @@ Or depend on the git source directly:
 
 ```toml
 [dependencies]
-noxu = { git = "https://codeberg.org/gregburd/noxu.git", tag = "v3.0.2" }
+noxu = { git = "https://codeberg.org/gregburd/noxu.git", tag = "v7.5.3" }
 ```
 
 Open an environment, write a record, and read it back:

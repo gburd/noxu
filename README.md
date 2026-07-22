@@ -12,7 +12,20 @@ crash recovery, master-replica replication with automatic leader elections,
 and an entity-persistence layer — all in a single library with no external
 database process required.
 
-**Current version**: 3.0.2.  See [CHANGELOG.md](CHANGELOG.md) for the full
+Noxu is an independent Rust implementation of the architecture of Oracle
+Berkeley DB Java Edition (BDB JE) 7.5.11 — its API and engine design track JE
+deliberately (see [Acknowledgements](#acknowledgements) and [NOTICE](NOTICE)).
+The version number tracks the JE release whose architecture it follows; it is
+**not** a claim of feature parity or of equivalent production maturity. Noxu is
+a young engine (first release 2026) with no production track record yet, and
+certain JE 7.5 features are not implemented (notably TTL/record expiration and
+replication wire authentication — see
+[known limitations](docs/src/operations/known-limitations.md) and the
+[capability matrix](https://codeberg.page/gregburd/noxu/introduction.html#capability-matrix)).
+Use it where those constraints are acceptable, and validate durability for your
+workload before relying on it.
+
+**Current version**: 7.5.3.  See [CHANGELOG.md](CHANGELOG.md) for the full
 release history.
 
 ## Quick Start
@@ -21,7 +34,7 @@ Add `noxu` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-noxu = "3"  # or pin to a specific version, e.g. "3.0.2"
+noxu = "7"  # or pin to a specific version, e.g. "7.5.3"
 ```
 
 Alternatively, depend on the git source directly (useful before a crates.io
@@ -29,7 +42,7 @@ release, or to track unreleased commits):
 
 ```toml
 [dependencies]
-noxu = { git = "https://codeberg.org/gregburd/noxu.git", tag = "v3.0.2" }
+noxu = { git = "https://codeberg.org/gregburd/noxu.git", tag = "v7.5.3" }
 ```
 
 The engine is composed of `noxu-*` component crates published as internal
@@ -142,7 +155,7 @@ see [`examples/getting_started.rs`](examples/getting_started.rs) and the
   Phi Accrual Failure Detection, VLSN-based log streaming, network restore,
   master transfer, dynamic membership, and configurable
   `ReplicaAckPolicy` / `ReplicaConsistencyPolicy`.  Transport over TCP or
-  QUIC (`rustls`-based).  **Security note**: as of v3.0.2 the replication
+  QUIC (`rustls`-based).  **Security note**: as of v7.5.3 the replication
   wire protocol has no authentication; deploy only across a trusted network
   boundary.  See
   [`docs/src/operations/known-limitations.md`](docs/src/operations/known-limitations.md)
@@ -164,7 +177,7 @@ Noxu DB is a Cargo workspace of **22 crates**:
 
 See the [crate guide](https://codeberg.page/gregburd/noxu/maintainer/crate-guide.html)
 for a per-crate purpose statement and the
-[v3.0.2 capability matrix](https://codeberg.page/gregburd/noxu/introduction.html#capability-matrix).
+[v7.5.3 capability matrix](https://codeberg.page/gregburd/noxu/introduction.html#capability-matrix).
 
 ## Building and Testing
 
@@ -244,20 +257,29 @@ Issues and patches are welcome at
 
 ## Acknowledgements
 
-Noxu DB's architecture draws on several decades of embedded database
-design.  The B+tree with write-ahead logging and checkpoint recovery
-follows the structure established in the embedded database literature.
-The log-structured approach, BIN-delta write optimisation, and
-memory-budget accounting model are derived from published techniques for
-transactional embedded stores.
+Noxu DB is an independent Rust implementation of the architecture of
+**Oracle Berkeley DB Java Edition (BDB JE) 7.5.11**, developed by Sleepycat
+Software and later Oracle and released under the Apache License 2.0. Noxu's
+public API, engine decomposition (log/file manager, IN/BIN/LN B+tree with key
+prefixing and BIN-deltas, memory-budget evictor, per-file-utilization cleaner,
+checkpoint-based multi-phase recovery, record-level lock manager with deadlock
+detection), and much of its behavior deliberately track JE's; the project's
+goal is fidelity to that design. See [NOTICE](NOTICE) for the provenance
+relationship (what was translated from JE source, what was reimplemented from
+JE documentation, and what is original to Noxu) and the Apache-2.0 attribution.
 
-The replication subsystem implements Flexible Paxos for leader election
-(Howard, Malkhi, and Spiegelman, 2016), the Phi Accrual Failure Detector
-(Hayashibara et al., 2004), and VLSN-based log streaming.  The adaptive
-replacement cache policy (Megiddo and Modha, 2003) and its CART variant
-(Bansal and Modha, 2004) are available as optional eviction strategies.
-The Clock with Adaptive Replacement policy references work by Jiang and
-Zhang (2005).
+Beyond JE, Noxu's B+tree with write-ahead logging and checkpoint recovery, the
+log-structured approach, BIN-delta write optimisation, and memory-budget
+accounting model follow techniques established in the embedded database
+literature.
+
+The replication subsystem departs from JE's design: it implements Flexible
+Paxos for leader election (Howard, Malkhi, and Spiegelman, 2016), the Phi
+Accrual Failure Detector (Hayashibara et al., 2004), and VLSN-based log
+streaming.  The adaptive replacement cache policy (Megiddo and Modha, 2003) and
+its CART variant (Bansal and Modha, 2004) are available as optional eviction
+strategies.  The Clock with Adaptive Replacement policy references work by
+Jiang and Zhang (2005).
 
 ## License
 
