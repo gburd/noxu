@@ -15,6 +15,64 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Security
+
+- **Replication now refuses to run on an unauthenticated wire transport by
+  default (closes the external review's core finding — "ships without wire
+  authentication; a regression vs JE 7.5's SSL-capable HA channels").**
+  `ReplicatedEnvironment::new` now enforces an authenticated-transport policy
+  before starting the service dispatcher: a node configured with the default
+  plaintext `RepTransportKind::Tcp` (or skip-verify `Quic`) and no mTLS
+  material is **refused** with a `ConfigError` directing the operator to
+  configure mutually-authenticated channels
+  (`transport_kind(RepTransportKind::Tls)` + `tls_config(..)` + a non-empty
+  `peer_allowlist(..)`). This mirrors BDB-JE HA, which authenticates the data
+  channel via mutual TLS (`com.sleepycat.je.rep.net.SSLAuthenticator` /
+  `SSLMirrorAuthenticator`) so a peer's identity is *verified from its
+  certificate*, never self-claimed on the wire. Noxu's `PeerAllowlistVerifier`
+  is the direct analogue of JE's `SSLAuthenticator`. You can no longer
+  *accidentally* run an unauthenticated replication cluster.
+  - **Explicit opt-out preserved** for trusted-network / local-dev / CI:
+    `RepConfig::insecure_no_auth(true)` permits the plaintext / skip-verify
+    path and emits a loud `log::warn!` at startup naming the risk. Under
+    `cfg(test)` / the `test-harness` feature this defaults to `true` so the
+    existing suite and the in-process harness keep running on plaintext /
+    in-memory transports without per-test PKI; a production build defaults it
+    to `false` (fail-closed).
+  - **No silent downgrade:** `transport_kind = Tls` without the `tls-rustls`
+    backend compiled in is a hard `ConfigError` (rather than falling through
+    to a plaintext dispatcher), and `Tls` with a missing `tls_config` /
+    empty `peer_allowlist` never binds a plaintext dispatcher.
+  - **In-process transport exempt:** `RepTransportKind::InMemory` has no
+    socket an untrusted peer can reach and is not subject to the wire-auth
+    requirement.
+- **Election RPC now runs over the mutually-authenticated channel when TLS is
+  configured (mitigates the on-path-attacker "flip the master" vector at the
+  transport layer).** The election driver's proposer side now connects to a
+  peer's `ELECTION` service with `connect_to_service_tls` (mutual-TLS
+  handshake + `peer_allowlist` check) whenever `transport_kind == Tls`, so
+  both the acceptor (server) and proposer (client) sides of every Paxos
+  promise/accept exchange traverse an authenticated channel — matching JE HA,
+  whose elections run over the same authenticated `DataChannel` as the rest
+  of the protocol. An off-path or on-path attacker cannot inject or replay a
+  proposal/vote without a CA-issued, allowlisted certificate. (Per-message
+  signing — binding a specific proposal to the handshake cert — is a strictly
+  stronger, separate scheme and is *not* implemented; see
+  `known-limitations.md`.)
+- **Hardened the QUIC skip-verify path documentation.** `SkipCertVerification`,
+  `insecure_client_config`, and `default_server_config`
+  (`net/quic_channel.rs`) are now clearly documented as the *explicit-insecure*
+  path only; the `Quic` transport is gated by the same enforced-auth default
+  above. The authenticated QUIC path
+  (`QuicChannelListener::bind_with_tls_and_allowlist` +
+  `QuicChannel::connect_with_config`) is the recommended production API.
+- **NetworkRestore path-traversal defense confirmed.** The restore client
+  rejects server-supplied filenames containing path separators, `..`, absolute
+  paths, embedded NUL bytes, or hidden dotfiles
+  (`network_restore::validate_restore_filename`, applied in both `execute` and
+  `execute_via_dispatcher`), so a malicious peer can no longer direct writes
+  outside the designated restore directory.
+
 ### Fixed
 
 - **`Durability` convenience constants diverged from JE (silent HA semantic

@@ -1,49 +1,89 @@
 # 7. Known Limitations
 
-## Replication security — **deploy only on a trusted network**
+## Replication security — mTLS is the enforced default
 
-The May-2026 security review (see
-the 2026 review) identified
-six blocker-class security gaps in the replication wire
-protocol. Until those are closed, **the replication
-subsystem must not be deployed across an untrusted network
-boundary**:
+The May-2026 security review (see the 2026 review) identified six
+blocker-class security gaps in the replication wire protocol. **The
+authenticated-transport gaps are now closed by default**: a
+`ReplicatedEnvironment` on the default plaintext transport **refuses to
+start** unless the operator either (a) configures mutually-authenticated
+channels, or (b) explicitly opts out for a trusted network. Status of each
+original gap:
 
-- The replication wire protocol has no authentication. A peer
-  identity (`group_name`, `node_name`) is self-claimed
-  plaintext and not verified.
-- **`peer_allowlist` (mTLS Phase 2 — v3.1.0)**: `RepConfig::peer_allowlist`
-  is now enforced at the TLS handshake layer via
-  `TlsTcpChannelListener::bind_with_tls_and_allowlist`.  Peers whose
-  certificate Subject CN or DNS SAN does not match the configured list
-  are rejected before any application data is exchanged.  Requires
-  `RepTransportKind::Tls`; see the replication security setup guide.
-- `NetworkRestoreServer` streams the entire on-disk
-  environment to anyone who connects to its port.
-- `PeerFeederService` streams the WAL to anyone who connects.
-- Election proposals and votes are unsigned and unauthenticated.
-  An on-path attacker can flip the cluster master.
-- `NetworkRestore` (client) trusts server-supplied filenames —
-  a malicious peer can write attacker-controlled bytes to any
-  filesystem path the noxu process can write
-  (path traversal).
-- TCP frame `payload_len` (32-bit) is unbounded — a single
-  attacker frame can trigger a 4 GiB allocation.
-- The QUIC channel's ergonomic constructor (`QuicChannel::connect`)
-  installs a no-op `ServerCertVerifier`. The user must
-  explicitly opt OUT of skip-verification by using
-  `connect_with_config` to get authenticated TLS.
+- **Wire protocol authentication — CLOSED (enforced default).**
+  `ReplicatedEnvironment::new` refuses to bring up a replication dispatcher on
+  an unauthenticated transport (default `RepTransportKind::Tcp`, or
+  skip-verify `Quic`) unless `RepConfig::insecure_no_auth(true)` is set. The
+  authenticated path (`transport_kind(RepTransportKind::Tls)` + `tls_config` +
+  a non-empty `peer_allowlist`) verifies each peer's identity from its
+  certificate during the mutual-TLS handshake — never self-claimed plaintext.
+  This is the direct analogue of BDB-JE HA's authenticated data channel
+  (`com.sleepycat.je.rep.net.SSLAuthenticator` / `SSLMirrorAuthenticator`).
+- **`peer_allowlist` (mTLS Phase 2/3) — CLOSED.** `RepConfig::peer_allowlist`
+  is enforced at the TLS handshake layer via
+  `TlsTcpChannelListener::bind_with_tls_and_allowlist` /
+  `TlsTcpServiceDispatcher` (and the QUIC equivalent). Peers whose certificate
+  Subject CN or DNS SAN does not match the configured list are rejected before
+  any application data is exchanged. An empty allowlist is fail-closed
+  (`ConfigError`).
+- **`NetworkRestoreServer` / `PeerFeederService` stream to any connector —
+  CLOSED WHEN mTLS IS ON.** When `transport_kind = Tls`, the RESTORE and
+  PEER_FEEDER services are registered on the mutually-authenticated dispatcher,
+  so only allowlisted peers reach the handler. **Remaining (honest):** the
+  restore/feeder/admin *client* connectors
+  (`connect_to_service(RESTORE/PEER_FEEDER/ADMIN)`) still use plain TCP even
+  when the node is TLS-configured — only the **election** client was upgraded
+  to `connect_to_service_tls` in this release. Under a TLS deployment these
+  client paths need the same upgrade before a replica can pull a restore /
+  feed / admin command over mTLS; until then, drive restore/feeder over the
+  authenticated dispatcher only from within the trusted set, or run those
+  flows on the isolated replication network.
+- **Election proposals/votes — MITIGATED AT THE TRANSPORT LAYER.** The election
+  RPC now runs over the mutually-authenticated channel on **both** ends when
+  `transport_kind = Tls`: the acceptor (`ELECTION` service) sits on the TLS
+  dispatcher and the proposer connects with `connect_to_service_tls`. An
+  off-path or on-path attacker cannot inject or replay a proposal/vote without
+  a CA-issued, allowlisted certificate — the same posture as JE HA, whose
+  elections run over the authenticated `DataChannel`. **Remaining (honest):**
+  mTLS authenticates the *wire*, not an individual message; it does not bind a
+  specific proposal to the cert that completed the handshake. A credentialed
+  (compromised-peer) attacker with a valid cert is still trusted. Full
+  per-message authentication (a signed proposal / MAC + persisted
+  `promised_term` nonce, JE review findings NA-5/NA-6/NA-7) is a separate,
+  strictly-stronger scheme and is **not** implemented — deliberately not built
+  half-way.
+- **`NetworkRestore` client trusts server-supplied filenames (path traversal)
+  — CLOSED.** `network_restore::validate_restore_filename` rejects any
+  server-supplied filename containing a path separator (`/` or `\`), `.` /
+  `..`, an absolute path, an embedded NUL byte, or a leading-dot hidden file,
+  in **both** `execute` and `execute_via_dispatcher`. Restore files are written
+  only as plain basenames into the designated restore directory.
+- **TCP frame `payload_len` (32-bit) unbounded — CLOSED.** Every
+  length-prefixed channel (TCP, TLS, QUIC) caps `payload_len` at
+  `MAX_FRAME_PAYLOAD` (64 MiB) before allocating, rejecting an oversize frame
+  with a `ProtocolError`.
+- **QUIC ergonomic constructor installs a no-op verifier — GATED.** The
+  skip-verify QUIC client/server helpers (`QuicChannel::connect`,
+  `insecure_client_config`, `default_server_config`) are documented as the
+  explicit-insecure path only; the `Quic` transport is subject to the enforced
+  auth default above, so it cannot start unauthenticated unless
+  `insecure_no_auth(true)` is set. The authenticated QUIC path
+  (`QuicChannelListener::bind_with_tls_and_allowlist` +
+  `QuicChannel::connect_with_config`) is the recommended API.
 
-Recommended deployment until these are remediated:
+Recommended deployment:
 
-- Replicate only across a host-firewalled or
-  VPC-segmented network where every peer IP is statically
-  known and the firewall blocks all other inbound traffic.
-- Do not expose the replication port on any
-  internet-reachable interface.
-- Treat the replication network as trusted: if a peer is
-  compromised, the entire replication group is
-  compromised.
+- **Production:** configure `transport_kind(RepTransportKind::Tls)` +
+  `tls_config(..)` (CA-rooted certs, no `SkipVerification`) + a non-empty
+  `peer_allowlist(..)`. This is now the only way to run a multi-node group
+  without explicitly opting into an unauthenticated transport.
+- **Trusted network / local dev / CI:** set `RepConfig::insecure_no_auth(true)`
+  to permit the plaintext / in-memory path. Only do this where every peer IP
+  is statically known and the firewall / VPC blocks all other inbound traffic
+  to the replication port. Do not expose the replication port on any
+  internet-reachable interface. Treat the replication network as trusted: a
+  compromised peer compromises the group (per-message election auth is not
+  implemented).
 
 ## Other limitations
 

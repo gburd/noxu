@@ -206,7 +206,49 @@ pub struct RepConfig {
     /// A downstream replica is therefore never more durable than the
     /// entries its mid-tier has itself persisted.
     pub cascade_feeding: bool,
+
+    /// Explicit opt-out of the enforced-authentication default.
+    ///
+    /// By default (`false`) Noxu **refuses to start a replication
+    /// dispatcher on an unauthenticated wire transport**: a node
+    /// configured with the default [`RepTransportKind::Tcp`] (or QUIC)
+    /// and no mTLS material fails [`crate::ReplicatedEnvironment::new`]
+    /// with a `ConfigError` directing the operator to configure
+    /// `transport_kind = Tls` + a `tls_config` + a non-empty
+    /// `peer_allowlist`.  This closes the external review's core finding
+    /// (NA-1/NA-4/NA-8): you cannot *accidentally* run an unauthenticated
+    /// replication cluster.
+    ///
+    /// This mirrors BDB-JE HA's fail-closed posture: JE authenticates the
+    /// data channel via mutual TLS (`SSLAuthenticator.isTrusted(SSLSession)`
+    /// / `SSLMirrorAuthenticator`, `com.sleepycat.je.rep.net`), so a peer's
+    /// identity is *verified from its certificate*, never self-claimed on
+    /// the wire.  Noxu's `PeerAllowlistVerifier` (see `crate::auth`) is the
+    /// direct analogue of `SSLAuthenticator`.
+    ///
+    /// Set `true` to permit the plaintext / skip-verify path for a
+    /// trusted-network deployment, local development, or CI.  Doing so
+    /// emits a loud `log::warn!` at startup — the transport carries **no**
+    /// peer authentication and any host that can reach the port can join
+    /// the group and impersonate a peer.  Only enable this when the
+    /// replication network is fully isolated (host firewall / VPC
+    /// segmentation with statically-known peer IPs).
+    ///
+    /// Under `cfg(test)` / the `test-harness` feature this defaults to
+    /// `true` so the in-process test harness and unit tests keep working
+    /// on the plaintext / in-memory transports without per-test PKI.  In a
+    /// production build it is always `false` unless the operator sets it.
+    pub insecure_no_auth: bool,
 }
+
+/// The default value of [`RepConfig::insecure_no_auth`].
+///
+/// Fail-closed (`false`) in a production build; opt-out (`true`) only when
+/// compiled for tests (`cfg(test)`) or with the `test-harness` feature, so
+/// the existing test suite and in-process harness keep running on the
+/// plaintext / in-memory transports without per-test certificate material.
+pub(crate) const DEFAULT_INSECURE_NO_AUTH: bool =
+    cfg!(any(test, feature = "test-harness"));
 
 impl RepConfig {
     /// Creates a builder for `RepConfig`.
@@ -236,6 +278,7 @@ impl RepConfig {
             peer_allowlist: Vec::new(),
             tls_config: None,
             cascade_feeding: false,
+            insecure_no_auth: DEFAULT_INSECURE_NO_AUTH,
         }
     }
 
@@ -286,6 +329,7 @@ pub struct RepConfigBuilder {
     peer_allowlist: Vec<String>,
     tls_config: Option<crate::tls::TlsConfig>,
     cascade_feeding: bool,
+    insecure_no_auth: bool,
 }
 
 impl RepConfigBuilder {
@@ -418,6 +462,22 @@ impl RepConfigBuilder {
         self
     }
 
+    /// Explicitly opt OUT of the enforced-authentication default.
+    ///
+    /// By default a node configured with an unauthenticated transport
+    /// (the default [`RepTransportKind::Tcp`], or QUIC) and no mTLS
+    /// material refuses to start.  Pass `true` here to permit the
+    /// plaintext / skip-verify path for a trusted-network deployment,
+    /// local development, or CI.  A loud `log::warn!` is emitted at
+    /// startup when it is enabled.
+    ///
+    /// See [`RepConfig::insecure_no_auth`] for the full rationale and the
+    /// BDB-JE `SSLAuthenticator` citation.
+    pub fn insecure_no_auth(mut self, insecure: bool) -> Self {
+        self.insecure_no_auth = insecure;
+        self
+    }
+
     /// Builds the `RepConfig`.
     pub fn build(self) -> RepConfig {
         RepConfig {
@@ -441,6 +501,7 @@ impl RepConfigBuilder {
             peer_allowlist: self.peer_allowlist,
             tls_config: self.tls_config,
             cascade_feeding: self.cascade_feeding,
+            insecure_no_auth: self.insecure_no_auth,
         }
     }
 }
@@ -536,6 +597,30 @@ mod tests {
             config.commit_durability.ack_timeout,
             Duration::from_secs(15)
         );
+    }
+
+    #[test]
+    fn test_insecure_no_auth_default_matches_build_profile() {
+        // The default is opt-out (true) only when compiled for tests /
+        // the test-harness feature, and fail-closed (false) in production.
+        let config = RepConfig::builder("g", "n", "h").build();
+        assert_eq!(config.insecure_no_auth, DEFAULT_INSECURE_NO_AUTH);
+        // Under `cargo test` this module compiles with cfg(test) set, so the
+        // default here is the opt-out value.
+        assert!(
+            config.insecure_no_auth,
+            "under cfg(test) the default must be the insecure opt-out"
+        );
+    }
+
+    #[test]
+    fn test_insecure_no_auth_builder_flips_it() {
+        let secure =
+            RepConfig::builder("g", "n", "h").insecure_no_auth(false).build();
+        assert!(!secure.insecure_no_auth);
+        let insecure =
+            RepConfig::builder("g", "n", "h").insecure_no_auth(true).build();
+        assert!(insecure.insecure_no_auth);
     }
 
     #[test]
