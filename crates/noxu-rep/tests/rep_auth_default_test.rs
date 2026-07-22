@@ -212,3 +212,39 @@ fn mtls_empty_allowlist_is_fail_closed_at_env_level() {
         "empty allowlist is fail-closed: no dispatcher may be bound"
     );
 }
+
+/// Exhaustive property over the full `(transport_kind x insecure_no_auth)`
+/// decision space of the enforced-auth policy: a node on an *unauthenticated
+/// wire* transport (`Tcp`/`Quic`, no mTLS material) may start ONLY when the
+/// operator explicitly set `insecure_no_auth(true)`; it must be *refused*
+/// otherwise. `InMemory` has no wire and is always permitted. The decision
+/// space is small and closed, so enumerating every combination is the
+/// strongest form of this property check -- it guards against a future edit
+/// silently re-opening the plaintext default the external review flagged.
+#[test]
+fn enforced_auth_decision_matrix_holds_for_every_combination() {
+    // (transport, insecure_no_auth, must_start_on_a_wire_without_mtls)
+    let cases = [
+        (RepTransportKind::Tcp, false, false),
+        (RepTransportKind::Tcp, true, true),
+        (RepTransportKind::Quic, false, false),
+        (RepTransportKind::Quic, true, true),
+        (RepTransportKind::InMemory, false, true),
+        (RepTransportKind::InMemory, true, true),
+    ];
+
+    for (transport, insecure, must_start) in cases {
+        let config = RepConfig::builder("g", "n", "127.0.0.1")
+            .node_port(0)
+            .transport_kind(transport)
+            .insecure_no_auth(insecure)
+            .build();
+        let started = ReplicatedEnvironment::new(config).is_ok();
+        assert_eq!(
+            started, must_start,
+            "auth policy violated for transport={transport:?} \
+             insecure_no_auth={insecure}: an unauthenticated wire transport \
+             must never start without the explicit insecure_no_auth opt-out"
+        );
+    }
+}
