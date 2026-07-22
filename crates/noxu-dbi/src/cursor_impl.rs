@@ -232,6 +232,17 @@ pub struct CursorImpl {
     /// `Cursor.checkUpdatesAllowed` skips the check when
     /// `dbImpl.getDbType().isInternal()`).
     disk_limit: Option<Arc<crate::disk_limit::DiskLimitTracker>>,
+
+    /// Per-operation record expiration (packed hours since the Unix epoch,
+    /// 0 = never expires) for the NEXT `put`.
+    ///
+    /// Set by [`Self::put_with_expiration`] immediately before delegating to
+    /// [`Self::put`], read by `log_ln_write` (so the LN log entry carries the
+    /// expiration and it survives recovery) and by `apply_tree_insert` (so the
+    /// BIN slot filters the record once expired), then reset to 0.  Mirrors
+    /// JE's `ExpirationInfo` threaded from `WriteOptions` into the put
+    /// operation (`CursorImpl.putInternal` / `LN.log`).
+    pending_expiration: i32,
 }
 
 impl CursorImpl {
@@ -264,6 +275,7 @@ impl CursorImpl {
             txn_manager: None,
             throughput,
             disk_limit: None,
+            pending_expiration: 0,
         }
     }
 
@@ -294,6 +306,7 @@ impl CursorImpl {
             txn_manager: None,
             throughput,
             disk_limit: None,
+            pending_expiration: 0,
         }
     }
 
@@ -411,11 +424,25 @@ impl CursorImpl {
     /// the per-database entry count.
     fn apply_tree_insert(&self, key: Vec<u8>, data: Vec<u8>, new_lsn: Lsn) {
         let db = self.db_impl.read();
-        if let Some(tree) = db.get_real_tree()
-            && let Ok(is_new) = tree.insert(key, data, new_lsn)
-            && is_new
-        {
-            db.increment_entry_count();
+        if let Some(tree) = db.get_real_tree() {
+            if let Ok(is_new) = tree.insert(key.clone(), data, new_lsn)
+                && is_new
+            {
+                db.increment_entry_count();
+            }
+            // Apply the per-operation expiration to the BIN slot so reads
+            // filter the record once expired and a full-BIN log carries it.
+            // JE `CursorImpl.putInternal` stores `ExpirationInfo.expiration`
+            // into the slot via `BIN.setExpiration`.  A zero expiration is a
+            // no-op for a fresh insert (slots default to 0 = never expires);
+            // it is written only when non-zero so the common no-TTL put does
+            // not pay the extra BIN descent.
+            if self.pending_expiration > 0 {
+                tree.update_key_expiration(
+                    &key,
+                    self.pending_expiration as u32,
+                );
+            }
         }
     }
 
@@ -2970,6 +2997,8 @@ impl CursorImpl {
     ///
     /// * `Success` if the record was inserted/updated
     /// * `KeyExist` if NoOverwrite mode and key already exists
+    ///
+    /// See [`Self::put_with_expiration`] for the TTL-stamping variant.
     pub fn put(
         &mut self,
         key: &[u8],
@@ -3113,6 +3142,27 @@ impl CursorImpl {
                 Ok(OperationStatus::Success)
             }
         }
+    }
+
+    /// Performs a `put` that stamps the record with an expiration time in
+    /// packed hours since the Unix epoch, where zero means never expires.
+    ///
+    /// The expiration is threaded into the LN log entry (so it survives crash
+    /// recovery) and into the BIN slot (so reads filter the record once it has
+    /// expired), mirroring JE's `ExpirationInfo` flowing from `WriteOptions`
+    /// into `CursorImpl.putInternal` → `LN.log` / `BIN.setExpiration`.  It is
+    /// scoped to this single operation and reset afterwards.
+    pub fn put_with_expiration(
+        &mut self,
+        key: &[u8],
+        data: &[u8],
+        put_mode: PutMode,
+        expiration: i32,
+    ) -> Result<OperationStatus, DbiError> {
+        self.pending_expiration = expiration;
+        let result = self.put(key, data, put_mode);
+        self.pending_expiration = 0;
+        result
     }
 
     /// Sorted-dup variant of `put()`.
@@ -3317,8 +3367,8 @@ impl CursorImpl {
             true,                            // embedded_ln
             key.to_vec(),
             data.map(|d| d.to_vec()),
-            0,         // expiration
-            NULL_VLSN, // vlsn
+            self.pending_expiration, // expiration (JE ExpirationInfo.expiration)
+            NULL_VLSN,               // vlsn
         );
 
         let mut buf = BytesMut::with_capacity(entry.log_size());

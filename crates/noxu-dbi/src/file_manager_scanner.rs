@@ -233,6 +233,9 @@ impl FileManagerLogScanner {
                 rec.abort_data =
                     r.abort_data.map(|s| payload.slice(subslice_range(raw, s)));
                 rec.vlsn = vlsn;
+                // Carry the record's TTL expiration from the LN entry so redo
+                // restores it into the BIN slot (JE LNLogEntry.getExpiration).
+                rec.expiration = r.expiration;
                 Some(LogEntry::Ln(rec))
             }
 

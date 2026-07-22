@@ -204,12 +204,13 @@ fn test_ttl_and_no_ttl_keys_both_survive_bin_split() {
 // ──────────────────────────────────────────────────────────────────────────────
 // Recovery guard (PASS-pre / PASS-post).
 //
-// This is a correctness guard, not a fail-pre test: after a clean close+reopen
-// cycle, `expiration_time` is reset to 0 (LN records in the WAL do not carry
-// expiration — it is in-memory only, see put_with_options audit note F8).
-// `is_expired(0, …) = false` so records are visible regardless of
-// `expiration_in_hours`.  This guard ensures that no other code path
-// accidentally makes the right-sibling records appear expired after recovery.
+// After a clean close+reopen cycle the TTL records must remain present.
+// The LN log entries now carry the record expiration (JE
+// `LNLogEntry.getExpiration`), so recovery replays it into the BIN slot and
+// the records keep their (future, 1000-hour) expiration — they are both
+// durable and non-expired after reopen.  This guard also confirms the
+// right-sibling BIN (which has `expiration_in_hours = false` in its
+// in-memory state before close) is correctly visible after recovery.
 //
 // NOTE: uses `drop(env)` (exit-checkpoint), NOT `env.checkpoint(None)`.
 // The explicit-checkpoint API has a known pre-existing limitation with
@@ -220,10 +221,10 @@ fn test_ttl_and_no_ttl_keys_both_survive_bin_split() {
 /// Inserts TTL records, closes the environment (exit checkpoint), then reopens
 /// and confirms all records are present.
 ///
-/// Post-recovery, `expiration_time = 0` (never expires) for all entries because
-/// the LN WAL records do not carry expiration times.  The test verifies that
-/// records from the right-sibling BIN (which has `expiration_in_hours = false`
-/// in its in-memory state before close) are correctly visible after reopen.
+/// Post-recovery the records keep their expiration (carried in the LN log
+/// entry and replayed into the slot).  The test verifies that records from
+/// the right-sibling BIN (which has `expiration_in_hours = false` in its
+/// in-memory state before close) are correctly visible after reopen.
 #[test]
 fn test_ttl_records_survive_close_and_reopen() {
     let dir = TempDir::new().unwrap();

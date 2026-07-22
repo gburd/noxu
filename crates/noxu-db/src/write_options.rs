@@ -2,6 +2,7 @@
 //!
 
 use crate::cache_mode::CacheMode;
+pub use noxu_util::TtlUnit;
 
 /// Options for write operations.
 ///
@@ -14,8 +15,17 @@ pub struct WriteOptions {
     /// Cache mode for the write operation.
     pub cache_mode: Option<CacheMode>,
 
-    /// Time-to-live in hours (0 = no expiration).
+    /// Time-to-live value (0 = no expiration).  Interpreted in [`ttl_unit`].
+    ///
+    /// [`ttl_unit`]: WriteOptions::ttl_unit
     pub ttl: u64,
+
+    /// Unit of [`ttl`]: [`TtlUnit::Hours`] or [`TtlUnit::Days`].  Default
+    /// is [`TtlUnit::Days`] (JE `WriteOptions` default), which minimizes the
+    /// per-slot expiration storage.
+    ///
+    /// [`ttl`]: WriteOptions::ttl
+    pub ttl_unit: TtlUnit,
 
     /// Whether to update TTL on existing records.
     pub update_ttl: bool,
@@ -24,7 +34,12 @@ pub struct WriteOptions {
 impl WriteOptions {
     /// Creates a new WriteOptions with default settings.
     pub fn new() -> Self {
-        Self { cache_mode: None, ttl: 0, update_ttl: false }
+        Self {
+            cache_mode: None,
+            ttl: 0,
+            ttl_unit: TtlUnit::Days,
+            update_ttl: false,
+        }
     }
 
     /// Sets the cache mode.
@@ -38,14 +53,31 @@ impl WriteOptions {
     }
 
     /// Sets the time-to-live in hours.
+    ///
+    /// Convenience for `with_ttl_unit(ttl_hours, TtlUnit::Hours)`.
     pub fn with_ttl(mut self, ttl_hours: u64) -> Self {
         self.ttl = ttl_hours;
+        self.ttl_unit = TtlUnit::Hours;
+        self
+    }
+
+    /// Sets the time-to-live with an explicit unit (hours or days).
+    ///
+    /// Mirrors JE `WriteOptions.setTTL(int ttl, TimeUnit)`.  `TtlUnit::Days`
+    /// is recommended to minimize per-slot expiration storage.
+    pub fn with_ttl_unit(mut self, ttl: u64, unit: TtlUnit) -> Self {
+        self.ttl = ttl;
+        self.ttl_unit = unit;
         self
     }
 
     /// Sets whether to update TTL on existing records.
-    #[deprecated(note = "not yet implemented: update_ttl is not consulted by \
-                put_with_options; this setting has no effect")]
+    ///
+    /// Mirrors JE `WriteOptions.setUpdateTTL(boolean)`: when `true`, an update
+    /// to an existing record re-assigns (or clears, if `ttl` is 0) the
+    /// record's expiration time; when `false`, an update leaves the existing
+    /// expiration unchanged.  Ignored for inserts (a new record always takes
+    /// the specified TTL).
     pub fn with_update_ttl(mut self, update_ttl: bool) -> Self {
         self.update_ttl = update_ttl;
         self
@@ -58,12 +90,22 @@ impl WriteOptions {
                 beyond WriteOptions::new()"
     )]
     pub fn evict_after_write() -> Self {
-        Self { cache_mode: Some(CacheMode::EvictLn), ttl: 0, update_ttl: false }
+        Self {
+            cache_mode: Some(CacheMode::EvictLn),
+            ttl: 0,
+            ttl_unit: TtlUnit::Days,
+            update_ttl: false,
+        }
     }
 
-    /// Creates WriteOptions with a TTL.
+    /// Creates WriteOptions with a TTL expressed in hours.
     pub fn with_expiration(ttl_hours: u64) -> Self {
-        Self { cache_mode: None, ttl: ttl_hours, update_ttl: false }
+        Self {
+            cache_mode: None,
+            ttl: ttl_hours,
+            ttl_unit: TtlUnit::Hours,
+            update_ttl: false,
+        }
     }
 
     /// Returns the expiration time in milliseconds from now, or 0 if no TTL.
@@ -71,7 +113,11 @@ impl WriteOptions {
         if self.ttl == 0 {
             0
         } else {
-            current_time_ms + (self.ttl * 3600 * 1000)
+            let unit_ms = match self.ttl_unit {
+                TtlUnit::Hours => 3600 * 1000,
+                TtlUnit::Days => 24 * 3600 * 1000,
+            };
+            current_time_ms + (self.ttl * unit_ms)
         }
     }
 
@@ -80,12 +126,15 @@ impl WriteOptions {
         self.ttl > 0
     }
 
-    /// Returns the packed expiration_time (hours since epoch) for use in BinEntry.
+    /// Returns the packed expiration_time (hours since epoch) for use in the
+    /// BIN slot and the LN log entry.
     ///
-    /// Returns 0 if no TTL is set.  Uses `noxu_util::ttl_hours_to_expiration`
-    /// to compute the expiration time relative to now.
+    /// Returns 0 if no TTL is set.  Uses the JE-faithful
+    /// `noxu_util::ttl_to_expiration` which rounds the current time up to the
+    /// next hour/day boundary before adding the TTL, and always yields
+    /// hours-since-epoch (day-granular TTLs land on a 24-hour boundary).
     pub fn expiration_time(&self) -> u32 {
-        noxu_util::ttl_hours_to_expiration(self.ttl as u32)
+        noxu_util::ttl_to_expiration(self.ttl as u32, self.ttl_unit)
     }
 }
 
@@ -96,7 +145,6 @@ impl Default for WriteOptions {
 }
 
 #[cfg(test)]
-#[allow(deprecated)] // tests still exercise the (now-deprecated) inert setters
 mod tests {
     use super::*;
 
@@ -109,6 +157,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_with_cache_mode() {
         let opts = WriteOptions::new().with_cache_mode(CacheMode::KeepHot);
         assert_eq!(opts.cache_mode, Some(CacheMode::KeepHot));
@@ -127,6 +176,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_evict_after_write() {
         let opts = WriteOptions::evict_after_write();
         assert_eq!(opts.cache_mode, Some(CacheMode::EvictLn));
@@ -156,7 +206,7 @@ mod tests {
 
     #[test]
     fn test_expiration_time_ms_24_hours() {
-        let opts = WriteOptions::new().with_ttl(24);
+        let opts = WriteOptions::new().with_ttl(24); // 24 hours
         let current = 0;
         let expected = 24 * 3600 * 1000;
         assert_eq!(opts.expiration_time_ms(current), expected);
@@ -186,6 +236,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_builder_chain() {
         let opts = WriteOptions::new()
             .with_cache_mode(CacheMode::EvictBin)

@@ -172,4 +172,4 @@ pub use sequence_stats::SequenceStats;
 pub use stats_config::StatsConfig;
 pub use transaction::Transaction;
 pub use transaction_config::TransactionConfig;
-pub use write_options::WriteOptions;
+pub use write_options::{TtlUnit, WriteOptions};

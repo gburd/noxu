@@ -366,6 +366,13 @@ pub fn apply_redo_ln(tree: &mut noxu_tree::Tree, rec: &LnRecord, lsn: Lsn) {
                     rec.db_id,
                     rec.operation,
                 );
+            } else if rec.expiration != 0 {
+                // Restore the record's TTL expiration into the BIN slot so a
+                // recovered record keeps its expiration (JE
+                // RecoveryManager.redo applies LNLogEntry.getExpiration via
+                // IN.setExpiration).  A zero expiration is the common
+                // no-TTL case and needs no slot touch — slots default to 0.
+                tree.update_key_expiration(&rec.key, rec.expiration as u32);
             }
         }
         LnOperation::Delete => {
@@ -2853,6 +2860,75 @@ mod tests {
         RollbackStartRecord, TxnAbortRecord, TxnCommitRecord,
     };
     use bytes::Bytes;
+
+    /// TTL recovery: an LN log entry that carries a non-zero `expiration`
+    /// must have that expiration restored into the BIN slot on redo, so a
+    /// record's TTL survives a crash.  We use a PAST expiration (hour 1 =
+    /// 1970) so the recovered slot is immediately expired and filtered from
+    /// reads; if redo dropped the expiration to 0 the slot would be visible
+    /// and this test would fail.  JE `RecoveryManager.redo` applies
+    /// `LNLogEntry.getExpiration` via `IN.setExpiration`.
+    #[test]
+    fn test_ttl_expiration_survives_redo() {
+        let mut scanner = InMemoryLogScanner::new();
+        scanner.push(
+            lsn(1, 100),
+            LogEntry::TxnCommit(TxnCommitRecord {
+                txn_id: 1,
+                lsn: lsn(1, 100),
+                dtvlsn: None,
+            }),
+        );
+        // A committed LN carrying a past (already-expired) expiration.
+        let mut ln = make_insert(1, Some(1), b"ttlkey", NULL_LSN);
+        ln.expiration = 1; // hour 1 since epoch — far in the past
+        scanner.push(lsn(1, 200), LogEntry::Ln(ln));
+
+        let mut trees = HashMap::new();
+        trees.insert(1u64, noxu_tree::Tree::new(1, 256));
+        let mut mgr = RecoveryManager::new();
+        mgr.recover_all(&mut scanner, &mut trees, false).unwrap();
+
+        // The recovered slot carries the past expiration, so it is filtered.
+        let tree = trees.get(&1).unwrap();
+        let fetch = tree.search_with_data(b"ttlkey").unwrap();
+        assert!(
+            !fetch.found,
+            "TTL recovery: the recovered slot's expiration was lost \
+             (record visible although its LN entry expired in 1970)"
+        );
+    }
+
+    /// Control for the above: an LN with a FUTURE expiration is recovered as
+    /// a live (visible) record — confirming redo does not spuriously expire
+    /// records and that the past-expiration filtering above is real.
+    #[test]
+    fn test_future_ttl_survives_redo_and_is_visible() {
+        let mut scanner = InMemoryLogScanner::new();
+        scanner.push(
+            lsn(1, 100),
+            LogEntry::TxnCommit(TxnCommitRecord {
+                txn_id: 1,
+                lsn: lsn(1, 100),
+                dtvlsn: None,
+            }),
+        );
+        let mut ln = make_insert(1, Some(1), b"livekey", NULL_LSN);
+        ln.expiration = (noxu_util::current_time_hours() + 10_000) as i32; // future
+        scanner.push(lsn(1, 200), LogEntry::Ln(ln));
+
+        let mut trees = HashMap::new();
+        trees.insert(1u64, noxu_tree::Tree::new(1, 256));
+        let mut mgr = RecoveryManager::new();
+        mgr.recover_all(&mut scanner, &mut trees, false).unwrap();
+
+        let tree = trees.get(&1).unwrap();
+        let fetch = tree.search_with_data(b"livekey").unwrap();
+        assert!(
+            fetch.found,
+            "a future-TTL record must remain visible after redo"
+        );
+    }
 
     // ------------------------------------------------------------------ helpers
 

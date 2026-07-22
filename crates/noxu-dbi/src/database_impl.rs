@@ -527,6 +527,17 @@ impl DatabaseImpl {
         }
     }
 
+    /// Thread the TTL master switch (`ENV_EXPIRATION_ENABLED`) into the real
+    /// tree so `slot_is_live` filters expired slots only when enabled
+    /// (JE `EnvironmentImpl.isExpired` gate).
+    pub fn set_tree_expiration_enabled(&mut self, enabled: bool) {
+        if let Some(tree_arc) = self.real_tree.as_ref()
+            && let Ok(mut tree) = tree_arc.write()
+        {
+            tree.set_expiration_enabled(enabled);
+        }
+    }
+
     // Configuration
     pub fn max_tree_entries_per_node(&self) -> i32 {
         self.max_tree_entries_per_node

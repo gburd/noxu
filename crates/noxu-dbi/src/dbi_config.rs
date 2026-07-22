@@ -267,8 +267,8 @@ impl Default for DbiEnvConfig {
             env_forced_yield: false,
             env_fair_latches: false,
             env_latch_timeout_ms: 300_000,
-            env_ttl_clock_tolerance_ms: 0,
-            env_expiration_enabled: false,
+            env_ttl_clock_tolerance_ms: 7_200_000, // JE default 2 h
+            env_expiration_enabled: true,          // JE default true
             dos_producer_queue_timeout_ms: 10_000,
             env_db_eviction: false,
             // Memory
@@ -343,7 +343,7 @@ impl Default for DbiEnvConfig {
             cleaner_foreground_proactive_migration: false,
             cleaner_background_proactive_migration: false,
             cleaner_lazy_migration: false,
-            cleaner_expiration_enabled: false,
+            cleaner_expiration_enabled: true,
             // Checkpointer
             run_checkpointer: true,
             checkpointer_bytes_interval: 20_000_000,

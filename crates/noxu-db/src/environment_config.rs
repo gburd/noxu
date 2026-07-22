@@ -203,23 +203,28 @@ pub struct EnvironmentConfig {
     /// Mirrors JE `ENV_LATCH_TIMEOUT` / default 300_000 ms (5 min).
     pub env_latch_timeout_ms: u64,
 
-    /// TTL clock tolerance — records within this many milliseconds of their
-    /// expiration time are treated as expired.
+    /// TTL clock tolerance in milliseconds — the grace window used by the
+    /// cleaner and compressor before an expired record's space is reclaimed.
     ///
-    /// **Reserved / not yet implemented as of v3.1.** Setting a non-default
-    /// value (non-zero) has no effect and emits a `WARN` log at
-    /// `Environment::open` time.
+    /// A record is only treated as safely purgeable once it has been expired
+    /// for at least this long, so a small backward adjustment of the system
+    /// clock cannot cause the space for a still-live record to be reclaimed.
+    /// The read path (query visibility) uses the exact expiration time and is
+    /// not affected by this tolerance.
     ///
-    /// Mirrors `ENV_TTL_CLOCK_TOLERANCE` / default 0.
+    /// Mirrors `ENV_TTL_CLOCK_TOLERANCE` / default 2 hours (7_200_000 ms).
     pub env_ttl_clock_tolerance_ms: u64,
 
-    /// Enable TTL-based record expiration at the environment level.
+    /// Master switch for TTL-based record expiration at the environment level.
     ///
-    /// **Reserved / not yet implemented as of v3.1.** Setting a non-default
-    /// value (true) has no effect and emits a `WARN` log at
-    /// `Environment::open` time.
+    /// When `true` (the default, matching JE), records with a non-zero
+    /// expiration time are filtered out of reads once expired and their space
+    /// is reclaimed by the cleaner.  Setting this to `false` disables all
+    /// expiration filtering and purging (a kill switch, e.g. for debugging or
+    /// migration): expired records remain visible and are never reclaimed on
+    /// account of expiry.
     ///
-    /// Mirrors `ENV_EXPIRATION_ENABLED` / default false.
+    /// Mirrors `ENV_EXPIRATION_ENABLED` / default true.
     pub env_expiration_enabled: bool,
 
     /// Enable per-database node eviction.
@@ -497,7 +502,14 @@ pub struct EnvironmentConfig {
     pub cleaner_lazy_migration: bool,
 
     /// Enable TTL-based record expiration tracking in the cleaner.
-    /// Mirrors `CLEANER_EXPIRATION_ENABLED` / default false.
+    ///
+    /// When `true` (the default), the cleaner counts expired records as
+    /// obsolete when computing per-file utilization, so files holding mostly
+    /// expired data are selected for cleaning and their space reclaimed.
+    /// JE folds this behaviour into `ENV_EXPIRATION_ENABLED` (there is no
+    /// separate JE parameter); Noxu keeps a dedicated sub-switch so cleaner
+    /// expiration accounting can be disabled independently for diagnostics.
+    /// Ignored when `env_expiration_enabled` is `false`.
     pub cleaner_expiration_enabled: bool,
 
     // -----------------------------------------------------------------------
@@ -801,8 +813,8 @@ impl EnvironmentConfig {
             env_forced_yield: false,
             env_fair_latches: false,
             env_latch_timeout_ms: 300_000,
-            env_ttl_clock_tolerance_ms: 0,
-            env_expiration_enabled: false,
+            env_ttl_clock_tolerance_ms: 7_200_000, // JE default 2 h
+            env_expiration_enabled: true,          // JE default true
             env_db_eviction: false,
             // Log
             log_file_max_bytes: 10 * 1024 * 1024,
@@ -867,7 +879,7 @@ impl EnvironmentConfig {
             cleaner_foreground_proactive_migration: false,
             cleaner_background_proactive_migration: false,
             cleaner_lazy_migration: false,
-            cleaner_expiration_enabled: false,
+            cleaner_expiration_enabled: true, // JE folds this into ENV_EXPIRATION_ENABLED (on)
             // Checkpointer
             checkpointer_bytes_interval: 20_000_000,
             checkpointer_wakeup_interval_ms: 30_000,
@@ -2666,7 +2678,7 @@ mod tests {
         assert!(!c.cleaner_foreground_proactive_migration);
         assert!(!c.cleaner_background_proactive_migration);
         assert!(!c.cleaner_lazy_migration);
-        assert!(!c.cleaner_expiration_enabled);
+        assert!(c.cleaner_expiration_enabled);
     }
 
     #[test]

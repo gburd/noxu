@@ -17,10 +17,9 @@ Berkeley DB Java Edition (BDB JE) 7.5.11 — its API and engine design track JE
 deliberately (see [Acknowledgements](#acknowledgements) and [NOTICE](NOTICE)).
 The version number tracks the JE release whose architecture it follows; it is
 **not** a claim of feature parity or of equivalent production maturity. Noxu is
-a young engine (first release 2026) with no production track record yet, and
-certain JE 7.5 features are not implemented (notably TTL/record expiration; the
+a young engine (first release 2026) with no production track record yet. The
 replication transport now defaults to mutually-authenticated mTLS, but
-per-message election authentication is not implemented — see
+per-message election authentication is not yet implemented (see
 [known limitations](docs/src/operations/known-limitations.md) and the
 [capability matrix](https://codeberg.page/gregburd/noxu/introduction.html#capability-matrix)).
 Use it where those constraints are acceptable, and validate durability for your
@@ -131,6 +130,10 @@ see [`examples/getting_started.rs`](examples/getting_started.rs) and the
   queues, per-operation cache modes, and optional off-heap allocation.
 - **Log cleaning** — background garbage collection of obsolete log entries
   with per-file utilization tracking.
+- **Record TTL / expiration** (JE 7.5) — per-record time-to-live via
+  `WriteOptions::with_ttl(hours)` / `with_ttl_unit(ttl, TtlUnit::Days)`;
+  expired records are invisible to reads, reclaimed by the cleaner, and the
+  expiration survives crash recovery. Hour/day granularity matching JE.
 
 ### Higher-level APIs
 

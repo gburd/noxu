@@ -59,25 +59,6 @@ pub static UNIMPLEMENTED_ENV_PARAMS: &[UnimplementedParam] = &[
         is_non_default: |c| c.env_fair_latches,
     },
     UnimplementedParam {
-        name: "env_ttl_clock_tolerance_ms",
-        // default = 0; non-default means non-zero
-        is_non_default: |c| c.env_ttl_clock_tolerance_ms != 0,
-    },
-    UnimplementedParam {
-        name: "env_expiration_enabled",
-        // default = false; non-default means true
-        is_non_default: |c| c.env_expiration_enabled,
-    },
-    UnimplementedParam {
-        name: "cleaner_expiration_enabled",
-        // default = false; non-default means true.  Part of the TTL /
-        // record-expiration family (a reserved feature Noxu does not yet
-        // implement); the cleaner does not consult expiration when
-        // selecting files, so this is inert.  Warn so a non-default
-        // setting is never a silent no-op.
-        is_non_default: |c| c.cleaner_expiration_enabled,
-    },
-    UnimplementedParam {
         name: "env_db_eviction",
         // default = false; non-default means true
         is_non_default: |c| c.env_db_eviction,
@@ -179,28 +160,6 @@ mod tests {
     }
 
     #[test]
-    fn env_ttl_clock_tolerance_ms_warn_on_non_zero() {
-        let mut c = env_default();
-        c.set_env_ttl_clock_tolerance_ms(100);
-        let p = UNIMPLEMENTED_ENV_PARAMS
-            .iter()
-            .find(|p| p.name == "env_ttl_clock_tolerance_ms")
-            .unwrap();
-        assert!((p.is_non_default)(&c));
-    }
-
-    #[test]
-    fn env_expiration_enabled_warn_on_true() {
-        let mut c = env_default();
-        c.set_env_expiration_enabled(true);
-        let p = UNIMPLEMENTED_ENV_PARAMS
-            .iter()
-            .find(|p| p.name == "env_expiration_enabled")
-            .unwrap();
-        assert!((p.is_non_default)(&c));
-    }
-
-    #[test]
     fn env_db_eviction_warn_on_true() {
         let mut c = env_default();
         c.set_env_db_eviction(true);
@@ -218,17 +177,6 @@ mod tests {
         let p = UNIMPLEMENTED_ENV_PARAMS
             .iter()
             .find(|p| p.name == "log_n_data_directories")
-            .unwrap();
-        assert!((p.is_non_default)(&c));
-    }
-
-    #[test]
-    fn cleaner_expiration_enabled_warn_on_true() {
-        let mut c = env_default();
-        c.set_cleaner_expiration_enabled(true);
-        let p = UNIMPLEMENTED_ENV_PARAMS
-            .iter()
-            .find(|p| p.name == "cleaner_expiration_enabled")
             .unwrap();
         assert!((p.is_non_default)(&c));
     }
