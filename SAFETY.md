@@ -104,11 +104,71 @@ Noxu DB targets **zero `unsafe` code** in core crates:
 - Master transfer uses coordinated handoff with VLSN synchronization
 - Network restore detects and repairs VLSN gaps
 
+## WAL write-error handling (the "fsyncgate" stance)
+
+A `write()` that reached the OS page cache is **not durable**; only a
+successful `fdatasync` is. The hard question is what to do when that
+`fdatasync` (or the preceding `pwrite`) **fails**. On Linux a failed
+`fsync`/`fdatasync` may drop the dirty page and is **not reliably
+retryable** — a second `fsync` can return success while the data is already
+gone (the "fsyncgate" problem, PostgreSQL 2018).
+
+**Noxu's stance:** *fail-stop on any WAL sync error, never retry, never
+swallow.* Concretely:
+
+- The single `fdatasync` runs inside `FsyncManager::flush_and_sync`
+  (`crates/noxu-log/src/fsync_manager.rs`). Any `io::Error` from the leader's
+  drain+`fdatasync` closure is propagated to the leader **and to every
+  piggybacking waiter** (`wakeup_all_with_error`) — every committer in the
+  failed group sees the error; none returns `Ok` on a failed sync.
+- On that error, `LogManager::flush_sync` sets the permanent `io_invalid`
+  flag (`crates/noxu-log/src/log_manager.rs`). Once set, **every subsequent
+  `log()` call is refused** with `WriteFailed`, so the environment cannot
+  accept writes it might silently lose. `is_io_invalid()` exposes the state.
+- Noxu does **not** retry the failed `fdatasync`. Retrying is the unsafe
+  behavior fsyncgate warns against, because the kernel may already have
+  discarded the dirty page and a retry can report a false success.
+
+**What Noxu does NOT do (documented limitation):** it does not attempt a
+full fsyncgate mitigation (e.g. re-`open`-and-re-`fsync`, or panicking the
+process the way PostgreSQL now does). It marks the environment invalid and
+refuses further writes; the operator must close and re-open (which runs
+recovery from the last durable checkpoint). See
+`docs/src/operations/known-limitations.md` and
+`docs/src/operations/power-loss.md` for the runbook and the residual risk.
+
+Regression coverage: `fsync_manager.rs` unit tests
+(`test_fsync_error_propagated_to_waiters`,
+`test_leader_fsync_failure_fails_all_piggybacking_waiters`) prove
+per-waiter error propagation; `log_manager.rs`'s `io_invalid` regression
+test proves writes are refused after a sync error.
+
+## ThreadSanitizer suppression justifications
+
+`tsan_suppressions.txt` (repo root) suppresses a small set of TSAN reports.
+**Every suppression is a claim that the reported race is a TSAN modeling
+limitation, not a real race** — a database's sync layer cannot afford an
+unjustified suppression, because it would hide a real data race behind a lid.
+The justifications live in the suppressions file itself and are summarized
+here for durability:
+
+| Suppression | Why it is a TSAN false positive (not a bug) |
+|---|---|
+| `race:Arc*drop` | `Arc::drop` decrements the strong count `Release` and the last dropper issues a standalone `atomic::fence(Acquire)` before freeing. TSAN models happens-before through atomic ops on a *location*, not a decoupled `fence()`, so it flags the final teardown load as a race. The libstd Arc teardown is sound. |
+| `race:std::thread::local` | `thread_local!` `LocalKey` accessors publish the initialized value through a libstd-internal acquire/release handshake TSAN instruments as opaque; the reader load looks unsynchronized. The init is fully synchronized by contract. |
+| `race:std::sync::Once` | `Once` / `OnceLock` / `LazyLock` one-time init publishes through the same internal state machine; same modeling gap. Covers all one-time-init statics (cleaner, evictor, clock, replicated-environment). |
+| `race:lazy_static` | **Vestigial / defense-in-depth only.** Noxu has NO `lazy_static` dependency (verified: not in `Cargo.lock`). Retained so a transitively-pulled dep using the crate does not reintroduce a spurious report. Suppresses nothing in Noxu's own code. |
+
+**Audit invariant:** if a suppression is ever needed for a race in Noxu's
+*own* code that is not one of the four modeling limitations above, that is a
+critical finding — fix the race, do not add the suppression.
+
 ## Summary
 
 | Hazard | Primary Mitigation | Secondary Mitigation |
 |--------|-------------------|---------------------|
 | Data loss | WAL + fsync | 3-phase recovery |
+| WAL sync failure | Fail-stop (`io_invalid`) + per-waiter error | No silent retry (fsyncgate-safe) |
 | Corruption | Latch coupling + CRC32 | B-tree verification |
 | Deadlock | DFS cycle detection | Latch ordering protocol |
 | Resource exhaustion | MemoryBudget + LRU | Cleaner daemon |

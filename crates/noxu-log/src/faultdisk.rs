@@ -135,6 +135,22 @@ impl FaultController {
         FaultController { kind, target_write, magnitude, prng, fired: false }
     }
 
+    /// Build a controller that injects an explicit `kind` at an explicit
+    /// `target_write` index. For deterministic tests (e.g. the fsync-error /
+    /// write-error propagation test) that need a *specific* fault at a
+    /// *specific* write, rather than the seed-random plan `from_seed` picks.
+    /// The `magnitude` is fixed (torn keeps ~half; corruption flips 1 byte)
+    /// since callers of this path only care about the fault firing at all.
+    pub fn for_test(kind: FaultKind, target_write: u64) -> Self {
+        FaultController {
+            kind,
+            target_write,
+            magnitude: 8,
+            prng: Prng::new(target_write.wrapping_add(1)),
+            fired: false,
+        }
+    }
+
     /// The fault kind this controller will inject.
     pub fn kind(&self) -> FaultKind {
         self.kind

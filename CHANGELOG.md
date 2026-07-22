@@ -114,6 +114,30 @@ listed in [References](#references).
   on-disk bytes): `entry_type::LOG_VERSION = 2` vs the authoritative
   `file_header::LOG_VERSION = 3` stamped into per-entry headers.
 
+### Testing
+
+- **Deterministic torn-write recovery-policy test + real write-error
+  invalidation test (release-gate validation program).** Added
+  `crates/noxu-db/tests/torn_write_policy_test.rs`, a deterministic,
+  in-process, byte-level companion to the SIGKILL-timed torn-write coverage:
+  it writes N committed transactions, closes the env cleanly so the `.ndb`
+  WAL is well-formed, then truncates the tail of the newest log file to model
+  a torn final write. `torn_tail_recovers_all_prior_committed` asserts a small
+  torn tail is truncated and every prior committed record is recovered;
+  `torn_tail_severity_sweep_is_always_a_prefix` sweeps truncation lengths
+  (including cuts that reach into committed data and drop the newest keys) and
+  asserts the recovered set is always a contiguous *prefix* of the commit
+  order (recovery never punches a hole), with a non-triviality guard that at
+  least one cut actually dropped a committed key (so the invariant is not
+  vacuous). Cites JE `RecoveryManager` / `LastFileReader` torn-tail behavior.
+  Added `noxu-log` `test_real_write_error_invalidates_and_is_not_swallowed`,
+  which drives a **real** injected `StorageFull` (faultdisk `DiskFull`) through
+  the WAL write path and asserts the error surfaces as `Err` (never swallowed)
+  AND permanently sets `io_invalid` so subsequent writes are refused —
+  exercising the actual fsyncgate error path end to end, not the flag set
+  directly. Added `FaultController::for_test(kind, target_write)` so a specific
+  fault can be aimed at a specific write deterministically.
+
 ### Documentation
 
 - **Explicit Berkeley DB Java Edition attribution + `NOTICE` file.** The
@@ -128,6 +152,45 @@ listed in [References](#references).
   limitations (TTL, replication wire auth) and capability matrix. Corrected
   stale `3.0.2` version references throughout the README and introduction to
   the current 7.5.3.
+- **WAL write-error (fsyncgate) stance documented in `SAFETY.md` +
+  known-limitations.** Added a `SAFETY.md` § "WAL write-error handling"
+  section documenting Noxu's fail-stop stance when an `fdatasync`/`pwrite`
+  returns an error: the error is propagated to every committer in the group,
+  the environment is permanently invalidated (`io_invalid`), and the sync is
+  never retried (retrying is unsafe on Linux post-fsyncgate). Noted the
+  deliberate non-goal (no full re-open-and-re-sync mitigation) as an honest
+  limitation. Cross-referenced from `docs/src/operations/known-limitations.md`
+  (new rows for the fsync-failure stance and the honest power-fail-testing
+  status) and `docs/src/operations/power-loss.md`.
+- **ThreadSanitizer suppression justifications.** Rewrote
+  `tsan_suppressions.txt` so every suppression carries a written justification
+  of why the reported race is a TSAN *modeling limitation* (Arc::drop's
+  decoupled Acquire fence; `Once`/`OnceLock`/`LazyLock` and `thread_local!`
+  implicit init barriers) and not a real race, with the audit invariant that a
+  suppression for a race in Noxu's own code that is NOT a modeling limitation
+  is a critical finding to fix, not suppress. Flagged the `race:lazy_static`
+  entry as vestigial (Noxu has no `lazy_static` dependency). Mirrored the
+  justifications into `SAFETY.md` § "ThreadSanitizer suppression
+  justifications" as durable documentation.
+- **Power-failure (`dm-log-writes`/CrashMonkey) + Jepsen-style HA soak
+  methodologies.** Extended `docs/src/operations/power-loss.md` with a Layer 3
+  section documenting the `dm-log-writes`/CrashMonkey block-level replay
+  methodology (record the write stream, replay to every flush barrier, assert
+  every acked commit survives as a prefix) and how the in-tree torn-write +
+  write-error tests are its runnable subset. Extended
+  `docs/src/maintainer/chaos-soak-testing.md` with a Jepsen-style HA
+  fault-injection plan: the faults to inject (partitions, master kill, clock
+  skew, disk-full, pause), the invariants to check (no lost acked commit after
+  failover, linearizability of acked ops, no split-brain, monotonic VLSN,
+  clean fail-stop), and the honest current status (6-hour soak done and found
+  3 bugs; weeks-long soak + linearizability checker planned, not yet run).
+- **Corrected the `noxu-log` `unsafe` inventory in `AGENTS.md`.** The unsafe
+  table listed 7 `noxu-log` `unsafe` blocks and omitted the lock-free
+  combining-funnel LWL in `consolidation.rs`; updated the count to 12 and
+  documented its 5 blocks (one `unsafe impl Sync` + four `UnsafeCell`/raw-ptr
+  accesses, each sound by the `done` Release/Acquire pin protocol). All
+  production `unsafe` blocks in `noxu-log` were confirmed to carry accurate
+  `// SAFETY:` comments.
 
 ## [7.5.3] - 2026-07-12
 

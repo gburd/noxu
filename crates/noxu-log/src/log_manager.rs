@@ -2014,6 +2014,78 @@ mod tests {
         assert!(lm.is_io_invalid(), "is_io_invalid() must return true");
     }
 
+    /// C-2 / fsyncgate END-TO-END: a REAL write-path I/O error (injected via
+    /// the faultdisk `DiskFull` fault, which returns `StorageFull` from the
+    /// WAL `pwrite`) must (1) surface as an `Err` from `flush_sync` — never be
+    /// swallowed — and (2) permanently set `io_invalid`, so every subsequent
+    /// `log()` is refused. This drives the actual error path
+    /// (`flush_and_sync` returns `Err` → `flush_sync` sets `io_invalid`),
+    /// unlike `test_fsync_failure_invalidates_log_manager` which sets the flag
+    /// directly. This is the runnable subset of the fsyncgate stance
+    /// documented in SAFETY.md § "WAL write-error handling".
+    ///
+    /// The faultdisk controller is global process state, so this test must
+    /// run alone: it installs at the start and uninstalls in every exit path.
+    #[test]
+    fn test_real_write_error_invalidates_and_is_not_swallowed() {
+        use crate::faultdisk::{self, FaultController, FaultKind};
+
+        let dir = TempDir::new().unwrap();
+        let lm = make_log_manager(&dir);
+
+        // Warm-up write + flush so the file header and first buffer are on
+        // disk; capture how many posio writes that took so we can aim the
+        // fault at the NEXT write (a data pwrite during the next flush).
+        lm.log(LogEntryType::Trace, b"warmup", Provisional::No, false, false)
+            .expect("warmup write");
+        lm.flush_sync().expect("warmup flush");
+        let writes_so_far = faultdisk::write_count();
+
+        // Arm a DiskFull fault at the very next posio write.
+        faultdisk::install(FaultController::for_test(
+            FaultKind::DiskFull,
+            writes_so_far,
+        ));
+
+        // Do a write + flush; SOMEWHERE in the drain/pwrite the injected
+        // StorageFull must fire. The error must surface (as Err from log or
+        // flush_sync), never be silently dropped.
+        let mut saw_err = false;
+        if lm
+            .log(LogEntryType::Trace, b"boom", Provisional::No, false, false)
+            .is_err()
+        {
+            saw_err = true;
+        }
+        if lm.flush_sync().is_err() {
+            saw_err = true;
+        }
+        faultdisk::uninstall();
+
+        assert!(
+            saw_err,
+            "a real WAL write error (StorageFull) must surface as Err, not be \
+             swallowed"
+        );
+        assert!(
+            lm.is_io_invalid(),
+            "a real fdatasync/pwrite error must permanently invalidate the \
+             log (io_invalid), matching the fail-stop fsyncgate stance"
+        );
+        // And a subsequent write must be refused.
+        assert!(
+            lm.log(
+                LogEntryType::Trace,
+                b"after",
+                Provisional::No,
+                false,
+                false
+            )
+            .is_err(),
+            "writes must be refused after a real write error invalidated the log"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Part-2 acceptance test (DRIFT-1 fix)
     //
