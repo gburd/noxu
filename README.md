@@ -18,8 +18,9 @@ deliberately (see [Acknowledgements](#acknowledgements) and [NOTICE](NOTICE)).
 The version number tracks the JE release whose architecture it follows; it is
 **not** a claim of feature parity or of equivalent production maturity. Noxu is
 a young engine (first release 2026) with no production track record yet, and
-certain JE 7.5 features are not implemented (notably TTL/record expiration and
-replication wire authentication — see
+certain JE 7.5 features are not implemented (notably TTL/record expiration; the
+replication transport now defaults to mutually-authenticated mTLS, but
+per-message election authentication is not implemented — see
 [known limitations](docs/src/operations/known-limitations.md) and the
 [capability matrix](https://codeberg.page/gregburd/noxu/introduction.html#capability-matrix)).
 Use it where those constraints are acceptable, and validate durability for your
@@ -155,9 +156,14 @@ see [`examples/getting_started.rs`](examples/getting_started.rs) and the
   Phi Accrual Failure Detection, VLSN-based log streaming, network restore,
   master transfer, dynamic membership, and configurable
   `ReplicaAckPolicy` / `ReplicaConsistencyPolicy`.  Transport over TCP or
-  QUIC (`rustls`-based).  **Security note**: as of v7.5.3 the replication
-  wire protocol has no authentication; deploy only across a trusted network
-  boundary.  See
+  QUIC (`rustls`-based).  **Security note**: replication **refuses to start
+  on an unauthenticated transport by default** — configure
+  `RepTransportKind::Tls` + a `tls_config` + `peer_allowlist` for
+  mutually-authenticated (mTLS) channels (the analogue of BDB-JE HA's
+  `SSLAuthenticator`), or explicitly opt out with
+  `RepConfig::insecure_no_auth(true)` for a trusted-network / dev / CI
+  deployment.  Per-message election authentication is still not implemented.
+  See
   [`docs/src/operations/known-limitations.md`](docs/src/operations/known-limitations.md)
   for the full list.
 

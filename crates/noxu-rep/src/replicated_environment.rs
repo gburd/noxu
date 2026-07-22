@@ -308,6 +308,20 @@ impl ReplicatedEnvironment {
     /// it is the very first electable node that is creating the group. In that
     /// case it joins as the Master of the newly formed singleton group.
     pub fn new(config: RepConfig) -> Result<Self> {
+        // ── Enforced-authentication default (closes the external review's
+        //    core finding NA-1/NA-4/NA-8) ────────────────────────────────
+        //
+        // Refuse to start a replication dispatcher on an *unauthenticated*
+        // wire transport unless the operator has explicitly opted out via
+        // `RepConfig::insecure_no_auth(true)`.  This is the fail-closed
+        // posture of BDB-JE HA, which authenticates the data channel with
+        // mutual TLS (`SSLAuthenticator.isTrusted(SSLSession)` /
+        // `SSLMirrorAuthenticator`, `com.sleepycat.je.rep.net`) so a peer's
+        // identity is verified from its certificate rather than
+        // self-claimed on the wire.  Noxu's `PeerAllowlistVerifier`
+        // (`crate::auth`) is the direct analogue.
+        Self::enforce_auth_policy(&config)?;
+
         // mTLS Phase 2 (v3.1.0): peer_allowlist enforcement is real at the
         // TLS channel layer (TlsTcpChannelListener::bind_with_tls_and_allowlist).
         // Phase 3 (this release): when RepConfig::tls_config is set AND
@@ -555,6 +569,94 @@ impl ReplicatedEnvironment {
         Ok(env)
     }
 
+    /// Enforce the authenticated-transport default.
+    ///
+    /// Returns `Err(ConfigError)` when the node would otherwise bring up a
+    /// replication dispatcher on an **unauthenticated** wire transport
+    /// without the operator explicitly opting in via
+    /// [`RepConfig::insecure_no_auth`].
+    ///
+    /// ## Policy
+    ///
+    /// | `transport_kind` | `insecure_no_auth` | Result |
+    /// |---|---|---|
+    /// | `Tls` | – | OK — mTLS is validated in [`Self::build_dispatcher`] (requires `tls_config` + non-empty `peer_allowlist`, fail-closed). |
+    /// | `InMemory` | – | OK — in-process transport, no wire to authenticate. |
+    /// | `Tcp` / `Quic` | `true` | OK, with a loud `log::warn!`. |
+    /// | `Tcp` / `Quic` | `false` | **Refused** with a `ConfigError`. |
+    ///
+    /// This mirrors BDB-JE HA's authenticated data channel
+    /// (`com.sleepycat.je.rep.net.SSLAuthenticator` /
+    /// `SSLMirrorAuthenticator`): a peer is trusted only after its
+    /// certificate is verified during the TLS handshake, never on the basis
+    /// of a self-claimed plaintext identity.
+    fn enforce_auth_policy(config: &RepConfig) -> Result<()> {
+        use crate::rep_config::RepTransportKind;
+        match config.transport_kind {
+            // mTLS transport: authentication is enforced (fail-closed) in
+            // build_dispatcher — tls_config must be present and the
+            // peer_allowlist must be non-empty.  This requires a TLS backend
+            // to be compiled in; if none is, the operator asked for an
+            // authenticated transport the binary cannot provide, so refuse
+            // rather than silently fall through to a plaintext dispatcher.
+            RepTransportKind::Tls => {
+                #[cfg(feature = "tls-rustls")]
+                {
+                    Ok(())
+                }
+                #[cfg(not(feature = "tls-rustls"))]
+                {
+                    Err(RepError::ConfigError(format!(
+                        "node '{}': transport_kind=Tls requires the \
+                         `tls-rustls` feature, but no TLS backend is compiled \
+                         in. Rebuild with `--features tls-rustls` (or \
+                         `noxu/replication-tls-rustls`); refusing to fall back \
+                         to a plaintext dispatcher.",
+                        config.node_name,
+                    )))
+                }
+            }
+            // In-process transport: there is no socket and no untrusted peer
+            // can reach it, so there is nothing to authenticate on the wire.
+            RepTransportKind::InMemory => Ok(()),
+            // Plaintext TCP / skip-verify QUIC: the regression the external
+            // review flagged.  Refuse unless the operator explicitly accepts
+            // an unauthenticated transport.
+            RepTransportKind::Tcp | RepTransportKind::Quic => {
+                if config.insecure_no_auth {
+                    log::warn!(
+                        "[{}] INSECURE: replication is running on an \
+                         UNAUTHENTICATED {:?} transport (insecure_no_auth = \
+                         true). Any host that can reach {}:{} can join the \
+                         group and impersonate a peer. Configure \
+                         transport_kind=Tls + tls_config + peer_allowlist for \
+                         mutually-authenticated (mTLS) channels; only leave \
+                         this enabled on a fully isolated / firewalled \
+                         replication network.",
+                        config.node_name,
+                        config.transport_kind,
+                        config.node_host,
+                        config.node_port,
+                    );
+                    Ok(())
+                } else {
+                    Err(RepError::ConfigError(format!(
+                        "node '{}': replication would start on an \
+                         UNAUTHENTICATED {:?} transport, which is refused by \
+                         default. Configure mutually-authenticated channels \
+                         with `RepConfig::transport_kind(RepTransportKind::Tls)` \
+                         + `.tls_config(..)` + a non-empty `.peer_allowlist(..)` \
+                         (mirrors BDB-JE HA's SSLAuthenticator), OR, for a \
+                         trusted-network / development / CI deployment, \
+                         explicitly opt out with \
+                         `RepConfig::insecure_no_auth(true)`.",
+                        config.node_name, config.transport_kind,
+                    )))
+                }
+            }
+        }
+    }
+
     /// Build the service dispatcher for this node.
     ///
     /// Phase 3 logic: when `config.transport_kind == Tls` AND
@@ -799,6 +901,55 @@ impl ReplicatedEnvironment {
         let _ = self.io_shutdown.load(Ordering::SeqCst);
     }
 
+    /// Open a channel to a peer's `ELECTION` service, using the
+    /// **authenticated** transport when the node is configured for TLS.
+    ///
+    /// This closes the on-path-attacker vector for the elections RPC
+    /// (review gap 3 / design-doc findings NA-5..NA-7 at the transport
+    /// level): when `transport_kind == Tls`, the proposer connects with
+    /// [`connect_to_service_tls`], which performs the mutual-TLS handshake
+    /// (client-cert presentation + the server's `peer_allowlist` check)
+    /// before any Paxos promise/accept message is exchanged.  Both the
+    /// server side (the `ELECTION` [`ElectionService`] registered on the TLS
+    /// dispatcher) and the client side therefore run over a
+    /// mutually-authenticated channel — an off-path or on-path attacker
+    /// cannot inject or replay a proposal/vote without a CA-issued,
+    /// allowlisted certificate.  This mirrors BDB-JE HA, whose elections run
+    /// over the same authenticated `DataChannel` as the rest of the
+    /// protocol (`com.sleepycat.je.rep.net`).
+    ///
+    /// Per-message signing (binding a specific proposal to the handshake
+    /// cert) is a strictly stronger, separate scheme and is NOT implemented
+    /// here; see the note in `known-limitations.md`.
+    fn connect_election_channel(
+        &self,
+        addr: SocketAddr,
+    ) -> Result<Arc<dyn crate::net::channel::Channel>> {
+        #[cfg(feature = "tls-rustls")]
+        if self.config.transport_kind
+            == crate::rep_config::RepTransportKind::Tls
+        {
+            let tls = self.config.tls_config.as_ref().ok_or_else(|| {
+                RepError::ConfigError(
+                    "transport_kind=Tls requires a tls_config for the \
+                     election channel"
+                        .into(),
+                )
+            })?;
+            let ch = crate::net::service_dispatcher::connect_to_service_tls(
+                addr,
+                ELECTION_SERVICE_NAME,
+                tls,
+            )?;
+            return Ok(Arc::new(ch));
+        }
+        let ch = crate::net::service_dispatcher::connect_to_service(
+            addr,
+            ELECTION_SERVICE_NAME,
+        )?;
+        Ok(Arc::new(ch))
+    }
+
     /// Body of the election driver loop.  Public only for tests; called
     /// by [`Self::start_election_driver`].
     fn run_election_loop(self: Arc<Self>) {
@@ -871,13 +1022,8 @@ impl ReplicatedEnvironment {
             let mut channels: Vec<Arc<dyn crate::net::channel::Channel>> =
                 Vec::new();
             for (peer_name, addr) in &peers {
-                match crate::net::service_dispatcher::connect_to_service(
-                    *addr,
-                    ELECTION_SERVICE_NAME,
-                ) {
-                    Ok(ch) => {
-                        let arc: Arc<dyn crate::net::channel::Channel> =
-                            Arc::new(ch);
+                match self.connect_election_channel(*addr) {
+                    Ok(arc) => {
                         channels.push(arc);
                     }
                     Err(e) => {

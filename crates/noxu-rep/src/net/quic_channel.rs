@@ -14,14 +14,22 @@
 //!
 //! ## TLS / certificates
 //!
-//! QUIC mandates TLS 1.3. For internal replication we generate a self-signed
-//! certificate at runtime via `rcgen`.  The client uses a custom
-//! `ServerCertVerifier` that skips chain validation — appropriate because all
-//! replication peers are trusted (authenticated at the Paxos layer) and
-//! operate on a private network.  Production deployments can supply their own
-//! `rustls::ServerConfig` / `rustls::ClientConfig` via the dedicated
-//! constructors [`QuicChannelListener::with_server_config`] and
-//! [`QuicChannel::connect_with_config`].
+//! QUIC mandates TLS 1.3.  Two paths exist:
+//!
+//! - **Authenticated (recommended):**
+//!   [`QuicChannelListener::bind_with_tls_and_allowlist`] requires a client
+//!   certificate and enforces the `peer_allowlist` — mutual TLS, the QUIC
+//!   analogue of BDB-JE HA's `SSLAuthenticator`
+//!   (`com.sleepycat.je.rep.net`).  Pair it with
+//!   [`QuicChannel::connect_with_config`] built from a CA-rooted
+//!   [`crate::tls::TlsConfig`].
+//! - **Explicit-insecure (trusted network only):**
+//!   [`QuicChannel::connect`] / [`default_server_config`] use a self-signed
+//!   cert and a no-op `ServerCertVerifier` that skips chain validation.
+//!   This path performs **no peer authentication** and is gated at the
+//!   environment level by [`crate::RepConfig::insecure_no_auth`] —
+//!   `ReplicatedEnvironment::new` refuses to start a `Quic` transport
+//!   unless the operator has explicitly opted out of authentication.
 //!
 //! ## Wire framing
 //!
@@ -55,7 +63,15 @@ use crate::net::channel::Channel;
 // ---------------------------------------------------------------------------
 
 /// A `ServerCertVerifier` that accepts any certificate without chain
-/// validation.  Suitable for internal, trusted replication networks.
+/// validation.
+///
+/// **INSECURE.**  This performs no authentication of the server — it accepts
+/// any presented certificate.  It backs only the explicit-insecure QUIC
+/// client path ([`insecure_client_config`] / [`QuicChannel::connect`]),
+/// which `ReplicatedEnvironment` refuses to use unless
+/// [`crate::RepConfig::insecure_no_auth`] is set.  Never used on the
+/// authenticated ([`QuicChannel::connect_with_config`] + CA-rooted
+/// [`crate::tls::TlsConfig`]) path.
 #[derive(Debug)]
 struct SkipCertVerification(Arc<rustls::crypto::CryptoProvider>);
 
@@ -126,6 +142,15 @@ fn self_signed_cert()
 }
 
 /// Build a `quinn::ServerConfig` backed by a self-signed certificate.
+///
+/// **INSECURE — no client authentication.** The server does not request a
+/// client certificate (`with_no_client_auth`), so any peer can connect. This
+/// is the *explicit-insecure* QUIC path, permitted only when the operator has
+/// set [`crate::RepConfig::insecure_no_auth`] (or is driving `QuicChannel`
+/// directly on a trusted network).  For mutually-authenticated QUIC use
+/// [`QuicChannelListener::bind_with_tls_and_allowlist`], which requires a
+/// client certificate and enforces the `peer_allowlist` (the analogue of
+/// BDB-JE HA's `SSLAuthenticator`).
 pub fn default_server_config() -> Result<quinn::ServerConfig> {
     let (certs, key) = self_signed_cert()?;
     let tls = rustls::ServerConfig::builder()
@@ -146,6 +171,14 @@ pub fn default_server_config() -> Result<quinn::ServerConfig> {
 }
 
 /// Build a `quinn::ClientConfig` that skips certificate verification.
+///
+/// **INSECURE — no server-certificate verification.** Installs a no-op
+/// [`SkipCertVerification`] verifier, so the client accepts *any* server
+/// certificate (no chain validation, no name check). This is the
+/// *explicit-insecure* QUIC client path, permitted only on a trusted network
+/// / under [`crate::RepConfig::insecure_no_auth`]. For an authenticated QUIC
+/// client use [`QuicChannel::connect_with_config`] with a `quinn::ClientConfig`
+/// built from a real CA-rooted [`crate::tls::TlsConfig`].
 pub fn insecure_client_config() -> quinn::ClientConfig {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let verifier = SkipCertVerification(Arc::clone(&provider));
@@ -212,10 +245,14 @@ impl QuicChannel {
         }
     }
 
-    /// Connect to a QUIC endpoint using the insecure (skip-verify) client
-    /// config.  `server_name` must match the SNI in the server certificate
-    /// (use `"localhost"` for the self-signed cert produced by
+    /// Connect to a QUIC endpoint using the **insecure** (skip-verify)
+    /// client config.  `server_name` must match the SNI in the server
+    /// certificate (use `"localhost"` for the self-signed cert produced by
     /// [`default_server_config`]).
+    ///
+    /// **INSECURE — no server authentication.** See [`insecure_client_config`].
+    /// For a mutually-authenticated channel use
+    /// [`QuicChannel::connect_with_config`] with a CA-rooted client config.
     pub fn connect(addr: SocketAddr, server_name: &str) -> Result<Self> {
         Self::connect_with_config(addr, server_name, insecure_client_config())
     }

@@ -81,6 +81,75 @@ the endpoint for 0-RTT reconnect (no new TLS handshake required).
 `TlsTcpChannel` provides encrypted TCP replication.  Use the `tls-rustls`
 feature for a pure-Rust implementation (no system library dependency).
 
+### mTLS is the enforced default
+
+`ReplicatedEnvironment::new` **refuses to start a replication dispatcher on an
+unauthenticated wire transport by default.** A node configured with the
+default plaintext `RepTransportKind::Tcp` (or skip-verify `Quic`) and no mTLS
+material fails with a `ConfigError`:
+
+```text
+node 'node-1': replication would start on an UNAUTHENTICATED Tcp transport,
+which is refused by default. Configure mutually-authenticated channels with
+`RepConfig::transport_kind(RepTransportKind::Tls)` + `.tls_config(..)` + a
+non-empty `.peer_allowlist(..)`, OR, for a trusted-network / development /
+CI deployment, explicitly opt out with `RepConfig::insecure_no_auth(true)`.
+```
+
+This mirrors BDB-JE HA, which authenticates the data channel via mutual TLS
+(`com.sleepycat.je.rep.net.SSLAuthenticator` / `SSLMirrorAuthenticator`) so a
+peer's identity is *verified from its certificate*, not self-claimed on the
+wire — you cannot accidentally run an unauthenticated replication cluster.
+
+To configure the authenticated production path, set all three on `RepConfig`:
+
+```rust
+use noxu_rep::{RepConfig, RepTransportKind, TlsConfig, TlsIdentity, TrustedCerts};
+
+let tls = TlsConfig::for_replication(
+    TlsIdentity::PemFiles {
+        cert: "/etc/noxu/cert.pem".into(),
+        key:  "/etc/noxu/key.pem".into(),
+    },
+    TrustedCerts::CaFiles(vec!["/etc/noxu/ca.pem".into()]),
+    "node-1.cluster.example",
+)?;
+
+let config = RepConfig::builder("group", "node-1", "10.0.0.1")
+    .transport_kind(RepTransportKind::Tls)
+    .tls_config(tls)
+    .peer_allowlist(vec![
+        "node-1.cluster.example".to_string(),
+        "node-2.cluster.example".to_string(),
+        "node-3.cluster.example".to_string(),
+    ])
+    .build();
+```
+
+With `transport_kind = Tls`, the RESTORE, PEER_FEEDER, ELECTION, and ADMIN
+services all run on the mutually-authenticated dispatcher, and the election
+RPC's proposer side connects with `connect_to_service_tls` — so every Paxos
+promise/accept traverses an authenticated channel (the on-path "flip the
+master" vector is closed at the transport layer). Note: mTLS authenticates
+the *wire*, not each message; per-message election signing is not implemented
+(see [known limitations](../operations/known-limitations.md)).
+
+### Explicit opt-out for trusted networks / dev / CI
+
+```rust
+let config = RepConfig::builder("group", "node-1", "10.0.0.1")
+    // Plaintext / in-memory transport, no peer authentication.
+    .insecure_no_auth(true)
+    .build();
+```
+
+`insecure_no_auth(true)` permits the plaintext / skip-verify path and emits a
+loud `log::warn!` at startup. Only enable it where every peer IP is statically
+known and the firewall / VPC blocks all other inbound traffic to the
+replication port. (Under `cfg(test)` / the `test-harness` feature this
+defaults to `true` so the test suite and the in-process harness run without
+per-test PKI.)
+
 ### Quick setup (server)
 
 ```rust
