@@ -37,6 +37,24 @@ listed in [References](#references).
   keeps the commit in the in-memory log buffer (lost on process crash);
   `WriteNoSync` writes to OS buffers (survives process crash, lost on power
   loss).
+- **Systematic JE constant/default/threshold audit — no further drift found.**
+  Followed up the `Durability` drift with a value-level diff of every public
+  Noxu constant, default, and threshold against BDB-JE 7.5.11, on the review's
+  reasoning that a single silent-drift bug is rarely alone. Result: all 152
+  configuration-parameter defaults that map to a `je.*` parameter match JE
+  exactly (verified against `EnvironmentParams.java`); the `LockType` 5x5
+  conflict and upgrade matrices, `LockMode`, `CacheMode`, `ReplicaAckPolicy`
+  `required_acks` semantics, `XaFlags`, XID size limits, VLSN constants
+  (`LOG_SIZE=8`, `NULL=-1`, `UNINITIALIZED=0`), and `EntryStates` slot bits
+  (`0x01`-`0x40`) all match JE. No new correctness drift was found beyond the
+  already-fixed `Durability` constants. Added `noxu-config`
+  `tests/je_default_audit.rs` locking the correctness-affecting defaults to
+  their JE 7.5.11 values (with JE source citations) so a future silent edit
+  fails a test, and recorded the full sweep as a durable, re-runnable artifact
+  in `docs/src/internal/je-constant-audit-2026-07.md`. One Noxu-internal
+  inconsistency was flagged for human decision (not changed, as it affects
+  on-disk bytes): `entry_type::LOG_VERSION = 2` vs the authoritative
+  `file_header::LOG_VERSION = 3` stamped into per-entry headers.
 
 ### Documentation
 
