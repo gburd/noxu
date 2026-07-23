@@ -7,6 +7,54 @@ v1.5 (and later releases) that is likely to surface in user code.
 > [Introduction → capability matrix](../introduction.md#capability-matrix-v15--v22)
 > for the canonical "what is supported in which release" table.
 
+## v7.5.3 → 7.5.4 — `Durability` constants corrected to JE (HA behaviour change)
+
+7.5.4 corrected the three `Durability` convenience constants, which had
+diverged from `com.sleepycat.je.Durability`. The Rust type signatures are
+unchanged, but the **observable durability and acknowledgement semantics of a
+replicated (HA) environment change** — so if you run replication and use these
+constants, read this.
+
+| constant | field | 7.5.3 (wrong) | 7.5.4 (JE-correct) |
+|---|---|---|---|
+| `COMMIT_SYNC` | `replica_sync` | `Sync` | `NoSync` |
+| `COMMIT_NO_SYNC` | `replica_ack` | `None` | `SimpleMajority` |
+| `COMMIT_WRITE_NO_SYNC` | `replica_sync` | `WriteNoSync` | `NoSync` |
+
+Impact on an existing HA deployment upgrading 7.5.3 → 7.5.4:
+
+- **`COMMIT_SYNC`**: replicas no longer fsync on every commit (JE never
+  required this). Lower commit latency; the master's own fsync is unchanged, so
+  local durability is unaffected. The majority still acknowledges.
+- **`COMMIT_NO_SYNC`**: commits now wait for a **majority** of replicas to
+  acknowledge (previously they waited for none). This restores the JE
+  durability guarantee but adds commit latency and changes failure modes (a
+  commit can now block on `InsufficientReplicas`). This is the important one:
+  7.5.3's `COMMIT_NO_SYNC` was a silent durability *downgrade*.
+- **Non-replicated (single-node) environments are unaffected**: `local_sync`
+  was already correct in all three, and the ack-wait only engages when a
+  replica coordinator is wired.
+
+**If you depended (knowingly or not) on the 7.5.3 behaviour**, reproduce it
+exactly with `Durability::new`:
+
+```rust
+# use noxu::{Durability, SyncPolicy, ReplicaAckPolicy};
+// 7.5.3 COMMIT_SYNC (replicas also fsync):
+let old_commit_sync = Durability::new(
+    SyncPolicy::Sync, SyncPolicy::Sync, ReplicaAckPolicy::SimpleMajority);
+// 7.5.3 COMMIT_NO_SYNC (no ack wait):
+let old_commit_no_sync = Durability::new(
+    SyncPolicy::NoSync, SyncPolicy::NoSync, ReplicaAckPolicy::None);
+```
+
+There is **no on-disk format change** in 7.5.4: a 7.5.3 environment opens
+unchanged, and the TTL feature added in 7.5.4 rides a pre-existing flag bit in
+the LN log entry (a 7.5.3 engine reads a 7.5.4-with-TTL file without
+misinterpreting it — it just does not expire records). See
+[on-disk-format.md](../reference/on-disk-format.md) for the cross-version
+matrix.
+
 ## v6.x → 7.0 — idiomatic-Rust API reshape + cleanups
 
 7.0 reshapes the `noxu-db` public surface to read as ordinary Rust. The core
