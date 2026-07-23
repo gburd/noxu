@@ -78,6 +78,56 @@ The following changes are **not breaking** (allowed in minor releases):
 
 ---
 
+## Behavioural, durability, and on-disk-format changes
+
+SemVer as defined for Rust APIs covers *type signatures*, but a storage
+engine has two additional stability surfaces a signature diff does not capture.
+Both get explicit rules here, added after the 7.5.4 review flagged a durability
+semantics change that shipped as a patch:
+
+### Durability / persistence semantics
+
+A change to the *observable durability or acknowledgement semantics* of a
+stable API item — even one that is technically a bug fix and leaves the type
+signature unchanged — is **minor-bump-worthy and MUST carry a migration note**.
+The canonical example is the 7.5.4 correction of the `Durability` convenience
+constants: `COMMIT_SYNC` changed `replicaSync` `Sync → NoSync` and
+`COMMIT_NO_SYNC` changed `replicaAck` `None → SimpleMajority`. Those were
+correct (they restore JE semantics) but they change the fsync-on-replica and
+ack-wait behaviour an existing HA deployment observes. Such a change:
+
+- MUST be called out in `CHANGELOG.md` with the exact before/after values and
+  the affected constant names.
+- MUST appear in the [migration guide](../getting-started/migrating.md) with
+  instructions to reproduce the prior behaviour (e.g. via `Durability::new`).
+- SHOULD, going forward, be released as at least a **minor** bump so
+  `^`-range resolution does not deliver it silently on `cargo update`.
+
+### On-disk (`.ndb`) format
+
+The on-disk log format is versioned by `noxu_log::file_header::LOG_VERSION`
+(currently 3) with a `MIN_LOG_VERSION` floor (2) enforced at open. The stability
+rules:
+
+- A change that makes a newer engine write bytes an older supported engine
+  **cannot read** is a format break: it MUST bump `LOG_VERSION` and be released
+  as at least a minor version, with the cross-version matrix documented in
+  [on-disk-format.md](../reference/on-disk-format.md).
+- Adding an **optional, flag-gated** field that older readers parse correctly
+  (the field is absent unless its presence bit is set, and its presence does
+  not change the layout of existing fields) is **not** a format break and needs
+  no `LOG_VERSION` bump. Example: per-record TTL expiration in 7.5.4 rides the
+  pre-existing `HAVE_EXPIRATION` flag bit in the LN log entry — the entry
+  format was byte-identical between 7.5.3 and 7.5.4, so 7.5.3 reads a
+  7.5.4-with-TTL file without misinterpreting it (it simply does not act on the
+  expiration). Every such addition MUST still be recorded in the on-disk-format
+  cross-version compatibility matrix.
+- The engine MUST fail loudly (`LogError::VersionMismatch`) on a file whose
+  `log_version` is below `MIN_LOG_VERSION` or above the engine's `LOG_VERSION`
+  rather than risk misreading.
+
+---
+
 ## Compatibility tier table
 
 | Crate | Tier | v3.0+ guarantee |

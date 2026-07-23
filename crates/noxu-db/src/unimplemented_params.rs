@@ -26,6 +26,24 @@
 //! and `env_latch_timeout_ms` were wired in 7.1 (JE `ENV_FORCED_YIELD` /
 //! `ENV_LATCH_TIMEOUT`); `env_fair_latches` (JE `setFairLatches`) remains
 //! reserved (a fair-latch mode is a dedicated `noxu-sync` FIFO rewrite).
+//!
+//! # Graduation audit trail
+//!
+//! Each parameter that leaves this registry (because it became honored by a
+//! production subsystem) is recorded here with the release and the test that
+//! proves it is now consumed — the same discipline that let a prior audit catch
+//! a stale entry:
+//!
+//! - `verify_schedule` — wired to the background verifier daemon.
+//! - `env_forced_yield`, `env_latch_timeout_ms` — wired in 7.1.
+//! - **`env_expiration_enabled`, `env_ttl_clock_tolerance_ms`,
+//!   `cleaner_expiration_enabled` — graduated in 7.5.4** when TTL / record
+//!   expiration was implemented end to end (put → BIN/LN → read-skip → cleaner
+//!   reclaim → recovery). Proven honored by
+//!   `crates/noxu-db/tests/ttl_expiration_test.rs` (expiry visibility, day
+//!   granularity, and recovery-survival) plus the tree/cleaner/recovery unit
+//!   coverage; JE refs `EnvironmentImpl.isExpired` / `BIN.isExpired` /
+//!   `ExpirationTracker` / `RecoveryManager.redo`.
 
 use crate::environment_config::EnvironmentConfig;
 
@@ -38,7 +56,7 @@ pub struct UnimplementedParam {
 }
 
 /// The complete list of `EnvironmentConfig` parameters that are stored but
-/// not consumed by any production subsystem as of v3.1.
+/// not consumed by any production subsystem in the current release.
 ///
 /// Update this list whenever:
 /// - A parameter is wired up (remove the entry), or
@@ -113,10 +131,11 @@ pub fn warn_unimplemented_params(config: &EnvironmentConfig) {
         if (param.is_non_default)(config) {
             log::warn!(
                 "EnvironmentConfig::{} is set to a non-default value but \
-                 is NOT YET IMPLEMENTED as of v3.1. \
+                 is NOT YET IMPLEMENTED in noxu {}. \
                  The setting has no effect. \
                  See docs/src/operations/known-limitations.md.",
-                param.name
+                param.name,
+                env!("CARGO_PKG_VERSION"),
             );
         }
     }

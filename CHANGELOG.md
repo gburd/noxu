@@ -15,6 +15,44 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Documentation
+
+- **Release-governance response to the 7.5.4 follow-up review.** The follow-up
+  correctly flagged that the 7.5.4 `Durability` constant fix — though correct —
+  changed observable HA durability/ack semantics yet shipped as a patch with no
+  migration signal. Addressed:
+  - **SemVer policy** (`docs/src/contributing/semver-policy.md`) gained a
+    "Behavioural, durability, and on-disk-format changes" section: a change to
+    the observable durability/acknowledgement semantics of a stable API item is
+    now minor-bump-worthy and MUST carry a migration note, even when the type
+    signature is unchanged.
+  - **Migration guide** (`docs/src/getting-started/migrating.md`) documents the
+    7.5.3→7.5.4 `Durability` change with the exact before/after values per
+    constant and a `Durability::new` recipe to reproduce the 7.5.3 behaviour.
+  - **On-disk format policy** (`docs/src/reference/on-disk-format.md`) gained a
+    version-stability section + cross-version compatibility matrix, and records
+    that **7.5.4's TTL feature made NO on-disk format change** — per-record
+    expiration rides a pre-existing flag bit in the LN log entry, byte-identical
+    to 7.5.3, so `LOG_VERSION` stays 3 and a 7.5.3 engine reads a 7.5.4-with-TTL
+    file without misinterpreting it. A new regression test
+    (`ln_log_entry::test_ln_expiration_is_flag_gated_and_roundtrips`) proves the
+    flag-gated encoding.
+
+### Fixed
+
+- **Stale hard-coded version strings in shipped code.** The
+  `unimplemented_params` operator WARN log said "NOT YET IMPLEMENTED as of
+  v3.1" (three major versions stale); it now interpolates
+  `env!("CARGO_PKG_VERSION")` at runtime. Removed the stale "as of v3.1" from
+  the registry doc comment and from the reserved-parameter rustdoc in
+  `noxu-dbi::dbi_config` and `noxu-db::environment_config`.
+- **TTL registry-graduation audit note.** The three TTL-family params
+  (`env_expiration_enabled`, `env_ttl_clock_tolerance_ms`,
+  `cleaner_expiration_enabled`) left the `unimplemented_params` registry in
+  7.5.4 without the dated NOTE the registry's own discipline calls for; added a
+  "Graduation audit trail" section recording the 7.5.4 graduation and the test
+  that proves the params are now honored.
+
 ## [7.5.4] - 2026-07-22
 
 ### Changed

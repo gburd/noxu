@@ -157,7 +157,7 @@ pub struct EnvironmentConfig {
     // -----------------------------------------------------------------------
     /// Check for lock leaks when databases are closed.
     ///
-    /// **Reserved / not yet implemented as of v3.1.** Setting a non-default
+    /// **Reserved / not yet implemented.** Setting a non-default
     /// value (false) has no effect and emits a `WARN` log at
     /// `Environment::open` time.
     ///
@@ -229,7 +229,7 @@ pub struct EnvironmentConfig {
 
     /// Enable per-database node eviction.
     ///
-    /// **Reserved / not yet implemented as of v3.1.** Setting a non-default
+    /// **Reserved / not yet implemented.** Setting a non-default
     /// value (true) has no effect and emits a `WARN` log at
     /// `Environment::open` time.
     ///

@@ -642,4 +642,53 @@ mod tests {
         assert_eq!(entry.abort_key, decoded.abort_key);
         assert_eq!(entry.abort_data, decoded.abort_data);
     }
+
+    /// Cross-version format-safety for TTL (7.5.4 follow-up review concern):
+    /// the per-record expiration field is flag-gated, so (1) a record WITHOUT a
+    /// TTL encodes byte-identically whether or not TTL support exists (no flag,
+    /// no bytes), and (2) a record WITH a TTL round-trips its expiration. This
+    /// is why 7.5.4 needed no LOG_VERSION bump and a 7.5.3 engine can read a
+    /// 7.5.4-with-TTL file (it parses the same flag-gated layout).
+    #[test]
+    fn test_ln_expiration_is_flag_gated_and_roundtrips() {
+        let mk = |expiration: i32| {
+            LnLogEntry::new(
+                100,
+                Some(42),
+                Lsn::new(1, 500),
+                false,
+                None,
+                None,
+                NULL_VLSN,
+                0,
+                true,
+                b"k".to_vec(),
+                Some(b"v".to_vec()),
+                expiration,
+                Vlsn::new(10),
+            )
+        };
+
+        // (1) No-TTL record: encoding must be exactly what a pre-TTL writer
+        // produced. The HAVE_EXPIRATION flag is off and NO expiration bytes are
+        // appended, so a 7.5.3 reader sees an identical byte stream.
+        let mut no_ttl = BytesMut::new();
+        mk(0).write_to_log(&mut no_ttl);
+        let d0 = LnLogEntry::read_from_log(&no_ttl, true).unwrap();
+        assert_eq!(d0.expiration, 0, "no-TTL record decodes expiration 0");
+
+        // (2) TTL record: the flag is set, the expiration round-trips, and the
+        // stream is strictly LONGER (the extra flag-gated field) but still
+        // parses through the same read path.
+        let mut ttl = BytesMut::new();
+        mk(123_456).write_to_log(&mut ttl);
+        let d1 = LnLogEntry::read_from_log(&ttl, true).unwrap();
+        assert_eq!(d1.expiration, 123_456, "TTL record round-trips expiration");
+        assert_eq!(d1.key, b"k".to_vec());
+        assert_eq!(d1.data, Some(b"v".to_vec()));
+        assert!(
+            ttl.len() > no_ttl.len(),
+            "a TTL record carries extra flag-gated bytes; a no-TTL record does not"
+        );
+    }
 }

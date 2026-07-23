@@ -187,3 +187,44 @@ entry) yields an empty per-DB-roots set; recovery then seeds no tree and
 falls back to full LN redo. Any malformed/truncated trailer degrades to the
 same empty set — a valid checkpoint is never rejected because of a torn
 trailer.
+
+## Format version stability & cross-version compatibility
+
+The on-disk log format is versioned by `noxu_log::file_header::LOG_VERSION`
+(currently **3**), with a `MIN_LOG_VERSION` floor (**2**) enforced at open. A
+file whose `log_version` is below the floor or above the engine's `LOG_VERSION`
+is rejected with `LogError::VersionMismatch` — the engine fails loudly rather
+than risk misreading.
+
+### Policy
+
+- **A format-breaking change** (newer engine writes bytes an older supported
+  engine cannot read) bumps `LOG_VERSION` and ships as at least a **minor**
+  release, documented in this matrix and the
+  [SemVer policy](../contributing/semver-policy.md).
+- **An optional, flag-gated field addition** that older readers parse correctly
+  (absent unless a presence bit is set; existing field layout unchanged) is
+  **not** a break and does not bump `LOG_VERSION`, but is still recorded here.
+
+### Cross-version compatibility matrix
+
+| Writer → Reader | Result |
+|---|---|
+| v2 file → v3 engine | ✅ read (v3 resolves the 32-byte v2 header via `on_disk_size`) |
+| v3 file → v3 engine | ✅ read |
+| v3 file → v2 engine | ❌ `VersionMismatch` (v2 predates the v3 header CRC) |
+| below `MIN_LOG_VERSION` | ❌ `VersionMismatch` (fail loud) |
+
+### Per-release entry-format notes
+
+- **7.5.4 (TTL / record expiration)**: **no format change.** Per-record
+  expiration is carried by the pre-existing `HAVE_EXPIRATION` / `HAVE_ABORT_
+  EXPIRATION` flag bits in the LN log entry (see [Entry Header](#entry-header)),
+  which have been part of the JE-faithful entry layout since before 7.5.3. A
+  record written without a TTL sets no flag and writes no expiration bytes, so
+  its encoding is unchanged; a record written *with* a TTL sets the flag and
+  appends the expiration field. The `ln_log_entry` serialization is
+  byte-identical between 7.5.3 and 7.5.4. **Consequence:** a 7.5.3 engine can
+  open and read a 7.5.4 environment, including files that contain TTL records —
+  it parses the expiration field identically but does not act on it (records do
+  not expire under 7.5.3). `LOG_VERSION` remains 3 across 7.5.3 ↔ 7.5.4.
