@@ -15,6 +15,25 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Performance
+
+- Latch-lite / optimistic tree descent (MVCC proposal §6c option 3):
+  **measured and rejected.** A criterion microbench decomposition
+  (`crates/noxu-tree/benches/descent_bench.rs`) of the warm point read shows the
+  hand-over-hand shared-latch acquire/release — the only cost an optimistic
+  latch-coupling (OLC) descent can remove — is just ~13–15 % of the end-to-end
+  read (descent latch cost ~112–148 ns of a ~875–984 ns read; the dominant
+  ~548 ns is `lock_ln` + cursor + txn, which latch-lite cannot touch). An OLC
+  version check is ~0.8 ns vs a ~38 ns latch pair, so the technique *works* —
+  the read is simply not latch-bound. Building a high-risk concurrency change in
+  the `forbid(unsafe_code)` tree core (new reader-vs-split shuttle proofs
+  required) for a low-teens ceiling fails the proposal's own go/no-go rule. The
+  read gap to WiredTiger (~4–5×) is structurally traversal/lock-bound, not
+  latch-bound — the only lever that attacks the dominant `lock_ln`/cursor cost
+  is a lock-free read path (opt-in MVCC, §6a). Analysis:
+  `docs/src/internal/latch-lite-descent-ceiling-2026-07.md`. No runtime code
+  changed; only a bench + docs were added.
+
 ## [7.5.6] - 2026-07-23
 
 ### Performance

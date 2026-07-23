@@ -130,3 +130,4 @@
   - [fsync group-commit: batch factor (2026-07)](internal/fsync-group-commit-batch-factor-2026-07.md)
   - [JE constant/default/threshold audit (2026-07)](internal/je-constant-audit-2026-07.md)
   - [MVCC proposal (2026-07)](internal/mvcc-proposal-2026-07.md)
+  - [latch-lite descent: ceiling (2026-07)](internal/latch-lite-descent-ceiling-2026-07.md)
