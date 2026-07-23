@@ -15,6 +15,28 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Changed
+
+- **LRU restored as the default cache-eviction policy; CLOCK/LIRS/ARC/CAR/
+  CoolHot moved behind an experimental feature.** An external review flagged the
+  collection of alternative eviction policies as unjustified by published
+  evidence and as multiplying the eviction↔cleaner↔checkpoint interaction test
+  matrix (the most delicate part of the design); our own benchmarking
+  independently found CoolHot did not move throughput on the measured
+  workloads. The default eviction algorithm (`EVICTOR_ALGORITHM`) is reverted
+  from `coolhot` back to `lru` — the JE-faithful (`Evictor` / `LRUEvictor`),
+  well-understood, benchmark-validated policy. CLOCK, LIRS, ARC, CAR, and
+  CoolHot are preserved (not deleted) but gated behind the non-default
+  `experimental-eviction-policies` cargo feature, wired through
+  `noxu-evictor` → `noxu-dbi` → `noxu-db` → `noxu`; with the feature off they
+  are absent from the default build surface and the default test matrix, and
+  `EvictionAlgorithm::from_name` falls back to LRU (with a warning) for a gated
+  name. This is a behavioral change to the default eviction policy; deployments
+  that relied on CoolHot must build with `--features noxu/experimental-
+  eviction-policies` and set `EVICTOR_ALGORITHM=coolhot`. Note: ARC and CAR
+  derive from IBM-patented algorithms (earliest patents expired / near expiry);
+  see the eviction-policies reference doc for the IP note.
+
 ### Security
 
 - **Replication now refuses to run on an unauthenticated wire transport by

@@ -876,7 +876,7 @@ impl EnvironmentConfig {
             checkpointer_high_priority: false,
             // Evictor
             evictor_nodes_per_scan: 10,
-            evictor_algorithm: "coolhot".to_string(),
+            evictor_algorithm: "lru".to_string(),
             evictor_evict_bytes: 512 * 1024,
             evictor_critical_percentage: 5,
             evictor_lru_only: false,

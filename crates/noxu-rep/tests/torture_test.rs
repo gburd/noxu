@@ -1116,12 +1116,18 @@ enum ChaosPhase {
     MasterHandover,
 }
 
-/// All eviction algorithms available for random selection.
-const ALL_ALGOS: [EvictionAlgorithm; 5] = [
+/// All eviction algorithms available for random selection.  Only LRU is
+/// available by default; the scan-resistant policies are added under the
+/// `experimental-eviction-policies` feature.
+const ALL_ALGOS: &[EvictionAlgorithm] = &[
     EvictionAlgorithm::Lru,
+    #[cfg(feature = "experimental-eviction-policies")]
     EvictionAlgorithm::Clock,
+    #[cfg(feature = "experimental-eviction-policies")]
     EvictionAlgorithm::Arc,
+    #[cfg(feature = "experimental-eviction-policies")]
     EvictionAlgorithm::Car,
+    #[cfg(feature = "experimental-eviction-policies")]
     EvictionAlgorithm::Lirs,
 ];
 

@@ -318,11 +318,10 @@ impl Evictor {
         max_batch_size: usize,
         lru_only: bool,
     ) -> Self {
-        // Default to the enum's `#[default]` algorithm (CoolHot) for both
-        // the primary and scan slots.  CoolHot is scan-resistant by
-        // construction (admission is COOL), so a one-touch scan self-evicts
-        // from the COOL stage without displacing the HOT working set — the
-        // fix for the θ=0.99 Zipfian LN-cache hit-rate collapse under LRU.
+        // Default to the enum's `#[default]` algorithm (LRU) for both the
+        // primary and scan slots.  LRU is the JE-faithful policy (JE's
+        // `Evictor` / `LRUEvictor`); scan pollution is mitigated by the
+        // separate scan-resistant tracking slot and `CacheMode`.
         let primary = EvictionAlgorithm::default().new_policy();
         let scan = EvictionAlgorithm::default().new_policy();
         Self::with_policies(arbiter, max_batch_size, lru_only, primary, scan)
@@ -2170,12 +2169,12 @@ mod tests {
     }
 
     #[test]
-    fn test_default_algorithm_is_coolhot() {
+    fn test_default_algorithm_is_lru() {
         let usage = Arc::new(AtomicI64::new(0));
         let arbiter = Arbiter::new(1000, usage, 100, 200);
         let e = Evictor::new(arbiter, 100, false);
-        assert_eq!(e.primary_algorithm_name(), "CoolHot");
-        assert_eq!(e.scan_algorithm_name(), "CoolHot");
+        assert_eq!(e.primary_algorithm_name(), "LRU");
+        assert_eq!(e.scan_algorithm_name(), "LRU");
     }
 
     /// EV-15 (JE Evictor.doCriticalEviction, Evictor.java:2054): a writer
@@ -2310,6 +2309,7 @@ mod tests {
         // not have to fall under budget in one shot — the writer proceeds.
     }
 
+    #[cfg(feature = "experimental-eviction-policies")]
     #[test]
     fn test_with_algorithm_clock() {
         let usage = Arc::new(AtomicI64::new(0));
@@ -2320,6 +2320,7 @@ mod tests {
         assert_eq!(e.scan_algorithm_name(), "Clock");
     }
 
+    #[cfg(feature = "experimental-eviction-policies")]
     #[test]
     fn test_with_scan_algorithm_independent() {
         let usage = Arc::new(AtomicI64::new(0));
@@ -2744,18 +2745,22 @@ mod tests {
     fn test_lru_evicts_all() {
         algo_evicts_all_nodes(EvictionAlgorithm::Lru);
     }
+    #[cfg(feature = "experimental-eviction-policies")]
     #[test]
     fn test_clock_evicts_all() {
         algo_evicts_all_nodes(EvictionAlgorithm::Clock);
     }
+    #[cfg(feature = "experimental-eviction-policies")]
     #[test]
     fn test_arc_evicts_all() {
         algo_evicts_all_nodes(EvictionAlgorithm::Arc);
     }
+    #[cfg(feature = "experimental-eviction-policies")]
     #[test]
     fn test_car_evicts_all() {
         algo_evicts_all_nodes(EvictionAlgorithm::Car);
     }
+    #[cfg(feature = "experimental-eviction-policies")]
     #[test]
     fn test_lirs_evicts_all() {
         algo_evicts_all_nodes(EvictionAlgorithm::Lirs);

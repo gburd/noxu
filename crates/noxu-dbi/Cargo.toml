@@ -33,6 +33,12 @@ memmap2 = { workspace = true }
 # dependent crates (e.g. noxu-db).  Never enable this in production builds.
 testing = []
 
+# Experimental, non-default eviction policies (CLOCK/LIRS/ARC/CAR/CoolHot).
+# Off by default; passthrough to noxu-evictor.
+experimental-eviction-policies = [
+    "noxu-evictor/experimental-eviction-policies",
+]
+
 # DST cursor coverage: only in the graph under `--cfg noxu_shuttle`.  Lets the
 # cursor's `db_impl` RwLock be scheduled by shuttle via the
 # noxu_util::dst_sync_pl seam (matching the already-seamed tree node latch), so

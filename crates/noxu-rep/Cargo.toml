@@ -24,6 +24,12 @@ tls-native = ["dep:native-tls"]
 # QUIC transport over multiplexed streams. QUIC mandates TLS 1.3, so this
 # always pulls in the pure-Rust TLS backend.
 quic = ["dep:quinn", "dep:tokio", "dep:bytes", "tls-rustls"]
+# Experimental, non-default eviction policies (CLOCK/LIRS/ARC/CAR/CoolHot).
+# Off by default; passthrough to noxu-evictor so the torture test can exercise
+# them when built with the feature.
+experimental-eviction-policies = [
+    "noxu-evictor/experimental-eviction-policies",
+]
 
 [dependencies]
 hashbrown = { workspace = true }

@@ -310,6 +310,12 @@ impl Drop for SharedEvictorHandle {
 mod tests {
     use super::*;
 
+    // These tests all mutate the process-global SharedEvictorHandle singleton
+    // via reset_for_test()/join(); serialize them so parallel test threads do
+    // not race on that shared state.  (Predates the eviction-policy feature
+    // gating; surfaced more often once the feature adds test count.)
+    static SERIAL: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
     fn params(budget: i64) -> SharedCacheParams {
         SharedCacheParams {
             budget_bytes: budget,
@@ -323,6 +329,7 @@ mod tests {
 
     #[test]
     fn join_and_deregister_lifecycle() {
+        let _guard = SERIAL.lock();
         SharedEvictorHandle::reset_for_test();
         assert_eq!(SharedEvictorHandle::member_count(), 0);
 
@@ -353,6 +360,7 @@ mod tests {
 
     #[test]
     fn deregister_removes_only_this_envs_trees() {
+        let _guard = SERIAL.lock();
         SharedEvictorHandle::reset_for_test();
         let h1 = SharedEvictorHandle::join(params(4 * 1024 * 1024));
         let h2 = SharedEvictorHandle::join(params(4 * 1024 * 1024));

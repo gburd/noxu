@@ -1057,9 +1057,12 @@ impl EnvironmentImpl {
                 cfg.evictor_nodes_per_scan,
                 cfg.evictor_lru_only,
             )
-            // Select the eviction algorithm (JE EVICTOR is LRU; Noxu defaults
-            // to "lru" but allows clock/arc/car/lirs via EVICTOR_ALGORITHM).
-            // Sets both the primary and scan policy slots.
+            // Select the eviction algorithm (JE EVICTOR is LRU; Noxu
+            // defaults to "lru" (JE-faithful).  The scan-resistant
+            // alternatives clock/arc/car/lirs/coolhot are experimental,
+            // gated behind the `experimental-eviction-policies` feature via
+            // EVICTOR_ALGORITHM; when the feature is off they fall back to
+            // LRU with a warning).  Sets both the primary and scan slots.
             .with_algorithm(noxu_evictor::EvictionAlgorithm::from_name(
                 &cfg.evictor_algorithm,
             ))
