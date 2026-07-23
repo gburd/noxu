@@ -80,51 +80,6 @@ listed in [References](#references).
   proposal's "measure §6c first" stance and its caution that the read gap must
   be re-measured on a quiet, high-throughput host before concluding whether
   MVCC is the only remaining read lever.
-### Fixed
-
-- **Data-safety: repeated `Environment::clean_log()` + checkpoint cycles no
-  longer lose committed records — or the database itself.** A public-API
-  correctness bug. Noxu's database catalog (the name → id mapping) is an
-  in-memory `HashMap` rebuilt from `NameLN` WAL entries during recovery
-  (REC-B) — NOT a checkpointed mapping tree the way JE stores it. The log
-  cleaner does not recognise `NameLN` / `NameLNTxn` entries (they fall into
-  the `Other` bucket in `Cleaner::decode_ln_entries_from_file`), so it never
-  migrates them forward the way JE's cleaner migrates naming/mapping-tree LNs
-  via `FileProcessor.processLN`.
-
-  **Before:** a single `clean_log()` + reopen was fine, but *repeated*
-  forced-clean (`clean_log()` = `run_cleaner(u32::MAX, true)`) + checkpoint
-  cycles eventually reclaimed the log file holding a database's only
-  `NameLN`. Recovery could then no longer find the database and
-  `open_database` failed with `DatabaseNotFound` — losing the database and
-  all its records.
-
-  **After:** the checkpointer re-logs the live catalog (one fresh `NameLN`
-  per open database) at the START of every checkpoint
-  (`Checkpointer::set_catalog_relog_fn` → `EnvironmentImpl::relog_live_catalog`).
-  Because the cleaner only deletes a file after it passes the two-checkpoint
-  deletion barrier (`FileSelector`), a fresh `NameLN` for every live database
-  always lands in a file newer than any file the barrier can make deletable
-  — so recovery's full-log scan always finds it. This is Noxu's analog of JE
-  flushing the mapping-tree root at checkpoint (`Checkpointer.flushRoot`) so
-  the catalog is durable at the checkpoint fence, restoring JE's invariant
-  "do not delete a cleaned file until a checkpoint reflects its (migrated)
-  entries" for the HashMap catalog. Regression guard:
-  `crates/noxu-db/tests/clean_log_recovery_test.rs` (fails on the pre-fix
-  base with `DatabaseNotFound`; passes after).
-
-### Documentation
-
-- **MVCC design proposal** (`docs/src/internal/mvcc-proposal-2026-07.md`). A
-  research + design proposal analysing whether to add multi-version concurrency
-  control to Noxu, cited to libdb (BDB-C, which has page-level MVCC), BDB-JE (the
-  lock-based parent), and Noxu's own log/txn/cleaner sources. Honestly weighs the
-  read-throughput gap (~715K vs WiredTiger's ~3.4M) against Noxu's
-  zero-abort mixed-workload win, and recommends **against** MVCC as a first step
-  in favour of a direct read-path optimization, reserving an opt-in,
-  read-only-snapshot MVCC (log-version reads, default OFF) as a secondary path.
-  No engine code — proposal for human decision.
-### Performance
 
 - **Concurrency-adaptive fsync batch window (opt-in; default-off, and
   falsified as a mid-concurrency win on the repro box — honest science).** The
@@ -194,6 +149,51 @@ listed in [References](#references).
   12/12, `recovery_correctness_test` 22/22, `bounded_fsync_durability_test`
   4/4.
 
+
+### Fixed
+
+- **Data-safety: repeated `Environment::clean_log()` + checkpoint cycles no
+  longer lose committed records — or the database itself.** A public-API
+  correctness bug. Noxu's database catalog (the name → id mapping) is an
+  in-memory `HashMap` rebuilt from `NameLN` WAL entries during recovery
+  (REC-B) — NOT a checkpointed mapping tree the way JE stores it. The log
+  cleaner does not recognise `NameLN` / `NameLNTxn` entries (they fall into
+  the `Other` bucket in `Cleaner::decode_ln_entries_from_file`), so it never
+  migrates them forward the way JE's cleaner migrates naming/mapping-tree LNs
+  via `FileProcessor.processLN`.
+
+  **Before:** a single `clean_log()` + reopen was fine, but *repeated*
+  forced-clean (`clean_log()` = `run_cleaner(u32::MAX, true)`) + checkpoint
+  cycles eventually reclaimed the log file holding a database's only
+  `NameLN`. Recovery could then no longer find the database and
+  `open_database` failed with `DatabaseNotFound` — losing the database and
+  all its records.
+
+  **After:** the checkpointer re-logs the live catalog (one fresh `NameLN`
+  per open database) at the START of every checkpoint
+  (`Checkpointer::set_catalog_relog_fn` → `EnvironmentImpl::relog_live_catalog`).
+  Because the cleaner only deletes a file after it passes the two-checkpoint
+  deletion barrier (`FileSelector`), a fresh `NameLN` for every live database
+  always lands in a file newer than any file the barrier can make deletable
+  — so recovery's full-log scan always finds it. This is Noxu's analog of JE
+  flushing the mapping-tree root at checkpoint (`Checkpointer.flushRoot`) so
+  the catalog is durable at the checkpoint fence, restoring JE's invariant
+  "do not delete a cleaned file until a checkpoint reflects its (migrated)
+  entries" for the HashMap catalog. Regression guard:
+  `crates/noxu-db/tests/clean_log_recovery_test.rs` (fails on the pre-fix
+  base with `DatabaseNotFound`; passes after).
+
+### Documentation
+
+- **MVCC design proposal** (`docs/src/internal/mvcc-proposal-2026-07.md`). A
+  research + design proposal analysing whether to add multi-version concurrency
+  control to Noxu, cited to libdb (BDB-C, which has page-level MVCC), BDB-JE (the
+  lock-based parent), and Noxu's own log/txn/cleaner sources. Honestly weighs the
+  read-throughput gap (~715K vs WiredTiger's ~3.4M) against Noxu's
+  zero-abort mixed-workload win, and recommends **against** MVCC as a first step
+  in favour of a direct read-path optimization, reserving an opt-in,
+  read-only-snapshot MVCC (log-version reads, default OFF) as a secondary path.
+  No engine code — proposal for human decision.
 ## [7.5.5] - 2026-07-23
 
 ### Documentation
