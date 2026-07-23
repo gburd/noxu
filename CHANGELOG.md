@@ -15,6 +15,8 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+## [7.5.5] - 2026-07-23
+
 ### Documentation
 
 - **Release-governance response to the 7.5.4 follow-up review.** The follow-up

@@ -101,7 +101,7 @@ name = "transaction_config"
 path = "examples/transaction_config.rs"
 
 [workspace.package]
-version = "7.5.4"
+version = "7.5.5"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0 OR MIT"
@@ -117,33 +117,33 @@ readme = "README.md"
 # Public crates (published to crates.io in dep order at v3.1.0).
 # Both `version` and `path` are required: `version` is used by crates.io,
 # `path` is used for local development inside the workspace.
-noxu-sync         = { version = "7.5.4", path = "crates/noxu-sync" }
-noxu-util         = { version = "7.5.4", path = "crates/noxu-util" }
-noxu-latch        = { version = "7.5.4", path = "crates/noxu-latch" }
-noxu-config       = { version = "7.5.4", path = "crates/noxu-config" }
-noxu-log          = { version = "7.5.4", path = "crates/noxu-log" }
-noxu-tree         = { version = "7.5.4", path = "crates/noxu-tree" }
-noxu-txn          = { version = "7.5.4", path = "crates/noxu-txn" }
-noxu-evictor      = { version = "7.5.4", path = "crates/noxu-evictor" }
-noxu-cleaner      = { version = "7.5.4", path = "crates/noxu-cleaner" }
-noxu-recovery     = { version = "7.5.4", path = "crates/noxu-recovery" }
-noxu-dbi          = { version = "7.5.4", path = "crates/noxu-dbi" }
-noxu-engine       = { version = "7.5.4", path = "crates/noxu-engine" }
-noxu-db           = { version = "7.5.4", path = "crates/noxu-db" }
-noxu-bind         = { version = "7.5.4", path = "crates/noxu-bind" }
-noxu-collections  = { version = "7.5.4", path = "crates/noxu-collections" }
-noxu-persist      = { version = "7.5.4", path = "crates/noxu-persist" }
-noxu-persist-derive = { version = "7.5.4", path = "crates/noxu-persist-derive" }
-noxu-xa           = { version = "7.5.4", path = "crates/noxu-xa" }
-noxu-rep          = { version = "7.5.4", path = "crates/noxu-rep" }
+noxu-sync         = { version = "7.5.5", path = "crates/noxu-sync" }
+noxu-util         = { version = "7.5.5", path = "crates/noxu-util" }
+noxu-latch        = { version = "7.5.5", path = "crates/noxu-latch" }
+noxu-config       = { version = "7.5.5", path = "crates/noxu-config" }
+noxu-log          = { version = "7.5.5", path = "crates/noxu-log" }
+noxu-tree         = { version = "7.5.5", path = "crates/noxu-tree" }
+noxu-txn          = { version = "7.5.5", path = "crates/noxu-txn" }
+noxu-evictor      = { version = "7.5.5", path = "crates/noxu-evictor" }
+noxu-cleaner      = { version = "7.5.5", path = "crates/noxu-cleaner" }
+noxu-recovery     = { version = "7.5.5", path = "crates/noxu-recovery" }
+noxu-dbi          = { version = "7.5.5", path = "crates/noxu-dbi" }
+noxu-engine       = { version = "7.5.5", path = "crates/noxu-engine" }
+noxu-db           = { version = "7.5.5", path = "crates/noxu-db" }
+noxu-bind         = { version = "7.5.5", path = "crates/noxu-bind" }
+noxu-collections  = { version = "7.5.5", path = "crates/noxu-collections" }
+noxu-persist      = { version = "7.5.5", path = "crates/noxu-persist" }
+noxu-persist-derive = { version = "7.5.5", path = "crates/noxu-persist-derive" }
+noxu-xa           = { version = "7.5.5", path = "crates/noxu-xa" }
+noxu-rep          = { version = "7.5.5", path = "crates/noxu-rep" }
 # noxu-observe is published to crates.io (immediately before noxu-db in the
 # publish order) because noxu-db has an optional `noxu-observe` dependency and
 # cargo validates that every dependency version exists on the registry. This
 # also makes the noxu-db / noxu `observability` feature work for crates.io
 # users (see docs/src/contributing/publishing.md).
-noxu-observe      = { version = "7.5.4", path = "crates/noxu-observe" }
+noxu-observe      = { version = "7.5.5", path = "crates/noxu-observe" }
 # The `noxu` umbrella is published LAST (after noxu-rep).
-noxu              = { version = "7.5.4", path = "crates/noxu" }
+noxu              = { version = "7.5.5", path = "crates/noxu" }
 
 # Quorum system library (authored by Greg Burd — published at crates.io before
 # noxu-rep can be published; path dep used for local development).
