@@ -282,6 +282,34 @@ pub struct Checkpointer {
     /// (`noxu_tree::peek_next_node_id_counter`, L-30).  `None` keeps the old
     /// zero behaviour for unit tests without a full environment.
     next_db_id: Option<Arc<std::sync::atomic::AtomicI64>>,
+    /// REC-CAT: callback that re-logs the live database catalog (one fresh
+    /// `NameLN` per open database name → id mapping) at the *start* of every
+    /// checkpoint, before `CkptStart` is written.
+    ///
+    /// Data-safety fix (repeated `clean_log()` losing the database): Noxu's
+    /// catalog is an in-memory `HashMap` rebuilt from `NameLN` WAL entries
+    /// during recovery (REC-B), NOT a checkpointed mapping tree.  Unlike JE —
+    /// where the naming/mapping trees are real B-trees whose live LNs the
+    /// cleaner migrates forward via `FileProcessor.processLN` and whose root
+    /// the checkpoint flushes (`Checkpointer.flushRoot`) — Noxu's cleaner
+    /// treats `NameLN`/`NameLNTxn` entries as unrecognised (`Other`) and never
+    /// migrates them.  A forced cleaning pass can therefore reclaim the log
+    /// file holding a database's only `NameLN`, and recovery then cannot find
+    /// the database (`DatabaseNotFound`).
+    ///
+    /// JE guarantees a cleaned file is not deleted until a checkpoint reflects
+    /// its migrated entries (`FileProcessor` + `FileSelector` two-checkpoint
+    /// barrier).  This callback restores the equivalent invariant for the
+    /// HashMap catalog: because a file can only be deleted after passing the
+    /// two-checkpoint barrier, re-logging the catalog into the log tail at the
+    /// start of *every* checkpoint guarantees that a fresh `NameLN` for each
+    /// live database always exists in a file newer than any file the barrier
+    /// could make deletable — so recovery's full-log scan always finds it.
+    ///
+    /// `None` (unset) for unit tests / read-only environments without a
+    /// catalog to persist.  Idempotent: re-logging the same name → id mapping
+    /// is harmless (latest `NameLN` wins in recovery).
+    catalog_relog_fn: std::sync::OnceLock<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Checkpointer {
@@ -313,6 +341,7 @@ impl Checkpointer {
             cleaner: None,
             txn_manager: None,
             next_db_id: None,
+            catalog_relog_fn: std::sync::OnceLock::new(),
         }
     }
 
@@ -418,6 +447,21 @@ impl Checkpointer {
     ) -> Self {
         self.next_db_id = Some(next_db_id);
         self
+    }
+
+    /// REC-CAT: register the callback that re-logs the live database catalog
+    /// at the start of every checkpoint.
+    ///
+    /// Set via interior mutability (not the consuming builder) because the
+    /// environment wires it after both the checkpointer and the catalog are
+    /// available — mirroring `Cleaner::set_checkpoint_wakeup_fn`.  Idempotent:
+    /// only the first registration takes effect (`OnceLock`).
+    ///
+    /// See the `catalog_relog_fn` field docs for the data-safety rationale
+    /// (repeated `clean_log()` reclaiming the file that holds a database's
+    /// only `NameLN`).
+    pub fn set_catalog_relog_fn(&self, f: Arc<dyn Fn() + Send + Sync>) {
+        let _ = self.catalog_relog_fn.set(f);
     }
 
     /// Accumulate bytes written and trigger a checkpoint when the threshold
@@ -658,6 +702,24 @@ impl Checkpointer {
         // Step 1: Generate checkpoint ID
         let checkpoint_id =
             self.next_checkpoint_id.fetch_add(1, Ordering::SeqCst);
+
+        // REC-CAT (data-safety): re-log the live database catalog BEFORE the
+        // checkpoint writes any entries.  Noxu's catalog is an in-memory
+        // HashMap rebuilt from NameLN WAL entries during recovery, and the
+        // cleaner never migrates NameLN entries forward (it classifies them
+        // as `Other`), so a forced cleaning pass can reclaim the file holding
+        // a database's only NameLN.  Re-logging the catalog into the log tail
+        // here — combined with the two-checkpoint deletion barrier below —
+        // guarantees a fresh NameLN for every live database always survives in
+        // a file newer than any file the barrier can make deletable, so
+        // recovery's full-log scan always finds it.  This is Noxu's analog of
+        // JE flushing the mapping-tree root at checkpoint (Checkpointer
+        // .flushRoot) so the catalog is durable at the checkpoint fence.
+        // Runs before CkptStart so the NameLNs are captured by this
+        // checkpoint's CkptEnd fsync.
+        if let Some(relog) = self.catalog_relog_fn.get() {
+            relog();
+        }
 
         // X-5: snapshot the cleaner's "cleaned" file set at checkpoint START
         // (before we write CkptStart) so we know which files were in the

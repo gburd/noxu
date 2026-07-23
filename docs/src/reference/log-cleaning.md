@@ -37,6 +37,22 @@ not by re-scanning files.
 A processed file is deleted only after the next checkpoint completes.
 This invariant ensures recovery never needs a deleted file.
 
+### 4a. Database catalog safety
+
+Noxu's database catalog (name → id) is an in-memory `HashMap` rebuilt from
+`NameLN` WAL entries during recovery, not a checkpointed mapping tree (unlike
+JE). The cleaner does not migrate `NameLN` entries (it treats them as
+unrecognised `Other` entries), so a forced cleaning pass could otherwise
+reclaim the log file holding a database's only `NameLN` — after which recovery
+could not find the database (`DatabaseNotFound`). To preserve the
+"recovery never needs a deleted file" invariant for the catalog, the
+checkpointer **re-logs the live catalog (one fresh `NameLN` per open
+database) at the start of every checkpoint**. Combined with the two-checkpoint
+deletion barrier above, a fresh `NameLN` for every live database always exists
+in a file newer than any file the barrier can make deletable, so recovery's
+full-log scan always finds it. This is Noxu's analog of JE flushing the
+mapping-tree root at checkpoint (`Checkpointer.flushRoot`).
+
 ## Cleaner Throttling
 
 `CleanerThrottle::should_throttle_writer()` returns `Option<Duration>` that

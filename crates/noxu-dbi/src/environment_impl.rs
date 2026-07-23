@@ -140,7 +140,7 @@ pub struct EnvironmentImpl {
     /// the transaction commits; on abort they are removed without ever
     /// appearing here.  This gives `get_database_names()` committed-only
     /// visibility (JE `DbTree.getDbNames()` / 1-J fix).
-    name_map: RwLock<HashMap<String, DatabaseId>>,
+    name_map: Arc<RwLock<HashMap<String, DatabaseId>>>,
 
     /// DBI-14: persisted comparator identities `(btree, dup)` per database
     /// name, recovered from NameLN data.  At open, a database whose name has
@@ -149,7 +149,7 @@ pub struct EnvironmentImpl {
     /// fails — mirroring JE's comparator mismatch semantics
     /// (`DatabaseImpl.ComparatorReader`).
     recovered_comparators:
-        RwLock<HashMap<String, (Option<String>, Option<String>)>>,
+        Arc<RwLock<HashMap<String, (Option<String>, Option<String>)>>>,
 
     /// Names of databases whose creating transaction has not yet committed.
     ///
@@ -1505,6 +1505,39 @@ impl EnvironmentImpl {
             RwLock<HashMap<DatabaseId, Arc<RwLock<DatabaseImpl>>>>,
         > = Arc::new(RwLock::new(HashMap::new()));
 
+        // REC-CAT (data-safety): the name→id catalog and the recovered
+        // comparator identities are shared via `Arc` so the checkpointer's
+        // catalog-relog callback (wired just below) can re-log the live
+        // catalog without touching the `Arc<Mutex<EnvironmentImpl>>`.
+        let name_map: Arc<RwLock<HashMap<String, DatabaseId>>> =
+            Arc::new(RwLock::new(recovered_names));
+        let recovered_comparators: Arc<
+            RwLock<HashMap<String, (Option<String>, Option<String>)>>,
+        > = Arc::new(RwLock::new(recovered_comparators));
+
+        // REC-CAT: wire the checkpointer's catalog-relog callback.  At the
+        // start of every checkpoint the checkpointer re-logs a fresh NameLN
+        // for each live database into the log tail; combined with the cleaner's
+        // two-checkpoint deletion barrier this guarantees the file holding a
+        // database's NameLN is never reclaimed before a newer copy is durable,
+        // so repeated clean_log()+checkpoint cycles can no longer lose the
+        // database.  Only wired for writable envs that have a checkpointer
+        // AND a LogManager.
+        if let (Some(ckpt), Some(lm)) = (&checkpointer, &log_manager) {
+            let lm_for_relog = Arc::clone(lm);
+            let name_map_for_relog = Arc::clone(&name_map);
+            let db_map_for_relog = Arc::clone(&db_map);
+            let comparators_for_relog = Arc::clone(&recovered_comparators);
+            ckpt.set_catalog_relog_fn(Arc::new(move || {
+                relog_live_catalog_impl(
+                    &lm_for_relog,
+                    &name_map_for_relog,
+                    &db_map_for_relog,
+                    &comparators_for_relog,
+                );
+            }));
+        }
+
         // Start the background INCompressor daemon thread (INCompressor).
         // Controlled by cfg.run_in_compressor; wakeup interval from
         // cfg.in_compressor_wakeup_interval_ms ( COMPRESSOR_WAKEUP_INTERVAL).
@@ -1666,8 +1699,8 @@ impl EnvironmentImpl {
             lock_manager,
             txn_manager,
             db_map,
-            name_map: RwLock::new(recovered_names),
-            recovered_comparators: RwLock::new(recovered_comparators),
+            name_map,
+            recovered_comparators,
             pending_names: RwLock::new(hashbrown::HashMap::new()),
             is_invalid: Arc::new(AtomicBool::new(false)),
             invalid_reason: RwLock::new(None),
@@ -2270,6 +2303,49 @@ impl EnvironmentImpl {
         )
         .map(|_| ())
         .map_err(DbiError::from)
+    }
+
+    /// REC-CAT (data-safety): re-log the live database catalog — one fresh
+    /// non-transactional `NameLN` per committed database name → id mapping —
+    /// then flush the log so the entries are durable.
+    ///
+    /// # Why this exists
+    ///
+    /// Noxu's catalog is an in-memory `HashMap<name, DatabaseId>` rebuilt from
+    /// `NameLN` WAL entries during recovery (REC-B), NOT a checkpointed
+    /// mapping tree.  The log cleaner does not recognise `NameLN` /
+    /// `NameLNTxn` entries (they fall into the `Other` bucket in
+    /// `Cleaner::decode_ln_entries_from_file`) and so never migrates them
+    /// forward the way JE's cleaner migrates naming/mapping-tree LNs via
+    /// `FileProcessor.processLN`.  A forced cleaning pass (`clean_log()`,
+    /// `run_cleaner(u32::MAX, true)`) can therefore reclaim the log file that
+    /// holds a database's only `NameLN`, after which recovery cannot find the
+    /// database and `open_database` fails with `DatabaseNotFound`.
+    ///
+    /// # The invariant this restores
+    ///
+    /// JE deletes a cleaned file only after a checkpoint has captured its
+    /// migrated entries (the `FileSelector` two-checkpoint barrier).  Because
+    /// this method runs at the *start* of every checkpoint (wired via
+    /// `Checkpointer::set_catalog_relog_fn`), a fresh `NameLN` for each live
+    /// database is always written into the log tail before any file the
+    /// barrier could make deletable is actually removed.  Recovery full-scans
+    /// the log from the start, latest `NameLN` per name wins, so the catalog
+    /// is always recoverable.
+    ///
+    /// Idempotent and cheap: the catalog is one entry per open database.
+    /// Re-logging the same mapping is harmless.
+    pub fn relog_live_catalog(&self) {
+        let lm = match &self.log_manager {
+            Some(lm) => lm,
+            None => return, // read-only env: nothing to persist
+        };
+        relog_live_catalog_impl(
+            lm,
+            &self.name_map,
+            &self.db_map,
+            &self.recovered_comparators,
+        );
     }
 
     /// Returns the `Arc<RwLock<DatabaseImpl>>` for `db_id`, or `None` if not found.
@@ -3105,6 +3181,65 @@ impl EnvironmentImpl {
     pub fn enqueue_erase(&self, request: noxu_cleaner::EraseRequest) {
         self.data_eraser.lock().unwrap().enqueue_erase(request);
     }
+}
+
+/// REC-CAT (data-safety): re-log the live database catalog from the shared
+/// pieces of an [`EnvironmentImpl`].
+///
+/// Factored out of [`EnvironmentImpl::relog_live_catalog`] so the checkpointer
+/// callback can drive it from `Arc`-cloned state WITHOUT re-acquiring the
+/// `Arc<Mutex<EnvironmentImpl>>` that the manual / close checkpoint paths hold
+/// while calling `do_checkpoint` (that would deadlock).  See the
+/// `Checkpointer::catalog_relog_fn` field docs for the full rationale.
+fn relog_live_catalog_impl(
+    lm: &Arc<LogManager>,
+    name_map: &Arc<RwLock<HashMap<String, DatabaseId>>>,
+    db_map: &Arc<RwLock<HashMap<DatabaseId, Arc<RwLock<DatabaseImpl>>>>>,
+    recovered_comparators: &Arc<
+        RwLock<HashMap<String, (Option<String>, Option<String>)>>,
+    >,
+) {
+    // Snapshot (name, id) pairs so we do not hold the name_map lock across
+    // WAL writes (which can block on the log write latch).
+    let names: Vec<(String, DatabaseId)> =
+        name_map.read().iter().map(|(n, id)| (n.clone(), *id)).collect();
+
+    if names.is_empty() {
+        return;
+    }
+
+    for (name, db_id) in &names {
+        // Comparator identities: prefer the open DatabaseImpl (authoritative
+        // for databases created in this session), else the identities
+        // recovered from the prior NameLN.  Both empty for the common
+        // byte-ordered case, preserving the pre-DBI-14 wire format.
+        let (btree_id, dup_id): (Option<String>, Option<String>) =
+            if let Some(db) = db_map.read().get(db_id) {
+                let g = db.read();
+                (
+                    g.btree_comparator_id().map(|s| s.to_string()),
+                    g.duplicate_comparator_id().map(|s| s.to_string()),
+                )
+            } else if let Some(ids) = recovered_comparators.read().get(name) {
+                ids.clone()
+            } else {
+                (None, None)
+            };
+
+        let _ = EnvironmentImpl::log_name_ln(
+            lm,
+            name,
+            db_id.id() as u64,
+            btree_id.as_deref(),
+            dup_id.as_deref(),
+        );
+    }
+
+    // Ensure the re-logged NameLNs reach the log before the checkpoint's
+    // CkptEnd fsync (the caller is do_checkpoint, which fsyncs CkptEnd).
+    // A plain flush to the OS is sufficient here — the CkptEnd fsync that
+    // follows makes the whole prefix durable.
+    let _ = lm.flush_no_sync();
 }
 
 impl Drop for EnvironmentImpl {
