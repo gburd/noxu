@@ -58,7 +58,7 @@ fn key_bytes(id: u64) -> [u8; 16] {
 fn ack(file: &mut std::fs::File, id: u64) {
     use std::io::{Seek, SeekFrom};
     let _ = file.seek(SeekFrom::Start(0));
-    let _ = write!(file, "{id}\n");
+    let _ = writeln!(file, "{id}");
     let _ = file.flush();
     let _ = file.sync_data();
 }
@@ -223,7 +223,7 @@ fn main() {
                     }
                 }
                 // Emit a heartbeat every ~2s so the harness can see progress.
-                if id % 5000 == 0 {
+                if id.is_multiple_of(5000) {
                     eprintln!(
                         "heartbeat id={id} elapsed={:.1}s",
                         started.elapsed().as_secs_f64()
