@@ -336,6 +336,34 @@ pub struct FsyncManager {
     /// `1` (default) = the original single-leader group commit; `> 1` = the
     /// bounded fsync pipeline.  Clamped to `>= 1` at construction.
     max_leaders: usize,
+    /// Concurrency-adaptive leader ceiling used ONLY when few committers are
+    /// contending (see `batch_trigger`).  At low concurrency a committer that
+    /// finds the (single) leader busy would otherwise PARK behind that
+    /// leader's fsync — pure added latency with little batching benefit, since
+    /// only a handful of committers are in flight.  When
+    /// `num_next_waiters < batch_trigger`, up to `adaptive_leaders` leaders may
+    /// run concurrently instead, so a low-concurrency committer issues its own
+    /// `fdatasync` immediately rather than waiting for a batch that is not
+    /// forming.  `1` (default) = disabled: identical to the JE
+    /// single-leader piggyback (`FSyncManager.flushAndSync`, `workInProgress`).
+    ///
+    /// JE cite: JE has no such knob — its coalescing window is exactly the
+    /// in-flight fsync duration (a committer arriving while `workInProgress`
+    /// waits; one arriving when idle leads immediately).  This preserves that
+    /// idle-leads-immediately property AND extends it: at LOW contention a
+    /// committer that arrives during an in-flight fsync also leads immediately
+    /// (its own parallel `fdatasync`) rather than serialising, because the
+    /// batch it would join is too small to amortise the park.  At HIGH
+    /// contention the ceiling clamps back to `max_leaders` so committers pile
+    /// into one big piggyback batch — exactly the JE behaviour that wins at
+    /// high thread counts.
+    adaptive_leaders: usize,
+    /// Waiter count at/above which the adaptive ceiling clamps back to
+    /// `max_leaders` (force batching).  Below it, up to `adaptive_leaders`
+    /// leaders may overlap.  Read under the already-held `state` lock — no
+    /// extra atomic, no CAS, no spin on the commit hot path.  `0` (default,
+    /// when `adaptive_leaders <= max_leaders`) leaves the adaptive path off.
+    batch_trigger: usize,
     /// Whether group-commit waiting is active (`grpcInterval != 0 && grpcThreshold != 0`).
     grp_wait_on: bool,
     /// Timeout for waiting threads before they do their own fsync.
@@ -377,6 +405,22 @@ impl FsyncManager {
         Self::with_clock(grpc_threshold, grpc_interval_ms, 1, RealClock::arc())
     }
 
+    /// Enable the concurrency-adaptive leader ceiling (chained after any
+    /// constructor).  `adaptive_leaders` is the max parallel leaders permitted
+    /// while `num_next_waiters < batch_trigger`; above the trigger the ceiling
+    /// clamps back to `max_leaders`.  `adaptive_leaders <= max_leaders` (or a
+    /// zero trigger) leaves the adaptive path off — behaviour is then the exact
+    /// JE single-leader piggyback.  See the `adaptive_leaders` field doc.
+    pub fn with_adaptive_window(
+        mut self,
+        adaptive_leaders: usize,
+        batch_trigger: usize,
+    ) -> Self {
+        self.adaptive_leaders = adaptive_leaders.max(self.max_leaders);
+        self.batch_trigger = batch_trigger;
+        self
+    }
+
     /// Create a new `FsyncManager` with a bounded fsync pipeline.
     ///
     /// `max_leaders` is the maximum number of concurrent leaders (concurrent
@@ -409,10 +453,15 @@ impl FsyncManager {
         clock: Arc<dyn Clock>,
     ) -> Self {
         let grp_wait_on = grpc_threshold != 0 && grpc_interval_ms != 0;
+        let max_leaders = max_leaders.max(1);
         FsyncManager {
             grpc_threshold,
             grpc_interval_ms,
-            max_leaders: max_leaders.max(1),
+            max_leaders,
+            // Adaptive path off by default: ceiling == max_leaders, so the
+            // effective ceiling is always max_leaders (exact JE behaviour).
+            adaptive_leaders: max_leaders,
+            batch_trigger: 0,
             grp_wait_on,
             // default timeout: 500 ms.
             fsync_timeout: Duration::from_millis(500),
@@ -510,8 +559,14 @@ impl FsyncManager {
         {
             let mut state = self.state.lock();
 
-            if state.leaders_in_flight >= self.max_leaders {
-                // All leader slots are taken — join the next-waiters cohort.
+            if state.leaders_in_flight
+                >= self.effective_ceiling(state.num_next_waiters)
+            {
+                // All (currently-permitted) leader slots are taken — join the
+                // next-waiters cohort.  The ceiling is concurrency-adaptive:
+                // at low contention it exceeds `max_leaders` so this committer
+                // would have led its own parallel fsync above; here it is
+                // high enough that batching pays, so we park to coalesce.
                 need_to_wait = true;
                 my_group = Some(Arc::clone(&state.next_fsync_waiters));
                 state.num_next_waiters += 1;
@@ -582,7 +637,9 @@ impl FsyncManager {
                     }
                     // Attempt to become a new leader for this cohort.
                     let mut state = self.state.lock();
-                    if state.leaders_in_flight >= self.max_leaders {
+                    if state.leaders_in_flight
+                        >= self.effective_ceiling(state.num_next_waiters)
+                    {
                         // No leader slot free (another thread took it while we
                         // were being woken) — do our own work as a safety
                         // measure. (JE: "Ensure that an fsync is done before
@@ -708,6 +765,26 @@ impl FsyncManager {
     /// Returns total number of fsync requests (before coalescing).
     pub fn fsync_request_count(&self) -> u64 {
         self.n_fsync_requests.load(Ordering::Relaxed)
+    }
+
+    /// Effective concurrent-leader ceiling for a committer arriving now, given
+    /// the current waiter count.  This is the concurrency-adaptive batch
+    /// window: below `batch_trigger` waiters the batch a new committer would
+    /// join is too small to amortise parking, so we permit up to
+    /// `adaptive_leaders` overlapping fsyncs (the committer leads its own
+    /// immediately); at/above the trigger we clamp back to `max_leaders` so
+    /// committers pile into ONE big piggyback batch (the JE high-concurrency
+    /// win).  Caller holds `state`, so `num_next_waiters` is read for free —
+    /// no extra atomic, no CAS, no spin on the commit hot path.
+    #[inline]
+    fn effective_ceiling(&self, num_next_waiters: usize) -> usize {
+        if self.adaptive_leaders > self.max_leaders
+            && num_next_waiters < self.batch_trigger
+        {
+            self.adaptive_leaders
+        } else {
+            self.max_leaders
+        }
     }
 
     /// Perform the group-commit wait: release the state lock and wait up to
@@ -1264,6 +1341,38 @@ mod tests {
         assert!(!m2.grp_wait_on);
         let m3 = FsyncManager::new(2, 100);
         assert!(m3.grp_wait_on);
+    }
+
+    /// ADAPTIVE WINDOW: the effective leader ceiling is `max_leaders` at/above
+    /// the trigger and `adaptive_leaders` below it; disabled (always
+    /// `max_leaders`) when `adaptive_leaders <= max_leaders` or trigger is 0.
+    #[test]
+    fn test_effective_ceiling_adaptive() {
+        // Off by default: ceiling is always max_leaders.
+        let off = FsyncManager::new(0, 0);
+        assert_eq!(off.effective_ceiling(0), 1);
+        assert_eq!(off.effective_ceiling(100), 1);
+
+        // Adaptive: max_leaders=1, adaptive_leaders=3, trigger=4.
+        // Below 4 waiters -> ceiling 3 (parallel leaders allowed); at/above
+        // 4 waiters -> ceiling 1 (clamp to batching).
+        let ad = FsyncManager::new(0, 0).with_adaptive_window(3, 4);
+        assert_eq!(ad.effective_ceiling(0), 3);
+        assert_eq!(ad.effective_ceiling(3), 3);
+        assert_eq!(ad.effective_ceiling(4), 1);
+        assert_eq!(ad.effective_ceiling(64), 1);
+
+        // trigger=0 disables even with adaptive_leaders>max_leaders.
+        let z = FsyncManager::new(0, 0).with_adaptive_window(3, 0);
+        assert_eq!(z.effective_ceiling(0), 1);
+
+        // adaptive_leaders is clamped up to at least max_leaders.
+        let clamp =
+            FsyncManager::with_pipeline(0, 0, 4).with_adaptive_window(2, 8);
+        assert_eq!(clamp.max_leaders, 4);
+        // adaptive_leaders (2) < max_leaders (4) -> clamped to 4 -> disabled.
+        assert_eq!(clamp.effective_ceiling(0), 4);
+        assert_eq!(clamp.effective_ceiling(100), 4);
     }
 
     // ── Wave 11-J: fsync-before-commit invariant ───────────────────────────

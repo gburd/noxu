@@ -593,6 +593,48 @@ pub static LOG_FSYNC_MAX_LEADERS: ConfigParam = ConfigParam::int_param(
     false,    // forReplication
 );
 
+/// Concurrency-adaptive fsync batch window: max overlapping `fdatasync`
+/// leaders permitted while FEWER than `LOG_FSYNC_ADAPTIVE_TRIGGER` committers
+/// are waiting.  Default `1` = disabled (exact JE single-leader piggyback).
+///
+/// The single-leader group commit (JE `FSyncManager`, `workInProgress`) makes
+/// a committer that arrives during an in-flight fsync PARK until that fsync
+/// completes.  At high concurrency this coalesces many committers into one
+/// fsync (a big win).  At low/mid concurrency the parked committer pays the
+/// leader's fsync latency for a batch of only 2-4 — pure added latency.  When
+/// this knob is `> 1`, a committer that finds the leader busy AND sees fewer
+/// than `LOG_FSYNC_ADAPTIVE_TRIGGER` waiters becomes an additional parallel
+/// leader (its own `fdatasync`) instead of parking; once the waiter count
+/// reaches the trigger the ceiling clamps back to `LOG_FSYNC_MAX_LEADERS` so
+/// committers pile into one big batch.  Recovers low/mid-concurrency write
+/// throughput without losing the high-concurrency batching win.  The signal
+/// (waiter count) is read under the fsync manager's already-held state lock —
+/// no extra atomic, no CAS, no spin on the commit hot path.
+pub static LOG_FSYNC_ADAPTIVE_LEADERS: ConfigParam = ConfigParam::int_param(
+    "noxu.log.fsyncAdaptiveLeaders",
+    Some(1),  // min (1 = disabled)
+    Some(64), // max
+    1,        // default: disabled, exact JE behaviour
+    false,    // mutable
+    false,    // forReplication
+);
+
+/// Waiter count at/above which the adaptive fsync window
+/// ([`LOG_FSYNC_ADAPTIVE_LEADERS`]) clamps the leader ceiling back to
+/// [`LOG_FSYNC_MAX_LEADERS`] and forces batching.  Below it, up to
+/// `LOG_FSYNC_ADAPTIVE_LEADERS` fsyncs may overlap.  Default `0` (paired with
+/// the default `LOG_FSYNC_ADAPTIVE_LEADERS = 1`, the adaptive path is off).
+/// A small value (e.g. `4`) means "batch once 4+ committers are contending;
+/// below that, let them fsync in parallel".
+pub static LOG_FSYNC_ADAPTIVE_TRIGGER: ConfigParam = ConfigParam::int_param(
+    "noxu.log.fsyncAdaptiveTrigger",
+    Some(0), // min (0 = off)
+    Some(1024),
+    0,     // default: off
+    false, // mutable
+    false, // forReplication
+);
+
 /// Consolidation-array Log Write Latch (Aether VLDB'10 tech 3 / Silo SOSP'13
 /// / WiredTiger `log_slot.c`).  When `true`, concurrent committers combine
 /// into one batch via a lock-free CAS-join and a single leader drives the
@@ -1831,6 +1873,8 @@ pub fn all_params() -> Vec<&'static ConfigParam> {
         &LOG_GROUP_COMMIT_INTERVAL,
         &LOG_GROUP_COMMIT_THRESHOLD,
         &LOG_FSYNC_MAX_LEADERS,
+        &LOG_FSYNC_ADAPTIVE_LEADERS,
+        &LOG_FSYNC_ADAPTIVE_TRIGGER,
         &LOG_CONSOLIDATION_ARRAY,
         &LOG_FLUSH_SYNC_INTERVAL,
         &LOG_FLUSH_NO_SYNC_INTERVAL,

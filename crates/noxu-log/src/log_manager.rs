@@ -455,6 +455,31 @@ impl LogManager {
             FsyncManager::with_pipeline(threshold, interval_ms, max_leaders);
     }
 
+    /// Enable the concurrency-adaptive fsync batch window.
+    ///
+    /// Below `batch_trigger` concurrent waiters a committer that finds the
+    /// leader busy issues its own `fdatasync` immediately (up to
+    /// `adaptive_leaders` overlapping) instead of parking for a batch that is
+    /// not forming; at/above the trigger the ceiling clamps to `max_leaders`
+    /// so committers coalesce into one big piggyback batch.  This recovers
+    /// low/mid-concurrency write throughput lost to the single-leader park
+    /// without giving up the high-concurrency batching win.  See
+    /// [`FsyncManager::with_adaptive_window`] for the JE citation.  Must be
+    /// called after [`Self::set_group_commit_pipelined`] (it rebuilds the
+    /// manager); `adaptive_leaders <= max_leaders` leaves it off.
+    pub fn set_fsync_adaptive_window(
+        &mut self,
+        adaptive_leaders: usize,
+        batch_trigger: usize,
+    ) {
+        // Rebuild preserving current group-commit + pipeline config, then
+        // layer the adaptive ceiling on top.
+        let mgr =
+            std::mem::replace(&mut self.fsync_manager, FsyncManager::new(0, 0));
+        self.fsync_manager =
+            mgr.with_adaptive_window(adaptive_leaders, batch_trigger);
+    }
+
     /// Installs the utilization tracking observer.
     ///
     /// Called by `EnvironmentImpl::open()` after creating the `LogManager` and

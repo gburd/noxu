@@ -494,6 +494,129 @@ fn bounded_pipeline_monotonic_watermark_holds() {
     );
 }
 
+/// CONCURRENCY-ADAPTIVE BATCH WINDOW DURABILITY (the adaptive fix, proven by
+/// shuttle).
+///
+/// The adaptive window changes ONLY the leader/waiter *decision* — the
+/// effective concurrent-leader ceiling now varies with the live waiter count
+/// (`effective_ceiling`): below `batch_trigger` waiters up to `adaptive_leaders`
+/// leaders may overlap; at/above the trigger the ceiling clamps to
+/// `max_leaders`.  It does NOT change the drain/pwrite/fdatasync ordering that
+/// makes the durable watermark sound.  This test enables the adaptive window
+/// (`adaptive_leaders = 3`, `batch_trigger = 2`, so both the parallel-leader
+/// regime AND the clamped-batch regime are exercised as the waiter count
+/// crosses the trigger under shuttle's interleavings) and re-asserts the same
+/// monotonic-watermark + coverage oracles as `bounded_pipeline_...`: a
+/// committer returns durable-success only when a completed fdatasync covered
+/// its LSN, under every interleaving.  If the adaptive decision let a committer
+/// return before its bytes were durable, one of the oracles below fires.
+#[test]
+fn adaptive_window_monotonic_watermark_holds() {
+    shuttle::check_random(
+        || {
+            const N: usize = 4;
+            // max_leaders = 1 (single-leader batching baseline), but the
+            // adaptive window raises the ceiling to 3 while < 2 waiters queue,
+            // so up to 3 leaders can overlap at low contention.  The effective
+            // ceiling flips between 1 and 3 as shuttle interleaves arrivals.
+            const MAX_LEADERS: usize = 1;
+            const ADAPTIVE_LEADERS: usize = 3;
+            const BATCH_TRIGGER: usize = 2;
+            let sim = Arc::new(SimClock::new(0));
+            install_sim_clock(Arc::clone(&sim));
+            let mgr = Arc::new(
+                FsyncManager::with_clock(
+                    0,
+                    0,
+                    MAX_LEADERS,
+                    Arc::clone(&sim) as Arc<dyn noxu_util::Clock>,
+                )
+                .with_adaptive_window(ADAPTIVE_LEADERS, BATCH_TRIGGER),
+            );
+            // Same model as bounded_pipeline_monotonic_watermark_holds: the LWL
+            // serializes the DRAIN (LSN-ordered pwrite to the page cache); only
+            // the fdatasync overlaps.  The adaptive ceiling only affects HOW
+            // MANY fdatasyncs may overlap, never the drain ordering.
+            let lwl = Arc::new(shuttle::sync::Mutex::new(()));
+            let assigned_eof = Arc::new(AtomicU64::new(0));
+            let next_lsn = Arc::new(AtomicU64::new(1));
+            let page_cache_eof = Arc::new(AtomicU64::new(0));
+            let last_synced = Arc::new(AtomicU64::new(0));
+            let fsync_execs = Arc::new(AtomicUsize::new(0));
+
+            let handles: Vec<_> = (0..N)
+                .map(|_| {
+                    let mgr = Arc::clone(&mgr);
+                    let lwl = Arc::clone(&lwl);
+                    let next_lsn = Arc::clone(&next_lsn);
+                    let assigned_eof = Arc::clone(&assigned_eof);
+                    let page_cache_eof = Arc::clone(&page_cache_eof);
+                    let last_synced = Arc::clone(&last_synced);
+                    let fsync_execs = Arc::clone(&fsync_execs);
+                    shuttle::thread::spawn(move || {
+                        let my_lsn = next_lsn.fetch_add(1, Ordering::SeqCst);
+                        bump_max(&assigned_eof, my_lsn);
+
+                        let lwl2 = Arc::clone(&lwl);
+                        let pce2 = Arc::clone(&page_cache_eof);
+                        let aeof2 = Arc::clone(&assigned_eof);
+                        let execs2 = Arc::clone(&fsync_execs);
+                        let eol = mgr
+                            .flush_and_sync(0, || 0, move || {
+                                // DRAIN under the LWL, pwrite all assigned bytes
+                                // to the page cache in LSN order, capture eol.
+                                let my_eol = {
+                                    let _g = lwl2.lock().unwrap();
+                                    let eol = aeof2.load(Ordering::SeqCst);
+                                    bump_max(&pce2, eol);
+                                    eol
+                                };
+                                // Monotonic-watermark oracle at fdatasync time:
+                                // the page cache MUST already cover my_eol.
+                                assert!(
+                                    pce2.load(Ordering::SeqCst) >= my_eol,
+                                    "adaptive: monotonic-watermark violated at \
+                                     fdatasync: publishing durable {my_eol} but \
+                                     page cache only covers {}",
+                                    pce2.load(Ordering::SeqCst)
+                                );
+                                execs2.fetch_add(1, Ordering::SeqCst);
+                                Ok(my_eol)
+                            })
+                            .expect("no fault injected: fsync must succeed");
+
+                        let published = eol.as_u64();
+                        let old = last_synced.load(Ordering::SeqCst);
+                        bump_max(&last_synced, published);
+                        let newv = last_synced.load(Ordering::SeqCst);
+                        assert_fsynced_never_decreases(old, newv.max(old));
+                        // DurableImpliesLogged: our own commit is durable.
+                        assert_durable_covers_commit(newv, my_lsn);
+                    })
+                })
+                .collect();
+
+            for h in handles {
+                h.join().unwrap();
+            }
+
+            let execs = fsync_execs.load(Ordering::SeqCst);
+            assert!(
+                (1..=N).contains(&execs),
+                "adaptive: fsync executions {execs} out of range 1..={N}"
+            );
+            let final_synced = last_synced.load(Ordering::SeqCst);
+            let highest = next_lsn.load(Ordering::SeqCst) - 1;
+            assert!(
+                final_synced >= highest,
+                "adaptive: final durable watermark {final_synced} < highest \
+                 commit LSN {highest}: a committed write was left unsynced"
+            );
+        },
+        ITERATIONS,
+    );
+}
+
 /// WRITEQUEUE SHORT-CIRCUIT DURABILITY (the coalescing fix, proven by shuttle).
 ///
 /// This is the oracle the task requires: N committers, some enqueue-and-return
