@@ -1,17 +1,63 @@
-# This suppressions file should really only be used for things
-# that TSAN can not correctly reason about, like raw memory
-# fences or implicit equivalents created by performing atomic
-# operations on variables.
+# ThreadSanitizer suppressions for Noxu DB.
+#
+# POLICY: this file may ONLY suppress races that TSAN *cannot model*, never
+# real data races. Every entry below carries a written justification of why
+# the reported race is a TSAN modeling limitation and not a bug. If you find
+# yourself wanting to add a suppression for a race in Noxu's own code that is
+# NOT one of the modeling limitations documented here, STOP: that is a latent
+# bug, not a false positive. See SAFETY.md § "ThreadSanitizer suppression
+# justifications" for the durable version of these justifications.
+#
+# How to use this file:
+#   RUSTFLAGS="-Zsanitizer=thread" \
+#   TSAN_OPTIONS="suppressions=$PWD/tsan_suppressions.txt" \
+#   cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu
+#
+# Reference: https://github.com/google/sanitizers/wiki/ThreadSanitizerSuppressions
 
-# Read more about how to use this file at:
-# https://github.com/google/sanitizers/wiki/ThreadSanitizerSuppressions
-
-# Arc::drop is not properly detected by TSAN due to the use
-# of a raw atomic Acquire fence after the strong-count
-# atomic subtraction with a Release fence in the Drop impl.
+# ── 1. Arc::drop — Acquire fence after the Release strong-count decrement ────
+#
+# JUSTIFICATION (TSAN modeling limitation, NOT a bug):
+# `Arc::drop` decrements the strong count with `Ordering::Release`, and the
+# *last* dropper issues a standalone `atomic::fence(Acquire)` BEFORE running the
+# inner `Drop` / freeing the allocation. That fence establishes the
+# happens-before edge from every prior Release-decrement to the final teardown,
+# so the object is provably not accessed after it is freed. TSAN reasons about
+# happens-before via atomic *operations on a location*, and does not model a
+# standalone `fence()` that is decoupled from the atomic it synchronizes with,
+# so it reports the "load of freed memory" as a race. It is not: the standard
+# library's Arc teardown is sound (documented in the `alloc::sync::Arc` Drop
+# impl and RFC discussion). Noxu leans on Arc for every shared tree node,
+# fsync group, and daemon handle, so this fires broadly under TSAN.
 race:Arc*drop
 
-# lazy_static and thread_local rely on implicit barriers not
-# picked-up by TSAN
+# ── 2/3. One-time / thread-local init — implicit release barriers ───────────
+#
+# JUSTIFICATION (TSAN modeling limitation, NOT a bug):
+# One-time-initialization primitives (`std::sync::Once`, `OnceLock`,
+# `LazyLock`, and the historical `lazy_static!`) and `thread_local!`
+# `LocalKey` accessors publish their initialized value through an
+# acquire/release handshake that is internal to libstd (a `Once` state machine
+# / a per-thread key slot). The *reader* side of that handshake is a plain
+# load of the initialized storage, which TSAN sees as an unsynchronized read
+# racing with the initializing write, because the synchronizing atomic lives
+# inside libstd's `Once`/key machinery that TSAN instruments as opaque. The
+# init is in fact fully synchronized (that is the entire contract of `Once` /
+# `LocalKey`), so the report is a false positive. Noxu uses `OnceLock` /
+# `LazyLock` (cleaner, evictor, clock, replicated-environment statics) and
+# `thread_local!` (latch-order tracking, cursor scratch, raw-mutex reentrancy
+# guard).
+#
+# `OnceLock` / `LazyLock` route their one-time init through the same libstd
+# `Once` state machine, so a report against them is caught by the `Once`
+# frame in the stack; no separate `OnceLock`/`LazyLock` pattern is needed.
+#
+# NOTE: `race:lazy_static` is retained for defense-in-depth only — Noxu itself
+# has NO `lazy_static` dependency (it uses std `OnceLock`/`LazyLock`). It is
+# kept so a transitively-pulled dependency that still uses the crate does not
+# reintroduce a spurious report; it suppresses nothing in Noxu's own code and
+# may be removed once the dependency tree is confirmed lazy_static-free at a
+# release.
 race:lazy_static
 race:std::thread::local
+race:std::sync::Once

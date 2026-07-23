@@ -147,3 +147,105 @@ documentation should not claim "survives power loss" — only
 Items only catchable by Layer 2 are real and matter. The Layer 1
 sweep + the architectural choice of always-fsync-before-commit
 gives a strong correctness baseline; Layer 2 closes the loop.
+
+## Layer 3 — `dm-log-writes` / CrashMonkey block-level replay (methodology)
+
+The qemu Layer 2 kills the VM at *wall-clock* moments; it cannot
+replay **every** crash point or check the invariant at each one. The
+gold standard for filesystem/WAL crash-consistency is the Linux
+`dm-log-writes` device-mapper target (as used by `xfstests` and the
+CrashMonkey / ACE tooling from the OSDI'18 "Barrier-Enabled IO Stack"
+line of work). It records every block write and every flush/FUA
+barrier to a log device, then lets you **replay the block stream up to
+any barrier** and mount the result — so you can check recovery at
+*every* durability boundary the WAL emitted, not just at random times.
+
+### What it needs (why it is not in `cargo test`)
+
+- **root** (to create device-mapper targets)
+- a **real block device** (or loopback file) for the data + log devices
+- kernel `dm-log-writes` support (`CONFIG_DM_LOG_WRITES`)
+- the `dm-log-writes` userspace tools (`src/log-writes/replay-log`
+  from `xfstests`, or the CrashMonkey harness)
+
+This is a CI-infrastructure project (dedicated privileged runner), not
+a per-PR unit test. It is documented here as the plan.
+
+### Procedure
+
+1. **Create the logging device over the data device:**
+
+   ```sh
+   # $DATA = the block device Noxu's env directory lives on
+   # $LOG  = a separate device to record the write stream
+   sectors=$(blockdev --getsz "$DATA")
+   dmsetup create noxu-logwrites --table \
+     "0 $sectors log-writes $DATA $LOG"
+   mkfs.ext4 /dev/mapper/noxu-logwrites   # or xfs
+   mount /dev/mapper/noxu-logwrites /mnt/noxu
+   ```
+
+2. **Run a committing workload against `/mnt/noxu`:**
+
+   ```sh
+   NOXU_CRASH_DIR=/mnt/noxu \
+   NOXU_CRASH_MODE=committed_then_uncommitted \
+   crash_worker &
+   # let it run through several commit/fsync cycles, then stop it
+   ```
+
+3. **Snapshot the write log, then replay to every flush boundary:**
+
+   ```sh
+   umount /mnt/noxu
+   dmsetup remove noxu-logwrites
+   # For each recorded flush/FUA mark i:
+   for i in $(seq 0 $NMARKS); do
+     replay-log --log "$LOG" --replay "$DATA_COPY" --limit-mark $i --fsck \
+       'mount + reopen Noxu env + run the recovery check below'
+   done
+   ```
+
+4. **Invariant checked at every replayed boundary** (the whole point):
+
+   > Reopen the Noxu env on the partially-replayed image. Recovery must
+   > succeed (or fail-stop cleanly), and **every transaction whose
+   > `commit()` returned before the replayed flush boundary must be
+   > present and readable, with no committed transaction lost and no
+   > uncommitted transaction visible.** The recovered committed set must
+   > be a *prefix* of the commit order (recovery never keeps a later
+   > commit while dropping an earlier one).
+
+   This is the same invariant the in-tree torn-write tests
+   (`torn_write_policy_test.rs`, `crash_recovery_test.rs`) assert at the
+   application layer — Layer 3 asserts it at *every* block-level
+   durability boundary the kernel actually emitted.
+
+### Relationship to the runnable subset
+
+The torn-write + write-error tests that DO run in CI
+(`torn_write_policy_test.rs`, `crash_recovery_test.rs`'s
+`test_torn_write_truncated_entry_recovered`, `power_loss_sweep_smoke`,
+and `noxu-log`'s `test_real_write_error_invalidates_and_is_not_swallowed`)
+are the runnable subset of this methodology: they exercise the
+torn-tail-truncate and write-error-invalidate paths deterministically
+without needing root or a block device. Layer 3 is the full rig that
+would let Noxu DB *attest* to power-fail correctness across every
+barrier; until it runs on a privileged CI runner, the honest claim is
+"survives process crash and torn final write, with a documented
+fail-stop stance on WAL write errors" — not a general power-loss
+attestation. See the current honest status in
+[Known Limitations](known-limitations.md).
+
+### Write-error (fsyncgate) stance
+
+What Noxu does when the `fdatasync`/`pwrite` **itself returns an
+error** (as opposed to a torn write from an abrupt stop) is a separate
+question from crash replay. Noxu's stance is **fail-stop**: the
+environment is permanently invalidated and refuses further writes; it
+never retries the sync (retrying is unsafe on Linux — a failed
+`fsync` may have already dropped the dirty page). The policy, its
+rationale, and its test coverage are documented in
+[SAFETY.md](https://codeberg.org/gregburd/noxu/src/branch/main/SAFETY.md)
+§ "WAL write-error handling" and summarised in
+[Known Limitations](known-limitations.md).
