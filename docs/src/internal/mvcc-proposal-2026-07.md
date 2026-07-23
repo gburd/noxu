@@ -428,7 +428,13 @@ The benchmark's read gap is *largely `lock_ln` + hand-over-hand latches* (§2.1)
   semantics, just cheaper in mechanism.
 - **Latch-lite descent** for point reads: reduce hand-over-hand overhead on the
   hot path (e.g. optimistic latch-coupling with a version/seqlock check on INs,
-  a well-trodden B+tree technique).
+  a well-trodden B+tree technique). **Measured and rejected (2026-07):** a
+  microbench decomposition put the ceiling at only ~13–15 % of the end-to-end
+  warm read (the descent latch cost is ~112–148 ns of a ~875–984 ns read; the
+  dominant ~548 ns is `lock_ln` + cursor + txn). Not worth a high-risk
+  concurrency change in the `forbid(unsafe_code)` tree core. The read gap is
+  traversal/lock-bound, not latch-bound — see
+  `latch-lite-descent-ceiling-2026-07.md`.
 - **Optimistic read validation** for repeatable-read: read without holding the
   per-record lock, take the lock only at commit / re-validate — closer to
   OCC than MVCC, keeps zero-version-GC.

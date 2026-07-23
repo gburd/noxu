@@ -25,6 +25,11 @@ bytes = { workspace = true }
 [dev-dependencies]
 hegeltest = { workspace = true }
 tempfile = "3"
+criterion = { workspace = true }
+
+[[bench]]
+name = "descent_bench"
+harness = false
 
 # DST tree coverage: the BIN-split concurrency shuttle gate
 # (tests/shuttle_bin_split.rs) is gated behind `#![cfg(noxu_shuttle)]`, so this
