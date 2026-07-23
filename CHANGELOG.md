@@ -15,6 +15,8 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+## [7.5.4] - 2026-07-22
+
 ### Changed
 
 - **LRU restored as the default cache-eviction policy; CLOCK/LIRS/ARC/CAR/
