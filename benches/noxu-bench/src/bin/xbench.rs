@@ -491,6 +491,12 @@ fn main() {
     if max_leaders > 1 {
         ecfg.set_log_fsync_max_leaders(max_leaders);
     }
+    // Concurrency-adaptive fsync batch window A/B knobs.
+    let adaptive_leaders = envp("BENCH_ADAPTIVE_LEADERS", 1) as usize;
+    let adaptive_trigger = envp("BENCH_ADAPTIVE_TRIGGER", 0) as usize;
+    if adaptive_leaders > 1 && adaptive_trigger > 0 {
+        ecfg.set_log_fsync_adaptive_window(adaptive_leaders, adaptive_trigger);
+    }
     let gc_threshold = envp("BENCH_GC_THRESHOLD", 0) as usize;
     let gc_interval = envp("BENCH_GC_INTERVAL_MS", 0);
     if gc_threshold > 0 && gc_interval > 0 {

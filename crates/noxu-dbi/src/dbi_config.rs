@@ -95,6 +95,14 @@ pub struct DbiEnvConfig {
     /// Bounded fsync pipeline depth (max concurrent `fdatasync`s).  1 =
     /// single-leader (default).  Mirrors `LOG_FSYNC_MAX_LEADERS`.
     pub log_fsync_max_leaders: usize,
+    /// Concurrency-adaptive fsync batch window: max overlapping fsync leaders
+    /// while fewer than `log_fsync_adaptive_trigger` committers wait.  1 =
+    /// disabled (default).  Mirrors `LOG_FSYNC_ADAPTIVE_LEADERS`.
+    pub log_fsync_adaptive_leaders: usize,
+    /// Waiter count at/above which the adaptive window clamps back to
+    /// `log_fsync_max_leaders` (force batching).  0 = off.  Mirrors
+    /// `LOG_FSYNC_ADAPTIVE_TRIGGER`.
+    pub log_fsync_adaptive_trigger: usize,
 
     /// Enable the consolidation-array Log Write Latch.  Mirrors
     /// `LOG_CONSOLIDATION_ARRAY`; default `false`.
@@ -303,6 +311,8 @@ impl Default for DbiEnvConfig {
             log_group_commit_threshold: 0,
             log_group_commit_interval_ms: 0,
             log_fsync_max_leaders: 1,
+            log_fsync_adaptive_leaders: 1,
+            log_fsync_adaptive_trigger: 0,
             log_consolidation_array: false,
             // B-tree
             node_max_entries: 128,

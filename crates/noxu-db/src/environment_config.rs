@@ -345,6 +345,22 @@ pub struct EnvironmentConfig {
     /// watermark stays monotonic).  Mirrors `LOG_FSYNC_MAX_LEADERS` / default 1.
     pub log_fsync_max_leaders: usize,
 
+    /// Concurrency-adaptive fsync batch window: max overlapping fsync leaders
+    /// permitted while fewer than [`Self::log_fsync_adaptive_trigger`]
+    /// committers are waiting.  `1` = disabled (default; exact JE single-leader
+    /// piggyback).  `> 1` recovers low/mid-concurrency write throughput lost to
+    /// the single-leader park: a committer that finds the leader busy but sees
+    /// few waiters fsyncs itself immediately instead of parking, while high
+    /// concurrency still coalesces into one big batch.  Mirrors
+    /// `LOG_FSYNC_ADAPTIVE_LEADERS`.
+    pub log_fsync_adaptive_leaders: usize,
+
+    /// Waiter count at/above which the adaptive window clamps the leader
+    /// ceiling back to [`Self::log_fsync_max_leaders`] (force batching).  `0`
+    /// (default) leaves the adaptive path off.  Mirrors
+    /// `LOG_FSYNC_ADAPTIVE_TRIGGER`.
+    pub log_fsync_adaptive_trigger: usize,
+
     /// Enable the consolidation-array Log Write Latch (Aether/Silo/WT).
     ///
     /// When `true`, concurrent committers combine into one batch via a
@@ -841,6 +857,8 @@ impl EnvironmentConfig {
             log_group_commit_threshold: 0,
             log_group_commit_interval_ms: 0,
             log_fsync_max_leaders: 1,
+            log_fsync_adaptive_leaders: 1,
+            log_fsync_adaptive_trigger: 0,
             log_consolidation_array: false,
             // B-tree
             node_max_entries: 128,
@@ -1255,6 +1273,24 @@ impl EnvironmentConfig {
     /// for write throughput.  Clamped to `>= 1` by the `FsyncManager`.
     pub fn set_log_fsync_max_leaders(&mut self, n: usize) -> &mut Self {
         self.log_fsync_max_leaders = n;
+        self
+    }
+
+    /// Enable the concurrency-adaptive fsync batch window.
+    ///
+    /// `adaptive_leaders` is the max overlapping fsync leaders permitted while
+    /// fewer than `trigger` committers are waiting; at/above `trigger` the
+    /// ceiling clamps back to [`Self::log_fsync_max_leaders`] (batching).
+    /// `adaptive_leaders <= log_fsync_max_leaders` or `trigger == 0` leaves it
+    /// off.  Recovers low/mid-concurrency write throughput without losing the
+    /// high-concurrency batching win.
+    pub fn set_log_fsync_adaptive_window(
+        &mut self,
+        adaptive_leaders: usize,
+        trigger: usize,
+    ) -> &mut Self {
+        self.log_fsync_adaptive_leaders = adaptive_leaders;
+        self.log_fsync_adaptive_trigger = trigger;
         self
     }
 

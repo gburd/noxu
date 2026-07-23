@@ -103,3 +103,83 @@ Durability proofs still hold: `shuttle_fsync_manager` (5 cases, incl.
 `writequeue_shortcircuit_durability_holds` — a waiter returns success only when
 a completed fsync covered its LSN, under all interleavings), `crash_recovery_test`
 (12), `recovery_correctness_test` (22).
+
+## Follow-up (2026-07-23): the concurrency-adaptive batch window
+
+A later effort acted on the mid-concurrency angle directly: build a
+*concurrency-adaptive leader ceiling* so a low-concurrency committer that finds
+the leader busy issues its own `fdatasync` immediately (parallel leader)
+instead of parking for a batch, while high concurrency still clamps back to
+single-leader batching. Knobs: `LOG_FSYNC_ADAPTIVE_LEADERS` (max overlapping
+leaders below the trigger) + `LOG_FSYNC_ADAPTIVE_TRIGGER` (waiter count at which
+the ceiling clamps to `LOG_FSYNC_MAX_LEADERS`). The contention signal is the
+live waiter count, read under the fsync manager's already-held state lock — no
+extra atomic, no CAS, no spin on the commit hot path.
+
+### Diagnosis first (measure before changing)
+
+Repro box (btrfs on NVMe, 8 physical cores), `tdb_write` + `ycsb_a`, SYNC,
+500k × 256 B, warm. The `batch_factor` curve is **proportional**, not
+over-batched:
+
+| threads | 1 | 8 | 64 | 256 |
+|---|---:|---:|---:|---:|
+| `tdb_write` batch_factor | 0.97 | 2.99 | 26.9 | 98.9 |
+| `ycsb_a`   batch_factor  | 0.93 | 3.03 | 20.9 | 54.1 |
+
+`batch_factor ~= 1` at 1 thread proves a solo committer already fsyncs
+immediately (idle manager → it leads → never parks). There is **no over-eager
+grace-wait** — the shipped defaults are `INTERVAL = THRESHOLD = 0`
+(`grp_wait_on = false`, exactly JE `FSyncManager`). So the mid-concurrency
+"loss" is the inherent fsync latency of coalescing, not diagnosis-(a)
+(configured grace-wait) and not a handoff that parks a committer when it could
+lead — diagnosis (b) is real but is *the JE behaviour*: JE also parks a
+committer that arrives while `workInProgress`. The idle-leads-immediately
+property the task cites is already satisfied.
+
+### Before/after (baseline = shipped default; adaptive = `leaders=2, trigger=4`)
+
+Throughput ops/s (batch_factor):
+
+| | 1t | 8t | 64t | 256t |
+|---|---:|---:|---:|---:|
+| `tdb_write` baseline | 804 (0.97) | 2085 (2.99) | 13771 (26.9) | 32301 (98.9) |
+| `tdb_write` adaptive | 592 (0.94) | 1223 (1.76) | 8247 (12.1) | 15367 (38.7) |
+| `ycsb_a` baseline | 737 (0.93) | 2942 (3.03) | 16380 (20.9) | 33930 (54.1) |
+| `ycsb_a` adaptive | 668 (0.89) | 840 (1.81) | 2467 (9.5) | 5452 (16.3) |
+
+### Conclusion (premise falsified again, same direction as `max_leaders>1`)
+
+The adaptive parallel-leader lever **loses at every concurrency level on this
+hardware**. The mechanism is identical to the `max_leaders > 1` non-fix above:
+a committer that would have piggybacked one leader's fsync instead issues its
+own, so the batch fragments — `batch_factor` collapses (256t `tdb_write`
+99 → 39; `ycsb_a` 54 → 16) and throughput drops. On this device, one coalesced
+`fdatasync` of N committers beats N parallel `fdatasync`s at *every* N ≥ 2, so
+the shipped single-leader batching is the fsync optimum everywhere; the 1-thread
+case is already optimal (solo leads immediately, batch_factor ~1).
+
+The knob is retained but ships **default-off** (`LOG_FSYNC_ADAPTIVE_LEADERS = 1`
+→ `effective_ceiling` always returns `max_leaders` → exact JE single-leader
+piggyback, byte-for-byte no-op). It can win only where BOTH (1) the device
+sustains many concurrent same-file `fdatasync`s cheaply AND (2) the per-fsync
+batch stays small enough that parallel syncs beat coalescing — a regime this
+repro box is not in, and the guidance above still stands for the 96-core EC2
+re-measurement.
+
+JE citation: `FSyncManager.flushAndSync` — a committer leads iff
+`!workInProgress` (idle), else waits; the coalescing window is exactly the
+in-flight fsync duration. The adaptive ceiling preserves idle-leads-immediately
+and extends it (low contention → also lead in parallel), then reverts to the JE
+batch at high contention. JE itself has no such knob.
+
+### Durability proof (adaptive path)
+
+Unchanged and re-proven for the adaptive decision: `shuttle_fsync_manager` 6/6
+including the new `adaptive_window_monotonic_watermark_holds` (enables the
+adaptive window so `effective_ceiling` flips between the parallel-leader and
+clamped-batch regimes as the waiter count crosses the trigger under shuttle's
+interleavings, and asserts the monotonic-watermark + coverage oracles — a
+committer returns durable-success only when a completed `fdatasync` covered its
+LSN). Plus `crash_recovery_test` 12/12, `recovery_correctness_test` 22/22,
+`bounded_fsync_durability_test` 4/4.

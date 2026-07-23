@@ -809,6 +809,12 @@ impl EnvironmentImpl {
                 cfg.log_group_commit_interval_ms,
                 cfg.log_fsync_max_leaders,
             );
+            // Concurrency-adaptive fsync batch window (off unless
+            // adaptive_leaders > max_leaders AND trigger > 0).
+            lm.set_fsync_adaptive_window(
+                cfg.log_fsync_adaptive_leaders,
+                cfg.log_fsync_adaptive_trigger,
+            );
             // Wire the LOG_CONSOLIDATION_ARRAY knob: route the LWL through the
             // lock-free combining funnel instead of the mutex when enabled.
             //

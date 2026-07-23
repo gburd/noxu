@@ -26,6 +26,75 @@ listed in [References](#references).
   in favour of a direct read-path optimization, reserving an opt-in,
   read-only-snapshot MVCC (log-version reads, default OFF) as a secondary path.
   No engine code — proposal for human decision.
+### Performance
+
+- **Concurrency-adaptive fsync batch window (opt-in; default-off, and
+  falsified as a mid-concurrency win on the repro box — honest science).** The
+  single-leader group-commit piggyback (JE `FSyncManager.flushAndSync`,
+  `workInProgress`) makes a committer that arrives during an in-flight
+  `fdatasync` PARK until it completes. At high concurrency this coalesces many
+  committers into one fsync (a big win: `batch_factor` ~66-99 at 256 threads).
+  The concern was that the same park HURTS low/mid concurrency, where the batch
+  a parked committer joins is only 2-4 deep. The fix builds a
+  **concurrency-adaptive leader ceiling** (`LOG_FSYNC_ADAPTIVE_LEADERS` /
+  `LOG_FSYNC_ADAPTIVE_TRIGGER`, `EnvironmentConfig::set_log_fsync_adaptive_window`,
+  xbench `BENCH_ADAPTIVE_LEADERS` / `BENCH_ADAPTIVE_TRIGGER`): below
+  `trigger` waiters a committer that finds the leader busy issues its own
+  `fdatasync` immediately (up to `adaptive_leaders` overlapping) instead of
+  parking; at/above the trigger the ceiling clamps back to `LOG_FSYNC_MAX_LEADERS`
+  so committers pile into one big batch. The contention signal (waiter count)
+  is read under the fsync manager's already-held state lock — **no extra
+  atomic, no CAS, no try_lock, no spin on the commit hot path** (the measured
+  17-45 % spin-in-front-of-mutex regression is not reintroduced).
+
+  **Diagnosis (measured, btrfs on NVMe, 8 physical cores; `tdb_write` +
+  `ycsb_a`, SYNC, 500k × 256 B, warm):** the `batch_factor` curve is
+  *proportional*, not over-batched —
+
+  | threads | 1 | 8 | 64 | 256 |
+  |---|---:|---:|---:|---:|
+  | `tdb_write` batch_factor | 0.97 | 2.99 | 26.9 | 98.9 |
+  | `ycsb_a`   batch_factor  | 0.93 | 3.03 | 20.9 | 54.1 |
+
+  `batch_factor ~= 1` at 1 thread proves a solo committer already fsyncs
+  immediately (it becomes the leader on an idle manager and never parks) —
+  there is NO over-eager grace-wait (the shipped defaults are
+  `LOG_GROUP_COMMIT_INTERVAL = LOG_GROUP_COMMIT_THRESHOLD = 0`,
+  `grp_wait_on = false`, exactly JE). The mid-concurrency cost is the
+  *inherent fsync latency of coalescing*, not a tunable park.
+
+  **Before/after ladder (baseline = shipped default; adaptive =
+  `adaptive_leaders=2, trigger=4`), throughput ops/s (batch_factor):**
+
+  | | 1t | 8t | 64t | 256t |
+  |---|---:|---:|---:|---:|
+  | `tdb_write` baseline | 804 (0.97) | 2085 (2.99) | 13771 (26.9) | 32301 (98.9) |
+  | `tdb_write` adaptive | 592 (0.94) | 1223 (1.76) | 8247 (12.1) | 15367 (38.7) |
+  | `ycsb_a` baseline | 737 (0.93) | 2942 (3.03) | 16380 (20.9) | 33930 (54.1) |
+  | `ycsb_a` adaptive | 668 (0.89) | 840 (1.81) | 2467 (9.5) | 5452 (16.3) |
+
+  **Honest tradeoff — the premise is falsified on this hardware.** The adaptive
+  parallel-leader lever LOSES at every concurrency level here, because on this
+  device fragmenting a would-be batch of N committers into N parallel
+  `fdatasync`s costs more than one coalesced fsync: `batch_factor` collapses
+  (256t: 99 → 39 for `tdb_write`; 54 → 16 for `ycsb_a`) and throughput drops.
+  This independently reproduces the repo's prior finding
+  (`docs/src/internal/fsync-group-commit-batch-factor-2026-07.md`, 7.5.3) that
+  `max_leaders > 1` *hurts* the batch factor — the adaptive ceiling has the same
+  mechanism, just gated on the live waiter count. On the repro box the shipped
+  **single-leader batching is already the fsync optimum at every thread count**;
+  the real 7-8k historical write ceiling was the cleaner-throttle bug (fixed in
+  7.5.2), not the fsync batch window. The adaptive knob therefore ships
+  **default-off** (`LOG_FSYNC_ADAPTIVE_LEADERS = 1`), a zero-regression no-op
+  identical to the JE single-leader piggyback, and is retained for the 96-core
+  EC2 re-measurement: it can win only where the device sustains many concurrent
+  same-file `fdatasync`s AND the per-fsync batch stays small enough that
+  parallel syncs beat coalescing. **Durability unchanged and proven:**
+  `shuttle_fsync_manager` 6/6 (added `adaptive_window_monotonic_watermark_holds`
+  — the adaptive decision introduces no new interleaving that lets a committer
+  return before a completed `fdatasync` covered its LSN), `crash_recovery_test`
+  12/12, `recovery_correctness_test` 22/22, `bounded_fsync_durability_test`
+  4/4.
 
 ## [7.5.5] - 2026-07-23
 
