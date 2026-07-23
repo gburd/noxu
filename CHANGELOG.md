@@ -15,6 +15,8 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+## [7.5.6] - 2026-07-23
+
 ### Performance
 
 - **Cheaper lock-based reads (MVCC proposal §6c, `perf/cheaper-lock-based-reads`).**
