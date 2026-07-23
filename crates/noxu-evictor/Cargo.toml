@@ -25,6 +25,14 @@ bytes = { workspace = true }
 memmap2 = { workspace = true }
 lru = "0.16"
 
+[features]
+# Non-default, scan-resistant eviction policies (CLOCK, LIRS, ARC, CAR,
+# CoolHot).  Default OFF: LRU is the tier-one, JE-faithful, benchmark-
+# validated policy.  These are preserved for future benchmark work but are
+# not part of the default surface or the default eviction/cleaner/checkpoint
+# interaction test matrix.  See docs/src/reference/eviction-policies.md.
+experimental-eviction-policies = []
+
 [dev-dependencies]
 tempfile = "3"
 

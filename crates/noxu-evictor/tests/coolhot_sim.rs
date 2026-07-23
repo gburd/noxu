@@ -9,6 +9,10 @@
 //! strips the chosen BIN's data (put_back).  We measure the steady-state hit
 //! rate for a skewed (Zipfian-like) read stream over a working set larger than
 //! the "budget" (max resident stripped-count).
+//!
+//! Requires the `experimental-eviction-policies` feature (the policies it
+//! exercises are gated behind it).
+#![cfg(feature = "experimental-eviction-policies")]
 
 use noxu_evictor::EvictionAlgorithm;
 use std::collections::HashSet;

@@ -13,6 +13,11 @@ description = "Noxu DB - An embedded transactional database engine"
 [features]
 default = []
 observability = ["dep:noxu-observe", "dep:tracing", "dep:metrics", "noxu-observe/export"]
+# Experimental, non-default eviction policies (CLOCK/LIRS/ARC/CAR/CoolHot).
+# Off by default; passthrough to noxu-dbi (which propagates to noxu-evictor).
+experimental-eviction-policies = [
+    "noxu-dbi/experimental-eviction-policies",
+]
 
 [dependencies]
 hashbrown = { workspace = true }

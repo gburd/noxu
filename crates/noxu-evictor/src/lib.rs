@@ -80,8 +80,10 @@ pub use evictor::{
 };
 pub use evictor_stat::EvictorStats;
 pub use off_heap::{OffHeapCache, OffHeapStats};
+pub use policies::LruPolicy;
+#[cfg(feature = "experimental-eviction-policies")]
 pub use policies::{
-    ArcPolicy, CarPolicy, ClockPolicy, CoolHotPolicy, LirsPolicy, LruPolicy,
+    ArcPolicy, CarPolicy, ClockPolicy, CoolHotPolicy, LirsPolicy,
 };
 pub use policy::{EvictionAlgorithm, EvictionPolicy};
 pub use shared::{SharedCacheParams, SharedEvictorHandle};
