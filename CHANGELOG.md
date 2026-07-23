@@ -15,6 +15,72 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Performance
+
+- **Cheaper lock-based reads (MVCC proposal §6c, `perf/cheaper-lock-based-reads`).**
+  Two per-read lock-path optimisations that lower the measured cost of a
+  lock-based read WITHOUT any MVCC / versioning — the lock-based isolation
+  north star is fully preserved (the complete `noxu-db` isolation suite,
+  `je_rmw_locking_test`, `je_db_cursor_test`, `lock_table_count_test`,
+  `crash_recovery_test`, and `recovery_correctness_test` all pass unchanged,
+  plus two new regression tests pinning the writer-conflict guarantee).
+  - **Read-committed / auto-commit read probe on the *txn* path.** A
+    read-committed cursor read formerly acquired a `Read` lock (non-blocking)
+    and released it immediately after the operation — two shard-mutex
+    round-trips plus a `read_locks` insert/remove — solely to detect a
+    concurrent writer. It now confirms "no foreign write owner, no waiters"
+    with a single lock-manager probe (`Txn::probe_read_uncontended` →
+    `LockManager::probe_read_uncontended`) and skips the acquire+release when
+    the slot is unlocked (the common read-heavy case). This extends the
+    auto-commit fast path added in 6.4.1 to the read-committed *transaction*
+    path. Behaviour-identical: read-committed never holds the read lock past
+    the operation, and a write owner or waiter falls through to the full
+    (blocking / no-wait) path, so dirty-read prevention and the
+    re-read-after-writer signal are preserved exactly. Repeatable-read /
+    serializable are unchanged — they hold the read lock to commit and MUST
+    register it so concurrent writers block, so they keep the full `lock()`
+    path.
+  - **Empty sharing-registry fast path in `build_shares_fn`.** The lock
+    manager consults its locker-sharing registry (a `RwLock<HashMap>`) on
+    EVERY acquire and release to honor JE `LockImpl.tryLock`'s
+    `sharesLocksWith` check. Regular `Txn`s and auto-commit lockers never join
+    a sharing group, so the registry is empty and that RwLock read was pure
+    per-op overhead on the read hot path (it fires on the *repeatable-read*
+    default path too, where the probe above does not apply because the lock is
+    held to commit). An `AtomicBool` emptiness flag now lets the acquire /
+    release path skip the registry read entirely when no locker is registered.
+    Sound: sharing can only ever *grant* co-ownership conflict detection would
+    otherwise deny, so short-circuiting an empty registry can never wrongly
+    grant; the flag is a relaxed atomic used only for read-only observation and
+    is published under the registry write lock.
+
+  **Measured cost (CPU-isolated criterion microbench, `noxu-txn`, quiet host):**
+  the per-read *lock mechanism* cost drops sharply —
+
+  | Path | Mechanism | ns/op | Δ |
+  |---|---|---:|---:|
+  | Baseline | Read acquire + immediate release | ~137.8 | — |
+  | Empty-registry fast path | Read acquire + immediate release | ~104 | −24% |
+  | Read-committed probe | single-shard probe (replaces acquire+release) | ~29.5 | −75% vs fast-path acquire, −79% vs baseline |
+
+  **End-to-end `ycsb_c` A/B (real disk, fully-cached 2M/2GB, NO_SYNC,
+  interleaved median-of-N pairs):** on the (heavily loaded) measurement host
+  the end-to-end result was **noise-limited** — baseline-vs-baseline itself
+  varied ±20% (spread 0.83–1.08), and the read-committed and repeatable-read
+  A/B medians (ranging −8.7% … +7.4% across batches at 8/64 threads) sat inside
+  that band with no statistically significant end-to-end change. At the
+  ~200–215K ops/s the host sustained, the per-op budget is ~4.6 µs, so the
+  ~34–87 ns of lock mechanism these changes remove is <2% of the end-to-end op
+  — below the machine's noise floor. **Honest-science finding:** on this
+  host the read path's lock mechanism is not the dominant per-read cost, so
+  §6c's lock-mechanism savings, while real and large *as a fraction of the
+  lock work* (−75% for read-committed), do not by themselves close the
+  cross-engine read gap here; the microbench confirms the mechanism is cheaper,
+  and no regression was observed at any thread count. This supports the
+  proposal's "measure §6c first" stance and its caution that the read gap must
+  be re-measured on a quiet, high-throughput host before concluding whether
+  MVCC is the only remaining read lever.
+
 ### Documentation
 
 - **MVCC design proposal** (`docs/src/internal/mvcc-proposal-2026-07.md`). A

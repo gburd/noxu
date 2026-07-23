@@ -643,6 +643,10 @@ fn main() {
         let mut c = TransactionConfig::new();
         match isolation.as_str() {
             "serializable" => c = c.with_serializable_isolation(true),
+            // read_committed: releases the per-record read lock immediately
+            // after each op (engine: is_read_committed_isolation / lock_ln RC
+            // probe fast path).
+            "read_committed" => c = c.with_read_committed(true),
             // read_uncommitted skips the record-lock probe on reads
             // (engine: is_read_uncommitted_default / lock_ln early return).
             "read_uncommitted" => c = c.with_read_uncommitted(true),

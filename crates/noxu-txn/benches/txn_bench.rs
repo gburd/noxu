@@ -219,6 +219,50 @@ fn bench_deadlock_diamond_no_cycle(c: &mut Criterion) {
 // Groups
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Read-committed read mechanism: old (acquire Read + release) vs new (probe).
+//
+// A read-committed / auto-commit read only needs to confirm no concurrent
+// writer owns the slot; it releases the read lock immediately.  The old
+// mechanism was two shard-mutex round-trips (acquire non-blocking + release);
+// the probe fast path is a single shard access.  This measures the pure
+// per-read mechanism cost on an unlocked hot slot (the common read-heavy case),
+// isolated from tree descent / I/O / scheduler noise so the delta is stable
+// even on a loaded host.
+// ---------------------------------------------------------------------------
+
+fn bench_rc_read_acquire_release(c: &mut Criterion) {
+    let mgr = LockManager::new();
+    // One hot slot, repeatedly read by the same locker (read-committed pattern:
+    // acquire Read non-blocking, then release immediately).
+    c.bench_function("rc_read_old_acquire_release", |b| {
+        b.iter(|| {
+            black_box(
+                mgr.lock(
+                    black_box(4242),
+                    black_box(7),
+                    LockType::Read,
+                    true,
+                    false,
+                )
+                .unwrap(),
+            );
+            mgr.release(black_box(4242), black_box(7)).unwrap();
+        })
+    });
+}
+
+fn bench_rc_read_probe(c: &mut Criterion) {
+    let mgr = LockManager::new();
+    c.bench_function("rc_read_new_probe", |b| {
+        b.iter(|| {
+            black_box(
+                mgr.probe_read_uncontended(black_box(4242), black_box(7)),
+            );
+        })
+    });
+}
+
 criterion_group!(
     conflict_benches,
     bench_lock_conflict_allow,
@@ -233,6 +277,8 @@ criterion_group!(
     bench_lock_acquire_single_no_contention,
     bench_lock_acquire_release_new_lsn,
     bench_lock_acquire_write,
+    bench_rc_read_acquire_release,
+    bench_rc_read_probe,
 );
 
 criterion_group!(

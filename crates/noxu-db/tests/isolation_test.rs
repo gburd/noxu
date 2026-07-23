@@ -1387,3 +1387,126 @@ fn test_fix3b_no_wait_aborts_immediately_not_after_timeout() {
     let _ = contender.abort();
     holder.commit().unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// REGRESSION: read-committed probe fast path preserves the writer conflict.
+//
+// perf/cheaper-lock-based-reads (MVCC proposal §6c): the read-committed /
+// auto-commit read path now confirms "no concurrent writer owns the slot" with
+// a single lock-manager probe (`Txn::probe_read_uncontended` ->
+// `LockManager::probe_read_uncontended`) instead of acquiring a Read lock and
+// releasing it immediately.  The probe MUST still detect a writer: a
+// read-committed read on a slot a concurrent uncommitted writer holds must
+// NOT report "uncontended" and hand back the dirty value.  These tests pin the
+// invariant the optimisation is not allowed to weaken.
+// ---------------------------------------------------------------------------
+
+/// A read-committed reader (no_wait) must be DENIED while a concurrent writer
+/// holds the WRITE lock — proving the probe fast path detected the writer and
+/// took the conflict path rather than falsely reporting the slot uncontended
+/// and returning the uncommitted value.
+#[test]
+fn test_read_committed_probe_still_conflicts_with_uncommitted_writer() {
+    let (_dir, env, db) = setup();
+    put_committed(&env, &db, b"pk", b"committed");
+
+    // Writer holds the WRITE lock on "pk" (uncommitted).
+    let writer = env.begin_transaction(None).unwrap();
+    db.put_in(
+        &writer,
+        DatabaseEntry::from_bytes(b"pk"),
+        DatabaseEntry::from_bytes(b"dirty"),
+    )
+    .unwrap();
+
+    // Read-committed + no_wait reader: the probe must see the writer's WRITE
+    // owner and fall through to the (no_wait) lock request, which is denied.
+    // If the probe wrongly reported "uncontended", the read would succeed and
+    // could observe the dirty value — the bug this test guards against.
+    let rc_no_wait = TransactionConfig::read_committed().with_no_wait(true);
+    let reader = env.begin_transaction(Some(&rc_no_wait)).unwrap();
+    let mut out = DatabaseEntry::new();
+    let status =
+        db.get_into(Some(&reader), DatabaseEntry::from_bytes(b"pk"), &mut out);
+    assert!(
+        status.is_err(),
+        "read-committed read must conflict with the uncommitted writer's \
+         WRITE lock (probe must not report the slot uncontended); got {status:?}"
+    );
+    // The conflict must be a lock-unavailable denial (never a success that
+    // could leak the dirty value).  A no_wait read routes the denial through
+    // the cursor as OperationNotAllowed("... lock not available ..."); a
+    // direct LockNotAvailable is equally acceptable.  Either way the read is
+    // DENIED, which is the invariant this test guards.
+    let err = status.unwrap_err();
+    let is_lock_denial = matches!(err, noxu_db::NoxuError::LockNotAvailable)
+        || format!("{err:?}").contains("lock not available");
+    assert!(
+        is_lock_denial,
+        "the conflict must be a lock-unavailable denial, not dirty data; \
+         got {err:?}"
+    );
+
+    let _ = reader.abort();
+    writer.commit().unwrap();
+
+    // After the writer commits, a fresh read-committed reader (probe fast
+    // path, now uncontended) sees the committed value.
+    let reader2 = env.begin_transaction(None).unwrap();
+    let mut out2 = DatabaseEntry::new();
+    assert!(get_val(&db, Some(&reader2), b"pk", &mut out2));
+    assert_eq!(
+        out2.data(),
+        b"dirty",
+        "committed write must be visible via the probe fast path"
+    );
+    reader2.commit().unwrap();
+}
+
+/// A read-committed reader (blocking) must WAIT for a concurrent writer and
+/// then observe the committed value — never the intermediate dirty value.
+/// Exercises the probe -> slow-path (block) -> re-read handoff.
+#[test]
+fn test_read_committed_probe_waits_then_reads_committed_value() {
+    let (_dir, env, db) = setup();
+    put_committed(&env, &db, b"wk", b"v1");
+    let env = Arc::new(env);
+    let db = Arc::new(db);
+
+    let wrote = Arc::new(Barrier::new(2));
+    let env_w = Arc::clone(&env);
+    let db_w = Arc::clone(&db);
+    let wrote_w = Arc::clone(&wrote);
+
+    let writer = thread::spawn(move || {
+        let txn = env_w.begin_transaction(None).unwrap();
+        db_w.put_in(
+            &txn,
+            DatabaseEntry::from_bytes(b"wk"),
+            DatabaseEntry::from_bytes(b"v2"),
+        )
+        .unwrap();
+        wrote_w.wait(); // writer holds the WRITE lock
+        // Hold briefly so the reader's probe -> slow-path definitely blocks,
+        // then commit so the reader unblocks and re-reads the committed value.
+        thread::sleep(Duration::from_millis(150));
+        txn.commit().unwrap();
+    });
+
+    wrote.wait();
+    // Blocking read-committed reader: probe sees the writer, blocks in the
+    // slow path, wakes when the writer commits, re-reads committed "v2".
+    let rc = TransactionConfig::read_committed();
+    let reader = env.begin_transaction(Some(&rc)).unwrap();
+    let mut out = DatabaseEntry::new();
+    let ok = get_val(&db, Some(&reader), b"wk", &mut out);
+    assert!(ok, "read must succeed after the writer commits");
+    assert_eq!(
+        out.data(),
+        b"v2",
+        "read-committed read must return the committed value, never the \
+         intermediate dirty value the probe path could have leaked"
+    );
+    reader.commit().unwrap();
+    writer.join().unwrap();
+}
