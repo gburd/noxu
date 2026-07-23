@@ -61,6 +61,7 @@
   - [Concurrency Model](reference/concurrency-model.md)
   - [Recovery Protocol](reference/recovery.md)
   - [Cache Eviction](reference/cache-eviction.md)
+  - [Eviction Policies](reference/eviction-policies.md)
   - [Log Cleaning](reference/log-cleaning.md)
   - [Configuration Reference](reference/configuration.md)
   - [On-Disk Format](reference/on-disk-format.md)

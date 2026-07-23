@@ -433,15 +433,23 @@ database without the matching comparator, the open fails with the same
 
 ## 13. Eviction Algorithm Selectable, LRU Stays the Default (EVICTOR_ALGORITHM)
 
-**Decision**: The cache eviction algorithm is now selectable per-environment
-via the `noxu.evictor.algorithm` config parameter
-(`"lru"|"clock"|"arc"|"car"|"lirs"`, default `"lru"`), wired through
-`EnvironmentConfig` → `DbiEnvConfig` → `Evictor::with_algorithm` for both the
-primary and scan policy slots. **The default stays LRU.**
+**Decision**: The cache eviction algorithm is selectable per-environment
+via the `noxu.evictor.algorithm` config parameter (default `"lru"`), wired
+through `EnvironmentConfig` → `DbiEnvConfig` → `Evictor::with_algorithm` for
+both the primary and scan policy slots. **The default is LRU**, and the
+alternative policies (CLOCK, LIRS, ARC, CAR, CoolHot) are gated behind the
+non-default `experimental-eviction-policies` cargo feature.
+
+**History note**: a later change briefly made CoolHot (a COOL/HOT cooling
+clock) the default; a subsequent benchmark and an external engineering review
+both found no default-workload justification for it, so the default was
+reverted to LRU and all non-LRU policies were moved behind the experimental
+feature (see the [eviction-policies reference](../reference/eviction-policies.md)).
+This section records the standing decision: LRU is the tier-one default.
 
 **Why LRU stays the default**: JE's evictor is LRU, so LRU is the JE-faithful
 choice; deviating would only be justified by a policy that *wins measurably and
-reproducibly*. A cache-pressure benchmark of all five policies
+reproducibly*. A cache-pressure benchmark of the policies
 (`benches/noxu-bench/src/bin/evictor_policy_bench.rs`, 16 MiB cache, 80k × 256 B
 ≈ 21 MB working set, on real disk, median of 3) found **no reproducible win**:
 
