@@ -129,3 +129,4 @@
   - [Write ceiling: the cleaner throttle (2026-07)](internal/write-ceiling-cleaner-throttle-2026-07.md)
   - [fsync group-commit: batch factor (2026-07)](internal/fsync-group-commit-batch-factor-2026-07.md)
   - [JE constant/default/threshold audit (2026-07)](internal/je-constant-audit-2026-07.md)
+  - [MVCC proposal (2026-07)](internal/mvcc-proposal-2026-07.md)

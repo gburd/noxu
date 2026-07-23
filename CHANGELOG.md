@@ -15,6 +15,18 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Documentation
+
+- **MVCC design proposal** (`docs/src/internal/mvcc-proposal-2026-07.md`). A
+  research + design proposal analysing whether to add multi-version concurrency
+  control to Noxu, cited to libdb (BDB-C, which has page-level MVCC), BDB-JE (the
+  lock-based parent), and Noxu's own log/txn/cleaner sources. Honestly weighs the
+  read-throughput gap (~715K vs WiredTiger's ~3.4M) against Noxu's
+  zero-abort mixed-workload win, and recommends **against** MVCC as a first step
+  in favour of a direct read-path optimization, reserving an opt-in,
+  read-only-snapshot MVCC (log-version reads, default OFF) as a secondary path.
+  No engine code — proposal for human decision.
+
 ## [7.5.5] - 2026-07-23
 
 ### Documentation
