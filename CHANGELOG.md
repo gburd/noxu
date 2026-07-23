@@ -94,6 +94,40 @@ listed in [References](#references).
   (`network_restore::validate_restore_filename`, applied in both `execute` and
   `execute_via_dispatcher`), so a malicious peer can no longer direct writes
   outside the designated restore directory.
+### Added
+
+- **TTL / record expiration (JE 7.5 flagship feature), JE-faithful.** Records
+  written via `Database::put_with_options` with a `WriteOptions` TTL now expire
+  automatically: expired records are invisible to reads and their space is
+  reclaimed by the cleaner. The port follows JE's design end to end:
+  - **Put path.** `WriteOptions::with_ttl(hours)` /
+    `with_ttl_unit(ttl, TtlUnit::Days|Hours)` mirror JE
+    `WriteOptions.setTTL(int, TimeUnit)` with hour/day granularity. The
+    expiration time is computed with JE's round-up rule
+    (`TTL.ttlToExpiration`: the current time is rounded up to the next hour/day
+    boundary, then the TTL is added) and stored as hours-since-epoch, exactly
+    as JE stores it (`ExpirationInfo`). The expiration is threaded into the BIN
+    slot **and** the LN log entry.
+  - **Read path.** A get or cursor step that lands on an expired record returns
+    NOTFOUND (`BIN.isExpired` / `isDefunct`, via `slot_is_live`), gated by the
+    `env_expiration_enabled` master switch (JE `EnvironmentImpl.isExpired`).
+  - **Cleaner.** Expired records count as obsolete for per-file utilization so
+    files holding mostly expired data are reclaimed
+    (`ExpirationTracker`/`ExpirationProfile`), gated by
+    `cleaner_expiration_enabled` and using the `env_ttl_clock_tolerance_ms`
+    grace window (JE `ENV_TTL_CLOCK_TOLERANCE` / `BIN.isProbablyExpired`) so a
+    small backward clock change cannot purge a still-live record.
+  - **Recovery.** The expiration is carried in the LN log entry
+    (`LnLogEntry.expiration`, flag-gated — old log entries read as
+    never-expiring, no format-version bump) and replayed into the BIN slot, so
+    a record keeps its expiration across a crash
+    (`RecoveryManager.redo` → `IN.setExpiration`).
+  - **Config.** `env_expiration_enabled` (master switch, default `true`, JE
+    default), `env_ttl_clock_tolerance_ms` (default 2 h, JE default), and
+    `cleaner_expiration_enabled` (default `true`) are now live and removed from
+    the accepted-but-inert parameter registry. This replaces the earlier
+    partial hook whose TTL update was in-memory only and did not survive
+    recovery (audit finding database-F8).
 
 ### Fixed
 

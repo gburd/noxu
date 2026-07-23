@@ -159,6 +159,7 @@ fn empty_stub() -> BinStub {
         keys: noxu_tree::tree::KeyRep::new(),
         compact_max_key_length:
             noxu_tree::tree::INKeyRep_DEFAULT_MAX_KEY_LENGTH,
+        expiration_enabled: true,
     }
 }
 

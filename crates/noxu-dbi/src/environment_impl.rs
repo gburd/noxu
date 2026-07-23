@@ -431,6 +431,18 @@ pub struct EnvironmentImpl {
     /// (`IN.getCompactMaxKeyLength`).  Default 16.
     compact_max_key_length: i32,
 
+    /// TTL master switch (`ENV_EXPIRATION_ENABLED`).  Threaded into every BIN
+    /// tree this environment opens via `Tree::set_expiration_enabled`; when
+    /// `false`, expired records are neither filtered from reads nor purged.
+    /// Default `true` (JE default).  JE `EnvironmentImpl.isExpired` gate.
+    expiration_enabled: bool,
+
+    /// TTL clock tolerance in ms (`ENV_TTL_CLOCK_TOLERANCE`).  Grace window
+    /// the cleaner applies before an expired record's space is reclaimed, so
+    /// a small backward clock change cannot purge a still-live record.
+    /// Default 7_200_000 (2 h, JE default).
+    ttl_clock_tolerance_ms: u64,
+
     /// Background-daemon exception dispatcher (JE `ExceptionListener`
     /// substrate).  A shared, late-bindable slot handed to each daemon at
     /// spawn time; the higher layer (`noxu-db`) installs a sink via
@@ -1215,6 +1227,13 @@ impl EnvironmentImpl {
             c = c.with_two_pass_params(
                 cfg.cleaner_two_pass_gap,
                 cfg.cleaner_two_pass_threshold,
+            ); // Wire the TTL expiration accounting: the cleaner counts expired
+            // records as obsolete only when BOTH the environment master switch
+            // and the cleaner sub-switch are on, using the configured
+            // clock-tolerance grace window (ENV_TTL_CLOCK_TOLERANCE).
+            c.set_expiration_config(
+                cfg.env_expiration_enabled && cfg.cleaner_expiration_enabled,
+                cfg.env_ttl_clock_tolerance_ms,
             );
             Arc::new(c)
         });
@@ -1692,6 +1711,9 @@ impl EnvironmentImpl {
             replication_vlsn_counter: Mutex::new(None),
             // T-5: TREE_COMPACT_MAX_KEY_LENGTH from the env config.
             compact_max_key_length: cfg.tree_compact_max_key_length as i32,
+            // TTL master switch + clock tolerance from the env config.
+            expiration_enabled: cfg.env_expiration_enabled,
+            ttl_clock_tolerance_ms: cfg.env_ttl_clock_tolerance_ms,
             exception_dispatcher,
         };
 
@@ -1971,6 +1993,9 @@ impl EnvironmentImpl {
         // compact-key rep uses the configured threshold
         // (IN.getCompactMaxKeyLength).
         db_impl.set_tree_compact_max_key_length(self.compact_max_key_length);
+        // Thread the TTL master switch into the tree so expired slots are
+        // filtered only when ENV_EXPIRATION_ENABLED is on.
+        db_impl.set_tree_expiration_enabled(self.expiration_enabled);
 
         // If recovery populated a tree for this db_id, transplant it so the
         // database starts from its recovered (crash-consistent) state rather
@@ -1983,6 +2008,10 @@ impl EnvironmentImpl {
             db_impl.set_recovered_tree(recovered_tree);
             // Re-wire counter since set_recovered_tree replaces the tree.
             db_impl.set_memory_counter(Arc::clone(&self.cache_usage));
+            // Re-apply the tree-level config the replacement tree lost.
+            db_impl
+                .set_tree_compact_max_key_length(self.compact_max_key_length);
+            db_impl.set_tree_expiration_enabled(self.expiration_enabled);
         }
 
         let db = Arc::new(RwLock::new(db_impl));

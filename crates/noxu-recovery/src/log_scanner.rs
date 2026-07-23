@@ -72,6 +72,15 @@ pub struct LnRecord {
     /// phase to verify that VLSNs of replicated entries are observed in
     /// strictly-increasing order (security review LOG-6).
     pub vlsn: Option<u64>,
+    /// Record expiration time (packed hours since the Unix epoch, 0 = never
+    /// expires) as carried in the LN log entry.
+    ///
+    /// Populated by the file-backed scanner from `LnEntryRef.expiration`.
+    /// The redo phase writes it back into the BIN slot so a record's TTL
+    /// survives crash recovery (JE `LNLogEntry.getExpiration` →
+    /// `IN.setExpiration` during `RecoveryManager.redo`).  0 for legacy log
+    /// entries written before TTL support, which read as never-expiring.
+    pub expiration: i32,
 }
 
 impl LnRecord {
@@ -98,6 +107,7 @@ impl LnRecord {
             is_invisible: false,
             is_replicated: false,
             vlsn: None,
+            expiration: 0,
         }
     }
 }

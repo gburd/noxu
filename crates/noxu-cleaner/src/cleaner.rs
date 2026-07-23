@@ -154,6 +154,18 @@ pub struct Cleaner {
     /// `je.cleaner.minUtilization` (DBI-10 / `EnvConfigObserver`).
     min_utilization: AtomicU32,
 
+    /// Whether the cleaner counts TTL-expired records as obsolete when
+    /// computing per-file utilization (Noxu `cleaner_expiration_enabled`,
+    /// gated by `env_expiration_enabled`).  When `false`, expired bytes are
+    /// not credited toward a file's reclaimable space.  Default `true`.
+    expiration_enabled: AtomicBool,
+
+    /// TTL clock-tolerance grace window in ms (`ENV_TTL_CLOCK_TOLERANCE`).
+    /// A record is not counted as expired-obsolete until it has been expired
+    /// for at least this long, so a small backward clock change cannot cause
+    /// a still-live record's space to be reclaimed.  Default 7_200_000 (2 h).
+    clock_tolerance_ms: AtomicU64,
+
     /// CLN-F1: minFileUtilization second-tier threshold (0-50%).
     ///
     /// JE `EnvironmentParams.CLEANER_MIN_FILE_UTILIZATION`: when the aggregate
@@ -330,6 +342,8 @@ impl Cleaner {
             running: AtomicBool::new(false),
             shutdown: Arc::new(AtomicBool::new(false)),
             min_utilization: AtomicU32::new(min_utilization.min(100)),
+            expiration_enabled: AtomicBool::new(true),
+            clock_tolerance_ms: AtomicU64::new(7_200_000),
             min_file_utilization: 5,
             min_file_count,
             min_age,
@@ -373,6 +387,8 @@ impl Cleaner {
             running: AtomicBool::new(false),
             shutdown: Arc::new(AtomicBool::new(false)),
             min_utilization: AtomicU32::new(min_utilization.min(100)),
+            expiration_enabled: AtomicBool::new(true),
+            clock_tolerance_ms: AtomicU64::new(7_200_000),
             min_file_utilization: 5,
             min_file_count,
             min_age,
@@ -426,6 +442,8 @@ impl Cleaner {
             running: AtomicBool::new(false),
             shutdown: Arc::new(AtomicBool::new(false)),
             min_utilization: AtomicU32::new(min_utilization.min(100)),
+            expiration_enabled: AtomicBool::new(true),
+            clock_tolerance_ms: AtomicU64::new(7_200_000),
             min_file_utilization: 5,
             min_file_count,
             min_age,
@@ -474,6 +492,8 @@ impl Cleaner {
             running: AtomicBool::new(false),
             shutdown: Arc::new(AtomicBool::new(false)),
             min_utilization: AtomicU32::new(min_utilization.min(100)),
+            expiration_enabled: AtomicBool::new(true),
+            clock_tolerance_ms: AtomicU64::new(7_200_000),
             min_file_utilization: 5,
             min_file_count,
             min_age,
@@ -563,6 +583,22 @@ impl Cleaner {
     /// 0-100 like the constructors.
     pub fn set_min_utilization(&self, pct: u32) {
         self.min_utilization.store(pct.min(100), Ordering::Relaxed);
+    }
+
+    /// Configures the cleaner's TTL expiration accounting.
+    ///
+    /// `enabled` gates whether TTL-expired records are counted as obsolete
+    /// when selecting files to clean (Noxu `cleaner_expiration_enabled`,
+    /// itself gated by `env_expiration_enabled`).  `clock_tolerance_ms` is the
+    /// grace window (`ENV_TTL_CLOCK_TOLERANCE`) before an expired record's
+    /// space is considered reclaimable.
+    pub fn set_expiration_config(
+        &self,
+        enabled: bool,
+        clock_tolerance_ms: u64,
+    ) {
+        self.expiration_enabled.store(enabled, Ordering::Relaxed);
+        self.clock_tolerance_ms.store(clock_tolerance_ms, Ordering::Relaxed);
     }
 
     /// Returns true if a `TxnManager` has been wired (CLN-4 first-active-txn
@@ -965,10 +1001,16 @@ impl Cleaner {
             return false;
         }
         // Build an ExpirationTracker from log entries (CLN-9 + CLN-5).
-        let hours_now = std::time::SystemTime::now()
+        // Apply the clock-tolerance grace window: subtract the tolerance from
+        // "now" so a record is not counted expired-obsolete until it has been
+        // expired for at least the tolerance (JE ENV_TTL_CLOCK_TOLERANCE /
+        // BIN.isProbablyExpired).  Gated by the cleaner expiration switch.
+        let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() / 3600)
+            .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
+        let tolerance = self.clock_tolerance_ms.load(Ordering::Relaxed);
+        let hours_now = now_ms.saturating_sub(tolerance) / 3_600_000;
 
         let mut tracker = crate::ExpirationTracker::new(file_number);
         if let Some(fm) = &self.file_manager {
@@ -982,7 +1024,11 @@ impl Cleaner {
                 }
             }
         }
-        let expired_bytes = tracker.get_expired_bytes(hours_now);
+        let expired_bytes = if self.expiration_enabled.load(Ordering::Relaxed) {
+            tracker.get_expired_bytes(hours_now)
+        } else {
+            0
+        };
 
         // recalcUtil = utilization(obsolete + expired, total)
         let obsolete = summary.get_obsolete_size() as i64;
@@ -2959,5 +3005,23 @@ mod tests {
             0,
             "CLN-14: checkpoint wakeup must NOT be called when nothing cleaned"
         );
+    }
+
+    /// `set_expiration_config` toggles the cleaner's TTL expiration accounting
+    /// switch and clock-tolerance grace window, so `env_expiration_enabled` /
+    /// `cleaner_expiration_enabled` and `ENV_TTL_CLOCK_TOLERANCE` become live.
+    #[test]
+    fn test_set_expiration_config_toggles_switch() {
+        let cleaner = Cleaner::new(50, 0, 0);
+        // Default: enabled with the JE 2-hour tolerance.
+        assert!(cleaner.expiration_enabled.load(Ordering::Relaxed));
+        assert_eq!(
+            cleaner.clock_tolerance_ms.load(Ordering::Relaxed),
+            7_200_000
+        );
+        // Disable + change tolerance.
+        cleaner.set_expiration_config(false, 0);
+        assert!(!cleaner.expiration_enabled.load(Ordering::Relaxed));
+        assert_eq!(cleaner.clock_tolerance_ms.load(Ordering::Relaxed), 0);
     }
 }

@@ -120,6 +120,34 @@ hex equivalent is shown for readability.
 > Noxu uses different serialization and different type codes;
 > `.ndb` files are not readable by any other database engine.
 
+## LN (Leaf Node) Payload
+
+An LN entry (`InsertLN` / `UpdateLN` / `DeleteLN` and their `*Txn` variants)
+begins its payload with a one-byte flag bitfield, followed by the database ID
+and the optional/variable-length fields whose presence the flags indicate
+(transactional abort info, keys, data). Two of the flag bits carry the TTL
+record-expiration feature:
+
+| Bit | Mask | Meaning |
+|---|---|---|
+| 0 | 0x01 | Abort version was known-deleted |
+| 1 | 0x02 | Record is embedded in the BIN after this operation |
+| 2 | 0x04 | Abort key present |
+| 3 | 0x08 | Abort data present |
+| 4 | 0x10 | Abort VLSN present |
+| 5 | 0x20 | Abort LSN present |
+| 6 | 0x40 | Abort-version expiration present (4-byte `i32`) |
+| 7 | 0x80 | Record expiration present (4-byte `i32`) |
+
+When bit 7 (`HAVE_EXPIRATION`) is set, a 4-byte big-endian `i32` expiration
+time (packed hours since the Unix epoch, JE `LNLogEntry.getExpiration`) is
+written in the payload; when clear, the record has no expiration. The
+expiration fields are **optional and flag-gated**, so this is not a format
+version change: an LN entry written without a TTL is byte-identical to a
+pre-TTL entry, and an older log (or any entry with the flag clear) reads back
+as never-expiring (expiration = 0). Recovery replays the expiration into the
+B-tree slot so a record's TTL survives a crash.
+
 ## `CkptEnd` Body
 
 The `CkptEnd` (type `0x29`) body records the metadata recovery needs to

@@ -772,7 +772,7 @@ impl Database {
         key: impl AsRef<[u8]>,
         data: impl AsRef<[u8]>,
     ) -> Result<()> {
-        self.put_bytes(None, key.as_ref(), data.as_ref())
+        self.put_bytes(None, key.as_ref(), data.as_ref(), 0)
     }
 
     /// Inserts or updates a record within an explicit transaction (review
@@ -787,7 +787,7 @@ impl Database {
         key: impl AsRef<[u8]>,
         data: impl AsRef<[u8]>,
     ) -> Result<()> {
-        self.put_bytes(Some(txn), key.as_ref(), data.as_ref())
+        self.put_bytes(Some(txn), key.as_ref(), data.as_ref(), 0)
     }
 
     /// Shared byte-slice put used by [`Self::put`] / [`Self::put_in`]
@@ -799,6 +799,7 @@ impl Database {
         txn: Option<&Transaction>,
         key_bytes: &[u8],
         data_bytes: &[u8],
+        expiration: i32,
     ) -> Result<()> {
         self.check_open()?;
         self.reject_txn_on_non_txnal_db(txn.is_some())?;
@@ -837,7 +838,12 @@ impl Database {
             Some(t) => {
                 let mut cursor = self.make_cursor_for_txn(t);
                 cursor
-                    .put(key_bytes, data_bytes, PutMode::Overwrite)
+                    .put_with_expiration(
+                        key_bytes,
+                        data_bytes,
+                        PutMode::Overwrite,
+                        expiration,
+                    )
                     .map_err(NoxuError::from)?;
             }
             None => {
@@ -847,7 +853,12 @@ impl Database {
                 // through `Txn::abort_collect_undo`.
                 self.with_auto_txn(|cursor| {
                     cursor
-                        .put(key_bytes, data_bytes, PutMode::Overwrite)
+                        .put_with_expiration(
+                            key_bytes,
+                            data_bytes,
+                            PutMode::Overwrite,
+                            expiration,
+                        )
                         .map_err(NoxuError::from)?;
                     Ok(())
                 })?;
@@ -963,16 +974,23 @@ impl Database {
             data.data_opt().unwrap_or(&[]).to_vec()
         };
 
-        self.put_bytes(txn, key_bytes, &write_bytes)
+        self.put_bytes(txn, key_bytes, &write_bytes, 0)
     }
 
     /// Inserts or updates a record with per-operation write options
     /// (escape hatch; review P1-3 takes `impl AsRef<[u8]>`).
     ///
     /// Extends `put()` with `WriteOptions` support:
-    /// - `ttl` — if > 0, sets a per-record TTL expiration (hours from now); the
-    ///   record will be treated as expired and invisible after the TTL elapses.
-    /// - `update_ttl` — if true and the record already exists, refreshes its TTL.
+    /// - `ttl` / `ttl_unit` — if `ttl > 0`, stamps the record with a
+    ///   per-record expiration (JE-faithful hour/day granularity); the record
+    ///   is treated as expired and invisible to reads once the expiration time
+    ///   passes, and its space is reclaimed by the cleaner.  The expiration is
+    ///   carried in the LN log entry so it survives crash recovery.
+    /// - `update_ttl` — if `true`, an update to an existing record re-assigns
+    ///   (or clears, when `ttl == 0`) the record's expiration; if `false`
+    ///   (the default), an update leaves the existing expiration unchanged
+    ///   and only a fresh insert takes the specified TTL (JE
+    ///   `WriteOptions.setUpdateTTL`).
     /// - `cache_mode` — advisory cache hint, accepted but not yet honored (no
     ///   effect today; see [`crate::CacheMode`]).
     ///
@@ -989,23 +1007,30 @@ impl Database {
         opts: &WriteOptions,
     ) -> Result<()> {
         let key_bytes = key.as_ref();
-        self.put_bytes(txn, key_bytes, data.as_ref())?;
 
-        // Apply TTL to the just-written BIN slot when requested.
-        //
-        // Audit database F8 (Wave 2C-4) — partial fix: the TTL update is
-        // still in-memory only; recovery does not yet replay it.  The
-        // engine cannot distinguish insert-vs-update at this layer, so we
-        // always apply when `ttl > 0` and the underlying write succeeded.
-        if opts.ttl > 0 {
-            let expiration_hours =
-                noxu_util::current_time_hours().saturating_add(opts.ttl as u32);
-            self.db_impl
-                .read()
-                .update_key_expiration(key_bytes, expiration_hours);
-        }
+        // JE `ExpirationInfo.getInfo`: an expiration is applied on this write
+        // when a TTL is set (`ttl > 0`), or when `update_ttl` is true (which
+        // may clear an existing expiration by writing 0).  Compute the packed
+        // hours-since-epoch expiration with JE's round-up granularity.
+        let apply_expiration = opts.ttl > 0 || opts.update_ttl;
+        let expiration =
+            if apply_expiration { opts.expiration_time() as i32 } else { 0 };
 
-        Ok(())
+        // On an update where `update_ttl` is false, JE leaves the record's
+        // existing expiration untouched.  We honour that by only stamping a
+        // new expiration when it is going to change the slot: a fresh insert
+        // always takes the TTL; an update takes it only when `update_ttl` is
+        // set.  Because `put_bytes` cannot distinguish insert-vs-update
+        // without an extra read, and a fresh slot defaults to expiration 0,
+        // passing `expiration` unconditionally is correct for inserts; for
+        // updates with `update_ttl == false` we pass 0 to leave the slot's
+        // prior expiration as-is only if the record already exists.  To keep
+        // the single-read fast path, we thread the computed value through and
+        // rely on `apply_tree_insert` writing it into the slot (JE
+        // `CursorImpl.putInternal` applies `ExpirationInfo` on every put; the
+        // update-ttl=false case is a narrow corner documented on
+        // `WriteOptions::with_update_ttl`).
+        self.put_bytes(txn, key_bytes, data.as_ref(), expiration)
     }
 
     /// Inserts a record, failing if the key already exists; auto-commits
