@@ -80,7 +80,7 @@ write-path backpressure.
 
 This was the third reframing of the write ceiling by measurement:
 (1) "LWL convoy" → (2) "missing WriteQueue / fsync coalescing" → (3) the actual
-cause, a mis-calibrated 1 MB/s cleaner throttle sleeping every committer. gdb
+cause, a miscalibrated 1 MB/s cleaner throttle sleeping every committer. gdb
 thread-state (58/69 in `hrtimer_nanosleep`) was the decisive signal. Lesson:
 trace *where* threads actually block; do not assume the theorized bottleneck.
 The WriteQueue re-check work remains correct (it removes redundant fsyncs when
