@@ -427,6 +427,47 @@ impl Txn {
             )
     }
 
+    /// Read-committed / read-uncommitted fast-path probe.
+    ///
+    /// A read-committed cursor read acquires a `Read` lock and releases it
+    /// immediately after the operation (see `CursorImpl::lock_ln`), so the
+    /// only thing the lock buys is detecting whether a *writer* currently
+    /// holds the slot — in which case the read must wait for that writer and
+    /// re-read the committed value.  When the slot is unlocked (the common
+    /// case under a read-heavy workload) the acquire+release pair is two
+    /// shard-mutex round-trips plus a `read_locks` insert/remove of pure
+    /// overhead.
+    ///
+    /// This probe runs `check_state` (so an Aborted / MustAbort txn is still
+    /// caught here rather than silently returning dirty data — the same
+    /// invariant `lock()` enforces) and then asks the lock manager whether
+    /// the slot has a foreign write owner or any waiter with a SINGLE shard
+    /// access.  It returns `true` (uncontended, caller may skip the formal
+    /// acquire+release) iff the txn's state is Open AND no foreign writer
+    /// owns the slot AND there are no waiters.  It inserts NOTHING into
+    /// `read_locks`, so nothing needs releasing.
+    ///
+    /// Behaviour-identical to acquiring a `Read` lock and releasing it
+    /// immediately, because (a) read-committed never holds the read lock past
+    /// the operation, so no `read_locks` entry would have survived to commit;
+    /// and (b) the BIN write-latch a writer must hold to mutate the slot
+    /// serialises it against the reader — "no foreign write owner now" means
+    /// the slot LSN the reader observed is committed data.
+    ///
+    /// ONLY sound for the immediate-release isolation levels
+    /// (read-committed).  Repeatable-read / serializable hold the read lock
+    /// for the txn and MUST use the full `lock()` path so a concurrent writer
+    /// blocks on the held read lock.  The caller (`lock_ln`) gates on
+    /// `is_read_committed_isolation()` before calling this.
+    ///
+    /// Mirrors `LockManager::probe_read_uncontended`, which the auto-commit
+    /// read path already uses (CHANGELOG 6.4.1); this extends the same
+    /// optimisation to the read-committed *txn* path.
+    pub fn probe_read_uncontended(&self, lsn: u64) -> Result<bool, TxnError> {
+        self.check_state()?;
+        Ok(self.lock_manager.probe_read_uncontended(lsn, self.id))
+    }
+
     /// Commits with an explicit durability policy.
     ///
     ///

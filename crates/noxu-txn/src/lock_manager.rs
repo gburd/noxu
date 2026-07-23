@@ -50,7 +50,7 @@ use crate::lock_info::WaiterNotify;
 use crate::{
     DeadlockDetector, Lock, LockGrantType, LockStats, LockType, TxnError,
 };
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Number of lock table shards.
 ///
@@ -121,6 +121,30 @@ pub struct LockManager {
     /// (thread-locker map), extended
     /// to support HandleLocker buddy sharing.
     share_registry: RwLock<HashMap<i64, i64>>,
+
+    /// Fast-path emptiness flag for `share_registry`.
+    ///
+    /// `build_shares_fn` runs on EVERY lock acquire and release (to honor
+    /// JE `LockImpl.tryLock`'s `sharesLocksWith` check, LockImpl.java:647-648).
+    /// For the overwhelmingly common case — a regular `Txn` or auto-commit
+    /// locker that never joins a sharing group — the registry is empty and the
+    /// RwLock read it takes is pure per-op overhead on the read hot path.
+    ///
+    /// This flag lets `build_shares_fn` skip the registry read entirely when
+    /// no locker is registered.  It is a relaxed atomic used only for
+    /// read-only observation: sharing can only ever *grant* co-ownership that
+    /// conflict detection would otherwise deny, so a false-negative (skipping
+    /// the check when it would have said "not shared" anyway) is
+    /// behaviour-identical, and the flag is only `false` when the registry is
+    /// genuinely empty.  Writers (`register_locker_sharing` /
+    /// `unregister_locker_sharing`) update it under the registry write lock
+    /// AFTER mutating the map, so a reader that observes `true` will take the
+    /// lock and see the up-to-date map, and a reader that observes `false`
+    /// after a concurrent register is the same benign race as any lock-free
+    /// read of shared state that becomes non-empty a moment later — the
+    /// registering locker has not yet taken any lock, so no acquire that
+    /// needed to see it has been missed.
+    share_registry_nonempty: AtomicBool,
 
     /// Incremental waits-for graph for O(1) deadlock detection.
     ///
@@ -226,6 +250,7 @@ impl LockManager {
             },
             lock_timeout_ms: AtomicU64::new(timeout_ms),
             share_registry: RwLock::new(HashMap::new()),
+            share_registry_nonempty: AtomicBool::new(false),
             waiter_graph: Mutex::new(HashMap::new()),
             locker_labels: RwLock::new(HashMap::new()),
             non_preemptable: RwLock::new(HashSet::new()),
@@ -1008,7 +1033,11 @@ impl LockManager {
     ///
     ///
     pub fn register_locker_sharing(&self, locker_id: i64, group_id: i64) {
-        self.share_registry.write().unwrap().insert(locker_id, group_id);
+        let mut reg = self.share_registry.write().unwrap();
+        reg.insert(locker_id, group_id);
+        // Publish non-empty under the write lock so `build_shares_fn`'s
+        // fast-path load never skips a live registry.
+        self.share_registry_nonempty.store(true, Ordering::Relaxed);
     }
 
     /// Removes a locker from the sharing registry.
@@ -1017,7 +1046,9 @@ impl LockManager {
     ///
     ///
     pub fn unregister_locker_sharing(&self, locker_id: i64) {
-        self.share_registry.write().unwrap().remove(&locker_id);
+        let mut reg = self.share_registry.write().unwrap();
+        reg.remove(&locker_id);
+        self.share_registry_nonempty.store(!reg.is_empty(), Ordering::Relaxed);
     }
 
     /// Marks `locker_id` as non-preemptable (its locks cannot be stolen).
@@ -1058,8 +1089,16 @@ impl LockManager {
     /// to a sharing group; the common path (BasicLockers, most internal ops)
     /// shares with no one and returns a closure that allocates nothing.
     fn build_shares_fn(&self, locker_id: i64) -> impl Fn(i64) -> bool + use<> {
+        // Hot-path shortcut: when no locker has ever joined a sharing group
+        // the registry is empty, so no owner can share with the requester and
+        // the closure would always return false.  Skip the RwLock read that
+        // would otherwise run on every acquire/release.
         let requester_group: Option<i64> =
-            self.share_registry.read().unwrap().get(&locker_id).copied();
+            if self.share_registry_nonempty.load(Ordering::Relaxed) {
+                self.share_registry.read().unwrap().get(&locker_id).copied()
+            } else {
+                None
+            };
         let registry_snapshot: Option<hashbrown::HashMap<i64, i64>> =
             if requester_group.is_some() {
                 Some(self.share_registry.read().unwrap().clone())

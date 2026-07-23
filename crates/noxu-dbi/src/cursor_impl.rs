@@ -1465,6 +1465,32 @@ impl CursorImpl {
             } else {
                 LockType::Read
             };
+            // Read-committed fast path: RC releases the read lock immediately
+            // after the operation, so the acquire+release only serves to
+            // detect a concurrent writer.  Probe the slot with a single shard
+            // access; when uncontended (no foreign write owner, no waiters —
+            // the common case) skip the acquire+release entirely.
+            // Behaviour-identical to the acquire+immediate-release below since
+            // RC never holds the read lock past the operation, and a write
+            // owner or waiter falls through to the full path so contention
+            // detection + the re-read-after-writer signal are preserved.
+            // This is an OPTIMISATION of JE `CursorImpl.lockLN`'s semantics,
+            // not a semantic change: JE acquires+releases a Read lock for a
+            // read-committed read purely to observe writer ownership; probing
+            // that same ownership under one shard access yields the identical
+            // outcome.  It mirrors the auto-commit branch's use of
+            // LockManager::probe_read_uncontended (CHANGELOG 6.4.1), extended
+            // to the RC *txn* path.  NOTE: only valid for RC — repeatable-read
+            // / serializable hold the read lock to commit and must register
+            // it so concurrent writers block, so they skip this probe.
+            if guard.is_read_committed_isolation()
+                && !guard.holds_range_insert(lsn)
+                && guard
+                    .probe_read_uncontended(lsn)
+                    .map_err(DbiError::TxnError)?
+            {
+                return Ok(false);
+            }
             // Locus-seam guard: if this txn already holds a RangeInsert
             // next-key lock on `lsn` (from a prior insert in this txn whose
             // successor is the key now being read), DO NOT request a
