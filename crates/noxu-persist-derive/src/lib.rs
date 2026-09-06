@@ -117,6 +117,7 @@ use syn::{
 // ============================================================================
 
 /// Parsed container-level `#[entity(…)]` attributes.
+#[derive(Debug)]
 struct EntityContainerAttrs {
     /// Resolved entity name (either from `name = "…"` or struct ident).
     name: String,
@@ -718,7 +719,7 @@ fn find_primary_key_field(
     })
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct ParsedSecondary {
     field_ident: syn::Ident,
     /// The `SK` type used by the generated `SecondaryIndex<SK, PK, E>` —
@@ -931,4 +932,501 @@ fn sanitise_ident(name: &str) -> String {
         out.push('_');
     }
     out
+}
+
+// ============================================================================
+// Unit tests for the macro-expansion logic
+// ============================================================================
+//
+// These call the `syn`/`proc_macro2`-typed helper functions directly rather
+// than going through `proc_macro::TokenStream` (which requires an active
+// macro-invocation context and is exercised instead by the `tests/ui`
+// trybuild fixtures). This lets every parsing/validation branch inside
+// `parse_entity_container_attrs`, `parse_secondary_key_attr`,
+// `expand_primary_key`'s composite-key shapes, `unwrap_option_type`, and
+// `sanitise_ident` be hit directly and deterministically, independent of
+// rustc-diagnostic-text fragility across toolchains (see trybuild's
+// stable-vs-nightly span-format mismatch noted in the coverage report).
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quote::ToTokens;
+
+    fn parse_input(src: &str) -> DeriveInput {
+        syn::parse_str::<DeriveInput>(src).expect("test fixture must parse")
+    }
+
+    fn first_field(src: &str) -> Field {
+        let input = parse_input(src);
+        match input.data {
+            Data::Struct(DataStruct {
+                fields: Fields::Named(named), ..
+            }) => {
+                named.named.into_iter().next().expect("fixture needs a field")
+            }
+            _ => panic!("fixture must be a named-field struct"),
+        }
+    }
+
+    fn first_secondary_key_attr(field: &Field) -> Attribute {
+        field
+            .attrs
+            .iter()
+            .find(|a| a.path().is_ident("secondary_key"))
+            .cloned()
+            .expect("fixture field must carry #[secondary_key(...)]")
+    }
+
+    // ── parse_entity_container_attrs ───────────────────────────────────
+
+    #[test]
+    fn entity_container_defaults_when_no_attr() {
+        let input = parse_input("struct Foo { x: u64 }");
+        let attrs =
+            parse_entity_container_attrs(&input.attrs, &input.ident).unwrap();
+        assert_eq!(attrs.name, "Foo");
+        assert_eq!(
+            attrs.krate.to_token_stream().to_string(),
+            quote!(::noxu::persist).to_string()
+        );
+    }
+
+    #[test]
+    fn entity_container_name_override() {
+        let input = parse_input(
+            r#"#[entity(name = "CustomName")] struct Foo { x: u64 }"#,
+        );
+        let attrs =
+            parse_entity_container_attrs(&input.attrs, &input.ident).unwrap();
+        assert_eq!(attrs.name, "CustomName");
+    }
+
+    #[test]
+    fn entity_container_crate_override_valid_path() {
+        let input = parse_input(
+            r#"#[entity(crate = "noxu_persist")] struct Foo { x: u64 }"#,
+        );
+        let attrs =
+            parse_entity_container_attrs(&input.attrs, &input.ident).unwrap();
+        assert_eq!(attrs.krate.to_token_stream().to_string(), "noxu_persist");
+    }
+
+    #[test]
+    fn entity_container_crate_override_rejects_invalid_path() {
+        let input = parse_input(
+            r#"#[entity(crate = "not valid!!")] struct Foo { x: u64 }"#,
+        );
+        let err = parse_entity_container_attrs(&input.attrs, &input.ident)
+            .unwrap_err();
+        assert!(err.to_string().contains("is not a valid"));
+    }
+
+    #[test]
+    fn entity_container_rejects_unknown_key() {
+        let input =
+            parse_input(r#"#[entity(bogus = "x")] struct Foo { x: u64 }"#);
+        let err = parse_entity_container_attrs(&input.attrs, &input.ident)
+            .unwrap_err();
+        assert!(err.to_string().contains("unrecognised attribute"));
+    }
+
+    #[test]
+    fn entity_container_rejects_empty_name() {
+        let input =
+            parse_input(r#"#[entity(name = "")] struct Foo { x: u64 }"#);
+        let err = parse_entity_container_attrs(&input.attrs, &input.ident)
+            .unwrap_err();
+        assert!(err.to_string().contains("empty"));
+    }
+
+    // ── parse_krate_from_entity_attr ───────────────────────────────────
+
+    #[test]
+    fn krate_from_entity_attr_defaults_without_attr() {
+        let input = parse_input("struct Foo { x: u64 }");
+        let krate = parse_krate_from_entity_attr(&input.attrs).unwrap();
+        assert_eq!(
+            krate.to_token_stream().to_string(),
+            quote!(::noxu::persist).to_string()
+        );
+    }
+
+    #[test]
+    fn krate_from_entity_attr_reads_crate_key() {
+        let input = parse_input(
+            r#"#[entity(crate = "noxu_persist")] struct Foo { x: u64 }"#,
+        );
+        let krate = parse_krate_from_entity_attr(&input.attrs).unwrap();
+        assert_eq!(krate.to_token_stream().to_string(), "noxu_persist");
+    }
+
+    #[test]
+    fn krate_from_entity_attr_silently_skips_name_key() {
+        // `name` alone (no `crate`) must fall through to the default
+        // krate — proves derive(PrimaryKey)/derive(SecondaryKey) tolerate
+        // a bare `#[entity(name = "...")]` without also requiring `crate`.
+        let input =
+            parse_input(r#"#[entity(name = "Foo")] struct Foo { x: u64 }"#);
+        let krate = parse_krate_from_entity_attr(&input.attrs).unwrap();
+        assert_eq!(
+            krate.to_token_stream().to_string(),
+            quote!(::noxu::persist).to_string()
+        );
+    }
+
+    #[test]
+    fn krate_from_entity_attr_rejects_unknown_key() {
+        let input =
+            parse_input(r#"#[entity(bogus = "x")] struct Foo { x: u64 }"#);
+        let err = parse_krate_from_entity_attr(&input.attrs).unwrap_err();
+        assert!(err.to_string().contains("unrecognised attribute"));
+    }
+
+    #[test]
+    fn default_krate_is_noxu_persist_path() {
+        assert_eq!(
+            default_krate().to_token_stream().to_string(),
+            quote!(::noxu::persist).to_string()
+        );
+    }
+
+    // ── expand_entity ───────────────────────────────────────────────────
+
+    #[test]
+    fn expand_entity_happy_path_generates_impl() {
+        let input =
+            parse_input("struct User { #[primary_key] id: u64, name: String }");
+        let rendered = expand_entity(&input).unwrap().to_string();
+        assert!(rendered.contains("impl"));
+        assert!(rendered.contains("Entity"));
+        assert!(rendered.contains("entity_name"));
+    }
+
+    #[test]
+    fn expand_entity_rejects_missing_primary_key() {
+        let input = parse_input("struct NoPk { id: u64 }");
+        let err = expand_entity(&input).unwrap_err();
+        assert!(err.to_string().contains("missing"));
+    }
+
+    #[test]
+    fn expand_entity_rejects_two_primary_keys() {
+        let input = parse_input(
+            "struct TwoKeys { #[primary_key] id: u64, #[primary_key] other: String }",
+        );
+        let err = expand_entity(&input).unwrap_err();
+        assert!(err.to_string().contains("multiple"));
+    }
+
+    #[test]
+    fn expand_entity_rejects_tuple_struct() {
+        let input = parse_input("struct Tup(u64, String);");
+        let err = expand_entity(&input).unwrap_err();
+        assert!(err.to_string().contains("named fields"));
+    }
+
+    #[test]
+    fn expand_entity_rejects_enum() {
+        let input = parse_input("enum NotAStruct { A, B }");
+        let err = expand_entity(&input).unwrap_err();
+        assert!(err.to_string().contains("can only be applied to structs"));
+    }
+
+    // ── expand_primary_key ──────────────────────────────────────────────
+
+    #[test]
+    fn expand_primary_key_newtype() {
+        let input = parse_input("struct UserId(u64);");
+        let rendered = expand_primary_key(&input).unwrap().to_string();
+        assert!(rendered.contains("PrimaryKey"));
+    }
+
+    #[test]
+    fn expand_primary_key_composite_tuple_multi_field() {
+        let input = parse_input("struct CompositeTuple(String, u64);");
+        let rendered = expand_primary_key(&input).unwrap().to_string();
+        assert!(rendered.contains("to_sortable_bytes"));
+        assert!(rendered.contains("from_sortable_bytes"));
+    }
+
+    #[test]
+    fn expand_primary_key_composite_named() {
+        let input = parse_input(
+            "struct CompositeKey { region: String, customer_id: u64 }",
+        );
+        let rendered = expand_primary_key(&input).unwrap().to_string();
+        assert!(rendered.contains("to_sortable_bytes"));
+        assert!(rendered.contains("from_sortable_bytes"));
+    }
+
+    #[test]
+    fn expand_primary_key_rejects_unit_struct() {
+        let input = parse_input("struct Empty;");
+        let err = expand_primary_key(&input).unwrap_err();
+        assert!(err.to_string().contains("unit structs"));
+    }
+
+    #[test]
+    fn expand_primary_key_rejects_enum() {
+        let input = parse_input("enum NotAStruct { A }");
+        let err = expand_primary_key(&input).unwrap_err();
+        assert!(err.to_string().contains("can only be applied to structs"));
+    }
+
+    // ── expand_secondary_key ────────────────────────────────────────────
+
+    #[test]
+    fn expand_secondary_key_happy_path_with_option_and_plain_fields() {
+        let input = parse_input(
+            r#"struct User {
+                #[primary_key] id: u64,
+                #[secondary_key(name = "by_email", relate = OneToOne)] email: String,
+                #[secondary_key(name = "by_dept", relate = ManyToOne, related_entity = "Department", on_related_entity_delete = NULLIFY)] dept: Option<u64>,
+            }"#,
+        );
+        let rendered = expand_secondary_key(&input).unwrap().to_string();
+        assert!(rendered.contains("SECONDARY_INDEXES"));
+        assert!(rendered.contains("open_by_email_index"));
+        assert!(rendered.contains("open_by_dept_index"));
+    }
+
+    #[test]
+    fn expand_secondary_key_rejects_no_secondary_fields() {
+        let input =
+            parse_input("struct NoSecondary { #[primary_key] id: u64 }");
+        let err = expand_secondary_key(&input).unwrap_err();
+        assert!(err.to_string().contains("at least one field"));
+    }
+
+    #[test]
+    fn expand_secondary_key_propagates_missing_primary_key() {
+        let input = parse_input(
+            r#"struct NoPk { #[secondary_key(name = "x", relate = OneToOne)] x: String }"#,
+        );
+        let err = expand_secondary_key(&input).unwrap_err();
+        assert!(err.to_string().contains("missing"));
+    }
+
+    #[test]
+    fn expand_secondary_key_crate_override_reaches_generated_code() {
+        let input = parse_input(
+            r#"#[entity(crate = "noxu_persist")] struct User {
+                #[primary_key] id: u64,
+                #[secondary_key(name = "by_email", relate = OneToOne)] email: String,
+            }"#,
+        );
+        let rendered = expand_secondary_key(&input).unwrap().to_string();
+        assert!(rendered.contains("noxu_persist"));
+    }
+
+    // ── parse_secondary_key_attr ────────────────────────────────────────
+
+    #[test]
+    fn parse_secondary_key_attr_bare_without_parens_is_rejected() {
+        let field = first_field("struct S { #[secondary_key] x: String }");
+        let attr = first_secondary_key_attr(&field);
+        let err = parse_secondary_key_attr(&attr, &field).unwrap_err();
+        assert!(err.to_string().contains("expected `#[secondary_key"));
+    }
+
+    #[test]
+    fn parse_secondary_key_attr_rejects_unknown_key() {
+        let field = first_field(
+            r#"struct S { #[secondary_key(name = "x", relate = OneToOne, bogus = "y")] x: String }"#,
+        );
+        let attr = first_secondary_key_attr(&field);
+        let err = parse_secondary_key_attr(&attr, &field).unwrap_err();
+        assert!(err.to_string().contains("unrecognised key"));
+    }
+
+    #[test]
+    fn parse_secondary_key_attr_requires_name() {
+        let field = first_field(
+            r#"struct S { #[secondary_key(relate = OneToOne)] x: String }"#,
+        );
+        let attr = first_secondary_key_attr(&field);
+        let err = parse_secondary_key_attr(&attr, &field).unwrap_err();
+        assert!(err.to_string().contains("requires `name"));
+    }
+
+    #[test]
+    fn parse_secondary_key_attr_requires_relate() {
+        let field = first_field(
+            r#"struct S { #[secondary_key(name = "x")] x: String }"#,
+        );
+        let attr = first_secondary_key_attr(&field);
+        let err = parse_secondary_key_attr(&attr, &field).unwrap_err();
+        assert!(err.to_string().contains("requires `relate"));
+    }
+
+    #[test]
+    fn parse_secondary_key_attr_rejects_invalid_relate() {
+        let field = first_field(
+            r#"struct S { #[secondary_key(name = "x", relate = Bogus)] x: String }"#,
+        );
+        let attr = first_secondary_key_attr(&field);
+        let err = parse_secondary_key_attr(&attr, &field).unwrap_err();
+        assert!(err.to_string().contains("invalid `relate"));
+    }
+
+    #[test]
+    fn parse_secondary_key_attr_rejects_invalid_on_delete() {
+        let field = first_field(
+            r#"struct S { #[secondary_key(name = "x", relate = OneToOne, on_related_entity_delete = Bogus)] x: String }"#,
+        );
+        let attr = first_secondary_key_attr(&field);
+        let err = parse_secondary_key_attr(&attr, &field).unwrap_err();
+        assert!(err.to_string().contains("invalid `on_related_entity_delete"));
+    }
+
+    #[test]
+    fn parse_secondary_key_attr_rejects_empty_name() {
+        let field = first_field(
+            r#"struct S { #[secondary_key(name = "", relate = OneToOne)] x: String }"#,
+        );
+        let attr = first_secondary_key_attr(&field);
+        let err = parse_secondary_key_attr(&attr, &field).unwrap_err();
+        assert!(err.to_string().contains("is empty"));
+    }
+
+    #[test]
+    fn parse_secondary_key_attr_normalises_je_style_delete_actions() {
+        for (je_style, expected) in
+            [("ABORT", "Abort"), ("CASCADE", "Cascade"), ("NULLIFY", "Nullify")]
+        {
+            let src = format!(
+                r#"struct S {{ #[secondary_key(name = "x", relate = OneToOne, related_entity = "Other", on_related_entity_delete = {je_style})] x: String }}"#
+            );
+            let field = first_field(&src);
+            let attr = first_secondary_key_attr(&field);
+            let parsed = parse_secondary_key_attr(&attr, &field).unwrap();
+            assert_eq!(parsed.on_delete, expected);
+            assert_eq!(parsed.related_entity, Some("Other".to_string()));
+        }
+    }
+
+    #[test]
+    fn parse_secondary_key_attr_relate_via_string_literal() {
+        // `relate` accepts either a bare identifier (OneToOne) or a string
+        // literal ("OneToOne"); this exercises the string-literal branch
+        // of `expr_to_ident_string`.
+        let field = first_field(
+            r#"struct S { #[secondary_key(name = "x", relate = "OneToOne")] x: String }"#,
+        );
+        let attr = first_secondary_key_attr(&field);
+        let parsed = parse_secondary_key_attr(&attr, &field).unwrap();
+        assert_eq!(parsed.relate, "OneToOne");
+    }
+
+    #[test]
+    fn parse_secondary_key_attr_relate_rejects_non_ident_expr() {
+        let field = first_field(
+            r#"struct S { #[secondary_key(name = "x", relate = 5)] x: String }"#,
+        );
+        let attr = first_secondary_key_attr(&field);
+        let err = parse_secondary_key_attr(&attr, &field).unwrap_err();
+        assert!(err.to_string().contains("expected an identifier"));
+    }
+
+    // ── normalise_action ────────────────────────────────────────────────
+
+    #[test]
+    fn normalise_action_maps_je_style_to_canonical() {
+        assert_eq!(normalise_action("ABORT"), "Abort");
+        assert_eq!(normalise_action("CASCADE"), "Cascade");
+        assert_eq!(normalise_action("NULLIFY"), "Nullify");
+        assert_eq!(normalise_action("Abort"), "Abort");
+    }
+
+    // ── relate_to_tokens / delete_action_to_tokens ─────────────────────
+
+    #[test]
+    fn relate_to_tokens_renders_qualified_variant() {
+        let krate: Path = syn::parse_str("::noxu::persist").unwrap();
+        let ts = relate_to_tokens("OneToOne", &krate);
+        assert_eq!(
+            ts.to_string(),
+            quote!(::noxu::persist::Relate::OneToOne).to_string()
+        );
+    }
+
+    #[test]
+    fn delete_action_to_tokens_renders_qualified_variant() {
+        let krate: Path = syn::parse_str("::noxu::persist").unwrap();
+        let ts = delete_action_to_tokens("Cascade", &krate);
+        assert_eq!(
+            ts.to_string(),
+            quote!(::noxu::persist::DeleteAction::Cascade).to_string()
+        );
+    }
+
+    // ── unwrap_option_type ──────────────────────────────────────────────
+
+    #[test]
+    fn unwrap_option_type_bare_option() {
+        let ty: Type = syn::parse_str("Option<u64>").unwrap();
+        let (is_opt, inner) = unwrap_option_type(&ty);
+        assert!(is_opt);
+        assert_eq!(inner.to_token_stream().to_string(), "u64");
+    }
+
+    #[test]
+    fn unwrap_option_type_qualified_std_spelling() {
+        let ty: Type = syn::parse_str("std::option::Option<String>").unwrap();
+        let (is_opt, inner) = unwrap_option_type(&ty);
+        assert!(is_opt);
+        assert_eq!(inner.to_token_stream().to_string(), "String");
+    }
+
+    #[test]
+    fn unwrap_option_type_qualified_core_spelling() {
+        let ty: Type = syn::parse_str("core::option::Option<i32>").unwrap();
+        let (is_opt, inner) = unwrap_option_type(&ty);
+        assert!(is_opt);
+        assert_eq!(inner.to_token_stream().to_string(), "i32");
+    }
+
+    #[test]
+    fn unwrap_option_type_non_option_passes_through() {
+        let ty: Type = syn::parse_str("Vec<u64>").unwrap();
+        let (is_opt, inner) = unwrap_option_type(&ty);
+        assert!(!is_opt);
+        assert_eq!(
+            inner.to_token_stream().to_string(),
+            ty.to_token_stream().to_string()
+        );
+    }
+
+    #[test]
+    fn unwrap_option_type_bare_option_without_generics_is_not_unwrapped() {
+        // `Option` used as a bare type (no generic args) must not be
+        // treated as unwrappable — guards the fallthrough at the end of
+        // the function.
+        let ty: Type = syn::parse_str("Option").unwrap();
+        let (is_opt, inner) = unwrap_option_type(&ty);
+        assert!(!is_opt);
+        assert_eq!(inner.to_token_stream().to_string(), "Option");
+    }
+
+    // ── sanitise_ident ──────────────────────────────────────────────────
+
+    #[test]
+    fn sanitise_ident_passes_through_valid_identifier() {
+        assert_eq!(sanitise_ident("by_email"), "by_email");
+    }
+
+    #[test]
+    fn sanitise_ident_replaces_non_ident_chars() {
+        assert_eq!(sanitise_ident("by-email"), "by_email");
+    }
+
+    #[test]
+    fn sanitise_ident_escapes_leading_digit() {
+        assert_eq!(sanitise_ident("1abc"), "_1abc");
+    }
+
+    #[test]
+    fn sanitise_ident_empty_input_yields_underscore() {
+        assert_eq!(sanitise_ident(""), "_");
+    }
 }

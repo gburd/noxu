@@ -449,4 +449,102 @@ mod tests {
 
         assert_eq!(map.first_key(None).unwrap(), Some(1));
     }
+
+    /// `new_read_only` must reject mutation and `is_read_only`/`database`
+    /// must report accurately -- proves the read-only construction path
+    /// (distinct from `new`) actually threads through to `StoredMap` and
+    /// isn't silently ignored.
+    #[test]
+    fn new_read_only_rejects_writes_and_reports_state() {
+        let (_td, _env, db) = setup();
+        let map: StoredSortedMap<'_, i32, String, _, _> =
+            StoredSortedMap::new(&db, IntBinding, StringBinding);
+        map.put(None, &1, &"one".to_string()).unwrap();
+
+        let ro: StoredSortedMap<'_, i32, String, _, _> =
+            StoredSortedMap::new_read_only(&db, IntBinding, StringBinding);
+        assert!(ro.is_read_only());
+        assert_eq!(ro.database() as *const _, &db as *const _);
+
+        // Reads still work.
+        assert_eq!(ro.get(None, &1).unwrap(), Some("one".to_string()));
+
+        // Writes must be rejected.
+        let err = ro.put(None, &2, &"two".to_string()).unwrap_err();
+        assert!(matches!(err, crate::error::CollectionError::ReadOnly));
+    }
+
+    /// `clear` must remove every entry, and the sorted navigation methods
+    /// (`first_key` / `last_key`) must reflect the emptied map afterwards.
+    #[test]
+    fn clear_empties_the_map() {
+        let (_td, _env, db) = setup();
+        let map: StoredSortedMap<'_, i32, String, _, _> =
+            StoredSortedMap::new(&db, IntBinding, StringBinding);
+        populate(&map);
+        assert_eq!(map.first_key(None).unwrap(), Some(1));
+
+        map.clear(None).unwrap();
+
+        assert_eq!(map.first_key(None).unwrap(), None);
+        assert_eq!(map.last_key(None).unwrap(), None);
+    }
+
+    /// The delegating `iter` / `keys` / `values` (lazy) accessors must
+    /// yield the same records as the sorted-navigation-specific methods
+    /// already tested above -- these three just forward to the inner
+    /// `StoredMap`, but the forwarding itself was previously untested.
+    #[test]
+    fn iter_keys_values_delegate_correctly() {
+        let (_td, _env, db) = setup();
+        let map: StoredSortedMap<'_, i32, String, _, _> =
+            StoredSortedMap::new(&db, IntBinding, StringBinding);
+        populate(&map);
+
+        let mut pairs: Vec<(i32, String)> =
+            map.iter(None).unwrap().map(Result::unwrap).collect();
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            vec![
+                (1, "one".to_string()),
+                (2, "two".to_string()),
+                (3, "three".to_string()),
+                (4, "four".to_string()),
+                (5, "five".to_string()),
+            ]
+        );
+
+        let mut keys: Vec<i32> =
+            map.keys(None).unwrap().map(Result::unwrap).collect();
+        keys.sort();
+        assert_eq!(keys, vec![1, 2, 3, 4, 5]);
+
+        let mut values: Vec<String> =
+            map.values(None).unwrap().map(Result::unwrap).collect();
+        values.sort();
+        assert_eq!(
+            values,
+            vec!["five", "four", "one", "three", "two"]
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The eager `snapshot` / `keys_snapshot` / `values_snapshot`
+    /// delegating accessors must also forward correctly -- distinct code
+    /// path from the lazy `iter`/`keys`/`values` above (materialises a
+    /// `Vec` up front via `StoredIterator::from_vec`).
+    #[test]
+    fn eager_snapshots_delegate_correctly() {
+        let (_td, _env, db) = setup();
+        let map: StoredSortedMap<'_, i32, String, _, _> =
+            StoredSortedMap::new(&db, IntBinding, StringBinding);
+        populate(&map);
+
+        assert_eq!(map.snapshot(None).unwrap().count(), 5);
+        assert_eq!(map.keys_snapshot(None).unwrap().count(), 5);
+        assert_eq!(map.values_snapshot(None).unwrap().count(), 5);
+    }
 }

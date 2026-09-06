@@ -248,4 +248,25 @@ mod tests {
         assert!(matches!(set.remove(None, &1), Err(CollectionError::ReadOnly)));
         assert!(matches!(set.clear(None), Err(CollectionError::ReadOnly)));
     }
+
+    /// The plain accessors (`is_read_only`, `database`, `key_binding`)
+    /// must report the values the view was actually constructed with --
+    /// distinct from `read_only_rejects_writes` above, which only checks
+    /// the *behavioural* consequence of read-only, not that the flag
+    /// itself is inspectable.
+    #[test]
+    fn accessors_report_construction_state() {
+        let (_td, _env, db) = setup();
+        let rw: StoredKeySet<'_, i32, _> = StoredKeySet::new(&db, IntBinding);
+        assert!(!rw.is_read_only());
+        assert_eq!(rw.database() as *const _, &db as *const _);
+        // `key_binding()` returns the binding instance; IntBinding is a
+        // unit struct, so this just proves the accessor compiles and
+        // returns *something* of the right type without panicking.
+        let _: &IntBinding = rw.key_binding();
+
+        let ro: StoredKeySet<'_, i32, _> =
+            StoredKeySet::new_read_only(&db, IntBinding);
+        assert!(ro.is_read_only());
+    }
 }

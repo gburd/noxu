@@ -165,3 +165,33 @@ macro_rules! gauge_dec {
         ::metrics::gauge!($name).decrement(1.0);
     };
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn describe_metrics_registers_every_metric_without_a_recorder() {
+        // No recorder installed: describe_* facade calls are no-ops, but
+        // this exercises every describe_* call site in the function (the
+        // whole point of `describe_metrics` is that it never panics even
+        // when nothing is listening).
+        describe_metrics();
+    }
+
+    #[cfg(feature = "prometheus")]
+    #[test]
+    fn prometheus_install_is_a_single_shot_global() {
+        // `metrics`'s global recorder can be installed exactly once per
+        // process; a second `install_recorder()` call must be rejected
+        // rather than silently replacing (or panicking on) the first.
+        let first = prometheus::install();
+        assert!(first.is_ok(), "first install should succeed: {first:?}");
+
+        let second = prometheus::install();
+        assert!(
+            second.is_err(),
+            "installing a second global Prometheus recorder must fail"
+        );
+    }
+}

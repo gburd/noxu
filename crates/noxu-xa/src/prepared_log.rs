@@ -198,4 +198,49 @@ mod tests {
             assert_eq!(recovered[0], xid);
         }
     }
+
+    /// A key shorter than the mandatory 5-byte
+    /// `[format_id:4][gtrid_len:1]` prefix must be rejected rather than
+    /// panic on the `data[0..4]` / `data[4]` slices -- `recover_all` skips
+    /// (rather than crashes on) any corrupted/foreign key it walks over.
+    #[test]
+    fn test_key_to_xid_rejects_short_key() {
+        assert!(PreparedLog::key_to_xid(&[]).is_none());
+        assert!(PreparedLog::key_to_xid(&[1, 2, 3, 4]).is_none());
+    }
+
+    /// A key whose declared `gtrid_len` claims more bytes than the key
+    /// actually carries must be rejected rather than panic on the
+    /// `data[5..5 + gtrid_len]` slice.
+    #[test]
+    fn test_key_to_xid_rejects_truncated_gtrid() {
+        // format_id (4 bytes) + gtrid_len=200, but no gtrid bytes follow.
+        let mut key = 1i32.to_le_bytes().to_vec();
+        key.push(200);
+        assert!(PreparedLog::key_to_xid(&key).is_none());
+    }
+
+    /// `recover_all` must silently skip a corrupted/foreign key instead of
+    /// aborting the whole recovery scan -- this is what makes the
+    /// defensive `key_to_xid` guards meaningful in practice: a single bad
+    /// entry in the `_xa_prepared` database must not block every other
+    /// prepared XID from being recovered after a crash.
+    #[test]
+    fn test_recover_all_skips_corrupted_key_but_returns_valid_ones() {
+        let (env, _dir) = make_env();
+        let log = PreparedLog::open(&env).unwrap();
+
+        let xid = Xid::new(1, b"good", b"branch").unwrap();
+        log.record_prepare(&xid).unwrap();
+
+        // Insert a corrupted key directly (too short to be a valid Xid key).
+        log.db.put([0xFFu8, 0x01], [0u8; 8]).unwrap();
+
+        let recovered = log.recover_all().unwrap();
+        assert_eq!(
+            recovered,
+            vec![xid],
+            "the corrupted key must be skipped, not abort the scan"
+        );
+    }
 }

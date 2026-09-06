@@ -471,3 +471,155 @@ where
     cursor.close()?;
     Ok(result)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use noxu_bind::{IntBinding, StringBinding};
+    use noxu_db::{DatabaseConfig, Environment, EnvironmentConfig};
+    use tempfile::TempDir;
+
+    fn setup() -> (TempDir, Environment, Database) {
+        let td = TempDir::new().unwrap();
+        let env_config = EnvironmentConfig::new(td.path().to_path_buf())
+            .with_allow_create(true)
+            .with_transactional(true);
+        let env = Environment::open(env_config).unwrap();
+        let db_config = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
+        let db =
+            env.open_database(None, "scan_records_test", &db_config).unwrap();
+        (td, env, db)
+    }
+
+    fn put(db: &Database, k: i32, v: &str) {
+        let key = encode_key(&IntBinding, &k).unwrap();
+        let data = encode_value(&StringBinding, &v.to_string()).unwrap();
+        db_put(db, None, &key, &data).unwrap();
+    }
+
+    /// `scan_records` with `ScanDirection::Reverse` must walk the keyspace
+    /// from `Get::Last` back to `Get::First`, yielding descending key
+    /// order. Every current in-tree caller (`StoredMap::snapshot` /
+    /// `keys_snapshot` / `values_snapshot`) only ever passes
+    /// `ScanDirection::Forward` -- this test exercises the Reverse arm
+    /// directly at the `internal::scan_records` level so the branch is a
+    /// proven, not merely theoretical, invariant for any future caller
+    /// (e.g. an eager `StoredSortedMap::snapshot_reverse`).
+    #[test]
+    fn scan_records_reverse_yields_descending_order() {
+        let (_td, _env, db) = setup();
+        for (k, v) in [(1, "a"), (2, "b"), (3, "c")] {
+            put(&db, k, v);
+        }
+
+        let items = scan_records(
+            &db,
+            None,
+            StartKey::None,
+            ScanDirection::Reverse,
+            &IntBinding,
+            &StringBinding,
+            |k, v| (k, v),
+        )
+        .unwrap();
+
+        assert_eq!(
+            items,
+            vec![
+                (3, "c".to_string()),
+                (2, "b".to_string()),
+                (1, "a".to_string())
+            ]
+        );
+    }
+
+    /// `scan_records` with a `start` bound must skip every record before
+    /// the bound (inclusive), for BOTH directions -- proves the
+    /// "skip records outside the requested half-range" loop, which no
+    /// current `StoredMap` caller exercises (they all pass
+    /// `StartKey::None`) but which `stored_sorted_map.rs`'s lazy
+    /// `scan_iter_owned_start`-based range queries rely on the equivalent
+    /// logic for (see `ScanIter::in_range`).
+    #[test]
+    fn scan_records_forward_with_start_bound_skips_earlier_keys() {
+        let (_td, _env, db) = setup();
+        for (k, v) in [(1, "a"), (2, "b"), (3, "c"), (4, "d")] {
+            put(&db, k, v);
+        }
+        let bound = encode_key(&IntBinding, &3).unwrap();
+        let bound_bytes = bound.data_opt().unwrap().to_vec();
+
+        let items = scan_records(
+            &db,
+            None,
+            Some(&bound_bytes),
+            ScanDirection::Forward,
+            &IntBinding,
+            &StringBinding,
+            |k, v| (k, v),
+        )
+        .unwrap();
+
+        assert_eq!(
+            items,
+            vec![(3, "c".to_string()), (4, "d".to_string())],
+            "records strictly before the start bound must be skipped"
+        );
+    }
+
+    /// Reverse scan with a start bound must skip every record AFTER the
+    /// bound (the mirror image of the forward case above), walking
+    /// downward from the bound to the first key.
+    #[test]
+    fn scan_records_reverse_with_start_bound_skips_later_keys() {
+        let (_td, _env, db) = setup();
+        for (k, v) in [(1, "a"), (2, "b"), (3, "c"), (4, "d")] {
+            put(&db, k, v);
+        }
+        let bound = encode_key(&IntBinding, &2).unwrap();
+        let bound_bytes = bound.data_opt().unwrap().to_vec();
+
+        let items = scan_records(
+            &db,
+            None,
+            Some(&bound_bytes),
+            ScanDirection::Reverse,
+            &IntBinding,
+            &StringBinding,
+            |k, v| (k, v),
+        )
+        .unwrap();
+
+        assert_eq!(
+            items,
+            vec![(2, "b".to_string()), (1, "a".to_string())],
+            "records strictly after the start bound must be skipped"
+        );
+    }
+
+    /// A start bound past every key in the database must return an empty
+    /// result (not error, not panic) -- exercises the "ran off the end
+    /// while skipping" early-return inside the skip loop.
+    #[test]
+    fn scan_records_start_bound_past_every_key_is_empty() {
+        let (_td, _env, db) = setup();
+        put(&db, 1, "a");
+        put(&db, 2, "b");
+        let bound = encode_key(&IntBinding, &99).unwrap();
+        let bound_bytes = bound.data_opt().unwrap().to_vec();
+
+        let items = scan_records(
+            &db,
+            None,
+            Some(&bound_bytes),
+            ScanDirection::Forward,
+            &IntBinding,
+            &StringBinding,
+            |k, v| (k, v),
+        )
+        .unwrap();
+        assert!(items.is_empty());
+    }
+}

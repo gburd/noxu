@@ -188,4 +188,16 @@ mod tests {
         }
         assert_eq!(set.len(None).unwrap(), 3);
     }
+
+    /// `database()` / `value_binding()` must expose the values the view
+    /// was constructed with -- proves the accessors aren't dead code
+    /// that just happens to compile.
+    #[test]
+    fn accessors_expose_construction_state() {
+        let (_td, _env, db) = setup();
+        let set: StoredValueSet<'_, String, _> =
+            StoredValueSet::new(&db, StringBinding);
+        assert_eq!(set.database() as *const _, &db as *const _);
+        let _: &StringBinding = set.value_binding();
+    }
 }
