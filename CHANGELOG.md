@@ -15,6 +15,30 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### CI / Testing
+
+- The shuttle concurrency-permutation (DST Milestone 2) gate now runs
+  automatically in CI: a new `shuttle` job in both
+  `.forgejo/workflows/test.yml` and `.github/workflows/test.yml` runs all
+  10 `crates/*/tests/shuttle_*.rs` targets via a new `make shuttle` target,
+  on a nightly schedule (`0 3 * * *` UTC) and on manual
+  `workflow_dispatch`, with a 60-minute job timeout. Previously the gate
+  was opt-in-by-memory only — a human had to remember the
+  `RUSTFLAGS="--cfg noxu_shuttle"` invocation — despite already having
+  caught a real lost-wakeup and a real BIN-split race. It deliberately does
+  not run on every push/PR (a full sweep is noticeably slower than the rest
+  of CI combined). Local invocation is unchanged: `make shuttle` or the
+  per-target `RUSTFLAGS="--cfg noxu_shuttle" cargo test -p <crate> --test
+  shuttle_<name> --release` command (`--release` is required for a
+  practical run time — measured ~20-30x faster per iteration than debug).
+- Fixed a latent build break under `--cfg noxu_shuttle`:
+  `noxu-recovery/src/checkpointer.rs` imported `parking_lot::RwLock as
+  NodeRwLock` directly instead of the shared `noxu_tree::NodeRwLock` alias
+  that every other tree-node-latch caller uses, so any shuttle build
+  pulling in `noxu-recovery` (e.g. `noxu-engine`) failed to compile. Found
+  while wiring the CI job; fixed by switching to `use
+  noxu_tree::NodeRwLock;`. No behavior change under the default cfg.
+
 ### Performance
 
 - Latch-lite / optimistic tree descent (MVCC proposal §6c option 3):

@@ -12,6 +12,11 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    # Nightly shuttle DST gate only (see the `shuttle` job below) — every
+    # other job above runs per-push/PR and ignores this trigger via `if:`.
+    - cron: '0 3 * * *'
+  workflow_dispatch: {}
 
 env:
   CARGO_TERM_COLOR: always
@@ -24,6 +29,7 @@ concurrency:
 jobs:
   check:
     name: Check (fmt + clippy)
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
     runs-on: lxc-bookworm
     steps:
       - uses: actions/checkout@v4
@@ -66,6 +72,7 @@ jobs:
     # GitHub `test` job for ubuntu-latest. macOS / Windows coverage lives
     # in the GitHub workflow only — Forgejo doesn't offer those runners.
     name: Test default features (linux)
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
     runs-on: lxc-bookworm
     needs: check
     steps:
@@ -107,6 +114,7 @@ jobs:
     # `observability`, and the rep `test-harness` feature. See
     # docs/src/internal/wave-10-f-ci-matrix.md for the matrix design.
     name: Test all features (linux)
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
     runs-on: lxc-bookworm
     needs: check
     steps:
@@ -141,6 +149,7 @@ jobs:
 
   doc:
     name: Documentation
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
     runs-on: lxc-bookworm
     needs: check
     steps:
@@ -179,6 +188,7 @@ jobs:
     # Advisory SemVer gate — mirrors the GitHub workflow job.  See
     # docs/src/contributing/semver-policy.md for promotion criteria.
     name: SemVer checks (advisory)
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
     runs-on: lxc-bookworm
     needs: check
     continue-on-error: true
@@ -215,3 +225,53 @@ jobs:
 
       - name: Run cargo-semver-checks
         run: cargo semver-checks --workspace --baseline-rev main
+
+  shuttle:
+    # DST Milestone 2 concurrency-permutation gate (shuttle). Deliberately
+    # NOT run on push/PR — a full sweep over all 10 shuttle_*.rs targets
+    # takes considerably longer than the rest of CI combined (thousands of
+    # interleavings per test). Runs nightly + on manual dispatch only. See
+    # docs/src/contributing/testing-guide.md "DST Milestone 2 — shuttle
+    # concurrency gate" for what each target covers and why --release
+    # matters (release is ~20-30x faster per iteration than debug).
+    name: Shuttle DST gate (nightly)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: lxc-bookworm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build prerequisites
+        run: |
+          apt-get update -q
+          apt-get install -qy curl build-essential pkg-config libssl-dev
+
+      - name: Install Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain none --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          # Distinct cache key: shuttle builds under a different RUSTFLAGS
+          # cfg, which changes the fingerprint of every crate in the
+          # dependency graph — sharing a key with the other jobs would just
+          # thrash the cache.
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-shuttle-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-shuttle-
+
+      # `make shuttle` runs all 10 shuttle_*.rs targets with
+      # `RUSTFLAGS="--cfg noxu_shuttle"` and `--release`; any assertion
+      # failure or shuttle-detected violation is a nonzero exit, which
+      # fails this step (and the job) — no error-swallowing.
+      - name: Run the shuttle DST concurrency gate
+        run: make shuttle
