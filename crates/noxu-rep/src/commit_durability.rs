@@ -212,11 +212,4 @@ mod tests {
         assert!(s.contains("SIMPLE_MAJORITY"));
         assert!(s.contains("5s"));
     }
-
-    #[test]
-    fn test_commit_durability_clone_eq() {
-        let cd = CommitDurability::default();
-        let cloned = cd;
-        assert_eq!(cd, cloned);
-    }
 }

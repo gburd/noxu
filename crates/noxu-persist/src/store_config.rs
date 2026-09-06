@@ -228,14 +228,6 @@ mod tests {
     }
 
     #[test]
-    fn test_clone() {
-        let config1 = StoreConfig::new("test").with_allow_create(true);
-        let config2 = config1.clone();
-        assert_eq!(config1.store_name, config2.store_name);
-        assert_eq!(config1.allow_create, config2.allow_create);
-    }
-
-    #[test]
     fn test_with_mutations_round_trip() {
         use crate::evolve::{Mutations, Renamer};
         let mut m = Mutations::new();

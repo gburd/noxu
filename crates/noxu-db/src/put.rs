@@ -101,20 +101,6 @@ mod tests {
     }
 
     #[test]
-    fn test_clone() {
-        let put1 = Put::Current;
-        let put2 = put1;
-        assert_eq!(put1, put2);
-    }
-
-    #[test]
-    fn test_copy() {
-        let put1 = Put::Overwrite;
-        let put2 = put1;
-        assert_eq!(put1, put2);
-    }
-
-    #[test]
     fn test_debug() {
         let put = Put::NoDupData;
         let debug = format!("{:?}", put);

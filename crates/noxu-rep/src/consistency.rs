@@ -488,16 +488,6 @@ mod tests {
         assert!(s.contains("42"));
     }
 
-    #[test]
-    fn test_clone_and_eq() {
-        let policy = ConsistencyPolicy::TimeConsistency {
-            max_lag: Duration::from_millis(100),
-            timeout: Duration::from_secs(5),
-        };
-        let cloned = policy.clone();
-        assert_eq!(policy, cloned);
-    }
-
     // -- ConsistencyTracker (blocking wait) ------------------------------
 
     #[test]

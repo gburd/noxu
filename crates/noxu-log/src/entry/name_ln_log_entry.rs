@@ -574,15 +574,6 @@ mod tests {
     }
 
     #[test]
-    fn test_name_ln_log_entry_clone() {
-        let original =
-            NameLnLogEntry::new_remove(1, None, NULL_LSN, b"y".to_vec());
-        let cloned = original.clone();
-        assert_eq!(original.operation_type, cloned.operation_type);
-        assert_eq!(original.ln_entry.db_id, cloned.ln_entry.db_id);
-    }
-
-    #[test]
     fn test_new_create_sets_fields() {
         let entry = NameLnLogEntry::new_create(
             42,

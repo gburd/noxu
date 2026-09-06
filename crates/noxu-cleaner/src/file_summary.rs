@@ -509,18 +509,6 @@ mod tests {
     }
 
     #[test]
-    fn test_clone() {
-        let summary1 = FileSummary {
-            total_count: 10,
-            total_size: 1000,
-            ..Default::default()
-        };
-
-        let summary2 = summary1.clone();
-        assert_eq!(summary1, summary2);
-    }
-
-    #[test]
     fn test_max_ln_size_preserved() {
         let mut summary =
             FileSummary { max_ln_size: 100, ..Default::default() };

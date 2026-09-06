@@ -99,15 +99,6 @@ mod tests {
     }
 
     #[test]
-    fn test_clone_and_copy() {
-        let nt = NodeType::Electable;
-        let cloned = nt;
-        let copied = nt;
-        assert_eq!(nt, cloned);
-        assert_eq!(nt, copied);
-    }
-
-    #[test]
     fn test_eq_and_hash() {
         use std::collections::HashSet;
         let mut set = HashSet::new();

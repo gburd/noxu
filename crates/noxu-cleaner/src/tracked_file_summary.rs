@@ -303,21 +303,6 @@ mod tests {
     }
 
     #[test]
-    fn test_clone() {
-        let mut tracked1 = TrackedFileSummary::new(42, true);
-        tracked1.get_summary_mut().total_count = 10;
-        tracked1.add_obsolete_offset(100);
-        tracked1.add_obsolete_offset(200);
-
-        let tracked2 = tracked1.clone();
-
-        assert_eq!(tracked2.get_file_number(), 42);
-        assert_eq!(tracked2.get_summary().total_count, 10);
-        assert_eq!(tracked2.obsolete_offset_count(), 2);
-        assert_eq!(tracked2.get_obsolete_offsets(), &[100, 200]);
-    }
-
-    #[test]
     fn test_get_summary_immutable() {
         let mut tracked = TrackedFileSummary::new(42, true);
         tracked.get_summary_mut().total_count = 10;

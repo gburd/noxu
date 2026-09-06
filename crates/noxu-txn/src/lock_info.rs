@@ -66,13 +66,6 @@ mod tests {
     }
 
     #[test]
-    fn test_clone() {
-        let info1 = LockInfo::new(100, LockType::Read);
-        let info2 = info1.clone();
-        assert_eq!(info1, info2);
-    }
-
-    #[test]
     fn test_equality() {
         let info1 = LockInfo::new(1, LockType::Read);
         let info2 = LockInfo::new(1, LockType::Read);

@@ -135,13 +135,6 @@ mod tests {
     }
 
     #[test]
-    fn test_clone() {
-        let result1 = OperationResult::update_with_expiration(500);
-        let result2 = result1.clone();
-        assert_eq!(result1, result2);
-    }
-
-    #[test]
     fn test_equality() {
         let r1 = OperationResult::read();
         let r2 = OperationResult::read();

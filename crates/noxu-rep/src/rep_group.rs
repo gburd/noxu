@@ -370,15 +370,6 @@ mod tests {
     }
 
     #[test]
-    fn test_clone() {
-        let mut group = RepGroup::new("g".to_string(), 1);
-        group.add_node(make_electable("n1", 1));
-        let cloned = group.clone();
-        assert_eq!(cloned.name(), group.name());
-        assert_eq!(cloned.node_count(), group.node_count());
-    }
-
-    #[test]
     fn test_get_node_not_found() {
         let group = RepGroup::new("g".to_string(), 1);
         assert!(group.get_node("nonexistent").is_none());

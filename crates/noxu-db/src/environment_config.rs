@@ -3104,15 +3104,4 @@ mod tests {
         c.set_dos_producer_queue_timeout_ms(5000);
         assert_eq!(c.dos_producer_queue_timeout_ms, 5000);
     }
-
-    #[test]
-    fn test_clone() {
-        let c1 = EnvironmentConfig::default()
-            .with_allow_create(true)
-            .with_cache_size(256 * 1024 * 1024);
-        let c2 = c1.clone();
-        assert_eq!(c1.allow_create, c2.allow_create);
-        assert_eq!(c1.cache_size, c2.cache_size);
-        assert_eq!(c1.free_disk, c2.free_disk);
-    }
 }

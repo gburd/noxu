@@ -303,16 +303,6 @@ mod tests {
     }
 
     #[test]
-    fn test_clone() {
-        let mut packed1 = PackedOffsets::new();
-        packed1.pack(&[100, 200, 300]);
-
-        let packed2 = packed1.clone();
-        assert_eq!(packed2.get_count(), 3);
-        assert_eq!(packed2.unpack(), vec![100, 200, 300]);
-    }
-
-    #[test]
     fn test_default() {
         let packed = PackedOffsets::default();
         assert!(packed.is_empty());

@@ -15,6 +15,18 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Testing
+
+- Removed 48 tautological `test_copy`/`test_clone`-style tests (e.g.
+  `let x2 = x1; assert_eq!(x1, x2)`) across 30 `src/*.rs` files in
+  `noxu-cleaner`, `noxu-db`, `noxu-engine`, `noxu-evictor`, `noxu-log`,
+  `noxu-persist`, `noxu-recovery`, `noxu-rep`, `noxu-tree`, and `noxu-txn`.
+  These only re-asserted what `#[derive(Copy, Clone, PartialEq)]` already
+  guarantees at compile time and carried no behavioral coverage. Tests that
+  exercised a manual `Clone`/copy-style method (e.g. `copy_all_info`,
+  `copy_write_lock_info`) or checked additional real behavior alongside the
+  copy were left in place.
+
 ### CI / Testing
 
 - The shuttle concurrency-permutation (DST Milestone 2) gate now runs

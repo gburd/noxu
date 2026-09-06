@@ -127,20 +127,6 @@ mod tests {
     }
 
     #[test]
-    fn test_clone() {
-        let mode1 = CacheMode::EvictBin;
-        let mode2 = mode1;
-        assert_eq!(mode1, mode2);
-    }
-
-    #[test]
-    fn test_copy() {
-        let mode1 = CacheMode::MakeCold;
-        let mode2 = mode1;
-        assert_eq!(mode1, mode2);
-    }
-
-    #[test]
     fn test_debug() {
         let mode = CacheMode::KeepHot;
         let debug = format!("{:?}", mode);

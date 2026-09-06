@@ -498,21 +498,6 @@ mod tests {
     }
 
     #[test]
-    fn test_off_heap_stats_clone() {
-        let stats = OffHeapStats {
-            enabled: true,
-            max_size: 1024,
-            usage: 512,
-            num_bins: 10,
-            num_lns: 100,
-            evictions: 0,
-        };
-
-        let cloned = stats;
-        assert_eq!(stats, cloned);
-    }
-
-    #[test]
     fn test_len_and_is_empty() {
         let cache = OffHeapCache::new(true, 4096);
         assert!(cache.is_empty());

@@ -646,14 +646,6 @@ mod tests {
     }
 
     #[test]
-    fn test_config_clone() {
-        let config = RepConfig::builder("g", "n", "h").build();
-        let cloned = config.clone();
-        assert_eq!(config.group_name, cloned.group_name);
-        assert_eq!(config.node_name, cloned.node_name);
-    }
-
-    #[test]
     fn test_config_debug() {
         let config = RepConfig::builder("g", "n", "h").build();
         let s = format!("{:?}", config);

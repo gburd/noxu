@@ -122,13 +122,6 @@ mod tests {
     }
 
     #[test]
-    fn test_clone() {
-        let opts1 = ReadOptions::read_uncommitted();
-        let opts2 = opts1.clone();
-        assert_eq!(opts1, opts2);
-    }
-
-    #[test]
     fn test_builder_chain() {
         let opts = ReadOptions::new()
             .with_lock_mode(LockMode::ReadCommitted)

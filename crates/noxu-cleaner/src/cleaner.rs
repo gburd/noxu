@@ -2096,17 +2096,6 @@ mod tests {
     }
 
     #[test]
-    fn test_clean_result_clone() {
-        let result = CleanResult {
-            files_cleaned: 3,
-            files_deleted: 2,
-            total_entries_read: 500,
-        };
-        let cloned = result.clone();
-        assert_eq!(cloned, result);
-    }
-
-    #[test]
     fn test_min_utilization_zero() {
         let cleaner = Cleaner::new(0, 0, 0);
         assert_eq!(cleaner.min_utilization.load(Ordering::Relaxed), 0);

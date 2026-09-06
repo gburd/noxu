@@ -154,23 +154,6 @@ mod tests {
     }
 
     #[test]
-    fn test_clone() {
-        let summary1 = DbFileSummary {
-            total_in_count: 5,
-            total_in_size: 500,
-            total_ln_count: 10,
-            total_ln_size: 1000,
-            obsolete_in_count: 2,
-            obsolete_ln_count: 3,
-            obsolete_ln_size: 300,
-            obsolete_ln_size_counted: 3,
-        };
-
-        let summary2 = summary1.clone();
-        assert_eq!(summary1, summary2);
-    }
-
-    #[test]
     fn test_default() {
         let summary = DbFileSummary::default();
         assert!(summary.is_empty());
