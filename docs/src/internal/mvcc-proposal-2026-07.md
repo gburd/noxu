@@ -1,15 +1,36 @@
 # Proposal: Multi-Version Concurrency Control (MVCC) for Noxu DB
 
-**Status:** Research / Design proposal — *for human decision.* NOT approved,
-NOT scheduled, NOT implemented.
+**Status:** **CLOSED (2026-07) — decision made: do not pursue MVCC now.**
 **Date:** 2026-07
 **Author:** research/mvcc-proposal
 **Decision requested:** Do we add MVCC to Noxu, and if so in what form?
 
-> **Read this first.** This document analyses a change that would trade one of
-> Noxu's measured *strengths* for one of its measured *weaknesses*. It is
-> written to inform a decision, not to sell a feature. The recommendation
-> (§9) includes "don't" and "narrow opt-in" as first-class outcomes.
+> **Decision (2026-07).** Every non-MVCC read lever proposed in §6 has since
+> been measured: §6c (cheaper lock-based reads) shipped and gave a real but
+> small ~+7% peak-read win (clean EC2 A/B, `docs/src/internal/
+> v6c-cheaper-reads-ec2-ab-2026-07.md` if archived, or the equivalent
+> perf-history note); §6c-option-3 (latch-lite/optimistic descent) was
+> measured BEFORE building it and rejected — the descent latch cost is only
+> ~13–15% of a warm read (`latch-lite-descent-ceiling-2026-07.md`), so even a
+> perfect implementation could not close the ~4–5× gap to WiredTiger. The read
+> gap is confirmed **structurally traversal/lock-bound**, not latch-bound — the
+> only remaining lever is a lock-free read path (§6a, MVCC).
+>
+> **Given that**, and Noxu's measured mixed-workload lead (0 aborts, beats
+> WiredTiger 2–5×, *because* it is lock-based): **MVCC is NOT scheduled.** The
+> read gap is accepted as the cost of the isolation model that produces that
+> lead. This is a business call, not a technical dead-end — §6a (opt-in,
+> read-only-snapshot, log-version reads, default OFF, lock-based stays the
+> default) remains the fully-specified fallback design if peak read throughput
+> ever becomes a stated hard requirement. Revisit only if that changes; do not
+> restart this research from scratch — this document + the two measurement
+> notes above are the complete evidence trail.
+
+> **Read this first (original framing, preserved).** This document analyses a
+> change that would trade one of Noxu's measured *strengths* for one of its
+> measured *weaknesses*. It is written to inform a decision, not to sell a
+> feature. The recommendation (§9) includes "don't" and "narrow opt-in" as
+> first-class outcomes — and "don't" is what happened.
 
 ---
 

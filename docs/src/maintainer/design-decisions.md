@@ -629,3 +629,50 @@ threading).
 **Proof**: `crates/noxu-db/tests/shared_cache_test.rs` (budget balancing +
 close-safety), `crates/noxu-evictor/tests/shuttle_shared_cache.rs` (DST shuttle
 register/deregister/scan interleavings).
+
+## 16. MVCC — Researched, Measured, and Rejected (Lock-Based Isolation Stays the Default)
+
+**Decision**: Noxu does NOT add MVCC. The lock-based isolation model
+(`AGENTS.md`: "Lock-based, NOT MVCC") remains the sole isolation substrate.
+This closes the research thread opened by an external benchmark comparison
+against WiredTiger.
+
+**Why**: the benchmark found Noxu's one structural weakness is peak read
+throughput (~715K ops/s vs WiredTiger's ~2.8-3.4M) and its one structural
+strength is the mixed-workload result (0 aborts vs WiredTiger's ~10%
+conflict-abort tax, beating it 2-5x) — a direct consequence of being
+lock-based rather than MVCC. Every non-MVCC read lever was measured before
+this decision, not assumed:
+
+1. **Cheaper lock-based reads** (shipped, 7.5.6): a real but small ~+7%
+   peak-read win on a clean EC2 host, isolation fully preserved.
+2. **Latch-lite / optimistic tree descent** (measured, NOT built): a ceiling
+   microbench BEFORE implementation found the hand-over-hand shared-latch
+   acquire/release is only ~13-15% of a warm read; the dominant cost is tree
+   traversal + `lock_ln`/cursor overhead, which latch-lite cannot touch. Per
+   the project's own measure-first discipline, a <15% ceiling did not justify
+   the risk of a concurrency-protocol change to the `forbid(unsafe_code)` tree
+   core, so it was not implemented.
+
+With both non-MVCC levers measured and found insufficient, the read gap is
+confirmed structural: only a lock-free read path (MVCC snapshot reads, or
+hazard pointers) can close it. Given that Noxu's lock-based model produces the
+measured mixed-workload win, adding MVCC would trade a proven strength for an
+unproven-necessary fix to a bounded weakness.
+
+**Disposition**: not scheduled. A fully-specified fallback design exists
+(opt-in, read-only-snapshot MVCC via log-version reads, default OFF, lock-based
+remains the default) if peak read throughput ever becomes a stated hard
+requirement — see the proposal doc. Revisit only if that requirement emerges;
+the evidence trail (proposal + two measurement notes) is complete and should
+not be re-derived from scratch.
+
+**Where**: `docs/src/internal/mvcc-proposal-2026-07.md` (the full analysis +
+closure note), `docs/src/internal/latch-lite-descent-ceiling-2026-07.md` (the
+ceiling microbench that closed option 6c-3).
+**JE refs**: JE has no MVCC (lock-based, `LockManager`/`CursorImpl.lockLN`) —
+this decision keeps Noxu JE-faithful on its most fundamental isolation choice.
+**Proof**: `crates/noxu-tree/benches/descent_bench.rs` (the ceiling microbench,
+independently reproducible); the §6c read-path tests (`isolation_test.rs`,
+`je_rmw_locking_test.rs`) prove the shipped optimization didn't weaken
+isolation.
