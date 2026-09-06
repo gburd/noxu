@@ -25,7 +25,7 @@ per-message election authentication is not yet implemented (see
 Use it where those constraints are acceptable, and validate durability for your
 workload before relying on it.
 
-**Current version**: 7.5.3.  See [CHANGELOG.md](CHANGELOG.md) for the full
+**Current version**: 7.5.6.  See [CHANGELOG.md](CHANGELOG.md) for the full
 release history.
 
 ## Quick Start
@@ -34,7 +34,7 @@ Add `noxu` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-noxu = "7"  # or pin to a specific version, e.g. "7.5.3"
+noxu = "7"  # or pin to a specific version, e.g. "7.5.6"
 ```
 
 Alternatively, depend on the git source directly (useful before a crates.io
@@ -42,7 +42,7 @@ release, or to track unreleased commits):
 
 ```toml
 [dependencies]
-noxu = { git = "https://codeberg.org/gregburd/noxu.git", tag = "v7.5.3" }
+noxu = { git = "https://codeberg.org/gregburd/noxu.git", tag = "v7.5.6" }
 ```
 
 The engine is composed of `noxu-*` component crates published as internal
@@ -186,7 +186,7 @@ Noxu DB is a Cargo workspace of **22 crates**:
 
 See the [crate guide](https://codeberg.page/gregburd/noxu/maintainer/crate-guide.html)
 for a per-crate purpose statement and the
-[v7.5.3 capability matrix](https://codeberg.page/gregburd/noxu/introduction.html#capability-matrix).
+[v7.5.6 capability matrix](https://codeberg.page/gregburd/noxu/introduction.html#capability-matrix).
 
 ## Building and Testing
 

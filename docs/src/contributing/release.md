@@ -39,6 +39,16 @@ Edit the workspace `Cargo.toml`:
 version = "0.X.Y"
 ```
 
+**Also update every hard-coded version string in `README.md`** (the "Current
+  version" line, the `noxu = "..."` pin example, the git-tag example, and the
+  capability-matrix link) — these are NOT derived from `Cargo.toml` and drift
+  silently every release if skipped:
+
+```bash
+sed -i 's/OLD\.VERSION/NEW.VERSION/g' README.md
+grep -n "version\|noxu = \|tag = \|capability matrix" README.md  # spot-check
+```
+
 ### 2. Update Changelog
 
 Add an entry to `CHANGELOG.md` following the [Keep a Changelog](https://keepachangelog.com/)

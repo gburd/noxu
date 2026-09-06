@@ -12,7 +12,7 @@ It provides ACID transactions, a log-structured B+tree, checkpoint-based crash
 recovery, and optional master-replica replication — all in a single library with
 no external database process required.
 
-The project lives at the repository root and uses a Cargo workspace with 19
+The project lives at the repository root and uses a Cargo workspace with 22
 crates under `crates/`.
 
 ## Crate Map
