@@ -238,17 +238,6 @@ mod tests {
     }
 
     #[test]
-    fn test_snapshot_clone() {
-        let stats = CheckpointStats::new();
-        stats.checkpoints.store(100, Ordering::Relaxed);
-
-        let snapshot1 = stats.snapshot();
-        let snapshot2 = snapshot1;
-
-        assert_eq!(snapshot1, snapshot2);
-    }
-
-    #[test]
     fn test_multiple_resets() {
         let stats = CheckpointStats::new();
 

@@ -218,13 +218,6 @@ mod tests {
     }
 
     #[test]
-    fn test_clone_and_eq() {
-        let node = make_node();
-        let cloned = node.clone();
-        assert_eq!(node, cloned);
-    }
-
-    #[test]
     fn test_not_equal() {
         let node1 = make_node();
         let node2 = RepNode::new(

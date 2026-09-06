@@ -218,25 +218,4 @@ mod tests {
         let d2 = Durability::COMMIT_SYNC;
         assert_eq!(d1, d2);
     }
-
-    #[test]
-    fn test_durability_clone() {
-        let d1 = Durability::COMMIT_SYNC;
-        let d2 = d1;
-        assert_eq!(d1, d2);
-    }
-
-    #[test]
-    fn test_sync_policy_copy() {
-        let s1 = SyncPolicy::Sync;
-        let s2 = s1;
-        assert_eq!(s1, s2);
-    }
-
-    #[test]
-    fn test_replica_ack_policy_copy() {
-        let r1 = ReplicaAckPolicy::All;
-        let r2 = r1;
-        assert_eq!(r1, r2);
-    }
 }

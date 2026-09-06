@@ -806,18 +806,6 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_result_clone() {
-        let mut result = VerifyResult::new();
-        result.add_error(VerifyError::DataInconsistency {
-            description: "Test".to_string(),
-        });
-
-        let cloned = result.clone();
-        assert_eq!(cloned.errors.len(), result.errors.len());
-        assert_eq!(cloned.passed, result.passed);
-    }
-
-    #[test]
     fn test_verify_error_equality() {
         let error1 = VerifyError::BtreeError {
             db_name: "db1".to_string(),

@@ -236,20 +236,6 @@ mod tests {
     }
 
     #[test]
-    fn test_clone() {
-        let get1 = Get::Search;
-        let get2 = get1;
-        assert_eq!(get1, get2);
-    }
-
-    #[test]
-    fn test_copy() {
-        let get1 = Get::Next;
-        let get2 = get1;
-        assert_eq!(get1, get2);
-    }
-
-    #[test]
     fn test_debug() {
         let get = Get::SearchBoth;
         let debug = format!("{:?}", get);

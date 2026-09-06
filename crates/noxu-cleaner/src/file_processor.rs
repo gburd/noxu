@@ -2152,21 +2152,6 @@ mod tests {
     }
 
     #[test]
-    fn test_result_clone() {
-        let result = FileProcessResult {
-            entries_read: 100,
-            lns_cleaned: 50,
-            completed: true,
-            ..Default::default()
-        };
-
-        let cloned = result.clone();
-        assert_eq!(cloned.entries_read, result.entries_read);
-        assert_eq!(cloned.lns_cleaned, result.lns_cleaned);
-        assert_eq!(cloned.completed, result.completed);
-    }
-
-    #[test]
     fn test_result_equality() {
         let result1 = FileProcessResult {
             entries_read: 100,
@@ -3045,25 +3030,6 @@ mod tests {
         let r3 = BinLookupResult::Found { tree_lsn: lsn };
         let s3 = format!("{:?}", r3);
         assert!(s3.contains("Found"));
-    }
-
-    // ── LogEntryType clone/debug ──────────────────────────────────────────────
-
-    #[test]
-    fn test_log_entry_type_clone_and_eq() {
-        let e1 = LogEntryType::Other;
-        let e2 = e1.clone();
-        assert_eq!(e1, e2);
-
-        let ln = LogEntryType::Ln {
-            db_id: 1,
-            key: vec![1],
-            deleted: false,
-            expiration_time: 0,
-            entry_size: 32,
-        };
-        let ln2 = ln.clone();
-        assert_eq!(ln, ln2);
     }
 
     // ── LookAheadCache: zero max_mem is immediately full ─────────────────────

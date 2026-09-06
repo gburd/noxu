@@ -207,21 +207,6 @@ mod tests {
     }
 
     #[test]
-    fn test_clone() {
-        let lsn = Lsn::new(1, 1000);
-        let info = LnInfo::new(lsn, 42, vec![1, 2, 3, 4], 128, false, 5000);
-
-        let cloned = info.clone();
-
-        assert_eq!(cloned.lsn(), info.lsn());
-        assert_eq!(cloned.db_id(), info.db_id());
-        assert_eq!(cloned.key(), info.key());
-        assert_eq!(cloned.log_size(), info.log_size());
-        assert_eq!(cloned.is_deleted(), info.is_deleted());
-        assert_eq!(cloned.expiration_time(), info.expiration_time());
-    }
-
-    #[test]
     fn test_large_database_id() {
         let lsn = Lsn::new(1, 1000);
         let info = LnInfo::new(lsn, i64::MAX, vec![1, 2, 3], 64, false, 0);

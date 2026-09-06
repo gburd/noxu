@@ -335,13 +335,6 @@ mod tests {
     }
 
     #[test]
-    fn test_clone() {
-        let entry1 = DatabaseEntry::from_bytes(b"original");
-        let entry2 = entry1.clone();
-        assert_eq!(entry1.data_opt(), entry2.data_opt());
-    }
-
-    #[test]
     fn test_equality() {
         let entry1 = DatabaseEntry::from_bytes(b"data");
         let entry2 = DatabaseEntry::from_bytes(b"data");

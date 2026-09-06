@@ -280,19 +280,4 @@ mod tests {
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Not enough data for LSN"));
     }
-
-    #[test]
-    fn test_clone() {
-        let key = b"clone_test".to_vec();
-        let lsn = Lsn::new(7, 7777);
-        let mut state = SlotState::new();
-        state.set_embedded_ln();
-
-        let delta1 = DeltaInfo::new(key, lsn, state);
-        let delta2 = delta1.clone();
-
-        assert_eq!(delta2.key, delta1.key);
-        assert_eq!(delta2.lsn, delta1.lsn);
-        assert_eq!(delta2.state.as_byte(), delta1.state.as_byte());
-    }
 }

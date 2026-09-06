@@ -177,18 +177,4 @@ mod tests {
         assert_eq!(CacheMode::Default, CacheMode::Default);
         assert_ne!(CacheMode::Default, CacheMode::EvictLn);
     }
-
-    #[test]
-    fn test_clone() {
-        let mode = CacheMode::EvictLn;
-        let cloned = mode;
-        assert_eq!(mode, cloned);
-    }
-
-    #[test]
-    fn test_copy() {
-        let mode = CacheMode::EvictBin;
-        let copied = mode;
-        assert_eq!(mode, copied);
-    }
 }

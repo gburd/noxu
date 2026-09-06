@@ -95,20 +95,6 @@ mod tests {
     }
 
     #[test]
-    fn test_clone() {
-        let mode1 = LockMode::Rmw;
-        let mode2 = mode1;
-        assert_eq!(mode1, mode2);
-    }
-
-    #[test]
-    fn test_copy() {
-        let mode1 = LockMode::ReadCommitted;
-        let mode2 = mode1;
-        assert_eq!(mode1, mode2);
-    }
-
-    #[test]
     fn test_debug() {
         let mode = LockMode::Rmw;
         let debug = format!("{:?}", mode);

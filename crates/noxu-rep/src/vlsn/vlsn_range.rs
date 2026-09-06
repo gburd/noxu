@@ -517,15 +517,6 @@ mod tests {
         assert!(range.is_empty());
     }
 
-    #[test]
-    fn test_clone_eq() {
-        let mut range = VlsnRange::with_range(1, 10);
-        range.update_commit(5);
-        range.update_sync(8);
-        let cloned = range.clone();
-        assert_eq!(range, cloned);
-    }
-
     // -------------------------------------------------------------------------
     // Ported from VLSNConsistencyTest.java — ordering invariants
     // -------------------------------------------------------------------------

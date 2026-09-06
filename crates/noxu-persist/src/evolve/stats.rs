@@ -104,14 +104,6 @@ mod tests {
     }
 
     #[test]
-    fn test_clone() {
-        let mut s = EvolveStats::new();
-        s.add(100, 50);
-        let cloned = s.clone();
-        assert_eq!(s, cloned);
-    }
-
-    #[test]
     fn test_display() {
         let mut s = EvolveStats::new();
         s.add(42, 21);

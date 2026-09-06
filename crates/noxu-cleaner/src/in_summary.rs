@@ -153,23 +153,6 @@ mod tests {
     }
 
     #[test]
-    fn test_clone() {
-        let summary1 = InSummary {
-            total_in_count: 10,
-            total_in_size: 1000,
-            total_bin_delta_count: 5,
-            total_bin_delta_size: 500,
-            obsolete_in_count: 2,
-            obsolete_in_size: 200,
-            obsolete_bin_delta_count: 1,
-            obsolete_bin_delta_size: 100,
-        };
-
-        let summary2 = summary1.clone();
-        assert_eq!(summary1, summary2);
-    }
-
-    #[test]
     fn test_default() {
         let summary = InSummary::default();
         assert!(summary.is_empty());

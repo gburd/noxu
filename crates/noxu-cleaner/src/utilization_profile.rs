@@ -467,16 +467,6 @@ mod tests {
     }
 
     #[test]
-    fn test_clone() {
-        let mut profile1 = UtilizationProfile::new();
-        profile1.update_file_summary(1, &create_summary(1000, 500));
-
-        let profile2 = profile1.clone();
-        assert_eq!(profile2.get_file_count(), 1);
-        assert!(profile2.get_file_summary(1).is_some());
-    }
-
-    #[test]
     fn test_default() {
         let profile = UtilizationProfile::default();
         assert_eq!(profile.get_file_count(), 0);

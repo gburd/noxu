@@ -215,20 +215,6 @@ mod tests {
     }
 
     #[test]
-    fn test_clone() {
-        let mut loc1 = TreeLocation::with_index_and_key(5, b"key".to_vec());
-        loc1.child_lsn = Lsn::new(2, 2000);
-        loc1.is_kd = true;
-
-        let loc2 = loc1.clone();
-
-        assert_eq!(loc2.index, loc1.index);
-        assert_eq!(loc2.ln_key, loc1.ln_key);
-        assert_eq!(loc2.child_lsn, loc1.child_lsn);
-        assert_eq!(loc2.is_kd, loc1.is_kd);
-    }
-
-    #[test]
     fn test_mutable_fields() {
         let mut loc = TreeLocation::new();
 

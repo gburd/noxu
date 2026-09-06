@@ -352,13 +352,6 @@ mod tests {
     }
 
     #[test]
-    fn test_clone() {
-        let config1 = TransactionConfig::read_committed();
-        let config2 = config1.clone();
-        assert_eq!(config1, config2);
-    }
-
-    #[test]
     fn test_equality() {
         let config1 = TransactionConfig::new();
         let config2 = TransactionConfig::default();

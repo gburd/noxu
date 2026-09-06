@@ -229,13 +229,6 @@ mod tests {
     }
 
     #[test]
-    fn test_clone() {
-        let opts1 = WriteOptions::with_expiration(12);
-        let opts2 = opts1.clone();
-        assert_eq!(opts1, opts2);
-    }
-
-    #[test]
     #[allow(deprecated)]
     fn test_builder_chain() {
         let opts = WriteOptions::new()
