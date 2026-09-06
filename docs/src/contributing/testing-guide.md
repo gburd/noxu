@@ -319,28 +319,46 @@ binary.
 
 #### Running the shuttle gate
 
-The shuttle gate is part of the **release** DST gate (like M1's long sweep), not
-required for local dev. It needs the `noxu_shuttle` cfg via `RUSTFLAGS`:
+The shuttle gate now runs in CI on a **nightly schedule** (`0 3 * * *` UTC) and
+on manual `workflow_dispatch`, in both `.forgejo/workflows/test.yml` and
+`.github/workflows/test.yml` (`shuttle` job, `make shuttle`) — see the job's
+own comments for the rationale. It deliberately does **not** run on every
+push/PR: a full sweep over all 10 `shuttle_*.rs` targets takes noticeably
+longer than the rest of CI combined, so the every-commit gates stay fast while
+the concurrency gate still runs automatically instead of depending on a human
+remembering the invocation. The CI job has a 60-minute timeout and fails the
+workflow on any panic, assertion failure, or shuttle-detected violation — the
+same as any other `cargo test` failure, no error-swallowing.
+
+For local dev / a manual run, use `make shuttle` (runs all 10 targets) or
+invoke a single target directly. It needs the `noxu_shuttle` cfg via
+`RUSTFLAGS`, and `--release` matters: shuttle re-runs the test closure
+thousands of times per target, and a release build is roughly 20-30x faster
+per iteration than debug (measured on `shuttle_bin_split`: 189s debug vs 6s
+release test time):
 
 ```bash
-# All shuttle targets:
-RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-engine --test shuttle_daemon_shutdown
-RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-log    --test shuttle_fsync_manager
-RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-txn    --test shuttle_lock_manager
-RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-evictor --test shuttle_shared_cache
-RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-tree   --test shuttle_bin_split
-RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-txn    --test shuttle_txn_commit
-RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-dbi    --test shuttle_cursor
-RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-tree   --test shuttle_checkpoint_mutation
-RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-rep    --test shuttle_rep_sync
+# All shuttle targets in one command:
+make shuttle
+
+# Or invoke a single target directly:
+RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-engine --test shuttle_daemon_shutdown --release
+RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-log    --test shuttle_fsync_manager --release
+RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-txn    --test shuttle_lock_manager --release
+RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-evictor --test shuttle_shared_cache --release
+RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-tree   --test shuttle_bin_split --release
+RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-txn    --test shuttle_txn_commit --release
+RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-dbi    --test shuttle_cursor --release
+RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-tree   --test shuttle_checkpoint_mutation --release
+RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-rep    --test shuttle_rep_sync --release
 
 # The M1.1 parking_lot-over-shuttle wrapper self-test:
-RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-util --test shuttle_dst_sync_pl
+RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-util --test shuttle_dst_sync_pl --release
 
 # Reproduce a specific shuttle schedule (shuttle prints a failing seed and a
 # replayable schedule string on failure):
 SHUTTLE_RANDOM_SEED=12345 RUSTFLAGS="--cfg noxu_shuttle" \
-    cargo test -p noxu-engine --test shuttle_daemon_shutdown
+    cargo test -p noxu-engine --test shuttle_daemon_shutdown --release
 ```
 
 The shared invariant asserts the shuttle tests check
@@ -359,11 +377,12 @@ cannot model (shuttle instruments `shuttle::sync` + `shuttle::thread`, not the
 tokio runtime). Rep's async loops are covered by tokio-level tests and by
 `noxu-spec` protocol models instead.
 
-Against that scope: **8 protocols are gated** (the table above), **1 is
+Against that scope: **10 protocols are gated** (the table above) and **1 is
 hard-blocked by shuttle 0.9** (`log_buffer`'s `lock_api::RawMutex` segment
-latch has no safe shuttle 0.9 shape), and **2 are sequenced follow-ups**
-(recovery-vs-mutation, rep sync state machines), both now tractable because the
-tree, txn, and cursor seams are landed. The one gap that mattered most — the
+latch has no safe shuttle 0.9 shape). The two follow-ups that were once
+sequenced (recovery-vs-mutation, rep sync state machines) are now landed as
+`shuttle_checkpoint_mutation.rs` and `shuttle_rep_sync.rs`, tractable because
+the tree, txn, and cursor seams were landed first. The one gap that mattered most — the
 BIN-split check-then-act race that a benchmark had to catch instead of DST — is
 closed by `shuttle_bin_split.rs`, and the two adjacent races that could have
 hidden the same way (a torn commit/abort `all_txns` map; a cursor skipping a
