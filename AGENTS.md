@@ -76,8 +76,8 @@ The 22 crates are organized by implementation layer:
 git submodule update --init --recursive
 
 cargo build                    # Build all crates
-cargo nextest run --workspace  # Run all tests (preferred)
-cargo test                     # Run all tests (fallback)
+cargo nextest run --workspace  # Run all tests (preferred locally; CI still uses `cargo test`, see below)
+cargo test                     # Run all tests (fallback; this is what CI actually runs)
 cargo test -p noxu-util        # Test a single crate
 cargo clippy --workspace --all-targets --all-features -- -D warnings  # Full CI lint
 cargo fmt --all                # Format all crates
