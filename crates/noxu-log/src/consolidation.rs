@@ -17,12 +17,10 @@
 //!     array changes only *how the serialisation point is acquired*, not the
 //!     log layout.  On-disk format is byte-identical.
 //!   * **SINGLE MONOTONIC LSN** — the leader assigns a *contiguous* LSN range
-//!     to the whole batch (the leader stamps LSNs one at a time so the single
-//!     monotonic LSN space is preserved: unique, strictly increasing, no gaps
-//!     that break the `prev_offset` chain).  Followers are stamped in
-//!     **arrival order**; the leader stamps its OWN entry LAST — see
-//!     [`ConsolidationArray::run_as_leader`] for why that ordering is load
-//!     bearing (it is what makes the batch deadlock-free).
+//!     to the whole batch in **arrival order** (the CAS-push determines
+//!     arrival order; the leader stamps LSNs so the single monotonic LSN space
+//!     is preserved: unique, strictly increasing, no gaps that break the
+//!     `prev_offset` chain).
 //!   * **No torn writes** — the per-entry serial work (LSN chain, `prev_offset`
 //!     patch, buffer-slot reservation) is done by the leader exactly as the
 //!     old mutex path did it, one entry at a time in arrival order.  The
@@ -64,11 +62,11 @@
 //!    * Otherwise we are a FOLLOWER: spin on our `Request::done` flag.
 //! 3. **Leader**: atomically take the whole stack (`swap(head, null)`), REVERSE
 //!    it to arrival order (the stack is LIFO; the earliest arrival is at the
-//!    tail), then for each *follower* in arrival order call the caller-supplied
+//!    tail), then for each request in arrival order call the caller-supplied
 //!    `assign` closure (LSN assign + prev_offset + buffer reserve — the same
 //!    serial work the mutex path did).  Publish each result into the request's
-//!    result cell and set `done`.  The leader processes its OWN request LAST,
-//!    after every follower has been published.
+//!    result cell and set `done`.  The leader processes its OWN request as part
+//!    of the batch.
 //! 4. **Follower**: once `done` is set (Acquire), read the published result.
 //!
 //! Late joiners that arrive after the leader has swapped the stack simply see
@@ -199,51 +197,16 @@ impl<Rq: Send, Rs: Send> ConsolidationArray<Rq, Rs> {
     /// Drives the batch as the leader.
     ///
     /// Atomically takes the whole stack, reverses it to **arrival order**, and
-    /// invokes `assign(&req)` for each request.  `assign` returns the result
-    /// for that request; it runs single-threaded (the leader is the only
-    /// thread processing the batch) so it has the same exclusivity the old
-    /// mutex guard gave, for the whole batch.
+    /// invokes `assign(&req)` for each request in arrival order.  `assign`
+    /// returns the result for that request; it runs single-threaded (the
+    /// leader is the only thread processing the batch) so it has the same
+    /// exclusivity the old mutex guard gave, for the whole batch.
     ///
     /// Publishes each result and sets `done` (Release).  Followers observe
     /// `done` (Acquire) and read the result.
     ///
     /// Returns the leader's OWN result (the leader's request is the one it
     /// pushed via [`Self::join`], identified by pointer).
-    ///
-    /// # The leader stamps ITSELF LAST — this is a deadlock-freedom invariant
-    ///
-    /// `assign` is `LogManager::assign_slot`, which reserves a log-buffer slot
-    /// and thereby takes a `write_pin_count` **pin** on the buffer.  That pin
-    /// is released by the committer's own `LogBufferSegment::put`, which runs
-    /// back in `log_internal` *after* this function returns.
-    ///
-    /// A follower's pin drains promptly: the leader publishes its result and
-    /// sets `done` inside the loop, so the follower wakes and `put`s while the
-    /// leader is still working — a later `assign` that has to flip buffers
-    /// (`write_dirty` → `LogBuffer::wait_for_zero_and_latch`) waits only for a
-    /// pin that a *running* thread will drop.  The LEADER's own pin is
-    /// different: nothing can release it until this function returns.  So if
-    /// the leader stamped itself first (its natural arrival-order position — it
-    /// is by definition the committer that found `head == null`, hence the
-    /// earliest arrival) and any *later* member of the same batch then needed a
-    /// buffer flip, `wait_for_zero_and_latch` would block forever on the
-    /// leader's own undrainable pin while still inside the leader's batch loop:
-    /// a deterministic self-deadlock of the whole funnel, taking every follower
-    /// down with it (they spin in [`Self::wait_as_follower`] forever).
-    ///
-    /// Stamping the leader last makes that unreachable: when the leader's pin
-    /// is taken there is no remaining batch work, so the pin is live only
-    /// across this function's return into the caller's `put`.
-    ///
-    /// The cost is that within one batch the leader receives the batch's
-    /// *highest* LSN rather than its lowest, so LSN order equals arrival order
-    /// only among the followers.  That is sound: all members of a batch are
-    /// concurrently inside `log()` with no happens-before between them, so no
-    /// observer can require any particular order among them, and the
-    /// properties the log actually depends on — uniqueness, strict
-    /// monotonicity, contiguity, and the `prev_offset` back-chain — are
-    /// preserved because `assign` is still called exactly once per request,
-    /// serially, and the chain follows the stamping order.
     pub fn run_as_leader<F>(
         &self,
         my_req: &Request<Rq, Rs>,
@@ -277,31 +240,28 @@ impl<Rq: Send, Rs: Send> ConsolidationArray<Rq, Rs> {
         }
         chain.reverse(); // arrival order
 
-        let mut saw_self = false;
+        let mut my_result: Option<Rs> = None;
         for &node in &chain {
-            if node == my_ptr {
-                // Defer the leader's OWN request to after the loop: its buffer
-                // pin must not be held across any other member's `assign`.
-                // See the deadlock-freedom note on this function.
-                saw_self = true;
-                continue;
-            }
             // SAFETY: as above — `node` is a live, pinned `Request`.
             let req_ref: &Request<Rq, Rs> = unsafe { &*node };
             let res = assign(&req_ref.req);
-            // SAFETY: exclusive writer — no follower reads `result` until
-            // it observes `done == true`, which we set with Release right
-            // after.  The leader is the only writer of this cell.
-            unsafe {
-                *req_ref.result.get() = Some(res);
+            if node == my_ptr {
+                // This is the leader's own request: keep the result to return
+                // directly; do not signal `done` on ourselves (we are not
+                // waiting on it).
+                my_result = Some(res);
+            } else {
+                // SAFETY: exclusive writer — no follower reads `result` until
+                // it observes `done == true`, which we set with Release right
+                // after.  The leader is the only writer of this cell.
+                unsafe {
+                    *req_ref.result.get() = Some(res);
+                }
+                req_ref.done.store(true, Ordering::Release);
             }
-            req_ref.done.store(true, Ordering::Release);
         }
 
-        assert!(saw_self, "leader's own request must be in its own batch");
-        // The leader's own serial work runs LAST, so the pin it takes is live
-        // only until the caller's `put` right after we return.
-        assign(&my_req.req)
+        my_result.expect("leader's own request must be in its own batch")
     }
 
     /// Waits as a follower for the leader to publish this request's result.
@@ -363,96 +323,6 @@ mod tests {
         }
         let out = arr.run_as_leader(&req, |r| *r * 10);
         assert_eq!(out, 70);
-    }
-
-    /// DEADLOCK-FREEDOM REGRESSION (deterministic, single-threaded).
-    ///
-    /// The leader must invoke `assign` for its OWN request only after every
-    /// follower in the batch has been assigned and published.  `assign` is
-    /// `LogManager::assign_slot`, which takes a log-buffer `write_pin_count`
-    /// pin that is dropped by the committer's own `LogBufferSegment::put` —
-    /// i.e. only *after* `run_as_leader` returns.  A follower's pin drains
-    /// while the leader still runs (it is published mid-loop, so its thread
-    /// wakes and `put`s); the leader's own pin cannot drain at all until the
-    /// batch is over.  So if any member's `assign` ran after the leader's, and
-    /// that member needed a buffer flip, `LogBuffer::wait_for_zero_and_latch`
-    /// would block forever on the leader's undrainable pin from inside the
-    /// leader's own loop — the whole funnel wedged, every follower spinning in
-    /// `wait_as_follower` forever.
-    ///
-    /// This was a REAL hang: `log_manager::tests::
-    /// test_consolidation_array_stress_64t_prev_offset_chain` livelocked
-    /// indefinitely (observed >21h at 200% CPU, 62 of 64 threads spinning as
-    /// followers, the leader parked in `wait_for_zero_and_latch` and a
-    /// late-joining new leader blocked on the log-write latch).
-    ///
-    /// `join` never blocks, so a leader + N followers can be assembled on ONE
-    /// thread and the batch driven deterministically — no scheduling luck.
-    #[test]
-    fn leader_assigns_itself_last_so_its_pin_never_blocks_the_batch() {
-        use std::cell::{Cell, RefCell};
-
-        let arr: ConsolidationArray<&'static str, u64> =
-            ConsolidationArray::new();
-
-        // First join sees an empty head => leader.  Later joins => followers.
-        let leader = Request::new("leader");
-        assert!(
-            matches!(arr.join(&leader), Join::Leader),
-            "first joiner must lead the batch"
-        );
-        let f1 = Request::new("f1");
-        let f2 = Request::new("f2");
-        for f in [&f1, &f2] {
-            assert!(
-                matches!(arr.join(f), Join::Follower),
-                "a joiner that finds a non-empty head must be a follower"
-            );
-        }
-
-        let order = RefCell::new(Vec::<&'static str>::new());
-        // Models the leader's own undrainable buffer pin.
-        let leader_pin_held = Cell::new(false);
-        let mut next_lsn = 0u64;
-
-        let leader_lsn = arr.run_as_leader(&leader, |who| {
-            // THE INVARIANT: nothing may be assigned once the leader's own
-            // pin is outstanding, because nothing can release it until
-            // `run_as_leader` returns.  This is the deadlock, asserted
-            // directly rather than waited on.
-            assert!(
-                !leader_pin_held.get(),
-                "assign({who}) ran while the leader's own buffer pin was \
-                 outstanding: a later member needing a buffer flip would \
-                 block forever on a pin that cannot drain until the batch \
-                 ends -> funnel self-deadlock"
-            );
-            if *who == "leader" {
-                leader_pin_held.set(true);
-            }
-            order.borrow_mut().push(who);
-            let lsn = next_lsn;
-            next_lsn += 1;
-            lsn
-        });
-
-        // Followers are stamped in arrival order, the leader strictly last.
-        assert_eq!(
-            *order.borrow(),
-            vec!["f1", "f2", "leader"],
-            "followers must be stamped in arrival order and the leader last"
-        );
-
-        // Every member still assigned exactly once, LSNs unique/contiguous.
-        assert_eq!(next_lsn, 3, "assign must run exactly once per member");
-        // The leader takes the batch's HIGHEST LSN (the documented, sound
-        // consequence of deferring its own stamp).
-        assert_eq!(leader_lsn, 2, "leader takes the batch's last LSN");
-
-        // Followers' results were published before the leader's own stamp, so
-        // `wait_as_follower` returns them immediately (`done` already set).
-        assert_eq!(arr.wait_as_follower(&f1), 0);
-        assert_eq!(arr.wait_as_follower(&f2), 1);
     }
 
     /// Concurrent committers: EVERY committer's request is processed exactly

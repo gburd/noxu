@@ -114,13 +114,7 @@ fn consolidation_lsn_monotonic_no_loss() {
                         let assigned = match arr.join(&req) {
                             Join::Leader => {
                                 // Leader holds the LWL for the whole batch and
-                                // stamps LSNs serially: followers in arrival
-                                // order, then ITSELF last (a deadlock-freedom
-                                // requirement — see `run_as_leader`).  The
-                                // oracle below is order-agnostic (it checks
-                                // uniqueness / contiguity / prev-chain, not
-                                // which committer got which LSN), so it holds
-                                // either way.  The `assign` closure
+                                // stamps LSNs in arrival order.  The `assign`
                                 // closure mutates the LSN state through the
                                 // guard captured here (shuttle's Mutex is not
                                 // reentrant, so we lock ONCE and mutate the
