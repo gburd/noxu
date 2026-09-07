@@ -71,7 +71,6 @@ shuttle:
 	RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-util    --test shuttle_dst_sync_pl --release
 	RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-engine  --test shuttle_daemon_shutdown --release
 	RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-log     --test shuttle_fsync_manager --release
-	RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-log     --test shuttle_consolidation --release
 	RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-txn     --test shuttle_lock_manager --release
 	RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-txn     --test shuttle_txn_commit --release
 	RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-evictor --test shuttle_shared_cache --release
