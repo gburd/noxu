@@ -124,6 +124,21 @@ pub enum SyncupAction {
     /// from `start_vlsn` (`matchpoint + 1`). `matchpoint_vlsn == last VLSN`
     /// means the replica was not diverged and nothing was truncated.
     RolledBack { matchpoint_vlsn: u64, start_vlsn: u64 },
+    /// A valid matchpoint was found and the replica IS diverged past it, but
+    /// the divergent tail cannot be discarded safely by this build, so nothing
+    /// was truncated and the syncup is REFUSED.
+    ///
+    /// This is the deliberately conservative middle case between
+    /// [`Self::RolledBack`] and [`Self::NeedsRestore`]: rather than truncate a
+    /// tail whose effects may already be visible in the live in-memory B-tree
+    /// (this build omits JE `Replay.rollback` step 2, the in-memory `TxnChain`
+    /// revert), the divergence is DETECTED and reported. `reason` names the
+    /// offending tail entry; the remedy is a network restore. See
+    /// [`crate::stream::syncup::classify_tail`].
+    ///
+    /// Truncating a replica's log is irreversible, so a refusal is always
+    /// preferred over a possibly-unsafe truncation.
+    DivergedRefused { matchpoint_vlsn: u64, tail_len: usize, reason: String },
     /// No safe rollback (no common matchpoint, or it would cross a committed
     /// txn); the replica must do a full network restore.
     NeedsRestore,
@@ -201,6 +216,11 @@ pub struct ReplicatedEnvironment {
     /// When `config.env_home` is `None` at construction time, registration is
     /// deferred until `with_environment()` provides the env home path.
     restore_registered: AtomicBool,
+    /// Whether the SYNCUP service (REP-1 STEP 5 matchpoint negotiation) has
+    /// been registered on the dispatcher. Registered eagerly when `env_home`
+    /// is in the config, else lazily by `with_environment`; tracked separately
+    /// from `restore_registered` so neither path can shadow the other.
+    syncup_registered: AtomicBool,
 
     /// In-memory log queue used by the peer feeder service.
     ///
@@ -419,6 +439,7 @@ impl ReplicatedEnvironment {
         let listen_addr_str =
             format!("{}:{}", config.node_host, config.node_port);
         let mut restore_registered_init = false;
+        let mut syncup_registered_init = false;
 
         // Returns (AnyServiceDispatcher, bound_addr) or (None, None) on error.
         let (tcp_dispatcher, bound_addr) = match listen_addr_str
@@ -444,6 +465,20 @@ impl ReplicatedEnvironment {
                                 home.display(),
                             );
                             restore_registered_init = true;
+
+                            // REP-1 STEP 5: the SYNCUP service, registered
+                            // wherever RESTORE is. A replica that is
+                            // (re)joining connects here to negotiate a
+                            // matchpoint against this node's log before
+                            // streaming, so a diverged tail is detected
+                            // instead of being streamed over.
+                            dispatcher.register(
+                                crate::stream::SYNCUP_SERVICE_NAME,
+                                Arc::new(crate::stream::SyncupService::new(
+                                    home.clone(),
+                                )),
+                            );
+                            syncup_registered_init = true;
                         }
                         let kind =
                             if dispatcher.is_tls() { "TLS" } else { "TCP" };
@@ -530,6 +565,7 @@ impl ReplicatedEnvironment {
             io_threads: StdMutex::new(Vec::new()),
             io_shutdown: Arc::new(AtomicBool::new(false)),
             restore_registered: AtomicBool::new(restore_registered_init),
+            syncup_registered: AtomicBool::new(syncup_registered_init),
             peer_scanner,
             dtvlsn: std::sync::atomic::AtomicU64::new(0),
             election_state,
@@ -1228,6 +1264,29 @@ impl ReplicatedEnvironment {
             );
         }
 
+        // REP-1 STEP 5: register the SYNCUP service (independently of RESTORE
+        // — when `env_home` is in the config, RESTORE is already registered
+        // eagerly at construction). A replica that is (re)joining this node
+        // connects here to negotiate a matchpoint against this node's log
+        // BEFORE streaming starts, so a diverged replica is detected (and
+        // rolled back or refused) instead of streaming the master's history on
+        // top of its own divergent tail. Port of JE `FeederReplicaSyncup`.
+        if !self.syncup_registered.load(Ordering::SeqCst)
+            && let Some(ref dispatcher) = self.tcp_dispatcher
+        {
+            dispatcher.register(
+                crate::stream::SYNCUP_SERVICE_NAME,
+                Arc::new(crate::stream::SyncupService::new(
+                    env.get_env_home().to_path_buf(),
+                )),
+            );
+            self.syncup_registered.store(true, Ordering::SeqCst);
+            log::debug!(
+                "Node '{}' SYNCUP service registered",
+                self.config.node_name,
+            );
+        }
+
         // X-14: rebuild the VLSN index from recovery-replayed LN entries.
         // After a crash the on-disk vlsn.idx may be stale (either ahead of
         // the recovered B-tree, or behind if vlsn.idx was not flushed
@@ -1698,6 +1757,10 @@ impl ReplicatedEnvironment {
     ///   the matchpoint; resume streaming from `start_vlsn`. The non-diverged
     ///   case (matchpoint == last VLSN) returns `RolledBack` with an empty
     ///   tail and is a no-op rollback.
+    /// - [`SyncupAction::DivergedRefused`] — a matchpoint exists and the
+    ///   replica IS diverged past it, but the divergent tail cannot be
+    ///   discarded safely (see [`crate::stream::syncup::classify_tail`]);
+    ///   NOTHING was truncated and the caller must network-restore.
     /// - [`SyncupAction::NeedsRestore`] — `verify_rollback` selected
     ///   NetworkRestore (no common matchpoint) or HardRecovery (the rollback
     ///   would cross a committed/aborted txn); the caller must network-restore
@@ -1774,11 +1837,52 @@ impl ReplicatedEnvironment {
                     Matchpoint::Found { lsn, .. } => *lsn,
                     Matchpoint::None => 0,
                 };
+                let mp = matchpoint_vlsn.sequence().max(0) as u64;
+
+                // SAFETY GATE (the conservative half of this feature): a
+                // verified matchpoint says the tail is not in the cluster's
+                // accepted history, but it does NOT say the tail can be
+                // discarded from THIS replica without further work. This build
+                // performs JE `Replay.rollback` steps 1 and 3-5 (RollbackStart,
+                // make-invisible, fsync, RollbackEnd) but NOT step 2 (the
+                // in-memory `TxnChain` revert), so only a tail that was never
+                // applied to the live tree may be dropped. Anything else is
+                // REFUSED, not truncated — log truncation is irreversible,
+                // while a refusal leaves the operator (or the automatic
+                // NeedsRestore path) a network restore.
+                let tail_types: Vec<(
+                    noxu_util::Vlsn,
+                    Option<noxu_log::LogEntryType>,
+                )> = match &log_view {
+                    Some(v) => v.tail_types(matchpoint_vlsn),
+                    // VLSN-index-only model (no log re-read): the index records
+                    // per-VLSN types only via the range summary, so the exact
+                    // tail types are unknown. Fall through with an empty tail
+                    // (the index truncation below is the whole rollback in that
+                    // model — there is no live tree to diverge from).
+                    None => Vec::new(),
+                };
+                let tail_len = tail_types.len();
+                if let crate::stream::syncup::TailSafety::Refuse { reason } =
+                    crate::stream::syncup::classify_tail(tail_types)
+                {
+                    log::error!(
+                        "Node '{}': REFUSING syncup rollback to matchpoint \
+                         vlsn={mp}: {reason} ({tail_len} diverged tail \
+                         entries left INTACT; no log truncation performed)",
+                        self.config.node_name,
+                    );
+                    return Ok(SyncupAction::DivergedRefused {
+                        matchpoint_vlsn: mp,
+                        tail_len,
+                        reason,
+                    });
+                }
+
                 // Collect the rolled-back LSNs (VLSNs strictly above the
                 // matchpoint). When the real log was re-read, use its EXACT
                 // per-VLSN LSNs so make-invisible flips the right header bytes
                 // (the sparse VLSN index only stores boundary/last LSNs).
-                let mp = matchpoint_vlsn.sequence().max(0) as u64;
                 let rollback_lsns: Vec<noxu_util::Lsn> = match &log_view {
                     Some(v) => v
                         .entries()
@@ -1806,6 +1910,59 @@ impl ReplicatedEnvironment {
                 Ok(SyncupAction::NeedsRestore)
             }
         }
+    }
+
+    /// REP-1 STEP 5 (E): run the LIVE syncup handshake against `feeder_addr`
+    /// over the wire and reconcile this replica's tail before streaming.
+    ///
+    /// This is the production entry point that closes the diverged-tail gap:
+    /// [`Self::syncup_with_feeder`] is the same decision + rollback core, but
+    /// with the feeder's half of the record comparison answered over a
+    /// [`crate::stream::RemoteFeederView`] instead of a local log scan. Port of
+    /// JE `ReplicaFeederSyncup.execute`, which a replica runs on the
+    /// replication channel BEFORE the `Replica` replay loop starts.
+    ///
+    /// Returns the [`SyncupAction`] taken:
+    /// - [`SyncupAction::RolledBack`] — not diverged (empty tail) or the
+    ///   divergent tail was durably rolled back; stream from `start_vlsn`.
+    /// - [`SyncupAction::DivergedRefused`] — diverged past a valid matchpoint
+    ///   but the tail cannot be discarded safely; NOTHING was truncated and the
+    ///   caller must network-restore.
+    /// - [`SyncupAction::NeedsRestore`] — no usable matchpoint.
+    ///
+    /// A feeder that does not offer the syncup service (an older peer) yields a
+    /// connection error, which the caller treats as "skip syncup" to preserve
+    /// the pre-existing streaming behaviour rather than refusing to replicate.
+    pub fn syncup_with_feeder_at(
+        &self,
+        feeder_addr: SocketAddr,
+    ) -> Result<SyncupAction> {
+        use crate::net::service_dispatcher::connect_to_service;
+
+        let channel = connect_to_service(
+            feeder_addr,
+            crate::stream::SYNCUP_SERVICE_NAME,
+        )?;
+        let remote = crate::stream::RemoteFeederView::new(&channel);
+
+        let action = self.syncup_with_feeder(&remote);
+
+        // Release the feeder's handshake loop either way (JE sends StartStream
+        // on convergence, RestoreRequest otherwise). Best-effort: the decision
+        // is already made locally, and a send failure here only means the
+        // feeder's per-connection thread ends on a closed channel.
+        match &action {
+            Ok(SyncupAction::RolledBack { start_vlsn, .. }) => {
+                let _ = remote.send_start_stream(noxu_util::Vlsn::new(
+                    *start_vlsn as i64,
+                ));
+            }
+            _ => {
+                let _ = remote.send_restore_request(noxu_util::NULL_VLSN);
+            }
+        }
+        let _ = crate::net::Channel::close(&channel);
+        action
     }
 
     /// Execute the durable + in-memory rollback to `matchpoint_vlsn`
@@ -2463,6 +2620,10 @@ impl ReplicatedEnvironment {
                 // and we fall back to operator-driven bootstrap.
                 let self_weak: Option<Weak<Self>> =
                     self.self_weak.get().cloned();
+                // REP-1 STEP 5: whether to run the wire syncup handshake
+                // before streaming. Captured for the replica thread, which
+                // performs the handshake once the master address is resolved.
+                let syncup_self_weak = self_weak.clone();
 
                 // REP-7 (B): clone the live EnvironmentImpl into the replica
                 // thread so the writer can drive a ReplicaReplay that applies
@@ -2507,6 +2668,79 @@ impl ReplicatedEnvironment {
                             );
                             return;
                         };
+
+                        // ---------------------------------------------------
+                        // REP-1 STEP 5: LIVE SYNCUP before the first stream.
+                        //
+                        // Negotiate a matchpoint against the master's log and
+                        // reconcile this replica's tail FIRST. Without this a
+                        // replica whose log diverged past the matchpoint (an
+                        // old master, or a partitioned node that kept accepting
+                        // writes) would stream the master's history on top of
+                        // its own divergent records and stay silently diverged
+                        // from the cluster's accepted history.
+                        //
+                        // JE runs `ReplicaFeederSyncup.execute` on the
+                        // replication channel before the replay loop starts.
+                        //
+                        // A master that does not answer the syncup service (an
+                        // older peer, or one with no env wired) is not fatal:
+                        // log and fall through to streaming, which is the
+                        // pre-STEP-5 behaviour.
+                        if let Some(env_arc) =
+                            syncup_self_weak.as_ref().and_then(Weak::upgrade)
+                        {
+                            match env_arc.syncup_with_feeder_at(addr) {
+                                Ok(SyncupAction::RolledBack {
+                                    matchpoint_vlsn,
+                                    start_vlsn,
+                                }) => {
+                                    log::info!(
+                                        "noxu-replica-{}: syncup with '{}' \
+                                         agreed matchpoint vlsn={}; streaming \
+                                         from {}",
+                                        node_name, master, matchpoint_vlsn,
+                                        start_vlsn,
+                                    );
+                                }
+                                Ok(SyncupAction::DivergedRefused {
+                                    matchpoint_vlsn,
+                                    tail_len,
+                                    reason,
+                                }) => {
+                                    // DETECTED divergence that cannot be
+                                    // truncated safely. Do NOT stream: doing so
+                                    // would layer the master's history over the
+                                    // divergent tail. Stop and leave the node
+                                    // for a network restore / operator action.
+                                    log::error!(
+                                        "noxu-replica-{}: DIVERGED from master \
+                                         '{}' past matchpoint vlsn={} \
+                                         ({tail_len} tail entries); \
+                                         replication NOT started. {reason}",
+                                        node_name, master, matchpoint_vlsn,
+                                    );
+                                    return;
+                                }
+                                Ok(SyncupAction::NeedsRestore) => {
+                                    log::warn!(
+                                        "noxu-replica-{}: syncup with '{}' \
+                                         found no usable matchpoint; a network \
+                                         restore is required",
+                                        node_name, master,
+                                    );
+                                    return;
+                                }
+                                Err(e) => {
+                                    log::info!(
+                                        "noxu-replica-{}: syncup with '{}' \
+                                         unavailable ({e}); streaming without \
+                                         matchpoint negotiation",
+                                        node_name, master,
+                                    );
+                                }
+                            }
+                        }
 
                         // Catch-up loop: catch up, observe NeedsRestore,
                         // optionally auto-bootstrap, retry once.  We cap

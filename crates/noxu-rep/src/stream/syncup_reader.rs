@@ -55,6 +55,14 @@ pub struct SyncupLogView {
     /// because [`VlsnEntry`]'s public shape (fixed by the decision core)
     /// carries only the sync-flag, not the narrower txn-end flag.
     txn_end_vlsns: std::collections::BTreeSet<i64>,
+    /// VLSN → raw log entry type byte, for every VLSN in the scan.
+    ///
+    /// Feeds [`crate::stream::syncup::classify_tail`], the safety gate that
+    /// decides whether a diverged tail may be discarded: the decision turns on
+    /// the exact entry TYPE of each tail entry (a provisional transactional LN
+    /// was never applied to the live tree; a non-transactional LN was). Kept
+    /// out of [`VlsnEntry`] for the same reason as `txn_end_vlsns`.
+    entry_types: BTreeMap<i64, u8>,
     /// Highest sync-point VLSN seen (JE `VLSNRange.getLastSync`).
     last_sync: Vlsn,
     /// Highest commit/abort VLSN seen (JE `VLSNRange.getLastTxnEnd`).
@@ -82,6 +90,7 @@ impl SyncupLogView {
     /// syncup driver, which already holds one, and by tests).
     pub fn scan_with_manager(fm: &FileManager) -> Self {
         let mut entries: BTreeMap<i64, VlsnEntry> = BTreeMap::new();
+        let mut entry_types: BTreeMap<i64, u8> = BTreeMap::new();
         let mut txn_end_vlsns: std::collections::BTreeSet<i64> =
             std::collections::BTreeSet::new();
         let mut last_sync = NULL_VLSN;
@@ -136,6 +145,7 @@ impl SyncupLogView {
                             vlsn as i64,
                             VlsnEntry { lsn, fingerprint, is_sync },
                         );
+                        entry_types.insert(vlsn as i64, type_byte);
                         let v = Vlsn::new(vlsn as i64);
                         if is_sync && v > last_sync {
                             last_sync = v;
@@ -154,7 +164,35 @@ impl SyncupLogView {
         let first =
             entries.keys().next().map(|&v| Vlsn::new(v)).unwrap_or(NULL_VLSN);
 
-        Self { entries, txn_end_vlsns, last_sync, last_txn_end, first }
+        Self {
+            entries,
+            txn_end_vlsns,
+            entry_types,
+            last_sync,
+            last_txn_end,
+            first,
+        }
+    }
+
+    /// The log entry type of every VLSN strictly above `matchpoint`, in
+    /// ascending VLSN order — the input to
+    /// [`crate::stream::syncup::classify_tail`].
+    ///
+    /// An entry whose type byte does not decode to a known
+    /// [`noxu_log::LogEntryType`] is reported as `None`; the gate treats an
+    /// undecodable tail entry as unsafe (it cannot prove the entry was never
+    /// applied to the tree).
+    pub fn tail_types(
+        &self,
+        matchpoint: Vlsn,
+    ) -> Vec<(Vlsn, Option<noxu_log::LogEntryType>)> {
+        let floor = matchpoint.sequence();
+        self.entry_types
+            .range((floor + 1)..)
+            .map(|(&v, &ty)| {
+                (Vlsn::new(v), noxu_log::LogEntryType::from_type_num(ty))
+            })
+            .collect()
     }
 
     /// Count the commit/abort records strictly above `matchpoint` (JE
@@ -363,12 +401,54 @@ mod tests {
         let view = SyncupLogView {
             entries,
             txn_end_vlsns,
+            entry_types: BTreeMap::new(),
             last_sync: Vlsn::new(5),
             last_txn_end: Vlsn::new(5),
             first: Vlsn::new(1),
         };
         assert_eq!(view.num_passed_commits(Vlsn::new(3)), 2);
         assert_eq!(view.num_passed_commits(Vlsn::new(5)), 0);
+    }
+
+    /// `tail_types` reports the entry type of every VLSN STRICTLY above the
+    /// matchpoint, ascending — the exact input the safety gate
+    /// (`classify_tail`) needs. Undecodable type bytes surface as `None` so the
+    /// gate can refuse them.
+    #[test]
+    fn test_tail_types_reports_entries_above_matchpoint() {
+        use noxu_log::LogEntryType as T;
+
+        let mut entry_types = BTreeMap::new();
+        entry_types.insert(4, T::TxnCommit as u8);
+        entry_types.insert(5, T::InsertLNTxn as u8);
+        entry_types.insert(6, T::InsertLN as u8);
+        entry_types.insert(7, 0xFE); // not a known LogEntryType
+        let view = SyncupLogView {
+            entries: BTreeMap::new(),
+            txn_end_vlsns: std::collections::BTreeSet::new(),
+            entry_types,
+            last_sync: Vlsn::new(7),
+            last_txn_end: Vlsn::new(4),
+            first: Vlsn::new(1),
+        };
+
+        assert_eq!(
+            view.tail_types(Vlsn::new(4)),
+            vec![
+                (Vlsn::new(5), Some(T::InsertLNTxn)),
+                (Vlsn::new(6), Some(T::InsertLN)),
+                (Vlsn::new(7), None),
+            ],
+            "matchpoint 4 is EXCLUDED; the tail is 5,6,7 ascending"
+        );
+        // A tail that stops at the last VLSN is empty (not diverged).
+        assert!(view.tail_types(Vlsn::new(7)).is_empty());
+
+        // And the gate refuses this tail (VLSN 6 is a non-txn LN).
+        assert!(matches!(
+            crate::stream::syncup::classify_tail(view.tail_types(Vlsn::new(4))),
+            crate::stream::syncup::TailSafety::Refuse { .. }
+        ));
     }
 
     /// The reader's per-VLSN data feeds find_matchpoint: a replica view whose

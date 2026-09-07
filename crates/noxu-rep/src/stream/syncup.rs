@@ -30,6 +30,19 @@ use noxu_util::{NULL_VLSN, Vlsn};
 ///
 /// JE compares full `OutputWireRecord.match(InputWireRecord)`; here the
 /// fingerprint stands in for that record equality.
+///
+/// ## The LSN is NODE-LOCAL and is NOT part of record equality
+///
+/// `lsn` is where *this* node happens to store the record. Two nodes that hold
+/// the identical replicated record will generally store it at DIFFERENT LSNs
+/// (their logs have different histories, file boundaries, and interleaved
+/// local entries). JE's record equality is
+/// `OutputWireRecord.match(InputWireRecord)` =
+/// `header.logicalEqualsIgnoreVersion(other.header) &&
+///  entry.logicalEquals(other.getLogEntry())` — a comparison of the log
+/// *header* and the decoded *entry contents*. It never compares LSNs.
+/// [`find_matchpoint`] therefore compares only `fingerprint`; each side's
+/// `lsn` is used solely as that side's own rollback/streaming target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VlsnEntry {
     /// LSN where this VLSN's log entry resides.
@@ -111,9 +124,15 @@ pub fn find_matchpoint(
         };
 
         // Ask the feeder for the same VLSN and compare records.
+        //
+        // RECORD equality only (JE OutputWireRecord.match): the fingerprint
+        // covers the entry type + payload contents. The two nodes' LSNs are
+        // node-local and routinely differ for the same replicated record, so
+        // comparing them would make every genuine cross-node matchpoint search
+        // dead-end in a (needless) network restore. See the note on
+        // [`VlsnEntry`].
         if let Some(feeder_entry) = feeder.entry(candidate)
             && feeder_entry.fingerprint == replica_entry.fingerprint
-            && feeder_entry.lsn == replica_entry.lsn
         {
             return Matchpoint::Found {
                 vlsn: candidate,
@@ -222,6 +241,134 @@ fn rollback_to(matchpoint_vlsn: Vlsn) -> RollbackDecision {
         matchpoint_vlsn,
         start_vlsn: matchpoint_vlsn.next(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Tail safety gate: may this diverged tail be discarded?
+// ---------------------------------------------------------------------------
+
+/// Whether the diverged tail above a verified matchpoint may be discarded by
+/// the rollback this crate implements.
+///
+/// See [`classify_tail`] for the invariant and why the unsafe case REFUSES
+/// rather than truncating.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TailSafety {
+    /// Every tail entry is a provisional (transactional) LN whose commit never
+    /// arrived, so no tail entry was ever applied to the live tree. Discarding
+    /// the tail from the log + VLSN index is sufficient and complete.
+    SafeToDiscard,
+    /// At least one tail entry's effects are already visible in the live
+    /// in-memory B-tree (or is a structural entry the log-only rollback cannot
+    /// account for). Truncating the log without reverting the tree would leave
+    /// the tree holding a record the cluster never accepted, so the rollback is
+    /// REFUSED. `reason` names the offending entry for the operator.
+    Refuse { reason: String },
+}
+
+/// Decide whether the diverged tail described by `tail_types` (the log entry
+/// type of every VLSN strictly above the verified matchpoint, in VLSN order)
+/// may be discarded.
+///
+/// ## Why this gate exists
+///
+/// JE `Replay.rollback` has five steps, and step 2 is "do the rollback in
+/// memory": `ReplayTxn.rollback` walks each active txn's `TxnChain` and
+/// REVERTS every in-window LN in the live tree to its previous version before
+/// the log entries are made invisible. Noxu implements steps 1 and 3-5
+/// (`noxu_recovery::rollback`: RollbackStart, make-invisible, fsync,
+/// RollbackEnd) but NOT step 2 — there is no `TxnChain` revert wired into the
+/// live replica path, as `noxu_recovery::replay`'s own module comment records
+/// ("the in-memory tree revert is the caller's responsibility").
+///
+/// That is safe for exactly one class of tail entry. Noxu's replica apply path
+/// (`noxu_dbi::ReplicaReplay::apply_entry`, port of `Replay.replayEntry`)
+/// BUFFERS a transactional LN in `active_txns` and only drains it into the tree
+/// when the matching `TxnCommit` streams in. A transactional LN above the
+/// matchpoint therefore has, by construction, no committed `TxnCommit` above the
+/// matchpoint either (`verify_rollback` routes any passed commit to
+/// `HardRecovery`), so it was never applied to the tree: dropping the log entry
+/// and the buffered op is a COMPLETE rollback with no tree work to do.
+///
+/// Every other tail entry breaks that argument:
+/// - a NON-transactional LN (`InsertLN`/`UpdateLN`/`DeleteLN`) is applied to
+///   the live tree immediately (`ReplicaReplay::apply_ln`), and nothing reverts
+///   it — making the log entry invisible would leave the tree holding a record
+///   the cluster never accepted (silent divergence, the exact bug this feature
+///   exists to prevent);
+/// - a structural entry (IN/BIN-delta, checkpoint marker) may be referenced by
+///   a still-live parent, which is the hazard JE documents in
+///   `ReplicaFeederSyncup.verifyRollback` ("the BIN at 5/500 is truncated. The
+///   BIN at 4/100 will be used, which refers to an LN in a truncated file")
+///   and which JE itself resolves conservatively ("we could use this
+///   information to validate a matchpoint" — left as future work there too);
+/// - a `TxnCommit`/`TxnAbort` should already have been routed to
+///   `HardRecovery`; seeing one here means the caller bypassed
+///   `verify_rollback`, so refuse rather than assume.
+///
+/// A detected-and-refused divergence is recoverable (the operator, or the
+/// automatic `NeedsRestore` path, network-restores the replica). An unsafe
+/// truncation is not. This function is the conservative half of that trade.
+pub fn classify_tail(
+    tail_types: impl IntoIterator<Item = (Vlsn, Option<noxu_log::LogEntryType>)>,
+) -> TailSafety {
+    for (vlsn, ty) in tail_types {
+        // An entry whose type byte did not decode cannot be proven
+        // never-applied, so it is not discardable.
+        let Some(ty) = ty else {
+            return TailSafety::Refuse {
+                reason: format!(
+                    "diverged tail entry at VLSN {} has an unrecognised log \
+                     entry type: cannot prove it was never applied to the \
+                     live B-tree. A network restore is required.",
+                    vlsn.sequence()
+                ),
+            };
+        };
+        // Txn ends must have been routed to HardRecovery by verify_rollback.
+        if matches!(
+            ty,
+            noxu_log::LogEntryType::TxnCommit
+                | noxu_log::LogEntryType::TxnAbort
+        ) {
+            return TailSafety::Refuse {
+                reason: format!(
+                    "diverged tail contains a transaction end ({ty:?}) at \
+                     VLSN {}: rolling back past an acknowledged commit/abort \
+                     requires hard recovery or a network restore",
+                    vlsn.sequence()
+                ),
+            };
+        }
+        // Provisional (transactional) LN: buffered by ReplicaReplay, never
+        // applied to the tree without its commit. Safe to drop.
+        if ty.is_ln_type() && ty.is_transactional() {
+            continue;
+        }
+        if ty.is_ln_type() {
+            return TailSafety::Refuse {
+                reason: format!(
+                    "diverged tail contains a NON-transactional LN ({ty:?}) \
+                     at VLSN {}: its effects are already visible in this \
+                     replica's live B-tree and this build has no in-memory \
+                     TxnChain revert (JE Replay.rollback step 2), so \
+                     discarding the log entry alone would leave the tree \
+                     diverged. A network restore is required.",
+                    vlsn.sequence()
+                ),
+            };
+        }
+        return TailSafety::Refuse {
+            reason: format!(
+                "diverged tail contains a structural/other entry ({ty:?}) at \
+                 VLSN {}: it may be referenced by a live parent IN, so \
+                 discarding it is not provably safe. A network restore is \
+                 required.",
+                vlsn.sequence()
+            ),
+        };
+    }
+    TailSafety::SafeToDiscard
 }
 
 #[cfg(test)]
@@ -382,5 +529,149 @@ mod tests {
         let d =
             verify_rollback(&Matchpoint::None, Vlsn::new(5), Vlsn::new(5), 0);
         assert_eq!(d, RollbackDecision::NetworkRestore);
+    }
+
+    // ── record equality is CONTENT-based, never LSN-based ───────────────
+
+    /// The same replicated record lives at DIFFERENT LSNs on two nodes (their
+    /// logs have different histories). JE `OutputWireRecord.match` compares the
+    /// header + decoded entry, never the LSN, so the matchpoint search must
+    /// still find VLSN 5 here. Before this was fixed, `find_matchpoint`
+    /// required `feeder.lsn == replica.lsn` and every genuine cross-node
+    /// search dead-ended in a needless network restore.
+    #[test]
+    fn test_matchpoint_found_despite_differing_node_local_lsns() {
+        let replica = MapView::new(1, 5, 5)
+            .put(5, 0x0500, 0xAA, true) // replica stores it at 0x500
+            .put(4, 0x0400, 0xBB, true);
+        let feeder = MapView::new(1, 7, 7)
+            .put(5, 0x9500, 0xAA, true) // feeder stores it at 0x9500
+            .put(4, 0x9400, 0xBB, true);
+
+        assert_eq!(
+            find_matchpoint(&replica, &feeder),
+            // The returned LSN is the REPLICA's own — it is the replica that
+            // rolls back, so the rollback target must be its local LSN.
+            Matchpoint::Found { vlsn: Vlsn::new(5), lsn: 0x0500 },
+            "record equality is content-based; node-local LSNs differ"
+        );
+    }
+
+    /// Same LSN, DIFFERENT contents is still a mismatch: the fingerprint is
+    /// what decides, so a coincidental LSN collision must not be accepted as a
+    /// matchpoint.
+    #[test]
+    fn test_same_lsn_different_content_is_not_a_matchpoint() {
+        let replica = MapView::new(1, 5, 5).put(5, 0x500, 0xAA, true);
+        let feeder = MapView::new(1, 5, 5).put(5, 0x500, 0xBB, true);
+        assert_eq!(find_matchpoint(&replica, &feeder), Matchpoint::None);
+    }
+
+    // ── classify_tail: the safety gate ─────────────────────────────────
+
+    use noxu_log::LogEntryType as T;
+
+    /// Wrap bare entry types as the `Option`s `classify_tail` consumes (it
+    /// takes `Option` so an undecodable type byte can be reported as unsafe).
+    fn tail(
+        types: impl IntoIterator<Item = (Vlsn, T)>,
+    ) -> Vec<(Vlsn, Option<T>)> {
+        types.into_iter().map(|(v, t)| (v, Some(t))).collect()
+    }
+
+    /// An empty tail (matchpoint == last VLSN, the not-actually-diverged case)
+    /// is trivially safe.
+    #[test]
+    fn test_classify_tail_empty_is_safe() {
+        assert_eq!(
+            classify_tail(std::iter::empty()),
+            TailSafety::SafeToDiscard
+        );
+    }
+
+    /// A tail of purely PROVISIONAL (transactional) LNs was buffered by
+    /// `ReplicaReplay` and never applied to the tree — safe to discard.
+    #[test]
+    fn test_classify_tail_provisional_lns_are_safe() {
+        let tail = tail([
+            (Vlsn::new(6), T::InsertLNTxn),
+            (Vlsn::new(7), T::UpdateLNTxn),
+            (Vlsn::new(8), T::DeleteLNTxn),
+        ]);
+        assert_eq!(classify_tail(tail), TailSafety::SafeToDiscard);
+    }
+
+    /// An undecodable entry type cannot be proven never-applied → refuse.
+    #[test]
+    fn test_classify_tail_unknown_type_is_refused() {
+        match classify_tail(vec![(Vlsn::new(6), None)]) {
+            TailSafety::Refuse { reason } => {
+                assert!(reason.contains("unrecognised"), "reason: {reason}")
+            }
+            other => panic!("expected Refuse, got {other:?}"),
+        }
+    }
+
+    /// A NON-transactional LN in the tail was applied straight to the live
+    /// tree, and this build has no in-memory revert (JE Replay.rollback step
+    /// 2), so the rollback must be REFUSED rather than silently corrupt the
+    /// tree. This is the headline safety property of the gate.
+    #[test]
+    fn test_classify_tail_non_txn_ln_is_refused() {
+        let tail =
+            tail([(Vlsn::new(6), T::InsertLNTxn), (Vlsn::new(7), T::InsertLN)]);
+        match classify_tail(tail) {
+            TailSafety::Refuse { reason } => {
+                assert!(
+                    reason.contains("NON-transactional"),
+                    "reason must name the hazard: {reason}"
+                );
+                assert!(
+                    reason.contains("network restore"),
+                    "reason must tell the operator the remedy: {reason}"
+                );
+            }
+            other => panic!("expected Refuse, got {other:?}"),
+        }
+    }
+
+    /// A structural entry (IN) in the tail may be referenced by a live parent
+    /// (the hazard JE documents in `verifyRollback`) → refuse.
+    #[test]
+    fn test_classify_tail_structural_entry_is_refused() {
+        let tail = tail([(Vlsn::new(6), T::IN)]);
+        assert!(matches!(classify_tail(tail), TailSafety::Refuse { .. }));
+    }
+
+    /// A txn end in the tail should have been routed to `HardRecovery` by
+    /// `verify_rollback`; if it reaches the gate, refuse rather than assume.
+    #[test]
+    fn test_classify_tail_txn_end_is_refused() {
+        for ty in [T::TxnCommit, T::TxnAbort] {
+            match classify_tail(tail([(Vlsn::new(6), ty)])) {
+                TailSafety::Refuse { reason } => assert!(
+                    reason.contains("transaction end"),
+                    "reason must name the txn end: {reason}"
+                ),
+                other => panic!("expected Refuse for {ty:?}, got {other:?}"),
+            }
+        }
+    }
+
+    /// The gate refuses on the FIRST unsafe entry even when safe entries
+    /// follow, and names that entry's VLSN.
+    #[test]
+    fn test_classify_tail_refuses_on_first_unsafe_entry() {
+        let tail = tail([
+            (Vlsn::new(6), T::InsertLNTxn),
+            (Vlsn::new(7), T::DeleteLN), // unsafe
+            (Vlsn::new(8), T::InsertLNTxn),
+        ]);
+        match classify_tail(tail) {
+            TailSafety::Refuse { reason } => {
+                assert!(reason.contains("VLSN 7"), "reason: {reason}")
+            }
+            other => panic!("expected Refuse, got {other:?}"),
+        }
     }
 }

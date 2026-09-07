@@ -27,11 +27,11 @@ pub use replica_stream::{
     ReplicaStreamState,
 };
 pub use syncup::{
-    Matchpoint, RollbackDecision, SyncupView, VlsnEntry, find_matchpoint,
-    verify_rollback,
+    Matchpoint, RollbackDecision, SyncupView, TailSafety, VlsnEntry,
+    classify_tail, find_matchpoint, verify_rollback,
 };
 pub use syncup_protocol::{
-    SYNCUP_SERVICE_NAME, SyncupMsg, SyncupOutcome, feeder_syncup_handshake,
-    replica_syncup_handshake,
+    RemoteFeederView, SYNCUP_SERVICE_NAME, SyncupMsg, SyncupOutcome,
+    SyncupService, feeder_syncup_handshake, replica_syncup_handshake,
 };
 pub use syncup_reader::{SyncupLogView, VlsnIndexView};
