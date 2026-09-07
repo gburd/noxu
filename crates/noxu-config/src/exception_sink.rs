@@ -110,4 +110,19 @@ mod tests {
         assert_eq!(count.load(Ordering::SeqCst), 2);
         assert_eq!(&*last.lock().unwrap(), "Cleaner:io error");
     }
+
+    /// `Debug` must reflect whether a sink is installed, not just print a
+    /// constant placeholder -- this is the only observable surface of the
+    /// dispatcher's internal state for a `{:?}`-format caller (e.g. logging
+    /// a config snapshot).
+    #[test]
+    fn debug_reports_installed_state() {
+        let d = ExceptionDispatcher::new();
+        assert_eq!(
+            format!("{d:?}"),
+            "ExceptionDispatcher { installed: false }"
+        );
+        d.set(Arc::new(|_source: &str, _msg: &str| {}));
+        assert_eq!(format!("{d:?}"), "ExceptionDispatcher { installed: true }");
+    }
 }

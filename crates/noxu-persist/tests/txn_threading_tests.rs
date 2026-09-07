@@ -466,3 +466,111 @@ fn put_with_txn_without_secondaries_does_not_warn() {
 
     assert!(index.contains(None, &50u64).unwrap());
 }
+
+/// `SecondaryIndex::delete(Some(&txn), …)` (deleting BY secondary key,
+/// inside a caller-supplied transaction) must roll back with the rest of
+/// the transaction on abort, exactly like the `PrimaryIndex::delete_with_entity`
+/// path already proven above -- this exercises the `Some(t) =>
+/// self.secondary.delete_in(t, &key)` branch of `SecondaryIndex::delete`
+/// directly (as opposed to going through the primary's fan-out).
+#[test]
+fn secondary_index_delete_by_key_with_txn_rolls_back_on_abort() {
+    let (_td, env) = make_txn_env();
+    let mut store = make_txn_store(&env);
+    let mut index: PrimaryIndex<u64, Widget> =
+        store.get_primary_index().unwrap();
+    let ser = Arc::new(WidgetSer);
+
+    let by_color: SecondaryIndex<String, u64, Widget> = store
+        .open_secondary_index(
+            &mut index,
+            "by_color",
+            Arc::clone(&ser),
+            |w: &Widget| Some(w.color.clone()),
+        )
+        .unwrap();
+
+    index.put(None, ser.as_ref(), &widget(11, "vase", "teal")).unwrap();
+    assert!(by_color.contains(&"teal".to_string()));
+
+    let txn = env.begin_transaction(None).unwrap();
+    let deleted = by_color
+        .delete(Some(&txn), ser.as_ref(), &index, &"teal".to_string())
+        .unwrap();
+    assert!(deleted, "delete-by-secondary-key must report a match deleted");
+    txn.abort().unwrap();
+
+    // Aborting the txn must restore both the primary record and the
+    // secondary mapping.
+    assert!(index.get(None, ser.as_ref(), &11u64).unwrap().is_some());
+    assert!(
+        by_color.contains(&"teal".to_string()),
+        "secondary entry must be restored when the delete-by-key txn aborts"
+    );
+}
+
+/// `SecondaryIndex::delete(Some(&txn), …)` committed (as opposed to
+/// aborted above) must make the deletion durable across both the primary
+/// and secondary.
+#[test]
+fn secondary_index_delete_by_key_with_txn_commits() {
+    let (_td, env) = make_txn_env();
+    let mut store = make_txn_store(&env);
+    let mut index: PrimaryIndex<u64, Widget> =
+        store.get_primary_index().unwrap();
+    let ser = Arc::new(WidgetSer);
+
+    let by_color: SecondaryIndex<String, u64, Widget> = store
+        .open_secondary_index(
+            &mut index,
+            "by_color",
+            Arc::clone(&ser),
+            |w: &Widget| Some(w.color.clone()),
+        )
+        .unwrap();
+
+    index.put(None, ser.as_ref(), &widget(12, "lamp", "amber")).unwrap();
+
+    let txn = env.begin_transaction(None).unwrap();
+    by_color
+        .delete(Some(&txn), ser.as_ref(), &index, &"amber".to_string())
+        .unwrap();
+    txn.commit().unwrap();
+
+    assert!(index.get(None, ser.as_ref(), &12u64).unwrap().is_none());
+    assert!(!by_color.contains(&"amber".to_string()));
+}
+
+/// `secondary_database()` returns a live handle into the same underlying
+/// `noxu_db::SecondaryDatabase` the typed `SecondaryIndex` wraps -- a
+/// direct write through it must be visible via the typed API.
+#[test]
+fn secondary_database_accessor_exposes_the_live_handle() {
+    let (_td, env) = make_txn_env();
+    let mut store = make_txn_store(&env);
+    let mut index: PrimaryIndex<u64, Widget> =
+        store.get_primary_index().unwrap();
+    let ser = Arc::new(WidgetSer);
+
+    let by_color: SecondaryIndex<String, u64, Widget> = store
+        .open_secondary_index(
+            &mut index,
+            "by_color",
+            Arc::clone(&ser),
+            |w: &Widget| Some(w.color.clone()),
+        )
+        .unwrap();
+
+    index.put(None, ser.as_ref(), &widget(13, "mug", "slate")).unwrap();
+
+    // Same secondary key must be visible both through the raw handle and
+    // through the typed `contains`.
+    let raw = by_color.secondary_database();
+    let key = noxu_db::DatabaseEntry::from_vec("slate".as_bytes().to_vec());
+    assert!(
+        raw.exists(None, &key).unwrap(),
+        "secondary_database() must expose the same underlying database \
+         the typed index writes through"
+    );
+    assert!(by_color.contains(&"slate".to_string()));
+}

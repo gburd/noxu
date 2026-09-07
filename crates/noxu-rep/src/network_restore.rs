@@ -863,4 +863,187 @@ mod tests {
         validate_restore_filename("name-with-dashes_and_underscores.ndb")
             .unwrap();
     }
+
+    // -----------------------------------------------------------------------
+    // execute_via_dispatcher: malformed-payload fault injection
+    // -----------------------------------------------------------------------
+    //
+    // These stand up a real `TcpServiceDispatcher` with a fake RESTORE
+    // handler that replies with a hand-crafted (malformed) payload, so the
+    // decode error paths inside `execute_via_dispatcher` -- otherwise only
+    // reachable via real wire corruption -- are exercised for real, over a
+    // real socket, rather than by unit-testing extracted logic.
+
+    struct FixedReplyRestoreService {
+        reply: Vec<u8>,
+    }
+
+    impl crate::net::service_dispatcher::ServiceHandler
+        for FixedReplyRestoreService
+    {
+        fn service_name(&self) -> &str {
+            crate::network_restore_server::RESTORE_SERVICE_NAME
+        }
+
+        fn handle(&self, channel: Box<dyn crate::net::Channel>) -> Result<()> {
+            // Drain the magic the client sends, then reply with the
+            // canned (possibly malformed) payload.
+            let _ = channel.receive(Duration::from_secs(5))?;
+            channel.send(&self.reply)?;
+            Ok(())
+        }
+    }
+
+    /// Bind a `TcpServiceDispatcher` on an ephemeral port serving a fixed
+    /// RESTORE reply, returning its bound address.
+    fn spawn_fixed_reply_restore_server(
+        reply: Vec<u8>,
+    ) -> (
+        crate::net::service_dispatcher::TcpServiceDispatcher,
+        std::net::SocketAddr,
+    ) {
+        let dispatcher =
+            crate::net::service_dispatcher::TcpServiceDispatcher::new(
+                "127.0.0.1:0".parse().unwrap(),
+            )
+            .unwrap();
+        dispatcher.register(
+            crate::network_restore_server::RESTORE_SERVICE_NAME,
+            std::sync::Arc::new(FixedReplyRestoreService { reply }),
+        );
+        let addr = dispatcher.start().unwrap();
+        (dispatcher, addr)
+    }
+
+    fn dispatcher_config(addr: std::net::SocketAddr) -> NetworkRestoreConfig {
+        NetworkRestoreConfig {
+            source_node: "peer".into(),
+            source_host: addr.ip().to_string(),
+            source_port: addr.port(),
+            retain_log_files: false,
+        }
+    }
+
+    /// A payload shorter than the mandatory 4-byte file-count prefix must
+    /// surface as a "truncated restore payload" error, not panic on the
+    /// `payload[off..off + 4]` slice.
+    #[test]
+    fn execute_via_dispatcher_rejects_payload_shorter_than_file_count() {
+        let (_disp, addr) = spawn_fixed_reply_restore_server(vec![0x01, 0x02]);
+        let dir = tempfile::TempDir::new().unwrap();
+        let restore = NetworkRestore::new(dispatcher_config(addr))
+            .with_local_dir(dir.path());
+        let err = restore.execute_via_dispatcher().unwrap_err();
+        assert!(
+            err.to_string().contains("truncated restore payload"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A file-count claiming one file, but with no bytes at all for its
+    /// `name_len` field, must surface "truncated ... at name_len".
+    #[test]
+    fn execute_via_dispatcher_rejects_truncated_name_len() {
+        let mut payload = 1u32.to_le_bytes().to_vec(); // file_count = 1
+        // no name_len bytes follow
+        let (_disp, addr) =
+            spawn_fixed_reply_restore_server(std::mem::take(&mut payload));
+        let dir = tempfile::TempDir::new().unwrap();
+        let restore = NetworkRestore::new(dispatcher_config(addr))
+            .with_local_dir(dir.path());
+        let err = restore.execute_via_dispatcher().unwrap_err();
+        assert!(
+            err.to_string().contains("name_len"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A file-count/name_len pair that claims more name+size bytes than the
+    /// payload actually carries must surface "truncated ... at name+size".
+    #[test]
+    fn execute_via_dispatcher_rejects_truncated_name_and_size() {
+        let mut payload = 1u32.to_le_bytes().to_vec(); // file_count = 1
+        payload.extend_from_slice(&100u16.to_le_bytes()); // name_len = 100
+        payload.extend_from_slice(b"short"); // far fewer bytes than claimed
+        let (_disp, addr) = spawn_fixed_reply_restore_server(payload);
+        let dir = tempfile::TempDir::new().unwrap();
+        let restore = NetworkRestore::new(dispatcher_config(addr))
+            .with_local_dir(dir.path());
+        let err = restore.execute_via_dispatcher().unwrap_err();
+        assert!(
+            err.to_string().contains("name+size"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A well-formed file record whose CRC32 trailer does not match its body
+    /// must be rejected as a digest mismatch — the wire-corruption guard
+    /// D10 exists for.
+    #[test]
+    fn execute_via_dispatcher_rejects_digest_mismatch() {
+        let filename = b"00000001.ndb";
+        let body = b"hello world";
+        let mut payload = 1u32.to_le_bytes().to_vec(); // file_count = 1
+        payload.extend_from_slice(&(filename.len() as u16).to_le_bytes());
+        payload.extend_from_slice(filename);
+        payload.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        payload.extend_from_slice(body);
+        // Wrong CRC32 (all zero) instead of crc32fast::hash(body).
+        payload.extend_from_slice(&0u32.to_le_bytes());
+
+        let (_disp, addr) = spawn_fixed_reply_restore_server(payload);
+        let dir = tempfile::TempDir::new().unwrap();
+        let restore = NetworkRestore::new(dispatcher_config(addr))
+            .with_local_dir(dir.path());
+        let err = restore.execute_via_dispatcher().unwrap_err();
+        assert!(
+            err.to_string().contains("digest mismatch"),
+            "unexpected error: {err}"
+        );
+        // The corrupted file must NOT have been left on disk.
+        assert!(!dir.path().join("00000001.ndb").exists());
+    }
+
+    /// A correctly-framed single file with a correct CRC32 trailer must be
+    /// written to `local_log_dir` — the round-trip counterpart to the
+    /// digest-mismatch rejection above, proving the CRC check is not simply
+    /// disabled.
+    #[test]
+    fn execute_via_dispatcher_accepts_valid_digest() {
+        let filename = b"00000002.ndb";
+        let body = b"valid payload bytes";
+        let mut payload = 1u32.to_le_bytes().to_vec();
+        payload.extend_from_slice(&(filename.len() as u16).to_le_bytes());
+        payload.extend_from_slice(filename);
+        payload.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        payload.extend_from_slice(body);
+        payload.extend_from_slice(&crc32fast::hash(body).to_le_bytes());
+
+        let (_disp, addr) = spawn_fixed_reply_restore_server(payload);
+        let dir = tempfile::TempDir::new().unwrap();
+        let restore = NetworkRestore::new(dispatcher_config(addr))
+            .with_local_dir(dir.path());
+        restore.execute_via_dispatcher().expect("valid digest must succeed");
+        let written = std::fs::read(dir.path().join("00000002.ndb")).unwrap();
+        assert_eq!(written, body);
+    }
+
+    /// `execute_via_dispatcher` called a second time (state already
+    /// `InProgress`/`Completed`) must reject with a state error instead of
+    /// re-running the transfer.
+    #[test]
+    fn execute_via_dispatcher_rejects_wrong_state() {
+        let (_disp, addr) = spawn_fixed_reply_restore_server(
+            0u32.to_le_bytes().to_vec(), // file_count = 0, valid empty restore
+        );
+        let dir = tempfile::TempDir::new().unwrap();
+        let restore = NetworkRestore::new(dispatcher_config(addr))
+            .with_local_dir(dir.path());
+        restore.execute_via_dispatcher().expect("first call must succeed");
+        let err = restore.execute_via_dispatcher().unwrap_err();
+        assert!(
+            err.to_string().contains("wrong state"),
+            "unexpected error: {err}"
+        );
+    }
 }

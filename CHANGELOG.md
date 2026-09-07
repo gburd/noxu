@@ -50,6 +50,238 @@ listed in [References](#references).
   pulling in `noxu-recovery` (e.g. `noxu-engine`) failed to compile. Found
   while wiring the CI job; fixed by switching to `use
   noxu_tree::NodeRwLock;`. No behavior change under the default cfg.
+- **Coverage measurement + gap-fill for 14 crates (rep/persist/bind/
+  collections/xa/config/util/latch/sync/engine/observe/persist-derive/noxu/
+  spec), branch coverage on the assigned half of the coverage mandate.**
+  Toolchain finding (recorded once for the sibling coverage agent too): the
+  documented `rustup run nightly cargo llvm-cov --branch` failure was a
+  proxy/argument-forwarding problem, not a real nightly incompatibility —
+  putting the nightly toolchain's own `cargo`/`rustc` directly on `PATH`
+  (`PATH="$HOME/.rustup/toolchains/nightly-*/bin:$PATH" cargo llvm-cov
+  --branch ...`) makes `-Z coverage-options=branch` build cleanly, including
+  through build scripts (`quote`/`zmij`/`serde_json`) that failed under the
+  `rustup run`/`+toolchain` proxy path. Branch coverage below is measured
+  with this recipe; region/function/line are measured on stable.
+
+  | Crate | Region before→after | Function | Line | Branch (nightly) |
+  |---|---|---|---|---|
+  | `noxu-rep` | 93.31%→92.95%\* | 89.98%→88.74%\* | 90.50%→90.22%\* | 72.95%→72.74%\* |
+  | `noxu-xa` | 96.06%→96.38% | 96.55%→96.72% | 95.07%→95.45% | 83.00%→86.00% |
+  | `noxu-persist` | 94.19%→94.26% | 93.68%→93.87% | 92.17%→92.24% | 67.72%→unchanged |
+  | `noxu-persist-derive` | 78.61%→96.29% (stable) | 76.74%→96.81% | 76.12%→97.29% | n/a→89.19%\*\* |
+  | `noxu-config` | 96.49%→97.23% | 94.00%→95.10% | 96.38%→96.97% | 92.11%→unchanged |
+  | `noxu-util` | 95.57% (already ≥85%, no changes) | 96.67% | 95.49% | 90.42% |
+  | `noxu-latch` | 98.55%→98.72% | 100% (unchanged) | 98.30%→98.61% | 67.31%→80.00% |
+  | `noxu-sync` | 81.22%→92.40% | 78.75%→91.58% | 76.79%→91.14% | 56.10%→66.67% |
+  | `noxu-engine` | 92.85% (already ≥85%, no changes) | 96.08% | 91.73% | 63.19% |
+  | `noxu-observe` | 0%→100% | 0%→100% | 0%→100% | n/a (no branches) |
+  | `noxu-bind` | 96.91% (already ≥85%, no changes) | 98.01% | 96.30% | 95.57% |
+  | `noxu-collections` | 91.55%→94.82% | 85.65%→93.53% | 90.28%→96.41% | 79.73%→83.78% |
+  | `noxu` (umbrella) | n/a—zero instrumented regions | n/a | n/a | n/a |
+  | `noxu-spec` | 94.30% (already ≥85%, no changes) | 98.06% | 95.01% | 80.25% |
+
+  \* `noxu-rep` region/function/line/branch measured with the `tls-rustls`
+  feature enabled (the no-features baseline undercounts `tls.rs`, which is
+  entirely `#[cfg(feature = "tls-rustls")]`); the total crate-wide numbers
+  moved slightly against the per-file gains above because enabling the
+  feature also brought ~2500 more regions of TLS/rustls-config code into the
+  denominator (`tls.rs` alone: 71.96%→85.47% region, 76.47%→77.94%
+  function, 80.09%→86.18% line).
+  \*\* `noxu-persist-derive`'s `tests/ui/*.rs` trybuild fixture
+  (`ui_compile_fail_and_pass`) fails to build under the nightly
+  `-Z coverage-options=branch` flags because trybuild's stderr comparison is
+  sensitive to the exact rustc diagnostic span-rendering, which differs
+  between stable 1.95 and the nightly used for coverage (multi-line vs.
+  single-token underline width on 6 of 13 fixtures) — a toolchain-version
+  mismatch, not a real regression (confirmed: all 13 fixtures pass under
+  stable). Branch coverage for this crate is measured with `--skip
+  ui_compile_fail_and_pass`; region/function/line (measured with the UI test
+  included, under stable) are unaffected.
+
+  **Real gaps filled** (every new test proves a cited invariant, not a
+  tautology):
+  - `noxu-rep::group_admin` (ADMIN service: `transfer_master` /
+    `shutdown_group` / `step_down` wire handler) had **zero** unit tests;
+    added 10 covering the empty-frame reject, env-already-dropped
+    (`Weak::upgrade` failure) reject, short-TRANSFER/-STEP_DOWN frame
+    rejects, non-UTF8 master-name reject, the `become_replica` branch
+    (TRANSFER addressed to a peer, not self), STEP_DOWN actually demoting a
+    live master, unknown-command reject, and an end-to-end `send_step_down`
+    round-trip over a real `TcpServiceDispatcher`. File: 56.83%→93.93%
+    region, 55.56%→95.00% function, 57.14%→95.85% line, 35.71%→62.50%
+    branch.
+  - `noxu-rep::network_restore::execute_via_dispatcher` malformed-payload
+    decode paths (truncated file-count/name_len/name+size, CRC32 digest
+    mismatch, wrong-state re-entry) were untested error paths reachable only
+    via real wire corruption; added a `FixedReplyRestoreService` fault
+    injector (a `TcpServiceDispatcher` handler that replies with a
+    hand-crafted malformed payload over a real socket) plus 6 tests,
+    including a valid-digest round-trip proving the CRC32 check is not
+    simply disabled.
+  - `noxu-rep::stream::syncup_protocol` gained 8 tests: the NULL-last-sync
+    "ask for VLSN 1" first-contact branch (both converges-on-VLSN-1 and
+    feeder-lacks-VLSN-1-so-restore variants), `local_matchpoint` agreeing
+    with the full wire handshake, `vlsn_entry`'s field-order assembly, and
+    both replica-side and feeder-side "unexpected message" protocol-error
+    rejections.
+  - `noxu-rep::stream::syncup_reader::VlsnIndexView` (the in-memory
+    `SyncupView` used by the live `become_replica` path) had **zero** tests
+    despite being production-path code; added 4 covering the real
+    (file,offset)-to-LSN lookup + sync-flag derivation, missing-VLSN,
+    NULL_VLSN rejection, and the empty-index null-range mapping. Also added
+    `SyncupLogView::scan`/`scan_with_manager` empty-env coverage.
+  - `noxu-xa::prepared_log::key_to_xid` corruption guards (too-short key,
+    truncated `gtrid_len`) were unreachable in every existing test; added
+    3 tests including `recover_all_skips_corrupted_key_but_returns_valid_ones`,
+    which proves the actual operational contract — one corrupted entry in
+    the `_xa_prepared` recovery log must not block recovery of every other
+    in-doubt XID after a crash.
+  - `noxu-config::exception_sink::ExceptionDispatcher`'s `Debug` impl
+    (used when logging a config snapshot) was untested; added a test
+    pinning both the "no sink" and "sink installed" renderings.
+  - `noxu-sync::raw_rwlock` / `raw_mutex` (the futex-based `lock_api`
+    backends underlying every `noxu_sync::RwLock`/`Mutex` in the codebase)
+    had **zero** in-module tests exercising the raw `lock_api::RawRwLock` /
+    `RawRwLockTimed` / `RawMutexTimed` trait surface directly (only the
+    wrapping `noxu_sync::RwLock`/`Mutex` convenience types were tested);
+    added 11 tests covering `try_lock_exclusive` fast-path owner recording,
+    exclusive-vs-shared mutual exclusion, `try_lock_exclusive_for`/`_until`
+    and `try_lock_shared_for` timeout paths (with waiter-count cleanup
+    verification), a real writer-parks-behind-reader-then-wakes-on-release
+    scenario, `get_owner()`'s locked/unlocked transitions, `try_lock_until`,
+    and a contended-mutex park/wake round-trip.
+  - `noxu-persist::secondary_index` had **zero** unit tests; added an
+    integration test proving `SecondaryIndex` reads honour the same class
+    `Renamer` mutation as `PrimaryIndex` reads (previously only tested on
+    the primary side), plus 3 `txn_threading_tests.rs` tests for
+    `SecondaryIndex::delete(Some(&txn), ...)` (both the abort-rolls-back and
+    commit-durable cases) and the `secondary_database()` raw-handle
+    accessor.
+  - `noxu-persist-derive` had **zero** unit tests (only `tests/ui/*.rs`
+    trybuild fixtures exercising the `proc_macro::TokenStream` entry
+    points); added 47 unit tests calling the `syn`/`proc_macro2`-typed
+    internal helpers directly (`parse_entity_container_attrs`,
+    `parse_krate_from_entity_attr`, `expand_entity`/`expand_primary_key`/
+    `expand_secondary_key`, `parse_secondary_key_attr`, `unwrap_option_type`,
+    `sanitise_ident`, `relate_to_tokens`, `delete_action_to_tokens`), so
+    every parsing/validation branch is exercised deterministically and
+    independent of the trybuild stable/nightly rustc-diagnostic mismatch
+    above.
+  - `noxu-observe` had **zero** tests and 0% coverage on every metric
+    (the crate's logic only compiles under the `export`/`prometheus`
+    features, which the default no-features coverage run never enables);
+    added `describe_metrics_registers_every_metric_without_a_recorder` and
+    `prometheus_install_is_a_single_shot_global` (proving
+    `metrics::set_global_recorder`'s documented "exactly once" contract:
+    installing a second global Prometheus recorder must fail, not silently
+    replace the first). With `--features export,prometheus`: 0%→100%
+    region/function/line.
+  - `noxu-collections::internal::scan_records` had an entirely dead
+    `ScanDirection::Reverse` arm and start-bound skip-loop under the
+    current call graph (every in-tree caller of the *eager* `scan_records`
+    passes `Forward`/`None`; only the *lazy* `scan_iter` path uses
+    `Reverse`/`Some(bound)`, via `StoredSortedMap`). Added 4 direct unit
+    tests exercising `scan_records` itself with `Reverse` and with a
+    `start` bound (both directions, plus an out-of-range bound), proving
+    the shared logic is correct for any future eager caller even though no
+    current one exercises it — see Dead-code findings below.
+  - `noxu-collections::stored_sorted_map` / `stored_key_set` /
+    `stored_value_set` plain delegating accessors (`new_read_only`,
+    `is_read_only`, `database`, `key_binding`/`value_binding`, `clear`,
+    `iter`/`keys`/`values`, `snapshot`/`keys_snapshot`/`values_snapshot`)
+    were never called by any test; added 6 tests.
+  - `noxu-latch`: tightened `test_latch_error_display` by removing a
+    tautological `||`-chained `.contains(...)` assertion (the second
+    disjunct never mattered because `Display`'s exact wording is stable and
+    known) in favour of an exact `assert_eq!` — a genuine test-quality fix,
+    not just a coverage-inflation change.
+
+  **Dead-code findings for a follow-up removal pass** (not deleted in this
+  wave, per guard):
+  - `noxu-collections::internal::scan_records`'s `ScanDirection::Reverse`
+    branch and its `start`-bound skip loop are unreachable given the
+    current call graph (`stored_map.rs` is the only caller and always
+    passes `Forward`/`None`); now covered by direct unit tests (see above)
+    rather than removed, since a future eager `StoredSortedMap` snapshot
+    could plausibly need them.
+  - `noxu-rep::net::channel::TlsTcpChannel::connect_native` /
+    `TlsAcceptorImpl::Native` / `TlsConfig::{to_native_acceptor,
+    to_native_connector, native_identity, apply_native_trust}` are flagged
+    dead by `clippy --all-features` (both `tls-rustls` and `tls-native`
+    enabled together apparently makes the native path unreachable) —
+    pre-existing on `main` @ `bf46ea8b` (confirmed via `git stash`, not
+    introduced by this wave); flagged to the `noxu-rep` TLS feature owner
+    separately, out of scope for a coverage-only pass.
+
+  **Honest ceiling notes for crates that cannot realistically hit 85% on
+  every axis, or where "85%" needs interpretation**:
+  - `noxu` (the umbrella crate): `src/lib.rs` is exclusively `pub use` 
+    re-exports and `#[cfg(feature = ...)]`-gated module declarations —
+    llvm-cov instruments **zero regions** (confirmed with `--all-features`
+    too), so region/function/line/branch percentages are undefined (0/0),
+    not a gap. Real coverage of the umbrella's surface comes transitively
+    from the 13 other crates' test suites plus `tests/smoke.rs` (4 tests
+    proving `noxu = "7"` alone is sufficient for core + derive-macro use);
+    additionally verified every documented feature combination
+    (`--no-default-features`, `replication,replication-tls-rustls`,
+    `observability,prometheus`) actually builds.
+  - `noxu-spec`: Stateright executable specifications, not conventional
+    unit tests — each `#[test]` is an **exhaustive bounded model check**
+    (`stateright::Checker`) of a protocol abstraction (B+tree latching,
+    Flexible Paxos, WAL group-commit, recovery, lock manager + deadlock,
+    VLSN streaming, master transfer, network restore, XA 2PC, cleaner
+    safety, cache↔cleaner ordering), not a test of a specific code path in
+    a specific function. "Line coverage" on a spec module means "was this
+    state-transition arm of the abstract model ever taken during the
+    exhaustive search", which is a meaningful but different question from
+    "did a unit test call this Rust function" — a spec module at genuinely
+    100% branch coverage would mean the model checker visited every
+    state-transition arm, which for a well-designed bounded model usually
+    happens naturally (most of noxu-spec's modules are already ≥85% on
+    every axis without any changes). The two anchor specs
+    (`lock_manager_deadlock` → `LockType`, `xa_two_phase_commit` →
+    `XaFlags`) additionally have a `tests/lock_manager_drives_production.rs`
+    companion asserting the spec's enum literally IS the production type
+    (not a copy that can drift) — the other 9 specs are kept in sync with
+    the code by review convention, per the crate's own module-doc caveat:
+    these are abstract protocol-design proofs, not a mechanical
+    refinement/conformance proof of the Rust implementation. Full-suite
+    `cargo llvm-cov --branch` on this crate takes ~8 minutes (exhaustive
+    state-space search, correctly slow) — no changes made; already ≥85% on
+    region/function/line, 80.25% branch.
+  - `noxu-util`, `noxu-bind`, `noxu-engine`: baseline-confirmed already
+    ≥85% on every measured axis (noxu-engine's branch number, 63.19%, is
+    the exception — see the generic-monomorphization note below); no
+    changes made, per the "find the actual weak spots" instruction rather
+    than padding crates that were already well-tested.
+  - **Branch-coverage-specific tooling caveat** (affects the `TOTAL` branch
+    percentages more than region/function/line): `cargo-llvm-cov --branch`
+    under nightly reports one `Branch (LINE:COL): [True: N, False: M]`
+    region **per monomorphized instantiation** of a generic function
+    (confirmed by inspection on `noxu-sync::raw_mutex::lock`,
+    `noxu-engine::verify`'s `Display` impls behind `write!`/`writeln!` `?`
+    propagation, and `noxu-collections::transaction_runner`'s generic
+    closures) — heavily generic/trait-object-dispatched code accumulates
+    many `[0, 0]`/`[0, N]` duplicate regions for call sites that share one
+    source line across different concrete types, which suppresses the
+    aggregate branch percentage even when the actual logic is fully
+    exercised (verified case-by-case for `noxu-engine::verify`'s Display
+    impls: every variant already had a dedicated `format!("{}", ...)`
+    assertion before this wave). Region/function/line coverage do not
+    exhibit this artifact as severely. Treated as a measurement caveat, not
+    a real gap, after per-file inspection; noted here rather than chased
+    further given diminishing returns.
+
+  All touched crates: `cargo fmt --all -- --check` clean, `cargo build
+  --workspace --all-targets` clean, `cargo clippy -p <crate> --all-targets
+  [-- feature flags] -- -D warnings` clean per-crate (plain `cargo clippy
+  --workspace --all-targets` with no `--all-features` is also clean; the
+  `--all-features` failure is the pre-existing noxu-rep tls-rustls/
+  tls-native conflict noted above), full test suites for every touched
+  crate green (`noxu-rep` 985/985 incl. `tls-rustls`, `noxu-xa`/
+  `noxu-persist-derive`/`noxu-collections`/`noxu-config`/`noxu-latch` 520/520
+  combined, `noxu-persist` 343/343, `noxu-observe` 3/3 with
+  `export,prometheus`, `noxu-engine` 89/89, `noxu` 4/4).
 
 ### Performance
 

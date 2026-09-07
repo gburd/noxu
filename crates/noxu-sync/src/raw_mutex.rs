@@ -257,3 +257,84 @@ impl NoxuRawMutex {
         self.owner.load(Ordering::Relaxed)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lock_api::{RawMutex as _, RawMutexTimed as _};
+    use std::sync::Arc;
+
+    /// `get_owner()` must report 0 when unlocked and the acquiring
+    /// thread's id-hash once locked, clearing back to 0 on unlock --
+    /// this accessor exists specifically so higher layers can attribute
+    /// a held lock to a thread (e.g. deadlock diagnostics).
+    #[test]
+    fn get_owner_reports_zero_when_unlocked_and_nonzero_when_locked() {
+        let raw = NoxuRawMutex::INIT;
+        assert_eq!(raw.get_owner(), 0);
+        raw.lock();
+        assert_ne!(raw.get_owner(), 0);
+        unsafe { raw.unlock() };
+        assert_eq!(raw.get_owner(), 0);
+    }
+
+    /// `try_lock_until` (the deadline-based `RawMutexTimed` entry point,
+    /// distinct from the duration-based `try_lock_for`) must succeed on
+    /// the uncontended fast path.
+    #[test]
+    fn try_lock_until_succeeds_on_fast_path() {
+        let raw = NoxuRawMutex::INIT;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert!(raw.try_lock_until(deadline));
+        assert!(raw.is_locked());
+        unsafe { raw.unlock() };
+    }
+
+    /// `try_lock_until` must time out (not block indefinitely) when the
+    /// mutex is held by another thread past the deadline -- exercises the
+    /// slow-path delegation distinct from `try_lock_for`'s.
+    #[test]
+    fn try_lock_until_times_out_when_contended() {
+        let raw = Arc::new(NoxuRawMutex::INIT);
+        raw.lock();
+
+        let raw2 = Arc::clone(&raw);
+        let timed_out = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_millis(30);
+            !raw2.try_lock_until(deadline)
+        })
+        .join()
+        .unwrap();
+        assert!(timed_out);
+
+        unsafe { raw.unlock() };
+    }
+
+    /// A second thread contending on an already-locked mutex must park
+    /// (via the spin-then-futex `lock_slow` path) and be woken once the
+    /// holder unlocks -- exercises the CONTENDED transition and the
+    /// `unlock()` wake branch together, not just the CAS fast path.
+    #[test]
+    fn contended_lock_parks_and_wakes_on_unlock() {
+        let raw = Arc::new(NoxuRawMutex::INIT);
+        raw.lock();
+
+        let raw2 = Arc::clone(&raw);
+        let waiter = std::thread::spawn(move || {
+            raw2.lock();
+            unsafe { raw2.unlock() };
+        });
+
+        // Give the second thread time to spin out and park.
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(raw.is_locked());
+        assert!(
+            raw.get_n_waiters() >= 1,
+            "the blocked thread must be recorded as a waiter"
+        );
+
+        unsafe { raw.unlock() };
+        waiter.join().unwrap();
+        assert!(!raw.is_locked());
+    }
+}

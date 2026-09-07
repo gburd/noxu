@@ -156,22 +156,13 @@ mod tests {
     #[test]
     fn test_latch_error_display() {
         let e1 = LatchError::AlreadyHeld("foo".to_string());
-        assert!(
-            format!("{}", e1).contains("already held")
-                || format!("{}", e1).contains("Latch already held")
-        );
+        assert_eq!(format!("{}", e1), "Latch already held: foo");
 
         let e2 = LatchError::NotHeld("bar".to_string());
-        assert!(
-            format!("{}", e2).contains("not held")
-                || format!("{}", e2).contains("Latch not held")
-        );
+        assert_eq!(format!("{}", e2), "Latch not held: bar");
 
         let e3 = LatchError::Timeout("baz".to_string());
-        assert!(
-            format!("{}", e3).contains("timeout")
-                || format!("{}", e3).contains("Latch timeout")
-        );
+        assert_eq!(format!("{}", e3), "Latch timeout: baz");
     }
 
     #[test]

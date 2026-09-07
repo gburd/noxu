@@ -411,4 +411,102 @@ mod tests {
             Matchpoint::Found { vlsn: Vlsn::new(4), lsn: 0x400 }
         );
     }
+
+    // ── VlsnIndexView ───────────────────────────────────────────────
+
+    /// `VlsnIndexView::entry` must look up the real (file, offset) LSN for a
+    /// VLSN the index holds, use that LSN as the fingerprint (same LSN at
+    /// the same VLSN == same record, per this view's doc contract), and mark
+    /// it a sync point iff its VLSN is <= the index's `last_sync`.
+    #[test]
+    fn vlsn_index_view_entry_reports_lsn_fingerprint_and_sync_flag() {
+        let index = Arc::new(VlsnIndex::new(4));
+        index.put_with_type(
+            1,
+            7,
+            100,
+            noxu_log::entry_type::LogEntryType::TxnCommit,
+        );
+        index.put(2, 7, 200);
+
+        let view = VlsnIndexView::from_index(&index);
+
+        let expected_lsn_1 = noxu_util::Lsn::new(7, 100).as_u64();
+        let e1 = view.entry(Vlsn::new(1)).expect("vlsn 1 must be present");
+        assert_eq!(e1.lsn, expected_lsn_1);
+        assert_eq!(e1.fingerprint, expected_lsn_1, "fingerprint == lsn");
+        assert!(e1.is_sync, "a commit is a sync point");
+
+        let expected_lsn_2 = noxu_util::Lsn::new(7, 200).as_u64();
+        let e2 = view.entry(Vlsn::new(2)).expect("vlsn 2 must be present");
+        assert_eq!(e2.lsn, expected_lsn_2);
+        assert!(
+            !e2.is_sync,
+            "vlsn 2 is above last_sync (only vlsn 1 was a commit)"
+        );
+
+        assert_eq!(view.last_sync(), Vlsn::new(1));
+        assert_eq!(view.last_txn_end(), Vlsn::new(1));
+        assert_eq!(view.first_vlsn(), Vlsn::new(1));
+    }
+
+    /// A VLSN the index has never seen must report `None`, not panic — the
+    /// syncup driver probes candidate matchpoints that may be outside the
+    /// range actually held.
+    #[test]
+    fn vlsn_index_view_entry_missing_vlsn_is_none() {
+        let index = Arc::new(VlsnIndex::new(4));
+        index.put(1, 7, 100);
+        let view = VlsnIndexView::from_index(&index);
+        assert!(view.entry(Vlsn::new(99)).is_none());
+    }
+
+    /// `lsn_fingerprint`'s `vlsn <= 0` guard must reject `NULL_VLSN` (0)
+    /// rather than treat it as a valid lookup key.
+    #[test]
+    fn vlsn_index_view_entry_rejects_null_vlsn() {
+        let index = Arc::new(VlsnIndex::new(4));
+        index.put(1, 7, 100);
+        let view = VlsnIndexView::from_index(&index);
+        assert!(view.entry(NULL_VLSN).is_none());
+    }
+
+    /// An empty index must report the null range via `from_index`, proving
+    /// the `range.get_first() == 0` → `NULL_VLSN` mapping in `from_index`.
+    #[test]
+    fn vlsn_index_view_from_empty_index_is_null_range() {
+        let index = Arc::new(VlsnIndex::new(4));
+        let view = VlsnIndexView::from_index(&index);
+        assert_eq!(view.first_vlsn(), NULL_VLSN);
+        assert_eq!(view.last_sync(), NULL_VLSN);
+        assert_eq!(view.last_txn_end(), NULL_VLSN);
+    }
+
+    // ── read_raw_entry / scan edge cases ────────────────────────────
+
+    /// `scan_with_manager` over a `FileManager` with no log files at all
+    /// must yield an empty, null-range view rather than panicking on the
+    /// `entries.keys().next()` fallback.
+    #[test]
+    fn scan_with_manager_on_empty_env_yields_null_range() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let fm = FileManager::new(dir.path(), false, 256 * 1024 * 1024, 32)
+            .expect("FileManager must open an empty, writable env dir");
+        let view = SyncupLogView::scan_with_manager(&fm);
+        assert_eq!(view.first_vlsn(), NULL_VLSN);
+        assert_eq!(view.last_sync(), NULL_VLSN);
+        assert_eq!(view.last_txn_end(), NULL_VLSN);
+        assert!(view.entries().next().is_none());
+    }
+
+    /// `SyncupLogView::scan` (the `Path`-based entry point, as opposed to
+    /// `scan_with_manager`) must succeed against a real (empty) env
+    /// directory and return a usable, empty view.
+    #[test]
+    fn scan_opens_its_own_file_manager() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let view = SyncupLogView::scan(dir.path())
+            .expect("scan must open a FileManager for an existing directory");
+        assert_eq!(view.first_vlsn(), NULL_VLSN);
+    }
 }

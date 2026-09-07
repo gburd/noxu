@@ -37,7 +37,7 @@ use noxu_persist::evolve::{
 };
 use noxu_persist::{
     Entity, EntitySerializer, EntityStore, PersistError, PrimaryIndex, Result,
-    StoreConfig,
+    SecondaryIndex, StoreConfig,
 };
 use tempfile::TempDir;
 
@@ -638,6 +638,83 @@ fn evolve_class_rename() {
         let idx: PrimaryIndex<u64, Person> = store.get_primary_index().unwrap();
         let p = idx.get(None, &PersonSer, &1).unwrap().unwrap();
         assert_eq!(p, Person { id: 1, name: "Alice".into() });
+    }
+}
+
+/// A secondary-index read must honour the same class Renamer as a primary
+/// read: the SecondaryIndex's `decode_primary` peels the on-disk envelope
+/// and, when the class tag does not match `E::entity_name()`, checks the
+/// registered Renamers before rejecting the record. This closes the gap
+/// where `PrimaryIndex` reads were renamer-aware but `SecondaryIndex` reads
+/// were untested against a renamed class tag.
+#[test]
+fn evolve_class_rename_is_honoured_by_secondary_index_reads() {
+    use class_rename::*;
+
+    let td = TempDir::new().unwrap();
+    let path = td.path().to_path_buf();
+
+    // Phase 1: write a record under class tag "OldPerson" (simulating a
+    // pre-rename write), with a secondary key on `name`.
+    {
+        let env_cfg = EnvironmentConfig::new(path.clone())
+            .with_allow_create(true)
+            .with_transactional(true);
+        let env = Environment::open(env_cfg).unwrap();
+        let payload = PersonSer
+            .serialize(&Person { id: 1, name: "Alice".into() })
+            .unwrap();
+        let envelope =
+            noxu_persist::evolve::envelope::encode(0, "OldPerson", &payload)
+                .unwrap();
+        let dbcfg = noxu_db::DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
+        let db = env.open_database(None, "s_Person", &dbcfg).unwrap();
+        let txn = env.begin_transaction(None).unwrap();
+        let key = noxu_db::DatabaseEntry::from_vec(1u64.to_be_bytes().to_vec());
+        let val = noxu_db::DatabaseEntry::from_vec(envelope);
+        db.put_in(&txn, &key, &val).unwrap();
+        txn.commit().unwrap();
+        db.close().unwrap();
+        env.close().unwrap();
+    }
+
+    // Phase 2: open with a Renamer mapping "OldPerson" v0 -> "Person",
+    // build a secondary index on `name`, and read the OLD record back
+    // THROUGH THE SECONDARY -- this is the path under test.
+    {
+        let env_cfg = EnvironmentConfig::new(path)
+            .with_allow_create(true)
+            .with_transactional(true);
+        let env = Environment::open(env_cfg).unwrap();
+        let mut mutations = Mutations::new();
+        mutations.add_renamer(Renamer::for_class("OldPerson", 0, "Person"));
+        let cfg = StoreConfig::new("s")
+            .with_allow_create(true)
+            .with_transactional(true)
+            .with_mutations(mutations);
+        let mut store = EntityStore::open(&env, cfg).unwrap();
+        let mut idx: PrimaryIndex<u64, Person> =
+            store.get_primary_index().unwrap();
+        let ser = std::sync::Arc::new(PersonSer);
+        let sec: SecondaryIndex<String, u64, Person> = store
+            .open_secondary_index(
+                &mut idx,
+                "by_name",
+                std::sync::Arc::clone(&ser),
+                |p: &Person| Some(p.name.clone()),
+            )
+            .unwrap();
+
+        let found =
+            sec.get(None, ser.as_ref(), &idx, &"Alice".to_string()).unwrap();
+        assert_eq!(
+            found,
+            Some(Person { id: 1, name: "Alice".into() }),
+            "secondary read must apply the class Renamer, same as a \
+             primary read"
+        );
     }
 }
 

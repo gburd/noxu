@@ -184,3 +184,214 @@ pub(crate) fn register_admin_service(
     let svc = AdminService::new(env);
     dispatcher.register(ADMIN_SERVICE_NAME, Arc::new(svc));
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::net::LocalChannelPair;
+    use crate::rep_config::RepConfig;
+    use crate::replicated_environment::ReplicatedEnvironment;
+
+    fn env(name: &str, dir: &tempfile::TempDir) -> Arc<ReplicatedEnvironment> {
+        let cfg = RepConfig::builder("g1", name, "127.0.0.1")
+            .node_port(0)
+            .env_home(dir.path())
+            .build();
+        Arc::new(ReplicatedEnvironment::new(cfg).unwrap())
+    }
+
+    /// `AdminService::handle` on an empty command frame must reject rather
+    /// than panic on `msg[0]` — the wire protocol requires at least one
+    /// command byte.
+    #[test]
+    fn handle_rejects_empty_frame() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let e = env("n", &dir);
+        let svc = AdminService::new(Arc::downgrade(&e));
+        let pair = LocalChannelPair::new();
+        pair.channel_b.send(&[]).unwrap();
+        svc.handle(Box::new(pair.channel_a)).unwrap();
+        let reply =
+            pair.channel_b.receive(Duration::from_secs(1)).unwrap().unwrap();
+        assert_eq!(reply, vec![ACK_REJECTED]);
+        Arc::clone(&e).close().unwrap();
+    }
+
+    /// If the target `ReplicatedEnvironment` has already been dropped (the
+    /// `Weak` no longer upgrades), the handler must reject instead of
+    /// panicking on `.unwrap()`.
+    #[test]
+    fn handle_rejects_when_env_is_gone() {
+        let weak = {
+            let dir = tempfile::TempDir::new().unwrap();
+            let e = env("n", &dir);
+            Arc::downgrade(&e)
+            // `e` (and its TempDir) drop here — env is gone.
+        };
+        assert!(weak.upgrade().is_none(), "env must actually be dropped");
+        let svc = AdminService::new(weak);
+        let pair = LocalChannelPair::new();
+        pair.channel_b.send(&[CMD_TRANSFER_MASTER]).unwrap();
+        svc.handle(Box::new(pair.channel_a)).unwrap();
+        let reply =
+            pair.channel_b.receive(Duration::from_secs(1)).unwrap().unwrap();
+        assert_eq!(reply, vec![ACK_REJECTED]);
+    }
+
+    /// A TRANSFER_MASTER frame shorter than the mandatory 9-byte
+    /// (command + term) prefix must be rejected, not panic on the
+    /// `msg[1..9]` slice.
+    #[test]
+    fn handle_rejects_short_transfer_frame() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let e = env("n", &dir);
+        let svc = AdminService::new(Arc::downgrade(&e));
+        let pair = LocalChannelPair::new();
+        pair.channel_b.send(&[CMD_TRANSFER_MASTER, 1, 2, 3]).unwrap();
+        svc.handle(Box::new(pair.channel_a)).unwrap();
+        let reply =
+            pair.channel_b.receive(Duration::from_secs(1)).unwrap().unwrap();
+        assert_eq!(reply, vec![ACK_REJECTED]);
+        Arc::clone(&e).close().unwrap();
+    }
+
+    /// A TRANSFER_MASTER frame whose master-name bytes are not valid UTF-8
+    /// must surface a `ProtocolError`, not panic in `String::from_utf8`.
+    #[test]
+    fn handle_rejects_non_utf8_master_name() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let e = env("n", &dir);
+        let svc = AdminService::new(Arc::downgrade(&e));
+        let pair = LocalChannelPair::new();
+        let mut msg = vec![CMD_TRANSFER_MASTER];
+        msg.extend_from_slice(&1u64.to_le_bytes());
+        msg.extend_from_slice(&[0xff, 0xfe]); // invalid UTF-8
+        pair.channel_b.send(&msg).unwrap();
+        let err = svc.handle(Box::new(pair.channel_a)).unwrap_err();
+        assert!(err.to_string().contains("non-UTF8"));
+        Arc::clone(&e).close().unwrap();
+    }
+
+    /// TRANSFER_MASTER addressed to a peer name that is NOT this node must
+    /// take the `become_replica` branch (not `become_master`), recording
+    /// the named peer as the new master.
+    #[test]
+    fn handle_transfer_to_other_peer_calls_become_replica() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let e = env("this_node", &dir);
+        let svc = AdminService::new(Arc::downgrade(&e));
+        let pair = LocalChannelPair::new();
+        let mut msg = vec![CMD_TRANSFER_MASTER];
+        msg.extend_from_slice(&7u64.to_le_bytes());
+        msg.extend_from_slice(b"other_node");
+        pair.channel_b.send(&msg).unwrap();
+        svc.handle(Box::new(pair.channel_a)).unwrap();
+        let reply =
+            pair.channel_b.receive(Duration::from_secs(1)).unwrap().unwrap();
+        assert_eq!(reply, vec![ACK_OK]);
+        assert!(e.is_replica());
+        assert_eq!(e.get_master_name(), Some("other_node".to_string()));
+        Arc::clone(&e).close().unwrap();
+    }
+
+    /// STEP_DOWN on a node currently in `Master` state must succeed and
+    /// leave the node in `Unknown` (no longer master) — the practical
+    /// effect `ensure_unknown_state` exists for.
+    #[test]
+    fn handle_step_down_demotes_master() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let e = env("n", &dir);
+        e.become_master(1).unwrap();
+        assert!(e.is_master());
+        let svc = AdminService::new(Arc::downgrade(&e));
+        let pair = LocalChannelPair::new();
+        let mut msg = vec![CMD_STEP_DOWN];
+        msg.extend_from_slice(&2u64.to_le_bytes());
+        pair.channel_b.send(&msg).unwrap();
+        svc.handle(Box::new(pair.channel_a)).unwrap();
+        let reply =
+            pair.channel_b.receive(Duration::from_secs(1)).unwrap().unwrap();
+        assert_eq!(reply, vec![ACK_OK]);
+        assert!(
+            !e.is_master(),
+            "node must no longer be master after step-down"
+        );
+        Arc::clone(&e).close().unwrap();
+    }
+
+    /// A STEP_DOWN frame shorter than the mandatory 9-byte prefix must be
+    /// rejected rather than panic.
+    #[test]
+    fn handle_rejects_short_step_down_frame() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let e = env("n", &dir);
+        let svc = AdminService::new(Arc::downgrade(&e));
+        let pair = LocalChannelPair::new();
+        pair.channel_b.send(&[CMD_STEP_DOWN, 1]).unwrap();
+        svc.handle(Box::new(pair.channel_a)).unwrap();
+        let reply =
+            pair.channel_b.receive(Duration::from_secs(1)).unwrap().unwrap();
+        assert_eq!(reply, vec![ACK_REJECTED]);
+        Arc::clone(&e).close().unwrap();
+    }
+
+    /// An unrecognised command byte must be rejected, not panic on an
+    /// unmatched `match` arm.
+    #[test]
+    fn handle_rejects_unknown_command() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let e = env("n", &dir);
+        let svc = AdminService::new(Arc::downgrade(&e));
+        let pair = LocalChannelPair::new();
+        pair.channel_b.send(&[0xEE]).unwrap();
+        svc.handle(Box::new(pair.channel_a)).unwrap();
+        let reply =
+            pair.channel_b.receive(Duration::from_secs(1)).unwrap().unwrap();
+        assert_eq!(reply, vec![ACK_REJECTED]);
+        Arc::clone(&e).close().unwrap();
+    }
+
+    /// `service_name()` must report the wire-protocol constant so the
+    /// `TcpServiceDispatcher` / `ServiceDispatcher` route ADMIN connections
+    /// correctly.
+    #[test]
+    fn service_name_matches_constant() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let e = env("n", &dir);
+        let svc = AdminService::new(Arc::downgrade(&e));
+        assert_eq!(svc.service_name(), ADMIN_SERVICE_NAME);
+        Arc::clone(&e).close().unwrap();
+    }
+
+    /// End-to-end `send_step_down` against a real `TcpServiceDispatcher`:
+    /// exercises the client-side framing (`send_step_down`) together with
+    /// the server-side STEP_DOWN branch that is otherwise only reachable
+    /// over the network.
+    #[test]
+    fn send_step_down_round_trips_over_tcp() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = RepConfig::builder("g1", "n", "127.0.0.1")
+            .node_port(0)
+            .env_home(dir.path())
+            .build();
+        cfg.insecure_no_auth = true;
+        let e = Arc::new(ReplicatedEnvironment::new(cfg).unwrap());
+        e.become_master(1).unwrap();
+        e.register_admin_service();
+        let addr = e.bound_addr().expect("admin dispatcher must bind");
+
+        let ok = send_step_down(addr, 2).expect("step-down call must succeed");
+        assert!(ok, "master must ack STEP_DOWN with ACK_OK");
+
+        let mut demoted = !e.is_master();
+        for _ in 0..50 {
+            if demoted {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            demoted = !e.is_master();
+        }
+        assert!(demoted, "node must no longer be master after STEP_DOWN");
+        Arc::clone(&e).close().unwrap();
+    }
+}

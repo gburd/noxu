@@ -648,4 +648,172 @@ mod tests {
         assert!(matches!(outcome, SyncupOutcome::NeedsRestore { .. }));
         assert_eq!(feeder_handle.join().unwrap().unwrap(), None);
     }
+
+    /// A replica with NO sync-able entries at all (fresh node, `last_sync`
+    /// is `NULL_VLSN`) must fall back to requesting VLSN 1 directly, and
+    /// converge on it if the feeder holds it — the "first contact" case
+    /// JE handles via `FIRST_VLSN`.
+    #[test]
+    fn test_handshake_null_last_sync_requests_vlsn_one() {
+        let pair = LocalChannelPair::new();
+        let replica_ch: Arc<dyn Channel> = Arc::new(pair.channel_a);
+        let feeder_ch: Arc<dyn Channel> = Arc::new(pair.channel_b);
+
+        // Replica: no entries at all, NULL_VLSN range.
+        let replica = MapView::new(
+            NULL_VLSN.sequence(),
+            NULL_VLSN.sequence(),
+            NULL_VLSN.sequence(),
+        );
+        let feeder = MapView::new(1, 4, 4)
+            .put(1, 0x100, 0x11, true)
+            .put(4, 0x400, 0x44, true);
+
+        let feeder_handle = std::thread::spawn(move || {
+            feeder_syncup_handshake(feeder_ch.as_ref(), &feeder)
+        });
+        let outcome =
+            replica_syncup_handshake(replica_ch.as_ref(), &replica).unwrap();
+        assert_eq!(
+            outcome,
+            SyncupOutcome::Matchpoint {
+                matchpoint_vlsn: NULL_VLSN,
+                matchpoint_lsn: 0,
+                start_vlsn: Vlsn::new(1),
+            }
+        );
+        // The null-last-sync branch resolves the outcome locally without
+        // sending StartStream, so the feeder is left blocked in `recv`.
+        // Closing the replica's end unblocks it with ChannelClosed rather
+        // than leaking the thread past the test.
+        replica_ch.close().unwrap();
+        let feeder_result = feeder_handle.join().unwrap();
+        assert!(
+            feeder_result.is_err(),
+            "feeder must observe the channel close, not succeed silently"
+        );
+    }
+
+    /// A replica with NO sync-able entries, whose feeder ALSO lacks VLSN 1
+    /// (e.g. a feeder that has already cleaned it), must fall back to
+    /// network restore rather than the (wrong) matchpoint-found path.
+    #[test]
+    fn test_handshake_null_last_sync_feeder_lacks_vlsn_one_restores() {
+        let pair = LocalChannelPair::new();
+        let replica_ch: Arc<dyn Channel> = Arc::new(pair.channel_a);
+        let feeder_ch: Arc<dyn Channel> = Arc::new(pair.channel_b);
+
+        let replica = MapView::new(
+            NULL_VLSN.sequence(),
+            NULL_VLSN.sequence(),
+            NULL_VLSN.sequence(),
+        );
+        // Feeder's range starts at VLSN 5 (VLSN 1 has been cleaned).
+        let feeder = MapView::new(5, 8, 8)
+            .put(8, 0x800, 0x88, true)
+            .put(5, 0x500, 0x55, true);
+
+        let feeder_handle = std::thread::spawn(move || {
+            feeder_syncup_handshake(feeder_ch.as_ref(), &feeder)
+        });
+        let outcome =
+            replica_syncup_handshake(replica_ch.as_ref(), &replica).unwrap();
+        assert!(matches!(outcome, SyncupOutcome::NeedsRestore { .. }));
+        assert_eq!(feeder_handle.join().unwrap().unwrap(), None);
+    }
+
+    /// `local_matchpoint` (the in-process fast path with no channel) must
+    /// agree with running the wire handshake to the same conclusion.
+    #[test]
+    fn test_local_matchpoint_matches_wire_handshake_result() {
+        let replica = MapView::new(1, 6, 6)
+            .put(6, 0x600, 0xDEAD, true)
+            .put(5, 0x500, 0x55, false)
+            .put(4, 0x400, 0x44, true);
+        let feeder = MapView::new(1, 8, 8)
+            .put(8, 0x800, 0x88, true)
+            .put(6, 0x600, 0xBEEF, true)
+            .put(4, 0x400, 0x44, true);
+
+        let m = local_matchpoint(&replica, &feeder);
+        assert_eq!(
+            m,
+            crate::stream::syncup::Matchpoint::Found {
+                vlsn: Vlsn::new(4),
+                lsn: 0x400
+            }
+        );
+    }
+
+    /// `vlsn_entry` is a trivial struct-literal helper; prove it actually
+    /// assembles the fields in the documented (lsn, fingerprint, is_sync)
+    /// order rather than e.g. swapping lsn/fingerprint.
+    #[test]
+    fn test_vlsn_entry_helper_assembles_fields_in_order() {
+        let e = vlsn_entry(0x1234, 0xABCD, true);
+        assert_eq!(e.lsn, 0x1234);
+        assert_eq!(e.fingerprint, 0xABCD);
+        assert!(e.is_sync);
+    }
+
+    /// An unexpected message on the replica side of the handshake (e.g. the
+    /// feeder sends a bare `RestoreResponse` when an `Entry`-family reply
+    /// was expected) must surface a `ProtocolError`, not panic on an
+    /// unmatched arm.
+    #[test]
+    fn test_handshake_replica_rejects_unexpected_response() {
+        let pair = LocalChannelPair::new();
+        let replica_ch: Arc<dyn Channel> = Arc::new(pair.channel_a);
+        let feeder_ch = pair.channel_b;
+
+        let replica = MapView::new(1, 4, 4).put(4, 0x400, 0x44, true);
+
+        let responder = std::thread::spawn(move || {
+            // Drain the EntryRequest, then reply with something the replica
+            // handshake never expects mid-negotiation.
+            let _ = feeder_ch.receive(Duration::from_secs(5)).unwrap();
+            send(&feeder_ch, &SyncupMsg::RestoreResponse).unwrap();
+        });
+
+        let err = replica_syncup_handshake(replica_ch.as_ref(), &replica)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("unexpected response"),
+            "unexpected error: {err}"
+        );
+        responder.join().unwrap();
+    }
+
+    /// An unexpected message on the feeder side (a bare `Entry` sent instead
+    /// of an `EntryRequest`/`StartStream`/`RestoreRequest`) must surface a
+    /// `ProtocolError`, not panic on an unmatched arm.
+    #[test]
+    fn test_handshake_feeder_rejects_unexpected_request() {
+        let pair = LocalChannelPair::new();
+        let feeder_ch: Arc<dyn Channel> = Arc::new(pair.channel_b);
+        let replica_ch = pair.channel_a;
+
+        let feeder = MapView::new(1, 4, 4).put(4, 0x400, 0x44, true);
+
+        let sender = std::thread::spawn(move || {
+            send(
+                &replica_ch,
+                &SyncupMsg::Entry {
+                    vlsn: Vlsn::new(4),
+                    lsn: 0x400,
+                    fingerprint: 0x44,
+                    is_sync: true,
+                },
+            )
+            .unwrap();
+        });
+
+        let err =
+            feeder_syncup_handshake(feeder_ch.as_ref(), &feeder).unwrap_err();
+        assert!(
+            err.to_string().contains("unexpected request"),
+            "unexpected error: {err}"
+        );
+        sender.join().unwrap();
+    }
 }

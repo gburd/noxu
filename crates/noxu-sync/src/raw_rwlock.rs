@@ -339,3 +339,142 @@ impl NoxuRawRwLock {
         self.exclusive_owner.load(Ordering::Relaxed)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lock_api::{RawRwLock as _, RawRwLockTimed as _};
+    use std::sync::Arc;
+
+    /// `try_lock_exclusive` on the raw lock (the `lock_api::RawRwLock`
+    /// entry point, not the wrapping `noxu_sync::RwLock`) must succeed
+    /// when free and report the acquiring thread as the exclusive owner.
+    #[test]
+    fn raw_try_lock_exclusive_succeeds_when_free_and_sets_owner() {
+        let raw = NoxuRawRwLock::INIT;
+        assert!(!raw.is_locked());
+        assert!(!raw.is_locked_exclusive());
+        assert_eq!(raw.get_exclusive_owner(), 0);
+
+        assert!(raw.try_lock_exclusive());
+        assert!(raw.is_locked());
+        assert!(raw.is_locked_exclusive());
+        assert!(raw.is_write_locked());
+        assert_ne!(
+            raw.get_exclusive_owner(),
+            0,
+            "owner must be recorded after acquiring the write lock"
+        );
+
+        unsafe { raw.unlock_exclusive() };
+        assert!(!raw.is_locked());
+        assert_eq!(
+            raw.get_exclusive_owner(),
+            0,
+            "owner must be cleared on unlock_exclusive"
+        );
+    }
+
+    /// `try_lock_exclusive` must fail (not block, not panic) when a
+    /// shared reader already holds the lock.
+    #[test]
+    fn raw_try_lock_exclusive_fails_while_read_locked() {
+        let raw = NoxuRawRwLock::INIT;
+        raw.lock_shared();
+        assert!(raw.is_locked());
+        assert!(!raw.is_locked_exclusive());
+        assert_eq!(raw.reader_count(), 1);
+
+        assert!(
+            !raw.try_lock_exclusive(),
+            "exclusive acquire must fail while a reader holds the lock"
+        );
+
+        unsafe { raw.unlock_shared() };
+        assert_eq!(raw.reader_count(), 0);
+        assert!(!raw.is_locked());
+    }
+
+    /// `try_lock_exclusive_for` / `try_lock_exclusive_until` (the
+    /// `RawRwLockTimed` entry points) must time out rather than block
+    /// forever when the lock is held, and must return control to the
+    /// caller with `false`.
+    #[test]
+    fn raw_try_lock_exclusive_for_times_out_when_contended() {
+        let raw = Arc::new(NoxuRawRwLock::INIT);
+        assert!(raw.try_lock_exclusive());
+
+        let raw2 = Arc::clone(&raw);
+        let timed_out = std::thread::spawn(move || {
+            !raw2.try_lock_exclusive_for(Duration::from_millis(30))
+        })
+        .join()
+        .unwrap();
+        assert!(timed_out);
+
+        unsafe { raw.unlock_exclusive() };
+    }
+
+    /// `try_lock_shared_for` on a write-locked raw lock must time out and
+    /// leave `get_n_waiters()` back at zero once the parked reader gives up
+    /// -- proves the waiter counter used by `noxu_sync::RwLock::get_n_waiters`
+    /// is not leaked on a timeout path.
+    #[test]
+    fn raw_try_lock_shared_for_times_out_and_clears_waiter_count() {
+        let raw = Arc::new(NoxuRawRwLock::INIT);
+        assert!(raw.try_lock_exclusive());
+
+        let raw2 = Arc::clone(&raw);
+        let timed_out = std::thread::spawn(move || {
+            !raw2.try_lock_shared_for(Duration::from_millis(30))
+        })
+        .join()
+        .unwrap();
+        assert!(timed_out);
+        assert_eq!(
+            raw.get_n_waiters(),
+            0,
+            "waiter count must be decremented on the timeout path"
+        );
+
+        unsafe { raw.unlock_exclusive() };
+    }
+
+    /// A writer parked behind a reader must be woken and granted the lock
+    /// once the reader releases it -- exercises the real
+    /// `lock_exclusive_slow` park/wake path (not just the CAS fast path)
+    /// together with `unlock_shared`'s "wake a writer" branch.
+    #[test]
+    fn raw_writer_parks_behind_reader_then_acquires_on_release() {
+        let raw = Arc::new(NoxuRawRwLock::INIT);
+        raw.lock_shared();
+
+        let raw2 = Arc::clone(&raw);
+        let writer = std::thread::spawn(move || {
+            raw2.lock_exclusive();
+            unsafe { raw2.unlock_exclusive() };
+        });
+
+        // Give the writer a chance to park behind the reader.
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(!raw.is_locked_exclusive(), "reader still holds the lock");
+
+        unsafe { raw.unlock_shared() };
+        writer.join().unwrap();
+
+        // Lock must be free again after the writer completed.
+        assert!(!raw.is_locked());
+    }
+
+    /// `try_lock_exclusive_until` (deadline form) must also succeed on the
+    /// fast (uncontended) path, exercising the CAS-success branch that
+    /// `try_lock_exclusive_for` shares by delegation.
+    #[test]
+    fn raw_try_lock_exclusive_until_succeeds_fast_path() {
+        let raw = NoxuRawRwLock::INIT;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert!(raw.try_lock_exclusive_until(deadline));
+        assert!(raw.is_locked_exclusive());
+        unsafe { raw.unlock_exclusive() };
+    }
+}
