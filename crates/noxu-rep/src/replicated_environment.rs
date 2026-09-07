@@ -124,6 +124,21 @@ pub enum SyncupAction {
     /// from `start_vlsn` (`matchpoint + 1`). `matchpoint_vlsn == last VLSN`
     /// means the replica was not diverged and nothing was truncated.
     RolledBack { matchpoint_vlsn: u64, start_vlsn: u64 },
+    /// A valid matchpoint was found and the replica IS diverged past it, but
+    /// the divergent tail cannot be discarded safely by this build, so nothing
+    /// was truncated and the syncup is REFUSED.
+    ///
+    /// This is the deliberately conservative middle case between
+    /// [`Self::RolledBack`] and [`Self::NeedsRestore`]: rather than truncate a
+    /// tail whose effects may already be visible in the live in-memory B-tree
+    /// (this build omits JE `Replay.rollback` step 2, the in-memory `TxnChain`
+    /// revert), the divergence is DETECTED and reported. `reason` names the
+    /// offending tail entry; the remedy is a network restore. See
+    /// [`crate::stream::syncup::classify_tail`].
+    ///
+    /// Truncating a replica's log is irreversible, so a refusal is always
+    /// preferred over a possibly-unsafe truncation.
+    DivergedRefused { matchpoint_vlsn: u64, tail_len: usize, reason: String },
     /// No safe rollback (no common matchpoint, or it would cross a committed
     /// txn); the replica must do a full network restore.
     NeedsRestore,
@@ -1698,6 +1713,10 @@ impl ReplicatedEnvironment {
     ///   the matchpoint; resume streaming from `start_vlsn`. The non-diverged
     ///   case (matchpoint == last VLSN) returns `RolledBack` with an empty
     ///   tail and is a no-op rollback.
+    /// - [`SyncupAction::DivergedRefused`] — a matchpoint exists and the
+    ///   replica IS diverged past it, but the divergent tail cannot be
+    ///   discarded safely (see [`crate::stream::syncup::classify_tail`]);
+    ///   NOTHING was truncated and the caller must network-restore.
     /// - [`SyncupAction::NeedsRestore`] — `verify_rollback` selected
     ///   NetworkRestore (no common matchpoint) or HardRecovery (the rollback
     ///   would cross a committed/aborted txn); the caller must network-restore
@@ -1774,11 +1793,52 @@ impl ReplicatedEnvironment {
                     Matchpoint::Found { lsn, .. } => *lsn,
                     Matchpoint::None => 0,
                 };
+                let mp = matchpoint_vlsn.sequence().max(0) as u64;
+
+                // SAFETY GATE (the conservative half of this feature): a
+                // verified matchpoint says the tail is not in the cluster's
+                // accepted history, but it does NOT say the tail can be
+                // discarded from THIS replica without further work. This build
+                // performs JE `Replay.rollback` steps 1 and 3-5 (RollbackStart,
+                // make-invisible, fsync, RollbackEnd) but NOT step 2 (the
+                // in-memory `TxnChain` revert), so only a tail that was never
+                // applied to the live tree may be dropped. Anything else is
+                // REFUSED, not truncated — log truncation is irreversible,
+                // while a refusal leaves the operator (or the automatic
+                // NeedsRestore path) a network restore.
+                let tail_types: Vec<(
+                    noxu_util::Vlsn,
+                    Option<noxu_log::LogEntryType>,
+                )> = match &log_view {
+                    Some(v) => v.tail_types(matchpoint_vlsn),
+                    // VLSN-index-only model (no log re-read): the index records
+                    // per-VLSN types only via the range summary, so the exact
+                    // tail types are unknown. Fall through with an empty tail
+                    // (the index truncation below is the whole rollback in that
+                    // model — there is no live tree to diverge from).
+                    None => Vec::new(),
+                };
+                let tail_len = tail_types.len();
+                if let crate::stream::syncup::TailSafety::Refuse { reason } =
+                    crate::stream::syncup::classify_tail(tail_types)
+                {
+                    log::error!(
+                        "Node '{}': REFUSING syncup rollback to matchpoint \
+                         vlsn={mp}: {reason} ({tail_len} diverged tail \
+                         entries left INTACT; no log truncation performed)",
+                        self.config.node_name,
+                    );
+                    return Ok(SyncupAction::DivergedRefused {
+                        matchpoint_vlsn: mp,
+                        tail_len,
+                        reason,
+                    });
+                }
+
                 // Collect the rolled-back LSNs (VLSNs strictly above the
                 // matchpoint). When the real log was re-read, use its EXACT
                 // per-VLSN LSNs so make-invisible flips the right header bytes
                 // (the sparse VLSN index only stores boundary/last LSNs).
-                let mp = matchpoint_vlsn.sequence().max(0) as u64;
                 let rollback_lsns: Vec<noxu_util::Lsn> = match &log_view {
                     Some(v) => v
                         .entries()

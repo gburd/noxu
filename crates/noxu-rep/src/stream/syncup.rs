@@ -310,9 +310,21 @@ pub enum TailSafety {
 /// automatic `NeedsRestore` path, network-restores the replica). An unsafe
 /// truncation is not. This function is the conservative half of that trade.
 pub fn classify_tail(
-    tail_types: impl IntoIterator<Item = (Vlsn, noxu_log::LogEntryType)>,
+    tail_types: impl IntoIterator<Item = (Vlsn, Option<noxu_log::LogEntryType>)>,
 ) -> TailSafety {
     for (vlsn, ty) in tail_types {
+        // An entry whose type byte did not decode cannot be proven
+        // never-applied, so it is not discardable.
+        let Some(ty) = ty else {
+            return TailSafety::Refuse {
+                reason: format!(
+                    "diverged tail entry at VLSN {} has an unrecognised log \
+                     entry type: cannot prove it was never applied to the \
+                     live B-tree. A network restore is required.",
+                    vlsn.sequence()
+                ),
+            };
+        };
         // Txn ends must have been routed to HardRecovery by verify_rollback.
         if matches!(
             ty,
@@ -559,6 +571,14 @@ mod tests {
 
     use noxu_log::LogEntryType as T;
 
+    /// Wrap bare entry types as the `Option`s `classify_tail` consumes (it
+    /// takes `Option` so an undecodable type byte can be reported as unsafe).
+    fn tail(
+        types: impl IntoIterator<Item = (Vlsn, T)>,
+    ) -> Vec<(Vlsn, Option<T>)> {
+        types.into_iter().map(|(v, t)| (v, Some(t))).collect()
+    }
+
     /// An empty tail (matchpoint == last VLSN, the not-actually-diverged case)
     /// is trivially safe.
     #[test]
@@ -573,12 +593,23 @@ mod tests {
     /// `ReplicaReplay` and never applied to the tree — safe to discard.
     #[test]
     fn test_classify_tail_provisional_lns_are_safe() {
-        let tail = vec![
+        let tail = tail([
             (Vlsn::new(6), T::InsertLNTxn),
             (Vlsn::new(7), T::UpdateLNTxn),
             (Vlsn::new(8), T::DeleteLNTxn),
-        ];
+        ]);
         assert_eq!(classify_tail(tail), TailSafety::SafeToDiscard);
+    }
+
+    /// An undecodable entry type cannot be proven never-applied → refuse.
+    #[test]
+    fn test_classify_tail_unknown_type_is_refused() {
+        match classify_tail(vec![(Vlsn::new(6), None)]) {
+            TailSafety::Refuse { reason } => {
+                assert!(reason.contains("unrecognised"), "reason: {reason}")
+            }
+            other => panic!("expected Refuse, got {other:?}"),
+        }
     }
 
     /// A NON-transactional LN in the tail was applied straight to the live
@@ -588,7 +619,7 @@ mod tests {
     #[test]
     fn test_classify_tail_non_txn_ln_is_refused() {
         let tail =
-            vec![(Vlsn::new(6), T::InsertLNTxn), (Vlsn::new(7), T::InsertLN)];
+            tail([(Vlsn::new(6), T::InsertLNTxn), (Vlsn::new(7), T::InsertLN)]);
         match classify_tail(tail) {
             TailSafety::Refuse { reason } => {
                 assert!(
@@ -608,7 +639,7 @@ mod tests {
     /// (the hazard JE documents in `verifyRollback`) → refuse.
     #[test]
     fn test_classify_tail_structural_entry_is_refused() {
-        let tail = vec![(Vlsn::new(6), T::IN)];
+        let tail = tail([(Vlsn::new(6), T::IN)]);
         assert!(matches!(classify_tail(tail), TailSafety::Refuse { .. }));
     }
 
@@ -617,7 +648,7 @@ mod tests {
     #[test]
     fn test_classify_tail_txn_end_is_refused() {
         for ty in [T::TxnCommit, T::TxnAbort] {
-            match classify_tail(vec![(Vlsn::new(6), ty)]) {
+            match classify_tail(tail([(Vlsn::new(6), ty)])) {
                 TailSafety::Refuse { reason } => assert!(
                     reason.contains("transaction end"),
                     "reason must name the txn end: {reason}"
@@ -631,11 +662,11 @@ mod tests {
     /// follow, and names that entry's VLSN.
     #[test]
     fn test_classify_tail_refuses_on_first_unsafe_entry() {
-        let tail = vec![
+        let tail = tail([
             (Vlsn::new(6), T::InsertLNTxn),
             (Vlsn::new(7), T::DeleteLN), // unsafe
             (Vlsn::new(8), T::InsertLNTxn),
-        ];
+        ]);
         match classify_tail(tail) {
             TailSafety::Refuse { reason } => {
                 assert!(reason.contains("VLSN 7"), "reason: {reason}")
