@@ -22,10 +22,10 @@ So the coverage mandate is satisfied for eight of the nine core data-path
 crates — function coverage 87–96%, line coverage 88–95%. **`noxu-dbi` is the
 one genuine outlier** and is where any future coverage effort should go.
 
-## Bugs found while measuring (both real, both recorded not fixed)
+## Bugs found while measuring (three real; all recorded, none fixed here)
 
-Measuring coverage turned up two genuine production bugs. Neither was found by
-reading code — both surfaced because a coverage run *failed or hung*, which is
+Measuring coverage turned up three genuine production bugs. None was found by
+reading code — each surfaced because a coverage run *failed or hung*, which is
 the lesson worth internalising: **treat a wedged or failing coverage run as a
 bug report, not a tooling problem.**
 
@@ -81,6 +81,46 @@ the two-list state up directly instead of racing into it, so it reproduces the
 identical panic **deterministically in 0.00s** instead of 886s. The fix is a
 `contains` guard on that arm, matching every sibling path; un-ignore the test
 with the fix.
+
+### 3. `noxu-db` aborted duplicates survive recovery — load-dependent, NOT root-caused
+
+`cargo llvm-cov -p noxu-db` also failed in
+`je_recovery_sr_test::sr9752_part2_abort_after_committed_dups_reverts_with_dups`
+(the port of JE `RecoveryAbortTest.testSR9752Part2`):
+
+```text
+assertion `left == right` failed: post-recovery: aborted dups must NOT appear
+  left:  [[97], [98], [99], [120]]
+  right: [[97], [98], [99]]
+```
+
+`[120]` is `"x"` — the first of three duplicates inserted under an **aborted**
+transaction. It is absent before recovery (the test asserts that too, and that
+assertion passes) and present after. That is an atomicity/durability violation:
+recovery resurrected data from a transaction that aborted.
+
+**This is not root-caused and is the most concerning of the three.** What is
+established:
+
+- It is **not** a coverage artifact in the "instrumentation changes semantics"
+  sense, but it is load-dependent. It reproduced in **both** full-crate
+  instrumented runs (`--test-threads` default and `4`), and the failing test
+  and the surviving datum were identical each time.
+- It does **not** reproduce in isolation: 12/12 runs of the single test pass,
+  6/6 runs of all four tests in that file at `--test-threads 4` pass, and 3/3
+  `cargo llvm-cov --test je_recovery_sr_test` runs pass. So instrumentation
+  alone is not sufficient — it needs the whole ~50-target crate running.
+- Each test uses its own `TempDir`, so this is not shared on-disk state between
+  tests. The likely mechanism is timing: background daemons (checkpointer /
+  evictor / cleaner) racing the abort-then-recover sequence, with the heavy
+  parallel load widening a window that is otherwise almost never hit.
+
+Next step for whoever picks this up: run the full crate under
+`--test-threads 1` to see whether load or concurrency is the trigger, then
+bisect toward which concurrent target perturbs it. Worth treating as a
+potentially serious recovery bug until shown otherwise — "aborted data
+reappears after restart" is the kind of failure a lock-based, non-MVCC engine
+must never exhibit.
 
 ## The "noxu-log cannot be measured" claim was WRONG — it was a deadlock
 
