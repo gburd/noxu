@@ -805,7 +805,10 @@ impl rustls::client::danger::ServerCertVerifier for SkipCertVerification {
 
 // ─── native-tls helpers ──────────────────────────────────────────────────────
 
-#[cfg(feature = "tls-native")]
+// Gated on native-tls being the SELECTED backend, not merely enabled: the
+// channel layer prefers rustls whenever both features are on, so with both
+// enabled these helpers would be defined but never called.
+#[cfg(all(feature = "tls-native", not(feature = "tls-rustls")))]
 impl TlsConfig {
     /// Build a `native_tls::TlsAcceptor` for TCP server use.
     ///
@@ -1106,7 +1109,7 @@ mod tests {
 
     // ── native-tls path (requires tls-native feature) ────────────────
 
-    #[cfg(feature = "tls-native")]
+    #[cfg(all(feature = "tls-native", not(feature = "tls-rustls")))]
     #[test]
     fn native_acceptor_requires_pkcs12_identity() {
         // SelfSigned identity is rejected because native_tls cannot
@@ -1125,7 +1128,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "tls-native")]
+    #[cfg(all(feature = "tls-native", not(feature = "tls-rustls")))]
     #[test]
     fn native_connector_skip_verification_succeeds() {
         let cfg = TlsConfig {
@@ -1542,7 +1545,7 @@ mod tests {
     // verification. A warning is not a security boundary. The check
     // runs before identity parsing so that the misconfiguration
     // surfaces independently of any identity-format issues.
-    #[cfg(feature = "tls-native")]
+    #[cfg(all(feature = "tls-native", not(feature = "tls-rustls")))]
     #[test]
     fn tls4_native_acceptor_with_ca_files_intent_errors() {
         let cfg = TlsConfig {
@@ -1570,7 +1573,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "tls-native")]
+    #[cfg(all(feature = "tls-native", not(feature = "tls-rustls")))]
     #[test]
     fn tls4_native_acceptor_with_ca_bytes_intent_errors() {
         let cfg = TlsConfig {
@@ -1595,7 +1598,7 @@ mod tests {
 
     // TLS-4: SkipVerification (no mTLS intent) must remain functional on
     // the tls-native server path — the Refusal is conditional on intent.
-    #[cfg(feature = "tls-native")]
+    #[cfg(all(feature = "tls-native", not(feature = "tls-rustls")))]
     #[test]
     fn tls4_native_acceptor_skip_verification_unaffected() {
         // SkipVerification = no mTLS intent, so the new TLS-4 check

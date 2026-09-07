@@ -697,7 +697,10 @@ impl TlsTcpChannel {
         Ok(Self::wrap(Box::new(stream)))
     }
 
-    #[cfg(feature = "tls-native")]
+    // Gated to match its only caller in `connect` (which prefers rustls when
+    // both TLS backends are enabled), so enabling both features does not leave
+    // this function defined-but-unreachable.
+    #[cfg(all(feature = "tls-native", not(feature = "tls-rustls")))]
     fn connect_native(addr: SocketAddr, tls: &TlsConfig) -> Result<Self> {
         let connector = tls.to_native_connector()?;
         let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(30))
@@ -794,7 +797,10 @@ impl Channel for TlsTcpChannel {
 enum TlsAcceptorImpl {
     #[cfg(feature = "tls-rustls")]
     Rustls(std::sync::Arc<rustls::ServerConfig>),
-    #[cfg(feature = "tls-native")]
+    // Gated to match the construction site in `bind_with_tls` (rustls is
+    // preferred when both backends are enabled), so enabling both features
+    // does not leave this variant defined-but-unconstructible.
+    #[cfg(all(feature = "tls-native", not(feature = "tls-rustls")))]
     Native(native_tls::TlsAcceptor),
 }
 
@@ -871,7 +877,7 @@ impl TlsTcpChannelListener {
                 let stream = rustls::StreamOwned::new(conn, tcp);
                 Ok(TlsTcpChannel::wrap(Box::new(stream)))
             }
-            #[cfg(feature = "tls-native")]
+            #[cfg(all(feature = "tls-native", not(feature = "tls-rustls")))]
             TlsAcceptorImpl::Native(acceptor) => {
                 let stream = acceptor.accept(tcp).map_err(|e| {
                     RepError::NetworkError(format!("TLS handshake: {e}"))
