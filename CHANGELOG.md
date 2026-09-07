@@ -36,6 +36,17 @@ listed in [References](#references).
   latch's own 5s freeze timeout, so a never-resolving election degrades to the
   previous behaviour rather than stalling the replay thread.
 
+  **Ranking subtlety worth preserving** (a non-obvious way to break this): the
+  latch thaws only when the frozen proposal is *not* better-than the incoming
+  event, i.e. it compares proposals using Noxu's **election-ranking** order
+  (dtvlsn, vlsn, priority, term, name) — not JE's monotone time-based proposal
+  order. A bare term therefore does not order rounds: a laggard's *later* round
+  could rank as "worse" and its `ElectionResult` would fail to lift the freeze.
+  The `round_proposal(term)` helper exists precisely for this — it encodes the
+  term into *every* dominant ranking key so freeze/thaw pairs order by election
+  round. Verified non-vacuously: removing the round check makes the shuttle
+  model find a stale round-6 event thawing round 7.
+
 ### Testing
 
 - The shuttle DST gate (`crates/noxu-rep/tests/shuttle_rep_sync.rs`) gains two
