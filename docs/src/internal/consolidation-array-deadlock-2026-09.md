@@ -1,23 +1,23 @@
 # `noxu-log` consolidation-array LWL: deterministic self-deadlock (2026-09)
 
-**Status**: found and root-caused during the core-crate coverage sweep. A
-candidate fix was written, verified, and then **backed out of the coverage
-branch** at the maintainer's request — the maintainer owns this bug because it
-also settles a pending "keep or retire the consolidation array" decision. The
-verified fix is preserved as a git commit that is *not* on any merged branch:
+**Status**: **RESOLVED — the feature was RETIRED.** This bug settled the
+long-standing "keep or retire the consolidation array" decision: the feature was
+not merely unproven-faster (it had previously measured ~100x slower on spread
+arrivals), it was *incorrect*. Rather than fix a deadlocking alternative to a
+working default path, `consolidation.rs`, its shuttle model, the hanging stress
+test, the `noxu.log.consolidationArray` config knob, and all of its config
+threading were removed outright (a BREAKING public-knob removal; see the
+CHANGELOG `### Removed` entry). That also deleted 5 production `unsafe` blocks
+(`noxu-log` 12 -> 7) and made `cargo nextest run -p noxu-log` complete in ~6s
+where it had previously hung forever.
 
-```sh
-git show 0f69de83        # the fix + its regression test
-git cherry-pick 0f69de83 # to apply it
-```
+The analysis below is retained because it documents the failure mode, the gdb
+evidence, and *why* retirement was the right call — not because any fix is
+pending. A candidate fix was written during the investigation but was
+deliberately superseded by the removal.
 
-A standalone patch file is also kept at
-`.agent/archived-audits/consolidation-array-deadlock-2026-09.patch` (untracked,
-local only — `.agent/archived-audits/` is gitignored) so nothing has to be
-re-derived.
-
-**Severity**: hangs the entire WAL write path. Gated behind
-`noxu.log.consolidationArray`, which **defaults to `false`**, so the shipped
+**Severity**: hung the entire WAL write path. Gated behind
+`noxu.log.consolidationArray`, which **defaulted to `false`**, so the shipped
 default path (classic mutex LWL) is unaffected. Any deployment that opts in
 hangs under concurrent write load. `noxu-dbi/src/environment_impl.rs:831`
 wires the config straight through, so opting in is a one-line config change.
