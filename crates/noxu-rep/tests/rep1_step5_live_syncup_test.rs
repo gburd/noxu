@@ -79,6 +79,23 @@ fn test_diverged_replica_converges_via_live_syncup_rollback() {
     master.with_environment(Arc::clone(&master_env));
     replica.with_environment(Arc::clone(&replica_env));
 
+    // Force the two nodes' logs to DIVERGE IN LAYOUT before the common
+    // history: the replica gets extra local (non-replicated, un-VLSN'd)
+    // entries, so the SAME replicated record lands at a DIFFERENT LSN on each
+    // node. This is the normal case in a real cluster (each node's log has its
+    // own history), and it is what makes this test meaningful: a matchpoint
+    // search that compared the two nodes' LSNs would find NO matchpoint here
+    // and wrongly demand a network restore. JE compares record CONTENTS
+    // (`OutputWireRecord.match` = header.logicalEqualsIgnoreVersion +
+    // entry.logicalEquals), never LSNs.
+    {
+        let lm = replica_env.get_log_manager().expect("log manager");
+        for i in 0..4u8 {
+            lm.log(LN, &[0xF0 | i; 24], noxu_log::Provisional::No, true, false)
+                .expect("local pre-history entry");
+        }
+    }
+
     // Common prefix: both nodes hold VLSNs 1..=5 (TxnCommit sync points).
     for v in 1u64..=5 {
         let payload = [v as u8; 8];
@@ -86,11 +103,36 @@ fn test_diverged_replica_converges_via_live_syncup_rollback() {
         apply(&replica, &replica_env, v, COMMIT, &payload);
     }
 
+    // Prove the layouts really did diverge, so this test cannot silently
+    // regress into the byte-identical-logs case that would mask an
+    // LSN-comparing matchpoint search.
+    {
+        master_env.get_log_manager().unwrap().flush_sync().ok();
+        replica_env.get_log_manager().unwrap().flush_sync().ok();
+        let m = SyncupLogView::scan(master_dir.path()).unwrap();
+        let r = SyncupLogView::scan(replica_dir.path()).unwrap();
+        let v5 = noxu_util::Vlsn::new(5);
+        let (me, re) = (m.entry(v5).unwrap(), r.entry(v5).unwrap());
+        assert_eq!(
+            me.fingerprint, re.fingerprint,
+            "same record contents at VLSN 5 on both nodes"
+        );
+        assert_ne!(
+            me.lsn, re.lsn,
+            "the two nodes must store VLSN 5 at DIFFERENT LSNs, else this \
+             test would pass even with an (incorrect) LSN-equality matchpoint \
+             predicate"
+        );
+    }
+
     // DIVERGENCE: the replica applied uncommitted LN writes at VLSNs 6,7 from
     // an OLD master; the NEW master applied DIFFERENT uncommitted LN writes at
-    // 6,7 plus a fresh entry at 8. VLSNs 6,7 are LN (NOT txn ends), so rolling
-    // them back is a NORMAL soft rollback, not hard recovery. The matchpoint
-    // is the highest common sync point, VLSN 5.
+    // 6,7 plus a fresh entry at 8. VLSNs 6,7 are transactional LN (NOT txn
+    // ends), so rolling them back is a NORMAL soft rollback, not hard
+    // recovery, AND the tail passes the `classify_tail` safety gate: a
+    // provisional transactional LN is buffered by `ReplicaReplay` and never
+    // applied to the live tree, so discarding the log entry is a COMPLETE
+    // rollback. The matchpoint is the highest common sync point, VLSN 5.
     apply(&replica, &replica_env, 6, LN, b"OLD-6-AA");
     apply(&replica, &replica_env, 7, LN, b"OLD-7-BB");
     apply(&master, &master_env, 6, LN, b"NEW-6-CC");

@@ -216,6 +216,11 @@ pub struct ReplicatedEnvironment {
     /// When `config.env_home` is `None` at construction time, registration is
     /// deferred until `with_environment()` provides the env home path.
     restore_registered: AtomicBool,
+    /// Whether the SYNCUP service (REP-1 STEP 5 matchpoint negotiation) has
+    /// been registered on the dispatcher. Registered eagerly when `env_home`
+    /// is in the config, else lazily by `with_environment`; tracked separately
+    /// from `restore_registered` so neither path can shadow the other.
+    syncup_registered: AtomicBool,
 
     /// In-memory log queue used by the peer feeder service.
     ///
@@ -434,6 +439,7 @@ impl ReplicatedEnvironment {
         let listen_addr_str =
             format!("{}:{}", config.node_host, config.node_port);
         let mut restore_registered_init = false;
+        let mut syncup_registered_init = false;
 
         // Returns (AnyServiceDispatcher, bound_addr) or (None, None) on error.
         let (tcp_dispatcher, bound_addr) = match listen_addr_str
@@ -459,6 +465,20 @@ impl ReplicatedEnvironment {
                                 home.display(),
                             );
                             restore_registered_init = true;
+
+                            // REP-1 STEP 5: the SYNCUP service, registered
+                            // wherever RESTORE is. A replica that is
+                            // (re)joining connects here to negotiate a
+                            // matchpoint against this node's log before
+                            // streaming, so a diverged tail is detected
+                            // instead of being streamed over.
+                            dispatcher.register(
+                                crate::stream::SYNCUP_SERVICE_NAME,
+                                Arc::new(crate::stream::SyncupService::new(
+                                    home.clone(),
+                                )),
+                            );
+                            syncup_registered_init = true;
                         }
                         let kind =
                             if dispatcher.is_tls() { "TLS" } else { "TCP" };
@@ -545,6 +565,7 @@ impl ReplicatedEnvironment {
             io_threads: StdMutex::new(Vec::new()),
             io_shutdown: Arc::new(AtomicBool::new(false)),
             restore_registered: AtomicBool::new(restore_registered_init),
+            syncup_registered: AtomicBool::new(syncup_registered_init),
             peer_scanner,
             dtvlsn: std::sync::atomic::AtomicU64::new(0),
             election_state,
@@ -1241,18 +1262,25 @@ impl ReplicatedEnvironment {
                 self.config.node_name,
                 env_home.display(),
             );
+        }
 
-            // REP-1 STEP 5: register the SYNCUP service too. A replica that is
-            // (re)joining this node connects here to negotiate a matchpoint
-            // against this node's log BEFORE streaming starts, so a diverged
-            // replica is detected (and rolled back or refused) instead of
-            // streaming the master's history on top of its own divergent tail.
-            // Port of JE `FeederReplicaSyncup`, which the feeder runs before
-            // handing the channel to the `Feeder` output loop.
+        // REP-1 STEP 5: register the SYNCUP service (independently of RESTORE
+        // — when `env_home` is in the config, RESTORE is already registered
+        // eagerly at construction). A replica that is (re)joining this node
+        // connects here to negotiate a matchpoint against this node's log
+        // BEFORE streaming starts, so a diverged replica is detected (and
+        // rolled back or refused) instead of streaming the master's history on
+        // top of its own divergent tail. Port of JE `FeederReplicaSyncup`.
+        if !self.syncup_registered.load(Ordering::SeqCst)
+            && let Some(ref dispatcher) = self.tcp_dispatcher
+        {
             dispatcher.register(
                 crate::stream::SYNCUP_SERVICE_NAME,
-                Arc::new(crate::stream::SyncupService::new(env_home)),
+                Arc::new(crate::stream::SyncupService::new(
+                    env.get_env_home().to_path_buf(),
+                )),
             );
+            self.syncup_registered.store(true, Ordering::SeqCst);
             log::debug!(
                 "Node '{}' SYNCUP service registered",
                 self.config.node_name,
