@@ -15,7 +15,55 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Fixed
+
+- **`noxu-log`: fixed a deterministic self-deadlock in the consolidation-array
+  Log Write Latch** (`consolidation.rs`, opt-in via
+  `noxu.log.consolidationArray`, default `false`). `run_as_leader` stamped the
+  whole batch in arrival order, and the leader — by definition the committer
+  that found `head == null`, hence the earliest arrival — was therefore always
+  stamped *first*. Each `assign` (`LogManager::assign_slot`) takes a log-buffer
+  `write_pin_count` pin that is released by that committer's own
+  `LogBufferSegment::put`, which runs only *after* `run_as_leader` returns. A
+  follower's pin drains promptly (it is published mid-loop, so its thread wakes
+  and `put`s while the leader still works), but the leader's own pin cannot
+  drain until the batch ends. So as soon as any later member of the same batch
+  needed a buffer flip, `LogBufferPool::write_dirty` →
+  `LogBuffer::wait_for_zero_and_latch` blocked forever on the leader's
+  undrainable pin from *inside* the leader's own batch loop — wedging the whole
+  funnel, with every follower spinning in `wait_as_follower` indefinitely. Any
+  batch of ≥2 committers that triggered a buffer flip hung.
+
+  The fix is a one-line ordering change with a large comment: the leader now
+  defers its OWN `assign` until after every follower has been assigned and
+  published, so its pin is live only across the return into the caller's `put`.
+  Within a batch the leader consequently receives the batch's highest LSN
+  rather than its lowest; that is sound because all members of a batch are
+  concurrently inside `log()` with no happens-before between them, and the
+  properties the log depends on — uniqueness, strict monotonicity, contiguity,
+  and the `prev_offset` back-chain — are unchanged (`assign` still runs exactly
+  once per request, serially).
+
+  Impact: the shipped default path (classic mutex LWL) was never affected, but
+  any deployment that opted into `noxu.log.consolidationArray` would hang under
+  concurrent write load. This also unwedged CI/coverage: the existing
+  `test_consolidation_array_stress_64t_prev_offset_chain` was silently hitting
+  this hang (observed livelocked for >21h at ~200% CPU, 62 of 64 threads
+  spinning as followers), which is what made `cargo llvm-cov -p noxu-log`
+  appear to "time out". The full `noxu-log` lib suite now runs in ~5s.
+
 ### Testing
+
+- Added `consolidation::tests::\
+  leader_assigns_itself_last_so_its_pin_never_blocks_the_batch`, a
+  deterministic single-threaded regression guard for the deadlock above.
+  Because `join` never blocks, a leader plus N followers can be assembled on
+  one thread and the batch driven with no scheduling luck; the test asserts
+  directly that no `assign` runs while the leader's own pin is outstanding
+  (rather than waiting on a hang), and also pins the resulting stamping order,
+  the exactly-once `assign` count, and that followers' results are published
+  before the leader's own stamp. Verified to have teeth: reverting the ordering
+  fix makes it fail in 0.00s instead of hanging forever.
 
 - Removed 48 tautological `test_copy`/`test_clone`-style tests (e.g.
   `let x2 = x1; assert_eq!(x1, x2)`) across 30 `src/*.rs` files in
