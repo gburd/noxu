@@ -2500,6 +2500,91 @@ mod tests {
         512
     }
 
+    /// REGRESSION: a node present in BOTH the primary policy and the pri2
+    /// staging list must not be double-added to pri2.
+    ///
+    /// `SlabList::add_front`/`add_back` carry `debug_assert!(!self.index
+    /// .contains_key(&id))` — re-adding an already-linked node panics in debug
+    /// and silently corrupts the intrusive list in release (the old slot is
+    /// orphaned, `len` over-counts, and the prev/next chain can cycle).
+    ///
+    /// The `MoveDirtyToPri2` arm of `evict_batch` calls
+    /// `self.pri2.lock().add_front(node_id)` **unconditionally**, unlike every
+    /// `primary_policy` path (`LruPolicy::insert`/`put_back` guard with
+    /// `contains` under the same lock) and unlike the `pri2_insert_for_test`
+    /// helper, which also guards. So it depends on the invariant "a node
+    /// drained from the primary policy is never already in pri2".
+    ///
+    /// That invariant does not hold: `note_ins_added` (called from
+    /// `noxu-tree`'s `tree.rs:2866` on BIN repopulation and `:4678` on split)
+    /// inserts straight into `primary_policy` without consulting pri2, so a
+    /// node parked in pri2 awaiting a checkpoint that is re-faulted and
+    /// re-added ends up in BOTH lists. `evict_batch` then drains it from
+    /// primary, and `decide_eviction` sees `already_in_pri2 == false` — that
+    /// flag is `from_pri2`, i.e. "which list did this candidate come from",
+    /// NOT "is it in pri2" — so it returns `MoveDirtyToPri2` and the unguarded
+    /// `add_front` fires the assert.
+    ///
+    /// Observed for real: `noxu-db`'s `read_only_workload_rss_stays_bounded`
+    /// panicked with `assertion failed: !self.index.contains_key(&id)` at
+    /// `slab.rs:129` under `cargo llvm-cov`. It passes uninstrumented, so this
+    /// is a genuine latent race (instrumentation just widens the window), not a
+    /// coverage artifact.
+    ///
+    /// Driven single-threaded so it is deterministic: the two-list state is set
+    /// up directly rather than raced into existence.
+    ///
+    /// IGNORED: currently FAILS — it documents an unfixed production bug. The
+    /// fix is a `contains` guard on the `MoveDirtyToPri2` arm (what every
+    /// sibling path and `pri2_insert_for_test` already do), but it is held back
+    /// pending a maintainer decision, so this is `#[ignore]`d rather than left
+    /// red. Un-ignore it with the fix. Analysis:
+    /// `docs/src/internal/coverage-baseline-2026-09.md`.
+    #[test]
+    #[ignore = "documents an unfixed bug: MoveDirtyToPri2 double-adds a node \
+                already in pri2; see docs/src/internal/coverage-baseline-2026-09.md"]
+    fn test_node_in_primary_and_pri2_is_not_double_added_to_pri2() {
+        let (_c, e) = make_evictor(1500, 1000, 10);
+
+        // Resident and tracked by the primary policy (what `note_ins_added`
+        // does on a repopulate/split) ...
+        e.note_ins_added(7, CacheMode::Default);
+        // ... and ALSO already parked in pri2 awaiting a checkpoint.
+        e.pri2_insert_for_test(7);
+
+        assert!(
+            e.primary_policy.contains(7),
+            "precondition: node tracked by the primary policy"
+        );
+        assert!(
+            e.pri2.lock().contains(7),
+            "precondition: node also parked in pri2"
+        );
+
+        // Dirty, non-BIN, unreferenced, resident => decide_eviction returns
+        // MoveDirtyToPri2 for a candidate drained from the PRIMARY policy
+        // (from_pri2 == false), which is the unguarded add_front arm.
+        let _ = e.evict_batch(
+            EvictionSource::Daemon,
+            &static_info_fn(true, false, true, 0),
+            &size_512,
+        );
+
+        // The invariant: pri2 must never hold a node twice. Checked via `len`
+        // because a double-add orphans the duplicate slot and `len` is what
+        // over-counts — the observable corruption in release builds, where the
+        // debug_assert is compiled out.
+        let p = e.pri2.lock();
+        assert!(p.contains(7), "the dirty node must still be staged in pri2");
+        assert_eq!(
+            p.len, 1,
+            "node 7 must appear in pri2 exactly once; len={} means the \
+             unguarded add_front double-linked an already-present node, \
+             orphaning its old slot and corrupting the intrusive list",
+            p.len
+        );
+    }
+
     #[test]
     fn test_evict_batch_skip_path() {
         let (_c, e) = make_evictor(1500, 1000, 10);

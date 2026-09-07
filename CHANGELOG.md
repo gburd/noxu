@@ -27,6 +27,31 @@ listed in [References](#references).
 
 ### Testing
 
+- **Found a real `noxu-evictor` bug on the DEFAULT path while measuring
+  coverage** and recorded it as an `#[ignore]`d, deterministic reproducer,
+  `evictor::tests::test_node_in_primary_and_pri2_is_not_double_added_to_pri2`.
+  The `MoveDirtyToPri2` arm of `evict_batch` calls `pri2.add_front(node_id)`
+  unconditionally, while every sibling `primary_policy` path (and the
+  `pri2_insert_for_test` helper) guards with `contains` first. It relies on "a
+  node drained from the primary policy is never already in pri2", which is
+  false: `note_ins_added` inserts into `primary_policy` without consulting
+  pri2, and `noxu-tree` calls it on BIN repopulation and on split, so a node
+  parked in pri2 awaiting a checkpoint that is re-faulted lands in both lists.
+  `decide_eviction`'s `already_in_pri2` argument is really `from_pri2` ("which
+  list did this candidate come from"), so it does not catch the case. Result:
+  `SlabList::add_front`'s `debug_assert!(!self.index.contains_key(&id))` fires
+  in debug, and in **release the assert is compiled out and the intrusive list
+  silently corrupts** (orphaned slot, `len` over-counts, prev/next can cycle).
+  Surfaced as a `cargo llvm-cov -p noxu-db` failure in
+  `read_only_workload_rss_stays_bounded` (panic at `slab.rs:129` after 886s);
+  it passes uninstrumented, so instrumentation merely widens the window. The
+  new test sets the two-list state up directly rather than racing into it and
+  reproduces the identical panic in 0.00s. Left `#[ignore]`d (not fixed)
+  pending a decision; the fix is a `contains` guard on that arm. Note the
+  existing `evicting` single-flight guard does not cover this — it prevents two
+  concurrent batches, whereas this is one batch double-adding a node that two
+  code paths put in two lists. Analysis in
+  [the coverage baseline](docs/src/internal/coverage-baseline-2026-09.md).
 - **Measured `noxu-log` and `noxu-dbi` coverage for the first time**, and
   recorded the whole core-crate picture in
   [the coverage baseline](docs/src/internal/coverage-baseline-2026-09.md).

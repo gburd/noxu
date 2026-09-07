@@ -22,6 +22,66 @@ So the coverage mandate is satisfied for eight of the nine core data-path
 crates — function coverage 87–96%, line coverage 88–95%. **`noxu-dbi` is the
 one genuine outlier** and is where any future coverage effort should go.
 
+## Bugs found while measuring (both real, both recorded not fixed)
+
+Measuring coverage turned up two genuine production bugs. Neither was found by
+reading code — both surfaced because a coverage run *failed or hung*, which is
+the lesson worth internalising: **treat a wedged or failing coverage run as a
+bug report, not a tooling problem.**
+
+### 1. `noxu-log` consolidation-array LWL self-deadlock
+
+Gated behind `noxu.log.consolidationArray` (**default `false`**), so the
+shipped default path is unaffected. This is what made `noxu-log` look
+unmeasurable. Full analysis:
+[the consolidation-array deadlock note](consolidation-array-deadlock-2026-09.md).
+
+### 2. `noxu-evictor` pri2 double-add — **on the DEFAULT path**
+
+`cargo llvm-cov -p noxu-db` *failed*: `read_only_workload_rss_stays_bounded`
+panicked with `assertion failed: !self.index.contains_key(&id)` at
+`slab.rs:129` after 886s. It **passes uninstrumented** (1217s), so
+instrumentation only widens the window — a genuine latent race.
+
+`SlabList::add_front`/`add_back` assert the id is not already linked. In debug
+that panics; in **release the `debug_assert` is compiled out and the intrusive
+list silently corrupts** — the old slot is orphaned, `len` over-counts, and the
+prev/next chain can cycle. That release behaviour is what makes this more
+serious than the deadlock above.
+
+The `MoveDirtyToPri2` arm of `evict_batch` (`evictor.rs:951`) calls
+`self.pri2.lock().add_front(node_id)` **unconditionally**. Every
+`primary_policy` path guards with `contains` under the same lock
+(`LruPolicy::insert`/`put_back`), and even the `pri2_insert_for_test` helper
+guards — this one arm does not. It relies on the invariant "a node drained from
+the primary policy is never already in pri2".
+
+That invariant is false:
+
+- `note_ins_added` (`evictor.rs:593`) inserts straight into `primary_policy`
+  without consulting pri2.
+- `noxu-tree` calls it on BIN repopulation (`tree.rs:2866`) and on split
+  (`tree.rs:4678`).
+- So a node parked in pri2 awaiting a checkpoint that is re-faulted and
+  re-added is in **both** lists.
+- `evict_batch` drains it from primary. `decide_eviction`'s `already_in_pri2`
+  parameter is actually `from_pri2` — "which list did this candidate come
+  from", **not** "is it in pri2" — so it is `false`, the function returns
+  `MoveDirtyToPri2`, and the unguarded `add_front` fires.
+
+The existing `evicting` single-flight guard does **not** cover this. That guard
+prevents two *concurrent batches* from double-adding (see its field doc); this
+is a *single* batch double-adding a node that two different code paths placed in
+two lists. A distinct hole.
+
+Recorded as `evictor::tests::
+test_node_in_primary_and_pri2_is_not_double_added_to_pri2`, `#[ignore]`d
+because it currently fails by design — it documents the unfixed bug. It sets
+the two-list state up directly instead of racing into it, so it reproduces the
+identical panic **deterministically in 0.00s** instead of 886s. The fix is a
+`contains` guard on that arm, matching every sibling path; un-ignore the test
+with the fix.
+
 ## The "noxu-log cannot be measured" claim was WRONG — it was a deadlock
 
 The prior baseline recorded that `cargo llvm-cov -p noxu-log --summary-only`
