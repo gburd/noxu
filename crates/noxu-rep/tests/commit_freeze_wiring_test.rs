@@ -8,10 +8,10 @@
 //! while an election it had promised in was still in flight).
 //!
 //! JE call sites mirrored:
-//!   - freeze       -> `MasterSuggestionGenerator.getRanking`
-//!                     (MasterSuggestionGenerator.java:63)
-//!   - vlsn_event   -> `MasterChangeListener.notify`
-//!                     (MasterChangeListener.java:49)
+//!   - freeze -> `MasterSuggestionGenerator.getRanking`
+//!     (MasterSuggestionGenerator.java:63)
+//!   - vlsn_event -> `MasterChangeListener.notify`
+//!     (MasterChangeListener.java:49)
 //!   - await_thaw   -> `Replay.replayEntry` (Replay.java:525)
 //!   - clear_latch  -> `Replica.shutdown` (Replica.java:305)
 
