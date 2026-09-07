@@ -1879,6 +1879,145 @@ mod tests {
         assert_eq!(lm.get_stats().n_repeat_fault_reads, 0);
     }
 
+    /// Bit-rot detection end to end, in two parts. Both assert the ONE
+    /// invariant that matters: bytes that changed on disk after the write must
+    /// never be handed back to the caller as valid data.
+    ///
+    /// Part 1 flips a **payload** byte, which slips past every structural
+    /// check (length, type, flags all still parse) so the per-entry CRC32 is
+    /// the only thing standing between silent corruption and the caller. This
+    /// is the branch the checksum exists for, and it had no test: nothing in
+    /// the workspace asserted that a flipped payload byte produces
+    /// `NoxuLogError::Checksum`.
+    ///
+    /// Part 2 drives the same thing through the `faultdisk` layer's
+    /// `FaultKind::Corruption`, the one fault kind with no end-to-end
+    /// coverage (`TornWrite` is exercised by `noxu-db`'s `dst_crash_sweep`,
+    /// `DiskFull` by `test_real_write_error_invalidates_and_is_not_swallowed`;
+    /// `Corruption` was only unit-tested at the *decision* level —
+    /// `faultdisk::on_write` returning a `Corrupt` variant — never through
+    /// `posio` → disk → read). It flips from `offset_in_buf: 0`, i.e. the
+    /// header, so detection legitimately comes from a structural check rather
+    /// than the CRC; the assertion is therefore "detected somehow", which is
+    /// the honest contract for that fault.
+    ///
+    /// Both parts read via `read_entry_from_disk`, not `read_entry`: the
+    /// buffer-pool fast path would serve the still-correct in-memory bytes and
+    /// never consult the corrupted disk image.
+    #[test]
+    fn test_on_disk_corruption_is_never_returned_as_valid_data() {
+        use crate::faultdisk::{self, FaultController, FaultKind};
+
+        // --- Part 1: payload bit-flip must be caught by the CRC. ---
+        let dir = TempDir::new().unwrap();
+        let lm = make_log_manager(&dir);
+
+        let payload = vec![0xa5u8; 200];
+        let lsn = lm
+            .log(
+                LogEntryType::InsertLN,
+                &payload,
+                Provisional::No,
+                false,
+                false,
+            )
+            .expect("write must succeed");
+        lm.flush_sync().expect("flush must succeed");
+
+        // Sanity: it reads back clean BEFORE we corrupt it, so a later failure
+        // is attributable to the flip and not to a broken setup.
+        let (ty, clean) =
+            lm.read_entry_from_disk(lsn).expect("clean read must succeed");
+        assert_eq!(ty, LogEntryType::InsertLN);
+        assert_eq!(
+            clean, payload,
+            "entry must read back intact when undamaged"
+        );
+
+        // Flip one byte in the middle of the PAYLOAD, leaving every header
+        // field (checksum, type, flags, sizes) untouched so the entry still
+        // parses perfectly and only the CRC can reject it.
+        let file_path = dir.path().join(format!(
+            "{:08x}{}",
+            lsn.file_number(),
+            crate::file_manager::LOG_FILE_EXTENSION
+        ));
+        let flip_at =
+            lsn.file_offset() as u64 + MIN_HEADER_SIZE as u64 + 100u64;
+        {
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&file_path)
+                .expect("open log file for corruption");
+            let mut one = [0u8; 1];
+            crate::posio::read_exact_at(&f, &mut one, flip_at)
+                .expect("read byte to flip");
+            one[0] = !one[0];
+            crate::posio::write_all_at(&f, &one, flip_at)
+                .expect("write flipped byte");
+            f.sync_all().expect("sync corruption to disk");
+        }
+
+        match lm.read_entry_from_disk(lsn) {
+            Err(NoxuLogError::Checksum { lsn: err_lsn, .. }) => {
+                assert_eq!(
+                    err_lsn, lsn,
+                    "checksum error must name the corrupted entry's LSN"
+                );
+            }
+            Ok((_, read_back)) => panic!(
+                "SILENT CORRUPTION: a flipped payload byte was returned as \
+                 valid data (payload_matches={}); the per-entry CRC32 failed \
+                 to reject it",
+                read_back == payload
+            ),
+            Err(other) => panic!(
+                "a flipped payload byte must fail the CRC with \
+                 NoxuLogError::Checksum, got {other:?}"
+            ),
+        }
+
+        // A corrupt READ must not be treated as a write failure: only
+        // fdatasync/pwrite errors set io_invalid (the C-2 fail-stop stance).
+        assert!(
+            !lm.is_io_invalid(),
+            "a failed checksum on READ must not invalidate the log for writes"
+        );
+
+        // --- Part 2: the faultdisk Corruption fault, end to end. ---
+        let dir2 = TempDir::new().unwrap();
+        let lm2 = make_log_manager(&dir2);
+        lm2.log(LogEntryType::Trace, b"warmup", Provisional::No, false, false)
+            .expect("warmup write");
+        lm2.flush_sync().expect("warmup flush");
+
+        faultdisk::install(FaultController::for_test(
+            FaultKind::Corruption,
+            faultdisk::write_count(),
+        ));
+        // The write itself SUCCEEDS — corruption is silent by construction.
+        let lsn2 = lm2
+            .log(
+                LogEntryType::InsertLN,
+                &payload,
+                Provisional::No,
+                false,
+                false,
+            )
+            .expect("write must succeed: corruption is silent, not an error");
+        lm2.flush_sync().expect("flush must succeed");
+        faultdisk::uninstall();
+
+        let got = lm2.read_entry_from_disk(lsn2);
+        assert!(
+            got.is_err(),
+            "faultdisk-injected on-disk corruption must be detected on read, \
+             but read_entry_from_disk succeeded — corrupt bytes reached the \
+             caller"
+        );
+    }
+
     /// Companion: an entry LARGER than LOG_FAULT_READ_SIZE takes the
     /// repeat-read path (2 random reads) and bumps `n_repeat_fault_reads`,
     /// exactly like JE.  This keeps the single-read fix honest: the second

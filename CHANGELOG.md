@@ -176,6 +176,64 @@ listed in [References](#references).
   matchpoint survives untouched. Also pins `negotiate_syncup` as content-blind
   (it reports `CanServe` for the very same diverged replica) so the range
   check cannot be mistaken for sufficient again.
+
+
+- **Found a real `noxu-evictor` bug on the DEFAULT path while measuring
+  coverage** and recorded it as an `#[ignore]`d, deterministic reproducer,
+  `evictor::tests::test_node_in_primary_and_pri2_is_not_double_added_to_pri2`.
+  The `MoveDirtyToPri2` arm of `evict_batch` calls `pri2.add_front(node_id)`
+  unconditionally, while every sibling `primary_policy` path (and the
+  `pri2_insert_for_test` helper) guards with `contains` first. It relies on "a
+  node drained from the primary policy is never already in pri2", which is
+  false: `note_ins_added` inserts into `primary_policy` without consulting
+  pri2, and `noxu-tree` calls it on BIN repopulation and on split, so a node
+  parked in pri2 awaiting a checkpoint that is re-faulted lands in both lists.
+  `decide_eviction`'s `already_in_pri2` argument is really `from_pri2` ("which
+  list did this candidate come from"), so it does not catch the case. Result:
+  `SlabList::add_front`'s `debug_assert!(!self.index.contains_key(&id))` fires
+  in debug, and in **release the assert is compiled out and the intrusive list
+  silently corrupts** (orphaned slot, `len` over-counts, prev/next can cycle).
+  Surfaced as a `cargo llvm-cov -p noxu-db` failure in
+  `read_only_workload_rss_stays_bounded` (panic at `slab.rs:129` after 886s);
+  it passes uninstrumented, so instrumentation merely widens the window. The
+  new test sets the two-list state up directly rather than racing into it and
+  reproduces the identical panic in 0.00s. Left `#[ignore]`d (not fixed)
+  pending a decision; the fix is a `contains` guard on that arm. Note the
+  existing `evicting` single-flight guard does not cover this — it prevents two
+  concurrent batches, whereas this is one batch double-adding a node that two
+  code paths put in two lists. Analysis in
+  [the coverage baseline](docs/src/internal/coverage-baseline-2026-09.md).
+- **Measured `noxu-log` and `noxu-dbi` coverage for the first time**, and
+  recorded the whole core-crate picture in
+  [the coverage baseline](docs/src/internal/coverage-baseline-2026-09.md).
+  `noxu-log` is at 92.48% region / 91.50% function / 91.37% line (`--lib`
+  scope); `noxu-dbi` is at 81.28% / 78.15% / 78.97%, making it the **only**
+  core data-path crate below the 85% target (the gap is concentrated in
+  `environment_impl.rs` at 58% function coverage). The previously recorded
+  claim that `noxu-log` "cannot be measured locally, needs EC2" was wrong: the
+  runs were not slow, they were wedged on a deadlocking test (see above).
+- `#[ignore]`d `noxu-log`'s
+  `test_consolidation_array_stress_64t_prev_offset_chain`, which deadlocks
+  rather than merely running slowly, and so hung `cargo test` / `cargo
+  llvm-cov` for the whole crate indefinitely (observed livelocked >21h at ~200%
+  CPU). Ignored rather than deleted: it is a correct reproducer of a real
+  production bug and should be un-ignored when the fix lands. `noxu-log --lib`
+  now completes in ~4.7s (492 passed, 2 ignored).
+- Added `noxu-log`'s
+  `test_on_disk_corruption_is_never_returned_as_valid_data`, closing a real
+  gap: nothing asserted that a byte flipped **on disk after a successful
+  write** is rejected on read. Part 1 flips a payload byte, which passes every
+  structural check (length/type/flags still parse) so the per-entry CRC32 is
+  the only thing preventing silent corruption — exactly the branch the checksum
+  exists for. Part 2 drives the same through `faultdisk`'s
+  `FaultKind::Corruption`, previously the only fault kind with no end-to-end
+  coverage (`TornWrite` is covered by `noxu-db`'s `dst_crash_sweep`,
+  `DiskFull` by `test_real_write_error_invalidates_and_is_not_swallowed`;
+  `Corruption` was only unit-tested at the `on_write` *decision* level, never
+  through `posio` → disk → read). Also asserts that a failed checksum on READ
+  does not set `io_invalid`, per the C-2 fail-stop stance that only write/fsync
+  errors invalidate the log.
+
 - Removed 48 tautological `test_copy`/`test_clone`-style tests (e.g.
   `let x2 = x1; assert_eq!(x1, x2)`) across 30 `src/*.rs` files in
   `noxu-cleaner`, `noxu-db`, `noxu-engine`, `noxu-evictor`, `noxu-log`,
