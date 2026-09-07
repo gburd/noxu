@@ -274,10 +274,16 @@ pub fn replica_syncup_handshake(
 
         send(channel, &SyncupMsg::EntryRequest { vlsn: candidate })?;
         match recv(channel)? {
-            SyncupMsg::Entry { vlsn, lsn, fingerprint, .. } => {
-                if vlsn == candidate
-                    && lsn == replica_entry.lsn
-                    && fingerprint == replica_entry.fingerprint
+            SyncupMsg::Entry { vlsn, fingerprint, .. } => {
+                // RECORD equality only (JE `OutputWireRecord.match` =
+                // `header.logicalEqualsIgnoreVersion` + `entry.logicalEquals`,
+                // which never compares LSNs). The feeder's LSN is where the
+                // FEEDER stores the record; the replica rolls back to its OWN
+                // `replica_entry.lsn`. Comparing the two nodes' LSNs would
+                // reject every genuine cross-node matchpoint, since two nodes
+                // holding the same replicated record almost never store it at
+                // the same LSN.
+                if vlsn == candidate && fingerprint == replica_entry.fingerprint
                 {
                     // Matchpoint found.
                     return converge(channel, candidate, replica_entry.lsn);
