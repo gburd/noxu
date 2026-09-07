@@ -55,6 +55,18 @@
 //!     acceptor had promised term `t` (the split-brain guard: an accept at a
 //!     term never promised, or above the promise, is rejected).
 //!
+//! ## Commit freeze latch (`CommitFreezeLatch`)
+//!
+//!   * **freeze-blocks-commit** — a replay thread's `await_thaw()` never
+//!     reports an election thaw before the election event for the frozen round
+//!     was delivered (a commit released early would advance the VLSN
+//!     mid-election, the exact gap the wiring closes), and a stale round's
+//!     event never lifts a newer round's freeze.
+//!   * **no-lost-thaw** — one election event releases every waiter on the
+//!     freeze (broadcast, not signal-one), and the latch is clear once the
+//!     round resolves. A lost wakeup would stall a replica's replay for the
+//!     whole latch timeout on every election.
+//!
 //! Two proposers legitimately use DISTINCT terms (the `flexible_paxos` model
 //! enforces one leader per term via its `StartElection` uniqueness guard), so
 //! this gate models valid executions: proposers at different terms racing the
@@ -80,6 +92,12 @@
 //!   violated). Restore the coarse-lock and every schedule honours the
 //!   promise. (The `flexible_paxos` Stateright model checks the same
 //!   PromiseHonoured invariant against the abstract protocol.)
+//! * **Freeze latch:** make `vlsn_event` lift unconditionally (drop its
+//!   `!cur.is_better_than(listener_proposal)` round check) and
+//!   [`freeze_latch_replay_never_proceeds_before_election_event`] finds the
+//!   schedule where the STALE round-6 event thaws round 7's freeze, releasing
+//!   the replay before the round-7 event was delivered. Restore the check and
+//!   every schedule defers the commit until its own round resolves.
 //!
 //! # Running
 //!
@@ -89,7 +107,12 @@
 #![cfg(noxu_shuttle)]
 
 use noxu_rep::elections::PersistentAcceptorState;
+use noxu_rep::elections::commit_freeze_latch::{
+    CommitFreezeLatch, round_proposal,
+};
 use noxu_rep::vlsn::VlsnIndex;
+use noxu_util::SimClock;
+use noxu_util::dst_sync_pl::install_sim_clock;
 use shuttle::sync::{Arc, Mutex};
 
 /// Number of interleavings shuttle explores per test.
@@ -381,6 +404,139 @@ fn acceptor_stale_proposer_never_regresses_promise() {
                 }
                 None => {}
             }
+        },
+        ITERATIONS,
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// GAP 2c — commit freeze latch: freeze vs replay
+// ─────────────────────────────────────────────────────────────────────────
+
+/// **freeze-blocks-commit**: a replay thread that calls `await_thaw()` while an
+/// election round is frozen never proceeds before the election event arrives,
+/// under every interleaving of (freeze, await_thaw, vlsn_event).
+///
+/// This models the wiring the acceptor and the replica replay path now share:
+/// the acceptor freezes when it grants a promise
+/// (JE `MasterSuggestionGenerator.getRanking`) and lifts the freeze when the
+/// `ElectionResult` arrives (JE `MasterChangeListener.notify`), while the
+/// replay thread awaits the thaw before logging a replayed commit (JE
+/// `Replay.replayEntry`).  The safety property is notify-driven, so the
+/// latch's timeout stays inert under shuttle (the `SimClock` is never
+/// advanced) — every observed thaw must be attributable to the election event.
+///
+/// Not vacuous: make `vlsn_event` unconditionally lift (drop its
+/// `!cur.is_better_than(listener_proposal)` round check) and the
+/// stale-round-event schedule thaws a freeze whose round never resolved.
+#[test]
+fn freeze_latch_replay_never_proceeds_before_election_event() {
+    shuttle::check_random(
+        || {
+            // The latch's timed `Condvar::wait_for` needs an installed
+            // SimClock to compute its deadline.  This property is
+            // notify-driven, so the clock is NEVER advanced — the timeout
+            // stays inert and every thaw observed here must come from the
+            // election event, not from expiry.
+            install_sim_clock(std::sync::Arc::new(SimClock::new(0)));
+            let latch = Arc::new(CommitFreezeLatch::with_timeout(
+                std::time::Duration::from_secs(3600),
+            ));
+            // Set by the election thread strictly BEFORE it delivers the
+            // event; read by the replay thread strictly AFTER await_thaw
+            // returns a thaw.  Any `true` from await_thaw with this still
+            // false is the invariant violation (a commit that would have
+            // advanced the VLSN mid-election).
+            let event_delivered = Arc::new(Mutex::new(false));
+
+            // The acceptor freezes for round 7 before either thread runs, the
+            // same ordering the wiring guarantees: the freeze is installed
+            // while the Promise is sent, so it precedes any replay that could
+            // observe it.
+            latch.freeze(round_proposal(7));
+
+            let election = {
+                let latch = Arc::clone(&latch);
+                let event_delivered = Arc::clone(&event_delivered);
+                shuttle::thread::spawn(move || {
+                    // A stale round's result must NOT lift round 7's freeze.
+                    latch.vlsn_event(&round_proposal(6));
+                    // Now the real result for round 7.
+                    *event_delivered.lock().unwrap() = true;
+                    latch.vlsn_event(&round_proposal(7));
+                })
+            };
+
+            let replay = {
+                let latch = Arc::clone(&latch);
+                let event_delivered = Arc::clone(&event_delivered);
+                shuttle::thread::spawn(move || {
+                    let thawed = latch.await_thaw();
+                    if thawed {
+                        assert!(
+                            *event_delivered.lock().unwrap(),
+                            "await_thaw reported an election thaw before the \
+                             election event was delivered — a replayed commit \
+                             would advance the VLSN mid-election"
+                        );
+                    }
+                })
+            };
+
+            election.join().unwrap();
+            replay.join().unwrap();
+
+            // The round resolved, so the latch must be clear no matter which
+            // thread got there first (a latch left frozen after its round
+            // resolved would stall replay for the whole timeout).
+            assert!(
+                !latch.is_frozen(),
+                "round 7 resolved but the latch is still frozen"
+            );
+        },
+        ITERATIONS,
+    );
+}
+
+/// **no-lost-thaw**: with N replay threads awaiting one freeze, a single
+/// election event releases ALL of them (the condvar broadcast, not a
+/// signal-one), and none is left frozen.  A lost wakeup here would stall a
+/// replica's replay for the full latch timeout on every election.
+#[test]
+fn freeze_latch_election_event_releases_all_waiters() {
+    shuttle::check_random(
+        || {
+            // Never-advanced SimClock: the timeout is inert, so a released
+            // waiter can only have been released by the election event.
+            install_sim_clock(std::sync::Arc::new(SimClock::new(0)));
+            let latch = Arc::new(CommitFreezeLatch::with_timeout(
+                std::time::Duration::from_secs(3600),
+            ));
+            latch.freeze(round_proposal(2));
+
+            let waiters: Vec<_> = (0..3)
+                .map(|_| {
+                    let latch = Arc::clone(&latch);
+                    shuttle::thread::spawn(move || {
+                        latch.await_thaw();
+                    })
+                })
+                .collect();
+
+            let election = {
+                let latch = Arc::clone(&latch);
+                shuttle::thread::spawn(move || {
+                    latch.vlsn_event(&round_proposal(2));
+                })
+            };
+
+            election.join().unwrap();
+            // Every waiter must be released by the single event; a lost wakeup
+            // would hang this join (shuttle reports it as a deadlock).
+            for w in waiters {
+                w.join().unwrap();
+            }
+            assert!(!latch.is_frozen());
         },
         ITERATIONS,
     );

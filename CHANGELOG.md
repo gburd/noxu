@@ -38,6 +38,15 @@ listed in [References](#references).
 
 ### Testing
 
+- The shuttle DST gate (`crates/noxu-rep/tests/shuttle_rep_sync.rs`) gains two
+  `CommitFreezeLatch` interleaving models: **freeze-blocks-commit** (a replay
+  thread's `await_thaw` never reports an election thaw before the event for the
+  frozen round was delivered, and a stale round's event never lifts a newer
+  round's freeze) and **no-lost-thaw** (one event releases every waiter). The
+  latch's mutex/condvar now route through the existing `noxu_util::dst_sync_pl`
+  seam so shuttle can schedule them; under the default cfg the seam is a
+  transparent `noxu_sync` re-export, so production is unchanged.
+
 - Removed 48 tautological `test_copy`/`test_clone`-style tests (e.g.
   `let x2 = x1; assert_eq!(x1, x2)`) across 30 `src/*.rs` files in
   `noxu-cleaner`, `noxu-db`, `noxu-engine`, `noxu-evictor`, `noxu-log`,

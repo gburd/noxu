@@ -20,7 +20,16 @@
 //! Both `vlsn_event` and `await_thaw` are no-ops in the absence of a freeze.
 
 use crate::elections::proposal::Proposal;
-use noxu_sync::{Condvar, Mutex};
+// DST seam (Milestone 2): the latch's mutex + condvar route through the
+// `noxu_util::dst_sync_pl` seam so the shuttle gate
+// (`tests/shuttle_rep_sync.rs`) can schedule freeze / thaw / await_thaw
+// interleavings.  Under the default cfg these ARE `noxu_sync::Mutex` /
+// `noxu_sync::Condvar` (a transparent re-export), so production is
+// byte-identical.  The `Instant`-based deadline is deliberately left on the
+// real clock: the latch's SAFETY property is notify-driven (a freeze is lifted
+// by an election event), and the timeout is only the liveness backstop, which
+// under shuttle stays inert.
+use noxu_util::dst_sync_pl::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 /// Default freeze timeout (JE `DEFAULT_LATCH_TIMEOUT = 5000ms`).
