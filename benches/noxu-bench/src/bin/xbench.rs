@@ -503,9 +503,6 @@ fn main() {
         ecfg.log_group_commit_threshold = gc_threshold;
         ecfg.log_group_commit_interval_ms = gc_interval;
     }
-    if envs("BENCH_CONSOLIDATION", "0") == "1" {
-        ecfg.set_log_consolidation_array(true);
-    }
     let env = Arc::new(Environment::open(ecfg).expect("open env"));
     let db = Arc::new(
         env.open_database(

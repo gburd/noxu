@@ -361,16 +361,6 @@ pub struct EnvironmentConfig {
     /// `LOG_FSYNC_ADAPTIVE_TRIGGER`.
     pub log_fsync_adaptive_trigger: usize,
 
-    /// Enable the consolidation-array Log Write Latch (Aether/Silo/WT).
-    ///
-    /// When `true`, concurrent committers combine into one batch via a
-    /// lock-free CAS-join and a single leader drives the whole batch under one
-    /// latch acquisition, dissolving the per-committer futex convoy on the LWL.
-    /// Single WAL + single monotonic LSN preserved; on-disk format identical.
-    /// Defaults to `false` (classic mutex LWL).  Mirrors
-    /// `LOG_CONSOLIDATION_ARRAY`.
-    pub log_consolidation_array: bool,
-
     // -----------------------------------------------------------------------
     // B-tree
     // -----------------------------------------------------------------------
@@ -859,7 +849,6 @@ impl EnvironmentConfig {
             log_fsync_max_leaders: 1,
             log_fsync_adaptive_leaders: 1,
             log_fsync_adaptive_trigger: 0,
-            log_consolidation_array: false,
             // B-tree
             node_max_entries: 128,
             node_dup_tree_max_entries: 128,
@@ -1294,17 +1283,6 @@ impl EnvironmentConfig {
         self
     }
 
-    /// Enable the consolidation-array Log Write Latch (Aether/Silo/WT).
-    ///
-    /// Off by default (classic mutex LWL).  When enabled, concurrent
-    /// committers combine into one batch via a lock-free CAS-join and a single
-    /// leader drives the batch under one latch acquisition, relieving the LWL
-    /// contention that serialises writes.  Single WAL + single monotonic LSN
-    /// preserved; on-disk format identical.  Mirrors `LOG_CONSOLIDATION_ARRAY`.
-    pub fn set_log_consolidation_array(&mut self, enabled: bool) -> &mut Self {
-        self.log_consolidation_array = enabled;
-        self
-    }
     pub fn with_log_group_commit(
         mut self,
         threshold: usize,

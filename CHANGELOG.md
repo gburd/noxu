@@ -115,6 +115,46 @@ listed in [References](#references).
   revert, which is what would widen the safe-truncate window to cover applied
   tails.
 
+### Removed
+
+- **BREAKING: the consolidation-array Log Write Latch is retired** — the
+  feature and its public config knob are removed outright:
+  - `noxu-config`: the `LOG_CONSOLIDATION_ARRAY` param
+    (`noxu.log.consolidationArray`) and its registry entry.
+  - `noxu-db`: `EnvironmentConfig::log_consolidation_array` and
+    `set_log_consolidation_array()`.
+  - `noxu-dbi`: `DbiEnvConfig::log_consolidation_array` and the
+    `NOXU_LOG_CONSOLIDATION_ARRAY` env override in `EnvironmentImpl::open()`.
+  - `noxu-log`: `crates/noxu-log/src/consolidation.rs`,
+    `LogManager::set_use_consolidation_array()`, the branch in `log_internal`
+    that chose it, the `shuttle_consolidation` DST model, and the
+    `test_consolidation_array_stress_64t_prev_offset_chain` stress test.
+  - `benches/noxu-bench`: the `BENCH_CONSOLIDATION` env knob.
+
+  **Why:** it contains a deterministic self-deadlock. `run_as_leader` reverses
+  the LIFO join stack to arrival order, which places the LEADER FIRST, so the
+  leader takes its own log-buffer pin and holds it across the whole batch; the
+  pin only drops in `segment.put()` after `run_as_leader` returns. Any batch of
+  >= 2 that needs a buffer flip therefore wedges — a later member blocks in
+  `wait_for_zero_and_latch` on a pin that cannot drain until the batch ends,
+  and the batch cannot end until that wait returns. Verified by gdb on a
+  21-hour hung test process. Full analysis:
+  `.agent/archived-audits/consolidation-array-deadlock-2026-09.md`.
+
+  **Why removal and not deprecation:** the knob defaulted to `false`, so the
+  shipped write path never used it; it was measured ~100x SLOWER on spread
+  arrivals (batch-size-1 degeneration); and the write-ceiling problem that
+  motivated it was solved by other means (the 7.5.2 cleaner-throttle fix plus
+  the group-commit piggyback, measured `batch_factor` ~25:1, which is what
+  ships). There are no external users, and the 7.2 "moot knobs deleted
+  outright" removal is precedent. Retiring it also removes 5 of `noxu-log`'s
+  12 `unsafe` blocks (now 7) and one test-matrix axis. **Migration:** delete
+  any `set_log_consolidation_array(...)` call and any
+  `noxu.log.consolidationArray` / `NOXU_LOG_CONSOLIDATION_ARRAY` setting; the
+  classic mutex LWL (always the default) is now the only write path.
+
+  The group-commit / `FsyncManager` piggyback machinery is untouched.
+
 ### Testing
 
 - The shuttle DST gate (`crates/noxu-rep/tests/shuttle_rep_sync.rs`) gains two

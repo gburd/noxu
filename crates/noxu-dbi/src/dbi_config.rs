@@ -104,10 +104,6 @@ pub struct DbiEnvConfig {
     /// `LOG_FSYNC_ADAPTIVE_TRIGGER`.
     pub log_fsync_adaptive_trigger: usize,
 
-    /// Enable the consolidation-array Log Write Latch.  Mirrors
-    /// `LOG_CONSOLIDATION_ARRAY`; default `false`.
-    pub log_consolidation_array: bool,
-
     // -----------------------------------------------------------------------
     // B-tree
     // -----------------------------------------------------------------------
@@ -313,7 +309,6 @@ impl Default for DbiEnvConfig {
             log_fsync_max_leaders: 1,
             log_fsync_adaptive_leaders: 1,
             log_fsync_adaptive_trigger: 0,
-            log_consolidation_array: false,
             // B-tree
             node_max_entries: 128,
             node_dup_tree_max_entries: 128,

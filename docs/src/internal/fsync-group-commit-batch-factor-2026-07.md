@@ -1,5 +1,14 @@
 # fsync group-commit: does it coalesce? (measured 2026-07)
 
+> **Retirement note (2026-09):** the consolidation-array Log Write Latch
+> referenced below (`noxu.log.consolidationArray`, the `BENCH_CONSOLIDATION`
+> knob) has been **removed** from the tree. It was never enabled by default,
+> was never shown to beat the classic mutex LWL, and was found to contain a
+> deterministic self-deadlock — see
+> `.agent/archived-audits/consolidation-array-deadlock-2026-09.md`. The
+> measurements below are preserved as recorded; the `BENCH_CONSOLIDATION` knob
+> no longer exists.
+
 ## The hypothesis under test
 
 An EC2 (96-core) `tdb_write` SYNC benchmark at 64 concurrent committers reported
