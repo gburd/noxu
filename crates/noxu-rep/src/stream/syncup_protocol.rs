@@ -487,6 +487,159 @@ pub fn vlsn_entry(lsn: u64, fingerprint: u64, is_sync: bool) -> VlsnEntry {
     VlsnEntry { lsn, fingerprint, is_sync }
 }
 
+// ---------------------------------------------------------------------------
+// RemoteFeederView — the feeder's log, queried over the syncup channel
+// ---------------------------------------------------------------------------
+
+/// A [`SyncupView`] whose `entry` lookups are answered by the REMOTE feeder
+/// over a syncup channel (one `EntryRequest` → `Entry` round-trip per query).
+///
+/// This is what lets the replica's *live* syncup reuse the same decision core
+/// (`find_matchpoint` → `verify_rollback` → `classify_tail` → rollback) that
+/// the in-process path uses, with the feeder's half of the comparison coming
+/// off the network instead of a local log scan — JE's arrangement, where
+/// `ReplicaFeederSyncup.getFeederRecord` issues an `EntryRequest` and compares
+/// the returned `OutputWireRecord` to the replica's own record.
+///
+/// ## Only `entry` is answerable remotely
+///
+/// `find_matchpoint` drives the search entirely from the REPLICA's range
+/// (`replica.last_sync()`, `replica.first_vlsn()`) and consults the feeder
+/// solely via `feeder.entry(candidate)`. The feeder's own range is therefore
+/// never needed, and the syncup message set has no message that carries it, so
+/// the range accessors here report `NULL_VLSN`. A feeder-range query would need
+/// a new opcode; nothing in the search wants one.
+pub struct RemoteFeederView<'a> {
+    channel: &'a dyn Channel,
+    /// Set once the first request has been answered, so a later query does not
+    /// re-trigger the feeder's first-response-only `AlternateMatchpoint`
+    /// behaviour handling.
+    asked: std::cell::Cell<bool>,
+    /// Remembers a transport failure: after one, every further lookup reports
+    /// "not held" rather than blocking on a dead channel. The driver surfaces
+    /// the resulting `Matchpoint::None` as a network restore, which is the
+    /// correct conservative outcome for an unusable feeder.
+    failed: std::cell::Cell<bool>,
+}
+
+impl<'a> RemoteFeederView<'a> {
+    /// Wrap a syncup `channel` already connected to the feeder's syncup
+    /// service.
+    pub fn new(channel: &'a dyn Channel) -> Self {
+        Self {
+            channel,
+            asked: std::cell::Cell::new(false),
+            failed: std::cell::Cell::new(false),
+        }
+    }
+
+    /// Whether a transport error was observed during the search.
+    pub fn transport_failed(&self) -> bool {
+        self.failed.get()
+    }
+
+    /// Tell the feeder the negotiation converged at `start_vlsn`
+    /// (JE `StartStream`), releasing its handshake loop.
+    pub fn send_start_stream(&self, start_vlsn: Vlsn) -> Result<()> {
+        send(self.channel, &SyncupMsg::StartStream { start_vlsn })
+    }
+
+    /// Tell the feeder no usable matchpoint was reached (JE `RestoreRequest`),
+    /// releasing its handshake loop. The feeder's `RestoreResponse` is drained
+    /// best-effort.
+    pub fn send_restore_request(&self, failed_vlsn: Vlsn) -> Result<()> {
+        send(self.channel, &SyncupMsg::RestoreRequest { failed_vlsn })?;
+        let _ = recv(self.channel);
+        Ok(())
+    }
+}
+
+impl SyncupView for RemoteFeederView<'_> {
+    fn last_sync(&self) -> Vlsn {
+        NULL_VLSN // not carried by the syncup message set; never consulted
+    }
+    fn last_txn_end(&self) -> Vlsn {
+        NULL_VLSN // ditto
+    }
+    fn first_vlsn(&self) -> Vlsn {
+        NULL_VLSN // ditto
+    }
+
+    fn entry(&self, vlsn: Vlsn) -> Option<VlsnEntry> {
+        if self.failed.get() {
+            return None;
+        }
+        let first = !self.asked.replace(true);
+        if send(self.channel, &SyncupMsg::EntryRequest { vlsn }).is_err() {
+            self.failed.set(true);
+            return None;
+        }
+        match recv(self.channel) {
+            Ok(SyncupMsg::Entry { vlsn: v, lsn, fingerprint, is_sync })
+                if v == vlsn =>
+            {
+                Some(VlsnEntry { lsn, fingerprint, is_sync })
+            }
+            // The feeder's counter-offer (its `lastSync`, sent only on the
+            // first response when our candidate is above its range) is a
+            // record at a DIFFERENT VLSN, so it is not an answer to this
+            // query. The backward search continues on its own and will reach
+            // that VLSN if it is inside our range.
+            Ok(SyncupMsg::AlternateMatchpoint { .. }) if first => None,
+            Ok(SyncupMsg::EntryNotFound) | Ok(_) => None,
+            Err(_) => {
+                self.failed.set(true);
+                None
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SyncupService — the feeder side, as a dispatcher service
+// ---------------------------------------------------------------------------
+
+/// The feeder's half of the syncup handshake, exposed as a dispatcher service
+/// on [`SYNCUP_SERVICE_NAME`].
+///
+/// A replica that is (re)joining connects here BEFORE it starts streaming and
+/// runs [`replica_syncup_handshake`]-equivalent queries against this node's
+/// log; this handler answers them from a fresh backward log scan of
+/// `env_home`. Port of JE `FeederReplicaSyncup`, which the feeder runs on the
+/// feeder side of the same channel the replication stream will use.
+pub struct SyncupService {
+    env_home: std::path::PathBuf,
+}
+
+impl SyncupService {
+    /// Serve syncup queries from the log under `env_home`.
+    pub fn new(env_home: std::path::PathBuf) -> Self {
+        Self { env_home }
+    }
+}
+
+impl crate::net::service_dispatcher::ServiceHandler for SyncupService {
+    fn service_name(&self) -> &str {
+        SYNCUP_SERVICE_NAME
+    }
+
+    fn handle(&self, channel: Box<dyn Channel>) -> Result<()> {
+        // Fresh scan per connection: the feeder's log advances continuously,
+        // and syncup is rare (a replica join), so a cached view would risk
+        // answering from a stale snapshot. JE likewise constructs a new
+        // `FeederSyncupReader` per syncup.
+        let view =
+            crate::stream::syncup_reader::SyncupLogView::scan(&self.env_home)
+                .ok_or_else(|| {
+                RepError::DatabaseError(format!(
+                    "syncup service: cannot open log at {}",
+                    self.env_home.display()
+                ))
+            })?;
+        feeder_syncup_handshake(channel.as_ref(), &view).map(|_| ())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
