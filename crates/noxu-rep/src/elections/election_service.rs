@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::elections::acceptor_state::PersistentAcceptorState;
+use crate::elections::commit_freeze_latch::CommitFreezeLatch;
 use crate::elections::paxos::run_acceptor_with_state;
 use crate::error::Result;
 use crate::net::channel::Channel;
@@ -44,6 +45,14 @@ pub struct ElectionAcceptorState {
     /// noxu-rep audit.  When `env_home` is `None` (test harness, in-memory
     /// configurations), this falls back to in-memory-only mode.
     pub persistent: Arc<PersistentAcceptorState>,
+    /// Latch used to freeze commit-VLSN advancement for the duration of an
+    /// election round (JE `RepNode.vlsnFreezeLatch`, `RepNode.java:193`).
+    ///
+    /// Shared with the replica replay path
+    /// ([`crate::stream::EnvironmentLogWriter::with_freeze_latch`]) so that the
+    /// VLSN this node advertises in a `Promise` cannot advance before the round
+    /// it promised in resolves.
+    pub freeze_latch: Arc<CommitFreezeLatch>,
 }
 
 impl ElectionAcceptorState {
@@ -59,6 +68,7 @@ impl ElectionAcceptorState {
             own_priority,
             own_term: AtomicU64::new(0),
             persistent: Arc::new(PersistentAcceptorState::in_memory()),
+            freeze_latch: Arc::new(CommitFreezeLatch::new()),
         }
     }
 
@@ -78,6 +88,7 @@ impl ElectionAcceptorState {
             persistent: Arc::new(PersistentAcceptorState::load_or_default(
                 env_home,
             )),
+            freeze_latch: Arc::new(CommitFreezeLatch::new()),
         }
     }
 
@@ -132,6 +143,7 @@ impl ServiceHandler for ElectionService {
             term,
             dtvlsn,
             &self.state.persistent,
+            Some(&self.state.freeze_latch),
         ) {
             Ok(_) => Ok(()),
             Err(e) => {

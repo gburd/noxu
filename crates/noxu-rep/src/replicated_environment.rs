@@ -1015,6 +1015,16 @@ impl ReplicatedEnvironment {
             // D2: advertise our DTVLSN as the major election-ranking key.
             self.election_state.set_dtvlsn(self.get_dtvlsn());
 
+            // Freeze commit-VLSN advancement for this round.  As proposer we
+            // are also advertising our own (dtvlsn, vlsn) as a candidate value,
+            // so it must not drift while the round is in flight.  JE freezes
+            // from the suggestion path that produces the ranking
+            // (`MasterSuggestionGenerator.java:63`).  Cleared on every exit
+            // path from the round below.
+            self.freeze_latch().freeze(
+                crate::elections::commit_freeze_latch::round_proposal(term),
+            );
+
             // Connect to each peer's ELECTION service.  Failures are
             // tolerated: a peer that doesn't answer simply contributes
             // no vote.  The election may still reach quorum in the
@@ -1074,6 +1084,14 @@ impl ReplicatedEnvironment {
                 std::time::Duration::from_millis(500),
             );
 
+            // The round is over — won, lost, or no quorum.  Thaw before acting
+            // on the outcome so the replay path is never blocked by a resolved
+            // round.  JE lifts the freeze from the learner
+            // (`MasterChangeListener.java:49`) and unconditionally in
+            // `Replica.shutdown` (`Replica.java:305`); this is the same
+            // "election over, let the VLSN move" point for the driver thread.
+            self.freeze_latch().clear_latch();
+
             match outcome {
                 Some(winner_id) if winner_id == self_node_id => {
                     if let Err(e) = self.become_master(term) {
@@ -1125,6 +1143,18 @@ impl ReplicatedEnvironment {
                 self.config.election_timeout.min(Duration::from_millis(500)),
             );
         }
+    }
+
+    /// The node's commit-freeze latch (JE `RepNode.getVLSNFreezeLatch`,
+    /// `RepNode.java:485`).
+    ///
+    /// Frozen for the duration of an election round by the election driver and
+    /// by each acceptor session; consulted by the replica replay path before a
+    /// replayed commit advances this node's VLSN.
+    pub fn freeze_latch(
+        &self,
+    ) -> Arc<crate::elections::commit_freeze_latch::CommitFreezeLatch> {
+        Arc::clone(&self.election_state.freeze_latch)
     }
 
     /// Internal: a `RepGroup` snapshot that includes self.
@@ -2446,6 +2476,7 @@ impl ReplicatedEnvironment {
                 // handle the replay thread advances.  Port of
                 // RepImpl.getConsistency / Replica.getConsistencyTracker.
                 let replay = noxu_dbi::ReplicaReplay::new(env_for_replay);
+                let freeze_latch_for_replay = self.freeze_latch();
                 let tracker = crate::ConsistencyTracker::new(
                     replay.last_applied_vlsn_handle(),
                 );
@@ -2462,7 +2493,11 @@ impl ReplicatedEnvironment {
                             log_mgr,
                             vlsn_index_clone,
                             replay,
-                        );
+                        )
+                        // Freeze replayed commits while an election round this
+                        // node participates in is unresolved (JE
+                        // `Replay.java:525`).
+                        .with_freeze_latch(freeze_latch_for_replay);
 
                         let Some(addr) = master_addr_opt else {
                             log::warn!(
@@ -3115,6 +3150,12 @@ impl ReplicatedEnvironment {
         // thread does a final flush on its way out so a clean close is
         // recoverable.  Closes finding F11.
         self.io_shutdown.store(true, Ordering::SeqCst);
+        // Clear the freeze latch so a replay thread blocked awaiting the
+        // outcome of an election is released and can observe the shutdown,
+        // instead of sitting out the latch timeout.  JE does the same in
+        // `Replica.shutdown`: "Clear the latch in case the replica loop is
+        // waiting for the outcome of an election" (`Replica.java:305`).
+        self.freeze_latch().clear_latch();
         {
             let mut threads = self.io_threads.lock().unwrap();
             for handle in threads.drain(..) {

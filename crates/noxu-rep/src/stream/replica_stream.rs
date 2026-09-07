@@ -75,6 +75,17 @@ pub struct EnvironmentLogWriter {
     /// live `EnvironmentImpl` is wired).  Port of JE `Replay` driven from the
     /// replica replay thread.
     replay: Option<noxu_dbi::ReplicaReplay>,
+    /// Commit-freeze latch shared with this node's election paths.
+    ///
+    /// When present, a replayed *commit* waits for the latch to thaw before it
+    /// is logged, so the commit VLSN this node reports cannot advance while an
+    /// election round it is participating in is still in flight.  Port of JE
+    /// `Replay.replayEntry`, which calls
+    /// `repImpl.getRepNode().getVLSNFreezeLatch().awaitThaw()` immediately
+    /// before committing a replayed txn (`Replay.java:525`).  `None` keeps the
+    /// legacy unfrozen behaviour (tests, non-HA writers).
+    freeze_latch:
+        Option<Arc<crate::elections::commit_freeze_latch::CommitFreezeLatch>>,
 }
 
 impl EnvironmentLogWriter {
@@ -87,7 +98,7 @@ impl EnvironmentLogWriter {
         log_manager: Arc<noxu_log::LogManager>,
         vlsn_index: Arc<crate::vlsn::vlsn_index::VlsnIndex>,
     ) -> Self {
-        Self { log_manager, vlsn_index, replay: None }
+        Self { log_manager, vlsn_index, replay: None, freeze_latch: None }
     }
 
     /// REP-7 (B): create a writer that ALSO live-applies each entry to the
@@ -98,7 +109,26 @@ impl EnvironmentLogWriter {
         vlsn_index: Arc<crate::vlsn::vlsn_index::VlsnIndex>,
         replay: noxu_dbi::ReplicaReplay,
     ) -> Self {
-        Self { log_manager, vlsn_index, replay: Some(replay) }
+        Self {
+            log_manager,
+            vlsn_index,
+            replay: Some(replay),
+            freeze_latch: None,
+        }
+    }
+
+    /// Install the node's commit-freeze latch on this writer.
+    ///
+    /// Replayed commits then block on
+    /// [`CommitFreezeLatch::await_thaw`](crate::elections::commit_freeze_latch::CommitFreezeLatch::await_thaw)
+    /// while an election round is frozen, so this node's commit VLSN cannot
+    /// advance mid-election.  Mirrors JE `Replay.java:525`.
+    pub fn with_freeze_latch(
+        mut self,
+        latch: Arc<crate::elections::commit_freeze_latch::CommitFreezeLatch>,
+    ) -> Self {
+        self.freeze_latch = Some(latch);
+        self
     }
 
     /// REP-10 seam: shared handle to the replica's last-applied VLSN, when a
@@ -131,6 +161,20 @@ impl LogWriter for EnvironmentLogWriter {
                     entry_type
                 ))
             })?;
+
+        // Commit-freeze: a replayed COMMIT must not advance this node's commit
+        // VLSN while an election round it is participating in is unresolved.
+        // JE `Replay.replayEntry` awaits the thaw at exactly this point, just
+        // before committing the replayed txn (`Replay.java:525`), and only for
+        // commits — non-commit entries stream on unimpeded.  The wait is
+        // bounded by the latch's own freeze timeout, so a never-resolving
+        // election degrades to the pre-freeze behaviour instead of stalling the
+        // replay thread forever.
+        if log_entry_type == LogEntryType::TxnCommit
+            && let Some(latch) = self.freeze_latch.as_ref()
+        {
+            latch.await_thaw();
+        }
 
         // Write to the local WAL.  Replicated entries are non-provisional and
         // do not require an immediate fsync on every entry (the master already

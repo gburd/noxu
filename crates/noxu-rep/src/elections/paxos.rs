@@ -453,8 +453,22 @@ pub fn run_acceptor_with_state(
     own_term: u64,
     own_dtvlsn: u64,
     state: &crate::elections::acceptor_state::PersistentAcceptorState,
+    freeze_latch: Option<
+        &crate::elections::commit_freeze_latch::CommitFreezeLatch,
+    >,
 ) -> Result<Option<String>> {
+    use crate::elections::commit_freeze_latch::round_proposal;
     let timeout = Duration::from_millis(500);
+
+    // Lift the freeze this acceptor session established, if it is still the
+    // current one.  `vlsn_event` only thaws when the arriving round is
+    // newer-or-equal, so a freeze installed by a LATER round (a concurrent
+    // session, or the local election driver) survives.
+    let thaw = |term: u64| {
+        if let Some(latch) = freeze_latch {
+            latch.vlsn_event(&round_proposal(term));
+        }
+    };
 
     // Phase 1: receive Propose.
     let phase1 = match receive_message(channel, timeout)? {
@@ -471,6 +485,17 @@ pub fn run_acceptor_with_state(
             dtvlsn: _dtvlsn,
         } => {
             if state.try_promise(term) {
+                // Freeze commit-VLSN advancement for the duration of this
+                // round: the VLSN/DTVLSN we are about to advertise in the
+                // Promise must still describe this node when the proposer
+                // picks a value in phase 2.  JE freezes at exactly this point
+                // — `MasterSuggestionGenerator.getRanking` calls
+                // `repNode.getVLSNFreezeLatch().freeze(proposal)` right before
+                // computing the (dtvlsn, vlsn) ranking it returns in the
+                // Promise (`MasterSuggestionGenerator.java:63`).
+                if let Some(latch) = freeze_latch {
+                    latch.freeze(round_proposal(term));
+                }
                 send_message(
                     channel,
                     &ProtocolMessage::ElectionProposal {
@@ -501,14 +526,30 @@ pub fn run_acceptor_with_state(
         }
     };
 
-    // Phase 2: receive ElectionResult.
-    let phase2 = match receive_message(channel, timeout)? {
-        Some(m) => m,
-        None => return Ok(None),
+    // Phase 2: receive ElectionResult.  Every exit path from here on thaws the
+    // freeze this session installed — an unresolved round must not leave the
+    // replay path blocked for the whole latch timeout, and a latch that never
+    // thaws would be worse than not freezing at all.
+    let phase2 = match receive_message(channel, timeout) {
+        Ok(Some(m)) => m,
+        Ok(None) => {
+            thaw(phase1_term);
+            return Ok(None);
+        }
+        Err(e) => {
+            thaw(phase1_term);
+            return Err(e);
+        }
     };
 
     match phase2 {
         ProtocolMessage::ElectionResult { master, term } => {
+            // The round resolved (for good or ill): lift the freeze.  JE does
+            // this from the Learner side — `MasterChangeListener.notify` calls
+            // `repNode.getVLSNFreezeLatch().vlsnEvent(proposal)` as the first
+            // thing it does on an election result
+            // (`MasterChangeListener.java:49`).
+            thaw(term.max(phase1_term));
             // Accept iff the result term EXACTLY equals the term we promised
             // in phase 1 (JE Acceptor.process(Accept): reject unless
             // promisedProposal.compareTo(accept.getProposal()) == 0). A
@@ -539,9 +580,12 @@ pub fn run_acceptor_with_state(
                 Ok(None)
             }
         }
-        _ => Err(RepError::ProtocolError(
-            "acceptor: expected ElectionResult in phase 2".into(),
-        )),
+        _ => {
+            thaw(phase1_term);
+            Err(RepError::ProtocolError(
+                "acceptor: expected ElectionResult in phase 2".into(),
+            ))
+        }
     }
 }
 
