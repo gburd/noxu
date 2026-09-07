@@ -36,6 +36,75 @@ listed in [References](#references).
   latch's own 5s freeze timeout, so a never-resolving election degrades to the
   previous behaviour rather than stalling the replay thread.
 
+- **Replication: the syncup matchpoint search compared node-local LSNs, so no
+  real cross-node syncup could ever succeed.** `find_matchpoint` and
+  `replica_syncup_handshake` required `feeder_entry.lsn == replica_entry.lsn`
+  in addition to matching record contents. An LSN is a node-local
+  (file, offset) address, so two nodes holding the *same* replicated record
+  essentially never agree on one — every genuine cross-node matchpoint search
+  dead-ended in `Matchpoint::None` and demanded a needless full network
+  restore, leaving the diverged-tail rollback path unreachable in practice.
+  Record equality is now content-based only, matching JE
+  `OutputWireRecord.match`
+  (`header.logicalEqualsIgnoreVersion(...) && entry.logicalEquals(...)`, which
+  never compares LSNs); each node keeps its own LSN as its local
+  rollback/streaming target. The existing `rep1_step5_live_syncup_test` could
+  not catch this because both test nodes wrote byte-identical logs, so their
+  LSNs coincidentally agreed; it now forces divergent log layouts and fails if
+  the LSN predicate is reintroduced.
+
+### Added
+
+- **Replication HA: the bilateral syncup matchpoint protocol is now wired into
+  the live replica-join path, and a diverged replica is rolled back to the
+  verified matchpoint (or refused).** Previously the decision core
+  (`find_matchpoint` / `verify_rollback`) and the rollback executor
+  (`ReplicatedEnvironment::syncup_with_feeder` → `noxu_recovery::rollback` +
+  `VlsnIndex::truncate_after`) both existed but were unreachable in
+  production: `become_replica` went straight to `catch_up_from_peer_until`,
+  and no node registered a syncup service, so a replica whose log had a
+  divergent tail past the matchpoint (an old master, or a node that kept
+  accepting writes through a partition) streamed the master's history *on top
+  of* its own non-accepted records and stayed silently diverged from the
+  cluster's accepted history. Now:
+  - `SyncupService` (new) answers the feeder half of the handshake on
+    `SYNCUP_SERVICE_NAME`, registered on every node that has an `env_home`
+    (eagerly at construction, else lazily by `with_environment`). Port of JE
+    `FeederReplicaSyncup`.
+  - `RemoteFeederView` (new) is a `SyncupView` whose per-VLSN lookups
+    round-trip over the syncup channel, so the existing decision + rollback
+    core runs unchanged with the feeder's half of the record comparison coming
+    off the network (JE `ReplicaFeederSyncup.getFeederRecord`).
+  - `ReplicatedEnvironment::syncup_with_feeder_at(addr)` (new) runs the
+    handshake against a feeder and releases the feeder's loop with
+    `StartStream` or `RestoreRequest` as JE does.
+  - `become_replica`'s replica thread runs syncup **before** its first stream:
+    a rolled-back (or non-diverged) replica proceeds to catch-up; a detected
+    divergence that cannot be repaired stops replication with an
+    operator-visible error instead of streaming over the diverged tail; a
+    feeder that does not offer the service falls through to streaming
+    (unchanged pre-existing behaviour).
+- **`SyncupAction::DivergedRefused` — detected-and-refused divergence.**
+  A deliberately conservative middle case between rollback and full network
+  restore. `classify_tail` (new, in `noxu-rep::stream::syncup`) discards a
+  divergent tail **only** when every entry above the matchpoint is a
+  provisional (transactional) LN, which `ReplicaReplay` buffers and never
+  applies to the live B-tree until its commit arrives; such a tail can be
+  dropped from the log and VLSN index completely. Any other tail — a
+  non-transactional LN (applied to the live tree immediately), a structural
+  entry (possibly referenced by a live parent IN, the hazard JE documents in
+  `ReplicaFeederSyncup.verifyRollback`), a transaction end, or an undecodable
+  entry type — leaves the log **entirely untouched** and returns
+  `DivergedRefused { matchpoint_vlsn, tail_len, reason }` with the offending
+  entry named for the operator. The reason: this build performs JE
+  `Replay.rollback` steps 1 and 3–5 (RollbackStart, make-invisible, fsync,
+  RollbackEnd) but not step 2, the in-memory `TxnChain` revert, so truncating
+  an already-applied tail would leave the tree holding a record the cluster
+  never accepted. Log truncation is irreversible; a refusal is recoverable via
+  network restore. **Still missing** (follow-up): the step-2 in-memory tree
+  revert, which is what would widen the safe-truncate window to cover applied
+  tails.
+
 ### Testing
 
 - The shuttle DST gate (`crates/noxu-rep/tests/shuttle_rep_sync.rs`) gains two
@@ -46,7 +115,17 @@ listed in [References](#references).
   latch's mutex/condvar now route through the existing `noxu_util::dst_sync_pl`
   seam so shuttle can schedule them; under the default cfg the seam is a
   transparent `noxu_sync` re-export, so production is unchanged.
-
+- New `crates/noxu-rep/tests/syncup_matchpoint_rollback_test.rs`: a two-node
+  master/replica pair with live environments, bound dispatchers, and
+  deliberately divergent log layouts runs a real `SYNCUP` handshake over TCP.
+  Asserts both outcomes and the safety invariant — a provisional divergent
+  tail is discarded and the replica then converges on the master's history
+  with matching record fingerprints at every VLSN; a tail containing an
+  already-applied non-transactional LN is refused with the log and VLSN index
+  left byte-identical; and in both cases every VLSN at or below the negotiated
+  matchpoint survives untouched. Also pins `negotiate_syncup` as content-blind
+  (it reports `CanServe` for the very same diverged replica) so the range
+  check cannot be mistaken for sufficient again.
 - Removed 48 tautological `test_copy`/`test_clone`-style tests (e.g.
   `let x2 = x1; assert_eq!(x1, x2)`) across 30 `src/*.rs` files in
   `noxu-cleaner`, `noxu-db`, `noxu-engine`, `noxu-evictor`, `noxu-log`,
