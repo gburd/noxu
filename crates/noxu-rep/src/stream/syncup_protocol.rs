@@ -975,4 +975,136 @@ mod tests {
         );
         sender.join().unwrap();
     }
+
+    // ── RemoteFeederView ────────────────────────────────────────────────
+
+    /// `RemoteFeederView` answers `entry()` from the REMOTE feeder over the
+    /// channel, so the local decision core (`find_matchpoint`) can run against
+    /// a feeder it only reaches by network. A diverged replica must converge on
+    /// the same matchpoint the in-process path would pick.
+    #[test]
+    fn test_remote_feeder_view_drives_find_matchpoint_over_channel() {
+        use crate::stream::syncup::{Matchpoint, find_matchpoint};
+
+        let pair = LocalChannelPair::new();
+        let replica_ch: Arc<dyn Channel> = Arc::new(pair.channel_a);
+        let feeder_ch: Arc<dyn Channel> = Arc::new(pair.channel_b);
+
+        // Replica diverges at VLSN 6; VLSN 4 is the highest common sync point.
+        // The two nodes store the SAME record at DIFFERENT LSNs (as real nodes
+        // do), so this also pins the content-based comparison.
+        let replica = MapView::new(1, 6, 4)
+            .put(6, 0x600, 0xDEAD, true)
+            .put(5, 0x500, 0x55, false)
+            .put(4, 0x400, 0x44, true);
+        let feeder = MapView::new(1, 8, 8)
+            .put(8, 0x9800, 0x88, true)
+            .put(6, 0x9600, 0xBEEF, true)
+            .put(4, 0x9400, 0x44, true); // same contents, different LSN
+
+        let feeder_handle = std::thread::spawn(move || {
+            feeder_syncup_handshake(feeder_ch.as_ref(), &feeder)
+        });
+
+        let remote = RemoteFeederView::new(replica_ch.as_ref());
+        let mp = find_matchpoint(&replica, &remote);
+        assert_eq!(
+            mp,
+            // The LSN reported is the REPLICA's own (its local rollback point).
+            Matchpoint::Found { vlsn: Vlsn::new(4), lsn: 0x400 },
+            "the remote view must reach the same matchpoint as a local view"
+        );
+        assert!(!remote.transport_failed(), "no transport error expected");
+
+        // Releasing the feeder's loop is the caller's job (JE StartStream).
+        remote.send_start_stream(Vlsn::new(5)).unwrap();
+        assert_eq!(feeder_handle.join().unwrap().unwrap(), Some(Vlsn::new(5)));
+    }
+
+    /// A closed channel must not hang or panic the search: every lookup reports
+    /// "not held", so the driver sees `Matchpoint::None` and takes the
+    /// conservative network-restore path.
+    ///
+    /// (A feeder that vanishes *without* closing is bounded by
+    /// `SYNCUP_TIMEOUT` on the receive rather than hanging forever; that path
+    /// is not exercised here because waiting it out would make the test take
+    /// 30 seconds.)
+    #[test]
+    fn test_remote_feeder_view_transport_failure_reports_not_held() {
+        let pair = LocalChannelPair::new();
+        let replica_ch: Arc<dyn Channel> = Arc::new(pair.channel_a);
+        pair.channel_b.close().unwrap(); // feeder hung up
+
+        let remote = RemoteFeederView::new(replica_ch.as_ref());
+        assert!(remote.entry(Vlsn::new(4)).is_none());
+        assert!(remote.transport_failed(), "the failure must be recorded");
+        // Subsequent lookups short-circuit rather than retry a dead channel.
+        assert!(remote.entry(Vlsn::new(3)).is_none());
+    }
+
+    /// The feeder's first-response-only `AlternateMatchpoint` counter-offer is
+    /// a record at a DIFFERENT VLSN, so it is not an answer to the query that
+    /// triggered it: `entry()` must report `None` rather than mis-attribute
+    /// that record to the requested VLSN (which would fabricate a matchpoint).
+    #[test]
+    fn test_remote_feeder_view_does_not_mistake_alternate_for_an_answer() {
+        let pair = LocalChannelPair::new();
+        let replica_ch: Arc<dyn Channel> = Arc::new(pair.channel_a);
+        let feeder_ch = pair.channel_b;
+
+        let responder = std::thread::spawn(move || {
+            let _ = feeder_ch.receive(Duration::from_secs(5)).unwrap();
+            send(
+                &feeder_ch,
+                &SyncupMsg::AlternateMatchpoint {
+                    vlsn: Vlsn::new(3),
+                    lsn: 0x300,
+                    fingerprint: 0x33,
+                    is_sync: true,
+                },
+            )
+            .unwrap();
+        });
+
+        let remote = RemoteFeederView::new(replica_ch.as_ref());
+        assert_eq!(
+            remote.entry(Vlsn::new(9)),
+            None,
+            "a counter-offer at VLSN 3 is not an answer about VLSN 9"
+        );
+        responder.join().unwrap();
+    }
+
+    /// The syncup message set carries no feeder-range message, so the remote
+    /// view reports NULL for the range accessors. `find_matchpoint` drives the
+    /// search from the REPLICA's range and never consults the feeder's, so this
+    /// is sufficient — pinned so a future change that starts depending on the
+    /// feeder's range fails loudly here instead of silently searching from
+    /// NULL.
+    #[test]
+    fn test_remote_feeder_view_range_accessors_are_null() {
+        let pair = LocalChannelPair::new();
+        let ch: Arc<dyn Channel> = Arc::new(pair.channel_a);
+        let remote = RemoteFeederView::new(ch.as_ref());
+        assert_eq!(remote.last_sync(), NULL_VLSN);
+        assert_eq!(remote.last_txn_end(), NULL_VLSN);
+        assert_eq!(remote.first_vlsn(), NULL_VLSN);
+    }
+
+    // ── SyncupService ───────────────────────────────────────────────────
+
+    /// `SyncupService` on an env home with no log must fail cleanly rather than
+    /// panic: a replica connecting to a feeder with no readable log gets an
+    /// error and falls back to a restore, not a crashed dispatcher thread.
+    #[test]
+    fn test_syncup_service_on_unreadable_home_errors() {
+        use crate::net::service_dispatcher::ServiceHandler;
+
+        let pair = LocalChannelPair::new();
+        let svc = SyncupService::new(std::path::PathBuf::from(
+            "/nonexistent-noxu-syncup-home",
+        ));
+        assert_eq!(svc.service_name(), SYNCUP_SERVICE_NAME);
+        assert!(svc.handle(Box::new(pair.channel_b)).is_err());
+    }
 }
