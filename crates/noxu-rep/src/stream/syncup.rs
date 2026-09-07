@@ -273,7 +273,7 @@ pub enum TailSafety {
 /// ## Why this gate exists
 ///
 /// JE `Replay.rollback` has five steps, and step 2 is "do the rollback in
-/// memory": `ReplayTxn.rollback` walks each active txn's [`TxnChain`] and
+/// memory": `ReplayTxn.rollback` walks each active txn's `TxnChain` and
 /// REVERTS every in-window LN in the live tree to its previous version before
 /// the log entries are made invisible. Noxu implements steps 1 and 3-5
 /// (`noxu_recovery::rollback`: RollbackStart, make-invisible, fsync,
