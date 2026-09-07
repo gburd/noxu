@@ -131,3 +131,5 @@
   - [JE constant/default/threshold audit (2026-07)](internal/je-constant-audit-2026-07.md)
   - [MVCC proposal (2026-07)](internal/mvcc-proposal-2026-07.md)
   - [latch-lite descent: ceiling (2026-07)](internal/latch-lite-descent-ceiling-2026-07.md)
+  - [Core-crate coverage baseline (2026-09)](internal/coverage-baseline-2026-09.md)
+    - [Consolidation-array LWL deadlock (2026-09)](internal/consolidation-array-deadlock-2026-09.md)

@@ -18,15 +18,45 @@ listed in [References](#references).
 ### Fixed
 
 - Nothing yet; see
-  `.agent/archived-audits/consolidation-array-deadlock-2026-09.md` for a
-  found-but-not-yet-fixed deterministic self-deadlock in `noxu-log`'s opt-in
-  consolidation-array Log Write Latch (`noxu.log.consolidationArray`, default
-  `false`, so the shipped default path is unaffected). Root-caused with a
-  verified fix preserved as
-  `.agent/archived-audits/consolidation-array-deadlock-2026-09.patch`; held
-  back pending a keep-or-retire decision on the feature.
+  [the consolidation-array deadlock note](docs/src/internal/consolidation-array-deadlock-2026-09.md)
+  for a found-but-not-yet-fixed deterministic self-deadlock in `noxu-log`'s
+  opt-in consolidation-array Log Write Latch (`noxu.log.consolidationArray`,
+  default `false`, so the shipped default path is unaffected). Root-caused with
+  a verified fix preserved as commit `0f69de83` (not on any merged branch);
+  held back pending a keep-or-retire decision on the feature.
 
 ### Testing
+
+- **Measured `noxu-log` and `noxu-dbi` coverage for the first time**, and
+  recorded the whole core-crate picture in
+  [the coverage baseline](docs/src/internal/coverage-baseline-2026-09.md).
+  `noxu-log` is at 92.48% region / 91.50% function / 91.37% line (`--lib`
+  scope); `noxu-dbi` is at 81.28% / 78.15% / 78.97%, making it the **only**
+  core data-path crate below the 85% target (the gap is concentrated in
+  `environment_impl.rs` at 58% function coverage). The previously recorded
+  claim that `noxu-log` "cannot be measured locally, needs EC2" was wrong: the
+  runs were not slow, they were wedged on a deadlocking test (see above).
+- `#[ignore]`d `noxu-log`'s
+  `test_consolidation_array_stress_64t_prev_offset_chain`, which deadlocks
+  rather than merely running slowly, and so hung `cargo test` / `cargo
+  llvm-cov` for the whole crate indefinitely (observed livelocked >21h at ~200%
+  CPU). Ignored rather than deleted: it is a correct reproducer of a real
+  production bug and should be un-ignored when the fix lands. `noxu-log --lib`
+  now completes in ~4.7s (492 passed, 2 ignored).
+- Added `noxu-log`'s
+  `test_on_disk_corruption_is_never_returned_as_valid_data`, closing a real
+  gap: nothing asserted that a byte flipped **on disk after a successful
+  write** is rejected on read. Part 1 flips a payload byte, which passes every
+  structural check (length/type/flags still parse) so the per-entry CRC32 is
+  the only thing preventing silent corruption — exactly the branch the checksum
+  exists for. Part 2 drives the same through `faultdisk`'s
+  `FaultKind::Corruption`, previously the only fault kind with no end-to-end
+  coverage (`TornWrite` is covered by `noxu-db`'s `dst_crash_sweep`,
+  `DiskFull` by `test_real_write_error_invalidates_and_is_not_swallowed`;
+  `Corruption` was only unit-tested at the `on_write` *decision* level, never
+  through `posio` → disk → read). Also asserts that a failed checksum on READ
+  does not set `io_invalid`, per the C-2 fail-stop stance that only write/fsync
+  errors invalidate the log.
 
 - Removed 48 tautological `test_copy`/`test_clone`-style tests (e.g.
   `let x2 = x1; assert_eq!(x1, x2)`) across 30 `src/*.rs` files in
