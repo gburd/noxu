@@ -20,7 +20,16 @@
 //! Both `vlsn_event` and `await_thaw` are no-ops in the absence of a freeze.
 
 use crate::elections::proposal::Proposal;
-use noxu_sync::{Condvar, Mutex};
+// DST seam (Milestone 2): the latch's mutex + condvar route through the
+// `noxu_util::dst_sync_pl` seam so the shuttle gate
+// (`tests/shuttle_rep_sync.rs`) can schedule freeze / thaw / await_thaw
+// interleavings.  Under the default cfg these ARE `noxu_sync::Mutex` /
+// `noxu_sync::Condvar` (a transparent re-export), so production is
+// byte-identical.  The `Instant`-based deadline is deliberately left on the
+// real clock: the latch's SAFETY property is notify-driven (a freeze is lifted
+// by an election event), and the timeout is only the liveness backstop, which
+// under shuttle stays inert.
+use noxu_util::dst_sync_pl::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 /// Default freeze timeout (JE `DEFAULT_LATCH_TIMEOUT = 5000ms`).
@@ -184,6 +193,21 @@ impl CommitFreezeLatch {
     pub fn is_frozen(&self) -> bool {
         self.state.lock().frozen
     }
+}
+
+/// The election-round identity used with [`CommitFreezeLatch::freeze`] and
+/// [`CommitFreezeLatch::vlsn_event`].
+///
+/// Only the round matters to the latch. JE's `Proposal` comes from a
+/// `TimebasedProposalGenerator`, so it is monotone in round order — which is
+/// what `freeze`/`vlsnEvent` compare. Noxu's [`Proposal`] `Ord` is instead the
+/// *election ranking* order (dtvlsn, then vlsn, then priority, term, name): a
+/// laggard node's later round would compare as "older" under that order, and an
+/// arriving result would then fail to lift the freeze. Encoding the term in
+/// every dominant ranking key with a constant node name makes the comparison
+/// the latch performs exactly "order by election round".
+pub fn round_proposal(term: u64) -> Proposal {
+    Proposal::with_timestamp(String::new(), term, 0, term, 0).with_dtvlsn(term)
 }
 
 #[cfg(test)]

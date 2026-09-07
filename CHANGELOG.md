@@ -15,7 +15,37 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Fixed
+
+- **`noxu-rep`: `CommitFreezeLatch` is now wired into the election and replay
+  paths.** The latch was a complete, unit-tested port of JE's
+  `CommitFreezeLatch` but was referenced nowhere outside its own file, so a
+  node could keep advancing its commit VLSN while an election round it had
+  promised in was still in flight — the VLSN/DTVLSN it advertised in a Promise
+  could no longer describe it by the time the proposer chose a value in phase
+  2. Mirroring JE's call sites: an acceptor calls `freeze` when it grants a
+  promise, just before advertising its `(dtvlsn, vlsn)` ranking
+  (`MasterSuggestionGenerator.getRanking`); it calls `vlsn_event` when the
+  `ElectionResult` arrives (`MasterChangeListener.notify`) and on every other
+  phase-2 exit so an unresolved round cannot pin the latch; the election driver
+  clears the latch after every round outcome (won / lost / no quorum); and
+  `EnvironmentLogWriter::write_entry` awaits the thaw before logging a replayed
+  `TxnCommit` (`Replay.replayEntry`), leaving non-commit entries ungated.
+  `ReplicatedEnvironment::close` clears the latch so a blocked replay thread
+  observes the shutdown (`Replica.shutdown`). The wait is bounded by the
+  latch's own 5s freeze timeout, so a never-resolving election degrades to the
+  previous behaviour rather than stalling the replay thread.
+
 ### Testing
+
+- The shuttle DST gate (`crates/noxu-rep/tests/shuttle_rep_sync.rs`) gains two
+  `CommitFreezeLatch` interleaving models: **freeze-blocks-commit** (a replay
+  thread's `await_thaw` never reports an election thaw before the event for the
+  frozen round was delivered, and a stale round's event never lifts a newer
+  round's freeze) and **no-lost-thaw** (one event releases every waiter). The
+  latch's mutex/condvar now route through the existing `noxu_util::dst_sync_pl`
+  seam so shuttle can schedule them; under the default cfg the seam is a
+  transparent `noxu_sync` re-export, so production is unchanged.
 
 - Removed 48 tautological `test_copy`/`test_clone`-style tests (e.g.
   `let x2 = x1; assert_eq!(x1, x2)`) across 30 `src/*.rs` files in

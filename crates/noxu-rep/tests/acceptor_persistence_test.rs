@@ -123,9 +123,15 @@ fn election_service_uses_persistent_state_end_to_end() {
 
     // Run an election against the running ELECTION service.  The proposer
     // wins at term 5 and becomes "self" master.
+    //
+    // The election timeout is deliberately generous (2s, not the ~100ms this
+    // once used): this test asserts election OUTCOMES (the proposer wins; a
+    // stale term is rejected), never latency.  A tight timeout made it flaky
+    // under full-suite CPU contention, where a real TCP round-trip to the
+    // in-process ELECTION service can easily exceed 100ms.
     let ch = connect_to_service(addr, ELECTION_SERVICE_NAME).unwrap();
     let ch_arc: Arc<dyn Channel> = Arc::new(ch);
-    let winner = run_election(1, "self", &group, &[ch_arc], 100, 1, 5);
+    let winner = run_election(1, "self", &group, &[ch_arc], 2000, 1, 5);
     assert_eq!(winner, Some(1));
 
     // Give the per-connection acceptor thread time to flush state.
@@ -141,7 +147,7 @@ fn election_service_uses_persistent_state_end_to_end() {
     // Try a stale proposal at term 3: must be rejected.
     let ch2 = connect_to_service(addr, ELECTION_SERVICE_NAME).unwrap();
     let ch2_arc: Arc<dyn Channel> = Arc::new(ch2);
-    let stale = run_election(1, "self", &group, &[ch2_arc], 100, 1, 3);
+    let stale = run_election(1, "self", &group, &[ch2_arc], 2000, 1, 3);
     assert!(
         stale.is_none(),
         "stale proposer at term 3 must NOT win after a term-5 promise was persisted"
