@@ -82,8 +82,10 @@ const REPS: usize = 3;
 const THREADS: &[usize] = &[2, 4, 8, 16, 32, 64];
 
 /// One-in-`WRITE_EVERY` ops takes the exclusive lock in the read-heavy
-/// rwlock regime — the tree-latch shape (overwhelmingly shared, occasional
-/// split/eviction).
+/// rwlock regime — read-mostly with occasional exclusive mutation, the shape
+/// of `noxu-dbi`'s cursor / `DatabaseImpl` locks (which route through
+/// `dst_sync_pl` to `noxu-sync` in production). Note this is *not* the B-tree
+/// node latch: that is already `parking_lot::RwLock`.
 const WRITE_EVERY: u64 = 1024;
 
 /// Cache-line-padded per-thread counter: without the padding, neighbouring
@@ -254,6 +256,136 @@ fn rwlock_outcome<R: RawRwLock + Send + Sync + 'static>(
     })
 }
 
+/// Result of the starvation probe: how long a single "victim" thread waits
+/// for the lock while N-1 threads hammer it.
+struct Starvation {
+    /// Acquisitions the victim managed inside the window.
+    acquisitions: u64,
+    /// Worst single wait observed, nanoseconds.
+    max_ns: u64,
+    /// 99th-percentile wait, nanoseconds.
+    p99_ns: u64,
+    /// Median wait, nanoseconds.
+    median_ns: u64,
+    /// True if the victim was still waiting when the probe deadline expired,
+    /// i.e. `max_ns` is a *floor* on the true worst case, not the worst case.
+    truncated: bool,
+}
+
+/// Measures the tail latency a *single* thread sees while `hammers` other
+/// threads contend for the same lock.
+///
+/// This is the number that turns "unfair" into an operator-visible quantity:
+/// aggregate throughput can look excellent while one unlucky thread waits
+/// milliseconds. A lock with a fairness mechanism bounds this; a pure barging
+/// lock does not bound it at all.
+///
+/// The victim's every acquisition is individually timed, so this reports the
+/// distribution rather than an average. A hard deadline caps the probe: if the
+/// victim is starved past it, the run is marked `truncated` and `max_ns` is
+/// reported as a lower bound rather than hanging the bench (an earlier version
+/// of this suite hung 15 minutes on exactly this condition).
+fn starvation_probe<R: RawMutex + Send + Sync + 'static>(
+    hammers: usize,
+) -> Starvation {
+    /// Cap on the whole probe. A victim starved this long has made the point.
+    const PROBE_DEADLINE: Duration = Duration::from_secs(10);
+
+    let m: Arc<lock_api::Mutex<R, u64>> = Arc::new(lock_api::Mutex::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let gate = Arc::new(Barrier::new(hammers + 2));
+
+    let hammer_handles: Vec<_> = (0..hammers)
+        .map(|_| {
+            let m = Arc::clone(&m);
+            let stop = Arc::clone(&stop);
+            let gate = Arc::clone(&gate);
+            std::thread::spawn(move || {
+                gate.wait();
+                while !stop.load(Ordering::Relaxed) {
+                    for _ in 0..64 {
+                        let mut g = m.lock();
+                        *g = g.wrapping_add(1);
+                    }
+                }
+            })
+        })
+        .collect();
+
+    let victim = {
+        let m = Arc::clone(&m);
+        let stop = Arc::clone(&stop);
+        let gate = Arc::clone(&gate);
+        std::thread::spawn(move || {
+            gate.wait();
+            let mut waits: Vec<u64> = Vec::with_capacity(1 << 16);
+            while !stop.load(Ordering::Relaxed) {
+                let t0 = Instant::now();
+                let mut g = m.lock();
+                let waited = t0.elapsed();
+                *g = g.wrapping_add(1);
+                drop(g);
+                waits.push(waited.as_nanos() as u64);
+                // Yield so the victim is a light, realistic participant
+                // rather than a hammer itself: the question is "can a normal
+                // thread get service", not "who wins a spin race".
+                std::thread::yield_now();
+            }
+            waits
+        })
+    };
+
+    gate.wait();
+    std::thread::sleep(WINDOW.min(PROBE_DEADLINE));
+    stop.store(true, Ordering::Relaxed);
+
+    // The victim may be blocked inside `lock()` right now; joining could take
+    // arbitrarily long under a starving lock. Bound the wait.
+    let deadline = Instant::now() + PROBE_DEADLINE;
+    let mut truncated = false;
+    while !victim.is_finished() {
+        if Instant::now() >= deadline {
+            truncated = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let waits = if truncated {
+        // Cannot join without risking an unbounded block; the hammers are
+        // stopped, so the victim will drain on its own. Report what the
+        // truncation implies rather than blocking the suite.
+        Vec::new()
+    } else {
+        victim.join().unwrap_or_default()
+    };
+    for h in hammer_handles {
+        let _ = h.join();
+    }
+
+    if waits.is_empty() {
+        return Starvation {
+            acquisitions: 0,
+            max_ns: PROBE_DEADLINE.as_nanos() as u64,
+            p99_ns: PROBE_DEADLINE.as_nanos() as u64,
+            median_ns: PROBE_DEADLINE.as_nanos() as u64,
+            truncated: true,
+        };
+    }
+
+    let mut sorted = waits;
+    sorted.sort_unstable();
+    let n = sorted.len();
+    let pick = |q: f64| sorted[((n as f64 * q) as usize).min(n - 1)];
+    Starvation {
+        acquisitions: n as u64,
+        max_ns: sorted[n - 1],
+        p99_ns: pick(0.99),
+        median_ns: pick(0.50),
+        truncated,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Reporting
 // ---------------------------------------------------------------------------
@@ -280,6 +412,43 @@ fn row(threads: usize, name: &str, o: &Outcome) {
         ratio_s,
         o.cov(),
         o.starved(),
+    );
+}
+
+fn starvation_header() {
+    println!("\n## Starvation probe: 1 light victim thread vs N-1 hammers");
+    println!(
+        "\nThe victim times every acquisition. An unbounded `max` is the \
+         operator-visible cost of a lock with no fairness mechanism. \
+         `trunc` = the victim was still starved at the probe deadline, so \
+         `max` is a **floor**, not the true worst case."
+    );
+    println!(
+        "\n| threads | impl | victim acqs | median wait | p99 wait | max wait | trunc |"
+    );
+    println!("|---:|---|---:|---:|---:|---:|---:|");
+}
+
+fn fmt_ns(ns: u64) -> String {
+    if ns >= 1_000_000 {
+        format!("{:.2} ms", ns as f64 / 1e6)
+    } else if ns >= 1_000 {
+        format!("{:.1} us", ns as f64 / 1e3)
+    } else {
+        format!("{ns} ns")
+    }
+}
+
+fn starvation_row(threads: usize, name: &str, s: &Starvation) {
+    println!(
+        "| {} | {} | {} | {} | {} | {} | {} |",
+        threads,
+        name,
+        s.acquisitions,
+        fmt_ns(s.median_ns),
+        fmt_ns(s.p99_ns),
+        fmt_ns(s.max_ns),
+        if s.truncated { "YES" } else { "no" },
     );
 }
 
@@ -359,7 +528,7 @@ fn main() {
         row(t, "parking_lot", &rwlock_outcome::<parking_lot::RawRwLock>(t, 0));
     }
 
-    header("RwLock, 1-in-1024 writers (tree-latch shape)");
+    header("RwLock, 1-in-1024 writers (dbi cursor/db lock shape)");
     for &t in THREADS {
         row(
             t,
@@ -370,6 +539,20 @@ fn main() {
             t,
             "parking_lot",
             &rwlock_outcome::<parking_lot::RawRwLock>(t, WRITE_EVERY),
+        );
+    }
+
+    starvation_header();
+    for &t in THREADS {
+        starvation_row(
+            t,
+            "noxu_sync",
+            &starvation_probe::<noxu_sync::RawMutex>(t - 1),
+        );
+        starvation_row(
+            t,
+            "parking_lot",
+            &starvation_probe::<parking_lot::RawMutex>(t - 1),
         );
     }
     println!();
