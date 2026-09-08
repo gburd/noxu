@@ -5118,4 +5118,135 @@ mod tests {
         cur.search(b"a", None, SearchMode::Set).unwrap();
         assert!(cur.upgrade_current_to_write_lock().is_ok());
     }
+
+    // ── put_with_expiration (TTL) ────────────────────────────────────────
+
+    /// Read the slot expiration for `key` by walking the tree, since there is
+    /// no public accessor for it.
+    fn slot_expiration(
+        db: &Arc<RwLock<DatabaseImpl>>,
+        key: &[u8],
+    ) -> Option<u32> {
+        let guard = db.read();
+        let tree = guard.get_real_tree()?;
+        for node_arc in tree.rebuild_in_list() {
+            let node = node_arc.read();
+            if let noxu_tree::tree::TreeNode::Bottom(bin) = &*node {
+                for i in 0..bin.entries.len() {
+                    if bin.get_full_key(i).as_deref() == Some(key) {
+                        return Some(bin.entries[i].expiration_time);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// A TTL put must stamp the slot, and -- the part that is easy to get
+    /// wrong -- the pending expiration must NOT leak into the next plain
+    /// `put`. It is stashed on the cursor across the call, so a missing reset
+    /// would silently give every subsequent record the previous record's TTL.
+    #[test]
+    fn put_with_expiration_stamps_the_slot_and_does_not_leak_to_the_next_put() {
+        let db = create_test_database();
+        let mut cur = CursorImpl::new(Arc::clone(&db), 500);
+
+        cur.put_with_expiration(b"ttl", b"v", PutMode::Overwrite, 42).unwrap();
+        assert_eq!(
+            slot_expiration(&db, b"ttl"),
+            Some(42),
+            "a TTL put must stamp the slot's expiration"
+        );
+
+        cur.put(b"plain", b"v", PutMode::Overwrite).unwrap();
+        assert_eq!(
+            slot_expiration(&db, b"plain"),
+            Some(0),
+            "the previous put's TTL must not leak into a plain put"
+        );
+
+        // A zero expiration is documented as a no-op (slots default to 0).
+        cur.put_with_expiration(b"zero", b"v", PutMode::Overwrite, 0).unwrap();
+        assert_eq!(slot_expiration(&db, b"zero"), Some(0));
+    }
+
+    /// Re-putting a key with a new TTL must replace the stamp, not keep the
+    /// old one -- otherwise a record's TTL could never be extended.
+    #[test]
+    fn put_with_expiration_replaces_an_earlier_ttl() {
+        let db = create_test_database();
+        let mut cur = CursorImpl::new(Arc::clone(&db), 501);
+        cur.put_with_expiration(b"k", b"v1", PutMode::Overwrite, 10).unwrap();
+        assert_eq!(slot_expiration(&db, b"k"), Some(10));
+        cur.put_with_expiration(b"k", b"v2", PutMode::Overwrite, 99).unwrap();
+        assert_eq!(
+            slot_expiration(&db, b"k"),
+            Some(99),
+            "a later TTL must replace the earlier one"
+        );
+    }
+
+    // ── fault-injection hooks ────────────────────────────────────────────
+
+    /// `set_cursor_fail_after(n)` makes the Nth state check fail. The countdown
+    /// semantics matter: `noxu-db`'s error-path tests use them to reach the
+    /// SECOND `map_err` closure inside a single `Database` method, which is
+    /// only possible if the first N-1 checks genuinely pass. Assert the
+    /// off-by-one directly rather than trusting it.
+    #[test]
+    fn cursor_fail_countdown_fails_exactly_the_nth_check() {
+        let mut cur = seeded_cursor(&["a"]);
+        clear_cursor_fail_flag();
+
+        // n = 1 -> the very next check fails.
+        set_cursor_fail_after(1);
+        assert!(matches!(
+            cur.search(b"a", None, SearchMode::Set),
+            Err(DbiError::CursorClosed)
+        ));
+        // The countdown is one-shot: it must have disarmed itself.
+        assert!(cur.search(b"a", None, SearchMode::Set).is_ok());
+
+        // n = 2 -> the first check passes, the second fails.
+        set_cursor_fail_after(2);
+        assert!(
+            cur.search(b"a", None, SearchMode::Set).is_ok(),
+            "with n=2 the FIRST check must pass, or the noxu-db tests cannot \
+             reach a method's second error closure"
+        );
+        assert!(matches!(
+            cur.search(b"a", None, SearchMode::Set),
+            Err(DbiError::CursorClosed)
+        ));
+        assert!(cur.search(b"a", None, SearchMode::Set).is_ok());
+    }
+
+    /// `clear_cursor_fail_flag` must disarm a countdown that has not fired, and
+    /// be idempotent. Without this, one test arming the hook and returning
+    /// early would poison every later test on the same thread.
+    #[test]
+    fn clearing_the_fail_flag_disarms_a_pending_countdown() {
+        let mut cur = seeded_cursor(&["a"]);
+        set_cursor_fail_after(5);
+        clear_cursor_fail_flag();
+        clear_cursor_fail_flag(); // idempotent
+        for _ in 0..8 {
+            assert!(
+                cur.search(b"a", None, SearchMode::Set).is_ok(),
+                "a cleared countdown must never fire"
+            );
+        }
+    }
+
+    /// A countdown of 0 is the disarmed state, which is what makes the hook
+    /// zero-cost when unused.
+    #[test]
+    fn a_zero_countdown_never_fires() {
+        let mut cur = seeded_cursor(&["a"]);
+        set_cursor_fail_after(0);
+        for _ in 0..4 {
+            assert!(cur.search(b"a", None, SearchMode::Set).is_ok());
+        }
+        clear_cursor_fail_flag();
+    }
 }

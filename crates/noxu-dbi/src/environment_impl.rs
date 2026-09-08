@@ -3686,6 +3686,214 @@ mod tests {
         );
     }
 
+    /// `remove_database` and `rename_database` share three refusal
+    /// conditions, each of which protects a different invariant. All three
+    /// were untested for both operations.
+    #[test]
+    fn remove_and_rename_refuse_a_name_that_does_not_exist() {
+        let (_dir, env) = make_env(false);
+        assert!(matches!(
+            env.remove_database("ghost"),
+            Err(DbiError::DatabaseNotFound(_))
+        ));
+        assert!(matches!(
+            env.rename_database("ghost", "phantom"),
+            Err(DbiError::DatabaseNotFound(_))
+        ));
+    }
+
+    /// Both refuse while a handle is open, and -- the part worth asserting --
+    /// a refused operation must leave the catalog untouched. A rename that
+    /// removed the old name before noticing the conflict would strand the
+    /// database under no name at all.
+    #[test]
+    fn remove_and_rename_refuse_open_handles_without_disturbing_the_catalog() {
+        let (_dir, env) = make_env(false);
+        seed(&env, "live", 2); // handle stays open
+
+        assert!(matches!(
+            env.remove_database("live"),
+            Err(DbiError::DatabaseInUse(_))
+        ));
+        assert!(matches!(
+            env.rename_database("live", "moved"),
+            Err(DbiError::DatabaseInUse(_))
+        ));
+
+        let names = env.get_database_names();
+        assert!(
+            names.contains(&"live".to_string()),
+            "a refused operation must leave the name in place; got {names:?}"
+        );
+        assert!(
+            !names.contains(&"moved".to_string()),
+            "a refused rename must not create the target name"
+        );
+    }
+
+    /// Renaming onto an occupied name must be refused, or the two databases
+    /// would collide in `name_map` and one would become unreachable.
+    #[test]
+    fn rename_refuses_to_overwrite_an_existing_name() {
+        let (_dir, env) = make_env(false);
+        let a = seed(&env, "src", 1);
+        let b = seed(&env, "dst", 1);
+        env.close_database(a).unwrap();
+        env.close_database(b).unwrap();
+
+        assert!(matches!(
+            env.rename_database("src", "dst"),
+            Err(DbiError::DatabaseAlreadyExists(_))
+        ));
+
+        // Both names must survive the refusal, still pointing at their own
+        // databases.
+        assert_eq!(env.get_database_by_id(a).unwrap().read().get_name(), "src");
+        assert_eq!(*env.name_map.read().get("src").unwrap(), a);
+        assert_eq!(*env.name_map.read().get("dst").unwrap(), b);
+    }
+
+    /// A successful rename must move the name and free the old one, keeping
+    /// the same database id (the point of rename versus remove+create).
+    #[test]
+    fn rename_moves_the_name_and_keeps_the_database_id() {
+        let (_dir, env) = make_env(false);
+        let id = seed(&env, "before", 3);
+        env.close_database(id).unwrap();
+
+        env.rename_database("before", "after").unwrap();
+
+        assert!(env.name_map.read().get("before").is_none());
+        assert_eq!(*env.name_map.read().get("after").unwrap(), id);
+        assert_eq!(
+            env.get_database_by_id(id).unwrap().read().entry_count(),
+            3,
+            "rename must not touch the data"
+        );
+    }
+
+    /// Every public operation must refuse once the environment is invalidated,
+    /// and the reported error must name the reason -- an operator who only
+    /// sees "not open" cannot tell a clean close from a corruption halt.
+    #[test]
+    fn an_invalidated_environment_refuses_operations_and_reports_the_reason() {
+        let (_dir, env) = make_env(false);
+        let flag = env.is_invalid_flag();
+        assert!(!flag.load(Ordering::Relaxed), "a fresh env is valid");
+        assert!(env.is_valid());
+
+        env.invalidate(EnvironmentFailureReason::LogChecksum);
+
+        assert!(
+            flag.load(Ordering::Relaxed),
+            "is_invalid_flag hands out the LIVE flag, not a snapshot - \
+             Database/CursorImpl cache it to avoid locking on every op"
+        );
+        assert!(!env.is_valid());
+        assert!(matches!(env.get_state(), EnvState::Invalid));
+
+        match env.check_open() {
+            Err(DbiError::EnvironmentFailure { reason }) => assert!(
+                reason.contains("LogChecksum"),
+                "the failure must name its reason; got {reason:?}"
+            ),
+            other => panic!("expected EnvironmentFailure, got {other:?}"),
+        }
+
+        // And the invalidation must take precedence over every entry point,
+        // not just check_open.
+        assert!(env.truncate_database("anything").is_err());
+        assert!(env.remove_database("anything").is_err());
+        assert!(env.rename_database("a", "b").is_err());
+    }
+
+    /// `get_creation_time` stamps the environment at open. It must be a real
+    /// wall-clock time, not zero -- it is what monitoring reports as env age.
+    #[test]
+    fn creation_time_is_a_real_timestamp_and_stable_across_reads() {
+        let (_dir, env) = make_env(false);
+        let t = env.get_creation_time();
+        assert!(t > 0, "creation time must be stamped, not left at 0");
+        assert_eq!(
+            t,
+            env.get_creation_time(),
+            "creation time must not drift between reads"
+        );
+    }
+
+    /// The cleaner-owned handles must be present exactly when the cleaner is:
+    /// a read-only environment has none, and asking for them must yield `None`
+    /// rather than panicking. A DiskOrderedCursor relies on
+    /// `get_file_protector` to keep the cleaner from deleting files mid-scan,
+    /// so a spurious `None` on a writable env would silently drop that
+    /// protection.
+    #[test]
+    fn cleaner_owned_handles_track_whether_a_cleaner_exists() {
+        let (_dir, rw) = make_env(false);
+        assert_eq!(
+            rw.get_cleaner_throttle().is_some(),
+            rw.get_file_protector().is_some(),
+            "the throttle and the file protector are both cleaner-owned, so \
+             they must appear and disappear together"
+        );
+
+        let (_dir2, ro) = make_env(true);
+        assert!(
+            ro.get_cleaner_throttle().is_none(),
+            "a read-only environment runs no cleaner, so there is no throttle"
+        );
+        assert!(ro.get_file_protector().is_none());
+        assert!(
+            ro.get_checkpointer().is_none(),
+            "nor a checkpointer, for the same reason"
+        );
+    }
+
+    /// The DOS producer queue timeout is passed straight through to the
+    /// producer thread, so a zero here would turn every enqueue into an
+    /// immediate scan failure. Assert the default is the configured non-zero
+    /// value.
+    #[test]
+    fn dos_producer_queue_timeout_is_non_zero_by_default() {
+        let (_dir, env) = make_env(false);
+        assert!(
+            env.get_dos_producer_queue_timeout_ms() > 0,
+            "a zero DOS enqueue timeout would fail every scan immediately"
+        );
+    }
+
+    /// Critical eviction is a no-op when the cache is nowhere near its budget,
+    /// so a fresh environment must report 0 bytes evicted rather than evicting
+    /// speculatively (which would defeat the cache).
+    #[test]
+    fn critical_eviction_does_nothing_on_an_empty_cache() {
+        let (_dir, env) = make_env(false);
+        assert_eq!(
+            env.critical_eviction(),
+            0,
+            "an empty cache is not critically over budget"
+        );
+    }
+
+    /// The memory budget and node sequence are the environment's shared
+    /// accounting handles. Assert they are wired to real state rather than
+    /// fresh defaults: the node sequence must hand out strictly increasing
+    /// ids, since duplicate node ids would corrupt the tree's identity map.
+    #[test]
+    fn node_sequence_hands_out_strictly_increasing_ids() {
+        let (_dir, env) = make_env(false);
+        let seq = env.get_node_sequence();
+        let a = seq.get_next_local_node_id();
+        let b = seq.get_next_local_node_id();
+        let c = seq.get_next_local_node_id();
+        assert!(a < b && b < c, "node ids must strictly increase: {a} {b} {c}");
+
+        assert!(
+            env.get_memory_budget().max_memory() > 0,
+            "the memory budget must be sized, or the evictor has no target"
+        );
+    }
+
     #[test]
     fn test_remove_database() {
         let (_dir, env) = make_env(false);
