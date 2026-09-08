@@ -202,6 +202,35 @@ wait, the other does not bound it at all.
 
 This is also the true cause of harness bug 2's deadlock.
 
+### Regression test (and why it is not timing-based)
+
+`crates/noxu-sync/tests/rwlock_writer_starvation.rs` pins this behaviour down
+so it cannot be silently changed. Note that the *emergent* starvation above is
+**not portably reproducible**: it needs readers to genuinely overlap in time,
+which needs free cores. Re-running the load-based probe on a loaded 8-core
+machine produced only a 19x reader:writer ratio — the readers descheduled
+often enough to leave `state == 0` windows and the writer got served. A test
+asserting the 64-vCPU ratio would fail on small CI boxes for reasons unrelated
+to the property.
+
+The committed tests therefore construct the starving condition
+**deterministically**, with no reliance on scheduling luck:
+
+1. `a_pending_writer_does_not_block_a_new_reader` — the single mechanism, as
+   one explicit handoff.
+2. `hand_over_hand_readers_starve_the_writer_indefinitely` — a reader chain
+   where each reader provably acquires *before* its predecessor releases, so
+   the reader count is >= 1 at every instant by construction. 40 handoff
+   windows pass and the writer never gets in.
+3. `a_single_non_overlapping_reader_does_not_starve_the_writer` — the control,
+   isolating overlap (not "readers exist") as the cause.
+
+These were verified to be non-vacuous by running the same logic against
+`parking_lot::RawRwLock`: it **refuses** the incoming reader at iteration 0
+(writer preference), which breaks the chain and lets its writer through. Both
+assertions fail against a writer-preferring lock, so they genuinely
+discriminate.
+
 ### Production exposure
 
 This is not a synthetic-only concern. `noxu_sync::RwLock` instances with a
@@ -393,5 +422,8 @@ scope here by instruction. This document is the input to that decision.
 - **Starvation probe is a lower bound.** The 3 s window shows the writer
   starved for the *whole window*; the true unbounded-ness follows from the
   algorithm (no reader-blocking mechanism), not from a longer measurement.
+  Relatedly, the *emergent* form is core-count-dependent (19x on a loaded
+  8-core box vs ~1e6x on the idle 64-vCPU box), which is why the committed
+  regression test constructs the condition deterministically instead.
 - **`Condvar` was not benchmarked.** It is used by `noxu-txn`'s lock manager
   and `noxu-rep`; it would ride along with a mutex retirement.
