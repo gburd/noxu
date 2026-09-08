@@ -15,6 +15,43 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Testing
+
+- **`noxu-dbi` and `noxu-db` raised over the >85% coverage mandate on
+  region / function / line.** These were the last two crates below target.
+
+  | crate | axis | before | after |
+  |---|---|---:|---:|
+  | `noxu-dbi` | region | 81.28% | 87.81% |
+  | `noxu-dbi` | function | 78.25% | 88.04% |
+  | `noxu-dbi` | line | 78.95% | 86.14% |
+  | `noxu-dbi` | branch | 54.30% | 61.43% |
+  | `noxu-db` (`--lib`) | region | 81.10% | 91.31% |
+  | `noxu-db` (`--lib`) | function | 73.60% | 89.38% |
+  | `noxu-db` (`--lib`) | line | 77.20% | 89.18% |
+  | `noxu-db` (`--lib`) | branch | 59.80% | 68.06% |
+
+  **Branch coverage does NOT meet the target and is not expected to.** The
+  residual gap is defensive arms on invariants the type system already maintains
+  (`if let Some(tree) = db.get_real_tree()`, where `None` is unreachable because
+  `DatabaseImpl::new` always builds a tree), `?`-propagation arms that need
+  per-call-site fault injection, multi-subsystem states that need a replication
+  or crash harness, and each `#[cfg(test)]` module's own `assert!` failure arms —
+  which are structurally uncoverable and grow as tests are added.
+  `docs/src/internal/coverage-gaps-dbi-db-2026-09.md` classifies every remaining
+  uncovered arm and states the realistic ceiling. `noxu-log` sits in the same
+  position at 72.1% branch.
+
+  The tests target behaviour, not the number. Highlights: a field-isolation
+  sweep over all ~140 `EnvironmentConfig` builders (each must write the field its
+  name promises AND nothing else, verified against planted cross-writes); the
+  secondary-index `update_secondary` delete/insert decision matrix; the
+  transaction terminal-state matrix, asserting that a refused resolution does not
+  mutate state; `search_lte`'s four floor-search outcomes; the reverse-packed
+  key-length encoding at every width boundary; and `parse_entry_from_bytes`'
+  malformed-header rejections. Several were validated by planting the bug they
+  claim to catch and confirming the test fails.
+
 ### Fixed
 
 - **`Environment::invalidate()` did not invalidate open `Database` handles.**
