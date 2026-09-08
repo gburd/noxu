@@ -39,6 +39,25 @@ pub struct NoxuRawRwLock {
     pub(crate) exclusive_owner: AtomicU64,
 }
 
+// SAFETY: `lock_api::RawRwLock` requires that this type actually provide
+// mutual exclusion between exclusive holders, and shared-but-not-exclusive
+// access between shared holders, so that `lock_api` may hand out `&mut T` to an
+// exclusive holder and `&T` to shared holders.
+//
+// That holds here: `state` packs a reader count (low bits, `READERS_MASK`) with
+// a `WRITE_LOCKED` bit (1 << 30). `lock_exclusive` only succeeds by CASing
+// `state` from 0 to `WRITE_LOCKED`, so an exclusive holder excludes every reader
+// and every other writer; `lock_shared` only succeeds while `WRITE_LOCKED` is
+// clear, so readers never coexist with a writer. All transitions are
+// compare-exchange on a single atomic word with Acquire on acquisition and
+// Release on release, giving the happens-before edges `lock_api` relies on.
+//
+// NOTE (not a soundness issue, but a documented behavioural limitation): this
+// lock is deliberately non-fair and has NO writer-waiting bit, so a sustained
+// stream of readers can starve a waiting writer indefinitely. That is a
+// liveness defect, measured and documented in
+// `docs/src/internal/noxu-sync-vs-parking-lot-2026-09.md`, and it does not
+// affect the exclusion guarantees this `unsafe impl` asserts.
 unsafe impl lock_api::RawRwLock for NoxuRawRwLock {
     const INIT: Self = NoxuRawRwLock {
         state: AtomicU32::new(0),
