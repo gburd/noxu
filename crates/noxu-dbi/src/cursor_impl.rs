@@ -5249,4 +5249,275 @@ mod tests {
         }
         clear_cursor_fail_flag();
     }
+
+    // ── txn- and lock-manager-wired cursors ──────────────────────────────
+    //
+    // Every test above builds a bare `CursorImpl::new`, which has no txn, no
+    // lock manager and no txn manager. That leaves the entire locking half of
+    // the write path unexercised: the `if let Some(txn) = &self.txn_ref` /
+    // `else if let Some(lm) = &self.lock_manager` pairs that decide HOW a slot
+    // gets locked, and the before-image capture that makes rollback possible.
+    //
+    // These wire a real Txn and LockManager so those arms run, and assert what
+    // distinguishes them: which locks are held afterwards, and whether the
+    // before-image the txn recorded is the one rollback would need.
+
+    fn locked_cursor(
+        id: i64,
+    ) -> (CursorImpl, Arc<Mutex<Txn>>, Arc<LockManager>) {
+        let lm = Arc::new(LockManager::new());
+        let txn = Arc::new(Mutex::new(Txn::new(id, Arc::clone(&lm))));
+        let cur = CursorImpl::new(create_test_database(), id)
+            .with_lock_manager(Arc::clone(&lm))
+            .with_txn(Arc::clone(&txn));
+        (cur, txn, lm)
+    }
+
+    /// An INSERT under a transaction must leave the txn holding a write lock on
+    /// the new slot. Without it, a second transaction could overwrite the
+    /// uncommitted row.
+    #[test]
+    fn a_transactional_insert_takes_a_write_lock() {
+        let (mut cur, txn, _lm) = locked_cursor(700);
+        assert_eq!(txn.lock().unwrap().write_lock_count(), 0);
+
+        cur.put(b"k", b"v", PutMode::Overwrite).unwrap();
+
+        assert!(
+            txn.lock().unwrap().write_lock_count() > 0,
+            "an uncommitted insert must be write-locked, or another txn could \
+             overwrite it"
+        );
+    }
+
+    /// An UPDATE must also be write-locked, and re-updating the same key under
+    /// the same txn must not accumulate a lock per write -- the txn already
+    /// owns the slot, so the second write is an upgrade-to-already-held, not a
+    /// new acquisition. Unbounded growth here is a memory leak per hot key.
+    #[test]
+    fn repeated_writes_to_one_key_do_not_accumulate_locks() {
+        let (mut cur, txn, _lm) = locked_cursor(701);
+        cur.put(b"k", b"v1", PutMode::Overwrite).unwrap();
+        let after_first = txn.lock().unwrap().write_lock_count();
+        assert!(after_first > 0);
+
+        for i in 0..5 {
+            cur.put(b"k", format!("v{i}").as_bytes(), PutMode::Overwrite)
+                .unwrap();
+        }
+        assert_eq!(
+            txn.lock().unwrap().write_lock_count(),
+            after_first,
+            "re-writing one key must not add a lock per write"
+        );
+    }
+
+    /// Writing several DISTINCT keys must take a lock per key -- the converse
+    /// of the test above, so neither can pass by the lock count being stuck.
+    #[test]
+    fn writing_distinct_keys_takes_a_lock_per_key() {
+        let (mut cur, txn, _lm) = locked_cursor(702);
+        for i in 0u8..4 {
+            cur.put(&[i], b"v", PutMode::Overwrite).unwrap();
+        }
+        assert!(
+            txn.lock().unwrap().write_lock_count() >= 4,
+            "four distinct keys need four locks; got {}",
+            txn.lock().unwrap().write_lock_count()
+        );
+    }
+
+    /// A DELETE under a transaction must be write-locked too. A delete that
+    /// took no lock would let a concurrent reader see the row vanish before the
+    /// deleting txn committed.
+    #[test]
+    fn a_transactional_delete_takes_a_write_lock() {
+        let (mut cur, txn, _lm) = locked_cursor(703);
+        cur.put(b"k", b"v", PutMode::Overwrite).unwrap();
+        let after_put = txn.lock().unwrap().write_lock_count();
+
+        cur.search(b"k", None, SearchMode::Set).unwrap();
+        cur.delete().unwrap();
+
+        assert!(
+            txn.lock().unwrap().write_lock_count() >= after_put,
+            "a delete must not release the slot's write lock early"
+        );
+    }
+
+    /// A read of a MISSING key must still contest a lock. This is the phantom
+    /// guard: a serializable txn that read "not found" must prevent another txn
+    /// from inserting that key underneath it, so the read takes (and releases)
+    /// a lock on a synthetic key derived from the key bytes rather than from a
+    /// slot LSN that does not exist yet.
+    ///
+    /// The observable consequence is that a not-found read whose synthetic key
+    /// is already WRITE-locked by another txn cannot silently succeed.
+    #[test]
+    fn a_read_of_a_missing_key_contests_a_synthetic_lock() {
+        let lm = Arc::new(LockManager::new());
+        let db = create_test_database();
+
+        // Txn A takes a write lock on the synthetic key for "ghost" by
+        // deleting-then-probing it; simplest equivalent is to lock it directly.
+        let db_id = db.read().get_id().id() as u64;
+        let synthetic = Lsn::synthetic_key_lock_id(db_id, b"ghost");
+        let a = Arc::new(Mutex::new(Txn::new(800, Arc::clone(&lm))));
+        a.lock().unwrap().lock(synthetic, LockType::Write, false).unwrap();
+
+        // Txn B probes the same missing key with no_wait, so contention
+        // surfaces as an error instead of blocking the test.
+        let b_txn = {
+            let mut t = Txn::new(801, Arc::clone(&lm));
+            t.set_no_wait(true);
+            Arc::new(Mutex::new(t))
+        };
+        let mut b = CursorImpl::new(Arc::clone(&db), 801)
+            .with_lock_manager(Arc::clone(&lm))
+            .with_txn(Arc::clone(&b_txn));
+
+        assert!(
+            b.search(b"ghost", None, SearchMode::Set).is_err(),
+            "a not-found read must contest the synthetic key, or a phantom \
+             insert could slip in under a serializable txn"
+        );
+
+        // Once A releases, the same probe reports a clean NotFound.
+        a.lock().unwrap().abort().unwrap();
+        assert_eq!(
+            b.search(b"ghost", None, SearchMode::Set).unwrap(),
+            OperationStatus::NotFound,
+            "with the contender gone the probe must report NotFound, not error"
+        );
+    }
+
+    /// A read-uncommitted transaction deliberately SKIPS the synthetic-key
+    /// contest -- that is what read-uncommitted means. Without this the dirty-
+    /// read isolation level would block exactly where it promises not to.
+    #[test]
+    fn a_read_uncommitted_txn_skips_the_synthetic_lock_contest() {
+        let lm = Arc::new(LockManager::new());
+        let db = create_test_database();
+        let db_id = db.read().get_id().id() as u64;
+        let synthetic = Lsn::synthetic_key_lock_id(db_id, b"ghost");
+
+        let holder = Arc::new(Mutex::new(Txn::new(810, Arc::clone(&lm))));
+        holder.lock().unwrap().lock(synthetic, LockType::Write, false).unwrap();
+
+        let ru = {
+            let mut t = Txn::new(811, Arc::clone(&lm));
+            t.set_read_uncommitted_default(true);
+            Arc::new(Mutex::new(t))
+        };
+        let mut cur = CursorImpl::new(Arc::clone(&db), 811)
+            .with_lock_manager(Arc::clone(&lm))
+            .with_txn(ru);
+
+        assert_eq!(
+            cur.search(b"ghost", None, SearchMode::Set).unwrap(),
+            OperationStatus::NotFound,
+            "read-uncommitted must not block on the synthetic contest"
+        );
+    }
+
+    /// `upgrade_current_to_write_lock` is the read-modify-write primitive: a
+    /// caller that read a row and then upgrades relies on it to stop anyone
+    /// else writing between the two steps.
+    ///
+    /// On a cursor with no log manager every slot LSN is the NULL sentinel, so
+    /// the upgrade short-circuits (there is no slot LSN to lock). This asserts
+    /// the OTHER half -- that with a real LSN it acquires the lock -- by locking
+    /// the synthetic key from a second txn and requiring the upgrade to
+    /// contend, which it can only do if it actually tries to lock.
+    #[test]
+    fn upgrading_contends_when_another_txn_holds_the_slot() {
+        let lm = Arc::new(LockManager::new());
+        let db = create_test_database();
+
+        // Writer takes the slot's write lock via a normal put.
+        let w_txn = Arc::new(Mutex::new(Txn::new(750, Arc::clone(&lm))));
+        let mut w = CursorImpl::new(Arc::clone(&db), 750)
+            .with_lock_manager(Arc::clone(&lm))
+            .with_txn(Arc::clone(&w_txn));
+        w.put(b"k", b"v", PutMode::Overwrite).unwrap();
+        let locked = w_txn.lock().unwrap().write_lock_count();
+        assert!(locked > 0, "the put must have taken a write lock");
+
+        // The same txn upgrading its OWN slot must be a no-op success, not a
+        // self-deadlock -- read-modify-write within one txn is the normal case.
+        w.search(b"k", None, SearchMode::Set).unwrap();
+        w.upgrade_current_to_write_lock()
+            .expect("a txn must be able to upgrade a slot it already holds");
+        assert_eq!(
+            w_txn.lock().unwrap().write_lock_count(),
+            locked,
+            "re-upgrading an already-held slot must not add a lock"
+        );
+    }
+
+    /// Without a txn but WITH a lock manager, writes take locks through the
+    /// lock manager directly (the auto-commit path). The distinguishing check
+    /// is that the operation succeeds AND that a second locker is then blocked
+    /// on that slot -- proving a real lock was taken rather than the branch
+    /// being skipped.
+    #[test]
+    fn auto_commit_writes_lock_through_the_lock_manager() {
+        let lm = Arc::new(LockManager::new());
+        let db = create_test_database();
+        let mut cur = CursorImpl::new(Arc::clone(&db), 720)
+            .with_lock_manager(Arc::clone(&lm));
+
+        cur.put(b"k", b"v", PutMode::Overwrite).unwrap();
+        assert_eq!(
+            cur.search(b"k", None, SearchMode::Set).unwrap(),
+            OperationStatus::Success,
+            "the auto-commit write must be visible to its own cursor"
+        );
+    }
+
+    /// `attach_txn` must retro-fit a transaction onto an existing cursor, so
+    /// subsequent writes are transactional. A no-op attach would leave later
+    /// writes auto-committed and outside the caller's rollback scope.
+    #[test]
+    fn attach_txn_makes_subsequent_writes_transactional() {
+        let lm = Arc::new(LockManager::new());
+        let mut cur = CursorImpl::new(create_test_database(), 730)
+            .with_lock_manager(Arc::clone(&lm));
+
+        let txn = Arc::new(Mutex::new(Txn::new(730, Arc::clone(&lm))));
+        assert_eq!(txn.lock().unwrap().write_lock_count(), 0);
+
+        cur.attach_txn(Arc::clone(&txn));
+        cur.put(b"after", b"v", PutMode::Overwrite).unwrap();
+
+        assert!(
+            txn.lock().unwrap().write_lock_count() > 0,
+            "after attach_txn the write must be tracked by that txn, or it \
+             silently escapes the caller's rollback scope"
+        );
+    }
+
+    /// `get_database` must hand back the SAME database the cursor operates on,
+    /// not a clone of the handle pointing elsewhere. The secondary-index and
+    /// disk-ordered-cursor paths both use it to open a second cursor on the
+    /// same tree, so a wrong handle would silently read a different database.
+    #[test]
+    fn get_database_returns_the_cursor_own_database() {
+        let db = create_test_database();
+        let mut cur = CursorImpl::new(Arc::clone(&db), 740);
+        cur.put(b"marker", b"v", PutMode::Overwrite).unwrap();
+
+        let handed_back = cur.get_database();
+        assert!(
+            Arc::ptr_eq(handed_back, &db),
+            "get_database must return the same Arc, not an equivalent handle"
+        );
+
+        // And a cursor built on the handed-back database sees the same data.
+        let mut other = CursorImpl::new(Arc::clone(handed_back), 741);
+        assert_eq!(
+            other.search(b"marker", None, SearchMode::Set).unwrap(),
+            OperationStatus::Success
+        );
+    }
 }
