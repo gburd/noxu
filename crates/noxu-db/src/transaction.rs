@@ -1607,4 +1607,274 @@ mod tests {
         let txn2 = Transaction::new(101, config);
         assert_ne!(txn1.id(), txn2.id());
     }
+
+    // ── the terminal-state matrix ────────────────────────────────────────
+    //
+    // Every public operation routes through `check_open`, which admits only
+    // `Open`. The four rejecting states each carry a DIFFERENT message,
+    // because "you cannot do that" is useless to a caller who needs to know
+    // whether to retry (MustAbort -> abort and retry), resolve via XA
+    // (Prepared), or treat the work as already done (Committed). Previously
+    // only two of the twenty state/operation pairs were tested.
+
+    /// Force `txn` into `state` without going through a real transition, so
+    /// each terminal state can be probed independently.
+    fn forced(id: u64, state: TransactionState) -> Transaction {
+        let txn = Transaction::new(id, TransactionConfig::default());
+        *txn.state.lock().unwrap() = state;
+        txn
+    }
+
+    #[test]
+    fn every_terminal_state_rejects_commit_with_a_distinguishable_reason() {
+        let cases = [
+            (TransactionState::Prepared, "prepared"),
+            (TransactionState::Committed, "committed"),
+            (TransactionState::Aborted, "aborted"),
+            (TransactionState::MustAbort, "must be aborted"),
+        ];
+        let mut messages = Vec::new();
+        for (i, (state, needle)) in cases.into_iter().enumerate() {
+            let txn = forced(900 + i as u64, state);
+            let err =
+                txn.commit().expect_err("a non-Open txn must refuse to commit");
+            let msg = err.to_string().to_lowercase();
+            assert!(
+                msg.contains(needle),
+                "the {state:?} rejection must say why (looking for \
+                 {needle:?}); got: {msg}"
+            );
+            assert!(matches!(err, NoxuError::OperationNotAllowed(_)));
+            messages.push(msg);
+        }
+        // Every message must be distinct, or the caller cannot branch on it.
+        for i in 0..messages.len() {
+            for j in (i + 1)..messages.len() {
+                assert_ne!(
+                    messages[i], messages[j],
+                    "two states share a rejection message"
+                );
+            }
+        }
+    }
+
+    /// `commit()` and `commit_with_durability()` must agree on the state
+    /// guard -- the convenience wrapper must not bypass it.
+    #[test]
+    fn commit_with_durability_enforces_the_same_state_guard_as_commit() {
+        for (i, state) in [
+            TransactionState::Prepared,
+            TransactionState::Committed,
+            TransactionState::Aborted,
+            TransactionState::MustAbort,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let txn = forced(920 + i as u64, state);
+            assert!(
+                txn.commit_with_durability(Durability::COMMIT_NO_SYNC).is_err(),
+                "{state:?} must be refused by commit_with_durability too"
+            );
+            assert_eq!(
+                txn.state(),
+                state,
+                "a refused commit must not change the state"
+            );
+        }
+    }
+
+    /// A `Prepared` transaction may only be resolved through the XA pair.
+    /// Direct commit/abort are protocol errors, and -- the part that matters --
+    /// a refused call must leave the txn still Prepared and still resolvable,
+    /// not stranded holding locks in a state nothing can clear.
+    #[test]
+    fn a_prepared_transaction_is_only_resolvable_through_the_xa_pair() {
+        let txn = forced(940, TransactionState::Prepared);
+        assert!(txn.commit().is_err(), "direct commit is a protocol error");
+        assert!(txn.abort().is_err(), "direct abort is a protocol error");
+        assert_eq!(
+            txn.state(),
+            TransactionState::Prepared,
+            "a refused direct resolution must leave the txn resolvable"
+        );
+
+        txn.resolved_commit_after_prepare().unwrap();
+        assert_eq!(txn.state(), TransactionState::Committed);
+    }
+
+    #[test]
+    fn a_prepared_transaction_can_be_resolved_by_abort() {
+        let txn = forced(941, TransactionState::Prepared);
+        txn.resolved_abort_after_prepare().unwrap();
+        assert_eq!(txn.state(), TransactionState::Aborted);
+    }
+
+    /// The XA resolvers must refuse anything that is not Prepared, or a
+    /// never-prepared transaction could be committed through the XA path,
+    /// skipping the phase-1 durability the protocol depends on.
+    #[test]
+    fn the_xa_resolvers_refuse_a_transaction_that_was_never_prepared() {
+        for (i, state) in [
+            TransactionState::Open,
+            TransactionState::Committed,
+            TransactionState::Aborted,
+            TransactionState::MustAbort,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let a = forced(960 + i as u64, state);
+            let err = a
+                .resolved_commit_after_prepare()
+                .expect_err("resolving a non-Prepared txn must be refused");
+            assert!(
+                err.to_string().contains("Prepared"),
+                "the error must name the state it expected; got: {err}"
+            );
+            assert_eq!(a.state(), state, "a refusal must not change state");
+
+            let b = forced(980 + i as u64, state);
+            assert!(b.resolved_abort_after_prepare().is_err());
+            assert_eq!(b.state(), state);
+        }
+    }
+
+    /// `prepare` itself requires Open: preparing an already-resolved
+    /// transaction would fabricate an in-doubt branch that recovery would then
+    /// try to resolve.
+    #[test]
+    fn prepare_requires_an_open_transaction() {
+        for (i, state) in [
+            TransactionState::Prepared,
+            TransactionState::Committed,
+            TransactionState::Aborted,
+            TransactionState::MustAbort,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let txn = forced(1000 + i as u64, state);
+            assert!(
+                txn.prepare(1, b"gtrid", b"bqual").is_err(),
+                "{state:?} must not be preparable"
+            );
+            assert_eq!(txn.state(), state);
+        }
+
+        let open = forced(1010, TransactionState::Open);
+        open.prepare(1, b"gtrid", b"bqual").unwrap();
+        assert_eq!(open.state(), TransactionState::Prepared);
+    }
+
+    /// Abort is idempotent-ish in the useful direction: aborting an already
+    /// Aborted txn must be refused rather than double-releasing locks or
+    /// re-applying undo. But `MustAbort` MUST still be abortable -- that is
+    /// the entire purpose of the state.
+    #[test]
+    fn abort_refuses_resolved_states_but_must_abort_stays_abortable() {
+        let committed = forced(1020, TransactionState::Committed);
+        assert!(committed.abort().is_err());
+        assert_eq!(committed.state(), TransactionState::Committed);
+
+        let aborted = forced(1021, TransactionState::Aborted);
+        assert!(aborted.abort().is_err(), "double abort must be refused");
+        assert_eq!(aborted.state(), TransactionState::Aborted);
+
+        let must = forced(1022, TransactionState::MustAbort);
+        assert!(!must.is_valid());
+        must.abort().expect("MustAbort exists so it CAN be aborted");
+        assert_eq!(must.state(), TransactionState::Aborted);
+    }
+
+    /// `is_valid` means "can still be USED for work", which is `Open` alone.
+    /// Notably `Prepared` is NOT valid even though it still holds locks and is
+    /// still resolvable: after phase 1 the commit decision is fixed, so
+    /// accepting further reads or writes would let work slip in behind a
+    /// durability promise that has already been made. Callers gate on this, so
+    /// misclassifying any state would let work proceed on a txn that cannot
+    /// accept it.
+    #[test]
+    fn is_valid_means_open_and_nothing_else() {
+        assert!(forced(1040, TransactionState::Open).is_valid());
+        assert!(
+            !forced(1041, TransactionState::Prepared).is_valid(),
+            "a Prepared txn is resolvable but NOT usable: its commit decision \
+             is already fixed"
+        );
+        assert!(!forced(1042, TransactionState::Committed).is_valid());
+        assert!(!forced(1043, TransactionState::Aborted).is_valid());
+        assert!(!forced(1044, TransactionState::MustAbort).is_valid());
+    }
+
+    /// The timeout setters must round-trip independently. They are separate
+    /// knobs (a lock timeout is per-lock-wait, a txn timeout is for the whole
+    /// transaction) and conflating them would silently change semantics.
+    #[test]
+    fn the_two_timeouts_are_independent_knobs() {
+        let txn = Transaction::new(1060, TransactionConfig::default());
+        txn.set_lock_timeout(500);
+        txn.set_txn_timeout(9_000);
+        assert_eq!(txn.lock_timeout(), 500);
+        assert_eq!(txn.txn_timeout(), 9_000);
+
+        txn.set_lock_timeout(0);
+        assert_eq!(txn.lock_timeout(), 0, "0 means no lock timeout");
+        assert_eq!(
+            txn.txn_timeout(),
+            9_000,
+            "changing the lock timeout must not disturb the txn timeout"
+        );
+    }
+
+    /// Registered callbacks must fire on the matching resolution and NOT on
+    /// the other one -- a commit callback firing on abort would let an
+    /// application publish work that was rolled back.
+    #[test]
+    fn resolution_callbacks_fire_only_on_their_own_outcome() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let commits = Arc::new(AtomicUsize::new(0));
+        let aborts = Arc::new(AtomicUsize::new(0));
+
+        let txn = Transaction::new(1080, TransactionConfig::default());
+        let c = Arc::clone(&commits);
+        txn.register_commit_callback(move || {
+            c.fetch_add(1, Ordering::SeqCst);
+        });
+        let a = Arc::clone(&aborts);
+        txn.register_abort_callback(move || {
+            a.fetch_add(1, Ordering::SeqCst);
+        });
+
+        txn.commit().unwrap();
+        assert_eq!(commits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            aborts.load(Ordering::SeqCst),
+            0,
+            "the abort callback must not fire on a commit"
+        );
+
+        let commits2 = Arc::new(AtomicUsize::new(0));
+        let aborts2 = Arc::new(AtomicUsize::new(0));
+        let txn2 = Transaction::new(1081, TransactionConfig::default());
+        let c2 = Arc::clone(&commits2);
+        txn2.register_commit_callback(move || {
+            c2.fetch_add(1, Ordering::SeqCst);
+        });
+        let a2 = Arc::clone(&aborts2);
+        txn2.register_abort_callback(move || {
+            a2.fetch_add(1, Ordering::SeqCst);
+        });
+
+        txn2.abort().unwrap();
+        assert_eq!(aborts2.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            commits2.load(Ordering::SeqCst),
+            0,
+            "the commit callback must not fire on an abort -- that would let \
+             an application publish rolled-back work"
+        );
+    }
 }
