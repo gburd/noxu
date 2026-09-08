@@ -7677,8 +7677,14 @@ pub struct TreeStats {
     pub n_bins: u64,
     /// Number of upper INs.
     pub n_ins: u64,
-    /// Total number of entries across all nodes.
-    pub n_entries: u64,
+    /// Number of leaf (LN) entries — i.e. the record count.
+    ///
+    /// Counts slots in BINs only. Upper-IN slots are *routing* entries, not
+    /// records, so they are deliberately excluded: the only consumers of this
+    /// field want a record count (`DatabaseStats::leaf_node_count`,
+    /// `PreloadStats::lns_loaded`), and including routing entries inflated
+    /// both by roughly `n_ins`.
+    pub n_leaf_entries: u64,
     /// Height of the tree (1 = root is a BIN, 2 = one level above BINs, …).
     pub height: u32,
 }
@@ -7711,11 +7717,12 @@ impl Tree {
         match &*guard {
             TreeNode::Bottom(b) => {
                 stats.n_bins += 1;
-                stats.n_entries += b.entries.len() as u64;
+                stats.n_leaf_entries += b.entries.len() as u64;
             }
             TreeNode::Internal(n) => {
                 stats.n_ins += 1;
-                stats.n_entries += n.entries.len() as u64;
+                // An upper IN's slots are routing entries, not records, so
+                // they must NOT be added to `n_leaf_entries`.
                 // Collect child arcs before releasing the guard.
                 let children: Vec<Arc<RwLock<TreeNode>>> =
                     n.resident_children();
@@ -10052,6 +10059,7 @@ mod tests {
     }
 
     /// collect_stats() on a single-entry tree: 1 IN + 1 BIN, height 2.
+    /// collect_stats() with a single insert reports one leaf entry.
     #[test]
     fn test_collect_stats_single_insert() {
         let tree = Tree::new(1, 128);
@@ -10060,10 +10068,16 @@ mod tests {
         assert_eq!(stats.n_bins, 1, "must have 1 BIN");
         assert_eq!(stats.n_ins, 1, "must have 1 upper IN");
         assert_eq!(stats.height, 2, "single-entry tree has height 2");
-        assert!(stats.n_entries >= 1, "must have at least 1 entry total");
+        assert_eq!(
+            stats.n_leaf_entries, 1,
+            "one insert is exactly one leaf entry - the upper IN's routing \
+             slot must not be counted as a record"
+        );
     }
 
-    /// collect_stats() with many inserts: entry count matches insert count.
+    /// collect_stats() with many inserts: leaf-entry count matches insert count
+    /// exactly, across a tree deep enough to have several upper INs whose
+    /// routing slots must stay out of the count.
     #[test]
     fn test_collect_stats_many_inserts() {
         let tree = Tree::new(1, 8);
@@ -10073,18 +10087,14 @@ mod tests {
             tree.insert(key, b"v".to_vec(), Lsn::new(1, i)).unwrap();
         }
         let stats = tree.collect_stats();
-        // All n entries should be accounted for across all BINs.
-        // n_entries counts entries in both INs and BINs; BIN entries = n.
-        // We verify BIN entry total equals n by summing manually.
-        let bin_entries: u64 = stats.n_entries - stats.n_ins; // rough check
-        // A more precise assertion: the sum of all BIN entries == n.
-        // Since we can't easily separate, just assert the tree is non-trivial.
-        assert!(stats.n_bins > 0, "must have at least one BIN");
+        assert!(stats.n_bins > 1, "fanout 8 with 50 records must split");
+        assert!(stats.n_ins > 0, "must have upper INs whose slots don't count");
         assert!(stats.height >= 2, "multi-entry tree has height >= 2");
-        // Total entries in the tree must be >= n (BIN entries alone).
-        assert!(
-            bin_entries >= n as u64 || stats.n_entries >= n as u64,
-            "entry count must account for all inserts"
+        assert_eq!(
+            stats.n_leaf_entries, n as u64,
+            "leaf-entry count must equal the number of records inserted, with \
+             no contribution from the {} upper IN(s)",
+            stats.n_ins
         );
     }
 

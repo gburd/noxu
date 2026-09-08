@@ -17,6 +17,23 @@ listed in [References](#references).
 
 ### Fixed
 
+- **`Database::stats(fast = false)` and `Database::preload` over-reported the
+  record count.** `Tree::collect_stats` accumulated its entry counter across
+  *every* node, summing BIN slots (records) together with upper-IN slots
+  (routing entries). Both consumers wanted a record count: `DatabaseStats`
+  maps it to `leaf_node_count` (JE `getLNCount()`) and `PreloadStats` to
+  `lns_loaded`. So a 64-record database in one BIN under one upper IN reported
+  65 records from the full-walk path while the O(1) `fast = true` path
+  correctly reported 64, and the overcount grew with tree height and fanout.
+
+  The field is renamed `TreeStats::n_entries` → `n_leaf_entries` and now counts
+  BIN slots only, which fixes both callers at once. The rename is deliberate:
+  the old name is what invited the wrong summation, and `TreeStats` is public
+  API on `noxu-tree`. Found by a new `stats_config` test that asserts the fast
+  and full paths agree on the record count — the existing suite's only
+  `stats(fast = false)` caller asserted `bottom_internal_node_count` and never
+  the record count, so nothing caught it.
+
 - **`noxu-rep`: `CommitFreezeLatch` is now wired into the election and replay
   paths.** The latch was a complete, unit-tested port of JE's
   `CommitFreezeLatch` but was referenced nowhere outside its own file, so a
