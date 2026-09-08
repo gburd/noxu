@@ -1726,4 +1726,414 @@ mod tests {
             !secondary.exists(None, &DatabaseEntry::from_bytes(b"A")).unwrap()
         );
     }
+
+    // ── update_secondary: the delete/insert decision matrix ──────────────
+    //
+    // `update_secondary` decides independently whether to DELETE the old
+    // secondary key and whether to INSERT the new one, from
+    // `(old_sec_key, new_sec_key)`. That is four outcomes, and getting any of
+    // them wrong corrupts the index in a way reads cannot detect: a missing
+    // delete leaves a dangling index entry pointing at a primary key whose
+    // value no longer produces that secondary key, and a missing insert makes
+    // a live record invisible to secondary lookups.
+    //
+    // The whole point is that the decision is `old != new`, NOT
+    // `old.is_some() && new.is_some()` — an update that leaves the secondary
+    // key unchanged must do neither, or it would churn the index (and, on a
+    // sorted-dup index, could delete the entry it just re-inserted).
+
+    /// A key creator that refuses to index values starting with `b'!'`, so
+    /// tests can drive the "creator returned false" (= no secondary key)
+    /// branches on either side of an update.
+    struct SkipBangKeyCreator;
+
+    impl SecondaryKeyCreator for SkipBangKeyCreator {
+        fn create_secondary_key(
+            &self,
+            _db: &Database,
+            _key: &DatabaseEntry,
+            data: &DatabaseEntry,
+            result: &mut DatabaseEntry,
+        ) -> bool {
+            match data.data_opt() {
+                Some(d) if !d.is_empty() && d[0] != b'!' => {
+                    result.set_data(&d[..1]);
+                    true
+                }
+                _ => false,
+            }
+        }
+    }
+
+    fn open_secondary_with(
+        primary: Arc<Mutex<Database>>,
+        env: &Environment,
+        name: &str,
+        config: SecondaryConfig,
+    ) -> SecondaryDatabase {
+        let sec_db = env
+            .open_database(
+                None,
+                name,
+                &DatabaseConfig::new()
+                    .with_allow_create(true)
+                    .with_transactional(true)
+                    .with_sorted_duplicates(true),
+            )
+            .unwrap();
+        SecondaryDatabase::open(primary, sec_db, config).unwrap()
+    }
+
+    /// Collect the primary keys the secondary index maps `sec_key` to.
+    fn index_entries(sec: &SecondaryDatabase, sec_key: &[u8]) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut cur = sec.inner_db().open_cursor(None).unwrap();
+        let mut k = DatabaseEntry::from_bytes(sec_key);
+        let mut v = DatabaseEntry::new();
+        let mut status =
+            cur.get(&mut k, &mut v, crate::get::Get::Search, None).unwrap();
+        while status == crate::operation_status::OperationStatus::Success {
+            out.push(v.data_opt().unwrap_or(&[]).to_vec());
+            k = DatabaseEntry::new();
+            v = DatabaseEntry::new();
+            status = cur
+                .get(&mut k, &mut v, crate::get::Get::NextDup, None)
+                .unwrap();
+        }
+        out.sort();
+        out
+    }
+
+    /// Both keys absent is a documented early return -- nothing to do.
+    #[test]
+    fn update_secondary_with_neither_old_nor_new_is_a_no_op() {
+        let (_tmp, env) = temp_env();
+        let primary = Arc::new(Mutex::new(open_primary(&env, "p")));
+        let sec = open_secondary(Arc::clone(&primary), &env, "s");
+
+        let before = sec.count().unwrap();
+        sec.update_secondary(
+            None,
+            &DatabaseEntry::from_bytes(b"k"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(sec.count().unwrap(), before);
+    }
+
+    /// insert-only: no old data, so nothing to delete.
+    #[test]
+    fn update_secondary_inserts_when_there_is_no_old_data() {
+        let (_tmp, env) = temp_env();
+        let primary = Arc::new(Mutex::new(open_primary(&env, "p")));
+        let sec = open_secondary(Arc::clone(&primary), &env, "s");
+
+        sec.update_secondary(
+            None,
+            &DatabaseEntry::from_bytes(b"pk1"),
+            None,
+            Some(&DatabaseEntry::from_bytes(b"aval")),
+        )
+        .unwrap();
+        assert_eq!(index_entries(&sec, b"a"), vec![b"pk1".to_vec()]);
+    }
+
+    /// delete-only: no new data (a primary delete), so nothing to insert.
+    #[test]
+    fn update_secondary_deletes_when_there_is_no_new_data() {
+        let (_tmp, env) = temp_env();
+        let primary = Arc::new(Mutex::new(open_primary(&env, "p")));
+        let sec = open_secondary(Arc::clone(&primary), &env, "s");
+
+        let pk = DatabaseEntry::from_bytes(b"pk1");
+        let av = DatabaseEntry::from_bytes(b"aval");
+        sec.update_secondary(None, &pk, None, Some(&av)).unwrap();
+        assert_eq!(index_entries(&sec, b"a"), vec![b"pk1".to_vec()]);
+
+        sec.update_secondary(None, &pk, Some(&av), None).unwrap();
+        assert!(
+            index_entries(&sec, b"a").is_empty(),
+            "a primary delete must remove the dangling index entry"
+        );
+    }
+
+    /// The load-bearing case: an update whose secondary key CHANGES must both
+    /// delete the old entry and insert the new one. Half-doing it leaves the
+    /// index either dangling or blind.
+    #[test]
+    fn update_secondary_moves_the_entry_when_the_secondary_key_changes() {
+        let (_tmp, env) = temp_env();
+        let primary = Arc::new(Mutex::new(open_primary(&env, "p")));
+        let sec = open_secondary(Arc::clone(&primary), &env, "s");
+
+        let pk = DatabaseEntry::from_bytes(b"pk1");
+        let old = DatabaseEntry::from_bytes(b"aval");
+        let new = DatabaseEntry::from_bytes(b"bval");
+
+        sec.update_secondary(None, &pk, None, Some(&old)).unwrap();
+        sec.update_secondary(None, &pk, Some(&old), Some(&new)).unwrap();
+
+        assert!(
+            index_entries(&sec, b"a").is_empty(),
+            "the old secondary key must no longer point at the primary key"
+        );
+        assert_eq!(index_entries(&sec, b"b"), vec![b"pk1".to_vec()]);
+    }
+
+    /// An update that leaves the secondary key UNCHANGED must do neither a
+    /// delete nor an insert. The decision is `old != new`, not
+    /// `both are present`.
+    ///
+    /// The end state is identical either way, so asserting on the index
+    /// contents alone cannot tell the two implementations apart. The
+    /// observable difference is WORK: keying off presence issues a
+    /// delete+insert pair that both hit the WAL. So this asserts the log did
+    /// not grow -- a genuine no-op writes nothing.
+    #[test]
+    fn update_secondary_writes_nothing_when_the_secondary_key_is_unchanged() {
+        let (_tmp, env) = temp_env();
+        let primary = Arc::new(Mutex::new(open_primary(&env, "p")));
+        let sec = open_secondary(Arc::clone(&primary), &env, "s");
+
+        let pk = DatabaseEntry::from_bytes(b"pk1");
+        // Both values share the first byte, so both map to secondary key "a".
+        let old = DatabaseEntry::from_bytes(b"a-one");
+        let new = DatabaseEntry::from_bytes(b"a-two");
+
+        sec.update_secondary(None, &pk, None, Some(&old)).unwrap();
+        let before = index_entries(&sec, b"a");
+        assert_eq!(before, vec![b"pk1".to_vec()]);
+
+        let log_before = env.stats().unwrap().log.end_of_log;
+        sec.update_secondary(None, &pk, Some(&old), Some(&new)).unwrap();
+        let log_after = env.stats().unwrap().log.end_of_log;
+
+        assert_eq!(
+            index_entries(&sec, b"a"),
+            before,
+            "an unchanged secondary key must leave the index byte-identical"
+        );
+        assert_eq!(
+            log_after, log_before,
+            "an unchanged secondary key must issue NO index writes; a version \
+             keying off presence rather than inequality would log a \
+             delete+insert pair here"
+        );
+    }
+
+    /// A key creator may decline to index a record ("returned false"), which
+    /// is a THIRD state beyond present/absent data. Both sides of an update
+    /// must handle it: declining on the new side is a delete, and declining on
+    /// the old side means there was never an entry to delete.
+    #[test]
+    fn update_secondary_honours_a_creator_that_declines_to_index() {
+        let (_tmp, env) = temp_env();
+        let primary = Arc::new(Mutex::new(open_primary(&env, "p")));
+        let sec = open_secondary_with(
+            Arc::clone(&primary),
+            &env,
+            "s",
+            SecondaryConfig::new()
+                .with_allow_create(true)
+                .with_key_creator(Box::new(SkipBangKeyCreator)),
+        );
+
+        let pk = DatabaseEntry::from_bytes(b"pk1");
+        let indexed = DatabaseEntry::from_bytes(b"aval");
+        let skipped = DatabaseEntry::from_bytes(b"!hidden");
+
+        // Declined on insert: no entry appears at all.
+        sec.update_secondary(None, &pk, None, Some(&skipped)).unwrap();
+        assert_eq!(
+            sec.count().unwrap(),
+            0,
+            "a declined record must not be indexed"
+        );
+
+        // indexed -> declined: the old entry must be removed, since the record
+        // is no longer indexable.
+        sec.update_secondary(None, &pk, None, Some(&indexed)).unwrap();
+        assert_eq!(index_entries(&sec, b"a"), vec![b"pk1".to_vec()]);
+        sec.update_secondary(None, &pk, Some(&indexed), Some(&skipped))
+            .unwrap();
+        assert!(
+            index_entries(&sec, b"a").is_empty(),
+            "becoming un-indexable must remove the stale entry"
+        );
+
+        // declined -> indexed: nothing to delete, one thing to insert.
+        sec.update_secondary(None, &pk, Some(&skipped), Some(&indexed))
+            .unwrap();
+        assert_eq!(index_entries(&sec, b"a"), vec![b"pk1".to_vec()]);
+    }
+
+    /// The multi-key path is a separate branch of `update_secondary` with its
+    /// own set-difference logic, and set difference is where off-by-one errors
+    /// live. An update from {a,b} to {b,c} must delete ONLY a, insert ONLY c,
+    /// and leave b alone -- deleting and re-inserting b would be wrong even
+    /// though the end state looks the same, because on a sorted-dup index the
+    /// delete/insert pair is not atomic within the loop.
+    #[test]
+    fn multi_key_update_deletes_and_inserts_only_the_set_difference() {
+        use crate::secondary_config::SecondaryMultiKeyCreator;
+
+        /// Emits one secondary key per byte of the value.
+        struct PerByteKeys;
+        impl SecondaryMultiKeyCreator for PerByteKeys {
+            fn create_secondary_keys(
+                &self,
+                _db: &Database,
+                _key: &DatabaseEntry,
+                data: &DatabaseEntry,
+                results: &mut Vec<DatabaseEntry>,
+            ) {
+                for b in data.data_opt().unwrap_or(&[]) {
+                    results.push(DatabaseEntry::from_bytes(&[*b]));
+                }
+            }
+        }
+
+        let (_tmp, env) = temp_env();
+        let primary = Arc::new(Mutex::new(open_primary(&env, "p")));
+        let sec = open_secondary_with(
+            Arc::clone(&primary),
+            &env,
+            "s",
+            SecondaryConfig::new()
+                .with_allow_create(true)
+                .with_multi_key_creator(Box::new(PerByteKeys)),
+        );
+
+        let pk = DatabaseEntry::from_bytes(b"pk1");
+        let old = DatabaseEntry::from_bytes(b"ab");
+        let new = DatabaseEntry::from_bytes(b"bc");
+
+        sec.update_secondary(None, &pk, None, Some(&old)).unwrap();
+        assert_eq!(index_entries(&sec, b"a"), vec![b"pk1".to_vec()]);
+        assert_eq!(index_entries(&sec, b"b"), vec![b"pk1".to_vec()]);
+
+        sec.update_secondary(None, &pk, Some(&old), Some(&new)).unwrap();
+        assert!(
+            index_entries(&sec, b"a").is_empty(),
+            "'a' left the key set, so its entry must go"
+        );
+        assert_eq!(
+            index_entries(&sec, b"b"),
+            vec![b"pk1".to_vec()],
+            "'b' is in both sets, so it must be left completely alone"
+        );
+        assert_eq!(
+            index_entries(&sec, b"c"),
+            vec![b"pk1".to_vec()],
+            "'c' is new, so it must be inserted"
+        );
+
+        // A full delete must clear every key the record contributed.
+        sec.update_secondary(None, &pk, Some(&new), None).unwrap();
+        assert!(index_entries(&sec, b"b").is_empty());
+        assert!(index_entries(&sec, b"c").is_empty());
+    }
+
+    /// Two primary records mapping to the SAME secondary key must coexist as
+    /// duplicates, and removing one must not remove the other. This is the
+    /// reason the inner index database is sorted-dup at all; a non-dup index
+    /// would silently overwrite.
+    #[test]
+    fn two_primaries_sharing_a_secondary_key_are_independent_duplicates() {
+        let (_tmp, env) = temp_env();
+        let primary = Arc::new(Mutex::new(open_primary(&env, "p")));
+        let sec = open_secondary(Arc::clone(&primary), &env, "s");
+
+        let a = DatabaseEntry::from_bytes(b"pkA");
+        let b = DatabaseEntry::from_bytes(b"pkB");
+        let val = DatabaseEntry::from_bytes(b"shared");
+
+        sec.update_secondary(None, &a, None, Some(&val)).unwrap();
+        sec.update_secondary(None, &b, None, Some(&val)).unwrap();
+        assert_eq!(
+            index_entries(&sec, b"s"),
+            vec![b"pkA".to_vec(), b"pkB".to_vec()],
+            "both primaries must be reachable through the shared secondary key"
+        );
+
+        sec.update_secondary(None, &a, Some(&val), None).unwrap();
+        assert_eq!(
+            index_entries(&sec, b"s"),
+            vec![b"pkB".to_vec()],
+            "deleting one primary must not evict the other's index entry"
+        );
+    }
+
+    /// A closed secondary must refuse every operation rather than reading or
+    /// writing through a dead handle.
+    #[test]
+    fn a_closed_secondary_refuses_operations() {
+        let (_tmp, env) = temp_env();
+        let primary = Arc::new(Mutex::new(open_primary(&env, "p")));
+        let sec = open_secondary(Arc::clone(&primary), &env, "s");
+        assert!(sec.is_valid());
+
+        sec.close().unwrap();
+        assert!(!sec.is_valid());
+        assert!(sec.count().is_err());
+        assert!(sec.truncate().is_err());
+        assert!(sec.delete(b"a").is_err());
+        assert!(sec.open_cursor(None).is_err());
+    }
+
+    /// `truncate` must empty the index and report the count it removed, and
+    /// leave the secondary usable afterwards.
+    #[test]
+    fn truncate_empties_the_index_and_reports_the_count() {
+        let (_tmp, env) = temp_env();
+        let primary = Arc::new(Mutex::new(open_primary(&env, "p")));
+        let sec = open_secondary(Arc::clone(&primary), &env, "s");
+
+        for (pk, v) in [(&b"p1"[..], &b"aa"[..]), (&b"p2"[..], &b"bb"[..])] {
+            sec.update_secondary(
+                None,
+                &DatabaseEntry::from_bytes(pk),
+                None,
+                Some(&DatabaseEntry::from_bytes(v)),
+            )
+            .unwrap();
+        }
+        assert_eq!(sec.count().unwrap(), 2);
+
+        assert_eq!(sec.truncate().unwrap(), 2, "must report what it removed");
+        assert_eq!(sec.count().unwrap(), 0);
+
+        // Still usable.
+        sec.update_secondary(
+            None,
+            &DatabaseEntry::from_bytes(b"p3"),
+            None,
+            Some(&DatabaseEntry::from_bytes(b"cc")),
+        )
+        .unwrap();
+        assert_eq!(sec.count().unwrap(), 1);
+    }
+
+    /// The incremental-population flag gates automatic maintenance during a
+    /// bulk load. It must round-trip and default to off, since a stuck-on flag
+    /// would silently stop maintaining the index.
+    #[test]
+    fn incremental_population_flag_round_trips_and_defaults_off() {
+        let (_tmp, env) = temp_env();
+        let primary = Arc::new(Mutex::new(open_primary(&env, "p")));
+        let sec = open_secondary(Arc::clone(&primary), &env, "s");
+
+        assert!(
+            !sec.is_incremental_population_enabled(),
+            "automatic maintenance must be on by default"
+        );
+        sec.start_incremental_population();
+        assert!(sec.is_incremental_population_enabled());
+        sec.end_incremental_population();
+        assert!(
+            !sec.is_incremental_population_enabled(),
+            "a stuck flag would silently stop maintaining the index"
+        );
+    }
 }
