@@ -132,4 +132,5 @@
   - [MVCC proposal (2026-07)](internal/mvcc-proposal-2026-07.md)
   - [latch-lite descent: ceiling (2026-07)](internal/latch-lite-descent-ceiling-2026-07.md)
   - [Core-crate coverage baseline (2026-09)](internal/coverage-baseline-2026-09.md)
+    - [noxu-dbi / noxu-db coverage gaps (2026-09)](internal/coverage-gaps-dbi-db-2026-09.md)
     - [Consolidation-array LWL deadlock (2026-09)](internal/consolidation-array-deadlock-2026-09.md)
