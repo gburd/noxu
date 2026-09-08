@@ -213,6 +213,23 @@ listed in [References](#references).
   `benches/results/syncbench/` under an explicit `-BIASED-` name so the
   artifact signature stays on the record.
 
+- **`crates/noxu-sync/tests/rwlock_writer_starvation.rs`: three deterministic
+  characterisation tests pinning the writer-starvation property.** The
+  load-based probe that discovered it is not portably reproducible — emergent
+  starvation needs readers to genuinely overlap, which needs free cores (the
+  same probe yields ~1e6x reader:writer on an idle 64-vCPU box but only 19x on
+  a loaded 8-core one), so these construct the condition by explicit handoff
+  instead: a pending writer failing to block a new reader, a hand-over-hand
+  reader chain in which each reader acquires *before* its predecessor releases
+  (holding the reader count >= 1 at every instant by construction, on any core
+  count), and a single-non-overlapping-reader control that isolates overlap as
+  the cause. Verified non-vacuous against `parking_lot::RawRwLock`, which
+  refuses the incoming reader at iteration 0 and lets its writer through — so
+  both assertions fail against a writer-preferring lock rather than passing
+  for the wrong reason. These assert *current documented* behaviour, not
+  desired behaviour: if the starvation is ever fixed they fail loudly and name
+  the other three places to update.
+
 - The shuttle DST gate (`crates/noxu-rep/tests/shuttle_rep_sync.rs`) gains two
   `CommitFreezeLatch` interleaving models: **freeze-blocks-commit** (a replay
   thread's `await_thaw` never reports an election thaw before the event for the
