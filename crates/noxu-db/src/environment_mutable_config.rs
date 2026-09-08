@@ -194,3 +194,178 @@ mod tests {
         assert_eq!(cfg.txn_timeout_ms, None);
     }
 }
+
+#[cfg(test)]
+mod mutable_config_roundtrip_tests {
+    use super::*;
+    use crate::environment::Environment;
+    use crate::environment_config::EnvironmentConfig;
+    use tempfile::TempDir;
+
+    fn open_env() -> (TempDir, Environment) {
+        let dir = TempDir::new().unwrap();
+        let env = Environment::open(
+            EnvironmentConfig::new(dir.path().to_path_buf())
+                .with_allow_create(true)
+                .with_transactional(true),
+        )
+        .unwrap();
+        (dir, env)
+    }
+
+    /// Every `Option` builder must record `Some`, so that a caller who wants
+    /// to change one knob does not accidentally leave it at the
+    /// "unchanged" sentinel.
+    #[test]
+    fn option_builders_record_some_and_leave_siblings_unchanged() {
+        let c = EnvironmentMutableConfig::new()
+            .with_cache_size(1 << 20)
+            .with_run_cleaner(false)
+            .with_run_checkpointer(false)
+            .with_run_evictor(false)
+            .with_cleaner_min_utilization(37)
+            .with_durability(crate::durability::Durability::COMMIT_NO_SYNC);
+        assert_eq!(c.cache_size, Some(1 << 20));
+        assert_eq!(c.run_cleaner, Some(false));
+        assert_eq!(c.run_checkpointer, Some(false));
+        assert_eq!(c.run_evictor, Some(false));
+        assert_eq!(c.cleaner_min_utilization, Some(37));
+        assert_eq!(
+            c.durability,
+            Some(crate::durability::Durability::COMMIT_NO_SYNC)
+        );
+        // The two timeouts were never touched, so they must still read as
+        // "unchanged" rather than as an accidental Some(0).
+        assert_eq!(c.lock_timeout_ms, None);
+        assert_eq!(c.txn_timeout_ms, None);
+    }
+
+    /// `mutable_config()` -> mutate -> `set_mutable_config()` must actually
+    /// change the environment's view of the knob. This is the round-trip the
+    /// type exists for, and none of it was covered.
+    #[test]
+    fn mutable_config_roundtrip_applies_changes() {
+        let (_d, mut env) = open_env();
+
+        let before = env.mutable_config().unwrap();
+        assert_eq!(
+            before.lock_timeout_ms,
+            Some(env.config().lock_timeout_ms),
+            "mutable_config must report the live lock timeout"
+        );
+
+        let changed = EnvironmentMutableConfig::new()
+            .with_lock_timeout_ms(Some(4_321))
+            .with_txn_timeout_ms(Some(8_765))
+            .with_cleaner_min_utilization(41)
+            .with_run_cleaner(false);
+        env.set_mutable_config(changed).unwrap();
+
+        assert_eq!(env.config().lock_timeout_ms, 4_321);
+        assert_eq!(env.config().txn_timeout_ms, 8_765);
+        assert_eq!(env.config().cleaner_min_utilization, 41);
+        assert!(!env.config().run_cleaner);
+
+        // And the change must be observable through a fresh read.
+        let after = env.mutable_config().unwrap();
+        assert_eq!(after.lock_timeout_ms, Some(4_321));
+        assert_eq!(after.txn_timeout_ms, Some(8_765));
+        assert_eq!(after.cleaner_min_utilization, Some(41));
+        assert_eq!(after.run_cleaner, Some(false));
+    }
+
+    /// `None` means "leave it alone" — the whole reason these fields are
+    /// `Option`. Applying an all-default config must change nothing.
+    #[test]
+    fn applying_an_all_none_config_changes_nothing() {
+        let (_d, mut env) = open_env();
+        let snapshot = format!("{:?}", env.mutable_config().unwrap());
+
+        env.set_mutable_config(EnvironmentMutableConfig::new()).unwrap();
+
+        assert_eq!(
+            format!("{:?}", env.mutable_config().unwrap()),
+            snapshot,
+            "an all-None mutable config must be a no-op"
+        );
+    }
+
+    /// `Some(0)` must CLEAR a timeout, not read as "unchanged". This is the
+    /// exact distinction the `Option` shape was introduced for (the older
+    /// bare-`u64` shape used 0 as the unchanged sentinel and so could not
+    /// express "no timeout").
+    #[test]
+    fn some_zero_clears_a_timeout_rather_than_meaning_unchanged() {
+        let (_d, mut env) = open_env();
+
+        env.set_mutable_config(
+            EnvironmentMutableConfig::new()
+                .with_lock_timeout_ms(Some(9_999))
+                .with_txn_timeout_ms(Some(9_999)),
+        )
+        .unwrap();
+        assert_eq!(env.config().lock_timeout_ms, 9_999);
+        assert_eq!(env.config().txn_timeout_ms, 9_999);
+
+        env.set_mutable_config(
+            EnvironmentMutableConfig::new()
+                .with_lock_timeout_ms(Some(0))
+                .with_txn_timeout_ms(Some(0)),
+        )
+        .unwrap();
+        assert_eq!(
+            env.config().lock_timeout_ms,
+            0,
+            "Some(0) must clear the lock timeout"
+        );
+        assert_eq!(
+            env.config().txn_timeout_ms,
+            0,
+            "Some(0) must clear the txn timeout"
+        );
+    }
+
+    /// `cleaner_min_utilization` is a percentage; a caller handing in a value
+    /// above 100 must be clamped rather than truncated into a nonsense `u8`.
+    #[test]
+    fn cleaner_min_utilization_is_clamped_to_a_percentage() {
+        let (_d, mut env) = open_env();
+        env.set_mutable_config(
+            EnvironmentMutableConfig::new().with_cleaner_min_utilization(4_000),
+        )
+        .unwrap();
+        assert_eq!(
+            env.config().cleaner_min_utilization,
+            100,
+            "an out-of-range percentage must clamp to 100, not wrap"
+        );
+    }
+
+    /// A closed environment must reject both halves of the round-trip rather
+    /// than silently recording changes into a dead handle.
+    #[test]
+    fn mutable_config_is_rejected_on_a_closed_environment() {
+        let (_d, mut env) = open_env();
+        env.close().unwrap();
+        assert!(env.mutable_config().is_err());
+        assert!(
+            env.set_mutable_config(EnvironmentMutableConfig::new()).is_err()
+        );
+    }
+
+    /// `mutable_config()` deliberately reports `durability: None` even when the
+    /// environment has a durability configured: the environment stores
+    /// durability plus two legacy booleans, and there is no single value to
+    /// report without picking one representation over the other. Pinning it so
+    /// that whoever unifies them has to update this test on purpose rather
+    /// than discovering the asymmetry in production.
+    #[test]
+    fn mutable_config_does_not_report_durability() {
+        let (_d, env) = open_env();
+        assert_eq!(
+            env.mutable_config().unwrap().durability,
+            None,
+            "known asymmetry: durability is settable but not readable here"
+        );
+    }
+}
