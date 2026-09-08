@@ -1877,4 +1877,387 @@ mod tests {
              an application publish rolled-back work"
         );
     }
+
+    // ── env-wired transactions: the real commit / abort / undo paths ─────
+    //
+    // The tests above use `Transaction::new` directly, which produces a
+    // "decorative" transaction with no log manager, no inner Txn, and no
+    // environment. That reaches the state machine but NOT the three write-path
+    // steps in `commit_with_durability` (WAL frame, replica-ack wait, cleaner
+    // throttle) or the undo application in `abort`, all of which are gated on
+    // `!read_only && has_logged_data() && <subsystem present>`.
+    //
+    // These tests open a real environment so those paths actually run, and
+    // assert the behaviour that distinguishes them: WHETHER a WAL frame is
+    // written, and whether undo restores the correct before-image.
+
+    use crate::database_config::DatabaseConfig;
+    use crate::environment::Environment;
+    use crate::environment_config::EnvironmentConfig;
+    use tempfile::TempDir;
+
+    fn wired() -> (TempDir, Environment, crate::database::Database) {
+        let dir = TempDir::new().unwrap();
+        let env = Environment::open(
+            EnvironmentConfig::new(dir.path().to_path_buf())
+                .with_allow_create(true)
+                .with_transactional(true),
+        )
+        .unwrap();
+        let db = env
+            .open_database(
+                None,
+                "txn",
+                &DatabaseConfig::new()
+                    .with_allow_create(true)
+                    .with_transactional(true),
+            )
+            .unwrap();
+        (dir, env, db)
+    }
+
+    fn log_end(env: &Environment) -> u64 {
+        env.stats().unwrap().log.end_of_log
+    }
+
+    /// A transaction that only READ must not write a TxnCommit frame. This is
+    /// the read-commit-contention fix: the gate is `has_logged_data()`, not the
+    /// static `read_only` config flag, so a default write-capable txn that
+    /// happened only to read pays no log write and -- crucially -- no commit
+    /// fsync.
+    #[test]
+    fn a_txn_that_only_read_writes_no_commit_frame() {
+        let (_d, env, db) = wired();
+        db.put(b"k", b"v").unwrap();
+
+        let txn = env.begin_transaction(None).unwrap();
+        assert_eq!(db.get_in(&txn, b"k").unwrap().as_deref(), Some(&b"v"[..]));
+
+        let before = log_end(&env);
+        txn.commit().unwrap();
+        assert_eq!(
+            log_end(&env),
+            before,
+            "a read-only-in-practice txn must write no TxnCommit frame, and \
+             therefore take no commit fsync"
+        );
+    }
+
+    /// A transaction that WROTE must write a TxnCommit frame -- otherwise
+    /// recovery could not tell the write was committed and would undo it.
+    #[test]
+    fn a_txn_that_wrote_does_write_a_commit_frame() {
+        let (_d, env, db) = wired();
+        let txn = env.begin_transaction(None).unwrap();
+        db.put_in(&txn, b"k", b"v").unwrap();
+
+        let before = log_end(&env);
+        txn.commit().unwrap();
+        assert!(
+            log_end(&env) > before,
+            "a txn with logged data must write a TxnCommit frame, or recovery \
+             would undo the committed write"
+        );
+        assert_eq!(db.get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
+    }
+
+    /// The same asymmetry on the abort side: a read-only-in-practice abort
+    /// writes no TxnAbort frame, because there is no undo chain for recovery to
+    /// follow.
+    #[test]
+    fn a_txn_that_only_read_writes_no_abort_frame() {
+        let (_d, env, db) = wired();
+        db.put(b"k", b"v").unwrap();
+
+        let txn = env.begin_transaction(None).unwrap();
+        let _ = db.get_in(&txn, b"k").unwrap();
+
+        let before = log_end(&env);
+        txn.abort().unwrap();
+        assert_eq!(
+            log_end(&env),
+            before,
+            "no logged data means no undo chain, so no TxnAbort frame"
+        );
+    }
+
+    /// Abort must restore the BEFORE-IMAGE of an updated record, not merely
+    /// drop the new value. This is the undo-application path
+    /// (`abort_data` / `abort_key`), and getting it wrong leaves the database
+    /// holding a value that was never committed.
+    #[test]
+    fn abort_restores_the_before_image_of_an_updated_record() {
+        let (_d, env, db) = wired();
+        db.put(b"k", b"original").unwrap();
+
+        let txn = env.begin_transaction(None).unwrap();
+        db.put_in(&txn, b"k", b"modified").unwrap();
+        assert_eq!(
+            db.get_in(&txn, b"k").unwrap().as_deref(),
+            Some(&b"modified"[..]),
+            "the txn must see its own write before resolving"
+        );
+
+        txn.abort().unwrap();
+        assert_eq!(
+            db.get(b"k").unwrap().as_deref(),
+            Some(&b"original"[..]),
+            "abort must restore the before-image, not leave the new value"
+        );
+    }
+
+    /// Abort of an INSERT must remove the record entirely -- there is no
+    /// before-image to restore, so the undo record carries
+    /// `abort_known_deleted` and the row must vanish.
+    #[test]
+    fn abort_removes_a_record_that_the_txn_inserted() {
+        let (_d, env, db) = wired();
+        let txn = env.begin_transaction(None).unwrap();
+        db.put_in(&txn, b"fresh", b"v").unwrap();
+        assert!(db.get_in(&txn, b"fresh").unwrap().is_some());
+
+        txn.abort().unwrap();
+        assert!(
+            db.get(b"fresh").unwrap().is_none(),
+            "an aborted insert must leave no record behind"
+        );
+    }
+
+    /// Abort of a DELETE must bring the record back. The three undo shapes
+    /// (update / insert / delete) are three distinct arms of the undo loop.
+    #[test]
+    fn abort_restores_a_record_that_the_txn_deleted() {
+        let (_d, env, db) = wired();
+        db.put(b"k", b"keepme").unwrap();
+
+        let txn = env.begin_transaction(None).unwrap();
+        assert!(db.delete_in(&txn, b"k").unwrap());
+        txn.abort().unwrap();
+
+        assert_eq!(
+            db.get(b"k").unwrap().as_deref(),
+            Some(&b"keepme"[..]),
+            "an aborted delete must restore the record"
+        );
+    }
+
+    /// Undo must span MULTIPLE keys and multiple databases-worth of records in
+    /// one abort. A loop that stopped after the first undo record would pass
+    /// every single-key test above.
+    #[test]
+    fn abort_undoes_every_record_the_txn_touched() {
+        let (_d, env, db) = wired();
+        for i in 0u8..5 {
+            db.put([i], b"orig").unwrap();
+        }
+
+        let txn = env.begin_transaction(None).unwrap();
+        for i in 0u8..5 {
+            db.put_in(&txn, [i], b"changed").unwrap();
+        }
+        db.put_in(&txn, b"new", b"inserted").unwrap();
+
+        txn.abort().unwrap();
+
+        for i in 0u8..5 {
+            assert_eq!(
+                db.get([i]).unwrap().as_deref(),
+                Some(&b"orig"[..]),
+                "key {i} was not undone -- the undo loop stopped early"
+            );
+        }
+        assert!(db.get(b"new").unwrap().is_none());
+    }
+
+    /// Commit must make the writes durable and visible outside the txn, and
+    /// must NOT be undone by a later abort of a different transaction.
+    #[test]
+    fn committed_writes_survive_a_later_unrelated_abort() {
+        let (_d, env, db) = wired();
+
+        let t1 = env.begin_transaction(None).unwrap();
+        db.put_in(&t1, b"committed", b"v1").unwrap();
+        t1.commit().unwrap();
+
+        let t2 = env.begin_transaction(None).unwrap();
+        db.put_in(&t2, b"rolledback", b"v2").unwrap();
+        t2.abort().unwrap();
+
+        assert_eq!(
+            db.get(b"committed").unwrap().as_deref(),
+            Some(&b"v1"[..]),
+            "an unrelated abort must not disturb committed data"
+        );
+        assert!(db.get(b"rolledback").unwrap().is_none());
+    }
+
+    /// `commit_with_durability` must honour the requested policy. NO_SYNC must
+    /// not fsync, SYNC must -- that is the entire point of the parameter, and
+    /// the fsync counter makes it observable.
+    #[test]
+    fn durability_controls_whether_the_commit_fsyncs() {
+        let (_d, env, db) = wired();
+
+        let before = env.stat_fsync_count();
+        let t = env.begin_transaction(None).unwrap();
+        db.put_in(&t, b"a", b"1").unwrap();
+        t.commit_with_durability(Durability::COMMIT_NO_SYNC).unwrap();
+        assert_eq!(
+            env.stat_fsync_count(),
+            before,
+            "COMMIT_NO_SYNC must not fsync"
+        );
+
+        let before = env.stat_fsync_count();
+        let t = env.begin_transaction(None).unwrap();
+        db.put_in(&t, b"b", b"2").unwrap();
+        t.commit_with_durability(Durability::COMMIT_SYNC).unwrap();
+        assert!(
+            env.stat_fsync_count() > before,
+            "COMMIT_SYNC must fsync, or the commit is not durable"
+        );
+    }
+
+    /// The active-transaction registry must be pruned on BOTH resolutions.
+    /// A leaked entry pins the txn's locks in the manager's view and would make
+    /// a later deadlock scan chase a transaction that no longer exists.
+    #[test]
+    fn both_resolutions_prune_the_active_transaction_registry() {
+        let (_d, env, db) = wired();
+        let baseline = env.stats().unwrap().txn.n_active;
+
+        let t = env.begin_transaction(None).unwrap();
+        db.put_in(&t, b"k", b"v").unwrap();
+        assert!(
+            env.stats().unwrap().txn.n_active > baseline,
+            "an open txn must be registered as active"
+        );
+        t.commit().unwrap();
+        assert_eq!(
+            env.stats().unwrap().txn.n_active,
+            baseline,
+            "a committed txn must be pruned from the active registry"
+        );
+
+        let t = env.begin_transaction(None).unwrap();
+        db.put_in(&t, b"k2", b"v").unwrap();
+        t.abort().unwrap();
+        assert_eq!(
+            env.stats().unwrap().txn.n_active,
+            baseline,
+            "an aborted txn must be pruned too"
+        );
+    }
+
+    /// Dropping a still-open transaction must ABORT it, not silently commit or
+    /// leak its locks. This is the F10 drop-abort path, and an early-return on
+    /// an error would leave the write visible.
+    #[test]
+    fn dropping_an_open_transaction_aborts_its_writes() {
+        let (_d, env, db) = wired();
+        db.put(b"k", b"original").unwrap();
+
+        {
+            let txn = env.begin_transaction(None).unwrap();
+            db.put_in(&txn, b"k", b"leaked").unwrap();
+            // No commit, no abort: just drop.
+        }
+
+        assert_eq!(
+            db.get(b"k").unwrap().as_deref(),
+            Some(&b"original"[..]),
+            "a dropped txn must abort, or its uncommitted write leaks"
+        );
+    }
+
+    /// A prepared transaction resolved through the XA commit path must make its
+    /// writes visible, and the prepare itself must write a durable frame so
+    /// recovery can find the in-doubt branch.
+    #[test]
+    fn a_prepared_txn_writes_a_durable_frame_and_commits_its_writes() {
+        let (_d, env, db) = wired();
+        let txn = env.begin_transaction(None).unwrap();
+        db.put_in(&txn, b"xa", b"v").unwrap();
+
+        let before = log_end(&env);
+        txn.prepare(1, b"gtrid", b"bqual").unwrap();
+        assert!(
+            log_end(&env) > before,
+            "prepare must write a durable TxnPrepare frame, or recovery \
+             cannot find the in-doubt branch"
+        );
+        assert_eq!(txn.state(), TransactionState::Prepared);
+
+        txn.resolved_commit_after_prepare().unwrap();
+        assert_eq!(txn.state(), TransactionState::Committed);
+        assert_eq!(db.get(b"xa").unwrap().as_deref(), Some(&b"v"[..]));
+    }
+
+    /// And resolved through the XA abort path, its writes must be undone --
+    /// prepare holds the locks but does not fix the outcome as commit.
+    #[test]
+    fn a_prepared_txn_resolved_by_abort_has_its_writes_undone() {
+        let (_d, env, db) = wired();
+        db.put(b"xa", b"original").unwrap();
+
+        let txn = env.begin_transaction(None).unwrap();
+        db.put_in(&txn, b"xa", b"modified").unwrap();
+        txn.prepare(1, b"gtrid", b"bqual").unwrap();
+        txn.resolved_abort_after_prepare().unwrap();
+
+        assert_eq!(
+            db.get(b"xa").unwrap().as_deref(),
+            Some(&b"original"[..]),
+            "an XA-aborted prepared txn must still undo its writes"
+        );
+    }
+
+    /// KNOWN GAP, pinned deliberately rather than asserted as correct.
+    ///
+    /// `TransactionConfig::read_only` does NOT prevent writes today. The flag
+    /// is consumed only inside `Transaction`, where `!self.read_only` gates the
+    /// commit / abort / prepare WAL-frame paths. Nothing on the write path
+    /// consults it: `Database`'s write entry points check `check_writable`,
+    /// which reads the *DatabaseConfig*'s `read_only`, not the transaction's.
+    ///
+    /// So a write on a read-only txn succeeds and lands in the tree, while the
+    /// flag suppresses the TxnCommit frame that would record it as committed.
+    /// JE rejects this at cursor-open time
+    /// (`LockerFactory.getWritableLocker`); Noxu does not.
+    ///
+    /// This test asserts CURRENT behaviour so the gap is visible in the suite
+    /// instead of merely absent from it. Adding the missing guard is a breaking
+    /// change for any caller relying on today's permissiveness, so it belongs
+    /// in its own commit -- and it will make this test fail, which is the
+    /// point.
+    #[test]
+    fn read_only_transactions_do_not_yet_reject_writes() {
+        let (_d, env, db) = wired();
+        db.put(b"k", b"v").unwrap();
+
+        let cfg = TransactionConfig::default().with_read_only(true);
+        let txn = env.begin_transaction(Some(&cfg)).unwrap();
+        assert!(txn.is_read_only(), "the flag itself round-trips");
+
+        // Reads work, as they should.
+        assert_eq!(db.get_in(&txn, b"k").unwrap().as_deref(), Some(&b"v"[..]));
+
+        // And so does a WRITE, which is the gap.
+        assert!(
+            db.put_in(&txn, b"k", b"v2").is_ok(),
+            "documenting current behaviour: the read-only txn flag is not \
+             enforced on the write path"
+        );
+
+        // The commit writes no TxnCommit frame, because the same flag DOES gate
+        // that -- so the write is applied without a commit record.
+        let before = log_end(&env);
+        txn.commit().unwrap();
+        assert_eq!(
+            log_end(&env),
+            before,
+            "the read_only flag suppresses the commit frame even though the \
+             write was accepted"
+        );
+    }
 }
