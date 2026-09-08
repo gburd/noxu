@@ -15,3 +15,14 @@ lock_api = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { workspace = true }
+
+# A/B microbenchmark against parking_lot (benches/sync_vs_parking_lot.rs) —
+# the "publish the numbers or retire it" measurement.  Dev-only: neither dep
+# is in the shipped dependency graph.
+[dev-dependencies]
+criterion = { workspace = true }
+parking_lot = { workspace = true }
+
+[[bench]]
+name = "sync_vs_parking_lot"
+harness = false
