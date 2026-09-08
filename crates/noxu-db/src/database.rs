@@ -2881,4 +2881,262 @@ mod tests {
         db.env_invalid.store(false, Ordering::Release);
         drop(env);
     }
+
+    // ── the three universal operation guards ─────────────────────────────
+    //
+    // Every data-path entry point begins with the same three checks:
+    // check_open, reject_txn_on_non_txnal_db, and (for writes) check_writable.
+    // The guards themselves are trivial; what is NOT trivial is that all
+    // twelve call sites actually apply them. A single entry point that forgot
+    // one would be an unguarded hole -- a write that lands on a read-only
+    // handle, or a txn silently ignored on a non-transactional database
+    // (leaving the write auto-committed and un-rollbackable, which is far worse
+    // than an error).
+    //
+    // These sweeps assert the guard on every entry point at once, so adding a
+    // new entry point without its guards shows up as a failing test rather
+    // than as a hole nobody looks for.
+
+    fn env_with(dir: &TempDir, transactional: bool) -> Environment {
+        Environment::open(
+            EnvironmentConfig::new(dir.path().to_path_buf())
+                .with_allow_create(true)
+                .with_transactional(transactional),
+        )
+        .unwrap()
+    }
+
+    /// A transaction handed to an operation on a NON-transactional database
+    /// must be an error, never silently ignored. Ignoring it would leave the
+    /// write auto-committed and outside the caller's rollback scope -- a silent
+    /// durability lie, worse than a rejection. Every entry point that takes a
+    /// txn is swept, and the database must be unchanged afterwards.
+    #[test]
+    fn a_txn_on_a_non_transactional_database_is_an_illegal_argument() {
+        let dir = TempDir::new().unwrap();
+        let env = env_with(&dir, true);
+        let db = env
+            .open_database(
+                None,
+                "nontxn",
+                &DatabaseConfig::new().with_allow_create(true),
+            )
+            .unwrap();
+        db.put(b"pre", b"existing").unwrap();
+        let before = db.count().unwrap();
+        let txn = env.begin_transaction(None).unwrap();
+        let entry = DatabaseEntry::from_bytes(b"v");
+
+        macro_rules! expect_illegal {
+            ($name:expr, $call:expr) => {{
+                match $call {
+                    Err(NoxuError::IllegalArgument(_)) => {}
+                    other => panic!(
+                        "{} must reject a txn on a non-txnal database with \
+                         IllegalArgument, got {:?}",
+                        $name,
+                        other.map(|_| "Ok")
+                    ),
+                }
+            }};
+        }
+
+        expect_illegal!("get_in", db.get_in(&txn, b"pre").map(|_| ()));
+        expect_illegal!("put_in", db.put_in(&txn, b"k", b"v"));
+        expect_illegal!(
+            "put_partial",
+            db.put_partial(Some(&txn), b"k", &entry)
+        );
+        expect_illegal!(
+            "put_no_overwrite_in",
+            db.put_no_overwrite_in(&txn, b"k", b"v").map(|_| ())
+        );
+        expect_illegal!("delete_in", db.delete_in(&txn, b"k").map(|_| ()));
+        expect_illegal!(
+            "open_cursor_in",
+            db.open_cursor_in(&txn, None).map(|_| ())
+        );
+        expect_illegal!(
+            "get_with_options",
+            db.get_with_options(
+                Some(&txn),
+                b"pre",
+                &crate::read_options::ReadOptions::default()
+            )
+            .map(|_| ())
+        );
+
+        assert_eq!(
+            db.count().unwrap(),
+            before,
+            "a rejected operation must not have modified the database"
+        );
+        txn.abort().unwrap();
+    }
+
+    /// Conversely, passing NO txn to a non-transactional database is the
+    /// normal case and must work -- the guard keys on the txn, not on the
+    /// database's transactionality alone.
+    #[test]
+    fn a_non_transactional_database_still_works_without_a_txn() {
+        let dir = TempDir::new().unwrap();
+        let env = env_with(&dir, true);
+        let db = env
+            .open_database(
+                None,
+                "nontxn",
+                &DatabaseConfig::new().with_allow_create(true),
+            )
+            .unwrap();
+        db.put(b"k", b"v").unwrap();
+        assert_eq!(db.get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
+        assert!(db.delete(b"k").unwrap());
+    }
+
+    /// Every WRITE entry point must refuse a read-only handle. A write that
+    /// slipped through would mutate a database the caller declared immutable.
+    #[test]
+    fn every_write_entry_point_refuses_a_read_only_database() {
+        let dir = TempDir::new().unwrap();
+        let env = env_with(&dir, true);
+        // Seed through a writable handle, then reopen read-only.
+        {
+            let w = env
+                .open_database(
+                    None,
+                    "ro",
+                    &DatabaseConfig::new()
+                        .with_allow_create(true)
+                        .with_transactional(true),
+                )
+                .unwrap();
+            w.put(b"k", b"v").unwrap();
+            w.close().unwrap();
+        }
+        let db = env
+            .open_database(
+                None,
+                "ro",
+                &DatabaseConfig::new()
+                    .with_transactional(true)
+                    .with_read_only(true),
+            )
+            .unwrap();
+        let entry = DatabaseEntry::from_bytes(b"v2");
+
+        macro_rules! expect_read_only {
+            ($name:expr, $call:expr) => {{
+                match $call {
+                    Err(NoxuError::ReadOnly) => {}
+                    other => panic!(
+                        "{} must refuse a read-only database with ReadOnly, \
+                         got {:?}",
+                        $name,
+                        other.map(|_| "Ok")
+                    ),
+                }
+            }};
+        }
+
+        expect_read_only!("put", db.put(b"k2", b"v2"));
+        expect_read_only!("put_partial", db.put_partial(None, b"k2", &entry));
+        expect_read_only!(
+            "put_no_overwrite",
+            db.put_no_overwrite(b"k2", b"v2").map(|_| ())
+        );
+        expect_read_only!("delete", db.delete(b"k").map(|_| ()));
+
+        // Reads must still work -- read-only means read-ONLY, not unusable.
+        assert_eq!(
+            db.get(b"k").unwrap().as_deref(),
+            Some(&b"v"[..]),
+            "a read-only handle must still serve reads"
+        );
+        assert_eq!(db.count().unwrap(), 1, "and the data must be intact");
+    }
+
+    /// Every entry point must refuse a CLOSED handle, and the error must be
+    /// `DatabaseClosed` specifically -- callers distinguish it from an
+    /// environment failure to decide whether reopening is enough.
+    #[test]
+    fn every_entry_point_refuses_a_closed_database() {
+        let (_tmp, _env, db) = temp_env_and_db();
+        db.put(b"k", b"v").unwrap();
+        db.close().unwrap();
+        let entry = DatabaseEntry::from_bytes(b"v");
+
+        macro_rules! expect_closed {
+            ($name:expr, $call:expr) => {{
+                match $call {
+                    Err(NoxuError::DatabaseClosed) => {}
+                    other => panic!(
+                        "{} must refuse a closed database with \
+                         DatabaseClosed, got {:?}",
+                        $name,
+                        other.map(|_| "Ok")
+                    ),
+                }
+            }};
+        }
+
+        expect_closed!("get", db.get(b"k").map(|_| ()));
+        expect_closed!("put", db.put(b"k", b"v"));
+        expect_closed!("put_partial", db.put_partial(None, b"k", &entry));
+        expect_closed!(
+            "put_no_overwrite",
+            db.put_no_overwrite(b"k", b"v").map(|_| ())
+        );
+        expect_closed!("delete", db.delete(b"k").map(|_| ()));
+        expect_closed!("count", db.count().map(|_| ()));
+        expect_closed!("open_cursor", db.open_cursor(None).map(|_| ()));
+        expect_closed!("stats", db.stats(None).map(|_| ()));
+        expect_closed!(
+            "preload",
+            db.preload(&crate::preload::PreloadConfig::new()).map(|_| ())
+        );
+        expect_closed!("iter", db.iter(None).map(|_| ()));
+        expect_closed!(
+            "range",
+            db.range(None, b"a".to_vec()..b"z".to_vec()).map(|_| ())
+        );
+
+        // Closing again is REFUSED, not tolerated. Pinned deliberately: it
+        // matches JE (which throws on double-close) and it means `Drop` must
+        // swallow the error from its own close on an already-closed handle,
+        // which it does. A future change to make close idempotent has to update
+        // this assertion on purpose.
+        assert!(
+            matches!(db.close(), Err(NoxuError::DatabaseClosed)),
+            "double close is refused; Drop relies on swallowing this"
+        );
+    }
+
+    /// An invalidated ENVIRONMENT must fail every database operation with an
+    /// environment failure, distinct from `DatabaseClosed`: the database handle
+    /// is fine, the environment underneath it is not, and reopening the
+    /// database would not help.
+    #[test]
+    fn an_invalidated_environment_fails_database_operations_distinctly() {
+        let (_tmp, env, db) = temp_env_and_db();
+        db.put(b"k", b"v").unwrap();
+
+        env.invalidate();
+
+        match db.get(b"k") {
+            Err(NoxuError::EnvironmentFailure { .. }) => {}
+            other => panic!(
+                "an invalidated env must surface as EnvironmentFailure, not \
+                 DatabaseClosed, got {:?}",
+                other.map(|_| "Ok")
+            ),
+        }
+        assert!(matches!(
+            db.put(b"k2", b"v2"),
+            Err(NoxuError::EnvironmentFailure { .. })
+        ));
+        assert!(matches!(
+            db.count(),
+            Err(NoxuError::EnvironmentFailure { .. })
+        ));
+    }
 }

@@ -17,6 +17,21 @@ listed in [References](#references).
 
 ### Fixed
 
+- **`Environment::invalidate()` did not invalidate open `Database` handles.**
+  There are two invalidity flags: `Environment`'s own `env_valid` bool, and the
+  `Arc<AtomicBool>` on `EnvironmentImpl` that every open `Database` and
+  `Cursor` clones at open time so its `check_open` fast path never has to take
+  `env_impl.lock()` (X-13). `Environment::invalidate()` set only the first, so
+  `env.is_valid()` correctly reported `false` while already-open `Database`
+  handles kept serving reads and accepting writes — directly contradicting the
+  method's own doc comment ("all subsequent public API calls return
+  `EnvironmentFailure`"). It now sets both, preserving the lock-free fast path.
+  The bug was latent because `Environment::invalidate()` has no in-crate
+  callers yet; a daemon wired to call it on a fatal error would have found that
+  application threads carried on writing to a corrupt environment. Found by a
+  new `database.rs` test that asserts an invalidated environment fails
+  `Database` operations distinctly from `DatabaseClosed`.
+
 - **`Database::stats(fast = false)` and `Database::preload` over-reported the
   record count.** `Tree::collect_stats` accumulated its entry counter across
   *every* node, summing BIN slots (records) together with upper-IN slots
