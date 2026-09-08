@@ -4897,4 +4897,225 @@ mod tests {
             back
         );
     }
+
+    // ── search_lte (floor search) ────────────────────────────────────────
+    //
+    // `search_lte` is the greatest-key-<=-target seek. It has four distinct
+    // outcomes (exact hit, ceiling-then-step-back, everything-below, empty
+    // tree) and the dup case differs from the non-dup case in two of them,
+    // so each is exercised rather than trusting one representative call.
+
+    fn seeded_cursor(keys: &[&str]) -> CursorImpl {
+        let db = create_test_database();
+        let mut cur = CursorImpl::new(db, 400);
+        for k in keys {
+            cur.put(k.as_bytes(), b"v", PutMode::Overwrite).unwrap();
+        }
+        cur
+    }
+
+    #[test]
+    fn search_lte_finds_the_exact_key_when_present() {
+        let mut cur = seeded_cursor(&["a", "c", "e"]);
+        assert_eq!(cur.search_lte(b"c").unwrap(), OperationStatus::Success);
+        assert_eq!(cur.get_current_key(), Some(b"c".as_slice()));
+    }
+
+    /// The interesting case: the target is absent, so the ceiling search
+    /// overshoots and `search_lte` must step BACK one record. A version that
+    /// forgot the step-back would return the ceiling ("e" for target "d"),
+    /// which is greater than the target and so wrong by definition.
+    #[test]
+    fn search_lte_steps_back_from_the_ceiling_when_the_key_is_absent() {
+        let mut cur = seeded_cursor(&["a", "c", "e"]);
+        assert_eq!(cur.search_lte(b"d").unwrap(), OperationStatus::Success);
+        assert_eq!(
+            cur.get_current_key(),
+            Some(b"c".as_slice()),
+            "floor of 'd' is 'c', not the ceiling 'e'"
+        );
+
+        // And again where the target sits between the first two keys.
+        assert_eq!(cur.search_lte(b"b").unwrap(), OperationStatus::Success);
+        assert_eq!(cur.get_current_key(), Some(b"a".as_slice()));
+    }
+
+    /// When the target is above every key there is no ceiling at all, so the
+    /// answer is the LAST record. This is a separate branch from the
+    /// step-back case.
+    #[test]
+    fn search_lte_returns_the_last_record_when_every_key_is_below() {
+        let mut cur = seeded_cursor(&["a", "c", "e"]);
+        assert_eq!(cur.search_lte(b"z").unwrap(), OperationStatus::Success);
+        assert_eq!(cur.get_current_key(), Some(b"e".as_slice()));
+    }
+
+    /// When the target is below every key there is no floor: `search_lte` must
+    /// report NotFound rather than clamping to the first record (which would
+    /// hand the caller a key GREATER than the target).
+    #[test]
+    fn search_lte_reports_not_found_when_no_key_is_at_or_below_the_target() {
+        let mut cur = seeded_cursor(&["c", "e"]);
+        assert_eq!(cur.search_lte(b"a").unwrap(), OperationStatus::NotFound);
+    }
+
+    #[test]
+    fn search_lte_on_an_empty_tree_reports_not_found() {
+        let db = create_test_database();
+        let mut cur = CursorImpl::new(db, 401);
+        assert_eq!(
+            cur.search_lte(b"anything").unwrap(),
+            OperationStatus::NotFound
+        );
+    }
+
+    #[test]
+    fn search_lte_is_rejected_on_a_closed_cursor() {
+        let mut cur = seeded_cursor(&["a"]);
+        cur.close();
+        assert!(matches!(cur.search_lte(b"a"), Err(DbiError::CursorClosed)));
+    }
+
+    /// On a sorted-dup database an exact key match lands the range-search on
+    /// the FIRST duplicate, but the floor (greatest record <= target) is the
+    /// LAST duplicate. `search_lte` walks the dup set to get there; a version
+    /// that skipped the walk would silently return the smallest dup.
+    #[test]
+    fn search_lte_on_a_dup_key_lands_on_the_last_duplicate() {
+        let db = create_dup_database();
+        let mut cur = CursorImpl::new(db, 402);
+        for d in ["d1", "d2", "d3"] {
+            cur.put(b"k", d.as_bytes(), PutMode::Overwrite).unwrap();
+        }
+        cur.put(b"m", b"m1", PutMode::Overwrite).unwrap();
+
+        assert_eq!(cur.search_lte(b"k").unwrap(), OperationStatus::Success);
+        let (pk, data) = cur.get_current().unwrap();
+        assert_eq!(pk, b"k");
+        assert_eq!(
+            &data[..],
+            b"d3",
+            "the floor of an exactly-matched dup key is its LAST duplicate"
+        );
+    }
+
+    // ── get_first_dup / get_last_dup ─────────────────────────────────────
+
+    /// The two dup-navigation primitives must stay INSIDE the current
+    /// duplicate set. Walking off the key would be the natural bug (the
+    /// implementation reaches the last dup by advancing until NextDup is
+    /// exhausted), so both the data value and the primary key are asserted.
+    #[test]
+    fn dup_navigation_reaches_both_ends_without_leaving_the_key() {
+        let db = create_dup_database();
+        let mut cur = CursorImpl::new(db, 403);
+        for d in ["b", "c", "d"] {
+            cur.put(b"key", d.as_bytes(), PutMode::Overwrite).unwrap();
+        }
+        // A neighbouring key on each side, so a walk that overshoots is visible.
+        cur.put(b"aaa", b"x", PutMode::Overwrite).unwrap();
+        cur.put(b"zzz", b"x", PutMode::Overwrite).unwrap();
+
+        // Position somewhere inside the dup set, then seek each end.
+        cur.search(b"key", None, SearchMode::Set).unwrap();
+
+        assert_eq!(cur.get_last_dup().unwrap(), OperationStatus::Success);
+        let (pk, data) = cur.get_current().unwrap();
+        assert_eq!(&data[..], b"d");
+        assert_eq!(
+            pk, b"key",
+            "get_last_dup must not walk off the end of the dup set"
+        );
+
+        assert_eq!(cur.get_first_dup().unwrap(), OperationStatus::Success);
+        let (pk, data) = cur.get_current().unwrap();
+        assert_eq!(&data[..], b"b");
+        assert_eq!(pk, b"key");
+
+        // Both must be idempotent -- calling twice must not step further.
+        cur.get_first_dup().unwrap();
+        assert_eq!(&cur.get_current().unwrap().1[..], b"b");
+        cur.get_last_dup().unwrap();
+        cur.get_last_dup().unwrap();
+        assert_eq!(&cur.get_current().unwrap().1[..], b"d");
+    }
+
+    /// On a NON-dup database every key has exactly one record, so both
+    /// primitives are documented no-ops that re-affirm the position. They must
+    /// not move the cursor or fail.
+    #[test]
+    fn dup_navigation_is_a_no_op_on_a_non_dup_database() {
+        let mut cur = seeded_cursor(&["a", "b", "c"]);
+        cur.search(b"b", None, SearchMode::Set).unwrap();
+
+        assert_eq!(cur.get_first_dup().unwrap(), OperationStatus::Success);
+        assert_eq!(cur.get_current_key(), Some(b"b".as_slice()));
+        assert_eq!(cur.get_last_dup().unwrap(), OperationStatus::Success);
+        assert_eq!(cur.get_current_key(), Some(b"b".as_slice()));
+    }
+
+    /// Both require an already-positioned cursor: JE's getFirstDup/getLastDup
+    /// are defined only within a duplicate set the cursor already occupies.
+    #[test]
+    fn dup_navigation_requires_a_positioned_cursor() {
+        let db = create_dup_database();
+        let mut cur = CursorImpl::new(db, 404);
+        assert!(matches!(
+            cur.get_first_dup(),
+            Err(DbiError::CursorNotInitialized)
+        ));
+        assert!(matches!(
+            cur.get_last_dup(),
+            Err(DbiError::CursorNotInitialized)
+        ));
+    }
+
+    // ── misc cursor state ────────────────────────────────────────────────
+
+    /// `get_current_lsn` reports the LSN of the slot the cursor sits on, which
+    /// is what the lock manager keys on. On a cursor with no log manager
+    /// attached nothing is written to the WAL, so every slot LSN is the NULL
+    /// sentinel -- and that is exactly why `upgrade_current_to_write_lock`
+    /// short-circuits on NULL rather than trying to lock LSN 0 (see the two
+    /// tests below). Pinning both halves: the sentinel for an unpositioned
+    /// cursor, and the same sentinel for a positioned-but-unlogged slot.
+    #[test]
+    fn get_current_lsn_is_the_null_sentinel_without_a_log_manager() {
+        let db = create_test_database();
+        let mut cur = CursorImpl::new(db, 405);
+        assert_eq!(
+            cur.get_current_lsn(),
+            noxu_util::NULL_LSN.as_u64(),
+            "an unpositioned cursor has no LSN"
+        );
+
+        cur.put(b"a", b"1", PutMode::Overwrite).unwrap();
+        cur.search(b"a", None, SearchMode::Set).unwrap();
+        assert_eq!(
+            cur.get_current_lsn(),
+            noxu_util::NULL_LSN.as_u64(),
+            "with no log manager the slot was never logged, so its LSN stays \
+             NULL -- the lock path must treat this as 'nothing to lock'"
+        );
+    }
+
+    /// `upgrade_current_to_write_lock` on an unpositioned cursor is a
+    /// documented no-op (there is no record to lock). It must succeed rather
+    /// than erroring, since the write path calls it unconditionally.
+    #[test]
+    fn upgrading_an_unpositioned_cursor_is_a_no_op() {
+        let db = create_test_database();
+        let cur = CursorImpl::new(db, 406);
+        assert!(cur.upgrade_current_to_write_lock().is_ok());
+    }
+
+    /// With no txn and no lock manager attached there is nothing to upgrade
+    /// against, so a positioned cursor must still succeed -- the non-locking
+    /// (`env_is_locking = false`) configuration relies on this.
+    #[test]
+    fn upgrading_without_a_locker_succeeds() {
+        let mut cur = seeded_cursor(&["a"]);
+        cur.search(b"a", None, SearchMode::Set).unwrap();
+        assert!(cur.upgrade_current_to_write_lock().is_ok());
+    }
 }
