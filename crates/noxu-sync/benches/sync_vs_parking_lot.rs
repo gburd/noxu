@@ -26,36 +26,73 @@
 //!
 //! | Regime | Shape | Why this engine cares |
 //! |---|---|---|
-//! | `mutex_uncontended` | 1 thread, lock/incr/unlock | The overwhelmingly common case: warm read path, log-buffer pin, stats bump |
+//! | `uncontended_mutex` | 1 thread, lock/incr/unlock, work sweep | The overwhelmingly common case: warm read path, log-buffer pin, stats bump |
+//! | `uncontended_rwlock_read` / `_write` | 1 thread, work sweep | Tree-latch acquire on an uncontended node |
+//! | `uncontended_*` `no_lock` arm | identical body, `Cell` instead of a lock | **Overhead control** — see below |
 //! | `mutex_contended_short/{N}` | N threads, ~1 ns critical section | Hot shared counters (memory budget, evictor state) |
 //! | `mutex_contended_long/{N}` | N threads, ~100 ns critical section | Log-buffer append, checkpoint bookkeeping |
-//! | `rwlock_uncontended_read` / `_write` | 1 thread | Tree-latch acquire on an uncontended node |
 //! | `rwlock_read_only/{N}` | N threads, 100 % shared | Hand-over-hand tree descent on hot upper INs |
 //! | `rwlock_read_heavy/{N}` | N threads, 1-in-1024 exclusive | Tree latch with occasional split/eviction |
 //!
-//! ### Multi-threaded timing convention
+//! ### The uncontended overhead control
+//!
+//! Uncontended lock/unlock is only ~15 ns, close enough to criterion's own
+//! per-iteration loop cost that a naive reading could be mostly harness.
+//! Two guards make the uncontended numbers interpretable:
+//!
+//!   * a **`no_lock` arm** runs a byte-identical body against a `Cell<u64>`
+//!     (no lock at all), so `impl − no_lock` is the actual lock cost and the
+//!     absolute number's harness component is visible rather than assumed;
+//!   * a **work sweep** (`/0`, `/8`, `/32` filler iterations inside the
+//!     critical section) must move all three arms by the *same* delta.  If it
+//!     does, the measurement tracks real work and the lock cost is the
+//!     constant offset; if the arms moved differently, the loop was being
+//!     optimised unevenly and the numbers would be void.
+//!
+//! ### Multi-threaded timing convention (and the artifact it avoids)
 //!
 //! Threaded regimes use `iter_custom`: criterion's `iters` is the **total**
 //! op count, split evenly across the N worker threads.  Threads are spawned,
 //! rendezvous on a `Barrier`, and only then is the clock started; the
-//! reported duration is wall-clock until the last thread finishes.  So the
-//! reported `time` is **aggregate ns per operation** (i.e. the reciprocal of
-//! system-wide lock throughput), *not* per-thread latency.  Lower is better
-//! and the number is directly comparable across thread counts.
+//! reported duration is wall-clock **makespan** — until the last worker has
+//! completed its quota.  So the reported `time` is **aggregate ns per
+//! operation** (i.e. the reciprocal of system-wide lock throughput), *not*
+//! per-thread latency.  Lower is better and the number is directly
+//! comparable across thread counts.
+//!
+//! Crucially, a worker that finishes its quota early does **not** exit: it
+//! keeps issuing *uncounted* ops until every worker has finished, so
+//! concurrency stays at N for the whole timed window.  Without this, a
+//! **barging** (non-fair) lock lets one thread race ahead, finish, and
+//! leave — decaying the contention level for the remainder and inflating
+//! the measured throughput.  A first version of this bench did exactly that
+//! and reported `noxu-sync` getting *faster* from 16 to 64 threads, which is
+//! the signature of the artifact, not of a fast lock.  Since non-fairness is
+//! the very property under review, the harness must not pay it a bonus.
+//!
+//! Makespan semantics do fold *some* unfairness cost into the throughput
+//! number (a lock that starves one thread has a long tail).  That is
+//! deliberate and is the metric an engine cares about — but it means
+//! throughput and fairness are not fully separated here.  The sibling
+//! `sync_fairness` bench separates them: it measures a fixed-duration
+//! window and reports per-thread op counts alongside throughput.
 //!
 //! Thread spawn/join is outside the timed window except for the join tail;
 //! `SamplingMode::Flat` keeps per-sample work large so that residual
 //! spawn/teardown cost is a small, symmetric constant.
 //!
 //! Run: `cargo bench -p noxu-sync --bench sync_vs_parking_lot`
-//! Single regime: `... --bench sync_vs_parking_lot -- mutex_uncontended`
+//! Single regime: `... --bench sync_vs_parking_lot -- uncontended_mutex`
+//!
+//! The companion `sync_fairness` bench reports the acquisition *fairness*
+//! these throughput numbers are bought with; read the two together.
 
 use criterion::{
     BenchmarkId, Criterion, SamplingMode, criterion_group, criterion_main,
 };
 use lock_api::{RawMutex, RawRwLock};
 use std::hint::black_box;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
@@ -73,6 +110,12 @@ const WRITE_EVERY: u64 = 1024;
 /// mul+add pairs ≈ 100 ns on a Xeon, which is the order of a log-buffer
 /// append or a BIN slot rewrite.
 const LONG_CS_WORK: u32 = 64;
+
+/// Filler-work levels swept in the uncontended regimes.  All three arms
+/// (both impls plus the lock-free control) must move by the same delta across
+/// the sweep; that is what makes the ~15 ns absolute numbers trustworthy
+/// rather than criterion loop noise.
+const WORK_SWEEP: &[u32] = &[0, 8, 32];
 
 /// Deterministic, unoptimisable filler work for the "long critical section"
 /// regimes.  `inline(never)` so it cannot be specialised differently between
@@ -93,11 +136,18 @@ fn filler(iters: u32, seed: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 /// Runs `total` operations spread over `threads` worker threads and returns
-/// the wall-clock time for the whole batch (clock started after all workers
-/// have rendezvoused).
+/// the wall-clock **makespan** for the batch (clock started after all workers
+/// have rendezvoused, stopped when the last worker completed its quota).
 ///
 /// `op` is `(thread_index, op_index) -> ()` and does exactly one lock
 /// acquire/release.
+///
+/// A worker that completes its `total / threads` quota keeps issuing
+/// **uncounted** ops until every other worker is done, so the offered
+/// concurrency is a constant N across the whole timed window.  See the module
+/// docs for why this matters: without it the harness pays a barging lock a
+/// bonus for shedding contention early, which is precisely the property under
+/// measurement.
 fn run_threaded<F>(threads: usize, total: u64, op: F) -> Duration
 where
     F: Fn(usize, u64) + Send + Sync + 'static,
@@ -105,16 +155,26 @@ where
     let per = (total / threads as u64).max(1);
     // +1 for the timing thread.
     let gate = Arc::new(Barrier::new(threads + 1));
+    let remaining = Arc::new(AtomicUsize::new(threads));
     let op = Arc::new(op);
 
     let handles: Vec<_> = (0..threads)
         .map(|t| {
             let gate = Arc::clone(&gate);
+            let remaining = Arc::clone(&remaining);
             let op = Arc::clone(&op);
             std::thread::spawn(move || {
                 gate.wait();
                 for i in 0..per {
                     op(t, i);
+                }
+                remaining.fetch_sub(1, Ordering::Release);
+                // Hold the load at N until the slowest worker is done.  These
+                // ops are not counted against `total`.
+                let mut i = per;
+                while remaining.load(Ordering::Acquire) > 0 {
+                    op(t, i);
+                    i = i.wrapping_add(1);
                 }
             })
         })
@@ -135,14 +195,38 @@ where
 fn bench_mutex_uncontended<R: RawMutex + 'static>(
     g: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
     name: &str,
+    work: u32,
 ) {
     let m: lock_api::Mutex<R, u64> = lock_api::Mutex::new(0);
-    g.bench_function(name, |b| {
+    g.bench_function(BenchmarkId::new(name, work), |b| {
         b.iter(|| {
             let mut guard = m.lock();
             *guard = guard.wrapping_add(1);
+            if work > 0 {
+                *guard ^= filler(work, *guard);
+            }
             drop(guard);
             black_box(&m);
+        });
+    });
+}
+
+/// Overhead control for the uncontended regimes: the same body with **no lock
+/// at all**, so `impl − no_lock` is the lock's true cost and the harness's
+/// share of the ~15 ns absolute number is visible rather than assumed.
+fn bench_uncontended_no_lock(
+    g: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+    work: u32,
+) {
+    let cell = std::cell::Cell::new(0u64);
+    g.bench_function(BenchmarkId::new("no_lock", work), |b| {
+        b.iter(|| {
+            let mut v = cell.get().wrapping_add(1);
+            if work > 0 {
+                v ^= filler(work, v);
+            }
+            cell.set(v);
+            black_box(&cell);
         });
     });
 }
@@ -180,20 +264,27 @@ fn bench_rwlock_uncontended<R: RawRwLock + 'static>(
     g: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
     name: &str,
     write: bool,
+    work: u32,
 ) {
     let l: lock_api::RwLock<R, u64> = lock_api::RwLock::new(7);
-    g.bench_function(name, |b| {
+    g.bench_function(BenchmarkId::new(name, work), |b| {
         if write {
             b.iter(|| {
                 let mut guard = l.write();
                 *guard = guard.wrapping_add(1);
+                if work > 0 {
+                    *guard ^= filler(work, *guard);
+                }
                 drop(guard);
                 black_box(&l);
             });
         } else {
             b.iter(|| {
                 let guard = l.read();
-                let v = *guard;
+                let mut v = *guard;
+                if work > 0 {
+                    v ^= filler(work, v);
+                }
                 drop(guard);
                 black_box(v)
             });
@@ -256,9 +347,20 @@ fn tune_threaded(
 
 fn mutex_benches(c: &mut Criterion) {
     {
-        let mut g = c.benchmark_group("mutex_uncontended");
-        bench_mutex_uncontended::<noxu_sync::RawMutex>(&mut g, "noxu_sync");
-        bench_mutex_uncontended::<parking_lot::RawMutex>(&mut g, "parking_lot");
+        let mut g = c.benchmark_group("uncontended_mutex");
+        for &w in WORK_SWEEP {
+            bench_mutex_uncontended::<noxu_sync::RawMutex>(
+                &mut g,
+                "noxu_sync",
+                w,
+            );
+            bench_mutex_uncontended::<parking_lot::RawMutex>(
+                &mut g,
+                "parking_lot",
+                w,
+            );
+            bench_uncontended_no_lock(&mut g, w);
+        }
         g.finish();
     }
 
@@ -284,32 +386,25 @@ fn mutex_benches(c: &mut Criterion) {
 }
 
 fn rwlock_benches(c: &mut Criterion) {
+    for (label, write) in
+        [("uncontended_rwlock_read", false), ("uncontended_rwlock_write", true)]
     {
-        let mut g = c.benchmark_group("rwlock_uncontended_read");
-        bench_rwlock_uncontended::<noxu_sync::NoxuRawRwLock>(
-            &mut g,
-            "noxu_sync",
-            false,
-        );
-        bench_rwlock_uncontended::<parking_lot::RawRwLock>(
-            &mut g,
-            "parking_lot",
-            false,
-        );
-        g.finish();
-    }
-    {
-        let mut g = c.benchmark_group("rwlock_uncontended_write");
-        bench_rwlock_uncontended::<noxu_sync::NoxuRawRwLock>(
-            &mut g,
-            "noxu_sync",
-            true,
-        );
-        bench_rwlock_uncontended::<parking_lot::RawRwLock>(
-            &mut g,
-            "parking_lot",
-            true,
-        );
+        let mut g = c.benchmark_group(label);
+        for &w in WORK_SWEEP {
+            bench_rwlock_uncontended::<noxu_sync::NoxuRawRwLock>(
+                &mut g,
+                "noxu_sync",
+                write,
+                w,
+            );
+            bench_rwlock_uncontended::<parking_lot::RawRwLock>(
+                &mut g,
+                "parking_lot",
+                write,
+                w,
+            );
+            bench_uncontended_no_lock(&mut g, w);
+        }
         g.finish();
     }
 
@@ -343,14 +438,22 @@ fn rwlock_benches(c: &mut Criterion) {
 fn self_check(_c: &mut Criterion) {
     fn check_mutex<R: RawMutex + Send + Sync + 'static>() {
         let m: Arc<lock_api::Mutex<R, u64>> = Arc::new(lock_api::Mutex::new(0));
+        // The driver issues extra *uncounted* ops to hold concurrency at N
+        // (see `run_threaded`), so the total op count is not known up front.
+        // Instead compare the lock-protected counter against an atomic
+        // incremented in the same critical section: they can only diverge if
+        // an update was lost, i.e. if mutual exclusion failed.
+        let atomic = Arc::new(AtomicU64::new(0));
         let m2 = Arc::clone(&m);
+        let a2 = Arc::clone(&atomic);
         run_threaded(8, 8_000, move |_t, _i| {
             let mut g = m2.lock();
-            *g += 1;
+            *g = g.wrapping_add(1);
+            a2.fetch_add(1, Ordering::Relaxed);
         });
         assert_eq!(
             *m.lock(),
-            8_000,
+            atomic.load(Ordering::Relaxed),
             "mutex lost updates: not mutually exclusive"
         );
     }

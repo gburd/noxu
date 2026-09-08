@@ -26,3 +26,10 @@ parking_lot = { workspace = true }
 [[bench]]
 name = "sync_vs_parking_lot"
 harness = false
+
+# Fairness + throughput in one run: a barging lock buys throughput WITH
+# unfairness, so the two must be reported together (see the bench's module
+# docs and docs/src/internal/noxu-sync-vs-parking-lot-2026-09.md).
+[[bench]]
+name = "sync_fairness"
+harness = false
