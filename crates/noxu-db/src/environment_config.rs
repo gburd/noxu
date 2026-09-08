@@ -3082,4 +3082,397 @@ mod tests {
         c.set_dos_producer_queue_timeout_ms(5000);
         assert_eq!(c.dos_producer_queue_timeout_ms, 5000);
     }
+
+    // ── builder field-isolation sweep ───────────────────────────────────
+    //
+    // `EnvironmentConfig` carries 144 fields with ~140 near-identical
+    // `with_*` / `set_*` pairs. That much copy-paste has one dominant failure
+    // mode: a builder that writes the WRONG field (or an extra one). This
+    // sweep proves, for every mechanically-paired builder, that
+    //   (1) it writes the field its name promises, and
+    //   (2) it writes nothing else.
+    //
+    // (2) is checked by restoring the one field to its default and requiring
+    // the whole struct to be `Debug`-identical to `default()` — so a builder
+    // that also clobbered a sibling field fails, which no per-field
+    // `assert_eq!` on the target field alone would catch.
+    //
+    // Builders whose name deliberately does not match its field
+    // (`set_lock_timeout` → `lock_timeout_ms`), which take more than one
+    // argument (`with_log_group_commit`), or which are `#[deprecated]`, are
+    // excluded here and covered explicitly in the tests below.
+
+    /// Assert `c` differs from `default()` in no field other than the one the
+    /// caller already restored.
+    fn assert_only_field_touched(c: &EnvironmentConfig, who: &str) {
+        let d = EnvironmentConfig::default();
+        assert_eq!(
+            format!("{c:?}"),
+            format!("{d:?}"),
+            "{who} wrote a field other than the one its name names"
+        );
+    }
+
+    macro_rules! sweep_bool_builders {
+        ($($field:ident / $with:ident / $set:ident),* $(,)?) => {{
+            $({
+                let d = EnvironmentConfig::default();
+                // Probe BOTH boolean values. A builder that also clobbers a
+                // sibling bool escapes a single probe whenever the sibling's
+                // default already equals the probe; it cannot escape both,
+                // since no default equals `true` and `false` at once.
+                for v in [!d.$field, d.$field] {
+                    let mut c = EnvironmentConfig::default().$with(v);
+                    assert_eq!(
+                        c.$field, v,
+                        "{} did not write {}",
+                        stringify!($with), stringify!($field)
+                    );
+                    c.$field = d.$field;
+                    assert_only_field_touched(&c, stringify!($with));
+
+                    let mut c = EnvironmentConfig::default();
+                    c.$set(v);
+                    assert_eq!(
+                        c.$field, v,
+                        "{} did not write {}",
+                        stringify!($set), stringify!($field)
+                    );
+                    c.$field = d.$field;
+                    assert_only_field_touched(&c, stringify!($set));
+                }
+            })*
+        }};
+    }
+
+    macro_rules! sweep_numeric_builders {
+        ($($field:ident / $with:ident / $set:ident),* $(,)?) => {{
+            $({
+                let d = EnvironmentConfig::default();
+                // Two probes, both distinct from this field's own default
+                // (`wrapping_add` keeps them in range for every width).
+                // Two are needed, not one: a builder that also writes a
+                // sibling field goes unnoticed if the sibling's default
+                // happens to equal the probe. `+1` and `+101` cannot both
+                // collide with the same sibling default.
+                for v in [d.$field.wrapping_add(1), d.$field.wrapping_add(101)]
+                {
+                    let mut c = EnvironmentConfig::default().$with(v);
+                    assert_eq!(
+                        c.$field, v,
+                        "{} did not write {}",
+                        stringify!($with), stringify!($field)
+                    );
+                    c.$field = d.$field;
+                    assert_only_field_touched(&c, stringify!($with));
+
+                    let mut c = EnvironmentConfig::default();
+                    c.$set(v);
+                    assert_eq!(
+                        c.$field, v,
+                        "{} did not write {}",
+                        stringify!($set), stringify!($field)
+                    );
+                    c.$field = d.$field;
+                    assert_only_field_touched(&c, stringify!($set));
+                }
+            })*
+        }};
+    }
+
+    #[test]
+    fn bool_builders_write_only_their_own_field() {
+        sweep_bool_builders! {
+        allow_create / with_allow_create / set_allow_create,
+        checkpointer_high_priority / with_checkpointer_high_priority / set_checkpointer_high_priority,
+        cleaner_adjust_utilization / with_cleaner_adjust_utilization / set_cleaner_adjust_utilization,
+        cleaner_background_proactive_migration / with_cleaner_background_proactive_migration / set_cleaner_background_proactive_migration,
+        cleaner_expiration_enabled / with_cleaner_expiration_enabled / set_cleaner_expiration_enabled,
+        cleaner_expunge / with_cleaner_expunge / set_cleaner_expunge,
+        cleaner_fetch_obsolete_size / with_cleaner_fetch_obsolete_size / set_cleaner_fetch_obsolete_size,
+        cleaner_foreground_proactive_migration / with_cleaner_foreground_proactive_migration / set_cleaner_foreground_proactive_migration,
+        cleaner_lazy_migration / with_cleaner_lazy_migration / set_cleaner_lazy_migration,
+        cleaner_use_deleted_dir / with_cleaner_use_deleted_dir / set_cleaner_use_deleted_dir,
+        compressor_purge_root / with_compressor_purge_root / set_compressor_purge_root,
+        env_check_leaks / with_env_check_leaks / set_env_check_leaks,
+        env_db_eviction / with_env_db_eviction / set_env_db_eviction,
+        env_expiration_enabled / with_env_expiration_enabled / set_env_expiration_enabled,
+        env_fair_latches / with_env_fair_latches / set_env_fair_latches,
+        env_forced_yield / with_env_forced_yield / set_env_forced_yield,
+        env_is_locking / with_env_is_locking / set_env_is_locking,
+        env_recovery_force_checkpoint / with_env_recovery_force_checkpoint / set_env_recovery_force_checkpoint,
+        env_recovery_force_new_file / with_env_recovery_force_new_file / set_env_recovery_force_new_file,
+        evictor_allow_bin_deltas / with_evictor_allow_bin_deltas / set_evictor_allow_bin_deltas,
+        evictor_lru_only / with_evictor_lru_only / set_evictor_lru_only,
+        evictor_mutate_bins / with_evictor_mutate_bins / set_evictor_mutate_bins,
+        evictor_use_dirty_lru / with_evictor_use_dirty_lru / set_evictor_use_dirty_lru,
+        halt_on_commit_after_checksum_exception / with_halt_on_commit_after_checksum_exception / set_halt_on_commit_after_checksum_exception,
+        lock_deadlock_detect / with_lock_deadlock_detect / set_lock_deadlock_detect,
+        log_checksum_read / with_log_checksum_read / set_log_checksum_read,
+        log_detect_file_delete / with_log_detect_file_delete / set_log_detect_file_delete,
+        log_mem_only / with_log_mem_only / set_log_mem_only,
+        log_use_odsync / with_log_use_odsync / set_log_use_odsync,
+        log_use_write_queue / with_log_use_write_queue / set_log_use_write_queue,
+        log_verify_checksums / with_log_verify_checksums / set_log_verify_checksums,
+        offheap_checksum / with_offheap_checksum / set_offheap_checksum,
+        read_only / with_read_only / set_read_only,
+        run_checkpointer / with_run_checkpointer / set_run_checkpointer,
+        run_cleaner / with_run_cleaner / set_run_cleaner,
+        run_evictor / with_run_evictor / set_run_evictor,
+        run_in_compressor / with_run_in_compressor / set_run_in_compressor,
+        run_offheap_evictor / with_run_offheap_evictor / set_run_offheap_evictor,
+        run_verifier / with_run_verifier / set_run_verifier,
+        shared_cache / with_shared_cache / set_shared_cache,
+        stats_collect / with_stats_collect / set_stats_collect,
+        transactional / with_transactional / set_transactional,
+        tree_bin_delta / with_tree_bin_delta / set_tree_bin_delta,
+        txn_deadlock_stack_trace / with_txn_deadlock_stack_trace / set_txn_deadlock_stack_trace,
+        txn_dump_locks / with_txn_dump_locks / set_txn_dump_locks,
+        txn_serializable_isolation / with_txn_serializable_isolation / set_txn_serializable_isolation,
+        verify_btree / with_verify_btree / set_verify_btree,
+        verify_data_records / with_verify_data_records / set_verify_data_records,
+        verify_log / with_verify_log / set_verify_log,
+        verify_obsolete_records / with_verify_obsolete_records / set_verify_obsolete_records,
+        verify_secondaries / with_verify_secondaries / set_verify_secondaries,
+        }
+    }
+
+    /// The builders the mechanical sweep above deliberately skips: their name
+    /// does not match their field, they write more than one field, or they take
+    /// a non-scalar value. Each is spelled out so the "writes only what its
+    /// name promises" invariant still holds for the whole config surface.
+    /// The three `#[deprecated]` durability flags are excluded from the sweep
+    /// (it would need a crate-wide `allow`). They are still public API, so the
+    /// same field-isolation invariant must hold while they exist.
+    #[test]
+    #[allow(deprecated)]
+    fn deprecated_durability_flag_builders_write_only_their_own_field() {
+        let d = EnvironmentConfig::default();
+        for v in [!d.txn_no_sync, d.txn_no_sync] {
+            let mut c = EnvironmentConfig::default().with_txn_no_sync(v);
+            assert_eq!(c.txn_no_sync, v);
+            c.txn_no_sync = d.txn_no_sync;
+            assert_only_field_touched(&c, "with_txn_no_sync");
+
+            let mut c = EnvironmentConfig::default();
+            c.set_txn_no_sync(v);
+            assert_eq!(c.txn_no_sync, v);
+            c.txn_no_sync = d.txn_no_sync;
+            assert_only_field_touched(&c, "set_txn_no_sync");
+
+            // `set_*`-only: no consuming counterpart exists for this one.
+            let mut c = EnvironmentConfig::default();
+            c.set_txn_write_no_sync(v);
+            assert_eq!(c.txn_write_no_sync, v);
+            // The two legacy flags are independent; setting one must not
+            // imply the other.
+            assert_eq!(c.txn_no_sync, d.txn_no_sync);
+            c.txn_write_no_sync = d.txn_write_no_sync;
+            assert_only_field_touched(&c, "set_txn_write_no_sync");
+        }
+    }
+
+    #[test]
+    fn irregular_builders_write_only_their_own_fields() {
+        // Name/field mismatch: `_timeout` setter, `_timeout_ms` field.
+        let mut c = EnvironmentConfig::default().with_lock_timeout(4321);
+        assert_eq!(c.lock_timeout_ms, 4321);
+        c.lock_timeout_ms = EnvironmentConfig::default().lock_timeout_ms;
+        assert_only_field_touched(&c, "with_lock_timeout");
+
+        let mut c = EnvironmentConfig::default().with_txn_timeout(8765);
+        assert_eq!(c.txn_timeout_ms, 8765);
+        c.txn_timeout_ms = EnvironmentConfig::default().txn_timeout_ms;
+        assert_only_field_touched(&c, "with_txn_timeout");
+
+        // Two fields from one call.
+        let d = EnvironmentConfig::default();
+        let mut c = EnvironmentConfig::default().with_log_group_commit(64, 9);
+        assert_eq!(c.log_group_commit_threshold, 64);
+        assert_eq!(c.log_group_commit_interval_ms, 9);
+        c.log_group_commit_threshold = d.log_group_commit_threshold;
+        c.log_group_commit_interval_ms = d.log_group_commit_interval_ms;
+        assert_only_field_touched(&c, "with_log_group_commit");
+
+        let mut c = EnvironmentConfig::default();
+        c.set_log_fsync_adaptive_window(6, 12);
+        assert_eq!(c.log_fsync_adaptive_leaders, 6);
+        assert_eq!(c.log_fsync_adaptive_trigger, 12);
+        // It must NOT touch the non-adaptive leader cap.
+        assert_eq!(c.log_fsync_max_leaders, d.log_fsync_max_leaders);
+        c.log_fsync_adaptive_leaders = d.log_fsync_adaptive_leaders;
+        c.log_fsync_adaptive_trigger = d.log_fsync_adaptive_trigger;
+        assert_only_field_touched(&c, "set_log_fsync_adaptive_window");
+
+        // `set_*`-only (no consuming counterpart).
+        let mut c = EnvironmentConfig::default();
+        c.set_log_fsync_max_leaders(4);
+        assert_eq!(c.log_fsync_max_leaders, 4);
+        c.log_fsync_max_leaders = d.log_fsync_max_leaders;
+        assert_only_field_touched(&c, "set_log_fsync_max_leaders");
+
+        // Non-scalar values.
+        let mut c =
+            EnvironmentConfig::default().with_evictor_algorithm("clock");
+        assert_eq!(c.evictor_algorithm, "clock");
+        c.evictor_algorithm = d.evictor_algorithm.clone();
+        assert_only_field_touched(&c, "with_evictor_algorithm");
+
+        let mut c = EnvironmentConfig::default()
+            .with_verify_schedule("0 0 * * *".to_string());
+        assert_eq!(c.verify_schedule, "0 0 * * *");
+        c.verify_schedule = d.verify_schedule.clone();
+        assert_only_field_touched(&c, "with_verify_schedule");
+
+        // `Option<PathBuf>` field fed a bare `PathBuf`: the setter must wrap it
+        // in `Some`, not leave the default `None`.
+        let mut c = EnvironmentConfig::default()
+            .with_stats_file_directory(PathBuf::from("/tmp/noxu-stats"));
+        assert_eq!(
+            c.stats_file_directory,
+            Some(PathBuf::from("/tmp/noxu-stats"))
+        );
+        c.stats_file_directory = d.stats_file_directory.clone();
+        assert_only_field_touched(&c, "with_stats_file_directory");
+
+        let mut c = EnvironmentConfig::default()
+            .with_durability(Durability::COMMIT_NO_SYNC);
+        assert_eq!(c.durability, Durability::COMMIT_NO_SYNC);
+        c.durability = d.durability;
+        assert_only_field_touched(&c, "with_durability");
+    }
+
+    /// `set_exception_listener` stores the listener behind the `Debug`-opaque
+    /// `ExceptionListenerHolder`, so the sweep's `Debug`-equality trick cannot
+    /// see it. Assert instead that the stored listener is the one handed in,
+    /// by driving a real event through it.
+    #[test]
+    fn exception_listener_builder_stores_the_supplied_listener() {
+        use crate::error::ExceptionEvent;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Counting(AtomicUsize);
+        impl ExceptionListener for Counting {
+            fn exception_event(&self, _event: &ExceptionEvent) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let listener = Arc::new(Counting(AtomicUsize::new(0)));
+        let c = EnvironmentConfig::default()
+            .with_exception_listener(listener.clone());
+
+        let held = c
+            .exception_listener
+            .0
+            .as_ref()
+            .expect("with_exception_listener must populate the holder");
+        held.exception_event(&ExceptionEvent::new(
+            "probe",
+            crate::error::ExceptionSource::Verifier,
+            "test",
+        ));
+        assert_eq!(
+            listener.0.load(Ordering::SeqCst),
+            1,
+            "the holder must contain the listener that was handed in"
+        );
+
+        // The holder's Debug must not leak the listener's contents, only its
+        // presence — that is the whole reason the wrapper type exists.
+        assert_eq!(
+            format!("{:?}", c.exception_listener),
+            "Some(<ExceptionListener>)"
+        );
+        assert_eq!(
+            format!("{:?}", EnvironmentConfig::default().exception_listener),
+            "None"
+        );
+    }
+
+    #[test]
+    fn numeric_builders_write_only_their_own_field() {
+        sweep_numeric_builders! {
+        cache_percent / with_cache_percent / set_cache_percent,
+        cache_size / with_cache_size / set_cache_size,
+        checkpointer_bytes_interval / with_checkpointer_bytes_interval / set_checkpointer_bytes_interval,
+        checkpointer_deadlock_retry / with_checkpointer_deadlock_retry / set_checkpointer_deadlock_retry,
+        checkpointer_min_interval_secs / with_checkpointer_min_interval_secs / set_checkpointer_min_interval_secs,
+        checkpointer_wakeup_interval_ms / with_checkpointer_wakeup_interval_ms / set_checkpointer_wakeup_interval_ms,
+        cleaner_bytes_interval / with_cleaner_bytes_interval / set_cleaner_bytes_interval,
+        cleaner_deadlock_retry / with_cleaner_deadlock_retry / set_cleaner_deadlock_retry,
+        cleaner_detail_max_memory_percentage / with_cleaner_detail_max_memory_percentage / set_cleaner_detail_max_memory_percentage,
+        cleaner_lock_timeout_ms / with_cleaner_lock_timeout_ms / set_cleaner_lock_timeout_ms,
+        cleaner_look_ahead_cache_size / with_cleaner_look_ahead_cache_size / set_cleaner_look_ahead_cache_size,
+        cleaner_max_batch_files / with_cleaner_max_batch_files / set_cleaner_max_batch_files,
+        cleaner_min_age / with_cleaner_min_age / set_cleaner_min_age,
+        cleaner_min_file_count / with_cleaner_min_file_count / set_cleaner_min_file_count,
+        cleaner_min_file_utilization / with_cleaner_min_file_utilization / set_cleaner_min_file_utilization,
+        cleaner_min_utilization / with_cleaner_min_utilization / set_cleaner_min_utilization,
+        cleaner_read_size / with_cleaner_read_size / set_cleaner_read_size,
+        cleaner_threads / with_cleaner_threads / set_cleaner_threads,
+        cleaner_two_pass_gap / with_cleaner_two_pass_gap / set_cleaner_two_pass_gap,
+        cleaner_two_pass_threshold / with_cleaner_two_pass_threshold / set_cleaner_two_pass_threshold,
+        cleaner_wakeup_interval_ms / with_cleaner_wakeup_interval_ms / set_cleaner_wakeup_interval_ms,
+        compressor_deadlock_retry / with_compressor_deadlock_retry / set_compressor_deadlock_retry,
+        compressor_lock_timeout_ms / with_compressor_lock_timeout_ms / set_compressor_lock_timeout_ms,
+        dos_producer_queue_timeout_ms / with_dos_producer_queue_timeout_ms / set_dos_producer_queue_timeout_ms,
+        env_background_read_limit_kb / with_env_background_read_limit_kb / set_env_background_read_limit_kb,
+        env_background_sleep_interval_us / with_env_background_sleep_interval_us / set_env_background_sleep_interval_us,
+        env_background_write_limit_kb / with_env_background_write_limit_kb / set_env_background_write_limit_kb,
+        env_latch_timeout_ms / with_env_latch_timeout_ms / set_env_latch_timeout_ms,
+        env_ttl_clock_tolerance_ms / with_env_ttl_clock_tolerance_ms / set_env_ttl_clock_tolerance_ms,
+        evictor_core_threads / with_evictor_core_threads / set_evictor_core_threads,
+        evictor_critical_percentage / with_evictor_critical_percentage / set_evictor_critical_percentage,
+        evictor_deadlock_retry / with_evictor_deadlock_retry / set_evictor_deadlock_retry,
+        evictor_evict_bytes / with_evictor_evict_bytes / set_evictor_evict_bytes,
+        evictor_keep_alive_ms / with_evictor_keep_alive_ms / set_evictor_keep_alive_ms,
+        evictor_max_threads / with_evictor_max_threads / set_evictor_max_threads,
+        evictor_n_lru_lists / with_evictor_n_lru_lists / set_evictor_n_lru_lists,
+        evictor_nodes_per_scan / with_evictor_nodes_per_scan / set_evictor_nodes_per_scan,
+        free_disk / with_free_disk / set_free_disk,
+        in_compressor_wakeup_interval_ms / with_in_compressor_wakeup_interval_ms / set_in_compressor_wakeup_interval_ms,
+        lock_deadlock_detect_delay_ms / with_lock_deadlock_detect_delay_ms / set_lock_deadlock_detect_delay_ms,
+        lock_n_lock_tables / with_lock_n_lock_tables / set_lock_n_lock_tables,
+        log_buffer_size / with_log_buffer_size / set_log_buffer_size,
+        log_detect_file_delete_interval_ms / with_log_detect_file_delete_interval_ms / set_log_detect_file_delete_interval_ms,
+        log_fault_read_size / with_log_fault_read_size / set_log_fault_read_size,
+        log_file_cache_size / with_log_file_cache_size / set_log_file_cache_size,
+        log_file_max_bytes / with_log_file_max_bytes / set_log_file_max_bytes,
+        log_flush_no_sync_interval_ms / with_log_flush_no_sync_interval_ms / set_log_flush_no_sync_interval_ms,
+        log_flush_sync_interval_ms / with_log_flush_sync_interval_ms / set_log_flush_sync_interval_ms,
+        log_fsync_time_limit_ms / with_log_fsync_time_limit_ms / set_log_fsync_time_limit_ms,
+        log_fsync_timeout_ms / with_log_fsync_timeout_ms / set_log_fsync_timeout_ms,
+        log_group_commit_interval_ms / with_log_group_commit_interval_ms / set_log_group_commit_interval_ms,
+        log_group_commit_threshold / with_log_group_commit_threshold / set_log_group_commit_threshold,
+        log_iterator_max_size / with_log_iterator_max_size / set_log_iterator_max_size,
+        log_iterator_read_size / with_log_iterator_read_size / set_log_iterator_read_size,
+        log_n_data_directories / with_log_n_data_directories / set_log_n_data_directories,
+        log_num_buffers / with_log_num_buffers / set_log_num_buffers,
+        log_total_buffer_bytes / with_log_total_buffer_bytes / set_log_total_buffer_bytes,
+        log_write_queue_size / with_log_write_queue_size / set_log_write_queue_size,
+        max_disk / with_max_disk / set_max_disk,
+        max_off_heap_memory / with_max_off_heap_memory / set_max_off_heap_memory,
+        node_dup_tree_max_entries / with_node_dup_tree_max_entries / set_node_dup_tree_max_entries,
+        node_max_entries / with_node_max_entries / set_node_max_entries,
+        offheap_core_threads / with_offheap_core_threads / set_offheap_core_threads,
+        offheap_evict_bytes / with_offheap_evict_bytes / set_offheap_evict_bytes,
+        offheap_keep_alive_ms / with_offheap_keep_alive_ms / set_offheap_keep_alive_ms,
+        offheap_max_threads / with_offheap_max_threads / set_offheap_max_threads,
+        offheap_n_lru_lists / with_offheap_n_lru_lists / set_offheap_n_lru_lists,
+        reserved_disk / with_reserved_disk / set_reserved_disk,
+        startup_dump_threshold_ms / with_startup_dump_threshold_ms / set_startup_dump_threshold_ms,
+        stats_collect_interval_secs / with_stats_collect_interval_secs / set_stats_collect_interval_secs,
+        stats_file_row_count / with_stats_file_row_count / set_stats_file_row_count,
+        stats_max_files / with_stats_max_files / set_stats_max_files,
+        tree_bin_delta_percent / with_tree_bin_delta_percent / set_tree_bin_delta_percent,
+        tree_compact_max_key_length / with_tree_compact_max_key_length / set_tree_compact_max_key_length,
+        tree_max_delta / with_tree_max_delta / set_tree_max_delta,
+        tree_max_embedded_ln / with_tree_max_embedded_ln / set_tree_max_embedded_ln,
+        tree_min_memory / with_tree_min_memory / set_tree_min_memory,
+        verify_btree_batch_delay_ms / with_verify_btree_batch_delay_ms / set_verify_btree_batch_delay_ms,
+        verify_btree_batch_size / with_verify_btree_batch_size / set_verify_btree_batch_size,
+        verify_log_read_delay_ms / with_verify_log_read_delay_ms / set_verify_log_read_delay_ms,
+        }
+    }
 }
