@@ -1245,8 +1245,7 @@ mod tests {
         insert_and_index(&primary, &secondary, b"p9", b"b-other");
 
         let mut cursor = secondary.open_cursor(None).unwrap();
-        let (mut k, mut pk, mut d) =
-            (DatabaseEntry::new(), DatabaseEntry::new(), DatabaseEntry::new());
+        let (mut pk, mut d) = (DatabaseEntry::new(), DatabaseEntry::new());
         let search = DatabaseEntry::from_bytes(b"a");
         assert_eq!(
             cursor.get_search_key(&search, &mut pk, &mut d).unwrap(),
@@ -1255,7 +1254,7 @@ mod tests {
 
         let mut in_set = 1;
         loop {
-            k = DatabaseEntry::new();
+            let mut k = DatabaseEntry::new();
             pk = DatabaseEntry::new();
             d = DatabaseEntry::new();
             match cursor.get_next_dup_full(&mut k, &mut pk, &mut d).unwrap() {
