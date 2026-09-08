@@ -5520,4 +5520,208 @@ mod tests {
             OperationStatus::Success
         );
     }
+
+    // ── log-manager-wired cursors: real slot LSNs ────────────────────────
+    //
+    // Without a LogManager every LN write returns the NULL LSN, so a large part
+    // of the write path is short-circuited: the `old_lsn == NULL` /
+    // `new_lsn == NULL` branches that decide which LSN to lock, whether an undo
+    // record is recorded, and whether the slot's LSN is updated. Those are the
+    // branches that make rollback and lock identity work, and no in-crate test
+    // reached them.
+    //
+    // These wire a real LogManager over a temp dir so slot LSNs are real.
+
+    fn logged_cursor(
+        dir: &tempfile::TempDir,
+        id: i64,
+    ) -> (CursorImpl, Arc<crate::EnvironmentImpl>) {
+        let env = Arc::new(
+            crate::EnvironmentImpl::new(dir.path(), false, true).unwrap(),
+        );
+        let lm = env.get_log_manager().expect("txnal env has a LogManager");
+        let mut cfg = DatabaseConfig::new();
+        cfg.set_allow_create(true);
+        let db = env.open_database("logged", &cfg).unwrap();
+        (CursorImpl::with_log_manager(db, id, lm), env)
+    }
+
+    /// A write through a real LogManager must produce a REAL slot LSN, and
+    /// distinct records must get distinct LSNs. The lock manager keys on the
+    /// slot LSN, so two records sharing one would let a lock on either block
+    /// both.
+    #[test]
+    fn logged_writes_get_distinct_non_null_slot_lsns() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (mut cur, _env) = logged_cursor(&dir, 900);
+
+        cur.put(b"a", b"1", PutMode::Overwrite).unwrap();
+        cur.search(b"a", None, SearchMode::Set).unwrap();
+        let lsn_a = cur.get_current_lsn();
+        assert_ne!(
+            lsn_a,
+            noxu_util::NULL_LSN.as_u64(),
+            "a logged write must produce a real slot LSN"
+        );
+
+        cur.put(b"b", b"2", PutMode::Overwrite).unwrap();
+        cur.search(b"b", None, SearchMode::Set).unwrap();
+        let lsn_b = cur.get_current_lsn();
+        assert_ne!(lsn_b, noxu_util::NULL_LSN.as_u64());
+        assert_ne!(
+            lsn_a, lsn_b,
+            "two records must not share a slot LSN, or a lock on either \
+             would block both"
+        );
+    }
+
+    /// Overwriting a key must MOVE its slot LSN forward: the new LN is at a new
+    /// log position, and the slot must point at it. A slot left pointing at the
+    /// old LSN would make a later read fetch the superseded value from the log.
+    #[test]
+    fn overwriting_a_key_advances_its_slot_lsn() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (mut cur, _env) = logged_cursor(&dir, 901);
+
+        cur.put(b"k", b"first", PutMode::Overwrite).unwrap();
+        cur.search(b"k", None, SearchMode::Set).unwrap();
+        let first = cur.get_current_lsn();
+
+        cur.put(b"k", b"second", PutMode::Overwrite).unwrap();
+        cur.search(b"k", None, SearchMode::Set).unwrap();
+        let second = cur.get_current_lsn();
+
+        assert_ne!(
+            first, second,
+            "the slot must point at the NEW LN, or a read would fetch the \
+             superseded value"
+        );
+        let (_k, d) = cur.get_current().unwrap();
+        assert_eq!(
+            &d[..],
+            b"second",
+            "and the current data must be the new one"
+        );
+    }
+
+    /// A TTL put through a real log manager must both log the LN and stamp the
+    /// slot. Combining the two matters: the expiration is applied after the
+    /// tree insert, so a reordering would stamp a slot that does not exist yet.
+    #[test]
+    fn a_logged_ttl_put_stamps_the_slot_and_still_logs_the_ln() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (mut cur, _env) = logged_cursor(&dir, 902);
+
+        cur.put_with_expiration(b"ttl", b"v", PutMode::Overwrite, 7).unwrap();
+        cur.search(b"ttl", None, SearchMode::Set).unwrap();
+        assert_ne!(
+            cur.get_current_lsn(),
+            noxu_util::NULL_LSN.as_u64(),
+            "the TTL put must still have logged its LN"
+        );
+
+        let db = cur.get_database();
+        let expiry = {
+            let guard = db.read();
+            let tree = guard.get_real_tree().unwrap();
+            let mut found = None;
+            for node in tree.rebuild_in_list() {
+                let n = node.read();
+                if let noxu_tree::tree::TreeNode::Bottom(bin) = &*n {
+                    for i in 0..bin.entries.len() {
+                        if bin.get_full_key(i).as_deref() == Some(&b"ttl"[..]) {
+                            found = Some(bin.entries[i].expiration_time);
+                        }
+                    }
+                }
+            }
+            found
+        };
+        assert_eq!(expiry, Some(7), "and stamped the slot it just created");
+    }
+
+    /// Deleting a logged record must remove it from the tree and leave a
+    /// subsequent search reporting NotFound rather than a stale slot.
+    #[test]
+    fn deleting_a_logged_record_removes_it_from_the_tree() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (mut cur, _env) = logged_cursor(&dir, 903);
+
+        cur.put(b"gone", b"v", PutMode::Overwrite).unwrap();
+        cur.search(b"gone", None, SearchMode::Set).unwrap();
+        cur.delete().unwrap();
+
+        assert_eq!(
+            cur.search(b"gone", None, SearchMode::Set).unwrap(),
+            OperationStatus::NotFound,
+            "a deleted record must not remain searchable"
+        );
+    }
+
+    /// A scan over logged records must visit them all, in key order, with the
+    /// right data. This exercises the fetch-from-log path: the slot holds an
+    /// LSN and the data comes back out of the log rather than from an in-memory
+    /// copy.
+    #[test]
+    fn a_scan_over_logged_records_returns_each_record_data() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (mut cur, _env) = logged_cursor(&dir, 904);
+
+        for i in 0u8..8 {
+            cur.put(&[i], format!("val{i}").as_bytes(), PutMode::Overwrite)
+                .unwrap();
+        }
+
+        let mut seen = Vec::new();
+        let mut status = cur.get_first().unwrap();
+        while status == OperationStatus::Success {
+            let (k, d) = cur.get_current().unwrap();
+            seen.push((k.to_vec(), d.to_vec()));
+            status = cur.retrieve_next(GetMode::Next).unwrap();
+            assert!(seen.len() < 100, "scan did not terminate");
+        }
+
+        assert_eq!(seen.len(), 8, "the scan must visit every logged record");
+        for (i, (k, d)) in seen.iter().enumerate() {
+            assert_eq!(
+                k.as_slice(),
+                &[i as u8],
+                "keys must come back in order"
+            );
+            assert_eq!(
+                d.as_slice(),
+                format!("val{i}").as_bytes(),
+                "each record must carry its OWN data back from the log"
+            );
+        }
+    }
+
+    /// `NoOverwrite` must refuse an existing key and must NOT log a second LN
+    /// for it -- a refused put that still wrote to the log would leave a
+    /// phantom LN that recovery could replay over the original value.
+    #[test]
+    fn a_refused_no_overwrite_put_neither_changes_the_value_nor_the_slot() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (mut cur, _env) = logged_cursor(&dir, 905);
+
+        cur.put(b"k", b"original", PutMode::NoOverwrite).unwrap();
+        cur.search(b"k", None, SearchMode::Set).unwrap();
+        let lsn_before = cur.get_current_lsn();
+
+        assert_eq!(
+            cur.put(b"k", b"replacement", PutMode::NoOverwrite).unwrap(),
+            OperationStatus::KeyExist,
+            "NoOverwrite must report KeyExist for an existing key"
+        );
+
+        cur.search(b"k", None, SearchMode::Set).unwrap();
+        assert_eq!(
+            cur.get_current_lsn(),
+            lsn_before,
+            "a refused put must not move the slot LSN -- a phantom LN could \
+             be replayed over the original value by recovery"
+        );
+        let (_k, d) = cur.get_current().unwrap();
+        assert_eq!(&d[..], b"original");
+    }
 }
