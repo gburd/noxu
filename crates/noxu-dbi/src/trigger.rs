@@ -139,3 +139,153 @@ pub trait Trigger: Send + Sync {
     /// JE `Trigger.removeTrigger(Transaction)`.
     fn remove_trigger(&self, _txn_id: Option<u64>) {}
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A trigger that implements ONLY the two required record-operation
+    /// methods. In JE terms this is a `Trigger` that does *not* also implement
+    /// `TransactionTrigger`, so it must have no commit/abort behaviour — the
+    /// contract the four default methods encode.
+    struct RecordOnly {
+        name: String,
+        calls: AtomicUsize,
+    }
+
+    impl Trigger for RecordOnly {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn put(
+            &self,
+            _txn_id: Option<u64>,
+            _key: &[u8],
+            _old: Option<&[u8]>,
+            _new: &[u8],
+        ) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+        }
+        fn delete(&self, _txn_id: Option<u64>, _key: &[u8], _old: &[u8]) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// The four lifecycle/transaction methods default to no-ops. Two things
+    /// must hold and neither is free: they must not panic (a
+    /// `todo!()`/`unimplemented!()` default would turn every commit of a
+    /// database carrying a record-only trigger into a crash), and they must not
+    /// forward into `put`/`delete` (which would fabricate record events out of
+    /// transaction events).
+    #[test]
+    fn unimplemented_lifecycle_methods_are_no_ops_not_panics_or_forwards() {
+        let t = RecordOnly {
+            name: "record-only".to_string(),
+            calls: AtomicUsize::new(0),
+        };
+
+        t.commit(7);
+        t.abort(7);
+        t.add_trigger(Some(7));
+        t.add_trigger(None);
+        t.remove_trigger(Some(7));
+        t.remove_trigger(None);
+
+        assert_eq!(
+            t.calls.load(Ordering::SeqCst),
+            0,
+            "the default lifecycle methods must not fire put/delete"
+        );
+
+        // The record methods still work — the defaults did not shadow them.
+        t.put(Some(7), b"k", None, b"v");
+        t.delete(Some(7), b"k", b"v");
+        assert_eq!(t.calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// The same must hold through a trait object, which is how the engine
+    /// actually holds triggers (`Vec<Arc<dyn Trigger>>` on `DatabaseImpl`). A
+    /// default method reached through the vtable is a distinct dispatch path
+    /// from one reached on the concrete type.
+    #[test]
+    fn defaults_are_reachable_through_a_trait_object() {
+        let t: Arc<dyn Trigger> = Arc::new(RecordOnly {
+            name: "boxed".to_string(),
+            calls: AtomicUsize::new(0),
+        });
+        assert_eq!(t.name(), "boxed");
+        t.add_trigger(None);
+        t.commit(1);
+        t.abort(1);
+        t.remove_trigger(None);
+    }
+
+    /// A trigger that DOES override the transaction methods must have its own
+    /// versions called, not the defaults — otherwise the default-no-op design
+    /// would silently swallow real `TransactionTrigger` implementations.
+    #[test]
+    fn an_overriding_trigger_gets_its_own_lifecycle_methods() {
+        struct Full {
+            committed: AtomicUsize,
+            aborted: AtomicUsize,
+            added: AtomicUsize,
+            removed: AtomicUsize,
+        }
+        impl Trigger for Full {
+            fn name(&self) -> &str {
+                "full"
+            }
+            fn put(
+                &self,
+                _t: Option<u64>,
+                _k: &[u8],
+                _o: Option<&[u8]>,
+                _n: &[u8],
+            ) {
+            }
+            fn delete(&self, _t: Option<u64>, _k: &[u8], _o: &[u8]) {}
+            fn commit(&self, _txn_id: u64) {
+                self.committed.fetch_add(1, Ordering::SeqCst);
+            }
+            fn abort(&self, _txn_id: u64) {
+                self.aborted.fetch_add(1, Ordering::SeqCst);
+            }
+            fn add_trigger(&self, _txn_id: Option<u64>) {
+                self.added.fetch_add(1, Ordering::SeqCst);
+            }
+            fn remove_trigger(&self, _txn_id: Option<u64>) {
+                self.removed.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let t: Arc<dyn Trigger> = Arc::new(Full {
+            committed: AtomicUsize::new(0),
+            aborted: AtomicUsize::new(0),
+            added: AtomicUsize::new(0),
+            removed: AtomicUsize::new(0),
+        });
+        t.add_trigger(Some(1));
+        t.commit(1);
+        t.abort(2);
+        t.remove_trigger(Some(1));
+
+        // Downcast-free check: re-read through a concrete handle.
+        let concrete = Arc::new(Full {
+            committed: AtomicUsize::new(0),
+            aborted: AtomicUsize::new(0),
+            added: AtomicUsize::new(0),
+            removed: AtomicUsize::new(0),
+        });
+        concrete.add_trigger(Some(1));
+        concrete.commit(1);
+        concrete.commit(2);
+        concrete.abort(3);
+        concrete.remove_trigger(None);
+        assert_eq!(concrete.added.load(Ordering::SeqCst), 1);
+        assert_eq!(concrete.committed.load(Ordering::SeqCst), 2);
+        assert_eq!(concrete.aborted.load(Ordering::SeqCst), 1);
+        assert_eq!(concrete.removed.load(Ordering::SeqCst), 1);
+    }
+}
