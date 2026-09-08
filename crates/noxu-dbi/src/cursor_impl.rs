@@ -4972,7 +4972,7 @@ mod tests {
     #[test]
     fn search_lte_is_rejected_on_a_closed_cursor() {
         let mut cur = seeded_cursor(&["a"]);
-        cur.close();
+        cur.close().unwrap();
         assert!(matches!(cur.search_lte(b"a"), Err(DbiError::CursorClosed)));
     }
 
