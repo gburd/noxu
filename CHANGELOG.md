@@ -157,6 +157,62 @@ listed in [References](#references).
 
 ### Testing
 
+- **`noxu-sync` vs `parking_lot` A/B measured on a dedicated 64-vCPU box; the
+  custom `RwLock` is recommended for retirement.** Answers the external
+  review's "publish the numbers or retire it" on the futex-based sync layer.
+  Two new benches in `crates/noxu-sync/benches/`: `sync_vs_parking_lot.rs`
+  (criterion; both sides written once, generic over `lock_api::RawMutex` /
+  `RawRwLock` and monomorphised per impl inside the same wrapper) and
+  `sync_fairness.rs` (fixed-window throughput **and** fairness — per-thread
+  acquisition distribution plus a single-victim tail-latency probe, because a
+  barging lock buys throughput *with* unfairness and the two must be quoted
+  together). `criterion` + `parking_lot` are dev-dependencies only; the
+  shipped dependency graph is unchanged.
+
+  Headline finding is a correctness issue, not a performance one:
+  `noxu_sync::RwLock` admits **unbounded writer starvation**. With >= 7
+  continuous readers a writer receives essentially zero service (1–385
+  acquisitions in a 3 s window, max wait == the entire window) where
+  `parking_lot` serves ~1 M writes with a sub-millisecond worst case —
+  `lock_exclusive_slow` only CASes when `state == 0` and nothing blocks
+  incoming readers, so the condition is never satisfiable under a reader
+  stream (`raw_rwlock.rs` documents the design as non-fair, with bit 31
+  `WRITE_WAITING` "reserved, not currently used"). Reachable in production
+  through `noxu-dbi/db_tree.rs` (`name_to_id` / `id_to_db`) and `noxu-txn`'s
+  `all_txns`, all bare `.write()` with no timeout backstop.
+
+  Performance: **uncontended is a wash** (mutex lock cost 13.25 ns vs
+  `parking_lot`'s 11.96 ns — `parking_lot` slightly faster; validated with a
+  `no_lock` control arm and a 0/8/32 work sweep), which removes the primary
+  justification since the warm read path is overwhelmingly uncontended. The
+  contended **mutex** wins 3.6x–9.8x at >= 16 threads (and loses up to 1.6x at
+  2–8), and its tail latency is *better* than `parking_lot`'s (377 us vs
+  7.53 ms at 64 threads), so the mutex is treated separately from the rwlock.
+  The contended rwlock's read-heavy "1.9x win" is the starvation itself
+  measured as throughput.
+
+  Also recorded: the B-tree node latch — the hottest lock in the engine — is
+  **already** `parking_lot::RwLock` (`noxu-tree/src/tree.rs`), so the review's
+  "replacing parking_lot on hot paths" premise does not hold for the hottest
+  path; and `noxu-sync` has 17 production `unsafe` items of which only 3 carry
+  a `SAFETY:` comment (`futex.rs`'s two raw `libc::syscall` FFI blocks have
+  none), contradicting `AGENTS.md`'s blanket claim. Full method, per-regime
+  tables, an honest "what was NOT measured" section (no engine-level A/B — no
+  swap seam exists), and the retirement sketch:
+  `docs/src/internal/noxu-sync-vs-parking-lot-2026-09.md`. Raw output:
+  `benches/results/syncbench/`. **No code was retired or refactored in this
+  change** — the deliverable is the numbers plus a recommendation for a human
+  decision.
+
+  Two harness bugs were found and fixed before publishing, both of which had
+  favoured `noxu-sync`: per-thread op quotas let a barging lock shed contention
+  early and inflate its own throughput (the tell was `noxu-sync` appearing to
+  get *faster* from 16 to 64 threads), and the makespan fix for that then
+  deadlocked outright on the starvation above. The final driver claims work
+  from one shared chunked budget, and the biased run is retained in
+  `benches/results/syncbench/` under an explicit `-BIASED-` name so the
+  artifact signature stays on the record.
+
 - The shuttle DST gate (`crates/noxu-rep/tests/shuttle_rep_sync.rs`) gains two
   `CommitFreezeLatch` interleaving models: **freeze-blocks-commit** (a replay
   thread's `await_thaw` never reports an election thaw before the event for the
