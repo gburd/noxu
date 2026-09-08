@@ -762,4 +762,54 @@ mod tests {
         assert_eq!(protector.get_protection_count(7), 1);
         assert!(protector.is_protected(7));
     }
+
+    /// `DbiError` is not `Clone` (it wraps `io::Error` and other non-Clone
+    /// sources), but `next_entry` must LATCH a producer error and return it on
+    /// every subsequent call. `clone_dbi_err` is what makes that possible, by
+    /// flattening any error into a `Clone`-able `OperationFailed`.
+    ///
+    /// The contract worth pinning is that flattening does not lose the
+    /// diagnostic: a scan that fails on an I/O error and then reports a bare
+    /// "operation failed" would leave the caller with nothing to act on.
+    #[test]
+    fn clone_dbi_err_flattens_every_error_without_losing_the_diagnostic() {
+        // OperationFailed passes through with its message intact.
+        let e = clone_dbi_err(&DbiError::OperationFailed("boom".to_string()));
+        assert!(matches!(&e, DbiError::OperationFailed(s) if s == "boom"));
+
+        // An I/O error becomes OperationFailed but must still name the cause
+        // AND say it came from the producer, since that is the only clue the
+        // caller gets about which thread failed.
+        let io = DbiError::IoError(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "short read",
+        ));
+        let e = clone_dbi_err(&io);
+        match &e {
+            DbiError::OperationFailed(s) => {
+                assert!(s.contains("short read"), "lost the cause: {s}");
+                assert!(
+                    s.contains("producer"),
+                    "must attribute the failure to the producer thread: {s}"
+                );
+            }
+            other => panic!("expected OperationFailed, got {other:?}"),
+        }
+
+        // Any other variant is flattened the same way, still carrying its
+        // Display text.
+        let e = clone_dbi_err(&DbiError::CursorClosed);
+        match &e {
+            DbiError::OperationFailed(s) => {
+                assert!(s.contains("cursor closed"), "lost the cause: {s}");
+                assert!(s.contains("producer"), "{s}");
+            }
+            other => panic!("expected OperationFailed, got {other:?}"),
+        }
+
+        // And the result must genuinely be re-cloneable, which is the whole
+        // reason this function exists: the latch re-clones on every call.
+        let again = clone_dbi_err(&e);
+        assert_eq!(again.to_string(), e.to_string());
+    }
 }

@@ -207,4 +207,151 @@ mod tests {
         assert_eq!(ReplicaAckPolicyKind::None.required_acks(0), 0);
         assert_eq!(ReplicaAckPolicyKind::None.required_acks(100), 0);
     }
+
+    /// A coordinator that implements ONLY the required method. The three VLSN
+    /// methods default to "no VLSN" (0 = NULL_VLSN), which is the documented
+    /// non-replicated behaviour -- `Environment::write_txn_commit_for_recovered`
+    /// calls them unconditionally, so a default that panicked or returned a
+    /// bogus non-zero VLSN would break XA recovery on every non-replicated
+    /// environment.
+    struct NonReplicated;
+
+    impl ReplicaAckCoordinator for NonReplicated {
+        fn await_replica_acks(
+            &self,
+            _policy: ReplicaAckPolicyKind,
+            _timeout: Duration,
+        ) -> std::result::Result<u32, AckWaitError> {
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn vlsn_defaults_report_null_vlsn_for_a_non_replicated_coordinator() {
+        let c = NonReplicated;
+        assert_eq!(
+            c.alloc_vlsn_for_recovered_commit(noxu_util::Lsn::new(1, 1)),
+            0,
+            "0 is NULL_VLSN: a non-replicated env allocates no VLSN"
+        );
+        assert_eq!(c.pre_alloc_vlsn_for_recovered_commit(), 0);
+        // The register half must be a silent no-op, not a panic -- XA recovery
+        // calls it after every recovered commit.
+        c.register_recovered_commit_vlsn(0, noxu_util::Lsn::new(1, 1));
+        c.register_recovered_commit_vlsn(42, noxu_util::Lsn::new(9, 9));
+    }
+
+    /// The same through a trait object, which is how `noxu-db::Environment`
+    /// actually holds the coordinator (`Option<Arc<dyn ReplicaAckCoordinator>>`).
+    #[test]
+    fn vlsn_defaults_are_reachable_through_a_trait_object() {
+        let c: SharedReplicaAckCoordinator = Arc::new(NonReplicated);
+        assert_eq!(c.pre_alloc_vlsn_for_recovered_commit(), 0);
+        assert_eq!(
+            c.alloc_vlsn_for_recovered_commit(noxu_util::Lsn::new(2, 2)),
+            0
+        );
+        c.register_recovered_commit_vlsn(0, noxu_util::Lsn::new(2, 2));
+    }
+
+    /// An overriding coordinator must get ITS versions, not the defaults --
+    /// otherwise a replicated environment's VLSN assignment would be silently
+    /// swallowed and its commits would never reach a feeder.
+    #[test]
+    fn an_overriding_coordinator_gets_its_own_vlsn_methods() {
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        struct Replicated {
+            next: AtomicU64,
+            registered: Mutex<Vec<(u64, u64)>>,
+        }
+        impl ReplicaAckCoordinator for Replicated {
+            fn await_replica_acks(
+                &self,
+                _p: ReplicaAckPolicyKind,
+                _t: Duration,
+            ) -> std::result::Result<u32, AckWaitError> {
+                Ok(1)
+            }
+            fn pre_alloc_vlsn_for_recovered_commit(&self) -> u64 {
+                self.next.fetch_add(1, Ordering::SeqCst) + 1
+            }
+            fn register_recovered_commit_vlsn(
+                &self,
+                vlsn: u64,
+                commit_lsn: noxu_util::Lsn,
+            ) {
+                self.registered
+                    .lock()
+                    .unwrap()
+                    .push((vlsn, commit_lsn.as_u64()));
+            }
+        }
+
+        let c = Replicated {
+            next: AtomicU64::new(0),
+            registered: Mutex::new(Vec::new()),
+        };
+        // R-3 ordering: pre-allocate, write the WAL entry, then register.
+        let v1 = c.pre_alloc_vlsn_for_recovered_commit();
+        let v2 = c.pre_alloc_vlsn_for_recovered_commit();
+        assert_eq!((v1, v2), (1, 2), "VLSNs must be handed out in order");
+        assert!(v1 > 0, "a replicated env must allocate a REAL vlsn, not 0");
+
+        let lsn = noxu_util::Lsn::new(3, 7);
+        c.register_recovered_commit_vlsn(v1, lsn);
+        assert_eq!(
+            *c.registered.lock().unwrap(),
+            vec![(1, lsn.as_u64())],
+            "the override must receive the pre-allocated vlsn and its LSN"
+        );
+    }
+
+    /// `AckWaitError`'s Display is what surfaces in a
+    /// `NoxuError::InsufficientReplicas`, so it must distinguish the three
+    /// failure kinds -- an operator cannot tell a timeout from a
+    /// wrong-node commit otherwise -- and the timeout case must carry the
+    /// counts that explain it.
+    #[test]
+    fn ack_wait_error_display_distinguishes_all_three_kinds() {
+        let timeout = AckWaitError {
+            kind: AckWaitErrorKind::Timeout,
+            needed: 2,
+            received: 1,
+        }
+        .to_string();
+        assert!(timeout.contains("timeout"), "got: {timeout}");
+        assert!(
+            timeout.contains('2') && timeout.contains('1'),
+            "the timeout message must report needed and received; got: {timeout}"
+        );
+
+        let not_master = AckWaitError {
+            kind: AckWaitErrorKind::NotMaster,
+            needed: 2,
+            received: 0,
+        }
+        .to_string();
+        let shutdown = AckWaitError {
+            kind: AckWaitErrorKind::Shutdown,
+            needed: 2,
+            received: 0,
+        }
+        .to_string();
+
+        assert!(not_master.contains("non-master"), "got: {not_master}");
+        assert!(shutdown.contains("shutting down"), "got: {shutdown}");
+        assert_ne!(timeout, not_master);
+        assert_ne!(not_master, shutdown);
+        assert_ne!(timeout, shutdown);
+
+        // It must also be a real std::error::Error, since callers wrap it.
+        let e: &dyn std::error::Error = &AckWaitError {
+            kind: AckWaitErrorKind::Timeout,
+            needed: 1,
+            received: 0,
+        };
+        assert!(!e.to_string().is_empty());
+    }
 }
