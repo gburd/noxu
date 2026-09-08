@@ -112,3 +112,35 @@ So the honest distinct-symbol picture is 616 covered / 817 total, of which
   behaviour — writing such tests is exactly the tautology anti-pattern the
   48 deleted `test_copy`/`test_clone` tests were removed for. Several get
   covered incidentally by the (a) tests above anyway.
+
+## Progress (measured, same worktree)
+
+| crate | axis | baseline | after test pass |
+|---|---|---:|---:|
+| noxu-dbi | region | 81.28% | **86.03%** |
+| noxu-dbi | function | 78.25% | **86.93%** |
+| noxu-dbi | line | 78.95% | **84.37%** |
+| noxu-dbi | branch | 54.3% | **58.48%** |
+| noxu-db (`--lib`) | region | 81.1% | **88.11%** |
+| noxu-db (`--lib`) | function | 73.6% | **87.22%** |
+| noxu-db (`--lib`) | line | 77.2% | **85.52%** |
+| noxu-db (`--lib`) | branch | 59.8% | **62.93%** |
+
+Function coverage is over target on both crates. **Branch is not**, and the
+remaining branch gap is concentrated in a handful of files:
+
+| file | branches missed | branch cover |
+|---|---:|---:|
+| `noxu-db/secondary_database.rs` | 66 | 40.0% |
+| `noxu-db/environment.rs` | 54 | 69.3% |
+| `noxu-db/transaction.rs` | 42 | 47.5% |
+| `noxu-db/database.rs` | 40 | 65.5% |
+| `noxu-dbi/cursor_impl.rs` | (largest dbi gap) | 54.1% |
+| `noxu-dbi/environment_impl.rs` | | 62.7% |
+
+Note that function coverage rising faster than branch coverage is expected
+here: the tests added so far target *whole uncovered functions* (which is what
+the fn axis measures), whereas the branch axis is dominated by the
+error/conflict arms inside functions that are already called. Closing branch
+coverage needs conflict- and failure-injection tests in the secondary-index
+maintenance and transaction-resolution paths, not more entry-point tests.
