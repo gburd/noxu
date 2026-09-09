@@ -135,3 +135,4 @@
     - [noxu-dbi / noxu-db coverage gaps (2026-09)](internal/coverage-gaps-dbi-db-2026-09.md)
     - [Consolidation-array LWL deadlock (2026-09)](internal/consolidation-array-deadlock-2026-09.md)
   - [noxu-sync vs parking_lot (2026-09)](internal/noxu-sync-vs-parking-lot-2026-09.md)
+  - [BIN generation counter: measured, not adopted (2026-09)](internal/bin-generation-counter-2026-09.md)

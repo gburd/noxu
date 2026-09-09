@@ -85,7 +85,8 @@ pub type RwLockWriteGuard<'a, T> =
 /// Reader-writer lock backed by a futex.
 ///
 /// Drop-in replacement for `parking_lot::RwLock<T>`.
-/// Non-fair: new readers are not blocked by waiting writers.
+/// Writer-preferring: new readers yield to a queued writer, so writers cannot
+/// be starved by a sustained reader stream. Not FIFO-fair between writers.
 ///
 /// Additional methods beyond parking_lot:
 ///   - `is_locked_exclusive()` — true when a write lock is held

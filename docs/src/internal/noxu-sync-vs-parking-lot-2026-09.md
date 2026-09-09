@@ -1,8 +1,13 @@
 # `noxu-sync` vs `parking_lot`: publish the numbers or retire it (2026-09)
 
-**Status:** measurement complete. **Recommendation: RETIRE** the custom
-`RwLock`; retire the `Mutex` on a slower schedule or keep it behind a
-documented, narrow justification. See [Recommendation](#recommendation).
+**Status:** measurement complete; **the `RwLock` defect this document
+identified has since been FIXED, superseding the retire recommendation for it.**
+See [Update: the RwLock was fixed](#update-the-rwlock-was-fixed) at the end. The
+`Mutex` findings below stand unchanged.
+
+The original recommendation — retire the custom `RwLock`, treat the `Mutex`
+separately — is preserved verbatim below because the measurements that produced
+it are the evidence base for the fix.
 
 ## The question
 
@@ -427,3 +432,72 @@ scope here by instruction. This document is the input to that decision.
   regression test constructs the condition deterministically instead.
 - **`Condvar` was not benchmarked.** It is used by `noxu-txn`'s lock manager
   and `noxu-rep`; it would ride along with a mutex retirement.
+
+## Update: the RwLock was fixed
+
+The unbounded writer starvation documented above was the reason to retire this
+primitive. It has since been fixed rather than retired, by adding the
+writer-waiting bit whose absence this document identified as the mechanism
+(`WRITE_WAITING`, bit 31; `WRITE_LOCKED` is bit 30 and the reader count occupies
+bits 0-29, so the bit was free). A queued writer publishes it and new readers
+must respect it; it gates *admission* only, never an existing holder.
+
+Re-measured with the same probe on the same instance type (idle i4i.16xlarge,
+3-second window, 1 writer vs N readers):
+
+| readers | before: writes / max wait | after: writes / max wait | `parking_lot` |
+|---:|---:|---:|---:|
+| 3 | 8,742 / 7.91 ms | **3,080,026 / 0.04 ms** | 4,746,248 / 0.02 ms |
+| 7 | **1 / 3000.02 ms** | **852,557 / 0.02 ms** | 2,336,740 / 0.34 ms |
+| 15 | **1 / 2998.81 ms** | **237,490 / 0.03 ms** | 876,434 / 0.64 ms |
+| 63 | **1 / 2999.90 ms** | **32,359 / 0.16 ms** | 271,758 / 0.74 ms |
+
+The worst-case write wait is now *better* than `parking_lot`'s (0.02 ms vs
+0.34 ms at 7 readers), because unconditional writer preference is stronger than
+`parking_lot`'s ~0.5 ms eventual-fairness handoff.
+
+### What it cost
+
+Read-heavy throughput drops where readers may no longer barge past a queued
+writer. That is the trade being bought, not a regression:
+
+| threads | before | after | `parking_lot` |
+|---:|---:|---:|---:|
+| 8 | 18.62 Mops/s | 16.64 | 17.76 |
+| 16 | 18.56 | 15.12 | 17.61 |
+| 32 | 17.67 | **11.34** | 9.90 |
+| 64 | 13.70 | **7.98** | 4.75 |
+
+Above 32 threads the fixed lock still beats `parking_lot`, so the contended win
+that justified keeping a custom primitive survives the fix. Uncontended is
+unchanged (still a wash, with `parking_lot` a few percent ahead).
+
+### Three deadlocks on the way there
+
+The fix was not a one-line change, and every failure mode was caught by testing
+rather than by review. They are recorded because each is a trap for anyone
+touching this state machine again:
+
+1. `unlock_shared`'s last-reader test compared the *whole* state word against
+   `ONE_READER`. Once `WRITE_WAITING` was set that equality could never hold, so
+   the queued writer was never woken. Mask `READERS_MASK` first.
+2. `futex_wake(.., 1)` could hand the single wakeup to a *reader*, which re-parked
+   on seeing `WRITE_WAITING` and consumed it — stranding the writer with nobody
+   holding the lock. Readers and writers share one futex word, so both unlock
+   paths now wake all when a writer is queued.
+3. The acquiring writer reconciled `WRITE_WAITING` from a waiter count read
+   *before* its CAS; a writer leaving in that window left the gate set with no
+   writer behind it, locking every reader out permanently (observed as 32 readers
+   parked, 0 writers). Clear the gate *after* decrementing, using the
+   authoritative count.
+
+`mixed_readers_and_writers_make_progress_without_deadlock` regression-tests all
+three and carries its own watchdog, so a liveness regression fails with a
+diagnostic instead of hanging the suite. Verified non-vacuous against each bug.
+
+### What this does not change
+
+The `Mutex` analysis stands: uncontended is a wash, the contended win above 16
+threads is real, and its fairness was never the problem. The scope correction
+also stands — the hottest path in the engine (B-tree node latches) is
+`parking_lot::RwLock` and always was.
