@@ -40,6 +40,19 @@ pub fn futex_wait(
         None => std::ptr::null(),
     };
 
+    // SAFETY: a raw `SYS_futex` syscall with `FUTEX_WAIT_PRIVATE`. The
+    // arguments satisfy the kernel's contract:
+    // - `futex_word` is a live `&AtomicU32` (borrow held for this call), so the
+    //   pointer is non-null, aligned to 4 bytes, and points at 4 readable bytes
+    //   for the whole syscall. FUTEX_WAIT only ever *reads* it.
+    // - `timeout_ptr` is either null (block indefinitely) or points at
+    //   `timeout_ts`, which is a live local that outlives this call.
+    // - `FUTEX_PRIVATE_FLAG` keeps the wait process-local, so no cross-process
+    //   mapping requirements apply.
+    // The syscall cannot violate Rust aliasing: the kernel only compares the
+    // word against `expected` and parks/wakes this thread. All failure modes
+    // (EAGAIN/EINTR/ETIMEDOUT) are returned as `ret` and handled below, never
+    // as UB.
     let ret = unsafe {
         libc::syscall(
             libc::SYS_futex,
@@ -72,6 +85,19 @@ pub fn futex_wake(futex_word: &AtomicU32, count: u32) {
     const FUTEX_WAKE_PRIVATE: i32 = 128 | 1;
     // Kernel nr_wake is signed; clamp to i32::MAX to avoid sign wrap.
     let nr_wake = count.min(i32::MAX as u32) as i32;
+    // SAFETY: a raw `SYS_futex` syscall with `FUTEX_WAKE_PRIVATE`. The
+    // arguments satisfy the kernel's contract:
+    // - `futex_word` is a live `&AtomicU32` (borrow held for this call), so the
+    //   pointer is non-null, aligned to 4 bytes, and points at 4 readable bytes
+    //   for the whole syscall. FUTEX_WAKE only *reads* it to locate the wait
+    //   queue; it never writes through the pointer.
+    // - `nr_wake` is clamped to `i32::MAX` above, so it cannot sign-wrap into a
+    //   negative count (which the kernel would treat as "wake one").
+    // - The timeout/uaddr2 arguments are unused by FUTEX_WAKE and passed as
+    //   null, and `FUTEX_PRIVATE_FLAG` keeps the wake process-local.
+    // Waking is idempotent and cannot fail in a way that affects memory safety:
+    // a spurious or lost wake is a liveness concern the callers handle with a
+    // predicate re-check, never UB. The return value is intentionally ignored.
     unsafe {
         libc::syscall(
             libc::SYS_futex,

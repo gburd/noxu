@@ -58,6 +58,16 @@ pub struct NoxuRawMutex {
     pub(crate) owner: AtomicU64,
 }
 
+// SAFETY: `lock_api::RawMutex` requires that this type provide genuine mutual
+// exclusion, so that `lock_api` may hand out `&mut T` to the single holder.
+//
+// That holds here: acquisition succeeds only by compare-exchanging the `state`
+// word from UNLOCKED to a locked value, so at most one thread can hold the lock
+// at a time; `unlock` stores UNLOCKED with Release and wakes a waiter, and
+// acquisition uses Acquire, giving the happens-before edges `lock_api` relies on
+// to make the guarded data's writes visible to the next holder. Waiters park in
+// `futex_wait` on the same word and always re-check the predicate on wake, so a
+// spurious or lost wake is a liveness concern, never a lost exclusion.
 unsafe impl lock_api::RawMutex for NoxuRawMutex {
     /// Const-initializer, needed for embedding `NoxuRawMutex` directly in
     /// structs (e.g., `LogBuffer`) without heap allocation.
