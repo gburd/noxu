@@ -82,8 +82,22 @@ const READERS_MASK: u32 = WRITE_LOCKED - 1;
 ///
 /// Implements `lock_api::RawRwLock` and `lock_api::RawRwLockTimed`.
 pub struct NoxuRawRwLock {
-    /// Combined state: reader count (bits 0–29) | WRITE_LOCKED (bit 30).
+    /// Combined state: reader count (bits 0-29) | WRITE_LOCKED (bit 30) |
+    /// WRITE_WAITING (bit 31).
     pub(crate) state: AtomicU32,
+    /// Dedicated futex word for blocked WRITERS.
+    ///
+    /// Writers park here rather than on `state`, so a release can wake exactly
+    /// ONE writer. On a shared word that is unsound: the single wakeup may land
+    /// on a reader which re-parks and swallows it, stranding the writer -- so a
+    /// shared word forces `futex_wake(ALL)` and a thundering herd on every
+    /// transition.
+    ///
+    /// The value is a generation counter bumped on every notification. A writer
+    /// samples it BEFORE testing `state` and passes the sample to `futex_wait`,
+    /// so a release landing between the test and the park has already moved the
+    /// counter and the wait returns immediately instead of sleeping through it.
+    write_futex: AtomicU32,
     /// Number of reader threads sleeping in futex_wait.
     read_waiters: AtomicUsize,
     /// Number of writer threads sleeping in futex_wait.
@@ -112,6 +126,7 @@ pub struct NoxuRawRwLock {
 unsafe impl lock_api::RawRwLock for NoxuRawRwLock {
     const INIT: Self = NoxuRawRwLock {
         state: AtomicU32::new(0),
+        write_futex: AtomicU32::new(0),
         read_waiters: AtomicUsize::new(0),
         write_waiters: AtomicUsize::new(0),
         exclusive_owner: AtomicU64::new(0),
@@ -145,14 +160,9 @@ unsafe impl lock_api::RawRwLock for NoxuRawRwLock {
         if prev & READERS_MASK == ONE_READER
             && self.write_waiters.load(Ordering::Relaxed) > 0
         {
-            // Wake ALL waiters, not one. Readers and writers park on the SAME
-            // futex word, so a single wake can land on a reader -- which, seeing
-            // WRITE_WAITING set, immediately re-parks and CONSUMES the wakeup,
-            // leaving the writer asleep with nobody holding the lock. Waking all
-            // guarantees the writer is among them; the readers that wake merely
-            // re-park. The herd is bounded to this one transition (last reader
-            // out with a writer queued), not the steady-state path.
-            futex_wake(&self.state, i32::MAX as u32);
+            // Last reader out with a writer queued: hand off to ONE writer on
+            // the dedicated writer word.
+            self.notify_one_writer();
         }
     }
 
@@ -208,15 +218,13 @@ unsafe impl lock_api::RawRwLock for NoxuRawRwLock {
         // fetch_and keeps whatever WRITE_WAITING state the queue currently has.
         self.state.fetch_and(!WRITE_LOCKED & !READERS_MASK, Ordering::Release);
 
-        // Wake writers first (reduce write starvation), then readers.
-        //
-        // Wake ALL when a writer is queued, for the same reason as
-        // `unlock_shared`: readers and writers share one futex word, so a
-        // single wake can be consumed by a reader that re-parks on seeing
-        // WRITE_WAITING, stranding the writer. Waking all guarantees the writer
-        // is included; superfluous readers just re-park.
+        // Hand off to ONE writer if any are queued, else release the readers.
+        // Writers park on their own word, so a targeted wake cannot be swallowed
+        // by a reader. Readers still share `state` and are woken as a group,
+        // which is right for them -- they all proceed concurrently, so no wakeup
+        // is wasted.
         if self.write_waiters.load(Ordering::Relaxed) > 0 {
-            futex_wake(&self.state, i32::MAX as u32);
+            self.notify_one_writer();
         } else if self.read_waiters.load(Ordering::Relaxed) > 0 {
             // i32::MAX as u32 — kernel nr_wake is signed; u32::MAX wraps to -1.
             futex_wake(&self.state, i32::MAX as u32);
@@ -383,6 +391,17 @@ impl NoxuRawRwLock {
         }
     }
 
+    /// Wake exactly ONE blocked writer.
+    ///
+    /// Bumps the generation counter first (so a writer that sampled the previous
+    /// value cannot park on a condition that has already passed), then wakes a
+    /// single waiter from the dedicated writer word.
+    #[inline]
+    fn notify_one_writer(&self) {
+        self.write_futex.fetch_add(1, Ordering::Release);
+        futex_wake(&self.write_futex, 1);
+    }
+
     /// A writer that just ACQUIRED stops being a waiter; reconcile the gate.
     ///
     /// If nobody is queued behind us, `WRITE_WAITING` must be cleared: a gate
@@ -478,6 +497,10 @@ impl NoxuRawRwLock {
                 }
             }
 
+            // Sample the writer generation BEFORE testing `state`; see
+            // `write_futex`. Reading it after the test would reopen the
+            // lost-wakeup window this ordering exists to close.
+            let seen_gen = self.write_futex.load(Ordering::Acquire);
             let state = self.state.load(Ordering::Relaxed);
 
             // Acquirable when no readers hold it and no writer owns it. Our own
@@ -539,7 +562,7 @@ impl NoxuRawRwLock {
                 })
             };
 
-            futex_wait(&self.state, state, timeout);
+            futex_wait(&self.write_futex, seen_gen, timeout);
 
             if deadline.map(|dl| Instant::now() >= dl).unwrap_or(false) {
                 self.give_up_waiting();
