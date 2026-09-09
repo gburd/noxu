@@ -15,6 +15,8 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+## [7.7.0] - 2026-09-09
+
 ### Changed
 
 - **BREAKING: `parking_lot` is removed from every shipped Noxu crate.**
