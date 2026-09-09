@@ -52,6 +52,166 @@ listed in [References](#references).
   malformed-header rejections. Several were validated by planting the bug they
   claim to catch and confirming the test fails.
 
+- **`noxu-sync` vs `parking_lot` A/B measured on a dedicated 64-vCPU box; the
+  custom `RwLock` is recommended for retirement.** Answers the external
+  review's "publish the numbers or retire it" on the futex-based sync layer.
+  Two new benches in `crates/noxu-sync/benches/`: `sync_vs_parking_lot.rs`
+  (criterion; both sides written once, generic over `lock_api::RawMutex` /
+  `RawRwLock` and monomorphised per impl inside the same wrapper) and
+  `sync_fairness.rs` (fixed-window throughput **and** fairness — per-thread
+  acquisition distribution plus a single-victim tail-latency probe, because a
+  barging lock buys throughput *with* unfairness and the two must be quoted
+  together). `criterion` + `parking_lot` are dev-dependencies only; the
+  shipped dependency graph is unchanged.
+
+  Headline finding is a correctness issue, not a performance one:
+  `noxu_sync::RwLock` admits **unbounded writer starvation**. With >= 7
+  continuous readers a writer receives essentially zero service (1–385
+  acquisitions in a 3 s window, max wait == the entire window) where
+  `parking_lot` serves ~1 M writes with a sub-millisecond worst case —
+  `lock_exclusive_slow` only CASes when `state == 0` and nothing blocks
+  incoming readers, so the condition is never satisfiable under a reader
+  stream (`raw_rwlock.rs` documents the design as non-fair, with bit 31
+  `WRITE_WAITING` "reserved, not currently used"). Reachable in production
+  through `noxu-dbi/db_tree.rs` (`name_to_id` / `id_to_db`) and `noxu-txn`'s
+  `all_txns`, all bare `.write()` with no timeout backstop.
+
+  Performance: **uncontended is a wash** (mutex lock cost 13.25 ns vs
+  `parking_lot`'s 11.96 ns — `parking_lot` slightly faster; validated with a
+  `no_lock` control arm and a 0/8/32 work sweep), which removes the primary
+  justification since the warm read path is overwhelmingly uncontended. The
+  contended **mutex** wins 3.6x–9.8x at >= 16 threads (and loses up to 1.6x at
+  2–8), and its tail latency is *better* than `parking_lot`'s (377 us vs
+  7.53 ms at 64 threads), so the mutex is treated separately from the rwlock.
+  The contended rwlock's read-heavy "1.9x win" is the starvation itself
+  measured as throughput.
+
+  Also recorded: the B-tree node latch — the hottest lock in the engine — is
+  **already** `parking_lot::RwLock` (`noxu-tree/src/tree.rs`), so the review's
+  "replacing parking_lot on hot paths" premise does not hold for the hottest
+  path; and `noxu-sync` has 17 production `unsafe` items of which only 3 carry
+  a `SAFETY:` comment (`futex.rs`'s two raw `libc::syscall` FFI blocks have
+  none), contradicting `AGENTS.md`'s blanket claim. Full method, per-regime
+  tables, an honest "what was NOT measured" section (no engine-level A/B — no
+  swap seam exists), and the retirement sketch:
+  `docs/src/internal/noxu-sync-vs-parking-lot-2026-09.md`. Raw output:
+  `benches/results/syncbench/`. **No code was retired or refactored in this
+  change** — the deliverable is the numbers plus a recommendation for a human
+  decision.
+
+  Two harness bugs were found and fixed before publishing, both of which had
+  favoured `noxu-sync`: per-thread op quotas let a barging lock shed contention
+  early and inflate its own throughput (the tell was `noxu-sync` appearing to
+  get *faster* from 16 to 64 threads), and the makespan fix for that then
+  deadlocked outright on the starvation above. The final driver claims work
+  from one shared chunked budget, and the biased run is retained in
+  `benches/results/syncbench/` under an explicit `-BIASED-` name so the
+  artifact signature stays on the record.
+
+- **`crates/noxu-sync/tests/rwlock_writer_starvation.rs`: three deterministic
+  characterisation tests pinning the writer-starvation property.** The
+  load-based probe that discovered it is not portably reproducible — emergent
+  starvation needs readers to genuinely overlap, which needs free cores (the
+  same probe yields ~1e6x reader:writer on an idle 64-vCPU box but only 19x on
+  a loaded 8-core one), so these construct the condition by explicit handoff
+  instead: a pending writer failing to block a new reader, a hand-over-hand
+  reader chain in which each reader acquires *before* its predecessor releases
+  (holding the reader count >= 1 at every instant by construction, on any core
+  count), and a single-non-overlapping-reader control that isolates overlap as
+  the cause. Verified non-vacuous against `parking_lot::RawRwLock`, which
+  refuses the incoming reader at iteration 0 and lets its writer through — so
+  both assertions fail against a writer-preferring lock rather than passing
+  for the wrong reason. These assert *current documented* behaviour, not
+  desired behaviour: if the starvation is ever fixed they fail loudly and name
+  the other three places to update.
+
+- The shuttle DST gate (`crates/noxu-rep/tests/shuttle_rep_sync.rs`) gains two
+  `CommitFreezeLatch` interleaving models: **freeze-blocks-commit** (a replay
+  thread's `await_thaw` never reports an election thaw before the event for the
+  frozen round was delivered, and a stale round's event never lifts a newer
+  round's freeze) and **no-lost-thaw** (one event releases every waiter). The
+  latch's mutex/condvar now route through the existing `noxu_util::dst_sync_pl`
+  seam so shuttle can schedule them; under the default cfg the seam is a
+  transparent `noxu_sync` re-export, so production is unchanged.
+- New `crates/noxu-rep/tests/syncup_matchpoint_rollback_test.rs`: a two-node
+  master/replica pair with live environments, bound dispatchers, and
+  deliberately divergent log layouts runs a real `SYNCUP` handshake over TCP.
+  Asserts both outcomes and the safety invariant — a provisional divergent
+  tail is discarded and the replica then converges on the master's history
+  with matching record fingerprints at every VLSN; a tail containing an
+  already-applied non-transactional LN is refused with the log and VLSN index
+  left byte-identical; and in both cases every VLSN at or below the negotiated
+  matchpoint survives untouched. Also pins `negotiate_syncup` as content-blind
+  (it reports `CanServe` for the very same diverged replica) so the range
+  check cannot be mistaken for sufficient again.
+
+
+- **Found a real `noxu-evictor` bug on the DEFAULT path while measuring
+  coverage** and recorded it as an `#[ignore]`d, deterministic reproducer,
+  `evictor::tests::test_node_in_primary_and_pri2_is_not_double_added_to_pri2`.
+  The `MoveDirtyToPri2` arm of `evict_batch` calls `pri2.add_front(node_id)`
+  unconditionally, while every sibling `primary_policy` path (and the
+  `pri2_insert_for_test` helper) guards with `contains` first. It relies on "a
+  node drained from the primary policy is never already in pri2", which is
+  false: `note_ins_added` inserts into `primary_policy` without consulting
+  pri2, and `noxu-tree` calls it on BIN repopulation and on split, so a node
+  parked in pri2 awaiting a checkpoint that is re-faulted lands in both lists.
+  `decide_eviction`'s `already_in_pri2` argument is really `from_pri2` ("which
+  list did this candidate come from"), so it does not catch the case. Result:
+  `SlabList::add_front`'s `debug_assert!(!self.index.contains_key(&id))` fires
+  in debug, and in **release the assert is compiled out and the intrusive list
+  silently corrupts** (orphaned slot, `len` over-counts, prev/next can cycle).
+  Surfaced as a `cargo llvm-cov -p noxu-db` failure in
+  `read_only_workload_rss_stays_bounded` (panic at `slab.rs:129` after 886s);
+  it passes uninstrumented, so instrumentation merely widens the window. The
+  new test sets the two-list state up directly rather than racing into it and
+  reproduces the identical panic in 0.00s. Left `#[ignore]`d (not fixed)
+  pending a decision; the fix is a `contains` guard on that arm. Note the
+  existing `evicting` single-flight guard does not cover this — it prevents two
+  concurrent batches, whereas this is one batch double-adding a node that two
+  code paths put in two lists. Analysis in
+  [the coverage baseline](docs/src/internal/coverage-baseline-2026-09.md).
+- **Measured `noxu-log` and `noxu-dbi` coverage for the first time**, and
+  recorded the whole core-crate picture in
+  [the coverage baseline](docs/src/internal/coverage-baseline-2026-09.md).
+  `noxu-log` is at 92.48% region / 91.50% function / 91.37% line (`--lib`
+  scope); `noxu-dbi` is at 81.28% / 78.15% / 78.97%, making it the **only**
+  core data-path crate below the 85% target (the gap is concentrated in
+  `environment_impl.rs` at 58% function coverage). The previously recorded
+  claim that `noxu-log` "cannot be measured locally, needs EC2" was wrong: the
+  runs were not slow, they were wedged on a deadlocking test (see above).
+- `#[ignore]`d `noxu-log`'s
+  `test_consolidation_array_stress_64t_prev_offset_chain`, which deadlocks
+  rather than merely running slowly, and so hung `cargo test` / `cargo
+  llvm-cov` for the whole crate indefinitely (observed livelocked >21h at ~200%
+  CPU). Ignored rather than deleted: it is a correct reproducer of a real
+  production bug and should be un-ignored when the fix lands. `noxu-log --lib`
+  now completes in ~4.7s (492 passed, 2 ignored).
+- Added `noxu-log`'s
+  `test_on_disk_corruption_is_never_returned_as_valid_data`, closing a real
+  gap: nothing asserted that a byte flipped **on disk after a successful
+  write** is rejected on read. Part 1 flips a payload byte, which passes every
+  structural check (length/type/flags still parse) so the per-entry CRC32 is
+  the only thing preventing silent corruption — exactly the branch the checksum
+  exists for. Part 2 drives the same through `faultdisk`'s
+  `FaultKind::Corruption`, previously the only fault kind with no end-to-end
+  coverage (`TornWrite` is covered by `noxu-db`'s `dst_crash_sweep`,
+  `DiskFull` by `test_real_write_error_invalidates_and_is_not_swallowed`;
+  `Corruption` was only unit-tested at the `on_write` *decision* level, never
+  through `posio` → disk → read). Also asserts that a failed checksum on READ
+  does not set `io_invalid`, per the C-2 fail-stop stance that only write/fsync
+  errors invalidate the log.
+
+- Removed 48 tautological `test_copy`/`test_clone`-style tests (e.g.
+  `let x2 = x1; assert_eq!(x1, x2)`) across 30 `src/*.rs` files in
+  `noxu-cleaner`, `noxu-db`, `noxu-engine`, `noxu-evictor`, `noxu-log`,
+  `noxu-persist`, `noxu-recovery`, `noxu-rep`, `noxu-tree`, and `noxu-txn`.
+  These only re-asserted what `#[derive(Copy, Clone, PartialEq)]` already
+  guarantees at compile time and carried no behavioral coverage. Tests that
+  exercised a manual `Clone`/copy-style method (e.g. `copy_all_info`,
+  `copy_write_lock_info`) or checked additional real behavior alongside the
+  copy were left in place.
+
 ### Fixed
 
 - **`Environment::invalidate()` did not invalidate open `Database` handles.**
@@ -223,168 +383,6 @@ listed in [References](#references).
   classic mutex LWL (always the default) is now the only write path.
 
   The group-commit / `FsyncManager` piggyback machinery is untouched.
-
-### Testing
-
-- **`noxu-sync` vs `parking_lot` A/B measured on a dedicated 64-vCPU box; the
-  custom `RwLock` is recommended for retirement.** Answers the external
-  review's "publish the numbers or retire it" on the futex-based sync layer.
-  Two new benches in `crates/noxu-sync/benches/`: `sync_vs_parking_lot.rs`
-  (criterion; both sides written once, generic over `lock_api::RawMutex` /
-  `RawRwLock` and monomorphised per impl inside the same wrapper) and
-  `sync_fairness.rs` (fixed-window throughput **and** fairness — per-thread
-  acquisition distribution plus a single-victim tail-latency probe, because a
-  barging lock buys throughput *with* unfairness and the two must be quoted
-  together). `criterion` + `parking_lot` are dev-dependencies only; the
-  shipped dependency graph is unchanged.
-
-  Headline finding is a correctness issue, not a performance one:
-  `noxu_sync::RwLock` admits **unbounded writer starvation**. With >= 7
-  continuous readers a writer receives essentially zero service (1–385
-  acquisitions in a 3 s window, max wait == the entire window) where
-  `parking_lot` serves ~1 M writes with a sub-millisecond worst case —
-  `lock_exclusive_slow` only CASes when `state == 0` and nothing blocks
-  incoming readers, so the condition is never satisfiable under a reader
-  stream (`raw_rwlock.rs` documents the design as non-fair, with bit 31
-  `WRITE_WAITING` "reserved, not currently used"). Reachable in production
-  through `noxu-dbi/db_tree.rs` (`name_to_id` / `id_to_db`) and `noxu-txn`'s
-  `all_txns`, all bare `.write()` with no timeout backstop.
-
-  Performance: **uncontended is a wash** (mutex lock cost 13.25 ns vs
-  `parking_lot`'s 11.96 ns — `parking_lot` slightly faster; validated with a
-  `no_lock` control arm and a 0/8/32 work sweep), which removes the primary
-  justification since the warm read path is overwhelmingly uncontended. The
-  contended **mutex** wins 3.6x–9.8x at >= 16 threads (and loses up to 1.6x at
-  2–8), and its tail latency is *better* than `parking_lot`'s (377 us vs
-  7.53 ms at 64 threads), so the mutex is treated separately from the rwlock.
-  The contended rwlock's read-heavy "1.9x win" is the starvation itself
-  measured as throughput.
-
-  Also recorded: the B-tree node latch — the hottest lock in the engine — is
-  **already** `parking_lot::RwLock` (`noxu-tree/src/tree.rs`), so the review's
-  "replacing parking_lot on hot paths" premise does not hold for the hottest
-  path; and `noxu-sync` has 17 production `unsafe` items of which only 3 carry
-  a `SAFETY:` comment (`futex.rs`'s two raw `libc::syscall` FFI blocks have
-  none), contradicting `AGENTS.md`'s blanket claim. Full method, per-regime
-  tables, an honest "what was NOT measured" section (no engine-level A/B — no
-  swap seam exists), and the retirement sketch:
-  `docs/src/internal/noxu-sync-vs-parking-lot-2026-09.md`. Raw output:
-  `benches/results/syncbench/`. **No code was retired or refactored in this
-  change** — the deliverable is the numbers plus a recommendation for a human
-  decision.
-
-  Two harness bugs were found and fixed before publishing, both of which had
-  favoured `noxu-sync`: per-thread op quotas let a barging lock shed contention
-  early and inflate its own throughput (the tell was `noxu-sync` appearing to
-  get *faster* from 16 to 64 threads), and the makespan fix for that then
-  deadlocked outright on the starvation above. The final driver claims work
-  from one shared chunked budget, and the biased run is retained in
-  `benches/results/syncbench/` under an explicit `-BIASED-` name so the
-  artifact signature stays on the record.
-
-- **`crates/noxu-sync/tests/rwlock_writer_starvation.rs`: three deterministic
-  characterisation tests pinning the writer-starvation property.** The
-  load-based probe that discovered it is not portably reproducible — emergent
-  starvation needs readers to genuinely overlap, which needs free cores (the
-  same probe yields ~1e6x reader:writer on an idle 64-vCPU box but only 19x on
-  a loaded 8-core one), so these construct the condition by explicit handoff
-  instead: a pending writer failing to block a new reader, a hand-over-hand
-  reader chain in which each reader acquires *before* its predecessor releases
-  (holding the reader count >= 1 at every instant by construction, on any core
-  count), and a single-non-overlapping-reader control that isolates overlap as
-  the cause. Verified non-vacuous against `parking_lot::RawRwLock`, which
-  refuses the incoming reader at iteration 0 and lets its writer through — so
-  both assertions fail against a writer-preferring lock rather than passing
-  for the wrong reason. These assert *current documented* behaviour, not
-  desired behaviour: if the starvation is ever fixed they fail loudly and name
-  the other three places to update.
-
-- The shuttle DST gate (`crates/noxu-rep/tests/shuttle_rep_sync.rs`) gains two
-  `CommitFreezeLatch` interleaving models: **freeze-blocks-commit** (a replay
-  thread's `await_thaw` never reports an election thaw before the event for the
-  frozen round was delivered, and a stale round's event never lifts a newer
-  round's freeze) and **no-lost-thaw** (one event releases every waiter). The
-  latch's mutex/condvar now route through the existing `noxu_util::dst_sync_pl`
-  seam so shuttle can schedule them; under the default cfg the seam is a
-  transparent `noxu_sync` re-export, so production is unchanged.
-- New `crates/noxu-rep/tests/syncup_matchpoint_rollback_test.rs`: a two-node
-  master/replica pair with live environments, bound dispatchers, and
-  deliberately divergent log layouts runs a real `SYNCUP` handshake over TCP.
-  Asserts both outcomes and the safety invariant — a provisional divergent
-  tail is discarded and the replica then converges on the master's history
-  with matching record fingerprints at every VLSN; a tail containing an
-  already-applied non-transactional LN is refused with the log and VLSN index
-  left byte-identical; and in both cases every VLSN at or below the negotiated
-  matchpoint survives untouched. Also pins `negotiate_syncup` as content-blind
-  (it reports `CanServe` for the very same diverged replica) so the range
-  check cannot be mistaken for sufficient again.
-
-
-- **Found a real `noxu-evictor` bug on the DEFAULT path while measuring
-  coverage** and recorded it as an `#[ignore]`d, deterministic reproducer,
-  `evictor::tests::test_node_in_primary_and_pri2_is_not_double_added_to_pri2`.
-  The `MoveDirtyToPri2` arm of `evict_batch` calls `pri2.add_front(node_id)`
-  unconditionally, while every sibling `primary_policy` path (and the
-  `pri2_insert_for_test` helper) guards with `contains` first. It relies on "a
-  node drained from the primary policy is never already in pri2", which is
-  false: `note_ins_added` inserts into `primary_policy` without consulting
-  pri2, and `noxu-tree` calls it on BIN repopulation and on split, so a node
-  parked in pri2 awaiting a checkpoint that is re-faulted lands in both lists.
-  `decide_eviction`'s `already_in_pri2` argument is really `from_pri2` ("which
-  list did this candidate come from"), so it does not catch the case. Result:
-  `SlabList::add_front`'s `debug_assert!(!self.index.contains_key(&id))` fires
-  in debug, and in **release the assert is compiled out and the intrusive list
-  silently corrupts** (orphaned slot, `len` over-counts, prev/next can cycle).
-  Surfaced as a `cargo llvm-cov -p noxu-db` failure in
-  `read_only_workload_rss_stays_bounded` (panic at `slab.rs:129` after 886s);
-  it passes uninstrumented, so instrumentation merely widens the window. The
-  new test sets the two-list state up directly rather than racing into it and
-  reproduces the identical panic in 0.00s. Left `#[ignore]`d (not fixed)
-  pending a decision; the fix is a `contains` guard on that arm. Note the
-  existing `evicting` single-flight guard does not cover this — it prevents two
-  concurrent batches, whereas this is one batch double-adding a node that two
-  code paths put in two lists. Analysis in
-  [the coverage baseline](docs/src/internal/coverage-baseline-2026-09.md).
-- **Measured `noxu-log` and `noxu-dbi` coverage for the first time**, and
-  recorded the whole core-crate picture in
-  [the coverage baseline](docs/src/internal/coverage-baseline-2026-09.md).
-  `noxu-log` is at 92.48% region / 91.50% function / 91.37% line (`--lib`
-  scope); `noxu-dbi` is at 81.28% / 78.15% / 78.97%, making it the **only**
-  core data-path crate below the 85% target (the gap is concentrated in
-  `environment_impl.rs` at 58% function coverage). The previously recorded
-  claim that `noxu-log` "cannot be measured locally, needs EC2" was wrong: the
-  runs were not slow, they were wedged on a deadlocking test (see above).
-- `#[ignore]`d `noxu-log`'s
-  `test_consolidation_array_stress_64t_prev_offset_chain`, which deadlocks
-  rather than merely running slowly, and so hung `cargo test` / `cargo
-  llvm-cov` for the whole crate indefinitely (observed livelocked >21h at ~200%
-  CPU). Ignored rather than deleted: it is a correct reproducer of a real
-  production bug and should be un-ignored when the fix lands. `noxu-log --lib`
-  now completes in ~4.7s (492 passed, 2 ignored).
-- Added `noxu-log`'s
-  `test_on_disk_corruption_is_never_returned_as_valid_data`, closing a real
-  gap: nothing asserted that a byte flipped **on disk after a successful
-  write** is rejected on read. Part 1 flips a payload byte, which passes every
-  structural check (length/type/flags still parse) so the per-entry CRC32 is
-  the only thing preventing silent corruption — exactly the branch the checksum
-  exists for. Part 2 drives the same through `faultdisk`'s
-  `FaultKind::Corruption`, previously the only fault kind with no end-to-end
-  coverage (`TornWrite` is covered by `noxu-db`'s `dst_crash_sweep`,
-  `DiskFull` by `test_real_write_error_invalidates_and_is_not_swallowed`;
-  `Corruption` was only unit-tested at the `on_write` *decision* level, never
-  through `posio` → disk → read). Also asserts that a failed checksum on READ
-  does not set `io_invalid`, per the C-2 fail-stop stance that only write/fsync
-  errors invalidate the log.
-
-- Removed 48 tautological `test_copy`/`test_clone`-style tests (e.g.
-  `let x2 = x1; assert_eq!(x1, x2)`) across 30 `src/*.rs` files in
-  `noxu-cleaner`, `noxu-db`, `noxu-engine`, `noxu-evictor`, `noxu-log`,
-  `noxu-persist`, `noxu-recovery`, `noxu-rep`, `noxu-tree`, and `noxu-txn`.
-  These only re-asserted what `#[derive(Copy, Clone, PartialEq)]` already
-  guarantees at compile time and carried no behavioral coverage. Tests that
-  exercised a manual `Clone`/copy-style method (e.g. `copy_all_info`,
-  `copy_write_lock_info`) or checked additional real behavior alongside the
-  copy were left in place.
 
 ### CI / Testing
 
