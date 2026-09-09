@@ -3,10 +3,19 @@
 //! State encoding (single `AtomicU32`):
 //!   bits 0-29: reader count  (ONE_READER = 1, max ~1 billion concurrent readers)
 //!   bit  30:   WRITE_LOCKED  (exclusive writer holds the lock)
-//!   bit  31:   WRITE_WAITING (reserved, not currently used — non-fair mode)
+//!   bit  31:   WRITE_WAITING (a writer is queued; new readers must yield)
 //!
-//! Non-fair design: new readers are not blocked by pending writers, which
-//! maximises read throughput.
+//! Writer-preferring design: while `WRITE_WAITING` is set, new readers are
+//! refused admission so a queued writer cannot be starved. Readers that already
+//! hold the lock are unaffected — the bit gates *admission*, not existing
+//! holders. This costs read throughput at low-to-moderate thread counts
+//! relative to letting readers barge, and buys a bounded write latency; without
+//! it a sustained reader stream starved writers indefinitely (measured at one
+//! write per three seconds above three readers). See
+//! `docs/src/internal/noxu-sync-vs-parking-lot-2026-09.md`.
+//!
+//! Writers are preferred over readers but are NOT ordered among themselves:
+//! this is writer preference, not FIFO fairness.
 //!
 //! Additional fields:
 //!   `read_waiters`  — readers blocked waiting for a write to finish
@@ -61,12 +70,10 @@ pub struct NoxuRawRwLock {
 // compare-exchange on a single atomic word with Acquire on acquisition and
 // Release on release, giving the happens-before edges `lock_api` relies on.
 //
-// NOTE (not a soundness issue, but a documented behavioural limitation): this
-// lock is deliberately non-fair and has NO writer-waiting bit, so a sustained
-// stream of readers can starve a waiting writer indefinitely. That is a
-// liveness defect, measured and documented in
-// `docs/src/internal/noxu-sync-vs-parking-lot-2026-09.md`, and it does not
-// affect the exclusion guarantees this `unsafe impl` asserts.
+// Liveness (not a soundness property, but worth stating next to the contract):
+// the lock is writer-preferring via `WRITE_WAITING`, so a reader stream cannot
+// starve a queued writer. Writers are not ordered among themselves. Neither
+// property affects the exclusion guarantees this `unsafe impl` asserts.
 unsafe impl lock_api::RawRwLock for NoxuRawRwLock {
     const INIT: Self = NoxuRawRwLock {
         state: AtomicU32::new(0),
