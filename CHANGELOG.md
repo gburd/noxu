@@ -15,6 +15,31 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+## [7.6.0] - 2026-09-09
+
+Minor release. Ships two correctness fixes in the read path, retires an
+incorrect sync primitive's recommendation, settles the last external-review
+open item with measurements, and raises the final two crates over the coverage
+mandate. The version is a **minor** bump rather than a patch because one public
+config knob was removed (see Removed) — per this project's SemVer policy,
+breaking cleanup ships as 7.x while there are no downstream users.
+
+**Highlights**
+
+- **A `READ_COMMITTED` cursor could return an aborting writer's uncommitted
+  data.** Root-caused by measurement (an initial hypothesis was falsified along
+  the way) and fixed at both affected search arms.
+- **`Database::stats(fast=false)` reported the wrong record count**, inflated by
+  every upper-IN routing slot, growing with tree height. `preload`'s
+  `lns_loaded` shared the defect.
+- **`Environment::invalidate()` did not invalidate open `Database` handles.**
+- **`noxu_sync::RwLock` starves writers unboundedly** — measured at ~6 orders of
+  magnitude, reachable in production. Documented with a RETIRE recommendation
+  and a characterization test; the primitive is not yet removed.
+- **Coverage:** `noxu-dbi` and `noxu-db` now clear >85% on region, function and
+  line. Branch coverage improved but remains below target, with the llvm-cov
+  placeholder-generic ceiling documented honestly rather than padded around.
+
 ### Fixed
 
 - **A `READ_COMMITTED` cursor could return an aborting writer's uncommitted
