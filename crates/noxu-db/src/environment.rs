@@ -1532,8 +1532,19 @@ impl Environment {
     /// `reason.invalidates_environment() == true` propagates out of a
     /// background daemon.  After invalidation `is_valid()` returns `false`
     /// and all subsequent public API calls return `EnvironmentFailure`.
+    ///
+    /// Sets BOTH invalidity flags, which is load-bearing. `Environment` keeps
+    /// its own `env_valid` bool, but every open `Database` and `Cursor` caches
+    /// `EnvironmentImpl`'s `Arc<AtomicBool>` at open time so their `check_open`
+    /// fast path never has to take `env_impl.lock()` (X-13). Setting only the
+    /// local bool would make `is_valid()` report false while already-open
+    /// `Database` handles kept serving reads and accepting writes.
     pub fn invalidate(&self) {
         self.env_valid.store(false, Ordering::Release);
+        // Propagate to the shared flag the open handles actually read.
+        self.env_impl.lock().invalidate(
+            noxu_dbi::EnvironmentFailureReason::UnexpectedStateFatal,
+        );
     }
 
     /// Returns whether the environment is transactional.

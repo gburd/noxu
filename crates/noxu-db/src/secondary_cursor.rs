@@ -1053,4 +1053,354 @@ mod tests {
             cursor.get_next(&mut sec_key, &mut p_key, &mut data).unwrap();
         assert_eq!(status, OperationStatus::NotFound);
     }
+
+    // ── traversal: the get_* family ──────────────────────────────────────
+    //
+    // Every `get_*` method funnels into `get_with_mode`, which does the
+    // three-step secondary read (secondary key -> primary key -> primary data).
+    // The existing tests cover only the two search modes; first/last/next/prev
+    // and the dup-full navigators were untested, and they are the ones a range
+    // scan is built out of.
+    //
+    // The invariant that matters throughout: EVERY successful get must return a
+    // consistent TRIPLE. A secondary cursor whose secondary key, primary key
+    // and primary data came from different records is the worst failure mode
+    // here, because each field looks individually plausible.
+
+    /// Assert the triple is self-consistent: the secondary key must be
+    /// derivable from the primary data (first byte, per `FirstByteKeyCreator`),
+    /// and the primary data must be what the primary database holds under the
+    /// returned primary key.
+    fn assert_consistent_triple(
+        primary: &Arc<Mutex<Database>>,
+        key: &DatabaseEntry,
+        p_key: &DatabaseEntry,
+        data: &DatabaseEntry,
+    ) {
+        let sec = key.data_opt().expect("secondary key must be populated");
+        let pk = p_key.data_opt().expect("primary key must be populated");
+        let d = data.data_opt().expect("primary data must be populated");
+
+        assert_eq!(
+            sec,
+            &d[..1],
+            "the secondary key must be the one the creator derives from THIS \
+             record's data, not another record's"
+        );
+        let held = primary.lock().get(pk).unwrap();
+        assert_eq!(
+            held.as_deref(),
+            Some(d),
+            "the primary data must be what the primary holds under the \
+             returned primary key"
+        );
+    }
+
+    #[test]
+    fn first_and_last_return_consistent_triples_at_both_ends() {
+        let (_t, _env, primary, secondary) = temp_env_primary_secondary();
+        for (k, v) in [
+            (&b"p1"[..], &b"aaa"[..]),
+            (&b"p2"[..], &b"bbb"[..]),
+            (&b"p3"[..], &b"ccc"[..]),
+        ] {
+            insert_and_index(&primary, &secondary, k, v);
+        }
+        let mut cursor = secondary.open_cursor(None).unwrap();
+
+        let (mut k, mut pk, mut d) =
+            (DatabaseEntry::new(), DatabaseEntry::new(), DatabaseEntry::new());
+        assert_eq!(
+            cursor.get_first(&mut k, &mut pk, &mut d).unwrap(),
+            OperationStatus::Success
+        );
+        assert_eq!(k.data_opt().unwrap(), b"a", "first secondary key is 'a'");
+        assert_consistent_triple(&primary, &k, &pk, &d);
+
+        let (mut k, mut pk, mut d) =
+            (DatabaseEntry::new(), DatabaseEntry::new(), DatabaseEntry::new());
+        assert_eq!(
+            cursor.get_last(&mut k, &mut pk, &mut d).unwrap(),
+            OperationStatus::Success
+        );
+        assert_eq!(k.data_opt().unwrap(), b"c", "last secondary key is 'c'");
+        assert_consistent_triple(&primary, &k, &pk, &d);
+    }
+
+    /// A forward scan must visit every secondary key in order and stop, with
+    /// every triple consistent. This is the composition first+next that a range
+    /// scan is built from.
+    #[test]
+    fn a_forward_scan_visits_every_record_in_secondary_key_order() {
+        let (_t, _env, primary, secondary) = temp_env_primary_secondary();
+        for (k, v) in [
+            (&b"p1"[..], &b"aaa"[..]),
+            (&b"p2"[..], &b"bbb"[..]),
+            (&b"p3"[..], &b"ccc"[..]),
+        ] {
+            insert_and_index(&primary, &secondary, k, v);
+        }
+        let mut cursor = secondary.open_cursor(None).unwrap();
+
+        let mut seen = Vec::new();
+        let (mut k, mut pk, mut d) =
+            (DatabaseEntry::new(), DatabaseEntry::new(), DatabaseEntry::new());
+        let mut status = cursor.get_first(&mut k, &mut pk, &mut d).unwrap();
+        while status == OperationStatus::Success {
+            assert_consistent_triple(&primary, &k, &pk, &d);
+            seen.push(k.data_opt().unwrap().to_vec());
+            k = DatabaseEntry::new();
+            pk = DatabaseEntry::new();
+            d = DatabaseEntry::new();
+            status = cursor.get_next(&mut k, &mut pk, &mut d).unwrap();
+            assert!(seen.len() < 100, "scan did not terminate");
+        }
+        assert_eq!(
+            seen,
+            vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()],
+            "the forward scan must visit every secondary key, in order"
+        );
+    }
+
+    /// And a backward scan must visit the same records in reverse. A `prev`
+    /// that silently behaved like `next` would pass any test that only checked
+    /// the set of records visited.
+    #[test]
+    fn a_backward_scan_visits_the_same_records_in_reverse() {
+        let (_t, _env, primary, secondary) = temp_env_primary_secondary();
+        for (k, v) in [
+            (&b"p1"[..], &b"aaa"[..]),
+            (&b"p2"[..], &b"bbb"[..]),
+            (&b"p3"[..], &b"ccc"[..]),
+        ] {
+            insert_and_index(&primary, &secondary, k, v);
+        }
+        let mut cursor = secondary.open_cursor(None).unwrap();
+
+        let mut seen = Vec::new();
+        let (mut k, mut pk, mut d) =
+            (DatabaseEntry::new(), DatabaseEntry::new(), DatabaseEntry::new());
+        let mut status = cursor.get_last(&mut k, &mut pk, &mut d).unwrap();
+        while status == OperationStatus::Success {
+            assert_consistent_triple(&primary, &k, &pk, &d);
+            seen.push(k.data_opt().unwrap().to_vec());
+            k = DatabaseEntry::new();
+            pk = DatabaseEntry::new();
+            d = DatabaseEntry::new();
+            status = cursor.get_prev(&mut k, &mut pk, &mut d).unwrap();
+            assert!(seen.len() < 100, "scan did not terminate");
+        }
+        assert_eq!(
+            seen,
+            vec![b"c".to_vec(), b"b".to_vec(), b"a".to_vec()],
+            "prev must walk backwards, not forwards"
+        );
+    }
+
+    /// `get_current` must re-emit the position without advancing, and must
+    /// report NotFound before the cursor has been positioned at all.
+    #[test]
+    fn get_current_re_emits_the_position_without_advancing() {
+        let (_t, _env, primary, secondary) = temp_env_primary_secondary();
+        insert_and_index(&primary, &secondary, b"p1", b"aaa");
+        insert_and_index(&primary, &secondary, b"p2", b"bbb");
+        let mut cursor = secondary.open_cursor(None).unwrap();
+
+        let (mut k, mut pk, mut d) =
+            (DatabaseEntry::new(), DatabaseEntry::new(), DatabaseEntry::new());
+        cursor.get_first(&mut k, &mut pk, &mut d).unwrap();
+        let at = k.data_opt().unwrap().to_vec();
+
+        for _ in 0..3 {
+            let (mut k2, mut pk2, mut d2) = (
+                DatabaseEntry::new(),
+                DatabaseEntry::new(),
+                DatabaseEntry::new(),
+            );
+            assert_eq!(
+                cursor.get_current(&mut k2, &mut pk2, &mut d2).unwrap(),
+                OperationStatus::Success
+            );
+            assert_eq!(
+                k2.data_opt().unwrap(),
+                at.as_slice(),
+                "get_current must not advance the cursor"
+            );
+            assert_consistent_triple(&primary, &k2, &pk2, &d2);
+        }
+    }
+
+    /// Two primary records sharing a secondary key are duplicates of that key.
+    /// `get_next_dup_full` must walk within the dup set and stop at its end
+    /// rather than spilling into the next secondary key -- that spill is the
+    /// natural bug, and it would make a dup scan silently return foreign
+    /// records.
+    #[test]
+    fn dup_navigation_stays_within_the_duplicate_set() {
+        let (_t, _env, primary, secondary) = temp_env_primary_secondary();
+        // Three records under secondary key "a", one under "b".
+        insert_and_index(&primary, &secondary, b"p1", b"a-one");
+        insert_and_index(&primary, &secondary, b"p2", b"a-two");
+        insert_and_index(&primary, &secondary, b"p3", b"a-three");
+        insert_and_index(&primary, &secondary, b"p9", b"b-other");
+
+        let mut cursor = secondary.open_cursor(None).unwrap();
+        let (mut pk, mut d) = (DatabaseEntry::new(), DatabaseEntry::new());
+        let search = DatabaseEntry::from_bytes(b"a");
+        assert_eq!(
+            cursor.get_search_key(&search, &mut pk, &mut d).unwrap(),
+            OperationStatus::Success
+        );
+
+        let mut in_set = 1;
+        loop {
+            let mut k = DatabaseEntry::new();
+            pk = DatabaseEntry::new();
+            d = DatabaseEntry::new();
+            match cursor.get_next_dup_full(&mut k, &mut pk, &mut d).unwrap() {
+                OperationStatus::Success => {
+                    assert_eq!(
+                        k.data_opt().unwrap(),
+                        b"a",
+                        "get_next_dup_full must not spill into the next \
+                         secondary key"
+                    );
+                    assert_consistent_triple(&primary, &k, &pk, &d);
+                    in_set += 1;
+                }
+                _ => break,
+            }
+            assert!(in_set < 20, "dup walk did not terminate");
+        }
+        assert_eq!(
+            in_set, 3,
+            "all three duplicates of 'a' must be visited, and only those"
+        );
+    }
+
+    /// The backward dup navigator must do the same, in reverse.
+    #[test]
+    fn backward_dup_navigation_also_stays_within_the_set() {
+        let (_t, _env, primary, secondary) = temp_env_primary_secondary();
+        insert_and_index(&primary, &secondary, b"p1", b"a-one");
+        insert_and_index(&primary, &secondary, b"p2", b"a-two");
+        insert_and_index(&primary, &secondary, b"z9", b"z-other");
+
+        let mut cursor = secondary.open_cursor(None).unwrap();
+        let (mut k, mut pk, mut d) =
+            (DatabaseEntry::new(), DatabaseEntry::new(), DatabaseEntry::new());
+        // Position on the first dup of "a", advance to the second, then walk
+        // back. Recording the forward path lets the backward path be checked
+        // against it rather than merely counted.
+        let search = DatabaseEntry::from_bytes(b"a");
+        cursor.get_search_key(&search, &mut pk, &mut d).unwrap();
+        let first_pk = pk.data_opt().unwrap().to_vec();
+
+        assert_eq!(
+            cursor.get_next_dup_full(&mut k, &mut pk, &mut d).unwrap(),
+            OperationStatus::Success,
+            "there are two dups of 'a', so a forward step must succeed"
+        );
+        assert_eq!(k.data_opt().unwrap(), b"a");
+        let second_pk = pk.data_opt().unwrap().to_vec();
+        assert_ne!(first_pk, second_pk, "the two dups are distinct records");
+
+        // Step back: must land on the FIRST dup again, still inside the set.
+        let (mut k2, mut pk2, mut d2) =
+            (DatabaseEntry::new(), DatabaseEntry::new(), DatabaseEntry::new());
+        assert_eq!(
+            cursor.get_prev_dup_full(&mut k2, &mut pk2, &mut d2).unwrap(),
+            OperationStatus::Success
+        );
+        assert_eq!(
+            k2.data_opt().unwrap(),
+            b"a",
+            "get_prev_dup_full must not spill out of the dup set"
+        );
+        assert_eq!(
+            pk2.data_opt().unwrap(),
+            first_pk.as_slice(),
+            "stepping back from the second dup must land on the first"
+        );
+
+        // One more step back leaves the set, so it must report NotFound rather
+        // than spilling into a lower secondary key.
+        let (mut k3, mut pk3, mut d3) =
+            (DatabaseEntry::new(), DatabaseEntry::new(), DatabaseEntry::new());
+        assert_eq!(
+            cursor.get_prev_dup_full(&mut k3, &mut pk3, &mut d3).unwrap(),
+            OperationStatus::NotFound,
+            "walking off the front of the dup set must stop, not spill"
+        );
+    }
+
+    /// A traversal on an EMPTY secondary must report NotFound from both ends
+    /// rather than erroring or returning a garbage triple.
+    ///
+    /// `get_current` is deliberately different: on an UNPOSITIONED cursor it
+    /// returns `OperationNotAllowed`, not `NotFound`. That asymmetry is worth
+    /// pinning -- "no record here" and "you never positioned me" are different
+    /// caller mistakes, and conflating them would let a caller loop forever on
+    /// `get_current` believing the database was empty.
+    #[test]
+    fn traversal_of_an_empty_secondary_reports_not_found() {
+        let (_t, _env, _primary, secondary) = temp_env_primary_secondary();
+        let mut cursor = secondary.open_cursor(None).unwrap();
+        let (mut k, mut pk, mut d) =
+            (DatabaseEntry::new(), DatabaseEntry::new(), DatabaseEntry::new());
+        assert_eq!(
+            cursor.get_first(&mut k, &mut pk, &mut d).unwrap(),
+            OperationStatus::NotFound
+        );
+        assert_eq!(
+            cursor.get_last(&mut k, &mut pk, &mut d).unwrap(),
+            OperationStatus::NotFound
+        );
+        assert!(
+            matches!(
+                cursor.get_current(&mut k, &mut pk, &mut d),
+                Err(NoxuError::OperationNotAllowed(_))
+            ),
+            "an unpositioned get_current is a caller error, distinct from \
+             an empty-database NotFound"
+        );
+    }
+
+    /// `put` on a secondary cursor must ALWAYS be refused. A secondary index is
+    /// derived state; letting a caller write into it directly would desynchronise
+    /// it from the primary with no way to detect the drift.
+    #[test]
+    fn put_through_a_secondary_cursor_is_always_refused() {
+        let (_t, _env, primary, secondary) = temp_env_primary_secondary();
+        insert_and_index(&primary, &secondary, b"p1", b"aaa");
+        let mut cursor = secondary.open_cursor(None).unwrap();
+
+        let key = DatabaseEntry::from_bytes(b"a");
+        let data = DatabaseEntry::from_bytes(b"p9");
+        assert!(matches!(
+            cursor.put(&key, &data),
+            Err(NoxuError::OperationNotAllowed(_)),
+        ));
+
+        // Even when positioned -- the refusal is unconditional.
+        let (mut k, mut pk, mut d) =
+            (DatabaseEntry::new(), DatabaseEntry::new(), DatabaseEntry::new());
+        cursor.get_first(&mut k, &mut pk, &mut d).unwrap();
+        assert!(cursor.put(&key, &data).is_err());
+    }
+
+    /// A closed secondary cursor must report itself invalid, and closing must be
+    /// tolerated more than once (the Drop glue closes too).
+    #[test]
+    fn closing_a_secondary_cursor_invalidates_it_and_is_repeatable() {
+        let (_t, _env, primary, secondary) = temp_env_primary_secondary();
+        insert_and_index(&primary, &secondary, b"p1", b"aaa");
+        let mut cursor = secondary.open_cursor(None).unwrap();
+        assert!(cursor.is_valid());
+
+        cursor.close().unwrap();
+        assert!(!cursor.is_valid());
+        cursor.close().unwrap();
+        assert!(!cursor.is_valid());
+    }
 }

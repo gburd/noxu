@@ -241,6 +241,77 @@ mod tests {
         assert_eq!(config.node_max_entries, 256);
     }
 
+    /// Triggers are the one `DatabaseConfig` field that is a growing list
+    /// rather than a scalar, and JE fires them in *registration order*, so the
+    /// order `add_trigger` produces is part of the contract, not an
+    /// implementation detail.
+    #[test]
+    fn add_trigger_preserves_registration_order_and_flows_to_database_impl() {
+        use crate::trigger::Trigger;
+        use std::sync::Arc;
+
+        struct Named(&'static str);
+        impl Trigger for Named {
+            fn name(&self) -> &str {
+                self.0
+            }
+            fn put(
+                &self,
+                _t: Option<u64>,
+                _k: &[u8],
+                _o: Option<&[u8]>,
+                _n: &[u8],
+            ) {
+            }
+            fn delete(&self, _t: Option<u64>, _k: &[u8], _o: &[u8]) {}
+        }
+
+        let mut config = DatabaseConfig::new();
+        assert!(
+            config.triggers.is_empty(),
+            "a fresh config carries no triggers"
+        );
+
+        config.add_trigger(Arc::new(Named("first")));
+        config.add_trigger(Arc::new(Named("second")));
+        config.add_trigger(Arc::new(Named("third")));
+
+        assert_eq!(
+            config.triggers.iter().map(|t| t.name()).collect::<Vec<_>>(),
+            ["first", "second", "third"],
+            "add_trigger must append, preserving registration order"
+        );
+
+        // The list must survive the hop into DatabaseImpl in the same order,
+        // and flip the has_user_triggers fast-path gate.
+        let db = crate::DatabaseImpl::new(
+            crate::DatabaseId::new(1),
+            "trig".to_string(),
+            crate::DbType::User,
+            &config,
+        );
+        assert!(
+            db.has_user_triggers(),
+            "a config with triggers must produce a DatabaseImpl that reports \
+             them, or the firing path is skipped entirely"
+        );
+        assert_eq!(
+            db.triggers().iter().map(|t| t.name()).collect::<Vec<_>>(),
+            ["first", "second", "third"]
+        );
+
+        // And the empty case must leave the gate closed, which is what makes a
+        // trigger-free database pay only an is_empty() check.
+        let plain = crate::DatabaseImpl::new(
+            crate::DatabaseId::new(2),
+            "plain".to_string(),
+            crate::DbType::User,
+            &DatabaseConfig::new(),
+        );
+        assert!(!plain.has_user_triggers());
+        assert!(plain.triggers().is_empty());
+    }
+
     #[test]
     fn test_builder_pattern() {
         let config = DatabaseConfig::new()

@@ -3386,6 +3386,514 @@ mod tests {
         assert_eq!(db1.read().reference_count(), 2);
     }
 
+    /// Insert `n` records straight into a database's tree, keeping the
+    /// entry-count counter in step, so tests can assert on truncate / compress
+    /// / stats without going through the cursor layer.
+    fn seed(env: &EnvironmentImpl, name: &str, n: u32) -> DatabaseId {
+        let mut config = DatabaseConfig::new();
+        config.set_allow_create(true);
+        let db = env.open_database(name, &config).unwrap();
+        let id = db.read().get_id();
+        {
+            let guard = db.read();
+            let tree = guard.get_real_tree_arc().unwrap();
+            let t = tree.write().unwrap();
+            for i in 0..n {
+                t.insert(
+                    format!("k{i:04}").into_bytes(),
+                    b"v".to_vec(),
+                    noxu_util::Lsn::new(1, i),
+                )
+                .unwrap();
+                guard.increment_entry_count();
+            }
+        }
+        id
+    }
+
+    /// `truncate_database` must report the count it removed AND actually leave
+    /// an empty tree behind. Reporting without emptying (or emptying without
+    /// reporting) would both pass a weaker test.
+    #[test]
+    fn truncate_database_empties_the_tree_and_reports_the_removed_count() {
+        let (_dir, env) = make_env(false);
+        let id = seed(&env, "trunc", 12);
+        env.close_database(id).unwrap();
+
+        let removed = env.truncate_database("trunc").unwrap();
+        assert_eq!(removed, 12, "must report how many records it removed");
+
+        let db = env.get_database_by_id(id).unwrap();
+        assert_eq!(
+            db.read().entry_count(),
+            0,
+            "the counter must be reset, not just the tree"
+        );
+        assert_eq!(
+            db.read().collect_btree_stats().map(|s| s.n_leaf_entries),
+            Some(0),
+            "the tree itself must be empty"
+        );
+
+        // Truncating an already-empty database is a no-op reporting 0, not an
+        // error.
+        assert_eq!(env.truncate_database("trunc").unwrap(), 0);
+    }
+
+    /// Truncate must refuse while a handle is open: it replaces the tree
+    /// wholesale, so a live cursor would be left positioned on a BIN that is no
+    /// longer reachable from the root.
+    #[test]
+    fn truncate_database_refuses_while_a_handle_is_open() {
+        let (_dir, env) = make_env(false);
+        seed(&env, "busy", 3); // leaves the handle open (refcount 1)
+
+        assert!(matches!(
+            env.truncate_database("busy"),
+            Err(DbiError::DatabaseInUse(_))
+        ));
+
+        // The data must be untouched by the refused truncate.
+        let id = *env.name_map.read().get("busy").unwrap();
+        let count = env.get_database_by_id(id).unwrap().read().entry_count();
+        assert_eq!(count, 3, "a refused truncate must not remove anything");
+    }
+
+    #[test]
+    fn truncate_database_reports_a_missing_name_rather_than_succeeding() {
+        let (_dir, env) = make_env(false);
+        assert!(matches!(
+            env.truncate_database("never-created"),
+            Err(DbiError::DatabaseNotFound(_))
+        ));
+    }
+
+    /// `get_database_by_id` / `get_all_database_impls` are the lookup pair the
+    /// verifier and the transaction-undo path walk. The contract worth pinning
+    /// is that they agree with each other and with `name_map`, and that an
+    /// unknown id is `None` rather than a panic or a wrong database.
+    #[test]
+    fn database_lookups_agree_and_reject_unknown_ids() {
+        let (_dir, env) = make_env(false);
+        let a = seed(&env, "alpha", 1);
+        let b = seed(&env, "beta", 1);
+        assert_ne!(a, b);
+
+        assert_eq!(
+            env.get_database_by_id(a).unwrap().read().get_name(),
+            "alpha"
+        );
+        assert_eq!(
+            env.get_database_by_id(b).unwrap().read().get_name(),
+            "beta"
+        );
+        assert!(
+            env.get_database_by_id(DatabaseId::new(9_999)).is_none(),
+            "an unknown id must be None, not a panic or a stray database"
+        );
+
+        let all = env.get_all_database_impls();
+        let mut names: Vec<String> =
+            all.iter().map(|d| d.read().get_name().to_string()).collect();
+        names.sort();
+        assert!(
+            names.contains(&"alpha".to_string())
+                && names.contains(&"beta".to_string()),
+            "get_all_database_impls must include every open database; \
+             got {names:?}"
+        );
+        assert_eq!(
+            all.len(),
+            env.db_map.read().len(),
+            "the snapshot must cover the whole map"
+        );
+    }
+
+    /// The throughput snapshot aggregates across every open database. An
+    /// aggregate that silently reported only one database's counters would be
+    /// invisible to a single-database test, so seed two.
+    #[test]
+    fn throughput_snapshot_aggregates_across_all_databases() {
+        let (_dir, env) = make_env(false);
+        let empty = env.get_throughput_snapshot();
+
+        let mut config = DatabaseConfig::new();
+        config.set_allow_create(true);
+        let d1 = env.open_database("t1", &config).unwrap();
+        let d2 = env.open_database("t2", &config).unwrap();
+        use std::sync::atomic::Ordering as AtomOrd;
+        d1.read().throughput.n_pri_searches.fetch_add(2, AtomOrd::Relaxed);
+        d2.read().throughput.n_pri_inserts.fetch_add(1, AtomOrd::Relaxed);
+
+        let agg = env.get_throughput_snapshot();
+        assert_eq!(
+            agg.n_pri_searches - empty.n_pri_searches,
+            2,
+            "both of db1's searches must be aggregated"
+        );
+        assert_eq!(
+            agg.n_pri_inserts - empty.n_pri_inserts,
+            1,
+            "db2's insert must be aggregated too, not just db1's counters"
+        );
+    }
+
+    /// The Wave 3-2 XA in-doubt trio: `recovered_prepared_txns` reports,
+    /// `take_recovered_prepared_lns` is destructive (the XA layer must not be
+    /// able to replay the same LNs twice), and `forget_recovered_prepared_txn`
+    /// is idempotent.
+    #[test]
+    fn recovered_prepared_txn_accessors_are_destructive_and_idempotent() {
+        let (_dir, env) = make_env(false);
+
+        // A freshly-created environment recovered nothing.
+        assert!(env.recovered_prepared_txns().is_empty());
+        assert!(env.take_recovered_prepared_lns(1).is_empty());
+        // Forgetting an unknown txn must be a no-op, not a panic.
+        env.forget_recovered_prepared_txn(1);
+
+        // Install two in-doubt txns as recovery would.
+        env.recovered_prepared_txns.lock().unwrap().extend([
+            noxu_recovery::PreparedTxnInfo {
+                txn_id: 10,
+                xid_format_id: 1,
+                xid_gtrid: vec![1, 2, 3],
+                xid_bqual: vec![9],
+                prepare_lsn: noxu_util::Lsn::new(1, 1),
+                first_lsn: noxu_util::Lsn::new(1, 1),
+                last_lsn: noxu_util::Lsn::new(1, 1),
+            },
+            noxu_recovery::PreparedTxnInfo {
+                txn_id: 20,
+                xid_format_id: 1,
+                xid_gtrid: vec![4, 5, 6],
+                xid_bqual: vec![9],
+                prepare_lsn: noxu_util::Lsn::new(1, 2),
+                first_lsn: noxu_util::Lsn::new(1, 2),
+                last_lsn: noxu_util::Lsn::new(1, 2),
+            },
+        ]);
+        env.recovered_prepared_lns.lock().unwrap().insert(
+            10,
+            vec![noxu_recovery::PreparedLnReplay {
+                db_id: 1,
+                original_lsn: noxu_util::Lsn::new(1, 1),
+                operation: noxu_recovery::PreparedLnOperation::Insert,
+                key: b"k".to_vec(),
+                data: Some(b"v".to_vec()),
+            }],
+        );
+
+        assert_eq!(env.recovered_prepared_txns().len(), 2);
+
+        // take_* must hand the list over ONCE.
+        assert_eq!(env.take_recovered_prepared_lns(10).len(), 1);
+        assert!(
+            env.take_recovered_prepared_lns(10).is_empty(),
+            "taking twice would let the XA layer replay the same LNs twice"
+        );
+
+        // forget_* removes only the named txn, and repeats harmlessly.
+        env.forget_recovered_prepared_txn(10);
+        let left = env.recovered_prepared_txns();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].txn_id, 20, "the wrong txn must not be forgotten");
+        env.forget_recovered_prepared_txn(10);
+        assert_eq!(
+            env.recovered_prepared_txns().len(),
+            1,
+            "forget is idempotent"
+        );
+    }
+
+    /// `compress_all` reports how many BINs it visited; on a database with no
+    /// known-deleted slots there is nothing to compress, so it must report 0
+    /// rather than counting every BIN in the tree.
+    #[test]
+    fn compress_all_reports_zero_when_there_is_nothing_to_compress() {
+        let (_dir, env) = make_env(false);
+        seed(&env, "nodel", 20);
+        assert_eq!(
+            env.compress_all(),
+            0,
+            "a tree with no known-deleted slots has nothing to compress"
+        );
+    }
+
+    /// Extinction scanning is idle on a fresh environment; a scan over a
+    /// database that was never created must report 0 discarded rather than
+    /// panicking or wedging the scanner active.
+    #[test]
+    fn extinction_scan_over_an_unknown_database_is_a_no_op() {
+        let (_dir, env) = make_env(false);
+        assert!(!env.is_record_extinction_active());
+        assert_eq!(env.n_lns_extinct(), 0);
+
+        let discarded =
+            env.discard_extinct_records("no-such-db", b"a".to_vec(), None);
+        assert_eq!(discarded, 0);
+        assert!(
+            !env.is_record_extinction_active(),
+            "the scanner must not be left active after a no-op scan"
+        );
+    }
+
+    /// `relog_live_catalog` re-persists the name->id catalog. It must be safe
+    /// to call repeatedly (the checkpoint path does) and must leave every
+    /// database still resolvable by name afterwards.
+    #[test]
+    fn relog_live_catalog_is_repeatable_and_preserves_the_catalog() {
+        let (_dir, env) = make_env(false);
+        seed(&env, "cat1", 2);
+        seed(&env, "cat2", 2);
+        let mut before = env.get_database_names();
+        env.relog_live_catalog();
+        env.relog_live_catalog();
+
+        let mut after = env.get_database_names();
+        before.sort();
+        after.sort();
+        assert!(!before.is_empty(), "the seeded databases must be catalogued");
+        assert_eq!(after, before);
+    }
+
+    /// The disk-limit tracker is inert unless a limit is configured, so
+    /// `refresh_disk_limit` on a default environment must not report a
+    /// violation (which would block every user write).
+    #[test]
+    fn refresh_disk_limit_does_not_invent_a_violation_when_unconfigured() {
+        let (_dir, env) = make_env(false);
+        env.refresh_disk_limit();
+        assert!(
+            !env.get_disk_limit().is_violated(),
+            "an environment with no MAX_DISK/FREE_DISK must never report a \
+             violation - that would block all user writes"
+        );
+    }
+
+    /// The evictor algorithm name is what stats and monitoring report. Note
+    /// the case asymmetry, which is deliberate but easy to trip over: config
+    /// ACCEPTS the lowercase `"lru"` (`DbiEnvConfig::evictor_algorithm`) while
+    /// this reports the display form `"LRU"`. Pinned so a caller comparing the
+    /// two directly finds out here rather than in a monitoring dashboard.
+    #[test]
+    fn evictor_algorithm_name_reports_the_display_form_of_the_policy() {
+        let (_dir, env) = make_env(false);
+        assert_eq!(
+            env.evictor_algorithm_name(),
+            "LRU",
+            "the default policy is LRU (JE-faithful), reported in display case"
+        );
+    }
+
+    /// `remove_database` and `rename_database` share three refusal
+    /// conditions, each of which protects a different invariant. All three
+    /// were untested for both operations.
+    #[test]
+    fn remove_and_rename_refuse_a_name_that_does_not_exist() {
+        let (_dir, env) = make_env(false);
+        assert!(matches!(
+            env.remove_database("ghost"),
+            Err(DbiError::DatabaseNotFound(_))
+        ));
+        assert!(matches!(
+            env.rename_database("ghost", "phantom"),
+            Err(DbiError::DatabaseNotFound(_))
+        ));
+    }
+
+    /// Both refuse while a handle is open, and -- the part worth asserting --
+    /// a refused operation must leave the catalog untouched. A rename that
+    /// removed the old name before noticing the conflict would strand the
+    /// database under no name at all.
+    #[test]
+    fn remove_and_rename_refuse_open_handles_without_disturbing_the_catalog() {
+        let (_dir, env) = make_env(false);
+        seed(&env, "live", 2); // handle stays open
+
+        assert!(matches!(
+            env.remove_database("live"),
+            Err(DbiError::DatabaseInUse(_))
+        ));
+        assert!(matches!(
+            env.rename_database("live", "moved"),
+            Err(DbiError::DatabaseInUse(_))
+        ));
+
+        let names = env.get_database_names();
+        assert!(
+            names.contains(&"live".to_string()),
+            "a refused operation must leave the name in place; got {names:?}"
+        );
+        assert!(
+            !names.contains(&"moved".to_string()),
+            "a refused rename must not create the target name"
+        );
+    }
+
+    /// Renaming onto an occupied name must be refused, or the two databases
+    /// would collide in `name_map` and one would become unreachable.
+    #[test]
+    fn rename_refuses_to_overwrite_an_existing_name() {
+        let (_dir, env) = make_env(false);
+        let a = seed(&env, "src", 1);
+        let b = seed(&env, "dst", 1);
+        env.close_database(a).unwrap();
+        env.close_database(b).unwrap();
+
+        assert!(matches!(
+            env.rename_database("src", "dst"),
+            Err(DbiError::DatabaseAlreadyExists(_))
+        ));
+
+        // Both names must survive the refusal, still pointing at their own
+        // databases.
+        assert_eq!(env.get_database_by_id(a).unwrap().read().get_name(), "src");
+        assert_eq!(*env.name_map.read().get("src").unwrap(), a);
+        assert_eq!(*env.name_map.read().get("dst").unwrap(), b);
+    }
+
+    /// A successful rename must move the name and free the old one, keeping
+    /// the same database id (the point of rename versus remove+create).
+    #[test]
+    fn rename_moves_the_name_and_keeps_the_database_id() {
+        let (_dir, env) = make_env(false);
+        let id = seed(&env, "before", 3);
+        env.close_database(id).unwrap();
+
+        env.rename_database("before", "after").unwrap();
+
+        assert!(env.name_map.read().get("before").is_none());
+        assert_eq!(*env.name_map.read().get("after").unwrap(), id);
+        assert_eq!(
+            env.get_database_by_id(id).unwrap().read().entry_count(),
+            3,
+            "rename must not touch the data"
+        );
+    }
+
+    /// Every public operation must refuse once the environment is invalidated,
+    /// and the reported error must name the reason -- an operator who only
+    /// sees "not open" cannot tell a clean close from a corruption halt.
+    #[test]
+    fn an_invalidated_environment_refuses_operations_and_reports_the_reason() {
+        let (_dir, env) = make_env(false);
+        let flag = env.is_invalid_flag();
+        assert!(!flag.load(Ordering::Relaxed), "a fresh env is valid");
+        assert!(env.is_valid());
+
+        env.invalidate(EnvironmentFailureReason::LogChecksum);
+
+        assert!(
+            flag.load(Ordering::Relaxed),
+            "is_invalid_flag hands out the LIVE flag, not a snapshot - \
+             Database/CursorImpl cache it to avoid locking on every op"
+        );
+        assert!(!env.is_valid());
+        assert!(matches!(env.get_state(), EnvState::Invalid));
+
+        match env.check_open() {
+            Err(DbiError::EnvironmentFailure { reason }) => assert!(
+                reason.contains("LogChecksum"),
+                "the failure must name its reason; got {reason:?}"
+            ),
+            other => panic!("expected EnvironmentFailure, got {other:?}"),
+        }
+
+        // And the invalidation must take precedence over every entry point,
+        // not just check_open.
+        assert!(env.truncate_database("anything").is_err());
+        assert!(env.remove_database("anything").is_err());
+        assert!(env.rename_database("a", "b").is_err());
+    }
+
+    /// `get_creation_time` stamps the environment at open. It must be a real
+    /// wall-clock time, not zero -- it is what monitoring reports as env age.
+    #[test]
+    fn creation_time_is_a_real_timestamp_and_stable_across_reads() {
+        let (_dir, env) = make_env(false);
+        let t = env.get_creation_time();
+        assert!(t > 0, "creation time must be stamped, not left at 0");
+        assert_eq!(
+            t,
+            env.get_creation_time(),
+            "creation time must not drift between reads"
+        );
+    }
+
+    /// The cleaner-owned handles must be present exactly when the cleaner is:
+    /// a read-only environment has none, and asking for them must yield `None`
+    /// rather than panicking. A DiskOrderedCursor relies on
+    /// `get_file_protector` to keep the cleaner from deleting files mid-scan,
+    /// so a spurious `None` on a writable env would silently drop that
+    /// protection.
+    #[test]
+    fn cleaner_owned_handles_track_whether_a_cleaner_exists() {
+        let (_dir, rw) = make_env(false);
+        assert_eq!(
+            rw.get_cleaner_throttle().is_some(),
+            rw.get_file_protector().is_some(),
+            "the throttle and the file protector are both cleaner-owned, so \
+             they must appear and disappear together"
+        );
+
+        let (_dir2, ro) = make_env(true);
+        assert!(
+            ro.get_cleaner_throttle().is_none(),
+            "a read-only environment runs no cleaner, so there is no throttle"
+        );
+        assert!(ro.get_file_protector().is_none());
+        assert!(
+            ro.get_checkpointer().is_none(),
+            "nor a checkpointer, for the same reason"
+        );
+    }
+
+    /// The DOS producer queue timeout is passed straight through to the
+    /// producer thread, so a zero here would turn every enqueue into an
+    /// immediate scan failure. Assert the default is the configured non-zero
+    /// value.
+    #[test]
+    fn dos_producer_queue_timeout_is_non_zero_by_default() {
+        let (_dir, env) = make_env(false);
+        assert!(
+            env.get_dos_producer_queue_timeout_ms() > 0,
+            "a zero DOS enqueue timeout would fail every scan immediately"
+        );
+    }
+
+    /// Critical eviction is a no-op when the cache is nowhere near its budget,
+    /// so a fresh environment must report 0 bytes evicted rather than evicting
+    /// speculatively (which would defeat the cache).
+    #[test]
+    fn critical_eviction_does_nothing_on_an_empty_cache() {
+        let (_dir, env) = make_env(false);
+        assert_eq!(
+            env.critical_eviction(),
+            0,
+            "an empty cache is not critically over budget"
+        );
+    }
+
+    /// The memory budget and node sequence are the environment's shared
+    /// accounting handles. Assert they are wired to real state rather than
+    /// fresh defaults: the node sequence must hand out strictly increasing
+    /// ids, since duplicate node ids would corrupt the tree's identity map.
+    #[test]
+    fn node_sequence_hands_out_strictly_increasing_ids() {
+        let (_dir, env) = make_env(false);
+        let seq = env.get_node_sequence();
+        let a = seq.get_next_local_node_id();
+        let b = seq.get_next_local_node_id();
+        let c = seq.get_next_local_node_id();
+        assert!(a < b && b < c, "node ids must strictly increase: {a} {b} {c}");
+
+        assert!(
+            env.get_memory_budget().max_memory() > 0,
+            "the memory budget must be sized, or the evictor has no target"
+        );
+    }
+
     #[test]
     fn test_remove_database() {
         let (_dir, env) = make_env(false);

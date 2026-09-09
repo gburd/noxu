@@ -449,4 +449,185 @@ mod tests {
         assert!(c.keys_only);
         assert!(c.dedup_keys);
     }
+
+    /// `next` / `current` / `close` form a small state machine that the
+    /// integration suite exercises for its happy path but never for its
+    /// closed-handle and not-yet-advanced arms. Those arms matter: a closed
+    /// cursor's producer thread has been joined, so reading through it would be
+    /// reading a dead channel, and `current` before the first `next` has
+    /// nothing to re-emit.
+    fn dos_env()
+    -> (tempfile::TempDir, crate::environment::Environment, Database) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let env = crate::environment::Environment::open(
+            crate::environment_config::EnvironmentConfig::new(
+                dir.path().to_path_buf(),
+            )
+            .with_allow_create(true)
+            .with_transactional(true),
+        )
+        .unwrap();
+        let db = env
+            .open_database(
+                None,
+                "dos",
+                &crate::database_config::DatabaseConfig::new()
+                    .with_allow_create(true)
+                    .with_transactional(true),
+            )
+            .unwrap();
+        for i in 0u8..6 {
+            db.put([i], b"v").unwrap();
+        }
+        (dir, env, db)
+    }
+
+    /// `current` before the first `next` must report NotFound, not the first
+    /// record and not an error -- there is genuinely nothing to re-emit yet.
+    #[test]
+    fn current_before_any_next_reports_not_found() {
+        let (_d, _env, db) = dos_env();
+        let cursor = db
+            .open_disk_ordered_cursor(DiskOrderedCursorConfig::new())
+            .unwrap();
+
+        let mut k = DatabaseEntry::new();
+        let mut v = DatabaseEntry::new();
+        assert_eq!(
+            cursor.current(&mut k, &mut v).unwrap(),
+            OperationStatus::NotFound
+        );
+        assert!(k.data_opt().is_none_or(|d| d.is_empty()));
+    }
+
+    /// `current` must re-emit the last `next` WITHOUT advancing, and must keep
+    /// doing so across repeated calls. A `current` that advanced would silently
+    /// drop records for any caller that peeked.
+    #[test]
+    fn current_re_emits_the_last_record_without_advancing() {
+        let (_d, _env, db) = dos_env();
+        let mut cursor = db
+            .open_disk_ordered_cursor(DiskOrderedCursorConfig::new())
+            .unwrap();
+
+        let mut k = DatabaseEntry::new();
+        let mut v = DatabaseEntry::new();
+        assert_eq!(
+            cursor.next(&mut k, &mut v).unwrap(),
+            OperationStatus::Success
+        );
+        let first = k.data_opt().unwrap().to_vec();
+
+        for _ in 0..3 {
+            let mut ck = DatabaseEntry::new();
+            let mut cv = DatabaseEntry::new();
+            assert_eq!(
+                cursor.current(&mut ck, &mut cv).unwrap(),
+                OperationStatus::Success
+            );
+            assert_eq!(
+                ck.data_opt().unwrap(),
+                first.as_slice(),
+                "current must not advance"
+            );
+        }
+
+        // And the next `next` still moves on from the same place.
+        let mut nk = DatabaseEntry::new();
+        let mut nv = DatabaseEntry::new();
+        assert_eq!(
+            cursor.next(&mut nk, &mut nv).unwrap(),
+            OperationStatus::Success
+        );
+        assert_ne!(nk.data_opt().unwrap(), first.as_slice());
+    }
+
+    /// A drained cursor must keep reporting NotFound, idempotently. The
+    /// producer thread has finished; re-reading must not error and must not
+    /// wrap around to the start.
+    #[test]
+    fn a_drained_cursor_keeps_reporting_not_found() {
+        let (_d, _env, db) = dos_env();
+        let mut cursor = db
+            .open_disk_ordered_cursor(DiskOrderedCursorConfig::new())
+            .unwrap();
+
+        let mut n = 0;
+        loop {
+            let mut k = DatabaseEntry::new();
+            let mut v = DatabaseEntry::new();
+            match cursor.next(&mut k, &mut v).unwrap() {
+                OperationStatus::Success => n += 1,
+                _ => break,
+            }
+            assert!(n < 1000, "scan did not terminate");
+        }
+        assert!(n > 0, "the scan must have yielded the seeded records");
+
+        for _ in 0..3 {
+            let mut k = DatabaseEntry::new();
+            let mut v = DatabaseEntry::new();
+            assert_eq!(
+                cursor.next(&mut k, &mut v).unwrap(),
+                OperationStatus::NotFound,
+                "a drained cursor must stay drained, not wrap around"
+            );
+        }
+    }
+
+    /// Every operation on a CLOSED cursor must fail with `CursorClosed`. The
+    /// producer thread has been joined by then, so reading through it would be
+    /// reading a dead channel.
+    #[test]
+    fn a_closed_cursor_refuses_next_and_current() {
+        let (_d, _env, db) = dos_env();
+        let mut cursor = db
+            .open_disk_ordered_cursor(DiskOrderedCursorConfig::new())
+            .unwrap();
+
+        let mut k = DatabaseEntry::new();
+        let mut v = DatabaseEntry::new();
+        cursor.next(&mut k, &mut v).unwrap();
+
+        cursor.close_in_place().unwrap();
+
+        assert!(matches!(
+            cursor.next(&mut k, &mut v),
+            Err(NoxuError::CursorClosed)
+        ));
+        assert!(matches!(
+            cursor.current(&mut k, &mut v),
+            Err(NoxuError::CursorClosed)
+        ));
+    }
+
+    /// `close` is documented idempotent, and it has to be: `Drop` also closes,
+    /// so an explicit `close` followed by the drop glue must not double-join
+    /// the producer thread.
+    #[test]
+    fn close_is_idempotent_so_drop_can_close_again() {
+        let (_d, _env, db) = dos_env();
+        let mut cursor = db
+            .open_disk_ordered_cursor(DiskOrderedCursorConfig::new())
+            .unwrap();
+        cursor.close_in_place().unwrap();
+        cursor.close_in_place().unwrap();
+        cursor.close_in_place().unwrap();
+        // Dropping now runs close_in_place a fourth time.
+    }
+
+    /// A disk-ordered cursor must be openable on a CLOSED database only if the
+    /// database is still open -- the scan reads the log through the database's
+    /// environment, so a closed handle has to be refused up front rather than
+    /// producing an empty scan a caller would read as "no data".
+    #[test]
+    fn opening_a_disk_ordered_cursor_on_a_closed_database_is_refused() {
+        let (_d, _env, db) = dos_env();
+        db.close().unwrap();
+        assert!(
+            db.open_disk_ordered_cursor(DiskOrderedCursorConfig::new())
+                .is_err(),
+            "an empty scan would be read as 'no data' rather than 'closed'"
+        );
+    }
 }

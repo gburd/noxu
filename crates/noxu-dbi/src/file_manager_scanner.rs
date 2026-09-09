@@ -1405,4 +1405,174 @@ mod tests {
         // Garbage is truncated.
         assert_eq!(fm.get_file_length(0).unwrap(), valid_len);
     }
+
+    // ── parse_entry_from_bytes: a parser on untrusted disk bytes ──────────
+    //
+    // Recovery hands this function raw file contents. Every rejection arm is a
+    // guard against a specific hostile or damaged shape, and the ONLY safe
+    // answer for all of them is `None` -- which the scanner loop treats as
+    // end-of-valid-log. Returning a parsed entry from any of these shapes
+    // injects garbage into the recovered B-tree; panicking aborts recovery
+    // entirely. The CRC arm has a regression test; none of the header-validity
+    // arms did.
+    //
+    // These build headers by hand because that is the only way to reach the
+    // arms: the log writer cannot produce a truncated or over-large header.
+
+    /// Header layout used below (little-endian):
+    ///   [0..4]   checksum (0 = "not computed", skips CRC validation)
+    ///   [4]      entry type   (0 = zero-filled region)
+    ///   [5]      flags        (0x08 / 0x20 = VLSN present)
+    ///   [10..14] item size
+    fn header(entry_type: u8, flags: u8, item_size: u32) -> Vec<u8> {
+        let mut h = vec![0u8; MIN_HEADER_SIZE];
+        h[4] = entry_type;
+        h[5] = flags;
+        h[10..14].copy_from_slice(&item_size.to_le_bytes());
+        h
+    }
+
+    #[test]
+    fn a_buffer_too_short_for_a_header_is_declined() {
+        for len in 0..MIN_HEADER_SIZE {
+            let bytes = Bytes::from(vec![0xAAu8; len]);
+            assert!(
+                FileManagerLogScanner::parse_entry_from_bytes(&bytes, 0)
+                    .is_none(),
+                "a {len}-byte buffer cannot hold a {MIN_HEADER_SIZE}-byte \
+                 header and must be declined, not read past its end"
+            );
+        }
+    }
+
+    /// A zero entry-type byte marks the region past the last write. Preallocated
+    /// log files are zero-filled, so this arm is what stops recovery walking off
+    /// the end of real data into the zeros and inventing entries from them.
+    #[test]
+    fn a_zero_filled_region_terminates_the_scan() {
+        let bytes = Bytes::from(vec![0u8; MIN_HEADER_SIZE * 4]);
+        assert!(
+            FileManagerLogScanner::parse_entry_from_bytes(&bytes, 0).is_none(),
+            "zero-filled preallocated space must read as end-of-log"
+        );
+
+        // A valid-looking header FOLLOWED by zeros must also stop at the zeros,
+        // not keep going.
+        let mut buf = header(1, 0, 0);
+        buf.extend(std::iter::repeat_n(0u8, MIN_HEADER_SIZE));
+        let bytes = Bytes::from(buf);
+        assert!(
+            FileManagerLogScanner::parse_entry_from_bytes(
+                &bytes,
+                MIN_HEADER_SIZE
+            )
+            .is_none()
+        );
+    }
+
+    /// An absurd item size -- the classic corrupted-length shape -- must be
+    /// declined rather than used to slice.
+    ///
+    /// Honest note on what this does and does not prove: for any buffer a test
+    /// can afford to build, the truncation check below ALSO rejects these,
+    /// because a 64 MiB+ item size cannot fit. Deleting the
+    /// `MAX_SANE_ITEM_SIZE` cap alone therefore does not fail this test;
+    /// deleting the truncation check does. The cap is defence in depth against
+    /// a large mmap where the promised length would fit, and reaching it in a
+    /// test would mean allocating past the cap on every run. So this test pins
+    /// the OUTCOME (declined, not panicking) across the hostile sizes, and the
+    /// cap's own line coverage comes along with it.
+    #[test]
+    fn an_absurd_item_size_is_declined_rather_than_used_to_slice() {
+        for size in [
+            (MAX_SANE_ITEM_SIZE + 1) as u32,
+            u32::MAX,
+            u32::MAX - 1,
+            0x8000_0000,
+            MAX_SANE_ITEM_SIZE as u32,
+        ] {
+            let bytes = Bytes::from(header(1, 0, size));
+            assert!(
+                FileManagerLogScanner::parse_entry_from_bytes(&bytes, 0)
+                    .is_none(),
+                "item size {size} must be declined, not used to slice"
+            );
+        }
+    }
+
+    /// A truncated write at the end of the log -- a header promising more bytes
+    /// than the file holds -- is the normal crash signature, and must terminate
+    /// the scan rather than slicing out of bounds.
+    #[test]
+    fn a_truncated_entry_terminates_the_scan_without_slicing_out_of_bounds() {
+        // Header says 64 bytes of payload; supply 10.
+        let mut buf = header(1, 0, 64);
+        buf.extend(std::iter::repeat_n(0xBBu8, 10));
+        let bytes = Bytes::from(buf);
+        assert!(
+            FileManagerLogScanner::parse_entry_from_bytes(&bytes, 0).is_none(),
+            "a header promising more payload than the file holds is a \
+             truncated write and must end the scan"
+        );
+    }
+
+    /// With the VLSN flag set the header is longer, so a buffer that would have
+    /// been long enough WITHOUT the flag must still be declined. Getting this
+    /// wrong would read the VLSN out of the payload.
+    #[test]
+    fn the_vlsn_flag_extends_the_header_and_the_length_check_follows_it() {
+        for flag in [0x08u8, 0x20] {
+            // Exactly MIN_HEADER_SIZE bytes: enough for a non-VLSN header, not
+            // enough for the VLSN extension.
+            let bytes = Bytes::from(header(1, flag, 0));
+            assert!(
+                FileManagerLogScanner::parse_entry_from_bytes(&bytes, 0)
+                    .is_none(),
+                "flag {flag:#x} declares a VLSN, so MAX_HEADER_SIZE bytes are \
+                 required -- reading the VLSN out of the payload instead would \
+                 be silent corruption"
+            );
+        }
+    }
+
+    /// A VLSN field of zero or negative with the flag set is a contradiction.
+    /// The documented behaviour is to treat it as no-VLSN rather than poisoning
+    /// the scan, so the entry must still parse and simply carry no VLSN.
+    #[test]
+    fn a_contradictory_vlsn_is_treated_as_absent_rather_than_poisoning_the_scan()
+     {
+        for raw in [0i64, -1, i64::MIN] {
+            let mut buf = header(1, 0x08, 0);
+            buf.resize(MAX_HEADER_SIZE, 0);
+            buf[MIN_HEADER_SIZE..MAX_HEADER_SIZE]
+                .copy_from_slice(&raw.to_le_bytes());
+            let bytes = Bytes::from(buf);
+            // It must not be rejected outright for the VLSN alone: the length
+            // and type checks are what decide, and a zero/negative VLSN is
+            // downgraded to None.
+            let parsed =
+                FileManagerLogScanner::parse_entry_from_bytes(&bytes, 0);
+            assert!(
+                parsed.is_some(),
+                "a contradictory VLSN ({raw}) must be downgraded to no-VLSN, \
+                 not rejected -- rejecting it would truncate recovery at a \
+                 recoverable entry"
+            );
+        }
+    }
+
+    /// The offset argument must be honoured: parsing at an offset past the end
+    /// must decline rather than wrapping or panicking, and parsing at a valid
+    /// offset must not read the entry that precedes it.
+    #[test]
+    fn parsing_at_an_out_of_range_offset_is_declined() {
+        let bytes = Bytes::from(header(1, 0, 0));
+        for off in [bytes.len(), bytes.len() + 1, bytes.len() * 4] {
+            assert!(
+                FileManagerLogScanner::parse_entry_from_bytes(&bytes, off)
+                    .is_none(),
+                "offset {off} is past the buffer and must be declined"
+            );
+        }
+    }
 }

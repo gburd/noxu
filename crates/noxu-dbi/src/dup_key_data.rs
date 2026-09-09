@@ -287,4 +287,193 @@ mod tests {
         assert_eq!(k, key);
         assert_eq!(d, data);
     }
+
+    // ── packed-integer encoding: every width and every boundary ──────────
+    //
+    // The reverse-packed length prefix has five widths selected by hard-coded
+    // thresholds (119, 0xFF, 0xFFFF, 0xFFFFFF). Only the 1-byte width was
+    // exercised, because real primary keys are short. But `combine` writes this
+    // prefix on EVERY two-part key, so a wrong threshold or a wrong marker byte
+    // silently corrupts the split of any key long enough to cross into the next
+    // width -- and the corruption surfaces as a dup cursor returning the wrong
+    // primary key, not as a decode error.
+
+    /// The round-trip property, stated once and checked at every boundary:
+    /// `split(combine(k, d)) == (k, d)` regardless of how long `k` is.
+    fn assert_round_trips(key_len: usize) {
+        let key: Vec<u8> = (0..key_len).map(|i| (i % 251) as u8).collect();
+        let data = b"payload".to_vec();
+        let combined = combine(&key, &data);
+
+        let (k2, d2) = split(&combined)
+            .unwrap_or_else(|| panic!("split failed for a {key_len}-byte key"));
+        assert_eq!(k2, key, "key corrupted at length {key_len}");
+        assert_eq!(d2, data, "data corrupted at length {key_len}");
+
+        // The no-allocation accessor must agree with the full split.
+        assert_eq!(
+            get_key(&combined).unwrap(),
+            key,
+            "get_key disagrees with split at length {key_len}"
+        );
+        assert!(matches_key(&combined, &key));
+        assert!(!matches_key(&combined, b"definitely-not-this-key"));
+    }
+
+    #[test]
+    fn packed_length_round_trips_across_every_encoding_width() {
+        // 1-byte width, and its last value.
+        for n in [0, 1, 2, 119] {
+            assert_round_trips(n);
+        }
+        // Each threshold, one below and one above, so an off-by-one in a
+        // boundary shows up as a specific failing length.
+        for n in [120, 121, 119 + 0xFF, 119 + 0x100, 119 + 0xFFFF] {
+            assert_round_trips(n);
+        }
+    }
+
+    /// The encoded length must be exactly what `packed_int_len` promises at
+    /// every width. `combine` sizes its buffer from that function, so a
+    /// disagreement between the predicted length and the bytes actually
+    /// written would either truncate the key or leave a zero gap in it.
+    #[test]
+    fn the_predicted_and_actual_encoded_lengths_agree_at_every_width() {
+        for (value, want_len) in [
+            (0usize, 1usize),
+            (119, 1),
+            (120, 2),
+            (119 + 0xFF, 2),
+            (119 + 0x100, 3),
+            (119 + 0xFFFF, 3),
+            (119 + 0x1_0000, 4),
+            (119 + 0xFF_FFFF, 4),
+            (119 + 0x100_0000, 5),
+        ] {
+            assert_eq!(
+                packed_int_len(value),
+                want_len,
+                "packed_int_len({value}) picked the wrong width"
+            );
+
+            let mut buf = Vec::new();
+            write_packed_int_at(&mut buf, 0, value);
+            assert_eq!(
+                buf.len(),
+                want_len,
+                "write_packed_int_at({value}) wrote {} bytes but \
+                 packed_int_len promised {want_len}",
+                buf.len()
+            );
+            assert_eq!(
+                read_packed_int_from_end(&buf),
+                Some((value, want_len)),
+                "the {want_len}-byte encoding of {value} did not decode back"
+            );
+        }
+    }
+
+    /// `write_packed_int_at` must honour a non-zero offset and must extend the
+    /// buffer only as far as it needs. `combine` relies on writing the prefix
+    /// after the key and data, so an offset bug would overwrite the payload.
+    #[test]
+    fn write_packed_int_at_respects_a_non_zero_offset() {
+        let mut buf = b"KEYDATA".to_vec();
+        let at = buf.len();
+        write_packed_int_at(&mut buf, at, 3);
+        assert_eq!(
+            &buf[..at],
+            b"KEYDATA",
+            "writing the length prefix must not disturb the payload"
+        );
+        assert_eq!(read_packed_int_from_end(&buf), Some((3, 1)));
+    }
+
+    // ── malformed input: split must decline, not panic or lie ────────────
+
+    /// A dup BIN slot is read straight off disk, so `split` is a parser on
+    /// untrusted bytes. It must return `None` for every malformed shape rather
+    /// than panicking (which would abort a cursor scan) or returning a
+    /// plausible-looking wrong key (which would silently hand the caller
+    /// another record's data).
+    #[test]
+    fn split_declines_malformed_buffers_instead_of_panicking_or_lying() {
+        // Empty: nothing to read the marker from.
+        assert_eq!(split(b""), None);
+        assert_eq!(get_key(b""), None);
+
+        // A marker claiming a key longer than the buffer holds.
+        //  buf = [0xFF] means key_size = 255 with a 1-byte prefix, but there
+        //  are zero bytes of key+data available.
+        assert_eq!(
+            split(&[0xFFu8]),
+            None,
+            "a key size larger than the buffer must be rejected"
+        );
+
+        // Negative / out-of-range marker (>=124 reads as a negative i8 or an
+        // unsupported width): not a valid key size.
+        for marker in [124u8, 200, 255] {
+            let buf = vec![0u8, 0u8, marker];
+            assert_eq!(
+                read_packed_int_from_end(&buf),
+                None,
+                "marker {marker} is not a valid key-size encoding"
+            );
+            assert_eq!(split(&buf), None);
+        }
+
+        // A multi-byte marker whose value bytes are truncated.
+        assert_eq!(
+            read_packed_int_from_end(&[123u8]),
+            None,
+            "a 5-byte encoding needs 4 value bytes before its marker"
+        );
+        assert_eq!(read_packed_int_from_end(&[0u8, 122u8]), None);
+
+        // A well-formed prefix whose key_size overruns the payload.
+        let mut buf = b"ab".to_vec();
+        write_packed_int_at(&mut buf, 2, 99); // claims a 99-byte key
+        assert_eq!(
+            split(&buf),
+            None,
+            "key_size must be validated against the available payload"
+        );
+        assert_eq!(get_key(&buf), None, "get_key must apply the same check");
+    }
+
+    /// The empty-data case is the `lower_bound` seek key, so it must round-trip
+    /// exactly -- it is what positions a cursor on the first duplicate of a key.
+    #[test]
+    fn lower_bound_is_the_smallest_two_part_key_for_its_primary() {
+        let key = b"pkey";
+        let lb = lower_bound(key);
+        assert_eq!(split(&lb).unwrap(), (key.to_vec(), Vec::new()));
+        assert!(matches_key(&lb, key));
+
+        // And it must sort at or before every real duplicate of that key.
+        for data in [&b"a"[..], &b"zzz"[..], &[0u8][..]] {
+            let full = combine(key, data);
+            assert!(
+                cmp_two_part_keys(
+                    &lb,
+                    &full,
+                    |x: &[u8], y: &[u8]| x.cmp(y),
+                    |x: &[u8], y: &[u8]| x.cmp(y),
+                ) != std::cmp::Ordering::Greater,
+                "lower_bound must not sort after a real duplicate"
+            );
+        }
+    }
+
+    /// An empty primary key is legal (key_size 0) and must not be confused with
+    /// a malformed buffer -- `None` and `Some(empty)` are different answers.
+    #[test]
+    fn an_empty_primary_key_round_trips_rather_than_reading_as_malformed() {
+        let combined = combine(b"", b"data");
+        assert_eq!(split(&combined).unwrap(), (Vec::new(), b"data".to_vec()));
+        assert_eq!(get_key(&combined), Some(Vec::new()));
+        assert!(matches_key(&combined, b""));
+        assert!(!matches_key(&combined, b"x"));
+    }
 }

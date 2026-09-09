@@ -286,6 +286,89 @@ mod tests {
         assert!(!t.is_violated(), "disabled tracker never reports a violation");
     }
 
+    /// The three reporting accessors exist to build the
+    /// `DbiError::DiskLimitExceeded` payload that `CursorImpl::check_disk_limit`
+    /// returns. Their contract is that they describe the SAME snapshot the
+    /// violation flag was computed from, so an operator reading the error sees
+    /// the numbers that actually caused it.
+    #[test]
+    fn reporting_accessors_describe_the_snapshot_that_caused_the_violation() {
+        // maxDisk set -> the reported limit is maxDisk.
+        let t = DiskLimitTracker::new(1_000, 25, 0, None);
+        t.recalc(1_000, 10_000);
+        assert!(t.is_violated());
+        assert_eq!(
+            t.last_total_log_size(),
+            1_000,
+            "must report the total_size from the recalc that set the flag"
+        );
+        assert_eq!(
+            t.effective_limit(),
+            1_000,
+            "with maxDisk set, maxDisk is the governing limit"
+        );
+
+        // A later recalc must move the reported numbers with it, not stick to
+        // the first snapshot.
+        t.recalc(400, 10_000);
+        assert!(!t.is_violated());
+        assert_eq!(t.last_total_log_size(), 400);
+
+        // No maxDisk -> the free-disk reserve is the reported limit, since
+        // there is no single byte ceiling to name.
+        let t = DiskLimitTracker::new(0, 25, 0, None);
+        t.recalc(9_999, 10);
+        assert!(t.is_violated());
+        assert_eq!(t.last_total_log_size(), 9_999);
+        assert_eq!(
+            t.effective_limit(),
+            25,
+            "without maxDisk, freeDisk is the limit to report"
+        );
+    }
+
+    /// The diagnostic message must carry every input to the violation
+    /// decision. An operator who cannot see which of maxDisk / freeDisk /
+    /// reservedDisk was breached cannot act on the error, so each value being
+    /// present is the actual requirement, not the exact wording.
+    #[test]
+    fn violation_message_reports_every_input_to_the_decision() {
+        let t = DiskLimitTracker::new(800, 25, 10, None);
+        t.recalc(790, 30);
+        assert!(t.is_violated());
+
+        let msg = t.violation_message();
+        for (label, value) in [
+            ("maxDisk", "800"),
+            ("freeDisk", "25"),
+            ("reservedDisk", "10"),
+            ("totalLogSize", "790"),
+            ("diskFreeSpace", "30"),
+        ] {
+            assert!(
+                msg.contains(&format!("{label}={value}")),
+                "message must report {label}={value}; got: {msg}"
+            );
+        }
+    }
+
+    /// `available_log_size` is stored as a `u64` but the JE formula is signed
+    /// and goes NEGATIVE on a violation. The message casts it back to `i64`,
+    /// so an over-limit environment must report a negative shortfall rather
+    /// than a ~1.8e19 wrapped value — which would be worse than useless in an
+    /// operator-facing error.
+    #[test]
+    fn violation_message_reports_a_negative_shortfall_not_a_wrapped_u64() {
+        let t = DiskLimitTracker::new(0, 100, 0, None);
+        t.recalc(0, 40); // 40 - 100 = -60
+        assert!(t.is_violated());
+        let msg = t.violation_message();
+        assert!(
+            msg.contains("availableLogSize=-60"),
+            "the shortfall must render as -60, not a wrapped u64; got: {msg}"
+        );
+    }
+
     #[test]
     fn both_limits_min_governs() {
         // JE row: freeDL=25 maxDL=80 diskFS=20 totalLS=50 -> avail 0 -> violated

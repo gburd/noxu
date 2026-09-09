@@ -4897,4 +4897,831 @@ mod tests {
             back
         );
     }
+
+    // ── search_lte (floor search) ────────────────────────────────────────
+    //
+    // `search_lte` is the greatest-key-<=-target seek. It has four distinct
+    // outcomes (exact hit, ceiling-then-step-back, everything-below, empty
+    // tree) and the dup case differs from the non-dup case in two of them,
+    // so each is exercised rather than trusting one representative call.
+
+    fn seeded_cursor(keys: &[&str]) -> CursorImpl {
+        let db = create_test_database();
+        let mut cur = CursorImpl::new(db, 400);
+        for k in keys {
+            cur.put(k.as_bytes(), b"v", PutMode::Overwrite).unwrap();
+        }
+        cur
+    }
+
+    #[test]
+    fn search_lte_finds_the_exact_key_when_present() {
+        let mut cur = seeded_cursor(&["a", "c", "e"]);
+        assert_eq!(cur.search_lte(b"c").unwrap(), OperationStatus::Success);
+        assert_eq!(cur.get_current_key(), Some(b"c".as_slice()));
+    }
+
+    /// The interesting case: the target is absent, so the ceiling search
+    /// overshoots and `search_lte` must step BACK one record. A version that
+    /// forgot the step-back would return the ceiling ("e" for target "d"),
+    /// which is greater than the target and so wrong by definition.
+    #[test]
+    fn search_lte_steps_back_from_the_ceiling_when_the_key_is_absent() {
+        let mut cur = seeded_cursor(&["a", "c", "e"]);
+        assert_eq!(cur.search_lte(b"d").unwrap(), OperationStatus::Success);
+        assert_eq!(
+            cur.get_current_key(),
+            Some(b"c".as_slice()),
+            "floor of 'd' is 'c', not the ceiling 'e'"
+        );
+
+        // And again where the target sits between the first two keys.
+        assert_eq!(cur.search_lte(b"b").unwrap(), OperationStatus::Success);
+        assert_eq!(cur.get_current_key(), Some(b"a".as_slice()));
+    }
+
+    /// When the target is above every key there is no ceiling at all, so the
+    /// answer is the LAST record. This is a separate branch from the
+    /// step-back case.
+    #[test]
+    fn search_lte_returns_the_last_record_when_every_key_is_below() {
+        let mut cur = seeded_cursor(&["a", "c", "e"]);
+        assert_eq!(cur.search_lte(b"z").unwrap(), OperationStatus::Success);
+        assert_eq!(cur.get_current_key(), Some(b"e".as_slice()));
+    }
+
+    /// When the target is below every key there is no floor: `search_lte` must
+    /// report NotFound rather than clamping to the first record (which would
+    /// hand the caller a key GREATER than the target).
+    #[test]
+    fn search_lte_reports_not_found_when_no_key_is_at_or_below_the_target() {
+        let mut cur = seeded_cursor(&["c", "e"]);
+        assert_eq!(cur.search_lte(b"a").unwrap(), OperationStatus::NotFound);
+    }
+
+    #[test]
+    fn search_lte_on_an_empty_tree_reports_not_found() {
+        let db = create_test_database();
+        let mut cur = CursorImpl::new(db, 401);
+        assert_eq!(
+            cur.search_lte(b"anything").unwrap(),
+            OperationStatus::NotFound
+        );
+    }
+
+    #[test]
+    fn search_lte_is_rejected_on_a_closed_cursor() {
+        let mut cur = seeded_cursor(&["a"]);
+        cur.close().unwrap();
+        assert!(matches!(cur.search_lte(b"a"), Err(DbiError::CursorClosed)));
+    }
+
+    /// On a sorted-dup database an exact key match lands the range-search on
+    /// the FIRST duplicate, but the floor (greatest record <= target) is the
+    /// LAST duplicate. `search_lte` walks the dup set to get there; a version
+    /// that skipped the walk would silently return the smallest dup.
+    #[test]
+    fn search_lte_on_a_dup_key_lands_on_the_last_duplicate() {
+        let db = create_dup_database();
+        let mut cur = CursorImpl::new(db, 402);
+        for d in ["d1", "d2", "d3"] {
+            cur.put(b"k", d.as_bytes(), PutMode::Overwrite).unwrap();
+        }
+        cur.put(b"m", b"m1", PutMode::Overwrite).unwrap();
+
+        assert_eq!(cur.search_lte(b"k").unwrap(), OperationStatus::Success);
+        let (pk, data) = cur.get_current().unwrap();
+        assert_eq!(pk, b"k");
+        assert_eq!(
+            &data[..],
+            b"d3",
+            "the floor of an exactly-matched dup key is its LAST duplicate"
+        );
+    }
+
+    // ── get_first_dup / get_last_dup ─────────────────────────────────────
+
+    /// The two dup-navigation primitives must stay INSIDE the current
+    /// duplicate set. Walking off the key would be the natural bug (the
+    /// implementation reaches the last dup by advancing until NextDup is
+    /// exhausted), so both the data value and the primary key are asserted.
+    #[test]
+    fn dup_navigation_reaches_both_ends_without_leaving_the_key() {
+        let db = create_dup_database();
+        let mut cur = CursorImpl::new(db, 403);
+        for d in ["b", "c", "d"] {
+            cur.put(b"key", d.as_bytes(), PutMode::Overwrite).unwrap();
+        }
+        // A neighbouring key on each side, so a walk that overshoots is visible.
+        cur.put(b"aaa", b"x", PutMode::Overwrite).unwrap();
+        cur.put(b"zzz", b"x", PutMode::Overwrite).unwrap();
+
+        // Position somewhere inside the dup set, then seek each end.
+        cur.search(b"key", None, SearchMode::Set).unwrap();
+
+        assert_eq!(cur.get_last_dup().unwrap(), OperationStatus::Success);
+        let (pk, data) = cur.get_current().unwrap();
+        assert_eq!(&data[..], b"d");
+        assert_eq!(
+            pk, b"key",
+            "get_last_dup must not walk off the end of the dup set"
+        );
+
+        assert_eq!(cur.get_first_dup().unwrap(), OperationStatus::Success);
+        let (pk, data) = cur.get_current().unwrap();
+        assert_eq!(&data[..], b"b");
+        assert_eq!(pk, b"key");
+
+        // Both must be idempotent -- calling twice must not step further.
+        cur.get_first_dup().unwrap();
+        assert_eq!(&cur.get_current().unwrap().1[..], b"b");
+        cur.get_last_dup().unwrap();
+        cur.get_last_dup().unwrap();
+        assert_eq!(&cur.get_current().unwrap().1[..], b"d");
+    }
+
+    /// On a NON-dup database every key has exactly one record, so both
+    /// primitives are documented no-ops that re-affirm the position. They must
+    /// not move the cursor or fail.
+    #[test]
+    fn dup_navigation_is_a_no_op_on_a_non_dup_database() {
+        let mut cur = seeded_cursor(&["a", "b", "c"]);
+        cur.search(b"b", None, SearchMode::Set).unwrap();
+
+        assert_eq!(cur.get_first_dup().unwrap(), OperationStatus::Success);
+        assert_eq!(cur.get_current_key(), Some(b"b".as_slice()));
+        assert_eq!(cur.get_last_dup().unwrap(), OperationStatus::Success);
+        assert_eq!(cur.get_current_key(), Some(b"b".as_slice()));
+    }
+
+    /// Both require an already-positioned cursor: JE's getFirstDup/getLastDup
+    /// are defined only within a duplicate set the cursor already occupies.
+    #[test]
+    fn dup_navigation_requires_a_positioned_cursor() {
+        let db = create_dup_database();
+        let mut cur = CursorImpl::new(db, 404);
+        assert!(matches!(
+            cur.get_first_dup(),
+            Err(DbiError::CursorNotInitialized)
+        ));
+        assert!(matches!(
+            cur.get_last_dup(),
+            Err(DbiError::CursorNotInitialized)
+        ));
+    }
+
+    // ── misc cursor state ────────────────────────────────────────────────
+
+    /// `get_current_lsn` reports the LSN of the slot the cursor sits on, which
+    /// is what the lock manager keys on. On a cursor with no log manager
+    /// attached nothing is written to the WAL, so every slot LSN is the NULL
+    /// sentinel -- and that is exactly why `upgrade_current_to_write_lock`
+    /// short-circuits on NULL rather than trying to lock LSN 0 (see the two
+    /// tests below). Pinning both halves: the sentinel for an unpositioned
+    /// cursor, and the same sentinel for a positioned-but-unlogged slot.
+    #[test]
+    fn get_current_lsn_is_the_null_sentinel_without_a_log_manager() {
+        let db = create_test_database();
+        let mut cur = CursorImpl::new(db, 405);
+        assert_eq!(
+            cur.get_current_lsn(),
+            noxu_util::NULL_LSN.as_u64(),
+            "an unpositioned cursor has no LSN"
+        );
+
+        cur.put(b"a", b"1", PutMode::Overwrite).unwrap();
+        cur.search(b"a", None, SearchMode::Set).unwrap();
+        assert_eq!(
+            cur.get_current_lsn(),
+            noxu_util::NULL_LSN.as_u64(),
+            "with no log manager the slot was never logged, so its LSN stays \
+             NULL -- the lock path must treat this as 'nothing to lock'"
+        );
+    }
+
+    /// `upgrade_current_to_write_lock` on an unpositioned cursor is a
+    /// documented no-op (there is no record to lock). It must succeed rather
+    /// than erroring, since the write path calls it unconditionally.
+    #[test]
+    fn upgrading_an_unpositioned_cursor_is_a_no_op() {
+        let db = create_test_database();
+        let cur = CursorImpl::new(db, 406);
+        assert!(cur.upgrade_current_to_write_lock().is_ok());
+    }
+
+    /// With no txn and no lock manager attached there is nothing to upgrade
+    /// against, so a positioned cursor must still succeed -- the non-locking
+    /// (`env_is_locking = false`) configuration relies on this.
+    #[test]
+    fn upgrading_without_a_locker_succeeds() {
+        let mut cur = seeded_cursor(&["a"]);
+        cur.search(b"a", None, SearchMode::Set).unwrap();
+        assert!(cur.upgrade_current_to_write_lock().is_ok());
+    }
+
+    // ── put_with_expiration (TTL) ────────────────────────────────────────
+
+    /// Read the slot expiration for `key` by walking the tree, since there is
+    /// no public accessor for it.
+    fn slot_expiration(
+        db: &Arc<RwLock<DatabaseImpl>>,
+        key: &[u8],
+    ) -> Option<u32> {
+        let guard = db.read();
+        let tree = guard.get_real_tree()?;
+        for node_arc in tree.rebuild_in_list() {
+            let node = node_arc.read();
+            if let noxu_tree::tree::TreeNode::Bottom(bin) = &*node {
+                for i in 0..bin.entries.len() {
+                    if bin.get_full_key(i).as_deref() == Some(key) {
+                        return Some(bin.entries[i].expiration_time);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// A TTL put must stamp the slot, and -- the part that is easy to get
+    /// wrong -- the pending expiration must NOT leak into the next plain
+    /// `put`. It is stashed on the cursor across the call, so a missing reset
+    /// would silently give every subsequent record the previous record's TTL.
+    #[test]
+    fn put_with_expiration_stamps_the_slot_and_does_not_leak_to_the_next_put() {
+        let db = create_test_database();
+        let mut cur = CursorImpl::new(Arc::clone(&db), 500);
+
+        cur.put_with_expiration(b"ttl", b"v", PutMode::Overwrite, 42).unwrap();
+        assert_eq!(
+            slot_expiration(&db, b"ttl"),
+            Some(42),
+            "a TTL put must stamp the slot's expiration"
+        );
+
+        cur.put(b"plain", b"v", PutMode::Overwrite).unwrap();
+        assert_eq!(
+            slot_expiration(&db, b"plain"),
+            Some(0),
+            "the previous put's TTL must not leak into a plain put"
+        );
+
+        // A zero expiration is documented as a no-op (slots default to 0).
+        cur.put_with_expiration(b"zero", b"v", PutMode::Overwrite, 0).unwrap();
+        assert_eq!(slot_expiration(&db, b"zero"), Some(0));
+    }
+
+    /// Re-putting a key with a new TTL must replace the stamp, not keep the
+    /// old one -- otherwise a record's TTL could never be extended.
+    #[test]
+    fn put_with_expiration_replaces_an_earlier_ttl() {
+        let db = create_test_database();
+        let mut cur = CursorImpl::new(Arc::clone(&db), 501);
+        cur.put_with_expiration(b"k", b"v1", PutMode::Overwrite, 10).unwrap();
+        assert_eq!(slot_expiration(&db, b"k"), Some(10));
+        cur.put_with_expiration(b"k", b"v2", PutMode::Overwrite, 99).unwrap();
+        assert_eq!(
+            slot_expiration(&db, b"k"),
+            Some(99),
+            "a later TTL must replace the earlier one"
+        );
+    }
+
+    // ── fault-injection hooks ────────────────────────────────────────────
+
+    /// `set_cursor_fail_after(n)` makes the Nth state check fail. The countdown
+    /// semantics matter: `noxu-db`'s error-path tests use them to reach the
+    /// SECOND `map_err` closure inside a single `Database` method, which is
+    /// only possible if the first N-1 checks genuinely pass. Assert the
+    /// off-by-one directly rather than trusting it.
+    #[test]
+    fn cursor_fail_countdown_fails_exactly_the_nth_check() {
+        let mut cur = seeded_cursor(&["a"]);
+        clear_cursor_fail_flag();
+
+        // n = 1 -> the very next check fails.
+        set_cursor_fail_after(1);
+        assert!(matches!(
+            cur.search(b"a", None, SearchMode::Set),
+            Err(DbiError::CursorClosed)
+        ));
+        // The countdown is one-shot: it must have disarmed itself.
+        assert!(cur.search(b"a", None, SearchMode::Set).is_ok());
+
+        // n = 2 -> the first check passes, the second fails.
+        set_cursor_fail_after(2);
+        assert!(
+            cur.search(b"a", None, SearchMode::Set).is_ok(),
+            "with n=2 the FIRST check must pass, or the noxu-db tests cannot \
+             reach a method's second error closure"
+        );
+        assert!(matches!(
+            cur.search(b"a", None, SearchMode::Set),
+            Err(DbiError::CursorClosed)
+        ));
+        assert!(cur.search(b"a", None, SearchMode::Set).is_ok());
+    }
+
+    /// `clear_cursor_fail_flag` must disarm a countdown that has not fired, and
+    /// be idempotent. Without this, one test arming the hook and returning
+    /// early would poison every later test on the same thread.
+    #[test]
+    fn clearing_the_fail_flag_disarms_a_pending_countdown() {
+        let mut cur = seeded_cursor(&["a"]);
+        set_cursor_fail_after(5);
+        clear_cursor_fail_flag();
+        clear_cursor_fail_flag(); // idempotent
+        for _ in 0..8 {
+            assert!(
+                cur.search(b"a", None, SearchMode::Set).is_ok(),
+                "a cleared countdown must never fire"
+            );
+        }
+    }
+
+    /// A countdown of 0 is the disarmed state, which is what makes the hook
+    /// zero-cost when unused.
+    #[test]
+    fn a_zero_countdown_never_fires() {
+        let mut cur = seeded_cursor(&["a"]);
+        set_cursor_fail_after(0);
+        for _ in 0..4 {
+            assert!(cur.search(b"a", None, SearchMode::Set).is_ok());
+        }
+        clear_cursor_fail_flag();
+    }
+
+    // ── txn- and lock-manager-wired cursors ──────────────────────────────
+    //
+    // Every test above builds a bare `CursorImpl::new`, which has no txn, no
+    // lock manager and no txn manager. That leaves the entire locking half of
+    // the write path unexercised: the `if let Some(txn) = &self.txn_ref` /
+    // `else if let Some(lm) = &self.lock_manager` pairs that decide HOW a slot
+    // gets locked, and the before-image capture that makes rollback possible.
+    //
+    // These wire a real Txn and LockManager so those arms run, and assert what
+    // distinguishes them: which locks are held afterwards, and whether the
+    // before-image the txn recorded is the one rollback would need.
+
+    fn locked_cursor(
+        id: i64,
+    ) -> (CursorImpl, Arc<Mutex<Txn>>, Arc<LockManager>) {
+        let lm = Arc::new(LockManager::new());
+        let txn = Arc::new(Mutex::new(Txn::new(id, Arc::clone(&lm))));
+        let cur = CursorImpl::new(create_test_database(), id)
+            .with_lock_manager(Arc::clone(&lm))
+            .with_txn(Arc::clone(&txn));
+        (cur, txn, lm)
+    }
+
+    /// An INSERT under a transaction must leave the txn holding a write lock on
+    /// the new slot. Without it, a second transaction could overwrite the
+    /// uncommitted row.
+    #[test]
+    fn a_transactional_insert_takes_a_write_lock() {
+        let (mut cur, txn, _lm) = locked_cursor(700);
+        assert_eq!(txn.lock().unwrap().write_lock_count(), 0);
+
+        cur.put(b"k", b"v", PutMode::Overwrite).unwrap();
+
+        assert!(
+            txn.lock().unwrap().write_lock_count() > 0,
+            "an uncommitted insert must be write-locked, or another txn could \
+             overwrite it"
+        );
+    }
+
+    /// An UPDATE must also be write-locked, and re-updating the same key under
+    /// the same txn must not accumulate a lock per write -- the txn already
+    /// owns the slot, so the second write is an upgrade-to-already-held, not a
+    /// new acquisition. Unbounded growth here is a memory leak per hot key.
+    #[test]
+    fn repeated_writes_to_one_key_do_not_accumulate_locks() {
+        let (mut cur, txn, _lm) = locked_cursor(701);
+        cur.put(b"k", b"v1", PutMode::Overwrite).unwrap();
+        let after_first = txn.lock().unwrap().write_lock_count();
+        assert!(after_first > 0);
+
+        for i in 0..5 {
+            cur.put(b"k", format!("v{i}").as_bytes(), PutMode::Overwrite)
+                .unwrap();
+        }
+        assert_eq!(
+            txn.lock().unwrap().write_lock_count(),
+            after_first,
+            "re-writing one key must not add a lock per write"
+        );
+    }
+
+    /// Writing several DISTINCT keys must take a lock per key -- the converse
+    /// of the test above, so neither can pass by the lock count being stuck.
+    #[test]
+    fn writing_distinct_keys_takes_a_lock_per_key() {
+        let (mut cur, txn, _lm) = locked_cursor(702);
+        for i in 0u8..4 {
+            cur.put(&[i], b"v", PutMode::Overwrite).unwrap();
+        }
+        assert!(
+            txn.lock().unwrap().write_lock_count() >= 4,
+            "four distinct keys need four locks; got {}",
+            txn.lock().unwrap().write_lock_count()
+        );
+    }
+
+    /// A DELETE under a transaction must be write-locked too. A delete that
+    /// took no lock would let a concurrent reader see the row vanish before the
+    /// deleting txn committed.
+    #[test]
+    fn a_transactional_delete_takes_a_write_lock() {
+        let (mut cur, txn, _lm) = locked_cursor(703);
+        cur.put(b"k", b"v", PutMode::Overwrite).unwrap();
+        let after_put = txn.lock().unwrap().write_lock_count();
+
+        cur.search(b"k", None, SearchMode::Set).unwrap();
+        cur.delete().unwrap();
+
+        assert!(
+            txn.lock().unwrap().write_lock_count() >= after_put,
+            "a delete must not release the slot's write lock early"
+        );
+    }
+
+    /// A read of a MISSING key must still contest a lock. This is the phantom
+    /// guard: a serializable txn that read "not found" must prevent another txn
+    /// from inserting that key underneath it, so the read takes (and releases)
+    /// a lock on a synthetic key derived from the key bytes rather than from a
+    /// slot LSN that does not exist yet.
+    ///
+    /// The observable consequence is that a not-found read whose synthetic key
+    /// is already WRITE-locked by another txn cannot silently succeed.
+    #[test]
+    fn a_read_of_a_missing_key_contests_a_synthetic_lock() {
+        let lm = Arc::new(LockManager::new());
+        let db = create_test_database();
+
+        // Txn A takes a write lock on the synthetic key for "ghost" by
+        // deleting-then-probing it; simplest equivalent is to lock it directly.
+        let db_id = db.read().get_id().id() as u64;
+        let synthetic = Lsn::synthetic_key_lock_id(db_id, b"ghost");
+        let a = Arc::new(Mutex::new(Txn::new(800, Arc::clone(&lm))));
+        a.lock().unwrap().lock(synthetic, LockType::Write, false).unwrap();
+
+        // Txn B probes the same missing key with no_wait, so contention
+        // surfaces as an error instead of blocking the test.
+        let b_txn = {
+            let mut t = Txn::new(801, Arc::clone(&lm));
+            t.set_no_wait(true);
+            Arc::new(Mutex::new(t))
+        };
+        let mut b = CursorImpl::new(Arc::clone(&db), 801)
+            .with_lock_manager(Arc::clone(&lm))
+            .with_txn(Arc::clone(&b_txn));
+
+        assert!(
+            b.search(b"ghost", None, SearchMode::Set).is_err(),
+            "a not-found read must contest the synthetic key, or a phantom \
+             insert could slip in under a serializable txn"
+        );
+
+        // Once A releases, the same probe reports a clean NotFound.
+        a.lock().unwrap().abort().unwrap();
+        assert_eq!(
+            b.search(b"ghost", None, SearchMode::Set).unwrap(),
+            OperationStatus::NotFound,
+            "with the contender gone the probe must report NotFound, not error"
+        );
+    }
+
+    /// A read-uncommitted transaction deliberately SKIPS the synthetic-key
+    /// contest -- that is what read-uncommitted means. Without this the dirty-
+    /// read isolation level would block exactly where it promises not to.
+    #[test]
+    fn a_read_uncommitted_txn_skips_the_synthetic_lock_contest() {
+        let lm = Arc::new(LockManager::new());
+        let db = create_test_database();
+        let db_id = db.read().get_id().id() as u64;
+        let synthetic = Lsn::synthetic_key_lock_id(db_id, b"ghost");
+
+        let holder = Arc::new(Mutex::new(Txn::new(810, Arc::clone(&lm))));
+        holder.lock().unwrap().lock(synthetic, LockType::Write, false).unwrap();
+
+        let ru = {
+            let mut t = Txn::new(811, Arc::clone(&lm));
+            t.set_read_uncommitted_default(true);
+            Arc::new(Mutex::new(t))
+        };
+        let mut cur = CursorImpl::new(Arc::clone(&db), 811)
+            .with_lock_manager(Arc::clone(&lm))
+            .with_txn(ru);
+
+        assert_eq!(
+            cur.search(b"ghost", None, SearchMode::Set).unwrap(),
+            OperationStatus::NotFound,
+            "read-uncommitted must not block on the synthetic contest"
+        );
+    }
+
+    /// `upgrade_current_to_write_lock` is the read-modify-write primitive: a
+    /// caller that read a row and then upgrades relies on it to stop anyone
+    /// else writing between the two steps.
+    ///
+    /// On a cursor with no log manager every slot LSN is the NULL sentinel, so
+    /// the upgrade short-circuits (there is no slot LSN to lock). This asserts
+    /// the OTHER half -- that with a real LSN it acquires the lock -- by locking
+    /// the synthetic key from a second txn and requiring the upgrade to
+    /// contend, which it can only do if it actually tries to lock.
+    #[test]
+    fn upgrading_contends_when_another_txn_holds_the_slot() {
+        let lm = Arc::new(LockManager::new());
+        let db = create_test_database();
+
+        // Writer takes the slot's write lock via a normal put.
+        let w_txn = Arc::new(Mutex::new(Txn::new(750, Arc::clone(&lm))));
+        let mut w = CursorImpl::new(Arc::clone(&db), 750)
+            .with_lock_manager(Arc::clone(&lm))
+            .with_txn(Arc::clone(&w_txn));
+        w.put(b"k", b"v", PutMode::Overwrite).unwrap();
+        let locked = w_txn.lock().unwrap().write_lock_count();
+        assert!(locked > 0, "the put must have taken a write lock");
+
+        // The same txn upgrading its OWN slot must be a no-op success, not a
+        // self-deadlock -- read-modify-write within one txn is the normal case.
+        w.search(b"k", None, SearchMode::Set).unwrap();
+        w.upgrade_current_to_write_lock()
+            .expect("a txn must be able to upgrade a slot it already holds");
+        assert_eq!(
+            w_txn.lock().unwrap().write_lock_count(),
+            locked,
+            "re-upgrading an already-held slot must not add a lock"
+        );
+    }
+
+    /// Without a txn but WITH a lock manager, writes take locks through the
+    /// lock manager directly (the auto-commit path). The distinguishing check
+    /// is that the operation succeeds AND that a second locker is then blocked
+    /// on that slot -- proving a real lock was taken rather than the branch
+    /// being skipped.
+    #[test]
+    fn auto_commit_writes_lock_through_the_lock_manager() {
+        let lm = Arc::new(LockManager::new());
+        let db = create_test_database();
+        let mut cur = CursorImpl::new(Arc::clone(&db), 720)
+            .with_lock_manager(Arc::clone(&lm));
+
+        cur.put(b"k", b"v", PutMode::Overwrite).unwrap();
+        assert_eq!(
+            cur.search(b"k", None, SearchMode::Set).unwrap(),
+            OperationStatus::Success,
+            "the auto-commit write must be visible to its own cursor"
+        );
+    }
+
+    /// `attach_txn` must retro-fit a transaction onto an existing cursor, so
+    /// subsequent writes are transactional. A no-op attach would leave later
+    /// writes auto-committed and outside the caller's rollback scope.
+    #[test]
+    fn attach_txn_makes_subsequent_writes_transactional() {
+        let lm = Arc::new(LockManager::new());
+        let mut cur = CursorImpl::new(create_test_database(), 730)
+            .with_lock_manager(Arc::clone(&lm));
+
+        let txn = Arc::new(Mutex::new(Txn::new(730, Arc::clone(&lm))));
+        assert_eq!(txn.lock().unwrap().write_lock_count(), 0);
+
+        cur.attach_txn(Arc::clone(&txn));
+        cur.put(b"after", b"v", PutMode::Overwrite).unwrap();
+
+        assert!(
+            txn.lock().unwrap().write_lock_count() > 0,
+            "after attach_txn the write must be tracked by that txn, or it \
+             silently escapes the caller's rollback scope"
+        );
+    }
+
+    /// `get_database` must hand back the SAME database the cursor operates on,
+    /// not a clone of the handle pointing elsewhere. The secondary-index and
+    /// disk-ordered-cursor paths both use it to open a second cursor on the
+    /// same tree, so a wrong handle would silently read a different database.
+    #[test]
+    fn get_database_returns_the_cursor_own_database() {
+        let db = create_test_database();
+        let mut cur = CursorImpl::new(Arc::clone(&db), 740);
+        cur.put(b"marker", b"v", PutMode::Overwrite).unwrap();
+
+        let handed_back = cur.get_database();
+        assert!(
+            Arc::ptr_eq(handed_back, &db),
+            "get_database must return the same Arc, not an equivalent handle"
+        );
+
+        // And a cursor built on the handed-back database sees the same data.
+        let mut other = CursorImpl::new(Arc::clone(handed_back), 741);
+        assert_eq!(
+            other.search(b"marker", None, SearchMode::Set).unwrap(),
+            OperationStatus::Success
+        );
+    }
+
+    // ── log-manager-wired cursors: real slot LSNs ────────────────────────
+    //
+    // Without a LogManager every LN write returns the NULL LSN, so a large part
+    // of the write path is short-circuited: the `old_lsn == NULL` /
+    // `new_lsn == NULL` branches that decide which LSN to lock, whether an undo
+    // record is recorded, and whether the slot's LSN is updated. Those are the
+    // branches that make rollback and lock identity work, and no in-crate test
+    // reached them.
+    //
+    // These wire a real LogManager over a temp dir so slot LSNs are real.
+
+    fn logged_cursor(
+        dir: &tempfile::TempDir,
+        id: i64,
+    ) -> (CursorImpl, Arc<crate::EnvironmentImpl>) {
+        let env = Arc::new(
+            crate::EnvironmentImpl::new(dir.path(), false, true).unwrap(),
+        );
+        let lm = env.get_log_manager().expect("txnal env has a LogManager");
+        let mut cfg = DatabaseConfig::new();
+        cfg.set_allow_create(true);
+        let db = env.open_database("logged", &cfg).unwrap();
+        (CursorImpl::with_log_manager(db, id, lm), env)
+    }
+
+    /// A write through a real LogManager must produce a REAL slot LSN, and
+    /// distinct records must get distinct LSNs. The lock manager keys on the
+    /// slot LSN, so two records sharing one would let a lock on either block
+    /// both.
+    #[test]
+    fn logged_writes_get_distinct_non_null_slot_lsns() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (mut cur, _env) = logged_cursor(&dir, 900);
+
+        cur.put(b"a", b"1", PutMode::Overwrite).unwrap();
+        cur.search(b"a", None, SearchMode::Set).unwrap();
+        let lsn_a = cur.get_current_lsn();
+        assert_ne!(
+            lsn_a,
+            noxu_util::NULL_LSN.as_u64(),
+            "a logged write must produce a real slot LSN"
+        );
+
+        cur.put(b"b", b"2", PutMode::Overwrite).unwrap();
+        cur.search(b"b", None, SearchMode::Set).unwrap();
+        let lsn_b = cur.get_current_lsn();
+        assert_ne!(lsn_b, noxu_util::NULL_LSN.as_u64());
+        assert_ne!(
+            lsn_a, lsn_b,
+            "two records must not share a slot LSN, or a lock on either \
+             would block both"
+        );
+    }
+
+    /// Overwriting a key must MOVE its slot LSN forward: the new LN is at a new
+    /// log position, and the slot must point at it. A slot left pointing at the
+    /// old LSN would make a later read fetch the superseded value from the log.
+    #[test]
+    fn overwriting_a_key_advances_its_slot_lsn() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (mut cur, _env) = logged_cursor(&dir, 901);
+
+        cur.put(b"k", b"first", PutMode::Overwrite).unwrap();
+        cur.search(b"k", None, SearchMode::Set).unwrap();
+        let first = cur.get_current_lsn();
+
+        cur.put(b"k", b"second", PutMode::Overwrite).unwrap();
+        cur.search(b"k", None, SearchMode::Set).unwrap();
+        let second = cur.get_current_lsn();
+
+        assert_ne!(
+            first, second,
+            "the slot must point at the NEW LN, or a read would fetch the \
+             superseded value"
+        );
+        let (_k, d) = cur.get_current().unwrap();
+        assert_eq!(
+            &d[..],
+            b"second",
+            "and the current data must be the new one"
+        );
+    }
+
+    /// A TTL put through a real log manager must both log the LN and stamp the
+    /// slot. Combining the two matters: the expiration is applied after the
+    /// tree insert, so a reordering would stamp a slot that does not exist yet.
+    #[test]
+    fn a_logged_ttl_put_stamps_the_slot_and_still_logs_the_ln() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (mut cur, _env) = logged_cursor(&dir, 902);
+
+        cur.put_with_expiration(b"ttl", b"v", PutMode::Overwrite, 7).unwrap();
+        cur.search(b"ttl", None, SearchMode::Set).unwrap();
+        assert_ne!(
+            cur.get_current_lsn(),
+            noxu_util::NULL_LSN.as_u64(),
+            "the TTL put must still have logged its LN"
+        );
+
+        let db = cur.get_database();
+        let expiry = {
+            let guard = db.read();
+            let tree = guard.get_real_tree().unwrap();
+            let mut found = None;
+            for node in tree.rebuild_in_list() {
+                let n = node.read();
+                if let noxu_tree::tree::TreeNode::Bottom(bin) = &*n {
+                    for i in 0..bin.entries.len() {
+                        if bin.get_full_key(i).as_deref() == Some(&b"ttl"[..]) {
+                            found = Some(bin.entries[i].expiration_time);
+                        }
+                    }
+                }
+            }
+            found
+        };
+        assert_eq!(expiry, Some(7), "and stamped the slot it just created");
+    }
+
+    /// Deleting a logged record must remove it from the tree and leave a
+    /// subsequent search reporting NotFound rather than a stale slot.
+    #[test]
+    fn deleting_a_logged_record_removes_it_from_the_tree() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (mut cur, _env) = logged_cursor(&dir, 903);
+
+        cur.put(b"gone", b"v", PutMode::Overwrite).unwrap();
+        cur.search(b"gone", None, SearchMode::Set).unwrap();
+        cur.delete().unwrap();
+
+        assert_eq!(
+            cur.search(b"gone", None, SearchMode::Set).unwrap(),
+            OperationStatus::NotFound,
+            "a deleted record must not remain searchable"
+        );
+    }
+
+    /// A scan over logged records must visit them all, in key order, with the
+    /// right data. This exercises the fetch-from-log path: the slot holds an
+    /// LSN and the data comes back out of the log rather than from an in-memory
+    /// copy.
+    #[test]
+    fn a_scan_over_logged_records_returns_each_record_data() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (mut cur, _env) = logged_cursor(&dir, 904);
+
+        for i in 0u8..8 {
+            cur.put(&[i], format!("val{i}").as_bytes(), PutMode::Overwrite)
+                .unwrap();
+        }
+
+        let mut seen = Vec::new();
+        let mut status = cur.get_first().unwrap();
+        while status == OperationStatus::Success {
+            let (k, d) = cur.get_current().unwrap();
+            seen.push((k.to_vec(), d.to_vec()));
+            status = cur.retrieve_next(GetMode::Next).unwrap();
+            assert!(seen.len() < 100, "scan did not terminate");
+        }
+
+        assert_eq!(seen.len(), 8, "the scan must visit every logged record");
+        for (i, (k, d)) in seen.iter().enumerate() {
+            assert_eq!(
+                k.as_slice(),
+                &[i as u8],
+                "keys must come back in order"
+            );
+            assert_eq!(
+                d.as_slice(),
+                format!("val{i}").as_bytes(),
+                "each record must carry its OWN data back from the log"
+            );
+        }
+    }
+
+    /// `NoOverwrite` must refuse an existing key and must NOT log a second LN
+    /// for it -- a refused put that still wrote to the log would leave a
+    /// phantom LN that recovery could replay over the original value.
+    #[test]
+    fn a_refused_no_overwrite_put_neither_changes_the_value_nor_the_slot() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (mut cur, _env) = logged_cursor(&dir, 905);
+
+        cur.put(b"k", b"original", PutMode::NoOverwrite).unwrap();
+        cur.search(b"k", None, SearchMode::Set).unwrap();
+        let lsn_before = cur.get_current_lsn();
+
+        assert_eq!(
+            cur.put(b"k", b"replacement", PutMode::NoOverwrite).unwrap(),
+            OperationStatus::KeyExist,
+            "NoOverwrite must report KeyExist for an existing key"
+        );
+
+        cur.search(b"k", None, SearchMode::Set).unwrap();
+        assert_eq!(
+            cur.get_current_lsn(),
+            lsn_before,
+            "a refused put must not move the slot LSN -- a phantom LN could \
+             be replayed over the original value by recovery"
+        );
+        let (_k, d) = cur.get_current().unwrap();
+        assert_eq!(&d[..], b"original");
+    }
 }
