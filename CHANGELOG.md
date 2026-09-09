@@ -15,6 +15,40 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+## [7.6.1] - 2026-09-09
+
+### Fixed
+
+- **`noxu_sync::RwLock` starved writers unboundedly; it is now
+  writer-preferring.** There was no writer-waiting bit at all — a queued writer
+  waited for `state == 0` while nothing stopped new readers from incrementing
+  the reader count, so a sustained reader stream blocked writers forever.
+  Measured (idle 64-vCPU box, 3 s window, 1 writer vs N readers): at 7 readers
+  the writer completed **1 write, worst wait 3000 ms**; after the fix, 852,557
+  writes with a 0.02 ms worst wait. Reachable in production — `noxu-dbi`'s
+  database catalog (`db_tree.rs`) and `txn_manager` guard state with this lock
+  using bare `.write()` calls and no timeout backstop. Fixed with a
+  `WRITE_WAITING` admission gate (bit 31, previously unused) that new readers
+  must respect; worst-case write latency is now better than `parking_lot`'s.
+  Read-heavy throughput is lower where readers can no longer barge past a queued
+  writer (16.6 vs 18.6 Mops/s at 8 threads) — that is the trade — while above 32
+  threads the lock still beats `parking_lot` (8.0 vs 4.8 Mops/s at 64).
+
+### Documentation
+
+- **Lock-free BIN generation counter: measured and declined.** Investigated as a
+  cheaper alternative to the `READ_COMMITTED` dirty-read fix's per-read BIN
+  latch. The ceiling is 16.8 ns/read (17.12 ns for an uncontended latch + `u64`
+  read vs 0.31 ns for an atomic load) = **2.6 % of a `db_get`**, which also
+  independently validates the fix's measured ~2.5 % cost. Building it requires
+  `ChildArc` to become `Arc<NodeCell>` — 121 mentions, 45 construction sites,
+  six crates — plus a permanent obligation that every future BIN mutation bump
+  the counter, whose failure mode is silently returning uncommitted data.
+  Declined: 2.6 % cannot clear a bar that latch-lite descent failed at a measured
+  13-15 %. See `docs/src/internal/bin-generation-counter-2026-09.md` for what
+  would change the answer.
+
+
 ## [7.6.0] - 2026-09-09
 
 Minor release. Ships two correctness fixes in the read path, retires an
@@ -41,21 +75,6 @@ breaking cleanup ships as 7.x while there are no downstream users.
   placeholder-generic ceiling documented honestly rather than padded around.
 
 ### Fixed
-
-- **`noxu_sync::RwLock` starved writers unboundedly; it is now
-  writer-preferring.** There was no writer-waiting bit at all — a queued writer
-  waited for `state == 0` while nothing stopped new readers from incrementing
-  the reader count, so a sustained reader stream blocked writers forever.
-  Measured (idle 64-vCPU box, 3 s window, 1 writer vs N readers): at 7 readers
-  the writer completed **1 write, worst wait 3000 ms**; after the fix, 852,557
-  writes with a 0.02 ms worst wait. Reachable in production — `noxu-dbi`'s
-  database catalog (`db_tree.rs`) and `txn_manager` guard state with this lock
-  using bare `.write()` calls and no timeout backstop. Fixed with a
-  `WRITE_WAITING` admission gate (bit 31, previously unused) that new readers
-  must respect; worst-case write latency is now better than `parking_lot`'s.
-  Read-heavy throughput is lower where readers can no longer barge past a queued
-  writer (16.6 vs 18.6 Mops/s at 8 threads) — that is the trade — while above 32
-  threads the lock still beats `parking_lot` (8.0 vs 4.8 Mops/s at 64).
 
 - **A `READ_COMMITTED` cursor could return an aborting writer's uncommitted
   data (dirty read).** Cursor reads captured a BIN slot's data *before*
