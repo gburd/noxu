@@ -166,7 +166,7 @@ v4.0.0 is a major release driven by a single source-incompatible change
 
 ### Source-level breaking change
 
-* **`XaEnvironment::get_transaction()` now returns `Arc<Transaction>`
+- **`XaEnvironment::get_transaction()` now returns `Arc<Transaction>`
   instead of `&Transaction`.** The previous borrow pointed into the XA
   branch map and could dangle if a protocol-violating
   `xa_rollback`/`xa_commit` freed the transaction on another thread. The
@@ -200,7 +200,7 @@ required.
 
 ### Source-level breaking changes
 
-* **`StoredMap<'db>` is now `StoredMap<'db, K, V, KB, VB>`.**  The map
+- **`StoredMap<'db>` is now `StoredMap<'db, K, V, KB, VB>`.**  The map
   is parameterised by `EntryBinding` implementations for keys and
   values.
 
@@ -220,7 +220,7 @@ required.
   `StoredKeySet<K, KB>`, `StoredValueSet<V, VB>`, and
   `StoredList<V, VB>`.
 
-* **Every `Stored*` method now takes `txn: Option<&Transaction>` as
+- **Every `Stored*` method now takes `txn: Option<&Transaction>` as
   the leading argument.**
 
   ```rust,ignore
@@ -243,12 +243,12 @@ required.
   `last_entry`, `higher_key` (StoredSortedMap), `add`, `contains`,
   `remove` (StoredKeySet), and every `StoredList` method.
 
-* **`StoredMap::len` returns `usize` instead of `u64`.**  The on-disk
+- **`StoredMap::len` returns `usize` instead of `u64`.**  The on-disk
   count is bounded by `Database::count() -> u64` but Rust callers
   almost always want `usize` (matching `BTreeMap::len`); the
   collections layer truncates to `usize::MAX` at the boundary.
 
-* **The internal `BTreeSet` key index is removed.**
+- **The internal `BTreeSet` key index is removed.**
   `register_key`, `register_keys`, `known_keys` are deleted.  Pre-
   existing data that was visible in v1.5 only after a
   `register_keys` call is now visible automatically because
@@ -265,14 +265,14 @@ required.
   for entry in map.iter(None)? { /* sees every record */ }
   ```
 
-* **`StoredList::remove` now compacts.**  Removing index `i` shifts
+- **`StoredList::remove` now compacts.**  Removing index `i` shifts
   every record at index `j > i` down to `j - 1` and decrements
   `next_index`.  Code that relied on the v1.5 "remove leaves a hole"
   contract will see different `get(idx)` results after `remove`.
   The whole compaction is issued under the supplied txn; pass
   `Some(&txn)` for crash-atomic semantics.
 
-* **`StoredList::new` / `StoredList::open` now take a value
+- **`StoredList::new` / `StoredList::open` now take a value
   binding.**
 
   ```rust,ignore
@@ -290,7 +290,7 @@ required.
 
 ### Behavioural breaking changes
 
-* **`TransactionRunner` now drives `Stored*` methods.**  In v1.5 the
+- **`TransactionRunner` now drives `Stored*` methods.**  In v1.5 the
   `&Transaction` it supplied could not be threaded into any `Stored*`
   call (every `Stored*` method ignored its txn argument because there
   *was* no txn argument).  In v1.6 the runner-supplied `&Transaction`
@@ -307,7 +307,7 @@ required.
   })?;
   ```
 
-* **`TransactionRunner` retries on every retryable error, with
+- **`TransactionRunner` retries on every retryable error, with
   jittered exponential backoff.**  v1.5 retried only on
   `DeadlockDetected`.  v1.6 retries on every variant returned by
   `NoxuError::is_retryable()` (`LockConflict`, `DeadlockDetected`,
@@ -323,12 +323,12 @@ required.
       .with_jitter(0.1);
   ```
 
-* **`StoredKeySet::add` returns `bool` (newly inserted).**  v1.5 had
+- **`StoredKeySet::add` returns `bool` (newly inserted).**  v1.5 had
   no `add` method; the v1.6 `add` matches `java.util.Set.add`
   semantics (returns `true` on first insert, `false` if already
   present).
 
-* **`TransactionRunner::run`'s closure signature relaxed from `Fn`
+- **`TransactionRunner::run`'s closure signature relaxed from `Fn`
   to `FnMut`.**  Closures may now capture mutable state (e.g. retry
   counters).
 
@@ -337,34 +337,34 @@ required.
 These are previously-broken paths that the engine now executes
 correctly. Code that *depended* on the v1.4.x bug will break.
 
-* **`Database::open_cursor(Some(&txn), ...)` now threads `txn` through
+- **`Database::open_cursor(Some(&txn), ...)` now threads `txn` through
   to the cursor.** Cursors opened on a transactional database
   participate in the transaction as documented. v1.4.x silently
   ignored the argument - every cursor was effectively auto-commit.
   The change can surface as new lock conflicts on workloads that were
   accidentally racing against themselves.
-* **`SecondaryDatabase::open_cursor(Some(&txn), ...)`** - same fix.
-* **`Database::count()` on a sorted-dup database** is now correct;
+- **`SecondaryDatabase::open_cursor(Some(&txn), ...)`** - same fix.
+- **`Database::count()` on a sorted-dup database** is now correct;
   v1.4.x returned 0.
-* **`Database::delete(key)` on a sorted-dup database** now removes
+- **`Database::delete(key)` on a sorted-dup database** now removes
   every duplicate value for `key`. v1.4.x removed only the first
   duplicate.
-* **`Environment::close()` after `txn.commit()` succeeds.** v1.4.x's
+- **`Environment::close()` after `txn.commit()` succeeds.** v1.4.x's
   active-transactions gate fired even after every txn was already
   committed.
-* **`EnvironmentConfig::durability` is honoured.** v1.4.x stored the
+- **`EnvironmentConfig::durability` is honoured.** v1.4.x stored the
   policy on the config but never threaded it into the txn manager.
-* **`TransactionConfig::read_uncommitted` is honoured.** Same shape.
+- **`TransactionConfig::read_uncommitted` is honoured.** Same shape.
 
 ## Cursor `Get` variants (v1.4.x → v1.5)
 
-* **`Get::SearchBoth` on a non-duplicates database now validates the
+- **`Get::SearchBoth` on a non-duplicates database now validates the
   data argument.** A non-matching data returns `NotFound` instead of
   succeeding on the key alone.
-* **`Get::NextDup` / `Get::PrevDup` on a non-duplicates database** now
+- **`Get::NextDup` / `Get::PrevDup` on a non-duplicates database** now
   return `NotFound` (consistent with the no-dups invariant). v1.4.x's
   behaviour was undefined.
-* **`Get::SearchLte`, `Get::FirstDup`, `Get::LastDup`** now return
+- **`Get::SearchLte`, `Get::FirstDup`, `Get::LastDup`** now return
   `NoxuError::Unsupported`. These variants were never wired in v1.4.x
   (the stub paths returned `NotFound` or panicked depending on the
   db shape); v1.5 surfaces a typed error so callers can match against
@@ -372,11 +372,11 @@ correctly. Code that *depended* on the v1.4.x bug will break.
 
 ## Architectural decisions (v1.5)
 
-* **`Environment::begin_transaction(Some(&parent), ...)` returns
+- **`Environment::begin_transaction(Some(&parent), ...)` returns
   `NoxuError::Unsupported` (v1.5) - and the `parent` parameter has been
   removed entirely in v2.0.**  See the v1.5 →
   v2.0 section below for the source-compatibility break.
-* **`SecondaryConfig::with_foreign_key_database` /
+- **`SecondaryConfig::with_foreign_key_database` /
   `with_foreign_key_delete_action` /
   `with_foreign_key_nullifier` /
   `with_foreign_multi_key_nullifier` are rejected at
@@ -397,7 +397,7 @@ correctly. Code that *depended* on the v1.4.x bug will break.
   > and multi-key) - work end-to-end under the caller's txn.  See
   > Secondary database unification.
 
-* **`SecondaryDatabase` cross-primary collisions return
+- **`SecondaryDatabase` cross-primary collisions return
   `NoxuError::Unsupported`.** Decision 1B. v1.4.x silently overwrote
   the first primary's secondary entry when a second primary produced
   the same secondary key. v1.5 rejects the second insert with a typed
@@ -422,13 +422,13 @@ correctly. Code that *depended* on the v1.4.x bug will break.
 
 See the 2026 review.
 
-* **`xa_commit(xid)` / `xa_rollback(xid)` on an XID that exists in
+- **`xa_commit(xid)` / `xa_rollback(xid)` on an XID that exists in
   the persistent `_xa_prepared` log but not in the in-memory
   `branches` map return `XaError::CrashDurabilityNotSupported`.**
   v1.4.x returned the misleading `XaError::NotFound` for the same
   case. The XID is still surfaced by `xa_recover` so operators can
   see what is in doubt; clear it with `xa_forget`.
-* **`xa_prepare` no longer requires `mark_write`.** v1.5 auto-detects
+- **`xa_prepare` no longer requires `mark_write`.** v1.5 auto-detects
   writes via `Transaction::has_logged_entries`. `mark_write` is kept
   as a no-op for source compatibility.
 
@@ -438,13 +438,13 @@ This is the only v1.5 change with a non-trivial source-level
 migration. See
 the 2026 review.
 
-* **`PrimaryIndex::{put, put_no_overwrite, get, delete,
+- **`PrimaryIndex::{put, put_no_overwrite, get, delete,
   delete_with_entity, contains, entities, keys}` now take
   `txn: Option<&Transaction>` as the leading argument.**
   Pass `None` for the historical auto-commit semantics.
-* **`SecondaryIndex::{get, delete, iter, iter_from}` take
+- **`SecondaryIndex::{get, delete, iter, iter_from}` take
   `txn: Option<&Transaction>` as the leading argument.**
-* **DPL secondary indexes are now transactional and persistent.** They
+- **DPL secondary indexes are now transactional and persistent.** They
   are backed by real `noxu-db` `SecondaryDatabase`s opened against the
   primary and maintained inside the active transaction (the JE
   `Store.openSecondaryDatabase` model). Aborting a transaction rolls the
@@ -460,7 +460,7 @@ the 2026 review.
 
 ## Collections and bind (v1.5)
 
-* **`SerdeBinding<T>` payloads now carry a 2-byte
+- **`SerdeBinding<T>` payloads now carry a 2-byte
   `[0xCB, 0x01]` magic + version header.** Records written by
   earlier 1.5 release candidates do **not** carry the header and will
   fail to decode under v1.5 with
@@ -469,7 +469,7 @@ the 2026 review.
   have a maintenance window. The plain tuple bindings
   (`IntBinding`, `LongBinding`, `StringBinding`,
   `SortedDoubleBinding`) are unaffected.
-* **`StoredList::next_index` is now persistent.** Use
+- **`StoredList::next_index` is now persistent.** Use
   `StoredList::open(&db)` (new) when reopening a database that
   already contains entries; it recovers `next_index` from the
   largest existing 8-byte big-endian key.
@@ -479,7 +479,7 @@ the 2026 review.
 
 ## DPL entity record envelope (v1.6)
 
-* **Every entity record stored by `noxu-persist::PrimaryIndex` now
+- **Every entity record stored by `noxu-persist::PrimaryIndex` now
   carries a per-record class-version envelope.**  Pre-v1.6
   records were the raw output of
   `EntitySerializer::serialize`; v1.6 records prepend
@@ -514,20 +514,20 @@ the 2026 review.
   Stores that opened the entity DBs **only** under v1.6 are
   unaffected - the envelope is universal under v1.6.
 
-* **`Entity` trait gained a default `class_version() -> u16` method.**
+- **`Entity` trait gained a default `class_version() -> u16` method.**
   Existing implementations need no change (the default is `0`).
   Bump `class_version()` whenever you change the on-disk shape of an
   entity and supply matching `noxu::persist::evolve::Mutations` via
   `StoreConfig::with_mutations(...)` so the open path can run
   schema evolution for older records.
 
-* **`EntitySerializer` trait gained a default `deserialize_versioned`
+- **`EntitySerializer` trait gained a default `deserialize_versioned`
   method.**  Existing implementations work as-is.  Override
   `deserialize_versioned` when you want field-level evolution that
   reads old records lazily without rewriting them.  See
   [Schema evolution](../collections/entity-persistence.md#schema-evolution).
 
-* **A hidden catalog database
+- **A hidden catalog database
   `__noxu_persist_catalog__<store_name>` is now created in every
   environment that opens an `EntityStore`.**  It records the most
   recent class version observed for each entity name and is
@@ -543,18 +543,18 @@ These are not breakages; they are clarifications. They affect the
 shape of patterns we recommend rather than the source-level signature
 of any method.
 
-* **`secondary.update_secondary(...)` runs auto-committed** even when
+- **`secondary.update_secondary(...)` runs auto-committed** even when
   the surrounding primary write is under a user txn. v1.5 has no
   `associate()` hook; the `update_secondary` call itself does not
   take a transaction. Atomic primary + secondary writes are planned
   for v1.6 alongside Decision 1's sorted-dup + `associate` work. See
   [Secondary Indices with Transactions](../transactions/secondary-with-txn.md).
-* **`Stored*` collection methods now thread `Option<&Transaction>`
+- **`Stored*` collection methods now thread `Option<&Transaction>`
   through every operation** - v1.5's auto-commit-only restriction is
   closed by v1.6 (see [Collections API (v1.5 → v1.6)](#collections-api-v15--v16)
   above).  `TransactionRunner` is now the recommended way to drive
   multi-statement `Stored*` sequences.
-* **Replication is GA in v2.0.** All ten pre-v2.0 blockers were
+- **Replication is GA in v2.0.** All ten pre-v2.0 blockers were
   closed.  See the
   Wave 4-A report for
   per-finding resolution notes.
@@ -649,10 +649,10 @@ for details.
 The `_txn` parameter was silently ignored in v2.x.  In v3.0 it is renamed
 to `txn` and is functional:
 
-* When `txn: Some(&txn)` is supplied and `config.allow_create = true`, the
+- When `txn: Some(&txn)` is supplied and `config.allow_create = true`, the
   database creation is **transactional**.  If the transaction is subsequently
   aborted, the database is rolled back and does not appear in the WAL.
-* `Environment::get_database_names()` now returns **committed names only**.
+- `Environment::get_database_names()` now returns **committed names only**.
   A database created inside an uncommitted transaction is not visible to
   other callers until the transaction commits.
 

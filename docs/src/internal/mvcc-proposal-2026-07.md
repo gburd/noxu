@@ -25,7 +25,7 @@
 > ever becomes a stated hard requirement. Revisit only if that changes; do not
 > restart this research from scratch — this document + the two measurement
 > notes above are the complete evidence trail.
-
+>
 > **Read this first (original framing, preserved).** This document analyses a
 > change that would trade one of Noxu's measured *strengths* for one of its
 > measured *weaknesses*. It is written to inform a decision, not to sell a
