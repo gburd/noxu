@@ -20,9 +20,18 @@ use std::time::{Duration, Instant};
 
 /// State bit representing an exclusive (write) lock.
 pub(crate) const WRITE_LOCKED: u32 = 1 << 30;
+/// State bit indicating at least one writer is blocked waiting to acquire.
+///
+/// New readers refuse to enter while this is set, which is what bounds writer
+/// starvation: a reader stream can no longer hold `state` above zero forever.
+/// A reader that already holds the lock is unaffected -- this gates *admission*,
+/// not existing holders -- so it cannot deadlock a reader that is mid-critical
+/// section, and re-entrant read acquisition is not supported by this lock in
+/// the first place.
+const WRITE_WAITING: u32 = 1 << 31;
 /// Each reader increments the state by this amount.
 const ONE_READER: u32 = 1;
-/// Mask for extracting the reader count.
+/// Mask for extracting the reader count (bits 0-29).
 const READERS_MASK: u32 = WRITE_LOCKED - 1;
 
 /// Futex-based raw reader-writer lock.
@@ -88,9 +97,20 @@ unsafe impl lock_api::RawRwLock for NoxuRawRwLock {
     unsafe fn unlock_shared(&self) {
         let prev = self.state.fetch_sub(ONE_READER, Ordering::Release);
         // If we were the last reader and writers are waiting, wake one writer.
-        if prev == ONE_READER && self.write_waiters.load(Ordering::Relaxed) > 0
+        // Compare only the READER bits: `state` may also carry WRITE_WAITING,
+        // so an equality test against ONE_READER would never match once a
+        // writer has queued -- which would leave that writer parked forever.
+        if prev & READERS_MASK == ONE_READER
+            && self.write_waiters.load(Ordering::Relaxed) > 0
         {
-            futex_wake(&self.state, 1);
+            // Wake ALL waiters, not one. Readers and writers park on the SAME
+            // futex word, so a single wake can land on a reader -- which, seeing
+            // WRITE_WAITING set, immediately re-parks and CONSUMES the wakeup,
+            // leaving the writer asleep with nobody holding the lock. Waking all
+            // guarantees the writer is among them; the readers that wake merely
+            // re-park. The herd is bounded to this one transition (last reader
+            // out with a writer queued), not the steady-state path.
+            futex_wake(&self.state, i32::MAX as u32);
         }
     }
 
@@ -140,11 +160,21 @@ unsafe impl lock_api::RawRwLock for NoxuRawRwLock {
     #[inline]
     unsafe fn unlock_exclusive(&self) {
         self.exclusive_owner.store(0, Ordering::Relaxed);
-        self.state.store(0, Ordering::Release);
+        // Release the WRITE_LOCKED bit but PRESERVE WRITE_WAITING: a blind
+        // `store(0)` would wipe the intent bit published by another queued
+        // writer, re-opening the reader-admission window that starves it.
+        // fetch_and keeps whatever WRITE_WAITING state the queue currently has.
+        self.state.fetch_and(!WRITE_LOCKED & !READERS_MASK, Ordering::Release);
 
         // Wake writers first (reduce write starvation), then readers.
+        //
+        // Wake ALL when a writer is queued, for the same reason as
+        // `unlock_shared`: readers and writers share one futex word, so a
+        // single wake can be consumed by a reader that re-parks on seeing
+        // WRITE_WAITING, stranding the writer. Waking all guarantees the writer
+        // is included; superfluous readers just re-park.
         if self.write_waiters.load(Ordering::Relaxed) > 0 {
-            futex_wake(&self.state, 1);
+            futex_wake(&self.state, i32::MAX as u32);
         } else if self.read_waiters.load(Ordering::Relaxed) > 0 {
             // i32::MAX as u32 — kernel nr_wake is signed; u32::MAX wraps to -1.
             futex_wake(&self.state, i32::MAX as u32);
@@ -222,7 +252,12 @@ impl NoxuRawRwLock {
     #[inline]
     fn try_lock_shared_fast(&self) -> bool {
         let state = self.state.load(Ordering::Relaxed);
-        if state & WRITE_LOCKED != 0 {
+        // Refuse admission while the lock is write-held OR a writer is queued.
+        // The WRITE_WAITING check is what makes writers non-starvable: without
+        // it, an unbroken hand-over-hand reader chain keeps the reader count
+        // above zero indefinitely and the writer's `state == 0` condition is
+        // never observable.
+        if state & (WRITE_LOCKED | WRITE_WAITING) != 0 {
             return false;
         }
         // No overflow check: WRITE_LOCKED bit acts as sentinel.
@@ -241,7 +276,8 @@ impl NoxuRawRwLock {
         loop {
             let state = self.state.load(Ordering::Relaxed);
 
-            if state & WRITE_LOCKED == 0 {
+            // Same admission rule as the fast path: yield to a queued writer.
+            if state & (WRITE_LOCKED | WRITE_WAITING) == 0 {
                 if self
                     .state
                     .compare_exchange_weak(
@@ -282,20 +318,56 @@ impl NoxuRawRwLock {
         }
     }
 
+    /// A queued writer is abandoning its wait (timed out).
+    ///
+    /// Decrements the writer-waiter count and, if we were the LAST queued
+    /// writer, clears `WRITE_WAITING` so readers are admitted again. Leaving the
+    /// bit set with no writer behind it would lock readers out indefinitely --
+    /// trading writer starvation for reader starvation.
+    ///
+    /// Clearing is conditional on being last, and a writer that queues
+    /// concurrently re-sets the bit on its own next loop iteration, so a lost
+    /// race here costs at most a brief window of reader admission, never
+    /// permanent exclusion.
+    fn give_up_waiting(&self) {
+        let prev = self.write_waiters.fetch_sub(1, Ordering::Relaxed);
+        if prev == 1 {
+            self.state.fetch_and(!WRITE_WAITING, Ordering::Relaxed);
+            // A reader may have parked while the bit was set; wake them all so
+            // they re-evaluate admission now that it is cleared.
+            if self.read_waiters.load(Ordering::Relaxed) > 0 {
+                futex_wake(&self.state, i32::MAX as u32);
+            }
+        }
+    }
+
     /// Slow path for exclusive lock with optional deadline.
     fn lock_exclusive_slow(&self, deadline: Option<Instant>) -> bool {
         self.write_waiters.fetch_add(1, Ordering::Relaxed);
+        // Announce our intent so new readers stop entering. Set unconditionally
+        // rather than CAS-once: the bit is sticky for as long as any writer is
+        // queued, and the last writer to leave clears it (see the exit paths
+        // below and `unlock_*`).
+        self.state.fetch_or(WRITE_WAITING, Ordering::Relaxed);
 
         loop {
             let state = self.state.load(Ordering::Relaxed);
 
-            // Lock is fully free (no readers, no writer).
-            if state == 0 {
+            // Acquirable when no readers hold it and no writer owns it. Our own
+            // WRITE_WAITING bit may be set, so compare against that rather than
+            // against a bare zero -- otherwise the writer that published the
+            // bit would never see its own acquire condition become true.
+            if state & (READERS_MASK | WRITE_LOCKED) == 0 {
                 if self
                     .state
                     .compare_exchange_weak(
-                        0,
-                        WRITE_LOCKED,
+                        state,
+                        // Preserve whatever WRITE_WAITING state we observed;
+                        // reconciling it here would race with writers joining
+                        // or leaving between the load and the CAS. The
+                        // authoritative reconciliation happens below, AFTER the
+                        // waiter count has been decremented.
+                        WRITE_LOCKED | (state & WRITE_WAITING),
                         Ordering::Acquire,
                         Ordering::Relaxed,
                     )
@@ -305,7 +377,23 @@ impl NoxuRawRwLock {
                         crate::raw_mutex::thread_id(),
                         Ordering::Relaxed,
                     );
-                    self.write_waiters.fetch_sub(1, Ordering::Relaxed);
+                    // We are no longer a waiter. If nobody is queued behind us,
+                    // clear the admission gate: a WRITE_WAITING bit with no
+                    // writer behind it locks readers out permanently (observed
+                    // as 32 readers parked with zero writers). Decrement FIRST
+                    // so the count we test is authoritative.
+                    if self.write_waiters.fetch_sub(1, Ordering::Relaxed) == 1 {
+                        self.state.fetch_and(!WRITE_WAITING, Ordering::Relaxed);
+                        // Readers may be parked on a state word that included
+                        // WRITE_WAITING. We just changed that word, so their
+                        // futex_wait comparison value is stale; wake them to
+                        // re-evaluate. They will re-park on WRITE_LOCKED (we
+                        // hold it), but not doing this risks a reader parked on
+                        // a value that will never recur.
+                        if self.read_waiters.load(Ordering::Relaxed) > 0 {
+                            futex_wake(&self.state, i32::MAX as u32);
+                        }
+                    }
                     return true;
                 }
                 continue;
@@ -316,7 +404,7 @@ impl NoxuRawRwLock {
                 Some(dl) => {
                     let now = Instant::now();
                     if now >= dl {
-                        self.write_waiters.fetch_sub(1, Ordering::Relaxed);
+                        self.give_up_waiting();
                         return false;
                     }
                     Some(dl - now)
@@ -327,7 +415,7 @@ impl NoxuRawRwLock {
             futex_wait(&self.state, state, timeout);
 
             if deadline.map(|dl| Instant::now() >= dl).unwrap_or(false) {
-                self.write_waiters.fetch_sub(1, Ordering::Relaxed);
+                self.give_up_waiting();
                 return false;
             }
         }

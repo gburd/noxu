@@ -65,7 +65,7 @@
 
 use lock_api::{RawRwLock as _, RawRwLockTimed as _};
 use noxu_sync::NoxuRawRwLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
@@ -80,7 +80,7 @@ const WRITER_GRACE: Duration = Duration::from_millis(600);
 /// the exact sentence in `raw_rwlock.rs`'s design comment. Fully
 /// deterministic: no races, no timing beyond one bounded wait.
 #[test]
-fn a_pending_writer_does_not_block_a_new_reader() {
+fn a_pending_writer_blocks_a_new_reader() {
     let lock = Arc::new(NoxuRawRwLock::INIT);
 
     // Reader 1 holds the lock.
@@ -111,21 +111,21 @@ fn a_pending_writer_does_not_block_a_new_reader() {
     }
     std::thread::sleep(Duration::from_millis(50));
 
-    // THE PROPERTY: with a writer already waiting, a brand-new reader still
-    // acquires immediately. A writer-preferring lock would make this fail.
+    // THE PROPERTY: with a writer already waiting, a brand-new reader is
+    // REFUSED admission. This is the mechanism that bounds writer starvation:
+    // readers may not keep the reader count above zero while a writer is
+    // queued. Readers already holding the lock are unaffected.
     assert!(
-        lock.try_lock_shared(),
-        "a new reader was blocked by the pending writer -- NoxuRawRwLock has \
-         gained writer preference. That is a behaviour change: update this \
-         test, the verdict doc \
-         (docs/src/internal/noxu-sync-vs-parking-lot-2026-09.md), and the \
-         'Non-fair design' comment in raw_rwlock.rs."
+        !lock.try_lock_shared(),
+        "a new reader was admitted while a writer was queued -- the \
+         WRITE_WAITING admission gate in raw_rwlock.rs is not holding, which \
+         re-opens unbounded writer starvation. Update this test only if \
+         writer preference was deliberately removed, and re-measure the \
+         starvation numbers in \
+         docs/src/internal/noxu-sync-vs-parking-lot-2026-09.md."
     );
-    // SAFETY: `try_lock_shared` returned true, so this thread holds a shared
-    // lock; released exactly once here.
-    unsafe { lock.unlock_shared() };
 
-    // Release the original reader so the writer can finally proceed.
+    // Release the original reader so the writer can proceed.
     // SAFETY: this thread holds the shared lock taken at the top of the test.
     unsafe { lock.unlock_shared() };
     writer.join().expect("writer panicked");
@@ -139,7 +139,7 @@ fn a_pending_writer_does_not_block_a_new_reader() {
 /// on any core count: the overlap is enforced by handoff, not by scheduling
 /// luck.
 #[test]
-fn hand_over_hand_readers_starve_the_writer_indefinitely() {
+fn a_hand_over_hand_reader_chain_cannot_starve_the_writer() {
     /// Handoffs in the chain. Each one is a window in which a fair (or
     /// writer-preferring) lock would let the waiting writer through.
     const HANDOFFS: usize = 40;
@@ -169,43 +169,43 @@ fn hand_over_hand_readers_starve_the_writer_indefinitely() {
     }
     std::thread::sleep(Duration::from_millis(30));
 
-    // Hand the lock reader-to-reader. `prev_held` is the guard we are holding;
-    // we take the next shared lock BEFORE dropping it, so the count never
-    // dips to zero and the writer's CAS condition never becomes true.
-    for i in 0..HANDOFFS {
-        // Acquire the next shared hold while still holding the previous one.
-        assert!(
-            lock.try_lock_shared(),
-            "handoff {i}: a reader could not join an already-read-locked \
-             lock while a writer waits -- the non-fair reader path changed"
-        );
-        // Now release the previous hold. Reader count went 1 -> 2 -> 1,
-        // never 0.
-        // SAFETY: two shared holds are outstanding at this point (the one
-        // from before the loop iteration and the one just acquired); this
-        // releases exactly one of them.
+    // Attempt the hand-over-hand chain that USED to starve the writer: take the
+    // next shared hold before releasing the previous one, so the reader count
+    // never dips to zero. With the WRITE_WAITING admission gate this chain can
+    // no longer be sustained -- the very first attempt to join while a writer is
+    // queued is refused, which is precisely what breaks the starvation.
+    let mut joins_admitted = 0usize;
+    for _ in 0..HANDOFFS {
+        if !lock.try_lock_shared() {
+            break;
+        }
+        joins_admitted += 1;
+        // SAFETY: two shared holds are outstanding here; release exactly one.
         unsafe { lock.unlock_shared() };
     }
-
-    // THE PROPERTY: after 40 handoff windows and the full grace period, the
-    // writer still never acquired.
-    assert!(
-        !writer_acquired.load(Ordering::Acquire),
-        "the writer acquired the lock despite an unbroken hand-over-hand \
-         reader chain -- NoxuRawRwLock no longer starves writers. That is a \
-         FIX (or the primitive was retired). Good news, but update: (1) this \
-         test, (2) \
-         docs/src/internal/noxu-sync-vs-parking-lot-2026-09.md, (3) the \
-         env_fair_latches entry in \
-         docs/src/operations/known-limitations.md, and (4) the 'Non-fair \
-         design' comment in raw_rwlock.rs."
+    assert_eq!(
+        joins_admitted, 0,
+        "a reader joined an already-read-locked lock while a writer was \
+         queued; the chain that starves writers is still constructible"
     );
 
-    // Release the final hold; the writer's timed acquire may now succeed or
-    // may already have timed out. Either way it terminates.
-    // SAFETY: exactly one shared hold remains outstanding here.
+    // Release the reader that was held before the writer queued; the writer
+    // must then acquire, because no new reader can slip in ahead of it.
+    // SAFETY: this thread still holds the shared lock taken at the top.
     unsafe { lock.unlock_shared() };
     writer.join().expect("writer panicked");
+
+    // THE PROPERTY: the writer acquired within its grace period rather than
+    // being starved by the reader chain.
+    assert!(
+        writer_acquired.load(Ordering::Acquire),
+        "the writer FAILED to acquire within its grace period even though no \
+         new reader could join -- writer starvation has regressed. Check the \
+         WRITE_WAITING gate in try_lock_shared_fast/lock_shared_slow and that \
+         unlock_shared's last-reader test masks READERS_MASK (an unmasked \
+         equality test never fires once WRITE_WAITING is set, which parks the \
+         writer forever)."
+    );
 }
 
 /// Control: a **single** reader that fully releases between acquisitions does
@@ -263,4 +263,91 @@ fn a_single_non_overlapping_reader_does_not_starve_the_writer() {
         "a single reader that fully releases must leave state==0 windows the \
          writer can claim, but the writer never acquired"
     );
+}
+
+/// Writer preference must not deadlock a mixed reader/writer population.
+///
+/// Every deadlock introduced while implementing the `WRITE_WAITING` admission
+/// gate showed up here and nowhere else, so this is the test that earns its
+/// keep. Three distinct bugs were caught by exactly this shape:
+///
+/// 1. `unlock_shared`'s last-reader test compared the whole state word against
+///    `ONE_READER`; once `WRITE_WAITING` was set that equality never held, so
+///    the queued writer was never woken.
+/// 2. `futex_wake(.., 1)` could hand the single wakeup to a reader, which
+///    re-parked on seeing `WRITE_WAITING` and *consumed* it, stranding the
+///    writer with nobody holding the lock.
+/// 3. The acquiring writer reconciled `WRITE_WAITING` from a count read BEFORE
+///    its CAS, so a concurrent writer leaving in that window could leave the
+///    gate set with no writer behind it -- locking every reader out forever
+///    (observed as 32 readers parked, 0 writers).
+///
+/// A regression in any of those hangs this test rather than failing it, so it
+/// carries its own watchdog: the worker threads must report completion within
+/// the deadline or the assertion fires.
+#[test]
+fn mixed_readers_and_writers_make_progress_without_deadlock() {
+    const THREADS: usize = 16;
+    const RUN: Duration = Duration::from_secs(2);
+    /// Generous: the point is liveness, not throughput.
+    const DEADLINE: Duration = Duration::from_secs(30);
+
+    let lock = Arc::new(NoxuRawRwLock::INIT);
+    let stop = Arc::new(AtomicBool::new(false));
+    let ops = Arc::new(AtomicU64::new(0));
+    let finished = Arc::new(AtomicUsize::new(0));
+
+    let mut handles = Vec::new();
+    for t in 0..THREADS {
+        let lock = Arc::clone(&lock);
+        let stop = Arc::clone(&stop);
+        let ops = Arc::clone(&ops);
+        let finished = Arc::clone(&finished);
+        handles.push(std::thread::spawn(move || {
+            let mut i = t;
+            while !stop.load(Ordering::Relaxed) {
+                // Mostly readers with a steady trickle of writers: the mix that
+                // keeps the admission gate churning.
+                if i % 32 == 0 {
+                    lock.lock_exclusive();
+                    // SAFETY: acquired exclusively above; released once here.
+                    unsafe { lock.unlock_exclusive() };
+                } else {
+                    lock.lock_shared();
+                    // SAFETY: acquired shared above; released once here.
+                    unsafe { lock.unlock_shared() };
+                }
+                i = i.wrapping_add(1);
+                ops.fetch_add(1, Ordering::Relaxed);
+            }
+            finished.fetch_add(1, Ordering::Relaxed);
+        }));
+    }
+
+    std::thread::sleep(RUN);
+    stop.store(true, Ordering::Relaxed);
+
+    // Watchdog: poll for completion instead of joining, so a deadlock produces
+    // a readable assertion rather than an indefinitely hung test binary.
+    let start = std::time::Instant::now();
+    while finished.load(Ordering::Relaxed) < THREADS {
+        assert!(
+            start.elapsed() < DEADLINE,
+            "only {}/{THREADS} threads finished after {:?} -- the rwlock \
+             deadlocked. Check (1) that unlock_shared masks READERS_MASK before \
+             its last-reader test, (2) that both unlock paths wake ALL waiters \
+             when a writer is queued (readers and writers share one futex \
+             word, so a single wake can be consumed by a reader that re-parks), \
+             and (3) that an acquiring writer clears WRITE_WAITING only AFTER \
+             decrementing write_waiters.",
+            finished.load(Ordering::Relaxed),
+            start.elapsed()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    for h in handles {
+        h.join().expect("worker panicked");
+    }
+
+    assert!(ops.load(Ordering::Relaxed) > 0, "no operations completed at all");
 }
