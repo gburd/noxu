@@ -38,6 +38,29 @@ pub(crate) const WRITE_LOCKED: u32 = 1 << 30;
 /// section, and re-entrant read acquisition is not supported by this lock in
 /// the first place.
 const WRITE_WAITING: u32 = 1 << 31;
+/// Spin attempts a writer makes before closing the reader-admission gate.
+///
+/// Tuned by measurement against the B-tree root -- the most-traversed lock in
+/// the engine, read-latched by every descent. Engine read throughput at 64
+/// threads (ycsb_c, idle 64-vCPU box), with `parking_lot` at 664k ops/s for
+/// reference:
+///
+/// | spin | throughput |
+/// |---:|---:|
+/// | 0 (gate fires immediately) | 78k |
+/// | 40 | 139k |
+/// | **400** | **649k** |
+/// | 4000 | 657k |
+///
+/// 400 is the knee; beyond it the curve is flat, so the extra spinning only
+/// delays a genuinely starved writer for nothing. Starvation stays fixed at this
+/// value: 6,510 writes completed against 63 hammering readers (versus **one**
+/// before the gate existed), with a 0.58 ms worst wait against `parking_lot`'s
+/// 0.60 ms.
+///
+/// The gate must not fire for a momentary overlap with a departing reader, only
+/// for a writer that is actually being starved.
+const WRITE_SPIN_ATTEMPTS: u32 = 400;
 /// Each reader increments the state by this amount.
 const ONE_READER: u32 = 1;
 /// Mask for extracting the reader count (bits 0-29).
@@ -348,13 +371,75 @@ impl NoxuRawRwLock {
         }
     }
 
+    /// A writer that just ACQUIRED stops being a waiter; reconcile the gate.
+    ///
+    /// If nobody is queued behind us, `WRITE_WAITING` must be cleared: a gate
+    /// left set with no writer behind it locks readers out permanently (observed
+    /// as 32 readers parked with zero writers). The decrement happens FIRST so
+    /// the count we test is authoritative -- reading it before the acquiring CAS
+    /// races with writers joining or leaving in that window.
+    ///
+    /// BOTH acquire paths (the initial spin and the parked loop) must call this.
+    /// An early return that skips it is exactly how the gate gets stranded.
+    fn stopped_waiting_after_acquire(&self) {
+        if self.write_waiters.fetch_sub(1, Ordering::Relaxed) == 1 {
+            self.state.fetch_and(!WRITE_WAITING, Ordering::Relaxed);
+            // Readers may be parked on a state word that included
+            // WRITE_WAITING; we just changed it, so their futex_wait comparison
+            // value can no longer recur. Wake them to re-evaluate (they will
+            // re-park on WRITE_LOCKED, which we now hold).
+            if self.read_waiters.load(Ordering::Relaxed) > 0 {
+                futex_wake(&self.state, i32::MAX as u32);
+            }
+        }
+    }
+
     /// Slow path for exclusive lock with optional deadline.
     fn lock_exclusive_slow(&self, deadline: Option<Instant>) -> bool {
         self.write_waiters.fetch_add(1, Ordering::Relaxed);
-        // Announce our intent so new readers stop entering. Set unconditionally
-        // rather than CAS-once: the bit is sticky for as long as any writer is
-        // queued, and the last writer to leave clears it (see the exit paths
-        // below and `unlock_*`).
+
+        // Spin briefly BEFORE closing the reader-admission gate.
+        //
+        // Publishing WRITE_WAITING immediately is correct but ruinous on a
+        // node that every thread traverses: the B-tree root is read-latched by
+        // every descent, so a writer that slams the gate shut the instant it
+        // fails its first CAS stalls every reader in the engine behind one
+        // background split or eviction. Measured at 64 threads read-heavy:
+        // 78k ops/s with an immediate gate vs 631k with no gate at all vs
+        // parking_lot's 691k.
+        //
+        // Most contention here is a brief overlap with a reader that is about
+        // to release. Spinning through that window keeps the barging fast path
+        // for the common case and reserves the gate for a writer that is
+        // genuinely being starved — the same trade `parking_lot` makes by
+        // setting WRITER_BIT only once a writer has actually parked.
+        for _ in 0..WRITE_SPIN_ATTEMPTS {
+            let state = self.state.load(Ordering::Relaxed);
+            if state & (READERS_MASK | WRITE_LOCKED) == 0 {
+                if self
+                    .state
+                    .compare_exchange_weak(
+                        state,
+                        WRITE_LOCKED | (state & WRITE_WAITING),
+                        Ordering::Acquire,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+                {
+                    self.exclusive_owner.store(
+                        crate::raw_mutex::thread_id(),
+                        Ordering::Relaxed,
+                    );
+                    self.stopped_waiting_after_acquire();
+                    return true;
+                }
+                continue;
+            }
+            std::hint::spin_loop();
+        }
+
+        // Spinning did not get us in: we are genuinely queued, so close the
+        // gate. Sticky while any writer waits; the last one out clears it.
         self.state.fetch_or(WRITE_WAITING, Ordering::Relaxed);
 
         loop {
@@ -384,23 +469,7 @@ impl NoxuRawRwLock {
                         crate::raw_mutex::thread_id(),
                         Ordering::Relaxed,
                     );
-                    // We are no longer a waiter. If nobody is queued behind us,
-                    // clear the admission gate: a WRITE_WAITING bit with no
-                    // writer behind it locks readers out permanently (observed
-                    // as 32 readers parked with zero writers). Decrement FIRST
-                    // so the count we test is authoritative.
-                    if self.write_waiters.fetch_sub(1, Ordering::Relaxed) == 1 {
-                        self.state.fetch_and(!WRITE_WAITING, Ordering::Relaxed);
-                        // Readers may be parked on a state word that included
-                        // WRITE_WAITING. We just changed that word, so their
-                        // futex_wait comparison value is stale; wake them to
-                        // re-evaluate. They will re-park on WRITE_LOCKED (we
-                        // hold it), but not doing this risks a reader parked on
-                        // a value that will never recur.
-                        if self.read_waiters.load(Ordering::Relaxed) > 0 {
-                            futex_wake(&self.state, i32::MAX as u32);
-                        }
-                    }
+                    self.stopped_waiting_after_acquire();
                     return true;
                 }
                 continue;
