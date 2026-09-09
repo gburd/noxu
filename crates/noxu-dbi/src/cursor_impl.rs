@@ -1031,12 +1031,24 @@ impl CursorImpl {
                     let slot_lsn = slot.lsn;
                     let slot_index = slot.slot_index;
                     let bin_arc = slot.bin_arc;
-                    // If a writer held the write lock when we called lock_ln,
-                    // our pre-fetched slot_data is stale — re-read from the BIN
-                    // after the writer commits/aborts.  If lock_ln returned
-                    // immediately (no contention), slot_data is still valid.
+                    // `slot_data` was captured BEFORE `lock_ln`, so a writer
+                    // that acquired, mutated and released the slot inside that
+                    // window would leave us holding stale bytes.  Contention
+                    // reported by `lock_ln` is not a sufficient signal: the
+                    // writer may have come and gone between the pre-fetch and
+                    // the lock request, in which case the lock is granted
+                    // immediately and `contended` is false while `slot_data` is
+                    // already wrong.  Re-validate the slot's LSN under the BIN
+                    // latch instead — an O(1) check on the slot we already
+                    // hold, no tree descent — and only trust the pre-fetch when
+                    // the LSN is unchanged.  (X-10 regression: this window let
+                    // a READ_COMMITTED secondary cursor observe an aborting
+                    // writer's uncommitted primary data.)
                     let contended = self.lock_ln(slot_lsn)?;
-                    let final_data = if contended {
+                    let final_data = if contended
+                        || Self::slot_lsn_changed(
+                            &bin_arc, slot_index, slot_lsn,
+                        ) {
                         let db = self.db_impl.read();
                         db.get_real_tree()
                             .and_then(|tree| {
@@ -1112,7 +1124,10 @@ impl CursorImpl {
                     let slot_index = slot.slot_index;
                     let bin_arc = slot.bin_arc;
                     let contended = self.lock_ln(slot_lsn)?;
-                    let final_data = if contended {
+                    let final_data = if contended
+                        || Self::slot_lsn_changed(
+                            &bin_arc, slot_index, slot_lsn,
+                        ) {
                         let db = self.db_impl.read();
                         db.get_real_tree()
                             .and_then(|tree| {
@@ -1438,6 +1453,38 @@ impl CursorImpl {
     /// Returns `Err(DbiError::TxnError(TxnError::RangeRestart))` if a
     /// concurrent `RangeInsert` owner caused a range restart — the caller
     /// must abort the current scan position and restart the operation.
+    /// Has the BIN slot we pre-fetched changed since we captured it?
+    ///
+    /// Cursor reads capture a slot's data BEFORE requesting its record lock, so
+    /// a writer that acquires, mutates and releases the slot inside that window
+    /// leaves the pre-fetched bytes stale. Contention reported by `lock_ln` does
+    /// not cover that case: if the writer has already finished, the lock is
+    /// granted immediately and no contention is seen, yet the captured data is
+    /// already wrong.
+    ///
+    /// Comparing the slot's LSN against the pre-fetched one closes that window
+    /// for the cost of one BIN latch and an index — no tree descent — because
+    /// every write to a record logs a new entry and installs a new LSN in the
+    /// slot.
+    fn slot_lsn_changed(
+        bin_arc: &std::sync::Arc<
+            noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>,
+        >,
+        slot_index: usize,
+        pre_fetched_lsn: u64,
+    ) -> bool {
+        let guard = bin_arc.read();
+        match &*guard {
+            noxu_tree::tree::TreeNode::Bottom(bin) => {
+                slot_index < bin.entries.len()
+                    && bin.get_lsn(slot_index).as_u64() != pre_fetched_lsn
+            }
+            // Slot no longer lives in a BIN (split/compress): fall back to the
+            // re-read rather than trusting the pre-fetch.
+            _ => true,
+        }
+    }
+
     fn lock_ln(&self, lsn: u64) -> Result<bool, DbiError> {
         if lsn == noxu_util::NULL_LSN.as_u64() {
             return Ok(false);
