@@ -15,6 +15,8 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+## [7.6.2] - 2026-09-09
+
 ## [7.6.1] - 2026-09-09
 
 ### Fixed
