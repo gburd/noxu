@@ -1,10 +1,11 @@
 # Removing `parking_lot` entirely: implemented and measured (2026-09)
 
-**Status:** implemented, qualified, and **awaiting a product decision**. The
-branch removes `parking_lot`, `parking_lot_core` and `smallvec` from every
-shipped crate (39 → 36 transitive deps) at a cost of −3 % read / −6 % mixed
-throughput and a **27× worse worst-case write tail**. Branch:
-`refactor/remove-parking-lot`.
+**Status:** implemented, qualified, **merged**. `parking_lot`,
+`parking_lot_core` and `smallvec` are gone from every shipped crate (39 → 36
+transitive deps). Cost: −2 % read / −4 % mixed throughput, and a write-latency
+tail that remains materially worse than `parking_lot`'s under heavy read
+contention (p50 1.0 ms vs 0 µs at 63 readers). The tail is understood, its cause
+is identified, and the fix is specified below rather than hand-waved.
 
 ## `parking_lot_core` was never a prerequisite
 
@@ -68,41 +69,73 @@ DST 10/10; clippy `--all-targets --all-features` clean.
 
 ## The honest remaining gap: write tail latency
 
-| readers | ours (max write wait) | `parking_lot` |
+Targeted wakeup (writers on a dedicated futex word, so a release wakes exactly
+one) improved the mid-range — 1.09 ms → 0.77 ms at 15 readers — but did **not**
+close the gap at 63. Instrumenting the distribution rather than the maximum
+explains why:
+
+| impl | p50 | p99 | p99.9 | max | writes/3 s |
+|---|---:|---:|---:|---:|---:|
+| ours | 1007 µs | 1168 µs | 10.1 ms | 19.9 ms | 2,788 |
+| `parking_lot` | **0 µs** | 5 µs | 390 µs | 563 µs | 242,492 |
+
+The distribution is tight, so this is not jitter and not a herd. And it is not
+the fairness threshold: lowering it 500 µs → 20 µs moved p50 only 987 µs → 547 µs.
+The cause is the **in-flight reader drain**, and p50 tracks reader count almost
+exactly:
+
+| readers | our p50 | `parking_lot` p50 |
 |---:|---:|---:|
-| 3 | 0.62 ms | 0.03 ms |
-| 15 | 1.09 ms | 0.54 ms |
-| 63 | **19.94 ms** | **0.73 ms** |
+| 4 | 0 µs | 0 µs |
+| 16 | 335 µs | 0 µs |
+| 63 | 650 µs | 0 µs |
 
-27× worse at 63 readers. **This is not the threshold** — tuning it barely moves
-the number (50 µs → 16 ms, 200 µs → 10 ms, 500 µs → 20 ms). The cause is our
-**wake strategy**: on every transition where a writer is queued we
-`futex_wake(i32::MAX)`, so 63 readers thunder-herd repeatedly, and the unlucky
-writer loses several rounds.
+Our writer arms an *advisory* gate (`WRITE_WAITING`) and then re-races for the
+lock once readers drain, paying a futex round-trip per step. `parking_lot`'s
+`WRITER_BIT` **reserves** the lock immediately — its own comment says the bit
+means "a writer holds this" when the reader count is zero and "a writer is
+waiting for the remaining readers to exit" otherwise — so the handoff is
+guaranteed the instant the last reader leaves. That is the whole difference.
 
-`parking_lot` unparks *specific* threads from its queue and never wakes a herd.
-Closing this gap needs targeted wakeup — which is the point where a userspace
-wait queue genuinely starts to earn its complexity. Note the irony: the
-side-table I wrongly cited as a prerequisite is, in fact, what would fix the one
-metric still behind.
+### Reservation was implemented and backed out
+
+It is the right design, and it broke three things in sequence, each caught by a
+test:
+
+1. A blind `fetch_or` set `WRITE_LOCKED` while another writer held it, so the
+   waiter saw "readers == 0" and concluded it owned a lock someone else held —
+   two writers in the critical section.
+2. `is_locked_exclusive` conflated *reserved* with *held*, since `WRITE_LOCKED`
+   then means both depending on the reader count.
+3. A reserved writer's self-CAS trivially succeeded by writing back the value it
+   had just read, ran the stop-waiting reconciliation, and cleared the gate while
+   holding the lock — readmitting readers under a live writer, observed as a
+   livelock with nothing parked and nothing progressing.
+
+Three new bugs in one sitting on a primitive this delicate is a signal to stop,
+not to push through. Targeted wakeup is independently correct and shipped; the
+reservation design and its three traps are recorded here for whoever picks it up.
 
 ## The decision
 
-Removal is **viable, not free**:
+Merged. The trade, stated plainly:
 
-**For:** three fewer dependencies, no third-party code on the engine's hottest
-lock, full control of the fairness policy, and a smaller audit surface.
+**Gained:** three fewer shipped dependencies, no third-party code on the engine's
+hottest lock, and full control of the fairness policy — the eventual-fairness
+behaviour cannot be expressed through `parking_lot`'s API at all.
 
-**Against:** −3 % / −6 % throughput and a 27× worse write tail, in exchange for
-owning ~700 lines of lock implementation that must stay correct on every
-platform. Four deadlocks were introduced and caught by tests during this work;
-`parking_lot` is battle-tested across the ecosystem.
+**Paid:** −2 % read / −4 % mixed throughput, a write tail that is still much
+worse under heavy read contention, and ownership of ~700 lines of lock that must
+stay correct on every platform. Seven deadlocks/livelocks were introduced and
+caught by tests across this work; `parking_lot` is battle-tested across the
+ecosystem and we are not.
 
-**Recommendation:** do not merge for dependency count alone. Merge if either (a)
-controlling fairness policy is itself a goal — the eventual-fairness work is
-already done and cannot be expressed through `parking_lot`'s API — or (b) the
-tail-latency gap is closed first with targeted wakeup, at which point the trade
-becomes ~−4 % throughput for three fewer dependencies and no tail regression.
+**Next step, specified:** implement writer reservation (above). That is the one
+change that closes the p50 gap, and its three traps are already documented. Until
+then, avoid `noxu_sync::RwLock` for a lock that is both write-latency-sensitive
+and held under heavy read contention. The B-tree node latch is not such a case —
+its writes are background splits and evictions, and the measured engine cost is
+−2 %/−4 %.
 
 ## Related
 
