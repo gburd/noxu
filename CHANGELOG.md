@@ -19,6 +19,21 @@ listed in [References](#references).
 
 ### Fixed
 
+- **`noxu_sync::RwLock`'s writer-preference gate now spins before closing, fixing
+  a severe throughput cliff on hot locks.** The v7.6.1 starvation fix published
+  `WRITE_WAITING` the instant a writer failed its first CAS, which is correct but
+  ruinous on a lock that every thread traverses: one background writer stalls
+  every reader behind it. Measured by swapping the B-tree node latch (read-latched
+  by every descent) onto this lock — engine read throughput at 64 threads was
+  **78k ops/s** with an immediate gate versus **631k** with no gate at all.
+  Writers now spin 400 times before closing the gate, which recovers **649k**
+  (within 2 % of `parking_lot`'s 664k) while keeping starvation fixed: 6,510
+  writes against 63 hammering readers (versus **one** before the gate existed),
+  worst wait 0.58 ms against `parking_lot`'s 0.60 ms. The spin count is tuned by
+  measurement and the curve is flat beyond it. This only affected the tree when
+  the swap was applied experimentally, but the same cliff was latent for every
+  production user of this lock (the database catalog and txn manager).
+
 - **`noxu_sync::RwLock` starved writers unboundedly; it is now
   writer-preferring.** There was no writer-waiting bit at all — a queued writer
   waited for `state == 0` while nothing stopped new readers from incrementing
