@@ -51,6 +51,22 @@ listed in [References](#references).
 
 ### Documentation
 
+- **Replacing `parking_lot` with `noxu-sync` everywhere: implemented, measured,
+  rejected.** The swap was carried out in full (seven edits; workspace builds,
+  6329/6333 tests pass), so this is a performance decision rather than a
+  feasibility one. Engine A/B at 64 threads on an idle 64-vCPU box: read-only is
+  competitive (645k vs 656k ops/s, −1.7 %) but **mixed read/write is 2.9× slower**
+  (175k vs 498k). Disabling the writer-preference gate closes it to −3 %, which
+  identifies the fairness *policy*, not the primitive, as the cost: every B-tree
+  descent read-latches the root, so unconditional writer preference lets one
+  background split or eviction stall every reader. `parking_lot` uses *eventual*
+  fairness and avoids this. Two premises also failed on inspection — `parking_lot`
+  is already an unconditional dependency of six crates (so copying it removes
+  nothing), and `read_arc` turned out not to be a structural blocker once the
+  newtype became a type alias. Preserved unmerged on
+  `spike/noxu-sync-everywhere`; see
+  `docs/src/internal/parking-lot-swap-evaluation-2026-09.md`.
+
 - **Lock-free BIN generation counter: measured and declined.** Investigated as a
   cheaper alternative to the `READ_COMMITTED` dirty-read fix's per-read BIN
   latch. The ceiling is 16.8 ns/read (17.12 ns for an uncontended latch + `u64`
