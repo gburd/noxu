@@ -314,7 +314,7 @@ mod tests {
     // via reset_for_test()/join(); serialize them so parallel test threads do
     // not race on that shared state.  (Predates the eviction-policy feature
     // gating; surfaced more often once the feature adds test count.)
-    static SERIAL: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    static SERIAL: noxu_sync::Mutex<()> = noxu_sync::Mutex::new(());
 
     fn params(budget: i64) -> SharedCacheParams {
         SharedCacheParams {

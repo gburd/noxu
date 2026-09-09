@@ -164,7 +164,7 @@ metrics = "0.24"
 
 # External crates (approved core set)
 hashbrown = "0.15"
-lock_api = "0.4"
+lock_api = { version = "0.4", features = ["arc_lock"] }
 libc = "0.2"
 parking_lot = { version = "0.12", features = ["arc_lock"] }
 thiserror = "2"

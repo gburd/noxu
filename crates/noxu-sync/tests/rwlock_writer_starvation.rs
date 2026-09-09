@@ -41,7 +41,7 @@
 //! ## These are characterisation tests, not correctness tests
 //!
 //! They assert *current, documented* behaviour, and the recommendation on the
-//! table is to retire this primitive for `parking_lot::RwLock`. They exist so
+//! table is to retire this primitive for `noxu_sync::RwLock`. They exist so
 //! the property cannot be silently changed or forgotten: if the starvation is
 //! ever fixed these fail loudly and say what else to update. The distinction
 //! between "this is what it does" and "this is what it should do" is the
@@ -80,7 +80,7 @@ const WRITER_GRACE: Duration = Duration::from_millis(600);
 /// the exact sentence in `raw_rwlock.rs`'s design comment. Fully
 /// deterministic: no races, no timing beyond one bounded wait.
 #[test]
-fn a_pending_writer_blocks_a_new_reader() {
+fn a_pending_writer_blocks_a_new_reader_after_the_fairness_threshold() {
     let lock = Arc::new(NoxuRawRwLock::INIT);
 
     // Reader 1 holds the lock.
@@ -111,10 +111,13 @@ fn a_pending_writer_blocks_a_new_reader() {
     }
     std::thread::sleep(Duration::from_millis(50));
 
-    // THE PROPERTY: with a writer already waiting, a brand-new reader is
-    // REFUSED admission. This is the mechanism that bounds writer starvation:
-    // readers may not keep the reader count above zero while a writer is
-    // queued. Readers already holding the lock are unaffected.
+    // THE PROPERTY: the lock is EVENTUALLY fair, not immediately writer-
+    // preferring. A brand-new reader is admitted while the writer is still
+    // inside its fairness grace period (that is what keeps hot nodes fast), and
+    // is refused once the writer has waited past FAIRNESS_THRESHOLD.
+    //
+    // The 50 ms sleep above is far beyond the 500 us threshold, so by now the
+    // gate must be closed.
     assert!(
         !lock.try_lock_shared(),
         "a new reader was admitted while a writer was queued -- the \
@@ -183,10 +186,16 @@ fn a_hand_over_hand_reader_chain_cannot_starve_the_writer() {
         // SAFETY: two shared holds are outstanding here; release exactly one.
         unsafe { lock.unlock_shared() };
     }
-    assert_eq!(
-        joins_admitted, 0,
-        "a reader joined an already-read-locked lock while a writer was \
-         queued; the chain that starves writers is still constructible"
+    // Under EVENTUAL fairness the first few joins may succeed (the writer is
+    // still inside its grace period); what must not happen is the chain running
+    // unbroken for all HANDOFFS, because that is the unbounded starvation this
+    // guards. The writer arms the gate after FAIRNESS_THRESHOLD and the chain
+    // then breaks.
+    assert!(
+        joins_admitted < HANDOFFS,
+        "a reader joined on all {HANDOFFS} handoffs while a writer waited; the \
+         chain that starves writers is still constructible, so the fairness \
+         deadline never armed the WRITE_WAITING gate"
     );
 
     // Release the reader that was held before the writer queued; the writer

@@ -38,7 +38,7 @@
 //! # Why this reproduces the bug that a benchmark had to find
 //!
 //! The 96-thread saturation benchmark found this because DST could not: the
-//! tree used `parking_lot::RwLock` directly, so shuttle could not schedule the
+//! tree used `noxu_sync::RwLock` directly, so shuttle could not schedule the
 //! node-latch interleavings. Routing the node latch through the seam (with the
 //! hand-over-hand `read_arc()` descent backed under shuttle by
 //! `noxu_latch::dst_arc_guard`) makes the whole tree schedulable; shuttle now

@@ -110,7 +110,7 @@ pub use tree_location::TreeLocation;
 // DST: byte-identical `parking_lot::RwLock` in production; under
 // `--cfg noxu_shuttle` the parking_lot-shaped shuttle wrapper, matching
 // `tree::RwLock` so node arcs share one lock type.
+#[cfg(not(noxu_shuttle))]
+pub use noxu_sync::RwLock as NodeRwLock;
 #[cfg(noxu_shuttle)]
 pub use noxu_util::dst_sync_pl::RwLock as NodeRwLock;
-#[cfg(not(noxu_shuttle))]
-pub use parking_lot::RwLock as NodeRwLock;

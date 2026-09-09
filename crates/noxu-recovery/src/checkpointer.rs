@@ -2148,8 +2148,8 @@ mod tests {
 
     #[test]
     fn test_is_checkpointed() {
+        use noxu_sync::RwLock as NodeRwLock;
         use noxu_tree::tree::{BinStub, TreeNode};
-        use parking_lot::RwLock as NodeRwLock;
 
         // Build a BIN node with last_full_lsn = NULL_LSN.
         let bin = BinStub {

@@ -38,10 +38,10 @@ use noxu_util::{Lsn, NULL_LSN};
 // itself because it is `#![forbid(unsafe_code)]`).  Under the default cfg
 // `read_arc()`/`ArcRwLockReadGuard` are parking_lot's own zero-cost inherent
 // API — no shim in the graph.
+#[cfg(not(noxu_shuttle))]
+use noxu_sync::RwLock;
 #[cfg(noxu_shuttle)]
 use noxu_util::dst_sync_pl::RwLock;
-#[cfg(not(noxu_shuttle))]
-use parking_lot::RwLock;
 
 // The Arc-owning read guard for the hand-over-hand descent.  Default =
 // parking_lot's own inherent type (zero-cost, byte-identical).  Under shuttle =
@@ -50,7 +50,7 @@ use parking_lot::RwLock;
 // via `noxu_latch::dst_arc_guard::ReadArc` under shuttle.
 #[cfg(not(noxu_shuttle))]
 type NodeArcReadGuard =
-    parking_lot::ArcRwLockReadGuard<parking_lot::RawRwLock, TreeNode>;
+    lock_api::ArcRwLockReadGuard<noxu_sync::NoxuRawRwLock, TreeNode>;
 #[cfg(noxu_shuttle)]
 type NodeArcReadGuard = noxu_latch::dst_arc_guard::ArcRwLockReadGuard<TreeNode>;
 #[cfg(noxu_shuttle)]
@@ -14314,8 +14314,8 @@ mod tests {
 #[test]
 fn test_split_child_sibling_inherits_expiration_in_hours() {
     use crate::tree::{BIN_LEVEL, BinEntry, BinStub, MAIN_LEVEL, TreeNode};
+    use noxu_sync::RwLock;
     use noxu_util::{Lsn, NULL_LSN};
-    use parking_lot::RwLock;
     use std::sync::Arc;
 
     // Manually build a tree with one BIN (4 entries, expiration_in_hours=true).
