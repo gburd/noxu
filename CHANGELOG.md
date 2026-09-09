@@ -15,6 +15,328 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Fixed
+
+- **A `READ_COMMITTED` cursor could return an aborting writer's uncommitted
+  data (dirty read).** Cursor reads captured a BIN slot's data *before*
+  requesting the record lock, then trusted those pre-fetched bytes whenever
+  `lock_ln` did not report contention. That signal does not cover the
+  time-of-check/time-of-use window: a writer that acquired, mutated and released
+  the slot *between* the pre-fetch and the lock request is granted-immediately
+  from the reader's point of view, so `contended` is false while the captured
+  data is already stale. A secondary cursor resolving its primary hit this
+  directly -- `secondary_decisions_test::test_x10` observed secondary key `"A"`
+  resolving to primary `"K"` with data `"Bvalue"`, the writer's uncommitted and
+  subsequently *aborted* value. Fixed by re-validating the slot's LSN under the
+  BIN latch (`CursorImpl::slot_lsn_changed`) and re-reading when it moved; both
+  affected search arms (`Set`/`Both` and `SetRange`/`BothRange`) now route
+  through the one guard. Measured: the failure reproduced ~42% of runs
+  (5/12) on the previous code and 0/20 with the fix.
+
+- **`noxu-rep`: `CommitFreezeLatch` is now wired into the election and replay
+  paths.** The latch was a complete, unit-tested port of JE's
+  `CommitFreezeLatch` but was referenced nowhere outside its own file, so a
+  node could keep advancing its commit VLSN while an election round it had
+  promised in was still in flight — the VLSN/DTVLSN it advertised in a Promise
+  could no longer describe it by the time the proposer chose a value in phase
+  2. Mirroring JE's call sites: an acceptor calls `freeze` when it grants a
+  promise, just before advertising its `(dtvlsn, vlsn)` ranking
+  (`MasterSuggestionGenerator.getRanking`); it calls `vlsn_event` when the
+  `ElectionResult` arrives (`MasterChangeListener.notify`) and on every other
+  phase-2 exit so an unresolved round cannot pin the latch; the election driver
+  clears the latch after every round outcome (won / lost / no quorum); and
+  `EnvironmentLogWriter::write_entry` awaits the thaw before logging a replayed
+  `TxnCommit` (`Replay.replayEntry`), leaving non-commit entries ungated.
+  `ReplicatedEnvironment::close` clears the latch so a blocked replay thread
+  observes the shutdown (`Replica.shutdown`). The wait is bounded by the
+  latch's own 5s freeze timeout, so a never-resolving election degrades to the
+  previous behaviour rather than stalling the replay thread.
+
+  **Ranking subtlety worth preserving** (a non-obvious way to break this): the
+  latch thaws only when the frozen proposal is *not* better-than the incoming
+  event, i.e. it compares proposals using Noxu's **election-ranking** order
+  (dtvlsn, vlsn, priority, term, name) — not JE's monotone time-based proposal
+  order. A bare term therefore does not order rounds: a laggard's *later* round
+  could rank as "worse" and its `ElectionResult` would fail to lift the freeze.
+  The `round_proposal(term)` helper exists precisely for this — it encodes the
+  term into *every* dominant ranking key so freeze/thaw pairs order by election
+  round. Verified non-vacuously: removing the round check makes the shuttle
+  model find a stale round-6 event thawing round 7.
+- **Replication: the syncup matchpoint search compared node-local LSNs, so no
+  real cross-node syncup could ever succeed.** `find_matchpoint` and
+  `replica_syncup_handshake` required `feeder_entry.lsn == replica_entry.lsn`
+  in addition to matching record contents. An LSN is a node-local
+  (file, offset) address, so two nodes holding the *same* replicated record
+  essentially never agree on one — every genuine cross-node matchpoint search
+  dead-ended in `Matchpoint::None` and demanded a needless full network
+  restore, leaving the diverged-tail rollback path unreachable in practice.
+  Record equality is now content-based only, matching JE
+  `OutputWireRecord.match`
+  (`header.logicalEqualsIgnoreVersion(...) && entry.logicalEquals(...)`, which
+  never compares LSNs); each node keeps its own LSN as its local
+  rollback/streaming target. The existing `rep1_step5_live_syncup_test` could
+  not catch this because both test nodes wrote byte-identical logs, so their
+  LSNs coincidentally agreed; it now forces divergent log layouts and fails if
+  the LSN predicate is reintroduced.
+
+- **`Environment::invalidate()` did not invalidate open `Database` handles.**
+  There are two invalidity flags: `Environment`'s own `env_valid` bool, and the
+  `Arc<AtomicBool>` on `EnvironmentImpl` that every open `Database` and
+  `Cursor` clones at open time so its `check_open` fast path never has to take
+  `env_impl.lock()` (X-13). `Environment::invalidate()` set only the first, so
+  `env.is_valid()` correctly reported `false` while already-open `Database`
+  handles kept serving reads and accepting writes — directly contradicting the
+  method's own doc comment ("all subsequent public API calls return
+  `EnvironmentFailure`"). It now sets both, preserving the lock-free fast path.
+  The bug was latent because `Environment::invalidate()` has no in-crate
+  callers yet; a daemon wired to call it on a fatal error would have found that
+  application threads carried on writing to a corrupt environment. Found by a
+  new `database.rs` test that asserts an invalidated environment fails
+  `Database` operations distinctly from `DatabaseClosed`.
+
+- **`Database::stats(fast = false)` and `Database::preload` over-reported the
+  record count.** `Tree::collect_stats` accumulated its entry counter across
+  *every* node, summing BIN slots (records) together with upper-IN slots
+  (routing entries). Both consumers wanted a record count: `DatabaseStats`
+  maps it to `leaf_node_count` (JE `getLNCount()`) and `PreloadStats` to
+  `lns_loaded`. So a 64-record database in one BIN under one upper IN reported
+  65 records from the full-walk path while the O(1) `fast = true` path
+  correctly reported 64, and the overcount grew with tree height and fanout.
+
+  The field is renamed `TreeStats::n_entries` → `n_leaf_entries` and now counts
+  BIN slots only, which fixes both callers at once. The rename is deliberate:
+  the old name is what invited the wrong summation, and `TreeStats` is public
+  API on `noxu-tree`. Found by a new `stats_config` test that asserts the fast
+  and full paths agree on the record count — the existing suite's only
+  `stats(fast = false)` caller asserted `bottom_internal_node_count` and never
+  the record count, so nothing caught it.
+
+- **`noxu-rep`: `CommitFreezeLatch` is now wired into the election and replay
+  paths.** The latch was a complete, unit-tested port of JE's
+  `CommitFreezeLatch` but was referenced nowhere outside its own file, so a
+  node could keep advancing its commit VLSN while an election round it had
+  promised in was still in flight — the VLSN/DTVLSN it advertised in a Promise
+  could no longer describe it by the time the proposer chose a value in phase
+  2. Mirroring JE's call sites: an acceptor calls `freeze` when it grants a
+  promise, just before advertising its `(dtvlsn, vlsn)` ranking
+  (`MasterSuggestionGenerator.getRanking`); it calls `vlsn_event` when the
+  `ElectionResult` arrives (`MasterChangeListener.notify`) and on every other
+  phase-2 exit so an unresolved round cannot pin the latch; the election driver
+  clears the latch after every round outcome (won / lost / no quorum); and
+  `EnvironmentLogWriter::write_entry` awaits the thaw before logging a replayed
+  `TxnCommit` (`Replay.replayEntry`), leaving non-commit entries ungated.
+  `ReplicatedEnvironment::close` clears the latch so a blocked replay thread
+  observes the shutdown (`Replica.shutdown`). The wait is bounded by the
+  latch's own 5s freeze timeout, so a never-resolving election degrades to the
+  previous behaviour rather than stalling the replay thread.
+
+  **Ranking subtlety worth preserving** (a non-obvious way to break this): the
+  latch thaws only when the frozen proposal is *not* better-than the incoming
+  event, i.e. it compares proposals using Noxu's **election-ranking** order
+  (dtvlsn, vlsn, priority, term, name) — not JE's monotone time-based proposal
+  order. A bare term therefore does not order rounds: a laggard's *later* round
+  could rank as "worse" and its `ElectionResult` would fail to lift the freeze.
+  The `round_proposal(term)` helper exists precisely for this — it encodes the
+  term into *every* dominant ranking key so freeze/thaw pairs order by election
+  round. Verified non-vacuously: removing the round check makes the shuttle
+  model find a stale round-6 event thawing round 7.
+- **Replication: the syncup matchpoint search compared node-local LSNs, so no
+  real cross-node syncup could ever succeed.** `find_matchpoint` and
+  `replica_syncup_handshake` required `feeder_entry.lsn == replica_entry.lsn`
+  in addition to matching record contents. An LSN is a node-local
+  (file, offset) address, so two nodes holding the *same* replicated record
+  essentially never agree on one — every genuine cross-node matchpoint search
+  dead-ended in `Matchpoint::None` and demanded a needless full network
+  restore, leaving the diverged-tail rollback path unreachable in practice.
+  Record equality is now content-based only, matching JE
+  `OutputWireRecord.match`
+  (`header.logicalEqualsIgnoreVersion(...) && entry.logicalEquals(...)`, which
+  never compares LSNs); each node keeps its own LSN as its local
+  rollback/streaming target. The existing `rep1_step5_live_syncup_test` could
+  not catch this because both test nodes wrote byte-identical logs, so their
+  LSNs coincidentally agreed; it now forces divergent log layouts and fails if
+  the LSN predicate is reintroduced.
+
+### Added
+
+- **Replication HA: the bilateral syncup matchpoint protocol is now wired into
+  the live replica-join path, and a diverged replica is rolled back to the
+  verified matchpoint (or refused).** Previously the decision core
+  (`find_matchpoint` / `verify_rollback`) and the rollback executor
+  (`ReplicatedEnvironment::syncup_with_feeder` → `noxu_recovery::rollback` +
+  `VlsnIndex::truncate_after`) both existed but were unreachable in
+  production: `become_replica` went straight to `catch_up_from_peer_until`,
+  and no node registered a syncup service, so a replica whose log had a
+  divergent tail past the matchpoint (an old master, or a node that kept
+  accepting writes through a partition) streamed the master's history *on top
+  of* its own non-accepted records and stayed silently diverged from the
+  cluster's accepted history. Now:
+  - `SyncupService` (new) answers the feeder half of the handshake on
+    `SYNCUP_SERVICE_NAME`, registered on every node that has an `env_home`
+    (eagerly at construction, else lazily by `with_environment`). Port of JE
+    `FeederReplicaSyncup`.
+  - `RemoteFeederView` (new) is a `SyncupView` whose per-VLSN lookups
+    round-trip over the syncup channel, so the existing decision + rollback
+    core runs unchanged with the feeder's half of the record comparison coming
+    off the network (JE `ReplicaFeederSyncup.getFeederRecord`).
+  - `ReplicatedEnvironment::syncup_with_feeder_at(addr)` (new) runs the
+    handshake against a feeder and releases the feeder's loop with
+    `StartStream` or `RestoreRequest` as JE does.
+  - `become_replica`'s replica thread runs syncup **before** its first stream:
+    a rolled-back (or non-diverged) replica proceeds to catch-up; a detected
+    divergence that cannot be repaired stops replication with an
+    operator-visible error instead of streaming over the diverged tail; a
+    feeder that does not offer the service falls through to streaming
+    (unchanged pre-existing behaviour).
+- **`SyncupAction::DivergedRefused` — detected-and-refused divergence.**
+  A deliberately conservative middle case between rollback and full network
+  restore. `classify_tail` (new, in `noxu-rep::stream::syncup`) discards a
+  divergent tail **only** when every entry above the matchpoint is a
+  provisional (transactional) LN, which `ReplicaReplay` buffers and never
+  applies to the live B-tree until its commit arrives; such a tail can be
+  dropped from the log and VLSN index completely. Any other tail — a
+  non-transactional LN (applied to the live tree immediately), a structural
+  entry (possibly referenced by a live parent IN, the hazard JE documents in
+  `ReplicaFeederSyncup.verifyRollback`), a transaction end, or an undecodable
+  entry type — leaves the log **entirely untouched** and returns
+  `DivergedRefused { matchpoint_vlsn, tail_len, reason }` with the offending
+  entry named for the operator. The reason: this build performs JE
+  `Replay.rollback` steps 1 and 3–5 (RollbackStart, make-invisible, fsync,
+  RollbackEnd) but not step 2, the in-memory `TxnChain` revert, so truncating
+  an already-applied tail would leave the tree holding a record the cluster
+  never accepted. Log truncation is irreversible; a refusal is recoverable via
+  network restore. **Still missing** (follow-up): the step-2 in-memory tree
+  revert, which is what would widen the safe-truncate window to cover applied
+  tails.
+
+- **Replication HA: the bilateral syncup matchpoint protocol is now wired into
+  the live replica-join path, and a diverged replica is rolled back to the
+  verified matchpoint (or refused).** Previously the decision core
+  (`find_matchpoint` / `verify_rollback`) and the rollback executor
+  (`ReplicatedEnvironment::syncup_with_feeder` → `noxu_recovery::rollback` +
+  `VlsnIndex::truncate_after`) both existed but were unreachable in
+  production: `become_replica` went straight to `catch_up_from_peer_until`,
+  and no node registered a syncup service, so a replica whose log had a
+  divergent tail past the matchpoint (an old master, or a node that kept
+  accepting writes through a partition) streamed the master's history *on top
+  of* its own non-accepted records and stayed silently diverged from the
+  cluster's accepted history. Now:
+  - `SyncupService` (new) answers the feeder half of the handshake on
+    `SYNCUP_SERVICE_NAME`, registered on every node that has an `env_home`
+    (eagerly at construction, else lazily by `with_environment`). Port of JE
+    `FeederReplicaSyncup`.
+  - `RemoteFeederView` (new) is a `SyncupView` whose per-VLSN lookups
+    round-trip over the syncup channel, so the existing decision + rollback
+    core runs unchanged with the feeder's half of the record comparison coming
+    off the network (JE `ReplicaFeederSyncup.getFeederRecord`).
+  - `ReplicatedEnvironment::syncup_with_feeder_at(addr)` (new) runs the
+    handshake against a feeder and releases the feeder's loop with
+    `StartStream` or `RestoreRequest` as JE does.
+  - `become_replica`'s replica thread runs syncup **before** its first stream:
+    a rolled-back (or non-diverged) replica proceeds to catch-up; a detected
+    divergence that cannot be repaired stops replication with an
+    operator-visible error instead of streaming over the diverged tail; a
+    feeder that does not offer the service falls through to streaming
+    (unchanged pre-existing behaviour).
+- **`SyncupAction::DivergedRefused` — detected-and-refused divergence.**
+  A deliberately conservative middle case between rollback and full network
+  restore. `classify_tail` (new, in `noxu-rep::stream::syncup`) discards a
+  divergent tail **only** when every entry above the matchpoint is a
+  provisional (transactional) LN, which `ReplicaReplay` buffers and never
+  applies to the live B-tree until its commit arrives; such a tail can be
+  dropped from the log and VLSN index completely. Any other tail — a
+  non-transactional LN (applied to the live tree immediately), a structural
+  entry (possibly referenced by a live parent IN, the hazard JE documents in
+  `ReplicaFeederSyncup.verifyRollback`), a transaction end, or an undecodable
+  entry type — leaves the log **entirely untouched** and returns
+  `DivergedRefused { matchpoint_vlsn, tail_len, reason }` with the offending
+  entry named for the operator. The reason: this build performs JE
+  `Replay.rollback` steps 1 and 3–5 (RollbackStart, make-invisible, fsync,
+  RollbackEnd) but not step 2, the in-memory `TxnChain` revert, so truncating
+  an already-applied tail would leave the tree holding a record the cluster
+  never accepted. Log truncation is irreversible; a refusal is recoverable via
+  network restore. **Still missing** (follow-up): the step-2 in-memory tree
+  revert, which is what would widen the safe-truncate window to cover applied
+  tails.
+
+### Removed
+
+- **BREAKING: the consolidation-array Log Write Latch is retired** — the
+  feature and its public config knob are removed outright:
+  - `noxu-config`: the `LOG_CONSOLIDATION_ARRAY` param
+    (`noxu.log.consolidationArray`) and its registry entry.
+  - `noxu-db`: `EnvironmentConfig::log_consolidation_array` and
+    `set_log_consolidation_array()`.
+  - `noxu-dbi`: `DbiEnvConfig::log_consolidation_array` and the
+    `NOXU_LOG_CONSOLIDATION_ARRAY` env override in `EnvironmentImpl::open()`.
+  - `noxu-log`: `crates/noxu-log/src/consolidation.rs`,
+    `LogManager::set_use_consolidation_array()`, the branch in `log_internal`
+    that chose it, the `shuttle_consolidation` DST model, and the
+    `test_consolidation_array_stress_64t_prev_offset_chain` stress test.
+  - `benches/noxu-bench`: the `BENCH_CONSOLIDATION` env knob.
+
+  **Why:** it contains a deterministic self-deadlock. `run_as_leader` reverses
+  the LIFO join stack to arrival order, which places the LEADER FIRST, so the
+  leader takes its own log-buffer pin and holds it across the whole batch; the
+  pin only drops in `segment.put()` after `run_as_leader` returns. Any batch of
+  >= 2 that needs a buffer flip therefore wedges — a later member blocks in
+  `wait_for_zero_and_latch` on a pin that cannot drain until the batch ends,
+  and the batch cannot end until that wait returns. Verified by gdb on a
+  21-hour hung test process. Full analysis:
+  `.agent/archived-audits/consolidation-array-deadlock-2026-09.md`.
+
+  **Why removal and not deprecation:** the knob defaulted to `false`, so the
+  shipped write path never used it; it was measured ~100x SLOWER on spread
+  arrivals (batch-size-1 degeneration); and the write-ceiling problem that
+  motivated it was solved by other means (the 7.5.2 cleaner-throttle fix plus
+  the group-commit piggyback, measured `batch_factor` ~25:1, which is what
+  ships). There are no external users, and the 7.2 "moot knobs deleted
+  outright" removal is precedent. Retiring it also removes 5 of `noxu-log`'s
+  12 `unsafe` blocks (now 7) and one test-matrix axis. **Migration:** delete
+  any `set_log_consolidation_array(...)` call and any
+  `noxu.log.consolidationArray` / `NOXU_LOG_CONSOLIDATION_ARRAY` setting; the
+  classic mutex LWL (always the default) is now the only write path.
+
+  The group-commit / `FsyncManager` piggyback machinery is untouched.
+
+- **BREAKING: the consolidation-array Log Write Latch is retired** — the
+  feature and its public config knob are removed outright:
+  - `noxu-config`: the `LOG_CONSOLIDATION_ARRAY` param
+    (`noxu.log.consolidationArray`) and its registry entry.
+  - `noxu-db`: `EnvironmentConfig::log_consolidation_array` and
+    `set_log_consolidation_array()`.
+  - `noxu-dbi`: `DbiEnvConfig::log_consolidation_array` and the
+    `NOXU_LOG_CONSOLIDATION_ARRAY` env override in `EnvironmentImpl::open()`.
+  - `noxu-log`: `crates/noxu-log/src/consolidation.rs`,
+    `LogManager::set_use_consolidation_array()`, the branch in `log_internal`
+    that chose it, the `shuttle_consolidation` DST model, and the
+    `test_consolidation_array_stress_64t_prev_offset_chain` stress test.
+  - `benches/noxu-bench`: the `BENCH_CONSOLIDATION` env knob.
+
+  **Why:** it contains a deterministic self-deadlock. `run_as_leader` reverses
+  the LIFO join stack to arrival order, which places the LEADER FIRST, so the
+  leader takes its own log-buffer pin and holds it across the whole batch; the
+  pin only drops in `segment.put()` after `run_as_leader` returns. Any batch of
+  >= 2 that needs a buffer flip therefore wedges — a later member blocks in
+  `wait_for_zero_and_latch` on a pin that cannot drain until the batch ends,
+  and the batch cannot end until that wait returns. Verified by gdb on a
+  21-hour hung test process. Full analysis:
+  `.agent/archived-audits/consolidation-array-deadlock-2026-09.md`.
+
+  **Why removal and not deprecation:** the knob defaulted to `false`, so the
+  shipped write path never used it; it was measured ~100x SLOWER on spread
+  arrivals (batch-size-1 degeneration); and the write-ceiling problem that
+  motivated it was solved by other means (the 7.5.2 cleaner-throttle fix plus
+  the group-commit piggyback, measured `batch_factor` ~25:1, which is what
+  ships). There are no external users, and the 7.2 "moot knobs deleted
+  outright" removal is precedent. Retiring it also removes 5 of `noxu-log`'s
+  12 `unsafe` blocks (now 7) and one test-matrix axis. **Migration:** delete
+  any `set_log_consolidation_array(...)` call and any
+  `noxu.log.consolidationArray` / `NOXU_LOG_CONSOLIDATION_ARRAY` setting; the
+  classic mutex LWL (always the default) is now the only write path.
+
+  The group-commit / `FsyncManager` piggyback machinery is untouched.
+
 ### Testing
 
 - **`noxu-dbi` and `noxu-db` raised over the >85% coverage mandate on
@@ -211,178 +533,6 @@ listed in [References](#references).
   exercised a manual `Clone`/copy-style method (e.g. `copy_all_info`,
   `copy_write_lock_info`) or checked additional real behavior alongside the
   copy were left in place.
-
-### Fixed
-
-- **`Environment::invalidate()` did not invalidate open `Database` handles.**
-  There are two invalidity flags: `Environment`'s own `env_valid` bool, and the
-  `Arc<AtomicBool>` on `EnvironmentImpl` that every open `Database` and
-  `Cursor` clones at open time so its `check_open` fast path never has to take
-  `env_impl.lock()` (X-13). `Environment::invalidate()` set only the first, so
-  `env.is_valid()` correctly reported `false` while already-open `Database`
-  handles kept serving reads and accepting writes — directly contradicting the
-  method's own doc comment ("all subsequent public API calls return
-  `EnvironmentFailure`"). It now sets both, preserving the lock-free fast path.
-  The bug was latent because `Environment::invalidate()` has no in-crate
-  callers yet; a daemon wired to call it on a fatal error would have found that
-  application threads carried on writing to a corrupt environment. Found by a
-  new `database.rs` test that asserts an invalidated environment fails
-  `Database` operations distinctly from `DatabaseClosed`.
-
-- **`Database::stats(fast = false)` and `Database::preload` over-reported the
-  record count.** `Tree::collect_stats` accumulated its entry counter across
-  *every* node, summing BIN slots (records) together with upper-IN slots
-  (routing entries). Both consumers wanted a record count: `DatabaseStats`
-  maps it to `leaf_node_count` (JE `getLNCount()`) and `PreloadStats` to
-  `lns_loaded`. So a 64-record database in one BIN under one upper IN reported
-  65 records from the full-walk path while the O(1) `fast = true` path
-  correctly reported 64, and the overcount grew with tree height and fanout.
-
-  The field is renamed `TreeStats::n_entries` → `n_leaf_entries` and now counts
-  BIN slots only, which fixes both callers at once. The rename is deliberate:
-  the old name is what invited the wrong summation, and `TreeStats` is public
-  API on `noxu-tree`. Found by a new `stats_config` test that asserts the fast
-  and full paths agree on the record count — the existing suite's only
-  `stats(fast = false)` caller asserted `bottom_internal_node_count` and never
-  the record count, so nothing caught it.
-
-- **`noxu-rep`: `CommitFreezeLatch` is now wired into the election and replay
-  paths.** The latch was a complete, unit-tested port of JE's
-  `CommitFreezeLatch` but was referenced nowhere outside its own file, so a
-  node could keep advancing its commit VLSN while an election round it had
-  promised in was still in flight — the VLSN/DTVLSN it advertised in a Promise
-  could no longer describe it by the time the proposer chose a value in phase
-  2. Mirroring JE's call sites: an acceptor calls `freeze` when it grants a
-  promise, just before advertising its `(dtvlsn, vlsn)` ranking
-  (`MasterSuggestionGenerator.getRanking`); it calls `vlsn_event` when the
-  `ElectionResult` arrives (`MasterChangeListener.notify`) and on every other
-  phase-2 exit so an unresolved round cannot pin the latch; the election driver
-  clears the latch after every round outcome (won / lost / no quorum); and
-  `EnvironmentLogWriter::write_entry` awaits the thaw before logging a replayed
-  `TxnCommit` (`Replay.replayEntry`), leaving non-commit entries ungated.
-  `ReplicatedEnvironment::close` clears the latch so a blocked replay thread
-  observes the shutdown (`Replica.shutdown`). The wait is bounded by the
-  latch's own 5s freeze timeout, so a never-resolving election degrades to the
-  previous behaviour rather than stalling the replay thread.
-
-  **Ranking subtlety worth preserving** (a non-obvious way to break this): the
-  latch thaws only when the frozen proposal is *not* better-than the incoming
-  event, i.e. it compares proposals using Noxu's **election-ranking** order
-  (dtvlsn, vlsn, priority, term, name) — not JE's monotone time-based proposal
-  order. A bare term therefore does not order rounds: a laggard's *later* round
-  could rank as "worse" and its `ElectionResult` would fail to lift the freeze.
-  The `round_proposal(term)` helper exists precisely for this — it encodes the
-  term into *every* dominant ranking key so freeze/thaw pairs order by election
-  round. Verified non-vacuously: removing the round check makes the shuttle
-  model find a stale round-6 event thawing round 7.
-- **Replication: the syncup matchpoint search compared node-local LSNs, so no
-  real cross-node syncup could ever succeed.** `find_matchpoint` and
-  `replica_syncup_handshake` required `feeder_entry.lsn == replica_entry.lsn`
-  in addition to matching record contents. An LSN is a node-local
-  (file, offset) address, so two nodes holding the *same* replicated record
-  essentially never agree on one — every genuine cross-node matchpoint search
-  dead-ended in `Matchpoint::None` and demanded a needless full network
-  restore, leaving the diverged-tail rollback path unreachable in practice.
-  Record equality is now content-based only, matching JE
-  `OutputWireRecord.match`
-  (`header.logicalEqualsIgnoreVersion(...) && entry.logicalEquals(...)`, which
-  never compares LSNs); each node keeps its own LSN as its local
-  rollback/streaming target. The existing `rep1_step5_live_syncup_test` could
-  not catch this because both test nodes wrote byte-identical logs, so their
-  LSNs coincidentally agreed; it now forces divergent log layouts and fails if
-  the LSN predicate is reintroduced.
-
-### Added
-
-- **Replication HA: the bilateral syncup matchpoint protocol is now wired into
-  the live replica-join path, and a diverged replica is rolled back to the
-  verified matchpoint (or refused).** Previously the decision core
-  (`find_matchpoint` / `verify_rollback`) and the rollback executor
-  (`ReplicatedEnvironment::syncup_with_feeder` → `noxu_recovery::rollback` +
-  `VlsnIndex::truncate_after`) both existed but were unreachable in
-  production: `become_replica` went straight to `catch_up_from_peer_until`,
-  and no node registered a syncup service, so a replica whose log had a
-  divergent tail past the matchpoint (an old master, or a node that kept
-  accepting writes through a partition) streamed the master's history *on top
-  of* its own non-accepted records and stayed silently diverged from the
-  cluster's accepted history. Now:
-  - `SyncupService` (new) answers the feeder half of the handshake on
-    `SYNCUP_SERVICE_NAME`, registered on every node that has an `env_home`
-    (eagerly at construction, else lazily by `with_environment`). Port of JE
-    `FeederReplicaSyncup`.
-  - `RemoteFeederView` (new) is a `SyncupView` whose per-VLSN lookups
-    round-trip over the syncup channel, so the existing decision + rollback
-    core runs unchanged with the feeder's half of the record comparison coming
-    off the network (JE `ReplicaFeederSyncup.getFeederRecord`).
-  - `ReplicatedEnvironment::syncup_with_feeder_at(addr)` (new) runs the
-    handshake against a feeder and releases the feeder's loop with
-    `StartStream` or `RestoreRequest` as JE does.
-  - `become_replica`'s replica thread runs syncup **before** its first stream:
-    a rolled-back (or non-diverged) replica proceeds to catch-up; a detected
-    divergence that cannot be repaired stops replication with an
-    operator-visible error instead of streaming over the diverged tail; a
-    feeder that does not offer the service falls through to streaming
-    (unchanged pre-existing behaviour).
-- **`SyncupAction::DivergedRefused` — detected-and-refused divergence.**
-  A deliberately conservative middle case between rollback and full network
-  restore. `classify_tail` (new, in `noxu-rep::stream::syncup`) discards a
-  divergent tail **only** when every entry above the matchpoint is a
-  provisional (transactional) LN, which `ReplicaReplay` buffers and never
-  applies to the live B-tree until its commit arrives; such a tail can be
-  dropped from the log and VLSN index completely. Any other tail — a
-  non-transactional LN (applied to the live tree immediately), a structural
-  entry (possibly referenced by a live parent IN, the hazard JE documents in
-  `ReplicaFeederSyncup.verifyRollback`), a transaction end, or an undecodable
-  entry type — leaves the log **entirely untouched** and returns
-  `DivergedRefused { matchpoint_vlsn, tail_len, reason }` with the offending
-  entry named for the operator. The reason: this build performs JE
-  `Replay.rollback` steps 1 and 3–5 (RollbackStart, make-invisible, fsync,
-  RollbackEnd) but not step 2, the in-memory `TxnChain` revert, so truncating
-  an already-applied tail would leave the tree holding a record the cluster
-  never accepted. Log truncation is irreversible; a refusal is recoverable via
-  network restore. **Still missing** (follow-up): the step-2 in-memory tree
-  revert, which is what would widen the safe-truncate window to cover applied
-  tails.
-
-### Removed
-
-- **BREAKING: the consolidation-array Log Write Latch is retired** — the
-  feature and its public config knob are removed outright:
-  - `noxu-config`: the `LOG_CONSOLIDATION_ARRAY` param
-    (`noxu.log.consolidationArray`) and its registry entry.
-  - `noxu-db`: `EnvironmentConfig::log_consolidation_array` and
-    `set_log_consolidation_array()`.
-  - `noxu-dbi`: `DbiEnvConfig::log_consolidation_array` and the
-    `NOXU_LOG_CONSOLIDATION_ARRAY` env override in `EnvironmentImpl::open()`.
-  - `noxu-log`: `crates/noxu-log/src/consolidation.rs`,
-    `LogManager::set_use_consolidation_array()`, the branch in `log_internal`
-    that chose it, the `shuttle_consolidation` DST model, and the
-    `test_consolidation_array_stress_64t_prev_offset_chain` stress test.
-  - `benches/noxu-bench`: the `BENCH_CONSOLIDATION` env knob.
-
-  **Why:** it contains a deterministic self-deadlock. `run_as_leader` reverses
-  the LIFO join stack to arrival order, which places the LEADER FIRST, so the
-  leader takes its own log-buffer pin and holds it across the whole batch; the
-  pin only drops in `segment.put()` after `run_as_leader` returns. Any batch of
-  >= 2 that needs a buffer flip therefore wedges — a later member blocks in
-  `wait_for_zero_and_latch` on a pin that cannot drain until the batch ends,
-  and the batch cannot end until that wait returns. Verified by gdb on a
-  21-hour hung test process. Full analysis:
-  `.agent/archived-audits/consolidation-array-deadlock-2026-09.md`.
-
-  **Why removal and not deprecation:** the knob defaulted to `false`, so the
-  shipped write path never used it; it was measured ~100x SLOWER on spread
-  arrivals (batch-size-1 degeneration); and the write-ceiling problem that
-  motivated it was solved by other means (the 7.5.2 cleaner-throttle fix plus
-  the group-commit piggyback, measured `batch_factor` ~25:1, which is what
-  ships). There are no external users, and the 7.2 "moot knobs deleted
-  outright" removal is precedent. Retiring it also removes 5 of `noxu-log`'s
-  12 `unsafe` blocks (now 7) and one test-matrix axis. **Migration:** delete
-  any `set_log_consolidation_array(...)` call and any
-  `noxu.log.consolidationArray` / `NOXU_LOG_CONSOLIDATION_ARRAY` setting; the
-  classic mutex LWL (always the default) is now the only write path.
-
-  The group-commit / `FsyncManager` piggyback machinery is untouched.
 
 ### CI / Testing
 
