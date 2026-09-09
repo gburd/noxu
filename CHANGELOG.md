@@ -15,6 +15,41 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING: `parking_lot` is removed from every shipped Noxu crate.**
+  `parking_lot`, `parking_lot_core` and `smallvec` are gone from the dependency
+  graph — `noxu-db`'s transitive count drops **39 → 36**. It remains only as a
+  `dev-dependency` of `noxu-sync`, for the A/B benchmark that measures against
+  it. `noxu_sync::RwLock` is now a `lock_api` type alias rather than a newtype
+  (so it exposes `lock_api`'s full inherent API, including `read_arc`), and the
+  B-tree node latch, `noxu-recovery`'s checkpointer and `noxu-evictor` all use
+  `noxu-sync`.
+
+  The earlier claim that this required re-implementing `parking_lot_core`'s
+  global hash table was **wrong**: that table exists because `parking_lot`'s
+  `RawRwLock` is a single word with nowhere to store waiters. `NoxuRawRwLock` is
+  28 bytes and parks on the kernel futex — the futex *is* the parking lot, so
+  there was nothing to port. Three crates (`noxu-cleaner`, `noxu-engine`,
+  `noxu-util`) turned out to declare the dependency without using it at all.
+
+  Cost, measured at 64 threads on an idle 64-vCPU box: read-only 654k → 646k
+  ops/s (**−2 %**), mixed read/write 504k → 484k (**−4 %**). Write tail latency
+  under heavy read contention remains worse than `parking_lot`'s (p50 1.0 ms vs
+  0 µs at 63 readers); the cause is the in-flight reader drain and the fix
+  (writer reservation) is specified in
+  `docs/src/internal/parking-lot-removal-2026-09.md`.
+
+### Performance
+
+- **`noxu_sync::RwLock` writers now park on a dedicated futex word.** Readers and
+  writers previously shared `state`, which forced `futex_wake(ALL)` on every
+  transition — waking one was unsound there, since the wakeup could land on a
+  reader that re-parks and swallows it. Writers now get a targeted single wakeup,
+  improving the worst-case write wait at 15 readers from 1.09 ms to 0.77 ms. Also
+  fixes a latent lost wakeup where a writer timing out with other writers queued
+  failed to pass the baton, letting them sleep through a free lock.
+
 ## [7.6.2] - 2026-09-09
 
 ## [7.6.1] - 2026-09-09
@@ -1125,6 +1160,39 @@ breaking cleanup ships as 7.x while there are no downstream users.
 ## [7.5.4] - 2026-07-22
 
 ### Changed
+
+- **BREAKING: `parking_lot` is removed from every shipped Noxu crate.**
+  `parking_lot`, `parking_lot_core` and `smallvec` are gone from the dependency
+  graph — `noxu-db`'s transitive count drops **39 → 36**. It remains only as a
+  `dev-dependency` of `noxu-sync`, for the A/B benchmark that measures against it.
+  `noxu_sync::RwLock` is now a `lock_api` type alias rather than a newtype (so it
+  exposes `lock_api`'s full inherent API, including `read_arc`), and the B-tree
+  node latch, `noxu-recovery`'s checkpointer and `noxu-evictor` all use
+  `noxu-sync`.
+
+  The earlier claim that this required re-implementing `parking_lot_core`'s global
+  hash table was **wrong**: that table exists because `parking_lot`'s `RawRwLock`
+  is a single word with nowhere to store waiters. `NoxuRawRwLock` is 28 bytes and
+  parks on the kernel futex — the futex *is* the parking lot, so there was nothing
+  to port. Three crates (`noxu-cleaner`, `noxu-engine`, `noxu-util`) turned out to
+  declare the dependency without using it at all.
+
+  Cost, measured at 64 threads on an idle 64-vCPU box: read-only 654k → 646k ops/s
+  (**−2 %**), mixed read/write 504k → 484k (**−4 %**). Write tail latency under
+  heavy read contention remains worse than `parking_lot`'s (p50 1.0 ms vs 0 µs at
+  63 readers); the cause is the in-flight reader drain, and the fix (writer
+  reservation) is specified in
+  `docs/src/internal/parking-lot-removal-2026-09.md`.
+
+### Performance
+
+- **`noxu_sync::RwLock` writers now park on a dedicated futex word.** Readers and
+  writers previously shared `state`, which forced `futex_wake(ALL)` on every
+  transition — waking one was unsound there, since the wakeup could land on a
+  reader that re-parks and swallows it. Writers now get a targeted single wakeup,
+  improving the worst-case write wait at 15 readers from 1.09 ms to 0.77 ms. Also
+  fixes a latent lost wakeup where a writer timing out with other writers queued
+  failed to pass the baton, letting them sleep through a free lock.
 
 - **LRU restored as the default cache-eviction policy; CLOCK/LIRS/ARC/CAR/
   CoolHot moved behind an experimental feature.** An external review flagged the

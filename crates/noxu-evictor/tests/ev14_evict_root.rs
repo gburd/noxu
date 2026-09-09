@@ -20,7 +20,7 @@ fn make_log(dir: &std::path::Path) -> Arc<noxu_log::LogManager> {
 fn log_and_detach_all_bins(tree: &Tree, lm: &noxu_log::LogManager) {
     let root = tree.get_root().expect("root");
     let mut ids = Vec::new();
-    fn collect(arc: &Arc<parking_lot::RwLock<TreeNode>>, out: &mut Vec<u64>) {
+    fn collect(arc: &Arc<noxu_sync::RwLock<TreeNode>>, out: &mut Vec<u64>) {
         let g = arc.read();
         match &*g {
             TreeNode::Bottom(b) => out.push(b.node_id),
@@ -34,9 +34,9 @@ fn log_and_detach_all_bins(tree: &Tree, lm: &noxu_log::LogManager) {
     collect(&root, &mut ids);
     for id in ids {
         fn find(
-            arc: &Arc<parking_lot::RwLock<TreeNode>>,
+            arc: &Arc<noxu_sync::RwLock<TreeNode>>,
             id: u64,
-        ) -> Option<Arc<parking_lot::RwLock<TreeNode>>> {
+        ) -> Option<Arc<noxu_sync::RwLock<TreeNode>>> {
             let g = arc.read();
             match &*g {
                 TreeNode::Bottom(b) if b.node_id == id => Some(arc.clone()),

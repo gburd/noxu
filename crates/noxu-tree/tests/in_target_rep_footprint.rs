@@ -19,10 +19,10 @@
 use std::mem::size_of;
 use std::sync::Arc;
 
+use noxu_sync::RwLock;
 use noxu_tree::tree::TreeNode;
 use noxu_tree::{ChildArc, InEntry, InNodeStub, KeyRep, LsnRep, TargetRep};
 use noxu_util::Lsn;
-use parking_lot::RwLock;
 
 const MAIN_LEVEL: i32 = 0x20000;
 
