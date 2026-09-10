@@ -605,6 +605,26 @@ finding above: the knob has no measurable throughput cost OR benefit here
 because the passive cleaner never meaningfully engages during a 30s
 steady-phase window regardless of its setting.
 
+#### The opposite direction: lowering the floor (min_utilization=20)
+
+```text
+SAP_DIR=/data/space-runs/sweep-20-forced SAP_RECORDS=2000000 SAP_VALUE=512 SAP_CACHE_MB=512 \
+SAP_UPDATE_SECONDS=180 SAP_THREADS=16 SAP_MIN_UTIL=20 SAP_DRAIN_MODE=forced SAP_FINAL_CLEAN_PASSES=40 \
+SAP_ADMIN_BIN=/data/work/target/release/noxu-admin \
+./target/release/noxu-space-amp-probe
+```
+
+| min_utilization | passive after-drain | space-amp passive | forced after-drain | space-amp forced |
+|---:|---:|---:|---:|---:|
+| 20 | 20,747,598,394 (unchanged from 20,932,520,581 before-drain) | 20.26x | 17,360,292 | 0.0170x |
+
+Same story as 40-80: passive is byte-for-byte flat (`cleaner_deletions=0`),
+forced drains to the same ~0.014-0.018x band every other value produced.
+**Lowering the floor to 20 costs nothing and gains nothing** in this
+measurement, for the identical structural reason as the 40-80 sweep: the
+passive path's selection input never reflects real utilization, and the
+forced path never consults the floor at all.
+
 ## NOT YET MEASURED (Phase 1 continuation)
 
 - **Live bytes vs on-disk bytes vs reclaimable-but-unreclaimed, decomposed**:
