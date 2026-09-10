@@ -1,8 +1,10 @@
 # Space amplification: characterisation (2026-09)
 
-Status: **Phase 1 (characterisation) partial, in progress.** This document
-records every number measured so far, with the exact command used to produce
-it, so the work survives even if the investigation is interrupted. Sections
+Status: **Phase 1 (characterisation) complete for what it covers; Phase 2
+(the min_utilization lever + a premise correction) in progress.** This
+document records every number measured so far, with the exact command used
+to produce it, so the work survives even if the investigation is
+interrupted. Sections
 not yet measured are marked **NOT YET MEASURED**. Nothing in this document
 recommends or makes a default change.
 
@@ -250,6 +252,283 @@ real compaction, not data loss, at this scale too.
    related to log-size/utilization are always 0 in production (see above);
    this report's numbers come from `du -sb` + the counters that ARE wired,
    not from those fields.
+
+## Phase 2: the min_utilization lever, and a premise correction to Phase 1
+
+Status: **in progress.** Run on a **dedicated** `i4i.16xlarge` (64 vCPU, 3.4 TB
+NVMe XFS at `/data`) with no other tenant — `uptime` shows load average under
+1.1 throughout this session, so (unlike Phase 1) every number below,
+including wall-clock/throughput, is clean, not order-of-magnitude.
+
+### Premise correction (read this before the sweep numbers)
+
+Phase 1's headline finding — "giving the existing daemons an idle window
+collapses the footprint far below the naive live-data floor, with NO config
+change" — is **not what actually happened**, and the mechanism matters for
+everything that follows. This section documents how that was found and
+verified; the sweep in the next section is designed around the corrected
+understanding.
+
+**The bug.** The cleaner decides whether a log file is cleanable by asking
+its `UtilizationTracker` how many bytes in that file are obsolete. For a
+record overwritten through the real `Environment`/`Database` API — an
+explicit `Transaction`, or the synthetic auto-commit transaction that
+`Database::put` wraps every call in — the prior LN version is **never**
+counted obsolete, anywhere:
+
+1. At log-write time (`crates/noxu-dbi/src/cursor_impl.rs::log_ln_write`),
+   counting the prior version obsolete is correctly deferred to commit when
+   this is the first write to the record within the transaction
+   (`curr_ne_abort == false`) — faithful to JE's design (the prior version
+   IS the transaction's abort/undo version until commit).
+2. At commit time (`crates/noxu-txn/src/txn.rs::count_obsolete_abort_lsns`),
+   the deferred entry is then **skipped** by this filter:
+   ```rust
+   if wli.abort_data.is_some() {
+       // Embedded abort version — already counted obsolete at
+       // logging time. (JE maybeCountObsoleteLSN: abortData != null.)
+       continue;
+   }
+   ```
+   `abort_data` is intended to mean "the LN was JE-style *embedded* in its
+   parent BIN, so counting it obsolete already happened at logging time."
+   But in Noxu, `abort_data` is unconditionally populated with the real
+   before-image bytes on **every** overwrite (`CursorImpl::finalize_write_lock`
+   passes `old_data` from `get_slot_before_image`, used for in-memory undo
+   on abort) — not only when the LN is actually embedded. Noxu's own
+   `embedded_ln` field is hard-coded `true` for a separate, already-flagged
+   fidelity gap (see the `ponytail:` comment at `cursor_impl.rs` line ~3512),
+   so it cannot be used to gate this. The filter therefore fires on **every**
+   overwrite, and the prior version is never counted obsolete anywhere.
+
+   A second, narrower instance of the same class of gap: `Checkpointer`'s
+   full-BIN-flush path (`crates/noxu-recovery/src/checkpointer.rs
+   ::flush_one_tree_bins`) re-logs every live slot's value inline and does
+   **not** count any of the superseded standalone per-record LN entries
+   obsolete (contrast with the evictor's analogous full-BIN-eviction path,
+   `crates/noxu-evictor/src/evictor.rs` ~line 1355, which correctly counts
+   the prior *full BIN* IN entry obsolete — a different, adjacent bookkeeping
+   edge it does get right).
+
+**Verified empirically**, three ways, with throwaway diagnostic binaries
+(built, run, and deleted during this investigation — not part of the
+committed probe suite):
+
+1. 2,000 commits, each overwriting the same one key: after all 2,000,
+   `obsolete_ln_count == 0` in the tracker; `get_obsolete_size()` reports
+   only ~8% obsolete (leftover header/TxnCommit bytes), not the ~99.9%
+   that 1,999 dead LN versions actually are.
+2. A 20,000-record / 4-thread / 15-20s update-storm with the daemons running
+   normally and **zero** manual calls of any kind: `du` is completely flat
+   across 60s of passive polling (`cleaner_runs` climbs into the 70s-120s;
+   `cleaner_deletions` stays 0). Reproduced with cache sizes from 2 MiB to
+   64 MiB (i.e. independent of whether BIN eviction pressure is present),
+   confirming the evictor's full-BIN-eviction obsolete-counting does not
+   compensate.
+3. The identical scenario, but replacing the passive daemon with a manual,
+   forced `env.clean_log()` (which is `force=true` internally) reclaims the
+   space on the very next call — `du` drops from hundreds of MB to the
+   live-data floor within one or two forced passes. `force=true` bypasses
+   the `min_utilization` tiers in `FileSelector::select_file_for_cleaning_
+   with_policy` entirely (`forced { best_file? }` — the last tier, which
+   ignores the aggregate utilization gate) and picks the lowest-scoring file
+   unconditionally, so this works **despite** the tracker gap above, not
+   because the gap doesn't matter.
+
+**Why Phase 1 didn't see this.** Phase 1's drain loop called
+`env.checkpoint(None)` and `env.clean_log()` *unconditionally on every poll*,
+regardless of whether the daemons were doing anything. `Environment::
+clean_log()` is *always* `force=true` internally (see its doc comment:
+"performs a forced cleaning pass ... regardless of the daemon's utilization
+budget"). So Phase 1's "give the already-running daemons an idle window, no
+config change" framing was, in fact, continuously exercising the force=true
+bypass path the entire time — the dramatic 12.2 MB / 16 MB post-drain
+numbers are real (verified against data-loss separately, and that
+verification stands), but they are not evidence that the **passive**,
+`min_utilization`-gated daemon path reclaims anything. It does not, under
+this workload shape, regardless of what `min_utilization` is set to — see
+below.
+
+**Existing test-suite blind spot.** Grepping the existing regression-test
+suite for this exact scenario found every test that exercises
+overwrite-driven obsolete tracking
+(`overwrites_count_prior_versions_obsolete_per_db`,
+`overwriting_all_records_makes_original_file_cleanable`,
+`cleaner_sees_persisted_obsolete_immediately_after_restart` in
+`crates/noxu-dbi/tests/integration_tests.rs`) uses `CursorImpl::with_log_manager`
+directly, which sets `txn_ref: None` — a *different* code path from every
+real `Environment`/`Database` call (which always attaches a real or
+synthetic `Txn`, and therefore always hits the `Some(txn) =>` branch these
+tests never exercise). The one CI test that runs the real API path under
+sustained overwrites, `test_cleaner_reduces_log_files_under_load`
+(`crates/noxu-db/tests/sustained_load_test.rs`), asserts only
+`stats.cleaner.runs > 0 || stats.cleaner.deletions > 0` — and `runs`
+increments on every daemon pass regardless of whether anything was
+selected, so it passes whether or not the daemon ever actually cleans a
+file. This is flagged here as a real test-suite gap, not fixed as part of
+this task (out of scope — this task is measurement of the space-amp lever,
+not a bug-fix task), but it explains how the underlying tracker gap survived
+this long unnoticed.
+
+**This does not reopen Phase 1's data-integrity claim** — the post-drain
+footprints Phase 1 measured were verified byte-for-byte against a full
+key-by-key scan, and that remains true; drained-via-`force=true` is still a
+real, correct compaction. What changes is the *causal story*: "idle window,
+no config change" is wrong; the correct story is "an operator-triggered
+forced maintenance pass reclaims the space; the passive background daemon,
+gated on `min_utilization`, currently does not, because of the tracker gap
+above — independent of what the floor is set to." The `space_amp_probe`
+binary was fixed to stop conflating the two
+(`SAP_DRAIN_MODE=passive|forced`, see the source doc comment) so this
+distinction cannot be silently re-lost.
+
+### Consequence for the min_utilization sweep the task asked for
+
+Because the tracker gap means `predicted_min_util` is ~100% for every file
+under any sustained-overwrite workload regardless of the true obsolete
+fraction, **the passive daemon path is expected to behave identically at
+min_utilization = 40/50/60/70/80** — the knob controls a threshold that the
+selection logic's input (predicted utilization) never drops below in this
+workload shape, so it cannot bind. The sweep below measures this
+directly (falsifying rather than assuming it) using `SAP_DRAIN_MODE=passive`,
+and separately measures the `force=true` maintenance-window path (which
+does NOT consult `min_utilization` at all — see the tier-4 `forced` branch
+above — so sweeping the knob under `SAP_DRAIN_MODE=forced` is expected to
+show **zero** sensitivity too, for a completely different reason: the forced
+path bypasses the threshold rather than never crossing it). If both
+predictions hold, the practical, honest structure of Part 2's answer is:
+**`min_utilization` currently has no measurable effect via any code path
+reachable from the public API under a sustained-overwrite workload**, until
+the tracker gap above is fixed — which is a materially different, and more
+important, finding than a write-amp-vs-space curve shape. Both the sweep
+numbers and this prediction are reported below; the sweep is run regardless
+of the prediction, per the task's "falsify by measurement" requirement.
+
+### Part 1: decomposition, corrected
+
+The task's Part 1 asked to decompose the before-drain gap into: garbage
+below the `min_utilization` floor, cleaner backlog
+(`FileSelector.to_be_cleaned`), checkpoint-eligibility lag, and per-record
+overhead. A `cleaner_diagnostics()` accessor was added to `Environment`
+(`crates/noxu-db/src/environment.rs`, diagnostic-only, not stable API) to
+read the `FileSelector`'s pipeline-state counts and the merged per-file
+utilization-summary map directly, rather than inferring them from `du`.
+
+Given the premise correction above, the decomposition itself is now
+simple to state precisely, and matches the code path exactly rather than
+being inferred: **100% of the before-drain gap is "above the
+`min_utilization` floor" per the (buggy) tracker's own numbers, 0% is
+queued backlog, and 0% is checkpoint-lag** — not because there is no real
+garbage (there manifestly is: forced cleaning reclaims 95%+ of it), but
+because the tracker never learns about it in the first place, so it never
+enters the `to_be_cleaned` queue or any per-file state above `Untracked`.
+The `FileSelector` pipeline-state counts (`to_be_cleaned=0 being_cleaned=0
+cleaned=0 checkpointed=0 safe_to_delete=0`) at both before-drain and
+after-drain confirm this: the *selection* mechanism never engages at all
+under `SAP_DRAIN_MODE=passive`, at any scale tested.
+
+#### Data point: 2,000,000 records, min_utilization=50, passive vs forced (dedicated box)
+
+```text
+SAP_DIR=/data/space-runs/p1-passive SAP_RECORDS=2000000 SAP_VALUE=512 SAP_CACHE_MB=512 \
+SAP_UPDATE_SECONDS=180 SAP_THREADS=16 SAP_MIN_UTIL=50 SAP_DRAIN_MODE=passive SAP_FINAL_CLEAN_PASSES=60 \
+SAP_ADMIN_BIN=/data/work/target/release/noxu-admin \
+./target/release/noxu-space-amp-probe
+```
+
+Live dataset: 2,000,000 records x 512 B = 1,024,000,000 bytes (0.95 GiB).
+This box was idle otherwise (`uptime` load average ~0.1-1.1 throughout), so
+the throughput number below is a clean, single-tenant number, unlike
+Phase 1's.
+
+| stage | du (bytes) | du (human) | space-amp vs live |
+|---|---:|---:|---:|
+| after load | 1,808,836,502 | 1.68 GiB | 1.77x |
+| before drain (after 180s storm) | 20,432,825,010 | 19.03 GiB | 19.95x |
+| after PASSIVE drain (daemons only, 0 manual calls, 10s polling) | 20,432,825,010 | 19.03 GiB | **19.95x (byte-for-byte unchanged)** |
+
+Update-storm throughput: 30,147,063 writes in 180.0s = **167,478 writes/s**
+(clean single-tenant number). `cleaner_runs=1728` before drain, climbing to
+`1742` over 10s of polling — but `cleaner_deletions=0` in both snapshots,
+and `du` is byte-for-byte identical before and after. `FileSelector` state
+after drain: `to_be_cleaned=0 being_cleaned=0 cleaned=0 checkpointed=0
+safe_to_delete=0` across 1,950 tracked files, every one reported "above the
+50% floor" by the (buggy) tracker. This is the passive-path prediction
+above: **confirmed, not assumed** — the daemon ran 1,742+ times over the
+run and reclaimed nothing.
+
+```text
+SAP_DIR=/data/space-runs/p1-forced SAP_RECORDS=2000000 SAP_VALUE=512 SAP_CACHE_MB=512 \
+SAP_UPDATE_SECONDS=180 SAP_THREADS=16 SAP_MIN_UTIL=50 SAP_DRAIN_MODE=forced SAP_FINAL_CLEAN_PASSES=40 \
+SAP_ADMIN_BIN=/data/work/target/release/noxu-admin \
+./target/release/noxu-space-amp-probe
+```
+
+| stage | du (bytes) | du (human) | space-amp vs live |
+|---|---:|---:|---:|
+| after load | 1,669,269,952 | 1.55 GiB | 1.63x |
+| before drain (after 180s storm) | 20,483,174,967 | 19.08 GiB | 20.00x |
+| after FORCED drain (40 manual force-checkpoint/clean_log rounds, 80s) | 14,558,692 | 13.9 MiB | **0.0142x** |
+
+Update-storm throughput: 30,446,245 writes in 180.0s = 169,139 writes/s.
+`cleaner_deletions` climbs from 0 to **41,702** during the forced-drain
+phase; `checkpoints` from 1 to 61. `FileSelector.cleaned=2,051` at the end
+(files cleaned in the LAST round, still mid the two-checkpoint barrier when
+the 40-round budget ran out — forced mode never fully settles because each
+forced checkpoint re-dirties a few BINs the cleaner's own LN migration just
+touched; see the probe source comment for why this is expected). Post-drain
+`noxu-admin print-log -S`: 125,522 entries / 12.9 MB, dominated by
+`FileSummaryLN` (125,198 entries — the same "one `FileSummaryLN` write per
+file per checkpoint pass" pattern Phase 1 flagged for follow-up, now seen at
+61 checkpoint passes instead of 15) with only 33 `BIN` entries and zero
+surviving standalone LN entries — consistent with Phase 1's
+"full-BIN-carries-inline-values" finding at this larger scale and
+forced-drain path too.
+
+**Both runs together settle Part 1's original decomposition question
+precisely**: the before-drain ~20x gap is not "50% below the floor, some %
+checkpoint lag, some % backlog" as originally framed — it is **100%
+garbage the tracker has never learned about**, full stop, because of the
+tracker gap described above. `min_utilization`, the backlog queue, and the
+checkpoint barrier are all downstream of a selection input (predicted
+per-file utilization) that never reflects reality for this workload shape.
+Forced cleaning still works (it bypasses that input entirely via the
+tier-4 `forced` branch), which is why it reclaims 99.9%+ of the gap in one
+maintenance window. The Part 1 "per-record overhead" question (LN header
+bytes, key prefixing, TTL slots) is moot as a *separate* line item at this
+workload's scale: post-forced-drain, standalone LN entries do not survive
+at all (0 `INS_LN`/`UPD_LN` entries in either drain), so per-record
+overhead is entirely subsumed into the BIN-inline-value mechanism —
+consistent with, but (per Phase 1's flag, still standing) not a substitute
+for, a targeted unit test directly against the BIN-serialization code path.
+
+### Part 2: the min_utilization lever — measured, not assumed
+
+Sweep at 50/60/70/80 (and, cheaply, 40) under BOTH drain modes, same
+workload shape as the Part 1 data point (2,000,000 records / 512B / 180s
+storm / 16 threads), one data point per cell, run once each (see caveat
+below on why 3x repetition was not done for every cell).
+
+#### Space (steady-state after drain, and peak during storm)
+
+| min_utilization | peak du (storm) | space-amp peak | passive after-drain | space-amp passive | forced after-drain | space-amp forced |
+|---:|---:|---:|---:|---:|---:|---:|
+
+<!-- sweep rows inserted here as each run completes -->
+
+#### Write amplification and cleaner cost
+
+| min_utilization | write_amp (storm phase) | cleaner_deletions (forced drain) | checkpoints (forced drain) |
+|---:|---:|---:|---:|
+
+<!-- sweep rows inserted here as each run completes -->
+
+#### Throughput (steady-phase YCSB A, xbench)
+
+| min_utilization | throughput (ops/s) | write_amp | p99 (µs) |
+|---:|---:|---:|---:|
+
+<!-- sweep rows inserted here as each run completes -->
 
 ## NOT YET MEASURED (Phase 1 continuation)
 
