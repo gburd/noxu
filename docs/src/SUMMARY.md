@@ -138,3 +138,4 @@
   - [BIN generation counter: measured, not adopted (2026-09)](internal/bin-generation-counter-2026-09.md)
   - [Replacing parking_lot: measured, not adopted (2026-09)](internal/parking-lot-swap-evaluation-2026-09.md)
   - [Removing parking_lot entirely: implemented and measured (2026-09)](internal/parking-lot-removal-2026-09.md)
+  - [Space amplification: characterisation (2026-09)](internal/space-amplification-2026-09.md)
