@@ -1040,12 +1040,12 @@ impl Cleaner {
         // or deleted in this pass.  JE: `FileProtector.getLogSizeStats()`
         // sums REAL file lengths, not the utilization profile's cached byte
         // counts.
-        if let Some(fm) = &self.file_manager {
-            if let Ok(total) = fm.total_log_size() {
-                self.stats.total_log_size.store(total, Ordering::Relaxed);
-                // No reserved/protected tier in Noxu: active == total.
-                self.stats.active_log_size.store(total, Ordering::Relaxed);
-            }
+        if let Some(fm) = &self.file_manager
+            && let Ok(total) = fm.total_log_size()
+        {
+            self.stats.total_log_size.store(total, Ordering::Relaxed);
+            // No reserved/protected tier in Noxu: active == total.
+            self.stats.active_log_size.store(total, Ordering::Relaxed);
         }
 
         // min_utilization / max_utilization: computed from the merged
