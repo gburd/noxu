@@ -40,6 +40,18 @@ listed in [References](#references).
 
 ### Added
 
+- **A replica now renegotiates syncup on a mid-stream master change (HA Gap B).**
+  Previously the replica ran the SYNCUP handshake once at spawn and then streamed
+  forever against that original channel, with nothing watching for a master
+  change — so after a failover it kept reading from a stale feeder and relied on
+  the caller to close the channel. `MasterTracker` now carries a generation
+  counter; the replica's streaming loop observes a bump, closes the stale channel,
+  and re-enters the full handshake against the new master before resuming
+  (mirroring JE's `MasterChangeListener` plus re-entry into
+  `ReplicaFeederSyncup`). The default-deny safety gate is unaffected — a
+  re-syncup that finds an unsafely-divergent tail still refuses rather than
+  streaming over it, and that is now covered by a dedicated test.
+
 - **noxu-rep: periodic DTVLSN flusher daemon** (Gap C of the HA
   remaining-gaps audit). Port of JE `FeederManager.DTVLSNFlusher`
   (`FeederManager.java` ~lines 930-1042). Noxu already computed the
