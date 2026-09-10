@@ -571,10 +571,39 @@ is not currently wired to fire under sustained overwrites.
 
 #### Throughput (steady-phase YCSB A, xbench)
 
-| min_utilization | throughput (ops/s) | write_amp | p99 (µs) |
+| min_utilization | throughput median (ops/s) | write_amp median | p99 median (µs) |
 |---:|---:|---:|---:|
+| 40 | 475,593 | 1.207 | 181 |
+| 50 | 486,032 | 1.206 | 181 |
+| 60 | 489,116 | 1.206 | 188 |
+| 70 | 486,510 | 1.206 | 185 |
+| 80 | 479,908 | 1.206 | 185 |
 
-<!-- sweep rows inserted here as each run completes -->
+Method: `noxu-xbench`, `BENCH_WORKLOAD=ycsb_a` (50% reads / 50% writes,
+Zipfian θ=0.99), `BENCH_RECORDS=2000000 BENCH_VALUE=512 BENCH_CACHE=512MiB
+BENCH_THREADS=32 BENCH_SECONDS=30 BENCH_DURABILITY=NO_SYNC`, one load
+(`BENCH_SKIP_LOAD=0`, seed=1) then 3 measured passes
+(`BENCH_SKIP_LOAD=1`, seeds 1/2/3) per `min_utilization` value, interleaved
+across values (all 5 values' rep 1 first, then all 5 values' rep 2, etc. —
+not one value's 3 reps back-to-back) per the task's interleaving
+requirement; median of the 3 reps reported. Every run measures only the
+30s steady/measured phase (the separate load phase is excluded from the
+reported numbers by construction — `BENCH_DIR` is reused with
+`BENCH_SKIP_LOAD=1` so reps 2 and 3 start from the SAME on-disk state rep 1
+left, not a fresh load each time).
+
+**Result: all 5 values are within ~3% of each other** (475,593 to 489,116
+ops/s; p99 181-188µs; write_amp 1.206-1.207 flat) — no monotonic trend, no
+value stands out, consistent with the space/write-amp results above: at
+this workload's default checkpoint interval (`checkpointer_bytes_
+interval=20MB`, unmodified), the cleaner's forced/passive engagement during
+the 30s measured window is dominated by other costs (BIN flush, fsync-free
+NO_SYNC write path) that `min_utilization` does not touch. The daemon runs
+with `force=false` throughout this benchmark (xbench never calls
+`clean_log()`), so this result is fully consistent with the passive-path
+finding above: the knob has no measurable throughput cost OR benefit here
+because the passive cleaner never meaningfully engages during a 30s
+steady-phase window regardless of its setting.
 
 ## NOT YET MEASURED (Phase 1 continuation)
 
