@@ -17,6 +17,20 @@ listed in [References](#references).
 
 ### Fixed
 
+- **Two CI flakes fixed; a third recorded as unreproducible.**
+  `noxu-xa::test_rapid_fire_10k_with_prepared_log` exceeded nextest's 120 s cap
+  under suite parallelism (measured: 47.8 s in isolation, so slow rather than
+  deadlocked). Its cycle count now scales with the build profile — 2,000 in debug,
+  10,000 in release — since the property under test ("resolved prepared branches
+  do not accumulate") holds at any sufficiently large count. Debug 47.8 s →
+  10.8 s; the whole `noxu-xa` suite 68 s → 32.5 s with no SLOW flag.
+  `noxu-rep::test_channel_drop_on_receiver_side_is_detected_by_sender` failed
+  ~1 in 20 runs because it allowed only 10 sends × 10 ms to observe a broken pipe;
+  how fast the kernel surfaces the peer's RST is not the test's to control. Now
+  bounded by a 10 s deadline instead of an iteration count: 0/25 after.
+  `dst_same_seed_reproduces_exactly` did **not** reproduce in ~1,000 attempts and
+  is deliberately left untouched rather than annotated with a retry.
+
 - **The evictor could silently corrupt its pri2 intrusive list in release
   builds.** `evict_batch`'s `MoveDirtyToPri2` arm called
   `pri2.add_front(node_id)` unconditionally, relying on the invariant "a node
