@@ -548,16 +548,33 @@ fn test_channel_drop_on_receiver_side_is_detected_by_sender() {
     // After the receiver drops, the sender must get an error on send.
     // Send a small payload; the OS may buffer the first write successfully,
     // so we may need more than one send to observe the broken pipe.
+    // How long the kernel takes to surface the broken pipe is not under our
+    // control: the first writes land in the socket buffer and succeed, and the
+    // error only appears once the peer's RST has been processed. The original
+    // 10 sends x 10 ms (~100 ms) was a hard-coded guess at that latency and
+    // failed ~1 in 20 runs under CPU contention, where the scheduler simply did
+    // not run us often enough inside the window.
+    //
+    // Bound by a DEADLINE rather than an iteration count, generous enough that
+    // only a real failure to ever detect the drop trips it.
     let payload = b"heartbeat";
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(10);
     let mut detected = false;
-    for _ in 0..10 {
+    let mut attempts = 0usize;
+    while std::time::Instant::now() < deadline {
+        attempts += 1;
         if master_ch.send(payload).is_err() {
             detected = true;
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    assert!(detected, "master must detect receiver disconnect within 10 sends");
+    assert!(
+        detected,
+        "master must detect the receiver disconnect; gave up after {attempts} \
+         sends over 10 s"
+    );
 }
 
 /// Verify that the `ReplicatedEnvironment` state machine correctly handles a

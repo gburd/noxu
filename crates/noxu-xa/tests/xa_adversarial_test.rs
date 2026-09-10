@@ -289,13 +289,25 @@ fn test_rapid_fire_10k_cycles() {
     assert!(status);
 }
 
-/// 10,000 prepare→commit cycles with PreparedLog enabled (tests log doesn't grow unbounded)
+/// Many prepare→commit cycles with PreparedLog enabled (tests the log does not
+/// grow unbounded as prepared branches are resolved).
+///
+/// The cycle count scales with the build profile. The property under test is
+/// "resolved branches do not accumulate", which holds at any sufficiently large
+/// count; 10,000 unoptimised cycles took ~48 s, which is under nextest's 120 s
+/// cap in isolation but exceeded it once the rest of the suite competed for CPU,
+/// making this the single most frequent source of red-but-not-broken CI runs.
+/// Debug therefore runs 2,000 cycles (~10 s, comfortably inside the cap under
+/// load) while release keeps the full 10,000.
 #[test]
 fn test_rapid_fire_10k_with_prepared_log() {
     let dir = TempDir::new().unwrap();
     let (xa, db) = make_xa_with_log(dir.path());
 
-    for i in 0..10_000u64 {
+    // 2,000 in debug, 10,000 in release -- see the doc comment above.
+    let cycles: u64 = if cfg!(debug_assertions) { 2_000 } else { 10_000 };
+
+    for i in 0..cycles {
         let xid = Xid::new(1, &i.to_le_bytes(), b"plog").unwrap();
         xa.xa_start(&xid, XaFlags::NOFLAGS).unwrap();
         {
