@@ -664,6 +664,46 @@ impl Txn {
             // written, but we still honour the caller's durability policy for
             // the LN entry the cursor already wrote.  `last_lsn` is the LN's
             // LSN.  The fsync is likewise deferred to the durable phase.
+
+            // The prior versions this op overwrote are now unreachable and must
+            // be counted obsolete, exactly as the explicit-txn arm above does.
+            //
+            // This arm previously skipped it, and because `Database::put`/`del`
+            // wrap EVERY call in a synthetic auto-txn, that meant the dominant
+            // write path never told the cleaner's UtilizationTracker about any
+            // garbage at all: overwrite a record a thousand times and its file
+            // still reported ~100 % utilization, so the cleaner daemon
+            // (`force=false`) never selected it regardless of `min_utilization`.
+            // Only `Environment::clean_log()` reclaimed anything, because it
+            // passes `force=true` and bypasses the utilization test entirely.
+            //
+            // Runs BEFORE write locks are released, while the WriteLockInfo
+            // abort-LSN set is still intact (same ordering constraint as the
+            // explicit-txn arm).
+            //
+            // GATED OFF BY DEFAULT, and the reason is a measured throughput
+            // cliff rather than any doubt about correctness. Every counted LSN
+            // takes the global tracker mutex
+            // (`UtilizationTrackerObserver::count_obsolete` ->
+            // `self.tracker.lock()`), and on the auto-commit path that is once
+            // per user operation. Measured on ycsb_a, 8 threads, 100k records:
+            //
+            //   counting off (today):  266,102 ops/s, 2,120 MB on disk
+            //   counting on:             7,600 ops/s,   187 MB on disk
+            //
+            // So it buys an 11.3x space reduction for a 35x throughput
+            // regression. Neither side of that trade is acceptable as a default.
+            //
+            // The fix is the piece JE has and we do not: a
+            // `LocalUtilizationTracker` (JE `LocalUtilizationTracker` /
+            // `BaseLocalUtilizationTracker`) that accumulates per-thread and
+            // merges in batches, so the shared mutex is taken once per batch
+            // instead of once per operation. Until that exists, enable this only
+            // to reproduce or measure the space behaviour.
+            if std::env::var_os("NOXU_COUNT_AUTOCOMMIT_OBSOLETE").is_some() {
+                self.count_obsolete_abort_lsns();
+            }
+
             Ok(PendingCommit {
                 assigned_lsn: NULL_LSN,
                 pending_sync: PendingSync::Ln {
@@ -1009,9 +1049,23 @@ impl Txn {
             if wli.abort_lsn == NULL_LSN.as_u64() || wli.abort_known_deleted {
                 continue;
             }
-            if wli.abort_data.is_some() {
-                // Embedded abort version — already counted obsolete at
-                // logging time. (JE maybeCountObsoleteLSN: abortData != null.)
+            if wli.abort_counted_at_log_time {
+                // Already counted obsolete when it was logged: an LN embedded in
+                // its parent BIN, or one in a duplicates database.
+                //
+                // JE expresses this as `getAbortData() != null ||
+                // getDb().isLNImmediatelyObsolete()` (Txn.maybeCountObsoleteLSN,
+                // Txn.java:1096-1116), where the abortData test is a valid proxy
+                // because JE assigns abortData ONLY inside
+                // `if (bin.isEmbeddedLN(idx))` (CursorImpl.java:3328).
+                //
+                // That proxy does NOT hold here: Noxu populates `abort_data` on
+                // every overwrite because the in-memory undo path needs the
+                // before-image unconditionally. Using it as the gate therefore
+                // skipped obsolete-counting for EVERY transactional overwrite,
+                // leaving the cleaner's UtilizationTracker unable to see
+                // essentially any real garbage — every file looked ~100%
+                // utilized, so the daemon (force=false) never selected one.
                 continue;
             }
             if !seen.insert(wli.abort_lsn) {
@@ -2270,6 +2324,19 @@ mod tests {
             false,
             9,
         );
+        // Record C models an LN that was ALREADY counted obsolete at logging
+        // time (embedded in its BIN, or in a duplicates DB), so counting it
+        // again here would double-count.
+        //
+        // This must be stated explicitly via `abort_counted_at_log_time`.
+        // Carrying before-image bytes in `abort_data` no longer implies it:
+        // Noxu populates `abort_data` on EVERY overwrite for in-memory undo, so
+        // using it as the gate suppressed counting for every transactional
+        // overwrite and left the cleaner blind to essentially all garbage.
+        txn.write_locks
+            .get_mut(&3000)
+            .expect("record C write lock")
+            .abort_counted_at_log_time = true;
 
         txn.commit().unwrap();
 

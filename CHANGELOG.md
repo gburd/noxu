@@ -135,6 +135,27 @@ listed in [References](#references).
 
 ### Fixed
 
+- **Root-caused why the cleaner never sees overwritten record versions as garbage
+  (three defects), fixed in code, gated off pending a `LocalUtilizationTracker`.**
+  Phase 2 identified the `abort_data.is_some()` filter; tracing the path with
+  instrumentation found that was one of **three** independent blockers, and not the
+  dominant one. (1) `abort_data` is not a valid proxy for "embedded" in Noxu —
+  JE assigns `abortData` only inside `if (bin.isEmbeddedLN(idx))`, while we populate
+  it on every overwrite for in-memory undo; now tracked explicitly as
+  `WriteLockInfo::abort_counted_at_log_time`. (2) Explicit transactions had no
+  `LogManager`, so `count_obsolete_abort_lsns` early-returned before reaching any
+  filter. (3) **The dominant defect:** `commit_append_phase` is guarded by
+  `!self.is_auto_txn()` and the counting lived inside that block, so the
+  auto-commit path — which `Database::put`/`del` wrap *every* call in — never
+  called it at all. Enabling correct counting reduces on-disk size ~12× (2,126 MB
+  → 187 MB) but costs ~33× throughput (267k → 7.6k ops/s), because
+  `UtilizationTrackerObserver::count_obsolete` takes a global mutex once per
+  commit. Both paths therefore ship gated behind `NOXU_COUNT_AUTOCOMMIT_OBSOLETE`
+  / `NOXU_COUNT_TXN_OBSOLETE`, **off by default, no behaviour change**. The
+  blocker is JE's `LocalUtilizationTracker` (per-thread accumulation merged in
+  batches), which we do not have. See
+  `docs/src/internal/space-amplification-2026-09.md`, Phase 3.
+
 - **Six `CleanerStats` fields always read 0; four are now wired and two removed.**
   The only stores lived in `cleaner_stat.rs`'s own test module, so `env.stats()`
   and the `noxu-observe` Prometheus gauges derived from them reported 0 forever —

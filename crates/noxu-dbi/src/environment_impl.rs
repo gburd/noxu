@@ -2567,7 +2567,30 @@ impl EnvironmentImpl {
     /// Begins a new transaction.
     pub fn begin_txn(&self) -> Result<Txn, DbiError> {
         self.check_open()?;
-        Ok(self.txn_manager.begin_txn())
+        // Attaching the LogManager is what lets the txn count its abort LSNs
+        // obsolete on commit, so the cleaner learns that overwritten record
+        // versions became garbage. It is GATED OFF by default because every
+        // counted LSN takes the global tracker mutex
+        // (`UtilizationTrackerObserver::count_obsolete` -> `tracker.lock()`),
+        // once per commit. Measured on ycsb_a, 8 threads, 100k records:
+        //
+        //   off (today): 318,573 ops/s, 2,506 MB on disk
+        //   on:            9,505 ops/s,   199 MB on disk
+        //
+        // A 12.6x space reduction for a 33x throughput regression -- neither
+        // side is acceptable as a default. The missing piece is JE's
+        // `LocalUtilizationTracker`/`BaseLocalUtilizationTracker`: per-thread
+        // accumulation merged in batches, so the shared mutex is taken once per
+        // batch rather than once per commit. See
+        // `docs/src/internal/space-amplification-2026-09.md`.
+        Ok(match &self.log_manager {
+            Some(lm)
+                if std::env::var_os("NOXU_COUNT_TXN_OBSOLETE").is_some() =>
+            {
+                self.txn_manager.begin_txn_with_log_manager(Arc::clone(lm))
+            }
+            _ => self.txn_manager.begin_txn(),
+        })
     }
 
     /// Returns a reference to the lock manager.
