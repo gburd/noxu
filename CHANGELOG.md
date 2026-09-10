@@ -15,6 +15,8 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+## [7.8.0] - 2026-09-10
+
 ### Documentation
 
 - **Space amplification: characterisation, Phase 1 partial.** New bench probe
