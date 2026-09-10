@@ -656,3 +656,54 @@ fn writer_can_reserve_under_an_overlapping_reader_relay() {
         ITERATIONS,
     );
 }
+
+/// A reservation must EXCLUDE new readers for its whole drain.
+///
+/// This is the entire point of reserving: the whole reason `WRITE_LOCKED` is set
+/// before the readers have gone is so that no further reader can join and extend
+/// the drain indefinitely. Without it we are back to the advisory-gate design
+/// whose p50 write wait scaled with reader count.
+///
+/// Added after a non-vacuity audit found the model silently PASSED when
+/// `try_read_acquire` was sabotaged to admit readers during `ReservedDraining`:
+/// the suite asserted writer/writer mutual exclusion (`max_seen == 1` on
+/// `WriteHeld`) but never asserted reader exclusion during the drain, so the
+/// single most important property of the design was unmodelled. It is checked
+/// here from first principles rather than inferred.
+#[test]
+fn a_reservation_admits_no_new_reader_while_draining() {
+    shuttle::check_random(
+        || {
+            let model = Arc::new(Model::new());
+
+            // One reader in, so a writer must reserve-and-drain rather than
+            // acquire outright.
+            assert!(model.try_read_acquire(), "first reader must get in");
+
+            // Reserve (does not block: one reader is in, so this transitions
+            // ReadHeld(1) -> ReservedDraining(1) and returns).
+            model.write_reserve_only();
+
+            // THE PROPERTY: with the reservation held, no new reader may enter,
+            // no matter how many try or how they interleave.
+            for _ in 0..4 {
+                assert!(
+                    !model.try_read_acquire(),
+                    "a reader was admitted during ReservedDraining -- the \
+                     reservation does not exclude new readers, so the drain can \
+                     be extended indefinitely and the reserving writer starves"
+                );
+            }
+
+            // Drain the original reader; the writer then owns the lock outright
+            // and readers must still be excluded.
+            model.read_release();
+            assert!(
+                !model.try_read_acquire(),
+                "a reader was admitted while the writer held the lock"
+            );
+            model.write_release();
+        },
+        3_000,
+    );
+}
