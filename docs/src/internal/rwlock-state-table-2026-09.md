@@ -234,26 +234,78 @@ well-defined.
    lost-wakeup or double-acquire interleaving in the gate-free design before
    it is trusted.
 
-## What the shuttle model must check
+## What the shuttle model checked, and what it found
 
-- **Mutual exclusion**: never two threads observe themselves as the
-  exclusive owner simultaneously (`write_held` is never entered twice
-  concurrently).
-- **No lost wakeup**: every waiter (reader or writer) that is parked
-  eventually gets woken and makes progress — model both wake paths
-  (`reserved_draining(1) -> write_held` targeted wake, and the two
-  unconditional-both wake rows).
-- **No livelock**: a reserving writer that reaches reader-count-zero
-  transitions to `write_held` without looping back through any CAS that
-  could fail and re-park it.
-- **Give-up correctness**: a writer that times out while `reserved_draining`
-  correctly clears only `WRITE_LOCKED` (never touches reader bits) and wakes
-  both populations.
-- **No starvation reintroduction**: with the gate deleted, confirm a reader
-  hand-over-hand chain cannot prevent a writer from ever reserving (the
-  central claim of the design decision above) — this is the one property a
-  pure state-transition model checker can prove that the two prior hands-on
-  attempts could only observe empirically after the fact.
+Built as `crates/noxu-sync/tests/shuttle_rwlock_reservation.rs` (gated behind
+`--cfg noxu_shuttle`, run via `make shuttle` or directly with
+`RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-sync --test
+shuttle_rwlock_reservation --release`). It is a standalone model of exactly
+the four states and transitions above (a `Mutex<LockState>` + three
+`Condvar`s standing in for the real `AtomicU32` + three futex words), NOT the
+real lock -- the point is to validate the table before porting it.
 
-See `docs/src/internal/rwlock-shuttle-model-2026-09.md` (next commit) for the
-model itself and what it found.
+- **Mutual exclusion** (`mutual_exclusion_never_two_writers`): never two
+  threads observe themselves as the exclusive owner simultaneously.
+- **No lost wakeup, mixed population** (`mixed_population_no_lost_wakeup`):
+  every waiter (reader or writer) eventually gets woken and makes progress —
+  shuttle's own scheduler panics with an explicit "deadlock!" diagnostic if
+  any schedule leaves a thread blocked with nothing runnable, so a plain
+  `join()` on every spawned thread doubles as the liveness assertion.
+- **Give-up correctness, no race**
+  (`give_up_while_draining_restores_read_held_and_wakes_both`): a writer that
+  gives up while nothing could have drained yet restores `read_held(n)`
+  (never silently drops to `free`) and wakes both populations.
+- **Give-up correctness, RACING the drain**
+  (`give_up_races_the_drain_completing_reader`): the one the task brief
+  specifically called out — "a reserved writer that times out must release
+  `WRITE_LOCKED`, or the lock is permanently dead." Lets shuttle explore both
+  orderings of "the last reader completes the drain" vs. "the writer decides
+  to give up" against the *same* outstanding reservation, and checks that
+  whichever the scheduler picks, the lock ends up live (never stuck in
+  `reserved_draining` with nobody left able to clear it) — modelled as
+  `try_give_up` returning an explicit `AlreadyAcquired` outcome when the
+  drain already won, which the caller (the real port's give-up path) MUST
+  turn into a `write_release()` rather than silently treating as "gave up
+  successfully."
+- **Structural non-starvation**
+  (`writer_can_reserve_under_an_overlapping_reader_relay`): a hand-over-hand
+  reader relay cannot prevent a writer from reserving, because the
+  reserve-CAS analogue never requires the reader count to be zero — only
+  that `WRITE_LOCKED` is clear. This is the central liveness claim behind
+  deleting `WRITE_WAITING`/`FAIRNESS_THRESHOLD`, checked here rather than
+  merely asserted.
+
+**Result: all 5 properties hold across 3,000 explored interleavings each
+(15,000 total), and the checks are not vacuous.** Each was validated against
+a deliberately sabotaged copy of the model before being trusted:
+
+- Reverting the dedicated `drain_futex`/`drain_cv` to share the readers'
+  condvar (i.e. re-introducing the exact bug this table's earlier draft
+  contained, before the fix in the previous commit) reproduces a lost
+  wakeup: `mutual_exclusion_never_two_writers`,
+  `give_up_while_draining_restores_read_held_and_wakes_both`, and
+  `mixed_population_no_lost_wakeup` all fail with shuttle's "deadlock!"
+  diagnostic.
+- Making the give-up path report success without actually clearing
+  `WRITE_LOCKED` (the brief's exact warning) is caught two ways: directly by
+  an assertion in `give_up_races_the_drain_completing_reader`
+  (`ReservedDraining(1)` observed where a live state was required), and
+  independently by a shuttle deadlock in
+  `give_up_while_draining_restores_read_held_and_wakes_both` (the queued
+  writer and reader behind the stuck reservation never get to run).
+
+This is the validation step working as intended: the table's own author
+found and fixed one real bug (the shared-condvar wakeup ambiguity) while
+building the model, and the model's tests were then shown to actually
+discriminate correct from incorrect behaviour, not just pass by
+construction.
+
+**No fourth, unidentified interaction was found in this abstract model.**
+That is evidence for, not proof of, the design-decision hypothesis above
+(deleting the redundant `WRITE_WAITING`/`FAIRNESS_THRESHOLD` gate removes the
+source of attempt #2's unexplained hang) — the model checks the PROTOCOL,
+not the real bit-packed `AtomicU32` CAS loops, real futex syscalls, or the
+real spin-then-reserve timing budget. The port step must re-derive every one
+of these transitions against the real primitives and cannot skip re-checking
+them under the full test suite (`rwlock_writer_starvation.rs`'s watchdog test
+and `rwstress`) just because the model passed.
