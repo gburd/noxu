@@ -671,7 +671,24 @@ impl NoxuRawRwLock {
         // mechanism for a writer that has genuinely failed to find a free
         // window — the same trade `parking_lot` makes by setting
         // `WRITER_BIT` only once a writer has actually parked.
-        for _ in 0..WRITE_SPIN_ATTEMPTS {
+        // Exponential backoff between re-reads of `state`, not a flat
+        // per-iteration reload: under heavy read contention (many readers
+        // doing fetch_add/fetch_sub on the same cache line) a flat
+        // `state.load()` every iteration pays the contended-cache-line cost
+        // on EVERY one of `WRITE_SPIN_ATTEMPTS` reads. Measured directly:
+        // this was the dominant remaining term in the writer's p50 at 63
+        // readers (~220us), not the drain wait -- confirmed by it being
+        // present, unchanged, in the pre-reservation baseline this whole
+        // module exists to improve on (same flat-reload loop, same
+        // 400-iteration count). Backing off means paying that cache-miss
+        // cost O(log iterations) times instead of O(iterations) times,
+        // which is exactly `parking_lot_core::SpinWait`'s own strategy
+        // (`cpu_relax(1 << counter)`, doubling each attempt) -- ported here
+        // rather than re-derived, since it is solving the identical
+        // problem.
+        let mut backoff: u32 = 1;
+        let mut iterations_spent = 0u32;
+        while iterations_spent < WRITE_SPIN_ATTEMPTS {
             let state = self.state.load(Ordering::Relaxed);
             if state & (READERS_MASK | WRITE_LOCKED) == 0 {
                 if self
@@ -691,9 +708,14 @@ impl NoxuRawRwLock {
                     );
                     return true;
                 }
+                iterations_spent += 1;
                 continue;
             }
-            std::hint::spin_loop();
+            for _ in 0..backoff {
+                std::hint::spin_loop();
+            }
+            iterations_spent += backoff;
+            backoff = (backoff * 2).min(WRITE_SPIN_ATTEMPTS);
         }
 
         // Spinning did not find a free window. RESERVE unconditionally: the
