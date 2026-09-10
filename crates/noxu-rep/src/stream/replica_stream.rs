@@ -139,6 +139,21 @@ impl EnvironmentLogWriter {
     ) -> Option<std::sync::Arc<std::sync::atomic::AtomicU64>> {
         self.replay.as_ref().map(|r| r.last_applied_vlsn_handle())
     }
+
+    /// HA Gap B: clear buffered provisional transactions before re-entering
+    /// streaming after a reconnect (fresh syncup against a new master, or a
+    /// resumed stream from the same one).
+    ///
+    /// Port of JE `doRunReplicaLoopInternalWork`'s
+    /// `repImpl.getReplay().reset()`, run on every re-entry into the replica
+    /// loop.  A no-op when no live replay driver is installed (byte-shadow
+    /// only path).  See [`noxu_dbi::ReplicaReplay::reset`] for why dropping
+    /// the buffer is a safe, complete discard.
+    pub fn reset_replay(&mut self) {
+        if let Some(replay) = self.replay.as_mut() {
+            replay.reset();
+        }
+    }
 }
 
 impl LogWriter for EnvironmentLogWriter {
@@ -350,22 +365,46 @@ impl ReplicaReceiver {
         shutdown: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<()> {
         use std::sync::atomic::Ordering;
-        // A short timeout when a shutdown flag is wired keeps close()
-        // responsive; without one, keep the original 30s budget.
-        let recv_timeout = if shutdown.is_some() {
-            Duration::from_secs(1)
-        } else {
-            Duration::from_secs(30)
-        };
+        match shutdown {
+            Some(flag) => {
+                self.run_while(log_writer, Duration::from_secs(1), &|| {
+                    flag.load(Ordering::SeqCst)
+                })
+            }
+            None => {
+                self.run_while(log_writer, Duration::from_secs(30), &|| false)
+            }
+        }
+    }
+
+    /// Run the replica receive loop, polling `should_stop` at every
+    /// `recv_timeout` interval (and once before every receive).  Returns
+    /// `Ok(())` as soon as `should_stop()` returns `true`.
+    ///
+    /// This is [`Self::run_until`]'s underlying loop, generalized from a
+    /// single `AtomicBool` to an arbitrary predicate so a caller can compose
+    /// several independent stop conditions (e.g. "shutdown requested OR the
+    /// master changed") without introducing a second polling thread.  HA Gap
+    /// B: `ReplicatedEnvironment::become_replica`'s outer reconnect loop uses
+    /// this to break streaming as soon as `MasterTracker::generation()`
+    /// changes underneath it, forcing a fresh syncup against the new master
+    /// instead of continuing to stream from the stale one — the check is
+    /// just one more predicate evaluated at the same poll cadence
+    /// `run_until` already uses for the shutdown flag, not a new thread or
+    /// synchronization primitive.
+    pub fn run_while(
+        &self,
+        log_writer: &mut dyn LogWriter,
+        recv_timeout: Duration,
+        should_stop: &dyn Fn() -> bool,
+    ) -> Result<()> {
         // LOG-7: strictly-increasing VLSN high-water mark.  0 == NULL_VLSN
         // (never assigned by the master), so "<= high-water" rejects 0
         // too once a real VLSN has arrived.
         let mut received_vlsn_high_water: u64 = 0;
 
         loop {
-            if let Some(flag) = shutdown
-                && flag.load(Ordering::SeqCst)
-            {
+            if should_stop() {
                 return Ok(());
             }
             // ----------------------------------------------------------------

@@ -9,6 +9,7 @@
 //! - Whether a new election result (with a higher term) should supersede the
 //!   current master.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use noxu_sync::RwLock;
@@ -34,6 +35,21 @@ pub struct MasterTracker {
     heartbeat_timeout: Duration,
     /// Optional phi accrual failure detector.
     phi_detector: Option<PhiAccrualDetector>,
+    /// Monotonic counter bumped every time [`set_master`](Self::set_master) or
+    /// [`update_master`](Self::update_master) actually changes the tracked
+    /// `(name, term)` pair.
+    ///
+    /// HA Gap B: a replica's receive thread captures the master address once
+    /// at spawn and streams forever against it, with no way to notice a
+    /// mid-stream master change (JE equivalent: `MasterChangeListener.notify`
+    /// updating `RepNode`'s view, observed by `Replica.runReplicaLoop`'s
+    /// `MasterStatus.inSync()` check on every replayed message). This
+    /// counter is the Rust analog of that observable change: the replica
+    /// thread's outer reconnect loop snapshots it before streaming and polls
+    /// it alongside the shutdown flag, so a changed generation breaks the
+    /// stream and forces fresh syncup against the new master instead of the
+    /// old one.
+    generation: AtomicU64,
 }
 
 impl MasterTracker {
@@ -48,6 +64,7 @@ impl MasterTracker {
             last_heartbeat: RwLock::new(None),
             heartbeat_timeout,
             phi_detector: None,
+            generation: AtomicU64::new(0),
         }
     }
 
@@ -64,17 +81,38 @@ impl MasterTracker {
     ///
     /// Also records a heartbeat at the current time.
     pub fn set_master(&self, name: &str, term: u64) {
+        let changed = self.current_master.read().as_deref() != Some(name)
+            || *self.master_term.read() != term;
         *self.current_master.write() = Some(name.to_string());
         *self.master_term.write() = term;
         *self.last_heartbeat.write() = Some(Instant::now());
+        if changed {
+            self.generation.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     /// Clear the current master.
     ///
     /// After this call, [`get_master`](Self::get_master) returns `None`.
     pub fn clear_master(&self) {
+        let changed = self.current_master.read().is_some();
         *self.current_master.write() = None;
         *self.last_heartbeat.write() = None;
+        if changed {
+            self.generation.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Current generation counter.
+    ///
+    /// Bumped on every `(name, term)` change made via
+    /// [`set_master`](Self::set_master) or an accepted
+    /// [`update_master`](Self::update_master).  A caller that snapshots this
+    /// value before starting work and observes a different value later
+    /// knows the master identity moved underneath it — the signal the Gap B
+    /// reconnect loop polls for.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
     }
 
     /// Returns the name of the current master, if known.
@@ -146,9 +184,14 @@ impl MasterTracker {
             return false;
         }
 
+        let changed = *current_term != term
+            || self.current_master.read().as_deref() != Some(name);
         *current_term = term;
         *self.current_master.write() = Some(name.to_string());
         *self.last_heartbeat.write() = Some(Instant::now());
+        if changed {
+            self.generation.fetch_add(1, Ordering::SeqCst);
+        }
 
         true
     }
@@ -317,6 +360,92 @@ mod tests {
         tracker.set_master("node1", 1);
         tracker.clear_master();
         assert!(!tracker.is_master_alive());
+    }
+
+    // --- Generation counter (HA Gap B) ---
+
+    #[test]
+    fn test_generation_starts_at_zero() {
+        let tracker = MasterTracker::new(Duration::from_secs(5));
+        assert_eq!(tracker.generation(), 0);
+    }
+
+    #[test]
+    fn test_generation_bumps_on_new_master() {
+        let tracker = MasterTracker::new(Duration::from_secs(5));
+        tracker.set_master("node1", 1);
+        let g1 = tracker.generation();
+        assert!(g1 > 0, "first set_master must bump the generation");
+
+        tracker.set_master("node2", 2);
+        let g2 = tracker.generation();
+        assert!(g2 > g1, "changing master must bump the generation again");
+    }
+
+    #[test]
+    fn test_generation_unchanged_on_identical_set_master() {
+        let tracker = MasterTracker::new(Duration::from_secs(5));
+        tracker.set_master("node1", 1);
+        let g1 = tracker.generation();
+
+        // Re-asserting the SAME (name, term) — e.g. a repeated heartbeat —
+        // must not bump the generation, or the Gap B reconnect loop would
+        // treat every heartbeat as a master change and needlessly re-syncup.
+        tracker.set_master("node1", 1);
+        assert_eq!(
+            tracker.generation(),
+            g1,
+            "identical (name, term) must not bump the generation"
+        );
+    }
+
+    #[test]
+    fn test_generation_bumps_on_clear_master() {
+        let tracker = MasterTracker::new(Duration::from_secs(5));
+        tracker.set_master("node1", 1);
+        let g1 = tracker.generation();
+        tracker.clear_master();
+        assert!(tracker.generation() > g1, "clear_master must bump generation");
+    }
+
+    #[test]
+    fn test_generation_unchanged_on_noop_clear() {
+        let tracker = MasterTracker::new(Duration::from_secs(5));
+        assert_eq!(tracker.generation(), 0);
+        tracker.clear_master();
+        assert_eq!(
+            tracker.generation(),
+            0,
+            "clearing an already-absent master must not bump generation"
+        );
+    }
+
+    #[test]
+    fn test_generation_bumps_on_update_master_change() {
+        let tracker = MasterTracker::new(Duration::from_secs(5));
+        tracker.set_master("node1", 1);
+        let g1 = tracker.generation();
+
+        assert!(tracker.update_master("node2", 2));
+        assert!(
+            tracker.generation() > g1,
+            "update_master accepting a new master must bump generation"
+        );
+    }
+
+    #[test]
+    fn test_generation_unchanged_on_rejected_update_master() {
+        let tracker = MasterTracker::new(Duration::from_secs(5));
+        tracker.set_master("node1", 5);
+        let g1 = tracker.generation();
+
+        assert!(!tracker.update_master("node2", 3));
+        assert_eq!(
+            tracker.generation(),
+            g1,
+            "a stale-term update rejected by update_master must not bump \
+             generation"
+        );
     }
 
     // --- Send + Sync ---

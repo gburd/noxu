@@ -782,6 +782,52 @@ pub fn catch_up_from_peer_until(
     Ok(true)
 }
 
+/// Like [`catch_up_from_peer_until`] but polls an arbitrary `should_stop`
+/// predicate instead of a single `AtomicBool`, so a caller can compose
+/// several independent stop conditions (HA Gap B: "shutdown requested OR
+/// the master changed") without a second polling thread.  `recv_timeout`
+/// bounds how long the underlying receive blocks between predicate checks—
+/// callers that need prompt reaction to `should_stop` should keep it short
+/// (1s, matching [`ReplicaReceiver::run_until`]'s shutdown-flag cadence).
+pub fn catch_up_from_peer_while(
+    peer_addr: std::net::SocketAddr,
+    start_vlsn: u64,
+    log_writer: &mut dyn crate::stream::replica_stream::LogWriter,
+    recv_timeout: std::time::Duration,
+    should_stop: &dyn Fn() -> bool,
+) -> Result<bool> {
+    use crate::net::service_dispatcher::connect_to_service;
+    use crate::stream::replica_stream::ReplicaReceiver;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let channel = connect_to_service(peer_addr, PEER_FEEDER_SERVICE_NAME)?;
+    channel.send(&start_vlsn.to_le_bytes())?;
+    let resp = channel.receive(Duration::from_secs(30))?.ok_or_else(|| {
+        RepError::NetworkError("no response from peer feeder".into())
+    })?;
+    if resp.is_empty() {
+        return Err(RepError::NetworkError(
+            "empty response from peer feeder".into(),
+        ));
+    }
+    match resp[0] {
+        PEER_FEEDER_CAN_SERVE => {}
+        PEER_FEEDER_NEEDS_RESTORE => return Ok(false),
+        other => {
+            return Err(RepError::ProtocolError(format!(
+                "peer feeder unknown response byte: {other:#x}"
+            )));
+        }
+    }
+
+    let channel_arc: Arc<dyn Channel> = Arc::from(channel);
+    let receiver = ReplicaReceiver::new(channel_arc);
+    receiver.run_while(log_writer, recv_timeout, should_stop)?;
+
+    Ok(true)
+}
+
 /// Pipelined catch-up from multiple peer nodes simultaneously.
 ///
 /// Spawns one thread per peer in `peers` and waits for all to finish (or
