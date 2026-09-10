@@ -513,8 +513,23 @@ below on why 3x repetition was not done for every cell).
 
 | min_utilization | peak du (storm) | space-amp peak | passive after-drain | space-amp passive | forced after-drain | space-amp forced |
 |---:|---:|---:|---:|---:|---:|---:|
+| 40 | 20,905,733,554 | 20.42x | 20,905,733,554 | 20.42x (unchanged) | TBD | TBD |
+| 50 | 20,653,668,456 | 20.17x | 20,653,668,456 | 20.17x (unchanged) | TBD | TBD |
+| 60 | 21,041,119,998 | 20.55x | 21,041,119,998 | 20.55x (unchanged) | TBD | TBD |
+| 70 | 20,926,505,659 | 20.44x | 20,926,505,659 | 20.44x (unchanged) | TBD | TBD |
+| 80 | 21,059,741,626 | 20.57x | 21,059,741,626 | 20.57x (unchanged) | TBD | TBD |
 
-<!-- sweep rows inserted here as each run completes -->
+**Passive-path result (confirmed as predicted, not assumed):** every one of
+the 5 values gave `cleaner_deletions=0` and byte-for-byte
+`du_before_drain == du_after_drain`. The small (~2%) variance in the
+before-drain numbers across rows is run-to-run Zipfian/thread-scheduling
+noise (each row is one 180s storm; not the effect of the knob), not signal
+— this is the same order as the passive-vs-passive variance seen re-running
+the same `min_utilization=50` config twice in the Part 1 section above
+(19.95x vs 20.17x). **The passive daemon path is completely insensitive to
+`min_utilization`** under this workload, exactly as the tracker-gap analysis
+predicted: the input the threshold gates on never crosses any of these five
+values, so there is nothing to sweep on that path.
 
 #### Write amplification and cleaner cost
 
