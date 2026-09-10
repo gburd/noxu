@@ -46,12 +46,16 @@
 //! likely cause of a fourth, previously unexplained hang in an earlier
 //! attempt at this exact change.
 //!
-//! The `WRITE_SPIN_ATTEMPTS` barging spin is UNCHANGED and still runs before
-//! any reservation is attempted: reserving on every momentary overlap with a
+//! The `WRITE_SPIN_ATTEMPTS` barging spin still runs before any reservation
+//! is attempted, with the same total budget (400 iterations) as the
+//! pre-reservation design: reserving on every momentary overlap with a
 //! departing reader would be as costly as the old immediately-closing gate
 //! (measured 2.9x throughput cost against the B-tree root), so a writer
 //! still spins for a genuinely free lock first and only reserves once that
-//! has failed.
+//! has failed. Its internal spin STRATEGY changed (exponential backoff
+//! between re-reads of `state` rather than reloading every iteration --
+//! see `WRITE_SPIN_ATTEMPTS`'s doc comment); the exit condition and budget
+//! did not.
 //!
 //! Writers are preferred over readers once a reservation exists (no new
 //! reader can be admitted past that point), but writers are NOT ordered
@@ -116,6 +120,20 @@ pub(crate) const WRITE_LOCKED: u32 = 1 << 30;
 /// future reader immediately (unlike spinning, which excludes nobody), so
 /// this must not fire for a momentary overlap with a departing reader —
 /// only once spinning has genuinely failed to find a free window.
+///
+/// This table was measured against a flat per-iteration `state.load()`,
+/// which the writer-reservation port's spin loop no longer does (see
+/// `lock_exclusive_slow`'s exponential-backoff comment): under heavy read
+/// contention a flat reload pays a contended-cache-line cost on every one
+/// of these 400 iterations, which was later found to be the dominant term
+/// in write-tail latency at high reader counts
+/// (`docs/src/internal/parking-lot-removal-2026-09.md`, "Third attempt:
+/// shipped"). The iteration BUDGET (400) is unchanged from this table --
+/// only how often `state` is actually reloaded while spinning changed. Not
+/// independently re-measured against this exact microbenchmark, but the
+/// full engine A/B (`noxu-xbench`, ycsb_c) showed +4.2% read-only
+/// throughput with the backoff version, so the historical throughput
+/// number above has not regressed in practice.
 const WRITE_SPIN_ATTEMPTS: u32 = 400;
 /// Spin attempts a RESERVING writer makes while waiting for the last
 /// draining reader to reach zero, before parking on `drain_futex`.
@@ -140,7 +158,7 @@ const WRITE_SPIN_ATTEMPTS: u32 = 400;
 // immediately. `parking_lot`'s own `wait_for_readers` avoids exactly this
 // with `SpinWait`: a handful of short CPU-relax bursts, THEN yields the
 // thread to the OS for the remaining attempts, never just busy-looping
-// throughout. `spin_then_yield` below is that same two-phase strategy.
+// throughout. `wait_for_drain` below is that same two-phase strategy.
 const DRAIN_SPIN_RELAX_ATTEMPTS: u32 = 3;
 const DRAIN_SPIN_YIELD_ATTEMPTS: u32 = 7;
 /// Each reader increments the state by this amount.
