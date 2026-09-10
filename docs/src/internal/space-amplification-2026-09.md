@@ -1,7 +1,7 @@
 # Space amplification: characterisation (2026-09)
 
 Status: **Phase 1 (characterisation) complete for what it covers; Phase 2
-(the min_utilization lever + a premise correction) in progress.** This
+(the min_utilization lever + a premise correction) complete.** This
 document records every number measured so far, with the exact command used
 to produce it, so the work survives even if the investigation is
 interrupted. Sections
@@ -625,60 +625,132 @@ measurement, for the identical structural reason as the 40-80 sweep: the
 passive path's selection input never reflects real utilization, and the
 forced path never consults the floor at all.
 
-## NOT YET MEASURED (Phase 1 continuation)
+## NOT YET MEASURED (Phase 1 continuation, still open after Phase 2)
 
-- **Live bytes vs on-disk bytes vs reclaimable-but-unreclaimed, decomposed**:
-  this report has "before drain" and "after drain" du numbers, but has not
-  yet decomposed the "before drain" gap into (a) garbage genuinely below the
-  `min_utilization` floor at that instant, (b) an unreclaimed *backlog*
-  (`FileSelector.to_be_cleaned` queue depth) the cleaner simply hadn't gotten
-  to yet under write pressure, and (c) checkpoint-interval lag (files not
-  yet checkpoint-barrier-eligible). The drain experiment conflates all
-  three by construction (it removes write pressure AND lets checkpoints run
-  freely). A steady-state-under-continuous-load measurement (keep the
-  update storm running indefinitely and sample `du` periodically without
-  ever stopping) is needed to see the genuine sustained floor, if one
-  exists, separate from a start/stop artifact.
 - **BIN-delta accumulation** and full-BIN re-logging frequency: the
-  `checkpoint.delta_in_flush` counter read `0` in both runs shown above
-  (`full_bin_flush` dominates), which is itself worth investigating (are
-  BIN-deltas even being used under this workload's dirty-fraction shape, or
-  is every checkpoint doing full BIN rewrites because the update-storm's
-  Zipfian hot set dirties most slots in most touched BINs?) — not yet
-  explained.
+  `checkpoint.delta_in_flush` counter reads `0` in every run in this report
+  (`full_bin_flush` dominates throughout Phase 1 AND Phase 2), which is
+  itself worth investigating (are BIN-deltas even being used under this
+  workload's dirty-fraction shape, or is every checkpoint doing full BIN
+  rewrites because the update-storm's Zipfian hot set dirties most slots in
+  most touched BINs?) — not yet explained, unchanged from Phase 1.
 - **Per-record overhead breakdown** (LN header bytes, key-prefixing
-  efficiency, TTL/expiration slot bytes) — not yet isolated from the
-  aggregate byte totals above.
+  efficiency, TTL/expiration slot bytes) as an *independent* line item is
+  now understood to be moot at this workload's scale (Phase 2's Part 1
+  section: standalone LN entries do not survive any drain, forced or
+  passive, once a file is actually cleaned) — but the underlying
+  BIN-serialization inline-value claim itself is still not confirmed by a
+  targeted unit test, unchanged from Phase 1's flag.
+- **The tracker gap itself is not fixed** (see Phase 2's premise-correction
+  section) — flagged as a real, separate bug (obsolete LN versions are
+  never counted for any real Environment/Database write), out of scope for
+  this measurement task. A fix would need to either (a) make `abort_data`
+  carry a genuine embedded-vs-not-embedded flag instead of always being
+  `Some`, or (b) stop trusting `abort_data.is_some()` as that signal and use
+  the real `embedded_ln` flag once it reflects true embedding (also
+  currently hard-coded `true`, a related, already-flagged gap). Either fix
+  would very likely change the numbers in this report's Phase 2 section —
+  once fixed, the min_utilization sweep would need to be **re-run**, since
+  the current flat curves are a direct consequence of the passive path
+  never engaging, not evidence the floor is unimportant once tracking works.
 - **Whether checkpoint frequency (not just cleaner min_utilization) is the
-  actual lever** — the baseline run used the default
-  `checkpointer_bytes_interval=20MB` / `checkpointer_wakeup_interval_ms=30s`;
-  not yet varied.
-- **The `min_utilization` sweep itself (Phase 2)**: 50/60/70/80 vs measured
-  space and write-amp cost — **not started**. Per the task brief, this is
-  an acceptable place to stop: "min_utilization=50 is a deliberate
-  space-for-write-amplification trade, here is the measured curve [not yet
-  produced], here is the knob, do not change the default" remains the
-  working hypothesis but is **not yet backed by a sweep**.
-- Checkpoint-frequency lever, cleaner backlog/throttle tuning — **not
-  started**.
+  actual lever** — the default `checkpointer_bytes_interval=20MB` /
+  `checkpointer_wakeup_interval_ms=30s` was not varied in Phase 2 either;
+  still open.
+- Checkpoint-frequency lever, cleaner backlog/throttle tuning — still open.
+- **Steady-state-under-continuous-load** (never stopping the storm, just
+  sampling `du` periodically) — still not measured; Phase 2's drain-mode
+  split answers a different, and now more important, question (passive vs
+  forced), but not this one.
+
+## Recommendation (Phase 2 conclusion)
+
+**Do not change the `min_utilization` default. It is JE-faithful (50) and
+this investigation found no measured case, in either direction (40 or 20
+vs 80), where changing it moved space, write-amp, cleaner cost, or
+throughput under a sustained-overwrite workload** — see the sweep tables
+above. That is not "50 happens to be optimal"; it is "the knob is not
+currently wired to a code path that engages under this workload shape,"
+which is a fundamentally different and more important statement, described
+in full in the premise-correction section above. Changing the default in
+this state would be cargo-culting a number that currently does nothing
+under the exact workload this investigation used to test it — the opposite
+of "a strong measured justification."
+
+**Ranked recommendations, with measured cost of each:**
+
+1. **Leave `min_utilization=50` as the default.** No cost, no benefit,
+   confirmed by measurement — this is the safe, JE-faithful, "wait and
+   don't touch it" choice. Users who want space reclaimed under sustained
+   overwrites should call `Environment::clean_log()` (or
+   `checkpoint(force=true)` then `clean_log()`) periodically or on a
+   maintenance-window schedule — this is a real, working, measured path
+   (0.014-0.018x space-amp across every floor value tested, 20 through 80)
+   that does not require any default change, only an operational habit
+   (e.g. a periodic maintenance-window daemon, or calling it from an
+   idle-detection hook). Cost: the write-amp during the forced-drain window
+   itself is higher (~1.27 vs ~1.21 during the storm) because cleaning IS
+   real I/O work — but it is bounded, one-time, and schedulable, unlike an
+   always-on lever.
+2. **File a follow-up bug for the tracker gap** (obsolete LN versions never
+   counted for real API writes — see premise-correction section). This is
+   the actual lever that matters; `min_utilization` cannot be meaningfully
+   evaluated as a space/write-amp trade-off until it is fixed, because right
+   now there is no code path where the trade-off exists to measure. This is
+   flagged, not fixed, per this task's scope (measurement, not a bug-fix
+   task) — but it is the single most actionable finding in this report and
+   should be prioritized ahead of any further `min_utilization` tuning work.
+3. **Do not chase the write-amp-vs-space curve shape as originally framed**
+   by the task brief ("does raising the floor buy meaningful space, or does
+   it just burn write bandwidth re-cleaning files that were about to become
+   garbage anyway?") — under the current engine, **neither** happens: it
+   buys nothing and burns nothing, because the mechanism that would make it
+   do either is not engaging. This question becomes meaningful again only
+   after the tracker gap is fixed, and should be re-run at that point (the
+   probe and sweep infrastructure built in Phase 2 make that a cheap re-run,
+   not a from-scratch investigation).
+4. **After a tracker-gap fix, re-run this exact sweep** (same probe, same
+   `SAP_DRAIN_MODE=passive` — that is the regime a real fix would change)
+   before drawing any conclusion about whether `min_utilization` needs
+   operator tuning guidance beyond "leave it at 50." The forced-drain
+   numbers in this report (0.014-0.018x, flat across 20-80) would likely
+   stay similarly flat even after a fix, since `force=true` bypasses the
+   floor by design (JE-faithful) — the passive numbers are the ones that
+   would actually change and need re-measuring.
 
 ## Artifacts
 
-- Probe source: `benches/noxu-bench/src/bin/space_amp_probe.rs`.
-- Registered as `noxu-space-amp-probe` in `benches/noxu-bench/Cargo.toml`.
-- Raw run logs on the shared EC2 instance (not committed, ephemeral):
-  `/data/space-runs/baseline.log`, `/data/space-runs/{smoke,baseline}/`.
+- Probe source: `benches/noxu-bench/src/bin/space_amp_probe.rs`
+  (`SAP_DRAIN_MODE=passive|forced`, added in Phase 2).
+- `noxu-xbench` (`benches/noxu-bench/src/bin/xbench.rs`) gained
+  `BENCH_MIN_UTIL` in Phase 2 for the throughput sweep.
+- `Environment::cleaner_diagnostics()` (`crates/noxu-db/src/environment.rs`)
+  and `Cleaner::get_file_selector_stats()` /
+  `Cleaner::get_merged_file_summary_map()`
+  (`crates/noxu-cleaner/src/cleaner.rs`), added in Phase 2 for the
+  decomposition. Diagnostic-only, not stable API.
+- Raw run logs on the EC2 instance (not committed, ephemeral):
+  `/data/space-runs/{baseline,smoke,p1-passive,p1-forced,sweep-*}.log` and
+  the matching `/data/space-runs/{name}/` environment directories.
 
 ## Honest summary for this checkpoint
 
-Phase 1 is partial. The breakdown table Phase 1 asked for (live bytes vs
-on-disk bytes vs reclaimable-but-unreclaimed vs per-record overhead) is only
-half built: this report has "before drain" and "after drain" on-disk bytes
-and confirmed data integrity, but has not yet decomposed "before drain" into
-its three candidate causes, and has not yet touched BIN-delta frequency,
-per-record overhead, or the `min_utilization` sweep (Phase 2). The most
-important finding so far — that giving the existing daemons an idle window
-collapses the footprint far below what the original cross-engine report's
-95 GB number would suggest is a hard floor — is a genuine course-correction
-to the task's starting assumption and is flagged as such rather than
-asserted as final. No behavior or default was changed.
+Phase 1 established the methodology (du-based ground truth + wired counters
++ per-entry-type log histogram + data-integrity verification) and flagged,
+but did not fully explain, why post-drain footprints collapsed far below
+the naive live-data floor. Phase 2 found and confirmed by measurement that
+Phase 1's explanation for that collapse was wrong: it attributed the
+collapse to "give the daemons an idle window, no config change," but the
+actual mechanism was `Environment::clean_log()`'s always-`force=true`
+internal behaviour, which bypasses `min_utilization` entirely — a
+consequence of a real tracker bug (obsolete LN versions are never counted
+for writes through the real API) that makes the passive,
+`min_utilization`-gated cleaner path never engage under sustained
+overwrites, at any floor setting from 20 to 80. The task's headline
+deliverable — a `min_utilization` sweep showing space vs write-amp vs
+throughput — was produced and is flat in every dimension, for a structural
+reason now identified and documented rather than assumed. The
+recommendation is to leave the default unchanged, file the tracker gap as
+a separate follow-up, and treat the sweep as not-yet-meaningful until that
+gap is fixed. No behavior or default was changed by this investigation;
+this document is measurement and analysis only.
