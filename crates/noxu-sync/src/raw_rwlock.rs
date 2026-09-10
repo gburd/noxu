@@ -130,10 +130,19 @@ const WRITE_SPIN_ATTEMPTS: u32 = 400;
 // protocol cost, a scheduling one: the reserving writer is usually the
 // (`readers + 1`)-th runnable thread, so parking sends it to the back of
 // the CPU queue instead of letting it observe the drain complete via a few
-// cache-coherent loads. `parking_lot`'s own `wait_for_readers` spins for the
-// identical reason (`SpinWait`, ~10 attempts) before setting
-// `WRITER_PARKED_BIT`.
-const DRAIN_SPIN_ATTEMPTS: u32 = 100;
+// cache-coherent loads.
+//
+// A FLAT busy-spin here is actively harmful under oversubscription (readers
+// + 1 writer > vCPUs): it burns a CPU slot competing with the very readers
+// it is waiting on, instead of yielding that slot back to the scheduler so a
+// reader can actually run and finish. Measured: a flat `spin_loop() x100`
+// pushed max latency at 63 readers to 20-70ms -- worse than parking
+// immediately. `parking_lot`'s own `wait_for_readers` avoids exactly this
+// with `SpinWait`: a handful of short CPU-relax bursts, THEN yields the
+// thread to the OS for the remaining attempts, never just busy-looping
+// throughout. `spin_then_yield` below is that same two-phase strategy.
+const DRAIN_SPIN_RELAX_ATTEMPTS: u32 = 3;
+const DRAIN_SPIN_YIELD_ATTEMPTS: u32 = 7;
 /// Each reader increments the state by this amount.
 const ONE_READER: u32 = 1;
 /// Mask for extracting the reader count (bits 0-29).
@@ -561,16 +570,23 @@ impl NoxuRawRwLock {
     /// timeout raced the drain and LOST). Returns `false` only if the
     /// deadline elapsed and the give-up won cleanly.
     fn wait_for_drain(&self, deadline: Option<Instant>) -> bool {
-        // Spin briefly before ever parking -- see `DRAIN_SPIN_ATTEMPTS`'s
-        // doc comment for why this is a pure latency win with no admission
-        // cost, unlike the barging spin in `lock_exclusive_slow`.
-        for _ in 0..DRAIN_SPIN_ATTEMPTS {
+        // Spin briefly before ever parking -- see
+        // `DRAIN_SPIN_RELAX_ATTEMPTS`/`DRAIN_SPIN_YIELD_ATTEMPTS`'s doc
+        // comment for why this is a pure latency win with no admission
+        // cost (unlike the barging spin in `lock_exclusive_slow`), and why
+        // it MUST yield rather than stay a flat busy-spin once the short
+        // relax phase is exhausted.
+        for i in 0..(DRAIN_SPIN_RELAX_ATTEMPTS + DRAIN_SPIN_YIELD_ATTEMPTS) {
             if self.state.load(Ordering::Relaxed) & READERS_MASK == 0 {
                 self.exclusive_owner
                     .store(crate::raw_mutex::thread_id(), Ordering::Relaxed);
                 return true;
             }
-            std::hint::spin_loop();
+            if i < DRAIN_SPIN_RELAX_ATTEMPTS {
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
         }
 
         loop {
