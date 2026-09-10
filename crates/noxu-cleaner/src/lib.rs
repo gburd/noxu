@@ -54,7 +54,7 @@ pub use file_processor::{
 };
 pub use file_protector::FileProtector;
 pub use file_selector::{
-    CheckpointStartCleanerState, FileSelector, FileStatus,
+    CheckpointStartCleanerState, FileSelector, FileSelectorStats, FileStatus,
 };
 pub use file_summary::FileSummary;
 pub use in_summary::InSummary;

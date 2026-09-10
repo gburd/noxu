@@ -22,6 +22,24 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
+/// Diagnostic snapshot returned by [`Environment::cleaner_diagnostics`].
+///
+/// Not part of the stable public API surface; shape may change without a
+/// major version bump.
+#[derive(Debug, Clone)]
+pub struct CleanerDiagnostics {
+    /// File-selector pipeline-state counts (see
+    /// [`noxu_cleaner::FileSelectorStats`]).
+    pub file_selector: noxu_cleaner::FileSelectorStats,
+    /// Merged per-file utilization summary map (cached profile + live
+    /// tracker), keyed by file number — the same map `do_clean` scores
+    /// against.
+    pub file_summaries:
+        std::collections::BTreeMap<u32, noxu_cleaner::FileSummary>,
+    /// The cleaner's currently configured `min_utilization` percentage.
+    pub min_utilization: u32,
+}
+
 /// Build an [`EnvironmentStats`] snapshot from a locked [`EnvironmentImpl`].
 ///
 /// Shared by [`Environment::stats`] and the periodic stats-file dumper
@@ -1863,6 +1881,30 @@ impl Environment {
         self.check_open()?;
         self.env_impl.lock().refresh_disk_limit();
         Ok(())
+    }
+
+    /// Diagnostic snapshot of the cleaner's file-selector pipeline state
+    /// (`to_be_cleaned`, `being_cleaned`, `cleaned`, `checkpointed`,
+    /// `safe_to_delete` file counts) plus the merged per-file utilization
+    /// summary map used for selection.  `None` if this environment has no
+    /// cleaner (read-only).
+    ///
+    /// Used by the space-amplification probe (Phase 2,
+    /// docs/src/internal/space-amplification-2026-09.md) to decompose an
+    /// observed on-disk-bytes gap into: genuinely-below-the-floor garbage
+    /// (derivable from the summary map + `min_utilization`), a real cleaner
+    /// backlog (`to_be_cleaned` non-zero), and files cleaned but not yet
+    /// past the two-checkpoint deletion barrier (`cleaned`/`checkpointed`
+    /// non-zero). Not part of the stable public API surface (diagnostic
+    /// only); may change shape without a major version bump.
+    pub fn cleaner_diagnostics(&self) -> Option<CleanerDiagnostics> {
+        let env_impl = self.env_impl.lock();
+        let cleaner = env_impl.get_cleaner()?;
+        Some(CleanerDiagnostics {
+            file_selector: cleaner.get_file_selector_stats(),
+            file_summaries: cleaner.get_merged_file_summary_map(),
+            min_utilization: cleaner.get_min_utilization(),
+        })
     }
 
     /// Explicitly trigger the memory evictor.

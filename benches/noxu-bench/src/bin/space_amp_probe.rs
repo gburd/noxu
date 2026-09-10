@@ -37,6 +37,16 @@
 //!   SAP_FINAL_CLEAN_PASSES  max poll rounds (poll_secs=2s each) to wait for
 //!                         the already-running daemons to drain the log to
 //!                         steady state at the end (default 50 => ~100s cap)
+//!   SAP_DRAIN_MODE        passive|forced (default passive). passive: leave
+//!                         the running daemons alone, no manual calls (tests
+//!                         the min_utilization-gated do_clean(force=false)
+//!                         path). forced: turn the daemons off, then
+//!                         manually alternate checkpoint(force=true) and
+//!                         clean_log() (force=true internally) -- tests the
+//!                         operator-triggered maintenance-window path, which
+//!                         Phase 2 found is a DIFFERENT mechanism (bypasses
+//!                         min_utilization tiers), not the same mechanism
+//!                         given more time. See Phase 2 in the report.
 
 use noxu_db::{
     DatabaseConfig, Durability, Environment, EnvironmentConfig,
@@ -283,11 +293,26 @@ min_util={min_util} ckpt_bytes={ckpt_bytes} ckpt_ms={ckpt_ms} dur={durability} =
             })
         })
         .collect();
-    std::thread::sleep(std::time::Duration::from_secs(update_seconds));
+    // Track peak du during the storm itself (Part 2 asks for both
+    // steady-state-after-drain AND peak-during-storm; polling here avoids
+    // relying on storm-end du as a proxy, in case a daemon happens to catch
+    // up mid-storm and du dips before growing again).
+    let mut peak_du_during_storm: u64 = du_sb(&dir);
+    let poll_deadline = ut0 + std::time::Duration::from_secs(update_seconds);
+    loop {
+        let now = Instant::now();
+        if now >= poll_deadline {
+            break;
+        }
+        let remaining = poll_deadline - now;
+        std::thread::sleep(remaining.min(std::time::Duration::from_secs(5)));
+        peak_du_during_storm = peak_du_during_storm.max(du_sb(&dir));
+    }
     stop.store(true, Ordering::Relaxed);
     for h in handles {
         h.join().unwrap();
     }
+    peak_du_during_storm = peak_du_during_storm.max(du_sb(&dir));
     let update_elapsed = ut0.elapsed().as_secs_f64();
     let total_writes = writes.load(Ordering::Relaxed);
     println!(
@@ -306,42 +331,101 @@ min_util={min_util} ckpt_bytes={ckpt_bytes} ckpt_ms={ckpt_ms} dur={durability} =
         du_before_drain as f64 / (1024.0 * 1024.0 * 1024.0)
     );
     print_cleaner_stats("before-drain", &s_before);
+    print_decomposition("before-drain", &env, du_before_drain);
 
-    // ── Drive the cleaner + checkpointer to steady state: alternate
-    //    checkpoint() (makes cleaned files reclaimable) and clean_log()
-    //    (forced pass) until no file is cleaned in a round, or the round
-    //    budget is exhausted. This answers "how much of the du growth is
-    //    reclaimable RIGHT NOW under the configured min_utilization, given
-    //    enough checkpoints" vs. "how much is genuinely retained garbage
-    //    under the floor".
-    println!(
-        "-- draining: waiting for the (already-running) checkpointer + \
-         cleaner daemons to reach steady state --"
-    );
-    // The checkpointer and cleaner daemons (run_checkpointer / run_cleaner,
-    // both on by default) have been running continuously since env open,
-    // including through the update storm. Racing them with manual
-    // env.checkpoint()/env.clean_log() calls is a methodological trap: both
-    // take an exclusive in-progress flag, so a manual call issued while the
-    // daemon holds it returns Err and -- with the original `let _ = ...` --
-    // silently did nothing, understating how much draining had actually
-    // happened (this is exactly what a first pass of this probe hit: du grew
-    // through this section instead of shrinking). "Draining" here means:
-    // stop generating new garbage and give the SAME daemons enough
-    // wall-clock time to catch up, polling `du -sb` until it stops shrinking.
+    // ── Drain phase.  Two selectable, NON-conflated modes (Phase 2 finding:
+    //    conflating them is exactly what made Phase 1's "give the daemons an
+    //    idle window" story misleading -- see the report's Phase 2 section
+    //    "the premise correction").
+    //
+    //    SAP_DRAIN_MODE=passive (default): the daemons that have been running
+    //      continuously since env open (run_checkpointer/run_cleaner, both on
+    //      by default) are left alone -- NO manual checkpoint()/clean_log()
+    //      calls at all.  This measures what "just let the system idle" (no
+    //      config change, no operator action) actually reclaims under
+    //      min_utilization-gated selection (do_clean(force=false)).
+    //
+    //    SAP_DRAIN_MODE=forced: manually alternates checkpoint(force=true)
+    //      and clean_log() (force=true internally) while the daemons keep
+    //      running in the background (disabling a running daemon thread is
+    //      advisory-only at the config layer -- see
+    //      EnvironmentMutableConfig's run_cleaner/run_checkpointer doc
+    //      comment; the already-spawned thread does not re-read the flag).
+    //      Both calls can transiently fail with "already in progress" when
+    //      they race the daemon's own concurrent pass; that is expected and
+    //      retried with a short backoff rather than aborting, since the
+    //      daemon holding the flag means SOME maintenance work is happening
+    //      anyway. This measures what an operator-triggered maintenance
+    //      window reclaims, which -- per the Phase 2 finding -- is a
+    //      DIFFERENT mechanism (force=true bypasses the min_utilization
+    //      tiers) from the passive daemon path, not the same mechanism given
+    //      more time. See Phase 2 in the report.
+    let drain_mode = envs("SAP_DRAIN_MODE", "passive");
+    println!("-- draining (SAP_DRAIN_MODE={drain_mode}) --");
     let mut last_du = du_sb(&dir);
     let mut stable_polls = 0u64;
     let poll_secs = 2u64;
     let max_polls = final_clean_passes.max(30);
     let mut poll = 0u64;
+    // Forced mode has no clean "steady state" to detect: each forced
+    // checkpoint flushes the dirty BINs the cleaner's own LN migration just
+    // touched (the migration moves a live LN forward, which updates its
+    // tree slot, which dirties the BIN), so du keeps drifting by a small,
+    // shrinking amount round after round rather than going byte-exact flat.
+    // Treating that drift as "not yet stable" made the loop run to
+    // max_polls without ever early-stopping (observed empirically). So
+    // forced mode always runs the full max_polls budget; passive mode keeps
+    // early-stopping since it genuinely goes byte-exact flat (or shrinks to
+    // true steady state) quickly.
     loop {
         poll += 1;
         std::thread::sleep(std::time::Duration::from_secs(poll_secs));
-        // Best-effort manual nudge; ignored on Err (daemon race).
-        let _ = env.checkpoint(None);
-        let _ = env.clean_log();
+        if drain_mode == "forced" {
+            // May transiently race the background daemon's own in-progress
+            // pass; retry with short backoff within this poll rather than
+            // silently moving on -- a single missed forced checkpoint here
+            // stalls files in the CLEANED state for a whole extra poll_secs
+            // (the two-checkpoint deletion barrier needs back-to-back
+            // successful checkpoints to actually advance).
+            for _ in 0..10 {
+                if env
+                    .checkpoint(Some(
+                        &noxu_db::CheckpointConfig::new().with_force(true),
+                    ))
+                    .is_ok()
+                {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            let _ = env.clean_log();
+        }
         let du_now = du_sb(&dir);
-        println!("   poll {poll}: du={du_now} bytes");
+        let pending_barrier = if drain_mode == "forced" {
+            env.cleaner_diagnostics()
+                .map(|d| d.file_selector.cleaned + d.file_selector.checkpointed)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        println!(
+            "   poll {poll}: du={du_now} bytes pending_barrier={pending_barrier}"
+        );
+        if drain_mode == "forced" {
+            // Always run the full budget (see comment above); stable_polls
+            // is tracked for visibility only, never used to stop early.
+            if du_now >= last_du {
+                stable_polls += 1;
+            } else {
+                stable_polls = 0;
+            }
+            last_du = du_now;
+            if poll >= max_polls {
+                println!("   stopping after {poll} polls (poll budget)");
+                break;
+            }
+            continue;
+        }
         if du_now >= last_du {
             stable_polls += 1;
         } else {
@@ -368,6 +452,7 @@ min_util={min_util} ckpt_bytes={ckpt_bytes} ckpt_ms={ckpt_ms} dur={durability} =
         du_after_drain as f64 / (1024.0 * 1024.0 * 1024.0)
     );
     print_cleaner_stats("after-drain", &s_after);
+    print_decomposition("after-drain", &env, du_after_drain);
 
     let phase_write_bytes = log_wb1.saturating_sub(log_wb0);
     let phase_read_bytes = log_rb1.saturating_sub(log_rb0);
@@ -378,8 +463,9 @@ min_util={min_util} ckpt_bytes={ckpt_bytes} ckpt_ms={ckpt_ms} dur={durability} =
     };
 
     println!(
-        "RESULT du_after_load={du_after_load} du_before_drain={du_before_drain} du_after_drain={du_after_drain} \
-user_bytes_live={user_bytes_live} space_amp_before_drain={:.4} space_amp_after_drain={:.4} \
+        "RESULT drain_mode={drain_mode} du_after_load={du_after_load} du_before_drain={du_before_drain} du_after_drain={du_after_drain} \
+peak_du_during_storm={peak_du_during_storm} \
+user_bytes_live={user_bytes_live} space_amp_before_drain={:.4} space_amp_after_drain={:.4} space_amp_peak={:.4} \
 update_storm_writes={total_writes} update_storm_secs={update_elapsed:.1} \
 phase_log_write_bytes={phase_write_bytes} phase_log_read_bytes={phase_read_bytes} write_amp_phase={write_amp_phase:.4} \
 cleaner_runs={} cleaner_deletions={} cleaner_lns_cleaned={} cleaner_lns_migrated={} cleaner_lns_dead={} cleaner_lns_obsolete={} \
@@ -388,6 +474,7 @@ bin_deltas_cleaned={} bin_deltas_migrated={} bin_deltas_dead={} bin_deltas_obsol
 checkpoints={} full_in_flush={} full_bin_flush={} delta_in_flush={}",
         du_before_drain as f64 / user_bytes_live as f64,
         du_after_drain as f64 / user_bytes_live as f64,
+        peak_du_during_storm as f64 / user_bytes_live as f64,
         s_after.cleaner.runs,
         s_after.cleaner.deletions,
         s_after.cleaner.lns_cleaned,
@@ -465,5 +552,62 @@ log: n_sequential_write_bytes={} n_sequential_read_bytes={} n_random_reads={}",
         s.log.n_sequential_write_bytes,
         s.log.n_sequential_read_bytes,
         s.log.n_random_reads,
+    );
+}
+
+/// Part 1 decomposition (space-amp Phase 2): attribute the `du_bytes`
+/// on-disk figure across the file-selector pipeline states plus a
+/// below-the-floor / above-the-floor split of the merged utilization
+/// summary map. `None` (skipped, printed as a note) if this environment
+/// exposes no cleaner (e.g. read-only).
+///
+/// Buckets (mutually exclusive by construction — each file is in exactly
+/// one FileSelector pipeline state, or untracked):
+///   - `below_floor_bytes`: total bytes of files whose summary utilization
+///     is already below `min_utilization` (garbage the cleaner is entitled
+///     to reclaim right now, whether or not it already has).
+///   - `backlog_to_be_cleaned` / `being_cleaned`: FileSelector queue depth
+///     — files the cleaner knows must be cleaned but hasn't gotten to yet
+///     (a genuine backlog under write pressure) vs. mid-clean.
+///   - `cleaned` / `checkpointed`: cleaned but not yet past the
+///     two-checkpoint deletion barrier (checkpoint-interval lag).
+///   - `above_floor_bytes`: the rest — files at or above `min_utilization`,
+///     not queued for cleaning, i.e. genuinely active/live data plus
+///     per-record overhead.
+fn print_decomposition(label: &str, env: &Environment, du_bytes: u64) {
+    let Some(diag) = env.cleaner_diagnostics() else {
+        println!(
+            "   [{label}] decomposition: skipped (no cleaner on this env)"
+        );
+        return;
+    };
+    let min_util = diag.min_utilization as f64 / 100.0;
+    let mut below_floor_bytes: i64 = 0;
+    let mut above_floor_bytes: i64 = 0;
+    let mut below_floor_files = 0u64;
+    let mut above_floor_files = 0u64;
+    for summary in diag.file_summaries.values() {
+        if summary.total_size <= 0 {
+            continue;
+        }
+        if summary.get_utilization() < min_util {
+            below_floor_bytes += summary.total_size as i64;
+            below_floor_files += 1;
+        } else {
+            above_floor_bytes += summary.total_size as i64;
+            above_floor_files += 1;
+        }
+    }
+    let fs = diag.file_selector;
+    println!(
+        "   [{label}] decomposition (min_utilization={}%, du={du_bytes}B): \
+below_floor={below_floor_bytes}B/{below_floor_files}files above_floor={above_floor_bytes}B/{above_floor_files}files | \
+file_selector: to_be_cleaned={} being_cleaned={} cleaned={} checkpointed={} safe_to_delete={}",
+        diag.min_utilization,
+        fs.to_be_cleaned,
+        fs.being_cleaned,
+        fs.cleaned,
+        fs.checkpointed,
+        fs.safe_to_delete,
     );
 }

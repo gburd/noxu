@@ -700,6 +700,37 @@ impl Cleaner {
         self.utilization_profile.lock().get_file_summary(file_number).cloned()
     }
 
+    /// Diagnostic snapshot of the file-selector's pipeline-state counts
+    /// (`to_be_cleaned` / `being_cleaned` / `cleaned` / `checkpointed` /
+    /// `safe_to_delete`) — see [`crate::file_selector::FileSelectorStats`].
+    ///
+    /// Used by the space-amplification probe (Phase 2) to distinguish "not
+    /// yet below the min_utilization floor" from "eligible but the cleaner
+    /// simply hasn't caught up yet" (a real backlog) from "cleaned but not
+    /// yet past the two-checkpoint deletion barrier".
+    pub fn get_file_selector_stats(
+        &self,
+    ) -> crate::file_selector::FileSelectorStats {
+        self.file_selector.lock().get_stats()
+    }
+
+    /// Diagnostic snapshot of the merged per-file utilization summary map
+    /// (cached profile + live tracker), the same map `do_clean` uses for
+    /// file selection. Used by the space-amplification probe (Phase 2) to
+    /// compute, at a point in time, how many bytes are below the configured
+    /// `min_utilization` floor vs. above it but still physically on disk.
+    pub fn get_merged_file_summary_map(
+        &self,
+    ) -> BTreeMap<u32, crate::FileSummary> {
+        let profile = self.utilization_profile.lock();
+        if let Some(ref tracker_arc) = self.utilization_tracker {
+            let tracker = tracker_arc.lock();
+            profile.get_file_summary_map(true, &tracker)
+        } else {
+            profile.get_file_summary_map(false, &UtilizationTracker::new(false))
+        }
+    }
+
     /// CLN-24: returns the serialized per-file expiration histogram for
     /// `file_number`, suitable for persisting in a `FileSummaryLN` trailer.
     ///
