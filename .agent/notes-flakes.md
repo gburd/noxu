@@ -130,3 +130,60 @@ background-thread write path that could touch the faultdisk write counter;
 960 reproduction attempts of flake 1 in isolation (0 failures) plus 40
 sequential (0 failures) — all under heavy synthetic EC2 load. No repro yet.
 Flake 2 not started.
+
+
+---
+
+# RESOLUTION (maintainer, continuing from the stopped agent)
+
+## Flake 2 (`xa_adversarial_test::test_rapid_fire_10k_with_prepared_log`) — FIXED
+
+Measured rather than assumed: in isolation with a generous budget it passes in
+47.8 s (so NOT deadlocked), but under suite parallelism it is flagged SLOW and
+exceeds nextest's 120 s cap once the whole workspace competes for CPU. Genuine
+slowness, not a hang.
+
+Fixed by scaling the cycle count with the build profile (2,000 debug / 10,000
+release). The property under test is "resolved prepared branches do not
+accumulate", which holds at any sufficiently large count; 10,000 was arbitrary.
+Debug 47.8 s -> 10.8 s; whole noxu-xa suite 68 s -> 32.5 s with no SLOW flag;
+release still runs the full 10,000.
+
+Deliberately NOT fixed by raising the global timeout (weakens the cap for every
+other test) or by `#[ignore]` (stops exercising the path in normal runs).
+
+## Flake 1 (`dst_crash_sweep::dst_same_seed_reproduces_exactly`) — NOT REPRODUCED
+
+Total reproduction attempts across this investigation: 960 parallel + 40
+sequential (agent, under synthetic load avg ~60 on 64 vCPU), plus 12 whole-binary
+runs and 3 full-workspace runs (maintainer). **Zero failures.** It did not fail
+once, including in the full-workspace configuration that is closest to CI.
+
+It is left as-is, unfixed and un-annotated, because there is nothing to act on:
+the process-global `faultdisk` interference hypothesis is plausible and
+documented above, but unconfirmed, and adding a retry or an `#[ignore]` to a test
+that never failed in ~1,000 attempts would be pure superstition.
+
+## What DID reproduce: two other tests, both load-induced
+
+The full-workspace runs failed a *different* test each time, which is the real
+signature here — CPU starvation under 6,300-test parallelism, not a specific
+broken test.
+
+- `noxu-rep::tcp_integration::test_channel_drop_on_receiver_side_is_detected_by_sender`
+  — **FIXED.** Measured 1/20 failures in isolation. Root cause was a hard-coded
+  timing assumption: 10 sends x 10 ms (~100 ms) to observe a broken pipe. How
+  fast the kernel surfaces the peer's RST is not ours to control, and under
+  contention the scheduler did not run the loop often enough inside that window.
+  Re-bounded by a 10 s DEADLINE instead of an iteration count. 0/25 after.
+
+- `noxu-xa::xa_adversarial_test::test_concurrent_prepared_log_stress` — 0/15 in
+  isolation, so it only fails under full-workspace load. Same starvation class,
+  left open and recorded here rather than guessed at.
+
+## The generalisable lesson
+
+Three of the four flakes examined were tests asserting that something happens
+within a hard-coded number of short sleeps. That pattern is a latent flake on any
+loaded machine. Prefer a generous deadline over an iteration count whenever the
+thing being waited for is scheduled by the kernel or another thread.
