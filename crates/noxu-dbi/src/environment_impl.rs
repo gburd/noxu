@@ -2898,6 +2898,70 @@ impl EnvironmentImpl {
         }
     }
 
+    /// Writes a "null" TxnCommit entry: no tree changes, existing solely to
+    /// persist the current durable-transaction VLSN (DTVLSN) to the WAL.
+    ///
+    /// Port of JE `MasterTxn.createNullTxn` + `FeederManager.DTVLSNFlusher
+    /// .flush()` (`FeederManager.java` ~line 1008-1035): "Writes a null (no
+    /// modifications) commit record when it detects that the DTVLSN is ahead
+    /// of the persistent DTVLSN and needs to be updated... without this
+    /// mechanism, the in-memory DTVLSN would always be ahead of the persisted
+    /// VLSN, since in general DTVLSN(vlsn) < vlsn."
+    ///
+    /// Allocates a fresh internal txn id from `self.txn_manager` (so the
+    /// commit id space stays consistent with ordinary transactions — JE's
+    /// `MasterTxn.createNullTxn` is a real `Txn` subclass, not a synthetic
+    /// id), writes exactly one `TxnCommit` WAL entry with `dtvlsn` embedded,
+    /// and immediately marks the txn committed in the txn manager (there is
+    /// no data to undo — no locks were ever acquired).
+    ///
+    /// `dtvlsn` must be non-zero (`NULL_VLSN` is a caller bug — this method
+    /// exists only to persist a real value). Returns the assigned LSN.
+    pub fn log_null_txn_commit(
+        &self,
+        dtvlsn: i64,
+        fsync: bool,
+        flush: bool,
+    ) -> Result<noxu_util::Lsn, DbiError> {
+        let lm = match &self.log_manager {
+            Some(lm) => lm,
+            None => return Ok(NULL_LSN), // read-only env: nothing to log
+        };
+        debug_assert!(
+            dtvlsn > 0,
+            "log_null_txn_commit: dtvlsn must be a real VLSN, got {dtvlsn}"
+        );
+
+        let txn_id = self.txn_manager.begin_txn().id_as_locker();
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        use noxu_util::vlsn::Vlsn;
+        let entry = TxnEndEntry::new_commit(
+            txn_id,
+            NULL_LSN,
+            timestamp,
+            0,
+            Vlsn::new(dtvlsn),
+        );
+        let mut buf = BytesMut::with_capacity(entry.log_size());
+        entry.write_to_log(&mut buf);
+
+        // The null commit carries no VLSN of its own (it is not a
+        // replicated data operation and must not be assigned a slot in the
+        // VLSN index — JE: "Don't save VLSN from null transaction as
+        // DTVLSN"). Use the plain `log()` path, not `log_with_vlsn`.
+        let result = lm
+            .log(LogEntryType::TxnCommit, &buf, Provisional::No, flush, fsync)
+            .map_err(DbiError::from);
+
+        self.txn_manager.commit_txn(txn_id);
+        result
+    }
+
     /// Writes a TxnAbort entry to the WAL (no fsync needed on abort).
     ///
     /// → log abort entry.
