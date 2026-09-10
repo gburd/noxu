@@ -754,3 +754,84 @@ recommendation is to leave the default unchanged, file the tracker gap as
 a separate follow-up, and treat the sweep as not-yet-meaningful until that
 gap is fixed. No behavior or default was changed by this investigation;
 this document is measurement and analysis only.
+
+## Phase 3: the tracker bug, root-caused and measured (2026-09)
+
+Phase 2 identified that the `UtilizationTracker` never learns an overwritten
+record's prior version is garbage. This phase traced *why*, end to end, and
+measured what fixing it costs.
+
+### It was three defects, not one
+
+Phase 2 named the `abort_data.is_some()` filter. That is real, but it is not the
+whole story, and it is not even the dominant one. Tracing with instrumentation
+rather than inspection found three independent blockers on the path from
+"overwrite a record" to "the cleaner knows":
+
+1. **`abort_data` is not a valid proxy for "embedded".** JE's
+   `Txn.maybeCountObsoleteLSN` skips counting when `getAbortData() != null`,
+   which is sound *in JE* because it assigns `abortData` only inside
+   `if (bin.isEmbeddedLN(idx))` (`CursorImpl.java:3328`). Noxu populates
+   `abort_data` on every overwrite because the in-memory undo path needs the
+   before-image unconditionally, so the proxy is always true. Fixed by tracking
+   the question explicitly as `WriteLockInfo::abort_counted_at_log_time`.
+
+2. **Explicit transactions had no `LogManager`.** `TxnManager::begin_txn` built a
+   `Txn` via `Txn::new`, and `count_obsolete_abort_lsns` early-returns without
+   one — so it never reached any filter. `Txn::with_log_manager` was called only
+   from unit tests.
+
+3. **THE DOMINANT ONE: auto-commit never called the counting at all.**
+   `commit_append_phase` is guarded by
+   `if self.has_logged_entries() && !self.is_auto_txn()`, and the counting lived
+   inside that block. Since `Database::put`/`del` wrap *every* call in a
+   synthetic auto-txn, the dominant write path skipped it entirely. This is why
+   the earlier `obs-probe` measured `obsolete_ln_count = 0` after 2,000
+   overwrites.
+
+Defect 3 is invisible to inspection of the filter, which is where the first two
+phases were looking. It only surfaced by instrumenting the call and observing
+that it never fired.
+
+### The measured cost of fixing it, and why it is gated off
+
+With all three corrected (`ycsb_a`, 8 threads, 100k records, 512-byte values,
+`NO_SYNC`, local NVMe):
+
+| configuration | throughput | on-disk |
+|---|---:|---:|
+| counting off (shipped default) | 267k–318k ops/s | 2,126–2,506 MB |
+| counting on | 7.6k–9.5k ops/s | 187–206 MB |
+
+**A ~12× space reduction for a ~33× throughput regression.** Neither side of that
+is acceptable as a default, so both counting paths ship gated behind
+`NOXU_COUNT_AUTOCOMMIT_OBSOLETE` and `NOXU_COUNT_TXN_OBSOLETE`, off by default,
+with the measurement recorded at each site.
+
+### The real blocker: no `LocalUtilizationTracker`
+
+The regression is not the counting arithmetic — it is contention.
+`UtilizationTrackerObserver::count_obsolete` takes a **global mutex**
+(`self.tracker.lock()`), and correct counting takes it once per commit. At ~300k
+ops/s across 8 threads that mutex is the bottleneck.
+
+JE does not have this problem because it has a piece we lack:
+`LocalUtilizationTracker` / `BaseLocalUtilizationTracker`, which accumulate
+per-thread and merge into the shared tracker in batches, so the shared lock is
+taken once per batch instead of once per operation.
+
+**That is the actual work item**, and it is now the blocker for everything else
+here: the `min_utilization` sweep cannot be re-run meaningfully until obsolete
+counting can be enabled by default, and it cannot be enabled by default until the
+local tracker exists.
+
+### Status
+
+- Root cause: fully understood, all three defects fixed in code.
+- Correctness: proven by `utilization_obsolete_counting_test`, which drives
+  `Database::put` (the real path) rather than `CursorImpl::with_log_manager`, and
+  which guards BOTH directions — that overwrites are counted, and that
+  single-write records are *not* (over-counting would let the cleaner discard live
+  data).
+- Default behaviour: unchanged, deliberately.
+- Next: port `LocalUtilizationTracker`, then flip the gates and re-run Phase 2.

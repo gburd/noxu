@@ -104,6 +104,30 @@ impl TxnManager {
         Txn::new(id, self.lock_manager.clone())
     }
 
+    /// Begins an explicit transaction with a `LogManager` attached.
+    ///
+    /// The log manager is what lets `Txn::commit` count each write-lock's abort
+    /// LSN obsolete through the `UtilizationTracker` on commit
+    /// (`Txn::count_obsolete_abort_lsns`, mirroring JE
+    /// `Txn.getObsoleteLsnInfo` -> `LogManager.countObsoleteNode`). Without it
+    /// that method early-returns, so the cleaner never learns that an
+    /// overwritten record's prior version became garbage — every file looks
+    /// ~100 % utilized and the daemon (`force=false`) never selects one.
+    ///
+    /// Prefer this over [`Self::begin_txn`] anywhere a log manager is available;
+    /// `begin_txn` remains for unit tests that run without one.
+    pub fn begin_txn_with_log_manager(
+        &self,
+        log_manager: Arc<LogManager>,
+    ) -> Txn {
+        let id = self.next_txn_id.fetch_add(1, Ordering::Relaxed);
+        self.last_local_txn_id.store(id, Ordering::Relaxed);
+        self.n_begins.fetch_add(1, Ordering::Relaxed);
+        self.all_txns.write().insert(id, NULL_LSN.as_u64());
+        self.lock_manager.register_locker_label(id, "txn");
+        Txn::with_log_manager(id, self.lock_manager.clone(), log_manager)
+    }
+
     /// Begins a synthetic transient transaction wrapping a single
     /// auto-commit operation.
     ///

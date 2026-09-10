@@ -18,8 +18,31 @@ pub struct WriteLockInfo {
     /// Key of the abort version (if key updates allowed).
     pub abort_key: Option<Vec<u8>>,
 
-    /// Data of the abort version (if embedded in BIN).
+    /// Data of the abort version — the record's pre-image bytes.
+    ///
+    /// NOTE: unlike JE, this is populated on EVERY overwrite, not only when the
+    /// LN was embedded in its parent BIN. Noxu's in-memory undo path needs the
+    /// before-image unconditionally (see `CursorImpl::finalize_write_lock`). Do
+    /// NOT use `abort_data.is_some()` as a proxy for "the LN was embedded, so it
+    /// was already counted obsolete at logging time" — that inference is valid in
+    /// JE, where `abortData` is assigned only inside `if (bin.isEmbeddedLN(idx))`
+    /// (`CursorImpl.java:3328`), but it is FALSE here. Use
+    /// `abort_counted_at_log_time` for that question instead.
     pub abort_data: Option<Vec<u8>>,
+
+    /// Was the abort version already counted obsolete when it was logged?
+    ///
+    /// This is the flag JE's `maybeCountObsoleteLSN` is really asking about via
+    /// `getAbortData() != null` / `isLNImmediatelyObsolete()`: an LN embedded in
+    /// its parent BIN, or one in a duplicates database, is counted obsolete at
+    /// logging time, so counting it again at commit would double-count.
+    ///
+    /// It is tracked explicitly because Noxu cannot reuse JE's `abortData`-based
+    /// proxy: we populate `abort_data` on every overwrite for in-memory undo, so
+    /// that proxy is always true and suppressed obsolete-counting for EVERY
+    /// transactional overwrite — leaving the cleaner's `UtilizationTracker` blind
+    /// to essentially all real garbage.
+    pub abort_counted_at_log_time: bool,
 
     /// VLSN of the abort version.
     pub abort_vlsn: i64,
@@ -54,6 +77,7 @@ impl WriteLockInfo {
             abort_known_deleted: false,
             abort_key: None,
             abort_data: None,
+            abort_counted_at_log_time: false,
             abort_vlsn: -1,
             abort_log_size: 0,
             abort_expiration: 0,
@@ -71,6 +95,7 @@ impl WriteLockInfo {
         self.abort_known_deleted = from.abort_known_deleted;
         self.abort_key = from.abort_key.clone();
         self.abort_data = from.abort_data.clone();
+        self.abort_counted_at_log_time = from.abort_counted_at_log_time;
         self.abort_vlsn = from.abort_vlsn;
         self.abort_log_size = from.abort_log_size;
         self.abort_expiration = from.abort_expiration;
