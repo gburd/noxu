@@ -16,12 +16,24 @@ lock_api = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { workspace = true }
 
+# DST wave (rwlock writer-reservation model, 2026-09): only in the graph
+# under `--cfg noxu_shuttle`.  Lets a standalone protocol model of the
+# reservation state table (crates/noxu-sync/tests/shuttle_rwlock_reservation.rs)
+# be explored by shuttle's scheduler.  Default builds never pull shuttle in.
+[target.'cfg(noxu_shuttle)'.dependencies]
+shuttle = { workspace = true }
+
 # A/B microbenchmark against parking_lot (benches/sync_vs_parking_lot.rs) —
 # the "publish the numbers or retire it" measurement.  Dev-only: neither dep
 # is in the shipped dependency graph.
 [dev-dependencies]
 criterion = { workspace = true }
 parking_lot = { workspace = true }
+
+# DST wave: tests/shuttle_rwlock_reservation.rs is gated behind
+# `#![cfg(noxu_shuttle)]`, so this dev-dep only matters under that cfg.
+[target.'cfg(noxu_shuttle)'.dev-dependencies]
+shuttle = { workspace = true }
 
 [[bench]]
 name = "sync_vs_parking_lot"

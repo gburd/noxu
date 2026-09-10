@@ -15,6 +15,34 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Performance
+
+- **`noxu-sync`: writer reservation for `NoxuRawRwLock`, closing most of the
+  documented write-latency tail gap against `parking_lot`.** Third attempt at
+  this change (two prior attempts backed out after introducing deadlocks/
+  livelocks; see `docs/src/internal/parking-lot-removal-2026-09.md`, "Third
+  attempt (2026-09): shipped"). Followed the mandated approach: a state table
+  (`docs/src/internal/rwlock-state-table-2026-09.md`) written and committed
+  before any lock code, validated by a standalone shuttle protocol model
+  (`crates/noxu-sync/tests/shuttle_rwlock_reservation.rs`) before porting.
+  `WRITE_LOCKED` now means "reserved or held" (parking_lot's `WRITER_BIT`
+  semantics): a writer that fails a short barging spin reserves
+  unconditionally, excluding every future reader immediately rather than
+  re-racing the acquire CAS once readers drain. The `WRITE_WAITING`/
+  `FAIRNESS_THRESHOLD` eventual-fairness gate is deleted entirely (redundant
+  once reservation exists). Measured on a dedicated, idle 32-vCPU box: p50
+  write latency at 63 readers 1007 µs → ~30 µs (~30×), max 19.9 ms → ~100 µs
+  (~200×); engine A/B (`noxu-xbench`) shows +4.2 % read-only (`ycsb_c`) and
+  +64.6 % mixed (`ycsb_a`, `NO_SYNC`) throughput — a gain, not the documented
+  cost. No behaviour change to callers; `is_locked_exclusive()`/
+  `is_write_locked()` now correctly distinguish "reserved" from "held" (a
+  reservation with readers still draining reports `false`, matching the
+  semantics callers already relied on). Full verification: `noxu-sync`
+  31/31, shuttle DST 10/10 (9 pre-existing suites + the new model), `rwstress`
+  7/7 configurations with no lost wakeups, workspace `cargo nextest`
+  6335/6336 (one unrelated pre-existing slow `noxu-spec` timeout), clippy
+  `--all-targets --all-features` and `cargo fmt --all --check` both clean.
+
 ## [7.8.0] - 2026-09-10
 
 ### Documentation
