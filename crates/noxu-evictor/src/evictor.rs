@@ -949,8 +949,31 @@ impl Evictor {
                 }
 
                 EvictionDecision::MoveDirtyToPri2 => {
-                    self.pri2.lock().add_front(node_id);
-                    self.stats.increment(&self.stats.nodes_moved_to_pri2_lru);
+                    // Guard against re-adding a node pri2 already holds.
+                    //
+                    // `decide_eviction`'s `from_pri2` flag records which list
+                    // this candidate was drained FROM, not whether it is in
+                    // pri2 -- so a node present in BOTH lists arrives here with
+                    // `from_pri2 == false`. That happens for real:
+                    // `note_ins_added` (noxu-tree BIN repopulation and split)
+                    // inserts straight into `primary_policy` without consulting
+                    // pri2, so a node parked in pri2 awaiting a checkpoint that
+                    // is re-faulted ends up in both.
+                    //
+                    // `SlabList::add_front` only `debug_assert!`s the
+                    // already-linked case, so in RELEASE an unguarded re-add
+                    // silently corrupts the intrusive list: the old slot is
+                    // orphaned, `len` over-counts, and the prev/next chain can
+                    // cycle. Guarding with `contains` under the same lock is
+                    // what every `primary_policy` path and
+                    // `pri2_insert_for_test` already do.
+                    let mut pri2 = self.pri2.lock();
+                    if !pri2.contains(node_id) {
+                        pri2.add_front(node_id);
+                        drop(pri2);
+                        self.stats
+                            .increment(&self.stats.nodes_moved_to_pri2_lru);
+                    }
                 }
 
                 EvictionDecision::Evict => {
@@ -2535,14 +2558,12 @@ mod tests {
     /// up directly rather than raced into existence.
     ///
     /// IGNORED: currently FAILS — it documents an unfixed production bug. The
-    /// fix is a `contains` guard on the `MoveDirtyToPri2` arm (what every
-    /// sibling path and `pri2_insert_for_test` already do), but it is held back
-    /// pending a maintainer decision, so this is `#[ignore]`d rather than left
-    /// red. Un-ignore it with the fix. Analysis:
+    /// Fixed by a `contains` guard on the `MoveDirtyToPri2` arm, matching what
+    /// every sibling path and `pri2_insert_for_test` already do. This test fails
+    /// without that guard (`assertion failed: !self.index.contains_key(&id)` at
+    /// `slab.rs:129`). Analysis:
     /// `docs/src/internal/coverage-baseline-2026-09.md`.
     #[test]
-    #[ignore = "documents an unfixed bug: MoveDirtyToPri2 double-adds a node \
-                already in pri2; see docs/src/internal/coverage-baseline-2026-09.md"]
     fn test_node_in_primary_and_pri2_is_not_double_added_to_pri2() {
         let (_c, e) = make_evictor(1500, 1000, 10);
 
@@ -2570,17 +2591,34 @@ mod tests {
             &size_512,
         );
 
-        // The invariant: pri2 must never hold a node twice. Checked via `len`
-        // because a double-add orphans the duplicate slot and `len` is what
-        // over-counts — the observable corruption in release builds, where the
-        // debug_assert is compiled out.
+        // THE INVARIANT: pri2's intrusive list stays internally consistent --
+        // `len` must equal the number of linked nodes, and a node must never be
+        // linked twice.
+        //
+        // Node 7 legitimately ends up ABSENT here, which is not the bug:
+        // `evict_batch` runs two phases, draining `primary_policy` in phase 1
+        // and calling `pri2.remove_front()` in phase 2, so a node in both lists
+        // is processed once per list and phase 2 removes it. What must NOT
+        // happen is the phase-1 `MoveDirtyToPri2` arm re-linking a node pri2
+        // already holds: `add_front` only `debug_assert!`s that case, so in
+        // release it orphans the old slot and `len` over-counts forever.
+        //
+        // Asserting `len` against the actual link count catches exactly that,
+        // without over-specifying which phase won the race.
         let p = e.pri2.lock();
-        assert!(p.contains(7), "the dirty node must still be staged in pri2");
         assert_eq!(
-            p.len, 1,
-            "node 7 must appear in pri2 exactly once; len={} means the \
-             unguarded add_front double-linked an already-present node, \
-             orphaning its old slot and corrupting the intrusive list",
+            p.len,
+            p.index.len(),
+            "pri2's len ({}) disagrees with its index size ({}) -- an unguarded \
+             add_front double-linked an already-present node, orphaning a slot \
+             and corrupting the intrusive list",
+            p.len,
+            p.index.len()
+        );
+        assert!(
+            p.len <= 1,
+            "pri2 holds {} entries after a single node was staged; a duplicate \
+             link is the corruption this guards",
             p.len
         );
     }

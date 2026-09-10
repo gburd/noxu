@@ -15,6 +15,27 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Fixed
+
+- **The evictor could silently corrupt its pri2 intrusive list in release
+  builds.** `evict_batch`'s `MoveDirtyToPri2` arm called
+  `pri2.add_front(node_id)` unconditionally, relying on the invariant "a node
+  drained from the primary policy is never already in pri2". That invariant does
+  not hold: `note_ins_added` (noxu-tree BIN repopulation and split) inserts
+  straight into `primary_policy` without consulting pri2, so a node parked in
+  pri2 awaiting a checkpoint that is then re-faulted lands in **both** lists. The
+  `from_pri2` flag records which list a candidate was drained *from*, not whether
+  it is in pri2, so such a node reaches the arm with `from_pri2 == false`.
+  `SlabList::add_front` only `debug_assert!`s the already-linked case, so debug
+  builds panicked while **release builds silently orphaned the old slot, leaving
+  `len` permanently over-counting and the prev/next chain able to cycle**. Fixed
+  with a `contains` guard under the same lock, matching every `primary_policy`
+  path and `pri2_insert_for_test`. The regression test is verified non-vacuous in
+  both profiles: without the guard, debug panics at `slab.rs:129` and release
+  fails with `len (1) disagrees with index size (0)` — the actual production
+  corruption.
+
+
 ## [7.7.0] - 2026-09-09
 
 ### Changed
