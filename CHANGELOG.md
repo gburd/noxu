@@ -15,6 +15,38 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Documentation
+
+- **Space amplification: characterisation, Phase 2 (min_utilization lever)
+  + a premise correction to Phase 1.** Ran the Phase 1 probe suite
+  (`noxu-space-amp-probe`) on a dedicated (single-tenant) EC2 host so
+  wall-clock/throughput numbers are clean, not order-of-magnitude. Found
+  and verified a real gap in the cleaner's `UtilizationTracker`: obsolete
+  LN versions are never counted for any write through the real
+  `Environment`/`Database` API (explicit or synthetic-auto-commit
+  transaction) — `crates/noxu-txn/src/txn.rs::count_obsolete_abort_lsns`'s
+  `abort_data.is_some()` filter (intended to skip only JE-style *embedded*
+  LNs already counted at logging time) fires on every overwrite, because
+  `abort_data` is unconditionally populated with the real before-image
+  bytes for in-memory undo support. Consequence: the passive,
+  `min_utilization`-gated background cleaner never selects a file for
+  cleaning under a sustained-overwrite workload, **at any floor setting
+  from 20 to 80** — confirmed by a full sweep, both drain-mode passive
+  (byte-for-byte flat, `cleaner_deletions=0`, at all 6 values tested) and
+  drain-mode forced (`Environment::clean_log()`'s always-`force=true`
+  internal behaviour, which bypasses `min_utilization` entirely and
+  reclaims to ~0.014-0.018x regardless of the floor). This corrects Phase
+  1's headline claim: the dramatic post-drain footprints Phase 1 measured
+  were driven by its drain loop's always-force=true manual calls, not by
+  "giving the already-running daemons an idle window, no config change" as
+  Phase 1's prose described. Recommendation: do not change the
+  `min_utilization` default (JE-faithful 50) — no measured case in either
+  direction shows the knob moving space, write-amp, cleaner cost, or
+  throughput, because neither reachable code path currently engages with
+  it under this workload. The tracker gap itself is flagged as a follow-up
+  bug, not fixed (out of scope for this measurement task). No behaviour or
+  default changed. See `docs/src/internal/space-amplification-2026-09.md`.
+
 ## [7.8.0] - 2026-09-10
 
 ### Documentation
