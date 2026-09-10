@@ -117,6 +117,23 @@ pub(crate) const WRITE_LOCKED: u32 = 1 << 30;
 /// this must not fire for a momentary overlap with a departing reader —
 /// only once spinning has genuinely failed to find a free window.
 const WRITE_SPIN_ATTEMPTS: u32 = 400;
+/// Spin attempts a RESERVING writer makes while waiting for the last
+/// draining reader to reach zero, before parking on `drain_futex`.
+//
+// Reservation excludes every future reader the instant it is taken, so
+// unlike the barging spin above (which trades throughput against
+// admission), this spin trades nothing but a park/wake round-trip: the
+// readers already in flight are, by construction, the only remaining
+// obstacle, and they are typically microseconds from finishing. Skipping
+// straight to a blocking futex_wait for every reservation was measured to
+// cost 70-100x parking_lot's p50 at 63 readers on a 32-vCPU box -- not a
+// protocol cost, a scheduling one: the reserving writer is usually the
+// (`readers + 1`)-th runnable thread, so parking sends it to the back of
+// the CPU queue instead of letting it observe the drain complete via a few
+// cache-coherent loads. `parking_lot`'s own `wait_for_readers` spins for the
+// identical reason (`SpinWait`, ~10 attempts) before setting
+// `WRITER_PARKED_BIT`.
+const DRAIN_SPIN_ATTEMPTS: u32 = 100;
 /// Each reader increments the state by this amount.
 const ONE_READER: u32 = 1;
 /// Mask for extracting the reader count (bits 0-29).
@@ -544,6 +561,18 @@ impl NoxuRawRwLock {
     /// timeout raced the drain and LOST). Returns `false` only if the
     /// deadline elapsed and the give-up won cleanly.
     fn wait_for_drain(&self, deadline: Option<Instant>) -> bool {
+        // Spin briefly before ever parking -- see `DRAIN_SPIN_ATTEMPTS`'s
+        // doc comment for why this is a pure latency win with no admission
+        // cost, unlike the barging spin in `lock_exclusive_slow`.
+        for _ in 0..DRAIN_SPIN_ATTEMPTS {
+            if self.state.load(Ordering::Relaxed) & READERS_MASK == 0 {
+                self.exclusive_owner
+                    .store(crate::raw_mutex::thread_id(), Ordering::Relaxed);
+                return true;
+            }
+            std::hint::spin_loop();
+        }
+
         loop {
             // Sample the generation BEFORE testing `state`; see
             // `drain_futex`'s doc comment for why (identical reasoning to
