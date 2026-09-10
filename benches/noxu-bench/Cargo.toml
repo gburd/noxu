@@ -25,6 +25,10 @@ name = "noxu-xbench"
 path = "src/bin/xbench.rs"
 
 [[bin]]
+name = "noxu-space-amp-probe"
+path = "src/bin/space_amp_probe.rs"
+
+[[bin]]
 name = "noxu-sustained-write"
 path = "src/bin/sustained_write.rs"
 

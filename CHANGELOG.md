@@ -15,6 +15,27 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Documentation
+
+- **Space amplification: characterisation, Phase 1 partial.** New bench probe
+  (`noxu-space-amp-probe`) drives a load + Zipfian overwrite-storm + drain cycle
+  against the real checkpointer/cleaner daemons on real NVMe. Headline finding: at
+  both 50K and 2M live records, giving the existing daemons an idle drain window
+  (no config change) collapsed on-disk size far below the naive live-data floor,
+  independently verified against data loss (full key-by-key scan, all records
+  intact) — which complicates the prior cross-engine report's framing that the
+  50 % `min_utilization` floor alone explains a sustained ~2x space-amp. The
+  before-drain ratios (49x at 50K, 11.9x at 2M) look like steady-load snapshots
+  rather than unreclaimable garbage. Also found: `CleanerStats`'s
+  `total_log_size`/`active_log_size`/`min_utilization`/`max_utilization`/
+  `probe_runs`/`repeat_iterator_reads` are never written by production code (only
+  by unit tests), so `env.stats()` and the `noxu-observe` Prometheus gauges
+  derived from them always read 0 in a running environment — a real operational
+  gap, verified independently, noted but out of scope here. Phase 2 (the
+  `min_utilization` lever sweep) and the before-drain gap decomposition are not
+  yet done. No behaviour or default changed. See
+  `docs/src/internal/space-amplification-2026-09.md`.
+
 ### Added
 
 - **noxu-rep: periodic DTVLSN flusher daemon** (Gap C of the HA
@@ -132,6 +153,24 @@ listed in [References](#references).
   threads the lock still beats `parking_lot` (8.0 vs 4.8 Mops/s at 64).
 
 ### Documentation
+
+- **Space amplification: characterisation, Phase 1 partial.** New bench probe
+  (`noxu-space-amp-probe`) drives a load + Zipfian overwrite-storm + drain
+  cycle against the real checkpointer/cleaner daemons on real NVMe.
+  Headline finding: at both 50K and 2M live records, giving the existing
+  daemons an idle drain window (no config change) collapsed on-disk size far
+  below the naive live-data floor, independently verified against data loss
+  (full key-by-key scan, all records intact) — complicating the prior
+  cross-engine report's framing that the 50 % `min_utilization` floor alone
+  explains a sustained ~2x space-amp. Also found: `CleanerStats`'s
+  `total_log_size`/`active_log_size`/`min_utilization`/`max_utilization`/
+  `probe_runs`/`repeat_iterator_reads` fields are never written by production
+  code (only unit tests), so `env.stats()` and the `noxu-observe` Prometheus
+  gauges derived from them always read 0 in a running environment — a real
+  operational gap, noted but out of scope to fix here. Phase 2 (the
+  `min_utilization` lever sweep) and the before-drain gap decomposition are
+  not yet done. No behavior or default changed. See
+  `docs/src/internal/space-amplification-2026-09.md`.
 
 - **Replacing `parking_lot` with `noxu-sync` everywhere: implemented, measured,
   rejected.** The swap was carried out in full (seven edits; workspace builds,
