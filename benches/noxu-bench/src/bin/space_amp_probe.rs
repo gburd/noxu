@@ -367,20 +367,65 @@ min_util={min_util} ckpt_bytes={ckpt_bytes} ckpt_ms={ckpt_ms} dur={durability} =
     let poll_secs = 2u64;
     let max_polls = final_clean_passes.max(30);
     let mut poll = 0u64;
+    // Forced mode has no clean "steady state" to detect: each forced
+    // checkpoint flushes the dirty BINs the cleaner's own LN migration just
+    // touched (the migration moves a live LN forward, which updates its
+    // tree slot, which dirties the BIN), so du keeps drifting by a small,
+    // shrinking amount round after round rather than going byte-exact flat.
+    // Treating that drift as "not yet stable" made the loop run to
+    // max_polls without ever early-stopping (observed empirically). So
+    // forced mode always runs the full max_polls budget; passive mode keeps
+    // early-stopping since it genuinely goes byte-exact flat (or shrinks to
+    // true steady state) quickly.
     loop {
         poll += 1;
         std::thread::sleep(std::time::Duration::from_secs(poll_secs));
         if drain_mode == "forced" {
             // May transiently race the background daemon's own in-progress
-            // pass; ignore Err (best-effort nudge) rather than aborting --
-            // see the drain-mode doc comment above.
-            let _ = env.checkpoint(Some(
-                &noxu_db::CheckpointConfig::new().with_force(true),
-            ));
+            // pass; retry with short backoff within this poll rather than
+            // silently moving on -- a single missed forced checkpoint here
+            // stalls files in the CLEANED state for a whole extra poll_secs
+            // (the two-checkpoint deletion barrier needs back-to-back
+            // successful checkpoints to actually advance).
+            for _ in 0..10 {
+                if env
+                    .checkpoint(Some(
+                        &noxu_db::CheckpointConfig::new().with_force(true),
+                    ))
+                    .is_ok()
+                {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
             let _ = env.clean_log();
         }
         let du_now = du_sb(&dir);
-        println!("   poll {poll}: du={du_now} bytes");
+        let pending_barrier = if drain_mode == "forced" {
+            env.cleaner_diagnostics()
+                .map(|d| d.file_selector.cleaned + d.file_selector.checkpointed)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        println!(
+            "   poll {poll}: du={du_now} bytes pending_barrier={pending_barrier}"
+        );
+        if drain_mode == "forced" {
+            // Always run the full budget (see comment above); stable_polls
+            // is tracked for visibility only, never used to stop early.
+            if du_now >= last_du {
+                stable_polls += 1;
+            } else {
+                stable_polls = 0;
+            }
+            last_du = du_now;
+            if poll >= max_polls {
+                println!("   stopping after {poll} polls (poll budget)");
+                break;
+            }
+            continue;
+        }
         if du_now >= last_du {
             stable_polls += 1;
         } else {
