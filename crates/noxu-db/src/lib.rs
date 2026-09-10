@@ -138,7 +138,7 @@ pub use disk_ordered_cursor::{
     DiskOrderedCursor, DiskOrderedCursorConfig, open_disk_ordered_cursor_multi,
 };
 pub use durability::{Durability, ReplicaAckPolicy, SyncPolicy};
-pub use environment::Environment;
+pub use environment::{CleanerDiagnostics, Environment};
 pub use environment_config::{EnvironmentConfig, ExceptionListenerHolder};
 pub use environment_mutable_config::EnvironmentMutableConfig;
 pub use error::{

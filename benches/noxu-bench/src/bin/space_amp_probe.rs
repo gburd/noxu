@@ -283,11 +283,26 @@ min_util={min_util} ckpt_bytes={ckpt_bytes} ckpt_ms={ckpt_ms} dur={durability} =
             })
         })
         .collect();
-    std::thread::sleep(std::time::Duration::from_secs(update_seconds));
+    // Track peak du during the storm itself (Part 2 asks for both
+    // steady-state-after-drain AND peak-during-storm; polling here avoids
+    // relying on storm-end du as a proxy, in case a daemon happens to catch
+    // up mid-storm and du dips before growing again).
+    let mut peak_du_during_storm: u64 = du_sb(&dir);
+    let poll_deadline = ut0 + std::time::Duration::from_secs(update_seconds);
+    loop {
+        let now = Instant::now();
+        if now >= poll_deadline {
+            break;
+        }
+        let remaining = poll_deadline - now;
+        std::thread::sleep(remaining.min(std::time::Duration::from_secs(5)));
+        peak_du_during_storm = peak_du_during_storm.max(du_sb(&dir));
+    }
     stop.store(true, Ordering::Relaxed);
     for h in handles {
         h.join().unwrap();
     }
+    peak_du_during_storm = peak_du_during_storm.max(du_sb(&dir));
     let update_elapsed = ut0.elapsed().as_secs_f64();
     let total_writes = writes.load(Ordering::Relaxed);
     println!(
@@ -306,6 +321,7 @@ min_util={min_util} ckpt_bytes={ckpt_bytes} ckpt_ms={ckpt_ms} dur={durability} =
         du_before_drain as f64 / (1024.0 * 1024.0 * 1024.0)
     );
     print_cleaner_stats("before-drain", &s_before);
+    print_decomposition("before-drain", &env, du_before_drain);
 
     // ── Drive the cleaner + checkpointer to steady state: alternate
     //    checkpoint() (makes cleaned files reclaimable) and clean_log()
@@ -368,6 +384,7 @@ min_util={min_util} ckpt_bytes={ckpt_bytes} ckpt_ms={ckpt_ms} dur={durability} =
         du_after_drain as f64 / (1024.0 * 1024.0 * 1024.0)
     );
     print_cleaner_stats("after-drain", &s_after);
+    print_decomposition("after-drain", &env, du_after_drain);
 
     let phase_write_bytes = log_wb1.saturating_sub(log_wb0);
     let phase_read_bytes = log_rb1.saturating_sub(log_rb0);
@@ -379,7 +396,8 @@ min_util={min_util} ckpt_bytes={ckpt_bytes} ckpt_ms={ckpt_ms} dur={durability} =
 
     println!(
         "RESULT du_after_load={du_after_load} du_before_drain={du_before_drain} du_after_drain={du_after_drain} \
-user_bytes_live={user_bytes_live} space_amp_before_drain={:.4} space_amp_after_drain={:.4} \
+peak_du_during_storm={peak_du_during_storm} \
+user_bytes_live={user_bytes_live} space_amp_before_drain={:.4} space_amp_after_drain={:.4} space_amp_peak={:.4} \
 update_storm_writes={total_writes} update_storm_secs={update_elapsed:.1} \
 phase_log_write_bytes={phase_write_bytes} phase_log_read_bytes={phase_read_bytes} write_amp_phase={write_amp_phase:.4} \
 cleaner_runs={} cleaner_deletions={} cleaner_lns_cleaned={} cleaner_lns_migrated={} cleaner_lns_dead={} cleaner_lns_obsolete={} \
@@ -388,6 +406,7 @@ bin_deltas_cleaned={} bin_deltas_migrated={} bin_deltas_dead={} bin_deltas_obsol
 checkpoints={} full_in_flush={} full_bin_flush={} delta_in_flush={}",
         du_before_drain as f64 / user_bytes_live as f64,
         du_after_drain as f64 / user_bytes_live as f64,
+        peak_du_during_storm as f64 / user_bytes_live as f64,
         s_after.cleaner.runs,
         s_after.cleaner.deletions,
         s_after.cleaner.lns_cleaned,
@@ -465,5 +484,62 @@ log: n_sequential_write_bytes={} n_sequential_read_bytes={} n_random_reads={}",
         s.log.n_sequential_write_bytes,
         s.log.n_sequential_read_bytes,
         s.log.n_random_reads,
+    );
+}
+
+/// Part 1 decomposition (space-amp Phase 2): attribute the `du_bytes`
+/// on-disk figure across the file-selector pipeline states plus a
+/// below-the-floor / above-the-floor split of the merged utilization
+/// summary map. `None` (skipped, printed as a note) if this environment
+/// exposes no cleaner (e.g. read-only).
+///
+/// Buckets (mutually exclusive by construction — each file is in exactly
+/// one FileSelector pipeline state, or untracked):
+///   - `below_floor_bytes`: total bytes of files whose summary utilization
+///     is already below `min_utilization` (garbage the cleaner is entitled
+///     to reclaim right now, whether or not it already has).
+///   - `backlog_to_be_cleaned` / `being_cleaned`: FileSelector queue depth
+///     — files the cleaner knows must be cleaned but hasn't gotten to yet
+///     (a genuine backlog under write pressure) vs. mid-clean.
+///   - `cleaned` / `checkpointed`: cleaned but not yet past the
+///     two-checkpoint deletion barrier (checkpoint-interval lag).
+///   - `above_floor_bytes`: the rest — files at or above `min_utilization`,
+///     not queued for cleaning, i.e. genuinely active/live data plus
+///     per-record overhead.
+fn print_decomposition(label: &str, env: &Environment, du_bytes: u64) {
+    let Some(diag) = env.cleaner_diagnostics() else {
+        println!(
+            "   [{label}] decomposition: skipped (no cleaner on this env)"
+        );
+        return;
+    };
+    let min_util = diag.min_utilization as f64 / 100.0;
+    let mut below_floor_bytes: i64 = 0;
+    let mut above_floor_bytes: i64 = 0;
+    let mut below_floor_files = 0u64;
+    let mut above_floor_files = 0u64;
+    for summary in diag.file_summaries.values() {
+        if summary.total_size <= 0 {
+            continue;
+        }
+        if summary.get_utilization() < min_util {
+            below_floor_bytes += summary.total_size as i64;
+            below_floor_files += 1;
+        } else {
+            above_floor_bytes += summary.total_size as i64;
+            above_floor_files += 1;
+        }
+    }
+    let fs = diag.file_selector;
+    println!(
+        "   [{label}] decomposition (min_utilization={}%, du={du_bytes}B): \
+below_floor={below_floor_bytes}B/{below_floor_files}files above_floor={above_floor_bytes}B/{above_floor_files}files | \
+file_selector: to_be_cleaned={} being_cleaned={} cleaned={} checkpointed={} safe_to_delete={}",
+        diag.min_utilization,
+        fs.to_be_cleaned,
+        fs.being_cleaned,
+        fs.cleaned,
+        fs.checkpointed,
+        fs.safe_to_delete,
     );
 }
