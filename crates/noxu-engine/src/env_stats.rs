@@ -152,8 +152,6 @@ impl Default for EnvironmentStats {
                 available_log_size: 0,
                 min_utilization: 0,
                 max_utilization: 0,
-                probe_runs: 0,
-                repeat_iterator_reads: 0,
             },
             checkpoint: CheckpointStatsSnapshot {
                 checkpoints: 0,

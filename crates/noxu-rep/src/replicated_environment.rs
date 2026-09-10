@@ -311,6 +311,26 @@ pub struct ReplicatedEnvironment {
     /// on this tracker (`begin_read_consistency`).  Port of
     /// `RepImpl.getConsistency` / `Replica.getConsistencyTracker`.
     consistency_tracker: StdMutex<Option<crate::ConsistencyTracker>>,
+
+    /// HA Gap B: idempotent-spawn guard for the `noxu-replica-*` receive
+    /// thread.
+    ///
+    /// `become_replica` is called more than once over a node's lifetime
+    /// (once per election it loses); before this guard, every call
+    /// unconditionally spawned a NEW `noxu-replica-*` thread with its own
+    /// `EnvironmentLogWriter`/`ReplicaReplay`, so a `become_replica` call
+    /// that raced with a still-running receive thread from a PRIOR call
+    /// (typical mid-stream failover: the old master is still up when the
+    /// election resolves) would double-spawn two threads driving
+    /// `log_with_vlsn`/`replay.apply_entry` against the SAME live
+    /// `EnvironmentImpl` concurrently.  Set `true` for the lifetime of a
+    /// running receive thread; the thread itself clears it just before
+    /// returning.  `become_replica` checks-and-sets it atomically: if a
+    /// thread is already running, it updates `master_tracker` (which the
+    /// running thread's outer reconnect loop observes via
+    /// `MasterTracker::generation()`) and returns without spawning a
+    /// second thread.
+    replica_thread_running: Arc<AtomicBool>,
 }
 
 impl ReplicatedEnvironment {
@@ -576,6 +596,7 @@ impl ReplicatedEnvironment {
             wal_vlsn_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             wal_feeds_served: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             consistency_tracker: StdMutex::new(None),
+            replica_thread_running: Arc::new(AtomicBool::new(false)),
         };
 
         Ok(env)
@@ -1621,6 +1642,39 @@ impl ReplicatedEnvironment {
     /// Detached state).
     pub fn get_master_name(&self) -> Option<String> {
         self.master_tracker.get_master()
+    }
+
+    /// HA Gap B: current master-tracker generation.
+    ///
+    /// Bumped every time the tracked `(master name, term)` pair actually
+    /// changes (see [`MasterTracker::generation`]).  The replica reconnect
+    /// loop in `become_replica`'s spawned thread snapshots this at the start
+    /// of each iteration and polls it alongside the shutdown flag while
+    /// streaming; a changed value means the master moved underneath it and
+    /// the current stream must be torn down for a fresh syncup.
+    pub fn master_generation(&self) -> u64 {
+        self.master_tracker.generation()
+    }
+
+    /// Resolve `node_name`'s socket address from the current `GroupService`
+    /// membership view.
+    ///
+    /// Returns `None` if the node is not (or no longer) registered, or its
+    /// recorded host/port do not parse as a socket address.  Used both at
+    /// `become_replica` spawn time and by the HA Gap B reconnect loop to
+    /// re-resolve the CURRENT master's address on every iteration, since the
+    /// group membership (and thus a node's address) can change independently
+    /// of who currently holds mastership.
+    pub fn resolve_peer_addr(&self, node_name: &str) -> Option<SocketAddr> {
+        self.group_service
+            .get_all_nodes()
+            .iter()
+            .find(|n| n.name == node_name)
+            .and_then(|info| {
+                format!("{}:{}", info.host, info.port)
+                    .parse::<SocketAddr>()
+                    .ok()
+            })
     }
 
     /// Get the replication group info.
@@ -2693,6 +2747,44 @@ impl ReplicatedEnvironment {
         // replicated entries via EnvironmentLogWriter.
         if let Some(env) = self.env_impl.lock().unwrap().clone() {
             if let Some(log_mgr) = env.get_log_manager() {
+                // --- HA Gap B: idempotent-spawn guard ---------------------
+                //
+                // `become_replica` is called more than once over a node's
+                // lifetime (once per election it loses).  A prior call's
+                // `noxu-replica-*` thread may still be alive and streaming
+                // when a NEW `become_replica` call arrives naming a
+                // different master (the common mid-stream failover shape:
+                // the old master is still up when the election for the new
+                // one resolves).  Spawning a second thread here would drive
+                // TWO `EnvironmentLogWriter`/`ReplicaReplay` pairs against
+                // the SAME live `EnvironmentImpl` concurrently — a
+                // correctness hazard, not just a resource leak.
+                //
+                // The generation bump already applied above
+                // (`master_tracker.set_master`) is the signal the
+                // ALREADY-RUNNING thread's outer reconnect loop polls for
+                // (alongside `io_shutdown`) to break its current stream and
+                // re-syncup against the new master itself.  So when a
+                // thread is already running, updating `master_tracker` /
+                // `replica_stream` above IS the whole job; return without
+                // touching the dispatcher or spawning a second thread.
+                if self.replica_thread_running.swap(true, Ordering::SeqCst) {
+                    log::info!(
+                        "Node '{}': replica receive thread already \
+                         running; updated master to '{}' -- the running \
+                         thread's reconnect loop will pick it up",
+                        self.config.node_name.as_str(),
+                        master_name,
+                    );
+                    self.notify_listeners(old_state, NodeState::Replica);
+                    log::info!(
+                        "Node '{}' became replica of master '{}'",
+                        self.config.node_name.as_str(),
+                        master_name
+                    );
+                    return Ok(());
+                }
+
                 // REP-6: feed the env's SHARED, persisted VLSN index (the one
                 // flush_to_disk persists and get_vlsn_range / election ranking
                 // read) into the replica receive loop — NOT a throwaway. Using
@@ -2756,16 +2848,8 @@ impl ReplicatedEnvironment {
                 }
 
                 // Resolve the master's socket address from the GroupService.
-                let master_addr_opt: Option<SocketAddr> = self
-                    .group_service
-                    .get_all_nodes()
-                    .iter()
-                    .find(|n| n.name == master_name)
-                    .and_then(|info| {
-                        format!("{}:{}", info.host, info.port)
-                            .parse::<SocketAddr>()
-                            .ok()
-                    });
+                let master_addr_opt: Option<SocketAddr> =
+                    self.resolve_peer_addr(master_name);
 
                 let node_name = self.config.node_name.clone();
                 let master = master_name.to_string();
@@ -2781,13 +2865,24 @@ impl ReplicatedEnvironment {
                 // never registered with `init_self_weak` (raw
                 // `Arc::new(Self::new(...))` without going through
                 // `open()` or the test harness), the weak ref is `None`
-                // and we fall back to operator-driven bootstrap.
+                // and we fall back to operator-driven bootstrap.  HA Gap B's
+                // outer reconnect loop ALSO depends on this: without a live
+                // `self_weak` there is no back-reference to re-resolve the
+                // master's address or re-run syncup on a generation change,
+                // so the loop degrades to a single one-shot pass using the
+                // address resolved at spawn time (documented at the call
+                // site below) rather than guessing.
                 let self_weak: Option<Weak<Self>> =
                     self.self_weak.get().cloned();
-                // REP-1 STEP 5: whether to run the wire syncup handshake
-                // before streaming. Captured for the replica thread, which
-                // performs the handshake once the master address is resolved.
-                let syncup_self_weak = self_weak.clone();
+
+                // HA Gap B: idempotent-spawn guard, released by
+                // `_clear_running_guard`'s `Drop` when the thread exits for
+                // ANY reason.  Without the release, a later `become_replica`
+                // call after this thread's natural exit would see the guard
+                // still held and silently skip spawning a replacement
+                // thread, leaving the node with no receive thread at all.
+                let replica_thread_running =
+                    Arc::clone(&self.replica_thread_running);
 
                 // REP-7 (B): clone the live EnvironmentImpl into the replica
                 // thread so the writer can drive a ReplicaReplay that applies
@@ -2800,6 +2895,14 @@ impl ReplicatedEnvironment {
                 // streaming.  A read on this replica then waits on the same
                 // handle the replay thread advances.  Port of
                 // RepImpl.getConsistency / Replica.getConsistencyTracker.
+                // HA Gap B: the SAME `ReplicaReplay` (and its
+                // `last_applied_vlsn` handle) is reused across every
+                // reconnect iteration — only its buffered provisional
+                // transactions are cleared (`EnvironmentLogWriter::
+                // reset_replay`) on each loop-back, matching JE's
+                // `Replay.reset()`/`abortOldTxns()` semantics without
+                // invalidating the handle the installed `ConsistencyTracker`
+                // already holds.
                 let replay = noxu_dbi::ReplicaReplay::new(env_for_replay);
                 let freeze_latch_for_replay = self.freeze_latch();
                 let tracker = crate::ConsistencyTracker::new(
@@ -2807,9 +2910,19 @@ impl ReplicatedEnvironment {
                 );
                 *self.consistency_tracker.lock().unwrap() = Some(tracker);
 
+                struct ClearOnDrop(Arc<AtomicBool>);
+                impl Drop for ClearOnDrop {
+                    fn drop(&mut self) {
+                        self.0.store(false, Ordering::SeqCst);
+                    }
+                }
+
                 let handle = std::thread::Builder::new()
                     .name(format!("noxu-replica-{}", node_name))
                     .spawn(move || {
+                        let _clear_running_guard =
+                            ClearOnDrop(replica_thread_running);
+
                         // REP-7 (B): wire the live replay-apply path so reads
                         // on the replica see replicated data without a
                         // restart.  JE: the replica writes each entry to its
@@ -2824,36 +2937,117 @@ impl ReplicatedEnvironment {
                         // `Replay.java:525`).
                         .with_freeze_latch(freeze_latch_for_replay);
 
-                        let Some(addr) = master_addr_opt else {
-                            log::warn!(
-                                "noxu-replica-{}: master '{}' address not in RepGroup; \
-                                 waiting for TCP dispatcher connection",
-                                node_name, master,
-                            );
-                            return;
-                        };
+                        // HA Gap B: outer reconnect loop.  Each iteration:
+                        //   1. upgrades `self_weak` to a strong `Arc<Self>`
+                        //      for this iteration and resolves the CURRENT
+                        //      master fresh from it (not the value captured
+                        //      at spawn time — that staleness is exactly
+                        //      this gap),
+                        //   2. clears any buffered provisional txns left over
+                        //      from the previous iteration,
+                        //   3. runs the full REP-1 STEP 5 syncup handshake
+                        //      against that master — never skipped, never
+                        //      shortcut, same `syncup_with_feeder_at` call
+                        //      and the same three-way
+                        //      RolledBack/DivergedRefused/NeedsRestore
+                        //      handling as the original one-shot code, so
+                        //      the default-deny safety gate
+                        //      (`classify_tail`/`verify_rollback`) keeps
+                        //      working identically on a Gap-B re-syncup,
+                        //   4. streams via `catch_up_from_peer_while`,
+                        //      stopping as soon as EITHER `shutdown` is set
+                        //      OR the master-tracker generation no longer
+                        //      matches the value snapshotted at the START
+                        //      of this iteration.
+                        // On a stream that ends because the generation
+                        // changed, the loop goes back to step 1 with a fresh
+                        // master resolution and a fresh syncup.  JE:
+                        // `Replica.runReplicaLoop`'s outer `while (true)`
+                        // retries `runReplicaLoopInternal` (which itself
+                        // calls `ReplicaFeederSyncup.execute` before
+                        // streaming) whenever the inner loop exits because
+                        // `MasterStatus.assertSync()` finds the node's
+                        // notion of master out of sync with the group's
+                        // (`Replica.java:520`, `MasterSyncException`).
+                        //
+                        // When `self_weak` never upgrades (no back-reference
+                        // — raw `Arc::new(Self::new(...))` callers that skip
+                        // `init_self_weak`), there is no safe way to
+                        // re-resolve or re-syncup, so this degrades to
+                        // exactly the pre-Gap-B one-shot behaviour using the
+                        // address resolved at spawn time.
+                        const MAX_AUTO_BOOTSTRAP_ATTEMPTS: u32 = 2;
+                        'reconnect: loop {
+                            if shutdown.load(Ordering::SeqCst) {
+                                return;
+                            }
 
-                        // ---------------------------------------------------
-                        // REP-1 STEP 5: LIVE SYNCUP before the first stream.
-                        //
-                        // Negotiate a matchpoint against the master's log and
-                        // reconcile this replica's tail FIRST. Without this a
-                        // replica whose log diverged past the matchpoint (an
-                        // old master, or a partitioned node that kept accepting
-                        // writes) would stream the master's history on top of
-                        // its own divergent records and stay silently diverged
-                        // from the cluster's accepted history.
-                        //
-                        // JE runs `ReplicaFeederSyncup.execute` on the
-                        // replication channel before the replay loop starts.
-                        //
-                        // A master that does not answer the syncup service (an
-                        // older peer, or one with no env wired) is not fatal:
-                        // log and fall through to streaming, which is the
-                        // pre-STEP-5 behaviour.
-                        if let Some(env_arc) =
-                            syncup_self_weak.as_ref().and_then(Weak::upgrade)
-                        {
+                            let Some(env_arc) =
+                                self_weak.as_ref().and_then(Weak::upgrade)
+                            else {
+                                let Some(addr) = master_addr_opt else {
+                                    log::warn!(
+                                        "noxu-replica-{}: master '{}' address \
+                                         not in RepGroup; waiting for TCP \
+                                         dispatcher connection",
+                                        node_name, master,
+                                    );
+                                    return;
+                                };
+                                log::info!(
+                                    "noxu-replica-{}: connecting to master \
+                                     '{}' at {} (no back-reference; \
+                                     one-shot mode)",
+                                    node_name, master, addr,
+                                );
+                                let _ = crate::stream::peer_feeder::catch_up_from_peer_until(
+                                    addr, 0, &mut writer, &shutdown,
+                                );
+                                return;
+                            };
+
+                            // Step 1: resolve the current master fresh.
+                            let Some(current_master) =
+                                env_arc.get_master_name()
+                            else {
+                                log::warn!(
+                                    "noxu-replica-{}: no master known; \
+                                     stopping replica receive loop",
+                                    node_name,
+                                );
+                                return;
+                            };
+                            let Some(addr) =
+                                env_arc.resolve_peer_addr(&current_master)
+                            else {
+                                log::warn!(
+                                    "noxu-replica-{}: master '{}' address \
+                                     not in RepGroup; waiting for TCP \
+                                     dispatcher connection",
+                                    node_name, current_master,
+                                );
+                                return;
+                            };
+                            let generation_at_start =
+                                env_arc.master_generation();
+
+                            // Step 2: drop any buffered provisional txns left
+                            // from a prior iteration's partial stream (JE
+                            // `abortOldTxns` on mastership change).
+                            writer.reset_replay();
+
+                            // ---------------------------------------------
+                            // Step 3: REP-1 STEP 5 LIVE SYNCUP, full
+                            // handshake, never shortcut.
+                            //
+                            // Negotiate a matchpoint against the CURRENT
+                            // master's log and reconcile this replica's tail
+                            // FIRST.  A master that does not answer the
+                            // syncup service (an older peer, or one with no
+                            // env wired) is not fatal: log and fall through
+                            // to streaming, which is the pre-STEP-5
+                            // behaviour.
+                            // ---------------------------------------------
                             match env_arc.syncup_with_feeder_at(addr) {
                                 Ok(SyncupAction::RolledBack {
                                     matchpoint_vlsn,
@@ -2863,8 +3057,8 @@ impl ReplicatedEnvironment {
                                         "noxu-replica-{}: syncup with '{}' \
                                          agreed matchpoint vlsn={}; streaming \
                                          from {}",
-                                        node_name, master, matchpoint_vlsn,
-                                        start_vlsn,
+                                        node_name, current_master,
+                                        matchpoint_vlsn, start_vlsn,
                                     );
                                 }
                                 Ok(SyncupAction::DivergedRefused {
@@ -2873,149 +3067,174 @@ impl ReplicatedEnvironment {
                                     reason,
                                 }) => {
                                     // DETECTED divergence that cannot be
-                                    // truncated safely. Do NOT stream: doing so
-                                    // would layer the master's history over the
-                                    // divergent tail. Stop and leave the node
-                                    // for a network restore / operator action.
+                                    // truncated safely. Do NOT stream: doing
+                                    // so would layer the master's history
+                                    // over the divergent tail. Stop and leave
+                                    // the node for a network restore /
+                                    // operator action — identical refusal
+                                    // whether this is the first syncup at
+                                    // spawn or a Gap-B re-syncup after a
+                                    // mid-stream master change.
                                     log::error!(
-                                        "noxu-replica-{}: DIVERGED from master \
-                                         '{}' past matchpoint vlsn={} \
-                                         ({tail_len} tail entries); \
+                                        "noxu-replica-{}: DIVERGED from \
+                                         master '{}' past matchpoint \
+                                         vlsn={} ({tail_len} tail entries); \
                                          replication NOT started. {reason}",
-                                        node_name, master, matchpoint_vlsn,
+                                        node_name, current_master,
+                                        matchpoint_vlsn,
                                     );
                                     return;
                                 }
                                 Ok(SyncupAction::NeedsRestore) => {
                                     log::warn!(
                                         "noxu-replica-{}: syncup with '{}' \
-                                         found no usable matchpoint; a network \
-                                         restore is required",
-                                        node_name, master,
+                                         found no usable matchpoint; a \
+                                         network restore is required",
+                                        node_name, current_master,
                                     );
                                     return;
                                 }
                                 Err(e) => {
                                     log::info!(
                                         "noxu-replica-{}: syncup with '{}' \
-                                         unavailable ({e}); streaming without \
-                                         matchpoint negotiation",
-                                        node_name, master,
+                                         unavailable ({e}); streaming \
+                                         without matchpoint negotiation",
+                                        node_name, current_master,
                                     );
                                 }
                             }
-                        }
+                            drop(env_arc);
 
-                        // Catch-up loop: catch up, observe NeedsRestore,
-                        // optionally auto-bootstrap, retry once.  We cap
-                        // the retry count at MAX_AUTO_BOOTSTRAP_ATTEMPTS
-                        // (small) so a misbehaving master does not loop
-                        // forever consuming network bandwidth.
-                        const MAX_AUTO_BOOTSTRAP_ATTEMPTS: u32 = 2;
-                        let mut attempts: u32 = 0;
-                        loop {
-                            // Observe close before (re)connecting so a
-                            // shutdown between catch-up attempts exits
-                            // promptly.
-                            if shutdown.load(Ordering::SeqCst) {
-                                return;
-                            }
-                            log::info!(
-                                "noxu-replica-{}: connecting to master '{}' at {}",
-                                node_name, master, addr,
-                            );
-                            match crate::stream::peer_feeder::catch_up_from_peer_until(
-                                addr, 0, &mut writer, &shutdown,
-                            ) {
-                                Ok(true) => {
-                                    log::info!(
-                                        "noxu-replica-{}: catch-up complete from '{}'",
-                                        node_name, master,
-                                    );
+                            // Step 4: catch-up + stream, stopping on shutdown
+                            // OR a master-generation change.  Auto-bootstrap
+                            // retry loop mirrors the original one-shot code.
+                            let mut attempts: u32 = 0;
+                            loop {
+                                if shutdown.load(Ordering::SeqCst) {
                                     return;
                                 }
-                                Ok(false) => {
-                                    // F2/F4: master signals NeedsRestore.
-                                    // Wave 9-A fix 2: if a Weak<Self> was
-                                    // plumbed in, upgrade it and call
-                                    // `bootstrap_via_dispatcher` ourselves
-                                    // so the replica auto-bootstraps and
-                                    // resumes catch-up without operator
-                                    // intervention.
-                                    log::warn!(
-                                        "noxu-replica-{}: master '{}' requires restore",
-                                        node_name, master,
-                                    );
-                                    attempts += 1;
-                                    if attempts > MAX_AUTO_BOOTSTRAP_ATTEMPTS {
-                                        log::error!(
-                                            "noxu-replica-{}: exceeded \
-                                             auto-bootstrap attempts ({}); giving up",
-                                            node_name,
-                                            MAX_AUTO_BOOTSTRAP_ATTEMPTS,
-                                        );
-                                        return;
+                                log::info!(
+                                    "noxu-replica-{}: connecting to master \
+                                     '{}' at {}",
+                                    node_name, current_master, addr,
+                                );
+                                let should_stop = || {
+                                    if shutdown.load(Ordering::SeqCst) {
+                                        return true;
                                     }
-                                    let env_arc = match self_weak
+                                    self_weak
                                         .as_ref()
                                         .and_then(Weak::upgrade)
-                                    {
-                                        Some(e) => e,
-                                        None => {
-                                            // No back-ref or env dropped:
-                                            // fall back to operator-driven
-                                            // bootstrap and exit cleanly.
-                                            log::warn!(
-                                                "noxu-replica-{}: no back-reference \
-                                                 available; operator must call \
-                                                 bootstrap_via_dispatcher manually",
-                                                node_name,
+                                        .is_none_or(|e| {
+                                            e.master_generation()
+                                                != generation_at_start
+                                        })
+                                };
+                                match crate::stream::peer_feeder::catch_up_from_peer_while(
+                                    addr, 0, &mut writer,
+                                    std::time::Duration::from_secs(1),
+                                    &should_stop,
+                                ) {
+                                    Ok(true) => {
+                                        if should_stop()
+                                            && !shutdown.load(Ordering::SeqCst)
+                                        {
+                                            log::info!(
+                                                "noxu-replica-{}: stream to \
+                                                 '{}' interrupted by a \
+                                                 master change; \
+                                                 re-syncing",
+                                                node_name, current_master,
                                             );
-                                            return;
+                                            continue 'reconnect;
                                         }
-                                    };
-                                    if env_arc.is_shutdown() {
+                                        log::info!(
+                                            "noxu-replica-{}: catch-up \
+                                             complete from '{}'",
+                                            node_name, current_master,
+                                        );
                                         return;
                                     }
-                                    log::info!(
-                                        "noxu-replica-{}: auto-bootstrapping via \
-                                         dispatcher from '{}' (attempt {})",
-                                        node_name, master, attempts,
-                                    );
-                                    match env_arc
-                                        .bootstrap_via_dispatcher(&master)
-                                    {
-                                        Ok(()) => {
-                                            log::info!(
-                                                "noxu-replica-{}: auto-bootstrap \
-                                                 succeeded; resuming catch-up",
-                                                node_name,
-                                            );
-                                            // Drop the strong ref before
-                                            // re-entering catch-up so we
-                                            // do not keep the env alive
-                                            // longer than necessary.
-                                            drop(env_arc);
-                                            continue;
-                                        }
-                                        Err(e) => {
+                                    Ok(false) => {
+                                        // F2/F4: master signals NeedsRestore.
+                                        log::warn!(
+                                            "noxu-replica-{}: master '{}' \
+                                             requires restore",
+                                            node_name, current_master,
+                                        );
+                                        attempts += 1;
+                                        if attempts
+                                            > MAX_AUTO_BOOTSTRAP_ATTEMPTS
+                                        {
                                             log::error!(
-                                                "noxu-replica-{}: auto-bootstrap \
-                                                 failed: {}",
-                                                node_name, e,
+                                                "noxu-replica-{}: exceeded \
+                                                 auto-bootstrap attempts \
+                                                 ({}); giving up",
+                                                node_name,
+                                                MAX_AUTO_BOOTSTRAP_ATTEMPTS,
                                             );
                                             return;
                                         }
-                                    }
-                                }
-                                Err(e) => {
-                                    if !shutdown.load(Ordering::SeqCst) {
-                                        log::error!(
-                                            "noxu-replica-{}: error from master '{}': {e}",
-                                            node_name, master,
+                                        let Some(env_arc) = self_weak
+                                            .as_ref()
+                                            .and_then(Weak::upgrade)
+                                        else {
+                                            log::warn!(
+                                                "noxu-replica-{}: no \
+                                                 back-reference available; \
+                                                 operator must call \
+                                                 bootstrap_via_dispatcher \
+                                                 manually",
+                                                node_name,
+                                            );
+                                            return;
+                                        };
+                                        if env_arc.is_shutdown() {
+                                            return;
+                                        }
+                                        log::info!(
+                                            "noxu-replica-{}: \
+                                             auto-bootstrapping via \
+                                             dispatcher from '{}' (attempt \
+                                             {})",
+                                            node_name, current_master,
+                                            attempts,
                                         );
+                                        match env_arc.bootstrap_via_dispatcher(
+                                            &current_master,
+                                        ) {
+                                            Ok(()) => {
+                                                log::info!(
+                                                    "noxu-replica-{}: \
+                                                     auto-bootstrap \
+                                                     succeeded; resuming \
+                                                     catch-up",
+                                                    node_name,
+                                                );
+                                                drop(env_arc);
+                                                continue;
+                                            }
+                                            Err(e) => {
+                                                log::error!(
+                                                    "noxu-replica-{}: \
+                                                     auto-bootstrap failed: \
+                                                     {}",
+                                                    node_name, e,
+                                                );
+                                                return;
+                                            }
+                                        }
                                     }
-                                    return;
+                                    Err(e) => {
+                                        if !shutdown.load(Ordering::SeqCst) {
+                                            log::error!(
+                                                "noxu-replica-{}: error from \
+                                                 master '{}': {e}",
+                                                node_name, current_master,
+                                            );
+                                        }
+                                        return;
+                                    }
                                 }
                             }
                         }
