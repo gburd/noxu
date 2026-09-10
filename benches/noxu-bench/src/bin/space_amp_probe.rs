@@ -39,7 +39,8 @@
 //!                         steady state at the end (default 50 => ~100s cap)
 
 use noxu_db::{
-    DatabaseConfig, Durability, Environment, EnvironmentConfig, EnvironmentStats,
+    DatabaseConfig, Durability, Environment, EnvironmentConfig,
+    EnvironmentStats,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -274,7 +275,7 @@ min_util={min_util} ckpt_bytes={ckpt_bytes} ckpt_ms={ckpt_ms} dur={durability} =
                             let _ = t.abort();
                         }
                     }
-                    if local % 4096 == 0 {
+                    if local.is_multiple_of(4096) {
                         writes.fetch_add(4096, Ordering::Relaxed);
                     }
                 }
@@ -358,8 +359,10 @@ min_util={min_util} ckpt_bytes={ckpt_bytes} ckpt_ms={ckpt_ms} dur={durability} =
 
     let du_after_drain = du_sb(&dir);
     let s_after = env.stats().unwrap();
-    let (log_wb1, log_rb1) =
-        (s_after.log.n_sequential_write_bytes, s_after.log.n_sequential_read_bytes);
+    let (log_wb1, log_rb1) = (
+        s_after.log.n_sequential_write_bytes,
+        s_after.log.n_sequential_read_bytes,
+    );
     println!(
         "   du AFTER final drain = {du_after_drain} bytes ({:.2} GiB)",
         du_after_drain as f64 / (1024.0 * 1024.0 * 1024.0)
