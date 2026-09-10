@@ -215,6 +215,30 @@ readers: **~170–200× better**. The gap to `parking_lot` narrows from roughly
 still trails `parking_lot`'s by roughly an order of magnitude at every reader
 count), but the dominant, fixable costs are addressed rather than open.
 
+### Read the p50 figures as a range, not a point
+
+The `~25–37 µs` above is three consecutive runs on one idle box, and repeated
+sampling shows the true run-to-run spread is wider. Four further runs at 63
+readers on a quiet machine gave p50 of **19.0, 50.7, 43.5 and 10.2 µs** — a 5×
+spread straddling the quoted range — and a fifth reading taken while three other
+tenants were loading the machine gave **229.6 µs**.
+
+Two things follow, both worth stating rather than smoothing over:
+
+1. The quoted range is a fair median but understates variance. Treat the honest
+   claim as "tens of microseconds on an idle machine, an order of magnitude worse
+   under contention", not a stable number.
+2. This metric is *dominated* by scheduler latency once readers oversubscribe the
+   CPU (63 readers + 1 writer on 32 vCPUs). That is exactly why the intermediate
+   fix attempts during this work behaved non-monotonically: a flat busy-spin made
+   the tail *worse* by competing for CPU with the very readers it was waiting on.
+   Any future attempt to close the residual gap must measure on an idle,
+   non-oversubscribed machine and report the spread, or it will chase scheduler
+   noise.
+
+The engine-level A/B (below) is the more decision-relevant number precisely
+because it is far less sensitive to this effect.
+
 Engine A/B (dedicated EC2, `noxu-xbench`, interleaved baseline-vs-change, 3×
 each, `BENCH_RECORDS=500000 BENCH_SECONDS=15 BENCH_THREADS=32 BENCH_VALUE=256`):
 
