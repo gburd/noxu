@@ -10,6 +10,7 @@
 //!      BENCH_ISOLATION(default|serializable|read_uncommitted)
 //!      BENCH_NO_WAIT(0|1)  (1 = per-txn immediate-abort-on-conflict)
 //!      BENCH_TAIL_INTERVAL(0=off, else per-N-sec TAIL series; default 0)
+//!      BENCH_MIN_UTIL(cleaner_min_utilization percent; default 50, JE default)
 //!
 //! Concurrency harness (BENCH-DRIVER-ONLY — does NOT make the engine async):
 //!      BENCH_HARNESS(threads|tokio; default threads)
@@ -486,6 +487,9 @@ fn main() {
     ecfg.set_transactional(true);
     ecfg.set_cache_size(cache);
     ecfg.set_durability(dur);
+    // Cleaner min-utilization A/B knob (default = JE-faithful 50).
+    let min_util = envp("BENCH_MIN_UTIL", 50) as u8;
+    ecfg.set_cleaner_min_utilization(min_util);
     // fsync group-commit A/B knobs (default = shipped values).
     let max_leaders = envp("BENCH_MAX_LEADERS", 1) as usize;
     if max_leaders > 1 {
