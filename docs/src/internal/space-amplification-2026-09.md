@@ -513,11 +513,11 @@ below on why 3x repetition was not done for every cell).
 
 | min_utilization | peak du (storm) | space-amp peak | passive after-drain | space-amp passive | forced after-drain | space-amp forced |
 |---:|---:|---:|---:|---:|---:|---:|
-| 40 | 20,905,733,554 | 20.42x | 20,905,733,554 | 20.42x (unchanged) | TBD | TBD |
-| 50 | 20,653,668,456 | 20.17x | 20,653,668,456 | 20.17x (unchanged) | TBD | TBD |
-| 60 | 21,041,119,998 | 20.55x | 21,041,119,998 | 20.55x (unchanged) | TBD | TBD |
-| 70 | 20,926,505,659 | 20.44x | 20,926,505,659 | 20.44x (unchanged) | TBD | TBD |
-| 80 | 21,059,741,626 | 20.57x | 21,059,741,626 | 20.57x (unchanged) | TBD | TBD |
+| 40 | 20,905,733,554 | 20.42x | 20,905,733,554 | 20.42x (unchanged) | 14,426,890 | 0.0141x |
+| 50 | 20,653,668,456 | 20.17x | 20,653,668,456 | 20.17x (unchanged) | 14,558,692 | 0.0142x |
+| 60 | 21,041,119,998 | 20.55x | 21,041,119,998 | 20.55x (unchanged) | 18,086,883 | 0.0177x |
+| 70 | 20,926,505,659 | 20.44x | 20,926,505,659 | 20.44x (unchanged) | 15,740,460 | 0.0154x |
+| 80 | 21,059,741,626 | 20.57x | 21,059,741,626 | 20.57x (unchanged) | 16,965,156 | 0.0166x |
 
 **Passive-path result (confirmed as predicted, not assumed):** every one of
 the 5 values gave `cleaner_deletions=0` and byte-for-byte
@@ -533,10 +533,41 @@ values, so there is nothing to sweep on that path.
 
 #### Write amplification and cleaner cost
 
-| min_utilization | write_amp (storm phase) | cleaner_deletions (forced drain) | checkpoints (forced drain) |
-|---:|---:|---:|---:|
+| min_utilization | write_amp storm-only (passive) | write_amp storm+forced-drain | cleaner_deletions (forced drain) | checkpoints (forced drain) |
+|---:|---:|---:|---:|---:|
+| 40 | 1.2066 | 1.2724 | 40,589 | 60 |
+| 50 | 1.2066 | 1.2730 | 41,702 | 61 |
+| 60 | 1.2070 | 1.2726 | 39,973 | 60 |
+| 70 | 1.2069 | 1.2723 | 42,116 | 61 |
+| 80 | 1.2070 | 1.2730 | 41,945 | 61 |
 
-<!-- sweep rows inserted here as each run completes -->
+**Write-amp result:** the storm-only write_amp (passive column, no cleaning
+ever happens) is ~1.207 regardless of `min_utilization`, as expected — the
+knob cannot affect a phase where the cleaner never engages. The
+storm+forced-drain write_amp is ~1.272-1.273 for every value, with no
+monotonic trend across 40->80 (60 and 80 are marginally higher than 50 and
+70, inside run-to-run noise, not a floor-height effect). The ~0.065
+difference between the two columns (the "cost of actually cleaning") is
+**constant across min_utilization values** in this measurement, because
+`force=true` cleaning does the same amount of work (drain to the same
+near-live floor) regardless of the configured floor — the floor is simply
+not consulted on the tier-4 forced path (`FileSelector::
+select_file_for_cleaning_with_policy`'s `forced { best_file? }` branch
+unconditionally selects the lowest-utilization file; `min_utilization_pct`
+is passed into the function but only read on the non-forced tiers). Checkpoint
+counts (60-61) and deletions (~40k) are likewise flat across all 5 values,
+within noise.
+
+**Interpretation**: under the current engine, `min_utilization` measurably
+affects **neither** code path reachable from either drain mode, for this
+workload. The passive path never engages (tracker gap). The forced path
+always fully engages, regardless of the floor (force=true bypasses the
+floor). There is, right now, no code path in which changing
+`min_utilization` from 40 to 80 changes measured space, write-amp, or
+cleaner cost under a sustained-overwrite workload — which is a stronger and
+more surprising finding than "the curve is flat because 50 is already a good
+default"; the curve is flat because the mechanism that would make it a curve
+is not currently wired to fire under sustained overwrites.
 
 #### Throughput (steady-phase YCSB A, xbench)
 
