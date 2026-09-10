@@ -165,6 +165,11 @@ pub fn describe_export_metrics() {
         "CLEANER_MIN_UTILIZATION"
     );
     describe_gauge!(
+        "noxu_cleaner_max_utilization",
+        Unit::Percent,
+        "CLEANER_MAX_UTILIZATION"
+    );
+    describe_gauge!(
         "noxu_cleaner_backlog",
         Unit::Count,
         "CLEANER_PENDING_LN_QUEUE_SIZE"
@@ -276,6 +281,7 @@ pub fn emit(stats: &EnvironmentStats) {
     counter!("noxu_cleaner_runs_total").absolute(c.runs);
     counter!("noxu_cleaner_files_deleted_total").absolute(c.deletions);
     gauge!("noxu_cleaner_min_utilization").set(c.min_utilization as f64);
+    gauge!("noxu_cleaner_max_utilization").set(c.max_utilization as f64);
     gauge!("noxu_cleaner_backlog").set(c.pending_ln_queue_size as f64);
     gauge!("noxu_cleaner_total_log_size_bytes").set(c.total_log_size as f64);
     gauge!("noxu_cleaner_active_log_size_bytes").set(c.active_log_size as f64);

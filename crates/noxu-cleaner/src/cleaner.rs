@@ -948,6 +948,32 @@ impl Cleaner {
         // Legacy pending_deletions.
         let _legacy = self.delete_pending_files();
 
+        // Publish disk-usage / utilization stats from the freshest merged
+        // (profile + tracker) summary map so `env.stats().cleaner.*` and the
+        // noxu-observe gauges reflect the actual on-disk state rather than
+        // reading 0 forever.  JE: `Cleaner.loadStats` reports
+        // `CLEANER_TOTAL_LOG_SIZE` / `CLEANER_ACTIVE_LOG_SIZE` from the
+        // cached `logSizeStats` (refreshed by `recalcLogSizeStats`) and
+        // `CLEANER_MIN_UTILIZATION` / `CLEANER_MAX_UTILIZATION` from
+        // `UtilizationCalculator.getCurrent{Min,Max}Utilization()`. Rebuild
+        // the merged map one more time so it reflects any files just
+        // cleaned/deleted in this pass.
+        {
+            let refreshed_map: BTreeMap<u32, crate::FileSummary> = {
+                let profile = self.utilization_profile.lock();
+                if let Some(ref tracker_arc) = self.utilization_tracker {
+                    let tracker = tracker_arc.lock();
+                    profile.get_file_summary_map(true, &tracker)
+                } else {
+                    profile.get_file_summary_map(
+                        false,
+                        &UtilizationTracker::new(false),
+                    )
+                }
+            };
+            self.publish_disk_usage_stats(&refreshed_map);
+        }
+
         // Adaptive throttle update.
         let current_write_bytes = self
             .log_manager
@@ -977,6 +1003,104 @@ impl Cleaner {
             files_deleted,
             total_entries_read: total_entries,
         })
+    }
+
+    /// Publishes disk-usage / utilization statistics from a merged per-file
+    /// summary map into `self.stats` so `env.stats().cleaner.*` and the
+    /// `noxu-observe` gauges reflect the actual on-disk state.
+    ///
+    /// JE: `Cleaner.loadStats` reports `CLEANER_TOTAL_LOG_SIZE` /
+    /// `CLEANER_ACTIVE_LOG_SIZE` from the cached `logSizeStats`
+    /// (`FileProtector.getLogSizeStats`, refreshed by
+    /// `Cleaner.recalcLogSizeStats`), and `CLEANER_MIN_UTILIZATION` /
+    /// `CLEANER_MAX_UTILIZATION` from
+    /// `UtilizationCalculator.getCurrentMinUtilization()` /
+    /// `getCurrentMaxUtilization()`, which are computed in `getBestFile`
+    /// (UtilizationCalculator.java ~343-390) as:
+    ///
+    ///   currentMinUtil = utilization(currentMaxObsoleteSize, currentTotalSize)
+    ///   currentMaxUtil = utilization(currentMinObsoleteSize, currentTotalSize)
+    ///
+    /// where `currentMinObsoleteSize`/`currentMaxObsoleteSize` are the
+    /// per-file lower/upper obsolete-byte bounds (definite obsolete vs.
+    /// definite-obsolete-plus-expired) summed over every file, and
+    /// `currentTotalSize` is the summed `FileSummary.total_size`.
+    ///
+    /// Noxu has no reserved/protected-file tier (the cleaner deletes files
+    /// outright rather than parking them — see `disk_limit.rs`), so
+    /// `active_log_size == total_log_size` here; that equivalence is the
+    /// honest value for our design, not an approximation.
+    fn publish_disk_usage_stats(
+        &self,
+        file_summaries: &BTreeMap<u32, crate::FileSummary>,
+    ) {
+        // total_log_size / active_log_size: real on-disk bytes, from the
+        // FileManager -- the same source `DiskLimitTracker` uses -- not from
+        // the FileSummary map, which may not yet reflect files just cleaned
+        // or deleted in this pass.  JE: `FileProtector.getLogSizeStats()`
+        // sums REAL file lengths, not the utilization profile's cached byte
+        // counts.
+        if let Some(fm) = &self.file_manager
+            && let Ok(total) = fm.total_log_size()
+        {
+            self.stats.total_log_size.store(total, Ordering::Relaxed);
+            // No reserved/protected tier in Noxu: active == total.
+            self.stats.active_log_size.store(total, Ordering::Relaxed);
+        }
+
+        // min_utilization / max_utilization: computed from the merged
+        // per-file summary map, mirroring
+        // `UtilizationCalculator.getBestFile`'s currentMinObsoleteSize /
+        // currentMaxObsoleteSize aggregation (~264-284).
+        let mut total_size: i64 = 0;
+        // current*ObsoleteSize bounds: min uses the definite-obsolete-only
+        // bound (lower bound on obsolete bytes); max uses obsolete+expired
+        // (upper bound).  These feed the INVERTED util names below: MORE
+        // obsolete bytes credited -> LOWER utilization.
+        let mut current_min_obsolete: i64 = 0; // obsolete only (lower bound)
+        let mut current_max_obsolete: i64 = 0; // obsolete + expired (upper bound)
+
+        for summary in file_summaries.values() {
+            if summary.is_empty() {
+                continue;
+            }
+            let total = summary.total_size as i64;
+            let obsolete = summary.get_obsolete_size() as i64;
+            let expired = (summary.obsolete_expired_size as i64).min(total);
+            let max_obsolete = (obsolete + expired).min(total);
+
+            total_size += total;
+            current_min_obsolete += obsolete;
+            current_max_obsolete += max_obsolete;
+        }
+
+        // currentMinUtil = utilization(currentMaxObsoleteSize, total): more
+        // obsolete bytes credited -> lower utilization (optimistic bound).
+        let current_min_util =
+            Self::utilization_pct_i64(current_max_obsolete, total_size);
+        // currentMaxUtil = utilization(currentMinObsoleteSize, total): fewer
+        // obsolete bytes credited -> higher utilization (pessimistic bound).
+        let current_max_util =
+            Self::utilization_pct_i64(current_min_obsolete, total_size);
+
+        self.stats
+            .min_utilization
+            .store(current_min_util as u64, Ordering::Relaxed);
+        self.stats
+            .max_utilization
+            .store(current_max_util as u64, Ordering::Relaxed);
+    }
+
+    /// `FileSummary.utilization(obsoleteSize, totalSize)` (FileSummary.java
+    /// ~292): `round(100 * (total - obsolete) / total)`, clamped to
+    /// [0, 100]. Operates on `i64` sums so callers can pass aggregate
+    /// (multi-file) totals without overflow.
+    fn utilization_pct_i64(obsolete: i64, total: i64) -> i32 {
+        if total <= 0 {
+            return 0;
+        }
+        let active = (total - obsolete).max(0) as f64;
+        ((100.0 * active) / total as f64).round().clamp(0.0, 100.0) as i32
     }
     ///
     /// Called when `required_util >= 0` to determine whether the file's true
@@ -2542,6 +2666,83 @@ mod tests {
         // TxnCommit entries are classified as Other → not migrated.
         let stats = cleaner.get_stats().snapshot();
         assert_eq!(stats.lns_migrated, 0);
+    }
+
+    /// CLEANER-STATS: `do_clean` must publish `total_log_size` /
+    /// `active_log_size` / `min_utilization` / `max_utilization` from real
+    /// production state, not leave them at their zero-initialised default.
+    ///
+    /// Drives a real `FileManager`-backed cleaner: writes actual log
+    /// entries to disk (so `total_log_size` has real on-disk bytes to
+    /// report), seeds the `UtilizationProfile` with a per-file summary that
+    /// is 50% obsolete (so `min_utilization`/`max_utilization` have a
+    /// non-trivial, checkable value), then runs `do_clean` and asserts the
+    /// published stats are NON-ZERO and match the expected values computed
+    /// independently from the same inputs — not merely that a setter round-
+    /// trips.
+    #[test]
+    fn test_do_clean_publishes_disk_usage_and_utilization_stats() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Write real entries so the file has non-zero bytes on disk.
+        let (fm, _lm) = make_fm_and_lm_with_entries(dir.path());
+
+        let on_disk_total =
+            fm.total_log_size().expect("file manager must report a size");
+        assert!(
+            on_disk_total > 0,
+            "test precondition: file must have real bytes on disk"
+        );
+
+        let cleaner = Cleaner::with_file_manager(50, 0, 0, Arc::clone(&fm));
+
+        // Seed the UtilizationProfile with a file summary that is exactly
+        // 50% obsolete (1000 total bytes, 500 obsolete-LN bytes), so
+        // min_utilization/max_utilization have an independently-computable
+        // expected value: utilization(500, 1000) == 50%.
+        let mut summary = FileSummary::new();
+        summary.total_count = 10;
+        summary.total_size = 1000;
+        summary.total_ln_count = 10;
+        summary.total_ln_size = 1000;
+        summary.obsolete_ln_count = 5;
+        summary.obsolete_ln_size = 500;
+        summary.obsolete_ln_size_counted = 5;
+        let mut summaries = hashbrown::HashMap::new();
+        summaries.insert(0u32, summary);
+        cleaner.seed_profile(summaries);
+
+        // Whether or not a file is actually selected for cleaning, the
+        // disk-usage/utilization publish step in `do_clean` runs
+        // unconditionally.
+        let _ = cleaner.do_clean(1, false);
+
+        let stats = cleaner.get_stats().snapshot();
+
+        // total_log_size / active_log_size: real on-disk bytes, not zero,
+        // and matching the FileManager's own ground truth.
+        assert_ne!(stats.total_log_size, 0, "total_log_size must not be 0");
+        assert_eq!(
+            stats.total_log_size, on_disk_total,
+            "total_log_size must equal the FileManager's real on-disk total"
+        );
+        // No reserved/protected tier in Noxu: active == total.
+        assert_eq!(
+            stats.active_log_size, on_disk_total,
+            "active_log_size must equal total_log_size (no reserved tier)"
+        );
+
+        // min_utilization / max_utilization: computed from the seeded
+        // 50%-obsolete summary, with no expiration data so min == max == 50.
+        assert_ne!(stats.min_utilization, 0, "min_utilization must not be 0");
+        assert_ne!(stats.max_utilization, 0, "max_utilization must not be 0");
+        assert_eq!(
+            stats.min_utilization, 50,
+            "min_utilization must equal utilization(obsolete=500, total=1000) == 50%"
+        );
+        assert_eq!(
+            stats.max_utilization, 50,
+            "max_utilization must equal min_utilization with no expiration data"
+        );
     }
 
     // ── X-6: migration writes real WAL LN entry ─────────────────────

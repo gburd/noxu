@@ -68,6 +68,18 @@ listed in [References](#references).
 
 ### Added
 
+- **A replica now renegotiates syncup on a mid-stream master change (HA Gap B).**
+  Previously the replica ran the SYNCUP handshake once at spawn and then streamed
+  forever against that original channel, with nothing watching for a master
+  change — so after a failover it kept reading from a stale feeder and relied on
+  the caller to close the channel. `MasterTracker` now carries a generation
+  counter; the replica's streaming loop observes a bump, closes the stale channel,
+  and re-enters the full handshake against the new master before resuming
+  (mirroring JE's `MasterChangeListener` plus re-entry into
+  `ReplicaFeederSyncup`). The default-deny safety gate is unaffected — a
+  re-syncup that finds an unsafely-divergent tail still refuses rather than
+  streaming over it, and that is now covered by a dedicated test.
+
 - **noxu-rep: periodic DTVLSN flusher daemon** (Gap C of the HA
   remaining-gaps audit). Port of JE `FeederManager.DTVLSNFlusher`
   (`FeederManager.java` ~lines 930-1042). Noxu already computed the
@@ -89,6 +101,24 @@ listed in [References](#references).
   application's own commit).
 
 ### Fixed
+
+- **Six `CleanerStats` fields always read 0; four are now wired and two removed.**
+  The only stores lived in `cleaner_stat.rs`'s own test module, so `env.stats()`
+  and the `noxu-observe` Prometheus gauges derived from them reported 0 forever —
+  an operator watching them to judge whether the cleaner was keeping up saw zeros
+  regardless of what the cleaner did. `total_log_size` / `active_log_size` are now
+  published from `FileManager::total_log_size()` (Noxu has no reserved-file tier,
+  so `active == total` is the honest value rather than a fabricated split), and
+  `min_utilization` / `max_utilization` are computed from the merged summary map
+  using JE's aggregate formula — note these are computed *statistics* (JE
+  `UtilizationCalculator::getCurrentMin/MaxUtilization`), deliberately distinct
+  from `Cleaner`'s `min_utilization` *config* threshold of the same name. The
+  previously-missing `noxu_cleaner_max_utilization` gauge is now exported.
+  `probe_runs` and `repeat_iterator_reads` were **removed** rather than wired: JE's
+  own `getNCleanerProbeRuns()` is deprecated and always returns zero, and
+  `repeat_iterator_reads` counts a buffer-regrow mechanism our exact-sized cleaner
+  reader structurally cannot exhibit. A permanently-zero gauge on a dashboard is
+  worse than no gauge.
 
 - **Two CI flakes fixed; a third recorded as unreproducible.**
   `noxu-xa::test_rapid_fire_10k_with_prepared_log` exceeded nextest's 120 s cap

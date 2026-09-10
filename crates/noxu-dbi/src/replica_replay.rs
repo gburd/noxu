@@ -116,6 +116,32 @@ impl ReplicaReplay {
         Arc::clone(&self.last_applied_vlsn)
     }
 
+    /// Clear buffered provisional transactions.
+    ///
+    /// Called by the replica's outer reconnect loop on every full re-sync
+    /// (HA Gap B: `ReplicatedEnvironment::become_replica`'s spawned thread,
+    /// on both its first entry and every loop-back after a mid-stream
+    /// master change).  Not a literal port of JE `Replay.reset()` (which
+    /// only clears the output-ack queue) — it is closer in spirit to JE's
+    /// `Replay.abortOldTxns()` ("When mastership changes, all inflight
+    /// replay transactions are aborted", `Replay.java:388`), adapted to
+    /// Noxu's simpler provisional-apply model: because a transactional LN is
+    /// NEVER applied to the live tree until its commit streams in (see the
+    /// module doc), any entry still buffered here when a stream ends
+    /// without a matching commit/abort was, by construction, never made
+    /// visible — dropping it is a complete, safe discard, equivalent to an
+    /// ordinary abort.  Without this call, a transaction left buffered by a
+    /// master that syncup then rolls back (its LNs invalidated on disk) would
+    /// linger in `active_txns` forever, since its commit/abort record can now
+    /// never arrive — a slow leak, and a latent hazard if a future master
+    /// ever reuses the same txn id.  Does NOT touch `last_applied_vlsn`: that
+    /// handle's identity must survive a reconnect because a
+    /// `ConsistencyTracker` installed once at replica-thread spawn keeps a
+    /// reference to it.
+    pub fn reset(&mut self) {
+        self.active_txns.clear();
+    }
+
     /// The highest VLSN whose effects are visible in the live tree.
     pub fn last_applied_vlsn(&self) -> u64 {
         self.last_applied_vlsn.load(Ordering::Acquire)
