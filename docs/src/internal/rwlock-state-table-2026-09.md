@@ -86,19 +86,56 @@ Auxiliary (not part of `state`, but part of the model):
   because `WRITE_LOCKED` was set when they tried.
 - At most one writer can ever be in `reserved_draining`/be the writer that
   transitions to `write_held`, by construction of the reserve-CAS (condition
-  is exclusive on `WRITE_LOCKED`). This is why the reserving writer can be
-  woken with a **targeted, unambiguous** `futex_wake(&state, 1)` — no other
-  thread is ever parked on that exact condition.
+  is exclusive on `WRITE_LOCKED`).
 
-Two disjoint futex words, so no wakeup class can be swallowed by another:
+### A third futex word is required (found while building the shuttle model, not assumed up front)
 
-- `state` — readers park here waiting for `WRITE_LOCKED` to clear; the
-  reserving writer parks here waiting for the reader count to hit zero. Both
-  conditions are visible in the same word, and at most one reservation-drain
-  waiter exists at a time, so a targeted `nr_wake=1` on this word during a
-  drain-completing release can only ever reach the reserving writer.
+The first draft of this table had the reserving writer park on `&state`
+and receive a targeted `futex_wake(&state, 1)` from the last reader out,
+reasoning that "at most one reservation-drain waiter exists at a time, so a
+targeted wake can only reach the reserving writer." **That reasoning is
+wrong and is exactly the kind of interaction this task's brief warned
+would be easy to miss.** Readers are *also* parked on `&state` — they are
+refused admission and park there during both `reserved_draining` and
+`write_held`. A targeted `nr_wake=1` on a shared address has no way to
+prefer the reserving writer over a parked reader; the OS can wake the
+reader instead, which rechecks, finds itself still refused, and re-parks —
+**swallowing the wakeup meant for the writer**, stranding it asleep with the
+lock already drained and nobody left to notice.
+
+Reusing the existing `write_futex` word for the reserving writer does not
+work either, for a different reason: other **non-reserving** writers also
+park on `write_futex` while waiting for a turn, and in the pre-reservation
+design any parked writer is an equally valid target for a wake (they all
+race the same acquire condition, so waking an arbitrary one and letting the
+rest stay parked is correct by design). That fungibility does not hold for
+the reserving writer: it is the *unique* thread that owns `WRITE_LOCKED` and
+is waiting only to notice `READERS_MASK == 0`; no other queued writer can
+substitute for it, because every other writer's own reserve/acquire CAS
+fails as long as `WRITE_LOCKED` stays set.
+
+Fix: a third, dedicated futex word, `drain_futex: AtomicU32`, that **only**
+the current reservation-holder ever parks on. Since at most one writer is
+ever `reserved_draining` (the reserve-CAS's own exclusivity), a targeted
+wake on `drain_futex` is unambiguous by construction — there is structurally
+nobody else who could be asleep on that address to swallow it. It uses the
+same generation-counter idiom already proven for `write_futex` (sample the
+counter before testing `state`, pass the sample to `futex_wait`, so a
+release landing between the test and the park cannot be missed): the last
+reader releasing to zero does `drain_futex.fetch_add(1, Release)` then
+`futex_wake(&drain_futex, 1)`.
+
+Three disjoint futex words, so no wakeup class can be swallowed by another:
+
+- `state` — readers park here waiting for `WRITE_LOCKED` to clear. Woken in
+  full (`ALL`) whenever that becomes possible, never targeted, so no reader
+  can ever swallow a wake meant for someone else parked here.
 - `write_futex` — writers not yet holding/reserving `WRITE_LOCKED` park here,
-  unchanged from the shipped targeted-wakeup design.
+  unchanged from the shipped targeted-wakeup design; any one of them is a
+  fungible target for a `nr_wake=1`.
+- `drain_futex` — **only** the current reservation-holder parks here, so a
+  targeted `nr_wake=1` from the last draining reader is guaranteed to reach
+  it and nothing else.
 
 ## Transition table
 
@@ -115,7 +152,7 @@ Two disjoint futex words, so no wakeup class can be swallowed by another:
 | `read_held(n)` | writer reserve | spin exhausted; CAS `state & WRITE_LOCKED == 0 -> state \| WRITE_LOCKED` (preserves reader bits) succeeds | `reserved_draining(n)` | none directly; `write_waiters` decremented now (this writer is no longer "waiting to reserve") |
 | `read_held(n)` | writer timeout (during spin, before reserving) | deadline elapsed, no CAS ever succeeded | `read_held(n)` (unchanged) | none — this writer never touched `state`; decrement `write_waiters` only |
 | `reserved_draining(n)`, n > 1 | reader release | fetch_sub leaves count > 0 | `reserved_draining(n-1)` | none — the reserving writer only cares about count == 0 |
-| `reserved_draining(1)` | reader release | fetch_sub leaves count == 0, `prev & WRITE_LOCKED != 0` | `write_held` | wake the reserving writer: targeted `futex_wake(&state, 1)`. **This is the fix for the whole tail-latency problem**: the reserving writer needs no CAS, no re-race — it already owns `WRITE_LOCKED`; the wakeup is purely "stop waiting and notice you're done." |
+| `reserved_draining(1)` | reader release | fetch_sub leaves count == 0, `prev & WRITE_LOCKED != 0` | `write_held` | wake the reserving writer: targeted `drain_futex.fetch_add(1, Release)` + `futex_wake(&drain_futex, 1)`. **This is the fix for the whole tail-latency problem**: the reserving writer needs no CAS, no re-race — it already owns `WRITE_LOCKED`; the wakeup is purely "stop waiting and notice you're done." |
 | `reserved_draining(n)` | reader acquire attempt | `state & WRITE_LOCKED != 0` → refused unconditionally | `reserved_draining(n)` (reader parks) | none (reader becomes a waiter, nothing to wake) |
 | `reserved_draining(n)` | second writer acquire/reserve attempt | reserve-CAS is conditional on `WRITE_LOCKED == 0`; it is 1, so CAS fails | `reserved_draining(n)` (that writer parks on `write_futex`) | none |
 | `reserved_draining(n)` | writer timeout (the reserving writer itself gives up) | its own deadline elapsed, reader count still > 0 | `read_held(n)` — `fetch_and(!WRITE_LOCKED)` (**must not** touch reader bits) | wake BOTH unconditionally, not `else if`: if `write_waiters > 0`, `notify_one_writer()`; if `read_waiters > 0`, `futex_wake(&state, ALL)`. Unconditional-both is required — see "Bug 4" mapping below. |
