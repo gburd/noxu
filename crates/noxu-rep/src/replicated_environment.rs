@@ -601,6 +601,7 @@ impl ReplicatedEnvironment {
         env.init_self_weak();
         env.start_election_driver();
         env.start_vlsn_persistence_daemon();
+        env.start_dtvlsn_flush_daemon();
         env.register_admin_service();
         Ok(env)
     }
@@ -885,6 +886,169 @@ impl ReplicatedEnvironment {
         log::debug!(
             "Node '{}' VLSN persistence daemon started",
             self.config.node_name,
+        );
+    }
+
+    /// Spawn the periodic DTVLSN flusher daemon (Gap C).
+    ///
+    /// Port of JE `FeederManager.DTVLSNFlusher` (`FeederManager.java`
+    /// ~lines 930-1042).  We track the DTVLSN (`get_dtvlsn`); without this
+    /// daemon the in-memory DTVLSN is always *ahead* of the persisted WAL
+    /// state (in general `DTVLSN(vlsn) < vlsn`, so an ordinary commit's own
+    /// `dtvlsn` field lags the current in-memory value), and after a quiet
+    /// period (no new commits) the durable point recorded on disk can lag
+    /// indefinitely.  JE's fix: once the in-memory DTVLSN has been *stable*
+    /// (unchanged) for `targetStableTicks` polling ticks and exceeds the
+    /// last-persisted value, write a "null" commit — a `TxnCommit` WAL entry
+    /// with no tree changes — solely to carry the current DTVLSN to disk.
+    ///
+    /// Only the master runs this (a replica's DTVLSN is set from the
+    /// commit/abort records it receives, not computed locally, mirroring JE
+    /// where `FeederManager` — and thus `DTVLSNFlusher` — exists only on the
+    /// master).  No-op when `config.env_home` is `None` or no environment has
+    /// been wired via `with_environment`.
+    ///
+    /// `targetStableTicks` mirrors JE's `max(1, 2 * heartbeatMs /
+    /// pollTimeoutMs)`: the tick interval is derived from
+    /// `config.heartbeat_interval` (capped to a sane minimum) so the daemon
+    /// waits roughly two heartbeat intervals of stability before flushing.
+    ///
+    /// Idempotent: only one daemon is ever spawned per env.
+    pub fn start_dtvlsn_flush_daemon(self: &Arc<Self>) {
+        {
+            let threads = self.io_threads.lock().unwrap();
+            if threads.iter().any(|h| {
+                h.thread()
+                    .name()
+                    .is_some_and(|n| n.starts_with("noxu-dtvlsn-flush-"))
+            }) {
+                return;
+            }
+        }
+
+        let me = Arc::clone(self);
+        let name = format!("noxu-dtvlsn-flush-{}", self.config.node_name);
+
+        // Tick interval: a quarter of the heartbeat interval, floored at
+        // 25ms so a tiny test-configured heartbeat still produces a usable
+        // tick, and capped so a very large heartbeat does not starve the
+        // daemon's shutdown-poll responsiveness.
+        let heartbeat_ms =
+            self.config.heartbeat_interval.as_millis().max(1) as u64;
+        let tick_ms = (heartbeat_ms / 4).clamp(25, 2_000);
+        let tick = Duration::from_millis(tick_ms);
+        // JE: max(1, 2 * heartbeatMs / pollTimeoutMs).
+        let target_stable_ticks = ((2 * heartbeat_ms) / tick_ms).max(1);
+
+        let handle = std::thread::Builder::new()
+            .name(name)
+            .spawn(move || {
+                use std::sync::atomic::Ordering;
+                // JE DTVLSNFlusher fields: stableDTVLSN, persistedDTVLSN,
+                // stableTicks. NULL_VLSN_SEQUENCE (0) is the "never seen a
+                // value yet" sentinel, matching Noxu's NULL_VLSN encoding.
+                let mut stable_dtvlsn: u64 = 0;
+                let mut persisted_dtvlsn: u64 = 0;
+                let mut stable_ticks: u64 = 0;
+
+                while !me.io_shutdown.load(Ordering::SeqCst)
+                    && !me.is_shutdown()
+                {
+                    std::thread::sleep(tick);
+                    if me.io_shutdown.load(Ordering::SeqCst) {
+                        break;
+                    }
+
+                    // JE: FeederManager (and thus DTVLSNFlusher) only runs on
+                    // the master.  A non-master resets the stability tracker
+                    // so a later become_master does not immediately flush a
+                    // stale stable count from a prior term.
+                    if !me.is_master() {
+                        stable_dtvlsn = 0;
+                        persisted_dtvlsn = 0;
+                        stable_ticks = 0;
+                        continue;
+                    }
+
+                    let Some(env) = me.env_impl.lock().unwrap().clone() else {
+                        continue;
+                    };
+
+                    let dtvlsn = me.get_dtvlsn();
+                    if dtvlsn == 0 {
+                        // Nothing durable has been computed yet.
+                        continue;
+                    }
+
+                    if dtvlsn > stable_dtvlsn {
+                        // Still moving: reset the stability window.
+                        stable_ticks = 0;
+                        stable_dtvlsn = dtvlsn;
+                        continue;
+                    }
+                    if dtvlsn < stable_dtvlsn {
+                        // The DTVLSN is defined as advance-only
+                        // (`update_dtvlsn`/`set_dtvlsn`); observing a
+                        // decrease here would indicate a bug elsewhere.
+                        // Do not panic a background daemon over it — log
+                        // and resynchronize the tracker defensively.
+                        log::error!(
+                            "noxu-dtvlsn-flush: DTVLSN decreased ({} -> {}); \
+                             resynchronizing tracker",
+                            stable_dtvlsn,
+                            dtvlsn,
+                        );
+                        stable_dtvlsn = dtvlsn;
+                        stable_ticks = 0;
+                        continue;
+                    }
+
+                    // dtvlsn == stable_dtvlsn: unchanged since last tick.
+                    stable_ticks += 1;
+                    if stable_ticks <= target_stable_ticks {
+                        continue;
+                    }
+                    stable_ticks = 0;
+
+                    if stable_dtvlsn <= persisted_dtvlsn {
+                        // Already persisted (e.g. an ordinary commit already
+                        // carried this exact dtvlsn to disk).
+                        continue;
+                    }
+
+                    match env.log_null_txn_commit(
+                        stable_dtvlsn as i64,
+                        /* fsync = */ false,
+                        /* flush = */ true,
+                    ) {
+                        Ok(_lsn) => {
+                            log::debug!(
+                                "noxu-dtvlsn-flush: persisted DTVLSN {} via \
+                                 null commit",
+                                stable_dtvlsn,
+                            );
+                            persisted_dtvlsn = stable_dtvlsn;
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "noxu-dtvlsn-flush: failed to persist DTVLSN \
+                                 {}: {} (will retry next stable window)",
+                                stable_dtvlsn,
+                                e,
+                            );
+                        }
+                    }
+                }
+            })
+            .expect("failed to spawn noxu-dtvlsn-flush thread");
+
+        self.io_threads.lock().unwrap().push(handle);
+        log::debug!(
+            "Node '{}' DTVLSN flush daemon started (tick={:?}, \
+             target_stable_ticks={})",
+            self.config.node_name,
+            tick,
+            target_stable_ticks,
         );
     }
 

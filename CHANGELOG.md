@@ -15,6 +15,28 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Added
+
+- **noxu-rep: periodic DTVLSN flusher daemon** (Gap C of the HA
+  remaining-gaps audit). Port of JE `FeederManager.DTVLSNFlusher`
+  (`FeederManager.java` ~lines 930-1042). Noxu already computed the
+  durable-transaction VLSN (DTVLSN) on the master via
+  `update_dtvlsn_from_feeders`, but nothing ever persisted a *stable, idle*
+  DTVLSN to the WAL — only an ordinary application commit's own `dtvlsn`
+  field advanced the on-disk value, so after a quiet period (no further
+  writes) the durable point recorded on disk could lag the in-memory value
+  indefinitely. `ReplicatedEnvironment::start_dtvlsn_flush_daemon` (spawned
+  from `open()` alongside the existing VLSN-persistence and election-driver
+  daemons, using the same `io_threads`/`io_shutdown` lifecycle) watches
+  `get_dtvlsn()`, and once the value has been unchanged for roughly two
+  heartbeat intervals and exceeds the last-persisted value, writes a "null"
+  `TxnCommit` WAL entry (`EnvironmentImpl::log_null_txn_commit`, new) that
+  carries no tree changes and exists solely to persist that DTVLSN. Only
+  runs on the master (mirrors JE, where `FeederManager` exists only on the
+  master). Regression test: `dtvlsn_flush_daemon_test.rs` (fails without the
+  daemon — verified against `origin/main`: a WAL that only ever contains the
+  application's own commit).
+
 ### Fixed
 
 - **The evictor could silently corrupt its pri2 intrusive list in release
