@@ -255,7 +255,7 @@ real compaction, not data loss, at this scale too.
 
 ## Phase 2: the min_utilization lever, and a premise correction to Phase 1
 
-Status: **in progress.** Run on a **dedicated** `i4i.16xlarge` (64 vCPU, 3.4 TB
+Status: **complete.** Run on a **dedicated** `i4i.16xlarge` (64 vCPU, 3.4 TB
 NVMe XFS at `/data`) with no other tenant — `uptime` shows load average under
 1.1 throughout this session, so (unlike Phase 1) every number below,
 including wall-clock/throughput, is clean, not order-of-magnitude.
@@ -735,16 +735,16 @@ of "a strong measured justification."
 
 ## Honest summary for this checkpoint
 
-Phase 1 established the methodology (du-based ground truth + wired counters
-+ per-entry-type log histogram + data-integrity verification) and flagged,
-but did not fully explain, why post-drain footprints collapsed far below
-the naive live-data floor. Phase 2 found and confirmed by measurement that
-Phase 1's explanation for that collapse was wrong: it attributed the
-collapse to "give the daemons an idle window, no config change," but the
-actual mechanism was `Environment::clean_log()`'s always-`force=true`
-internal behaviour, which bypasses `min_utilization` entirely — a
-consequence of a real tracker bug (obsolete LN versions are never counted
-for writes through the real API) that makes the passive,
+Phase 1 established the methodology (du-based ground truth, wired
+counters, per-entry-type log histogram, data-integrity verification) and
+flagged, but did not fully explain, why post-drain footprints collapsed
+far below the naive live-data floor. Phase 2 found and confirmed by
+measurement that Phase 1's explanation for that collapse was wrong: it
+attributed the collapse to "give the daemons an idle window, no config
+change," but the actual mechanism was `Environment::clean_log()`'s
+always-`force=true` internal behaviour, which bypasses `min_utilization`
+entirely — a consequence of a real tracker bug (obsolete LN versions are
+never counted for writes through the real API) that makes the passive,
 `min_utilization`-gated cleaner path never engage under sustained
 overwrites, at any floor setting from 20 to 80. The task's headline
 deliverable — a `min_utilization` sweep showing space vs write-amp vs
