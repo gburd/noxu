@@ -5,6 +5,7 @@
 //! replica side and receives data from the master.
 
 pub mod feeder;
+pub mod live_txn_chain;
 pub mod output_thread;
 pub mod peer_feeder;
 pub mod reconnect;
@@ -16,6 +17,7 @@ pub mod syncup_reader;
 pub use feeder::{
     EnvironmentLogScanner, Feeder, FeederRunner, FeederState, LogScanner,
 };
+pub use live_txn_chain::{build_live_chain, build_live_chain_unbounded};
 pub use output_thread::OutputQueue;
 pub use peer_feeder::{
     PeerFeederSource, PeerLogScanner, PeerScannerAdapter, SyncupResult,
