@@ -280,6 +280,10 @@ fn large_dataset_sync_load_and_checkpoint_completes() {
 /// read-then-evict cycles keep `cache_usage` BOUNDED (no unbounded cache
 /// growth). Also proves read-consistency: a re-populated-slot read returns
 /// the same bytes a cold fetch does.
+///
+/// Initial load is batched 1000/txn to avoid one `fdatasync` per record
+/// (unrelated to the read/re-populate behaviour under test).
+/// Measured: 159.5s -> see the batched timing recorded at commit time.
 #[test]
 fn repopulated_read_is_consistent_and_budget_bounded() {
     let dir = TempDir::new().unwrap();
@@ -293,9 +297,19 @@ fn repopulated_read_is_consistent_and_budget_bounded() {
         v[..4].copy_from_slice(&(i as u32).to_be_bytes());
         v
     };
-    for i in 0..n {
-        let k = DatabaseEntry::from_vec(format!("{:010}", i).into_bytes());
-        db.put(&k, DatabaseEntry::from_bytes(&make_val(i))).unwrap();
+    // Batched 1000/txn -- see fill_batched's doc comment for why (avoids one
+    // fdatasync per record; does not change record count or values).
+    let mut i = 0usize;
+    while i < n {
+        let end = (i + 1000).min(n);
+        let txn = env.begin_transaction(None).unwrap();
+        for j in i..end {
+            let k = DatabaseEntry::from_vec(format!("{:010}", j).into_bytes());
+            db.put_in(&txn, &k, DatabaseEntry::from_bytes(&make_val(j)))
+                .unwrap();
+        }
+        txn.commit().unwrap();
+        i = end;
     }
     // Force LN stripping: cache << working set.
     let _ = env.evict_memory().unwrap();
