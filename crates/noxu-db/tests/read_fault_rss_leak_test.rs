@@ -81,14 +81,28 @@ fn read_only_workload_rss_stays_bounded() {
         .open_database(
             None,
             "leak",
-            &DatabaseConfig::new().with_allow_create(true),
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true),
         )
         .expect("open db");
 
     let n_records = 80_000usize;
     let value = vec![0xABu8; 1024]; // 1 KiB values, like the bench.
-    for i in 0..n_records {
-        db.put(format!("{:012}", i).into_bytes(), &value).unwrap();
+    // Batched 1000/txn: an unbatched auto-commit loop pays one fdatasync per
+    // record (COMMIT_SYNC is the default); measured ~2.9ms/fdatasync on this
+    // filesystem, so 80,000 unbatched puts alone cost ~230s, unrelated to the
+    // read-phase RSS-leak property this test actually checks. Record count
+    // (and therefore the ~80 MiB dataset / 10x-cache ratio) is unchanged.
+    let mut i = 0usize;
+    while i < n_records {
+        let end = (i + 1000).min(n_records);
+        let txn = env.begin_transaction(None).unwrap();
+        for j in i..end {
+            db.put_in(&txn, format!("{:012}", j).into_bytes(), &value).unwrap();
+        }
+        txn.commit().unwrap();
+        i = end;
     }
     // Force the loaded set down toward the budget before the read phase so the
     // baseline is a warm, budget-sized cache (not the just-written working
