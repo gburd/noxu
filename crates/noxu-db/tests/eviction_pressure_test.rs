@@ -152,6 +152,10 @@ fn delete_heavy_does_not_inflate_cache_usage() {
 /// A full cursor scan over a working set larger than the cache must return the
 /// correct data for EVERY record (the scan path must re-hydrate stripped LNs
 /// from the log, not return empty data). Validates the scan-path fetchTarget.
+///
+/// Writes are batched via `fill_batched` (see its doc comment) to avoid one
+/// `fdatasync` per record; unrelated to the scan-path behaviour under test.
+/// Measured: 154.6s -> see the batched timing recorded at commit time.
 #[test]
 fn cursor_scan_under_eviction_returns_all_data() {
     use noxu_db::Get;
@@ -160,10 +164,7 @@ fn cursor_scan_under_eviction_returns_all_data() {
 
     let n = 20_000usize;
     let val = vec![7u8; 80];
-    for i in 0..n {
-        let k = DatabaseEntry::from_vec(format!("{:010}", i).into_bytes());
-        db.put(&k, DatabaseEntry::from_bytes(&val)).unwrap();
-    }
+    fill_batched(&env, &db, n, &val);
     let _ = env.evict_memory().unwrap();
 
     // Scan the whole database with a cursor; every record's data must be the
