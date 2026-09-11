@@ -106,7 +106,7 @@ fn evictor_reclaims_to_budget_across_user_dbs() {
             while i < n && placed < BATCH {
                 let k =
                     DatabaseEntry::from_vec(format!("{:010}", i).into_bytes());
-                db.put_in(&txn, &k, &DatabaseEntry::from_bytes(&val)).unwrap();
+                db.put_in(&txn, &k, DatabaseEntry::from_bytes(&val)).unwrap();
                 i += 2;
                 placed += 1;
             }
