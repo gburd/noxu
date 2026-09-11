@@ -27,15 +27,46 @@ fn open_small_cache_env(
         .open_database(
             None,
             "evict",
-            &DatabaseConfig::new().with_allow_create(true),
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true),
         )
         .expect("open db");
     (env, db)
 }
 
+/// Writes `n` `{:010}`-keyed `val`-valued records to `db` in batches of 1000
+/// per explicit transaction (one `fdatasync` per 1000 records instead of one
+/// per record). Measured: this crate's auto-commit `db.put()` defaults to
+/// `COMMIT_SYNC`, so an unbatched N-record loop pays N `fdatasync` calls; on a
+/// COW filesystem (btrfs) measured at ~2.9ms/fdatasync that alone is
+/// N * 2.9ms of the test's wall time, unrelated to the eviction behaviour
+/// under test. Batching is exactly the pattern
+/// `large_dataset_sync_load_and_checkpoint_completes` already uses in this
+/// file (200,000 records in 20.5s) and does not change record count / the
+/// working-set-vs-cache ratio, which is the actual property under test.
+fn fill_batched(env: &Environment, db: &Database, n: usize, val: &[u8]) {
+    let mut i = 0usize;
+    while i < n {
+        let end = (i + 1000).min(n);
+        let txn = env.begin_transaction(None).unwrap();
+        for j in i..end {
+            let k = DatabaseEntry::from_vec(format!("{:010}", j).into_bytes());
+            db.put_in(&txn, &k, DatabaseEntry::from_bytes(val)).unwrap();
+        }
+        txn.commit().unwrap();
+        i = end;
+    }
+}
+
 /// With a cache far smaller than the working set, after inserting many records
 /// and running eviction the cache_usage must be bounded (eviction actually
 /// reduces it) AND every record must still be readable (correctness preserved).
+///
+/// Writes are batched 1000/txn (see `fill_batched`) purely to avoid paying an
+/// `fdatasync` per record; this does not change the working-set-vs-cache
+/// ratio the test asserts on. Measured: 156.1s (unbatched, debug, isolation)
+/// -> see the batched timing recorded at commit time.
 #[test]
 fn eviction_bounds_cache_and_preserves_data() {
     let dir = TempDir::new().unwrap();
@@ -44,11 +75,7 @@ fn eviction_bounds_cache_and_preserves_data() {
 
     let n = 50_000usize;
     let val = vec![0u8; 100];
-    for i in 0..n {
-        let k = DatabaseEntry::from_vec(format!("{:010}", i).into_bytes());
-        let v = DatabaseEntry::from_bytes(&val);
-        db.put(&k, &v).unwrap();
-    }
+    fill_batched(&env, &db, n, &val);
 
     // Run eviction explicitly (the daemon also runs, but make it deterministic).
     let _ = env.evict_memory().unwrap();
