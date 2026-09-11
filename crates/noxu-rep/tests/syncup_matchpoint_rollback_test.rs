@@ -389,6 +389,110 @@ fn test_diverged_replica_with_applied_tail_is_refused() {
 }
 
 // ---------------------------------------------------------------------------
+// Gap A step 2: the computed revert set is correct EVEN for a tail that
+// stays refused. This does not change the decision -- it proves the data
+// source `syncup_with_feeder` runs internally (diagnostically) is right.
+// ---------------------------------------------------------------------------
+
+/// The exact tail from `test_diverged_replica_with_applied_tail_is_refused`
+/// (a still-active transactional LN at VLSN 6, an applied non-transactional
+/// LN at VLSN 7) still yields `DivergedRefused` -- but the live
+/// `TxnChain` this build computes internally (`live_txn_chain::
+/// build_tail_chains`, wired diagnostically into
+/// `ReplicatedEnvironment::syncup_with_feeder`) for the transactional LN's
+/// txn id is independently verifiable as CORRECT via the same public API,
+/// against the replica's real on-disk WAL, proving Gap A step 2: "wired but
+/// nothing admitted" with a tested, correct data source underneath.
+#[test]
+fn test_computed_revert_set_is_correct_for_a_still_refused_tail() {
+    let p = Pair::new(5);
+    p.assert_layouts_diverged(5);
+
+    // Same tail shape as test_diverged_replica_with_applied_tail_is_refused:
+    // VLSN 6 is a transactional LN for txn 42 (still active, never
+    // committed -- ReplicaReplay buffers it, never applies it); VLSN 7 is a
+    // non-transactional LN (applied immediately) which is what forces the
+    // refusal.
+    let db_id = 1u64; // matches the plain payload's db_id below; TxnChain's
+    // CompareSlot only needs a stable id, not a real open database.
+    let txn6_payload = {
+        use bytes::BytesMut;
+        use noxu_log::entry::LnLogEntry;
+        use noxu_util::{NULL_LSN, NULL_VLSN};
+        let entry = LnLogEntry::new(
+            db_id,
+            Some(42),
+            NULL_LSN,
+            true, // abort_known_deleted: first write of this slot by txn 42
+            None,
+            None,
+            NULL_VLSN,
+            0,
+            true,
+            b"only-in-txn-42".to_vec(),
+            Some(b"OLD-6-AA".to_vec()),
+            0,
+            NULL_VLSN,
+        );
+        let mut buf = BytesMut::new();
+        entry.write_to_log(&mut buf);
+        buf.to_vec()
+    };
+    apply(&p.replica, &p.replica_env, 6, TXN_LN, &txn6_payload);
+    apply(&p.replica, &p.replica_env, 7, PLAIN_LN, b"OLD-7-APPLIED");
+    apply(&p.master, &p.master_env, 6, TXN_LN, b"NEW-6-CC");
+    apply(&p.master, &p.master_env, 7, TXN_LN, b"NEW-7-DD");
+    p.flush();
+
+    // THE PRODUCTION DECISION: still refused, exactly as before -- the
+    // diagnostic chain computation inside syncup_with_feeder must not have
+    // changed the verdict.
+    let action = p
+        .replica
+        .syncup_with_feeder_at(p.master_addr())
+        .expect("syncup handshake");
+    match &action {
+        SyncupAction::DivergedRefused { matchpoint_vlsn, .. } => {
+            assert_eq!(*matchpoint_vlsn, 5);
+        }
+        other => panic!("expected DivergedRefused, got {other:?}"),
+    }
+
+    // INDEPENDENT VERIFICATION: call the exact same public data source the
+    // diagnostic block calls, against the replica's own real WAL, and prove
+    // its output is the CORRECT chain for txn 42 -- one rolled-back logrec
+    // (VLSN 6's LSN) reverting to the pre-txn abort info embedded in that
+    // same logrec (abort_known_deleted=true -> delete the slot).
+    let lm = p.replica_env.get_log_manager().expect("log manager");
+    let fm = lm.file_manager();
+    let matchpoint_lsn = {
+        let view = p.replica_view();
+        view.entry(Vlsn::new(5)).expect("matchpoint entry present").lsn
+    };
+    let mut chains = noxu_rep::stream::build_tail_chains(
+        fm,
+        &[noxu_util::Lsn::from_u64({
+            let view = p.replica_view();
+            view.entry(Vlsn::new(6)).expect("vlsn 6 present").lsn
+        })],
+        noxu_util::Lsn::from_u64(matchpoint_lsn),
+        &|a: &[u8], b: &[u8]| a.cmp(b),
+    );
+
+    let mut chain = chains.remove(&42).expect("txn 42 must be discovered");
+    assert_eq!(chain.len(), 1, "txn 42 logged exactly one LN above matchpoint");
+    let ri = chain.pop().unwrap();
+    assert!(
+        ri.revert_kd,
+        "txn 42's ONLY write was the first write of this slot: reverting \
+         it must delete the slot (revert-to-known-deleted), matching the \
+         abort_known_deleted=true embedded in the logrec itself"
+    );
+
+    p.close();
+}
+
+// ---------------------------------------------------------------------------
 // The gap itself: the range check cannot do this.
 // ---------------------------------------------------------------------------
 

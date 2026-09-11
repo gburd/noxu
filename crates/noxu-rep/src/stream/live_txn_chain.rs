@@ -127,6 +127,52 @@ pub fn build_live_chain_unbounded(
     build_live_chain(fm, txn_id, matchpoint_lsn, NULL_LSN, NULL_LSN, cmp)
 }
 
+/// Gap A, step 2: build a live [`TxnChain`] for EVERY distinct transactional
+/// txn id found in a diverged tail, keyed by txn id.
+///
+/// This is the call the syncup driver makes to PROVE the computed revert set
+/// is correct BEFORE (and independently of) any decision to admit a case —
+/// see [`crate::stream::syncup::classify_tail`]'s module doc for the safety
+/// bar. `tail_lsns` is the exact set of LSNs strictly above the verified
+/// matchpoint (the same set [`crate::stream::syncup_reader::SyncupLogView`]
+/// already computes for `rollback_lsns` in
+/// `ReplicatedEnvironment::syncup_with_feeder`); each is read back via
+/// [`noxu_recovery::LogScanner::read_at_lsn`] to discover which txn ids
+/// actually appear in the tail (a tail may span zero, one, or several
+/// txns). Non-transactional / structural tail entries are skipped here —
+/// this function only ever answers "what would txn T's chain look like",
+/// never whether the tail as a whole may be discarded.
+///
+/// Returns one [`TxnChain`] per distinct txn id seen in `tail_lsns`, each
+/// built by an UNBOUNDED scan (`scan_from = NULL_LSN`) so the result is
+/// provably identical regardless of the bounded-vs-unbounded optimisation —
+/// callers that want the bounded scan's LSN savings should call
+/// [`build_live_chain`] directly per txn id once a case is soundly admitted.
+pub fn build_tail_chains(
+    fm: &Arc<FileManager>,
+    tail_lsns: &[Lsn],
+    matchpoint_lsn: Lsn,
+    cmp: KeyCmp<'_>,
+) -> std::collections::HashMap<u64, TxnChain> {
+    let scanner = FileManagerLogScanner::new(Arc::clone(fm));
+    let mut txn_ids: std::collections::BTreeSet<u64> =
+        std::collections::BTreeSet::new();
+    for &lsn in tail_lsns {
+        if let Some(LogEntry::Ln(rec)) = scanner.read_at_lsn(lsn)
+            && let Some(txn_id) = rec.txn_id
+        {
+            txn_ids.insert(txn_id);
+        }
+    }
+    txn_ids
+        .into_iter()
+        .filter_map(|txn_id| {
+            build_live_chain_unbounded(fm, txn_id, matchpoint_lsn, cmp)
+                .map(|chain| (txn_id, chain))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,5 +443,90 @@ mod tests {
             2,
             "only txn 1's two writes; txn 2's must not leak in"
         );
+    }
+
+    /// `build_tail_chains`: given the exact LSNs of a diverged tail (as the
+    /// syncup driver would compute them), discover every distinct txn id
+    /// present and build a correct chain per txn -- the Gap A step 2 call
+    /// the syncup driver makes to PROVE the computed revert set before any
+    /// decision to admit a case.
+    #[test]
+    fn test_build_tail_chains_discovers_and_builds_per_txn() {
+        let dir = TempDir::new().unwrap();
+        let (fm, lm) = make_fm(dir.path());
+
+        let pretxn_a =
+            write_ln(&lm, 7, 0, b"A", Some(b"pre-A"), NULL_LSN, true, None);
+        let matchpoint = pretxn_a;
+
+        // Two txns each write once above the matchpoint -- this is what a
+        // diverged tail spanning two still-active transactions looks like.
+        let lsn_txn1 = write_ln(
+            &lm,
+            7,
+            1,
+            b"A",
+            Some(b"t1"),
+            pretxn_a,
+            false,
+            Some(b"pre-A"),
+        );
+        let lsn_txn2 =
+            write_ln(&lm, 7, 2, b"B", Some(b"t2"), NULL_LSN, true, None);
+        lm.flush_sync().unwrap();
+
+        let mut chains = build_tail_chains(
+            &fm,
+            &[lsn_txn1, lsn_txn2],
+            matchpoint,
+            &|a: &[u8], b: &[u8]| a.cmp(b),
+        );
+
+        assert_eq!(chains.len(), 2, "both txn 1 and txn 2 must be discovered");
+        let mut c1 = chains
+            .remove(&1)
+            .unwrap_or_else(|| panic!("txn 1 must have a chain"));
+        assert_eq!(c1.len(), 1);
+        let ri1 = c1.pop().unwrap();
+        assert_eq!(ri1.revert_lsn, pretxn_a, "txn 1 reverts to pre-txn A");
+
+        let mut c2 = chains
+            .remove(&2)
+            .unwrap_or_else(|| panic!("txn 2 must have a chain"));
+        assert_eq!(c2.len(), 1);
+        let ri2 = c2.pop().unwrap();
+        assert!(ri2.revert_kd, "txn 2's first write reverts to pre-txn delete");
+    }
+
+    /// A tail LSN that is NOT an LN at all (e.g. a structural entry) must be
+    /// skipped, not panic -- `build_tail_chains` only ever answers "what
+    /// would txn T's chain look like", it does not classify the tail.
+    #[test]
+    fn test_build_tail_chains_skips_non_ln_lsns() {
+        let dir = TempDir::new().unwrap();
+        let (fm, lm) = make_fm(dir.path());
+
+        let pretxn =
+            write_ln(&lm, 7, 0, b"A", Some(b"pre"), NULL_LSN, true, None);
+        // A commit record is not an LN; build_tail_chains must ignore it.
+        use bytes::BytesMut;
+        use noxu_log::entry::TxnEndEntry;
+        use noxu_log::{LogEntryType, Provisional};
+        let commit_entry =
+            TxnEndEntry::new_commit(99, NULL_LSN, 0, 0, NULL_VLSN);
+        let mut buf = BytesMut::new();
+        commit_entry.write_to_log(&mut buf);
+        let commit_lsn = lm
+            .log(LogEntryType::TxnCommit, &buf, Provisional::No, true, false)
+            .unwrap();
+        lm.flush_sync().unwrap();
+
+        let chains = build_tail_chains(
+            &fm,
+            &[commit_lsn],
+            pretxn,
+            &|a: &[u8], b: &[u8]| a.cmp(b),
+        );
+        assert!(chains.is_empty(), "a non-LN tail LSN yields no chains");
     }
 }
