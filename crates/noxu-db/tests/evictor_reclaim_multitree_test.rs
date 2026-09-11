@@ -73,25 +73,45 @@ fn evictor_reclaims_to_budget_across_user_dbs() {
         .open_database(
             None,
             "userdb_a",
-            &DatabaseConfig::new().with_allow_create(true),
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true),
         )
         .expect("open user db a");
     let db_b: Database = env
         .open_database(
             None,
             "userdb_b",
-            &DatabaseConfig::new().with_allow_create(true),
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true),
         )
         .expect("open user db b");
 
     // ~6 MB total: 50k records * ~140 B, half in each database.
     let n = 50_000usize;
     let val = vec![0xABu8; 120];
-    for i in 0..n {
-        let k = DatabaseEntry::from_vec(format!("{:010}", i).into_bytes());
-        let v = DatabaseEntry::from_bytes(&val);
-        let db = if i % 2 == 0 { &db_a } else { &db_b };
-        db.put(&k, &v).unwrap();
+    // Batched 1000/txn per database: the record count (and thus the ~6 MB of
+    // cache pressure this test exists to reclaim) is unchanged; batching only
+    // removes the one-fdatasync-per-put cost of auto-commit, which is what made
+    // this exceed nextest's 120s debug cap.
+    const BATCH: usize = 1000;
+    // (db, start_index) — db_a takes even indices, db_b odd, preserving the
+    // original interleaved split exactly.
+    for (db, start) in [(&db_a, 0usize), (&db_b, 1usize)] {
+        let mut i = start;
+        while i < n {
+            let txn = env.begin_transaction(None).unwrap();
+            let mut placed = 0;
+            while i < n && placed < BATCH {
+                let k =
+                    DatabaseEntry::from_vec(format!("{:010}", i).into_bytes());
+                db.put_in(&txn, &k, &DatabaseEntry::from_bytes(&val)).unwrap();
+                i += 2;
+                placed += 1;
+            }
+            txn.commit().unwrap();
+        }
     }
 
     let usage_before = env.cache_usage_bytes().unwrap();

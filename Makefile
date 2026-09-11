@@ -58,7 +58,7 @@ fuzz:
 # protocols modelled. Each model is a `cargo test` case; failures
 # print a Stateright counterexample trace.
 spec:
-	cargo test -p noxu-spec --release
+	cargo test -p noxu-spec --release -- --include-ignored
 
 # Run every shuttle concurrency-permutation (DST Milestone 2) test file.
 # Gated behind `#[cfg(noxu_shuttle)]`, so these compile to empty test

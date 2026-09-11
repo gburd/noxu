@@ -364,6 +364,8 @@ mod tests {
     /// Post-Wave-4-A: `acceptor.state` makes the
     /// (promised_term, accepted_term, accepted_master) triple
     /// crash-durable. ElectionSafety holds across arbitrary crashes.
+    #[ignore = "large BFS model check (~35s release, minutes in debug); run via \
+                `make spec`, which passes --include-ignored"]
     #[test]
     fn paxos_safety_holds() {
         let checker =
@@ -376,6 +378,8 @@ mod tests {
     /// proposer can win a second majority at the same term. The
     /// counterexample below is exactly the split-brain that the
     /// `acceptor.state` file closes (F5/F31).
+    #[ignore = "large BFS model check (~35s release, minutes in debug); run via \
+                `make spec`, which passes --include-ignored"]
     #[test]
     fn ephemeral_promises_allow_split_brain() {
         let checker =

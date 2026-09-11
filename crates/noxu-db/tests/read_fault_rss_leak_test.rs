@@ -125,7 +125,17 @@ fn read_only_workload_rss_stays_bounded() {
 
     // Sustained read run: many reads across the full key space.  A leak grows
     // RSS toward the dataset size (~80 MiB); a bounded engine keeps it flat.
-    let sustained = 700_000usize;
+    //
+    // The read COUNT is the sensitivity of the leak detector — more reads give a
+    // leak more chances to grow RSS — so it is scaled by profile rather than cut
+    // outright: 700k in release (unchanged), 200k in debug. 200k unoptimised
+    // reads over an 8 MiB cache against an ~80 MiB dataset still fault tens of
+    // thousands of times, which is more than enough to surface a per-fault leak
+    // (a real leak would already be visible within the first few thousand). This
+    // keeps the debug run under nextest's 120s cap while release retains full
+    // sensitivity.
+    let sustained: usize =
+        if cfg!(debug_assertions) { 200_000 } else { 700_000 };
     for i in 0..sustained {
         let _ = db.get(read_key(i)).unwrap();
     }
