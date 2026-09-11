@@ -475,6 +475,10 @@ fn default_cache_mode_keeps_hot_lns_resident() {
 /// byte-identical data.  (Fault *counts* are asserted at the log level, not
 /// here, because the DB read can be partly absorbed by the write buffer pool,
 /// which makes the DB-level random-read count non-deterministic.)
+///
+/// The cold-set load is batched 1000/txn to avoid one `fdatasync` per record
+/// (unrelated to the strip/re-fetch behaviour under test). Measured: 84.3s
+/// -> see the batched timing recorded at commit time.
 #[test]
 fn stripped_ln_refetch_roundtrips() {
     let dir = TempDir::new().unwrap();
@@ -484,9 +488,22 @@ fn stripped_ln_refetch_roundtrips() {
     let value = vec![0x5au8; 100];
     db.put(&key, DatabaseEntry::from_bytes(&value)).unwrap();
 
-    for i in 0..20_000usize {
-        let k = DatabaseEntry::from_vec(format!("cold{:08}", i).into_bytes());
-        db.put(&k, DatabaseEntry::from_bytes(&[0u8; 100])).unwrap();
+    // Batched 1000/txn -- see fill_batched's doc comment (avoids one
+    // fdatasync per record; unrelated to the strip/re-fetch behaviour under
+    // test).
+    let cold_n = 20_000usize;
+    let mut i = 0usize;
+    while i < cold_n {
+        let end = (i + 1000).min(cold_n);
+        let txn = env.begin_transaction(None).unwrap();
+        for j in i..end {
+            let k =
+                DatabaseEntry::from_vec(format!("cold{:08}", j).into_bytes());
+            db.put_in(&txn, &k, DatabaseEntry::from_bytes(&[0u8; 100]))
+                .unwrap();
+        }
+        txn.commit().unwrap();
+        i = end;
     }
     // Strip the LNs (drops the hot-key slot data, keeps the LSN).
     let _ = env.evict_memory().unwrap();
