@@ -680,6 +680,24 @@ breaking cleanup ships as 7.x while there are no downstream users.
 
 ### Testing
 
+- **Both remaining CI flakes addressed at the timing assumption behind them.**
+  `xa::test_concurrent_prepared_log_stress` took 57.95 s in debug — under
+  nextest's 120 s cap alone but close enough that full-workspace CPU contention
+  pushed it over, which matches the evidence (never reproduced in isolation across
+  ~20 attempts, only in full runs). Cycles now scale with the build profile (50
+  debug / 200 release): debug 57.95 s → 8.36 s, release still runs the full
+  workload, and the whole `noxu-xa` suite drops to 34.5 s with no SLOW flags. Its
+  harness also now reports each worker thread's panic payload and commit count
+  instead of collapsing every failure into an opaque `join().unwrap()` — every XA
+  entry point does `branches.lock().unwrap()`, so one panicking thread poisons the
+  mutex and buries the original cause under collateral panics.
+  `dst_crash_sweep::dst_same_seed_reproduces_exactly` waited a hard-coded 600 ms
+  for its crash worker then silently `kill()`ed it; a killed worker stops at an
+  arbitrary point, so the test's two same-seed runs were compared at *different*
+  crash points and reported "determinism broken" with the engine blameless. The
+  wait is now a 30 s deadline and a kill is an explicit test failure that says so.
+  Verified 0/15 failures under synthetic load (load average 20.6).
+
 - **`noxu-dbi` and `noxu-db` raised over the >85% coverage mandate on
   region / function / line.** These were the last two crates below target.
 

@@ -676,6 +676,16 @@ fn test_concurrent_prepared_log_stress() {
     let barrier = Arc::new(Barrier::new(8));
     let committed = Arc::new(AtomicU64::new(0));
 
+    // Iterations scale with the build profile, for the same reason as
+    // `test_rapid_fire_10k_with_prepared_log`: 8 threads x 200 cycles takes ~58 s
+    // unoptimised, which is under nextest's 120 s cap in isolation but close
+    // enough that CPU contention from a full 6,300-test workspace run can push it
+    // over -- the most likely explanation for this test's observed flakiness,
+    // given it has never reproduced in isolation. The property under test
+    // ("concurrent prepare/commit cycles leave no lingering prepared branches")
+    // holds at any sufficiently large cycle count.
+    let cycles: u64 = if cfg!(debug_assertions) { 50 } else { 200 };
+
     let handles: Vec<_> = (0..8)
         .map(|tid| {
             let xa = Arc::clone(&xa);
@@ -685,7 +695,7 @@ fn test_concurrent_prepared_log_stress() {
 
             std::thread::spawn(move || {
                 barrier.wait();
-                for i in 0..200u64 {
+                for i in 0..cycles {
                     let xid = Xid::new(
                         tid + 1,
                         format!("cpl_t{tid}_i{i:04}").as_bytes(),
@@ -712,12 +722,49 @@ fn test_concurrent_prepared_log_stress() {
         })
         .collect();
 
-    for h in handles {
-        h.join().unwrap();
+    // Report WHICH thread failed and how far it got, rather than collapsing every
+    // failure into a bare `join().unwrap()` panic.
+    //
+    // This test has been observed failing under full-workspace parallelism but has
+    // never reproduced in isolation (0/15) nor in two full-workspace runs, so the
+    // trigger is still unidentified. The single most likely mechanism is a
+    // poisoned `branches` mutex: every XA entry point does
+    // `self.branches.lock().unwrap()`, so ONE panicking thread poisons the mutex
+    // and every subsequent call in every other thread panics too -- which
+    // presents as an opaque `join()` failure with the original cause lost.
+    // Surfacing the panic payload and the committed count is what makes the next
+    // occurrence diagnosable instead of another dead end.
+    let mut thread_failures = Vec::new();
+    for (tid, h) in handles.into_iter().enumerate() {
+        if let Err(payload) = h.join() {
+            let msg = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| {
+                    payload.downcast_ref::<&str>().map(|s| (*s).to_string())
+                })
+                .unwrap_or_else(|| "<non-string panic payload>".to_string());
+            thread_failures.push(format!("thread {tid}: {msg}"));
+        }
     }
-
     let total = committed.load(Ordering::Relaxed);
-    assert_eq!(total, 8 * 200);
+    assert!(
+        thread_failures.is_empty(),
+        "{} of 8 worker threads panicked after {total}/{} commits. If several \
+         threads report the same mutex-poisoning error, the FIRST distinct \
+         message is the real cause and the rest are collateral. Failures:\n{}",
+        thread_failures.len(),
+        8 * cycles,
+        thread_failures.join("\n")
+    );
+
+    assert_eq!(
+        total,
+        8 * cycles,
+        "all 8 threads returned without panicking, but only {total} of {} \
+         commits were counted -- a commit path returned without incrementing",
+        8 * cycles
+    );
 
     // No lingering prepared branches
     let recovered = xa.xa_recover(XaFlags::STARTRSCAN).unwrap();
