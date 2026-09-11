@@ -466,8 +466,11 @@ impl LogManager {
     /// `obsoleteWriteLockInfo` loop): for each write-lock whose abort version
     /// is reclaimable, calls `countObsoleteNode(abortLsn, null, abortLogSize,
     /// db)` under the log write latch.  Here the same accounting fires
-    /// through the installed observer so it lands in the per-FILE and per-DB
-    /// summaries.
+    /// through the installed observer's BATCHED entry point
+    /// ([`LogWriteObserver::count_obsolete_batch`]) so a lock-protected
+    /// observer (e.g. `UtilizationTrackerObserver`) takes its lock ONCE for
+    /// the whole commit's obsolete set rather than once per LSN — see
+    /// `docs/src/internal/space-amplification-2026-09.md` Phase 4.
     ///
     /// Each tuple is `(abort_lsn, db_id, abort_log_size)`.  The caller is
     /// responsible for applying JE's `maybeCountObsoleteLSN` filters
@@ -476,15 +479,18 @@ impl LogManager {
         &self,
         infos: &[(Lsn, Option<u32>, i32)],
     ) {
-        if let Some(obs) = &self.write_observer {
-            for &(lsn, db_id, size) in infos {
-                if lsn.is_null() {
-                    continue;
-                }
-                // Prior versions overwritten by a committed txn are LNs;
-                // counted via the exact variant (JE countObsoleteNode).
-                obs.count_obsolete(ObsoleteLsn::exact(lsn, db_id, size, true));
-            }
+        let Some(obs) = &self.write_observer else {
+            return;
+        };
+        // Prior versions overwritten by a committed txn are LNs; counted via
+        // the exact variant (JE countObsoleteNode).
+        let batch: Vec<ObsoleteLsn> = infos
+            .iter()
+            .filter(|(lsn, _, _)| !lsn.is_null())
+            .map(|&(lsn, db_id, size)| ObsoleteLsn::exact(lsn, db_id, size, true))
+            .collect();
+        if !batch.is_empty() {
+            obs.count_obsolete_batch(&batch);
         }
     }
 
