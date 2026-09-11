@@ -325,7 +325,13 @@ pub fn classify_tail(
                 ),
             };
         };
-        // Txn ends must have been routed to HardRecovery by verify_rollback.
+        // Unreachable by construction, kept as a defensive backstop.
+        //
+        // `verify_rollback` only returns `RollbackToMatchpoint` when
+        // `last_txn_end <= matchpoint_vlsn && num_passed_commits == 0`, so a tail
+        // containing a committed/aborted transaction is routed to `HardRecovery`
+        // before `classify_tail` is ever consulted. This arm therefore fires only
+        // on a caller bug -- see `txn_end_arm_is_unreachable_via_verify_rollback`.
         if matches!(
             ty,
             noxu_log::LogEntryType::TxnCommit
@@ -349,11 +355,12 @@ pub fn classify_tail(
             return TailSafety::Refuse {
                 reason: format!(
                     "diverged tail contains a NON-transactional LN ({ty:?}) \
-                     at VLSN {}: its effects are already visible in this \
-                     replica's live B-tree and this build has no in-memory \
-                     TxnChain revert (JE Replay.rollback step 2), so \
-                     discarding the log entry alone would leave the tree \
-                     diverged. A network restore is required.",
+                     at VLSN {}: its effects are already applied to this \
+                     replica's live B-tree (ReplicaReplay::apply_entry applies \
+                     non-transactional LNs immediately), and the log entry \
+                     carries NO before-image to revert to -- LnLogEntry \
+                     serializes abort_lsn/abort_data only `if \
+                     self.is_transactional()`. A network restore is required.",
                     vlsn.sequence()
                 ),
             };
@@ -373,6 +380,50 @@ pub fn classify_tail(
 
 #[cfg(test)]
 mod tests {
+    /// `classify_tail`'s txn-end refusal arm is unreachable through the real
+    /// decision path, and this pins that fact so it is not mistaken for live
+    /// protection.
+    ///
+    /// `verify_rollback` returns `RollbackToMatchpoint` only when
+    /// `last_txn_end <= matchpoint_vlsn && num_passed_commits == 0`. A tail
+    /// containing a committed or aborted transaction violates one of those by
+    /// definition, so it is routed to `HardRecovery` and `classify_tail` is never
+    /// asked about it.
+    ///
+    /// This matters because a 2026 audit set out to close "HA Gap A" by porting
+    /// JE's `TxnChain` in-memory revert, on the assumption that it would let this
+    /// arm start admitting committed-txn tails. It cannot: those tails never
+    /// arrive here. Asserting it keeps the next reader from re-deriving that.
+    #[test]
+    fn txn_end_arm_is_unreachable_via_verify_rollback() {
+        // A committed txn end ABOVE the matchpoint, which is the case the
+        // dead arm nominally guards.
+        let decision = verify_rollback(
+            &Matchpoint::Found { vlsn: Vlsn::new(10), lsn: 0 },
+            /*last_txn_end=*/ Vlsn::new(20),
+            /*last_sync=*/ Vlsn::new(5),
+            /*num_passed_commits=*/ 0,
+        );
+        assert!(
+            matches!(decision, RollbackDecision::HardRecovery { .. }),
+            "a txn end above the matchpoint must route to HardRecovery, not to \
+             a rollback that would consult classify_tail; got {decision:?}"
+        );
+
+        // Same, via the passed-commits counter rather than the VLSN comparison.
+        let decision = verify_rollback(
+            &Matchpoint::Found { vlsn: Vlsn::new(10), lsn: 0 },
+            /*last_txn_end=*/ Vlsn::new(8),
+            /*last_sync=*/ Vlsn::new(5),
+            /*num_passed_commits=*/ 1,
+        );
+        assert!(
+            matches!(decision, RollbackDecision::HardRecovery { .. }),
+            "passing a commit during the backward scan must route to \
+             HardRecovery; got {decision:?}"
+        );
+    }
+
     use super::*;
     use std::collections::HashMap;
 
