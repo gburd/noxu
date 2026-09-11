@@ -374,6 +374,11 @@ fn repopulated_read_is_consistent_and_budget_bounded() {
 /// the lead-benchmarks work) must climb only marginally during the hot-read
 /// phase.  Without the LRU touch the hot BINs are stripped between reads and
 /// `n_random_reads` climbs ~1 per hot read.
+///
+/// The cold-set initial load is batched 1000/txn to avoid one `fdatasync`
+/// per record (see `fill_batched`'s doc comment); unrelated to the LRU
+/// keep-hot behaviour under test. Measured: 240s+ -> see the batched timing
+/// recorded at commit time.
 #[test]
 fn default_cache_mode_keeps_hot_lns_resident() {
     let dir = TempDir::new().unwrap();
@@ -385,10 +390,10 @@ fn default_cache_mode_keeps_hot_lns_resident() {
     let cold_n = 60_000usize;
     let hot: Vec<usize> = (0..200).map(|i| i * 251).collect(); // spread
     let val = vec![0x5au8; 100];
-    for i in 0..cold_n {
-        let k = DatabaseEntry::from_vec(format!("{:010}", i).into_bytes());
-        db.put(&k, DatabaseEntry::from_bytes(&val)).unwrap();
-    }
+    // Batched 1000/txn -- see fill_batched's doc comment (avoids one
+    // fdatasync per record; the read/eviction behaviour measured below is
+    // unaffected by how the initial load was committed).
+    fill_batched(&env, &db, cold_n, &val);
 
     let read = |i: usize| {
         let k = DatabaseEntry::from_vec(format!("{:010}", i).into_bytes());
