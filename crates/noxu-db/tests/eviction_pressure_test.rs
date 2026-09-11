@@ -113,19 +113,29 @@ fn delete_heavy_does_not_inflate_cache_usage() {
     let val = vec![0u8; 100];
     // Insert then delete the same keys many times. With the F8 leak, each
     // delete would under-subtract by data_len (100B), inflating cache_usage.
+    //
+    // Each round's 2000 puts + 2000 deletes run in ONE explicit transaction
+    // (one fdatasync per round instead of one per record) -- measured
+    // ~2.9ms/fdatasync on this filesystem, so the original 80,000 auto-commit
+    // ops cost ~230s of pure fsync wait, unrelated to the cache-accounting
+    // behaviour under test. Round count and per-round key count are
+    // unchanged, so the working set / churn pattern the test asserts on is
+    // identical.
     for round in 0..20 {
+        let txn = env.begin_transaction(None).unwrap();
         for i in 0..2_000usize {
             let k = DatabaseEntry::from_vec(
                 format!("r{}-{:08}", round % 2, i).into_bytes(),
             );
-            db.put(&k, DatabaseEntry::from_bytes(&val)).unwrap();
+            db.put_in(&txn, &k, DatabaseEntry::from_bytes(&val)).unwrap();
         }
         for i in 0..2_000usize {
             let k = DatabaseEntry::from_vec(
                 format!("r{}-{:08}", round % 2, i).into_bytes(),
             );
-            let _ = db.delete(&k);
+            let _ = db.delete_in(&txn, &k);
         }
+        txn.commit().unwrap();
     }
     let _ = env.evict_memory().unwrap();
     let stats = env.stats().unwrap();
