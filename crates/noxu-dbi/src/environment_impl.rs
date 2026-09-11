@@ -2568,28 +2568,20 @@ impl EnvironmentImpl {
     pub fn begin_txn(&self) -> Result<Txn, DbiError> {
         self.check_open()?;
         // Attaching the LogManager is what lets the txn count its abort LSNs
-        // obsolete on commit, so the cleaner learns that overwritten record
-        // versions became garbage. It is GATED OFF by default because every
-        // counted LSN takes the global tracker mutex
-        // (`UtilizationTrackerObserver::count_obsolete` -> `tracker.lock()`),
-        // once per commit. Measured on ycsb_a, 8 threads, 100k records:
-        //
-        //   off (today): 318,573 ops/s, 2,506 MB on disk
-        //   on:            9,505 ops/s,   199 MB on disk
-        //
-        // A 12.6x space reduction for a 33x throughput regression -- neither
-        // side is acceptable as a default. The missing piece is JE's
-        // `LocalUtilizationTracker`/`BaseLocalUtilizationTracker`: per-thread
-        // accumulation merged in batches, so the shared mutex is taken once per
-        // batch rather than once per commit. See
-        // `docs/src/internal/space-amplification-2026-09.md`.
+        // obsolete on commit (TXN-1), so the cleaner learns that overwritten
+        // record versions became garbage. This used to be gated off by
+        // default (NOXU_COUNT_TXN_OBSOLETE) because every counted LSN took
+        // the global tracker mutex once per commit. The gate is removed now
+        // that the merge is batched (one lock acquisition per commit's whole
+        // obsolete set, not per LSN) and moved to run AFTER the per-record
+        // write locks are released, removing the lock-ordering convoy that
+        // was the actual mechanism behind the measured regression. See
+        // `docs/src/internal/space-amplification-2026-09.md` Phase 4.
         Ok(match &self.log_manager {
-            Some(lm)
-                if std::env::var_os("NOXU_COUNT_TXN_OBSOLETE").is_some() =>
-            {
+            Some(lm) => {
                 self.txn_manager.begin_txn_with_log_manager(Arc::clone(lm))
             }
-            _ => self.txn_manager.begin_txn(),
+            None => self.txn_manager.begin_txn(),
         })
     }
 

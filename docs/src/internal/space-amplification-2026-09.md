@@ -835,3 +835,61 @@ local tracker exists.
   data).
 - Default behaviour: unchanged, deliberately.
 - Next: port `LocalUtilizationTracker`, then flip the gates and re-run Phase 2.
+
+## Phase 4: counting enabled by default, and a corrected space figure (2026-09-11)
+
+Phase 3 fixed obsolete counting but shipped it gated because per-commit counting
+took the global tracker mutex once per commit (~33× throughput cost). Phase 4
+removes the gates.
+
+### What made it affordable
+
+Two changes, and the second matters more than the first:
+
+1. **Batched per-txn merge.** Obsolete LSNs accumulate in the transaction and
+   merge into the shared tracker once, at commit, instead of once per counted
+   record.
+2. **Merge AFTER write-lock release.** The shared-tracker acquisition was moved
+   to after the per-record write locks are dropped, so it no longer serialises
+   behind lock holders. This removes a convoy rather than amortising a mutex, and
+   is the larger of the two effects.
+
+### A double-commit-frame bug the gate removal exposed
+
+Attaching a `LogManager` to the inner `noxu_txn::Txn` — needed so it can merge
+obsolete LSNs — made its own `commit()`/`abort()` write a `TxnCommit`/`TxnAbort`
+WAL frame *in addition* to the one the outer `noxu_db::Transaction` already
+writes: a second frame, under a colliding txn-id namespace, hardcoded to
+`CommitSync`, blind to the caller's `read_only` flag. Latent (nobody set the old
+env gate), the removal made it fire by default. Fixed with a suppress-own-end-frame
+flag; `txn_end_frame_dedup_test` pins exactly one frame per op.
+
+### The space figure, corrected
+
+Phase 3 reported ~12× (2,126 MB → 187 MB). **That 187 MB was an artifact of the
+double-frame bug.** With counting forced on but ungated, the duplicate frame's
+hardcoded `CommitSync` forced a synchronous fsync per commit regardless of the
+`NO_SYNC` benchmark setting, so only ~15k writes landed in the 25 s window instead
+of ~1.4M. The small footprint was two orders of magnitude fewer writes, not better
+reclamation.
+
+Corrected, three fresh runs of the same command (`ycsb_a`, 100k records, 25 s,
+8 threads, 512 B, `NO_SYNC`), on current HEAD:
+
+| configuration | on-disk | writes |
+|---|---:|---:|
+| counting OFF | 1,061–1,142 MB | ~1.4M |
+| counting ON (default) | 644–667 MB | ~1.27M |
+
+**~1.6–1.7×, not 12×.** Byte measurements (`du -sb`) are immune to CPU
+contention, so these are trustworthy even though the box was loaded; the
+throughput A/B (indicative ~100k ops/s on the loaded box) still owes a
+clean-hardware confirmation.
+
+### Lesson
+
+The 12× was never real — it measured writes that never happened. A space figure
+taken from a run whose throughput collapsed is meaningless, because on-disk size
+tracks write volume. Always report the committed-write count alongside any
+footprint number, and be suspicious of a space win that coincides with a
+throughput drop: it is usually the same phenomenon seen twice.

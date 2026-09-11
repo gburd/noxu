@@ -13,8 +13,44 @@ For dense per-release context (sprint and wave attribution, audit
 finding IDs, full test-gate counts), see the annotated git tags
 (`git tag -l vX.Y.Z --format='%(contents)'`) and the per-wave reports
 listed in [References](#references).
+
 ## [Unreleased]
 
+### Changed
+
+- **Obsolete-LN counting is now ON BY DEFAULT; the `NOXU_COUNT_*` gates are
+  removed.** v7.9.1 fixed the counting but shipped it gated because per-commit
+  counting took a global tracker mutex once per commit (~33× throughput cost).
+  This batches the obsolete-LSN merge per transaction and — the larger win —
+  moves the shared-tracker acquisition to AFTER the per-record write locks are
+  released, removing a lock convoy rather than merely amortising the mutex.
+  Throughput with counting on is now ~100k ops/s on a loaded box (the gated-off
+  default was 267k–318k on an idle one; a clean-hardware A/B is still owed).
+
+  **The space win is smaller than v7.9.1's gated measurement implied, and the
+  discrepancy was a measurement bug worth recording.** v7.9.1 reported ~12×
+  (2,126 MB → 187 MB). That 187 MB was an artifact: with counting forced on but
+  ungated, a latent double-commit-frame bug (see below) forced a synchronous
+  fsync per commit regardless of the caller's `NO_SYNC` setting, so only ~15k
+  writes landed in the benchmark window instead of ~1.4M — the small footprint
+  was fewer writes, not better reclamation. On corrected HEAD, the same workload
+  writes ~1.27M records and lands at ~640–670 MB vs ~1,060–1,140 MB with counting
+  off: **~1.6–1.7×**, not 12×. Byte measurements are contention-immune so these
+  are trustworthy; the honest figure is recorded rather than the flattering one.
+
+### Fixed
+
+- **Explicit transactions wrote TWO commit frames once the inner `Txn` gained a
+  `LogManager`.** Attaching a `LogManager` to the inner `noxu_txn::Txn` (needed so
+  it can merge obsolete LSNs) made its own `commit()`/`abort()` write a
+  `TxnCommit`/`TxnAbort` WAL frame in addition to the one the outer
+  `noxu_db::Transaction` wrapper already writes — under a second, colliding txn-id
+  namespace, hardcoded to `CommitSync`, and blind to the caller's `read_only`
+  flag. Latent until the gate removal made it fire by default. Fixed with a
+  suppress-own-end-frame flag set only when an outer wrapper owns the frame; the
+  auto-commit path (`Database::put`/`del`, no wrapper) was never affected.
+  Regression-tested by `txn_end_frame_dedup_test` (exactly one frame per op),
+  verified non-vacuous.
 ### Added
 
 - **Gap A, step 1+2: live WAL re-scan `TxnChain` source for HA syncup

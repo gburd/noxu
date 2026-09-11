@@ -26,6 +26,9 @@
 //!   SAP_UPDATE_SECONDS    update-storm phase duration (default 120)
 //!   SAP_THREADS           updater threads (default 16)
 //!   SAP_MIN_UTIL          cleaner_min_utilization (default 50, JE default)
+//!   SAP_KEY_DIST          zipf (default, hot-key theta=0.99) | uniform
+//!                         (overwrites spread evenly across the whole
+//!                         keyspace instead of a small hot set)
 //!   SAP_CKPT_BYTES        checkpointer_bytes_interval (default 20_000_000)
 //!   SAP_CKPT_MS           checkpointer_wakeup_interval_ms (default 30_000)
 //!   SAP_DURABILITY        SYNC|NO_SYNC|WRITE_NO_SYNC (default NO_SYNC — the
@@ -124,6 +127,27 @@ impl Zipf {
             * (self.eta * u - self.eta + 1.0).powf(self.alpha))
             as u64;
         v % self.n
+    }
+}
+
+/// Key-distribution selector for the update-storm phase (`SAP_KEY_DIST`,
+/// default `zipf`). `zipf` is the original hot-key shape (theta=0.99,
+/// matches xbench). `uniform` distributes overwrites evenly across the
+/// whole keyspace instead of concentrating them on a small hot set -- a
+/// distinct workload shape asked for by the LocalUtilizationTracker task's
+/// "re-measure across more than one workload shape" requirement, since the
+/// original ~12x space win was measured only under the Zipfian hot-key
+/// shape.
+enum KeyDist {
+    Zipf(Zipf),
+    Uniform { n: u64 },
+}
+impl KeyDist {
+    fn next(&self, rng: &mut Rng) -> u64 {
+        match self {
+            KeyDist::Zipf(z) => z.next(rng),
+            KeyDist::Uniform { n } => rng.next() % n,
+        }
     }
 }
 
@@ -256,7 +280,11 @@ min_util={min_util} ckpt_bytes={ckpt_bytes} ckpt_ms={ckpt_ms} dur={durability} =
     println!("-- update-storm for {update_seconds}s ({threads} threads) --");
     let stop = Arc::new(AtomicBool::new(false));
     let writes = Arc::new(AtomicU64::new(0));
-    let zipf = Arc::new(Zipf::new(records));
+    let key_dist_name = envs("SAP_KEY_DIST", "zipf");
+    let zipf = Arc::new(match key_dist_name.as_str() {
+        "uniform" => KeyDist::Uniform { n: records },
+        _ => KeyDist::Zipf(Zipf::new(records)),
+    });
     let (log_wb0, log_rb0) = {
         let s = env.stats().unwrap();
         (s.log.n_sequential_write_bytes, s.log.n_sequential_read_bytes)
