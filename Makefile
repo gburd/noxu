@@ -1,6 +1,6 @@
 .PHONY: build test check fmt doc clean bench fuzz test-crate tc-helper torture torture-quic \
         docs docs-serve docs-check docs-spell docs-lint docs-clean \
-        spec shuttle spec-and-shuttle coverage
+        spec shuttle spec-and-shuttle coverage slow-tests
 
 build:
 	cargo build --workspace
@@ -59,6 +59,12 @@ fuzz:
 # print a Stateright counterexample trace.
 spec:
 	cargo test -p noxu-spec --release -- --include-ignored
+
+# Memory-pressure and RSS-leak tests that need a large dataset to make the signal
+# measurable above noise, so they exceed nextest's 120s debug cap and are
+# #[ignore]d out of the default suite. --release + --include-ignored runs them.
+slow-tests:
+	cargo test --release -p noxu-db --test read_fault_rss_leak_test -- --include-ignored
 
 # Run every shuttle concurrency-permutation (DST Milestone 2) test file.
 # Gated behind `#[cfg(noxu_shuttle)]`, so these compile to empty test

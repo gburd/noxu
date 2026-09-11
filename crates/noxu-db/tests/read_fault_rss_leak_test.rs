@@ -62,6 +62,12 @@ fn rss_bytes() -> u64 {
 /// PASSES after the fix (fetched data is budgeted + the read path applies
 /// critical-eviction back-pressure, so eviction holds RSS at the cache size).
 #[test]
+#[ignore = "RSS-leak regression: needs an 80 MiB dataset (10x cache) + 700k reads \
+            to make the leak measurable above RSS noise; ~130-260s in debug, over \
+            nextest's 120s cap. Cannot be shrunk without losing the signal (a \
+            10 MiB dataset makes the RSS delta indistinguishable from noise, \
+            verified). Run via `make slow-tests`, which passes --include-ignored. \
+            Passes in ~232s release."]
 fn read_only_workload_rss_stays_bounded() {
     let dir = TempDir::new().unwrap();
 
