@@ -84,6 +84,30 @@ const IMPORTUNATE: u8 = 8;
 /// commit/abort record for every auto-commit op.  Closes the first F12
 /// residual.
 const IS_AUTO_TXN: u8 = 16;
+/// This `Txn` is owned by an external wrapper (`noxu_db::Transaction`) that
+/// already writes its own `TxnCommit` / `TxnAbort` / `TxnPrepare` WAL frame,
+/// with its own fsync policy derived from the caller's [`Durability`] choice.
+///
+/// A `Txn` needs a `LogManager` reference for TXN-1 (merging obsolete abort
+/// LSNs into the shared `UtilizationTracker` on commit) even when it is
+/// wrapped this way. Before that LogManager was attached unconditionally
+/// (`NOXU_COUNT_TXN_OBSOLETE` gate, since removed), this was moot: a `Txn`
+/// with no `LogManager` silently no-ops every `log_entry` call ([`Self::log_entry`]
+/// returns `Ok(NULL_LSN)` without a `LogManager`), so its own would-be
+/// `TxnCommit`/`TxnAbort`/`TxnPrepare` writes were dead code by construction.
+/// Attaching a real `LogManager` for the obsolete-merge feature un-silences
+/// those writes too, producing a SECOND frame (wrong durability -- always
+/// `Durability::CommitSync` regardless of the caller's actual choice -- and a
+/// colliding-possible txn-id namespace, since the outer `Environment` and the
+/// inner `TxnManager` each allocate ids from 1) for every commit/abort/prepare
+/// under an outer wrapper. This flag says "skip writing any frame or fsync of
+/// your own; the outer wrapper already did both" while still allowing
+/// [`Self::log_manager`]-gated obsolete-LSN collection/merge to run.
+///
+/// Set by [`crate::TxnManager::begin_txn_with_log_manager`], whose only
+/// production caller (`EnvironmentImpl::begin_txn`) is always wrapped by
+/// exactly such an outer `Transaction`.
+const SUPPRESS_OWN_END_FRAME: u8 = 32;
 
 /// A Txn is the internal representation of a transaction.
 ///
@@ -335,6 +359,29 @@ impl Txn {
     /// Same semantics as `with_group_commit()` but works on `&mut self`.
     pub fn set_group_commit(&mut self, gc: Arc<dyn GroupCommit>) {
         self.group_commit = Some(gc);
+    }
+
+    /// Marks this `Txn` as owned by an external wrapper that already writes
+    /// its own `TxnCommit` / `TxnAbort` / `TxnPrepare` WAL frame and its own
+    /// fsync, with its own [`Durability`] policy.
+    ///
+    /// After this call, [`Self::commit_with_durability`], [`Self::abort`],
+    /// [`Self::abort_collect_undo`], [`Self::prepare`],
+    /// [`Self::resolved_commit_after_prepare`], and
+    /// [`Self::resolved_abort_after_prepare`] still run their lock/undo/
+    /// obsolete-LSN-merge bookkeeping, but skip writing their own WAL frame
+    /// and skip their own fsync — see [`SUPPRESS_OWN_END_FRAME`]'s doc comment
+    /// for why this exists (it does not exist to change any correctness
+    /// property this `Txn` type provides on its own; it exists because
+    /// giving a wrapped `Txn` a `LogManager`, which TXN-1 obsolete-LSN
+    /// merging needs, un-silences writes the wrapper already performs).
+    pub(crate) fn set_suppress_own_end_frame(&mut self) {
+        self.txn_flags |= SUPPRESS_OWN_END_FRAME;
+    }
+
+    /// Returns whether [`Self::set_suppress_own_end_frame`] was called.
+    fn suppress_own_end_frame(&self) -> bool {
+        self.txn_flags & SUPPRESS_OWN_END_FRAME != 0
     }
 
     /// Creates a new transaction wired to a LogManager.
@@ -649,6 +696,21 @@ impl Txn {
     /// Phase 4.
     fn commit_append_phase(&mut self) -> Result<PendingCommit, TxnError> {
         if self.has_logged_entries() && !self.is_auto_txn() {
+            if self.suppress_own_end_frame() {
+                // Owned by an outer wrapper (`noxu_db::Transaction`) that
+                // already wrote its own TxnCommit frame and will run its own
+                // fsync with the caller's actual Durability choice. Skip
+                // writing a second frame and skip this Txn's own fsync
+                // (`PendingSync::None`), but still collect the obsolete-LSN
+                // batch — the only reason this Txn has a LogManager at all.
+                // See `SUPPRESS_OWN_END_FRAME`'s doc comment.
+                let obsolete_lsns = self.collect_obsolete_abort_lsns();
+                return Ok(PendingCommit {
+                    assigned_lsn: NULL_LSN,
+                    pending_sync: PendingSync::None,
+                    obsolete_lsns,
+                });
+            }
             if let Some(ref hook) = self.pre_commit_hook {
                 hook();
             }
@@ -1191,7 +1253,12 @@ impl Txn {
         // No logged entries — caller should have taken the read-only
         // optimisation.  We still mark prepared (defensive), but do not
         // emit a TxnPrepare frame: there is nothing to resolve.
-        if !self.has_logged_entries() {
+        //
+        // A Txn marked `suppress_own_end_frame()` is owned by an outer
+        // wrapper (`noxu_db::Transaction`) that already writes its own
+        // TxnPrepare frame (`Transaction::prepare`); skip writing a second
+        // one here too. See `SUPPRESS_OWN_END_FRAME`'s doc comment.
+        if !self.has_logged_entries() || self.suppress_own_end_frame() {
             self.txn_flags |= IS_PREPARED;
             return Ok(NULL_LSN);
         }
@@ -1349,7 +1416,14 @@ impl Txn {
         // `txn_id=0`), so no synthetic abort record is required and the
         // on-disk WAL format stays identical to pre-Wave-1A auto-commit.
         // Closes the first F12 residual.
-        let assigned_lsn = if self.has_logged_entries() && !self.is_auto_txn() {
+        //
+        // A Txn marked `suppress_own_end_frame()` is owned by an outer
+        // wrapper that already writes its own TxnAbort frame; see
+        // `SUPPRESS_OWN_END_FRAME`'s doc comment.
+        let assigned_lsn = if self.has_logged_entries()
+            && !self.is_auto_txn()
+            && !self.suppress_own_end_frame()
+        {
             let abort = TxnAbort::new(
                 self.id,
                 self.last_lsn,
@@ -1421,8 +1495,14 @@ impl Txn {
         self.state = TxnState::Aborted;
 
         // Synthetic auto-txns skip the `TxnAbort` WAL entry; see
-        // [`Self::abort`] for rationale.
-        let assigned_lsn = if self.has_logged_entries() && !self.is_auto_txn() {
+        // [`Self::abort`] for rationale. A Txn marked
+        // `suppress_own_end_frame()` is owned by an outer wrapper that
+        // already writes its own TxnAbort frame; see
+        // `SUPPRESS_OWN_END_FRAME`'s doc comment.
+        let assigned_lsn = if self.has_logged_entries()
+            && !self.is_auto_txn()
+            && !self.suppress_own_end_frame()
+        {
             let abort = TxnAbort::new(
                 self.id,
                 self.last_lsn,

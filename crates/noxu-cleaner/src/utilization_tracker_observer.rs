@@ -132,12 +132,7 @@ mod tests {
     fn batched_merge_matches_sequential_single_calls() {
         let batch: Vec<ObsoleteLsn> = (0..50u32)
             .map(|i| {
-                ObsoleteLsn::exact(
-                    Lsn::new(1, 100 + i * 8),
-                    Some(7),
-                    64,
-                    true,
-                )
+                ObsoleteLsn::exact(Lsn::new(1, 100 + i * 8), Some(7), 64, true)
             })
             .collect();
 

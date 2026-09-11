@@ -487,7 +487,9 @@ impl LogManager {
         let batch: Vec<ObsoleteLsn> = infos
             .iter()
             .filter(|(lsn, _, _)| !lsn.is_null())
-            .map(|&(lsn, db_id, size)| ObsoleteLsn::exact(lsn, db_id, size, true))
+            .map(|&(lsn, db_id, size)| {
+                ObsoleteLsn::exact(lsn, db_id, size, true)
+            })
             .collect();
         if !batch.is_empty() {
             obs.count_obsolete_batch(&batch);
