@@ -194,3 +194,51 @@ this session; recorded as a limitation, not silently ignored).
     trustworthy despite CPU load).
 11. Docs: Phase 4 section in `space-amplification-2026-09.md`, CHANGELOG
     `## [Unreleased]`.
+
+## Test-suite status after fixes (2026, this session)
+
+Box load average ~18-28 throughout (peer agents running `rustc`, memory-pressure
+suites, and synthetic `yes` load concurrently -- confirmed via `ps`/`uptime`).
+Correctness (pass/fail, not timing) verified clean:
+
+- `noxu-txn --lib`: 292/292 pass.
+- `noxu-db --lib` (transaction module): 43/43 pass, including the two tests
+  that failed deterministically before the `SUPPRESS_OWN_END_FRAME` fix
+  (`durability_controls_whether_the_commit_fsyncs`,
+  `read_only_transactions_do_not_yet_reject_writes`).
+- Full 4-crate suite (`noxu-cleaner`, `noxu-txn`, `noxu-dbi`, `noxu-db`)
+  excluding known load-sensitive suites: 2376/2378 pass; the 2 remaining
+  (`shared_cache_test::shared_cache_balances_one_budget_across_envs`,
+  `sustained_load_test::test_cleaner_reduces_log_files_under_load`) are
+  wall-clock->60s tests that hit nextest's 120s per-test timeout under
+  this box's contention but PASS when given room (154s / 204s via plain
+  `cargo test`, no timeout).
+- `eviction_pressure_test` / `evictor_reclaim_multitree_test`: excluded from
+  every run in this session -- these are the exact suites the user's
+  first message named as being run concurrently by peer agents, and
+  independently they collide on the shared box regardless of any change
+  here.
+- `read_fault_rss_leak_test::read_only_workload_rss_stays_bounded`: FAILS
+  on a `noxu-evictor/src/slab.rs:129` debug_assert
+  (`!self.index.contains_key(&id)`) -- confirmed present on the
+  PRE-TASK baseline commit (634cf6f7) too, via a disposable worktree.
+  Pre-existing, unrelated to this branch, not investigated further (out
+  of scope for this task; flagged here so it is not re-discovered from
+  scratch).
+- `xa_adversarial_test::test_rapid_fire_10k_with_prepared_log`: failed once
+  under full-suite contention with an fsync `EnvironmentFailure`; the
+  test's own doc comment identifies it as "the single most frequent
+  source of red-but-not-broken CI runs" under load. Passes standalone
+  (32s) on this box at the same load average.
+- `je_recovery_test::recovery_duplicates_with_deletion_survives_recovery`:
+  failed once in a single nextest run (assertion count mismatch), but
+  10/10 standalone runs and 3 full `noxu-db` suite runs (2 clean, 1 with
+  unrelated timeouts) never reproduced it again. Treated as a one-off
+  scheduling/tempdir artifact of heavy parallel test execution on a loaded
+  box, not a reproducible regression -- flagged here in case it recurs on
+  clean hardware, which would change this conclusion.
+
+Net: every test that fails deterministically and repeatably is now fixed
+(the double-end-frame bug). Every remaining failure in this session is
+either pre-existing (confirmed against baseline) or resolves with wall-clock
+room, consistent with the box being shared and heavily loaded throughout.
