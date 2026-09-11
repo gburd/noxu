@@ -23,7 +23,7 @@ static SERIAL: Mutex<()> = Mutex::new(());
 /// `configure` cannot reproduce the pre-configure `UNSET` sentinel from
 /// outside the crate; 5 s is `DEFAULT_LATCH_TIMEOUT`, so behaviour matches.
 fn restore_defaults() {
-    noxu_latch::configure(5_000, false);
+    noxu_latch::configure(5_000, false, false);
 }
 
 /// ENV_LATCH_TIMEOUT: a deliberately-held exclusive latch causes a contending
@@ -33,7 +33,7 @@ fn restore_defaults() {
 fn env_latch_timeout_fails_held_latch_within_timeout() {
     let _s = SERIAL.lock().unwrap();
     // Configure a short 100 ms timeout (operator opted in to a non-default).
-    noxu_latch::configure(100, false);
+    noxu_latch::configure(100, false, false);
 
     // A latch constructed AFTER configure picks up the 100 ms default.
     let latch = Arc::new(ExclusiveLatch::new(LatchContext::new("timeout-me")));
@@ -71,7 +71,7 @@ fn env_latch_timeout_fails_held_latch_within_timeout() {
 #[test]
 fn env_latch_timeout_fails_shared_latch_within_timeout() {
     let _s = SERIAL.lock().unwrap();
-    noxu_latch::configure(100, false);
+    noxu_latch::configure(100, false, false);
     let latch =
         Arc::new(SharedLatch::new(LatchContext::new("s-timeout"), false));
 
@@ -105,7 +105,7 @@ fn env_latch_timeout_fails_shared_latch_within_timeout() {
 #[test]
 fn env_forced_yield_injects_at_acquire_release() {
     let _s = SERIAL.lock().unwrap();
-    noxu_latch::configure(5_000, true);
+    noxu_latch::configure(5_000, true, false);
     assert!(
         noxu_latch::forced_yield(),
         "forced_yield flag must reflect configure(_, true)"

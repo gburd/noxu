@@ -512,18 +512,23 @@ impl EnvironmentImpl {
         env_home: impl Into<PathBuf>,
         cfg: &DbiEnvConfig,
     ) -> Result<Self, DbiError> {
-        // JE latch knobs (ENV_LATCH_TIMEOUT / ENV_FORCED_YIELD): install the
-        // process-global latch config BEFORE any latch is constructed during
-        // env build-up.  Only touch the globals if the operator opted out of
-        // the defaults, so an env that leaves these unset preserves the exact
-        // historical latch behaviour (5 s timeout, no forced yield) —
-        // byte-identical.  `env_latch_timeout_ms == 300_000` is the unset
-        // sentinel (the JE default); `env_forced_yield == false` is the unset
-        // sentinel.  See `noxu_latch::config`.
-        if cfg.env_latch_timeout_ms != 300_000 || cfg.env_forced_yield {
+        // JE latch knobs (ENV_LATCH_TIMEOUT / ENV_FORCED_YIELD / ENV_FAIR_LATCHES):
+        // install the process-global latch config BEFORE any latch is
+        // constructed during env build-up.  Only touch the globals if the
+        // operator opted out of the defaults, so an env that leaves these
+        // unset preserves the exact historical latch behaviour (5 s timeout,
+        // no forced yield, barging admission) — byte-identical.
+        // `env_latch_timeout_ms == 300_000` is the unset sentinel (the JE
+        // default); `env_forced_yield == false` and `env_fair_latches ==
+        // false` are the unset sentinels.  See `noxu_latch::config`.
+        if cfg.env_latch_timeout_ms != 300_000
+            || cfg.env_forced_yield
+            || cfg.env_fair_latches
+        {
             noxu_latch::configure(
                 cfg.env_latch_timeout_ms,
                 cfg.env_forced_yield,
+                cfg.env_fair_latches,
             );
         }
 
