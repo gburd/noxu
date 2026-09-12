@@ -15,6 +15,29 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Added
+
+- **`env_fair_latches` (JE `setFairLatches`) wired end to end.** `noxu-latch`
+  gained a per-latch FIFO admission queue (`fair_queue::FairQueue`) that
+  `ExclusiveLatch::acquire`/`SharedLatch::acquire_exclusive`/
+  `acquire_shared` now join before contending for the real inner lock, and
+  leave (from the RAII guard's `Drop`, exactly once, including across a
+  panicking critical section) after releasing it. Zero cost when the flag
+  is off: the acquire/release fast path pays exactly one relaxed atomic
+  load. Per `.agent/notes-fair-latches.md`, Noxu implements the strictly
+  stronger full-FIFO guarantee (every acquisition serialized in arrival
+  order, readers included) rather than JE's documented — and, per that
+  investigation, never actually wired in JE's own source — contiguous-
+  reader batching. `try_acquire`/`try_acquire_exclusive` still barge
+  regardless of the flag, matching `ReentrantLock.tryLock()` semantics.
+  Proven by `crates/noxu-latch/tests/fair_latch_fifo_test.rs` (FIFO grant
+  order through the real latch types, including a barging-race ablation
+  test) and the `noxu_shuttle`-gated
+  `crates/noxu-latch/tests/shuttle_fair_latch.rs` DST model (mutual
+  exclusion, FIFO order, give-up-does-not-strand, and `leave()`-fires-
+  exactly-once-under-panic). `env_fair_latches` is removed from the
+  `unimplemented_params` WARN registry.
+
 ## [7.9.1] - 2026-09-10
 
 ## [7.9.0] - 2026-09-10

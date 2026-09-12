@@ -256,15 +256,16 @@ impl Model {
 
 /// **Invariant: FIFO grant order.** With fair mode on, `N` threads that join
 /// the queue while the lock is held are granted in strict arrival order.
-/// Threads are spawned one at a time and each blocks on `queue.push_back`
-/// happening before the NEXT thread is spawned (guaranteed by construction:
-/// this model's `state` mutex serializes the push itself, and each spawned
-/// thread's `acquire()` call cannot return until the holder releases, which
-/// only happens after every spawn -- so shuttle explores every interleaving
-/// of the ADMITTED order, not of the JOIN order, matching
+/// The main thread calls [`Model::join_queue`] for each waiter, IN INDEX
+/// ORDER, before spawning the thread that will actually wait on that ticket
+/// -- pinning arrival order structurally rather than by wall-clock stagger
+/// (which would not make sense inside shuttle's deterministic scheduler:
+/// shuttle explores interleavings, not timing, so if enqueueing happened
+/// inside the spawned closures themselves, shuttle would be free to explore
+/// schedules where they enqueue in a different order than they were spawned,
+/// making a FIFO assertion against "spawn order" meaningless). This mirrors
 /// `fair_queue.rs::grants_in_strict_arrival_order`'s own approach of pinning
-/// join order structurally rather than by wall-clock stagger, which would
-/// not make sense inside shuttle's deterministic scheduler anyway).
+/// join order structurally, adapted for shuttle instead of wall-clock sleeps.
 #[test]
 fn fair_mode_grants_in_strict_arrival_order() {
     shuttle::check_random(
@@ -277,17 +278,21 @@ fn fair_mode_grants_in_strict_arrival_order() {
             let order = Arc::new(Mutex::new(Vec::<usize>::new()));
             let mut handles = Vec::new();
             for i in 0..N {
+                // Join the queue from the MAIN thread, in index order,
+                // before spawning the thread that will wait on its ticket
+                // -- pins arrival order structurally. If enqueueing happened
+                // inside the spawned closure instead, shuttle would be free
+                // to interleave the pushes in any order, and asserting FIFO
+                // against an unpinned arrival order would be meaningless
+                // (see `join_queue`'s doc comment).
+                let ticket = model.join_queue();
                 let model = Arc::clone(&model);
                 let order = Arc::clone(&order);
                 let h = thread::spawn(move || {
-                    let ticket = model.acquire();
+                    model.wait_for_admission(ticket);
                     order.lock().unwrap().push(i);
                     model.release(ticket);
                 });
-                // Join the queue before spawning the next thread, so the
-                // queue order is pinned to spawn order -- mirrors the real
-                // test's wall-clock stagger, but expressed as a structural
-                // ordering constraint instead (shuttle has no wall clock).
                 handles.push(h);
             }
 
