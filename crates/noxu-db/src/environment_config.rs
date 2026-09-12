@@ -227,13 +227,24 @@ pub struct EnvironmentConfig {
     /// Mirrors `ENV_EXPIRATION_ENABLED` / default true.
     pub env_expiration_enabled: bool,
 
-    /// Enable per-database node eviction.
+    /// Enable eviction of metadata for closed databases.
     ///
-    /// **Reserved / not yet implemented.** Setting a non-default
-    /// value (true) has no effect and emits a `WARN` log at
-    /// `Environment::open` time.
+    /// When true (the default, matching JE), a database's DatabaseImpl
+    /// (its name/config/comparator identity and cached B-tree) may be
+    /// evicted from the environment's open-database map once the last open
+    /// handle on it is closed (Database::close), freeing the per-database
+    /// object overhead. A subsequent Environment::open_database call for
+    /// the same name transparently reconstructs it from the persisted
+    /// catalog. This does NOT target eviction among *open* databases'
+    /// cached B-tree pages -- that is the ordinary page evictor's job
+    /// (Environment::evict_memory), unaffected by this flag.
     ///
-    /// Mirrors `ENV_DB_EVICTION` / default false.
+    /// There is no known benefit to setting this to false (JE: there is
+    /// no known benefit to setting this parameter to false); it exists for
+    /// debugging/testing, e.g. to keep every closed database's metadata
+    /// pinned.
+    ///
+    /// Mirrors `ENV_DB_EVICTION` / default true / immutable.
     pub env_db_eviction: bool,
 
     // -----------------------------------------------------------------------
@@ -821,7 +832,7 @@ impl EnvironmentConfig {
             env_latch_timeout_ms: 300_000,
             env_ttl_clock_tolerance_ms: 7_200_000, // JE default 2 h
             env_expiration_enabled: true,          // JE default true
-            env_db_eviction: false,
+            env_db_eviction: true,                 // JE default true
             // Log
             log_file_max_bytes: 10 * 1024 * 1024,
             log_file_cache_size: 100,
