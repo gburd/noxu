@@ -84,7 +84,7 @@ impl ExclusiveLatch {
         // all, so there is nothing else to release.
         let fair_ticket = if crate::config::fair_latches() {
             Some(self.queue.enter(fair_queue::deadline_from(timeout)).map_err(
-                |()| {
+                |_| {
                     LatchError::Timeout(format!(
                         "Fair-queue admission timed out after {}ms: {}",
                         timeout.as_millis(),

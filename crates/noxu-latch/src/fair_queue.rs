@@ -52,6 +52,12 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+/// A [`FairQueue::enter`] call gave up before reaching the front of the queue
+/// because its deadline elapsed. The caller's id has already been removed from
+/// the queue, so it must NOT call [`FairQueue::leave`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueTimeout;
+
 /// Computes the `Instant` deadline `timeout` in the future, for use with
 /// [`FairQueue::enter`].
 ///
@@ -93,7 +99,16 @@ impl FairQueue {
     /// done contending for (and using) the real latch. Returns `Err(())` on
     /// timeout, having already removed its id from the queue: the caller
     /// must NOT call `leave` in that case.
-    pub fn enter(&self, deadline: Option<Instant>) -> Result<u64, ()> {
+    // Result<_, ()> is deliberate here (not `Result<u64, SomeError>`): the
+    // only failure mode is "gave up at the deadline", which every caller
+    // already turns into its own richer error (`LatchError::Timeout` in
+    // `exclusive.rs`/`shared.rs`) -- a unit error keeps this internal type
+    // from duplicating that.
+    #[allow(clippy::result_unit_err)]
+    pub fn enter(
+        &self,
+        deadline: Option<Instant>,
+    ) -> Result<u64, QueueTimeout> {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let mut q = self.state.lock();
         q.push_back(id);
@@ -115,14 +130,14 @@ impl FairQueue {
                         // defensively so no invariant can be silently
                         // violated by future changes to this function.
                         self.cv.notify_all();
-                        return Err(());
+                        return Err(QueueTimeout);
                     }
                     let remaining = dl - now;
                     let timed_out = self.cv.wait_for(&mut q, remaining);
                     if timed_out.timed_out() && q.front() != Some(&id) {
                         q.retain(|&x| x != id);
                         self.cv.notify_all();
-                        return Err(());
+                        return Err(QueueTimeout);
                     }
                 }
             }
