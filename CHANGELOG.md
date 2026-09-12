@@ -16,6 +16,19 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A third `pri2` double-add corruption site in the evictor (`move_to_pri2`).**
+  `move_to_pri2` removed a node from the primary/scan policy then
+  unconditionally `pri2.add_back()`, but a node can be in the primary policy AND
+  already in pri2 (`note_ins_added` inserts into primary without consulting
+  pri2), so the add_back double-linked it — silently orphaning a slab slot and
+  over-counting `len` in release, where the `debug_assert` is compiled out. Same
+  class as the two `MoveDirtyToPri2` add_front sites (v7.8.0) and the dirty-BIN
+  arm (v7.10.0), now guarded the same way. Audited all seven `add_back` sites; the
+  other six re-add a node just popped by `pri2.remove_front()` and are safe.
+  Regression test verified non-vacuous in release (`len (2) != index size (1)`).
+
 ## [7.10.0] - 2026-09-12
 
 ### Added
