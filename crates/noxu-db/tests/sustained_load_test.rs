@@ -335,7 +335,8 @@ fn test_cleaner_reduces_log_files_under_load() {
 
     // Phase 1: initial write of all keys.
     let keys: Vec<String> = (0..KEYS).map(|i| format!("k{i:05}")).collect();
-    let initial_vals: Vec<Vec<u8>> = (0..KEYS).map(|_| vec![b'a'; 100]).collect();
+    let initial_vals: Vec<Vec<u8>> =
+        (0..KEYS).map(|_| vec![b'a'; 100]).collect();
     write_batch(&keys, &initial_vals);
 
     // Phase 2: overwrite each key OVERWRITES times → lots of obsolete LNs.

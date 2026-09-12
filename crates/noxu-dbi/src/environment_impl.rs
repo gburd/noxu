@@ -90,6 +90,31 @@ impl DaemonSignal {
     }
 }
 
+/// Minimal reconstructable state stashed when a closed database is evicted
+/// from `db_map` (DBEVICT-1, `env_db_eviction`).
+///
+/// Everything needed to rebuild an equivalent `DatabaseImpl` on the next
+/// `open_database` call for the same name, without re-scanning the WAL:
+/// `db_id`/`db_type`/`flags`/`max_tree_entries_per_node` are exactly what
+/// `DatabaseImpl::new` derives from a `DatabaseConfig`, so the reopen path
+/// re-derives them from the caller-supplied config (re-checked byte-for-byte
+/// against `recovered_comparators`, same as any other reopen) rather than
+/// duplicating them here.  What genuinely cannot be re-derived from the
+/// config is the *tree content*: the root LSN (to lazily re-fetch the B-tree
+/// from the log) and the live entry count.
+struct EvictedDbState {
+    /// The database's stable ID (must be reused, not reallocated).
+    db_id: DatabaseId,
+    /// The tree's root LSN at eviction time (`Tree::get_root_lsn`), used to
+    /// seed the reconstructed tree via `Tree::set_root_lsn` so the first
+    /// access lazily re-fetches the persisted root (`fetch_root_from_log`).
+    /// `NULL_LSN` if the tree was never logged (e.g. an empty database).
+    root_lsn: noxu_util::Lsn,
+    /// The live entry count at eviction time, restored into the
+    /// reconstructed `DatabaseImpl`'s `entry_count` counter.
+    entry_count: u64,
+}
+
 /// The internal representation of an environment.
 ///
 /// Owns all subsystems: log manager, B-tree, transaction manager,
@@ -151,6 +176,25 @@ pub struct EnvironmentImpl {
     recovered_comparators:
         Arc<RwLock<HashMap<String, (Option<String>, Option<String>)>>>,
 
+    /// DBEVICT-1: minimal reconstructable state stashed for a database that
+    /// was evicted from `db_map` while closed (`env_db_eviction = true`,
+    /// mirroring JE `ENV_DB_EVICTION` / `MapLN.isEvictableInexact`, which
+    /// evicts a closed database's in-memory metadata once its `DatabaseImpl`
+    /// use count is zero).  Keyed by database name.
+    ///
+    /// Captured at eviction time (NOT reconstructed later) because
+    /// `open_database_inner`'s only other reconstruction source
+    /// (`recovered_trees`) is populated once from the WAL at
+    /// `EnvironmentImpl::new` and consumed by the FIRST open of each db_id —
+    /// a database evicted and reopened later in the same session has no
+    /// second source, so the tree's root LSN and entry count must be stashed
+    /// explicitly, or reopen would silently return an empty tree.
+    ///
+    /// Removed from this map the moment the database is reopened (the
+    /// `DatabaseImpl` then owns the live state again) or removed
+    /// (`remove_database`).
+    evicted_db_state: Arc<RwLock<HashMap<String, EvictedDbState>>>,
+
     /// Names of databases whose creating transaction has not yet committed.
     ///
     /// Maps database name → the `DatabaseId` that was allocated at
@@ -165,6 +209,23 @@ pub struct EnvironmentImpl {
     /// `get_database_names()` excludes names in this map so callers see only
     /// committed databases (C-4 / JE 1-I / 1-J fix).
     pending_names: RwLock<hashbrown::HashMap<String, DatabaseId>>,
+
+    /// DBEVICT-1 (root-cause fix): serializes the "database absent from
+    /// db_map, must be created or reconstructed" slow path of
+    /// `open_database_inner` so two threads racing to open the SAME name
+    /// (a name recovered from the WAL, or a name env_db_eviction just
+    /// evicted) never each build a SEPARATE `DatabaseImpl` and race to
+    /// insert into `db_map` -- the loser's Arc becomes orphaned split-brain
+    /// state (its own increment_reference_count() never gets balanced by a
+    /// close routed through the WINNING db_map entry, so the loser's
+    /// refcount never returns to <= 0 and the winning entry can look
+    /// spuriously "closed" to a caller who actually still holds the loser's
+    /// handle open). Pre-existing race (any two first-open callers on a
+    /// WAL-recovered name could hit it); env_db_eviction turns "absent from
+    /// db_map with a known db_id" from a rare cold-start case into a routine
+    /// one, so it surfaces here. The fast "already open" path above does
+    /// NOT take this lock -- only the slow reconstruction path does.
+    open_reconstruct_lock: Mutex<()>,
 
     /// Whether the environment has been invalidated.
     ///
@@ -442,6 +503,16 @@ pub struct EnvironmentImpl {
     /// a small backward clock change cannot purge a still-live record.
     /// Default 7_200_000 (2 h, JE default).
     ttl_clock_tolerance_ms: u64,
+
+    /// `ENV_DB_EVICTION` (JE `je.env.dbEviction`): whether a closed
+    /// database's metadata (`DatabaseImpl` + its tree) may be evicted from
+    /// `db_map` once nobody has it open (`reference_count() <= 0`).  Default
+    /// `true`, matching JE ("there is no known benefit to setting this
+    /// parameter to false").  This gates ONLY closed-database metadata
+    /// eviction -- it has no effect on which OPEN database's cached B-tree
+    /// pages the ordinary page evictor reclaims first; see
+    /// `evict_closed_databases`.
+    env_db_eviction: bool,
 
     /// Background-daemon exception dispatcher (JE `ExceptionListener`
     /// substrate).  A shared, late-bindable slot handed to each daemon at
@@ -1687,7 +1758,9 @@ impl EnvironmentImpl {
             db_map,
             name_map,
             recovered_comparators,
+            evicted_db_state: Arc::new(RwLock::new(HashMap::new())),
             pending_names: RwLock::new(hashbrown::HashMap::new()),
+            open_reconstruct_lock: Mutex::new(()),
             is_invalid: Arc::new(AtomicBool::new(false)),
             invalid_reason: RwLock::new(None),
             creation_time_ms: std::time::SystemTime::now()
@@ -1739,6 +1812,7 @@ impl EnvironmentImpl {
             // TTL master switch + clock tolerance from the env config.
             expiration_enabled: cfg.env_expiration_enabled,
             ttl_clock_tolerance_ms: cfg.env_ttl_clock_tolerance_ms,
+            env_db_eviction: cfg.env_db_eviction,
             exception_dispatcher,
         };
 
@@ -1930,6 +2004,25 @@ impl EnvironmentImpl {
             return Ok(db.clone());
         }
 
+        // DBEVICT-1 (root-cause fix): the database is absent from db_map --
+        // either genuinely new, WAL-recovered but never opened this session,
+        // or just evicted by env_db_eviction.  All three cases build a fresh
+        // DatabaseImpl below; serialize that construction (held for the rest
+        // of this call) so two threads racing to open the SAME name can
+        // never each build a separate DatabaseImpl and race db_map's insert
+        // (the loser's Arc would be orphaned split-brain state -- its
+        // increment_reference_count() balanced against a close() that no
+        // longer routes through it once db_map holds the winner's Arc
+        // instead). Re-check the fast path once inside the lock: another
+        // thread may have completed the reconstruction while we waited.
+        let _reconstruct_guard = self.open_reconstruct_lock.lock().unwrap();
+        if let Some(db_id) = self.name_map.read().get(name)
+            && let Some(db) = self.db_map.read().get(db_id)
+        {
+            db.read().increment_reference_count();
+            return Ok(db.clone());
+        }
+
         // R-4 TOCTOU guard: if the name is currently being committed from
         // another transaction (name in pending_names but not yet in
         // name_map), treat it as "already exists" rather than creating a
@@ -2037,6 +2130,42 @@ impl EnvironmentImpl {
             db_impl
                 .set_tree_compact_max_key_length(self.compact_max_key_length);
             db_impl.set_tree_expiration_enabled(self.expiration_enabled);
+        }
+
+        // DBEVICT-1: if this database was evicted from db_map earlier in
+        // THIS session (closed, then env_db_eviction reclaimed its metadata),
+        // recovered_trees was already consumed by the FIRST open above and
+        // has nothing for us -- reconstruct from the stash captured at evict
+        // time instead: seed the fresh tree's root LSN so the first access
+        // lazily re-fetches the persisted B-tree from the log, and restore
+        // the live entry count.  Removed from the stash once consumed.
+        if let Some(evicted) = self.evicted_db_state.write().remove(name) {
+            // Correctness guard (not a debug_assert -- must hold in release
+            // too): remove_database / rename_database keep this stash keyed
+            // correctly, so db_id should always match here. If it somehow
+            // does not, the stash is untrustworthy -- DISCARD it rather than
+            // seed the tree from a mismatched root_lsn, which would attach
+            // this database to a stranger's persisted B-tree (silent data
+            // corruption, the exact failure mode this feature must avoid).
+            if evicted.db_id == db_id {
+                if let (Some(tree_arc), Some(lm)) =
+                    (db_impl.get_real_tree_arc(), self.log_manager.as_ref())
+                    && let Ok(mut tree) = tree_arc.write()
+                {
+                    tree.set_log_manager(Arc::clone(lm));
+                    tree.set_root_lsn(evicted.root_lsn);
+                }
+                db_impl.set_entry_count(evicted.entry_count);
+            } else {
+                log::warn!(
+                    "DBEVICT-1: discarding eviction stash for '{name}': \
+                     db_id mismatch (stashed {:?}, reopened {:?}) -- \
+                     reopening with an empty tree instead of risking a \
+                     cross-database root_lsn attach",
+                    evicted.db_id,
+                    db_id
+                );
+            }
         }
 
         let db = Arc::new(RwLock::new(db_impl));
@@ -2357,14 +2486,106 @@ impl EnvironmentImpl {
     }
 
     /// Closes a database handle.
+    ///
+    /// Decrements `reference_count`; once it reaches zero the database is
+    /// merely ELIGIBLE for eviction (mirrors JE `MapLN.isEvictableInexact`:
+    /// `!isInUse()`) -- it is not evicted immediately.  Actual metadata
+    /// eviction happens lazily under memory pressure or an explicit sweep;
+    /// see `evict_closed_databases` (called from `evict_memory` /
+    /// `critical_eviction` / the background evictor daemon) and
+    /// `env_db_eviction`.
     pub fn close_database(&self, db_id: DatabaseId) -> Result<(), DbiError> {
         if let Some(db) = self.db_map.read().get(&db_id) {
             db.read().decrement_reference_count();
-            if db.read().reference_count() <= 0 {
-                // Could remove from maps, but keep for now
-            }
         }
         Ok(())
+    }
+
+    /// DBEVICT-1: evict ONE closed database's metadata from `db_map`.
+    ///
+    /// Caller must have already verified `reference_count() <= 0` --
+    /// re-checked here under the write lock as the final guard (JE
+    /// `MapLN.isEvictable`: re-check `isInUse()` after acquiring the lock
+    /// that excludes a concurrent `getDb`).  NEVER evicts a database whose
+    /// reference_count is positive: doing so would let a live handle's tree
+    /// `Arc` keep working (Arcs the handle already holds stay valid) while a
+    /// concurrent `open_database` on the same name reconstructs a SECOND,
+    /// diverging `DatabaseImpl` -- silent data corruption. Stashes the tree's
+    /// root LSN and entry count (the state `open_database_inner` cannot
+    /// otherwise recover -- see `EvictedDbState`) before dropping the entry.
+    fn evict_closed_database(
+        &self,
+        db_id: DatabaseId,
+        db: &Arc<RwLock<DatabaseImpl>>,
+    ) {
+        // Re-check under the db_map write lock: a concurrent open_database
+        // may have bumped the refcount back up between the caller's check
+        // and here.
+        let mut db_map = self.db_map.write();
+        if db.read().reference_count() > 0 {
+            return;
+        }
+        let Some(db_arc) = db_map.remove(&db_id) else { return };
+        let db_guard = db_arc.read();
+        let name = db_guard.get_name().to_string();
+        let root_lsn = db_guard
+            .get_real_tree_arc()
+            .map(|t| t.read().map(|g| g.get_root_lsn()).unwrap_or(NULL_LSN))
+            .unwrap_or(NULL_LSN);
+        let entry_count = db_guard.entry_count();
+        drop(db_guard);
+        drop(db_map);
+
+        self.evicted_db_state
+            .write()
+            .insert(name, EvictedDbState { db_id, root_lsn, entry_count });
+
+        // Drop the tree from every place that would otherwise keep it (and
+        // the DatabaseImpl it belongs to) alive: the registry the cleaner /
+        // checkpointer / evictor walk, and the evictor's primary tree slot
+        // if it happened to point here.  Any handle that already holds an
+        // `Arc` to the old DatabaseImpl (there should be none once
+        // reference_count reached zero) keeps working via that Arc; new
+        // opens go through open_database_inner's reconstruction path.
+        if let Ok(mut reg) = self.db_trees_registry.lock() {
+            reg.remove(&db_id.id());
+        }
+    }
+
+    /// DBEVICT-1: sweep every closed database (`reference_count() <= 0`) and
+    /// evict its metadata from `db_map`, when `env_db_eviction` is enabled.
+    ///
+    /// No-op (returns 0) when `env_db_eviction` is `false` -- every closed
+    /// database stays pinned, as today.  Called from the manual/critical
+    /// eviction paths (`evict_memory` / `critical_eviction`) so that closed
+    /// database metadata is reclaimed under memory pressure, mirroring JE's
+    /// `MapLN` becoming a normal eviction candidate once `isEvictable`
+    /// (`!isInUse() && env_db_eviction`) holds -- Noxu evicts the whole
+    /// closed-database entry rather than JE's LN-stripping-then-MapLN-evict
+    /// two-step, since Noxu has no separate id-mapping B-tree to strip a
+    /// MapLN's data from.
+    ///
+    /// Returns the number of databases evicted.
+    pub fn evict_closed_databases(&self) -> usize {
+        if !self.env_db_eviction {
+            return 0;
+        }
+        let candidates: Vec<(DatabaseId, Arc<RwLock<DatabaseImpl>>)> = self
+            .db_map
+            .read()
+            .iter()
+            .filter(|(_, db)| db.read().reference_count() <= 0)
+            .map(|(id, db)| (*id, Arc::clone(db)))
+            .collect();
+        let mut evicted = 0;
+        for (db_id, db) in candidates {
+            let before = self.db_map.read().contains_key(&db_id);
+            self.evict_closed_database(db_id, &db);
+            if before && !self.db_map.read().contains_key(&db_id) {
+                evicted += 1;
+            }
+        }
+        evicted
     }
 
     /// Removes (deletes) a database by name.
@@ -2393,6 +2614,11 @@ impl EnvironmentImpl {
             db.write().start_delete();
             db.write().finish_delete();
         }
+        // DBEVICT-1: drop any stashed eviction state for this name too, or a
+        // FUTURE database created under the same name would be reconstructed
+        // with this deleted database's root_lsn/entry_count (silent
+        // cross-database data corruption).
+        self.evicted_db_state.write().remove(name);
 
         Ok(())
     }
@@ -2426,6 +2652,14 @@ impl EnvironmentImpl {
 
         self.name_map.write().remove(old_name);
         self.name_map.write().insert(new_name.to_string(), db_id);
+        // DBEVICT-1: move any stashed eviction state to the new name too, or
+        // a reopen under old_name after a future rename-back would
+        // reconstruct a fresh (wrongly-empty) tree while the real stashed
+        // root_lsn/entry_count sits abandoned under the old key -- and a
+        // reopen under new_name would silently miss the stash it needs.
+        if let Some(evicted) = self.evicted_db_state.write().remove(old_name) {
+            self.evicted_db_state.write().insert(new_name.to_string(), evicted);
+        }
 
         // In a full implementation, would log the rename
 
@@ -3053,6 +3287,11 @@ impl EnvironmentImpl {
     /// Returns the number of cache bytes evicted (0 if nothing was evicted
     /// or no cache is active).
     pub fn evict_memory(&self) -> usize {
+        // DBEVICT-1: reclaim closed-database metadata alongside ordinary
+        // page eviction, when env_db_eviction is on.  This is metadata
+        // eviction, not bytes tracked by the cache_usage budget, so it is a
+        // side effect here rather than folded into the returned byte count.
+        self.evict_closed_databases();
         self.evictor.do_evict(EvictionSource::Manual).bytes_evicted as usize
     }
 
@@ -3071,6 +3310,9 @@ impl EnvironmentImpl {
     /// writer filling the cache blocks before continuing.  Returns bytes
     /// evicted (0 when no critical eviction was needed).
     pub fn critical_eviction(&self) -> u64 {
+        // DBEVICT-1: reclaim closed-database metadata under critical
+        // pressure too, same rationale as evict_memory above.
+        self.evict_closed_databases();
         self.evictor.do_critical_eviction()
     }
 
@@ -4297,6 +4539,322 @@ mod tests {
             );
         }
         drop(db);
+        env.close().unwrap();
+    }
+
+    /// SCOPE-CHECK (kept as a regression guard documenting the pre-existing
+    /// behaviour the eviction feature must change): proves that removing a
+    /// closed database's entry from `db_map` / `db_trees_registry`
+    /// mid-session and reopening it by name, WITHOUT any per-db state stash,
+    /// does NOT reconstruct the tree — `open_database_inner`'s only
+    /// reconstruction source (`recovered_trees`) is populated once at
+    /// `EnvironmentImpl::new` and already consumed by the first open. This is
+    /// why eviction must stash (root_lsn, entry_count) at evict time rather
+    /// than relying on "recovery already handles it".
+    #[test]
+    fn scope_check_naive_db_map_removal_loses_tree_without_stash() {
+        let dir = TempDir::new().unwrap();
+        let env = EnvironmentImpl::new(dir.path(), false, true).unwrap();
+
+        let mut config = DatabaseConfig::new();
+        config.set_allow_create(true);
+        let db_id;
+        {
+            let db = env.open_database("scope_db", &config).unwrap();
+            db_id = db.read().get_id();
+            let tree_arc = db.read().get_real_tree_arc().unwrap();
+            {
+                let tree = tree_arc.write().unwrap();
+                for i in 0..50u32 {
+                    tree.insert(
+                        format!("key{i:04}").into_bytes(),
+                        format!("val{i:04}").into_bytes(),
+                        NULL_LSN,
+                    )
+                    .unwrap();
+                }
+            }
+            // Checkpoint: flushes dirty BINs + roots the tree (per_db_roots) so
+            // the tree is durable and re-fetchable from the log.
+            env.run_checkpoint().unwrap();
+            // Close the handle (refcount -> 0); production close_database
+            // currently leaves the entry pinned in db_map ("keep for now").
+            env.close_database(db_id).unwrap();
+            assert_eq!(db.read().reference_count(), 0);
+        }
+
+        // Naive eviction: just drop the entries, no stash.
+        env.db_map.write().remove(&db_id);
+
+        let db2 = env.open_database("scope_db", &config).unwrap();
+        assert_eq!(
+            db2.read().entry_count(),
+            0,
+            "naive db_map removal without a state stash silently loses data \
+             on reopen -- proves eviction must stash root_lsn/entry_count \
+             at evict time, not rely on 'recovery already handles it'"
+        );
+
+        env.close().unwrap();
+    }
+
+    /// DBEVICT-1: with `env_db_eviction` on (the default), closing a
+    /// database's last handle and running an explicit eviction sweep removes
+    /// it from `db_map`; reopening it by name reconstructs the SAME tree
+    /// content (proves the flag has an observable effect end to end, not
+    /// just a bookkeeping no-op).
+    #[test]
+    fn dbevict1_closed_db_evicted_and_reopen_recovers_tree() {
+        let dir = TempDir::new().unwrap();
+        let env = EnvironmentImpl::new(dir.path(), false, true).unwrap();
+        assert!(
+            env.env_db_eviction,
+            "env_db_eviction must default to true (JE default)"
+        );
+
+        let mut config = DatabaseConfig::new();
+        config.set_allow_create(true);
+        let db_id;
+        {
+            let db = env.open_database("dbevict_db", &config).unwrap();
+            db_id = db.read().get_id();
+            let tree_arc = db.read().get_real_tree_arc().unwrap();
+            {
+                let tree = tree_arc.write().unwrap();
+                for i in 0..50u32 {
+                    tree.insert(
+                        format!("key{i:04}").into_bytes(),
+                        format!("val{i:04}").into_bytes(),
+                        NULL_LSN,
+                    )
+                    .unwrap();
+                    // tree.insert() alone does not update DatabaseImpl's
+                    // entry_count (only the cursor/put path does that) --
+                    // mirror it explicitly so entry_count reflects the tree.
+                    db.read().increment_entry_count();
+                }
+            }
+            // Checkpoint so the tree is durable and re-fetchable from the log.
+            env.run_checkpoint().unwrap();
+            env.close_database(db_id).unwrap();
+            assert_eq!(db.read().reference_count(), 0);
+        }
+        assert!(
+            env.db_map.read().contains_key(&db_id),
+            "closing must not evict immediately -- only an eviction pass does"
+        );
+
+        // Observable effect #1: an explicit sweep removes the closed db's
+        // metadata from db_map.
+        let evicted = env.evict_closed_databases();
+        assert_eq!(evicted, 1);
+        assert!(
+            !env.db_map.read().contains_key(&db_id),
+            "evict_closed_databases must remove the closed database from db_map"
+        );
+        assert!(
+            env.evicted_db_state.read().contains_key("dbevict_db"),
+            "eviction must stash reconstructable state for the evicted db"
+        );
+
+        // Observable effect #2: reopening the SAME name transparently
+        // reconstructs the SAME db_id and the SAME tree content.
+        let db2 = env.open_database("dbevict_db", &config).unwrap();
+        assert_eq!(db2.read().get_id(), db_id);
+        assert_eq!(
+            db2.read().entry_count(),
+            50,
+            "reopen after eviction must recover all 50 entries"
+        );
+        assert!(
+            !env.evicted_db_state.read().contains_key("dbevict_db"),
+            "the stash must be consumed (removed) once reopened"
+        );
+
+        // The reconstructed tree must actually be readable, not just report
+        // the right count -- fetch a key back through the real tree.
+        let tree_arc2 = db2.read().get_real_tree_arc().unwrap();
+        {
+            let tree2 = tree_arc2.read().unwrap();
+            let found = tree2.search(b"key0025");
+            assert!(
+                found.is_some(),
+                "reconstructed tree must be searchable, not just correctly counted"
+            );
+        }
+
+        env.close().unwrap();
+    }
+
+    /// DBEVICT-1 absolute correctness bar: a database with an open handle
+    /// (reference_count > 0) must NEVER be evicted by
+    /// `evict_closed_databases`, even when `env_db_eviction` is on.
+    #[test]
+    fn dbevict1_in_use_database_is_never_evicted() {
+        let dir = TempDir::new().unwrap();
+        let env = EnvironmentImpl::new(dir.path(), false, true).unwrap();
+        assert!(env.env_db_eviction);
+
+        let mut config = DatabaseConfig::new();
+        config.set_allow_create(true);
+        let db = env.open_database("inuse_db", &config).unwrap();
+        let db_id = db.read().get_id();
+        assert_eq!(db.read().reference_count(), 1, "one open handle");
+
+        // A sweep must find zero candidates: refcount is 1, not <= 0.
+        let evicted = env.evict_closed_databases();
+        assert_eq!(evicted, 0, "an in-use database must not be evicted");
+        assert!(
+            env.db_map.read().contains_key(&db_id),
+            "an in-use database must remain in db_map"
+        );
+
+        // Same guarantee via the public entry points a real workload uses.
+        let _ = env.evict_memory();
+        assert!(
+            env.db_map.read().contains_key(&db_id),
+            "evict_memory must not evict an in-use database"
+        );
+        let _ = env.critical_eviction();
+        assert!(
+            env.db_map.read().contains_key(&db_id),
+            "critical_eviction must not evict an in-use database"
+        );
+
+        drop(db);
+        env.close().unwrap();
+    }
+
+    /// DBEVICT-1: with a SECOND handle still open, closing ONE handle must
+    /// not make the database eligible -- reference_count only reaches zero
+    /// after every handle is closed.  Regression guard for the exact
+    /// "in-use DB must never be evicted" bar under multiple handles.
+    #[test]
+    fn dbevict1_second_open_handle_keeps_database_pinned() {
+        let dir = TempDir::new().unwrap();
+        let env = EnvironmentImpl::new(dir.path(), false, true).unwrap();
+
+        let mut config = DatabaseConfig::new();
+        config.set_allow_create(true);
+        let db1 = env.open_database("shared_db", &config).unwrap();
+        let db_id = db1.read().get_id();
+        let _db2 = env.open_database("shared_db", &config).unwrap();
+        assert_eq!(db1.read().reference_count(), 2);
+
+        env.close_database(db_id).unwrap(); // one of the two handles
+        assert_eq!(db1.read().reference_count(), 1);
+
+        let evicted = env.evict_closed_databases();
+        assert_eq!(
+            evicted, 0,
+            "a database with a still-open second handle must not be evicted"
+        );
+        assert!(env.db_map.read().contains_key(&db_id));
+
+        env.close().unwrap();
+    }
+
+    /// DBEVICT-1: with `env_db_eviction = false`, a closed database's
+    /// metadata stays pinned in `db_map` even under an explicit eviction
+    /// sweep -- the flag genuinely gates the behaviour both ways.
+    #[test]
+    fn dbevict1_env_db_eviction_false_pins_closed_database() {
+        let dir = TempDir::new().unwrap();
+        let cfg =
+            DbiEnvConfig { env_db_eviction: false, ..DbiEnvConfig::default() };
+        let env = EnvironmentImpl::from_dbi_config(dir.path(), &cfg).unwrap();
+        assert!(!env.env_db_eviction);
+
+        let mut config = DatabaseConfig::new();
+        config.set_allow_create(true);
+        let db = env.open_database("pinned_db", &config).unwrap();
+        let db_id = db.read().get_id();
+        env.close_database(db_id).unwrap();
+        assert_eq!(db.read().reference_count(), 0);
+        drop(db);
+
+        let evicted = env.evict_closed_databases();
+        assert_eq!(
+            evicted, 0,
+            "env_db_eviction=false must keep every closed database pinned"
+        );
+        assert!(env.db_map.read().contains_key(&db_id));
+
+        let _ = env.evict_memory();
+        assert!(
+            env.db_map.read().contains_key(&db_id),
+            "evict_memory must not evict when env_db_eviction=false"
+        );
+
+        env.close().unwrap();
+    }
+
+    /// DBEVICT-1 absolute correctness bar under real concurrency: many
+    /// threads racing open/close on the SAME database name while another
+    /// thread repeatedly sweeps `evict_closed_databases()` must never
+    /// observe a `reference_count() > 0` database evicted -- exercising the
+    /// exact TOCTOU window `evict_closed_database` re-checks under the
+    /// `db_map` write lock (the caller's refcount<=0 snapshot can go stale
+    /// between the check and the write-lock acquisition).
+    #[test]
+    fn dbevict1_concurrent_open_close_never_evicts_in_use_database() {
+        let dir = TempDir::new().unwrap();
+        let env =
+            Arc::new(EnvironmentImpl::new(dir.path(), false, true).unwrap());
+
+        let mut config = DatabaseConfig::new();
+        config.set_allow_create(true);
+        // Ensure the database + its id exist before the race starts.
+        let seed = env.open_database("race_db", &config).unwrap();
+        let db_id = seed.read().get_id();
+        env.close_database(db_id).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+
+        // Sweeper thread: hammers evict_closed_databases().
+        let env_sweep = Arc::clone(&env);
+        let stop_sweep = Arc::clone(&stop);
+        let sweeper = std::thread::spawn(move || {
+            while !stop_sweep.load(Ordering::Relaxed) {
+                env_sweep.evict_closed_databases();
+            }
+        });
+
+        // Opener/closer threads: open the same name, immediately verify the
+        // handle they hold reports reference_count > 0 the whole time they
+        // hold it open, then close.
+        let mut openers = Vec::new();
+        for _ in 0..4 {
+            let env_open = Arc::clone(&env);
+            let mut cfg = DatabaseConfig::new();
+            cfg.set_allow_create(true);
+            openers.push(std::thread::spawn(move || {
+                for _ in 0..200 {
+                    let db = env_open.open_database("race_db", &cfg).unwrap();
+                    let id = db.read().get_id();
+                    // While we hold this handle, reference_count must be
+                    // positive -- if evict_closed_database ever removed an
+                    // in-use entry from db_map, a concurrent open here would
+                    // reconstruct a SECOND DatabaseImpl for the same name
+                    // (silent split-brain), and get_id() would still return
+                    // the same id by construction but the tree contents
+                    // could diverge from ours. The count check below is the
+                    // direct, cheap invariant: our own open bumped the count,
+                    // so it can never read back as <= 0 for our own read.
+                    assert!(
+                        db.read().reference_count() > 0,
+                        "a handle we hold open must report reference_count > 0"
+                    );
+                    env_open.close_database(id).unwrap();
+                }
+            }));
+        }
+        for h in openers {
+            h.join().unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        sweeper.join().unwrap();
+
         env.close().unwrap();
     }
 

@@ -43,8 +43,12 @@ pub struct DbiEnvConfig {
     /// `DOS_PRODUCER_QUEUE_TIMEOUT`: max time the DiskOrderedScan producer
     /// will block trying to enqueue an item before failing the scan.
     pub dos_producer_queue_timeout_ms: u64,
-    /// Reserved / not yet implemented.
-    /// Stored for future use; not read by the evictor.
+    /// `ENV_DB_EVICTION` (JE `je.env.dbEviction`): enable eviction of
+    /// metadata (the `DatabaseImpl` and its cached B-tree) for CLOSED
+    /// databases once nobody has them open.  Does NOT target eviction among
+    /// OPEN databases' cached pages -- that is the ordinary page evictor's
+    /// job, unaffected by this flag.  Default true (JE: there is no known
+    /// benefit to setting this parameter to false).
     pub env_db_eviction: bool,
 
     // -----------------------------------------------------------------------
@@ -274,7 +278,7 @@ impl Default for DbiEnvConfig {
             env_ttl_clock_tolerance_ms: 7_200_000, // JE default 2 h
             env_expiration_enabled: true,          // JE default true
             dos_producer_queue_timeout_ms: 10_000,
-            env_db_eviction: false,
+            env_db_eviction: true, // JE default true
             // Memory
             cache_size: 64 * 1024 * 1024,
             cache_percent: 0,
