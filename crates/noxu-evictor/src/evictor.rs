@@ -653,8 +653,21 @@ impl Evictor {
         let removed = self.primary_policy.remove(node_id)
             || self.scan_policy.remove(node_id);
         if removed {
-            self.pri2.lock().add_back(node_id);
-            self.stats.increment(&self.stats.nodes_moved_to_pri2_lru);
+            // Guard against double-adding: a node can be in the primary policy
+            // AND already in pri2 at once (note_ins_added inserts straight into
+            // primary without consulting pri2, so a node parked in pri2 awaiting
+            // a checkpoint that is re-faulted lands in both). Removing it from
+            // primary above does not remove it from pri2, so an unconditional
+            // add_back would double-link it -- SlabList::add_back only
+            // debug_asserts the already-present case, silently corrupting the
+            // list in release. Same class as the two MoveDirtyToPri2 add_front
+            // sites and the third dirty-BIN arm; guarded the same way.
+            let mut pri2 = self.pri2.lock();
+            if !pri2.contains(node_id) {
+                pri2.add_back(node_id);
+                drop(pri2);
+                self.stats.increment(&self.stats.nodes_moved_to_pri2_lru);
+            }
         }
         removed
     }
@@ -2435,6 +2448,42 @@ mod tests {
     // -----------------------------------------------------------------------
     // move_to_pri2 and complete_checkpoint_for_node
     // -----------------------------------------------------------------------
+
+    /// `move_to_pri2` on a node that is in the primary policy AND already in
+    /// pri2 must not double-link it into pri2.
+    ///
+    /// This is the third site of the pri2 double-add corruption (after the two
+    /// MoveDirtyToPri2 add_front arms and the dirty-BIN second-chance arm).
+    /// `move_to_pri2` removes from primary then add_back's to pri2, but a node
+    /// can legitimately be in both lists (note_ins_added inserts into primary
+    /// without consulting pri2). Removing from primary does not remove from
+    /// pri2, so an unguarded add_back double-links. Asserts list integrity
+    /// (`len == index.len()`), the invariant SlabList::add_back's debug_assert
+    /// protects in debug but silently violates in release.
+    #[test]
+    fn move_to_pri2_on_node_already_in_pri2_does_not_double_add() {
+        let usage = Arc::new(AtomicI64::new(0));
+        let e = Evictor::new(Arbiter::new(1000, usage, 100, 200), 100, false);
+        // In the primary policy AND already parked in pri2.
+        e.note_ins_added(7, CacheMode::Default);
+        e.pri2_insert_for_test(7);
+        assert!(e.primary_policy.contains(7));
+        assert!(e.pri2.lock().contains(7));
+
+        // Removes from primary, then must NOT re-add to pri2 (already there).
+        e.move_to_pri2(7);
+
+        let p = e.pri2.lock();
+        assert_eq!(
+            p.len,
+            p.index.len(),
+            "pri2 len ({}) != index size ({}) -- move_to_pri2 double-linked a \
+             node already in pri2, orphaning a slot",
+            p.len,
+            p.index.len()
+        );
+        assert!(p.len <= 1, "pri2 holds {} entries for one node", p.len);
+    }
 
     #[test]
     fn test_move_to_pri2() {
