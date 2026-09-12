@@ -31,7 +31,7 @@ mod env_failure_reason;
 mod env_state;
 mod environment_impl;
 mod error;
-mod file_manager_scanner;
+pub mod file_manager_scanner;
 mod get_mode;
 mod memory_budget;
 pub mod name_ln_codec;
@@ -61,6 +61,7 @@ pub use disk_ordered_cursor_impl::{
 pub use env_failure_reason::EnvironmentFailureReason;
 pub use env_state::EnvState;
 pub use environment_impl::EnvironmentImpl;
+pub use file_manager_scanner::FileManagerLogScanner;
 pub use replica_replay::ReplicaReplay;
 pub use trigger::Trigger;
 // EV-15: re-export the evictor so noxu-db can cache an Arc<Evictor> for

@@ -13,6 +13,7 @@ For dense per-release context (sprint and wave attribution, audit
 finding IDs, full test-gate counts), see the annotated git tags
 (`git tag -l vX.Y.Z --format='%(contents)'`) and the per-wave reports
 listed in [References](#references).
+
 ## [Unreleased]
 
 ### Added
@@ -40,6 +41,97 @@ listed in [References](#references).
   chain fully draining — the release-before-dequeue RAII ordering that, if
   inverted, livelocks rather than crashes). `env_fair_latches` is removed
   from the `unimplemented_params` WARN registry.
+
+- **Gap A, step 1+2: live WAL re-scan `TxnChain` source for HA syncup
+  rollback (diagnostic wiring only, refusal NOT narrowed).** Adds
+  `noxu-rep::stream::live_txn_chain` — `build_live_chain`/
+  `build_live_chain_unbounded`/`build_tail_chains`, a pure, unit-tested
+  function that re-scans a replica's own WAL for one transaction's LN
+  logrecs and feeds them into the already-existing, unit-tested
+  `noxu_recovery::TxnChain::build` (port of JE `TxnChain`'s constructor,
+  `com.sleepycat.je.txn.TxnChain`). A re-scan is required rather than a
+  rewire of live state because Noxu's on-disk `LnLogEntry` format has no
+  "prev LSN of same txn" pointer for `ReplayTxn.undoWrites`-style backward
+  chasing — a forward scan filtering by `txn_id` is the only way to
+  reconstruct a transaction's chain from the WAL once `ReplicaReplay`'s
+  in-memory buffer for it has been dropped (on commit or abort). Wired
+  into `ReplicatedEnvironment::syncup_with_feeder` **diagnostically only**:
+  for a `RollbackToMatchpoint` decision, it computes and logs a live
+  `TxnChain` per txn id in the diverged tail, but `classify_tail`'s verdict
+  is computed independently and is never overridden by this block. A new
+  test (`test_computed_revert_set_is_correct_for_a_still_refused_tail`)
+  proves the computed revert set is correct for a tail that stays refused.
+  **The default-deny refusal in `classify_tail`/`verify_rollback` is
+  UNCHANGED** — narrowing it is not attempted this round; see
+  `docs/src/operations/known-limitations.md`'s Gap A entry for the
+  per-case argument for why this codebase's current architecture cannot
+  soundly admit any currently-refused case via a value-revert mechanism
+  (a committed txn's LNs can never reach the admit branch at all; an
+  active txn's LNs were never applied to the tree, so dropping the buffer
+  already is a complete rollback; a non-transactional LN carries no
+  on-disk abort/before-image fields to revert from; a structural entry's
+  hazard is not a value-revert problem).
+
+### Changed
+
+- **Obsolete-LN counting is now ON BY DEFAULT; the `NOXU_COUNT_*` gates are
+  removed.** v7.9.1 fixed the counting but shipped it gated because per-commit
+  counting took a global tracker mutex once per commit (~33× throughput cost).
+  This batches the obsolete-LSN merge per transaction and — the larger win —
+  moves the shared-tracker acquisition to AFTER the per-record write locks are
+  released, removing a lock convoy rather than merely amortising the mutex.
+  Throughput with counting on is now ~100k ops/s on a loaded box (the gated-off
+  default was 267k–318k on an idle one; a clean-hardware A/B is still owed).
+
+  **The space win is smaller than v7.9.1's gated measurement implied, and the
+  discrepancy was a measurement bug worth recording.** v7.9.1 reported ~12×
+  (2,126 MB → 187 MB). That 187 MB was an artifact: with counting forced on but
+  ungated, a latent double-commit-frame bug (see below) forced a synchronous
+  fsync per commit regardless of the caller's `NO_SYNC` setting, so only ~15k
+  writes landed in the benchmark window instead of ~1.4M — the small footprint
+  was fewer writes, not better reclamation. On corrected HEAD, the same workload
+  writes ~1.27M records and lands at ~640–670 MB vs ~1,060–1,140 MB with counting
+  off: **~1.6–1.7×**, not 12×. Byte measurements are contention-immune so these
+  are trustworthy; the honest figure is recorded rather than the flattering one.
+
+### Fixed
+
+- **`env_db_eviction` implemented (JE-faithful closed-database metadata
+  eviction); prior doc conflation corrected.** `env_db_eviction` was settable
+  but inert (WARN on set, no effect), and `known-limitations.md`'s wording
+  ("per-database node eviction") described the wrong feature -- a misreading
+  that this fix corrects. JE's actual semantics
+  (`EnvironmentConfig.ENV_DB_EVICTION` javadoc): "enable eviction of metadata
+  for closed databases"; default `true`, immutable; "there is no known
+  benefit to setting this parameter to false". It gates whether a CLOSED
+  database's `DatabaseImpl` (name/config/comparator identity, cached
+  B-tree) can leave the open-database map once nobody has it open -- it has
+  nothing to do with targeting eviction among OPEN databases' cached pages.
+  Implemented: once a database's last handle is closed
+  (`reference_count() <= 0`), it becomes eligible for eviction;
+  `evict_closed_databases()` (wired into `evict_memory()` /
+  `critical_eviction()`) removes it from `db_map`, stashing the tree's root
+  LSN and live entry count so a subsequent `open_database()` for the same
+  name transparently reconstructs it from the persisted catalog. A database
+  with any open handle is never evicted -- verified by dedicated tests
+  (`dbevict1_in_use_database_is_never_evicted`,
+  `dbevict1_second_open_handle_keeps_database_pinned`). Default changed
+  `false` -> `true` (matching JE) in `EnvironmentConfig` / `DbiEnvConfig`.
+  Removed the `unimplemented_params.rs` registry entry and its WARN test.
+  Rewrote the misleading rustdoc on `EnvironmentConfig::env_db_eviction` /
+  `set_env_db_eviction` and the `known-limitations.md` row.
+
+- **Explicit transactions wrote TWO commit frames once the inner `Txn` gained a
+  `LogManager`.** Attaching a `LogManager` to the inner `noxu_txn::Txn` (needed so
+  it can merge obsolete LSNs) made its own `commit()`/`abort()` write a
+  `TxnCommit`/`TxnAbort` WAL frame in addition to the one the outer
+  `noxu_db::Transaction` wrapper already writes — under a second, colliding txn-id
+  namespace, hardcoded to `CommitSync`, and blind to the caller's `read_only`
+  flag. Latent until the gate removal made it fire by default. Fixed with a
+  suppress-own-end-frame flag set only when an outer wrapper owns the frame; the
+  auto-commit path (`Database::put`/`del`, no wrapper) was never affected.
+  Regression-tested by `txn_end_frame_dedup_test` (exactly one frame per op),
+  verified non-vacuous.
 
 ## [7.9.1] - 2026-09-10
 
@@ -705,6 +797,24 @@ breaking cleanup ships as 7.x while there are no downstream users.
   The group-commit / `FsyncManager` piggyback machinery is untouched.
 
 ### Testing
+
+- **Both remaining CI flakes addressed at the timing assumption behind them.**
+  `xa::test_concurrent_prepared_log_stress` took 57.95 s in debug — under
+  nextest's 120 s cap alone but close enough that full-workspace CPU contention
+  pushed it over, which matches the evidence (never reproduced in isolation across
+  ~20 attempts, only in full runs). Cycles now scale with the build profile (50
+  debug / 200 release): debug 57.95 s → 8.36 s, release still runs the full
+  workload, and the whole `noxu-xa` suite drops to 34.5 s with no SLOW flags. Its
+  harness also now reports each worker thread's panic payload and commit count
+  instead of collapsing every failure into an opaque `join().unwrap()` — every XA
+  entry point does `branches.lock().unwrap()`, so one panicking thread poisons the
+  mutex and buries the original cause under collateral panics.
+  `dst_crash_sweep::dst_same_seed_reproduces_exactly` waited a hard-coded 600 ms
+  for its crash worker then silently `kill()`ed it; a killed worker stops at an
+  arbitrary point, so the test's two same-seed runs were compared at *different*
+  crash points and reported "determinism broken" with the engine blameless. The
+  wait is now a 30 s deadline and a kill is an explicit test failure that says so.
+  Verified 0/15 failures under synthetic load (load average 20.6).
 
 - **`noxu-dbi` and `noxu-db` raised over the >85% coverage mandate on
   region / function / line.** These were the last two crates below target.

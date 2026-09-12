@@ -93,4 +93,28 @@ pub trait LogWriteObserver: Send + Sync {
     /// The `ObsoleteLsn` carries the obsolete LSN, the owning DB id, the size,
     /// the LN/IN flag, and which `countObsolete*` variant to apply.
     fn count_obsolete(&self, obsolete: ObsoleteLsn);
+
+    /// Counts a batch of obsolete LSNs, taking any internal lock ONCE for
+    /// the whole batch rather than once per entry.
+    ///
+    /// This is the piece JE's `LocalUtilizationTracker` /
+    /// `BaseLocalUtilizationTracker.transferToUtilizationTracker` provides:
+    /// many locally-accumulated updates merged into the shared tracker under
+    /// a single lock acquisition. Noxu's per-commit accumulation already
+    /// lives in `Txn::write_locks` (no separate local-tracker type is
+    /// needed — see `docs/src/internal/space-amplification-2026-09.md`
+    /// Phase 4), so this is the batched MERGE half of that pattern: the
+    /// caller (`LogManager::count_obsolete_commit_lsns`) hands over the
+    /// whole per-commit list at once.
+    ///
+    /// Default implementation falls back to one [`Self::count_obsolete`]
+    /// call per entry, so existing implementors of this trait keep working
+    /// unchanged; [`crate::LogWriteObserver`] implementors that back a
+    /// lock-protected tracker (e.g. `UtilizationTrackerObserver`) should
+    /// override this to take their lock exactly once.
+    fn count_obsolete_batch(&self, obsolete: &[ObsoleteLsn]) {
+        for &o in obsolete {
+            self.count_obsolete(o);
+        }
+    }
 }

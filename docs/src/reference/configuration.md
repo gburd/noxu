@@ -203,6 +203,18 @@ All three knobs are installed process-globally at `Environment::open` via
 defaults sees exactly the pre-7.1 latch behaviour (a 5 s acquire timeout, no
 yields, barging admission).
 
+## Closed-database metadata eviction (`env_db_eviction`)
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `env_db_eviction` | `bool` | `true` | **Implemented.** Enables eviction of metadata for CLOSED databases. Once a database's last open handle is closed (`reference_count() <= 0`), its `DatabaseImpl` and cached B-tree become eligible for eviction from the open-database map; an eviction pass (`Environment::evict_memory`, or the critical-eviction back-pressure path) reclaims it, stashing the tree's root LSN and entry count so the next `open_database()` call for the same name transparently reconstructs it from the persisted catalog. A database with any open handle is never evicted, regardless of this setting. JE: `ENV_DB_EVICTION` (`EnvironmentConfig.ENV_DB_EVICTION` javadoc: "there is no known benefit to setting this parameter to false"). Immutable (set at open, not tunable on a running env). |
+
+This does **not** control which *open* database's cached B-tree pages the
+ordinary page evictor reclaims first -- every open database's pages are
+treated identically by the page evictor regardless of `env_db_eviction`. An
+earlier revision of this document conflated the two; that reading was wrong
+and has been corrected (see `docs/src/operations/known-limitations.md`).
+
 ## Replication Parameters
 
 Replication is configured on `RepConfig` / `RepConfigBuilder`, not

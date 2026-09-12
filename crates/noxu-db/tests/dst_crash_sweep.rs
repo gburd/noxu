@@ -251,14 +251,31 @@ fn dst_same_seed_reproduces_exactly() {
             .env("NOXU_DST_SEED", s.to_string())
             .spawn()
             .expect("spawn");
-        // Wait for the worker (it self-exits on the torn write).
+        // Wait for the worker, which self-exits when it hits the torn write.
+        //
+        // The budget here is deliberately generous, and killing the child is
+        // treated as a TEST FAILURE rather than a normal path. That distinction
+        // is the whole point: this test runs the same seed twice and asserts the
+        // recovered state matches. If a slow child gets killed mid-write, it is
+        // killed at a DIFFERENT point in each run, so the two snapshots differ
+        // and the assertion reports "determinism broken" when the engine was
+        // never at fault.
+        //
+        // The previous budget was a hard-coded 600 ms followed by a silent
+        // `child.kill()`, which is exactly that failure mode -- and this test's
+        // reported flakiness (it has never reproduced in ~1,000 isolated
+        // attempts, only ever under full-workspace load) fits a scheduling
+        // artifact far better than a real non-determinism bug.
+        const WORKER_BUDGET: Duration = Duration::from_secs(30);
         let mut waited = Duration::ZERO;
+        let mut had_to_kill = false;
         loop {
             match child.try_wait().unwrap() {
                 Some(_) => break,
-                None if waited >= Duration::from_millis(600) => {
+                None if waited >= WORKER_BUDGET => {
                     let _ = child.kill();
                     let _ = child.wait();
+                    had_to_kill = true;
                     break;
                 }
                 None => {
@@ -267,6 +284,16 @@ fn dst_same_seed_reproduces_exactly() {
                 }
             }
         }
+        assert!(
+            !had_to_kill,
+            "crash worker did not self-exit on the torn write within {:?} (seed \
+             {s}). This is an environment/timing failure, NOT a determinism \
+             failure: a killed worker stops at an arbitrary point, so the two \
+             runs would be compared at different crash points. Re-run on a less \
+             loaded machine, or investigate why the worker never reached its \
+             fault injection point.",
+            WORKER_BUDGET
+        );
         recover_snapshot(&dir_path).expect("recover")
     };
 

@@ -45,13 +45,24 @@
 //!   `noxu_shuttle`-gated `crates/noxu-latch/tests/shuttle_fair_latch.rs`
 //!   model. JE ref: `EnvironmentConfig.ENV_FAIR_LATCHES` / `setFairLatches`.
 //! - **`env_expiration_enabled`, `env_ttl_clock_tolerance_ms`,
-//!   `cleaner_expiration_enabled` — graduated in 7.5.4** when TTL / record
-//!   expiration was implemented end to end (put → BIN/LN → read-skip → cleaner
-//!   reclaim → recovery). Proven honored by
+//!   `cleaner_expiration_enabled` -- graduated in 7.5.4** when TTL / record
+//!   expiration was implemented end to end (put -> BIN/LN -> read-skip ->
+//!   cleaner reclaim -> recovery). Proven honored by
 //!   `crates/noxu-db/tests/ttl_expiration_test.rs` (expiry visibility, day
 //!   granularity, and recovery-survival) plus the tree/cleaner/recovery unit
 //!   coverage; JE refs `EnvironmentImpl.isExpired` / `BIN.isExpired` /
 //!   `ExpirationTracker` / `RecoveryManager.redo`.
+//! - **`env_db_eviction` -- graduated in DBEVICT-1.** The prior entry claimed
+//!   'per-database node eviction' (choosing which OPEN database's cached
+//!   pages get reclaimed first); that reading was WRONG and traced to a
+//!   `known-limitations.md` mischaracterisation. JE's actual semantics
+//!   (`EnvironmentConfig.ENV_DB_EVICTION` javadoc): eviction of metadata for
+//!   CLOSED databases -- gates whether a closed `DatabaseImpl`'s catalog
+//!   entry (name/config/root LSN) can leave `db_map` once nobody has it
+//!   open. Now wired in `EnvironmentImpl::close_database` /
+//!   `evict_closed_databases`; proven by the `dbevict1_*` tests in
+//!   `crates/noxu-dbi/src/environment_impl.rs` (closed-db eviction + reopen
+//!   reconstruction, and the in-use / `env_db_eviction=false` guards).
 
 use crate::environment_config::EnvironmentConfig;
 
@@ -75,11 +86,10 @@ pub static UNIMPLEMENTED_ENV_PARAMS: &[UnimplementedParam] = &[
     // `ExclusiveLatch`/`SharedLatch` acquire/release paths via a per-latch
     // `FairQueue` FIFO admission queue. See the graduation audit trail note
     // above and `crates/noxu-latch/tests/fair_latch_fifo_test.rs`.
-    UnimplementedParam {
-        name: "env_db_eviction",
-        // default = false; non-default means true
-        is_non_default: |c| c.env_db_eviction,
-    },
+    //
+    // NOTE: `env_db_eviction` also graduated out of this registry (DBEVICT-1)
+    // -- see the graduation audit trail note above and the `dbevict1_*` tests
+    // in `crates/noxu-dbi/src/environment_impl.rs`.
     // ---------------------------------------------------------------------
     // DBI-14 inert-flag sweep (2026-06-23): the following EnvironmentConfig
     // fields have a setter+field but ZERO runtime read sites.  They are
@@ -164,17 +174,6 @@ mod tests {
                 param.name,
             );
         }
-    }
-
-    #[test]
-    fn env_db_eviction_warn_on_true() {
-        let mut c = env_default();
-        c.set_env_db_eviction(true);
-        let p = UNIMPLEMENTED_ENV_PARAMS
-            .iter()
-            .find(|p| p.name == "env_db_eviction")
-            .unwrap();
-        assert!((p.is_non_default)(&c));
     }
 
     #[test]

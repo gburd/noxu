@@ -84,6 +84,30 @@ const IMPORTUNATE: u8 = 8;
 /// commit/abort record for every auto-commit op.  Closes the first F12
 /// residual.
 const IS_AUTO_TXN: u8 = 16;
+/// This `Txn` is owned by an external wrapper (`noxu_db::Transaction`) that
+/// already writes its own `TxnCommit` / `TxnAbort` / `TxnPrepare` WAL frame,
+/// with its own fsync policy derived from the caller's [`Durability`] choice.
+///
+/// A `Txn` needs a `LogManager` reference for TXN-1 (merging obsolete abort
+/// LSNs into the shared `UtilizationTracker` on commit) even when it is
+/// wrapped this way. Before that LogManager was attached unconditionally
+/// (`NOXU_COUNT_TXN_OBSOLETE` gate, since removed), this was moot: a `Txn`
+/// with no `LogManager` silently no-ops every `log_entry` call ([`Self::log_entry`]
+/// returns `Ok(NULL_LSN)` without a `LogManager`), so its own would-be
+/// `TxnCommit`/`TxnAbort`/`TxnPrepare` writes were dead code by construction.
+/// Attaching a real `LogManager` for the obsolete-merge feature un-silences
+/// those writes too, producing a SECOND frame (wrong durability -- always
+/// `Durability::CommitSync` regardless of the caller's actual choice -- and a
+/// colliding-possible txn-id namespace, since the outer `Environment` and the
+/// inner `TxnManager` each allocate ids from 1) for every commit/abort/prepare
+/// under an outer wrapper. This flag says "skip writing any frame or fsync of
+/// your own; the outer wrapper already did both" while still allowing
+/// [`Self::log_manager`]-gated obsolete-LSN collection/merge to run.
+///
+/// Set by [`crate::TxnManager::begin_txn_with_log_manager`], whose only
+/// production caller (`EnvironmentImpl::begin_txn`) is always wrapped by
+/// exactly such an outer `Transaction`.
+const SUPPRESS_OWN_END_FRAME: u8 = 32;
 
 /// A Txn is the internal representation of a transaction.
 ///
@@ -218,6 +242,11 @@ struct PendingCommit {
     assigned_lsn: Lsn,
     /// The durability barrier still owed after the write locks are released.
     pending_sync: PendingSync,
+    /// Obsolete abort-LSNs collected while `self.write_locks` was still
+    /// intact (TXN-1), to be merged into the shared `UtilizationTracker`
+    /// AFTER the per-record write locks are released. See
+    /// `Txn::collect_obsolete_abort_lsns` / `Txn::merge_obsolete_lsns`.
+    obsolete_lsns: Vec<(Lsn, Option<u32>, i32)>,
 }
 
 /// The fsync still owed by the commit *durable* phase after the WAL append.
@@ -330,6 +359,29 @@ impl Txn {
     /// Same semantics as `with_group_commit()` but works on `&mut self`.
     pub fn set_group_commit(&mut self, gc: Arc<dyn GroupCommit>) {
         self.group_commit = Some(gc);
+    }
+
+    /// Marks this `Txn` as owned by an external wrapper that already writes
+    /// its own `TxnCommit` / `TxnAbort` / `TxnPrepare` WAL frame and its own
+    /// fsync, with its own [`Durability`] policy.
+    ///
+    /// After this call, [`Self::commit_with_durability`], [`Self::abort`],
+    /// [`Self::abort_collect_undo`], [`Self::prepare`],
+    /// [`Self::resolved_commit_after_prepare`], and
+    /// [`Self::resolved_abort_after_prepare`] still run their lock/undo/
+    /// obsolete-LSN-merge bookkeeping, but skip writing their own WAL frame
+    /// and skip their own fsync — see [`SUPPRESS_OWN_END_FRAME`]'s doc comment
+    /// for why this exists (it does not exist to change any correctness
+    /// property this `Txn` type provides on its own; it exists because
+    /// giving a wrapped `Txn` a `LogManager`, which TXN-1 obsolete-LSN
+    /// merging needs, un-silences writes the wrapper already performs).
+    pub(crate) fn set_suppress_own_end_frame(&mut self) {
+        self.txn_flags |= SUPPRESS_OWN_END_FRAME;
+    }
+
+    /// Returns whether [`Self::set_suppress_own_end_frame`] was called.
+    fn suppress_own_end_frame(&self) -> bool {
+        self.txn_flags & SUPPRESS_OWN_END_FRAME != 0
     }
 
     /// Creates a new transaction wired to a LogManager.
@@ -537,7 +589,7 @@ impl Txn {
         // (LSN assigned + buffer slot reserved), but does NOT yet fsync.  On
         // any `?` failure here the write locks are still held, so the epilogue
         // drains them and flips to MustAbort.
-        let PendingCommit { assigned_lsn, pending_sync } =
+        let PendingCommit { assigned_lsn, pending_sync, obsolete_lsns } =
             match self.commit_append_phase() {
                 Ok(pending) => pending,
                 Err(e) => {
@@ -603,6 +655,14 @@ impl Txn {
         }
         self.write_locks.clear();
 
+        // TXN-1 merge: apply the abort-LSN batch collected in Phase 1 into
+        // the shared UtilizationTracker now that the per-record write locks
+        // are released. This is the ordering fix that removes the convoy
+        // between a hot per-record lock and the contended global tracker
+        // mutex — see `docs/src/internal/space-amplification-2026-09.md`
+        // Phase 4 and `Self::collect_obsolete_abort_lsns`'s doc comment.
+        self.merge_obsolete_lsns(&obsolete_lsns);
+
         // ── Phase 2: durability barrier ─────────────────────────────────
         // The committer STILL blocks here until the fsync makes the commit
         // record durable — success is returned to the caller only after this.
@@ -626,8 +686,31 @@ impl Txn {
     /// — that is [`Self::commit_durable_phase`], which runs AFTER write locks
     /// are released (Fix 3a).  Any `?` failure leaves write locks held so the
     /// caller's epilogue can drain them.
+    ///
+    /// Also COLLECTS (but does not yet merge) the obsolete abort-LSNs this
+    /// commit makes reclaimable (TXN-1): see `PendingCommit::obsolete_lsns`.
+    /// The merge into the shared `UtilizationTracker` is deferred to the
+    /// caller, AFTER the write locks are released, so the (contended)
+    /// global-tracker mutex is never awaited while a hot per-record lock is
+    /// still held — see `docs/src/internal/space-amplification-2026-09.md`
+    /// Phase 4.
     fn commit_append_phase(&mut self) -> Result<PendingCommit, TxnError> {
         if self.has_logged_entries() && !self.is_auto_txn() {
+            if self.suppress_own_end_frame() {
+                // Owned by an outer wrapper (`noxu_db::Transaction`) that
+                // already wrote its own TxnCommit frame and will run its own
+                // fsync with the caller's actual Durability choice. Skip
+                // writing a second frame and skip this Txn's own fsync
+                // (`PendingSync::None`), but still collect the obsolete-LSN
+                // batch — the only reason this Txn has a LogManager at all.
+                // See `SUPPRESS_OWN_END_FRAME`'s doc comment.
+                let obsolete_lsns = self.collect_obsolete_abort_lsns();
+                return Ok(PendingCommit {
+                    assigned_lsn: NULL_LSN,
+                    pending_sync: PendingSync::None,
+                    obsolete_lsns,
+                });
+            }
             if let Some(ref hook) = self.pre_commit_hook {
                 hook();
             }
@@ -643,14 +726,13 @@ impl Txn {
                 self.log_entry(LogEntryType::TxnCommit, &payload, false)?;
 
             // TXN-1: the prior versions of every record this txn overwrote
-            // become reclaimable on commit.  Count each write-lock's abort
-            // LSN obsolete through the tracker.
+            // become reclaimable on commit. Collect each write-lock's abort
+            // LSN here, while `self.write_locks` is still intact; the merge
+            // into the shared tracker happens after the write-lock release
+            // (see this method's doc comment and `Self::merge_obsolete_lsns`).
             // JE Txn.getObsoleteLsnInfo -> LogManager counts each
             // obsoleteWriteLockInfo via countObsoleteNode under the LWL.
-            //
-            // Runs BEFORE the write locks are released (Fix 3a) so the
-            // WriteLockInfo abort-LSN set is still intact here.
-            self.count_obsolete_abort_lsns();
+            let obsolete_lsns = self.collect_obsolete_abort_lsns();
 
             if let Some(ref hook) = self.post_commit_hook {
                 hook(commit_lsn);
@@ -658,6 +740,7 @@ impl Txn {
             Ok(PendingCommit {
                 assigned_lsn: commit_lsn,
                 pending_sync: PendingSync::Commit { commit_lsn },
+                obsolete_lsns,
             })
         } else if self.is_auto_txn() && self.has_logged_entries() {
             // Auto-commit (synthetic auto-txn): no `TxnCommit` WAL entry is
@@ -667,53 +750,25 @@ impl Txn {
 
             // The prior versions this op overwrote are now unreachable and must
             // be counted obsolete, exactly as the explicit-txn arm above does.
-            //
-            // This arm previously skipped it, and because `Database::put`/`del`
-            // wrap EVERY call in a synthetic auto-txn, that meant the dominant
-            // write path never told the cleaner's UtilizationTracker about any
-            // garbage at all: overwrite a record a thousand times and its file
-            // still reported ~100 % utilization, so the cleaner daemon
-            // (`force=false`) never selected it regardless of `min_utilization`.
-            // Only `Environment::clean_log()` reclaimed anything, because it
-            // passes `force=true` and bypasses the utilization test entirely.
-            //
-            // Runs BEFORE write locks are released, while the WriteLockInfo
-            // abort-LSN set is still intact (same ordering constraint as the
-            // explicit-txn arm).
-            //
-            // GATED OFF BY DEFAULT, and the reason is a measured throughput
-            // cliff rather than any doubt about correctness. Every counted LSN
-            // takes the global tracker mutex
-            // (`UtilizationTrackerObserver::count_obsolete` ->
-            // `self.tracker.lock()`), and on the auto-commit path that is once
-            // per user operation. Measured on ycsb_a, 8 threads, 100k records:
-            //
-            //   counting off (today):  266,102 ops/s, 2,120 MB on disk
-            //   counting on:             7,600 ops/s,   187 MB on disk
-            //
-            // So it buys an 11.3x space reduction for a 35x throughput
-            // regression. Neither side of that trade is acceptable as a default.
-            //
-            // The fix is the piece JE has and we do not: a
-            // `LocalUtilizationTracker` (JE `LocalUtilizationTracker` /
-            // `BaseLocalUtilizationTracker`) that accumulates per-thread and
-            // merges in batches, so the shared mutex is taken once per batch
-            // instead of once per operation. Until that exists, enable this only
-            // to reproduce or measure the space behaviour.
-            if std::env::var_os("NOXU_COUNT_AUTOCOMMIT_OBSOLETE").is_some() {
-                self.count_obsolete_abort_lsns();
-            }
+            // `Database::put`/`del` wrap EVERY call in a synthetic auto-txn,
+            // so this is the dominant write path for telling the cleaner's
+            // UtilizationTracker about garbage. Collected here (write_locks
+            // still intact); merged after the write-lock release, same as the
+            // explicit-txn arm above.
+            let obsolete_lsns = self.collect_obsolete_abort_lsns();
 
             Ok(PendingCommit {
                 assigned_lsn: NULL_LSN,
                 pending_sync: PendingSync::Ln {
                     ln_lsn: Lsn::from_u64(self.last_lsn),
                 },
+                obsolete_lsns,
             })
         } else {
             Ok(PendingCommit {
                 assigned_lsn: NULL_LSN,
                 pending_sync: PendingSync::None,
+                obsolete_lsns: Vec::new(),
             })
         }
     }
@@ -1022,7 +1077,8 @@ impl Txn {
         }
     }
 
-    /// TXN-1: counts the abort versions of this txn's write locks obsolete.
+    /// TXN-1: collects the abort versions of this txn's write locks that
+    /// are reclaimable, WITHOUT merging them into the shared tracker yet.
     ///
     /// JE `Txn.getObsoleteLsnInfo` + `maybeCountObsoleteLSN`: for each write
     /// lock, the prior (abort) version becomes reclaimable on commit and is
@@ -1030,7 +1086,7 @@ impl Txn {
     /// counted at logging time.  The filters applied here:
     ///
     /// - skip NULL abort LSN or `abort_known_deleted` (nothing reclaimable);
-    /// - skip `abort_data.is_some()` (embedded — already counted at logging);
+    /// - skip `abort_counted_at_log_time` (already counted at logging);
     /// - de-duplicate by abort LSN (a txn may touch the same record twice).
     ///
     /// ponytail: the JE `db.isLNImmediatelyObsolete()` filter (dup-DB LNs
@@ -1039,10 +1095,20 @@ impl Txn {
     /// double-count the abort LSN obsolete, which only makes a file *more*
     /// cleanable (never deletes live data); it is conservative.  Restore the
     /// filter when the txn can resolve `database_id -> isLNImmediatelyObsolete`.
-    fn count_obsolete_abort_lsns(&self) {
-        let Some(lm) = &self.log_manager else {
-            return;
-        };
+    ///
+    /// Split from the actual merge (see [`Self::merge_obsolete_lsns`]) so the
+    /// caller can collect while `self.write_locks` is still intact and defer
+    /// the shared-tracker-mutex acquisition to AFTER the per-record write
+    /// locks are released (Fix 3a's ordering) — see
+    /// `docs/src/internal/space-amplification-2026-09.md` Phase 4 for why
+    /// that ordering matters: without it, a hot per-record lock is held for
+    /// the full duration of a contended global-mutex wait, which is the
+    /// mechanism behind the measured throughput cliff, not the mutex
+    /// acquisition count by itself.
+    fn collect_obsolete_abort_lsns(&self) -> Vec<(Lsn, Option<u32>, i32)> {
+        if self.log_manager.is_none() {
+            return Vec::new();
+        }
         let mut seen: HashSet<u64> = HashSet::new();
         let mut infos: Vec<(Lsn, Option<u32>, i32)> = Vec::new();
         for wli in self.write_locks.values() {
@@ -1077,8 +1143,27 @@ impl Txn {
                 wli.abort_log_size,
             ));
         }
-        if !infos.is_empty() {
-            lm.count_obsolete_commit_lsns(&infos);
+        infos
+    }
+
+    /// TXN-1: merges a previously-[`Self::collect_obsolete_abort_lsns`]ed
+    /// batch into the shared `UtilizationTracker`, through the LOG MANAGER'S
+    /// batched entry point ([`noxu_log::LogManager::count_obsolete_commit_lsns`],
+    /// which in turn calls
+    /// [`noxu_log::LogWriteObserver::count_obsolete_batch`]) so the shared
+    /// tracker mutex is acquired ONCE for the whole batch rather than once
+    /// per LSN.
+    ///
+    /// Callers should invoke this AFTER releasing the per-record write locks
+    /// (see [`Self::collect_obsolete_abort_lsns`]'s doc comment) so the
+    /// (contended) global-tracker wait never happens while a (hot,
+    /// contended) per-record lock is still held.
+    fn merge_obsolete_lsns(&self, infos: &[(Lsn, Option<u32>, i32)]) {
+        if infos.is_empty() {
+            return;
+        }
+        if let Some(lm) = &self.log_manager {
+            lm.count_obsolete_commit_lsns(infos);
         }
     }
 
@@ -1168,7 +1253,12 @@ impl Txn {
         // No logged entries — caller should have taken the read-only
         // optimisation.  We still mark prepared (defensive), but do not
         // emit a TxnPrepare frame: there is nothing to resolve.
-        if !self.has_logged_entries() {
+        //
+        // A Txn marked `suppress_own_end_frame()` is owned by an outer
+        // wrapper (`noxu_db::Transaction`) that already writes its own
+        // TxnPrepare frame (`Transaction::prepare`); skip writing a second
+        // one here too. See `SUPPRESS_OWN_END_FRAME`'s doc comment.
+        if !self.has_logged_entries() || self.suppress_own_end_frame() {
             self.txn_flags |= IS_PREPARED;
             return Ok(NULL_LSN);
         }
@@ -1326,7 +1416,14 @@ impl Txn {
         // `txn_id=0`), so no synthetic abort record is required and the
         // on-disk WAL format stays identical to pre-Wave-1A auto-commit.
         // Closes the first F12 residual.
-        let assigned_lsn = if self.has_logged_entries() && !self.is_auto_txn() {
+        //
+        // A Txn marked `suppress_own_end_frame()` is owned by an outer
+        // wrapper that already writes its own TxnAbort frame; see
+        // `SUPPRESS_OWN_END_FRAME`'s doc comment.
+        let assigned_lsn = if self.has_logged_entries()
+            && !self.is_auto_txn()
+            && !self.suppress_own_end_frame()
+        {
             let abort = TxnAbort::new(
                 self.id,
                 self.last_lsn,
@@ -1398,8 +1495,14 @@ impl Txn {
         self.state = TxnState::Aborted;
 
         // Synthetic auto-txns skip the `TxnAbort` WAL entry; see
-        // [`Self::abort`] for rationale.
-        let assigned_lsn = if self.has_logged_entries() && !self.is_auto_txn() {
+        // [`Self::abort`] for rationale. A Txn marked
+        // `suppress_own_end_frame()` is owned by an outer wrapper that
+        // already writes its own TxnAbort frame; see
+        // `SUPPRESS_OWN_END_FRAME`'s doc comment.
+        let assigned_lsn = if self.has_logged_entries()
+            && !self.is_auto_txn()
+            && !self.suppress_own_end_frame()
+        {
             let abort = TxnAbort::new(
                 self.id,
                 self.last_lsn,

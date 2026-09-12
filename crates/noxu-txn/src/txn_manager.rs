@@ -125,7 +125,19 @@ impl TxnManager {
         self.n_begins.fetch_add(1, Ordering::Relaxed);
         self.all_txns.write().insert(id, NULL_LSN.as_u64());
         self.lock_manager.register_locker_label(id, "txn");
-        Txn::with_log_manager(id, self.lock_manager.clone(), log_manager)
+        let mut txn =
+            Txn::with_log_manager(id, self.lock_manager.clone(), log_manager);
+        // The only production caller of this method
+        // (`EnvironmentImpl::begin_txn`) is always wrapped by an outer
+        // `noxu_db::Transaction`, which already writes its own
+        // TxnCommit/TxnAbort/TxnPrepare frame and its own fsync (with the
+        // caller's actual Durability choice). Without this, attaching the
+        // LogManager here (needed for TXN-1 obsolete-LSN merging) would
+        // ALSO un-silence this Txn's own frame writes, producing a second,
+        // wrongly-durable frame per commit/abort. See
+        // `SUPPRESS_OWN_END_FRAME`'s doc comment.
+        txn.set_suppress_own_end_frame();
+        txn
     }
 
     /// Begins a synthetic transient transaction wrapping a single

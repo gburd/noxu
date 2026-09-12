@@ -53,4 +53,4 @@ pub use recovery_manager::{
 };
 pub use replay::{RollbackOutcome, rollback, rollback_steps_1_to_4};
 pub use rollback_tracker::{RollbackPeriod, RollbackScanner, RollbackTracker};
-pub use txn_chain::{RevertInfo, TxnChain};
+pub use txn_chain::{KeyCmp, RevertInfo, TxnChain};

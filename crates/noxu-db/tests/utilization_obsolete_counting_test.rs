@@ -19,25 +19,19 @@
 //! than `CursorImpl::with_log_manager`. The existing obsolete-counting tests use
 //! the latter and bypass the `Txn`-attached path entirely, which is why this went
 //! unnoticed.
+//!
+//! Counting is now on by DEFAULT
+//! (`docs/src/internal/space-amplification-2026-09.md` Phase 4): the
+//! `NOXU_COUNT_AUTOCOMMIT_OBSOLETE` / `NOXU_COUNT_TXN_OBSOLETE` gates these
+//! tests used to set are gone, so they now exercise the shipped default path
+//! directly.
 
 use noxu_db::{DatabaseConfig, Environment, EnvironmentConfig};
 use tempfile::TempDir;
 
-/// Both counting paths are gated off by default pending a
-/// `LocalUtilizationTracker`; these tests set the knobs so they exercise the
-/// corrected accounting rather than the shipped default.
-fn enable_obsolete_counting() {
-    // SAFETY: single-threaded test setup, before any env is opened.
-    unsafe {
-        std::env::set_var("NOXU_COUNT_AUTOCOMMIT_OBSOLETE", "1");
-        std::env::set_var("NOXU_COUNT_TXN_OBSOLETE", "1");
-    }
-}
-
 /// Repeatedly overwriting one key must drive utilization DOWN.
 #[test]
 fn overwrites_through_the_public_api_are_counted_obsolete() {
-    enable_obsolete_counting();
     let tmp = TempDir::new().unwrap();
     let value = vec![0x5Au8; 512];
 
@@ -93,7 +87,6 @@ fn overwrites_through_the_public_api_are_counted_obsolete() {
 /// A single write of each key must NOT look obsolete — guards over-counting.
 #[test]
 fn distinct_keys_written_once_are_not_counted_obsolete() {
-    enable_obsolete_counting();
     let tmp = TempDir::new().unwrap();
     let value = vec![0x33u8; 512];
 

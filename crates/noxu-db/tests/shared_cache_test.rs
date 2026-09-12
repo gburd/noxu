@@ -47,13 +47,25 @@ fn open_shared_env(dir: &std::path::Path, cache_bytes: u64) -> Environment {
     Environment::open(cfg).expect("open shared-cache env")
 }
 
-fn fill(db: &Database, prefix: u8, n: usize, val: &[u8]) {
-    for i in 0..n {
-        let mut key = vec![prefix];
-        key.extend_from_slice(format!("{:010}", i).as_bytes());
-        let k = DatabaseEntry::from_vec(key);
-        let v = DatabaseEntry::from_bytes(val);
-        db.put(&k, &v).unwrap();
+fn fill(env: &Environment, db: &Database, prefix: u8, n: usize, val: &[u8]) {
+    // Batched 1000/txn -- an unbatched auto-commit loop pays one fdatasync
+    // per record (COMMIT_SYNC is the default). Measured ~2.9ms/fdatasync on
+    // this filesystem, so the original 8,000+8,000+3,000 unbatched puts here
+    // accounted for the bulk of this test's 194.7s isolation wall time,
+    // unrelated to the shared-cache-budget behaviour under test.
+    let mut i = 0usize;
+    while i < n {
+        let end = (i + 1000).min(n);
+        let txn = env.begin_transaction(None).unwrap();
+        for j in i..end {
+            let mut key = vec![prefix];
+            key.extend_from_slice(format!("{:010}", j).as_bytes());
+            let k = DatabaseEntry::from_vec(key);
+            let v = DatabaseEntry::from_bytes(val);
+            db.put_in(&txn, &k, &v).unwrap();
+        }
+        txn.commit().unwrap();
+        i = end;
     }
 }
 
@@ -73,6 +85,10 @@ fn drive_eviction(env: &Environment, budget: u64) -> i64 {
     env.cache_usage_bytes().unwrap()
 }
 
+/// Writes are batched via `fill()` (1000/txn per call) to avoid one
+/// `fdatasync` per record; see `fill`'s doc comment. Record counts and the
+/// shared-budget assertions below are unchanged.
+/// Measured: 194.7s -> ~4.3s in isolation, debug build.
 #[test]
 fn shared_cache_balances_one_budget_across_envs() {
     // Isolate this test's shared-evictor state from any other test in the
@@ -97,14 +113,18 @@ fn shared_cache_balances_one_budget_across_envs() {
         .open_database(
             None,
             "db1",
-            &DatabaseConfig::new().with_allow_create(true),
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true),
         )
         .expect("open db1");
     let db2: Database = env2
         .open_database(
             None,
             "db2",
-            &DatabaseConfig::new().with_allow_create(true),
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true),
         )
         .expect("open db2");
 
@@ -113,8 +133,8 @@ fn shared_cache_balances_one_budget_across_envs() {
     // well under the fast-suite timeout.
     let n = 8_000usize;
     let val = vec![0xCDu8; 120];
-    fill(&db1, b'A', n, &val);
-    fill(&db2, b'B', n, &val);
+    fill(&env1, &db1, b'A', n, &val);
+    fill(&env2, &db2, b'B', n, &val);
 
     // env1 and env2 read the SAME shared counter, so both report the shared
     // total.  Prove that first.
@@ -218,7 +238,7 @@ fn shared_cache_balances_one_budget_across_envs() {
 
     // Survivor can still write + evict (proves the shared daemon/evictor is
     // intact and does not touch the closed env's freed trees).
-    fill(&db1, b'C', 3_000, &val);
+    fill(&env1, &db1, b'C', 3_000, &val);
     let _ = drive_eviction(&env1, budget);
     let mut kc = vec![b'C'];
     kc.extend_from_slice(format!("{:010}", 42usize).as_bytes());

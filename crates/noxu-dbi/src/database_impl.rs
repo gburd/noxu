@@ -369,6 +369,16 @@ impl DatabaseImpl {
         self.entry_count.load(Ordering::Relaxed)
     }
 
+    /// Overwrites the entry count with an externally-known value.
+    ///
+    /// Used by DBEVICT-1's reopen-after-eviction path to restore the live
+    /// count stashed at eviction time (the reconstructed tree's root is not
+    /// materialized yet, so `count_entries()` cannot be used here the way
+    /// `set_recovered_tree` uses it for the WAL-replay reconstruction path).
+    pub fn set_entry_count(&self, count: u64) {
+        self.entry_count.store(count, Ordering::Relaxed);
+    }
+
     /// Increments the entry count by 1 (on new insert).
     pub fn increment_entry_count(&self) {
         self.entry_count.fetch_add(1, Ordering::Relaxed);

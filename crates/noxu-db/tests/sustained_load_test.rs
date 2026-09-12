@@ -302,35 +302,48 @@ fn test_cleaner_reduces_log_files_under_load() {
     const OVERWRITES: usize = 49;
     let stall_limit = Duration::from_secs(5);
 
+    // Phase 1 + Phase 2 writes are batched 50 keys per explicit transaction
+    // (one fdatasync per batch instead of one per auto-commit put). Measured:
+    // this crate's auto-commit `db.put()` defaults to COMMIT_SYNC, so the
+    // original 500 + 500*49 = 24,990 unbatched puts paid 24,990 fdatasync
+    // calls; at ~2.9ms/fdatasync (measured on this filesystem) that alone
+    // accounts for ~72s, unrelated to the cleaner behaviour under test.
+    // `log_file_max_bytes(64 * 1024)` still forces many small log files by
+    // byte count, independent of how writes are batched into transactions,
+    // so the cleaner still has the same amount of concrete work to do. The
+    // stall check moves from per-put to per-batch-commit (still generous at
+    // 5s, still catches a cleaner-throttle deadlock).
+    let write_batch = |keys: &[String], vals: &[Vec<u8>]| {
+        let mut idx = 0usize;
+        while idx < keys.len() {
+            let end = (idx + 50).min(keys.len());
+            let txn = env.begin_transaction(None).unwrap();
+            for j in idx..end {
+                let k = DatabaseEntry::from_bytes(keys[j].as_bytes());
+                let v = DatabaseEntry::from_bytes(&vals[j]);
+                db.put_in(&txn, &k, &v).unwrap();
+            }
+            let t = Instant::now();
+            txn.commit().unwrap();
+            assert!(
+                t.elapsed() < stall_limit,
+                "txn commit stalled on batch [{idx},{end})"
+            );
+            idx = end;
+        }
+    };
+
     // Phase 1: initial write of all keys.
-    for i in 0..KEYS {
-        let key = format!("k{i:05}");
-        let val = vec![b'a'; 100];
-        let k = DatabaseEntry::from_bytes(key.as_bytes());
-        let v = DatabaseEntry::from_bytes(&val);
-        let t = Instant::now();
-        db.put(&k, &v).unwrap();
-        assert!(
-            t.elapsed() < stall_limit,
-            "put stalled on initial write k={i}"
-        );
-    }
+    let keys: Vec<String> = (0..KEYS).map(|i| format!("k{i:05}")).collect();
+    let initial_vals: Vec<Vec<u8>> =
+        (0..KEYS).map(|_| vec![b'a'; 100]).collect();
+    write_batch(&keys, &initial_vals);
 
     // Phase 2: overwrite each key OVERWRITES times → lots of obsolete LNs.
     for pass in 0..OVERWRITES {
-        for i in 0..KEYS {
-            let key = format!("k{i:05}");
-            let fill = b'a' + (pass as u8 % 26);
-            let val = vec![fill; 100];
-            let k = DatabaseEntry::from_bytes(key.as_bytes());
-            let v = DatabaseEntry::from_bytes(&val);
-            let t = Instant::now();
-            db.put(&k, &v).unwrap();
-            assert!(
-                t.elapsed() < stall_limit,
-                "put stalled on overwrite pass={pass} k={i}"
-            );
-        }
+        let fill = b'a' + (pass as u8 % 26);
+        let vals: Vec<Vec<u8>> = (0..KEYS).map(|_| vec![fill; 100]).collect();
+        write_batch(&keys, &vals);
     }
 
     // Checkpoint so the cleaner can see the obsolete summary information.
