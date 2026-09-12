@@ -16,6 +16,8 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+## [7.10.1] - 2026-09-12
+
 ### Fixed
 
 - **A third `pri2` double-add corruption site in the evictor (`move_to_pri2`).**
