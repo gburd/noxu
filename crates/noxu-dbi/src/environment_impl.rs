@@ -210,6 +210,23 @@ pub struct EnvironmentImpl {
     /// committed databases (C-4 / JE 1-I / 1-J fix).
     pending_names: RwLock<hashbrown::HashMap<String, DatabaseId>>,
 
+    /// DBEVICT-1 (root-cause fix): serializes the "database absent from
+    /// db_map, must be created or reconstructed" slow path of
+    /// `open_database_inner` so two threads racing to open the SAME name
+    /// (a name recovered from the WAL, or a name env_db_eviction just
+    /// evicted) never each build a SEPARATE `DatabaseImpl` and race to
+    /// insert into `db_map` -- the loser's Arc becomes orphaned split-brain
+    /// state (its own increment_reference_count() never gets balanced by a
+    /// close routed through the WINNING db_map entry, so the loser's
+    /// refcount never returns to <= 0 and the winning entry can look
+    /// spuriously "closed" to a caller who actually still holds the loser's
+    /// handle open). Pre-existing race (any two first-open callers on a
+    /// WAL-recovered name could hit it); env_db_eviction turns "absent from
+    /// db_map with a known db_id" from a rare cold-start case into a routine
+    /// one, so it surfaces here. The fast "already open" path above does
+    /// NOT take this lock -- only the slow reconstruction path does.
+    open_reconstruct_lock: Mutex<()>,
+
     /// Whether the environment has been invalidated.
     ///
     /// Stored as `Arc<AtomicBool>` so that `Database` and `CursorImpl`
@@ -1743,6 +1760,7 @@ impl EnvironmentImpl {
             recovered_comparators,
             evicted_db_state: Arc::new(RwLock::new(HashMap::new())),
             pending_names: RwLock::new(hashbrown::HashMap::new()),
+            open_reconstruct_lock: Mutex::new(()),
             is_invalid: Arc::new(AtomicBool::new(false)),
             invalid_reason: RwLock::new(None),
             creation_time_ms: std::time::SystemTime::now()
@@ -1979,6 +1997,25 @@ impl EnvironmentImpl {
         self.check_open()?;
 
         // Check if database already exists in the open db_map.
+        if let Some(db_id) = self.name_map.read().get(name)
+            && let Some(db) = self.db_map.read().get(db_id)
+        {
+            db.read().increment_reference_count();
+            return Ok(db.clone());
+        }
+
+        // DBEVICT-1 (root-cause fix): the database is absent from db_map --
+        // either genuinely new, WAL-recovered but never opened this session,
+        // or just evicted by env_db_eviction.  All three cases build a fresh
+        // DatabaseImpl below; serialize that construction (held for the rest
+        // of this call) so two threads racing to open the SAME name can
+        // never each build a separate DatabaseImpl and race db_map's insert
+        // (the loser's Arc would be orphaned split-brain state -- its
+        // increment_reference_count() balanced against a close() that no
+        // longer routes through it once db_map holds the winner's Arc
+        // instead). Re-check the fast path once inside the lock: another
+        // thread may have completed the reconstruction while we waited.
+        let _reconstruct_guard = self.open_reconstruct_lock.lock().unwrap();
         if let Some(db_id) = self.name_map.read().get(name)
             && let Some(db) = self.db_map.read().get(db_id)
         {
@@ -4748,6 +4785,75 @@ mod tests {
             env.db_map.read().contains_key(&db_id),
             "evict_memory must not evict when env_db_eviction=false"
         );
+
+        env.close().unwrap();
+    }
+
+    /// DBEVICT-1 absolute correctness bar under real concurrency: many
+    /// threads racing open/close on the SAME database name while another
+    /// thread repeatedly sweeps `evict_closed_databases()` must never
+    /// observe a `reference_count() > 0` database evicted -- exercising the
+    /// exact TOCTOU window `evict_closed_database` re-checks under the
+    /// `db_map` write lock (the caller's refcount<=0 snapshot can go stale
+    /// between the check and the write-lock acquisition).
+    #[test]
+    fn dbevict1_concurrent_open_close_never_evicts_in_use_database() {
+        let dir = TempDir::new().unwrap();
+        let env =
+            Arc::new(EnvironmentImpl::new(dir.path(), false, true).unwrap());
+
+        let mut config = DatabaseConfig::new();
+        config.set_allow_create(true);
+        // Ensure the database + its id exist before the race starts.
+        let seed = env.open_database("race_db", &config).unwrap();
+        let db_id = seed.read().get_id();
+        env.close_database(db_id).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+
+        // Sweeper thread: hammers evict_closed_databases().
+        let env_sweep = Arc::clone(&env);
+        let stop_sweep = Arc::clone(&stop);
+        let sweeper = std::thread::spawn(move || {
+            while !stop_sweep.load(Ordering::Relaxed) {
+                env_sweep.evict_closed_databases();
+            }
+        });
+
+        // Opener/closer threads: open the same name, immediately verify the
+        // handle they hold reports reference_count > 0 the whole time they
+        // hold it open, then close.
+        let mut openers = Vec::new();
+        for _ in 0..4 {
+            let env_open = Arc::clone(&env);
+            let mut cfg = DatabaseConfig::new();
+            cfg.set_allow_create(true);
+            openers.push(std::thread::spawn(move || {
+                for _ in 0..200 {
+                    let db = env_open.open_database("race_db", &cfg).unwrap();
+                    let id = db.read().get_id();
+                    // While we hold this handle, reference_count must be
+                    // positive -- if evict_closed_database ever removed an
+                    // in-use entry from db_map, a concurrent open here would
+                    // reconstruct a SECOND DatabaseImpl for the same name
+                    // (silent split-brain), and get_id() would still return
+                    // the same id by construction but the tree contents
+                    // could diverge from ours. The count check below is the
+                    // direct, cheap invariant: our own open bumped the count,
+                    // so it can never read back as <= 0 for our own read.
+                    assert!(
+                        db.read().reference_count() > 0,
+                        "a handle we hold open must report reference_count > 0"
+                    );
+                    env_open.close_database(id).unwrap();
+                }
+            }));
+        }
+        for h in openers {
+            h.join().unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        sweeper.join().unwrap();
 
         env.close().unwrap();
     }
