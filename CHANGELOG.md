@@ -21,22 +21,25 @@ listed in [References](#references).
   gained a per-latch FIFO admission queue (`fair_queue::FairQueue`) that
   `ExclusiveLatch::acquire`/`SharedLatch::acquire_exclusive`/
   `acquire_shared` now join before contending for the real inner lock, and
-  leave (from the RAII guard's `Drop`, exactly once, including across a
-  panicking critical section) after releasing it. Zero cost when the flag
-  is off: the acquire/release fast path pays exactly one relaxed atomic
-  load. Per `.agent/notes-fair-latches.md`, Noxu implements the strictly
-  stronger full-FIFO guarantee (every acquisition serialized in arrival
-  order, readers included) rather than JE's documented — and, per that
-  investigation, never actually wired in JE's own source — contiguous-
-  reader batching. `try_acquire`/`try_acquire_exclusive` still barge
-  regardless of the flag, matching `ReentrantLock.tryLock()` semantics.
+  leave (from the RAII guard's `Drop`, exactly once) after releasing it.
+  Zero cost when the flag is off: the acquire/release fast path pays
+  exactly one relaxed atomic load. Per `.agent/notes-fair-latches.md`, Noxu
+  implements the strictly stronger full-FIFO guarantee (every acquisition
+  serialized in arrival order, readers included) rather than JE's
+  documented — and, per that investigation, never actually wired in JE's
+  own source — contiguous-reader batching. `try_acquire`/
+  `try_acquire_exclusive` still barge regardless of the flag, matching
+  `ReentrantLock.tryLock()` semantics.
   Proven by `crates/noxu-latch/tests/fair_latch_fifo_test.rs` (FIFO grant
   order through the real latch types, including a barging-race ablation
-  test) and the `noxu_shuttle`-gated
+  test that fails if the `FairQueue` consultation is removed from
+  `ExclusiveLatch::acquire`) and the `noxu_shuttle`-gated
   `crates/noxu-latch/tests/shuttle_fair_latch.rs` DST model (mutual
-  exclusion, FIFO order, give-up-does-not-strand, and `leave()`-fires-
-  exactly-once-under-panic). `env_fair_latches` is removed from the
-  `unimplemented_params` WARN registry.
+  exclusion under fair and unfair mode, strict FIFO grant order, a
+  give-up/timeout that does not strand the next waiter, and a long FIFO
+  chain fully draining — the release-before-dequeue RAII ordering that, if
+  inverted, livelocks rather than crashes). `env_fair_latches` is removed
+  from the `unimplemented_params` WARN registry.
 
 ## [7.9.1] - 2026-09-10
 

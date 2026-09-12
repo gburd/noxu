@@ -188,8 +188,9 @@ ops/monitoring; for a live metrics pipeline use `metrics_export` (the
 
 ## Latch fairness & timeout (`EnvironmentConfig`)
 
-Three JE latch knobs control the low-level B-tree / log latches.  Two are
-**implemented (7.1)**; the third is **reserved** (see the note).
+Three JE latch knobs control the low-level B-tree / log latches, all
+**implemented**: `env_latch_timeout_ms` and `env_forced_yield` (7.1),
+`env_fair_latches` (Unreleased).
 
 | Field | Type | Default | Description |
 |---|---|---|---|
@@ -197,9 +198,10 @@ Three JE latch knobs control the low-level B-tree / log latches.  Two are
 | `env_forced_yield` | `bool` | `false` | **Implemented.** Test-only fairness stress: when `true`, `noxu-latch` injects `std::thread::yield_now()` at each latch acquire (post-grant) and release point to shake out latch-ordering races.  Zero cost when off (a single relaxed atomic load).  JE: `ENV_FORCED_YIELD`. |
 | `env_fair_latches` | `bool` | `false` | **Implemented.** FIFO-ordered latch acquisition: `noxu-latch` gains a per-latch admission queue (`FairQueue`) that `acquire`/`acquire_exclusive`/`acquire_shared` join before contending for the real lock, and leave (from the RAII guard's `Drop`) after releasing it. Every acquisition — readers included — is granted in strict arrival order (a strictly stronger guarantee than JE's documented, and in JE's own source never actually wired, contiguous-reader batching; see `.agent/notes-fair-latches.md`). Non-blocking `try_acquire`/`try_acquire_exclusive` always barge, matching `ReentrantLock.tryLock()` semantics. Zero cost when off: the fast path pays one relaxed atomic load. JE: `ENV_FAIR_LATCHES` (`setFairLatches`). |
 
-The two implemented knobs are installed process-globally at `Environment::open`
-via `noxu_latch::configure`; an environment that leaves both at their defaults
-sees exactly the pre-7.1 latch behaviour (a 5 s acquire timeout, no yields).
+All three knobs are installed process-globally at `Environment::open` via
+`noxu_latch::configure`; an environment that leaves all three at their
+defaults sees exactly the pre-7.1 latch behaviour (a 5 s acquire timeout, no
+yields, barging admission).
 
 ## Replication Parameters
 
