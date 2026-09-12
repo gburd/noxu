@@ -27,10 +27,12 @@
 
 pub mod config;
 mod exclusive;
+pub mod fair_queue;
 mod shared;
 
-pub use config::{configure, forced_yield};
+pub use config::{configure, fair_latches, forced_yield};
 pub use exclusive::{ExclusiveLatch, ExclusiveLatchGuard};
+pub use fair_queue::FairQueue;
 pub use shared::{SharedLatch, SharedLatchReadGuard, SharedLatchWriteGuard};
 
 pub mod latch_order;

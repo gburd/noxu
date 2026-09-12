@@ -24,8 +24,9 @@
 //! below.  Each has been marked reserved in its rustdoc.  As parameters are
 //! wired to real features they are removed from this registry: `env_forced_yield`
 //! and `env_latch_timeout_ms` were wired in 7.1 (JE `ENV_FORCED_YIELD` /
-//! `ENV_LATCH_TIMEOUT`); `env_fair_latches` (JE `setFairLatches`) remains
-//! reserved (a fair-latch mode is a dedicated `noxu-sync` FIFO rewrite).
+//! `ENV_LATCH_TIMEOUT`); `env_fair_latches` (JE `setFairLatches`) was wired
+//! in this release via a per-latch `FairQueue` FIFO admission queue (see
+//! `noxu-latch::fair_queue` and `.agent/notes-fair-latches.md`).
 //!
 //! # Graduation audit trail
 //!
@@ -36,6 +37,13 @@
 //!
 //! - `verify_schedule` — wired to the background verifier daemon.
 //! - `env_forced_yield`, `env_latch_timeout_ms` — wired in 7.1.
+//! - **`env_fair_latches`** — wired via `noxu-latch::fair_queue::FairQueue`, a
+//!   per-latch FIFO admission queue consulted from `ExclusiveLatch`'s and
+//!   `SharedLatch`'s acquire/release paths whenever the flag is set. Proven
+//!   honored by `crates/noxu-latch/tests/fair_latch_fifo_test.rs` (FIFO grant
+//!   order through the real latch types, flag on vs. off) and the
+//!   `noxu_shuttle`-gated `crates/noxu-latch/tests/shuttle_fair_latch.rs`
+//!   model. JE ref: `EnvironmentConfig.ENV_FAIR_LATCHES` / `setFairLatches`.
 //! - **`env_expiration_enabled`, `env_ttl_clock_tolerance_ms`,
 //!   `cleaner_expiration_enabled` -- graduated in 7.5.4** when TTL / record
 //!   expiration was implemented end to end (put -> BIN/LN -> read-skip ->
@@ -73,20 +81,15 @@ pub struct UnimplementedParam {
 /// - A parameter is wired up (remove the entry), or
 /// - A new reserved parameter is added (add an entry).
 pub static UNIMPLEMENTED_ENV_PARAMS: &[UnimplementedParam] = &[
-    UnimplementedParam {
-        name: "env_fair_latches",
-        // default = false; non-default means the caller set it to true.
-        //
-        // DEFERRED (7.1): `env_forced_yield` and `env_latch_timeout_ms` were
-        // removed from this registry when they were WIRED into `noxu-latch`
-        // (JE `ENV_FORCED_YIELD` / `ENV_LATCH_TIMEOUT`).  `env_fair_latches`
-        // (JE `setFairLatches`) is NOT wired: `noxu-sync`'s futex primitives
-        // are fundamentally non-fair and have no FIFO queue to toggle, so a
-        // faithful fair-latch mode is a dedicated latch rewrite rather than a
-        // flag flip.  It stays reserved and warned here so a non-default
-        // setting is never a silent no-op.
-        is_non_default: |c| c.env_fair_latches,
-    },
+    // NOTE: `env_fair_latches` (JE `setFairLatches`) graduated out of this
+    // registry in this release -- it is now wired into `noxu-latch`'s
+    // `ExclusiveLatch`/`SharedLatch` acquire/release paths via a per-latch
+    // `FairQueue` FIFO admission queue. See the graduation audit trail note
+    // above and `crates/noxu-latch/tests/fair_latch_fifo_test.rs`.
+    //
+    // NOTE: `env_db_eviction` also graduated out of this registry (DBEVICT-1)
+    // -- see the graduation audit trail note above and the `dbevict1_*` tests
+    // in `crates/noxu-dbi/src/environment_impl.rs`.
     // ---------------------------------------------------------------------
     // DBI-14 inert-flag sweep (2026-06-23): the following EnvironmentConfig
     // fields have a setter+field but ZERO runtime read sites.  They are
@@ -171,17 +174,6 @@ mod tests {
                 param.name,
             );
         }
-    }
-
-    #[test]
-    fn env_fair_latches_warn_on_true() {
-        let mut c = env_default();
-        c.set_env_fair_latches(true);
-        let p = UNIMPLEMENTED_ENV_PARAMS
-            .iter()
-            .find(|p| p.name == "env_fair_latches")
-            .unwrap();
-        assert!((p.is_non_default)(&c));
     }
 
     #[test]

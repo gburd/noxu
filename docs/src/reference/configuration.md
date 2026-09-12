@@ -188,18 +188,20 @@ ops/monitoring; for a live metrics pipeline use `metrics_export` (the
 
 ## Latch fairness & timeout (`EnvironmentConfig`)
 
-Three JE latch knobs control the low-level B-tree / log latches.  Two are
-**implemented (7.1)**; the third is **reserved** (see the note).
+Three JE latch knobs control the low-level B-tree / log latches, all
+**implemented**: `env_latch_timeout_ms` and `env_forced_yield` (7.1),
+`env_fair_latches` (Unreleased).
 
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `env_latch_timeout_ms` | `u64` | `300_000` (5 min) | **Implemented.** Maximum time a latch acquisition blocks before failing with a `LatchTimeout` error instead of hanging forever — turning a latch deadlock into a diagnosable error.  `0` = no timeout (block until acquired).  The default is treated as "unset": leaving it unchanged preserves the historical latch behaviour byte-for-byte; any other value opts in.  JE: `ENV_LATCH_TIMEOUT`. |
 | `env_forced_yield` | `bool` | `false` | **Implemented.** Test-only fairness stress: when `true`, `noxu-latch` injects `std::thread::yield_now()` at each latch acquire (post-grant) and release point to shake out latch-ordering races.  Zero cost when off (a single relaxed atomic load).  JE: `ENV_FORCED_YIELD`. |
-| `env_fair_latches` | `bool` | `false` | **Reserved — not implemented.** FIFO-ordered (no-barging) latch acquisition.  Noxu's latches are backed by `noxu-sync`'s futex primitives, which are fundamentally non-fair and have no FIFO wait queue to toggle; a faithful fair-latch mode is a dedicated latch rewrite.  Setting `true` emits a `WARN` and has no effect.  JE: `ENV_FAIR_LATCHES` (`setFairLatches`). |
+| `env_fair_latches` | `bool` | `false` | **Implemented.** FIFO-ordered latch acquisition: `noxu-latch` gains a per-latch admission queue (`FairQueue`) that `acquire`/`acquire_exclusive`/`acquire_shared` join before contending for the real lock, and leave (from the RAII guard's `Drop`) after releasing it. Every acquisition — readers included — is granted in strict arrival order (a strictly stronger guarantee than JE's documented, and in JE's own source never actually wired, contiguous-reader batching; see `.agent/notes-fair-latches.md`). Non-blocking `try_acquire`/`try_acquire_exclusive` always barge, matching `ReentrantLock.tryLock()` semantics. Zero cost when off: the fast path pays one relaxed atomic load. JE: `ENV_FAIR_LATCHES` (`setFairLatches`). |
 
-The two implemented knobs are installed process-globally at `Environment::open`
-via `noxu_latch::configure`; an environment that leaves both at their defaults
-sees exactly the pre-7.1 latch behaviour (a 5 s acquire timeout, no yields).
+All three knobs are installed process-globally at `Environment::open` via
+`noxu_latch::configure`; an environment that leaves all three at their
+defaults sees exactly the pre-7.1 latch behaviour (a 5 s acquire timeout, no
+yields, barging admission).
 
 ## Closed-database metadata eviction (`env_db_eviction`)
 

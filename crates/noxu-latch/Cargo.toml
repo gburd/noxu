@@ -15,8 +15,19 @@ noxu-util = { workspace = true }
 noxu-sync = { workspace = true }
 log = { workspace = true }
 
+# DST wave: only in the graph under `--cfg noxu_shuttle`. Lets a standalone
+# shuttle model of the FairQueue-backed `env_fair_latches` wiring
+# (crates/noxu-latch/tests/shuttle_fair_latch.rs) be explored by shuttle's
+# scheduler. Default builds never pull shuttle in. Mirrors
+# crates/noxu-sync/Cargo.toml's identical seam for shuttle_rwlock_reservation.rs.
+[target.'cfg(noxu_shuttle)'.dependencies]
+shuttle = { workspace = true }
+
 [dev-dependencies]
 hegeltest = { workspace = true }
+
+[target.'cfg(noxu_shuttle)'.dev-dependencies]
+shuttle = { workspace = true }
 
 [lints]
 workspace = true

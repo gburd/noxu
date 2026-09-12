@@ -18,26 +18,32 @@
 //!
 //! Noxu mirrors JE's approach: rather than plumb a `LatchConfig` through the
 //! dozens of ad-hoc `LatchContext::new(...)` sites in `noxu-tree` / `noxu-log`
-//! (which would be a large cross-crate churn), the two tractable knobs live
+//! (which would be a large cross-crate churn), the three tractable knobs live
 //! here as process-global defaults installed once by `Environment::open` via
 //! [`configure`].  [`LatchContext::new`](crate::LatchContext::new) reads
 //! [`default_timeout`] at construction time, and the acquire/release paths
-//! consult [`forced_yield`].
+//! consult [`forced_yield`] and [`fair_latches`].
 //!
 //! **Default behaviour is byte-identical to before this module existed**: the
 //! timeout defaults to [`DEFAULT_LATCH_TIMEOUT`](crate::DEFAULT_LATCH_TIMEOUT)
-//! (5 s) and forced-yield defaults to `false` (no yields).  An `Environment`
-//! that never calls [`configure`] — every unit test, every embedded use that
-//! constructs latches directly — sees exactly the old constants.
+//! (5 s), forced-yield defaults to `false` (no yields), and fair-latches
+//! defaults to `false` (barging, as before). An `Environment` that never
+//! calls [`configure`] — every unit test, every embedded use that constructs
+//! latches directly — sees exactly the old constants.
 //!
-//! ## Fair (FIFO) latches — deliberately NOT here
+//! ## Fair (FIFO) latches (JE `setFairLatches` / `ENV_FAIR_LATCHES`)
 //!
-//! JE's `setFairLatches` (`ENV_FAIR_LATCHES`) selects a FIFO-ordered latch.
-//! Noxu's latches are backed by `noxu-sync`'s futex primitives, which are
-//! fundamentally **non-fair** (a new arrival can barge ahead of a queued
-//! waiter) with no FIFO queue to toggle.  A faithful fair-latch mode is a
-//! dedicated latch rewrite (a ticket/FIFO wait queue in `noxu-sync`), not a
-//! flag flip, so it is intentionally left unimplemented rather than faked.
+//! See `crate::fair_queue` for the mechanism (a per-latch FIFO admission
+//! queue) and `.agent/notes-fair-latches.md` for the JE semantics this ports
+//! and why: JE's own reference source never actually wires
+//! `ENV_FAIR_LATCHES` into a `SharedLatchImpl`/`LatchImpl` constructor (both
+//! `LatchFactory` call sites hardcode `false`), so there is no live JE
+//! runtime behaviour to reproduce byte-for-byte — only the documented
+//! *intent* (no-barging admission order). Noxu implements the strictly
+//! stronger guarantee (full FIFO order across readers and writers alike,
+//! not JE's documented contiguous-reader batching) because it is
+//! substantially simpler to build and verify, and the flag is a
+//! diagnostic/anti-starvation aid rather than a throughput feature.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -58,6 +64,11 @@ static TIMEOUT_MS: AtomicU64 = AtomicU64::new(UNSET_TIMEOUT);
 /// Global forced-yield flag (JE `ENV_FORCED_YIELD`).  Default `false`.
 static FORCED_YIELD: AtomicBool = AtomicBool::new(false);
 
+/// Global fair-latches flag (JE `ENV_FAIR_LATCHES` / `setFairLatches`).
+/// Default `false` (barging, as before this flag existed). See the module
+/// doc comment's "Fair (FIFO) latches" section.
+static FAIR_LATCHES: AtomicBool = AtomicBool::new(false);
+
 /// A very large timeout used to approximate "block forever" while still going
 /// through the timed-acquire path.  ~292 million years; effectively infinite
 /// for a process lifetime, but a real `Duration` the futex primitives accept.
@@ -66,17 +77,21 @@ const EFFECTIVELY_FOREVER: Duration = Duration::from_secs(u64::MAX / 1000);
 /// Installs the process-global latch configuration.
 ///
 /// Called once by `Environment::open` from the translated `env_latch_timeout_ms`
-/// / `env_forced_yield` config values.  Idempotent and last-writer-wins: a
-/// second `Environment` in the same process overwrites the globals (JE's latch
-/// params are likewise process-static).
+/// / `env_forced_yield` / `env_fair_latches` config values.  Idempotent and
+/// last-writer-wins: a second `Environment` in the same process overwrites
+/// the globals (JE's latch params are likewise process-static).
 ///
 /// * `timeout_ms` — `0` means "no timeout" (block, using an effectively-infinite
 ///   duration); any other value is the per-acquire timeout in milliseconds.
 /// * `forced_yield` — when `true`, inject `std::thread::yield_now()` at latch
 ///   acquire/release points (test-only fairness stress).
-pub fn configure(timeout_ms: u64, forced_yield: bool) {
+/// * `fair_latches` — when `true`, latch acquisition is granted in strict
+///   FIFO arrival order (JE `ENV_FAIR_LATCHES` / `setFairLatches`; see the
+///   module doc comment's "Fair (FIFO) latches" section).
+pub fn configure(timeout_ms: u64, forced_yield: bool, fair_latches: bool) {
     TIMEOUT_MS.store(timeout_ms, Ordering::Relaxed);
     FORCED_YIELD.store(forced_yield, Ordering::Relaxed);
+    FAIR_LATCHES.store(fair_latches, Ordering::Relaxed);
 }
 
 /// Returns the currently-configured default latch timeout.
@@ -98,6 +113,16 @@ pub fn default_timeout() -> Duration {
 #[inline]
 pub fn forced_yield() -> bool {
     FORCED_YIELD.load(Ordering::Relaxed)
+}
+
+/// Returns whether fair (FIFO) latch acquisition is enabled (JE
+/// `ENV_FAIR_LATCHES` / `setFairLatches`).
+///
+/// A single relaxed atomic load — effectively free when disabled, which is
+/// the default and every production path today.
+#[inline]
+pub fn fair_latches() -> bool {
+    FAIR_LATCHES.load(Ordering::Relaxed)
 }
 
 /// Injection point: yield the current thread iff forced-yield is enabled.
@@ -124,6 +149,7 @@ mod tests {
     fn reset() {
         TIMEOUT_MS.store(UNSET_TIMEOUT, Ordering::Relaxed);
         FORCED_YIELD.store(false, Ordering::Relaxed);
+        FAIR_LATCHES.store(false, Ordering::Relaxed);
     }
 
     #[test]
@@ -132,6 +158,7 @@ mod tests {
         reset();
         assert_eq!(default_timeout(), crate::DEFAULT_LATCH_TIMEOUT);
         assert!(!forced_yield());
+        assert!(!fair_latches());
         reset();
     }
 
@@ -139,7 +166,7 @@ mod tests {
     fn configure_zero_means_no_timeout() {
         let _g = GUARD.lock().unwrap();
         reset();
-        configure(0, false);
+        configure(0, false, false);
         assert_eq!(default_timeout(), EFFECTIVELY_FOREVER);
         reset();
     }
@@ -148,7 +175,7 @@ mod tests {
     fn configure_nonzero_sets_millis() {
         let _g = GUARD.lock().unwrap();
         reset();
-        configure(1234, false);
+        configure(1234, false, false);
         assert_eq!(default_timeout(), Duration::from_millis(1234));
         reset();
     }
@@ -158,10 +185,20 @@ mod tests {
         let _g = GUARD.lock().unwrap();
         reset();
         assert!(!forced_yield());
-        configure(300_000, true);
+        configure(300_000, true, false);
         assert!(forced_yield());
         // maybe_yield must not panic when enabled.
         maybe_yield();
+        reset();
+    }
+
+    #[test]
+    fn configure_fair_latches_toggles_flag() {
+        let _g = GUARD.lock().unwrap();
+        reset();
+        assert!(!fair_latches());
+        configure(300_000, false, true);
+        assert!(fair_latches());
         reset();
     }
 }

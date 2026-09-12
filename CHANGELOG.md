@@ -16,6 +16,62 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Added
+
+- **`env_fair_latches` (JE `setFairLatches`) wired end to end.** `noxu-latch`
+  gained a per-latch FIFO admission queue (`fair_queue::FairQueue`) that
+  `ExclusiveLatch::acquire`/`SharedLatch::acquire_exclusive`/
+  `acquire_shared` now join before contending for the real inner lock, and
+  leave (from the RAII guard's `Drop`, exactly once) after releasing it.
+  Zero cost when the flag is off: the acquire/release fast path pays
+  exactly one relaxed atomic load. Per `.agent/notes-fair-latches.md`, Noxu
+  implements the strictly stronger full-FIFO guarantee (every acquisition
+  serialized in arrival order, readers included) rather than JE's
+  documented — and, per that investigation, never actually wired in JE's
+  own source — contiguous-reader batching. `try_acquire`/
+  `try_acquire_exclusive` still barge regardless of the flag, matching
+  `ReentrantLock.tryLock()` semantics.
+  Proven by `crates/noxu-latch/tests/fair_latch_fifo_test.rs` (FIFO grant
+  order through the real latch types, including a barging-race ablation
+  test that fails if the `FairQueue` consultation is removed from
+  `ExclusiveLatch::acquire`) and the `noxu_shuttle`-gated
+  `crates/noxu-latch/tests/shuttle_fair_latch.rs` DST model (mutual
+  exclusion under fair and unfair mode, strict FIFO grant order, a
+  give-up/timeout that does not strand the next waiter, and a long FIFO
+  chain fully draining — the release-before-dequeue RAII ordering that, if
+  inverted, livelocks rather than crashes). `env_fair_latches` is removed
+  from the `unimplemented_params` WARN registry.
+
+- **Gap A, step 1+2: live WAL re-scan `TxnChain` source for HA syncup
+  rollback (diagnostic wiring only, refusal NOT narrowed).** Adds
+  `noxu-rep::stream::live_txn_chain` — `build_live_chain`/
+  `build_live_chain_unbounded`/`build_tail_chains`, a pure, unit-tested
+  function that re-scans a replica's own WAL for one transaction's LN
+  logrecs and feeds them into the already-existing, unit-tested
+  `noxu_recovery::TxnChain::build` (port of JE `TxnChain`'s constructor,
+  `com.sleepycat.je.txn.TxnChain`). A re-scan is required rather than a
+  rewire of live state because Noxu's on-disk `LnLogEntry` format has no
+  "prev LSN of same txn" pointer for `ReplayTxn.undoWrites`-style backward
+  chasing — a forward scan filtering by `txn_id` is the only way to
+  reconstruct a transaction's chain from the WAL once `ReplicaReplay`'s
+  in-memory buffer for it has been dropped (on commit or abort). Wired
+  into `ReplicatedEnvironment::syncup_with_feeder` **diagnostically only**:
+  for a `RollbackToMatchpoint` decision, it computes and logs a live
+  `TxnChain` per txn id in the diverged tail, but `classify_tail`'s verdict
+  is computed independently and is never overridden by this block. A new
+  test (`test_computed_revert_set_is_correct_for_a_still_refused_tail`)
+  proves the computed revert set is correct for a tail that stays refused.
+  **The default-deny refusal in `classify_tail`/`verify_rollback` is
+  UNCHANGED** — narrowing it is not attempted this round; see
+  `docs/src/operations/known-limitations.md`'s Gap A entry for the
+  per-case argument for why this codebase's current architecture cannot
+  soundly admit any currently-refused case via a value-revert mechanism
+  (a committed txn's LNs can never reach the admit branch at all; an
+  active txn's LNs were never applied to the tree, so dropping the buffer
+  already is a complete rollback; a non-transactional LN carries no
+  on-disk abort/before-image fields to revert from; a structural entry's
+  hazard is not a value-revert problem).
+
 ### Changed
 
 - **Obsolete-LN counting is now ON BY DEFAULT; the `NOXU_COUNT_*` gates are
@@ -76,38 +132,6 @@ listed in [References](#references).
   auto-commit path (`Database::put`/`del`, no wrapper) was never affected.
   Regression-tested by `txn_end_frame_dedup_test` (exactly one frame per op),
   verified non-vacuous.
-
-### Added
-
-- **Gap A, step 1+2: live WAL re-scan `TxnChain` source for HA syncup
-  rollback (diagnostic wiring only, refusal NOT narrowed).** Adds
-  `noxu-rep::stream::live_txn_chain` — `build_live_chain`/
-  `build_live_chain_unbounded`/`build_tail_chains`, a pure, unit-tested
-  function that re-scans a replica's own WAL for one transaction's LN
-  logrecs and feeds them into the already-existing, unit-tested
-  `noxu_recovery::TxnChain::build` (port of JE `TxnChain`'s constructor,
-  `com.sleepycat.je.txn.TxnChain`). A re-scan is required rather than a
-  rewire of live state because Noxu's on-disk `LnLogEntry` format has no
-  "prev LSN of same txn" pointer for `ReplayTxn.undoWrites`-style backward
-  chasing — a forward scan filtering by `txn_id` is the only way to
-  reconstruct a transaction's chain from the WAL once `ReplicaReplay`'s
-  in-memory buffer for it has been dropped (on commit or abort). Wired
-  into `ReplicatedEnvironment::syncup_with_feeder` **diagnostically only**:
-  for a `RollbackToMatchpoint` decision, it computes and logs a live
-  `TxnChain` per txn id in the diverged tail, but `classify_tail`'s verdict
-  is computed independently and is never overridden by this block. A new
-  test (`test_computed_revert_set_is_correct_for_a_still_refused_tail`)
-  proves the computed revert set is correct for a tail that stays refused.
-  **The default-deny refusal in `classify_tail`/`verify_rollback` is
-  UNCHANGED** — narrowing it is not attempted this round; see
-  `docs/src/operations/known-limitations.md`'s Gap A entry for the
-  per-case argument for why this codebase's current architecture cannot
-  soundly admit any currently-refused case via a value-revert mechanism
-  (a committed txn's LNs can never reach the admit branch at all; an
-  active txn's LNs were never applied to the tree, so dropping the buffer
-  already is a complete rollback; a non-transactional LN carries no
-  on-disk abort/before-image fields to revert from; a structural entry's
-  hazard is not a value-revert problem).
 
 ## [7.9.1] - 2026-09-10
 

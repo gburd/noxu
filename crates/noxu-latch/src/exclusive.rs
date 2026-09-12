@@ -4,6 +4,7 @@
 //! Reentrancy is prevented: attempting to acquire a latch already held by
 //! the current thread will panic, detecting accidental reentrant calls.
 
+use crate::fair_queue::{self, FairQueue};
 use crate::{LatchContext, LatchError};
 use noxu_sync::Mutex;
 use std::fmt;
@@ -20,6 +21,23 @@ pub struct ExclusiveLatch {
     inner: Mutex<()>,
     /// Thread ID of the current owner (0 if not held).
     owner: AtomicU64,
+    /// FIFO admission queue backing `env_fair_latches`. Always present (a
+    /// `Mutex<VecDeque<u64>>` + `Condvar`, no allocation until first use);
+    /// only ever consulted from `acquire()` / release paths when
+    /// `crate::config::fair_latches()` is true -- see the module doc comment
+    /// on `fair_queue` for the zero-cost-when-off argument. `try_acquire()`
+    /// never consults it: `tryLock()`-style non-blocking acquisition barges
+    /// even under a fair lock (matches `ReentrantLock.tryLock()`, which the
+    /// JDK docs state does not honor the fairness setting).
+    queue: FairQueue,
+    /// The current holder's fair-queue ticket id (0 if none, i.e. the latch
+    /// is unheld, held via `try_acquire()`, or fair mode was off at
+    /// acquire time). Lives on the latch rather than the guard so both the
+    /// normal `Drop` path AND the `release_if_owner()` force-unlock
+    /// recovery path (where the guard was already forgotten) leave the
+    /// queue exactly once. Like `owner`, only ever written by the current
+    /// holder, so plain `Relaxed` loads/stores are race-free.
+    fair_ticket: AtomicU64,
 }
 
 impl ExclusiveLatch {
@@ -29,6 +47,8 @@ impl ExclusiveLatch {
             context,
             inner: Mutex::new(()),
             owner: AtomicU64::new(0),
+            queue: FairQueue::new(),
+            fair_ticket: AtomicU64::new(0),
         }
     }
 
@@ -57,7 +77,32 @@ impl ExclusiveLatch {
         }
 
         let timeout = self.context.timeout;
+
+        // JE ENV_FAIR_LATCHES: when enabled, join the FIFO admission queue
+        // and block until admitted to the front before even attempting the
+        // real lock. A give-up here (timeout) has not taken the real lock at
+        // all, so there is nothing else to release.
+        let fair_ticket = if crate::config::fair_latches() {
+            Some(self.queue.enter(fair_queue::deadline_from(timeout)).map_err(
+                |_| {
+                    LatchError::Timeout(format!(
+                        "Fair-queue admission timed out after {}ms: {}",
+                        timeout.as_millis(),
+                        self.context.name
+                    ))
+                },
+            )?)
+        } else {
+            None
+        };
+
         let guard = self.inner.try_lock_for(timeout).ok_or_else(|| {
+            // Admitted to the fair queue but failed to take the real lock:
+            // must leave the queue or every later waiter is stuck behind us
+            // forever (we are the front).
+            if let Some(id) = fair_ticket {
+                self.queue.leave(id);
+            }
             LatchError::Timeout(format!(
                 "Latch acquisition timed out after {}ms: {}",
                 timeout.as_millis(),
@@ -65,12 +110,13 @@ impl ExclusiveLatch {
             ))
         })?;
         self.owner.store(current, Ordering::Relaxed);
+        self.fair_ticket.store(fair_ticket.unwrap_or(0), Ordering::Relaxed);
         // L-3: record the acquisition for the debug-build latch-ordering
         // assertion (no-op in release builds and for rank-0 latches).
         crate::latch_order::enter(self.context.rank, &self.context.name);
         // JE ENV_FORCED_YIELD: test-only fairness stress (no-op unless set).
         crate::config::maybe_yield();
-        Ok(ExclusiveLatchGuard { latch: self, _guard: guard })
+        Ok(ExclusiveLatchGuard { latch: self, _guard: Some(guard) })
     }
 
     /// Attempts to acquire the latch without blocking.
@@ -93,9 +139,11 @@ impl ExclusiveLatch {
 
         self.inner.try_lock().map(|guard| {
             self.owner.store(current, Ordering::Relaxed);
+            // try_acquire() barges regardless of fair mode (see the `queue`
+            // field doc comment) -- fair_ticket stays 0 (unheld sentinel).
             crate::latch_order::enter(self.context.rank, &self.context.name);
             crate::config::maybe_yield();
-            ExclusiveLatchGuard { latch: self, _guard: guard }
+            ExclusiveLatchGuard { latch: self, _guard: Some(guard) }
         })
     }
 
@@ -136,6 +184,13 @@ impl ExclusiveLatch {
             // remains (see the safety precondition on this method) so this is
             // the only outstanding unlock.
             unsafe { self.inner.force_unlock() };
+            // Release the real lock (above) before leaving the fair queue
+            // (below), matching the guard `Drop` order: the next admitted
+            // waiter must find the real lock already free.
+            let ticket = self.fair_ticket.swap(0, Ordering::Relaxed);
+            if ticket != 0 {
+                self.queue.leave(ticket);
+            }
         }
     }
 }
@@ -154,13 +209,26 @@ impl fmt::Debug for ExclusiveLatch {
 /// RAII guard for an exclusive latch. Releases the latch when dropped.
 pub struct ExclusiveLatchGuard<'a> {
     latch: &'a ExclusiveLatch,
-    _guard: noxu_sync::MutexGuard<'a, ()>,
+    // `Option` so `Drop::drop` can release the real lock (by explicitly
+    // dropping this field's contents) BEFORE leaving the fair queue --
+    // otherwise the next admitted waiter could reach the front of the queue
+    // and immediately re-block on a real lock we have not released yet.
+    _guard: Option<noxu_sync::MutexGuard<'a, ()>>,
 }
 
 impl Drop for ExclusiveLatchGuard<'_> {
     fn drop(&mut self) {
         crate::latch_order::leave(self.latch.context.rank);
         self.latch.owner.store(0, Ordering::Relaxed);
+        // Release the real lock first (see the field doc comment), then
+        // leave the fair queue so the next waiter's turn begins only once
+        // the lock is actually free. `swap` guarantees `leave` fires exactly
+        // once even if this runs during a panic unwind.
+        self._guard.take();
+        let ticket = self.latch.fair_ticket.swap(0, Ordering::Relaxed);
+        if ticket != 0 {
+            self.latch.queue.leave(ticket);
+        }
         // JE ENV_FORCED_YIELD: yield on release too (no-op unless set).
         crate::config::maybe_yield();
     }
