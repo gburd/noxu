@@ -1997,6 +1997,19 @@ impl ReplicatedEnvironment {
         // actual record checksum (JE ReplicaSyncupReader). Otherwise (the
         // VLSN-index-only harness model) fall back to the index view, whose
         // fingerprint is the LSN.
+        //
+        // Gap A step 2: also capture the live `FileManager`, if any, so a
+        // `RollbackToMatchpoint` decision can build (and PROVE correct) a
+        // live `TxnChain` per tail txn id alongside the existing
+        // `classify_tail` gate -- see the call site below. `None` in the
+        // VLSN-index-only harness model, same gating as `log_view`.
+        let fm: Option<Arc<noxu_log::FileManager>> = self
+            .env_impl
+            .lock()
+            .unwrap()
+            .clone()
+            .and_then(|env| env.get_log_manager())
+            .map(|lm| Arc::clone(lm.file_manager()));
         let log_view: Option<crate::stream::syncup_reader::SyncupLogView> =
             self.env_impl.lock().unwrap().clone().and_then(|env| {
                 if let Some(lm) = env.get_log_manager() {
@@ -2081,26 +2094,14 @@ impl ReplicatedEnvironment {
                     None => Vec::new(),
                 };
                 let tail_len = tail_types.len();
-                if let crate::stream::syncup::TailSafety::Refuse { reason } =
-                    crate::stream::syncup::classify_tail(tail_types)
-                {
-                    log::error!(
-                        "Node '{}': REFUSING syncup rollback to matchpoint \
-                         vlsn={mp}: {reason} ({tail_len} diverged tail \
-                         entries left INTACT; no log truncation performed)",
-                        self.config.node_name,
-                    );
-                    return Ok(SyncupAction::DivergedRefused {
-                        matchpoint_vlsn: mp,
-                        tail_len,
-                        reason,
-                    });
-                }
 
                 // Collect the rolled-back LSNs (VLSNs strictly above the
-                // matchpoint). When the real log was re-read, use its EXACT
-                // per-VLSN LSNs so make-invisible flips the right header bytes
-                // (the sparse VLSN index only stores boundary/last LSNs).
+                // matchpoint) up front so BOTH the diagnostic Gap A step 2
+                // chain computation below AND the eventual rollback (if not
+                // refused) use the identical LSN set. When the real log was
+                // re-read, use its EXACT per-VLSN LSNs so make-invisible
+                // flips the right header bytes (the sparse VLSN index only
+                // stores boundary/last LSNs).
                 let rollback_lsns: Vec<noxu_util::Lsn> = match &log_view {
                     Some(v) => v
                         .entries()
@@ -2117,6 +2118,56 @@ impl ReplicatedEnvironment {
                         })
                         .collect(),
                 };
+
+                // Gap A, step 2: compute (but do NOT act on) a live
+                // `TxnChain` per transactional txn id present in the
+                // diverged tail, so the computed revert set is exercised on
+                // the production code path and can be asserted correct by a
+                // test -- see `crate::stream::live_txn_chain` module doc and
+                // `docs/src/operations/known-limitations.md`'s Gap A entry.
+                // This is PURELY diagnostic: `classify_tail`'s verdict below
+                // is computed independently and is NEVER overridden by this
+                // block, whether or not a chain was found. Only runs when a
+                // live `FileManager` is wired (the harness/VLSN-index-only
+                // model has no WAL to re-scan).
+                if let Some(fm) = &fm
+                    && matchpoint_lsn != 0
+                {
+                    let chains = crate::stream::build_tail_chains(
+                        fm,
+                        &rollback_lsns,
+                        noxu_util::Lsn::from_u64(matchpoint_lsn),
+                        &|a: &[u8], b: &[u8]| a.cmp(b),
+                    );
+                    if !chains.is_empty() {
+                        log::debug!(
+                            "Node '{}': Gap A step 2 (diagnostic only, does \
+                             not affect the rollback decision): computed \
+                             {} live TxnChain(s) for the diverged tail \
+                             above matchpoint vlsn={mp} ({} total revert-info \
+                             entries)",
+                            self.config.node_name,
+                            chains.len(),
+                            chains.values().map(|c| c.len()).sum::<usize>(),
+                        );
+                    }
+                }
+
+                if let crate::stream::syncup::TailSafety::Refuse { reason } =
+                    crate::stream::syncup::classify_tail(tail_types)
+                {
+                    log::error!(
+                        "Node '{}': REFUSING syncup rollback to matchpoint \
+                         vlsn={mp}: {reason} ({tail_len} diverged tail \
+                         entries left INTACT; no log truncation performed)",
+                        self.config.node_name,
+                    );
+                    return Ok(SyncupAction::DivergedRefused {
+                        matchpoint_vlsn: mp,
+                        tail_len,
+                        reason,
+                    });
+                }
                 self.execute_rollback(mp, matchpoint_lsn, &rollback_lsns)?;
                 Ok(SyncupAction::RolledBack {
                     matchpoint_vlsn: mp,

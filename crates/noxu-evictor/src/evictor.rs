@@ -882,10 +882,31 @@ impl Evictor {
                                 {
                                     // JE ~2762-2768: dirty & not in pri2 ->
                                     // moveToPri2LRU (one-time second chance).
-                                    self.pri2.lock().add_front(node_id);
-                                    self.stats.increment(
-                                        &self.stats.nodes_moved_to_pri2_lru,
-                                    );
+                                    //
+                                    // Guard against re-adding a node pri2
+                                    // already holds -- `from_pri2` is "which
+                                    // list did this candidate come FROM", not
+                                    // "is it in pri2", so a node inserted
+                                    // straight into `primary_policy` by
+                                    // `note_ins_added` (BIN repopulation /
+                                    // split) while still parked in pri2
+                                    // awaiting a checkpoint reaches here with
+                                    // `from_pri2 == false`. Same fix as the
+                                    // `MoveDirtyToPri2` arm below (a distinct
+                                    // unguarded `add_front` call site with the
+                                    // identical bug pattern; found via
+                                    // read_only_workload_rss_stays_bounded
+                                    // panicking `assertion failed:
+                                    // !self.index.contains_key(&id)` at
+                                    // slab.rs:129 in a single-threaded run).
+                                    let mut pri2 = self.pri2.lock();
+                                    if !pri2.contains(node_id) {
+                                        pri2.add_front(node_id);
+                                        drop(pri2);
+                                        self.stats.increment(
+                                            &self.stats.nodes_moved_to_pri2_lru,
+                                        );
+                                    }
                                 } else {
                                     // JE processTarget fall-through (Evictor.java
                                     // ~2786-2795): once the dirty BIN has had
@@ -2621,6 +2642,48 @@ mod tests {
              link is the corruption this guards",
             p.len
         );
+    }
+
+    /// Second `add_front` site: the dirty-BIN "second chance" arm must also
+    /// guard against re-adding a node pri2 already holds.
+    ///
+    /// `evict_batch` has TWO unguarded `add_front` call sites that share the
+    /// identical bug. The first (`MoveDirtyToPri2`) is covered by the test
+    /// above. This one is the `use_dirty_lru && !from_pri2` dirty-BIN arm
+    /// (Evictor.java ~2762-2768). It was found in the field by
+    /// `read_only_workload_rss_stays_bounded` panicking `assertion failed:
+    /// !self.index.contains_key(&id)` at slab.rs:129; this pins it as a unit so
+    /// the guard is not silently lost, and asserts LIST INTEGRITY rather than
+    /// node residency for the same reason the sibling test does.
+    #[test]
+    fn dirty_bin_second_chance_does_not_double_add_to_pri2() {
+        let (_c, e) = make_evictor(1500, 1000, 10);
+
+        // Tracked by the primary policy AND already parked in pri2.
+        e.note_ins_added(7, CacheMode::Default);
+        e.pri2_insert_for_test(7);
+        assert!(e.primary_policy.contains(7));
+        assert!(e.pri2.lock().contains(7));
+
+        // Dirty BIN, unreferenced, resident: reaches the dirty-BIN second-chance
+        // arm for a candidate drained from the primary policy (from_pri2 ==
+        // false), which is the second unguarded add_front site.
+        let _ = e.evict_batch(
+            EvictionSource::Daemon,
+            &static_info_fn(true, true, true, 0),
+            &size_512,
+        );
+
+        let p = e.pri2.lock();
+        assert_eq!(
+            p.len,
+            p.index.len(),
+            "pri2's len ({}) disagrees with its index size ({}) -- the dirty-BIN \
+             second-chance arm double-linked an already-present node",
+            p.len,
+            p.index.len()
+        );
+        assert!(p.len <= 1, "pri2 holds {} entries for a single node", p.len);
     }
 
     #[test]

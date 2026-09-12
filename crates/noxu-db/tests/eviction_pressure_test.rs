@@ -27,15 +27,46 @@ fn open_small_cache_env(
         .open_database(
             None,
             "evict",
-            &DatabaseConfig::new().with_allow_create(true),
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true),
         )
         .expect("open db");
     (env, db)
 }
 
+/// Writes `n` `{:010}`-keyed `val`-valued records to `db` in batches of 1000
+/// per explicit transaction (one `fdatasync` per 1000 records instead of one
+/// per record). Measured: this crate's auto-commit `db.put()` defaults to
+/// `COMMIT_SYNC`, so an unbatched N-record loop pays N `fdatasync` calls; on a
+/// COW filesystem (btrfs) measured at ~2.9ms/fdatasync that alone is
+/// N * 2.9ms of the test's wall time, unrelated to the eviction behaviour
+/// under test. Batching is exactly the pattern
+/// `large_dataset_sync_load_and_checkpoint_completes` already uses in this
+/// file (200,000 records in 20.5s) and does not change record count / the
+/// working-set-vs-cache ratio, which is the actual property under test.
+fn fill_batched(env: &Environment, db: &Database, n: usize, val: &[u8]) {
+    let mut i = 0usize;
+    while i < n {
+        let end = (i + 1000).min(n);
+        let txn = env.begin_transaction(None).unwrap();
+        for j in i..end {
+            let k = DatabaseEntry::from_vec(format!("{:010}", j).into_bytes());
+            db.put_in(&txn, &k, DatabaseEntry::from_bytes(val)).unwrap();
+        }
+        txn.commit().unwrap();
+        i = end;
+    }
+}
+
 /// With a cache far smaller than the working set, after inserting many records
 /// and running eviction the cache_usage must be bounded (eviction actually
 /// reduces it) AND every record must still be readable (correctness preserved).
+///
+/// Writes are batched 1000/txn (see `fill_batched`) purely to avoid paying an
+/// `fdatasync` per record; this does not change the working-set-vs-cache
+/// ratio the test asserts on. Measured: 156.1s (unbatched, debug, isolation)
+/// -> see the batched timing recorded at commit time.
 #[test]
 fn eviction_bounds_cache_and_preserves_data() {
     let dir = TempDir::new().unwrap();
@@ -44,11 +75,7 @@ fn eviction_bounds_cache_and_preserves_data() {
 
     let n = 50_000usize;
     let val = vec![0u8; 100];
-    for i in 0..n {
-        let k = DatabaseEntry::from_vec(format!("{:010}", i).into_bytes());
-        let v = DatabaseEntry::from_bytes(&val);
-        db.put(&k, &v).unwrap();
-    }
+    fill_batched(&env, &db, n, &val);
 
     // Run eviction explicitly (the daemon also runs, but make it deterministic).
     let _ = env.evict_memory().unwrap();
@@ -86,19 +113,29 @@ fn delete_heavy_does_not_inflate_cache_usage() {
     let val = vec![0u8; 100];
     // Insert then delete the same keys many times. With the F8 leak, each
     // delete would under-subtract by data_len (100B), inflating cache_usage.
+    //
+    // Each round's 2000 puts + 2000 deletes run in ONE explicit transaction
+    // (one fdatasync per round instead of one per record) -- measured
+    // ~2.9ms/fdatasync on this filesystem, so the original 80,000 auto-commit
+    // ops cost ~230s of pure fsync wait, unrelated to the cache-accounting
+    // behaviour under test. Round count and per-round key count are
+    // unchanged, so the working set / churn pattern the test asserts on is
+    // identical.
     for round in 0..20 {
+        let txn = env.begin_transaction(None).unwrap();
         for i in 0..2_000usize {
             let k = DatabaseEntry::from_vec(
                 format!("r{}-{:08}", round % 2, i).into_bytes(),
             );
-            db.put(&k, DatabaseEntry::from_bytes(&val)).unwrap();
+            db.put_in(&txn, &k, DatabaseEntry::from_bytes(&val)).unwrap();
         }
         for i in 0..2_000usize {
             let k = DatabaseEntry::from_vec(
                 format!("r{}-{:08}", round % 2, i).into_bytes(),
             );
-            let _ = db.delete(&k);
+            let _ = db.delete_in(&txn, &k);
         }
+        txn.commit().unwrap();
     }
     let _ = env.evict_memory().unwrap();
     let stats = env.stats().unwrap();
@@ -115,6 +152,10 @@ fn delete_heavy_does_not_inflate_cache_usage() {
 /// A full cursor scan over a working set larger than the cache must return the
 /// correct data for EVERY record (the scan path must re-hydrate stripped LNs
 /// from the log, not return empty data). Validates the scan-path fetchTarget.
+///
+/// Writes are batched via `fill_batched` (see its doc comment) to avoid one
+/// `fdatasync` per record; unrelated to the scan-path behaviour under test.
+/// Measured: 154.6s -> see the batched timing recorded at commit time.
 #[test]
 fn cursor_scan_under_eviction_returns_all_data() {
     use noxu_db::Get;
@@ -123,10 +164,7 @@ fn cursor_scan_under_eviction_returns_all_data() {
 
     let n = 20_000usize;
     let val = vec![7u8; 80];
-    for i in 0..n {
-        let k = DatabaseEntry::from_vec(format!("{:010}", i).into_bytes());
-        db.put(&k, DatabaseEntry::from_bytes(&val)).unwrap();
-    }
+    fill_batched(&env, &db, n, &val);
     let _ = env.evict_memory().unwrap();
 
     // Scan the whole database with a cursor; every record's data must be the
@@ -242,6 +280,10 @@ fn large_dataset_sync_load_and_checkpoint_completes() {
 /// read-then-evict cycles keep `cache_usage` BOUNDED (no unbounded cache
 /// growth). Also proves read-consistency: a re-populated-slot read returns
 /// the same bytes a cold fetch does.
+///
+/// Initial load is batched 1000/txn to avoid one `fdatasync` per record
+/// (unrelated to the read/re-populate behaviour under test).
+/// Measured: 159.5s -> see the batched timing recorded at commit time.
 #[test]
 fn repopulated_read_is_consistent_and_budget_bounded() {
     let dir = TempDir::new().unwrap();
@@ -255,9 +297,19 @@ fn repopulated_read_is_consistent_and_budget_bounded() {
         v[..4].copy_from_slice(&(i as u32).to_be_bytes());
         v
     };
-    for i in 0..n {
-        let k = DatabaseEntry::from_vec(format!("{:010}", i).into_bytes());
-        db.put(&k, DatabaseEntry::from_bytes(&make_val(i))).unwrap();
+    // Batched 1000/txn -- see fill_batched's doc comment for why (avoids one
+    // fdatasync per record; does not change record count or values).
+    let mut i = 0usize;
+    while i < n {
+        let end = (i + 1000).min(n);
+        let txn = env.begin_transaction(None).unwrap();
+        for j in i..end {
+            let k = DatabaseEntry::from_vec(format!("{:010}", j).into_bytes());
+            db.put_in(&txn, &k, DatabaseEntry::from_bytes(&make_val(j)))
+                .unwrap();
+        }
+        txn.commit().unwrap();
+        i = end;
     }
     // Force LN stripping: cache << working set.
     let _ = env.evict_memory().unwrap();
@@ -322,6 +374,11 @@ fn repopulated_read_is_consistent_and_budget_bounded() {
 /// the lead-benchmarks work) must climb only marginally during the hot-read
 /// phase.  Without the LRU touch the hot BINs are stripped between reads and
 /// `n_random_reads` climbs ~1 per hot read.
+///
+/// The cold-set initial load is batched 1000/txn to avoid one `fdatasync`
+/// per record (see `fill_batched`'s doc comment); unrelated to the LRU
+/// keep-hot behaviour under test. Measured: 240s+ -> see the batched timing
+/// recorded at commit time.
 #[test]
 fn default_cache_mode_keeps_hot_lns_resident() {
     let dir = TempDir::new().unwrap();
@@ -333,10 +390,10 @@ fn default_cache_mode_keeps_hot_lns_resident() {
     let cold_n = 60_000usize;
     let hot: Vec<usize> = (0..200).map(|i| i * 251).collect(); // spread
     let val = vec![0x5au8; 100];
-    for i in 0..cold_n {
-        let k = DatabaseEntry::from_vec(format!("{:010}", i).into_bytes());
-        db.put(&k, DatabaseEntry::from_bytes(&val)).unwrap();
-    }
+    // Batched 1000/txn -- see fill_batched's doc comment (avoids one
+    // fdatasync per record; the read/eviction behaviour measured below is
+    // unaffected by how the initial load was committed).
+    fill_batched(&env, &db, cold_n, &val);
 
     let read = |i: usize| {
         let k = DatabaseEntry::from_vec(format!("{:010}", i).into_bytes());
@@ -418,6 +475,10 @@ fn default_cache_mode_keeps_hot_lns_resident() {
 /// byte-identical data.  (Fault *counts* are asserted at the log level, not
 /// here, because the DB read can be partly absorbed by the write buffer pool,
 /// which makes the DB-level random-read count non-deterministic.)
+///
+/// The cold-set load is batched 1000/txn to avoid one `fdatasync` per record
+/// (unrelated to the strip/re-fetch behaviour under test). Measured: 84.3s
+/// -> see the batched timing recorded at commit time.
 #[test]
 fn stripped_ln_refetch_roundtrips() {
     let dir = TempDir::new().unwrap();
@@ -427,9 +488,22 @@ fn stripped_ln_refetch_roundtrips() {
     let value = vec![0x5au8; 100];
     db.put(&key, DatabaseEntry::from_bytes(&value)).unwrap();
 
-    for i in 0..20_000usize {
-        let k = DatabaseEntry::from_vec(format!("cold{:08}", i).into_bytes());
-        db.put(&k, DatabaseEntry::from_bytes(&[0u8; 100])).unwrap();
+    // Batched 1000/txn -- see fill_batched's doc comment (avoids one
+    // fdatasync per record; unrelated to the strip/re-fetch behaviour under
+    // test).
+    let cold_n = 20_000usize;
+    let mut i = 0usize;
+    while i < cold_n {
+        let end = (i + 1000).min(cold_n);
+        let txn = env.begin_transaction(None).unwrap();
+        for j in i..end {
+            let k =
+                DatabaseEntry::from_vec(format!("cold{:08}", j).into_bytes());
+            db.put_in(&txn, &k, DatabaseEntry::from_bytes(&[0u8; 100]))
+                .unwrap();
+        }
+        txn.commit().unwrap();
+        i = end;
     }
     // Strip the LNs (drops the hot-key slot data, keeps the LSN).
     let _ = env.evict_memory().unwrap();
