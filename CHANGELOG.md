@@ -16,6 +16,8 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+## [7.10.0] - 2026-09-12
+
 ### Added
 
 - **`env_fair_latches` (JE `setFairLatches`) wired end to end.** `noxu-latch`
