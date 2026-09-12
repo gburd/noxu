@@ -15,6 +15,33 @@ finding IDs, full test-gate counts), see the annotated git tags
 listed in [References](#references).
 ## [Unreleased]
 
+### Fixed
+
+- **`env_db_eviction` implemented (JE-faithful closed-database metadata
+  eviction); prior doc conflation corrected.** `env_db_eviction` was settable
+  but inert (WARN on set, no effect), and `known-limitations.md`'s wording
+  ("per-database node eviction") described the wrong feature -- a misreading
+  that this fix corrects. JE's actual semantics
+  (`EnvironmentConfig.ENV_DB_EVICTION` javadoc): "enable eviction of metadata
+  for closed databases"; default `true`, immutable; "there is no known
+  benefit to setting this parameter to false". It gates whether a CLOSED
+  database's `DatabaseImpl` (name/config/comparator identity, cached
+  B-tree) can leave the open-database map once nobody has it open -- it has
+  nothing to do with targeting eviction among OPEN databases' cached pages.
+  Implemented: once a database's last handle is closed
+  (`reference_count() <= 0`), it becomes eligible for eviction;
+  `evict_closed_databases()` (wired into `evict_memory()` /
+  `critical_eviction()`) removes it from `db_map`, stashing the tree's root
+  LSN and live entry count so a subsequent `open_database()` for the same
+  name transparently reconstructs it from the persisted catalog. A database
+  with any open handle is never evicted -- verified by dedicated tests
+  (`dbevict1_in_use_database_is_never_evicted`,
+  `dbevict1_second_open_handle_keeps_database_pinned`). Default changed
+  `false` -> `true` (matching JE) in `EnvironmentConfig` / `DbiEnvConfig`.
+  Removed the `unimplemented_params.rs` registry entry and its WARN test.
+  Rewrote the misleading rustdoc on `EnvironmentConfig::env_db_eviction` /
+  `set_env_db_eviction` and the `known-limitations.md` row.
+
 ## [7.9.1] - 2026-09-10
 
 ## [7.9.0] - 2026-09-10

@@ -2621,9 +2621,7 @@ impl EnvironmentImpl {
         // root_lsn/entry_count sits abandoned under the old key -- and a
         // reopen under new_name would silently miss the stash it needs.
         if let Some(evicted) = self.evicted_db_state.write().remove(old_name) {
-            self.evicted_db_state
-                .write()
-                .insert(new_name.to_string(), evicted);
+            self.evicted_db_state.write().insert(new_name.to_string(), evicted);
         }
 
         // In a full implementation, would log the rename
@@ -4733,7 +4731,8 @@ mod tests {
     #[test]
     fn dbevict1_env_db_eviction_false_pins_closed_database() {
         let dir = TempDir::new().unwrap();
-        let cfg = DbiEnvConfig { env_db_eviction: false, ..DbiEnvConfig::default() };
+        let cfg =
+            DbiEnvConfig { env_db_eviction: false, ..DbiEnvConfig::default() };
         let env = EnvironmentImpl::from_dbi_config(dir.path(), &cfg).unwrap();
         assert!(!env.env_db_eviction);
 
