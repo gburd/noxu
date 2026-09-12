@@ -7,6 +7,7 @@
 //! This may also operate in exclusive-only mode where `acquire_shared()`
 //! behaves like `acquire_exclusive()`. BIN latches use this mode.
 
+use crate::fair_queue::{self, FairQueue};
 use crate::{LatchContext, LatchError};
 use noxu_sync::RwLock;
 use std::collections::HashMap;
@@ -62,6 +63,19 @@ pub struct SharedLatch {
     inner: RwLock<()>,
     /// Thread ID of the exclusive owner (0 if not exclusively held).
     exclusive_owner: AtomicU64,
+    /// FIFO admission queue backing `env_fair_latches`. See the identical
+    /// field on `ExclusiveLatch` for the zero-cost-when-off argument; the
+    /// per-JE-notes design here additionally means fair mode fully
+    /// serializes readers (no contiguous-reader batching) -- see
+    /// `.agent/notes-fair-latches.md`. `try_acquire_exclusive()` never
+    /// consults it (barges, matching `tryLock()` semantics).
+    queue: FairQueue,
+    /// The current holder's fair-queue ticket id (0 if none). Because fair
+    /// mode fully serializes (see `queue` doc comment), at most one thread
+    /// -- reader or writer -- ever holds a non-zero ticket at a time, so a
+    /// single latch-level slot (shared by both `acquire_exclusive` and
+    /// `acquire_shared`) is sufficient, exactly like `exclusive_owner`.
+    fair_ticket: AtomicU64,
 }
 
 impl SharedLatch {
@@ -72,6 +86,8 @@ impl SharedLatch {
             exclusive_only,
             inner: RwLock::new(()),
             exclusive_owner: AtomicU64::new(0),
+            queue: FairQueue::new(),
+            fair_ticket: AtomicU64::new(0),
         }
     }
 
@@ -120,7 +136,28 @@ impl SharedLatch {
         }
 
         let timeout = self.context.timeout;
+
+        // JE ENV_FAIR_LATCHES: join the FIFO admission queue before even
+        // attempting the real write lock. See `ExclusiveLatch::acquire` for
+        // the identical pattern and rationale.
+        let fair_ticket = if crate::config::fair_latches() {
+            Some(self.queue.enter(fair_queue::deadline_from(timeout)).map_err(
+                |()| {
+                    LatchError::Timeout(format!(
+                        "Fair-queue admission timed out after {}ms: {}",
+                        timeout.as_millis(),
+                        self.context.name
+                    ))
+                },
+            )?)
+        } else {
+            None
+        };
+
         let guard = self.inner.try_write_for(timeout).ok_or_else(|| {
+            if let Some(id) = fair_ticket {
+                self.queue.leave(id);
+            }
             LatchError::Timeout(format!(
                 "Latch acquisition timed out after {}ms: {}",
                 timeout.as_millis(),
@@ -128,12 +165,13 @@ impl SharedLatch {
             ))
         })?;
         self.exclusive_owner.store(current, Ordering::Relaxed);
+        self.fair_ticket.store(fair_ticket.unwrap_or(0), Ordering::Relaxed);
         // L-3: record the exclusive acquisition for the debug-build latch-
         // ordering assertion (no-op in release builds and for rank-0 latches).
         crate::latch_order::enter(self.context.rank, &self.context.name);
         // JE ENV_FORCED_YIELD: test-only fairness stress (no-op unless set).
         crate::config::maybe_yield();
-        Ok(SharedLatchWriteGuard { latch: self, _guard: guard })
+        Ok(SharedLatchWriteGuard { latch: self, _guard: Some(guard) })
     }
 
     /// Attempts to acquire the latch for exclusive access without blocking.
@@ -151,9 +189,10 @@ impl SharedLatch {
 
         self.inner.try_write().map(|guard| {
             self.exclusive_owner.store(current, Ordering::Relaxed);
+            // Barges regardless of fair mode; fair_ticket stays 0.
             crate::latch_order::enter(self.context.rank, &self.context.name);
             crate::config::maybe_yield();
-            SharedLatchWriteGuard { latch: self, _guard: guard }
+            SharedLatchWriteGuard { latch: self, _guard: Some(guard) }
         })
     }
 
@@ -185,7 +224,31 @@ impl SharedLatch {
             }
 
             let timeout = self.context.timeout;
+
+            // JE ENV_FAIR_LATCHES: join the FIFO admission queue before even
+            // attempting the real read lock. Per `.agent/notes-fair-latches.md`,
+            // fair mode fully serializes -- a reader admitted to the front
+            // still excludes every other reader/writer until it leaves.
+            let fair_ticket = if crate::config::fair_latches() {
+                Some(
+                    self.queue
+                        .enter(fair_queue::deadline_from(timeout))
+                        .map_err(|()| {
+                            LatchError::Timeout(format!(
+                                "Fair-queue admission timed out after {}ms: {}",
+                                timeout.as_millis(),
+                                self.context.name
+                            ))
+                        })?,
+                )
+            } else {
+                None
+            };
+
             let guard = self.inner.try_read_for(timeout).ok_or_else(|| {
+                if let Some(id) = fair_ticket {
+                    self.queue.leave(id);
+                }
                 LatchError::Timeout(format!(
                     "Latch acquisition timed out after {}ms: {}",
                     timeout.as_millis(),
@@ -194,10 +257,11 @@ impl SharedLatch {
             })?;
             let latch_id = self as *const Self as usize;
             increment_read_hold(latch_id);
+            self.fair_ticket.store(fair_ticket.unwrap_or(0), Ordering::Relaxed);
             crate::config::maybe_yield();
             Ok(SharedLatchGuard::Read(SharedLatchReadGuard {
-                latch_id,
-                _guard: guard,
+                latch: self,
+                _guard: Some(guard),
             }))
         }
     }
@@ -231,15 +295,22 @@ pub enum SharedLatchGuard<'a> {
 
 /// RAII guard for shared/read access. Releases when dropped.
 pub struct SharedLatchReadGuard<'a> {
-    latch_id: usize,
-    _guard: noxu_sync::RwLockReadGuard<'a, ()>,
+    latch: &'a SharedLatch,
+    // `Option` so `Drop::drop` can release the real read lock before leaving
+    // the fair queue -- see `ExclusiveLatchGuard`'s identical field comment.
+    _guard: Option<noxu_sync::RwLockReadGuard<'a, ()>>,
 }
 
 impl Drop for SharedLatchReadGuard<'_> {
     fn drop(&mut self) {
         // Decrement before the inner guard drops to keep the count accurate
         // for any code that runs between our drop and the lock release.
-        decrement_read_hold(self.latch_id);
+        decrement_read_hold(self.latch as *const SharedLatch as usize);
+        self._guard.take();
+        let ticket = self.latch.fair_ticket.swap(0, Ordering::Relaxed);
+        if ticket != 0 {
+            self.latch.queue.leave(ticket);
+        }
         // JE ENV_FORCED_YIELD: yield on release too (no-op unless set).
         crate::config::maybe_yield();
     }
@@ -248,13 +319,18 @@ impl Drop for SharedLatchReadGuard<'_> {
 /// RAII guard for exclusive/write access. Releases when dropped.
 pub struct SharedLatchWriteGuard<'a> {
     latch: &'a SharedLatch,
-    _guard: noxu_sync::RwLockWriteGuard<'a, ()>,
+    _guard: Option<noxu_sync::RwLockWriteGuard<'a, ()>>,
 }
 
 impl Drop for SharedLatchWriteGuard<'_> {
     fn drop(&mut self) {
         crate::latch_order::leave(self.latch.context.rank);
         self.latch.exclusive_owner.store(0, Ordering::Relaxed);
+        self._guard.take();
+        let ticket = self.latch.fair_ticket.swap(0, Ordering::Relaxed);
+        if ticket != 0 {
+            self.latch.queue.leave(ticket);
+        }
         // JE ENV_FORCED_YIELD: yield on release too (no-op unless set).
         crate::config::maybe_yield();
     }

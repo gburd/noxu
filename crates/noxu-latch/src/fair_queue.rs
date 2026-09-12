@@ -50,8 +50,22 @@
 use noxu_sync::{Condvar, Mutex};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+/// Computes the `Instant` deadline `timeout` in the future, for use with
+/// [`FairQueue::enter`].
+///
+/// Uses `checked_add` rather than the panicking `+` operator: the only
+/// caller of this is `exclusive.rs`/`shared.rs` passing a `LatchContext`'s
+/// configured timeout, which can be the "effectively forever" no-timeout
+/// sentinel (`config::EFFECTIVELY_FOREVER`, ~292 million years) -- large
+/// enough that `Instant::now() + timeout` is not guaranteed not to overflow
+/// on every platform's `Instant` representation. On overflow this falls back
+/// to `None` (wait forever), which is exactly the right behaviour for that
+/// sentinel anyway.
+pub(crate) fn deadline_from(timeout: Duration) -> Option<Instant> {
+    Instant::now().checked_add(timeout)
+}
 
 /// Monotonic id generator for queue entries. Shared process-wide (not
 /// per-queue) purely so ids are easy to eyeball in traces; uniqueness only
@@ -149,8 +163,7 @@ impl std::fmt::Debug for FairQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering as AOrdering};
-    use std::sync::{Arc, Barrier};
+    use std::sync::Arc;
     use std::time::Duration;
 
     #[test]
@@ -165,41 +178,33 @@ mod tests {
         let q = Arc::new(FairQueue::new());
         const N: usize = 8;
         let order = Arc::new(Mutex::new(Vec::<usize>::new()));
-        let start_barrier = Arc::new(Barrier::new(N + 1));
-        let enrolled = Arc::new(AtomicUsize::new(0));
 
-        // Each thread enrolls (pushes to the queue) strictly in index order
-        // by taking a turn signal before calling enter -- we can't control
-        // OS scheduling, so we serialize the *push* itself under a second
-        // mutex to pin arrival order deterministically, which is exactly
-        // what this test needs to check (grant order == arrival order).
-        let push_lock = Arc::new(Mutex::new(()));
+        // Occupy the front so every worker below blocks inside `enter()`
+        // until we release it, giving us control over when admission can
+        // begin. `enter()` only returns to the thread that reaches the
+        // front, so there is no "I have pushed" signal to synchronize a
+        // push-order barrier on other than wall-clock staggering (matching
+        // the pattern `exclusive.rs::test_multiple_waiters_sequential_grant`
+        // already uses for the same reason).
+        let holder = q.enter(None).expect("holder enters");
+
         let mut handles = Vec::new();
         for i in 0..N {
             let q = q.clone();
             let order = order.clone();
-            let start_barrier = start_barrier.clone();
-            let enrolled = enrolled.clone();
-            let push_lock = push_lock.clone();
             handles.push(std::thread::spawn(move || {
-                // Wait until it is this thread's turn to push, in order.
-                loop {
-                    let g = push_lock.lock();
-                    if enrolled.load(AOrdering::SeqCst) == i {
-                        let id = q.enter(None).expect("enter");
-                        enrolled.fetch_add(1, AOrdering::SeqCst);
-                        drop(g);
-                        start_barrier.wait();
-                        order.lock().push(i);
-                        q.leave(id);
-                        return;
-                    }
-                    drop(g);
-                    std::thread::yield_now();
-                }
+                std::thread::sleep(Duration::from_millis(5 * (i as u64 + 1)));
+                let id = q.enter(None).expect("enter");
+                order.lock().push(i);
+                q.leave(id);
             }));
         }
-        start_barrier.wait();
+
+        // Give every worker time to have pushed (the last one sleeps
+        // 5*N ms) before releasing the holder and letting admission begin.
+        std::thread::sleep(Duration::from_millis(5 * (N as u64 + 1) + 50));
+        q.leave(holder);
+
         for h in handles {
             h.join().unwrap();
         }
