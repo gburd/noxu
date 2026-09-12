@@ -69,6 +69,7 @@ spec:
 # iteration (measured: shuttle_bin_split 189s debug vs 6s release).
 shuttle:
 	RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-sync    --test shuttle_rwlock_reservation --release
+	RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-latch   --test shuttle_fair_latch --release
 	RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-util    --test shuttle_dst_sync_pl --release
 	RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-engine  --test shuttle_daemon_shutdown --release
 	RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-log     --test shuttle_fsync_manager --release
