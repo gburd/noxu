@@ -84,6 +84,7 @@ shuttle:
 	RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-evictor --test shuttle_shared_cache --release
 	RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-tree    --test shuttle_bin_split --release
 	RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-tree    --test shuttle_checkpoint_mutation --release
+	RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-tree    --test shuttle_evict_pin_race --release
 	RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-dbi     --test shuttle_cursor --release
 	RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-rep     --test shuttle_rep_sync --release
 

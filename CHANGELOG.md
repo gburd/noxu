@@ -113,6 +113,16 @@ listed in [References](#references).
   (documented): the change is visible at commit, not within the open transaction,
   and the pre-commit name is not hidden from concurrent readers — full within-txn
   name visibility needs a transactional naming tree and is tracked separately.
+- **Eviction no longer detaches a BIN that was re-dirtied or pinned since its
+  flush.** The evictor logged a dirty BIN under the child latch, released it,
+  then detached under the parent latch — a window in which a cursor could
+  re-dirty the BIN (a new, unlogged slot) or pin it. Detach published the stale
+  flushed image and dropped the BIN, losing the window update on refault or
+  yanking a pinned BIN. Detach now re-validates under the parent latch and
+  refuses (keeps the node resident, re-flushing next pass) if the BIN is pinned
+  or dirty, matching JE's continuous-latch log→detach with an `isPinned` recheck.
+  (A dirty upper internal node evicted without logging is a related, separately
+  tracked gap.)
 
 ### Changed
 
