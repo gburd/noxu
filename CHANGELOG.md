@@ -100,18 +100,6 @@ listed in [References](#references).
   environment instead of being silently retryable in-process; free space and
   reopen. Still uncertified and tracked: reopen-after-fail-stop recovery,
   cleaner-vs-failed-replacement, and replication log-writer paths.
-- **The exported evictor metrics report real values instead of constants.**
-  `noxu_evictor_cache_hit_ratio` was permanently `1.0` (its backing
-  `bin_fetch`/`bin_fetch_miss` counters had no production writers) and
-  `noxu_evictor_lru_size` was permanently `0` (its refresh had no caller on the
-  stats path) — an operator dashboard showed a perfect cache and an empty LRU
-  regardless of workload. Both are now wired (JE `IN.incFetchStats` /
-  `Evictor.loadStats`) and a guard test asserts every exported evictor metric
-  moves under a real workload, so a dead gauge cannot regress unnoticed.
-  **Migration:** no API/on-disk change; dashboards will now see moving values —
-  review any alert rules that assumed the old constants (`1.0`, `0`).
-  Replication health metrics (`RepStats`) remain unwired and unexported (no
-  fabricated rep gauge is shipped); wiring them is tracked as a separate task.
 
 ### Changed
 
