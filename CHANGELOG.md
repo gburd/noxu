@@ -60,14 +60,22 @@ listed in [References](#references).
     `last_full_lsn == NULL` and is forced full regardless; delta eligibility is
     restored after the next full log.
 
+  - **BIN sibling-merge could leave a stale full-image base (defense-in-depth).**
+    `compress_node`'s non-empty sibling-merge arm left the merge survivor's
+    `last_full_lsn` on its pre-merge image; a later delta would lose the
+    merged-in keys on recovery. The survivor now sets `prohibit_next_delta`. This
+    completes the BIN-delta base-invalidation class — a full audit of every bulk
+    entry-replacement site confirms the class is CLOSED: upper INs are never
+    delta-logged, and all three BIN slot-mutation sites (physical delete, split,
+    merge) are guarded. Note this merge arm has no production caller today
+    (`env.compress()` and the compressor daemon only prune empty BINs); the guard
+    protects the boundary if it is ever wired into production.
+
   Known follow-ups deliberately left open (tracked, not yet fixed): dirty-BIN
   eviction failing closed on a log-write error (WAL failed-append fail-stop, in
-  progress); dirty generation/pin eviction races; dirty upper-IN eviction
-  handling; the cleaner's legacy protected-retry phantom-deletion accounting;
-  recovery discarding a database's configured `NODE_MAX_ENTRIES`; and the
-  `compress_node` sibling-merge survivor base (guarded defensively — that merge
-  path has no production caller today). The BIN-delta base-invalidation class is
-  being swept for any remaining reachable site.
+  review); dirty generation/pin eviction races; dirty upper-IN eviction
+  handling; the cleaner's legacy protected-retry phantom-deletion accounting; and
+  recovery discarding a database's configured `NODE_MAX_ENTRIES`.
 
 ### Changed
 

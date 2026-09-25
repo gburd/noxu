@@ -119,6 +119,7 @@
 # Internal Documents
 
 - [Internal Overview](internal/README.md)
+  - [BIN-Delta Base-Invalidation Audit](internal/bin-delta-base-invalidation-audit-2026-09.md)
   - [Serialization Research](internal/serialization-research.md)
   - [Checksum Selection](internal/checksum-selection.md)
   - [mTLS-by-default design (2026-05)](internal/auth-mtls-design-2026-05.md)
