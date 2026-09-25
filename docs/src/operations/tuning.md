@@ -47,9 +47,12 @@ environment permanently invalidated by a WAL I/O failure must still follow
 the normal failure/recovery procedure; this change does not clear invalidation.
 No format migration is required, and already-lost updates are not restored.
 
-This fix covers unsuccessful dirty-BIN logging only. Dirty-generation/pin
-races between logging and detach, and dirty upper-IN handling, remain separate
-open safety issues; it is not a general eviction data-loss-safety guarantee.
+This fix covers unsuccessful dirty-BIN logging only. WAL obsolete-image
+accounting after failed writes remains an open blocker: retaining the dirty
+node alone is not sufficient to make repeated logging attempts safe.
+Dirty-generation/pin races between logging and detach, and dirty upper-IN
+handling, also remain separate open safety issues. This is not a general
+eviction data-loss-safety guarantee.
 
 ## Recommended production settings
 
