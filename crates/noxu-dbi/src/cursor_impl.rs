@@ -190,7 +190,12 @@ pub struct CursorImpl {
     /// boundary — a delete-all loop would clear only the first BIN.  We save
     /// the deleted key here and use it as the cross-BIN anchor, mirroring
     /// JE's "cursor stays positioned at the deleted slot; advance from
-    /// there" semantics.  Cleared on every successful (re)position.
+    /// there" semantics.  Not cleared on reposition: it is only ever read as
+    /// `current_key.as_ref().or(last_deleted_key.as_ref())`, and every
+    /// successful (re)position sets `current_key = Some(..)`, which shadows
+    /// any stale value here — so the anchor is used only while
+    /// `PendingDeleted` (i.e. immediately after `delete()`, before the next
+    /// successful advance sets `current_key`).
     last_deleted_key: Option<Vec<u8>>,
 
     /// The BIN Arc the cursor is currently pinned to, if any.
@@ -2480,13 +2485,31 @@ impl CursorImpl {
                 }
             };
             if stale_split {
-                // Re-anchor: find the BIN that now contains current_key.
+                // Re-anchor: find the BIN that now contains the anchor key.
+                //
+                // NEW-3 (reverse): after a delete `current_key` is None but
+                // `last_deleted_key` holds the just-removed key.  When a
+                // reverse (`Get::Prev`) delete removes the LAST live slot of a
+                // BIN, `current_index` is left >= len (out of bounds), so the
+                // `stale_split` guard fires even though the predecessor still
+                // lives in this same BIN.  We must resume the within-BIN
+                // backward scan, not cross the boundary yet.  Fall back to
+                // `last_deleted_key` for the anchor (same `.or(...)` pattern
+                // used at the cross-BIN site) so re-anchor lands in the right
+                // BIN and continues.  This mirrors JE, which keeps the
+                // PD-flagged slot (and thus `index`) in the pinned `bin` and
+                // does the within-BIN `--index > -1` step before ever calling
+                // `Tree.getPrevBin` (`CursorImpl.java:2579,2624` getNext).
+                let anchor_for_reanchor = self
+                    .current_key
+                    .as_deref()
+                    .or(self.last_deleted_key.as_deref());
                 let reanchor_result: Option<(
                     std::sync::Arc<
                         noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>,
                     >,
                     i32,
-                )> = self.current_key.as_deref().and_then(|ck| {
+                )> = anchor_for_reanchor.and_then(|ck| {
                     let db = self.db_impl.read();
                     let tree = db.get_real_tree()?;
                     let root = tree.get_root()?;
@@ -2495,14 +2518,60 @@ impl CursorImpl {
                         ck,
                         tree.get_comparator(),
                     )?;
+                    let cmp = tree.get_comparator();
                     let idx = {
                         let g = found_arc.read();
                         if let TreeNode::Bottom(bin) = &*g {
-                            // Binary-search for current_key within the new BIN.
-                            (0..bin.entries.len() as i32).find(|&i| {
+                            let nentries = bin.entries.len() as i32;
+                            // Look for an exact match first (D5/split case:
+                            // the key still exists, just moved slots).
+                            let exact = (0..nentries).find(|&i| {
                                 bin.get_full_key(i as usize)
                                     .is_some_and(|k| k == ck)
-                            })
+                            });
+                            match exact {
+                                Some(i) => Some(i),
+                                // No exact match: the anchor key was physically
+                                // removed by `delete()` (NEW-3).  Position the
+                                // re-anchor at the gap where the key would be
+                                // — the count of live slots ordered strictly
+                                // before the anchor — so the retry step (gap for
+                                // forward, gap-1 for reverse) resumes at the
+                                // correct neighbour, exactly as JE resumes from
+                                // the deleted slot's `index`.
+                                None => {
+                                    let gap = (0..nentries)
+                                        .take_while(|&i| {
+                                            bin.get_full_key(i as usize)
+                                                .is_some_and(|k| {
+                                                    let ord = match cmp {
+                                                        Some(c) => c(&k, ck),
+                                                        None => {
+                                                            k.as_slice().cmp(ck)
+                                                        }
+                                                    };
+                                                    ord
+                                                        == std::cmp::Ordering::Less
+                                                })
+                                        })
+                                        .count()
+                                        as i32;
+                                    // The gap is index `gap` (live slots
+                                    // `0..gap` are strictly before the anchor;
+                                    // `gap..nentries` are strictly after).  The
+                                    // retry step below is `+1` for forward and
+                                    // `-1` for reverse, and it starts from the
+                                    // returned index.  We want the retry to
+                                    // land ON the neighbour: forward on the
+                                    // first slot at/after the gap (`gap`),
+                                    // reverse on the last slot before the gap
+                                    // (`gap - 1`).  So return `gap - 1` for
+                                    // forward and `gap` for reverse.  This
+                                    // reproduces JE resuming from the deleted
+                                    // slot's `index` (`--index`/`++index`).
+                                    Some(if forward { gap - 1 } else { gap })
+                                }
+                            }
                         } else {
                             None
                         }
