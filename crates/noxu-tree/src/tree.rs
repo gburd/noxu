@@ -2927,6 +2927,27 @@ impl Tree {
         }
     }
 
+    /// Record the `nBINsFetch` count for a descent that has just reached its
+    /// terminal BIN (JE `IN.incFetchStats` on `fetchTarget`, IN.java:3003 —
+    /// fired on **every** fetch, hit or miss).
+    ///
+    /// This is the single definition of the BIN-arrival fetch rule. Every
+    /// descent that can fault a BIN via `child_at_or_fetch` /
+    /// `fetch_root_from_log` (which records `bin_fetch_miss`) MUST call this at
+    /// its BIN-arrival point, so `bin_fetch` counts every BIN reached (hits +
+    /// misses) and the invariant `bin_fetch_miss <= bin_fetch` holds on all
+    /// descent paths — not only `search_with_data`. A resident BIN reached by
+    /// the hand-over-hand fast path never enters `child_at_or_fetch`, so the
+    /// hit count can only be taken here, at arrival; the miss count can only
+    /// be taken at the fault site. The two counts therefore live at two sites
+    /// by construction, and this helper keeps the arrival half in one place.
+    #[inline]
+    fn note_bin_arrival(&self, guard: &NodeArcReadGuard) {
+        if let TreeNode::Bottom(bin) = &**guard {
+            self.note_bin_access(bin.is_delta);
+        }
+    }
+
     /// Notify the listener that a BIN/upper-IN had to be re-read from the log
     /// (a cache miss — JE fetch `isMiss=true`), backing `bin_fetch_miss` /
     /// `upper_in_fetch_miss` for the exported hit-ratio metric.
@@ -3294,6 +3315,14 @@ impl Tree {
         };
         for idx in 0..n_entries {
             if let Some(child) = self.child_at_or_fetch(node_arc, idx) {
+                // JE `nBINsFetch`: `child_at_or_fetch` records a BIN miss when
+                // it faults a non-resident BIN from the log; count the
+                // matching fetch here so materialization keeps
+                // `bin_fetch_miss <= bin_fetch`. Recursion into a BIN child
+                // returns immediately (BINs have no IN children), so the
+                // arrival must be counted at this level. `note_bin_arrival`
+                // is a no-op for an internal child.
+                self.note_bin_arrival(&child.read_arc());
                 self.materialize_recursive(&child);
             }
         }
@@ -3376,6 +3405,16 @@ impl Tree {
                 if let TreeNode::Bottom(bin) = &*guard {
                     self.note_accessed(bin.node_id);
                 }
+                // JE `nBINsFetch` (IN.incFetchStats on every fetchTarget,
+                // IN.java:3003): count the BIN this descent reached. The miss
+                // fraction is recorded at the shared fault site
+                // (`child_at_or_fetch`), so this arrival count MUST fire on
+                // every descent that can fault — including this one, which the
+                // cleaner LN-liveness probe (lookup_parent_bin) and cursor
+                // existence checks reach. Without it a cleaner-faulted BIN
+                // records a miss with no matching fetch and the exported
+                // cache-hit ratio goes negative (fabricated-metric bug B3/V22).
+                self.note_bin_arrival(&guard);
                 // Reached a BIN: final key lookup within the same guard.
                 // Use indicate_if_duplicate=true so an exact match sets
                 // EXACT_MATCH in the return value.  Guard against -1 (not
@@ -3795,6 +3834,11 @@ impl Tree {
 
         loop {
             if guard.is_bin() {
+                // JE `nBINsFetch`: count the BIN reached by this cursor range
+                // seek (the miss fraction is recorded at the shared fault
+                // site). Required so a faulted BIN on this path does not
+                // record a miss with no matching fetch.
+                self.note_bin_arrival(&guard);
                 let result = match &*guard {
                     TreeNode::Bottom(bin) => {
                         let (mut idx, _exact) = match &self.key_comparator {
@@ -3893,6 +3937,9 @@ impl Tree {
         let mut guard: NodeArcReadGuard = self.get_root()?.read_arc();
         loop {
             if guard.is_bin() {
+                // JE `nBINsFetch`: count the BIN reached by this cursor range
+                // seek (miss fraction recorded at the shared fault site).
+                self.note_bin_arrival(&guard);
                 if let TreeNode::Bottom(bin) = &*guard {
                     let (idx, _exact) = match &self.key_comparator {
                         Some(cmp) => bin.find_entry_cmp(key, cmp.as_ref()),
@@ -5059,6 +5106,13 @@ impl Tree {
             let mut guard = node_arc.write();
             match &mut *guard {
                 TreeNode::Bottom(bin) => {
+                    // JE `nBINsFetch` (IN.incFetchStats on fetchTarget): the
+                    // redo descent reached this BIN. The miss fraction for a
+                    // BIN faulted on the way down is recorded at the shared
+                    // fault site (child_at_or_fetch); count the matching
+                    // arrival here so `bin_fetch_miss <= bin_fetch` also holds
+                    // on the recovery-redo path.
+                    tree.note_bin_access(bin.is_delta);
                     // REC-F2: JE redo currency check
                     // (RecoveryManager.redo() line ~2512/2544).  A logged LN
                     // is applied only when logrecLsn > treeLsn.  If the slot
@@ -5479,6 +5533,10 @@ impl Tree {
             let mut g = node_arc.write();
             match &mut *g {
                 TreeNode::Bottom(bin) => {
+                    // JE `nBINsFetch`: the delete descent reached this BIN
+                    // (miss fraction recorded at the shared fault site) so
+                    // `bin_fetch_miss <= bin_fetch` holds on the delete path.
+                    tree.note_bin_access(bin.is_delta);
                     if let Some(cmp) = key_comparator {
                         bin.delete_cmp(key, cmp.as_ref())
                     } else {
@@ -6796,9 +6854,11 @@ impl Tree {
             let g = parent_arc.read();
             if let TreeNode::Internal(n) = &*g {
                 if let Some(c) = n.get_child(idx) {
-                    // Cache hit for this child. BIN arrivals are counted at the
-                    // descent's BIN-arrival point (`note_bin_access`), not
-                    // here, so a resident child needs no fetch-stat recording.
+                    // Cache hit for this child. Every descent counts the BIN
+                    // it reaches at its BIN-arrival point (`note_bin_arrival`
+                    // / `note_bin_access`), so a resident child needs no
+                    // fetch-stat recording here; only the MISS below is
+                    // recorded at this shared fault site.
                     return Some(c);
                 }
             } else {
@@ -6829,8 +6889,11 @@ impl Tree {
         // branch, IN.java:2350, then `incFetchStats(isMiss=true)`,
         // IN.java:3003). Record the miss by node kind so bin_fetch_miss (and
         // the upper-IN pair) back the exported cache-hit-ratio gauge. The
-        // `bin_fetch` total for this access is recorded when the descent
-        // reaches the BIN (`note_bin_access`).
+        // matching `bin_fetch` count for this access is recorded when the
+        // descent reaches the BIN (`note_bin_arrival` / `note_bin_access`),
+        // which every faulting descent now does — keeping the invariant
+        // `bin_fetch_miss <= bin_fetch` (JE incFetchStats fires on every
+        // fetchTarget, hit and miss).
         let (is_bin, is_delta) = match &node {
             TreeNode::Bottom(b) => (true, b.is_delta),
             TreeNode::Internal(_) => (false, false),
@@ -6988,6 +7051,10 @@ impl Tree {
 
         loop {
             if guard.is_bin() {
+                // JE `nBINsFetch`: count the BIN reached (miss fraction
+                // recorded at the shared fault site) so this descent cannot
+                // record a miss with no matching fetch.
+                self.note_bin_arrival(&guard);
                 let index = guard.find_entry(key, true, true);
                 let found = index >= 0 && (index & EXACT_MATCH != 0);
                 return Some(SearchResult::with_values(
@@ -8070,6 +8137,12 @@ impl Tree {
 
         loop {
             if guard.is_bin() {
+                // JE `nBINsFetch`: count the BIN reached by this parent-BIN
+                // lookup (used by the cleaner's LN-liveness probe among
+                // others). The miss fraction is recorded at the shared fault
+                // site, so this arrival count is required to keep
+                // `bin_fetch_miss <= bin_fetch`.
+                self.note_bin_arrival(&guard);
                 drop(guard);
                 return Some(current_arc);
             }

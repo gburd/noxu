@@ -111,3 +111,140 @@ fn every_exported_evictor_metric_has_a_real_writer() {
     drop(db);
     env.close().unwrap();
 }
+
+/// Q1 asymmetry guard (V22/B3): `bin_fetch` and `bin_fetch_miss` must stay
+/// consistent on the **non-cursor** descent paths, not only on
+/// `Tree::search_with_data` (which `db.get` uses).
+///
+/// The miss counter is recorded at the single fault site
+/// (`Tree::child_at_or_fetch` / `fetch_root_from_log`) shared by every
+/// descent; the matching `bin_fetch` count must be recorded at that same
+/// fault site (for a faulted BIN) plus at the resident BIN-arrival point (for
+/// a hit). `search_with_data` records the arrival count; the cleaner
+/// LN-liveness probe (`Cleaner` -> `lookup_parent_bin` -> `Tree::search`)
+/// originally did NOT. So a cleaner probe that faulted a cold (evicted) BIN
+/// recorded a MISS with no matching FETCH. Once cleaner misses out-run cursor
+/// fetches, `bin_fetch_miss > bin_fetch`, `bin_fetch_miss_ratio() > 1.0`, and
+/// the exported `noxu_evictor_cache_hit_ratio` (`1.0 - ratio`) goes NEGATIVE
+/// -- the same "dashboard lies" defect B3/V22 set out to kill.
+///
+/// JE has no such asymmetry: `IN.incFetchStats(envImpl, isMiss)`
+/// (IN.java:3003) fires on **every** `fetchTarget` -- hit and miss together --
+/// including the cleaner's `getParentBINForChildLN` / `tree.search(...)`
+/// probes (FileProcessor.java:1140,1507). Fetch and miss are always
+/// incremented as a pair at the fault site.
+///
+/// This test drives the cleaner miss path directly and asserts the invariant
+/// `bin_fetch_miss <= bin_fetch` and a strictly-in-`[0, 1]` exported
+/// hit_ratio. It FAILS on 515ce63d (cleaner-only misses drive the ratio > 1,
+/// hit_ratio < 0) and PASSES once the fetch count is recorded at the shared
+/// fault site.
+#[test]
+fn cleaner_search_miss_path_keeps_hit_ratio_in_range() {
+    let dir = TempDir::new().unwrap();
+
+    // Small cache + small log files: a few hundred 1 KiB records span many
+    // files and cannot all stay resident, so eviction leaves cold BINs that
+    // the cleaner's LN-liveness probe must fault back from the log.
+    let mut cfg = EnvironmentConfig::new(dir.path().to_path_buf());
+    cfg.set_allow_create(true);
+    cfg.set_transactional(true);
+    cfg.set_cache_percent(0);
+    cfg.set_cache_size(1024 * 1024);
+    cfg.set_log_file_max_bytes(64 * 1024);
+    // Drive cleaning explicitly (no daemon race) and keep the checkpointer off
+    // so the cleaner sees a large obsolete fraction to reclaim.
+    cfg.set_run_cleaner(false);
+    cfg.set_run_checkpointer(false);
+    let env = Environment::open(cfg).expect("open env");
+    let db = env
+        .open_database(
+            None,
+            "clean",
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true),
+        )
+        .expect("open db");
+
+    let n_records = 4_000usize;
+    let value = vec![0xCDu8; 1024];
+    // Initial load.
+    let mut i = 0usize;
+    while i < n_records {
+        let end = (i + 300).min(n_records);
+        let txn = env.begin_transaction(None).unwrap();
+        for j in i..end {
+            db.put_in(&txn, format!("{:012}", j).into_bytes(), &value).unwrap();
+        }
+        txn.commit().unwrap();
+        i = end;
+    }
+    // Churn: overwrite every key several times so a large fraction of the log
+    // becomes obsolete and the cleaner has files worth reclaiming (each still
+    // holding live LNs whose BINs it must probe).
+    for _ in 0..1 {
+        let mut i = 0usize;
+        while i < n_records {
+            let end = (i + 300).min(n_records);
+            let txn = env.begin_transaction(None).unwrap();
+            for j in i..end {
+                db.put_in(&txn, format!("{:012}", j).into_bytes(), &value)
+                    .unwrap();
+            }
+            txn.commit().unwrap();
+            i = end;
+        }
+    }
+    env.checkpoint(None).unwrap();
+
+    // Force eviction so the cleaner's Tree::search probes fault COLD BINs from
+    // the log (recording misses). Crucially we do NOT warm the cache with
+    // db.get first -- the miss traffic here comes from the cleaner's
+    // Tree::search path, not the cursor search_with_data path.
+    let _ = env.evict_memory().unwrap();
+
+    // Run the cleaner: it walks obsolete files, and for each still-live LN it
+    // calls lookup_parent_bin -> Tree::search, faulting the evicted BIN.
+    // Repeat a few times to accumulate cleaner-side misses.
+    for _ in 0..3 {
+        env.clean_log().unwrap();
+        let _ = env.evict_memory().unwrap();
+    }
+
+    let stats = env.stats().unwrap();
+    let e = &stats.evictor;
+
+    // The invariant JE maintains by pairing fetch+miss at the fault site: a
+    // BIN reached (fetch) is a superset of a BIN faulted (miss).
+    assert!(
+        e.bin_fetch_miss <= e.bin_fetch,
+        "bin_fetch_miss ({}) exceeds bin_fetch ({}) -- a descent recorded a \
+         cache MISS with no matching FETCH. The cleaner's Tree::search probe \
+         faults cold BINs but did not count the fetch, so the exported \
+         cache-hit ratio is corrupted (JE incFetchStats pairs both).",
+        e.bin_fetch_miss,
+        e.bin_fetch
+    );
+
+    // The exported gauge: noxu_evictor_cache_hit_ratio = 1 - miss/fetch. If
+    // miss > fetch this goes NEGATIVE -- the shipped dashboard lie.
+    let hit_ratio = 1.0 - stats.bin_fetch_miss_ratio();
+    assert!(
+        (0.0..=1.0).contains(&hit_ratio),
+        "noxu_evictor_cache_hit_ratio ({hit_ratio}) is outside [0, 1] after a \
+         cleaner run -- the fetch/miss counters are asymmetric on the \
+         Tree::search descent (fabricated-metric bug class B3/V22)."
+    );
+
+    // Precondition: the workload actually exercised the cleaner miss path, so
+    // this test is not vacuously green. bin_fetch_miss must have moved.
+    assert!(
+        e.bin_fetch_miss > 0,
+        "precondition: the cleaner/eviction workload must record BIN misses; \
+         bin_fetch_miss is 0 so the Tree::search miss path was not exercised."
+    );
+
+    drop(db);
+    env.close().unwrap();
+}

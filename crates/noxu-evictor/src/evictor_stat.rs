@@ -195,13 +195,32 @@ impl EvictorStats {
     }
 
     /// Calculate the BIN fetch miss ratio.
+    ///
+    /// The ratio is `bin_fetch_miss / bin_fetch` and, by the fetch/miss
+    /// counting invariant (every descent that records a BIN miss at the fault
+    /// site also records the matching fetch at BIN-arrival — JE
+    /// `IN.incFetchStats` fires on every `fetchTarget`), always lies in
+    /// `[0, 1]`. The result is nonetheless clamped as defense-in-depth: the
+    /// exported `noxu_evictor_cache_hit_ratio` is `1.0 - ratio`, so a future
+    /// counting asymmetry that let `miss > fetch` would otherwise emit a
+    /// NEGATIVE cache-hit gauge (the fabricated-metric bug class B3/V22 this
+    /// guards against). The clamp bounds the exported gauge even if the
+    /// primary invariant regresses; a `debug_assert` fires in debug builds so
+    /// the regression is caught in tests rather than silently masked.
     pub fn bin_fetch_miss_ratio(&self) -> f64 {
         let fetch = self.bin_fetch.load(Ordering::Relaxed);
         if fetch == 0 {
             0.0
         } else {
             let miss = self.bin_fetch_miss.load(Ordering::Relaxed);
-            miss as f64 / fetch as f64
+            debug_assert!(
+                miss <= fetch,
+                "bin_fetch_miss ({miss}) exceeds bin_fetch ({fetch}): a descent \
+                 recorded a BIN cache miss with no matching fetch (JE \
+                 incFetchStats pairs both on every fetchTarget). The exported \
+                 cache-hit ratio would go negative."
+            );
+            (miss as f64 / fetch as f64).clamp(0.0, 1.0)
         }
     }
 
