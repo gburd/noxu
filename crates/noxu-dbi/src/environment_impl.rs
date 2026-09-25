@@ -2591,7 +2591,16 @@ impl EnvironmentImpl {
     /// transactional remove to commit time (B7/V3).  Mirrors JE's
     /// `DbTree.lockNameLN`, which locks and validates the NameLN at operation
     /// time even though the physical deletion is scheduled for commit.
-    pub fn can_remove_database(&self, name: &str) -> Result<(), DbiError> {
+    ///
+    /// Returns the validated [`DatabaseId`] so a deferred (transactional)
+    /// remove can bind to the *specific database identity* it validated,
+    /// mirroring JE binding `markDeleteAtTxnEnd` to the `DatabaseImpl` object
+    /// (`DbTree.java:1214`, `Txn.java:1481`) rather than to the name.  See
+    /// [`Self::remove_database_if_id`].
+    pub fn can_remove_database(
+        &self,
+        name: &str,
+    ) -> Result<DatabaseId, DbiError> {
         self.check_open()?;
         let db_id = self
             .name_map
@@ -2604,17 +2613,21 @@ impl EnvironmentImpl {
         {
             return Err(DbiError::DatabaseInUse(name.to_string()));
         }
-        Ok(())
+        Ok(db_id)
     }
 
     /// Validates that `rename_database(old_name, new_name)` would succeed
     /// right now (source exists, no open handles, destination free) without
     /// performing the rename.  See [`Self::can_remove_database`].
+    ///
+    /// Returns the validated source [`DatabaseId`] so a deferred rename can
+    /// bind to the specific database identity (see [`Self::can_remove_database`]
+    /// and [`Self::rename_database_if_id`]).
     pub fn can_rename_database(
         &self,
         old_name: &str,
         new_name: &str,
-    ) -> Result<(), DbiError> {
+    ) -> Result<DatabaseId, DbiError> {
         self.check_open()?;
         let db_id =
             self.name_map.read().get(old_name).copied().ok_or_else(|| {
@@ -2628,7 +2641,7 @@ impl EnvironmentImpl {
         if self.name_map.read().contains_key(new_name) {
             return Err(DbiError::DatabaseAlreadyExists(new_name.to_string()));
         }
-        Ok(())
+        Ok(db_id)
     }
 
     /// Validates that `truncate_database(name)` would succeed right now and
@@ -2636,7 +2649,13 @@ impl EnvironmentImpl {
     ///
     /// Used by the public API to return JE's `returnCount` synchronously
     /// before deferring a transactional truncate to commit time (B7/V3).
-    pub fn count_for_truncate(&self, name: &str) -> Result<u64, DbiError> {
+    ///
+    /// Returns `(count, db_id)` so a deferred truncate can bind to the
+    /// specific database identity (see [`Self::truncate_database_if_id`]).
+    pub fn count_for_truncate(
+        &self,
+        name: &str,
+    ) -> Result<(u64, DatabaseId), DbiError> {
         self.check_open()?;
         let db_id = self
             .name_map
@@ -2652,7 +2671,7 @@ impl EnvironmentImpl {
         if db_guard.reference_count() > 0 {
             return Err(DbiError::DatabaseInUse(name.to_string()));
         }
-        Ok(db_guard.entry_count())
+        Ok((db_guard.entry_count(), db_id))
     }
 
     /// Removes (deletes) a database by name.
@@ -2823,6 +2842,74 @@ impl EnvironmentImpl {
         };
 
         Ok(count)
+    }
+
+    /// Identity-guarded remove for deferred (transactional) DDL.
+    ///
+    /// F-DDL-1: a deferred remove is scheduled at operation time but applied
+    /// at commit time.  Between those two points a concurrent txn may remove
+    /// the original database and recreate a *different* database under the
+    /// same name (a new [`DatabaseId`]).  Resolving the target by name at
+    /// commit would then silently destroy the recreated database.  This
+    /// method no-ops unless the database currently registered under `name`
+    /// still has the `expected_id` validated up front — mirroring JE binding
+    /// `markDeleteAtTxnEnd` to the specific `DatabaseImpl` object identity
+    /// (`DbTree.java:1214`, `Txn.java:1481`) rather than the name.
+    pub fn remove_database_if_id(
+        &self,
+        name: &str,
+        expected_id: DatabaseId,
+    ) -> Result<bool, DbiError> {
+        self.check_open()?;
+        match self.name_map.read().get(name).copied() {
+            Some(id) if id == expected_id => {}
+            // Name gone, or now bound to a different (recreated) database:
+            // the validated target is already gone/replaced -> no-op.
+            _ => return Ok(false),
+        }
+        self.remove_database(name)?;
+        Ok(true)
+    }
+
+    /// Identity-guarded rename for deferred (transactional) DDL.
+    ///
+    /// F-DDL-1: no-ops unless `old_name` still maps to the `expected_id`
+    /// validated up front, so a deferred rename can never relocate (and thus
+    /// destroy) a database recreated under the source name after validation.
+    /// See [`Self::remove_database_if_id`].
+    pub fn rename_database_if_id(
+        &self,
+        old_name: &str,
+        new_name: &str,
+        expected_id: DatabaseId,
+    ) -> Result<bool, DbiError> {
+        self.check_open()?;
+        match self.name_map.read().get(old_name).copied() {
+            Some(id) if id == expected_id => {}
+            _ => return Ok(false),
+        }
+        self.rename_database(old_name, new_name)?;
+        Ok(true)
+    }
+
+    /// Identity-guarded truncate for deferred (transactional) DDL.
+    ///
+    /// F-DDL-1: no-ops unless `name` still maps to the `expected_id`
+    /// validated up front, so a deferred truncate can never wipe a database
+    /// recreated under the same name after validation.  See
+    /// [`Self::remove_database_if_id`].
+    pub fn truncate_database_if_id(
+        &self,
+        name: &str,
+        expected_id: DatabaseId,
+    ) -> Result<bool, DbiError> {
+        self.check_open()?;
+        match self.name_map.read().get(name).copied() {
+            Some(id) if id == expected_id => {}
+            _ => return Ok(false),
+        }
+        self.truncate_database(name)?;
+        Ok(true)
     }
 
     /// Write a non-transactional `DeleteLN` entry to the WAL.
