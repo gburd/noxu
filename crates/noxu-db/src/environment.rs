@@ -1009,11 +1009,13 @@ impl Environment {
 
         // Validate up front (existence + not-in-use) so the caller gets a
         // synchronous error, mirroring JE's `DbTree.lockNameLN` check at
-        // operation time.  `remove_database` itself re-validates.
-        {
+        // operation time.  Capture the validated `DatabaseId` so a deferred
+        // remove binds to the specific database identity (F-DDL-1), not the
+        // name.  `remove_database` itself re-validates.
+        let db_id = {
             let env_impl = self.env_impl.lock();
-            env_impl.can_remove_database(name).map_err(map_dbi_err(name))?;
-        }
+            env_impl.can_remove_database(name).map_err(map_dbi_err(name))?
+        };
 
         match txn {
             None => {
@@ -1032,13 +1034,21 @@ impl Environment {
                 // Defer the destructive op to commit (JE
                 // markDeleteAtTxnEnd, deleteAtCommit=true).  Abort simply
                 // never runs the callback -> the database survives.
+                // F-DDL-1: bind to the validated `db_id`, not the name, so a
+                // concurrent same-name recreate committed before us is not
+                // silently destroyed (JE binds to the `DatabaseImpl`
+                // identity, DbTree.java:1214 / Txn.java:1481).
                 let env_impl_arc = Arc::clone(&self.env_impl);
                 let databases_arc = Arc::clone(&self.databases);
                 let name_owned = name.to_string();
                 txn.register_commit_callback(move || {
                     let mut databases = databases_arc.lock();
-                    let _ = env_impl_arc.lock().remove_database(&name_owned);
-                    databases.remove(&name_owned);
+                    if let Ok(true) = env_impl_arc
+                        .lock()
+                        .remove_database_if_id(&name_owned, db_id)
+                    {
+                        databases.remove(&name_owned);
+                    }
                 });
                 Ok(())
             }
@@ -1079,8 +1089,10 @@ impl Environment {
             }
             Some(txn) => {
                 // Validate + read the count now (JE returns it synchronously),
-                // defer the tree replacement to commit.
-                let count = {
+                // defer the tree replacement to commit.  Capture `db_id` so
+                // the deferred truncate binds to the validated identity
+                // (F-DDL-1), not the name.
+                let (count, db_id) = {
                     let env_impl = self.env_impl.lock();
                     env_impl
                         .count_for_truncate(name)
@@ -1089,7 +1101,9 @@ impl Environment {
                 let env_impl_arc = Arc::clone(&self.env_impl);
                 let name_owned = name.to_string();
                 txn.register_commit_callback(move || {
-                    let _ = env_impl_arc.lock().truncate_database(&name_owned);
+                    let _ = env_impl_arc
+                        .lock()
+                        .truncate_database_if_id(&name_owned, db_id);
                 });
                 Ok(count)
             }
@@ -1134,13 +1148,15 @@ impl Environment {
         }
 
         // Validate up front so the caller gets a synchronous error (JE
-        // `DbTree.lockNameLN` locks/validates at operation time).
-        {
+        // `DbTree.lockNameLN` locks/validates at operation time).  Capture
+        // the validated source `DatabaseId` so a deferred rename binds to the
+        // specific identity (F-DDL-1), not the name.
+        let db_id = {
             let env_impl = self.env_impl.lock();
             env_impl
                 .can_rename_database(old_name, new_name)
-                .map_err(map_rename_err(old_name, new_name))?;
-        }
+                .map_err(map_rename_err(old_name, new_name))?
+        };
 
         match txn {
             None => {
@@ -1163,10 +1179,12 @@ impl Environment {
                 let new_owned = new_name.to_string();
                 txn.register_commit_callback(move || {
                     let mut databases = databases_arc.lock();
-                    let _ = env_impl_arc
+                    // F-DDL-1: bind to the validated source identity.
+                    if let Ok(true) = env_impl_arc
                         .lock()
-                        .rename_database(&old_owned, &new_owned);
-                    if let Some(handle) = databases.remove(&old_owned) {
+                        .rename_database_if_id(&old_owned, &new_owned, db_id)
+                        && let Some(handle) = databases.remove(&old_owned)
+                    {
                         databases.insert(new_owned.clone(), handle);
                     }
                 });
