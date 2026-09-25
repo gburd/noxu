@@ -26,6 +26,21 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
+/// Unsupported semantics retain one file; integrity/I/O failures stop the pass.
+#[derive(Debug, thiserror::Error)]
+enum FileCleaningError {
+    #[error("cleaner: unsupported {entry_type} at {lsn}; retaining file")]
+    Unsupported { entry_type: WireEntryType, lsn: noxu_util::Lsn },
+    #[error("{0}")]
+    Failed(String),
+}
+
+impl From<String> for FileCleaningError {
+    fn from(error: String) -> Self {
+        Self::Failed(error)
+    }
+}
+
 /// Bundled context for calling `process_pending` from within the
 /// `FileProcessor` periodic hook (CLN-12).
 ///
@@ -867,10 +882,19 @@ impl Cleaner {
         let mut total_entries = 0u64;
         // file_summary_map is refreshed inside the loop (CLN-13).
         let mut current_summary_map = file_summary_map;
+        let mut deferred = Vec::new();
+        let mut unsupported_error = None;
+        let mut fatal_error = None;
 
-        // JE FileProcessor.doClean main loop (~line 345): clean until no
-        // more files are selected or n_files budget is exhausted.
-        for _ in 0..n_files {
+        // JE 7.5.11 FileProcessor.doClean:335-386 bounds the pass by the
+        // original file count. Unsupported semantics are Noxu-specific:
+        // leave those files in BEING_CLEANED until pass end so the existing
+        // selector exclusion prevents reselection. They consume the scan
+        // cap, not n_files, so even one-file daemon passes can make progress.
+        for attempt in 0..original_count.max(1) {
+            if attempt - deferred.len() >= n_files as usize {
+                break;
+            }
             // Check shutdown before each iteration.
             if self.shutdown.load(Ordering::Relaxed) {
                 break;
@@ -947,13 +971,19 @@ impl Cleaner {
             self.file_protector.unprotect_file(file_number);
 
             match result {
+                Err(e @ FileCleaningError::Unsupported { .. }) => {
+                    log::warn!("{e}");
+                    unsupported_error.get_or_insert_with(|| e.to_string());
+                    deferred.push(file_number);
+                }
                 Err(e) => {
-                    // Processing failed — put file back so it is retried.
-                    // JE: FileProcessor.doClean() finally { putBackFileForCleaning }.
+                    // JE FileProcessor.doClean:557-593 stops on integrity/I/O
+                    // failures and puts unfinished files back for retry.
                     self.file_selector
                         .lock()
                         .put_back_file_for_cleaning(file_number);
-                    return Err(e);
+                    fatal_error = Some(e.to_string());
+                    break;
                 }
                 Ok(result) => {
                     // Record any LNs that could not be migrated due to lock denial.
@@ -984,6 +1014,15 @@ impl Cleaner {
                     }
                 }
             }
+        }
+
+        // Restore every deferred file even if a later file failed or shutdown
+        // interrupted the pass. None may enter the checkpoint deletion barrier.
+        for file_number in deferred {
+            self.file_selector.lock().put_back_file_for_cleaning(file_number);
+        }
+        if let Some(error) = fatal_error {
+            return Err(error);
         }
 
         // X-5: only delete files that have passed the two-checkpoint barrier.
@@ -1042,6 +1081,11 @@ impl Cleaner {
             cb();
         }
 
+        // Keep the error visible to manual callers and daemon listeners even
+        // when independent files made progress (their stats are already updated).
+        if let Some(error) = unsupported_error {
+            return Err(error);
+        }
         Ok(CleanResult {
             files_cleaned,
             files_deleted,
@@ -1225,7 +1269,7 @@ impl Cleaner {
     fn process_single_file(
         &self,
         file_number: u32,
-    ) -> Result<FileProcessResult, String> {
+    ) -> Result<FileProcessResult, FileCleaningError> {
         let file_summary = match &self.file_manager {
             None => crate::FileSummary::new(),
             Some(fm) => self.scan_file_summary(fm, file_number)?,
@@ -1291,15 +1335,19 @@ impl Cleaner {
                             .unwrap_or_default(),
                     )
             };
-            return processor.process_file(
-                file_number,
-                &file_summary,
-                &entries,
-                &tree_lookup,
-            );
+            return processor
+                .process_file(
+                    file_number,
+                    &file_summary,
+                    &entries,
+                    &tree_lookup,
+                )
+                .map_err(FileCleaningError::from);
         }
 
-        processor.process_file_no_entries(file_number, &file_summary)
+        processor
+            .process_file_no_entries(file_number, &file_summary)
+            .map_err(FileCleaningError::from)
     }
 
     /// Decode Noxu entries for `FileProcessor::process_file`.
@@ -1311,7 +1359,7 @@ impl Cleaner {
         &self,
         fm: &Arc<FileManager>,
         file_number: u32,
-    ) -> Result<Vec<LogEntry>, String> {
+    ) -> Result<Vec<LogEntry>, FileCleaningError> {
         let mut entries = Vec::new();
         let mut reader = LogFileReader::open(Arc::clone(fm), file_number)
             .map_err(|e| e.to_string())?;
@@ -1382,9 +1430,10 @@ impl Cleaner {
                 // Do not guess at the lifetime of legacy, XA, replication or
                 // other unsupported records. Keep the entire file instead.
                 t => {
-                    return Err(format!(
-                        "cleaner: unsupported {t} at {lsn}; retaining file"
-                    ));
+                    return Err(FileCleaningError::Unsupported {
+                        entry_type: t,
+                        lsn,
+                    });
                 }
             };
             entries.push(LogEntry { lsn, entry_type: log_entry_type });
@@ -1396,7 +1445,8 @@ impl Cleaner {
         {
             return Err(format!(
                 "cleaner: incomplete scan of file {file_number:08x}"
-            ));
+            )
+            .into());
         }
         Ok(entries)
     }
@@ -1426,7 +1476,7 @@ impl Cleaner {
         &self,
         fm: &Arc<FileManager>,
         file_number: u32,
-    ) -> Result<crate::FileSummary, String> {
+    ) -> Result<crate::FileSummary, FileCleaningError> {
         let mut summary = crate::FileSummary::new();
         let file_len =
             fm.get_file_length(file_number).map_err(|e| e.to_string())?;

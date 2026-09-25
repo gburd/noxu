@@ -50,12 +50,23 @@ records. The corrected cleaner prevents this entry-type misclassification; it
 cannot reconstruct deleted files. Restore missing data from an independently
 verified backup or replica. No log-format conversion is required.
 
-The cleaner now retains files containing unknown or unsupported entry types,
-or incomplete or invalid entries, and reports an error rather than treating
-unreadable bytes as obsolete. Investigate such errors; do not manually delete
-the retained files. A forced pass is bounded, but may clean files created by
-migration within that bound; subsequent passes can reclaim more space after
-checkpoint barriers complete.
+The cleaner retains files containing unknown or unsupported entry types, or
+incomplete or invalid entries. Known but unsupported types include current XA
+`TxnPrepare` records, even when a commit follows: the cleaner has no lifetime
+proof that permits discarding them. Such files are deferred until pass end and
+requeued; independent eligible files can still be cleaned, including in
+one-file daemon passes. Each unsupported-file error is logged, and the pass
+returns its first unsupported-file error after publishing progress statistics
+and performing normal checkpoint-gated deletion. An error therefore does not
+mean that no other files were cleaned.
+
+Unknown types, corruption, and I/O failures still stop the pass immediately;
+they are not treated as unsupported semantics or obsolete bytes. Investigate
+errors and do not manually delete retained files. Attempts remain bounded by
+the initial summary/queue count. Unsupported files consume this attempt cap,
+not the requested cleaning budget; migration output may be selected within
+the cap. Subsequent passes can reclaim more space after checkpoint barriers
+complete.
 
 ## Disk-full recovery
 
