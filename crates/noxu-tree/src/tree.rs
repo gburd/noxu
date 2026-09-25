@@ -10229,6 +10229,189 @@ mod tests {
         tree.compress(); // must not panic
     }
 
+    /// SYMMETRIC lead (sibling of the BIN-split base bug fixed at 1c817fbd):
+    /// `Tree::compress_node`'s BIN-merge arm (tree.rs ~5871) BULK-REPLACES the
+    /// SURVIVOR's entries (`rb.entries = combined`) with left+right keys but
+    /// leaves the survivor's persistence metadata untouched — it does NOT set
+    /// `prohibit_next_delta`, and it keeps the survivor's PRE-merge
+    /// `last_full_lsn`, whose durable full image holds only the survivor's
+    /// OWN original (right-half) keys, NOT the merged-in left keys.
+    ///
+    /// A BINDelta records only dirty slots; it cannot encode the ARRIVAL of the
+    /// merged-in keys that are not individually dirtied. So if the survivor is
+    /// later logged as a sparse delta against its stale pre-merge base, then on
+    /// refault/recovery `mutate_to_full_bin` merges (survivor's original keys)
+    /// + (sparse delta) BY KEY, and the merged-in left keys — which live
+    /// NOWHERE else after the left BIN was cleared — are LOST. (The mirror of
+    /// the split bug, whose failure mode was resurrection/duplication.)
+    ///
+    /// JE preserves the invariant that any bulk entry change a delta cannot
+    /// express must invalidate the full base: `IN.deleteEntry`
+    /// (IN.java:3466) does `if (isDirty(index)) setProhibitNextDelta(true)`,
+    /// and `INCompressor.java:80-88` states "dirty slots cannot be compressed
+    /// until we know that a full BIN will be logged next ... in that case the
+    /// 'prohibit next logged delta' flag is set." The split precedent is
+    /// `IN.splitInternal` (IN.java:4154) → `logInternal(allowDeltas=false)`
+    /// (IN.java:5545). `remove_slot` (tree.rs ~2092, fix a1061397) already
+    /// obeys this; the merge survivor does NOT.
+    ///
+    /// This deterministic test drives `Tree::compress_node` (the sibling-merge)
+    /// directly, then asserts on the survivor's metadata: after the merge it
+    /// holds keys absent from its own durable full image yet remains
+    /// DELTA-ELIGIBLE against that stale base (`should_log_delta()` true).
+    /// That is the exact precondition for merged-in key loss on recovery.
+    #[test]
+    fn compress_merge_survivor_full_base_is_invalidated_for_delta() {
+        let max_entries = 8usize;
+        let tree = Tree::new(1, max_entries);
+
+        // Build a multi-BIN tree.
+        let n = 64u32;
+        for i in 0..n {
+            tree.insert(
+                format!("cm{i:04}").into_bytes(),
+                vec![i as u8],
+                Lsn::new(1, i),
+            )
+            .unwrap();
+        }
+        assert!(tree.collect_stats().n_bins >= 4, "need several BINs");
+
+        // Simulate that EVERY BIN was previously logged as a FULL image at a
+        // distinct LSN and is currently clean and delta-eligible — i.e. each
+        // BIN's durable base reflects EXACTLY its own current entries. This is
+        // the state the checkpointer leaves BINs in.
+        let mut base_lsn_off = 1000u32;
+        for node in tree.rebuild_in_list() {
+            let mut g = node.write();
+            if let TreeNode::Bottom(b) = &mut *g {
+                b.last_full_lsn = Lsn::new(1, base_lsn_off);
+                base_lsn_off += 1;
+                b.is_delta = false;
+                b.last_delta_lsn = NULL_LSN;
+                b.prohibit_next_delta = false;
+                b.dirty = false;
+                for e in b.entries.iter_mut() {
+                    e.dirty = false;
+                }
+            }
+        }
+
+        // Snapshot, per BIN, the exact key set its durable full base holds
+        // (== its current entries, since we just "logged" each BIN full).
+        // Keyed by base LSN so we can later ask, for the survivor, "which keys
+        // does its base actually contain?".
+        let mut base_keys: std::collections::HashMap<u32, Vec<Vec<u8>>> =
+            std::collections::HashMap::new();
+        for node in tree.rebuild_in_list() {
+            let g = node.read();
+            if let TreeNode::Bottom(b) = &*g {
+                let lsn = b.last_full_lsn.file_offset();
+                let keys: Vec<Vec<u8>> = (0..b.entries.len())
+                    .map(|j| b.get_full_key(j).unwrap_or_default())
+                    .collect();
+                base_keys.insert(lsn, keys);
+            }
+        }
+
+        // Delete most keys so adjacent siblings become jointly under-full and
+        // will MERGE. Keep a sparse spread so several merges fire. `delete`
+        // routes through `remove_slot`, which sets prohibit_next_delta on the
+        // BINs it touches — but the MERGE reassembles entries into the SURVIVOR
+        // (`rb.entries = combined`) WITHOUT re-deriving that flag, which is the
+        // bug under test. We RESET prohibit on every BIN after the deletes and
+        // before compress so the merge is the ONLY thing that could set it.
+        let keep: std::collections::HashSet<u32> =
+            [0u32, 8, 16, 24, 32, 40, 48, 56].iter().copied().collect();
+        for i in 0..n {
+            if !keep.contains(&i) {
+                tree.delete(&format!("cm{i:04}").into_bytes());
+            }
+        }
+        for node in tree.rebuild_in_list() {
+            let mut g = node.write();
+            if let TreeNode::Bottom(b) = &mut *g {
+                b.prohibit_next_delta = false;
+            }
+        }
+
+        let bins_before = tree.collect_stats().n_bins;
+        tree.compress();
+        let bins_after = tree.collect_stats().n_bins;
+
+        // Path activation: a genuine sibling MERGE must have occurred (BIN count
+        // dropped). Otherwise the test is vacuous.
+        assert!(
+            bins_after < bins_before,
+            "compress must MERGE under-full siblings (path activation): \
+             was {bins_before}, now {bins_after}"
+        );
+
+        // Inspect every surviving BIN. Find one that is a genuine MERGE
+        // SURVIVOR: it now holds a key that its OWN durable full base does NOT
+        // contain (a merged-in key). Assert whether it is delta-eligible over
+        // that stale base.
+        let mut found_survivor = false;
+        let mut buggy_survivor = false;
+        for node in tree.rebuild_in_list() {
+            let g = node.read();
+            let TreeNode::Bottom(b) = &*g else { continue };
+            if b.last_full_lsn == NULL_LSN {
+                continue; // never logged full → forced full, safe
+            }
+            let base = match base_keys.get(&b.last_full_lsn.file_offset()) {
+                Some(k) => k,
+                None => continue,
+            };
+            let base_set: std::collections::HashSet<&Vec<u8>> =
+                base.iter().collect();
+            let current: Vec<Vec<u8>> = (0..b.entries.len())
+                .map(|j| b.get_full_key(j).unwrap_or_default())
+                .collect();
+            let merged_in: Vec<&Vec<u8>> =
+                current.iter().filter(|k| !base_set.contains(*k)).collect();
+            if merged_in.is_empty() {
+                continue; // not a merge survivor (base still covers it)
+            }
+            found_survivor = true;
+
+            // THE BUG: the survivor holds merged-in keys absent from its
+            // durable full base, yet a delta over that base is still eligible.
+            // `should_log_delta` needs dirty slots; the merge set b.dirty but
+            // the individual merged-in slots may be clean, so mark one dirty to
+            // model a subsequent sparse update on an ORIGINAL slot (the exact
+            // scenario: a small update triggers a delta over the stale base).
+            let delta_eligible = b.should_log_delta(25)
+                || (!b.prohibit_next_delta && b.last_full_lsn != NULL_LSN);
+            eprintln!(
+                "survivor node_id={} entries={} base_lsn={:?} \
+                 merged_in={} prohibit={} delta_eligible={}",
+                b.node_id,
+                b.entries.len(),
+                b.last_full_lsn,
+                merged_in.len(),
+                b.prohibit_next_delta,
+                delta_eligible,
+            );
+            if delta_eligible {
+                buggy_survivor = true;
+            }
+        }
+
+        assert!(found_survivor, "no merge survivor with merged-in keys found");
+
+        // The invariant we require (JE parity): a merge survivor holding keys
+        // absent from its durable full base MUST NOT be delta-eligible over
+        // that base — the next image must be forced full. Pre-fix this FAILS.
+        assert!(
+            !buggy_survivor,
+            "merge survivor with merged-in keys is still DELTA-ELIGIBLE over a \
+             stale full base that lacks those keys — a delta would lose them on \
+             recovery (compress_node must set prohibit_next_delta on the \
+             survivor, cf. remove_slot / IN.deleteEntry IN.java:3466)"
+        );
+    }
+
     /// Deterministic regression for the BIN/IN split-path check-then-act race
     /// (`.agent/archived-audits/bench/bug-bin-split-concurrency.md`).
     ///
