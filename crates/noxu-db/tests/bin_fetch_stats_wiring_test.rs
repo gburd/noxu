@@ -70,15 +70,15 @@ fn bin_fetch_counters_reflect_real_cache_misses() {
     // Push the resident set down toward the budget so the read phase faults.
     let _ = env.evict_memory().unwrap();
 
-    // Read the whole key space several times: every cold access re-faults a
-    // BIN (a miss); repeat passes over the same keys hit resident BINs.
-    for _pass in 0..3 {
+    // Read the whole key space several times. The first pass over a >>cache
+    // dataset re-faults many BINs (misses); later passes re-hit the BINs that
+    // are still resident. Without evicting between passes the cache warms, so
+    // the aggregate is a genuine MIX of hits and misses — the ratio must land
+    // strictly between 0 and 1, not the fabricated 1.0.
+    for _pass in 0..4 {
         for j in 0..n_records {
             let _ = db.get(format!("{:012}", j).into_bytes()).unwrap();
         }
-        // Keep pressure on so subsequent passes still see misses, not a fully
-        // warm cache.
-        let _ = env.evict_memory().unwrap();
     }
 
     let stats = env.stats().unwrap();
@@ -104,18 +104,19 @@ fn bin_fetch_counters_reflect_real_cache_misses() {
     );
 
     // (3) The exported hit ratio must be a PLAUSIBLE value, not the fabricated
-    //     1.0. With a 4x-cache dataset re-read under sustained eviction the
-    //     real hit ratio is well below 1.0.
+    //     1.0 and not the degenerate 0.0. A >>cache dataset read multiple
+    //     times yields BOTH hits (resident BINs on repeat passes) and misses
+    //     (cold re-faults), so the ratio must be strictly inside (0, 1).
     assert!(
         bin_fetch_miss <= bin_fetch,
         "bin_fetch_miss ({bin_fetch_miss}) cannot exceed bin_fetch \
          ({bin_fetch})"
     );
     assert!(
-        hit_ratio < 1.0 && hit_ratio >= 0.0,
-        "cache hit ratio ({hit_ratio}) must reflect real misses; exactly 1.0 \
-         is the fabricated value (bin_fetch={bin_fetch}, \
-         bin_fetch_miss={bin_fetch_miss})."
+        hit_ratio > 0.0 && hit_ratio < 1.0,
+        "cache hit ratio ({hit_ratio}) must reflect a real hit/miss mix; \
+         exactly 1.0 is the fabricated value and 0.0 would mean every access \
+         missed (bin_fetch={bin_fetch}, bin_fetch_miss={bin_fetch_miss})."
     );
 
     drop(db);

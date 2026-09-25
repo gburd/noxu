@@ -1695,6 +1695,32 @@ impl InListListener for Evictor {
         // Forward to the inherent method (clears all three policies).
         Evictor::note_ins_removed(self, node_id);
     }
+
+    /// JE `nBINsFetch` (`IN.incFetchStats` on `fetchTarget`): a btree
+    /// operation reached a BIN. Counts BIN accesses (hits + misses) — the
+    /// denominator of the exported `noxu_evictor_cache_hit_ratio` gauge.
+    fn note_ins_bin_access(&self, _is_delta: bool) {
+        self.stats.increment(&self.stats.bin_fetch);
+    }
+
+    /// JE `Evictor.incBINFetchStats(isMiss=true, isDelta)` /
+    /// `incUINFetchStats(isMiss=true)`: a BIN or upper IN had to be read back
+    /// from the log (a real cache miss). Backs `bin_fetch_miss` (the numerator
+    /// of the exported hit ratio) and the upper-IN / BIN-delta miss counters.
+    fn note_ins_fetch_miss(&self, is_bin: bool, is_delta: bool) {
+        if is_bin {
+            self.stats.increment(&self.stats.bin_fetch_miss);
+            if is_delta {
+                self.stats.increment(&self.stats.bin_delta_fetch_miss);
+            }
+        } else {
+            // An upper-IN miss also implies it was fetched; count both so the
+            // upper-IN pair stays internally consistent (upper_in_fetch is not
+            // currently exported, but must not be a miss-only counter).
+            self.stats.increment(&self.stats.upper_in_fetch);
+            self.stats.increment(&self.stats.upper_in_fetch_miss);
+        }
+    }
 }
 
 impl std::fmt::Debug for Evictor {
