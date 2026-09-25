@@ -32,6 +32,25 @@ It prevents future stale-image refaults; it does not restore values already
 lost by an affected build. Validate suspect data against application records
 or a known-good backup before resuming writes.
 
+## Dirty BIN logging failures
+
+A dirty BIN now stays resident when eviction cannot log its current image,
+including when no logger is available. A previously logged image is not a
+substitute for unlogged updates. Refusal leaves the candidate eligible for
+retry and gives no node or byte eviction credit; cache pressure can therefore
+remain high while logging is unavailable. Clean BINs with a valid image can
+still be evicted without a logger.
+
+Investigate storage errors rather than treating low eviction throughput as a
+cache-sizing issue. Retry can proceed when logging succeeds again, but an
+environment permanently invalidated by a WAL I/O failure must still follow
+the normal failure/recovery procedure; this change does not clear invalidation.
+No format migration is required, and already-lost updates are not restored.
+
+This fix covers unsuccessful dirty-BIN logging only. Dirty-generation/pin
+races between logging and detach, and dirty upper-IN handling, remain separate
+open safety issues; it is not a general eviction data-loss-safety guarantee.
+
 ## Recommended production settings
 
 - **OLTP workloads**: `checkpointer_bytes_interval = 64 MiB` (default is fine; tighten to 16 MiB

@@ -938,7 +938,7 @@ impl Evictor {
                                     //
                                     // CC-6 latch discipline: flush uses a
                                     // non-blocking try_write + cursor_count
-                                    // re-check; `false` means busy/pinned ->
+                                    // re-check; `false` means busy/pinned or unlogged ->
                                     // put back without credit for a later pass.
                                     if self.flush_dirty_node_to_log(node_id) {
                                         let freed = node_size_fn(node_id);
@@ -1037,13 +1037,12 @@ impl Evictor {
 
                     // CC-6: flush_dirty_node_to_log uses a non-blocking
                     // try_write latch and re-checks cursor_count.  `false`
-                    // means the node is busy or became pinned — put it back.
+                    // means busy, pinned, or unable to log — put it back.
                     if info.is_dirty()
                         && !stored_off_heap
                         && !self.flush_dirty_node_to_log(node_id)
                     {
-                        // Node is latched by another thread or pinned.
-                        // Put it back; do NOT credit bytes evicted.
+                        // Retain the node for retry; do NOT credit bytes evicted.
                         if from_pri2 {
                             self.pri2.lock().add_back(node_id);
                         } else {
@@ -1290,8 +1289,9 @@ impl Evictor {
     /// Returns `false` if the node's write latch could not be acquired
     /// immediately (another thread holds a read or write latch) **or** if,
     /// after acquiring the latch, a cursor has pinned the BIN (cursor_count
-    /// is positive).  The caller must put the node back into the eviction
-    /// list in both cases.
+    /// is positive), or a dirty BIN cannot be logged (including no logger).
+    /// The caller must put the node back without eviction credit in all
+    /// these cases. A prior full image does not contain its latest updates.
     ///
     /// JE reference: `Evictor.java` `isPinned()` guard +
     /// `latchNoWait`-style non-blocking latch attempt before any eviction
@@ -1362,7 +1362,7 @@ impl Evictor {
             .and_then(|g| g.as_ref().map(Arc::clone))
         {
             Some(lm) => lm,
-            None => return true, // no log manager (tests); allow eviction
+            None => return false, // dirty BIN has no way to preserve updates
         };
 
         // CC-4: choose Provisional::Yes when a checkpoint is in progress and
@@ -1411,7 +1411,9 @@ impl Evictor {
             None
         };
 
-        if let Ok(logged_lsn) = lm.log_tracked(
+        // JE Evictor.evict (Evictor.java:3009–3035) detaches only after
+        // target.log succeeds; a log failure must never authorize detach.
+        let logged_lsn = match lm.log_tracked(
             LogEntryType::BIN,
             &buf,
             provisional,
@@ -1421,9 +1423,11 @@ impl Evictor {
             old_obsolete,
             false,
         ) {
-            bin.clear_dirty_after_full_log(logged_lsn);
-            self.stats.increment(&self.stats.dirty_nodes_evicted);
-        }
+            Ok(lsn) => lsn,
+            Err(_) => return false,
+        };
+        bin.clear_dirty_after_full_log(logged_lsn);
+        self.stats.increment(&self.stats.dirty_nodes_evicted);
         true
     }
 
