@@ -2584,6 +2584,77 @@ impl EnvironmentImpl {
         evicted
     }
 
+    /// Validates that `remove_database(name)` would succeed right now
+    /// (database exists, no open handles) without performing the removal.
+    ///
+    /// Used by the public API to give a synchronous error before deferring a
+    /// transactional remove to commit time (B7/V3).  Mirrors JE's
+    /// `DbTree.lockNameLN`, which locks and validates the NameLN at operation
+    /// time even though the physical deletion is scheduled for commit.
+    pub fn can_remove_database(&self, name: &str) -> Result<(), DbiError> {
+        self.check_open()?;
+        let db_id = self
+            .name_map
+            .read()
+            .get(name)
+            .copied()
+            .ok_or_else(|| DbiError::DatabaseNotFound(name.to_string()))?;
+        if let Some(db) = self.db_map.read().get(&db_id)
+            && db.read().reference_count() > 0
+        {
+            return Err(DbiError::DatabaseInUse(name.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Validates that `rename_database(old_name, new_name)` would succeed
+    /// right now (source exists, no open handles, destination free) without
+    /// performing the rename.  See [`Self::can_remove_database`].
+    pub fn can_rename_database(
+        &self,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<(), DbiError> {
+        self.check_open()?;
+        let db_id =
+            self.name_map.read().get(old_name).copied().ok_or_else(|| {
+                DbiError::DatabaseNotFound(old_name.to_string())
+            })?;
+        if let Some(db) = self.db_map.read().get(&db_id)
+            && db.read().reference_count() > 0
+        {
+            return Err(DbiError::DatabaseInUse(old_name.to_string()));
+        }
+        if self.name_map.read().contains_key(new_name) {
+            return Err(DbiError::DatabaseAlreadyExists(new_name.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Validates that `truncate_database(name)` would succeed right now and
+    /// returns the current record count, without performing the truncation.
+    ///
+    /// Used by the public API to return JE's `returnCount` synchronously
+    /// before deferring a transactional truncate to commit time (B7/V3).
+    pub fn count_for_truncate(&self, name: &str) -> Result<u64, DbiError> {
+        self.check_open()?;
+        let db_id = self
+            .name_map
+            .read()
+            .get(name)
+            .copied()
+            .ok_or_else(|| DbiError::DatabaseNotFound(name.to_string()))?;
+        let db_map_guard = self.db_map.read();
+        let db_arc = db_map_guard
+            .get(&db_id)
+            .ok_or_else(|| DbiError::DatabaseNotFound(name.to_string()))?;
+        let db_guard = db_arc.read();
+        if db_guard.reference_count() > 0 {
+            return Err(DbiError::DatabaseInUse(name.to_string()));
+        }
+        Ok(db_guard.entry_count())
+    }
+
     /// Removes (deletes) a database by name.
     ///
     /// Returns an error if any open

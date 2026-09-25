@@ -83,6 +83,39 @@ pub(crate) fn build_environment_stats(
     }
 }
 
+/// Maps a [`noxu_dbi::DbiError`] from a single-name DDL op (remove/truncate)
+/// to the public [`NoxuError`], turning `DatabaseNotFound` into a
+/// user-facing message naming the database.  Shared by the auto-commit and
+/// deferred (commit-callback) paths so both surface the same error.
+fn map_dbi_err(name: &str) -> impl Fn(noxu_dbi::DbiError) -> NoxuError + '_ {
+    move |e| match &e {
+        noxu_dbi::DbiError::DatabaseNotFound(_) => NoxuError::DatabaseNotFound(
+            format!("Database '{}' does not exist", name),
+        ),
+        _ => NoxuError::environment(e.to_string()),
+    }
+}
+
+/// Maps a [`noxu_dbi::DbiError`] from `rename_database` to the public
+/// [`NoxuError`], distinguishing missing-source from destination-exists.
+fn map_rename_err<'a>(
+    old_name: &'a str,
+    new_name: &'a str,
+) -> impl Fn(noxu_dbi::DbiError) -> NoxuError + 'a {
+    move |e| match &e {
+        noxu_dbi::DbiError::DatabaseNotFound(_) => NoxuError::DatabaseNotFound(
+            format!("Database '{}' does not exist", old_name),
+        ),
+        noxu_dbi::DbiError::DatabaseAlreadyExists(_) => {
+            NoxuError::DatabaseAlreadyExists(format!(
+                "Database '{}' already exists",
+                new_name
+            ))
+        }
+        _ => NoxuError::environment(e.to_string()),
+    }
+}
+
 /// A database environment.
 ///
 ///
@@ -108,7 +141,7 @@ pub struct Environment {
     /// Configuration used to open this environment
     config: EnvironmentConfig,
     /// Open databases by name (tracks which names are currently open via this handle)
-    databases: Mutex<HashMap<String, Arc<DatabaseHandle>>>,
+    databases: Arc<Mutex<HashMap<String, Arc<DatabaseHandle>>>>,
     /// Active transactions registry, shared with `Transaction` so that
     /// `Transaction::commit()` / `Transaction::abort()` can prune their
     /// own entry on completion (F1: `mark_transaction_complete` was dead
@@ -600,7 +633,7 @@ impl Environment {
         let env = Environment {
             home,
             config,
-            databases: Mutex::new(HashMap::new()),
+            databases: Arc::new(Mutex::new(HashMap::new())),
             active_txns: Arc::new(ActiveTxns::new()),
             next_txn_id: AtomicU64::new(1),
             open: AtomicBool::new(true),
@@ -935,10 +968,25 @@ impl Environment {
 
     /// Removes a database.
     ///
+    /// When `txn` is `Some`, the removal participates in that transaction:
+    /// the existence / not-in-use checks run immediately (mirroring JE's
+    /// `DbTree.lockNameLN`, which locks and validates the NameLN at operation
+    /// time), but the physical deletion of the database is **deferred to
+    /// commit**.  Aborting the transaction therefore rolls the removal back —
+    /// the database and its records survive.  This mirrors JE, where
+    /// `Environment.removeDatabase` runs under a `Locker` derived from the
+    /// passed `Transaction` (`Environment.java:988` -> `DbNameOperation` ->
+    /// `DbTree.dbRemove`, `DbTree.java:1230`), the NameLN delete is
+    /// transactional, and the physical `MapLN`/tree deletion is scheduled for
+    /// commit via `Txn.markDeleteAtTxnEnd(dbImpl, /*deleteAtCommit=*/true)`
+    /// (`DbTree.java:1214`, `Txn.java:1481`).
     ///
+    /// When `txn` is `None`, the removal is applied immediately (auto-commit),
+    /// matching JE's null-txn auto-commit locker.
     ///
     /// # Arguments
-    /// * `txn` - Optional transaction handle (currently ignored)
+    /// * `txn` - Optional transaction handle; if supplied, the removal is
+    ///   undone on abort and applied on commit.
     /// * `name` - Database name
     ///
     /// # Errors
@@ -946,61 +994,124 @@ impl Environment {
     /// - The environment is closed
     /// - The database does not exist
     /// - The database is currently open
+    ///
+    /// # Fidelity note
+    /// The removed name remains visible to `database_names()` (and to
+    /// concurrent openers) until the transaction commits, whereas JE deletes
+    /// the NameLN transactionally and hides it within the txn.  See
+    /// `docs/src/reference/known-limitations.md` ("Transactional DDL").
     pub fn remove_database(
         &self,
-        _txn: Option<&Transaction>,
+        txn: Option<&Transaction>,
         name: &str,
     ) -> Result<()> {
         self.check_writable("remove_database")?;
 
-        let mut databases = self.databases.lock();
+        // Validate up front (existence + not-in-use) so the caller gets a
+        // synchronous error, mirroring JE's `DbTree.lockNameLN` check at
+        // operation time.  `remove_database` itself re-validates.
         {
             let env_impl = self.env_impl.lock();
-            env_impl.remove_database(name).map_err(|e| match &e {
-                noxu_dbi::DbiError::DatabaseNotFound(_) => {
-                    NoxuError::DatabaseNotFound(format!(
-                        "Database '{}' does not exist",
-                        name
-                    ))
-                }
-                _ => NoxuError::environment(e.to_string()),
-            })?;
+            env_impl.can_remove_database(name).map_err(map_dbi_err(name))?;
         }
-        databases.remove(name);
 
-        Ok(())
+        match txn {
+            None => {
+                // Auto-commit: apply immediately (JE null-txn locker).
+                let mut databases = self.databases.lock();
+                {
+                    let env_impl = self.env_impl.lock();
+                    env_impl
+                        .remove_database(name)
+                        .map_err(map_dbi_err(name))?;
+                }
+                databases.remove(name);
+                Ok(())
+            }
+            Some(txn) => {
+                // Defer the destructive op to commit (JE
+                // markDeleteAtTxnEnd, deleteAtCommit=true).  Abort simply
+                // never runs the callback -> the database survives.
+                let env_impl_arc = Arc::clone(&self.env_impl);
+                let databases_arc = Arc::clone(&self.databases);
+                let name_owned = name.to_string();
+                txn.register_commit_callback(move || {
+                    let mut databases = databases_arc.lock();
+                    let _ = env_impl_arc.lock().remove_database(&name_owned);
+                    databases.remove(&name_owned);
+                });
+                Ok(())
+            }
+        }
     }
 
     /// Truncates a database: removes all records while keeping the database
     /// registered and any open handles valid.
     ///
-    /// Returns the number of records that were in the database before truncation.
+    /// Returns the number of records that were in the database before
+    /// truncation.
+    ///
+    /// When `txn` is `Some`, the truncation participates in that transaction:
+    /// the existence / not-in-use checks and the pre-truncate record count run
+    /// immediately (so the count is returned synchronously, as JE's
+    /// `returnCount` result is), but the physical tree replacement is
+    /// **deferred to commit**.  Aborting the transaction rolls the truncation
+    /// back — the records survive.  Mirrors JE, where
+    /// `Environment.truncateDatabase` runs under a `Locker` from the passed
+    /// `Transaction` (`Environment.java:1125` -> `DbTree.truncate`,
+    /// `DbTree.java:1392`) and schedules the old DB for commit-time deletion.
+    ///
+    /// When `txn` is `None`, the truncation is applied immediately
+    /// (auto-commit).
     ///
     /// Mirrors `Environment.truncateDatabase(txn, dbName, returnCount)`.
     pub fn truncate_database(
         &self,
-        _txn: Option<&Transaction>,
+        txn: Option<&Transaction>,
         name: &str,
     ) -> Result<u64> {
         self.check_writable("truncate_database")?;
-        let env_impl = self.env_impl.lock();
-        env_impl.truncate_database(name).map_err(|e| match &e {
-            noxu_dbi::DbiError::DatabaseNotFound(_) => {
-                NoxuError::DatabaseNotFound(format!(
-                    "Database '{}' does not exist",
-                    name
-                ))
+
+        match txn {
+            None => {
+                let env_impl = self.env_impl.lock();
+                env_impl.truncate_database(name).map_err(map_dbi_err(name))
             }
-            _ => NoxuError::environment(e.to_string()),
-        })
+            Some(txn) => {
+                // Validate + read the count now (JE returns it synchronously),
+                // defer the tree replacement to commit.
+                let count = {
+                    let env_impl = self.env_impl.lock();
+                    env_impl
+                        .count_for_truncate(name)
+                        .map_err(map_dbi_err(name))?
+                };
+                let env_impl_arc = Arc::clone(&self.env_impl);
+                let name_owned = name.to_string();
+                txn.register_commit_callback(move || {
+                    let _ = env_impl_arc.lock().truncate_database(&name_owned);
+                });
+                Ok(count)
+            }
+        }
     }
 
     /// Renames a database.
     ///
+    /// When `txn` is `Some`, the rename participates in that transaction: the
+    /// existence / not-in-use / destination-free checks run immediately, but
+    /// the physical rename is **deferred to commit**.  Aborting the
+    /// transaction rolls the rename back — the original name survives and the
+    /// new name is not created.  Mirrors JE, where `Environment.renameDatabase`
+    /// runs under a `Locker` from the passed `Transaction`
+    /// (`Environment.java:1047` -> `DbTree.dbRename`, `DbTree.java:1136`) and
+    /// the NameLN update is transactional.
     ///
+    /// When `txn` is `None`, the rename is applied immediately (auto-commit).
     ///
     /// # Arguments
-    /// * `txn` - Optional transaction handle (currently ignored)
+    /// * `txn` - Optional transaction handle; if supplied, the rename is
+    ///   undone on abort and applied on commit.
     /// * `old_name` - Current database name
     /// * `new_name` - New database name
     ///
@@ -1012,7 +1123,7 @@ impl Environment {
     /// - The source database is currently open
     pub fn rename_database(
         &self,
-        _txn: Option<&Transaction>,
+        txn: Option<&Transaction>,
         old_name: &str,
         new_name: &str,
     ) -> Result<()> {
@@ -1022,33 +1133,46 @@ impl Environment {
             return Ok(());
         }
 
-        let mut databases = self.databases.lock();
+        // Validate up front so the caller gets a synchronous error (JE
+        // `DbTree.lockNameLN` locks/validates at operation time).
         {
             let env_impl = self.env_impl.lock();
-            env_impl.rename_database(old_name, new_name).map_err(
-                |e| match &e {
-                    noxu_dbi::DbiError::DatabaseNotFound(_) => {
-                        NoxuError::DatabaseNotFound(format!(
-                            "Database '{}' does not exist",
-                            old_name
-                        ))
-                    }
-                    noxu_dbi::DbiError::DatabaseAlreadyExists(_) => {
-                        NoxuError::DatabaseAlreadyExists(format!(
-                            "Database '{}' already exists",
-                            new_name
-                        ))
-                    }
-                    _ => NoxuError::environment(e.to_string()),
-                },
-            )?;
+            env_impl
+                .can_rename_database(old_name, new_name)
+                .map_err(map_rename_err(old_name, new_name))?;
         }
 
-        if let Some(handle) = databases.remove(old_name) {
-            databases.insert(new_name.to_string(), handle);
+        match txn {
+            None => {
+                let mut databases = self.databases.lock();
+                {
+                    let env_impl = self.env_impl.lock();
+                    env_impl
+                        .rename_database(old_name, new_name)
+                        .map_err(map_rename_err(old_name, new_name))?;
+                }
+                if let Some(handle) = databases.remove(old_name) {
+                    databases.insert(new_name.to_string(), handle);
+                }
+                Ok(())
+            }
+            Some(txn) => {
+                let env_impl_arc = Arc::clone(&self.env_impl);
+                let databases_arc = Arc::clone(&self.databases);
+                let old_owned = old_name.to_string();
+                let new_owned = new_name.to_string();
+                txn.register_commit_callback(move || {
+                    let mut databases = databases_arc.lock();
+                    let _ = env_impl_arc
+                        .lock()
+                        .rename_database(&old_owned, &new_owned);
+                    if let Some(handle) = databases.remove(&old_owned) {
+                        databases.insert(new_owned.clone(), handle);
+                    }
+                });
+                Ok(())
+            }
         }
-
-        Ok(())
     }
 
     /// Begins a new transaction.
