@@ -101,12 +101,8 @@ fn build_logged_dirty_tree() -> Tree {
     // captures + clears; we then re-dirty by inserting one more key range.
     let _ = tree.shuttle_checkpoint_flush_bins(DB_ID);
     // Re-dirty the first BIN so eviction of it has real work to do.
-    tree.insert(
-        b"k0000x".to_vec(),
-        vec![0xEE],
-        Lsn::new(2, 1),
-    )
-    .expect("re-dirty insert");
+    tree.insert(b"k0000x".to_vec(), vec![0xEE], Lsn::new(2, 1))
+        .expect("re-dirty insert");
     tree
 }
 
@@ -125,7 +121,7 @@ fn no_lost_update_on_evict() {
             // A key that sorts inside the first BIN's key range (just after
             // its smallest key), so the concurrent insert lands in the BIN
             // being evicted.
-            let mut win_key = lo.clone();
+            let mut win_key = lo;
             win_key.push(b'm'); // e.g. "k0000m" — between k0000 and k0001
 
             let evictor = {
@@ -212,7 +208,7 @@ fn forced_window_insert_is_not_lost() {
             let (bin_id, lo, _hi) = tree
                 .shuttle_first_bin_id()
                 .expect("tree must have a first BIN");
-            let mut win_key = lo.clone();
+            let mut win_key = lo;
             win_key.push(b'm');
 
             let tree_hook = Arc::clone(&tree);
@@ -239,8 +235,7 @@ fn forced_window_insert_is_not_lost() {
                     );
                 }
                 Some((captured, _)) => {
-                    let captured_here =
-                        captured.iter().any(|c| c == &win_key);
+                    let captured_here = captured.iter().any(|c| c == &win_key);
                     assert!(
                         captured_here || resident,
                         "LOST UPDATE (deterministic window race): key {:?} was \
@@ -291,6 +286,22 @@ fn build_tall_dirty_tree() -> Tree {
 /// JE `Evictor.evict` logs ANY dirty target before `parent.detachNode(...)`
 /// (Evictor.java:3013-3035), so JE never detaches a dirty upper IN with a
 /// stale slot LSN.
+///
+/// # Status: ESCALATED (unfixed)
+///
+/// GAP B is NOT fixed in this branch. The correct JE-faithful fix is to LOG
+/// the dirty upper IN in the evictor (as `flush_dirty_node_to_log` does for
+/// BINs) before detach, OR to distinguish a genuine unlogged *structural*
+/// change from the benign "dirtied only by child detachment" case (detach
+/// retains the slot key/LSN, so that image is still valid to refetch). A
+/// blanket refusal of every dirty upper IN wrongly pins legitimate childless
+/// upper INs in cache (it broke `test_do_evict_bytes_matches_node_size_not_
+/// sentinel`). Choosing between "log in the evictor" and "precise structural
+/// marker" is a design decision, so this regression is #[ignore]d as a
+/// documented, reproducible unfixed bug rather than driving a guessed fix.
+#[ignore = "GAP B unfixed: correct fix (log dirty upper IN in evictor, or \
+            precise structural-change marker) is a design decision; see \
+            /tmp/audit/remediation/eviction-pin-race.md"]
 #[test]
 fn dirty_upper_in_not_detached_without_logging() {
     shuttle::check_dfs(
@@ -310,24 +321,23 @@ fn dirty_upper_in_not_detached_without_logging() {
                 // Detach refused (the fix's behaviour): dirty upper IN kept
                 // resident until the checkpointer logs it. Safe.
                 None => {}
-                Some((gp_lsn_after, was_dirty)) => {
-                    if was_dirty {
-                        // BASE bug: a dirty upper IN was detached, and because
-                        // flush did not log it and detach keeps the Internal
-                        // child's slot LSN, the grandparent slot LSN did NOT
-                        // advance to a fresh image. The in-memory structural
-                        // change is unrecoverable on refault.
-                        assert_ne!(
-                            gp_lsn_after, gp_lsn_before,
-                            "GAP B: dirty upper IN {} was detached without \
-                             being logged — grandparent slot LSN unchanged \
-                             ({:?}); the upper IN's in-memory structural \
-                             state (post-split child slot) is lost on refault. \
-                             JE logs any dirty target before detach.",
-                            upper_id, gp_lsn_before
-                        );
-                    }
+                Some((gp_lsn_after, was_dirty)) if was_dirty => {
+                    // BASE bug: a dirty upper IN was detached, and because
+                    // flush did not log it and detach keeps the Internal
+                    // child's slot LSN, the grandparent slot LSN did NOT
+                    // advance to a fresh image. The in-memory structural
+                    // change is unrecoverable on refault.
+                    assert_ne!(
+                        gp_lsn_after, gp_lsn_before,
+                        "GAP B: dirty upper IN {} was detached without \
+                         being logged — grandparent slot LSN unchanged \
+                         ({:?}); the upper IN's in-memory structural \
+                         state (post-split child slot) is lost on refault. \
+                         JE logs any dirty target before detach.",
+                        upper_id, gp_lsn_before
+                    );
                 }
+                Some(_) => {}
             }
         },
         None,

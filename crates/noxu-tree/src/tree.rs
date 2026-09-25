@@ -5563,7 +5563,11 @@ impl Tree {
                     if n == 0 {
                         return None;
                     }
-                    Some((b.node_id, b.get_full_key(0)?, b.get_full_key(n - 1)?))
+                    Some((
+                        b.node_id,
+                        b.get_full_key(0)?,
+                        b.get_full_key(n - 1)?,
+                    ))
                 }
                 TreeNode::Internal(p) => {
                     for i in 0..p.entries.len() {
@@ -5622,9 +5626,7 @@ impl Tree {
         let root = self.get_root()?;
         // Walk from the root; for each Internal child that is an Internal node
         // and dirty, return it with the parent's published slot LSN.
-        fn walk(
-            node: &Arc<RwLock<TreeNode>>,
-        ) -> Option<(u64, Lsn, bool)> {
+        fn walk(node: &Arc<RwLock<TreeNode>>) -> Option<(u64, Lsn, bool)> {
             let g = node.read();
             let TreeNode::Internal(p) = &*g else {
                 return None;
@@ -5913,10 +5915,16 @@ impl Tree {
         {
             return None;
         }
-        // NOTE (GAP A): the current code does NOT re-check `bin.dirty` or
-        // `bin.cursor_count` here.  It reads the child's `last_full_lsn` and
-        // publishes it, dropping whatever in-memory mutation happened in the
-        // flush→detach window.
+        // EVICTOR-PIN-1 (GAP A fix): re-validate the child under the parent
+        // latch and REFUSE if it was re-dirtied or pinned since the flush
+        // snapshot (mirrors the fix in detach_node_by_id).  BIN-only — the
+        // dirty-upper-IN case (GAP B) is escalated separately.
+        if let Some(c) = p.child_ref(child_index)
+            && let TreeNode::Bottom(b) = &*c.read()
+            && (b.cursor_count > 0 || b.dirty || b.dirty_count() > 0)
+        {
+            return None; // keep resident
+        }
         let child = p.take_child(child_index)?;
         let child_full_lsn = match &*child.read() {
             TreeNode::Bottom(b) => b.last_full_lsn,
@@ -6013,7 +6021,10 @@ impl Tree {
             return None;
         }
         // Never-logged refusal is BIN-only (tree.rs:6529), so an Internal
-        // child is NOT refused here.  Take it.
+        // child is NOT refused there.  GAP B is UNFIXED / escalated: this
+        // model reflects the current (base) production behaviour — a dirty
+        // upper IN is detached without a fresh logged image.  The regression
+        // that uses this model is #[ignore]d until GAP B's fix lands.
         let child = gp.take_child(gp_index)?;
         // For an Internal child, detach forces child_full_lsn = NULL_LSN and
         // therefore keeps the grandparent's existing published slot LSN.
@@ -6905,6 +6916,45 @@ impl Tree {
             && matches!(&*c.read(), TreeNode::Bottom(b) if b.last_full_lsn == NULL_LSN)
         {
             return 0; // never-logged BIN -- keep resident, do not corrupt slot
+        }
+        // EVICTOR-PIN-1 (audit GAP A): the caller `flush_dirty_node_to_log`
+        // logged the BIN and cleared its dirty flag under the CHILD write
+        // latch, then RELEASED that latch before this method re-acquired the
+        // PARENT latch.  In that flush->detach window the child latch is free,
+        // so a concurrent cursor could have:
+        //   (A) re-dirtied the BIN (a new/updated slot) WITHOUT it being
+        //       re-logged -- publishing the flushed `last_full_lsn` here would
+        //       drop that mutation on refault (lost update); or
+        //   (B) pinned the BIN (`cursor_count > 0`) -- detaching it would
+        //       yank a BIN out from under an active cursor.
+        // JE never has this window: `Evictor.evict` holds the target latch
+        // continuously from before `target.log(...)` through
+        // `parent.detachNode(...)` (Evictor.java:3027-3035, released only in
+        // the `processTarget` finally), and re-checks `isPinned()` before
+        // evicting (Evictor.java:2699).  Noxu splits log (child latch) and
+        // detach (parent latch) into two phases, so we RE-VALIDATE the child
+        // under this latch and REFUSE (keep resident) if it was re-dirtied or
+        // pinned since the flush snapshot -- the checkpointer or a later
+        // eviction pass will re-flush-then-detach it.
+        //
+        // NOTE: this guard is BIN-only.  A dirty *upper* IN (audit GAP B) is a
+        // separate concern: `flush_dirty_node_to_log` is a no-op for non-BINs,
+        // so a dirty upper IN reaching detach has no fresh logged image and
+        // its unlogged structural change (a post-split child slot) is lost on
+        // recovery.  But an upper IN dirtied only by *child detachment*
+        // (`take_child` nulls the resident pointer but RETAINS the slot
+        // key/LSN, then sets `p.dirty = true` conservatively below) has an
+        // on-disk image that is still valid to refetch, so blanket-refusing
+        // every dirty upper IN would wrongly pin legitimate childless upper
+        // INs in cache.  Distinguishing the two safely requires either logging
+        // the upper IN in the evictor (JE `Evictor.evict` logs any dirty
+        // target, Evictor.java:3013) or a precise structural-change marker;
+        // that is a design decision tracked separately, not fixed here.
+        if let Some(c) = p.child_ref(child_index)
+            && let TreeNode::Bottom(b) = &*c.read()
+            && (b.cursor_count > 0 || b.dirty || b.dirty_count() > 0)
+        {
+            return 0; // re-dirtied / pinned BIN since flush -- keep resident
         }
         // T-4: detach the cached child via the node-level INTargetRep, leaving
         // the slot's key/LSN intact for re-fetch (JE IN.setTarget(idx, null)).
