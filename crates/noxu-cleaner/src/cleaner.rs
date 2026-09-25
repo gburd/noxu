@@ -15,9 +15,9 @@ use crate::throttle::CleanerThrottle;
 use crate::utilization_profile::UtilizationProfile;
 use crate::utilization_tracker::UtilizationTracker;
 use noxu_log::{
-    FileManager, LogManager,
-    entry_header::{MAX_HEADER_SIZE, MIN_HEADER_SIZE},
-    file_header::FILE_HEADER_SIZE,
+    FileManager, LogEntryType as WireEntryType, LogManager,
+    entry::{BinDeltaLogEntry, InLogEntry, LnLogEntry},
+    log_file_reader::LogFileReader,
 };
 use noxu_sync::Mutex;
 use noxu_txn::TxnManager;
@@ -25,6 +25,21 @@ use noxu_util::lsn::NULL_LSN;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
+
+/// Unsupported semantics retain one file; integrity/I/O failures stop the pass.
+#[derive(Debug, thiserror::Error)]
+enum FileCleaningError {
+    #[error("cleaner: unsupported {entry_type} at {lsn}; retaining file")]
+    Unsupported { entry_type: WireEntryType, lsn: noxu_util::Lsn },
+    #[error("{0}")]
+    Failed(String),
+}
+
+impl From<String> for FileCleaningError {
+    fn from(error: String) -> Self {
+        Self::Failed(error)
+    }
+}
 
 /// Bundled context for calling `process_pending` from within the
 /// `FileProcessor` periodic hook (CLN-12).
@@ -747,7 +762,11 @@ impl Cleaner {
             return Vec::new();
         };
         let mut tracker = crate::ExpirationTracker::new(file_number);
-        let entries = self.decode_ln_entries_from_file(fm, file_number);
+        let Ok(entries) = self.decode_ln_entries_from_file(fm, file_number)
+        else {
+            // No expiration credit for an unreadable/unsupported file.
+            return Vec::new();
+        };
         for entry in &entries {
             if let LogEntryType::Ln { expiration_time, entry_size, .. } =
                 entry.entry_type
@@ -835,6 +854,15 @@ impl Cleaner {
             }
         };
 
+        // JE 7.5.11 FileProcessor.doClean:335,373-386 limits a pass to
+        // the initial summary-map count, not a frozen eligible-file set.
+        // Refreshed selection may include migration output within this cap.
+        // Explicitly queued files may not have summaries (standalone cleaner).
+        let original_count = file_summary_map
+            .len()
+            .max(self.file_selector.lock().get_stats().to_be_cleaned);
+        let n_files = n_files.min(original_count.max(1) as u32);
+
         // CLN-4: compute first_active_txn_file from TxnManager so that
         // files inside an open transaction's log window are excluded.
         // JE: UtilizationCalculator.getBestFile reads
@@ -854,10 +882,19 @@ impl Cleaner {
         let mut total_entries = 0u64;
         // file_summary_map is refreshed inside the loop (CLN-13).
         let mut current_summary_map = file_summary_map;
+        let mut deferred = Vec::new();
+        let mut unsupported_error = None;
+        let mut fatal_error = None;
 
-        // JE FileProcessor.doClean main loop (~line 345): clean until no
-        // more files are selected or n_files budget is exhausted.
-        for _ in 0..n_files {
+        // JE 7.5.11 FileProcessor.doClean:335-386 bounds the pass by the
+        // original file count. Unsupported semantics are Noxu-specific:
+        // leave those files in BEING_CLEANED until pass end so the existing
+        // selector exclusion prevents reselection. They consume the scan
+        // cap, not n_files, so even one-file daemon passes can make progress.
+        for attempt in 0..original_count.max(1) {
+            if attempt - deferred.len() >= n_files as usize {
+                break;
+            }
             // Check shutdown before each iteration.
             if self.shutdown.load(Ordering::Relaxed) {
                 break;
@@ -934,13 +971,19 @@ impl Cleaner {
             self.file_protector.unprotect_file(file_number);
 
             match result {
+                Err(e @ FileCleaningError::Unsupported { .. }) => {
+                    log::warn!("{e}");
+                    unsupported_error.get_or_insert_with(|| e.to_string());
+                    deferred.push(file_number);
+                }
                 Err(e) => {
-                    // Processing failed — put file back so it is retried.
-                    // JE: FileProcessor.doClean() finally { putBackFileForCleaning }.
+                    // JE FileProcessor.doClean:557-593 stops on integrity/I/O
+                    // failures and puts unfinished files back for retry.
                     self.file_selector
                         .lock()
                         .put_back_file_for_cleaning(file_number);
-                    return Err(e);
+                    fatal_error = Some(e.to_string());
+                    break;
                 }
                 Ok(result) => {
                     // Record any LNs that could not be migrated due to lock denial.
@@ -971,6 +1014,15 @@ impl Cleaner {
                     }
                 }
             }
+        }
+
+        // Restore every deferred file even if a later file failed or shutdown
+        // interrupted the pass. None may enter the checkpoint deletion barrier.
+        for file_number in deferred {
+            self.file_selector.lock().put_back_file_for_cleaning(file_number);
+        }
+        if let Some(error) = fatal_error {
+            return Err(error);
         }
 
         // X-5: only delete files that have passed the two-checkpoint barrier.
@@ -1029,6 +1081,11 @@ impl Cleaner {
             cb();
         }
 
+        // Keep the error visible to manual callers and daemon listeners even
+        // when independent files made progress (their stats are already updated).
+        if let Some(error) = unsupported_error {
+            return Err(error);
+        }
         Ok(CleanResult {
             files_cleaned,
             files_deleted,
@@ -1150,7 +1207,11 @@ impl Cleaner {
     fn two_pass_check(&self, file_number: u32, required_util: i32) -> bool {
         let summary = match &self.file_manager {
             None => return false, // no file to scan — don't skip
-            Some(fm) => self.scan_file_summary(fm, file_number),
+            Some(fm) => match self.scan_file_summary(fm, file_number) {
+                Ok(summary) => summary,
+                // Let process_single_file report the failure and requeue it.
+                Err(_) => return false,
+            },
         };
         if summary.total_size <= 0 {
             return false;
@@ -1169,7 +1230,10 @@ impl Cleaner {
 
         let mut tracker = crate::ExpirationTracker::new(file_number);
         if let Some(fm) = &self.file_manager {
-            let entries = self.decode_ln_entries_from_file(fm, file_number);
+            let Ok(entries) = self.decode_ln_entries_from_file(fm, file_number)
+            else {
+                return false;
+            };
             for entry in &entries {
                 if let LogEntryType::Ln {
                     expiration_time, entry_size, ..
@@ -1205,10 +1269,10 @@ impl Cleaner {
     fn process_single_file(
         &self,
         file_number: u32,
-    ) -> Result<FileProcessResult, String> {
+    ) -> Result<FileProcessResult, FileCleaningError> {
         let file_summary = match &self.file_manager {
             None => crate::FileSummary::new(),
-            Some(fm) => self.scan_file_summary(fm, file_number),
+            Some(fm) => self.scan_file_summary(fm, file_number)?,
         };
 
         // CLN-12: build a process_pending callback from cloned Arcs so the
@@ -1246,7 +1310,7 @@ impl Cleaner {
         if let (Some(fm), Some(tree), Some(lm)) =
             (&self.file_manager, &self.tree, &self.log_manager)
         {
-            let entries = self.decode_ln_entries_from_file(fm, file_number);
+            let entries = self.decode_ln_entries_from_file(fm, file_number)?;
             // Use the environment's shared LockManager when available so that
             // cleaner-held locks contend with user transactions (fidelity).
             // Cleaner uses env.getTxnManager().getLockManager().
@@ -1271,209 +1335,120 @@ impl Cleaner {
                             .unwrap_or_default(),
                     )
             };
-            return processor.process_file(
-                file_number,
-                &file_summary,
-                &entries,
-                &tree_lookup,
-            );
+            return processor
+                .process_file(
+                    file_number,
+                    &file_summary,
+                    &entries,
+                    &tree_lookup,
+                )
+                .map_err(FileCleaningError::from);
         }
 
-        processor.process_file_no_entries(file_number, &file_summary)
+        processor
+            .process_file_no_entries(file_number, &file_summary)
+            .map_err(FileCleaningError::from)
     }
 
-    /// Decodes LN log entries from a file into `LogEntry` values suitable
-    /// for `FileProcessor::process_file`.
+    /// Decode Noxu entries for `FileProcessor::process_file`.
     ///
-    /// Scans the file sequentially, reading each entry header and payload.
-    /// For LN-family entries (type bytes 4–9) the payload is parsed using
-    /// `LnLogEntry::read_from_log` to extract the real record key.  This
-    /// mirrors the way `CleanerFileReader` extracts keys from log entries
-    /// before passing them to `FileProcessor.processFile()`.
-    ///
-    /// IN, BIN-delta, and all other entry types are represented as
-    /// `LogEntryType::Other` (they will be skipped by the migration loop).
-    ///
-    ///
+    /// JE 7.5.11 CleanerFileReader.processEntry classifies by LogEntryType,
+    /// not a second wire-number table. Read errors and unsupported types must
+    /// abort cleaning: a partial scan is NOT proof that a file is obsolete.
     fn decode_ln_entries_from_file(
         &self,
         fm: &Arc<FileManager>,
         file_number: u32,
-    ) -> Vec<LogEntry> {
+    ) -> Result<Vec<LogEntry>, FileCleaningError> {
         let mut entries = Vec::new();
-
-        let file_len = match fm.get_file_length(file_number) {
-            Ok(l) => l,
-            Err(_) => return entries,
-        };
-
-        // Resolve the version-aware first-entry offset:
-        // v2 files start at byte 32; v3 files at byte 36.
-        let first_entry_offset =
-            fm.file_header_size_for(file_number).unwrap_or(FILE_HEADER_SIZE)
-                as u64;
-        let mut offset = first_entry_offset;
-        while offset < file_len {
-            let mut hdr = [0u8; MIN_HEADER_SIZE];
-            let n = match fm.read_from_file(file_number, offset, &mut hdr) {
-                Ok(n) => n,
-                Err(_) => break,
+        let mut reader = LogFileReader::open(Arc::clone(fm), file_number)
+            .map_err(|e| e.to_string())?;
+        while let Some((lsn, entry_type, payload)) =
+            reader.read_next_strict().map_err(|e| e.to_string())?
+        {
+            let entry_size =
+                (reader.current_offset() - lsn.file_offset() as u64) as i32;
+            let log_entry_type = match entry_type {
+                t if t.is_user_ln_type() => {
+                    let ln = LnLogEntry::read_from_log(
+                        &payload,
+                        t.is_transactional(),
+                    )
+                    .map_err(|e| format!("cleaner: {t} at {lsn}: {e}"))?;
+                    LogEntryType::Ln {
+                        db_id: ln.db_id as i64,
+                        key: ln.key,
+                        deleted: matches!(
+                            t,
+                            WireEntryType::DeleteLN
+                                | WireEntryType::DeleteLNTxn
+                        ),
+                        expiration_time: ln.expiration as u64,
+                        entry_size,
+                    }
+                }
+                WireEntryType::IN | WireEntryType::BIN => {
+                    let node = InLogEntry::read_from_log(&payload)
+                        .map_err(|e| e.to_string())?;
+                    let id = node.node_data.get(..8).ok_or_else(|| {
+                        format!("cleaner: missing node ID at {lsn}")
+                    })?;
+                    LogEntryType::In {
+                        db_id: node.db_id as i64,
+                        node_id: i64::from_be_bytes(
+                            id.try_into()
+                                .expect("invariant: eight-byte node ID"),
+                        ),
+                    }
+                }
+                WireEntryType::BINDelta => {
+                    let node = BinDeltaLogEntry::read_from_log(&payload)
+                        .map_err(|e| e.to_string())?;
+                    let id = node.delta_data.get(..8).ok_or_else(|| {
+                        format!("cleaner: missing delta node ID at {lsn}")
+                    })?;
+                    LogEntryType::BinDelta {
+                        db_id: node.db_id as i64,
+                        node_id: i64::from_be_bytes(
+                            id.try_into()
+                                .expect("invariant: eight-byte node ID"),
+                        ),
+                    }
+                }
+                // Catalog and utilization are re-logged at checkpoint before
+                // the deletion barrier. Transaction/checkpoint records in an
+                // eligible old file are superseded by that checkpoint.
+                WireEntryType::NameLN
+                | WireEntryType::NameLNTxn
+                | WireEntryType::FileSummaryLN
+                | WireEntryType::TxnCommit
+                | WireEntryType::TxnAbort
+                | WireEntryType::CkptStart
+                | WireEntryType::CkptEnd
+                | WireEntryType::FileHeader
+                | WireEntryType::Trace => LogEntryType::Other,
+                // Do not guess at the lifetime of legacy, XA, replication or
+                // other unsupported records. Keep the entire file instead.
+                t => {
+                    return Err(FileCleaningError::Unsupported {
+                        entry_type: t,
+                        lsn,
+                    });
+                }
             };
-            if n < MIN_HEADER_SIZE {
-                break;
-            }
-            if hdr[4] == 0 {
-                break;
-            }
-
-            let entry_type_byte = hdr[4];
-            let flags = hdr[5];
-            let item_size =
-                u32::from_le_bytes([hdr[10], hdr[11], hdr[12], hdr[13]])
-                    as usize;
-
-            let vlsn_present = (flags & 0x08) != 0 || (flags & 0x20) != 0;
-            let header_size =
-                if vlsn_present { MAX_HEADER_SIZE } else { MIN_HEADER_SIZE };
-            let entry_size = header_size + item_size;
-
-            let file_offset = offset as u32;
-            let lsn = noxu_util::Lsn::new(file_number, file_offset);
-
-            // Build a LogEntry for LN-family types only; everything else
-            // is emitted as LogEntryType::Other so the processor skips it.
-            // For LN entries, read the payload and deserialise the real key.
-            // CleanerFileReader reading actual record keys via
-            // LN payload deserialization.
-            let log_entry_type = match entry_type_byte {
-                // InsertLN=4, UpdateLN=6 (non-transactional) — active entries
-                // that may need migration. Read payload to extract real key.
-                4 | 6 => {
-                    let payload_offset = offset + header_size as u64;
-                    let mut payload = vec![0u8; item_size];
-                    let (key, db_id, expiration_time): (Vec<u8>, i64, u64) =
-                        if item_size > 0
-                            && fm
-                                .read_from_file(
-                                    file_number,
-                                    payload_offset,
-                                    &mut payload,
-                                )
-                                .is_ok()
-                        {
-                            use noxu_log::entry::LnLogEntry;
-                            match LnLogEntry::read_from_log(&payload, false) {
-                                // CLN NEW-4: read ln.expiration as u64 (hours
-                                // since epoch, per CLN-10) so the two-pass
-                                // TTL-adjusted utilization sees real expired bytes.
-                                // JE: FileProcessor.processFile reads
-                                // lnEntry.getExpiration() (~line 1004).
-                                Ok(ln) => (
-                                    ln.key.clone(),
-                                    ln.db_id as i64,
-                                    ln.expiration as u64,
-                                ),
-                                Err(_) => (
-                                    file_offset.to_le_bytes().to_vec(),
-                                    1i64,
-                                    0u64,
-                                ),
-                            }
-                        } else {
-                            (file_offset.to_le_bytes().to_vec(), 1i64, 0u64)
-                        };
-                    LogEntryType::Ln {
-                        db_id,
-                        key,
-                        deleted: false,
-                        expiration_time,
-                        entry_size: entry_size as i32,
-                    }
-                }
-                // InsertLNTxn=5, UpdateLNTxn=7 — transactional variants.
-                // Read payload using transactional deserialization.
-                5 | 7 => {
-                    let payload_offset = offset + header_size as u64;
-                    let mut payload = vec![0u8; item_size];
-                    let (key, db_id, expiration_time): (Vec<u8>, i64, u64) =
-                        if item_size > 0
-                            && fm
-                                .read_from_file(
-                                    file_number,
-                                    payload_offset,
-                                    &mut payload,
-                                )
-                                .is_ok()
-                        {
-                            use noxu_log::entry::LnLogEntry;
-                            match LnLogEntry::read_from_log(&payload, true) {
-                                // CLN NEW-4: read ln.expiration as u64 (hours).
-                                Ok(ln) => (
-                                    ln.key.clone(),
-                                    ln.db_id as i64,
-                                    ln.expiration as u64,
-                                ),
-                                Err(_) => (
-                                    file_offset.to_le_bytes().to_vec(),
-                                    1i64,
-                                    0u64,
-                                ),
-                            }
-                        } else {
-                            (file_offset.to_le_bytes().to_vec(), 1i64, 0u64)
-                        };
-                    // Transactional variants are considered live during
-                    // cleaning — the cleaner migrates them.
-                    LogEntryType::Ln {
-                        db_id,
-                        key,
-                        deleted: false,
-                        expiration_time,
-                        entry_size: entry_size as i32,
-                    }
-                }
-                // DeleteLN=8, DeleteLNTxn=9 — deleted LN entries are
-                // immediately obsolete; emit as Ln { deleted: true }.
-                8 | 9 => {
-                    let payload_offset = offset + header_size as u64;
-                    let mut payload = vec![0u8; item_size];
-                    let (key, db_id): (Vec<u8>, i64) = if item_size > 0
-                        && fm
-                            .read_from_file(
-                                file_number,
-                                payload_offset,
-                                &mut payload,
-                            )
-                            .is_ok()
-                    {
-                        use noxu_log::entry::LnLogEntry;
-                        let is_txn = entry_type_byte == 9;
-                        match LnLogEntry::read_from_log(&payload, is_txn) {
-                            Ok(ln) => (ln.key.clone(), ln.db_id as i64),
-                            Err(_) => {
-                                (file_offset.to_le_bytes().to_vec(), 1i64)
-                            }
-                        }
-                    } else {
-                        (file_offset.to_le_bytes().to_vec(), 1i64)
-                    };
-                    LogEntryType::Ln {
-                        db_id,
-                        key,
-                        deleted: true,
-                        expiration_time: 0,
-                        entry_size: entry_size as i32,
-                    }
-                }
-                // IN/BIN/BINDelta and everything else → Other (skipped).
-                _ => LogEntryType::Other,
-            };
-
             entries.push(LogEntry { lsn, entry_type: log_entry_type });
-            offset += entry_size as u64;
         }
-
-        entries
+        // The strict reader still reports short reads as EOF. A closed file
+        // must be consumed completely before it may enter the deletion barrier.
+        if reader.current_offset()
+            != fm.get_file_length(file_number).map_err(|e| e.to_string())?
+        {
+            return Err(format!(
+                "cleaner: incomplete scan of file {file_number:08x}"
+            )
+            .into());
+        }
+        Ok(entries)
     }
 
     /// Scans a log file and returns a populated `FileSummary`.
@@ -1483,9 +1458,7 @@ impl Cleaner {
     /// - `total_ln_count` / `total_ln_size` for LN entry types
     /// - `total_in_count` / `total_in_size` for IN / BIN-delta entry types
     ///
-    /// Entry-type bytes recognised as LN:  `InsertLN`=4, `InsertLNTxn`=5,
-    /// `UpdateLN`=6, `UpdateLNTxn`=7, `DeleteLN`=8, `DeleteLNTxn`=9.
-    /// Entry-type bytes recognised as IN:  `IN`=2, `BIN`=3, `BINDelta`=26.
+    /// Classification uses the canonical Noxu LogEntryType predicates.
     /// All other types are counted in the totals but not in the per-type
     /// fields, so they show up in "leftover" space (treated as obsolete by
     /// `FileSummary::calculate_obsolete_size`).
@@ -1503,57 +1476,27 @@ impl Cleaner {
         &self,
         fm: &Arc<FileManager>,
         file_number: u32,
-    ) -> crate::FileSummary {
+    ) -> Result<crate::FileSummary, FileCleaningError> {
         let mut summary = crate::FileSummary::new();
-
-        let file_len = match fm.get_file_length(file_number) {
-            Ok(l) => l,
-            Err(_) => return summary,
-        };
+        let file_len =
+            fm.get_file_length(file_number).map_err(|e| e.to_string())?;
         // Total size is the full file, including the file header.
         summary.total_size = file_len.min(i32::MAX as u64) as i32;
 
-        // Resolve the version-aware first-entry offset:
-        // v2 files start at byte 32; v3 files at byte 36.
-        let first_entry_offset =
-            fm.file_header_size_for(file_number).unwrap_or(FILE_HEADER_SIZE)
-                as u64;
-        let mut offset = first_entry_offset;
-        while offset < file_len {
-            let mut hdr = [0u8; MIN_HEADER_SIZE];
-            let n = match fm.read_from_file(file_number, offset, &mut hdr) {
-                Ok(n) => n,
-                Err(_) => break,
-            };
-            if n < MIN_HEADER_SIZE {
-                break; // Truncated read at end of file.
-            }
-            // A zero entry-type byte means we've reached unwritten space.
-            if hdr[4] == 0 {
-                break;
-            }
-
-            let entry_type_byte = hdr[4];
-            let flags = hdr[5];
-            let item_size =
-                u32::from_le_bytes([hdr[10], hdr[11], hdr[12], hdr[13]])
-                    as usize;
-
-            let vlsn_present = (flags & 0x08) != 0 || (flags & 0x20) != 0;
-            let header_size =
-                if vlsn_present { MAX_HEADER_SIZE } else { MIN_HEADER_SIZE };
-            let entry_size = (header_size + item_size) as i32;
+        let mut reader = LogFileReader::open(Arc::clone(fm), file_number)
+            .map_err(|e| e.to_string())?;
+        while let Some((lsn, entry_type, _)) =
+            reader.read_next_strict().map_err(|e| e.to_string())?
+        {
+            let entry_size =
+                (reader.current_offset() - lsn.file_offset() as u64) as i32;
 
             summary.total_count += 1;
             // total_size was already set to the full file length; we track
             // per-type sizes below for utilization estimation.
 
-            // Classify by entry type.
-            // LN types: InsertLN=4, InsertLNTxn=5, UpdateLN=6,
-            //           UpdateLNTxn=7, DeleteLN=8, DeleteLNTxn=9
-            // IN types: IN=2, BIN=3, BINDelta=26
-            match entry_type_byte {
-                4..=9 => {
+            match entry_type {
+                t if t.is_ln_type() => {
                     // LN family
                     summary.total_ln_count += 1;
                     summary.total_ln_size += entry_size;
@@ -1561,7 +1504,7 @@ impl Cleaner {
                         summary.max_ln_size = entry_size;
                     }
                 }
-                2 | 3 | 26 => {
+                t if t.is_in_type() => {
                     // IN / BIN / BINDelta family
                     summary.total_in_count += 1;
                     summary.total_in_size += entry_size;
@@ -1572,8 +1515,6 @@ impl Cleaner {
                     // bytes will appear as "leftover" obsolete space.
                 }
             }
-
-            offset += (header_size + item_size) as u64;
         }
 
         // Populate the expiration uncertainty band (lower = definitely
@@ -1582,7 +1523,9 @@ impl Cleaner {
         // file's min/max utilization. CLN-9 / CFG-TWOPASS-1.
         {
             let mut tracker = crate::ExpirationTracker::new(file_number);
-            let entries = self.decode_ln_entries_from_file(fm, file_number);
+            // Also validates complete consumption and supported semantics;
+            // never publish obsolete-byte credit from an incomplete scan.
+            let entries = self.decode_ln_entries_from_file(fm, file_number)?;
             for entry in &entries {
                 if let LogEntryType::Ln {
                     expiration_time, entry_size, ..
@@ -1604,7 +1547,7 @@ impl Cleaner {
                 gradual.min(i32::MAX as i64) as i32;
         }
 
-        summary
+        Ok(summary)
     }
 
     /// Updates statistics from a file processing result.
@@ -1815,9 +1758,26 @@ impl Cleaner {
         let mut deleted = 0u32;
         for file_number in files_to_delete {
             if !self.file_protector.is_protected(file_number) {
-                if let Some(fm) = &self.file_manager {
-                    let _ = fm.delete_file(file_number);
+                if let Some(fm) = &self.file_manager
+                    && let Err(e) = fm.delete_file(file_number)
+                {
+                    log::warn!(
+                        "cleaner: cannot delete file {file_number:08x}: {e}"
+                    );
+                    self.file_selector
+                        .lock()
+                        .add_safe_to_delete_back(file_number);
+                    continue;
                 }
+                // Remove obsolete selection metadata with the deleted file;
+                // otherwise the next pass tries to clean it again.
+                // Match the profile -> tracker lock order used by summary
+                // snapshots/checkpoint transfers; retire both atomically.
+                let mut profile = self.utilization_profile.lock();
+                if let Some(tracker) = &self.utilization_tracker {
+                    tracker.lock().remove_tracked_file(file_number);
+                }
+                profile.remove_file_summary(file_number);
                 deleted += 1;
                 self.stats.deletions.fetch_add(1, Ordering::Relaxed);
             } else {
@@ -2301,7 +2261,7 @@ mod tests {
         let cleaner = Cleaner::with_file_manager(50, 0, 0, Arc::clone(&fm));
 
         // The written entries land in file 0.
-        let summary = cleaner.scan_file_summary(&fm, 0);
+        let summary = cleaner.scan_file_summary(&fm, 0).unwrap();
 
         assert!(
             summary.total_size > 0,
@@ -2439,6 +2399,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn unreadable_or_unsupported_entries_block_reclamation() {
+        use noxu_log::{LogEntryType as T, Provisional};
+        // Unknown type, unsupported legacy node, malformed user LN, and
+        // truncated tail must not turn a partially scanned file into garbage.
+        for kind in 0..4 {
+            let dir = tempfile::TempDir::new().unwrap();
+            let (fm, lm) = make_fm_and_lm(dir.path());
+            let t = match kind {
+                1 => T::OldLN,
+                2 => T::InsertLN,
+                _ => T::Trace,
+            };
+            let lsn = lm.log(t, &[], Provisional::No, true, true).unwrap();
+            let path = dir.path().join("00000000.ndb");
+            if kind == 0 {
+                use std::io::{Seek, SeekFrom, Write};
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .unwrap();
+                f.seek(SeekFrom::Start(lsn.file_offset() as u64 + 4)).unwrap();
+                f.write_all(&[255]).unwrap();
+            } else if kind == 3 {
+                use std::io::Write;
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap()
+                    .write_all(&[1, 2, 3])
+                    .unwrap();
+            }
+            let tree = Arc::new(RwLock::new(noxu_tree::Tree::new(1, 128)));
+            let cleaner =
+                Cleaner::with_file_manager_and_tree(50, 0, 0, fm, tree, lm);
+            cleaner.add_file_to_clean(0);
+            assert!(
+                cleaner.do_clean(1, true).is_err(),
+                "kind {kind} must fail closed"
+            );
+            for _ in 0..2 {
+                let state =
+                    cleaner.get_file_selector().lock().get_checkpoint_state();
+                cleaner.after_checkpoint(&state);
+            }
+            assert_eq!(cleaner.delete_safe_files(), 0);
+            assert!(path.exists(), "unclassified file must be retained");
+        }
+    }
+
     // ── Integration tests: tree-wired cleaner (with_file_manager_and_tree) ───
 
     /// Helper: create a FileManager + LogManager pair in `dir`.
@@ -2539,92 +2549,179 @@ mod tests {
         );
     }
 
-    /// `process_single_file` with a tree-wired cleaner: live LN entries
-    /// whose keys match entries in the tree are migrated.
-    ///
-    /// Core migration path for log file cleaning.
-    /// `FileProcessor.processFoundLN()`.  We insert a key into the tree at
-    /// the LSN that would be produced by a synthetic LN entry in the log, then
-    /// verify the cleaner reports a migration.
-    ///
-    /// Because `decode_ln_entries_from_file` uses the file offset as a
-    /// synthetic key and sets `db_id = 1`, we write a matching entry into the
-    /// tree using those same values before running the cleaner.
+    #[test]
+    fn deletion_retires_accounting_only_after_success() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (fm, _lm) = make_fm_and_lm_with_entries(dir.path());
+        let tracker = Arc::new(Mutex::new(UtilizationTracker::new(true)));
+        tracker.lock().count_new_log_entry(0, 100, true, false);
+        tracker.lock().count_new_log_entry(1, 200, true, false);
+        let cleaner = Cleaner::with_file_manager(50, 0, 1, Arc::clone(&fm))
+            .with_utilization_tracker(Arc::clone(&tracker));
+        cleaner
+            .utilization_profile
+            .lock()
+            .update_file_summary(0, &FileSummary::new());
+        cleaner.get_file_selector().lock().add_safe_to_delete_back(0);
+        let before = cleaner.get_merged_file_summary_map();
+        let budget_before = tracker.lock().get_bytes_tracked();
+
+        // A directory at the file path forces remove_file to fail even as root.
+        let path = dir.path().join("00000000.ndb");
+        let saved = dir.path().join("saved.ndb");
+        std::fs::rename(&path, &saved).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert_eq!(cleaner.delete_safe_files(), 0);
+        assert_eq!(cleaner.get_merged_file_summary_map().len(), before.len());
+        assert!(cleaner.get_profile_summary(0).is_some());
+        assert!(tracker.lock().get_tracked_files().contains_key(&0));
+        assert_eq!(tracker.lock().get_bytes_tracked(), budget_before);
+        assert!(
+            cleaner
+                .get_file_selector()
+                .lock()
+                .get_safe_to_delete()
+                .contains(&0)
+        );
+        assert_eq!(cleaner.get_stats().snapshot().deletions, 0);
+
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(&saved, &path).unwrap();
+        assert_eq!(cleaner.delete_safe_files(), 1);
+        assert!(!path.exists());
+        assert!(cleaner.get_profile_summary(0).is_none());
+        assert!(!tracker.lock().get_tracked_files().contains_key(&0));
+        assert!(tracker.lock().get_tracked_files().contains_key(&1));
+        assert!(tracker.lock().get_bytes_tracked() < budget_before);
+        assert!(!cleaner.get_merged_file_summary_map().contains_key(&0));
+        // No ghost summary can select deleted file 0 for a subsequent scan.
+        assert_eq!(cleaner.do_clean(10, true).unwrap().files_cleaned, 0);
+    }
+
+    #[test]
+    fn forced_pass_is_bounded_when_migrations_create_files() {
+        use bytes::BytesMut;
+        use noxu_log::Provisional;
+        use noxu_util::NULL_VLSN;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let fm =
+            Arc::new(FileManager::new(dir.path(), false, 4096, 100).unwrap());
+        let tracker = Arc::new(Mutex::new(UtilizationTracker::new(true)));
+        let mut lm = LogManager::new(Arc::clone(&fm), 3, 8192, 4096);
+        lm.set_write_observer(Arc::new(
+            crate::UtilizationTrackerObserver::new(Arc::clone(&tracker)),
+        ));
+        let lm = Arc::new(lm);
+        let tree = Arc::new(RwLock::new(noxu_tree::Tree::new(1, 128)));
+        let value = vec![42; 512];
+        for k in 0u32..24 {
+            let key = k.to_be_bytes().to_vec();
+            let entry = LnLogEntry::new(
+                1,
+                None,
+                NULL_LSN,
+                false,
+                None,
+                None,
+                NULL_VLSN,
+                0,
+                false,
+                key.clone(),
+                Some(value.clone()),
+                0,
+                NULL_VLSN,
+            );
+            let mut buf = BytesMut::new();
+            entry.write_to_log(&mut buf);
+            let lsn = lm
+                .log(
+                    WireEntryType::InsertLN,
+                    &buf,
+                    Provisional::No,
+                    true,
+                    false,
+                )
+                .unwrap();
+            tree.write().unwrap().insert(key, value.clone(), lsn).unwrap();
+        }
+        lm.flush_sync().unwrap();
+        let cleaner = Cleaner::with_file_manager_and_tree(
+            50,
+            0,
+            1,
+            Arc::clone(&fm),
+            Arc::clone(&tree),
+            Arc::clone(&lm),
+        )
+        .with_utilization_tracker(tracker);
+        for _ in 0..2 {
+            let original = cleaner.get_merged_file_summary_map().len() as u32;
+            let before = fm.list_file_numbers().unwrap().len();
+            // Finite caller budget exposes a missing per-pass bound without
+            // hanging the test. The public u32::MAX call is covered at DB level.
+            let result = cleaner.do_clean(original + 3, true).unwrap();
+            assert!(
+                result.files_cleaned > 0,
+                "later passes must remain possible"
+            );
+            assert!(
+                fm.list_file_numbers().unwrap().len() > before,
+                "must create migration output"
+            );
+            assert!(
+                result.files_cleaned <= original,
+                "one pass cleaned {} files, original map had {original}",
+                result.files_cleaned
+            );
+            for k in 0u32..24 {
+                assert_eq!(
+                    tree.read()
+                        .unwrap()
+                        .search_with_data(&k.to_be_bytes())
+                        .unwrap()
+                        .data
+                        .as_deref(),
+                    Some(value.as_slice())
+                );
+            }
+        }
+    }
+
+    /// Real Noxu LN payloads and type bytes must reach live migration.
     #[test]
     fn test_process_single_file_with_tree_migrates_live_ln() {
-        use noxu_util::Lsn;
+        use bytes::BytesMut;
+        use noxu_log::Provisional;
+        use noxu_util::NULL_VLSN;
 
         let dir = tempfile::TempDir::new().unwrap();
         let (fm, lm) = make_fm_and_lm(dir.path());
-
-        // Write a non-transactional InsertLN entry (type byte 4) so that
-        // `decode_ln_entries_from_file` classifies it as a live LN.
-        // We use `LogEntryType::Trace` with a crafted first byte because
-        // the cleaner dispatches on the raw entry-type byte, not the enum.
-        // Easiest approach: write raw bytes directly via FileManager.
-        //
-        // LogManager.log() writes a real entry header; the type byte at
-        // position 4 of the record will be whatever `entry_type.type_num()`
-        // returns.  Trace = type 1, TxnCommit = type 14, IN = type 2.
-        //
-        // For InsertLN (type 4) we need to write it as a raw payload.
-        // We write a minimal 0-byte payload so item_size = 0.
-        //
-        // Note: LogManager.log() writes type byte 4 for InsertLN only if
-        // LogEntryType::InsertLN exists.  Looking at the entry_type enum,
-        // type 4 = InsertLN.  We use `LogEntryType::InsertLN` if present,
-        // otherwise we skip this test.
-        //
-        // Looking at the existing code, we know TxnCommit entries are the
-        // only ones easily writable.  To keep the test practical, we test
-        // with a `NoopTree`-like scenario: write TxnCommit entries (type 14,
-        // which maps to Other in the cleaner), confirm the file-level path
-        // still completes.  The real LN-migration with a synthetic InsertLN
-        // offset-based key is tested in the file_processor unit tests.
-        //
-        // Simpler approach: insert a key derived from FILE_HEADER_SIZE
-        // (the first offset after the file header) into the tree at a
-        // sentinel LSN, then write a raw log buffer whose header has type=4.
-
-        use noxu_log::entry_header::MIN_HEADER_SIZE;
-        use noxu_log::file_header::FILE_HEADER_SIZE;
-
-        // Offset where the first log entry lands after the file header.
-        let first_ln_offset = FILE_HEADER_SIZE as u32;
-        let synthetic_key = first_ln_offset.to_le_bytes().to_vec();
-        let entry_lsn = Lsn::new(0, first_ln_offset);
-
-        // Insert that key into the tree at entry_lsn so the cleaner will
-        // find it and attempt migration.
-        let tree = Arc::new(RwLock::new(noxu_tree::Tree::new(1, 128)));
-        {
-            let t = tree.write().unwrap();
-            t.insert(synthetic_key, b"value".to_vec(), entry_lsn)
-                .expect("insert should succeed");
-        }
-
-        // Write a raw InsertLN (type=4) entry at `first_ln_offset` so the
-        // decode loop picks it up.  We write directly via the FileManager
-        // after flushing a file header; the easiest way is to construct the
-        // 14-byte header manually with type=4 and item_size=0.
-        let item_size: u32 = 0;
-        let mut hdr = [0u8; MIN_HEADER_SIZE];
-        hdr[4] = 4; // entry_type = InsertLN
-        hdr[5] = 0; // flags = 0 (no VLSN)
-        hdr[10..14].copy_from_slice(&item_size.to_le_bytes());
-        // Compute CRC over bytes [4..MIN_HEADER_SIZE]
-        let crc = noxu_log::ChecksumValidator::compute_range(
-            &hdr,
-            4,
-            MIN_HEADER_SIZE - 4,
+        let entry = LnLogEntry::new(
+            1,
+            None,
+            NULL_LSN,
+            false,
+            None,
+            None,
+            NULL_VLSN,
+            0,
+            false,
+            b"key".to_vec(),
+            Some(b"value".to_vec()),
+            0,
+            NULL_VLSN,
         );
-        hdr[0..4].copy_from_slice(&crc.to_le_bytes());
-
-        // Write file header + LN header to file 0.
-        // The FileManager creates file 0 on first write; we need to write
-        // past the file header.  We use write_buffer at offset
-        // FILE_HEADER_SIZE.
-        fm.write_buffer(&hdr, first_ln_offset as u64).unwrap();
+        let mut buf = BytesMut::new();
+        entry.write_to_log(&mut buf);
+        let entry_lsn = lm
+            .log(WireEntryType::InsertLN, &buf, Provisional::No, true, true)
+            .unwrap();
+        let tree = Arc::new(RwLock::new(noxu_tree::Tree::new(1, 128)));
+        tree.write()
+            .unwrap()
+            .insert(b"key".to_vec(), b"value".to_vec(), entry_lsn)
+            .unwrap();
 
         let cleaner = Cleaner::with_file_manager_and_tree(
             50,
@@ -2638,8 +2735,7 @@ mod tests {
         let result = cleaner.process_single_file(0).unwrap();
 
         assert!(result.completed, "processing must complete");
-        // The InsertLN entry is decoded and its synthetic key matches the
-        // tree entry at entry_lsn == log_lsn → migration.
+        // The decoded real key matches the tree at entry_lsn == log_lsn.
         assert_eq!(result.lns_cleaned, 1, "one LN entry should be cleaned");
         assert_eq!(result.lns_migrated, 1, "the live LN must be migrated");
         assert_eq!(result.lns_dead, 0, "no entries should be dead");

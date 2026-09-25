@@ -57,6 +57,37 @@ review items.
 6. **Last resort — restore from backup** using `BackupManager`-copied files.
    Replace the corrupted environment directory with the backup and reopen.
 
+## Cleaner entry-type data loss
+
+Older cleaner code used entry-type numbers that did not match the Noxu log
+format. Cleaning could delete files containing live records; a successful
+reopen alone does not establish that all records survived.
+
+Before upgrading an affected environment, stop cleaning and preserve a copy of
+its directory. Validate expected keys **and values** against a trusted backup or
+application source. Prior cleaner runs may already have deleted unrecoverable
+records. The corrected cleaner prevents this entry-type misclassification; it
+cannot reconstruct deleted files. Restore missing data from an independently
+verified backup or replica. No log-format conversion is required.
+
+The cleaner retains files containing unknown or unsupported entry types, or
+incomplete or invalid entries. Known but unsupported types include current XA
+`TxnPrepare` records, even when a commit follows: the cleaner has no lifetime
+proof that permits discarding them. Such files are deferred until pass end and
+requeued; independent eligible files can still be cleaned, including in
+one-file daemon passes. Each unsupported-file error is logged, and the pass
+returns its first unsupported-file error after publishing progress statistics
+and performing normal checkpoint-gated deletion. An error therefore does not
+mean that no other files were cleaned.
+
+Unknown types, corruption, and I/O failures still stop the pass immediately;
+they are not treated as unsupported semantics or obsolete bytes. Investigate
+errors and do not manually delete retained files. Attempts remain bounded by
+the initial summary/queue count. Unsupported files consume this attempt cap,
+not the requested cleaning budget; migration output may be selected within
+the cap. Subsequent passes can reclaim more space after checkpoint barriers
+complete.
+
 ## Disk-full recovery
 
 If a write returns `NoxuError::DiskLimitExceeded { used, limit }`, a disk-space

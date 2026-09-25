@@ -37,6 +37,126 @@
 use noxu_db::{DatabaseConfig, Environment, EnvironmentConfig};
 use tempfile::TempDir;
 
+/// Untouched live records must not be mistaken for obsolete bytes merely
+/// because they reside in old files. Check both recovery and actual reclamation.
+fn old_live_records_survive_reclamation(clean: bool) {
+    use noxu_db::CheckpointConfig;
+    use std::collections::BTreeSet;
+
+    let tmp = TempDir::new().unwrap();
+    let files = || -> BTreeSet<_> {
+        std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|e| e == "ndb"))
+            .collect()
+    };
+    let config = || {
+        let mut cfg = EnvironmentConfig::new(tmp.path().to_path_buf())
+            .with_allow_create(true)
+            .with_transactional(true)
+            .with_log_file_max_bytes(64 * 1024)
+            .with_cache_size(32 * 1024 * 1024);
+        cfg.set_run_cleaner(false);
+        cfg.set_run_checkpointer(false);
+        cfg.set_run_evictor(false);
+        cfg.set_run_in_compressor(false);
+        cfg
+    };
+    let value = |k: u32, generation: u8| {
+        let mut v = vec![generation; 512];
+        v[..4].copy_from_slice(&k.to_be_bytes());
+        v
+    };
+    let env = Environment::open(config()).unwrap();
+    let db_cfg =
+        DatabaseConfig::new().with_allow_create(true).with_transactional(true);
+    let db = env.open_database(None, "old-live", &db_cfg).unwrap();
+    for k in 0u32..2000 {
+        db.put(k.to_be_bytes(), value(k, 0)).unwrap();
+    }
+    db.sync().unwrap();
+    let old_files = files();
+    assert!(old_files.len() > 2, "old records must span closed files");
+
+    // The old keys are NEVER rewritten. Only newer keys generate obsolete
+    // versions, so a clean-close checkpoint cannot repair lost old LN images.
+    for generation in 1..=4 {
+        for k in 2000u32..3000 {
+            db.put(k.to_be_bytes(), value(k, generation)).unwrap();
+        }
+    }
+    let checkpoint = CheckpointConfig::new().with_force(true);
+    env.checkpoint(Some(&checkpoint)).unwrap();
+    let mut cleaned = 0;
+    for _ in 0..3 {
+        if clean {
+            cleaned += env.clean_log().unwrap();
+        }
+        env.checkpoint(Some(&checkpoint)).unwrap();
+    }
+    let remaining = files();
+    let reclaimed = old_files.difference(&remaining).count();
+    eprintln!(
+        "clean={clean}: cleaned={cleaned}, old files reclaimed={reclaimed}/{}",
+        old_files.len()
+    );
+    if clean {
+        assert!(cleaned > 0, "must activate real cleaner processing");
+        assert!(reclaimed > 0, "must physically delete old record files");
+    } else {
+        assert_eq!(reclaimed, 0, "control must not reclaim files");
+    }
+    db.close().unwrap();
+    env.close().unwrap();
+    drop(db);
+    drop(env);
+
+    let env = Environment::open(config()).unwrap();
+    let db = env
+        .open_database(
+            None,
+            "old-live",
+            &DatabaseConfig::new().with_transactional(true),
+        )
+        .unwrap();
+    let mut missing_old = 0;
+    let mut mismatches = Vec::new();
+    for k in 0u32..3000 {
+        let actual = db.get(k.to_be_bytes()).unwrap();
+        if k < 2000 && actual.is_none() {
+            missing_old += 1;
+        }
+        if actual.as_deref()
+            != Some(value(k, if k < 2000 { 0 } else { 4 }).as_slice())
+        {
+            mismatches.push(k);
+        }
+    }
+    eprintln!(
+        "clean={clean}: missing old records={missing_old}/2000, mismatched key/value pairs={}",
+        mismatches.len()
+    );
+    assert!(
+        mismatches.is_empty(),
+        "reopen lost/changed {} records; first keys: {:?}",
+        mismatches.len(),
+        &mismatches[..mismatches.len().min(20)]
+    );
+    db.close().unwrap();
+    env.close().unwrap();
+}
+
+#[test]
+fn cleaner_reclaims_old_files_without_losing_live_records() {
+    old_live_records_survive_reclamation(true);
+}
+
+#[test]
+fn old_live_records_without_cleaning_control() {
+    old_live_records_survive_reclamation(false);
+}
+
 /// Single clean_log() + reopen preserves all records.  (Passed even before
 /// the fix — kept as a lower-bound guard.)
 #[test]
