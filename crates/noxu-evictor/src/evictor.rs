@@ -1346,7 +1346,44 @@ impl Evictor {
                 }
                 b
             }
-            _ => return true, // non-BIN dirty node; nothing to flush here
+            // EVICTOR-UPPER-IN-1 (audit GAP B): a dirty *upper* IN reaching
+            // the Evict path must be LOGGED before it can be detached, exactly
+            // as a dirty BIN is — otherwise `detach_node_by_id` drops the
+            // resident upper IN while its grandparent slot still points at the
+            // pre-change on-disk image, losing the in-memory structural update
+            // (a post-split child slot) on crash before the next checkpoint.
+            //
+            // JE `Evictor.evict` logs ANY dirty target before
+            // `parent.detachNode(...)`: the `if (target.getDirty() &&
+            // !storedOffHeap) { ... loggedLsn = target.log(...); logged =
+            // true; }` block is NOT BIN-specific, and
+            // `parent.detachNode(index, logged /*updateLsn*/, loggedLsn)` then
+            // publishes the fresh LSN into the parent slot (Evictor.java
+            // :3013-3035, IN.detachNode IN.java:4019-4027).
+            //
+            // We mirror that here by reusing the checkpointer's upper-IN
+            // logging machinery (serialize via `write_to_bytes()` ->
+            // `InLogEntry` -> `LogEntryType::IN`, then
+            // `Tree::update_parent_slot_lsn` to stamp the logged LSN into the
+            // parent slot — Checkpointer.flush_one_tree_upper_ins,
+            // checkpointer.rs).  After logging the upper IN is clean, so the
+            // subsequent detach publishes the fresh slot LSN and GAP A's
+            // re-dirty/pin recheck passes.
+            TreeNode::Internal(n) => {
+                if !n.dirty {
+                    return true; // clean now; evict normally
+                }
+                let node_bytes = node_guard.write_to_bytes();
+                // Drop the child latch before touching the log manager /
+                // parent latch (parent-then-child lock order, matching the
+                // checkpointer's upper-IN flush).
+                drop(node_guard);
+                return self.log_dirty_upper_in(
+                    owning_db_id,
+                    &node_arc,
+                    node_bytes,
+                );
+            }
         };
 
         if !bin.dirty && bin.dirty_count() == 0 {
@@ -1429,6 +1466,99 @@ impl Evictor {
         bin.clear_dirty_after_full_log(logged_lsn);
         self.stats.increment(&self.stats.dirty_nodes_evicted);
         true
+    }
+
+    /// Log a dirty upper (non-BIN) IN before it is detached, then publish the
+    /// logged LSN into its parent slot — the JE `Evictor.evict` behaviour for
+    /// a dirty non-BIN target (EVICTOR-UPPER-IN-1, audit GAP B).
+    ///
+    /// Mirrors the checkpointer's `flush_one_tree_upper_ins` machinery
+    /// (Checkpointer.flush_one_tree_upper_ins, checkpointer.rs): serialize the
+    /// upper IN with `write_to_bytes()`, wrap it in an `InLogEntry`, log it as
+    /// `LogEntryType::IN`, clear its dirty flag, and stamp the logged LSN into
+    /// the parent slot via `Tree::update_parent_slot_lsn` so recovery can
+    /// re-fetch the fresh image.  The `provisional` decision reuses the same
+    /// checkpoint-coordination hook the BIN path uses
+    /// (`get_eviction_provisional`).
+    ///
+    /// The caller has already released the child write latch (parent-then-
+    /// child lock order); `update_parent_slot_lsn` re-acquires the parent
+    /// latch to publish, exactly as the checkpointer does.
+    ///
+    /// Returns `true` ("proceed to detach") when the upper IN is either logged
+    /// clean here or when there is no log manager wired (tests):
+    /// * logged clean — `detach_node_by_id` publishes the fresh slot LSN and
+    ///   GAP A's re-dirty/pin recheck passes;
+    /// * no log manager — same fallback as the BIN path (the shared detach
+    ///   site's own safety checks apply).
+    ///
+    /// Returns `false` ("put the node back") when the log write FAILS: the
+    /// upper IN stays dirty, so a later eviction pass or the checkpointer will
+    /// re-flush it.  On this pre-WAL-fail-stop branch this matches the BIN
+    /// flush-failure behaviour (a failed `lm.log*` leaves the node dirty).
+    fn log_dirty_upper_in(
+        &self,
+        db_id: u64,
+        node_arc: &Arc<NodeRwLock<TreeNode>>,
+        node_bytes: Vec<u8>,
+    ) -> bool {
+        let lm = match self
+            .log_manager
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().map(Arc::clone))
+        {
+            Some(lm) => lm,
+            None => return true, // no log manager (tests); allow eviction
+        };
+
+        // CC-4: coordinate with an in-progress checkpoint the same way the BIN
+        // path does.  A childless upper IN evicted standalone logs
+        // Provisional::No by default (no checkpointer / not covered), which is
+        // the safe choice — a non-provisional full image recovery can trust.
+        let level = { node_arc.read().level() };
+        let provisional = self
+            .checkpointer
+            .read()
+            .expect("evictor ckpt lock poisoned")
+            .as_ref()
+            .and_then(|w| w.upgrade())
+            .map(|c| c.get_eviction_provisional(db_id, level))
+            .unwrap_or(Provisional::No);
+
+        let entry = InLogEntry::new(db_id, NULL_LSN, NULL_LSN, node_bytes);
+        let mut buf = bytes::BytesMut::with_capacity(entry.log_size());
+        entry.write_to_log(&mut buf);
+
+        match lm.log(
+            LogEntryType::IN,
+            &buf,
+            provisional,
+            false, // flush_required
+            false, // fsync_required
+        ) {
+            Ok(logged_lsn) => {
+                // Clear the dirty flag under the child latch, then release it
+                // BEFORE publishing to the parent (parent-then-child order).
+                {
+                    let mut g = node_arc.write();
+                    g.set_dirty(false);
+                }
+                // JE `IN.detachNode(index, updateLsn=true, loggedLsn)` stamps
+                // the fresh LSN into the parent slot.  We do the equivalent
+                // via the checkpointer's `update_parent_slot_lsn` (it matches
+                // the child by node_id under the parent latch and marks the
+                // parent dirty), so `detach_node_by_id` then keeps this fresh
+                // slot LSN for the Internal child instead of a stale one.
+                Tree::update_parent_slot_lsn(node_arc, logged_lsn);
+                self.stats.increment(&self.stats.dirty_nodes_evicted);
+                true
+            }
+            // Log write failed: leave the upper IN dirty and put it back.
+            // (Pre-WAL-fail-stop: this matches the BIN path leaving the node
+            // dirty on a failed log write.)
+            Err(_) => false,
+        }
     }
 
     /// Strips the embedded-LN data from a BIN, freeing the heap allocations

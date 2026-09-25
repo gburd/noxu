@@ -5967,29 +5967,35 @@ impl Tree {
         Some((captured, final_lsn))
     }
 
-    /// GAP B model: reproduce the evictor's handling of a DIRTY UPPER IN.
+    /// GAP B model: reproduce the evictor's handling of a DIRTY UPPER IN
+    /// AFTER the EVICTOR-UPPER-IN-1 fix.
     ///
     /// The evictor's Evict path for a non-BIN dirty node calls
-    /// `flush_dirty_node_to_log` (evictor.rs:1043), which for a
-    /// `TreeNode::Internal` returns `true` WITHOUT logging anything
-    /// (evictor.rs ~1348-1350).  It then runs `detach_node_by_id`, which for
-    /// an Internal child forces `child_full_lsn = NULL_LSN` (tree.rs:6552) and
-    /// so KEEPS the parent's existing published slot LSN (the pre-change
-    /// image), then drops the resident upper IN.
+    /// `flush_dirty_node_to_log` (evictor.rs), which now LOGS a dirty upper IN
+    /// via `log_dirty_upper_in` — serialize, write an `InLogEntry` as
+    /// `LogEntryType::IN`, clear the dirty flag, and stamp the fresh logged
+    /// LSN into the parent slot via `Tree::update_parent_slot_lsn` — exactly
+    /// as JE `Evictor.evict` logs ANY dirty target before
+    /// `parent.detachNode(...)` (Evictor.java:3013-3035).  It then runs
+    /// `detach_node_by_id`, which for an Internal child KEEPS the parent slot
+    /// LSN the flush just freshened (mirroring JE
+    /// `IN.detachNode(idx, updateLsn=true, loggedLsn)`, IN.java:4019-4027).
     ///
-    /// This models exactly that: it does NOT log the target upper IN, then
-    /// detaches it, and returns the LSN the grandparent slot ends up pointing
-    /// at (the image a refault would read).  The GAP B invariant is:
+    /// This models exactly that fixed flow with a synthetic log LSN standing
+    /// in for the WAL write (the model has no LogManager): Phase 1 assigns a
+    /// fresh LSN, publishes it into the grandparent slot, and clears the
+    /// upper IN's dirty flag; Phase 2 detaches, keeping the fresh slot LSN.
+    /// The GAP B invariant is:
     ///
     /// ```text
     /// dirty(upper_in)  =>  detach refused  OR  a fresh image was published
     /// ```
     ///
-    /// On BASE this returns `Some(old_lsn)` for a dirty upper IN whose
-    /// in-memory structural state (e.g. a post-split new child slot) is newer
-    /// than `old_lsn` — the change is lost on refault.  A fix must either
-    /// LOG the dirty upper IN first (JE `Evictor.evict` logs any dirty target
-    /// before detach, Evictor.java:3013-3035) or REFUSE to detach it.
+    /// After the fix this returns `Some((fresh_lsn, was_dirty))` for a dirty
+    /// upper IN, where `fresh_lsn != old_lsn` — the in-memory structural state
+    /// is captured on disk before the node is dropped, so a refault reads the
+    /// current image.  (On BASE, Phase 1 did NOT log, so the slot kept the
+    /// stale `old_lsn` and the change was lost.)
     ///
     /// Returns `Some((published_lsn, was_dirty))` on detach, `None` on refusal.
     #[cfg(noxu_shuttle)]
@@ -5998,10 +6004,12 @@ impl Tree {
         upper_in_node_id: u64,
     ) -> Option<(Lsn, bool)> {
         // ---- Phase 1: flush_dirty_node_to_log for a non-BIN --------------
-        // The evictor's flush hits `_ => return true` for a TreeNode::Internal
-        // WITHOUT logging.  We reproduce that no-op: capture whether it was
-        // dirty, then do NOT log / clear it.
-        let was_dirty = {
+        // The evictor's flush LOGS a dirty upper IN (EVICTOR-UPPER-IN-1) and
+        // stamps the fresh logged LSN into the parent slot.  We reproduce that
+        // with a synthetic "logged" LSN: if the target is dirty, publish a
+        // fresh LSN into its parent slot (via `update_parent_slot_lsn`) and
+        // clear the dirty flag — exactly what `log_dirty_upper_in` does.
+        let (was_dirty, target_arc) = {
             let root = self.get_root()?;
             let (parent_arc, idx) =
                 Self::find_parent_of_node_id(&root, upper_in_node_id)?;
@@ -6012,17 +6020,36 @@ impl Tree {
                 };
                 Arc::clone(p.child_ref(idx)?)
             };
-            let g = target_arc.read();
-            match &*g {
-                TreeNode::Internal(n) => n.dirty,
-                // Not an upper IN; wrong model.
-                TreeNode::Bottom(_) => return None,
-            }
-            // flush returns true WITHOUT logging: dirty flag stays set, no
-            // new image is written.
+            let dirty = {
+                let g = target_arc.read();
+                match &*g {
+                    TreeNode::Internal(n) => n.dirty,
+                    // Not an upper IN; wrong model.
+                    TreeNode::Bottom(_) => return None,
+                }
+            };
+            (dirty, target_arc)
         };
 
-        // ---- Phase 2: detach_node_by_id for the (still-dirty) upper IN ----
+        if was_dirty {
+            // Synthetic "log" of the upper IN: a fresh LSN newer than any slot
+            // LSN in this small fixture.  `log_dirty_upper_in` derives the
+            // real one from `lm.log(...)`.
+            let fresh_lsn = Lsn::new(u32::MAX, u32::MAX - 1);
+            // Clear dirty under the child latch, then release before touching
+            // the parent (parent-then-child order), matching
+            // `log_dirty_upper_in`.
+            {
+                let mut g = target_arc.write();
+                g.set_dirty(false);
+            }
+            // Publish the fresh LSN into the parent slot (grandparent slot for
+            // the being-detached upper IN), matching
+            // `Tree::update_parent_slot_lsn`.
+            Self::update_parent_slot_lsn(&target_arc, fresh_lsn);
+        }
+
+        // ---- Phase 2: detach_node_by_id for the (now-clean) upper IN ------
         let (grandparent_arc, gp_index) =
             Self::find_parent_of_node_id(&self.get_root()?, upper_in_node_id)?;
         let mut gp_guard = grandparent_arc.write();
@@ -6037,14 +6064,10 @@ impl Tree {
         {
             return None;
         }
-        // Never-logged refusal is BIN-only (tree.rs:6529), so an Internal
-        // child is NOT refused there.  GAP B is UNFIXED / escalated: this
-        // model reflects the current (base) production behaviour — a dirty
-        // upper IN is detached without a fresh logged image.  The regression
-        // that uses this model is #[ignore]d until GAP B's fix lands.
         let child = gp.take_child(gp_index)?;
         // For an Internal child, detach forces child_full_lsn = NULL_LSN and
-        // therefore keeps the grandparent's existing published slot LSN.
+        // therefore KEEPS the grandparent's published slot LSN — which Phase 1
+        // just freshened for a dirty upper IN (GAP B fix).
         let child_full_lsn = match &*child.read() {
             TreeNode::Bottom(b) => b.last_full_lsn,
             TreeNode::Internal(_) => NULL_LSN,
@@ -6954,19 +6977,19 @@ impl Tree {
         // pinned since the flush snapshot -- the checkpointer or a later
         // eviction pass will re-flush-then-detach it.
         //
-        // NOTE: this guard is BIN-only.  A dirty *upper* IN (audit GAP B) is a
-        // separate concern: `flush_dirty_node_to_log` is a no-op for non-BINs,
-        // so a dirty upper IN reaching detach has no fresh logged image and
-        // its unlogged structural change (a post-split child slot) is lost on
-        // recovery.  But an upper IN dirtied only by *child detachment*
-        // (`take_child` nulls the resident pointer but RETAINS the slot
-        // key/LSN, then sets `p.dirty = true` conservatively below) has an
-        // on-disk image that is still valid to refetch, so blanket-refusing
-        // every dirty upper IN would wrongly pin legitimate childless upper
-        // INs in cache.  Distinguishing the two safely requires either logging
-        // the upper IN in the evictor (JE `Evictor.evict` logs any dirty
-        // target, Evictor.java:3013) or a precise structural-change marker;
-        // that is a design decision tracked separately, not fixed here.
+        // GAP B (dirty *upper* IN) is now handled by the caller: the evictor's
+        // `flush_dirty_node_to_log` LOGS a dirty upper IN via
+        // `log_dirty_upper_in` (JE `Evictor.evict` logs ANY dirty target,
+        // Evictor.java:3013-3035) and stamps the fresh logged LSN into this
+        // parent slot via `Tree::update_parent_slot_lsn` before detach runs,
+        // so `published_lsn` below already reflects the current on-disk image.
+        // A childless upper IN dirtied only by *child detachment* (`take_child`
+        // nulls the resident pointer but RETAINS the slot key/LSN, then sets
+        // `p.dirty = true`) still has a valid on-disk image to refetch, so it
+        // is safe to detach keeping the existing slot LSN; the guard above is
+        // therefore left BIN-only.  (An upper IN reaching detach with no log
+        // manager wired — unit fixtures — keeps its pre-existing valid slot
+        // LSN, which is likewise safe to refetch.)
         if let Some(c) = p.child_ref(child_index)
             && let TreeNode::Bottom(b) = &*c.read()
             && (b.cursor_count > 0 || b.dirty || b.dirty_count() > 0)
@@ -6990,6 +7013,15 @@ impl Tree {
         // that full LSN is the delta's BASE, not the current image. Our
         // evictor logs dirty BINs before calling detach, so install its new
         // full image only if newer than the already-published slot.
+        //
+        // For an Internal (upper IN) child the fresh logged LSN was already
+        // stamped into this parent slot by the evictor's `log_dirty_upper_in`
+        // -> `Tree::update_parent_slot_lsn` (GAP B fix), mirroring JE
+        // `IN.detachNode(idx, updateLsn=true, loggedLsn)` which does
+        // `setLsn(idx, newLsn)` for any target (IN.java:4019-4027).  So we
+        // force `child_full_lsn = NULL` for an Internal child and KEEP the
+        // already-published (fresh) `published_lsn`, rather than re-deriving an
+        // LSN the upper IN does not carry (`InNodeStub` has no last_full_lsn).
         let child_full_lsn = match &*child.read() {
             TreeNode::Bottom(b) => b.last_full_lsn,
             TreeNode::Internal(_) => NULL_LSN,

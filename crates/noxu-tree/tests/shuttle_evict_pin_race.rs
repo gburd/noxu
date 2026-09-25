@@ -274,11 +274,11 @@ fn build_tall_dirty_tree() -> Tree {
 
 /// THE GAP B GATE: a DIRTY upper IN must never be detached with a stale
 /// (un-refreshed) grandparent slot LSN. The evictor's `flush_dirty_node_to_log`
-/// returns `true` for a non-BIN WITHOUT logging it, and `detach_node_by_id`
-/// keeps the existing slot LSN for an Internal child. So on BASE a dirty upper
-/// IN is dropped while its grandparent slot still points at the pre-change
-/// on-disk image — structural updates (a post-split new child slot) are lost
-/// on refault.
+/// now LOGS a dirty upper IN (EVICTOR-UPPER-IN-1) via `log_dirty_upper_in` and
+/// stamps the fresh logged LSN into the grandparent slot before detach, so
+/// `detach_node_by_id` keeps the fresh slot LSN for the Internal child. A
+/// refault therefore reads the current on-disk image — structural updates (a
+/// post-split new child slot) survive.
 ///
 /// Invariant: `was_dirty` => (detach refused) OR (a fresh image published,
 /// i.e. the grandparent slot LSN advanced to reflect the current structure).
@@ -287,21 +287,13 @@ fn build_tall_dirty_tree() -> Tree {
 /// (Evictor.java:3013-3035), so JE never detaches a dirty upper IN with a
 /// stale slot LSN.
 ///
-/// # Status: ESCALATED (unfixed)
+/// # Status: FIXED (EVICTOR-UPPER-IN-1)
 ///
-/// GAP B is NOT fixed in this branch. The correct JE-faithful fix is to LOG
-/// the dirty upper IN in the evictor (as `flush_dirty_node_to_log` does for
-/// BINs) before detach, OR to distinguish a genuine unlogged *structural*
-/// change from the benign "dirtied only by child detachment" case (detach
-/// retains the slot key/LSN, so that image is still valid to refetch). A
-/// blanket refusal of every dirty upper IN wrongly pins legitimate childless
-/// upper INs in cache (it broke `test_do_evict_bytes_matches_node_size_not_
-/// sentinel`). Choosing between "log in the evictor" and "precise structural
-/// marker" is a design decision, so this regression is #[ignore]d as a
-/// documented, reproducible unfixed bug rather than driving a guessed fix.
-#[ignore = "GAP B unfixed: correct fix (log dirty upper IN in evictor, or \
-            precise structural-change marker) is a design decision; see \
-            /tmp/audit/remediation/eviction-pin-race.md"]
+/// GAP B is fixed on this branch: the evictor logs the dirty upper IN before
+/// detach (as `flush_dirty_node_to_log` does for BINs) and publishes the fresh
+/// LSN into the parent slot, so detach keeps a current image. This test FAILED
+/// on base aad7e077 (dirty upper IN detached with the stale slot LSN) and
+/// PASSES after the fix.
 #[test]
 fn dirty_upper_in_not_detached_without_logging() {
     shuttle::check_dfs(
