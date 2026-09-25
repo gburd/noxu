@@ -37,8 +37,15 @@ fn prepare_does_not_block_progress(include_prepare: bool, budget: u32) {
         .unwrap();
     for _ in 0..2 {
         fm.flip_file().unwrap();
-        lm.log(LogEntryType::Trace, b"supported", Provisional::No, true, true)
+        // A fresh pool prevents an old buffer from writing into the prior file.
+        lm = LogManager::new(Arc::clone(&fm), 3, 8192, 4096);
+        lm.set_write_observer(Arc::new(UtilizationTrackerObserver::new(
+            Arc::clone(&tracker),
+        )));
+        let lsn = lm
+            .log(LogEntryType::Trace, b"supported", Provisional::No, true, true)
             .unwrap();
+        assert_eq!(lsn.file_number(), fm.get_current_file_num());
     }
     let retained_path = dir.path().join("00000000.ndb");
     let retained_bytes = std::fs::read(&retained_path).unwrap();
@@ -60,7 +67,7 @@ fn prepare_does_not_block_progress(include_prepare: bool, budget: u32) {
         eprintln!("prepare={include_prepare}, budget={budget}, pass={pass}: {result:?}");
         if include_prepare {
             let error = result.expect_err("unsupported Prepare must remain visible");
-            assert!(error.contains("unsupported TxnPrepare"), "{error}");
+            assert!(error.contains("unsupported Prepare"), "{error}");
             let selector = cleaner.get_file_selector_stats();
             assert_eq!(selector.to_be_cleaned, 1, "retry remains visible");
             assert_eq!(selector.being_cleaned, 0, "no stuck file");
