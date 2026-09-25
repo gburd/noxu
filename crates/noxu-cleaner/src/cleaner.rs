@@ -842,8 +842,11 @@ impl Cleaner {
         // JE 7.5.11 FileProcessor.doClean:335,373-386 limits a pass to
         // the initial summary-map count, not a frozen eligible-file set.
         // Refreshed selection may include migration output within this cap.
-        // Allow one attempt when only the explicit queue has a file.
-        let n_files = n_files.min((file_summary_map.len() as u32).max(1));
+        // Explicitly queued files may not have summaries (standalone cleaner).
+        let original_count = file_summary_map
+            .len()
+            .max(self.file_selector.lock().get_stats().to_be_cleaned);
+        let n_files = n_files.min(original_count.max(1) as u32);
 
         // CLN-4: compute first_active_txn_file from TxnManager so that
         // files inside an open transaction's log window are excluded.

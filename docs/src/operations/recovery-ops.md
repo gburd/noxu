@@ -37,6 +37,26 @@ to the amount of data written since the last checkpoint.
 6. **Last resort — restore from backup** using `BackupManager`-copied files.
    Replace the corrupted environment directory with the backup and reopen.
 
+## Cleaner entry-type data loss
+
+Older cleaner code used entry-type numbers that did not match the Noxu log
+format. Cleaning could delete files containing live records; a successful
+reopen alone does not establish that all records survived.
+
+Before upgrading an affected environment, stop cleaning and preserve a copy of
+its directory. Validate expected keys **and values** against a trusted backup or
+application source. Prior cleaner runs may already have deleted unrecoverable
+records. The corrected cleaner prevents this entry-type misclassification; it
+cannot reconstruct deleted files. Restore missing data from an independently
+verified backup or replica. No log-format conversion is required.
+
+The cleaner now retains files containing unknown or unsupported entry types,
+or incomplete or invalid entries, and reports an error rather than treating
+unreadable bytes as obsolete. Investigate such errors; do not manually delete
+the retained files. A forced pass is bounded, but may clean files created by
+migration within that bound; subsequent passes can reclaim more space after
+checkpoint barriers complete.
+
 ## Disk-full recovery
 
 If a write returns `NoxuError::DiskLimitExceeded { used, limit }`, a disk-space
