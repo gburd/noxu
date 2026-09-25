@@ -1705,8 +1705,24 @@ impl Cleaner {
         let mut deleted = 0u32;
         for file_number in files_to_delete {
             if !self.file_protector.is_protected(file_number) {
-                if let Some(fm) = &self.file_manager {
-                    let _ = fm.delete_file(file_number);
+                if let Some(fm) = &self.file_manager
+                    && let Err(e) = fm.delete_file(file_number)
+                {
+                    log::warn!(
+                        "cleaner: cannot delete file {file_number:08x}: {e}"
+                    );
+                    self.file_selector
+                        .lock()
+                        .add_safe_to_delete_back(file_number);
+                    continue;
+                }
+                // Remove obsolete selection metadata with the deleted file;
+                // otherwise the next pass tries to clean it again.
+                self.utilization_profile
+                    .lock()
+                    .remove_file_summary(file_number);
+                if let Some(tracker) = &self.utilization_tracker {
+                    tracker.lock().get_tracked_files_mut().remove(&file_number);
                 }
                 deleted += 1;
                 self.stats.deletions.fetch_add(1, Ordering::Relaxed);
