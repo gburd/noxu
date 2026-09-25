@@ -106,7 +106,8 @@ fn value(i: u32) -> Vec<u8> {
     format!("v_{i:07}").into_bytes()
 }
 
-/// True committed set: all N keys inserted, then every 100th key updated.
+/// True committed set: all N keys inserted, then every 100th key updated, then
+/// (phase 5) every 100th key offset by 50 updated to "updated2".
 fn expected_set() -> BTreeMap<Vec<u8>, Vec<u8>> {
     let mut m = BTreeMap::new();
     for i in 0..N {
@@ -114,6 +115,9 @@ fn expected_set() -> BTreeMap<Vec<u8>, Vec<u8>> {
     }
     for i in (0..N).step_by(100) {
         m.insert(key(i), b"updated".to_vec());
+    }
+    for i in (50..N).step_by(100) {
+        m.insert(key(i), b"updated2".to_vec());
     }
     m
 }
@@ -177,7 +181,29 @@ fn build_workload(env: &noxu_db::Environment, db: &noxu_db::Database) -> u64 {
     checkpoint(env);
     let deltas = delta_in_flush(env) - before;
     eprintln!("build_workload: phase-4 deltas={deltas}");
-    deltas
+
+    // Phase 5: after the split's modified halves have been persisted (full
+    // images with the fix), a subsequent sparse update MUST once again be
+    // delta-eligible — the fix invalidates the stale base for ONE image, it
+    // does not permanently disable deltas. Update a different sparse set and
+    // checkpoint; assert a delta is chosen and the result still recovers.
+    {
+        let txn = env.begin_transaction(None).unwrap();
+        for i in (50..N).step_by(100) {
+            db.put_in(
+                &txn,
+                DatabaseEntry::from_bytes(&key(i)),
+                DatabaseEntry::from_bytes(b"updated2"),
+            )
+            .unwrap();
+        }
+        txn.commit().unwrap();
+    }
+    let before5 = delta_in_flush(env);
+    checkpoint(env);
+    let deltas5 = delta_in_flush(env) - before5;
+    eprintln!("build_workload: phase-5 deltas={deltas5}");
+    deltas5
 }
 
 fn assert_no_resurrection(
@@ -237,7 +263,15 @@ fn split_left_half_delta_survives_evict_refault() {
     let env = open_env_split(dir.path());
     let db = open_db_split(&env);
 
-    build_workload(&env, &db);
+    let phase5_deltas = build_workload(&env, &db);
+    // Regression against over-fixing: after the split's forced full image, a
+    // later sparse update MUST be delta-eligible again (the fix invalidates
+    // the base for one image, it does not permanently disable deltas).
+    assert!(
+        phase5_deltas > 0,
+        "post-split full image did not restore delta eligibility \
+         (phase-5 deltas={phase5_deltas})"
+    );
 
     // Drop resident BINs so a later access must refault them from their
     // delta+base chain.

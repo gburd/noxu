@@ -4545,6 +4545,27 @@ impl Tree {
                 } else {
                     b.keys.compact(b.compact_max_key_length); // T-2
                 }
+                // A split moves the right-half entries OUT of this (left)
+                // BIN, but `last_full_lsn` still points at the PRE-split full
+                // image, which contains ALL the original entries (both
+                // halves). A BINDelta records only dirty slots and cannot
+                // express the removal of the moved-away keys, so a delta
+                // logged against that stale base would resurrect them on
+                // refault/recovery (base + sparse delta merged by key). Force
+                // the NEXT persisted image of this modified half to be a FULL
+                // image, which advances `last_full_lsn` past the split and
+                // invalidates the stale base for delta purposes.
+                //
+                // JE achieves the same by logging BOTH split halves in full at
+                // split time: `IN.splitInternal` (IN.java:4154) calls
+                // `optionalLogProvisionalNoCompress` -> `logInternal(...,
+                // allowDeltas=false, ...)` (IN.java:5373), which sets
+                // `lastFullLsn=newLsn` + `lastDeltaLsn=NULL` for each half
+                // (IN.java:5545). Noxu defers logging to the checkpointer, so
+                // the equivalent invalidation is a `prohibit_next_delta` on the
+                // modified left half. (The right sibling below is created with
+                // `last_full_lsn == NULL_LSN`, so it is already forced full.)
+                b.prohibit_next_delta = true;
             }
             _ => return Err(TreeError::SplitRequired),
         }
