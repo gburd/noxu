@@ -223,6 +223,24 @@ impl FileManager {
         self.env_dir.join(filename)
     }
 
+    /// Returns the simple (partial) file name for a log file number, e.g.
+    /// `00000003.ndb`, without a directory component.
+    ///
+    /// JE: `FileManager.getPartialFileName` (used by `DbBackup.getFileNames`,
+    /// DbBackup.java:729) to build the copy list.  Kept public so the backup
+    /// API can name files independently of the environment's on-disk layout.
+    pub fn partial_file_name(&self, file_num: u32) -> String {
+        format!("{}{}", format_file_number(file_num), LOG_FILE_EXTENSION)
+    }
+
+    /// Returns the absolute path to a log file number in this environment.
+    ///
+    /// JE: `FileManager.getFullFileName`.  The backup API returns these paths
+    /// so the caller can copy the exact bytes on disk.
+    pub fn full_file_name(&self, file_num: u32) -> PathBuf {
+        self.file_path(file_num)
+    }
+
     /// Lists all log file numbers in the environment directory.
     ///
     /// Returns the file numbers sorted in ascending order.

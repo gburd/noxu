@@ -18,5 +18,5 @@ described here.
 5. [Isolation Levels](isolation.md) — read-committed, serializable, and default isolation
 6. [Deadlock Handling](deadlocks.md) — detection, retry patterns, victim selection
 7. [Durability Policies](durability.md) — `SyncPolicy`, `DurabilityPolicy`, group commit
-8. [Backup and Recovery](backup-recovery.md) — live backup, normal vs catastrophic recovery
+8. [Backup and Recovery](backup-recovery.md) — hot backup, normal vs catastrophic recovery
 9. [XA Distributed Transactions](xa-distributed.md) — X/Open 2PC across multiple environments

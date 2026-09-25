@@ -83,9 +83,7 @@ Three paths in order of preference:
      size.
 
 2. **Restore from backup**: replace the env directory with the
-   most recent `BackupManager` snapshot. The
-   `transaction_id_at_backup_time` field on the snapshot tells you
-   how much committed data you're dropping.
+   most recent hot-backup snapshot (see [Backup](backup.md)).
 
 3. **Manual log truncation** (last resort, no replica, no
    backup):
@@ -368,5 +366,5 @@ from minutes to hours.
   throughout these runbooks
 - [Recovery Procedures](recovery-ops.md) — for the corruption /
   fatal-error case (Runbook 1's deepest path)
-- [Backup](backup.md) — how to take a `BackupManager` snapshot
+- [Backup](backup.md) — how to take a hot-backup snapshot
   for the Runbook 1 fallback

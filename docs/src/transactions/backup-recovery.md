@@ -28,46 +28,38 @@ reopen the environment; normal recovery reconstructs the B-tree automatically.
 
 ### Hot Backup (Online)
 
-A hot backup is taken while write operations are in progress. Copy all `.ndb` log
-files from the environment directory to your archival location. Files must be
-copied in alphabetical (numerical) order. You do not need to stop database
-operations.
+A hot backup is taken while write operations are in progress, using the
+[`Environment::start_backup`](../operations/backup.md) API. It pins the current
+log-file set so the log cleaner cannot delete or replace a file while you copy
+it, then hands you the exact list of files to copy. This is the JE `DbBackup`
+contract.
 
-The complication with hot backups is that the log cleaner may delete or create
-files while you are copying. A naive copy loop may miss newly created files. The
-recommended solution is to do two passes:
+> **Do not** naively `cp`/`rsync` a live environment directory without
+> `start_backup()`. The log cleaner may delete or replace files mid-copy,
+> producing an inconsistent, unrecoverable set. Use the API below, or take an
+> offline backup.
 
-1. Enumerate all log files and begin copying.
-2. After finishing, check for any new files created during the copy and copy those
-   as well.
+```rust,no_run
+use noxu_db::{CheckpointConfig, Environment};
+use std::path::Path;
 
-Or use a systematic approach:
+/// Consistent hot backup: pin the file set, copy it, release.
+fn hot_backup(env: &Environment, backup_dir: &Path) -> noxu_db::error::Result<()> {
+    std::fs::create_dir_all(backup_dir)?;
 
-```rust
-use std::fs;
-use std::path::{Path, PathBuf};
+    // Force a checkpoint first to reduce recovery time after a restore.
+    env.checkpoint(Some(&CheckpointConfig::new().with_force(true)))?;
 
-/// Copy all .ndb log files from `env_dir` to `backup_dir` in order.
-/// A simple hot-backup approach; for production use, implement two-pass
-/// logic or freeze the log file set before copying.
-fn hot_backup(env_dir: &Path, backup_dir: &Path) -> std::io::Result<()> {
-    fs::create_dir_all(backup_dir)?;
+    // Pin the log-file set against cleaner deletion.
+    let backup = env.start_backup()?;
 
-    let mut log_files: Vec<PathBuf> = fs::read_dir(env_dir)?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().map(|x| x == "ndb").unwrap_or(false))
-        .collect();
-
-    // Sort numerically (alphabetical order matches numerical for hex-named files).
-    log_files.sort();
-
-    for file in &log_files {
-        let dest = backup_dir.join(file.file_name().unwrap());
-        fs::copy(file, dest)?;
-        println!("Backed up {:?}", file.file_name().unwrap());
+    for src in backup.log_files_in_backup_set() {
+        let name = src.file_name().expect("log file name");
+        std::fs::copy(&src, backup_dir.join(name))?;
     }
 
+    // Re-enable cleaning of the copied files.
+    backup.end_backup()?;
     Ok(())
 }
 ```
@@ -89,10 +81,10 @@ contents at the moment of the backup:
 
 ### Incremental Backups
 
-An incremental backup copies only those log files modified or created since the
-last backup. Track the last log file number included in each backup and on the next
-run copy only files with higher numbers. Most system backup tools support
-incremental backup natively.
+An incremental backup copies only those log files created since the last backup.
+Save `Backup::last_file_in_backup_set()` after each backup; on the next run,
+copy only the files whose number is greater than that value (older files are
+immutable and already archived).
 
 ### Restore
 

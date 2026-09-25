@@ -1869,6 +1869,50 @@ impl Environment {
         Ok(result.files_cleaned)
     }
 
+    /// Starts a hot backup and returns a [`Backup`](crate::Backup) handle.
+    ///
+    /// This is the JE `DbBackup` contract (`util/DbBackup.java`): it does
+    /// **not** copy any files.  It pins the current log-file set so the cleaner
+    /// cannot delete it, and returns the exact list of `.ndb` files you must
+    /// copy.  You copy them with any tool (`std::fs::copy`, `rsync`, an
+    /// object-store client, …), then call
+    /// [`Backup::end_backup`](crate::Backup::end_backup) — or drop the handle —
+    /// to re-enable cleaning.
+    ///
+    /// For a fast restore, force a checkpoint immediately before calling this
+    /// (JE recommends the same, `DbBackup.java:108`).
+    ///
+    /// ```no_run
+    /// use noxu_db::{CheckpointConfig, Environment, EnvironmentConfig};
+    /// # fn run(env: &Environment) -> noxu_db::error::Result<()> {
+    /// // Reduce recovery time after a restore.
+    /// env.checkpoint(Some(&CheckpointConfig::new().with_force(true)))?;
+    ///
+    /// let backup = env.start_backup()?;
+    /// for src in backup.log_files_in_backup_set() {
+    ///     let name = src.file_name().expect("log file name");
+    ///     std::fs::copy(&src, std::path::Path::new("/backup/noxu").join(name))?;
+    /// }
+    /// backup.end_backup()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    /// Returns an error if the environment is closed, or if it was opened
+    /// read-only / without a cleaner (a hot backup needs the running cleaner's
+    /// file protector to pin the set).
+    ///
+    /// JE: `new DbBackup(env).startBackup()` (`DbBackup.java:480`).
+    pub fn start_backup(&self) -> Result<crate::Backup> {
+        self.check_open()?;
+        let env_impl = self.env_impl.lock();
+        let inner = env_impl
+            .start_backup()
+            .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
+        Ok(crate::Backup::new(inner))
+    }
+
     /// Recomputes the cached disk-limit violation state immediately (JE:
     /// `Cleaner.freshenLogSizeStats`).
     ///

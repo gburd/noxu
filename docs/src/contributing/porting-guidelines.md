@@ -107,7 +107,7 @@ The 10 Noxu enhancements not present in standalone Noxu are:
 | Async Acks + GroupCommit | `noxu-txn/src/group_commit.rs` |
 | ByteComparator | `noxu-db/src/byte_comparator.rs` |
 | UncachedLN mode | `noxu-dbi/src/cursor_impl.rs` (CacheMode enum) |
-| Auto-Backup (BackupManager) | `noxu-dbi/src/backup_manager.rs` |
+| Hot backup (DbBackup) | `noxu-dbi/src/db_backup.rs` (via `Environment::start_backup`) |
 | Enhanced Verify (VerifyCheckpointInterval) | `noxu-recovery/src/recovery_manager.rs` |
 | ScanFilter + ScanResult | `noxu-db/src/scan_filter.rs` |
 | Per-slot BIN timestamps (TTL) | `noxu-tree/src/tree.rs` (`BinStub`: modification_times, creation_times) |

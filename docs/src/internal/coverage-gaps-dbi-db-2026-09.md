@@ -169,10 +169,10 @@ anti-pattern — the following were left uncovered rather than padded:
 * `Debug` impls: `DatabaseImpl`, `DatabaseConfig`, `ConfigComparator`,
   `Triggers`, `Comparator`.
 * `Default` impls that forward to `new()`: `DbTree`, `NodeSequence`,
-  `DatabaseTree`, `BackupManager`, `DiskOrderedCursorOptions`.
+  `DatabaseTree`, `DiskOrderedCursorOptions`.
 * Branch-free one-line accessors returning `&self.field`:
   `get_memory_budget`, `get_node_sequence`, `get_disk_limit`,
-  `get_creation_time`, `BackupManager::last_backup_ms`,
+  `get_creation_time`,
   `ReplicaReplay::last_applied_vlsn_handle`, `MemoryBudget::tree_memory_counter`.
   Several are covered incidentally by the behavioural tests anyway.
 * The 20 placeholder-generic `environment_impl` records.

@@ -163,8 +163,7 @@ Key files:
 - `src/memory_budget.rs` — `MemoryBudget`: explicit memory accounting
 
 `EnvironmentImpl` fields: `checkpointer`, `primary_tree`, `cleaner`, `evictor`,
-`evictor_handle`, `in_compressor_handle`, `data_eraser`, `extinction_scanner`,
-`backup_manager`.
+`evictor_handle`, `in_compressor_handle`, `data_eraser`, `extinction_scanner`.
 
 ## Phase 5 — Background Services
 

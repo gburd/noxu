@@ -17,7 +17,7 @@ embedded database with:
 
 All 10 extended-fork enhancements are included (Record Extinction, TTL,
 Group Commit, ByteComparator, DataEraser, ExtinctionFilter, ScanFilter,
-UncachedLN, BackupManager, AsyncAcks).
+UncachedLN, DbBackup hot backup, AsyncAcks).
 
 ## Development Timeline
 
@@ -26,7 +26,7 @@ UncachedLN, BackupManager, AsyncAcks).
 | 1–22 | Foundation: B-tree, WAL, transaction manager, recovery, evictor, cleaner, checkpointer, public API |
 | 23 | First full benchmark comparison — Noxu reads 25x faster than Noxu at 1K scale (no JVM warmup) |
 | 24 | BIN-delta chaining, Sequence transactions, upper-IN cleaner, comment audit |
-| 25 | 10 Noxu enhancements: ByteComparator, ScanFilter, ExtinctionFilter, GroupCommit, per-slot BIN times, VerifyCheckpointInterval, DataEraser, ExtinctionScanner, BackupManager |
+| 25 | 10 Noxu enhancements: ByteComparator, ScanFilter, ExtinctionFilter, GroupCommit, per-slot BIN times, VerifyCheckpointInterval, DataEraser, ExtinctionScanner, DbBackup hot backup |
 | 26 | Lock/latch hierarchy: Locker trait, ThreadLocker sharing, HandleLocker buddy system, DummyLockManager wired, TxnChain for replication partial rollback |
 | 27 | Non-standard write-buffering (superseded by Session 28) |
 | 28 | **Critical fix**: Replaced tentative MVCC with Noxu's lock-based isolation. Writers block readers; no snapshot isolation. |
