@@ -16,6 +16,47 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Three independent data-loss defects on the storage path, each reproduced on a
+  release build before the fix and re-verified by an independent reviewer and a
+  fresh-worktree lead requalification (debug and release).** All three were found
+  by an external fidelity audit against Berkeley DB JE 7.5.11.
+  - **Deleted keys resurrected after reopen (BIN-delta).** A physical slot removal
+    was not representable in a `BINDelta`, so a later delta checkpoint left the
+    deleted key in the pre-delete full image and recovery restored it (regression:
+    400/400 deleted keys came back). Physical removal now forces a full BIN image
+    on the next log via a shared `remove_slot` helper (`prohibit_next_delta`)
+    covering the comparator, `delete_recursive`, and compressor paths. Delta
+    logging resumes on the following sparse update.
+  - **Eviction published a stale parent image.** When a checkpoint had published a
+    `BINDelta` newer than `last_full_lsn`, detaching the evicted BIN overwrote the
+    parent slot with the older full-image base, so the next refault returned stale
+    data (regression: refault returned the pre-overwrite value). Detach now
+    installs a new full image only when it is persistent and newer than the
+    already-published slot, revalidates child identity under the parent write
+    latch, and no longer credits a refused detach as a successful eviction.
+  - **The cleaner deleted files still holding live data.** Log entries were decoded
+    with JE wire-type numbers instead of Noxu's canonical `LogEntryType`, so live
+    LNs were misclassified as obsolete and their files reclaimed (regression:
+    2000/2000 old records lost after reopen). Decoding and the utilization-summary
+    path now use the canonical typed dispatch and fail closed on unknown or
+    unsupported entry types. Related fixes on the same branch: the JE
+    original-file-count pass bound was restored to stop forced-clean
+    nontermination once migrations create new files; utilization summaries are
+    retired only after a successful physical deletion (a failed deletion retains
+    the file, its metadata, and its accounting); and an unsupported entry (for
+    example a valid XA `TxnPrepare`) is now deferred *within* a bounded pass so
+    unrelated eligible files still make progress, while fatal corruption or I/O
+    errors still stop the pass. **Note:** this prevents future loss; files whose
+    only copies a prior buggy cleaner already deleted cannot be reconstructed.
+
+  Known follow-ups deliberately left open (tracked, not yet fixed): BIN split/merge
+  old-base delta invalidation; dirty-BIN eviction failing closed on a log-write
+  error (blocked on a WAL failed-append accounting/contract decision); dirty
+  generation/pin eviction races; dirty upper-IN eviction handling; and the
+  cleaner's legacy protected-retry phantom-deletion accounting.
+
 ## [7.10.1] - 2026-09-12
 
 ### Fixed
