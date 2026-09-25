@@ -104,7 +104,8 @@ fn plain_get_next_scan_visits_all_keys_across_bins() {
     let expected: BTreeSet<Vec<u8>> =
         (0..N_KEYS).map(|i| ikey(i).into_bytes()).collect();
     assert_eq!(
-        seen, expected,
+        seen,
+        expected,
         "plain Get::Next scan must visit all {N_KEYS} keys across all BINs; \
          visited {} of {N_KEYS}",
         seen.len()

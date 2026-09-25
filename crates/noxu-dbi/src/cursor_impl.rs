@@ -175,6 +175,24 @@ pub struct CursorImpl {
     /// In this is `CursorImpl.index`. -1 means "before first entry".
     current_index: i32,
 
+    /// The tree key of the record most recently removed by [`Self::delete`],
+    /// retained as the cross-BIN advance anchor while the cursor is in the
+    /// `PendingDeleted` state.
+    ///
+    /// JE keeps the cursor's `bin` reference (pinned) across a delete and
+    /// uses it as the `anchorBIN` for `Tree.getNextBin`/`getPrevBin`
+    /// (`CursorImpl.java:2624` `getNext`), because `deleteCurrentRecord`
+    /// only sets the slot's PD flag — the slot stays in the BIN carrying its
+    /// key, so there is always a live anchor.  Noxu physically removes the
+    /// slot on delete (`apply_tree_delete` → `Tree::delete`) and clears
+    /// `current_key`, so the key-based cross-BIN step in `retrieve_next`
+    /// would otherwise have no anchor and return `NotFound` at the first BIN
+    /// boundary — a delete-all loop would clear only the first BIN.  We save
+    /// the deleted key here and use it as the cross-BIN anchor, mirroring
+    /// JE's "cursor stays positioned at the deleted slot; advance from
+    /// there" semantics.  Cleared on every successful (re)position.
+    last_deleted_key: Option<Vec<u8>>,
+
     /// The BIN Arc the cursor is currently pinned to, if any.
     ///
     /// Increments `BinStub.cursor_count` via `Tree::pin_bin()` so the
@@ -267,6 +285,7 @@ impl CursorImpl {
             current_data: None,
             current_lsn: noxu_util::NULL_LSN.as_u64(),
             current_index: -1,
+            last_deleted_key: None,
             current_bin_arc: None,
             log_manager: None,
             env_invalid: None,
@@ -298,6 +317,7 @@ impl CursorImpl {
             current_data: None,
             current_lsn: noxu_util::NULL_LSN.as_u64(),
             current_index: -1,
+            last_deleted_key: None,
             current_bin_arc: None,
             log_manager: Some(log_manager),
             env_invalid: None,
@@ -2678,7 +2698,17 @@ impl CursorImpl {
         }
 
         // Current BIN exhausted — cross to adjacent BIN.
-        let mut anchor_key: Vec<u8> = match &self.current_key {
+        // NEW-3: after a delete `current_key` is None but `last_deleted_key`
+        // holds the just-removed key, which is the correct anchor for
+        // `get_next_bin`/`get_prev_bin` (it still resolves to the BIN the
+        // cursor was positioned in, whose sibling is the next BIN).  This
+        // mirrors JE keeping the pinned `bin` as `anchorBIN` across a delete
+        // (CursorImpl.java:2624).
+        let mut anchor_key: Vec<u8> = match self
+            .current_key
+            .as_ref()
+            .or(self.last_deleted_key.as_ref())
+        {
             Some(k) => k.clone(),
             None => return Ok(OperationStatus::NotFound),
         };
@@ -3600,7 +3630,17 @@ impl CursorImpl {
         // gap so Next/Prev advances correctly (D1).
         // current_index now points to the slot that was the successor; leave
         // it unchanged.  Clear key/data/lsn since the record is gone.
-        self.current_key = None;
+        //
+        // NEW-3: retain the deleted key as the cross-BIN advance anchor.
+        // Unlike JE — which keeps the PD-flagged slot (and thus its key) in
+        // the BIN and uses the pinned `bin` object as `anchorBIN` for
+        // `Tree.getNextBin` (`CursorImpl.java:2624`) — Noxu physically removed
+        // the slot above and clears `current_key` here.  Without an anchor,
+        // the key-based cross-BIN step in `retrieve_next` returns NotFound at
+        // the first BIN boundary, so a delete-all loop clears only the first
+        // BIN.  Saving the deleted key preserves JE's "advance from the
+        // deleted slot's position" behaviour across BIN boundaries.
+        self.last_deleted_key = self.current_key.take();
         self.current_data = None;
         self.current_lsn = noxu_util::NULL_LSN.as_u64();
         // current_index stays; it is the gap index (former successor's slot).
