@@ -1190,61 +1190,79 @@ impl LogManager {
 
     /// Flushes all dirty write buffers to the OS page cache (no fsync).
     ///
-    /// # R-2 fix (Keith re-audit)
+    /// # A-prime: no-sync drain serialized under the LWL
     ///
-    /// The LWL is released **before** the pwrite64 calls.  Holding the LWL
-    /// through I/O in the background flush task would block ALL concurrent
-    /// foreground transaction commits for the duration of each kernel write,
-    /// injecting periodic multi-ms latency spikes whenever
-    /// `log_flush_no_sync_interval_ms > 0`.
+    /// The snapshot (`fill_flush_pending`, which advances each buffer's
+    /// `flushed_len` watermark), **every pwrite**, and the page-cache watermark
+    /// publication all run under the LWL — the same way the sync leader's drain
+    /// does (`flush_sync`'s `leader_work`).  This is required for correctness:
+    /// `fill_flush_pending` marks a range flushed BEFORE it is written, so a
+    /// range whose pwrite has not yet completed reads as "already flushed"
+    /// (empty unflushed data) to any other drain.  If the pwrite ran OFF the
+    /// LWL, a concurrent `flush_sync` could:
     ///
-    /// **Correctness argument**: `fill_flush_pending()` advances each buffer's
-    /// `flushed_len` watermark under the per-buffer latch before returning.
-    /// After that advance, concurrent foreground writers may only append at
-    /// file positions ≥ `new_flushed_len` — strictly after the range we
-    /// captured.  The pwrite64 calls below therefore write to disjoint file
-    /// regions from any concurrent foreground write.  `write_buffer()`
-    /// serialises its own file-handle access internally.
+    ///   1. acquire the LWL while this no-sync pwrite is still in flight,
+    ///   2. skip the already-marked-flushed range (nothing to drain),
+    ///   3. capture `eol` past that range, fdatasync, and publish a durable
+    ///      watermark covering bytes that are **not yet on disk**,
+    ///
+    /// losing an acknowledged-durable prefix on power loss.  Keeping the pwrite
+    /// and watermark publish under the LWL means `flush_sync` cannot acquire
+    /// the LWL until the no-sync bytes are in the page cache, so the durable
+    /// watermark can never name un-pwritten bytes.
+    ///
+    /// # R-2 performance reversal (accepted cost)
+    ///
+    /// This REVERSES the earlier R-2 policy of releasing the LWL before the
+    /// no-sync pwrite64s.  The background flush task (and any NO_SYNC-commit
+    /// caller) now holds the LWL across its page-cache writes, which can inject
+    /// brief latency into concurrent foreground commits whenever
+    /// `log_flush_no_sync_interval_ms > 0`.  The pwrite is a cheap memcpy into
+    /// the page cache (the expensive fdatasync is never held here), and
+    /// correctness (no false durable watermark) takes precedence over the
+    /// former off-LWL latency optimisation.  See the fail-stop
+    /// perf/migration note in docs/src/operations/power-loss.md.
     pub fn flush_no_sync(&self) -> Result<Lsn> {
-        // Phase 1 — under LWL: snapshot buffer data and capture EOL.
-        let (pending_snapshot, eol) = {
-            let mut guard = self.log_write_latch.lock();
-            // Admission gate: reject once the log is invalid.
-            if self.io_invalid.load(Ordering::Acquire) {
-                return Err(NoxuLogError::WriteFailed(
-                    "environment permanently invalidated by prior I/O error"
-                        .to_string(),
-                ));
-            }
-            // R-1: reuse flush_pending Vec.  We take ownership here to move
-            // items out before releasing the LWL.  flush_no_sync is called
-            // infrequently (background daemon), so losing outer-Vec capacity
-            // on take is acceptable.
-            guard.flush_pending.clear();
-            Self::fill_flush_pending(
-                &self.buffer_pool,
-                &mut guard.flush_pending,
-            );
-            let eol = self.file_manager.get_next_available_lsn();
-            (std::mem::take(&mut guard.flush_pending), eol)
-        }; // ← LWL released; foreground writers unblocked before pwrite64
+        let mut guard = self.log_write_latch.lock();
+        // Admission gate: reject once the log is invalid.
+        if self.io_invalid.load(Ordering::Acquire) {
+            return Err(NoxuLogError::WriteFailed(
+                "environment permanently invalidated by prior I/O error"
+                    .to_string(),
+            ));
+        }
+        // R-1: reuse flush_pending Vec (clear keeps capacity).
+        guard.flush_pending.clear();
+        Self::fill_flush_pending(&self.buffer_pool, &mut guard.flush_pending);
+        let eol = self.file_manager.get_next_available_lsn();
 
-        // Phase 2 — outside LWL: write to OS page cache.
-        for (data, file_num, offset) in &pending_snapshot {
+        // Pwrite each dirty range to the page cache while STILL holding the
+        // LWL, so a concurrent sync/rotation cannot capture an eol past a
+        // range that `fill_flush_pending` marked flushed but has not yet
+        // written.  Take ownership to satisfy the borrow checker, then return
+        // the Vec (with capacity) for reuse.
+        let pending = std::mem::take(&mut guard.flush_pending);
+        for (data, file_num, offset) in &pending {
             if let Err(e) =
                 self.file_manager.write_buffer_to_file(*file_num, data, *offset)
             {
                 // A-prime: a failed no-sync drain is a critical failure — the
                 // range was already marked flushed under the LWL, so it cannot
-                // be replayed by a later drain.  Invalidate before returning.
+                // be replayed by a later drain.  Invalidate while the LWL is
+                // STILL held so no successor drain/rotation/append is admitted,
+                // then return the error.
                 self.invalidate_log();
                 return Err(e);
             }
         }
+        guard.flush_pending = pending;
+        guard.flush_pending.clear();
+
         // Monotonic publication (A-prime): use CAS-max, not a plain store, so a
         // lower-EOL no-sync completion can never regress `last_flush_lsn` after
         // a higher sync leader already published a covering page-cache
-        // watermark.
+        // watermark.  Published UNDER the LWL, after the pwrites landed, so the
+        // page-cache watermark never names bytes that are not yet written.
         Self::advance_watermark_max(&self.last_flush_lsn, eol.as_u64());
         Ok(eol)
     }
