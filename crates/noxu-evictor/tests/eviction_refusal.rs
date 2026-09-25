@@ -23,11 +23,23 @@ fn refused_detach_does_not_credit_eviction() {
     evictor.note_ins_added(id, CacheMode::Default);
     // No WAL image: the shared detach guard refuses. Exercise that same
     // refusal result as a moved parent slot, without a timing-based race.
-    let result = evictor.do_evict(EvictionSource::Manual);
-    assert_eq!(result.nodes_evicted, 0);
-    assert_eq!(result.bytes_evicted, 0);
-    assert_eq!(usage.load(Ordering::Relaxed), 100_000);
-    assert!(tree.read().unwrap().get_parent_in_for_child_in(id).is_some());
-    assert_eq!(evictor.get_policy_sizes().0, 1);
-    assert_eq!(evictor.get_stats().get(&evictor.get_stats().nodes_evicted), 0);
+    for _ in 0..32 {
+        let result = evictor.do_evict(EvictionSource::Manual);
+        assert_eq!(result.nodes_evicted, 0);
+        assert_eq!(result.bytes_evicted, 0);
+        assert_eq!(usage.load(Ordering::Relaxed), 100_000);
+        assert!(tree.read().unwrap().get_parent_in_for_child_in(id).is_some());
+        assert_eq!(evictor.get_policy_sizes(), (1, 0, 0));
+        assert_eq!(
+            evictor.get_stats().get(&evictor.get_stats().nodes_evicted),
+            0
+        );
+        // Removing/reinserting also exercises the list's ID index, not only
+        // its length. Repeated insertion must not create duplicate links.
+        evictor.note_ins_removed(id);
+        assert_eq!(evictor.get_policy_sizes(), (0, 0, 0));
+        evictor.note_ins_added(id, CacheMode::Default);
+        evictor.note_ins_added(id, CacheMode::Default);
+        assert_eq!(evictor.get_policy_sizes(), (1, 0, 0));
+    }
 }

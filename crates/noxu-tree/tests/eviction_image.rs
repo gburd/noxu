@@ -16,7 +16,27 @@ fn detach_publishes_full_image_over_missing_or_older_slot() {
         let mut tree = Tree::new(1, 8);
         tree.set_log_manager(Arc::clone(&lm));
         for i in 0..20u8 {
-            tree.insert(vec![i], b"old".to_vec(), NULL_LSN).unwrap();
+            let entry = noxu_log::entry::ln_log_entry::LnLogEntry::new(
+                1,
+                None,
+                NULL_LSN,
+                false,
+                None,
+                None,
+                noxu_util::Vlsn::new(-1),
+                0,
+                true,
+                vec![i],
+                Some(b"old".to_vec()),
+                0,
+                noxu_util::Vlsn::new(-1),
+            );
+            let mut buf = bytes::BytesMut::new();
+            entry.write_to_log(&mut buf);
+            let lsn = lm
+                .log(LogEntryType::InsertLN, &buf, Provisional::No, true, false)
+                .unwrap();
+            tree.insert(vec![i], b"old".to_vec(), lsn).unwrap();
         }
         let bin = tree.search_with_data(&[0]).unwrap().bin_arc;
         let id = bin.read().node_id();
@@ -40,7 +60,16 @@ fn detach_publishes_full_image_over_missing_or_older_slot() {
         };
         let old = log_full();
         if let TreeNode::Internal(p) = &mut *parent.write() {
-            p.set_lsn(slot, missing.unwrap_or(old));
+            if let Some(missing) = missing {
+                p.set_lsn(slot, missing);
+            } else {
+                // This is the real LN placeholder installed by Tree::insert,
+                // not a manufactured earlier BIN image.
+                assert_eq!(
+                    lm.read_entry(p.get_lsn(slot)).unwrap().0,
+                    LogEntryType::InsertLN
+                );
+            }
         }
         tree.insert(vec![0], b"new full".to_vec(), NULL_LSN).unwrap();
         assert!(tree.delete(&[1]));
