@@ -1,4 +1,11 @@
 //! Dirty BIN eviction must fail closed when its new WAL image cannot be logged.
+//!
+//! Two distinct refusal contracts (A-prime fail-stop):
+//! - missing logger: no critical append began, so eviction refusal is
+//!   RETRYABLE and the environment stays valid (attach a logger and retry).
+//! - real logger, failed oversized pwrite: a critical append failure PERMANENTLY
+//!   invalidates the environment (JE serialLog fail-stop); the dirty BIN is
+//!   retained, no obsolete is credited, and no same-instance retry is allowed.
 #![cfg(not(noxu_shuttle))]
 
 use noxu_dbi::{
@@ -116,7 +123,14 @@ fn exercise_refusal(missing_logger: bool, dirty_lru: bool, dirty: bool) {
             assert!(bin.dirty_count() > 0);
             bin.dirty_count()
         };
-        for attempt in 0..32 {
+        // missing_logger: eviction refuses because there is NO logger — no
+        // critical append ever began, so the refusal stays RETRYABLE and the
+        // environment is never invalidated (repeat many times to prove it).
+        // real-logger: the first failed oversized pwrite is a critical append
+        // failure, so under A-prime fail-stop it PERMANENTLY invalidates the
+        // environment; there is exactly ONE attempt and no same-instance retry.
+        let attempts = if missing_logger { 32 } else { 1 };
+        for attempt in 0..attempts {
             let oversized_before = lm.get_stats().n_temp_buffer_writes;
             if !missing_logger {
                 faultdisk::install(FaultController::for_test(
@@ -129,16 +143,19 @@ fn exercise_refusal(missing_logger: bool, dirty_lru: bool, dirty: bool) {
                 assert_eq!(
                     faultdisk::write_count(),
                     1,
-                    "one actual failing pwrite per attempt"
+                    "one actual failing pwrite before fail-stop"
                 );
                 assert_eq!(
                     lm.get_stats().n_temp_buffer_writes,
                     oversized_before + 1
                 );
                 faultdisk::uninstall();
+                // A-prime fail-stop: the failed critical append fatally
+                // invalidates the environment (JE invalidates on any
+                // serialLog failure).
                 assert!(
-                    !lm.is_io_invalid(),
-                    "direct-write refusal is retryable; not a failed fsync"
+                    lm.is_io_invalid(),
+                    "a failed oversized append fatally invalidates the log"
                 );
             }
             // Check data first: on the unfixed code this refaults the OLD image
@@ -168,6 +185,27 @@ fn exercise_refusal(missing_logger: bool, dirty_lru: bool, dirty: bool) {
             assert_eq!(stats.get(&stats.dirty_nodes_evicted), 0);
             assert_eq!(stats.get(&stats.bytes_evicted_manual), 0);
             assert!(stats.get(&stats.nodes_put_back) > attempt);
+        }
+        if !missing_logger {
+            // Fail-stop is terminal: a second eviction attempt must be refused
+            // by the invalidated log without another pwrite, and must not
+            // double-count obsolete or evict the dirty BIN.
+            let writes_before = faultdisk::write_count();
+            let result = evictor.do_evict(EvictionSource::Manual);
+            assert_eq!(result.nodes_evicted, 0, "no eviction after fail-stop");
+            assert_eq!(
+                faultdisk::write_count(),
+                writes_before,
+                "rejected retry must not touch the kernel"
+            );
+            assert!(
+                tree.read().unwrap().get_parent_in_for_child_in(id).is_some(),
+                "dirty BIN retained after fail-stop"
+            );
+            assert!(!env.is_valid(), "environment invalid after fatal log write");
+            assert_values();
+            let _ = env.close();
+            return;
         }
         if missing_logger {
             // Existing builder preserves the candidate lists; no reinsertion.

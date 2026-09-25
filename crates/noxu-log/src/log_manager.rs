@@ -1641,6 +1641,16 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
+    // `faultdisk` install/uninstall and its `write_count()` are process-GLOBAL.
+    // Every test that installs a fault must hold this lock so a concurrently
+    // running faultdisk test cannot bump the global write counter (aiming a
+    // targeted fault at the wrong write) or observe another test's injected
+    // failure.  A-prime widened the number of paths that consult/publish
+    // io_invalid, which made this pre-existing cross-test race surface; the
+    // lock removes it deterministically (matching eviction_log_failure_test's
+    // FAULT_LOCK).
+    static FAULT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Helper: create a LogManager backed by a real FileManager in a temp dir.
     fn make_log_manager(dir: &TempDir) -> LogManager {
         let fm = Arc::new(
@@ -2012,6 +2022,7 @@ mod tests {
     /// (`nRepeatFaultReads`), so a small LN is one read.
     #[test]
     fn test_small_entry_disk_fault_is_single_random_read() {
+        let _fault_lock = FAULT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = TempDir::new().unwrap();
         let lm = make_log_manager(&dir);
 
@@ -2074,6 +2085,7 @@ mod tests {
     #[test]
     fn test_on_disk_corruption_is_never_returned_as_valid_data() {
         use crate::faultdisk::{self, FaultController, FaultKind};
+        let _fault_lock = FAULT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         // --- Part 1: payload bit-flip must be caught by the CRC. ---
         let dir = TempDir::new().unwrap();
@@ -2191,6 +2203,7 @@ mod tests {
     /// read is not gone, it is now conditional on entry size.
     #[test]
     fn test_large_entry_disk_fault_repeat_reads() {
+        let _fault_lock = FAULT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = TempDir::new().unwrap();
         let lm = make_log_manager(&dir);
 
@@ -2258,6 +2271,7 @@ mod tests {
     #[test]
     fn test_fsync_failure_invalidates_log_manager() {
         use std::sync::atomic::Ordering;
+        let _fault_lock = FAULT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = TempDir::new().unwrap();
         let lm = make_log_manager(&dir);
 
@@ -2298,6 +2312,7 @@ mod tests {
     #[test]
     fn test_real_write_error_invalidates_and_is_not_swallowed() {
         use crate::faultdisk::{self, FaultController, FaultKind};
+        let _fault_lock = FAULT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let dir = TempDir::new().unwrap();
         let lm = make_log_manager(&dir);
