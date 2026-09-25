@@ -1193,11 +1193,31 @@ impl CursorImpl {
                                     })
                                 })
                             };
-                            self.current_key = Some(k);
-                            // `find_range_entry` yields an owned Vec (range
-                            // path); O(1) move into the Bytes-typed field.
-                            self.current_data = Some(Bytes::from(v));
-                            self.current_lsn = lsn;
+                            // READ_COMMITTED revalidation (C1/V1): `k`/`v` were
+                            // captured by `find_range_entry` BEFORE `lock_ln`,
+                            // so a writer that mutated this slot inside the
+                            // prefetch->lock window leaves them stale.  Re-derive
+                            // from the now-authoritative slot if its LSN moved.
+                            // JE CursorImpl.lockLN re-reads bin.getLsn(index)
+                            // after locking (CursorImpl.java:3641-3680) and
+                            // getCurrent/fetchLN(index) returns current-slot data
+                            // (CursorImpl.java:2230/2294).
+                            let (final_key, final_data, final_lsn) =
+                                match bin_arc.as_ref().and_then(|arc| {
+                                    Self::revalidate_locked_slot(
+                                        arc, slot_idx, lsn,
+                                    )
+                                }) {
+                                    // LSN moved and slot re-read succeeded.
+                                    Some(Some((rk, rd, rl))) => (rk, rd, rl),
+                                    // LSN moved but slot is gone/non-live, OR
+                                    // unchanged: keep the prefetch (rehydrate
+                                    // below re-fills stripped data from the log).
+                                    _ => (k, Bytes::from(v), lsn),
+                                };
+                            self.current_key = Some(final_key);
+                            self.current_data = Some(final_data);
+                            self.current_lsn = final_lsn;
                             self.rehydrate_current_data();
                             self.current_index = slot_idx as i32;
                             self.state = CursorState::Initialized;
@@ -1272,10 +1292,28 @@ impl CursorImpl {
                 };
                 if matches {
                     self.lock_ln(slot_lsn)?;
+                    // READ_COMMITTED revalidation (C1/V1): `raw_key`/`idx` were
+                    // captured BEFORE `lock_ln`; if a writer moved this slot's
+                    // LSN inside the prefetch->lock window, re-derive the
+                    // authoritative two-part key from the pinned slot.  JE
+                    // CursorImpl.lockLN re-reads bin.getLsn(index) after locking
+                    // (CursorImpl.java:3641-3680); getCurrent decodes the
+                    // current slot (CursorImpl.java:2230).  `current_data` stays
+                    // None here and is decoded lazily by get_current(), so we
+                    // only need the authoritative key + LSN.
+                    let (final_key, final_lsn) =
+                        match Self::revalidate_locked_slot(
+                            &bin_arc, idx, slot_lsn,
+                        ) {
+                            Some(Some((rk, _rd, rl))) => (rk, rl),
+                            // Unchanged, or slot gone/non-live: keep the prefetch;
+                            // rehydrate_current_data below fills stripped data.
+                            _ => (raw_key, slot_lsn),
+                        };
                     // Store the raw two-part key; get_current() will decode it.
-                    self.current_key = Some(raw_key);
+                    self.current_key = Some(final_key);
                     self.current_data = None; // decoded lazily in get_current()
-                    self.current_lsn = slot_lsn;
+                    self.current_lsn = final_lsn;
                     // If the slot was stripped by the evictor, re-hydrate from
                     // the log now (get_current is &self and cannot fetch).
                     self.rehydrate_current_data();
@@ -1482,6 +1520,76 @@ impl CursorImpl {
             // Slot no longer lives in a BIN (split/compress): fall back to the
             // re-read rather than trusting the pre-fetch.
             _ => true,
+        }
+    }
+
+    /// Re-derive `(key, data, lsn)` from the *authoritative* pinned BIN slot
+    /// after a record lock has been acquired, but only if the slot's LSN moved
+    /// while we were unlatched.
+    ///
+    /// This is the JE `CursorImpl.lockLN` + `getCurrent`/`fetchLN(index)`
+    /// contract expressed for Noxu's prefetch-then-lock structure.  In JE the
+    /// BIN is held latched across `lockLN`, which unlatches to block, then
+    /// re-latches and re-reads `bin.getLsn(index)` — reverting and retrying the
+    /// lock if the LSN changed (CursorImpl.java:3641-3680) — so the subsequent
+    /// `getCurrent`/`fetchLN(index)` (CursorImpl.java:2230/2294) always derives
+    /// the returned key+data from the *current* latched slot, never from a
+    /// value captured before the lock.  Noxu prefetches the slot (key, data,
+    /// lsn) and drops the BIN latch before requesting the lock, so a writer
+    /// that acquired, mutated and released the slot inside that window leaves
+    /// the prefetched bytes stale even when `lock_ln` reports no contention
+    /// (the writer came and went, so the lock is granted immediately).
+    ///
+    /// The equivalent guard: after `lock_ln`, re-check the slot LSN under the
+    /// BIN latch (`slot_lsn_changed`, O(1) — no tree descent).  If unchanged,
+    /// return `None` and the caller keeps its prefetch.  If changed, re-read
+    /// the full key + data + LSN directly from the pinned slot at `slot_index`
+    /// (the direct-slot analogue of `bin.fetchLN(index)`) and return them so
+    /// the caller installs the authoritative committed values.  A slot that no
+    /// longer lives in a BIN, is out of bounds, or is no longer live
+    /// (split/compress/delete raced the read) yields `Some(None)`, signalling
+    /// the caller to fall back to its own re-read/miss handling rather than
+    /// trusting the prefetch.
+    ///
+    /// Cost: one extra BIN read-latch + index on every locked read whose slot
+    /// LSN is *unchanged* (the common case returns immediately after the
+    /// `slot_lsn_changed` check).  This is the same O(1) post-lock re-check the
+    /// two search arms already pay; matching cost was measured and accepted
+    /// (~2.5% read overhead) when the original fix landed (commit 8c7ea1c4).
+    #[allow(clippy::type_complexity)]
+    fn revalidate_locked_slot(
+        bin_arc: &std::sync::Arc<
+            noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>,
+        >,
+        slot_index: usize,
+        pre_lock_lsn: u64,
+    ) -> Option<Option<(Vec<u8>, Bytes, u64)>> {
+        use noxu_tree::tree::TreeNode;
+        let guard = bin_arc.read();
+        match &*guard {
+            TreeNode::Bottom(bin) => {
+                if slot_index >= bin.entries.len() {
+                    // Slot fell off the end (split/compress) — force fallback.
+                    return Some(None);
+                }
+                let cur_lsn = bin.get_lsn(slot_index).as_u64();
+                if cur_lsn == pre_lock_lsn {
+                    // Unchanged: the prefetch is still authoritative.
+                    return None;
+                }
+                // LSN moved while unlatched: re-derive from the current slot.
+                if !bin.slot_is_live(slot_index) {
+                    // Slot is now known-deleted/expired — do not trust it as a
+                    // live read; let the caller apply its miss/skip handling.
+                    return Some(None);
+                }
+                let key = bin.get_full_key(slot_index)?;
+                let data =
+                    bin.entries[slot_index].data.clone().unwrap_or_default();
+                Some(Some((key, data, cur_lsn)))
+            }
+            // No longer a BIN (split/compress): force the caller to fall back.
+            _ => Some(None),
         }
     }
 
@@ -2102,6 +2210,21 @@ impl CursorImpl {
                     return self.retrieve_next(GetMode::Next);
                 }
                 self.lock_ln(lsn)?;
+                // READ_COMMITTED revalidation (C1/V1): key/data/lsn were read
+                // from the BIN BEFORE lock_ln, so a writer that mutated slot
+                // `idx` inside the prefetch->lock window would leave them stale.
+                // Re-derive from the pinned slot if its LSN moved.  JE
+                // CursorImpl.lockLN re-reads bin.getLsn(index) post-lock
+                // (CursorImpl.java:3641-3680); getCurrent/fetchLN(index) returns
+                // current-slot data (CursorImpl.java:2230/2294).
+                let (key, data, lsn) = match Self::revalidate_locked_slot(
+                    &bin_arc,
+                    idx as usize,
+                    lsn,
+                ) {
+                    Some(Some((rk, rd, rl))) => (rk, rd, rl),
+                    _ => (key, data, lsn),
+                };
                 self.current_key = Some(key);
                 self.current_data = Some(data);
                 self.current_lsn = lsn;
@@ -2212,6 +2335,17 @@ impl CursorImpl {
                     return self.retrieve_next(GetMode::Prev);
                 }
                 self.lock_ln(lsn)?;
+                // READ_COMMITTED revalidation (C1/V1): re-derive from the pinned
+                // slot if its LSN moved during the prefetch->lock window (see
+                // get_first / JE CursorImpl.lockLN, CursorImpl.java:3641-3680).
+                let (key, data, lsn) = match Self::revalidate_locked_slot(
+                    &bin_arc,
+                    idx as usize,
+                    lsn,
+                ) {
+                    Some(Some((rk, rd, rl))) => (rk, rd, rl),
+                    _ => (key, data, lsn),
+                };
                 self.current_key = Some(key);
                 self.current_data = Some(data);
                 self.current_lsn = lsn;
@@ -2669,6 +2803,21 @@ impl CursorImpl {
                 return Ok(s);
             }
             self.lock_ln(lsn)?;
+            // READ_COMMITTED revalidation (C1/V1): `key`/`data` were read from
+            // the pinned BIN slot BEFORE lock_ln, so a writer that mutated slot
+            // `idx` in the prefetch->lock window would leave them stale.  The
+            // slot lives in `current_bin_arc` (set by update_bin_pin above or
+            // already pinned from the prior step); re-derive if its LSN moved.
+            // JE CursorImpl.lockLN re-reads bin.getLsn(index) post-lock
+            // (CursorImpl.java:3641-3680); getCurrent/fetchLN(index) returns
+            // current-slot data (CursorImpl.java:2230/2294).
+            let (key, data, lsn) =
+                match self.current_bin_arc.as_ref().and_then(|arc| {
+                    Self::revalidate_locked_slot(arc, idx as usize, lsn)
+                }) {
+                    Some(Some((rk, rd, rl))) => (rk, rd, rl),
+                    _ => (key, data, lsn),
+                };
             self.current_key = Some(key);
             self.current_data = Some(data);
             self.current_lsn = lsn;
@@ -2778,6 +2927,20 @@ impl CursorImpl {
                     })
                 })
             };
+            // READ_COMMITTED revalidation (C1/V1): `raw_key`/`raw_data` were
+            // snapshotted from get_next_bin/get_prev_bin BEFORE lock_ln, so a
+            // writer that mutated the slot in the prefetch->lock window leaves
+            // them stale.  Re-derive from the freshly-pinned slot if its LSN
+            // moved.  JE CursorImpl.lockLN re-reads bin.getLsn(index) post-lock
+            // (CursorImpl.java:3641-3680); getCurrent/fetchLN(index) returns
+            // current-slot data (CursorImpl.java:2230/2294).
+            let (raw_key, raw_data, lsn) =
+                match bin_arc.as_ref().and_then(|arc| {
+                    Self::revalidate_locked_slot(arc, idx as usize, lsn)
+                }) {
+                    Some(Some((rk, rd, rl))) => (rk, rd, rl),
+                    _ => (raw_key, raw_data, lsn),
+                };
             self.current_key = Some(raw_key);
             self.current_data = Some(raw_data);
             self.current_lsn = lsn;
@@ -2810,6 +2973,42 @@ impl CursorImpl {
     /// would read `next_index = current_index + 1` from the old BIN —
     /// effectively re-emitting old entries and (for large secondary
     /// indexes) preventing the walk from terminating.
+    /// Lock, pin and install a dup-filter accept position, applying the
+    /// READ_COMMITTED post-lock slot revalidation (C1/V1).
+    ///
+    /// The three accept arms of `apply_dup_filter` (NextDup/PrevDup,
+    /// NextNoDup/PrevNoDup, Next/Prev) all captured `(raw_key, raw_data, idx,
+    /// lsn)` from the tree BEFORE taking the record lock, so a writer that
+    /// mutated the slot in the prefetch->lock window would leave them stale.
+    /// This mirrors JE CursorImpl.lockLN's post-lock LSN re-check
+    /// (CursorImpl.java:3641-3680) + getCurrent/fetchLN(index) returning
+    /// current-slot data (CursorImpl.java:2230/2294): after `lock_ln`, pin the
+    /// BIN for `raw_key` and re-derive the authoritative key+data+lsn from the
+    /// pinned slot if its LSN moved; otherwise keep the prefetch.
+    fn install_dup_accept(
+        &mut self,
+        raw_key: Vec<u8>,
+        raw_data: Bytes,
+        idx: i32,
+        lsn: u64,
+    ) -> Result<(), DbiError> {
+        self.lock_ln(lsn)?;
+        let bin_arc = self.find_bin_arc_for_key(&raw_key);
+        let (raw_key, raw_data, lsn) = match bin_arc.as_ref().and_then(|arc| {
+            Self::revalidate_locked_slot(arc, idx as usize, lsn)
+        }) {
+            Some(Some((rk, rd, rl))) => (rk, rd, rl),
+            _ => (raw_key, raw_data, lsn),
+        };
+        self.current_key = Some(raw_key);
+        self.current_data = Some(raw_data);
+        self.current_lsn = lsn;
+        self.rehydrate_current_data();
+        self.current_index = idx;
+        self.update_bin_pin(bin_arc);
+        Ok(())
+    }
+
     fn apply_dup_filter(
         &mut self,
         mut raw_key: Vec<u8>,
@@ -2830,14 +3029,7 @@ impl CursorImpl {
                         _ => false,
                     };
                     if same {
-                        self.lock_ln(lsn)?;
-                        let bin_arc = self.find_bin_arc_for_key(&raw_key);
-                        self.current_key = Some(raw_key);
-                        self.current_data = Some(raw_data);
-                        self.current_lsn = lsn;
-                        self.rehydrate_current_data();
-                        self.current_index = idx;
-                        self.update_bin_pin(bin_arc);
+                        self.install_dup_accept(raw_key, raw_data, idx, lsn)?;
                         return Ok(OperationStatus::Success);
                     } else {
                         return Ok(OperationStatus::NotFound);
@@ -2850,14 +3042,7 @@ impl CursorImpl {
                         _ => false,
                     };
                     if !same {
-                        self.lock_ln(lsn)?;
-                        let bin_arc = self.find_bin_arc_for_key(&raw_key);
-                        self.current_key = Some(raw_key);
-                        self.current_data = Some(raw_data);
-                        self.current_lsn = lsn;
-                        self.rehydrate_current_data();
-                        self.current_index = idx;
-                        self.update_bin_pin(bin_arc);
+                        self.install_dup_accept(raw_key, raw_data, idx, lsn)?;
                         return Ok(OperationStatus::Success);
                     }
                     // Need to advance further.
@@ -2969,13 +3154,7 @@ impl CursorImpl {
                 }
                 // Next / Prev: accept any entry.
                 GetMode::Next | GetMode::Prev => {
-                    self.lock_ln(lsn)?;
-                    let bin_arc = self.find_bin_arc_for_key(&raw_key);
-                    self.current_key = Some(raw_key);
-                    self.current_data = Some(raw_data);
-                    self.current_lsn = lsn;
-                    self.current_index = idx;
-                    self.update_bin_pin(bin_arc);
+                    self.install_dup_accept(raw_key, raw_data, idx, lsn)?;
                     return Ok(OperationStatus::Success);
                 }
             }
