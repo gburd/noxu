@@ -129,7 +129,11 @@ pub struct EnvironmentConfig {
     pub run_evictor: bool,
 
     /// Run the background off-heap Evictor daemon.
-    /// Mirrors `ENV_RUN_OFFHEAP_EVICTOR` / default true (when off-heap configured).
+    /// Mirrors `ENV_RUN_OFFHEAP_EVICTOR`.  JE default true; effective default
+    /// `false` in Noxu because no off-heap evictor daemon exists yet.
+    /// Accepted-but-inert: registered in `unimplemented_params` so setting it
+    /// `true` warns.  Tracked follow-up: implement the feature or remove the
+    /// flag (see design-decisions.md §17).
     pub run_offheap_evictor: bool,
 
     /// Run the background data-integrity Verifier daemon.
@@ -311,7 +315,10 @@ pub struct EnvironmentConfig {
     pub log_mem_only: bool,
 
     /// Detect external deletion of log files and respond gracefully.
-    /// Mirrors `LOG_DETECT_FILE_DELETE` / default false.
+    /// Mirrors `LOG_DETECT_FILE_DELETE`.  JE default true; effective default
+    /// `false` in Noxu because the detector is not implemented.
+    /// Accepted-but-inert: registered in `unimplemented_params` so setting it
+    /// `true` warns.  Tracked follow-up: implement or remove (design-decisions.md §17).
     pub log_detect_file_delete: bool,
 
     /// Interval between log-file deletion detection polls in milliseconds.
@@ -333,7 +340,10 @@ pub struct EnvironmentConfig {
     pub log_use_odsync: bool,
 
     /// Use an asynchronous write queue between the log manager and the OS.
-    /// Mirrors `LOG_USE_WRITE_QUEUE` / default false.
+    /// Mirrors `LOG_USE_WRITE_QUEUE`.  JE default true; effective default
+    /// `false` in Noxu because the async write queue is not wired.
+    /// Accepted-but-inert: registered in `unimplemented_params` so setting it
+    /// `true` warns.  Tracked follow-up: implement or remove (design-decisions.md §17).
     pub log_use_write_queue: bool,
 
     /// Size of the asynchronous write queue in bytes.

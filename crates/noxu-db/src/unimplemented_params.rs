@@ -123,6 +123,40 @@ pub static UNIMPLEMENTED_ENV_PARAMS: &[UnimplementedParam] = &[
         // never a silent no-op.
         is_non_default: |c| c.log_n_data_directories != 0,
     },
+    // ---------------------------------------------------------------------
+    // B2 config-defaults follow-up (config-defaults-review.md, follow-up A):
+    // three JE flags that default `true` in JE but whose feature is NOT
+    // implemented in Noxu.  The B2 fix set the params.rs + EnvironmentConfig
+    // *defaults* to `false` (a documented divergence, see
+    // design-decisions.md §17) so the two sources of truth agree that the
+    // feature does not run.  But a caller can still *explicitly* set any of
+    // them to `true` via the setter/builder, which is a silent no-op unless
+    // registered here.  Registering them closes that settable-but-inert
+    // honesty gap: `warn_unimplemented_params` now warns an operator who
+    // opts the flag back on.  These stay registered until the feature is
+    // implemented or the flag is removed (tracked follow-up; see
+    // docs/src/operations/known-limitations.md and the field-doc notes on
+    // each EnvironmentConfig field).
+    UnimplementedParam {
+        name: "run_offheap_evictor",
+        // JE ENV_RUN_OFFHEAP_EVICTOR defaults true; Noxu has no off-heap
+        // evictor daemon, so the flag is read by no subsystem.  Non-default
+        // means the caller re-enabled it (expecting the JE behaviour).
+        is_non_default: |c| c.run_offheap_evictor,
+    },
+    UnimplementedParam {
+        name: "log_detect_file_delete",
+        // JE LOG_DETECT_FILE_DELETE defaults true; Noxu does not run the
+        // background log-file-deletion detector, so the flag is inert.
+        is_non_default: |c| c.log_detect_file_delete,
+    },
+    UnimplementedParam {
+        name: "log_use_write_queue",
+        // JE LOG_USE_WRITE_QUEUE defaults true; Noxu's async write queue is
+        // not wired (log writes go straight to the buffer pool), so the flag
+        // is inert.
+        is_non_default: |c| c.log_use_write_queue,
+    },
     // NOTE (2026-07): `verify_schedule` was removed from this registry —
     // it was WIRED into a background daemon in 7.1 (`VerifyDaemon`,
     // `Environment::open`); this list stayed stale claiming it inert (flag-
@@ -204,5 +238,34 @@ mod tests {
             (p.is_non_default)(&c),
             "{name} should detect its non-default value"
         );
+    }
+
+    /// B2 follow-up A: the three JE-default-true flags whose feature is not
+    /// implemented in Noxu must warn when a caller explicitly opts them back
+    /// on (settable-but-inert honesty gap).  Each defaults `false`, so setting
+    /// `true` is the non-default value the registry must flag.
+    #[test]
+    fn b2_inert_je_true_flags_warn_when_set_true() {
+        for name in [
+            "run_offheap_evictor",
+            "log_detect_file_delete",
+            "log_use_write_queue",
+        ] {
+            let mut c = env_default();
+            match name {
+                "run_offheap_evictor" => c.set_run_offheap_evictor(true),
+                "log_detect_file_delete" => c.set_log_detect_file_delete(true),
+                "log_use_write_queue" => c.set_log_use_write_queue(true),
+                _ => unreachable!(),
+            };
+            let p = UNIMPLEMENTED_ENV_PARAMS
+                .iter()
+                .find(|p| p.name == name)
+                .unwrap_or_else(|| panic!("registry missing {name}"));
+            assert!(
+                (p.is_non_default)(&c),
+                "{name}=true should be flagged as a non-default inert setting"
+            );
+        }
     }
 }
