@@ -323,16 +323,6 @@ fn split_aunt_recovers() {
 /// INa that still references obsolete BINs). Recover and assert data +
 /// structure.
 #[test]
-#[ignore = "KNOWN BUG NEW-4 (reverse-split-recovery-loss), NOT flaky. \
-            NEW-2 de-vacuuming unmasked a latent production data-loss bug: \
-            after empty-BIN compress (reverse split) + right split, reopen \
-            recovers the EMPTY set (0 of 23 committed keys) at NODE_MAX=4, \
-            silently (env.verify() reports 0 errors). Reproduces in debug AND \
-            release, and even on a CLEAN checkpointed close (not just crash). \
-            Latent on main today only because recovery forces fanout 256 \
-            (single BIN, so the reverse-split topology never forms). Fix the \
-            reverse-split/empty-BIN-compress recovery path separately; do NOT \
-            re-vacuum by reverting the NODE_MAX fanout fix."]
 fn reverse_split_recovers() {
     const NODE_MAX: u32 = 4;
     let dir = TempDir::new().unwrap();
