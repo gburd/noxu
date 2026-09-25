@@ -5883,6 +5883,43 @@ impl Tree {
                                             .compact(rb.compact_max_key_length);
                                     }
                                     rb.dirty = true;
+                                    // SYMMETRIC to the split fix (1c817fbd):
+                                    // this bulk-replaces the SURVIVOR's entries
+                                    // with the left+right keys, but the
+                                    // survivor still carries its PRE-merge
+                                    // `last_full_lsn`, whose durable full image
+                                    // holds only the survivor's OWN original
+                                    // keys — NOT the merged-in left keys. A
+                                    // BINDelta records only dirty slots and
+                                    // cannot encode the ARRIVAL of the
+                                    // merged-in keys, so a later sparse delta
+                                    // over that stale base would LOSE them on
+                                    // refault/recovery (base + sparse delta
+                                    // merged by key). Force the NEXT persisted
+                                    // image of the survivor to be a FULL image,
+                                    // advancing `last_full_lsn` past the merge
+                                    // and invalidating the stale base for delta
+                                    // purposes.
+                                    //
+                                    // JE keeps this invariant everywhere a bulk
+                                    // entry change a delta cannot express
+                                    // occurs: `IN.deleteEntry` (IN.java:3466)
+                                    // does `if (isDirty(index))
+                                    // setProhibitNextDelta(true)`, and
+                                    // `INCompressor.java:80-88` states "dirty
+                                    // slots cannot be compressed until we know
+                                    // that a full BIN will be logged next ...
+                                    // in that case the 'prohibit next logged
+                                    // delta' flag is set." Our `remove_slot`
+                                    // (a1061397) and split left half (1c817fbd)
+                                    // already obey it; the merge survivor must
+                                    // too. `clear_dirty_after_full_log` clears
+                                    // the flag once the full image is logged, so
+                                    // a later sparse update is delta-eligible
+                                    // again. (Upper-IN merges below need no
+                                    // equivalent: `InNodeStub` has no delta
+                                    // machinery — INs are always logged full.)
+                                    rb.prohibit_next_delta = true;
                                 }
                                 _ => {
                                     i += 1;
@@ -10240,10 +10277,10 @@ mod tests {
     /// A BINDelta records only dirty slots; it cannot encode the ARRIVAL of the
     /// merged-in keys that are not individually dirtied. So if the survivor is
     /// later logged as a sparse delta against its stale pre-merge base, then on
-    /// refault/recovery `mutate_to_full_bin` merges (survivor's original keys)
-    /// + (sparse delta) BY KEY, and the merged-in left keys — which live
-    /// NOWHERE else after the left BIN was cleared — are LOST. (The mirror of
-    /// the split bug, whose failure mode was resurrection/duplication.)
+    /// refault/recovery `mutate_to_full_bin` merges the survivor's original
+    /// keys with the sparse delta BY KEY, and the merged-in left keys — which
+    /// live NOWHERE else after the left BIN was cleared — are LOST. (The mirror
+    /// of the split bug, whose failure mode was resurrection/duplication.)
     ///
     /// JE preserves the invariant that any bulk entry change a delta cannot
     /// express must invalidate the full base: `IN.deleteEntry`
@@ -10410,6 +10447,35 @@ mod tests {
              recovery (compress_node must set prohibit_next_delta on the \
              survivor, cf. remove_slot / IN.deleteEntry IN.java:3466)"
         );
+
+        // Not over-fixed: prohibit_next_delta is TRANSIENT. Once the survivor
+        // is next logged as a FULL image (advancing its base past the merge),
+        // a subsequent sparse update must be delta-eligible again — the fix
+        // invalidates the base for ONE image, it does not permanently disable
+        // deltas. `clear_dirty_after_full_log` clears the flag (JE
+        // IN.afterLog, IN.java:5557).
+        for node in tree.rebuild_in_list() {
+            let mut g = node.write();
+            let TreeNode::Bottom(b) = &mut *g else { continue };
+            if !b.prohibit_next_delta || b.entries.is_empty() {
+                continue;
+            }
+            // Simulate the forced full-image log of the survivor.
+            b.clear_dirty_after_full_log(Lsn::new(1, 9000));
+            assert!(
+                !b.prohibit_next_delta,
+                "full-image log must clear prohibit_next_delta on the survivor"
+            );
+            // A subsequent sparse update dirties a slot; a delta is now valid.
+            b.entries[0].dirty = true;
+            assert!(
+                b.should_log_delta(25),
+                "after the forced full image, a later sparse update on the \
+                 merge survivor MUST be delta-eligible again (fix must not \
+                 permanently disable deltas)"
+            );
+            break;
+        }
     }
 
     /// Deterministic regression for the BIN/IN split-path check-then-act race
