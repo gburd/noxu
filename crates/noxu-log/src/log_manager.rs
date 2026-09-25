@@ -109,9 +109,12 @@ struct SlotRequest {
 enum SlotPlacement {
     /// Fits in a pool write buffer: the committer will `segment.put` its bytes.
     Buffered(crate::log_buffer::LogBufferSegment),
-    /// Too large for any pool buffer: the committer writes directly at
-    /// `file_offset`.
-    Oversized { file_offset: u64 },
+    /// Too large for any pool buffer: the committer writes directly to the
+    /// EXPLICITLY assigned `file_num` at `file_offset`, UNDER the LWL (JE
+    /// serialLogWork completes oversized writes inside logWriteMutex).  The
+    /// assigned file is carried here rather than re-read at write time so a
+    /// concurrent flip cannot route the pwrite to the wrong file.
+    Oversized { file_num: u32, file_offset: u64 },
 }
 
 /// Result handed back to the committer: the assigned LSN, the
@@ -315,38 +318,25 @@ impl LogManager {
                 last_used.file_offset()
             };
 
-        // Utilization tracking — called in LSN-assign order (batched: once per
-        // member, in arrival order), matching the serialLogWork() tracker
-        // calls.  Unchanged from the mutex path.
-        if let Some(obs) = &self.write_observer {
-            if let Some(old) = req.old_obsolete
-                && !old.lsn.is_null()
-            {
-                obs.count_obsolete(old);
-            }
-            obs.count_new_entry(
-                current_lsn.file_number(),
-                current_lsn.file_offset(),
-                entry_size as u32,
-                req.entry_type.is_ln_type(),
-                req.entry_type.is_in_type(),
-                req.new_db_id,
-            );
-            if req.immediately_obsolete {
-                obs.count_obsolete(ObsoleteLsn {
-                    lsn: current_lsn,
-                    db_id: req.new_db_id,
-                    size: entry_size as i32,
-                    is_ln: req.entry_type.is_ln_type(),
-                    kind: ObsoleteKind::Inexact,
-                });
-            }
-        }
+        // Utilization tracking is DEFERRED to the committer (log_internal).
+        // A-prime fail-stop: no observer credit (old-obsolete, new-entry, or
+        // immediate-obsolete) may be published until the slot has been
+        // prepared AND the entry's bytes are irrevocably accepted (buffered
+        // pin reserved / oversized direct pwrite completed).  Publishing
+        // credit here — before the fallible `get_write_buffer` drain and the
+        // oversized direct write — would obsolete the old image for a
+        // replacement that may never reach the log (JE serialLogWork counts
+        // obsolete only inside the successful under-mutex write).
 
         // Obtain a write buffer that can hold entry_size bytes.  When
         // flipped=true this drains dirty buffers (bumpAndWriteDirty) AND
         // fsyncs/closes the old file (syncLogEndAndFinishFile) while
         // current_file_num still points to the old file (DRIFT-3 ordering).
+        //
+        // A-prime: any error here is a critical drain/rotation failure.  The
+        // caller (log_internal) publishes invalidity while still holding the
+        // LWL, so no observer credit fired for the unaccepted entry and no
+        // further append/flush is admitted.
         let buffer_arc = {
             let mut pool = self.buffer_pool.lock();
             pool.get_write_buffer(entry_size, flipped)?
@@ -367,16 +357,76 @@ impl LogManager {
                 SlotPlacement::Buffered(segment)
             }
             None => {
-                // Entry too large for any pool buffer: direct write later.
+                // Entry too large for any pool buffer: direct write, done
+                // UNDER the LWL by the committer to the assigned file.
                 drop(buffer);
                 self.n_temp_buffer_writes.fetch_add(1, Ordering::Relaxed);
                 SlotPlacement::Oversized {
+                    file_num,
                     file_offset: current_lsn.file_offset() as u64,
                 }
             }
         };
 
         Ok(SlotResult { lsn: current_lsn, prev_offset, placement })
+    }
+
+    /// Publishes the deferred observer notifications for one appended entry,
+    /// exactly once, in the original order (old-obsolete → new-entry →
+    /// immediate-obsolete), matching JE serialLogWork's tracker calls.
+    ///
+    /// A-prime fail-stop: called ONLY after the entry's bytes are irrevocably
+    /// accepted — a buffered pin reserved (its infallible `segment.put` will
+    /// complete unconditionally) or an oversized direct pwrite that has
+    /// already SUCCEEDED.  There is no fallible append step after this point,
+    /// so a panicking observer leaves no pin to clean up; the committer catches
+    /// the unwind and invalidates (JE catches Error as well as Exception).
+    fn notify_observer(&self, req: &SlotRequest, current_lsn: Lsn) {
+        let Some(obs) = &self.write_observer else {
+            return;
+        };
+        if let Some(old) = req.old_obsolete
+            && !old.lsn.is_null()
+        {
+            obs.count_obsolete(old);
+        }
+        obs.count_new_entry(
+            current_lsn.file_number(),
+            current_lsn.file_offset(),
+            req.entry_size as u32,
+            req.entry_type.is_ln_type(),
+            req.entry_type.is_in_type(),
+            req.new_db_id,
+        );
+        if req.immediately_obsolete {
+            obs.count_obsolete(ObsoleteLsn {
+                lsn: current_lsn,
+                db_id: req.new_db_id,
+                size: req.entry_size as i32,
+                is_ln: req.entry_type.is_ln_type(),
+                kind: ObsoleteKind::Inexact,
+            });
+        }
+    }
+
+    /// Runs [`Self::notify_observer`] and, if the observer callback panics,
+    /// publishes log invalidity before resuming the unwind.
+    ///
+    /// JE catches `Error` as well as `Exception` in serialLog and invalidates
+    /// the environment; `parking_lot` mutexes do not poison, so a panicking
+    /// observer would otherwise leave the log "valid" for the next writer.
+    /// Called strictly AFTER the last step that owns a pin (buffered
+    /// `segment.put` complete / oversized pwrite complete), so there is no pin
+    /// to release here on unwind (Blocker 2).
+    fn notify_or_invalidate(&self, req: &SlotRequest, current_lsn: Lsn) {
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.notify_observer(req, current_lsn)
+            }));
+        if let Err(payload) = result {
+            self.invalidate_log();
+            std::panic::resume_unwind(payload);
+        }
     }
 
     /// Sets whether entry checksums are validated on read.
@@ -502,6 +552,34 @@ impl LogManager {
     /// an error immediately without touching the kernel page-cache.
     pub fn is_io_invalid(&self) -> bool {
         self.io_invalid.load(Ordering::Acquire)
+    }
+
+    /// Test-support: total outstanding write-pin count across all buffers.
+    ///
+    /// A buffered append reserves a pin in `allocate` that is released only by
+    /// `LogBufferSegment::put`.  This lets a test assert that a panicking
+    /// observer on the buffered path does not leak the pin (Blocker 2).
+    #[doc(hidden)]
+    pub fn outstanding_write_pins(&self) -> u32 {
+        let buffers = self.buffer_pool.lock().get_all_buffers();
+        buffers.iter().map(|b| b.lock().write_pin_count()).sum()
+    }
+
+    /// Publishes permanent log invalidity (A-prime fail-stop).
+    ///
+    /// Sets the shared `io_invalid` atomic with Release ordering so that
+    /// `EnvironmentImpl::is_valid` / public `Environment` health and every
+    /// subsequent under-LWL admission check observe the failure.  Callers on
+    /// the critical append/drain/rotation path MUST call this while STILL
+    /// holding the LWL (before returning or admitting another writer); the
+    /// off-LWL fdatasync leader calls it inside its closure before waking the
+    /// cohort.  This never takes `env_impl.lock()` or any tree/txn/cleaner
+    /// lock, so it cannot deadlock against a caller already holding those
+    /// (JE invalidates the environment, but the transition is decoupled from
+    /// the logger's failure path via this shared atomic — see the design
+    /// review).
+    fn invalidate_log(&self) {
+        self.io_invalid.store(true, Ordering::Release);
     }
 
     /// Logs a raw entry to the WAL, optionally marking an old LSN obsolete.
@@ -758,49 +836,103 @@ impl LogManager {
             new_db_id,
             immediately_obsolete,
         };
-        let slot = {
-            // Hold `log_write_latch` for exactly the serial work, matching
-            // serialLog/serialLogWork.
+        // A-prime: assignment, prev_offset/CRC finalisation, the oversized
+        // direct write, the buffered `segment.put`, and the observer
+        // notification all happen UNDER the LWL, one entry at a time in strict
+        // LSN/arrival order (JE serialLog + serialLogWork: validity check,
+        // oversized writeLogBuffer, buffered slot copy, and tracker calls all
+        // inside logWriteMutex).
+        //
+        // Blocker 2: `segment.put` runs BEFORE the observer notification so a
+        // panicking observer cannot leak the buffered pin.  `LogBufferSegment`
+        // has no Drop; the pin is released only by `put`.  If we notified
+        // first (with the pin still reserved) and the observer panicked,
+        // catch_unwind -> invalidate -> resume_unwind would drop the segment
+        // WITHOUT `put`, leaking the pin forever (a drainer waiting on the pin
+        // would hang).  `put` is a memcpy into the reserved sub-range plus a
+        // pin decrement; it takes only the buffer's raw read latch (never the
+        // LWL, pool, or buffer mutex), so completing it under the LWL cannot
+        // deadlock: a concurrent drainer waits on the LWL we hold, not on our
+        // pin.
+        let lsn = {
             let _lwl_guard = self.log_write_latch.lock();
-            self.assign_slot(&slot_req)?
+
+            // Recheck validity under the LWL (admission gate): a concurrent
+            // failure may have invalidated the log after our pre-LWL check.
+            if self.io_invalid.load(Ordering::Acquire) {
+                return Err(NoxuLogError::WriteFailed(
+                    "environment permanently invalidated by prior I/O error"
+                        .to_string(),
+                ));
+            }
+
+            // Assign the slot.  On a critical drain/rotation failure inside
+            // get_write_buffer, publish invalidity while the LWL is still held
+            // so no further append/flush is admitted, and no observer credit
+            // has fired for the unaccepted entry.
+            let slot = match self.assign_slot(&slot_req) {
+                Ok(s) => s,
+                Err(e) => {
+                    self.invalidate_log();
+                    return Err(e);
+                }
+            };
+            let lsn = slot.lsn;
+
+            // Patch prev_offset (LSN-dependent) then finalise the CRC over
+            // bytes [CHECKSUM_BYTES..entry_size] on this committer's OWN buffer.
+            // JE addPostMarshallingInfo does this before writeLogBuffer; for
+            // the oversized direct write it MUST be complete before the pwrite.
+            entry_buf[6..10].copy_from_slice(&slot.prev_offset.to_le_bytes());
+            let crc = ChecksumValidator::compute_range(
+                &entry_buf,
+                CHECKSUM_BYTES,
+                entry_size - CHECKSUM_BYTES,
+            );
+            entry_buf[0..4].copy_from_slice(&crc.to_le_bytes());
+
+            match slot.placement {
+                SlotPlacement::Oversized { file_num, file_offset } => {
+                    // JE completes oversized writes INSIDE serialLogWork /
+                    // logWriteMutex.  Write to the EXPLICITLY assigned file
+                    // (never current-file-at-write-time) so a concurrent flip
+                    // cannot route it to the wrong file, and so no concurrent
+                    // sync/rotation can advance a durable boundary past this
+                    // still-unwritten reservation.  On failure: invalidate
+                    // under LWL and return; no observer credit for the failed
+                    // replacement, no tail rollback.
+                    if let Err(e) = self.file_manager.write_buffer_to_file(
+                        file_num,
+                        &entry_buf,
+                        file_offset,
+                    ) {
+                        self.invalidate_log();
+                        return Err(e);
+                    }
+                    // Direct image is now irrevocably on disk (page cache).
+                    // Notify exactly once, in original order.  Catch an
+                    // observer unwind (JE catches Error) and invalidate; there
+                    // is no pin to clean up because the direct write owns no
+                    // buffer segment.
+                    self.notify_or_invalidate(&slot_req, lsn);
+                    lsn
+                }
+                SlotPlacement::Buffered(segment) => {
+                    // Complete the infallible `segment.put` FIRST (memcpy into
+                    // the reserved sub-range + pin decrement), while still under
+                    // the LWL, so the pin is released before any code that can
+                    // panic runs.  Then notify exactly once, in original order,
+                    // with NO pin outstanding: a panicking observer
+                    // (catch_unwind -> invalidate -> resume_unwind) has nothing
+                    // to leak.  A panic AFTER `put` still invalidates cleanly.
+                    segment.put(&entry_buf);
+                    self.notify_or_invalidate(&slot_req, lsn);
+                    lsn
+                }
+            }
         };
-
-        let lsn = slot.lsn;
-        // Serialisation point released here.  Everything below runs off the
-        // contended path (JE: prevOffset + VLSN + checksum + LogBufferSegment
-        // .put all run AFTER logWriteMutex is released, addPostMarshallingInfo).
-
-        // Patch prev_offset into the header buffer (LSN-dependent, handed back
-        // under the latch).  JE addPostMarshallingInfo writes prevOffset
-        // here, outside the latch.
-        entry_buf[6..10].copy_from_slice(&slot.prev_offset.to_le_bytes());
-
-        // Compute CRC32 over bytes [CHECKSUM_BYTES..entry_size].  It covers the
-        // just-patched prev_offset (LSN-dependent) + the VLSN, so it MUST be
-        // computed AFTER prev_offset is known — exactly why JE finalises the
-        // checksum in addPostMarshallingInfo after the latch, using the
-        // returned offset.  Moving it here (off the serialisation point) is
-        // the whole point of handing `prev_offset` back rather than patching
-        // the buffer under the latch.
-        let crc = ChecksumValidator::compute_range(
-            &entry_buf,
-            CHECKSUM_BYTES,
-            entry_size - CHECKSUM_BYTES,
-        );
-        entry_buf[0..4].copy_from_slice(&crc.to_le_bytes());
-
-        // Copy bytes into the reserved slot / direct-write oversized entries
-        // (JE LogBufferSegment.put outside logWriteMutex).  The pin-count
-        // protocol (wait_for_zero_and_latch in write_dirty) keeps the buffer
-        // from being reused before put() decrements the pin.
-        match slot.placement {
-            SlotPlacement::Buffered(segment) => {
-                segment.put(&entry_buf);
-            }
-            SlotPlacement::Oversized { file_offset } => {
-                self.file_manager.write_buffer(&entry_buf, file_offset)?;
-            }
-        }
+        // Serialisation point released here.  The buffered copy already
+        // completed under the LWL (Blocker 2); nothing pin-protected remains.
 
         // Flush / fsync if requested, outside the LWL (correct).
         // Use flush_sync_if_needed(lsn) rather than flush_sync() so that a
@@ -912,6 +1044,13 @@ impl LogManager {
             // R-1: flush_pending Vec reused across calls (clear keeps capacity).
             let eol = {
                 let mut guard = self.log_write_latch.lock();
+                // Admission gate: reject a leader drain once the log is
+                // invalid (a concurrent critical failure may have poisoned it).
+                if self.io_invalid.load(Ordering::Acquire) {
+                    return Err(std::io::Error::other(
+                        "environment permanently invalidated by prior I/O error",
+                    ));
+                }
                 guard.flush_pending.clear();
                 Self::fill_flush_pending(
                     &self.buffer_pool,
@@ -923,9 +1062,18 @@ impl LogManager {
                 // a time).
                 let pending = std::mem::take(&mut guard.flush_pending);
                 for (data, file_num, offset) in &pending {
-                    self.file_manager
+                    if let Err(e) = self
+                        .file_manager
                         .write_buffer_to_file(*file_num, data, *offset)
-                        .map_err(|e| std::io::Error::other(e.to_string()))?;
+                    {
+                        // A-prime: a failed drain pwrite is a critical
+                        // failure.  Publish invalidity while the LWL is STILL
+                        // held so no successor drain/rotation/append is
+                        // admitted, then return the error (the cohort is woken
+                        // with the error by FsyncManager).
+                        self.invalidate_log();
+                        return Err(std::io::Error::other(e.to_string()));
+                    }
                 }
                 // Return the Vec (with capacity) to the guard for reuse.
                 guard.flush_pending = pending;
@@ -947,9 +1095,15 @@ impl LogManager {
             // every byte below `eol` (all pwritten to the page cache before the
             // LWL was released above).  Up to max_leaders of these run
             // concurrently (sync_log_end does not hold the file write latch).
-            self.file_manager
-                .sync_log_end()
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            if let Err(e) = self.file_manager.sync_log_end() {
+                // A-prime: publish invalidity BEFORE returning to FsyncManager
+                // (which then wakes the whole cohort).  This off-LWL fdatasync
+                // error must poison the log before any waiter is admitted, so
+                // the invalidation is visible to every piggybacking committer
+                // and to any successor leader.
+                self.invalidate_log();
+                return Err(std::io::Error::other(e.to_string()));
+            }
             Ok(eol.as_u64())
         };
 
@@ -983,13 +1137,15 @@ impl LogManager {
                 Ok(Lsn::from_u64(self.last_synced_lsn.load(Ordering::Acquire)))
             }
             Err(e) => {
-                // C-2 (the 2026 review F-3.2 / F-8.4 / F-9.4): any I/O error
-                // from fdatasync permanently invalidates the log; refuse all
-                // further writes (fsyncgate class).  The error is propagated to
-                // ALL piggybacking waiters by flush_and_sync (each waiter gets
-                // its own Err here), so every committer in the failed batch
-                // sees the failure — their commits are NOT durable.
-                self.io_invalid.store(true, Ordering::Release);
+                // A-prime: any error from the leader work (drain, rotation,
+                // or fdatasync) permanently invalidates the log.  The critical
+                // boundary already published invalidity under the LWL / before
+                // the cohort wakeup (see leader_work); this store is idempotent
+                // and covers any residual path.  The error is propagated to ALL
+                // piggybacking waiters by flush_and_sync, so every committer in
+                // the failed batch sees the failure — their commits are NOT
+                // durable.
+                self.invalidate_log();
                 Err(NoxuLogError::WriteFailed(format!(
                     "fdatasync failed, environment permanently invalidated: {e}"
                 )))
@@ -1020,6 +1176,15 @@ impl LogManager {
     ///
     /// Result: 1 fdatasync for 8 commits (8:1 coalescing, no config needed).
     pub fn flush_sync_if_needed(&self, lsn: Lsn) -> Result<Lsn> {
+        // A-prime: reject the fast path once the log is invalid so a
+        // post-invalidation caller can never return Ok off a cached durable
+        // watermark (no post-invalid piggyback / cached-watermark loophole).
+        if self.io_invalid.load(Ordering::Acquire) {
+            return Err(NoxuLogError::WriteFailed(
+                "environment permanently invalidated by prior I/O error"
+                    .to_string(),
+            ));
+        }
         // NULL_LSN (= u64::MAX) means "no write LSN known" — always flush.
         // last_flush_lsn is initialised to 0 ("nothing flushed") so that a
         // fresh environment never skips the first flush.
@@ -1047,43 +1212,80 @@ impl LogManager {
 
     /// Flushes all dirty write buffers to the OS page cache (no fsync).
     ///
-    /// # R-2 fix (Keith re-audit)
+    /// # A-prime: no-sync drain serialized under the LWL
     ///
-    /// The LWL is released **before** the pwrite64 calls.  Holding the LWL
-    /// through I/O in the background flush task would block ALL concurrent
-    /// foreground transaction commits for the duration of each kernel write,
-    /// injecting periodic multi-ms latency spikes whenever
-    /// `log_flush_no_sync_interval_ms > 0`.
+    /// The snapshot (`fill_flush_pending`, which advances each buffer's
+    /// `flushed_len` watermark), **every pwrite**, and the page-cache watermark
+    /// publication all run under the LWL — the same way the sync leader's drain
+    /// does (`flush_sync`'s `leader_work`).  This is required for correctness:
+    /// `fill_flush_pending` marks a range flushed BEFORE it is written, so a
+    /// range whose pwrite has not yet completed reads as "already flushed"
+    /// (empty unflushed data) to any other drain.  If the pwrite ran OFF the
+    /// LWL, a concurrent `flush_sync` could:
     ///
-    /// **Correctness argument**: `fill_flush_pending()` advances each buffer's
-    /// `flushed_len` watermark under the per-buffer latch before returning.
-    /// After that advance, concurrent foreground writers may only append at
-    /// file positions ≥ `new_flushed_len` — strictly after the range we
-    /// captured.  The pwrite64 calls below therefore write to disjoint file
-    /// regions from any concurrent foreground write.  `write_buffer()`
-    /// serialises its own file-handle access internally.
+    ///   1. acquire the LWL while this no-sync pwrite is still in flight,
+    ///   2. skip the already-marked-flushed range (nothing to drain),
+    ///   3. capture `eol` past that range, fdatasync, and publish a durable
+    ///      watermark covering bytes that are **not yet on disk**,
+    ///
+    /// losing an acknowledged-durable prefix on power loss.  Keeping the pwrite
+    /// and watermark publish under the LWL means `flush_sync` cannot acquire
+    /// the LWL until the no-sync bytes are in the page cache, so the durable
+    /// watermark can never name un-pwritten bytes.
+    ///
+    /// # R-2 performance reversal (accepted cost)
+    ///
+    /// This REVERSES the earlier R-2 policy of releasing the LWL before the
+    /// no-sync pwrite64s.  The background flush task (and any NO_SYNC-commit
+    /// caller) now holds the LWL across its page-cache writes, which can inject
+    /// brief latency into concurrent foreground commits whenever
+    /// `log_flush_no_sync_interval_ms > 0`.  The pwrite is a cheap memcpy into
+    /// the page cache (the expensive fdatasync is never held here), and
+    /// correctness (no false durable watermark) takes precedence over the
+    /// former off-LWL latency optimisation.  See the fail-stop
+    /// perf/migration note in docs/src/operations/power-loss.md.
     pub fn flush_no_sync(&self) -> Result<Lsn> {
-        // Phase 1 — under LWL: snapshot buffer data and capture EOL.
-        let (pending_snapshot, eol) = {
-            let mut guard = self.log_write_latch.lock();
-            // R-1: reuse flush_pending Vec.  We take ownership here to move
-            // items out before releasing the LWL.  flush_no_sync is called
-            // infrequently (background daemon), so losing outer-Vec capacity
-            // on take is acceptable.
-            guard.flush_pending.clear();
-            Self::fill_flush_pending(
-                &self.buffer_pool,
-                &mut guard.flush_pending,
-            );
-            let eol = self.file_manager.get_next_available_lsn();
-            (std::mem::take(&mut guard.flush_pending), eol)
-        }; // ← LWL released; foreground writers unblocked before pwrite64
-
-        // Phase 2 — outside LWL: write to OS page cache.
-        for (data, file_num, offset) in &pending_snapshot {
-            self.file_manager.write_buffer_to_file(*file_num, data, *offset)?;
+        let mut guard = self.log_write_latch.lock();
+        // Admission gate: reject once the log is invalid.
+        if self.io_invalid.load(Ordering::Acquire) {
+            return Err(NoxuLogError::WriteFailed(
+                "environment permanently invalidated by prior I/O error"
+                    .to_string(),
+            ));
         }
-        self.last_flush_lsn.store(eol.as_u64(), Ordering::Release);
+        // R-1: reuse flush_pending Vec (clear keeps capacity).
+        guard.flush_pending.clear();
+        Self::fill_flush_pending(&self.buffer_pool, &mut guard.flush_pending);
+        let eol = self.file_manager.get_next_available_lsn();
+
+        // Pwrite each dirty range to the page cache while STILL holding the
+        // LWL, so a concurrent sync/rotation cannot capture an eol past a
+        // range that `fill_flush_pending` marked flushed but has not yet
+        // written.  Take ownership to satisfy the borrow checker, then return
+        // the Vec (with capacity) for reuse.
+        let pending = std::mem::take(&mut guard.flush_pending);
+        for (data, file_num, offset) in &pending {
+            if let Err(e) =
+                self.file_manager.write_buffer_to_file(*file_num, data, *offset)
+            {
+                // A-prime: a failed no-sync drain is a critical failure — the
+                // range was already marked flushed under the LWL, so it cannot
+                // be replayed by a later drain.  Invalidate while the LWL is
+                // STILL held so no successor drain/rotation/append is admitted,
+                // then return the error.
+                self.invalidate_log();
+                return Err(e);
+            }
+        }
+        guard.flush_pending = pending;
+        guard.flush_pending.clear();
+
+        // Monotonic publication (A-prime): use CAS-max, not a plain store, so a
+        // lower-EOL no-sync completion can never regress `last_flush_lsn` after
+        // a higher sync leader already published a covering page-cache
+        // watermark.  Published UNDER the LWL, after the pwrites landed, so the
+        // page-cache watermark never names bytes that are not yet written.
+        Self::advance_watermark_max(&self.last_flush_lsn, eol.as_u64());
         Ok(eol)
     }
 
@@ -1482,6 +1684,16 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
+    // `faultdisk` install/uninstall and its `write_count()` are process-GLOBAL.
+    // Every test that installs a fault must hold this lock so a concurrently
+    // running faultdisk test cannot bump the global write counter (aiming a
+    // targeted fault at the wrong write) or observe another test's injected
+    // failure.  A-prime widened the number of paths that consult/publish
+    // io_invalid, which made this pre-existing cross-test race surface; the
+    // lock removes it deterministically (matching eviction_log_failure_test's
+    // FAULT_LOCK).
+    static FAULT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Helper: create a LogManager backed by a real FileManager in a temp dir.
     fn make_log_manager(dir: &TempDir) -> LogManager {
         let fm = Arc::new(
@@ -1853,6 +2065,7 @@ mod tests {
     /// (`nRepeatFaultReads`), so a small LN is one read.
     #[test]
     fn test_small_entry_disk_fault_is_single_random_read() {
+        let _fault_lock = FAULT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = TempDir::new().unwrap();
         let lm = make_log_manager(&dir);
 
@@ -1915,6 +2128,7 @@ mod tests {
     #[test]
     fn test_on_disk_corruption_is_never_returned_as_valid_data() {
         use crate::faultdisk::{self, FaultController, FaultKind};
+        let _fault_lock = FAULT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         // --- Part 1: payload bit-flip must be caught by the CRC. ---
         let dir = TempDir::new().unwrap();
@@ -2032,6 +2246,7 @@ mod tests {
     /// read is not gone, it is now conditional on entry size.
     #[test]
     fn test_large_entry_disk_fault_repeat_reads() {
+        let _fault_lock = FAULT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = TempDir::new().unwrap();
         let lm = make_log_manager(&dir);
 
@@ -2099,6 +2314,7 @@ mod tests {
     #[test]
     fn test_fsync_failure_invalidates_log_manager() {
         use std::sync::atomic::Ordering;
+        let _fault_lock = FAULT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = TempDir::new().unwrap();
         let lm = make_log_manager(&dir);
 
@@ -2139,6 +2355,7 @@ mod tests {
     #[test]
     fn test_real_write_error_invalidates_and_is_not_swallowed() {
         use crate::faultdisk::{self, FaultController, FaultKind};
+        let _fault_lock = FAULT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let dir = TempDir::new().unwrap();
         let lm = make_log_manager(&dir);
