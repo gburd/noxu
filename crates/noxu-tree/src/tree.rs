@@ -2083,6 +2083,20 @@ impl BinStub {
         }
     }
 
+    /// Physically remove a slot and invalidate the next delta.
+    ///
+    /// JE `IN.deleteEntry` prohibits a delta when removing a dirty slot.
+    /// Unlike JE's tombstone-first deletion, our committed deletes remove
+    /// even clean live slots directly. No remaining delta slot can encode
+    /// their absence, so every physical removal must force a full image.
+    fn remove_slot(&mut self, idx: usize) {
+        self.prohibit_next_delta = true;
+        self.entries.remove(idx);
+        self.keys.remove(idx);
+        self.lsn_rep.remove_shift(idx);
+        self.dirty = true;
+    }
+
     /// Comparator-aware delete: removes `full_key` from the BIN using `cmp`.
     ///
     /// Returns `true` if the entry was found and removed.
@@ -2104,10 +2118,7 @@ impl BinStub {
         };
         match result {
             Ok(idx) => {
-                self.entries.remove(idx);
-                self.keys.remove(idx); // T-2
-                self.lsn_rep.remove_shift(idx); // T-3
-                self.dirty = true;
+                self.remove_slot(idx);
                 true
             }
             Err(_) => false,
@@ -5423,11 +5434,7 @@ impl Tree {
                         let suffix = bin.compress_key(key);
                         match bin.key_binary_search(suffix.as_slice()) {
                             Ok(idx) => {
-                                bin.entries.remove(idx);
-                                bin.keys.remove(idx); // T-2
-                                bin.lsn_rep.remove_shift(idx); // T-3
-                                // Mark dirty after any modification.
-                                bin.dirty = true;
+                                bin.remove_slot(idx);
                                 true
                             }
                             Err(_) => false,
@@ -6179,18 +6186,7 @@ impl Tree {
                                         continue;
                                     }
                                 }
-                                // JE `IN.deleteEntry` (IN.java:3466): removing a
-                                // DIRTY slot must prohibit the next delta — a
-                                // delta only carries dirty slots, so the removal
-                                // would otherwise be silently lost.  Force a
-                                // full BIN on the next log.
-                                if b.entries[j].dirty {
-                                    b.prohibit_next_delta = true;
-                                }
-                                b.entries.remove(j);
-                                b.keys.remove(j); // T-2
-                                b.lsn_rep.remove_shift(j); // T-3
-                                b.dirty = true;
+                                b.remove_slot(j);
                             }
                         }
                         // Recompute prefix after slot removal, since the
@@ -13726,6 +13722,32 @@ mod tests {
             e.dirty = true;
         }
         bin
+    }
+
+    #[test]
+    fn physical_slot_removal_prohibits_delta_in_comparator_and_compressor_paths()
+     {
+        let mut bin = bin_with_dirty(100, 1);
+        assert!(bin.should_log_delta(25));
+        assert!(bin.delete_cmp(b"0050", &|a, b| a.cmp(b)));
+        assert!(!bin.should_log_delta(25));
+        bin.clear_dirty_after_full_log(Lsn::new(2, 1));
+        bin.entries[0].dirty = true;
+        assert!(bin.should_log_delta(25));
+
+        for dirty_tombstone in [false, true] {
+            let tree = Tree::new(1, 256);
+            let mut bin = bin_with_dirty(100, 1);
+            bin.entries[50].known_deleted = true;
+            bin.entries[50].dirty = dirty_tombstone;
+            let node = Arc::new(RwLock::new(TreeNode::Bottom(bin)));
+            assert!(tree.compress_bin(&node));
+            let guard = node.read();
+            let TreeNode::Bottom(bin) = &*guard else { unreachable!() };
+            assert_eq!(bin.entries.len(), 99);
+            assert!(!bin.should_log_delta(25));
+            assert!(!bin.find_entry_compressed(b"0050").1);
+        }
     }
 
     /// COUNT-based + CONFIGURABLE percent: with percent=10 and 100 slots, the

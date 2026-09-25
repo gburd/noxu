@@ -1064,25 +1064,12 @@ fn stage2_txn_manager_records_first_active_lsn() {
 // checkpointer + compressor OFF so checkpoints can be driven explicitly. We
 // mirror that: daemons off, explicit `env.checkpoint(force)` / `env.compress()`.
 //
-// ## Authorized deviation — JE's deferred-compression stat invariant
-//
-// JE `testCompress` asserts that after a compress the next checkpoint writes a
-// FULL BIN (not a delta), because in JE a committed delete leaves a deleted
-// SLOT in the BIN that the INCompressor later removes, and that removal forces
-// the BIN to be re-logged in full. Noxu's delete path is PHYSICAL: a committed
-// delete removes the slot immediately via `tree.delete()` (see
-// `noxu-tree/src/tree.rs::compress_bin` IC-3 note and
-// `docs/src/operations/known-limitations.md`). `env.compress()` therefore only
-// reclaims slots left `known_deleted` by aborted inserts / recovery replay —
-// it is a no-op for committed deletes, and there is no "compress forces a full
-// BIN" interaction to assert.
-//
-// We therefore port the DATA-correctness half of testCompress faithfully
-// (delete-half + compress + checkpoint + recover == exact surviving set, with
-// `env.verify()`), and DO NOT assert the JE-internal NDeltaINFlush==0
-// invariant, which tests a deferred-compression mechanic Noxu deliberately
-// omits. testKnownDeleted retains its delta-write assertion because the
-// known-deleted BIN-delta reconstitution path IS implemented in Noxu recovery.
+// JE's committed delete leaves a tombstone that the compressor later removes.
+// Noxu physically removes committed deletes immediately. Both physical delete
+// and compressor slot removal must force the next full BIN image: a delta
+// cannot encode an absent slot. The sparse-update regression below asserts
+// this path selection; delete-half alone could choose full merely because it
+// leaves no dirty slots to log.
 
 use noxu_db::CheckpointConfig;
 
@@ -1105,9 +1092,8 @@ fn delta_in_flush(env: &noxu_db::Environment) -> u64 {
     env.stats().unwrap().checkpoint.delta_in_flush
 }
 
-/// JE `RecoveryDeltaTest.testCompress` (DATA-correctness half — see the
-/// authorized-deviation note above for why the NDeltaINFlush==0 assertion is
-/// omitted).
+/// JE `RecoveryDeltaTest.testCompress` (data correctness; the sparse-update
+/// regression below separately verifies full-vs-delta path selection).
 ///
 /// Insert records (txn, commit), delete every other (txn, commit), compress,
 /// force a checkpoint, close, recover, and assert the recovered set equals the
@@ -1269,11 +1255,36 @@ fn delta_physical_deletes_survive_recovery() {
         assert_eq!(collect_all(&db).len(), 400);
         if mode != "commit-crash" {
             let before = delta_in_flush(&env);
+            let full_before = env.stats().unwrap().checkpoint.full_bin_flush;
             checkpoint(&env);
+            let full =
+                env.stats().unwrap().checkpoint.full_bin_flush - full_before;
             eprintln!(
-                "{mode}: delete-checkpoint deltas={}",
+                "{mode}: delete-checkpoint deltas={}, full={full}",
                 delta_in_flush(&env) - before
             );
+            assert_eq!(
+                delta_in_flush(&env),
+                before,
+                "physical removals require full images"
+            );
+            assert!(full > 0, "no full BIN logged after deletion");
+            if mode == "delta-crash" {
+                db.put(
+                    DatabaseEntry::from_bytes(&key(1)),
+                    DatabaseEntry::from_bytes(b"after delete"),
+                )
+                .unwrap();
+                checkpoint(&env);
+                assert!(
+                    delta_in_flush(&env) > before,
+                    "full log must restore delta eligibility"
+                );
+                eprintln!(
+                    "{mode}: post-full deltas={}",
+                    delta_in_flush(&env) - before
+                );
+            }
         }
         if mode == "close" {
             db.close().unwrap();
@@ -1282,7 +1293,7 @@ fn delta_physical_deletes_survive_recovery() {
         std::process::exit(73);
     }
 
-    for mode in ["close", "checkpoint-crash", "commit-crash"] {
+    for mode in ["close", "checkpoint-crash", "commit-crash", "delta-crash"] {
         let dir = TempDir::new().unwrap();
         let status =
             std::process::Command::new(std::env::current_exe().unwrap())

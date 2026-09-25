@@ -6,6 +6,26 @@ WAL recovery runs automatically on `Environment::open()`.  No manual steps
 are required after a clean or unclean shutdown.  Recovery time is proportional
 to the amount of data written since the last checkpoint.
 
+## BIN-delta deletion recovery
+
+Physical record deletion now forces the affected BIN's next checkpoint image
+to be full, rather than a partial BIN-delta. Sparse updates after deletion
+previously could log a delta that omitted the removed keys, allowing recovery
+to restore those keys from the older full image. Comparator-based deletion
+and compressor slot removal use the same full-image requirement. After that
+full image is logged, ordinary delta logging is eligible again.
+
+The on-disk format is unchanged; no file conversion is required. This prevents
+new incorrect deletion images, but does **not** repair existing logs or detect
+keys already resurrected by an earlier reopen. Preserve a copy of a suspected
+environment and reconcile its keys and values against an authoritative source
+or known-good backup before resuming writes. Successful reopen alone is not
+proof that the deleted-key set is correct.
+
+This fix does not certify partial-page logging overall: split/merge base
+invalidation, successive-delta history, and index-based IN-redo remain separate
+review items.
+
 ## Manual recovery steps (corrupted environment)
 
 1. **Identify corruption scope** — check logs for `NoxuError::EnvironmentFailure`
