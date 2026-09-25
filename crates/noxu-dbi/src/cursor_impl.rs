@@ -175,6 +175,29 @@ pub struct CursorImpl {
     /// In this is `CursorImpl.index`. -1 means "before first entry".
     current_index: i32,
 
+    /// The tree key of the record most recently removed by [`Self::delete`],
+    /// retained as the cross-BIN advance anchor while the cursor is in the
+    /// `PendingDeleted` state.
+    ///
+    /// JE keeps the cursor's `bin` reference (pinned) across a delete and
+    /// uses it as the `anchorBIN` for `Tree.getNextBin`/`getPrevBin`
+    /// (`CursorImpl.java:2624` `getNext`), because `deleteCurrentRecord`
+    /// only sets the slot's PD flag — the slot stays in the BIN carrying its
+    /// key, so there is always a live anchor.  Noxu physically removes the
+    /// slot on delete (`apply_tree_delete` → `Tree::delete`) and clears
+    /// `current_key`, so the key-based cross-BIN step in `retrieve_next`
+    /// would otherwise have no anchor and return `NotFound` at the first BIN
+    /// boundary — a delete-all loop would clear only the first BIN.  We save
+    /// the deleted key here and use it as the cross-BIN anchor, mirroring
+    /// JE's "cursor stays positioned at the deleted slot; advance from
+    /// there" semantics.  Not cleared on reposition: it is only ever read as
+    /// `current_key.as_ref().or(last_deleted_key.as_ref())`, and every
+    /// successful (re)position sets `current_key = Some(..)`, which shadows
+    /// any stale value here — so the anchor is used only while
+    /// `PendingDeleted` (i.e. immediately after `delete()`, before the next
+    /// successful advance sets `current_key`).
+    last_deleted_key: Option<Vec<u8>>,
+
     /// The BIN Arc the cursor is currently pinned to, if any.
     ///
     /// Increments `BinStub.cursor_count` via `Tree::pin_bin()` so the
@@ -267,6 +290,7 @@ impl CursorImpl {
             current_data: None,
             current_lsn: noxu_util::NULL_LSN.as_u64(),
             current_index: -1,
+            last_deleted_key: None,
             current_bin_arc: None,
             log_manager: None,
             env_invalid: None,
@@ -298,6 +322,7 @@ impl CursorImpl {
             current_data: None,
             current_lsn: noxu_util::NULL_LSN.as_u64(),
             current_index: -1,
+            last_deleted_key: None,
             current_bin_arc: None,
             log_manager: Some(log_manager),
             env_invalid: None,
@@ -2594,13 +2619,31 @@ impl CursorImpl {
                 }
             };
             if stale_split {
-                // Re-anchor: find the BIN that now contains current_key.
+                // Re-anchor: find the BIN that now contains the anchor key.
+                //
+                // NEW-3 (reverse): after a delete `current_key` is None but
+                // `last_deleted_key` holds the just-removed key.  When a
+                // reverse (`Get::Prev`) delete removes the LAST live slot of a
+                // BIN, `current_index` is left >= len (out of bounds), so the
+                // `stale_split` guard fires even though the predecessor still
+                // lives in this same BIN.  We must resume the within-BIN
+                // backward scan, not cross the boundary yet.  Fall back to
+                // `last_deleted_key` for the anchor (same `.or(...)` pattern
+                // used at the cross-BIN site) so re-anchor lands in the right
+                // BIN and continues.  This mirrors JE, which keeps the
+                // PD-flagged slot (and thus `index`) in the pinned `bin` and
+                // does the within-BIN `--index > -1` step before ever calling
+                // `Tree.getPrevBin` (`CursorImpl.java:2579,2624` getNext).
+                let anchor_for_reanchor = self
+                    .current_key
+                    .as_deref()
+                    .or(self.last_deleted_key.as_deref());
                 let reanchor_result: Option<(
                     std::sync::Arc<
                         noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>,
                     >,
                     i32,
-                )> = self.current_key.as_deref().and_then(|ck| {
+                )> = anchor_for_reanchor.and_then(|ck| {
                     let db = self.db_impl.read();
                     let tree = db.get_real_tree()?;
                     let root = tree.get_root()?;
@@ -2609,14 +2652,60 @@ impl CursorImpl {
                         ck,
                         tree.get_comparator(),
                     )?;
+                    let cmp = tree.get_comparator();
                     let idx = {
                         let g = found_arc.read();
                         if let TreeNode::Bottom(bin) = &*g {
-                            // Binary-search for current_key within the new BIN.
-                            (0..bin.entries.len() as i32).find(|&i| {
+                            let nentries = bin.entries.len() as i32;
+                            // Look for an exact match first (D5/split case:
+                            // the key still exists, just moved slots).
+                            let exact = (0..nentries).find(|&i| {
                                 bin.get_full_key(i as usize)
                                     .is_some_and(|k| k == ck)
-                            })
+                            });
+                            match exact {
+                                Some(i) => Some(i),
+                                // No exact match: the anchor key was physically
+                                // removed by `delete()` (NEW-3).  Position the
+                                // re-anchor at the gap where the key would be
+                                // — the count of live slots ordered strictly
+                                // before the anchor — so the retry step (gap for
+                                // forward, gap-1 for reverse) resumes at the
+                                // correct neighbour, exactly as JE resumes from
+                                // the deleted slot's `index`.
+                                None => {
+                                    let gap = (0..nentries)
+                                        .take_while(|&i| {
+                                            bin.get_full_key(i as usize)
+                                                .is_some_and(|k| {
+                                                    let ord = match cmp {
+                                                        Some(c) => c(&k, ck),
+                                                        None => {
+                                                            k.as_slice().cmp(ck)
+                                                        }
+                                                    };
+                                                    ord
+                                                        == std::cmp::Ordering::Less
+                                                })
+                                        })
+                                        .count()
+                                        as i32;
+                                    // The gap is index `gap` (live slots
+                                    // `0..gap` are strictly before the anchor;
+                                    // `gap..nentries` are strictly after).  The
+                                    // retry step below is `+1` for forward and
+                                    // `-1` for reverse, and it starts from the
+                                    // returned index.  We want the retry to
+                                    // land ON the neighbour: forward on the
+                                    // first slot at/after the gap (`gap`),
+                                    // reverse on the last slot before the gap
+                                    // (`gap - 1`).  So return `gap - 1` for
+                                    // forward and `gap` for reverse.  This
+                                    // reproduces JE resuming from the deleted
+                                    // slot's `index` (`--index`/`++index`).
+                                    Some(if forward { gap - 1 } else { gap })
+                                }
+                            }
                         } else {
                             None
                         }
@@ -2827,7 +2916,17 @@ impl CursorImpl {
         }
 
         // Current BIN exhausted — cross to adjacent BIN.
-        let mut anchor_key: Vec<u8> = match &self.current_key {
+        // NEW-3: after a delete `current_key` is None but `last_deleted_key`
+        // holds the just-removed key, which is the correct anchor for
+        // `get_next_bin`/`get_prev_bin` (it still resolves to the BIN the
+        // cursor was positioned in, whose sibling is the next BIN).  This
+        // mirrors JE keeping the pinned `bin` as `anchorBIN` across a delete
+        // (CursorImpl.java:2624).
+        let mut anchor_key: Vec<u8> = match self
+            .current_key
+            .as_ref()
+            .or(self.last_deleted_key.as_ref())
+        {
             Some(k) => k.clone(),
             None => return Ok(OperationStatus::NotFound),
         };
@@ -3779,7 +3878,17 @@ impl CursorImpl {
         // gap so Next/Prev advances correctly (D1).
         // current_index now points to the slot that was the successor; leave
         // it unchanged.  Clear key/data/lsn since the record is gone.
-        self.current_key = None;
+        //
+        // NEW-3: retain the deleted key as the cross-BIN advance anchor.
+        // Unlike JE — which keeps the PD-flagged slot (and thus its key) in
+        // the BIN and uses the pinned `bin` object as `anchorBIN` for
+        // `Tree.getNextBin` (`CursorImpl.java:2624`) — Noxu physically removed
+        // the slot above and clears `current_key` here.  Without an anchor,
+        // the key-based cross-BIN step in `retrieve_next` returns NotFound at
+        // the first BIN boundary, so a delete-all loop clears only the first
+        // BIN.  Saving the deleted key preserves JE's "advance from the
+        // deleted slot's position" behaviour across BIN boundaries.
+        self.last_deleted_key = self.current_key.take();
         self.current_data = None;
         self.current_lsn = noxu_util::NULL_LSN.as_u64();
         // current_index stays; it is the gap index (former successor's slot).
