@@ -1542,6 +1542,16 @@ impl Environment {
     pub fn is_valid(&self) -> bool {
         self.open.load(Ordering::Acquire)
             && self.env_valid.load(Ordering::Acquire)
+            // A-prime public fail-stop: a critical WAL write/drain/rotation/
+            // sync failure poisons the shared LogManager `io_invalid` flag.
+            // Surface it here so `Environment::is_valid` reports fail-stop for
+            // the whole environment (JE invalidates the environment, not just
+            // the logger).  Handles without their own logger (e.g. read-only
+            // cursors) still observe it through this shared flag.
+            && !self
+                .log_manager
+                .as_ref()
+                .is_some_and(|lm| lm.is_io_invalid())
     }
 
     /// Invalidates the environment in response to a fatal error.
@@ -1967,6 +1977,21 @@ impl Environment {
             return Err(NoxuError::environment_with_reason(
                 crate::error::EnvironmentFailureReason::ForcedShutdown,
                 "environment has been invalidated due to a prior fatal error"
+                    .to_string(),
+            ));
+        }
+        // A-prime public fail-stop: a critical WAL failure maps to a typed
+        // fatal `EnvironmentFailure(LogWrite)` for user operations funnelled
+        // through the environment (open_database / begin transaction / etc.),
+        // including handles that have no logger of their own.
+        if self
+            .log_manager
+            .as_ref()
+            .is_some_and(|lm| lm.is_io_invalid())
+        {
+            return Err(NoxuError::environment_with_reason(
+                crate::error::EnvironmentFailureReason::LogWrite,
+                "environment invalidated by a fatal log write failure"
                     .to_string(),
             ));
         }
