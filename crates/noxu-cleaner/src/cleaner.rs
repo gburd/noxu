@@ -1718,12 +1718,13 @@ impl Cleaner {
                 }
                 // Remove obsolete selection metadata with the deleted file;
                 // otherwise the next pass tries to clean it again.
-                self.utilization_profile
-                    .lock()
-                    .remove_file_summary(file_number);
+                // Match the profile -> tracker lock order used by summary
+                // snapshots/checkpoint transfers; retire both atomically.
+                let mut profile = self.utilization_profile.lock();
                 if let Some(tracker) = &self.utilization_tracker {
-                    tracker.lock().get_tracked_files_mut().remove(&file_number);
+                    tracker.lock().remove_tracked_file(file_number);
                 }
+                profile.remove_file_summary(file_number);
                 deleted += 1;
                 self.stats.deletions.fetch_add(1, Ordering::Relaxed);
             } else {
@@ -2493,6 +2494,55 @@ mod tests {
             result.lns_dead, 0,
             "no LN entries were written, so lns_dead must be 0"
         );
+    }
+
+    #[test]
+    fn deletion_retires_accounting_only_after_success() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (fm, _lm) = make_fm_and_lm_with_entries(dir.path());
+        let tracker = Arc::new(Mutex::new(UtilizationTracker::new(true)));
+        tracker.lock().count_new_log_entry(0, 100, true, false);
+        tracker.lock().count_new_log_entry(1, 200, true, false);
+        let cleaner = Cleaner::with_file_manager(50, 0, 1, Arc::clone(&fm))
+            .with_utilization_tracker(Arc::clone(&tracker));
+        cleaner
+            .utilization_profile
+            .lock()
+            .update_file_summary(0, &FileSummary::new());
+        cleaner.get_file_selector().lock().add_safe_to_delete_back(0);
+        let before = cleaner.get_merged_file_summary_map();
+        let budget_before = tracker.lock().get_bytes_tracked();
+
+        // A directory at the file path forces remove_file to fail even as root.
+        let path = dir.path().join("00000000.ndb");
+        let saved = dir.path().join("saved.ndb");
+        std::fs::rename(&path, &saved).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert_eq!(cleaner.delete_safe_files(), 0);
+        assert_eq!(cleaner.get_merged_file_summary_map().len(), before.len());
+        assert!(cleaner.get_profile_summary(0).is_some());
+        assert!(tracker.lock().get_tracked_files().contains_key(&0));
+        assert_eq!(tracker.lock().get_bytes_tracked(), budget_before);
+        assert!(
+            cleaner
+                .get_file_selector()
+                .lock()
+                .get_safe_to_delete()
+                .contains(&0)
+        );
+        assert_eq!(cleaner.get_stats().snapshot().deletions, 0);
+
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(&saved, &path).unwrap();
+        assert_eq!(cleaner.delete_safe_files(), 1);
+        assert!(!path.exists());
+        assert!(cleaner.get_profile_summary(0).is_none());
+        assert!(!tracker.lock().get_tracked_files().contains_key(&0));
+        assert!(tracker.lock().get_tracked_files().contains_key(&1));
+        assert!(tracker.lock().get_bytes_tracked() < budget_before);
+        assert!(!cleaner.get_merged_file_summary_map().contains_key(&0));
+        // No ghost summary can select deleted file 0 for a subsequent scan.
+        assert_eq!(cleaner.do_clean(10, true).unwrap().files_cleaned, 0);
     }
 
     #[test]
