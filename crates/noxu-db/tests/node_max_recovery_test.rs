@@ -27,9 +27,7 @@
 //! closes and reopens, and asserts the reopened tree STILL splits at fanout 4
 //! — i.e. its structure reflects the small fanout, not 256.
 
-use noxu_db::{
-    DatabaseConfig, DatabaseEntry, EnvironmentConfig, StatsConfig,
-};
+use noxu_db::{DatabaseConfig, DatabaseEntry, EnvironmentConfig, StatsConfig};
 use std::path::Path;
 use tempfile::TempDir;
 
@@ -55,10 +53,7 @@ fn ikey(i: u32) -> String {
 
 fn bin_and_in_count(db: &noxu_db::Database) -> (u64, u64) {
     let s = db.stats(Some(&StatsConfig::new().with_fast(false))).unwrap();
-    (
-        s.btree.bottom_internal_node_count,
-        s.btree.internal_node_count,
-    )
+    (s.btree.bottom_internal_node_count, s.btree.internal_node_count)
 }
 
 /// Per-DB `DatabaseConfig::node_max_entries` must survive reopen.

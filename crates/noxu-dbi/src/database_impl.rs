@@ -497,6 +497,18 @@ impl DatabaseImpl {
         // all post-recovery inserts. (JE DatabaseImpl.getKeyPrefixing is read
         // from persistent DB metadata, so it survives recovery.)
         tree.set_key_prefixing(self.flags & PREFIXING_ENABLED != 0);
+        // NEW-2: re-apply the database's configured fanout to the recovered
+        // tree.  RecoveryManager builds every recovered tree at a fixed
+        // fanout (it has no per-DB config), so without this the configured
+        // NODE_MAX_ENTRIES is silently replaced by that fixed value on
+        // reopen — a small-fanout database would split at 256 after restart
+        // (wrong structure, wrong split geometry).  JE reconstitutes the
+        // DatabaseImpl with its persisted maxTreeEntriesPerNode
+        // (DatabaseImpl.readFromLog, DatabaseImpl.java:2203); here the fanout
+        // lives on the DatabaseImpl (from the DatabaseConfig supplied at open,
+        // falling back to the env-level NODE_MAX like JE DatabaseImpl.java:420)
+        // and we push it onto the recovered tree.
+        tree.set_max_entries_per_node(self.max_tree_entries_per_node as usize);
         // DBI-14: recovery redo lays keys out in unsigned-byte order (it has
         // no access to the application comparator), so re-sort the recovered
         // tree under the now-attached comparator.  Without this, a database
