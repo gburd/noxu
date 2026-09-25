@@ -19,6 +19,15 @@ store suffix only. `recompute_key_prefix()` rebuilds on deserialization.
 
 **BIN-delta**: Changed slots only are logged, reducing write amplification.
 Base BIN reconstructed by reading `last_full_lsn` then applying deltas.
+Because a delta can only add/overwrite slots (never express a *removal*), any
+operation that removes entries from a BIN in bulk must invalidate the stale
+full-image base so the next persisted image is a FULL BIN. Two such cases:
+physical slot deletion (`remove_slot`) and a **BIN split**, where the
+right-half entries move out of the left half while its `last_full_lsn` still
+names the pre-split image. Both set `prohibit_next_delta` on the modified BIN
+(JE: `IN.splitInternal` logs both split halves in full via
+`logInternal(allowDeltas=false)`), forcing a full image that advances
+`last_full_lsn` past the change before any delta can ride on it.
 
 **Reference**: Noxu DB Architecture Notes; Ramakrishnan & Gehrke, *Database
 Management Systems*, Chapter 14.
