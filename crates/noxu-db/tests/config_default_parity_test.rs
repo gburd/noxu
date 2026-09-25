@@ -16,6 +16,17 @@
 //!     only, reserved, or test-only) so that adding a new bool param without
 //!     wiring it is caught here.
 //!
+//! # Completeness guard (config-defaults-review.md, follow-up B)
+//!
+//! The classification is EXHAUSTIVE and cannot silently skip a param.  The
+//! `bool_param_classification_is_complete` test enumerates every bool
+//! `ConfigParam` from `noxu_config::params::all_params()` and asserts each is
+//! in EXACTLY one of [`PARAM_TO_FIELD`] (mapped to an `EnvironmentConfig`
+//! field) or [`KNOWN_UNMAPPED`] (with a documented reason), and that
+//! `mapped + known_unmapped == total bool param count`.  A newly-added bool
+//! param therefore FAILS this test until someone classifies it — the earlier
+//! version walked only the 48 mapped entries and silently skipped the other 21.
+//!
 //! Any deliberate divergence between a param default and its effective config
 //! default must be recorded in `INTENTIONAL_DIVERGENCES` with a reason, so the
 //! two sources agree and the divergence is auditable in one place.
@@ -156,6 +167,101 @@ const PARAM_TO_FIELD: &[(&ConfigParam, &str)] = &[
 /// docs/src/maintainer/design-decisions.md and the field doc comments.
 const INTENTIONAL_DIVERGENCES: &[(&str, bool, &str)] = &[];
 
+/// Bool `ConfigParam`s that have NO effective `EnvironmentConfig` bool field,
+/// with the reason each is genuinely unmappable.  Together with
+/// [`PARAM_TO_FIELD`] this must partition every bool param (enforced by
+/// `bool_param_classification_is_complete`): a param is mapped OR known-
+/// unmapped, never neither and never both.
+///
+/// `(param name, reason)`.  Keep the param NAME (the `noxu.*` key) here, since
+/// that is what `ConfigParam::name` reports.
+const KNOWN_UNMAPPED: &[(&str, &str)] = &[
+    // Tree-internal knobs consumed inside noxu-tree; no EnvironmentConfig
+    // bool field (EnvironmentConfig exposes the int TREE_BIN_DELTA percent,
+    // not these blind-op toggles).
+    ("noxu.tree.binDeltaBlindOps", "tree-internal; no EnvironmentConfig field"),
+    (
+        "noxu.tree.binDeltaBlindPuts",
+        "tree-internal; no EnvironmentConfig field",
+    ),
+    // Cleaner-internal knobs consumed inside noxu-cleaner; no EnvironmentConfig
+    // bool field.
+    (
+        "noxu.cleaner.trackDetail",
+        "cleaner-internal; no EnvironmentConfig field",
+    ),
+    (
+        "noxu.cleaner.gradualExpiration",
+        "cleaner-internal; no EnvironmentConfig field",
+    ),
+    ("noxu.cleaner.rmwFix", "cleaner-internal; no EnvironmentConfig field"),
+    // Utility / diagnostics flags with no runtime EnvironmentConfig field.
+    (
+        "noxu.env.comparatorsRequired",
+        "utility-only (DbScavenger-style tools); no EnvironmentConfig field",
+    ),
+    (
+        "noxu.env.exposeUserData",
+        "diagnostics (include user data in messages); no EnvironmentConfig field",
+    ),
+    (
+        "noxu.env.recovery",
+        "recovery is always enabled in Noxu; no opt-out EnvironmentConfig field",
+    ),
+    (
+        "noxu.env.setupLogger",
+        "logging routes through the `log` crate; no EnvironmentConfig field",
+    ),
+    (
+        "noxu.env.logTrace",
+        "logging routes through the `log` crate / noxu-observe; no EnvironmentConfig field",
+    ),
+    (
+        "noxu.lock.oldLockExceptions",
+        "legacy exception-type compat; no EnvironmentConfig field",
+    ),
+    (
+        "noxu.log.checksumFatal",
+        "log-internal (checksum-error fatality); no EnvironmentConfig field",
+    ),
+    (
+        "noxu.tree.secondaryIntegrityFatal",
+        "tree-internal (secondary-integrity fatality); no EnvironmentConfig field",
+    ),
+    // Test-only flags.
+    ("noxu.testMode", "test-only; no EnvironmentConfig field"),
+    (
+        "noxu.evictor.forcedYield",
+        "test-only yield hook; no EnvironmentConfig field",
+    ),
+    // Deprecated / moot compatibility flags kept only so old config strings
+    // still parse; the underlying feature is N/A to Noxu.
+    (
+        "noxu.env.sharedLatches",
+        "deprecated in JE ('no longer used'); no EnvironmentConfig field",
+    ),
+    (
+        "noxu.env.dupConvertPreloadAll",
+        "deprecated-moot (JE 4->5 dup conversion N/A to .ndb); no EnvironmentConfig field",
+    ),
+    (
+        "noxu.log.useNIO",
+        "deprecated-moot (Java NIO N/A to Noxu); no EnvironmentConfig field",
+    ),
+    (
+        "noxu.log.directNIO",
+        "deprecated-moot (Java NIO direct buffers N/A to Noxu); no EnvironmentConfig field",
+    ),
+    (
+        "noxu.deferredWrite.temp",
+        "deprecated (per-DB deferred-write via DatabaseConfig); no EnvironmentConfig field",
+    ),
+    (
+        "noxu.rep.runLogFlushTask",
+        "replication-managed (flush task always controlled by the rep layer); no EnvironmentConfig field",
+    ),
+];
+
 #[test]
 fn bool_param_defaults_match_environment_config_defaults() {
     let cfg = EnvironmentConfig::new(PathBuf::from("/tmp/parity-test"));
@@ -198,5 +304,79 @@ fn bool_param_defaults_match_environment_config_defaults() {
          INTENTIONAL_DIVERGENCES with a reason.\n",
         mismatches.len(),
         mismatches.join("\n")
+    );
+}
+
+/// Completeness guard (follow-up B): every bool `ConfigParam` must be
+/// classified as EXACTLY one of mapped ([`PARAM_TO_FIELD`]) or known-unmapped
+/// ([`KNOWN_UNMAPPED`]).  This CANNOT silently skip a param: it enumerates the
+/// full param set from `noxu_config::params::all_params()`, so a newly-added
+/// bool param that is in neither table fails here until someone classifies it.
+#[test]
+fn bool_param_classification_is_complete() {
+    // The full universe of bool params, straight from the params module.
+    let all_bool: Vec<&'static str> = params::all_params()
+        .into_iter()
+        .filter(|p| p.default.as_bool().is_some())
+        .map(|p| p.name)
+        .collect();
+    let total_bool = all_bool.len();
+
+    // Mapped param NAMES (the `noxu.*` keys) from PARAM_TO_FIELD.
+    let mapped_names: Vec<&'static str> =
+        PARAM_TO_FIELD.iter().map(|(p, _)| p.name).collect();
+    let unmapped_names: Vec<&'static str> =
+        KNOWN_UNMAPPED.iter().map(|(n, _)| *n).collect();
+
+    // 1. No param may be in BOTH tables (the partition must be disjoint).
+    let both: Vec<&str> = mapped_names
+        .iter()
+        .filter(|n| unmapped_names.contains(n))
+        .copied()
+        .collect();
+    assert!(
+        both.is_empty(),
+        "param(s) appear in BOTH PARAM_TO_FIELD and KNOWN_UNMAPPED (must be \
+         one or the other): {both:?}"
+    );
+
+    // 2. Neither table may reference a name that is not a real bool param
+    //    (catches typos / stale entries after a param is renamed/removed).
+    for n in mapped_names.iter().chain(unmapped_names.iter()) {
+        assert!(
+            all_bool.contains(n),
+            "'{n}' is listed in PARAM_TO_FIELD/KNOWN_UNMAPPED but is not a \
+             bool ConfigParam in params::all_params() (stale or misspelled)"
+        );
+    }
+
+    // 3. Every bool param must be classified (in exactly one table). Report
+    //    the unclassified ones by name so a newcomer knows what to add.
+    let unclassified: Vec<&str> = all_bool
+        .iter()
+        .filter(|n| !mapped_names.contains(n) && !unmapped_names.contains(n))
+        .copied()
+        .collect();
+    assert!(
+        unclassified.is_empty(),
+        "\n{} bool ConfigParam(s) are unclassified — add each to PARAM_TO_FIELD \
+         (if it drives an EnvironmentConfig field) or to KNOWN_UNMAPPED (with \
+         a reason):\n  {}\n",
+        unclassified.len(),
+        unclassified.join("\n  ")
+    );
+
+    // 4. The count identity: mapped + known_unmapped == total. This is the
+    //    load-bearing assertion — with (1)-(3) already holding, an equal count
+    //    proves the two tables exactly partition the bool-param universe, so
+    //    the classification cannot silently skip anything.
+    assert_eq!(
+        mapped_names.len() + unmapped_names.len(),
+        total_bool,
+        "PARAM_TO_FIELD ({}) + KNOWN_UNMAPPED ({}) != total bool params ({}) — \
+         the classification is not exhaustive",
+        mapped_names.len(),
+        unmapped_names.len(),
+        total_bool,
     );
 }
