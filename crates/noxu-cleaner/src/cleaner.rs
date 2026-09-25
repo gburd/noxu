@@ -839,6 +839,12 @@ impl Cleaner {
             }
         };
 
+        // JE 7.5.11 FileProcessor.doClean:335,373-386 limits a pass to
+        // the initial summary-map count, not a frozen eligible-file set.
+        // Refreshed selection may include migration output within this cap.
+        // Allow one attempt when only the explicit queue has a file.
+        let n_files = n_files.min((file_summary_map.len() as u32).max(1));
+
         // CLN-4: compute first_active_txn_file from TxnManager so that
         // files inside an open transaction's log window are excluded.
         // JE: UtilizationCalculator.getBestFile reads
@@ -2471,6 +2477,96 @@ mod tests {
             result.lns_dead, 0,
             "no LN entries were written, so lns_dead must be 0"
         );
+    }
+
+    #[test]
+    fn forced_pass_is_bounded_when_migrations_create_files() {
+        use bytes::BytesMut;
+        use noxu_log::Provisional;
+        use noxu_util::NULL_VLSN;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let fm =
+            Arc::new(FileManager::new(dir.path(), false, 4096, 100).unwrap());
+        let tracker = Arc::new(Mutex::new(UtilizationTracker::new(true)));
+        let mut lm = LogManager::new(Arc::clone(&fm), 3, 8192, 4096);
+        lm.set_write_observer(Arc::new(
+            crate::UtilizationTrackerObserver::new(Arc::clone(&tracker)),
+        ));
+        let lm = Arc::new(lm);
+        let tree = Arc::new(RwLock::new(noxu_tree::Tree::new(1, 128)));
+        let value = vec![42; 512];
+        for k in 0u32..24 {
+            let key = k.to_be_bytes().to_vec();
+            let entry = LnLogEntry::new(
+                1,
+                None,
+                NULL_LSN,
+                false,
+                None,
+                None,
+                NULL_VLSN,
+                0,
+                false,
+                key.clone(),
+                Some(value.clone()),
+                0,
+                NULL_VLSN,
+            );
+            let mut buf = BytesMut::new();
+            entry.write_to_log(&mut buf);
+            let lsn = lm
+                .log(
+                    WireEntryType::InsertLN,
+                    &buf,
+                    Provisional::No,
+                    true,
+                    false,
+                )
+                .unwrap();
+            tree.write().unwrap().insert(key, value.clone(), lsn).unwrap();
+        }
+        lm.flush_sync().unwrap();
+        let cleaner = Cleaner::with_file_manager_and_tree(
+            50,
+            0,
+            1,
+            Arc::clone(&fm),
+            Arc::clone(&tree),
+            Arc::clone(&lm),
+        )
+        .with_utilization_tracker(tracker);
+        for _ in 0..2 {
+            let original = cleaner.get_merged_file_summary_map().len() as u32;
+            let before = fm.list_file_numbers().unwrap().len();
+            // Finite caller budget exposes a missing per-pass bound without
+            // hanging the test. The public u32::MAX call is covered at DB level.
+            let result = cleaner.do_clean(original + 3, true).unwrap();
+            assert!(
+                result.files_cleaned > 0,
+                "later passes must remain possible"
+            );
+            assert!(
+                fm.list_file_numbers().unwrap().len() > before,
+                "must create migration output"
+            );
+            assert!(
+                result.files_cleaned <= original,
+                "one pass cleaned {} files, original map had {original}",
+                result.files_cleaned
+            );
+            for k in 0u32..24 {
+                assert_eq!(
+                    tree.read()
+                        .unwrap()
+                        .search_with_data(&k.to_be_bytes())
+                        .unwrap()
+                        .data
+                        .as_deref(),
+                    Some(value.as_slice())
+                );
+            }
+        }
     }
 
     /// Real Noxu LN payloads and type bytes must reach live migration.
