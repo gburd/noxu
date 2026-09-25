@@ -101,7 +101,7 @@ fn exercise_refusal(missing_logger: bool, dirty_lru: bool, dirty: bool) {
                     .search_with_data(&i.to_be_bytes())
                     .unwrap()
                     .data,
-                Some(expected),
+                Some(expected.into()),
                 "key {i}"
             );
         }
