@@ -384,6 +384,98 @@ fn reverse_split_recovers() {
     );
 }
 
+/// Crash variant of `reverse_split_recovers`: identical topology, but the
+/// producer environment is torn down by **dropping the handles WITHOUT a
+/// clean `close()`** — `EnvironmentImpl::Drop` takes no final checkpoint
+/// (unlike `close()`), so recovery must reconstruct the committed set from
+/// the WAL and the pre-compress checkpoint alone, not from a close-time
+/// checkpoint that could mask a defect (REMEDIATION-BRIEF: controls must not
+/// get repaired by normal close/checkpoint when testing crash durability).
+///
+/// The committed 23 keys are durable because each `put`/`delete` is an
+/// autocommit transaction whose commit fsyncs the WAL.  Asserts the exact
+/// key+value set via BOTH the cursor full-scan (`recover_and_collect`) AND a
+/// direct point-get sweep, so the check does not rely solely on the traversal
+/// path that NEW-4 broke.
+#[test]
+fn reverse_split_recovers_crash() {
+    const NODE_MAX: u32 = 4;
+    let dir = TempDir::new().unwrap();
+    let max = 12u32;
+    let mut expected = BTreeMap::new();
+
+    {
+        let env = open_env(dir.path(), NODE_MAX);
+        let db = open_db(&env);
+
+        for i in 0u32..max {
+            let k = ikey(i);
+            put(&db, &k, &k);
+            expected.insert(k.clone().into_bytes(), k.into_bytes());
+        }
+
+        // Empty the leftmost BIN (delete first two keys via cursor).
+        {
+            let mut c = db.open_cursor(None).unwrap();
+            let mut key = DatabaseEntry::new();
+            let mut val = DatabaseEntry::new();
+            for _ in 0..2 {
+                let s = c.get(&mut key, &mut val, Get::First, None).unwrap();
+                assert_eq!(s, OperationStatus::Success);
+                let removed = key.data_opt().unwrap().to_vec();
+                assert_eq!(c.delete().unwrap(), OperationStatus::Success);
+                expected.remove(&removed);
+            }
+            c.close().unwrap();
+        }
+
+        // Checkpoint (recovery relies on INs for the deletes), then compress
+        // out the empty BIN (reverse split), then split the right branch.
+        env.checkpoint(Some(&CheckpointConfig::new().with_force(true)))
+            .unwrap();
+        let _ = env.compress().unwrap();
+        for i in max..(max + 13) {
+            let k = ikey(i);
+            put(&db, &k, &k);
+            expected.insert(k.clone().into_bytes(), k.into_bytes());
+        }
+
+        // CRASH: drop without close() — no final checkpoint (Drop path).
+        drop(db);
+        drop(env);
+    }
+
+    // Recover: cursor full-scan set must equal the committed set …
+    let recovered = recover_and_collect(dir.path(), NODE_MAX, 2);
+    assert_eq!(
+        recovered, expected,
+        "reverse-split crash: recovered set != expected committed set"
+    );
+
+    // … and a direct point-get sweep must find every committed key/value and
+    // NOT find the two deleted keys (independent of the scan path).
+    let env = open_env(dir.path(), NODE_MAX);
+    let db = open_db(&env);
+    for i in 0u32..(max + 13) {
+        let k = ikey(i);
+        let got = db.get(k.as_bytes()).unwrap();
+        if expected.contains_key(k.as_bytes()) {
+            assert_eq!(
+                got.as_deref(),
+                Some(k.as_bytes()),
+                "reverse-split crash: committed key {k} must return its value"
+            );
+        } else {
+            assert!(
+                got.is_none(),
+                "reverse-split crash: deleted key {k} must not be present"
+            );
+        }
+    }
+    db.close().unwrap();
+    env.close().unwrap();
+}
+
 /// JE `CheckReverseSplitsTest.testCompleteRemoval` (`setupCompleteRemoval`):
 /// populate a 3-level tree, delete EVERY record, checkpoint, compress (the
 /// subtree is removed leaving a single BIN), then insert new data. Recover and
