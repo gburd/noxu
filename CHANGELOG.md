@@ -77,6 +77,42 @@ listed in [References](#references).
   handling; the cleaner's legacy protected-retry phantom-deletion accounting; and
   recovery discarding a database's configured `NODE_MAX_ENTRIES`.
 
+### Fixed (write path & observability)
+
+- **WAL now fail-stops the environment on a critical log-write failure (JE
+  `LogManager.serialLog` parity).** A failed or partial WAL write previously left
+  the log manager's LSN/buffer/file correspondence inconsistent and allowed
+  further writes, and several concrete data-loss paths followed: an evicted dirty
+  BIN could be detached after its logging failed (losing the update); a failed
+  oversized append could be retried and double-count the old image obsolete
+  (debug panic, silent utilization-tracker corruption in release); and an
+  off-lock no-sync drain racing a sync could publish a durable watermark over
+  bytes not yet on disk (lost acknowledged prefix). Now any critical
+  append/drain/rotation/sync failure invalidates the environment (surfaced as
+  `EnvironmentFailure(LogWrite)` to database/cursor/transaction operations) and
+  refuses subsequent writes; recover by reopening. Oversized writes complete
+  under the log-write lock, obsolete/new accounting is deferred until the write
+  succeeds (exactly once, no credit on a failed replacement), the no-sync drain
+  is serialized under the lock (a correctness-over-throughput reversal of the
+  off-lock no-sync optimization, documented in `power-loss.md`), and eviction
+  retains a dirty BIN when logging is unavailable. **Migration:** a critical
+  write failure (e.g. disk full, I/O error) now fatally invalidates the
+  environment instead of being silently retryable in-process; free space and
+  reopen. Still uncertified and tracked: reopen-after-fail-stop recovery,
+  cleaner-vs-failed-replacement, and replication log-writer paths.
+- **The exported evictor metrics report real values instead of constants.**
+  `noxu_evictor_cache_hit_ratio` was permanently `1.0` (its backing
+  `bin_fetch`/`bin_fetch_miss` counters had no production writers) and
+  `noxu_evictor_lru_size` was permanently `0` (its refresh had no caller on the
+  stats path) — an operator dashboard showed a perfect cache and an empty LRU
+  regardless of workload. Both are now wired (JE `IN.incFetchStats` /
+  `Evictor.loadStats`) and a guard test asserts every exported evictor metric
+  moves under a real workload, so a dead gauge cannot regress unnoticed.
+  **Migration:** no API/on-disk change; dashboards will now see moving values —
+  review any alert rules that assumed the old constants (`1.0`, `0`).
+  Replication health metrics (`RepStats`) remain unwired and unexported (no
+  fabricated rep gauge is shipped); wiring them is tracked as a separate task.
+
 ### Changed
 
 - **Backup: the non-functional live-backup daemon is replaced by a real
