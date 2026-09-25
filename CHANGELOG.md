@@ -123,6 +123,14 @@ listed in [References](#references).
   or dirty, matching JE's continuous-latch log→detach with an `isPinned` recheck.
   (A dirty upper internal node evicted without logging is a related, separately
   tracked gap.)
+- **READ_COMMITTED no longer returns a dirty read on scan/lookup paths.** The
+  post-lock slot revalidation that re-derives a record from the authoritative
+  BIN slot when the slot moved during lock acquisition was applied to only 2 of
+  ~12 `lock_ln` sites; the rest (`get_first`, `get_last`, `retrieve_next`,
+  range-not-found, sorted-duplicate cursor moves) trusted a pre-lock prefetch
+  and could surface an uncommitted value that a concurrent writer then aborted.
+  All data-returning lock sites now revalidate (JE `CursorImpl.lockLN`), with no
+  cost on the uncontended path and no weakening of higher isolation levels.
 
 ### Changed
 
