@@ -280,6 +280,32 @@ Handles must be discarded after a fatal log write failure. This is a
 runtime-behavior change only — **there is no on-disk format change** and
 existing `.ndb` logs are unaffected.
 
+#### Performance change (v7.10.1): no-sync drain serialized under the LWL
+
+Closing the fail-stop contract required one performance reversal. The
+no-sync flush path (`flush_no_sync`: the background
+`log_flush_no_sync_interval_ms` daemon, `NO_SYNC` commits, and
+close-time flushes) previously released the Log Write Latch (LWL)
+**before** issuing its page-cache `pwrite`s (the earlier "R-2" latency
+optimisation). That window let a concurrent `flush_sync` observe a range
+as already-flushed (its `flushed_len` watermark had advanced) yet not
+yet on disk, capture an end-of-log past it, `fdatasync`, and publish a
+**durable** watermark over bytes that were not actually written — an
+acknowledged-durable prefix could then be lost on power loss.
+
+As of v7.10.1 the no-sync snapshot, **every** `pwrite`, and the
+page-cache watermark publication all run **under the LWL**, exactly as
+the `flush_sync` leader's drain already did. A concurrent `flush_sync`
+cannot acquire the LWL until the no-sync bytes are in the page cache, so
+the durable watermark can never name un-pwritten bytes. The cost: the
+background no-sync flush (and `NO_SYNC` committers) now hold the LWL
+across their page-cache `pwrite`s, which can add brief latency to
+concurrent foreground commits whenever `log_flush_no_sync_interval_ms >
+0`. The held work is only a `memcpy` into the OS page cache — the
+expensive `fdatasync` is never held under the LWL — and correctness (no
+false durable watermark) takes precedence over the former off-LWL
+latency win. No configuration or on-disk format changes.
+
 Legitimate non-failure refusals are unchanged and remain retryable
 without invalidation: a dirty-node eviction refused because the evictor
 has **no logger attached** (no critical append began), read-only / no-WAL
