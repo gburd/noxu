@@ -100,6 +100,19 @@ listed in [References](#references).
   environment instead of being silently retryable in-process; free space and
   reopen. Still uncertified and tracked: reopen-after-fail-stop recovery,
   cleaner-vs-failed-replacement, and replication log-writer paths.
+- **`remove_database`/`rename_database`/`truncate_database` now honour their
+  transaction argument.** They previously ignored the passed `Transaction`
+  (rustdoc said "currently ignored"), applied the DDL immediately, and had no
+  abort-undo — so aborting the transaction did not roll back the removal, rename,
+  or truncation, losing data on abort. The destructive mutation is now deferred
+  to the transaction's commit (JE `Txn.markDeleteAtTxnEnd` parity), so an abort
+  leaves the database, its name, and its contents intact; up-front validation
+  (existence, open handles, destination-free, truncate count) still runs
+  synchronously so callers get immediate errors and the record count.
+  Auto-committed calls (no explicit transaction) are unchanged. Bounded gap
+  (documented): the change is visible at commit, not within the open transaction,
+  and the pre-commit name is not hidden from concurrent readers — full within-txn
+  name visibility needs a transactional naming tree and is tracked separately.
 
 ### Changed
 
