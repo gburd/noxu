@@ -2083,6 +2083,20 @@ impl BinStub {
         }
     }
 
+    /// Physically remove a slot and invalidate the next delta.
+    ///
+    /// JE `IN.deleteEntry` prohibits a delta when removing a dirty slot.
+    /// Unlike JE's tombstone-first deletion, our committed deletes remove
+    /// even clean live slots directly. No remaining delta slot can encode
+    /// their absence, so every physical removal must force a full image.
+    fn remove_slot(&mut self, idx: usize) {
+        self.prohibit_next_delta = true;
+        self.entries.remove(idx);
+        self.keys.remove(idx);
+        self.lsn_rep.remove_shift(idx);
+        self.dirty = true;
+    }
+
     /// Comparator-aware delete: removes `full_key` from the BIN using `cmp`.
     ///
     /// Returns `true` if the entry was found and removed.
@@ -2104,10 +2118,7 @@ impl BinStub {
         };
         match result {
             Ok(idx) => {
-                self.entries.remove(idx);
-                self.keys.remove(idx); // T-2
-                self.lsn_rep.remove_shift(idx); // T-3
-                self.dirty = true;
+                self.remove_slot(idx);
                 true
             }
             Err(_) => false,
@@ -5423,11 +5434,7 @@ impl Tree {
                         let suffix = bin.compress_key(key);
                         match bin.key_binary_search(suffix.as_slice()) {
                             Ok(idx) => {
-                                bin.entries.remove(idx);
-                                bin.keys.remove(idx); // T-2
-                                bin.lsn_rep.remove_shift(idx); // T-3
-                                // Mark dirty after any modification.
-                                bin.dirty = true;
+                                bin.remove_slot(idx);
                                 true
                             }
                             Err(_) => false,
@@ -6179,18 +6186,7 @@ impl Tree {
                                         continue;
                                     }
                                 }
-                                // JE `IN.deleteEntry` (IN.java:3466): removing a
-                                // DIRTY slot must prohibit the next delta — a
-                                // delta only carries dirty slots, so the removal
-                                // would otherwise be silently lost.  Force a
-                                // full BIN on the next log.
-                                if b.entries[j].dirty {
-                                    b.prohibit_next_delta = true;
-                                }
-                                b.entries.remove(j);
-                                b.keys.remove(j); // T-2
-                                b.lsn_rep.remove_shift(j); // T-3
-                                b.dirty = true;
+                                b.remove_slot(j);
                             }
                         }
                         // Recompute prefix after slot removal, since the
@@ -6451,9 +6447,15 @@ impl Tree {
         if child_index >= p.entries.len() {
             return 0;
         }
+        // The parent lookup released its latch. A split may have moved the
+        // slot before we acquired it again; never publish for another child.
+        if p.child_ref(child_index).map(|c| c.read().node_id()) != Some(node_id)
+        {
+            return 0;
+        }
         // EVICTOR-LOG-1 safety: a BIN may only be detached once it has a
         // durable full-BIN version on disk (`last_full_lsn != NULL`).  The
-        // parent slot LSN is stamped from `last_full_lsn` below and drives the
+        // parent slot LSN (full image or newer delta) drives the
         // re-fetch (`fetch_node_from_log`, which parses the entry as an
         // InLogEntry/BIN).  If we detached a never-logged BIN the slot would
         // keep its prior value -- an *LN* LSN -- and the re-fetch would try to
@@ -6481,22 +6483,21 @@ impl Tree {
         // JE: long evictedBytes = target.getBudgetedMemorySize().
         let freed = child.read().budgeted_memory_size();
 
-        // EV-14 re-fetch correctness: the parent slot LSN must point at the
-        // child's CURRENT on-disk version so `child_at_or_fetch` re-reads the
-        // right bytes (JE `IN.updateEntry(idx, newLsn)` is called whenever a
-        // child is logged; the parent slot LSN tracks the child's LSN).  The
-        // evictor only fully evicts/detaches a CLEAN BIN (it logs+clears dirty
-        // BINs via flush_dirty_node_to_log first, which sets `last_full_lsn`),
-        // so the child's authoritative LSN is its `last_full_lsn`.  Stamp it
-        // into the parent slot before dropping the child; if it is null (the
-        // child was never logged) leave the existing slot LSN intact rather
-        // than writing a null — a never-logged clean child cannot occur on
-        // the evict path, but be conservative.
+        // JE Evictor.evict / IN.detachNode(index, logged, loggedLsn) keeps
+        // the existing slot when evicting a clean child. In particular, a
+        // checkpoint may have published a BINDelta newer than last_full_lsn:
+        // that full LSN is the delta's BASE, not the current image. Our
+        // evictor logs dirty BINs before calling detach, so install its new
+        // full image only if newer than the already-published slot.
         let child_full_lsn = match &*child.read() {
             TreeNode::Bottom(b) => b.last_full_lsn,
             TreeNode::Internal(_) => NULL_LSN,
         };
-        if child_full_lsn != NULL_LSN {
+        let published_lsn = p.get_lsn(child_index);
+        if !child_full_lsn.is_transient_or_null()
+            && (published_lsn.is_transient_or_null()
+                || child_full_lsn > published_lsn)
+        {
             p.set_lsn(child_index, child_full_lsn);
         }
 
@@ -13726,6 +13727,32 @@ mod tests {
             e.dirty = true;
         }
         bin
+    }
+
+    #[test]
+    fn physical_slot_removal_prohibits_delta_in_comparator_and_compressor_paths()
+     {
+        let mut bin = bin_with_dirty(100, 1);
+        assert!(bin.should_log_delta(25));
+        assert!(bin.delete_cmp(b"0050", &|a, b| a.cmp(b)));
+        assert!(!bin.should_log_delta(25));
+        bin.clear_dirty_after_full_log(Lsn::new(2, 1));
+        bin.entries[0].dirty = true;
+        assert!(bin.should_log_delta(25));
+
+        for dirty_tombstone in [false, true] {
+            let tree = Tree::new(1, 256);
+            let mut bin = bin_with_dirty(100, 1);
+            bin.entries[50].known_deleted = true;
+            bin.entries[50].dirty = dirty_tombstone;
+            let node = Arc::new(RwLock::new(TreeNode::Bottom(bin)));
+            assert!(tree.compress_bin(&node));
+            let guard = node.read();
+            let TreeNode::Bottom(bin) = &*guard else { unreachable!() };
+            assert_eq!(bin.entries.len(), 99);
+            assert!(!bin.should_log_delta(25));
+            assert!(!bin.find_entry_compressed(b"0050").1);
+        }
     }
 
     /// COUNT-based + CONFIGURABLE percent: with percent=10 and 100 slots, the

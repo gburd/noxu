@@ -456,6 +456,12 @@ impl UtilizationTracker {
         &mut self.tracked_files
     }
 
+    /// Retire a physically deleted file and release its tracked memory budget.
+    pub fn remove_tracked_file(&mut self, file_number: u32) {
+        self.tracked_files.remove(&file_number);
+        self.update_tracked_bytes();
+    }
+
     /// Removes and returns all tracked files, clearing the tracker.
     ///
     /// This is typically called when transferring tracked data to the utilization profile.

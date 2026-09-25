@@ -943,10 +943,12 @@ impl Evictor {
                                     if self.flush_dirty_node_to_log(node_id) {
                                         let freed = node_size_fn(node_id);
                                         result.bytes_evicted += freed;
-                                        result.nodes_evicted += 1;
-                                        self.stats.increment(
-                                            &self.stats.nodes_evicted,
-                                        );
+                                        if freed > 0 {
+                                            result.nodes_evicted += 1;
+                                            self.stats.increment(
+                                                &self.stats.nodes_evicted,
+                                            );
+                                        }
                                     } else {
                                         if from_pri2 {
                                             self.pri2.lock().add_back(node_id);
@@ -965,8 +967,11 @@ impl Evictor {
                                 // and reclaim its node-level heap (CLN-F2).
                                 let freed = node_size_fn(node_id);
                                 result.bytes_evicted += freed;
-                                result.nodes_evicted += 1;
-                                self.stats.increment(&self.stats.nodes_evicted);
+                                if freed > 0 {
+                                    result.nodes_evicted += 1;
+                                    self.stats
+                                        .increment(&self.stats.nodes_evicted);
+                                }
                             }
                         }
                         None => {
@@ -1050,8 +1055,10 @@ impl Evictor {
 
                     let freed = node_size_fn(node_id);
                     result.bytes_evicted += freed;
-                    result.nodes_evicted += 1;
-                    self.stats.increment(&self.stats.nodes_evicted);
+                    if freed > 0 {
+                        result.nodes_evicted += 1;
+                        self.stats.increment(&self.stats.nodes_evicted);
+                    }
                 }
 
                 EvictionDecision::EvictRoot => {
@@ -1207,7 +1214,7 @@ impl Evictor {
             let node_size_fn = move |node_id: u64| -> u64 {
                 // Drain the cached size first so the RefCell never leaks the
                 // entry even when detach short-circuits.
-                let cached = sc.borrow_mut().remove(&node_id);
+                sc.borrow_mut().remove(&node_id);
                 let mut freed = 0u64;
                 for tree_arc in &trees_detach {
                     if let Ok(t) = tree_arc.read() {
@@ -1222,10 +1229,13 @@ impl Evictor {
                     // Detached and freed for real — credit the measured size.
                     freed
                 } else {
-                    // Not a detachable child (root / already gone / pinned).
-                    // Fall back to the cached size rather than over-crediting
-                    // a node we did not free; 1024 only if no walk ran.
-                    cached.unwrap_or(1024)
+                    // Detach may refuse after the selection snapshot (for
+                    // example, the parent slot moved). Keep the candidate
+                    // eligible for retry, without crediting bytes or a node
+                    // that we did not actually remove.
+                    self.primary_policy.put_back(node_id);
+                    self.stats.increment(&self.stats.nodes_put_back);
+                    0
                 }
             };
             self.do_evict_with_callbacks(source, &node_info_fn, &node_size_fn)

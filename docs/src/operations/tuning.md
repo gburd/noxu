@@ -23,6 +23,15 @@ env.checkpoint(Some(CheckpointConfig::new().with_force(true)))?;
 | `.with_minutes(n)` | Only checkpoint if ≥ n minutes have elapsed |
 | `.with_minimize_recovery_time(true)` | Flush all dirty nodes (expensive; use before planned shutdown) |
 
+## Checkpoint images and eviction
+
+A parent slot may reference a BIN delta rather than its older full image.
+Eviction preserves that newer reference so a cache miss reads the checkpointed
+values, not the delta's stale base. This fix requires no log-format migration.
+It prevents future stale-image refaults; it does not restore values already
+lost by an affected build. Validate suspect data against application records
+or a known-good backup before resuming writes.
+
 ## Recommended production settings
 
 - **OLTP workloads**: `checkpointer_bytes_interval = 64 MiB` (default is fine; tighten to 16 MiB
