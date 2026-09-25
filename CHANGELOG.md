@@ -113,6 +113,14 @@ listed in [References](#references).
   (documented): the change is visible at commit, not within the open transaction,
   and the pre-commit name is not hidden from concurrent readers — full within-txn
   name visibility needs a transactional naming tree and is tracked separately.
+- **Deferred DDL is now identity-guarded (fixes a destruction window in the
+  preceding change).** The commit callbacks above initially re-resolved their
+  target by name at commit, so a deferred remove/rename/truncate committing after
+  a concurrent recreate of the same name silently destroyed the recreated
+  database. Each callback is now bound to the specific database id validated when
+  the operation was issued and no-ops if the name maps to a different id (JE
+  binds the deferred delete to the `DatabaseImpl`), so concurrent same-name DDL
+  no longer corrupts — it no-ops.
 - **Eviction no longer detaches a BIN that was re-dirtied or pinned since its
   flush.** The evictor logged a dirty BIN under the child latch, released it,
   then detached under the parent latch — a window in which a cursor could
