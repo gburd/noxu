@@ -1,5 +1,18 @@
 # JE Constant / Default / Threshold Audit (2026-07)
 
+> **Correction (V18/V19/B2, Unreleased):** the `MATCH` verdicts below compared
+> JE against the `noxu-config::params` constant table **only** — not against
+> the effective `EnvironmentConfig::default()` a user actually gets. A later
+> audit found eight boolean params whose `params.rs` default matched JE (`true`)
+> while `EnvironmentConfig::default()` applied `false`
+> (`env.runVerifier`, `env.verifyBtree`, `env.verifyLog`, `log.detectFileDelete`,
+> `env.runOffHeapEvictor`, `log.useWriteQueue`, `stats.collect`,
+> `evictor.lruOnly`). Those rows below are therefore "MATCH for the table,
+> mismatch for the effective default." The split has since been reconciled and
+> guarded by a cross-check test
+> (`crates/noxu-db/tests/config_default_parity_test.rs`); see
+> [design-decisions §17](../maintainer/design-decisions.md).
+
 ## Motivation
 
 An external review found a real semantic-drift bug in transaction

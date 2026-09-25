@@ -676,3 +676,72 @@ this decision keeps Noxu JE-faithful on its most fundamental isolation choice.
 independently reproducible); the §6c read-path tests (`isolation_test.rs`,
 `je_rmw_locking_test.rs`) prove the shipped optimization didn't weaken
 isolation.
+
+## 17. Config defaults reconciled to JE — single source of truth (V18/V19/B2)
+
+**Decision**: `noxu-config::params` and `EnvironmentConfig`/`DbiEnvConfig`
+declare the *same* default for every boolean parameter, verified by a
+compile-and-run cross-check test
+(`crates/noxu-db/tests/config_default_parity_test.rs`). Where Noxu's effective
+default deliberately differs from JE's literal `EnvironmentParams.java` value,
+the divergence is documented here, in the param's doc comment, and in the
+field's doc comment — and `params.rs` is set to the effective value so the two
+sources agree.
+
+**Why**: an audit (V18/V19) found eight boolean params whose `params.rs`
+default was `true` (matching JE) while `EnvironmentConfig::default()`
+effectively applied `false`. The prior "152/152 constant MATCH" audit compared
+JE only against `params.rs`, never against the struct users actually get, so
+the split went unnoticed. Three of the eight were safety features (background
+verifier, B-tree verification, log verification) — silently off, so corruption
+went undetected by default.
+
+**Resolution** (JE refs are `src/com/sleepycat/je/config/EnvironmentParams.java`):
+
+*Flipped ON to match JE (feature implemented and wired):*
+
+| Param | JE line | Note |
+|---|---|---|
+| `env.runVerifier` | 788-791 | background verifier daemon |
+| `env.verifyBtree` | 855-858 | |
+| `env.verifyLog` | 835-838 | |
+| `env.verifySchedule` | 797-800 | `"0 0 * * *"` — the verifier daemon starts only when `run_verifier` is true AND the schedule is non-empty |
+| `stats.collect` | 1787-1790 | background stats-file dumper |
+
+A fresh environment now runs the structural + log verifier daily at midnight
+and collects background stats, matching JE's out-of-the-box behaviour.
+
+*Documented divergence — JE default `true`, Noxu effective `false`, because
+the JE feature is not yet wired in Noxu (the flag is carried through
+`DbiEnvConfig` but read by no subsystem). `params.rs` set to `false` so the two
+sources agree; when the feature lands, flip both together:*
+
+| Param | JE line | Missing capability |
+|---|---|---|
+| `log.detectFileDelete` | 500-504 | external-file-deletion detection poll |
+| `env.runOffHeapEvictor` | 1177-1180 | off-heap cache + its evictor daemon |
+| `log.useWriteQueue` | 740-743 | asynchronous log write queue |
+
+*Documented divergence — `evictor.lruOnly` (JE line 1104-1107, default `true`):*
+JE **deprecated** this param as of JE 6.0 — its javadoc states "This parameter
+is ignored by the new, more efficient and more accurate evictor." JE's actual
+runtime behaviour is the multi-queue evictor, which Noxu obtains with
+`evictor_lru_only = false` (priority-1 + priority-2 dirty-node split). Setting
+the effective default to JE's stale literal `true` would *disable* the
+multi-queue split and diverge from real JE behaviour, so Noxu keeps `false` and
+`params.rs` declares `false` to reflect real JE behaviour rather than the
+ignored literal.
+
+**Cascade fixed alongside**: enabling the verifier + stats daemons by default
+surfaced a latent bug in `Environment::close()`, which returns early (without
+stopping the background daemons) when the environment still has open databases
+or active transactions. A daemon's `Arc<EnvironmentImpl>` clone then kept the
+`FileManager` file lock alive past `Environment::drop`, blocking a reopen of the
+same directory. `Environment::drop` now stops both daemons unconditionally
+(idempotent with `close()`).
+
+**Where**: `crates/noxu-config/src/params.rs`,
+`crates/noxu-db/src/environment_config.rs`, `crates/noxu-dbi/src/dbi_config.rs`.
+**Proof**: `crates/noxu-db/tests/config_default_parity_test.rs` walks every
+mappable boolean param and asserts declared == effective (or a recorded
+divergence), so this class of split cannot silently regress.
