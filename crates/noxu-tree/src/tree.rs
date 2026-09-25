@@ -5547,6 +5547,71 @@ impl Tree {
         self.max_entries_per_node
     }
 
+    /// Return the `node_id` of the first (leftmost) BIN and its current
+    /// smallest and largest keys — used by the GAP A evict/flush→detach gate
+    /// to target a concurrent insert at the exact BIN being evicted.
+    #[cfg(noxu_shuttle)]
+    pub fn shuttle_first_bin_id(&self) -> Option<(u64, Vec<u8>, Vec<u8>)> {
+        let root = self.get_root()?;
+        fn descend(
+            node: &Arc<RwLock<TreeNode>>,
+        ) -> Option<(u64, Vec<u8>, Vec<u8>)> {
+            let g = node.read();
+            match &*g {
+                TreeNode::Bottom(b) => {
+                    let n = b.entries.len();
+                    if n == 0 {
+                        return None;
+                    }
+                    Some((b.node_id, b.get_full_key(0)?, b.get_full_key(n - 1)?))
+                }
+                TreeNode::Internal(p) => {
+                    for i in 0..p.entries.len() {
+                        if let Some(c) = p.child_ref(i)
+                            && let Some(r) = descend(c)
+                        {
+                            return Some(r);
+                        }
+                    }
+                    None
+                }
+            }
+        }
+        descend(&root)
+    }
+
+    /// Pin the BIN with `node_id` (set `cursor_count += 1`) under its write
+    /// latch, modelling a cursor registering on the BIN in the flush→detach
+    /// window.  Returns `true` if the BIN was found and pinned.
+    #[cfg(noxu_shuttle)]
+    pub fn shuttle_pin_bin(&self, node_id: u64) -> bool {
+        let Some(root) = self.get_root() else {
+            return false;
+        };
+        let Some((parent_arc, idx)) =
+            Self::find_parent_of_node_id(&root, node_id)
+        else {
+            return false;
+        };
+        let bin_arc = {
+            let pg = parent_arc.read();
+            let TreeNode::Internal(p) = &*pg else {
+                return false;
+            };
+            match p.child_ref(idx) {
+                Some(c) => Arc::clone(c),
+                None => return false,
+            }
+        };
+        let mut g = bin_arc.write();
+        if let TreeNode::Bottom(b) = &mut *g {
+            b.cursor_count += 1;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Drive `split_child(parent, child_index)` with default (no-comparator,
     /// no-prefix, no-listener) parameters — the same call the insert path
     /// makes after it has dropped the parent read lock (the drop→reacquire
@@ -5658,6 +5723,179 @@ impl Tree {
             b.clear_dirty_after_full_log(Lsn::new(1, 1));
         }
         captured
+    }
+
+    /// Faithful copy of the *evictor's* two-phase dirty-BIN eviction of a
+    /// single BIN, modelling the flush→detach latch discipline that GAP A is
+    /// about.  This mirrors, MINUS the WAL write this pure-tree harness cannot
+    /// build:
+    ///
+    ///   Phase 1 — `Evictor::flush_dirty_node_to_log` (evictor.rs:1299):
+    ///     `node_arc.try_write()` the BIN, capture every key (what
+    ///     `serialize_full` would have logged), `clear_dirty_after_full_log(Y)`
+    ///     (sets `last_full_lsn = Y`, clears dirty), then **RELEASE the BIN
+    ///     write latch** (the guard is a local that drops when the function
+    ///     returns).
+    ///
+    ///   Phase 2 — `Tree::detach_node_by_id` (tree.rs:6470): re-locate the
+    ///     parent, take the PARENT write latch, recheck child IDENTITY, then —
+    ///     as the current code does — read the child's `last_full_lsn` and
+    ///     publish it into the parent slot, `take_child`, drop the child.
+    ///     Phase 2 does NOT re-acquire the child latch and does NOT re-check
+    ///     `bin.dirty`.
+    ///
+    /// Between phase 1 and phase 2 the BIN latch is FREE — the exact window a
+    /// concurrent insert can slip a slot into the BIN without the flush having
+    /// captured it, after which detach publishes the stale `Y`.
+    ///
+    /// Returns `(captured, published_lsn)`: the keys the flush made durable and
+    /// the LSN the detach published into the parent slot.  The harness models
+    /// a refault as "only the captured keys come back" (the on-disk image at
+    /// `published_lsn` is exactly `captured`), then asserts the LOST-DIRTY
+    /// invariant: every key present in the tree at detach time is captured OR
+    /// the BIN was left resident (detach refused).  `None` = detach refused
+    /// (identity moved / never-logged), BIN stays resident, no loss.
+    ///
+    /// # Not vacuous
+    ///
+    /// The gate is meaningful only because there is NO continuous child latch
+    /// spanning phase 1 and phase 2.  JE holds the target latch from before
+    /// `target.log(...)` through `parent.detachNode(...)` (Evictor.java:3027,
+    /// 3035, released only in the `processTarget` finally at ~2800), so no
+    /// insert can land between capture and detach.  The fix (recheck
+    /// dirty/cursor under a re-acquired child latch inside phase 2, refusing
+    /// detach if the BIN was re-dirtied) makes every schedule pass.
+    #[cfg(noxu_shuttle)]
+    pub fn shuttle_evict_flush_then_detach(
+        &self,
+        bin_node_id: u64,
+    ) -> Option<(Vec<Vec<u8>>, Lsn)> {
+        self.shuttle_evict_flush_then_detach_hooked(bin_node_id, || {})
+    }
+
+    /// As [`shuttle_evict_flush_then_detach`], but runs `in_window` between
+    /// phase 1 (flush, child latch released) and phase 2 (parent-latch
+    /// detach).  A deterministic test can drive an insert / pin into the exact
+    /// flush→detach window with this hook, proving the model is not vacuous
+    /// without relying on shuttle's scheduler.
+    #[cfg(noxu_shuttle)]
+    pub fn shuttle_evict_flush_then_detach_hooked(
+        &self,
+        bin_node_id: u64,
+        in_window: impl FnOnce(),
+    ) -> Option<(Vec<Vec<u8>>, Lsn)> {
+        // A distinct, strictly-newer full LSN for this eviction's log write
+        // (JE `target.log` appends past every prior BIN image).
+        let logged_lsn = Lsn::new(9, 9);
+
+        // ---- Phase 1: flush_dirty_node_to_log (child latch, then RELEASED) --
+        let captured: Vec<Vec<u8>> = {
+            let root = self.get_root()?;
+            let (parent_arc, child_index) =
+                Self::find_parent_of_node_id(&root, bin_node_id)?;
+            let bin_arc = {
+                let pg = parent_arc.read();
+                let TreeNode::Internal(p) = &*pg else {
+                    return None;
+                };
+                Arc::clone(p.child_ref(child_index)?)
+            };
+            let mut g = bin_arc.write();
+            let b = match &mut *g {
+                TreeNode::Bottom(b) => b,
+                _ => return None, // non-BIN; GAP B, not modelled here
+            };
+            // CC-6 cursor re-check + clean early-exit (evictor.rs:1338-1356).
+            if b.cursor_count > 0 {
+                return None; // pinned — put back, no eviction
+            }
+            if !b.dirty && b.dirty_count() == 0 {
+                // clean now: evict without logging, published slot unchanged.
+                let keys: Vec<Vec<u8>> = (0..b.entries.len())
+                    .filter_map(|i| b.get_full_key(i))
+                    .collect();
+                let pub_lsn = b.last_full_lsn;
+                drop(g);
+                return self.shuttle_detach_publish(bin_node_id, keys, pub_lsn);
+            }
+            // "Log" the full BIN: capture keys, then clear dirty + set the new
+            // full LSN (BIN.afterLog).
+            let keys: Vec<Vec<u8>> = (0..b.entries.len())
+                .filter_map(|i| b.get_full_key(i))
+                .collect();
+            b.clear_dirty_after_full_log(logged_lsn);
+            keys
+            // <-- BIN write latch RELEASED here (guard `g` dropped).  WINDOW.
+        };
+
+        // The flush→detach window: on BASE there is NO child latch here, so a
+        // concurrent insert / pin can mutate the BIN before phase 2 runs.
+        in_window();
+
+        // ---- Phase 2: detach_node_by_id (PARENT latch only) ----------------
+        self.shuttle_detach_publish(bin_node_id, captured, logged_lsn)
+    }
+
+    /// Phase 2 of [`shuttle_evict_flush_then_detach`]: the current
+    /// `detach_node_by_id` publication logic, extracted so both the
+    /// clean-early-exit and the logged path share it.  Returns
+    /// `Some((captured, published_lsn))` on detach, `None` on refusal.
+    #[cfg(noxu_shuttle)]
+    fn shuttle_detach_publish(
+        &self,
+        bin_node_id: u64,
+        captured: Vec<Vec<u8>>,
+        logged_lsn: Lsn,
+    ) -> Option<(Vec<Vec<u8>>, Lsn)> {
+        let root = self.get_root()?;
+        let (parent_arc, child_index) =
+            Self::find_parent_of_node_id(&root, bin_node_id)?;
+        let mut parent_guard = parent_arc.write();
+        let TreeNode::Internal(p) = &mut *parent_guard else {
+            return None;
+        };
+        if child_index >= p.entries.len() {
+            return None;
+        }
+        // Child-identity recheck (tree.rs:6510).
+        if p.child_ref(child_index).map(|c| c.read().node_id())
+            != Some(bin_node_id)
+        {
+            return None;
+        }
+        // EVICTOR-LOG-1 never-logged refusal (tree.rs:6529).
+        if let Some(c) = p.child_ref(child_index)
+            && matches!(&*c.read(), TreeNode::Bottom(b) if b.last_full_lsn == NULL_LSN)
+        {
+            return None;
+        }
+        // NOTE (GAP A): the current code does NOT re-check `bin.dirty` or
+        // `bin.cursor_count` here.  It reads the child's `last_full_lsn` and
+        // publishes it, dropping whatever in-memory mutation happened in the
+        // flush→detach window.
+        let child = p.take_child(child_index)?;
+        let child_full_lsn = match &*child.read() {
+            TreeNode::Bottom(b) => b.last_full_lsn,
+            TreeNode::Internal(_) => NULL_LSN,
+        };
+        let published_lsn = p.get_lsn(child_index);
+        if !child_full_lsn.is_transient_or_null()
+            && (published_lsn.is_transient_or_null()
+                || child_full_lsn > published_lsn)
+        {
+            p.set_lsn(child_index, child_full_lsn);
+        }
+        p.dirty = true;
+        let final_lsn = p.get_lsn(child_index);
+        drop(parent_guard);
+        drop(child);
+        self.note_removed(bin_node_id);
+        // Model a refault: the on-disk image at `final_lsn` is exactly what
+        // was captured/logged for it.  For a clean early-exit the caller
+        // passed the already-published keyset (logged_lsn == last_full_lsn),
+        // so `captured` is still the correct refault set.
+        let _ = logged_lsn;
+        Some((captured, final_lsn))
     }
 
     /// Snapshot every full key currently present in the tree together with
