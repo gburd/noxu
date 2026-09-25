@@ -104,8 +104,8 @@ fn get_first_read_committed_never_returns_aborted_inplace_update() {
         let txn = env.begin_transaction(None).unwrap();
         db.put_in(
             &txn,
-            &DatabaseEntry::from_bytes(b"K"),
-            &DatabaseEntry::from_bytes(b"AAAA"),
+            DatabaseEntry::from_bytes(b"K"),
+            DatabaseEntry::from_bytes(b"AAAA"),
         )
         .unwrap();
         txn.commit().unwrap();
@@ -125,8 +125,8 @@ fn get_first_read_committed_never_returns_aborted_inplace_update() {
             // holds the WRITE lock on that new lsn.
             w_db.put_in(
                 &txn,
-                &DatabaseEntry::from_bytes(b"K"),
-                &DatabaseEntry::from_bytes(b"BBBB"),
+                DatabaseEntry::from_bytes(b"K"),
+                DatabaseEntry::from_bytes(b"BBBB"),
             )
             .unwrap();
             // Release the reader only AFTER the uncommitted BBBB is in the
@@ -204,14 +204,14 @@ fn retrieve_next_read_committed_never_returns_aborted_inplace_update() {
         let txn = env.begin_transaction(None).unwrap();
         db.put_in(
             &txn,
-            &DatabaseEntry::from_bytes(b"K1"),
-            &DatabaseEntry::from_bytes(b"aaaa"),
+            DatabaseEntry::from_bytes(b"K1"),
+            DatabaseEntry::from_bytes(b"aaaa"),
         )
         .unwrap();
         db.put_in(
             &txn,
-            &DatabaseEntry::from_bytes(b"K2"),
-            &DatabaseEntry::from_bytes(b"AAAA"),
+            DatabaseEntry::from_bytes(b"K2"),
+            DatabaseEntry::from_bytes(b"AAAA"),
         )
         .unwrap();
         txn.commit().unwrap();
@@ -229,8 +229,8 @@ fn retrieve_next_read_committed_never_returns_aborted_inplace_update() {
             let txn = w_env.begin_transaction(None).unwrap();
             w_db.put_in(
                 &txn,
-                &DatabaseEntry::from_bytes(b"K2"),
-                &DatabaseEntry::from_bytes(b"BBBB"),
+                DatabaseEntry::from_bytes(b"K2"),
+                DatabaseEntry::from_bytes(b"BBBB"),
             )
             .unwrap();
             w_barrier.wait();
@@ -301,8 +301,8 @@ fn get_last_read_committed_never_returns_aborted_inplace_update() {
         let txn = env.begin_transaction(None).unwrap();
         db.put_in(
             &txn,
-            &DatabaseEntry::from_bytes(b"K"),
-            &DatabaseEntry::from_bytes(b"AAAA"),
+            DatabaseEntry::from_bytes(b"K"),
+            DatabaseEntry::from_bytes(b"AAAA"),
         )
         .unwrap();
         txn.commit().unwrap();
@@ -319,8 +319,8 @@ fn get_last_read_committed_never_returns_aborted_inplace_update() {
             let txn = w_env.begin_transaction(None).unwrap();
             w_db.put_in(
                 &txn,
-                &DatabaseEntry::from_bytes(b"K"),
-                &DatabaseEntry::from_bytes(b"BBBB"),
+                DatabaseEntry::from_bytes(b"K"),
+                DatabaseEntry::from_bytes(b"BBBB"),
             )
             .unwrap();
             w_barrier.wait();
@@ -391,14 +391,14 @@ fn search_range_notfound_read_committed_never_returns_aborted_inplace_update() {
         let txn = env.begin_transaction(None).unwrap();
         db.put_in(
             &txn,
-            &DatabaseEntry::from_bytes(b"K1"),
-            &DatabaseEntry::from_bytes(b"aaaa"),
+            DatabaseEntry::from_bytes(b"K1"),
+            DatabaseEntry::from_bytes(b"aaaa"),
         )
         .unwrap();
         db.put_in(
             &txn,
-            &DatabaseEntry::from_bytes(b"K3"),
-            &DatabaseEntry::from_bytes(b"AAAA"),
+            DatabaseEntry::from_bytes(b"K3"),
+            DatabaseEntry::from_bytes(b"AAAA"),
         )
         .unwrap();
         txn.commit().unwrap();
@@ -415,8 +415,8 @@ fn search_range_notfound_read_committed_never_returns_aborted_inplace_update() {
             let txn = w_env.begin_transaction(None).unwrap();
             w_db.put_in(
                 &txn,
-                &DatabaseEntry::from_bytes(b"K3"),
-                &DatabaseEntry::from_bytes(b"BBBB"),
+                DatabaseEntry::from_bytes(b"K3"),
+                DatabaseEntry::from_bytes(b"BBBB"),
             )
             .unwrap();
             w_barrier.wait();
