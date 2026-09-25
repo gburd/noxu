@@ -76,6 +76,9 @@ fn log_and_detach_all_bins(tree: &Tree, lm: &noxu_log::LogManager) {
         if let TreeNode::Bottom(b) = &mut *bin.write() {
             b.clear_dirty_after_full_log(lsn);
         }
+        // Publish the real WAL image, replacing the fixture's synthetic
+        // file-1 insertion LSN (the real log above is still in file 0).
+        Tree::update_parent_slot_lsn(&bin, lsn);
         assert!(tree.detach_node_by_id(id) > 0, "detach bin {id}");
     }
     lm.flush_no_sync().expect("flush");

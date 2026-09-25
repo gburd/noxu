@@ -6447,9 +6447,15 @@ impl Tree {
         if child_index >= p.entries.len() {
             return 0;
         }
+        // The parent lookup released its latch. A split may have moved the
+        // slot before we acquired it again; never publish for another child.
+        if p.child_ref(child_index).map(|c| c.read().node_id()) != Some(node_id)
+        {
+            return 0;
+        }
         // EVICTOR-LOG-1 safety: a BIN may only be detached once it has a
         // durable full-BIN version on disk (`last_full_lsn != NULL`).  The
-        // parent slot LSN is stamped from `last_full_lsn` below and drives the
+        // parent slot LSN (full image or newer delta) drives the
         // re-fetch (`fetch_node_from_log`, which parses the entry as an
         // InLogEntry/BIN).  If we detached a never-logged BIN the slot would
         // keep its prior value -- an *LN* LSN -- and the re-fetch would try to
@@ -6477,22 +6483,21 @@ impl Tree {
         // JE: long evictedBytes = target.getBudgetedMemorySize().
         let freed = child.read().budgeted_memory_size();
 
-        // EV-14 re-fetch correctness: the parent slot LSN must point at the
-        // child's CURRENT on-disk version so `child_at_or_fetch` re-reads the
-        // right bytes (JE `IN.updateEntry(idx, newLsn)` is called whenever a
-        // child is logged; the parent slot LSN tracks the child's LSN).  The
-        // evictor only fully evicts/detaches a CLEAN BIN (it logs+clears dirty
-        // BINs via flush_dirty_node_to_log first, which sets `last_full_lsn`),
-        // so the child's authoritative LSN is its `last_full_lsn`.  Stamp it
-        // into the parent slot before dropping the child; if it is null (the
-        // child was never logged) leave the existing slot LSN intact rather
-        // than writing a null — a never-logged clean child cannot occur on
-        // the evict path, but be conservative.
+        // JE Evictor.evict / IN.detachNode(index, logged, loggedLsn) keeps
+        // the existing slot when evicting a clean child. In particular, a
+        // checkpoint may have published a BINDelta newer than last_full_lsn:
+        // that full LSN is the delta's BASE, not the current image. Our
+        // evictor logs dirty BINs before calling detach, so install its new
+        // full image only if newer than the already-published slot.
         let child_full_lsn = match &*child.read() {
             TreeNode::Bottom(b) => b.last_full_lsn,
             TreeNode::Internal(_) => NULL_LSN,
         };
-        if child_full_lsn != NULL_LSN {
+        let published_lsn = p.get_lsn(child_index);
+        if !child_full_lsn.is_transient_or_null()
+            && (published_lsn.is_transient_or_null()
+                || child_full_lsn > published_lsn)
+        {
             p.set_lsn(child_index, child_full_lsn);
         }
 

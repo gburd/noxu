@@ -87,6 +87,9 @@ fn log_and_detach_all_bins(tree: &Tree, lm: &noxu_log::LogManager) {
                 b.clear_dirty_after_full_log(lsn);
             }
         }
+        // Publish the logged image as production checkpoint logging does;
+        // fixture insert LSNs are synthetic and may sort after this real WAL.
+        Tree::update_parent_slot_lsn(&bin_arc, lsn);
         // Detach the BIN (drops the resident child, stamps parent slot LSN).
         let freed = tree.detach_node_by_id(id);
         assert!(freed > 0, "detach must free bytes for bin {id}");
