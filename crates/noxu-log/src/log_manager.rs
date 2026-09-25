@@ -415,9 +415,9 @@ impl LogManager {
     /// JE catches `Error` as well as `Exception` in serialLog and invalidates
     /// the environment; `parking_lot` mutexes do not poison, so a panicking
     /// observer would otherwise leave the log "valid" for the next writer.
-    /// Called strictly AFTER the last fallible append step (buffered pin
-    /// reserved / oversized pwrite complete), so there is no pin to release
-    /// here on unwind.
+    /// Called strictly AFTER the last step that owns a pin (buffered
+    /// `segment.put` complete / oversized pwrite complete), so there is no pin
+    /// to release here on unwind (Blocker 2).
     fn notify_or_invalidate(&self, req: &SlotRequest, current_lsn: Lsn) {
         let result =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -837,12 +837,24 @@ impl LogManager {
             immediately_obsolete,
         };
         // A-prime: assignment, prev_offset/CRC finalisation, the oversized
-        // direct write, and the observer notification all happen UNDER the LWL,
-        // one entry at a time in strict LSN/arrival order (JE serialLog +
-        // serialLogWork: validity check, oversized writeLogBuffer, and tracker
-        // calls all inside logWriteMutex).  Only the pin-protected buffered
-        // `segment.put` runs after the LWL is released.
-        let (lsn, placement) = {
+        // direct write, the buffered `segment.put`, and the observer
+        // notification all happen UNDER the LWL, one entry at a time in strict
+        // LSN/arrival order (JE serialLog + serialLogWork: validity check,
+        // oversized writeLogBuffer, buffered slot copy, and tracker calls all
+        // inside logWriteMutex).
+        //
+        // Blocker 2: `segment.put` runs BEFORE the observer notification so a
+        // panicking observer cannot leak the buffered pin.  `LogBufferSegment`
+        // has no Drop; the pin is released only by `put`.  If we notified
+        // first (with the pin still reserved) and the observer panicked,
+        // catch_unwind -> invalidate -> resume_unwind would drop the segment
+        // WITHOUT `put`, leaking the pin forever (a drainer waiting on the pin
+        // would hang).  `put` is a memcpy into the reserved sub-range plus a
+        // pin decrement; it takes only the buffer's raw read latch (never the
+        // LWL, pool, or buffer mutex), so completing it under the LWL cannot
+        // deadlock: a concurrent drainer waits on the LWL we hold, not on our
+        // pin.
+        let lsn = {
             let _lwl_guard = self.log_write_latch.lock();
 
             // Recheck validity under the LWL (admission gate): a concurrent
@@ -903,25 +915,24 @@ impl LogManager {
                     // is no pin to clean up because the direct write owns no
                     // buffer segment.
                     self.notify_or_invalidate(&slot_req, lsn);
-                    (lsn, None)
+                    lsn
                 }
                 SlotPlacement::Buffered(segment) => {
-                    // The pin is reserved (register_lsn); its infallible
-                    // `segment.put` below will complete unconditionally after
-                    // the LWL is released.  Notify exactly once, in original
-                    // order, while the pin is held — no fallible append step
-                    // remains, so a panicking observer leaves the pin owned by
-                    // `segment` (dropped normally on unwind).
+                    // Complete the infallible `segment.put` FIRST (memcpy into
+                    // the reserved sub-range + pin decrement), while still under
+                    // the LWL, so the pin is released before any code that can
+                    // panic runs.  Then notify exactly once, in original order,
+                    // with NO pin outstanding: a panicking observer
+                    // (catch_unwind -> invalidate -> resume_unwind) has nothing
+                    // to leak.  A panic AFTER `put` still invalidates cleanly.
+                    segment.put(&entry_buf);
                     self.notify_or_invalidate(&slot_req, lsn);
-                    (lsn, Some(segment))
+                    lsn
                 }
             }
         };
-        // Serialisation point released here.  Only the pin-protected buffered
-        // copy remains (JE LogBufferSegment.put outside logWriteMutex).
-        if let Some(segment) = placement {
-            segment.put(&entry_buf);
-        }
+        // Serialisation point released here.  The buffered copy already
+        // completed under the LWL (Blocker 2); nothing pin-protected remains.
 
         // Flush / fsync if requested, outside the LWL (correct).
         // Use flush_sync_if_needed(lsn) rather than flush_sync() so that a
