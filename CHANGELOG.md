@@ -131,6 +131,14 @@ listed in [References](#references).
   multi-level tree. (The fanout is still taken from the config supplied at open,
   as with comparators; persisting it on disk for a default-config reopen is a
   separately tracked enhancement.)
+- **Cursor delete-all now works across BIN boundaries in both directions.** A
+  `Get::Next` (or `Get::Prev`) delete loop deleted only the first BIN's keys and
+  silently left the rest — forward deleted 2 of 12, reverse 4 of 12 — because
+  deleting the current record cleared the cursor's anchor, so the next cross-BIN
+  advance found nothing. The cursor now retains the deleted key as a cross-BIN
+  anchor (matching JE, which keeps a deleted slot as a positioning anchor), so a
+  delete-all loop empties the whole database in either direction, including
+  sorted-duplicate databases.
 - **Eviction no longer detaches a BIN that was re-dirtied or pinned since its
   flush.** The evictor logged a dirty BIN under the child latch, released it,
   then detached under the parent latch — a window in which a cursor could
