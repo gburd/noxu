@@ -5,7 +5,11 @@ use noxu_log::{FileManager, LogEntryType, LogManager, Provisional};
 use noxu_sync::Mutex;
 use std::sync::Arc;
 
-fn prepare_does_not_block_progress(include_prepare: bool, budget: u32) {
+fn prepare_does_not_block_progress(
+    include_prepare: bool,
+    budget: u32,
+    fault: Option<&str>,
+) {
     let dir = tempfile::tempdir().unwrap();
     let fm = Arc::new(FileManager::new(dir.path(), false, 4096, 100).unwrap());
     let tracker = Arc::new(Mutex::new(UtilizationTracker::new(true)));
@@ -33,8 +37,7 @@ fn prepare_does_not_block_progress(include_prepare: bool, budget: u32) {
     );
     let mut buf = bytes::BytesMut::new();
     commit.write_to_log(&mut buf);
-    lm.log(LogEntryType::TxnCommit, &buf, Provisional::No, true, true)
-        .unwrap();
+    lm.log(LogEntryType::TxnCommit, &buf, Provisional::No, true, true).unwrap();
     for _ in 0..2 {
         fm.flip_file().unwrap();
         // A fresh pool prevents an old buffer from writing into the prior file.
@@ -61,12 +64,44 @@ fn prepare_does_not_block_progress(include_prepare: bool, budget: u32) {
     )
     .with_utilization_tracker(Arc::clone(&tracker));
     cleaner.add_file_to_clean(0);
+    assert_eq!(cleaner.do_clean(0, true).unwrap().files_cleaned, 0);
+    if let Some(fault) = fault {
+        let path = dir.path().join("00000001.ndb");
+        let mut bytes = std::fs::read(&path).unwrap();
+        if fault == "crc" {
+            *bytes.last_mut().unwrap() ^= 1;
+            std::fs::write(&path, &bytes).unwrap();
+        } else {
+            std::fs::remove_file(&path).unwrap();
+        }
+        fm.clear_cache();
+        let error = cleaner.do_clean(budget, true).unwrap_err();
+        eprintln!("fatal after Prepare ({fault}): {error}");
+        assert!(!error.contains("unsupported"), "fatal error must win");
+        assert_eq!(cleaner.get_file_selector_stats().to_be_cleaned, 2);
+        assert_eq!(cleaner.get_file_selector_stats().being_cleaned, 0);
+        assert_eq!(cleaner.get_stats().snapshot().entries_read, 0);
+        for _ in 0..2 {
+            let state = cleaner.get_checkpoint_start_state();
+            cleaner.after_checkpoint(&state);
+        }
+        assert_eq!(cleaner.delete_safe_files(), 0);
+        assert_eq!(std::fs::read(&retained_path).unwrap(), retained_bytes);
+        assert_eq!(std::fs::read(&active_path).unwrap(), active_bytes);
+        if fault == "crc" {
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+        return;
+    }
     let mut deleted = 0;
     for pass in 0..3 {
         let result = cleaner.do_clean(budget, true);
-        eprintln!("prepare={include_prepare}, budget={budget}, pass={pass}: {result:?}");
+        eprintln!(
+            "prepare={include_prepare}, budget={budget}, pass={pass}: {result:?}"
+        );
         if include_prepare {
-            let error = result.expect_err("unsupported Prepare must remain visible");
+            let error =
+                result.expect_err("unsupported Prepare must remain visible");
             assert!(error.contains("unsupported Prepare"), "{error}");
             let selector = cleaner.get_file_selector_stats();
             assert_eq!(selector.to_be_cleaned, 1, "retry remains visible");
@@ -105,16 +140,23 @@ fn prepare_does_not_block_progress(include_prepare: bool, budget: u32) {
 
 #[test]
 fn resolved_prepare_retained_without_starving_supported_file() {
-    prepare_does_not_block_progress(true, 20);
+    prepare_does_not_block_progress(true, 20, None);
 }
 
 #[test]
 fn resolved_prepare_does_not_starve_one_file_passes() {
-    prepare_does_not_block_progress(true, 1);
+    prepare_does_not_block_progress(true, 1, None);
 }
 
 #[test]
 fn trace_substitution_reclaims_the_same_candidate() {
-    prepare_does_not_block_progress(false, 20);
-    prepare_does_not_block_progress(false, 1);
+    prepare_does_not_block_progress(false, 20, None);
+    prepare_does_not_block_progress(false, 1, None);
+}
+
+#[test]
+fn fatal_error_after_prepare_restores_both_files_for_retry() {
+    for fault in ["crc", "missing"] {
+        prepare_does_not_block_progress(true, 1, Some(fault));
+    }
 }
