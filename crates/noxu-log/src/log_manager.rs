@@ -554,6 +554,17 @@ impl LogManager {
         self.io_invalid.load(Ordering::Acquire)
     }
 
+    /// Test-support: total outstanding write-pin count across all buffers.
+    ///
+    /// A buffered append reserves a pin in `allocate` that is released only by
+    /// `LogBufferSegment::put`.  This lets a test assert that a panicking
+    /// observer on the buffered path does not leak the pin (Blocker 2).
+    #[doc(hidden)]
+    pub fn outstanding_write_pins(&self) -> u32 {
+        let buffers = self.buffer_pool.lock().get_all_buffers();
+        buffers.iter().map(|b| b.lock().write_pin_count()).sum()
+    }
+
     /// Publishes permanent log invalidity (A-prime fail-stop).
     ///
     /// Sets the shared `io_invalid` atomic with Release ordering so that

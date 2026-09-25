@@ -415,6 +415,16 @@ impl LogBuffer {
         }
     }
 
+    /// Test-support: current outstanding write-pin count for this buffer.
+    ///
+    /// A reserved-but-unwritten pin (e.g. a leaked one after a panicking
+    /// observer skips `LogBufferSegment::put`) shows up here as a nonzero
+    /// count (Blocker 2 regression).
+    #[doc(hidden)]
+    pub fn write_pin_count(&self) -> u32 {
+        self.control.write_pin_count.load(Ordering::Acquire)
+    }
+
     /// Acquires the buffer latched and with the buffer pin count equal to zero.
     pub fn wait_for_zero_and_latch(&self) {
         loop {

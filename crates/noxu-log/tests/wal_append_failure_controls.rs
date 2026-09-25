@@ -283,3 +283,74 @@ fn partial_write_error_requires_fail_stop_or_complete_rollback() {
         "partial append remains on disk and LSN is advanced: continuing is unsafe without rollback"
     );
 }
+
+// Blocker 2 (pin leak on observer panic): the buffered append path reserves a
+// pin in `allocate` that is released only by `LogBufferSegment::put`.
+// `LogBufferSegment` has NO Drop, so if the observer notification panics BEFORE
+// `put` runs, catch_unwind -> invalidate -> resume_unwind drops the segment
+// without `put`, leaking the pin forever (a would-be drainer waiting on the pin
+// would hang).
+//
+// JE calls the tracker BEFORE reserving a buffer slot, so a JE tracker throw has
+// no pin to leak. Noxu correctly DEFERS the tracker to after acceptance (the
+// accounting fix), which creates a live pin at notify time JE never has. The
+// fix therefore completes `segment.put` BEFORE notifying, so a panicking
+// observer leaves no pin.
+//
+// This control installs an observer that panics on the buffered success path,
+// appends inside catch_unwind, and asserts (a) the env is invalidated and (b)
+// no write pin is leaked.
+struct PanicObserver;
+impl noxu_log::LogWriteObserver for PanicObserver {
+    fn count_new_entry(
+        &self,
+        _file_num: u32,
+        _offset: u32,
+        _entry_size: u32,
+        _is_ln: bool,
+        _is_in: bool,
+        _db_id: Option<u32>,
+    ) {
+        panic!("observer panic on buffered append (Blocker 2 control)");
+    }
+    fn count_obsolete(&self, _obsolete: noxu_log::ObsoleteLsn) {}
+}
+
+#[test]
+fn buffered_observer_panic_must_not_leak_a_pin() {
+    let dir = tempfile::tempdir().unwrap();
+    let fm =
+        Arc::new(FileManager::new(dir.path(), false, 1_000_000, 100).unwrap());
+    // Buffer size 256 -> a small payload is a BUFFERED append (has a pin),
+    // not an oversized direct write (no segment/pin).
+    let mut lm_owned = LogManager::new(fm, 3, 256, 4096);
+    lm_owned.set_write_observer(Arc::new(PanicObserver));
+    let lm = Arc::new(lm_owned);
+
+    let lm_c = Arc::clone(&lm);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        lm_c.log(
+            LogEntryType::Trace,
+            b"buffered",
+            Provisional::No,
+            false,
+            false,
+        )
+    }));
+    // The observer panic must propagate (JE catch-and-invalidate re-raises).
+    assert!(result.is_err(), "buffered observer panic must propagate");
+
+    // The log must be permanently invalidated (JE catches Error and invalidates).
+    assert!(
+        lm.is_io_invalid(),
+        "observer panic must invalidate the log (fail-stop)"
+    );
+
+    // The reserved pin must be released even though `put` never ran normally:
+    // a leaked pin would hang any drainer that waits on the pin count.
+    assert_eq!(
+        lm.outstanding_write_pins(),
+        0,
+        "buffered observer panic leaked a write pin (drainers would hang)"
+    );
+}
