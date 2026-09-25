@@ -153,9 +153,10 @@ pub struct Environment {
     stats_dumper: Mutex<Option<crate::stats_file::StatsFileDumper>>,
 
     /// Background B-tree verifier daemon (`VERIFY_SCHEDULE` /
-    /// `ENV_RUN_VERIFIER`).  `Some` only when `run_verifier` is true AND a
-    /// non-empty, well-formed `verify_schedule` was supplied; `None`
-    /// otherwise (the default — no daemon, unchanged behaviour).  Stopped
+    /// `ENV_RUN_VERIFIER`).  `Some` when `run_verifier` is true AND a
+    /// non-empty, well-formed `verify_schedule` was supplied — now the
+    /// default (both flags default ON to match JE), so a daemon runs unless
+    /// the operator opts out; `None` otherwise.  Stopped
     /// (joined) at `close`.
     verify_daemon: Mutex<Option<crate::verify_daemon::VerifyDaemon>>,
 }
@@ -534,8 +535,8 @@ impl Environment {
         // STATS_FILE_*: start the periodic stats-file dumper (JE StatCapture)
         // when stats collection is enabled.  The dumper samples the same
         // snapshot `stats()` returns and appends a rotating CSV to
-        // `stats_file_directory` (default: the env home).  Off by default
-        // (stats_collect = false).
+        // `stats_file_directory` (default: the env home).  On by default
+        // (stats_collect = true, matching JE STATS_COLLECT).
         let stats_dumper = if config.stats_collect {
             let dir = config
                 .stats_file_directory
@@ -558,10 +559,11 @@ impl Environment {
         };
 
         // VERIFY_SCHEDULE / ENV_RUN_VERIFIER: start the background B-tree
-        // verifier daemon ONLY when the operator explicitly enabled it
-        // (run_verifier = true, default false) AND supplied a non-empty,
-        // well-formed cron schedule.  The default (run_verifier = false)
-        // spawns nothing, so behaviour is unchanged.  The daemon re-uses the
+        // verifier daemon when `run_verifier` is true (now the default, matching
+        // JE ENV_RUN_VERIFIER) AND a non-empty, well-formed cron schedule was
+        // supplied (the default `verify_schedule` is "0 0 * * *", also matching
+        // JE, so the daemon runs by default).  Setting `run_verifier = false`
+        // or clearing `verify_schedule` spawns nothing.  The daemon re-uses the
         // same public verification walk `Environment::verify` runs (it does
         // NOT touch verify's internals) on the shared EnvironmentImpl.  It is
         // env-owned (not registered with the engine DaemonManager) so it
