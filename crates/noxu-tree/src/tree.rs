@@ -5612,6 +5612,50 @@ impl Tree {
         }
     }
 
+    /// Find a DIRTY, non-root upper IN (level >= 2, `TreeNode::Internal`) whose
+    /// grandparent slot exists, returning `(upper_in_id, grandparent_slot_lsn,
+    /// has_resident_children)`.  Used by the GAP B gate: a dirty upper IN whose
+    /// grandparent slot LSN predates its in-memory structural change is a
+    /// candidate for the lose-on-evict bug.
+    #[cfg(noxu_shuttle)]
+    pub fn shuttle_find_dirty_upper_in(&self) -> Option<(u64, Lsn, bool)> {
+        let root = self.get_root()?;
+        // Walk from the root; for each Internal child that is an Internal node
+        // and dirty, return it with the parent's published slot LSN.
+        fn walk(
+            node: &Arc<RwLock<TreeNode>>,
+        ) -> Option<(u64, Lsn, bool)> {
+            let g = node.read();
+            let TreeNode::Internal(p) = &*g else {
+                return None;
+            };
+            for i in 0..p.entries.len() {
+                if let Some(child) = p.child_ref(i) {
+                    let cg = child.read();
+                    if let TreeNode::Internal(cn) = &*cg {
+                        if cn.dirty {
+                            let has_children =
+                                !cn.resident_children().is_empty();
+                            return Some((
+                                cn.node_id,
+                                p.get_lsn(i),
+                                has_children,
+                            ));
+                        }
+                        // Recurse deeper.
+                        let child_clone = Arc::clone(child);
+                        drop(cg);
+                        if let Some(r) = walk(&child_clone) {
+                            return Some(r);
+                        }
+                    }
+                }
+            }
+            None
+        }
+        walk(&root)
+    }
+
     /// Drive `split_child(parent, child_index)` with default (no-comparator,
     /// no-prefix, no-listener) parameters — the same call the insert path
     /// makes after it has dropped the parent read lock (the drop→reacquire
@@ -5896,6 +5940,100 @@ impl Tree {
         // so `captured` is still the correct refault set.
         let _ = logged_lsn;
         Some((captured, final_lsn))
+    }
+
+    /// GAP B model: reproduce the evictor's handling of a DIRTY UPPER IN.
+    ///
+    /// The evictor's Evict path for a non-BIN dirty node calls
+    /// `flush_dirty_node_to_log` (evictor.rs:1043), which for a
+    /// `TreeNode::Internal` returns `true` WITHOUT logging anything
+    /// (evictor.rs ~1348-1350).  It then runs `detach_node_by_id`, which for
+    /// an Internal child forces `child_full_lsn = NULL_LSN` (tree.rs:6552) and
+    /// so KEEPS the parent's existing published slot LSN (the pre-change
+    /// image), then drops the resident upper IN.
+    ///
+    /// This models exactly that: it does NOT log the target upper IN, then
+    /// detaches it, and returns the LSN the grandparent slot ends up pointing
+    /// at (the image a refault would read).  The GAP B invariant is:
+    ///
+    /// ```text
+    /// dirty(upper_in)  =>  detach refused  OR  a fresh image was published
+    /// ```
+    ///
+    /// On BASE this returns `Some(old_lsn)` for a dirty upper IN whose
+    /// in-memory structural state (e.g. a post-split new child slot) is newer
+    /// than `old_lsn` — the change is lost on refault.  A fix must either
+    /// LOG the dirty upper IN first (JE `Evictor.evict` logs any dirty target
+    /// before detach, Evictor.java:3013-3035) or REFUSE to detach it.
+    ///
+    /// Returns `Some((published_lsn, was_dirty))` on detach, `None` on refusal.
+    #[cfg(noxu_shuttle)]
+    pub fn shuttle_evict_dirty_upper_in(
+        &self,
+        upper_in_node_id: u64,
+    ) -> Option<(Lsn, bool)> {
+        // ---- Phase 1: flush_dirty_node_to_log for a non-BIN --------------
+        // The evictor's flush hits `_ => return true` for a TreeNode::Internal
+        // WITHOUT logging.  We reproduce that no-op: capture whether it was
+        // dirty, then do NOT log / clear it.
+        let was_dirty = {
+            let root = self.get_root()?;
+            let (parent_arc, idx) =
+                Self::find_parent_of_node_id(&root, upper_in_node_id)?;
+            let target_arc = {
+                let pg = parent_arc.read();
+                let TreeNode::Internal(p) = &*pg else {
+                    return None;
+                };
+                Arc::clone(p.child_ref(idx)?)
+            };
+            let g = target_arc.read();
+            match &*g {
+                TreeNode::Internal(n) => n.dirty,
+                // Not an upper IN; wrong model.
+                TreeNode::Bottom(_) => return None,
+            }
+            // flush returns true WITHOUT logging: dirty flag stays set, no
+            // new image is written.
+        };
+
+        // ---- Phase 2: detach_node_by_id for the (still-dirty) upper IN ----
+        let (grandparent_arc, gp_index) =
+            Self::find_parent_of_node_id(&self.get_root()?, upper_in_node_id)?;
+        let mut gp_guard = grandparent_arc.write();
+        let TreeNode::Internal(gp) = &mut *gp_guard else {
+            return None;
+        };
+        if gp_index >= gp.entries.len() {
+            return None;
+        }
+        if gp.child_ref(gp_index).map(|c| c.read().node_id())
+            != Some(upper_in_node_id)
+        {
+            return None;
+        }
+        // Never-logged refusal is BIN-only (tree.rs:6529), so an Internal
+        // child is NOT refused here.  Take it.
+        let child = gp.take_child(gp_index)?;
+        // For an Internal child, detach forces child_full_lsn = NULL_LSN and
+        // therefore keeps the grandparent's existing published slot LSN.
+        let child_full_lsn = match &*child.read() {
+            TreeNode::Bottom(b) => b.last_full_lsn,
+            TreeNode::Internal(_) => NULL_LSN,
+        };
+        let published_lsn = gp.get_lsn(gp_index);
+        if !child_full_lsn.is_transient_or_null()
+            && (published_lsn.is_transient_or_null()
+                || child_full_lsn > published_lsn)
+        {
+            gp.set_lsn(gp_index, child_full_lsn);
+        }
+        gp.dirty = true;
+        let final_lsn = gp.get_lsn(gp_index);
+        drop(gp_guard);
+        drop(child);
+        self.note_removed(upper_in_node_id);
+        Some((final_lsn, was_dirty))
     }
 
     /// Snapshot every full key currently present in the tree together with

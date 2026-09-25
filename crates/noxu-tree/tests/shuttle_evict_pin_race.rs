@@ -257,6 +257,83 @@ fn forced_window_insert_is_not_lost() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// GAP B: dirty upper IN evicted/detached without being logged.
+// ---------------------------------------------------------------------------
+
+/// Build a tree tall enough to have a non-root dirty upper IN (level >= 2).
+/// Inserting enough keys forces BIN splits, which fill and split level-2 INs,
+/// which grows the root and dirties the intermediate upper INs.
+fn build_tall_dirty_tree() -> Tree {
+    let tree = Tree::new(DB_ID, 4); // small fanout → splits quickly
+    for i in 0..200u32 {
+        tree.insert(
+            format!("k{i:05}").into_bytes(),
+            vec![(i & 0xff) as u8],
+            Lsn::new(1, i),
+        )
+        .expect("insert during setup");
+    }
+    tree
+}
+
+/// THE GAP B GATE: a DIRTY upper IN must never be detached with a stale
+/// (un-refreshed) grandparent slot LSN. The evictor's `flush_dirty_node_to_log`
+/// returns `true` for a non-BIN WITHOUT logging it, and `detach_node_by_id`
+/// keeps the existing slot LSN for an Internal child. So on BASE a dirty upper
+/// IN is dropped while its grandparent slot still points at the pre-change
+/// on-disk image — structural updates (a post-split new child slot) are lost
+/// on refault.
+///
+/// Invariant: `was_dirty` => (detach refused) OR (a fresh image published,
+/// i.e. the grandparent slot LSN advanced to reflect the current structure).
+///
+/// JE `Evictor.evict` logs ANY dirty target before `parent.detachNode(...)`
+/// (Evictor.java:3013-3035), so JE never detaches a dirty upper IN with a
+/// stale slot LSN.
+#[test]
+fn dirty_upper_in_not_detached_without_logging() {
+    shuttle::check_dfs(
+        || {
+            let tree = Arc::new(build_tall_dirty_tree());
+            let Some((upper_id, gp_lsn_before, _has_children)) =
+                tree.shuttle_find_dirty_upper_in()
+            else {
+                // No dirty upper IN in this build — vacuously fine, but the
+                // small-fanout tall tree above should always produce one.
+                return;
+            };
+
+            let result = tree.shuttle_evict_dirty_upper_in(upper_id);
+
+            match result {
+                // Detach refused (the fix's behaviour): dirty upper IN kept
+                // resident until the checkpointer logs it. Safe.
+                None => {}
+                Some((gp_lsn_after, was_dirty)) => {
+                    if was_dirty {
+                        // BASE bug: a dirty upper IN was detached, and because
+                        // flush did not log it and detach keeps the Internal
+                        // child's slot LSN, the grandparent slot LSN did NOT
+                        // advance to a fresh image. The in-memory structural
+                        // change is unrecoverable on refault.
+                        assert_ne!(
+                            gp_lsn_after, gp_lsn_before,
+                            "GAP B: dirty upper IN {} was detached without \
+                             being logged — grandparent slot LSN unchanged \
+                             ({:?}); the upper IN's in-memory structural \
+                             state (post-split child slot) is lost on refault. \
+                             JE logs any dirty target before detach.",
+                            upper_id, gp_lsn_before
+                        );
+                    }
+                }
+            }
+        },
+        None,
+    );
+}
+
 /// GAP A pin variant: a cursor pins the BIN in the flush→detach window. Phase 2
 /// must not detach a pinned BIN. Models the pin by bumping `cursor_count` on
 /// the target BIN concurrently with the eviction.
