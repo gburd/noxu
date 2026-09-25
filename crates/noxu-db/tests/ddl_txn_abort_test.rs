@@ -27,9 +27,7 @@ fn open_env(dir: &TempDir, allow_create: bool) -> Environment {
 }
 
 fn db_cfg() -> DatabaseConfig {
-    DatabaseConfig::new()
-        .with_allow_create(true)
-        .with_transactional(true)
+    DatabaseConfig::new().with_allow_create(true).with_transactional(true)
 }
 
 /// Create a database `name`, put `key`/`val`, and close the handle so DDL is
