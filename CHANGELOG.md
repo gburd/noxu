@@ -92,6 +92,22 @@ listed in [References](#references).
   `with_backup_interval_ms` are removed; use `Environment::start_backup()` (see
   `docs/src/operations/backup.md`). No built-in copy engine or scheduled daemon
   (also true of JE).
+- **Config defaults reconciled to JE; safety features now ON by default.** Eight
+  boolean parameters had an effective default (`EnvironmentConfig`) that
+  contradicted both JE and Noxu's own declared default (`noxu-config`). The
+  background verifier (`env.runVerifier` + the `"0 0 * * *"` `verifySchedule`),
+  B-tree and log verification (`env.verifyBtree`/`verifyLog`), and stats
+  collection (`stats.collect`) were silently OFF and are now ON by default,
+  matching JE — so corruption and structural checks run without opting in.
+  `log.detectFileDelete`, `env.runOffHeapEvictor`, `log.useWriteQueue` (not wired
+  in Noxu) and the JE-deprecated `evictor.lruOnly` remain off as a documented
+  divergence, and the three unwired flags are now registered so setting them
+  warns. A new exhaustive parity test asserts every boolean parameter's declared
+  and effective default agree (or is explicitly classified), preventing future
+  drift. Also fixes a latent shutdown cascade: `Environment` drop now stops the
+  verifier/stats daemons unconditionally, so a reopen after drop no longer fails
+  with a stale file lock. **Migration:** verification and stats collection are on
+  by default now; disable via `EnvironmentConfig` if undesired.
 
 ## [7.10.1] - 2026-09-12
 
