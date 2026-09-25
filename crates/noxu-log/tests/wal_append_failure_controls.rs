@@ -170,8 +170,14 @@ fn no_sync_drain_must_not_let_sync_publish_a_false_durable_watermark() {
     let eof_base = std::fs::metadata(&path).unwrap().len();
     // A small buffered record: flush=false, fsync=false -> lives in the write
     // buffer, its bytes are NOT on disk yet.
-    lm.log(LogEntryType::Trace, b"buffered-nosync", Provisional::No, false, false)
-        .unwrap();
+    lm.log(
+        LogEntryType::Trace,
+        b"buffered-nosync",
+        Provisional::No,
+        false,
+        false,
+    )
+    .unwrap();
     // The next LSN marks the exclusive end of the buffered range.
     let eol_before = lm.file_manager().get_next_available_lsn();
     assert_eq!(eol_before.file_number(), file_num);
@@ -196,7 +202,8 @@ fn no_sync_drain_must_not_let_sync_publish_a_false_durable_watermark() {
     // bytes. On the fixed code it BLOCKS on the LWL held by thread N.
     let (tx, rx) = std::sync::mpsc::channel();
     let sync_lm = Arc::clone(&lm);
-    let sync = std::thread::spawn(move || tx.send(sync_lm.flush_sync()).unwrap());
+    let sync =
+        std::thread::spawn(move || tx.send(sync_lm.flush_sync()).unwrap());
 
     // Observe an EARLY sync completion (the bug) before releasing the latch.
     let early = rx.recv_timeout(Duration::from_millis(400)).ok();
