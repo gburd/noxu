@@ -1203,6 +1203,130 @@ fn delta_test_compress_recovers_surviving_set() {
     );
 }
 
+/// A physical delete must invalidate the full-image base for subsequent
+/// deltas. Sparse updates after deletion used to log only the surviving
+/// changed slots, resurrecting deleted keys when merged with the old full BIN.
+/// The child exits without destructors in crash modes: close cannot repair it.
+#[test]
+fn delta_physical_deletes_survive_recovery() {
+    const CHILD_MODE: &str = "NOXU_DELTA_DELETE_CHILD";
+    const CHILD_HOME: &str = "NOXU_DELTA_DELETE_HOME";
+    const N: u32 = 800;
+    let key = |i: u32| format!("physical_{i:05}").into_bytes();
+    let value = |i: u32| format!("value_{i:05}").into_bytes();
+    let checkpoint = |env: &noxu_db::Environment| {
+        env.checkpoint(Some(&CheckpointConfig::new().with_force(true)))
+            .unwrap();
+    };
+
+    if let Ok(mode) = std::env::var(CHILD_MODE) {
+        let home = std::env::var_os(CHILD_HOME).unwrap();
+        let env = open_env_delta(Path::new(&home));
+        let db = open_db(&env);
+        let txn = env.begin_transaction(None).unwrap();
+        for i in 0..N {
+            db.put_in(
+                &txn,
+                DatabaseEntry::from_bytes(&key(i)),
+                DatabaseEntry::from_bytes(&value(i)),
+            )
+            .unwrap();
+        }
+        txn.commit().unwrap();
+        checkpoint(&env); // full-image bases
+
+        // Prove the actual checkpoint delta path is enabled and exercised.
+        db.put(
+            DatabaseEntry::from_bytes(&key(1)),
+            DatabaseEntry::from_bytes(b"first delta"),
+        )
+        .unwrap();
+        let before = delta_in_flush(&env);
+        checkpoint(&env);
+        assert!(delta_in_flush(&env) > before, "delta path not activated");
+        eprintln!(
+            "{mode}: pre-delete deltas={}",
+            delta_in_flush(&env) - before
+        );
+
+        let txn = env.begin_transaction(None).unwrap();
+        for i in (0..N).step_by(2) {
+            assert!(
+                db.delete_in(&txn, DatabaseEntry::from_bytes(&key(i))).unwrap()
+            );
+        }
+        // Without invalidating delta eligibility, these sparse updates cause
+        // partial images that cannot express the physical removals.
+        for i in (1..N).step_by(40) {
+            db.put_in(
+                &txn,
+                DatabaseEntry::from_bytes(&key(i)),
+                DatabaseEntry::from_bytes(b"after delete"),
+            )
+            .unwrap();
+        }
+        txn.commit().unwrap();
+        assert_eq!(collect_all(&db).len(), 400);
+        if mode != "commit-crash" {
+            let before = delta_in_flush(&env);
+            checkpoint(&env);
+            eprintln!(
+                "{mode}: delete-checkpoint deltas={}",
+                delta_in_flush(&env) - before
+            );
+        }
+        if mode == "close" {
+            db.close().unwrap();
+            env.close().unwrap();
+        }
+        std::process::exit(73);
+    }
+
+    for mode in ["close", "checkpoint-crash", "commit-crash"] {
+        let dir = TempDir::new().unwrap();
+        let status =
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "delta_physical_deletes_survive_recovery",
+                    "--nocapture",
+                ])
+                .env(CHILD_MODE, mode)
+                .env(CHILD_HOME, dir.path())
+                .status()
+                .unwrap();
+        assert_eq!(status.code(), Some(73), "child failed: {mode}");
+        let env = open_env_delta(dir.path());
+        let db = open_db(&env);
+        let recovered = collect_all(&db);
+        let resurrected = (0..N)
+            .step_by(2)
+            .filter(|i| recovered.contains_key(&key(*i)))
+            .count();
+        eprintln!(
+            "{mode}: resurrected={resurrected}/400, recovered={}",
+            recovered.len()
+        );
+        assert_eq!(resurrected, 0, "deleted keys resurrected: {mode}");
+        let expected: BTreeMap<_, _> = (1..N)
+            .step_by(2)
+            .map(|i| {
+                (
+                    key(i),
+                    if i % 40 == 1 {
+                        b"after delete".to_vec()
+                    } else {
+                        value(i)
+                    },
+                )
+            })
+            .collect();
+        assert_eq!(recovered, expected, "exact recovered values: {mode}");
+        db.close().unwrap();
+        env.close().unwrap();
+    }
+}
+
 /// JE `RecoveryDeltaTest.testKnownDeleted`.
 ///
 /// Reconstituting a BIN-delta must handle the known-deleted flag correctly.
