@@ -121,6 +121,16 @@ listed in [References](#references).
   the operation was issued and no-ops if the name maps to a different id (JE
   binds the deferred delete to the `DatabaseImpl`), so concurrent same-name DDL
   no longer corrupts — it no-ops.
+- **A database's configured `NODE_MAX_ENTRIES` (fanout) now survives reopen.**
+  Recovery hardcoded a fanout of 256 and applied it to every reconstructed tree,
+  so a database opened with a different node size silently came back at 256 after
+  a restart — wrong tree structure and split behavior. Recovery now applies the
+  fanout the reopened `DatabaseImpl` already carries (with an environment-level
+  `NODE_MAX_ENTRIES` fallback, matching JE). This also un-vacuumed the
+  split-recovery test, which had been passing without ever building a
+  multi-level tree. (The fanout is still taken from the config supplied at open,
+  as with comparators; persisting it on disk for a default-config reopen is a
+  separately tracked enhancement.)
 - **Eviction no longer detaches a BIN that was re-dirtied or pinned since its
   flush.** The evictor logged a dirty BIN under the child latch, released it,
   then detached under the parent latch — a window in which a cursor could
