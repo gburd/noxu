@@ -80,6 +80,7 @@ let s = env.get_stats()?;
 | Field | Alert condition | Action |
 |-------|----------------|--------|
 | `s.cache_utilization_percent()` | > 90% | Increase `cache_size` or reduce working set |
+| `1.0 - s.bin_fetch_miss_ratio()` (cache hit ratio) | Trending down / < ~0.9 under steady load | BIN cache misses are climbing — the cache is undersized for the working set; increase `cache_size`. (This gauge is now backed by real BIN fetch/miss counters; before it was fabricated as a constant 1.0.) |
 | `s.lock.n_waits / s.lock.n_requests` | > 5% | High lock contention; check key distribution or transaction sizes |
 | `s.cleaner.runs == 0` after writes | No cleaner activity | Verify cleaner is not disabled; check utilization threshold |
 | `s.cleaner.deletions` plateauing | Cleaner not keeping up | Reduce writer rate or lower `cleaner_min_utilization` |

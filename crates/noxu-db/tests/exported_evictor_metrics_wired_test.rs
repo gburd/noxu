@@ -78,7 +78,10 @@ fn every_exported_evictor_metric_has_a_real_writer() {
         ("noxu_evictor_nodes_evicted_total (nodes_evicted)", e.nodes_evicted),
         ("noxu_evictor_bytes_evicted_total (bytes_evicted)", e.bytes_evicted),
         ("noxu_evictor_bin_fetch_total (bin_fetch)", e.bin_fetch),
-        ("noxu_evictor_bin_fetch_miss_total (bin_fetch_miss)", e.bin_fetch_miss),
+        (
+            "noxu_evictor_bin_fetch_miss_total (bin_fetch_miss)",
+            e.bin_fetch_miss,
+        ),
     ];
     for (metric, value) in checks {
         assert!(
@@ -108,4 +111,3 @@ fn every_exported_evictor_metric_has_a_real_writer() {
     drop(db);
     env.close().unwrap();
 }
-
