@@ -20,14 +20,25 @@ store suffix only. `recompute_key_prefix()` rebuilds on deserialization.
 **BIN-delta**: Changed slots only are logged, reducing write amplification.
 Base BIN reconstructed by reading `last_full_lsn` then applying deltas.
 Because a delta can only add/overwrite slots (never express a *removal*), any
-operation that removes entries from a BIN in bulk must invalidate the stale
-full-image base so the next persisted image is a FULL BIN. Two such cases:
-physical slot deletion (`remove_slot`) and a **BIN split**, where the
-right-half entries move out of the left half while its `last_full_lsn` still
-names the pre-split image. Both set `prohibit_next_delta` on the modified BIN
-(JE: `IN.splitInternal` logs both split halves in full via
-`logInternal(allowDeltas=false)`), forcing a full image that advances
-`last_full_lsn` past the change before any delta can ride on it.
+operation that changes a BIN's slot membership in bulk — in a way a
+slot-granular delta cannot reconstruct — must invalidate the stale full-image
+base so the next persisted image is a FULL BIN. Three such cases: physical
+slot deletion (`remove_slot`); a **BIN split**, where the right-half entries
+move out of the left half while its `last_full_lsn` still names the pre-split
+image; and a **BIN sibling merge** (`Tree::compress_node`), where two
+under-full siblings are combined into the survivor — the survivor keeps its
+pre-merge `last_full_lsn`, whose full image lacks the merged-in keys, so a
+delta over it would *lose* those keys on recovery (the mirror of the split
+case, whose failure mode is instead resurrecting the moved-away keys). All
+three set `prohibit_next_delta` on the affected BIN (JE parity:
+`IN.deleteEntry` forces a full image when a dirty slot is removed,
+IN.java:3466; `IN.splitInternal` logs both split halves in full via
+`logInternal(allowDeltas=false)`; the `INCompressor.java` header (lines 80-88)
+states the general rule), forcing a full image that advances `last_full_lsn`
+past the change before any delta can ride on it. (Upper INs never log deltas,
+so the IN-merge arm needs no equivalent guard. In the current code base the
+sibling-merge path is exercised only in tests; the merge guard is
+defense-in-depth against any future production caller of `compress_node`.)
 
 **Reference**: Noxu DB Architecture Notes; Ramakrishnan & Gehrke, *Database
 Management Systems*, Chapter 14.
