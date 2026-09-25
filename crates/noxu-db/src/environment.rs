@@ -2049,8 +2049,23 @@ fn write_txn_end_for_recovered(
 
 impl Drop for Environment {
     fn drop(&mut self) {
-        // Best effort close on drop
+        // Best effort close on drop.
         let _ = self.close();
+        // `close()` returns early (without stopping the background daemons) if
+        // the environment still has open databases or active transactions.
+        // The verifier / stats daemons each hold an `Arc<EnvironmentImpl>`
+        // clone, so a daemon left running would keep the environment — and its
+        // FileManager file lock — alive past this `Drop`, blocking a subsequent
+        // reopen of the same directory. Both daemons default ON (JE parity), so
+        // we must join them unconditionally here. `stop()` joins the thread and
+        // drops the daemon's `Arc`; taking from the `Mutex<Option<_>>` makes it
+        // idempotent with the `close()` path above.
+        if let Some(dumper) = self.stats_dumper.lock().take() {
+            dumper.stop();
+        }
+        if let Some(verifier) = self.verify_daemon.lock().take() {
+            verifier.stop();
+        }
     }
 }
 

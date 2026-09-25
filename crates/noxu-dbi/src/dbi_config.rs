@@ -394,18 +394,20 @@ impl Default for DbiEnvConfig {
             txn_dump_locks: false,
             // Recovery
             env_recovery_force_checkpoint_field: false,
-            // Verifier
-            run_verifier: false,
-            verify_log: false,
+            // Verifier — JE default ON (matches EnvironmentConfig::new();
+            // the daemon itself is started in noxu-db from EnvironmentConfig,
+            // these fields are carried for completeness).
+            run_verifier: true,
+            verify_log: true,
             verify_log_read_delay_ms: 0,
-            verify_btree: false,
+            verify_btree: true,
             verify_secondaries: true,
             verify_data_records: false,
             verify_obsolete_records: false,
             verify_btree_batch_size: 1_000,
             verify_btree_batch_delay_ms: 10,
-            // Stats
-            stats_collect: false,
+            // Stats — JE default ON (matches EnvironmentConfig::new()).
+            stats_collect: true,
             stats_collect_interval_secs: 300,
             // Background rate limits
             env_background_read_limit_kb: 0,

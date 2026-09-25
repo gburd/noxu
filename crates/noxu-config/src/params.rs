@@ -297,9 +297,16 @@ pub static ENV_RUN_EVICTOR: ConfigParam = ConfigParam::bool_param(
 );
 
 /// If true, run the off-heap evictor daemon threads.
+///
+/// JE default is `true` (EnvironmentParams.java:1177-1180), but the off-heap
+/// cache and its evictor daemon are not yet wired in Noxu (`run_offheap_evictor`
+/// is carried through `DbiEnvConfig` but read by no subsystem). The effective
+/// default is therefore `false`; this constant is set to `false` so the two
+/// sources of truth agree. Documented divergence: see
+/// docs/src/maintainer/design-decisions.md ("Config defaults reconciled to JE").
 pub static ENV_RUN_OFFHEAP_EVICTOR: ConfigParam = ConfigParam::bool_param(
     "noxu.env.runOffHeapEvictor",
-    true,  // default
+    false, // default (JE true; off-heap evictor not yet wired — see doc)
     true,  // mutable
     false, // forReplication
 );
@@ -499,9 +506,16 @@ pub static LOG_FILE_WARM_UP_BUF_SIZE: ConfigParam = ConfigParam::int_param(
 );
 
 /// If true, detect unexpected log file deletion.
+///
+/// JE default is `true` (EnvironmentParams.java:500-504), but the file-delete
+/// detection poll is not yet wired in Noxu (`log_detect_file_delete` is carried
+/// through `DbiEnvConfig` but read by no subsystem). The effective default is
+/// therefore `false`; this constant is set to `false` so the two sources of
+/// truth agree. Documented divergence: see
+/// docs/src/maintainer/design-decisions.md ("Config defaults reconciled to JE").
 pub static LOG_DETECT_FILE_DELETE: ConfigParam = ConfigParam::bool_param(
     "noxu.log.detectFileDelete",
-    true,  // default
+    false, // default (JE true; detection poll not yet wired — see doc)
     false, // mutable
     false, // forReplication
 );
@@ -680,9 +694,17 @@ pub static LOG_USE_NIO: ConfigParam = ConfigParam::bool_param(
 );
 
 /// If true, use a write queue for asynchronous log I/O.
+///
+/// JE default is `true` (EnvironmentParams.java:740-743), but the asynchronous
+/// write queue is not yet wired in Noxu (`log_use_write_queue` is carried
+/// through `DbiEnvConfig` but read by no subsystem; log writes go straight to
+/// the buffer pool). The effective default is therefore `false`; this constant
+/// is set to `false` so the two sources of truth agree. Documented divergence:
+/// see docs/src/maintainer/design-decisions.md ("Config defaults reconciled to
+/// JE").
 pub static LOG_USE_WRITE_QUEUE: ConfigParam = ConfigParam::bool_param(
     "noxu.log.useWriteQueue",
-    true,  // default
+    false, // default (JE true; async write queue not yet wired — see doc)
     false, // mutable
     false, // forReplication
 );
@@ -1696,14 +1718,26 @@ pub static EVICTOR_DEADLOCK_RETRY: ConfigParam = ConfigParam::int_param(
     false,   // forReplication
 );
 
-/// Deprecated — cache eviction policy is always multi-queue; LRU-only mode is not supported.
+/// Deprecated — cache eviction policy is always multi-queue; LRU-only mode is
+/// a legacy fallback.
+///
+/// JE declares this param's default `true` (EnvironmentParams.java:1104-1107)
+/// but deprecated it as of JE 6.0: "This parameter is ignored by the new, more
+/// efficient and more accurate evictor" (EnvironmentConfig.java `EVICTOR_LRU_ONLY`
+/// javadoc). JE's *actual* runtime behaviour is the multi-queue evictor, which
+/// Noxu obtains with `evictor_lru_only = false` (pri1 + pri2 dirty-node split).
+/// The effective default is therefore `false`; this constant is set to `false`
+/// so it reflects real JE behaviour rather than the stale, ignored literal
+/// `true`. Documented divergence: see
+/// docs/src/maintainer/design-decisions.md ("Config defaults reconciled to JE").
 #[deprecated(
     since = "2.4.1",
-    note = "cache eviction is always multi-queue; this flag has no effect"
+    note = "deprecated in JE 6.0 and ignored by the multi-queue evictor; \
+            leave at the default (false) for JE-equivalent behaviour"
 )]
 pub static EVICTOR_LRU_ONLY: ConfigParam = ConfigParam::bool_param(
     "noxu.evictor.lruOnly",
-    true,  // default
+    false, // default (JE literal true but deprecated/ignored — see doc)
     false, // mutable
     false, // forReplication
 );
@@ -2084,7 +2118,10 @@ mod tests {
         assert_eq!(LOG_NUM_BUFFERS.default, ParamValue::Int(3));
         assert_eq!(LOG_BUFFER_SIZE.default, ParamValue::Int(1 << 20));
         assert_eq!(LOG_FILE_CACHE_SIZE.default, ParamValue::Int(100));
-        assert_eq!(LOG_USE_WRITE_QUEUE.default, ParamValue::Bool(true));
+        // LOG_USE_WRITE_QUEUE: JE default true, but the async write queue is
+        // not yet wired in Noxu so the reconciled default is false (see the
+        // param doc comment / design-decisions.md).
+        assert_eq!(LOG_USE_WRITE_QUEUE.default, ParamValue::Bool(false));
 
         // Tree
         assert_eq!(NODE_MAX_ENTRIES.default, ParamValue::Int(128));

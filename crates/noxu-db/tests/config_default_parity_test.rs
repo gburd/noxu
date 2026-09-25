@@ -20,8 +20,8 @@
 //! default must be recorded in `INTENTIONAL_DIVERGENCES` with a reason, so the
 //! two sources agree and the divergence is auditable in one place.
 
-use noxu_config::params;
 use noxu_config::ConfigParam;
+use noxu_config::params;
 use noxu_db::EnvironmentConfig;
 use std::path::PathBuf;
 
@@ -89,6 +89,7 @@ fn env_default_field(cfg: &EnvironmentConfig, field: &str) -> bool {
 
 /// Every bool `ConfigParam` whose default *drives* an `EnvironmentConfig`
 /// bool field. `(param, field)`.
+#[allow(deprecated)] // some referenced params are deprecated but still tracked
 const PARAM_TO_FIELD: &[(&ConfigParam, &str)] = &[
     (&params::CHECKPOINTER_HIGH_PRIORITY, "checkpointer_high_priority"),
     (&params::CLEANER_ADJUST_UTILIZATION, "cleaner_adjust_utilization"),
