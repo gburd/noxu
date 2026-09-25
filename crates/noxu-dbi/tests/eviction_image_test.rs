@@ -30,11 +30,13 @@ fn eviction_refault_preserves_checkpointed_delta_image() {
         cursor.put(&i.to_be_bytes(), b"old", PutMode::Overwrite).unwrap();
     }
     cursor.close().unwrap();
+    drop(cursor);
     env.run_checkpoint().unwrap();
 
     let mut cursor = CursorImpl::new(Arc::clone(&db), 2);
     cursor.put(&0u32.to_be_bytes(), b"new", PutMode::Overwrite).unwrap();
     cursor.close().unwrap();
+    drop(cursor);
     env.run_checkpoint().unwrap();
 
     let tree = db.read().get_real_tree_arc().unwrap();
@@ -87,6 +89,12 @@ fn eviction_refault_preserves_checkpointed_delta_image() {
     }
     cursor.close().unwrap();
     env.close().unwrap();
+    drop(cursor);
+    drop(db);
+    drop(root);
+    drop(tree);
+    drop(evictor);
+    drop(env);
 
     let env = EnvironmentImpl::from_dbi_config(dir.path(), &cfg).unwrap();
     let db = env.open_database("images", &db_cfg).unwrap();
