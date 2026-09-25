@@ -133,6 +133,104 @@ fn sync_must_not_cover_an_unwritten_oversized_reservation() {
     }
 }
 
+// Blocker 1 (data-loss, false durable watermark): a `flush_no_sync` that
+// marks a range flushed under the LWL but pwrites it OFF the LWL lets a
+// concurrent `flush_sync` seal a durable boundary over bytes not yet on disk.
+//
+// Repro (all under production locks):
+//  1. A buffered NO_SYNC record is appended (bytes in the buffer, not on disk).
+//  2. `flush_no_sync` snapshots + `mark_flushed` under the LWL, then blocks in
+//     its pwrite (we hold the file write latch to freeze it there).
+//  3. `flush_sync` runs: its drain sees the range already flushed (empty
+//     unflushed data), skips it, captures eol PAST that range, fdatasyncs, and
+//     publishes a durable watermark covering the un-pwritten range.
+//  4. The `flush_sync` return value (the durable LSN) then names an offset
+//     beyond the file's physical length -> power-loss loss.
+//
+// The fix keeps the no-sync snapshot + pwrite + watermark publication under
+// the LWL, so `flush_sync` cannot even acquire the LWL until the no-sync
+// pwrite has landed; the durable watermark can then never exceed on-disk EOF.
+// Because the fix serializes both under the LWL, holding the file latch would
+// deadlock the covering `flush_sync` on the LWL; we release the latch from an
+// independent control, join both threads, and assert the FINAL durable
+// watermark never covers un-pwritten bytes.
+//
+// Run with --test-threads=1 (faultdisk-free, but shares the process file latch).
+#[test]
+fn no_sync_drain_must_not_let_sync_publish_a_false_durable_watermark() {
+    let dir = tempfile::tempdir().unwrap();
+    let lm = manager(&dir);
+    // First, a flushed record so the log FILE physically exists on disk (its
+    // bytes are pwritten). This lets us hold that file's write latch.
+    let base = lm
+        .log(LogEntryType::Trace, b"base", Provisional::No, true, false)
+        .unwrap();
+    let file_num = base.file_number();
+    let path = dir.path().join(format!("{file_num:08x}.ndb"));
+    let eof_base = std::fs::metadata(&path).unwrap().len();
+    // A small buffered record: flush=false, fsync=false -> lives in the write
+    // buffer, its bytes are NOT on disk yet.
+    lm.log(LogEntryType::Trace, b"buffered-nosync", Provisional::No, false, false)
+        .unwrap();
+    // The next LSN marks the exclusive end of the buffered range.
+    let eol_before = lm.file_manager().get_next_available_lsn();
+    assert_eq!(eol_before.file_number(), file_num);
+
+    // Freeze the no-sync Phase-2 pwrite by holding the file's write latch.
+    let handle = lm.file_manager().get_file_handle(file_num).unwrap();
+    let held = handle.acquire().unwrap();
+
+    // Thread N: flush_no_sync. On the buggy code it marks the range flushed
+    // under the LWL, releases the LWL, then blocks on the file latch in its
+    // off-LWL pwrite. On the fixed code it blocks on the file latch WHILE
+    // holding the LWL.
+    let nosync_lm = Arc::clone(&lm);
+    let nosync = std::thread::spawn(move || nosync_lm.flush_no_sync());
+
+    // Give thread N time to reach (and block at) the pwrite.
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Thread S: covering flush_sync. On the buggy code it acquires the LWL
+    // (thread N already released it), skips the already-marked range, captures
+    // eol past it, fdatasyncs and returns a durable LSN covering un-pwritten
+    // bytes. On the fixed code it BLOCKS on the LWL held by thread N.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let sync_lm = Arc::clone(&lm);
+    let sync = std::thread::spawn(move || tx.send(sync_lm.flush_sync()).unwrap());
+
+    // Observe an EARLY sync completion (the bug) before releasing the latch.
+    let early = rx.recv_timeout(Duration::from_millis(400)).ok();
+    let eof_at_early = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    eprintln!(
+        "eol_before={eol_before:?} eof_base={eof_base} early sync={early:?} EOF@early={eof_at_early}"
+    );
+    if let Some(Ok(durable)) = early {
+        assert!(
+            (durable.file_number() < file_num)
+                || (durable.file_number() == file_num
+                    && (durable.file_offset() as u64) <= eof_at_early),
+            "durable watermark {durable:?} covers bytes past physical EOF {eof_at_early} \
+             (false durable boundary over an un-pwritten no-sync range)"
+        );
+    }
+
+    // Release the latch so the frozen pwrite (and the blocked sync, if any)
+    // can complete, then join both threads.
+    drop(held);
+    let nosync_res = nosync.join().unwrap();
+    sync.join().unwrap();
+    nosync_res.unwrap();
+    let durable = rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+    let eof_final = std::fs::metadata(&path).unwrap().len();
+    eprintln!("final durable={durable:?} EOF_final={eof_final}");
+    assert!(
+        (durable.file_number() < file_num)
+            || (durable.file_number() == file_num
+                && (durable.file_offset() as u64) <= eof_final),
+        "final durable watermark {durable:?} must not exceed on-disk EOF {eof_final}"
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn partial_write_error_requires_fail_stop_or_complete_rollback() {
