@@ -50,8 +50,10 @@ impl VerifyDaemon {
     /// * `schedule` — a cron-style schedule string (`VERIFY_SCHEDULE`,
     ///   e.g. `"0 0 * * *"` for daily at midnight).  Must be non-empty; the
     ///   caller (`Environment::open`) only starts the daemon when
-    ///   `run_verifier` is true AND `schedule` is non-empty, so the default
-    ///   (`run_verifier = false`) spawns nothing and behaviour is unchanged.
+    ///   `run_verifier` is true AND `schedule` is non-empty.  Both now default
+    ///   ON (`run_verifier = true`, `verify_schedule = "0 0 * * *"`, matching
+    ///   JE ENV_RUN_VERIFIER / VERIFY_SCHEDULE), so the daemon runs by default;
+    ///   setting `run_verifier = false` or clearing the schedule spawns nothing.
     /// * `config` — the [`VerifyConfig`] used for each run.
     pub fn start(
         env_impl: Arc<Mutex<EnvironmentImpl>>,

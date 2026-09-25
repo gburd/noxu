@@ -129,11 +129,16 @@ pub struct EnvironmentConfig {
     pub run_evictor: bool,
 
     /// Run the background off-heap Evictor daemon.
-    /// Mirrors `ENV_RUN_OFFHEAP_EVICTOR` / default true (when off-heap configured).
+    /// Mirrors `ENV_RUN_OFFHEAP_EVICTOR`.  JE default true; effective default
+    /// `false` in Noxu because no off-heap evictor daemon exists yet.
+    /// Accepted-but-inert: registered in `unimplemented_params` so setting it
+    /// `true` warns.  Tracked follow-up: implement the feature or remove the
+    /// flag (see design-decisions.md §17).
     pub run_offheap_evictor: bool,
 
     /// Run the background data-integrity Verifier daemon.
-    /// Mirrors `ENV_RUN_VERIFIER` / default false.
+    /// Mirrors `ENV_RUN_VERIFIER` / JE default true (verifies daily at
+    /// midnight per `VERIFY_SCHEDULE = "0 0 * * *"`).
     pub run_verifier: bool,
 
     // -----------------------------------------------------------------------
@@ -310,7 +315,10 @@ pub struct EnvironmentConfig {
     pub log_mem_only: bool,
 
     /// Detect external deletion of log files and respond gracefully.
-    /// Mirrors `LOG_DETECT_FILE_DELETE` / default false.
+    /// Mirrors `LOG_DETECT_FILE_DELETE`.  JE default true; effective default
+    /// `false` in Noxu because the detector is not implemented.
+    /// Accepted-but-inert: registered in `unimplemented_params` so setting it
+    /// `true` warns.  Tracked follow-up: implement or remove (design-decisions.md §17).
     pub log_detect_file_delete: bool,
 
     /// Interval between log-file deletion detection polls in milliseconds.
@@ -332,7 +340,10 @@ pub struct EnvironmentConfig {
     pub log_use_odsync: bool,
 
     /// Use an asynchronous write queue between the log manager and the OS.
-    /// Mirrors `LOG_USE_WRITE_QUEUE` / default false.
+    /// Mirrors `LOG_USE_WRITE_QUEUE`.  JE default true; effective default
+    /// `false` in Noxu because the async write queue is not wired.
+    /// Accepted-but-inert: registered in `unimplemented_params` so setting it
+    /// `true` warns.  Tracked follow-up: implement or remove (design-decisions.md §17).
     pub log_use_write_queue: bool,
 
     /// Size of the asynchronous write queue in bytes.
@@ -703,11 +714,11 @@ pub struct EnvironmentConfig {
     // -----------------------------------------------------------------------
     /// Cron-style schedule string for the background verifier.
     /// Empty string = run continuously when `run_verifier = true`.
-    /// Mirrors `VERIFY_SCHEDULE` / default `""`.
+    /// Mirrors `VERIFY_SCHEDULE` / JE default `"0 0 * * *"` (daily midnight).
     pub verify_schedule: String,
 
     /// Verify log-file checksums in the background.
-    /// Mirrors `VERIFY_LOG` / default false.
+    /// Mirrors `VERIFY_LOG` / JE default true.
     pub verify_log: bool,
 
     /// Delay between log verification read operations in milliseconds.
@@ -715,7 +726,7 @@ pub struct EnvironmentConfig {
     pub verify_log_read_delay_ms: u64,
 
     /// Verify the B-tree structure in the background.
-    /// Mirrors `VERIFY_BTREE` / default false.
+    /// Mirrors `VERIFY_BTREE` / JE default true.
     pub verify_btree: bool,
 
     /// Verify secondary index consistency in the background.
@@ -757,7 +768,7 @@ pub struct EnvironmentConfig {
     // -----------------------------------------------------------------------
 
     /// Collect environment statistics in the background.
-    /// Mirrors `STATS_COLLECT` / default false.
+    /// Mirrors `STATS_COLLECT` / JE default true.
     pub stats_collect: bool,
 
     /// Interval between background stats collection passes in seconds.
@@ -820,7 +831,7 @@ impl EnvironmentConfig {
             run_cleaner: true,
             run_evictor: true,
             run_offheap_evictor: false,
-            run_verifier: false,
+            run_verifier: true,
             // Background daemon rate limits
             env_background_read_limit_kb: 0,
             env_background_write_limit_kb: 0,
@@ -938,11 +949,13 @@ impl EnvironmentConfig {
             txn_serializable_isolation: false,
             txn_deadlock_stack_trace: false,
             txn_dump_locks: false,
-            // Verifier
-            verify_schedule: String::new(),
-            verify_log: false,
+            // Verifier — JE default ON: run daily structural + log verification
+            // so corruption is detected automatically (EnvironmentParams.java
+            // ENV_RUN_VERIFIER/VERIFY_SCHEDULE/VERIFY_BTREE/VERIFY_LOG, all true).
+            verify_schedule: String::from("0 0 * * *"),
+            verify_log: true,
             verify_log_read_delay_ms: 0,
-            verify_btree: false,
+            verify_btree: true,
             verify_secondaries: true,
             verify_data_records: false,
             verify_obsolete_records: false,
@@ -950,8 +963,8 @@ impl EnvironmentConfig {
             verify_btree_batch_delay_ms: 10,
             // Disk-ordered cursor
             dos_producer_queue_timeout_ms: 10_000,
-            // Stats
-            stats_collect: false,
+            // Stats — JE default ON (EnvironmentParams.java STATS_COLLECT true).
+            stats_collect: true,
             stats_collect_interval_secs: 300,
             stats_max_files: 100,
             stats_file_row_count: 1_000,
@@ -2637,7 +2650,9 @@ mod tests {
         assert!(c.run_cleaner);
         assert!(c.run_evictor);
         assert!(!c.run_offheap_evictor);
-        assert!(!c.run_verifier);
+        // JE default true: the background verifier runs daily (see
+        // config_default_parity_test).
+        assert!(c.run_verifier);
     }
 
     #[test]
@@ -2765,10 +2780,11 @@ mod tests {
     #[test]
     fn test_defaults_verifier() {
         let c = EnvironmentConfig::default();
-        assert_eq!(c.verify_schedule, "");
-        assert!(!c.verify_log);
+        // JE default ON: daily structural + log verification.
+        assert_eq!(c.verify_schedule, "0 0 * * *");
+        assert!(c.verify_log);
         assert_eq!(c.verify_log_read_delay_ms, 0);
-        assert!(!c.verify_btree);
+        assert!(c.verify_btree);
         assert!(c.verify_secondaries);
         assert!(!c.verify_data_records);
         assert!(!c.verify_obsolete_records);
@@ -2779,7 +2795,8 @@ mod tests {
     #[test]
     fn test_defaults_stats() {
         let c = EnvironmentConfig::default();
-        assert!(!c.stats_collect);
+        // JE default ON (STATS_COLLECT true).
+        assert!(c.stats_collect);
         assert_eq!(c.stats_collect_interval_secs, 300);
         assert_eq!(c.stats_max_files, 100);
         assert_eq!(c.stats_file_row_count, 1_000);
@@ -3330,8 +3347,8 @@ mod tests {
         assert_only_field_touched(&c, "with_evictor_algorithm");
 
         let mut c = EnvironmentConfig::default()
-            .with_verify_schedule("0 0 * * *".to_string());
-        assert_eq!(c.verify_schedule, "0 0 * * *");
+            .with_verify_schedule("0 3 * * *".to_string());
+        assert_eq!(c.verify_schedule, "0 3 * * *");
         c.verify_schedule = d.verify_schedule.clone();
         assert_only_field_touched(&c, "with_verify_schedule");
 

@@ -170,7 +170,7 @@ JE-style `logging_level` / `trace_*` knobs were removed in 7.2).
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `startup_dump_threshold_ms` | `u64` | `0` (off) | If `Environment::open` takes at least this many ms (startup is dominated by crash recovery), log a `warn!` startup summary with the elapsed time and a stats snapshot. JE: `STARTUP_DUMP_THRESHOLD`. |
-| `stats_collect` | `bool` | `false` | Enable the background stats-file dumper (JE `StatCapture`). |
+| `stats_collect` | `bool` | `true` | Enable the background stats-file dumper (JE `StatCapture`). JE default `true`. |
 | `stats_collect_interval_secs` | `u64` | `300` | Sampling interval for the stats-file dumper. |
 | `stats_file_directory` | `Option<PathBuf>` | env home | Output directory for rotating stats CSV files (`noxu.stat.<N>.csv`). JE: `STATS_FILE_DIRECTORY`. |
 | `stats_file_row_count` | `u32` | `1000` | CSV data rows per stats file before rotation. JE: `STATS_FILE_ROW_COUNT`. |
@@ -185,6 +185,24 @@ a new `noxu.stat.<N>.csv`, retaining at most `stats_max_files`.  The CSV is
 self-contained (no external recorder needed) and is aimed at simple
 ops/monitoring; for a live metrics pipeline use `metrics_export` (the
 `observability` feature) instead.
+
+## Background verifier (`EnvironmentConfig`)
+
+A background daemon periodically runs the same structural + log verification
+walk that `Environment::verify` performs, so on-disk corruption is detected
+automatically rather than only when a corrupt page is next read. **On by
+default**, matching JE (`ENV_RUN_VERIFIER` / `VERIFY_SCHEDULE` / `VERIFY_BTREE`
+/ `VERIFY_LOG` all default `true` in `EnvironmentParams.java`).
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `run_verifier` | `bool` | `true` | Run the background data-integrity verifier daemon. The daemon only spawns when `run_verifier` is `true` **and** `verify_schedule` is a valid, non-empty cron expression. JE: `ENV_RUN_VERIFIER`. |
+| `verify_schedule` | `String` | `"0 0 * * *"` | 5-field cron schedule (minute hour day month weekday). Default runs once daily at midnight local time. Empty string disables the daemon. JE: `VERIFY_SCHEDULE`. |
+| `verify_btree` | `bool` | `true` | Verify the B-tree structure during each scheduled run. JE: `VERIFY_BTREE`. |
+| `verify_log` | `bool` | `true` | Verify log-file checksums during each scheduled run. JE: `VERIFY_LOG`. |
+
+To disable background verification set `with_run_verifier(false)` (or
+`with_verify_schedule("")`).
 
 ## Latch fairness & timeout (`EnvironmentConfig`)
 

@@ -89,7 +89,7 @@ fn stats_file_is_written_and_rotates() {
     }
 }
 
-/// When `stats_collect` is off (the default), no stats file is written.
+/// When `stats_collect` is off, no stats file is written.
 #[test]
 fn no_stats_file_when_collection_disabled() {
     let env_dir = TempDir::new().unwrap();
@@ -97,8 +97,10 @@ fn no_stats_file_when_collection_disabled() {
     let config = EnvironmentConfig::new(env_dir.path().to_path_buf())
         .with_allow_create(true)
         .with_transactional(true)
+        // stats_collect defaults to true (JE parity); explicitly disable it
+        // to exercise the collection-off path.
+        .with_stats_collect(false)
         .with_stats_file_directory(stats_dir.path().to_path_buf());
-    // stats_collect defaults to false.
     let env = Environment::open(config).unwrap();
     std::thread::sleep(Duration::from_millis(300));
     env.close().unwrap();

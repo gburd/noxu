@@ -7,6 +7,37 @@ v1.5 (and later releases) that is likely to surface in user code.
 > [Introduction → capability matrix](../introduction.md#capability-matrix-v15--v22)
 > for the canonical "what is supported in which release" table.
 
+## Unreleased — config defaults reconciled to JE (background verifier + stats now ON)
+
+Eight boolean `EnvironmentConfig` defaults were previously the *opposite* of
+both JE and Noxu's own `noxu-config` parameter table. They are now reconciled
+(see [design-decisions §17](../maintainer/design-decisions.md)).
+
+**Behaviour change — these now default ON, matching JE:**
+
+| Setting | Old effective default | New default | Effect |
+|---|---|---|---|
+| `run_verifier` + `verify_schedule` | off / `""` | on / `"0 0 * * *"` | A background verifier daemon now runs a structural + log integrity walk **once daily at midnight** on a fresh environment. |
+| `verify_btree` | off | on | B-tree structure is verified during each scheduled run. |
+| `verify_log` | off | on | Log-file checksums are verified during each scheduled run. |
+| `stats_collect` | off | on | The background stats-file dumper (`noxu.stat.<N>.csv`) now runs by default. |
+
+To restore the previous behaviour, opt out explicitly:
+
+```rust,ignore
+let cfg = EnvironmentConfig::new(path)
+    .with_allow_create(true)
+    .with_run_verifier(false)   // or .with_verify_schedule("".into())
+    .with_stats_collect(false);
+```
+
+**No behaviour change (documented-off):** `log.detectFileDelete`,
+`env.runOffHeapEvictor`, and `log.useWriteQueue` are `true` in JE but stay
+`false` in Noxu because the underlying feature is not yet wired; the
+`noxu-config` table now declares `false` for them too so the two sources agree.
+`evictor.lruOnly` stays `false` (it is deprecated/ignored in JE 6.0; `false`
+gives JE's real multi-queue-evictor behaviour).
+
 ## v7.5.3 → 7.5.4 — `Durability` constants corrected to JE (HA behaviour change)
 
 7.5.4 corrected the three `Durability` convenience constants, which had
