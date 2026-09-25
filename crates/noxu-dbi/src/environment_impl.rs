@@ -447,12 +447,6 @@ pub struct EnvironmentImpl {
 
     /// Automatic backup manager.
     ///
-    /// Copies closed log files to a configured archive destination on a
-    /// cron-style schedule.
-    ///
-    /// (extended fork).
-    backup_manager: Mutex<crate::backup_manager::BackupManager>,
-
     /// Per-file utilization tracker shared between the LogManager write path
     /// and the Cleaner.
     ///
@@ -1805,9 +1799,6 @@ impl EnvironmentImpl {
             extinction_scanner: Mutex::new(
                 noxu_cleaner::ExtinctionScanner::new(),
             ),
-            backup_manager: Mutex::new(
-                crate::backup_manager::BackupManager::new(),
-            ),
             utilization_tracker,
             cache_usage,
             memory_budget,
@@ -3022,6 +3013,34 @@ impl EnvironmentImpl {
         self.cleaner.as_ref().map(|c| Arc::clone(c.get_file_protector()))
     }
 
+    /// Starts a hot backup: pins the current log-file set against cleaner
+    /// deletion and returns a [`DbBackup`](crate::DbBackup) handle enumerating
+    /// the files to copy.
+    ///
+    /// JE: `new DbBackup(env).startBackup()` (`DbBackup.java:480`).  The caller
+    /// should force a checkpoint first (see `Environment::start_backup`).
+    ///
+    /// # Errors
+    /// Returns [`DbiError::EnvironmentFailure`] if the environment has no
+    /// cleaner/file-protector (e.g. a read-only environment with cleaning
+    /// disabled) or no log manager, so no consistent backup set can be pinned.
+    pub fn start_backup(&self) -> Result<crate::DbBackup, DbiError> {
+        let file_protector = self.get_file_protector().ok_or_else(|| {
+            DbiError::EnvironmentFailure {
+                reason: "backup requires a running cleaner (open the \
+                         environment read-write with the cleaner enabled)"
+                    .to_string(),
+            }
+        })?;
+        let file_manager = self
+            .get_log_manager()
+            .map(|lm| Arc::clone(lm.file_manager()))
+            .ok_or_else(|| DbiError::EnvironmentFailure {
+                reason: "backup requires a log manager".to_string(),
+            })?;
+        crate::DbBackup::start_backup(file_protector, file_manager)
+    }
+
     /// Returns the checkpointer, if one was created.
     ///
     /// Returns `None` for read-only environments.
@@ -3440,7 +3459,6 @@ impl EnvironmentImpl {
         // Shut down the extended-fork background services.
         self.extinction_scanner.lock().unwrap().shutdown();
         self.data_eraser.lock().unwrap().shutdown();
-        self.backup_manager.lock().unwrap().shutdown();
 
         *state = EnvState::Closed;
         Ok(())
@@ -3629,10 +3647,6 @@ impl Drop for EnvironmentImpl {
             .unwrap_or_else(|p| p.into_inner())
             .shutdown();
         self.data_eraser.lock().unwrap_or_else(|p| p.into_inner()).shutdown();
-        self.backup_manager
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .shutdown();
 
         // EV-14 teardown: break the `Tree -> Arc<LogManager> -> FileManager`
         // chain so the FileManager's on-disk exclusive lock is released on

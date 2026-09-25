@@ -85,6 +85,7 @@ pub use noxu_recovery::{
     PreparedLnOperation, PreparedLnReplay, PreparedTxnInfo,
 };
 
+pub mod backup;
 pub mod cache_mode;
 pub mod checkpoint_config;
 pub mod cursor;
@@ -125,6 +126,7 @@ pub mod verify_daemon;
 pub mod write_options;
 
 // Re-export commonly used types
+pub use backup::Backup;
 pub use cache_mode::CacheMode;
 pub use checkpoint_config::CheckpointConfig;
 pub use cursor::Cursor;

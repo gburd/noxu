@@ -16,11 +16,11 @@
 //! internal implementations including
 //! EnvironmentImpl, DatabaseImpl, CursorImpl, DbTree, MemoryBudget.
 
-pub mod backup_manager;
 pub mod cursor_impl;
 mod database_config;
 mod database_id;
 mod database_impl;
+pub mod db_backup;
 mod db_tree;
 mod db_type;
 pub mod dbi_config;
@@ -45,13 +45,13 @@ pub mod throughput_stats;
 pub mod trigger;
 mod truncate_result;
 
-pub use backup_manager::{BackupDestination, BackupManager};
 pub use cursor_impl::CursorImpl;
 #[cfg(any(test, feature = "testing"))]
 pub use cursor_impl::{clear_cursor_fail_flag, set_cursor_fail_after};
 pub use database_config::{ConfigComparator, DatabaseConfig};
 pub use database_id::DatabaseId;
 pub use database_impl::{DatabaseImpl, DatabaseTree};
+pub use db_backup::DbBackup;
 pub use db_tree::DbTree;
 pub use db_type::DbType;
 pub use dbi_config::DbiEnvConfig;
