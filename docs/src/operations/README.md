@@ -8,7 +8,7 @@ performance tuning, backup, recovery, and known limitations.
 1. [Sizing](sizing.md) — cache sizing, log file size, thread pool recommendations
 2. [Monitoring](monitoring.md) — `EnvironmentStats`, `LockStatsSnapshot`, throughput metrics
 3. [Performance Tuning](tuning.md) — write throughput, read latency, group commit tuning
-4. [Backup](backup.md) — `BackupManager`, live backup while serving traffic
+4. [Backup](backup.md) — `Environment::start_backup`, hot backup while serving traffic
 5. [Recovery Procedures](recovery-ops.md) — crash recovery, data verification, catastrophic failure
 6. [Operational Runbooks](runbooks.md) — actionable procedures for recovery loops, cleaner
    backlog, election thrash, slow checkpoints

@@ -179,8 +179,8 @@ and the [Getting Started guide](getting-started/index.html).
 - **XA distributed transactions** (X/Open XA two-phase commit), crash-durable
   across restart.
 - **Extended capabilities**: TTL record expiry, `ByteComparator`,
-  `ExtinctionFilter`, group commit, `BackupManager`, `DataEraser`, and
-  more.
+  `ExtinctionFilter`, group commit, hot backup (`Environment::start_backup`),
+  `DataEraser`, and more.
 
 ## Reference Archives
 

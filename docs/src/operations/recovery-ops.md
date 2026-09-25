@@ -54,7 +54,8 @@ review items.
    Use the network restore protocol to sync from a healthy replica.
    The `env_home` field on `RepConfig` must be set on the source node.
 
-6. **Last resort — restore from backup** using `BackupManager`-copied files.
+6. **Last resort — restore from backup** using files copied via
+   [`Environment::start_backup`](backup.md).
    Replace the corrupted environment directory with the backup and reopen.
 
 ## Cleaner entry-type data loss
