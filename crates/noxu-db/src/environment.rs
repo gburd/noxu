@@ -1984,11 +1984,7 @@ impl Environment {
         // fatal `EnvironmentFailure(LogWrite)` for user operations funnelled
         // through the environment (open_database / begin transaction / etc.),
         // including handles that have no logger of their own.
-        if self
-            .log_manager
-            .as_ref()
-            .is_some_and(|lm| lm.is_io_invalid())
-        {
+        if self.log_manager.as_ref().is_some_and(|lm| lm.is_io_invalid()) {
             return Err(NoxuError::environment_with_reason(
                 crate::error::EnvironmentFailureReason::LogWrite,
                 "environment invalidated by a fatal log write failure"

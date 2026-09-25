@@ -202,7 +202,10 @@ fn exercise_refusal(missing_logger: bool, dirty_lru: bool, dirty: bool) {
                 tree.read().unwrap().get_parent_in_for_child_in(id).is_some(),
                 "dirty BIN retained after fail-stop"
             );
-            assert!(!env.is_valid(), "environment invalid after fatal log write");
+            assert!(
+                !env.is_valid(),
+                "environment invalid after fatal log write"
+            );
             assert_values();
             let _ = env.close();
             return;

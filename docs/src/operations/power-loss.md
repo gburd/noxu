@@ -249,3 +249,39 @@ rationale, and its test coverage are documented in
 [SAFETY.md](https://codeberg.org/gregburd/noxu/src/branch/main/SAFETY.md)
 § "WAL write-error handling" and summarised in
 [Known Limitations](known-limitations.md).
+
+#### Behavioral change (v7.10.1): fail-stop now covers the whole write path
+
+Earlier releases only invalidated the environment on an `fdatasync`
+error. As of v7.10.1 (WAL fail-stop, matching Berkeley DB JE's
+`LogManager.serialLog`), **any** critical WAL failure — an oversized
+direct append, a buffer-pool drain, a log-file rotation sync, or the
+`fdatasync` — permanently invalidates the environment. Concretely:
+
+- A failed append credits **no** obsolete/new utilization accounting for
+  the entry that did not reach the log (no space is reclaimed for a
+  replacement that never landed), and it does **not** roll back or
+  truncate the log tail.
+- The failure surfaces to user operations as
+  `EnvironmentFailure { reason: LogWrite, .. }` through
+  `Environment::is_valid()` / `check_open()` and every `Database`,
+  `Cursor`, and `Transaction` operation — including handles that were
+  opened without their own logger.
+- A dirty resident node whose new image could not be logged is
+  **retained** in the cache (not evicted), so the old durable image and
+  the in-memory update both remain readable until the environment is
+  reopened.
+
+**Migration:** in-process retry of a failed write against the *same*
+environment is no longer supported (even a zero-byte `ENOSPC`). Free up
+space (or repair the underlying device), then **close and re-open** the
+environment; recovery replays the log up to the last durable entry.
+Handles must be discarded after a fatal log write failure. This is a
+runtime-behavior change only — **there is no on-disk format change** and
+existing `.ndb` logs are unaffected.
+
+Legitimate non-failure refusals are unchanged and remain retryable
+without invalidation: a dirty-node eviction refused because the evictor
+has **no logger attached** (no critical append began), read-only / no-WAL
+/ deferred-write paths, and preflight/input refusals that perform no
+mutation.

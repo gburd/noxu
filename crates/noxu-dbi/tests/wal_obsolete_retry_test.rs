@@ -147,7 +147,10 @@ fn failed_bin_log_fail_stops_and_credits_no_obsolete() {
         Some(ObsoleteLsn::exact(old_full, Some(db_id as u32), 0, false)),
         false,
     );
-    assert!(retry.is_err(), "subsequent writes must be rejected after fail-stop");
+    assert!(
+        retry.is_err(),
+        "subsequent writes must be rejected after fail-stop"
+    );
     assert_eq!(
         faultdisk::write_count(),
         before_writes,

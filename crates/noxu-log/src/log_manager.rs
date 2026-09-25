@@ -419,9 +419,10 @@ impl LogManager {
     /// reserved / oversized pwrite complete), so there is no pin to release
     /// here on unwind.
     fn notify_or_invalidate(&self, req: &SlotRequest, current_lsn: Lsn) {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-            || self.notify_observer(req, current_lsn),
-        ));
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.notify_observer(req, current_lsn)
+            }));
         if let Err(payload) = result {
             self.invalidate_log();
             std::panic::resume_unwind(payload);
@@ -878,10 +879,12 @@ impl LogManager {
                     // under LWL and return; no observer credit for the failed
                     // replacement, no tail rollback.
                     if let Err(e) = self.file_manager.write_buffer_to_file(
-                        file_num, &entry_buf, file_offset,
+                        file_num,
+                        &entry_buf,
+                        file_offset,
                     ) {
                         self.invalidate_log();
-                        return Err(e.into());
+                        return Err(e);
                     }
                     // Direct image is now irrevocably on disk (page cache).
                     // Notify exactly once, in original order.  Catch an
