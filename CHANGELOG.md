@@ -18,9 +18,9 @@ listed in [References](#references).
 
 ### Fixed
 
-- **Three independent data-loss defects on the storage path, each reproduced on a
+- **Four independent data-loss defects on the storage path, each reproduced on a
   release build before the fix and re-verified by an independent reviewer and a
-  fresh-worktree lead requalification (debug and release).** All three were found
+  fresh-worktree lead requalification (debug and release).** All four were found
   by an external fidelity audit against Berkeley DB JE 7.5.11.
   - **Deleted keys resurrected after reopen (BIN-delta).** A physical slot removal
     was not representable in a `BINDelta`, so a later delta checkpoint left the
@@ -50,12 +50,40 @@ listed in [References](#references).
     unrelated eligible files still make progress, while fatal corruption or I/O
     errors still stop the pass. **Note:** this prevents future loss; files whose
     only copies a prior buggy cleaner already deleted cannot be reconstructed.
+  - **BIN split left a stale full-image base for later deltas.** `split_child`
+    moved the right half out of a logged BIN but left the left half's
+    `last_full_lsn` on the pre-split image without prohibiting the next delta, so
+    a later sparse `BINDelta` overlaid on that stale base resurrected the
+    moved-away keys on crash recovery (regression: 183/700 keys lost). The split
+    left half now sets `prohibit_next_delta` (JE `IN.splitInternal` logs both
+    halves full via `logInternal(allowDeltas=false)`); the new right sibling has
+    `last_full_lsn == NULL` and is forced full regardless; delta eligibility is
+    restored after the next full log.
 
-  Known follow-ups deliberately left open (tracked, not yet fixed): BIN split/merge
-  old-base delta invalidation; dirty-BIN eviction failing closed on a log-write
-  error (blocked on a WAL failed-append accounting/contract decision); dirty
-  generation/pin eviction races; dirty upper-IN eviction handling; and the
-  cleaner's legacy protected-retry phantom-deletion accounting.
+  Known follow-ups deliberately left open (tracked, not yet fixed): dirty-BIN
+  eviction failing closed on a log-write error (WAL failed-append fail-stop, in
+  progress); dirty generation/pin eviction races; dirty upper-IN eviction
+  handling; the cleaner's legacy protected-retry phantom-deletion accounting;
+  recovery discarding a database's configured `NODE_MAX_ENTRIES`; and the
+  `compress_node` sibling-merge survivor base (guarded defensively — that merge
+  path has no production caller today). The BIN-delta base-invalidation class is
+  being swept for any remaining reachable site.
+
+### Changed
+
+- **Backup: the non-functional live-backup daemon is replaced by a real
+  `Environment::start_backup()` (a port of JE `DbBackup`).** The previous
+  `BackupManager` never copied a byte (its thread body was a sleep loop) and the
+  documented `with_backup_dir`/`with_backup_interval_ms` config methods did not
+  exist, so an operator following the runbook got no backup and no error.
+  `start_backup()` pins the active log-file set through the cleaner's
+  file-protector (so no file is reclaimed mid-backup), returns a stable file set
+  to copy, and releases the pins on `end_backup()`/drop — matching JE, which pins
+  the set and leaves the copy to the caller. **Migration:** the never-functional
+  `BackupManager`, `BackupDestination`, `with_backup_dir`, and
+  `with_backup_interval_ms` are removed; use `Environment::start_backup()` (see
+  `docs/src/operations/backup.md`). No built-in copy engine or scheduled daemon
+  (also true of JE).
 
 ## [7.10.1] - 2026-09-12
 
