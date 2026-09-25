@@ -860,8 +860,20 @@ impl Environment {
         // through to DatabaseImpl so put/delete/commit/abort fire.  JE
         // `DatabaseConfig.getTriggers` -> `DatabaseImpl.triggers`.
         dbi_config.triggers = config.triggers.0.clone();
-        if config.node_max_entries > 0 {
-            dbi_config.set_node_max_entries(config.node_max_entries as i32);
+        // Resolve the effective fanout (NODE_MAX_ENTRIES): the per-database
+        // DatabaseConfig overrides, but when it is unset (0) fall back to the
+        // environment-level NODE_MAX_ENTRIES default.  Mirrors JE
+        // DatabaseImpl.java:420 ("if maxTreeEntriesPerNode is zero ... set it
+        // to the [env] default config value"), so a database created without
+        // an explicit per-DB fanout inherits the env default and keeps it
+        // across reopen.
+        let effective_node_max = if config.node_max_entries > 0 {
+            config.node_max_entries
+        } else {
+            self.config.node_max_entries
+        };
+        if effective_node_max > 0 {
+            dbi_config.set_node_max_entries(effective_node_max as i32);
         }
 
         // Open the database via EnvironmentImpl (creates if allow_create, else errors)

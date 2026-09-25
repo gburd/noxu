@@ -5547,6 +5547,23 @@ impl Tree {
         self.max_entries_per_node
     }
 
+    /// The node capacity (fanout) / split-and-merge threshold for this tree.
+    pub fn max_entries_per_node(&self) -> usize {
+        self.max_entries_per_node
+    }
+
+    /// Set the node capacity (fanout) / split-and-merge threshold.
+    ///
+    /// Used by `DatabaseImpl::set_recovered_tree` to re-apply the database's
+    /// configured `NODE_MAX_ENTRIES` to a tree built by `RecoveryManager`,
+    /// which has no access to per-DB config and constructs every recovered
+    /// tree at a fixed fanout.  Without this the configured fanout is lost on
+    /// reopen (JE reconstitutes the `DatabaseImpl` with its persisted
+    /// `maxTreeEntriesPerNode`, DatabaseImpl.java:2203).
+    pub fn set_max_entries_per_node(&mut self, max_entries: usize) {
+        self.max_entries_per_node = max_entries;
+    }
+
     /// Return the `node_id` of the first (leftmost) BIN and its current
     /// smallest and largest keys — used by the GAP A evict/flush→detach gate
     /// to target a concurrent insert at the exact BIN being evicted.
