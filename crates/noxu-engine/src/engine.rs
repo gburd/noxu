@@ -369,6 +369,12 @@ impl Engine {
     ///
     /// Returns a snapshot of statistics from all subsystems.
     pub fn get_stats(&self) -> EnvironmentStats {
+        // Refresh the instantaneous LRU-size gauges (pri1/pri2) from the live
+        // policy lists before snapshotting, mirroring JE's Evictor.loadStats
+        // which recomputes cache-composition stats on demand. Without this the
+        // exported noxu_evictor_lru_size gauge would read a stale 0 (the
+        // counters are only otherwise touched during eviction runs).
+        self.evictor.update_lru_stats();
         let evictor_stats = self.evictor.get_stats();
         let cleaner_stats = self.cleaner.get_stats();
         let checkpoint_stats = self.checkpointer.get_stats();
