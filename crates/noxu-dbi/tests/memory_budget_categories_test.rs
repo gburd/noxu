@@ -37,8 +37,14 @@ fn lock_table_footprint_counts_toward_memory_budget() {
     let locker_id = 42_i64;
     let n_locks = 2_000_u64;
     for lsn in 1..=n_locks {
-        lm.lock(lsn, locker_id, LockType::Write, /*non_blocking=*/ true, false)
-            .expect("non-blocking lock on a fresh lsn always granted");
+        lm.lock(
+            lsn,
+            locker_id,
+            LockType::Write,
+            /*non_blocking=*/ true,
+            false,
+        )
+        .expect("non-blocking lock on a fresh lsn always granted");
     }
 
     let lock_after = budget.get_lock_memory_usage();

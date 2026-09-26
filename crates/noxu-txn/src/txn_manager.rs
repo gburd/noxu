@@ -26,6 +26,13 @@ use crate::LockManager;
 use crate::group_commit::GroupCommit;
 use crate::txn::Txn;
 
+/// Resident memory charged to the MemoryBudget txn category per active
+/// transaction, credited back when it commits or aborts.  Mirrors JE
+/// `MemoryBudget.TXN_OVERHEAD_64` (361): the `Txn` object plus its per-txn
+/// bookkeeping.  Makes a many-open-transaction workload visible to the
+/// eviction over-budget arbiter (C3/SC-5).  Relaxed atomic, no extra lock.
+const TXN_MEMORY_OVERHEAD: i64 = 361;
+
 /// Null transaction ID for non-transactional lockers.
 ///
 ///
@@ -73,6 +80,15 @@ pub struct TxnManager {
     /// Number of active serializable (repeatable-read) transactions.
     ///
     n_active_serializable: AtomicU64,
+
+    /// Shared txn memory counter (bytes), read by the MemoryBudget's txn
+    /// category so a many-open-transaction workload is visible to the
+    /// eviction over-budget arbiter (C3/SC-5).  `+TXN_MEMORY_OVERHEAD` on each
+    /// `begin_*`, `-` on `commit_txn`/`abort_txn`.  A private zero-Arc until
+    /// `set_memory_counter` shares the env's `MemoryBudget` counter in, so
+    /// unit-test managers that never wire it stay a no-op.  Relaxed atomic;
+    /// mirrors JE feeding `MemoryBudget.txnMemoryUsage`.
+    txn_memory_counter: Arc<std::sync::atomic::AtomicI64>,
 }
 
 impl TxnManager {
@@ -88,7 +104,39 @@ impl TxnManager {
             n_commits: AtomicU64::new(0),
             n_aborts: AtomicU64::new(0),
             n_active_serializable: AtomicU64::new(0),
+            txn_memory_counter: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         }
+    }
+
+    /// Shares an external txn-memory counter (bytes) into this manager so the
+    /// MemoryBudget's txn category tracks the number of open transactions
+    /// (C3/SC-5).  Called once at env-open by `EnvironmentImpl`.  Must be
+    /// called before any txn begins (the counter starts from empty).
+    pub fn set_memory_counter(
+        &mut self,
+        counter: Arc<std::sync::atomic::AtomicI64>,
+    ) {
+        self.txn_memory_counter = counter;
+    }
+
+    /// Charges one active transaction to the shared txn-memory counter.
+    #[inline]
+    fn charge_txn(&self) {
+        self.txn_memory_counter.fetch_add(
+            TXN_MEMORY_OVERHEAD,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// Credits one ended transaction back to the shared counter, clamped at
+    /// zero.
+    #[inline]
+    fn credit_txn(&self) {
+        let _ = self.txn_memory_counter.fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |cur| Some((cur - TXN_MEMORY_OVERHEAD).max(0)),
+        );
     }
 
     /// Begins a new transaction.
@@ -98,6 +146,7 @@ impl TxnManager {
         self.n_begins.fetch_add(1, Ordering::Relaxed);
         // Register with NULL_LSN initially; updated when first log entry written.
         self.all_txns.write().insert(id, NULL_LSN.as_u64());
+        self.charge_txn();
         // Register a typed diagnostic label so deadlock and lock-timeout
         // error messages render this locker as `"txn:<id>"`.
         self.lock_manager.register_locker_label(id, "txn");
@@ -124,6 +173,7 @@ impl TxnManager {
         self.last_local_txn_id.store(id, Ordering::Relaxed);
         self.n_begins.fetch_add(1, Ordering::Relaxed);
         self.all_txns.write().insert(id, NULL_LSN.as_u64());
+        self.charge_txn();
         self.lock_manager.register_locker_label(id, "txn");
         let mut txn =
             Txn::with_log_manager(id, self.lock_manager.clone(), log_manager);
@@ -169,6 +219,7 @@ impl TxnManager {
         self.last_local_txn_id.store(id, Ordering::Relaxed);
         self.n_begins.fetch_add(1, Ordering::Relaxed);
         self.all_txns.write().insert(id, NULL_LSN.as_u64());
+        self.charge_txn();
         // Register a typed diagnostic label so deadlock messages involving
         // this auto-commit op are rendered as `"auto-txn:<id>"` rather than
         // an opaque integer.
@@ -183,14 +234,18 @@ impl TxnManager {
 
     /// Records that a transaction has committed.
     pub fn commit_txn(&self, txn_id: i64) {
-        self.all_txns.write().remove(&txn_id);
+        if self.all_txns.write().remove(&txn_id).is_some() {
+            self.credit_txn();
+        }
         self.n_commits.fetch_add(1, Ordering::Relaxed);
         self.lock_manager.unregister_locker_label(txn_id);
     }
 
     /// Records that a transaction has aborted.
     pub fn abort_txn(&self, txn_id: i64) {
-        self.all_txns.write().remove(&txn_id);
+        if self.all_txns.write().remove(&txn_id).is_some() {
+            self.credit_txn();
+        }
         self.n_aborts.fetch_add(1, Ordering::Relaxed);
         self.lock_manager.unregister_locker_label(txn_id);
     }

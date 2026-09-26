@@ -22,6 +22,24 @@ pub struct Arbiter {
     /// Current cache usage in bytes (shared with MemoryBudget).
     cache_usage: Arc<AtomicI64>,
 
+    /// Non-tree memory counters (lock / txn / admin) shared with the
+    /// `MemoryBudget` (C3/SC-5).  The over-budget checks read
+    /// `cache_usage + sum(non_tree)` so a lock/txn-heavy workload triggers
+    /// eviction pressure exactly as JE's arbiter does (JE `Evictor.isCacheFull`
+    /// reads `MemoryBudget.getCacheMemoryUsage()`, the SUM of all four
+    /// categories).  Empty for arbiters built without a MemoryBudget (unit
+    /// tests and the pre-wiring path), which then behave exactly as before
+    /// (tree-only).
+    ///
+    /// The eviction loop only ever reclaims TREE bytes (via `release_memory`,
+    /// which decrements `cache_usage`); non-tree memory is NOT evictable.  The
+    /// NEW-7 convergence loop is still bounded because it also stops on
+    /// "no progress" — when a batch frees no tree bytes and leaves the LRU
+    /// lists unchanged (which is exactly what happens once only non-evictable
+    /// lock/txn memory remains over budget), the loop breaks rather than
+    /// spinning.  See `Evictor::do_evict_with_callbacks`.
+    non_tree_usage: Vec<Arc<AtomicI64>>,
+
     /// Number of bytes to evict beyond the over-budget amount.
     /// This provides hysteresis to avoid constant eviction.
     evict_bytes: i64,
@@ -48,15 +66,39 @@ impl Arbiter {
         Self {
             max_memory: AtomicI64::new(max_memory),
             cache_usage,
+            non_tree_usage: Vec::new(),
             evict_bytes,
             critical_threshold,
         }
     }
 
+    /// Builder: attach the non-tree memory counters (lock / txn / admin) the
+    /// `MemoryBudget` feeds, so the over-budget checks read the total across
+    /// all categories (C3/SC-5) rather than tree-only.  Additive: an arbiter
+    /// built without this behaves exactly as before.
+    pub fn with_non_tree_counters(
+        mut self,
+        counters: Vec<Arc<AtomicI64>>,
+    ) -> Self {
+        self.non_tree_usage = counters;
+        self
+    }
+
+    /// Total resident bytes across every category the budget enforces:
+    /// tree (`cache_usage`) plus the non-tree lock / txn / admin counters.
+    /// This is the figure JE's arbiter compares against `maxMemory`.
+    #[inline]
+    fn total_usage(&self) -> i64 {
+        let mut usage = self.cache_usage.load(Ordering::Relaxed);
+        for c in &self.non_tree_usage {
+            usage += c.load(Ordering::Relaxed);
+        }
+        usage
+    }
+
     /// Return true if the memory budget is overspent.
     pub fn is_over_budget(&self) -> bool {
-        self.cache_usage.load(Ordering::Relaxed)
-            > self.max_memory.load(Ordering::Relaxed)
+        self.total_usage() > self.max_memory.load(Ordering::Relaxed)
     }
 
     /// Check whether synchronous (critical) eviction is needed.
@@ -65,7 +107,7 @@ impl Arbiter {
     /// when checking for critical eviction. It's called from application
     /// threads for every cursor operation.
     pub fn need_critical_eviction(&self) -> bool {
-        let usage = self.cache_usage.load(Ordering::Relaxed);
+        let usage = self.total_usage();
         let max = self.max_memory.load(Ordering::Relaxed);
         let over = usage - max;
         over > self.critical_threshold
@@ -76,7 +118,7 @@ impl Arbiter {
     /// This method is intentionally not synchronized to minimize overhead,
     /// because it's checked on every iteration of the evict batch loop.
     pub fn still_needs_eviction(&self) -> bool {
-        let usage = self.cache_usage.load(Ordering::Relaxed);
+        let usage = self.total_usage();
         let max = self.max_memory.load(Ordering::Relaxed);
         (usage + self.evict_bytes) > max
     }
@@ -87,7 +129,7 @@ impl Arbiter {
     /// both the over-budget amount and the evict_bytes hysteresis, but
     /// is capped to avoid evicting more than 50% of the cache.
     pub fn get_eviction_pledge(&self) -> i64 {
-        let usage = self.cache_usage.load(Ordering::Relaxed);
+        let usage = self.total_usage();
         let max = self.max_memory.load(Ordering::Relaxed);
         let over_budget = usage - max;
 

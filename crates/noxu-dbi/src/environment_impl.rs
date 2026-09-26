@@ -601,11 +601,22 @@ impl EnvironmentImpl {
         let transactional = cfg.transactional;
         let checkpoint_interval_ms = cfg.checkpointer_wakeup_interval_ms;
         let env_home = env_home.into();
-        let lock_manager = Arc::new(LockManager::with_config(
-            cfg.lock_timeout_ms,
-            cfg.n_lock_tables,
-        ));
-        let txn_manager = Arc::new(TxnManager::new(lock_manager.clone()));
+        // C3/SC-5: shared per-category memory counters.  Created here so the
+        // LockManager / TxnManager can feed them (via set_memory_counter, which
+        // needs &mut before the Arc wrap) and the MemoryBudget + eviction
+        // arbiter can read the SAME counters, mirroring JE where LockManager /
+        // Txn update MemoryBudget.{lock,txn}MemoryUsage and the arbiter reads
+        // the sum of all categories.
+        let lock_memory_counter =
+            Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let txn_memory_counter = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let mut lock_manager_inner =
+            LockManager::with_config(cfg.lock_timeout_ms, cfg.n_lock_tables);
+        lock_manager_inner.set_memory_counter(Arc::clone(&lock_memory_counter));
+        let lock_manager = Arc::new(lock_manager_inner);
+        let mut txn_manager_inner = TxnManager::new(lock_manager.clone());
+        txn_manager_inner.set_memory_counter(Arc::clone(&txn_memory_counter));
+        let txn_manager = Arc::new(txn_manager_inner);
 
         // REC-S/REC-C/L-30: the env's three id sequences.  Created here as
         // Arc so the checkpointer can read the current maxima at checkpoint
@@ -1103,20 +1114,35 @@ impl EnvironmentImpl {
         let primary_tree: Arc<std::sync::RwLock<noxu_tree::Tree>> =
             Arc::new(std::sync::RwLock::new(primary_tree_inner));
 
+        // DBI-20/21 + C3/SC-5: the real per-category memory budget.  Its tree
+        // category shares `cache_usage` with the arbiter; its lock / txn
+        // categories share the counters the LockManager / TxnManager feed, so
+        // total memory (not just tree nodes) is visible.  Built before the
+        // arbiter so the arbiter can read the SAME non-tree counters.
+        let memory_budget = Arc::new(crate::memory_budget::MemoryBudget::new(
+            arbiter_budget,
+            Arc::clone(&cache_usage),
+            Arc::clone(&lock_memory_counter),
+            Arc::clone(&txn_memory_counter),
+        ));
+
+        // C3/SC-5: the arbiter reads the SUM of all budget categories
+        // (tree + lock + txn + admin), matching JE `Evictor.isCacheFull` ->
+        // `MemoryBudget.getCacheMemoryUsage()`.  A lock/txn-heavy workload
+        // therefore generates eviction pressure.  The eviction loop only ever
+        // reclaims tree bytes; the NEW-7 no-progress bound keeps it from
+        // spinning when only non-evictable lock/txn memory remains over budget.
         let arbiter = Arbiter::new(
             arbiter_budget,
             Arc::clone(&cache_usage),
             evict_bytes,
             critical_threshold,
-        );
-
-        // DBI-20/21: the real per-category memory budget.  Its tree category
-        // shares `cache_usage` with the arbiter; lock / txn / admin categories
-        // are added on top so total memory (not just tree nodes) is visible.
-        let memory_budget = Arc::new(crate::memory_budget::MemoryBudget::new(
-            arbiter_budget,
-            Arc::clone(&cache_usage),
-        ));
+        )
+        .with_non_tree_counters(vec![
+            Arc::clone(&lock_memory_counter),
+            Arc::clone(&txn_memory_counter),
+            memory_budget.admin_memory_counter(),
+        ]);
         // Build optional off-heap cache from config ( MAX_OFF_HEAP_MEMORY).
         let off_heap_cache = Arc::new(noxu_evictor::OffHeapCache::new(
             cfg.max_off_heap_memory > 0,
