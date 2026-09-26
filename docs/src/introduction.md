@@ -17,7 +17,7 @@ Linux futex, socket options), for memory-mapped I/O, and for a handful of
 > phase; it was retired in favour of this summary plus the tracked
 > limitations list, which are kept current with the code.)
 
-**Storage and transactions**
+### Storage and transactions
 
 - Single-process transactional key-value storage with ACID commit.
 - Sorted-duplicate values on primary databases.
@@ -31,7 +31,7 @@ Linux futex, socket options), for memory-mapped I/O, and for a handful of
 - Per-record TTL / expiration (hour/day granularity), reclaimed by the
   cleaner and honoured across recovery.
 
-**Cursors and secondary indexes**
+### Cursors and secondary indexes
 
 - Range and duplicate navigation (`Get::SearchGte`, `NextDup`/`PrevDup`,
   etc.); `DiskOrderedCursor` for high-throughput unordered multi-database
@@ -40,7 +40,7 @@ Linux futex, socket options), for memory-mapped I/O, and for a handful of
   secondaries, `JoinCursor`, and foreign-key constraints
   (`Abort` / `Cascade` / `Nullify`).
 
-**Higher-level APIs**
+### Higher-level APIs
 
 - Collections: typed `StoredMap<K, V>`, `StoredSet<K>`, `StoredList<V>` with
   `TransactionRunner` deadlock retry.
@@ -50,7 +50,7 @@ Linux futex, socket options), for memory-mapped I/O, and for a handful of
 - Serialization bindings (tuple, entry, serde) with version-checking magic
   headers.
 
-**Distribution and durability**
+### Distribution and durability
 
 - XA distributed transactions (two-phase commit), crash-durable across
   restart via a `TxnPrepare` WAL record.
@@ -61,8 +61,10 @@ Linux futex, socket options), for memory-mapped I/O, and for a handful of
 - Hot backup (`Environment::start_backup`) that pins the log-file set against
   the cleaner while the caller copies it.
 
-**Known bounds** (see [Known Limitations](operations/known-limitations.md)
-for the full, current list):
+### Known bounds
+
+(See [Known Limitations](operations/known-limitations.md) for the full,
+current list.)
 
 - Replication defaults to mutually-authenticated mTLS and **refuses to start
   on an unauthenticated transport** unless the operator opts out
