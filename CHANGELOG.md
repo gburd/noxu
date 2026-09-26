@@ -174,6 +174,14 @@ listed in [References](#references).
   key) at the comparator-sorted position and searches by reconstructing the full
   key under the comparator (matching JE, which keeps prefixing active with a
   comparator). Found by a faithful port of JE's `KeyPrefixTest.testRLEComparator`.
+- **Opening a database with an already-closed transaction is now rejected
+  (NEW-TXN-1).** `Environment::open_database` did not validate the passed
+  transaction's state, so opening or creating a database through a committed or
+  aborted transaction was silently accepted. It now rejects a non-open
+  transaction with `TransactionAborted`, matching the data path (`put`/`get` on
+  a closed transaction) and JE (which rejects any operation on a closed
+  transaction). Auto-commit (`None`) and open-transaction opens are unaffected.
+  Found by a faithful port of JE's `TxnEndTest.testClose`.
 
 - **WAL now fail-stops the environment on a critical log-write failure (JE
   `LogManager.serialLog` parity).** A failed or partial WAL write previously left
