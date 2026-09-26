@@ -22,7 +22,7 @@ thiserror = { workspace = true }
 log = { workspace = true }
 bytes = { workspace = true }
 memmap2 = { workspace = true }
-lru = "0.16"
+lru = "0.18"
 
 [features]
 # Non-default, scan-resistant eviction policies (CLOCK, LIRS, ARC, CAR,
