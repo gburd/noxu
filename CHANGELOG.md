@@ -148,6 +148,23 @@ listed in [References](#references).
   carry no fanout marker and continue to use the environment-level fallback; no
   log-format version bump.
 
+### Security
+
+- **Replication elections and admin RPC now bind to the verified TLS peer
+  identity (S1/F3b/F5).** Previously the Paxos acceptor believed the self-reported
+  `node_name` in an election proposal with no binding to the sender's certificate
+  (an allowlisted peer could impersonate another member), and the ADMIN service
+  performed no per-command authorization (any transport-admitted peer could shut
+  down or transfer mastership of the group). Handlers can now read the
+  TLS-verified peer identity (`Channel::peer_identity`): under mTLS an election
+  proposal's `node_name` must match the verified certificate, and the privileged
+  admin commands (`SHUTDOWN_GROUP`, `TRANSFER_MASTER`, `STEP_DOWN`) require an
+  authenticated caller in the new `RepConfig::admin_allowlist` (defaults to the
+  full peer allowlist). Under an unauthenticated transport the privileged
+  commands are rejected unless the operator sets `RepConfig::insecure_admin`
+  (fail-closed by default). Authorization reads the verified channel identity,
+  never a wire-supplied name.
+
 - **WAL now fail-stops the environment on a critical log-write failure (JE
   `LogManager.serialLog` parity).** A failed or partial WAL write previously left
   the log manager's LSN/buffer/file correspondence inconsistent and allowed
