@@ -27,13 +27,15 @@ pub struct MemoryBudget {
     /// Tree (IN/BIN) memory.  Backed by the shared `cache_usage` `Arc` the
     /// tree path increments and the arbiter reads — JE `treeMemoryUsage`.
     tree_memory_usage: Arc<AtomicI64>,
-    /// Lock-table memory — JE `lockMemoryUsage`.
-    lock_memory_usage: AtomicI64,
-    /// Transaction memory — JE `txnMemoryUsage`.
-    txn_memory_usage: AtomicI64,
+    /// Lock-table memory — JE `lockMemoryUsage`.  Backed by the shared `Arc`
+    /// the `LockManager` increments on each lock-table entry (C3/SC-5).
+    lock_memory_usage: Arc<AtomicI64>,
+    /// Transaction memory — JE `txnMemoryUsage`.  Backed by the shared `Arc`
+    /// the `TxnManager` increments per active transaction (C3/SC-5).
+    txn_memory_usage: Arc<AtomicI64>,
     /// Admin / misc memory (e.g. cleaner utilization tracker) —
     /// JE `adminMemoryUsage`.
-    admin_memory_usage: AtomicI64,
+    admin_memory_usage: Arc<AtomicI64>,
     /// Current cache usage: log buffer memory.
     log_buffer_budget: i64,
 }
@@ -69,17 +71,25 @@ impl MemoryOverhead {
 
 impl MemoryBudget {
     /// Creates a new MemoryBudget whose tree category is backed by the shared
-    /// `cache_usage` counter the tree path increments and the arbiter reads.
-    pub fn new(max_memory: i64, tree_memory_usage: Arc<AtomicI64>) -> Self {
+    /// `cache_usage` counter the tree path increments and the arbiter reads,
+    /// and whose lock / txn categories are backed by the shared counters the
+    /// `LockManager` / `TxnManager` feed (C3/SC-5).  The admin category is an
+    /// owned counter fed via [`Self::update_admin_memory_usage`].
+    pub fn new(
+        max_memory: i64,
+        tree_memory_usage: Arc<AtomicI64>,
+        lock_memory_usage: Arc<AtomicI64>,
+        txn_memory_usage: Arc<AtomicI64>,
+    ) -> Self {
         // Reserve 7% for log buffers (matching default)
         let log_buffer_budget = max_memory * 7 / 100;
 
         MemoryBudget {
             max_memory,
             tree_memory_usage,
-            lock_memory_usage: AtomicI64::new(0),
-            txn_memory_usage: AtomicI64::new(0),
-            admin_memory_usage: AtomicI64::new(0),
+            lock_memory_usage,
+            txn_memory_usage,
+            admin_memory_usage: Arc::new(AtomicI64::new(0)),
             log_buffer_budget,
         }
     }
@@ -125,6 +135,23 @@ impl MemoryBudget {
     /// The shared tree-memory counter, so the arbiter and tree can clone it.
     pub fn tree_memory_counter(&self) -> Arc<AtomicI64> {
         Arc::clone(&self.tree_memory_usage)
+    }
+
+    /// The shared lock-memory counter, so the `LockManager` and the arbiter
+    /// can clone it (C3/SC-5).
+    pub fn lock_memory_counter(&self) -> Arc<AtomicI64> {
+        Arc::clone(&self.lock_memory_usage)
+    }
+
+    /// The shared txn-memory counter, so the `TxnManager` and the arbiter can
+    /// clone it (C3/SC-5).
+    pub fn txn_memory_counter(&self) -> Arc<AtomicI64> {
+        Arc::clone(&self.txn_memory_usage)
+    }
+
+    /// The shared admin-memory counter, so the arbiter can clone it.
+    pub fn admin_memory_counter(&self) -> Arc<AtomicI64> {
+        Arc::clone(&self.admin_memory_usage)
     }
 
     // Lock memory — JE updateLockMemoryUsage.
@@ -193,7 +220,12 @@ mod tests {
     use super::*;
 
     fn budget(max: i64) -> MemoryBudget {
-        MemoryBudget::new(max, Arc::new(AtomicI64::new(0)))
+        MemoryBudget::new(
+            max,
+            Arc::new(AtomicI64::new(0)),
+            Arc::new(AtomicI64::new(0)),
+            Arc::new(AtomicI64::new(0)),
+        )
     }
 
     #[test]
@@ -248,7 +280,12 @@ mod tests {
         // The tree counter is the SAME Arc the arbiter reads: an external
         // tree-path update must be visible through the budget.
         let shared = Arc::new(AtomicI64::new(0));
-        let budget = MemoryBudget::new(1000, Arc::clone(&shared));
+        let budget = MemoryBudget::new(
+            1000,
+            Arc::clone(&shared),
+            Arc::new(AtomicI64::new(0)),
+            Arc::new(AtomicI64::new(0)),
+        );
         shared.fetch_add(250, Ordering::Relaxed); // simulate tree-path insert
         assert_eq!(budget.get_tree_memory_usage(), 250);
         assert_eq!(budget.total_usage(), 250);

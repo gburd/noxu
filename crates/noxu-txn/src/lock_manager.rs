@@ -50,7 +50,18 @@ use crate::lock_info::WaiterNotify;
 use crate::{
     DeadlockDetector, Lock, LockGrantType, LockStats, LockType, TxnError,
 };
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+
+/// Per-lock resident memory charged to the MemoryBudget lock category when a
+/// new `Lock` is created in a shard table, and credited back when it is
+/// removed.  Mirrors JE `MemoryBudget.LOCKIMPL_OVERHEAD_64` (48) +
+/// `LOCKINFO_OVERHEAD_64` (32): every entry in the lock table costs at least
+/// one `LockImpl` plus one `LockInfo` for its first owner.  This is a
+/// deliberately coarse per-lock approximation (not per-owner) — enough to
+/// make a large lock table visible to the over-budget arbiter, which is the
+/// whole point of the category (C3/SC-5).  A relaxed atomic add/sub, no extra
+/// lock: the shard mutex is already held at both the add and sub sites.
+const LOCK_ENTRY_MEMORY: i64 = 48 + 32;
 
 /// Number of lock table shards.
 ///
@@ -184,6 +195,15 @@ pub struct LockManager {
     /// and 50 ms re-detection slice a pure function of the simulated timeline.
     /// Defaults to [`RealClock`] — production behavior is unchanged.
     clock: Arc<dyn Clock>,
+
+    /// Shared lock-table memory counter (bytes), read by the MemoryBudget's
+    /// lock category so a large lock table is visible to the eviction
+    /// over-budget arbiter (C3/SC-5).  Incremented `LOCK_ENTRY_MEMORY` on each
+    /// new lock-table entry, decremented on removal.  A private zero-Arc until
+    /// `set_memory_counter` shares the env's `MemoryBudget` counter into it,
+    /// so unit-test managers that never wire it stay a no-op.  Relaxed atomic;
+    /// mirrors JE `LockManager` updating `MemoryBudget.lockMemoryUsage`.
+    lock_memory_counter: Arc<AtomicI64>,
 }
 
 /// Internal statistics tracking.
@@ -255,7 +275,37 @@ impl LockManager {
             locker_labels: RwLock::new(HashMap::new()),
             non_preemptable: RwLock::new(HashSet::new()),
             clock,
+            lock_memory_counter: Arc::new(AtomicI64::new(0)),
         }
+    }
+
+    /// Shares an external lock-memory counter (bytes) into this manager so the
+    /// MemoryBudget's lock category tracks the resident lock-table footprint
+    /// (C3/SC-5).  Called once at env-open by `EnvironmentImpl`; mirrors JE
+    /// wiring `LockManager` to `MemoryBudget.updateLockMemoryUsage`.  Must be
+    /// called before any lock is taken (the counter starts from the current
+    /// table state == empty).
+    pub fn set_memory_counter(&mut self, counter: Arc<AtomicI64>) {
+        self.lock_memory_counter = counter;
+    }
+
+    /// Charges one lock-table entry to the shared lock-memory counter.
+    #[inline]
+    fn charge_lock_entry(&self) {
+        self.lock_memory_counter
+            .fetch_add(LOCK_ENTRY_MEMORY, Ordering::Relaxed);
+    }
+
+    /// Credits one removed lock-table entry back to the shared counter,
+    /// clamped at zero (the per-lock charge is an approximation, so a
+    /// transient over-credit must not drive the category negative).
+    #[inline]
+    fn credit_lock_entry(&self) {
+        let _ = self.lock_memory_counter.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |cur| Some((cur - LOCK_ENTRY_MEMORY).max(0)),
+        );
     }
 
     /// Registers a diagnostic label for `locker_id`.
@@ -502,7 +552,11 @@ impl LockManager {
         // "Attempt to lock without any initial wait."
         let (initial_grant, owner_ids, notify_pair) = {
             let mut table = self.lock_tables[table_idx].lock();
+            let is_new_entry = !table.contains_key(&lsn);
             let lock = table.entry(lsn).or_insert_with(Lock::new_thin);
+            if is_new_entry {
+                self.charge_lock_entry();
+            }
 
             let result = lock.lock_with_sharing(
                 lock_type,
@@ -878,6 +932,7 @@ impl LockManager {
             // table to free memory.
             if lock.n_owners() == 0 && lock.n_waiters() == 0 {
                 table.remove(&lsn);
+                self.credit_lock_entry();
             }
         }
 
@@ -942,6 +997,7 @@ impl LockManager {
                     released += 1;
                     if lock.n_owners() == 0 && lock.n_waiters() == 0 {
                         table.remove(&lsn);
+                        self.credit_lock_entry();
                     }
                 }
             }
@@ -973,7 +1029,11 @@ impl LockManager {
         let table_idx = self.get_table_index(lsn);
         let mut table = self.lock_tables[table_idx].lock();
 
+        let is_new_entry = !table.contains_key(&lsn);
         let lock = table.entry(lsn).or_insert_with(Lock::new_thin);
+        if is_new_entry {
+            self.charge_lock_entry();
+        }
         let _preempted = lock.steal_lock(locker_id);
 
         Ok(())
@@ -1008,7 +1068,11 @@ impl LockManager {
 
         let table_idx = self.get_table_index(lsn);
         let mut table = self.lock_tables[table_idx].lock();
+        let is_new_entry = !table.contains_key(&lsn);
         let lock = table.entry(lsn).or_insert_with(Lock::new_thin);
+        if is_new_entry {
+            self.charge_lock_entry();
+        }
 
         // flushWaiter: our waiter entry may still be present.
         lock.flush_waiter(locker_id);
@@ -1323,6 +1387,7 @@ impl LockManager {
                 lock.flush_waiter(locker_id);
                 if lock.n_owners() == 0 && lock.n_waiters() == 0 {
                     table.remove(&lsn);
+                    self.credit_lock_entry();
                 }
             }
         }

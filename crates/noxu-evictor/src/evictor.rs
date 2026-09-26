@@ -2770,6 +2770,51 @@ mod tests {
         assert!(stats.get(&stats.bytes_evicted_critical) > 0);
     }
 
+    /// C3/SC-5 convergence guard: the NEW-7 `do_evict` loop MUST terminate
+    /// (not spin) when the cache is over budget SOLELY because of non-tree,
+    /// non-evictable memory (lock/txn) that eviction cannot reclaim.
+    ///
+    /// Setup: tree usage 0 (empty LRU, nothing to evict) but a non-tree
+    /// counter drives the arbiter's total over budget.  `still_needs_eviction`
+    /// therefore stays true, but a batch frees no tree bytes and leaves the
+    /// LRU lists unchanged, so the no-progress bound must break the loop.
+    /// A bounded wall-clock assert catches a regression that makes the loop
+    /// spin forever on non-evictable overage.
+    #[test]
+    fn test_new7_loop_terminates_on_nonevictable_over_budget() {
+        use std::time::Instant;
+        let tree_usage = Arc::new(AtomicI64::new(0));
+        let non_tree = Arc::new(AtomicI64::new(10_000)); // way over budget
+        let arbiter = Arbiter::new(1000, Arc::clone(&tree_usage), 100, 200)
+            .with_non_tree_counters(vec![Arc::clone(&non_tree)]);
+        assert!(
+            arbiter.still_needs_eviction(),
+            "non-tree memory must register as over budget"
+        );
+        let e = Evictor::new(arbiter, 100, false);
+        // No nodes registered: the LRU is empty, so eviction can reclaim
+        // nothing.  The loop must still return promptly.
+        let start = Instant::now();
+        let r = e.do_evict(EvictionSource::Daemon);
+        let elapsed = start.elapsed();
+        assert_eq!(
+            r.nodes_evicted, 0,
+            "no tree nodes exist, so nothing can be evicted"
+        );
+        assert!(
+            elapsed.as_secs() < 5,
+            "NEW-7 no-progress bound must terminate the loop on non-evictable \
+             over-budget; took {elapsed:?} (regression: infinite spin)"
+        );
+        // The non-tree overage remains (eviction cannot touch it) — the
+        // arbiter correctly still reports over budget, which is the accounting
+        // the finding requires (stats/monitoring see the true footprint).
+        assert!(
+            e.get_arbiter().still_needs_eviction(),
+            "non-evictable overage is correctly still accounted after eviction"
+        );
+    }
+
     #[test]
     fn test_shutdown_stops_eviction() {
         let usage = Arc::new(AtomicI64::new(0));
