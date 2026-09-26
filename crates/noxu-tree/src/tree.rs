@@ -10453,6 +10453,58 @@ mod tests {
         }
     }
 
+    // ========================================================================
+    // JE: MemorySizeTest.testKeyPrefixChange
+    //     (je/test/com/sleepycat/je/tree/MemorySizeTest.java)
+    //
+    // JE inserts records sharing a key prefix, then changes the BIN's key
+    // prefix and asserts `bin.getInMemorySize()` CHANGES (the MemoryBudget
+    // must track prefix bytes).  Noxu ports MemoryBudget as explicit
+    // `budgeted_memory_size()`, which charges `key_prefix.len()` +
+    // `keys.memory_size()`.  Establishing (or shrinking) a shared prefix moves
+    // bytes between the shared prefix and the per-slot suffixes, changing the
+    // node's budgeted size.
+    //
+    // (JE's `testMemSizeMaintenanceDups` / `testSlotReuseMaintenance` — the
+    // exhaustive validateNodeMemUsage sweeps across split/modify/delete/
+    // compress/checkpoint/evict — are exercised end-to-end by the eviction and
+    // recovery suites; this unit test pins the prefix-specific accounting the
+    // remediation touched.)
+    // ========================================================================
+    #[test]
+    fn memorysize_key_prefix_change_changes_budgeted_size() {
+        // Build a BIN of keys sharing a long common byte prefix, with NO
+        // prefix computed yet (each slot holds its full key).
+        let full: Vec<Vec<u8>> = (0..9u8)
+            .map(|i| {
+                let mut k = b"herococo".to_vec();
+                k.push(b'1' + i);
+                k
+            })
+            .collect();
+        // BinStub is not Clone, so build two identical BINs.
+        let before = TreeNode::Bottom(bin_with_physical_keys(full.clone()))
+            .budgeted_memory_size();
+
+        // Compute the shared prefix ("herococo").  This moves 8 bytes out of
+        // every one of the 9 suffixes into the single shared prefix, so the
+        // total budgeted key bytes MUST shrink.
+        let mut bin = bin_with_physical_keys(full);
+        bin.recompute_key_prefix();
+        assert_eq!(bin.key_prefix, b"herococo", "shared prefix must form");
+        let after = TreeNode::Bottom(bin).budgeted_memory_size();
+
+        assert_ne!(
+            before, after,
+            "establishing a key prefix must change the BIN's budgeted size"
+        );
+        assert!(
+            after < before,
+            "an 8-byte prefix shared by 9 slots must SHRINK the budgeted key \
+             bytes (before={before} after={after})"
+        );
+    }
+
     #[test]
     fn test_empty_tree() {
         let tree = Tree::new(1, 128);
