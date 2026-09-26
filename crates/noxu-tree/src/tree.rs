@@ -16179,6 +16179,11 @@ mod tests {
     }
 
     #[test]
+    // JE: GetParentNodeTest.testBasic — on a multi-level tree, every BIN's
+    // parent search (`getParentINForChildIN`) finds an Internal-node parent at
+    // a valid slot.  (The 'potential node' inexact-parent arm of the JE test
+    // is N/A: Noxu's `get_parent_in_for_child_in` is keyed by node id and has
+    // no by-key inexact-fit variant.)
     fn test_get_parent_in_for_child_in_multi_level() {
         // Build a tree with at least 3 levels so we test the recursive descent.
         let tree = Tree::new(1, 4);

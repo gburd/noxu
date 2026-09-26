@@ -701,12 +701,29 @@ fn rle_to_str(b: &[u8]) -> String {
 // inserting > fanout RLE-encoded keys into a key-prefixing DB with an RLE
 // comparator makes keys unretrievable starting at the first BIN split
 // (insert #128 at the default fanout); ~250/300 keys are missing at the end.
-// The same workload with prefixing OFF loses nothing, and a byte-order-
-// *consistent* comparator (reverse) + prefixing also loses nothing — so the
-// fault is the interaction of (split-time suffix re-encoding / split-key
-// selection, which is byte-based) with a comparator whose order is NOT the
-// byte order.  JE's KeyPrefixTest.testRLEComparator combines exactly these
-// features and passes, so this is a genuine Noxu fidelity gap, not a JE-ism.
+// Controls: prefixing OFF loses nothing; a byte-order-*consistent* comparator
+// (reverse) + prefixing also loses nothing.  A whole-tree cursor walk after the
+// split is NOT in comparator order (walk_sorted=false) even though every key is
+// physically present — the BINs are byte-ordered while descent/lookup are
+// comparator-ordered, so keys become unreachable.
+//
+// Root cause (noxu-tree/src/tree.rs): key prefixing (a BYTE-common-prefix) is
+// applied to comparator-ordered BINs.  Two loci:
+//   1. `BinStub::insert_cmp` else-branch (~tree.rs:2085): when the BIN already
+//      has a non-empty prefix it stores the FULL key via `insert_slot`, mixing
+//      full keys with prefix-stripped suffixes in the same node.
+//   2. `Tree::split_child` (~tree.rs:4649): re-prefixes the split halves with
+//      `recompute_key_prefix()` (byte-based `compute_key_prefix` +
+//      byte-`compress_key` suffix truncation) whenever `key_prefixing` is true
+//      — it does NOT also require `key_comparator.is_none()`.  Noxu's own design
+//      note (tree.rs:305) says a configured comparator must SKIP prefixing
+//      (`insert_raw`); the split/reconstitute paths don't honour that when both
+//      key_prefixing AND a comparator are set.
+// Fix direction: gate every prefix-compute/re-encode path on
+// `key_comparator.is_none()` (comparator ⇒ no prefixing, store full keys), OR
+// make prefix computation comparator-aware.  JE's KeyPrefixTest.testRLEComparator
+// combines prefixing + a non-byte-order comparator and passes, so this is a
+// genuine Noxu fidelity gap, not a JE-ism.
 //
 // This is a FAITHFUL port kept #[ignore]d (not weakened) per the test-parity
 // contract: it must pass once the split/prefix path respects the configured
