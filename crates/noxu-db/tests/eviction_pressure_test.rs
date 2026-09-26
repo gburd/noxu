@@ -156,7 +156,6 @@ fn delete_heavy_does_not_inflate_cache_usage() {
 /// Writes are batched via `fill_batched` (see its doc comment) to avoid one
 /// `fdatasync` per record; unrelated to the scan-path behaviour under test.
 /// Measured: 154.6s -> see the batched timing recorded at commit time.
-#[ignore = "NEW-8 (pre-existing cursor bug, HIGH severity, no on-disk data loss): this test is now the DETERMINISTIC reproduction. After real eviction the cursor scan (Get::First + Next) returns only PARTIAL data (observed scan=0 or ~55% of n, 3/3 runs) while point-get and the data assertions on the visited records still pass. Root cause: the cursor scan-start descent helpers in cursor_impl.rs (descend_to_bin / find_bin_for_key / descend_to_last_bin) walk IN.get_child(idx), which returns None for an evicted child, so the descent aborts instead of re-faulting the child from the log the way the point-read path (Tree::search_with_data) does. PRE-EXISTING on clean base cb0b5cac (500 evict_memory() calls -> scan 10986/20000 while point-get 20000/20000, env.verify clean). NEW-7 (the do_evict loop) merely makes eviction effective enough to detach edge/interior BINs and expose this every run. See new8-cursor-descent-refault.md. Un-ignore when NEW-8 is fixed."]
 #[test]
 fn cursor_scan_under_eviction_returns_all_data() {
     use noxu_db::Get;
@@ -663,4 +662,90 @@ fn bounded_eviction_converges_and_evicts_dirty_bins() {
         );
         assert_eq!(out.data(), &val[..], "record {i} data intact");
     }
+}
+
+/// NEW-8 (get_last / Prev direction): a full backward cursor scan
+/// (Get::Last + repeated Get::Prev) over a working set larger than the cache
+/// must visit EVERY record. The rightmost scan-start descent
+/// (Tree::get_last_node / descend_to_last_bin) must re-fault an evicted child
+/// from the log, exactly like the forward scan and the point-read path.
+#[test]
+fn cursor_reverse_scan_under_eviction_returns_all_data() {
+    use noxu_db::Get;
+    let dir = TempDir::new().unwrap();
+    let (env, db) = open_small_cache_env(dir.path(), 2 * 1024 * 1024);
+
+    let n = 20_000usize;
+    let val = vec![9u8; 80];
+    fill_batched(&env, &db, n, &val);
+    let _ = env.evict_memory().unwrap();
+
+    let mut cursor = db.open_cursor(None).unwrap();
+    let mut key = DatabaseEntry::new();
+    let mut data = DatabaseEntry::new();
+    let mut count = 0usize;
+    let mut st = cursor.get(&mut key, &mut data, Get::Last, None).unwrap();
+    while st == OperationStatus::Success {
+        assert_eq!(
+            data.data(),
+            &val[..],
+            "reverse-scanned record {} ({:?}) must have full data",
+            count,
+            String::from_utf8_lossy(key.data())
+        );
+        count += 1;
+        st = cursor.get(&mut key, &mut data, Get::Prev, None).unwrap();
+    }
+    assert_eq!(count, n, "reverse scan must visit every record");
+}
+
+/// NEW-8 (range / find_bin_for_key): a range seek (Get::SearchGte) to a key
+/// whose containing BIN sits under an evicted interior child must re-fault the
+/// child and land in the right BIN, then scan forward to the end visiting
+/// every remaining record. Exercises the range scan-start descent, not just
+/// the leftmost/rightmost edges.
+#[test]
+fn cursor_range_seek_under_eviction_finds_all_from_mid() {
+    use noxu_db::Get;
+    let dir = TempDir::new().unwrap();
+    let (env, db) = open_small_cache_env(dir.path(), 2 * 1024 * 1024);
+
+    let n = 20_000usize;
+    let val = vec![3u8; 80];
+    fill_batched(&env, &db, n, &val);
+    let _ = env.evict_memory().unwrap();
+
+    // Seek to a mid-range key (well inside the tree, so the descent must
+    // route through interior INs that may have evicted children).
+    let start = n / 3;
+    let mut cursor = db.open_cursor(None).unwrap();
+    let mut key =
+        DatabaseEntry::from_vec(format!("{:010}", start).into_bytes());
+    let mut data = DatabaseEntry::new();
+    let mut st = cursor.get(&mut key, &mut data, Get::SearchGte, None).unwrap();
+    assert_eq!(
+        st,
+        OperationStatus::Success,
+        "range seek to mid-key {} must find a record (child re-fault)",
+        start
+    );
+    // From the found position (>= start), scan forward to the end; every key
+    // from the landing point through n-1 must be visited, in order.
+    let mut expect = start;
+    let mut count = 0usize;
+    while st == OperationStatus::Success {
+        let k: usize = String::from_utf8_lossy(key.data())
+            .parse()
+            .expect("numeric key");
+        assert_eq!(k, expect, "range scan must be gap-free from mid-point");
+        assert_eq!(data.data(), &val[..], "range-scanned data must be full");
+        expect += 1;
+        count += 1;
+        st = cursor.get(&mut key, &mut data, Get::Next, None).unwrap();
+    }
+    assert_eq!(
+        count,
+        n - start,
+        "range scan from mid-point must visit every remaining record"
+    );
 }
