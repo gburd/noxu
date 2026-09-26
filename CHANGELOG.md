@@ -157,6 +157,18 @@ listed in [References](#references).
   test-reported "reverse-split recovery loses all data" symptom that was in fact
   this cursor-scan bug in the test's readback — recovery itself was correct: the
   data was always on disk and retrievable by key.)
+- **The exported evictor metrics report real values instead of constants.**
+  `noxu_evictor_cache_hit_ratio` was permanently `1.0` and
+  `noxu_evictor_lru_size` permanently `0` — their backing counters had no
+  production writers, so a monitoring dashboard showed a perfect cache and an
+  empty LRU regardless of workload. Both are now wired to real fetch/miss and
+  resident-node counts (matching JE), with a clamp and a debug assertion as a
+  backstop and a guard test that fails if an exported evictor metric stops
+  moving. Replication health metrics (`RepStats`) remain unwired and unexported
+  (no fabricated replication gauge ships) and are tracked separately. **Note:**
+  a related eviction-convergence limitation (bounded eviction can leave a cache
+  over its budget) is tracked as a follow-up; one metrics guard is temporarily
+  disabled because of it.
 - **Eviction no longer detaches a BIN that was re-dirtied or pinned since its
   flush.** The evictor logged a dirty BIN under the child latch, released it,
   then detached under the parent latch — a window in which a cursor could
