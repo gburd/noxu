@@ -90,12 +90,19 @@ The process may crash if:
 
 ## Memory Safety
 
-Noxu DB targets **zero `unsafe` code** in core crates:
+Noxu DB targets **zero `unsafe` code** in core data-path crates:
 
-- All concurrency through `parking_lot::Mutex/RwLock`
+- All concurrency through `noxu-sync::Mutex/RwLock` — Noxu's own futex-based,
+  `lock_api`-shaped primitives (`parking_lot` was removed from every shipped
+  crate in v7.7.0 and is now a dev-dependency benchmark baseline only)
 - Tree nodes use `Arc<RwLock<IN>>` for shared ownership
 - Atomic operations use `std::sync::atomic` with correct orderings
-- Exceptions limited to: `memmap2` (memory-mapped files), potential off-heap cache
+- `unsafe` is confined to four crates: `noxu-sync` (Linux futex FFI +
+  the raw mutex/rwlock primitives), `noxu-log` (memory-mapped files),
+  `noxu-rep` (one socket-option FFI block), and `noxu-latch` (one RAII
+  force-unlock).  See [AGENTS.md](AGENTS.md) for the authoritative per-crate
+  `unsafe` inventory; every production `unsafe` block carries a `// SAFETY:`
+  comment
 
 ## Replication Safety
 

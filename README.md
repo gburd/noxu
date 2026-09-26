@@ -52,10 +52,7 @@ directly.
 Open an environment, write a record, and read it back:
 
 ```rust
-use noxu::{
-    DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig, Get,
-    OperationStatus,
-};
+use noxu::{DatabaseConfig, Environment, EnvironmentConfig};
 use std::path::PathBuf;
 
 fn main() -> noxu::Result<()> {
@@ -71,32 +68,25 @@ fn main() -> noxu::Result<()> {
         .with_transactional(true);
     let db = env.open_database(None, "mydb", &db_config)?;
 
-    // Auto-commit put.
-    let key = DatabaseEntry::from_bytes(b"hello");
-    let value = DatabaseEntry::from_bytes(b"world");
-    db.put(None, &key, &value)?;
+    // Auto-commit put: the unadorned `put` writes and commits atomically.
+    // Keys and values accept any `impl AsRef<[u8]>`.
+    db.put(b"hello", b"world")?;
 
-    // Auto-commit get.
-    let mut result = DatabaseEntry::new();
-    let status = db.get(None, &key, &mut result)?;
-    assert_eq!(status, OperationStatus::Success);
-    assert_eq!(result.data(), b"world");
+    // Reads return `Result<Option<Bytes>>` — `Some(value)` on a hit.
+    if let Some(value) = db.get(b"hello")? {
+        assert_eq!(value.as_ref(), b"world");
+    }
 
-    // Explicit transaction.
+    // Explicit transaction: `put_in` / `get_in` take the transaction by name.
     let txn = env.begin_transaction(None)?;
-    db.put(
-        Some(&txn),
-        &DatabaseEntry::from_bytes(b"key2"),
-        &DatabaseEntry::from_bytes(b"val2"),
-    )?;
+    db.put_in(&txn, b"key2", b"val2")?;
+    let _got = db.get_in(&txn, b"key2")?;
     txn.commit()?;
 
-    // Cursor scan.
-    let mut cursor = db.open_cursor(None, None)?;
-    let mut k = DatabaseEntry::new();
-    let mut v = DatabaseEntry::new();
-    while cursor.get(&mut k, &mut v, Get::Next, None)? == OperationStatus::Success {
-        println!("{:?} => {:?}", k.data(), v.data());
+    // Cursor scan: `next()` returns `Some((key, value))` or `None` at the end.
+    let mut cursor = db.open_cursor(None)?;
+    while let Some((k, v)) = cursor.next()? {
+        println!("{:?} => {:?}", k.as_ref(), v.as_ref());
     }
     cursor.close()?;
 
@@ -238,17 +228,22 @@ Starting points:
 - **Idiomatic Rust.**  RAII latches, `Result<T, NoxuError>` error handling,
   enums for closed hierarchies, traits for open extension points.
 - **Minimal core dependencies.**  The core engine pulls in only
-  `parking_lot`, `thiserror`, `log`, `bytes`, `crc32fast`, `byteorder`,
+  `thiserror`, `log`, `bytes`, `crc32fast`, `byteorder`,
   `memmap2`, `fs2`, plus `hashbrown`, `lock_api`, `lru`, `libc`, and `serde`.
+  Concurrency uses Noxu's own `noxu-sync` primitives (futex-based,
+  `lock_api`-shaped `Mutex`/`RwLock`), not `parking_lot` — which was removed
+  from every shipped crate in v7.7.0 and now appears only as a
+  dev-dependency benchmark baseline.
   Replication (`noxu-rep`) and observability (`noxu-observe`) pull in
   additional dependencies (`tokio`, `quinn`, `rustls` / `native-tls`,
   `tracing`, `metrics`, `opentelemetry`) only when their features are
   enabled.
 - **Limited unsafe.**  Core data-path crates target zero `unsafe`.  The
-  exceptions are `noxu-sync` (FFI to libc futex / `parking_lot` raw
-  locking), `noxu-log` (memory-mapped I/O), `noxu-rep` (network I/O glue +
-  `parking_lot` raw locking), and one `unsafe` block each in `noxu-latch`
-  (RAII force-unlock); each is documented inline.
+  exceptions are `noxu-sync` (FFI to the Linux futex plus `lock_api`-shaped
+  raw mutex/rwlock primitives), `noxu-log` (memory-mapped I/O), `noxu-rep`
+  (one socket-option FFI block), and one `unsafe` block in `noxu-latch`
+  (RAII force-unlock); each is documented inline.  See
+  [AGENTS.md](AGENTS.md) for the authoritative per-crate `unsafe` inventory.
 - **No async in the core.**  Core engine uses blocking I/O with explicit
   threading.  Only `noxu-rep` networking uses tokio.
 - **Own log format.**  `.ndb` files are Rust-native and not compatible with

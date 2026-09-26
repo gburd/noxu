@@ -25,7 +25,7 @@ The 22 crates are organized by implementation layer:
 |---|---|
 | `noxu-util` | LSN, VLSN, packed integers, stats, daemon threads |
 | `noxu-sync` | Internal sync primitives (raw mutex/rwlock, condvar, futex) |
-| `noxu-latch` | Exclusive and shared/exclusive latches (parking_lot) |
+| `noxu-latch` | Exclusive and shared/exclusive latches (built on `noxu-sync`) |
 | `noxu-config` | 160+ configuration parameters with validation |
 
 ### Phase 1–6 — Core Engine (complete)
@@ -94,14 +94,18 @@ make docs-serve   # Live-reload docs at http://localhost:3000
   with other database formats. The file header carries a CRC32 (v3); v2 files
   (no header CRC, 32-byte header) remain readable — the first-entry offset is
   resolved per file via `FileHeader::on_disk_size(version)`.
-- **External crates**: Core engine pulls in only `parking_lot`, `thiserror`,
+- **External crates**: Core engine pulls in only `thiserror`,
   `log`, `bytes`, `crc32fast`, `byteorder`, `memmap2`, `fs2`, plus
-  `hashbrown`, `lock_api`, `lru`, `libc`, and `serde`. Replication
+  `hashbrown`, `lock_api`, `lru`, `libc`, and `serde`. Concurrency uses
+  Noxu's own `noxu-sync` primitives, not `parking_lot` (removed from every
+  shipped crate in v7.7.0; now a dev-dependency benchmark baseline only).
+  Replication
   (`noxu-rep`) and observability (`noxu-observe`) pull in extra dependencies
   (`tokio`, `quinn`, `rustls` / `native-tls`, `tracing`, `metrics`,
   `opentelemetry`) only when their features are enabled.
-- **Concurrency**: `parking_lot::Mutex/RwLock` and `noxu-sync` primitives for
-  latches, `std::sync::atomic` for volatile fields, `Arc<RwLock<IN>>` for
+- **Concurrency**: `noxu-sync::Mutex/RwLock` (Noxu's own futex-based,
+  `lock_api`-shaped primitives) for latches and general locking,
+  `std::sync::atomic` for volatile fields, `Arc<RwLock<IN>>` for
   tree nodes.
 - **Isolation model**: Lock-based, NOT MVCC. Writers lock BIN slots; readers
   block on write-locked records.
@@ -120,7 +124,7 @@ make docs-serve   # Live-reload docs at http://localhost:3000
 
   | Crate | Production `unsafe` blocks | Reason |
   |---|---:|---|
-  | `noxu-sync` | ~20 (mostly small) | FFI to `libc` futex and `parking_lot` raw locking primitives. |
+  | `noxu-sync` | ~20 (mostly small) | FFI to the Linux `libc` futex, plus the `lock_api`-shaped raw mutex/rwlock primitives (`NoxuRawMutex`/`NoxuRawRwLock`) Noxu ships in place of `parking_lot`. |
   | `noxu-log` | 7 | Memory-mapped I/O via `Mmap::map`; in `log_buffer.rs`: `as_ptr().add` in `allocate`, `copy_nonoverlapping` in `LogBufferSegment::put`, the `read_latch.unlock` calls in `release`/`put`, and one `unsafe impl Send for LogBufferSegment` (now only the raw `data_ptr` requires it — the latch/pin-count control block is shared via `Arc`, so a `LogBuffer` move no longer dangles a segment; review R-F01); and one `std::mem::transmute` extending a `FileHandleGuard<'_>` to `'static` in `log_source.rs` (sound only because struct fields drop in declaration order — `guard` before `_handle`). |
   | `noxu-rep` | 1 | Single `unsafe` FFI in `net/channel.rs` for socket-option setup. |
   | `noxu-latch` | 1 | RAII force-unlock for poison-recovery. |
