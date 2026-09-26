@@ -1876,23 +1876,35 @@ impl Locker for Txn {
         // request is an internal contention *probe* the DBI cursor layer
         // (`cursor_impl::lock_ln` and friends) issues and then retries with a
         // blocking wait -- a lock WAIT that later SUCCEEDS must NOT poison the
-        // txn.  So we gate poisoning on `!non_blocking`.  (A no-wait txn's real
-        // op still arrives here with the caller's `non_blocking == false`; the
-        // `no_wait` flag is OR-ed in only at the lock-manager call above, so
-        // its `LockNotAvailable` failure correctly poisons.)  `RangeRestart`
-        // is a retry signal, not an operation failure, and state errors
+        // txn.  So we gate poisoning on `!non_blocking`.  A no-wait txn's real
+        // op arrives here with the caller's `non_blocking == false` and the
+        // `no_wait` flag OR-ed in only at the lock-manager call above, so it
+        // fails with `LockNotAvailable` -- which is EXCLUDED from the poison
+        // set below (JE does not invalidate the handle on a no-wait failure).
+        // `RangeRestart` is a retry signal, not an operation failure, and
+        // state errors
         // (`InvalidTransaction`) mean the txn is already resolved -- neither
         // poisons.
         let grant = match raw {
             Ok(g) => g,
             Err(e) => {
+                // Poison the locker abort-only ONLY on a BLOCKING lock-conflict
+                // failure.  Never poison on TxnError::LockNotAvailable: that is
+                // Noxu's no-wait failure (lock_manager.rs:587,904 -- produced
+                // only for non-blocking/no-wait requests), and JE explicitly
+                // does NOT invalidate the txn on a no-wait failure
+                // (LockNotAvailableException.java:41-43 "Do not set abort-only
+                // for a no-wait lock failure"; javadoc "The Transaction handle
+                // is not invalidated").  A genuine BLOCKING conflict always
+                // surfaces as LockConflict / LockTimeout / TransactionTimeout /
+                // Deadlock, never LockNotAvailable, so excluding it can never
+                // suppress a real poison.
                 if !non_blocking
                     && matches!(
                         e,
                         TxnError::LockConflict(_)
                             | TxnError::LockTimeout { .. }
                             | TxnError::TransactionTimeout { .. }
-                            | TxnError::LockNotAvailable { .. }
                             | TxnError::Deadlock(_)
                     )
                 {

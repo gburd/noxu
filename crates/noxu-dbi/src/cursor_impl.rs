@@ -5924,21 +5924,10 @@ mod tests {
              insert could slip in under a serializable txn"
         );
 
-        // NEW-TXN-2: the contended probe above FAILED with a lock conflict,
-        // which now poisons txn B abort-only (JE Locker.setOnlyAbortable on
-        // OperationFailureException) -- so B is no longer usable and must be
-        // aborted.  Reprobe with a FRESH txn C (JE would require the same:
-        // after a lock-conflict failure the locker is invalid).
-        let _ = b_txn.lock().unwrap().abort();
-
-        // Once A releases, a fresh probe reports a clean NotFound.
+        // Once A releases, the same probe reports a clean NotFound.
         a.lock().unwrap().abort().unwrap();
-        let c_txn = Arc::new(Mutex::new(Txn::new(802, Arc::clone(&lm))));
-        let mut c = CursorImpl::new(Arc::clone(&db), 802)
-            .with_lock_manager(Arc::clone(&lm))
-            .with_txn(Arc::clone(&c_txn));
         assert_eq!(
-            c.search(b"ghost", None, SearchMode::Set).unwrap(),
+            b.search(b"ghost", None, SearchMode::Set).unwrap(),
             OperationStatus::NotFound,
             "with the contender gone the probe must report NotFound, not error"
         );
