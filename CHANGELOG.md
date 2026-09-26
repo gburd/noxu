@@ -207,6 +207,20 @@ listed in [References](#references).
   marked abort-only on `TMFAIL` (matching JE), so any further operation on it is
   rejected regardless of how the caller reaches it; the follow-up `xa_rollback`
   is unaffected.
+- **Lock-table and transaction memory now count toward the cache budget
+  (C3/SC-5).** `MemoryBudget`'s lock/txn categories had no production feeders and
+  the eviction arbiter read only a tree-only counter, so a workload with a large
+  lock table or many open transactions (small tree) could grow resident memory
+  past `cache_size` without ever triggering eviction. The `LockManager` now
+  charges per lock-table entry and the `TxnManager` per active transaction into
+  shared counters the `MemoryBudget` reads, and the arbiter's over-budget check
+  reads the total across all categories (tree + lock + txn + admin), matching JE
+  where the evictor reads `MemoryBudget.getCacheMemoryUsage()`. Non-tree memory
+  is not evictable, so the NEW-7 convergence loop's existing no-progress bound
+  correctly terminates eviction once only lock/txn memory remains over budget
+  (it does not spin); the accounting still makes that footprint visible to
+  stats/monitoring. All updates are relaxed atomics on the existing lock/txn
+  paths — no new locks and no per-grant lock-hot-path locking.
 
 ### Security
 
