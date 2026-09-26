@@ -2,92 +2,80 @@
 
 Noxu DB is an embedded, transactional key-value database written in Rust.
 The project's design goal is idiomatic Rust with zero `unsafe` in library
-logic — only narrowly-scoped, documented `unsafe` for FFI to the OS, for
-memory-mapped I/O, and for a handful of `parking_lot`/`Send` shims.
+logic — only narrowly-scoped, documented `unsafe` for FFI to the OS (the
+Linux futex, socket options), for memory-mapped I/O, and for a handful of
+`Send`/lifetime shims.
 
-## Capability matrix (v1.5 → v2.2)
+## Capability matrix
 
-This matrix states what each released line delivers.  Columns are
-git tags (`v1.5.0`, `v1.6.0`, `v2.0.0`, `v2.2.1`).
+> **Source of truth.** This summary reflects the current release (v7.10.1).
+> The authoritative, continuously-maintained statement of what is
+> implemented, partially implemented, or deliberately bounded lives in
+> [Known Limitations](operations/known-limitations.md) — consult it for the
+> exact status, workarounds, and residual risk of any feature below.
+> (A per-version matrix was maintained through the pre-v3.0 remediation
+> phase; it was retired in favour of this summary plus the tracked
+> limitations list, which are kept current with the code.)
 
-| Feature | v1.5 | v1.6 | v2.0 | v2.2 (current) |
-|---|---|---|---|---|
-| **Storage and transactions** | | | | |
-| Single-process transactional KV | ✅ | ✅ | ✅ | ✅ |
-| Sorted-duplicate values (primary DB) | ✅ | ✅ | ✅ | ✅ |
-| Read-uncommitted / read-committed / repeatable-read / serializable isolation | ✅ | ✅ | ✅ | ✅ |
-| `EnvironmentConfig::durability` honoured | ✅ | ✅ | ✅ | ✅ |
-| `TransactionConfig::read_uncommitted` honoured | ✅ | ✅ | ✅ | ✅ |
-| Auto-commit + explicit-txn co-existence | ✅ | ✅ | ✅ | ✅ |
-| `Database::count()` correct on sorted-dup | ✅ | ✅ | ✅ | ✅ |
-| `Database::delete(key)` removes all dups | ✅ | ✅ | ✅ | ✅ |
-| `Environment::close()` after `txn.commit()` | ✅ | ✅ | ✅ | ✅ |
-| Nested / child transactions | ❌ (`Unsupported`) | ❌ | ❌ (parent param removed — compile-time error) | ❌ |
-| **Cursors** | | | | |
-| `Cursor::get` with `Get::SearchGte` / range scans | ✅ | ✅ | ✅ | ✅ |
-| `Cursor::get` with `Get::Search` / `SearchBoth` (validated on non-dup) | ✅ | ✅ | ✅ | ✅ |
-| `Cursor::get` with `Get::NextDup` / `PrevDup` on dup DB | ✅ | ✅ | ✅ | ✅ |
-| `Cursor::get` with `Get::NextDup` / `PrevDup` on non-dup DB returns `NotFound` | ✅ | ✅ | ✅ | ✅ |
-| `Cursor::get` with `Get::SearchLte` / `FirstDup` / `LastDup` | ❌ (`Unsupported`) | ❌ | ❌ | ❌ (`Unsupported`) |
-| `DiskOrderedCursor` (high-throughput unordered scan; multi-DB) | ❌ | ✅ (v1.6) | ✅ | ✅ |
-| Auto-commit through cursor with proper lock manager | ✅ | ✅ | ✅ | ✅ |
-| Cursor on `Database` honours `Some(&txn)` | ✅ | ✅ | ✅ | ✅ |
-| Cursor on `SecondaryDatabase` honours `Some(&txn)` | ✅ | ✅ | ✅ | ✅ |
-| **Secondary databases and foreign keys** | | | | |
-| One-to-one secondary indexes (manual maintenance) | ✅ | ✅ | ✅ | ✅ |
-| Sorted-dup secondary indexes / `JoinCursor` over true dups | ❌ (`Unsupported` on collision) | ✅ (v1.6) | ✅ | ✅ |
-| `associate()`-style automatic secondary maintenance | ❌ (manual `secondary.update_secondary` only) | ✅ (v1.6) | ✅ | ✅ |
-| Foreign-key constraints (`Abort` / `Cascade` / `Nullify`, single + multi-key) | ❌ (rejected at `SecondaryDatabase::open`) | ✅ (v1.6) | ✅ | ✅ |
-| Atomic primary + secondary writes under one txn | ✅ (manual path) | ✅ (v1.6) | ✅ | ✅ |
-| **Distributed transactions (XA)** | | | | |
-| In-process XA (`xa_prepare` / `xa_commit` same process) | ⚠️ in-process only | ✅ | ✅ | ✅ |
-| Crash-durable XA (`TxnPrepare` WAL + recovery) | ❌ (`XaError::CrashDurabilityNotSupported` after restart) | ✅ (v1.6) | ✅ | ✅ |
-| **Collections (`StoredMap` / `StoredSet` / `StoredList`)** | | | | |
-| `Stored*` collections under explicit txn (`Option<&Transaction>` on every method) | ✅ | ✅ | ✅ | ✅ |
-| Typed `StoredMap<K, V>` / `StoredSet<K>` / `StoredList<V>` parameterised by `EntryBinding` | ✅ | ✅ | ✅ | ✅ |
-| `StoredList::next_index` persistent across reopen (via `StoredList::open`) | ✅ | ✅ | ✅ | ✅ |
-| `StoredList::remove` compacts the freed slot atomically | ✅ | ✅ | ✅ | ✅ |
-| `TransactionRunner` deadlock retry + jittered backoff | ✅ | ✅ | ✅ | ✅ |
-| **Serialization / DPL** | | | | |
-| `SerdeBinding` 2-byte magic + version header | ✅ (BREAKING vs pre-v1.5 builds) | ✅ | ✅ | ✅ |
-| Schema evolution for `SerdeBinding` (read older struct shapes) | ❌ (header catches inter-format drift only) | ✅ (v1.6) | ✅ | ✅ |
-| DPL primary-index reads/writes participate in user txn | ✅ (BREAKING signature change) | ✅ | ✅ | ✅ |
-| DPL `#[derive(Entity)]` / `#[derive(PrimaryKey)]` / `#[derive(SecondaryKey)]` proc-macros (`noxu-persist-derive`) | ❌ (manual `impl` only) | ✅ (v1.6) | ✅ | ✅ |
-| DPL schema evolution (`Mutations` wired into open path; `Renamer` / `Deleter` / `Converter`; per-record class-version envelope) | ❌ | ✅ (v1.6 — BREAKING on-disk shape vs. pre-v1.6) | ✅ | ✅ |
-| DPL secondary indexes durable (survive restart) | ❌ (in-memory `BTreeMap` only) | ✅ | ✅ | ✅ |
-| DPL secondary updates atomic with user txn | ❌ (in-memory, not txn-atomic) | ✅ | ✅ | ✅ |
-| Read-only reopen of an existing entity store (`allow_create=false`) | ❌ | ❌ | ❌ | ✅ |
-| **Replication / HA** | | | | |
-| Single-process election test, 2-node sync, FPaxos shape | preview | refined | GA | GA |
-| `ReplicaAckPolicy` honoured on commit | ❌ (config not plumbed; commits return after local fsync) | ❌ | ✅ | ✅ |
-| Election driver wired into `ReplicatedEnvironment` | ❌ (sat in `Detached` until `become_master`) | ❌ | ✅ | ✅ |
-| Dispatcher service-name length bound (DoS hardening) | ❌ (4-byte unbounded length prefix) | ❌ | ✅ | ✅ |
-| `apply_entry` peer-scanner bounded under sustained load | ❌ (unbounded growth) | ❌ | ✅ | ✅ |
-| Arbiters cannot win Paxos elections | ❌ (could be elected master, wedging the cluster) | ❌ | ✅ | ✅ |
-| Network restore via dispatcher (`ReplicatedEnvironment` bootstrap) | ❌ (broken framing) | ❌ | ✅ | ✅ |
-| Acceptor promise persistent across restart | ❌ | ❌ | ✅ | ✅ |
-| `transfer_master` / `shutdown_group` operator APIs | ❌ (silently no-op) | ❌ | ✅ | ✅ |
-| Master spawns Feeder per known replica on `become_master` | ❌ (no feeders dispatched) | ❌ | ✅ (in-memory tracker structs only) | ✅ (tracker structs; active thread spawn deferred) |
-| `register_feeder_channel` + push-feeder + WAL-scanner auto-feed (C-C2/C-C2b) | ❌ | ❌ | ❌ | ✅ (v3.2.0: push threads; v4.0.0: WAL-scanner auto-feed via `with_environment`) |
-| VLSN index persistent across restart (no forced full restore) | ❌ (in-memory only) | ❌ | ✅ | ✅ |
-| `become_master` rejects non-`Electable` node types | ❌ (silently transitioned `Secondary` → `Master`) | ❌ | ❌ | ✅ |
-| Replica I/O thread auto-bootstraps on `NeedsRestore` | ❌ (manual `bootstrap_via_dispatcher` required) | ❌ | ❌ | ✅ |
-| Stateright executable specs match implementation | n/a | n/a | ⚠️ deferred at v2.0 | ✅ (all 5 updated specs pass) |
-| In-memory transport for production use (`InMemoryTransport`, `RepTransportKind::InMemory`) | ❌ | ❌ | ⚠️ cfg(test) / `test-harness` only | ⚠️ promoted to first-class in v2.4 |
-| **Test coverage** | | | | |
-| Workspace test gate (`cargo test --workspace`) | ~3,800 passed | 5,384 passed | 5,540 passed | 5,625 passed |
-| JE TCK ported tests (`PORTED-EQUIVALENT`) | n/a | partial | 205 | 243 |
-| JE TCK enumeration tracked in TSV under `internal/` | n/a | partial | ✅ | ✅ |
+### Storage and transactions
 
-Legend: ✅ supported, ❌ not supported in that release, ⚠️ partial /
-preview — see the release notes for the exact scope.
+- Single-process transactional key-value storage with ACID commit.
+- Sorted-duplicate values on primary databases.
+- Four isolation levels: read-uncommitted, read-committed, repeatable-read
+  (default), and serializable (next-key range locking for phantom
+  prevention).
+- Configurable durability (`SyncWriteNoSync` / `WriteNoSync` / `NoSync`),
+  group commit, and fsync coalescing (fail-stop on WAL sync error).
+- Auto-commit and explicit-transaction paths coexist; `Database::count()`
+  and `delete(key)` are correct on sorted-dup databases.
+- Per-record TTL / expiration (hour/day granularity), reclaimed by the
+  cleaner and honoured across recovery.
 
-The replication subsystem reached GA in v2.0 with all ten pre-v2.0 blockers
-closed.  Two regressions identified post-v2.0 were fixed in v2.2.  The
-Stageright executable specifications were re-validated against the v2.0+
-code as part of that work.  See
-the 2026 review
-for the per-finding notes.
+### Cursors and secondary indexes
+
+- Range and duplicate navigation (`Get::SearchGte`, `NextDup`/`PrevDup`,
+  etc.); `DiskOrderedCursor` for high-throughput unordered multi-database
+  scans.
+- `associate()`-style automatic secondary maintenance, sorted-duplicate
+  secondaries, `JoinCursor`, and foreign-key constraints
+  (`Abort` / `Cascade` / `Nullify`).
+
+### Higher-level APIs
+
+- Collections: typed `StoredMap<K, V>`, `StoredSet<K>`, `StoredList<V>` with
+  `TransactionRunner` deadlock retry.
+- Direct Persistence Layer with `#[derive(Entity)]` / `#[derive(PrimaryKey)]`
+  / `#[derive(SecondaryKey)]`, durable transactional secondary indexes, and
+  schema evolution (`Renamer` / `Deleter` / `Converter`).
+- Serialization bindings (tuple, entry, serde) with version-checking magic
+  headers.
+
+### Distribution and durability
+
+- XA distributed transactions (two-phase commit), crash-durable across
+  restart via a `TxnPrepare` WAL record.
+- Master-replica replication / HA: Flexible Paxos leader election, Phi
+  Accrual failure detection, VLSN log streaming, network restore, master
+  transfer, dynamic membership, and configurable `ReplicaAckPolicy` /
+  consistency policies. Transport over TCP, TLS, or QUIC.
+- Hot backup (`Environment::start_backup`) that pins the log-file set against
+  the cleaner while the caller copies it.
+
+### Known bounds
+
+(See [Known Limitations](operations/known-limitations.md) for the full,
+current list.)
+
+- Replication defaults to mutually-authenticated mTLS and **refuses to start
+  on an unauthenticated transport** unless the operator opts out
+  (`RepConfig::insecure_no_auth(true)`); per-message election authentication
+  is not implemented, so a compromised allowlisted peer is trusted.
+- Some replication client connectors (restore / feeder / admin) still use
+  plain TCP even under a TLS deployment.
+- Sustained `COMMIT_SYNC` throughput trails BDB-JE at low writer counts
+  (Noxu trades peak throughput for flatter tail latency); it closes to within
+  ~10% at relaxed durability or high writer concurrency.
+- Nested / child transactions are not supported.
 
 ## Quick Start
 
@@ -102,16 +90,13 @@ Or depend on the git source directly:
 
 ```toml
 [dependencies]
-noxu = { git = "https://codeberg.org/gregburd/noxu.git", tag = "v7.5.3" }
+noxu = { git = "https://codeberg.org/gregburd/noxu.git", tag = "v7.10.1" }
 ```
 
 Open an environment, write a record, and read it back:
 
 ```rust
-use noxu::{
-    DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
-    OperationStatus,
-};
+use noxu::{DatabaseConfig, Environment, EnvironmentConfig};
 use std::path::PathBuf;
 
 fn main() -> noxu::Result<()> {
@@ -127,25 +112,15 @@ fn main() -> noxu::Result<()> {
         .with_transactional(true);
     let db = env.open_database(None, "my-store", &db_config)?;
 
-    // Write a record under an explicit transaction.
+    // Write a record under an explicit transaction (`put_in` names the txn).
     let txn = env.begin_transaction(None)?;
-    db.put(
-        Some(&txn),
-        &DatabaseEntry::from_bytes(b"hello"),
-        &DatabaseEntry::from_bytes(b"world"),
-    )?;
+    db.put_in(&txn, b"hello", b"world")?;
     txn.commit()?;
 
-    // Read it back with auto-commit.
-    let mut value = DatabaseEntry::new();
-    let status = db.get(
-        None,
-        &DatabaseEntry::from_bytes(b"hello"),
-        &mut value,
-        None,
-    )?;
-    assert_eq!(status, OperationStatus::Success);
-    assert_eq!(value.data(), b"world");
+    // Read it back with auto-commit. Reads return `Result<Option<Bytes>>`.
+    if let Some(value) = db.get(b"hello")? {
+        assert_eq!(value.as_ref(), b"world");
+    }
 
     db.close()?;
     env.close()?;

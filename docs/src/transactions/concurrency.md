@@ -141,7 +141,7 @@ deadlock at the cost of reduced read concurrency.
 > shared. Use RMW only if you are seeing high rates of deadlocking.
 
 ```rust
-use noxu::{DatabaseEntry, LockMode, NoxuError};
+use noxu::{LockMode, NoxuError, ReadOptions};
 
 const MAX_RETRIES: u32 = 10;
 let mut retries = 0;
@@ -150,27 +150,18 @@ loop {
     let txn = env.begin_transaction(None)?;
 
     let result = (|| -> Result<(), NoxuError> {
-        let key = DatabaseEntry::from_bytes(b"counter");
-        let mut data = DatabaseEntry::new();
-
         // Read with RMW: acquires a write lock immediately.
-        db.get_with_lock_mode(
-            Some(&txn),
-            &key,
-            &mut data,
-            LockMode::Rmw,
-        )?;
+        let opts = ReadOptions::new().with_lock_mode(LockMode::Rmw);
+        let current = db.get_with_options(Some(&txn), b"counter", &opts)?;
 
-        // Modify the data in place.
-        let current_value: u64 = data
-            .get_data()
-            .map(|b| u64::from_le_bytes(b.try_into().unwrap_or([0; 8])))
+        // Modify the data. Reads return `Option<Bytes>`.
+        let current_value: u64 = current
+            .map(|b| u64::from_le_bytes(b.as_ref().try_into().unwrap_or([0; 8])))
             .unwrap_or(0);
         let new_value = (current_value + 1).to_le_bytes();
-        let new_data = DatabaseEntry::from_bytes(&new_value);
 
         // Write back. No special flag needed because we already hold the write lock.
-        db.put_in(&txn, &key, &new_data)?;
+        db.put_in(&txn, b"counter", new_value)?;
         txn.commit()?;
         Ok(())
     })();

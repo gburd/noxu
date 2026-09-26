@@ -63,17 +63,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 You can also request uncommitted reads on a per-operation basis using
-`LockMode::ReadUncommitted`:
+a [`ReadOptions`] with `LockMode::ReadUncommitted`:
 
 ```rust
-use noxu::{DatabaseEntry, LockMode};
+use noxu::{LockMode, ReadOptions};
 
 // (env, db, txn assumed to be open)
-let key = DatabaseEntry::from_bytes(b"thekey");
-let mut data = DatabaseEntry::new();
-
-// Pass the lock mode directly to the get call.
-db.get_with_lock_mode(Some(&txn), &key, &mut data, LockMode::ReadUncommitted)?;
+// Build per-operation read options and pass them to `get_with_options`.
+// Reads return `Result<Option<Bytes>>` — `Some(value)` on a hit, `None` if absent.
+let opts = ReadOptions::new().with_lock_mode(LockMode::ReadUncommitted);
+let value = db.get_with_options(Some(&txn), b"thekey", &opts)?;
 ```
 
 ## Committed Reads
@@ -95,9 +94,10 @@ let txn = env.begin_transaction(Some(&txn_config))?;
 Or per-operation:
 
 ```rust
-use noxu::LockMode;
+use noxu::{LockMode, ReadOptions};
 
-db.get_with_lock_mode(Some(&txn), &key, &mut data, LockMode::ReadCommitted)?;
+let opts = ReadOptions::new().with_lock_mode(LockMode::ReadCommitted);
+let value = db.get_with_options(Some(&txn), b"thekey", &opts)?;
 ```
 
 Read committed is most useful for forward-scanning cursors that never need to

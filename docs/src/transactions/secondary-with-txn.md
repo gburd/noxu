@@ -1,9 +1,10 @@
 # Secondary Indices with Transactions
 
-> **v1.6 capability matrix:** see
-> [Introduction → v1.6 capability matrix](../introduction.md#v15-capability-matrix).
+> **Capability status:** see
+> [Introduction → capability summary](../introduction.md#capability-matrix)
+> and [Known Limitations](../operations/known-limitations.md).
 >
-> **v1.6 update:** secondaries are now sorted-dup (Decision 1B / audit
+> Secondaries are sorted-dup (Decision 1B / audit
 > C4), the primary database automatically maintains every registered
 > `SecondaryDatabase` under the caller's transaction (audit C3),
 > and foreign-key constraints (Abort, Cascade, Nullify) are enforced
@@ -19,9 +20,10 @@
   `Environment`. The inner secondary DB additionally **must** be
   opened with `with_sorted_duplicates(true)` so multiple primaries
   may share a secondary key.
-* `secondary.open_cursor(Some(&txn), config)` — secondary reads
+* `secondary.open_cursor_in(&txn, config)` — secondary reads
   participate in `txn` correctly.  Cursor operations on a secondary
-  acquire locks on behalf of the transaction.
+  acquire locks on behalf of the transaction.  (The auto-commit form
+  is the single-argument `secondary.open_cursor(config)`.)
 * `secondary.update_secondary(Some(&txn), pri_key, old_data, new_data)`
   — manual maintenance for population paths.  Application code that
   goes through `Database::put` / `Database::delete` no longer has to
@@ -31,19 +33,23 @@
 ## Read path: cursors honour the transaction
 
 Secondary reads under a user transaction work as expected. Open the
-cursor with `Some(&txn)` and close it before committing or aborting:
+cursor with `open_cursor_in(&txn, ..)` and close it before committing or
+aborting:
 
 ```rust
-use noxu::{Get, OperationStatus};
+use noxu::OperationStatus;
 
 let txn = env.begin_transaction(None)?;
-let mut cursor = secondary.open_cursor(Some(&txn), None)?;
+let mut cursor = secondary.open_cursor_in(&txn, None)?;
 
 let mut sec_key = DatabaseEntry::from_bytes(b"Engineering");
 let mut pk = DatabaseEntry::new();
 let mut data = DatabaseEntry::new();
 
-let status = cursor.get(&mut sec_key, &mut pk, &mut data, Get::SearchGte, None)?;
+// `SecondaryCursor` exposes named navigators, not a generic `get(..)`.
+// A "secondary key >= X" search is `get_search_key_range`, which fills the
+// secondary key, the primary key, and the primary record's value.
+let status = cursor.get_search_key_range(&mut sec_key, &mut pk, &mut data)?;
 if status == OperationStatus::Success {
     // ... use the row ...
 }
@@ -102,7 +108,7 @@ primary write to drive the fan-out — `SecondaryDatabase::update_secondary`
 remains available and still honours the caller's txn:
 
 ```rust
-let txn = env.begin_transaction(None, None)?;
+let txn = env.begin_transaction(None)?;
 secondary.update_secondary(
     Some(&txn),
     &pri_key,
@@ -124,7 +130,7 @@ caller-supplied txn. Aborting the foreign delete rolls back the
 cascade or the nullification atomically.
 
 ```rust
-let txn = env.begin_transaction(None, None)?;
+let txn = env.begin_transaction(None)?;
 match foreign.lock().delete_in(&txn, &fk) {
     Ok(_) => txn.commit()?,
     Err(NoxuError::ForeignConstraintViolation(_)) => {

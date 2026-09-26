@@ -19,13 +19,20 @@ considers it durable:
 | `SimpleMajority` | (n_replicas/2)+1 | Wait for majority of replicas |
 | `All` | n_replicas | Wait for all replicas |
 
-Configure on `RepConfig`:
+Configure on `RepConfig` via `commit_durability`, which bundles the ack
+policy with the ack timeout into a `CommitDurability`:
 
 ```rust
-RepConfig::builder()
-    .replica_ack_policy(ReplicaAckPolicy::SimpleMajority)
-    .replica_ack_timeout_ms(5_000)
-    // ...
+use noxu::replication::{CommitDurability, RepConfig, ReplicaAckPolicy};
+use std::time::Duration;
+
+RepConfig::builder("group", "node-1", "10.0.0.1")
+    .commit_durability(CommitDurability::new(
+        ReplicaAckPolicy::SimpleMajority,
+        Duration::from_secs(5),
+    ))
+    // ... other settings ...
+    .build();
 ```
 
 Returns `RepError::InsufficientAcks { needed, received }` if the timeout

@@ -1,7 +1,8 @@
 # Secondary Databases
 
-> **v1.6 capability matrix:** see
-> [Introduction → v1.6 capability matrix](../introduction.md#v15-capability-matrix).
+> **Capability status:** see
+> [Introduction → capability summary](../introduction.md#capability-matrix)
+> and [Known Limitations](../operations/known-limitations.md).
 
 ## What is a Secondary Database?
 

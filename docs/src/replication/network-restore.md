@@ -1,7 +1,7 @@
 # Network Restore
 
 > **v1.5 status — broken on the dispatcher path.** See
-> [Introduction → v1.5 capability matrix](../introduction.md#v15-capability-matrix)
+> [Introduction → capability summary](../introduction.md#capability-matrix)
 > and [the chapter overview](index.html). The standalone `serve_raw`
 > path used by the unit tests works; the path used by
 > `ReplicatedEnvironment` (via `TcpServiceDispatcher`) misinterprets

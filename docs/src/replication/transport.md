@@ -42,8 +42,11 @@ default transport.
 The server-side listener accepts downstream connections:
 
 ```rust
-let listener = TcpChannel::bind_dual_stack(5001)?;
-while let Some(channel) = listener.accept()? {
+let listener = TcpChannel::bind_dual_stack(14_001)?;
+// `accept()` blocks and returns `Result<TcpChannel>` (never `None`), so this
+// is an infinite accept loop.
+loop {
+    let channel = listener.accept()?;
     spawn_feeder_thread(channel);
 }
 ```

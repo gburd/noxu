@@ -1,13 +1,15 @@
 # Cursors
 
-> **v1.5 capability matrix:** see
-> [Introduction → v1.5 capability matrix](../introduction.md#v15-capability-matrix).
+> **Capability status:** see
+> [Introduction → capability summary](../introduction.md#capability-matrix)
+> and [Known Limitations](../operations/known-limitations.md).
 >
-> **v1.5 cursor contract — highlights:**
+> **Cursor contract — highlights:**
 >
-> * `Database::open_cursor(Some(&txn), …)` and
->   `SecondaryDatabase::open_cursor(Some(&txn), …)` correctly thread
->   the supplied transaction through to the underlying cursor in v1.5.
+> * `Database::open_cursor_in(&txn, …)` and
+>   `SecondaryDatabase::open_cursor_in(&txn, …)` thread the supplied
+>   transaction through to the underlying cursor; the single-argument
+>   `open_cursor(…)` form is the auto-commit path.
 >   Pre-1.5 release candidates silently ignored the
 >   transaction; if you are upgrading, see
 >   [Migrating from v1.4.x](migrating.md) for the lock-conflict

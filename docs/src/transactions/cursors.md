@@ -9,7 +9,7 @@ all subsequent cursor operations automatically participate in the transaction.
 ```rust
 use noxu::{
     DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig, Get,
-    LockMode, OperationStatus,
+    LockMode, OperationStatus, Put,
 };
 use std::path::PathBuf;
 
@@ -32,8 +32,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let txn = env.begin_transaction(None)?;
 
-    // Open the cursor with the transaction handle.
-    let mut cursor = db.open_cursor(Some(&txn), None)?;
+    // Open the cursor within the transaction via `open_cursor_in`.
+    let mut cursor = db.open_cursor_in(&txn, None)?;
 
     let mut key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
@@ -49,9 +49,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if status != OperationStatus::Success {
                 break;
             }
-            // Replace the current record's data.
+            // Replace the current record's data with `Put::Current`.
             let new_data = DatabaseEntry::from_bytes(replacement);
-            cursor.put_current(&new_data)?;
+            cursor.put(&key, &new_data, Put::Current)?;
         }
         // Close the cursor BEFORE committing.
         cursor.close()?;

@@ -3,9 +3,9 @@
 This page lists every observable behaviour change between v1.4.x and
 v1.5 (and later releases) that is likely to surface in user code.
 
-> **Capability matrix:** see
-> [Introduction → capability matrix](../introduction.md#capability-matrix-v15--v22)
-> for the canonical "what is supported in which release" table.
+> **Capability status:** see
+> [Introduction → capability summary](../introduction.md#capability-matrix)
+> and [Known Limitations](../operations/known-limitations.md).
 
 ## Unreleased — config defaults reconciled to JE (background verifier + stats now ON)
 
