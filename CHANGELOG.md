@@ -201,6 +201,29 @@ listed in [References](#references).
   precedence: a tie resolves to `TransactionTimeout`). Behavior is unchanged when
   no transaction timeout is set; deadlock detection is unaffected.
 
+### Security
+
+- **Undocumented `unsafe` closed off (S5).** `noxu-sync` and `noxu-xa` were
+  excluded from the workspace `undocumented_unsafe_blocks` lint; the lint is now
+  enabled on both and every production `unsafe` block carries a real `SAFETY`
+  justification (verified by `clippy --workspace --all-targets --all-features
+  -D warnings`).
+- **Slow-loris / unbounded-connection hardening on the plain-TCP transport
+  (S3).** The plain-TCP service dispatcher now applies a handshake read timeout
+  (matching the TLS path) so a silent client cannot pin a thread, and bounds the
+  number of concurrent connections so accepts cannot spawn unbounded threads.
+- **Dependency + supply-chain gating (S2/S4).** Bumped `lru` to 0.18 (the one
+  live advisory in the tree; the TLS/QUIC stack was already on safe versions),
+  hardened `deny.toml`'s unmaintained/yanked policy, and added the `cargo deny`
+  check to the primary (Forgejo) CI workflow, not just the GitHub one.
+- **Honest security documentation (S1/F2, S6).** Corrected misleading comments
+  that implied election/VLSN-layer authentication that does not exist, and
+  updated `SECURITY.md` and `known-limitations.md` to state the real posture:
+  mTLS + peer allowlist fail-closed by default, with the remaining
+  election/admin authorization gaps documented plainly. (Binding the verified
+  TLS peer identity to admin authorization and election messages — F5/F3b — is a
+  tracked design proposal, not yet implemented.)
+
 ### Changed
 
 - **Backup: the non-functional live-backup daemon is replaced by a real
