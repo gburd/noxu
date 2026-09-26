@@ -1706,8 +1706,9 @@ fn gap8_production_cleaner_has_txn_manager_wired() {
 fn small_cache_env(dir: &std::path::Path) -> EnvironmentImpl {
     use noxu_dbi::DbiEnvConfig;
     let cfg = DbiEnvConfig {
-        // Small total budget. The arbiter floors at 1 MiB, so use a 1-buffer
-        // 64 KiB log pool and a 1.5 MiB cache -> arbiter budget ~1.4 MiB.
+        // Small total budget. The arbiter floors at 96 KiB (JE
+        // MIN_MAX_MEMORY_SIZE), so use a 1-buffer 64 KiB log pool and a
+        // 1.5 MiB cache -> arbiter budget ~1.4 MiB.
         cache_size: 3 * 1024 * 1024 / 2, // 1.5 MiB
         log_num_buffers: 1,
         log_buffer_size: 64 * 1024,

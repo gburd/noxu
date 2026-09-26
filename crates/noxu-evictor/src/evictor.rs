@@ -1658,18 +1658,65 @@ impl Evictor {
             return EvictResult::zero();
         }
 
-        let result = self.evict_batch(source, node_info_fn, node_size_fn);
+        // NEW-7 (JE Evictor.doEvict loop): a single `evict_batch` processes at
+        // most `max_batch_size` (= EVICTOR_NODES_PER_SCAN, default 10)
+        // candidates and then returns even if the cache is still far over
+        // budget.  JE's `doEvict` LOOPS `evictBatch` while the eviction pledge
+        // is nonzero (Evictor.java doEvict / evictBatch loop) so a single
+        // `evictMemory` / critical-eviction call actually converges toward the
+        // budget.  Before this loop one `env.evict_memory()` reclaimed only
+        // ~`max_batch_size` nodes per call: with the primary LRU >> the batch
+        // size, phase-1 LN-stripping exhausted the batch before phase-2 drained
+        // the pri2 dirty-BIN LRU, so dirty BINs piled in pri2 and never reached
+        // detach — the cache stayed multiples over budget (measured ~8x over a
+        // 128 KiB budget after one call).
+        //
+        // Re-enter `evict_batch` while still over budget, crediting each
+        // batch's freed bytes to the arbiter INSIDE the loop so
+        // `still_needs_eviction()` re-reads the updated usage.  Bound by
+        // "no progress" exactly like JE: stop when a full batch neither frees
+        // any bytes nor changes the LRU composition (a node moved pri1->pri2 is
+        // progress — a later batch drains it in phase-2).  This cannot
+        // live-lock: every iteration either reclaims bytes, shrinks/reshapes
+        // the finite LRU lists, or breaks on no-progress.
+        let mut result = EvictResult::zero();
+        loop {
+            let (p1_before, s1_before, p2_before) = self.get_policy_sizes();
+            let batch = self.evict_batch(source, node_info_fn, node_size_fn);
 
-        // Release the single-flight guard before crediting the budget/stats;
-        // the batch is done touching the policy lists at this point.
+            result.nodes_evicted += batch.nodes_evicted;
+            result.bytes_evicted += batch.bytes_evicted;
+
+            // F2: decrement the shared budget counter by the bytes just freed.
+            // evict_batch only *accounts* bytes_evicted; without this the
+            // counter (incremented on insert) never drops and the engine can't
+            // get back under budget, and the loop's `still_needs_eviction()`
+            // guard would never observe progress.  JE: every eviction calls
+            // IN.updateMemorySize(-bytes) ->
+            // MemoryBudget.updateTreeMemoryUsage(-bytes).
+            self.arbiter.release_memory(batch.bytes_evicted);
+
+            // Under budget now — done.
+            if !self.arbiter.still_needs_eviction() {
+                break;
+            }
+
+            // No-progress bound: the batch freed nothing AND left the LRU
+            // lists structurally unchanged (no strip, no evict, no pri1->pri2
+            // move).  Nothing more this pass can reclaim — stop rather than
+            // spin (JE's doEvict returns when a scan makes no progress).
+            let (p1_after, s1_after, p2_after) = self.get_policy_sizes();
+            let made_progress = batch.bytes_evicted > 0
+                || (p1_after, s1_after, p2_after)
+                    != (p1_before, s1_before, p2_before);
+            if !made_progress {
+                break;
+            }
+        }
+
+        // Release the single-flight guard before crediting the stats; the loop
+        // is done touching the policy lists at this point.
         self.evicting.store(false, Ordering::Release);
-
-        // F2: decrement the shared budget counter by the bytes just freed.
-        // evict_batch only *accounts* bytes_evicted; without this the counter
-        // (incremented on insert) never drops and the engine can't get back
-        // under budget.  JE: every eviction calls IN.updateMemorySize(-bytes)
-        // → MemoryBudget.updateTreeMemoryUsage(-bytes).
-        self.arbiter.release_memory(result.bytes_evicted);
 
         match source {
             EvictionSource::Daemon => self
