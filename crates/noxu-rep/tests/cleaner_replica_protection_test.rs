@@ -69,7 +69,9 @@ fn seed_vlsn_index(env: &ReplicatedEnvironment, up_to: u64) {
 fn master_with_two_replicas(
     group: &str,
 ) -> (Arc<ReplicatedEnvironment>, Arc<FileProtector>) {
-    let env = Arc::new(ReplicatedEnvironment::new(master_cfg(group, "master")).unwrap());
+    let env = Arc::new(
+        ReplicatedEnvironment::new(master_cfg(group, "master")).unwrap(),
+    );
     for (i, name) in ["replicaA", "replicaB"].iter().enumerate() {
         env.add_peer(RepNode::new(
             name.to_string(),
@@ -84,8 +86,14 @@ fn master_with_two_replicas(
     let pair_a = LocalChannelPair::new();
     let pair_b = LocalChannelPair::new();
     env.init_self_weak();
-    env.register_feeder_channel("replicaA".to_string(), Arc::new(pair_a.channel_a));
-    env.register_feeder_channel("replicaB".to_string(), Arc::new(pair_b.channel_a));
+    env.register_feeder_channel(
+        "replicaA".to_string(),
+        Arc::new(pair_a.channel_a),
+    );
+    env.register_feeder_channel(
+        "replicaB".to_string(),
+        Arc::new(pair_b.channel_a),
+    );
 
     let protector = Arc::new(FileProtector::new());
     env.set_replication_file_protector(Arc::clone(&protector));
@@ -165,13 +173,19 @@ fn protection_is_released_as_replica_catches_up() {
         "file 1 is now below the advanced CBVLSN (25) and must be released",
     );
     assert!(!protector.is_protected(0), "file 0 stays cleanable");
-    assert!(protector.is_protected(2), "file 2 (contains CBVLSN 25) still protected");
+    assert!(
+        protector.is_protected(2),
+        "file 2 (contains CBVLSN 25) still protected"
+    );
     assert!(protector.is_protected(3), "file 3 (above CBVLSN) still protected");
 
     // replicaA fully catches up to 40. CBVLSN = 40 → file 3. Only file 3 pinned.
     env.record_ack(40, "replicaA");
     assert_eq!(env.replication_protected_file_floor(), Some(3));
-    assert!(!protector.is_protected(2), "file 2 released once CBVLSN reaches 40");
+    assert!(
+        !protector.is_protected(2),
+        "file 2 released once CBVLSN reaches 40"
+    );
     assert!(protector.is_protected(3));
 
     env.close().unwrap();
@@ -181,8 +195,9 @@ fn protection_is_released_as_replica_catches_up() {
 /// unaffected: no replication-protected floor is ever set.
 #[test]
 fn non_replicated_env_sets_no_protection_floor() {
-    let env =
-        Arc::new(ReplicatedEnvironment::new(master_cfg("b6_none", "solo")).unwrap());
+    let env = Arc::new(
+        ReplicatedEnvironment::new(master_cfg("b6_none", "solo")).unwrap(),
+    );
     env.become_master(1).unwrap();
     // No peers, no protector injected, no acks.
     assert_eq!(

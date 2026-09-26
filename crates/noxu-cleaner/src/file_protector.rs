@@ -5,16 +5,38 @@
 
 use hashbrown::HashMap;
 use noxu_sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Sentinel meaning "no replication-protected floor is set" (all files are
+/// eligible for deletion as far as replication is concerned).
+const NO_FLOOR: u64 = u64::MAX;
 
 /// Protects log files from deletion while they are being read or processed.
 ///
 /// Files can be protected by multiple consumers (backup, disk-ordered cursor,
 /// replication feeders, etc.). A file is only safe to delete when its
 /// protection count reaches zero.
+///
+/// Replication additionally installs a *file floor* (`set_replication_floor`):
+/// every log file whose number is at or after the floor is protected,
+/// regardless of its per-file protection count. This is the Noxu port of JE's
+/// `FileProtector` replication-protected range: the master pins every file at
+/// or after the file containing the global CBVLSN so the cleaner never deletes
+/// a file a lagging replica still needs (`GlobalCBVLSN` / `LocalCBVLSNUpdater`
+/// plus `FileProtector`). The floor rises as replicas catch up, releasing
+/// older files.
 #[derive(Debug)]
 pub struct FileProtector {
     /// Map of file_number -> protection information.
     protected_files: Mutex<HashMap<u32, ProtectionInfo>>,
+
+    /// Replication-protected file floor (JE `FileProtector` replication range).
+    ///
+    /// `NO_FLOOR` means no floor is set. Otherwise every file with number
+    /// `>= replication_floor` is protected from deletion because a lagging
+    /// replica may still need to read it. Stored as `u64` so `NO_FLOOR` is
+    /// representable; the meaningful values are `0..=u32::MAX`.
+    replication_floor: AtomicU64,
 }
 
 /// Information about why a file is protected.
@@ -30,7 +52,10 @@ pub struct ProtectionInfo {
 impl FileProtector {
     /// Creates a new file protector with no protected files.
     pub fn new() -> Self {
-        Self { protected_files: Mutex::new(HashMap::new()) }
+        Self {
+            protected_files: Mutex::new(HashMap::new()),
+            replication_floor: AtomicU64::new(NO_FLOOR),
+        }
     }
 
     /// Protects a file from deletion.
@@ -87,8 +112,46 @@ impl FileProtector {
     }
 
     /// Returns whether a file is currently protected.
+    ///
+    /// A file is protected if it has a nonzero per-file protection count OR
+    /// it lies at or after the replication-protected file floor (see
+    /// [`set_replication_floor`](Self::set_replication_floor)).
     pub fn is_protected(&self, file_number: u32) -> bool {
+        if self.is_replication_protected(file_number) {
+            return true;
+        }
         self.protected_files.lock().contains_key(&file_number)
+    }
+
+    /// Sets the replication-protected file floor.
+    ///
+    /// `Some(f)`: every log file with number `>= f` is protected from
+    /// deletion (a lagging replica may still need it). `None`: clears the
+    /// floor (no file is replication-protected).
+    ///
+    /// The master derives `f` from the global CBVLSN: the file that contains
+    /// the CBVLSN, so files fully below it (already replayed by every
+    /// still-attached electable replica) can be reclaimed while the file the
+    /// slowest replica is still reading — and everything after it — is pinned.
+    /// JE: the master pins every log file at or after the file containing the
+    /// global CBVLSN via the `FileProtector` replication-protected range.
+    pub fn set_replication_floor(&self, floor: Option<u32>) {
+        let v = floor.map(u64::from).unwrap_or(NO_FLOOR);
+        self.replication_floor.store(v, Ordering::Release);
+    }
+
+    /// Returns the current replication-protected file floor, if any.
+    pub fn replication_floor(&self) -> Option<u32> {
+        match self.replication_floor.load(Ordering::Acquire) {
+            NO_FLOOR => None,
+            v => Some(v as u32),
+        }
+    }
+
+    /// Returns whether `file_number` is protected by the replication floor
+    /// (i.e. it lies at or after the CBVLSN-derived floor).
+    pub fn is_replication_protected(&self, file_number: u32) -> bool {
+        u64::from(file_number) >= self.replication_floor.load(Ordering::Acquire)
     }
 
     /// Returns a list of all protected files with their reasons.
@@ -304,5 +367,48 @@ mod tests {
     fn test_default() {
         let protector = FileProtector::default();
         assert_eq!(protector.get_protected_size(), 0);
+    }
+
+    #[test]
+    fn test_replication_floor_protects_file_and_above() {
+        let protector = FileProtector::new();
+        // No floor: nothing protected by replication.
+        assert_eq!(protector.replication_floor(), None);
+        assert!(!protector.is_protected(0));
+
+        // Floor at file 2 → files 2,3,.. protected; 0,1 cleanable.
+        protector.set_replication_floor(Some(2));
+        assert_eq!(protector.replication_floor(), Some(2));
+        assert!(!protector.is_protected(0));
+        assert!(!protector.is_protected(1));
+        assert!(protector.is_protected(2));
+        assert!(protector.is_protected(3));
+        assert!(protector.is_replication_protected(2));
+        assert!(!protector.is_replication_protected(1));
+
+        // Floor rises to file 3 → file 2 released.
+        protector.set_replication_floor(Some(3));
+        assert!(!protector.is_protected(2));
+        assert!(protector.is_protected(3));
+
+        // Clearing the floor releases everything (no per-file counts here).
+        protector.set_replication_floor(None);
+        assert_eq!(protector.replication_floor(), None);
+        assert!(!protector.is_protected(3));
+    }
+
+    #[test]
+    fn test_replication_floor_and_count_are_independent() {
+        let protector = FileProtector::new();
+        // A per-file protection below the floor still protects that file.
+        protector.protect_file(0, "Backup");
+        protector.set_replication_floor(Some(2));
+        assert!(protector.is_protected(0), "per-file count protects file 0");
+        assert!(!protector.is_protected(1), "file 1 below floor, no count");
+        assert!(protector.is_protected(2), "file 2 at floor");
+
+        // Dropping the per-file count releases file 0 (still below the floor).
+        protector.unprotect_file(0);
+        assert!(!protector.is_protected(0));
     }
 }

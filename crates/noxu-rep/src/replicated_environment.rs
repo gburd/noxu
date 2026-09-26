@@ -35,7 +35,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
 use std::sync::Weak;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::ack_tracker::AckTracker;
@@ -340,6 +340,29 @@ pub struct ReplicatedEnvironment {
     /// `MasterTracker::generation()`) and returns without spawning a
     /// second thread.
     replica_thread_running: Arc<AtomicBool>,
+
+    /// B6/V15/F2: the cleaner's shared `FileProtector`, used to translate the
+    /// global CBVLSN into a file-protection bound the log cleaner honors.
+    ///
+    /// Wired from `EnvironmentImpl::get_file_protector()` in
+    /// [`Self::with_environment`] (production) or injected directly by tests
+    /// via [`Self::set_replication_file_protector`]. When set and this node is
+    /// a master, every ack triggers [`Self::update_cleaner_replica_protection`]
+    /// which pins every log file at or after the file containing the CBVLSN so
+    /// the cleaner cannot delete a file a lagging replica still needs. `None`
+    /// (no cleaner, or replication not driving the cleaner) leaves the cleaner
+    /// behaviour unchanged.
+    ///
+    /// JE: the master pins every log file at or after the file containing the
+    /// global CBVLSN via the `FileProtector` replication-protected range
+    /// (`GlobalCBVLSN` / `LocalCBVLSNUpdater` + `FileProtector`).
+    file_protector: StdMutex<Option<Arc<noxu_cleaner::FileProtector>>>,
+
+    /// B6/V15/F2: the current replication-protected file floor (the file that
+    /// contains the CBVLSN). `None` until the first CBVLSN is established.
+    /// Cached so [`Self::replication_protected_file_floor`] can report it
+    /// without touching the `FileProtector`.
+    replication_protected_floor: AtomicU64,
 }
 
 impl ReplicatedEnvironment {
@@ -608,6 +631,9 @@ impl ReplicatedEnvironment {
             wal_feeds_served: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             consistency_tracker: StdMutex::new(None),
             replica_thread_running: Arc::new(AtomicBool::new(false)),
+            file_protector: StdMutex::new(None),
+            // NO_FLOOR sentinel (u64::MAX) == "no floor set yet".
+            replication_protected_floor: AtomicU64::new(u64::MAX),
         };
 
         Ok(env)
@@ -1533,6 +1559,18 @@ impl ReplicatedEnvironment {
         }
 
         *self.env_impl.lock().unwrap() = Some(Arc::clone(&env));
+
+        // B6/V15/F2: wire the cleaner's shared FileProtector so the master can
+        // translate the global CBVLSN into a file-protection bound. When the
+        // env has a running cleaner, every ack thereafter pins the log files a
+        // lagging replica still needs (JE `FileProtector` replication range).
+        // A read-only env with no cleaner returns None and the cleaner path is
+        // left unchanged.
+        if let Some(fp) = env.get_file_protector() {
+            *self.file_protector.lock().unwrap() = Some(fp);
+            // Establish the initial floor from whatever progress exists.
+            self.update_cleaner_replica_protection();
+        }
 
         // C-C2b: install the VLSN counter so log_txn_commit writes
         // VLSN-tagged headers.  When become_master then spawns an
@@ -3393,6 +3431,73 @@ impl ReplicatedEnvironment {
                 ))
             })?;
 
+        // -------------------------------------------------------------
+        // B5 / V16 / F1: WAIT for the target to catch up before handing off.
+        //
+        // JE `MasterTransfer` tracks each ready replica's VLSN progress
+        // (`MasterTransfer.java:254-283`, `VLSNProgress`) and only completes
+        // the transfer to a replica that has caught up to the master's commit
+        // VLSN.  Without this wait the transfer is "best-effort": handing off
+        // to a LAGGING replica makes it master missing the old master's most
+        // recent commits, and those commits are then rolled back on the old
+        // master when it re-syncs as a replica — loss of COMMITTED,
+        // acknowledged data.
+        //
+        // We reuse the same catch-up mechanism `shutdown_group` uses (M-4):
+        // the target's acked VLSN is observed via its `FeederRunner`
+        // (`active_feeder_runner_acked_vlsn`) and compared to the master's
+        // current VLSN (`vlsn_index.get_range().last()`).  If the target does
+        // not reach the master's VLSN within `config.timeout`, we ABORT the
+        // transfer (return an error) WITHOUT demoting self or promoting the
+        // lagging node.  `config.force` bypasses the wait for the operator
+        // who explicitly accepts the risk (JE `force`).
+        let master_vlsn = self.vlsn_index.get_range().last();
+        if master_vlsn > 0 && !config.force {
+            let has_runner = self
+                .active_feeder_runners
+                .lock()
+                .unwrap()
+                .contains_key(config.target_node.as_str());
+            if !has_runner {
+                // No observable VLSN-progress source for the target: we cannot
+                // verify it has caught up, so we must not hand off blind.
+                return Err(RepError::StateError(format!(
+                    "transfer_master: cannot verify target '{}' has caught up \
+                     (no active feeder); refusing hand-off to avoid data loss \
+                     (use force to override)",
+                    config.target_node
+                )));
+            }
+            let deadline = std::time::Instant::now() + config.timeout;
+            loop {
+                let acked =
+                    self.active_feeder_runner_acked_vlsn(&config.target_node);
+                if acked >= master_vlsn {
+                    log::info!(
+                        "transfer_master: target '{}' caught up to VLSN {} \
+                         (master VLSN {})",
+                        config.target_node,
+                        acked,
+                        master_vlsn,
+                    );
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(RepError::StateError(format!(
+                        "transfer_master: target '{}' did not catch up within \
+                         {}ms (acked VLSN {} < master VLSN {}); refusing \
+                         hand-off to avoid data loss",
+                        config.target_node,
+                        config.timeout.as_millis(),
+                        acked,
+                        master_vlsn,
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        // -------------------------------------------------------------
+
         let new_term = self.master_tracker.get_term().saturating_add(1);
 
         // 1. Tell the target to become master at the new term.
@@ -3617,12 +3722,131 @@ impl ReplicatedEnvironment {
         }
         // Recompute the DTVLSN from feeder progress whenever an ack lands.
         self.update_dtvlsn_from_feeders();
+        // B6/V15/F2: recompute the CBVLSN and refresh the cleaner's
+        // replication-protected file floor so a lagging replica's needed log
+        // files are never reclaimed (JE `LocalCBVLSNUpdater` + `FileProtector`).
+        self.update_cleaner_replica_protection();
         // REP-9: wake any committer parked in `await_replica_acks`. Its
         // satisfaction predicate is the high-water feeder count, not an
         // exact-VLSN registration, so we must notify unconditionally (the
         // AckTracker's own `record_ack` only notifies when the exact VLSN was
         // registered, which the per-frame feeder acks generally are not).
         self.ack_tracker.notify_waiters();
+    }
+
+    // -----------------------------------------------------------------------
+    // B6/V15/F2 — CBVLSN → cleaner file protection
+    // -----------------------------------------------------------------------
+
+    /// Inject the cleaner's shared `FileProtector` directly.
+    ///
+    /// Production wires this from `EnvironmentImpl::get_file_protector()` in
+    /// [`Self::with_environment`]. This setter is the deterministic entry
+    /// point for tests (and any embedder that composes the cleaner and the
+    /// replicated environment itself). Setting it immediately refreshes the
+    /// replication-protected floor from current progress.
+    pub fn set_replication_file_protector(
+        &self,
+        protector: Arc<noxu_cleaner::FileProtector>,
+    ) {
+        *self.file_protector.lock().unwrap() = Some(protector);
+        self.update_cleaner_replica_protection();
+    }
+
+    /// Compute the global CBVLSN (Cleaner Barrier VLSN): the minimum VLSN
+    /// acknowledged by any still-attached electable replica.
+    ///
+    /// This is the data half of JE's mechanism (`min(known_vlsn)` over active
+    /// electable nodes): a log file below this VLSN has been replayed by every
+    /// electable replica and is safe to reclaim; a file at or above it may
+    /// still be needed. Returns `None` when this node is not a master or has
+    /// no electable replica progress to protect for (nothing to pin).
+    ///
+    /// A registered electable feeder that has not yet acked (`acked_vlsn == 0`)
+    /// forces the CBVLSN to `0` — the conservative choice, since a replica at
+    /// VLSN 0 needs the whole log; this mirrors JE holding files for a replica
+    /// whose progress is unknown.
+    fn compute_cbvlsn(&self) -> Option<u64> {
+        if !self.is_master() {
+            return None;
+        }
+        let group = self.get_rep_group();
+        let mut min_vlsn: Option<u64> = None;
+        for feeder in self.feeders.read().iter() {
+            // Only electable replicas gate the cleaner (JE
+            // `DurabilityQuorum.replicaAcksQualify`); Monitors/Secondaries do
+            // not pin the master's log for durability.
+            let electable = group
+                .get_node(&feeder.get_replica_name())
+                .map(|n| n.node_type == crate::node_type::NodeType::Electable)
+                .unwrap_or(false);
+            if !electable {
+                continue;
+            }
+            let v = feeder.get_acked_vlsn();
+            min_vlsn = Some(min_vlsn.map_or(v, |m| m.min(v)));
+        }
+        min_vlsn
+    }
+
+    /// Recompute the CBVLSN and refresh the cleaner's replication-protected
+    /// file floor: pin every log file at or after the file that contains the
+    /// CBVLSN, so the cleaner cannot delete a file a lagging replica still
+    /// needs. As the slowest replica catches up the CBVLSN rises, the floor
+    /// rises, and older files are released for cleaning.
+    ///
+    /// No-op when no `FileProtector` is wired (no cleaner / replication not
+    /// driving the cleaner) or when this node is not a master.
+    ///
+    /// JE: `LocalCBVLSNUpdater` publishes the CBVLSN; the master pins every
+    /// log file at or after the file containing the global CBVLSN via the
+    /// `FileProtector` replication-protected range.
+    fn update_cleaner_replica_protection(&self) {
+        let protector = { self.file_protector.lock().unwrap().clone() };
+        let Some(protector) = protector else {
+            return;
+        };
+        let Some(cbvlsn) = self.compute_cbvlsn() else {
+            // Not a master (or no electable replicas): release the floor so
+            // the cleaner is not needlessly held back once mastership moves.
+            protector.set_replication_floor(None);
+            self.replication_protected_floor.store(u64::MAX, Ordering::Release);
+            return;
+        };
+        // Publish the CBVLSN on the GroupService for observability/parity with
+        // JE's `RepGroupImpl.getCBVLSN()`.
+        self.group_service.set_cbvlsn(cbvlsn);
+
+        // Map the CBVLSN to the log file that contains it. `VlsnIndex.get_lsn`
+        // returns the LSN of the covering (or nearest-lower) mapping, whose
+        // file number is where the CBVLSN's data lives — pin that file and all
+        // later ones. A CBVLSN of 0 (a replica at NULL_VLSN) has no file
+        // mapping, so pin from file 0 (the whole log) — the conservative,
+        // JE-faithful choice for a replica whose progress is unknown.
+        let floor = if cbvlsn == 0 {
+            0
+        } else {
+            match self.vlsn_index.get_lsn(cbvlsn) {
+                Some((file_number, _offset)) => file_number,
+                // CBVLSN not (yet) in the index: pin conservatively from 0.
+                None => 0,
+            }
+        };
+        protector.set_replication_floor(Some(floor));
+        self.replication_protected_floor
+            .store(u64::from(floor), Ordering::Release);
+    }
+
+    /// Returns the current replication-protected file floor: every log file at
+    /// or after this number is protected from the cleaner because a lagging
+    /// electable replica may still need it. `None` when replication is not
+    /// driving the cleaner (not a master, no electable replicas, or no cleaner
+    /// wired). See [`Self::update_cleaner_replica_protection`].
+    pub fn replication_protected_file_floor(&self) -> Option<u32> {
+        match self.replication_protected_floor.load(Ordering::Acquire) {
+            u64::MAX => None,
+            v => Some(v as u32),
+        }
     }
 
     /// Returns the current Durable Transaction VLSN (D7, JE RepNode.getDTVLSN).
