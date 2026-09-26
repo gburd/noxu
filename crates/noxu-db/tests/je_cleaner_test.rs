@@ -1120,3 +1120,80 @@ fn rmw_locking_basic_utilization_accuracy() {
     db.close().unwrap();
     env.close().unwrap();
 }
+
+// ===========================================================================
+// CleanerTest — read-only + mutable-config
+// ===========================================================================
+
+/// JE `CleanerTest.testCleanLogReadOnly`: `cleanLog()` must fail in a
+/// read-only environment (JE throws `UnsupportedOperationException` "Log
+/// cleaning not allowed in a read-only or memory-only environment"). Noxu's
+/// `Environment::clean_log()` returns an error on a read-only env.
+#[test]
+fn clean_log_read_only_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    // Create the env read-write, then close.
+    {
+        let env = open_cleaner_env(dir.path(), 4096);
+        let db = open_db(&env, false);
+        db.put(ikey(0), ikey(0)).unwrap();
+        db.close().unwrap();
+        env.close().unwrap();
+    }
+    // Reopen read-only and confirm clean_log is rejected.
+    {
+        let mut cfg = EnvironmentConfig::new(dir.path().to_path_buf())
+            .with_transactional(true)
+            .with_read_only(true);
+        cfg.set_run_cleaner(false);
+        cfg.set_run_checkpointer(false);
+        let env = Environment::open(cfg).unwrap();
+        assert!(
+            env.clean_log().is_err(),
+            "clean_log() must be rejected in a read-only environment"
+        );
+        env.close().unwrap();
+    }
+}
+
+/// JE `CleanerTest.testMutableConfig` (the `minUtilization` row, the mutable
+/// cleaner param Noxu pushes to the live cleaner). Changing
+/// `CLEANER_MIN_UTILIZATION` via `setMutableConfig` must be reflected by the
+/// running cleaner's `min_utilization` (JE re-reads it on `envConfigUpdate`;
+/// Noxu `set_mutable_config` calls `Cleaner::set_min_utilization`).
+///
+/// The other rows JE checks (`minFileUtilization`, `bytesInterval`,
+/// `deadlockRetry`, `lockTimeout`, `expunge`) are config-struct values covered
+/// by `config_default_parity_test.rs`; they are not pushed to a live cleaner
+/// field in Noxu (documented: most daemon params are advisory at runtime).
+#[test]
+fn mutable_config_min_utilization_reaches_live_cleaner() {
+    let dir = TempDir::new().unwrap();
+    let mut cfg = EnvironmentConfig::new(dir.path().to_path_buf())
+        .with_allow_create(true)
+        .with_transactional(true)
+        .with_cleaner_min_utilization(33);
+    cfg.set_run_cleaner(false);
+    cfg.set_run_checkpointer(false);
+    let mut env = Environment::open(cfg).unwrap();
+
+    assert_eq!(
+        env.cleaner_diagnostics().unwrap().min_utilization,
+        33,
+        "initial min_utilization must be the configured 33"
+    );
+
+    env.set_mutable_config(
+        noxu_db::EnvironmentMutableConfig::new()
+            .with_cleaner_min_utilization(77),
+    )
+    .unwrap();
+
+    assert_eq!(
+        env.cleaner_diagnostics().unwrap().min_utilization,
+        77,
+        "setMutableConfig(minUtilization=77) must reach the live cleaner"
+    );
+
+    env.close().unwrap();
+}
