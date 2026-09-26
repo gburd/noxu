@@ -148,6 +148,51 @@ pre-TTL entry, and an older log (or any entry with the flag clear) reads back
 as never-expiring (expiration = 0). Recovery replays the expiration into the
 B-tree slot so a record's TTL survives a crash.
 
+## `NameLN` / `NameLNTxn` data field
+
+A `NameLN` (type `0x15`) or `NameLNTxn` (type `0x16`) maps a database *name*
+(the LN key) to its persistent per-database metadata (the LN data). The data
+field is a fixed 8-byte database ID followed by an **optional, self-describing
+trailer**:
+
+| Field | Bytes | Notes |
+|---|---|---|
+| db_id | 8 (u64, LE) | database ID |
+| btree_id_len + bytes | 2 (u16, LE) + N | B-tree comparator identity (DBI-14); len 0 = none |
+| dup_id_len + bytes | 2 (u16, LE) + N | duplicate comparator identity (DBI-14); len 0 = none |
+| fanout marker | 1 | `0xF0` introduces the fanout field (NEW-5); absent otherwise |
+| fanout | 4 (i32, LE, if marker present) | persisted `NODE_MAX_ENTRIES` / `maxTreeEntriesPerNode` |
+
+The trailer is layered so that each historical shape reads correctly, shortest
+first:
+
+- **Pre-DBI-14** records are exactly the 8-byte db_id (no trailer) and decode
+  to no comparators and no fanout.
+- **DBI-14** records append the two length-prefixed comparator identities and
+  decode with no fanout.
+- **NEW-5** records additionally append `[0xF0][fanout i32]` after the
+  comparator block, so the fanout has a fixed starting offset.
+
+A fanout of `0` (JE's "use the environment `NODE_MAX_ENTRIES` default",
+`DatabaseImpl.java:420`) is **elided** — but this does NOT occur in a normal environment. The
+**resolved** effective fanout is persisted, and the env default `NODE_MAX_ENTRIES`
+is `128` (not `0`), so a database that never overrode its fanout still writes a
+`[0xF0][128]` trailer, NOT the pre-NEW-5 shape. This mirrors JE, which stores the
+resolved default and
+serializes `maxTreeEntriesPerNode` in the `DatabaseImpl` record
+(`DatabaseImpl.writeToLog`, `DatabaseImpl.java:2134`) and reads it back
+(`readFromLog`, `:2203`).
+
+**Reading rule:** a reader that finds no fanout marker (a pre-NEW-5 record, or
+a NEW-5 record for a default-fanout database) recovers no fanout, and the
+database falls back to the environment-level `NODE_MAX_ENTRIES` on reopen —
+exactly the prior behaviour. An older reader that understands only the DBI-14
+comparator block parses the two identities and ignores the fanout tail. Any
+malformed/truncated trailer degrades to no fanout (env-default fallback); a
+valid catalog entry is never rejected because of a torn trailer. Because the
+addition is an optional, marker-gated field that older readers parse
+correctly, it does **not** bump `LOG_VERSION`.
+
 ## `CkptEnd` Body
 
 The `CkptEnd` (type `0x29`) body records the metadata recovery needs to
@@ -228,3 +273,20 @@ than risk misreading.
   open and read a 7.5.4 environment, including files that contain TTL records —
   it parses the expiration field identically but does not act on it (records do
   not expire under 7.5.3). `LOG_VERSION` remains 3 across 7.5.3 ↔ 7.5.4.
+
+- **NEW-5 (persisted per-DB fanout)**: **no format change.** The database's
+  resolved `NODE_MAX_ENTRIES` (`maxTreeEntriesPerNode`) is persisted in the
+  `NameLN` / `NameLNTxn` data field as an optional, `0xF0`-marker-gated `i32`
+  after the DBI-14 comparator block (see
+  [`NameLN` data field](#nameln--namelntxn-data-field)). New databases persist
+  their **resolved** fanout, so a normal database writes a `[0xF0][fanout]`
+  trailer (the env default is `128`, not `0`, so the trailer is present, not
+  elided). Backward compatibility is by READ TOLERANCE, not byte-identical
+  writes: older readers parse the comparator identities and skip the fanout
+  tail; records written before NEW-5 carry no fanout and reopen with the
+  environment-level `NODE_MAX_ENTRIES` fallback (the prior behaviour). New
+  databases get the persisted fanout restored on reopen even without a
+  re-supplied `DatabaseConfig`; old databases keep relying on the env
+  `NODE_MAX_ENTRIES` until the catalog entry is rewritten (a fresh `NameLN` is
+  emitted at the next checkpoint's catalog relog, or on the next
+  create/rename). `LOG_VERSION` remains 3.

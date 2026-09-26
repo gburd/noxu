@@ -176,6 +176,14 @@ pub struct EnvironmentImpl {
     recovered_comparators:
         Arc<RwLock<HashMap<String, (Option<String>, Option<String>)>>>,
 
+    /// NEW-5: persisted per-DB fanout (`maxTreeEntriesPerNode`) per database
+    /// name, recovered from NameLN data.  On a default-config reopen this is
+    /// applied to the reconstructed `DatabaseImpl` so the configured
+    /// `NODE_MAX_ENTRIES` survives even when the caller does not re-supply a
+    /// `DatabaseConfig` (JE persists the resolved fanout in the DatabaseImpl
+    /// record, DatabaseImpl.java:2134/:2203).
+    recovered_fanouts: Arc<RwLock<HashMap<String, i32>>>,
+
     /// DBEVICT-1: minimal reconstructable state stashed for a database that
     /// was evicted from `db_map` while closed (`env_db_eviction = true`,
     /// mirroring JE `ENV_DB_EVICTION` / `MapLN.isEvictableInexact`, which
@@ -659,6 +667,8 @@ impl EnvironmentImpl {
             String,
             (Option<String>, Option<String>),
         > = HashMap::new();
+        // NEW-5: persisted per-DB fanouts recovered from NameLN data.
+        let mut recovered_fanouts: HashMap<String, i32> = HashMap::new();
         // Wave 3-2: prepared (XA in-doubt) transactions surfaced by
         // recovery.  Empty for fresh / clean-shutdown environments.
         let mut recovered_prepared: Vec<noxu_recovery::PreparedTxnInfo> =
@@ -887,6 +897,10 @@ impl EnvironmentImpl {
             for (name, ids) in recovery_info.recovered_db_comparators {
                 recovered_comparators.insert(name, ids);
             }
+            // NEW-5: capture persisted per-DB fanouts.
+            for (name, fanout) in recovery_info.recovered_db_fanouts {
+                recovered_fanouts.insert(name, fanout);
+            }
 
             let mut lm = LogManager::new(
                 fm,
@@ -963,6 +977,10 @@ impl EnvironmentImpl {
                     // (read-only reopen path).
                     for (name, ids) in info.recovered_db_comparators {
                         recovered_comparators.insert(name, ids);
+                    }
+                    // NEW-5: capture persisted per-DB fanouts (read-only).
+                    for (name, fanout) in info.recovered_db_fanouts {
+                        recovered_fanouts.insert(name, fanout);
                     }
                 }
                 for (db_id, tree) in recovery_trees {
@@ -1614,6 +1632,8 @@ impl EnvironmentImpl {
         let recovered_comparators: Arc<
             RwLock<HashMap<String, (Option<String>, Option<String>)>>,
         > = Arc::new(RwLock::new(recovered_comparators));
+        let recovered_fanouts: Arc<RwLock<HashMap<String, i32>>> =
+            Arc::new(RwLock::new(recovered_fanouts));
 
         // REC-CAT: wire the checkpointer's catalog-relog callback.  At the
         // start of every checkpoint the checkpointer re-logs a fresh NameLN
@@ -1628,12 +1648,14 @@ impl EnvironmentImpl {
             let name_map_for_relog = Arc::clone(&name_map);
             let db_map_for_relog = Arc::clone(&db_map);
             let comparators_for_relog = Arc::clone(&recovered_comparators);
+            let fanouts_for_relog = Arc::clone(&recovered_fanouts);
             ckpt.set_catalog_relog_fn(Arc::new(move || {
                 relog_live_catalog_impl(
                     &lm_for_relog,
                     &name_map_for_relog,
                     &db_map_for_relog,
                     &comparators_for_relog,
+                    &fanouts_for_relog,
                 );
             }));
         }
@@ -1801,6 +1823,7 @@ impl EnvironmentImpl {
             db_map,
             name_map,
             recovered_comparators,
+            recovered_fanouts,
             evicted_db_state: Arc::new(RwLock::new(HashMap::new())),
             pending_names: RwLock::new(hashbrown::HashMap::new()),
             open_reconstruct_lock: Mutex::new(()),
@@ -2156,6 +2179,26 @@ impl EnvironmentImpl {
             db_impl.set_replicated(config.replicated);
         }
 
+        // NEW-5: on reopen, restore the per-DB fanout persisted in the NameLN
+        // record.  `DatabaseImpl::new` derived the fanout from the caller's
+        // `DatabaseConfig`, whose effective value falls back to the env-level
+        // NODE_MAX_ENTRIES when the caller did not re-supply a per-DB fanout
+        // (JE DatabaseImpl.java:420).  When we recovered a persisted fanout
+        // for this name, it is authoritative — JE reconstitutes the
+        // DatabaseImpl from its log record with the persisted
+        // maxTreeEntriesPerNode (DatabaseImpl.writeToLog/readFromLog,
+        // DatabaseImpl.java:2134/:2203), so the configured split geometry
+        // survives a default-config reopen.  Pre-NEW-5 records carry no fanout
+        // and leave the env-default fallback untouched (NEW-2 behaviour).
+        // Applied BEFORE the tree wiring below so set_recovered_tree pushes
+        // the correct fanout onto the transplanted tree.
+        if recovered_db_id.is_some()
+            && let Some(&persisted_fanout) =
+                self.recovered_fanouts.read().get(name)
+        {
+            db_impl.set_max_tree_entries_per_node(persisted_fanout);
+        }
+
         // Wire the environment's shared memory counter into the new database
         // tree so that BIN insertions/deletions are visible to the Arbiter
         // (MemoryBudget.updateTreeMemoryUsage path).
@@ -2297,6 +2340,11 @@ impl EnvironmentImpl {
                             .duplicate_comparator
                             .as_ref()
                             .map(|c| c.identity.as_str()),
+                        // NEW-5: persist the DB's effective fanout so a
+                        // default-config reopen restores it instead of
+                        // falling back to the (possibly different) env-level
+                        // NODE_MAX_ENTRIES.
+                        Some(config.node_max_entries),
                     );
                 }
             }
@@ -2325,6 +2373,8 @@ impl EnvironmentImpl {
                         .duplicate_comparator
                         .as_ref()
                         .map(|c| c.identity.as_str()),
+                    // NEW-5: persist the DB's effective fanout.
+                    Some(config.node_max_entries),
                 );
             }
         }
@@ -2390,14 +2440,17 @@ impl EnvironmentImpl {
         txn_id: u64,
         btree_comparator_id: Option<&str>,
         dup_comparator_id: Option<&str>,
+        fanout: Option<i32>,
     ) -> Result<(), DbiError> {
         let key = name.as_bytes().to_vec();
         let mut data = db_id.to_le_bytes().to_vec();
-        // DBI-14: append the persisted comparator identities (empty for
-        // byte-ordered databases, preserving the pre-DBI-14 wire format).
-        data.extend_from_slice(&crate::name_ln_codec::encode_comparator_ids(
+        // DBI-14 + NEW-5: append the persisted comparator identities and the
+        // per-DB fanout (empty for a byte-ordered DB with env-default fanout,
+        // preserving the pre-DBI-14 wire format).
+        data.extend_from_slice(&crate::name_ln_codec::encode_name_ln_trailer(
             btree_comparator_id,
             dup_comparator_id,
+            fanout,
         ));
         let entry = LnLogEntry::new(
             0,                   // db_id header field (unused for NameLN)
@@ -2437,13 +2490,16 @@ impl EnvironmentImpl {
         db_id: u64,
         btree_comparator_id: Option<&str>,
         dup_comparator_id: Option<&str>,
+        fanout: Option<i32>,
     ) -> Result<(), DbiError> {
         let key = name.as_bytes().to_vec();
         let mut data = db_id.to_le_bytes().to_vec();
-        // DBI-14: append the persisted comparator identities.
-        data.extend_from_slice(&crate::name_ln_codec::encode_comparator_ids(
+        // DBI-14 + NEW-5: append the persisted comparator identities and the
+        // per-DB fanout (NEW-5).
+        data.extend_from_slice(&crate::name_ln_codec::encode_name_ln_trailer(
             btree_comparator_id,
             dup_comparator_id,
+            fanout,
         ));
         let entry = LnLogEntry::new(
             0,    // db_id header field (unused for NameLN, use 0)
@@ -2513,6 +2569,7 @@ impl EnvironmentImpl {
             &self.name_map,
             &self.db_map,
             &self.recovered_comparators,
+            &self.recovered_fanouts,
         );
     }
 
@@ -3757,6 +3814,7 @@ fn relog_live_catalog_impl(
     recovered_comparators: &Arc<
         RwLock<HashMap<String, (Option<String>, Option<String>)>>,
     >,
+    recovered_fanouts: &Arc<RwLock<HashMap<String, i32>>>,
 ) {
     // Snapshot (name, id) pairs so we do not hold the name_map lock across
     // WAL writes (which can block on the log write latch).
@@ -3785,12 +3843,22 @@ fn relog_live_catalog_impl(
                 (None, None)
             };
 
+        // NEW-5: fanout — prefer the open DatabaseImpl (authoritative), else
+        // the fanout recovered from the prior NameLN.  `None` for a DB that
+        // never overrode the fanout, preserving the pre-NEW-5 wire format.
+        let fanout: Option<i32> = if let Some(db) = db_map.read().get(db_id) {
+            Some(db.read().max_tree_entries_per_node())
+        } else {
+            recovered_fanouts.read().get(name).copied()
+        };
+
         let _ = EnvironmentImpl::log_name_ln(
             lm,
             name,
             db_id.id() as u64,
             btree_id.as_deref(),
             dup_id.as_deref(),
+            fanout,
         );
     }
 

@@ -93,6 +93,14 @@ pub struct RecoveryInfo {
     pub recovered_db_comparators:
         hashbrown::HashMap<String, (Option<String>, Option<String>)>,
 
+    /// Database name → persisted per-DB fanout (NEW-5).
+    ///
+    /// Mirrors `AnalysisResult::recovered_db_fanouts`; consumed by
+    /// `EnvironmentImpl::open_database` to restore the configured
+    /// `NODE_MAX_ENTRIES` on a default-config reopen (JE persists the resolved
+    /// `maxTreeEntriesPerNode`, DatabaseImpl.java:2134/:2203).
+    pub recovered_db_fanouts: hashbrown::HashMap<String, i32>,
+
     /// VLSN→LSN pairs replayed during the redo phase.
     ///
     /// X-14 fix: populated from every LN record that carries a non-zero
@@ -190,6 +198,7 @@ impl RecoveryInfo {
             prepared_txn_lns: hashbrown::HashMap::new(),
             recovered_db_names: hashbrown::HashMap::new(),
             recovered_db_comparators: hashbrown::HashMap::new(),
+            recovered_db_fanouts: hashbrown::HashMap::new(),
             recovered_vlsns: Vec::new(),
             rollback_matchpoint_lsn: None,
             rebuilt_file_summaries: hashbrown::HashMap::new(),
