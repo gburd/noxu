@@ -20,6 +20,11 @@ use noxu_dbi::EnvironmentImpl;
 use noxu_txn::LockType;
 use tempfile::TempDir;
 
+// JE: TxnMemoryTest.testWriteLocks / TxnMemoryTest.testReadLocks — a
+// user transaction holding record locks grows MemoryBudget.getLockMemoryUsage()
+// and the count returns to baseline after commit/abort.  JE tests this end
+// to end via db.put(txn)/scan; here we drive the same MemoryBudget lock/txn
+// categories directly through the production LockManager/TxnManager feeders.
 /// Holding many record locks in the live LockManager must show up in the
 /// MemoryBudget's lock category and hence in total_usage().
 #[test]
