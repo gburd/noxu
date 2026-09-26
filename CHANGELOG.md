@@ -78,6 +78,17 @@ listed in [References](#references).
   recovery discarding a database's configured `NODE_MAX_ENTRIES`.
 
 ### Fixed (write path & observability)
+- **Durable data loss under the default background evictor is fixed (critical).**
+  With the background evictor daemon running (the default) under cache pressure,
+  a committed record could be silently missing after a reopen. When the evictor
+  detached a BIN, a concurrent insert routed to that slot found the child no
+  longer resident and failed to re-fault it from the log (only recovery did),
+  and the cursor layer then swallowed the resulting error — so the write's log
+  record was durable but the record never entered the tree. Live insert descents
+  now re-fault an evicted child (as reads and recovery already did) and the
+  insert result is no longer discarded, so a committed transaction's record
+  cannot silently fail to land. Proven with a point-get-after-reopen regression
+  and an exhaustive concurrency (shuttle) model of evictor-detach vs insert.
 
 - **WAL now fail-stops the environment on a critical log-write failure (JE
   `LogManager.serialLog` parity).** A failed or partial WAL write previously left
