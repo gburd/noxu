@@ -293,3 +293,173 @@ fn read_commit_lockers_test_no_false_self_deadlock() {
         "after both txns commit, R must hold the writer's newdata"
     );
 }
+
+
+// ───────────────────────────────────────────────────────────────────────────
+// JE: TxnTest.testAbortNoSplit -- inserting enough records to make the tree
+// "ripe for a split", then aborting, must leave the database EMPTY and must
+// not corrupt the tree.  JE additionally asserts abort never attempts a tree
+// split (a latch-ordering invariant checked via an internal no-latches-while-
+// locking assertion).  Noxu has no such internal latch-order probe, so we port
+// the OBSERVABLE behaviour: after aborting a large insert batch the DB is
+// empty and a concurrent txn (opened before the abort) sees nothing.
+// ───────────────────────────────────────────────────────────────────────────
+#[test]
+fn txn_test_abort_no_split_leaves_db_empty() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let db = txn_db(&env, "abort_no_split");
+
+    // Insert enough data (well past a single BIN's fanout) to make the tree
+    // ripe for a split, all under ONE transaction.
+    let txn = env.begin_transaction(None).unwrap();
+    const NUM_FOR_SPLIT: u32 = 200;
+    for i in 0..NUM_FOR_SPLIT {
+        let key = format!("k{i:05}");
+        db.put_in(
+            &txn,
+            DatabaseEntry::from_bytes(key.as_bytes()),
+            DatabaseEntry::from_bytes(b"d"),
+        )
+        .unwrap();
+    }
+
+    // A second txn (JE's "spoiler") started before the abort must not see the
+    // uncommitted inserts.
+    let spoiler = env.begin_transaction(None).unwrap();
+
+    // Abort the big insert batch.
+    txn.abort().unwrap();
+
+    // The spoiler must observe an empty database (nothing was committed).
+    {
+        let mut c = db.open_cursor_in(&spoiler, None).unwrap();
+        let mut k = DatabaseEntry::new();
+        let mut d = DatabaseEntry::new();
+        let s = c.get(&mut k, &mut d, Get::First, None).unwrap();
+        assert_eq!(
+            s,
+            OperationStatus::NotFound,
+            "after aborting the insert batch, the DB must be empty for the \
+             spoiler txn (JE TxnTest.testAbortNoSplit)"
+        );
+    }
+    spoiler.abort().unwrap();
+
+    // A fresh auto-commit read also finds nothing.
+    let mut c = db.open_cursor(None).unwrap();
+    let mut k = DatabaseEntry::new();
+    let mut d = DatabaseEntry::new();
+    assert_eq!(
+        c.get(&mut k, &mut d, Get::First, None).unwrap(),
+        OperationStatus::NotFound,
+        "aborted inserts must leave no committed records"
+    );
+    drop(c);
+
+    // The tree is still usable: a new committed insert then reads back.
+    let t2 = env.begin_transaction(None).unwrap();
+    db.put_in(
+        &t2,
+        DatabaseEntry::from_bytes(b"after"),
+        DatabaseEntry::from_bytes(b"ok"),
+    )
+    .unwrap();
+    t2.commit().unwrap();
+    assert_eq!(
+        db.get(b"after").unwrap().as_deref(),
+        Some(&b"ok"[..]),
+        "tree must remain usable after an aborted split-ripe batch"
+    );
+}
+
+
+// JE: TxnEndTest.testDbCreation -- N/A / COVERED.
+//
+// JE's scenario opens the SAME database name concurrently under two
+// transactions (txnA creates it; txnB opens it non-create) to prove the DDL
+// name is invisible until txnA commits.  Noxu enforces ONE open handle per
+// database name per Environment (Environment::open_database returns
+// "Database 'foo' is already open" for a second open), so the two-handles
+// variant does not map to Noxu's model.  The PORTABLE intent -- DDL
+// create/remove/rename/truncate under a txn is invisible/rolled back until
+// the txn resolves -- is covered by crates/noxu-db/tests/ddl_txn_abort_test.rs
+// (remove/rename/truncate under a txn commit vs abort).  Classified N/A for
+// the two-concurrent-handles shape (one-handle-per-name design), COVERED for
+// the DDL-visibility intent.
+
+// ───────────────────────────────────────────────────────────────────────────
+// JE: TxnEndTest.testClose -- a transaction is unusable after it has been
+// committed: using it (e.g. to open a database) must be rejected, not silently
+// accepted.
+// ───────────────────────────────────────────────────────────────────────────
+#[test]
+fn txn_end_test_closed_transaction_is_unusable() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let db = txn_db(&env, "closed_txn");
+
+    let txn_a = env.begin_transaction(None).unwrap();
+    txn_a.commit().unwrap();
+
+    // A committed (closed) transaction must be unusable: DATA operations
+    // through it are rejected (state != Open -> InvalidTransaction).  This is
+    // the observable "closed transaction is unusable" invariant JE asserts.
+    let put = db.put_in(
+        &txn_a,
+        DatabaseEntry::from_bytes(b"k"),
+        DatabaseEntry::from_bytes(b"v"),
+    );
+    assert!(
+        put.is_err(),
+        "put through a committed transaction must be rejected \
+         (JE TxnEndTest.testClose)"
+    );
+    let mut out = DatabaseEntry::new();
+    let get =
+        db.get_into(Some(&txn_a), &DatabaseEntry::from_bytes(b"k"), &mut out);
+    assert!(
+        get.is_err(),
+        "get through a committed transaction must be rejected \
+         (JE TxnEndTest.testClose)"
+    );
+}
+
+// JE: TxnEndTest.testClose (DDL sub-case) -- BUG CANDIDATE (NEW-TXN-1).
+//
+// JE rejects using a closed transaction for ANY operation, including
+// `env.openDatabase(closedTxn, ...)` (throws IllegalArgumentException).  Noxu
+// enforces this on the DATA path (put/get through a committed txn error with
+// InvalidTransaction -- see `txn_end_test_closed_transaction_is_unusable`), but
+// `Environment::open_database` does NOT validate the passed transaction's
+// state, so a DDL create/open through a COMMITTED transaction is silently
+// accepted.  This is a minor gap (DDL only, not a data-integrity bug), kept
+// ignored and escalated as NEW-TXN-1.
+//
+// Root cause: `Environment::open_database` (crates/noxu-db/src/environment.rs)
+// calls `self.check_open()` (env open?) but never checks
+// `txn.state() == Open` / `txn.is_valid()` on the supplied `Option<&Transaction>`
+// before creating/opening the database under it.  Fix: add a txn-state guard
+// mirroring the data path's `check_state`.
+#[test]
+#[ignore = "NEW-TXN-1: open_database does not reject a committed/closed txn (DDL-path gap)"]
+fn txn_end_test_close_open_database_rejects_closed_txn_bug() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let create_cfg =
+        DatabaseConfig::new().with_allow_create(true).with_transactional(true);
+
+    let txn_a = env.begin_transaction(None).unwrap();
+    txn_a.commit().unwrap();
+
+    // FAITHFUL JE expectation: using a committed transaction to open/create a
+    // database must be rejected.  Fails on the current engine (open_database
+    // accepts the committed txn).
+    let r = env.open_database(Some(&txn_a), "foo", &create_cfg);
+    assert!(
+        r.is_err(),
+        "NEW-TXN-1: open_database through a committed (closed) transaction \
+         must be rejected (JE TxnEndTest.testClose); engine currently accepts it"
+    );
+}
+
