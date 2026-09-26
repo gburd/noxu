@@ -98,6 +98,23 @@ If `reserved_log_size` grows without `deletions` increasing, the cleaner is
 reading files but cannot delete them (active cursors or open transactions are
 pinning log files).  Keep transactions short-lived to unpin files promptly.
 
+In a replicated group, the master additionally pins every log file at or after
+the file containing the group's CBVLSN (the minimum VLSN acknowledged by any
+live electable replica) so the cleaner never deletes a file a lagging replica
+still needs. A replica that falls far behind (or is briefly disconnected) will
+therefore hold the master's log files that cover its gap — so `deletions` can
+stall until the slow replica catches up. Watch replica lag; the protection is
+released automatically as the CBVLSN advances.
+
+A replica whose feeder goes **silent** (disconnected but still a group member)
+stops holding the log down after `RepConfig::cbvlsn_timeout` (default 30 s, JE
+`RepParams.FEEDER_TIMEOUT`): its stale contribution to the CBVLSN expires and
+the floor advances to the slowest **live** replica. A permanently dead member
+therefore does not pin the master's log indefinitely — and removing it with
+`ReplicatedEnvironment::remove_peer` releases its floor immediately. Only a
+member that is genuinely alive but lagging keeps its files protected. See
+[Replication concepts → CBVLSN](../replication/concepts.md).
+
 ## Write throttling
 
 When the cleaner falls behind, it signals writer threads to pause briefly

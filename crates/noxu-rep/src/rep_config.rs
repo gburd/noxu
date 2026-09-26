@@ -15,6 +15,17 @@ use crate::stream::reconnect::ReconnectConfig;
 const DEFAULT_ELECTION_TIMEOUT: Duration = Duration::from_secs(10);
 /// Default heartbeat interval.
 const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+/// Default CBVLSN expiry timeout: how long an electable replica's feeder may
+/// go silent (no ack / no queued entry) before it stops holding the cleaner's
+/// replication-protected file floor down.
+///
+/// Matches JE's `LocalCBVLSNUpdater` expiry, which is bounded by
+/// `RepParams.FEEDER_TIMEOUT` (default 30 s): a replica that has not reported
+/// its local CBVLSN within the timeout no longer pins the global CBVLSN, so a
+/// dead/disconnected-but-not-removed member cannot pin the master's log files
+/// forever (disk-fill). A live-but-lagging replica keeps its feeder fresh
+/// (each ack / queued entry touches `last_activity`) and stays protected.
+const DEFAULT_CBVLSN_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default replication port.
 ///
 /// Default port:
@@ -119,6 +130,14 @@ pub struct RepConfig {
     pub election_timeout: Duration,
     /// Interval between heartbeat messages.
     pub heartbeat_interval: Duration,
+    /// CBVLSN expiry timeout (JE `LocalCBVLSNUpdater` / `FEEDER_TIMEOUT`).
+    ///
+    /// An electable replica whose feeder has been silent (no ack / no queued
+    /// entry) for longer than this is excluded from the global CBVLSN, so a
+    /// disconnected-but-not-removed member does not pin the master's log files
+    /// against the cleaner indefinitely. A live-but-lagging replica keeps its
+    /// feeder fresh and remains protected. Default 30 s.
+    pub cbvlsn_timeout: Duration,
     /// Default consistency policy for read operations.
     pub consistency_policy: ConsistencyPolicy,
     /// Default commit durability for replicated transactions.
@@ -297,6 +316,7 @@ impl RepConfig {
             node_priority: DEFAULT_NODE_PRIORITY,
             election_timeout: DEFAULT_ELECTION_TIMEOUT,
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
+            cbvlsn_timeout: DEFAULT_CBVLSN_TIMEOUT,
             consistency_policy: ConsistencyPolicy::default(),
             commit_durability: CommitDurability::default(),
             env_home: None,
@@ -349,6 +369,7 @@ pub struct RepConfigBuilder {
     node_priority: u32,
     election_timeout: Duration,
     heartbeat_interval: Duration,
+    cbvlsn_timeout: Duration,
     consistency_policy: ConsistencyPolicy,
     commit_durability: CommitDurability,
     env_home: Option<PathBuf>,
@@ -399,6 +420,17 @@ impl RepConfigBuilder {
     /// Sets the heartbeat interval.
     pub fn heartbeat_interval(mut self, interval: Duration) -> Self {
         self.heartbeat_interval = interval;
+        self
+    }
+
+    /// Sets the CBVLSN expiry timeout (JE `LocalCBVLSNUpdater` /
+    /// `FEEDER_TIMEOUT`, default 30 s): the interval an electable replica's
+    /// feeder may go silent before it stops holding the cleaner's
+    /// replication-protected file floor down. Lower it to release the log
+    /// sooner after a member disconnects; a live-but-lagging replica is
+    /// unaffected (its feeder stays fresh on every ack / queued entry).
+    pub fn cbvlsn_timeout(mut self, timeout: Duration) -> Self {
+        self.cbvlsn_timeout = timeout;
         self
     }
 
@@ -534,6 +566,7 @@ impl RepConfigBuilder {
             node_priority: self.node_priority,
             election_timeout: self.election_timeout,
             heartbeat_interval: self.heartbeat_interval,
+            cbvlsn_timeout: self.cbvlsn_timeout,
             consistency_policy: self.consistency_policy,
             commit_durability: self.commit_durability,
             env_home: self.env_home,

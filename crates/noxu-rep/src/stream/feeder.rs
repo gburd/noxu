@@ -616,6 +616,15 @@ impl Feeder {
     pub fn touch(&self) {
         *self.last_activity.lock() = Instant::now();
     }
+
+    /// Test-only: force this feeder to look silent by pushing its
+    /// `last_activity` timestamp `age` into the past. Lets a test drive the
+    /// CBVLSN expiry path (a disconnected member stops holding the cleaner
+    /// floor down) deterministically, without real sleeping.
+    #[cfg(any(test, feature = "test-harness"))]
+    pub fn set_last_activity_ago_for_test(&self, age: Duration) {
+        *self.last_activity.lock() = Instant::now() - age;
+    }
 }
 
 impl std::fmt::Debug for Feeder {

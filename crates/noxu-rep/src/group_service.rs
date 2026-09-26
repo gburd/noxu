@@ -115,6 +115,28 @@ impl GroupService {
         Arc::clone(&self.cbvlsn)
     }
 
+    /// Publish a directly-computed CBVLSN (advance-only).
+    ///
+    /// The master computes the global CBVLSN from per-feeder ack progress
+    /// (`ReplicatedEnvironment::compute_cbvlsn`) rather than from the
+    /// `known_vlsn`-per-node path in [`Self::update_node_vlsn`], so this
+    /// setter lets it publish that value here for observability / parity with
+    /// JE `RepGroupImpl.getCBVLSN()`. The CBVLSN never moves backward.
+    pub fn set_cbvlsn(&self, vlsn: u64) {
+        let mut cur = self.cbvlsn.load(Ordering::Acquire);
+        while vlsn > cur {
+            match self.cbvlsn.compare_exchange_weak(
+                cur,
+                vlsn,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => cur = observed,
+            }
+        }
+    }
+
     /// Update the `known_vlsn` for a node and recompute the CBVLSN.
     ///
     /// Call this whenever a heartbeat or ack arrives from the named node.

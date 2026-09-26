@@ -41,6 +41,9 @@ noxu-txn = { workspace = true }
 noxu-tree = { workspace = true }
 noxu-sync = { workspace = true }
 noxu-dbi = { workspace = true }
+# B6/V15/F2: the master translates the CBVLSN into a cleaner file-protection
+# bound via the cleaner's `FileProtector` (JE `GlobalCBVLSN` + `FileProtector`).
+noxu-cleaner = { workspace = true }
 noxu-recovery = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }

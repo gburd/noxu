@@ -352,9 +352,29 @@ is assigned the next VLSN, and this assignment is replicated to all nodes.
 **VlsnIndex:** Maps VLSN values to log file positions (LSNs) for efficient random
 access during replica catch-up and network restore.
 
-**CBVLSN (Cluster-Based Barrier VLSN):** The minimum VLSN across all active replicas.
-Log entries below CBVLSN are safe to reclaim by the log cleaner. Broadcast via
-unreliable QUIC datagrams or piggybacked on TCP heartbeats.
+**CBVLSN (Cluster-Based Barrier VLSN):** The minimum VLSN acknowledged across
+all active electable replicas. The master translates the CBVLSN into a log-file
+protection bound the cleaner honors: every log file at or after the file that
+contains the CBVLSN is pinned via the cleaner's `FileProtector`
+(`set_replication_floor`), so the cleaner never deletes a file a lagging replica
+still needs. Files fully below the CBVLSN are safe to reclaim. As the slowest
+replica catches up the CBVLSN advances, the protected floor rises, and the older
+files are released for cleaning. The protection is refreshed on every replica
+ack (`ReplicatedEnvironment::record_ack` → `update_cleaner_replica_protection`)
+and on a periodic master-side timer; a non-replicated environment sets no floor
+and the cleaner is unaffected.
+
+An electable replica whose feeder has gone **silent** — no ack and no queued
+entry for longer than `RepConfig::cbvlsn_timeout` (default 30 s, JE
+`RepParams.FEEDER_TIMEOUT`) — is **excluded** from the CBVLSN, so a
+disconnected-but-not-removed member does not pin the master's log files forever.
+This mirrors JE's `LocalCBVLSNUpdater`, whose per-replica CBVLSN contribution
+expires when the replica stops reporting. A **live-but-lagging** replica keeps
+its feeder fresh (every ack and every queued entry advances its activity clock),
+so it stays counted and its files stay protected — only a genuinely silent
+member drops out. When every electable member has expired the floor is released
+entirely. Broadcast via unreliable QUIC datagrams or piggybacked on TCP
+heartbeats.
 
 **Log shipping architecture:**
 
