@@ -2324,6 +2324,22 @@ impl CursorImpl {
     pub fn get_last(&mut self) -> Result<OperationStatus, DbiError> {
         self.check_state()?;
 
+        // C2/V2/F10: lock the per-database EOF sentinel BEFORE positioning,
+        // unconditionally, so a concurrent transaction cannot insert a new
+        // maximum key (a phantom) after this getLast.  JE
+        // `CursorImpl.positionNoDups` calls `cursorImpl.lockEof(RANGE_READ)`
+        // unconditionally for getLast (`!first`) before attempting the
+        // position (CursorImpl.java:3274/3864) — regardless of whether a last
+        // record is found or the database is empty.  lock_eof_for_scan is a
+        // no-op unless the cursor is backed by a SERIALIZABLE txn, so
+        // READ_COMMITTED / REPEATABLE_READ / auto-commit are unaffected.
+        // Placed before the tree-descend block so it also covers the
+        // known-deleted-edge path that delegates to retrieve_next(Prev) and
+        // the empty-tree NotFound path (contrast get_first, which locks EOF
+        // only on the empty branch — getFirst's found record needs no EOF
+        // protection, but getLast's does).
+        self.lock_eof_for_scan()?;
+
         let result: Option<(
             Vec<u8>,
             Bytes,
