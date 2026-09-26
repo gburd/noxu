@@ -254,7 +254,10 @@ fn split_propagation_recovers() {
             expected.insert(k.clone().into_bytes(), k.into_bytes());
         }
 
-        assert!(bin_count(&db) >= 3, "split-propagation must produce many BINs");
+        assert!(
+            bin_count(&db) >= 3,
+            "split-propagation must produce many BINs"
+        );
         // Close WITHOUT a final checkpoint (JE testOneCase).
         db.close().unwrap();
         env.close().unwrap();
@@ -577,7 +580,11 @@ fn ln_slot_reuse_after_crash_count_is_one() {
     // ---- parent: launch child, then recover and assert count == 1 ----------
     let dir = TempDir::new().unwrap();
     let status = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "ln_slot_reuse_after_crash_count_is_one", "--nocapture"])
+        .args([
+            "--exact",
+            "ln_slot_reuse_after_crash_count_is_one",
+            "--nocapture",
+        ])
         .env(CHILD_MODE, "1")
         .env(CHILD_HOME, dir.path())
         .status()
@@ -838,7 +845,9 @@ fn read_only_checkpoint_is_benign() {
         .open_database(
             None,
             "simpleDB",
-            &DatabaseConfig::new().with_read_only(true).with_transactional(true),
+            &DatabaseConfig::new()
+                .with_read_only(true)
+                .with_transactional(true),
         )
         .unwrap();
     for i in 0u32..5 {
