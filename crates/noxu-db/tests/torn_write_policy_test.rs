@@ -1,6 +1,12 @@
 // Copyright (C) 2024-2025 Greg Burd.  Apache-2.0 OR MIT.
 //! Deterministic torn-write recovery policy test.
 //!
+//! JE: FileEdgeCaseTest.testFindCommittedTxn ([#18307], cases 1 & 2) --
+//! a checksum error at the tail with NO committed txn after it (case 2), and
+//! a double-corruption prefix (case 1), both truncate-and-recover the prior
+//! committed entries. (Case 3, the halt-and-refuse path, is in
+//! halt_on_commit_after_checksum_test.rs.)
+//!
 //! This is the byte-level, in-process, no-timing-race companion to the
 //! SIGKILL-timed torn-write coverage in `crash_recovery_test.rs`
 //! (`test_torn_write_truncated_entry_recovered`) and the randomised

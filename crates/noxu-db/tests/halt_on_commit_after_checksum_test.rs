@@ -2,6 +2,12 @@
 //! End-to-end integration test for `EnvironmentConfig::with_halt_on_commit_
 //! after_checksum_exception`.
 //!
+//! JE: FileEdgeCaseTest.testFindCommittedTxn ([#18307], case 3) at the
+//! Environment-open level -- corruption before a committed txn with the
+//! HALT_ON_COMMIT_AFTER_CHECKSUMEXCEPTION flag set must refuse to mount
+//! (FOUND_COMMITTED_TXN). Also relates to FileEdgeCaseTest.testPostChecksumError
+//! (repeated opens keep failing rather than degrading the log).
+//!
 //! By default, if end-of-log discovery hits a checksum error near the end
 //! of the log, the reader assumes an ordinary torn write from an
 //! interrupted crash and quietly truncates the log there. When this flag
