@@ -721,10 +721,9 @@ fn rle_to_str(b: &[u8]) -> String {
 //
 // This is a FAITHFUL port kept #[ignore]d (not weakened) per the test-parity
 // contract: it must pass once the split/prefix path respects the configured
-// comparator.  Un-ignore when NEW-TREE-RLE is fixed.
+// comparator.  NEW-TREE-RLE is FIXED (main 792bbd70): this is now a live guard.
 //
 // JE: KeyPrefixTest.testRLEComparator
-#[ignore = "NEW-TREE-RLE: split+key-prefixing+non-byte-order comparator loses records"]
 #[test]
 fn key_prefix_rle_comparator_round_trip() {
     let dir = TempDir::new().unwrap();
