@@ -1040,10 +1040,19 @@ impl EnvironmentImpl {
         // log_buffer_size is the per-buffer size; log_num_buffers is the count.
         let log_buf_total = (cfg.log_num_buffers * cfg.log_buffer_size) as i64;
         let off_heap_reserved = cfg.max_off_heap_memory as i64;
-        // Floor at 1 MiB so the arbiter remains functional even if the user
-        // sets a cache_size smaller than the buffer + off-heap reservations.
+        // Floor so the arbiter budget stays positive even if the user sets a
+        // cache_size smaller than the buffer + off-heap reservations.  JE uses
+        // MIN_MAX_MEMORY_SIZE = 96 KiB (EnvironmentImpl.MIN_MAX_MEMORY_SIZE)
+        // as the minimum cache and rejects anything smaller at config time; it
+        // does NOT silently inflate a legitimately-small configured budget.
+        // NEW-7: the previous 1 MiB floor did exactly that — a configured cache
+        // smaller than 1 MiB was silently rounded UP to 1 MiB, so a small
+        // cache never triggered meaningful eviction (the resident set fit the
+        // inflated budget).  Lower the floor to JE's 96 KiB so a small
+        // configured cache is honored, while still preventing a non-positive
+        // budget when log buffers + off-heap exceed cache_size.
         let arbiter_budget = (cache_bytes - log_buf_total - off_heap_reserved)
-            .max(1024 * 1024_i64);
+            .max(96 * 1024_i64);
         // F10 (JE EVICTOR_EVICT_BYTES / EVICTOR_CRITICAL_PERCENTAGE): read the
         // eviction hysteresis and critical threshold from config instead of
         // hardcoding 128 KiB / budget/16. Default evict_bytes = 512 KiB

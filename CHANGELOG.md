@@ -148,6 +148,8 @@ listed in [References](#references).
   (which logs any dirty eviction target, not just leaves). This path is
   low-reachability under normal workloads (leaf/record eviction relieves memory
   pressure first) but is now correct when it does occur.
+- **Bounded eviction now converges toward the cache budget (JE `Evictor.doEvict` loop).** `Evictor::do_evict` ran a single capped `evict_batch` per call (batch size = `EVICTOR_NODES_PER_SCAN`, default 10). With the primary LRU larger than the batch, phase-1 LN-stripping exhausted the batch before phase-2 drained the pri2 dirty-BIN LRU, so one `env.evict_memory()` reclaimed only ~10 nodes even when the cache was many times over budget with thousands of dirty BINs parked in pri2 — a small or pressured cache was effectively not honored and memory could grow far past the configured budget. `do_evict` now loops `evict_batch` while still over budget and making progress (JE `Evictor.doEvict`), bounded by a no-progress check so it cannot live-lock, and the arbiter budget floor was lowered from 1 MiB to JE's `MIN_MAX_MEMORY_SIZE` (96 KiB) so a configured small cache is honored instead of silently rounded up. A configured cache now converges to its budget in a single `evict_memory()` call, and dirty BINs are actually evicted under sustained pressure. (This also re-enables the B3 cleaner-miss metrics guard that was temporarily disabled while eviction could not fully evict a BIN.)
+- **Cursor scans can return partial results on a partially-evicted tree (follow-up, tracked).** The cursor scan-start descent (`descend_to_bin` / `find_bin_for_key` / `descend_to_last_bin`) does not re-fault an evicted child from the log the way the point-read path does, so after real eviction a `Get::First`+`Get::Next` scan can silently return only a subset of the records while point lookups still return every key (no on-disk data loss; `env.verify()` is clean). This is a pre-existing bug exposed — not caused — by the eviction-convergence fix above (which makes eviction effective enough to detach interior BINs). It is captured as a deterministic, currently-ignored reproduction and is the next fix task.
 - **Cursor scans no longer stop at an empty edge BIN.** `Get::First` / `Get::Last`
   (and the scans they drive) returned nothing when the leftmost/rightmost BIN was
   physically empty after deletes (slots removed, BIN not yet compressed), even
@@ -166,9 +168,10 @@ listed in [References](#references).
   backstop and a guard test that fails if an exported evictor metric stops
   moving. Replication health metrics (`RepStats`) remain unwired and unexported
   (no fabricated replication gauge ships) and are tracked separately. **Note:**
-  a related eviction-convergence limitation (bounded eviction can leave a cache
-  over its budget) is tracked as a follow-up; one metrics guard is temporarily
-  disabled because of it.
+  the related eviction-convergence limitation (bounded eviction could leave a
+  cache over its budget) is now fixed (see the eviction-convergence entry
+  above), and the metrics guard that was temporarily disabled because of it is
+  re-enabled.
 - **Eviction no longer detaches a BIN that was re-dirtied or pinned since its
   flush.** The evictor logged a dirty BIN under the child latch, released it,
   then detached under the parent latch — a window in which a cursor could
