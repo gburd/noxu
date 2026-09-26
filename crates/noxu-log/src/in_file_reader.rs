@@ -347,6 +347,19 @@ impl<F: LogFileAccess> INFileReader<F> {
 }
 
 #[cfg(test)]
+// JE: INFileReaderTest.{testNoFile,testEmpty,testBasic,testTracking,
+// testMiddleStart}. The JE tests fill a log file with INs/BINs/BIN-deltas
+// (+ Debug records + provisional entries), then drive an INFileReader that
+// filters to IN/BIN/BIN-delta target types, tracks max node/db IDs, and
+// checks LSNs + node contents match. Noxu exercises the same reader
+// contract with MockFileAccess fixtures: target-type filtering
+// (test_read_in_entry / test_read_bin_entry / test_read_bin_delta_entry /
+// test_skip_non_target), db-id tracking (test_max_db_id_tracking),
+// start/finish LSN (test_finish_lsn_stops_reading), empty/no-file
+// (test_eof_on_empty_file / test_eof_on_no_files), and multi-file scans.
+// Deviation: node_id is embedded in opaque node_data that noxu-log cannot
+// decode without noxu-tree, so get_max_node_id() stays 0 and JE's
+// testTracking maxNodeId assertion is covered only for max_db_id.
 mod tests {
     use super::*;
     use crate::entry::bin_delta_log_entry::BinDeltaLogEntry;

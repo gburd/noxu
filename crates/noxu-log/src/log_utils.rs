@@ -227,6 +227,12 @@ pub fn timestamp_size(millis: i64) -> usize {
 }
 
 #[cfg(test)]
+// JE: LogUtilsTest.testMarshalling -- read/write round-trips and exact
+// on-disk byte lengths for the primitive marshalling helpers (ints,
+// longs, packed ints/longs, byte arrays, strings incl. multi-byte UTF-8,
+// timestamps, booleans). Noxu splits JE's single testMarshalling method
+// into one focused #[test] per primitive; together they assert the same
+// intent. (.ndb format deviation: field encodings match JE LogUtils.)
 mod tests {
     use super::*;
     use std::io::Cursor;
@@ -291,6 +297,37 @@ mod tests {
             let result = read_string(&mut Cursor::new(&buf)).unwrap();
             assert_eq!(result.as_deref(), text);
         }
+    }
+
+    /// JE: LogUtilsTest.testMarshalling (String portion) -- a string is
+    /// written as a packed-int length prefix followed by the UTF-8 bytes,
+    /// so the on-disk size is `packed_i32_size(nbytes) + nbytes`. A 12-byte
+    /// ASCII string encodes in 1 + 12 bytes; the Euro sign U+20AC is 3
+    /// UTF-8 bytes, so "Hello Euro!\u{20ac}" (11 ASCII + 3) encodes in
+    /// 1 + 14 bytes. JE asserts these exact lengths.
+    #[test]
+    fn test_string_exact_byte_length_and_multibyte() {
+        // 12-byte ASCII string: 1-byte packed length + 12 payload bytes.
+        let ascii = "Hello world!";
+        assert_eq!(ascii.len(), 12);
+        let mut buf = Vec::new();
+        write_string(&mut buf, Some(ascii)).unwrap();
+        assert_eq!(buf.len(), packed_i32_size(12) + 12);
+        assert_eq!(
+            read_string(&mut Cursor::new(&buf)).unwrap().as_deref(),
+            Some(ascii)
+        );
+
+        // Multi-byte: Euro sign U+20AC is 3 UTF-8 bytes.
+        let euro = "Hello Euro!\u{20ac}";
+        assert_eq!(euro.len(), 14, "11 ASCII + 3 UTF-8 bytes");
+        let mut buf = Vec::new();
+        write_string(&mut buf, Some(euro)).unwrap();
+        assert_eq!(buf.len(), packed_i32_size(14) + 14);
+        assert_eq!(
+            read_string(&mut Cursor::new(&buf)).unwrap().as_deref(),
+            Some(euro)
+        );
     }
 
     #[test]

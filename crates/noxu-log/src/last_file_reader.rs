@@ -601,6 +601,19 @@ mod tests {
     // txn exists AFTER a mid-file corruption point.
     // Faithful to JE LastFileReader.readNextEntry/findCommittedTxn
     // (LastFileReader.java:313/394, [#18307]).
+    //
+    // JE: FileEdgeCaseTest.testFindCommittedTxn ([#18307]) exercises the
+    // three cases these tests mirror at the reader level:
+    //   case 3 (corruption BEFORE a commit, halt enabled) -> throw
+    //     FOUND_COMMITTED_TXN:
+    //     test_l14_found_committed_txn_after_corruption_halts
+    //   case 2 (corruption, NO commit after) -> truncate:
+    //     test_l14_torn_tail_no_commit_truncates_when_enabled
+    //   halt disabled -> truncate even with a commit after:
+    //     test_l14_disabled_keeps_truncate_even_with_commit_after
+    // The env-level FileEdgeCaseTest is additionally covered end-to-end by
+    // noxu-db tests/halt_on_commit_after_checksum_test.rs and
+    // tests/torn_write_policy_test.rs (case 1 double-corruption prefix).
     // ------------------------------------------------------------------
 
     /// Layout: [valid type-0 entry][CORRUPT entry][valid TxnCommit (type 30)].

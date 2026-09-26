@@ -399,6 +399,22 @@ impl<F: LogFileAccess> LNFileReader<F> {
 }
 
 #[cfg(test)]
+// JE: LNFileReaderTest.{testNoFile,testEmpty,testBasicRedo,testBasicUndo,
+// testSmallBuffersRedo,testSmallBuffersUndo,testMedBuffersRedo,
+// testMedBuffersUndo,testMiddleStartRedo,testMiddleStartUndo}. JE's tests
+// are all `doTest` variants: fill a log with transactional LNs (tracked),
+// non-transactional LNs (skipped), MapLNs, and Debug records, then read
+// forward (redo) or backward (undo) with varying buffer sizes and start
+// offsets, checking LSN, LN contents, key, and txn id. Noxu exercises the
+// same reader contract with MockFileAccess fixtures: forward redo
+// (test_ln_file_reader_new_forward / test_read_ln_entry), backward undo
+// (test_ln_file_reader_new_backward), user-LN target filtering + skip of
+// non-target entries (test_skip_non_target_entries), transactional txn id
+// (test_read_transactional_ln_entry), commit/abort matching
+// (test_read_commit_entry / test_read_abort_entry), finish-LSN stop
+// (test_finish_lsn_stops_reading), and empty/no-file EOF. Buffer-size is a
+// no-op in Noxu (the reader accumulates whole entries regardless), so the
+// small/med-buffer JE variants collapse to the same functional assertion.
 mod tests {
     use super::*;
     use crate::entry::commit_abort_entry::TxnEndEntry;

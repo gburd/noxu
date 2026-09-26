@@ -234,6 +234,11 @@ impl FileSummaryLnEntry {
 }
 
 #[cfg(test)]
+// JE: LoggableTest.testEntryData (writeAndRead for FileSummaryLN (LOG_FILESUMMARYLN)).
+// The round-trip tests below assert the same writeAndRead invariant JE
+// applies to every loggable: write_to_log produces exactly log_size()
+// bytes, read_from_log recovers an equal object, and the re-read object
+// reports the same log_size().
 mod tests {
     use super::*;
 

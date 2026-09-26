@@ -1846,6 +1846,16 @@ mod tests {
     /// because the read path cloaks the invisible bit before validating
     /// (JE `LogEntryHeader.turnOffInvisible`). The entry must still read back
     /// after make_invisible + force.
+    ///
+    /// JE: InvisibleTest.testBasic (core invariant) -- entries are marked
+    /// invisible on disk via FileManager.makeInvisible + force, and the fetch
+    /// path still validates and returns them (the invisible-bit cloak). JE's
+    /// full testBasic additionally checks (a) a visible-only scan skips the
+    /// marked entries and (b) the plain getLogEntry raises LOG_INTEGRITY while
+    /// getLogEntryAllowInvisible succeeds; Noxu does not expose that
+    /// two-tier fetch API (recovery consumes invisibility differently), so
+    /// those halves are a documented API deviation. The checksum-preservation
+    /// core -- the point of the invisible bit -- is what this test proves.
     #[test]
     fn test_make_invisible_preserves_checksum() {
         let dir = TempDir::new().unwrap();

@@ -84,6 +84,11 @@ impl RollbackEndEntry {
 }
 
 #[cfg(test)]
+// JE: LoggableTest.testEntryData (writeAndRead for RollbackEnd (LOG_ROLLBACK_END)).
+// The round-trip tests below assert the same writeAndRead invariant JE
+// applies to every loggable: write_to_log produces exactly log_size()
+// bytes, read_from_log recovers an equal object, and the re-read object
+// reports the same log_size().
 mod tests {
     use super::*;
     use noxu_util::lsn::{Lsn, NULL_LSN};
