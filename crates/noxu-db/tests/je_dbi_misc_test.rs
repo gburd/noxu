@@ -136,8 +136,12 @@ fn contended(dups: bool) {
         .unwrap();
         drop(c);
     } else {
-        db.put_in(&t1, DatabaseEntry::from_bytes(b"k"), DatabaseEntry::from_bytes(b"v1"))
-            .unwrap();
+        db.put_in(
+            &t1,
+            DatabaseEntry::from_bytes(b"k"),
+            DatabaseEntry::from_bytes(b"v1"),
+        )
+        .unwrap();
     }
 
     let barrier = Arc::new(Barrier::new(2));
@@ -346,9 +350,8 @@ fn sr12641_splits_with_scans_dups() {
 fn db_tree_test_db_lookup() {
     let dir = TempDir::new().unwrap();
     let env = open_env(&dir);
-    let create = DatabaseConfig::new()
-        .with_allow_create(true)
-        .with_transactional(true);
+    let create =
+        DatabaseConfig::new().with_allow_create(true).with_transactional(true);
     let db_abcd = env.open_database(None, "abcd", &create).unwrap();
     let db_xyz = env.open_database(None, "xyz", &create).unwrap();
     // Put one record in each so the reopen resolves a non-empty tree.
@@ -369,14 +372,18 @@ fn db_tree_test_db_lookup() {
 
     // The reopened handles see the same records.
     let mut out = DatabaseEntry::new();
-    assert!(re_abcd
-        .get_into(None, &DatabaseEntry::from_bytes(b"a"), &mut out)
-        .unwrap());
+    assert!(
+        re_abcd
+            .get_into(None, DatabaseEntry::from_bytes(b"a"), &mut out)
+            .unwrap()
+    );
     assert_eq!(b"1", out.data_opt().unwrap());
     let mut out = DatabaseEntry::new();
-    assert!(re_xyz
-        .get_into(None, &DatabaseEntry::from_bytes(b"x"), &mut out)
-        .unwrap());
+    assert!(
+        re_xyz
+            .get_into(None, DatabaseEntry::from_bytes(b"x"), &mut out)
+            .unwrap()
+    );
     assert_eq!(b"2", out.data_opt().unwrap());
 
     // Opening a NON-existent name with allowCreate=false must fail.

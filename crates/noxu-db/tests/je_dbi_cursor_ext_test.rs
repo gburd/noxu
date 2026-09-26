@@ -2,16 +2,14 @@
 //! `je_db_cursor_test.rs` / `je_dup_cursor_test.rs` / `je_cursor_delete_test.rs`.
 //!
 //! Source classes:
-//!   - `DbCursorTest.java`          (edge cases: out-of-bounds, twice-closed,
-//!                                    simpleGetPut2, replace, large traversals,
-//!                                    tree-splitting-with-deleted-id-key)
-//!   - `DbCursorSearchTest.java`    (large search, delete+search, dup search)
-//!   - `DbCursorDupTest.java`       (cursor dup-initialized state machine)
-//!   - `DbCursorDuplicateTest.java` (missing dup ops: keyLast, comparators,
-//!                                    putNoDupData, getPrevDup/NoDup,
-//!                                    illegal-dup)
-//!   - `DbCursorDuplicateDeleteTest.java` (dup delete/count round-trips)
-//!   - `CodeCoverageTest.java`      (double-delete via cursor)
+//! - `DbCursorTest.java` (edge cases: out-of-bounds, twice-closed,
+//!   simpleGetPut2, replace, large traversals, tree-splitting-deleted-id-key)
+//! - `DbCursorSearchTest.java` (large search, delete+search, dup search)
+//! - `DbCursorDupTest.java` (cursor dup-initialized state machine)
+//! - `DbCursorDuplicateTest.java` (missing dup ops: keyLast, comparators,
+//!   putNoDupData, getPrevDup/NoDup, illegal-dup)
+//! - `DbCursorDuplicateDeleteTest.java` (dup delete/count round-trips)
+//! - `CodeCoverageTest.java` (double-delete via cursor)
 //!
 //! JE's `DataWalker` / `BackwardsDataWalker` harness is flattened into direct
 //! `Get::First`/`Get::Last` + `Get::Next`/`Get::Prev` walks; the user-visible
@@ -162,7 +160,11 @@ fn db_cursor_test_simple_replace() {
                 let mut nv = d.data_opt().unwrap_or(&[]).to_vec();
                 nv.push(b'x');
                 let p = cursor
-                    .put(&cur_key, &DatabaseEntry::from_bytes(&nv), Put::Current)
+                    .put(
+                        &cur_key,
+                        &DatabaseEntry::from_bytes(&nv),
+                        Put::Current,
+                    )
                     .unwrap();
                 assert_eq!(OperationStatus::Success, p);
                 s = cursor.get(&mut k, &mut d, Get::Next, None).unwrap();
@@ -283,7 +285,11 @@ fn db_cursor_test_large_count() {
     let mut seen = 0u32;
     let mut s = cursor.get(&mut k, &mut d, Get::First, None).unwrap();
     while s == OperationStatus::Success {
-        assert_eq!(1, cursor.count().unwrap(), "count() must be 1 on a no-dup db");
+        assert_eq!(
+            1,
+            cursor.count().unwrap(),
+            "count() must be 1 on a no-dup db"
+        );
         let key = k.data_opt().unwrap_or(&[]).to_vec();
         if let Some(p) = &prev {
             assert!(*p < key, "keys must be strictly ascending");
@@ -396,12 +402,12 @@ fn tree_splitting_with_deleted_id_key(comparator: bool) {
             .with_transactional(true),
     )
     .unwrap();
-    let mut cfg = DatabaseConfig::new()
-        .with_allow_create(true)
-        .with_transactional(true);
+    let mut cfg =
+        DatabaseConfig::new().with_allow_create(true).with_transactional(true);
     if comparator {
-        cfg = cfg
-            .with_btree_comparator(Comparator::new("bytewise", |a, b| a.cmp(b)));
+        cfg = cfg.with_btree_comparator(Comparator::new("bytewise", |a, b| {
+            a.cmp(b)
+        }));
     }
     let db = env.open_database(None, "splitidkey", &cfg).unwrap();
 
@@ -420,11 +426,11 @@ fn tree_splitting_with_deleted_id_key(comparator: bool) {
     }
 
     // Oracle: every surviving key retrievable, forward walk sorted + exact set.
-    let expect: BTreeSet<Vec<u8>> = ["AHHHH", "AIIII", "AAAAA", "AABBB",
-        "AACCC", "AAAAB", "AAAAC"]
-        .iter()
-        .map(|s| s.as_bytes().to_vec())
-        .collect();
+    let expect: BTreeSet<Vec<u8>> =
+        ["AHHHH", "AIIII", "AAAAA", "AABBB", "AACCC", "AAAAB", "AAAAC"]
+            .iter()
+            .map(|s| s.as_bytes().to_vec())
+            .collect();
     let mut cursor = db.open_cursor(None).unwrap();
     let mut k = DatabaseEntry::new();
     let mut d = DatabaseEntry::new();
@@ -436,14 +442,17 @@ fn tree_splitting_with_deleted_id_key(comparator: bool) {
     }
     let mut sorted = walked.clone();
     sorted.sort();
-    assert_eq!(walked, sorted, "walk must be in sorted order (comparator={comparator})");
+    assert_eq!(
+        walked, sorted,
+        "walk must be in sorted order (comparator={comparator})"
+    );
     let got: BTreeSet<Vec<u8>> = walked.into_iter().collect();
     assert_eq!(expect, got, "exact surviving set (comparator={comparator})");
     // Point-get every surviving key.
     for k in &expect {
         let mut out = DatabaseEntry::new();
         assert!(
-            db.get_into(None, &DatabaseEntry::from_bytes(k), &mut out).unwrap(),
+            db.get_into(None, DatabaseEntry::from_bytes(k), &mut out).unwrap(),
             "surviving key {:?} must be retrievable",
             String::from_utf8_lossy(k)
         );
@@ -488,11 +497,15 @@ fn db_cursor_search_test_large_search_key() {
         // getSearchKey (Get::Search)
         let s = cursor.get(&mut key, &mut data, Get::Search, None).unwrap();
         assert_eq!(OperationStatus::Success, s, "search key {i}");
-        assert_eq!(&(i.wrapping_mul(3)).to_be_bytes()[..], data.data_opt().unwrap());
+        assert_eq!(
+            &(i.wrapping_mul(3)).to_be_bytes()[..],
+            data.data_opt().unwrap()
+        );
         // getSearchKeyRange for the exact key resolves the exact record.
         let mut key = DatabaseEntry::from_bytes(&i.to_be_bytes());
         let mut data = DatabaseEntry::new();
-        let s = cursor.get(&mut key, &mut data, Get::SearchRange, None).unwrap();
+        let s =
+            cursor.get(&mut key, &mut data, Get::SearchRange, None).unwrap();
         assert_eq!(OperationStatus::Success, s, "search-range key {i}");
         assert_eq!(&i.to_be_bytes()[..], key.data_opt().unwrap());
     }
@@ -541,7 +554,8 @@ fn db_cursor_search_test_large_delete_and_search_key() {
         // getSearchKeyRange -> SUCCESS (a later key survives) or NOTFOUND (last)
         let mut key = DatabaseEntry::from_bytes(&i.to_be_bytes());
         let mut data = DatabaseEntry::new();
-        let s = cursor.get(&mut key, &mut data, Get::SearchRange, None).unwrap();
+        let s =
+            cursor.get(&mut key, &mut data, Get::SearchRange, None).unwrap();
         assert!(
             s == OperationStatus::Success || s == OperationStatus::NotFound,
             "search-range must be SUCCESS or NOTFOUND, got {s:?}"
@@ -598,7 +612,11 @@ fn db_cursor_search_test_large_search_key_duplicates() {
             let s = cursor
                 .get(&mut key, &mut data, Get::SearchBothRange, None)
                 .unwrap();
-            assert_eq!(OperationStatus::Success, s, "search-both-range {k}/{d}");
+            assert_eq!(
+                OperationStatus::Success,
+                s,
+                "search-both-range {k}/{d}"
+            );
             assert_eq!(&d.to_be_bytes()[..], data.data_opt().unwrap());
             assert_eq!(&k.to_be_bytes()[..], key.data_opt().unwrap());
         }
@@ -620,7 +638,7 @@ fn db_cursor_search_test_simple_search_both_with_partial_dbt() {
     put_simple(&env, &db);
     let mut cursor = db.open_cursor(None).unwrap();
     // Build a data entry with a larger backing buffer but 3 significant bytes.
-    let mut buf = vec![0u8; 100];
+    let mut buf = [0u8; 100];
     buf[..3].copy_from_slice(b"two");
     let mut key = DatabaseEntry::from_bytes(b"bar");
     let mut data = DatabaseEntry::from_bytes(&buf[..3]);
@@ -652,7 +670,10 @@ fn db_cursor_dup_test_dup_initialized_uninitialized_get_current_fails() {
     let r = c.get(&mut k, &mut d, Get::Current, None);
     assert!(
         r.is_err()
-            || matches!(r, Ok(OperationStatus::NotFound | OperationStatus::KeyEmpty)),
+            || matches!(
+                r,
+                Ok(OperationStatus::NotFound | OperationStatus::KeyEmpty)
+            ),
         "getCurrent on an uninitialized cursor must not return Success: {r:?}"
     );
     // After inserting a record, getFirst/getNext become usable.
@@ -692,11 +713,8 @@ fn code_coverage_test_delete_deleted() {
     // Second delete on the now-deleted slot must NOT report Success again and
     // must not panic (JE KEYEMPTY).
     let r2 = cursor.delete();
-    match r2 {
-        Ok(OperationStatus::Success) => {
-            panic!("double-delete returned Success (JE requires KEYEMPTY)")
-        }
-        Ok(_) | Err(_) => {}
+    if let Ok(OperationStatus::Success) = r2 {
+        panic!("double-delete returned Success (JE requires KEYEMPTY)")
     }
     drop(cursor);
     txn.commit().unwrap();
@@ -704,7 +722,7 @@ fn code_coverage_test_delete_deleted() {
     // The record is genuinely gone and the rest of the DB is intact.
     let mut out = DatabaseEntry::new();
     assert!(
-        !db.get_into(None, &DatabaseEntry::from_bytes(&first_key), &mut out)
+        !db.get_into(None, DatabaseEntry::from_bytes(&first_key), &mut out)
             .unwrap()
     );
     assert_eq!(SIMPLE_KEYS.len() as u64 - 1, db.count().unwrap());
@@ -749,7 +767,10 @@ fn db_cursor_duplicate_test_duplicate_creation_forward_key_last() {
             d.data_opt().unwrap_or(&[]).to_vec(),
         );
         if let Some(p) = &prev {
-            assert!(p <= &cur, "forward walk must be (k asc, d asc): {p:?} {cur:?}");
+            assert!(
+                p <= &cur,
+                "forward walk must be (k asc, d asc): {p:?} {cur:?}"
+            );
         }
         prev = Some(cur);
         seen += 1;
@@ -768,12 +789,8 @@ fn db_cursor_duplicate_test_put_no_dup_data() {
     let (_dir, _env, db) = open_dup();
     let mut cursor = db.open_cursor(None).unwrap();
     // Insert a handful of dup pairs.
-    let pairs: &[(&[u8], &[u8])] = &[
-        (b"k1", b"a"),
-        (b"k1", b"b"),
-        (b"k2", b"a"),
-        (b"k2", b"c"),
-    ];
+    let pairs: &[(&[u8], &[u8])] =
+        &[(b"k1", b"a"), (b"k1", b"b"), (b"k2", b"a"), (b"k2", b"c")];
     for (k, d) in pairs {
         let s = cursor
             .put(
@@ -833,9 +850,8 @@ fn db_cursor_duplicate_test_get_prev_dup() {
         assert_eq!(OperationStatus::Success, s);
         // Advance to the last dup.
         loop {
-            let s = cursor
-                .get(&mut key, &mut data, Get::NextDup, None)
-                .unwrap();
+            let s =
+                cursor.get(&mut key, &mut data, Get::NextDup, None).unwrap();
             if s == OperationStatus::NotFound {
                 break;
             }
@@ -845,9 +861,8 @@ fn db_cursor_duplicate_test_get_prev_dup() {
         assert_eq!(prev, vec![4u8], "cursor should be on last dup 4");
         let mut seen = 1usize;
         loop {
-            let s = cursor
-                .get(&mut key, &mut data, Get::PrevDup, None)
-                .unwrap();
+            let s =
+                cursor.get(&mut key, &mut data, Get::PrevDup, None).unwrap();
             if s == OperationStatus::NotFound {
                 break;
             }
@@ -921,10 +936,12 @@ fn db_cursor_duplicate_test_illegal_duplicate_creation() {
     let (_dir, _env, db) = open_nondup(false);
     let k = DatabaseEntry::from_bytes(b"k");
     // First insert succeeds.
-    assert!(db.put_no_overwrite(&k, &DatabaseEntry::from_bytes(b"v1")).unwrap());
+    assert!(db.put_no_overwrite(&k, DatabaseEntry::from_bytes(b"v1")).unwrap());
     // A second putNoOverwrite under the same key must NOT create a dup: it
     // returns KEYEXIST (false) and leaves v1 in place.
-    assert!(!db.put_no_overwrite(&k, &DatabaseEntry::from_bytes(b"v2")).unwrap());
+    assert!(
+        !db.put_no_overwrite(&k, DatabaseEntry::from_bytes(b"v2")).unwrap()
+    );
     // Exactly one record under the key; it is still v1.
     let mut out = DatabaseEntry::new();
     assert!(db.get_into(None, &k, &mut out).unwrap());
@@ -966,11 +983,13 @@ fn db_cursor_duplicate_test_duplicate_replacement_failure() {
     // Two dups: d1d1, d2d2 (JE testDuplicateReplacementFailure).
     assert_eq!(
         OperationStatus::Success,
-        c.put(&key, &DatabaseEntry::from_bytes(b"d1d1"), Put::NoDupData).unwrap()
+        c.put(&key, &DatabaseEntry::from_bytes(b"d1d1"), Put::NoDupData)
+            .unwrap()
     );
     assert_eq!(
         OperationStatus::Success,
-        c.put(&key, &DatabaseEntry::from_bytes(b"d2d2"), Put::NoDupData).unwrap()
+        c.put(&key, &DatabaseEntry::from_bytes(b"d2d2"), Put::NoDupData)
+            .unwrap()
     );
 
     // Walk each dup and putCurrent("blort") — JE: every one throws
@@ -1070,12 +1089,12 @@ fn db_cursor_duplicate_delete_test_simple_delete_insert() {
 
     let put_all = |env: &noxu_db::Environment, db: &noxu_db::Database| {
         let txn = env.begin_transaction(None).unwrap();
-        for ki in 0..k {
-            for di in 0..k {
+        for pk in SIMPLE_KEYS.iter().take(k) {
+            for dv in SIMPLE_DATA.iter().take(k) {
                 db.put_in(
                     &txn,
-                    DatabaseEntry::from_bytes(SIMPLE_KEYS[ki].as_bytes()),
-                    DatabaseEntry::from_bytes(SIMPLE_DATA[di].as_bytes()),
+                    DatabaseEntry::from_bytes(pk.as_bytes()),
+                    DatabaseEntry::from_bytes(dv.as_bytes()),
                 )
                 .unwrap();
             }
@@ -1322,7 +1341,11 @@ fn db_cursor_duplicate_delete_test_duplicate_deletion_assorted_sr15375() {
                         Put::NoDupData,
                     )
                     .unwrap();
-                assert_eq!(OperationStatus::Success, s2, "add-back must succeed");
+                assert_eq!(
+                    OperationStatus::Success,
+                    s2,
+                    "add-back must succeed"
+                );
                 expected.insert((key, added));
             }
             s = c.get(&mut cur, &mut d, Get::Next, None).unwrap();
@@ -1345,7 +1368,10 @@ fn db_cursor_duplicate_delete_test_duplicate_deletion_assorted_sr15375() {
         ));
         s = c.get(&mut k, &mut d, Get::Next, None).unwrap();
     }
-    assert_eq!(expected, survivors, "SR15375: delete+add-back corrupted dup set");
+    assert_eq!(
+        expected, survivors,
+        "SR15375: delete+add-back corrupted dup set"
+    );
 }
 
 // ===========================================================================
@@ -1374,7 +1400,7 @@ fn db_cursor_duplicate_delete_test_count_after_delete_returns_remaining() {
     let (_dir, env, db) = open_dup();
     let key = DatabaseEntry::from_bytes(b"k");
     for d in 0u8..5 {
-        db.put(&key, &DatabaseEntry::from_bytes(&[d])).unwrap();
+        db.put(&key, DatabaseEntry::from_bytes(&[d])).unwrap();
     }
     let txn = env.begin_transaction(None).unwrap();
     let mut c = db.open_cursor_in(&txn, None).unwrap();

@@ -40,7 +40,11 @@ fn open_env(dir: &Path) -> Environment {
     Environment::open(cfg).unwrap()
 }
 
-fn open_db(env: &Environment, name: &str, deferred_write: bool) -> noxu_db::Database {
+fn open_db(
+    env: &Environment,
+    name: &str,
+    deferred_write: bool,
+) -> noxu_db::Database {
     env.open_database(
         None,
         name,
@@ -348,7 +352,7 @@ fn embedded_ops_test_no_dups_observable_survives_delta_abort_recover() {
 
     // The committed value for key i after the baseline.
     let expect_val = |i: u32| -> Vec<u8> {
-        if i % 30 == 0 {
+        if i.is_multiple_of(30) {
             (i + 1).to_be_bytes().to_vec()
         } else {
             i.to_be_bytes().to_vec()
@@ -385,9 +389,10 @@ fn embedded_ops_test_no_dups_observable_survives_delta_abort_recover() {
         assert_eq!(N as u64, db.count().unwrap(), "abort must restore count");
         for i in 0..N {
             let mut out = DatabaseEntry::new();
-            assert!(db
-                .get_into(None, &DatabaseEntry::from_bytes(&key(i)), &mut out)
-                .unwrap());
+            assert!(
+                db.get_into(None, DatabaseEntry::from_bytes(&key(i)), &mut out)
+                    .unwrap()
+            );
             assert_eq!(
                 expect_val(i),
                 out.data_opt().unwrap(),
@@ -396,9 +401,15 @@ fn embedded_ops_test_no_dups_observable_survives_delta_abort_recover() {
         }
         for i in N..(N + 50) {
             let mut out = DatabaseEntry::new();
-            assert!(!db
-                .get_into(None, &DatabaseEntry::from_bytes(&key(i)), &mut out)
-                .unwrap(), "aborted insert {i} must not survive");
+            assert!(
+                !db.get_into(
+                    None,
+                    DatabaseEntry::from_bytes(&key(i)),
+                    &mut out
+                )
+                .unwrap(),
+                "aborted insert {i} must not survive"
+            );
         }
         checkpoint(&env);
         db.close().unwrap();
@@ -412,9 +423,10 @@ fn embedded_ops_test_no_dups_observable_survives_delta_abort_recover() {
         assert_eq!(N as u64, db.count().unwrap(), "recovered count");
         for i in 0..N {
             let mut out = DatabaseEntry::new();
-            assert!(db
-                .get_into(None, &DatabaseEntry::from_bytes(&key(i)), &mut out)
-                .unwrap());
+            assert!(
+                db.get_into(None, DatabaseEntry::from_bytes(&key(i)), &mut out)
+                    .unwrap()
+            );
             assert_eq!(
                 expect_val(i),
                 out.data_opt().unwrap(),

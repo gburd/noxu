@@ -39,10 +39,10 @@
 //!   * SortedLSNTreeWalkerTest (`testNoDups*`/`testDups*`/`testPendingDeleted`)
 //!     -> the walker underlies DOS + preload; walk-all-nodes / load-LNs
 //!     behaviour is covered here and by `crates/noxu-db/src/preload.rs`.
-//! The `testBlockedProducer*` / `*MultiDBInternal*` methods drive JE-INTERNAL
-//! producer-queue-slot hooks (`hook.getHookValue()`, `DiskOrderedCursorImpl`)
-//! with exact slot/LSN counts and are recorded N/A in tp-je-dbi.md (the
-//! observable "scan completes / bounded queue" behaviour is covered above).
+//!     The `testBlockedProducer*` / `*MultiDBInternal*` methods drive JE-INTERNAL
+//!     producer-queue-slot hooks (`hook.getHookValue()`, `DiskOrderedCursorImpl`)
+//!     with exact slot/LSN counts and are recorded N/A in tp-je-dbi.md (the
+//!     observable "scan completes / bounded queue" behaviour is covered above).
 
 use noxu_db::{
     DatabaseConfig, DatabaseEntry, DiskOrderedCursorConfig, Environment,
