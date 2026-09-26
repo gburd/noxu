@@ -192,6 +192,12 @@ listed in [References](#references).
   that eventually succeeds, and a no-wait `LockNotAvailable` failure, both leave
   the transaction valid (matching JE). Found by a faithful port of JE's
   `TxnTest.testRepeatingOperationFailures`.
+- **`Cursor.count()` on a just-deleted duplicate position now reports the
+  remaining duplicate count (NEW-DBI-COUNT).** After deleting a duplicate with the
+  cursor still parked on the deleted slot, `count()` returned 0 instead of the
+  number of duplicates remaining under the current key. It now re-anchors by the
+  current key (matching JE `Cursor.countHandleDups`) and counts the live
+  duplicates. Found by a faithful port of JE's `DbCursorDuplicateDeleteTest`.
 
 - **WAL now fail-stops the environment on a critical log-write failure (JE
   `LogManager.serialLog` parity).** A failed or partial WAL write previously left
