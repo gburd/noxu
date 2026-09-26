@@ -1510,3 +1510,181 @@ fn test_read_committed_probe_waits_then_reads_committed_value() {
     reader.commit().unwrap();
     writer.join().unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// C2/V2/F10: get_last() under SERIALIZABLE must lock the EOF sentinel.
+//
+// JE `CursorImpl.lockEof(LockType.RANGE_READ)` is called UNCONDITIONALLY on
+// positioning for getLast (CursorImpl.java:3274/3864) — locking the
+// end-of-database range so a concurrent transaction cannot insert a new
+// maximum key (a phantom the SERIALIZABLE scan must prevent).
+//
+// Contrast with `test_serializable_prevents_phantom_eof_insert`, which
+// reaches EOF via get_first + Get::Next (retrieve_next locks EOF on its own).
+// Here we position with Get::Last ALONE, which is the path that was missing
+// the EOF lock on base b4cd7f7d.
+// ---------------------------------------------------------------------------
+
+/// SERIALIZABLE `get_last` phantom test.
+///
+/// T1 (SERIALIZABLE) positions at the current maximum key with `Get::Last`.
+/// A concurrent no_wait inserter (T2) tries to insert a NEW HIGHER key, which
+/// becomes the new maximum — its next-key insert lands on the EOF sentinel
+/// with RangeInsert.  Because T1's `get_last` acquired RangeRead on the EOF
+/// sentinel, T2's append MUST conflict (phantom prevented).
+///
+/// On base b4cd7f7d this FAILS: `get_last` never locks EOF, so T2's insert
+/// succeeds and T1 could re-scan and observe the phantom new-maximum.
+#[test]
+fn test_serializable_get_last_locks_eof_prevents_phantom() {
+    let dir = TempDir::new().unwrap();
+    let env = noxu_db::Environment::open(
+        EnvironmentConfig::new(dir.path().to_path_buf())
+            .with_allow_create(true)
+            .with_transactional(true),
+    )
+    .unwrap();
+    let db = env
+        .open_database(
+            None,
+            "getlast_phantom_eof_test",
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true),
+        )
+        .unwrap();
+
+    // Pre-populate a single key "m" (the current maximum).
+    {
+        let txn = env.begin_transaction(None).unwrap();
+        db.put_in(
+            &txn,
+            DatabaseEntry::from_bytes(b"m"),
+            DatabaseEntry::from_bytes(b"v"),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+    }
+
+    // T1: SERIALIZABLE cursor positions at the LAST key with Get::Last ONLY.
+    // JE locks the EOF sentinel (RangeRead) on this positioning; Noxu must
+    // mirror it via lock_eof_for_scan inside get_last.
+    let ser_cfg = TransactionConfig::new().with_serializable_isolation(true);
+    let t1 = env.begin_transaction(Some(&ser_cfg)).unwrap();
+    let mut cursor = db.open_cursor_in(&t1, None).unwrap();
+    let mut k = DatabaseEntry::new();
+    let mut v = DatabaseEntry::new();
+    assert_eq!(
+        cursor.get(&mut k, &mut v, noxu_db::Get::Last, None).unwrap(),
+        OperationStatus::Success,
+        "get_last must find the current maximum key"
+    );
+    assert_eq!(k.data(), b"m", "get_last must position on the maximum key");
+    cursor.close().unwrap();
+
+    // T2: no_wait inserter inserts "z" — a NEW maximum (past "m").  Its
+    // successor is the EOF sentinel, so it needs RangeInsert on EOF, which
+    // conflicts with T1's RangeRead → LockNotAvailable.
+    let no_wait_cfg = TransactionConfig::new().with_no_wait(true);
+    let t2 = env.begin_transaction(Some(&no_wait_cfg)).unwrap();
+    let insert_result = db.put_in(
+        &t2,
+        DatabaseEntry::from_bytes(b"z"),
+        DatabaseEntry::from_bytes(b"val_z"),
+    );
+    let _ = t2.abort();
+
+    assert!(
+        insert_result.is_err(),
+        "T2's new-maximum insert of 'z' MUST fail while T1's get_last holds \
+         RangeRead on the EOF sentinel (phantom prevented).  Got: {:?}",
+        insert_result
+    );
+    assert!(
+        matches!(
+            insert_result.unwrap_err(),
+            noxu_db::NoxuError::LockNotAvailable
+        ),
+        "Expected LockNotAvailable from the EOF sentinel conflict"
+    );
+
+    // After T1 commits, the EOF lock is released and T2 can insert.
+    t1.commit().unwrap();
+    let t3 = env.begin_transaction(Some(&no_wait_cfg)).unwrap();
+    assert!(
+        db.put_in(
+            &t3,
+            DatabaseEntry::from_bytes(b"z"),
+            DatabaseEntry::from_bytes(b"val_z")
+        )
+        .is_ok(),
+        "After T1 commits, the new-maximum 'z' insert must succeed"
+    );
+    t3.commit().unwrap();
+}
+
+/// READ_COMMITTED `get_last` must NOT lock the EOF sentinel — a concurrent
+/// appender must not be falsely blocked (RC is not phantom-free by contract).
+///
+/// This guards against the fix over-reaching: `lock_eof_for_scan` is a no-op
+/// unless the txn is SERIALIZABLE, so a READ_COMMITTED `get_last` leaves the
+/// tail open for concurrent inserts.
+#[test]
+fn test_read_committed_get_last_does_not_block_appender() {
+    let dir = TempDir::new().unwrap();
+    let env = noxu_db::Environment::open(
+        EnvironmentConfig::new(dir.path().to_path_buf())
+            .with_allow_create(true)
+            .with_transactional(true),
+    )
+    .unwrap();
+    let db = env
+        .open_database(
+            None,
+            "getlast_rc_no_block_test",
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true),
+        )
+        .unwrap();
+
+    {
+        let txn = env.begin_transaction(None).unwrap();
+        db.put_in(
+            &txn,
+            DatabaseEntry::from_bytes(b"m"),
+            DatabaseEntry::from_bytes(b"v"),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+    }
+
+    // T1: READ_COMMITTED get_last — must find "m" and take NO EOF lock.
+    let rc_cfg = TransactionConfig::read_committed();
+    let t1 = env.begin_transaction(Some(&rc_cfg)).unwrap();
+    let mut cursor = db.open_cursor_in(&t1, None).unwrap();
+    let mut k = DatabaseEntry::new();
+    let mut v = DatabaseEntry::new();
+    assert_eq!(
+        cursor.get(&mut k, &mut v, noxu_db::Get::Last, None).unwrap(),
+        OperationStatus::Success
+    );
+    assert_eq!(k.data(), b"m");
+    cursor.close().unwrap();
+
+    // T2: no_wait inserter appends a new maximum "z".  Under READ_COMMITTED
+    // T1 holds no EOF lock, so the append MUST succeed (no false block).
+    let no_wait_cfg = TransactionConfig::new().with_no_wait(true);
+    let t2 = env.begin_transaction(Some(&no_wait_cfg)).unwrap();
+    assert!(
+        db.put_in(
+            &t2,
+            DatabaseEntry::from_bytes(b"z"),
+            DatabaseEntry::from_bytes(b"val_z")
+        )
+        .is_ok(),
+        "READ_COMMITTED get_last must NOT lock EOF; the appender must succeed"
+    );
+    t2.commit().unwrap();
+    t1.commit().unwrap();
+}
