@@ -10348,6 +10348,109 @@ mod tests {
         }
     }
 
+    // ========================================================================
+    // JE: KeyPrefixTest (je/test/com/sleepycat/je/tree/KeyPrefixTest.java)
+    //
+    // Key prefixing is directly exercised by `BinStub::recompute_key_prefix` /
+    // `compute_key_prefix`, which port `IN.recalcKeyPrefix` / `recalcSuffixes`.
+    // The prefix is always a BYTE-common prefix scanned across EVERY key in the
+    // node (JE [#21405]), independent of any custom comparator that drives the
+    // physical order.  These unit tests port the two prefix-correctness cases;
+    // the public-API round-trip cases (testPrefixBasic/ManySequential) live in
+    // noxu-db/tests/je_tree_test.rs.
+    // ========================================================================
+
+    /// Build a BIN whose keys are the given full keys in the given PHYSICAL
+    /// order (the order a comparator would place them), with no prefix yet.
+    fn bin_with_physical_keys(full_keys: Vec<Vec<u8>>) -> BinStub {
+        let n = full_keys.len();
+        let entries = (0..n)
+            .map(|_| BinEntry {
+                data: Some(Bytes::from(vec![1u8])),
+                known_deleted: false,
+                dirty: false,
+                expiration_time: 0,
+            })
+            .collect();
+        BinStub {
+            node_id: 1,
+            level: BIN_LEVEL,
+            entries,
+            key_prefix: Vec::new(),
+            dirty: false,
+            is_delta: false,
+            last_full_lsn: NULL_LSN,
+            last_delta_lsn: NULL_LSN,
+            generation: 0,
+            parent: None,
+            expiration_in_hours: true,
+            cursor_count: 0,
+            prohibit_next_delta: false,
+            lsn_rep: LsnRep::from_lsns(
+                &(0..n).map(|i| Lsn::new(1, (i + 1) as u32)).collect::<Vec<_>>(),
+            ),
+            keys: KeyRep::from_keys(full_keys),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
+            expiration_enabled: true,
+        }
+    }
+
+    /// JE: KeyPrefixTest.testPrefixBasic (the `somePrefixSeen` invariant) — a
+    /// BIN of keys sharing a common byte prefix must actually compute a
+    /// non-empty prefix, and every full key must still reconstruct exactly.
+    #[test]
+    fn keyprefix_basic_computes_prefix() {
+        // Keys sharing "aa" — a subset of KeyPrefixTest's key set.
+        let full: Vec<Vec<u8>> = ["aaa", "aab", "aac", "aae", "aaf", "aag"]
+            .iter()
+            .map(|k| k.as_bytes().to_vec())
+            .collect();
+        let mut bin = bin_with_physical_keys(full.clone());
+        bin.recompute_key_prefix();
+        assert!(
+            !bin.key_prefix.is_empty(),
+            "a BIN of common-prefixed keys must compute a non-empty prefix"
+        );
+        assert_eq!(bin.key_prefix, b"aa", "shared prefix must be 'aa'");
+        // Every full key reconstructs exactly after prefix compression.
+        for (i, k) in full.iter().enumerate() {
+            assert_eq!(bin.get_full_key(i).as_deref(), Some(k.as_slice()));
+        }
+    }
+
+    /// JE: KeyPrefixTest.testLeadingLengthKeys [#21405] — the prefix must be
+    /// computed from ALL keys, not just the first and last.  With a custom
+    /// (string) comparator the physical order is aa,bb,cccc,dd whose leading
+    /// LENGTH bytes are 2,2,4,2.  The OLD (buggy) code inspected only the first
+    /// two keys and the last (all length 2) and wrongly derived the prefix
+    /// [2]; the middle key (length 4) breaks any [2]-prefix.  The fix scans
+    /// every key, so the computed prefix must be EMPTY.
+    #[test]
+    fn keyprefix_leading_length_keys_21405() {
+        // Leading-length-encoded keys in comparator (string) order.
+        fn llk(s: &str) -> Vec<u8> {
+            let mut b = vec![s.len() as u8];
+            b.extend_from_slice(s.as_bytes());
+            b
+        }
+        let full = vec![llk("aa"), llk("bb"), llk("cccc"), llk("dd")];
+        // Leading length bytes: 2, 2, 4, 2 — the first byte differs across the
+        // set, so the true byte-common prefix is empty.
+        let mut bin = bin_with_physical_keys(full.clone());
+        bin.recompute_key_prefix();
+        assert!(
+            bin.key_prefix.is_empty(),
+            "prefix must be EMPTY: the middle key (len 4) breaks a [2]-prefix; \
+             a non-empty prefix means the first/last-only [#21405] bug is back \
+             (got {:?})",
+            bin.key_prefix
+        );
+        // All keys still reconstruct exactly.
+        for (i, k) in full.iter().enumerate() {
+            assert_eq!(bin.get_full_key(i).as_deref(), Some(k.as_slice()));
+        }
+    }
+
     #[test]
     fn test_empty_tree() {
         let tree = Tree::new(1, 128);
