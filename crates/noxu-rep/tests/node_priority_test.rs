@@ -20,12 +20,12 @@
 //!  * `test_priority_zero_node_refuses_to_propose_itself` fails because the
 //!    base `run_election` lets a priority-0 self-proposer win a self-quorum.
 
-use noxu_rep::elections::paxos::run_election;
+use noxu_rep::RepConfig;
 use noxu_rep::elections::Proposal;
+use noxu_rep::elections::paxos::run_election;
 use noxu_rep::node_type::NodeType;
 use noxu_rep::rep_group::RepGroup;
 use noxu_rep::rep_node::RepNode;
-use noxu_rep::RepConfig;
 
 // ---------------------------------------------------------------------------
 // Config plumbing: NODE_PRIORITY is a real RepConfig field with JE's default.

@@ -26,6 +26,12 @@ const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_NODE_PORT: u16 = 14_001;
 /// Default per-phase election message timeout.
 const DEFAULT_ELECTION_PHASE_TIMEOUT: Duration = Duration::from_millis(500);
+/// Default election priority (JE `RepParams.NODE_PRIORITY` default is `1`).
+///
+/// `1` is an ordinary electable node. `0` means "electable but never chosen
+/// as master" (see [`RepConfig::node_priority`]).
+pub(crate) const DEFAULT_NODE_PRIORITY: u32 = 1;
+
 /// Default phi accrual sample window size.
 const DEFAULT_PHI_WINDOW_SIZE: usize = 200;
 
@@ -84,6 +90,31 @@ pub struct RepConfig {
     pub node_port: u16,
     /// Type of this node.
     pub node_type: NodeType,
+    /// Election priority for steering mastership (JE `NODE_PRIORITY`).
+    ///
+    /// Threaded into every election round this node starts as the
+    /// `Proposal::priority` ranking key (JE `RepParams.NODE_PRIORITY`,
+    /// a mutable per-node parameter exposed via
+    /// `ReplicationMutableConfig.java:165`). Semantics, matching JE:
+    ///
+    /// * **Higher priority is preferred** as master when election progress
+    ///   (DTVLSN / VLSN / term) is otherwise equal — the operator lever for
+    ///   steering mastership toward a particular node (e.g. faster storage,
+    ///   the primary datacenter).
+    /// * **`0` means "electable but never chosen"** — the node still
+    ///   participates in elections as an acceptor / counts toward quorum,
+    ///   but it refuses to propose itself as master and its counter-proposal
+    ///   is never selected as the Phase 2 value. This is the same
+    ///   not-master-eligible treatment Noxu already applies to arbiters in
+    ///   the ranking layer.
+    ///
+    /// Default `1` (an ordinary electable node), matching JE's
+    /// `RepParams.NODE_PRIORITY` default.
+    ///
+    /// Runtime-mutable: use
+    /// [`crate::ReplicatedEnvironment::set_node_priority`] to change it on a
+    /// running node (JE makes `NODE_PRIORITY` a mutable rep param).
+    pub node_priority: u32,
     /// Timeout for elections.
     pub election_timeout: Duration,
     /// Interval between heartbeat messages.
@@ -263,6 +294,7 @@ impl RepConfig {
             node_host: node_host.to_string(),
             node_port: DEFAULT_NODE_PORT,
             node_type: NodeType::Electable,
+            node_priority: DEFAULT_NODE_PRIORITY,
             election_timeout: DEFAULT_ELECTION_TIMEOUT,
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
             consistency_policy: ConsistencyPolicy::default(),
@@ -314,6 +346,7 @@ pub struct RepConfigBuilder {
     node_host: String,
     node_port: u16,
     node_type: NodeType,
+    node_priority: u32,
     election_timeout: Duration,
     heartbeat_interval: Duration,
     consistency_policy: ConsistencyPolicy,
@@ -342,6 +375,18 @@ impl RepConfigBuilder {
     /// Sets the node type.
     pub fn node_type(mut self, node_type: NodeType) -> Self {
         self.node_type = node_type;
+        self
+    }
+
+    /// Sets the election priority (JE `NODE_PRIORITY`).
+    ///
+    /// A higher priority is preferred as master when election progress is
+    /// otherwise equal; `0` means "electable but never chosen as master"
+    /// (participates in quorum, refuses to propose itself). Default `1`.
+    ///
+    /// See [`RepConfig::node_priority`] for the JE citation and semantics.
+    pub fn node_priority(mut self, priority: u32) -> Self {
+        self.node_priority = priority;
         self
     }
 
@@ -486,6 +531,7 @@ impl RepConfigBuilder {
             node_host: self.node_host,
             node_port: self.node_port,
             node_type: self.node_type,
+            node_priority: self.node_priority,
             election_timeout: self.election_timeout,
             heartbeat_interval: self.heartbeat_interval,
             consistency_policy: self.consistency_policy,

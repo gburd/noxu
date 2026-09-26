@@ -35,7 +35,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
 use std::sync::Weak;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use crate::ack_tracker::AckTracker;
@@ -238,6 +238,15 @@ pub struct ReplicatedEnvironment {
     /// `update_max`). 0 = NULL_VLSN. Used by the election ranking (D2) so the
     /// most-durable node, not merely the highest-raw-VLSN node, wins.
     dtvlsn: std::sync::atomic::AtomicU64,
+
+    /// Live election priority (JE `NODE_PRIORITY`, a *mutable* rep param).
+    ///
+    /// Seeded from [`RepConfig::node_priority`] at construction and read by
+    /// the election driver on every round (see `run_election_loop`), so an
+    /// operator can steer mastership on a running node via
+    /// [`ReplicatedEnvironment::set_node_priority`]. `0` = electable but
+    /// never chosen as master (JE `RepParams.NODE_PRIORITY`).
+    node_priority: AtomicU32,
 
     /// Shared acceptor state used by the ELECTION service handler.
     /// The election driver updates `own_vlsn` / `own_term` here as the
@@ -567,6 +576,7 @@ impl ReplicatedEnvironment {
             );
         }
 
+        let node_priority_init = config.node_priority;
         let env = Self {
             config,
             node_state,
@@ -588,6 +598,7 @@ impl ReplicatedEnvironment {
             syncup_registered: AtomicBool::new(syncup_registered_init),
             peer_scanner,
             dtvlsn: std::sync::atomic::AtomicU64::new(0),
+            node_priority: AtomicU32::new(node_priority_init),
             election_state,
             self_weak: OnceLock::new(),
             feeder_channels: StdMutex::new(HashMap::new()),
@@ -1297,7 +1308,9 @@ impl ReplicatedEnvironment {
                 &group,
                 &channels,
                 our_vlsn,
-                /* priority */ 1,
+                /* priority: JE NODE_PRIORITY, read live so an operator can
+                 * steer mastership via set_node_priority (C5/V14). */
+                self.node_priority(),
                 term,
                 /* own_dtvlsn (D2 major ranking key) */
                 self.get_dtvlsn(),
@@ -3617,6 +3630,33 @@ impl ReplicatedEnvironment {
     /// none yet. Used by the election ranking so the most-durable node wins.
     pub fn get_dtvlsn(&self) -> u64 {
         self.dtvlsn.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Returns the node's current election priority (JE `NODE_PRIORITY`).
+    ///
+    /// The election driver reads this on every round. `1` is an ordinary
+    /// electable node; `0` means electable-but-never-chosen-as-master. See
+    /// [`RepConfig::node_priority`] and [`Self::set_node_priority`].
+    pub fn node_priority(&self) -> u32 {
+        self.node_priority.load(Ordering::Acquire)
+    }
+
+    /// Sets the node's election priority at runtime (JE makes `NODE_PRIORITY`
+    /// a *mutable* rep param, `ReplicationMutableConfig.java:165`).
+    ///
+    /// The change takes effect on the next election round the driver starts.
+    /// A higher priority is preferred as master when progress is equal; `0`
+    /// makes the node electable-but-not-master-eligible (it will step down as
+    /// a candidate at its next round and refuse to propose itself). This does
+    /// NOT demote a node that is *currently* master — like JE, it only
+    /// affects future elections.
+    pub fn set_node_priority(&self, priority: u32) {
+        self.node_priority.store(priority, Ordering::Release);
+        log::info!(
+            "node '{}' NODE_PRIORITY set to {} (effective next election)",
+            self.config.node_name,
+            priority,
+        );
     }
 
     /// Advance the DTVLSN to `candidate` if it is greater (JE

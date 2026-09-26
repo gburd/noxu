@@ -161,6 +161,25 @@ pub fn run_election_with_phi_dtvlsn(
         return None;
     }
 
+    // C5/V14 guard: NODE_PRIORITY == 0 means "electable but never chosen as
+    // master" (JE RepParams.NODE_PRIORITY). Such a node still participates in
+    // elections as an acceptor (it responds to peers via `run_acceptor` and
+    // counts toward a peer's Phase 1 quorum), but it must NOT propose itself
+    // as master — even at the highest VLSN. This mirrors the F22 arbiter
+    // guard above: not-master-eligible nodes short-circuit before advertising
+    // themselves as a candidate value. (A priority-0 peer's counter-proposal
+    // is likewise never selected as the Phase 2 value — see the peer guard
+    // below, which already filters `priority == 0` the same way it filters
+    // arbiter promises.)
+    if priority == 0 {
+        log::warn!(
+            "election: node {} has NODE_PRIORITY 0 (electable but not \
+             master-eligible) refusing to propose itself as master",
+            node_name
+        );
+        return None;
+    }
+
     // Flexible Paxos: Phase 1 and Phase 2 may use different quorum sizes.
     // For SimpleMajority both equal (n/2)+1; for Flexible they differ.
     let phase1_quorum = group.phase1_quorum();
@@ -221,12 +240,17 @@ pub fn run_election_with_phi_dtvlsn(
                     // only as a Promise — never as a candidate value.
                     // Otherwise an Arbiter with the highest VLSN would
                     // win Phase 2 and wedge the cluster.
+                    //
+                    // C5/V14: a peer advertising NODE_PRIORITY 0 is likewise
+                    // not master-eligible (electable, but never chosen), so
+                    // its counter-proposal is treated only as a Promise too.
                     let peer_can_be_master = group
                         .get_node(&peer_name)
                         .map(|n| n.can_be_master())
                         // Unknown peer name — be conservative and do
                         // NOT promote it.
-                        .unwrap_or(false);
+                        .unwrap_or(false)
+                        && peer_priority != 0;
                     if peer_can_be_master {
                         let peer_p = Proposal::new(
                             peer_name,

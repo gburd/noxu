@@ -43,6 +43,9 @@ use std::time::Duration;
 
 let rep_config = RepConfig::builder("prod-cluster", "node-1", "192.168.1.10")
     .node_port(14_001)
+    // Election priority (JE NODE_PRIORITY). Higher = preferred as master on
+    // equal progress; 0 = electable but never chosen. Default is 1.
+    .node_priority(1)
     .election_phase_timeout(Duration::from_millis(500))
     // `phi_threshold` is `Option<f64>`: `Some(8.0)` turns ON phi-accrual
     // failure detection (the paper's recommended value); the default is
@@ -111,6 +114,7 @@ if rep_env.is_master() {
 | `node_host` (builder arg) | required | Hostname / IP for this node |
 | `node_port` | `14001` | Replication port (override in production) |
 | `node_type` | `Electable` | Node role |
+| `node_priority` | `1` | Election priority (JE `NODE_PRIORITY`). Higher is preferred as master on equal progress; `0` = electable but never chosen. Runtime-mutable via `ReplicatedEnvironment::set_node_priority`. See [Leader Elections](./elections.md#node-priority-steering-mastership). |
 | `election_phase_timeout` | 500 ms | FPaxos per-phase message timeout |
 | `phi_threshold` | `None` (binary heartbeat) | `Some(8.0)` enables phi-accrual detection (Hayashibara 2004) |
 | `phi_window_size` | `200` | Phi-accrual inter-arrival samples (use `1000` for WAN) |
