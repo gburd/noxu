@@ -120,6 +120,14 @@ if rep_env.is_master() {
 | `phi_window_size` | `200` | Phi-accrual inter-arrival samples (use `1000` for WAN) |
 | `quorum_policy` | `SimpleMajority` | Quorum strategy |
 | `commit_durability` | `CommitDurability::default()` (`ack_timeout` 5 s) | Replica-ack policy + timeout for replicated commits |
+| `admin_allowlist` | `None` | Which verified peer identities may issue privileged ADMIN RPCs (shutdown-group / master-transfer / step-down). `None` = the full `peer_allowlist` (JE `RepGroupAdmin` semantics: any allowlisted peer is an admin); `Some(subset)` restricts to a tighter set. Enforced against the TLS-verified `Channel::peer_identity()` (F5/S1). |
+| `insecure_admin` | `false` (prod) | Permit privileged ADMIN RPCs over an unauthenticated transport (plain TCP / `insecure_no_auth`, where there is no verified peer identity). Fail-closed by default: without a verified identity a privileged command is rejected unless this is `true`. |
+
+Security note: `transport_kind`, `tls_config`, `peer_allowlist`,
+`insecure_no_auth`, `admin_allowlist`, and `insecure_admin` together control
+authenticated replication and per-command ADMIN authorization. See
+[Known Limitations](../operations/known-limitations.md) for the exact
+fail-closed semantics and the F5/F3b/S1 remediation.
 
 ## Dynamic Peer Management
 

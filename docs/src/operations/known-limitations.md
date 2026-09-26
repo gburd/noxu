@@ -53,31 +53,41 @@ original gap:
   strictly-stronger scheme and is **not** implemented — deliberately not built
   half-way.
 - **ADMIN RPC authorization (shutdown-group / master-transfer / step-down) —
-  TRANSPORT-LEVEL ONLY, no per-command authorization.** The `ADMIN` service
-  (`AdminService::handle`) executes `CMD_SHUTDOWN_GROUP` (closes the local
-  environment), `CMD_TRANSFER_MASTER`, and `CMD_STEP_DOWN` for **any** peer that
-  reaches the handler. Authorization is delegated entirely to the transport:
-  under mTLS that means *any allowlisted peer* can shut down or reshuffle
-  mastership of *any other* member unilaterally — there is no separate check
-  that the caller is the current master or a designated administrator identity.
-  Peer-allowlist membership therefore currently implies **full administrative
-  authority over the whole group** (this matches JE's `RepGroupAdmin` model,
-  where any node with group access can issue these RPCs). Under
-  `insecure_no_auth` / plain TCP there is no authorization at all: any host that
-  can reach the port can shut the node down. This is the exact gap the 2026
-  security audit tracks as **F5/S1**; binding a per-command authorization
-  decision to the TLS-verified peer identity requires threading that identity
-  through the `Channel` trait (it exposes none today) and is a design change
-  tracked separately (see the S1 remediation design note). Until then: keep the
-  replication network isolated, and treat every allowlisted certificate as a
-  full cluster administrator.
-- **Election/admin messages self-report `node_name` with no binding to the
-  TLS-verified peer identity (F3b/S1).** Election proposals and admin commands
-  carry a self-reported node name that the acceptor/handler does not cross-check
-  against the certificate that completed the handshake (the `Channel` trait
-  exposes no verified peer identity). An allowlisted-but-compromised peer can
-  therefore claim to be a different node. Same root cause and same tracked
-  remediation as the ADMIN-authorization bullet above.
+  CLOSED (F5/S1).** The `ADMIN` service (`AdminService::handle`) now gates the
+  privileged commands `CMD_SHUTDOWN_GROUP`, `CMD_TRANSFER_MASTER`, and
+  `CMD_STEP_DOWN` on the caller's **TLS-verified** peer identity, surfaced
+  through the new `Channel::peer_identity()` (a `PeerIdentity { subject_names }`
+  built from the client leaf cert's CN + DNS SANs — the same
+  `crate::auth::extract_cert_names` normalization the allowlist uses). The
+  authorization decision (`ReplicatedEnvironment::is_admin_identity`) checks the
+  verified identity against a new admin tier controlled by two config fields.
+  `RepConfig::admin_allowlist: Option<Vec<String>>` — `None` (default) means the
+  admin tier equals the full `peer_allowlist` (preserves JE `RepGroupAdmin`
+  "any allowlisted peer == admin" semantics), while `Some(subset)` restricts
+  privileged commands to a tighter set of verified identities.
+  `RepConfig::insecure_admin: bool` — default `false` (fail-closed): under an
+  unauthenticated transport (plain TCP / `insecure_no_auth`, where
+  `peer_identity()` is `None`) a privileged command is **rejected** unless the
+  operator explicitly sets `insecure_admin = true`; a `None` identity is never
+  silently trusted. A privileged command from an identity not in the admin tier
+  is answered with a rejection byte (`ACK_REJECTED`) and not executed.
+  Non-privileged commands are unchanged. Note the ADMIN *client* connectors
+  still use plain TCP even on a TLS node (see the RESTORE/PEER_FEEDER bullet
+  above); server-side authorization is enforced regardless of how the caller
+  connected, because it reads the *verified* channel identity, not a
+  self-reported field.
+- **Election/admin messages self-report `node_name` — CLOSED (F3b/S1).** The
+  Paxos acceptor (`run_acceptor` / `run_acceptor_with_state`) now binds the
+  self-reported proposer `node_name` in an incoming `ElectionProposal` to the
+  channel's TLS-verified peer identity: under mTLS the name MUST match one of
+  the verified cert subject names (case-insensitive) or the proposal is rejected
+  with a `ProtocolError`. An allowlisted-but-compromised peer (cert `node-a`)
+  can therefore no longer send `ElectionProposal { node_name: "node-c", .. }`
+  and be believed. Under plain TCP / `insecure_no_auth` (no verified identity)
+  the behaviour is unchanged — a documented opt-out, since the operator has
+  explicitly chosen an unauthenticated transport. **Deployment constraint:** a
+  member's configured `node_name` must equal one of its certificate subject
+  names (already implied by the `peer_allowlist` being keyed on subject names).
 - **`NetworkRestore` client trusts server-supplied filenames (path traversal)
   — CLOSED.** `network_restore::validate_restore_filename` rejects any
   server-supplied filename containing a path separator (`/` or `\`), `.` /

@@ -318,6 +318,46 @@ pub fn run_election_with_phi_dtvlsn(
 }
 
 // ---------------------------------------------------------------------------
+// Election identity binding (F3b / S1)
+// ---------------------------------------------------------------------------
+
+/// Bind a wire-reported proposer `node_name` to the channel's TLS-verified
+/// peer identity.
+///
+/// F3b / S1: the acceptor reads the proposer's `node_name` straight off the
+/// wire (`ElectionProposal { node_name, .. }`) and, historically, believed
+/// it.  An allowlisted-but-compromised peer (cert CN `node-a`) could send
+/// `ElectionProposal { node_name: "node-c", vlsn: <inflated>, .. }` and be
+/// believed, impersonating another member.
+///
+/// When the channel is mutually authenticated (`peer_identity()` is `Some`),
+/// the self-reported `node_name` MUST match one of the verified subject
+/// names (case-insensitive) or the proposal is rejected with a
+/// `ProtocolError`.  When it is `None` (plain TCP / `insecure_no_auth`), the
+/// operator has explicitly opted out of peer authentication, so behaviour is
+/// unchanged (documented opt-out) -- there is no verified identity to bind
+/// against.
+fn check_election_identity(
+    channel: &dyn Channel,
+    proposer: &str,
+) -> Result<()> {
+    if let Some(id) = channel.peer_identity()
+        && !id.subject_names.iter().any(|n| n.eq_ignore_ascii_case(proposer))
+    {
+        log::warn!(
+            "election: rejecting proposer '{}' -- name not backed by verified peer identity {:?}",
+            proposer,
+            id.subject_names
+        );
+        return Err(RepError::ProtocolError(format!(
+            "election node_name '{proposer}' does not match verified peer identity {:?}",
+            id.subject_names
+        )));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // run_acceptor
 // ---------------------------------------------------------------------------
 
@@ -365,12 +405,15 @@ pub fn run_acceptor(
 
     match phase1 {
         ProtocolMessage::ElectionProposal {
-            node_name: _proposer,
+            node_name: proposer,
             vlsn: _vlsn,
             priority: _priority,
             term,
             dtvlsn: _dtvlsn,
         } => {
+            // F3b/S1: bind the self-reported proposer name to the verified
+            // TLS peer identity before trusting it.
+            check_election_identity(channel, &proposer)?;
             // acceptor: reject only if a higher-numbered proposal was
             // already promised. Accept/promise the first proposal regardless
             // of the proposer's VLSN — the VLSN comparison happens at the
@@ -502,12 +545,16 @@ pub fn run_acceptor_with_state(
 
     let phase1_term = match phase1 {
         ProtocolMessage::ElectionProposal {
-            node_name: _proposer,
+            node_name: proposer,
             vlsn: _vlsn,
             priority: _priority,
             term,
             dtvlsn: _dtvlsn,
         } => {
+            // F3b/S1: bind the self-reported proposer name to the verified
+            // TLS peer identity before trusting it.  A rejection here returns
+            // before any freeze is installed, so no thaw is needed.
+            check_election_identity(channel, &proposer)?;
             if state.try_promise(term) {
                 // Freeze commit-VLSN advancement for the duration of this
                 // round: the VLSN/DTVLSN we are about to advertise in the
