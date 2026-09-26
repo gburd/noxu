@@ -113,6 +113,13 @@ listed in [References](#references).
   `get_last()` now locks the EOF sentinel under SERIALIZABLE (a concurrent
   new-maximum insert conflicts until the scanner commits); lower isolation levels
   are unaffected.
+- **Evicted dirty internal-node images are counted obsolete (space accounting).**
+  When the evictor logged a dirty upper internal node before detaching it, the
+  superseded prior image was not recorded as obsolete, so the cleaner
+  under-counted reclaimable space in files holding old internal-node versions.
+  The evictor now tracks the prior image as obsolete on re-log (matching JE and
+  the leaf-node path). Recovery was already correct; this improves space
+  reclamation accuracy only.
 
 - **WAL now fail-stops the environment on a critical log-write failure (JE
   `LogManager.serialLog` parity).** A failed or partial WAL write previously left
