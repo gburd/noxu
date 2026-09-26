@@ -20,6 +20,21 @@
 //! Because the shared evictor is a process-global singleton, this test resets
 //! it at start via the internal test hook so it does not collide with other
 //! tests in the same binary.
+//!
+//! JE test-parity (package je.evictor): this single headline test covers the
+//! INTENT of several `SharedCacheTest` methods:
+//!   * `SharedCacheTest.testWriteOneEnvAtATime` -> "one shared budget, not the
+//!     sum" (total resident across both shared envs stays ~= ONE budget).
+//!   * `SharedCacheTest.testOpenClose` -> close-safety: closing one shared env
+//!     leaves the survivor working (reads + eviction) with no dangling trees.
+//!   * `SharedCacheTest.testMutateCacheSize` -> partial: the shared budget is
+//!     one value; runtime cache-size mutation is unit-tested in
+//!     `environment.rs::test_set_mutable_config_pushes_cache_size_to_arbiter`.
+//! The per-DB LRU-accuracy / even-share / hotness methods
+//! (`testBaseline`, `testWriteAllEnvsEvenly`, `testHotness`) require per-DB
+//! cache-byte accounting (JE `getDatabaseCacheBytes` via `IN.getDatabase()`)
+//! and are recorded in the package report; the `*OffHeap` variants are N/A
+//! (off-heap allocator internals -- documented deviation, AGENTS.md).
 
 use noxu_db::{
     Database, DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
