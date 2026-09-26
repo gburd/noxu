@@ -456,6 +456,33 @@ impl Channel for QuicChannel {
     fn is_open(&self) -> bool {
         self.open.load(Ordering::SeqCst)
     }
+
+    fn peer_identity(&self) -> Option<crate::net::channel::PeerIdentity> {
+        // Only surface identity on the *server-accepted* side (`_endpoint`
+        // is `None`), where the connection's peer cert is the verified
+        // *client* identity.  The client-connected side (`_endpoint` is
+        // `Some`) sees the server's cert, which is not a peer identity.
+        //
+        // NOTE: no QUIC service dispatcher hands QUIC channels to the ELECTION
+        // or ADMIN handlers today (see net/service_dispatcher.rs -- only
+        // TcpServiceDispatcher / TlsTcpServiceDispatcher do), so this is not
+        // on the F3b/F5 authorization path.  It is implemented for contract
+        // consistency and to be correct if a QUIC dispatcher is added.
+        if self._endpoint.is_some() {
+            return None;
+        }
+        let certs = self
+            ._connection
+            .peer_identity()?
+            .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+            .ok()?;
+        let leaf = certs.first()?;
+        let names = crate::auth::extract_cert_names(leaf.as_ref());
+        if names.is_empty() {
+            return None;
+        }
+        Some(crate::net::channel::PeerIdentity { subject_names: names })
+    }
 }
 
 impl Drop for QuicChannel {

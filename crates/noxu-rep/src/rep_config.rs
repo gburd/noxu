@@ -289,6 +289,43 @@ pub struct RepConfig {
     /// on the plaintext / in-memory transports without per-test PKI.  In a
     /// production build it is always `false` unless the operator sets it.
     pub insecure_no_auth: bool,
+
+    /// Which peer identities may issue **privileged** ADMIN RPC commands
+    /// (`SHUTDOWN_GROUP`, `TRANSFER_MASTER`, `STEP_DOWN`).  Closes F5 / S1.
+    ///
+    /// - `None` (default): the admin tier equals the full
+    ///   [`RepConfig::peer_allowlist`] -- i.e. *any* allowlisted peer is an
+    ///   admin.  This preserves BDB-JE `RepGroupAdmin` semantics ("any peer
+    ///   admitted to the group can administer it") as the default posture.
+    /// - `Some(subset)`: a **tighter** admin tier.  Only peers whose verified
+    ///   TLS subject names match an entry here may run privileged commands;
+    ///   all other allowlisted peers get read/non-privileged access only.
+    ///
+    /// Authorization is enforced against the channel's *verified* peer
+    /// identity ([`crate::net::Channel::peer_identity`]) -- a self-reported
+    /// name on the wire is never trusted.  Under an unauthenticated transport
+    /// (plain TCP / `insecure_no_auth`) `peer_identity()` is `None`, so
+    /// privileged commands are **rejected** (fail-closed) unless
+    /// [`RepConfig::insecure_admin`] is set.
+    pub admin_allowlist: Option<Vec<String>>,
+
+    /// Permit privileged ADMIN commands over an **unauthenticated** transport
+    /// (plain TCP / `insecure_no_auth`, where there is no verified peer
+    /// identity to authorize against).  Closes F5 / S1.
+    ///
+    /// Default `false` (fail-closed): without a verified peer identity a
+    /// privileged ADMIN command (`SHUTDOWN_GROUP`, `TRANSFER_MASTER`,
+    /// `STEP_DOWN`) is rejected.  This is the safe default -- it does NOT
+    /// silently allow a `None` identity to administer the group, which would
+    /// let any host that can reach the port shut it down.
+    ///
+    /// Set `true` only on a fully-isolated trusted network (or for the
+    /// in-process test harness) where the operator has already accepted the
+    /// `insecure_no_auth` posture and wants the ADMIN RPC to remain usable
+    /// without mTLS.  Under `cfg(test)` / the `test-harness` feature this
+    /// defaults to `true` so existing tests that drive ADMIN over
+    /// `LocalChannel` / plain TCP keep working.
+    pub insecure_admin: bool,
 }
 
 /// The default value of [`RepConfig::insecure_no_auth`].
@@ -298,6 +335,15 @@ pub struct RepConfig {
 /// the existing test suite and in-process harness keep running on the
 /// plaintext / in-memory transports without per-test certificate material.
 pub(crate) const DEFAULT_INSECURE_NO_AUTH: bool =
+    cfg!(any(test, feature = "test-harness"));
+
+/// The default value of [`RepConfig::insecure_admin`].
+///
+/// Fail-closed (`false`) in a production build; opt-out (`true`) only under
+/// `cfg(test)` / the `test-harness` feature so existing tests that drive the
+/// ADMIN RPC over `LocalChannel` / plain TCP (which yield no verified peer
+/// identity) keep working without per-test PKI.
+pub(crate) const DEFAULT_INSECURE_ADMIN: bool =
     cfg!(any(test, feature = "test-harness"));
 
 impl RepConfig {
@@ -331,6 +377,8 @@ impl RepConfig {
             tls_config: None,
             cascade_feeding: false,
             insecure_no_auth: DEFAULT_INSECURE_NO_AUTH,
+            admin_allowlist: None,
+            insecure_admin: DEFAULT_INSECURE_ADMIN,
         }
     }
 
@@ -384,6 +432,8 @@ pub struct RepConfigBuilder {
     tls_config: Option<crate::tls::TlsConfig>,
     cascade_feeding: bool,
     insecure_no_auth: bool,
+    admin_allowlist: Option<Vec<String>>,
+    insecure_admin: bool,
 }
 
 impl RepConfigBuilder {
@@ -555,6 +605,27 @@ impl RepConfigBuilder {
         self
     }
 
+    /// Restrict privileged ADMIN commands to a **subset** of the
+    /// `peer_allowlist`.  See [`RepConfig::admin_allowlist`].
+    ///
+    /// Passing `None` (the default) means "any allowlisted peer is an admin"
+    /// (JE `RepGroupAdmin` semantics); passing `Some(names)` restricts the
+    /// admin tier to just those verified identities.
+    pub fn admin_allowlist(mut self, names: Option<Vec<String>>) -> Self {
+        self.admin_allowlist = names;
+        self
+    }
+
+    /// Permit privileged ADMIN commands over an unauthenticated transport
+    /// (no verified peer identity).  See [`RepConfig::insecure_admin`].
+    ///
+    /// Default is fail-closed (`false` in production): privileged commands
+    /// require a verified peer identity.
+    pub fn insecure_admin(mut self, insecure: bool) -> Self {
+        self.insecure_admin = insecure;
+        self
+    }
+
     /// Builds the `RepConfig`.
     pub fn build(self) -> RepConfig {
         RepConfig {
@@ -581,6 +652,8 @@ impl RepConfigBuilder {
             tls_config: self.tls_config,
             cascade_feeding: self.cascade_feeding,
             insecure_no_auth: self.insecure_no_auth,
+            admin_allowlist: self.admin_allowlist,
+            insecure_admin: self.insecure_admin,
         }
     }
 }

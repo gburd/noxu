@@ -59,6 +59,46 @@ pub trait Channel: Send + Sync {
 
     /// Check if the channel is still open.
     fn is_open(&self) -> bool;
+
+    /// The TLS-verified identity of the remote peer that connected to us, if
+    /// this channel is mutually authenticated.
+    ///
+    /// Returns `Some(PeerIdentity)` only when the transport completed a mutual
+    /// TLS handshake AND a verified peer (client) certificate is available --
+    /// i.e. the *server-accepted* side of a `TlsTcpChannel` / `QuicChannel`
+    /// whose listener enforced `bind_with_tls_and_allowlist`.  Returns `None`
+    /// for plain TCP, in-process (`LocalChannel`) transports, and the
+    /// client-connected side of a TLS/QUIC channel (where the presented cert
+    /// is the *server's*, not a verified peer identity).
+    ///
+    /// # Security contract
+    ///
+    /// Handlers MUST treat `None` as **unauthenticated** and apply their
+    /// configured fail-closed policy.  A `Some` value has already passed
+    /// rustls chain validation and the `PeerAllowlistVerifier` allowlist
+    /// check (see `crate::auth`), so its `subject_names` are trustworthy for
+    /// authorization decisions (F3b election identity binding, F5 admin
+    /// authorization).
+    fn peer_identity(&self) -> Option<PeerIdentity> {
+        None
+    }
+}
+
+/// The verified subject identity of a mutually-authenticated remote peer.
+///
+/// Produced by [`Channel::peer_identity`] on the server-accepted side of a
+/// mutually-authenticated TLS/QUIC channel.  The names are the leaf
+/// certificate's Subject Common Name plus every DNS Subject Alternative Name,
+/// lowercased with the exact same normalization the
+/// [`crate::auth::PeerAllowlist`] applies (via
+/// `crate::auth::extract_cert_names`), so an authorization check can compare a
+/// self-reported name against `subject_names` with `eq_ignore_ascii_case` and
+/// be certain the match is backed by the certificate the peer proved
+/// possession of during the handshake.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeerIdentity {
+    /// Lowercased subject names (CN + DNS SANs) from the verified leaf cert.
+    pub subject_names: Vec<String>,
 }
 
 /// Shared state for one direction of a `LocalChannelPair`.
@@ -532,6 +572,13 @@ trait TlsStreamOps: Send + 'static {
         dur: Option<Duration>,
     ) -> std::io::Result<()>;
     fn shutdown_inner(&self) -> std::io::Result<()>;
+
+    /// DER bytes of the *verified peer* leaf certificate, if this is the
+    /// server-accepted side of a mutually-authenticated session and the
+    /// handshake has completed.  `None` on the client side (the peer cert is
+    /// the server's own, not a verified client identity), before the
+    /// handshake, or on backends that do not surface a raw DER peer cert.
+    fn peer_leaf_der(&self) -> Option<Vec<u8>>;
 }
 
 // ── rustls backend ───────────────────────────────────────────────────────────
@@ -562,6 +609,17 @@ impl TlsStreamOps for rustls::StreamOwned<rustls::ServerConnection, TcpStream> {
     fn shutdown_inner(&self) -> std::io::Result<()> {
         self.sock.shutdown(std::net::Shutdown::Both)
     }
+    fn peer_leaf_der(&self) -> Option<Vec<u8>> {
+        // Server side: `peer_certificates()` returns the *client's* verified
+        // chain (client-auth completed).  The leaf is index 0.  `None` until
+        // the handshake has produced a peer cert -- our framing layer forces
+        // the handshake before any handler reads, so by the time a handler
+        // calls `peer_identity()` this is populated for an mTLS session.
+        self.conn
+            .peer_certificates()
+            .and_then(|c| c.first())
+            .map(|c| c.as_ref().to_vec())
+    }
 }
 
 #[cfg(feature = "tls-rustls")]
@@ -589,6 +647,11 @@ impl TlsStreamOps for rustls::StreamOwned<rustls::ClientConnection, TcpStream> {
     }
     fn shutdown_inner(&self) -> std::io::Result<()> {
         self.sock.shutdown(std::net::Shutdown::Both)
+    }
+    fn peer_leaf_der(&self) -> Option<Vec<u8>> {
+        // Client side: the peer cert here is the *server's*, not a verified
+        // client identity, so it must NOT be surfaced as a peer identity.
+        None
     }
 }
 
@@ -619,6 +682,14 @@ impl TlsStreamOps for native_tls::TlsStream<TcpStream> {
     }
     fn shutdown_inner(&self) -> std::io::Result<()> {
         self.get_ref().shutdown(std::net::Shutdown::Both)
+    }
+    fn peer_leaf_der(&self) -> Option<Vec<u8>> {
+        // native-tls does not expose the peer leaf cert in a form our
+        // rustls-only DER name parser consumes, and under `--all-features`
+        // rustls is always preferred as the server backend, so this path is
+        // never the mTLS acceptor.  Return `None` (fail-closed): a native-tls
+        // channel yields no verified peer identity.  See s1-identity-binding.
+        None
     }
 }
 
@@ -788,6 +859,31 @@ impl Channel for TlsTcpChannel {
 
     fn is_open(&self) -> bool {
         self.open.load(Ordering::SeqCst)
+    }
+
+    fn peer_identity(&self) -> Option<PeerIdentity> {
+        // Only the rustls backend surfaces a verified peer leaf cert; under
+        // `tls-native` (or if the handshake produced no client cert) this is
+        // `None` (fail-closed).
+        let der = {
+            let s = self.stream.lock().ok()?;
+            s.peer_leaf_der()?
+        };
+        #[cfg(feature = "tls-rustls")]
+        {
+            let names = crate::auth::extract_cert_names(&der);
+            if names.is_empty() {
+                // A verified cert with no CN/SAN names cannot back any
+                // authorization decision -- treat as unauthenticated.
+                return None;
+            }
+            Some(PeerIdentity { subject_names: names })
+        }
+        #[cfg(not(feature = "tls-rustls"))]
+        {
+            let _ = der;
+            None
+        }
     }
 }
 

@@ -1705,6 +1705,42 @@ impl ReplicatedEnvironment {
         self.config.node_name.as_str()
     }
 
+    /// Whether `identity` is authorized to issue **privileged** ADMIN RPC
+    /// commands (`SHUTDOWN_GROUP`, `TRANSFER_MASTER`, `STEP_DOWN`).  F5 / S1.
+    ///
+    /// The effective admin tier is [`RepConfig::admin_allowlist`] if set,
+    /// otherwise the full [`RepConfig::peer_allowlist`] (JE `RepGroupAdmin`
+    /// semantics: any allowlisted peer is an admin by default).  A verified
+    /// subject name matches an admin entry case-insensitively -- the exact
+    /// same normalization the `PeerAllowlist` / handshake verifier uses.
+    ///
+    /// `identity` MUST come from [`crate::net::Channel::peer_identity`] (a
+    /// TLS-verified identity), never from a self-reported wire field.
+    pub fn is_admin_identity(
+        &self,
+        identity: &crate::net::PeerIdentity,
+    ) -> bool {
+        use crate::auth::PeerAllowlist;
+        // Effective admin tier: explicit subset, else the full peer allowlist.
+        let entries: &Vec<String> = self
+            .config
+            .admin_allowlist
+            .as_ref()
+            .unwrap_or(&self.config.peer_allowlist);
+        // An empty effective admin tier admits no one (fail-closed).
+        if entries.is_empty() {
+            return false;
+        }
+        let allow = PeerAllowlist::new(entries.iter().cloned());
+        allow.contains_any(&identity.subject_names)
+    }
+
+    /// Whether privileged ADMIN commands are permitted over an
+    /// unauthenticated transport (no verified peer identity).  F5 / S1.
+    pub(crate) fn insecure_admin_allowed(&self) -> bool {
+        self.config.insecure_admin
+    }
+
     /// Get the group name.
     ///
     /// Returns the name of the replication group this node belongs to.

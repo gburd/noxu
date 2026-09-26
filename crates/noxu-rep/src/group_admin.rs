@@ -43,6 +43,32 @@ pub const CMD_STEP_DOWN: u8 = 0x03;
 pub const ACK_OK: u8 = 0x00;
 pub const ACK_REJECTED: u8 = 0x01;
 
+/// Whether `cmd` is a **privileged** ADMIN command requiring authorization.
+///
+/// F5 / S1: `SHUTDOWN_GROUP`, `TRANSFER_MASTER`, and `STEP_DOWN` each hand
+/// full group-administrative authority to the caller (shut a node down,
+/// reshuffle mastership).  They must be authorized against a verified peer
+/// identity.  There are no non-privileged ADMIN commands today, but keeping
+/// the predicate explicit means adding a future read-only command does not
+/// accidentally inherit the privileged gate.
+fn is_privileged(cmd: u8) -> bool {
+    matches!(cmd, CMD_SHUTDOWN_GROUP | CMD_TRANSFER_MASTER | CMD_STEP_DOWN)
+}
+
+/// Whether the caller on `channel` is authorized to run a privileged command.
+///
+/// Fail-closed: a `None` (unauthenticated) identity is authorized only when
+/// the operator explicitly set `insecure_admin`.
+fn admin_authorized(
+    channel: &dyn Channel,
+    env: &crate::replicated_environment::ReplicatedEnvironment,
+) -> bool {
+    match channel.peer_identity() {
+        Some(id) => env.is_admin_identity(&id),
+        None => env.insecure_admin_allowed(),
+    }
+}
+
 /// Service handler for the ADMIN channel.
 ///
 /// Holds a `Weak<ReplicatedEnvironment>` so that handler-spawned per-
@@ -83,6 +109,26 @@ impl ServiceHandler for AdminService {
                 return Ok(());
             }
         };
+
+        // F5 / S1: privileged commands require an authenticated, admin-
+        // authorized caller.  This is enforced against the channel's
+        // *verified* peer identity -- never a self-reported wire field.
+        //
+        // Fail-closed policy:
+        //   * mTLS, identity in the admin allowlist  -> proceed.
+        //   * mTLS, identity NOT in the admin tier   -> reject.
+        //   * no verified identity (plain TCP /       -> reject, UNLESS the
+        //     `insecure_no_auth`)                        operator set
+        //                                                `insecure_admin`.
+        if is_privileged(msg[0]) && !admin_authorized(&*channel, &env) {
+            log::warn!(
+                "ADMIN: rejecting privileged command 0x{:02x} -- caller not \
+                 authorized (no verified admin identity)",
+                msg[0]
+            );
+            let _ = channel.send(&[ACK_REJECTED]);
+            return Ok(());
+        }
 
         match msg[0] {
             CMD_TRANSFER_MASTER => {
