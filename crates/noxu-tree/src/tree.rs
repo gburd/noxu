@@ -9452,6 +9452,49 @@ impl Tree {
         Self::find_parent_of_node_id(&root, child_node_id)
     }
 
+    /// Read the LSN currently stored in the slot of `child_arc`'s parent IN
+    /// that points at `child_arc` — the child's CURRENT on-disk image LSN as
+    /// recorded by the parent.
+    ///
+    /// This is the read-side companion of [`Self::update_parent_slot_lsn`].
+    /// Before re-logging a child IN, the caller reads the prior slot LSN with
+    /// this method so the superseded image can be counted OBSOLETE (JE
+    /// `IN.logInternal` counts the prior version obsolete via
+    /// `countObsoleteNode` before stamping the fresh LSN with
+    /// `IN.updateEntry`).
+    ///
+    /// Returns `NULL_LSN` when the child has no parent (it is the root), the
+    /// parent Weak is dead, or the child is not found in the parent's slots.
+    pub fn get_parent_slot_lsn(child_arc: &Arc<RwLock<TreeNode>>) -> Lsn {
+        let (child_id, parent_weak) = {
+            let g = child_arc.read();
+            let weak = match &*g {
+                TreeNode::Bottom(b) => b.parent.clone(),
+                TreeNode::Internal(n) => n.parent.clone(),
+            };
+            (g.node_id(), weak)
+        };
+        let Some(parent_weak) = parent_weak else {
+            return NULL_LSN;
+        };
+        let Some(parent_arc) = parent_weak.upgrade() else {
+            return NULL_LSN;
+        };
+        let pg = parent_arc.read();
+        if let TreeNode::Internal(p) = &*pg {
+            for slot in 0..p.entries.len() {
+                let matches = p
+                    .child_ref(slot)
+                    .map(|c| c.read().node_id() == child_id)
+                    .unwrap_or(false);
+                if matches {
+                    return p.get_lsn(slot);
+                }
+            }
+        }
+        NULL_LSN
+    }
+
     /// Stamp `new_lsn` into the slot of `child_arc`'s parent IN that points at
     /// `child_arc`, and mark the parent dirty.
     ///

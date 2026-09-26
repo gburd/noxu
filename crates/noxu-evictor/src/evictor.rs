@@ -1475,11 +1475,13 @@ impl Evictor {
     /// Mirrors the checkpointer's `flush_one_tree_upper_ins` machinery
     /// (Checkpointer.flush_one_tree_upper_ins, checkpointer.rs): serialize the
     /// upper IN with `write_to_bytes()`, wrap it in an `InLogEntry`, log it as
-    /// `LogEntryType::IN`, clear its dirty flag, and stamp the logged LSN into
-    /// the parent slot via `Tree::update_parent_slot_lsn` so recovery can
-    /// re-fetch the fresh image.  The `provisional` decision reuses the same
-    /// checkpoint-coordination hook the BIN path uses
-    /// (`get_eviction_provisional`).
+    /// `LogEntryType::IN` **with utilization tracking** (`log_tracked` with the
+    /// owning `db_id` and the prior slot LSN as the obsolete image — NEW-6, JE
+    /// `IN.logInternal` -> `countObsoleteNode`), clear its dirty flag, and
+    /// stamp the logged LSN into the parent slot via
+    /// `Tree::update_parent_slot_lsn` so recovery can re-fetch the fresh image.
+    /// The `provisional` decision reuses the same checkpoint-coordination hook
+    /// the BIN path uses (`get_eviction_provisional`).
     ///
     /// The caller has already released the child write latch (parent-then-
     /// child lock order); `update_parent_slot_lsn` re-acquires the parent
@@ -1530,12 +1532,35 @@ impl Evictor {
         let mut buf = bytes::BytesMut::with_capacity(entry.log_size());
         entry.write_to_log(&mut buf);
 
-        match lm.log(
+        // NEW-6: read the PRIOR slot LSN (the upper IN's current on-disk image
+        // as recorded by its parent) BEFORE we publish the fresh LSN, so the
+        // superseded image is counted obsolete for the cleaner's utilization
+        // tracking.  JE `IN.logInternal` counts the prior version obsolete via
+        // `countObsoleteNode` (IN type, exact, size 0) whenever an IN is
+        // re-logged — the BIN path above does the same with `bin.last_full_lsn`;
+        // an upper IN carries no `last_full_lsn`, so the prior LSN lives in the
+        // parent slot (which `update_parent_slot_lsn` will overwrite below).
+        let prev_slot_lsn = Tree::get_parent_slot_lsn(node_arc);
+        let old_obsolete = if !prev_slot_lsn.is_null() {
+            Some(noxu_log::ObsoleteLsn::exact(
+                prev_slot_lsn,
+                Some(db_id as u32),
+                0,     // IN obsolete size must be 0
+                false, // is_ln = false (this is an IN)
+            ))
+        } else {
+            None
+        };
+
+        match lm.log_tracked(
             LogEntryType::IN,
             &buf,
             provisional,
             false, // flush_required
             false, // fsync_required
+            Some(db_id as u32),
+            old_obsolete,
+            false, // immediately_obsolete
         ) {
             Ok(logged_lsn) => {
                 // Clear the dirty flag under the child latch, then release it

@@ -34,6 +34,10 @@ experimental-eviction-policies = []
 
 [dev-dependencies]
 tempfile = "3"
+# NEW-6: assert the superseded upper-IN image is counted obsolete in the
+# cleaner's utilization tracker after the evictor re-logs a dirty upper IN.
+# noxu-cleaner does NOT depend on noxu-evictor (no dependency cycle).
+noxu-cleaner = { workspace = true }
 
 # DST shuttle coverage for the SHARED_CACHE register/deregister/evict
 # interleavings: only in the graph under `--cfg noxu_shuttle`.  Default
