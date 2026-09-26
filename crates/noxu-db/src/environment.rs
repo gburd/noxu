@@ -59,6 +59,13 @@ pub(crate) fn build_environment_stats(
         LockStatsSnapshot::from(&env_impl.get_lock_manager().get_stats());
     let txn = TxnStatsSnapshot::from(&env_impl.get_txn_manager().get_stats());
     let throughput = env_impl.get_throughput_snapshot();
+    // Refresh the instantaneous LRU-size gauges (pri1/pri2) from the live
+    // eviction policy before snapshotting, mirroring JE's Evictor.loadStats
+    // which recomputes cache-composition stats on demand. Without this the
+    // exported noxu_evictor_lru_size gauge reads a stale 0: pri1_lru_size /
+    // pri2_lru_size are only otherwise written by update_lru_stats, which had
+    // no production caller on the env.stats() path.
+    env_impl.get_evictor().update_lru_stats();
     let evictor =
         EvictorStatsSnapshot::from(env_impl.get_evictor().get_stats());
     let cleaner = env_impl
