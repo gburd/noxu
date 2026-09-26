@@ -75,6 +75,14 @@ impl ExpirationTracker {
     ///   values passed to `track`)
     ///
     /// # Returns
+    /// JE `TTLCleaningTest.testHistogram1/2/3` verify this histogram/expired-
+    /// bytes accounting (JE `ExpirationTracker.getExpiredBytes`). The end-to-
+    /// end purge tests (`testCleanLNs`/`testCleanBINs`/`testRevisalCleaning`/
+    /// `testGradualExpiration`) drive JE `TTL.setTimeTestHook` to advance the
+    /// clock; Noxu's `current_time_hours()` reads `SystemTime::now()` with no
+    /// injection hook, so those are not portable without a production time-
+    /// injection hook (test-infra gap, tracked separately — not an engine bug).
+    ///
     /// Total size in bytes of all entries that have expired by `current_time`
     pub fn get_expired_bytes(&self, current_time: u64) -> i64 {
         let mut expired_size = 0i64;
