@@ -1534,7 +1534,7 @@ fn test_commit_pending_database_no_toctou() {
     // Simulate transactional database creation:
     // open with txn_id=42 → name goes to pending_names (not name_map)
     let txn_id: u64 = 42;
-    let _db_arc =
+    let (_db_arc, _lsn) =
         env.open_database_transactional("pending_db", &db_cfg, txn_id).unwrap();
 
     // Database is not visible in committed names yet.
@@ -1577,7 +1577,7 @@ fn test_abort_pending_database() {
         c
     };
     let txn_id: u64 = 99;
-    let _db_arc =
+    let (_db_arc, _lsn) =
         env.open_database_transactional("aborted_db", &db_cfg, txn_id).unwrap();
 
     // Abort: name is removed from pending_names and db_map.
@@ -1621,7 +1621,7 @@ fn test_commit_pending_concurrent_open_no_duplicate_db_id() {
     };
     // Create the pending database in txn 1.
     let txn_id: u64 = 1;
-    let db_arc =
+    let (db_arc, _lsn) =
         env.open_database_transactional("race_db", &db_cfg, txn_id).unwrap();
     let committed_id = db_arc.read().get_id();
 
@@ -1635,7 +1635,7 @@ fn test_commit_pending_concurrent_open_no_duplicate_db_id() {
         // This open may race with commit below.
         let mut cfg = DatabaseConfig::new();
         cfg.set_allow_create(true);
-        env2.open_database_transactional("race_db", &cfg, 2)
+        env2.open_database_transactional("race_db", &cfg, 2).map(|(db, _)| db)
     });
 
     barrier.wait();

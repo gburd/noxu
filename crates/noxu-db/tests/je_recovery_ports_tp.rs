@@ -895,15 +895,12 @@ fn read_only_checkpoint_is_benign() {
 // commit; the recovery NameLN replay never sees the create). Do NOT weaken by
 // inserting data to make the DBs "stick" — that hides the gap.
 // ===========================================================================
+// NEW-REC-1 FIXED: a committed DB-create transaction now records the
+// provisional NameLNTxn's LSN on the inner Txn (Txn::note_log_entry), so the
+// txn reports has_logged_entries() and Txn::commit() writes a durable
+// TxnCommit — an empty (data-less) txn-created database survives recovery
+// exactly as an auto-commit create does.  JE: RecoveryAbortTest.testDbCreateRemove.
 #[test]
-#[ignore = "ENGINE-BUG CANDIDATE (faithful port, do not weaken): an EMPTY \
-            database created under an explicit transaction (create+close+commit, \
-            no data) is LOST after recovery — database_names() is [] on reopen \
-            in debug AND release. Controls: auto-commit create survives; txn \
-            create WITH a data put survives; only the data-less txn-created DB \
-            is dropped. Root cause: the create-only txn commit does not durably \
-            replay the NameLN the way the auto-commit create path does. \
-            JE: RecoveryAbortTest.testDbCreateRemove."]
 fn db_create_remove_rename_survives_recovery() {
     let dir = TempDir::new().unwrap();
     // Small ranges (JE uses 10/50/60/70/100; we keep the shape, fewer dbs).

@@ -908,6 +908,9 @@ impl Environment {
         // creation, use the transactional path so the name registration is
         // deferred until commit.
         let is_transactional_create = txn.is_some() && config.allow_create;
+        // NEW-REC-1: LSN of the provisional NameLNTxn written for a
+        // transactional create; recorded on the inner Txn below.
+        let mut name_ln_lsn: Option<noxu_util::Lsn> = None;
         let db_impl_arc = {
             let env_impl = self.env_impl.lock();
             if is_transactional_create {
@@ -917,6 +920,10 @@ impl Environment {
                     .id();
                 env_impl
                     .open_database_transactional(name, &dbi_config, txn_id)
+                    .map(|(db, lsn)| {
+                        name_ln_lsn = lsn;
+                        db
+                    })
             } else {
                 env_impl.open_database(name, &dbi_config)
             }
@@ -944,6 +951,22 @@ impl Environment {
             // SAFETY: is_transactional_create implies txn.is_some().
             let txn_ref = txn
                 .expect("invariant: txn is Some when is_transactional_create");
+            // NEW-REC-1: record the provisional NameLNTxn's LSN on the inner
+            // Txn so it reports has_logged_entries() == true.  Without this,
+            // an empty (data-less) DB-create txn logs the NameLNTxn directly
+            // through the LogManager but never advances the Txn's last_lsn, so
+            // Txn::commit() skips writing the durable TxnCommit record and
+            // recovery drops the database (its provisional NameLNTxn pairs with
+            // no committed txn).  JE: NameLN.log() inside DbTree.createDb runs
+            // through the txn, advancing Txn.lastLoggedLsn.
+            if let Some(lsn) = name_ln_lsn
+                && let Some(inner) = txn_ref.get_inner_txn()
+            {
+                inner
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .note_log_entry(lsn.as_u64());
+            }
             txn_ref.register_abort_callback(move || {
                 env_impl_arc.lock().abort_pending_database(&db_name_abort);
             });

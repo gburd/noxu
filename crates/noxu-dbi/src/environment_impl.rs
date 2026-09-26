@@ -2043,7 +2043,7 @@ impl EnvironmentImpl {
         name: &str,
         config: &DatabaseConfig,
     ) -> Result<Arc<RwLock<DatabaseImpl>>, DbiError> {
-        self.open_database_inner(name, config, None)
+        self.open_database_inner(name, config, None).map(|(db, _)| db)
     }
 
     /// Transactional variant: creates the database under a transaction.
@@ -2055,12 +2055,20 @@ impl EnvironmentImpl {
     /// `txn_id` is the ID of the creating transaction.  A `NameLNTxn` WAL
     /// entry (with `Provisional::Yes`) is written **inside** the transaction
     /// so that crash recovery can undo it if the transaction never commits.
+    ///
+    /// NEW-REC-1: returns the LSN of the provisional `NameLNTxn` written inside
+    /// the transaction (or `None` when no WAL entry was written, e.g. reopening
+    /// a recovered db).  The caller records it on the creating `Txn` so the
+    /// txn reports `has_logged_entries()` and its commit writes a durable
+    /// `TxnCommit` record — otherwise a data-less DB-create txn is dropped on
+    /// recovery.
     pub fn open_database_transactional(
         &self,
         name: &str,
         config: &DatabaseConfig,
         txn_id: u64,
-    ) -> Result<Arc<RwLock<DatabaseImpl>>, DbiError> {
+    ) -> Result<(Arc<RwLock<DatabaseImpl>>, Option<noxu_util::Lsn>), DbiError>
+    {
         self.open_database_inner(name, config, Some(txn_id))
     }
 
@@ -2069,7 +2077,8 @@ impl EnvironmentImpl {
         name: &str,
         config: &DatabaseConfig,
         creating_txn_id: Option<u64>,
-    ) -> Result<Arc<RwLock<DatabaseImpl>>, DbiError> {
+    ) -> Result<(Arc<RwLock<DatabaseImpl>>, Option<noxu_util::Lsn>), DbiError>
+    {
         self.check_open()?;
 
         // Check if database already exists in the open db_map.
@@ -2077,7 +2086,7 @@ impl EnvironmentImpl {
             && let Some(db) = self.db_map.read().get(db_id)
         {
             db.read().increment_reference_count();
-            return Ok(db.clone());
+            return Ok((db.clone(), None));
         }
 
         // DBEVICT-1 (root-cause fix): the database is absent from db_map --
@@ -2096,7 +2105,7 @@ impl EnvironmentImpl {
             && let Some(db) = self.db_map.read().get(db_id)
         {
             db.read().increment_reference_count();
-            return Ok(db.clone());
+            return Ok((db.clone(), None));
         }
 
         // R-4 TOCTOU guard: if the name is currently being committed from
@@ -2317,6 +2326,9 @@ impl EnvironmentImpl {
 
         self.db_map.write().insert(db_id, db.clone());
 
+        // NEW-REC-1: LSN of the provisional NameLNTxn written below (if any),
+        // returned to the caller so it can be recorded on the creating txn.
+        let mut name_ln_lsn: Option<noxu_util::Lsn> = None;
         if let Some(txn_id) = creating_txn_id {
             if recovered_db_id.is_none() {
                 // C-4 / JE 1-I fix + C-6: defer name_map insertion until commit.
@@ -2327,7 +2339,11 @@ impl EnvironmentImpl {
                 // transaction so crash recovery can undo it if the transaction
                 // aborts or the process crashes before commit.
                 if let Some(lm) = &self.log_manager {
-                    let _ = Self::log_name_ln_txn(
+                    // NEW-REC-1: capture the NameLNTxn LSN and return it so the
+                    // caller records it on the creating transaction; this makes
+                    // Txn::has_logged_entries() true and forces a durable
+                    // TxnCommit for an empty (data-less) DB-create txn.
+                    name_ln_lsn = Self::log_name_ln_txn(
                         lm,
                         name,
                         db_id.id() as u64,
@@ -2345,7 +2361,8 @@ impl EnvironmentImpl {
                         // falling back to the (possibly different) env-level
                         // NODE_MAX_ENTRIES.
                         Some(config.node_max_entries),
-                    );
+                    )
+                    .ok();
                 }
             }
             // recovered_db_id.is_some(): db already in name_map from recovery;
@@ -2379,7 +2396,7 @@ impl EnvironmentImpl {
             }
         }
 
-        Ok(db)
+        Ok((db, name_ln_lsn))
     }
 
     /// Called when the transaction that created `name` commits.
@@ -2441,7 +2458,7 @@ impl EnvironmentImpl {
         btree_comparator_id: Option<&str>,
         dup_comparator_id: Option<&str>,
         fanout: Option<i32>,
-    ) -> Result<(), DbiError> {
+    ) -> Result<noxu_util::Lsn, DbiError> {
         let key = name.as_bytes().to_vec();
         let mut data = db_id.to_le_bytes().to_vec();
         // DBI-14 + NEW-5: append the persisted comparator identities and the
@@ -2469,6 +2486,14 @@ impl EnvironmentImpl {
         );
         let mut buf = BytesMut::with_capacity(entry.log_size());
         entry.write_to_log(&mut buf);
+        // NEW-REC-1: return the assigned LSN so the caller can record it on
+        // the creating transaction (Txn::note_log_entry).  Without that, the
+        // inner Txn's last_lsn stays NULL_LSN, has_logged_entries() reads
+        // false, and Txn::commit() skips writing the TxnCommit record - so an
+        // empty (data-less) txn-created database is dropped on recovery (its
+        // provisional NameLNTxn has no committed txn to pair with).  JE: the
+        // NameLN.log() inside DbTree.createDb advances Txn.lastLoggedLsn, and
+        // Txn.commit() then writes the commit entry.
         lm.log(
             LogEntryType::NameLNTxn,
             &buf,
@@ -2476,7 +2501,6 @@ impl EnvironmentImpl {
             false, // flush: lazy
             false, // fsync: lazy
         )
-        .map(|_| ())
         .map_err(DbiError::from)
     }
 
@@ -2809,7 +2833,19 @@ impl EnvironmentImpl {
             return Err(DbiError::DatabaseInUse(name.to_string()));
         }
 
+        // NEW-REC-1: durably tombstone the name so recovery drops it.  A plain
+        // in-memory removal is invisible after reopen — recovery's latest-
+        // NameLN-wins scan would resurrect the database from its still-present
+        // create NameLN.  Written before the map mutation so a failure leaves
+        // the maps consistent with the (un-)logged state.
+        if let Some(lm) = &self.log_manager {
+            let _ = Self::log_name_ln_delete(lm, name);
+        }
         self.name_map.write().remove(name);
+        // NEW-REC-1: the name is no longer live, so the close/checkpoint
+        // catalog relog will not re-log it; recovery must not see it either.
+        self.recovered_comparators.write().remove(name);
+        self.recovered_fanouts.write().remove(name);
         if let Some(db) = self.db_map.write().remove(&db_id) {
             db.write().start_delete();
             db.write().finish_delete();
@@ -2850,8 +2886,65 @@ impl EnvironmentImpl {
             return Err(DbiError::DatabaseAlreadyExists(new_name.to_string()));
         }
 
+        // NEW-REC-1: resolve the DB's persisted comparator identities and
+        // per-DB fanout so the new-name create NameLN carries the same
+        // metadata (mirrors relog_live_catalog_impl): prefer the open
+        // DatabaseImpl, else the values recovered from the prior NameLN.
+        let (btree_id, dup_id): (Option<String>, Option<String>) =
+            if let Some(db) = self.db_map.read().get(&db_id) {
+                let g = db.read();
+                (
+                    g.btree_comparator_id().map(|x| x.to_string()),
+                    g.duplicate_comparator_id().map(|x| x.to_string()),
+                )
+            } else if let Some(ids) =
+                self.recovered_comparators.read().get(old_name)
+            {
+                ids.clone()
+            } else {
+                (None, None)
+            };
+        let fanout: Option<i32> =
+            if let Some(db) = self.db_map.read().get(&db_id) {
+                Some(db.read().max_tree_entries_per_node())
+            } else {
+                self.recovered_fanouts.read().get(old_name).copied()
+            };
+
+        // NEW-REC-1: durably persist the rename as a tombstone for old_name +
+        // a fresh create NameLN for new_name (same db_id, same metadata).
+        // Without this the rename is invisible after reopen — recovery would
+        // resurrect old_name from its create NameLN and never learn new_name.
+        // JE: `DbTree.dbRename` re-logs the NameLN under the new name.
+        if let Some(lm) = &self.log_manager {
+            let _ = Self::log_name_ln_delete(lm, old_name);
+            let _ = Self::log_name_ln(
+                lm,
+                new_name,
+                db_id.id() as u64,
+                btree_id.as_deref(),
+                dup_id.as_deref(),
+                fanout,
+            );
+        }
+
         self.name_map.write().remove(old_name);
         self.name_map.write().insert(new_name.to_string(), db_id);
+        // NEW-REC-1: carry the recovered metadata across the rename so a
+        // later close/checkpoint relog (and a reopen) sees new_name with the
+        // right comparator/fanout, and old_name is no longer live.
+        {
+            let old_cmp = self.recovered_comparators.write().remove(old_name);
+            if let Some(cmp) = old_cmp {
+                self.recovered_comparators
+                    .write()
+                    .insert(new_name.to_string(), cmp);
+            }
+            let old_fan = self.recovered_fanouts.write().remove(old_name);
+            if let Some(f) = old_fan {
+                self.recovered_fanouts.write().insert(new_name.to_string(), f);
+            }
+        }
         // DBEVICT-1: move any stashed eviction state to the new name too, or
         // a reopen under old_name after a future rename-back would
         // reconstruct a fresh (wrongly-empty) tree while the real stashed
@@ -2860,8 +2953,6 @@ impl EnvironmentImpl {
         if let Some(evicted) = self.evicted_db_state.write().remove(old_name) {
             self.evicted_db_state.write().insert(new_name.to_string(), evicted);
         }
-
-        // In a full implementation, would log the rename
 
         Ok(())
     }
@@ -3051,6 +3142,40 @@ impl EnvironmentImpl {
         let mut buf = BytesMut::with_capacity(entry.log_size());
         entry.write_to_log(&mut buf);
         lm.log(LogEntryType::DeleteLN, &buf, Provisional::No, false, false)
+            .map(|_| ())
+            .map_err(DbiError::from)
+    }
+
+    /// NEW-REC-1: write a **deletion** `NameLN` (data = None) so recovery drops
+    /// the name.  Without a durable tombstone, recovery's latest-`NameLN`-wins
+    /// scan resurrects a removed database from its still-present create
+    /// `NameLN` in an earlier log file.  Non-transactional (treated as
+    /// committed by recovery), written after the create in log order so
+    /// latest-wins selects the deletion.  JE: `DbTree.deleteMapLN` /
+    /// `NameLN` marked deleted on remove.
+    fn log_name_ln_delete(
+        lm: &Arc<LogManager>,
+        name: &str,
+    ) -> Result<(), DbiError> {
+        use noxu_util::vlsn::NULL_VLSN;
+        let entry = LnLogEntry::new(
+            0,    // db_id header field (unused for NameLN)
+            None, // txn_id: non-transactional tombstone
+            NULL_LSN,
+            false,
+            None,
+            None,
+            NULL_VLSN,
+            0,
+            false,
+            name.as_bytes().to_vec(),
+            None, // data = None -> deletion NameLN (is_deleted on recovery)
+            0,
+            NULL_VLSN,
+        );
+        let mut buf = BytesMut::with_capacity(entry.log_size());
+        entry.write_to_log(&mut buf);
+        lm.log(LogEntryType::NameLN, &buf, Provisional::No, false, false)
             .map(|_| ())
             .map_err(DbiError::from)
     }
