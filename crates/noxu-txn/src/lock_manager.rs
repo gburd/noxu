@@ -1639,6 +1639,10 @@ mod tests {
         assert_eq!(lm.n_total_locks(), 0);
     }
 
+    /// JE: LockManagerTest.testImportunateTxn1 -- an importunate locker steals
+    /// a held, conflicting lock from a preemptable owner (the victim is
+    /// preempted) instead of waiting/timing out.
+    ///
     /// TXN-F3 regression: an importunate locker steals a held, conflicting
     /// lock from a preemptable owner instead of waiting/timing out.  JE
     /// `LockManager.waitForLock`: `if (isImportunate) { result =
@@ -1669,6 +1673,10 @@ mod tests {
         assert!(!lm.is_owned_write_lock(LSN, 1));
     }
 
+    /// JE: LockManagerTest.testImportunateTxn2 -- a non-preemptable owner
+    /// (another importunate locker) blocks the steal, so the importunate
+    /// request falls back to a normal wait rather than preempting.
+    ///
     /// A non-preemptable owner blocks the steal: the importunate request
     /// falls back to a normal wait and times out rather than stealing.
     /// JE: "Lock holder is non-preemptable, wait again" (LockManager.java:556).
@@ -2373,7 +2381,8 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Ported from LockManagerTest.java — testUpgradeLock
+    // JE: LockManagerTest.testUpgradeLock -- a promotion (upgrade) waiter butts
+    // in front of an existing new WRITE waiter and is granted first.
     // -----------------------------------------------------------------------
 
     /// A promotion waiter (locker

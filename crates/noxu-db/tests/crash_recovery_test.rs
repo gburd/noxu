@@ -149,6 +149,10 @@ fn reopen_db(dir: &Path) -> (noxu_db::Environment, noxu_db::Database) {
 /// This validates:
 ///   - fsync guarantees for committed transactions
 ///   - log truncation / undo of the in-flight transaction during recovery
+///
+// JE: TxnFSyncTest.testFSyncButNoClose -- committed data is durable across an
+// unclean shutdown (env not closed cleanly); JE drops the env without flushing
+// the log manager, here we SIGKILL (a strictly stronger crash).
 #[test]
 fn test_committed_writes_survive_sigkill() {
     let dir = TempDir::new().unwrap();

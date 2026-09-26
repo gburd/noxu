@@ -230,6 +230,9 @@ fn lock_manager_two_readers_coexist() {
 // 4. Deadlock detection: 2-locker cycle, 3-locker cycle, no-cycle case
 // ============================================================================
 
+// JE: DeadlockTest.testDeadlockBetweenTwoLockers / testDeadlockBetweenTwoTxns
+// (BasicLocker vs Txn is a JE-internal locker-class distinction; the
+// waits-for cycle and victim selection are identical).
 #[test]
 fn deadlock_two_locker_cycle_detected() {
     // T1 waits for T2, T2 requests lock held by T1 -> deadlock.
@@ -243,6 +246,8 @@ fn deadlock_two_locker_cycle_detected() {
     assert_eq!(*c.last().unwrap(), 2);
 }
 
+// JE: DeadlockTest.testDeadlockAmongThreeLockers / testDeadlockAmongThreeTxns
+// -- a 3-locker ring T1->T2->T3->T1 is detected and broken.
 #[test]
 fn deadlock_three_locker_cycle_detected() {
     // T1->T2->T3->T1 ring.
@@ -769,4 +774,156 @@ fn two_txns_shared_lock_manager_read_write_conflict() {
 
     // After both transactions are done the lock table must be empty.
     assert_eq!(lm.n_total_locks(), 0, "lock table empty after both txns end");
+}
+
+// JE: DeadlockTest.testDeadlockIntersectionWithTwoCommonLocker -- two deadlock
+// cycles that intersect at TWO common lockers.  Graph-level topology (from the
+// JE ASCII diagram): four lockers acquire a set of locks and then each waits
+// for the next in a way that forms two interlocking cycles sharing locker2 and
+// locker3.  Modelled at the waits-for-graph level:
+//   L1 owned by T1; L2 owned by T2; L3 owned by T3; L4 owned by T2.
+//   T1 -> {T2}   (T1 waits on L2, owned by T2)
+//   T2 -> {T3}   (T2 waits on L3, owned by T3)
+//   T3 -> {T1,T4}(T3 waits on a lock owned by T1 and T4)
+//   T4 -> {T2}   (T4 waits on L2, owned by T2)
+// The requester closing the graph is T4 (or any member); the detector must
+// find a cycle and never loop, even with the two shared lockers T2/T3 on
+// multiple cycles.
+#[test]
+fn deadlock_intersection_two_common_lockers_detected() {
+    let mut waits_for: HashMap<i64, HashSet<i64>> = HashMap::new();
+    waits_for.insert(1, HashSet::from([2]));
+    waits_for.insert(2, HashSet::from([3]));
+    waits_for.insert(3, HashSet::from([1, 4]));
+    // T4 requests a lock owned by T2, closing the interlocking cycles.
+    let cycle = DeadlockDetector::detect(4, &[2], &waits_for);
+    assert!(
+        cycle.is_some(),
+        "two intersecting cycles sharing two common lockers must be detected"
+    );
+    let c = cycle.unwrap();
+    assert_eq!(c[0], 4, "cycle path starts at the requester T4");
+    assert_eq!(*c.last().unwrap(), 4, "cycle must close back on the requester");
+    // The cycle must route through the shared lockers.
+    assert!(
+        c.contains(&2) && c.contains(&3),
+        "cycle must pass through the two common lockers T2 and T3: {c:?}"
+    );
+}
+
+// JE: DeadlockTest.testPartialDeadlock (behavioural port, no simulate-hook).
+// JE uses an internal `simulatePartialDeadlockHook` to inject a sleep between
+// setting `waitingFor` and running detection, forcing a race where a THIRD
+// locker (txn3) runs the deadlock check while txn1/txn2 have a partially-formed
+// cycle.  The invariant the JE test asserts is twofold: (a) the deadlock
+// checker TERMINATES (does not loop infinitely / `hasCycleInternal` returns)
+// and (b) the non-cyclic third locker txn3 does NOT get a false
+// DeadlockException.  Noxu has no such hook; we assert the same two invariants
+// at the graph level: txn1<->txn2 form a real cycle, but txn3 (which only waits
+// on txn1, no return path) must NOT be reported as a deadlock victim.
+#[test]
+fn partial_deadlock_third_locker_no_false_deadlock() {
+    // Real cycle between T1 and T2 (T1->T2, T2->T1).
+    let mut waits_for: HashMap<i64, HashSet<i64>> = HashMap::new();
+    waits_for.insert(1, HashSet::from([2]));
+    waits_for.insert(2, HashSet::from([1]));
+
+    // T1<->T2 is a genuine cycle: detection must find it (and terminate).
+    let cyc = DeadlockDetector::detect(2, &[1], &waits_for);
+    assert!(cyc.is_some(), "T1<->T2 is a real cycle and must be detected");
+
+    // T3 only waits on T1 (owner of the lock it wants); T1 does not wait on
+    // T3, so there is NO path back to T3 -- T3 must NOT be a deadlock victim.
+    // (If detection followed the T1<->T2 cycle and mis-attributed it to T3,
+    // this would spuriously return Some -- the false-deadlock bug.)
+    let no_cyc = DeadlockDetector::detect(3, &[1], &waits_for);
+    assert!(
+        no_cyc.is_none(),
+        "T3 waits only on T1 with no return path; it must not be reported as a \
+         deadlock victim even though T1<->T2 is cyclic (JE partial-deadlock: \
+         the non-cyclic locker gets no false DeadlockException): {no_cyc:?}"
+    );
+}
+
+// JE: DeadlockTest.testDeadlockExceptionThrowBeforeLongTimeWait -- a genuine
+// deadlock is detected and broken PROMPTLY, well before a long per-lock timeout
+// would elapse (JE asserts `elapsed < lockTimeout`).  Threaded port: T1 holds
+// L1, T2 holds L2; both then request the other's lock with a LONG (5 s) per-lock
+// timeout.  The detector must break the cycle in a small fraction of that
+// window; we assert the total wall time is well under the 5 s timeout AND at
+// least one waiter surfaced a Deadlock (not a timeout).
+#[test]
+fn deadlock_detected_before_long_timeout_elapses() {
+    use noxu_txn::TxnError;
+    use std::thread;
+    use std::time::Duration;
+
+    let lm = Arc::new(LockManager::with_lock_timeout(0));
+    let (l1, l2) = (0xD1u64, 0xD2u64);
+    let (t1, t2) = (1i64, 2i64);
+    const LONG_TIMEOUT_MS: u64 = 5_000;
+
+    lm.lock(l1, t1, LockType::Write, false, false).unwrap();
+    lm.lock(l2, t2, LockType::Write, false, false).unwrap();
+
+    let start = std::time::Instant::now();
+
+    // Each waiter, on being chosen as the deadlock victim, releases the lock
+    // it already holds -- mirroring what a real transaction's abort does.
+    // Without this the non-victim legitimately keeps waiting (its target lock
+    // is still held by the victim): correct behaviour, but not what this test
+    // measures.  With the release, the non-victim is granted promptly once the
+    // victim aborts.
+    let lm1 = Arc::clone(&lm);
+    let h1 = thread::spawn(move || {
+        let r = lm1.lock_with_timeout(
+            l2,
+            t1,
+            LockType::Write,
+            false,
+            false,
+            LONG_TIMEOUT_MS,
+        );
+        if r.is_err() {
+            lm1.release_all_for_locker(t1);
+        }
+        r
+    });
+    thread::sleep(Duration::from_millis(30));
+    let lm2 = Arc::clone(&lm);
+    let h2 = thread::spawn(move || {
+        let r = lm2.lock_with_timeout(
+            l1,
+            t2,
+            LockType::Write,
+            false,
+            false,
+            LONG_TIMEOUT_MS,
+        );
+        if r.is_err() {
+            lm2.release_all_for_locker(t2);
+        }
+        r
+    });
+
+    let r1 = h1.join().unwrap();
+    let r2 = h2.join().unwrap();
+    let elapsed = start.elapsed();
+
+    let dl = matches!(&r1, Err(TxnError::Deadlock(_)))
+        || matches!(&r2, Err(TxnError::Deadlock(_)));
+    assert!(
+        dl,
+        "a real cycle must surface a Deadlock, not a timeout: r1={r1:?} r2={r2:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(LONG_TIMEOUT_MS / 2),
+        "deadlock must be detected promptly, well before the {LONG_TIMEOUT_MS}ms \
+         per-lock timeout would elapse; elapsed={elapsed:?} (JE \
+         DeadlockTest.testDeadlockExceptionThrowBeforeLongTimeWait)"
+    );
+
+    for t in [t1, t2] {
+        lm.release_all_for_locker(t);
+    }
 }

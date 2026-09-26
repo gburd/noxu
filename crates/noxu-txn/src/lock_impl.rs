@@ -1139,7 +1139,9 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Ported from LockTest.java — testLockConflicts
+    // JE: LockTest.testLockConflicts — LockImpl grant-type / owner / waiter
+    // matrix (LockImpl.lock/release, nOwners/nWaiters).  Direct port of the
+    // low-level LockImpl assertions from LockTest.java.
     // -----------------------------------------------------------------------
 
     /// Read lock granted new the first time,
@@ -1345,7 +1347,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Ported from LockTest.java — testOwners
+    // JE: LockTest.testOwners — owner-set add/remove + getWriteOwnerLocker.
     // -----------------------------------------------------------------------
 
     /// No write owner until a write lock is held.
@@ -1392,7 +1394,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Ported from LockTest.java — testPromotion
+    // JE: LockTest.testPromotion — releasing a writer promotes ALL waiting readers.
     // -----------------------------------------------------------------------
 
     /// Releasing the single writer promotes
@@ -1432,7 +1434,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Ported from LockTest.java — testWaiters
+    // JE: LockTest.testWaiters — flushWaiter + promotion-at-head ordering.
     // -----------------------------------------------------------------------
 
     /// Flush_waiter removes from waiter list
@@ -1484,7 +1486,8 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Ported from LockTest.java — testRangeConflicts (spot-checks)
+    // JE: LockTest.testRangeConflicts / LockTest.testRangeUpgrades — range-lock
+    // conflict matrix (RANGE_INSERT/RANGE_READ/RANGE_WRITE).
     // -----------------------------------------------------------------------
 
     /// Range_insert held → range_read
@@ -1524,7 +1527,8 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Ported from LockTest.java — testRangeInsertWaiterConflict
+    // JE: LockTest.testRangeInsertWaiterConflict — a waiting RANGE_INSERT forces
+    // a subsequent RANGE_READ to WAIT_RESTART (restart-conflict waiter scan).
     // -----------------------------------------------------------------------
 
     /// When a range_insert

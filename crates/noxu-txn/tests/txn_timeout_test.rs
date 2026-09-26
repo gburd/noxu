@@ -8,6 +8,15 @@
 //! `waitForLock` (LockManager.java:729-738) precedence "when both timeouts
 //! occur, throw TransactionTimeout".
 //!
+//! JE parity: `com.sleepycat.je.txn.TxnTimeoutTest` exercises the same
+//! txn-vs-lock timeout precedence at the public API level.  Its
+//! `testTxnTimeout` / `testPerTxnTimeout` / `testEnvTxnTimeout` /
+//! `testEnvNoLockTimeout` assert that a SHORT txn timeout fires as a
+//! TransactionTimeout even when the per-lock timeout is longer; its
+//! `testPerLockTimeout` / `testEnvLockTimeout` assert the reverse (a
+//! short lock timeout fires as a LockTimeout).  These tests port that
+//! precedence at the LockManager/Txn layer (the min(lock,txn) budget).
+//!
 //! The harness mirrors `lock_manager_test.rs::lock_times_out_when_blocked`:
 //! one txn holds a write lock, a second txn (on another thread) blocks on it
 //! with a bounded timeout, and we assert the *elapsed* wait is bounded by the
@@ -31,6 +40,9 @@ fn lm_forever() -> Arc<LockManager> {
 // txn1 holds a write lock on lsn 1 (never releases). txn2 sets a 100 ms
 // txn-level timeout and a 60 s per-lock timeout, then blocks. It MUST fail with
 // TransactionTimeout after ~100 ms, NOT wait the 60 s lock timeout.
+// JE: TxnTimeoutTest.testTxnTimeout / testPerTxnTimeout / testEnvTxnTimeout —
+// a short txn timeout fires (TransactionTimeout) even when the per-lock
+// timeout is long.
 #[test]
 fn short_txn_timeout_cuts_long_lock_wait_short() {
     let lm = lm_forever();
@@ -69,6 +81,8 @@ fn short_txn_timeout_cuts_long_lock_wait_short() {
 //
 // Same as above but the waiter passes lock timeout 0 (forever). On base this
 // hangs forever; with the fix the txn timeout must still fire.
+// JE: TxnTimeoutTest.testEnvNoLockTimeout — lock timeout 0 (wait forever) must
+// still yield to a short txn timeout.
 #[test]
 fn short_txn_timeout_fires_when_lock_timeout_is_forever() {
     let lm = lm_forever();
@@ -109,6 +123,8 @@ fn short_txn_timeout_fires_when_lock_timeout_is_forever() {
 //
 // Preserves existing per-lock timeout behaviour: when the lock deadline is the
 // one that expires first, the error is LockTimeout (not TransactionTimeout).
+// JE: TxnTimeoutTest.testPerLockTimeout / testEnvLockTimeout — a short per-lock
+// timeout fires (LockTimeout) when the txn timeout is long.
 #[test]
 fn long_txn_timeout_yields_to_short_lock_timeout() {
     let lm = lm_forever();
@@ -142,6 +158,8 @@ fn long_txn_timeout_yields_to_short_lock_timeout() {
 // txn and lock timeouts are equal, so both deadlines expire together; JE
 // throws TransactionTimeout in that case (LockManager.java:729-738) "otherwise
 // TransactionTimeout may never be thrown".
+// JE: TxnTimeoutTest (LockManager.waitForLock precedence) — when both deadlines
+// expire together, TransactionTimeout wins.
 #[test]
 fn both_timeouts_expire_transaction_timeout_wins() {
     let lm = lm_forever();
@@ -171,6 +189,8 @@ fn both_timeouts_expire_transaction_timeout_wins() {
 }
 
 // ── 5. No txn timeout set (== 0) → existing per-lock behaviour unchanged ──────
+// JE: TxnTimeoutTest.testPerLockTimeout (no-txn-timeout case) — with no txn
+// timeout only the per-lock timeout applies.
 #[test]
 fn no_txn_timeout_preserves_lock_timeout() {
     let lm = lm_forever();

@@ -50,6 +50,8 @@ fn test_txn_timeout_propagated_from_config() {
     txn.abort().unwrap();
 }
 
+// JE: TxnTest.testNoWaitConfig -- a no-wait txn turns a lock conflict into an
+// immediate LockNotAvailable error instead of blocking (JE'''s expectNoWaitTxn).
 /// Verify that `no_wait` config causes immediate lock failure rather than
 /// blocking when contending with another writer.
 #[test]

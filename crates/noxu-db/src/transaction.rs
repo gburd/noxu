@@ -1412,6 +1412,9 @@ mod tests {
         assert!(!txn.is_read_only());
     }
 
+    /// JE: TxnTest.testTransactionName -- `set_name`/`get_name` round-trip; the
+    /// txn stays printable/queryable after close (JE'''s toString-after-abort).
+    ///
     /// `set_name` / `get_name`
     /// round-trip and survives commit (the JE shape stays valid until
     /// the txn is dropped).

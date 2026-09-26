@@ -77,6 +77,8 @@ fn none_type_returns_none_needed() {
 
 // ─── 2. Non-blocking acquire ──────────────────────────────────────────────────
 
+// JE: LockManagerTest.testNonBlockingLock2 -- a non-blocking READ request
+// against a held WRITE is DENIED (no waiter enqueued).
 #[test]
 fn non_blocking_fails_when_write_held() {
     let lm = lm();
@@ -86,6 +88,8 @@ fn non_blocking_fails_when_write_held() {
     assert!(matches!(r.unwrap_err(), TxnError::LockNotAvailable { .. }));
 }
 
+// JE: LockManagerTest.testMultipleReaders -- a non-blocking READ succeeds
+// when only compatible (read) locks are held.
 #[test]
 fn non_blocking_succeeds_for_reader_when_no_conflict() {
     let lm = lm();
@@ -94,6 +98,8 @@ fn non_blocking_succeeds_for_reader_when_no_conflict() {
     assert_eq!(r.unwrap(), LockGrantType::New);
 }
 
+// JE: LockManagerTest.testNonBlockingLock1 -- a non-blocking WRITE request
+// against a held READ (by another locker) is DENIED (no waiter enqueued).
 #[test]
 fn non_blocking_fails_when_read_held_by_other_and_write_requested() {
     let lm = lm();
@@ -297,6 +303,9 @@ fn concurrent_readers_all_granted() {
     }
 }
 
+// JE: LockManagerTest.testMultipleReadersSingleWrite1 / testWaitingLock --
+// a WRITE waits behind held READ lock(s) and is granted once the reader(s)
+// release.
 #[test]
 fn writer_blocked_then_released() {
     let lm = Arc::new(LockManager::new());
@@ -709,4 +718,70 @@ fn je_deadlock_intersection_one_common_locker() {
     for t in [t1, t2, t3] {
         lm.release_all_for_locker(t);
     }
+}
+
+// JE: LockManagerTest.testMultipleReadersSingleWrite2 -- two readers hold the
+// lock; a WRITE request (txn3) waits behind them; a FOURTH reader (txn4) that
+// arrives while txn3 is waiting must ALSO wait (a reader does not jump ahead of
+// a waiting writer -- the anti-starvation / fairness rule).  Once both original
+// readers release, txn3 gets the write, releases it, then txn4 gets its read.
+//
+// Noxu adaptation: driven with threads via LockManager, asserting (a) the late
+// reader txn4 does NOT complete while the two readers still hold + txn3 waits
+// (it is enqueued behind the writer, not granted), and (b) every waiter is
+// ultimately granted (no thread hangs; all join).
+#[test]
+fn je_multiple_readers_single_write_reader_behind_writer_waits() {
+    let lm = Arc::new(LockManager::with_lock_timeout(5000));
+    const LSN: u64 = 0xABCD;
+
+    // Two readers hold the lock.
+    lm.lock(LSN, 1, LockType::Read, false, false).unwrap();
+    lm.lock(LSN, 2, LockType::Read, false, false).unwrap();
+
+    // txn3 requests WRITE -> waits behind the two readers.
+    let lm3 = Arc::clone(&lm);
+    let w =
+        thread::spawn(move || lm3.lock(LSN, 3, LockType::Write, false, false));
+    // Let txn3 enqueue as a waiter.
+    thread::sleep(Duration::from_millis(80));
+
+    // txn4 requests READ while txn3 is waiting -> must ALSO wait (behind the
+    // writer), not be granted immediately despite compatible readers holding.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let lm4 = Arc::clone(&lm);
+    let r = thread::spawn(move || {
+        let res = lm4.lock(LSN, 4, LockType::Read, false, false);
+        let _ = tx.send(());
+        res
+    });
+
+    // While the two readers still hold and txn3 waits, txn4 must NOT complete
+    // (it is queued behind the writer).  Give it a generous window.
+    let early = rx.recv_timeout(Duration::from_millis(300));
+    assert!(
+        early.is_err(),
+        "reader txn4 must wait behind the pending writer txn3 (fairness), \
+         but it was granted while the readers still held the lock"
+    );
+
+    // Release both original readers; txn3's write is now grantable.
+    lm.release(LSN, 1).unwrap();
+    lm.release(LSN, 2).unwrap();
+
+    // txn3 gets the write, then releases so txn4 can proceed.
+    let r3 = w.join().unwrap();
+    assert!(
+        r3.is_ok(),
+        "writer txn3 must be granted after readers release: {r3:?}"
+    );
+    lm.release(LSN, 3).unwrap();
+
+    // txn4 finally gets its read.
+    let r4 = r.join().unwrap();
+    assert!(
+        r4.is_ok(),
+        "reader txn4 must be granted after the writer releases: {r4:?}"
+    );
+    lm.release(LSN, 4).ok();
 }
