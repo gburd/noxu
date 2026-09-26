@@ -115,8 +115,10 @@ fn setup(ack_upto: u64) -> Harness {
     let chan_replica: Arc<dyn noxu_rep::net::Channel> =
         Arc::new(pair.channel_b);
 
-    master_env
-        .register_feeder_channel("target".to_string(), Arc::clone(&chan_master));
+    master_env.register_feeder_channel(
+        "target".to_string(),
+        Arc::clone(&chan_master),
+    );
     master_env.become_master(1).unwrap();
 
     // Master replicates 5 entries (advances master VLSN to 5 and streams
@@ -157,11 +159,7 @@ fn setup(ack_upto: u64) -> Harness {
         ack_upto,
         "target's observed acked VLSN must settle at {ack_upto}"
     );
-    assert_eq!(
-        master_env.get_current_vlsn(),
-        5,
-        "master must be at VLSN 5"
-    );
+    assert_eq!(master_env.get_current_vlsn(), 5, "master must be at VLSN 5");
 
     Harness {
         master_env,
@@ -219,10 +217,8 @@ fn transfer_master_refuses_lagging_target() {
 fn transfer_master_succeeds_when_target_caught_up() {
     let h = setup(5);
 
-    let cfg = MasterTransferConfig::new(
-        "target".to_string(),
-        Duration::from_secs(5),
-    );
+    let cfg =
+        MasterTransferConfig::new("target".to_string(), Duration::from_secs(5));
     let start = Instant::now();
     let res = Arc::clone(&h.master_env).transfer_master(cfg);
     let elapsed = start.elapsed();

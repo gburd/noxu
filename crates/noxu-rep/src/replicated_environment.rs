@@ -3337,11 +3337,18 @@ impl ReplicatedEnvironment {
     ///
     ///
     ///
-    /// Transfers the current master state from this node to one of the
-    /// electable replicas. The replica that is actually chosen to be the new
-    /// master is the one with which the Master Transfer can be completed most
-    /// rapidly. The transfer operation ensures that all changes at this node
-    /// are available at the new master upon conclusion of the operation.
+    /// Transfers the current master state from this node to the target
+    /// electable replica. The transfer operation ensures that all changes at
+    /// this node are available at the new master upon conclusion of the
+    /// operation: before handing off, it WAITS (bounded by `config.timeout`)
+    /// for the target's replicated VLSN to reach this master's current VLSN
+    /// (JE `MasterTransfer.VLSNProgress`, `MasterTransfer.java:254-283`). If
+    /// the target does not catch up within the timeout the transfer is
+    /// REFUSED (returns `Err`) and this node stays master — handing off to a
+    /// lagging replica would lose this master's most recent committed,
+    /// acknowledged commits when it later re-syncs as a replica (audit
+    /// B5/V16/F1). Set `config.force` to skip the wait and hand off
+    /// unconditionally (operator explicitly accepts the risk).
     pub fn transfer_master(&self, config: MasterTransferConfig) -> Result<()> {
         if self.is_shutdown() {
             return Err(RepError::StateError(
@@ -3362,19 +3369,24 @@ impl ReplicatedEnvironment {
             config.target_node,
         );
 
-        // Closes finding F7 of the 2026 review.
+        // Closes finding F7 of the 2026 review; catch-up wait closes
+        // finding B5/V16/F1.
         //
         // Steps:
         //   1. Locate the target's address.
-        //   2. Compute the new term (current observed term + 1).
-        //   3. Send TRANSFER_MASTER to the target — it will become master.
-        //   4. Send TRANSFER_MASTER (with the same term + new master name) to
+        //   2. Wait for the target to catch up to the master's VLSN (below);
+        //      abort the transfer if it does not within config.timeout.
+        //   3. Compute the new term (current observed term + 1).
+        //   4. Send TRANSFER_MASTER to the target — it will become master.
+        //   5. Send TRANSFER_MASTER (with the same term + new master name) to
         //      every other peer so they re-target.
-        //   5. Demote self to Replica of the target.
+        //   6. Demote self to Replica of the target.
         //
-        // The transfer is best-effort: a peer that doesn't ack is logged
-        // and skipped.  The election driver will reconcile any divergence
-        // on the next election round.
+        // The catch-up wait (step 2) is mandatory unless config.force is set:
+        // handing off to a lagging replica would lose this master's most
+        // recent committed data. The peer notifications in step 5 remain
+        // best-effort (a peer that doesn't ack is logged and skipped; the
+        // election driver reconciles any divergence on the next round).
 
         let target_addr = self
             .group_service
@@ -3392,6 +3404,73 @@ impl ReplicatedEnvironment {
                     config.target_node
                 ))
             })?;
+
+        // -------------------------------------------------------------
+        // B5 / V16 / F1: WAIT for the target to catch up before handing off.
+        //
+        // JE `MasterTransfer` tracks each ready replica's VLSN progress
+        // (`MasterTransfer.java:254-283`, `VLSNProgress`) and only completes
+        // the transfer to a replica that has caught up to the master's commit
+        // VLSN.  Without this wait the transfer is "best-effort": handing off
+        // to a LAGGING replica makes it master missing the old master's most
+        // recent commits, and those commits are then rolled back on the old
+        // master when it re-syncs as a replica -- loss of COMMITTED,
+        // acknowledged data.
+        //
+        // We reuse the same catch-up mechanism `shutdown_group` uses (M-4):
+        // the target's acked VLSN is observed via its `FeederRunner`
+        // (`active_feeder_runner_acked_vlsn`) and compared to the master's
+        // current VLSN (`vlsn_index.get_range().last()`).  If the target does
+        // not reach the master's VLSN within `config.timeout`, we ABORT the
+        // transfer (return an error) WITHOUT demoting self or promoting the
+        // lagging node.  `config.force` bypasses the wait for the operator
+        // who explicitly accepts the risk (JE `force`).
+        let master_vlsn = self.vlsn_index.get_range().last();
+        if master_vlsn > 0 && !config.force {
+            let has_runner = self
+                .active_feeder_runners
+                .lock()
+                .unwrap()
+                .contains_key(config.target_node.as_str());
+            if !has_runner {
+                // No observable VLSN-progress source for the target: we cannot
+                // verify it has caught up, so we must not hand off blind.
+                return Err(RepError::StateError(format!(
+                    "transfer_master: cannot verify target '{}' has caught up \\
+                     (no active feeder); refusing hand-off to avoid data loss \\
+                     (use force to override)",
+                    config.target_node
+                )));
+            }
+            let deadline = std::time::Instant::now() + config.timeout;
+            loop {
+                let acked =
+                    self.active_feeder_runner_acked_vlsn(&config.target_node);
+                if acked >= master_vlsn {
+                    log::info!(
+                        "transfer_master: target '{}' caught up to VLSN {} \\
+                         (master VLSN {})",
+                        config.target_node,
+                        acked,
+                        master_vlsn,
+                    );
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(RepError::StateError(format!(
+                        "transfer_master: target '{}' did not catch up within \\
+                         {}ms (acked VLSN {} < master VLSN {}); refusing \\
+                         hand-off to avoid data loss",
+                        config.target_node,
+                        config.timeout.as_millis(),
+                        acked,
+                        master_vlsn,
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        // -------------------------------------------------------------
 
         let new_term = self.master_tracker.get_term().saturating_add(1);
 
