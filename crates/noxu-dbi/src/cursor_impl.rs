@@ -450,7 +450,33 @@ impl CursorImpl {
     fn apply_tree_insert(&self, key: Vec<u8>, data: Vec<u8>, new_lsn: Lsn) {
         let db = self.db_impl.read();
         if let Some(tree) = db.get_real_tree() {
-            if let Ok(is_new) = tree.insert(key.clone(), data, new_lsn)
+            // NEW-10: `tree.insert` returns `Err(SplitRequired)` when the
+            // target child slot is transiently non-resident (e.g. the
+            // background evictor detached the child between our descent and
+            // the child fetch).  The tree's insert descent now re-faults a
+            // detached child itself, so `SplitRequired` should not reach here
+            // for that reason any more; but if a transient restructure ever
+            // does surface it, we MUST NOT silently swallow the result — that
+            // durably drops an already-logged, already-committed record.
+            // Retry a bounded number of times (re-descending the current
+            // topology), matching JE's re-descend-until-inserted behaviour.
+            let mut result = tree.insert(key.clone(), data.clone(), new_lsn);
+            let mut attempts = 0u32;
+            while matches!(result, Err(noxu_tree::TreeError::SplitRequired))
+                && attempts < 64
+            {
+                attempts += 1;
+                result = tree.insert(key.clone(), data.clone(), new_lsn);
+            }
+            // The insert must eventually succeed; a persistent failure is a
+            // tree-structure bug, not a legitimate outcome.  Surface it loudly
+            // rather than silently losing the committed record (NEW-10).
+            debug_assert!(
+                result.is_ok(),
+                "apply_tree_insert: tree.insert failed after {attempts} retries \
+                 for key {key:?}: {result:?}"
+            );
+            if let Ok(is_new) = result
                 && is_new
             {
                 db.increment_entry_count();
