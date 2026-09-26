@@ -5519,9 +5519,11 @@ impl Tree {
                             guard = next_guard;
                             continue;
                         }
-                        None => {
-                            (NodeArcReadGuard::rwlock(&guard).clone(), last, sep)
-                        }
+                        None => (
+                            NodeArcReadGuard::rwlock(&guard).clone(),
+                            last,
+                            sep,
+                        ),
                     }
                 }
                 TreeNode::Bottom(_) => unreachable!(),

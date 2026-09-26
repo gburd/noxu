@@ -774,9 +774,8 @@ fn cursor_range_seek_under_eviction_finds_all_from_mid() {
     let mut expect = start;
     let mut count = 0usize;
     while st == OperationStatus::Success {
-        let k: usize = String::from_utf8_lossy(key.data())
-            .parse()
-            .expect("numeric key");
+        let k: usize =
+            String::from_utf8_lossy(key.data()).parse().expect("numeric key");
         assert_eq!(k, expect, "range scan must be gap-free from mid-point");
         assert_eq!(data.data(), &val[..], "range-scanned data must be full");
         expect += 1;
@@ -789,7 +788,6 @@ fn cursor_range_seek_under_eviction_finds_all_from_mid() {
         "range scan from mid-point must visit every remaining record"
     );
 }
-
 
 /// NEW-9 (cursor<->evictor cross-BIN-advance race) -- RUNNABLE reproduction,
 /// ignored because it is ~50% flaky and DAEMON-DEPENDENT.
@@ -843,8 +841,7 @@ fn cursor_scan_with_evictor_daemon_skips_no_records_new9() {
         let mut key = DatabaseEntry::new();
         let mut data = DatabaseEntry::new();
         let mut count = 0usize;
-        let mut st =
-            cursor.get(&mut key, &mut data, Get::First, None).unwrap();
+        let mut st = cursor.get(&mut key, &mut data, Get::First, None).unwrap();
         while st == OperationStatus::Success {
             count += 1;
             st = cursor.get(&mut key, &mut data, Get::Next, None).unwrap();

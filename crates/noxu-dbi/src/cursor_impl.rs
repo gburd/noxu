@@ -3128,8 +3128,8 @@ impl CursorImpl {
                                 use noxu_tree::tree::TreeNode;
                                 // Use the current raw_key to find the BIN
                                 // (re-faulting an evicted child, NEW-8).
-                                Self::find_bin_for_key(&tree, &raw_key).and_then(
-                                    |bin_arc| {
+                                Self::find_bin_for_key(&tree, &raw_key)
+                                    .and_then(|bin_arc| {
                                         let g = bin_arc.read();
                                         match &*g {
                                             TreeNode::Bottom(bin) => {
@@ -3143,11 +3143,13 @@ impl CursorImpl {
                                                     let i = idx as usize;
                                                     Some((
                                                         bin.get_full_key(i)
-                                                            .unwrap_or_default(),
+                                                            .unwrap_or_default(
+                                                            ),
                                                         bin.entries[i]
                                                             .data
                                                             .clone()
-                                                            .unwrap_or_default(),
+                                                            .unwrap_or_default(
+                                                            ),
                                                         idx,
                                                         bin.get_lsn(i).as_u64(),
                                                     ))
@@ -3155,8 +3157,7 @@ impl CursorImpl {
                                             }
                                             _ => None,
                                         }
-                                    },
-                                )
+                                    })
                             }
                         } else {
                             None
