@@ -9,7 +9,7 @@
 
 use noxu_db::{
     Database, DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
-    OperationStatus,
+    EnvironmentMutableConfig, OperationStatus,
 };
 use tempfile::TempDir;
 
@@ -515,4 +515,145 @@ fn stripped_ln_refetch_roundtrips() {
         &value[..],
         "stripped LN must re-fetch byte-identical data from the log"
     );
+}
+
+// ===========================================================================
+// NEW-7 regression: bounded eviction must CONVERGE (JE Evictor.doEvict loop).
+// ===========================================================================
+
+/// NEW-7: a bounded number of `env.evict_memory()` calls must drive resident
+/// cache usage down to (a small multiple of) the budget, AND must actually
+/// evict dirty BINs under sustained pressure.
+///
+/// Root cause (confirmed): `Evictor::do_evict` ran ONE capped `evict_batch`
+/// per call (batch size = `EVICTOR_NODES_PER_SCAN`, default 10).  With the
+/// primary LRU >> the batch size, phase-1 LN-stripping exhausted the batch
+/// before phase-2 drained the pri2 dirty-BIN LRU, so each call evicted only
+/// ~10 nodes (~5 KB) even when the cache was ~8x over budget with thousands of
+/// dirty BINs parked in pri2.  A single `evict_memory()` therefore left the
+/// cache multiples over budget; converging required hundreds of calls.  JE's
+/// `Evictor.doEvict` LOOPS `evictBatch` while the eviction pledge is nonzero,
+/// so one call converges.
+///
+/// Fixture regime (matches the finding): fanout 8 -> many tiny dirty BINs;
+/// daemons OFF so `evict_memory()` is the ONLY eviction path (deterministic);
+/// no checkpointer so the BINs stay dirty (must be flushed+evicted, exercising
+/// the phase-2 pri2 drain).  The runtime budget is lowered below the resident
+/// BIN structure via `set_mutable_config` (which bypasses the 1 MiB
+/// construction floor), so convergence *requires* reaching phase-2 and
+/// evicting dirty BINs.
+///
+/// FAILS on base cb0b5cac: after 3 `evict_memory()` calls the cache is still
+/// ~8x over budget (each call reclaims only ~10 nodes).
+/// PASSES after the do_evict loop fix: one call converges to <= ~1.5x budget
+/// and `dirty_nodes_evicted > 0`.
+#[test]
+fn bounded_eviction_converges_and_evicts_dirty_bins() {
+    let dir = TempDir::new().unwrap();
+    let mut cfg = EnvironmentConfig::new(dir.path().to_path_buf());
+    cfg.set_allow_create(true);
+    cfg.set_transactional(true);
+    cfg.set_cache_percent(0); // so set_cache_size takes effect
+    cfg.set_cache_size(2 * 1024 * 1024);
+    // Daemons OFF: evict_memory() is the ONLY eviction path (deterministic).
+    cfg.set_run_evictor(false);
+    cfg.set_run_cleaner(false);
+    cfg.set_run_checkpointer(false); // keep BINs dirty (no checkpoint clean)
+    cfg.set_node_max_entries(8); // fanout 8 -> many tiny dirty BINs
+    let mut env = Environment::open(cfg).expect("open env");
+    let db = env
+        .open_database(
+            None,
+            "new7",
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true)
+                .with_node_max_entries(8),
+        )
+        .expect("open db");
+
+    // ~40k tiny records -> thousands of dirty BINs, resident structure ~1 MiB.
+    let n = 40_000usize;
+    let val = vec![0u8; 64];
+    let mut i = 0usize;
+    while i < n {
+        let end = (i + 1000).min(n);
+        let txn = env.begin_transaction(None).unwrap();
+        for j in i..end {
+            let k = DatabaseEntry::from_vec(format!("{:012}", j).into_bytes());
+            db.put_in(&txn, &k, DatabaseEntry::from_bytes(&val)).unwrap();
+        }
+        txn.commit().unwrap();
+        i = end;
+    }
+
+    // Lower the runtime budget below the resident BIN structure. This uses
+    // arbiter.set_max_memory (bypasses the 1 MiB construction floor), so
+    // convergence now REQUIRES draining the pri2 dirty-BIN LRU (phase-2).
+    let budget = 128 * 1024i64;
+    env.set_mutable_config(
+        EnvironmentMutableConfig::new().with_cache_size(budget as usize),
+    )
+    .unwrap();
+
+    let before = env.cache_usage_bytes().unwrap();
+    assert!(
+        before as f64 > 4.0 * budget as f64,
+        "fixture must start well over budget; before={before} budget={budget}"
+    );
+
+    // Bounded number of eviction calls. JE's doEvict converges in ONE call;
+    // the pre-fix single-batch behaviour reclaims ~10 nodes/call and needs
+    // hundreds of calls, so 3 calls is nowhere near enough on base.
+    for _ in 0..3 {
+        let _ = env.evict_memory().unwrap();
+    }
+    let after = env.cache_usage_bytes().unwrap();
+    let s = env.stats().unwrap().evictor;
+    eprintln!(
+        "NEW-7 CONVERGE: budget={budget} before={before} after={after} \
+         ratio={:.2} targeted={} stripped={} evicted={} dirty_evicted={} \
+         moved_pri2={} pri1={} pri2={}",
+        after as f64 / budget as f64,
+        s.nodes_targeted,
+        s.nodes_stripped,
+        s.nodes_evicted,
+        s.dirty_nodes_evicted,
+        s.nodes_moved_to_pri2_lru,
+        s.pri1_lru_size,
+        s.pri2_lru_size,
+    );
+
+    // CONVERGENCE: a bounded number of evict_memory() calls must drive resident
+    // usage down to near the budget. 2x is a generous ceiling that the JE loop
+    // clears easily (measured ~1x) while the pre-fix ~8x fails wide.
+    assert!(
+        (after as f64) <= 2.0 * budget as f64,
+        "NEW-7: bounded eviction must converge toward budget; got {after} bytes \
+         ({:.2}x budget {budget}) after 3 evict_memory() calls (pre-fix ~8x: a \
+         single capped evict_batch per call reclaims ~10 nodes while thousands \
+         of dirty BINs pile in pri2)",
+        after as f64 / budget as f64,
+    );
+
+    // DIRTY-BIN EVICTION: convergence under this dirty workload is only
+    // possible by flushing+evicting dirty BINs from pri2 (phase-2 drain).
+    assert!(
+        s.dirty_nodes_evicted > 0,
+        "NEW-7: sustained pressure must evict dirty BINs (phase-2 pri2 drain); \
+         dirty_nodes_evicted={} (pre-fix: phase-2 rarely reached)",
+        s.dirty_nodes_evicted,
+    );
+
+    // CORRECTNESS (sacred): every sampled record must still re-fetch (evicted
+    // nodes are recoverable from the log).
+    for i in (0..n).step_by(97) {
+        let k = DatabaseEntry::from_vec(format!("{:012}", i).into_bytes());
+        let mut out = DatabaseEntry::new();
+        assert!(
+            db.get_into(None, &k, &mut out).unwrap(),
+            "record {i} must survive eviction"
+        );
+        assert_eq!(out.data(), &val[..], "record {i} data intact");
+    }
 }
