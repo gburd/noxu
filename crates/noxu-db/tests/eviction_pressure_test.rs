@@ -818,10 +818,11 @@ fn cursor_range_seek_under_eviction_finds_all_from_mid() {
 /// NEW-9 named (the original NEW-9 note's "point-get 100% / verify clean / no
 /// on-disk loss" does not hold; see new9-fix.md for the evidence).
 ///
-/// Kept `#[ignore]`d and pointed at the evictor durable-loss bug (NEW-10).
+/// Now a live regression guard: NEW-10 (evictor-detach vs insert durable loss)
+/// and NEW-9 (cursor cross-BIN pin) are both fixed and merged, so a
+/// daemon-concurrent full scan visits every record (verified 5/5 on main).
 /// Un-ignore only when that evictor concurrency bug is fixed (this test does
 /// not fail on the cursor race any longer).
-#[ignore = "NEW-10 (evictor DURABLE data-loss under daemon-vs-foreground eviction concurrency, HIGH): evict_memory() concurrent with the background evictor daemon intermittently DURABLY loses ONE record (~1/6-1/8; survives close+reopen; point-get FALSE). NOT the NEW-9 cursor cross-BIN race (that is fixed + shuttle-proven) and NOT NEW-8: reproduces with evict_memory alone (no cursor) and NOT with run_evictor=false (single-threaded, 0 loss). The original NEW-9 note's 'point-get 100%/verify clean' is contradicted by measurement. See new9-fix.md. Un-ignore when the evictor concurrency loss is fixed."]
 #[test]
 fn cursor_scan_with_evictor_daemon_skips_no_records_new9() {
     use noxu_db::Get;

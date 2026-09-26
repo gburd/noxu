@@ -89,6 +89,13 @@ listed in [References](#references).
   insert result is no longer discarded, so a committed transaction's record
   cannot silently fail to land. Proven with a point-get-after-reopen regression
   and an exhaustive concurrency (shuttle) model of evictor-detach vs insert.
+- **Cursor scans no longer skip a record while the evictor runs (NEW-9).** When a
+  scan crossed a BIN boundary it briefly held no pin on the BIN it was advancing
+  into, so a concurrent evictor could detach that BIN and the scan would skip a
+  boundary record. The cursor now pins the next BIN before releasing the current
+  one (matching JE), so the evictor's in-use guard protects it; proven by a
+  concurrency (shuttle) model. Together with the durable-loss fix above, a full
+  scan under the default background evictor now visits every record.
 
 - **WAL now fail-stops the environment on a critical log-write failure (JE
   `LogManager.serialLog` parity).** A failed or partial WAL write previously left
