@@ -323,16 +323,6 @@ fn split_aunt_recovers() {
 /// INa that still references obsolete BINs). Recover and assert data +
 /// structure.
 #[test]
-#[ignore = "KNOWN BUG NEW-4 (reverse-split-recovery-loss), NOT flaky. \
-            NEW-2 de-vacuuming unmasked a latent production data-loss bug: \
-            after empty-BIN compress (reverse split) + right split, reopen \
-            recovers the EMPTY set (0 of 23 committed keys) at NODE_MAX=4, \
-            silently (env.verify() reports 0 errors). Reproduces in debug AND \
-            release, and even on a CLEAN checkpointed close (not just crash). \
-            Latent on main today only because recovery forces fanout 256 \
-            (single BIN, so the reverse-split topology never forms). Fix the \
-            reverse-split/empty-BIN-compress recovery path separately; do NOT \
-            re-vacuum by reverting the NODE_MAX fanout fix."]
 fn reverse_split_recovers() {
     const NODE_MAX: u32 = 4;
     let dir = TempDir::new().unwrap();
@@ -392,6 +382,98 @@ fn reverse_split_recovers() {
         recovered, expected,
         "reverse-split: recovered set != expected committed set"
     );
+}
+
+/// Crash variant of `reverse_split_recovers`: identical topology, but the
+/// producer environment is torn down by **dropping the handles WITHOUT a
+/// clean `close()`** — `EnvironmentImpl::Drop` takes no final checkpoint
+/// (unlike `close()`), so recovery must reconstruct the committed set from
+/// the WAL and the pre-compress checkpoint alone, not from a close-time
+/// checkpoint that could mask a defect (REMEDIATION-BRIEF: controls must not
+/// get repaired by normal close/checkpoint when testing crash durability).
+///
+/// The committed 23 keys are durable because each `put`/`delete` is an
+/// autocommit transaction whose commit fsyncs the WAL.  Asserts the exact
+/// key+value set via BOTH the cursor full-scan (`recover_and_collect`) AND a
+/// direct point-get sweep, so the check does not rely solely on the traversal
+/// path that NEW-4 broke.
+#[test]
+fn reverse_split_recovers_crash() {
+    const NODE_MAX: u32 = 4;
+    let dir = TempDir::new().unwrap();
+    let max = 12u32;
+    let mut expected = BTreeMap::new();
+
+    {
+        let env = open_env(dir.path(), NODE_MAX);
+        let db = open_db(&env);
+
+        for i in 0u32..max {
+            let k = ikey(i);
+            put(&db, &k, &k);
+            expected.insert(k.clone().into_bytes(), k.into_bytes());
+        }
+
+        // Empty the leftmost BIN (delete first two keys via cursor).
+        {
+            let mut c = db.open_cursor(None).unwrap();
+            let mut key = DatabaseEntry::new();
+            let mut val = DatabaseEntry::new();
+            for _ in 0..2 {
+                let s = c.get(&mut key, &mut val, Get::First, None).unwrap();
+                assert_eq!(s, OperationStatus::Success);
+                let removed = key.data_opt().unwrap().to_vec();
+                assert_eq!(c.delete().unwrap(), OperationStatus::Success);
+                expected.remove(&removed);
+            }
+            c.close().unwrap();
+        }
+
+        // Checkpoint (recovery relies on INs for the deletes), then compress
+        // out the empty BIN (reverse split), then split the right branch.
+        env.checkpoint(Some(&CheckpointConfig::new().with_force(true)))
+            .unwrap();
+        let _ = env.compress().unwrap();
+        for i in max..(max + 13) {
+            let k = ikey(i);
+            put(&db, &k, &k);
+            expected.insert(k.clone().into_bytes(), k.into_bytes());
+        }
+
+        // CRASH: drop without close() — no final checkpoint (Drop path).
+        drop(db);
+        drop(env);
+    }
+
+    // Recover: cursor full-scan set must equal the committed set …
+    let recovered = recover_and_collect(dir.path(), NODE_MAX, 2);
+    assert_eq!(
+        recovered, expected,
+        "reverse-split crash: recovered set != expected committed set"
+    );
+
+    // … and a direct point-get sweep must find every committed key/value and
+    // NOT find the two deleted keys (independent of the scan path).
+    let env = open_env(dir.path(), NODE_MAX);
+    let db = open_db(&env);
+    for i in 0u32..(max + 13) {
+        let k = ikey(i);
+        let got = db.get(k.as_bytes()).unwrap();
+        if expected.contains_key(k.as_bytes()) {
+            assert_eq!(
+                got.as_deref(),
+                Some(k.as_bytes()),
+                "reverse-split crash: committed key {k} must return its value"
+            );
+        } else {
+            assert!(
+                got.is_none(),
+                "reverse-split crash: deleted key {k} must not be present"
+            );
+        }
+    }
+    db.close().unwrap();
+    env.close().unwrap();
 }
 
 /// JE `CheckReverseSplitsTest.testCompleteRemoval` (`setupCompleteRemoval`):
@@ -469,4 +551,171 @@ fn complete_removal_recovers() {
         recovered, expected,
         "complete-removal: recovered set != expected committed set"
     );
+}
+
+// ---------------------------------------------------------------------------
+// NEW-4 §3 — multiple CONSECUTIVE physically-empty edge BINs
+//
+// The NEW-4 fix crosses exactly ONE empty leading/trailing BIN.  When two or
+// more CONSECUTIVE edge BINs are physically empty (delete >= 5 leading keys at
+// NODE_MAX=4 with no compress → 1st BIN fully empty AND 2nd BIN now empty),
+// the forward `Get::First` scan silently returns 0 while live keys remain —
+// the same visibility class NEW-4 targets, just at N >= 2 empty edge BINs.
+//
+// JE has no such gap: `Cursor.getNext`/`getPrev` is a WHILE-LOOP that skips
+// ANY number of empty BINs — on an empty crossed-into BIN it sets index=-1,
+// re-tests `++index < getNEntries()`, and calls `getNextBin`/`getPrevBin`
+// AGAIN (CursorImpl.java getNext ~line 2546 / getPrev loop), not a single
+// cross.
+//
+// Method: deletes use POINT `db.delete` (NOT a cursor delete-all loop) to
+// avoid the separate NEW-3 cross-BIN-cursor-delete path, and NO compress
+// runs, so the emptied BINs stay physically present (n_entries == 0).  The
+// point-get sweep must already find every live key (data is on disk) —
+// proving this is a cursor-traversal bug, not durability.
+// ---------------------------------------------------------------------------
+
+/// Delete `n` leading keys via point `db.delete`, leaving >= 2 CONSECUTIVE
+/// leftmost BINs physically empty; the forward `Get::First`+`Get::Next` scan
+/// must still find EVERY remaining live key.  FAILS on tip 48784649 (scan
+/// returns 0 once the 2nd leading BIN empties); PASSES after the loop fix.
+#[test]
+fn get_first_crosses_multiple_empty_leading_bins() {
+    const NODE_MAX: u32 = 4;
+    let dir = TempDir::new().unwrap();
+    // 16 keys @ NODE_MAX=4 ≈ 4 BINs of 4 keys each.
+    let total = 16u32;
+    // Delete 5 leading keys: 1st BIN fully empty, 2nd BIN loses its first
+    // slot — but the reviewer's sweep showed delete_n=5 empties the 2nd BIN
+    // too under this geometry.  Use 6 to unambiguously empty >= 2 BINs.
+    let delete_n = 6u32;
+
+    let env = open_env(dir.path(), NODE_MAX);
+    let db = open_db(&env);
+    let mut expected: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    for i in 0u32..total {
+        let k = ikey(i);
+        put(&db, &k, &k);
+        expected.insert(k.clone().into_bytes(), k.into_bytes());
+    }
+    // Genuine split geometry (else the test is vacuous — single fat BIN).
+    assert_multi_bin(&db, 3);
+
+    // Point-delete the leading keys (no cursor, no compress).
+    for i in 0u32..delete_n {
+        let k = ikey(i);
+        assert!(
+            db.delete(k.as_bytes()).unwrap(),
+            "point-delete of leading key {k} must succeed"
+        );
+        expected.remove(k.as_bytes());
+    }
+    assert!(
+        expected.len() as u32 == total - delete_n && !expected.is_empty(),
+        "expected {} live keys after deleting {delete_n} leading",
+        total - delete_n
+    );
+
+    // Point-get sweep: every live key IS on disk (proves it's a cursor bug,
+    // not durability), and deleted keys are gone.
+    for i in 0u32..total {
+        let k = ikey(i);
+        let got = db.get(k.as_bytes()).unwrap();
+        if expected.contains_key(k.as_bytes()) {
+            assert_eq!(
+                got.as_deref(),
+                Some(k.as_bytes()),
+                "point-get: live key {k} must be present (data on disk)"
+            );
+        } else {
+            assert!(got.is_none(), "point-get: deleted key {k} must be gone");
+        }
+    }
+
+    // The actual regression: forward cursor scan must find the EXACT live set,
+    // crossing >= 2 consecutive empty leading BINs.
+    let scanned = collect_all(&db);
+    assert_eq!(
+        scanned, expected,
+        "Get::First forward scan must cross ALL empty leading BINs and find \
+         every live key (NEW-4 §3 multi-empty-BIN gap)"
+    );
+
+    db.close().unwrap();
+    env.close().unwrap();
+}
+
+/// Symmetric: delete `n` TRAILING keys, leaving >= 2 CONSECUTIVE rightmost
+/// BINs physically empty; the backward `Get::Last`+`Get::Prev` scan must find
+/// EVERY remaining live key.
+#[test]
+fn get_last_crosses_multiple_empty_trailing_bins() {
+    const NODE_MAX: u32 = 4;
+    let dir = TempDir::new().unwrap();
+    let total = 16u32;
+    let delete_n = 6u32;
+
+    let env = open_env(dir.path(), NODE_MAX);
+    let db = open_db(&env);
+    let mut expected: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    for i in 0u32..total {
+        let k = ikey(i);
+        put(&db, &k, &k);
+        expected.insert(k.clone().into_bytes(), k.into_bytes());
+    }
+    assert_multi_bin(&db, 3);
+
+    // Point-delete the trailing keys.
+    for i in (total - delete_n)..total {
+        let k = ikey(i);
+        assert!(
+            db.delete(k.as_bytes()).unwrap(),
+            "point-delete of trailing key {k} must succeed"
+        );
+        expected.remove(k.as_bytes());
+    }
+    assert!(
+        expected.len() as u32 == total - delete_n && !expected.is_empty(),
+        "expected {} live keys after deleting {delete_n} trailing",
+        total - delete_n
+    );
+
+    // Point-get sweep (data on disk).
+    for i in 0u32..total {
+        let k = ikey(i);
+        let got = db.get(k.as_bytes()).unwrap();
+        if expected.contains_key(k.as_bytes()) {
+            assert_eq!(
+                got.as_deref(),
+                Some(k.as_bytes()),
+                "point-get: live key {k} must be present (data on disk)"
+            );
+        } else {
+            assert!(got.is_none(), "point-get: deleted key {k} must be gone");
+        }
+    }
+
+    // Backward cursor scan (Get::Last + Get::Prev) must find the EXACT live
+    // set, crossing >= 2 consecutive empty trailing BINs.
+    let mut cursor = db.open_cursor(None).unwrap();
+    let mut scanned: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    let mut key = DatabaseEntry::new();
+    let mut val = DatabaseEntry::new();
+    let mut status = cursor.get(&mut key, &mut val, Get::Last, None).unwrap();
+    while status == OperationStatus::Success {
+        scanned.insert(
+            key.data_opt().unwrap_or(&[]).to_vec(),
+            val.data_opt().unwrap_or(&[]).to_vec(),
+        );
+        status = cursor.get(&mut key, &mut val, Get::Prev, None).unwrap();
+    }
+    cursor.close().unwrap();
+    assert_eq!(
+        scanned, expected,
+        "Get::Last backward scan must cross ALL empty trailing BINs and find \
+         every live key (NEW-4 §3 multi-empty-BIN gap)"
+    );
+
+    db.close().unwrap();
+    env.close().unwrap();
 }

@@ -8094,7 +8094,17 @@ impl Tree {
                 return AdjacentBinOutcome::SplitRaceRetry;
             }
 
-            let sibling_idx = if forward {
+            // Scan siblings in edge order starting from the adjacent slot.
+            // A flat (2-level) tree keeps all its BINs as direct children of
+            // one parent, so consecutive empty edge BINs appear as adjacent
+            // SIBLING slots here — we must skip ALL of them at this level, not
+            // just the first, before ascending.  For each sibling sub-tree we
+            // descend to its edge-most NON-empty BIN; a wholly-empty sub-tree
+            // yields None and we move to the next sibling.  When this level's
+            // siblings are exhausted we ascend (continue) to the next level.
+            // Mirrors JE's getNext/getPrev while-loop skipping any number of
+            // consecutive empty BINs (NEW-4 §3).
+            let first_sibling = if forward {
                 taken_idx + 1
             } else if taken_idx == 0 {
                 // No left sibling at this level — ascend further.
@@ -8103,30 +8113,37 @@ impl Tree {
                 taken_idx - 1
             };
 
-            if forward && sibling_idx >= n_entries {
+            if forward && first_sibling >= n_entries {
                 // No right sibling at this level — ascend further.
                 continue;
             }
 
-            // Found a sibling slot — fetch the sibling child arc.
-            let sibling_arc = {
-                let g = parent_arc.read();
-                match &*g {
-                    TreeNode::Internal(p) => match p.get_child(sibling_idx) {
-                        Some(c) => c,
-                        None => {
-                            return AdjacentBinOutcome::NoAdjacent;
-                        }
-                    },
-                    _ => return AdjacentBinOutcome::NoAdjacent,
+            // Iterate siblings toward the edge of this level.
+            let mut sibling_idx = first_sibling as i64;
+            loop {
+                if sibling_idx < 0 || sibling_idx >= n_entries as i64 {
+                    break; // level exhausted — ascend further
                 }
-            };
-
-            // Descend to the leftmost (forward) or rightmost (!forward) BIN.
-            return match Self::descend_to_edge_bin(&sibling_arc, forward) {
-                Some(v) => AdjacentBinOutcome::Found(v),
-                None => AdjacentBinOutcome::NoAdjacent,
-            };
+                let sibling_arc = {
+                    let g = parent_arc.read();
+                    match &*g {
+                        TreeNode::Internal(p) => {
+                            match p.get_child(sibling_idx as usize) {
+                                Some(c) => c,
+                                None => return AdjacentBinOutcome::NoAdjacent,
+                            }
+                        }
+                        _ => return AdjacentBinOutcome::NoAdjacent,
+                    }
+                };
+                if let Some(v) =
+                    Self::descend_to_edge_bin(&sibling_arc, forward)
+                {
+                    return AdjacentBinOutcome::Found(v);
+                }
+                // Sibling sub-tree entirely empty — try the next sibling.
+                sibling_idx += if forward { 1 } else { -1 };
+            }
         }
 
         // Exhausted path without finding a sibling → no adjacent BIN.
@@ -8134,67 +8151,112 @@ impl Tree {
     }
 
     /// Descend to the leftmost BIN (`forward = true`) or rightmost BIN
-    /// (`forward = false`) in the sub-tree rooted at `node_arc`.
+    /// (`forward = false`) in the sub-tree rooted at `node_arc`, **skipping
+    /// physically-empty BINs** (`n_entries == 0`).
     ///
-    /// `Tree.searchSubTree(SearchType.LEFT / RIGHT, targetLevel)`.
+    /// `Tree.searchSubTree(SearchType.LEFT / RIGHT, targetLevel)` composed
+    /// with JE `getNextBinInternal`'s empty-leaf skipping.  A BIN whose every
+    /// slot was physically removed (e.g. every leading/trailing key deleted
+    /// but the BIN not yet pruned by the compressor) is NOT a valid stopping
+    /// point: JE's `Cursor.getNext`/`getPrev` while-loop calls
+    /// `getNextBin`/`getPrevBin` repeatedly, skipping ANY number of
+    /// consecutive empty BINs (CursorImpl.java `getNext` loop ~line 2546 /
+    /// `getPrev` loop; `Tree.getNextBinInternal` skips empty leaves).  We
+    /// mirror that here by walking siblings in edge order across the whole
+    /// sub-tree and returning the first NON-empty edge BIN's entries.  If
+    /// every BIN in the sub-tree is physically empty we return `None`, letting
+    /// the caller (`get_adjacent_bin_attempt` ascent) continue to the next
+    /// sibling sub-tree — so a run of empty edge BINs spanning multiple
+    /// parents is also crossed (NEW-4 §3).
+    ///
+    /// A KD-but-non-empty BIN (slots present, all `known_deleted`) is still
+    /// returned verbatim — the cursor's own cross loop re-anchors on its edge
+    /// key and continues (TREE-F1); only PHYSICALLY-empty BINs, which carry no
+    /// slot key to re-anchor on, are skipped here.
     fn descend_to_edge_bin(
         node_arc: &Arc<RwLock<TreeNode>>,
         forward: bool,
     ) -> Option<Vec<(BinEntry, Lsn, Vec<u8>)>> {
-        // Hand-over-hand latch coupling — see Tree::search.
-        let mut guard: NodeArcReadGuard = node_arc.read_arc();
-
-        loop {
+        // Iterative pre-order (forward) / reverse-order (backward) walk of the
+        // sub-tree, returning the first non-empty BIN in edge order.  A stack
+        // of child Arcs is used so we can backtrack to a sibling sub-tree when
+        // an edge BIN turns out to be empty, without needing a parent-pointer
+        // ascent.  Each node's read guard is held only while its children are
+        // cloned onto the stack (pinning them alive) and is dropped before the
+        // next node is latched; a concurrent split that appears between drop
+        // and re-latch is caught by the caller's `SplitRaceRetry` validation
+        // in `get_adjacent_bin_attempt` (the whole lookup retries from root).
+        let mut stack: Vec<Arc<RwLock<TreeNode>>> = vec![Arc::clone(node_arc)];
+        while let Some(arc) = stack.pop() {
+            let guard: NodeArcReadGuard = arc.read_arc();
             if guard.is_bin() {
-                return match &*guard {
-                    TreeNode::Bottom(b) => {
-                        // Return entries with full (decompressed) keys so that
-                        // callers always work with complete keys.
-                        //
-                        // TREE-F1: KD slots are NOT filtered here — the BIN's
-                        // slot indices are returned verbatim so the cursor can
-                        // skip KD slots itself (CursorImpl getNext loop;
-                        // CursorImpl.java:2062-2064) and continue to the next
-                        // BIN when an edge BIN is entirely KD during the
-                        // BIN-delta reconstitution window.
-                        let full_entries: Vec<(BinEntry, Lsn, Vec<u8>)> = (0
-                            ..b.entries.len())
-                            .map(|i| {
-                                (
-                                    BinEntry {
-                                        data: b.entries[i].data.clone(),
-                                        known_deleted: b.entries[i]
-                                            .known_deleted,
-                                        dirty: b.entries[i].dirty,
-                                        expiration_time: b.entries[i]
-                                            .expiration_time,
-                                    },
-                                    b.get_lsn(i),
-                                    b.get_full_key(i).unwrap_or_default(),
-                                )
-                            })
-                            .collect();
-                        Some(full_entries)
+                if let TreeNode::Bottom(b) = &*guard {
+                    // Skip a physically-empty BIN — it has no slot key to
+                    // anchor on, so returning it would make the cursor's cross
+                    // loop bail to NotFound (NEW-4 §3).  Continue to the next
+                    // sibling on the stack.
+                    if b.entries.is_empty() {
+                        continue;
                     }
-                    _ => None,
-                };
+                    // Return entries with full (decompressed) keys so that
+                    // callers always work with complete keys.
+                    //
+                    // TREE-F1: KD slots are NOT filtered here — the BIN's
+                    // slot indices are returned verbatim so the cursor can
+                    // skip KD slots itself (CursorImpl getNext loop;
+                    // CursorImpl.java:2062-2064) and continue to the next
+                    // BIN when an edge BIN is entirely KD during the
+                    // BIN-delta reconstitution window.
+                    let full_entries: Vec<(BinEntry, Lsn, Vec<u8>)> = (0..b
+                        .entries
+                        .len())
+                        .map(|i| {
+                            (
+                                BinEntry {
+                                    data: b.entries[i].data.clone(),
+                                    known_deleted: b.entries[i].known_deleted,
+                                    dirty: b.entries[i].dirty,
+                                    expiration_time: b.entries[i]
+                                        .expiration_time,
+                                },
+                                b.get_lsn(i),
+                                b.get_full_key(i).unwrap_or_default(),
+                            )
+                        })
+                        .collect();
+                    return Some(full_entries);
+                }
+                continue;
             }
 
-            let next = match &*guard {
-                TreeNode::Internal(n) => {
-                    if forward {
-                        n.get_child(0)?
-                    } else {
-                        n.get_child(n.entries.len().saturating_sub(1))?
+            // Internal node: push children so the edge-most child is popped
+            // FIRST.  For a forward (leftmost) walk we want child 0 popped
+            // first, so push children in REVERSE order (last pushed = child 0
+            // popped first).  For a backward (rightmost) walk we want the last
+            // child popped first, so push in FORWARD order.
+            if let TreeNode::Internal(n) = &*guard {
+                let count = n.entries.len();
+                if forward {
+                    for i in (0..count).rev() {
+                        if let Some(c) = n.get_child(i) {
+                            stack.push(c);
+                        }
+                    }
+                } else {
+                    for i in 0..count {
+                        if let Some(c) = n.get_child(i) {
+                            stack.push(c);
+                        }
                     }
                 }
-                _ => return None,
-            };
-            // Take child read lock BEFORE releasing parent's.
-            let next_guard = next.read_arc();
+            }
+            // Guard dropped at end of loop iteration (after pushing child Arcs,
+            // which hold their own refs) — hand-over-hand: children are pinned
+            // via Arc before this parent guard is released.
             drop(guard);
-            guard = next_guard;
         }
+        // Every BIN in this sub-tree is physically empty.
+        None
     }
 }
 

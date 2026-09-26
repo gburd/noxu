@@ -2114,31 +2114,56 @@ impl CursorImpl {
         }
     }
 
-    /// Descends from the given node to the rightmost BIN, returning its Arc.
+    /// Descends from the given node to the rightmost BIN, returning its Arc
+    /// together with an anchor key that routes back into that BIN.
+    ///
+    /// The anchor is the parent IN's highest separator key (the key at the
+    /// slot we descended through to reach the rightmost child).  It is needed
+    /// only when the rightmost BIN turns out to be **physically empty**
+    /// (`n_entries == 0`, e.g. after every slot was deleted but the BIN has
+    /// not yet been pruned): `get_last` then uses it as the anchor for
+    /// `retrieve_next(Prev)` → `get_prev_bin(anchor)`, mirroring JE
+    /// `CursorImpl.positionFirstOrLast` treating an empty edge BIN as
+    /// FOUND/index=-1 and letting getPrev cross to the previous BIN
+    /// (CursorImpl.java:1765-1772).  `None` when the rightmost BIN is the
+    /// root (single-BIN tree, no parent separator).
     fn descend_to_last_bin(
         node: std::sync::Arc<noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>>,
-    ) -> Option<std::sync::Arc<noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>>>
-    {
+    ) -> Option<(
+        std::sync::Arc<noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>>,
+        Option<Vec<u8>>,
+    )> {
         use noxu_tree::tree::TreeNode;
         let mut current = node;
+        let mut anchor: Option<Vec<u8>> = None;
         loop {
-            let (is_bin, child) = {
+            let (is_bin, child, sep) = {
                 let g = current.read();
                 let is_bin = g.is_bin();
-                let child = if !is_bin {
+                let (child, sep) = if !is_bin {
                     match &*g {
                         TreeNode::Internal(n) => {
-                            n.get_child(n.entries.len().saturating_sub(1))
+                            let last = n.entries.len().saturating_sub(1);
+                            (
+                                n.get_child(last),
+                                n.entries.get(last).map(|e| e.key.clone()),
+                            )
                         }
-                        _ => None,
+                        _ => (None, None),
                     }
                 } else {
-                    None
+                    (None, None)
                 };
-                (is_bin, child)
+                (is_bin, child, sep)
             };
             if is_bin {
-                return Some(current);
+                return Some((current, anchor));
+            }
+            // Remember the separator that routes into the rightmost child so
+            // an empty rightmost BIN can still be anchored for a backward
+            // cross.
+            if let Some(s) = sep {
+                anchor = Some(s);
             }
             current = child?;
         }
@@ -2178,7 +2203,27 @@ impl CursorImpl {
                             match &*g {
                                 TreeNode::Bottom(bin) => {
                                     if bin.entries.is_empty() {
-                                        return None;
+                                        // JE `CursorImpl.positionFirstOrLast`
+                                        // (CursorImpl.java:1765-1772): an
+                                        // empty leftmost BIN (every slot
+                                        // physically removed by delete, not
+                                        // yet pruned) is treated as FOUND with
+                                        // index=-1 — NOT not-found — so getNext
+                                        // crosses to the first live BIN to the
+                                        // right.  Anchor on the empty byte key
+                                        // (≤ every key, so it routes into this
+                                        // leftmost subtree) and delegate to
+                                        // retrieve_next, which crosses via
+                                        // get_next_bin.  Without this the scan
+                                        // returns NotFound even though live
+                                        // BINs exist (NEW-4).
+                                        return Some((
+                                            Vec::new(),
+                                            Bytes::new(),
+                                            -1i32,
+                                            0u64,
+                                            bin_arc.clone(),
+                                        ));
                                     }
                                     // TREE-F1: first LIVE slot, skipping
                                     // known_deleted slots
@@ -2296,14 +2341,34 @@ impl CursorImpl {
                 } else {
                     use noxu_tree::tree::TreeNode;
                     tree.get_root().and_then(|r| {
-                        let bin_arc = Self::descend_to_last_bin(r)?;
+                        let (bin_arc, empty_anchor) =
+                            Self::descend_to_last_bin(r)?;
                         let (key, data, idx, lsn) = {
                             let g = bin_arc.read();
                             match &*g {
                                 TreeNode::Bottom(bin) => {
                                     let n = bin.entries.len();
                                     if n == 0 {
-                                        return None;
+                                        // JE `CursorImpl.positionFirstOrLast`
+                                        // (CursorImpl.java:1765-1772): an
+                                        // empty rightmost BIN is treated as
+                                        // FOUND/index=-1 so getPrev crosses to
+                                        // the previous live BIN.  Anchor on
+                                        // the parent separator that routes
+                                        // into this rightmost subtree and
+                                        // delegate to retrieve_next(Prev),
+                                        // which crosses via get_prev_bin.
+                                        // (Symmetric to get_first's empty-BIN
+                                        // path — NEW-4.)
+                                        let anchor =
+                                            empty_anchor.unwrap_or_default();
+                                        return Some((
+                                            anchor,
+                                            Bytes::new(),
+                                            -1i32,
+                                            0u64,
+                                            bin_arc.clone(),
+                                        ));
                                     }
                                     // TREE-F1: last LIVE slot, skipping
                                     // known_deleted slots
