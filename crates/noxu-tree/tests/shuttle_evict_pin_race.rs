@@ -389,3 +389,211 @@ fn no_detach_of_pinned_bin() {
         ITERATIONS,
     );
 }
+
+// ===========================================================================
+// NEW-9: cursor cross-BIN-advance vs background-evictor detach/re-fault race.
+// ===========================================================================
+//
+// A full forward cursor scan crossing a BIN boundary reads the boundary record
+// from a *snapshot* of the next BIN and then re-pins that BIN by a SEPARATE
+// descent (`CursorImpl::retrieve_next` -> `get_next_bin` snapshot ->
+// `find_bin_for_key` re-pin).  Between the snapshot and the re-pin NO BIN is
+// pinned, so the background evictor's `detach_node_by_id` / `strip_lns`
+// `cursor_count > 0` guard (GAP A / EVICTOR-PIN-1) is NOT armed for the BIN the
+// cursor is crossing INTO.  The evictor can detach + re-fault that BIN to a
+// shifted (BIN-delta) layout in the window, moving the boundary record off the
+// index the cursor captured -- the cursor then reports a DIFFERENT record and
+// the boundary record is silently SKIPPED (observed: keys 15102 / 11177).
+//
+// JE keeps the target BIN registered continuously across the boundary:
+// `CursorImpl.getNextBin` returns the next BIN with `BIN.incrementCursorCount`
+// applied BEFORE the current BIN's latch/registration is released, so the
+// evictor's cursor-count guard is always armed for the BIN being read.  The
+// Noxu fix ports that: `Tree::get_next_bin_pinned` returns the boundary
+// snapshot together with the BIN's `Arc` already pinned (`cursor_count += 1`)
+// under the SAME latch that captured the snapshot, and `update_bin_pin`
+// installs it before releasing the old BIN (pin-next-before-unpin-current).
+//
+// These gates race `Tree::shuttle_cursor_cross_bin` (models both the BASE
+// unpinned path and the FIXED pinned path) against
+// `Tree::shuttle_evict_shift_bin` (models detach + re-fault to a shifted
+// delta, honouring the `cursor_count` refusal guard byte-for-byte).
+//
+// INVARIANT (NEW-9): the record the cursor REPORTS for the boundary equals the
+// boundary record it chose from the snapshot -- no record is skipped.
+
+/// Build a two-BIN tree: enough keys to force a split so a forward scan crosses
+/// from the first BIN into a second, and every BIN has a durable full image so
+/// the evictor's never-logged refusal does not mask the race.
+fn build_two_bin_tree() -> Tree {
+    let tree = Tree::new(DB_ID, 8);
+    for i in 0..40u32 {
+        tree.insert(
+            format!("k{i:04}").into_bytes(),
+            vec![i as u8],
+            Lsn::new(1, i),
+        )
+        .expect("insert during setup");
+    }
+    let _ = tree.shuttle_checkpoint_flush_bins(DB_ID);
+    tree
+}
+
+/// FAIL-ON-BASE WITNESS (deterministic): the BASE cursor cross-BIN advance
+/// (unpinned snapshot -> re-descend) SKIPS the boundary record when the evictor
+/// shifts the next BIN in the window.  Forces the exact bad interleaving via
+/// the in-window hook so the failure is deterministic.  Asserting the
+/// captured != reported MISMATCH proves the model faithfully observes the
+/// NEW-9 skip on the unpinned path; the fixed path (which pins) is gated to
+/// NEVER skip in `fixed_cursor_pin_prevents_skip`.
+#[test]
+fn base_unpinned_cursor_skips_boundary_record() {
+    shuttle::check_dfs(
+        || {
+            let tree = Arc::new(build_two_bin_tree());
+            let bins = tree.shuttle_bin_ids_in_order();
+            assert!(bins.len() >= 2, "need at least two BINs to cross");
+            let (_first_id, _lo, first_hi) = tree
+                .shuttle_first_bin_id()
+                .expect("tree must have a first BIN");
+            let second_id = bins[1];
+
+            let tree_hook = Arc::clone(&tree);
+            // BASE cursor advance: nothing pinned across the window.
+            let out = tree.shuttle_cursor_cross_bin(
+                &first_hi,
+                false, // pin_during_descent = false -> BASE (racy) path
+                move || {
+                    // Window: the evictor shifts the second BIN (drop leading
+                    // slot).  Not pinned on BASE, so the shift is NOT refused.
+                    let shifted = tree_hook.shuttle_evict_shift_bin(second_id);
+                    assert!(
+                        shifted,
+                        "evictor should shift the unpinned second BIN on BASE"
+                    );
+                },
+            );
+
+            if let Some((captured, reported)) = out {
+                // THE BUG: because the BASE cursor holds no pin across the
+                // window, the evictor's in-window shift moved the boundary
+                // record off slot `pos`, so the fixed-index re-read returned a
+                // DIFFERENT key -- the captured boundary record was SKIPPED.
+                assert_ne!(
+                    captured,
+                    reported,
+                    "NEW-9 model must observe the skip on the UNPINNED path: \
+                     the evictor's in-window shift should move the boundary \
+                     record {:?} off its index so the base cursor reports a \
+                     different record, but it reported {:?} unchanged -- the \
+                     model is not exercising the race",
+                    String::from_utf8_lossy(&captured),
+                    String::from_utf8_lossy(&reported),
+                );
+            }
+        },
+        None,
+    );
+}
+
+/// THE FIX GATE (deterministic): the FIXED cursor cross-BIN advance pins the
+/// next BIN during the descent, so the evictor's shift in the window is REFUSED
+/// (`cursor_count > 0`) and the cursor reports the record it captured -- no
+/// skip.  This FAILS on base (no descent pin -> shift not refused -> captured
+/// != reported) and PASSES after the fix.
+#[test]
+fn fixed_cursor_pin_prevents_skip() {
+    shuttle::check_dfs(
+        || {
+            let tree = Arc::new(build_two_bin_tree());
+            let bins = tree.shuttle_bin_ids_in_order();
+            assert!(bins.len() >= 2, "need at least two BINs to cross");
+            let (_first_id, _lo, first_hi) = tree
+                .shuttle_first_bin_id()
+                .expect("tree must have a first BIN");
+            let second_id = bins[1];
+
+            let tree_hook = Arc::clone(&tree);
+            let out = tree.shuttle_cursor_cross_bin(
+                &first_hi,
+                true, // pin_during_descent = true -> FIXED path
+                move || {
+                    // Window: the evictor TRIES to shift the second BIN, but
+                    // the fixed cursor has it pinned, so the shift is refused.
+                    let shifted = tree_hook.shuttle_evict_shift_bin(second_id);
+                    assert!(
+                        !shifted,
+                        "NEW-9 fix: evictor must REFUSE to shift a BIN the \
+                         cursor pinned during its cross-BIN descent \
+                         (cursor_count > 0 guard)"
+                    );
+                },
+            );
+
+            let (captured, reported) = out.expect("adjacent BIN exists");
+            assert_eq!(
+                captured,
+                reported,
+                "NEW-9 fix: pinned cursor must report the boundary record it \
+                 captured ({:?}), got {:?} -- boundary was skipped",
+                String::from_utf8_lossy(&captured),
+                String::from_utf8_lossy(&reported),
+            );
+        },
+        None,
+    );
+}
+
+/// RANDOMIZED GATE: race the FIXED cursor advance against the evictor shift on
+/// its own thread across all interleavings.  For every schedule the cursor
+/// must report the record it captured (`captured == reported`): the evictor
+/// either loses the race to the pin (shift refused, layout intact) or shifts
+/// before the cursor pins (but then the cursor's pinned descent captures AND
+/// re-reads the SAME post-shift layout consistently).  No schedule may make
+/// the cursor report a record other than the one it selected.
+#[test]
+fn fixed_cursor_no_skip_any_interleaving() {
+    shuttle::check_random(
+        || {
+            let tree = Arc::new(build_two_bin_tree());
+            let bins = tree.shuttle_bin_ids_in_order();
+            if bins.len() < 2 {
+                return;
+            }
+            let (_first_id, _lo, first_hi) = tree
+                .shuttle_first_bin_id()
+                .expect("tree must have a first BIN");
+            let second_id = bins[1];
+
+            let evictor = {
+                let tree = Arc::clone(&tree);
+                shuttle::thread::spawn(move || {
+                    tree.shuttle_evict_shift_bin(second_id)
+                })
+            };
+            let cursor = {
+                let tree = Arc::clone(&tree);
+                let anchor = first_hi;
+                shuttle::thread::spawn(move || {
+                    tree.shuttle_cursor_cross_bin(&anchor, true, || {})
+                })
+            };
+
+            let _shifted = evictor.join().unwrap();
+            let out = cursor.join().unwrap();
+
+            if let Some((captured, reported)) = out {
+                assert_eq!(
+                    captured,
+                    reported,
+                    "NEW-9 fix: pinned cursor reported {:?} but had selected \
+                     boundary {:?} -- the boundary record was skipped under \
+                     some interleaving of the evictor shift",
+                    String::from_utf8_lossy(&reported),
+                    String::from_utf8_lossy(&captured),
+                );
+            }
+        },
+        ITERATIONS,
+    );
+}

@@ -789,35 +789,39 @@ fn cursor_range_seek_under_eviction_finds_all_from_mid() {
     );
 }
 
-/// NEW-9 (cursor<->evictor cross-BIN-advance race) -- RUNNABLE reproduction,
-/// ignored because it is ~50% flaky and DAEMON-DEPENDENT.
+/// NEW-9 follow-up -- RUNNABLE reproduction, STILL ignored: it exercises a
+/// SEPARATE, still-open evictor durable-loss bug (NEW-10), not the cursor race
+/// that NEW-9's cursor-side fix closed.
 ///
-/// With the BACKGROUND EVICTOR DAEMON on (the DEFAULT config), a full cursor
-/// scan concurrent with the daemon intermittently skips EXACTLY ONE mid-range
-/// record at a BIN boundary (observed missing keys e.g. 15102, 11177; count
-/// 19998-19999/20000). Isolation proof (captured on this branch): daemons OFF
-/// with eviction via explicit evict_memory() only (quiescent tree) -> scan
-/// visits 20000/20000 deterministically 5/5 (so this is NOT NEW-8, whose
-/// scan-start / cross-BIN descent re-fault is correct); evictor daemon ON only
-/// -> reproduces (~1/4 runs); compressor daemon ON only -> does NOT reproduce
-/// (4/4 clean).
+/// With the BACKGROUND EVICTOR DAEMON on (the DEFAULT config), a workload that
+/// drives explicit `evict_memory()` concurrently with the daemon
+/// intermittently loses EXACTLY ONE record (~1/6-1/8 runs; observed missing
+/// keys scattered: 7259, 8000, 10346, 12006, 14350, 17650, 19818, 19830,
+/// 19945). The NEW-9 fix (cursor cross-BIN advance now PINS the next BIN
+/// during the same descent that reads the boundary record -- see
+/// `Tree::get_next_bin_pinned` + `shuttle_evict_pin_race`
+/// `fixed_cursor_pin_prevents_skip`/`fixed_cursor_no_skip_any_interleaving`,
+/// which FAIL on base and PASS after the fix) closes the cursor snapshot->
+/// re-pin window it was designed for, but does NOT stop this repro.
 ///
-/// Suspected window: CursorImpl::retrieve_next's cross-BIN advance reads a
-/// COPY of the next BIN's entries via Tree::get_next_bin / get_prev_bin
-/// (get_adjacent_bin_attempt), then SEPARATELY re-descends via find_bin_for_key
-/// to pin the new BIN (update_bin_pin -> pin_bin cursor_count). Between the
-/// entry snapshot and the re-pin the tree is unpinned, so the background
-/// evictor detach_node_by_id (GAP A guards only cursor_count>0) can
-/// detach/strip/re-fault the target BIN in that window and the record chosen
-/// from the stale snapshot no longer matches the re-pinned BIN -- one record
-/// is skipped. See new9-cursor-evictor-race.md. HIGH: silent single-record
-/// loss in a concurrent scan under the DEFAULT evictor config (wrong results);
-/// no on-disk loss (point-get + env.verify() clean).
+/// CORRECTED DIAGNOSIS (measured on this branch, base 9a943ad3 AND with the
+/// NEW-9 fix): the lost record is NOT merely skipped by the cursor -- it is
+/// DURABLY LOST.  At the time of loss, point-get returns FALSE, 50x point-get
+/// retry returns FALSE, and a fresh full rescan returns FALSE; after closing
+/// and REOPENING the environment, point-get is still FALSE and a clean full
+/// scan returns 19999/20000.  Isolation: the loss reproduces with
+/// `evict_memory()` ALONE (no cursor at all), and does NOT reproduce with
+/// `run_evictor=false` (single-threaded eviction, 0 loss over 8x300 evicts).
+/// So this is a DAEMON-vs-foreground evictor CONCURRENCY race that drops a
+/// record on the detach/flush/BIN-delta path -- a durable data-loss bug in
+/// the evictor, distinct from and more severe than the cursor cross-BIN race
+/// NEW-9 named (the original NEW-9 note's "point-get 100% / verify clean / no
+/// on-disk loss" does not hold; see new9-fix.md for the evidence).
 ///
-/// Un-ignore / make deterministic (e.g. a shuttle DST of the cursor-advance
-/// vs evictor-detach interleave, like the GAP A shuttle_evict_pin_race model)
-/// when NEW-9 is fixed.
-#[ignore = "NEW-9 (cursor<->evictor cross-BIN-advance race, HIGH, ~50% flaky, DAEMON-dependent): a full cursor scan concurrent with the DEFAULT background evictor daemon intermittently skips ONE mid-range record at a BIN boundary. NOT NEW-8 (quiescent scan is 20000/20000 5/5). Suspected: retrieve_next reads a get_next_bin entry SNAPSHOT then re-pins via find_bin_for_key; the evictor detach/strip/re-fault window between snapshot and re-pin drops one record. See new9-cursor-evictor-race.md. Un-ignore when NEW-9 is fixed."]
+/// Kept `#[ignore]`d and pointed at the evictor durable-loss bug (NEW-10).
+/// Un-ignore only when that evictor concurrency bug is fixed (this test does
+/// not fail on the cursor race any longer).
+#[ignore = "NEW-10 (evictor DURABLE data-loss under daemon-vs-foreground eviction concurrency, HIGH): evict_memory() concurrent with the background evictor daemon intermittently DURABLY loses ONE record (~1/6-1/8; survives close+reopen; point-get FALSE). NOT the NEW-9 cursor cross-BIN race (that is fixed + shuttle-proven) and NOT NEW-8: reproduces with evict_memory alone (no cursor) and NOT with run_evictor=false (single-threaded, 0 loss). The original NEW-9 note's 'point-get 100%/verify clean' is contradicted by measurement. See new9-fix.md. Un-ignore when the evictor concurrency loss is fixed."]
 #[test]
 fn cursor_scan_with_evictor_daemon_skips_no_records_new9() {
     use noxu_db::Get;

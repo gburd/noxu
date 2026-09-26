@@ -268,6 +268,63 @@ pub struct CursorImpl {
     pending_expiration: i32,
 }
 
+/// RAII pin-guard for a BIN `Arc` pinned by the cursor descent
+/// (`Tree::get_next_bin_pinned` / `get_prev_bin_pinned`, `cursor_count += 1`).
+///
+/// NEW-9 (leak fix): the cross-BIN advance in [`CursorImpl::retrieve_next`]
+/// pins the next BIN and then calls `lock_ln`, which can return `Err`
+/// (deadlock / `RangeRestart` / lock-manager error).  A raw local `Arc` would
+/// drop on that `?` WITHOUT decrementing `cursor_count`, permanently wedging
+/// the evictor off that BIN (its `cursor_count > 0` detach guard would refuse
+/// to ever evict it).  This guard unpins on drop UNLESS [`Self::into_arc`] is
+/// called first (the success path, which hands the still-pinned arc to
+/// `update_bin_pin_prepinned` for installation).  It covers every
+/// early-return / `?` between the descent pin and the install.
+struct PinnedBinGuard {
+    arc: Option<
+        std::sync::Arc<noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>>,
+    >,
+}
+
+impl PinnedBinGuard {
+    /// Adopt an already-pinned (`cursor_count += 1`) BIN arc.
+    fn new(
+        arc: std::sync::Arc<noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>>,
+    ) -> Self {
+        Self { arc: Some(arc) }
+    }
+
+    /// Borrow the pinned arc (still owned by the guard).
+    fn arc(
+        &self,
+    ) -> &std::sync::Arc<noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>> {
+        self.arc
+            .as_ref()
+            .expect("invariant: PinnedBinGuard::arc called after into_arc")
+    }
+
+    /// Disarm the guard and return the still-pinned arc for installation.
+    /// The pin is NOT released — the caller (`update_bin_pin_prepinned`) now
+    /// owns it.
+    fn into_arc(
+        mut self,
+    ) -> std::sync::Arc<noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>> {
+        self.arc
+            .take()
+            .expect("invariant: PinnedBinGuard::into_arc called twice")
+    }
+}
+
+impl Drop for PinnedBinGuard {
+    fn drop(&mut self) {
+        // Still armed => this is an early-return / error path that never
+        // installed the pin; release it so the evictor is not wedged.
+        if let Some(arc) = self.arc.take() {
+            noxu_tree::Tree::unpin_bin(&arc);
+        }
+    }
+}
+
 impl CursorImpl {
     /// Creates a new CursorImpl for the given database.
     ///
@@ -2939,22 +2996,50 @@ impl CursorImpl {
         // found or the key space is exhausted.
         const MAX_BIN_CROSSINGS: usize = 1 << 20;
         for _ in 0..MAX_BIN_CROSSINGS {
-            let adjacent_entries: Option<Vec<(BinEntry, Lsn, Vec<u8>)>> = {
+            // NEW-9: get the adjacent BIN's entry snapshot TOGETHER with the
+            // BIN's `Arc` already pinned (`cursor_count += 1`), so the
+            // background evictor's `detach_node_by_id` `cursor_count > 0` guard
+            // (GAP A / EVICTOR-PIN-1) is armed for the BIN this cursor is
+            // crossing INTO for the entire time between reading the boundary
+            // record and installing the pin.  The prior code read a detached
+            // entry snapshot here and re-descended (`find_bin_for_key`) to pin
+            // separately, leaving an unpinned window in which the evictor could
+            // detach/strip/re-fault the target BIN and shift its slot layout,
+            // dropping the boundary record (silent one-record skip).  Mirrors
+            // JE `CursorImpl.getNextBin` returning the next BIN with
+            // `BIN.incrementCursorCount` applied before the current BIN is
+            // released (pin-next-before-unpin-current).
+            let adjacent: Option<(
+                Vec<(BinEntry, Lsn, Vec<u8>)>,
+                std::sync::Arc<
+                    noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>,
+                >,
+            )> = {
                 let db = self.db_impl.read();
                 if let Some(tree) = db.get_real_tree() {
                     if forward {
-                        tree.get_next_bin(&anchor_key)
+                        tree.get_next_bin_pinned(&anchor_key)
                     } else {
-                        tree.get_prev_bin(&anchor_key)
+                        tree.get_prev_bin_pinned(&anchor_key)
                     }
                 } else {
                     None
                 }
             };
 
-            let entries = match adjacent_entries {
-                Some(e) if !e.is_empty() => e,
-                _ => {
+            let (entries, pinned_arc) = match adjacent {
+                Some((e, arc)) if !e.is_empty() => (e, arc),
+                Some((_, arc)) => {
+                    // Empty BIN returned (should not happen — descend skips
+                    // physically-empty BINs); release the pin and treat as
+                    // end-of-key-space.
+                    noxu_tree::Tree::unpin_bin(&arc);
+                    if forward {
+                        self.lock_eof_for_scan()?;
+                    }
+                    return Ok(OperationStatus::NotFound);
+                }
+                None => {
                     // Reached the end of the key space (no adjacent BIN).
                     // T-F2: for a SERIALIZABLE forward scan, acquire RangeRead
                     // on the per-database EOF sentinel so concurrent inserts
@@ -2967,6 +3052,16 @@ impl CursorImpl {
                 }
             };
 
+            // NEW-9 (leak fix): move the descent pin into an RAII guard so that
+            // EVERY early-return / `?` between here and the
+            // `update_bin_pin_prepinned` install below releases the pin
+            // (`cursor_count -= 1`).  Without this, the `self.lock_ln(lsn)?`
+            // below would drop `pinned_arc` on an `Err` (deadlock /
+            // RangeRestart) WITHOUT unpinning, wedging the evictor off this BIN
+            // forever.  The success path calls `pin_guard.into_arc()` to disarm
+            // the guard and hand the still-pinned arc to the install.
+            let pin_guard = PinnedBinGuard::new(pinned_arc);
+
             // Pick the first (forward) / last (backward) LIVE slot; the slot
             // index equals the position in the returned vec because
             // descend_to_edge_bin returns slots verbatim.
@@ -2978,7 +3073,10 @@ impl CursorImpl {
 
             let Some(pos) = live_pos else {
                 // This BIN is entirely known_deleted — re-anchor on its edge
-                // key and continue crossing to the next BIN.
+                // key and continue crossing to the next BIN.  Release the pin
+                // on this BIN first (we are not staying on it): dropping the
+                // guard unpins it.
+                drop(pin_guard);
                 let edge_key = if forward {
                     entries.last().map(|e| e.2.clone())
                 } else {
@@ -3000,6 +3098,11 @@ impl CursorImpl {
             let lsn = e_lsn.as_u64();
 
             if is_dup {
+                // The sorted-dup path re-pins the accept BIN itself via
+                // `install_dup_accept` (`find_bin_arc_for_key`), so release the
+                // descent pin before handing off (avoids a leaked pin):
+                // dropping the guard unpins it.
+                drop(pin_guard);
                 let s = self.apply_dup_filter(
                     raw_key,
                     raw_data,
@@ -3011,35 +3114,42 @@ impl CursorImpl {
                 )?;
                 return Ok(s);
             }
+            // NEW-9 (leak fix): `lock_ln` can return Err (deadlock /
+            // RangeRestart / lock-manager error).  On that `?`, `pin_guard`
+            // drops and releases the descent pin (`cursor_count -= 1`) — the
+            // BIN is NOT left permanently pinned/wedged for the evictor.
             self.lock_ln(lsn)?;
-            // Crossed into a new BIN — update the cursor pin.
-            let new_key_ref = raw_key.clone();
-            let bin_arc = {
-                let db = self.db_impl.read();
-                db.get_real_tree().and_then(|tree| {
-                    Self::find_bin_for_key(&tree, &new_key_ref)
-                })
-            };
+            // Crossed into a new BIN.  The BIN is ALREADY pinned by the
+            // descent (NEW-9), so revalidate against THAT pinned arc — no
+            // second descent, no unpinned window.
             // READ_COMMITTED revalidation (C1/V1): `raw_key`/`raw_data` were
-            // snapshotted from get_next_bin/get_prev_bin BEFORE lock_ln, so a
-            // writer that mutated the slot in the prefetch->lock window leaves
-            // them stale.  Re-derive from the freshly-pinned slot if its LSN
-            // moved.  JE CursorImpl.lockLN re-reads bin.getLsn(index) post-lock
-            // (CursorImpl.java:3641-3680); getCurrent/fetchLN(index) returns
-            // current-slot data (CursorImpl.java:2230/2294).
-            let (raw_key, raw_data, lsn) =
-                match bin_arc.as_ref().and_then(|arc| {
-                    Self::revalidate_locked_slot(arc, idx as usize, lsn)
-                }) {
-                    Some(Some((rk, rd, rl))) => (rk, rd, rl),
-                    _ => (raw_key, raw_data, lsn),
-                };
+            // snapshotted before lock_ln, so a writer that mutated the slot in
+            // the prefetch->lock window leaves them stale.  Re-derive from the
+            // pinned slot if its LSN moved.  JE CursorImpl.lockLN re-reads
+            // bin.getLsn(index) post-lock (CursorImpl.java:3641-3680);
+            // getCurrent/fetchLN(index) returns current-slot data
+            // (CursorImpl.java:2230/2294).  Because the BIN is pinned, the
+            // evictor cannot have detached/re-faulted it under us, so `idx`
+            // still names the boundary record's slot.
+            let (raw_key, raw_data, lsn) = match Self::revalidate_locked_slot(
+                pin_guard.arc(),
+                idx as usize,
+                lsn,
+            ) {
+                Some(Some((rk, rd, rl))) => (rk, rd, rl),
+                _ => (raw_key, raw_data, lsn),
+            };
             self.current_key = Some(raw_key);
             self.current_data = Some(raw_data);
             self.current_lsn = lsn;
             self.rehydrate_current_data();
             self.current_index = idx;
-            self.update_bin_pin(bin_arc);
+            // Install the already-pinned BIN: `into_arc()` disarms the guard
+            // (the pin is NOT released here — it is handed off), and
+            // `update_bin_pin_prepinned` unpins the OLD BIN only after adopting
+            // this one, so the cursor is registered on the next BIN before the
+            // current one is released (pin-next-before-unpin).
+            self.update_bin_pin_prepinned(pin_guard.into_arc());
             return Ok(OperationStatus::Success);
         }
         // Crossing budget exhausted (pathological all-KD key space).
@@ -4003,6 +4113,39 @@ impl CursorImpl {
         self.current_bin_arc = new_bin;
     }
 
+    /// Install an ALREADY-PINNED BIN as the cursor's current BIN (NEW-9).
+    ///
+    /// Unlike [`Self::update_bin_pin`], the incoming arc's `cursor_count` was
+    /// already incremented by the descent (`Tree::get_next_bin_pinned` /
+    /// `get_prev_bin_pinned`), so this method must NOT pin it again — it only
+    /// unpins the OLD BIN and adopts the new one.  Because the new BIN was
+    /// pinned before this call and the old BIN is unpinned only here, the
+    /// cursor is registered on the next BIN before it releases the current one
+    /// (pin-next-before-unpin-current), so the evictor's `cursor_count > 0`
+    /// detach guard is armed continuously across the boundary.  Mirrors JE
+    /// `CursorImpl.getNextBin` → `latchNextBin`/`incrementCursorCount` on the
+    /// next BIN preceding the current BIN's release.
+    fn update_bin_pin_prepinned(
+        &mut self,
+        new_arc: std::sync::Arc<
+            noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>,
+        >,
+    ) {
+        // Same BIN: the descent pinned it a second time, so drop that extra
+        // pin and keep the existing one.
+        if let Some(old) = &self.current_bin_arc
+            && std::sync::Arc::ptr_eq(old, &new_arc)
+        {
+            noxu_tree::Tree::unpin_bin(&new_arc);
+            return;
+        }
+        // Unpin the OLD BIN (the new one is already pinned).
+        if let Some(old_arc) = self.current_bin_arc.take() {
+            noxu_tree::Tree::unpin_bin(&old_arc);
+        }
+        self.current_bin_arc = Some(new_arc);
+    }
+
     /// first close.
     ///
     /// # Returns
@@ -4056,6 +4199,101 @@ mod tests {
             &config,
         );
         Arc::new(RwLock::new(db_impl))
+    }
+
+    /// Read the `cursor_count` (descent pin count) directly off a BIN arc.
+    ///
+    /// Panics if the arc is not a `TreeNode::Bottom` (BIN) — the NEW-9 guard
+    /// only ever wraps BIN arcs pinned by the cursor descent.
+    fn bin_cursor_count(
+        arc: &Arc<noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>>,
+    ) -> i32 {
+        let guard = arc.read();
+        match &*guard {
+            noxu_tree::tree::TreeNode::Bottom(stub) => stub.cursor_count,
+            _ => panic!("expected a BIN (TreeNode::Bottom)"),
+        }
+    }
+
+    /// NEW-9 (leak fix) — deterministic unit proof of the `PinnedBinGuard`
+    /// contract, independent of lock timing or tree topology.
+    ///
+    /// The cross-BIN advance in [`CursorImpl::retrieve_next`] pins the next
+    /// BIN (`cursor_count += 1`) and then calls `lock_ln`, which can `Err`.
+    /// Pre-fix, a raw local `Arc` dropped on that `?` WITHOUT unpinning,
+    /// wedging the evictor off that BIN forever (`cursor_count > 0`).  The
+    /// guard fixes this: it unpins on drop UNLESS `into_arc` committed the
+    /// pin to the installer.  This test proves both halves of that contract
+    /// directly:
+    ///
+    ///  (a) error path — dropping the guard WITHOUT `into_arc` unpins
+    ///      (`cursor_count` returns to 0);
+    ///  (b) success path — `into_arc` keeps the pin (`cursor_count` stays 1)
+    ///      and hands back the SAME BIN arc for installation.
+    ///
+    /// Non-vacuity: if the guard's `Drop` is neutered (unpin removed), part
+    /// (a) fails because `cursor_count` stays 1 after drop.
+    #[test]
+    fn pinned_bin_guard_drop_unpins_into_arc_keeps_pin() {
+        let db = create_test_database();
+        {
+            let mut cursor = CursorImpl::new(Arc::clone(&db), 100);
+            cursor.put(b"k", b"v", PutMode::Overwrite).unwrap();
+        }
+
+        // Grab a real BIN arc for the seeded key.
+        let bin_arc = {
+            let guard = db.read();
+            let tree = guard.get_real_tree().expect("real tree");
+            tree.bin_arc_for_key(b"k").expect("key resolves to a BIN")
+        };
+        assert_eq!(bin_cursor_count(&bin_arc), 0, "BIN starts unpinned");
+
+        // (a) ERROR PATH: pin the BIN (as the descent does), wrap it in a
+        //     guard, then drop the guard WITHOUT calling into_arc.  The pin
+        //     must be released (this is the leak-fix contract).
+        {
+            Tree::pin_bin(&bin_arc);
+            assert_eq!(
+                bin_cursor_count(&bin_arc),
+                1,
+                "pin_bin must bump cursor_count to 1"
+            );
+            let guard = PinnedBinGuard::new(Arc::clone(&bin_arc));
+            // The guard still borrows the SAME arc while armed.
+            assert!(Arc::ptr_eq(guard.arc(), &bin_arc));
+            drop(guard);
+        }
+        assert_eq!(
+            bin_cursor_count(&bin_arc),
+            0,
+            "NEW-9 leak: dropping an armed PinnedBinGuard (error path) must \
+             unpin the BIN (cursor_count back to 0); a leaked pin wedges the \
+             evictor off this BIN forever"
+        );
+
+        // (b) SUCCESS PATH: pin the BIN, wrap it, then into_arc() (commit).
+        //     The pin must STAY (ownership transferred to the installer), and
+        //     the returned arc must be the SAME BIN.
+        Tree::pin_bin(&bin_arc);
+        assert_eq!(bin_cursor_count(&bin_arc), 1, "pin_bin bumps to 1");
+        let installed = PinnedBinGuard::new(Arc::clone(&bin_arc)).into_arc();
+        assert!(
+            Arc::ptr_eq(&installed, &bin_arc),
+            "into_arc must return the same pinned BIN arc"
+        );
+        assert_eq!(
+            bin_cursor_count(&bin_arc),
+            1,
+            "NEW-9 success path: into_arc() transfers ownership and must NOT \
+             unpin (cursor_count stays 1); the installer \
+             (update_bin_pin_prepinned) now owns the pin"
+        );
+
+        // Clean up the pin we committed above so we leave the BIN as we
+        // found it (mirrors update_bin_pin_prepinned's eventual unpin).
+        Tree::unpin_bin(&bin_arc);
+        assert_eq!(bin_cursor_count(&bin_arc), 0);
     }
 
     #[test]
