@@ -1249,7 +1249,26 @@ impl Transaction {
 
     /// Returns the current transaction state.
     pub fn state(&self) -> TransactionState {
-        *self.state.lock().unwrap()
+        let outer = *self.state.lock().unwrap();
+        // NEW-TXN-2 / JE Locker.setOnlyAbortable (Locker.java:285): the inner
+        // `Txn` is Noxu's Locker.  A lock-conflict operation failure poisons
+        // the Locker abort-only (`Txn::set_only_abortable`, flipping the inner
+        // `Txn` to `MustAbort`) so the transaction is thereafter invalid, a
+        // further operation is rejected, and it can only be aborted -- matching
+        // JE's OperationFailureException contract.  The public wrapper keeps its
+        // own state field for its lifecycle transitions (Prepared/Committed/
+        // Aborted are terminal and authoritative), but while the wrapper is
+        // still `Open` it must reflect a poisoned Locker so `is_valid()`,
+        // `check_open()`, `commit()` and every per-op state check observe the
+        // abort-only flag with a single source of truth (the Locker).
+        if outer == TransactionState::Open
+            && let Some(inner) = &self.inner_txn
+            && inner.lock().unwrap().get_state()
+                == noxu_txn::TxnState::MustAbort
+        {
+            return TransactionState::MustAbort;
+        }
+        outer
     }
 
     /// Check if the transaction is valid (in Open state).
