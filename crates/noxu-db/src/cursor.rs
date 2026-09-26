@@ -498,17 +498,26 @@ impl<'txn> Cursor<'txn> {
     pub fn count(&self) -> Result<u64> {
         self.check_open()?;
 
-        if self.state != CursorState::Initialized {
-            return Ok(0);
+        // JE Cursor.count() counts the dup set for the current KEY regardless
+        // of whether the current record was just deleted: deleteCurrentRecord
+        // PD-flags the slot but getCurrentKey() still returns the anchor.  A
+        // `PendingDeleted` position must therefore fall through to the inner
+        // count, which re-anchors by key and reports the LIVE dups remaining
+        // (NEW-DBI-COUNT-AFTER-DELETE).  Only an unpositioned/closed cursor
+        // short-circuits to 0.
+        match self.state {
+            CursorState::Initialized | CursorState::PendingDeleted => {}
+            _ => return Ok(0),
         }
 
         // Audit cursor F16 (Wave 2C-4): drop the previous `.max(1)`
-        // clamp.  The inner `count()` always returns at least 1 when the
-        // cursor is positioned (one record at minimum); a 0 from the
-        // inner is therefore a real bug and must surface, not be silently
-        // promoted to 1.
+        // clamp.  A live position always has at least one record, so a 0
+        // from the inner count on an `Initialized` cursor is a real bug and
+        // must surface.  A `PendingDeleted` position, however, legitimately
+        // reports 0 once the last dup of the key has been deleted, so 0 is
+        // only an invariant violation while `Initialized`.
         let n = self.inner.count().map_err(map_cursor_err)?;
-        if n < 1 {
+        if n < 1 && self.state == CursorState::Initialized {
             return Err(NoxuError::OperationNotAllowed(format!(
                 "cursor count() returned {n} while positioned (invariant violated)",
             )));

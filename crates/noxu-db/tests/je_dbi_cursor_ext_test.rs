@@ -1106,9 +1106,10 @@ fn db_cursor_duplicate_delete_test_simple_delete_insert() {
     assert_eq!((k * k) as u64, db.count().unwrap());
 
     // Delete every record via a walk.  (JE also asserts count() counts down
-    // within the dup set after each delete; Noxu returns 0 for count() on a
-    // just-deleted/defunct cursor position — that faithful assertion is the
-    // #[ignore]d NEW-DBI-COUNT-AFTER-DELETE test below.)
+    // within the dup set after each delete; that count()-after-delete
+    // assertion is exercised by
+    // db_cursor_duplicate_delete_test_count_after_delete_returns_remaining
+    // below — NEW-DBI-COUNT-AFTER-DELETE, now fixed.)
     let txn = env.begin_transaction(None).unwrap();
     {
         let mut c = db.open_cursor_in(&txn, None).unwrap();
@@ -1155,8 +1156,10 @@ fn db_cursor_duplicate_delete_test_duplicate_deletion_all() {
     assert_eq!((N_KEYS as u64) * (N_DUPS as u64), db.count().unwrap());
 
     // Walk deleting every record, asserting dups within each key ascend.
-    // (JE also asserts count()==remaining after each delete; see the
-    // #[ignore]d NEW-DBI-COUNT-AFTER-DELETE test below.)
+    // (JE also asserts count()==remaining after each delete; that assertion
+    // is exercised by
+    // db_cursor_duplicate_delete_test_count_after_delete_returns_remaining
+    // below — NEW-DBI-COUNT-AFTER-DELETE, now fixed.)
     let txn = env.begin_transaction(None).unwrap();
     {
         let mut c = db.open_cursor_in(&txn, None).unwrap();
@@ -1378,24 +1381,18 @@ fn db_cursor_duplicate_delete_test_duplicate_deletion_assorted_sr15375() {
 // DbCursorDuplicateDeleteTest.testDuplicateDeletionAll / testSimpleDeleteInsert
 // (the count()-after-delete assertion)
 //
-//   ⚠️ ENGINE BUG CANDIDATE — NEW-DBI-COUNT-AFTER-DELETE (see tp-je-dbi.md)
-//
-// JE invariant: immediately after `cursor.delete()` on a sorted-dups db (with
-// the cursor still parked on the just-deleted slot, NOT repositioned),
-// `cursor.count()` returns the number of dups REMAINING in the current key.
-// Noxu's `CursorImpl::count()` re-derives the dup count by cloning the cursor
-// and walking Prev/NextDup from `current_key`; after a delete `current_key` is
-// the two-part key of a slot that no longer exists in the tree, so the walk
-// finds nothing and count() returns 0.  Repositioning first (getNext) makes
-// count() correct again — so this is specifically "count() on a just-deleted
-// cursor position".  Kept #[ignore]d, NOT weakened, with the JE citation.
-// Un-ignore when count() on a defunct dup position reports the remaining set.
+// NEW-DBI-COUNT-AFTER-DELETE (fixed): immediately after `cursor.delete()` on a
+// sorted-dups db (with the cursor still parked on the just-deleted slot, NOT
+// repositioned), `cursor.count()` returns the number of dups REMAINING in the
+// current key.  JE Cursor.countHandleDups re-anchors by the current KEY
+// (getCurrentKey survives a delete) and counts the live dups; Noxu's
+// `CursorImpl::count()` now does the same — it resolves the primary key from
+// the retained anchor (`current_key`, or `last_deleted_key` after a delete),
+// searches the tree fresh for the first LIVE dup, and counts forward, so a
+// defunct current slot no longer breaks the walk and a fully-emptied key
+// reports 0.  Ref: Cursor.java countHandleDups / tp-je-dbi.md.
 // ===========================================================================
 #[test]
-#[ignore = "NEW-DBI-COUNT-AFTER-DELETE: cursor.count() on a just-deleted \
-            sorted-dup position returns 0 instead of the remaining dup count \
-            (JE DbCursorDuplicateDeleteTest.testDuplicateDeletionAll; see \
-            tp-je-dbi.md)"]
 fn db_cursor_duplicate_delete_test_count_after_delete_returns_remaining() {
     let (_dir, env, db) = open_dup();
     let key = DatabaseEntry::from_bytes(b"k");
@@ -1424,5 +1421,57 @@ fn db_cursor_duplicate_delete_test_count_after_delete_returns_remaining() {
     txn.commit().unwrap();
 }
 
+// POSITIVE GUARDS (must pass on BOTH base and fix): count() on a NON-deleted
+// position must be unaffected by the NEW-DBI-COUNT-AFTER-DELETE fix.
+//
+//   * a live dup position reports the FULL dup count of the current key,
+//     from any offset within the dup set;
+//   * a non-dup DB reports 1 when positioned.
+#[test]
+fn count_on_live_dup_position_reports_full_dup_count() {
+    let (_dir, env, db) = open_dup();
+    let key = DatabaseEntry::from_bytes(b"k");
+    for d in 0u8..5 {
+        db.put(&key, DatabaseEntry::from_bytes(&[d])).unwrap();
+    }
+    let txn = env.begin_transaction(None).unwrap();
+    let mut c = db.open_cursor_in(&txn, None).unwrap();
+    let mut k = DatabaseEntry::new();
+    let mut d = DatabaseEntry::new();
+    // From every offset within the (undeleted) dup set count() must be 5.
+    let mut s = c.get(&mut k, &mut d, Get::First, None).unwrap();
+    let mut offset = 0;
+    while s == OperationStatus::Success {
+        assert_eq!(
+            5u64,
+            c.count().unwrap(),
+            "count() on a live dup position (offset {offset}) must be the \
+             full dup count"
+        );
+        offset += 1;
+        s = c.get(&mut k, &mut d, Get::Next, None).unwrap();
+    }
+    assert_eq!(5, offset, "walk must visit all five dups");
+    drop(c);
+    txn.commit().unwrap();
+}
+
+#[test]
+fn count_on_nondup_db_reports_one() {
+    let (_dir, env, db) = open_nondup(false);
+    db.put(DatabaseEntry::from_bytes(b"k"), DatabaseEntry::from_bytes(b"v"))
+        .unwrap();
+    let txn = env.begin_transaction(None).unwrap();
+    let mut c = db.open_cursor_in(&txn, None).unwrap();
+    let mut k = DatabaseEntry::from_bytes(b"k");
+    let mut d = DatabaseEntry::new();
+    assert_eq!(
+        OperationStatus::Success,
+        c.get(&mut k, &mut d, Get::Search, None).unwrap()
+    );
+    assert_eq!(1, c.count().unwrap(), "non-dup count() when positioned is 1");
+    drop(c);
+    txn.commit().unwrap();
+}
 // Keep an unused-import guard: Ordering is used by the comparator ctor.
 const _: fn(&[u8], &[u8]) -> Ordering = |a, b| a.cmp(b);
