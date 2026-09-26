@@ -550,6 +550,11 @@ fn cursor_impl_count_returns_one_after_search() {
     assert_eq!(cursor.count().unwrap(), 1);
 }
 
+// JE: DbCursorDupTest.testCursorDupSamePosition / testCursorDupAndCloseDb
+// (com.sleepycat.je.dbi) -- CursorImpl::dup(same_position) copies the
+// current position only when the origin is Initialized; dup(false) yields
+// a fresh NotInitialized cursor.  The public noxu_db::Cursor does not
+// expose dup(); these CursorImpl-level ports capture the dup state machine.
 #[test]
 fn cursor_impl_dup_same_position() {
     let db = make_cursor_db();
