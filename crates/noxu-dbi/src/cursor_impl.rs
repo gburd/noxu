@@ -3993,42 +3993,66 @@ impl CursorImpl {
     /// * `CursorNotInitialized` if cursor is not positioned
     /// * `CursorClosed` if cursor has been closed
     pub fn count(&self) -> Result<i64, DbiError> {
-        self.check_initialized()?;
-
-        // For sorted-dup databases, count all entries sharing the same primary
-        // key as the current position.
-        //
-        // Strategy (Wave 11-N Bug 1 fix): clone the cursor at the current
-        // position, walk backward with PrevDup until NotFound (which leaves
-        // scratch on the FIRST dup of the primary), then walk forward with
-        // NextDup counting successful steps.  The total count is
-        // `forward + 1` because the forward walk visits every dup *after*
-        // the first, plus the one scratch is parked on at the start of the
-        // forward walk.
-        //
-        // Pre-fix the formula was `backward + 1 + forward`, which double
-        // counted: the backward walk left scratch on the first dup
-        // already, so the forward walk re-traverses every dup including
-        // the original position.  The result for an N-dup primary observed
-        // at offset `i` was `i + N` instead of `N`.
-        if self.is_sorted_dup() {
-            let mut scratch = self.dup(true)?;
-            // Walk backward to the first dup of this primary.  We do not
-            // count these steps — they are pure repositioning.
-            while let Ok(OperationStatus::Success) =
-                scratch.retrieve_next(GetMode::PrevDup)
-            {}
-            // scratch is now parked on the first dup of this primary.
-            let mut forward: i64 = 0;
-            while let Ok(OperationStatus::Success) =
-                scratch.retrieve_next(GetMode::NextDup)
-            {
-                forward += 1;
+        // JE Cursor.countHandleDups / countNoDups count the dup set for the
+        // CURRENT KEY regardless of whether the current record is deleted:
+        // deleteCurrentRecord only PD-flags the slot, so getCurrentKey() still
+        // returns the key and the count re-anchors from it.  Noxu physically
+        // removes the slot on delete and moves the key to `last_deleted_key`,
+        // leaving the cursor in `PendingDeleted`.  count() must therefore
+        // accept a just-deleted position and use the retained key as the
+        // dup-set anchor (NEW-DBI-COUNT-AFTER-DELETE).
+        match self.state {
+            CursorState::Closed => return Err(DbiError::CursorClosed),
+            CursorState::NotInitialized => {
+                return Err(DbiError::CursorNotInitialized);
             }
-            return Ok(forward + 1);
+            CursorState::Initialized | CursorState::PendingDeleted => {}
         }
 
-        Ok(1)
+        // The anchor key: the live current key, or (after delete) the key of
+        // the just-removed slot.  This is JE's `cursorImpl.getCurrentKey()`,
+        // which survives a delete.
+        let anchor_key = self
+            .current_key
+            .as_deref()
+            .or(self.last_deleted_key.as_deref())
+            .ok_or(DbiError::CursorNotInitialized)?;
+
+        if !self.is_sorted_dup() {
+            // Non-dup: the count is 0 or 1.  A live position counts 1; a
+            // just-deleted position counts 0 (the record is gone).  Mirrors
+            // JE Cursor.countNoDups (lockAndGetCurrent => 1 if found else 0).
+            return Ok(match self.state {
+                CursorState::PendingDeleted => 0,
+                _ => 1,
+            });
+        }
+
+        // Sorted-dup: re-anchor by the PRIMARY key and count the LIVE dups
+        // remaining under it.  Mirrors JE countHandleDups: dup(false),
+        // searchNoDups(twoPartKey, SET_RANGE) to the first live dup, then
+        // 1 + skip(forward).  Searching the tree fresh means a just-deleted
+        // current slot does not break the walk — only live dups are counted,
+        // and a fully-emptied key correctly reports 0.
+        let primary_key = dup_key_data::get_key(anchor_key)
+            .ok_or(DbiError::CursorNotInitialized)?;
+
+        let mut scratch = self.dup(false)?;
+        match scratch.search_dup(&primary_key, None, SearchMode::Set)? {
+            OperationStatus::Success => {}
+            // No live dup remains under this key (e.g. the last dup was just
+            // deleted) — JE returns 0 here.
+            _ => return Ok(0),
+        }
+        // scratch is parked on the first live dup of this primary; count the
+        // rest with NextDup (the dup filter stops at the primary boundary).
+        let mut count: i64 = 1;
+        while let Ok(OperationStatus::Success) =
+            scratch.retrieve_next(GetMode::NextDup)
+        {
+            count += 1;
+        }
+        Ok(count)
     }
 
     /// Creates a duplicate of this cursor at the same position.
