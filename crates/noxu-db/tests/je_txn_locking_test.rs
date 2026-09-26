@@ -489,3 +489,86 @@ fn txn_end_test_open_database_accepts_open_txn_and_auto_commit() {
     drop(db_txn);
     txn_open.commit().unwrap();
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// JE: TxnTest.testRepeatingOperationFailures -- BUG CANDIDATE (NEW-TXN-2).
+//
+// JE: when an operation on a txn fails (e.g. a lock conflict /
+// LockConflictException, which extends OperationFailureException), the txn is
+// set abort-only (Transaction.State.MUST_ABORT) and is thereafter invalid; a
+// FURTHER operation on the same txn re-throws (the same failure is preserved as
+// the cause), and the txn cannot commit -- only abort.  This is JE's
+// "operation failure invalidates the transaction" contract.
+//
+// Noxu DIVERGES: a lock TIMEOUT/conflict surfaced from a `db.put`/`db.get`
+// leaves the transaction in state `Open` (NOT MustAbort), and a subsequent
+// operation on a DIFFERENT key SUCCEEDS.  (Verified: after txn2's put on a
+// write-locked key times out, txn2.state() == Open and txn2's next put
+// succeeds.)  Only the deadlock-victim path (inside the LockManager wait loop)
+// and a commit-time I/O failure flip Noxu to MustAbort; a plain lock
+// timeout/conflict does not.
+//
+// This is NOT a data-integrity bug (the failed op did not partially apply, and
+// the txn's own writes still commit/abort atomically), but it is a faithful-
+// parity divergence from JE's OperationFailureException semantics.  Whether
+// Noxu SHOULD adopt JE's "lock conflict invalidates the txn" contract is a
+// design decision with cross-layer impact (cursor_impl + Txn error handling),
+// so this is escalated as NEW-TXN-2 rather than fixed unilaterally, and the
+// faithful test is kept ignored (not weakened).
+//
+// Root cause: neither `Txn::lock` (crates/noxu-txn/src/txn.rs) nor the DBI
+// cursor lock path (crates/noxu-dbi/src/cursor_impl.rs) calls
+// `set_only_abortable()` when a `LockTimeout`/`LockConflict`/`LockNotAvailable`
+// is surfaced; the error is propagated but the txn stays `Open`.  JE parity
+// would flip the locker abort-only on any LockConflictException from an
+// operation (Locker.setOnlyAbortable / Txn handling of
+// OperationFailureException).
+#[test]
+#[ignore = "NEW-TXN-2: a lock conflict/timeout does not set the txn abort-only (JE OperationFailureException divergence)"]
+fn txn_test_repeating_operation_failures_bug() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let db = txn_db(&env, "repeating");
+
+    let txn1 = env.begin_transaction(None).unwrap();
+    let short = TransactionConfig::new().with_lock_timeout_ms(50);
+    let txn2 = env.begin_transaction(Some(&short)).unwrap();
+
+    // txn1 holds a write lock on key1.
+    db.put_in(
+        &txn1,
+        DatabaseEntry::from_bytes(b"key1"),
+        DatabaseEntry::from_bytes(b"v"),
+    )
+    .unwrap();
+
+    // txn2's put on key1 fails with a lock conflict/timeout.
+    let first = db.put_in(
+        &txn2,
+        DatabaseEntry::from_bytes(b"key1"),
+        DatabaseEntry::from_bytes(b"v"),
+    );
+    assert!(first.is_err(), "txn2's contended put must fail");
+
+    // FAITHFUL JE expectation: txn2 is now invalid (MUST_ABORT) and a further
+    // operation must be rejected.  On the current engine txn2 stays Open and
+    // this second put SUCCEEDS -> the assert fails (NEW-TXN-2).
+    assert!(
+        !txn2.is_valid(),
+        "NEW-TXN-2: after a lock-conflict operation failure the txn must be \
+         invalid/abort-only (JE TxnTest.testRepeatingOperationFailures); \
+         engine currently leaves it Open"
+    );
+    let second = db.put_in(
+        &txn2,
+        DatabaseEntry::from_bytes(b"key2"),
+        DatabaseEntry::from_bytes(b"v"),
+    );
+    assert!(
+        second.is_err(),
+        "NEW-TXN-2: a further operation on the abort-only txn must be rejected"
+    );
+
+    let _ = txn2.abort();
+    let _ = txn1.commit();
+}
