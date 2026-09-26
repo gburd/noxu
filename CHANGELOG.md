@@ -96,6 +96,16 @@ listed in [References](#references).
   one (matching JE), so the evictor's in-use guard protects it; proven by a
   concurrency (shuttle) model. Together with the durable-loss fix above, a full
   scan under the default background evictor now visits every record.
+- **Lock-table and transaction memory now count toward the cache budget
+  (C3/SC-5).** The cache-memory categories for locks and open transactions had
+  no production feeders and the evictor read only a tree-only counter, so a
+  lock- or transaction-heavy workload with a small tree could grow resident
+  memory well past the configured `cache_size` without triggering eviction. The
+  lock manager and transaction manager now charge those categories, and the
+  evictor's over-budget check reads the total (matching JE). Non-tree memory is
+  not evictable, so eviction correctly stops — rather than spinning — once only
+  lock/transaction memory remains over budget; the footprint is now visible to
+  stats/monitoring.
 
 - **WAL now fail-stops the environment on a critical log-write failure (JE
   `LogManager.serialLog` parity).** A failed or partial WAL write previously left
