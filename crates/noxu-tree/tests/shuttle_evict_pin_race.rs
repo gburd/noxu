@@ -573,7 +573,7 @@ fn fixed_cursor_no_skip_any_interleaving() {
             };
             let cursor = {
                 let tree = Arc::clone(&tree);
-                let anchor = first_hi.clone();
+                let anchor = first_hi;
                 shuttle::thread::spawn(move || {
                     tree.shuttle_cursor_cross_bin(&anchor, true, || {})
                 })
