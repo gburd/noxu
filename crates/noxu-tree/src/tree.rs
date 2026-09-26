@@ -10387,7 +10387,9 @@ mod tests {
             cursor_count: 0,
             prohibit_next_delta: false,
             lsn_rep: LsnRep::from_lsns(
-                &(0..n).map(|i| Lsn::new(1, (i + 1) as u32)).collect::<Vec<_>>(),
+                &(0..n)
+                    .map(|i| Lsn::new(1, (i + 1) as u32))
+                    .collect::<Vec<_>>(),
             ),
             keys: KeyRep::from_keys(full_keys),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
@@ -11427,7 +11429,8 @@ mod tests {
         let max_bytes = vec![0xFFu8; N_BYTES_IN_KEY];
 
         let mut bin = intest_empty_bin();
-        let node = TreeNode::Bottom(std::mem::replace(&mut bin, intest_empty_bin()));
+        let node =
+            TreeNode::Bottom(std::mem::replace(&mut bin, intest_empty_bin()));
 
         // Empty node: no exact match, and (exact=false) floors to slot 0 with
         // no live entries -> insertion point 0.
@@ -11441,14 +11444,22 @@ mod tests {
         let TreeNode::Bottom(mut bin) = node else { unreachable!() };
         for i in 0..cap {
             let key = vec![0x01u8, i as u8, 0x10u8];
-            bin.insert_with_prefix(key.clone(), Lsn::new(0, (i + 1) as u32), None);
+            bin.insert_with_prefix(
+                key.clone(),
+                Lsn::new(0, (i + 1) as u32),
+                None,
+            );
             let node = TreeNode::Bottom(bin);
 
             // Every inserted key is found exactly at a binary-search-consistent
             // slot, and re-finding it yields the same index + EXACT_MATCH.
             let r = node.find_entry(&key, true, false);
             assert!(r >= 0, "inserted key must be found");
-            assert_ne!(r & EXACT_MATCH, 0, "inserted key must be an exact match");
+            assert_ne!(
+                r & EXACT_MATCH,
+                0,
+                "inserted key must be an exact match"
+            );
 
             // maxBytes (0xFF...) is greater than every stored key.  Under
             // UNSIGNED byte comparison it sorts AFTER all keys, so the BIN's
@@ -11457,7 +11468,8 @@ mod tests {
             // (wrongly) sort 0xFF before 0x01 and return 0 — this is exactly
             // the bug JE's 0xFF `maxBytes` guards against.
             let n_entries = node.get_n_entries();
-            let r_max = (node.find_entry(&max_bytes, false, false) & 0xFFFF) as usize;
+            let r_max =
+                (node.find_entry(&max_bytes, false, false) & 0xFFFF) as usize;
             assert_eq!(
                 r_max, n_entries,
                 "0xFF key must sort AFTER all keys under UNSIGNED compare \
@@ -11482,7 +11494,11 @@ mod tests {
         let keys: Vec<Vec<u8>> =
             (0..5u8).map(|i| vec![0x01, i, 0x10]).collect();
         for (i, k) in keys.iter().enumerate() {
-            bin.insert_with_prefix(k.clone(), Lsn::new(0, (i + 1) as u32), None);
+            bin.insert_with_prefix(
+                k.clone(),
+                Lsn::new(0, (i + 1) as u32),
+                None,
+            );
         }
         // Delete the middle key (index 2) via the public remove path.
         let node = TreeNode::Bottom(bin);
@@ -11503,7 +11519,10 @@ mod tests {
                 continue;
             }
             let r = node.find_entry(k, false, true);
-            assert!(r >= 0 && (r & EXACT_MATCH) != 0, "survivor {i} must be found");
+            assert!(
+                r >= 0 && (r & EXACT_MATCH) != 0,
+                "survivor {i} must be found"
+            );
         }
     }
 

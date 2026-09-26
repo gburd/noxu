@@ -312,7 +312,6 @@ fn sr9752_part2_abort_after_committed_dups_reverts_with_dups() {
     drop(env2);
 }
 
-
 // ──────────────────────────────────────────────────────────────────────────────
 // JE: SR13034Test.testSR13034 — a duplicate deleted BEFORE the dup tree exists,
 // then dup inserts aborted (setting KnownDeleted), then recovery.

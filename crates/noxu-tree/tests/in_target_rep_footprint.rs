@@ -374,7 +374,6 @@ fn bin_same_file_with_keys(n: usize, key_len: usize) -> noxu_tree::BinStub {
     bin
 }
 
-
 // ===========================================================================
 // JE: INTargetRepTest.testRandomEntries / testShiftEntries — randomized
 // set/compact and insert/remove-shift stress on the child-target rep, checked
@@ -419,8 +418,8 @@ fn target_rep_random_entries_match_model() {
         n.targets.compact();
 
         // Every slot must match the model (identity by Arc ptr).
-        for s in 0..SIZE {
-            match (&children[s], n.get_child(s)) {
+        for (s, expected) in children.iter().enumerate() {
+            match (expected, n.get_child(s)) {
                 (None, got) => assert!(
                     got.is_none(),
                     "slot {s} expected empty after compact"
@@ -457,9 +456,11 @@ fn target_rep_shift_entries_match_model() {
         model[slot] = child.clone();
         n.set_child(slot, child);
         // Verify alignment.
-        for s in 0..SIZE {
-            match (&model[s], n.get_child(s)) {
-                (None, got) => assert!(got.is_none(), "slot {s} should be empty"),
+        for (s, expected) in model.iter().enumerate() {
+            match (expected, n.get_child(s)) {
+                (None, got) => {
+                    assert!(got.is_none(), "slot {s} should be empty")
+                }
                 (Some(exp), Some(got)) => assert!(
                     std::sync::Arc::ptr_eq(exp, &got),
                     "slot {s} child mismatch"

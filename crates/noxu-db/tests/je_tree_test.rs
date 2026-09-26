@@ -356,7 +356,6 @@ fn key_prefix_many_sequential_round_trip() {
     txn.commit().unwrap();
 }
 
-
 // ──────────────────────────────────────────────────────────────────────────────
 // JE: TreeTest.testSimpleTreeCreation — rudimentary insert/retrieve of a few
 // keys (including keys that are byte-prefixes of each other).
@@ -558,11 +557,8 @@ fn split_0split_zeroth_entry_promotion() {
     let db = env.open_database(None, "zerosplit", &db_cfg).unwrap();
 
     let put = |v: u8| {
-        db.put(
-            DatabaseEntry::from_bytes(&[v]),
-            DatabaseEntry::from_bytes(&[1]),
-        )
-        .unwrap()
+        db.put(DatabaseEntry::from_bytes(&[v]), DatabaseEntry::from_bytes(&[1]))
+            .unwrap()
     };
 
     // Build up: 160,150,...,10 then 151,152,153.
@@ -590,9 +586,8 @@ fn split_0split_zeroth_entry_promotion() {
 
     // The regression: 140 must still be retrievable.
     let mut out = DatabaseEntry::new();
-    let found = db
-        .get_into(None, DatabaseEntry::from_bytes(&[140]), &mut out)
-        .unwrap();
+    let found =
+        db.get_into(None, DatabaseEntry::from_bytes(&[140]), &mut out).unwrap();
     assert!(found, "record 140 must survive the 0th-entry-promotion split");
 }
 
@@ -683,8 +678,7 @@ fn rle_to_str(b: &[u8]) -> String {
     let mut out = String::new();
     let mut i = 0;
     while i + 5 <= b.len() {
-        let len =
-            u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+        let len = u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
         let c = b[i + 4] as char;
         for _ in 0..len {
             out.push(c);
@@ -844,7 +838,6 @@ fn count_estimator_dups_sequential_exact_counts() {
     }
 }
 
-
 // ──────────────────────────────────────────────────────────────────────────────
 // JE: SplitTest.testSplitOverSizedNode [#24917] — fill a BIN to the OLD (larger)
 // fanout, reduce the fanout across reopen (so the BIN is now over-sized), then
@@ -932,7 +925,6 @@ fn split_oversized_node_after_fanout_reduction() {
         "fanout reduction + splits must produce multiple BINs"
     );
 }
-
 
 // ──────────────────────────────────────────────────────────────────────────────
 // JE: CountEstimatorTest.testDupsInsertNonSequential — the EXACT-count arm.
