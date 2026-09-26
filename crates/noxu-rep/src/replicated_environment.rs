@@ -1028,6 +1028,15 @@ impl ReplicatedEnvironment {
                         continue;
                     }
 
+                    // B6/V15/F2 — CBVLSN expiry timer (JE `LocalCBVLSNUpdater`).
+                    // Recompute the cleaner's replication-protected file floor
+                    // every tick, not only on `record_ack`. This is what lets a
+                    // silent (disconnected-but-not-removed) electable member
+                    // stop pinning the log: once its feeder passes the CBVLSN
+                    // timeout, `compute_cbvlsn` drops it and the floor advances
+                    // even though no further ack ever arrives from any node.
+                    me.update_cleaner_replica_protection();
+
                     let Some(env) = me.env_impl.lock().unwrap().clone() else {
                         continue;
                     };
@@ -1801,6 +1810,15 @@ impl ReplicatedEnvironment {
     /// after this call will not include the removed node in quorum calculations.
     pub fn remove_peer(&self, name: &str) -> Result<()> {
         self.group_service.remove_node(name)?;
+        // B6/V15/F2 — drop the removed member's feeder so it no longer gates
+        // the CBVLSN, then recompute the cleaner's replication-protected file
+        // floor immediately. Without this the floor would only drop on the
+        // next ack from some other node (leaving a window where the log keeps
+        // filling after the operator has already removed the dead member).
+        // JE `RepNode.removeMember` similarly stops the removed node from
+        // holding the global CBVLSN down.
+        self.feeders.write().retain(|f| f.get_replica_name() != name);
+        self.update_cleaner_replica_protection();
         log::info!(
             "Node '{}': removed peer '{}' from group '{}'",
             self.config.node_name,
@@ -2842,6 +2860,17 @@ impl ReplicatedEnvironment {
             crate::stream::replica_stream::ReplicaStreamState::Connecting,
         );
 
+        // B6/V15/F2 — release the cleaner's replication-protected file floor on
+        // demotion. The floor is only *raised* from `record_ack` (a master-only
+        // event) and from the master-only expiry timer; a demoted master
+        // receives no more acks and its DTVLSN timer bails on `!is_master()`,
+        // so without this its old floor would stay pinned on its own cleaner
+        // forever. Now that this node is a Replica, `compute_cbvlsn` returns
+        // `None` (not a master), so `update_cleaner_replica_protection` clears
+        // the floor. Placed before any early return below so every demotion
+        // path releases it.
+        self.update_cleaner_replica_protection();
+
         // --- G19: start replica receive loop --------------------------------
         //
         // Connects to the master's PEER_FEEDER service and runs a
@@ -3753,6 +3782,22 @@ impl ReplicatedEnvironment {
         self.update_cleaner_replica_protection();
     }
 
+    /// Test-only: force a named feeder to look silent by pushing its
+    /// `last_activity` timestamp `age` into the past, then recompute the
+    /// replication-protected file floor. Drives the CBVLSN expiry path
+    /// (JE `LocalCBVLSNUpdater`) deterministically — a disconnected member
+    /// stops holding the floor down without waiting on the periodic timer or
+    /// real wall-clock time. No-op if no feeder matches `name`.
+    #[cfg(any(test, feature = "test-harness"))]
+    pub fn mark_feeder_silent_for_test(&self, name: &str, age: Duration) {
+        for feeder in self.feeders.read().iter() {
+            if feeder.get_replica_name() == name {
+                feeder.set_last_activity_ago_for_test(age);
+            }
+        }
+        self.update_cleaner_replica_protection();
+    }
+
     /// Compute the global CBVLSN (Cleaner Barrier VLSN): the minimum VLSN
     /// acknowledged by any still-attached electable replica.
     ///
@@ -3766,11 +3811,25 @@ impl ReplicatedEnvironment {
     /// forces the CBVLSN to `0` — the conservative choice, since a replica at
     /// VLSN 0 needs the whole log; this mirrors JE holding files for a replica
     /// whose progress is unknown.
+    ///
+    /// **Expiry (JE `LocalCBVLSNUpdater`):** an electable feeder that has gone
+    /// silent — no ack and no queued entry within `RepConfig::cbvlsn_timeout`
+    /// (JE `RepParams.FEEDER_TIMEOUT`) — is **excluded** from the minimum, so a
+    /// disconnected-but-not-removed member does not pin the master's log files
+    /// forever. In JE each replica's `LocalCBVLSNUpdater` periodically
+    /// broadcasts its local CBVLSN and that contribution *expires* if the
+    /// replica stops reporting; the feeder's `last_activity` (advanced by
+    /// `record_ack` / `queue_entry`) is our equivalent "last reported" clock.
+    /// A live-but-lagging replica keeps its feeder fresh and is still counted
+    /// (and therefore still protected); only a genuinely silent member drops
+    /// out. When *every* electable feeder has expired the result is `None` (no
+    /// live replica to protect for), which releases the floor.
     fn compute_cbvlsn(&self) -> Option<u64> {
         if !self.is_master() {
             return None;
         }
         let group = self.get_rep_group();
+        let cbvlsn_timeout = self.config.cbvlsn_timeout;
         let mut min_vlsn: Option<u64> = None;
         for feeder in self.feeders.read().iter() {
             // Only electable replicas gate the cleaner (JE
@@ -3781,6 +3840,14 @@ impl ReplicatedEnvironment {
                 .map(|n| n.node_type == crate::node_type::NodeType::Electable)
                 .unwrap_or(false);
             if !electable {
+                continue;
+            }
+            // JE `LocalCBVLSNUpdater` expiry: a feeder that has gone silent
+            // past the timeout stops holding the global CBVLSN down — a dead
+            // or disconnected member must not pin the log forever (disk-fill).
+            // A live-but-lagging replica keeps `last_activity` fresh on every
+            // ack / queued entry, so it stays counted and stays protected.
+            if feeder.is_timed_out(cbvlsn_timeout) {
                 continue;
             }
             let v = feeder.get_acked_vlsn();
