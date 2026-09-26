@@ -140,6 +140,9 @@ fn try_recover_and_scan(
 /// torn-write boundary. In all cases the recovered data set must NOT contain a
 /// silently-corrupted value, and the corruption must be observable as either
 /// an error or a truncated prefix of the committed set.
+// JE parity: RecoveryEdgeTest.testBadChecksum — a corrupt/checksum-failing
+// region in the log must never be returned as valid data (JE recovers the
+// committed prefix / raises EnvironmentFailureException).
 #[test]
 fn byte_flip_in_committed_entry_is_detected() {
     let dir = TempDir::new().unwrap();
@@ -232,6 +235,9 @@ fn byte_flip_in_committed_entry_is_detected() {
 /// torn tail as end-of-log (CRC / short-read boundary) and never return the
 /// torn bytes as data. The recovered set must be a valid prefix of the
 /// committed set with no garbage values.
+// JE parity: RecoveryEdgeTest.testNoCheckpointEnd / testBadChecksumReadOnly-
+// ReadPastLastFile — a torn tail must be treated as end-of-log and never
+// surfaced as data.
 #[test]
 fn mid_entry_truncation_torn_tail_not_returned() {
     let dir = TempDir::new().unwrap();

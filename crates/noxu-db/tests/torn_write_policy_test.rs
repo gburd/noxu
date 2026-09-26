@@ -139,6 +139,8 @@ fn reopen_and_count_present(dir: &std::path::Path, n: u32) -> u32 {
 /// clean-closed, the trailing bytes are checkpoint/close metadata, not a
 /// committed data record, so recovery truncates the torn tail and every one of
 /// the `N` committed keys must survive.
+// JE parity: RecoveryEdgeTest.testNoCheckpointEnd — a torn final write is
+// truncated and every prior committed record recovers.
 #[test]
 fn torn_tail_recovers_all_prior_committed() {
     const N: u32 = 40;
@@ -171,6 +173,9 @@ fn torn_tail_recovers_all_prior_committed() {
 /// If recovery ever "punched a hole" (kept key 39 but dropped key 10) this
 /// test fails; a monotone-non-increasing present-count as truncation grows,
 /// with a contiguous surviving prefix, is the correct behavior.
+// JE parity: RecoveryEdgeTest.testBadChecksumReadOnlyReadPastLastFile — a
+// checksum/short-read boundary near the tail recovers a contiguous prefix
+// of committed records (recovery reads back past the last file if needed).
 #[test]
 fn torn_tail_severity_sweep_is_always_a_prefix() {
     const N: u32 = 60;

@@ -157,6 +157,9 @@ mod tests {
 
     /// `minutes` gates the same way, and `force` must override BOTH gates —
     /// that is the documented meaning of `force`.
+    /// JE parity: CheckpointActivationTest.testApiCalls — env.checkpoint() with
+    /// a KBytes/Minutes threshold runs only when the threshold is met; force
+    /// overrides both gates.
     #[test]
     fn minutes_threshold_gates_and_force_overrides_it() {
         let (_d, env) = env_with_records();

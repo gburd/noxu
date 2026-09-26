@@ -57,6 +57,8 @@ fn bin_and_in_count(db: &noxu_db::Database) -> (u64, u64) {
 }
 
 /// Per-DB `DatabaseConfig::node_max_entries` must survive reopen.
+// JE parity: DbConfigUpdateRecoveryTest.testTransactional — a per-DB
+// NodeMaxEntries set via DatabaseConfig survives a reopen (recovery).
 #[test]
 fn db_config_node_max_survives_reopen() {
     let dir = TempDir::new().unwrap();

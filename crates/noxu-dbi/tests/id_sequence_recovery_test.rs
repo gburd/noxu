@@ -44,6 +44,11 @@ fn open_env(dir: &std::path::Path) -> EnvironmentImpl {
 /// FAIL-PRE: on `main` `next_db_id`, `TxnManager.next_txn_id`, and the tree
 /// node-id counters all restart at 1, so the first post-recovery allocation
 /// collides with an id already in the log.
+// JE parity: RecoveryEdgeTest.testDbId / testNodeId / testTxnId — after
+// recovery, a newly allocated db-id / node-id / txn-id must be strictly
+// greater than the max present in the recovered log (no id reuse). JE
+// checks each sequence via DbInternal reflection; Noxu asserts the same
+// no-reuse invariant through the public allocation path (all three ids).
 #[test]
 fn ids_do_not_restart_at_one_after_recovery() {
     let dir = TempDir::new().unwrap();
