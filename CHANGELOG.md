@@ -138,6 +138,15 @@ listed in [References](#references).
   default 30s) is excluded from the CBVLSN so a disconnected node cannot pin the
   log indefinitely; the exclusion keys on liveness, so a live-but-lagging replica
   stays protected.
+- **A database's configured fanout (`NODE_MAX_ENTRIES`) now survives a
+  default-config reopen.** Previously the per-DB fanout was restored only when
+  the caller re-supplied `DatabaseConfig` at open; on a default-config reopen the
+  database reverted to the environment-level `NODE_MAX_ENTRIES`. The resolved
+  fanout is now persisted in the database's on-disk `NameLN` record (matching
+  JE's `maxTreeEntriesPerNode` persistence) and restored automatically. The
+  on-disk change is backward compatible: databases created before this release
+  carry no fanout marker and continue to use the environment-level fallback; no
+  log-format version bump.
 
 - **WAL now fail-stops the environment on a critical log-write failure (JE
   `LogManager.serialLog` parity).** A failed or partial WAL write previously left
