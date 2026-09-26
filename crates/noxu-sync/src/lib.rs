@@ -153,6 +153,8 @@ mod tests {
         barrier.wait();
         std::thread::sleep(Duration::from_millis(10));
         // The raw() accessor exposes get_n_waiters.
+        // SAFETY: `raw()` only exposes the raw lock; `get_n_waiters` reads an
+        // atomic counter and imposes no locking contract on the caller.
         assert!(unsafe { m.raw().get_n_waiters() } >= 1 || m.is_locked());
         drop(_g);
         handle.join().unwrap();
@@ -162,6 +164,8 @@ mod tests {
     fn mutex_force_unlock() {
         let m = Mutex::new(());
         let _g = m.lock();
+        // SAFETY: this thread holds the lock via `m.lock()` (`_g`), so it may
+        // force-unlock it. `_g` is not used to touch the data afterwards.
         unsafe { m.force_unlock() };
         // Should be acquirable now.
         assert!(m.try_lock().is_some());
@@ -243,6 +247,8 @@ mod tests {
         assert!(!raw.is_locked());
         raw.lock();
         assert!(raw.is_locked());
+        // SAFETY: this thread acquired the lock via `raw.lock()` above and
+        // holds it, so it may release it.
         unsafe { raw.unlock() };
         assert!(!raw.is_locked());
     }

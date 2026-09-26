@@ -386,6 +386,14 @@ unsafe impl lock_api::RawRwLock for NoxuRawRwLock {
     }
 }
 
+// SAFETY: `RawRwLockTimed` extends `RawRwLock` with deadline-bounded
+// acquisition; it requires the same shared/exclusive exclusion guarantee,
+// which the `RawRwLock` impl above establishes and documents. Each
+// `try_lock_*_for` / `try_lock_*_until` here acquires only via the same
+// fast-path CAS (`try_lock_shared_fast` / `try_lock_exclusive_fast`) or the
+// same `*_slow` paths used by `RawRwLock`, and returns `false` without
+// acquiring once the deadline passes — so a `true` return always means this
+// thread now holds the requested (shared or exclusive) access.
 unsafe impl lock_api::RawRwLockTimed for NoxuRawRwLock {
     type Duration = Duration;
     type Instant = Instant;
@@ -865,6 +873,8 @@ mod tests {
             "owner must be recorded after acquiring the write lock"
         );
 
+        // SAFETY: this thread acquired the write lock via `try_lock_exclusive`
+        // above and holds it, so it may release it.
         unsafe { raw.unlock_exclusive() };
         assert!(!raw.is_locked());
         assert_eq!(
@@ -889,6 +899,8 @@ mod tests {
             "exclusive acquire must fail while a reader holds the lock"
         );
 
+        // SAFETY: this thread acquired a shared lock via `raw.lock_shared()`
+        // above and holds it, so it may release one shared hold.
         unsafe { raw.unlock_shared() };
         assert_eq!(raw.reader_count(), 0);
         assert!(!raw.is_locked());
@@ -911,6 +923,9 @@ mod tests {
         .unwrap();
         assert!(timed_out);
 
+        // SAFETY: this thread holds the write lock (`try_lock_exclusive` above;
+        // the spawned thread timed out and never acquired it), so it may
+        // release it.
         unsafe { raw.unlock_exclusive() };
     }
 
@@ -951,7 +966,11 @@ mod tests {
              timeout -- if this fails, WRITE_LOCKED was left set with no \
              owner and no unlock coming, i.e. the lock is permanently dead"
         );
+        // SAFETY: the original `raw.lock_shared()` hold and the `try_lock_shared`
+        // hold above are both still held by this thread (the writer timed out
+        // and acquired nothing), so it may release both shared holds.
         unsafe { raw.unlock_shared() };
+        // SAFETY: as above — the second of this thread's two shared holds.
         unsafe { raw.unlock_shared() };
         assert!(!raw.is_locked());
     }
@@ -978,6 +997,8 @@ mod tests {
             "waiter count must be decremented on the timeout path"
         );
 
+        // SAFETY: this thread holds the write lock (`try_lock_exclusive` above;
+        // the spawned reader timed out), so it may release it.
         unsafe { raw.unlock_exclusive() };
     }
 
@@ -998,6 +1019,9 @@ mod tests {
         let raw2 = Arc::clone(&raw);
         let writer = std::thread::spawn(move || {
             raw2.lock_exclusive();
+            // SAFETY: this closure acquired the write lock via
+            // `raw2.lock_exclusive()` on the line above and holds it, so it
+            // may release it.
             unsafe { raw2.unlock_exclusive() };
         });
 
@@ -1005,6 +1029,9 @@ mod tests {
         std::thread::sleep(Duration::from_millis(30));
         assert!(!raw.is_locked_exclusive(), "reader still holds the lock");
 
+        // SAFETY: this thread holds the shared lock it took via
+        // `raw.lock_shared()` above; releasing it lets the parked writer
+        // acquire.
         unsafe { raw.unlock_shared() };
         writer.join().unwrap();
 
@@ -1021,6 +1048,8 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         assert!(raw.try_lock_exclusive_until(deadline));
         assert!(raw.is_locked_exclusive());
+        // SAFETY: `try_lock_exclusive_until` returned `true`, so this thread
+        // holds the write lock and may release it.
         unsafe { raw.unlock_exclusive() };
     }
 }

@@ -45,3 +45,6 @@ harness = false
 [[bench]]
 name = "sync_fairness"
 harness = false
+
+[lints]
+workspace = true

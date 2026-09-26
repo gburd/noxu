@@ -18,9 +18,15 @@ fn run(threads: usize, write_every: usize, secs: u64) {
             while !s.load(Ordering::Relaxed) {
                 if write_every > 0 && i % write_every == 0 {
                     l.lock_exclusive();
+                    // SAFETY: `lock_exclusive()` on the line above acquired the
+                    // write lock for this thread; it holds it here, so it may
+                    // release it.
                     unsafe { l.unlock_exclusive() };
                 } else {
                     l.lock_shared();
+                    // SAFETY: `lock_shared()` on the line above acquired a
+                    // shared hold for this thread; it holds it here, so it may
+                    // release it.
                     unsafe { l.unlock_shared() };
                 }
                 i = i.wrapping_add(1);
