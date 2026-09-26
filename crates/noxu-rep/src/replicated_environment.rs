@@ -26,8 +26,8 @@
 //! When the environment is closed, the node transitions to the Detached state.
 
 use noxu_dbi::{
-    AckWaitError, AckWaitErrorKind, EnvironmentImpl, ReplicaAckCoordinator,
-    ReplicaAckPolicyKind,
+    AckWaitError, AckWaitErrorKind, CommitBlockLatch, EnvironmentImpl,
+    ReplicaAckCoordinator, ReplicaAckPolicyKind,
 };
 use noxu_sync::RwLock;
 use std::net::SocketAddr;
@@ -340,6 +340,16 @@ pub struct ReplicatedEnvironment {
     /// `MasterTracker::generation()`) and returns without spawning a
     /// second thread.
     replica_thread_running: Arc<AtomicBool>,
+
+    /// B5/V16/F1 (JE `MasterTransfer` phase 2): transfer-scoped commit block,
+    /// shared with the wired `EnvironmentImpl`. [`Self::transfer_master`]
+    /// engages it once the target is confirmed caught up, re-confirms the
+    /// target covers the master's now-frozen final VLSN, hands off, and lifts
+    /// it (on success or on any abort/timeout). While engaged, both
+    /// [`Self::replicate_entry`] and `EnvironmentImpl::log_txn_commit` park
+    /// before advancing / assigning a new commit VLSN, so no commit can slip
+    /// in after the catch-up check and be handed off missing.
+    transfer_commit_block: Arc<CommitBlockLatch>,
 }
 
 impl ReplicatedEnvironment {
@@ -608,6 +618,7 @@ impl ReplicatedEnvironment {
             wal_feeds_served: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             consistency_tracker: StdMutex::new(None),
             replica_thread_running: Arc::new(AtomicBool::new(false)),
+            transfer_commit_block: Arc::new(CommitBlockLatch::new()),
         };
 
         Ok(env)
@@ -1540,6 +1551,13 @@ impl ReplicatedEnvironment {
         // entries and auto-feed them to replicas without any
         // replicate_entry call from the application.
         env.set_replication_vlsn_counter(Arc::clone(&self.wal_vlsn_counter));
+
+        // B5/V16/F1 (JE `MasterTransfer` phase 2): install the transfer-scoped
+        // commit block so `log_txn_commit` parks before assigning a new commit
+        // VLSN while `transfer_master` holds the block for its final hand-off
+        // window. Shares the same latch `transfer_master` engages / lifts and
+        // that `replicate_entry` also honours.
+        env.set_transfer_commit_block(Arc::clone(&self.transfer_commit_block));
     }
 
     /// Get the current node state.
@@ -3472,6 +3490,65 @@ impl ReplicatedEnvironment {
         }
         // -------------------------------------------------------------
 
+        // B5/V16/F1 (JE `MasterTransfer` phase 2, MasterTransfer.java ~220-226
+        // phase-1/phase-2, and ~254-283 VLSNProgress/readyReplicas):
+        //
+        // Phase 1 above waited for the target to catch up to a one-time VLSN
+        // snapshot, but nothing stopped the master from accepting more commits
+        // between that check and the hand-off -- so the target could be handed
+        // mastership already behind the master's true tail again (the same
+        // loss shape, narrower). Phase 2 closes that window: FREEZE new commit
+        // VLSN assignment, then RE-CONFIRM the target covers the master's now-
+        // frozen, final VLSN before handing off. While frozen, both
+        // `EnvironmentImpl::log_txn_commit` and `Self::replicate_entry` park
+        // before advancing the tail, so no commit can slip in after the check.
+        //
+        // The freeze is lifted on EVERY exit path via `_freeze_guard`'s Drop:
+        //   - re-confirm fails / any hand-off error -> old master resumes as
+        //     master with its full tail (nothing was demoted yet);
+        //   - successful hand-off -> we are now a replica, so lifting the
+        //     (master-side) freeze is a harmless idempotent no-op.
+        // The block is bounded (`CommitBlockLatch`), so even a panic between
+        // here and hand-off cannot wedge the commit path indefinitely.
+        //
+        // `config.force` already skipped phase 1; it also skips phase 2.
+        struct FreezeGuard<'a>(&'a CommitBlockLatch);
+        impl Drop for FreezeGuard<'_> {
+            fn drop(&mut self) {
+                self.0.thaw();
+            }
+        }
+        let _freeze_guard = if master_vlsn > 0 && !config.force {
+            self.transfer_commit_block.block();
+            // Re-confirm under the freeze: read the master's now-final VLSN and
+            // require the target to still cover it. A commit that raced in
+            // before the freeze took hold (advancing master_vlsn) is caught
+            // here; the freeze guarantees no FURTHER commit can advance it.
+            let final_master_vlsn = self.vlsn_index.get_range().last();
+            let acked =
+                self.active_feeder_runner_acked_vlsn(&config.target_node);
+            if acked < final_master_vlsn {
+                // Guard not yet constructed, so lift the freeze explicitly.
+                self.transfer_commit_block.thaw();
+                return Err(RepError::StateError(format!(
+                    "transfer_master: target '{}' fell behind the master's \
+                     final VLSN under the commit freeze (acked {} < master \
+                     {}); refusing hand-off to avoid data loss",
+                    config.target_node, acked, final_master_vlsn,
+                )));
+            }
+            log::info!(
+                "transfer_master: commit freeze engaged; target '{}' confirmed \
+                 at final master VLSN {} (acked {})",
+                config.target_node,
+                final_master_vlsn,
+                acked,
+            );
+            Some(FreezeGuard(&self.transfer_commit_block))
+        } else {
+            None
+        };
+
         let new_term = self.master_tracker.get_term().saturating_add(1);
 
         // 1. Tell the target to become master at the new term.
@@ -3572,6 +3649,13 @@ impl ReplicatedEnvironment {
         entry_type: u8,
         data: Vec<u8>,
     ) {
+        // B5/V16/F1 (JE `MasterTransfer` phase 2): while a master transfer
+        // holds the transfer-scoped commit block, park BEFORE advancing this
+        // node's observable VLSN tail, so a commit cannot slip in and advance
+        // the master past the VLSN the target was just confirmed to cover.
+        // Bounded (see `CommitBlockLatch`), so it never wedges the feed path.
+        self.transfer_commit_block.await_thaw();
+
         // Register VLSN -> LSN, dispatching entry type so lastSync /
         // lastTxnEnd advance (REP-5; JE VLSNRange.getUpdateForNewMapping).
         // An unknown type byte falls back to extend-only registration.

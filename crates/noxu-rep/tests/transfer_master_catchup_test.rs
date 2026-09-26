@@ -240,3 +240,105 @@ fn transfer_master_succeeds_when_target_caught_up() {
 
     h.teardown();
 }
+
+/// B5/V16/F1 phase-2 (JE `MasterTransfer` phase-2 commit block): a master that
+/// is ACTIVELY COMMITTING during the transfer window must not lose an
+/// acknowledged commit.
+///
+/// This pins the residual window the review found: the phase-1 catch-up wait
+/// compares the target against a ONE-TIME snapshot of the master VLSN, and
+/// (before the fix) nothing froze new commits between that check and the
+/// hand-off. So a commit that lands after the check advances the master past
+/// the VLSN the target was confirmed to cover, and the target is handed
+/// mastership already behind again -- the same loss shape, narrower.
+///
+/// Scenario: target is caught up to VLSN 5 (== master), phase-1 passes. A
+/// concurrent writer commits VLSN 6 during the transfer window. The target
+/// never acks past 5 (the drain stops at 5).
+///
+/// * On base c4478496 (no commit freeze): `replicate_entry(6)` advances the
+///   master to 6 immediately; the transfer -- having only checked the stale
+///   snapshot 5 -- hands off anyway, demoting the old master while the target
+///   became master having acked only 5. The master`s VLSN at hand-off was 6
+///   with the target at 5: commit 6 is lost. This test FAILS on base.
+/// * With the fix (JE phase-2 freeze): `replicate_entry(6)` PARKS on the
+///   transfer-scoped commit block until the transfer resolves, so the master`s
+///   observable tail stays 5 through the re-confirm and hand-off. The transfer
+///   re-confirms the target covers the master`s final VLSN (5) and hands off
+///   cleanly; commit 6 only advances the tail AFTER the node is already a
+///   replica -- it was never handed off as the master`s acknowledged tail.
+///
+/// The invariant asserted (independent of interleaving): if the transfer
+/// succeeded (old master demoted), then the master`s VLSN observed at the
+/// instant the transfer returned must NOT exceed the VLSN the target was
+/// confirmed to cover (5). On base the observed VLSN is 6 > 5 -> FAIL.
+#[test]
+fn transfer_master_freezes_commits_during_handoff_window() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let h = setup(5);
+
+    // A concurrent writer that advances the master VLSN to 6 during the
+    // transfer window. It is armed just before the transfer starts and fires
+    // immediately, so it races into the check->hand-off window. On the fixed
+    // build `replicate_entry` parks on the commit freeze; on base it advances
+    // the master to 6 with nothing stopping it.
+    let master = Arc::clone(&h.master_env);
+    let start_writer = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer_advanced_to = Arc::new(AtomicU64::new(0));
+    let sw = Arc::clone(&start_writer);
+    let wa = Arc::clone(&writer_advanced_to);
+    let writer = std::thread::spawn(move || {
+        while !sw.load(Ordering::Acquire) {
+            std::hint::spin_loop();
+        }
+        // Post-check commit: advances (or tries to advance) the master to 6.
+        // On the fixed build this call blocks on the transfer commit freeze
+        // until the transfer resolves.
+        master.replicate_entry(6, 0, 6 * 16, 0, vec![6u8; 4]);
+        wa.store(master.get_current_vlsn(), Ordering::Release);
+    });
+
+    // Fire the writer and immediately start the transfer so the commit races
+    // into the hand-off window. A generous timeout: the caught-up target
+    // (acked 5) passes phase-1 promptly.
+    start_writer.store(true, Ordering::Release);
+    let cfg =
+        MasterTransferConfig::new("target".to_string(), Duration::from_secs(5));
+    let res = Arc::clone(&h.master_env).transfer_master(cfg);
+
+    // Snapshot the master VLSN the instant the transfer returned.
+    let vlsn_at_return = h.master_env.get_current_vlsn();
+
+    // If the transfer handed off (Ok + demoted), the target only ever acked 5,
+    // so the master`s tail at hand-off must not have exceeded 5 -- otherwise a
+    // committed entry (6) was handed off missing.
+    if res.is_ok() {
+        assert!(
+            h.master_env.is_replica(),
+            "Ok transfer must have demoted the old master (got {:?})",
+            h.master_env.get_state()
+        );
+        assert!(
+            vlsn_at_return <= 5,
+            "DATA LOSS: transfer handed off with master VLSN {vlsn_at_return} \
+             > target`s confirmed VLSN 5. A commit that landed after the \
+             catch-up check was handed off missing (target became master \
+             having acked only 5). The phase-2 commit freeze must prevent a \
+             post-check commit from advancing the handed-off tail."
+        );
+    } else {
+        // A refused transfer is also acceptable (old master keeps its tail and
+        // stays master) -- no acknowledged data is lost either way.
+        assert!(
+            h.master_env.is_master(),
+            "a refused transfer must leave the old master as master"
+        );
+    }
+
+    // Let the (possibly parked) writer finish before teardown.
+    let _ = writer.join();
+    let _ = writer_advanced_to.load(Ordering::Acquire);
+
+    h.teardown();
+}
