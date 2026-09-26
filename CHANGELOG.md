@@ -259,7 +259,13 @@ listed in [References](#references).
   environment sets no floor and the cleaner is unaffected. Matches JE, where
   the master pins every log file at or after the file containing the global
   CBVLSN via the `FileProtector` replication-protected range (`GlobalCBVLSN` /
-  `LocalCBVLSNUpdater`). Reproduced fail-on-base / pass-on-fix (debug and
+  `LocalCBVLSNUpdater`). The floor is also recomputed on a periodic master-side
+  timer (JE `LocalCBVLSNUpdater`), on `remove_peer`, and released on demotion.
+  A silent (disconnected-but-not-removed) electable member is **excluded** from
+  the CBVLSN after `RepConfig::cbvlsn_timeout` (default 30 s, JE
+  `RepParams.FEEDER_TIMEOUT`) so a dead member does not pin the master's log
+  files forever (disk-fill); a live-but-lagging replica keeps its feeder fresh
+  and stays protected. Reproduced fail-on-base / pass-on-fix (debug and
   release).
 
 ### Security
