@@ -8047,35 +8047,6 @@ impl Tree {
         }
     }
 
-    /// Test-only: return the `cursor_count` (pin count) of the BIN that owns
-    /// `key`, or `None` if no BIN is found.  Used by the NEW-9 leak regression
-    /// test to assert the descent pin is released on the `lock_ln` error path
-    /// (the crossed-into BIN's `cursor_count` must return to 0, so the evictor
-    /// is not wedged off it).
-    pub fn bin_cursor_count_for_key(&self, key: &[u8]) -> Option<i32> {
-        let arc = self.bin_arc_for_key(key)?;
-        let guard = arc.read();
-        if let TreeNode::Bottom(ref stub) = *guard {
-            Some(stub.cursor_count)
-        } else {
-            None
-        }
-    }
-
-    /// Test-only: return the `node_id` of the BIN that owns `key`, or `None`.
-    /// Used by the NEW-9 leak regression test to find a BIN boundary (the
-    /// first adjacent key pair that lands in two different BINs) without the
-    /// `#[cfg(noxu_shuttle)]`-gated shuttle helpers.
-    pub fn bin_node_id_for_key(&self, key: &[u8]) -> Option<u64> {
-        let arc = self.bin_arc_for_key(key)?;
-        let guard = arc.read();
-        if let TreeNode::Bottom(ref stub) = *guard {
-            Some(stub.node_id)
-        } else {
-            None
-        }
-    }
-
     /// Returns `true` if the given `BinStub` is a BIN-delta (not a full BIN).
     ///
     /// `IN.isBINDelta()`.

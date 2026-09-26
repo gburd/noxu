@@ -289,9 +289,7 @@ struct PinnedBinGuard {
 impl PinnedBinGuard {
     /// Adopt an already-pinned (`cursor_count += 1`) BIN arc.
     fn new(
-        arc: std::sync::Arc<
-            noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>,
-        >,
+        arc: std::sync::Arc<noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>>,
     ) -> Self {
         Self { arc: Some(arc) }
     }
@@ -4175,6 +4173,101 @@ mod tests {
             &config,
         );
         Arc::new(RwLock::new(db_impl))
+    }
+
+    /// Read the `cursor_count` (descent pin count) directly off a BIN arc.
+    ///
+    /// Panics if the arc is not a `TreeNode::Bottom` (BIN) — the NEW-9 guard
+    /// only ever wraps BIN arcs pinned by the cursor descent.
+    fn bin_cursor_count(
+        arc: &Arc<noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>>,
+    ) -> i32 {
+        let guard = arc.read();
+        match &*guard {
+            noxu_tree::tree::TreeNode::Bottom(stub) => stub.cursor_count,
+            _ => panic!("expected a BIN (TreeNode::Bottom)"),
+        }
+    }
+
+    /// NEW-9 (leak fix) — deterministic unit proof of the `PinnedBinGuard`
+    /// contract, independent of lock timing or tree topology.
+    ///
+    /// The cross-BIN advance in [`CursorImpl::retrieve_next`] pins the next
+    /// BIN (`cursor_count += 1`) and then calls `lock_ln`, which can `Err`.
+    /// Pre-fix, a raw local `Arc` dropped on that `?` WITHOUT unpinning,
+    /// wedging the evictor off that BIN forever (`cursor_count > 0`).  The
+    /// guard fixes this: it unpins on drop UNLESS `into_arc` committed the
+    /// pin to the installer.  This test proves both halves of that contract
+    /// directly:
+    ///
+    ///  (a) error path — dropping the guard WITHOUT `into_arc` unpins
+    ///      (`cursor_count` returns to 0);
+    ///  (b) success path — `into_arc` keeps the pin (`cursor_count` stays 1)
+    ///      and hands back the SAME BIN arc for installation.
+    ///
+    /// Non-vacuity: if the guard's `Drop` is neutered (unpin removed), part
+    /// (a) fails because `cursor_count` stays 1 after drop.
+    #[test]
+    fn pinned_bin_guard_drop_unpins_into_arc_keeps_pin() {
+        let db = create_test_database();
+        {
+            let mut cursor = CursorImpl::new(Arc::clone(&db), 100);
+            cursor.put(b"k", b"v", PutMode::Overwrite).unwrap();
+        }
+
+        // Grab a real BIN arc for the seeded key.
+        let bin_arc = {
+            let guard = db.read();
+            let tree = guard.get_real_tree().expect("real tree");
+            tree.bin_arc_for_key(b"k").expect("key resolves to a BIN")
+        };
+        assert_eq!(bin_cursor_count(&bin_arc), 0, "BIN starts unpinned");
+
+        // (a) ERROR PATH: pin the BIN (as the descent does), wrap it in a
+        //     guard, then drop the guard WITHOUT calling into_arc.  The pin
+        //     must be released (this is the leak-fix contract).
+        {
+            Tree::pin_bin(&bin_arc);
+            assert_eq!(
+                bin_cursor_count(&bin_arc),
+                1,
+                "pin_bin must bump cursor_count to 1"
+            );
+            let guard = PinnedBinGuard::new(Arc::clone(&bin_arc));
+            // The guard still borrows the SAME arc while armed.
+            assert!(Arc::ptr_eq(guard.arc(), &bin_arc));
+            drop(guard);
+        }
+        assert_eq!(
+            bin_cursor_count(&bin_arc),
+            0,
+            "NEW-9 leak: dropping an armed PinnedBinGuard (error path) must \
+             unpin the BIN (cursor_count back to 0); a leaked pin wedges the \
+             evictor off this BIN forever"
+        );
+
+        // (b) SUCCESS PATH: pin the BIN, wrap it, then into_arc() (commit).
+        //     The pin must STAY (ownership transferred to the installer), and
+        //     the returned arc must be the SAME BIN.
+        Tree::pin_bin(&bin_arc);
+        assert_eq!(bin_cursor_count(&bin_arc), 1, "pin_bin bumps to 1");
+        let installed = PinnedBinGuard::new(Arc::clone(&bin_arc)).into_arc();
+        assert!(
+            Arc::ptr_eq(&installed, &bin_arc),
+            "into_arc must return the same pinned BIN arc"
+        );
+        assert_eq!(
+            bin_cursor_count(&bin_arc),
+            1,
+            "NEW-9 success path: into_arc() transfers ownership and must NOT \
+             unpin (cursor_count stays 1); the installer \
+             (update_bin_pin_prepinned) now owns the pin"
+        );
+
+        // Clean up the pin we committed above so we leave the BIN as we
+        // found it (mirrors update_bin_pin_prepinned's eventual unpin).
+        Tree::unpin_bin(&bin_arc);
+        assert_eq!(bin_cursor_count(&bin_arc), 0);
     }
 
     #[test]
