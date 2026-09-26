@@ -10209,6 +10209,145 @@ mod tests {
         );
     }
 
+    // ========================================================================
+    // JE: INKeyRepTest (je/test/com/sleepycat/je/tree/INKeyRepTest.java)
+    //
+    // JE's `INKeyRep` has two representations — `Default` (one byte[] per slot)
+    // and `MaxKeySize` (all keys packed into one fixed-width buffer).  Noxu's
+    // `KeyRep` is the port: `KeyRep::Default` <-> `INKeyRep.Default`,
+    // `KeyRep::Compact` <-> `INKeyRep.MaxKeySize` (Type.DEFAULT / MAX_KEY_SIZE).
+    // These unit tests port the rep-level set/get and type-transition
+    // assertions (`compact` / `expandToDefaultRep`).
+    //
+    // Deviations: JE pre-sizes a fixed nullable-slot array (`new Default(size)`)
+    // and mutates the rep object in place returning the (possibly new) rep;
+    // Noxu's `KeyRep` is a dense grow-on-insert vector, so we build slots with
+    // `insert` and drive transitions with `set`/`compact`.  The observable
+    // contract asserted here — WHEN the rep is Compact vs Default — is
+    // identical.  JE's embedded-LN-data variant of `compareKeys` is N/A: Noxu
+    // stores LN data separately from keys (see BinEntry.data).
+    // ========================================================================
+
+    /// JE: INKeyRepTest.testBasic — set/get round-trip on both reps.
+    #[test]
+    fn inkeyrep_basic_set_get() {
+        // Default rep: build slots, set, read back.
+        let mut rep = KeyRep::new();
+        for i in 0..8u8 {
+            rep.insert(i as usize, vec![i]);
+        }
+        rep.set(1, vec![1]);
+        assert_eq!(rep.get(1), &[1]);
+        // Overwrite slot 1, confirm the new value.
+        rep.set(1, vec![9]);
+        assert_eq!(rep.get(1), &[9]);
+
+        // Compact rep: same round-trip after compaction (all keys <= max).
+        rep.set(1, vec![1]);
+        rep.compact(INKeyRep_DEFAULT_MAX_KEY_LENGTH);
+        assert!(rep.is_compact(), "small-key rep must compact");
+        assert_eq!(rep.get(1), &[1]);
+    }
+
+    /// JE: INKeyRepTest.testMaxKeyMutation — a MaxKeySize (Compact) rep stays
+    /// Compact on a null/small set but mutates to Default when a key larger
+    /// than the slot width is stored (`MaxKeySize.expandToDefaultRep`).
+    #[test]
+    fn inkeyrep_max_key_mutation() {
+        let max = INKeyRep_DEFAULT_MAX_KEY_LENGTH; // 16
+        let mut rep = KeyRep::new();
+        for i in 0..8u8 {
+            rep.insert(i as usize, vec![i; 4]); // 4-byte keys, all <= max
+        }
+        rep.compact(max);
+        assert!(rep.is_compact(), "all-small keys -> Compact (MAX_KEY_SIZE)");
+
+        // Set a same-or-smaller key: no mutation.
+        rep.set(0, vec![0u8; 4]);
+        assert!(rep.is_compact(), "small key set must not mutate the rep");
+
+        // Set a key LARGER than the slot width: must inflate to Default.
+        rep.set(0, vec![0u8; (max + 1) as usize]);
+        assert!(
+            !rep.is_compact(),
+            "a key > TREE_COMPACT_MAX_KEY_LENGTH must mutate to Default"
+        );
+        assert_eq!(rep.get(0).len(), (max + 1) as usize);
+    }
+
+    /// JE: INKeyRepTest.testRampUp — inserting keys of growing length and
+    /// compacting: with a small max the rep ends MAX_KEY_SIZE (Compact); with a
+    /// large max it stays Default because packing 128 keys at the max width
+    /// would cost more than per-key byte[]s.
+    #[test]
+    fn inkeyrep_ramp_up() {
+        // Small max (5): after compaction the rep is Compact.
+        {
+            let small_max = 5i32;
+            let mut rep = KeyRep::new();
+            // All keys <= small_max bytes.
+            for i in 0..16usize {
+                let klen = (i % small_max as usize).max(1);
+                rep.insert(i, vec![0xAB; klen]);
+            }
+            rep.compact(small_max);
+            assert!(
+                rep.is_compact(),
+                "small-max ramp-up must transition to Compact/MAX_KEY_SIZE"
+            );
+        }
+        // A key exceeding the max keeps the rep Default even after compact().
+        {
+            let small_max = 5i32;
+            let mut rep = KeyRep::new();
+            for i in 0..8usize {
+                rep.insert(i, vec![0xAB; 3]);
+            }
+            rep.insert(8, vec![0xCD; (small_max + 3) as usize]); // > max
+            rep.compact(small_max);
+            assert!(
+                !rep.is_compact(),
+                "a key over the max must keep the rep Default"
+            );
+        }
+    }
+
+    /// JE: INKeyRepTest.testShiftEntries — insert/remove shift slots and keep
+    /// every slot's key aligned (the `INArrayRep.copy` shift semantics), for
+    /// both the Default and Compact reps.
+    #[test]
+    fn inkeyrep_shift_entries() {
+        for compact in [false, true] {
+            let mut rep = KeyRep::new();
+            let mut model: Vec<Vec<u8>> = Vec::new();
+            for i in 0..8u8 {
+                let k = vec![i; 4];
+                rep.insert(i as usize, k.clone());
+                model.insert(i as usize, k);
+            }
+            if compact {
+                rep.compact(INKeyRep_DEFAULT_MAX_KEY_LENGTH);
+                assert!(rep.is_compact());
+            }
+
+            // Insert at slot 3 -> everything at >=3 shifts up.
+            let nk = vec![0x77u8; 4];
+            rep.insert(3, nk.clone());
+            model.insert(3, nk);
+            for (i, m) in model.iter().enumerate() {
+                assert_eq!(rep.get(i), m.as_slice(), "after insert, slot {i}");
+            }
+
+            // Remove slot 3 -> everything above shifts down.
+            rep.remove(3);
+            model.remove(3);
+            assert_eq!(rep.len(), model.len());
+            for (i, m) in model.iter().enumerate() {
+                assert_eq!(rep.get(i), m.as_slice(), "after remove, slot {i}");
+            }
+        }
+    }
+
     #[test]
     fn test_empty_tree() {
         let tree = Tree::new(1, 128);
