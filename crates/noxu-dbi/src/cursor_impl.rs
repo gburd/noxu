@@ -1209,13 +1209,7 @@ impl CursorImpl {
                             let bin_arc = {
                                 let db = self.db_impl.read();
                                 db.get_real_tree().and_then(|tree| {
-                                    tree.get_root().and_then(|r| {
-                                        Self::find_bin_for_key(
-                                            r,
-                                            &k,
-                                            tree.get_comparator(),
-                                        )
-                                    })
+                                    Self::find_bin_for_key(&tree, &k)
                                 })
                             };
                             // READ_COMMITTED revalidation (C1/V1): `k`/`v` were
@@ -1875,9 +1869,9 @@ impl CursorImpl {
     /// Data-read path in `CursorImpl.lockAndGetCurrent()`.
     fn get_data_from_tree(tree: &Tree, key: &[u8]) -> Option<(Vec<u8>, u64)> {
         use noxu_tree::tree::TreeNode;
-        let root = tree.get_root()?;
-        // Descend to the BIN that should contain `key` (not always the leftmost).
-        let bin_arc = Self::find_bin_for_key(root, key, tree.get_comparator())?;
+        // Descend to the BIN that should contain `key` (not always the
+        // leftmost), re-faulting an evicted interior child (NEW-8).
+        let bin_arc = Self::find_bin_for_key(tree, key)?;
         let guard = bin_arc.read();
         match &*guard {
             TreeNode::Bottom(bin) => {
@@ -1983,9 +1977,9 @@ impl CursorImpl {
         // Step 1: scan the BIN that should contain `key`.  The read lock
         // is dropped at the end of this block before step 2 runs.
         let in_current: Option<(Vec<u8>, Vec<u8>, u64, usize)> = {
-            let root = tree.get_root()?;
-            // Use find_bin_for_key so range searches also work for non-leftmost BINs.
-            let bin_arc = Self::find_bin_for_key(root, key, cmp.as_ref())?;
+            // Use find_bin_for_key so range searches also work for
+            // non-leftmost BINs (re-faulting an evicted interior child, NEW-8).
+            let bin_arc = Self::find_bin_for_key(tree, key)?;
             let guard = bin_arc.read();
             match &*guard {
                 TreeNode::Bottom(bin) => {
@@ -2086,89 +2080,6 @@ impl CursorImpl {
         ))
     }
 
-    /// Descends from the given node to the leftmost BIN, returning its Arc.
-    fn descend_to_bin(
-        node: std::sync::Arc<noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>>,
-    ) -> Option<std::sync::Arc<noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>>>
-    {
-        use noxu_tree::tree::TreeNode;
-        let mut current = node;
-        loop {
-            let (is_bin, child) = {
-                let g = current.read();
-                let is_bin = g.is_bin();
-                let child = if !is_bin {
-                    match &*g {
-                        TreeNode::Internal(n) => n.get_child(0),
-                        _ => None,
-                    }
-                } else {
-                    None
-                };
-                (is_bin, child)
-            };
-            if is_bin {
-                return Some(current);
-            }
-            current = child?;
-        }
-    }
-
-    /// Descends from the given node to the rightmost BIN, returning its Arc
-    /// together with an anchor key that routes back into that BIN.
-    ///
-    /// The anchor is the parent IN's highest separator key (the key at the
-    /// slot we descended through to reach the rightmost child).  It is needed
-    /// only when the rightmost BIN turns out to be **physically empty**
-    /// (`n_entries == 0`, e.g. after every slot was deleted but the BIN has
-    /// not yet been pruned): `get_last` then uses it as the anchor for
-    /// `retrieve_next(Prev)` → `get_prev_bin(anchor)`, mirroring JE
-    /// `CursorImpl.positionFirstOrLast` treating an empty edge BIN as
-    /// FOUND/index=-1 and letting getPrev cross to the previous BIN
-    /// (CursorImpl.java:1765-1772).  `None` when the rightmost BIN is the
-    /// root (single-BIN tree, no parent separator).
-    fn descend_to_last_bin(
-        node: std::sync::Arc<noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>>,
-    ) -> Option<(
-        std::sync::Arc<noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>>,
-        Option<Vec<u8>>,
-    )> {
-        use noxu_tree::tree::TreeNode;
-        let mut current = node;
-        let mut anchor: Option<Vec<u8>> = None;
-        loop {
-            let (is_bin, child, sep) = {
-                let g = current.read();
-                let is_bin = g.is_bin();
-                let (child, sep) = if !is_bin {
-                    match &*g {
-                        TreeNode::Internal(n) => {
-                            let last = n.entries.len().saturating_sub(1);
-                            (
-                                n.get_child(last),
-                                n.entries.get(last).map(|e| e.key.clone()),
-                            )
-                        }
-                        _ => (None, None),
-                    }
-                } else {
-                    (None, None)
-                };
-                (is_bin, child, sep)
-            };
-            if is_bin {
-                return Some((current, anchor));
-            }
-            // Remember the separator that routes into the rightmost child so
-            // an empty rightmost BIN can still be anchored for a backward
-            // cross.
-            if let Some(s) = sep {
-                anchor = Some(s);
-            }
-            current = child?;
-        }
-    }
-
     /// Positions the cursor at the first (smallest) record in the database.
     ///
     /// .
@@ -2196,8 +2107,11 @@ impl CursorImpl {
                     None
                 } else {
                     use noxu_tree::tree::TreeNode;
-                    tree.get_root().and_then(|r| {
-                        let bin_arc = Self::descend_to_bin(r)?;
+                    // EV-14/EV-13 (NEW-8): descend via the re-faulting
+                    // Tree::first_bin_arc so an EVICTED leftmost child is
+                    // re-faulted from the log (JE Tree.getFirstNode ->
+                    // IN.fetchTarget), matching the point-read path.
+                    tree.first_bin_arc().and_then(|bin_arc| {
                         let (key, data, idx, lsn) = {
                             let g = bin_arc.read();
                             match &*g {
@@ -2340,9 +2254,11 @@ impl CursorImpl {
                     None
                 } else {
                     use noxu_tree::tree::TreeNode;
-                    tree.get_root().and_then(|r| {
-                        let (bin_arc, empty_anchor) =
-                            Self::descend_to_last_bin(r)?;
+                    // EV-14/EV-13 (NEW-8): descend via the re-faulting
+                    // Tree::last_bin_arc so an EVICTED rightmost child is
+                    // re-faulted from the log (JE Tree.getLastNode ->
+                    // IN.fetchTarget), matching the point-read path.
+                    tree.last_bin_arc().and_then(|(bin_arc, empty_anchor)| {
                         let (key, data, idx, lsn) = {
                             let g = bin_arc.read();
                             match &*g {
@@ -2711,12 +2627,7 @@ impl CursorImpl {
                 )> = anchor_for_reanchor.and_then(|ck| {
                     let db = self.db_impl.read();
                     let tree = db.get_real_tree()?;
-                    let root = tree.get_root()?;
-                    let found_arc = Self::find_bin_for_key(
-                        root,
-                        ck,
-                        tree.get_comparator(),
-                    )?;
+                    let found_arc = Self::find_bin_for_key(&tree, ck)?;
                     let cmp = tree.get_comparator();
                     let idx = {
                         let g = found_arc.read();
@@ -2874,14 +2785,12 @@ impl CursorImpl {
                 if tree.is_empty() {
                     entry = None;
                     new_bin_arc = None;
-                } else if let (Some(current_key), Some(root)) =
-                    (current_key_slice_opt.as_deref(), tree.get_root())
+                } else if let Some(current_key) =
+                    current_key_slice_opt.as_deref()
                 {
-                    if let Some(bin_arc) = Self::find_bin_for_key(
-                        root,
-                        current_key,
-                        tree.get_comparator(),
-                    ) {
+                    if let Some(bin_arc) =
+                        Self::find_bin_for_key(&tree, current_key)
+                    {
                         // Clone so we can move the arc after the read guard is dropped.
                         let arc_to_save = bin_arc.clone();
                         {
@@ -3082,13 +2991,7 @@ impl CursorImpl {
             let bin_arc = {
                 let db = self.db_impl.read();
                 db.get_real_tree().and_then(|tree| {
-                    tree.get_root().and_then(|r| {
-                        Self::find_bin_for_key(
-                            r,
-                            &new_key_ref,
-                            tree.get_comparator(),
-                        )
-                    })
+                    Self::find_bin_for_key(&tree, &new_key_ref)
                 })
             };
             // READ_COMMITTED revalidation (C1/V1): `raw_key`/`raw_data` were
@@ -3223,38 +3126,37 @@ impl CursorImpl {
                                 None
                             } else {
                                 use noxu_tree::tree::TreeNode;
-                                tree.get_root().and_then(|r| {
-                                    // Use the current raw_key to find the BIN.
-                                    let bin_arc = Self::find_bin_for_key(
-                                        r,
-                                        &raw_key,
-                                        tree.get_comparator(),
-                                    )?;
-                                    let g = bin_arc.read();
-                                    match &*g {
-                                        TreeNode::Bottom(bin) => {
-                                            if idx < 0
-                                                || idx
-                                                    >= bin.entries.len() as i32
-                                            {
-                                                None
-                                            } else {
-                                                let i = idx as usize;
-                                                Some((
-                                                    bin.get_full_key(i)
-                                                        .unwrap_or_default(),
-                                                    bin.entries[i]
-                                                        .data
-                                                        .clone()
-                                                        .unwrap_or_default(),
-                                                    idx,
-                                                    bin.get_lsn(i).as_u64(),
-                                                ))
+                                // Use the current raw_key to find the BIN
+                                // (re-faulting an evicted child, NEW-8).
+                                Self::find_bin_for_key(&tree, &raw_key).and_then(
+                                    |bin_arc| {
+                                        let g = bin_arc.read();
+                                        match &*g {
+                                            TreeNode::Bottom(bin) => {
+                                                if idx < 0
+                                                    || idx
+                                                        >= bin.entries.len()
+                                                            as i32
+                                                {
+                                                    None
+                                                } else {
+                                                    let i = idx as usize;
+                                                    Some((
+                                                        bin.get_full_key(i)
+                                                            .unwrap_or_default(),
+                                                        bin.entries[i]
+                                                            .data
+                                                            .clone()
+                                                            .unwrap_or_default(),
+                                                        idx,
+                                                        bin.get_lsn(i).as_u64(),
+                                                    ))
+                                                }
                                             }
+                                            _ => None,
                                         }
-                                        _ => None,
-                                    }
-                                })
+                                    },
+                                )
                             }
                         } else {
                             None
@@ -3337,58 +3239,18 @@ impl CursorImpl {
     /// secondary-index databases could land in the wrong BIN on any descent
     /// through a non-leaf internal node when comparator order ≠ byte order.
     fn find_bin_for_key(
-        node: std::sync::Arc<noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>>,
+        tree: &Tree,
         key: &[u8],
-        key_comparator: Option<&noxu_tree::KeyComparatorFn>,
     ) -> Option<std::sync::Arc<noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>>>
     {
-        use noxu_tree::tree::TreeNode;
-        let mut current = node;
-        loop {
-            let (is_bin, child) = {
-                let g = current.read();
-                let is_bin = g.is_bin();
-                let child = if !is_bin {
-                    match &*g {
-                        TreeNode::Internal(n) => {
-                            if n.entries.is_empty() {
-                                return None;
-                            }
-                            // R4 fix: honour the custom comparator when
-                            // selecting the floor slot. Mirrors JE
-                            // CursorImpl's use of IN.findEntry.
-                            let mut idx = 0usize;
-                            for (i, entry) in n.entries.iter().enumerate() {
-                                if i == 0 {
-                                    idx = 0;
-                                } else {
-                                    let ord = match key_comparator {
-                                        Some(cmp) => {
-                                            cmp(entry.key.as_slice(), key)
-                                        }
-                                        None => entry.key.as_slice().cmp(key),
-                                    };
-                                    if ord != std::cmp::Ordering::Greater {
-                                        idx = i;
-                                    } else {
-                                        break;
-                                    }
-                                }
-                            }
-                            n.get_child(idx)
-                        }
-                        _ => None,
-                    }
-                } else {
-                    None
-                };
-                (is_bin, child)
-            };
-            if is_bin {
-                return Some(current);
-            }
-            current = child?;
-        }
+        // EV-14/EV-13 (NEW-8): delegate to the re-faulting Tree descent so an
+        // EVICTED interior child on a range seek is re-faulted from its slot
+        // LSN, exactly like the point-read path -- rather than aborting the
+        // descent (which truncated cursor range scans after real eviction).
+        // `bin_arc_for_key` chooses the floor slot with the tree's
+        // comparator-aware `upper_in_floor_index`, subsuming the old R4
+        // comparator fix this helper used to carry.
+        tree.bin_arc_for_key(key)
     }
 
     /// Inserts or updates a record at the cursor position.
@@ -4084,8 +3946,7 @@ impl CursorImpl {
     {
         let db = self.db_impl.read();
         let tree = db.get_real_tree()?;
-        let root = tree.get_root()?;
-        Self::find_bin_for_key(root, key, tree.get_comparator())
+        Self::find_bin_for_key(&tree, key)
     }
 
     ///

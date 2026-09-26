@@ -5346,14 +5346,28 @@ impl Tree {
 
             // Capture the leftmost child Arc while holding `guard`, then
             // hand-over-hand: take the child read lock before releasing
-            // the parent's. Same race fix as `Tree::search`.
-            let next_arc = match &*guard {
-                TreeNode::Internal(n_node) => n_node.get_child(0)?,
+            // the parent's. Same race fix as `Tree::search`.  EV-14/EV-13
+            // (NEW-8): when the leftmost child has been EVICTED (slot holds
+            // only its LSN), re-fault it from the log via `child_at_or_fetch`
+            // exactly like the point-read path -- otherwise the leftmost
+            // descent aborts and a full forward scan returns partial/zero
+            // records.  JE `Tree.getFirstNode` faults a missing child via
+            // `IN.fetchTarget` on descent.
+            let (parent_arc, next_idx) = match &*guard {
+                TreeNode::Internal(n_node) => match n_node.get_child(0) {
+                    Some(c) => {
+                        let next_guard = c.read_arc();
+                        drop(guard);
+                        guard = next_guard;
+                        continue;
+                    }
+                    None => (NodeArcReadGuard::rwlock(&guard).clone(), 0usize),
+                },
                 _ => return None,
             };
-            let next_guard = next_arc.read_arc();
             drop(guard);
-            guard = next_guard;
+            let child = self.child_at_or_fetch(&parent_arc, next_idx)?;
+            guard = child.read_arc();
         }
     }
 
@@ -5394,16 +5408,176 @@ impl Tree {
 
             // Capture the rightmost child Arc while holding `guard`, then
             // hand-over-hand: take the child read lock before releasing
-            // the parent's. Same race fix as `Tree::search`.
-            let next_arc = match &*guard {
+            // the parent's. Same race fix as `Tree::search`.  EV-14/EV-13
+            // (NEW-8): re-fault an EVICTED rightmost child from the log via
+            // `child_at_or_fetch` -- otherwise the rightmost descent aborts
+            // and a full backward scan returns partial/zero records.  JE
+            // `Tree.getLastNode` faults a missing child via `IN.fetchTarget`.
+            let (parent_arc, next_idx) = match &*guard {
                 TreeNode::Internal(n_node) => {
-                    n_node.get_child(n_node.entries.len().saturating_sub(1))?
+                    let last = n_node.entries.len().saturating_sub(1);
+                    match n_node.get_child(last) {
+                        Some(c) => {
+                            let next_guard = c.read_arc();
+                            drop(guard);
+                            guard = next_guard;
+                            continue;
+                        }
+                        None => {
+                            (NodeArcReadGuard::rwlock(&guard).clone(), last)
+                        }
+                    }
                 }
                 _ => return None,
             };
-            let next_guard = next_arc.read_arc();
             drop(guard);
-            guard = next_guard;
+            let child = self.child_at_or_fetch(&parent_arc, next_idx)?;
+            guard = child.read_arc();
+        }
+    }
+
+    /// Descend to the leftmost BIN and return its `Arc`, re-faulting any
+    /// EVICTED child on the way down (NEW-8).
+    ///
+    /// The scan-start counterpart of `search_with_data`'s arc-returning
+    /// descent: `CursorImpl::get_first` needs the BIN `Arc` (to pin it, lock
+    /// the LN, and revalidate the slot), so this returns the arc rather than a
+    /// `SearchResult`.  An evicted leftmost child is re-faulted from its slot
+    /// LSN via `child_at_or_fetch`, exactly like the point-read path; a
+    /// genuinely-empty subtree still yields `None` (never wrong data).  JE
+    /// `Tree.getFirstNode` faults a missing child via `IN.fetchTarget`.
+    pub fn first_bin_arc(&self) -> Option<ChildArc> {
+        let mut guard: NodeArcReadGuard = self.get_root()?.read_arc();
+        loop {
+            if guard.is_bin() {
+                let bin_arc = NodeArcReadGuard::rwlock(&guard).clone();
+                if let TreeNode::Bottom(bin) = &*guard {
+                    self.note_accessed(bin.node_id);
+                    self.note_bin_access(bin.is_delta);
+                }
+                drop(guard);
+                return Some(bin_arc);
+            }
+            let (parent_arc, next_idx) = match &*guard {
+                TreeNode::Internal(n) => {
+                    if n.entries.is_empty() {
+                        return None;
+                    }
+                    match n.get_child(0) {
+                        Some(c) => {
+                            let next_guard = c.read_arc();
+                            drop(guard);
+                            guard = next_guard;
+                            continue;
+                        }
+                        None => (NodeArcReadGuard::rwlock(&guard).clone(), 0),
+                    }
+                }
+                TreeNode::Bottom(_) => unreachable!(),
+            };
+            drop(guard);
+            let child = self.child_at_or_fetch(&parent_arc, next_idx)?;
+            guard = child.read_arc();
+        }
+    }
+
+    /// Descend to the rightmost BIN and return its `Arc` together with the
+    /// deepest parent separator key that routes into it (the anchor a caller
+    /// uses when the rightmost BIN turns out to be physically empty), re-
+    /// faulting any EVICTED child on the way down (NEW-8).
+    ///
+    /// The scan-start counterpart of `first_bin_arc` for the backward
+    /// direction.  JE `Tree.getLastNode` faults a missing child via
+    /// `IN.fetchTarget`.
+    pub fn last_bin_arc(&self) -> Option<(ChildArc, Option<Vec<u8>>)> {
+        let mut guard: NodeArcReadGuard = self.get_root()?.read_arc();
+        let mut anchor: Option<Vec<u8>> = None;
+        loop {
+            if guard.is_bin() {
+                let bin_arc = NodeArcReadGuard::rwlock(&guard).clone();
+                if let TreeNode::Bottom(bin) = &*guard {
+                    self.note_accessed(bin.node_id);
+                    self.note_bin_access(bin.is_delta);
+                }
+                drop(guard);
+                return Some((bin_arc, anchor));
+            }
+            let (parent_arc, next_idx, sep) = match &*guard {
+                TreeNode::Internal(n) => {
+                    if n.entries.is_empty() {
+                        return None;
+                    }
+                    let last = n.entries.len().saturating_sub(1);
+                    let sep = n.entries.get(last).map(|e| e.key.clone());
+                    match n.get_child(last) {
+                        Some(c) => {
+                            if let Some(sk) = sep {
+                                anchor = Some(sk);
+                            }
+                            let next_guard = c.read_arc();
+                            drop(guard);
+                            guard = next_guard;
+                            continue;
+                        }
+                        None => {
+                            (NodeArcReadGuard::rwlock(&guard).clone(), last, sep)
+                        }
+                    }
+                }
+                TreeNode::Bottom(_) => unreachable!(),
+            };
+            if let Some(sk) = sep {
+                anchor = Some(sk);
+            }
+            drop(guard);
+            let child = self.child_at_or_fetch(&parent_arc, next_idx)?;
+            guard = child.read_arc();
+        }
+    }
+
+    /// Descend to the BIN whose key range contains `key` and return its
+    /// `Arc`, re-faulting any EVICTED child on the way down (NEW-8).
+    ///
+    /// The scan-start counterpart of `search_with_data` used by the cursor
+    /// range-seek path (`CursorImpl::find_bin_for_key`).  The IN-level floor
+    /// slot is chosen with `upper_in_floor_index`, which honours the
+    /// configured `key_comparator` (subsumes the R4 comparator fix that the
+    /// old cursor-side descent carried).  JE `CursorImpl` descent delegates to
+    /// `IN.findEntry` (comparator-aware) and faults a missing child via
+    /// `IN.fetchTarget`.
+    pub fn bin_arc_for_key(&self, key: &[u8]) -> Option<ChildArc> {
+        let mut guard: NodeArcReadGuard = self.get_root()?.read_arc();
+        loop {
+            if guard.is_bin() {
+                let bin_arc = NodeArcReadGuard::rwlock(&guard).clone();
+                if let TreeNode::Bottom(bin) = &*guard {
+                    self.note_accessed(bin.node_id);
+                    self.note_bin_access(bin.is_delta);
+                }
+                drop(guard);
+                return Some(bin_arc);
+            }
+            let (parent_arc, next_idx) = match &*guard {
+                TreeNode::Internal(n) => {
+                    if n.entries.is_empty() {
+                        return None;
+                    }
+                    let idx = self.upper_in_floor_index(&n.entries, key);
+                    match n.get_child(idx) {
+                        Some(c) => {
+                            let next_guard = c.read_arc();
+                            drop(guard);
+                            guard = next_guard;
+                            continue;
+                        }
+                        None => (NodeArcReadGuard::rwlock(&guard).clone(), idx),
+                    }
+                }
+                TreeNode::Bottom(_) => unreachable!(),
+            };
+            drop(guard);
+            let child = self.child_at_or_fetch(&parent_arc, next_idx)?;
+            guard = child.read_arc();
         }
     }
 
@@ -8177,7 +8351,10 @@ impl Tree {
                 break;
             }
 
-            let (next_arc, slot_idx) = match &*guard {
+            // Choose the descent slot at this level.  `resident` holds the
+            // child Arc when it is still in memory (hot hand-over-hand path);
+            // otherwise `slot_idx` names an EVICTED child to re-fault.
+            let (resident, slot_idx) = match &*guard {
                 TreeNode::Internal(n) => {
                     if n.entries.is_empty() {
                         return AdjacentBinOutcome::NoAdjacent;
@@ -8188,26 +8365,39 @@ impl Tree {
                     // uses IN.findEntry (comparator-aware) not raw byte order.
                     let idx =
                         self.upper_in_floor_index(&n.entries, current_key);
-                    let child = match n.get_child(idx) {
-                        Some(c) => c,
-                        None => {
-                            return AdjacentBinOutcome::NoAdjacent;
-                        }
-                    };
-                    (child, idx)
+                    (n.get_child(idx), idx)
                 }
                 TreeNode::Bottom(_) => unreachable!(),
             };
 
-            // Record the parent and the child we are about to enter
-            // — the child Arc lets the ascent validate the slot.
             let parent_arc = NodeArcReadGuard::rwlock(&guard).clone();
+            let next_arc = match resident {
+                // Hot path: child resident.  Record the path edge and hand
+                // over to the child read lock before releasing the parent.
+                Some(c) => {
+                    path.push((parent_arc, slot_idx, Arc::clone(&c)));
+                    let next_guard = c.read_arc();
+                    drop(guard);
+                    guard = next_guard;
+                    continue;
+                }
+                // EV-14/EV-13 (NEW-8): child EVICTED — re-fault it from its
+                // slot LSN, exactly like the point-read path and the
+                // scan-start descents.  Without this the cross-BIN descent to
+                // the current BIN aborts mid-scan and the cursor reports a
+                // false end-of-iteration, truncating a scan that crosses an
+                // evicted interior child.  `child_at_or_fetch` needs the
+                // parent write latch, so drop the parent read guard first.
+                None => {
+                    drop(guard);
+                    match self.child_at_or_fetch(&parent_arc, slot_idx) {
+                        Some(c) => c,
+                        None => return AdjacentBinOutcome::NoAdjacent,
+                    }
+                }
+            };
             path.push((parent_arc, slot_idx, Arc::clone(&next_arc)));
-
-            // Hand-over-hand: take child read lock BEFORE releasing parent.
-            let next_guard = next_arc.read_arc();
-            drop(guard);
-            guard = next_guard;
+            guard = next_arc.read_arc();
         }
         drop(guard);
 
@@ -8263,20 +8453,30 @@ impl Tree {
                 if sibling_idx < 0 || sibling_idx >= n_entries as i64 {
                     break; // level exhausted — ascend further
                 }
+                // EV-14/EV-13 (NEW-8): the sibling sub-tree's root child may
+                // itself be EVICTED; re-fault it from its slot LSN via
+                // `child_at_or_fetch` (parent write latch) instead of bailing.
                 let sibling_arc = {
                     let g = parent_arc.read();
-                    match &*g {
+                    let resident = match &*g {
                         TreeNode::Internal(p) => {
-                            match p.get_child(sibling_idx as usize) {
-                                Some(c) => c,
-                                None => return AdjacentBinOutcome::NoAdjacent,
-                            }
+                            p.get_child(sibling_idx as usize)
                         }
                         _ => return AdjacentBinOutcome::NoAdjacent,
+                    };
+                    drop(g);
+                    match resident {
+                        Some(c) => c,
+                        None => match self.child_at_or_fetch(
+                            &parent_arc,
+                            sibling_idx as usize,
+                        ) {
+                            Some(c) => c,
+                            None => return AdjacentBinOutcome::NoAdjacent,
+                        },
                     }
                 };
-                if let Some(v) =
-                    Self::descend_to_edge_bin(&sibling_arc, forward)
+                if let Some(v) = self.descend_to_edge_bin(&sibling_arc, forward)
                 {
                     return AdjacentBinOutcome::Found(v);
                 }
@@ -8313,6 +8513,7 @@ impl Tree {
     /// key and continues (TREE-F1); only PHYSICALLY-empty BINs, which carry no
     /// slot key to re-anchor on, are skipped here.
     fn descend_to_edge_bin(
+        &self,
         node_arc: &Arc<RwLock<TreeNode>>,
         forward: bool,
     ) -> Option<Vec<(BinEntry, Lsn, Vec<u8>)>> {
@@ -8373,26 +8574,43 @@ impl Tree {
             // first, so push children in REVERSE order (last pushed = child 0
             // popped first).  For a backward (rightmost) walk we want the last
             // child popped first, so push in FORWARD order.
-            if let TreeNode::Internal(n) = &*guard {
-                let count = n.entries.len();
-                if forward {
-                    for i in (0..count).rev() {
-                        if let Some(c) = n.get_child(i) {
-                            stack.push(c);
-                        }
-                    }
-                } else {
-                    for i in 0..count {
-                        if let Some(c) = n.get_child(i) {
-                            stack.push(c);
-                        }
-                    }
+            //
+            //
+            // EV-14/EV-13 (NEW-8): a child at some slot may be EVICTED (slot
+            // holds only its LSN); `get_child` returns None for it, so the
+            // bare push would silently drop that whole sub-tree from the edge
+            // walk -- exactly the truncation this fix removes.  We therefore
+            // process slots in the SAME edge order the push loop used, and for
+            // each slot push the resident child or (if evicted) re-fault it via
+            // `child_at_or_fetch`.  Faulting needs the parent write latch, so
+            // we snapshot how many children this IN has under the read guard,
+            // drop the guard, then resolve each slot (resident get_child or
+            // re-fault) with its own short-lived latch.  Pushing in edge order
+            // (child count-1..0 for forward, 0..count for backward) keeps the
+            // edge-most child on top of the LIFO stack so it pops FIRST.
+            let count = match &*guard {
+                TreeNode::Internal(n) => n.entries.len(),
+                _ => 0,
+            };
+            // Guard dropped before faulting — `child_at_or_fetch` re-latches
+            // `arc` for write to install a fetched child.  A concurrent split
+            // between here and re-latch is caught by the caller's
+            // `SplitRaceRetry` validation in `get_adjacent_bin_attempt`.
+            drop(guard);
+            let order: Vec<usize> = if forward {
+                (0..count).rev().collect()
+            } else {
+                (0..count).collect()
+            };
+            for i in order {
+                // Resolve slot `i`: resident (read latch) or re-fault
+                // (write latch).  `child_at_or_fetch` itself takes the read
+                // fast path when the child is resident, so a plain call
+                // covers both cases; use it directly.
+                if let Some(c) = self.child_at_or_fetch(&arc, i) {
+                    stack.push(c);
                 }
             }
-            // Guard dropped at end of loop iteration (after pushing child Arcs,
-            // which hold their own refs) — hand-over-hand: children are pinned
-            // via Arc before this parent guard is released.
-            drop(guard);
         }
         // Every BIN in this sub-tree is physically empty.
         None
@@ -15990,7 +16208,7 @@ mod split_special_tests {
         // set, so the cursor can skip them (CursorImpl.java:2062-2064).  The
         // contract here is: the KD slot is never reported as a LIVE entry.
         let root = tree.get_root().expect("root");
-        let edge = Tree::descend_to_edge_bin(&root, true).expect("edge bin");
+        let edge = tree.descend_to_edge_bin(&root, true).expect("edge bin");
         assert!(
             !edge.iter().any(|(e, _, k)| k == &kd_key && !e.known_deleted),
             "TREE-F1: scan must not surface a known_deleted slot as live \
