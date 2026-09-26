@@ -11217,6 +11217,9 @@ mod tests {
     /// Inserting 500 keys in pseudo-random (reverse) order and verifying all
     /// are searchable.
     #[test]
+    // JE: TreeTest.testMultipleInsertRetrieve0 — insert non-sorted keys that
+    // force IN splits (JE seeded this to reproduce a split putting the
+    // identifier key on the right side) and retrieve them all back.
     fn test_insert_random_keys() {
         let tree = Tree::new(1, 8);
         let n = 500u32;
@@ -12531,6 +12534,9 @@ mod tests {
     /// IC-1 happy path: prune_empty_bin removes the parent slot when the BIN
     /// really is empty, no cursors, not a delta.
     #[test]
+    // JE: ValidateSubtreeDeleteTest.testBasic / testDuplicates — a subtree
+    // with NO live records is deletable (`validateDelete` true); the prune
+    // succeeds only when the BIN is truly empty.
     fn test_ic1_prune_empty_bin_succeeds_when_truly_empty() {
         let tree = Tree::new(1, 4);
         for i in 0..16u32 {
@@ -15180,6 +15186,9 @@ mod tests {
     /// still has a live entry after partial deletion does NOT remove the BIN
     /// from the parent.
     #[test]
+    // JE: ValidateSubtreeDeleteTest.testBasic — a subtree that still holds
+    // live records is NOT deletable (`validateDelete` false); the prune must
+    // be refused.
     fn test_incompressor_node_not_empty_prevents_prune() {
         let _lsn = Lsn::new(1, 1);
 
