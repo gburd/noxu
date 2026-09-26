@@ -259,7 +259,7 @@ fn double_crash_before_resolution_keeps_xid_in_doubt() {
         let recovered = xa.xa_recover(XaFlags::STARTRSCAN).unwrap();
         assert_eq!(
             recovered,
-            vec![xid.clone()],
+            vec![xid],
             "in-doubt XID must persist across multiple crashes \
              until explicitly resolved"
         );

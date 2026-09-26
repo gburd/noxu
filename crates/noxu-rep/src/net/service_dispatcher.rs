@@ -30,8 +30,9 @@ use hashbrown::HashMap;
 use std::io::{Read as IoRead, Write as IoWrite};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
+use std::time::Duration;
 
 use noxu_sync::Mutex;
 
@@ -48,6 +49,30 @@ use crate::error::{RepError, Result};
 /// Frames whose length prefix exceeds this bound are rejected before any
 /// allocation occurs (see `handle_incoming`).
 pub const MAX_SERVICE_NAME_LEN: usize = 256;
+
+/// Wall-clock bound on the plain-TCP service-name handshake read.
+///
+/// Without a bound, a peer that completes the TCP handshake and then never
+/// sends the length-prefixed service name (or sends one byte and stalls)
+/// leaves the per-connection thread blocked in `read_exact` forever
+/// (slow-loris resource exhaustion, security audit 2026 F14). A
+/// `set_read_timeout` releases such a thread after this bound. 10s mirrors
+/// the TLS dispatcher's `channel.receive(Duration::from_secs(10))` handshake
+/// bound and JE's `ServiceDispatcher` read-timeout on the channel factory.
+pub const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Default cap on the number of connections a [`TcpServiceDispatcher`] will
+/// handle concurrently.
+///
+/// Each accepted connection spawns an OS thread (holding a stack plus an fd)
+/// that lives until the service protocol finishes. Without a cap, a burst of
+/// connect-then-stall connections can spawn unbounded threads/fds and hit the
+/// process ulimit, starving legitimate peers (security audit 2026 F15).
+/// Beyond this many in-flight connections the accept loop drops the newest
+/// connection (closing the socket) rather than spawn another thread. 1024 is
+/// far above any real replication group's connection count (a few per peer)
+/// while still bounding a hostile burst.
+pub const DEFAULT_MAX_CONCURRENT_CONNECTIONS: usize = 1024;
 
 /// Callback for handling incoming connections on a named service.
 ///
@@ -177,16 +202,54 @@ pub struct TcpServiceDispatcher {
     addr: SocketAddr,
     /// Whether the accept loop is running.
     running: Arc<AtomicBool>,
+    /// Number of connections currently being handled (in-flight threads).
+    /// Bounded by `max_connections` to cap thread/fd exhaustion (F15).
+    active_connections: Arc<AtomicUsize>,
+    /// Upper bound on `active_connections`; connections accepted beyond this
+    /// are dropped without spawning a handler thread.
+    max_connections: usize,
+    /// Wall-clock bound on the service-name handshake read (F14). Defaults to
+    /// [`HANDSHAKE_READ_TIMEOUT`]; overridable for tests.
+    handshake_timeout: Duration,
 }
 
 impl TcpServiceDispatcher {
     /// Create a new dispatcher bound to the given address.
+    ///
+    /// Uses [`DEFAULT_MAX_CONCURRENT_CONNECTIONS`] as the concurrent-connection
+    /// cap; see [`TcpServiceDispatcher::with_max_connections`] to override it.
     pub fn new(addr: SocketAddr) -> Result<Self> {
+        Self::with_max_connections(addr, DEFAULT_MAX_CONCURRENT_CONNECTIONS)
+    }
+
+    /// Create a new dispatcher bound to `addr` with an explicit cap on the
+    /// number of concurrently-handled connections (F15 defense-in-depth).
+    pub fn with_max_connections(
+        addr: SocketAddr,
+        max_connections: usize,
+    ) -> Result<Self> {
         Ok(Self {
             services: Arc::new(Mutex::new(HashMap::new())),
             addr,
             running: Arc::new(AtomicBool::new(false)),
+            active_connections: Arc::new(AtomicUsize::new(0)),
+            max_connections: max_connections.max(1),
+            handshake_timeout: HANDSHAKE_READ_TIMEOUT,
         })
+    }
+
+    /// Override the handshake read timeout (F14). Primarily for tests that
+    /// need a short bound; production uses [`HANDSHAKE_READ_TIMEOUT`].
+    #[cfg(test)]
+    fn set_handshake_timeout(&mut self, timeout: Duration) {
+        self.handshake_timeout = timeout;
+    }
+
+    /// Number of connections currently being handled (test observability for
+    /// the F14/F15 fixes).
+    #[cfg(test)]
+    fn active_connections(&self) -> usize {
+        self.active_connections.load(Ordering::Acquire)
     }
 
     /// Register a service handler by name.
@@ -231,19 +294,40 @@ impl TcpServiceDispatcher {
 
         let services = Arc::clone(&self.services);
         let running = Arc::clone(&self.running);
+        let active_connections = Arc::clone(&self.active_connections);
+        let max_connections = self.max_connections;
+        let handshake_timeout = self.handshake_timeout;
         running.store(true, Ordering::SeqCst);
 
         thread::spawn(move || {
             while running.load(Ordering::SeqCst) {
                 match listener.accept() {
-                    Ok((stream, _peer_addr)) => {
+                    Ok((stream, peer_addr)) => {
+                        // Connection-count limit (F15): refuse to spawn beyond
+                        // `max_connections` in-flight handlers. Drop the newest
+                        // connection (closing its socket) rather than let a
+                        // connect-burst exhaust threads/fds.
+                        if active_connections.load(Ordering::Acquire)
+                            >= max_connections
+                        {
+                            log::warn!(
+                                "TcpServiceDispatcher: at connection limit \
+                                 ({max_connections}); dropping {peer_addr}"
+                            );
+                            drop(stream);
+                            continue;
+                        }
+                        active_connections.fetch_add(1, Ordering::AcqRel);
                         let services_clone = Arc::clone(&services);
-                        let running_check = Arc::clone(&running);
+                        let active_clone = Arc::clone(&active_connections);
                         thread::spawn(move || {
+                            // Decrement the in-flight counter no matter how
+                            // `handle_incoming` returns (RAII guard).
+                            let _guard = ConnectionGuard(&active_clone);
                             handle_incoming(
                                 stream,
                                 services_clone,
-                                running_check,
+                                handshake_timeout,
                             );
                         });
                     }
@@ -260,16 +344,37 @@ impl TcpServiceDispatcher {
     }
 }
 
+/// RAII guard that decrements the dispatcher's in-flight connection counter
+/// when the per-connection handler thread exits, however it exits.
+struct ConnectionGuard<'a>(&'a AtomicUsize);
+
+impl Drop for ConnectionGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// Read the service name from a newly accepted TCP connection and dispatch.
 ///
 /// Service name wire format: `[len: u32 LE][utf8 bytes]`.
 /// After reading the service name the raw `TcpStream` is wrapped back into a
 /// `TcpChannel` for the handler.
+///
+/// A read timeout ([`HANDSHAKE_READ_TIMEOUT`]) is installed on the socket
+/// before the handshake reads so that a peer which connects and then withholds
+/// the service-name bytes cannot pin this thread indefinitely (F14).
 fn handle_incoming(
     stream: std::net::TcpStream,
     services: Arc<Mutex<HashMap<String, Arc<dyn ServiceHandler>>>>,
-    _running: Arc<AtomicBool>,
+    handshake_timeout: Duration,
 ) {
+    // Bound the handshake read so a silent/slow peer is dropped rather than
+    // pinning this thread forever (F14 slow-loris). Applied to the read half
+    // used for the two `read_exact` calls below.
+    if stream.set_read_timeout(Some(handshake_timeout)).is_err() {
+        return;
+    }
+
     // We need a clone for the TcpChannel wrapper after the read.
     // Use try_clone so the read and the channel share the same underlying fd.
     let mut read_stream = match stream.try_clone() {
@@ -874,6 +979,103 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
+        sd.stop();
+    }
+
+    /// F14 regression: a client that connects and then sends NOTHING (never
+    /// sends the service-name length prefix) must have its handler thread
+    /// released after the handshake read timeout, not pinned forever. We
+    /// observe this through the dispatcher's in-flight connection counter,
+    /// which the `ConnectionGuard` decrements when the handler returns.
+    #[test]
+    fn slow_loris_client_is_dropped_after_handshake_timeout() {
+        use std::net::TcpStream;
+
+        let mut sd =
+            TcpServiceDispatcher::new("127.0.0.1:0".parse().unwrap()).unwrap();
+        sd.register("echo", Arc::new(EchoHandler { name: "echo".into() }));
+        // Short handshake timeout so the test is fast; production is 10s.
+        sd.set_handshake_timeout(Duration::from_millis(150));
+        let bound_addr = sd.start().unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+
+        // Connect and send nothing. Hold the socket open.
+        let _silent = TcpStream::connect(bound_addr).unwrap();
+
+        // The handler thread should have started and be blocked in the
+        // handshake read.
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            sd.active_connections(),
+            1,
+            "the silent connection should be in-flight before the timeout"
+        );
+
+        // After the handshake timeout elapses, the read fails and the handler
+        // returns, dropping the ConnectionGuard back to zero.
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if sd.active_connections() == 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "slow-loris connection was not released after the handshake \
+                 timeout — the F14 read timeout is not effective"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+
+        // A legitimate client can still be served afterwards.
+        let client = connect_to_service(bound_addr, "echo").unwrap();
+        client.send(b"still alive").unwrap();
+        let reply = client.receive(Duration::from_secs(5)).unwrap();
+        assert_eq!(reply, Some(b"still alive".to_vec()));
+
+        drop(_silent);
+        sd.stop();
+    }
+
+    /// F15 regression: with `max_connections == 1`, a second concurrent
+    /// connection is dropped by the accept loop (no handler thread spawned)
+    /// while the first is still in-flight.
+    #[test]
+    fn connection_count_limit_drops_excess_connections() {
+        use std::net::TcpStream;
+
+        let mut sd = TcpServiceDispatcher::with_max_connections(
+            "127.0.0.1:0".parse().unwrap(),
+            1,
+        )
+        .unwrap();
+        sd.register("echo", Arc::new(EchoHandler { name: "echo".into() }));
+        // Long handshake timeout so the first (silent) connection stays
+        // in-flight while we test the cap.
+        sd.set_handshake_timeout(Duration::from_secs(30));
+        let bound_addr = sd.start().unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+
+        // First silent connection: occupies the single slot.
+        let _c1 = TcpStream::connect(bound_addr).unwrap();
+        std::thread::sleep(Duration::from_millis(80));
+        assert_eq!(
+            sd.active_connections(),
+            1,
+            "first connection fills the cap"
+        );
+
+        // Second connection: accepted at TCP level but dropped by the loop
+        // (no handler thread), so the in-flight count stays at 1.
+        let _c2 = TcpStream::connect(bound_addr).unwrap();
+        std::thread::sleep(Duration::from_millis(120));
+        assert_eq!(
+            sd.active_connections(),
+            1,
+            "a connection beyond the limit must not spawn a handler thread"
+        );
+
+        drop(_c1);
+        drop(_c2);
         sd.stop();
     }
 }

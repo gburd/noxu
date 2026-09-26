@@ -23,7 +23,7 @@ crc32fast = { workspace = true }
 byteorder = { workspace = true }
 fs2 = { workspace = true }
 memmap2 = { workspace = true }
-lru = "0.16"
+lru = "0.18"
 
 # DST Milestone 2 (Phase 2a): only in the graph under `--cfg noxu_shuttle`.
 # Lets the FsyncManager group-commit protocol be scheduled by shuttle via the

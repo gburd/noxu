@@ -62,6 +62,11 @@ impl Condvar {
 
         // Release the mutex before parking.
         let mutex = lock_api::MutexGuard::mutex(guard);
+        // SAFETY: We hold `guard`, which proves this mutex is currently locked
+        // by this thread. `force_unlock` therefore releases a lock we own; we
+        // re-acquire it below before returning, so on return `guard` is valid
+        // (lock held) again. `guard` is not used to touch the data between the
+        // unlock and the re-lock.
         unsafe { mutex.force_unlock() };
 
         // Park until seq changes (woken by notify) or spurious wakeup.
@@ -85,6 +90,11 @@ impl Condvar {
         let deadline = Instant::now() + timeout;
 
         let mutex = lock_api::MutexGuard::mutex(guard);
+        // SAFETY: We hold `guard`, which proves this mutex is currently locked
+        // by this thread. `force_unlock` releases a lock we own; it is
+        // re-acquired below before returning, so on return `guard` is valid
+        // (lock held) again. `guard` is not used to touch the data between the
+        // unlock and the re-lock.
         unsafe { mutex.force_unlock() };
 
         let timed_out = loop {

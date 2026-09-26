@@ -67,6 +67,12 @@ jobs:
           cargo clippy --workspace --all-targets \
             --all-features -- -D warnings
 
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked || true
+
+      - name: Run cargo deny (supply-chain + license gate)
+        run: cargo deny check
+
   test:
     # Default-features test on Codeberg's only-Linux runners. Mirrors the
     # GitHub `test` job for ubuntu-latest. macOS / Windows coverage lives

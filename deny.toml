@@ -5,10 +5,22 @@
 # Security vulnerabilities are always denied (the default in current
 # cargo-deny when an advisory matches; severity strings were removed from the
 # schema). `unmaintained` accepts "all"/"workspace"/"transitive"/"none".
-unmaintained = "workspace"
+#
+# `unmaintained = "all"` (not just "workspace") so the gate actually fires on
+# EVERY unmaintained crate in the graph, transitive included -- a new
+# unmaintained transitive dep fails the build instead of passing silently
+# (security audit 2026, F9). `yanked = "deny"` blocks any yanked crate.
+unmaintained = "all"
 yanked = "deny"
-# Advisory IDs to ignore (none currently).
-ignore = []
+# Advisory IDs explicitly acknowledged (each must be justified). We do NOT
+# suppress any code-execution / memory-safety advisory here.
+ignore = [
+    # paste 1.x -- "no longer maintained". Pulled in ONLY through the
+    # `hegeltest-c` property-testing dev-dependency (a proc-macro helper);
+    # never in any shipped library or binary. No vulnerable behavior, just an
+    # unmaintained-status advisory. Revisit if hegeltest-c drops it.
+    "RUSTSEC-2024-0436",
+]
 
 [licenses]
 # version = 2 schema: an empty/unknown license is denied by default; only the

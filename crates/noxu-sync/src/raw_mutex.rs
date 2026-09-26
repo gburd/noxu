@@ -132,6 +132,13 @@ unsafe impl lock_api::RawMutex for NoxuRawMutex {
     }
 }
 
+// SAFETY: `RawMutexTimed` extends `RawMutex` with deadline-bounded
+// acquisition; it requires the same mutual-exclusion guarantee, which the
+// `RawMutex` impl above establishes and documents. `try_lock_for` /
+// `try_lock_until` acquire the lock only by the same UNLOCKED→locked CAS
+// (Acquire ordering) or via `lock_slow`, which uses the identical CAS, and
+// return `false` without acquiring when the deadline passes — so a `true`
+// return always means this thread now holds exclusive access.
 unsafe impl lock_api::RawMutexTimed for NoxuRawMutex {
     type Duration = Duration;
     type Instant = Instant;
@@ -284,6 +291,8 @@ mod tests {
         assert_eq!(raw.get_owner(), 0);
         raw.lock();
         assert_ne!(raw.get_owner(), 0);
+        // SAFETY: this thread acquired the lock via `raw.lock()` above and has
+        // not released it, so it is the sole owner and may `unlock`.
         unsafe { raw.unlock() };
         assert_eq!(raw.get_owner(), 0);
     }
@@ -297,6 +306,8 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         assert!(raw.try_lock_until(deadline));
         assert!(raw.is_locked());
+        // SAFETY: `try_lock_until` returned `true`, so this thread holds the
+        // lock and may release it.
         unsafe { raw.unlock() };
     }
 
@@ -317,6 +328,8 @@ mod tests {
         .unwrap();
         assert!(timed_out);
 
+        // SAFETY: this thread holds the lock (`raw.lock()` above; the spawned
+        // thread never acquired it) and may release it.
         unsafe { raw.unlock() };
     }
 
@@ -332,6 +345,8 @@ mod tests {
         let raw2 = Arc::clone(&raw);
         let waiter = std::thread::spawn(move || {
             raw2.lock();
+            // SAFETY: this closure acquired the lock via `raw2.lock()` on the
+            // line above and holds it here, so it may release it.
             unsafe { raw2.unlock() };
         });
 
@@ -343,6 +358,9 @@ mod tests {
             "the blocked thread must be recorded as a waiter"
         );
 
+        // SAFETY: this thread still holds the lock it took via `raw.lock()`
+        // at the top of the test; the waiter is parked and has not acquired
+        // it, so this thread may release it (which then wakes the waiter).
         unsafe { raw.unlock() };
         waiter.join().unwrap();
         assert!(!raw.is_locked());
