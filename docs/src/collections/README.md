@@ -1,7 +1,8 @@
 # Collections and Persistence
 
-> **v1.6 capability matrix:** see
-> [Introduction → v1.6 capability matrix](../introduction.md#v16-capability-matrix).
+> **Capability status:** see
+> [Introduction → capability summary](../introduction.md#capability-matrix)
+> and [Known Limitations](../operations/known-limitations.md).
 
 This chapter covers the higher-level APIs built on top of the core
 Noxu DB key-value store:

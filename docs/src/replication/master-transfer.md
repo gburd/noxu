@@ -1,7 +1,7 @@
 # Master Transfer
 
 > **v1.5 status — not implemented.** See
-> [Introduction → v1.5 capability matrix](../introduction.md#v15-capability-matrix)
+> [Introduction → capability summary](../introduction.md#capability-matrix)
 > and [the chapter overview](index.html). `transfer_master` is a
 > silent no-op in v1.5 (audit finding 7). The chapter below describes
 > the **intended** v2.0 contract.
