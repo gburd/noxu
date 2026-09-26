@@ -843,3 +843,158 @@ fn count_estimator_dups_sequential_exact_counts() {
         drop(c);
     }
 }
+
+
+// ──────────────────────────────────────────────────────────────────────────────
+// JE: SplitTest.testSplitOverSizedNode [#24917] — fill a BIN to the OLD (larger)
+// fanout, reduce the fanout across reopen (so the BIN is now over-sized), then
+// insert at the leftmost position.  The first insertion causes a split where
+// the existing node keeps 1 record and the new sibling holds the other 255.
+// JE's bug was that the new sibling was sized to the NEW fanout and could not
+// hold 255 entries (ArrayIndexOutOfBoundsException).  Noxu sizes BIN slots
+// dynamically (Vec), so the AIOOBE cannot occur, but the correctness intent —
+// an over-sized-node split preserves every record — is ported here.
+// ──────────────────────────────────────────────────────────────────────────────
+#[test]
+fn split_oversized_node_after_fanout_reduction() {
+    use noxu_db::StatsConfig;
+    let dir = TempDir::new().unwrap();
+
+    // Phase 1: fanout 256, fill a BIN with 256 records (1000..1256).
+    {
+        let env_cfg = EnvironmentConfig::new(dir.path().to_path_buf())
+            .with_allow_create(true)
+            .with_transactional(true);
+        let env = noxu_db::Environment::open(env_cfg).unwrap();
+        let db_cfg = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true)
+            .with_node_max_entries(256);
+        let db = env.open_database(None, "oversized", &db_cfg).unwrap();
+        for i in 1000u32..1256 {
+            db.put(
+                DatabaseEntry::from_bytes(&i.to_be_bytes()),
+                DatabaseEntry::from_bytes(&[0u8; 20]),
+            )
+            .unwrap();
+        }
+        db.close().unwrap();
+        env.close().unwrap();
+    }
+
+    // Phase 2: reopen with fanout 128 (the recovered BIN now holds 256 > 128).
+    let env_cfg = EnvironmentConfig::new(dir.path().to_path_buf())
+        .with_allow_create(false)
+        .with_transactional(true);
+    let env = noxu_db::Environment::open(env_cfg).unwrap();
+    let db_cfg = DatabaseConfig::new()
+        .with_allow_create(false)
+        .with_transactional(true)
+        .with_node_max_entries(128);
+    let db = env.open_database(None, "oversized", &db_cfg).unwrap();
+
+    // Insert records at the BEGINNING (keys 999..0 descending) — the leftmost
+    // position — forcing the over-sized node to split.  Must not panic and must
+    // preserve every record.
+    for i in (0u32..1000).rev() {
+        db.put(
+            DatabaseEntry::from_bytes(&i.to_be_bytes()),
+            DatabaseEntry::from_bytes(&[0u8; 20]),
+        )
+        .unwrap();
+    }
+
+    // Oracle: all 1256 records present and in sorted order.
+    let mut c = db.open_cursor(None).unwrap();
+    let mut k = DatabaseEntry::new();
+    let mut d = DatabaseEntry::new();
+    let mut count = 0u32;
+    let mut prev: Option<u32> = None;
+    let mut s = c.get(&mut k, &mut d, Get::First, None).unwrap();
+    while s == OperationStatus::Success {
+        let mut a = [0u8; 4];
+        a.copy_from_slice(k.data_opt().unwrap());
+        let cur = u32::from_be_bytes(a);
+        if let Some(p) = prev {
+            assert!(p < cur, "over-sized split must keep keys sorted");
+        }
+        prev = Some(cur);
+        count += 1;
+        s = c.get(&mut k, &mut d, Get::Next, None).unwrap();
+    }
+    drop(c);
+    assert_eq!(count, 1256, "every record must survive the over-sized split");
+
+    // The tree must actually reflect the reduced fanout (multiple BINs).
+    let stats = db.stats(Some(&StatsConfig::new().with_fast(false))).unwrap();
+    assert!(
+        stats.btree.bottom_internal_node_count > 1,
+        "fanout reduction + splits must produce multiple BINs"
+    );
+}
+
+
+// ──────────────────────────────────────────────────────────────────────────────
+// JE: CountEstimatorTest.testDupsInsertNonSequential — the EXACT-count arm.
+// With duplicates inserted in a non-sequential (column-major) order, a cursor
+// positioned on a key still reports the exact duplicate count via count().
+// (JE's `countEstimate()` off-by-up-to-2x arm exercises an internal estimator
+// API — `count_estimate()` is `pub(crate)` on Noxu's SecondaryCursor and not
+// on the public Cursor — so only the EXACT count, which the estimate must
+// equal for counts below nodeMax, is ported.  See tp-je-tree.md.)
+// ──────────────────────────────────────────────────────────────────────────────
+#[test]
+fn count_estimator_dups_nonsequential_exact_counts() {
+    let dir = TempDir::new().unwrap();
+    let env = noxu_db::Environment::open(
+        EnvironmentConfig::new(dir.path().to_path_buf())
+            .with_allow_create(true)
+            .with_transactional(true),
+    )
+    .unwrap();
+    let db = env
+        .open_database(
+            None,
+            "dups_ns",
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true)
+                .with_sorted_duplicates(true),
+        )
+        .unwrap();
+
+    let n_dups = [1u32, 2, 3, 20, 50, 90, 50, 20, 3, 2, 1];
+    let max = *n_dups.iter().max().unwrap();
+    let mut total: u64 = 0;
+    // Column-major insertion: outer loop over dup index j, inner over key i.
+    for j in 0..max {
+        for (i, &nd) in n_dups.iter().enumerate() {
+            if j < nd {
+                db.put(
+                    DatabaseEntry::from_bytes(&(i as u32).to_be_bytes()),
+                    DatabaseEntry::from_bytes(&j.to_be_bytes()),
+                )
+                .unwrap();
+                total += 1;
+            }
+        }
+    }
+    assert_eq!(db.count().unwrap(), total, "db.count tracks the total");
+
+    for (i, &nd) in n_dups.iter().enumerate() {
+        let mut c = db.open_cursor(None).unwrap();
+        let mut k = DatabaseEntry::from_bytes(&(i as u32).to_be_bytes());
+        let mut d = DatabaseEntry::new();
+        assert_eq!(
+            c.get(&mut k, &mut d, Get::Search, None).unwrap(),
+            OperationStatus::Success
+        );
+        assert_eq!(
+            c.count().unwrap(),
+            nd as u64,
+            "cursor.count() must be the exact dup count for key {i} \
+             regardless of insertion order"
+        );
+        drop(c);
+    }
+}
