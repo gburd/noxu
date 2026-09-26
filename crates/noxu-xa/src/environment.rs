@@ -321,6 +321,22 @@ impl XaResource for XaEnvironment {
             branch.state = BranchState::Suspended;
         } else if flags.contains(XaFlags::TMFAIL) {
             branch.state = BranchState::RollbackOnly;
+            // C4/F15/V13: also mark the inner Txn abort-only, mirroring JE.
+            // JE XAEnvironment.end (XAEnvironment.java:150) on TMFAIL builds
+            // `new XAFailureException(txn)` whose constructor calls
+            // `super(locker, true /*abortOnly*/, ...)`
+            // (XAFailureException.java:37-41), setting the Locker own
+            // abortOnly flag (Locker.setOnlyAbortable() semantics). The
+            // underlying Txn/Locker then refuses any further put/get
+            // regardless of whether the caller goes through the XA wrapper
+            // or holds a raw Transaction handle obtained BEFORE xa_end.
+            // set_only_abortable() flips Open -> MustAbort (and is a no-op
+            // in any other state), so the legitimate xa_rollback that must
+            // follow a RollbackOnly branch is unaffected: abort() runs from
+            // both Open and MustAbort.
+            if let Some(inner) = branch.txn.get_inner_txn() {
+                inner.lock().unwrap().set_only_abortable();
+            }
         } else {
             // TMSUCCESS or NOFLAGS
             branch.state = BranchState::Idle;
