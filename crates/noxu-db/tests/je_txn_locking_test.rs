@@ -524,8 +524,7 @@ fn txn_end_test_open_database_accepts_open_txn_and_auto_commit() {
 // operation (Locker.setOnlyAbortable / Txn handling of
 // OperationFailureException).
 #[test]
-#[ignore = "NEW-TXN-2: a lock conflict/timeout does not set the txn abort-only (JE OperationFailureException divergence)"]
-fn txn_test_repeating_operation_failures_bug() {
+fn txn_test_repeating_operation_failures() {
     let dir = TempDir::new().unwrap();
     let env = open_env(&dir);
     let db = txn_db(&env, "repeating");
@@ -550,15 +549,17 @@ fn txn_test_repeating_operation_failures_bug() {
     );
     assert!(first.is_err(), "txn2's contended put must fail");
 
-    // FAITHFUL JE expectation: txn2 is now invalid (MUST_ABORT) and a further
-    // operation must be rejected.  On the current engine txn2 stays Open and
-    // this second put SUCCEEDS -> the assert fails (NEW-TXN-2).
+    // FAITHFUL JE expectation (fixed as NEW-TXN-2): txn2 is now invalid
+    // (MUST_ABORT) -- the lock-conflict operation failure poisoned the txn
+    // abort-only (JE Locker.setOnlyAbortable on OperationFailureException,
+    // Locker.java:285).
     assert!(
         !txn2.is_valid(),
         "NEW-TXN-2: after a lock-conflict operation failure the txn must be \
-         invalid/abort-only (JE TxnTest.testRepeatingOperationFailures); \
-         engine currently leaves it Open"
+         invalid/abort-only (JE TxnTest.testRepeatingOperationFailures)"
     );
+    // A further operation on the abort-only txn must be rejected (check_state
+    // returns InvalidTransaction).
     let second = db.put_in(
         &txn2,
         DatabaseEntry::from_bytes(b"key2"),
@@ -568,7 +569,147 @@ fn txn_test_repeating_operation_failures_bug() {
         second.is_err(),
         "NEW-TXN-2: a further operation on the abort-only txn must be rejected"
     );
+    // The poisoned txn cannot commit -- it can only be aborted.
+    assert!(
+        txn2.commit().is_err(),
+        "NEW-TXN-2: an abort-only txn must refuse to commit"
+    );
 
     let _ = txn2.abort();
     let _ = txn1.commit();
+}
+
+// NEW-TXN-2 positive guard: a lock WAIT that eventually SUCCEEDS must NOT
+// poison the txn.  A blocking waiter whose contended lock is later released
+// (owner commits) is granted the lock and can still commit normally -- only a
+// lock request that RETURNS AN ERROR poisons (JE Locker.setOnlyAbortable fires
+// on OperationFailureException, not on a successful grant after a wait).
+#[test]
+fn txn_test_lock_wait_that_succeeds_does_not_poison() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let db = Arc::new(txn_db(&env, "wait_ok"));
+
+    // txn1 holds a write lock on key1, then releases it shortly by committing.
+    let txn1 = env.begin_transaction(None).unwrap();
+    db.put_in(
+        &txn1,
+        DatabaseEntry::from_bytes(b"key1"),
+        DatabaseEntry::from_bytes(b"v1"),
+    )
+    .unwrap();
+
+    // txn2 has a generous lock timeout so its put on key1 WAITS and then
+    // SUCCEEDS once txn1 commits and releases the lock.
+    let env2 = Arc::clone(&env);
+    let db2 = Arc::clone(&db);
+    let waiter = thread::spawn(move || {
+        let long = TransactionConfig::new().with_lock_timeout_ms(10_000);
+        let txn2 = env2.begin_transaction(Some(&long)).unwrap();
+        // Blocks until txn1 releases the write lock, then is granted.
+        db2.put_in(
+            &txn2,
+            DatabaseEntry::from_bytes(b"key1"),
+            DatabaseEntry::from_bytes(b"v2"),
+        )
+        .expect("waiter should be granted the lock once txn1 commits");
+        // A successful lock WAIT must leave the txn usable: a further op and
+        // the commit must both succeed (the txn was NOT poisoned).
+        assert!(
+            txn2.is_valid(),
+            "waiter txn must still be Open after a granted wait"
+        );
+        db2.put_in(
+            &txn2,
+            DatabaseEntry::from_bytes(b"key2"),
+            DatabaseEntry::from_bytes(b"v3"),
+        )
+        .expect("second op on a non-poisoned txn must succeed");
+        txn2.commit()
+            .expect("a txn that only WAITED (never failed) must commit");
+    });
+
+    // Give the waiter time to start blocking, then release the lock.
+    thread::sleep(Duration::from_millis(150));
+    txn1.commit().unwrap();
+
+    waiter.join().unwrap();
+
+    // Final durable state reflects the waiter's committed writes.
+    let mut out = DatabaseEntry::new();
+    db.get_into(None, DatabaseEntry::from_bytes(b"key1"), &mut out).unwrap();
+    assert_eq!(out.data(), b"v2");
+}
+
+// NEW-TXN-2 (JE-faithful, no-wait): a NO-WAIT transaction whose operation
+// fails to get a lock (surfacing `LockNotAvailable`) must NOT be poisoned.
+// JE's `LockNotAvailableException` explicitly documents The Transaction
+
+// NEW-TXN-2 (JE-faithful, no-wait): a NO-WAIT transaction whose operation
+// fails to get a lock (surfacing `LockNotAvailable`) must NOT be poisoned.
+// JE's `LockNotAvailableException` explicitly documents "The Transaction
+// handle is not invalidated as a result of this exception"
+// (LockNotAvailableException.java:18-23,41-43 -- "Do not set abort-only for a
+// no-wait lock failure"; ctor path LockConflictException.java:127-128 passes
+// abortOnly=false).  So after a no-wait failure the txn stays usable: a
+// subsequent operation on a FREE key succeeds and the txn commits.
+#[test]
+fn txn_test_no_wait_lock_failure_does_not_poison() {
+    use noxu_db::NoxuError;
+
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let db = txn_db(&env, "no_wait_ok");
+
+    // txn1 holds a write lock on key1.
+    let txn1 = env.begin_transaction(None).unwrap();
+    db.put_in(
+        &txn1,
+        DatabaseEntry::from_bytes(b"key1"),
+        DatabaseEntry::from_bytes(b"v1"),
+    )
+    .unwrap();
+
+    // txn2 is a NO-WAIT txn: its put on the write-locked key1 fails
+    // IMMEDIATELY with LockNotAvailable (never waits).
+    let cfg = TransactionConfig::new().with_no_wait(true);
+    let txn2 = env.begin_transaction(Some(&cfg)).unwrap();
+    let contended = db.put_in(
+        &txn2,
+        DatabaseEntry::from_bytes(b"key1"),
+        DatabaseEntry::from_bytes(b"v2"),
+    );
+    assert!(
+        matches!(contended, Err(NoxuError::LockNotAvailable)),
+        "no-wait put on a write-locked key must fail with LockNotAvailable, \
+         got {contended:?}"
+    );
+
+    // JE contract: the no-wait failure did NOT invalidate the handle.
+    assert!(
+        txn2.is_valid(),
+        "NEW-TXN-2: a no-wait LockNotAvailable failure must NOT poison the txn \
+         (JE LockNotAvailableException: handle not invalidated)"
+    );
+
+    // The txn is still usable: an op on a FREE key succeeds ...
+    db.put_in(
+        &txn2,
+        DatabaseEntry::from_bytes(b"free_key"),
+        DatabaseEntry::from_bytes(b"v3"),
+    )
+    .expect("op on a free key after a no-wait failure must succeed");
+
+    // ... and the txn commits normally.
+    txn2.commit().expect(
+        "a no-wait txn that only hit LockNotAvailable must still commit",
+    );
+
+    let _ = txn1.commit();
+
+    // The committed write on the free key is durable.
+    let mut out = DatabaseEntry::new();
+    db.get_into(None, DatabaseEntry::from_bytes(b"free_key"), &mut out)
+        .unwrap();
+    assert_eq!(out.data(), b"v3");
 }

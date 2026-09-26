@@ -1820,7 +1820,7 @@ impl Locker for Txn {
         // it is handled by the lock-steal path inside the lock manager
         // (LockManager.waitForLock -> stealLock, LockManager.java:552), so
         // route importunate requests through `lock_importunate_with_timeout`.
-        let grant = if self.importunate {
+        let raw = if self.importunate {
             // Importunate (HA replay) lockers steal rather than wait, so the
             // transaction-level timeout does not apply to their bounded steal
             // path (JE skips deadlock detection and timed waits for them,
@@ -1831,7 +1831,7 @@ impl Locker for Txn {
                 lock_type,
                 non_blocking || self.no_wait,
                 self.lock_timeout_ms,
-            )?
+            )
         } else {
             // F22/C6: thread this txn transaction-level timeout into the lock
             // wait so a short txn timeout can cut a long (or forever) lock
@@ -1859,7 +1859,59 @@ impl Locker for Txn {
                         }
                     }
                     other => other,
-                })?
+                })
+        };
+
+        // NEW-TXN-2 / JE Locker.setOnlyAbortable (Locker.java:285): a lock
+        // request that FAILS with a lock-conflict-class error is an
+        // OperationFailureException in JE (LockConflictException /
+        // LockTimeoutException / LockNotGrantedException all extend it), which
+        // poisons the locker abort-only -- the txn is thereafter invalid, a
+        // further operation re-throws, and it can only be aborted, never
+        // committed.  Mirror that here: flip the txn to MustAbort BEFORE
+        // propagating the error.
+        //
+        // CRUCIAL DISTINCTION: only a lock request the *caller* issued as a
+        // real (blocking) operation poisons the txn.  A `non_blocking == true`
+        // request is an internal contention *probe* the DBI cursor layer
+        // (`cursor_impl::lock_ln` and friends) issues and then retries with a
+        // blocking wait -- a lock WAIT that later SUCCEEDS must NOT poison the
+        // txn.  So we gate poisoning on `!non_blocking`.  A no-wait txn's real
+        // op arrives here with the caller's `non_blocking == false` and the
+        // `no_wait` flag OR-ed in only at the lock-manager call above, so it
+        // fails with `LockNotAvailable` -- which is EXCLUDED from the poison
+        // set below (JE does not invalidate the handle on a no-wait failure).
+        // `RangeRestart` is a retry signal, not an operation failure, and
+        // state errors
+        // (`InvalidTransaction`) mean the txn is already resolved -- neither
+        // poisons.
+        let grant = match raw {
+            Ok(g) => g,
+            Err(e) => {
+                // Poison the locker abort-only ONLY on a BLOCKING lock-conflict
+                // failure.  Never poison on TxnError::LockNotAvailable: that is
+                // Noxu's no-wait failure (lock_manager.rs:587,904 -- produced
+                // only for non-blocking/no-wait requests), and JE explicitly
+                // does NOT invalidate the txn on a no-wait failure
+                // (LockNotAvailableException.java:41-43 "Do not set abort-only
+                // for a no-wait lock failure"; javadoc "The Transaction handle
+                // is not invalidated").  A genuine BLOCKING conflict always
+                // surfaces as LockConflict / LockTimeout / TransactionTimeout /
+                // Deadlock, never LockNotAvailable, so excluding it can never
+                // suppress a real poison.
+                if !non_blocking
+                    && matches!(
+                        e,
+                        TxnError::LockConflict(_)
+                            | TxnError::LockTimeout { .. }
+                            | TxnError::TransactionTimeout { .. }
+                            | TxnError::Deadlock(_)
+                    )
+                {
+                    self.set_only_abortable();
+                }
+                return Err(e);
+            }
         };
 
         // Track the lock.
