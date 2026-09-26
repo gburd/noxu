@@ -120,6 +120,24 @@ listed in [References](#references).
   The evictor now tracks the prior image as obsolete on re-log (matching JE and
   the leaf-node path). Recovery was already correct; this improves space
   reclamation accuracy only.
+- **Master transfer waits for catch-up and freezes commits during hand-off.**
+  `transfer_master` handed off best-effort without waiting for the target to
+  catch up, so a lagging target could become master missing the old master's
+  most recent acknowledged commits (lost on re-sync). It now waits (bounded) for
+  the target's VLSN to reach the master's, freezes new commit assignment during
+  the hand-off window, re-confirms the target still covers the final VLSN, then
+  hands off — closing the loss window (JE `MasterTransfer` phase 2). The freeze
+  is transfer-scoped, released on every path, and zero-cost when no transfer is
+  in progress.
+- **The log cleaner no longer deletes files a lagging replica still needs.**
+  The cleaner honored only local read/txn protection, so a file within a lagging
+  replica's catch-up range could be reclaimed, forcing the replica to
+  network-restore. The master now pins every log file at or after the file
+  containing the global CBVLSN (JE `FileProtector` replication-protected range).
+  A member that goes silent past a configurable timeout (`cbvlsn_timeout`,
+  default 30s) is excluded from the CBVLSN so a disconnected node cannot pin the
+  log indefinitely; the exclusion keys on liveness, so a live-but-lagging replica
+  stays protected.
 
 - **WAL now fail-stops the environment on a critical log-write failure (JE
   `LogManager.serialLog` parity).** A failed or partial WAL write previously left
