@@ -626,6 +626,8 @@ fn f11_nested_transaction_none_still_works() {
 // lock-manager locker-label map) grew without bound because the explicit
 // commit/abort paths never called `commit_txn`/`abort_txn`, so `n_active`
 // climbed monotonically and `n_commits`/`n_aborts` undercounted.
+// JE: TxnEndTest.testTxnStats / TxnEndTest.testBasicDb -- n_begins / n_commits /
+// n_aborts / n_active track begin/commit/abort exactly and return to baseline.
 #[test]
 fn f5_explicit_txns_unregister_from_txn_manager() {
     let tmp = TempDir::new().unwrap();

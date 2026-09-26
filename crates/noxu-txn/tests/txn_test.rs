@@ -157,6 +157,8 @@ fn txn_locker_id_matches_new_id() {
     assert_eq!(txn.id(), 77);
 }
 
+// JE: TxnTest.testBasicLocking / TxnTest.testCommit -- a READ lock increments
+// the txn's read-lock count (checkHeldLocks(1, 0)).
 #[test]
 fn txn_acquire_read_lock_increments_count() {
     let lm = lm();
@@ -166,6 +168,8 @@ fn txn_acquire_read_lock_increments_count() {
     assert_eq!(txn.n_write_locks(), 0);
 }
 
+// JE: TxnTest.testBasicLocking -- a WRITE lock increments the write-lock
+// count (checkHeldLocks(0, 1)).
 #[test]
 fn txn_acquire_write_lock_increments_write_count() {
     let lm = lm();
@@ -175,6 +179,8 @@ fn txn_acquire_write_lock_increments_write_count() {
     assert_eq!(txn.n_read_locks(), 0);
 }
 
+// JE: TxnTest.testCommit -- upgrading a held READ to WRITE (PROMOTION) moves
+// the lock from the read set to the write set (checkHeldLocks(1,0)->(0,1)).
 #[test]
 fn txn_promote_read_to_write_removes_from_read_set() {
     let lm = lm();
@@ -194,6 +200,8 @@ fn txn_n_locks_totals_both_sets() {
     assert_eq!(txn.n_locks(), 2);
 }
 
+// JE: TxnTest.testCommit / TxnTest.testBasicLocking -- commit releases every
+// held lock (checkHeldLocks(0, 0) after commit).
 #[test]
 fn txn_commit_releases_all_locks() {
     let lm = lm();
@@ -205,6 +213,8 @@ fn txn_commit_releases_all_locks() {
     assert_eq!(lm2.n_total_locks(), 0);
 }
 
+// JE: TxnTest.testLockMutation -- abort releases every held lock and the
+// live lock count returns to its pre-txn baseline.
 #[test]
 fn txn_abort_releases_all_locks() {
     let lm = lm();
@@ -219,6 +229,8 @@ fn txn_abort_releases_all_locks() {
 
 // ─── 6. Demote write → read ───────────────────────────────────────────────────
 
+// JE: TxnTest.testBasicLocking -- demoteLock turns a held WRITE back into a
+// READ (checkHeldLocks(0,1)->(1,0)).
 #[test]
 fn demote_lock_moves_write_to_read() {
     let lm = lm();
@@ -355,6 +367,8 @@ fn commit_no_sync_succeeds_without_log_manager() {
 
 // ─── 11. Cursor registration guard ────────────────────────────────────────────
 
+// JE: TxnEndTest.testTxnClose -- commit must fail while cursors are still open
+// (JE throws IllegalStateException "detected open cursors").
 #[test]
 fn commit_fails_when_cursors_open() {
     let lm = lm();

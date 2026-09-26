@@ -156,6 +156,8 @@ fn rename_database_under_txn_commits() {
 // truncate_database
 // ---------------------------------------------------------------------------
 
+// JE: TxnEndTest.testTruncateDeleteDB -- truncate+remove of a DB under one txn
+// is rolled back on abort (DB survives) and applied on commit.
 #[test]
 fn truncate_database_under_txn_is_rolled_back_on_abort() {
     let dir = TempDir::new().unwrap();
