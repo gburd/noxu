@@ -908,3 +908,215 @@ fn sr12978_migrate_flag_dup_move_then_split() {
     db.close().unwrap();
     env.close().unwrap();
 }
+
+// ===========================================================================
+// WakeupTest — background cleaner daemon wakeup
+// ===========================================================================
+
+/// JE `WakeupTest.testCleanAtStartup`.
+///
+/// Write files that are mostly obsolete with the cleaner OFF, close, then
+/// reopen with the background cleaner ON and assert it wakes up and cleans at
+/// startup (JE `expectBackgroundCleaning`: `getNCleanerRuns() > 0` within a
+/// timeout). The faithful invariant: a freshly-opened env with a backlog of
+/// low-utilization files cleans on its own without any explicit `clean_log`.
+#[test]
+fn wakeup_clean_at_startup() {
+    let dir = TempDir::new().unwrap();
+    let value = vec![0x9Cu8; 400];
+
+    // Phase 1: cleaner OFF, create obsolete files (overwrite one key many
+    // times so the log is overwhelmingly garbage).
+    {
+        let mut cfg = EnvironmentConfig::new(dir.path().to_path_buf())
+            .with_allow_create(true)
+            .with_transactional(true)
+            .with_log_file_max_bytes(8192)
+            .with_cleaner_min_utilization(50);
+        cfg.set_run_cleaner(false);
+        cfg.set_run_checkpointer(false);
+        cfg.set_run_evictor(false);
+        let env = Environment::open(cfg).unwrap();
+        let db = open_db(&env, false);
+        for _ in 0..400 {
+            db.put(ikey(0), &value).unwrap();
+        }
+        env.checkpoint(Some(&force())).unwrap();
+        db.close().unwrap();
+        env.close().unwrap();
+    }
+
+    // Phase 2: cleaner ON with a short wakeup interval — expect it to run.
+    {
+        let mut cfg = EnvironmentConfig::new(dir.path().to_path_buf())
+            .with_allow_create(true)
+            .with_transactional(true)
+            .with_log_file_max_bytes(8192)
+            .with_cleaner_min_utilization(50)
+            .with_cleaner_wakeup_interval_ms(100);
+        cfg.set_run_cleaner(true);
+        cfg.set_run_checkpointer(true);
+        let env = Environment::open(cfg).unwrap();
+        let _db = open_db(&env, false);
+
+        // JE expectBackgroundCleaning: poll up to 30s for a cleaner run.
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut ran = false;
+        while std::time::Instant::now() < deadline {
+            if env.stats().unwrap().cleaner.runs > 0 {
+                ran = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(ran, "background cleaner did not run at startup");
+
+        _db.close().unwrap();
+        env.close().unwrap();
+    }
+}
+
+/// JE `WakeupTest.testCleanAfterMinUtilizationChange`.
+///
+/// With the cleaner running and files at moderate utilization that
+/// `min_utilization` does not yet select, nothing is cleaned; raising
+/// `min_utilization` via `setMutableConfig` must make the running cleaner wake
+/// up and clean (JE re-reads `CLEANER_MIN_UTILIZATION` on config update, which
+/// Noxu `set_mutable_config` pushes to the live cleaner via
+/// `Cleaner::set_min_utilization`).
+#[test]
+fn wakeup_clean_after_min_utilization_change() {
+    let dir = TempDir::new().unwrap();
+    let value = vec![0x6Du8; 400];
+
+    let mut cfg = EnvironmentConfig::new(dir.path().to_path_buf())
+        .with_allow_create(true)
+        .with_transactional(true)
+        .with_log_file_max_bytes(8192)
+        // Start LOW so the moderate-utilization files are not selected.
+        .with_cleaner_min_utilization(10)
+        .with_cleaner_wakeup_interval_ms(100);
+    cfg.set_run_cleaner(true);
+    cfg.set_run_checkpointer(true);
+    let mut env = Environment::open(cfg).unwrap();
+    let db = open_db(&env, false);
+
+    // ~50% utilization: half the keys are live, half overwritten once.
+    for i in 0..200u32 {
+        db.put(ikey(i), &value).unwrap();
+    }
+    for i in 0..100u32 {
+        db.put(ikey(i), &value).unwrap();
+    }
+    env.checkpoint(Some(&force())).unwrap();
+
+    let runs_before = env.stats().unwrap().cleaner.runs;
+
+    // Raise min_utilization so the files now look under-utilized and the
+    // running cleaner should select them.
+    env.set_mutable_config(
+        noxu_db::EnvironmentMutableConfig::new()
+            .with_cleaner_min_utilization(90),
+    )
+    .unwrap();
+
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut cleaned = false;
+    while std::time::Instant::now() < deadline {
+        let s = env.stats().unwrap().cleaner;
+        if s.runs > runs_before && (s.lns_cleaned > 0 || s.deletions > 0) {
+            cleaned = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        cleaned,
+        "raising min_utilization must make the running cleaner clean"
+    );
+
+    db.close().unwrap();
+    env.close().unwrap();
+}
+
+// ===========================================================================
+// RMWLockingTest — utilization accuracy after RMW read + partial modify
+// ===========================================================================
+
+/// JE `RMWLockingTest.testBasic`.
+///
+/// Insert N records, then in one txn RMW-read two records and modify only one,
+/// commit, checkpoint. JE asserts `UtilizationProfile.verifyFileSummaryDatabase()`
+/// — i.e. the FileSummaryLNs accurately reflect ONLY the LNs actually made
+/// obsolete (the RMW-read-but-unmodified record must NOT be counted obsolete;
+/// only the modified one's prior version is). The Noxu analog of
+/// `verifyFileSummaryDatabase` is the `VerifyUtils.check_lsns` disjointness
+/// invariant: no live LSN may be recorded obsolete. We assert it via a
+/// data-survival + obsolete-count sanity: the RMW-modify obsoletes exactly the
+/// modified record's prior version, both RMW-read records still fetch, and no
+/// spurious over-counting occurs.
+///
+/// (The RMW write-lock-on-read behavior itself is covered by
+/// `je_rmw_locking_test.rs`; this port covers the utilization-accounting half
+/// of `RMWLockingTest`.)
+#[test]
+fn rmw_locking_basic_utilization_accuracy() {
+    let dir = TempDir::new().unwrap();
+    let env = open_util_env(dir.path());
+    let db = open_db(&env, false);
+
+    const NUM_RECS: u32 = 5;
+    let data = ikey(100);
+    for i in 0..NUM_RECS {
+        db.put(ikey(i), &data).unwrap();
+    }
+    env.checkpoint(Some(&force())).unwrap();
+    let base = total_obsolete_lns(&env);
+
+    // RMW-read record 0 and record 1 (write-locking them), modify only 1.
+    let txn = env.begin_transaction(None).unwrap();
+    let s0 = db
+        .get_with_options(
+            Some(&txn),
+            DatabaseEntry::from_bytes(&ikey(0)),
+            &noxu_db::ReadOptions::read_modify_write(),
+        )
+        .unwrap();
+    assert!(s0.is_some(), "RMW-read of record 0 must find it");
+    let s1 = db
+        .get_with_options(
+            Some(&txn),
+            DatabaseEntry::from_bytes(&ikey(1)),
+            &noxu_db::ReadOptions::read_modify_write(),
+        )
+        .unwrap();
+    assert!(s1.is_some(), "RMW-read of record 1 must find it");
+    // Modify only record 1.
+    db.put_in(&txn, ikey(1), ikey(200)).unwrap();
+    txn.commit().unwrap();
+    env.compress().unwrap();
+
+    // Exactly one prior version (record 1's) is obsolete; record 0 was only
+    // read (RMW), so its LN must NOT be counted obsolete.
+    let delta = total_obsolete_lns(&env) - base;
+    assert_eq!(
+        delta, 1,
+        "RMW-modify of one of two RMW-read records must obsolete exactly ONE \
+         prior LN (the modified one); the read-only record must not be \
+         counted obsolete. delta={delta}"
+    );
+
+    // Both records still fetch; record 1 has the new value.
+    assert!(exists(&db, &ikey(0)), "RMW-read record 0 must survive");
+    let mut val = DatabaseEntry::new();
+    assert!(
+        db.get_into(None, DatabaseEntry::from_bytes(&ikey(1)), &mut val)
+            .unwrap()
+    );
+    assert_eq!(val.data_opt(), Some(ikey(200).as_slice()));
+
+    db.close().unwrap();
+    env.close().unwrap();
+}
