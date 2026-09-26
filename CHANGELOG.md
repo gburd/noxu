@@ -106,6 +106,13 @@ listed in [References](#references).
   not evictable, so eviction correctly stops — rather than spinning — once only
   lock/transaction memory remains over budget; the footprint is now visible to
   stats/monitoring.
+- **`get_last()` now takes the SERIALIZABLE end-of-database lock.** A SERIALIZABLE
+  scan that positioned at the last record did not lock the end-of-database range,
+  so a concurrent transaction could insert a new maximum key without conflict — a
+  phantom the isolation level must prevent (`get_first`/`next` already locked it).
+  `get_last()` now locks the EOF sentinel under SERIALIZABLE (a concurrent
+  new-maximum insert conflicts until the scanner commits); lower isolation levels
+  are unaffected.
 
 - **WAL now fail-stops the environment on a critical log-write failure (JE
   `LogManager.serialLog` parity).** A failed or partial WAL write previously left
