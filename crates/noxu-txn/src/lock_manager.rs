@@ -430,6 +430,48 @@ impl LockManager {
         jump_ahead_of_waiters: bool,
         timeout_ms: u64,
     ) -> Result<LockGrantType, TxnError> {
+        self.lock_with_timeout_and_txn(
+            lsn,
+            locker_id,
+            lock_type,
+            non_blocking,
+            jump_ahead_of_waiters,
+            timeout_ms,
+            None,
+        )
+    }
+
+    /// Like [`lock_with_timeout`], but also honours the requesting
+    /// transaction's *transaction-level* timeout.
+    ///
+    /// `txn_timeout_remaining_ms` is the transaction's remaining time budget
+    /// (`txnTimeout - (now - txnStart)`) at the moment of the call, or `None`
+    /// when the locker has no transaction-level timeout configured
+    /// (`txn_timeout_ms == 0`).  `Some(0)` means the transaction deadline has
+    /// already passed.
+    ///
+    /// F22/C6: mirrors JE `LockManager.lock()` (LockManager.java:298-306) —
+    /// "If there is a txn timeout, and the txn time remaining is less than the
+    /// lock timeout, then use the txn time remaining instead" — so a short
+    /// transaction-level timeout can cut a lock wait SHORT even when the
+    /// per-lock timeout is longer (or `0` == wait forever).  When the wait ends
+    /// because the *transaction* deadline expired (not the lock deadline) we
+    /// return [`TxnError::TransactionTimeout`], and per JE's precedence rule
+    /// (`waitForLock`, LockManager.java:729-738) "when both types of timeouts
+    /// occur, throw TransactionTimeout" the transaction timeout wins a tie.
+    /// When `txn_timeout_remaining_ms` is `None` the behaviour is identical to
+    /// [`lock_with_timeout`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn lock_with_timeout_and_txn(
+        &self,
+        lsn: u64,
+        locker_id: i64,
+        lock_type: LockType,
+        non_blocking: bool,
+        jump_ahead_of_waiters: bool,
+        timeout_ms: u64,
+        txn_timeout_remaining_ms: Option<u64>,
+    ) -> Result<LockGrantType, TxnError> {
         // No lock needed for dirty-read, return immediately.
         if lock_type == LockType::None {
             return Ok(LockGrantType::NoneNeeded);
@@ -510,6 +552,18 @@ impl LockManager {
         };
         // Shard mutex is released here.
 
+        // F22/C6: if the transaction-level deadline has ALREADY passed by the
+        // time we would begin to wait, don't sleep at all — return
+        // TransactionTimeout immediately.  This mirrors JE's `Math.max(1,
+        // timeRemain)` clamp: a genuinely-expired txn never busy-spins with a
+        // zero/negative wait, it simply times out (LockManager.java:298-306 /
+        // 729-738).
+        if txn_timeout_remaining_ms == Some(0) {
+            self.flush_and_clear_waiter(table_idx, lsn, locker_id);
+            self.stats.lock_timeouts.fetch_add(1, Ordering::Relaxed);
+            return Err(self.txn_timeout_error(locker_id));
+        }
+
         // Register in the incremental waits-for graph so deadlock detection
         // can find this edge without rescanning all lock-table shards.
         self.record_wait(locker_id, &owner_ids);
@@ -558,6 +612,13 @@ impl LockManager {
         let (mutex, condvar) = &*notify_pair;
         let mut granted_guard = mutex.lock();
 
+        // Closure computing whether the transaction-level deadline has expired
+        // given `elapsed_ms` since we started waiting, and the txn's remaining
+        // budget at wait entry.  `None` when no txn timeout is set.
+        let txn_expired = |elapsed_ms: u64| -> bool {
+            matches!(txn_timeout_remaining_ms, Some(budget) if elapsed_ms >= budget)
+        };
+
         loop {
             if *granted_guard {
                 // We were woken by the releasing thread which set our flag and
@@ -566,37 +627,69 @@ impl LockManager {
                 break;
             }
 
-            // Compute remaining time.
-            let remaining_ms = if timeout_ms == 0 {
-                0 // 0 means wait forever
+            let elapsed_ms =
+                self.clock.now_nanos().saturating_sub(start_ns) / 1_000_000;
+
+            // F22/C6: the transaction-level deadline takes precedence over the
+            // lock-level one (JE LockManager.java:729-738 — "when both types of
+            // timeouts occur, throw TransactionTimeout").  Check it FIRST so a
+            // tie resolves to TransactionTimeout.
+            if txn_expired(elapsed_ms) {
+                drop(granted_guard);
+                self.flush_and_clear_waiter(table_idx, lsn, locker_id);
+                self.stats.lock_timeouts.fetch_add(1, Ordering::Relaxed);
+                return Err(self.txn_timeout_error(locker_id));
+            }
+
+            // Compute remaining lock-level time.
+            let lock_remaining_ms = if timeout_ms == 0 {
+                0 // 0 means wait forever (at the lock level)
+            } else if elapsed_ms >= timeout_ms {
+                // Already past the lock deadline before we slept this iteration.
+                drop(granted_guard);
+                // H-2: shard before waiter_graph.
+                self.flush_and_clear_waiter(table_idx, lsn, locker_id);
+                self.stats.lock_timeouts.fetch_add(1, Ordering::Relaxed);
+                return Err(TxnError::LockTimeout {
+                    timeout_ms,
+                    lsn,
+                    owner: format!(
+                        "[{}] on LSN {lsn}",
+                        self.format_lockers(&owner_ids)
+                    ),
+                    requested_type: lock_type,
+                    requester: self.format_locker(locker_id),
+                });
             } else {
-                let elapsed =
-                    self.clock.now_nanos().saturating_sub(start_ns) / 1_000_000;
-                if elapsed >= timeout_ms {
-                    // Already timed out before we even slept this iteration.
-                    drop(granted_guard);
-                    // H-2: shard before waiter_graph.
-                    self.flush_and_clear_waiter(table_idx, lsn, locker_id);
-                    self.stats.lock_timeouts.fetch_add(1, Ordering::Relaxed);
-                    return Err(TxnError::LockTimeout {
-                        timeout_ms,
-                        lsn,
-                        owner: format!(
-                            "[{}] on LSN {lsn}",
-                            self.format_lockers(&owner_ids)
-                        ),
-                        requested_type: lock_type,
-                        requester: self.format_locker(locker_id),
-                    });
-                }
-                timeout_ms - elapsed
+                timeout_ms - elapsed_ms
             };
+
+            // F22/C6: fold the txn-level remaining time into the wait budget so
+            // a short txn timeout cuts a long (or forever) lock wait short.
+            // `Math.max(1, timeRemain)` clamp: never a 0/negative wait that
+            // busy-spins — a `Some(budget)` that is already exhausted was
+            // handled by the `txn_expired` check above.
+            let txn_remaining_ms = txn_timeout_remaining_ms
+                .map(|budget| budget.saturating_sub(elapsed_ms).max(1));
+
+            // Effective remaining = min(lock_remaining, txn_remaining), where
+            // a value of 0 for the lock side means "infinite".
+            let effective_remaining_ms =
+                match (lock_remaining_ms, txn_remaining_ms) {
+                    (0, None) => 0,           // both infinite
+                    (0, Some(t)) => t,        // lock infinite, txn bounded
+                    (l, None) => l,           // lock bounded, no txn timeout
+                    (l, Some(t)) => l.min(t), // both bounded — take the shorter
+                };
 
             // Use a short slice (up to 50 ms) so we can re-check for
             // deadlocks that may form after we entered the wait path.
             // uses a "deadlock detection delay" for the same purpose.
-            let slice_ms =
-                if remaining_ms == 0 { 50 } else { remaining_ms.min(50) };
+            let slice_ms = if effective_remaining_ms == 0 {
+                50
+            } else {
+                effective_remaining_ms.min(50)
+            };
 
             let timed_out = condvar
                 .wait_for(&mut granted_guard, Duration::from_millis(slice_ms))
@@ -636,12 +729,17 @@ impl LockManager {
             }
 
             if timed_out {
-                // Check if total time is exceeded.
-                if timeout_ms > 0
-                    && self.clock.now_nanos().saturating_sub(start_ns)
-                        / 1_000_000
-                        >= timeout_ms
-                {
+                let elapsed_ms =
+                    self.clock.now_nanos().saturating_sub(start_ns) / 1_000_000;
+                // F22/C6: txn-level deadline wins the tie (checked first).
+                if txn_expired(elapsed_ms) {
+                    drop(granted_guard);
+                    self.flush_and_clear_waiter(table_idx, lsn, locker_id);
+                    self.stats.lock_timeouts.fetch_add(1, Ordering::Relaxed);
+                    return Err(self.txn_timeout_error(locker_id));
+                }
+                // Check if the lock-level timeout is exceeded.
+                if timeout_ms > 0 && elapsed_ms >= timeout_ms {
                     drop(granted_guard);
                     // H-2: shard before waiter_graph.
                     self.flush_and_clear_waiter(table_idx, lsn, locker_id);
@@ -689,6 +787,19 @@ impl LockManager {
         };
 
         Ok(grant)
+    }
+
+    /// Builds a [`TxnError::TransactionTimeout`] for `locker_id`.
+    ///
+    /// F22/C6: the transaction-level timeout is enforced in
+    /// [`lock_with_timeout_and_txn`]; the actual `txn_timeout_ms` lives on the
+    /// `Txn`, so we report the locker id here and let the caller
+    /// (`Txn::lock`) — which owns the real value — not need to re-wrap it.
+    /// The lock manager does not track per-txn timeouts, so `timeout_ms` is
+    /// reported as `0` and overwritten with the real value if the caller
+    /// re-maps; the important signal is the error *variant*.
+    fn txn_timeout_error(&self, locker_id: i64) -> TxnError {
+        TxnError::TransactionTimeout { timeout_ms: 0, txn_id: locker_id }
     }
 
     /// Importunate lock acquisition for HA replay (`ReplayTxn`).

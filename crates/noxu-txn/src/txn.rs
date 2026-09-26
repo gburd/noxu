@@ -977,6 +977,24 @@ impl Txn {
         self.txn_timeout_ms = timeout_ms;
     }
 
+    /// Returns this transaction's remaining transaction-level time budget in
+    /// milliseconds, or `None` when no transaction-level timeout is configured
+    /// (`txn_timeout_ms == 0`).  `Some(0)` means the deadline has already
+    /// passed.
+    ///
+    /// F22/C6: this is the `timeRemain = txnTimeout - (now - txnStartMillis)`
+    /// value JE folds into the lock wait (`LockManager.java:298-306`); it is
+    /// passed to `LockManager::lock_with_timeout_and_txn` so a short txn
+    /// timeout can cut a long lock wait short.
+    fn txn_timeout_remaining_ms(&self) -> Option<u64> {
+        if self.txn_timeout_ms == 0 {
+            None
+        } else {
+            let elapsed = self.txn_start.elapsed().as_millis() as u64;
+            Some(self.txn_timeout_ms.saturating_sub(elapsed))
+        }
+    }
+
     /// Sets the no-wait flag. When true, all lock requests are non-blocking
     /// and fail immediately if the lock is not available.
     pub fn set_no_wait(&mut self, v: bool) {
@@ -1803,6 +1821,10 @@ impl Locker for Txn {
         // (LockManager.waitForLock -> stealLock, LockManager.java:552), so
         // route importunate requests through `lock_importunate_with_timeout`.
         let grant = if self.importunate {
+            // Importunate (HA replay) lockers steal rather than wait, so the
+            // transaction-level timeout does not apply to their bounded steal
+            // path (JE skips deadlock detection and timed waits for them,
+            // LockManager.java:472/552).
             self.lock_manager.lock_importunate_with_timeout(
                 lsn,
                 self.id,
@@ -1811,14 +1833,33 @@ impl Locker for Txn {
                 self.lock_timeout_ms,
             )?
         } else {
-            self.lock_manager.lock_with_timeout(
-                lsn,
-                self.id,
-                lock_type,
-                non_blocking || self.no_wait,
-                false, // jumpAheadOfWaiters
-                self.lock_timeout_ms,
-            )?
+            // F22/C6: thread this txn transaction-level timeout into the lock
+            // wait so a short txn timeout can cut a long (or forever) lock
+            // wait short (JE LockManager.java:298-306).  `None` when no txn
+            // timeout is configured (`txn_timeout_ms == 0`) -- behaviour then
+            // identical to the plain per-lock timeout.
+            self.lock_manager
+                .lock_with_timeout_and_txn(
+                    lsn,
+                    self.id,
+                    lock_type,
+                    non_blocking || self.no_wait,
+                    false, // jumpAheadOfWaiters
+                    self.lock_timeout_ms,
+                    self.txn_timeout_remaining_ms(),
+                )
+                .map_err(|e| match e {
+                    // The lock manager does not know this txn configured
+                    // timeout value, so it reports 0; fill in the real value
+                    // for the error message / NoxuError mapping.
+                    TxnError::TransactionTimeout { txn_id, .. } => {
+                        TxnError::TransactionTimeout {
+                            timeout_ms: self.txn_timeout_ms,
+                            txn_id,
+                        }
+                    }
+                    other => other,
+                })?
         };
 
         // Track the lock.
