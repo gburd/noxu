@@ -148,6 +148,15 @@ listed in [References](#references).
   (which logs any dirty eviction target, not just leaves). This path is
   low-reachability under normal workloads (leaf/record eviction relieves memory
   pressure first) but is now correct when it does occur.
+- **Cursor scans no longer stop at an empty edge BIN.** `Get::First` / `Get::Last`
+  (and the scans they drive) returned nothing when the leftmost/rightmost BIN was
+  physically empty after deletes (slots removed, BIN not yet compressed), even
+  though live keys remained — so a full scan after such deletes silently saw an
+  empty database. The cursor now skips any run of consecutive empty edge BINs to
+  the first live entry, matching JE's traversal. (This also corrects a
+  test-reported "reverse-split recovery loses all data" symptom that was in fact
+  this cursor-scan bug in the test's readback — recovery itself was correct: the
+  data was always on disk and retrievable by key.)
 - **Eviction no longer detaches a BIN that was re-dirtied or pinned since its
   flush.** The evictor logged a dirty BIN under the child latch, released it,
   then detached under the parent latch — a window in which a cursor could
