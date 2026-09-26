@@ -139,6 +139,15 @@ listed in [References](#references).
   anchor (matching JE, which keeps a deleted slot as a positioning anchor), so a
   delete-all loop empties the whole database in either direction, including
   sorted-duplicate databases.
+- **A dirty upper internal node is now logged before it is evicted.** The
+  evictor treated a dirty non-leaf node as "flushed" without logging it, then
+  detached it while leaving the parent pointer at the stale pre-change location —
+  so a structural change (such as a post-split parent-slot update) could be lost
+  on a crash before the next checkpoint. The evictor now logs a dirty upper
+  internal node and publishes its new location before detaching, matching JE
+  (which logs any dirty eviction target, not just leaves). This path is
+  low-reachability under normal workloads (leaf/record eviction relieves memory
+  pressure first) but is now correct when it does occur.
 - **Eviction no longer detaches a BIN that was re-dirtied or pinned since its
   flush.** The evictor logged a dirty BIN under the child latch, released it,
   then detached under the parent latch — a window in which a cursor could
