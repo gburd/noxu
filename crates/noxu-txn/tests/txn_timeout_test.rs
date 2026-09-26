@@ -132,10 +132,7 @@ fn long_txn_timeout_yields_to_short_lock_timeout() {
         matches!(result, Err(TxnError::LockTimeout { .. })),
         "expected LockTimeout (lock deadline fires first), got {result:?}"
     );
-    assert!(
-        elapsed < Duration::from_secs(5),
-        "elapsed = {elapsed:?}"
-    );
+    assert!(elapsed < Duration::from_secs(5), "elapsed = {elapsed:?}");
 
     drop(holder);
 }
@@ -163,7 +160,10 @@ fn both_timeouts_expire_transaction_timeout_wins() {
     .unwrap();
 
     assert!(
-        matches!(result, Err(TxnError::TransactionTimeout { txn_id: 2000, .. })),
+        matches!(
+            result,
+            Err(TxnError::TransactionTimeout { txn_id: 2000, .. })
+        ),
         "when both deadlines expire, TransactionTimeout must win, got {result:?}"
     );
 
