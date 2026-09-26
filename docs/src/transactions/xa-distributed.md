@@ -49,11 +49,13 @@ xa1.xa_start(&xid, XaFlags::NOFLAGS).unwrap();
 xa2.xa_start(&xid, XaFlags::NOFLAGS).unwrap();
 
 // Do work — mark_write is no longer required, writes are auto-detected.
+// `get_transaction` returns `Arc<Transaction>`; `put_in` takes the txn by
+// name (deref-coercion turns `&Arc<Transaction>` into `&Transaction`).
 let txn1 = xa1.get_transaction(&xid).unwrap();
-db1.put(Some(txn1), &key, &debit_entry).unwrap();
+db1.put_in(&txn1, &key, &debit_entry).unwrap();
 
 let txn2 = xa2.get_transaction(&xid).unwrap();
-db2.put(Some(txn2), &key, &credit_entry).unwrap();
+db2.put_in(&txn2, &key, &credit_entry).unwrap();
 
 // End branches
 xa1.xa_end(&xid, XaFlags::TMSUCCESS).unwrap();

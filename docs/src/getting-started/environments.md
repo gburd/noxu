@@ -103,7 +103,7 @@ applications but explicit close is recommended to propagate any errors.
 ## Listing Databases in an Environment
 
 ```rust
-let names: Vec<String> = env.get_database_names()?;
+let names: Vec<String> = env.database_names()?;
 for name in &names {
     println!("database: {}", name);
 }
