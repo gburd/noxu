@@ -25,6 +25,10 @@ use std::marker::PhantomData;
 fn map_cursor_err(e: DbiError) -> NoxuError {
     match e {
         DbiError::EnvironmentFailure { .. } => NoxuError::from(e),
+        // NEW-DBI-DUPPUTCUR: surface a rejected putCurrent (moving a dup to
+        // a new sort position) as the typed DuplicateDataException so
+        // callers can match on it, mirroring JE Cursor.putCurrent.
+        DbiError::DuplicateData(_) => NoxuError::DuplicateDataException,
         _ => NoxuError::OperationFailed {
             msg: e.to_string(),
             source: Box::new(e),

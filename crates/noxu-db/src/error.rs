@@ -810,6 +810,11 @@ impl From<noxu_dbi::DbiError> for NoxuError {
             },
             DbiError::DatabaseInUse(s) => NoxuError::OperationNotAllowed(s),
             DbiError::OperationFailed(s) => NoxuError::OperationNotAllowed(s),
+            // NEW-DBI-DUPPUTCUR: putCurrent may only update the current
+            // duplicate to an equal-sorting value; a value that would MOVE
+            // the dup is rejected.  JE surfaces this as
+            // DuplicateDataException.
+            DbiError::DuplicateData(_) => NoxuError::DuplicateDataException,
             // DBI-14: surface the comparator mismatch as an operation error
             // carrying the full diagnostic (persisted vs. configured
             // identity) as both the message and the chained `source`.

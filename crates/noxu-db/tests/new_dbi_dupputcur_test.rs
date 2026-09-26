@@ -206,9 +206,8 @@ fn put_current_on_non_dup_db_replaces_data() {
     let dir = TempDir::new().unwrap();
     let env = open_env(&dir);
     // No sorted_duplicates: plain DB.
-    let db_cfg = DatabaseConfig::new()
-        .with_allow_create(true)
-        .with_transactional(true);
+    let db_cfg =
+        DatabaseConfig::new().with_allow_create(true).with_transactional(true);
     let db = env.open_database(None, "plain", &db_cfg).unwrap();
 
     let key = DatabaseEntry::from_bytes(b"k");
@@ -229,7 +228,11 @@ fn put_current_on_non_dup_db_replaces_data() {
 
     let mut out = DatabaseEntry::new();
     assert!(db.get_into(None, &key, &mut out).unwrap());
-    assert_eq!(out.data_opt().unwrap(), b"v2", "non-dup putCurrent must replace");
+    assert_eq!(
+        out.data_opt().unwrap(),
+        b"v2",
+        "non-dup putCurrent must replace"
+    );
 
     let _ = env.close();
 }
@@ -252,6 +255,67 @@ fn normal_dup_insert_still_adds_dups() {
     let mut dout = DatabaseEntry::new();
     cursor.get(&mut kout, &mut dout, Get::Search, None).unwrap();
     assert_eq!(cursor.count().unwrap(), 3);
+    cursor.close().unwrap();
+
+    let _ = env.close();
+}
+
+/// EQUAL-under-a-CUSTOM-dup-comparator: JE allows putCurrent to replace the
+/// current dup with a byte-DIFFERENT value that still sorts EQUAL under the
+/// duplicate comparator (CursorImpl.java:1618 note: "the 2 keys may not be
+/// identical if custom comparators are used").
+///
+/// Here a case-insensitive dup comparator treats "a" and "A" as equal, so
+/// putCurrent("a" -> "A") is an allowed in-place update (Success), while
+/// putCurrent("a" -> "b") (which sorts DIFFERENTLY) is rejected.
+#[test]
+fn put_current_sort_equal_under_custom_dup_comparator_succeeds() {
+    use noxu_db::Comparator;
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+
+    let ci = Comparator::new("ascii_ci", |a: &[u8], b: &[u8]| {
+        let la: Vec<u8> = a.iter().map(|c| c.to_ascii_lowercase()).collect();
+        let lb: Vec<u8> = b.iter().map(|c| c.to_ascii_lowercase()).collect();
+        la.cmp(&lb)
+    });
+    let db_cfg = DatabaseConfig::new()
+        .with_allow_create(true)
+        .with_transactional(true)
+        .with_sorted_duplicates(true)
+        .with_duplicate_comparator(ci);
+    let db = env.open_database(None, "dupputcur_ci", &db_cfg).unwrap();
+
+    let key = DatabaseEntry::from_bytes(b"k");
+    // Under case-insensitive dup ordering these are distinct dups.
+    db.put(&key, DatabaseEntry::from_bytes(b"a")).unwrap();
+    db.put(&key, DatabaseEntry::from_bytes(b"m")).unwrap();
+
+    // Position on "a".
+    let mut cursor = db.open_cursor(None).unwrap();
+    let mut kout = DatabaseEntry::from_bytes(b"k");
+    let mut dout = DatabaseEntry::from_bytes(b"a");
+    let s = cursor.get(&mut kout, &mut dout, Get::SearchBoth, None).unwrap();
+    assert_eq!(s, OperationStatus::Success);
+
+    // "A" sorts EQUAL to "a" under the CI comparator: allowed in-place update.
+    let s = cursor
+        .put(&key, &DatabaseEntry::from_bytes(b"A"), Put::Current)
+        .unwrap();
+    assert_eq!(
+        s,
+        OperationStatus::Success,
+        "sort-equal replace under a custom dup comparator must be allowed"
+    );
+
+    // The cursor is now on the updated "A" entry.  "b" sorts DIFFERENTLY
+    // (it would move between "a"/"A" and "m") -> rejected.
+    let res = cursor.put(&key, &DatabaseEntry::from_bytes(b"b"), Put::Current);
+    assert!(
+        matches!(res, Err(NoxuError::DuplicateDataException)),
+        "sort-DIFFERENT replace under a custom dup comparator must be rejected, got {:?}",
+        res
+    );
     cursor.close().unwrap();
 
     let _ = env.close();
