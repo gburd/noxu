@@ -19,9 +19,7 @@
 //!
 //! JE: KeyPrefixTest.testRLEComparator
 
-use noxu_db::{
-    Comparator, DatabaseConfig, DatabaseEntry, EnvironmentConfig,
-};
+use noxu_db::{Comparator, DatabaseConfig, DatabaseEntry, EnvironmentConfig};
 use tempfile::TempDir;
 
 // ── RLE codec (JE KeyPrefixTest.strToRLEbytes / rleBytesToStr) ──────────────
@@ -136,11 +134,8 @@ fn rle_comparator_prefixing_no_loss_and_durable() {
 
         // put + immediate get (as JE does), then a full sweep.
         for k in &keys {
-            db.put(
-                DatabaseEntry::from_bytes(k),
-                DatabaseEntry::from_bytes(k),
-            )
-            .unwrap();
+            db.put(DatabaseEntry::from_bytes(k), DatabaseEntry::from_bytes(k))
+                .unwrap();
             assert!(
                 get_present(&db, k),
                 "RLE key must be retrievable immediately after insert"
@@ -155,7 +150,8 @@ fn rle_comparator_prefixing_no_loss_and_durable() {
             }
         }
         assert_eq!(
-            missing, 0,
+            missing,
+            0,
             "point-get: {missing}/{} keys unretrievable under prefixing + \
              non-byte-order comparator",
             keys.len()
@@ -227,7 +223,8 @@ fn rle_comparator_prefixing_no_loss_and_durable() {
         }
     }
     assert_eq!(
-        missing, 0,
+        missing,
+        0,
         "AFTER REOPEN: {missing}/{} keys unretrievable (durable loss)",
         keys.len()
     );
@@ -314,5 +311,10 @@ fn control_b_byte_consistent_comparator_prefixing_on_no_loss() {
     expect.sort_by(|a, b| b.cmp(a));
     assert_eq!(scan, expect, "control(b): scan must be descending");
     let vr = db.verify(&noxu_db::VerifyConfig::new()).unwrap();
-    assert_eq!(vr.error_count(), 0, "control(b): verify errors {:?}", vr.errors);
+    assert_eq!(
+        vr.error_count(),
+        0,
+        "control(b): verify errors {:?}",
+        vr.errors
+    );
 }
