@@ -3841,7 +3841,7 @@ impl ReplicatedEnvironment {
     /// or after this number is protected from the cleaner because a lagging
     /// electable replica may still need it. `None` when replication is not
     /// driving the cleaner (not a master, no electable replicas, or no cleaner
-    /// wired). See [`Self::update_cleaner_replica_protection`].
+    /// wired). The floor is refreshed on every ack (`record_ack`).
     pub fn replication_protected_file_floor(&self) -> Option<u32> {
         match self.replication_protected_floor.load(Ordering::Acquire) {
             u64::MAX => None,
