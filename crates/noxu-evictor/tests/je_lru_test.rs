@@ -23,6 +23,19 @@
 //!   `insert`  -> `insert`, `pop_lru` -> `evict_candidate`
 //!   (`remove_front`), `touch` -> `touch`, `remove` -> `remove`,
 //!   `contains` -> `contains`, `len` -> `len`.
+//!
+//! Scope / intentional deviation (per test-parity audit, package je.evictor):
+//! JE `LRUTest`'s cache-mode variants (`testCacheMode_UNCHANGED`,
+//! `testCacheMode_MAKE_COLD`, `testCacheMode_EVICT_LN`, `testCacheMode_EVICT_BIN`)
+//! set a PER-CURSOR `CacheMode` and assert per-DB cache byte usage differs
+//! accordingly.  In Noxu the user-settable per-operation / per-cursor / per-DB
+//! `CacheMode` hints are ADVISORY (accepted but not yet honored -- the hint
+//! does not reach the evictor; the setters are `#[deprecated]`; see
+//! `crates/noxu-db/src/cache_mode.rs` "Advisory status" and AGENTS.md).  A
+//! faithful end-to-end port of the per-cursor-cache-mode eviction assertions
+//! therefore cannot pass and is recorded N/A (documented deviation) in the
+//! package report; here we port the underlying LRU/MRU *mechanism* the JE
+//! tests ultimately validate, at the live `LruPolicy` level.
 
 use noxu_evictor::policies::LruPolicy;
 use noxu_evictor::policy::EvictionPolicy;
@@ -31,6 +44,8 @@ use noxu_evictor::policy::EvictionPolicy;
 // testBaseline-equivalent: insertion order = LRU order; evict_candidate
 // drains in insertion order until empty.
 // --------------------------------------------------------------------------
+// JE: LRUTest.testBaseline (LRU-mechanism intent; see module note re:
+// per-cursor CacheMode being advisory in Noxu).
 #[test]
 fn test_baseline_insertion_then_pop_lru() {
     let lru = LruPolicy::new();
@@ -55,6 +70,7 @@ fn test_baseline_insertion_then_pop_lru() {
 // testCacheMode_KEEP_HOT-equivalent: `touch(n)` marks n as recently used
 // (moved to MRU).  Subsequent pops return the un-touched nodes first.
 // --------------------------------------------------------------------------
+// JE: LRUTest.testCacheMode_KEEP_HOT (touch()==MRU promotion).
 #[test]
 fn test_keep_hot_via_touch() {
     let lru = LruPolicy::new();
@@ -80,6 +96,7 @@ fn test_keep_hot_via_touch() {
 // stay in insertion order.  A second insert of an already-present node
 // is rejected (the index already maps it).
 // --------------------------------------------------------------------------
+// JE: LRUTest.testCacheMode_UNCHANGED (untouched nodes keep LRU order).
 #[test]
 fn test_unchanged_nodes_stay_in_insertion_order() {
     let lru = LruPolicy::new();
@@ -98,6 +115,7 @@ fn test_unchanged_nodes_stay_in_insertion_order() {
 // equivalent to evicting that node from the list, regardless of its
 // position.  Subsequent pops do not return n.
 // --------------------------------------------------------------------------
+// JE: LRUTest.testCacheMode_EVICT_LN (remove()==immediate eviction).
 #[test]
 fn test_evict_ln_via_remove() {
     let lru = LruPolicy::new();
