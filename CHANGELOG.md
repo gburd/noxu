@@ -200,6 +200,13 @@ listed in [References](#references).
   raise `TransactionTimeout` when the transaction deadline is what expired (JE
   precedence: a tie resolves to `TransactionTimeout`). Behavior is unchanged when
   no transaction timeout is set; deadlock detection is unaffected.
+- **A failed XA branch now blocks further writes through a stale handle.**
+  `xa_end(TMFAIL)` marked only the XA branch's own bookkeeping, so a caller
+  holding a `Transaction` handle obtained before the `xa_end` call could keep
+  writing through it after the branch had failed. The inner transaction is now
+  marked abort-only on `TMFAIL` (matching JE), so any further operation on it is
+  rejected regardless of how the caller reaches it; the follow-up `xa_rollback`
+  is unaffected.
 
 ### Security
 
