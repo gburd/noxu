@@ -156,6 +156,9 @@ fn headline2_reopen_without_matching_comparator_fails() {
     );
 }
 
+// JE parity: RecoveryTest.testBasicRecoveryWithBtreeComparator — a DB
+// opened with a custom Btree comparator keeps its comparator order across
+// a close+reopen (recovery); the persisted comparator identity is honoured.
 #[test]
 fn headline2_reopen_with_matching_identity_succeeds() {
     let dir = TempDir::new().unwrap();

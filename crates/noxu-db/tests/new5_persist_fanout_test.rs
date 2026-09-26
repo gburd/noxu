@@ -63,6 +63,11 @@ fn bin_count(db: &noxu_db::Database) -> u64 {
 /// effective fanout would resolve to the env-level 256 and the tree would
 /// collapse to a single BIN on the recovered path; NEW-5 restores the
 /// persisted fanout 4.
+// JE parity: DbConfigUpdateRecoveryTest.testTransactional / testNonTransactional
+// (SR#18262) core invariant — a persisted per-DB NodeMaxEntries config
+// survives recovery. (JE additionally truncates mid-NameLN to prove an
+// unflushed MapLN is NOT persisted; that internal-reader half is a
+// documented N/A — see tp-je-recovery.md.)
 #[test]
 fn per_db_fanout_persisted_across_default_reopen() {
     let dir = TempDir::new().unwrap();

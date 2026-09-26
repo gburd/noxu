@@ -360,6 +360,8 @@ fn equality_mixed_pre_post_checkpoint() {
 ///
 /// Write some committed keys and some aborted keys (abort record in log).
 /// After recovery, only committed keys must be present.
+// JE parity: RecoveryAbortTest.testBasic — committed inserts survive, an
+// aborted batch leaves no trace after recovery.
 #[test]
 fn equality_aborted_txns() {
     let dir = TempDir::new().unwrap();
@@ -449,6 +451,9 @@ fn equality_deletes() {
 ///
 /// Update the same keys many times to produce BINDelta log entries.
 /// Recovery must see the final values.
+// JE parity: RecoveryDeltaTest.testRecoveryDelta / RecoveryCheckpointTest.
+// testBinDelta — repeated updates produce BIN-deltas; recovery from a
+// checkpoint that used deltas yields the final values.
 #[test]
 fn equality_bindelta_updates() {
     let dir = TempDir::new().unwrap();
@@ -497,6 +502,9 @@ fn equality_bindelta_updates() {
 ///
 /// 2 000 keys exercises the evictor path (partial evict / LN strip)
 /// without exhausting parallel test resources.  Recovery must see all keys.
+// JE parity: RecoveryDeltaTest.testEvictedDelta — BIN-deltas written under
+// eviction memory pressure are applied correctly by recovery (all keys
+// survive).
 #[test]
 fn equality_eviction_workload() {
     let dir = TempDir::new().unwrap();
@@ -543,6 +551,9 @@ fn equality_eviction_workload() {
 /// This avoids the txn-id-reuse problem that can occur when transaction
 /// counters reset across separate environment opens (committed and aborted
 /// keys are written within the SAME environment open here).
+// JE parity: RecoveryCheckpointTest.testActiveWhileCheckpointing — a txn
+// active across a checkpoint that then aborts must leave no trace after
+// recovery.
 #[test]
 fn equality_abort_spanning_checkpoint() {
     let dir = TempDir::new().unwrap();
