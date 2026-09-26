@@ -207,6 +207,13 @@ listed in [References](#references).
   marked abort-only on `TMFAIL` (matching JE), so any further operation on it is
   rejected regardless of how the caller reaches it; the follow-up `xa_rollback`
   is unaffected.
+- **Operator-configurable election priority (`NODE_PRIORITY`).** Every node
+  ranked with a hard-coded priority, so mastership could not be steered and a
+  node could not be made electable-but-not-preferred. `RepConfig::node_priority`
+  (default 1, runtime-mutable) now feeds the election ranking as a tiebreaker
+  after replication progress (so a higher-priority node never wins over a
+  more-advanced one), and priority 0 makes a node participate in quorum but
+  never become master — matching JE's `NODE_PRIORITY`.
 
 ### Security
 
