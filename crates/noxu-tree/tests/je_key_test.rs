@@ -5,6 +5,18 @@
 //! Ports invariants from `je/test/com/sleepycat/je/tree/KeyTest.java`,
 //! adapted to Noxu's `noxu_tree::key` module.
 //!
+//! JE method dispositions (je/test/com/sleepycat/je/tree/KeyTest.java):
+//! * KeyTest.testKeyPrefixer            -> `test_key_prefixer`
+//! * KeyTest.testKeyPrefixSubsetting    -> `test_key_prefix_subsetting`
+//! * KeyTest.testKeyComparison          -> `test_key_comparison`
+//! * KeyTest.testKeyComparisonPerformance -> `test_key_comparison_equal_repeats`
+//!   (correctness-only port; JE's 1,000,000-iteration micro-benchmark is a
+//!   perf smoke test, scaled down — the invariant, equal keys compare Equal,
+//!   is preserved).
+//! * The JE `Key.compareKeys(key1, null)` NullPointerException case is N/A in
+//!   Rust: `compare_keys` takes `&[u8]`, so passing "null" is a compile-time
+//!   impossibility — the NPE contract is a type-level guarantee here.
+//!
 //! Mapping table (JE -> Noxu):
 //! * `Key.createKeyPrefix(k1, k2)`        -> `key::create_key_prefix(k1, k2)`
 //! * `Key.compareKeys(k1, k2, null)`      -> `key::compare_keys(k1, k2, None)`

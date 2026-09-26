@@ -311,3 +311,76 @@ fn sr9752_part2_abort_after_committed_dups_reverts_with_dups() {
     drop(db2);
     drop(env2);
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// JE: SR13034Test.testSR13034 — a duplicate deleted BEFORE the dup tree exists,
+// then dup inserts aborted (setting KnownDeleted), then recovery.
+//
+// JE's original bug was DIN/DBIN-specific: recovery searched the dup tree BY
+// LN NODE ID and called `fetchEntry` (not `fetchEntryIgnoreKnownDeleted`) on a
+// KnownDeleted DBIN entry, throwing.  Noxu stores duplicates as composite keys
+// (NOT a JE DIN/DBIN dup sub-tree) and LNs carry no node ids, so the exact
+// search-by-node-id-hits-KnownDeleted mechanism CANNOT occur (JE's own comment:
+// "Because LNs no longer have node IDs, the bug this test was checking is no
+// longer applicable.  However, the test is generic and should run.").
+//
+// This is the GENERIC survivability port: the JE operation sequence must
+// recover cleanly with the correct final contents.
+//   1. put {A,C}; delete {A,C}; commit  (a deleted record, no dups yet)
+//   2. put {A,A}, {A,B}; abort          (would-be dups, rolled back)
+//   3. close (no checkpoint) + recover  (must not throw; A must be absent)
+// ──────────────────────────────────────────────────────────────────────────────
+#[test]
+fn sr13034_dup_delete_before_duptree_then_abort_recovers() {
+    let dir = TempDir::new().unwrap();
+    let path: PathBuf = dir.path().to_path_buf();
+
+    {
+        let (env, db) = open_env_db(&path, "sr13034", true /* dups */);
+
+        // 1) Insert {A,C} then delete it, commit.  No dup tree exists yet.
+        let txn1 = env.begin_transaction(None).unwrap();
+        db.put_no_overwrite_in(
+            &txn1,
+            DatabaseEntry::from_bytes(b"A"),
+            DatabaseEntry::from_bytes(b"C"),
+        )
+        .unwrap();
+        assert!(db.delete_in(&txn1, DatabaseEntry::from_bytes(b"A")).unwrap());
+        txn1.commit().unwrap();
+
+        // 2) Insert {A,A},{A,B} (would create the dup set) then abort so the
+        //    entries are rolled back (JE: KnownDeleted set on these entries).
+        let txn2 = env.begin_transaction(None).unwrap();
+        db.put_in(
+            &txn2,
+            DatabaseEntry::from_bytes(b"A"),
+            DatabaseEntry::from_bytes(b"A"),
+        )
+        .unwrap();
+        db.put_in(
+            &txn2,
+            DatabaseEntry::from_bytes(b"A"),
+            DatabaseEntry::from_bytes(b"B"),
+        )
+        .unwrap();
+        txn2.abort().unwrap();
+
+        // After the abort, key A must be absent (the committed delete stands).
+        assert_eq!(record_count(&db), 0, "A must be absent after abort");
+        drop(db);
+        drop(env);
+    }
+
+    // 3) Reopen (forces recovery).  Must NOT throw, and A must still be absent.
+    let (env2, db2) = open_env_db(&path, "sr13034", true);
+    assert_eq!(
+        record_count(&db2),
+        0,
+        "recovery must replay cleanly; deleted-before-dup-tree key stays absent"
+    );
+    // A full cursor scan must complete without error (JE's recovery-throw guard).
+    let _ = collect_all_kv(&db2);
+    drop(db2);
+    drop(env2);
+}

@@ -87,6 +87,9 @@ fn no_children_footprint_smaller_than_pre_compaction() {
 
 /// A few resident children use `Sparse`; the 5th inflates to `Default`.
 /// `INTargetRep.Sparse.MAX_ENTRIES == 4`.
+///
+/// JE: INTargetRepTest.testRampUpDown (ramp-up arm) — NONE -> SPARSE ->
+/// DEFAULT as resident children are added past `Sparse.MAX_ENTRIES`.
 #[test]
 fn grows_none_to_sparse_to_default() {
     let mut n = empty_in(16);
@@ -114,6 +117,10 @@ fn grows_none_to_sparse_to_default() {
 
 /// `INTargetRep.compact` collapses a Default rep back to Sparse/None when
 /// children are stripped (eviction path).
+///
+/// JE: INTargetRepTest.testCompact + testRampUpDown (ramp-down arm) —
+/// `Default.compact` returns NONE when empty, SPARSE at <= MAX_ENTRIES,
+/// DEFAULT above the threshold.
 #[test]
 fn compact_collapses_back() {
     let mut n = empty_in(16);
@@ -140,6 +147,9 @@ fn compact_collapses_back() {
 /// Children stay aligned with their slots across insert/remove (the
 /// `INArrayRep.copy` shift semantics) — a correctness guard on the layout
 /// change, not just footprint.
+///
+/// JE: INTargetRepTest.testBasic / testShiftEntries — set/get/copy keep each
+/// slot's child aligned across insertion and deletion shifts.
 #[test]
 fn child_mapping_survives_insert_remove() {
     let mut n = empty_in(4);
@@ -262,6 +272,8 @@ fn node_lsn_rep_bytes(node: &TreeNode) -> u64 {
 /// A BIN whose post-prefix keys are all small (<= TREE_COMPACT_MAX_KEY_LENGTH)
 /// uses the Compact key rep (one fixed-width buffer, no per-key `Vec`), not
 /// the Default `Vec<Vec<u8>>`.  `INKeyRep.MaxKeySize`.
+///
+/// JE: INKeyRepTest.testINBasic / testMaxKeyVals (Type.MAX_KEY_SIZE arm).
 #[test]
 fn small_keys_use_compact_rep() {
     let n = 64usize;
@@ -282,6 +294,9 @@ fn small_keys_use_compact_rep() {
 
 /// A key longer than TREE_COMPACT_MAX_KEY_LENGTH inflates the node to the
 /// Default rep (`MaxKeySize.expandToDefaultRep`).
+///
+/// JE: INKeyRepTest.testINMutate / testMaxKeyMutation (MAX_KEY_SIZE ->
+/// DEFAULT on a large key).
 #[test]
 fn long_key_inflates_to_default() {
     let mut bin = empty_bin();
@@ -357,4 +372,101 @@ fn bin_same_file_with_keys(n: usize, key_len: usize) -> noxu_tree::BinStub {
         bin.insert_with_prefix(k, Lsn::new(7, 1000 + i as u32), None);
     }
     bin
+}
+
+// ===========================================================================
+// JE: INTargetRepTest.testRandomEntries / testShiftEntries — randomized
+// set/compact and insert/remove-shift stress on the child-target rep, checked
+// against a reference model.  These are the correctness stress ports that the
+// footprint tests above don't cover.
+// ===========================================================================
+
+/// JE: INTargetRepTest.testRandomEntries — random set(slot, node|null) +
+/// compact() must always agree with a reference model.
+#[test]
+fn target_rep_random_entries_match_model() {
+    // Deterministic pseudo-random so the test is reproducible.
+    let mut state: u64 = 0x1234_5678_9abc_def0;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+
+    const SIZE: usize = 32;
+    let mut n = empty_in(SIZE);
+    // Reference model: which slots hold a (non-null) child, keyed by Arc ptr.
+    let mut model: Vec<Option<usize>> = vec![None; SIZE];
+    let mut children: Vec<Option<ChildArc>> = vec![None; SIZE];
+    let mut id_ctr = 0usize;
+
+    for _ in 0..(10 * SIZE) {
+        let slot = (next() as usize) % SIZE;
+        if (next() % 5) == 0 {
+            // Clear the slot.
+            n.take_child(slot);
+            model[slot] = None;
+            children[slot] = None;
+        } else {
+            let c = dummy_child();
+            children[slot] = Some(c.clone());
+            n.set_child(slot, Some(c));
+            model[slot] = Some(id_ctr);
+            id_ctr += 1;
+        }
+        n.targets.compact();
+
+        // Every slot must match the model (identity by Arc ptr).
+        for (s, expected) in children.iter().enumerate() {
+            match (expected, n.get_child(s)) {
+                (None, got) => assert!(
+                    got.is_none(),
+                    "slot {s} expected empty after compact"
+                ),
+                (Some(exp), Some(got)) => assert!(
+                    std::sync::Arc::ptr_eq(exp, &got),
+                    "slot {s} child mismatch after compact"
+                ),
+                (Some(_), None) => panic!("slot {s} lost its child"),
+            }
+        }
+    }
+}
+
+/// JE: INTargetRepTest.testShiftEntries — repeated set + insert-shift +
+/// delete-shift keep the whole rep aligned with the reference model.
+#[test]
+fn target_rep_shift_entries_match_model() {
+    const SIZE: usize = 16;
+    let mut n = empty_in(SIZE);
+    let mut model: Vec<Option<ChildArc>> = vec![None; SIZE];
+
+    let mut state: u64 = 0xdead_beef_cafe_babe;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+
+    for i in 0..2000usize {
+        let slot = (next() as usize) % SIZE;
+        let child = if (i % 10) == 0 { None } else { Some(dummy_child()) };
+        model[slot] = child.clone();
+        n.set_child(slot, child);
+        // Verify alignment.
+        for (s, expected) in model.iter().enumerate() {
+            match (expected, n.get_child(s)) {
+                (None, got) => {
+                    assert!(got.is_none(), "slot {s} should be empty")
+                }
+                (Some(exp), Some(got)) => assert!(
+                    std::sync::Arc::ptr_eq(exp, &got),
+                    "slot {s} child mismatch"
+                ),
+                (Some(_), None) => panic!("slot {s} lost its child"),
+            }
+        }
+    }
 }

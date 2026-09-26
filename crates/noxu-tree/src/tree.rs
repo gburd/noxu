@@ -10009,6 +10009,17 @@ mod tests {
     // ====================================================================
     // T-3: LsnRep packed-LSN encoding (IN.entryLsnByteArray / getLsn /
     // setLsnInternal, IN.java:1752-1935).
+    //
+    // JE test parity: these unit tests port
+    // `je/test/com/sleepycat/je/tree/LSNArrayTest.java`:
+    //   * LSNArrayTest.testPutGetElement / testOverflow ->
+    //     `lsnrep_compact_roundtrip_same_file`, `lsnrep_put_get_element`,
+    //     `lsnrep_overflow`.
+    //   * LSNArrayTest.testFileOffsetGreaterThan3Bytes ->
+    //     `lsnrep_mutates_to_long_on_large_offset` +
+    //     `lsnrep_file_offset_greater_than_3_bytes`.
+    // JE's `entryLsnByteArray != null` <-> `LsnRep::Compact`; JE's
+    // `entryLsnLongArray != null` <-> `LsnRep::Long`.
     // ====================================================================
 
     /// All-NULL node uses the 0-byte Empty rep; reads return NULL_LSN.
@@ -10113,6 +10124,385 @@ mod tests {
         assert_eq!(rep.get(0), Lsn::new(2, 1));
         assert_eq!(rep.get(1), Lsn::new(2, 2));
         assert_eq!(rep.get(2), Lsn::new(2, 3));
+    }
+
+    // ------------------------------------------------------------------
+    // JE: LSNArrayTest.testPutGetElement — put/get every slot of a 128-slot
+    // LSN array and read it back exactly.  JE builds each LSN with
+    // `DbLsn.makeLsn(i, i)` (file i, offset i), sets it via `setLsnInternal`,
+    // then re-sets it via `setLsn`, and asserts `getLsn(i)` round-trips both
+    // times.  Noxu's `LsnRep::set` is the equivalent of both JE setters.
+    // ------------------------------------------------------------------
+    #[test]
+    fn lsnrep_put_get_element() {
+        lsnrep_do_test(128);
+    }
+
+    // JE: LSNArrayTest.testOverflow — same round-trip at 512 (N_ELTS << 2)
+    // slots, exercising the array growth path.
+    #[test]
+    fn lsnrep_overflow() {
+        lsnrep_do_test(512);
+    }
+
+    /// Port of JE `LSNArrayTest.doTest(nElts)`: descending then ascending
+    /// per-slot set/get round-trip.  `makeLsn(i, i)` -> `Lsn::new(i, i)`.
+    fn lsnrep_do_test(n_elts: usize) {
+        let n = n_elts;
+        let mut rep = LsnRep::new(n);
+        // Descending set via the "internal" setter.
+        for i in (0..n).rev() {
+            let this_lsn = Lsn::new(i as u32, i as u32);
+            rep.set(i, this_lsn, n);
+            assert_eq!(rep.get(i), this_lsn, "slot {i} descending set/get");
+        }
+        // Ascending set via the plain setter.
+        for i in 0..n {
+            let this_lsn = Lsn::new(i as u32, i as u32);
+            rep.set(i, this_lsn, n);
+            assert_eq!(rep.get(i), this_lsn, "slot {i} ascending set/get");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // JE: LSNArrayTest.testFileOffsetGreaterThan3Bytes — the boundary at which
+    // the Compact (byte-array) rep must inflate to the Long (long-array) rep.
+    //
+    // JE constructs raw LSN values: 0xfffffe stays in the byte array
+    // (`entryLsnByteArray != null`, `entryLsnLongArray == null`); 0xffffff and
+    // 0xffffff+1 force the long array (`entryLsnLongArray != null`,
+    // `entryLsnByteArray == null`).  In Noxu the 3-byte file offset holds up to
+    // `MAX_FILE_OFFSET == 0x00ff_fffe`; `0x00ff_ffff` is the NULL sentinel
+    // (`THREE_BYTE_NEGATIVE_ONE`), so any real offset >= 0x00ff_ffff must
+    // mutate to `LsnRep::Long`.  We assert the SAME transition JE asserts,
+    // mapping byte-array<->Compact and long-array<->Long.
+    // ------------------------------------------------------------------
+    #[test]
+    fn lsnrep_file_offset_greater_than_3_bytes() {
+        // 0xfffffe: max offset that still fits the 3-byte Compact field.
+        let mut rep = LsnRep::new(10);
+        rep.set(0, Lsn::new(0, 0x00ff_fffe), 10);
+        assert_eq!(rep.get(0), Lsn::new(0, 0x00ff_fffe));
+        assert!(
+            matches!(rep, LsnRep::Compact { .. }),
+            "0xfffffe offset must stay in the Compact (byte-array) rep"
+        );
+        // 0xffffff: collides with the NULL sentinel -> must inflate to Long.
+        rep.set(1, Lsn::new(0, 0x00ff_ffff), 10);
+        assert_eq!(rep.get(1), Lsn::new(0, 0x00ff_ffff));
+        assert!(
+            matches!(rep, LsnRep::Long(_)),
+            "0xffffff offset must inflate to the Long (long-array) rep"
+        );
+
+        // Fresh rep: 0xfffffe stays Compact, 0xffffff+1 (0x1000000) is beyond
+        // MAX_FILE_OFFSET and forces Long, exactly as JE asserts for
+        // `0xffffff + 1`.
+        let mut rep2 = LsnRep::new(10);
+        rep2.set(0, Lsn::new(0, 0x00ff_fffe), 10);
+        assert!(matches!(rep2, LsnRep::Compact { .. }));
+        rep2.set(1, Lsn::new(0, 0x00ff_ffff + 1), 10);
+        assert_eq!(rep2.get(1), Lsn::new(0, 0x0100_0000));
+        assert!(
+            matches!(rep2, LsnRep::Long(_)),
+            "0xffffff+1 offset must inflate to the Long rep"
+        );
+    }
+
+    // ========================================================================
+    // JE: INKeyRepTest (je/test/com/sleepycat/je/tree/INKeyRepTest.java)
+    //
+    // JE's `INKeyRep` has two representations — `Default` (one byte[] per slot)
+    // and `MaxKeySize` (all keys packed into one fixed-width buffer).  Noxu's
+    // `KeyRep` is the port: `KeyRep::Default` <-> `INKeyRep.Default`,
+    // `KeyRep::Compact` <-> `INKeyRep.MaxKeySize` (Type.DEFAULT / MAX_KEY_SIZE).
+    // These unit tests port the rep-level set/get and type-transition
+    // assertions (`compact` / `expandToDefaultRep`).
+    //
+    // Deviations: JE pre-sizes a fixed nullable-slot array (`new Default(size)`)
+    // and mutates the rep object in place returning the (possibly new) rep;
+    // Noxu's `KeyRep` is a dense grow-on-insert vector, so we build slots with
+    // `insert` and drive transitions with `set`/`compact`.  The observable
+    // contract asserted here — WHEN the rep is Compact vs Default — is
+    // identical.  JE's embedded-LN-data variant of `compareKeys` is N/A: Noxu
+    // stores LN data separately from keys (see BinEntry.data).
+    // ========================================================================
+
+    /// JE: INKeyRepTest.testBasic — set/get round-trip on both reps.
+    #[test]
+    fn inkeyrep_basic_set_get() {
+        // Default rep: build slots, set, read back.
+        let mut rep = KeyRep::new();
+        for i in 0..8u8 {
+            rep.insert(i as usize, vec![i]);
+        }
+        rep.set(1, vec![1]);
+        assert_eq!(rep.get(1), &[1]);
+        // Overwrite slot 1, confirm the new value.
+        rep.set(1, vec![9]);
+        assert_eq!(rep.get(1), &[9]);
+
+        // Compact rep: same round-trip after compaction (all keys <= max).
+        rep.set(1, vec![1]);
+        rep.compact(INKeyRep_DEFAULT_MAX_KEY_LENGTH);
+        assert!(rep.is_compact(), "small-key rep must compact");
+        assert_eq!(rep.get(1), &[1]);
+    }
+
+    /// JE: INKeyRepTest.testMaxKeyMutation — a MaxKeySize (Compact) rep stays
+    /// Compact on a null/small set but mutates to Default when a key larger
+    /// than the slot width is stored (`MaxKeySize.expandToDefaultRep`).
+    #[test]
+    fn inkeyrep_max_key_mutation() {
+        let max = INKeyRep_DEFAULT_MAX_KEY_LENGTH; // 16
+        let mut rep = KeyRep::new();
+        for i in 0..8u8 {
+            rep.insert(i as usize, vec![i; 4]); // 4-byte keys, all <= max
+        }
+        rep.compact(max);
+        assert!(rep.is_compact(), "all-small keys -> Compact (MAX_KEY_SIZE)");
+
+        // Set a same-or-smaller key: no mutation.
+        rep.set(0, vec![0u8; 4]);
+        assert!(rep.is_compact(), "small key set must not mutate the rep");
+
+        // Set a key LARGER than the slot width: must inflate to Default.
+        rep.set(0, vec![0u8; (max + 1) as usize]);
+        assert!(
+            !rep.is_compact(),
+            "a key > TREE_COMPACT_MAX_KEY_LENGTH must mutate to Default"
+        );
+        assert_eq!(rep.get(0).len(), (max + 1) as usize);
+    }
+
+    /// JE: INKeyRepTest.testRampUp — inserting keys of growing length and
+    /// compacting: with a small max the rep ends MAX_KEY_SIZE (Compact); with a
+    /// large max it stays Default because packing 128 keys at the max width
+    /// would cost more than per-key byte[]s.
+    #[test]
+    fn inkeyrep_ramp_up() {
+        // Small max (5): after compaction the rep is Compact.
+        {
+            let small_max = 5i32;
+            let mut rep = KeyRep::new();
+            // All keys <= small_max bytes.
+            for i in 0..16usize {
+                let klen = (i % small_max as usize).max(1);
+                rep.insert(i, vec![0xAB; klen]);
+            }
+            rep.compact(small_max);
+            assert!(
+                rep.is_compact(),
+                "small-max ramp-up must transition to Compact/MAX_KEY_SIZE"
+            );
+        }
+        // A key exceeding the max keeps the rep Default even after compact().
+        {
+            let small_max = 5i32;
+            let mut rep = KeyRep::new();
+            for i in 0..8usize {
+                rep.insert(i, vec![0xAB; 3]);
+            }
+            rep.insert(8, vec![0xCD; (small_max + 3) as usize]); // > max
+            rep.compact(small_max);
+            assert!(
+                !rep.is_compact(),
+                "a key over the max must keep the rep Default"
+            );
+        }
+    }
+
+    /// JE: INKeyRepTest.testShiftEntries — insert/remove shift slots and keep
+    /// every slot's key aligned (the `INArrayRep.copy` shift semantics), for
+    /// both the Default and Compact reps.
+    #[test]
+    fn inkeyrep_shift_entries() {
+        for compact in [false, true] {
+            let mut rep = KeyRep::new();
+            let mut model: Vec<Vec<u8>> = Vec::new();
+            for i in 0..8u8 {
+                let k = vec![i; 4];
+                rep.insert(i as usize, k.clone());
+                model.insert(i as usize, k);
+            }
+            if compact {
+                rep.compact(INKeyRep_DEFAULT_MAX_KEY_LENGTH);
+                assert!(rep.is_compact());
+            }
+
+            // Insert at slot 3 -> everything at >=3 shifts up.
+            let nk = vec![0x77u8; 4];
+            rep.insert(3, nk.clone());
+            model.insert(3, nk);
+            for (i, m) in model.iter().enumerate() {
+                assert_eq!(rep.get(i), m.as_slice(), "after insert, slot {i}");
+            }
+
+            // Remove slot 3 -> everything above shifts down.
+            rep.remove(3);
+            model.remove(3);
+            assert_eq!(rep.len(), model.len());
+            for (i, m) in model.iter().enumerate() {
+                assert_eq!(rep.get(i), m.as_slice(), "after remove, slot {i}");
+            }
+        }
+    }
+
+    // ========================================================================
+    // JE: KeyPrefixTest (je/test/com/sleepycat/je/tree/KeyPrefixTest.java)
+    //
+    // Key prefixing is directly exercised by `BinStub::recompute_key_prefix` /
+    // `compute_key_prefix`, which port `IN.recalcKeyPrefix` / `recalcSuffixes`.
+    // The prefix is always a BYTE-common prefix scanned across EVERY key in the
+    // node (JE [#21405]), independent of any custom comparator that drives the
+    // physical order.  These unit tests port the two prefix-correctness cases;
+    // the public-API round-trip cases (testPrefixBasic/ManySequential) live in
+    // noxu-db/tests/je_tree_test.rs.
+    // ========================================================================
+
+    /// Build a BIN whose keys are the given full keys in the given PHYSICAL
+    /// order (the order a comparator would place them), with no prefix yet.
+    fn bin_with_physical_keys(full_keys: Vec<Vec<u8>>) -> BinStub {
+        let n = full_keys.len();
+        let entries = (0..n)
+            .map(|_| BinEntry {
+                data: Some(Bytes::from(vec![1u8])),
+                known_deleted: false,
+                dirty: false,
+                expiration_time: 0,
+            })
+            .collect();
+        BinStub {
+            node_id: 1,
+            level: BIN_LEVEL,
+            entries,
+            key_prefix: Vec::new(),
+            dirty: false,
+            is_delta: false,
+            last_full_lsn: NULL_LSN,
+            last_delta_lsn: NULL_LSN,
+            generation: 0,
+            parent: None,
+            expiration_in_hours: true,
+            cursor_count: 0,
+            prohibit_next_delta: false,
+            lsn_rep: LsnRep::from_lsns(
+                &(0..n)
+                    .map(|i| Lsn::new(1, (i + 1) as u32))
+                    .collect::<Vec<_>>(),
+            ),
+            keys: KeyRep::from_keys(full_keys),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
+            expiration_enabled: true,
+        }
+    }
+
+    /// JE: KeyPrefixTest.testPrefixBasic (the `somePrefixSeen` invariant) — a
+    /// BIN of keys sharing a common byte prefix must actually compute a
+    /// non-empty prefix, and every full key must still reconstruct exactly.
+    #[test]
+    fn keyprefix_basic_computes_prefix() {
+        // Keys sharing "aa" — a subset of KeyPrefixTest's key set.
+        let full: Vec<Vec<u8>> = ["aaa", "aab", "aac", "aae", "aaf", "aag"]
+            .iter()
+            .map(|k| k.as_bytes().to_vec())
+            .collect();
+        let mut bin = bin_with_physical_keys(full.clone());
+        bin.recompute_key_prefix();
+        assert!(
+            !bin.key_prefix.is_empty(),
+            "a BIN of common-prefixed keys must compute a non-empty prefix"
+        );
+        assert_eq!(bin.key_prefix, b"aa", "shared prefix must be 'aa'");
+        // Every full key reconstructs exactly after prefix compression.
+        for (i, k) in full.iter().enumerate() {
+            assert_eq!(bin.get_full_key(i).as_deref(), Some(k.as_slice()));
+        }
+    }
+
+    /// JE: KeyPrefixTest.testLeadingLengthKeys [#21405] — the prefix must be
+    /// computed from ALL keys, not just the first and last.  With a custom
+    /// (string) comparator the physical order is aa,bb,cccc,dd whose leading
+    /// LENGTH bytes are 2,2,4,2.  The OLD (buggy) code inspected only the first
+    /// two keys and the last (all length 2) and wrongly derived the prefix
+    /// [2]; the middle key (length 4) breaks any [2]-prefix.  The fix scans
+    /// every key, so the computed prefix must be EMPTY.
+    #[test]
+    fn keyprefix_leading_length_keys_21405() {
+        // Leading-length-encoded keys in comparator (string) order.
+        fn llk(s: &str) -> Vec<u8> {
+            let mut b = vec![s.len() as u8];
+            b.extend_from_slice(s.as_bytes());
+            b
+        }
+        let full = vec![llk("aa"), llk("bb"), llk("cccc"), llk("dd")];
+        // Leading length bytes: 2, 2, 4, 2 — the first byte differs across the
+        // set, so the true byte-common prefix is empty.
+        let mut bin = bin_with_physical_keys(full.clone());
+        bin.recompute_key_prefix();
+        assert!(
+            bin.key_prefix.is_empty(),
+            "prefix must be EMPTY: the middle key (len 4) breaks a [2]-prefix; \
+             a non-empty prefix means the first/last-only [#21405] bug is back \
+             (got {:?})",
+            bin.key_prefix
+        );
+        // All keys still reconstruct exactly.
+        for (i, k) in full.iter().enumerate() {
+            assert_eq!(bin.get_full_key(i).as_deref(), Some(k.as_slice()));
+        }
+    }
+
+    // ========================================================================
+    // JE: MemorySizeTest.testKeyPrefixChange
+    //     (je/test/com/sleepycat/je/tree/MemorySizeTest.java)
+    //
+    // JE inserts records sharing a key prefix, then changes the BIN's key
+    // prefix and asserts `bin.getInMemorySize()` CHANGES (the MemoryBudget
+    // must track prefix bytes).  Noxu ports MemoryBudget as explicit
+    // `budgeted_memory_size()`, which charges `key_prefix.len()` +
+    // `keys.memory_size()`.  Establishing (or shrinking) a shared prefix moves
+    // bytes between the shared prefix and the per-slot suffixes, changing the
+    // node's budgeted size.
+    //
+    // (JE's `testMemSizeMaintenanceDups` / `testSlotReuseMaintenance` — the
+    // exhaustive validateNodeMemUsage sweeps across split/modify/delete/
+    // compress/checkpoint/evict — are exercised end-to-end by the eviction and
+    // recovery suites; this unit test pins the prefix-specific accounting the
+    // remediation touched.)
+    // ========================================================================
+    #[test]
+    fn memorysize_key_prefix_change_changes_budgeted_size() {
+        // Build a BIN of keys sharing a long common byte prefix, with NO
+        // prefix computed yet (each slot holds its full key).
+        let full: Vec<Vec<u8>> = (0..9u8)
+            .map(|i| {
+                let mut k = b"herococo".to_vec();
+                k.push(b'1' + i);
+                k
+            })
+            .collect();
+        // BinStub is not Clone, so build two identical BINs.
+        let before = TreeNode::Bottom(bin_with_physical_keys(full.clone()))
+            .budgeted_memory_size();
+
+        // Compute the shared prefix ("herococo").  This moves 8 bytes out of
+        // every one of the 9 suffixes into the single shared prefix, so the
+        // total budgeted key bytes MUST shrink.
+        let mut bin = bin_with_physical_keys(full);
+        bin.recompute_key_prefix();
+        assert_eq!(bin.key_prefix, b"herococo", "shared prefix must form");
+        let after = TreeNode::Bottom(bin).budgeted_memory_size();
+
+        assert_ne!(
+            before, after,
+            "establishing a key prefix must change the BIN's budgeted size"
+        );
+        assert!(
+            after < before,
+            "an 8-byte prefix shared by 9 slots must SHRINK the budgeted key \
+             bytes (before={before} after={after})"
+        );
     }
 
     #[test]
@@ -10881,6 +11271,9 @@ mod tests {
     /// Inserting 500 keys in pseudo-random (reverse) order and verifying all
     /// are searchable.
     #[test]
+    // JE: TreeTest.testMultipleInsertRetrieve0 — insert non-sorted keys that
+    // force IN splits (JE seeded this to reproduce a split putting the
+    // identifier key on the right side) and retrieve them all back.
     fn test_insert_random_keys() {
         let tree = Tree::new(1, 8);
         let n = 500u32;
@@ -10971,6 +11364,7 @@ mod tests {
     }
 
     #[test]
+    // JE: INTest.testFindEntry (binary search + EXACT_MATCH on an IN).
     fn test_find_entry_on_internal_node() {
         let mut entries = vec![];
         for i in 0..4 {
@@ -11027,6 +11421,161 @@ mod tests {
         let r = internal.find_entry(b"k2", false, false);
         assert_ne!(r & EXACT_MATCH, 0);
         assert_eq!(r & 0xFFFF, 2);
+    }
+
+    // ========================================================================
+    // JE: INTest.testFindEntry / testInsertEntry / testDeleteEntry
+    //     (je/test/com/sleepycat/je/tree/INTest.java)
+    //
+    // INTest exercises the IN-level binary search (`IN.findEntry`), the
+    // progressive-insert index contract, and delete/find consistency, with a
+    // deliberate emphasis on UNSIGNED key comparison (JE fills `maxBytes` with
+    // 0xFF precisely to catch a signed-byte comparator).  Noxu's node-level
+    // `find_entry(key, indicateIfDuplicate, exact)` returns
+    // `index | EXACT_MATCH` on an exact hit and (for exact=false) the floor /
+    // "virtual 0th key" slot, exactly like JE.  We port the assertions onto a
+    // BIN built via the public `insert_with_prefix` (JE's IN in this test is a
+    // leaf-parent that behaves as a sorted key array).
+    //
+    // Language/API deviations from the JE original:
+    //   * JE `IN.insertEntry1` returns `INSERT_SUCCESS | index`; Noxu inserts
+    //     positionally and we recover the slot via `find_entry`.  The observed
+    //     contract (each insert lands at a stable, binary-search-consistent
+    //     index) is preserved.
+    //   * JE's capacity-full -> `EnvironmentFailureException(UNEXPECTED_STATE)`
+    //     is a raw-IN invariant; Noxu splits at the tree level instead of
+    //     erroring, a documented design choice, so that arm is not ported here
+    //     (it is covered by the split tests).
+    // ========================================================================
+
+    /// Build a BIN with `entries.len() == 0` for direct find/insert testing.
+    fn intest_empty_bin() -> BinStub {
+        BinStub {
+            node_id: 1,
+            level: BIN_LEVEL,
+            entries: Vec::new(),
+            key_prefix: Vec::new(),
+            dirty: false,
+            is_delta: false,
+            last_full_lsn: NULL_LSN,
+            last_delta_lsn: NULL_LSN,
+            generation: 0,
+            parent: None,
+            expiration_in_hours: true,
+            cursor_count: 0,
+            prohibit_next_delta: false,
+            lsn_rep: LsnRep::Empty,
+            keys: KeyRep::new(),
+            compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
+            expiration_enabled: true,
+        }
+    }
+
+    /// JE: INTest.testFindEntry — the empty-node case, the unsigned-byte
+    /// comparison via a 0xFF key, and the progressive-insert index contract.
+    #[test]
+    fn intest_find_entry() {
+        const N_BYTES_IN_KEY: usize = 3;
+        let zero_bytes = vec![0x00u8; N_BYTES_IN_KEY];
+        // 0xFF sets the sign bit — JE uses this to catch a signed comparator.
+        let max_bytes = vec![0xFFu8; N_BYTES_IN_KEY];
+
+        let mut bin = intest_empty_bin();
+        let node =
+            TreeNode::Bottom(std::mem::replace(&mut bin, intest_empty_bin()));
+
+        // Empty node: no exact match, and (exact=false) floors to slot 0 with
+        // no live entries -> insertion point 0.
+        assert_eq!(node.find_entry(&zero_bytes, false, true), -1);
+        assert_eq!(node.find_entry(&max_bytes, false, true), -1);
+        assert_eq!(node.find_entry(&zero_bytes, true, true), -1);
+        assert_eq!(node.find_entry(&max_bytes, true, true), -1);
+
+        // Rebuild a mutable BIN and insert keys 0x01,i,0x10 for i in 0..cap.
+        let cap = 6usize; // NODE_MAX == 6 in JE INTest.
+        let TreeNode::Bottom(mut bin) = node else { unreachable!() };
+        for i in 0..cap {
+            let key = vec![0x01u8, i as u8, 0x10u8];
+            bin.insert_with_prefix(
+                key.clone(),
+                Lsn::new(0, (i + 1) as u32),
+                None,
+            );
+            let node = TreeNode::Bottom(bin);
+
+            // Every inserted key is found exactly at a binary-search-consistent
+            // slot, and re-finding it yields the same index + EXACT_MATCH.
+            let r = node.find_entry(&key, true, false);
+            assert!(r >= 0, "inserted key must be found");
+            assert_ne!(
+                r & EXACT_MATCH,
+                0,
+                "inserted key must be an exact match"
+            );
+
+            // maxBytes (0xFF...) is greater than every stored key.  Under
+            // UNSIGNED byte comparison it sorts AFTER all keys, so the BIN's
+            // non-exact search returns the insertion point == n_entries (the
+            // key belongs past the last slot).  A signed comparator would
+            // (wrongly) sort 0xFF before 0x01 and return 0 — this is exactly
+            // the bug JE's 0xFF `maxBytes` guards against.
+            let n_entries = node.get_n_entries();
+            let r_max =
+                (node.find_entry(&max_bytes, false, false) & 0xFFFF) as usize;
+            assert_eq!(
+                r_max, n_entries,
+                "0xFF key must sort AFTER all keys under UNSIGNED compare \
+                 (a signed comparator would return 0)"
+            );
+            // zeroBytes (0x00...) is <= every stored key -> insertion point 0.
+            let r_zero = node.find_entry(&zero_bytes, false, false) & 0xFFFF;
+            assert_eq!(r_zero, 0, "0x00 key sorts before all keys -> slot 0");
+
+            let TreeNode::Bottom(b) = node else { unreachable!() };
+            bin = b;
+        }
+    }
+
+    /// JE: INTest.testDeleteEntry — after filling a node and deleting slots,
+    /// `find_entry` stays consistent: a deleted key is no longer found, and
+    /// surviving keys are still found at valid slots.
+    #[test]
+    fn intest_delete_entry() {
+        let mut bin = intest_empty_bin();
+        // Insert 5 distinct keys.
+        let keys: Vec<Vec<u8>> =
+            (0..5u8).map(|i| vec![0x01, i, 0x10]).collect();
+        for (i, k) in keys.iter().enumerate() {
+            bin.insert_with_prefix(
+                k.clone(),
+                Lsn::new(0, (i + 1) as u32),
+                None,
+            );
+        }
+        // Delete the middle key (index 2) via the public remove path.
+        let node = TreeNode::Bottom(bin);
+        let mid = node.find_entry(&keys[2], false, true);
+        assert!(mid >= 0 && (mid & EXACT_MATCH) != 0);
+        let TreeNode::Bottom(mut bin) = node else { unreachable!() };
+        bin.remove_slot((mid & 0xFFFF) as usize);
+        let node = TreeNode::Bottom(bin);
+
+        // Deleted key is gone; survivors remain findable.
+        assert_eq!(
+            node.find_entry(&keys[2], false, true),
+            -1,
+            "deleted key must not be found"
+        );
+        for (i, k) in keys.iter().enumerate() {
+            if i == 2 {
+                continue;
+            }
+            let r = node.find_entry(k, false, true);
+            assert!(
+                r >= 0 && (r & EXACT_MATCH) != 0,
+                "survivor {i} must be found"
+            );
+        }
     }
 
     // ========================================================================
@@ -12056,6 +12605,9 @@ mod tests {
     /// IC-1 happy path: prune_empty_bin removes the parent slot when the BIN
     /// really is empty, no cursors, not a delta.
     #[test]
+    // JE: ValidateSubtreeDeleteTest.testBasic / testDuplicates — a subtree
+    // with NO live records is deletable (`validateDelete` true); the prune
+    // succeeds only when the BIN is truly empty.
     fn test_ic1_prune_empty_bin_succeeds_when_truly_empty() {
         let tree = Tree::new(1, 4);
         for i in 0..16u32 {
@@ -14705,6 +15257,9 @@ mod tests {
     /// still has a live entry after partial deletion does NOT remove the BIN
     /// from the parent.
     #[test]
+    // JE: ValidateSubtreeDeleteTest.testBasic — a subtree that still holds
+    // live records is NOT deletable (`validateDelete` false); the prune must
+    // be refused.
     fn test_incompressor_node_not_empty_prevents_prune() {
         let _lsn = Lsn::new(1, 1);
 
@@ -15704,6 +16259,11 @@ mod tests {
     }
 
     #[test]
+    // JE: GetParentNodeTest.testBasic — on a multi-level tree, every BIN's
+    // parent search (`getParentINForChildIN`) finds an Internal-node parent at
+    // a valid slot.  (The 'potential node' inexact-parent arm of the JE test
+    // is N/A: Noxu's `get_parent_in_for_child_in` is keyed by node id and has
+    // no by-key inexact-fit variant.)
     fn test_get_parent_in_for_child_in_multi_level() {
         // Build a tree with at least 3 levels so we test the recursive descent.
         let tree = Tree::new(1, 4);

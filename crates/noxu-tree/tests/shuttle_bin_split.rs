@@ -302,6 +302,12 @@ fn search_racing_insert_finds_present_key_no_panic() {
     );
 }
 
+/// JE: SplitRace_SR11144Test.testSplitRootRace — two threads split sibling
+/// full BINs "simultaneously", both rippling up.  JE's fix re-tests root/child
+/// fullness after re-latching; Noxu's fix (v7.2.2) re-validates child fullness
+/// under the child write latch.  This DST test explores exactly those
+/// check-then-act interleavings.
+///
 /// Two concurrent splitters on the SAME full child — the primary bug scenario:
 /// two inserters both pass the read-lock fullness check, both drop the parent
 /// read lock, both call `split_child`. They serialise on `parent.write()`; the

@@ -34,6 +34,21 @@
 //! two BINs and shows up as an extra cursor step. We also assert exact set
 //! equality against the true committed set and run structural `env.verify()`.
 //! Daemons are OFF; delta-path activation is reported via `delta_in_flush`.
+//!
+//! JE test parity: this is a stronger (crash-recovery-level) port of
+//! `je/test/com/sleepycat/je/tree/BinDeltaTest`:
+//!   * BinDeltaTest.testSimple — "delta a BIN several times, reconstruct, the
+//!     recreated BIN's entries/LSNs match the in-memory BIN" -> the
+//!     evict+refault probe (`split_left_half_delta_survives_evict_refault`),
+//!     which logs BINDeltas over a durable base and reconstitutes on refault.
+//!   * BinDeltaTest.testUndo — "a slot restored by an abort has a child LSN
+//!     older than the last full-BIN LSN; a later delta must still reflect the
+//!     restoration" -> the stale-pre-split-base resurrection scenario proved
+//!     absent here (a delta over a stale base must not lose/duplicate the
+//!     restored/moved keys).  JE asserts this at the internal `bin.log()` /
+//!     `reconstituteBIN` API; Noxu asserts the same invariant end-to-end
+//!     through evict+refault and crash+recover, which is the observable
+//!     consequence.
 
 use noxu_db::{
     CheckpointConfig, DatabaseConfig, DatabaseEntry, EnvironmentConfig, Get,
