@@ -2784,7 +2784,18 @@ enum AdjacentBinOutcome {
     /// A BIN was found in the requested direction.  T-3: each slot carries its
     /// `Lsn` alongside the `BinEntry` (the LSN lives in the node's packed
     /// `LsnRep`, not in `BinEntry`, so the scan snapshot pairs them).
-    Found(Vec<(BinEntry, Lsn, Vec<u8>)>),
+    ///
+    /// NEW-9: the second element is the target BIN's `Arc`, returned with the
+    /// cursor already REGISTERED on it (`cursor_count += 1`) under the SAME
+    /// write latch that captured the entry snapshot — so there is no unpinned
+    /// window between "read the boundary record" and "pin the BIN it lives
+    /// in".  Mirrors JE `Tree.getNextBin`/`CursorImpl.getNextBin` returning
+    /// the next BIN with `BIN.incrementCursorCount` already applied before the
+    /// old BIN's latch is released (`CursorImpl.java` getNextBin →
+    /// `latchNextBin` + `bin.incrementCursorCount`).  The caller must
+    /// eventually `unpin_bin` this arc (the cursor does so via
+    /// `update_bin_pin`, the plain `get_next_bin` wrapper does so immediately).
+    Found(Vec<(BinEntry, Lsn, Vec<u8>)>, Arc<RwLock<TreeNode>>),
     /// The tree genuinely has no BIN in the requested direction.
     NoAdjacent,
     /// A concurrent split invalidated our captured path; the
@@ -5881,6 +5892,38 @@ impl Tree {
         descend(&root)
     }
 
+    /// NEW-9: return the `node_id`s of all BINs in left-to-right (edge) order.
+    /// Used by the cursor cross-BIN-advance gate to target the SECOND BIN
+    /// (the one a forward scan crosses INTO from the first).
+    #[cfg(noxu_shuttle)]
+    pub fn shuttle_bin_ids_in_order(&self) -> Vec<u64> {
+        let mut out = Vec::new();
+        if let Some(root) = self.get_root() {
+            fn walk(node: &Arc<RwLock<TreeNode>>, out: &mut Vec<u64>) {
+                let g = node.read();
+                match &*g {
+                    TreeNode::Bottom(b) => {
+                        if !b.entries.is_empty() {
+                            out.push(b.node_id);
+                        }
+                    }
+                    TreeNode::Internal(p) => {
+                        let children: Vec<Arc<RwLock<TreeNode>>> =
+                            (0..p.entries.len())
+                                .filter_map(|i| p.child_ref(i).cloned())
+                                .collect();
+                        drop(g);
+                        for c in children {
+                            walk(&c, out);
+                        }
+                    }
+                }
+            }
+            walk(&root, &mut out);
+        }
+        out
+    }
+
     /// Pin the BIN with `node_id` (set `cursor_count += 1`) under its write
     /// latch, modelling a cursor registering on the BIN in the flush→detach
     /// window.  Returns `true` if the BIN was found and pinned.
@@ -6418,6 +6461,198 @@ impl Tree {
                 }
             }
         }
+    }
+
+    // ======================================================================
+    // NEW-9: cursor cross-BIN-advance vs evictor detach/re-fault race model.
+    // ======================================================================
+
+    /// Model the CURSOR side of the NEW-9 cross-BIN advance.
+    ///
+    /// Reproduces the two candidate `CursorImpl::retrieve_next` cross-BIN
+    /// implementations so a shuttle schedule can race either one against the
+    /// evictor:
+    ///
+    ///   * `pin_during_descent = false` (BASE): read a detached entry SNAPSHOT
+    ///     of the next BIN (`get_next_bin`), pick the boundary record at slot
+    ///     0, then — in a window with NO BIN pinned — RE-DESCEND
+    ///     (`bin_arc_for_key`) and re-read slot 0 applying the LSN-based slot
+    ///     revalidation the cursor uses (`revalidate_locked_slot`).  This is
+    ///     the racy path: nothing is pinned between the snapshot and the
+    ///     re-read, so the evictor can detach/re-fault the BIN and shift its
+    ///     slots under the cursor.
+    ///
+    ///   * `pin_during_descent = true` (FIXED): read the boundary record from
+    ///     the SAME pinned arc the descent returned (`get_next_bin_pinned`),
+    ///     so the evictor's `cursor_count > 0` guard is armed continuously and
+    ///     the slot cannot shift.
+    ///
+    /// The `in_window` hook runs between the snapshot/pin and the boundary
+    /// read — a deterministic test drives the evictor into that exact window
+    /// with it; the shuttle scheduler explores it for the randomized gate.
+    ///
+    /// Returns `(captured_boundary_key, reported_key)`: the key the cursor
+    /// selected as the boundary at snapshot/pin time, and the key it actually
+    /// REPORTS after the window + slot re-read.  The NEW-9 invariant is
+    /// `captured == reported` — a cursor must report the record it selected,
+    /// never a different one (which would mean the selected record was
+    /// skipped).  Returns `None` only if there is no adjacent BIN.
+    #[cfg(noxu_shuttle)]
+    pub fn shuttle_cursor_cross_bin(
+        &self,
+        anchor_key: &[u8],
+        pin_during_descent: bool,
+        in_window: impl FnOnce(),
+    ) -> Option<(Vec<u8>, Vec<u8>)> {
+        // ---- Read the adjacent BIN's boundary record (snapshot). ----
+        let (entries, pinned) = if pin_during_descent {
+            let (e, arc) = self.get_next_bin_pinned(anchor_key)?;
+            (e, Some(arc))
+        } else {
+            (self.get_next_bin(anchor_key)?, None)
+        };
+        if entries.is_empty() {
+            if let Some(arc) = pinned {
+                Self::unpin_bin(&arc);
+            }
+            return None;
+        }
+        // Boundary record = first live slot (forward), at index `pos`.
+        let pos = entries.iter().position(|e| !e.0.known_deleted)?;
+        let boundary_key = entries[pos].2.clone();
+        let boundary_lsn = entries[pos].1.as_u64();
+
+        // ---- The vulnerable window (BASE: nothing pinned). ----
+        in_window();
+
+        // ---- Re-read the boundary slot and report. ----
+        let report = if let Some(arc) = &pinned {
+            // FIXED: read from the SAME pinned arc — the evictor cannot have
+            // detached/re-faulted it (cursor_count > 0), so slot `pos` still
+            // names the boundary record.
+            Self::shuttle_revalidate_slot(arc, pos, boundary_lsn)
+                .unwrap_or_else(|| boundary_key.clone())
+        } else {
+            // BASE: re-descend via a SEPARATE lookup and re-read slot `pos`.
+            match self.bin_arc_for_key(&boundary_key) {
+                Some(arc) => {
+                    Self::shuttle_revalidate_slot(&arc, pos, boundary_lsn)
+                        .unwrap_or_else(|| boundary_key.clone())
+                }
+                None => boundary_key.clone(),
+            }
+        };
+        if let Some(arc) = pinned {
+            Self::unpin_bin(&arc);
+        }
+        Some((boundary_key, report))
+    }
+
+    /// The key `CursorImpl::revalidate_locked_slot` would report for slot
+    /// `idx` after locking, given the pre-lock LSN.  If the slot's LSN is
+    /// unchanged the pre-lock (boundary) read stands (returns `None` so the
+    /// caller keeps its prefetch); if the LSN moved, re-derive the key from
+    /// the CURRENT slot (this is exactly the substitution that silently
+    /// replaces the boundary record when the slot shifted under an unpinned
+    /// cursor).  Returns the current slot's key when the LSN moved and the
+    /// slot is live; `None` when unchanged (keep prefetch) or the slot fell
+    /// off / is dead.
+    #[cfg(noxu_shuttle)]
+    fn shuttle_revalidate_slot(
+        bin_arc: &Arc<RwLock<TreeNode>>,
+        idx: usize,
+        pre_lock_lsn: u64,
+    ) -> Option<Vec<u8>> {
+        let g = bin_arc.read();
+        match &*g {
+            TreeNode::Bottom(bin) => {
+                if idx >= bin.entries.len() {
+                    return None; // slot fell off — caller keeps prefetch
+                }
+                let cur = bin.get_lsn(idx).as_u64();
+                if cur == pre_lock_lsn {
+                    return None; // unchanged — keep prefetch (boundary)
+                }
+                if !bin.slot_is_live(idx) {
+                    return None;
+                }
+                // LSN moved: report the CURRENT slot's key (the substitution).
+                bin.get_full_key(idx)
+            }
+            _ => None,
+        }
+    }
+
+    /// Model the EVICTOR side of NEW-9: detach + re-fault the BIN with
+    /// `node_id` to a SHIFTED layout (a BIN-delta reconstruction that drops
+    /// the leading slot), the exact mutation that moves the boundary record
+    /// off slot 0.  Honours the GAP A / EVICTOR-PIN-1 guard: if the BIN is
+    /// pinned (`cursor_count > 0`) the detach is REFUSED and the layout is
+    /// left intact (returns `false`).  Returns `true` if the BIN was shifted.
+    ///
+    /// This is a faithful stand-in for `detach_node_by_id` +
+    /// `child_at_or_fetch` re-faulting a delta whose slot 0 differs: the real
+    /// path removes the resident BIN and reconstructs it from the on-disk
+    /// image, which can present the boundary record at a DIFFERENT index; here
+    /// we mutate the resident node in place (drop slot 0) under its write
+    /// latch, which produces the identical index-shift the cursor observes.
+    /// The `cursor_count` refusal is byte-for-byte the guard in
+    /// `detach_node_by_id` and `strip_lns_from_node`.
+    #[cfg(noxu_shuttle)]
+    pub fn shuttle_evict_shift_bin(&self, node_id: u64) -> bool {
+        let Some(root) = self.get_root() else {
+            return false;
+        };
+        let Some((parent_arc, idx)) =
+            Self::find_parent_of_node_id(&root, node_id)
+        else {
+            return false;
+        };
+        let bin_arc = {
+            let pg = parent_arc.read();
+            let TreeNode::Internal(p) = &*pg else {
+                return false;
+            };
+            match p.child_ref(idx) {
+                Some(c) => Arc::clone(c),
+                None => return false,
+            }
+        };
+        let mut g = bin_arc.write();
+        let TreeNode::Bottom(b) = &mut *g else {
+            return false;
+        };
+        // GAP A / EVICTOR-PIN-1 guard (identical to detach_node_by_id /
+        // strip_lns): never mutate a BIN an active cursor is registered on.
+        if b.cursor_count > 0 {
+            return false; // pinned — refuse, leave layout intact
+        }
+        if b.entries.len() < 2 {
+            return false; // nothing to shift
+        }
+        // Reconstruct as a delta that drops the leading slot: rebuild the BIN
+        // from slots 1.. so every remaining record moves down one index and
+        // gets a fresh (delta) LSN — exactly the layout a re-faulted BIN-delta
+        // presents, and enough to make the cursor's fixed-index re-read miss
+        // the boundary record.
+        let mut kept: Vec<(Vec<u8>, Lsn, Option<Vec<u8>>)> = Vec::new();
+        for i in 1..b.entries.len() {
+            if let Some(k) = b.get_full_key(i) {
+                // Fresh delta LSN so the cursor's LSN-revalidate re-derives
+                // from the (now shifted) slot instead of trusting its
+                // prefetch — the substitution that yields the wrong record.
+                let data = b.entries[i].data.as_ref().map(|d| d.to_vec());
+                kept.push((k, Lsn::new(7, 700 + i as u32), data));
+            }
+        }
+        b.entries.clear();
+        b.lsn_rep = LsnRep::Empty;
+        b.keys = KeyRep::new();
+        for (k, lsn, data) in kept {
+            b.insert_with_prefix(k, lsn, data);
+        }
+        b.is_delta = true;
+        true
     }
 
     /// Recursive post-order compress helper.
@@ -8257,8 +8492,12 @@ impl Tree {
         &self,
         current_key: &[u8],
     ) -> Option<Vec<(BinEntry, Lsn, Vec<u8>)>> {
-        let root = self.get_root()?;
-        self.get_adjacent_bin(&root, current_key, true)
+        // Plain (non-pinning) callers get the entry snapshot only; the pin the
+        // descent took (NEW-9) is released immediately so behaviour is
+        // unchanged for range-seek / dup callers that re-pin separately.
+        let (entries, pinned) = self.get_next_bin_pinned(current_key)?;
+        Self::unpin_bin(&pinned);
+        Some(entries)
     }
 
     /// Return the entries of the BIN immediately to the left of the BIN
@@ -8269,6 +8508,46 @@ impl Tree {
         &self,
         current_key: &[u8],
     ) -> Option<Vec<(BinEntry, Lsn, Vec<u8>)>> {
+        let (entries, pinned) = self.get_prev_bin_pinned(current_key)?;
+        Self::unpin_bin(&pinned);
+        Some(entries)
+    }
+
+    /// NEW-9: like [`Self::get_next_bin`], but return the target BIN's `Arc`
+    /// with the cursor already REGISTERED on it (`cursor_count += 1`), pinned
+    /// under the SAME write latch that captured the entry snapshot.
+    ///
+    /// This closes the cursor ↔ evictor cross-BIN-advance race (audit NEW-9):
+    /// `CursorImpl::retrieve_next` used to read a detached entry SNAPSHOT here
+    /// and then RE-DESCEND (`find_bin_for_key`) to pin the BIN it was crossing
+    /// into — leaving a window in which NO BIN was pinned, so the background
+    /// evictor's `detach_node_by_id` `cursor_count > 0` guard (GAP A /
+    /// EVICTOR-PIN-1) was not armed for the BIN the cursor was about to read.
+    /// The evictor could detach / strip / re-fault that BIN in the window,
+    /// shifting its slot layout, and the boundary record chosen from the stale
+    /// snapshot would no longer line up — one record silently skipped.
+    ///
+    /// By pinning the target BIN as part of the descent that produces the
+    /// snapshot, the guard is armed continuously: the cursor is registered on
+    /// the next BIN BEFORE it releases the current one (`update_bin_pin`
+    /// unpins the old BIN only after installing this already-pinned arc —
+    /// pin-next-before-unpin-current).  Mirrors JE `CursorImpl.getNextBin`
+    /// returning the next BIN with `BIN.incrementCursorCount` applied before
+    /// the prior BIN's latch/registration is released.
+    pub fn get_next_bin_pinned(
+        &self,
+        current_key: &[u8],
+    ) -> Option<(Vec<(BinEntry, Lsn, Vec<u8>)>, Arc<RwLock<TreeNode>>)> {
+        let root = self.get_root()?;
+        self.get_adjacent_bin(&root, current_key, true)
+    }
+
+    /// NEW-9: like [`Self::get_prev_bin`], but return the target BIN's `Arc`
+    /// already pinned (`cursor_count += 1`).  See [`Self::get_next_bin_pinned`].
+    pub fn get_prev_bin_pinned(
+        &self,
+        current_key: &[u8],
+    ) -> Option<(Vec<(BinEntry, Lsn, Vec<u8>)>, Arc<RwLock<TreeNode>>)> {
         let root = self.get_root()?;
         self.get_adjacent_bin(&root, current_key, false)
     }
@@ -8308,11 +8587,11 @@ impl Tree {
         root: &Arc<RwLock<TreeNode>>,
         current_key: &[u8],
         forward: bool,
-    ) -> Option<Vec<(BinEntry, Lsn, Vec<u8>)>> {
+    ) -> Option<(Vec<(BinEntry, Lsn, Vec<u8>)>, Arc<RwLock<TreeNode>>)> {
         const MAX_ASCENT_ATTEMPTS: u32 = 8;
         for attempt in 0..MAX_ASCENT_ATTEMPTS {
             match self.get_adjacent_bin_attempt(root, current_key, forward) {
-                AdjacentBinOutcome::Found(v) => return Some(v),
+                AdjacentBinOutcome::Found(v, arc) => return Some((v, arc)),
                 AdjacentBinOutcome::NoAdjacent => return None,
                 AdjacentBinOutcome::SplitRaceRetry => {
                     // Brief pause to let the splitter finish.
@@ -8478,9 +8757,10 @@ impl Tree {
                         },
                     }
                 };
-                if let Some(v) = self.descend_to_edge_bin(&sibling_arc, forward)
+                if let Some((v, arc)) =
+                    self.descend_to_edge_bin(&sibling_arc, forward)
                 {
-                    return AdjacentBinOutcome::Found(v);
+                    return AdjacentBinOutcome::Found(v, arc);
                 }
                 // Sibling sub-tree entirely empty — try the next sibling.
                 sibling_idx += if forward { 1 } else { -1 };
@@ -8518,7 +8798,7 @@ impl Tree {
         &self,
         node_arc: &Arc<RwLock<TreeNode>>,
         forward: bool,
-    ) -> Option<Vec<(BinEntry, Lsn, Vec<u8>)>> {
+    ) -> Option<(Vec<(BinEntry, Lsn, Vec<u8>)>, Arc<RwLock<TreeNode>>)> {
         // Iterative pre-order (forward) / reverse-order (backward) walk of the
         // sub-tree, returning the first non-empty BIN in edge order.  A stack
         // of child Arcs is used so we can backtrack to a sibling sub-tree when
@@ -8532,43 +8812,73 @@ impl Tree {
         while let Some(arc) = stack.pop() {
             let guard: NodeArcReadGuard = arc.read_arc();
             if guard.is_bin() {
-                if let TreeNode::Bottom(b) = &*guard {
-                    // Skip a physically-empty BIN — it has no slot key to
-                    // anchor on, so returning it would make the cursor's cross
-                    // loop bail to NotFound (NEW-4 §3).  Continue to the next
-                    // sibling on the stack.
-                    if b.entries.is_empty() {
-                        continue;
-                    }
-                    // Return entries with full (decompressed) keys so that
-                    // callers always work with complete keys.
-                    //
-                    // TREE-F1: KD slots are NOT filtered here — the BIN's
-                    // slot indices are returned verbatim so the cursor can
-                    // skip KD slots itself (CursorImpl getNext loop;
-                    // CursorImpl.java:2062-2064) and continue to the next
-                    // BIN when an edge BIN is entirely KD during the
-                    // BIN-delta reconstitution window.
-                    let full_entries: Vec<(BinEntry, Lsn, Vec<u8>)> = (0..b
-                        .entries
-                        .len())
-                        .map(|i| {
-                            (
-                                BinEntry {
-                                    data: b.entries[i].data.clone(),
-                                    known_deleted: b.entries[i].known_deleted,
-                                    dirty: b.entries[i].dirty,
-                                    expiration_time: b.entries[i]
-                                        .expiration_time,
-                                },
-                                b.get_lsn(i),
-                                b.get_full_key(i).unwrap_or_default(),
-                            )
-                        })
-                        .collect();
-                    return Some(full_entries);
+                let empty = match &*guard {
+                    TreeNode::Bottom(b) => b.entries.is_empty(),
+                    _ => true,
+                };
+                // Skip a physically-empty BIN — it has no slot key to
+                // anchor on, so returning it would make the cursor's cross
+                // loop bail to NotFound (NEW-4 §3).  Continue to the next
+                // sibling on the stack.
+                if empty {
+                    continue;
                 }
-                continue;
+                // NEW-9: re-latch the found BIN for WRITE so the pin
+                // (`cursor_count += 1`) and the entry snapshot are taken
+                // ATOMICALLY under one latch.  The read guard cannot be
+                // upgraded in place (parking_lot latches are not reentrant),
+                // so drop it and re-acquire; `arc` keeps the node alive across
+                // the drop.  Between the drop and the write-acquire the
+                // evictor cannot detach this BIN out from under us because the
+                // detach takes the PARENT write latch and re-checks child
+                // identity — but more importantly, capturing the snapshot and
+                // the pin under the SAME write latch means the arc we return
+                // is registered before any caller reads it, and the snapshot
+                // reflects exactly the pinned BIN's slots.  Mirrors JE
+                // `BIN.incrementCursorCount` applied under the BIN latch before
+                // the entries are handed to the cursor (`CursorImpl.getNextBin`).
+                drop(guard);
+                let mut wguard = arc.write();
+                let TreeNode::Bottom(b) = &mut *wguard else {
+                    // Turned into a non-BIN under us (split/restructure) —
+                    // signal empty so the caller retries from root.
+                    continue;
+                };
+                if b.entries.is_empty() {
+                    // Emptied under us (compressed) — skip it.
+                    continue;
+                }
+                // Register the cursor on this BIN before returning it, so the
+                // evictor's `cursor_count > 0` detach guard is armed for the
+                // entire time the caller holds the returned snapshot+arc.
+                b.cursor_count += 1;
+                // Return entries with full (decompressed) keys so that
+                // callers always work with complete keys.
+                //
+                // TREE-F1: KD slots are NOT filtered here — the BIN's
+                // slot indices are returned verbatim so the cursor can
+                // skip KD slots itself (CursorImpl getNext loop;
+                // CursorImpl.java:2062-2064) and continue to the next
+                // BIN when an edge BIN is entirely KD during the
+                // BIN-delta reconstitution window.
+                let full_entries: Vec<(BinEntry, Lsn, Vec<u8>)> = (0..b
+                    .entries
+                    .len())
+                    .map(|i| {
+                        (
+                            BinEntry {
+                                data: b.entries[i].data.clone(),
+                                known_deleted: b.entries[i].known_deleted,
+                                dirty: b.entries[i].dirty,
+                                expiration_time: b.entries[i].expiration_time,
+                            },
+                            b.get_lsn(i),
+                            b.get_full_key(i).unwrap_or_default(),
+                        )
+                    })
+                    .collect();
+                drop(wguard);
+                return Some((full_entries, arc));
             }
 
             // Internal node: push children so the edge-most child is popped
@@ -16210,7 +16520,10 @@ mod split_special_tests {
         // set, so the cursor can skip them (CursorImpl.java:2062-2064).  The
         // contract here is: the KD slot is never reported as a LIVE entry.
         let root = tree.get_root().expect("root");
-        let edge = tree.descend_to_edge_bin(&root, true).expect("edge bin");
+        let (edge, edge_arc) =
+            tree.descend_to_edge_bin(&root, true).expect("edge bin");
+        // descend_to_edge_bin now pins the BIN it returns (NEW-9); release it.
+        Tree::unpin_bin(&edge_arc);
         assert!(
             !edge.iter().any(|(e, _, k)| k == &kd_key && !e.known_deleted),
             "TREE-F1: scan must not surface a known_deleted slot as live \
