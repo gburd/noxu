@@ -165,6 +165,16 @@ listed in [References](#references).
   (fail-closed by default). Authorization reads the verified channel identity,
   never a wire-supplied name.
 
+- **Key prefixing with a custom non-byte-order btree comparator no longer loses
+  data (durable-loss fix).** With key-prefix compression enabled and a btree
+  comparator whose order diverges from unsigned-byte order, inserting past the
+  node fanout could lose records starting at the first node split — keys became
+  unreachable via the comparator search path and were durably absent after
+  reopen. The BIN slot store now keeps the prefix-stripped suffix (never a full
+  key) at the comparator-sorted position and searches by reconstructing the full
+  key under the comparator (matching JE, which keeps prefixing active with a
+  comparator). Found by a faithful port of JE's `KeyPrefixTest.testRLEComparator`.
+
 - **WAL now fail-stops the environment on a critical log-write failure (JE
   `LogManager.serialLog` parity).** A failed or partial WAL write previously left
   the log manager's LSN/buffer/file correspondence inconsistent and allowed
