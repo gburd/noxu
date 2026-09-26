@@ -174,8 +174,11 @@ first:
   comparator block, so the fanout has a fixed starting offset.
 
 A fanout of `0` (JE's "use the environment `NODE_MAX_ENTRIES` default",
-`DatabaseImpl.java:420`) is **elided**: a database that never overrode its
-fanout writes the pre-NEW-5 shape byte-for-byte. This mirrors JE, which
+`DatabaseImpl.java:420`) is **elided** — but this does NOT occur in a normal environment. The
+**resolved** effective fanout is persisted, and the env default `NODE_MAX_ENTRIES`
+is `128` (not `0`), so a database that never overrode its fanout still writes a
+`[0xF0][128]` trailer, NOT the pre-NEW-5 shape. This mirrors JE, which stores the
+resolved default and
 serializes `maxTreeEntriesPerNode` in the `DatabaseImpl` record
 (`DatabaseImpl.writeToLog`, `DatabaseImpl.java:2134`) and reads it back
 (`readFromLog`, `:2203`).
@@ -275,9 +278,11 @@ than risk misreading.
   resolved `NODE_MAX_ENTRIES` (`maxTreeEntriesPerNode`) is persisted in the
   `NameLN` / `NameLNTxn` data field as an optional, `0xF0`-marker-gated `i32`
   after the DBI-14 comparator block (see
-  [`NameLN` data field](#nameln--namelntxn-data-field)). A database that never
-  overrode its fanout writes the pre-NEW-5 shape byte-for-byte (the fanout is
-  elided). Older readers parse the comparator identities and ignore the fanout
+  [`NameLN` data field](#nameln--namelntxn-data-field)). New databases persist
+  their **resolved** fanout, so a normal database writes a `[0xF0][fanout]`
+  trailer (the env default is `128`, not `0`, so the trailer is present, not
+  elided). Backward compatibility is by READ TOLERANCE, not byte-identical
+  writes: older readers parse the comparator identities and skip the fanout
   tail; records written before NEW-5 carry no fanout and reopen with the
   environment-level `NODE_MAX_ENTRIES` fallback (the prior behaviour). New
   databases get the persisted fanout restored on reopen even without a
