@@ -43,6 +43,14 @@ fn val(i: usize) -> DatabaseEntry {
 
 /// HEADLINE: write past MAX_DISK -> DiskLimitExceeded; reads + abort still
 /// work over-limit; cleaner can still write (it frees space) -> writes resume.
+///
+/// JE parity: `DiskLimitTest.testWritesProhibited` (standalone, non-HA half) --
+/// a disk-limit violation prohibits user writes while reads/aborts continue,
+/// and freeing space re-enables writes. (The 3-node replicated-group ack-policy
+/// portion of `testWritesProhibited` is a rep test, out of scope for the
+/// cleaner package.) Also covers the standalone half of
+/// `DiskLimitTest.testCheckpointCleanEvict` (the cleaner's own writes are
+/// never blocked because they free the space).
 #[test]
 fn disk_limit_blocks_then_resumes() {
     let dir = TempDir::new().unwrap();
