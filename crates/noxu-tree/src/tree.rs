@@ -4119,6 +4119,7 @@ impl Tree {
             self.key_comparator.as_ref(),
             self.key_prefixing,
             self.in_list_listener.as_ref(),
+            self,
         )?;
 
         // Update the memory counter for new inserts.
@@ -4818,6 +4819,7 @@ impl Tree {
     ///
     /// This implements the "preemptive splitting" strategy from the: we split
     /// children on the way down so we never need to walk back up.
+    #[allow(clippy::too_many_arguments)]
     fn insert_recursive(
         node_arc: &Arc<RwLock<TreeNode>>,
         key: Vec<u8>,
@@ -4827,6 +4829,7 @@ impl Tree {
         key_comparator: Option<&KeyComparatorFn>,
         key_prefixing: bool,
         listener: Option<&Arc<dyn InListListener>>,
+        tree: &Tree,
     ) -> Result<bool, TreeError> {
         Self::insert_recursive_inner(
             node_arc,
@@ -4839,6 +4842,7 @@ impl Tree {
             true, // all_left_so_far
             true, // all_right_so_far
             listener,
+            tree,
         )
     }
 
@@ -4861,6 +4865,7 @@ impl Tree {
         all_left_so_far: bool,
         all_right_so_far: bool,
         listener: Option<&Arc<dyn InListListener>>,
+        tree: &Tree,
     ) -> Result<bool, TreeError> {
         // Determine if this is a BIN (leaf level).
         //
@@ -4959,9 +4964,44 @@ impl Tree {
                                 }
                             }
                         }
-                        let child =
-                            n.get_child(idx).ok_or(TreeError::SplitRequired)?;
-                        (idx, n.entries.len(), child)
+                        // NEW-10 fix: a child slot may be non-resident
+                        // here because the background evictor DETACHED the
+                        // child concurrently (its cached `Arc` was removed,
+                        // leaving only the slot key/LSN).  Returning
+                        // `SplitRequired` in that case silently loses the
+                        // insert (the caller `CursorImpl::apply_tree_insert`
+                        // used to swallow the error), durably dropping a
+                        // committed record.  Instead, re-fault the child from
+                        // its slot LSN and re-descend from this node, exactly
+                        // as the recovery-redo path does via
+                        // `child_at_or_fetch` (JE `IN.fetchTarget` faults a
+                        // non-resident child during a live descent).
+                        match n.get_child(idx) {
+                            Some(child) => (idx, n.entries.len(), child),
+                            None => {
+                                // Drop the parent read latch, fault the child
+                                // in under the parent write latch, then
+                                // re-descend from the top of this node so
+                                // latch coupling is re-established on the
+                                // now-current topology.
+                                drop(parent_guard);
+                                tree.child_at_or_fetch(node_arc, idx)
+                                    .ok_or(TreeError::SplitRequired)?;
+                                return Self::insert_recursive_inner(
+                                    node_arc,
+                                    key,
+                                    data,
+                                    lsn,
+                                    max_entries,
+                                    key_comparator,
+                                    key_prefixing,
+                                    all_left_so_far,
+                                    all_right_so_far,
+                                    listener,
+                                    tree,
+                                );
+                            }
+                        }
                     }
                     TreeNode::Bottom(_) => {
                         return Err(TreeError::SplitRequired);
@@ -5023,6 +5063,7 @@ impl Tree {
                     all_left_so_far,
                     all_right_so_far,
                     listener,
+                    tree,
                 );
             }
 
@@ -5042,6 +5083,7 @@ impl Tree {
                 all_left,
                 all_right,
                 listener,
+                tree,
             );
             drop(parent_guard);
             r
