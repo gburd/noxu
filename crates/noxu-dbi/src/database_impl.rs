@@ -565,6 +565,27 @@ impl DatabaseImpl {
         self.max_tree_entries_per_node
     }
 
+    /// NEW-5: override the per-DB fanout (`maxTreeEntriesPerNode`) with a
+    /// value persisted in the on-disk database record and apply it to the
+    /// live tree, so a database reopened WITHOUT re-supplying its
+    /// `DatabaseConfig` keeps its configured `NODE_MAX_ENTRIES` instead of
+    /// reverting to the env-level default.  Ignores non-positive values
+    /// (JE's zero-means-env-default convention, DatabaseImpl.java:420).
+    ///
+    /// Must be called before `set_recovered_tree`, which reads
+    /// `max_tree_entries_per_node` to configure the transplanted tree.
+    pub fn set_max_tree_entries_per_node(&mut self, max_entries: i32) {
+        if max_entries <= 0 {
+            return;
+        }
+        self.max_tree_entries_per_node = max_entries;
+        if let Some(tree_arc) = self.real_tree.as_ref()
+            && let Ok(mut tree) = tree_arc.write()
+        {
+            tree.set_max_entries_per_node(max_entries as usize);
+        }
+    }
+
     /// Serialization.
     ///
     pub fn log_size(&self) -> usize {

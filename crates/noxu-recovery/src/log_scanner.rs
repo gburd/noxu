@@ -378,6 +378,13 @@ pub struct NameLnRecord {
     pub btree_comparator_id: Option<String>,
     /// Persisted identity of the user duplicate-data comparator (DBI-14).
     pub dup_comparator_id: Option<String>,
+    /// Persisted per-DB fanout (`maxTreeEntriesPerNode`) from the NameLN data
+    /// trailer (NEW-5).  `None` for pre-NEW-5 WAL entries (no fanout field in
+    /// the trailer), in which case the reopen path keeps the env-default
+    /// fallback — exactly today's (NEW-2) behaviour.  JE persists the
+    /// resolved fanout in the DatabaseImpl record (DatabaseImpl.writeToLog,
+    /// DatabaseImpl.java:2134) and reads it back (:2203).
+    pub fanout: Option<i32>,
 }
 
 #[derive(Debug, Clone)]

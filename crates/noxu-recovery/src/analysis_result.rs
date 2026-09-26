@@ -211,6 +211,12 @@ pub struct AnalysisResult {
     pub recovered_db_comparators:
         hashbrown::HashMap<String, (Option<String>, Option<String>)>,
 
+    /// Database name → persisted per-DB fanout (`maxTreeEntriesPerNode`) from
+    /// NameLN data (NEW-5).  Absent for pre-NEW-5 records (env-default
+    /// fallback).  Consumed by `open_database` to restore the fanout on a
+    /// default-config reopen.
+    pub recovered_db_fanouts: hashbrown::HashMap<String, i32>,
+
     /// R-3: (vlsn, commit_lsn_u64) pairs from TxnCommit records whose
     /// `dtvlsn` payload field is non-zero.
     ///
@@ -249,6 +255,7 @@ impl AnalysisResult {
             recovered_db_names: hashbrown::HashMap::new(),
             recovered_db_txn_ids: hashbrown::HashMap::new(),
             recovered_db_comparators: hashbrown::HashMap::new(),
+            recovered_db_fanouts: hashbrown::HashMap::new(),
             txncommit_vlsns: Vec::new(),
             rebuilt_file_summaries: HashMap::new(),
         }

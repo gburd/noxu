@@ -823,6 +823,8 @@ impl RecoveryManager {
         // DBI-14: propagate persisted comparator identities.
         self.info.recovered_db_comparators =
             analysis.recovered_db_comparators.clone();
+        // NEW-5: propagate persisted per-DB fanouts.
+        self.info.recovered_db_fanouts = analysis.recovered_db_fanouts.clone();
 
         // CLN-4: the per-file utilization profile was rebuilt INLINE during
         // run_analysis (from persisted FileSummaryLN records + obsolete
@@ -1864,6 +1866,7 @@ impl RecoveryManager {
                         result_ref.recovered_db_names.remove(&rec.name);
                         result_ref.recovered_db_txn_ids.remove(&rec.name);
                         result_ref.recovered_db_comparators.remove(&rec.name);
+                        result_ref.recovered_db_fanouts.remove(&rec.name);
                     } else {
                         result_ref
                             .recovered_db_names
@@ -1877,6 +1880,13 @@ impl RecoveryManager {
                                 rec.dup_comparator_id.clone(),
                             ),
                         );
+                        // NEW-5: remember the persisted per-DB fanout so
+                        // open_database can restore it on a default reopen.
+                        if let Some(fanout) = rec.fanout {
+                            result_ref
+                                .recovered_db_fanouts
+                                .insert(rec.name.clone(), fanout);
+                        }
                         // C-6: record the creating txn_id so that
                         // run_mapping_tree_undo_pass can undo NameLNs whose
                         // transaction aborted.
@@ -4586,6 +4596,7 @@ mod tests {
                 txn_id: Some(42),
                 btree_comparator_id: None,
                 dup_comparator_id: None,
+                fanout: None,
             }),
         );
         scanner.push(
@@ -4623,6 +4634,7 @@ mod tests {
                 txn_id: Some(43),
                 btree_comparator_id: None,
                 dup_comparator_id: None,
+                fanout: None,
             }),
         );
         scanner.push(
@@ -4671,6 +4683,7 @@ mod tests {
                 txn_id: None,
                 btree_comparator_id: None,
                 dup_comparator_id: None,
+                fanout: None,
             }),
         );
 
@@ -4684,6 +4697,7 @@ mod tests {
                 txn_id: Some(55),
                 btree_comparator_id: None,
                 dup_comparator_id: None,
+                fanout: None,
             }),
         );
         scanner.push(
@@ -4708,6 +4722,100 @@ mod tests {
         assert!(
             !info.recovered_db_names.contains_key("aborted_txn_db"),
             "C-6: aborted transactional NameLN must be removed by undo pass"
+        );
+    }
+
+    /// NEW-5 backward-compat: a NameLN recovered in the OLD format (no fanout
+    /// field in the trailer, decoded to `fanout: None`) must NOT populate
+    /// `recovered_db_fanouts`, so the reopen path keeps the env-default
+    /// fallback (NEW-2 behaviour).  A NameLN with a persisted fanout populates
+    /// the map so open_database can restore it.
+    #[test]
+    fn test_new5_fanout_recovery_backward_compat() {
+        let mut scanner = InMemoryLogScanner::new();
+        // OLD-format record: fanout None (pre-NEW-5 / DBI-14-or-earlier WAL).
+        scanner.push(
+            lsn(0, 100),
+            LogEntry::NameLn(crate::log_scanner::NameLnRecord {
+                name: "old_db".to_string(),
+                db_id: 10,
+                is_deleted: false,
+                txn_id: None,
+                btree_comparator_id: None,
+                dup_comparator_id: None,
+                fanout: None,
+            }),
+        );
+        // NEW-format record: persisted fanout 4.
+        scanner.push(
+            lsn(0, 200),
+            LogEntry::NameLn(crate::log_scanner::NameLnRecord {
+                name: "new_db".to_string(),
+                db_id: 11,
+                is_deleted: false,
+                txn_id: None,
+                btree_comparator_id: None,
+                dup_comparator_id: None,
+                fanout: Some(4),
+            }),
+        );
+
+        let mut mgr = RecoveryManager::new();
+        let mut trees = HashMap::new();
+        let info = mgr.recover_all(&mut scanner, &mut trees, false).unwrap();
+
+        // Both names recover.
+        assert!(info.recovered_db_names.contains_key("old_db"));
+        assert!(info.recovered_db_names.contains_key("new_db"));
+        // OLD-format record contributes NO fanout (env-default fallback).
+        assert!(
+            !info.recovered_db_fanouts.contains_key("old_db"),
+            "NEW-5 backward-compat: an old-format NameLN (fanout None) must              not populate recovered_db_fanouts, so the DB keeps the env              NODE_MAX fallback"
+        );
+        // NEW-format record carries its persisted fanout.
+        assert_eq!(
+            info.recovered_db_fanouts.get("new_db"),
+            Some(&4),
+            "NEW-5: a NameLN with a persisted fanout must be recovered"
+        );
+    }
+
+    /// NEW-5: a Remove NameLN clears any recovered fanout for that name.
+    #[test]
+    fn test_new5_fanout_cleared_on_remove() {
+        let mut scanner = InMemoryLogScanner::new();
+        scanner.push(
+            lsn(0, 100),
+            LogEntry::NameLn(crate::log_scanner::NameLnRecord {
+                name: "d".to_string(),
+                db_id: 20,
+                is_deleted: false,
+                txn_id: None,
+                btree_comparator_id: None,
+                dup_comparator_id: None,
+                fanout: Some(8),
+            }),
+        );
+        scanner.push(
+            lsn(0, 200),
+            LogEntry::NameLn(crate::log_scanner::NameLnRecord {
+                name: "d".to_string(),
+                db_id: 0,
+                is_deleted: true,
+                txn_id: None,
+                btree_comparator_id: None,
+                dup_comparator_id: None,
+                fanout: None,
+            }),
+        );
+
+        let mut mgr = RecoveryManager::new();
+        let mut trees = HashMap::new();
+        let info = mgr.recover_all(&mut scanner, &mut trees, false).unwrap();
+        assert!(!info.recovered_db_names.contains_key("d"));
+        assert!(
+            !info.recovered_db_fanouts.contains_key("d"),
+            "NEW-5: a removed database must not leave a recovered fanout"
         );
     }
 
