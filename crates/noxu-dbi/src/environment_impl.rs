@@ -480,6 +480,15 @@ pub struct EnvironmentImpl {
     /// those always write the 14-byte header and are byte-unchanged.
     replication_vlsn_counter: Mutex<Option<Arc<std::sync::atomic::AtomicU64>>>,
 
+    /// B5/V16/F1 (JE `MasterTransfer` phase 2): transfer-scoped commit block.
+    /// While engaged, `log_txn_commit` parks *before* assigning a new commit
+    /// VLSN so the master's observable tail is frozen for a master transfer's
+    /// final catch-up re-confirm + hand-off window. `None` for standalone
+    /// (non-replicated) environments -- their commit path is byte-unchanged.
+    /// Installed by `ReplicatedEnvironment::with_environment`.
+    transfer_commit_block:
+        Mutex<Option<Arc<crate::commit_block_latch::CommitBlockLatch>>>,
+
     /// T-5: `TREE_COMPACT_MAX_KEY_LENGTH` (`EnvironmentParams
     /// .TREE_COMPACT_MAX_KEY_LENGTH`).  Threaded into every BIN tree this
     /// environment opens via `Tree::set_compact_max_key_length`
@@ -1838,6 +1847,7 @@ impl EnvironmentImpl {
             cache_usage,
             memory_budget,
             replication_vlsn_counter: Mutex::new(None),
+            transfer_commit_block: Mutex::new(None),
             // T-5: TREE_COMPACT_MAX_KEY_LENGTH from the env config.
             compact_max_key_length: cfg.tree_compact_max_key_length as i32,
             // TTL master switch + clock tolerance from the env config.
@@ -1873,6 +1883,18 @@ impl EnvironmentImpl {
         counter: Arc<std::sync::atomic::AtomicU64>,
     ) {
         *self.replication_vlsn_counter.lock().unwrap() = Some(counter);
+    }
+
+    /// Install the transfer-scoped commit block latch (B5/V16/F1, JE
+    /// `MasterTransfer` phase 2). Called by
+    /// `ReplicatedEnvironment::with_environment` so `log_txn_commit` parks on
+    /// it before assigning a new commit VLSN while a master transfer holds the
+    /// block. Non-replicated environments never call this.
+    pub fn set_transfer_commit_block(
+        &self,
+        block: Arc<crate::commit_block_latch::CommitBlockLatch>,
+    ) {
+        *self.transfer_commit_block.lock().unwrap() = Some(block);
     }
 
     /// Install the background-daemon exception sink (JE `ExceptionListener`).
@@ -3326,6 +3348,20 @@ impl EnvironmentImpl {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
+
+        // B5/V16/F1 (JE `MasterTransfer` phase 2, MasterTransfer.java ~220-226):
+        // if a master transfer has engaged the transfer-scoped commit block,
+        // park HERE -- before assigning this commit's VLSN -- so the master's
+        // observable tail cannot advance during the transfer's final catch-up
+        // re-confirm + hand-off window. A commit that already holds a VLSN is
+        // unaffected; only *new* VLSN assignment is frozen. The park is bounded
+        // (see `CommitBlockLatch`), so it never wedges the commit path. Take
+        // the handle out from under its lock before parking.
+        let commit_block =
+            self.transfer_commit_block.lock().unwrap().as_ref().map(Arc::clone);
+        if let Some(block) = commit_block {
+            block.await_thaw();
+        }
 
         // C-C2b: when a VLSN counter is installed (replicated env), assign the
         // next VLSN and write a 22-byte VLSN-tagged header so that

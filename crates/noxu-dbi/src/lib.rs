@@ -16,6 +16,7 @@
 //! internal implementations including
 //! EnvironmentImpl, DatabaseImpl, CursorImpl, DbTree, MemoryBudget.
 
+pub mod commit_block_latch;
 pub mod cursor_impl;
 mod database_config;
 mod database_id;
@@ -45,6 +46,7 @@ pub mod throughput_stats;
 pub mod trigger;
 mod truncate_result;
 
+pub use commit_block_latch::CommitBlockLatch;
 pub use cursor_impl::CursorImpl;
 #[cfg(any(test, feature = "testing"))]
 pub use cursor_impl::{clear_cursor_fail_flag, set_cursor_fail_after};
