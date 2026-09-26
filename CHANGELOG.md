@@ -191,6 +191,15 @@ listed in [References](#references).
   and could surface an uncommitted value that a concurrent writer then aborted.
   All data-returning lock sites now revalidate (JE `CursorImpl.lockLN`), with no
   cost on the uncontended path and no weakening of higher isolation levels.
+- **The transaction-level timeout is now enforced.** `txn_timeout_ms` was
+  configurable but never applied to lock waits: a transaction with a short
+  transaction timeout and a long (or infinite) per-lock timeout would block for
+  the full lock timeout — or forever — instead of being bounded by its own
+  deadline, and `TransactionTimeout` was never actually raised. Lock waits now
+  use the smaller of the lock timeout and the transaction's remaining time and
+  raise `TransactionTimeout` when the transaction deadline is what expired (JE
+  precedence: a tie resolves to `TransactionTimeout`). Behavior is unchanged when
+  no transaction timeout is set; deadlock detection is unaffected.
 
 ### Changed
 
