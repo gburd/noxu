@@ -150,8 +150,15 @@ impl std::fmt::Debug for TlsIdentity {
 pub enum TrustedCerts {
     /// Accept any certificate without verification.
     ///
-    /// **Insecure.** Use only on private, trusted networks where all nodes
-    /// are implicitly trusted (authenticated at the Paxos / VLSN layer).
+    /// **Insecure — provides ZERO peer authentication of any kind.** This
+    /// disables TLS chain validation entirely; it does NOT fall back to some
+    /// other authentication layer. In particular, election/Paxos and
+    /// heartbeat messages are NOT authenticated at the message level (see
+    /// `docs/src/operations/known-limitations.md` and the auth-mtls design
+    /// doc, NA-5/NA-6/NA-7), so nothing else re-establishes peer identity if
+    /// TLS verification is skipped. Use only on a network that is trusted by
+    /// other means (physically isolated / firewalled), understanding that any
+    /// host able to reach the port is fully trusted.
     SkipVerification,
 
     /// Trust CA certificates loaded from PEM files on disk.
@@ -733,8 +740,11 @@ impl TlsConfig {
 /// A `rustls` `ServerCertVerifier` that accepts any certificate without chain
 /// validation.
 ///
-/// Suitable for internal, trusted replication networks where nodes are
-/// implicitly trusted (authenticated at the Paxos / VLSN layer).
+/// **Provides ZERO peer authentication of any kind.** It does not defer to
+/// any other layer: election/Paxos and heartbeat traffic is unauthenticated
+/// at the message level (auth-mtls design doc, NA-5/NA-6/NA-7), so skipping
+/// certificate verification leaves the peer entirely unauthenticated. Use only
+/// on a network trusted by other means (isolated / firewalled).
 #[cfg(feature = "tls-rustls")]
 #[derive(Debug)]
 pub(crate) struct SkipCertVerification(

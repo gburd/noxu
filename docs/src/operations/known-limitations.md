@@ -52,6 +52,32 @@ original gap:
   `promised_term` nonce, JE review findings NA-5/NA-6/NA-7) is a separate,
   strictly-stronger scheme and is **not** implemented — deliberately not built
   half-way.
+- **ADMIN RPC authorization (shutdown-group / master-transfer / step-down) —
+  TRANSPORT-LEVEL ONLY, no per-command authorization.** The `ADMIN` service
+  (`AdminService::handle`) executes `CMD_SHUTDOWN_GROUP` (closes the local
+  environment), `CMD_TRANSFER_MASTER`, and `CMD_STEP_DOWN` for **any** peer that
+  reaches the handler. Authorization is delegated entirely to the transport:
+  under mTLS that means *any allowlisted peer* can shut down or reshuffle
+  mastership of *any other* member unilaterally — there is no separate check
+  that the caller is the current master or a designated administrator identity.
+  Peer-allowlist membership therefore currently implies **full administrative
+  authority over the whole group** (this matches JE's `RepGroupAdmin` model,
+  where any node with group access can issue these RPCs). Under
+  `insecure_no_auth` / plain TCP there is no authorization at all: any host that
+  can reach the port can shut the node down. This is the exact gap the 2026
+  security audit tracks as **F5/S1**; binding a per-command authorization
+  decision to the TLS-verified peer identity requires threading that identity
+  through the `Channel` trait (it exposes none today) and is a design change
+  tracked separately (see the S1 remediation design note). Until then: keep the
+  replication network isolated, and treat every allowlisted certificate as a
+  full cluster administrator.
+- **Election/admin messages self-report `node_name` with no binding to the
+  TLS-verified peer identity (F3b/S1).** Election proposals and admin commands
+  carry a self-reported node name that the acceptor/handler does not cross-check
+  against the certificate that completed the handshake (the `Channel` trait
+  exposes no verified peer identity). An allowlisted-but-compromised peer can
+  therefore claim to be a different node. Same root cause and same tracked
+  remediation as the ADMIN-authorization bullet above.
 - **`NetworkRestore` client trusts server-supplied filenames (path traversal)
   — CLOSED.** `network_restore::validate_restore_filename` rejects any
   server-supplied filename containing a path separator (`/` or `\`), `.` /
