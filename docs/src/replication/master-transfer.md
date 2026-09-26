@@ -1,8 +1,16 @@
 # Master Transfer
 
 Master transfer moves the master role to a designated replica in a controlled,
-non-disruptive way. No committed data is lost: the transfer only completes to a
-target that has **caught up** to the current master's VLSN.
+non-disruptive way. For a non-forced transfer no acknowledged committed data is
+lost, **even against a master that is still actively committing**: the master
+first waits for the target to **catch up** to its current VLSN, then **freezes
+new commits** for the final hand-off window and re-confirms the target still
+covers the master's now-frozen VLSN before handing off — so no commit can slip
+in after the check and be handed off missing. This is the two-phase model of JE
+`MasterTransfer` (phase 1 catch-up, phase 2 commit block). The freeze is a
+bounded hold: if the transfer aborts or times out it is lifted and the old
+master resumes committing. `with_force` skips both phases (see below) and does
+not carry this guarantee.
 
 ## When to Use Master Transfer
 
@@ -22,10 +30,19 @@ target that has **caught up** to the current master's VLSN.
    the old master rejoins as a replica — loss of committed, acknowledged data.
    This mirrors JE `MasterTransfer`'s `VLSNProgress` / `readyReplicas`
    accounting.
-3. **Hand off**: Once the target has caught up, the master signals the target
-   (which becomes master at the next term) and notifies the other peers so they
-   re-target.
-4. **Reconnect**: The former master reconnects as a replica of the new master.
+3. **Freeze commits and re-confirm** (JE `MasterTransfer` phase 2): once the
+   target has caught up, the master engages a transfer-scoped commit freeze so
+   no new commit can assign a VLSN, then re-reads its now-frozen final VLSN and
+   re-confirms the target still covers it. This closes the check→hand-off
+   window: without the freeze a master that keeps committing after the catch-up
+   check could advance past the VLSN the target was confirmed to cover and hand
+   off already behind again. If the target no longer covers the final VLSN the
+   transfer is refused and the freeze is lifted (the master resumes). The freeze
+   is bounded — a transfer that dies mid-window cannot wedge the commit path.
+4. **Hand off**: Under the freeze, the master signals the target (which becomes
+   master at the next term) and notifies the other peers so they re-target.
+5. **Reconnect**: The former master reconnects as a replica of the new master;
+   the (now moot) master-side freeze is released.
 
 ```rust
 use noxu_rep::master_transfer::MasterTransferConfig;
