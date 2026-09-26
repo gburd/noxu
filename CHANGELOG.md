@@ -182,6 +182,16 @@ listed in [References](#references).
   a closed transaction) and JE (which rejects any operation on a closed
   transaction). Auto-commit (`None`) and open-transaction opens are unaffected.
   Found by a faithful port of JE's `TxnEndTest.testClose`.
+- **A lock timeout / conflict / deadlock operation failure now marks the
+  transaction abort-only (NEW-TXN-2).** A blocking lock conflict surfaced from a
+  `put`/`get` returned the error but left the transaction open, so a subsequent
+  operation on a different key could still succeed and the transaction could
+  commit — diverging from JE's `OperationFailureException` contract. After a
+  blocking lock-conflict failure the transaction is now invalid: a further
+  operation is rejected and commit is refused (only abort succeeds). A lock wait
+  that eventually succeeds, and a no-wait `LockNotAvailable` failure, both leave
+  the transaction valid (matching JE). Found by a faithful port of JE's
+  `TxnTest.testRepeatingOperationFailures`.
 
 - **WAL now fail-stops the environment on a critical log-write failure (JE
   `LogManager.serialLog` parity).** A failed or partial WAL write previously left
