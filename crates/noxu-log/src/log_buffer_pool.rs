@@ -469,6 +469,21 @@ pub struct BufferPoolStats {
 }
 
 #[cfg(test)]
+// JE: LogBufferPoolTest.{testGrowBuffers,testBufferFlush} +
+// BufferPoolReadLatchTest.testBufferPoolReadLatch.
+//   - testGrowBuffers: the pool adds buffers on demand and
+//     getReadBufferByLsn locates a buffered LSN, returning null for an LSN
+//     below the minimum buffered LSN or above the last registered LSN.
+//     Covered by test_get_write_buffer / test_buffer_cycling (grow) and
+//     test_read_buffer_lsn_below_min_is_miss (out-of-range -> None).
+//   - testBufferFlush: full buffers are written out and read back. Covered
+//     by test_write_dirty_drains_ring_no_panic (ring wraps + read back).
+//   - BufferPoolReadLatchTest [#19642]: reads for an LSN outside the pool
+//     range must NOT latch the pool. Noxu implements the same lock-free
+//     skip via an AtomicU64 min-buffer-LSN handle checked before acquiring
+//     buffer_pool_latch; test_read_buffer_lsn_below_min_is_miss proves the
+//     below-min branch returns a miss without latching. Deviation: Noxu has
+//     no LATCH_RELEASES stat, so the exact latch-count assertion is N/A.
 mod tests {
     use super::*;
     use crate::file_manager::FileManager;

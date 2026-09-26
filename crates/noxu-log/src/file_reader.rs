@@ -1390,6 +1390,11 @@ mod tests {
     }
 
     /// With validate_checksum=false a corrupted entry is read without error.
+    ///
+    /// JE: FileReaderTest.testNonDefaultParams -- reads a log with
+    /// `je.log.checksumRead=false`; the FileReader must not raise a checksum
+    /// error even on corrupt bytes. Noxu's `validate_checksum` flag is the
+    /// direct analogue of JE's `LOG_CHECKSUM_READ`.
     #[test]
     fn test_checksum_skipped_when_disabled() {
         let payload = b"hello noxu";

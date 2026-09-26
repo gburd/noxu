@@ -184,6 +184,16 @@ impl LogFlusher {
 }
 
 #[cfg(test)]
+// JE: LogFlusherTest.{testConfig,testFlushSync,testNoFlushSync,
+// testFlushNoSync,testNoFlushNoSync}. JE tests the four combinations of
+// flush-vs-sync daemon config plus the interval getters. Noxu's LogFlusher
+// is a standalone daemon (JE ties config parsing to HA/replication):
+// test_new_flusher checks the interval getters (testConfig); a daemon is
+// spawned only when its interval > 0 (test_flusher_triggers_on_commits =
+// flush-sync enabled; test_flusher_no_flush_without_commits = the daemon
+// runs but does not flush when no new commits arrived). The
+// testHAConfigOld / testConfigCompatibility deprecated-HA-param cases are
+// N/A here (ReplicatedEnvironment config parsing lives in noxu-rep).
 mod tests {
     use super::*;
     use crate::file_manager::FileManager;
