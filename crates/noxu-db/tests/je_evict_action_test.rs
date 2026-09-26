@@ -6,18 +6,18 @@
 //! expected nodes have been evicted properly."  The methods ported here test
 //! the *decision* to evict as a function of the configured cache size:
 //!
-//!  * `testEvict`         — with a SMALL cache over a populated tree, a forced
-//!                          eviction must reduce cache usage AND all data must
-//!                          still read back.
-//!  * `testNoNeedToEvict` — with a BIG cache, a forced eviction must NOT reduce
-//!                          cache usage (nothing is over budget) and all data
-//!                          still reads back.
-//!  * `testSetCacheSize`  — starting BIG (no eviction), shrinking to SMALL via
-//!                          the mutable config triggers eviction, then growing
-//!                          BIG again stops it — with data intact throughout.
-//!  * `testThreadedCacheSizeChanges` — concurrent reader/writer threads flip
-//!                          the cache size while forcing eviction; the engine
-//!                          must not crash or lose data.
+//! * `testEvict`         — with a SMALL cache over a populated tree, a forced
+//!   eviction must reduce cache usage AND all data must
+//!   still read back.
+//! * `testNoNeedToEvict` — with a BIG cache, a forced eviction must NOT reduce
+//!   cache usage (nothing is over budget) and all data
+//!   still reads back.
+//! * `testSetCacheSize`  — starting BIG (no eviction), shrinking to SMALL via
+//!   the mutable config triggers eviction, then growing
+//!   BIG again stops it — with data intact throughout.
+//! * `testThreadedCacheSizeChanges` — concurrent reader/writer threads flip
+//!   the cache size while forcing eviction; the engine
+//!   must not crash or lose data.
 //!
 //! JE root/mapping-tree white-box methods (`testRootINEviction`,
 //! `testReadOnlyRootINEviction`, `testMappingTreeEviction`, `testAbortOpen`)
@@ -47,7 +47,10 @@ const SMALL_CACHE: u64 = 1024 * 1024;
 const N_KEYS: usize = 40_000;
 const VAL_LEN: usize = 100;
 
-fn open_env(dir: &std::path::Path, cache_bytes: u64) -> (Environment, Database) {
+fn open_env(
+    dir: &std::path::Path,
+    cache_bytes: u64,
+) -> (Environment, Database) {
     let mut cfg = EnvironmentConfig::new(dir.to_path_buf());
     cfg.set_allow_create(true);
     cfg.set_transactional(true);
@@ -72,7 +75,7 @@ fn open_env(dir: &std::path::Path, cache_bytes: u64) -> (Environment, Database) 
 }
 
 fn insert_data(env: &Environment, db: &Database, n: usize) {
-    let val = vec![0x77u8; VAL_LEN];
+    let val = [0x77u8; VAL_LEN];
     let mut i = 0usize;
     while i < n {
         let end = (i + 1000).min(n);
@@ -88,7 +91,7 @@ fn insert_data(env: &Environment, db: &Database, n: usize) {
 
 /// JE `verifyData`: full scan, every record must read back.
 fn verify_data(db: &Database, n: usize) {
-    let val = vec![0x77u8; VAL_LEN];
+    let val = [0x77u8; VAL_LEN];
     let mut out = DatabaseEntry::new();
     for j in 0..n {
         let k = DatabaseEntry::from_vec(format!("{j:010}").into_bytes());
@@ -99,7 +102,12 @@ fn verify_data(db: &Database, n: usize) {
 
 /// JE `evictAndCheck(shouldEvict, nKeys)`: force eviction and assert usage
 /// dropped iff `should_evict`, then verify all data.
-fn evict_and_check(env: &Environment, db: &Database, should_evict: bool, n: usize) {
+fn evict_and_check(
+    env: &Environment,
+    db: &Database,
+    should_evict: bool,
+    n: usize,
+) {
     let pre = env.cache_usage_bytes().unwrap();
     let _ = env.evict_memory().unwrap();
     let post = env.cache_usage_bytes().unwrap();
