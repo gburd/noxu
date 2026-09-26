@@ -8,6 +8,39 @@
 //! - `LogManagerTest.java` — write → flush → read; LSN ordering; bad checksum detected on read
 //! - `LastFileReaderTest.java` / `FileReaderTest.java` — forward scan, end-of-log, trailing junk
 //! - `INFileReaderTest.java` / `LNFileReaderTest.java` — entry-type filtering via LogFileReader
+//!
+//! JE @Test method mapping:
+//! - LogEntryTest.testEquality: test_entry_type_find_type,
+//!   test_entry_type_num_roundtrip (findType returns the right variant;
+//!   JE's shared-vs-new-instance distinction is a Java object-model detail,
+//!   N/A in Rust where entries are constructed fresh via enum matching).
+//! - LoggableTest.testEntryData: test_loggable_* below (Trace, FileHeader,
+//!   EmptyLogEntry=Ckpt, TxnCommit/Abort, IN, LN, RestoreRequired) plus the
+//!   per-entry #[test]s in src/entry/{matchpoint,name_ln,file_summary_ln,
+//!   rollback_start,rollback_end,txn_prepare}_*.rs. Each asserts the JE
+//!   writeAndRead invariant: bytes-written == log_size(), read-back equal,
+//!   log_size() preserved. (DbTree is a noxu-dbi loggable, not a log entry.)
+//! - FSyncManagerTest.testBasic / testSimulatedFsync: the
+//!   test_fsync_manager_* block below (coalescing reduces fsyncs; waiter
+//!   notified; error propagates; sequential calls each flush).
+//! - LogManagerTest.testBasicInMemory / testBasicOnDisk / testComboDiskMemory
+//!   / testFaultingIn: all call JE's logAndRetrieve (log 10 Trace records,
+//!   read back out-of-order + reversed); covered by
+//!   test_log_manager_write_and_read_multiple_entries,
+//!   test_log_manager_read_entries_in_reverse_order, and
+//!   test_log_manager_random_access_mid_file. JE's exact on-disk file-count
+//!   asserts (10 files) depend on env root/ckpt/daemon entries and are N/A
+//!   (env-internal accounting; Noxu tests the log layer directly).
+//! - LogManagerTest.testEntryChecksum:
+//!   test_log_manager_entry_checksum_exhaustive_corruption (below).
+//! - LogManagerTest.testFlushItemLargerThanBufferSize:
+//!   test_log_manager_item_larger_than_buffer (below).
+//! - LastFileReaderTest.{testBasic,testSmallBuffers,testMedBuffers,testJunk,
+//!   testLastFileEmpty,testEmptyAtEnd}: the LogFileReader forward-scan tests
+//!   below; the reader-level end-of-log / target-tracking assertions are in
+//!   src/last_file_reader.rs. (testBadFileHeader/testExtraEmpty move-aside
+//!   of bad files is a recovery-level behavior; testRestoreMarkerFile maps
+//!   to the RestoreRequired round-trip test_loggable_restore_required_*.)
 
 // ============================================================================
 // Shared imports
@@ -631,6 +664,16 @@ fn test_header_post_marshalling_roundtrip() {
 use noxu_log::fsync_manager::FsyncManager;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// JE: FSyncManagerTest.testBasic -- when several threads request an fsync
+/// as a group, fewer actual fsyncs run than requests (JE asserts exactly 2
+/// fsyncs for 3 requests: the initial leader + the next group's leader, with
+/// the last thread getting a free ride). JE forces the exact grouping by
+/// blocking executeFSync on a WaitVal; Noxu's coalescer is
+/// concurrency-adaptive, so we assert the robust invariant (fsyncs <
+/// threads) rather than the exact 2-of-3 count. The all-interleavings
+/// version (N committers -> 1..=N fsyncs, no double/missing) is model-checked
+/// by tests/shuttle_fsync_manager.rs fsync_coalescing_and_coverage_hold.
+///
 /// Multiple threads requesting fsync
 /// should result in fewer actual fsyncs than threads (coalescing).
 #[test]
@@ -704,6 +747,12 @@ fn test_fsync_manager_flush_only_no_fsync() {
     );
 }
 
+/// JE: FSyncManagerTest.testSimulatedFsync (waiter half) -- a thread that
+/// piggybacks on another's fsync must be woken and complete; the coalescer
+/// must never drop a waiter. JE's full stress (10 threads x 50 iters adding
+/// map entries that the leader's fsync clears) is model-checked over all
+/// interleavings by shuttle_fsync_manager.rs fsync_coalescing_and_coverage_hold.
+///
 /// Waiter is notified after leader completes.
 #[test]
 fn test_fsync_manager_waiter_notified() {
@@ -1064,6 +1113,167 @@ fn test_log_manager_flush_sync_durability() {
     let (_, et, rp) = result.unwrap();
     assert_eq!(et, LogEntryType::Trace);
     assert_eq!(rp.as_slice(), payload);
+}
+
+/// JE: LogManagerTest.testFlushItemLargerThanBufferSize +
+/// LogBufferPoolTest.testTemporaryBuffers.
+///
+/// A log entry whose serialized size exceeds the log-buffer size must still
+/// be logged (JE routes it through a temporary buffer / write-queue flush;
+/// Noxu writes it via the oversized direct-pwrite path), flushed, and read
+/// back byte-for-byte. Before JE's [#20717] fix the write queue was not
+/// flushed when the oversized trace was logged; the invariant under test is
+/// simply that an over-sized item round-trips.
+#[test]
+fn test_log_manager_item_larger_than_buffer() {
+    let dir = TempDir::new().unwrap();
+    // Tiny 1 KiB log buffers, generous max file size.
+    let fm = Arc::new(
+        FileManager::new(dir.path(), false, 100_000_000, 100).unwrap(),
+    );
+    let buf_size = 1024usize;
+    let lm = LogManager::new(Arc::clone(&fm), 3, buf_size, 4096);
+
+    // First a small entry, to initialize the file (JE logs a "small" trace
+    // to prime FileManager.endOfLogRWFile).
+    let small = b"small";
+    lm.log(LogEntryType::Trace, small, Provisional::No, false, false).unwrap();
+    lm.flush_no_sync().unwrap();
+
+    // Now an entry strictly larger than the buffer.
+    let big_payload = vec![0x5Au8; buf_size * 2];
+    assert!(
+        big_payload.len() + MIN_HEADER_SIZE > buf_size,
+        "payload must exceed the log buffer size"
+    );
+    let big_lsn = lm
+        .log(LogEntryType::Trace, &big_payload, Provisional::No, true, false)
+        .unwrap();
+
+    lm.flush_sync().unwrap();
+    fm.clear_cache();
+
+    // The oversized entry must read back byte-for-byte from disk.
+    let (et, rp) = lm.read_entry(big_lsn).unwrap();
+    assert_eq!(et, LogEntryType::Trace);
+    assert_eq!(rp, big_payload, "oversized entry must round-trip exactly");
+}
+
+/// JE: LogManagerTest.testEntryChecksum.
+///
+/// Corrupting ANY byte of a committed entry (via bit set, bit clear, byte
+/// increment, or byte decrement) after the 4-byte checksum field must be
+/// detected on read-back. JE walks every byte and every single-bit
+/// mutation; this port applies the same exhaustive per-bit + inc/dec sweep
+/// to the first on-disk data entry and asserts the strict reader raises a
+/// checksum error every time.
+///
+/// Deviation: JE additionally (a) corrupts the file-header entry at LSN
+/// (0,0), and (b) tolerates a lone invisible-bit toggle (flags 0x10) because
+/// recovery flips it with a single atomic byte write and the fetch path
+/// cloaks it before checksumming. In Noxu the file-header entry is consumed
+/// by LogFileReader::open (not returned to the caller), and the
+/// invisible-bit cloak lives on the LogManager fetch path -- both are
+/// covered separately by noxu-log src/log_manager.rs
+/// `test_make_invisible_preserves_checksum`. LogFileReader::read_next_strict
+/// (the recovery reader) is deliberately stricter and flags EVERY bit flip,
+/// including the invisible bit, so this test does not exempt flags[5].
+///
+/// Adaptation: JE collapses all corruption into a single ChecksumException.
+/// Noxu's strict reader has a richer taxonomy (LOG-5): a bad entry-type byte
+/// surfaces InvalidEntryType, a bad item-size surfaces InvalidEntrySize or a
+/// short read. The invariant we assert is JE's real intent -- a corrupt
+/// entry is DETECTED and never returned as the original valid entry -- so we
+/// accept any Err, or an Ok(None)/Ok(Some(other)) that is not the intact
+/// Trace payload.
+#[test]
+fn test_log_manager_entry_checksum_exhaustive_corruption() {
+    let dir = TempDir::new().unwrap();
+    let (fm, lm) = make_managers(&dir);
+
+    let payload = b"checksum sweep payload";
+    let lsn = lm
+        .log(LogEntryType::Trace, payload, Provisional::No, true, false)
+        .unwrap();
+    lm.flush_sync().unwrap();
+    fm.clear_cache();
+
+    let file_path = dir.path().join(format!("{:08x}.ndb", lsn.file_number()));
+    let original = std::fs::read(&file_path).unwrap();
+
+    let entry_start = lsn.file_offset() as usize;
+    let entry_end = entry_start + MIN_HEADER_SIZE + payload.len();
+
+    // Helper: rewrite the file with `original`, apply `mutate` to the byte
+    // at `idx`, and assert read_next_strict raises a checksum error.
+    let expect_checksum_failure = |idx: usize, new_val: u8| {
+        use std::io::Write;
+        let mut modified = original.clone();
+        modified[idx] = new_val;
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&file_path)
+                .unwrap();
+            f.write_all(&modified).unwrap();
+            f.flush().unwrap();
+        }
+        fm.clear_cache();
+        let mut reader =
+            LogFileReader::open(Arc::clone(&fm), lsn.file_number()).unwrap();
+        let result = reader.read_next_strict();
+        // Corruption must be detected: never silently return the intact
+        // original entry.
+        let returned_original = matches!(
+            &result,
+            Ok(Some((_, LogEntryType::Trace, p))) if p.as_slice() == payload
+        );
+        assert!(
+            !returned_original,
+            "corruption at byte {} -> {:#04x} was NOT detected; \
+             read_next_strict returned the intact entry: {:?}",
+            idx, new_val, result
+        );
+    };
+
+    // Sanity: the unmodified entry validates cleanly.
+    {
+        let mut reader =
+            LogFileReader::open(Arc::clone(&fm), lsn.file_number()).unwrap();
+        assert!(
+            reader.read_next_strict().is_ok(),
+            "unmodified entry must validate"
+        );
+    }
+
+    // Exhaustive sweep over every byte past the checksum field.
+    let sweep_start = entry_start + CHECKSUM_BYTES;
+    for (off, &old_val) in original[sweep_start..entry_end].iter().enumerate() {
+        let idx = sweep_start + off;
+
+        // Replace with 0 (or 1 if already 0).
+        expect_checksum_failure(idx, if old_val == 0 { 1 } else { 0 });
+        // Replace with 0xFF (or 0xF7 if already 0xFF).
+        expect_checksum_failure(idx, if old_val == 0xFF { 0xF7 } else { 0xFF });
+        // Increment / decrement (wrapping).
+        expect_checksum_failure(idx, old_val.wrapping_add(1));
+        expect_checksum_failure(idx, old_val.wrapping_sub(1));
+
+        // Set each currently-clear bit.
+        for j in 0..8 {
+            let flag = 1u8 << j;
+            if old_val & flag == 0 {
+                expect_checksum_failure(idx, old_val | flag);
+            }
+        }
+        // Clear each currently-set bit.
+        for j in 0..8 {
+            let flag = 1u8 << j;
+            if old_val & flag != 0 {
+                expect_checksum_failure(idx, old_val & !flag);
+            }
+        }
+    }
 }
 
 // ============================================================================

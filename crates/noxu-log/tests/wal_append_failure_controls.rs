@@ -1,5 +1,12 @@
 //! Investigation controls for failed/unfinished append handling. NOT MERGE-READY.
 //! No production hooks: faultdisk, the real file latch, and (Linux only) RLIMIT_FSIZE.
+//!
+//! JE: IOExceptionTest.testIOExceptionDuringFileFlippingWrite -- an I/O error
+//! injected during log writes (incl. across a file flip) must not leave a
+//! gap before acknowledged entries; the WAL fail-stops or rolls back cleanly.
+//! These controls model the same fail-stop-on-partial-write contract via
+//! faultdisk (disk-full retry no-gap, partial-write fail-stop, oversized
+//! reservation not covered by a premature sync).
 #![cfg(not(noxu_shuttle))]
 
 use noxu_log::faultdisk::{self, FaultController, FaultKind};

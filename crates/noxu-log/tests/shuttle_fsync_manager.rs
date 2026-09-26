@@ -72,6 +72,14 @@ use shuttle::sync::atomic::{AtomicU64, AtomicUsize};
 /// Number of interleavings shuttle explores per test.
 const ITERATIONS: usize = 5_000;
 
+/// JE: FSyncManagerTest.testBasic / testSimulatedFsync -- the all-
+/// interleavings model-check of group-commit coalescing. JE's testBasic
+/// asserts fewer fsyncs than requests (2 of 3); testSimulatedFsync stresses
+/// 10 threads x 50 iters and requires the fsync to "clear" every enqueued
+/// entry (no dropped waiter). This shuttle test proves the same contract
+/// over every interleaving: N committers cause 1..=N fsyncs and every
+/// committer is covered.
+///
 /// SAFETY ORACLE: every committer's returned durable watermark covers its own
 /// LSN, coalescing holds, and the durable watermark never regresses, under
 /// every interleaving.
