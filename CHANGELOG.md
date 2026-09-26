@@ -242,6 +242,25 @@ listed in [References](#references).
   after replication progress (so a higher-priority node never wins over a
   more-advanced one), and priority 0 makes a node participate in quorum but
   never become master — matching JE's `NODE_PRIORITY`.
+- **The log cleaner no longer deletes log files a lagging replica still needs
+  (B6/V15/F2, HIGH).** The rep side computed the global CBVLSN
+  (`GroupService`, the minimum VLSN acknowledged by any active electable
+  replica) and the cleaner had a `FileProtector`, but the two were never wired
+  together — so under sustained writes on the master, a lagging or briefly
+  disconnected replica's needed `.ndb` files could be reclaimed, forcing an
+  otherwise-avoidable full network restore (or, if every node had cleaned past
+  it, an unrecoverable gap). The master now translates the CBVLSN into a
+  cleaner file-protection bound: it maps the CBVLSN to the log file that
+  contains it (via the `VlsnIndex`) and pins that file and every later one on
+  the cleaner's shared `FileProtector` (a new replication *file floor*), so the
+  cleaner never deletes a file below the slowest replica's needed range. The
+  floor is refreshed on every replica ack and rises as the slowest replica
+  catches up, releasing the older files for cleaning. A non-replicated
+  environment sets no floor and the cleaner is unaffected. Matches JE, where
+  the master pins every log file at or after the file containing the global
+  CBVLSN via the `FileProtector` replication-protected range (`GlobalCBVLSN` /
+  `LocalCBVLSNUpdater`). Reproduced fail-on-base / pass-on-fix (debug and
+  release).
 
 ### Security
 

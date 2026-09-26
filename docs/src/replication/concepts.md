@@ -352,9 +352,17 @@ is assigned the next VLSN, and this assignment is replicated to all nodes.
 **VlsnIndex:** Maps VLSN values to log file positions (LSNs) for efficient random
 access during replica catch-up and network restore.
 
-**CBVLSN (Cluster-Based Barrier VLSN):** The minimum VLSN across all active replicas.
-Log entries below CBVLSN are safe to reclaim by the log cleaner. Broadcast via
-unreliable QUIC datagrams or piggybacked on TCP heartbeats.
+**CBVLSN (Cluster-Based Barrier VLSN):** The minimum VLSN acknowledged across
+all active electable replicas. The master translates the CBVLSN into a log-file
+protection bound the cleaner honors: every log file at or after the file that
+contains the CBVLSN is pinned via the cleaner's `FileProtector`
+(`set_replication_floor`), so the cleaner never deletes a file a lagging replica
+still needs. Files fully below the CBVLSN are safe to reclaim. As the slowest
+replica catches up the CBVLSN advances, the protected floor rises, and the older
+files are released for cleaning. The protection is refreshed on every replica
+ack (`ReplicatedEnvironment::record_ack` → `update_cleaner_replica_protection`);
+a non-replicated environment sets no floor and the cleaner is unaffected.
+Broadcast via unreliable QUIC datagrams or piggybacked on TCP heartbeats.
 
 **Log shipping architecture:**
 
