@@ -35,6 +35,12 @@
 //!   cache-byte accounting (JE `getDatabaseCacheBytes` via `IN.getDatabase()`)
 //!   and are recorded in the package report; the `*OffHeap` variants are N/A
 //!   (off-heap allocator internals -- documented deviation, AGENTS.md).
+//!
+//! JE test-parity (package je.dbi): also covers the INTENT of
+//! `DbEnvPoolTest.testSharedCacheEnv` -- two shared-cache envs share ONE
+//! evictor and ONE memory budget, so the shared-cache total bytes read through
+//! EITHER env is the SAME value (invariant 1, "one budget, not the sum"), and
+//! eviction driven from either env frees bytes across both (invariant 2).
 
 use noxu_db::{
     Database, DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,

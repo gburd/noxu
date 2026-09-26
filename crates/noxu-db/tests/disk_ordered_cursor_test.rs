@@ -20,6 +20,29 @@
 //!    each key at most once.
 //! 8. `current_returns_last_record` — `current()` re-emits the last
 //!    `next()` result.
+//!
+//! JE test-parity (package je.dbi, DiskOrderedScanTest / SortedLSNTreeWalkerTest):
+//! these cover the OBSERVABLE intent of several JE methods:
+//!   * `testScanArgChecks` -> `empty_db_list_is_rejected` (arg validation).
+//!   * `testScanPermutations` (keysOnly/countOnly slice) ->
+//!     `walks_all_inserted_records`, `keys_only_returns_empty_data`,
+//!     `dedup_keys_filters_repeated_keys`.
+//!   * `testLargeScan` / `testLowMemoryLargeCount` -> `bounded_queue_completes`,
+//!     `dos_producer_queue_timeout_config_flows_and_scan_succeeds`.
+//!   * `testInterruptedDiskOrderedScan` -> `drop_mid_iteration_joins_producer`,
+//!     `close_is_idempotent`.
+//!   * `testDeleteOneDuringScan` / `testDeleteAllDuringScan` ->
+//!     `skips_deleted_records`, `stale_versions_visible_by_default`.
+//!   * `testCleanDeltasNoEviction` / `*Eviction` / `testDirtyDeltas*` +
+//!     `cln7_scan_completes_with_concurrent_cleaning` -> a DOS scan completes
+//!     correctly while cleaning/eviction runs.
+//!   * SortedLSNTreeWalkerTest (`testNoDups*`/`testDups*`/`testPendingDeleted`)
+//!     -> the walker underlies DOS + preload; walk-all-nodes / load-LNs
+//!     behaviour is covered here and by `crates/noxu-db/src/preload.rs`.
+//!     The `testBlockedProducer*` / `*MultiDBInternal*` methods drive JE-INTERNAL
+//!     producer-queue-slot hooks (`hook.getHookValue()`, `DiskOrderedCursorImpl`)
+//!     with exact slot/LSN counts and are recorded N/A in tp-je-dbi.md (the
+//!     observable "scan completes / bounded queue" behaviour is covered above).
 
 use noxu_db::{
     DatabaseConfig, DatabaseEntry, DiskOrderedCursorConfig, Environment,
