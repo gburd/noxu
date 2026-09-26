@@ -2054,9 +2054,20 @@ impl BinStub {
 
     /// Comparator-aware insert: inserts `full_key` into the BIN using `cmp`.
     ///
-    /// Prefix compression is DISABLED: the key is stored as-is.  This is
-    /// intentional for sorted-dup databases where the custom comparator
-    /// requires full-key access at every comparison.
+    /// Prefix compression is TRANSPARENT to ordering: as in JE, a BIN with a
+    /// custom comparator may still carry a byte-common `key_prefix` (set by
+    /// `recompute_key_prefix` on split / recalc — `IN.computeKeyPrefix` runs
+    /// regardless of the comparator, IN.java:1623).  Every stored slot is the
+    /// prefix-stripped SUFFIX; the slot search reconstructs the FULL key
+    /// (prefix + suffix) and applies the comparator, and a new key is stored
+    /// as its suffix under the (possibly shrunk) prefix — never as a full key.
+    ///
+    /// This mirrors JE `IN.setKey` (IN.java:1493): when the new key does not
+    /// share the current prefix the prefix is recomputed and every suffix
+    /// re-encoded (`recalcSuffixes`); otherwise the key is stored via
+    /// `computeKeySuffix(keyPrefix, key)`.  Storing a full key into a
+    /// suffix-compressed slot array would desync the comparator binary search
+    /// and lose records after a split (NEW-TREE-RLE / KeyPrefixTest.testRLEComparator).
     ///
     /// Returns `(slot_index, is_new_insert)`.
     ///
@@ -2069,39 +2080,76 @@ impl BinStub {
     ) -> (usize, bool) {
         // Zero-copy slot storage: O(1) `Vec` -> `Bytes` conversion up front.
         let data = data.map(Bytes::from);
-        if self.key_prefix.is_empty() {
-            match self.key_binary_search_by(|s| cmp(s, &full_key)) {
-                Ok(idx) => {
-                    self.set_lsn(idx, lsn); // T-3
-                    self.entries[idx].data = data;
-                    self.entries[idx].dirty = true;
-                    (idx, false)
+
+        // If a prefix is active and the incoming key does not share it, shrink
+        // the prefix and re-encode every existing suffix FIRST, so the stored
+        // slots and the new key are all suffixes of the SAME prefix.  Mirrors
+        // JE `IN.setKey` -> `recalcSuffixes` (IN.java:1508-1533).  This is the
+        // exact prefix-shrink logic used by `insert_with_prefix`; the only
+        // difference in `insert_cmp` is that the slot search below uses the
+        // configured comparator on reconstructed full keys, not byte order.
+        let plen = self.key_prefix.len();
+        if plen > 0 {
+            let new_len = get_key_prefix_length(&self.key_prefix, &full_key);
+            if new_len < plen {
+                let mut candidate = self.compute_key_prefix(None);
+                if !candidate.is_empty() {
+                    let cl = get_key_prefix_length(&candidate, &full_key);
+                    candidate.truncate(cl);
+                } else if !self.entries.is_empty()
+                    && let Some(first_full) = self.get_full_key(0)
+                {
+                    candidate = create_key_prefix(&first_full, &full_key)
+                        .unwrap_or_default();
+                    for i in 1..self.entries.len() {
+                        if candidate.is_empty() {
+                            break;
+                        }
+                        if let Some(fk) = self.get_full_key(i) {
+                            let l = get_key_prefix_length(&candidate, &fk);
+                            candidate.truncate(l);
+                        }
+                    }
                 }
-                Err(idx) => {
-                    self.insert_slot(idx, full_key, lsn, data);
-                    (idx, true)
-                }
+                self.apply_new_prefix(candidate);
             }
+        }
+
+        // Slot search: reconstruct the FULL key from prefix + stored suffix and
+        // apply the comparator (`INKeyRep.compareKeys` -> `Key.compareKeys`
+        // with the DB comparator, INKeyRep.java:216/225).  When no prefix is
+        // active the stored suffix IS the full key, so we compare the suffix
+        // directly (no allocation).
+        let found = if self.key_prefix.is_empty() {
+            self.key_binary_search_by(|s| cmp(s, &full_key))
         } else {
             let prefix = self.key_prefix.clone();
-            match self.key_binary_search_by(|s| {
+            self.key_binary_search_by(|s| {
                 let mut fk = Vec::with_capacity(prefix.len() + s.len());
                 fk.extend_from_slice(&prefix);
                 fk.extend_from_slice(s);
                 cmp(&fk, &full_key)
-            }) {
-                Ok(idx) => {
-                    // Key exists — update in place.
-                    self.set_lsn(idx, lsn); // T-3
-                    self.entries[idx].data = data;
-                    self.entries[idx].dirty = true;
-                    (idx, false)
+            })
+        };
+        match found {
+            Ok(idx) => {
+                // Key exists — update in place (key/suffix already correct).
+                self.set_lsn(idx, lsn); // T-3
+                self.entries[idx].data = data;
+                self.entries[idx].dirty = true;
+                (idx, false)
+            }
+            Err(idx) => {
+                // New key — store the prefix-stripped SUFFIX at the
+                // comparator-sorted position (JE `computeKeySuffix`).
+                let suffix = self.compress_key(&full_key);
+                self.insert_slot(idx, suffix, lsn, data);
+                // Establish a prefix once 2+ entries share leading bytes
+                // (JE recalcs on split; here we mirror `insert_with_prefix`).
+                if self.key_prefix.is_empty() && self.entries.len() >= 2 {
+                    self.recompute_key_prefix();
                 }
-                Err(idx) => {
-                    // New key — insert at sorted position (no prefix compression).
-                    self.insert_slot(idx, full_key, lsn, data);
-                    (idx, true)
-                }
+                (idx, true)
             }
         }
     }
@@ -8392,7 +8440,20 @@ impl Tree {
                 for delta_bytes in deltas.iter().rev() {
                     let entries = Self::parse_delta_entries(delta_bytes)?;
                     for (full_key, lsn, data, known_deleted) in entries {
-                        let (idx, _new) = if self.key_prefixing {
+                        // Reconstitute in the SAME order the live tree uses.
+                        // A custom comparator lays slots out in comparator
+                        // order (not byte order), and prefix compression is
+                        // transparent to that order (JE keeps the byte prefix
+                        // AND compares full keys via the comparator).  Using
+                        // the byte-order `insert_with_prefix` here would order
+                        // a refaulted comparator BIN by bytes, desyncing it
+                        // from comparator-driven descent/search and losing
+                        // records after eviction+refault (NEW-TREE-RLE).
+                        let (idx, _new) = if let Some(cmp) =
+                            self.key_comparator.as_ref()
+                        {
+                            bin.insert_cmp(full_key, lsn, data, cmp.as_ref())
+                        } else if self.key_prefixing {
                             bin.insert_with_prefix(full_key, lsn, data)
                         } else {
                             bin.insert_raw(full_key, lsn, data)
@@ -16838,18 +16899,30 @@ mod key_prefixing_tests {
         );
     }
 
-    /// Custom-comparator databases (sorted-dup) always bypass prefix
-    /// regardless of key_prefixing: `insert_cmp` does not touch key_prefix.
+    /// Custom-comparator databases compute a byte-common `key_prefix` just
+    /// like the byte-order path -- JE `IN.computeKeyPrefix` runs REGARDLESS of
+    /// whether a comparator is configured (`byteOrdered=false` forces the
+    /// all-keys scan precisely because a comparator can reorder keys,
+    /// IN.java:1623).  Prefix compression is TRANSPARENT to ordering: the
+    /// slot search reconstructs the full key (prefix+suffix) and applies the
+    /// comparator (`INKeyRep.compareKeys` -> `Key.compareKeys`,
+    /// INKeyRep.java:216/225), and every stored slot is the prefix-stripped
+    /// SUFFIX (`IN.setKey` -> `computeKeySuffix`, IN.java:1533).
+    ///
+    /// NEW-TREE-RLE regression: the previous behaviour (comparator => no
+    /// prefix, store full keys) desynced the comparator binary search from
+    /// the byte-prefixed slot layout after a split and lost records durably.
     #[test]
-    fn test_key_prefixing_custom_comparator_no_prefix() {
+    fn test_key_prefixing_custom_comparator_computes_prefix() {
         let cmp: KeyComparatorFn = Arc::new(|a: &[u8], b: &[u8]| a.cmp(b));
         let mut tree = Tree::new_with_comparator(1, 16, cmp);
-        // Enable key_prefixing — should have no effect via insert_cmp path.
         tree.set_key_prefixing(true);
 
         let lsn = noxu_util::Lsn::new(1, 10);
+        let mut keys = Vec::new();
         for i in 0u8..8 {
             let key = vec![b'r', b'e', b'c', b'o', b'r', b'd', b':', i];
+            keys.push(key.clone());
             tree.insert(key, vec![i], lsn).expect("insert");
         }
 
@@ -16859,11 +16932,25 @@ mod key_prefixing_tests {
         let TreeNode::Bottom(ref bin) = *guard else {
             panic!("must be a BIN");
         };
-        // Custom-comparator path (insert_cmp) does not set key_prefix.
-        assert!(
-            bin.key_prefix.is_empty(),
-            "custom-comparator path must not set key_prefix"
+        // JE-faithful: the byte-common prefix `record:` IS computed even with
+        // a comparator; stored slots are suffixes of it.
+        assert_eq!(
+            bin.key_prefix.as_slice(),
+            b"record:",
+            "custom-comparator path must still compute the byte-common prefix"
         );
+        // And every key is reachable via the comparator on reconstructed
+        // full keys (the property the old assertion silently broke).
+        for k in &keys {
+            let (idx, exact) =
+                bin.find_entry_cmp(k, &|a: &[u8], b: &[u8]| a.cmp(b));
+            assert!(exact, "key {k:?} must be found via comparator");
+            assert_eq!(
+                bin.get_full_key(idx).as_deref(),
+                Some(k.as_slice()),
+                "reconstructed full key must match"
+            );
+        }
     }
 }
 
