@@ -164,7 +164,6 @@ fn cursor_txn_test_null_txn_lock_release() {
     );
 }
 
-
 // ───────────────────────────────────────────────────────────────────────────
 // JE: ReadCommitLockersTest.runTest  (SR #23783)
 //
@@ -294,7 +293,6 @@ fn read_commit_lockers_test_no_false_self_deadlock() {
     );
 }
 
-
 // ───────────────────────────────────────────────────────────────────────────
 // JE: TxnTest.testAbortNoSplit -- inserting enough records to make the tree
 // "ripe for a split", then aborting, must leave the database EMPTY and must
@@ -373,7 +371,6 @@ fn txn_test_abort_no_split_leaves_db_empty() {
     );
 }
 
-
 // JE: TxnEndTest.testDbCreation -- N/A / COVERED.
 //
 // JE's scenario opens the SAME database name concurrently under two
@@ -416,8 +413,7 @@ fn txn_end_test_closed_transaction_is_unusable() {
          (JE TxnEndTest.testClose)"
     );
     let mut out = DatabaseEntry::new();
-    let get =
-        db.get_into(Some(&txn_a), &DatabaseEntry::from_bytes(b"k"), &mut out);
+    let get = db.get_into(Some(&txn_a), b"k", &mut out);
     assert!(
         get.is_err(),
         "get through a committed transaction must be rejected \
@@ -425,41 +421,71 @@ fn txn_end_test_closed_transaction_is_unusable() {
     );
 }
 
-// JE: TxnEndTest.testClose (DDL sub-case) -- BUG CANDIDATE (NEW-TXN-1).
+// JE: TxnEndTest.testClose (DDL sub-case) -- NEW-TXN-1 production guard-fix.
 //
 // JE rejects using a closed transaction for ANY operation, including
 // `env.openDatabase(closedTxn, ...)` (throws IllegalArgumentException).  Noxu
-// enforces this on the DATA path (put/get through a committed txn error with
-// InvalidTransaction -- see `txn_end_test_closed_transaction_is_unusable`), but
-// `Environment::open_database` does NOT validate the passed transaction's
-// state, so a DDL create/open through a COMMITTED transaction is silently
-// accepted.  This is a minor gap (DDL only, not a data-integrity bug), kept
-// ignored and escalated as NEW-TXN-1.
-//
-// Root cause: `Environment::open_database` (crates/noxu-db/src/environment.rs)
-// calls `self.check_open()` (env open?) but never checks
-// `txn.state() == Open` / `txn.is_valid()` on the supplied `Option<&Transaction>`
-// before creating/opening the database under it.  Fix: add a txn-state guard
-// mirroring the data path's `check_state`.
+// enforced this on the DATA path (put/get through a committed txn error with
+// InvalidTransaction -- see `txn_end_test_closed_transaction_is_unusable`) but
+// NOT on the DDL path: `Environment::open_database` silently accepted a
+// committed/aborted transaction.  This test drove the NEW-TXN-1 guard added to
+// `Environment::open_database` (a txn-state check mirroring the data path's
+// `Txn::check_state`).  Fails on base 2ad524d2 (open_database accepts the
+// committed txn); passes with the guard.
 #[test]
-#[ignore = "NEW-TXN-1: open_database does not reject a committed/closed txn (DDL-path gap)"]
-fn txn_end_test_close_open_database_rejects_closed_txn_bug() {
+fn txn_end_test_close_open_database_rejects_closed_txn() {
     let dir = TempDir::new().unwrap();
     let env = open_env(&dir);
     let create_cfg =
         DatabaseConfig::new().with_allow_create(true).with_transactional(true);
 
-    let txn_a = env.begin_transaction(None).unwrap();
-    txn_a.commit().unwrap();
-
-    // FAITHFUL JE expectation: using a committed transaction to open/create a
-    // database must be rejected.  Fails on the current engine (open_database
-    // accepts the committed txn).
-    let r = env.open_database(Some(&txn_a), "foo", &create_cfg);
+    // A committed transaction must be rejected by open_database.
+    let txn_committed = env.begin_transaction(None).unwrap();
+    txn_committed.commit().unwrap();
+    let r = env.open_database(Some(&txn_committed), "foo", &create_cfg);
     assert!(
         r.is_err(),
         "NEW-TXN-1: open_database through a committed (closed) transaction \
-         must be rejected (JE TxnEndTest.testClose); engine currently accepts it"
+         must be rejected (JE TxnEndTest.testClose)"
+    );
+
+    // An aborted transaction must likewise be rejected.
+    let txn_aborted = env.begin_transaction(None).unwrap();
+    txn_aborted.abort().unwrap();
+    let r2 = env.open_database(Some(&txn_aborted), "bar", &create_cfg);
+    assert!(
+        r2.is_err(),
+        "NEW-TXN-1: open_database through an aborted transaction must be \
+         rejected"
     );
 }
 
+// NEW-TXN-1 regression guard: the txn-state check must NOT break the legitimate
+// cases -- an OPEN transaction opening a DB, and auto-commit (txn = None).
+#[test]
+fn txn_end_test_open_database_accepts_open_txn_and_auto_commit() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let create_cfg =
+        DatabaseConfig::new().with_allow_create(true).with_transactional(true);
+
+    // Auto-commit (txn = None) must still work.
+    let db_auto = env.open_database(None, "auto_db", &create_cfg);
+    assert!(
+        db_auto.is_ok(),
+        "auto-commit open_database must work: {:?}",
+        db_auto.err()
+    );
+    drop(db_auto);
+
+    // An OPEN transaction opening a (different) DB must succeed, then commit.
+    let txn_open = env.begin_transaction(None).unwrap();
+    let db_txn = env.open_database(Some(&txn_open), "txn_db", &create_cfg);
+    assert!(
+        db_txn.is_ok(),
+        "an Open transaction must be able to open/create a database: {:?}",
+        db_txn.err()
+    );
+    drop(db_txn);
+    txn_open.commit().unwrap();
+}

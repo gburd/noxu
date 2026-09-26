@@ -776,7 +776,6 @@ fn two_txns_shared_lock_manager_read_write_conflict() {
     assert_eq!(lm.n_total_locks(), 0, "lock table empty after both txns end");
 }
 
-
 // JE: DeadlockTest.testDeadlockIntersectionWithTwoCommonLocker -- two deadlock
 // cycles that intersect at TWO common lockers.  Graph-level topology (from the
 // JE ASCII diagram): four lockers acquire a set of locks and then each waits
@@ -877,8 +876,14 @@ fn deadlock_detected_before_long_timeout_elapses() {
     // victim aborts.
     let lm1 = Arc::clone(&lm);
     let h1 = thread::spawn(move || {
-        let r = lm1
-            .lock_with_timeout(l2, t1, LockType::Write, false, false, LONG_TIMEOUT_MS);
+        let r = lm1.lock_with_timeout(
+            l2,
+            t1,
+            LockType::Write,
+            false,
+            false,
+            LONG_TIMEOUT_MS,
+        );
         if r.is_err() {
             lm1.release_all_for_locker(t1);
         }
@@ -887,8 +892,14 @@ fn deadlock_detected_before_long_timeout_elapses() {
     thread::sleep(Duration::from_millis(30));
     let lm2 = Arc::clone(&lm);
     let h2 = thread::spawn(move || {
-        let r = lm2
-            .lock_with_timeout(l1, t2, LockType::Write, false, false, LONG_TIMEOUT_MS);
+        let r = lm2.lock_with_timeout(
+            l1,
+            t2,
+            LockType::Write,
+            false,
+            false,
+            LONG_TIMEOUT_MS,
+        );
         if r.is_err() {
             lm2.release_all_for_locker(t2);
         }
@@ -901,7 +912,10 @@ fn deadlock_detected_before_long_timeout_elapses() {
 
     let dl = matches!(&r1, Err(TxnError::Deadlock(_)))
         || matches!(&r2, Err(TxnError::Deadlock(_)));
-    assert!(dl, "a real cycle must surface a Deadlock, not a timeout: r1={r1:?} r2={r2:?}");
+    assert!(
+        dl,
+        "a real cycle must surface a Deadlock, not a timeout: r1={r1:?} r2={r2:?}"
+    );
     assert!(
         elapsed < Duration::from_millis(LONG_TIMEOUT_MS / 2),
         "deadlock must be detected promptly, well before the {LONG_TIMEOUT_MS}ms \
@@ -913,4 +927,3 @@ fn deadlock_detected_before_long_timeout_elapses() {
         lm.release_all_for_locker(t);
     }
 }
-

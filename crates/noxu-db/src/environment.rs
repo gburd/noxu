@@ -820,6 +820,26 @@ impl Environment {
             ));
         }
 
+        // NEW-TXN-1: reject a closed / non-open transaction, mirroring the
+        // data path.  JE rejects ANY operation on a closed Locker/Transaction
+        // (TxnEndTest.testClose: `env.openDatabase(closedTxn, ...)` throws).
+        // On the Noxu data path, `Txn::check_state` (crates/noxu-txn/src/txn.rs)
+        // returns `TxnError::InvalidTransaction` for every state except `Open`,
+        // which `put_in` / `get_into` surface as
+        // `NoxuError::TransactionAborted`.  `open_database` (a DDL entry point)
+        // previously skipped this check, silently accepting a committed/aborted
+        // txn.  Mirror `check_state` here: only an `Open` transaction may be
+        // used to open/create a database.
+        if let Some(t) = txn
+            && t.state() != crate::transaction::TransactionState::Open
+        {
+            return Err(NoxuError::TransactionAborted(format!(
+                "txn {}: {:?}",
+                t.id(),
+                t.state()
+            )));
+        }
+
         let mut databases = self.databases.lock();
 
         // Check if database is already open via this environment handle

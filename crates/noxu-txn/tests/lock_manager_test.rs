@@ -720,7 +720,6 @@ fn je_deadlock_intersection_one_common_locker() {
     }
 }
 
-
 // JE: LockManagerTest.testMultipleReadersSingleWrite2 -- two readers hold the
 // lock; a WRITE request (txn3) waits behind them; a FOURTH reader (txn4) that
 // arrives while txn3 is waiting must ALSO wait (a reader does not jump ahead of
@@ -742,9 +741,8 @@ fn je_multiple_readers_single_write_reader_behind_writer_waits() {
 
     // txn3 requests WRITE -> waits behind the two readers.
     let lm3 = Arc::clone(&lm);
-    let w = thread::spawn(move || {
-        lm3.lock(LSN, 3, LockType::Write, false, false)
-    });
+    let w =
+        thread::spawn(move || lm3.lock(LSN, 3, LockType::Write, false, false));
     // Let txn3 enqueue as a waiter.
     thread::sleep(Duration::from_millis(80));
 
@@ -773,12 +771,17 @@ fn je_multiple_readers_single_write_reader_behind_writer_waits() {
 
     // txn3 gets the write, then releases so txn4 can proceed.
     let r3 = w.join().unwrap();
-    assert!(r3.is_ok(), "writer txn3 must be granted after readers release: {r3:?}");
+    assert!(
+        r3.is_ok(),
+        "writer txn3 must be granted after readers release: {r3:?}"
+    );
     lm.release(LSN, 3).unwrap();
 
     // txn4 finally gets its read.
     let r4 = r.join().unwrap();
-    assert!(r4.is_ok(), "reader txn4 must be granted after the writer releases: {r4:?}");
+    assert!(
+        r4.is_ok(),
+        "reader txn4 must be granted after the writer releases: {r4:?}"
+    );
     lm.release(LSN, 4).ok();
 }
-
