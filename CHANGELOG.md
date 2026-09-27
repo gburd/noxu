@@ -198,6 +198,15 @@ listed in [References](#references).
   number of duplicates remaining under the current key. It now re-anchors by the
   current key (matching JE `Cursor.countHandleDups`) and counts the live
   duplicates. Found by a faithful port of JE's `DbCursorDuplicateDeleteTest`.
+- **Cursor `get_first`/`get_last` cross into the first/last non-empty node when
+  leading/trailing nodes are empty (NEW-REC-2).** Deleting all duplicates of a key
+  whose duplicate chain spans multiple nodes via a `get_first`+delete loop stopped
+  at the first node boundary (only the first node's duplicates were removed),
+  because the empty-node fall-through anchored on a synthetic key that mis-routed
+  under a sorted-duplicate comparator. `get_first`/`get_last` now re-descend to the
+  first/last non-empty node and position on its edge live slot (matching JE
+  `positionFirstOrLast`). Found by a faithful port of JE's
+  `CheckReverseSplitsTest.testCompleteRemovalDups`.
 
 - **WAL now fail-stops the environment on a critical log-write failure (JE
   `LogManager.serialLog` parity).** A failed or partial WAL write previously left
