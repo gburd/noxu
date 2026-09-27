@@ -224,8 +224,246 @@ impl VlsnBucket {
             }
         }
     }
-}
+    /// Trim this bucket's head so it no longer owns any VLSN `< new_first`.
+    ///
+    /// Adapted from JE `VLSNBucket.removeFromHead`. JE, having a persistent
+    /// per-file bucket layout, may spin a "remainder" bucket out of a broken
+    /// stride interval by scanning the log; the Noxu in-memory index keeps a
+    /// single expanding bucket per origin and lets the authoritative
+    /// `VlsnRange` gate the head, so here we simply advance `first_vlsn` to
+    /// `new_first` and rebuild the sparse offset array against the new origin.
+    /// The last vlsn/last lsn are preserved (they always remain `>=
+    /// new_first` because the caller only trims a straddling bucket, never one
+    /// wholly below `new_first`). The intermediate stride mappings that fall
+    /// at or after `new_first` are re-homed to the new stride grid; those
+    /// below `new_first` are dropped. A dropped stride mapping simply becomes
+    /// an LTE fall-back to `new_first`, matching the range gate.
+    ///
+    /// JE: VLSNBucket.removeFromHead (VLSNBucket.java:245-330), adapted.
+    pub fn remove_from_head(&mut self, new_first: u64) {
+        if new_first <= self.first_vlsn {
+            return;
+        }
+        if new_first > self.last_vlsn {
+            // Whole bucket is below the new head; collapse to empty at
+            // new_first (caller should have dropped it, but be safe).
+            self.first_vlsn = new_first;
+            self.last_vlsn = new_first;
+            self.offsets = vec![NO_OFFSET];
+            self.last_lsn = None;
+            return;
+        }
+        // Collect the surviving stride/last mappings, then rebuild against the
+        // new origin.
+        let mut survivors: Vec<(u64, (u32, u32))> = Vec::new();
+        for (i, slot) in self.offsets.iter().enumerate() {
+            if *slot != NO_OFFSET {
+                let vlsn =
+                    self.first_vlsn + (i as u64) * (self.stride as u64);
+                if vlsn >= new_first && vlsn <= self.last_vlsn {
+                    survivors.push((vlsn, *slot));
+                }
+            }
+        }
+        let last_vlsn = self.last_vlsn;
+        let last_lsn = self.last_lsn;
+        // Reset to a fresh bucket at new_first and replay the survivors.
+        self.first_vlsn = new_first;
+        self.last_vlsn = new_first;
+        self.offsets = vec![NO_OFFSET];
+        self.last_lsn = None;
+        for (vlsn, (fnum, off)) in survivors {
+            self.put(vlsn, fnum, off);
+        }
+        // Ensure the last vlsn/last lsn are re-established.
+        if let Some((fnum, off)) = last_lsn {
+            self.put(last_vlsn, fnum, off);
+        }
+    }
 
+    /// JE `VLSNBucket.getLsn(vlsn)`: return the LSN for an **exact** vlsn
+    /// match, or `None` if this bucket has no stored mapping for exactly
+    /// `vlsn`.
+    ///
+    /// Unlike [`Self::get_lsn`] (which is LTE — the nearest preceding
+    /// mapping), this is the strict/precise lookup used by
+    /// `ForwardVLSNScanner.getPreciseLsn`. It returns a value only when the
+    /// vlsn is the last vlsn or falls on a populated stride boundary; an
+    /// intermediate vlsn (or an out-of-order hole on a stride boundary)
+    /// returns `None`.
+    ///
+    /// JE: VLSNBucket.getLsn (VLSNBucket.java:566-596).
+    pub fn get_exact_lsn(&self, vlsn: u64) -> Option<(u32, u32)> {
+        debug_assert!(self.owns(vlsn), "get_exact_lsn on non-owned vlsn");
+        if vlsn == self.last_vlsn {
+            return self.last_lsn;
+        }
+        if !self.is_modulo(vlsn) {
+            return None;
+        }
+        let index = self.get_index(vlsn);
+        if index >= self.offsets.len() {
+            return None;
+        }
+        let offset = self.offsets[index];
+        if offset == NO_OFFSET {
+            return None;
+        }
+        Some(offset)
+    }
+
+    /// JE `VLSNBucket.getLTELsn(vlsn)`: the mapping whose vlsn is <= `vlsn`
+    /// (the nearest preceding populated mapping). Never returns `None` for a
+    /// vlsn this bucket owns, because the first offset is always populated.
+    ///
+    /// This is exactly the semantics of [`Self::get_lsn`]; provided under the
+    /// JE-faithful name so ported tests read naturally.
+    ///
+    /// JE: VLSNBucket.getLTELsn (VLSNBucket.java:614-650).
+    pub fn get_lte_lsn(&self, vlsn: u64) -> Option<(u32, u32)> {
+        self.get_lsn(vlsn)
+    }
+
+    /// JE `VLSNBucket.getGTELsn(vlsn)`: the mapping whose vlsn is >= `vlsn`
+    /// (the nearest following populated mapping). Never returns `None` for a
+    /// vlsn this bucket owns, because the last vlsn is always mapped.
+    ///
+    /// Mirrors the JE algorithm: compute the ceiling stride index
+    /// `ceil((vlsn - first_vlsn) / stride)`, clamp to `last_lsn` when the
+    /// index runs past the offsets array, then scan **forward** for the next
+    /// populated slot (accounting for out-of-order holes). A slot that is
+    /// still `NO_OFFSET` after the forward scan falls back to `last_lsn`.
+    ///
+    /// JE: VLSNBucket.getGTELsn / getGTEIndex / findPopulatedIndex
+    /// (VLSNBucket.java:391-471).
+    pub fn get_gte_lsn(&self, vlsn: u64) -> Option<(u32, u32)> {
+        if !self.owns(vlsn) {
+            return None;
+        }
+        if vlsn == self.last_vlsn {
+            return self.last_lsn;
+        }
+        // getGTEIndex: ceil division toward the next stride boundary. If
+        // vlsn <= first_vlsn (can happen for a vlsn that falls between two
+        // buckets), the index is 0.
+        let index = if vlsn <= self.first_vlsn {
+            0usize
+        } else {
+            let diff = vlsn - self.first_vlsn;
+            (((diff + (self.stride as u64 - 1)) / self.stride as u64)) as usize
+        };
+        if index >= self.offsets.len() {
+            return self.last_lsn;
+        }
+        // findPopulatedIndex forward.
+        let mut use_index = index;
+        while use_index < self.offsets.len() {
+            if self.offsets[use_index] != NO_OFFSET {
+                break;
+            }
+            use_index += 1;
+        }
+        if use_index >= self.offsets.len() || self.offsets[use_index] == NO_OFFSET
+        {
+            return self.last_lsn;
+        }
+        Some(self.offsets[use_index])
+    }
+
+    /// JE `VLSNBucket.getLastLsn()`: the LSN of the last (highest) vlsn.
+    pub fn get_last_lsn(&self) -> Option<(u32, u32)> {
+        self.last_lsn
+    }
+
+    /// JE `VLSNBucket.removeFromTail(startOfDelete, prevLsn)`: remove all
+    /// mappings for vlsns `>= start_of_delete` from this bucket.
+    ///
+    /// `prev_lsn` is the LSN of `start_of_delete - 1` (i.e. the new last
+    /// mapping's LSN). If `prev_lsn` is `None` (JE's `NULL_LSN`), we don't
+    /// have a value to cap the bucket, so the bucket is cut back to the
+    /// largest known populated stride mapping (which may drop mappings
+    /// between the last stride offset and the old last vlsn).
+    ///
+    /// Mirrors the JE algorithm exactly (including the two
+    /// "between last stride and last vlsn" cases and the out-of-order-hole
+    /// handling via findPopulatedIndex).
+    ///
+    /// JE: VLSNBucket.removeFromTail (VLSNBucket.java:735-833).
+    pub fn remove_from_tail(&mut self, start_of_delete: u64, prev_lsn: Option<(u32, u32)>) {
+        if self.is_empty() {
+            return;
+        }
+        // Nothing to delete: the whole bucket precedes the delete point.
+        if self.last_vlsn < start_of_delete {
+            return;
+        }
+        // Delete all mappings.
+        if self.first_vlsn >= start_of_delete {
+            self.last_vlsn = self.first_vlsn;
+            self.last_lsn = None;
+            self.offsets.clear();
+            return;
+        }
+
+        // getGTEIndex(start_of_delete).
+        let diff = start_of_delete - self.first_vlsn;
+        let mut delete_index =
+            (((diff + (self.stride as u64 - 1)) / self.stride as u64)) as usize;
+        debug_assert!(delete_index > 0, "delete_index must be > 0");
+
+        if delete_index < self.offsets.len() {
+            // start_of_delete is between first_vlsn and the last file offset.
+            if prev_lsn.is_none() {
+                let last_populated =
+                    self.find_populated_index_back(delete_index - 1);
+                if last_populated != delete_index - 1 {
+                    delete_index = last_populated + 1;
+                }
+            }
+            self.offsets.truncate(delete_index);
+        } else {
+            // start_of_delete is between the last file offset and last vlsn.
+            if prev_lsn.is_none() {
+                let last_index = self.offsets.len() - 1;
+                let last_populated = self.find_populated_index_back(last_index);
+                if last_populated < last_index {
+                    self.offsets.truncate(last_populated + 1);
+                }
+            }
+        }
+
+        // Set the new last vlsn -> last lsn mapping.
+        match prev_lsn {
+            None => {
+                self.last_vlsn = ((self.offsets.len() - 1) as u64)
+                    * (self.stride as u64)
+                    + self.first_vlsn;
+                let last_offset = self.offsets[self.offsets.len() - 1];
+                debug_assert!(last_offset != NO_OFFSET);
+                self.last_lsn = Some(last_offset);
+            }
+            Some(prev) => {
+                self.last_vlsn = start_of_delete - 1;
+                self.last_lsn = Some(prev);
+            }
+        }
+    }
+
+    /// JE `VLSNBucket.findPopulatedIndex(startIndex, forward=false)`: scan
+    /// backward from `start_index` for the first populated offset; if none is
+    /// found, return `start_index` unchanged.
+    fn find_populated_index_back(&self, start_index: usize) -> usize {
+        let mut i = start_index as isize;
+        while i >= 0 {
+            if self.offsets[i as usize] != NO_OFFSET {
+                return i as usize;
+            }
+            i -= 1;
+        }
+        start_index
+    }
+
+}
 impl std::fmt::Display for VlsnBucket {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(

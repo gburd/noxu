@@ -206,6 +206,67 @@ impl VlsnIndex {
         range.truncate_after(vlsn);
     }
 
+
+    /// Truncate all entries at or before the given VLSN (head truncation).
+    ///
+    /// Removes every mapping for VLSNs `<= delete_end`; the new range first
+    /// VLSN becomes `delete_end + 1`. This is the log-cleaner / head-of-range
+    /// operation: JE calls it after cleaning has advanced past `delete_end`
+    /// so the corresponding log files can be deleted.
+    ///
+    /// Returns `false` (no change) if `delete_end` is already below the range
+    /// first (it was cast out earlier) or the range is empty. Like JE, a
+    /// head-truncate must never remove the last sync point (matchpoint): if a
+    /// `lastSync` (`sync_vlsn`) is set and `delete_end > sync_vlsn`, the call
+    /// is refused with `false` rather than corrupting the matchpoint the
+    /// syncup protocol depends on. (JE throws `EnvironmentFailureException`;
+    /// the Rust engine reports the refusal to the caller instead of
+    /// panicking — a language/API deviation, same semantics.)
+    ///
+    /// JE: VLSNIndex.truncateFromHead / VLSNTracker.truncateFromHead /
+    /// VLSNRange.shortenFromHead
+    /// (VLSNIndex.java:700-727, VLSNTracker.java:565-640,
+    /// VLSNRange.java:241-260).
+    pub fn truncate_from_head(&self, delete_end: u64) -> bool {
+        if delete_end == 0 {
+            return false;
+        }
+        let mut buckets = self.buckets.write();
+        let mut range = self.range.write();
+
+        if range.is_empty() {
+            return false;
+        }
+        if delete_end < range.get_first() {
+            // Already cast out of the index; no change.
+            return false;
+        }
+        // Never log-clean away the last matchpoint (JE refuses this).
+        let sync = range.get_sync_vlsn();
+        if sync != 0 && delete_end > sync {
+            return false;
+        }
+
+        let new_range = range.shorten_from_head(delete_end);
+        *range = new_range;
+
+        if range.is_empty() {
+            buckets.clear();
+            return true;
+        }
+
+        let new_first = range.get_first();
+        // Drop buckets entirely covered by the delete (last_vlsn < new_first).
+        buckets.retain(|b| b.get_last_vlsn() >= new_first);
+        // Head-trim the boundary bucket if it straddles the delete point.
+        if let Some(first_bucket) = buckets.first_mut() {
+            if first_bucket.get_first_vlsn() < new_first {
+                first_bucket.remove_from_head(new_first);
+            }
+        }
+        true
+    }
+
     /// Return the number of buckets in the index.
     pub fn bucket_count(&self) -> usize {
         self.buckets.read().len()
