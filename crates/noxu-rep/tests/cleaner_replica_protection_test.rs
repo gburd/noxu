@@ -106,6 +106,14 @@ fn master_with_two_replicas(
 /// PRIMARY TEST: with a lagging replica, the file containing the CBVLSN and
 /// every later file must be protected from the cleaner, while files fully
 /// below the CBVLSN are cleanable.
+///
+/// JE: `CBVLSNTest.testBasic` / `CBVLSNTest.testSmallFiles` (the group/local
+/// CBVLSN gates log reclamation so a lagging replica's files are retained) and
+/// `MinRetainedVLSNsTest.testNoneRetained` (with no artificial retention
+/// floor, the protected range is exactly `>= CBVLSN`). JE's CBVLSNTest is
+/// maintained only for legacy global-CBVLSN groups (defunct as of JE 7.5);
+/// Noxu implements the *modern* per-node CBVLSN + `FileProtector` floor, which
+/// is the mechanism CBVLSNTest verifies at the group level.
 #[test]
 fn cbvlsn_protects_lagging_replica_files_from_cleaner() {
     let (env, protector) = master_with_two_replicas("b6_protect");
@@ -149,6 +157,13 @@ fn cbvlsn_protects_lagging_replica_files_from_cleaner() {
 
 /// As the lagging replica catches up, the CBVLSN advances and the
 /// previously-protected older files become cleanable (protection released).
+///
+/// JE: `CBVLSNTest.testBasic` (the group CBVLSN advances as replicas report
+/// higher local CBVLSNs) and `MinRetainedVLSNsTest.testRetained` — with
+/// `MIN_RETAINED_VLSNS = 0` (Noxu's only, default behavior) the retained set
+/// is exactly `last - CBVLSN`, so `retainedVLSNs >= 0` always holds and the
+/// floor tracks the CBVLSN exactly. (Noxu does not implement the JE
+/// `MIN_RETAINED_VLSNS` tunable — see the N/A note in the package report.)
 #[test]
 fn protection_is_released_as_replica_catches_up() {
     let (env, protector) = master_with_two_replicas("b6_release");
@@ -270,6 +285,10 @@ fn master_with_two_replicas_short_timeout(
     (env, protector)
 }
 
+/// JE: `CBVLSNTest.testDbUpdateSuppression` (a member that stops publishing
+/// its local CBVLSN to the group must not pin the barrier) and the
+/// `LocalCBVLSNUpdater` / `FEEDER_TIMEOUT` expiry.
+///
 /// EXPIRY TEST: a disconnected (silent) electable member must stop holding the
 /// cleaner floor down after `cbvlsn_timeout`, so its stale files become
 /// cleanable — a dead member does NOT pin the log forever.

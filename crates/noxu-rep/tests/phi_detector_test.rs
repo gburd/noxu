@@ -122,6 +122,14 @@ fn test_suspected_above_threshold() {
 // MasterTracker + phi integration
 // ---------------------------------------------------------------------------
 
+/// JE: `ReplicaTimeoutTest.testReplicaHeartbeatTimeout` — a replica that
+/// stops seeing the master's heartbeats within `REPLICA_TIMEOUT` suspects
+/// the master and transitions to the Unknown state to hold an election.
+/// This test pins the failure-detection primitive behind that behavior:
+/// after extended heartbeat silence the `MasterTracker` reports the master
+/// as no longer alive (phi crosses threshold), which is what drives the
+/// replica out of the Replica state in the full node. The Unknown->active
+/// re-election half is covered by `cluster_integration_test`.
 #[test]
 fn test_master_tracker_phi_mode() {
     let det = PhiAccrualDetector::new(1.0, 50);

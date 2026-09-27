@@ -605,6 +605,13 @@ mod tests {
         assert_eq!(e.get_state(), ElectionState::Complete);
     }
 
+    /// JE: `PrimaryNodeTest.testElectionsActivate` (self-elect subset) — a
+    /// designated primary in a 2-node group can conclude an election with
+    /// only its own vote (quorum of 1) when its peer is unavailable. Noxu
+    /// models the designated-primary behavior as an election-quorum-of-1;
+    /// JE's separate `getArbiter().isActive()` active-primary state machine
+    /// (activate-on-txn / passivate-on-new-node) is not implemented — see the
+    /// N/A note for the rest of PrimaryNodeTest in the package report.
     #[test]
     fn test_designated_primary_self_election() {
         // In a 2-node group with designated_primary, the primary can

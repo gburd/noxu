@@ -117,6 +117,17 @@ fn f6_two_node_cluster_resolves_via_election_driver() {
     let _ = env_a.close();
 }
 
+/// JE: `MasterBounceTest.testBounce` (root invariant): a node coming up in a
+/// group does not silently resume as master — it must go through an
+/// election. JE asserts an election is *held* on a master bounce even when
+/// the peers still agree (because a bounced master may have lost
+/// transactions). Noxu enforces the same invariant structurally: `new()`
+/// leaves the node Detached (no auto-master), and only `open()` /
+/// `start_election_driver` drives it to a role via an election
+/// (`f6_two_node_cluster_resolves_via_election_driver`). A per-node
+/// election-count accessor (JE `getElections().getElectionCount()`) is not
+/// surfaced; the invariant that matters — no auto-resume-as-master — is
+/// pinned here.
 /// `ReplicatedEnvironment::new` (without `open`) must NOT spawn the
 /// driver \u2014 it preserves the explicit-control entry point used by
 /// existing tests and recovery tooling.

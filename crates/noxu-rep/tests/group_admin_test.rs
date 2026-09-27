@@ -30,6 +30,12 @@ fn admin_env(
     env
 }
 
+/// JE: `MasterTransferTest.testBasic` (idle-master transfer): in a group,
+/// `transferMaster` to a caught-up replica demotes the old master to a replica
+/// and promotes the target to master. Here the master is idle (VLSN 0) so the
+/// catch-up wait is skipped, matching JE's `testBasic` where the master is
+/// idle at the time of transfer. The lagging/caught-up catch-up gate is pinned
+/// separately by `transfer_master_catchup_test`.
 #[test]
 fn transfer_master_demotes_old_and_promotes_new() {
     let dir1 = TempDir::new().unwrap();
@@ -104,6 +110,11 @@ fn transfer_master_demotes_old_and_promotes_new() {
     Arc::clone(&target_env).close().unwrap();
 }
 
+/// JE: `MasterTransferTest.testStupidCodingMistakes` (bogus-replica-name
+/// subset) / `MasterTransferTest.testRemoteInvocation` (unknown-target
+/// failure): a transfer to a node that is not a group member is rejected.
+/// See also `je_rep_impl_node_tck::transfer_master_argument_validation` for
+/// the full validation matrix (empty / secondary / monitor / self / on-replica).
 #[test]
 fn transfer_master_rejects_unknown_target() {
     let dir = TempDir::new().unwrap();
@@ -117,6 +128,12 @@ fn transfer_master_rejects_unknown_target() {
     Arc::clone(&env).close().unwrap();
 }
 
+/// JE: `GroupShutdownTest.testShutdownBasic` / `testShutdownTimeout`: the
+/// master's `shutdownGroup(timeout)` signals every replica to close (JE
+/// replicas then observe a `GroupShutdownException`) and the master closes
+/// itself. Noxu's `shutdown_group` additionally waits (M-4) for active feeder
+/// replicas to ack the master's VLSN before signalling — the JE catch-up half
+/// of `testShutdownBasic`.
 #[test]
 fn shutdown_group_closes_master_and_signals_replicas() {
     let dir1 = TempDir::new().unwrap();
@@ -160,6 +177,9 @@ fn shutdown_group_closes_master_and_signals_replicas() {
     );
 }
 
+/// JE: `GroupShutdownTest.testShutdownExceptions` (shutdownGroup-on-replica
+/// subset): invoking `shutdownGroup` on a replica throws
+/// `IllegalStateException`; Noxu returns `Err`.
 #[test]
 fn shutdown_group_only_runs_on_master() {
     let dir = TempDir::new().unwrap();
