@@ -23,7 +23,9 @@
 //! `run_election_with_phi_dtvlsn`, so those cases are asserted here in full.
 
 use noxu_rep::elections::Proposal;
-use noxu_rep::elections::paxos::{choose_phase2_value, Phase2Value, PromiseRecord};
+use noxu_rep::elections::paxos::{
+    Phase2Value, PromiseRecord, choose_phase2_value,
+};
 
 const NODE_NAME: &str = "node1";
 
@@ -63,9 +65,18 @@ fn choose(promises: &[PromiseRecord]) -> Option<String> {
 // --------------------------------------------------------------------------
 #[test]
 fn test_phase2_two_nodes() {
-    assert_eq!(choose(&[node_promise(100), node_promise(100)]).as_deref(), Some(NODE_NAME));
-    assert_eq!(choose(&[node_promise(100), node_promise(200)]).as_deref(), Some(NODE_NAME));
-    assert_eq!(choose(&[node_promise(200), node_promise(100)]).as_deref(), Some(NODE_NAME));
+    assert_eq!(
+        choose(&[node_promise(100), node_promise(100)]).as_deref(),
+        Some(NODE_NAME)
+    );
+    assert_eq!(
+        choose(&[node_promise(100), node_promise(200)]).as_deref(),
+        Some(NODE_NAME)
+    );
+    assert_eq!(
+        choose(&[node_promise(200), node_promise(100)]).as_deref(),
+        Some(NODE_NAME)
+    );
 }
 
 // --------------------------------------------------------------------------
@@ -74,11 +85,13 @@ fn test_phase2_two_nodes() {
 #[test]
 fn test_phase2_three_nodes() {
     assert_eq!(
-        choose(&[node_promise(100), node_promise(100), node_promise(100)]).as_deref(),
+        choose(&[node_promise(100), node_promise(100), node_promise(100)])
+            .as_deref(),
         Some(NODE_NAME)
     );
     assert_eq!(
-        choose(&[node_promise(100), node_promise(200), node_promise(300)]).as_deref(),
+        choose(&[node_promise(100), node_promise(200), node_promise(300)])
+            .as_deref(),
         Some(NODE_NAME)
     );
 }
@@ -91,17 +104,29 @@ fn test_phase2_three_nodes() {
 #[test]
 fn test_phase2_arb_one_node() {
     // (NODE,100)+(arb,100) -> NODE
-    assert_eq!(choose(&[node_promise(100), arb_promise(100)]).as_deref(), Some(NODE_NAME));
+    assert_eq!(
+        choose(&[node_promise(100), arb_promise(100)]).as_deref(),
+        Some(NODE_NAME)
+    );
     // (arb,100)+(NODE,100) -> NODE (order independence)
-    assert_eq!(choose(&[arb_promise(100), node_promise(100)]).as_deref(), Some(NODE_NAME));
+    assert_eq!(
+        choose(&[arb_promise(100), node_promise(100)]).as_deref(),
+        Some(NODE_NAME)
+    );
     // (NODE,100)+(arb,200) -> null: arbiter remembers MORE than the sole node.
     assert_eq!(choose(&[node_promise(100), arb_promise(200)]), None);
     // (arb,200)+(NODE,100) -> null (order independence)
     assert_eq!(choose(&[arb_promise(200), node_promise(100)]), None);
     // (NODE,200)+(arb,100) -> NODE (node ahead of arbiter)
-    assert_eq!(choose(&[node_promise(200), arb_promise(100)]).as_deref(), Some(NODE_NAME));
+    assert_eq!(
+        choose(&[node_promise(200), arb_promise(100)]).as_deref(),
+        Some(NODE_NAME)
+    );
     // (arb,100)+(NODE,200) -> NODE
-    assert_eq!(choose(&[arb_promise(100), node_promise(200)]).as_deref(), Some(NODE_NAME));
+    assert_eq!(
+        choose(&[arb_promise(100), node_promise(200)]).as_deref(),
+        Some(NODE_NAME)
+    );
 }
 
 // --------------------------------------------------------------------------
@@ -145,8 +170,13 @@ fn test_phase2_arb_two_nodes() {
 #[test]
 fn test_phase2_two_arbs() {
     assert_eq!(
-        choose(&[node_promise(100), arb_promise(300), arb_promise(400), node_promise(200)])
-            .as_deref(),
+        choose(&[
+            node_promise(100),
+            arb_promise(300),
+            arb_promise(400),
+            node_promise(200)
+        ])
+        .as_deref(),
         Some(NODE_NAME),
         "both arbiters ignored even at the highest DTVLSN when >=2 non-arbs"
     );

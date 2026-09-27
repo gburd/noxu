@@ -362,7 +362,9 @@ pub fn run_election_with_phi_dtvlsn(
                     // is the RF=2 tie-breaker whose ranking must be seen.
                     let peer_is_arbiter = peer_node
                         .as_ref()
-                        .map(|n| n.node_type().is_electable() && !n.can_be_master())
+                        .map(|n| {
+                            n.node_type().is_electable() && !n.can_be_master()
+                        })
                         .unwrap_or(false);
                     let peer_p = Proposal::new(
                         peer_name,

@@ -22,12 +22,12 @@ use std::sync::Arc;
 use noxu_rep::elections::paxos::{
     run_acceptor, run_election, run_election_with_phi_dtvlsn,
 };
-use noxu_rep::protocol::ProtocolMessage;
-use std::time::Duration;
 use noxu_rep::net::{Channel, LocalChannelPair};
 use noxu_rep::node_type::NodeType;
+use noxu_rep::protocol::ProtocolMessage;
 use noxu_rep::rep_group::RepGroup;
 use noxu_rep::rep_node::RepNode;
+use std::time::Duration;
 
 fn make_group() -> RepGroup {
     let mut g = RepGroup::new("testgroup".into(), 1);
@@ -140,7 +140,6 @@ fn f22_unknown_node_refuses_to_propose() {
         "unknown proposer must not run an election (F22 closed-world)"
     );
 }
-
 
 /// RF=2 [#25311] arbiter veto (end-to-end through `run_election`).
 ///

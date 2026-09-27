@@ -6,15 +6,15 @@
 //! Paxos Promise stays valid until the election concludes. The four JE
 //! `@Test` methods pin the *sequential* API contract the latch must honour:
 //!
-//!   - `testTimeout`   — freeze(p2); an OLDER event (p1) does NOT release the
-//!                       waiter; `awaitThaw()` times out -> false,
-//!                       `awaitTimeoutCount == 1`.
-//!   - `testElection`  — freeze(p2); the SAME-round event (p2) releases the
-//!                       waiter; `awaitThaw()` -> true, `awaitElectionCount == 1`.
-//!   - `testNewerElection` — freeze(p2); a NEWER event (p3) releases the
-//!                       waiter; `awaitThaw()` -> true, `awaitElectionCount == 1`.
-//!   - `testNoFreeze`  — no freeze in effect; `vlsnEvent(p1)` is a no-op;
-//!                       `awaitThaw()` -> false, `awaitTimeoutCount == 0`.
+//! - `testTimeout`   — freeze(p2); an OLDER event (p1) does NOT release the
+//!   waiter; `awaitThaw()` times out -> false,
+//!   `awaitTimeoutCount == 1`.
+//! - `testElection`  — freeze(p2); the SAME-round event (p2) releases the
+//!   waiter; `awaitThaw()` -> true, `awaitElectionCount == 1`.
+//! - `testNewerElection` — freeze(p2); a NEWER event (p3) releases the
+//!   waiter; `awaitThaw()` -> true, `awaitElectionCount == 1`.
+//! - `testNoFreeze`  — no freeze in effect; `vlsnEvent(p1)` is a no-op;
+//!   `awaitThaw()` -> false, `awaitTimeoutCount == 0`.
 //!
 //! JE uses `TimebasedProposalGenerator` to make three sequential proposals
 //! p1 < p2 < p3. Noxu's `round_proposal(term)` is monotone in `term`
@@ -28,7 +28,9 @@
 //! thread waits must still be observed as an election-driven thaw
 //! (`awaitThaw() == true`, election count incremented), not silently lost.
 
-use noxu_rep::elections::commit_freeze_latch::{CommitFreezeLatch, round_proposal};
+use noxu_rep::elections::commit_freeze_latch::{
+    CommitFreezeLatch, round_proposal,
+};
 use std::time::Duration;
 
 /// The three sequential proposals p1 < p2 < p3 (JE

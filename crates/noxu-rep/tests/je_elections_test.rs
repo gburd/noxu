@@ -33,6 +33,10 @@ use noxu_rep::node_type::NodeType;
 use noxu_rep::rep_group::RepGroup;
 use noxu_rep::rep_node::RepNode;
 
+/// A set of proposer-side channels plus the acceptor threads answering them.
+type Peers =
+    (Vec<Arc<dyn Channel>>, Vec<std::thread::JoinHandle<Option<String>>>);
+
 /// Build an electable `n`-node group (node1..nodeN) with the given quorum
 /// policy. Priorities are all 1 unless overridden by the caller via
 /// `set_priority`.
@@ -53,9 +57,8 @@ fn group_n(n: u32, policy: QuorumPolicy) -> RepGroup {
 /// Spawn `count` acceptor threads, each on the B side of a fresh channel pair.
 /// The returned proposer-side channels are what `run_election` broadcasts to.
 /// Each acceptor reports `(vlsn, priority)` as its own suggestion.
-fn spawn_peers(
-    specs: &[(&str, u64, u32)], // (name, vlsn, priority)
-) -> (Vec<Arc<dyn Channel>>, Vec<std::thread::JoinHandle<Option<String>>>) {
+fn spawn_peers(specs: &[(&str, u64, u32)], // (name, vlsn, priority)
+) -> Peers {
     let mut chans: Vec<Arc<dyn Channel>> = Vec::new();
     let mut handles = Vec::new();
     for (name, vlsn, prio) in specs {
