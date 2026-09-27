@@ -185,6 +185,13 @@ fn d9_overwrite_changing_sec_key_removes_old_entry() {
 // When the primary is deleted but the secondary still has an orphaned entry,
 // a dirty-read cursor should return NotFound (skip), not raise
 // SecondaryIntegrityException.
+//
+// JE: SecondaryDirtyReadTest (runReadUncommittedScan / runReadUncommittedByKey
+// + runPrimaryDelete): a READ_UNCOMMITTED secondary read whose primary was
+// concurrently deleted skips the orphaned entry rather than raising an
+// integrity error.  This ports the deterministic single-thread skip; the
+// concurrent two-thread JUnitMethodThread harness is N/A test-infra (its
+// safety property is this skip + isolation_test.rs).
 #[test]
 fn d8_dirty_read_missing_primary_skips_record() {
     let dir = TempDir::new().unwrap();

@@ -971,6 +971,12 @@ fn test_200_thread_disjoint_writers() {
 /// (not RangeRead), leaving no conflict with RangeInsert.
 #[test]
 fn test_serializable_prevents_phantom_insert() {
+    // JE: PhantomTest (the getSearchKeyRange / getNext family, e.g.
+    // testGetSearchKeyRange_Success, testGetNext_Success): a SERIALIZABLE
+    // scanner's next-key/range lock blocks a phantom insert into the scanned
+    // gap.  PhantomTest's 51-method matrix asserts this for every read op via
+    // a two-thread startInsert harness; this is the deterministic no_wait
+    // form of the same range-lock rule.
     let dir = TempDir::new().unwrap();
     let env = noxu_db::Environment::open(
         EnvironmentConfig::new(dir.path().to_path_buf())
@@ -1065,6 +1071,9 @@ fn test_serializable_prevents_phantom_insert() {
 /// the range-locking machinery does NOT interfere with non-serializable txns.
 #[test]
 fn test_default_isolation_allows_phantom_insert() {
+    // JE: PhantomTest non-serializable branch (each testX has an
+    // `if (txnSerializable)` else-branch that expects the phantom to be
+    // visible): a non-serializable reader does NOT block phantom inserts.
     let dir = TempDir::new().unwrap();
     let env = noxu_db::Environment::open(
         EnvironmentConfig::new(dir.path().to_path_buf())
