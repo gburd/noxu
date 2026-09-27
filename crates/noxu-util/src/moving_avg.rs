@@ -55,7 +55,9 @@ impl DoubleExpMovingAvg {
         } else {
             // Exponential moving average.  See the Wikipedia "Application to
             // measuring computer performance" section referenced by JE.
-            let m = (-((time - self.prev_time) as f64) / (self.period_millis as f64)).exp();
+            let m = (-((time - self.prev_time) as f64)
+                / (self.period_millis as f64))
+                .exp();
             self.avg = ((1.0 - m) * value) + (m * self.avg);
         }
         self.prev_time = time;
@@ -163,7 +165,11 @@ impl LongAvgRate {
 
     /// Creates an instance averaging over `period_millis` and reporting in
     /// `report_time_unit`.
-    pub fn new(name: impl Into<String>, period_millis: i64, report_time_unit: TimeUnit) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        period_millis: i64,
+        report_time_unit: TimeUnit,
+    ) -> Self {
         LongAvgRate {
             avg: DoubleExpMovingAvg::new(name, period_millis),
             report_time_unit,
@@ -186,7 +192,10 @@ impl LongAvgRate {
             if delta_time < Self::MIN_PERIOD {
                 return;
             }
-            self.avg.add((value - self.prev_value) as f64 / delta_time as f64, time);
+            self.avg.add(
+                (value - self.prev_value) as f64 / delta_time as f64,
+                time,
+            );
         }
         self.prev_value = value;
         self.prev_time = time;
@@ -247,11 +256,7 @@ impl LongAvgRate {
             return "unknown".to_string();
         }
         let val = self.get();
-        if use_commas {
-            format_grouped_i64(val)
-        } else {
-            val.to_string()
-        }
+        if use_commas { format_grouped_i64(val) } else { val.to_string() }
     }
 
     /// True until enough values have been added to compute an average.
@@ -342,16 +347,12 @@ fn format_grouped_i64(v: i64) -> String {
     let mut out = String::new();
     let len = bytes.len();
     for (i, b) in bytes.iter().enumerate() {
-        if i > 0 && (len - i) % 3 == 0 {
+        if i > 0 && (len - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(*b as char);
     }
-    if neg {
-        format!("-{out}")
-    } else {
-        out
-    }
+    if neg { format!("-{out}") } else { out }
 }
 
 /// Formats a double with thousands separators on the integer part and no
@@ -367,7 +368,11 @@ fn format_grouped_f64(v: f64) -> String {
     } else {
         let int_part = rounded.trunc() as i64;
         let frac = ((rounded.abs().fract()) * 100.0).round() as i64;
-        let frac_str = if frac % 10 == 0 { format!("{}", frac / 10) } else { format!("{frac:02}") };
+        let frac_str = if frac % 10 == 0 {
+            format!("{}", frac / 10)
+        } else {
+            format!("{frac:02}")
+        };
         format!("{}.{}", format_grouped_i64(int_part), frac_str)
     }
 }

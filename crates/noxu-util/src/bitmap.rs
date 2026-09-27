@@ -42,7 +42,10 @@ impl BitMap {
         let segment_id = index >> SEGMENT_SIZE;
         let word = (index & SEGMENT_MASK) as usize / WORD_BITS;
         let bit = (index & SEGMENT_MASK) as usize % WORD_BITS;
-        let seg = self.bit_segments.entry(segment_id).or_insert_with(|| Box::new([0u64; WORDS_PER_SEGMENT]));
+        let seg = self
+            .bit_segments
+            .entry(segment_id)
+            .or_insert_with(|| Box::new([0u64; WORDS_PER_SEGMENT]));
         seg[word] |= 1u64 << bit;
     }
 
@@ -71,7 +74,12 @@ impl BitMap {
 
     /// Returns the total number of set bits.
     pub fn cardinality(&self) -> usize {
-        self.bit_segments.values().map(|seg| seg.iter().map(|w| w.count_ones() as usize).sum::<usize>()).sum()
+        self.bit_segments
+            .values()
+            .map(|seg| {
+                seg.iter().map(|w| w.count_ones() as usize).sum::<usize>()
+            })
+            .sum()
     }
 }
 
