@@ -17,6 +17,9 @@ listed in [References](#references).
 ## [Unreleased]
 
 ### Added
+- `CommitToken::try_compare` orders two commit tokens by VLSN when they share a
+  replication group, returning `None` for tokens from different groups (matching JE
+  `CommitToken.compareTo`).
 - `noxu-util` gains faithful reference ports of JE's stat primitives
   (`DoubleExpMovingAvg`, `LongAvgRate`, `AtomicLongComponent`, `BitMap`,
   `LongDiffStat`) with JE's exact test vectors. These are reference ports for
