@@ -126,6 +126,7 @@ fn my_entity(pri_key: i32, sec_key: Option<i32>) -> MyEntity {
 // ---------------------------------------------------------------------------
 
 /// EntityStore open/close round-trip — mirrors `testReadOnly` part 1.
+// JE: com.sleepycat.persist.test.OperationTest.testReadOnly (store open/close half)
 #[test]
 fn test_entity_store_open_close() {
     let td = TempDir::new().unwrap();
@@ -141,6 +142,7 @@ fn test_entity_store_open_close() {
 
 /// Closing a store a second time must return an error.
 /// Mirrors behavior: calling `EntityStore.close()` twice throws.
+// JE: com.sleepycat.persist.test.OperationTest (EntityStore.close idempotency; JE throws on double close)
 #[test]
 fn test_close_twice_returns_error() {
     let td = TempDir::new().unwrap();
@@ -156,6 +158,7 @@ fn test_close_twice_returns_error() {
 /// `put()` stores an entity, `get()` retrieves it with matching fields.
 /// Mirrors `OperationTest.testCursorUpdate` (put/get assertions) and the
 /// general entity-store CRUD contract verified throughout OperationTest.
+// JE: com.sleepycat.persist.test.IndexTest.testPrimary (put/get); OperationTest.testCursorUpdate
 #[test]
 fn test_put_get() {
     let td = TempDir::new().unwrap();
@@ -178,6 +181,7 @@ fn test_put_get() {
 
 /// `put()` with the same primary key replaces the existing entity.
 /// Mirrors OperationTest entity-store update contract.
+// JE: com.sleepycat.persist.test.IndexTest.testPrimary (put overwrite)
 #[test]
 fn test_put_replaces_existing() {
     let td = TempDir::new().unwrap();
@@ -203,6 +207,7 @@ fn test_put_replaces_existing() {
 
 /// `delete()` removes an entity; subsequent `get()` returns `None`.
 /// Mirrors `OperationTest.testCursorDelete` primary delete assertions.
+// JE: com.sleepycat.persist.test.OperationTest.testCursorDelete (primary delete)
 #[test]
 fn test_delete_then_get_returns_none() {
     let td = TempDir::new().unwrap();
@@ -223,6 +228,7 @@ fn test_delete_then_get_returns_none() {
 }
 
 /// Deleting a non-existent key returns `false`.
+// JE: com.sleepycat.persist.test.IndexTest.testPrimary (delete missing key)
 #[test]
 fn test_delete_missing_key_returns_false() {
     let td = TempDir::new().unwrap();
@@ -240,6 +246,7 @@ fn test_delete_missing_key_returns_false() {
 /// `count()` reflects inserts and deletes.
 /// Mirrors `OperationTest.testAutoOpenRelatedEntity` (priY.count() == 1 after
 /// insert, == 0 after delete) and `IndexTest` expandValueSize checks.
+// JE: com.sleepycat.persist.test.IndexTest.testPrimary (checkIndex count) / OperationTest.testAutoOpenRelatedEntity
 #[test]
 fn test_count_reflects_inserts_and_deletes() {
     let td = TempDir::new().unwrap();
@@ -268,6 +275,7 @@ fn test_count_reflects_inserts_and_deletes() {
 
 /// `put_no_overwrite()` returns `true` on new insert, `false` on collision.
 /// Mirrors `OperationTest.testSharedSequence` putNoOverwrite assertions.
+// JE: com.sleepycat.persist.test.IndexTest.testPrimary (putNoOverwrite); OperationTest.testSharedSequence
 #[test]
 fn test_put_no_overwrite() {
     let td = TempDir::new().unwrap();
@@ -290,6 +298,7 @@ fn test_put_no_overwrite() {
 }
 
 /// `contains()` returns true only after insertion.
+// JE: com.sleepycat.persist.test.IndexTest.checkIndex (contains)
 #[test]
 fn test_contains() {
     let td = TempDir::new().unwrap();
@@ -310,6 +319,7 @@ fn test_contains() {
 
 /// Operations on a closed store return an error.
 /// Raised on closed-store access.
+// JE: com.sleepycat.persist.test.NegativeTest.testSetConfigAfterOpen (closed-store access rejected; JE rejects via IllegalStateException)
 #[test]
 fn test_get_primary_index_on_closed_store_fails() {
     let td = TempDir::new().unwrap();
@@ -360,6 +370,7 @@ impl EntitySerializer<OtherEntity> for OtherEntitySerializer {
     }
 }
 
+// JE: com.sleepycat.persist.test.OperationTest.testKeyName (two entity types in one store)
 #[test]
 fn test_two_entity_types_in_same_store() {
     let td = TempDir::new().unwrap();
@@ -411,6 +422,7 @@ fn test_two_entity_types_in_same_store() {
 /// Insert N entities with keys 0..N and verify iteration yields them in
 /// sorted primary-key order.
 /// Mirrors `IndexTest.testPrimary` addEntities + checkIndex loop.
+// JE: com.sleepycat.persist.test.IndexTest.testPrimary (addEntities + checkIndex order)
 #[test]
 fn test_primary_iteration_in_key_order() {
     let td = TempDir::new().unwrap();
@@ -441,6 +453,7 @@ fn test_primary_iteration_in_key_order() {
 
 /// Iterator over an empty index yields nothing.
 /// Mirrors `IndexTest.checkAllEmpty` / `checkEmpty`.
+// JE: com.sleepycat.persist.test.IndexTest.checkAllEmpty / checkEmpty
 #[test]
 fn test_primary_iteration_empty() {
     let td = TempDir::new().unwrap();
@@ -463,6 +476,7 @@ fn test_primary_iteration_empty() {
 /// Insert then delete entities one by one; verify count decrements correctly
 /// and the deleted entity is gone from iteration.
 /// Mirrors `IndexTest.testPrimary` "Check primary delete" loop.
+// JE: com.sleepycat.persist.test.IndexTest.testPrimary (Check primary delete loop)
 #[test]
 fn test_primary_delete_one_by_one() {
     let td = TempDir::new().unwrap();
@@ -491,6 +505,7 @@ fn test_primary_delete_one_by_one() {
 /// `put()` returns after overwrite; existing entity not findable at new key.
 /// Mirrors `IndexTest.testPrimary` "Check PrimaryIndex put operations":
 /// put/get, putNoOverwrite true/false checks.
+// JE: com.sleepycat.persist.test.IndexTest.testPrimary (Check PrimaryIndex put operations)
 #[test]
 fn test_put_operations() {
     let td = TempDir::new().unwrap();
@@ -523,6 +538,7 @@ fn test_put_operations() {
 
 /// Secondary index lookup by secondary key.
 /// Mirrors `IndexTest.testOneToOne` / `testManyToOne` core get checks.
+// JE: com.sleepycat.persist.test.IndexTest.testOneToOne (secondary get)
 #[test]
 fn test_secondary_lookup_by_key() {
     let td = TempDir::new().unwrap();
@@ -563,6 +579,7 @@ fn test_secondary_lookup_by_key() {
 /// MANY_TO_ONE: multiple entities share the same secondary key; `sub_index`
 /// returns all matching primary keys.
 /// Mirrors `IndexTest.testManyToOne` pattern: sec_key = pri_key % 3.
+// JE: com.sleepycat.persist.test.IndexTest.testManyToOne (secKey = priKey % 3, subIndex)
 #[test]
 fn test_secondary_many_to_one() {
     let td = TempDir::new().unwrap();
@@ -610,6 +627,7 @@ fn test_secondary_many_to_one() {
 
 /// Secondary iteration yields pairs in secondary-key order.
 /// Mirrors `IndexTest.checkIndex` cursor + `expandKeys`/`expandValues` checks.
+// JE: com.sleepycat.persist.test.IndexTest.checkIndex (entities() cursor order)
 #[test]
 fn test_secondary_iteration_in_key_order() {
     let td = TempDir::new().unwrap();
@@ -649,6 +667,7 @@ fn test_secondary_iteration_in_key_order() {
 
 /// Sub-range via `iter_from`: only entities with sec_key >= bound returned.
 /// Mirrors `IndexTest.checkOpenRanges` tail-inclusive logic.
+// JE: com.sleepycat.persist.test.IndexTest.checkOpenRanges (tail-inclusive range)
 #[test]
 fn test_secondary_iter_from_range() {
     let td = TempDir::new().unwrap();
@@ -688,6 +707,7 @@ fn test_secondary_iter_from_range() {
 /// Secondary delete cascades to primary; secondary map is cleaned up.
 /// Mirrors `IndexTest.checkDelete` → `SecondaryIndex.delete` / `IndexTest`
 /// assertNull(index.get) after delete.
+// JE: com.sleepycat.persist.test.IndexTest.checkDelete (delete cascades) / OperationTest.testDeleteFromSubIndex
 #[test]
 fn test_secondary_delete_cascades_to_primary() {
     let td = TempDir::new().unwrap();
@@ -727,6 +747,7 @@ fn test_secondary_delete_cascades_to_primary() {
 
 /// Secondary delete on a non-existent key returns false.
 /// Mirrors `IndexTest.checkDelete`: second delete call returns false.
+// JE: com.sleepycat.persist.test.IndexTest.checkDelete (second delete returns false)
 #[test]
 fn test_secondary_delete_not_found() {
     let td = TempDir::new().unwrap();
@@ -759,6 +780,7 @@ fn test_secondary_delete_not_found() {
 
 /// `contains()` on secondary index correctly reflects inserts/deletes.
 /// Mirrors `IndexTest.checkIndex` → `index.contains`.
+// JE: com.sleepycat.persist.test.IndexTest.checkIndex (index.contains)
 #[test]
 fn test_secondary_contains() {
     let td = TempDir::new().unwrap();
@@ -789,6 +811,7 @@ fn test_secondary_contains() {
 
 /// `keys_index()` returns (sec_key, pri_key) pairs without fetching entities.
 /// Mirrors `IndexTest.checkIndex` → `index.keysIndex()` usage.
+// JE: com.sleepycat.persist.test.IndexTest.checkIndex (keysIndex)
 #[test]
 fn test_secondary_keys_index() {
     let td = TempDir::new().unwrap();
@@ -825,6 +848,7 @@ fn test_secondary_keys_index() {
 
 /// Secondary index updated when entity is overwritten with new secondary key.
 /// Mirrors `OperationTest.testCursorUpdate` update-then-verify flow.
+// JE: com.sleepycat.persist.test.OperationTest.testCursorUpdate (secKey change on update)
 #[test]
 fn test_secondary_updated_on_overwrite() {
     let td = TempDir::new().unwrap();
@@ -864,6 +888,7 @@ fn test_secondary_updated_on_overwrite() {
 
 /// Two independent secondary indexes on the same primary are both maintained.
 /// Mirrors `OperationTest.testCursorDelete` looping over {priIndex, secIndex}.
+// JE: com.sleepycat.persist.test.OperationTest.testCursorDelete (multi-index maintenance)
 #[test]
 fn test_two_secondary_indexes_maintained_independently() {
     let td = TempDir::new().unwrap();
