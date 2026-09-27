@@ -205,18 +205,25 @@ impl<'a> JoinCursor<'a> {
         }
 
         loop {
-            // The full candidate set for cursor[0]'s secondary key was
-            // drained into `self.candidates` by `new()`.  Do NOT refill from
-            // `cursors[0].get_next_dup()` here: the initial drain already ran
-            // `get_next_dup` until it returned NotFound, which leaves the
+            // NEW-JOIN-1 (fix): the full candidate set for cursor[0]'s
+            // secondary key was already drained into `self.candidates` by
+            // `new()`, which loops `get_next_dup()` until NotFound.  Do NOT
+            // refill from `cursors[0].get_next_dup()` here.
+            //
+            // JE `JoinCursor.retrieveNext` (JoinCursor.java) walks cursor[0]
+            // LAZILY with `GetMode.NEXT_DUP` bound to the captured
+            // `firstSecKey` anchor, which never crosses into the next
+            // secondary key.  Noxu instead drains eagerly in `new()`, so the
+            // candidate set is complete and authoritative.  The old refill
+            // re-walked cursor[0] with `get_next_dup()`, but Noxu's
+            // `get_next_dup` steps `Get::Next` FIRST and only then detects the
+            // secondary-key boundary — so after the eager drain it leaves the
             // inner cursor parked on the FIRST record of the *next* secondary
-            // key (get_next_dup steps with Get::Next before detecting the key
-            // change).  Refilling from that overran position pulls in primary
-            // keys belonging to a different secondary key value, corrupting
-            // the join intersection (NEW-JOIN-1: observed as extra primary
-            // keys when JoinConfig sorts cursors by count so an overrun
-            // candidate happens to pass every probe).  When the pre-collected
-            // deque empties, the join is exhausted.
+            // key, and the refill collected primary keys belonging to a
+            // foreign secondary-key value.  That corrupted the intersection on
+            // the default sort-by-count path (extra rows whenever an overrun
+            // candidate passed every probe).  When the pre-collected deque
+            // empties, the join is exhausted.
             let candidate = match self.candidates.pop_front() {
                 Some(c) => c,
                 None => {

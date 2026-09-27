@@ -230,11 +230,8 @@ fn run_join(
     }
 
     let pri = primary.lock();
-    let cfg = if no_sort {
-        Some(JoinConfig::new().with_no_sort(true))
-    } else {
-        None
-    };
+    let cfg =
+        if no_sort { Some(JoinConfig::new().with_no_sort(true)) } else { None };
     // JE asserts `jc.getDatabase() == priDb`; Noxu's `join.database()`
     // returns the primary ref by construction.  We just confirm the call
     // is wired (a getter, not the substantive join assertion).
@@ -303,8 +300,7 @@ fn je_join_test_test_join() {
                     let mut want: Vec<u8> = expected.to_vec();
                     want.sort_unstable();
                     let got = run_join(
-                        &primary, &sec, *search, no_sort, with_data,
-                        case.data,
+                        &primary, &sec, *search, no_sort, with_data, case.data,
                     );
                     assert_eq!(
                         got,
@@ -379,13 +375,100 @@ fn je_join_test_test_write_during_join() {
     let mut key = DatabaseEntry::new();
     let mut data = DatabaseEntry::new();
     let mut got: Vec<u8> = Vec::new();
-    while join.get_next(&mut key, &mut data).unwrap() == OperationStatus::Success
+    while join.get_next(&mut key, &mut data).unwrap()
+        == OperationStatus::Success
     {
         got.push(key.data_opt().unwrap()[0]);
     }
     got.sort_unstable();
-    assert_eq!(got, vec![13u8, 14u8], "join must return the two pre-join records");
+    assert_eq!(
+        got,
+        vec![13u8, 14u8],
+        "join must return the two pre-join records"
+    );
 
     // Try writing again after draining — still must not block.
     pri.put([11u8], [1u8, 1, 1]).unwrap();
+}
+
+/// NEW-JOIN-1 deletion-safety control: `new()` must eagerly drain cursor[0]'s
+/// ENTIRE duplicate set into the candidate list, so removing the (buggy)
+/// refill in `next_matching_candidate` cannot drop legitimate candidates.
+///
+/// We build a secondary whose search key `sec0='1'` is shared by 500
+/// primaries, and a second secondary whose search key `sec1='1'` is shared by
+/// a KNOWN even-keyed subset of those.  The join intersection must be exactly
+/// that subset (250 primaries), with cursor[0] sorted first (fewest dups) so
+/// the default (sort) path is exercised.  If the deletion dropped candidates,
+/// the intersection would come up short.
+#[test]
+fn je_join_test_new_join_1_large_dup_set_no_candidates_dropped() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let primary = open_primary(&env, "pri");
+    // sec0 keys on data byte 0; sec1 keys on data byte 1.
+    let sec = [
+        open_secondary(&env, &primary, "sec0", 0),
+        open_secondary(&env, &primary, "sec1", 1),
+    ];
+
+    // 500 primaries, all with sec0 byte = 1.  Even-numbered pk get sec1
+    // byte = 1 (in the intersection); odd get sec1 byte = 2 (excluded).
+    // Primary keys are 2 bytes so all 500 fit distinctly.
+    let mut expected: Vec<[u8; 2]> = Vec::new();
+    {
+        let pri = primary.lock();
+        for i in 0u16..500 {
+            let pk = i.to_be_bytes();
+            let sec1_byte = if i % 2 == 0 { 1u8 } else { 2u8 };
+            // data = [sec0=1, sec1=sec1_byte, filler]
+            pri.put(pk, [1u8, sec1_byte, 0u8]).unwrap();
+            if sec1_byte == 1 {
+                expected.push(pk);
+            }
+        }
+    }
+
+    // Position both cursors at their '1' keys.
+    let mut c0 = sec[0].open_cursor(None).unwrap();
+    let mut c1 = sec[1].open_cursor(None).unwrap();
+    for c in [&mut c0, &mut c1] {
+        let mut p = DatabaseEntry::new();
+        let mut d = DatabaseEntry::new();
+        assert_eq!(
+            c.get_search_key(
+                &DatabaseEntry::from_bytes(&[1u8]),
+                &mut p,
+                &mut d
+            )
+            .unwrap(),
+            OperationStatus::Success
+        );
+    }
+
+    // Default JoinConfig => sorts by count ascending.  c1 (sec1='1') has 250
+    // dups; c0 (sec0='1') has 500 — so c1 sorts first as cursor[0].  This is
+    // the exact configuration that exposed NEW-JOIN-1 (a large cursor[0] dup
+    // set feeding the deleted refill path).
+    let pri = primary.lock();
+    let mut join = pri.join(vec![c0, c1], None).unwrap();
+
+    let mut got: Vec<[u8; 2]> = Vec::new();
+    let mut key = DatabaseEntry::new();
+    let mut data = DatabaseEntry::new();
+    while join.get_next(&mut key, &mut data).unwrap()
+        == OperationStatus::Success
+    {
+        let b = key.data_opt().unwrap();
+        got.push([b[0], b[1]]);
+    }
+    got.sort_unstable();
+    expected.sort_unstable();
+    assert_eq!(
+        got.len(),
+        250,
+        "intersection must contain all 250 even-keyed primaries; a dropped \
+         candidate would shorten this (deletion-safety proof for NEW-JOIN-1)"
+    );
+    assert_eq!(got, expected, "join must be exactly the even-keyed subset");
 }
