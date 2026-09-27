@@ -200,14 +200,20 @@ fn arbiter_veto_blocks_election_when_sole_node_lags_dtvlsn() {
             };
             arb_ch.send(&counter.encode()).unwrap();
         }
-        // Phase 2 (if it ever comes): reject.
+        // Phase 2 (if it ever comes): GRANT it. This makes the test NON-VACUOUS
+        // w.r.t. the arbiter veto: if the veto were removed, node1 would win the
+        // Phase-2 quorum here and the election would return Some(1) (electing a
+        // node below the arbiter's durable point). The ONLY reason the result is
+        // None is the choose_phase2_value arbiter veto aborting the round before
+        // Phase 2 (JE RankingProposer.choosePhase2Value). A quorum-reject would
+        // mask the veto, so we deliberately grant.
         if let Ok(Some(bytes)) = arb_ch.receive(Duration::from_millis(300))
             && let Ok(ProtocolMessage::ElectionResult { term, .. }) =
                 ProtocolMessage::decode(&bytes)
         {
             let vote = ProtocolMessage::ElectionVote {
                 voter: "arbiter".into(),
-                granted: false,
+                granted: true,
                 term,
             };
             let _ = arb_ch.send(&vote.encode());
