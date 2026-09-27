@@ -217,6 +217,15 @@ listed in [References](#references).
   LSN), and remove/rename log a durable deletion tombstone via the commit callback
   (so abort still rolls back). Found by a faithful port of JE's
   `RecoveryAbortTest.testDbCreateRemove`.
+- **Superseded internal-node versions are counted obsolete at checkpoint (space
+  reclamation, NEW-CLEANER-IN-OBSOLETE).** When a checkpoint logged a new full
+  BIN/internal-node version, the prior full version (and any intervening delta)
+  was not recorded obsolete — only the delta path did — so internal-node
+  utilization was over-reported and the cleaner under-reclaimed stale space. The
+  checkpointer now counts the superseded prior full version (and the intervening
+  delta on a full-after-delta) obsolete, matching JE
+  (`IN.afterLogCommon`/`countObsoleteNode`). Space-accounting only; recovery is
+  unchanged. Found by a faithful port of JE's `INUtilizationTest`.
 
 - **WAL now fail-stops the environment on a critical log-write failure (JE
   `LogManager.serialLog` parity).** A failed or partial WAL write previously left
