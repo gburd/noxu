@@ -1437,6 +1437,17 @@ impl Checkpointer {
                 // JE `getLastFullVersion` returns early on NULL (IN.java:5200),
                 // so we skip it below (no double-count).
                 let superseded_full_lsn = b.last_full_lsn;
+                // NEW-CLEANER-IN-OBSOLETE: a FULL BIN that supersedes a
+                // delta chain also makes the intervening DELTA image obsolete
+                // (JE INLogEntry.java:150-151 sets prevDeltaLsn even on a FULL
+                // entry; IN.java:5493-5497/5518-5519 count BOTH getPrevFullLsn()
+                // AND getPrevDeltaLsn() obsolete via oldLsn + auxOldLsn).
+                // Capture it BEFORE the `b.last_delta_lsn = NULL_LSN` reset
+                // below (read-before-overwrite).  Non-null only on a
+                // full->delta->full sequence; a full->full sequence with no
+                // intervening delta has `last_delta_lsn == NULL_LSN` (no
+                // phantom count).
+                let superseded_delta_lsn = b.last_delta_lsn;
                 let full_bytes = b.serialize_full();
                 let entry = InLogEntry::new(
                     db_id,
@@ -1465,13 +1476,23 @@ impl Checkpointer {
                 // NEW-CLEANER-IN-OBSOLETE: record the superseded prior full BIN
                 // image (getPrevFullLsn) for obsolete counting.  Only when
                 // non-null — a brand-new BIN's first full log has no prior
-                // version (skip, no double-count).  An intervening full->delta
-                // chain's obsolete accounting is handled by the delta path;
-                // here we count only the immediately-superseded prior FULL.
+                // version (skip, no double-count).  The intervening delta on
+                // a full->delta->full sequence is counted separately below.
                 if superseded_full_lsn != NULL_LSN {
                     result
                         .obsolete_full_lsns
                         .push((superseded_full_lsn, db_id as u32));
+                }
+                // NEW-CLEANER-IN-OBSOLETE: also count the intervening DELTA
+                // image obsolete (JE INLogEntry.java:150-151 prevDeltaLsn /
+                // IN.java:5493-5519 auxOldLsn).  Captured above before the
+                // `last_delta_lsn = NULL_LSN` reset.  Only on a
+                // full->delta->full sequence (non-NULL); a full->full sequence
+                // has NULL here, so no phantom delta is counted.
+                if superseded_delta_lsn != NULL_LSN {
+                    result
+                        .obsolete_full_lsns
+                        .push((superseded_delta_lsn, db_id as u32));
                 }
                 // A full BIN entry is directly re-fetchable by
                 // `fetch_node_from_log`.
@@ -2676,6 +2697,231 @@ mod tests {
         assert_eq!(
             result.full_bins_flushed, 1,
             "allow_bin_deltas=false must log the dirty BIN in full instead"
+        );
+    }
+
+    /// NEW-CLEANER-IN-OBSOLETE (delta->full transition): when the checkpointer
+    /// logs a FULL BIN that supersedes BOTH a prior full image AND an
+    /// intervening delta (a full->delta->full sequence, reached in normal
+    /// operation when a delta is logged and then `prohibit_next_delta` /
+    /// `allow_bin_deltas=false` forces the next checkpoint to a full), it must
+    /// count BOTH the prior full LSN (JE `getPrevFullLsn`) AND the intervening
+    /// delta LSN (JE `getPrevDeltaLsn` / `auxOldLsn`) obsolete.
+    ///
+    /// FAIL-PRE (branch tip b1829b905): the full-BIN path counted only the
+    /// prior full obsolete and reset `last_delta_lsn = NULL_LSN` WITHOUT
+    /// counting it — the intervening delta LEAKED (obsolete_in_count == 0 for
+    /// the delta's file), utilization over-reported, cleaner under-reclaimed.
+    ///
+    /// PASS-POST: both the prior full's file (2) AND the delta's file (3) show
+    /// one obsolete IN each, with the offsets tracked.
+    ///
+    /// JE: INLogEntry.java:150-151 (prevFullLsn + prevDeltaLsn both set even
+    /// for a FULL entry) + IN.java:5493-5497/5518-5519 (afterLogCommon counts
+    /// BOTH oldLsn = getPrevFullLsn() AND auxOldLsn = getPrevDeltaLsn()).
+    #[test]
+    fn test_full_bin_counts_intervening_delta_obsolete_on_delta_to_full() {
+        use noxu_cleaner::UtilizationTracker;
+        use noxu_log::FileManager;
+        use noxu_tree::tree::{Tree, TreeNode};
+        use noxu_util::lsn::Lsn;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let fm = Arc::new(
+            FileManager::new(dir.path(), false, 64 * 1024 * 1024, 100).unwrap(),
+        );
+        let lm =
+            Arc::new(LogManager::new(Arc::clone(&fm), 3, 1024 * 1024, 65536));
+
+        let tree = Tree::new(1, 256);
+        for i in 0u16..16 {
+            let key = format!("key{i:03}");
+            tree.insert(
+                key.into_bytes(),
+                b"v".to_vec(),
+                Lsn::new(1, i as u32 + 1),
+            )
+            .unwrap();
+        }
+        let tree_arc = Arc::new(RwLock::new(tree));
+
+        // full->delta->full state: a prior FULL BIN in file 2, an intervening
+        // DELTA in file 3, and exactly one re-dirtied slot.  allow_bin_deltas
+        // is turned OFF below so the next log is forced to a FULL BIN,
+        // superseding BOTH prior versions.
+        let prior_full_lsn = Lsn::new(2, 100);
+        let prior_delta_lsn = Lsn::new(3, 4096);
+        let dirty_bins = tree_arc.read().unwrap().collect_dirty_bins(1);
+        assert!(!dirty_bins.is_empty(), "precondition: dirty BINs");
+        for (_db, bin_arc) in &dirty_bins {
+            let mut guard = bin_arc.write();
+            if let TreeNode::Bottom(ref mut b) = *guard {
+                b.clear_dirty_after_full_log(prior_full_lsn);
+                b.last_delta_lsn = prior_delta_lsn;
+                b.is_delta = true;
+                b.prohibit_next_delta = false;
+                b.dirty = true;
+                if let Some(e) = b.entries.first_mut() {
+                    e.dirty = true;
+                }
+            }
+        }
+
+        let mut tracker = UtilizationTracker::new(true);
+        // Seed both files so obsolete counting has summaries to update.
+        tracker.count_new_log_entry(2, 128, false, true);
+        tracker.count_new_log_entry(3, 64, false, true);
+        let tracker_arc = Arc::new(Mutex::new(tracker));
+
+        // allow_bin_deltas(false): force the FULL-BIN path (delta->full).
+        let checkpointer = Checkpointer::new(
+            CheckpointConfig::default().allow_bin_deltas(false),
+        )
+        .with_log_manager(Arc::clone(&lm))
+        .with_tree(Arc::clone(&tree_arc), 1)
+        .with_utilization_tracker(Arc::clone(&tracker_arc));
+
+        let result = checkpointer
+            .flush_dirty_bins_internal()
+            .expect("flush_dirty_bins_internal failed");
+
+        assert_eq!(
+            result.delta_ins_flushed, 0,
+            "delta->full: must take the FULL path, no delta logged"
+        );
+        assert_eq!(
+            result.full_bins_flushed, 1,
+            "delta->full: must log exactly one FULL BIN"
+        );
+
+        let tracker = tracker_arc.lock();
+
+        // Prior FULL (getPrevFullLsn) obsolete in file 2.
+        let full_summary = tracker
+            .get_tracked_summary(prior_full_lsn.file_number())
+            .expect("file 2 summary must exist after counting the prior full");
+        assert_eq!(
+            full_summary.get_summary().obsolete_in_count,
+            1,
+            "delta->full: the superseded prior FULL BIN must be counted \
+             obsolete (getPrevFullLsn)"
+        );
+        assert!(
+            full_summary
+                .get_obsolete_offsets()
+                .contains(&prior_full_lsn.file_offset()),
+            "delta->full: the prior full's offset must be tracked obsolete"
+        );
+
+        // Intervening DELTA (getPrevDeltaLsn / auxOldLsn) obsolete in file 3 —
+        // this is the leak the fix closes.
+        let delta_summary = tracker
+            .get_tracked_summary(prior_delta_lsn.file_number())
+            .expect("file 3 summary must exist after counting the delta");
+        assert_eq!(
+            delta_summary.get_summary().obsolete_in_count,
+            1,
+            "delta->full: the INTERVENING DELTA superseded by the FULL BIN \
+             must be counted obsolete (getPrevDeltaLsn / auxOldLsn) — this is \
+             the under-count the fix closes; obsolete_in_count == 0 here means \
+             the intervening delta leaked (branch tip b1829b905)"
+        );
+        assert!(
+            delta_summary
+                .get_obsolete_offsets()
+                .contains(&prior_delta_lsn.file_offset()),
+            "delta->full: the intervening delta's offset must be tracked obsolete"
+        );
+    }
+
+    /// NEW-CLEANER-IN-OBSOLETE (no double-count on full->full): a FULL BIN
+    /// that supersedes ONLY a prior full (no intervening delta —
+    /// `last_delta_lsn == NULL_LSN`) must count EXACTLY the prior full
+    /// obsolete, never a phantom delta.  Guards against the delta->full fix
+    /// over-counting when there is no delta to count.
+    #[test]
+    fn test_full_bin_no_phantom_delta_on_full_to_full() {
+        use noxu_cleaner::UtilizationTracker;
+        use noxu_log::FileManager;
+        use noxu_tree::tree::{Tree, TreeNode};
+        use noxu_util::lsn::Lsn;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let fm = Arc::new(
+            FileManager::new(dir.path(), false, 64 * 1024 * 1024, 100).unwrap(),
+        );
+        let lm =
+            Arc::new(LogManager::new(Arc::clone(&fm), 3, 1024 * 1024, 65536));
+
+        let tree = Tree::new(1, 256);
+        for i in 0u16..16 {
+            let key = format!("key{i:03}");
+            tree.insert(
+                key.into_bytes(),
+                b"v".to_vec(),
+                Lsn::new(1, i as u32 + 1),
+            )
+            .unwrap();
+        }
+        let tree_arc = Arc::new(RwLock::new(tree));
+
+        // full->full state: a prior FULL BIN in file 2, NO intervening delta
+        // (last_delta_lsn == NULL_LSN), one re-dirtied slot.  allow_bin_deltas
+        // OFF forces a FULL BIN.
+        let prior_full_lsn = Lsn::new(2, 100);
+        let dirty_bins = tree_arc.read().unwrap().collect_dirty_bins(1);
+        assert!(!dirty_bins.is_empty(), "precondition: dirty BINs");
+        for (_db, bin_arc) in &dirty_bins {
+            let mut guard = bin_arc.write();
+            if let TreeNode::Bottom(ref mut b) = *guard {
+                b.clear_dirty_after_full_log(prior_full_lsn);
+                b.last_delta_lsn = noxu_util::NULL_LSN; // no intervening delta
+                b.is_delta = false;
+                b.prohibit_next_delta = false;
+                b.dirty = true;
+                if let Some(e) = b.entries.first_mut() {
+                    e.dirty = true;
+                }
+            }
+        }
+
+        let mut tracker = UtilizationTracker::new(true);
+        tracker.count_new_log_entry(2, 128, false, true);
+        let tracker_arc = Arc::new(Mutex::new(tracker));
+
+        let checkpointer = Checkpointer::new(
+            CheckpointConfig::default().allow_bin_deltas(false),
+        )
+        .with_log_manager(Arc::clone(&lm))
+        .with_tree(Arc::clone(&tree_arc), 1)
+        .with_utilization_tracker(Arc::clone(&tracker_arc));
+
+        let result = checkpointer
+            .flush_dirty_bins_internal()
+            .expect("flush_dirty_bins_internal failed");
+
+        assert_eq!(
+            result.full_bins_flushed, 1,
+            "full->full: must log exactly one FULL BIN"
+        );
+
+        let tracker = tracker_arc.lock();
+        // Exactly the prior full, counted once.
+        let full_summary = tracker
+            .get_tracked_summary(prior_full_lsn.file_number())
+            .expect("file 2 summary must exist");
+        assert_eq!(
+            full_summary.get_summary().obsolete_in_count,
+            1,
+            "full->full: exactly the prior full counted obsolete, once"
+        );
+        // No phantom delta counted in any other file.
+        assert!(
+            tracker.get_tracked_summary(3).is_none(),
+            "full->full: no intervening delta exists, so no phantom obsolete \
+             IN may be counted in any other file"
         );
     }
 
