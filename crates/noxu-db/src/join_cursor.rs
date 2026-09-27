@@ -205,23 +205,18 @@ impl<'a> JoinCursor<'a> {
         }
 
         loop {
-            // --- Refill candidates from cursor[0]'s next duplicate ---
-            if self.candidates.is_empty() {
-                match self.cursors[0].get_next_dup()? {
-                    OperationStatus::Success => {
-                        if let Some(pk) =
-                            self.cursors[0].get_current_primary_key_only()?
-                        {
-                            self.candidates.push_back(pk);
-                        }
-                    }
-                    _ => {
-                        self.exhausted = true;
-                        return Ok(None);
-                    }
-                }
-            }
-
+            // The full candidate set for cursor[0]'s secondary key was
+            // drained into `self.candidates` by `new()`.  Do NOT refill from
+            // `cursors[0].get_next_dup()` here: the initial drain already ran
+            // `get_next_dup` until it returned NotFound, which leaves the
+            // inner cursor parked on the FIRST record of the *next* secondary
+            // key (get_next_dup steps with Get::Next before detecting the key
+            // change).  Refilling from that overran position pulls in primary
+            // keys belonging to a different secondary key value, corrupting
+            // the join intersection (NEW-JOIN-1: observed as extra primary
+            // keys when JoinConfig sorts cursors by count so an overrun
+            // candidate happens to pass every probe).  When the pre-collected
+            // deque empties, the join is exhausted.
             let candidate = match self.candidates.pop_front() {
                 Some(c) => c,
                 None => {
