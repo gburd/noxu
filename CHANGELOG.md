@@ -207,6 +207,16 @@ listed in [References](#references).
   first/last non-empty node and position on its edge live slot (matching JE
   `positionFirstOrLast`). Found by a faithful port of JE's
   `CheckReverseSplitsTest.testCompleteRemovalDups`.
+- **Committed database create/remove/rename now survive recovery correctly
+  (NEW-REC-1).** Two catalog-durability gaps: (1) an empty database created under
+  an explicit transaction (no data written) was lost after recovery — the
+  create-only transaction never wrote a commit record, so recovery dropped it; and
+  (2) a committed `remove_database`/`rename_database` was resurrected after recovery
+  because no deletion record was logged. The create now durably records its
+  transaction commit (matching JE `NameLN.log` advancing the transaction's last
+  LSN), and remove/rename log a durable deletion tombstone via the commit callback
+  (so abort still rolls back). Found by a faithful port of JE's
+  `RecoveryAbortTest.testDbCreateRemove`.
 
 - **WAL now fail-stops the environment on a critical log-write failure (JE
   `LogManager.serialLog` parity).** A failed or partial WAL write previously left
