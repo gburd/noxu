@@ -184,6 +184,12 @@ impl Harness {
 ///
 /// FAILS on base b4cd7f7d: the best-effort transfer hands off immediately,
 /// demoting the old master and promoting a target missing commits 3,4,5.
+///
+/// JE: `MasterTransferTest.testLateJoiner` (transfer to a not-yet-caught-up /
+/// down target fails) and `MasterTransferTest.testAnotherTryAfterFailure`
+/// (the refused transfer leaves the old master master; a later attempt to a
+/// caught-up target then succeeds). The refuse half is here; the succeed half
+/// is `transfer_master_succeeds_when_target_caught_up` below.
 #[test]
 fn transfer_master_refuses_lagging_target() {
     let h = setup(2);
@@ -213,6 +219,12 @@ fn transfer_master_refuses_lagging_target() {
 
 /// CAUGHT-UP target: acked VLSN 5 == master VLSN 5. `transfer_master` must
 /// still succeed promptly (no regression).
+///
+/// JE: `MasterTransferTest.testConcurrentTxns` / `testAnotherTryAfterFailure`
+/// (success once the target has caught up): JE drives phase-1/phase-2
+/// completion by acks from the replica reaching the master's VLSN; here the
+/// target's acked VLSN deterministically equals the master's, so the transfer
+/// completes.
 #[test]
 fn transfer_master_succeeds_when_target_caught_up() {
     let h = setup(5);
@@ -241,6 +253,8 @@ fn transfer_master_succeeds_when_target_caught_up() {
     h.teardown();
 }
 
+/// JE: `MasterTransferTest.testConcurrentTxns` / `MasterTransferTest.testPhase2Timeout`.
+///
 /// B5/V16/F1 phase-2 (JE `MasterTransfer` phase-2 commit block): a master that
 /// is ACTIVELY COMMITTING during the transfer window must not lose an
 /// acknowledged commit.
