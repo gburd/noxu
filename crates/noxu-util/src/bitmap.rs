@@ -8,6 +8,10 @@
 //! JE ref: `com.sleepycat.je.utilint.BitMap`.
 //!
 //! Note: like the JE original, this is not thread-safe.
+//!
+//! This is a faithful reference port kept for test parity with JE; it is not
+//! yet wired into a Noxu subsystem (JE uses it only in the unimplemented
+//! DbScavenger).
 
 use hashbrown::HashMap;
 
