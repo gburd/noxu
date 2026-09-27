@@ -101,6 +101,7 @@ fn make_byte_sorted_map(db: &Database) -> ByteSortedMap<'_> {
 // CollectionTest: StoredMap basics
 // ---------------------------------------------------------------------------
 
+// JE: CollectionTest.runTest (readAll / put round-trip over keys 1..6).
 #[test]
 fn test_stored_map_put_get_roundtrip() {
     let (_td, _env, db) = setup_env_and_db();
@@ -117,6 +118,7 @@ fn test_stored_map_put_get_roundtrip() {
     }
 }
 
+// JE: CollectionTest.runTest (Map.put returns prior value).
 #[test]
 fn test_stored_map_put_overwrite_returns_old() {
     let (_td, _env, db) = setup_env_and_db();
@@ -127,6 +129,7 @@ fn test_stored_map_put_overwrite_returns_old() {
     assert_eq!(map.get(None, &b"k1".to_vec()).unwrap(), Some(b"v2".to_vec()));
 }
 
+// JE: CollectionTest.runTest (removeAll then readAll sees nothing).
 #[test]
 fn test_stored_map_remove_then_get_none() {
     let (_td, _env, db) = setup_env_and_db();
@@ -151,6 +154,7 @@ fn test_stored_map_remove_absent_key() {
     assert!(map.remove(None, &b"absent".to_vec()).unwrap().is_none());
 }
 
+// JE: CollectionTest.runTest (containsKey reflects put/remove).
 #[test]
 fn test_stored_map_contains_key() {
     let (_td, _env, db) = setup_env_and_db();
@@ -163,6 +167,7 @@ fn test_stored_map_contains_key() {
     assert!(!map.contains_key(None, &b"k".to_vec()).unwrap());
 }
 
+// JE: CollectionTest.testCreation (size()) + readAll.
 #[test]
 fn test_stored_map_len() {
     let (_td, _env, db) = setup_env_and_db();
@@ -178,6 +183,7 @@ fn test_stored_map_len() {
     assert!(!map.is_empty(None).unwrap());
 }
 
+// JE: CollectionTest.clearAll (Map.clear empties the map).
 #[test]
 fn test_stored_map_clear() {
     let (_td, _env, db) = setup_env_and_db();
@@ -191,6 +197,7 @@ fn test_stored_map_clear() {
     assert!(map.get(None, &key_bytes(1)).unwrap().is_none());
 }
 
+// JE: CollectionTest.runTest (a read-only StoredContainer rejects mutation).
 #[test]
 fn test_stored_map_read_only_rejects_writes() {
     let (_td, _env, db) = setup_env_and_db();
@@ -215,6 +222,7 @@ fn test_stored_map_read_only_rejects_writes() {
 // CollectionTest: StoredMap iteration
 // ---------------------------------------------------------------------------
 
+// JE: CollectionTest.readAll (entrySet iterates in key order).
 #[test]
 fn test_stored_map_iter_sorted_order() {
     let (_td, _env, db) = setup_env_and_db();
@@ -230,6 +238,7 @@ fn test_stored_map_iter_sorted_order() {
     assert_eq!(items[2].0, b"cherry");
 }
 
+// JE: CollectionTest.readAll (keySet in key order).
 #[test]
 fn test_stored_map_keys_sorted() {
     let (_td, _env, db) = setup_env_and_db();
@@ -242,6 +251,7 @@ fn test_stored_map_keys_sorted() {
     assert_eq!(keys, vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
 }
 
+// JE: CollectionTest.readAll (values in key order).
 #[test]
 fn test_stored_map_values_sorted_by_key() {
     let (_td, _env, db) = setup_env_and_db();
@@ -285,6 +295,7 @@ fn test_stored_map_iter_after_partial_remove() {
 // CollectionTest: StoredSortedMap (headMap / tailMap / subMap)
 // ---------------------------------------------------------------------------
 
+// JE: CollectionTest.readWriteRange (StoredSortedMap firstKey/lastKey).
 #[test]
 fn test_sorted_map_first_and_last_key() {
     let (_td, _env, db) = setup_env_and_db();
@@ -304,6 +315,7 @@ fn test_sorted_map_first_last_empty() {
     assert_eq!(map.last_key(None).unwrap(), None);
 }
 
+// JE: CollectionTest.readWriteRange TAIL (tailMap iteration).
 #[test]
 fn test_sorted_map_iter_from_tail() {
     let (_td, _env, db) = setup_env_and_db();
@@ -334,6 +346,7 @@ fn test_sorted_map_iter_from_beyond_all() {
     assert!(items.is_empty());
 }
 
+// JE: CollectionTest.readWriteRange (descending navigation).
 #[test]
 fn test_sorted_map_reverse_iter() {
     let (_td, _env, db) = setup_env_and_db();
@@ -349,6 +362,7 @@ fn test_sorted_map_reverse_iter() {
     assert_eq!(items, vec![4, 3, 2, 1]);
 }
 
+// JE: CollectionTest.readWriteRange (firstEntry).
 #[test]
 fn test_sorted_map_first_entry() {
     let (_td, _env, db) = setup_env_and_db();
@@ -362,6 +376,7 @@ fn test_sorted_map_first_entry() {
     assert_eq!(entry.1, b"a");
 }
 
+// JE: CollectionTest.readWriteRange (lastEntry).
 #[test]
 fn test_sorted_map_last_entry() {
     let (_td, _env, db) = setup_env_and_db();
@@ -427,6 +442,7 @@ fn make_byte_list(db: &Database) -> ByteList<'_> {
     StoredList::new(db, ByteArrayBinding)
 }
 
+// JE: CollectionTest.addOddList / readAll (StoredList append + indexed get).
 #[test]
 fn test_stored_list_push_get() {
     let (_td, _env, db) = setup_env_and_db();
@@ -457,6 +473,7 @@ fn test_stored_list_size_increases() {
     }
 }
 
+// JE: CollectionTest.removeOddList (StoredList remove renumbers/compacts).
 #[test]
 fn test_stored_list_remove_compacts() {
     let (_td, _env, db) = setup_env_and_db();
@@ -524,6 +541,7 @@ fn test_stored_list_index_sort_order() {
     assert!(k255 < k256);
 }
 
+// JE: CollectionTest.readAll (StoredList iterates in index order).
 #[test]
 fn test_stored_list_iteration_order() {
     let (_td, _env, db) = setup_env_and_db();
@@ -546,6 +564,7 @@ fn test_stored_list_iteration_order() {
     );
 }
 
+// JE: CollectionTest.addAllList / removeAllList.
 #[test]
 fn test_stored_list_add_all_remove_all() {
     let (_td, _env, db) = setup_env_and_db();
@@ -567,6 +586,7 @@ fn test_stored_list_add_all_remove_all() {
 // CollectionTest: StoredKeySet / StoredValueSet
 // ---------------------------------------------------------------------------
 
+// JE: CollectionTest.checkKeySetAndValueSet (StoredKeySet contains + iterate).
 #[test]
 fn test_stored_key_set_contains_and_iter() {
     let (_td, _env, db) = setup_env_and_db();
@@ -597,6 +617,7 @@ fn test_stored_key_set_len_and_is_empty() {
     assert!(!ks.is_empty(None).unwrap());
 }
 
+// JE: CollectionTest.checkKeySetAndValueSet (StoredValueSet iterates by key).
 #[test]
 fn test_stored_value_set_iter_sorted() {
     let (_td, _env, db) = setup_env_and_db();
@@ -617,6 +638,7 @@ fn test_stored_value_set_iter_sorted() {
 // TransactionRunner — typed StoredMap composition
 // ---------------------------------------------------------------------------
 
+// JE: TransactionTest.testRunnerCommit (runner drives StoredMap writes).
 #[test]
 fn test_transaction_runner_drives_typed_storedmap() {
     let (_td, env, db) = setup_transactional_env_and_db();
@@ -636,6 +658,7 @@ fn test_transaction_runner_drives_typed_storedmap() {
     assert_eq!(map.get(None, &2).unwrap(), Some("beta".to_string()));
 }
 
+// JE: TransactionTest.testRunnerAbort (worker error rolls the txn back).
 #[test]
 fn test_transaction_runner_aborts_typed_storedmap_on_error() {
     let (_td, env, db) = setup_transactional_env_and_db();
@@ -652,6 +675,7 @@ fn test_transaction_runner_aborts_typed_storedmap_on_error() {
     assert_eq!(map.get(None, &1).unwrap(), None);
 }
 
+// JE: TransactionTest.testRetry (runner retries a retryable conflict then succeeds).
 #[test]
 fn test_transaction_runner_deadlock_retry() {
     let (_td, env, _db) = setup_transactional_env_and_db();
@@ -674,6 +698,7 @@ fn test_transaction_runner_deadlock_retry() {
     assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
 }
 
+// JE: TransactionTest.testRetry / testExceptionHandler (retry budget exhausted surfaces the conflict).
 #[test]
 fn test_transaction_runner_retries_exhausted() {
     let (_td, env, _db) = setup_transactional_env_and_db();
@@ -691,6 +716,7 @@ fn test_transaction_runner_retries_exhausted() {
 // ForeignKeyTest equivalents
 // ---------------------------------------------------------------------------
 
+// JE: ForeignKeyTest.runTest (ABORT/NULLIFY delete action at the map view layer; engine FK enforcement is COVERED-CITED in noxu-db/tests/secondary_decisions_test.rs).
 #[test]
 fn test_foreign_key_delete_abort_pattern() {
     let (_td, _env, db1) = setup_env_and_db();
@@ -715,6 +741,7 @@ fn test_foreign_key_delete_abort_pattern() {
     assert!(store1.get(None, &b"pk1".to_vec()).unwrap().is_none());
 }
 
+// JE: ForeignKeyTest.runTest (CASCADE delete action at the map view layer; engine FK enforcement COVERED-CITED in noxu-db/tests/secondary_decisions_test.rs).
 #[test]
 fn test_foreign_key_delete_cascade_pattern() {
     let (_td, _env, db1) = setup_env_and_db();
@@ -739,6 +766,7 @@ fn test_foreign_key_delete_cascade_pattern() {
 // NullValueTest equivalents
 // ---------------------------------------------------------------------------
 
+// JE: NullValueTest.runTest (noxu empty-slice stands in for Java null).
 #[test]
 fn test_null_value_store_and_retrieve() {
     let (_td, _env, db) = setup_env_and_db();
@@ -750,6 +778,7 @@ fn test_null_value_store_and_retrieve() {
     assert_eq!(val.unwrap(), b"".to_vec());
 }
 
+// JE: NullValueTest.runTest (empty value visible in values() iteration).
 #[test]
 fn test_null_value_visible_in_values_iter() {
     let (_td, _env, db) = setup_env_and_db();
@@ -759,6 +788,7 @@ fn test_null_value_visible_in_values_iter() {
     assert_eq!(vals, vec![b"".to_vec()]);
 }
 
+// JE: NullValueTest.runTest (empty value can be removed).
 #[test]
 fn test_null_value_remove() {
     let (_td, _env, db) = setup_env_and_db();
@@ -773,6 +803,7 @@ fn test_null_value_remove() {
 // TestSR15721 equivalents
 // ---------------------------------------------------------------------------
 
+// JE: TestSR15721.testSR15721Fix (two views over one env observe the same committed data; noxu uses Drop not WeakHashMap GC -- the reachability half is N/A).
 #[test]
 fn test_sr15721_two_views_same_data() {
     let (_td, _env, db) = setup_env_and_db();
