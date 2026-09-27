@@ -841,6 +841,19 @@ fn test_master_crash_detected_by_32_replicas() {
 /// while a group of 17 nodes (majority) CAN elect a master.
 /// This test exercises the `ensure_unknown_state()` precondition — a node
 /// that cannot reach majority must stay in Unknown until it can.
+///
+/// COVERED-CITED for the JE network-partition-healing tests:
+///   * JE: `je.rep.impl.NetworkPartitionHealingTest.testPostNetworkPartition`
+///     and `testPostNetworkPartitionMaster` — after a 3-node group splits and
+///     re-heals, the master must end up on the MAJORITY side and the minority
+///     (obsolete) master reverts to a replica.  This test proves the quorum
+///     half: a minority partition cannot hold/elect a master (it stays
+///     Unknown); the obsolete-master-reverts-to-replica half is covered by
+///     `je_rep_txn_tck::rollback_old_master_rejoins_as_replica`.
+///   * JE: `NetworkPartitionHealingTest.testDemonstrateCorrectMasterSelection`
+///     — the post-partition master is chosen by the higher DTVLSN even when a
+///     minority node has a higher raw VLSN; covered by
+///     `je_rep_impl_tck::dtvlsn_ranking_tie_breaks_to_highest_vlsn`.
 #[test]
 fn test_split_brain_minority_group_cannot_elect_master() {
     const TOTAL: usize = 33;

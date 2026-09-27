@@ -45,6 +45,13 @@ fn acceptor_state_file_is_created_on_open() {
     env.close().unwrap();
 }
 
+/// JE (COVERED-CITED): `je.rep.impl.RepGroupDBTest.testInitFailure` — after
+/// an abnormal close (process kill) and group restart, the group must NOT
+/// deadlock in a circular wait (one node stuck concluding an election, the
+/// other stuck locating a master).  The election-liveness-after-crash core is
+/// this test's invariant: a restarted node reconstitutes its durable promise
+/// state and elections still make progress (a stale proposer is rejected
+/// rather than wedging the round), which is what breaks the circular wait.
 #[test]
 fn promise_survives_restart_and_rejects_stale_term() {
     // Simulate the F5/F31 split-brain attack:

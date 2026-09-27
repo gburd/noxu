@@ -188,6 +188,11 @@ fn rollback_preserves_entries_before_matchpoint() {
 ///     `TXN_ROLLBACK_LIMIT`/`*Disabled` knob variants are N/A (not modeled).
 ///     The syncup/matchpoint mechanics are additionally covered by
 ///     `syncup_matchpoint_rollback_test`.
+///   * JE: `je.rep.impl.DTVLSNTest.testRollbackNonDurable` — non-durable
+///     (unacknowledged) transactions are rolled back on startup without a
+///     RollbackProhibitedException when below the rollback limit.  That is the
+///     same "post-matchpoint master-only writes are discarded on failover"
+///     invariant this test asserts; the `TXN_ROLLBACK_LIMIT` knob is N/A.
 ///
 /// "A txn that committed only on the master after the matchpoint is
 /// rolled back when the master fails over."  In the harness: replicas
