@@ -284,6 +284,11 @@ listed in [References](#references).
 - **Commit-freeze latch no longer loses a pre-arriving election thaw
   (NEW-FREEZE-THAW-1).** A diagnostic-fidelity fix to `CommitFreezeLatch`; the
   park-while-frozen safety property was unaffected.
+- **Documented that the `Trigger` trait's `add_trigger`/`remove_trigger` lifecycle
+  hooks are reserved and not currently invoked (NEW-TRIGGER-LIFECYCLE).** Noxu fires
+  only the data-operation (`put`/`delete`) and transaction (`commit`/`abort`) trigger
+  methods; database-lifecycle trigger events are not yet wired. The trait docs
+  previously implied the lifecycle hooks fire.
 - **VLSN index lookups are range-gated (je.rep.vlsn parity).** `VlsnIndex::get_lsn`
   now returns `None` for a VLSN outside the current VLSN range, enforcing JE's
   documented contract that the VLSN range is the boundary authority. Both callers
