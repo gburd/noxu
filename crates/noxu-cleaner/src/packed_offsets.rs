@@ -329,4 +329,66 @@ mod tests {
         let unpacked = packed.unpack();
         assert_eq!(unpacked, offsets);
     }
+
+    /// JE `OffsetTest.testOffsets` (the `PackedOffsets` half).
+    ///
+    /// JE's `doAllTest` packs a fixed value set in forward, reversed, and
+    /// shuffled order and asserts `PackedOffsets.pack(array).toArray()` equals
+    /// the SORTED array (delta encoding requires sorted input, so pack sorts).
+    /// JE's `OffsetList` (which preserves insertion order) has no Noxu
+    /// counterpart — the cleaner tracks obsolete offsets via
+    /// `TrackedFileSummary`, not a standalone ordered list — so only the
+    /// `PackedOffsets` invariant is ported.
+    ///
+    /// JE's set includes `Integer.MAX_VALUE`; Noxu offsets are `u32`
+    /// (file offsets are 32-bit), so the largest JE value that fits is used
+    /// unchanged and the deliberately-excluded `> Integer.MAX_VALUE` values
+    /// JE comments out are likewise out of range here.
+    #[test]
+    fn test_je_offset_test_offsets_pack_sorts() {
+        // JE OffsetTest.testOffsets value set (those within u32 range).
+        let base: Vec<u32> = vec![
+            1,
+            2,
+            0xfffe,
+            0xffff,
+            0xfffff,
+            i32::MAX as u32 - 1,
+            i32::MAX as u32,
+        ];
+        let mut sorted = base.clone();
+        sorted.sort_unstable();
+
+        // Forward order.
+        let mut packed = PackedOffsets::new();
+        packed.pack(&base);
+        assert_eq!(
+            packed.unpack(),
+            sorted,
+            "forward order must pack to sorted"
+        );
+
+        // Reversed order.
+        let mut rev = base.clone();
+        rev.reverse();
+        let mut packed = PackedOffsets::new();
+        packed.pack(&rev);
+        assert_eq!(
+            packed.unpack(),
+            sorted,
+            "reversed order must pack to sorted"
+        );
+
+        // A shuffled order (deterministic swap, no rng dep).
+        let mut shuf = base.clone();
+        shuf.swap(0, 6);
+        shuf.swap(1, 4);
+        let mut packed = PackedOffsets::new();
+        packed.pack(&shuf);
+        assert_eq!(
+            packed.unpack(),
+            sorted,
+            "shuffled order must pack to sorted"
+        );
+    }
 }

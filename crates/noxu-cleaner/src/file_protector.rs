@@ -214,6 +214,12 @@ mod tests {
         assert_eq!(protector.get_protection_count(1), 1);
     }
 
+    // JE `FileProtectorTest.testDiskOrderedCursor` / `testBackup`: a file may
+    // be protected by several subsystems at once (backup, feeder, an open
+    // DiskOrderedCursor), and stays protected until EVERY protector releases
+    // it. The DiskOrderedCursor end-to-end wiring lives in
+    // `noxu-dbi::disk_ordered_cursor_impl` (protect on open, unprotect on
+    // drop; the cleaner delete path checks `is_protected`).
     #[test]
     fn test_protect_multiple_times() {
         let protector = FileProtector::new();

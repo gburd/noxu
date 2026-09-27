@@ -381,4 +381,53 @@ mod tests {
         t2.recalc(50, 20);
         assert!(!t2.is_violated());
     }
+
+    /// JE `DiskLimitTest.testAvailableLogSize` (the subset that maps to Noxu's
+    /// model).
+    ///
+    /// JE's table uses `activeLS=50, reservedLS=25, protectedLS=5`, but Noxu
+    /// has no reserved-file / protected-file machinery, so `reservedSize` and
+    /// `protectedSize` are structurally 0 (documented deviation: the cleaner
+    /// deletes files outright rather than parking them as reserved). We port
+    /// the rows whose availability reduces to the Noxu formula
+    /// `avail = (maxDisk>0) ? min(diskFree-freeDisk, maxDisk-totalSize)
+    ///                      : diskFree-freeDisk`, and assert `is_violated()`
+    /// tracks `avail <= 0` exactly as JE asserts on `getAvailableLogSize()`
+    /// and `getDiskLimitViolation()`.
+    ///
+    /// JE `testFreeDiskSubtraction` is N/A: it verifies JE's
+    /// `adjustedMaxDiskLimit` (subtract freeDisk from maxDisk only when
+    /// maxDisk>10GB or freeDisk is explicit). Noxu applies maxDisk and the
+    /// freeDisk reserve as INDEPENDENT limits (no adjustedMax), so that
+    /// conditional-subtraction behaviour does not exist here.
+    #[test]
+    fn je_disk_limit_test_available_log_size() {
+        // Row shape: (freeDisk, maxDisk, diskFree, totalSize, expect_violation)
+        // Derived from JE checkAvailableSize rows, dropping the reserved (25)
+        // and protected (5) contributions that Noxu does not model.
+        //
+        //   avail = (maxDisk>0) ? min(diskFree-freeDisk, maxDisk-totalSize)
+        //                       : diskFree-freeDisk
+        let cases: &[(u64, u64, u64, u64, bool)] = &[
+            // freeDisk only (maxDisk=0): avail = diskFree - freeDisk.
+            (5, 0, 20, 0, false), // 20-5=15 > 0 -> ok
+            (25, 0, 5, 0, true),  // 5-25=-20 <= 0 -> violated
+            (30, 0, 5, 0, true),  // 5-30=-25 <= 0 -> violated
+            // maxDisk cap governs: avail = min(diskFree-freeDisk, maxDisk-total)
+            (5, 100, 20, 50, false), // min(15, 50) = 15 > 0 -> ok
+            (25, 100, 20, 95, true), // min(-5, 5) = -5 <= 0 -> violated (freeDisk)
+            (5, 80, 20, 80, true), // min(15, 0) = 0 <= 0 -> violated (maxDisk)
+            (5, 80, 20, 79, false), // min(15, 1) = 1 > 0 -> ok
+        ];
+        for &(free_disk, max_disk, disk_free, total, expect) in cases {
+            let t = DiskLimitTracker::new(max_disk, free_disk, 0, None);
+            t.recalc(total, disk_free);
+            assert_eq!(
+                t.is_violated(),
+                expect,
+                "freeDisk={free_disk} maxDisk={max_disk} diskFree={disk_free} \
+                 total={total}: expected violation={expect}"
+            );
+        }
+    }
 }
