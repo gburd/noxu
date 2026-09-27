@@ -275,6 +275,11 @@ listed in [References](#references).
   non-electable, empty, and non-member targets up-front and treats a self-target as
   an immediate success (matching JE `RepNode.transferMaster`). Found by a faithful
   port of JE's `MasterTransferTest`.
+- **VLSN index lookups are range-gated (je.rep.vlsn parity).** `VlsnIndex::get_lsn`
+  now returns `None` for a VLSN outside the current VLSN range, enforcing JE's
+  documented contract that the VLSN range is the boundary authority. Both callers
+  (syncup matchpoint selection and the CBVLSN→cleaner protection floor) become
+  strictly more conservative (no false matchpoint; never a premature file deletion).
 
 - **WAL now fail-stops the environment on a critical log-write failure (JE
   `LogManager.serialLog` parity).** A failed or partial WAL write previously left
