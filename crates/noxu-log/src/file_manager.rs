@@ -1066,6 +1066,22 @@ mod tests {
         assert_eq!(parse_file_number("00000000.txt"), None);
     }
 
+    // JE: FileStoreInfoTest.testJava7 (portable half) -- FileStoreInfo.getInfo
+    // for a real path reports usable space > 0.  JE's testJava6/testJava7 also
+    // exercise the Java-version reflection dichotomy (Class.forName of the
+    // java.nio FileStore class; Java 6 throws UnsupportedOperationException),
+    // which is Java-platform-only and N/A in Rust.  The portable assertion --
+    // usable/free space for an existing directory is positive -- is checked
+    // here against Noxu's fs2::available_space-backed disk_free_space().
+    #[test]
+    fn test_disk_free_space_positive() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager =
+            FileManager::new(temp_dir.path(), false, 10_000_000, 100).unwrap();
+        let free = manager.disk_free_space().unwrap();
+        assert!(free > 0, "usable space greater than zero");
+    }
+
     #[test]
     fn test_file_manager_create() {
         let temp_dir = TempDir::new().unwrap();

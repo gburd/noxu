@@ -2409,6 +2409,13 @@ mod tests {
     }
 
     // exception_listener (JE ExceptionListener)
+    // JE: ExceptionListenerTest.testExceptionListener -- a listener registered
+    // on the env config is invoked (with the failing daemon thread name) when
+    // a daemon thread throws; this drives the same dispatch path.  The
+    // "open without a listener -> null/uninstalled" half of the JE test is
+    // covered by test_no_exception_listener_leaves_sink_uninstalled below.
+    // (Noxu dispatches the error synchronously rather than spinning a real
+    // daemon that yields until shutdown -- language/API deviation, same intent.)
     #[test]
     fn test_exception_listener_fires_on_daemon_error() {
         use crate::error::{
@@ -2459,6 +2466,8 @@ mod tests {
         env.close().unwrap();
     }
 
+    // JE: ExceptionListenerTest.testExceptionListener (no-listener half:
+    // envConfig.setExceptionListener(null) -> assertNull getExceptionListener).
     #[test]
     fn test_no_exception_listener_leaves_sink_uninstalled() {
         let (_temp_dir, config) = temp_env_config();

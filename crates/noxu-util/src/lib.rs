@@ -38,12 +38,15 @@
 //! `#[cfg(not(target_os = "linux"))]`; on non-Linux platforms the tests run
 //! with software-only fault injection (`TcNetemGuard::active == false`).
 
+pub mod bitmap;
 pub mod clock;
 pub mod daemon;
 pub mod dst_invariants;
 pub mod dst_sync;
 pub mod dst_sync_pl;
+pub mod long_diff;
 pub mod lsn;
+pub mod moving_avg;
 pub mod packed;
 pub mod prng;
 pub mod stats;
