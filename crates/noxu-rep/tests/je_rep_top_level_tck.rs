@@ -476,6 +476,18 @@ fn node_priority_higher_vlsn_can_be_master() {
 
 /// JE: `MasterChangeTest.testTransitions` (master-switch subset).
 ///
+/// Also cited for `je.rep.impl.RoundRobinTest.testRoundRobinMasters`,
+/// `je.rep.impl.ReplayWithBinDeltaInsertionsTest.testRoundRobinMasters`,
+/// and `je.rep.impl.DTVLSNTest.testMultiGenerationalStream`: each of those
+/// JE tests brings up N nodes, does work, then round-robins the master role
+/// through the group asserting every node holds identical committed data
+/// (`checkNodeEquality`) after each switch — the same master-rotation +
+/// data-preservation invariant this test drives.  The BIN-delta-insertion
+/// variant additionally exercises tree-layer BIN-delta *replay* (a
+/// noxu-tree / noxu-recovery concern, out of the rep group-behavior scope
+/// covered here); `testMultiGenerationalStream` additionally checks DTVLSN
+/// replay-sequencing, covered by `je_rep_impl_tck::dtvlsn_is_advance_only`.
+///
 /// JE's `testTransitions` does FIVE rounds of switching the master (by
 /// mimicking network partitions) and, per round, asserts (a) the master
 /// actually changes and the committed data is preserved across the switch,
