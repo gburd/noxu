@@ -268,6 +268,13 @@ listed in [References](#references).
   missed records inserted via `put_no_overwrite`. It now maintains registered
   secondaries identically to `put` (matching JE, where all put modes funnel through
   one path). Found by a faithful port of JE's `JoinTest`.
+- **`transfer_master` now validates the target node (NEW-XFER-VALIDATE).** A master
+  hand-off to a node that can never become master (a `SECONDARY`/`MONITOR`), an
+  empty target, or a non-member previously proceeded blind rather than being
+  rejected; a self-as-target transfer wrongly errored. The transfer now rejects
+  non-electable, empty, and non-member targets up-front and treats a self-target as
+  an immediate success (matching JE `RepNode.transferMaster`). Found by a faithful
+  port of JE's `MasterTransferTest`.
 
 - **WAL now fail-stops the environment on a critical log-write failure (JE
   `LogManager.serialLog` parity).** A failed or partial WAL write previously left
