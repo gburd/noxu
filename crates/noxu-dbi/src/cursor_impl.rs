@@ -325,7 +325,151 @@ impl Drop for PinnedBinGuard {
     }
 }
 
+/// Sentinel `current_index` value produced by `get_first` / `get_last` when the
+/// leftmost / rightmost BIN is physically EMPTY (all slots removed by committed
+/// deletes, not yet pruned).  The outer match re-descends to the first / last
+/// NON-EMPTY BIN via `position_edge_live_slot` (NEW-REC-2).  Distinct from `-1`
+/// (which the KD-edge-BIN path uses to mean "anchor + delegate to
+/// retrieve_next").
+const EMPTY_EDGE_BIN: i32 = -2;
+
 impl CursorImpl {
+    /// Position the cursor on the first (`forward = true`) / last
+    /// (`forward = false`) LIVE record, re-descending to the first / last
+    /// NON-EMPTY BIN via the shared `descend_to_edge_bin` empty-skipping edge
+    /// walk (`Tree::first_nonempty_bin_pinned` / `last_nonempty_bin_pinned`).
+    ///
+    /// NEW-REC-2: called from `get_first` / `get_last` when the leftmost /
+    /// rightmost BIN is physically empty (a `Get::First`/`Get::Last`+delete
+    /// loop over a dup chain that spans several BINs empties the edge BIN).
+    /// This shares the SAME cross-BIN traversal primitive `get_next_bin`
+    /// (NEW-3) uses, so `Get::First`/`Get::Last` position on the true edge
+    /// live record without synthetic-key routing (which mis-routed under a
+    /// sorted-dup comparator, draining tail dups and orphaning middle ones).
+    ///
+    /// If the edge non-empty BIN is entirely known_deleted (BIN-delta
+    /// reconstitution window), anchor on its edge key and delegate to
+    /// `retrieve_next`, which crosses BINs skipping KD slots (the KD-cross path
+    /// works because it anchors on a REAL slot key, not the synthetic empty
+    /// key).  Mirrors JE `CursorImpl.getFirst`/`getLast` falling into the
+    /// `getNext`/`getPrev` KD-skip loop.
+    fn position_edge_live_slot(
+        &mut self,
+        forward: bool,
+    ) -> Result<OperationStatus, DbiError> {
+        use noxu_tree::tree::TreeNode;
+
+        // Re-descend to the first/last NON-EMPTY BIN (skips physically-empty
+        // edge BINs, re-faults evicted children), pinned under one latch.
+        let edge: Option<(
+            Vec<(BinEntry, Lsn, Vec<u8>)>,
+            std::sync::Arc<noxu_tree::NodeRwLock<TreeNode>>,
+        )> = {
+            let db = self.db_impl.read();
+            match db.get_real_tree() {
+                Some(tree) => {
+                    if forward {
+                        tree.first_nonempty_bin_pinned()
+                    } else {
+                        tree.last_nonempty_bin_pinned()
+                    }
+                }
+                None => None,
+            }
+        };
+
+        let (entries, pinned_arc) = match edge {
+            Some((e, arc)) if !e.is_empty() => (e, arc),
+            Some((_, arc)) => {
+                // Physically empty (should not happen — descend skips empties).
+                noxu_tree::Tree::unpin_bin(&arc);
+                if forward {
+                    self.lock_eof_for_scan()?;
+                }
+                return Ok(OperationStatus::NotFound);
+            }
+            None => {
+                // Every BIN physically empty → tree logically empty.
+                if forward {
+                    self.lock_eof_for_scan()?;
+                }
+                return Ok(OperationStatus::NotFound);
+            }
+        };
+
+        // RAII pin release on any early return / `?` before install.
+        let pin_guard = PinnedBinGuard::new(pinned_arc);
+
+        // First (forward) / last (backward) LIVE slot, skipping KD slots.
+        let live_pos = if forward {
+            entries.iter().position(|e| !e.0.known_deleted)
+        } else {
+            entries.iter().rposition(|e| !e.0.known_deleted)
+        };
+
+        let Some(pos) = live_pos else {
+            // Edge BIN entirely known_deleted: anchor on its edge key and
+            // delegate to retrieve_next, which crosses BINs skipping KD slots.
+            // This uses a REAL slot key (not the synthetic empty key), so the
+            // cross-BIN routing is correct.
+            drop(pin_guard);
+            let anchor = if forward {
+                entries.last().map(|e| e.2.clone())
+            } else {
+                entries.first().map(|e| e.2.clone())
+            };
+            match anchor {
+                Some(k) => {
+                    self.current_key = Some(k);
+                    self.current_index = 0;
+                    self.state = CursorState::PendingDeleted;
+                    self.update_bin_pin(None);
+                    return self.retrieve_next(if forward {
+                        GetMode::Next
+                    } else {
+                        GetMode::Prev
+                    });
+                }
+                None => {
+                    if forward {
+                        self.lock_eof_for_scan()?;
+                    }
+                    return Ok(OperationStatus::NotFound);
+                }
+            }
+        };
+
+        let idx = pos as i32;
+        let (e, e_lsn, e_key) = &entries[pos];
+        let raw_key = e_key.clone();
+        let raw_data = e.data.clone().unwrap_or_default();
+        let lsn = e_lsn.as_u64();
+
+        // `lock_ln` may Err (deadlock / RangeRestart); the guard drops and
+        // releases the descent pin so the evictor is not wedged.
+        self.lock_ln(lsn)?;
+        // READ_COMMITTED revalidation (C1/V1): re-derive from the pinned slot
+        // if its LSN moved during the prefetch->lock window.  The BIN is
+        // pinned, so the evictor cannot have detached/re-faulted it under us.
+        let (raw_key, raw_data, lsn) = match Self::revalidate_locked_slot(
+            pin_guard.arc(),
+            idx as usize,
+            lsn,
+        ) {
+            Some(Some((rk, rd, rl))) => (rk, rd, rl),
+            _ => (raw_key, raw_data, lsn),
+        };
+        self.current_key = Some(raw_key);
+        self.current_data = Some(raw_data);
+        self.current_lsn = lsn;
+        self.current_index = idx;
+        self.state = CursorState::Initialized;
+        self.rehydrate_current_data();
+        // Install the already-pinned BIN (pin-next-before-unpin-current).
+        self.update_bin_pin_prepinned(pin_guard.into_arc());
+        Ok(OperationStatus::Success)
+    }
+
     /// Creates a new CursorImpl for the given database.
     ///
     /// The cursor is initially in the NotInitialized state and must be
@@ -2200,24 +2344,37 @@ impl CursorImpl {
                             match &*g {
                                 TreeNode::Bottom(bin) => {
                                     if bin.entries.is_empty() {
-                                        // JE `CursorImpl.positionFirstOrLast`
-                                        // (CursorImpl.java:1765-1772): an
-                                        // empty leftmost BIN (every slot
-                                        // physically removed by delete, not
-                                        // yet pruned) is treated as FOUND with
-                                        // index=-1 — NOT not-found — so getNext
-                                        // crosses to the first live BIN to the
-                                        // right.  Anchor on the empty byte key
-                                        // (≤ every key, so it routes into this
-                                        // leftmost subtree) and delegate to
-                                        // retrieve_next, which crosses via
-                                        // get_next_bin.  Without this the scan
-                                        // returns NotFound even though live
-                                        // BINs exist (NEW-4).
+                                        // NEW-REC-2: the leftmost BIN is
+                                        // physically empty (every slot removed
+                                        // by a committed delete, not yet pruned
+                                        // by the compressor).  A
+                                        // `Get::First`+delete loop over a dup
+                                        // chain that spans several BINs empties
+                                        // the leftmost BIN and must re-descend
+                                        // to the leftmost LIVE record.  Signal
+                                        // "empty leftmost BIN" to the outer
+                                        // match (idx == EMPTY_EDGE_BIN) so it
+                                        // re-descends via
+                                        // `first_nonempty_bin_pinned` — the SAME
+                                        // `descend_to_edge_bin` empty-skipping
+                                        // edge walk that `get_next_bin` (NEW-3
+                                        // cross-BIN traversal) uses.  The prior
+                                        // path anchored on a synthetic empty
+                                        // byte key and delegated to
+                                        // retrieve_next, but empty-key routing
+                                        // through `bin_arc_for_key` floors to
+                                        // the WRONG BIN under a sorted-dup
+                                        // comparator (tail, not leftmost live),
+                                        // draining tail dups and orphaning the
+                                        // middle ones (6/12).  JE
+                                        // `CursorImpl.positionFirstOrLast`
+                                        // (CursorImpl.java:1765) → getFirst
+                                        // falling into the getNext empty-leaf
+                                        // skip.
                                         return Some((
                                             Vec::new(),
                                             Bytes::new(),
-                                            -1i32,
+                                            EMPTY_EDGE_BIN,
                                             0u64,
                                             bin_arc.clone(),
                                         ));
@@ -2265,6 +2422,15 @@ impl CursorImpl {
 
         match result {
             Some((key, data, idx, lsn, bin_arc)) => {
+                if idx == EMPTY_EDGE_BIN {
+                    // NEW-REC-2: the leftmost BIN is physically empty.  Release
+                    // its (unused) pin and re-descend to the first NON-EMPTY
+                    // BIN via the shared empty-skipping edge walk, then position
+                    // on its first live slot.  No synthetic-key routing.
+                    drop(bin_arc);
+                    let _ = (key, data, lsn);
+                    return self.position_edge_live_slot(true);
+                }
                 if idx < 0 {
                     // TREE-F1: edge BIN was entirely known_deleted.  Anchor on
                     // its edge key (PendingDeleted-style) and delegate to
@@ -2364,23 +2530,25 @@ impl CursorImpl {
                                 TreeNode::Bottom(bin) => {
                                     let n = bin.entries.len();
                                     if n == 0 {
-                                        // JE `CursorImpl.positionFirstOrLast`
-                                        // (CursorImpl.java:1765-1772): an
-                                        // empty rightmost BIN is treated as
-                                        // FOUND/index=-1 so getPrev crosses to
-                                        // the previous live BIN.  Anchor on
-                                        // the parent separator that routes
-                                        // into this rightmost subtree and
-                                        // delegate to retrieve_next(Prev),
-                                        // which crosses via get_prev_bin.
-                                        // (Symmetric to get_first's empty-BIN
-                                        // path — NEW-4.)
-                                        let anchor =
-                                            empty_anchor.unwrap_or_default();
+                                        // NEW-REC-2 (symmetric): the rightmost
+                                        // BIN is physically empty.  Signal
+                                        // "empty edge BIN" (idx ==
+                                        // EMPTY_EDGE_BIN) so the outer match
+                                        // re-descends to the last NON-EMPTY BIN
+                                        // via `last_nonempty_bin_pinned` — the
+                                        // same `descend_to_edge_bin`
+                                        // empty-skipping edge walk NEW-3 uses —
+                                        // rather than anchoring on the parent
+                                        // separator and routing through
+                                        // retrieve_next (which mis-routes for
+                                        // spanning dup chains, mirror of the
+                                        // get_first defect).  JE
+                                        // `CursorImpl.positionFirstOrLast`.
+                                        let _ = &empty_anchor;
                                         return Some((
-                                            anchor,
+                                            Vec::new(),
                                             Bytes::new(),
-                                            -1i32,
+                                            EMPTY_EDGE_BIN,
                                             0u64,
                                             bin_arc.clone(),
                                         ));
@@ -2429,6 +2597,13 @@ impl CursorImpl {
 
         match result {
             Some((key, data, idx, lsn, bin_arc)) => {
+                if idx == EMPTY_EDGE_BIN {
+                    // NEW-REC-2 (symmetric): rightmost BIN physically empty.
+                    // Release its pin and re-descend to the last NON-EMPTY BIN.
+                    drop(bin_arc);
+                    let _ = (key, data, lsn);
+                    return self.position_edge_live_slot(false);
+                }
                 if idx < 0 {
                     // TREE-F1: rightmost BIN entirely known_deleted.  Anchor
                     // and delegate to retrieve_next (Prev), which crosses

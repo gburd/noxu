@@ -366,17 +366,18 @@ fn reverse_split_dups_recovers() {
 // Uses a cursor Get::First + delete loop to remove every dup (JE's
 // setupCompleteRemoval deletes via a getNext cursor loop).
 // ===========================================================================
+// NEW-REC-2 (FIXED): a `Get::First`+delete loop over a duplicate chain that
+// spans several BINs at NODE_MAX=4 previously removed only 6 of 12 dups — the
+// leftmost BIN emptied, and `get_first`'s empty-leftmost-BIN fall-through
+// anchored on a synthetic empty key that mis-routed through `bin_arc_for_key`
+// under the sorted-dup comparator (floored to the tail BIN, not the leftmost
+// live one), draining the tail dups and orphaning the middle ones.  Fixed by
+// re-descending to the first NON-EMPTY BIN via the shared `descend_to_edge_bin`
+// empty-skipping edge walk (`Tree::first_nonempty_bin_pinned`) — the same
+// cross-BIN traversal primitive NEW-3's `get_next_bin` uses.  Distinct from
+// NEW-3 (which fixed the `Get::Next` path).  JE:
+// CheckReverseSplitsTest.testCompleteRemovalDups + CursorImpl.positionFirstOrLast.
 #[test]
-#[ignore = "KNOWN BUG NEW-3 class (cross-BIN cursor delete), NOT flaky. Once \
-            the dup chain under one key spans multiple BINs at NODE_MAX=4, the \
-            cursor Get::First+delete loop removes only 6 of 12 dups (stops at \
-            the first BIN boundary) — the same cross-BIN cursor-delete \
-            traversal defect NEW-3 tracks, here on the duplicate chain. \
-            Reproduces in debug AND release. Control: the isolated \
-            single-key/point delete_in path removes all dups correctly (see \
-            report probes), so this is the cursor traversal, not durability. \
-            Fix the cursor cross-BIN delete traversal (shared with NEW-3); do \
-            NOT weaken this test. JE: CheckReverseSplitsTest.testCompleteRemovalDups."]
 fn complete_removal_dups_recovers() {
     const NODE_MAX: u32 = 4;
     let dir = TempDir::new().unwrap();
@@ -444,8 +445,156 @@ fn complete_removal_dups_recovers() {
         got, expected,
         "complete-removal-dups: recovered dup set != post-removal inserts"
     );
+
+    // NEW-4 lesson: do NOT trust the cursor scan alone.  Cross-check every
+    // (key,data) pair by POINT-GET (`Get::SearchBoth`) and by `count()`.
+    {
+        // All 12 originally-deleted dups must be ABSENT after recovery.
+        for i in 0u32..max {
+            let d = ikey(i).into_bytes();
+            let mut c = db.open_cursor(None).unwrap();
+            let mut k = DatabaseEntry::from_bytes(&key);
+            let mut dv = DatabaseEntry::from_bytes(&d);
+            assert_eq!(
+                c.get(&mut k, &mut dv, Get::SearchBoth, None).unwrap(),
+                OperationStatus::NotFound,
+                "deleted dup #{i} must be absent after recovery (point-get)"
+            );
+            c.close().unwrap();
+        }
+        // The 5 post-removal inserts must all be present by point-get, and
+        // count() at the key must equal exactly 5.
+        let mut counted: Option<u64> = None;
+        for d in &expected {
+            let mut c = db.open_cursor(None).unwrap();
+            let mut k = DatabaseEntry::from_bytes(&key);
+            let mut dv = DatabaseEntry::from_bytes(d);
+            assert_eq!(
+                c.get(&mut k, &mut dv, Get::SearchBoth, None).unwrap(),
+                OperationStatus::Success,
+                "surviving dup {d:?} must be present after recovery (point-get)"
+            );
+            if counted.is_none() {
+                counted = Some(c.count().unwrap());
+            }
+            c.close().unwrap();
+        }
+        assert_eq!(
+            counted,
+            Some(expected.len() as u64),
+            "count() at key must equal the surviving dup set size"
+        );
+    }
     drop(db);
     drop(env);
+}
+
+// ===========================================================================
+// NEW-REC-2 guard A: `Get::Next`+delete over the SAME spanning dup chain
+// (12 dups under one key at NODE_MAX=4) must remove all 12 — the NEW-3 path
+// must NOT regress.  Distinct entry point from `Get::First` (NEW-REC-2), same
+// topology.
+// ===========================================================================
+#[test]
+fn complete_removal_dups_get_next_still_12() {
+    const NODE_MAX: u32 = 4;
+    let dir = TempDir::new().unwrap();
+    let max = 12u32;
+    let key = b"dupkey".to_vec();
+
+    let env = open_env(dir.path(), NODE_MAX);
+    let db = open_db(&env, true);
+    for i in 0u32..max {
+        let d = ikey(i).into_bytes();
+        db.put(DatabaseEntry::from_bytes(&key), DatabaseEntry::from_bytes(&d))
+            .unwrap();
+    }
+
+    // Delete every dup by advancing with Get::Next (NEW-3 cross-BIN path).
+    let mut c = db.open_cursor(None).unwrap();
+    let mut k = DatabaseEntry::new();
+    let mut d = DatabaseEntry::new();
+    let mut count = 0u32;
+    let mut s = c.get(&mut k, &mut d, Get::First, None).unwrap();
+    while s == OperationStatus::Success {
+        assert_eq!(c.delete().unwrap(), OperationStatus::Success);
+        count += 1;
+        s = c.get(&mut k, &mut d, Get::Next, None).unwrap();
+    }
+    assert_eq!(count, max, "Get::Next+delete must remove all {max} dups");
+    c.close().unwrap();
+
+    // Point-get sweep: every dup absent.
+    for i in 0u32..max {
+        let d = ikey(i).into_bytes();
+        let mut c = db.open_cursor(None).unwrap();
+        let mut kk = DatabaseEntry::from_bytes(&key);
+        let mut dv = DatabaseEntry::from_bytes(&d);
+        assert_eq!(
+            c.get(&mut kk, &mut dv, Get::SearchBoth, None).unwrap(),
+            OperationStatus::NotFound,
+            "dup #{i} must be absent after Get::Next+delete"
+        );
+        c.close().unwrap();
+    }
+    assert!(
+        !collect_dups(&db).contains_key(&key),
+        "no dups should remain after Get::Next+delete"
+    );
+    db.close().unwrap();
+    env.close().unwrap();
+}
+
+// ===========================================================================
+// NEW-REC-2 guard B: a SINGLE-BIN dup chain (dups fit in one BIN) via
+// `Get::First`+delete must remove all — the fix must not break the common
+// non-spanning case.  NODE_MAX=0 (default fanout) keeps 3 dups in one BIN.
+// ===========================================================================
+#[test]
+fn single_bin_dups_get_first_removes_all() {
+    let dir = TempDir::new().unwrap();
+    let max = 3u32; // fits comfortably in one BIN at default fanout
+    let key = b"dupkey".to_vec();
+
+    let env = open_env(dir.path(), 0);
+    let db = open_db(&env, true);
+    for i in 0u32..max {
+        let d = ikey(i).into_bytes();
+        db.put(DatabaseEntry::from_bytes(&key), DatabaseEntry::from_bytes(&d))
+            .unwrap();
+    }
+
+    let mut c = db.open_cursor(None).unwrap();
+    let mut k = DatabaseEntry::new();
+    let mut d = DatabaseEntry::new();
+    let mut count = 0u32;
+    while c.get(&mut k, &mut d, Get::First, None).unwrap()
+        == OperationStatus::Success
+    {
+        assert_eq!(c.delete().unwrap(), OperationStatus::Success);
+        count += 1;
+    }
+    assert_eq!(
+        count, max,
+        "single-BIN Get::First+delete must remove all {max} dups"
+    );
+    c.close().unwrap();
+
+    for i in 0u32..max {
+        let d = ikey(i).into_bytes();
+        let mut c = db.open_cursor(None).unwrap();
+        let mut kk = DatabaseEntry::from_bytes(&key);
+        let mut dv = DatabaseEntry::from_bytes(&d);
+        assert_eq!(
+            c.get(&mut kk, &mut dv, Get::SearchBoth, None).unwrap(),
+            OperationStatus::NotFound,
+            "single-BIN dup #{i} must be absent"
+        );
+        c.close().unwrap();
+    }
+    assert!(!collect_dups(&db).contains_key(&key), "no dups should remain");
+    db.close().unwrap();
+    env.close().unwrap();
 }
 
 // ===========================================================================
