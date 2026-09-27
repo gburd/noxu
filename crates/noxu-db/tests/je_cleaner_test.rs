@@ -617,12 +617,13 @@ fn util_reuse_slot_after_delete() {
 /// Write a record and checkpoint (root clean), then dirty the BIN and
 /// checkpoint again: the prior BIN and its parent IN become obsolete. JE reads
 /// per-file `obsoleteINCount`; we assert the aggregate obsolete-IN count rises.
+// NEW-CLEANER-IN-OBSOLETE FIXED: the checkpointer now counts the superseded
+// prior full BIN image (b.last_full_lsn, captured before
+// clear_dirty_after_full_log) and the prior full upper-IN image (parent-slot /
+// root LSN) obsolete on the same tracker path the BIN-delta obsolete LSNs use,
+// mirroring JE IN.afterLogCommon (params.oldLsn = getPrevFullLsn()) and the
+// merged NEW-6 evictor-path sibling.  This port is the acceptance test.
 #[test]
-#[ignore = "NEW-CLEANER-IN-OBSOLETE: superseded full BIN/IN versions are not \
-counted obsolete at checkpoint (checkpointer.rs flush_one_tree_bins full-BIN \
-path logs the new IN without passing b.last_full_lsn as obsolete; only the \
-BIN-delta path counts obsolete). JE IN.afterLog counts getLastFullVersion() \
-obsolete. Control: obsolete_ln_count is counted correctly on the same path."]
 fn in_util_basic_checkpoint_obsoletes_ins() {
     let dir = TempDir::new().unwrap();
     let env = open_util_env(dir.path());
@@ -654,11 +655,11 @@ fn in_util_basic_checkpoint_obsoletes_ins() {
 /// JE `INUtilizationTest.testRecovery` (portable core): IN utilization counted
 /// across a close/reopen. After writing, checkpointing, and reopening, prior
 /// IN versions must have been counted obsolete (utilization is recovered).
+// NEW-CLEANER-IN-OBSOLETE FIXED: obsolete_in_count is now populated at
+// checkpoint (see in_util_basic_checkpoint_obsoletes_ins).  This port
+// additionally asserts the obsolete-IN accounting is re-derived across a
+// close/reopen recovery cycle.
 #[test]
-#[ignore = "NEW-CLEANER-IN-OBSOLETE: obsolete_in_count is never populated (see \
-in_util_basic_checkpoint_obsoletes_ins). Data survival across recovery is \
-separately covered by clean_log_recovery_test; this port additionally asserts \
-the obsolete-IN accounting, which is the piece that is not yet wired."]
 fn in_util_recovery_preserves_utilization() {
     let dir = TempDir::new().unwrap();
 
@@ -668,6 +669,13 @@ fn in_util_recovery_preserves_utilization() {
         for i in 0..5u32 {
             db.put(ikey(i), ikey(i)).unwrap();
         }
+        // First checkpoint establishes the prior full BIN/IN on-disk versions
+        // (JE `openAndWriteDatabase` checkpoints, capturing binFile/inFile).
+        env.checkpoint(Some(&force())).unwrap();
+        // Update to dirty the BIN, then checkpoint again: the prior full BIN
+        // and its parent IN are superseded and become obsolete (JE re-logs the
+        // BIN/IN via `logBINAndIN` and asserts `expectObsolete(binFile/inFile,
+        // true)`).
         db.put(ikey(0), ikey(99)).unwrap();
         env.checkpoint(Some(&force())).unwrap();
         assert!(
