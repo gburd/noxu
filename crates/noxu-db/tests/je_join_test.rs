@@ -472,3 +472,154 @@ fn je_join_test_new_join_1_large_dup_set_no_candidates_dropped() {
     );
     assert_eq!(got, expected, "join must be exactly the even-keyed subset");
 }
+
+/// NEW-PNO-SEC-1 (secondary data-integrity): the JE `JoinTest.testJoin`
+/// matrix run through `Database::put_no_overwrite` instead of `put`.
+///
+/// This is the primary repro for NEW-PNO-SEC-1.  Before the fix,
+/// `put_no_overwrite_bytes` fired put-triggers on a successful insert but
+/// never called `hook.maintain(...)`, so every registered secondary was left
+/// WITHOUT the new entry — the join over those secondaries returned nothing
+/// (or the wrong set).  After the fix, `put_no_overwrite` maintains
+/// secondaries exactly like `put`, so this test matches
+/// `je_join_test_test_join` (the via-`put` control) byte for byte.
+///
+/// Fails on base 0c54a122 (secondaries empty after put_no_overwrite → join
+/// intersection mismatch); passes on fix.
+#[test]
+fn je_join_test_test_join_via_put_no_overwrite() {
+    for (set_num, case) in CASES.iter().enumerate() {
+        for with_data in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let env = open_env(&dir);
+            let primary = open_primary(&env, "pri");
+            let sec = [
+                open_secondary(&env, &primary, "sec0", 0),
+                open_secondary(&env, &primary, "sec1", 1),
+                open_secondary(&env, &primary, "sec2", 2),
+            ];
+
+            // Populate the primary via put_no_overwrite; secondaries must
+            // auto-maintain via hooks (NEW-PNO-SEC-1).  Every pk in a case is
+            // distinct, so each no-overwrite is a fresh insert (Ok(true)).
+            {
+                let pri = primary.lock();
+                for (pk, d) in case.data {
+                    let inserted = pri.put_no_overwrite([*pk], &d[..]).unwrap();
+                    assert!(
+                        inserted,
+                        "set#{} pk={pk}: put_no_overwrite of a distinct key \
+                         must insert",
+                        set_num + 1
+                    );
+                }
+            }
+
+            for (search, expected) in case.joins {
+                for no_sort in [false, true] {
+                    let mut want: Vec<u8> = expected.to_vec();
+                    want.sort_unstable();
+                    let got = run_join(
+                        &primary, &sec, *search, no_sort, with_data, case.data,
+                    );
+                    assert_eq!(
+                        got,
+                        want,
+                        "set#{} search={:?} no_sort={} with_data={}: join \
+                         intersection mismatch (secondaries not maintained by \
+                         put_no_overwrite? — NEW-PNO-SEC-1)",
+                        set_num + 1,
+                        search,
+                        no_sort,
+                        with_data
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// NEW-PNO-SEC-1 focused control: a single `put_no_overwrite` insert must be
+/// visible via the SECONDARY index (query by secondary key finds the record).
+///
+/// Fails on base (secondary empty → not found); passes on fix.
+#[test]
+fn je_join_test_pno_sec_1_put_no_overwrite_maintains_secondary() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let primary = open_primary(&env, "pri");
+    let sec = open_secondary(&env, &primary, "sec0", 0);
+
+    // Insert pk=42 with data byte0=7 via put_no_overwrite (fresh key).
+    {
+        let pri = primary.lock();
+        let inserted = pri.put_no_overwrite([42u8], [7u8, 0, 0]).unwrap();
+        assert!(inserted, "fresh key must insert");
+    }
+
+    // The secondary index (keyed on data byte 0 = 7) must now contain the
+    // entry — query by secondary key '7' must find primary key 42 and its
+    // data.  Before the fix the secondary was empty, so this returned false.
+    let mut p_key = DatabaseEntry::new();
+    let mut data = DatabaseEntry::new();
+    let found = sec.get_into(None, [7u8], &mut p_key, &mut data).unwrap();
+    assert!(
+        found,
+        "secondary query by key must find the put_no_overwrite record \
+         (NEW-PNO-SEC-1)"
+    );
+    assert_eq!(p_key.data_opt().unwrap(), &[42u8][..], "primary key mismatch");
+    assert_eq!(
+        data.data_opt().unwrap(),
+        &[7u8, 0, 0][..],
+        "primary data mismatch"
+    );
+}
+
+/// NEW-PNO-SEC-1 dup-key control: a `put_no_overwrite` that FAILS because the
+/// key already exists must NOT touch the secondary index (no change → no
+/// maintain).  A successful `put` establishes the record and its secondary
+/// entry; a subsequent `put_no_overwrite` with a DIFFERENT data value must
+/// return false and leave both the primary AND the old secondary entry intact
+/// (the new secondary key must NOT appear).
+#[test]
+fn je_join_test_pno_sec_1_dup_key_does_not_maintain_secondary() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let primary = open_primary(&env, "pri");
+    let sec = open_secondary(&env, &primary, "sec0", 0);
+
+    {
+        let pri = primary.lock();
+        // Establish pk=42 with secondary key '7'.
+        let inserted = pri.put_no_overwrite([42u8], [7u8, 0, 0]).unwrap();
+        assert!(inserted);
+        // Now attempt a no-overwrite with a DIFFERENT data value whose
+        // secondary key would be '9'.  The key already exists, so this must
+        // FAIL (return false) and NOT insert / NOT maintain secondaries.
+        let inserted2 = pri.put_no_overwrite([42u8], [9u8, 0, 0]).unwrap();
+        assert!(
+            !inserted2,
+            "put_no_overwrite of an existing key must return false"
+        );
+    }
+
+    // The original secondary key '7' is still present (the primary is
+    // unchanged).
+    assert!(
+        sec.exists(None, &DatabaseEntry::from_bytes(&[7u8])).unwrap(),
+        "the original secondary entry must survive a failed no-overwrite"
+    );
+    // The would-be new secondary key '9' must NOT exist — the failed
+    // no-overwrite made no change, so it maintained nothing.
+    assert!(
+        !sec.exists(None, &DatabaseEntry::from_bytes(&[9u8])).unwrap(),
+        "a failed no-overwrite must NOT create a secondary entry \
+         (NEW-PNO-SEC-1: no change → no maintain)"
+    );
+    // And the primary data is unchanged (still byte0=7).
+    let pri = primary.lock();
+    let mut data = DatabaseEntry::new();
+    assert!(pri.get_into(None, [42u8], &mut data).unwrap());
+    assert_eq!(data.data_opt().unwrap(), &[7u8, 0, 0][..]);
+}

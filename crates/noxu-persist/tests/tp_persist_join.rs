@@ -175,7 +175,6 @@ fn assert_all_cases(
 ///
 /// JE: `com.sleepycat.persist.test.JoinTest.testJoin`
 #[test]
-#[ignore = "NEW-PNO-SEC-1: put_no_overwrite does not maintain secondary indexes"]
 fn join_test_test_join() {
     let td = TempDir::new().unwrap();
     let env = Environment::open(
