@@ -47,6 +47,15 @@ struct FreezeState {
     generation: u64,
     /// True while a freeze is in effect (the latch is "closed").
     frozen: bool,
+    /// Pending election-driven thaw: set by `vlsn_event` when an election
+    /// result of the current-or-newer round lifts an active freeze, and
+    /// consumed by the next `await_thaw`. This mirrors JE's persistent
+    /// `CountDownLatch`, whose count-down is remembered until `awaitThaw`
+    /// observes it (`awaitThaw` returns true / `awaitElectionCount++`), so an
+    /// election event that arrives *before* the replay thread waits is not
+    /// silently lost. Cleared by `freeze` (re-arm), `clear_latch`, and once
+    /// consumed by `await_thaw`.
+    thawed_by_election: bool,
 }
 
 /// Diagnostic counters (JE `freezeCount` / `awaitTimeoutCount` /
@@ -81,6 +90,7 @@ impl CommitFreezeLatch {
                 freeze_end: None,
                 generation: 0,
                 frozen: false,
+                thawed_by_election: false,
             }),
             thaw_signal: Condvar::new(),
             timeout: DEFAULT_LATCH_TIMEOUT,
@@ -116,6 +126,8 @@ impl CommitFreezeLatch {
         st.proposal = Some(freeze_proposal);
         st.freeze_end = Some(Instant::now() + self.timeout);
         st.frozen = true;
+        // Re-arm: a new freeze discards any pending thaw from a prior round.
+        st.thawed_by_election = false;
         self.stats.lock().freeze_count += 1;
     }
 
@@ -132,6 +144,10 @@ impl CommitFreezeLatch {
         };
         if lift {
             st.frozen = false;
+            // Record the election-driven thaw as a pending signal so a next
+            // `await_thaw` that has not yet begun waiting still observes it
+            // (JE's CountDownLatch count-down is remembered until awaited).
+            st.thawed_by_election = true;
             st.generation = st.generation.wrapping_add(1);
             self.thaw_signal.notify_all();
         }
@@ -143,6 +159,9 @@ impl CommitFreezeLatch {
         st.frozen = false;
         st.proposal = None;
         st.freeze_end = None;
+        // A hard clear (election abandoned / node closing) is NOT an election
+        // thaw: drop any pending signal so the next await_thaw returns false.
+        st.thawed_by_election = false;
         st.generation = st.generation.wrapping_add(1);
         self.thaw_signal.notify_all();
     }
@@ -156,6 +175,18 @@ impl CommitFreezeLatch {
     /// must be re-initialized (via `freeze`) for a subsequent round.
     pub fn await_thaw(&self) -> bool {
         let mut st = self.state.lock();
+        // A same-or-newer-round election event may have thawed an active
+        // freeze *before* the replay thread reached this wait. JE remembers
+        // that (persistent CountDownLatch); honour it here as an election
+        // thaw rather than mistaking it for "no freeze". Consume once.
+        if st.thawed_by_election {
+            st.thawed_by_election = false;
+            st.frozen = false;
+            st.proposal = None;
+            st.freeze_end = None;
+            self.stats.lock().await_election_count += 1;
+            return true;
+        }
         if !st.frozen {
             return false; // no freeze in effect
         }
@@ -165,6 +196,7 @@ impl CommitFreezeLatch {
             if !st.frozen || st.generation != my_generation {
                 // If frozen==false this was a genuine thaw (election event).
                 if !st.frozen {
+                    st.thawed_by_election = false;
                     self.stats.lock().await_election_count += 1;
                     st.proposal = None;
                     st.freeze_end = None;

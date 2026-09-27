@@ -19,11 +19,15 @@
 
 use std::sync::Arc;
 
-use noxu_rep::elections::paxos::{run_acceptor, run_election};
+use noxu_rep::elections::paxos::{
+    run_acceptor, run_election, run_election_with_phi_dtvlsn,
+};
 use noxu_rep::net::{Channel, LocalChannelPair};
 use noxu_rep::node_type::NodeType;
+use noxu_rep::protocol::ProtocolMessage;
 use noxu_rep::rep_group::RepGroup;
 use noxu_rep::rep_node::RepNode;
+use std::time::Duration;
 
 fn make_group() -> RepGroup {
     let mut g = RepGroup::new("testgroup".into(), 1);
@@ -134,5 +138,186 @@ fn f22_unknown_node_refuses_to_propose() {
     assert!(
         winner.is_none(),
         "unknown proposer must not run an election (F22 closed-world)"
+    );
+}
+
+/// RF=2 [#25311] arbiter veto (end-to-end through `run_election`).
+///
+/// JE `RankingProposer.choosePhase2Value` returns null when there is at most
+/// one non-arbiter candidate and an arbiter remembers a *strictly higher*
+/// ranking (DTVLSN) than that candidate: the sole surviving node has lost
+/// durable data the arbiter witnessed, so electing it would silently lose
+/// committed transactions. JE test `RankingProposerTest.testPhase2ArbOneNode`
+/// asserts the two `assertEquals(null, ...)` cases; this test proves the same
+/// veto fires through the production election path, not just the value chooser.
+///
+/// Scenario: an RF=2 group (node1 electable + arbiter). node1 proposes with
+/// DTVLSN 100; the arbiter answers Phase 1 with a counter-proposal carrying
+/// DTVLSN 200 (it remembers a more-durable commit from the departed master).
+/// `run_election_with_phi_dtvlsn` must return `None` (no master this round).
+#[test]
+fn arbiter_veto_blocks_election_when_sole_node_lags_dtvlsn() {
+    let mut group = RepGroup::new("rf2".into(), 1);
+    group.add_node(RepNode::new(
+        "node1".into(),
+        NodeType::Electable,
+        "127.0.0.1".into(),
+        6001,
+        1,
+    ));
+    group.add_node(RepNode::new(
+        "arbiter".into(),
+        NodeType::Arbiter,
+        "127.0.0.1".into(),
+        6002,
+        2,
+    ));
+
+    let pair = LocalChannelPair::new();
+    let proposer_ch: Arc<dyn Channel> = Arc::new(pair.channel_a);
+    let arb_ch: Arc<dyn Channel> = Arc::new(pair.channel_b);
+
+    // Hand-rolled arbiter acceptor: promise Phase 1 by returning a
+    // counter-proposal with a HIGHER DTVLSN than node1's, then reject Phase 2
+    // (an arbiter cannot be master and does not grant the accept for itself;
+    // the point is the veto aborts the round before Phase 2 quorum anyway).
+    let h = std::thread::spawn(move || {
+        // Phase 1: receive the proposal.
+        let msg = arb_ch
+            .receive(Duration::from_secs(2))
+            .unwrap()
+            .expect("arbiter should receive a proposal");
+        if let ProtocolMessage::ElectionProposal { .. } =
+            ProtocolMessage::decode(&msg).unwrap()
+        {
+            // Reply with a counter-proposal: arbiter DTVLSN = 200 > node1's 100.
+            let counter = ProtocolMessage::ElectionProposal {
+                node_name: "arbiter".into(),
+                vlsn: 200,
+                priority: 1,
+                term: 1,
+                dtvlsn: 200,
+            };
+            arb_ch.send(&counter.encode()).unwrap();
+        }
+        // Phase 2 (if it ever comes): GRANT it. This makes the test NON-VACUOUS
+        // w.r.t. the arbiter veto: if the veto were removed, node1 would win the
+        // Phase-2 quorum here and the election would return Some(1) (electing a
+        // node below the arbiter's durable point). The ONLY reason the result is
+        // None is the choose_phase2_value arbiter veto aborting the round before
+        // Phase 2 (JE RankingProposer.choosePhase2Value). A quorum-reject would
+        // mask the veto, so we deliberately grant.
+        if let Ok(Some(bytes)) = arb_ch.receive(Duration::from_millis(300))
+            && let Ok(ProtocolMessage::ElectionResult { term, .. }) =
+                ProtocolMessage::decode(&bytes)
+        {
+            let vote = ProtocolMessage::ElectionVote {
+                voter: "arbiter".into(),
+                granted: true,
+                term,
+            };
+            let _ = arb_ch.send(&vote.encode());
+        }
+    });
+
+    // node1 proposes with own DTVLSN = 100 (lags the arbiter's 200).
+    let winner = run_election_with_phi_dtvlsn(
+        1,
+        "node1",
+        &group,
+        &[proposer_ch],
+        100, // proposed_vlsn
+        1,   // priority
+        1,   // term
+        100, // own_dtvlsn (< arbiter's 200)
+        None,
+        Duration::from_millis(500),
+    );
+
+    let _ = h.join();
+
+    assert!(
+        winner.is_none(),
+        "RF=2 arbiter veto: a node lagging the arbiter's DTVLSN must NOT be \
+         elected ([#25311]); got {winner:?}"
+    );
+}
+
+/// Control for the veto: when the sole node is AHEAD of (or equal to) the
+/// arbiter's DTVLSN, the veto does NOT fire and the node is elected. Proves
+/// the veto is specific to the lagging case, not a blanket arbiter-present
+/// refusal.
+#[test]
+fn arbiter_veto_does_not_fire_when_node_leads_dtvlsn() {
+    let mut group = RepGroup::new("rf2b".into(), 1);
+    group.add_node(RepNode::new(
+        "node1".into(),
+        NodeType::Electable,
+        "127.0.0.1".into(),
+        6101,
+        1,
+    ));
+    group.add_node(RepNode::new(
+        "arbiter".into(),
+        NodeType::Arbiter,
+        "127.0.0.1".into(),
+        6102,
+        2,
+    ));
+
+    let pair = LocalChannelPair::new();
+    let proposer_ch: Arc<dyn Channel> = Arc::new(pair.channel_a);
+    let arb_ch: Arc<dyn Channel> = Arc::new(pair.channel_b);
+
+    let h = std::thread::spawn(move || {
+        let msg = arb_ch.receive(Duration::from_secs(2)).unwrap().unwrap();
+        if let ProtocolMessage::ElectionProposal { .. } =
+            ProtocolMessage::decode(&msg).unwrap()
+        {
+            // Arbiter DTVLSN = 50 < node1's 100 -> no veto.
+            let counter = ProtocolMessage::ElectionProposal {
+                node_name: "arbiter".into(),
+                vlsn: 50,
+                priority: 1,
+                term: 1,
+                dtvlsn: 50,
+            };
+            arb_ch.send(&counter.encode()).unwrap();
+        }
+        // Phase 2: the arbiter's promise counts toward quorum; grant so the
+        // 2-node quorum (self + arbiter) is met.
+        if let Ok(Some(bytes)) = arb_ch.receive(Duration::from_millis(500))
+            && let Ok(ProtocolMessage::ElectionResult { term, .. }) =
+                ProtocolMessage::decode(&bytes)
+        {
+            let vote = ProtocolMessage::ElectionVote {
+                voter: "arbiter".into(),
+                granted: true,
+                term,
+            };
+            let _ = arb_ch.send(&vote.encode());
+        }
+    });
+
+    let winner = run_election_with_phi_dtvlsn(
+        1,
+        "node1",
+        &group,
+        &[proposer_ch],
+        100,
+        1,
+        1,
+        100, // own_dtvlsn (> arbiter's 50)
+        None,
+        Duration::from_millis(500),
+    );
+
+    let _ = h.join();
+
+    assert_eq!(
+        winner,
+        Some(1),
+        "node ahead of the arbiter's DTVLSN must still be elected (veto is \
+         specific to the lagging case)"
     );
 }
