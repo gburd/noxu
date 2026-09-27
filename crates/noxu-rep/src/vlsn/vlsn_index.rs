@@ -1401,4 +1401,91 @@ mod tests {
             "range unchanged after refused head truncate"
         );
     }
+
+    /// JE: VLSNIndexTest.testTruncateTailOutOfOrder — load mappings that
+    /// arrive out of order and leave a gap (vlsns 1..16 then 20, then 17,18,19
+    /// then 21), then truncate the tail at points inside and past the gap and
+    /// verify the range and the GTE/LTE boundary lookups (JE checkBoundaryVLSN)
+    /// stay consistent. JE additionally exercises the tracker/on-disk-database
+    /// flush split at every flush point; that split does not exist in the
+    /// in-memory index (flush is a `vlsn.idx` snapshot, not a bucket DB), so we
+    /// port the algorithmic core: out-of-order load + gap + tail truncate.
+    #[test]
+    fn je_index_test_truncate_tail_out_of_order() {
+        // (vlsn, file, offset) — JE uses file 1, offset = vlsn*10 with a gap:
+        // 1..16 in order, then 20 (early), then 17,18,19, then 21.
+        let load: &[(u64, u32, u32)] = &[
+            (1, 1, 10),
+            (2, 1, 20),
+            (3, 1, 30),
+            (4, 1, 40),
+            (5, 1, 50),
+            (6, 1, 60),
+            (7, 1, 70),
+            (8, 1, 80),
+            (9, 1, 90),
+            (10, 1, 100),
+            (11, 1, 110),
+            (12, 1, 120),
+            (13, 1, 130),
+            (14, 1, 140),
+            (15, 1, 150),
+            (16, 1, 160),
+            (20, 1, 1020),
+            (17, 1, 170),
+            (18, 1, 180),
+            (19, 1, 190),
+            (21, 1, 1021),
+        ];
+
+        // Truncate at each JE truncate point (17, 18, 19) and check the range
+        // and boundary lookups.
+        for &truncate_point in &[17u64, 18, 19] {
+            let index = VlsnIndex::new(3);
+            for &(v, f, off) in load {
+                index.put(v, f, off);
+            }
+            let range = index.get_range();
+            assert_eq!(range.get_first(), 1);
+            assert_eq!(range.get_last(), 21);
+
+            // JE truncateFromTail(truncatePoint, lsn(1,170)); the index-level
+            // equivalent keeps vlsns <= truncatePoint-1.
+            index.truncate_after(truncate_point - 1);
+            let range = index.get_range();
+            assert_eq!(range.get_first(), 1);
+            assert_eq!(
+                range.get_last(),
+                truncate_point - 1,
+                "last == truncatePoint-1 (tp={})",
+                truncate_point
+            );
+
+            // JE checkBoundaryVLSN: for every surviving vlsn, a GTE and LTE
+            // lookup must succeed (no exception / not None); truncated vlsns
+            // must be out of range.
+            for v in 16u64..truncate_point {
+                assert!(
+                    index.get_gte_lsn(v).is_some(),
+                    "GTE boundary for vlsn {} (tp={})",
+                    v,
+                    truncate_point
+                );
+                assert!(
+                    index.get_lsn(v).is_some(),
+                    "LTE boundary for vlsn {} (tp={})",
+                    v,
+                    truncate_point
+                );
+            }
+            for v in truncate_point..=21 {
+                assert!(
+                    !range.contains(v),
+                    "vlsn {} must be truncated (tp={})",
+                    v,
+                    truncate_point
+                );
+            }
+        }
+    }
 }
