@@ -3798,6 +3798,50 @@ impl CursorImpl {
                     .current_key
                     .clone()
                     .ok_or(DbiError::CursorNotInitialized)?;
+                // NEW-DBI-DUPPUTCUR: on a sorted-duplicate DB you may only
+                // update the CURRENT duplicate to a value that sorts EQUAL
+                // under the DB (composite) comparator -- you may never MOVE
+                // it to a new sort position.  Mirror JE
+                // `CursorImpl.putCurrent` (CursorImpl.java:1618):
+                //
+                //     if (key != null &&
+                //         Key.compareKeys(currKey, key, keyComparator) != 0)
+                //         throw new DuplicateDataException(...);
+                //
+                // Because putCurrent keeps the same primary key, comparing
+                // the two full two-part keys with the DB's composite
+                // comparator is equivalent to comparing just the data under
+                // the duplicate comparator (byte order when none is set).
+                // Without this guard an unconditional delete+reinsert
+                // silently re-sorts the entry to a new position, and a
+                // later forward walk then skips intervening duplicates -- a
+                // silent wrong result / data reorder.
+                {
+                    let db = self.db_impl.read();
+                    let equal = match db.get_real_tree() {
+                        Some(tree) => match tree.get_comparator() {
+                            Some(cmp) => {
+                                cmp(&old_key, &two_part_key)
+                                    == std::cmp::Ordering::Equal
+                            }
+                            // A sorted-dup DB always installs a composite
+                            // comparator (byte order when no custom dup
+                            // comparator is configured); if it is somehow
+                            // absent, fall back to raw byte comparison of
+                            // the two-part keys, which for equal primary
+                            // keys reduces to byte-order data comparison.
+                            None => old_key == two_part_key,
+                        },
+                        None => old_key == two_part_key,
+                    };
+                    if !equal {
+                        return Err(DbiError::DuplicateData(
+                            "putCurrent on a duplicate DB must not move the \
+                             duplicate to a new sort position"
+                                .to_string(),
+                        ));
+                    }
+                }
                 let del_lsn = self.log_ln_write(
                     &old_key,
                     None,

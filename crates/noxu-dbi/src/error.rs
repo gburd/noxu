@@ -84,6 +84,22 @@ pub enum DbiError {
     #[error("operation status: {0}")]
     OperationFailed(String),
 
+    /// NEW-DBI-DUPPUTCUR: a `putCurrent` on a sorted-duplicate database
+    /// tried to replace the current duplicate with data that does not
+    /// compare EQUAL to the existing data under the duplicate comparator.
+    ///
+    /// JE `Cursor.putCurrent` / `CursorImpl.putCurrent`
+    /// (CursorImpl.java:1618): for a dups DB the new 2-part key must
+    /// compare equal to the current slot key under the DB comparator,
+    /// otherwise `DuplicateDataException` is thrown.  You may only update
+    /// the current duplicate in place to an equal-sorting value; you may
+    /// never MOVE it to a new sort position via putCurrent.
+    #[error(
+        "can't replace a duplicate with new data that is not equal to the \
+         existing data according to the duplicate comparator"
+    )]
+    DuplicateData(String),
+
     /// Lock conflict occurred.
     #[error("lock conflict: {0}")]
     LockConflict(String),

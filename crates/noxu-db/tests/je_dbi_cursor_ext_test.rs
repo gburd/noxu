@@ -972,9 +972,6 @@ fn db_cursor_duplicate_test_illegal_duplicate_creation() {
 // (or otherwise rejects a sort-order-changing putCurrent) for sorted dups.
 // ===========================================================================
 #[test]
-#[ignore = "NEW-DBI-DUPPUTCUR: putCurrent with different dup data silently \
-            moves the dup instead of throwing DuplicateDataException; forward \
-            walks then skip intervening dups (see tp-je-dbi.md)"]
 fn db_cursor_duplicate_test_duplicate_replacement_failure() {
     let (_dir, env, db) = open_dup();
     let txn = env.begin_transaction(None).unwrap();
