@@ -1198,10 +1198,33 @@ impl Database {
                     })?;
                     deleted_old_values.push(v);
                 }
-                cursor.delete().map_err(|e| {
+                // NEW-DEL-RACE-1: `CursorImpl::delete` revalidates the slot
+                // AFTER acquiring the write lock and returns `KeyEmpty` when a
+                // concurrent committed deleter already removed this record
+                // (the loser of a delete race).  Only count a delete that
+                // actually removed the record — `search` found the slot LIVE
+                // pre-lock, so without honouring the status here every loser
+                // would still report `deleted_any = true`, re-exposing the
+                // race at the `Database::delete` boundary.  A KeyEmpty pops
+                // the captured old-data (there is no removed pair to fan out to
+                // secondaries / triggers) and re-searches: in a sorted-dup DB a
+                // raced pair must be skipped without abandoning the remaining
+                // duplicates, and the winner physically removed the raced slot
+                // so the next `search` makes progress (finds a different pair
+                // or `NotFound`) — never a livelock.
+                match cursor.delete().map_err(|e| {
                     NoxuError::OperationNotAllowed(e.to_string())
-                })?;
-                deleted_any = true;
+                })? {
+                    noxu_dbi::OperationStatus::Success => {
+                        deleted_any = true;
+                    }
+                    _ => {
+                        // Fall through to the `while` re-search (below).
+                        if track_old_data {
+                            deleted_old_values.pop();
+                        }
+                    }
+                }
             }
             Ok(deleted_any)
         };

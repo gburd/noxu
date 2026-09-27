@@ -7,19 +7,24 @@
 //!     delete the SAME key; exactly ONE deleter succeeds, every other gets
 //!     NOTFOUND.  This is the record-level-locking atomicity guarantee.
 //!
-//! ENGINE-BUG CANDIDATE **NEW-DEL-RACE-1** (kept `#[ignore]`, not weakened):
-//! Noxu does NOT serialize concurrent deletes of the same record.  With N=8
-//! transactions racing to delete one record, 6-7 each observe the record LIVE
-//! and commit a delete (`notfound` only 1-2) — under default AND serializable
-//! isolation.  Exactly one should win.  Controls in the test rule out a test
-//! artifact: the record count is 1 (single non-dup record) and a sequential
-//! double-delete correctly returns false (visibility is fine sequentially —
-//! the anomaly is purely concurrent).  Root-cause pointer: the delete write
-//! lock is keyed on the record LSN (`cursor_impl.rs::lock_write_before_log`,
-//! `lock(lsn_to_lock, LockType::Write, ...)`); concurrent searchers each find
-//! the same live LSN and their write-lock acquisition does not mutually
-//! exclude, so several proceed to delete the same slot and each reports
-//! success.  This is in the core txn/lock/delete path — escalated, not fixed.
+//! **NEW-DEL-RACE-1** (FIXED): concurrent deletes of the SAME single record
+//! are now serialized so that EXACTLY ONE transaction wins.  Previously Noxu
+//! did not: with N transactions racing to delete one record, 6-7 each
+//! observed the record LIVE and committed a delete (`notfound` only 1-2) —
+//! under default AND serializable isolation.  Root cause: `CursorImpl::delete`
+//! checked the deleted-state (D3) BEFORE acquiring the write lock, then
+//! `lock_write_before_log` BLOCKED until a concurrent deleter committed, then
+//! UNCONDITIONALLY logged a second DeleteLN + re-applied the tree delete and
+//! reported success.  Fix (JE-faithful, `CursorImpl.deleteCurrentRecord`'s
+//! post-`lockLN` `!lockStanding.recordExists()` revert): after the write lock
+//! is acquired, re-read the current committed slot LSN; if the record is gone
+//! (`NULL_LSN`) or its LSN changed (a concurrent commit removed it), return
+//! `KeyEmpty` without a second log/apply.  `Database::delete_bytes` now honours
+//! that `KeyEmpty` so only the true winner reports `deleted = true`.  This test
+//! asserts exactly-one-winner under BOTH default and serializable isolation.
+//! Controls rule out a test artifact: the record count is 1 (single non-dup
+//! record) and a sequential double-delete correctly returns false (visibility
+//! is fine sequentially — the anomaly was purely concurrent).
 //!
 //! Classification of the other SecondaryMultiTest methods (see report):
 //!   - `testMultiDelete` (two-thread ordered delete via the `DeleteIt`
@@ -48,14 +53,25 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use tempfile::TempDir;
 
-/// JE `SecondaryMultiTest.testMultiDeleteUnordered`.
+/// JE `SecondaryMultiTest.testMultiDeleteUnordered` — default isolation.
 ///
-/// Kept `#[ignore]` as ENGINE-BUG CANDIDATE NEW-DEL-RACE-1 (see module doc).
-/// Run with `--ignored` to reproduce the anomaly.
+/// NEW-DEL-RACE-1 (FIXED): exactly one of N concurrent deleters of the same
+/// record wins; every other observes NOTFOUND (or loses a lock conflict).
 #[test]
-#[ignore = "NEW-DEL-RACE-1: concurrent deletes of the same record are not \
-            serialized; several transactions each delete it and commit"]
 fn je_secondary_multi_test_test_multi_delete_unordered() {
+    multi_delete_unordered(false);
+}
+
+/// Same property under SERIALIZABLE isolation (read locks retained through
+/// commit).  The exactly-one-winner guarantee must hold identically.
+#[test]
+fn je_secondary_multi_test_test_multi_delete_unordered_serializable() {
+    multi_delete_unordered(true);
+}
+
+fn multi_delete_unordered(serializable: bool) {
+    use noxu_db::TransactionConfig;
+
     const DATACOUNT: u32 = 99;
     const KEY: u32 = 55;
     const DELETERS: usize = 20;
@@ -116,7 +132,9 @@ fn je_secondary_multi_test_test_multi_delete_unordered() {
         let barrier = Arc::clone(&barrier);
         handles.push(thread::spawn(move || {
             barrier.wait();
-            let txn = env.begin_transaction(None).unwrap();
+            let txn_cfg = TransactionConfig::new()
+                .with_serializable_isolation(serializable);
+            let txn = env.begin_transaction(Some(&txn_cfg)).unwrap();
             match db.delete_in(&txn, target.as_bytes()) {
                 Ok(true) => {
                     txn.commit().unwrap();

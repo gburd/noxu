@@ -87,6 +87,7 @@ shuttle:
 	RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-tree    --test shuttle_evict_pin_race --release
 	RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-tree    --test shuttle_evict_insert_race --release
 	RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-dbi     --test shuttle_cursor --release
+	RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-dbi     --test shuttle_delete_race --release
 	RUSTFLAGS="--cfg noxu_shuttle" cargo test -p noxu-rep     --test shuttle_rep_sync --release
 
 # Run the Stateright specs and the shuttle DST gate back-to-back — the two
