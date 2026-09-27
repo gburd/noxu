@@ -213,7 +213,7 @@ fn dump_load_multiple_databases() {
         per_db
     };
 
-    for d in 0..N_DBS {
+    for (d, expected_recs) in expected.iter().enumerate() {
         let name = format!("testDB{d}");
         let dump1 = src.path().join(format!("dump{d}.txt"));
         dump(src.path(), &name, &dump1, false);
@@ -223,7 +223,7 @@ fn dump_load_multiple_databases() {
         let mut loaded = read_all(dst.path(), &name);
         loaded.sort();
         assert_eq!(
-            loaded, expected[d],
+            &loaded, expected_recs,
             "db {name} round-trip mismatch (JE testDumpLoadTwo/Three verifyDb)"
         );
 
