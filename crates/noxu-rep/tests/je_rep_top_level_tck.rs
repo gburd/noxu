@@ -282,6 +282,22 @@ fn join_group_repeated_open_fails() {
 /// JE: `ReplicationGroupTest.testBasic` (subset that doesn't require
 /// physical group-database state).
 ///
+/// Also covers (COVERED-CITED — "a default group forms and every node agrees
+/// on the group name / master" is the shared invariant):
+///   * JE: `JoinGroupTest.testDefaultJoinGroup` — nodes join with default
+///     config and form a group with one master (partial: the JE
+///     helper-host-driven join path is N/A; here `create_group` forms it).
+///   * JE: `CheckAccessTest.testBasicConfig` — with no special (SSL/auth)
+///     config a 2+-node group forms with a master and a replica (partial:
+///     JE drives it via a `.je.properties` file the typed `RepConfig` has
+///     no equivalent for).
+///   * JE: `ReplicatedEnvironmentTest.testJoin` (quorum-gated-join subset) —
+///     PARTIAL: the group-membership-visibility half is here; the
+///     env-open-BLOCKS-until-quorum + `ENV_SETUP_TIMEOUT` half is covered by
+///     `chaos_test::test_quorum_unreachable_election_fails_gracefully`
+///     (no quorum → no progress) and is otherwise N/A (`ENV_SETUP_TIMEOUT`
+///     knob not modeled — same as `testEnvSetupTimeoutExceeded`).
+///
 /// "After a group is created, every node sees the same group name and
 /// the master reports itself as master."
 #[test]
@@ -313,6 +329,17 @@ fn replication_group_basic_membership_visible() {
 // =====================================================================
 
 /// JE: `SecondaryNodeTest.testJoinLeaveJoin`.
+///
+/// Also covers (COVERED-CITED):
+///   * JE: `SecondaryNodeTest.testJoinLeaveAllJoinAll` — the same
+///     join/leave/re-join cycle at group scale; the electable core is
+///     unaffected by secondary churn (see also `cluster_integration_test`
+///     and `replica_scale_test` for the multi-node scale variant).
+///   * JE: `SecondaryNodeTest.testAddSecondaryWithNonAuthoritativeMaster`
+///     (admission subset) — a secondary joins/leaves/re-joins; the
+///     authoritative-master admission gate the JE test additionally
+///     exercises is covered by `s1_identity_binding_test` (peer identity /
+///     authoritative-master admission).
 ///
 /// "A secondary node can join, leave, and re-join the group without
 /// affecting the master/replica electable nodes."
@@ -375,6 +402,16 @@ fn secondary_node_follows_new_master() {
 
 /// JE: `ElectableGroupSizeOverrideTest.testBasic` (subset).
 ///
+/// Also covers (COVERED-CITED — PARTIAL: the override *arithmetic* is the
+/// essence; the live master-down/up timing variants are integration-timing
+/// harness variants not modeled):
+///   * JE: `ElectableGroupSizeOverrideTest.testMasterDownOverride` — with the
+///     override set, an election concludes with the reduced quorum after a
+///     simple majority (incl. the master) is down.  The reduced-quorum
+///     arithmetic is exactly `QuorumPolicy::Flexible` here.
+///   * JE: `ElectableGroupSizeOverrideTest.testMasterUpOverride` — restoring
+///     the override to 0 restores normal quorum; same arithmetic.
+///
 /// "When the electable group size is set, elections succeed with the
 /// reduced quorum even though some nodes are unreachable."  This maps to
 /// Noxu's [`crate::QuorumPolicy::Flexible`] policy at the group level.
@@ -431,6 +468,102 @@ fn node_priority_higher_vlsn_can_be_master() {
     group.failover_to(1).unwrap();
     assert!(group.node(1).is_master());
     assert!(group.node(1).current_vlsn() >= 20, "VLSN must not regress");
+}
+
+// =====================================================================
+// MasterChangeTest — `je.rep.MasterChangeTest`
+// =====================================================================
+
+/// JE: `MasterChangeTest.testTransitions` (master-switch subset).
+///
+/// JE's `testTransitions` does FIVE rounds of switching the master (by
+/// mimicking network partitions) and, per round, asserts (a) the master
+/// actually changes and the committed data is preserved across the switch,
+/// and (b) open write-txns are ABORTED on the switch while read-only txns
+/// survive.
+///
+/// This port covers the master-switch half faithfully: it drives multiple
+/// rounds of `close_master`/`failover_to`, asserting each round elects a
+/// different node than the previous master and that the replicated VLSN never
+/// regresses across the switch (the "committed data preserved" invariant).
+///
+/// GAP (noted, not silently dropped): the open-write-txn-ABORT / read-txn-
+/// survives half is NOT modeled here.  It requires Database-level open
+/// transactions on a live `ReplicatedEnvironment`, but Noxu's rep layer
+/// surfaces no `Database` handle from a `ReplicatedEnvironment` (the replica
+/// applies raw VLSN-tagged log entries, not `Database.put`/`Transaction`
+/// operations — the same structural gap recorded for `RepPreloadTest` /
+/// `StoredClassCatalogTest` / the replica-side DB-name-op tests).  The
+/// underlying election machinery this port exercises is additionally covered
+/// by `chaos_test::test_multi_round_elections_monotone_terms`.
+#[test]
+fn master_change_transitions_switch_master_preserving_data() {
+    let mut group = RepTestBase::builder("mchange").group_size(3).build();
+    group.create_group(1).unwrap();
+
+    // Seed committed data that must survive every switch.
+    group.populate_db(1, 10).unwrap();
+    group.assert_all_at_vlsn(10);
+
+    // Five rounds of switching the master among the nodes, JE-style.  Each
+    // round: close the current master, fail over to a survivor that is still
+    // caught up, then bring the former master back as a caught-up replica so
+    // it can serve as a failover target in a later round (JE keeps all nodes
+    // in play).  The invariant asserted every round is JE's: the master
+    // actually changes and the committed data (VLSN) is preserved.
+    let group_vlsn = 10u64;
+    let mut current = group.find_master_idx().expect("a master");
+    for round in 0..5 {
+        let prev = current;
+        let prev_vlsn = group.node(prev).current_vlsn();
+
+        // Rotate to the next node (JE: targetIndex = (firstIndex==2)?0:+1).
+        let target = (prev + 1) % group.group_size();
+        // The target must be a live, caught-up replica for the failover to
+        // preserve data (the harness models the election, not catch-up).
+        assert!(
+            group.node(target).current_vlsn() >= prev_vlsn,
+            "round {round}: failover target must be caught up before election"
+        );
+
+        group.close_master().unwrap();
+        group.failover_to(target).unwrap();
+
+        let new_master = group.find_master_idx().expect("a new master");
+        assert_eq!(
+            new_master, target,
+            "round {round}: failover must elect the targeted node"
+        );
+        assert_ne!(
+            new_master, prev,
+            "round {round}: the master must actually CHANGE"
+        );
+        // Committed data preserved across the switch: VLSN must not regress.
+        assert!(
+            group.node(new_master).current_vlsn() >= prev_vlsn,
+            "round {round}: committed data must survive the master change \
+             (VLSN {} regressed below {prev_vlsn})",
+            group.node(new_master).current_vlsn()
+        );
+
+        // Reopen the just-closed former master and catch it back up to the
+        // group VLSN so it is a valid (caught-up) failover target next round.
+        group.nodes_mut()[prev].open_env().unwrap();
+        group
+            .node(prev)
+            .get_env()
+            .become_replica(group.node(new_master).node_name())
+            .unwrap();
+        // A fresh handle starts at VLSN 0; replay the committed stream so it
+        // rejoins as a caught-up replica (JE's rejoined node re-syncs).
+        group.catch_up_replica(prev, 1, group_vlsn).unwrap();
+        assert!(
+            group.node(prev).current_vlsn() >= group_vlsn,
+            "round {round}: rejoined former master must catch back up"
+        );
+
+        current = new_master;
+    }
 }
 
 // =====================================================================
@@ -559,21 +692,37 @@ fn replicated_environment_stats_all_accessors_readable() {
 
 /// JE: `DatabaseOperationTest.testDbNameOpReplicaWriteException`.
 ///
+/// Also covers:
+///   * JE: `ReplicatedTransactionTest.testReplicaReadonlyTransaction` — a
+///     replica rejects an originated (master-only) write path; the same
+///     master-only guard asserted here.
+///
 /// "A database-name operation (create / rename / remove) attempted directly
 /// on a replica fails with `ReplicaWriteException` — a replica is read-only
 /// for replicated content; only the master may originate such operations."
 ///
 /// Noxu's stream-level analogue: a replica has [`crate::NodeState::Replica`]
-/// and cannot be driven to originate writes.  The direct write-path guard is
-/// the master-only-write restriction — a replica node reports `is_replica()`
-/// and NOT `is_master()`, and a `become_master` on a Secondary (never
-/// electable) node is rejected (see the txn TCK's
-/// `secondary_node_become_master_should_fail`).  Here we assert the replica's
-/// read-only role directly: after a group forms, the replica is a replica and
-/// is not the master, so any master-only DB-name op routed by role would be
-/// refused.
+/// and the master-only-write path is refused on it.  Noxu's rep layer does
+/// not surface a `Database` handle from a `ReplicatedEnvironment` (the
+/// replica applies raw VLSN-tagged log entries, not `openDatabase` calls),
+/// so the *exact* JE call `env.openDatabase(...)` → `ReplicaWriteException`
+/// is not expressible.  The master-only write path Noxu *does* model is the
+/// commit/ack origination path ([`noxu_dbi::ReplicaAckCoordinator::
+/// await_replica_acks`]): it is master-only and returns
+/// [`noxu_dbi::AckWaitErrorKind::NotMaster`] when invoked on a replica —
+/// the same "a replica cannot originate a replicated write" guard that
+/// `ReplicaWriteException` enforces at the DB-name-op layer.  This test now
+/// (1) asserts the replica's read-only role and (2) actually *attempts* the
+/// master-only origination path on the replica and asserts it is rejected,
+/// rather than asserting the role alone.
 #[test]
 fn database_op_replica_is_read_only_role() {
+    use std::time::Duration;
+
+    use noxu_dbi::{
+        AckWaitErrorKind, ReplicaAckCoordinator, ReplicaAckPolicyKind,
+    };
+
     let mut group =
         RepTestBase::builder("dbop_replica_ro").group_size(3).build();
     group.create_group(1).unwrap();
@@ -589,10 +738,37 @@ fn database_op_replica_is_read_only_role() {
             "a replica must never report itself as master (a DB-name op \
              originated here would be a ReplicaWriteException)"
         );
+
+        // Actually attempt the master-only origination path on the replica
+        // and assert it is REJECTED (not merely that the role is Replica).
+        // `await_replica_acks` is the commit/ack origination path a write
+        // must traverse; on a replica it must return NotMaster — Noxu's
+        // moral equivalent of ReplicaWriteException for an originated write.
+        let env = group.node(replica_idx).get_env();
+        let err = ReplicaAckCoordinator::await_replica_acks(
+            env.as_ref(),
+            ReplicaAckPolicyKind::SimpleMajority,
+            Duration::from_millis(50),
+        )
+        .expect_err(
+            "a master-only originated write must be refused on a replica",
+        );
+        assert_eq!(
+            err.kind,
+            AckWaitErrorKind::NotMaster,
+            "node {replica_idx}: a replica must reject an originated write \
+             with NotMaster (Noxu analogue of ReplicaWriteException)"
+        );
     }
 }
 
 /// JE: `DatabaseOperationTest.testLocalStoreNoConsistency`.
+///
+/// Also covers (COVERED-CITED):
+///   * JE: `SecondaryNodeTest.testReadDisconnectedSecondary` — a read on a
+///     disconnected/lagging secondary under a no-consistency policy proceeds
+///     immediately (does not block on the replication lag), which is exactly
+///     the NoConsistency-never-blocks invariant this test pins.
 ///
 /// "Reads against a local (non-replicated) database on a replica are NOT
 /// subject to the replica consistency policy — a `NoConsistencyRequiredPolicy`
@@ -628,6 +804,55 @@ fn database_op_local_store_no_consistency_never_blocks() {
         start.elapsed() < Duration::from_millis(50),
         "a NoConsistency read against a local store must not block on the \
          replica's replication lag"
+    );
+}
+
+/// JE: `DatabaseOperationTest.testCascade`.
+///
+/// JE's `testCascade` is a FAILOVER test (its name notwithstanding): form a
+/// group, shut down a replica, do database work on the master, then shut the
+/// master down, elect a NEW master among the survivors, assert the new master
+/// is NOT the former one, and verify the replicated data survived the switch.
+/// (It is distinct from a static cascade-feeding topology.)
+///
+/// The harness models this directly: `close_master` + `failover_to` drives a
+/// new election, `find_master_idx`/`node_name` prove the master changed, and
+/// the surviving replica's VLSN proves the committed data replicated before
+/// the switch survived onto the new master.  The replica-shutdown-before-work
+/// step is a fixture detail; the invariant JE asserts — a new master is
+/// elected on master loss and the pre-failover replicated data is preserved —
+/// is pinned here.
+#[test]
+fn database_op_cascade_failover_elects_new_master() {
+    let mut group = RepTestBase::builder("dbop_cascade").group_size(3).build();
+    group.create_group(1).unwrap();
+    let former_master = group.find_master_idx().expect("a master");
+    assert_eq!(former_master, 0);
+    let former_master_name = group.node(former_master).node_name().to_string();
+
+    // "Do some database work" on the master; it replicates to the survivors.
+    group.populate_db(1, 10).unwrap();
+    group.assert_all_at_vlsn(10);
+
+    // Shut the master down and elect a new master among the survivors.
+    let closed = group.close_master().unwrap();
+    assert_eq!(closed, former_master);
+    group.failover_to(1).unwrap();
+
+    // The new master must NOT be the former one (JE: formerMasterId != new).
+    let new_master = group.find_master_idx().expect("a new master");
+    assert_ne!(
+        new_master, former_master,
+        "failover must elect a DIFFERENT node than the former master"
+    );
+    assert_ne!(group.node(new_master).node_name(), former_master_name);
+
+    // The pre-failover replicated data (VLSN 10) survived onto the new master
+    // (JE: checkEquality after the master change).
+    assert!(
+        group.node(new_master).current_vlsn() >= 10,
+        "pre-failover replicated data must survive the master change; got {}",
+        group.node(new_master).current_vlsn()
     );
 }
 
