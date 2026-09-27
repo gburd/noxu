@@ -1247,6 +1247,7 @@ impl Checkpointer {
             result.full_bins_flushed += r.full_bins_flushed;
             result.delta_ins_flushed += r.delta_ins_flushed;
             result.obsolete_delta_lsns.extend(r.obsolete_delta_lsns);
+            result.obsolete_full_lsns.extend(r.obsolete_full_lsns);
         }
 
         // L-5-delta: count the superseded prior BIN-deltas (auxOldLsn)
@@ -1254,13 +1255,32 @@ impl Checkpointer {
         // persist_file_summaries so the counts land in this checkpoint's
         // FileSummaryLN.  JE: LogManager.serialLogWork counts auxOldLsn via
         // countObsoleteNodeDupsAllowed(auxOldLsn, type, size=0, nodeDb).
-        if !result.obsolete_delta_lsns.is_empty()
+        if (!result.obsolete_delta_lsns.is_empty()
+            || !result.obsolete_full_lsns.is_empty())
             && let Some(tracker_lock) = &self.utilization_tracker
         {
             let mut tracker = tracker_lock.lock();
             for (lsn, db_id) in &result.obsolete_delta_lsns {
                 // size 0 (auxOldLsn carries no size); count_as_ln = false (an
                 // IN/BIN-delta, not an LN); dups-allowed variant (INs use it).
+                tracker.count_obsolete_node_dups_allowed(
+                    lsn.file_number(),
+                    lsn.file_offset(),
+                    0,
+                    false,
+                    Some(*db_id),
+                );
+            }
+            // NEW-CLEANER-IN-OBSOLETE: count the superseded prior FULL BIN/IN
+            // images (getPrevFullLsn / getLastFullVersion) obsolete on the SAME
+            // tracker path the delta path uses, BEFORE persist_file_summaries so
+            // the counts land in this checkpoint's FileSummaryLN.  size 0 (an
+            // IN image carries no size for obsolete accounting — the tracker
+            // asserts size==0 for INs); count_as_ln = false; dups-allowed
+            // variant (INs use it, matching the delta path).  JE:
+            // `IN.afterLogCommon` sets `params.oldLsn = getPrevFullLsn()` and
+            // `LogManager.countObsoleteNode` counts it.
+            for (lsn, db_id) in &result.obsolete_full_lsns {
                 tracker.count_obsolete_node_dups_allowed(
                     lsn.file_number(),
                     lsn.file_offset(),
@@ -1406,6 +1426,17 @@ impl Checkpointer {
                 seed_full_lsn = delta_logged_lsn;
             } else {
                 // --- Full BIN path ---
+                // NEW-CLEANER-IN-OBSOLETE: the prior full BIN image this one
+                // supersedes (JE `logEntry.getPrevFullLsn()` /
+                // `getLastFullVersion()`) becomes obsolete when we log the new
+                // full BIN non-provisionally.  Capture it BEFORE
+                // `clear_dirty_after_full_log` overwrites `last_full_lsn` with
+                // the fresh LSN; counted obsolete by `flush_dirty_bins_internal`
+                // via the tracker.  A brand-new BIN (first-ever log) has
+                // `last_full_lsn == NULL_LSN` and no prior version to count —
+                // JE `getLastFullVersion` returns early on NULL (IN.java:5200),
+                // so we skip it below (no double-count).
+                let superseded_full_lsn = b.last_full_lsn;
                 let full_bytes = b.serialize_full();
                 let entry = InLogEntry::new(
                     db_id,
@@ -1431,6 +1462,17 @@ impl Checkpointer {
                 b.last_delta_lsn = NULL_LSN; // full BIN resets delta chain
                 b.clear_dirty_after_full_log(logged_lsn);
                 result.full_bins_flushed += 1;
+                // NEW-CLEANER-IN-OBSOLETE: record the superseded prior full BIN
+                // image (getPrevFullLsn) for obsolete counting.  Only when
+                // non-null — a brand-new BIN's first full log has no prior
+                // version (skip, no double-count).  An intervening full->delta
+                // chain's obsolete accounting is handled by the delta path;
+                // here we count only the immediately-superseded prior FULL.
+                if superseded_full_lsn != NULL_LSN {
+                    result
+                        .obsolete_full_lsns
+                        .push((superseded_full_lsn, db_id as u32));
+                }
                 // A full BIN entry is directly re-fetchable by
                 // `fetch_node_from_log`.
                 seed_full_lsn = logged_lsn;
@@ -1544,6 +1586,31 @@ impl Checkpointer {
         for (db_id, tree_arc) in trees_to_flush {
             let r = Self::flush_one_tree_upper_ins(db_id, &tree_arc, lm)?;
             result.full_ins_flushed += r.full_ins_flushed;
+            result.obsolete_full_lsns.extend(r.obsolete_full_lsns);
+        }
+
+        // NEW-CLEANER-IN-OBSOLETE: count the superseded prior full upper-IN
+        // images obsolete via the wired UtilizationTracker, on the SAME path
+        // the BIN/delta obsolete LSNs use in `flush_dirty_bins_internal`, and
+        // BEFORE `do_checkpoint` logs CkptEnd / persist_file_summaries runs so
+        // the counts land in this checkpoint's FileSummaryLN.  size 0 (an IN
+        // image carries no size — the tracker asserts size==0 for INs);
+        // count_as_ln = false; dups-allowed variant (INs use it).  JE:
+        // `IN.afterLogCommon` sets `params.oldLsn = getPrevFullLsn()` and
+        // `LogManager.countObsoleteNode(getLastFullVersion())` counts it.
+        if !result.obsolete_full_lsns.is_empty()
+            && let Some(tracker_lock) = &self.utilization_tracker
+        {
+            let mut tracker = tracker_lock.lock();
+            for (lsn, db_id) in &result.obsolete_full_lsns {
+                tracker.count_obsolete_node_dups_allowed(
+                    lsn.file_number(),
+                    lsn.file_offset(),
+                    0,
+                    false,
+                    Some(*db_id),
+                );
+            }
         }
 
         Ok(result)
@@ -1644,8 +1711,31 @@ impl Checkpointer {
                 node_guard.set_dirty(false);
                 result.full_ins_flushed += 1;
                 // Release the node write lock before touching its parent
-                // (parent-then-child lock order).
+                // (parent-then-child lock order).  `get_parent_slot_lsn` /
+                // `get_root_lsn` below take read locks on the child+parent, so
+                // they must run AFTER releasing this write lock.
                 drop(node_guard);
+
+                // NEW-CLEANER-IN-OBSOLETE: an upper IN carries no
+                // `last_full_lsn` field (unlike a BIN — confirmed in tree.rs;
+                // see the merged NEW-6 note).  Its prior on-disk image LSN is
+                // the LSN currently recorded for it: the PARENT-SLOT LSN for a
+                // non-root, or the tree's `root_log_lsn` for the root.  Read it
+                // BEFORE `update_parent_slot_lsn` / `note_root_logged`
+                // overwrites it with the fresh LSN.  This is the prior full
+                // version (JE `getPrevFullLsn` / `getLastFullVersion`); a
+                // brand-new IN's first log has NULL here and no prior version
+                // to count (skip below, no double-count).
+                let superseded_full_lsn = if Some(this_node_id) == root_node_id
+                {
+                    tree_arc
+                        .read()
+                        .ok()
+                        .map(|g| g.get_root_lsn())
+                        .unwrap_or(NULL_LSN)
+                } else {
+                    Tree::get_parent_slot_lsn(node_arc)
+                };
 
                 // JE `IN.updateEntry`: stamp this IN's current on-disk LSN into
                 // its parent's slot (dirtying the parent), so the parent —
@@ -1658,6 +1748,18 @@ impl Checkpointer {
                     }
                 } else {
                     Tree::update_parent_slot_lsn(node_arc, logged_lsn);
+                }
+
+                // NEW-CLEANER-IN-OBSOLETE: record the superseded prior full
+                // upper-IN image obsolete (JE `IN.afterLogCommon`
+                // `params.oldLsn = getPrevFullLsn()`).  Skip NULL (first-ever
+                // log — no prior version, no double-count).  Counted by
+                // `flush_upper_ins_internal` via the wired tracker on the same
+                // path the BIN/delta obsolete LSNs use.
+                if superseded_full_lsn != NULL_LSN {
+                    result
+                        .obsolete_full_lsns
+                        .push((superseded_full_lsn, db_id as u32));
                 }
             }
 
@@ -1707,6 +1809,19 @@ pub(crate) struct FlushResult {
     /// `(prev_delta_lsn, db_id)`.  JE: IN.java auxOldLsn ->
     /// LogManager.countObsoleteNodeDupsAllowed.
     obsolete_delta_lsns: Vec<(Lsn, u32)>,
+    /// NEW-CLEANER-IN-OBSOLETE: per-DB superseded prior FULL BIN/IN image LSNs
+    /// made obsolete by a newly-logged full BIN or full upper-IN (the prior
+    /// `last_full_lsn` for a BIN, or the prior parent-slot LSN for an upper
+    /// IN — JE `logEntry.getPrevFullLsn()` / `getLastFullVersion()`).  Counted
+    /// obsolete by `flush_dirty_bins_internal` via the wired
+    /// `UtilizationTracker` on the same path as `obsolete_delta_lsns` (the
+    /// per-tree flush is a static helper without tracker access).  Tuple is
+    /// `(prev_full_lsn, db_id)`.  JE: `IN.afterLogCommon` sets
+    /// `params.oldLsn = logEntry.getPrevFullLsn()` and counts the prior
+    /// version obsolete via `countObsoleteNode(getLastFullVersion())` whenever
+    /// an IN/BIN is re-logged non-provisionally.  This is the CHECKPOINTER
+    /// sibling of the merged NEW-6 evictor-path fix (`log_dirty_upper_in`).
+    obsolete_full_lsns: Vec<(Lsn, u32)>,
 }
 
 #[cfg(test)]
