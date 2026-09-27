@@ -275,6 +275,15 @@ listed in [References](#references).
   non-electable, empty, and non-member targets up-front and treats a self-target as
   an immediate success (matching JE `RepNode.transferMaster`). Found by a faithful
   port of JE's `MasterTransferTest`.
+- **Two-node (RF=2) elections no longer elect a node that lags the arbiter
+  (NEW-ELECT-ARBITER-VETO, `[#25311]`).** When the sole surviving electable node
+  lagged the arbiter's durable VLSN, the election could make it master below the
+  durable point, silently losing an acknowledged transaction. Elections now apply
+  JE's arbiter veto (`RankingProposer.choosePhase2Value`): a lagging sole candidate
+  is vetoed rather than elected. Found by a faithful port of JE's election tests.
+- **Commit-freeze latch no longer loses a pre-arriving election thaw
+  (NEW-FREEZE-THAW-1).** A diagnostic-fidelity fix to `CommitFreezeLatch`; the
+  park-while-frozen safety property was unaffected.
 - **VLSN index lookups are range-gated (je.rep.vlsn parity).** `VlsnIndex::get_lsn`
   now returns `None` for a VLSN outside the current VLSN range, enforcing JE's
   documented contract that the VLSN range is the boundary authority. Both callers
