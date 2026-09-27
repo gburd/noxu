@@ -60,6 +60,7 @@ fn open_env(transactional: bool) -> (TempDir, Environment, Database) {
 // `java.util.Map.put(k, v)` returns the previous value associated with k,
 // or null if there was none.  The JE StoredMap honours this contract.
 
+// JE: CollectionTest.runTest (Map.put returns prior value on overwrite).
 #[test]
 fn tck_collection_map_put_returns_previous_value_on_overwrite() {
     let (_td, _env, db) = open_env(false);
@@ -74,6 +75,7 @@ fn tck_collection_map_put_returns_previous_value_on_overwrite() {
     assert_eq!(Some(200), map.get(None, &1).unwrap());
 }
 
+// JE: CollectionTest.runTest (Map.remove returns prior value).
 #[test]
 fn tck_collection_map_remove_returns_previous_value() {
     let (_td, _env, db) = open_env(false);
@@ -94,6 +96,7 @@ fn tck_collection_map_remove_returns_previous_value() {
 // Iteration order — port of CollectionTest "iter sorted by key"
 // ---------------------------------------------------------------------------
 
+// JE: CollectionTest.runTest (readAll iterates keys in sorted order).
 #[test]
 fn tck_collection_iteration_yields_keys_in_sorted_order() {
     let (_td, _env, db) = open_env(false);
@@ -120,6 +123,7 @@ fn tck_collection_iteration_yields_keys_in_sorted_order() {
 // records.  In both implementations, a mutation made *after* the
 // iterator is constructed is invisible to that iterator.
 
+// JE: CollectionTest.runTest (iterator semantics; noxu iterators are construction-time snapshots, not live cursors -- documented deviation).
 #[test]
 fn tck_collection_iterator_is_a_snapshot_of_construction_time() {
     let (_td, _env, db) = open_env(false);
@@ -147,6 +151,7 @@ fn tck_collection_iterator_is_a_snapshot_of_construction_time() {
 // Submap / iter_from — port of KeyRangeTest.testSubRanges
 // ---------------------------------------------------------------------------
 
+// JE: CollectionTest.runTest (readWriteRange TAIL: iter from key).
 #[test]
 fn tck_collection_iter_from_starts_at_or_after_key() {
     let (_td, _env, db) = open_env(false);
@@ -178,6 +183,7 @@ fn tck_collection_iter_from_starts_at_or_after_key() {
     assert!(from_99.is_empty());
 }
 
+// JE: CollectionTest.runTest (StoredSortedMap descending navigation).
 #[test]
 fn tck_collection_iter_reverse_yields_descending_order() {
     let (_td, _env, db) = open_env(false);
@@ -203,6 +209,7 @@ fn tck_collection_iter_reverse_yields_descending_order() {
 // and `None` as values; `SerdeBinding<T>` (no Option) cannot represent
 // "null" because the type system rejects it at the call site.
 
+// JE: NullValueTest.runTest (null value via a binding that supports null -- noxu uses Option<T>).
 #[test]
 fn tck_collection_null_values_round_trip_via_option() {
     let (_td, _env, db) = open_env(false);
@@ -228,6 +235,7 @@ fn tck_collection_null_values_round_trip_via_option() {
 // Transaction abort visibility — port of CollectionTest TXN/abort flows
 // ---------------------------------------------------------------------------
 
+// JE: TransactionTest.testRunnerAbort / testExplicitAbort (aborted writes invisible after abort).
 #[test]
 fn tck_collection_aborted_writes_are_invisible_after_abort() {
     let (_td, env, db) = open_env(true);
@@ -249,6 +257,7 @@ fn tck_collection_aborted_writes_are_invisible_after_abort() {
     assert_eq!(None, map.get(None, &2).unwrap()); // insert rolled back
 }
 
+// JE: TransactionTest.testExplicitCommit (committed writes visible after commit).
 #[test]
 fn tck_collection_committed_writes_are_visible_after_commit() {
     let (_td, env, db) = open_env(true);
@@ -266,6 +275,7 @@ fn tck_collection_committed_writes_are_visible_after_commit() {
 // TransactionRunner — port of CollectionTest's TransactionWorker pattern
 // ---------------------------------------------------------------------------
 
+// JE: TransactionTest.testRunnerCommit (runner commits when the worker returns normally).
 #[test]
 fn tck_collection_transaction_runner_commits_on_ok() {
     let (_td, env, db) = open_env(true);
@@ -291,6 +301,7 @@ fn tck_collection_transaction_runner_commits_on_ok() {
     assert_eq!(Some(22), map.get(None, &2).unwrap());
 }
 
+// JE: TransactionTest.testRunnerAbort (runner aborts when the worker throws).
 #[test]
 fn tck_collection_transaction_runner_rolls_back_on_err() {
     let (_td, env, db) = open_env(true);
@@ -321,6 +332,7 @@ fn tck_collection_transaction_runner_rolls_back_on_err() {
 // auto-commit reader on the same handle — is what we port here.
 // ---------------------------------------------------------------------------
 
+// JE: CollectionTest.runTest (auto-commit write immediately visible to a fresh auto-commit reader).
 #[test]
 fn tck_collection_auto_commit_writes_are_immediately_visible() {
     let (_td, _env, db) = open_env(true);
