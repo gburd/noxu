@@ -69,6 +69,9 @@ fn no_ttl_put_still_works() {
 
 #[test]
 fn day_granularity_ttl_round_trips() {
+    // JE: TTLTest.testTimeCalculations day/hour-granularity path — DAYS-unit
+    // TTL is stored as hours-since-epoch (the day-granular result * 24), the
+    // representation TTL.ttlToExpiration produces.
     let dir = TempDir::new().unwrap();
     let (_env, db) = open(&dir);
 
@@ -80,6 +83,10 @@ fn day_granularity_ttl_round_trips() {
 
 #[test]
 fn ttl_record_survives_close_and_reopen() {
+    // JE: TTLTest.testExpirationTimeStorage — a record's packed expiration is
+    // persisted in the LN log entry and restored on recovery, so a TTL record
+    // survives close + reopen (RecoveryManager.redo carries LNLogEntry
+    // getExpiration).
     let dir = TempDir::new().unwrap();
 
     // Phase 1: write TTL records, then close (exit checkpoint + WAL fsync).
