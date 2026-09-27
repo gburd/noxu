@@ -71,6 +71,16 @@ fn empty_txn_does_not_advance_replica_vlsn() {
 
 /// JE: `RepAutoCommitTest.testAutoCommit` (master-write subset).
 ///
+/// Also covers (COVERED-CITED — master-write→replica-apply is the same
+/// invariant these JE tests assert):
+///   * JE: `DatabaseOperationTest.testBasic` — master DB writes replicate to
+///     the replica (JE `checkEquality`); the harness proxies `checkEquality`
+///     with `assert_all_at_vlsn` (all nodes converge to the master VLSN).
+///   * JE: `ReplicatedTransactionTest.testAutoCommitDatabaseCreation` — an
+///     auto-commit master write replicates to all nodes.
+///   * JE: `ReplicatedTransactionTest.testAutoTransactions` — auto-commit
+///     txns on the master replicate to all nodes.
+///
 /// "Writes succeed on the master and replicate to all replicas."  In
 /// the harness, this is `populate_db` + `assert_all_at_vlsn`.
 #[test]
@@ -171,6 +181,14 @@ fn rollback_preserves_entries_before_matchpoint() {
 
 /// JE: `RollbackTest.testTxnEndAfterMatchpoint`.
 ///
+/// Also covers (COVERED-CITED):
+///   * JE: `HardRecoveryTest.testHardRecoveryNoLimit` — hard recovery rolls
+///     back the master-only post-matchpoint writes on failover (with no
+///     rollback limit).  That is exactly this test's invariant; the JE
+///     `TXN_ROLLBACK_LIMIT`/`*Disabled` knob variants are N/A (not modeled).
+///     The syncup/matchpoint mechanics are additionally covered by
+///     `syncup_matchpoint_rollback_test`.
+///
 /// "A txn that committed only on the master after the matchpoint is
 /// rolled back when the master fails over."  In the harness: replicas
 /// that did not see post-matchpoint VLSNs do not have them after taking
@@ -225,6 +243,12 @@ fn rollback_straddling_txn_is_fully_discarded() {
 }
 
 /// JE: `RollbackTest.testReplicasFlip`.
+///
+/// Also covers (COVERED-CITED):
+///   * JE: `MasterChangeTest.testMasterBecomesReplica` — after a master
+///     change the former master rejoins as a replica of the new master;
+///     the harness drives Unknown → Replica on the old master and asserts
+///     it reports the new master, which is exactly that invariant.
 ///
 /// "After a failover, a node that was master can rejoin as a replica."
 /// Specifically: the old master, brought back, can be transitioned

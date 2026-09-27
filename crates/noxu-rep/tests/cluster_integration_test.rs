@@ -86,6 +86,27 @@ fn ephemeral_listener() -> TcpChannelListener {
 /// memory queues).  This test verifies the same protocol works correctly when
 /// messages traverse the `TcpChannel` length-prefix framing layer.
 ///
+/// Also covers (COVERED-CITED — the Unknown→active-via-quorum transition):
+///   * JE: `JoinGroupTimeoutsTest.testSetupTimeout` — a node with no quorum
+///     cannot conclude an election and stays Unknown/fails; the election here
+///     concludes precisely BECAUSE a 2-of-3 quorum is reachable (the
+///     no-quorum→no-master half is `chaos_test::
+///     test_quorum_unreachable_election_fails_gracefully`).
+///   * JE: `JoinGroupTimeoutsTest.testUnknownStateTimeout` — a node in Unknown
+///     transitions to Master/Replica once a quorum forms; that Unknown→active
+///     transition via a concluded election is what this test drives.
+///   * JE: `JoinGroupTimeoutsTest.testUnknownStateTimeoutAndProceed` — the
+///     node proceeds to an active (replica) state once the election
+///     concludes.  (JE's ENV_UNKNOWN_STATE_TIMEOUT / ENV_SETUP_TIMEOUT knob
+///     interplay is N/A — those open-timeout knobs are not modeled, same as
+///     `testEnvSetupTimeoutExceeded`.)
+///   * JE: `ReplicatedEnvironmentTest.testOpenUnknown` — opening a node yields
+///     Unknown until an election concludes; the concluded election here is
+///     that transition.
+///   * JE: `UnknownStateReplicaTest.testBasic` (state-transition half) — a
+///     node in Unknown becomes active once the group can elect; the live-read
+///     half is covered by `rep7_live_read_test`.
+///
 /// Setup: 3-node group (quorum = 2).
 ///   - node1 (id=1, vlsn=100): proposer.  Highest VLSN → should win.
 ///   - node2 (id=2, vlsn=50): acceptor thread on listener2.

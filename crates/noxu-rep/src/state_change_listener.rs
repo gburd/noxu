@@ -100,6 +100,15 @@ mod tests {
         }
     }
 
+    // JE: StateChangeListenerTest.testEventIdentity (event-identity subset) —
+    // a StateChangeEvent carries the correct state and master-node-name
+    // identity. The two tests below pin that identity (state + master name,
+    // and the no-master case). JE's headline additionally asserts the event
+    // stored in a ReplicaWriteException (thrown by openDatabase on a replica)
+    // is the *same* event the listener currently holds; that half is N/A —
+    // Noxu surfaces no Database handle on a ReplicatedEnvironment, so there is
+    // no ReplicaWriteException.getEvent() to compare (see je_rep_top_level_tck
+    // database_op_replica_is_read_only_role / tp-je-rep.md structural note).
     #[test]
     fn test_state_change_event_creation() {
         let event = StateChangeEvent::new(

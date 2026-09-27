@@ -56,6 +56,14 @@ fn add_peers(env: &ReplicatedEnvironment, n: u32) {
 // (no acking replicas) does not silently succeed. Same intent at the
 // coordinator layer Noxu exposes (AckWaitErrorKind::Timeout ~
 // InsufficientAcksException).
+//
+// JE: ReplicatedTransactionTest.testMasterTxnBegin — a txn under SYNC_SYNC_ALL
+// (ReplicaAckPolicy::All) with a replica missing must NOT enter its scope /
+// succeed; JE throws InsufficientReplicasException. Same intent: the All
+// policy that cannot be met with no acking replicas does not silently
+// succeed — it returns AckWaitErrorKind::Timeout with needed > received.
+// (JE's SYNC_SYNC_QUORUM-still-succeeds-with-one-down half maps to
+// f1_simple_majority_with_no_acks_times_out's quorum arithmetic.)
 #[test]
 fn f1_all_policy_with_no_acks_times_out() {
     let env = build_master_env("master_f1_all");
@@ -84,6 +92,15 @@ fn f1_all_policy_with_no_acks_times_out() {
 /// `ReplicaAckPolicy::SimpleMajority` on a master with one peer
 /// (single peer means 2 electables, majority=2, master counts as 1, so
 /// needed=1 ack) blocks for the full timeout when no acks arrive.
+///
+// JE: ReplicatedTransactionTest.testReadonlyTxnBasic (commit-under-quorum
+// subset) — that test commits 100 txns under SYNC_SYNC_QUORUM with one
+// replica down; the SimpleMajority quorum arithmetic that governs whether
+// such a commit can proceed is exactly what this test pins (needed acks
+// under SimpleMajority with one peer). The consistency read-back half
+// (TimeConsistency returns the master's last value on the lagging replica)
+// is covered by rep10_consistency_policy_test::
+// test_time_consistency_blocks_lagging_replica.
 #[test]
 fn f1_simple_majority_with_no_acks_times_out() {
     let env = build_master_env("master_f1_maj");
@@ -192,6 +209,12 @@ fn f1_acks_within_timeout_succeed() {
 // commit blocks until the durability (ack) policy is satisfied and fails
 // cleanly (InsufficientReplicasException) when it cannot be, rather than
 // returning success without the required acks.
+//
+// JE: ReplicatedTransactionTest.testTxnCommitException — commit(SYNC_SYNC_ALL)
+// with a replica missing throws InsufficientReplicasException from the
+// pre/post-log-commit hook. This end-to-end test is exactly that: commit
+// with ReplicaAckPolicy::All and non-acking peers returns
+// NoxuError::InsufficientReplicas (Noxu's InsufficientReplicasException).
 ///
 /// This test now writes data (a `put`) before committing so the txn is a
 /// real ack-requiring commit.  An EMPTY / read-only txn correctly returns

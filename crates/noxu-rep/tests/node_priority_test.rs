@@ -96,6 +96,14 @@ fn one_node_group() -> RepGroup {
 /// quorum and the highest possible VLSN. It participates as an acceptor but
 /// refuses to propose itself as master (JE NODE_PRIORITY == 0).
 ///
+/// JE: `NodePriorityTest.testNZFailoverAndRestore` — only non-zero-priority
+/// nodes are elected; when every remaining candidate is priority 0 no
+/// election concludes.  This test pins the core guard (a priority-0 node
+/// refuses to propose/elect itself), so a group whose only surviving nodes
+/// are priority 0 cannot conclude an election.
+/// JE: `NodePriorityTest.testOnlyNZMasters` — a master is only ever a
+/// non-zero-priority node; same guard, asserted here.
+///
 /// On base this FAILS: `run_election` with `priority = 0` and a self-quorum
 /// wins and returns the proposer's id (the priority-0 guard is absent).
 #[test]

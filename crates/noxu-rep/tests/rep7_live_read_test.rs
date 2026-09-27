@@ -108,6 +108,15 @@ fn replica_setup() -> (
 
 // ─── HEADLINE 1: replica serves a live read without restart ─────────────────
 
+// JE: UnknownStateReplicaTest.testBasic (read half) — a replica (JE opens it
+// in Unknown state via ALLOW_UNKNOWN_STATE_ENV_OPEN + NoConsistency) still
+// serves correct reads of already-applied data without a restart. That
+// read-without-restart invariant is exactly this test. The companion halves:
+// the write on such a node fails (Noxu: database_op_replica_is_read_only_role,
+// which asserts an originated write is refused with NotMaster), and the
+// Unknown→active state transition is covered by
+// cluster_integration_test::test_election_over_tcp_channels. JE's
+// ALLOW_UNKNOWN_STATE_ENV_OPEN env-open knob itself is N/A.
 #[test]
 fn test_replica_serves_live_read_without_restart() {
     let (env, db_id, tree, log_mgr) = replica_setup();

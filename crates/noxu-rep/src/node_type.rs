@@ -66,6 +66,12 @@ impl std::fmt::Display for NodeType {
 mod tests {
     use super::*;
 
+    // JE: SecondaryNodeTest.testQuorums (secondary-not-counted subset) — a
+    // secondary must NOT be counted in the electable quorum, so closing a
+    // primary in a 2/3-plus-secondary group still holds a quorum.  The root
+    // invariant that makes that true is `NodeType::Secondary.is_electable()
+    // == false`, pinned here (see also quorum_policy_test for the arithmetic
+    // and rep_group_admin_add_monitor for the non-voting-member half).
     #[test]
     fn test_is_electable() {
         assert!(NodeType::Electable.is_electable());
