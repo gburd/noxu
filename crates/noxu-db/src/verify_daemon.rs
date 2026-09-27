@@ -370,6 +370,51 @@ mod tests {
         assert!(!s.matches_epoch_secs(midnight + 18 * 3600)); // 18:00 (> 17)
     }
 
+    // JE: CronScheduleParserTest.testValidate — parity for the SHARED cron
+    // subset that both parsers accept, and for the range-invalid strings both
+    // reject.  Noxu's `CronSchedule` is a deliberately DIFFERENT design from
+    // JE's `CronScheduleParser`: a per-minute matcher over a richer POSIX
+    // crontab grammar (ranges `a-b`, steps `*/n`, lists `a,b`), whereas JE's
+    // parser only accepts a restricted subset (each field an int or `*`) and
+    // additionally rejects any day-of-month/month field (JE cons3/cons4) and
+    // any `*` minute/hour when day-of-week is concrete (JE cons6/cons7), all so
+    // it can compute a java.util.Timer delay/interval.  Noxu computes no
+    // delay/interval (it polls), so those constraint rejections are an
+    // intentional deviation, NOT ported.  What IS common — the valid subset is
+    // accepted and out-of-range fields are rejected — is asserted here.
+    #[test]
+    fn cron_validate_shared_subset() {
+        // JE validateCorrect cases (Constraints 1,2,5) — all accepted by both.
+        for s in [
+            "* * * * *",
+            "5 6 * * 4",
+            "0 0 * * 6",
+            "59 23 * * 5",
+            "59 23 * * *",
+            "0 * * * *",
+            "59 * * * *",
+            "1 0 * * *",
+            "1 23 * * *",
+            "1 1 * * 0",
+            "1 1 * * 6",
+        ] {
+            assert!(CronSchedule::parse(s).is_some(), "should accept {s:?}");
+        }
+
+        // JE Constraint 1: wrong field count is rejected by both.
+        assert!(CronSchedule::parse(" * * *").is_none());
+        assert!(CronSchedule::parse("* * * * ").is_none());
+        assert!(CronSchedule::parse("* * * * * *").is_none());
+
+        // JE Constraint 5: out-of-range int fields are rejected by both.
+        assert!(CronSchedule::parse("-1 * * * *").is_none()); // minute < 0
+        assert!(CronSchedule::parse("60 * * * *").is_none()); // minute > 59
+        assert!(CronSchedule::parse("1 -1 * * *").is_none()); // hour < 0
+        assert!(CronSchedule::parse("1 24 * * *").is_none()); // hour > 23
+        assert!(CronSchedule::parse("1 1 * * -1").is_none()); // dow < 0
+        assert!(CronSchedule::parse("1 1 * * 7").is_none()); // dow > 6
+    }
+
     #[test]
     fn rejects_malformed() {
         assert!(CronSchedule::parse("").is_none());
