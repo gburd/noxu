@@ -240,6 +240,14 @@ listed in [References](#references).
   (`SecondaryDatabase.close`/`removeReferringAssociations`); other open
   secondaries on the same primary are unaffected. Found by a faithful port of JE's
   `SecondaryTest.testOpenAndClose`.
+- **`putCurrent` on a sorted-duplicate database no longer silently moves a
+  duplicate (NEW-DBI-DUPPUTCUR).** Updating the current record via `putCurrent`
+  with data that sorts differently silently relocated the duplicate (via
+  delete+reinsert) and returned success, so a later scan skipped duplicates. It
+  now compares the new value against the current one under the duplicate
+  comparator and returns `DuplicateDataException` if they are not sort-equal
+  (matching JE `Cursor.putCurrent`); an equal-sorting update still succeeds
+  in place. Found by a faithful port of JE's `DbCursorDuplicateTest`.
 
 - **WAL now fail-stops the environment on a critical log-write failure (JE
   `LogManager.serialLog` parity).** A failed or partial WAL write previously left
