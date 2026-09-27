@@ -186,6 +186,30 @@ impl UtilizationTracker {
         );
     }
 
+    /// REG-CLEANER-DISKLIMIT (split-propagation double-count guard): returns
+    /// true when `offset` in `file_number` has ALREADY been recorded obsolete
+    /// (in the tracked-offset set).  The checkpointer uses this to avoid
+    /// counting a superseded full IN/BIN version obsolete when that exact
+    /// offset was already counted by a more-authoritative path (e.g. an LN's
+    /// prior version counted Exact at write time, or another node's flush in
+    /// the same checkpoint) — a split can re-log an ancestor IN whose
+    /// `get_parent_slot_lsn`-derived "prior version" LSN coincides with an
+    /// already-counted offset, which the JE `checkDupOffsets` invariant
+    /// forbids.  JE keeps each node's prior version counted once
+    /// (`IN.afterLogCommon` counts `getLastFullVersion` exactly once); this is
+    /// the Noxu-shaped equivalent for the checkpointer's superseded-version
+    /// pass, which lacks a per-IN `last_full_lsn`.
+    pub fn is_obsolete_offset_tracked(
+        &self,
+        file_number: u32,
+        offset: u32,
+    ) -> bool {
+        self.tracked_files
+            .get(&file_number)
+            .map(|t| t.get_obsolete_offsets().contains(&offset))
+            .unwrap_or(false)
+    }
+
     /// Shared obsolete-counting core.
     ///
     /// JE `BaseUtilizationTracker.countObsolete`. Updates both the per-FILE

@@ -1281,6 +1281,25 @@ impl Checkpointer {
             // `IN.afterLogCommon` sets `params.oldLsn = getPrevFullLsn()` and
             // `LogManager.countObsoleteNode` counts it.
             for (lsn, db_id) in &result.obsolete_full_lsns {
+                // REG-CLEANER-DISKLIMIT (split-propagation double-count guard):
+                // skip a superseded full IN/BIN LSN whose offset is ALREADY
+                // recorded obsolete for this file.  A split can re-log an
+                // ancestor IN whose `get_parent_slot_lsn`-derived "prior
+                // version" LSN coincides with an offset already counted by a
+                // more-authoritative path (an LN's prior version counted Exact
+                // at write time, or another node flushed earlier in this same
+                // checkpoint) — counting it again violates the JE
+                // `checkDupOffsets` invariant (each node's prior version is
+                // counted once, JE `IN.afterLogCommon` /
+                // `countObsoleteNode(getLastFullVersion)`).  The legitimate
+                // dups-allowed case (a full->delta->full intervening delta) is
+                // never already tracked at this point, so it is not skipped.
+                if tracker.is_obsolete_offset_tracked(
+                    lsn.file_number(),
+                    lsn.file_offset(),
+                ) {
+                    continue;
+                }
                 tracker.count_obsolete_node_dups_allowed(
                     lsn.file_number(),
                     lsn.file_offset(),
@@ -1624,6 +1643,25 @@ impl Checkpointer {
         {
             let mut tracker = tracker_lock.lock();
             for (lsn, db_id) in &result.obsolete_full_lsns {
+                // REG-CLEANER-DISKLIMIT (split-propagation double-count guard):
+                // skip a superseded full IN/BIN LSN whose offset is ALREADY
+                // recorded obsolete for this file.  A split can re-log an
+                // ancestor IN whose `get_parent_slot_lsn`-derived "prior
+                // version" LSN coincides with an offset already counted by a
+                // more-authoritative path (an LN's prior version counted Exact
+                // at write time, or another node flushed earlier in this same
+                // checkpoint) — counting it again violates the JE
+                // `checkDupOffsets` invariant (each node's prior version is
+                // counted once, JE `IN.afterLogCommon` /
+                // `countObsoleteNode(getLastFullVersion)`).  The legitimate
+                // dups-allowed case (a full->delta->full intervening delta) is
+                // never already tracked at this point, so it is not skipped.
+                if tracker.is_obsolete_offset_tracked(
+                    lsn.file_number(),
+                    lsn.file_offset(),
+                ) {
+                    continue;
+                }
                 tracker.count_obsolete_node_dups_allowed(
                     lsn.file_number(),
                     lsn.file_offset(),
@@ -2310,6 +2348,7 @@ mod tests {
             compact_max_key_length:
                 noxu_tree::tree::INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: noxu_tree::TREE_MAX_EMBEDDED_LN_DEFAULT,
         };
         let node = NodeRwLock::new(TreeNode::Bottom(bin));
 

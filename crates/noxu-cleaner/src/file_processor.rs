@@ -1179,6 +1179,18 @@ pub struct FileProcessor {
     /// JE: `FileProcessor.processFile` calls `cleaner.processPending()` every
     /// `PROCESS_PENDING_EVERY_N_LNS` (FileProcessor.java ~line 1004–1005).
     process_pending_fn: Option<Arc<dyn Fn() + Send + Sync>>,
+
+    /// REG-CLEANER-DISKLIMIT (embedded-LN immediate-obsolete): the set of LN
+    /// log-entry offsets in the file being processed that are already KNOWN
+    /// obsolete (recorded in the file's `TrackedFileSummary` /
+    /// `FileSummaryLN` obsolete-offset list — e.g. a standalone LN whose data
+    /// a checkpoint has since embedded into its BIN slot).  Such an entry is
+    /// skipped WITHOUT a tree lookup or migration, exactly like JE
+    /// `FileProcessor.processFile`'s obsolete-offset check
+    /// (FileProcessor.java:673-802: `obsoleteIter` / `nextObsolete ==
+    /// fileOffset -> isObsolete = true`).  Empty by default (no skip); wired
+    /// by `Cleaner::process_single_file` from the live utilization tracker.
+    obsolete_offsets: std::collections::HashSet<u32>,
 }
 
 /// Result of processing a single file.
@@ -1250,7 +1262,20 @@ impl FileProcessor {
             shutdown,
             process_pending_interval: PROCESS_PENDING_EVERY_N_LNS,
             process_pending_fn: None,
+            obsolete_offsets: std::collections::HashSet::new(),
         }
+    }
+
+    /// Wires the set of already-known-obsolete LN offsets for the file being
+    /// processed (REG-CLEANER-DISKLIMIT).  Entries whose offset is in this set
+    /// are counted obsolete and skipped without a tree lookup or migration,
+    /// mirroring JE `FileProcessor.processFile`'s obsolete-offset check.
+    pub fn with_obsolete_offsets(
+        mut self,
+        offsets: std::collections::HashSet<u32>,
+    ) -> Self {
+        self.obsolete_offsets = offsets;
+        self
     }
 
     /// Sets the interval for processing pending LNs.
@@ -1352,6 +1377,25 @@ impl FileProcessor {
                     expiration_time,
                     entry_size,
                 } => {
+                    // REG-CLEANER-DISKLIMIT (embedded-LN immediate-obsolete):
+                    // skip an LN whose offset is already recorded obsolete in
+                    // the file's tracked obsolete-offset set — e.g. a
+                    // standalone LN whose data a checkpoint has since embedded
+                    // into its BIN slot (its authoritative copy now lives in
+                    // the checkpointed BIN; the standalone entry is redundant).
+                    // Counted obsolete and skipped WITHOUT a tree lookup or
+                    // migration.  JE FileProcessor.processFile:796-802 (the
+                    // `nextObsolete == fileOffset -> isObsolete` check) does
+                    // exactly this via the file's persisted obsolete offsets;
+                    // migrating an already-obsolete embedded LN would re-log
+                    // it, dirty its BIN, and drive the checkpoint/migration
+                    // treadmill that blocked disk-limit recovery.
+                    if self.obsolete_offsets.contains(&file_offset) {
+                        result.lns_obsolete += 1;
+                        self.stats.lns_obsolete.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+
                     // Deleted LNs (log version > 2) are immediately obsolete.
                     if *deleted {
                         result.lns_obsolete += 1;

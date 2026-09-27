@@ -18,7 +18,8 @@
 //! writes; the cleaner's own writes are never blocked (it freed the space).
 
 use noxu_db::{
-    DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig, NoxuError,
+    DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
+    EnvironmentMutableConfig, NoxuError,
 };
 use tempfile::TempDir;
 
@@ -114,56 +115,56 @@ fn disk_limit_blocks_then_resumes() {
     // ...but aborting the txn still succeeds.
     txn.abort().expect("abort must succeed while over the disk limit");
 
-    // Free space: delete records and run the cleaner. The cleaner's OWN writes
-    // (migrating live LNs, writing FileSummaryLNs to the internal utilization
-    // DB) must NOT be blocked by the limit, or it could never reclaim space.
-    // clean_log() succeeding here proves the internal-writes-exempt rule.
-    for i in 0..blocked_at {
-        let key = DatabaseEntry::from_bytes(&(i as u64).to_be_bytes());
-        // Deletes are also gated while over-limit, so we may need to clean
-        // first. Try the delete; ignore a disk-limit refusal and rely on the
-        // checkpoint+clean below to reclaim whole obsolete files.
-        let _ = db.delete(&key);
-    }
-    // Checkpoint flushes the tree so cleaned files become fully obsolete, then
-    // clean_log reclaims them (the cleaner refreshes the disk-limit state after
-    // its pass, JE Cleaner.manageDiskUsage -> freshenLogSizeStats).
-    let _ = env.checkpoint(None);
+    // The cleaner's OWN writes (migrating live LNs, writing FileSummaryLNs to
+    // the internal utilization DB) must NOT be blocked by the limit, or it
+    // could never reclaim space. clean_log() succeeding while over-limit proves
+    // the internal-writes-exempt rule (JE: internal DBs skip
+    // checkUpdatesAllowed). It runs force=false (JE Environment.cleanLog ->
+    // invokeCleaner(false)); on a 100%-live workload it reclaims nothing, and
+    // that is correct -- JE getBestFile(forceCleaning=false) never selects a
+    // 100%-live file (UtilizationCalculator.java:405-431).
     let _cleaned = env.clean_log().expect(
-        "cleaner must be able to write/delete while over the limit \
+        "cleaner must be able to write while over the limit \
          (internal-writes-exempt rule); otherwise it deadlocks",
     );
     env.refresh_disk_limit().unwrap();
 
-    // Writes must resume once we are back within the limit. If a single clean
-    // pass did not reclaim enough, drive a few more delete+clean cycles.
-    let mut resumed = false;
-    for round in 0..8 {
-        let key =
-            DatabaseEntry::from_bytes(&(10_000 + round as u64).to_be_bytes());
-        env.refresh_disk_limit().unwrap();
-        match db.put(&key, val(round)) {
-            Ok(()) => {
-                resumed = true;
-                break;
-            }
-            Err(NoxuError::DiskLimitExceeded { .. }) => {
-                // Still over-limit: reclaim more and retry.
-                for i in 0..blocked_at {
-                    let k =
-                        DatabaseEntry::from_bytes(&(i as u64).to_be_bytes());
-                    let _ = db.delete(&k);
-                }
-                let _ = env.checkpoint(None);
-                let _ = env.clean_log();
-            }
-            other => panic!("unexpected on resume: {other:?}"),
-        }
-    }
+    // Deletes are gated under the limit too (JE Cursor.deleteInternal ->
+    // checkUpdatesAllowed), so the workload cannot free itself by deleting +
+    // cleaning while blocked: writes stay blocked.
+    let key = DatabaseEntry::from_bytes(&(blocked_at as u64).to_be_bytes());
     assert!(
-        resumed,
-        "writes must resume after the cleaner reclaims space below MAX_DISK"
+        matches!(
+            db.put(&key, val(blocked_at)),
+            Err(NoxuError::DiskLimitExceeded { .. })
+        ),
+        "writes must remain blocked over the limit -- deletes are gated, so \
+         cleaning a 100%-live workload cannot drop below the cap (JE resumes \
+         by relaxing the limit, not by reclaim-below-cap)"
     );
+
+    // RESUME by RELAXING the limit -- the Noxu analogue of JE
+    // DiskLimitTest.allowWrites() (setMaxDisk(0), DiskLimitTest.java:578-580).
+    // Disabling MAX_DISK (FREE_DISK is already 0 in this test) clears the
+    // violation, so the next user write succeeds.
+    let mut env = env;
+    env.set_mutable_config(EnvironmentMutableConfig::new().with_max_disk(0))
+        .expect("relaxing MAX_DISK must succeed");
+    env.refresh_disk_limit().unwrap();
+
+    let resume_key = DatabaseEntry::from_bytes(&10_000u64.to_be_bytes());
+    match db.put(&resume_key, val(0)) {
+        Ok(()) => {}
+        other => panic!(
+            "write must resume once the limit is relaxed (JE allowWrites / \
+             setMaxDisk(0)); got {other:?}"
+        ),
+    }
+    // And the record is readable back -- resume actually persisted the write.
+    let mut out = DatabaseEntry::new();
+    let s = db.get_into(None, &resume_key, &mut out).unwrap();
+    assert!(s, "resumed write must be readable");
+    assert_eq!(out.data_opt().unwrap().len(), 1024);
 }
 
 /// Default behaviour is unchanged: with MAX_DISK=0 and FREE_DISK=0 the tracker

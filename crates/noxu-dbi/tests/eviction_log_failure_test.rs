@@ -6,6 +6,16 @@
 //! - real logger, failed oversized pwrite: a critical append failure PERMANENTLY
 //!   invalidates the environment (JE serialLog fail-stop); the dirty BIN is
 //!   retained, no obsolete is credited, and no same-instance retry is allowed.
+//!
+//! 1A note (REG-CLEANER-DISKLIMIT): this test asserts the evicted/retained BIN
+//! image via the RAW tree (`search_with_data`), which returns a slot's cached
+//! data directly — it does NOT run the cursor's log-fetch path.  So it must use
+//! values that are EMBEDDED in the BIN slot (`<= TREE_MAX_EMBEDDED_LN` = 16 B);
+//! a larger value would be serialised as an LSN pointer only (1A) and would be
+//! materialisable only through the cursor's `fetch_ln_data_from_log`, not the
+//! raw tree read used here.  The eviction-refusal / fail-stop contract under
+//! test is independent of LN size; 16-byte values keep a 20-slot BIN well above
+//! the 256-byte log buffer so eviction still performs a real oversized pwrite.
 #![cfg(not(noxu_shuttle))]
 
 use noxu_dbi::{
@@ -51,7 +61,7 @@ fn exercise_refusal(missing_logger: bool, dirty_lru: bool, dirty: bool) {
     let mut cursor = CursorImpl::new(Arc::clone(&db), 1);
     for i in 0..20u32 {
         cursor
-            .put(&i.to_be_bytes(), &vec![i as u8; 1024], PutMode::Overwrite)
+            .put(&i.to_be_bytes(), &[i as u8; 16], PutMode::Overwrite)
             .unwrap();
     }
     cursor.close().unwrap();
@@ -72,11 +82,7 @@ fn exercise_refusal(missing_logger: bool, dirty_lru: bool, dirty: bool) {
         let mut cursor = CursorImpl::new(Arc::clone(&db), 2);
         for i in 0..20u32 {
             cursor
-                .put(
-                    &i.to_be_bytes(),
-                    &vec![100 + i as u8; 1024],
-                    PutMode::Overwrite,
-                )
+                .put(&i.to_be_bytes(), &[100 + i as u8; 16], PutMode::Overwrite)
                 .unwrap();
         }
         cursor.close().unwrap();
@@ -101,7 +107,7 @@ fn exercise_refusal(missing_logger: bool, dirty_lru: bool, dirty: bool) {
     let assert_values = || {
         for i in 0..20u32 {
             let expected =
-                vec![if dirty { 100 + i as u8 } else { i as u8 }; 1024];
+                vec![if dirty { 100 + i as u8 } else { i as u8 }; 16];
             assert_eq!(
                 tree.read()
                     .unwrap()

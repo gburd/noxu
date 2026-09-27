@@ -75,6 +75,14 @@ pub struct EnvironmentMutableConfig {
     /// JE `EnvironmentConfig.CLEANER_MIN_UTILIZATION` re-read via
     /// `EnvConfigObserver`.
     pub cleaner_min_utilization: Option<u32>,
+
+    /// Override `MAX_DISK` (absolute log-size cap, bytes) at runtime.  `None`
+    /// means unchanged; `Some(0)` DISABLES the max-disk cap so a write blocked
+    /// purely by `MAX_DISK` resumes.  Mirrors JE
+    /// `EnvironmentMutableConfig.setMaxDisk` (a mutable param); the disk-limit
+    /// tests relax the cap this way to resume writes, matching JE
+    /// `DiskLimitTest.allowWrites()` (`setMaxDisk(0)`).
+    pub max_disk: Option<u64>,
 }
 
 impl EnvironmentMutableConfig {
@@ -162,6 +170,14 @@ impl EnvironmentMutableConfig {
     /// Sets the cleaner minimum-utilization threshold (0-100%).
     pub fn with_cleaner_min_utilization(mut self, pct: u32) -> Self {
         self.cleaner_min_utilization = Some(pct);
+        self
+    }
+
+    /// Sets the `MAX_DISK` override (absolute log-size cap in bytes).  Pass 0
+    /// to DISABLE the max-disk cap (JE `setMaxDisk(0)`), which resumes a write
+    /// blocked purely by `MAX_DISK`.
+    pub fn with_max_disk(mut self, bytes: u64) -> Self {
+        self.max_disk = Some(bytes);
         self
     }
 }

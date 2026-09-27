@@ -301,6 +301,24 @@ impl DatabaseImpl {
         // && !btree_partial_comparator && !duplicate_partial_comparator
         // (always true: Noxu has no partial comparators)
     }
+
+    /// 1A (REG-CLEANER-DISKLIMIT): whether an LN with `data_len` bytes of data
+    /// is embedded directly in its BIN slot (vs. an LSN pointer only, fetched
+    /// from the log on read).  Faithful JE `CursorImpl.shouldEmbedLN`
+    /// (CursorImpl.java:870-874): embed only when the data fits the configured
+    /// `maxEmbeddedLN`, the DB is not a sorted-duplicate DB (dup data lives in
+    /// the composite key, never embedded), and it is not an internal DB.  The
+    /// threshold is the tree's `max_embedded_ln` snapshot (wired from
+    /// `noxu.tree.maxEmbeddedLN`); with no tree yet, use the default 16.
+    pub fn should_embed_ln(&self, data_len: usize) -> bool {
+        let max = self
+            .get_real_tree()
+            .map(|t| t.max_embedded_ln)
+            .unwrap_or(noxu_tree::TREE_MAX_EMBEDDED_LN_DEFAULT);
+        (data_len as i64) <= max as i64
+            && !self.get_sorted_duplicates()
+            && !self.db_type.is_internal()
+    }
     pub fn is_temporary(&self) -> bool {
         self.flags & TEMPORARY_BIT != 0
     }
@@ -557,6 +575,17 @@ impl DatabaseImpl {
             && let Ok(mut tree) = tree_arc.write()
         {
             tree.set_expiration_enabled(enabled);
+        }
+    }
+
+    /// 1A: thread `TREE_MAX_EMBEDDED_LN` into the real tree so a large LN is
+    /// serialised as an LSN pointer only in its BIN slot (fetched from the log
+    /// on read) instead of embedded (JE `env.getMaxEmbeddedLN`).
+    pub fn set_tree_max_embedded_ln(&mut self, max: i32) {
+        if let Some(tree_arc) = self.real_tree.as_ref()
+            && let Ok(mut tree) = tree_arc.write()
+        {
+            tree.set_max_embedded_ln(max);
         }
     }
 

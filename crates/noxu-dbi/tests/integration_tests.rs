@@ -1021,12 +1021,20 @@ fn overwrites_count_prior_versions_obsolete_per_db() {
     let mut cursor = CursorImpl::with_log_manager(db_arc, 1, lm);
 
     const N: u8 = 20;
+    // Values are <= TREE_MAX_EMBEDDED_LN (2 bytes), so every LN is EMBEDDED in
+    // its BIN slot (1A: non-dup, non-internal DB).  Under B2a
+    // (REG-CLEANER-DISKLIMIT), an embedded LN is counted IMMEDIATELY obsolete
+    // at its OWN write time (JE `LNLogEntry.isImmediatelyObsolete`: the
+    // `embeddedLN` arm — its authoritative copy lives in the checkpointed BIN,
+    // so the standalone log entry is redundant the moment it is written).  The
+    // prior-version count is then SUPPRESSED by the JE `!currEmbeddedLN` guard
+    // (LN.logInternal:685-688) so the same version is never counted twice.
+    const WRITES: i32 = 4; // 1 initial + 3 overwrite rounds
     // Initial write of N records (auto-commit).
     for i in 0u8..N {
         cursor.put(&[i], b"v0", PutMode::Overwrite).unwrap();
     }
-    // Overwrite every record 3 times.  Each overwrite supersedes the prior
-    // version, which must be counted obsolete.
+    // Overwrite every record 3 times.
     for round in 1u8..=3 {
         for i in 0u8..N {
             let v = [b'v', round];
@@ -1037,8 +1045,11 @@ fn overwrites_count_prior_versions_obsolete_per_db() {
 
     let tracker = env.get_utilization_tracker().unwrap().lock();
 
-    // Per-file: the obsolete LN count across all tracked files must equal the
-    // number of superseded versions: N records * 3 overwrite rounds = 60.
+    // Per-file: EVERY embedded LN write is counted immediately obsolete, so the
+    // total obsolete LN count equals the total number of LN writes:
+    // N records * (1 initial + 3 overwrites) = 80.  (Before 1A/B2a, embedding
+    // was inert and only the 60 superseded PRIOR versions were counted; the
+    // JE-faithful embedded-LN accounting counts each embedded write itself.)
     let total_obsolete_ln: i32 = tracker
         .get_tracked_files()
         .values()
@@ -1046,13 +1057,14 @@ fn overwrites_count_prior_versions_obsolete_per_db() {
         .sum();
     assert_eq!(
         total_obsolete_ln,
-        (N as i32) * 3,
-        "each of the {N} records overwritten 3 times must produce 60 \
-         obsolete prior versions in the per-file summaries"
+        (N as i32) * WRITES,
+        "each embedded LN write is immediately obsolete (JE embeddedLN arm): \
+         {N} records * {WRITES} writes = 80, counted ONCE each (no \
+         double-count under the !currEmbeddedLN guard)"
     );
 
     // Per-DB axis (CLN-9): the DbFileSummary for this db must exist and have
-    // recorded the obsolete LNs.  On main this map has no producer.
+    // recorded the same obsolete LNs.  On main this map has no producer.
     let per_db_obsolete: i32 = tracker
         .get_tracked_files()
         .keys()
@@ -1061,7 +1073,7 @@ fn overwrites_count_prior_versions_obsolete_per_db() {
         .sum();
     assert_eq!(
         per_db_obsolete,
-        (N as i32) * 3,
+        (N as i32) * WRITES,
         "CLN-9: the per-DB DbFileSummary must record the same obsolete LN \
          count (the per-DB axis has a live producer)"
     );

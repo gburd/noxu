@@ -4005,6 +4005,29 @@ impl CursorImpl {
         let db_id = self.db_impl.read().get_id().id() as u64;
         let txn_id_opt = if txn_id != 0 { Some(txn_id) } else { None };
 
+        // 1A/B2a (REG-CLEANER-DISKLIMIT): decide whether THIS LN's data is
+        // embedded in the BIN slot (`data.len() <= maxEmbeddedLN`, non-dup,
+        // non-internal DB — JE `CursorImpl.shouldEmbedLN`).  A deletion carries
+        // no data and is never "embedded" in this sense (it is immediately
+        // obsolete via the `is_deleted` arm).  Also read whether the PRIOR slot
+        // version was embedded (`curr_embedded_ln`) — JE `currEmbeddedLN`,
+        // needed for the double-count guard below.  Read the prior data BEFORE
+        // `apply_tree_insert`/`apply_tree_delete` overwrites the slot (both run
+        // after `log_ln_write`), so the tree still holds the pre-write value.
+        let new_embedded_ln = match data {
+            Some(d) => self.db_impl.read().should_embed_ln(d.len()),
+            None => false,
+        };
+        let curr_embedded_ln = if old_lsn != noxu_util::NULL_LSN.as_u64() {
+            let (prior_data, _) = self.get_slot_before_image(key);
+            match prior_data {
+                Some(pd) => self.db_impl.read().should_embed_ln(pd.len()),
+                None => false,
+            }
+        } else {
+            false
+        };
+
         let entry = LnLogEntry::new(
             db_id,
             txn_id_opt,
@@ -4014,7 +4037,7 @@ impl CursorImpl {
             None,                            // abort_data
             NULL_VLSN,                       // abort_vlsn
             0,                               // abort_expiration
-            true,                            // embedded_ln
+            new_embedded_ln, // embedded_ln (1A: true iff embedded)
             key.to_vec(),
             data.map(|d| d.to_vec()),
             self.pending_expiration, // expiration (JE ExpirationInfo.expiration)
@@ -4068,8 +4091,16 @@ impl CursorImpl {
             // Auto-commit: abortLsn is NULL, so currLsn != abortLsn.
             None => true,
         };
-        let count_prior_obsolete_now =
-            has_prior && curr_ne_abort && !is_immediately_obsolete_db;
+        // B2a: JE `LN.logInternal:685-688` also guards on `!currEmbeddedLN`.
+        // If the prior slot version was embedded, it was ALREADY counted
+        // immediately obsolete at ITS OWN write time (the embeddedLN arm
+        // below), so counting it obsolete again here would double-count it
+        // (the debug_assert the WIP tripped).  Suppress the prior-version
+        // obsolete count when the prior version was embedded.
+        let count_prior_obsolete_now = has_prior
+            && curr_ne_abort
+            && !is_immediately_obsolete_db
+            && !curr_embedded_ln;
         let old_obsolete = if count_prior_obsolete_now {
             Some(noxu_log::ObsoleteLsn::exact(
                 Lsn::from_u64(old_lsn),
@@ -4086,14 +4117,21 @@ impl CursorImpl {
         // are immediately obsolete (dup DBs).
         // JE LNLogEntry.isImmediatelyObsolete:
         //   ln.isDeleted() || embeddedLN || dbImpl.isLNImmediatelyObsolete()
-        // The embeddedLN arm is omitted here: the `embedded_ln` field on the
-        // LnLogEntry is currently hard-coded `true` (a separate fidelity gap),
-        // so it cannot be used to decide immediate-obsolescence without
-        // marking every LN obsolete.  Once real BIN-embedding is tracked the
-        // arm can be restored.  ponytail: omit unreliable embedded arm,
-        // restore when LnLogEntry.embedded_ln reflects true embedding.
+        // B2a (REG-CLEANER-DISKLIMIT): the embeddedLN arm is now RESTORED.
+        // `new_embedded_ln` (computed above via `should_embed_ln`) reflects
+        // TRUE embedding — an LN whose data is small enough to live in the BIN
+        // slot (data.len() <= maxEmbeddedLN, non-dup, non-internal DB).  Such
+        // an LN's authoritative copy lives in the checkpointed BIN, so its
+        // standalone log entry is immediately obsolete the moment it is
+        // written (JE `LNLogEntry.isImmediatelyObsolete`: `ln.isDeleted() ||
+        // embeddedLN || dbImpl.isLNImmediatelyObsolete()`).  A LARGE LN
+        // (`!new_embedded_ln`) is NOT immediately obsolete: its data is NOT in
+        // the BIN (the slot stores an LSN pointer only, 1A), so the log entry
+        // is the only copy and must survive until a later version supersedes
+        // it — matching JE, which never embeds it and never counts it here.
         let is_deleted = data.is_none();
-        let immediately_obsolete = is_deleted || is_immediately_obsolete_db;
+        let immediately_obsolete =
+            is_deleted || new_embedded_ln || is_immediately_obsolete_db;
 
         lm.log_tracked(
             entry_type,

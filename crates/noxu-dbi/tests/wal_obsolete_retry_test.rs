@@ -21,7 +21,7 @@ use noxu_log::faultdisk::{self, FaultController, FaultKind};
 use noxu_log::{LogEntryType, ObsoleteLsn, Provisional};
 use noxu_tree::tree::TreeNode;
 use noxu_util::NULL_LSN;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 struct FaultReset;
 impl Drop for FaultReset {
@@ -30,9 +30,15 @@ impl Drop for FaultReset {
     }
 }
 
-// Sole test in its executable: no concurrent faultdisk users or env daemons.
+// faultdisk is process-global; both tests in this executable install/uninstall
+// it, so they must not run concurrently.  Serialise them on a shared lock (the
+// same pattern as eviction_log_failure_test's FAULT_LOCK) so the suite is
+// correct under the default parallel test runner, not only `--test-threads=1`.
+static FAULT_LOCK: Mutex<()> = Mutex::new(());
+
 #[test]
 fn failed_bin_log_fail_stops_and_credits_no_obsolete() {
+    let _lock = FAULT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _reset = FaultReset;
     faultdisk::uninstall();
     let dir = tempfile::tempdir().unwrap();
@@ -50,12 +56,21 @@ fn failed_bin_log_fail_stops_and_credits_no_obsolete() {
     db_cfg.set_allow_create(true);
     let db = env.open_database("retry", &db_cfg).unwrap();
     let mut cursor = CursorImpl::new(Arc::clone(&db), 1);
-    cursor.put(b"key", &[1; 1024], PutMode::Overwrite).unwrap();
+    // Many small (<= TREE_MAX_EMBEDDED_LN) records so the FULL BIN image
+    // exceeds the 256B log buffer on its own (1A: a large LN would be an LSN
+    // pointer only and would NOT inflate the BIN image).
+    for i in 0u16..40 {
+        cursor.put(&i.to_be_bytes(), &[1u8; 8], PutMode::Overwrite).unwrap();
+    }
     cursor.close().unwrap();
     env.run_checkpoint().unwrap();
     let tree = db.read().get_real_tree_arc().unwrap();
-    let bin_arc =
-        tree.read().unwrap().search_with_data(b"key").unwrap().bin_arc;
+    let bin_arc = tree
+        .read()
+        .unwrap()
+        .search_with_data(&0u16.to_be_bytes())
+        .unwrap()
+        .bin_arc;
     let old_full = {
         let guard = bin_arc.read();
         let TreeNode::Bottom(bin) = &*guard else { panic!("BIN required") };
@@ -64,7 +79,9 @@ fn failed_bin_log_fail_stops_and_credits_no_obsolete() {
         bin.last_full_lsn
     };
     let mut cursor = CursorImpl::new(Arc::clone(&db), 2);
-    cursor.put(b"key", &[2; 1024], PutMode::Overwrite).unwrap();
+    for i in 0u16..40 {
+        cursor.put(&i.to_be_bytes(), &[2u8; 8], PutMode::Overwrite).unwrap();
+    }
     cursor.close().unwrap();
     let db_id = db.read().get_id().id() as u64;
     let entry = {
@@ -175,6 +192,7 @@ fn failed_bin_log_fail_stops_and_credits_no_obsolete() {
 // EXACTLY ONCE (no-error-exactly-once), in a fresh healthy environment.
 #[test]
 fn successful_bin_log_credits_obsolete_exactly_once() {
+    let _lock = FAULT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _reset = FaultReset;
     faultdisk::uninstall();
     let dir = tempfile::tempdir().unwrap();
@@ -192,19 +210,28 @@ fn successful_bin_log_credits_obsolete_exactly_once() {
     db_cfg.set_allow_create(true);
     let db = env.open_database("ok", &db_cfg).unwrap();
     let mut cursor = CursorImpl::new(Arc::clone(&db), 1);
-    cursor.put(b"key", &[1; 1024], PutMode::Overwrite).unwrap();
+    // Many small (embedded) records -> full BIN image > 256B log buffer (1A).
+    for i in 0u16..40 {
+        cursor.put(&i.to_be_bytes(), &[1u8; 8], PutMode::Overwrite).unwrap();
+    }
     cursor.close().unwrap();
     env.run_checkpoint().unwrap();
     let tree = db.read().get_real_tree_arc().unwrap();
-    let bin_arc =
-        tree.read().unwrap().search_with_data(b"key").unwrap().bin_arc;
+    let bin_arc = tree
+        .read()
+        .unwrap()
+        .search_with_data(&0u16.to_be_bytes())
+        .unwrap()
+        .bin_arc;
     let old_full = {
         let guard = bin_arc.read();
         let TreeNode::Bottom(bin) = &*guard else { panic!("BIN required") };
         bin.last_full_lsn
     };
     let mut cursor = CursorImpl::new(Arc::clone(&db), 2);
-    cursor.put(b"key", &[2; 1024], PutMode::Overwrite).unwrap();
+    for i in 0u16..40 {
+        cursor.put(&i.to_be_bytes(), &[2u8; 8], PutMode::Overwrite).unwrap();
+    }
     cursor.close().unwrap();
     let db_id = db.read().get_id().id() as u64;
     let entry = {
