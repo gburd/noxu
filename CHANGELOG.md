@@ -248,6 +248,14 @@ listed in [References](#references).
   comparator and returns `DuplicateDataException` if they are not sort-equal
   (matching JE `Cursor.putCurrent`); an equal-sorting update still succeeds
   in place. Found by a faithful port of JE's `DbCursorDuplicateTest`.
+- **Concurrent deletes of the same record are now serialized (NEW-DEL-RACE-1).**
+  When multiple transactions deleted the same record concurrently, each could
+  observe it live and commit a delete (only one should win), because the
+  already-deleted check ran before the write lock was acquired. The delete path
+  now re-validates the record's state after acquiring the write lock and returns
+  `KeyEmpty` if a concurrent transaction already removed it (matching JE
+  `CursorImpl.deleteCurrentRecord`). Exactly one concurrent deleter now succeeds.
+  Found by a faithful port of JE's `SecondaryMultiTest.testMultiDeleteUnordered`.
 
 - **WAL now fail-stops the environment on a critical log-write failure (JE
   `LogManager.serialLog` parity).** A failed or partial WAL write previously left
