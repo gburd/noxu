@@ -9,6 +9,9 @@
 //! this backs the replication `Feeder` lag stats.
 //!
 //! JE ref: `com.sleepycat.je.utilint.LongDiffStat`.
+//!
+//! Faithful reference port kept for test parity with JE; the eventual wiring
+//! into Feeder-lag stats is tracked as a follow-up.
 
 use crate::moving_avg::AtomicLongComponent;
 use std::sync::Arc;
