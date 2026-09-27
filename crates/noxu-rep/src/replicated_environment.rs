@@ -3493,37 +3493,87 @@ impl ReplicatedEnvironment {
         // finding B5/V16/F1.
         //
         // Steps:
-        //   1. Locate the target's address.
-        //   2. Wait for the target to catch up to the master's VLSN (below);
+        //   1. Validate the target argument (below).
+        //   2. Locate the target's address.
+        //   3. Wait for the target to catch up to the master's VLSN (below);
         //      abort the transfer if it does not within config.timeout.
-        //   3. Compute the new term (current observed term + 1).
-        //   4. Send TRANSFER_MASTER to the target — it will become master.
-        //   5. Send TRANSFER_MASTER (with the same term + new master name) to
+        //   4. Compute the new term (current observed term + 1).
+        //   5. Send TRANSFER_MASTER to the target — it will become master.
+        //   6. Send TRANSFER_MASTER (with the same term + new master name) to
         //      every other peer so they re-target.
-        //   6. Demote self to Replica of the target.
+        //   7. Demote self to Replica of the target.
         //
-        // The catch-up wait (step 2) is mandatory unless config.force is set:
+        // The catch-up wait (step 3) is mandatory unless config.force is set:
         // handing off to a lagging replica would lose this master's most
-        // recent committed data. The peer notifications in step 5 remain
+        // recent committed data. The peer notifications in step 6 remain
         // best-effort (a peer that doesn't ack is logged and skipped; the
         // election driver reconciles any divergence on the next round).
 
-        let target_addr = self
+        // JE: `MasterTransfer` argument validation
+        // (`MasterTransferTest.testStupidCodingMistakes`,
+        // `ReplicatedEnvironment.transferMaster` /
+        // `RepNode.transferMaster`): the target set must name a real,
+        // *electable* replica; an empty target, a SECONDARY/MONITOR, or a
+        // non-member is rejected up front, and the master naming *itself* as
+        // the target completes immediately and successfully (it is already
+        // master).  Faithful port of JE's `IllegalArgumentException` guards
+        // (adapted to `Result::Err`) plus the self-in-candidate-set
+        // short-circuit.
+
+        // Empty target: JE rejects an empty `replicas` set.
+        if config.target_node.is_empty() {
+            return Err(RepError::ConfigError(
+                "transfer_master: target node name must not be empty"
+                    .to_string(),
+            ));
+        }
+
+        // Self-as-target: JE defines this to complete immediately and
+        // successfully — the node is already master, so there is nothing to
+        // hand off.
+        if config.target_node == self.config.node_name.as_str() {
+            log::info!(
+                "transfer_master: target '{}' is this master; completing \
+                 immediately",
+                config.target_node,
+            );
+            return Ok(());
+        }
+
+        let target_node_info = self
             .group_service
             .get_all_nodes()
             .into_iter()
             .find(|n| n.name == config.target_node)
-            .and_then(|n| {
-                format!("{}:{}", n.host, n.port)
-                    .parse::<std::net::SocketAddr>()
-                    .ok()
-            })
             .ok_or_else(|| {
                 RepError::ConfigError(format!(
-                    "transfer_master: target '{}' not registered or has bad address",
+                    "transfer_master: target '{}' not registered",
                     config.target_node
                 ))
             })?;
+
+        // Non-electable target: a SECONDARY or MONITOR can never become
+        // master, so a transfer to one is rejected (JE
+        // `IllegalArgumentException`).
+        if !target_node_info.node_type.can_be_master() {
+            return Err(RepError::ConfigError(format!(
+                "transfer_master: target '{}' is a {} and cannot become \
+                 master (only electable nodes are valid transfer targets)",
+                config.target_node, target_node_info.node_type,
+            )));
+        }
+
+        let target_addr =
+            format!("{}:{}", target_node_info.host, target_node_info.port)
+                .parse::<std::net::SocketAddr>()
+                .map_err(|_| {
+                    RepError::ConfigError(format!(
+                        "transfer_master: target '{}' has bad address {}:{}",
+                        config.target_node,
+                        target_node_info.host,
+                        target_node_info.port,
+                    ))
+                })?;
 
         // -------------------------------------------------------------
         // B5 / V16 / F1: WAIT for the target to catch up before handing off.
