@@ -92,11 +92,17 @@ fn read_all(dir: &Path) -> BTreeSet<(Vec<u8>, Vec<u8>)> {
 /// HEADLINE: the full JE DbBackup workflow — pin, enumerate, copy, recover,
 /// release.
 ///
-/// JE parity: `FileProtectorTest.testBackup` — a `DbBackup` protects its file
-/// set from cleaner deletion while active, and `end_backup` releases the
-/// protection so the cleaner can reclaim them again. (The `testSyncupAndFeeder`
-/// / `testNetworkRestore` variants of `FileProtectorTest` are replication tests,
-/// out of scope for the cleaner package.)
+/// JE parity: `DbBackupTest.testBackupVsCleaning` (DbBackup.java) — the full
+/// backup workflow: `startBackup` pins the active file set, the cleaner cannot
+/// delete a pinned file while the backup is open, the enumerated set copies to
+/// a fresh dir and recovers to identical data, and `endBackup` releases the
+/// protection so the cleaner can reclaim.  Also aligns with
+/// `FileProtectorTest.testBackup` (the underlying `FileProtector` pin the
+/// backup relies on).  (JE `testBackupVsCleaning` additionally counts >5 files
+/// reclaimed after endBackup; the reclaim-after-release direction is exercised
+/// here by running the cleaner after `end_backup`.  The `testSyncupAndFeeder` /
+/// `testNetworkRestore` variants of `FileProtectorTest` are replication tests,
+/// out of scope for this package.)
 #[test]
 fn backup_pins_files_and_restore_recovers_same_data() {
     let src = tempfile::tempdir().unwrap();

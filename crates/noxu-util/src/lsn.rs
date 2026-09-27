@@ -84,6 +84,17 @@ impl Lsn {
     /// no log files have been cleaned (deleted).
     ///
     /// This is an approximation; the actual log may be slightly more or less.
+    ///
+    /// JE: `DbLsn.getNoCleaningDistance` (`DbLsn.java:167`).  JE additionally
+    /// exposes `getWithCleaningDistance` (`DbLsn.java:196`) and
+    /// `getTrueDistance` (`DbLsn.java:245`), which walk the `FileManager` to
+    /// measure real on-disk file sizes across cleaned (deleted) files.  Noxu
+    /// intentionally does not port those two: they are `FileManager`-coupled
+    /// accounting helpers used only by JE's cleaner cost model, and Noxu's
+    /// cleaner tracks utilization differently (see `noxu-cleaner`).  The
+    /// `DbLsnTest.testWithCleaningDistance` / `testTrueDistance` cases are
+    /// therefore N/A (see tp-je-util report), while
+    /// `testNoCleaningDistance` is ported below.
     pub fn no_cleaning_distance(self, other: Lsn, log_file_size: u64) -> u64 {
         if self.is_null() {
             return 0;
@@ -350,6 +361,9 @@ mod tests {
         assert_eq!(c.no_cleaning_distance(d, 10_000_000), 20_000_300);
     }
 
+    // JE: DbLsnTest.testNoCleaningDistance (DbLsn.getNoCleaningDistance,
+    // DbLsn.java:167). Same fixture values (files 1/3, offsets 10/40/50,
+    // logFileSize 100) and expected distances (230, 40) as the JE test.
     #[test]
     fn test_no_cleaning_distance_je_port() {
         let a = Lsn::new(1, 10);
@@ -402,6 +416,9 @@ mod tests {
     }
 
     // Verify file_number and file_offset roundtrip for large values including 0xFFFFFFFF.
+    // JE: DbLsnTest.testDbLsn (DbLsn.makeLsn / getFileNumber / getFileOffset,
+    // DbLsn.java:44/89/97). Same values[] {0xFF,0xFFFF,0xFFFFFF,0x7FFFFFFF};
+    // the JE 0xFFFFFFFF entry makes NULL_LSN and is covered separately.
     #[test]
     fn test_je_large_values() {
         let values: &[u32] = &[0xFF, 0xFFFF, 0xFFFFFF, 0x7FFFFFFF];
@@ -423,6 +440,8 @@ mod tests {
     }
 
     // Verify that higher file number produces a greater LSN.
+    // JE: DbLsnTest.testComparableInequalityFileNumber (DbLsn.compareTo,
+    // DbLsn.java:126): higher file number => greater LSN, same values[].
     #[test]
     fn test_comparable_inequality_file_number() {
         let values: &[u32] = &[0xFF, 0xFFFF, 0xFFFFFF, 0x7FFFFFFF];
@@ -435,6 +454,8 @@ mod tests {
     }
 
     // Verify that higher file offset produces a greater LSN within the same file.
+    // JE: DbLsnTest.testComparableInequalityFileOffset (DbLsn.compareTo,
+    // DbLsn.java:126): higher offset within a file => greater LSN.
     #[test]
     fn test_comparable_inequality_file_offset() {
         let values: &[u32] = &[0xFF, 0xFFFF, 0xFFFFFF, 0x7FFFFFFF];
@@ -471,6 +492,8 @@ mod tests {
     // produces NULL_LSN (u64::MAX) and is tested separately.
     // -----------------------------------------------------------------------
 
+    // JE: DbLsnTest.testDbLsn / NULL_LSN convention (DbLsn.NULL_LSN):
+    // the JE values[] 0xFFFFFFFF entry makes NULL_LSN (== u64::MAX).
     #[test]
     fn test_make_entry_null_lsn_sentinel() {
         // NULL_LSN must equal Lsn::new(u32::MAX, u32::MAX) == u64::MAX
@@ -508,6 +531,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // JE: DbLsnTest.testComparableException (DbLsn.compareTo, DbLsn.java:126):
+    // comparing against NULL_LSN throws EnvironmentFailureException in JE;
+    // Noxu panics instead (documented deviation: a NULL_LSN comparison is an
+    // invariant violation, not a recoverable Result error).
     // compare(NULL, NULL), compare(LSN, NULL), compare(NULL, LSN) all panic.
     // compare(smaller, larger) and same-file different-offset comparisons.
     // -----------------------------------------------------------------------
@@ -623,6 +650,8 @@ mod tests {
     // Two LSNs constructed with the same file/offset must compare equal.
     // -----------------------------------------------------------------------
 
+    // JE: DbLsnTest.testComparableEquality (DbLsn.compareTo == 0,
+    // DbLsn.java:126): equal file/offset compare equal, same values[].
     #[test]
     fn test_comparable_equality() {
         let values: &[u32] = &[0xFF, 0xFFFF, 0xFFFFFF, 0x7FFF_FFFF];
