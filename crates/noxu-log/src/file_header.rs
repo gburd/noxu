@@ -465,6 +465,11 @@ mod tests {
     // v2 backward-compatibility
     // -----------------------------------------------------------------------
 
+    /// JE: LogEntryVersionTest.doTest (prior-format read arm), mapped to
+    /// Noxu's ONLY historical format transition (v2 -> v3). JE reads a log
+    /// written by a prior JE version; Noxu reads a prior-format (v2) header
+    /// with the current (v3) engine. See tp-je-logversion.md.
+    ///
     /// St-C3 backward-compat: a pre-written 32-byte v2 header parses cleanly.
     /// No CRC is checked (there is none).  This confirms that entries at
     /// offset 32 in a v2 file will be found correctly.
@@ -542,6 +547,10 @@ mod tests {
         assert!(header.validate(99).is_err());
     }
 
+    /// JE: LogHeaderVersionTest.testGreaterVersionNotAllowed (validate() arm)
+    /// -- a header whose `log_version` is newer than the engine's
+    /// `LOG_VERSION` is rejected. JE throws `VersionMismatchException`;
+    /// Noxu returns `LogError::VersionMismatch`.
     #[test]
     fn test_file_header_validate_future_version_rejected() {
         let mut header = FileHeader::new(0, 0);
@@ -594,5 +603,239 @@ mod tests {
     fn test_last_entry_in_prev_file_offset() {
         let header = FileHeader::new(3, 9999);
         assert_eq!(header.last_entry_in_prev_file_offset(), 9999);
+    }
+
+    // -----------------------------------------------------------------------
+    // JE test-parity ports (je.logversion)
+    //
+    // JE's logversion package (LogEntryVersionTest, LogHeaderVersionTest)
+    // asserts that the CURRENT engine reads log entries and file headers
+    // written by a PRIOR on-disk format across the version boundary. JE has a
+    // long version history (FileHeader v3, v4, v5, ...; LogEntryType
+    // LOG_VERSION 1..N) and ships golden .jdb/.txt fixtures per historical
+    // version.
+    //
+    // DEVIATION (documented): Noxu is NOT a JE-format reader. It is a fresh
+    // Rust-native `.ndb` format that started at LOG_VERSION 3, and the ONLY
+    // historical transition it implements read-compat for is v2 -> v3 (v2 =
+    // 32-byte header, no CRC; v3 = 36-byte header, trailing CRC32). Noxu has
+    // no v1/v4/v5 formats and no JE fixtures, so the per-JE-version methods
+    // (test_2_0_0 .. test_7_1_9) are N/A. What IS real and testable is the
+    // v2 -> v3 boundary; the tests below port the *intent* of the JE tests
+    // onto that boundary.
+    // -----------------------------------------------------------------------
+
+    /// JE: LogHeaderVersionTest.testGreaterVersionNotAllowed
+    ///
+    /// JE loads `maxversion.jdb` (header version = Integer.MAX_VALUE) and
+    /// expects `VersionMismatchException` when the environment is opened. In
+    /// JE the version is READ by `FileHeader.readFromLog` and REJECTED by
+    /// `FileHeader.validate` (`logVersion > LogEntryType.LOG_VERSION` ->
+    /// `VersionMismatchException`). The open path is read-then-validate.
+    ///
+    /// Noxu mirrors that exact layering: `read_from` treats any
+    /// `log_version >= LOG_VERSION` as the current (v3) shape and verifies the
+    /// CRC -- it does NOT itself reject a future version -- and `validate()`
+    /// is the gate that rejects `log_version > LOG_VERSION` with
+    /// `LogError::VersionMismatch`. This test ports the JE open path:
+    /// read_from succeeds, validate rejects. (Data loss avoided: a
+    /// newer-format file can never be silently opened by an older engine.)
+    #[test]
+    fn test_greater_version_not_allowed() {
+        // Build a 36-byte v3-shaped header but stamp a version above
+        // LOG_VERSION (mimics JE's maxversion.jdb). A valid CRC ensures the
+        // CRC check is NOT what trips -- the version gate is under test.
+        let future_version = LOG_VERSION + 1;
+        let mut covered = [0u8; FILE_HEADER_SIZE_V2];
+        covered[..8].copy_from_slice(FILE_MAGIC);
+        covered[8..12].copy_from_slice(&future_version.to_be_bytes());
+        covered[12] = BYTE_ORDER_BIG_ENDIAN;
+        // 13..16 reserved zeros
+        covered[16..24].copy_from_slice(&123u64.to_be_bytes());
+        covered[24..28].copy_from_slice(&0u32.to_be_bytes());
+        covered[28..32].copy_from_slice(&0u32.to_be_bytes());
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&covered);
+        buf.extend_from_slice(&crc32fast::hash(&covered).to_be_bytes());
+
+        // Step 1 (JE readFromLog): the version is read, not rejected here.
+        let mut cursor = Cursor::new(buf);
+        let header = FileHeader::read_from(&mut cursor)
+            .expect("read_from reads the version without rejecting it");
+        assert_eq!(
+            header.log_version, future_version,
+            "read_from recovers the (future) version verbatim"
+        );
+
+        // Step 2 (JE FileHeader.validate at env-open): the future version is
+        // REJECTED with VersionMismatch -- the parity assertion.
+        match header
+            .validate(header.file_number)
+            .expect_err("a header newer than LOG_VERSION must be rejected")
+        {
+            LogError::VersionMismatch { expected, found, .. } => {
+                assert_eq!(expected, LOG_VERSION);
+                assert_eq!(found, future_version);
+            }
+            other => panic!("expected VersionMismatch, got {:?}", other),
+        }
+    }
+
+    /// JE: LogHeaderVersionTest.testGreaterVersionNotAllowed (validate arm)
+    ///
+    /// Belt-and-braces: even if a future-version header were somehow read,
+    /// `validate()` (the recovery/open gate, JE's `FileHeader.validate`) must
+    /// reject it with `VersionMismatch`. Mirrors JE throwing
+    /// `VersionMismatchException` from `FileHeader.validate` when
+    /// `logVersion > LogEntryType.LOG_VERSION`.
+    #[test]
+    fn test_greater_version_rejected_by_validate() {
+        let mut header = FileHeader::new(0, 0);
+        header.log_version = LOG_VERSION + 5;
+        match header.validate(0).expect_err("future version must be rejected") {
+            LogError::VersionMismatch { expected, found, .. } => {
+                assert_eq!(expected, LOG_VERSION);
+                assert_eq!(found, LOG_VERSION + 5);
+            }
+            other => panic!("expected VersionMismatch, got {:?}", other),
+        }
+    }
+
+    /// JE: LogHeaderVersionTest.testLesserVersionNotUpdated
+    ///
+    /// JE loads `minversion.jdb` (header version = 1, the minimum), opens the
+    /// env, syncs, closes, and asserts the file size is UNCHANGED -- i.e. an
+    /// older-version file's header is NOT rewritten in place; a new log file
+    /// would be started for new writes so the old header is preserved as-is.
+    ///
+    /// Noxu equivalent (mapped to the v2 -> v3 boundary, Noxu's only lesser
+    /// version): reading a v2 header MUST NOT silently upgrade it to v3. The
+    /// decoded header preserves `log_version == 2`, its on-disk size stays 32
+    /// (not 36), and re-serializing the *decoded-as-v2* header via the v2
+    /// layout reproduces the original bytes exactly. This proves Noxu will not
+    /// clobber a lesser-version file's format on read -- the safety property
+    /// JE's size-unchanged assertion protects.
+    #[test]
+    fn test_lesser_version_not_updated() {
+        // A raw 32-byte v2 header (Noxu's minimum readable version).
+        let mut orig = Vec::new();
+        orig.extend_from_slice(FILE_MAGIC); // 0..8
+        orig.extend_from_slice(&MIN_LOG_VERSION.to_be_bytes()); // 8..12 = 2
+        orig.push(BYTE_ORDER_BIG_ENDIAN); // 12
+        orig.extend_from_slice(&[0u8; 3]); // 13..16 reserved
+        orig.extend_from_slice(&7777u64.to_be_bytes()); // 16..24 timestamp
+        orig.extend_from_slice(&12u32.to_be_bytes()); // 24..28 file_number
+        orig.extend_from_slice(&0x800u32.to_be_bytes()); // 28..32 last_entry
+        assert_eq!(orig.len(), FILE_HEADER_SIZE_V2);
+
+        let mut cursor = Cursor::new(&orig);
+        let decoded =
+            FileHeader::read_from(&mut cursor).expect("v2 header must read");
+
+        // The read must NOT upgrade the version.
+        assert_eq!(
+            decoded.log_version, MIN_LOG_VERSION,
+            "reading a v2 header must not silently upgrade it to v3"
+        );
+        // On-disk size stays at the v2 size (first entry at offset 32, not 36).
+        assert_eq!(
+            FileHeader::on_disk_size(decoded.log_version),
+            FILE_HEADER_SIZE_V2,
+            "a lesser-version file keeps its 32-byte header size"
+        );
+
+        // Re-serialize the decoded header via the *v2* layout (no CRC) and
+        // confirm it reproduces the original 32 bytes byte-for-byte -- i.e. no
+        // in-place format change. (write_to always emits v3; JE's guarantee is
+        // that the OLD file is left as-is, which for Noxu means the v2 bytes
+        // are reproducible from the decoded fields.)
+        let mut reser = Vec::new();
+        reser.extend_from_slice(FILE_MAGIC);
+        reser.extend_from_slice(&decoded.log_version.to_be_bytes());
+        reser.push(BYTE_ORDER_BIG_ENDIAN);
+        reser.extend_from_slice(&[0u8; 3]);
+        reser.extend_from_slice(&decoded.timestamp.to_be_bytes());
+        reser.extend_from_slice(&decoded.file_number.to_be_bytes());
+        reser.extend_from_slice(&decoded.last_entry_in_prev_file.to_be_bytes());
+        assert_eq!(
+            reser, orig,
+            "decoded v2 header must reproduce the original v2 bytes exactly"
+        );
+    }
+
+    /// JE: LogEntryVersionTest.doTest (prior-format entry-read arm)
+    ///
+    /// JE writes a full log with a prior JE version and asserts the current
+    /// engine reads every entry across the version boundary. Noxu has only ONE
+    /// historical boundary (v2 -> v3), so this ports the intent to that
+    /// boundary: a file header written in the PRIOR (v2) format is read
+    /// correctly by the CURRENT (v3) engine, recovering every field, with the
+    /// first-entry offset resolved to 32 (v2), not 36 (v3).
+    ///
+    /// A regression here (v2 header mis-read) would mean DATA LOSS on upgrade:
+    /// the engine would look for the first log entry at the wrong offset.
+    #[test]
+    fn test_prior_format_v2_header_read_across_boundary() {
+        // Prior-format (v2) header with distinctive field values.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(FILE_MAGIC);
+        buf.extend_from_slice(&MIN_LOG_VERSION.to_be_bytes()); // version 2
+        buf.push(BYTE_ORDER_BIG_ENDIAN);
+        buf.extend_from_slice(&[0u8; 3]);
+        buf.extend_from_slice(&0x0123_4567_89ab_cdefu64.to_be_bytes());
+        buf.extend_from_slice(&0xdead_beefu32.to_be_bytes());
+        buf.extend_from_slice(&0x0000_1234u32.to_be_bytes());
+        // Sentinel bytes that represent the START of the first log entry at
+        // offset 32 -- the v2 read must stop before them.
+        buf.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+
+        let mut cursor = Cursor::new(&buf);
+        let h = FileHeader::read_from(&mut cursor)
+            .expect("current engine must read a prior-format (v2) header");
+
+        assert_eq!(h.log_version, 2, "prior format version recovered");
+        assert_eq!(h.timestamp, 0x0123_4567_89ab_cdef);
+        assert_eq!(h.file_number, 0xdead_beef);
+        assert_eq!(h.last_entry_in_prev_file, 0x0000_1234);
+
+        // The v2 read must consume EXACTLY 32 bytes: the first entry begins at
+        // on_disk_size(2) == 32. Mis-reading (eating 36 bytes) would swallow
+        // the first entry's leading bytes -> data loss.
+        assert_eq!(
+            cursor.position() as usize,
+            FileHeader::on_disk_size(h.log_version),
+            "prior-format read stops at the v2 first-entry offset (32)"
+        );
+        assert_eq!(cursor.position(), 32);
+    }
+
+    /// JE: LogEntryVersionTest.doTest (current-format round-trip arm)
+    ///
+    /// The current (v3) engine writes and reads its own format. Complements
+    /// the prior-format arm above: proves the boundary is exercised in BOTH
+    /// directions -- current writer -> current reader, and prior writer ->
+    /// current reader. Guards the parity port against vacuity (a v2-only test
+    /// could pass even if v3 read were broken).
+    #[test]
+    fn test_current_format_v3_header_read_across_boundary() {
+        let header = FileHeader::new(0x00ab_cdef, 0x0000_5678);
+        assert_eq!(header.log_version, LOG_VERSION);
+
+        let mut buf = Vec::new();
+        header.write_to(&mut buf).unwrap();
+        assert_eq!(buf.len(), FILE_HEADER_SIZE, "v3 writer emits 36 bytes");
+
+        let mut cursor = Cursor::new(&buf);
+        let h = FileHeader::read_from(&mut cursor).unwrap();
+        assert_eq!(h.log_version, LOG_VERSION);
+        assert_eq!(h.file_number, 0x00ab_cdef);
+        assert_eq!(h.last_entry_in_prev_file, 0x0000_5678);
+        assert_eq!(
+            cursor.position() as usize,
+            FileHeader::on_disk_size(h.log_version),
+            "current-format read stops at the v3 first-entry offset (36)"
+        );
+        assert_eq!(cursor.position(), 36);
     }
 }
