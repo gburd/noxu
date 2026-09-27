@@ -102,6 +102,11 @@ const RECV_TIMEOUT: Duration = Duration::from_secs(5);
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
+// JE: CheckAccessTest.testSSLOnlyConfig — with SSL/mTLS configured, a group
+// forms and members connect and exchange data over the secured channel. Noxu
+// analogue: an allowlisted mTLS peer connects and exchanges data (the JE
+// keystore/string-property config path is N/A — Noxu uses a structured
+// rustls TlsConfig; see the ReplicationNetworkConfigTest N/A note).
 /// A peer whose cert CN/SAN is in the allowlist connects and exchanges data.
 #[test]
 fn admitted_peer_connects_and_exchanges_data() {

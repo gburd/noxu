@@ -109,6 +109,17 @@ fn replica_setup() -> Setup {
 
 // ── HEADLINE 1: commit-point read blocks until applied, then sees data ──────
 
+// JE: CommitPointConsistencyPolicyTest.testCommitPointConsistencyOnOpen /
+// testVLSNConsistencyJoinGroup (block-then-see subset), and
+// JoinGroupTest.testVLSNConsistencyJoinGroup. A read on a replica with a
+// CommitPointConsistencyPolicy built from the master's commit token BLOCKS
+// until the replica has replayed up to that VLSN, then the data is visible.
+//
+// JE: DatabaseOperationTest.testMasterUpdateWhileReplicaReading — a replica
+// read that overlaps a master update is gated by the consistency policy: it
+// blocks until the replica has applied the concurrent update, then observes
+// the up-to-date data. Same read-consistency-under-concurrent-apply gate as
+// this test (block until applied → then see the data).
 #[test]
 fn test_commit_point_blocks_then_sees_data() {
     let Setup { rep_env, mut replay, handle, db_id, tree, .. } =
@@ -168,6 +179,18 @@ fn test_commit_point_blocks_then_sees_data() {
 
 // ── HEADLINE 2: time-consistency blocks a lagging replica ───────────────────
 
+// JE: TimeConsistencyPolicy via Replica.ConsistencyTracker.lagAwait
+// (CommitPointConsistencyPolicyTest exercises the sibling policy through
+// the same tracker). A lagging replica blocks a time-consistency read until
+// it catches up within the permissible lag.
+//
+// JE: SecondaryNodeTest.testSecondaryLag (lag-detection subset) — a delayed
+// secondary lags the master; the effect a reader observes (a lagging replica
+// gates a consistency read until it catches up) is exactly this test. The JE
+// headline assertion getNMaxReplicaLagName() (identify the slowest replica by
+// NAME in RepStats) is N/A: Noxu's RepStats exposes max_replica_lag_ms but no
+// per-replica lag-name map (see the ReplicationRateStatsTest N/A note); lag
+// *detection* itself is also covered by phi_detector_test.
 #[test]
 fn test_time_consistency_blocks_lagging_replica() {
     let Setup { rep_env, mut replay, handle, db_id, .. } = replica_setup();
@@ -226,6 +249,18 @@ fn test_no_consistency_never_blocks() {
 
 // ── HEADLINE 4: timeout is a clean error, not a hang ────────────────────────
 
+// JE: CommitPointConsistencyPolicyTest.testVLSNConsistencyJoinGroup
+// (timeout subset) — a commit token the replica never reaches yields a
+// clean ReplicaConsistencyException (Noxu: RepError::ConsistencyTimeout),
+// asserted by JE via policyTimeout <= elapsed. NEVER a hang.
+//
+// JE: ReplicatedEnvironmentTest.testRepEnvTimeout — a replica whose syncup /
+// consistency wait exceeds the configured timeout fails with a clean
+// ReplicaConsistencyException rather than hanging. That is exactly this
+// clean-consistency-timeout invariant (Noxu RepError::ConsistencyTimeout).
+// (JE drives it through ENV_SETUP_TIMEOUT / ENV_CONSISTENCY_TIMEOUT env-open
+// knobs; the knobs themselves are N/A, but the clean-timeout outcome is
+// pinned here.)
 #[test]
 fn test_commit_point_timeout_is_clean_error() {
     let Setup { rep_env, .. } = replica_setup();

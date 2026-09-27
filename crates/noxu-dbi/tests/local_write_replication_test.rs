@@ -28,6 +28,15 @@ fn tmp_env() -> (TempDir, EnvironmentImpl) {
     (dir, env)
 }
 
+// JE: PerDbReplicationTest.testStandalone — "A database in a standalone
+// (non-replicated) environment should not be replicated." Noxu asserts the
+// same: a DB opened in a non-replicated EnvironmentImpl is never marked
+// replicated regardless of DatabaseConfig::replicated's default, and a
+// default (local-write) locker may write it. (The JE close/reopen
+// round-trip of the replicated bit and the replicated-env config-mismatch
+// rejection are N/A here: Noxu's is_replicated is a runtime env flag, not a
+// persisted per-DB attribute re-validated at open — see tp-je-rep.md
+// ConversionTest / PerDbReplicationTest notes.)
 #[test]
 fn non_replicated_environment_default_locker_can_always_write() {
     let (_dir, env) = tmp_env();
@@ -52,6 +61,15 @@ fn non_replicated_environment_default_locker_can_always_write() {
     assert!(res.is_ok(), "default locker must not be blocked; got {res:?}");
 }
 
+// JE: LocalWriteTxnTest.testReadAndWrite (write-enforcement subset) +
+// PerDbReplicationTest.testNotReplicated. Mirrors JE's checkWriteAllowed
+// matrix: an ordinary (replicating) locker may write a replicated DB but a
+// local-write locker may not; a local-write locker may write a
+// non-replicated DB but an ordinary replicating locker may not. Also covers
+// testNotReplicated's core: a DB opened with set_replicated(false) in a
+// replicated env stays non-replicated. Consistency-enforcement and
+// non-txnal-read halves of testReadAndWrite are covered by
+// noxu-rep::rep10_consistency_policy_test (the replica read gate).
 #[test]
 fn replicated_environment_enforces_local_write_agreement() {
     let (_dir, env) = tmp_env();

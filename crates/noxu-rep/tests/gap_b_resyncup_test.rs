@@ -210,6 +210,12 @@ fn wait_until(mut f: impl FnMut() -> bool, timeout: Duration) -> bool {
 // HEADLINE 1: mid-stream master change -> re-syncup -> converge on new master
 // ---------------------------------------------------------------------------
 
+// JE: HardRecoveryTest.testMultipleLogFilesHardRecovery — a replica hard-
+// recovers (re-syncups to a matchpoint) after a master change even when the
+// stream spans multiple log files. The multi-file span is a fixture detail;
+// the core invariant (find the matchpoint, re-syncup to the new master, and
+// converge) is exactly what this mid-stream re-syncup test asserts. The JE
+// TXN_ROLLBACK_LIMIT / dead-handle knob variants are N/A (not modeled).
 #[test]
 fn test_replica_resyncs_to_new_master_mid_stream() {
     // ── master1 ──────────────────────────────────────────────────────────
