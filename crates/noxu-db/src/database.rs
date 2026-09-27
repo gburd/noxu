@@ -1098,6 +1098,27 @@ impl Database {
             // DB-TRIG: a successful no-overwrite put is always an insert, so
             // oldData is None.  JE `TriggerManager.runPutTriggers`.
             self.fire_put_triggers(txn, key_bytes, None, data_bytes);
+
+            // NEW-PNO-SEC-1 (secondary data-integrity): a successful
+            // no-overwrite insert must maintain every registered secondary
+            // index, exactly like `put_bytes` does.  JE `Database.putNoOverwrite`
+            // drives the same trigger/secondary path as `put`; omitting this
+            // left secondary queries silently missing records inserted via
+            // `put_no_overwrite`.  A no-overwrite insert always writes a
+            // brand-new key (a KeyExist failure takes the `else` branch and does
+            // NOT maintain), so `old` is always None.  We fan out under the
+            // caller's txn so the primary record and its secondary entries
+            // commit / abort together, mirroring `put_bytes` (sibling of
+            // NEW-SEC-CLOSE-1).
+            let secondaries = self.live_secondaries();
+            if !secondaries.is_empty() {
+                let key_entry = DatabaseEntry::from_bytes(key_bytes);
+                let new_entry = DatabaseEntry::from_bytes(data_bytes);
+                for hook in secondaries {
+                    hook.maintain(txn, &key_entry, None, Some(&new_entry))?;
+                }
+            }
+
             self.throughput.n_pri_inserts.fetch_add(1, Ordering::Relaxed);
         } else {
             self.throughput.n_pri_insert_fails.fetch_add(1, Ordering::Relaxed);
