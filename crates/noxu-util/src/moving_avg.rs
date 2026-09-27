@@ -338,6 +338,12 @@ fn round_half_up(x: f64) -> i64 {
     (x + 0.5).floor() as i64
 }
 
+/// Crate-internal accessor for the grouped-integer formatter, reused by
+/// [`crate::long_diff::LongDiffStat`].
+pub(crate) fn format_grouped_i64_pub(v: i64) -> String {
+    format_grouped_i64(v)
+}
+
 /// Formats an integer with thousands separators (matching Java's grouping
 /// `DecimalFormat`, e.g. `123456789 -> "123,456,789"`).
 fn format_grouped_i64(v: i64) -> String {
