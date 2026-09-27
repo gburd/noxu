@@ -256,6 +256,12 @@ listed in [References](#references).
   `KeyEmpty` if a concurrent transaction already removed it (matching JE
   `CursorImpl.deleteCurrentRecord`). Exactly one concurrent deleter now succeeds.
   Found by a faithful port of JE's `SecondaryMultiTest.testMultiDeleteUnordered`.
+- **`put_no_overwrite` now maintains secondary indexes (NEW-PNO-SEC-1).** A
+  successful no-overwrite insert fired put triggers but skipped the secondary-index
+  maintenance that a normal `put` performs, so secondary-index queries silently
+  missed records inserted via `put_no_overwrite`. It now maintains registered
+  secondaries identically to `put` (matching JE, where all put modes funnel through
+  one path). Found by a faithful port of JE's `JoinTest`.
 
 - **WAL now fail-stops the environment on a critical log-write failure (JE
   `LogManager.serialLog` parity).** A failed or partial WAL write previously left
