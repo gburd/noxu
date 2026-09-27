@@ -580,6 +580,9 @@ mod tests {
     }
 
     // JE: LongAvgRateTest.testCopyLatest
+    // Also covers LongAvgRateStatTest.testComputeInterval: JE
+    // LongAvgRateStat.computeInterval(base) == avg.copyLatest(baseAvg)
+    // (LongAvgRateStat.java:108-112), identical vectors (3, 20, 13).
     #[test]
     fn long_rate_copy_latest() {
         let mut avg = LongAvgRate::new("stat", 3000, Milliseconds);
@@ -628,6 +631,8 @@ mod tests {
     }
 
     // JE: LongAvgRateTest.testCopy
+    // Also covers LongAvgRateStatTest.testCopy: JE LongAvgRateStat.copy()
+    // == avg.copy() (LongAvgRateStat.java:75-77), same underlying arithmetic.
     #[test]
     fn long_rate_copy() {
         let mut avg = LongAvgRate::new("stat", 3000, Milliseconds);
