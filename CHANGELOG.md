@@ -16,6 +16,12 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+### Added
+- `noxu-util` gains faithful reference ports of JE's stat primitives
+  (`DoubleExpMovingAvg`, `LongAvgRate`, `AtomicLongComponent`, `BitMap`,
+  `LongDiffStat`) with JE's exact test vectors. These are reference ports for
+  test parity and are not yet wired into a Noxu subsystem.
+
 ### Fixed
 
 - **Four independent data-loss defects on the storage path, each reproduced on a
