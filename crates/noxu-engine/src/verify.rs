@@ -931,6 +931,16 @@ mod tests {
     /// former standalone `verify_environment` / `verify_database` stubs would
     /// have returned `passed = true` for the same corruption (the bug this
     /// removal fixes).
+    ///
+    /// JE: this is the structural-corruption-detection half of
+    /// `BtreeCorruptionTest` (`BtreeVerifier` flagging a corrupt BIN slot).
+    /// Noxu's structural verifier detects the NULL-LSN / null-child /
+    /// first-key-order faults; it does NOT dereference slot LSNs (so JE's
+    /// `testLSNDangling*`, which injects an LSN into a nonexistent file, is
+    /// N/A — see tp-je-util report), nor check intra-BIN key order / the BIN
+    /// identifier key (JE `testKeyOrder*` / `testIndentifyKey*`, N/A: no
+    /// injection API + not checked), and it is advisory-logging rather than
+    /// fail-stop (it does not invalidate the env / flip `isCorrupted()`).
     #[test]
     fn test_verify_tree_detects_null_lsn() {
         use noxu_dbi::{

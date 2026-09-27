@@ -125,6 +125,16 @@ fn read_all(
 
 /// HEADLINE: dump | load round-trip must reproduce the database exactly,
 /// for both printable and hex formats, including binary and duplicate keys.
+///
+/// JE: `DbDumpTest.doDumpLoadTest(printable, nDumps=1)` — the shared body of
+/// `testDumpLoadPrintable` (printable=true) and `testDumpLoadBinary`
+/// (printable=false).  JE dumps a db, loads it into a fresh db, verifies the
+/// loaded data matches, then re-dumps and asserts the two dumps are byte-equal
+/// (`Key.compareKeys(baosba, baos2) == 0`).  This port asserts the stronger
+/// data-equality invariant directly (`original == loaded`) and additionally
+/// proves binary safety via the all-bytes record.  The re-dump-equals-dump
+/// invariant is ported separately in `dump_matches_core_fixed_format`
+/// (JE `testMatchCore`).
 fn round_trip(printable: bool, dup_sort: bool) {
     let src = tempfile::tempdir().unwrap();
     let dst = tempfile::tempdir().unwrap();
@@ -196,21 +206,27 @@ fn round_trip(printable: bool, dup_sort: bool) {
     assert!(loaded.contains(&(b"allbytes".to_vec(), (0u8..=255).collect())));
 }
 
+/// JE: `DbDumpTest.testDumpLoadPrintable` (printable format, one db).
 #[test]
 fn dump_load_round_trip_printable_no_dups() {
     round_trip(true, false);
 }
 
+/// JE: `DbDumpTest.testDumpLoadBinary` (byte/hex format, one db).
 #[test]
 fn dump_load_round_trip_hex_no_dups() {
     round_trip(false, false);
 }
 
+/// JE: `DbDumpTest.testDumpLoadPrintable` with sorted duplicates
+/// (`initDbs` sets `setSortedDuplicates(true)`; printable format).
 #[test]
 fn dump_load_round_trip_printable_with_dups() {
     round_trip(true, true);
 }
 
+/// JE: `DbDumpTest.testDumpLoadBinary` with sorted duplicates
+/// (`initDbs` sets `setSortedDuplicates(true)`; byte/hex format).
 #[test]
 fn dump_load_round_trip_hex_with_dups() {
     round_trip(false, true);
