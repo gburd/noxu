@@ -55,6 +55,11 @@ tempfile = "3"
 # `#![cfg(noxu_shuttle)]`, so these dev-deps only matter under that cfg.
 [target.'cfg(noxu_shuttle)'.dev-dependencies]
 shuttle = { workspace = true }
+# NEW-DEL-RACE-1 shuttle model (tests/shuttle_delete_race.rs) drives the real
+# Txn / LockManager write-lock path and seeds a real slot LSN, so it needs the
+# txn + util crates directly.  Only in the graph under `--cfg noxu_shuttle`.
+noxu-txn = { workspace = true }
+noxu-util = { workspace = true }
 
 [lints]
 workspace = true

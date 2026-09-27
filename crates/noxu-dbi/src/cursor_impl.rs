@@ -4157,6 +4157,51 @@ impl CursorImpl {
         if let Some(tree_key) = self.current_key.clone() {
             let (old_data, old_lsn) = self.get_slot_before_image(&tree_key);
             self.lock_write_before_log(old_lsn, &tree_key)?;
+            // NEW-DEL-RACE-1: revalidate-after-lock (JE
+            // `CursorImpl.deleteCurrentRecord`'s post-`lockLN`
+            // `if (!lockStanding.recordExists()) { revertLock(...); return
+            // null; }`).  `lock_write_before_log` above BLOCKS until any
+            // concurrent writer holding the WRITE lock on `old_lsn` commits
+            // or aborts.  A concurrent deleter that COMMITTED before us
+            // physically removed the slot (`apply_tree_delete` ->
+            // `tree.delete`) and moved its write lock off `old_lsn`.  The
+            // pre-lock `is_current_slot_deleted` D3 check ran BEFORE we
+            // waited, so without this re-read every waiter would proceed to
+            // log a second DeleteLN + re-apply the tree delete and wrongly
+            // report success — the exact anomaly this fixes.  Re-read the
+            // CURRENT committed slot now that the lock is held (which
+            // guarantees no other writer is mid-flight) and check whether the
+            // record we set out to delete still exists.  If it does not, a
+            // concurrent commit removed it (we are the loser of the race) —
+            // return KEYEMPTY without a second log/apply.  Only the FIRST
+            // deleter (locked while live, still live after locking) proceeds.
+            // The stale WRITE lock on the now-defunct `old_lsn` is harmless
+            // (no live slot references it) and is released at commit/abort
+            // with the txn's other locks.
+            //
+            // The existence test is keyed on `old_lsn`:
+            //   * WAL-backed slot (`old_lsn != NULL_LSN`, the common
+            //     transactional case): the record carried a real slot LSN
+            //     pre-lock.  If the current slot LSN differs (gone -> NULL, or
+            //     deleted-then-reinserted -> a new LSN) the version we locked
+            //     is gone.  This is the exact `lockStanding.lsn != currLsn`
+            //     check.
+            //   * Unlogged slot (`old_lsn == NULL_LSN`: deferred-write DB, or a
+            //     database with no log manager): the slot has no meaningful
+            //     LSN to compare, so fall back to a pure tree-existence probe —
+            //     `key_exists_in_view` is false only if the record was removed.
+            //     (A NULL slot LSN is legitimate for an unlogged live record,
+            //     so an LSN==NULL test here would wrongly reject every such
+            //     delete — see `test_delete_removes_from_tree`.)
+            let record_gone = if old_lsn != noxu_util::NULL_LSN.as_u64() {
+                let (_, current_lsn) = self.get_slot_before_image(&tree_key);
+                current_lsn != old_lsn
+            } else {
+                !self.key_exists_in_view(&tree_key)
+            };
+            if record_gone {
+                return Ok(OperationStatus::KeyEmpty);
+            }
             // Wave 5: also hold a synthetic-key write lock for the
             // duration of the txn so concurrent readers that probe the
             // BIN post-physical-removal can detect contention via
