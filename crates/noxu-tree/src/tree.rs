@@ -8655,6 +8655,45 @@ impl Tree {
         self.get_adjacent_bin(&root, current_key, false)
     }
 
+    /// Return the entries + pinned `Arc` of the first (leftmost) NON-EMPTY BIN
+    /// in the whole tree, skipping any run of physically-empty leftmost BINs,
+    /// re-faulting evicted children on the way down.  `None` iff every BIN is
+    /// physically empty (tree logically empty).
+    ///
+    /// NEW-REC-2: `first_bin_arc` returns the leftmost BIN *even when it is
+    /// physically empty* (every slot removed by a committed delete, not yet
+    /// pruned by the compressor).  A `Get::First`+delete loop over a
+    /// duplicate chain that spans several BINs empties the leftmost BIN and
+    /// must then re-descend to the leftmost LIVE record.  The prior cursor
+    /// path anchored on a synthetic empty key and delegated to
+    /// `retrieve_next`, but the empty-key routing through `bin_arc_for_key`
+    /// lands on the WRONG BIN under a sorted-dup comparator (it floors to the
+    /// tail BIN, not the leftmost live one), so the scan drained the tail dups
+    /// and orphaned the middle ones (6/12).  This wrapper reuses the SAME
+    /// `descend_to_edge_bin` empty-skipping edge walk that `get_next_bin`
+    /// (NEW-3 cross-BIN traversal) uses, so `Get::First` positions on the true
+    /// leftmost live record without any synthetic-key routing.
+    ///
+    /// JE `Tree.getFirstNode` composed with `getNextBinInternal`'s empty-leaf
+    /// skipping (the `Cursor.getFirst` -> `getNext` fall-through).
+    pub fn first_nonempty_bin_pinned(
+        &self,
+    ) -> Option<(Vec<(BinEntry, Lsn, Vec<u8>)>, Arc<RwLock<TreeNode>>)> {
+        let root = self.get_root()?;
+        self.descend_to_edge_bin(&root, true)
+    }
+
+    /// Return the entries + pinned `Arc` of the last (rightmost) NON-EMPTY BIN
+    /// in the whole tree, skipping any run of physically-empty rightmost BINs.
+    /// The backward counterpart of [`Self::first_nonempty_bin_pinned`] for
+    /// `Get::Last`+delete loops over spanning dup chains (NEW-REC-2, symmetric).
+    pub fn last_nonempty_bin_pinned(
+        &self,
+    ) -> Option<(Vec<(BinEntry, Lsn, Vec<u8>)>, Arc<RwLock<TreeNode>>)> {
+        let root = self.get_root()?;
+        self.descend_to_edge_bin(&root, false)
+    }
+
     /// Core implementation shared by `get_next_bin` and `get_prev_bin`.
     ///
     /// Builds the path from `root` down to the BIN for `current_key`
