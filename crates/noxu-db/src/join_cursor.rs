@@ -205,23 +205,25 @@ impl<'a> JoinCursor<'a> {
         }
 
         loop {
-            // --- Refill candidates from cursor[0]'s next duplicate ---
-            if self.candidates.is_empty() {
-                match self.cursors[0].get_next_dup()? {
-                    OperationStatus::Success => {
-                        if let Some(pk) =
-                            self.cursors[0].get_current_primary_key_only()?
-                        {
-                            self.candidates.push_back(pk);
-                        }
-                    }
-                    _ => {
-                        self.exhausted = true;
-                        return Ok(None);
-                    }
-                }
-            }
-
+            // NEW-JOIN-1 (fix): the full candidate set for cursor[0]'s
+            // secondary key was already drained into `self.candidates` by
+            // `new()`, which loops `get_next_dup()` until NotFound.  Do NOT
+            // refill from `cursors[0].get_next_dup()` here.
+            //
+            // JE `JoinCursor.retrieveNext` (JoinCursor.java) walks cursor[0]
+            // LAZILY with `GetMode.NEXT_DUP` bound to the captured
+            // `firstSecKey` anchor, which never crosses into the next
+            // secondary key.  Noxu instead drains eagerly in `new()`, so the
+            // candidate set is complete and authoritative.  The old refill
+            // re-walked cursor[0] with `get_next_dup()`, but Noxu's
+            // `get_next_dup` steps `Get::Next` FIRST and only then detects the
+            // secondary-key boundary — so after the eager drain it leaves the
+            // inner cursor parked on the FIRST record of the *next* secondary
+            // key, and the refill collected primary keys belonging to a
+            // foreign secondary-key value.  That corrupted the intersection on
+            // the default sort-by-count path (extra rows whenever an overrun
+            // candidate passed every probe).  When the pre-collected deque
+            // empties, the join is exhausted.
             let candidate = match self.candidates.pop_front() {
                 Some(c) => c,
                 None => {

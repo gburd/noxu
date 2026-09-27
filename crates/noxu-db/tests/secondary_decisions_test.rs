@@ -790,6 +790,10 @@ fn d2c_foreign_key_nullify_runtime_unsupported() {
 /// FK Abort happy path: deleting a foreign primary record that is
 /// still referenced by a child secondary entry returns
 /// `ForeignConstraintViolation`; the foreign record is NOT deleted.
+///
+/// JE: `ForeignKeyTest.testAbort` (`doTest(ForeignKeyDeleteAction.ABORT)`):
+/// deleting a referenced foreign key raises `DeleteConstraintException` and
+/// leaves the foreign record intact.
 #[test]
 fn fk_abort_blocks_delete_of_referenced_foreign_record() {
     let dir = TempDir::new().unwrap();
@@ -875,6 +879,10 @@ fn fk_insert_rejects_secondary_key_absent_from_foreign_db() {
 /// FK Nullify with the multi-key variant: every secondary key in a
 /// multi-key index is nullified individually via
 /// [`ForeignMultiKeyNullifier`].  v1.6 step 10.
+///
+/// JE: `ForeignKeyTest.testNullify` (`doTest(ForeignKeyDeleteAction.NULLIFY)`):
+/// deleting the referenced foreign key nullifies the foreign-key value in
+/// every referring record.
 #[test]
 fn fk_nullify_multi_key_nullifier_path() {
     use noxu_db::secondary_config::{
@@ -964,6 +972,10 @@ fn fk_nullify_multi_key_nullifier_path() {
 
 /// FK Cascade transitive: deleting a record in the root foreign
 /// causes the cascade to walk through both levels.  v1.6 step 9.
+///
+/// JE: `ForeignKeyTest.testCascade` (`doTest(ForeignKeyDeleteAction.CASCADE)`):
+/// deleting the referenced foreign key cascades to delete every referring
+/// record (including secondary duplicates).
 #[test]
 fn fk_cascade_transitive_two_levels() {
     let dir = TempDir::new().unwrap();

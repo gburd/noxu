@@ -698,6 +698,10 @@ mod tests {
         assert!(config.key_creator.is_none());
     }
 
+    /// JE: `ForeignKeyTest.testIllegalNullifier` — a NULLIFY action requires
+    /// a nullifier; both nullifiers may not be set at once; and a
+    /// ForeignKeyNullifier may not be combined with a MultiKeyCreator.  These
+    /// are the `SecondaryConfig::validate` rules exercised here.
     #[test]
     fn test_validate_both_nullifiers_fails() {
         use crate::environment::Environment;
