@@ -68,8 +68,8 @@ use noxu_dbi::{CursorImpl, GetMode};
 use noxu_sync::Mutex;
 use std::cell::RefCell;
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 
 thread_local! {
     /// Cycle-detection frame for FK cascades and nullifications.
@@ -847,8 +847,31 @@ impl SecondaryDatabase {
 
     /// Closes the secondary database handle.
     ///
+    /// JE parity (`SecondaryDatabase.close()` ->
+    /// `removeReferringAssociations`): before closing the inner index DB, the
+    /// secondary is removed from its primary's association list (and, if it
+    /// has a foreign-key database, from that DB's FK-referrer list).  A closed
+    /// secondary must NOT be driven by later `Database::put` / `delete` on the
+    /// primary — otherwise the maintenance hook would run against the
+    /// now-closed inner DB and fail `DatabaseClosed` (NEW-SEC-CLOSE-1).
     ///
+    /// Unregister is matched by allocation identity, so closing one secondary
+    /// leaves every other still-open secondary on the same primary registered
+    /// and maintained.
     pub fn close(&self) -> Result<()> {
+        // Remove this secondary's maintenance hook from the primary.
+        let sec_weak: Weak<dyn SecondaryHook + Send + Sync> =
+            Arc::downgrade(&self.state) as _;
+        self.state.primary.lock().unregister_secondary(&sec_weak);
+
+        // Remove the FK-referrer registration from the foreign DB, if any.
+        if let Some(fk_handle) = self.state.config.foreign_key_database.clone()
+        {
+            let fk_weak: Weak<dyn FkReferrer + Send + Sync> =
+                Arc::downgrade(&self.state) as _;
+            fk_handle.lock().unregister_fk_referrer(&fk_weak);
+        }
+
         self.state.inner.close()
     }
 

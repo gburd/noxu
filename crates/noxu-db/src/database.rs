@@ -1506,6 +1506,30 @@ impl Database {
         guard.push(hook);
     }
 
+    /// Removes a previously-registered secondary hook from this primary's
+    /// association list.  Called from [`SecondaryDatabase::close`] so that a
+    /// closed secondary is no longer driven by later primary writes.
+    ///
+    /// JE parity: `SecondaryDatabase.close()` -> `removeReferringAssociations`
+    /// -> `primaryDatabase.simpleAssocSecondaries.remove(this)`
+    /// (SecondaryDatabase.java).  Without this, a closed-but-not-dropped
+    /// secondary's `Weak` still upgrades and `Database::put`/`delete` would
+    /// call `maintain()` on the closed inner index DB and fail
+    /// `DatabaseClosed` (NEW-SEC-CLOSE-1).
+    ///
+    /// Entries are matched by allocation identity (`Weak::ptr_eq`), so only
+    /// the exact closing secondary is removed; other still-open secondaries
+    /// on the same primary are untouched.  Dead `Weak`s are compacted too.
+    pub(crate) fn unregister_secondary(
+        &self,
+        hook: &std::sync::Weak<
+            dyn crate::secondary_database::SecondaryHook + Send + Sync,
+        >,
+    ) {
+        let mut guard = self.secondaries.write();
+        guard.retain(|w| w.strong_count() > 0 && !w.ptr_eq(hook));
+    }
+
     /// Returns a snapshot of every live registered secondary.  Used by
     /// the automatic-maintenance plumbing in `put` / `delete` to drive
     /// secondaries without holding the registry lock across the
@@ -1598,6 +1622,21 @@ impl Database {
         let mut guard = self.fk_referrers.write();
         guard.retain(|w| w.strong_count() > 0);
         guard.push(referrer);
+    }
+
+    /// Removes a previously-registered FK referrer from this foreign DB's
+    /// list.  Called from [`SecondaryDatabase::close`].  JE parity:
+    /// `removeReferringAssociations` -> `foreignDb.foreignKeySecondaries
+    /// .remove(this)` (SecondaryDatabase.java).  Matched by allocation
+    /// identity so only the closing secondary is removed.
+    pub(crate) fn unregister_fk_referrer(
+        &self,
+        referrer: &std::sync::Weak<
+            dyn crate::secondary_database::FkReferrer + Send + Sync,
+        >,
+    ) {
+        let mut guard = self.fk_referrers.write();
+        guard.retain(|w| w.strong_count() > 0 && !w.ptr_eq(referrer));
     }
 
     /// Snapshot of every live FK referrer.

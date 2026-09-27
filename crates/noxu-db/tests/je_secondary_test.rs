@@ -292,29 +292,15 @@ fn je_secondary_test_test_extract_from_primary_key_only_behavioral() {
 /// secondary; a closed secondary is removed from the primary's association
 /// and no longer driven.
 ///
-/// ENGINE-BUG CANDIDATE **NEW-SEC-CLOSE-1** (kept `#[ignore]`, not weakened).
-/// Noxu `SecondaryDatabase::close()` closes the inner index DB handle but does
-/// NOT unregister the maintenance hook from the primary: the hook is held as a
-/// `Weak<dyn SecondaryHook>` that only drops out of `Database::live_secondaries`
-/// when the `SecondaryDatabase` is *dropped*, not when it is *closed*.  So the
-/// next `primary.put()` still calls `hook.maintain()` on the closed inner DB
-/// and fails with `DatabaseClosed`.
-///
-/// JE reference: `SecondaryDatabase.close()` removes the secondary from the
-/// primary's secondary list (`getSecondaries(priDb)` shrinks), and
-/// `SecondaryTest.testOpenAndClose` asserts primary.put() thereafter drives
-/// only the still-open secondaries — never erroring.
-///
-/// Control (point-verify, not cursor-scan): after `sec2.close()`,
-/// `primary.lock().put([2],[2])` returns `Err(DatabaseClosed)` on the current
-/// engine; it MUST return `Ok(())` (JE drives only sec1).  Root-cause pointer:
-/// `Database::live_secondaries` (upgrades a closed-but-not-dropped hook) +
-/// `SecondaryDatabase::close` (closes inner DB, does not unregister).
-/// Minimal fix candidate: skip a closed inner DB in `SecondaryHook::maintain`
-/// (guard `self.inner.is_valid()`), or unregister the Weak on `close()`.
+/// Exercises the **NEW-SEC-CLOSE-1** fix: `SecondaryDatabase::close()` now
+/// unregisters its maintenance hook from the primary (JE
+/// `SecondaryDatabase.close()` -> `removeReferringAssociations` ->
+/// `primaryDatabase.simpleAssocSecondaries.remove(this)`), so the next
+/// `primary.put()` drives only the still-open secondaries and never fails
+/// `DatabaseClosed`.  Before the fix, closing a secondary left its `Weak`
+/// hook registered and the next primary write called `maintain()` on the
+/// closed inner DB (fail-on-base: `primary.put()` -> `Err(DatabaseClosed)`).
 #[test]
-#[ignore = "NEW-SEC-CLOSE-1: closing a secondary does not unregister its \
-            primary-maintenance hook; next primary.put() fails DatabaseClosed"]
 fn je_secondary_test_test_open_and_close() {
     let dir = TempDir::new().unwrap();
     let env = open_env(&dir);
@@ -351,27 +337,111 @@ fn je_secondary_test_test_open_and_close() {
     );
 
     // Record sec2's count before closing (1 record so far).
-    let sec2_count_before = sec2.count().unwrap();
-    assert_eq!(sec2_count_before, 1, "sec2 indexed the first record");
+    assert_eq!(sec2.count().unwrap(), 1, "sec2 indexed the first record");
 
-    // Close sec2.  Subsequent primary puts must NOT error and must NOT be
-    // driven into the closed secondary; the still-open sec1 keeps working.
+    // Close sec2.  It is unregistered from the primary, so subsequent primary
+    // puts must NOT error and must NOT be driven into the closed secondary;
+    // the still-open sec1 must keep being maintained.
     sec2.close().unwrap();
     primary
         .lock()
         .put([2u8], [2u8])
         .expect("primary.put() must not fail because a secondary is closed");
+    // CRUX (do not break live secondaries): sec1 is still open and MUST have
+    // indexed the new record.
     assert!(
         sec1.get_into(None, [2 + KEY_OFFSET], &mut pk, &mut d).unwrap(),
-        "sec1 (still open) must see the new record"
+        "the still-open sec1 must be maintained after another secondary closed"
     );
-    // sec2 is closed; its handle must report closed (not silently accept
-    // reads/maintenance).  This is the observable "no longer driven" signal
-    // available on the public API — a closed secondary cannot be queried,
-    // and the put above proves closing it does not break the primary.
+    assert_eq!(pk.data_opt().unwrap(), &[2u8]);
+    // The closed sec2 handle rejects further operations.
     assert!(
         sec2.count().is_err(),
         "a closed secondary handle must reject further operations"
     );
     assert!(!sec2.is_valid(), "closed secondary is invalid");
+}
+
+/// NEW-SEC-CLOSE-1 safety control: closing ONE secondary must not stop
+/// maintenance of OTHER still-open secondaries, and reopening a secondary
+/// re-registers it.  Two secondaries with DIFFERENT key spaces so we can tell
+/// them apart.
+#[test]
+fn je_secondary_test_new_sec_close_1_close_one_keeps_other_live() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let primary = open_primary(&env, "testDB");
+
+    // sec_a keys on data+100; sec_b keys on data+200 (disjoint key spaces).
+    struct Offset200;
+    impl SecondaryKeyCreator for Offset200 {
+        fn create_secondary_key(
+            &self,
+            _db: &Database,
+            _key: &DatabaseEntry,
+            data: &DatabaseEntry,
+            result: &mut DatabaseEntry,
+        ) -> bool {
+            if let Some(d) = data.data_opt()
+                && !d.is_empty()
+            {
+                result.set_data(&[d[0].wrapping_add(200)]);
+                return true;
+            }
+            false
+        }
+    }
+
+    let sec_a = SecondaryDatabase::open(
+        Arc::clone(&primary),
+        open_inner(&env, "secA"),
+        SecondaryConfig::new()
+            .with_allow_create(true)
+            .with_key_creator(Box::new(OffsetKeyCreator)),
+    )
+    .unwrap();
+    let sec_b = SecondaryDatabase::open(
+        Arc::clone(&primary),
+        open_inner(&env, "secB"),
+        SecondaryConfig::new()
+            .with_allow_create(true)
+            .with_key_creator(Box::new(Offset200)),
+    )
+    .unwrap();
+
+    // Put 1 -> both secondaries index it.
+    primary.lock().put([1u8], [1u8]).unwrap();
+    let mut pk = DatabaseEntry::new();
+    let mut d = DatabaseEntry::new();
+    assert!(sec_a.get_into(None, [1 + 100], &mut pk, &mut d).unwrap());
+    assert!(
+        sec_b.get_into(None, [1u8.wrapping_add(200)], &mut pk, &mut d).unwrap()
+    );
+
+    // Close sec_a.  Put 2 -> sec_b (still open) must index it; sec_a must not.
+    sec_a.close().unwrap();
+    primary.lock().put([2u8], [2u8]).unwrap();
+    assert!(
+        sec_b.get_into(None, [2u8.wrapping_add(200)], &mut pk, &mut d).unwrap(),
+        "closing sec_a must not stop sec_b being maintained"
+    );
+    assert_eq!(pk.data_opt().unwrap(), &[2u8]);
+
+    // Reopen a secondary over sec_a's store -> re-registers and is driven.
+    let sec_a2 = SecondaryDatabase::open(
+        Arc::clone(&primary),
+        open_inner(&env, "secA"),
+        SecondaryConfig::new()
+            .with_allow_create(true)
+            .with_allow_populate(true)
+            .with_key_creator(Box::new(OffsetKeyCreator)),
+    )
+    .unwrap();
+    // Put 3 -> the reopened secondary must index it (re-registration works).
+    primary.lock().put([3u8], [3u8]).unwrap();
+    assert!(
+        sec_a2.get_into(None, [3 + 100], &mut pk, &mut d).unwrap(),
+        "a reopened secondary must re-register and be maintained"
+    );
+    assert_eq!(pk.data_opt().unwrap(), &[3u8]);
 }
