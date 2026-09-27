@@ -50,6 +50,12 @@ fn add_peers(env: &ReplicatedEnvironment, n: u32) {
 /// `ReplicaAckPolicy::All` on a master with two peer replicas (none of
 /// which ack) must NOT silently succeed.  The coordinator must wait
 /// the full timeout and return `AckWaitErrorKind::Timeout`.
+///
+// JE: ReplicatedTransactionTest.testReplicaAckPolicy — the master enforces
+// the configured ReplicaAckPolicy on commit; a policy that cannot be met
+// (no acking replicas) does not silently succeed. Same intent at the
+// coordinator layer Noxu exposes (AckWaitErrorKind::Timeout ~
+// InsufficientAcksException).
 #[test]
 fn f1_all_policy_with_no_acks_times_out() {
     let env = build_master_env("master_f1_all");
@@ -181,6 +187,11 @@ fn f1_acks_within_timeout_succeed() {
 /// and verify that `Transaction::commit_with_durability` actually
 /// blocks on replica acks. Without F1 the commit returned `Ok(())`
 /// silently; with F1 it returns `NoxuError::InsufficientReplicas`.
+///
+// JE: ReplicatedTransactionTest.testReplicaCommitDurability — a replicated
+// commit blocks until the durability (ack) policy is satisfied and fails
+// cleanly (InsufficientReplicasException) when it cannot be, rather than
+// returning success without the required acks.
 ///
 /// This test now writes data (a `put`) before committing so the txn is a
 /// real ack-requiring commit.  An EMPTY / read-only txn correctly returns

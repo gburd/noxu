@@ -432,3 +432,306 @@ fn node_priority_higher_vlsn_can_be_master() {
     assert!(group.node(1).is_master());
     assert!(group.node(1).current_vlsn() >= 20, "VLSN must not regress");
 }
+
+// =====================================================================
+// ReplicationConfigTest — `je.rep.ReplicationConfigTest`
+// =====================================================================
+
+/// JE: `ReplicationConfigTest.testConsistency`.
+///
+/// "A `ReplicationConfig` round-trips every valid `ReplicaConsistencyPolicy`
+/// (`setConsistencyPolicy` / `getConsistencyPolicy`), and an invalid policy
+/// (a `CommitPointConsistencyPolicy` built over a null-VLSN token, or a
+/// point-consistency policy over `VLSN.NULL_VLSN`) is rejected with an
+/// `IllegalArgumentException`."
+///
+/// Noxu adaptation of the JE assertions:
+///   * `TimeConsistencyPolicy` and `NoConsistencyRequiredPolicy` round-trip
+///     through the [`crate::RepConfig`] builder — same as JE's
+///     `setConsistencyPolicy` / `getConsistencyPolicy` equality check.
+///   * The invalid-policy half maps to Noxu's typed constructor: a
+///     [`crate::CommitToken`] with VLSN 0 (JE `new CommitToken(uuid, 0)`,
+///     which the `CommitPointConsistencyPolicy` ctor rejects) is
+///     un-constructible — [`crate::CommitToken::new`] returns `None`, so the
+///     bad policy can never be built.  This is the Rust idiom for JE's
+///     "throw `IllegalArgumentException` on a null-VLSN commit token".
+///
+/// The string-config path (`setConfigParam(CONSISTENCY_POLICY, "badPolicy")`)
+/// is N/A: Noxu's `RepConfig` is a typed builder with no string
+/// `setConfigParam` facility (recorded in the package report).
+#[test]
+fn replication_config_consistency_round_trip() {
+    use std::time::Duration;
+
+    use noxu_rep::{CommitToken, ConsistencyPolicy, RepConfig};
+
+    // TimeConsistencyPolicy round-trips (JE: policy.equals(getConsistencyPolicy)).
+    let time_policy = ConsistencyPolicy::TimeConsistency {
+        max_lag: Duration::from_millis(100),
+        timeout: Duration::from_secs(1),
+    };
+    let cfg = RepConfig::builder("g", "n", "127.0.0.1")
+        .consistency_policy(time_policy.clone())
+        .build();
+    assert_eq!(cfg.consistency_policy, time_policy);
+
+    // NoConsistencyRequiredPolicy round-trips.
+    let cfg = RepConfig::builder("g", "n", "127.0.0.1")
+        .consistency_policy(ConsistencyPolicy::NoConsistency)
+        .build();
+    assert_eq!(cfg.consistency_policy, ConsistencyPolicy::NoConsistency);
+
+    // A CommitPointConsistencyPolicy over a null-VLSN commit token is
+    // rejected — in JE the ctor throws IllegalArgumentException; in Noxu the
+    // token itself is un-constructible (VLSN must be non-null).
+    assert!(
+        CommitToken::new("g", 0).is_none(),
+        "a null-VLSN commit token must be rejected (JE CommitToken ctor: \
+         'the vlsn must not be null'), so no invalid CommitPointConsistency \
+         policy can be built"
+    );
+    // A valid token yields a usable commit-point policy that round-trips.
+    let token = CommitToken::new("g", 42).expect("valid token");
+    let cp = ConsistencyPolicy::commit_point(&token, Duration::from_secs(1));
+    let cfg = RepConfig::builder("g", "n", "127.0.0.1")
+        .consistency_policy(cp.clone())
+        .build();
+    assert_eq!(cfg.consistency_policy, cp);
+}
+
+// =====================================================================
+// ReplicatedEnvironmentStatsTest — `je.rep.ReplicatedEnvironmentStatsTest`
+// =====================================================================
+
+/// JE: `ReplicatedEnvironmentStatsTest.testBasic`.
+///
+/// "After a group is created, `getRepStats()` is available on every node and
+/// every stat accessor returns without throwing."  JE's `invokeAllAccessors`
+/// calls ~50 getters purely to prove they are reachable and side-effect free.
+///
+/// Noxu exposes a subset of the JE `ReplicatedEnvironmentStats` group via
+/// [`crate::ReplicatedEnvironment::get_stats`] → [`crate::RepStats`]
+/// (elections, feeders, acks, replicated/applied entries, bytes, max lag).
+/// This test reads every field on every node of a formed group, exactly as
+/// JE's smoke test does — it would fail (panic / not compile) if the stats
+/// handle were unreachable or a field were removed.  The JE getters Noxu does
+/// not implement (per-replica VLSN-rate maps, protocol-nanos, group-commit
+/// counters) are recorded as N/A in the package report.
+#[test]
+fn replicated_environment_stats_all_accessors_readable() {
+    use std::sync::atomic::Ordering;
+
+    let mut group =
+        RepTestBase::builder("rep_stats_basic").group_size(3).build();
+    group.create_group(1).unwrap();
+
+    // Drive a little replication so the counters are exercised, not just zero.
+    group.populate_db(1, 5).unwrap();
+    group.assert_all_at_vlsn(5);
+
+    for idx in 0..group.group_size() {
+        let env = group.node(idx).get_env();
+        let stats = env.get_stats();
+        // Read every accessor (JE invokeAllAccessors) — the loads must not
+        // panic and the summary must render.
+        let _ = stats.elections_held.load(Ordering::Relaxed);
+        let _ = stats.elections_won.load(Ordering::Relaxed);
+        let _ = stats.elections_lost.load(Ordering::Relaxed);
+        let _ = stats.feeders_created.load(Ordering::Relaxed);
+        let _ = stats.feeders_shutdown.load(Ordering::Relaxed);
+        let _ = stats.acks_received.load(Ordering::Relaxed);
+        let _ = stats.ack_timeouts.load(Ordering::Relaxed);
+        let _ = stats.entries_replicated.load(Ordering::Relaxed);
+        let _ = stats.entries_applied.load(Ordering::Relaxed);
+        let _ = stats.bytes_replicated.load(Ordering::Relaxed);
+        let _ = stats.max_replica_lag_ms.load(Ordering::Relaxed);
+        let summary = stats.summary();
+        assert!(
+            summary.contains("RepStats"),
+            "stats summary must render on node {idx}"
+        );
+    }
+}
+
+// =====================================================================
+// DatabaseOperationTest — `je.rep.DatabaseOperationTest`
+// =====================================================================
+
+/// JE: `DatabaseOperationTest.testDbNameOpReplicaWriteException`.
+///
+/// "A database-name operation (create / rename / remove) attempted directly
+/// on a replica fails with `ReplicaWriteException` — a replica is read-only
+/// for replicated content; only the master may originate such operations."
+///
+/// Noxu's stream-level analogue: a replica has [`crate::NodeState::Replica`]
+/// and cannot be driven to originate writes.  The direct write-path guard is
+/// the master-only-write restriction — a replica node reports `is_replica()`
+/// and NOT `is_master()`, and a `become_master` on a Secondary (never
+/// electable) node is rejected (see the txn TCK's
+/// `secondary_node_become_master_should_fail`).  Here we assert the replica's
+/// read-only role directly: after a group forms, the replica is a replica and
+/// is not the master, so any master-only DB-name op routed by role would be
+/// refused.
+#[test]
+fn database_op_replica_is_read_only_role() {
+    let mut group =
+        RepTestBase::builder("dbop_replica_ro").group_size(3).build();
+    group.create_group(1).unwrap();
+
+    assert!(group.node(0).is_master(), "node 0 is the master");
+    for replica_idx in 1..group.group_size() {
+        assert!(
+            group.node(replica_idx).is_replica(),
+            "node {replica_idx} must be a (read-only) replica"
+        );
+        assert!(
+            !group.node(replica_idx).is_master(),
+            "a replica must never report itself as master (a DB-name op \
+             originated here would be a ReplicaWriteException)"
+        );
+    }
+}
+
+/// JE: `DatabaseOperationTest.testLocalStoreNoConsistency`.
+///
+/// "Reads against a local (non-replicated) database on a replica are NOT
+/// subject to the replica consistency policy — a `NoConsistencyRequiredPolicy`
+/// read proceeds immediately regardless of how far the replica lags the
+/// master."
+///
+/// Noxu analogue at the consistency-gate layer: a
+/// [`crate::ConsistencyPolicy::NoConsistency`] read never blocks, even when
+/// the master is far ahead.  (The full local-DB-bypass wiring is covered by
+/// `noxu-dbi`'s `local_write_replication_test`; here we assert the
+/// no-consistency-never-blocks half that JE's local-store read relies on.)
+#[test]
+fn database_op_local_store_no_consistency_never_blocks() {
+    use std::time::{Duration, Instant};
+
+    use noxu_rep::ConsistencyPolicy;
+
+    let mut group =
+        RepTestBase::builder("dbop_local_noc").group_size(2).build();
+    group.create_group(1).unwrap();
+
+    // Master writes; replica intentionally left behind (master-only).
+    group.populate_master_only(1, 50).unwrap();
+
+    // A NoConsistency read on the (lagging) replica must return at once.
+    let start = Instant::now();
+    group
+        .node(1)
+        .get_env()
+        .begin_read_consistency(Some(&ConsistencyPolicy::NoConsistency))
+        .unwrap();
+    assert!(
+        start.elapsed() < Duration::from_millis(50),
+        "a NoConsistency read against a local store must not block on the \
+         replica's replication lag"
+    );
+}
+
+// =====================================================================
+// RepGroupAdminTest — `je.rep.RepGroupAdminTest`
+// =====================================================================
+
+/// JE: `RepGroupAdminTest.testRemoveMember`.
+///
+/// "`RepGroupAdmin.removeMember` removes an electable member from the group;
+/// afterwards the group's electable membership no longer includes it and the
+/// quorum arithmetic reflects the smaller group."
+///
+/// Noxu analogue at the group-model layer ([`crate::RepGroup`]): removing an
+/// electable node drops the electable count (and thus the majority quorum),
+/// while the removed node is no longer resolvable by name.
+#[test]
+fn rep_group_admin_remove_member() {
+    let mut g = RepGroup::new("rga_remove".to_string(), 7);
+    for i in 1u32..=3 {
+        g.add_node(RepNode::new(
+            format!("n{i}"),
+            NodeType::Electable,
+            "127.0.0.1".to_string(),
+            7100 + i as u16,
+            i,
+        ));
+    }
+    assert_eq!(g.electable_count(), 3);
+    // Majority of 3 is 2.
+    assert_eq!(g.phase2_quorum(), 2);
+
+    let removed = g.remove_node("n3");
+    assert!(removed.is_some(), "removeMember must return the removed member");
+    assert_eq!(g.electable_count(), 2, "electable membership shrinks");
+    assert!(g.get_node("n3").is_none(), "removed member is no longer present");
+    // Majority of 2 is 2 (JE: quorum recomputed over the smaller group).
+    assert_eq!(g.phase2_quorum(), 2);
+}
+
+/// JE: `RepGroupAdminTest.testDeleteMember`.
+///
+/// "`RepGroupAdmin.deleteMember` permanently deletes a member; deleting a
+/// member that is not present (or already deleted) is an error / no-op."
+///
+/// Noxu analogue: [`crate::RepGroup::remove_node`] returns the deleted node on
+/// first call and `None` on a second (idempotent removal / not-present).
+#[test]
+fn rep_group_admin_delete_member_is_idempotent() {
+    let mut g = RepGroup::new("rga_delete".to_string(), 8);
+    g.add_node(RepNode::new(
+        "n1".to_string(),
+        NodeType::Electable,
+        "127.0.0.1".to_string(),
+        7200,
+        1,
+    ));
+    assert!(g.remove_node("n1").is_some(), "first delete removes the member");
+    assert!(
+        g.remove_node("n1").is_none(),
+        "deleting an absent member returns None (JE: MemberNotFoundException)"
+    );
+}
+
+/// JE: `RepGroupAdminTest.testAddMonitor`.
+///
+/// "A monitor can be added to the group; it observes membership but does not
+/// count toward the electable quorum."
+///
+/// Noxu analogue: a [`crate::NodeType::Monitor`] node added to a
+/// [`crate::RepGroup`] appears in `get_monitors()` but NOT in
+/// `get_electable_nodes()`, and does not change `electable_count()`.
+#[test]
+fn rep_group_admin_add_monitor() {
+    let mut g = RepGroup::new("rga_monitor".to_string(), 9);
+    for i in 1u32..=2 {
+        g.add_node(RepNode::new(
+            format!("e{i}"),
+            NodeType::Electable,
+            "127.0.0.1".to_string(),
+            7300 + i as u16,
+            i,
+        ));
+    }
+    assert_eq!(g.electable_count(), 2);
+    assert_eq!(g.get_monitors().len(), 0);
+
+    g.add_node(RepNode::new(
+        "mon1".to_string(),
+        NodeType::Monitor,
+        "127.0.0.1".to_string(),
+        7400,
+        3,
+    ));
+    // Monitor is visible as a monitor, absent from the electable set, and
+    // does NOT inflate the electable quorum (JE: monitors are non-voting).
+    assert_eq!(g.get_monitors().len(), 1, "monitor is registered");
+    assert_eq!(
+        g.electable_count(),
+        2,
+        "a monitor does not count toward the electable quorum"
+    );
+    assert!(
+        !g.get_electable_nodes().iter().any(|n| n.name == "mon1"),
+        "a monitor must not appear in the electable set"
+    );
+}

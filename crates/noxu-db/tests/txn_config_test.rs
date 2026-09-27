@@ -170,6 +170,15 @@ fn test_default_config_new_fields() {
 
 /// `local_write` and `read_only` may not both be true: begin_transaction
 /// must reject the combination rather than silently favoring one flag.
+///
+// JE: LocalWriteTxnTest.testIllegalConfig — "Expect exception when both
+// localWrite and readOnly are set to true." In JE the setters
+// (TransactionConfig.setLocalWrite / setReadOnly) throw
+// IllegalArgumentException on the conflicting combination; Rust setters
+// return `&mut Self` and cannot fail, so Noxu enforces the same invariant at
+// begin_transaction time (Environment::begin_transaction rejects
+// local_write && read_only). Same intent, language-idiom relocation of the
+// check.
 #[test]
 fn test_local_write_and_read_only_rejected() {
     let dir = TempDir::new().unwrap();

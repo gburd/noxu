@@ -109,6 +109,11 @@ fn replica_setup() -> Setup {
 
 // ── HEADLINE 1: commit-point read blocks until applied, then sees data ──────
 
+// JE: CommitPointConsistencyPolicyTest.testCommitPointConsistencyOnOpen /
+// testVLSNConsistencyJoinGroup (block-then-see subset), and
+// JoinGroupTest.testVLSNConsistencyJoinGroup. A read on a replica with a
+// CommitPointConsistencyPolicy built from the master's commit token BLOCKS
+// until the replica has replayed up to that VLSN, then the data is visible.
 #[test]
 fn test_commit_point_blocks_then_sees_data() {
     let Setup { rep_env, mut replay, handle, db_id, tree, .. } =
@@ -168,6 +173,10 @@ fn test_commit_point_blocks_then_sees_data() {
 
 // ── HEADLINE 2: time-consistency blocks a lagging replica ───────────────────
 
+// JE: TimeConsistencyPolicy via Replica.ConsistencyTracker.lagAwait
+// (CommitPointConsistencyPolicyTest exercises the sibling policy through
+// the same tracker). A lagging replica blocks a time-consistency read until
+// it catches up within the permissible lag.
 #[test]
 fn test_time_consistency_blocks_lagging_replica() {
     let Setup { rep_env, mut replay, handle, db_id, .. } = replica_setup();
@@ -226,6 +235,10 @@ fn test_no_consistency_never_blocks() {
 
 // ── HEADLINE 4: timeout is a clean error, not a hang ────────────────────────
 
+// JE: CommitPointConsistencyPolicyTest.testVLSNConsistencyJoinGroup
+// (timeout subset) — a commit token the replica never reaches yields a
+// clean ReplicaConsistencyException (Noxu: RepError::ConsistencyTimeout),
+// asserted by JE via policyTimeout <= elapsed. NEVER a hang.
 #[test]
 fn test_commit_point_timeout_is_clean_error() {
     let Setup { rep_env, .. } = replica_setup();
