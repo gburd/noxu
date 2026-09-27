@@ -23,11 +23,11 @@
 //!     The substantive invariant — that the secondary index exactly mirrors
 //!     the primary data's byte-set after every mutation — is fully asserted.
 
+use noxu_db::secondary_config::SecondaryMultiKeyCreator;
 use noxu_db::{
     Database, DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig,
     OperationStatus, SecondaryConfig, SecondaryDatabase,
 };
-use noxu_db::secondary_config::SecondaryMultiKeyCreator;
 use noxu_sync::Mutex;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -123,18 +123,26 @@ impl Harness {
         let env = open_env(&dir);
         let primary = open_primary(&env);
         let secondary = open_secondary(&env, &primary, dups);
-        Self { _dir: dir, _env: env, primary, secondary, pri_model: Model::new() }
+        Self {
+            _dir: dir,
+            _env: env,
+            primary,
+            secondary,
+            pri_model: Model::new(),
+        }
     }
 
     /// JE `write`: put (priData != null) or delete (priData == null) a single
     /// primary record.  Returns Ok on success, Err if the write was rejected
     /// (unique-constraint violation in the one-to-many case).
-    fn write(&self, pri_key: u8, pri_data: Option<&[u8]>) -> Result<(), String> {
+    fn write(
+        &self,
+        pri_key: u8,
+        pri_data: Option<&[u8]>,
+    ) -> Result<(), String> {
         let pri = self.primary.lock();
         match pri_data {
-            Some(d) => pri
-                .put([pri_key], d)
-                .map_err(|e| e.to_string()),
+            Some(d) => pri.put([pri_key], d).map_err(|e| e.to_string()),
             None => {
                 // JE: get then delete; delete of a missing key is fine here
                 // because writeAndVerify only deletes existing records.
@@ -144,7 +152,11 @@ impl Harness {
     }
 
     /// JE `updateMaps`: mutate the expected model to reflect the write.
-    fn update_model(&mut self, pri_key: u8, new_pri_data: Option<BTreeSet<u8>>) {
+    fn update_model(
+        &mut self,
+        pri_key: u8,
+        new_pri_data: Option<BTreeSet<u8>>,
+    ) {
         match new_pri_data {
             Some(set) => {
                 self.pri_model.insert(pri_key, set);
@@ -217,7 +229,10 @@ impl Harness {
         }
 
         // JE's four assertions.
-        assert_eq!(self.pri_model, pri_map1, "priMap0 == priMap1 (primary scan)");
+        assert_eq!(
+            self.pri_model, pri_map1,
+            "priMap0 == priMap1 (primary scan)"
+        );
         assert_eq!(pri_map1, pri_map2, "priMap1 == priMap2 (secondary scan)");
         assert_eq!(sec_model, sec_map1, "secMap0 == secMap1");
         assert_eq!(sec_map1, sec_map2, "secMap1 == secMap2");
