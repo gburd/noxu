@@ -250,8 +250,41 @@ impl VlsnRange {
             (a, b) => a.max(b),
         };
     }
-}
 
+    /// JE `VLSNRange.shortenFromHead(deleteEnd)`: return a new range with all
+    /// VLSNs `<= delete_end` removed from the head.
+    ///
+    /// The new `first` becomes `delete_end + 1` (or empty if `delete_end`
+    /// equals the current `last`, i.e. the whole range is deleted). `last`
+    /// is unchanged (unless the whole range goes away). `lastSync`
+    /// (`sync_vlsn`) is preserved as-is — JE asserts it is never truncated by
+    /// a head delete. `lastTxnEnd` (`commit_vlsn`) is kept only if it still
+    /// falls at or after the new first; otherwise it is cleared to NULL.
+    ///
+    /// JE: VLSNRange.shortenFromHead (VLSNRange.java:241-260).
+    pub fn shorten_from_head(&self, delete_end: u64) -> VlsnRange {
+        let (new_first, new_last) = if delete_end == self.last {
+            (0, 0)
+        } else {
+            (delete_end + 1, self.last)
+        };
+        // JE keeps lastTxnEnd only if it is strictly greater than newFirst
+        // (and the range is not now empty); otherwise it is cleared.
+        let new_txn_end = if new_first != 0 && self.commit_vlsn > new_first {
+            self.commit_vlsn
+        } else {
+            0
+        };
+        VlsnRange {
+            first: new_first,
+            last: new_last,
+            commit_vlsn: new_txn_end,
+            // lastSync is preserved unchanged (JE keeps it and asserts it is
+            // not being truncated away).
+            sync_vlsn: if new_first == 0 { 0 } else { self.sync_vlsn },
+        }
+    }
+}
 impl std::fmt::Display for VlsnRange {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(

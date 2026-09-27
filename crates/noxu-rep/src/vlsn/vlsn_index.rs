@@ -169,6 +169,12 @@ impl VlsnIndex {
         if vlsn == 0 {
             return None;
         }
+        // The VlsnRange is authoritative for the head/tail boundary (see
+        // truncate_from_head / truncate_after): a vlsn outside the range is
+        // not resolvable even if a straddling bucket still nominally owns it.
+        if !self.range.read().contains(vlsn) {
+            return None;
+        }
 
         let buckets = self.buckets.read();
 
@@ -182,6 +188,68 @@ impl VlsnIndex {
 
         let bucket = &buckets[pos - 1];
         bucket.get_lsn(vlsn)
+    }
+
+    /// Look up the **exact** LSN for a VLSN, or `None` if no precise mapping
+    /// is stored (JE `ForwardVLSNScanner.getPreciseLsn`). Unlike
+    /// [`Self::get_lsn`] (approximate / LTE), this returns a value only when
+    /// the vlsn falls on a stored stride boundary or is a bucket's last vlsn.
+    ///
+    /// JE: VLSNIndex getPreciseLsn -> VLSNBucket.getLsn.
+    pub fn get_exact_lsn(&self, vlsn: u64) -> Option<(u32, u32)> {
+        if vlsn == 0 {
+            return None;
+        }
+        if !self.range.read().contains(vlsn) {
+            return None;
+        }
+        let buckets = self.buckets.read();
+        let pos = buckets.partition_point(|b| b.get_first_vlsn() <= vlsn);
+        if pos == 0 {
+            return None;
+        }
+        let bucket = &buckets[pos - 1];
+        if !bucket.owns(vlsn) {
+            return None;
+        }
+        bucket.get_exact_lsn(vlsn)
+    }
+
+    /// Look up the nearest mapping whose vlsn is `>= vlsn` (JE
+    /// `VLSNIndex.getGTEBucket` -> `VLSNBucket.getGTELsn`). Returns `None` if
+    /// `vlsn` is beyond the tracked range.
+    ///
+    /// JE: VLSNIndex.getGTEBucket / VLSNBucket.getGTELsn.
+    pub fn get_gte_lsn(&self, vlsn: u64) -> Option<(u32, u32)> {
+        if vlsn == 0 {
+            return None;
+        }
+        {
+            let range = self.range.read();
+            if range.is_empty() || vlsn > range.get_last() {
+                return None;
+            }
+            // A GTE query below the range head resolves to the range's first
+            // mapping.
+        }
+        let buckets = self.buckets.read();
+        // Find the bucket that owns vlsn, or the first bucket that follows it
+        // (JE getGTEBucket returns the next bucket if vlsn falls in a gap).
+        let pos = buckets.partition_point(|b| b.get_first_vlsn() <= vlsn);
+        if pos > 0 {
+            let bucket = &buckets[pos - 1];
+            if bucket.owns(vlsn) {
+                return bucket.get_gte_lsn(vlsn);
+            }
+            // vlsn is between this bucket and the next: use the next bucket's
+            // first mapping (its GTE for its own first vlsn).
+        }
+        // Fall to the next bucket after vlsn, if any.
+        if pos < buckets.len() {
+            let next = &buckets[pos];
+            return next.get_gte_lsn(next.get_first_vlsn());
+        }
+        None
     }
 
     /// Get the latest (highest) VLSN registered in the index.
@@ -204,6 +272,66 @@ impl VlsnIndex {
         buckets.retain(|b| b.get_first_vlsn() <= vlsn);
 
         range.truncate_after(vlsn);
+    }
+
+    /// Truncate all entries at or before the given VLSN (head truncation).
+    ///
+    /// Removes every mapping for VLSNs `<= delete_end`; the new range first
+    /// VLSN becomes `delete_end + 1`. This is the log-cleaner / head-of-range
+    /// operation: JE calls it after cleaning has advanced past `delete_end`
+    /// so the corresponding log files can be deleted.
+    ///
+    /// Returns `false` (no change) if `delete_end` is already below the range
+    /// first (it was cast out earlier) or the range is empty. Like JE, a
+    /// head-truncate must never remove the last sync point (matchpoint): if a
+    /// `lastSync` (`sync_vlsn`) is set and `delete_end > sync_vlsn`, the call
+    /// is refused with `false` rather than corrupting the matchpoint the
+    /// syncup protocol depends on. (JE throws `EnvironmentFailureException`;
+    /// the Rust engine reports the refusal to the caller instead of
+    /// panicking — a language/API deviation, same semantics.)
+    ///
+    /// JE: VLSNIndex.truncateFromHead / VLSNTracker.truncateFromHead /
+    /// VLSNRange.shortenFromHead
+    /// (VLSNIndex.java:700-727, VLSNTracker.java:565-640,
+    /// VLSNRange.java:241-260).
+    pub fn truncate_from_head(&self, delete_end: u64) -> bool {
+        if delete_end == 0 {
+            return false;
+        }
+        let mut buckets = self.buckets.write();
+        let mut range = self.range.write();
+
+        if range.is_empty() {
+            return false;
+        }
+        if delete_end < range.get_first() {
+            // Already cast out of the index; no change.
+            return false;
+        }
+        // Never log-clean away the last matchpoint (JE refuses this).
+        let sync = range.get_sync_vlsn();
+        if sync != 0 && delete_end > sync {
+            return false;
+        }
+
+        let new_range = range.shorten_from_head(delete_end);
+        *range = new_range;
+
+        if range.is_empty() {
+            buckets.clear();
+            return true;
+        }
+
+        let new_first = range.get_first();
+        // Drop buckets entirely covered by the delete (last_vlsn < new_first).
+        buckets.retain(|b| b.get_last_vlsn() >= new_first);
+        // Head-trim the boundary bucket if it straddles the delete point.
+        if let Some(first_bucket) = buckets.first_mut()
+            && first_bucket.get_first_vlsn() < new_first
+        {
+            first_bucket.remove_from_head(new_first);
+        }
+        true
     }
 
     /// Return the number of buckets in the index.
@@ -429,6 +557,8 @@ mod tests {
     ///   - range first/last are correct
     ///   - LTE lookup (get_lsn) returns the expected stride-boundary lsn
     ///   - VLSNs without a stride entry return the nearest lower mapped entry
+    // JE: VLSNIndexTest.testNonFlushedGets (LTE-only view; the faithful
+    // precise+approximate port is `je_index_test_gets_faithful` below).
     #[test]
     fn test_non_flushed_gets() {
         let stride = 3u32;
@@ -716,8 +846,9 @@ mod tests {
         }
     }
 
-    /// Range first/last track the actual vlsn
-    /// extremes even when insertions arrive out of order.
+    /// Range first/last track the actual vlsn extremes even when insertions
+    /// arrive out of order.
+    // JE: VLSNIndexTest.testOutOfOrderPuts (range extremes portion).
     #[test]
     fn test_range_tracks_extremes() {
         let index = VlsnIndex::new(5);
@@ -864,5 +995,497 @@ mod tests {
         assert!(index.get_lsn(1).is_some());
         assert!(index.get_lsn(2).is_some());
         assert!(index.get_lsn(3).is_some());
+    }
+
+    // =========================================================================
+    // FAITHFUL ports of VLSNIndexTest.java / VLSNIndexTruncateTest.java.
+    //
+    // Bucketing deviation: JE splits into multiple buckets at maxMappings and
+    // maxDistance; the Noxu in-memory VlsnIndex keeps a single expanding
+    // bucket per origin (documented model difference). The SET of precise
+    // (exactly stored) mappings therefore differs from JE's — JE stores each
+    // bucket's own "last" vlsn, Noxu stores the global stride grid plus the
+    // single last vlsn. These ports assert the JE ALGORITHM INVARIANTS that
+    // are independent of the split:
+    //   * getPreciseLsn returns the exact stored LSN or NULL (never an
+    //     interpolated one);
+    //   * getApproximateLsn returns the nearest preceding stored mapping
+    //     (LTE); when a precise mapping exists, precise == approximate;
+    //   * getGTELsn / getGTEBucket returns the nearest following mapping;
+    //   * put(LogItem) dispatches lastSync / lastTxnEnd by entry type.
+    // flushToDatabase is a no-op here (the index has no on-disk bucket DB),
+    // so testFlushedGets and testNonFlushedGets collapse to one port.
+    // =========================================================================
+
+    // Compute the vlsns Noxu actually stores as precise mappings for a single
+    // expanding bucket at first_vlsn=1, given `stride` and `last`: every
+    // stride boundary plus the last vlsn.
+    fn je_stored_vlsns(stride: u64, last: u64) -> Vec<u64> {
+        let mut v: Vec<u64> = (1..=last).step_by(stride as usize).collect();
+        if *v.last().unwrap() != last {
+            v.push(last);
+        }
+        v
+    }
+
+    /// JE: VLSNIndexTest.testNonFlushedGets / testFlushedGets (doGets),
+    /// faithful precise + approximate semantics.
+    #[test]
+    fn je_index_test_gets_faithful() {
+        let stride = 3u32;
+        let index = VlsnIndex::new(stride);
+        let num_entries = 25u64;
+        let file = 33u32;
+        let offset = 100u32;
+        for i in 1..=num_entries {
+            index.put(i, file, i as u32 * offset);
+        }
+
+        let range = index.get_range();
+        assert_eq!(range.get_first(), 1);
+        assert_eq!(range.get_last(), num_entries);
+
+        let stored = je_stored_vlsns(stride as u64, num_entries);
+
+        // getPreciseLsn: exact stored mapping or None.
+        for i in 1..=num_entries {
+            let precise = index.get_exact_lsn(i);
+            if stored.contains(&i) {
+                assert_eq!(
+                    precise,
+                    Some((file, i as u32 * offset)),
+                    "precise lsn for stored vlsn {}",
+                    i
+                );
+                // When a precise mapping exists, approximate (LTE) == precise.
+                assert_eq!(
+                    index.get_lsn(i),
+                    precise,
+                    "approx==precise at {}",
+                    i
+                );
+            } else {
+                assert_eq!(precise, None, "no precise mapping for vlsn {}", i);
+                // Approximate returns the nearest preceding stored vlsn.
+                let prev = *stored.iter().rfind(|&&s| s < i).unwrap();
+                assert_eq!(
+                    index.get_lsn(i),
+                    Some((file, prev as u32 * offset)),
+                    "approx lsn for vlsn {} should be stored vlsn {}",
+                    i,
+                    prev
+                );
+            }
+        }
+
+        // getGTELsn: nearest following stored mapping.
+        for i in 1..=num_entries {
+            let gte = index.get_gte_lsn(i);
+            let next = *stored.iter().find(|&&s| s >= i).unwrap();
+            assert_eq!(
+                gte,
+                Some((file, next as u32 * offset)),
+                "gte lsn for vlsn {} should be stored vlsn {}",
+                i,
+                next
+            );
+        }
+    }
+
+    /// JE: VLSNIndexTest.testOutOfOrderPuts — load vlsns 1..9 out of order,
+    /// with a commit at 2 & 4 and a Matchpoint (sync point) at 7; verify the
+    /// range's lastSync=7 and lastTxnEnd=4, and that every precise mapping
+    /// round-trips.
+    #[test]
+    fn je_index_test_out_of_order_puts_faithful() {
+        use noxu_log::LogEntryType;
+        // (vlsn, file, offset, entry_type)
+        let mappings: &[(u64, u32, u32, LogEntryType)] = &[
+            (1, 1, 0, LogEntryType::InsertLNTxn),
+            (2, 2, 100, LogEntryType::TxnCommit),
+            (3, 2, 200, LogEntryType::InsertLNTxn),
+            (4, 3, 100, LogEntryType::TxnCommit),
+            (5, 3, 200, LogEntryType::InsertLNTxn),
+            (6, 4, 100, LogEntryType::InsertLNTxn),
+            (7, 4, 200, LogEntryType::Matchpoint),
+            (8, 4, 300, LogEntryType::InsertLNTxn),
+            (9, 5, 100, LogEntryType::InsertLNTxn),
+        ];
+        let load_order: &[u64] = &[1, 2, 5, 3, 6, 4, 8, 9, 7];
+
+        let index = VlsnIndex::new(3);
+        for &v in load_order {
+            let m = mappings.iter().find(|m| m.0 == v).unwrap();
+            index.put_with_type(m.0, m.1, m.2, m.3);
+        }
+
+        let range = index.get_range();
+        assert_eq!(range.get_first(), 1);
+        assert_eq!(range.get_last(), 9);
+        // JE: loader.verify(lastSync=7, lastTxnEnd=4).
+        assert_eq!(range.get_last_sync(), 7, "lastSync should be Matchpoint@7");
+        assert_eq!(
+            range.get_last_txn_end(),
+            4,
+            "lastTxnEnd should be commit@4"
+        );
+
+        // Every precise mapping that is stored must round-trip to its exact
+        // lsn; count them (JE asserts numMappings >= minimum).
+        let mut precise_count = 0;
+        for &(v, f, off, _) in mappings {
+            if let Some(lsn) = index.get_exact_lsn(v) {
+                assert_eq!(lsn, (f, off), "precise lsn mismatch at vlsn {}", v);
+                precise_count += 1;
+            }
+        }
+        assert!(precise_count >= 4, "precise_count={} < 4", precise_count);
+    }
+
+    /// JE: VLSNIndexTest.testSR20726GTESearch — a GTE lookup for vlsn 22 must
+    /// return the mapping for vlsn 22's stored-successor and stay stable as
+    /// more mappings are appended (JE checks getGTEBucket first/last across a
+    /// concurrent flush; the flush is a no-op in the in-memory index, so we
+    /// port the stable-result invariant).
+    #[test]
+    fn je_index_test_sr20726_gte_search() {
+        let stride = 5u32;
+        let index = VlsnIndex::new(stride);
+        for i in 1u64..=25 {
+            index.put(i, 33, i as u32 * 100);
+        }
+        // stride grid from 1: 1,6,11,16,21 + last 25. GTE(22) -> the nearest
+        // stored mapping whose vlsn is >= 22. In JE's multi-bucket layout that
+        // is bucket3.last = vlsn 25; in Noxu's single expanding bucket vlsn 22
+        // is past the last stride offset (21) so it also resolves to the last
+        // vlsn (25). Assert the GTE INVARIANT: the returned mapping's vlsn is
+        // >= 22 (JE getGTELsn contract) — the exact vlsn chosen is a
+        // bucketing detail.
+        let gte_before = index.get_gte_lsn(22);
+        assert_eq!(
+            gte_before,
+            Some((33, 25 * 100)),
+            "GTE(22) resolves to vlsn 25"
+        );
+
+        // Append vlsns 26..30 (a separate bucket in JE; the same expanding
+        // bucket here). vlsn 26 lands on the stride grid (1+25), so in the
+        // single-bucket model GTE(22) now tightens to vlsn 26 — still a valid
+        // >= 22 answer (documented single-bucket deviation: JE would keep 25
+        // because its bucket boundary caps there).
+        for i in 26u64..=30 {
+            index.put(i, 34, (i - 25) as u32 * 100);
+        }
+        let gte_after = index.get_gte_lsn(22);
+        assert!(gte_after.is_some(), "GTE(22) must still resolve after append");
+        // Whatever mapping is returned, its file/offset belongs to a vlsn
+        // >= 22 (26/34/100 or 25/33/2500) — both satisfy the GTE contract.
+        assert!(
+            gte_after == Some((34, 100)) || gte_after == Some((33, 2500)),
+            "GTE(22) after append = {:?} (must be a vlsn>=22 mapping)",
+            gte_after
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // VLSNIndexTruncateTest.java — head & tail truncation.
+    // JE varies flushPoint across every vlsn; flush is a no-op here so we run
+    // the truncate-at-every-vlsn sweep once (the in-memory index has no
+    // tracker/database split to exercise). Each vlsn is in its own file.
+    // -------------------------------------------------------------------------
+
+    /// JE: VLSNIndexTruncateTest.testTailTruncate — truncate the tail at every
+    /// vlsn; after truncateFromTail(deletePoint), range.first stays 1 and
+    /// range.last == deletePoint-1 (or empty if deletePoint==first).
+    #[test]
+    fn je_index_test_tail_truncate() {
+        let first_val = 1u64;
+        let last_val = 40u64;
+        for delete_point in first_val..=last_val {
+            let index = VlsnIndex::new(5);
+            for i in first_val..=last_val {
+                index.put(i, i as u32, i as u32); // each vlsn in its own file
+            }
+            // JE truncateFromTail(deletePoint, deletePoint.lsn-1); the Noxu
+            // index-level tail truncate keeps vlsns <= deletePoint-1.
+            index.truncate_after(delete_point.saturating_sub(1));
+            let range = index.get_range();
+            if delete_point == first_val {
+                assert!(
+                    range.is_empty(),
+                    "truncating at first vlsn empties the range"
+                );
+            } else {
+                assert_eq!(range.get_first(), first_val, "first stays 1");
+                assert_eq!(
+                    range.get_last(),
+                    delete_point - 1,
+                    "last == deletePoint-1 (dp={})",
+                    delete_point
+                );
+                // Surviving vlsns resolve; truncated ones do not.
+                for i in first_val..=last_val {
+                    if i < delete_point {
+                        assert!(
+                            index.get_lsn(i).is_some(),
+                            "vlsn {} must survive (dp={})",
+                            i,
+                            delete_point
+                        );
+                    } else {
+                        assert!(
+                            !range.contains(i),
+                            "vlsn {} must be gone from range (dp={})",
+                            i,
+                            delete_point
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// JE: VLSNIndexTruncateTest.testHeadTruncateManyFiles — truncate the head
+    /// at every vlsn; after truncateFromHead(deletePoint), range.first ==
+    /// deletePoint+1 and range.last stays 40 (or empty if deletePoint==last).
+    /// Each vlsn is in its own file. (JE also flushes at every point; flush is
+    /// a no-op in the in-memory index.)
+    #[test]
+    fn je_index_test_head_truncate_many_files() {
+        let first_val = 1u64;
+        let last_val = 40u64;
+        for delete_point in first_val..=last_val {
+            let index = VlsnIndex::new(5);
+            for i in first_val..=last_val {
+                index.put(i, i as u32, i as u32);
+            }
+            // truncate_from_head refuses to remove the last matchpoint; no
+            // sync point is set here (plain LN puts), so head truncate always
+            // proceeds.
+            let changed = index.truncate_from_head(delete_point);
+            assert!(
+                changed,
+                "head truncate at {} should change range",
+                delete_point
+            );
+            let range = index.get_range();
+            if delete_point == last_val {
+                assert!(
+                    range.is_empty(),
+                    "truncating at last vlsn empties range"
+                );
+            } else {
+                assert_eq!(
+                    range.get_first(),
+                    delete_point + 1,
+                    "first == deletePoint+1 (dp={})",
+                    delete_point
+                );
+                assert_eq!(
+                    range.get_last(),
+                    last_val,
+                    "last stays {}",
+                    last_val
+                );
+                // Truncated head vlsns must no longer be in the range and must
+                // not resolve.
+                for i in first_val..=delete_point {
+                    assert!(
+                        !range.contains(i),
+                        "head vlsn {} gone (dp={})",
+                        i,
+                        delete_point
+                    );
+                    assert_eq!(
+                        index.get_lsn(i),
+                        None,
+                        "head vlsn {} lookup None (dp={})",
+                        i,
+                        delete_point
+                    );
+                }
+                // Deviation from JE: JE reconstructs a "ghost bucket" so the
+                // new first vlsn always maps (to file/0). Noxu keeps a single
+                // expanding bucket with a sparse stride grid and no ghost
+                // bucket, so a survivor resolves via get_lsn (LTE) only if it
+                // is at or after the nearest surviving stride-grid entry. We
+                // assert that at least the range boundary is correct (above)
+                // and that stride-grid survivors still resolve — the portable
+                // invariant. (See vlsn_index.rs::truncate_from_head docs.)
+                let stride = 5u64;
+                for i in (delete_point + 1)..=last_val {
+                    // The nearest stride-grid vlsn at or below i, but not below
+                    // the new range first.
+                    let grid = 1 + ((i - 1) / stride) * stride;
+                    if grid > delete_point {
+                        assert!(
+                            index.get_lsn(i).is_some(),
+                            "stride-grid survivor {} resolves (dp={})",
+                            i,
+                            delete_point
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// JE: VLSNIndexTruncateTest head/tail truncate on out-of-order mappings
+    /// (testHeadTruncateoutOfOrderMappings / testHeadTruncateSeveralFiles):
+    /// the range boundary math must hold even when the head bucket straddles
+    /// the delete point and mappings arrived out of order. We exercise the
+    /// straddling-bucket head trim directly.
+    #[test]
+    fn je_index_test_head_truncate_straddling_bucket() {
+        // Single expanding bucket vlsns 1..20 (stride 5), sequential inserts.
+        // (Out-of-order inserts below the current bucket origin spawn extra
+        // buckets — a separate concern; here we exercise the straddling head
+        // trim of one bucket.)
+        let index = VlsnIndex::new(5);
+        for v in 1u64..=20 {
+            index.put(v, 0, v as u32 * 10);
+        }
+        assert_eq!(index.bucket_count(), 1);
+
+        // Head-truncate at vlsn 7 -> new first = 8. The boundary bucket
+        // straddles the delete point and must be trimmed so vlsns 1..7 no
+        // longer resolve.
+        assert!(index.truncate_from_head(7));
+        let range = index.get_range();
+        assert_eq!(range.get_first(), 8);
+        assert_eq!(range.get_last(), 20);
+        for i in 1u64..=7 {
+            assert_eq!(index.get_lsn(i), None, "vlsn {} trimmed from head", i);
+            assert!(!range.contains(i));
+        }
+        // stride grid after trim (origin 8): 8,13,18 + last 20. Stride-grid
+        // survivors resolve; the ghost-bucket deviation (see above) means a
+        // non-grid new-first need not resolve, so we check the grid entries.
+        for i in [8u64, 13, 18, 20] {
+            assert!(index.get_lsn(i).is_some(), "grid survivor {} resolves", i);
+        }
+    }
+
+    /// truncate_from_head must refuse to clean away the last matchpoint
+    /// (JE VLSNTracker.truncateFromHead throws; the Rust engine returns
+    /// `false`).
+    #[test]
+    fn je_index_test_head_truncate_refuses_past_matchpoint() {
+        use noxu_log::LogEntryType;
+        let index = VlsnIndex::new(5);
+        for i in 1u64..=20 {
+            if i == 10 {
+                index.put_with_type(
+                    i,
+                    0,
+                    i as u32 * 10,
+                    LogEntryType::Matchpoint,
+                );
+            } else {
+                index.put(i, 0, i as u32 * 10);
+            }
+        }
+        assert_eq!(index.get_range().get_last_sync(), 10);
+
+        // Truncating at or before the matchpoint is allowed.
+        assert!(index.truncate_from_head(9), "truncate before matchpoint ok");
+        // Truncating past the matchpoint (vlsn 11 > sync 10) must be refused.
+        let before = index.get_range();
+        assert!(
+            !index.truncate_from_head(11),
+            "must refuse to clean away last matchpoint"
+        );
+        assert_eq!(
+            index.get_range(),
+            before,
+            "range unchanged after refused head truncate"
+        );
+    }
+
+    /// JE: VLSNIndexTest.testTruncateTailOutOfOrder — load mappings that
+    /// arrive out of order and leave a gap (vlsns 1..16 then 20, then 17,18,19
+    /// then 21), then truncate the tail at points inside and past the gap and
+    /// verify the range and the GTE/LTE boundary lookups (JE checkBoundaryVLSN)
+    /// stay consistent. JE additionally exercises the tracker/on-disk-database
+    /// flush split at every flush point; that split does not exist in the
+    /// in-memory index (flush is a `vlsn.idx` snapshot, not a bucket DB), so we
+    /// port the algorithmic core: out-of-order load + gap + tail truncate.
+    #[test]
+    fn je_index_test_truncate_tail_out_of_order() {
+        // (vlsn, file, offset) — JE uses file 1, offset = vlsn*10 with a gap:
+        // 1..16 in order, then 20 (early), then 17,18,19, then 21.
+        let load: &[(u64, u32, u32)] = &[
+            (1, 1, 10),
+            (2, 1, 20),
+            (3, 1, 30),
+            (4, 1, 40),
+            (5, 1, 50),
+            (6, 1, 60),
+            (7, 1, 70),
+            (8, 1, 80),
+            (9, 1, 90),
+            (10, 1, 100),
+            (11, 1, 110),
+            (12, 1, 120),
+            (13, 1, 130),
+            (14, 1, 140),
+            (15, 1, 150),
+            (16, 1, 160),
+            (20, 1, 1020),
+            (17, 1, 170),
+            (18, 1, 180),
+            (19, 1, 190),
+            (21, 1, 1021),
+        ];
+
+        // Truncate at each JE truncate point (17, 18, 19) and check the range
+        // and boundary lookups.
+        for &truncate_point in &[17u64, 18, 19] {
+            let index = VlsnIndex::new(3);
+            for &(v, f, off) in load {
+                index.put(v, f, off);
+            }
+            let range = index.get_range();
+            assert_eq!(range.get_first(), 1);
+            assert_eq!(range.get_last(), 21);
+
+            // JE truncateFromTail(truncatePoint, lsn(1,170)); the index-level
+            // equivalent keeps vlsns <= truncatePoint-1.
+            index.truncate_after(truncate_point - 1);
+            let range = index.get_range();
+            assert_eq!(range.get_first(), 1);
+            assert_eq!(
+                range.get_last(),
+                truncate_point - 1,
+                "last == truncatePoint-1 (tp={})",
+                truncate_point
+            );
+
+            // JE checkBoundaryVLSN: for every surviving vlsn, a GTE and LTE
+            // lookup must succeed (no exception / not None); truncated vlsns
+            // must be out of range.
+            for v in 16u64..truncate_point {
+                assert!(
+                    index.get_gte_lsn(v).is_some(),
+                    "GTE boundary for vlsn {} (tp={})",
+                    v,
+                    truncate_point
+                );
+                assert!(
+                    index.get_lsn(v).is_some(),
+                    "LTE boundary for vlsn {} (tp={})",
+                    v,
+                    truncate_point
+                );
+            }
+            for v in truncate_point..=21 {
+                assert!(
+                    !range.contains(v),
+                    "vlsn {} must be truncated (tp={})",
+                    v,
+                    truncate_point
+                );
+            }
+        }
     }
 }

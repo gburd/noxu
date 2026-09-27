@@ -224,8 +224,240 @@ impl VlsnBucket {
             }
         }
     }
-}
+    /// Trim this bucket's head so it no longer owns any VLSN `< new_first`,
+    /// **preserving the stride grid** so surviving stride-boundary mappings
+    /// still resolve.
+    ///
+    /// Adapted from JE `VLSNBucket.removeFromHead`. JE advances `firstVLSN` to
+    /// a stride boundary and spins any sub-stride prefix into a "remainder"
+    /// bucket by scanning the log. The Noxu in-memory index has no log to
+    /// scan and keeps a single expanding bucket per origin, so we advance
+    /// `first_vlsn` only to the **largest stride-grid vlsn `<= new_first`**
+    /// (keeping grid alignment intact) and drop the offset slots below it. Any
+    /// vlsn in `[grid_first, new_first)` that the bucket still nominally
+    /// covers is rejected by the authoritative `VlsnRange` at the index layer,
+    /// which is why the index lookups are range-gated. Non-grid survivors
+    /// between two stride boundaries resolve via LTE to the surviving lower
+    /// boundary — Noxu does not reconstruct JE's per-vlsn ghost mapping (a
+    /// documented single-bucket deviation).
+    ///
+    /// JE: VLSNBucket.removeFromHead (VLSNBucket.java:245-330), adapted.
+    pub fn remove_from_head(&mut self, new_first: u64) {
+        if new_first <= self.first_vlsn {
+            return;
+        }
+        if new_first > self.last_vlsn {
+            // Whole bucket is below the new head; collapse to empty.
+            self.first_vlsn = new_first;
+            self.last_vlsn = new_first;
+            self.offsets = vec![NO_OFFSET];
+            self.last_lsn = None;
+            return;
+        }
+        // Largest stride-grid vlsn <= new_first (keeps grid alignment).
+        let grid_first = self.first_vlsn
+            + ((new_first - self.first_vlsn) / self.stride as u64)
+                * self.stride as u64;
+        let drop =
+            ((grid_first - self.first_vlsn) / self.stride as u64) as usize;
+        if drop > 0 && drop < self.offsets.len() {
+            self.offsets.drain(0..drop);
+        } else if drop >= self.offsets.len() {
+            // All stride offsets fall below grid_first; keep just a
+            // placeholder for grid_first.
+            self.offsets = vec![NO_OFFSET];
+        }
+        self.first_vlsn = grid_first;
+        // last_vlsn / last_lsn are unchanged (always >= new_first > grid_first
+        // when the bucket straddles the delete point).
+    }
 
+    /// JE `VLSNBucket.getLsn(vlsn)`: return the LSN for an **exact** vlsn
+    /// match, or `None` if this bucket has no stored mapping for exactly
+    /// `vlsn`.
+    ///
+    /// Unlike [`Self::get_lsn`] (which is LTE — the nearest preceding
+    /// mapping), this is the strict/precise lookup used by
+    /// `ForwardVLSNScanner.getPreciseLsn`. It returns a value only when the
+    /// vlsn is the last vlsn or falls on a populated stride boundary; an
+    /// intermediate vlsn (or an out-of-order hole on a stride boundary)
+    /// returns `None`.
+    ///
+    /// JE: VLSNBucket.getLsn (VLSNBucket.java:566-596).
+    pub fn get_exact_lsn(&self, vlsn: u64) -> Option<(u32, u32)> {
+        debug_assert!(self.owns(vlsn), "get_exact_lsn on non-owned vlsn");
+        if vlsn == self.last_vlsn {
+            return self.last_lsn;
+        }
+        if !self.is_modulo(vlsn) {
+            return None;
+        }
+        let index = self.get_index(vlsn);
+        if index >= self.offsets.len() {
+            return None;
+        }
+        let offset = self.offsets[index];
+        if offset == NO_OFFSET {
+            return None;
+        }
+        Some(offset)
+    }
+
+    /// JE `VLSNBucket.getLTELsn(vlsn)`: the mapping whose vlsn is <= `vlsn`
+    /// (the nearest preceding populated mapping). Never returns `None` for a
+    /// vlsn this bucket owns, because the first offset is always populated.
+    ///
+    /// This is exactly the semantics of [`Self::get_lsn`]; provided under the
+    /// JE-faithful name so ported tests read naturally.
+    ///
+    /// JE: VLSNBucket.getLTELsn (VLSNBucket.java:614-650).
+    pub fn get_lte_lsn(&self, vlsn: u64) -> Option<(u32, u32)> {
+        self.get_lsn(vlsn)
+    }
+
+    /// JE `VLSNBucket.getGTELsn(vlsn)`: the mapping whose vlsn is >= `vlsn`
+    /// (the nearest following populated mapping). Never returns `None` for a
+    /// vlsn this bucket owns, because the last vlsn is always mapped.
+    ///
+    /// Mirrors the JE algorithm: compute the ceiling stride index
+    /// `ceil((vlsn - first_vlsn) / stride)`, clamp to `last_lsn` when the
+    /// index runs past the offsets array, then scan **forward** for the next
+    /// populated slot (accounting for out-of-order holes). A slot that is
+    /// still `NO_OFFSET` after the forward scan falls back to `last_lsn`.
+    ///
+    /// JE: VLSNBucket.getGTELsn / getGTEIndex / findPopulatedIndex
+    /// (VLSNBucket.java:391-471).
+    pub fn get_gte_lsn(&self, vlsn: u64) -> Option<(u32, u32)> {
+        if !self.owns(vlsn) {
+            return None;
+        }
+        if vlsn == self.last_vlsn {
+            return self.last_lsn;
+        }
+        // getGTEIndex: ceil division toward the next stride boundary. If
+        // vlsn <= first_vlsn (can happen for a vlsn that falls between two
+        // buckets), the index is 0.
+        let index = if vlsn <= self.first_vlsn {
+            0usize
+        } else {
+            let diff = vlsn - self.first_vlsn;
+            diff.div_ceil(self.stride as u64) as usize
+        };
+        if index >= self.offsets.len() {
+            return self.last_lsn;
+        }
+        // findPopulatedIndex forward.
+        let mut use_index = index;
+        while use_index < self.offsets.len() {
+            if self.offsets[use_index] != NO_OFFSET {
+                break;
+            }
+            use_index += 1;
+        }
+        if use_index >= self.offsets.len()
+            || self.offsets[use_index] == NO_OFFSET
+        {
+            return self.last_lsn;
+        }
+        Some(self.offsets[use_index])
+    }
+
+    /// JE `VLSNBucket.getLastLsn()`: the LSN of the last (highest) vlsn.
+    pub fn get_last_lsn(&self) -> Option<(u32, u32)> {
+        self.last_lsn
+    }
+
+    /// JE `VLSNBucket.removeFromTail(startOfDelete, prevLsn)`: remove all
+    /// mappings for vlsns `>= start_of_delete` from this bucket.
+    ///
+    /// `prev_lsn` is the LSN of `start_of_delete - 1` (i.e. the new last
+    /// mapping's LSN). If `prev_lsn` is `None` (JE's `NULL_LSN`), we don't
+    /// have a value to cap the bucket, so the bucket is cut back to the
+    /// largest known populated stride mapping (which may drop mappings
+    /// between the last stride offset and the old last vlsn).
+    ///
+    /// Mirrors the JE algorithm exactly (including the two
+    /// "between last stride and last vlsn" cases and the out-of-order-hole
+    /// handling via findPopulatedIndex).
+    ///
+    /// JE: VLSNBucket.removeFromTail (VLSNBucket.java:735-833).
+    pub fn remove_from_tail(
+        &mut self,
+        start_of_delete: u64,
+        prev_lsn: Option<(u32, u32)>,
+    ) {
+        if self.is_empty() {
+            return;
+        }
+        // Nothing to delete: the whole bucket precedes the delete point.
+        if self.last_vlsn < start_of_delete {
+            return;
+        }
+        // Delete all mappings.
+        if self.first_vlsn >= start_of_delete {
+            self.last_vlsn = self.first_vlsn;
+            self.last_lsn = None;
+            self.offsets.clear();
+            return;
+        }
+
+        // getGTEIndex(start_of_delete).
+        let diff = start_of_delete - self.first_vlsn;
+        let mut delete_index = diff.div_ceil(self.stride as u64) as usize;
+        debug_assert!(delete_index > 0, "delete_index must be > 0");
+
+        if delete_index < self.offsets.len() {
+            // start_of_delete is between first_vlsn and the last file offset.
+            if prev_lsn.is_none() {
+                let last_populated =
+                    self.find_populated_index_back(delete_index - 1);
+                if last_populated != delete_index - 1 {
+                    delete_index = last_populated + 1;
+                }
+            }
+            self.offsets.truncate(delete_index);
+        } else {
+            // start_of_delete is between the last file offset and last vlsn.
+            if prev_lsn.is_none() {
+                let last_index = self.offsets.len() - 1;
+                let last_populated = self.find_populated_index_back(last_index);
+                if last_populated < last_index {
+                    self.offsets.truncate(last_populated + 1);
+                }
+            }
+        }
+
+        // Set the new last vlsn -> last lsn mapping.
+        match prev_lsn {
+            None => {
+                self.last_vlsn = ((self.offsets.len() - 1) as u64)
+                    * (self.stride as u64)
+                    + self.first_vlsn;
+                let last_offset = self.offsets[self.offsets.len() - 1];
+                debug_assert!(last_offset != NO_OFFSET);
+                self.last_lsn = Some(last_offset);
+            }
+            Some(prev) => {
+                self.last_vlsn = start_of_delete - 1;
+                self.last_lsn = Some(prev);
+            }
+        }
+    }
+
+    /// JE `VLSNBucket.findPopulatedIndex(startIndex, forward=false)`: scan
+    /// backward from `start_index` for the first populated offset; if none is
+    /// found, return `start_index` unchanged.
+    fn find_populated_index_back(&self, start_index: usize) -> usize {
+        let mut i = start_index as isize;
+        while i >= 0 {
+            if self.offsets[i as usize] != NO_OFFSET {
+                return i as usize;
+            }
+            i -= 1;
+        }
+        start_index
+    }
+}
 impl std::fmt::Display for VlsnBucket {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -426,6 +658,8 @@ mod tests {
     ///   - stride boundaries get exact mappings; intermediate vlsns fall
     ///     back to the nearest lower stride entry
     ///   - the last vlsn in the bucket is always stored exactly
+    // JE: VLSNBucketTest.testBasic (LTE-only view; the faithful port
+    // asserting GTE too is `je_bucket_test_basic_faithful` below).
     #[test]
     fn test_basic() {
         let stride = 3u32;
@@ -509,6 +743,8 @@ mod tests {
 
     /// Vlsns inserted in
     /// non-monotonic order; ownership and LTE lookup must still be correct.
+    // JE: VLSNBucketTest.testOutOfOrderPuts (LTE-only view; faithful GTE
+    // port is `je_bucket_test_out_of_order_puts_faithful` below).
     #[test]
     fn test_out_of_order_puts_with_stride() {
         let stride = 3u32;
@@ -545,6 +781,8 @@ mod tests {
     /// Bucket with holes
     /// (out-of-order puts that leave unpopulated stride slots), checking
     /// that LTE and GTE semantics work correctly around holes.
+    // JE: VLSNBucketTest.testGetNonNullWithHoles (LTE-only view; faithful
+    // GTE+LTE port is `je_bucket_test_get_non_null_with_holes_faithful`).
     #[test]
     fn test_get_non_null_with_holes() {
         // stride=2, file=0
@@ -636,5 +874,237 @@ mod tests {
         bucket.put(9, 0, 90);
         assert_eq!(bucket.get_first_vlsn(), 5);
         assert_eq!(bucket.get_last_vlsn(), 9);
+    }
+
+    // =========================================================================
+    // FAITHFUL ports of VLSNBucketTest.java asserting the full JE access
+    // semantics: get_exact_lsn (JE getLsn), get_lte_lsn (JE getLTELsn) and
+    // get_gte_lsn (JE getGTELsn). The Noxu bucket has no hard maxMappings /
+    // maxDistance cap and accepts entries from any file (a documented
+    // deviation — Noxu constrains a bucket to one file at the index layer,
+    // not the bucket), so those refusal assertions from JE are not ported;
+    // every mapping-semantics assertion IS ported verbatim.
+    // =========================================================================
+
+    // (vlsn, file, offset) for vlsn=1..6, file=3, offset=i*10  (JE initData).
+    fn je_init_data() -> Vec<(u64, u32, u32)> {
+        (1u64..=6).map(|i| (i, 3u32, i as u32 * 10)).collect()
+    }
+
+    /// JE VLSNBucketTest.checkAccess — full get/getLTE/getGTE table for a
+    /// bucket holding vlsns 1..6 at stride 3 (stored strides: vlsn 1, 4;
+    /// last vlsn 6 always stored).
+    fn je_check_access(bucket: &VlsnBucket, vals: &[(u64, u32, u32)]) {
+        // exact stride-boundary hits (i += stride).
+        let stride = bucket.get_stride() as usize;
+        for i in (0..vals.len()).step_by(stride) {
+            let (vlsn, file, off) = vals[i];
+            assert!(bucket.owns(vlsn));
+            assert_eq!(bucket.get_exact_lsn(vlsn), Some((file, off)));
+        }
+
+        // getLTELsn table (JE checkAccess).
+        assert_eq!(bucket.get_lte_lsn(vals[0].0), Some((vals[0].1, vals[0].2)));
+        assert_eq!(bucket.get_lte_lsn(vals[1].0), Some((vals[0].1, vals[0].2)));
+        assert_eq!(bucket.get_lte_lsn(vals[2].0), Some((vals[0].1, vals[0].2)));
+        assert_eq!(bucket.get_lte_lsn(vals[3].0), Some((vals[3].1, vals[3].2)));
+        assert_eq!(bucket.get_lte_lsn(vals[4].0), Some((vals[3].1, vals[3].2)));
+        assert_eq!(bucket.get_lte_lsn(vals[5].0), Some((vals[5].1, vals[5].2)));
+
+        // getGTELsn table (JE checkAccess).
+        assert_eq!(bucket.get_gte_lsn(vals[0].0), Some((vals[0].1, vals[0].2)));
+        assert_eq!(bucket.get_gte_lsn(vals[1].0), Some((vals[3].1, vals[3].2)));
+        assert_eq!(bucket.get_gte_lsn(vals[2].0), Some((vals[3].1, vals[3].2)));
+        assert_eq!(bucket.get_gte_lsn(vals[3].0), Some((vals[3].1, vals[3].2)));
+        assert_eq!(bucket.get_gte_lsn(vals[4].0), Some((vals[5].1, vals[5].2)));
+        assert_eq!(bucket.get_gte_lsn(vals[5].0), Some((vals[5].1, vals[5].2)));
+    }
+
+    /// JE: VLSNBucketTest.testBasic (faithful — exact/LTE/GTE).
+    #[test]
+    fn je_bucket_test_basic_faithful() {
+        let vals = je_init_data();
+        let mut bucket = VlsnBucket::new(vals[0].0, 3);
+
+        assert!(bucket.is_empty());
+        assert!(bucket.put(vals[0].0, vals[0].1, vals[0].2)); // vlsn 1
+        assert!(!bucket.is_empty());
+        assert!(bucket.put(vals[1].0, vals[1].1, vals[1].2)); // vlsn 2
+
+        assert!(bucket.owns(vals[0].0));
+        assert!(bucket.owns(vals[1].0));
+        assert!(!bucket.owns(vals[2].0)); // vlsn 3 not yet in range
+
+        assert!(bucket.put(vals[2].0, vals[2].1, vals[2].2)); // vlsn 3
+
+        // JE: getGTELsn table before the bucket fills up.
+        //   only stride entry so far is vlsn 1 (index 0); last vlsn is 3.
+        assert_eq!(bucket.get_gte_lsn(vals[0].0), Some((vals[0].1, vals[0].2)));
+        // GTE(2): ceil(1/3)=index1 (empty) -> forward none -> last (vlsn3).
+        assert_eq!(bucket.get_gte_lsn(vals[1].0), Some((vals[2].1, vals[2].2)));
+        // GTE(3) == last vlsn.
+        assert_eq!(bucket.get_gte_lsn(vals[2].0), Some((vals[2].1, vals[2].2)));
+
+        // Only one stride offset stored (vlsn 1).
+        assert_eq!(bucket.len(), 1);
+
+        // Fill up: 4, 5, 6.
+        assert!(bucket.put(vals[3].0, vals[3].1, vals[3].2));
+        assert!(bucket.put(vals[4].0, vals[4].1, vals[4].2));
+        assert!(bucket.put(vals[5].0, vals[5].1, vals[5].2));
+
+        je_check_access(&bucket, &vals);
+    }
+
+    /// JE: VLSNBucketTest.testOutOfOrderPuts (faithful — exact/LTE/GTE).
+    #[test]
+    fn je_bucket_test_out_of_order_puts_faithful() {
+        let vals = je_init_data();
+        let mut bucket = VlsnBucket::new(vals[0].0, 3);
+
+        assert!(bucket.is_empty());
+        assert!(bucket.put(vals[1].0, vals[1].1, vals[1].2)); // vlsn 2 first
+        assert!(!bucket.is_empty());
+
+        assert!(bucket.owns(vals[1].0)); // vlsn 2
+        assert!(bucket.owns(vals[0].0)); // vlsn 1 (in [first,last])
+        assert!(!bucket.owns(vals[2].0)); // vlsn 3
+
+        assert!(bucket.put(vals[0].0, vals[0].1, vals[0].2)); // vlsn 1
+
+        assert!(!bucket.owns(vals[2].0));
+        assert_eq!(bucket.len(), 1);
+
+        // Fill up out of order: 5,6,3,4.
+        assert!(bucket.put(vals[4].0, vals[4].1, vals[4].2)); // 5
+        assert!(bucket.put(vals[5].0, vals[5].1, vals[5].2)); // 6
+        assert!(bucket.put(vals[2].0, vals[2].1, vals[2].2)); // 3
+        assert!(bucket.put(vals[3].0, vals[3].1, vals[3].2)); // 4
+
+        je_check_access(&bucket, &vals);
+    }
+
+    /// JE: VLSNBucketTest.testGetNonNullWithHoles (faithful — exact GTE+LTE
+    /// table with out-of-order holes, stride=2, file=0).
+    #[test]
+    fn je_bucket_test_get_non_null_with_holes_faithful() {
+        let mut bucket = VlsnBucket::new(1, 2);
+        assert!(bucket.put(1, 0, 10));
+        assert!(bucket.put(3, 0, 30));
+        // Jump to vlsn 6 -> file-offset array stays size 2 (edge case for
+        // the "too-small array" LTE/GTE handling).
+        assert!(bucket.put(6, 0, 60));
+
+        // getLTELsn table (JE).
+        assert_eq!(bucket.get_lte_lsn(1), Some((0, 10)));
+        assert_eq!(bucket.get_lte_lsn(2), Some((0, 10)));
+        assert_eq!(bucket.get_lte_lsn(3), Some((0, 30)));
+        assert_eq!(bucket.get_lte_lsn(4), Some((0, 30)));
+        assert_eq!(bucket.get_lte_lsn(5), Some((0, 30)));
+        assert_eq!(bucket.get_lte_lsn(6), Some((0, 60)));
+
+        // getGTELsn table (JE).
+        assert_eq!(bucket.get_gte_lsn(1), Some((0, 10)));
+        assert_eq!(bucket.get_gte_lsn(2), Some((0, 30)));
+        assert_eq!(bucket.get_gte_lsn(3), Some((0, 30)));
+        assert_eq!(bucket.get_gte_lsn(4), Some((0, 60)));
+        assert_eq!(bucket.get_gte_lsn(5), Some((0, 60)));
+        assert_eq!(bucket.get_gte_lsn(6), Some((0, 60)));
+    }
+
+    // Build a bucket loaded with the given (vlsn,file,offset) mappings, like
+    // JE VLSNBucketTest.loadBucket.
+    fn je_load_bucket(
+        mappings: &[(u64, u32, u32)],
+        stride: u32,
+        first_vlsn: u64,
+    ) -> VlsnBucket {
+        let mut bucket = VlsnBucket::new(first_vlsn, stride);
+        for &(vlsn, f, off) in mappings {
+            assert!(bucket.put(vlsn, f, off), "put {} rejected", vlsn);
+        }
+        bucket
+    }
+
+    /// JE: VLSNBucketTest.testRemoveFromTail. Load vlsns 10..19 at stride 3,
+    /// file 0, offset=vlsn*10, then removeFromTail at every point in
+    /// [start-1, end] and check the surviving mappings match JE's rules.
+    #[test]
+    fn je_bucket_test_remove_from_tail() {
+        let stride = 3u32;
+        let start = 10u64;
+        let end = 20u64; // exclusive (vlsns 10..=19)
+        let expected: Vec<(u64, u32, u32)> =
+            (start..end).map(|i| (i, 0u32, i as u32 * 10)).collect();
+
+        for start_delete in (start - 1)..(end + 1) {
+            let mut bucket = je_load_bucket(&expected, stride, start);
+            // prevLsn = (startDelete-1)*10 on file 0  (JE passes this).
+            let prev = ((start_delete - 1) as u32) * 10;
+            bucket.remove_from_tail(start_delete, Some((0, prev)));
+
+            for &(vlsn, f, off) in &expected {
+                let lsn = if bucket.owns(vlsn) {
+                    bucket.get_exact_lsn(vlsn)
+                } else {
+                    None
+                };
+
+                if vlsn >= start_delete {
+                    // Anything >= startDelete should be truncated.
+                    assert_eq!(
+                        lsn, None,
+                        "startDelete={} vlsn={} should be truncated",
+                        start_delete, vlsn
+                    );
+                } else if (vlsn - start).is_multiple_of(stride as u64) {
+                    // On a stride boundary -> exact mapping present.
+                    assert_eq!(
+                        lsn,
+                        Some((f, off)),
+                        "stride vlsn {} should map (startDelete={})",
+                        vlsn,
+                        start_delete
+                    );
+                } else if vlsn == start_delete - 1 {
+                    // It's the last mapping (capped by prevLsn).
+                    assert_eq!(
+                        bucket.get_last_lsn(),
+                        Some((0, prev)),
+                        "last mapping should be prevLsn"
+                    );
+                } else {
+                    // Non-stride, non-last -> no exact mapping.
+                    assert_eq!(
+                        lsn, None,
+                        "non-stride vlsn {} exact=None",
+                        vlsn
+                    );
+                }
+            }
+        }
+    }
+
+    /// JE: VLSNBucketTest.testTruncateAfterFileOffset [#20796] — truncate when
+    /// the truncation point lies between the last stored file offset and the
+    /// last vlsn.
+    #[test]
+    fn je_bucket_test_truncate_after_file_offset() {
+        // stride 5, first 10. Mappings: 10/0/10, 15/0/20, 20/0/30, and 28/0/40
+        // (25 skipped: vlsn 28 arrived out of order before 25).
+        let mappings: &[(u64, u32, u32)] =
+            &[(10, 0, 10), (15, 0, 20), (20, 0, 30), (28, 0, 40)];
+
+        // Case 1: prevLsn = NULL -> cut back to the largest stride mapping.
+        let mut bucket = je_load_bucket(mappings, 5, 10);
+        bucket.remove_from_tail(26, None);
+        assert_eq!(bucket.get_last_vlsn(), 20);
+        assert_eq!(bucket.get_last_lsn(), Some((0, 30)));
+
+        // Case 2: prevLsn = 0/33 -> cap the bucket at vlsn 25 -> 0/33.
+        let mut bucket = je_load_bucket(mappings, 5, 10);
+        bucket.remove_from_tail(26, Some((0, 33)));
+        assert_eq!(bucket.get_last_vlsn(), 25);
+        assert_eq!(bucket.get_last_lsn(), Some((0, 33)));
     }
 }
