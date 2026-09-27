@@ -119,6 +119,112 @@ pub fn run_election_with_phi(
     )
 }
 
+/// A Phase-1 Promise as seen by the proposer's value selection, faithful to
+/// JE `RankingProposer.choosePhase2Value`'s inputs.
+///
+/// JE distinguishes three buckets of promise: zero-priority (never a
+/// candidate, counted only for diagnostics), arbiter (ranking remembered but
+/// never a candidate value), and ordinary non-arbiter (a ranked candidate).
+#[derive(Debug, Clone)]
+pub struct PromiseRecord {
+    /// The suggested candidate this promise advertises.
+    pub proposal: Proposal,
+    /// True if the suggesting node cannot be master (Arbiter / Monitor /
+    /// Secondary) — JE `isArb` (suggestion NameIdPair == NULL). Such a
+    /// promise is never chosen as the value, but its ranking is remembered
+    /// for the RF=2 veto below.
+    pub is_arbiter: bool,
+}
+
+/// Outcome of choosing the Phase-2 value, mirroring JE's tri-state:
+/// a value, or `None` for the two distinct JE null cases.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Phase2Value {
+    /// A candidate was chosen (JE returns the `MasterValue`).
+    Value(Proposal),
+    /// No non-zero-priority node responded — JE increments
+    /// `phase1NoNonZeroPrio` and returns null.
+    NoNonZeroPriority,
+    /// The only non-arbiter candidate lags an arbiter's remembered ranking
+    /// (RF=2 `[#25311]`) — JE increments `phase1Arbiter` and returns null.
+    /// Electing the lagging node would lose durable data the arbiter
+    /// witnessed.
+    ArbiterVeto,
+}
+
+/// Choose the Phase-2 value from a set of Phase-1 Promises, faithful to JE
+/// `RankingProposer.choosePhase2Value` (elections/RankingProposer.java:60).
+///
+/// Rules (JE):
+///  * Zero-priority promises are never chosen (they count only toward the
+///    "no non-zero-priority node responded" diagnostic).
+///  * Arbiter promises are never chosen as the value, but their ranking is
+///    remembered for the RF=2 veto.
+///  * Among non-arbiter, non-zero-priority promises the highest ranking wins
+///    (Proposal `Ord`: dtvlsn, then vlsn, then priority, then term, name — the
+///    same total order JE's `Ranking.compareTo` + priority + socket tie-break
+///    imposes).
+///  * RF=2 veto `[#25311]`: if there is at most one non-arbiter candidate and
+///    an arbiter promised with a *strictly higher* ranking than the chosen
+///    value, the election yields no value — the sole surviving node has lost
+///    durable data the arbiter remembers, so electing it is unsafe. With two
+///    or more non-arbiters the arbiter is ignored outright.
+///
+/// The caller supplies only the promises it accepted; the proposer's own
+/// candidacy is passed as one of them.
+pub fn choose_phase2_value(promises: &[PromiseRecord]) -> Phase2Value {
+    let mut chosen: Option<Proposal> = None;
+    let mut zero_prio_nodes = 0usize;
+    let mut arb_best: Option<Proposal> = None;
+    let mut non_arb_count = 0usize;
+
+    for p in promises {
+        // JE: zero-priority promises are skipped entirely.
+        if p.proposal.priority == 0 {
+            zero_prio_nodes += 1;
+            continue;
+        }
+        if p.is_arbiter {
+            // Remember the best arbiter ranking for the RF=2 veto; never a
+            // candidate value.
+            match arb_best {
+                Some(ref cur) if !p.proposal.is_better_than(cur) => {}
+                _ => arb_best = Some(p.proposal.clone()),
+            }
+            continue;
+        }
+        non_arb_count += 1;
+        // Highest ranking wins (Proposal Ord). On an exact tie, keep the first
+        // seen — deterministic, matching JE's "consistent ordering" intent.
+        match chosen {
+            Some(ref cur) if !p.proposal.is_better_than(cur) => {}
+            _ => chosen = Some(p.proposal.clone()),
+        }
+    }
+
+    match chosen {
+        None => {
+            if zero_prio_nodes > 0 {
+                Phase2Value::NoNonZeroPriority
+            } else {
+                // No candidate at all (e.g. only arbiters). JE returns null;
+                // treat as no-non-zero-priority for the caller (no master).
+                Phase2Value::NoNonZeroPriority
+            }
+        }
+        Some(value) => {
+            // RF=2 arbiter veto [#25311].
+            if non_arb_count <= 1
+                && let Some(ref arb) = arb_best
+                && arb.is_better_than(&value)
+            {
+                return Phase2Value::ArbiterVeto;
+            }
+            Phase2Value::Value(value)
+        }
+    }
+}
+
 /// As `run_election_with_phi`, but with the node's own DTVLSN as the major
 /// election-ranking key (D2, JE Ranking(major=dtvlsn, minor=vlsn)). Production
 /// passes `ReplicatedEnvironment::get_dtvlsn()`; the legacy entry points pass
@@ -214,8 +320,10 @@ pub fn run_election_with_phi_dtvlsn(
 
     // Broadcast to all peers.
     let mut promises: Vec<Arc<dyn Channel>> = Vec::new();
-    // Track the best proposal seen in promises (for phase 2 value selection).
-    let mut best_proposal = our_proposal;
+    // Collect the Promise suggestions for JE-faithful Phase-2 value selection
+    // (choose_phase2_value). Our own candidacy is always the first record.
+    let mut promise_records: Vec<PromiseRecord> =
+        vec![PromiseRecord { proposal: our_proposal, is_arbiter: false }];
 
     let phase1_timeout = phase_timeout;
 
@@ -235,36 +343,50 @@ pub fn run_election_with_phi_dtvlsn(
                     term: peer_term,
                     dtvlsn: peer_dtvlsn,
                 })) => {
-                    // F22: a counter-proposal from a peer that cannot be
-                    // master (Arbiter / Monitor / Secondary) is treated
-                    // only as a Promise — never as a candidate value.
-                    // Otherwise an Arbiter with the highest VLSN would
-                    // win Phase 2 and wedge the cluster.
-                    //
-                    // C5/V14: a peer advertising NODE_PRIORITY 0 is likewise
-                    // not master-eligible (electable, but never chosen), so
-                    // its counter-proposal is treated only as a Promise too.
-                    let peer_can_be_master = group
-                        .get_node(&peer_name)
+                    // F22 / C5 / V14: a peer that cannot be master (Arbiter /
+                    // Monitor / Secondary) or advertises NODE_PRIORITY 0 is a
+                    // Promise but never an ordinary candidate value. We record
+                    // arbiter suggestions with `is_arbiter = true` so
+                    // `choose_phase2_value` can apply the RF=2 [#25311] veto
+                    // (an arbiter that remembers more durable data than a lone
+                    // surviving node blocks the election). A priority-0 peer's
+                    // suggestion is dropped by the zero-priority rule inside
+                    // the chooser.
+                    let peer_node = group.get_node(&peer_name);
+                    let peer_can_be_master = peer_node
+                        .as_ref()
                         .map(|n| n.can_be_master())
-                        // Unknown peer name — be conservative and do
-                        // NOT promote it.
-                        .unwrap_or(false)
-                        && peer_priority != 0;
-                    if peer_can_be_master {
-                        let peer_p = Proposal::new(
-                            peer_name,
-                            peer_vlsn,
-                            peer_priority,
-                            peer_term,
-                        )
-                        .with_dtvlsn(peer_dtvlsn);
-                        if peer_p.is_better_than(&best_proposal) {
-                            best_proposal = peer_p;
-                        }
+                        // Unknown peer name — be conservative, do NOT promote.
+                        .unwrap_or(false);
+                    // An arbiter (electable, not master-eligible by TYPE)
+                    // is the RF=2 tie-breaker whose ranking must be seen.
+                    let peer_is_arbiter = peer_node
+                        .as_ref()
+                        .map(|n| n.node_type().is_electable() && !n.can_be_master())
+                        .unwrap_or(false);
+                    let peer_p = Proposal::new(
+                        peer_name,
+                        peer_vlsn,
+                        peer_priority,
+                        peer_term,
+                    )
+                    .with_dtvlsn(peer_dtvlsn);
+                    if peer_can_be_master && peer_priority != 0 {
+                        promise_records.push(PromiseRecord {
+                            proposal: peer_p,
+                            is_arbiter: false,
+                        });
+                    } else if peer_is_arbiter {
+                        promise_records.push(PromiseRecord {
+                            proposal: peer_p,
+                            is_arbiter: true,
+                        });
                     }
-                    // Counts as a Promise either way (Arbiters DO
-                    // participate in elections — they just cannot win).
+                    // (Priority-0 non-arbiter peers contribute a Promise for
+                    // quorum but no record — the chooser's zero-priority rule
+                    // would drop them anyway; we simply do not record them.)
+                    // Counts as a Promise either way (Arbiters DO participate
+                    // in elections — they just cannot win).
                     promises.push(Arc::clone(ch));
                 }
                 _ => {
@@ -283,8 +405,24 @@ pub fn run_election_with_phi_dtvlsn(
     // -------------------------------------------------------------------------
     // Phase 2: Accept
     // -------------------------------------------------------------------------
-    // We propose the best value seen ("Value" mechanism).
-    let winner_name = best_proposal.node_name;
+    // JE-faithful value selection (RankingProposer.choosePhase2Value). The
+    // RF=2 arbiter veto and the no-non-zero-priority case both yield no value,
+    // which aborts this round (no master elected).
+    let winner_name = match choose_phase2_value(&promise_records) {
+        Phase2Value::Value(p) => p.node_name,
+        Phase2Value::ArbiterVeto => {
+            log::warn!(
+                "election: arbiter remembers more durable data than the sole                  candidate ([#25311]); no master safely electable this round"
+            );
+            return None;
+        }
+        Phase2Value::NoNonZeroPriority => {
+            log::info!(
+                "election: no non-zero-priority master candidate responded"
+            );
+            return None;
+        }
+    };
     let accept_msg =
         ProtocolMessage::ElectionResult { master: winner_name.clone(), term };
 
