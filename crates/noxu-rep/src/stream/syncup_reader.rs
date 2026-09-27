@@ -63,12 +63,47 @@ pub struct SyncupLogView {
     /// was never applied to the live tree; a non-transactional LN was). Kept
     /// out of [`VlsnEntry`] for the same reason as `txn_end_vlsns`.
     entry_types: BTreeMap<i64, u8>,
+    /// Per-VLSN details of every replicated transaction-end scanned, so the
+    /// syncup driver can report the earliest passed transaction (JE
+    /// `MatchpointSearchResults.getEarliestPassedTxn` → `PassedTxnInfo`) and
+    /// count passed commits by VLSN. Only replicated (VLSN-tagged)
+    /// commit/abort records appear here, matching JE's reader, which counts
+    /// only entries for which `entryIsReplicated()` is true.
+    passed_txns: BTreeMap<i64, PassedTxn>,
+    /// Whether the scan stepped over a checkpoint-end whose
+    /// `cleaned_files_to_delete` flag is set (JE
+    /// `MatchpointSearchResults.getPassedCheckpointEnd`, set by
+    /// `notePassedCheckpointEnd` only when
+    /// `CheckpointEnd.getCleanedFilesToDelete()` is true).
+    ///
+    /// Scan-wide (not matchpoint-relative): a checkpoint-end is not a
+    /// replicated entry and carries no VLSN, so it cannot be filtered by a
+    /// matchpoint VLSN. This mirrors the JE test's usage, where the backward
+    /// scan runs down to the bottom of the newly populated region (matchpoint
+    /// at/below the first populated VLSN) so every populated checkpoint-end is
+    /// "passed".
+    passed_checkpoint_end: bool,
     /// Highest sync-point VLSN seen (JE `VLSNRange.getLastSync`).
     last_sync: Vlsn,
     /// Highest commit/abort VLSN seen (JE `VLSNRange.getLastTxnEnd`).
     last_txn_end: Vlsn,
     /// First (lowest) VLSN available (JE `VLSNRange.getFirst`).
     first: Vlsn,
+}
+
+/// The details of a transaction-end record the syncup backward scan stepped
+/// over, mirroring JE `MatchpointSearchResults.PassedTxnInfo` (`id`, `time`,
+/// `lsn`). Used to report the *earliest* passed transaction, which the syncup
+/// driver logs for the operator and JE's `verifyRollback` uses when adjusting
+/// the passed-commit count at the matchpoint boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PassedTxn {
+    /// Transaction id (JE `PassedTxnInfo.id`).
+    pub id: i64,
+    /// Commit/abort timestamp in milliseconds (JE `PassedTxnInfo.time`).
+    pub time_ms: u64,
+    /// LSN of the transaction-end record (JE `PassedTxnInfo.lsn`).
+    pub lsn: u64,
 }
 
 impl SyncupLogView {
@@ -95,6 +130,8 @@ impl SyncupLogView {
             std::collections::BTreeSet::new();
         let mut last_sync = NULL_VLSN;
         let mut last_txn_end = NULL_VLSN;
+        let mut passed_txns: BTreeMap<i64, PassedTxn> = BTreeMap::new();
+        let mut passed_checkpoint_end = false;
 
         // ponytail: one forward O(n) pass over the log collects every
         // per-VLSN fact (lsn, fingerprint, sync-flag). JE scans backward and
@@ -116,6 +153,19 @@ impl SyncupLogView {
                     None => break, // end of written data in this file
                     Some((entry_size, vlsn_opt, type_byte, payload)) => {
                         offset += entry_size as u64;
+                        // A checkpoint-end (JE `LOG_CKPT_END`) is not
+                        // replicated and carries no VLSN, so it would be
+                        // dropped by the `continue` below. But JE's reader
+                        // reads it anyway (`isTargetEntry` returns true for
+                        // CKPT_END) to note whether a rollback-blocking
+                        // checkpoint was passed. Inspect its
+                        // `cleaned_files_to_delete` flag here.
+                        if noxu_log::LogEntryType::from_type_num(type_byte)
+                            == Some(noxu_log::LogEntryType::CkptEnd)
+                            && ckpt_end_cleaned_files(&payload)
+                        {
+                            passed_checkpoint_end = true;
+                        }
                         let Some(vlsn) = vlsn_opt else { continue };
                         let lsn = noxu_util::Lsn::new(file_num, {
                             // offset before this entry (we just advanced)
@@ -155,6 +205,20 @@ impl SyncupLogView {
                             if v > last_txn_end {
                                 last_txn_end = v;
                             }
+                            // JE `notePassedCommits`/`notePassedAborts`: record
+                            // the txn id + timestamp so the earliest passed
+                            // txn can be reported. The payload layout is the
+                            // `TxnEnd` header (id:i64 BE, timestamp:u64 BE,
+                            // last_lsn:u64 BE, ...), identical for commit and
+                            // abort.
+                            if let Some((id, time_ms)) =
+                                txn_end_id_and_time(&payload)
+                            {
+                                passed_txns.insert(
+                                    vlsn as i64,
+                                    PassedTxn { id, time_ms, lsn },
+                                );
+                            }
                         }
                     }
                 }
@@ -168,6 +232,8 @@ impl SyncupLogView {
             entries,
             txn_end_vlsns,
             entry_types,
+            passed_txns,
+            passed_checkpoint_end,
             last_sync,
             last_txn_end,
             first,
@@ -202,6 +268,21 @@ impl SyncupLogView {
     pub fn num_passed_commits(&self, matchpoint: Vlsn) -> u64 {
         let floor = matchpoint.sequence();
         self.txn_end_vlsns.range((floor + 1)..).count() as u64
+    }
+
+    /// Whether a checkpoint-end with `cleaned_files_to_delete` set was scanned
+    /// (JE `MatchpointSearchResults.getPassedCheckpointEnd`). Scan-wide; see
+    /// the field doc for why it is not matchpoint-relative.
+    pub fn passed_checkpoint_end(&self) -> bool {
+        self.passed_checkpoint_end
+    }
+
+    /// The earliest (lowest-VLSN) replicated transaction end scanned strictly
+    /// above `matchpoint` (JE `MatchpointSearchResults.getEarliestPassedTxn`).
+    /// `None` if no replicated txn end was passed.
+    pub fn earliest_passed_txn(&self, matchpoint: Vlsn) -> Option<PassedTxn> {
+        let floor = matchpoint.sequence();
+        self.passed_txns.range((floor + 1)..).next().map(|(_, t)| *t)
     }
 
     /// All VLSN→[`VlsnEntry`] pairs, ascending. Used by the feeder side of the
@@ -294,6 +375,31 @@ impl SyncupView for VlsnIndexView {
             self.lsn_fingerprint(vlsn.sequence())?;
         Some(VlsnEntry { lsn, fingerprint, is_sync })
     }
+}
+
+/// Extract the transaction id and commit/abort timestamp from a `TxnEnd`
+/// payload (JE `TxnCommit`/`TxnAbort` main item). Layout: `id:i64 BE`,
+/// `timestamp_ms:u64 BE`, then `last_lsn`/`master_id`/`dtvlsn`. Returns `None`
+/// if the payload is too short.
+fn txn_end_id_and_time(payload: &[u8]) -> Option<(i64, u64)> {
+    if payload.len() < 16 {
+        return None;
+    }
+    let id = i64::from_be_bytes(payload[0..8].try_into().ok()?);
+    let time_ms = u64::from_be_bytes(payload[8..16].try_into().ok()?);
+    Some((id, time_ms))
+}
+
+/// Read the `cleaned_files_to_delete` flag from a `CheckpointEnd` payload by
+/// decoding it with the owning crate's reader (JE
+/// `CheckpointEnd.getCleanedFilesToDelete()`). The flag lives after the
+/// variable-length invoker string, so it cannot be read at a fixed offset;
+/// `CheckpointEnd::read_from_log` handles the layout (and the v1/v2 trailer).
+/// Returns false if the payload does not decode as a checkpoint-end.
+fn ckpt_end_cleaned_files(payload: &[u8]) -> bool {
+    noxu_recovery::CheckpointEnd::read_from_log(payload)
+        .map(|c| c.get_cleaned_files_to_delete())
+        .unwrap_or(false)
 }
 
 /// Read the raw header+payload at `(file_num, offset)`.
@@ -402,6 +508,8 @@ mod tests {
             entries,
             txn_end_vlsns,
             entry_types: BTreeMap::new(),
+            passed_txns: BTreeMap::new(),
+            passed_checkpoint_end: false,
             last_sync: Vlsn::new(5),
             last_txn_end: Vlsn::new(5),
             first: Vlsn::new(1),
@@ -427,6 +535,8 @@ mod tests {
             entries: BTreeMap::new(),
             txn_end_vlsns: std::collections::BTreeSet::new(),
             entry_types,
+            passed_txns: BTreeMap::new(),
+            passed_checkpoint_end: false,
             last_sync: Vlsn::new(7),
             last_txn_end: Vlsn::new(4),
             first: Vlsn::new(1),
@@ -588,5 +698,262 @@ mod tests {
         let view = SyncupLogView::scan(dir.path())
             .expect("scan must open a FileManager for an existing directory");
         assert_eq!(view.first_vlsn(), NULL_VLSN);
+    }
+    // ── ReplicaSyncupReaderTest (JE) ────────────────────────────────────
+    //
+    // Port of com.sleepycat.je.rep.stream.ReplicaSyncupReaderTest. The JE test
+    // populates a real replicated log with a controlled mix of checkpoint-end
+    // and commit records (some replicated, some not), scans it backward with a
+    // ReplicaSyncupReader, and asserts the MatchpointSearchResults counters:
+    //   - getNumPassedCommits()   — only REPLICATED commits are counted;
+    //   - getPassedCheckpointEnd()— true iff a CKPT_END with
+    //                               cleanedFilesToDelete was passed;
+    //   - getEarliestPassedTxn()  — {id, time, lsn} of the earliest passed txn.
+    //
+    // Noxu's `SyncupLogView` is the equivalent backward-scan bookkeeping
+    // (num_passed_commits / passed_checkpoint_end / earliest_passed_txn). We
+    // reproduce the JE fixture by writing the same entry mix to a real log via
+    // the FileManager and scanning it, so the same invariants the JE test
+    // guards (non-replicated commits ignored; checkpoint-end noted only when it
+    // cleans files; earliest passed txn recorded) are exercised end to end.
+    //
+    // Deviation from the JE mechanism (documented): JE assigns VLSNs through the
+    // live replication write path and bounds the backward scan with finishLSN.
+    // Noxu writes a fresh log containing ONLY the fixture entries, so the whole
+    // log IS the "newly populated" region and the matchpoint is the bottom
+    // (NULL) — identical in effect to JE's finishLSN bound. Non-replicated
+    // entries are written WITHOUT a VLSN (JE ReplicationContext.NO_REPLICATE),
+    // which is exactly why the reader must count them out.
+
+    use noxu_log::LogEntryType;
+    use noxu_log::{LogEntryHeader, Provisional};
+    use noxu_txn::TxnCommit;
+
+    /// Append one log entry (header + payload) at `offset` in file 0, returning
+    /// the offset past it. `vlsn = Some(_)` marks the entry replicated (JE
+    /// ReplicationContext.MASTER); `None` marks it non-replicated
+    /// (NO_REPLICATE) — no VLSN in the header, so the syncup reader ignores it
+    /// for commit-counting, exactly as JE's `entryIsReplicated()` gate does.
+    fn append_entry(
+        fm: &FileManager,
+        offset: u64,
+        entry_type: LogEntryType,
+        vlsn: Option<Vlsn>,
+        payload: &[u8],
+    ) -> u64 {
+        let mut header = LogEntryHeader::new(
+            entry_type,
+            payload.len() as u32,
+            Provisional::No,
+            vlsn.is_some(),
+            vlsn,
+        );
+        let mut buf = Vec::new();
+        header.write_to_log(&mut buf).unwrap();
+        buf.extend_from_slice(payload);
+        // Fill in prev_offset/vlsn/checksum. The syncup reader does not
+        // validate the checksum, but a real record carries one, so compute it.
+        let checksum = crc32fast::hash(&buf[4..]);
+        header
+            .add_post_marshalling_info(&mut buf, 0, vlsn, checksum)
+            .unwrap();
+        fm.write_buffer_to_file(0, &buf, offset).unwrap();
+        offset + buf.len() as u64
+    }
+
+    /// Serialize a `TxnCommit` main-item payload (the `TxnEnd` header the
+    /// syncup reader parses for id/timestamp).
+    fn commit_payload(id: i64) -> Vec<u8> {
+        let mut buf = Vec::new();
+        // last_lsn/master_id/dtvlsn are irrelevant to the reader's id/time
+        // extraction; use plausible values.
+        TxnCommit::new(id, 1, 1, 1).write_to_log(&mut buf);
+        buf
+    }
+
+    /// Serialize a `CheckpointEnd` payload with the given
+    /// `cleaned_files_to_delete` flag (the flag JE keys `passedCheckpointEnd`
+    /// on).
+    fn ckpt_end_payload(cleaned_files_to_delete: bool) -> Vec<u8> {
+        let ckpt = noxu_recovery::CheckpointEnd::new(
+            1,
+            "test",
+            noxu_util::Lsn::from_u64(0),
+            None,
+            noxu_util::Lsn::from_u64(0),
+            0u64,
+            0i64,
+            0u64,
+            0i64,
+            0u64,
+            0i64,
+            cleaned_files_to_delete,
+        );
+        let mut buf = Vec::new();
+        ckpt.write_to_log(&mut buf).unwrap();
+        buf
+    }
+
+    /// Open a writable FileManager over a fresh env dir and return it with the
+    /// first-entry offset for file 0.
+    fn fresh_log(dir: &Path) -> (FileManager, u64) {
+        let fm = FileManager::new(dir, false, 256 * 1024 * 1024, 32)
+            .expect("writable FileManager");
+        // Force file 0 to exist with its header by writing a zero-length entry
+        // region: the first real append creates + headers the file.
+        let header_size =
+            noxu_log::file_header::on_disk_size(LOG_FILE_VERSION) as u64;
+        (fm, header_size)
+    }
+
+    /// JE ReplicaSyncupReaderTest.testRepAndNonRepCommits: a CKPT_END (cleans
+    /// files) then a NON-replicated commit (txn 10) then a REPLICATED commit
+    /// (txn 20). Expected: numPassedCommits=1 (only the replicated txn 20),
+    /// passedCheckpointEnd=true, earliestTxnId=20.
+    #[test]
+    fn test_rep_and_non_rep_commits() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (fm, mut off) = fresh_log(dir.path());
+
+        // CKPT_END, cleanedFilesToDelete=true, NOT replicated (no VLSN).
+        off = append_entry(
+            &fm,
+            off,
+            LogEntryType::CkptEnd,
+            None,
+            &ckpt_end_payload(true),
+        );
+        // Commit txn 10, NOT replicated → must be ignored by the reader.
+        off = append_entry(
+            &fm,
+            off,
+            LogEntryType::TxnCommit,
+            None,
+            &commit_payload(10),
+        );
+        // Commit txn 20, replicated (VLSN 1) → the only passed commit.
+        let _ = append_entry(
+            &fm,
+            off,
+            LogEntryType::TxnCommit,
+            Some(Vlsn::new(1)),
+            &commit_payload(20),
+        );
+
+        let view = SyncupLogView::scan_with_manager(&fm);
+
+        // Only the replicated commit is counted (matchpoint at the bottom).
+        assert_eq!(
+            view.num_passed_commits(NULL_VLSN),
+            1,
+            "only the replicated commit (txn 20) is counted; the \
+             non-replicated commit (txn 10) is ignored"
+        );
+        // The checkpoint-end cleaned files → passed-checkpoint-end noted.
+        assert!(
+            view.passed_checkpoint_end(),
+            "a CKPT_END with cleaned_files_to_delete must be noted"
+        );
+        // Earliest (only) passed txn is txn 20.
+        let earliest =
+            view.earliest_passed_txn(NULL_VLSN).expect("one passed txn");
+        assert_eq!(earliest.id, 20, "earliest passed txn id");
+    }
+
+    /// JE ReplicaSyncupReaderTest.testMultipleCkpts: two CKPT_END records that
+    /// do NOT clean files, bracketing two REPLICATED commits (txn 10, txn 20).
+    /// Expected: numPassedCommits=2, passedCheckpointEnd=false,
+    /// earliestTxnId=10.
+    #[test]
+    fn test_multiple_ckpts() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (fm, mut off) = fresh_log(dir.path());
+
+        // Ckpt A — does NOT clean files.
+        off = append_entry(
+            &fm,
+            off,
+            LogEntryType::CkptEnd,
+            None,
+            &ckpt_end_payload(false),
+        );
+        // Commit A (txn 10), replicated at VLSN 1 → earliest passed txn.
+        off = append_entry(
+            &fm,
+            off,
+            LogEntryType::TxnCommit,
+            Some(Vlsn::new(1)),
+            &commit_payload(10),
+        );
+        // Commit B (txn 20), replicated at VLSN 2.
+        off = append_entry(
+            &fm,
+            off,
+            LogEntryType::TxnCommit,
+            Some(Vlsn::new(2)),
+            &commit_payload(20),
+        );
+        // Ckpt B — does NOT clean files.
+        let _ = append_entry(
+            &fm,
+            off,
+            LogEntryType::CkptEnd,
+            None,
+            &ckpt_end_payload(false),
+        );
+
+        let view = SyncupLogView::scan_with_manager(&fm);
+
+        assert_eq!(
+            view.num_passed_commits(NULL_VLSN),
+            2,
+            "both replicated commits (txn 10 and txn 20) are counted"
+        );
+        assert!(
+            !view.passed_checkpoint_end(),
+            "neither CKPT_END cleaned files, so passed-checkpoint-end is false"
+        );
+        let earliest =
+            view.earliest_passed_txn(NULL_VLSN).expect("two passed txns");
+        assert_eq!(
+            earliest.id, 10,
+            "earliest passed txn is the lowest-VLSN one (txn 10)"
+        );
+    }
+
+    /// Guard against a vacuous port: prove the reader ACTUALLY excludes
+    /// non-replicated commits (would-count-them regression would flip this).
+    /// A log of three commits, only the middle one replicated, must report
+    /// exactly one passed commit — with the replicated one's id.
+    #[test]
+    fn test_non_replicated_commits_are_not_counted() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (fm, mut off) = fresh_log(dir.path());
+
+        off = append_entry(
+            &fm,
+            off,
+            LogEntryType::TxnCommit,
+            None,
+            &commit_payload(100),
+        );
+        off = append_entry(
+            &fm,
+            off,
+            LogEntryType::TxnCommit,
+            Some(Vlsn::new(1)),
+            &commit_payload(200),
+        );
+        let _ = append_entry(
+            &fm,
+            off,
+            LogEntryType::TxnCommit,
+            None,
+            &commit_payload(300),
+        );
+
+        let view = SyncupLogView::scan_with_manager(&fm);
+        assert_eq!(view.num_passed_commits(NULL_VLSN), 1);
+        assert_eq!(view.earliest_passed_txn(NULL_VLSN).unwrap().id, 200);
     }
 }
