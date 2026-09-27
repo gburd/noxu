@@ -221,6 +221,23 @@ what won't be done and why.
 - **T-16 — `CountEstimator` sampling count:** Noxu returns EXACT record counts,
   which is stronger than JE's sampled estimate — implementing sampling would be
   a regression, so it is deliberately not done.
+- **LDIFF — rolling-hash block-level database diff (`je.rep.util.ldiff`):**
+  JE's LDIFF compares two databases with an rsync-style rolling Adler32
+  checksum over fixed-size record blocks (`Window`, `Block`, `BlockBag`,
+  `LDiff`, `LDiffService`, and a dedicated `Protocol` carrying `DbBlocks` /
+  `BlockInfo` / `RemoteDiffRequest` messages) to transfer only the differing
+  regions. Noxu does not implement it. Network restore instead uses a
+  **whole-file copy** — `[file_count][name_len][name][file_size][file bytes]`
+  in 64 KiB chunks with a per-file CRC32 trailer (not Adler32; the
+  project-wide checksum deviation) — which needs no block-hash surface. There
+  are therefore no `Block` / `BlockBag` / `Window` / rolling-checksum types in
+  any Noxu crate, and the rolling checksum is deliberately not ported as a
+  reference primitive (unlike the `je.utilint` stat primitives, which have
+  live Noxu callers): it has zero callers here and depends on the omitted
+  Adler32, so a port would be dead code. Consequently the entire
+  `je.rep.util.ldiff` test surface (37 `@Test` across `BlockBagTest`,
+  `LDiffServiceTest`, `LDiffTest`, `WindowTest`, and the ldiff `ProtocolTest`,
+  plus two empty JUnit placeholders) is **N/A by design**.
 
 (Implemented in 7.1 and moved out of this list: **L-3** debug-build
 latch-ordering assertion, **`exception_listener`**, **stats-file dump**
