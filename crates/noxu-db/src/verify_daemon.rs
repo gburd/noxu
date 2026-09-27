@@ -304,6 +304,17 @@ fn utc_fields(epoch_secs: u64) -> (u32, u32, u32, u32, u32) {
 
 #[cfg(test)]
 mod tests {
+    // JE: LogFileCorruptionTest.testConfig / testConfigChange verify that the
+    // VERIFY_SCHEDULE cron string is parsed and drives WHEN the data verifier
+    // runs (JE asserts DataVerifier.getVerifyDelay / getVerifyInterval /
+    // getVerifyTask, i.e. the ms-until-next-fire + repeat-interval of a
+    // java.util.Timer TimerTask).  Noxu implements the schedule with a
+    // per-minute POLL (`should_run_now` + `matches_epoch_secs`) rather than a
+    // TimerTask, so it has no delay/interval to assert; the equivalent and
+    // portable behavior -- "the parsed cron matches exactly the intended
+    // minutes and fires once per matching minute" -- is what these tests cover.
+    // The getVerifyDelay/getVerifyInterval/getVerifyTask assertions are N/A
+    // (TimerTask-model internals; see tp-je-util report).
     use super::*;
 
     // Known epoch instants (UTC) to validate the civil-date decode.

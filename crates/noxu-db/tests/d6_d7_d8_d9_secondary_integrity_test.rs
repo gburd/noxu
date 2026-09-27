@@ -96,6 +96,11 @@ fn open_sec(
 
 // ── D6: duplicate (sec_key, pri_key) insert → integrity error ────────────────
 //
+// JE: BtreeCorruptionTest.testWith[out]VerifierPrimaryRecordDoesNotExist
+// (on-access half): when the primary and secondary indexes disagree, the
+// secondary access raises SecondaryIntegrityException.  Noxu detects this
+// on-access (here), NOT via a scheduled BtreeVerifier that invalidates the
+// env — see tp-je-util report for the verifier-detection deviation.
 // JE SecondaryDatabase.insertSecKey() KEYEXIST on fully-populated DB.
 // Two primaries where the first is inserted with the same (sec_key, pri_key)
 // pair already present → SecondaryIntegrityException.
@@ -182,6 +187,10 @@ fn d9_overwrite_changing_sec_key_removes_old_entry() {
 
 // ── D8: secondary cursor dirty-read, missing primary → skip (NotFound) ────────
 //
+// JE: BtreeCorruptionTest.testWith[out]VerifierForeignRecordDoesNotExist /
+// the traverseOneDb "safe record" path -- reading past an orphaned index
+// entry whose primary is gone.  A READ_UNCOMMITTED secondary read skips it
+// (NotFound) rather than raising, matching JE's dirty-read behavior.
 // When the primary is deleted but the secondary still has an orphaned entry,
 // a dirty-read cursor should return NotFound (skip), not raise
 // SecondaryIntegrityException.
@@ -249,6 +258,12 @@ fn d8_dirty_read_missing_primary_skips_record() {
 // JE SecondaryDatabase.deleteSecKey() missing-entry on fully-populated DB.
 // update_secondary(old=Some(data), new=None) when the entry doesn't exist
 // in the secondary → SecondaryIntegrityException.
+/// JE: BtreeCorruptionTest.testWith[out]VerifierSecondaryRecordDoesNotExist
+/// (on-access half): the primary record contains a key not present in the
+/// secondary index -> SecondaryIntegrityException on the secondary access.
+/// Noxu detects this on-access; the scheduled-verifier detection + je.info
+/// WARNING count + isCorrupted() transition JE also asserts are not
+/// implemented (advisory-logging verifier) -- see tp-je-util report.
 #[test]
 fn d7_missing_sec_entry_on_delete_raises_integrity_error() {
     let dir = TempDir::new().unwrap();
