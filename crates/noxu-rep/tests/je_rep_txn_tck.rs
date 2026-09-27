@@ -25,10 +25,13 @@ use noxu_rep::{NodeState, NodeType};
 /// JE: `CommitTokenTest.testBasic`.
 ///
 /// "Commit tokens are totally ordered by their VLSN within a group."
-/// Noxu does not yet expose a `CommitToken` type (issue: noxu-rep does
-/// not return commit tokens from txn.commit), but the underlying
-/// invariant — that successive commits on the master produce strictly
-/// increasing VLSNs — is observable via [`RepTestBase::populate_db`].
+/// The `CommitToken` VALUE semantics of `CommitTokenTest.testBasic`
+/// (ordering by VLSN within a group; cross-group comparison rejected) are
+/// ported directly in `noxu_rep::commit_token`'s unit tests
+/// (`commit_token_test_basic_ordering`). This stream-level companion
+/// asserts the complementary end-to-end invariant that the token source —
+/// successive master commits — produces strictly increasing VLSNs,
+/// observable via [`RepTestBase::populate_db`].
 #[test]
 fn commit_token_vlsns_are_strictly_increasing() {
     let mut group = RepTestBase::builder("ct_basic").group_size(2).build();
@@ -282,15 +285,20 @@ fn rollback_old_master_rejoins_as_replica() {
 }
 
 // =====================================================================
-// LockPreemptionTest — `je.rep.txn.LockPreemptionTest`
+// Shutdown-env safety (LockPreemptionTest.testPreempted is ported at the
+// lock-manager level in noxu-txn/tests/je_lock_preemption_tck.rs)
 // =====================================================================
 
-/// JE: `LockPreemptionTest.testPreempted`.
+/// JE: `ExceptionTest.test` (operations on a shut-down env return a
+/// well-defined error, not a panic/corruption).
 ///
-/// "A txn whose read-lock has been preempted by a replication-stream
-/// invalidation receives a `LockPreemptedException` on its next
-/// access."  In the harness, the analog is: an `apply_entry` on a node
-/// that has been transitioned to `Shutdown` returns an error.
+/// NOTE: the `LockPreemptionTest.testPreempted` family is ported faithfully
+/// at the lock-manager level in
+/// `noxu-txn/tests/je_lock_preemption_tck.rs` (the importunate steal — the
+/// master's replicated write preempting a replica reader). This harness
+/// test instead pins the adjacent safety property that an `apply_entry` on
+/// a node transitioned to `Shutdown` returns an error rather than
+/// panicking.
 #[test]
 fn apply_entry_on_shutdown_env_fails() {
     let mut group = RepTestBase::builder("lp_preempt").group_size(2).build();
