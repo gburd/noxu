@@ -159,11 +159,7 @@ fn assert_all_cases(
     for &(k1, k2, k3, expect) in JOIN_CASES {
         let found = do_join(sec1, sec2, sec3, k1, k2, k3);
         let want = expect.to_vec();
-        assert_eq!(
-            found, want,
-            "join({}, {}, {}) mismatch",
-            k1, k2, k3
-        );
+        assert_eq!(found, want, "join({}, {}, {}) mismatch", k1, k2, k3);
     }
 }
 

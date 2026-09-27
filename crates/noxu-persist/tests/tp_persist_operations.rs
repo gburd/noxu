@@ -50,10 +50,7 @@ impl EntitySerializer<MyEntity> for MyEntitySer {
     }
 }
 
-fn open() -> (
-    TempDir,
-    Environment,
-) {
+fn open() -> (TempDir, Environment) {
     let td = TempDir::new().unwrap();
     let env = Environment::open(
         EnvironmentConfig::new(td.path().to_path_buf()).with_allow_create(true),
@@ -166,8 +163,12 @@ fn operation_test_secondary_populated_on_open() {
         let pri: PrimaryIndex<i32, MyEntity> =
             store.get_primary_index().unwrap();
         for pk in 1..=5 {
-            pri.put(None, ser.as_ref(), &MyEntity { pri_key: pk, sec_key: pk % 2 })
-                .unwrap();
+            pri.put(
+                None,
+                ser.as_ref(),
+                &MyEntity { pri_key: pk, sec_key: pk % 2 },
+            )
+            .unwrap();
         }
     }
 
