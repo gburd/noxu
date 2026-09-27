@@ -347,22 +347,37 @@ mod tests {
     #[test]
     fn test_je_offset_test_offsets_pack_sorts() {
         // JE OffsetTest.testOffsets value set (those within u32 range).
-        let base: Vec<u32> =
-            vec![1, 2, 0xfffe, 0xffff, 0xfffff, i32::MAX as u32 - 1, i32::MAX as u32];
+        let base: Vec<u32> = vec![
+            1,
+            2,
+            0xfffe,
+            0xffff,
+            0xfffff,
+            i32::MAX as u32 - 1,
+            i32::MAX as u32,
+        ];
         let mut sorted = base.clone();
         sorted.sort_unstable();
 
         // Forward order.
         let mut packed = PackedOffsets::new();
         packed.pack(&base);
-        assert_eq!(packed.unpack(), sorted, "forward order must pack to sorted");
+        assert_eq!(
+            packed.unpack(),
+            sorted,
+            "forward order must pack to sorted"
+        );
 
         // Reversed order.
         let mut rev = base.clone();
         rev.reverse();
         let mut packed = PackedOffsets::new();
         packed.pack(&rev);
-        assert_eq!(packed.unpack(), sorted, "reversed order must pack to sorted");
+        assert_eq!(
+            packed.unpack(),
+            sorted,
+            "reversed order must pack to sorted"
+        );
 
         // A shuffled order (deterministic swap, no rng dep).
         let mut shuf = base.clone();
@@ -370,6 +385,10 @@ mod tests {
         shuf.swap(1, 4);
         let mut packed = PackedOffsets::new();
         packed.pack(&shuf);
-        assert_eq!(packed.unpack(), sorted, "shuffled order must pack to sorted");
+        assert_eq!(
+            packed.unpack(),
+            sorted,
+            "shuffled order must pack to sorted"
+        );
     }
 }

@@ -410,14 +410,14 @@ mod tests {
         //                       : diskFree-freeDisk
         let cases: &[(u64, u64, u64, u64, bool)] = &[
             // freeDisk only (maxDisk=0): avail = diskFree - freeDisk.
-            (5, 0, 20, 0, false),  // 20-5=15 > 0 -> ok
-            (25, 0, 5, 0, true),   // 5-25=-20 <= 0 -> violated
-            (30, 0, 5, 0, true),   // 5-30=-25 <= 0 -> violated
+            (5, 0, 20, 0, false), // 20-5=15 > 0 -> ok
+            (25, 0, 5, 0, true),  // 5-25=-20 <= 0 -> violated
+            (30, 0, 5, 0, true),  // 5-30=-25 <= 0 -> violated
             // maxDisk cap governs: avail = min(diskFree-freeDisk, maxDisk-total)
             (5, 100, 20, 50, false), // min(15, 50) = 15 > 0 -> ok
             (25, 100, 20, 95, true), // min(-5, 5) = -5 <= 0 -> violated (freeDisk)
-            (5, 80, 20, 80, true),   // min(15, 0) = 0 <= 0 -> violated (maxDisk)
-            (5, 80, 20, 79, false),  // min(15, 1) = 1 > 0 -> ok
+            (5, 80, 20, 80, true), // min(15, 0) = 0 <= 0 -> violated (maxDisk)
+            (5, 80, 20, 79, false), // min(15, 1) = 1 > 0 -> ok
         ];
         for &(free_disk, max_disk, disk_free, total, expect) in cases {
             let t = DiskLimitTracker::new(max_disk, free_disk, 0, None);

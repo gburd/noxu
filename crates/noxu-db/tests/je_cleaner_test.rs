@@ -136,8 +136,7 @@ fn total_obsolete_ins(env: &Environment) -> i64 {
 /// contract requires point-get, not cursor-scan, for data claims).
 fn exists(db: &noxu_db::Database, key: &[u8]) -> bool {
     let mut val = DatabaseEntry::new();
-    db.get_into(None, DatabaseEntry::from_bytes(key), &mut val)
-        .unwrap()
+    db.get_into(None, DatabaseEntry::from_bytes(key), &mut val).unwrap()
 }
 
 // ===========================================================================
@@ -422,7 +421,7 @@ fn util_update_obsoletes_prior_version() {
     env.compress().unwrap();
 
     assert!(
-        total_obsolete_lns(&env) >= base + 1,
+        total_obsolete_lns(&env) > base,
         "update must obsolete the prior LN version: base {base}, now {}",
         total_obsolete_lns(&env)
     );
@@ -457,7 +456,7 @@ fn util_delete_obsoletes_record() {
     env.compress().unwrap();
 
     assert!(
-        total_obsolete_lns(&env) >= base + 1,
+        total_obsolete_lns(&env) > base,
         "delete must obsolete the record's LN: base {base}, now {}",
         total_obsolete_lns(&env)
     );
@@ -484,7 +483,7 @@ fn util_insert_update_same_txn() {
     env.compress().unwrap();
 
     assert!(
-        total_obsolete_lns(&env) >= base + 1,
+        total_obsolete_lns(&env) > base,
         "insert+update in one txn must obsolete the superseded version"
     );
     let mut val = DatabaseEntry::new();
@@ -514,7 +513,7 @@ fn util_insert_delete_same_txn() {
     env.compress().unwrap();
 
     assert!(
-        total_obsolete_lns(&env) >= base + 1,
+        total_obsolete_lns(&env) > base,
         "insert+delete in one txn must leave the inserted LN obsolete"
     );
     assert!(!exists(&db, &ikey(0)));
