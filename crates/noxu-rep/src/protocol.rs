@@ -429,10 +429,113 @@ mod tests {
     use super::*;
 
     /// Helper: encode then decode, assert round-trip equality.
+    ///
+    /// This is the per-message form of JE `ProtocolTest.testBasic`'s
+    /// wireFormat -> read -> match round-trip; the individual
+    /// `test_*_round_trip` tests below each cover one message type, and
+    /// `test_all_variants_round_trip_and_match` covers the whole set at
+    /// once.
     fn round_trip(msg: &ProtocolMessage) {
         let encoded = msg.encode();
         let decoded = ProtocolMessage::decode(&encoded).unwrap();
         assert_eq!(*msg, decoded);
+    }
+
+    /// JE: ProtocolTest.testBasic — the exhaustive "round-trip every message
+    /// type and confirm the decoded message matches the original" check. JE
+    /// builds one instance of every `Protocol` message, serializes each via
+    /// `wireFormat()`, reads it back with `protocol.read(TestChannel(..))`, and
+    /// asserts `newMessage.match(original)`. This test is the Noxu equivalent
+    /// over every `ProtocolMessage` variant (the streaming/group/election
+    /// message set Noxu implements). The syncup message set (Entry/EntryRequest/
+    /// EntryNotFound/AlternateMatchpoint/StartStream/RestoreRequest/
+    /// RestoreResponse) is round-tripped by `syncup_protocol::tests::
+    /// test_msg_roundtrip`.
+    ///
+    /// Deviation (documented): Noxu has no multi-version wire protocol, so the
+    /// JE version-negotiation / JE-version-handshake / SNTP time-sync /
+    /// batch-ack / re-authenticate messages (ReplicaProtocolVersion,
+    /// FeederProtocolVersion, ReplicaJEVersions, FeederJEVersions, GroupAck,
+    /// SNTPRequest/Response, ReAuthenticate, and the *Reject/*OK handshake
+    /// sub-messages) have no Noxu equivalent — see the je.rep.stream parity
+    /// report. Every message Noxu DOES define is covered here.
+    #[test]
+    fn test_all_variants_round_trip_and_match() {
+        let all = vec![
+            ProtocolMessage::Handshake {
+                node_name: "n".to_string(),
+                group_name: "g".to_string(),
+                node_type: NodeType::Electable,
+            },
+            ProtocolMessage::HandshakeResponse { accepted: true, reason: None },
+            ProtocolMessage::HandshakeResponse {
+                accepted: false,
+                reason: Some("dup".to_string()),
+            },
+            ProtocolMessage::Heartbeat { master_vlsn: 100, timestamp_ms: 1 },
+            ProtocolMessage::HeartbeatResponse {
+                replica_vlsn: 200,
+                timestamp_ms: 2,
+            },
+            // JE `Entry` (and `Commit`, which Noxu folds into a typed
+            // LogEntry rather than a distinct message).
+            ProtocolMessage::LogEntry {
+                vlsn: 33,
+                entry_type: 42,
+                data: b"Tom Brady".to_vec(),
+            },
+            ProtocolMessage::Ack { vlsn: 19 },
+            // JE `NodeGroupInfo`.
+            ProtocolMessage::GroupChange {
+                change_type: GroupChangeType::Add,
+                node: RepNode::new(
+                    "node1".to_string(),
+                    NodeType::Electable,
+                    "oracle.com".to_string(),
+                    7000,
+                    1,
+                ),
+            },
+            ProtocolMessage::GroupChangeResponse { accepted: true },
+            ProtocolMessage::ElectionProposal {
+                node_name: "c".to_string(),
+                vlsn: 5000,
+                priority: 10,
+                term: 3,
+                dtvlsn: 4900,
+            },
+            ProtocolMessage::ElectionVote {
+                voter: "v".to_string(),
+                granted: true,
+                term: 3,
+            },
+            ProtocolMessage::ElectionResult {
+                master: "m".to_string(),
+                term: 4,
+            },
+            // JE `ShutdownRequest`/`ShutdownResponse`.
+            ProtocolMessage::Shutdown { reason: "bye".to_string() },
+        ];
+
+        // Every ProtocolMessage variant must be represented above, so a new
+        // variant fails to round-trip loudly instead of silently escaping the
+        // exhaustive check (JE's testBasic asserts messageCount()).
+        assert_eq!(
+            all.len(),
+            13,
+            "expected one sample per ProtocolMessage variant; update this \
+             test when the message set changes"
+        );
+
+        for msg in &all {
+            let decoded = ProtocolMessage::decode(&msg.encode()).expect(
+                "every well-formed message must decode (JE protocol.read)",
+            );
+            assert_eq!(
+                *msg, decoded,
+                "decoded message must equal the original (JE match())"
+            );
+        }
     }
 
     #[test]

@@ -683,6 +683,16 @@ mod tests {
         }
     }
 
+    /// JE: ProtocolTest.testBasic (syncup half). testBasic round-trips
+    /// every `Protocol` message, including the syncup exchange
+    /// (Entry / EntryRequest / EntryNotFound / AlternateMatchpoint /
+    /// StartStream / RestoreRequest / RestoreResponse). Those messages
+    /// live in Noxu's separate syncup message set, so their
+    /// encode -> decode round-trip is proven here rather than in
+    /// protocol.rs. Deviation: Noxu's syncup `Entry` carries the record's
+    /// (vlsn, lsn, fingerprint, is_sync) rather than the full JE
+    /// OutputWireRecord bytes; the matchpoint decision only needs those
+    /// fields (see syncup.rs VlsnEntry).
     #[test]
     fn test_msg_roundtrip() {
         let msgs = vec![

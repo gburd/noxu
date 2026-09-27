@@ -489,6 +489,14 @@ mod tests {
     /// Diverged tail: the replica applied VLSN 6/7 that the feeder never had
     /// (its 6/7 differ or are absent). The search walks back to the highest
     /// common sync point (VLSN 4).
+    ///
+    /// JE: FeederReaderTest.testBackwardScans / testFindSyncableentries.
+    /// Those tests drive a backward reader that walks the log from a start
+    /// VLSN toward the front, stopping at each syncable (sync-point) entry
+    /// (`findPrevSyncEntry`). This is the same backward sync-point walk the
+    /// matchpoint search performs here via `prev_sync_candidate` (which only
+    /// stops at `is_sync` entries) — proven end to end against a real log's
+    /// sync flags in `stream::syncup_reader::tests`.
     #[test]
     fn test_diverged_tail_walks_back() {
         // Replica's sync points: 6 (divergent), 4 (common), with 5 a non-sync.

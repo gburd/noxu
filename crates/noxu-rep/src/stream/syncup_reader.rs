@@ -754,9 +754,7 @@ mod tests {
         // Fill in prev_offset/vlsn/checksum. The syncup reader does not
         // validate the checksum, but a real record carries one, so compute it.
         let checksum = crc32fast::hash(&buf[4..]);
-        header
-            .add_post_marshalling_info(&mut buf, 0, vlsn, checksum)
-            .unwrap();
+        header.add_post_marshalling_info(&mut buf, 0, vlsn, checksum).unwrap();
         fm.write_buffer_to_file(0, &buf, offset).unwrap();
         offset + buf.len() as u64
     }
