@@ -93,6 +93,8 @@ fn ent(b: &[u8]) -> DatabaseEntry {
 // HEADLINE 1 — put(insert: old=None), put(update: old=Some), delete(old).
 // ───────────────────────────────────────────────────────────────────────────
 
+// JE: InvokeTest.testKVOpsTrans (put insert old=None, put update old=Some,
+// delete old=Some, then commit) — record + txn trigger core.
 #[test]
 fn headline1_put_delete_old_new_within_txn() {
     let dir = TempDir::new().unwrap();
@@ -147,6 +149,8 @@ fn headline1_put_delete_old_new_within_txn() {
 // HEADLINE 2 — put trigger fires BEFORE commit.
 // ───────────────────────────────────────────────────────────────────────────
 
+// JE: InvokeTest.verifyPut / verifyCommit ordering — put fires within the
+// txn (Cursor.putNotify) before TransactionTrigger.commit on resolution.
 #[test]
 fn headline2_put_trigger_fires_before_commit() {
     let dir = TempDir::new().unwrap();
@@ -180,6 +184,8 @@ fn headline2_put_trigger_fires_before_commit() {
 // HEADLINE 3 — abort fires TransactionTrigger.abort; data change rolled back.
 // ───────────────────────────────────────────────────────────────────────────
 
+// JE: InvokeTest.testKVOpsAbort (verifyAbort(1)) — TransactionTrigger.abort
+// fires on abort and the record change rolls back with the txn.
 #[test]
 fn headline3_abort_fires_and_rolls_back() {
     let dir = TempDir::new().unwrap();
@@ -217,6 +223,8 @@ fn headline3_abort_fires_and_rolls_back() {
 // HEADLINE 4 — multiple triggers fire in registration order.
 // ───────────────────────────────────────────────────────────────────────────
 
+// JE: InvokeTest — triggers stored in a List<Trigger> and fired in list
+// (registration) order by TriggerManager.runPutTriggers/runCommitTriggers.
 #[test]
 fn headline4_multiple_triggers_fire_in_registration_order() {
     let dir = TempDir::new().unwrap();
@@ -300,6 +308,8 @@ fn headline5_no_trigger_unchanged_behaviour() {
 // null when non-transactional; auto-commit commits immediately.
 // ───────────────────────────────────────────────────────────────────────────
 
+// JE: InvokeTest.testKVOpsAuto (partial) — put fires with a null/None txn
+// arg under auto-commit (KVOps(null)).
 #[test]
 fn auto_commit_put_fires_with_none_txn() {
     let dir = TempDir::new().unwrap();
@@ -322,5 +332,155 @@ fn auto_commit_put_fires_with_none_txn() {
             old: None,
             new: b"v".to_vec(),
         }]
+    );
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// JE: InvokeTest.testKVOpsTrans / testKVOpsAuto / testKVOpsAbort.
+//
+// Faithful port of InvokeTest.KVOps(transaction):
+//   put(k, data1)         -> verifyPut(1, key, data1, null)   insert: old=None
+//   put(k, data2)         -> verifyPut(1, key, data2, data1)  update: old=Some
+//   delete(k) == SUCCESS  -> verifyDelete(1, key, data2)
+//   delete(k) == NOTFOUND -> verifyDelete(0, null, null)      no trigger fires
+// with a resetTriggers() between each step so counts are per-operation.
+// The Trans / Auto variants differ only in the txn handle (Some vs None);
+// the Abort variant runs the same KVOps under an explicit txn and then
+// aborts, asserting TransactionTrigger.abort fires once (verifyAbort(1)).
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Run the JE KVOps step sequence against `db` under the given (optional)
+/// transaction, asserting the per-step put/delete trigger arguments exactly as
+/// JE verifyPut / verifyDelete do.  `txn` is the Noxu handle (None = auto-commit,
+/// i.e. JE KVOps(null)); `expect_txn` is the id the trigger should observe.
+fn run_kvops(
+    db: &noxu_db::Database,
+    calls: &Arc<Mutex<Vec<Call>>>,
+    txn: Option<&noxu_db::Transaction>,
+    expect_txn: Option<u64>,
+) {
+    let put = |db: &noxu_db::Database, k: &[u8], v: &[u8]| match txn {
+        Some(t) => db.put_in(t, ent(k), ent(v)).unwrap(),
+        None => {
+            db.put(ent(k), ent(v)).unwrap();
+        }
+    };
+    let del = |db: &noxu_db::Database, k: &[u8]| -> bool {
+        match txn {
+            Some(t) => db.delete_in(t, ent(k)).unwrap(),
+            None => db.delete(ent(k)).unwrap(),
+        }
+    };
+    let reset = || calls.lock().unwrap().clear();
+
+    // Nothing fired yet.  JE verifyPut(0, null, null, null).
+    assert!(calls.lock().unwrap().is_empty());
+
+    // Insert: oldData = None.  JE verifyPut(1, key, data1, null).
+    put(db, b"k", b"\x02");
+    assert_eq!(
+        *calls.lock().unwrap(),
+        vec![Call::Put {
+            txn: expect_txn,
+            key: b"k".to_vec(),
+            old: None,
+            new: b"\x02".to_vec(),
+        }]
+    );
+    reset();
+
+    // Update: oldData = Some(data1).  JE verifyPut(1, key, data2, data1).
+    put(db, b"k", b"\x03");
+    assert_eq!(
+        *calls.lock().unwrap(),
+        vec![Call::Put {
+            txn: expect_txn,
+            key: b"k".to_vec(),
+            old: Some(b"\x02".to_vec()),
+            new: b"\x03".to_vec(),
+        }]
+    );
+    reset();
+
+    // Delete SUCCESS: oldData = Some(data2).  JE verifyDelete(1, key, data2).
+    assert!(del(db, b"k"), "first delete must succeed");
+    assert_eq!(
+        *calls.lock().unwrap(),
+        vec![Call::Delete {
+            txn: expect_txn,
+            key: b"k".to_vec(),
+            old: b"\x03".to_vec(),
+        }]
+    );
+    reset();
+
+    // Delete NOTFOUND: no record removed => NO delete trigger fires.
+    // JE: status == NOTFOUND, verifyDelete(0, null, null).  This is the
+    // vacuity guard — a hook that fired on a no-op delete would fail here.
+    assert!(!del(db, b"k"), "second delete must find nothing");
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "delete of an absent key must NOT fire a delete trigger"
+    );
+}
+
+#[test]
+fn kvops_trans() {
+    let dir = TempDir::new().unwrap();
+    let e = env(&dir);
+    let (trig, calls) = Recorder::new("rec");
+    let cfg = DatabaseConfig::new()
+        .with_allow_create(true)
+        .with_transactional(true)
+        .with_trigger(trig);
+    let db = e.open_database(None, "kv_t", &cfg).unwrap();
+
+    let txn = e.begin_transaction(None).unwrap();
+    let txn_id = txn.id();
+    run_kvops(&db, &calls, Some(&txn), Some(txn_id));
+    txn.commit().unwrap();
+}
+
+#[test]
+fn kvops_auto() {
+    let dir = TempDir::new().unwrap();
+    let e = env(&dir);
+    let (trig, calls) = Recorder::new("rec");
+    let cfg = DatabaseConfig::new()
+        .with_allow_create(true)
+        .with_transactional(true)
+        .with_trigger(trig);
+    let db = e.open_database(None, "kv_a", &cfg).unwrap();
+
+    // JE KVOps(null): auto-commit, trigger observes a null (None) txn arg.
+    run_kvops(&db, &calls, None, None);
+}
+
+#[test]
+fn kvops_abort() {
+    let dir = TempDir::new().unwrap();
+    let e = env(&dir);
+    let (trig, calls) = Recorder::new("rec");
+    let cfg = DatabaseConfig::new()
+        .with_allow_create(true)
+        .with_transactional(true)
+        .with_trigger(trig);
+    let db = e.open_database(None, "kv_ab", &cfg).unwrap();
+
+    let txn = e.begin_transaction(None).unwrap();
+    let txn_id = txn.id();
+    run_kvops(&db, &calls, Some(&txn), Some(txn_id));
+
+    // The record ops fired within the txn; now abort.  JE verifyAbort(1):
+    // TransactionTrigger.abort fires exactly once for the modified database.
+    calls.lock().unwrap().clear();
+    txn.abort().unwrap();
+    assert_eq!(*calls.lock().unwrap(), vec![Call::Abort(txn_id)]);
+
+    // And the record change rolled back with the txn: the key is gone.
+    let mut data = DatabaseEntry::new();
+    assert!(
+        !db.get_into(None, ent(b"k"), &mut data).unwrap(),
+        "aborted KVOps must leave no record"
     );
 }

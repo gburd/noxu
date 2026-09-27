@@ -127,14 +127,23 @@ pub trait Trigger: Send + Sync {
     /// JE `TransactionTrigger.abort(Transaction)`.
     fn abort(&self, _txn_id: u64) {}
 
-    /// Lifecycle hook invoked when the trigger is added to the database
-    /// (the first trigger method invoked, exactly once).  Default: no-op.
+    /// Lifecycle hook that JE invokes when a trigger is added to a database.
+    ///
+    /// RESERVED / NOT CURRENTLY INVOKED: Noxu fires only the data-operation
+    /// (`put`/`delete`) and transaction-resolution (`commit`/`abort`) trigger
+    /// methods.  Database-lifecycle trigger events (add/remove/open/close/
+    /// rename/truncate) are not yet wired into the engine, so this default
+    /// no-op is never called.  Do not rely on it firing.  Tracked as
+    /// NEW-TRIGGER-LIFECYCLE.
     ///
     /// JE `Trigger.addTrigger(Transaction)`.
     fn add_trigger(&self, _txn_id: Option<u64>) {}
 
-    /// Lifecycle hook invoked when the trigger is removed from the database
-    /// (e.g. on close).  Default: no-op.
+    /// Lifecycle hook that JE invokes when a trigger is removed from a database.
+    ///
+    /// RESERVED / NOT CURRENTLY INVOKED (see [`Trigger::add_trigger`]): Noxu
+    /// does not yet fire database-lifecycle trigger events, so this default
+    /// no-op is never called.  Tracked as NEW-TRIGGER-LIFECYCLE.
     ///
     /// JE `Trigger.removeTrigger(Transaction)`.
     fn remove_trigger(&self, _txn_id: Option<u64>) {}
