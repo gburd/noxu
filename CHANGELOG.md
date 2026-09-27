@@ -226,6 +226,20 @@ listed in [References](#references).
   delta on a full-after-delta) obsolete, matching JE
   (`IN.afterLogCommon`/`countObsoleteNode`). Space-accounting only; recovery is
   unchanged. Found by a faithful port of JE's `INUtilizationTest`.
+- **Join cursor no longer returns extra rows on its default (sort-by-count) path
+  (NEW-JOIN-1).** The join re-drained the first cursor's duplicate set after it
+  was already fully drained, overrunning onto the next secondary key and
+  returning primary keys belonging to a different secondary value. Fixed to drain
+  once (matching JE `JoinCursor.retrieveNext`). Found by a faithful port of JE's
+  `JoinTest.testJoin`.
+- **Closing a secondary database no longer breaks writes to its primary
+  (NEW-SEC-CLOSE-1).** `SecondaryDatabase::close()` left its maintenance hook
+  registered on the primary, so the next `put()` on the primary failed with
+  `DatabaseClosed`. Close now unregisters the secondary (and any foreign-key
+  referrer) from the primary's association, matching JE
+  (`SecondaryDatabase.close`/`removeReferringAssociations`); other open
+  secondaries on the same primary are unaffected. Found by a faithful port of JE's
+  `SecondaryTest.testOpenAndClose`.
 
 - **WAL now fail-stops the environment on a critical log-write failure (JE
   `LogManager.serialLog` parity).** A failed or partial WAL write previously left
