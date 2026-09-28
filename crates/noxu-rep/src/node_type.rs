@@ -12,9 +12,16 @@ pub enum NodeType {
     /// copy of the data.
     Electable,
 
-    /// A monitor node that observes group state changes but does not
-    /// participate in elections or store data. Monitors receive
-    /// notifications about master changes and group membership.
+    /// A reserved node type for a non-electable, non-data observer node.
+    ///
+    /// A `Monitor` node participates in the group only as a non-electable,
+    /// non-data member: it does not participate in elections
+    /// ([`is_electable`](Self::is_electable) is `false`) and stores no data
+    /// ([`is_data_node`](Self::is_data_node) is `false`). The
+    /// notification/observer subsystem that would deliver master-change and
+    /// group-membership events to a monitor (a `Monitor` handle, a
+    /// change-listener, and the associated wire protocol) is **not yet
+    /// implemented**; today `Monitor` exists only as this node-type marker.
     Monitor,
 
     /// A secondary node that replicates data from the master but
