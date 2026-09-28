@@ -143,6 +143,16 @@ fn admitted_peer_connects_and_exchanges_data() {
     server_thread.join().expect("server thread panicked");
 }
 
+// JE: SSLChannelTest.testPeerPatternAuthentication (the reject axis) --
+// JE's SSLDNAuthenticator rejects a client whose cert DN does not match
+// the configured pattern. MECHANISM DEVIATION: JE's authenticator marks
+// the *connected* channel isTrusted()==false but still completes the
+// handshake; Noxu's rustls PeerAllowlistVerifier is fail-closed and
+// ABORTS the handshake for an unauthorized peer (strictly stronger --
+// an unauthorized peer never exchanges a byte). The SECURITY INTENT
+// (reject a peer whose verified cert name is not authorized) is the
+// same and is asserted here, non-vacuously (admit-valid is proven by
+// `admitted_peer_connects_and_exchanges_data`).
 /// A peer whose cert CN/SAN is NOT in the allowlist is rejected at the TLS
 /// handshake — the connection fails before any data is exchanged.
 #[test]
@@ -196,6 +206,13 @@ fn rejected_peer_fails_at_handshake() {
     server_thread.join().expect("server thread panicked");
 }
 
+// JE: SSLChannelTest.testStdHostVerification / testPeerPatternAuthentication
+// (the PeerNotVerifiedChecker path) -- a peer that fails CHAIN validation
+// is rejected regardless of name. JE's SSLStdHostVerifier fails the
+// client-side server-identity check ("Server identity could not be
+// verified"); Noxu's rustls WebPkiClientVerifier fails chain validation
+// BEFORE the allowlist name check runs. Same security intent: an
+// untrusted-CA cert cannot authenticate even with an allowlisted name.
 /// A peer from a DIFFERENT CA is rejected even if its SAN would match.
 ///
 /// This tests that chain validation runs BEFORE the allowlist check.
@@ -259,6 +276,10 @@ fn foreign_ca_peer_is_rejected_despite_allowlisted_name() {
     server_thread.join().expect("server thread panicked");
 }
 
+// JE: SSLChannelTest peer-auth config -- an authenticator with no
+// admissible pattern authorizes no one. Noxu is fail-closed at
+// construction (an empty allowlist is a ConfigError) rather than
+// silently admitting no peers; documented deviation, same intent.
 /// An empty allowlist is rejected at construction time (fail-closed).
 ///
 /// Per the design doc: "an empty allowlist means no peer is authorised,
@@ -285,6 +306,10 @@ fn empty_allowlist_errors_at_construction() {
     );
 }
 
+// JE: SSLChannelTest peer-auth requires a truststore/CA to verify peer
+// certs. Noxu refuses to pair the allowlist verifier with a
+// SkipVerification (no-CA) config -- there is no chain to validate, so
+// allowlist enforcement would be meaningless. Fail-closed, same intent.
 /// A SkipVerification TlsConfig cannot be used with the allowlist verifier
 /// (no CA means no chain validation).
 #[test]
@@ -305,6 +330,13 @@ fn skip_verification_with_allowlist_errors() {
     );
 }
 
+// JE: SSLChannelTest.testPeerMirrorAuthentication -- JE's
+// SSLMirrorAuthenticator trusts a peer whose cert matches the node's own
+// (mirror) identity, and admitted peers exchange data. Noxu's analogue:
+// multiple allowlisted peers each complete the mTLS handshake and
+// round-trip data. (JE's mirror mechanism -- comparing the peer DN to
+// the local cert DN -- is Java-keystore-specific; the portable intent is
+// "authorized peers connect and exchange data".)
 /// Two admitted peers can connect sequentially to the same allowlisted server.
 #[test]
 fn two_admitted_peers_connect_sequentially() {
@@ -457,6 +489,8 @@ impl ServiceHandler for EchoService {
     }
 }
 
+// JE: SSLChannelTest.testPeerPatternAuthentication (admit axis) carried
+// through to an application service round-trip.
 /// An allowlisted peer reaches the dispatcher's service handler end-to-end:
 /// the mTLS handshake (allowlist check) passes, the service-name routing
 /// runs, and an application-level echo round-trips.
@@ -487,6 +521,8 @@ fn tls_dispatcher_admits_allowlisted_peer_end_to_end() {
     dispatcher.stop();
 }
 
+// JE: SSLChannelTest.testPeerPatternAuthentication (reject axis) at the
+// service-dispatcher layer -- an unauthorized peer never reaches a handler.
 /// A peer whose cert name is NOT in the dispatcher allowlist is rejected at
 /// the mTLS handshake — it never reaches the service handler.
 #[test]

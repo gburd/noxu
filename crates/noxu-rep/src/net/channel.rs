@@ -1298,6 +1298,14 @@ mod tests {
         use super::*;
         use crate::tls::TlsConfig;
 
+        // JE: SSLChannelTest.testSmallPackets / testMediumPackets
+        // (BasicChecker path): a client and server complete the TLS
+        // handshake and exchange application data over the encrypted
+        // channel (JE asserts server.channelSecure == true). Noxu uses
+        // rustls, not a Java SSLEngine, so the SSLEngine wrap/unwrap
+        // buffer state machine is internal (N/A); the portable intent
+        // -- encrypted round-trip after a successful handshake -- is
+        // asserted here.
         #[test]
         fn test_tls_tcp_send_receive() {
             let tls = TlsConfig::insecure("localhost");
@@ -1323,6 +1331,10 @@ mod tests {
             handle.join().unwrap();
         }
 
+        // JE: SSLChannelTest.testSmallPackets (a stream of many small
+        // packets over one TLS channel). JE fires 50+ packets per
+        // stream; the portable intent is that repeated framed writes
+        // round-trip intact over the same TLS session.
         #[test]
         fn test_tls_tcp_multiple_messages() {
             let tls = TlsConfig::insecure("localhost");
@@ -1349,6 +1361,11 @@ mod tests {
             handle.join().unwrap();
         }
 
+        // JE: SSLChannelTest.testLargePackets / testHugePackets
+        // (packets up to 500 KB). rustls fragments/reassembles records
+        // internally (the SSLEngine buffer mechanics JE exercises are
+        // N/A); the portable intent -- a large payload survives the TLS
+        // record layer intact -- is asserted with a 64 KiB payload.
         #[test]
         fn test_tls_tcp_large_payload() {
             let tls = TlsConfig::insecure("localhost");
@@ -1373,6 +1390,10 @@ mod tests {
             handle.join().unwrap();
         }
 
+        // JE: SSLChannelTest read path -- a receive that has no data
+        // available returns without corrupting the session. JE drives
+        // this through non-blocking SocketChannel selects; Noxu maps
+        // the same intent onto a socket read timeout -> Ok(None).
         #[test]
         fn test_tls_tcp_receive_timeout() {
             let tls = TlsConfig::insecure("localhost");
@@ -1398,6 +1419,10 @@ mod tests {
             handle.join().unwrap();
         }
 
+        // JE: SSLChannelTest close path -- dataChannel.close() ends the
+        // session cleanly (BasicTask.processPackets closes each channel;
+        // ServerTask/ClientTask close on exit). Noxu asserts is_open()
+        // flips false after close().
         #[test]
         fn test_tls_tcp_close() {
             let tls = TlsConfig::insecure("localhost");
@@ -1462,6 +1487,64 @@ mod tests {
                 other => panic!("expected ProtocolError, got {:?}", other),
             }
             let _ = handle.join();
+        }
+
+        /// JE: SSLChannelTest.testSmallPackets / testMediumPackets /
+        /// testLargePackets -- SSLChannelTest.runScenario drives a sequence of
+        /// packets whose sizes are drawn from a [min, max] range (small: 1..10,
+        /// medium: 1000..5000, large: 20000..50000) and sends them in *both*
+        /// directions over one TLS channel, verifying every byte survives the
+        /// TLS record layer. This is the portable core of those tests: the
+        /// SSLEngine wrap/unwrap buffer state machine and the non-blocking
+        /// SocketChannel select loop are Java-mechanism-specific (rustls handles
+        /// record fragmentation internally -> N/A), but "packets of many sizes
+        /// round-trip bidirectionally over TLS" is directly portable.
+        ///
+        /// Non-vacuous: the assertion compares the exact bytes; a corrupted or
+        /// truncated TLS payload would fail the assert_eq!.
+        #[test]
+        fn test_tls_tcp_varied_packet_sizes_bidirectional() {
+            let tls = TlsConfig::insecure("localhost");
+            let listener = TlsTcpChannelListener::bind_with_tls(
+                "127.0.0.1:0".parse().unwrap(),
+                &tls,
+            )
+            .unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            // One size from each of JE's small / medium / large classes.
+            let sizes: [usize; 4] = [1, 10, 4096, 50000];
+
+            let sizes_srv = sizes;
+            let handle = std::thread::spawn(move || {
+                let ch = listener.accept().unwrap();
+                for (i, &sz) in sizes_srv.iter().enumerate() {
+                    // Client -> server: receive the packet the client sent.
+                    let got =
+                        ch.receive(Duration::from_secs(10)).unwrap().unwrap();
+                    let expected: Vec<u8> =
+                        (0..sz).map(|j| ((i + j) % 256) as u8).collect();
+                    assert_eq!(got, expected, "c->s packet {i} (size {sz})");
+                    // Server -> client: echo a differently-filled packet back
+                    // (exercises the reverse direction, like JE's TO_CLIENT).
+                    let reply: Vec<u8> =
+                        (0..sz).map(|j| ((i + j + 7) % 256) as u8).collect();
+                    ch.send(&reply).unwrap();
+                }
+            });
+
+            let client = TlsTcpChannel::connect_with_tls(addr, &tls).unwrap();
+            for (i, &sz) in sizes.iter().enumerate() {
+                let packet: Vec<u8> =
+                    (0..sz).map(|j| ((i + j) % 256) as u8).collect();
+                client.send(&packet).unwrap();
+                let echoed =
+                    client.receive(Duration::from_secs(10)).unwrap().unwrap();
+                let expected: Vec<u8> =
+                    (0..sz).map(|j| ((i + j + 7) % 256) as u8).collect();
+                assert_eq!(echoed, expected, "s->c packet {i} (size {sz})");
+            }
+            handle.join().unwrap();
         }
     }
 }
