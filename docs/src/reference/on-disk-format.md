@@ -127,7 +127,7 @@ A full `BIN` (`0x03`) serialises `node_id` (`u64`, BE) and the slot count
 prefixed with the dirty-slot index and includes only dirty slots. Each slot
 is:
 
-```
+```text
 key_len (u32, BE) | key | lsn (u64, BE) | has_data (u8) [| data_len (u32, BE) | data] | known_deleted (u8)
 ```
 
