@@ -152,6 +152,20 @@ impl ExclusiveLatch {
         self.inner.is_locked()
     }
 
+    /// Returns an estimate of the number of threads currently blocked waiting
+    /// to acquire this latch.
+    ///
+    /// Faithful analogue of JE `Latch.getNWaiters()` (which returns
+    /// `ReentrantLock.getQueueLength()`).  Reads the waiter counter maintained
+    /// by the underlying `noxu_sync` futex mutex.
+    pub fn n_waiters(&self) -> usize {
+        // SAFETY: `raw()` only hands back the raw lock; `get_n_waiters()`
+        // reads an atomic counter and imposes no locking contract on the
+        // caller.  Matches the pattern documented in `noxu_sync`'s
+        // `mutex_get_n_waiters` test.
+        unsafe { self.inner.raw().get_n_waiters() }
+    }
+
     /// Returns true if the latch is held by the current thread.
     pub fn is_owner(&self) -> bool {
         self.owner.load(Ordering::Relaxed) == thread_id()
