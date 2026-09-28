@@ -352,10 +352,11 @@ listed in [References](#references).
   value no longer risks writing an empty record. Old-format logs remain readable
   (no log-version bump). Removing or truncating a database does not yet reclaim its
   freed space under non-forced cleaning (tracked as NEW-CLEANER-DBOBSOLETE).
-- **Known limitation:** an empty B-tree leaf (BIN) left behind by committed deletes is
-  not yet reclaimed by compression (NEW-INCOMP-EMPTY-BIN). Records are correctly gone and
-  all lookups/scans remain correct — this is a space-reclamation gap only, tracked for a
-  fix.
+- **Known limitation (fixed in Unreleased — see `### Changed`):** an empty B-tree leaf
+  (BIN) left behind by committed deletes was not reclaimed by compression
+  (NEW-INCOMP-EMPTY-BIN). Records were correctly gone and all lookups/scans remained
+  correct — a space-reclamation gap only. Now fixed: such BINs are pruned from their
+  parent (with a last-child guard that keeps an emptied database writable).
 - **Two-node (RF=2) elections no longer elect a node that lags the arbiter
   (NEW-ELECT-ARBITER-VETO, `[#25311]`).** When the sole surviving electable node
   lagged the arbiter's durable VLSN, the election could make it master below the
@@ -567,6 +568,7 @@ listed in [References](#references).
 
 ### Changed
 
+- **Empty B-tree leaves left by committed deletes are now reclaimed** (`NEW-INCOMP-EMPTY-BIN`): a BIN emptied by committed deletes (Noxu removes deleted slots physically, leaving no tombstone) was previously never pruned, so its index space leaked after delete-heavy workloads. The compress/checkpoint path now prunes such empty BINs from their parent (JE `INCompressor.pruneBIN`), with a last-child guard — the tree’s last/only BIN is never pruned, so a fully-emptied database keeps its empty root BIN and stays writable (JE `Tree.searchDeletableSubTree`, "root compression is no longer supported"). Records were always correctly gone and scans correct; this reclaims the space.
 - **Backup: the non-functional live-backup daemon is replaced by a real
   `Environment::start_backup()` (a port of JE `DbBackup`).** The previous
   `BackupManager` never copied a byte (its thread body was a sleep loop) and the
