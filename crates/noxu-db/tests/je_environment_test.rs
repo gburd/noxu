@@ -377,3 +377,50 @@ fn db_handle_lock_open_handle_acquires_locks() {
     db.close().unwrap();
     txn.commit().unwrap();
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// JE: DatabaseTest.testDbOpenAbortWithDbClose / testDbOpenAbortNoDbClose
+//
+// JE invariant: opening (creating) a database under a transaction and then
+// ABORTING that transaction must (a) not error, (b) roll back the creation (the
+// db does not exist afterward), and (c) allow the Database handle to be closed
+// after the abort (with close) OR require no close (no leak, without close).
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn database_open_abort_with_db_close() {
+    let dir = TempDir::new().unwrap();
+    let env = Environment::open(txn_env(&dir, true)).unwrap();
+    let txn = env.begin_transaction(None).unwrap();
+    let db = env.open_database(Some(&txn), "testDB", &dbcfg()).unwrap();
+    db.put_in(
+        &txn,
+        DatabaseEntry::from_bytes(&[1]),
+        DatabaseEntry::from_bytes(&[1]),
+    )
+    .unwrap();
+    txn.abort().unwrap();
+    // Close after abort must be allowed (no error).
+    db.close().unwrap();
+    // The create was rolled back: the db does not exist.
+    assert!(!env.database_names().unwrap().contains(&"testDB".to_string()));
+}
+
+#[test]
+fn database_open_abort_no_db_close() {
+    let dir = TempDir::new().unwrap();
+    let env = Environment::open(txn_env(&dir, true)).unwrap();
+    let txn = env.begin_transaction(None).unwrap();
+    let db = env.open_database(Some(&txn), "testDB", &dbcfg()).unwrap();
+    db.put_in(
+        &txn,
+        DatabaseEntry::from_bytes(&[1]),
+        DatabaseEntry::from_bytes(&[1]),
+    )
+    .unwrap();
+    txn.abort().unwrap();
+    // Deliberately do NOT close the handle — must not leak / must not be
+    // required (the aborted create left nothing to clean up).
+    drop(db);
+    assert!(!env.database_names().unwrap().contains(&"testDB".to_string()));
+}
