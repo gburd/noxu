@@ -271,6 +271,32 @@ impl SharedLatch {
         self.exclusive_owner.load(Ordering::Relaxed) == thread_id()
     }
 
+    /// Returns true if the current thread holds this latch in EITHER shared
+    /// or exclusive mode.
+    ///
+    /// Faithful analogue of JE `SharedLatch.isOwner()`, which returns
+    /// `isWriteLockedByCurrentThread() || (getReadHoldCount() > 0)`.  The
+    /// read-hold side reads the same per-latch thread-local counter used to
+    /// detect same-latch shared reentrancy.
+    pub fn is_owner(&self) -> bool {
+        self.is_exclusive_owner()
+            || read_hold_count(self as *const Self as usize) > 0
+    }
+
+    /// Returns an estimate of the number of threads currently blocked waiting
+    /// to acquire this latch (readers + writers).
+    ///
+    /// Faithful analogue of JE `Latch.getNWaiters()` (which returns
+    /// `ReentrantReadWriteLock.getQueueLength()`).  Reads the waiter counter
+    /// maintained by the underlying `noxu_sync` futex rwlock.
+    pub fn n_waiters(&self) -> usize {
+        // SAFETY: `raw()` only hands back the raw lock; `get_n_waiters()`
+        // reads an atomic counter and imposes no locking contract on the
+        // caller.  Matches the pattern documented in `noxu_sync`'s rwlock
+        // waiter-count test.
+        unsafe { self.inner.raw().get_n_waiters() }
+    }
+
     /// Returns the context for this latch.
     pub fn context(&self) -> &LatchContext {
         &self.context
