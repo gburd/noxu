@@ -546,8 +546,11 @@ fn do_test_reuse_slot_partial_key(run_recovery: bool) {
 //   comparator, so it targets the existing slot) ; insert {0,1}/{1} (reuses
 //   that slot) } ; ABORT
 // leaves the database EMPTY (count == 0, getFirst == NotFound) — the original
-// {0,0}/{0} is gone.  Expected (JE): abort rolls the slot back to {0,0}/{0}
-// (count == 1).  Control: the SAME sequence with the DEFAULT byte comparator
+// {0,0}/{0} is gone.  DURABLE: a point-get of the original committed key {0,0}
+// returns NotFound after the abort AND still after a close+reopen (recovery) —
+// the committed record is permanently lost, not merely mis-counted.  Expected
+// (JE): abort rolls the slot back to {0,0}/{0} (count == 1).  Control: the SAME
+// sequence with the DEFAULT byte comparator
 // (where {0,0} and {0,1} are DISTINCT keys, so no slot reuse occurs) correctly
 // leaves count == 1 after abort — isolating the fault to the slot-reuse path
 // under a partial (compares-equal) comparator, not the abort machinery itself.
