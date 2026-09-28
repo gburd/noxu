@@ -1574,6 +1574,7 @@ impl Environment {
             cleaner_min_utilization: Some(
                 self.config.cleaner_min_utilization as u32,
             ),
+            max_disk: Some(self.config.max_disk),
         })
     }
 
@@ -1642,6 +1643,17 @@ impl Environment {
         }
         if let Some(v) = cfg.run_evictor {
             self.config.run_evictor = v;
+        }
+        // Runtime MAX_DISK change (JE EnvironmentMutableConfig.setMaxDisk):
+        // push it to the live DiskLimitTracker (shared with the write path,
+        // cleaner and checkpointer) and re-evaluate the violation flag
+        // immediately.  Passing 0 disables the max-disk cap so a write blocked
+        // purely by MAX_DISK resumes -- the Noxu analogue of DiskLimitTest's
+        // allowWrites() -> setMaxDisk(0).
+        if let Some(bytes) = cfg.max_disk {
+            self.config.max_disk = bytes;
+            let env_impl = self.env_impl.lock();
+            env_impl.get_disk_limit().set_max_disk(bytes);
         }
         Ok(())
     }
@@ -2069,14 +2081,48 @@ impl Environment {
     /// low-utilization files for deletion. This is the manual counterpart to
     /// the background cleaner daemon, used to reclaim space on demand.
     ///
-    /// Unlike the throttled daemon pass, this performs a forced cleaning pass
-    /// (JE's `cleanLog()` likewise cleans regardless of the daemon's
-    /// utilization budget), so callers can deterministically reclaim obsolete
-    /// files in tests and batch maintenance.
+    /// This runs the cleaner with `forceCleaning = false`, matching JE
+    /// `Environment.cleanLog()` -> `invokeCleaner(false)` -> `doClean(...,
+    /// false /*forceCleaning*/)` (EnvironmentImpl.java:2299-2300): only files
+    /// whose utilization is below the configured threshold are selected, so a
+    /// manual clean does NOT re-migrate 100%-live files on every pass (which
+    /// would be an unbounded migration treadmill — REG-CLEANER-DISKLIMIT).
+    /// For the JE test-internal forced pass (`doClean(..., true)`), which
+    /// cleans regardless of utilization, use [`Self::clean_log_forced`].
     ///
     /// Returns `Ok(files_cleaned)`. Returns `Err` if the environment is closed
     /// or read-only (no cleaner is available).
     pub fn clean_log(&self) -> Result<u32> {
+        self.check_open()?;
+        let env_impl = self.env_impl.lock();
+        let result = env_impl
+            .run_cleaner(u32::MAX, false)
+            .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
+        Ok(result.files_cleaned)
+    }
+
+    /// Forced log-cleaning pass: clean every age-eligible file regardless of
+    /// its utilization, returning the number of files cleaned.
+    ///
+    /// This is the Noxu equivalent of JE's test/maintenance forced clean —
+    /// `envImpl.getCleaner().doClean(cleanMultipleFiles, true /*forceCleaning*/)`
+    /// (the `forceCleaning` branch of `UtilizationCalculator.getBestFile`,
+    /// labelled "forced for testing" in JE).  JE's cleaner tests
+    /// (`CleanerTest`, `FileSelectionTest`, `TruncateAndRemoveTest`, ...) drive
+    /// exactly this path to deterministically reclaim files that hold obsolete
+    /// space but still sit at or above the utilization threshold (e.g. a
+    /// single-generation overwrite churn, or a truncated/removed database
+    /// whose per-file obsolete accounting has not yet dropped below the cap).
+    ///
+    /// Prefer [`Self::clean_log`] (`forceCleaning = false`) for normal manual
+    /// reclamation: forcing a clean of 100%-live files re-migrates them every
+    /// pass (the migration treadmill REG-CLEANER-DISKLIMIT fixed), so this
+    /// forced variant is intended for tests and one-off batch maintenance, not
+    /// steady-state use.
+    ///
+    /// Returns `Ok(files_cleaned)`. Returns `Err` if the environment is closed
+    /// or read-only (no cleaner is available).
+    pub fn clean_log_forced(&self) -> Result<u32> {
         self.check_open()?;
         let env_impl = self.env_impl.lock();
         let result = env_impl

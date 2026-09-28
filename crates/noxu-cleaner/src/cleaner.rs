@@ -1295,9 +1295,30 @@ impl Cleaner {
                 None
             };
 
+        // REG-CLEANER-DISKLIMIT (embedded-LN immediate-obsolete): gather the
+        // set of LN offsets already recorded obsolete for this file from the
+        // live utilization tracker so `process_file` can skip them without a
+        // tree lookup or migration (JE FileProcessor.processFile:673-802
+        // reads the file's persisted obsolete offsets and does the same).
+        // Without this skip, an LN a checkpoint marked obsolete-because-
+        // embedded would still be re-migrated (its BIN slot LSN still points
+        // at it), re-logged, and its BIN re-dirtied — driving an unbounded
+        // checkpoint/migration treadmill that starves disk-limit recovery.
+        let obsolete_offsets: std::collections::HashSet<u32> =
+            if let Some(ref tracker_arc) = self.utilization_tracker {
+                let tracker = tracker_arc.lock();
+                tracker
+                    .get_tracked_summary(file_number)
+                    .map(|t| t.get_obsolete_offsets().iter().copied().collect())
+                    .unwrap_or_default()
+            } else {
+                std::collections::HashSet::new()
+            };
+
         let processor = {
             let p =
-                FileProcessor::new(self.stats.clone(), self.shutdown.clone());
+                FileProcessor::new(self.stats.clone(), self.shutdown.clone())
+                    .with_obsolete_offsets(obsolete_offsets);
             if let Some(f) = pending_fn {
                 p.with_process_pending_fn(f)
             } else {

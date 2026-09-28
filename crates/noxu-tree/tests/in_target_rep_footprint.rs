@@ -197,6 +197,7 @@ fn bin_same_file(n: usize) -> noxu_tree::BinStub {
         compact_max_key_length:
             noxu_tree::tree::INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         expiration_enabled: true,
+        max_embedded_ln: noxu_tree::TREE_MAX_EMBEDDED_LN_DEFAULT,
     };
     for i in 0..n {
         let k = (i as u32).to_be_bytes().to_vec();
@@ -357,6 +358,7 @@ fn empty_bin() -> noxu_tree::BinStub {
         compact_max_key_length:
             noxu_tree::tree::INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         expiration_enabled: true,
+        max_embedded_ln: noxu_tree::TREE_MAX_EMBEDDED_LN_DEFAULT,
     }
 }
 

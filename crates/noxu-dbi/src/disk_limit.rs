@@ -61,7 +61,12 @@ use noxu_log::file_manager::FileManager;
 /// cached flag, never probes the disk synchronously.
 pub struct DiskLimitTracker {
     /// `MAX_DISK`: absolute cap on total log size in bytes. 0 = disabled.
-    max_disk: u64,
+    ///
+    /// Atomic so it can be mutated at runtime via [`Self::set_max_disk`] (JE
+    /// `EnvironmentMutableConfig.setMaxDisk` — a genuinely mutable param).
+    /// The disk-limit tests relax the cap (set it to 0) to resume writes,
+    /// matching JE `DiskLimitTest`'s `allowWrites()` -> `setMaxDisk(0)`.
+    max_disk: AtomicU64,
     /// `FREE_DISK`: keep-this-much-free reserve in bytes. 0 = disabled.
     free_disk: u64,
     /// `RESERVED_DISK`: extra bytes reserved on top of `free_disk`. Writes
@@ -94,7 +99,7 @@ impl DiskLimitTracker {
         file_manager: Option<Arc<FileManager>>,
     ) -> Self {
         DiskLimitTracker {
-            max_disk,
+            max_disk: AtomicU64::new(max_disk),
             free_disk,
             reserved_disk,
             file_manager,
@@ -111,7 +116,9 @@ impl DiskLimitTracker {
     /// branch with no atomic contention.
     #[inline]
     pub fn is_enabled(&self) -> bool {
-        self.max_disk > 0 || self.free_disk > 0 || self.reserved_disk > 0
+        self.max_disk.load(Ordering::Relaxed) > 0
+            || self.free_disk > 0
+            || self.reserved_disk > 0
     }
 
     /// Cheap read of the cached violation flag (JE: read volatile
@@ -131,7 +138,20 @@ impl DiskLimitTracker {
     /// the free-disk-derived ceiling is not a single number, so report
     /// `disk_free_space` reserve target. Used only for the error payload.
     pub fn effective_limit(&self) -> u64 {
-        if self.max_disk > 0 { self.max_disk } else { self.free_disk }
+        let max = self.max_disk.load(Ordering::Relaxed);
+        if max > 0 { max } else { self.free_disk }
+    }
+
+    /// Sets `MAX_DISK` at runtime and immediately re-evaluates the cached
+    /// violation flag (JE `EnvironmentMutableConfig.setMaxDisk` — a mutable
+    /// param — followed by the next `freshenLogSizeStats`).  Passing 0
+    /// disables the max-disk cap (the free-disk / reserved-disk limits, if
+    /// any, still apply), so a write blocked purely by `MAX_DISK` resumes.
+    /// This is the Noxu analogue of `DiskLimitTest`'s `allowWrites()`
+    /// (`setMaxDisk(0)`, DiskLimitTest.java:578-580).
+    pub fn set_max_disk(&self, max_disk: u64) {
+        self.max_disk.store(max_disk, Ordering::Relaxed);
+        self.refresh();
     }
 
     /// Re-probes the disk and recomputes the cached violation flag.
@@ -178,8 +198,9 @@ impl DiskLimitTracker {
         // availBytes (with reservedSize == protectedSize == 0):
         //   adjustedMax > 0 -> min(freeBytes1, adjustedMax - totalSize)
         //   else            -> freeBytes1
-        let avail_bytes: i64 = if self.max_disk > 0 {
-            let max_room = self.max_disk as i64 - total_size as i64;
+        let max_disk = self.max_disk.load(Ordering::Relaxed);
+        let avail_bytes: i64 = if max_disk > 0 {
+            let max_room = max_disk as i64 - total_size as i64;
             free_bytes1.min(max_room)
         } else {
             free_bytes1
@@ -204,7 +225,7 @@ impl DiskLimitTracker {
              operations are prohibited: maxDisk={}, freeDisk={}, \
              reservedDisk={}, totalLogSize={}, diskFreeSpace={}, \
              availableLogSize={}",
-            self.max_disk,
+            self.max_disk.load(Ordering::Relaxed),
             self.free_disk,
             self.reserved_disk,
             self.total_log_size.load(Ordering::Relaxed),

@@ -509,6 +509,13 @@ pub struct EnvironmentImpl {
     /// Default `true` (JE default).  JE `EnvironmentImpl.isExpired` gate.
     expiration_enabled: bool,
 
+    /// 1A: `TREE_MAX_EMBEDDED_LN` (`noxu.tree.maxEmbeddedLN`, default 16).
+    /// Threaded into every BIN tree this environment opens via
+    /// `Tree::set_max_embedded_ln`; an LN whose data length exceeds it is
+    /// stored as an LSN pointer only in its BIN slot (fetched from the log
+    /// on read) instead of embedded (JE `env.getMaxEmbeddedLN`).
+    max_embedded_ln: i32,
+
     /// TTL clock tolerance in ms (`ENV_TTL_CLOCK_TOLERANCE`).  Grace window
     /// the cleaner applies before an expired record's space is reclaimed, so
     /// a small backward clock change cannot purge a still-live record.
@@ -1875,6 +1882,8 @@ impl EnvironmentImpl {
             compact_max_key_length: cfg.tree_compact_max_key_length as i32,
             // TTL master switch + clock tolerance from the env config.
             expiration_enabled: cfg.env_expiration_enabled,
+            // 1A: TREE_MAX_EMBEDDED_LN from the env config.
+            max_embedded_ln: cfg.tree_max_embedded_ln as i32,
             ttl_clock_tolerance_ms: cfg.env_ttl_clock_tolerance_ms,
             env_db_eviction: cfg.env_db_eviction,
             exception_dispatcher,
@@ -2219,6 +2228,9 @@ impl EnvironmentImpl {
         // Thread the TTL master switch into the tree so expired slots are
         // filtered only when ENV_EXPIRATION_ENABLED is on.
         db_impl.set_tree_expiration_enabled(self.expiration_enabled);
+        // 1A: thread TREE_MAX_EMBEDDED_LN into the tree so a large LN is
+        // serialised as an LSN pointer only (fetched from the log on read).
+        db_impl.set_tree_max_embedded_ln(self.max_embedded_ln);
 
         // If recovery populated a tree for this db_id, transplant it so the
         // database starts from its recovered (crash-consistent) state rather
@@ -2235,6 +2247,7 @@ impl EnvironmentImpl {
             db_impl
                 .set_tree_compact_max_key_length(self.compact_max_key_length);
             db_impl.set_tree_expiration_enabled(self.expiration_enabled);
+            db_impl.set_tree_max_embedded_ln(self.max_embedded_ln);
         }
 
         // DBEVICT-1: if this database was evicted from db_map earlier in

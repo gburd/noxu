@@ -56,6 +56,7 @@ fn make_bin_bytes(
         compact_max_key_length:
             noxu_tree::tree::INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         expiration_enabled: true,
+        max_embedded_ln: noxu_tree::TREE_MAX_EMBEDDED_LN_DEFAULT,
     };
     bin.serialize_full()
 }

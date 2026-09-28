@@ -93,7 +93,7 @@ pub use tree::{
 // removed with the shelved faithful `InNode` (T-1).
 pub use tree::{
     BIN_LEVEL, DBMAP_LEVEL, EXACT_MATCH, INSERT_SUCCESS, LEVEL_MASK,
-    MAIN_LEVEL, MIN_LEVEL,
+    MAIN_LEVEL, MIN_LEVEL, TREE_MAX_EMBEDDED_LN_DEFAULT,
 };
 
 // Re-export foundation types

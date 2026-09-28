@@ -37,8 +37,26 @@
 use noxu_db::{DatabaseConfig, Environment, EnvironmentConfig};
 use tempfile::TempDir;
 
-/// Untouched live records must not be mistaken for obsolete bytes merely
-/// because they reside in old files. Check both recovery and actual reclamation.
+/// JE-faithful reclamation (REG-CLEANER-TEST-NONJE reconciliation).
+///
+/// The cleaner must reclaim files that contain OBSOLETE space (superseded LN
+/// versions) WITHOUT losing any live record — never-rewritten records that
+/// happen to reside in old files must survive both physical reclamation and a
+/// subsequent recovery.  This is the real JE property
+/// (`UtilizationCalculator.getBestFile`, UtilizationCalculator.java:405-431:
+/// a file is selected for cleaning only when its utilization is below the
+/// threshold — i.e. it has obsolete space — never merely because it is old).
+///
+/// The ORIGINAL form of this test (added by the regressing merge 1cc6b013)
+/// asserted that `clean_log()` physically deletes the 100%-LIVE, never-
+/// rewritten old files (`reclaimed > 0` over `old_files`).  That is NOT JE
+/// behavior: `getBestFile` under `forceCleaning=false` (which `clean_log()`
+/// now maps to, matching `Environment.cleanLog` -> `invokeCleaner`) NEVER
+/// selects a 100%-live file — the `forceCleaning` branch that would is
+/// explicitly labelled "forced for testing".  Forcing it back reintroduces
+/// the migration treadmill (REG-CLEANER-DISKLIMIT).  Reconciled here to assert
+/// the JE-faithful property: obsolete-space files ARE reclaimed, live records
+/// are NOT lost.
 fn old_live_records_survive_reclamation(clean: bool) {
     use noxu_db::CheckpointConfig;
     use std::collections::BTreeSet;
@@ -88,6 +106,10 @@ fn old_live_records_survive_reclamation(clean: bool) {
     }
     let checkpoint = CheckpointConfig::new().with_force(true);
     env.checkpoint(Some(&checkpoint)).unwrap();
+    // Peak file count: after loading + churning + a first checkpoint, before
+    // any reclamation.  A successful clean of the obsolete-churn files brings
+    // the on-disk count below this.
+    let peak_file_count = files().len();
     let mut cleaned = 0;
     for _ in 0..3 {
         if clean {
@@ -96,16 +118,49 @@ fn old_live_records_survive_reclamation(clean: bool) {
         env.checkpoint(Some(&checkpoint)).unwrap();
     }
     let remaining = files();
-    let reclaimed = old_files.difference(&remaining).count();
+    // Total on-disk file count BEFORE the churn+clean cycle vs AFTER: the
+    // churn (keys 2000..3000 rewritten 4x) creates whole files of superseded
+    // (obsolete) LN versions, which the cleaner reclaims.  We assert the
+    // JE-faithful outcome: files with obsolete space are physically reclaimed
+    // (the total file count drops relative to the peak), while the 100%-live
+    // never-rewritten old files (keys 0..2000) are NOT selected — matching JE
+    // `getBestFile(forceCleaning=false)`.
+    let old_live_files_still_present =
+        old_files.intersection(&remaining).count();
     eprintln!(
-        "clean={clean}: cleaned={cleaned}, old files reclaimed={reclaimed}/{}",
-        old_files.len()
+        "clean={clean}: cleaned={cleaned}, live-old files still present={}/{}, total files now={}",
+        old_live_files_still_present,
+        old_files.len(),
+        remaining.len(),
     );
     if clean {
+        // JE-faithful reclaim of OBSOLETE-space files happened (the churn's
+        // superseded versions were migrated/reclaimed).
         assert!(cleaned > 0, "must activate real cleaner processing");
-        assert!(reclaimed > 0, "must physically delete old record files");
+        // Physical reclamation occurred: with a genuinely-obsolete churn set,
+        // at least one whole file of superseded versions is deleted, so the
+        // on-disk file count is strictly below the count of files that existed
+        // at the churn peak.  (We compare against the peak captured below.)
+        assert!(
+            remaining.len() < peak_file_count,
+            "cleaner must physically delete at least one obsolete-space file              (peak={peak_file_count}, now={})",
+            remaining.len()
+        );
+        // JE-faithful: the 100%-live never-rewritten old files are NOT
+        // force-reclaimed (forceCleaning=false never selects them). They must
+        // still be present — their live records have not been thrown away.
+        assert_eq!(
+            old_live_files_still_present,
+            old_files.len(),
+            "100%-live never-rewritten old files must NOT be reclaimed under              clean_log() (JE forceCleaning=false); their live records must              stay on disk"
+        );
     } else {
-        assert_eq!(reclaimed, 0, "control must not reclaim files");
+        // Control: without ever calling clean_log(), no file is reclaimed.
+        assert_eq!(
+            old_files.intersection(&remaining).count(),
+            old_files.len(),
+            "control must not reclaim files"
+        );
     }
     db.close().unwrap();
     env.close().unwrap();

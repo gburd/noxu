@@ -32,6 +32,47 @@ listed in [References](#references).
 
 ### Fixed
 
+- **Disk-limit recovery treadmill + inert `TREE_MAX_EMBEDDED_LN`
+  (REG-CLEANER-DISKLIMIT), fixed together as a bounded on-disk-format change.**
+  Found by the external JE-fidelity audit; reproduced on a release build and
+  re-verified debug + release, single-threaded.
+  - `Environment::clean_log()` now invokes the cleaner with
+    `forceCleaning = false` (matching JE `Environment.cleanLog` →
+    `invokeCleaner(false)`), so a manual clean no longer re-migrates 100%-live
+    files on every pass. Previously it forced cleaning of every age-eligible
+    file, which — once the cleaner's LN decode was fixed — became an unbounded
+    migration treadmill that grew the log each pass and prevented a
+    `DiskLimitExceeded`-blocked write from ever resuming. A new
+    `Environment::clean_log_forced()` exposes the JE test/maintenance forced
+    pass (`doClean(.., forceCleaning = true)`) for callers that must reclaim
+    files holding obsolete space that still sit at/above the utilization
+    threshold.
+  - **On-disk format: `TREE_MAX_EMBEDDED_LN` (`noxu.tree.maxEmbeddedLN`,
+    default 16) is now honored.** An LN whose value exceeds the threshold is
+    stored as an **LSN pointer only** in its BIN slot (`has_data = 0`) and
+    fetched from the log on read, instead of being embedded in the BIN
+    regardless of size (the previous inert-config behaviour). This stops a
+    checkpoint from amplifying the log by re-serialising large values into
+    every BIN it writes. The change is carried by the existing `has_data` slot
+    byte, so it needs **no `LOG_VERSION` bump**: an old database (large values
+    embedded) still reads under the new decoder, and a new BIN's non-embedded
+    slot materialises its value from the log exactly like an evictor-stripped
+    slot. See `docs/src/reference/on-disk-format.md`.
+  - **Embedded LNs are counted obsolete at write time** (JE
+    `LN.logInternal:685-688` / `LNLogEntry.isImmediatelyObsolete` `embeddedLN`
+    arm): a value that lives in the checkpointed BIN makes its standalone LN
+    log entry immediately obsolete. The JE `!currEmbeddedLN` guard suppresses
+    re-counting a prior embedded version, so a later update never double-counts
+    (no `checkDupOffsets` violation).
+  - **Split-propagation obsolete double-count.** A B-tree split seeded a new
+    sibling IN's parent-slot LSN with the triggering write's LN LSN; the
+    checkpointer's superseded-IN obsolete pass then counted that LN offset as a
+    bogus prior *IN* version, colliding with the LN's genuine obsolete count
+    and tripping the `checkDupOffsets` invariant on recovery. A never-logged
+    split sibling now gets `NULL_LSN` in its parent slot (it has no on-disk
+    image until logged, mirroring JE `IN.getLastFullVersion()`), and the
+    checkpoint obsolete pass skips an offset already counted for the file.
+
 - **Four independent data-loss defects on the storage path, each reproduced on a
   release build before the fix and re-verified by an independent reviewer and a
   fresh-worktree lead requalification (debug and release).** All four were found

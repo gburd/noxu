@@ -120,6 +120,57 @@ hex equivalent is shown for readability.
 > Noxu uses different serialization and different type codes;
 > `.ndb` files are not readable by any other database engine.
 
+## BIN Node Payload — embedded LN storage
+
+A full `BIN` (`0x03`) serialises `node_id` (`u64`, BE) and the slot count
+(`u32`, BE), then one record per slot; a `BINDelta` (`0x04`) is the same but
+prefixed with the dirty-slot index and includes only dirty slots. Each slot
+is:
+
+```
+key_len (u32, BE) | key | lsn (u64, BE) | has_data (u8) [| data_len (u32, BE) | data] | known_deleted (u8)
+```
+
+The **`has_data` byte** decides whether the LN's value is *embedded* in the
+slot:
+
+- `has_data = 1` — the slot carries the value inline (`data_len` + `data`
+  follow). Read directly.
+- `has_data = 0` — the slot carries **an LSN pointer only**; the value lives
+  in the LN log entry at `lsn` and is materialised from the log on read (the
+  same path an evictor-stripped LN takes). `known_deleted` still follows.
+
+**Embedding rule (1A, `TREE_MAX_EMBEDDED_LN` / `noxu.tree.maxEmbeddedLN`,
+default 16):** on serialisation a slot embeds its value (`has_data = 1`) only
+when the value length is `<= max_embedded_ln` (and the DB is not a
+sorted-duplicate or internal DB — those never embed). A larger value is
+written as an LSN pointer only (`has_data = 0`). This mirrors JE
+`CursorImpl.shouldEmbedLN` (`data.length <= env.getMaxEmbeddedLN()`) and
+`BIN.updateRecord(.., newEmbeddedLN ? data : null, ..)`. It keeps the BIN
+image small for large records so a checkpoint no longer amplifies the log by
+re-serialising the full value into every BIN it writes (REG-CLEANER-DISKLIMIT).
+
+**Backward compatibility — no `LOG_VERSION` bump.** The `has_data` byte has
+always been part of the slot format, so the change is purely *which value* the
+serialiser writes for a large record, not a new field:
+
+- **Old-format BINs** (written before 1A, when Noxu embedded every value
+  regardless of size) have `has_data = 1` for large records. The decoder reads
+  the embedded bytes exactly as before — an existing database opens and reads
+  with no migration.
+- **New-format BINs** write `has_data = 0` for a value `> max_embedded_ln`;
+  the decoder yields `data = None` for that slot and the read path fetches the
+  value from `lsn` — the identical code path used for an evictor-stripped slot,
+  so recovery and normal reads both materialise the value.
+- A slot with no value (a deletion tombstone, or an already-stripped resident
+  LN) is likewise written `has_data = 0`; `known_deleted` disambiguates a
+  deleted slot from a live-but-non-embedded one.
+
+Because the distinction is carried by the existing `has_data` byte and both
+shapes decode correctly, an old log reads under new code and a new log reads
+under any reader that already understood the slot format — no format-version
+field and no `LOG_VERSION` change.
+
 ## LN (Leaf Node) Payload
 
 An LN entry (`InsertLN` / `UpdateLN` / `DeleteLN` and their `*Txn` variants)

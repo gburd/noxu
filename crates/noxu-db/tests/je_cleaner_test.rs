@@ -173,7 +173,7 @@ fn cleaner_no_dupes_migrates_all_live_data() {
         env.checkpoint(Some(&force())).unwrap();
 
         let before = env.stats().unwrap().cleaner.lns_cleaned;
-        let cleaned = env.clean_log().unwrap();
+        let cleaned = env.clean_log_forced().unwrap();
         assert!(cleaned > 0, "expected files cleaned, got {cleaned}");
         let after = env.stats().unwrap().cleaner.lns_cleaned;
         assert!(
@@ -376,8 +376,17 @@ fn clean_log_baseline_deletes_files_then_reopen_intact() {
 // what we assert. `env.compress()` is JE's `performRecoveryOperation` OP_NONE
 // path ("compress to count deleted LNs").
 
-/// JE `UtilizationTest.testInsert`: a single committed insert leaves the LN
-/// live — zero obsolete LNs. Guards against OVER-counting.
+/// JE `UtilizationTest.testInsert`: a single committed insert.
+///
+/// 1A/B2a (REG-CLEANER-DISKLIMIT): the value (`ikey(0)`, 4 bytes) is
+/// `<= TREE_MAX_EMBEDDED_LN` (16) in a non-dup DB, so the LN is EMBEDDED in its
+/// BIN slot and is counted IMMEDIATELY obsolete at write — exactly JE
+/// `UtilizationTest.testInsert`'s `embeddedLNs` branch: `if (embeddedLNs)
+/// assertEquals(1, obsoleteLNCount) else assertEquals(0, ...)`
+/// (UtilizationTest.java:381-388), and `embeddedLNs = (maxEmbeddedLN >= 4)`
+/// (line 176) — true at the default 16.  The prior port hard-coded the
+/// non-embedded (0) branch because Noxu's `maxEmbeddedLN` was inert; with 1A
+/// honoring it, this is the JE `embeddedLNs = true` expectation.
 #[test]
 fn util_insert_not_obsolete() {
     let dir = TempDir::new().unwrap();
@@ -391,8 +400,9 @@ fn util_insert_not_obsolete() {
 
     assert_eq!(
         total_obsolete_lns(&env),
-        0,
-        "a single committed insert must leave zero obsolete LNs"
+        1,
+        "a committed insert of an EMBEDDED LN (<=16B) is counted immediately \
+         obsolete (JE UtilizationTest.testInsert, embeddedLNs=true branch)"
     );
     assert!(total_lns(&env) >= 1, "at least the user LN was written");
 
@@ -780,7 +790,7 @@ fn file_selection_truncate_database_obsoletes_entries() {
 
     env.checkpoint(Some(&force())).unwrap();
     let cleaned_before = env.stats().unwrap().cleaner.lns_cleaned;
-    let cleaned = env.clean_log().unwrap();
+    let cleaned = env.clean_log_forced().unwrap();
     assert!(cleaned > 0, "truncated-away files must be cleanable");
     let cleaned_after = env.stats().unwrap().cleaner.lns_cleaned;
     assert!(
@@ -813,7 +823,7 @@ fn file_selection_remove_database_obsoletes_entries() {
     env.checkpoint(Some(&force())).unwrap();
 
     let cleaned_before = env.stats().unwrap().cleaner.lns_cleaned;
-    let cleaned = env.clean_log().unwrap();
+    let cleaned = env.clean_log_forced().unwrap();
     assert!(cleaned > 0, "removed-database files must be cleanable");
     let cleaned_after = env.stats().unwrap().cleaner.lns_cleaned;
     assert!(
@@ -1105,14 +1115,24 @@ fn rmw_locking_basic_utilization_accuracy() {
     txn.commit().unwrap();
     env.compress().unwrap();
 
-    // Exactly one prior version (record 1's) is obsolete; record 0 was only
-    // read (RMW), so its LN must NOT be counted obsolete.
+    // 1A/B2a (REG-CLEANER-DISKLIMIT): the values (`ikey(..)`, 4 bytes) are
+    // EMBEDDED (<=16B, non-dup DB).  JE `UtilizationTest.testUpdate`
+    // (UtilizationTest.java:463-478) counts an update of an embedded record as
+    // TWO obsolete LNs: `expectObsolete(file0 /*prior*/, true)` ALWAYS, and
+    // `expectObsolete(file1 /*new*/, embeddedLNs)` — the new embedded version
+    // is itself immediately obsolete.  So modifying record 1 obsoletes its
+    // PRIOR version (+1) AND the NEW embedded version (+1) = 2.  Record 0 was
+    // only RMW-READ (never rewritten), so it contributes ZERO — the RMW-read
+    // must not count its live LN obsolete, which this delta still proves
+    // (2, not 3+).  The prior port asserted 1 under the pre-1A non-embedded
+    // assumption (`embeddedLNs=false`, only the prior version obsolete).
     let delta = total_obsolete_lns(&env) - base;
     assert_eq!(
-        delta, 1,
-        "RMW-modify of one of two RMW-read records must obsolete exactly ONE \
-         prior LN (the modified one); the read-only record must not be \
-         counted obsolete. delta={delta}"
+        delta, 2,
+        "RMW-modify of an EMBEDDED record obsoletes its prior version AND the \
+         new embedded version (JE UtilizationTest.testUpdate, embeddedLNs=true: \
+         file0=true + file1=embeddedLNs); the RMW-READ-only record 0 must add \
+         nothing (delta stays 2, not 3+). delta={delta}"
     );
 
     // Both records still fetch; record 1 has the new value.

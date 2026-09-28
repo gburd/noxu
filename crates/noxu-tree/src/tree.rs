@@ -331,6 +331,16 @@ pub struct Tree {
     /// `EnvironmentImpl.isExpired`'s `expirationEnabled` gate.  Default `true`
     /// (JE default).
     pub expiration_enabled: bool,
+
+    /// Maximum LN data length (bytes) embedded directly in a BIN slot; an LN
+    /// whose data length is `> max_embedded_ln` stores an LSN pointer only in
+    /// the slot and is fetched from the log on read (REG-CLEANER-DISKLIMIT /
+    /// 1A).  Copied into each newly-created `BinStub` (like
+    /// `compact_max_key_length`).  Wired from `EnvironmentConfig`'s
+    /// `noxu.tree.maxEmbeddedLN` via [`Tree::set_max_embedded_ln`].  Default 16
+    /// (JE `EnvironmentParams.TREE_MAX_EMBEDDED_LN` / `env.getMaxEmbeddedLN`,
+    /// `CursorImpl.shouldEmbedLN`, CursorImpl.java:870-874).
+    pub max_embedded_ln: i32,
 }
 
 /// A node in the tree.
@@ -881,6 +891,13 @@ fn self_get_compact(base_file_number: u32, bytes: &[u8], idx: usize) -> Lsn {
 #[allow(non_upper_case_globals)]
 pub const INKeyRep_DEFAULT_MAX_KEY_LENGTH: i32 = 16;
 
+/// Default maximum embedded-LN data length (bytes): an LN whose data is
+/// longer than this stores an LSN pointer only in its BIN slot instead of
+/// the full data (REG-CLEANER-DISKLIMIT / 1A).  Matches JE
+/// `EnvironmentParams.TREE_MAX_EMBEDDED_LN` (`noxu.tree.maxEmbeddedLN`,
+/// default 16).  Wired per-environment via `Tree::set_max_embedded_ln`.
+pub const TREE_MAX_EMBEDDED_LN_DEFAULT: i32 = 16;
+
 /// T-2: node-level key array — `INKeyRep.{Default,MaxKeySize}` (INKeyRep.java).
 ///
 /// The per-slot key that used to live in `BinEntry`/`InEntry` as a `Vec<u8>`
@@ -1236,6 +1253,17 @@ pub struct BinStub {
     /// Default `true` (JE default), so a BIN built without a tree filters
     /// expired records as usual.
     pub expiration_enabled: bool,
+
+    /// Maximum LN data length (bytes) embedded directly in a slot of this BIN.
+    ///
+    /// Copied from the owning `Tree`'s `max_embedded_ln` snapshot at BIN
+    /// construction (like `compact_max_key_length`).  A slot whose cached LN
+    /// data length is `> max_embedded_ln` is serialised as an LSN pointer
+    /// only (`has_data = 0`); its value is materialised from the log on read.
+    /// Default 16 (JE `env.getMaxEmbeddedLN`, `CursorImpl.shouldEmbedLN`).
+    /// A BIN built without a tree (e.g. `deserialize_full`) uses this default,
+    /// which is only consulted when the BIN is (re-)serialised.
+    pub max_embedded_ln: i32,
 }
 
 /// Entry in a BIN node.
@@ -2215,12 +2243,24 @@ impl BinStub {
             let lsn = self.get_lsn(i); // T-3
             let e = &self.entries[i];
             buf.extend_from_slice(&lsn.as_u64().to_be_bytes());
-            if let Some(d) = &e.data {
-                buf.push(1u8);
-                buf.extend_from_slice(&(d.len() as u32).to_be_bytes());
-                buf.extend_from_slice(d);
-            } else {
-                buf.push(0u8);
+            // 1A (REG-CLEANER-DISKLIMIT): embed the data in the slot only when
+            // it is small enough (`len <= max_embedded_ln`); a larger LN stores
+            // an LSN pointer only (`has_data = 0`) and is materialised from the
+            // log at `lsn` on read (the same path an evictor-stripped LN takes,
+            // `fetch_ln_data_from_log`).  JE `CursorImpl.shouldEmbedLN`
+            // (CursorImpl.java:870-874) + `BIN.updateRecord(..,
+            // newEmbeddedLN ? data : null, ..)` (CursorImpl.java:1695).  A slot
+            // with no cached data (`None` — deletion tombstone or already
+            // stripped) is written `has_data = 0` unchanged.
+            match &e.data {
+                Some(d) if (d.len() as i64) <= self.max_embedded_ln as i64 => {
+                    buf.push(1u8);
+                    buf.extend_from_slice(&(d.len() as u32).to_be_bytes());
+                    buf.extend_from_slice(d);
+                }
+                _ => {
+                    buf.push(0u8);
+                }
             }
             buf.push(e.known_deleted as u8);
         }
@@ -2250,12 +2290,17 @@ impl BinStub {
             let lsn = self.get_lsn(idx); // T-3
             let e = &self.entries[idx];
             buf.extend_from_slice(&lsn.as_u64().to_be_bytes());
-            if let Some(d) = &e.data {
-                buf.push(1u8);
-                buf.extend_from_slice(&(d.len() as u32).to_be_bytes());
-                buf.extend_from_slice(d);
-            } else {
-                buf.push(0u8);
+            // 1A (REG-CLEANER-DISKLIMIT): embed only when small enough; a
+            // larger LN stores an LSN pointer only (see `serialize_full`).
+            match &e.data {
+                Some(d) if (d.len() as i64) <= self.max_embedded_ln as i64 => {
+                    buf.push(1u8);
+                    buf.extend_from_slice(&(d.len() as u32).to_be_bytes());
+                    buf.extend_from_slice(d);
+                }
+                _ => {
+                    buf.push(0u8);
+                }
             }
             buf.push(e.known_deleted as u8);
         }
@@ -2360,6 +2405,7 @@ impl BinStub {
             keys: KeyRep::from_keys(keys),     // T-2 (full keys, no prefix yet)
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         };
         // Recompute key prefix from the full keys just loaded.
         // `IN.recalcKeyPrefix()` called after materializing from log.
@@ -2897,6 +2943,7 @@ impl Tree {
             key_prefixing: false, // JE default: KEY_PREFIXING_DEFAULT = false
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH, // T-5
             expiration_enabled: true, // JE default: ENV_EXPIRATION_ENABLED = true
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         }
     }
 
@@ -2950,6 +2997,15 @@ impl Tree {
     /// (`ENV_EXPIRATION_ENABLED` kill switch, JE `EnvironmentImpl.isExpired`).
     pub fn set_expiration_enabled(&mut self, enabled: bool) {
         self.expiration_enabled = enabled;
+    }
+
+    /// 1A: set the embedded-LN threshold (`TREE_MAX_EMBEDDED_LN` /
+    /// `env.getMaxEmbeddedLN`).  New BINs created by this tree inherit it; an
+    /// LN whose data length exceeds it is serialised as an LSN pointer only
+    /// (fetched from the log on read) rather than embedded in the BIN slot.
+    /// Wired from `EnvironmentConfig.noxu.tree.maxEmbeddedLN`.  Default 16.
+    pub fn set_max_embedded_ln(&mut self, max: i32) {
+        self.max_embedded_ln = max;
     }
 
     /// Notify the listener that a node became resident (JE `Evictor.addBack`).
@@ -3044,6 +3100,7 @@ impl Tree {
             key_prefixing: false,
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH, // T-5
             expiration_enabled: true, // JE default: ENV_EXPIRATION_ENABLED = true
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         }
     }
 
@@ -4118,6 +4175,7 @@ impl Tree {
                     keys: KeyRep::from_keys(vec![key]), // T-2
                     compact_max_key_length: self.compact_max_key_length,
                     expiration_enabled: self.expiration_enabled,
+                    max_embedded_ln: self.max_embedded_ln,
                 })));
 
                 // Upper IN at level 2; slot 0 uses an empty key (virtual root key).
@@ -4271,6 +4329,7 @@ impl Tree {
                     keys: KeyRep::from_keys(vec![key.to_vec()]), // T-2
                     compact_max_key_length: self.compact_max_key_length,
                     expiration_enabled: self.expiration_enabled,
+                    max_embedded_ln: self.max_embedded_ln,
                 })));
 
                 let root_arc =
@@ -4446,7 +4505,13 @@ impl Tree {
         parent: &Arc<RwLock<TreeNode>>,
         child_index: usize,
         max_entries: usize,
-        lsn: Lsn,
+        // REG-CLEANER-DISKLIMIT: the triggering write's LSN is no longer used
+        // here -- the new split sibling is seeded with `NULL_LSN` in its parent
+        // slot (it has no on-disk image until it is logged), so the
+        // checkpointer's superseded-IN obsolete pass never mistakes an LN LSN
+        // for the sibling's prior version. Retained in the signature for the
+        // descent's call shape; prefixed to document the deliberate non-use.
+        _lsn: Lsn,
         hint: SplitHint,
         insert_key: &[u8],
         key_comparator: Option<&KeyComparatorFn>,
@@ -4567,6 +4632,12 @@ impl Tree {
         let bin_expiration_enabled: bool = match &*child_guard {
             TreeNode::Bottom(b) => b.expiration_enabled,
             TreeNode::Internal(_) => true,
+        };
+        // Inherit the splitting BIN's embedded-LN threshold so the right half
+        // makes the same embed-vs-LSN-pointer serialisation decision (1A).
+        let bin_max_embedded_ln: i32 = match &*child_guard {
+            TreeNode::Bottom(b) => b.max_embedded_ln,
+            TreeNode::Internal(_) => TREE_MAX_EMBEDDED_LN_DEFAULT,
         };
         let (all_entries, bin_old_prefix) = match &*child_guard {
             TreeNode::Internal(n) => {
@@ -4780,6 +4851,7 @@ impl Tree {
                     keys: KeyRep::from_keys(rk),
                     compact_max_key_length: bin_compact_max_key_length,
                     expiration_enabled: bin_expiration_enabled,
+                    max_embedded_ln: bin_max_embedded_ln,
                 };
                 // St-H6 debug guard: the sibling must carry the same flag as
                 // the splitting BIN so that in_hours-resolution entries are
@@ -4812,10 +4884,27 @@ impl Tree {
                 let insert_pos = child_index + 1;
                 // T-4: insert the parent slot and set its cached child via the
                 // node-level INTargetRep (shifting existing children).
+                //
+                // REG-CLEANER-DISKLIMIT (split-propagation obsolete fix): the
+                // new sibling has NO on-disk image yet — it is dirty and will
+                // be logged by the next checkpoint/eviction, which then stamps
+                // its real LSN into this slot (`update_parent_slot_lsn` /
+                // `note_root_logged`).  Seed the slot with `NULL_LSN`, NOT the
+                // triggering write's `lsn` (which is the LN that caused the
+                // split): a never-logged IN's prior version is NULL, mirroring
+                // JE `IN.getLastFullVersion()` for an unlogged node.  Stamping
+                // the LN's LSN here made the checkpointer's superseded-IN
+                // obsolete pass (NEW-CLEANER-IN-OBSOLETE) read that LN LSN back
+                // via `get_parent_slot_lsn` and count it obsolete AS AN IN —
+                // colliding with the same LN's genuine Exact obsolete count and
+                // tripping the JE `checkDupOffsets` invariant
+                // (split_propagation_recovers).  The resident sibling is used
+                // directly until it is logged, so a NULL slot LSN is never
+                // followed for a fetch before the real LSN is stamped.
                 p.insert_entry(
                     insert_pos,
                     new_id_key,
-                    lsn,
+                    NULL_LSN,
                     Some(new_sibling.clone()),
                 );
                 // Parent is dirty because it gained a new entry.
@@ -10494,6 +10583,7 @@ mod tests {
             keys: KeyRep::from_keys(full_keys),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         }
     }
 
@@ -10785,6 +10875,7 @@ mod tests {
             keys: KeyRep::new(),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         });
         assert!(bin.is_bin());
         assert_eq!(bin.level(), BIN_LEVEL);
@@ -10835,6 +10926,7 @@ mod tests {
             keys: KeyRep::from_keys(keys),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         });
 
         // Search for existing key
@@ -11295,6 +11387,7 @@ mod tests {
             keys: KeyRep::new(),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         });
         tree.set_root(bin);
         assert!(tree.get_root().is_some());
@@ -11568,6 +11661,7 @@ mod tests {
             keys: KeyRep::new(),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         }
     }
 
@@ -11805,6 +11899,7 @@ mod tests {
             keys: KeyRep::new(),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         });
         assert!(!bin_node.is_dirty());
         bin_node.set_dirty(true);
@@ -11848,6 +11943,7 @@ mod tests {
             keys: KeyRep::new(),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         });
         assert_eq!(bin_node.get_generation(), 0);
         bin_node.set_generation(42);
@@ -11902,6 +11998,7 @@ mod tests {
             keys: KeyRep::from_keys(vec![b"alpha".to_vec(), b"beta".to_vec()]),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         });
         assert_eq!(bin_node.log_size(), bin_node.write_to_bytes().len());
 
@@ -11943,6 +12040,7 @@ mod tests {
             keys: KeyRep::new(),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         });
         let bytes = node.write_to_bytes();
         // First 8 bytes = node_id big-endian.
@@ -11973,6 +12071,7 @@ mod tests {
             keys: KeyRep::new(),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         });
         let with_entry = TreeNode::Bottom(BinStub {
             node_id: 2,
@@ -11997,6 +12096,7 @@ mod tests {
             keys: KeyRep::from_keys(vec![b"longkey_here".to_vec()]),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         });
         assert!(
             with_entry.log_size() > empty.log_size(),
@@ -12026,6 +12126,7 @@ mod tests {
             keys: KeyRep::new(),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         })));
 
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
@@ -12776,6 +12877,7 @@ mod tests {
             keys: KeyRep::new(),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         })));
 
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
@@ -12826,6 +12928,7 @@ mod tests {
             keys: KeyRep::new(),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         })));
 
         assert!(
@@ -12855,6 +12958,7 @@ mod tests {
             keys: KeyRep::new(),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         })));
         let bin_b = Arc::new(RwLock::new(TreeNode::Bottom(BinStub {
             node_id: generate_node_id(),
@@ -12874,6 +12978,7 @@ mod tests {
             keys: KeyRep::new(),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         })));
 
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
@@ -12975,6 +13080,7 @@ mod tests {
             keys: KeyRep::from_keys(vec![b"a".to_vec(), b"c".to_vec()]),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         };
 
         let delta_entries = vec![
@@ -13041,6 +13147,7 @@ mod tests {
             keys: KeyRep::from_keys(vec![b"x".to_vec()]),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         };
         let n_before = base.entries.len();
         Tree::apply_delta_to_bin(&mut base, vec![]);
@@ -13090,6 +13197,7 @@ mod tests {
             keys: KeyRep::from_keys(vec![b"aa".to_vec(), b"cc".to_vec()]),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         };
 
         // The delta has a new entry "bb" and overwrites "aa".
@@ -13124,6 +13232,7 @@ mod tests {
             keys: KeyRep::from_keys(vec![b"aa".to_vec(), b"bb".to_vec()]),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         };
 
         Tree::mutate_to_full_bin(&mut delta, base);
@@ -13181,6 +13290,7 @@ mod tests {
             keys: KeyRep::new(),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         };
         assert!(!Tree::bin_is_delta(&bin));
         bin.is_delta = true;
@@ -13224,6 +13334,7 @@ mod tests {
             keys: KeyRep::from_keys(vec![b"key1".to_vec()]),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         };
 
         Tree::mutate_to_full_bin_from_log(&mut bin, &lm);
@@ -13270,6 +13381,7 @@ mod tests {
             keys: KeyRep::from_keys(vec![b"a".to_vec()]),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         };
 
         Tree::mutate_to_full_bin_from_log(&mut delta, &lm);
@@ -13333,6 +13445,7 @@ mod tests {
             ]),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         };
 
         let payload = full_bin.serialize_full();
@@ -13384,6 +13497,7 @@ mod tests {
             ]),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         };
 
         Tree::mutate_to_full_bin_from_log(&mut delta, &lm);
@@ -13482,6 +13596,7 @@ mod tests {
             ]),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         };
         source.recompute_key_prefix();
         // Verify the source has the expected prefix before serializing.
@@ -13536,6 +13651,7 @@ mod tests {
             keys: KeyRep::from_keys(vec![b"solo".to_vec()]),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         };
 
         let payload = source.serialize_full();
@@ -13813,6 +13929,7 @@ mod tests {
             keys: KeyRep::new(),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         };
 
         bin.insert_with_prefix(b"record:aaa".to_vec(), Lsn::new(1, 1), None);
@@ -13847,6 +13964,7 @@ mod tests {
             keys: KeyRep::new(),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         };
 
         let keys = [
@@ -13893,6 +14011,7 @@ mod tests {
             keys: KeyRep::new(),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         };
 
         for k in
@@ -13978,6 +14097,7 @@ mod tests {
             keys: KeyRep::new(),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         };
 
         for k in [b"myapp:user:1".as_ref(), b"myapp:user:2".as_ref()] {
@@ -14371,6 +14491,7 @@ mod tests {
             ]),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         })));
 
         // Wire a minimal parent IN so compress_bin can prune if needed.
@@ -14486,6 +14607,7 @@ mod tests {
             ]),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         })));
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
             node_id: generate_node_id(),
@@ -14586,6 +14708,7 @@ mod tests {
             ]),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         })));
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
             node_id: generate_node_id(),
@@ -14646,6 +14769,7 @@ mod tests {
             keys: KeyRep::from_keys(vec![b"x".to_vec()]),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         })));
 
         let tree = Tree::new(1, 128);
@@ -14685,6 +14809,7 @@ mod tests {
             keys: KeyRep::from_keys(vec![b"k".to_vec()]),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         })));
 
         let tree = Tree::new(1, 128);
@@ -14734,6 +14859,7 @@ mod tests {
             keys: KeyRep::from_keys(vec![b"only".to_vec()]),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         })));
 
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
@@ -14796,6 +14922,7 @@ mod tests {
             keys: KeyRep::from_keys(vec![b"live".to_vec()]),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         })));
 
         let tree = Tree::new(1, 128);
@@ -14844,6 +14971,7 @@ mod tests {
             keys: KeyRep::from_keys(vec![b"live".to_vec(), b"dead".to_vec()]),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         })));
 
         let tree = Tree::new(1, 128);
@@ -14919,6 +15047,7 @@ mod tests {
             ]),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         })));
 
         // Parent IN with two children: the BIN above plus a placeholder sibling.
@@ -14945,6 +15074,7 @@ mod tests {
             keys: KeyRep::from_keys(vec![b"\x40".to_vec()]),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         })));
 
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
@@ -15083,6 +15213,7 @@ mod tests {
             keys: KeyRep::from_keys(vec![b"k".to_vec()]),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         })));
 
         let tree = Tree::new(1, 128);
@@ -15144,6 +15275,7 @@ mod tests {
             keys: KeyRep::from_keys(vec![b"\x00".to_vec(), b"\x01".to_vec()]),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         })));
 
         let tree = Tree::new(1, 128);
@@ -15218,6 +15350,7 @@ mod tests {
             ]),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         })));
 
         // Wire up a parent so compress_bin can run normally.
@@ -15395,6 +15528,7 @@ mod tests {
             keys: KeyRep::from_keys(vec![b"\x00".to_vec(), b"\x01".to_vec()]),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         })));
 
         let sibling_arc = Arc::new(RwLock::new(TreeNode::Bottom(BinStub {
@@ -15420,6 +15554,7 @@ mod tests {
             keys: KeyRep::from_keys(vec![b"\x40".to_vec()]),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         })));
 
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
@@ -15536,6 +15671,7 @@ mod tests {
             ]),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         })));
 
         let root_arc = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
@@ -15723,6 +15859,7 @@ mod tests {
             keys: KeyRep::new(),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         };
         bin.insert_with_prefix(b"key".to_vec(), lsn, Some(b"val".to_vec()));
         assert_eq!(bin.dirty_count(), 1, "new slot should be dirty");
@@ -15755,6 +15892,7 @@ mod tests {
             keys: KeyRep::from_keys(vec![b"key".to_vec()]),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         };
         bin.insert_with_prefix(
             b"key".to_vec(),
@@ -15798,6 +15936,7 @@ mod tests {
             keys: KeyRep::from_keys(vec![b"alpha".to_vec(), b"beta".to_vec()]),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         };
         let bytes = bin.serialize_full();
         let node_id = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
@@ -15808,6 +15947,69 @@ mod tests {
         assert_eq!(bin.dirty_count(), 0);
         assert_eq!(bin.last_full_lsn, Lsn::new(2, 1));
         assert!(!bin.dirty);
+    }
+
+    /// 1A (REG-CLEANER-DISKLIMIT): a slot whose cached data length exceeds
+    /// `max_embedded_ln` is serialised as an LSN-pointer only (`has_data = 0`),
+    /// and re-reads as `data: None` (the read path then fetches it from the LSN
+    /// — the same path an evictor-stripped LN takes).  A small slot (<= 16 B)
+    /// still embeds.
+    #[test]
+    fn test_serialize_full_large_ln_is_lsn_pointer_only() {
+        let small = vec![1u8; 16]; // == threshold: embedded
+        let large = vec![2u8; 17]; // > threshold: LSN-pointer only
+        let mut bin = make_bin_for_delta_tests(vec![
+            (b"k_small".to_vec(), Lsn::new(3, 10), Some(small.clone())),
+            (b"k_large".to_vec(), Lsn::new(3, 20), Some(large)),
+        ]);
+        bin.max_embedded_ln = 16;
+        let bytes = bin.serialize_full();
+        let loaded =
+            BinStub::deserialize_full(&bytes).expect("must deserialize");
+        // The <=16 B slot keeps its embedded data.
+        let small_idx =
+            loaded.get_full_key(0).map(|k| k == b"k_small").unwrap_or(false);
+        let (i_small, i_large) = if small_idx { (0, 1) } else { (1, 0) };
+        assert_eq!(
+            loaded.entries[i_small].data.as_deref(),
+            Some(small.as_slice()),
+            "<=16B LN must stay embedded"
+        );
+        // The >16 B slot is NOT embedded: has_data was written 0, so it loads
+        // as None (the read path fetches from the slot LSN, preserved below).
+        assert!(
+            loaded.entries[i_large].data.is_none(),
+            ">16B LN must serialise as an LSN pointer only (data: None on load)"
+        );
+        // The LSN pointer survives so the value is recoverable from the log.
+        assert_eq!(loaded.get_lsn(i_large), Lsn::new(3, 20));
+    }
+
+    /// 1A backward-compat: an OLD-format BIN (written before 1A, so ALL data
+    /// embedded regardless of size — modelled by `max_embedded_ln = i32::MAX`)
+    /// must still READ correctly under the NEW decode.  `deserialize_full`
+    /// keys the embed decision off the on-disk `has_data` byte, not off the
+    /// current `max_embedded_ln`, so an old BIN with a large embedded value
+    /// round-trips its data intact — no LOG_VERSION bump required.
+    #[test]
+    fn test_deserialize_full_old_format_large_embedded_reads() {
+        let large = vec![7u8; 4096]; // huge value, embedded in the OLD format
+        let mut old_bin = make_bin_for_delta_tests(vec![(
+            b"legacy".to_vec(),
+            Lsn::new(9, 99),
+            Some(large.clone()),
+        )]);
+        // Old format: everything embeds regardless of size.
+        old_bin.max_embedded_ln = i32::MAX;
+        let old_bytes = old_bin.serialize_full();
+        // New code decodes the old bytes: the embedded value must survive.
+        let loaded = BinStub::deserialize_full(&old_bytes)
+            .expect("new code must decode an old-format BIN");
+        assert_eq!(
+            loaded.entries[0].data.as_deref(),
+            Some(large.as_slice()),
+            "old-format embedded value must read back intact (no format bump)"
+        );
     }
 
     #[test]
@@ -15853,6 +16055,7 @@ mod tests {
             ]),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         };
         let bytes = bin.serialize_delta();
         let node_id = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
@@ -15919,6 +16122,7 @@ mod tests {
             keys: KeyRep::from_keys(keys),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         }
     }
 
@@ -16426,6 +16630,7 @@ mod tests {
             keys: KeyRep::new(),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         };
         // Three slots with embedded data + VALID logged LSNs (one dirty).
         // JE-faithful: a slot with a valid LSN is strippable regardless of the
@@ -16606,6 +16811,7 @@ fn test_split_child_sibling_inherits_expiration_in_hours() {
         keys: KeyRep::from_keys(bin_keys),
         compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
         expiration_enabled: true,
+        max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
     })));
 
     let root = Arc::new(RwLock::new(TreeNode::Internal(InNodeStub {
@@ -16736,6 +16942,7 @@ mod in_redo_tests {
             keys: KeyRep::new(),
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
             expiration_enabled: true,
+            max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
         };
         for i in 0..n {
             // T-2/T-3: route through insert so entries/keys/lsn_rep stay

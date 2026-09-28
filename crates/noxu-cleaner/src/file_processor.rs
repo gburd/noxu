@@ -61,20 +61,21 @@ fn write_migration_ln(
     key: &[u8],
     data: &[u8],
     old_lsn: Lsn,
+    embedded_ln: bool,
 ) -> Option<Lsn> {
     use noxu_log::{LogEntryType, Provisional, entry::LnLogEntry};
     use noxu_util::vlsn::NULL_VLSN;
 
     let entry = LnLogEntry::new(
         db_id,
-        None,      // txn_id: non-transactional migration
-        old_lsn,   // abort_lsn: the pre-migration slot LSN (before-image)
-        false,     // abort_known_deleted
-        None,      // abort_key
-        None,      // abort_data
-        NULL_VLSN, // abort_vlsn
-        0,         // abort_expiration
-        true,      // embedded_ln (data inline in BIN)
+        None,        // txn_id: non-transactional migration
+        old_lsn,     // abort_lsn: the pre-migration slot LSN (before-image)
+        false,       // abort_known_deleted
+        None,        // abort_key
+        None,        // abort_data
+        NULL_VLSN,   // abort_vlsn
+        0,           // abort_expiration
+        embedded_ln, // 1A: <=max_embedded_ln embed, >16B LSN-pointer only
         key.to_vec(),
         Some(data.to_vec()),
         0,         // expiration
@@ -93,6 +94,36 @@ fn write_migration_ln(
         false, // fsync_required
     )
     .ok()
+}
+
+/// Fetch an LN's value from the log at `lsn`.
+///
+/// 1A on-disk format: an LN whose data length is `> max_embedded_ln`
+/// (`TREE_MAX_EMBEDDED_LN`, default 16) is written to the BIN slot as an
+/// LSN-pointer only (`has_data = 0`, `data = None`); its authoritative copy is
+/// the standalone LN log entry.  After a restart (or after the evictor strips
+/// the slot) the resident slot holds `data = None`, so the cleaner cannot read
+/// the value out of the slot — it must re-read it from the log, exactly as
+/// `CursorImpl::fetch_ln_data_from_log` / JE `bin.fetchLN` do.  JE
+/// `FileProcessor.processFoundLN` migrates `lnFromLog = info.getLN()`, the LN
+/// read from the log entry being cleaned; Noxu's `LnInfo` does not carry the
+/// value, so we fetch it here from the slot's `tree_lsn`.
+///
+/// Returns `None` if the log manager cannot read the entry, the entry is not an
+/// LN, or the parse fails — the caller must NOT migrate empty data for a
+/// non-embedded slot (that is the data-loss defect this fixes).
+fn fetch_migration_ln_data_from_log(
+    lm: &LogManager,
+    lsn: Lsn,
+) -> Option<Vec<u8>> {
+    use noxu_log::entry::LnLogEntry;
+    let (entry_type, bytes) = lm.read_entry(lsn).ok()?;
+    if !entry_type.is_ln_type() {
+        return None;
+    }
+    let is_txnal = entry_type.is_transactional();
+    let ln = LnLogEntry::parse_from_slice(&bytes, is_txnal).ok()?;
+    ln.data.map(|d| d.to_vec())
 }
 
 /// The number of LN log entries after which we process pending LNs.
@@ -336,8 +367,41 @@ impl TreeLookup for RealTreeLookup {
                     return MigrationOutcome::Obsolete;
                 }
             };
-            Self::get_slot_data_from_root(tree.get_root(), key)
-                .unwrap_or_default()
+            let slot_data = Self::get_slot_data_from_root(tree.get_root(), key);
+            let max_embedded_ln = tree.max_embedded_ln;
+            (slot_data, max_embedded_ln)
+        };
+        let (slot_data, max_embedded_ln) = data;
+
+        // 1A DATA-LOSS FIX: a slot whose data length is > max_embedded_ln is
+        // stored as an LSN-pointer only (`data = None`) after a restart or an
+        // evictor strip.  Do NOT migrate `.unwrap_or_default()` empty data —
+        // fetch the value from the log at `tree_lsn`, mirroring
+        // `CursorImpl::fetch_ln_data_from_log` and JE `bin.fetchLN` /
+        // `FileProcessor.processFoundLN`'s `lnFromLog`.
+        let data: Vec<u8> = match slot_data {
+            Some(d) => d,
+            None => match &self.log_manager {
+                Some(lm) => {
+                    match fetch_migration_ln_data_from_log(lm, tree_lsn) {
+                        Some(d) => d,
+                        None => {
+                            // Could not re-read the value; aborting migration is
+                            // safe (the source file stays protected) — never
+                            // migrate empty data for a non-embedded slot.
+                            release_cleaner_lock(
+                                &self.lock_manager,
+                                lock_lsn,
+                                locker_id,
+                                "RealTreeLookup::migrate_ln_slot:fetch_failed",
+                            );
+                            return MigrationOutcome::Locked;
+                        }
+                    }
+                }
+                // Test-only no-WAL path: no log to fetch from.
+                None => Vec::new(),
+            },
         };
 
         // X-6: write a real WAL entry for the migrated LN so that recovery
@@ -346,12 +410,16 @@ impl TreeLookup for RealTreeLookup {
         // is wired (unit-test mode without a real WAL — acceptable there).
         // In production (SharedTreeLookup), the log manager is always present
         // and R-7 applies: WAL failure aborts migration instead of falling back.
+        // 1A: honor TREE_MAX_EMBEDDED_LN — a >16B LN is re-logged embedded=false
+        // (authoritative copy is the standalone log entry, matching
+        // serialize_full and JE's newEmbeddedLN=false for migrations).
+        let embedded_ln = (data.len() as i64) <= max_embedded_ln as i64;
         let db_id_u64 = _db_id.unsigned_abs();
         let new_lsn = if let Some(lm) = &self.log_manager {
             // RealTreeLookup is test-only (SharedTreeLookup is production).
             // Fall back to log_lsn only in this test path; production path
             // uses SharedTreeLookup which enforces R-7 abort-on-failure.
-            write_migration_ln(lm, db_id_u64, key, &data, log_lsn)
+            write_migration_ln(lm, db_id_u64, key, &data, log_lsn, embedded_ln)
                 .unwrap_or(log_lsn)
         } else {
             log_lsn
@@ -819,11 +887,47 @@ impl TreeLookup for SharedTreeLookup {
                     return MigrationOutcome::Obsolete;
                 }
             };
-            RealTreeLookup::get_slot_data_from_root(tree.get_root(), key)
-                .unwrap_or_default()
+            let slot_data =
+                RealTreeLookup::get_slot_data_from_root(tree.get_root(), key);
+            let max_embedded_ln = tree.max_embedded_ln;
+            (slot_data, max_embedded_ln)
+        };
+        let (slot_data, max_embedded_ln) = data;
+
+        // 1A DATA-LOSS FIX: a >max_embedded_ln slot is an LSN-pointer only
+        // (`data = None`) after a restart / evictor strip.  Fetch the value
+        // from the log at `tree_lsn` instead of migrating empty data — mirrors
+        // `CursorImpl::fetch_ln_data_from_log` and JE
+        // `FileProcessor.processFoundLN`'s `lnFromLog` (read from the log entry
+        // being cleaned, not the possibly-stripped in-memory slot).
+        let data: Vec<u8> = match slot_data {
+            Some(d) => d,
+            None => match fetch_migration_ln_data_from_log(
+                &self.log_manager,
+                tree_lsn,
+            ) {
+                Some(d) => d,
+                None => {
+                    // Could not re-read the value; abort the migration (source
+                    // file stays protected).  Never migrate empty data for a
+                    // non-embedded slot — that is the data-loss defect.
+                    release_cleaner_lock(
+                        &self.lock_manager,
+                        lock_lsn,
+                        locker_id,
+                        "SharedTreeLookup::migrate_ln_slot:fetch_failed",
+                    );
+                    return MigrationOutcome::Locked;
+                }
+            },
         };
 
         let db_id_u64 = db_id.unsigned_abs();
+        // 1A: honor TREE_MAX_EMBEDDED_LN — re-log a >16B migrated LN with
+        // embedded_ln=false (its authoritative copy is the standalone log
+        // entry; embedded=true would reintroduce the 1A inconsistency and,
+        // under B2a, mark the re-logged large LN immediately obsolete).
+        let embedded_ln = (data.len() as i64) <= max_embedded_ln as i64;
         // R-7 (Keith re-audit): if write_migration_ln() fails, do NOT fall back
         // to the original log_lsn.  That stale LSN points to the file being
         // cleaned; once the cleaner deletes it, recovery cannot find the data.
@@ -835,6 +939,7 @@ impl TreeLookup for SharedTreeLookup {
             key,
             &data,
             log_lsn,
+            embedded_ln,
         ) {
             Some(lsn) => lsn,
             None => {
@@ -1179,6 +1284,18 @@ pub struct FileProcessor {
     /// JE: `FileProcessor.processFile` calls `cleaner.processPending()` every
     /// `PROCESS_PENDING_EVERY_N_LNS` (FileProcessor.java ~line 1004–1005).
     process_pending_fn: Option<Arc<dyn Fn() + Send + Sync>>,
+
+    /// REG-CLEANER-DISKLIMIT (embedded-LN immediate-obsolete): the set of LN
+    /// log-entry offsets in the file being processed that are already KNOWN
+    /// obsolete (recorded in the file's `TrackedFileSummary` /
+    /// `FileSummaryLN` obsolete-offset list — e.g. a standalone LN whose data
+    /// a checkpoint has since embedded into its BIN slot).  Such an entry is
+    /// skipped WITHOUT a tree lookup or migration, exactly like JE
+    /// `FileProcessor.processFile`'s obsolete-offset check
+    /// (FileProcessor.java:673-802: `obsoleteIter` / `nextObsolete ==
+    /// fileOffset -> isObsolete = true`).  Empty by default (no skip); wired
+    /// by `Cleaner::process_single_file` from the live utilization tracker.
+    obsolete_offsets: std::collections::HashSet<u32>,
 }
 
 /// Result of processing a single file.
@@ -1250,7 +1367,20 @@ impl FileProcessor {
             shutdown,
             process_pending_interval: PROCESS_PENDING_EVERY_N_LNS,
             process_pending_fn: None,
+            obsolete_offsets: std::collections::HashSet::new(),
         }
+    }
+
+    /// Wires the set of already-known-obsolete LN offsets for the file being
+    /// processed (REG-CLEANER-DISKLIMIT).  Entries whose offset is in this set
+    /// are counted obsolete and skipped without a tree lookup or migration,
+    /// mirroring JE `FileProcessor.processFile`'s obsolete-offset check.
+    pub fn with_obsolete_offsets(
+        mut self,
+        offsets: std::collections::HashSet<u32>,
+    ) -> Self {
+        self.obsolete_offsets = offsets;
+        self
     }
 
     /// Sets the interval for processing pending LNs.
@@ -1352,6 +1482,25 @@ impl FileProcessor {
                     expiration_time,
                     entry_size,
                 } => {
+                    // REG-CLEANER-DISKLIMIT (embedded-LN immediate-obsolete):
+                    // skip an LN whose offset is already recorded obsolete in
+                    // the file's tracked obsolete-offset set — e.g. a
+                    // standalone LN whose data a checkpoint has since embedded
+                    // into its BIN slot (its authoritative copy now lives in
+                    // the checkpointed BIN; the standalone entry is redundant).
+                    // Counted obsolete and skipped WITHOUT a tree lookup or
+                    // migration.  JE FileProcessor.processFile:796-802 (the
+                    // `nextObsolete == fileOffset -> isObsolete` check) does
+                    // exactly this via the file's persisted obsolete offsets;
+                    // migrating an already-obsolete embedded LN would re-log
+                    // it, dirty its BIN, and drive the checkpoint/migration
+                    // treadmill that blocked disk-limit recovery.
+                    if self.obsolete_offsets.contains(&file_offset) {
+                        result.lns_obsolete += 1;
+                        self.stats.lns_obsolete.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+
                     // Deleted LNs (log version > 2) are immediately obsolete.
                     if *deleted {
                         result.lns_obsolete += 1;
