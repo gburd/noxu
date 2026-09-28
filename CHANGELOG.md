@@ -17,6 +17,9 @@ listed in [References](#references).
 ## [Unreleased]
 
 ### Added
+- `noxu-latch` exposes read-only `n_waiters()` on the exclusive and shared latches
+  and `is_owner()` on the shared latch (matching JE `Latch.getNWaiters` /
+  `SharedLatch.isOwner`), surfacing the existing waiter counter for observability.
 - Subscription API gains `EntryRequestType` (with a JE-faithful start-VLSN resolution
   table), a validating `SubscriptionConfig::new`, and `Subscription::start_from_vlsn`,
   completing the subscription config/positioning primitives (matching JE
