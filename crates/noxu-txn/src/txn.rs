@@ -1596,6 +1596,13 @@ impl Txn {
                 );
             }
         }
+        // Real txn-end: drop the lock-manager's preempted flag for this locker
+        // (JE `Locker` close -> preemptedCause reset).  This is the ordinary
+        // commit-and-abort path — `release_all_for_locker` (the only other
+        // clear site) is a cleaner/catastrophic sweep, not the normal path — so
+        // without this the flag would leak and a reused locker id could inherit
+        // a stale `LockPreempted`.
+        self.lock_manager.clear_preempted(self.id);
     }
 
     /// Returns (and clears) the list of undo records produced by `abort()`.
