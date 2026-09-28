@@ -682,10 +682,18 @@ mod tests {
             end_key: &[u8],
             end_inclusive: bool,
         ) -> std::result::Result<KeyRange, KeyRangeException> {
-            if !self.check_begin(begin_key, begin_inclusive) {
+            // JE KeyRange.subRange validates each new bound with the FULL
+            // check() = checkBegin && checkEnd (not a single-sided check), so a
+            // new begin that violates the parent's END constraint (e.g. an
+            // empty [k,k) request) is reported as "beginKey out of range".
+            if !(self.check_begin(begin_key, begin_inclusive)
+                && self.check_end(begin_key, begin_inclusive))
+            {
                 return Err(KeyRangeException("beginKey out of range"));
             }
-            if !self.check_end(end_key, end_inclusive) {
+            if !(self.check_begin(end_key, end_inclusive)
+                && self.check_end(end_key, end_inclusive))
+            {
                 return Err(KeyRangeException("endKey out of range"));
             }
             Ok(KeyRange {
@@ -1047,12 +1055,14 @@ mod tests {
             KeyRangeException("beginKey out of range"),
         );
 
-        // Subrange [3, 3) is invalid: begin 3 (>= parent begin 1) passes,
-        // but end 3 > parent end 2 fails.  JE checks begin first, then
-        // end, so this reports endKey (not beginKey) out of range.
+        // Subrange [3, 3) is invalid: JE validates the new BEGIN bound with
+        // the full check() = checkBegin && checkEnd, so begin 3 — though it
+        // satisfies the parent begin (3 >= 1) — fails the parent END constraint
+        // (3 > 2), and JE reports "beginKey out of range" (KeyRange.subRange
+        // checks begin before end).
         assert_eq!(
             base.sub_range(&[3], true, &[3], false).unwrap_err(),
-            KeyRangeException("endKey out of range"),
+            KeyRangeException("beginKey out of range"),
         );
     }
 }
