@@ -909,6 +909,18 @@ impl EnvironmentImpl {
                 recovered_fanouts.insert(name, fanout);
             }
 
+            // NEW-UTIL-1: ENV_RECOVERY_FORCE_NEW_FILE.  After a
+            // restore-from-backup recovery, force the next log write onto a
+            // fresh file so the restored backup's last log file is never
+            // appended to (protecting it from being written past its
+            // backed-up length) [#22834].  JE `RecoveryManager.recover`
+            // (~line 329) calls `fileManager.forceNewLogFile()` under this
+            // param; we do the equivalent here after the recovery scan, on
+            // the same FileManager the real LogManager is about to wrap.
+            if cfg.env_recovery_force_new_file {
+                fm.force_new_log_file();
+            }
+
             let mut lm = LogManager::new(
                 fm,
                 cfg.log_num_buffers,
