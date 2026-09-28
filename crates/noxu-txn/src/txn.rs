@@ -677,6 +677,14 @@ impl Txn {
             return Err(e);
         }
 
+        // Real txn-end (commit-success path): this path drains read + write
+        // locks INLINE (Fix 3a splits the write-lock release across the fsync
+        // barrier) and never calls `release_all_locks`, so the preempted flag
+        // must be cleared here too.  (Abort and every commit ERROR path route
+        // through `release_all_locks`, which clears it there.)  JE `Locker`
+        // close -> preemptedCause reset; without this a committed victim on a
+        // steal-heavy replica would leak its flag and a reused id inherit it.
+        self.lock_manager.clear_preempted(self.id);
         self.state = TxnState::Committed;
         Ok(assigned_lsn)
     }
@@ -1596,6 +1604,13 @@ impl Txn {
                 );
             }
         }
+        // Real txn-end: drop the lock-manager's preempted flag for this locker
+        // (JE `Locker` close -> preemptedCause reset).  This is the ordinary
+        // commit-and-abort path — `release_all_for_locker` (the only other
+        // clear site) is a cleaner/catastrophic sweep, not the normal path — so
+        // without this the flag would leak and a reused locker id could inherit
+        // a stale `LockPreempted`.
+        self.lock_manager.clear_preempted(self.id);
     }
 
     /// Returns (and clears) the list of undo records produced by `abort()`.
@@ -2066,6 +2081,65 @@ mod tests {
     fn create_test_txn() -> Txn {
         let lock_manager = Arc::new(LockManager::new());
         Txn::new(1, lock_manager)
+    }
+
+    /// BLOCKER 1 probe (clear-at-end, COMMIT): a locker whose lock is stolen
+    /// (importunate HA-replay steal marks it preempted) has its preempted flag
+    /// CLEARED by the real txn-end path.  `Txn::commit` ->
+    /// `commit_with_durability` drains its locks INLINE (Fix 3a) rather than
+    /// via `release_all_locks`, so the clear fires at the commit-success
+    /// terminal — NOT via `release_all_for_locker`, which the commit path never
+    /// calls.  Before this fix the flag leaked forever.
+    #[test]
+    fn preempted_flag_cleared_after_commit() {
+        let lm = Arc::new(LockManager::new());
+        let mut txn = Txn::new(7, lm.clone());
+
+        // txn 7 holds a read lock; an importunate stealer (txn 8) steals it,
+        // marking txn 7 preempted (the real production steal path).
+        txn.lock(500, LockType::Read, false).unwrap();
+        lm.lock_importunate_with_timeout(500, 8, LockType::Write, false, 200)
+            .expect("steal");
+        assert!(
+            lm.is_preempted(7),
+            "steal must mark the victim locker preempted"
+        );
+
+        // Real txn-end (commit) drains locks then clears the flag.
+        txn.commit().unwrap();
+        assert!(
+            !lm.is_preempted(7),
+            "commit via Txn::release_all_locks must clear the preempted flag"
+        );
+        // Last entry gone -> hot-path gate atomic goes back to false.
+        assert!(
+            !lm.preempted_nonempty_flag(),
+            "clearing the last preempted entry must reset preempted_nonempty"
+        );
+    }
+
+    /// BLOCKER 1 probe (clear-at-end, ABORT): same as above but the txn ABORTS.
+    /// `Txn::abort` also routes through `release_all_locks`, so the flag is
+    /// cleared on the abort path too.
+    #[test]
+    fn preempted_flag_cleared_after_abort_via_release_all_locks() {
+        let lm = Arc::new(LockManager::new());
+        let mut txn = Txn::new(9, lm.clone());
+
+        txn.lock(600, LockType::Read, false).unwrap();
+        lm.lock_importunate_with_timeout(600, 10, LockType::Write, false, 200)
+            .expect("steal");
+        assert!(lm.is_preempted(9), "steal must mark the victim preempted");
+
+        txn.abort().unwrap();
+        assert!(
+            !lm.is_preempted(9),
+            "abort via Txn::release_all_locks must clear the preempted flag"
+        );
+        assert!(
+            !lm.preempted_nonempty_flag(),
+            "clearing the last preempted entry must reset preempted_nonempty"
+        );
     }
 
     #[test]

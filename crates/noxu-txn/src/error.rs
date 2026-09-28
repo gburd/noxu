@@ -65,6 +65,23 @@ pub enum TxnError {
         lsn: u64,
     },
 
+    /// A lock was preempted (stolen) by a replication-stream replay write
+    /// operation, and the preempted locker is now requesting a lock again.
+    ///
+    /// JE `com.sleepycat.je.rep.LockPreemptedException` (a subclass of
+    /// `LockConflictException`): on a Replica, when an HA replay write needs a
+    /// lock a reader holds, the replayer steals it and marks the reader
+    /// preempted (`Locker.setPreempted`). The reader's next lock-taking
+    /// operation throws this so it learns its read snapshot was invalidated and
+    /// must abort/retry, rather than silently continuing or seeing an ordinary
+    /// no-wait conflict. Distinct from [`TxnError::LockNotAvailable`], which is
+    /// ordinary lock contention with no preemption semantics.
+    #[error("lock preempted by replication replay for LSN {lsn}")]
+    LockPreempted {
+        /// LSN of the record whose lock was preempted.
+        lsn: u64,
+    },
+
     /// Range restart required due to range lock conflict.
     ///
     ///

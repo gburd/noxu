@@ -188,6 +188,36 @@ pub struct LockManager {
     /// A locker absent from this set is preemptable (the default).
     non_preemptable: RwLock<HashSet<i64>>,
 
+    /// Set of locker IDs whose lock was PREEMPTED (stolen) by an importunate
+    /// HA-replay steal and who have not yet been cleaned up.  This is Noxu's
+    /// lock-manager-level analog of JE's per-`Locker` `preemptedCause` flag
+    /// (`Locker.setPreempted` / `checkPreempted`, Locker.java:319-364): the
+    /// steal sets the flag, and the victim's next lock-taking request observes
+    /// it and gets [`TxnError::LockPreempted`] (JE `LockPreemptedException`)
+    /// instead of silently re-acquiring or seeing an ordinary no-wait conflict.
+    /// Cleared for a locker by [`LockManager::clear_preempted`], which the
+    /// real txn-end path ([`crate::Txn::release_all_locks`], covering both
+    /// commit and abort) calls after draining the locker's per-lsn
+    /// [`LockManager::release`] calls, mirroring JE dropping the flag when the
+    /// `Locker` closes.  (`release_all_for_locker` — the cleaner/catastrophic
+    /// sweep — also clears it, but that is not the ordinary txn-end path.)
+    preempted: RwLock<HashSet<i64>>,
+
+    /// Cheap-to-read mirror of `!preempted.is_empty()`, checked by the acquire
+    /// funnel ([`LockManager::lock_with_timeout_and_txn`]) BEFORE it takes the
+    /// `preempted` `RwLock` read lock.  The common (never-preempted) path — all
+    /// non-HA workloads — does a single `Relaxed` atomic load and skips the
+    /// `RwLock` read entirely, keeping the preempted-flag check off the hot
+    /// path.  This mirrors `share_registry_nonempty` exactly: writers
+    /// (`mark_preempted` / `clear_preempted`) update it under the `preempted`
+    /// write lock AFTER mutating the set, so a reader that observes `true`
+    /// takes the lock and sees the up-to-date set, and a reader that observes
+    /// `false` after a concurrent `mark_preempted` is the same benign race as
+    /// any lock-free read of shared state that becomes non-empty a moment
+    /// later — the steal that set it has not yet let the victim re-request a
+    /// lock, so no acquire that needed to see it has been missed.
+    preempted_nonempty: AtomicBool,
+
     /// Injectable clock for the wait-loop timeout / deadlock re-detection
     /// cadence (DST M1.1).  JE reads `System.currentTimeMillis()` /
     /// `nanoTime()` at these sites; here the elapsed math routes through an
@@ -274,6 +304,8 @@ impl LockManager {
             waiter_graph: Mutex::new(HashMap::new()),
             locker_labels: RwLock::new(HashMap::new()),
             non_preemptable: RwLock::new(HashSet::new()),
+            preempted: RwLock::new(HashSet::new()),
+            preempted_nonempty: AtomicBool::new(false),
             clock,
             lock_memory_counter: Arc::new(AtomicI64::new(0)),
         }
@@ -530,6 +562,25 @@ impl LockManager {
         // Special restart lock type throws immediately.
         if lock_type == LockType::Restart {
             return Err(TxnError::RangeRestart);
+        }
+
+        // JE `Locker.checkPreempted`/`throwIfPreempted` (Locker.java:346-364):
+        // if this locker's lock was stolen by an importunate HA-replay steal,
+        // its NEXT lock-taking operation must learn about it — throw
+        // `LockPreempted` (JE `LockPreemptedException`) so the reader knows its
+        // snapshot was invalidated by the master's replay and must abort/retry,
+        // rather than silently re-acquiring or seeing an ordinary no-wait
+        // conflict.  Ordinary contention (no steal) never sets this flag, so a
+        // normal lock-unavailable still returns `LockNotAvailable`/`LockTimeout`.
+        // Hot-path gate: the preempted set is empty for every non-HA workload
+        // and almost always empty even on a replica, so consult the cheap
+        // `Relaxed` atomic first and only take the `preempted` `RwLock` read
+        // lock when a steal has actually marked someone (mirrors
+        // `share_registry_nonempty` in `build_shares_fn`).
+        if self.preempted_nonempty.load(Ordering::Relaxed)
+            && self.preempted.read().unwrap().contains(&locker_id)
+        {
+            return Err(TxnError::LockPreempted { lsn });
         }
 
         // Track statistics.
@@ -1002,6 +1053,11 @@ impl LockManager {
                 }
             }
         }
+        // The cleaner/catastrophic sweep also drops the preempted flag (via
+        // the atomic-maintaining clear) so `preempted_nonempty` stays accurate
+        // even when this path — rather than the ordinary txn-end path — is what
+        // retires the locker.
+        self.clear_preempted(locker_id);
         released
     }
 
@@ -1019,6 +1075,60 @@ impl LockManager {
         Ok(())
     }
 
+    /// Marks each `locker_id` in `victims` as preempted (JE
+    /// `Locker.setPreempted`, Locker.java:319): its next lock-taking request
+    /// will observe the flag and get [`TxnError::LockPreempted`].  The stealer
+    /// itself is never in `victims` (`steal_lock`/`steal_lock_preemptable`
+    /// only report OTHER owners that were removed).
+    fn mark_preempted(&self, victims: &[i64]) {
+        if victims.is_empty() {
+            return;
+        }
+        let mut p = self.preempted.write().unwrap();
+        for &v in victims {
+            p.insert(v);
+        }
+        // Publish non-empty under the write lock (AFTER mutating the set) so
+        // the funnel's fast-path atomic load never skips a live preempted flag.
+        self.preempted_nonempty.store(true, Ordering::Relaxed);
+    }
+
+    /// Clears the preempted flag for `locker_id` on the real txn-end path.
+    ///
+    /// JE drops the per-`Locker` `preemptedCause` flag when the `Locker`
+    /// closes; the ordinary txn-end path in Noxu is
+    /// [`crate::Txn::release_all_locks`] (called on BOTH commit and abort),
+    /// which drains the locker's per-lsn [`LockManager::release`] calls and
+    /// then calls this.  Removing the entry here (rather than only in
+    /// `release_all_for_locker`, which the ordinary path never invokes)
+    /// prevents a stale `LockPreempted` from being inherited by a reused
+    /// locker id and stops the preempted set from leaking on a steal-heavy
+    /// replica.  Updates `preempted_nonempty` under the write lock, matching
+    /// `unregister_locker_sharing`.
+    pub fn clear_preempted(&self, locker_id: i64) {
+        let mut p = self.preempted.write().unwrap();
+        p.remove(&locker_id);
+        // Republish emptiness under the write lock, mirroring
+        // `unregister_locker_sharing`.
+        self.preempted_nonempty.store(!p.is_empty(), Ordering::Relaxed);
+    }
+
+    /// Test-only probe: whether `locker_id` currently carries the preempted
+    /// flag.  Used by the clear-at-end probes to observe that
+    /// `Txn::release_all_locks` (the real txn-end path) drops the flag on both
+    /// commit and abort.
+    #[cfg(test)]
+    pub(crate) fn is_preempted(&self, locker_id: i64) -> bool {
+        self.preempted.read().unwrap().contains(&locker_id)
+    }
+
+    /// Test-only probe for the hot-path gate: the value of the
+    /// `preempted_nonempty` fast-path atomic.
+    #[cfg(test)]
+    pub(crate) fn preempted_nonempty_flag(&self) -> bool {
+        self.preempted_nonempty.load(Ordering::Relaxed)
+    }
+
     /// Steals a lock for the given locker.
     ///
     /// Used by the HA replayer to forcibly acquire locks, removing all other
@@ -1034,7 +1144,8 @@ impl LockManager {
         if is_new_entry {
             self.charge_lock_entry();
         }
-        let _preempted = lock.steal_lock(locker_id);
+        let preempted = lock.steal_lock(locker_id);
+        self.mark_preempted(&preempted);
 
         Ok(())
     }
@@ -1076,9 +1187,11 @@ impl LockManager {
 
         // flushWaiter: our waiter entry may still be present.
         lock.flush_waiter(locker_id);
-        // stealLock: remove all preemptable owners.
-        let _preempted =
-            lock.steal_lock_preemptable(locker_id, &preemptable_fn);
+        // stealLock: remove all preemptable owners, and mark each preempted
+        // victim so its next lock request gets `LockPreempted` (JE
+        // `LockImpl.stealLock` -> `Locker.setPreempted`, LockImpl.java:545/559).
+        let preempted = lock.steal_lock_preemptable(locker_id, &preemptable_fn);
+        self.mark_preempted(&preempted);
         // Re-attempt as a non-blocking, jump-ahead request.
         let result = lock.lock_with_sharing(
             lock_type, locker_id, true,  // non_blocking

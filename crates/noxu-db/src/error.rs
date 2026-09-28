@@ -851,6 +851,11 @@ impl From<noxu_txn::TxnError> for NoxuError {
                 NoxuError::TransactionTimeout { timeout_ms, txn_id }
             }
             TxnError::LockNotAvailable { .. } => NoxuError::LockNotAvailable,
+            // NEW-LOCK-PREEMPT-EXN: a lock stolen by HA replay surfaces as the
+            // preemption-specific error (JE `LockPreemptedException`, a
+            // `LockConflictException` subclass) so the reader learns its
+            // snapshot was invalidated, not an ordinary `LockNotAvailable`.
+            TxnError::LockPreempted { .. } => NoxuError::LockPreempted,
             TxnError::RangeRestart => {
                 NoxuError::LockConflict("range restart".into())
             }

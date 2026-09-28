@@ -25,12 +25,15 @@
 //! PASSES: the importunate steal succeeds even while the reader holds the lock.
 //!
 //! The victim-NOTIFICATION half — the reader learning, via
-//! `LockPreemptedException`, that its snapshot was invalidated — is NOT
-//! implemented in Noxu (the victim is silently removed from the lock's owners;
-//! there is no `LockPreempted` error and no per-locker preempted flag). That is
-//! recorded as an `#[ignore]`d faithful port + escalated as a fidelity gap in
-//! the package report. It is NOT data-loss/corruption (no write is lost, the
-//! master always wins); it is a read-stability notification gap.
+//! `LockPreemptedException`, that its snapshot was invalidated — is now
+//! implemented (NEW-LOCK-PREEMPT-EXN). The importunate steal marks each
+//! preempted victim (`LockManager::mark_preempted`, the analog of JE
+//! `Locker.setPreempted`), and the victim's next lock-taking request observes
+//! the flag and gets `TxnError::LockPreempted` (JE `LockPreemptedException`)
+//! rather than a generic `LockNotAvailable`. This was previously an
+//! `#[ignore]`d faithful port + escalated fidelity gap; it is now LIVE. It was
+//! never a data-loss/corruption issue (no write is lost, the master always
+//! wins); it was purely a read-stability notification gap.
 
 use noxu_txn::{LockGrantType, LockManager, LockType, TxnError};
 
@@ -122,12 +125,28 @@ fn lock_preemption_master_write_wins_over_replica_reader() {
 ///   * `LockPreemptionTest.testNotPreemptedAfterAttemptToMoveReadCommittedCursor`
 ///   * `LockPreemptionTest.testNotPreemptedAfterAttemptToMoveNonTransactionalCursor`
 ///
-/// The JE invariant across this family: after its lock is stolen, a reader that
-/// does NOT take a new lock (it commits, aborts, or moves a read-committed
-/// cursor to a *different*, still-available record) must complete WITHOUT a
-/// `LockPreemptedException`. In Noxu, a preempted locker's lock is simply
-/// removed from the owners; releasing whatever it still holds (commit/abort
-/// path) is unconditionally safe and takes no new lock, so it never errors.
+/// The JE invariant across this family, split into its two distinct causes:
+///
+///   1. A locker that WAS preempted (held its lock through the steal) but then
+///      takes NO new lock — it commits or aborts — completes WITHOUT a
+///      `LockPreemptedException`, because commit/abort acquire no lock and JE
+///      only calls `checkPreempted` after a successful lock GRANT
+///      (Locker.java:509). This is asserted below via `release` after a steal.
+///
+///   2. `testNotPreemptedMove{ReadCommitted,NonTransactional}Cursor` complete
+///      WITHOUT `LockPreemptedException` NOT because moving after preemption is
+///      allowed, but because a READ_COMMITTED / non-transactional cursor
+///      RELEASES its read lock immediately after reading — so at steal time it
+///      holds nothing, the steal never marks it preempted
+///      (`setPreempted` is not called), and its subsequent move to another key
+///      is an ordinary, never-preempted lock. This is asserted below with a
+///      separate locker (locker 3) that released before the steal.
+///
+/// (A locker that DID hold its lock through the steal is preempted and its next
+/// NEW lock on ANY key throws — that is
+/// `lock_preemption_victim_is_notified_on_next_lock`.) In Noxu, releasing a
+/// lock the locker no longer owns is a harmless no-op and takes no new lock, so
+/// the commit/abort path never errors.
 #[test]
 fn lock_preemption_not_signalled_when_no_new_lock_taken() {
     let lm = LockManager::new();
@@ -149,14 +168,24 @@ fn lock_preemption_not_signalled_when_no_new_lock_taken() {
          error; got {r:?}"
     );
 
-    // A read on a DIFFERENT, unstolen record (JE: read-committed cursor MOVE
-    // to another key) still succeeds — no lingering preemption state blocks
-    // unrelated locks.
+    // JE's `testNotPreemptedMoveReadCommittedCursor` only avoids
+    // LockPreemptedException because a READ_COMMITTED cursor RELEASES its read
+    // lock immediately after reading — so at steal time it holds nothing, the
+    // steal never marks it preempted (`setPreempted` is not called), and its
+    // subsequent MOVE to another key succeeds. Model that faithfully with a
+    // separate read-committed-style locker (locker 3) that released KEY2
+    // BEFORE the steal: it was never preempted, so an unrelated new lock still
+    // succeeds. (A locker that HELD its lock through the steal — locker 1
+    // above — IS preempted and its next new lock gets LockPreempted; that JE
+    // contract is asserted in `lock_preemption_victim_is_notified_on_next_lock`.)
     const LSN_KEY2: u64 = 0x1002;
-    let g2 = lm.lock(LSN_KEY2, 1, LockType::Read, false, false);
+    lm.lock(LSN_KEY2, 3, LockType::Read, false, false).unwrap();
+    lm.release(LSN_KEY2, 3).unwrap(); // read-committed: released before steal
+    let g2 = lm.lock(LSN_KEY2, 3, LockType::Read, false, false);
     assert!(
         matches!(g2, Ok(LockGrantType::New | LockGrantType::Existing)),
-        "an unrelated lock after a steal must still be grantable; got {g2:?}"
+        "an unrelated lock by a never-preempted (read-committed) locker after \
+         a steal must still be grantable; got {g2:?}"
     );
 }
 
@@ -166,31 +195,30 @@ fn lock_preemption_not_signalled_when_no_new_lock_taken() {
 
 /// JE: `LockPreemptionTest.testPreempted` (victim-notification half).
 ///
-/// ENGINE-FIDELITY GAP (escalated in tp-je-rep-txn.md, NOT a data-loss bug):
-/// after its lock is stolen, the reader's NEXT lock-taking operation must throw
+/// NEW-LOCK-PREEMPT-EXN (fidelity fix, NOT a data-loss bug): after its lock is
+/// stolen, the reader's NEXT lock-taking operation must throw
 /// `LockPreemptedException` and mark the transaction invalid
-/// (`assertFalse(replicaTxn.isValid())`), so a reader whose snapshot was
-/// invalidated by a replicated write is forced to abort rather than silently
-/// continue with a broken read-stability guarantee.
+/// (`assertFalse(replicaTxn.isValid())`, LockPreemptionTest.java:176), so a
+/// reader whose snapshot was invalidated by a replicated write is forced to
+/// abort rather than silently continue with a broken read-stability guarantee.
 ///
-/// Noxu's lock manager silently removes the victim from the lock's owners and
-/// has no `LockPreempted` error variant nor a per-locker preempted flag. A
-/// victim's next lock request therefore does not distinguish "your lock was
-/// stolen" from an ordinary conflict:
-///   * a NON-blocking re-read returns `LockNotAvailable` (an ordinary no-wait
-///     conflict) — not a preemption signal;
-///   * a BLOCKING re-read would WAIT for the stealer to release and then read
-///     the NEW value, never learning its original snapshot was invalidated.
+/// JE tracks preemption per-`Locker`, not per-lock: `Locker.setPreempted` sets
+/// `preemptedCause` (Locker.java:96,319), and `Locker.lock(lsn, ...)` calls
+/// `checkPreempted` after EVERY successful grant on ANY lsn (Locker.java:509),
+/// which `throwIfPreempted` turns into a `LockPreemptedException` whenever
+/// `preemptedCause != null` (Locker.java:359-364) — i.e. a locker preempted on
+/// KEY1 gets the exception on its next new lock even for a DIFFERENT key. The
+/// no-wait DENIED path (`nonBlockingLock`) does NOT call `checkPreempted`
+/// (Locker.java:539-542), so an op that takes no lock never spuriously throws.
 ///
-/// This is a read-stability / notification deviation, not data loss: the
-/// master's write is always applied (see
-/// `lock_preemption_master_write_wins_over_replica_reader`) and nothing is
-/// lost or corrupted. Ignored until Noxu grows a `LockPreemptedException`
-/// analog (a per-locker preempted flag set by `steal_lock` + checked on the
-/// next lock request). Kept as the faithful assertion so the gap is not lost.
+/// Noxu now mirrors this with a lock-manager-level per-locker preempted flag
+/// (`LockManager::mark_preempted`, set by the steal; checked in the single lock
+/// funnel `lock_with_timeout_and_txn` behind a `preempted_nonempty` fast-path
+/// atomic; cleared at the real txn-end path `Txn::release_all_locks` ->
+/// `LockManager::clear_preempted`, on both commit and abort). The steal
+/// MECHANISM (master write wins) is
+/// unchanged — see `lock_preemption_master_write_wins_over_replica_reader`.
 #[test]
-#[ignore = "ENGINE GAP: no LockPreemptedException — victim not notified its \
-            lock was stolen (fidelity gap, not data loss); see tp-je-rep-txn.md"]
 fn lock_preemption_victim_is_notified_on_next_lock() {
     let lm = LockManager::new();
 
@@ -199,20 +227,30 @@ fn lock_preemption_victim_is_notified_on_next_lock() {
     lm.lock_importunate_with_timeout(LSN_KEY1, 2, LockType::Write, false, 200)
         .expect("steal");
 
-    // JE: the reader's next lock-taking op throws LockPreemptedException. This
-    // assertion encodes the JE contract; it FAILS today because Noxu returns
-    // LockNotAvailable (ordinary conflict), not a preemption signal.
+    // JE: the reader's next lock-taking op throws LockPreemptedException. Noxu
+    // now surfaces the equivalent `TxnError::LockPreempted` (set by the steal
+    // via `LockManager::mark_preempted`, checked in the lock funnel), so the
+    // victim learns its snapshot was invalidated instead of seeing an ordinary
+    // `LockNotAvailable` no-wait conflict.
     let r = lm.lock(LSN_KEY1, 1, LockType::Read, true, false);
     match r {
-        Err(e) => {
-            let msg = format!("{e:?}");
+        Err(TxnError::LockPreempted { lsn }) => {
+            assert_eq!(
+                lsn, LSN_KEY1,
+                "preemption is reported for the stolen LSN"
+            );
+            let msg = format!("{}", TxnError::LockPreempted { lsn });
             assert!(
-                msg.contains("Preempt"),
-                "the preempted reader's next lock request must signal \
-                 PREEMPTION (JE LockPreemptedException), not an ordinary \
-                 conflict; got {msg}"
+                msg.contains("preempt"),
+                "the LockPreempted display must signal PREEMPTION (JE \
+                 LockPreemptedException); got {msg}"
             );
         }
+        Err(e) => panic!(
+            "the preempted reader's next lock request must signal PREEMPTION \
+             (TxnError::LockPreempted, JE LockPreemptedException), not an \
+             ordinary conflict; got {e:?}"
+        ),
         Ok(g) => panic!(
             "the preempted reader must NOT silently re-acquire; got {g:?}"
         ),
