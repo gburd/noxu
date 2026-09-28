@@ -239,6 +239,24 @@ what won't be done and why.
   `LDiffServiceTest`, `LDiffTest`, `WindowTest`, and the ldiff `ProtocolTest`,
   plus two empty JUnit placeholders) is **N/A by design**.
 
+- **NEW-DPL-REP-COMPOSITION — DPL entity persistence on a replicated node:**
+  The Direct Persistence Layer (`noxu-persist`) cannot currently be used on a
+  replicated node. JE routinely opens an `EntityStore` on a
+  `ReplicatedEnvironment` (its `je.rep.persist` tests exercise DPL metadata
+  refresh and class evolution across master and replica); Noxu does not expose
+  an equivalent path. `noxu-persist` does not depend on `noxu-rep`, `noxu-rep`
+  does not reference `EntityStore`, and no API opens a DPL store on a replica.
+  The two subsystems each work independently — DPL class evolution
+  (rename / add-field / delete / convert via `Mutations`, `Renamer`,
+  `Deleter`, `Converter`, and envelope versioning) and master-replica
+  replication (log/VLSN streaming with opaque payloads) are both implemented and
+  tested in isolation — but they are not composed. This is an unimplemented
+  composition gap (the pieces exist but are not wired together), not a
+  deliberate single-node-only DPL design. The nine `je.rep.persist.test`
+  `@Test` methods (`SimpleTest` 2 + `UpgradeTest` 7), which all require a DPL
+  store running on a replicated node, are therefore **N/A** pending this
+  composition. Tracked as NEW-DPL-REP-COMPOSITION.
+
 (Implemented in 7.1 and moved out of this list: **L-3** debug-build
 latch-ordering assertion, **`exception_listener`**, **stats-file dump**
 `STATS_FILE_*`, **`startup_dump_threshold_ms`**, and **`env_check_leaks`** —
