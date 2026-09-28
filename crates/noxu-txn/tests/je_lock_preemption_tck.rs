@@ -149,14 +149,24 @@ fn lock_preemption_not_signalled_when_no_new_lock_taken() {
          error; got {r:?}"
     );
 
-    // A read on a DIFFERENT, unstolen record (JE: read-committed cursor MOVE
-    // to another key) still succeeds — no lingering preemption state blocks
-    // unrelated locks.
+    // JE's `testNotPreemptedMoveReadCommittedCursor` only avoids
+    // LockPreemptedException because a READ_COMMITTED cursor RELEASES its read
+    // lock immediately after reading — so at steal time it holds nothing, the
+    // steal never marks it preempted (`setPreempted` is not called), and its
+    // subsequent MOVE to another key succeeds. Model that faithfully with a
+    // separate read-committed-style locker (locker 3) that released KEY2
+    // BEFORE the steal: it was never preempted, so an unrelated new lock still
+    // succeeds. (A locker that HELD its lock through the steal — locker 1
+    // above — IS preempted and its next new lock gets LockPreempted; that JE
+    // contract is asserted in `lock_preemption_victim_is_notified_on_next_lock`.)
     const LSN_KEY2: u64 = 0x1002;
-    let g2 = lm.lock(LSN_KEY2, 1, LockType::Read, false, false);
+    lm.lock(LSN_KEY2, 3, LockType::Read, false, false).unwrap();
+    lm.release(LSN_KEY2, 3).unwrap(); // read-committed: released before steal
+    let g2 = lm.lock(LSN_KEY2, 3, LockType::Read, false, false);
     assert!(
         matches!(g2, Ok(LockGrantType::New | LockGrantType::Existing)),
-        "an unrelated lock after a steal must still be grantable; got {g2:?}"
+        "an unrelated lock by a never-preempted (read-committed) locker after \
+         a steal must still be grantable; got {g2:?}"
     );
 }
 
@@ -189,8 +199,6 @@ fn lock_preemption_not_signalled_when_no_new_lock_taken() {
 /// analog (a per-locker preempted flag set by `steal_lock` + checked on the
 /// next lock request). Kept as the faithful assertion so the gap is not lost.
 #[test]
-#[ignore = "ENGINE GAP: no LockPreemptedException — victim not notified its \
-            lock was stolen (fidelity gap, not data loss); see tp-je-rep-txn.md"]
 fn lock_preemption_victim_is_notified_on_next_lock() {
     let lm = LockManager::new();
 
@@ -199,20 +207,27 @@ fn lock_preemption_victim_is_notified_on_next_lock() {
     lm.lock_importunate_with_timeout(LSN_KEY1, 2, LockType::Write, false, 200)
         .expect("steal");
 
-    // JE: the reader's next lock-taking op throws LockPreemptedException. This
-    // assertion encodes the JE contract; it FAILS today because Noxu returns
-    // LockNotAvailable (ordinary conflict), not a preemption signal.
+    // JE: the reader's next lock-taking op throws LockPreemptedException. Noxu
+    // now surfaces the equivalent `TxnError::LockPreempted` (set by the steal
+    // via `LockManager::mark_preempted`, checked in the lock funnel), so the
+    // victim learns its snapshot was invalidated instead of seeing an ordinary
+    // `LockNotAvailable` no-wait conflict.
     let r = lm.lock(LSN_KEY1, 1, LockType::Read, true, false);
     match r {
-        Err(e) => {
-            let msg = format!("{e:?}");
+        Err(TxnError::LockPreempted { lsn }) => {
+            assert_eq!(lsn, LSN_KEY1, "preemption is reported for the stolen LSN");
+            let msg = format!("{}", TxnError::LockPreempted { lsn });
             assert!(
-                msg.contains("Preempt"),
-                "the preempted reader's next lock request must signal \
-                 PREEMPTION (JE LockPreemptedException), not an ordinary \
-                 conflict; got {msg}"
+                msg.contains("preempt"),
+                "the LockPreempted display must signal PREEMPTION (JE \
+                 LockPreemptedException); got {msg}"
             );
         }
+        Err(e) => panic!(
+            "the preempted reader's next lock request must signal PREEMPTION \
+             (TxnError::LockPreempted, JE LockPreemptedException), not an \
+             ordinary conflict; got {e:?}"
+        ),
         Ok(g) => panic!(
             "the preempted reader must NOT silently re-acquire; got {g:?}"
         ),
