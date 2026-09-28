@@ -697,13 +697,13 @@ fn lazy_pruning_records_gone_tree_consistent() {
 // When the fix lands: replace the two `bin_count unchanged` assertions with
 // `bin_count` DROPPING by one (the pruned first BIN) and remove `#[ignore]`.
 // ===========================================================================
+// NEW-INCOMP-EMPTY-BIN (FIXED): the empty BIN emptied by committed deletes
+// is now pruned from its parent on the compress/checkpoint path.
+// `collect_bins_with_known_deleted` also surfaces `entries.is_empty()` BINs
+// and `compress_bin_with_lock_check` routes an already-empty BIN through
+// `prune_empty_bin_by_id` (noxu-tree/src/tree.rs).  `bin_count` now drops by
+// exactly one after reclamation.
 #[test]
-#[ignore = "ENGINE BUG CANDIDATE (space-reclamation): an empty BIN left by \
-committed deletes is never pruned from its parent — env.compress/checkpoint/\
-sync/daemon all skip it because Noxu leaves no known_deleted slot on a \
-committed delete. Correctness holds; compaction debt only. Prod fix in \
-noxu-tree/src/tree.rs is REG-CLEANER-frozen. JE: INCompressorTest.\
-testRemoveEmptyBIN / testLazyPruning."]
 fn empty_bin_left_by_committed_deletes_is_never_pruned() {
     let dir = TempDir::new().unwrap();
     let (env, db) = open_and_init(&dir, false);
@@ -725,14 +725,39 @@ fn empty_bin_left_by_committed_deletes_is_never_pruned() {
     db.sync().unwrap();
     env.compress().unwrap();
 
-    // JE EXPECTATION (the assertion that FAILS on Noxu today): the empty BIN
-    // was pruned, so the BIN count dropped by exactly one.
+    // JE EXPECTATION (now satisfied after NEW-INCOMP-EMPTY-BIN): the empty
+    // BIN was pruned, so the BIN count dropped by exactly one.
     assert_eq!(
         bin_count(&db),
         pre - 1,
         "JE: an emptied BIN must be pruned from its parent (bin_count should \
-         drop by 1). Noxu leaves it attached forever — space-reclamation gap."
+         drop by 1) so the index space is reclaimed."
     );
+
+    // STRUCTURAL INTEGRITY: pruning must not leave a dangling parent slot,
+    // orphan a sibling, or corrupt the tree.  env.verify() must report zero
+    // structural errors after the prune.
+    let vresult = env.verify(&noxu_db::VerifyConfig::new()).unwrap();
+    assert_eq!(
+        vresult.error_count(),
+        0,
+        "env.verify() must report 0 structural errors after pruning the \
+         empty BIN, got: {vresult}"
+    );
+
+    // SCAN CORRECTNESS: the surviving keys 2..8 must still be readable and
+    // returned in order by a full forward scan across the pruned gap.
+    assert_eq!(scan(&db, true, None), vec![2, 3, 4, 5, 6, 7]);
+    for i in 2u8..8 {
+        assert!(db.get([i]).unwrap().is_some(), "survivor {i} must remain");
+    }
+    assert!(db.get([0]).unwrap().is_none());
+    assert!(db.get([1]).unwrap().is_none());
+
+    // IDEMPOTENT: a second reclamation pass changes nothing observable.
+    env.compress().unwrap();
+    assert_eq!(bin_count(&db), pre - 1);
+    assert_eq!(scan(&db, true, None), vec![2, 3, 4, 5, 6, 7]);
 
     db.close().unwrap();
     env.close().unwrap();
