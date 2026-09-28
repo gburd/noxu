@@ -12,6 +12,9 @@ use tempfile::TempDir;
 
 /// With `stats_collect` enabled and a short interval, the dumper writes at
 /// least one rotating CSV stats file into the configured directory.
+// JE: StatCaptureTest.testStatsCapture (a rotating CSV stats file is written
+// with the expected header) / testChangeStatConfig (stats-file rotation honours
+// the configured file/row counts).
 #[test]
 fn stats_file_is_written_and_rotates() {
     let env_dir = TempDir::new().unwrap();
@@ -90,6 +93,8 @@ fn stats_file_is_written_and_rotates() {
 }
 
 /// When `stats_collect` is off, no stats file is written.
+// JE: StatCaptureTest.testChangeStatConfig (collection-off path: disabling
+// stats collection suppresses the stats file).
 #[test]
 fn no_stats_file_when_collection_disabled() {
     let env_dir = TempDir::new().unwrap();

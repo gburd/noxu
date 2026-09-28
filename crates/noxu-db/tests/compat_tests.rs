@@ -889,6 +889,12 @@ fn cursor_search_gte_edge_cases() {
 // ---------------------------------------------------------------------------
 
 /// : ReadCommittedTest.testWithTransactionConfig
+/// JE: ReadCommittedTest.testWithLockMode / testWithCursorConfig /
+/// testNonCloningWithTransactionConfig / testNonCloningWithCursorConfig — all
+/// four exercise the SAME read-committed property (read locks are released as
+/// the cursor moves off a record) via different config entry points; Noxu
+/// selects read-committed via TransactionConfig / LockMode (CursorConfig no
+/// longer carries read_committed), and has no nonSticky cursor variant.
 /// Under read-committed, a second read in the same transaction may see a value
 /// committed by another transaction between the two reads.
 ///
@@ -956,13 +962,18 @@ fn read_committed_allows_non_repeatable_read() {
 
     // Second read under read-committed: read lock was released after first read,
     // so T1 may see v2 if the lock is re-acquired.
-    let status =
-        db.get_into(Some(&txn1), DatabaseEntry::from_bytes(b"key"), &mut out);
-    // Under semantics the second read will block waiting for write-lock
-    // from the writer (already released); it should succeed with v2.
-    // We accept either v1 (if lock not released) or v2 (if released) depending
-    // on the isolation implementation, but it must not error.
-    assert!(status.is_ok(), "second read must not error under read-committed");
+    db.get_into(Some(&txn1), DatabaseEntry::from_bytes(b"key"), &mut out)
+        .unwrap();
+    // Read-committed releases the read lock after the first read, so the second
+    // read re-acquires and sees the writer's committed v2 — the defining
+    // NON-REPEATABLE read (JE ReadCommittedTest). The serializable sibling test
+    // asserts the opposite (both reads see v1).
+    assert_eq!(
+        out.data(),
+        b"v2",
+        "read-committed second read must see the newly committed v2 \
+         (non-repeatable read)",
+    );
 
     txn1.abort().unwrap();
     writer.join().unwrap();

@@ -498,6 +498,13 @@ fn tree_descending_insert_balance_levels_bounded() {
 // JE: TreeTest.testVerify — insert N keys, verify() succeeds, and BtreeStats
 // obey the shape invariants: internalNodeCount < bottomInternalNodeCount <
 // leafNodeCount, and leafNodeCount == N_KEYS.
+//
+// JE: DatabaseTest.testStat / testStatDups — the same getStats() contract:
+// after N inserts, full (non-fast) stats report leafNodeCount == N and a
+// tree-shape-consistent BIN/IN count.  (JE asserts EXACT node counts — 15
+// INs, 52 BINs — which are fanout/NODE_MAX-specific to JE's B-tree and are an
+// intentional deviation here: Noxu's fanout differs, so we assert the shape
+// invariant leafNodeCount == N and IN < BIN < leaf, not the exact JE numbers.)
 // ──────────────────────────────────────────────────────────────────────────────
 #[test]
 fn tree_verify_and_stats_shape() {

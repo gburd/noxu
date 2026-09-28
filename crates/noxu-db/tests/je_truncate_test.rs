@@ -1,11 +1,14 @@
-//! JE TruncateTest ports — `Environment::truncate_database` / autocommit.
+//! JE TruncateTest ports — `Environment::truncate_database` (autocommit AND
+//! transactional).
 //!
 //! Each test below corresponds to a method in
-//! `test/com/sleepycat/je/TruncateTest.java`.  Noxu's
-//! `Environment::truncate_database` is autocommit-only (the JE-style
-//! transactional truncate-then-abort is not supported), so the abort-flavour
-//! variants are *NOT* ported.  See the per-package TSV
-//! `je-tck-port-2026-05-enumeration-je.tsv` for the OUT-OF-SCOPE rows.
+//! `test/com/sleepycat/je/TruncateTest.java`.  `Environment::truncate_database`
+//! now supports a transactional form: when a `Transaction` is passed, the
+//! record count is returned synchronously but the physical tree replacement is
+//! deferred to commit and rolled back on abort (see `environment.rs`).  The
+//! transactional commit/abort variants (`testTruncateCommit`,
+//! `testTruncateAbort`, and the `doTruncateAndAdd` env-truncate matrix) are
+//! ported here and in `ddl_txn_abort_test.rs`.
 
 use noxu_db::{
     DatabaseConfig, DatabaseEntry, EnvironmentConfig, Get, OperationStatus,
@@ -179,4 +182,262 @@ fn truncate_then_get_returns_not_found() {
     let mut out = DatabaseEntry::new();
     let s = db.get_into(None, ikey(0), &mut out).unwrap();
     assert!(!s);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// TruncateTest.doTruncateAndAdd matrix (testEnvTruncateCommit,
+// testEnvTruncateAbort, testEnvTruncateAutocommit, testEnvTruncateNoFirstInsert,
+// testNoTxnEnvTruncateCommit)
+//
+// JE's `doTruncateAndAdd(transactional, step1, autoCommit, step3, abort, step5)`:
+//   1. populate `step1` records (under `txn` if transactional)
+//   2. optionally commit that txn (autoCommit)
+//   3. env.truncateDatabase(txn, name) — asserts the returned count == step1
+//   4. reopen the db (under `txn`), add `step3` records
+//   5. abort or commit
+//   6. assert the final record count == `step5`, both immediately and after a
+//      clean close+reopen (recovery)
+//
+// Noxu adaptation: the `doTruncateAndAdd` helper drives all five configured
+// invocations.  When `transactional` is false, `txn` is `None` throughout
+// (auto-commit).  When `abort` is true the whole txn (populate + truncate +
+// adds) is rolled back, which is why JE expects step5 == 0 for the abort case.
+// ──────────────────────────────────────────────────────────────────────────────
+
+fn do_truncate_and_add(
+    transactional: bool,
+    step1: u32,
+    auto_commit: bool,
+    step3: u32,
+    abort: bool,
+    step5: u32,
+) {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().to_path_buf();
+    let name = "ttadd";
+
+    let cfg = |create: bool| {
+        EnvironmentConfig::new(path.clone())
+            .with_allow_create(create)
+            .with_transactional(transactional)
+            // JE forces a split with NODE_MAX=6; keep it small so the truncate
+            // spans real internal nodes.
+            .with_node_max_entries(6)
+    };
+    let dbcfg = || {
+        DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(transactional)
+    };
+
+    {
+        let env = noxu_db::Environment::open(cfg(true)).unwrap();
+        let db = env.open_database(None, name, &dbcfg()).unwrap();
+
+        // Step 1: populate (under txn iff transactional).
+        let mut txn = if transactional {
+            Some(env.begin_transaction(None).unwrap())
+        } else {
+            None
+        };
+        for i in 0..step1 {
+            match &txn {
+                Some(t) => db.put_in(t, ikey(i), ikey(i)).unwrap(),
+                None => db.put(ikey(i), ikey(i)).unwrap(),
+            };
+        }
+        db.close().unwrap();
+
+        // Step 2: possibly auto-commit the populate txn before truncating.
+        if auto_commit && transactional {
+            txn.take().unwrap().commit().unwrap();
+        }
+
+        // Step 3: truncate; the returned count must equal step1.
+        let truncate_count = env.truncate_database(txn.as_ref(), name).unwrap();
+        assert_eq!(
+            truncate_count as u32, step1,
+            "truncate must report the pre-truncate record count"
+        );
+
+        // Step 4: reopen and add step3 records.
+        let db = env.open_database(txn.as_ref(), name, &dbcfg()).unwrap();
+        for i in 0..step3 {
+            match &txn {
+                Some(t) => db.put_in(t, ikey(i), ikey(i)).unwrap(),
+                None => db.put(ikey(i), ikey(i)).unwrap(),
+            };
+        }
+        db.close().unwrap();
+
+        // Step 5: abort or commit.
+        if let Some(t) = txn {
+            if abort {
+                t.abort().unwrap();
+            } else {
+                t.commit().unwrap();
+            }
+        }
+
+        // Verify the record count == step5 immediately.
+        let db = env.open_database(None, name, &dbcfg()).unwrap();
+        assert_eq!(
+            db.count().unwrap() as u32,
+            step5,
+            "record count after truncate+add must equal step5"
+        );
+        db.close().unwrap();
+    }
+
+    // Verify step5 survives a clean close+reopen (recovery).
+    let env = noxu_db::Environment::open(cfg(false)).unwrap();
+    let db = env.open_database(None, name, &dbcfg()).unwrap();
+    assert_eq!(
+        db.count().unwrap() as u32,
+        step5,
+        "record count must survive a clean close+reopen (recovery)"
+    );
+}
+
+// JE: TruncateTest.testEnvTruncateCommit
+//
+// ENGINE-BUG CANDIDATE (NEW-TRUNCATE-1) — DATA LOSS: a transactional truncate
+// followed by inserts in the SAME transaction, then commit, LOSES the inserts.
+//
+// Runtime-probed on this code (2026-05): truncate returns the correct up-front
+// count (256), but after commit the final count is 0 AND point-gets for the
+// inserted keys return NotFound — i.e. durable loss of committed inserts, not
+// just a stale count.  Control: auto-committing the truncate BEFORE the inserts
+// yields 150 (correct), isolating the fault to the same-txn
+// truncate-then-insert-then-commit ordering.
+//
+// Root cause: Noxu defers the physical tree replacement to a commit callback
+// (`Environment::truncate_database` -> `register_commit_callback` ->
+// `truncate_database_if_id`), and `Transaction::commit` runs that callback
+// AFTER the transaction's own data-log writes are committed (`transaction.rs`
+// commit path: set Committed + flush data, THEN run commit callbacks).  So the
+// 150 inserts are committed into the pre-truncate tree and then overwritten by
+// the deferred whole-tree swap.
+//
+// JE-faithful fix pointer: JE `DbTree.doTruncateDb` clones the DB with a NEW
+// DatabaseId + a fresh empty `Tree` and repoints the NameLN IMMEDIATELY at
+// operation time, then uses `markDeleteAtTxnEnd(oldDb, /*deleteAtCommit=*/true)`
+// / `markDeleteAtTxnEnd(newDb, /*deleteAtCommit=*/false)` so ONLY the physical
+// old-tree cleanup is deferred.  Same-txn inserts therefore land in the new
+// tree.  The fix is to install the fresh empty tree at truncate time (identity
+// bound to the new DatabaseId) rather than swapping the whole tree in a
+// post-commit callback.
+//
+// Kept #[ignore]d — a faithful port that must not be weakened; escalated for a
+// dedicated fix worker.  Severity: DATA LOSS, but NARROW (only the same-txn
+// truncate-then-insert path; the common auto-commit truncate path is safe).
+#[test]
+#[ignore = "NEW-TRUNCATE-1: same-txn truncate-then-insert loses inserts on commit (deferred truncate ordered after inserts)"]
+fn env_truncate_commit() {
+    do_truncate_and_add(true, 256, false, 150, false, 150);
+}
+
+// JE: TruncateTest.testEnvTruncateAbort — aborting the txn rolls back the
+// populate, the truncate, AND the adds, leaving zero records.
+#[test]
+fn env_truncate_abort() {
+    do_truncate_and_add(true, 256, false, 150, true, 0);
+}
+
+// JE: TruncateTest.testEnvTruncateAutocommit — the populate is committed, then
+// a fresh auto-commit truncate + 150 adds commit, leaving 150 records.
+#[test]
+fn env_truncate_autocommit() {
+    do_truncate_and_add(true, 256, true, 150, false, 150);
+}
+
+// JE: TruncateTest.testEnvTruncateNoFirstInsert — truncating a never-populated
+// db returns 0; the subsequent 150 adds commit, leaving 150.
+//
+// ENGINE-BUG CANDIDATE (NEW-TRUNCATE-1): same root cause as
+// `env_truncate_commit` — the 150 same-txn inserts after the (0-count)
+// truncate are wiped by the deferred truncate callback on commit.  Kept
+// #[ignore]d.
+#[test]
+#[ignore = "NEW-TRUNCATE-1: same-txn truncate-then-insert loses inserts on commit (deferred truncate ordered after inserts)"]
+fn env_truncate_no_first_insert() {
+    do_truncate_and_add(true, 0, false, 150, false, 150);
+}
+
+// JE: TruncateTest.testNoTxnEnvTruncateCommit — the whole flow on a
+// non-transactional env (auto-commit throughout) leaves 150 records.
+#[test]
+fn no_txn_env_truncate_commit() {
+    do_truncate_and_add(false, 256, false, 150, false, 150);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// TruncateTest.testTruncateAbort / testTruncateCommit / testTruncateCommitAutoTxn
+//
+// JE's `doTruncate(abort, useAutoTxn)`: populate NUM_RECS, truncate, then
+// abort/commit; assert the final record count.  useAutoTxn=false + abort=true
+// -> records survive (NUM_RECS); useAutoTxn=false + abort=false -> 0;
+// useAutoTxn=true -> 0.
+//
+// The transactional commit/abort forms are also covered in
+// `ddl_txn_abort_test.rs` (`truncate_database_under_txn_is_rolled_back_on_abort`
+// / `truncate_database_under_txn_commits`).  This is the DB-populate flavour
+// with a larger record set to force a tree with real internal nodes.
+// ──────────────────────────────────────────────────────────────────────────────
+
+// JE: TruncateTest.testTruncateAbort — transactional truncate then abort;
+// the records must survive (the deferred tree replacement is rolled back).
+#[test]
+fn do_truncate_transactional_abort_preserves_records() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(dir.path());
+    let db = open_db(&env, DB_NAME);
+    populate(&db, &env, NUM_RECS);
+    db.close().unwrap();
+
+    let txn = env.begin_transaction(None).unwrap();
+    let n = env.truncate_database(Some(&txn), DB_NAME).unwrap();
+    assert_eq!(n as u32, NUM_RECS, "count is reported up front");
+    txn.abort().unwrap();
+
+    let db = open_db(&env, DB_NAME);
+    assert_eq!(
+        db.count().unwrap() as u32,
+        NUM_RECS,
+        "aborted truncate must leave all records intact"
+    );
+}
+
+// JE: TruncateTest.testTruncateCommit — transactional truncate then commit; 0.
+#[test]
+fn do_truncate_transactional_commit_clears_records() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(dir.path());
+    let db = open_db(&env, DB_NAME);
+    populate(&db, &env, NUM_RECS);
+    db.close().unwrap();
+
+    let txn = env.begin_transaction(None).unwrap();
+    let n = env.truncate_database(Some(&txn), DB_NAME).unwrap();
+    assert_eq!(n as u32, NUM_RECS);
+    txn.commit().unwrap();
+
+    let db = open_db(&env, DB_NAME);
+    assert_eq!(db.count().unwrap(), 0, "committed truncate clears all records");
+}
+
+// JE: TruncateTest.testTruncateCommitAutoTxn — auto-commit truncate; 0.
+#[test]
+fn do_truncate_autocommit_clears_records() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(dir.path());
+    let db = open_db(&env, DB_NAME);
+    populate(&db, &env, NUM_RECS);
+    db.close().unwrap();
+
+    let n = env.truncate_database(None, DB_NAME).unwrap();
+    assert_eq!(n as u32, NUM_RECS);
+
+    let db = open_db(&env, DB_NAME);
+    assert_eq!(db.count().unwrap(), 0);
 }

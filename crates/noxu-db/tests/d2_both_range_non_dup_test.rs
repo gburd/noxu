@@ -1,5 +1,9 @@
 //! Part 2 acceptance tests — D2: BOTH_RANGE on non-dup DB.
 //!
+//! JE tests covered here: GetSearchBothRangeTest.testSuccess (non-dup:
+//! exact data -> SUCCESS, wrong data -> NOTFOUND) and
+//! GetSearchBothRangeTest.testNotFound (missing key -> NOTFOUND).
+//!
 //! JE reference: `Cursor.java search()` converts `BOTH_RANGE → BOTH` (exact
 //! key+data match) when the database has no duplicates.  On a non-dup DB,
 //! BOTH_RANGE must NOT do a range-on-key search ignoring `data`.
@@ -31,6 +35,7 @@ fn de(s: &[u8]) -> DatabaseEntry {
 
 // ── D2: BOTH_RANGE non-matching data → NotFound ───────────────────────────────
 //
+// JE: GetSearchBothRangeTest.testSuccess (wrong-data branch) / testNotFound.
 // JE Cursor.search() converts BOTH_RANGE to BOTH on a non-dup database.
 // The key exists but data doesn't match → NotFound.
 #[test]
@@ -58,6 +63,7 @@ fn d2_both_range_non_dup_non_matching_data_returns_not_found() {
 
 // ── D2: BOTH_RANGE matching key AND data → Success ───────────────────────────
 //
+// JE: GetSearchBothRangeTest.testSuccess (exact-data branch).
 // With the exact data, BOTH_RANGE on a non-dup DB acts like BOTH: success.
 #[test]
 fn d2_both_range_non_dup_exact_data_returns_success() {
@@ -82,6 +88,8 @@ fn d2_both_range_non_dup_exact_data_returns_success() {
 }
 
 // ── D2: BOTH_RANGE missing key → NotFound ────────────────────────────────────
+//
+// JE: GetSearchBothRangeTest.testNotFound (key=2 search for absent key=1).
 #[test]
 fn d2_both_range_non_dup_missing_key_returns_not_found() {
     let dir = TempDir::new().unwrap();

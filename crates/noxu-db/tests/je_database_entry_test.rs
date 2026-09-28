@@ -34,6 +34,7 @@ fn open_env_db() -> (TempDir, noxu_db::Environment, noxu_db::Database) {
 
 // ---------------------------------------------------------------------------
 // DatabaseEntryTest.testBasic
+// JE: DatabaseEntryTest.testBasic
 // ---------------------------------------------------------------------------
 
 /// Port of `DatabaseEntryTest.testBasic`.  Exercises constructors,
@@ -71,6 +72,7 @@ fn database_entry_test_basic() {
 
 // ---------------------------------------------------------------------------
 // DatabaseEntryTest.testOffset
+// JE: DatabaseEntryTest.testOffset
 // ---------------------------------------------------------------------------
 
 /// Port of `DatabaseEntryTest.testOffset`.  A 30-byte buffer with the

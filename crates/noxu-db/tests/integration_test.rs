@@ -359,6 +359,11 @@ fn dbentry_get_data_respects_offset_and_size() {
 
 /// is_partial() / set_partial() round-trip.
 /// Mirrors the partial flag checks in testPartial().
+// JE: DatabaseEntryTest.testPartial / testPartialCursorPuts (partial-flag API
+// surface: setPartial/setPartialOffset/setPartialLength round-trip).  NOTE: the
+// full JE partial-PUT byte-assembly (grafting data at an offset into a
+// zero-filled record) differs in Noxu on a non-existent record; that
+// data-assembly detail is documented in the package report, not asserted here.
 #[test]
 fn dbentry_partial_flag_round_trip() {
     let mut entry = noxu_db::DatabaseEntry::new();
@@ -955,6 +960,9 @@ fn db_put_no_overwrite_after_delete_succeeds() {
 /// the full record set without interfering with each other.
 /// Mirrors the multi-cursor open + scan pattern from DatabaseTest.testCursor()
 /// and CursorTest.insertMultiDb().
+// JE: CursorTest.testBasic (insertMultiDb(1)) / CursorTest.testMulti
+// (insertMultiDb(4)) — open cursor(s) over one/several DBs, insert NUM_RECS,
+// scan forward/back and verify the full record set is traversable.
 #[test]
 fn db_multiple_concurrent_cursors_scan_same_records() {
     let dir = tempfile::TempDir::new().unwrap();
