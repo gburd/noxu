@@ -1412,3 +1412,278 @@ fn evolve_class_deleter_drops_records_and_catalog() {
         assert_eq!(idx.count().unwrap(), 0, "stats: {}", stats);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Test: incompatible class change is REJECTED, not silently applied.
+// ---------------------------------------------------------------------------
+//
+// Faithful port of JE's `EvolveClasses$DisallowNonKeyField_PrimitiveToObject`
+// (test/com/sleepycat/persist/test/EvolveClasses.java:1750).  In JE that
+// case changes a non-key field's type incompatibly (`int ff` -> `String ff`)
+// with NO Converter mutation registered.  JE's `Evolver` detects the
+// incompatible field-type change and `PersistCatalog.evolve`
+// (impl/PersistCatalog.java:518) throws:
+//
+//   com.sleepycat.persist.evolve.IncompatibleClassException:
+//     Mutation is missing to evolve class ... version: 0 to version: 1
+//     Error: Old field type: int is not compatible with the new type:
+//     java.lang.String for field: ff
+//
+// The JE invariant (IncompatibleClassException javadoc): "A class has been
+// changed incompatibly and no mutation has been configured to handle the
+// change" — the store must REFUSE the change rather than read the old bytes
+// as if they were the new shape (which would silently corrupt).
+//
+// Noxu has no separate `EntityModel` that inspects field types at open time;
+// evolution is driven by the user's `deserialize_versioned` consulting the
+// registered `Mutations` (see entity_store.rs `decode_entity_record` ->
+// `EntitySerializer::deserialize_versioned`, and `compute_evolve_action`
+// which leaves a record `Skip`ped when no class-level Converter/Deleter is
+// registered).  The `IncompatibleClassException` analog therefore surfaces
+// as a `PersistError::SerializationError` on the read/evolve path: a v1
+// entity reading a v0 record for which no Converter is registered refuses
+// (Result-vs-exception is an allowed language-idiom deviation, same as the
+// read-only-catalog corner case in evolve/catalog.rs).
+//
+// The negative test asserts the rejection; the positive control (same field
+// type change WITH a Converter) asserts success — mirroring JE's paired
+// `Convert_*` cases in EvolveClasses.java.
+mod incompatible_field_type_change {
+    use super::*;
+
+    /// OLD (version 0): non-key field `ff` is a primitive `u32` (JE `int`).
+    #[derive(Clone, Debug)]
+    pub struct V0 {
+        pub key: u64,
+        pub ff: u32,
+    }
+    impl Entity for V0 {
+        type PrimaryKey = u64;
+        fn primary_key(&self) -> &u64 {
+            &self.key
+        }
+        fn entity_name() -> &'static str {
+            "DisallowNonKeyField_PrimitiveToObject"
+        }
+        // class_version() defaults to 0
+    }
+    pub struct S0;
+    impl EntitySerializer<V0> for S0 {
+        fn serialize(&self, e: &V0) -> Result<Vec<u8>> {
+            // [u64 key][u32 ff]
+            let mut b = Vec::new();
+            b.extend_from_slice(&e.key.to_be_bytes());
+            b.extend_from_slice(&e.ff.to_be_bytes());
+            Ok(b)
+        }
+        fn deserialize(&self, b: &[u8]) -> Result<V0> {
+            let key = u64::from_be_bytes(b[0..8].try_into().unwrap());
+            let ff = u32::from_be_bytes(b[8..12].try_into().unwrap());
+            Ok(V0 { key, ff })
+        }
+    }
+
+    /// NEW (version 1): non-key field `ff` changed to a `String` (JE
+    /// `String`).  This is incompatible with the on-disk `u32` bytes: the
+    /// new shape is `[u64 key][u32 len][utf8 ff]`, which cannot be produced
+    /// from the old `[u64 key][u32 ff]` bytes without a Converter.
+    #[derive(Clone, Debug, PartialEq)]
+    pub struct V1 {
+        pub key: u64,
+        pub ff: String,
+    }
+    impl Entity for V1 {
+        type PrimaryKey = u64;
+        fn primary_key(&self) -> &u64 {
+            &self.key
+        }
+        fn entity_name() -> &'static str {
+            "DisallowNonKeyField_PrimitiveToObject"
+        }
+        fn class_version() -> u16 {
+            1
+        }
+    }
+    pub struct S1;
+    impl EntitySerializer<V1> for S1 {
+        fn serialize(&self, e: &V1) -> Result<Vec<u8>> {
+            let mut b = Vec::new();
+            b.extend_from_slice(&e.key.to_be_bytes());
+            let f = e.ff.as_bytes();
+            b.extend_from_slice(&(f.len() as u32).to_be_bytes());
+            b.extend_from_slice(f);
+            Ok(b)
+        }
+        fn deserialize(&self, b: &[u8]) -> Result<V1> {
+            // Decodes the *new* (v1) shape only.
+            let key = u64::from_be_bytes(b[0..8].try_into().unwrap());
+            let n = u32::from_be_bytes(b[8..12].try_into().unwrap()) as usize;
+            let end = 12 + n;
+            if b.len() < end {
+                return Err(PersistError::SerializationError(
+                    "not enough bytes for V1 ff".to_string(),
+                ));
+            }
+            let ff = String::from_utf8(b[12..end].to_vec()).map_err(|e| {
+                PersistError::SerializationError(format!("bad ff: {}", e))
+            })?;
+            Ok(V1 { key, ff })
+        }
+
+        // Field-level evolution gate — the noxu analog of JE's Evolver
+        // field-type-compatibility check.  A v1 reader handed a v0 record
+        // must NOT reinterpret the old `[u64 key][u32 ff]` bytes as the new
+        // `[u64 key][u32 len][utf8 ff]` shape; doing so would read the raw
+        // `u32 ff` value as a UTF-8 string length and silently corrupt.
+        // The change is only safe if a class-level Converter was registered
+        // (`mutations.get_converter(..., v0, None)`).  When it is, the
+        // envelope stream-evolve path (compute_evolve_action) has already
+        // rewritten the payload into the v1 shape and stamped the envelope
+        // to v1, so this method is only ever invoked with class_version==1;
+        // seeing class_version==0 here therefore means no Converter ran, and
+        // the incompatible change must be refused.
+        fn deserialize_versioned(
+            &self,
+            bytes: &[u8],
+            class_version: u16,
+            mutations: &Mutations,
+        ) -> Result<V1> {
+            if class_version == 1 {
+                return self.deserialize(bytes);
+            }
+            // Reading an older (v0) record.  Only a class-level Converter
+            // can make an int->String field change safe.
+            if mutations
+                .get_converter(
+                    "DisallowNonKeyField_PrimitiveToObject",
+                    class_version.into(),
+                    None,
+                )
+                .is_some()
+            {
+                // With a Converter registered, the stream-evolve path
+                // rewrites+restamps the record, so we should never actually
+                // reach here with a v0 version — but be defensive and decode
+                // the already-converted (v1-shaped) bytes.
+                return self.deserialize(bytes);
+            }
+            // IncompatibleClassException analog: no mutation configured for
+            // an incompatible field-type change.
+            Err(PersistError::SerializationError(format!(
+                "Old field type: u32 is not compatible with the new type: \
+                 String for field: ff (Mutation is missing to evolve class: \
+                 DisallowNonKeyField_PrimitiveToObject version: {} to \
+                 version: 1)",
+                class_version,
+            )))
+        }
+    }
+}
+
+/// JE: `EvolveClasses$DisallowNonKeyField_PrimitiveToObject`
+/// (EvolveClasses.java:1750) — an incompatible non-key field type change
+/// (`int`/`u32` -> `String`) with NO Converter mutation MUST be rejected,
+/// not silently applied.  JE throws `IncompatibleClassException` at store
+/// open; noxu surfaces the equivalent `PersistError::SerializationError` on
+/// the first read of an unconverted old record.
+#[test]
+fn evolve_incompatible_field_type_change_is_rejected_without_converter() {
+    use incompatible_field_type_change::*;
+
+    let td = TempDir::new().unwrap();
+    let path = td.path().to_path_buf();
+
+    // Phase 1: write V0 (ff is a u32).
+    {
+        let env = env_for(&path);
+        let cfg = StoreConfig::new("s").with_allow_create(true);
+        let mut store = EntityStore::open(&env, cfg).unwrap();
+        let idx: PrimaryIndex<u64, V0> = store.get_primary_index().unwrap();
+        idx.put(None, &S0, &V0 { key: 99, ff: 88 }).unwrap();
+        store.close().unwrap();
+        env.close().unwrap();
+    }
+
+    // Phase 2: reopen with V1 (ff is a String) but NO Converter mutation.
+    // The record on disk is still the v0 shape; reading it must be REFUSED.
+    {
+        let env = env_for(&path);
+        // Deliberately empty: no Converter for the incompatible change.
+        let cfg = StoreConfig::new("s").with_allow_create(true);
+        let mut store = EntityStore::open(&env, cfg).unwrap();
+        let idx: PrimaryIndex<u64, V1> = store.get_primary_index().unwrap();
+
+        let err = idx.get(None, &S1, &99).expect_err(
+            "expected the incompatible field-type change to be \
+                 rejected, but the read succeeded",
+        );
+        assert!(
+            matches!(err, PersistError::SerializationError(_)),
+            "expected PersistError::SerializationError (IncompatibleClass \
+             analog), got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not compatible with the new type")
+                && msg.contains("Mutation is missing"),
+            "rejection message should name the incompatible field-type \
+             change (JE IncompatibleClassException analog), got: {msg}"
+        );
+        store.close().unwrap();
+        env.close().unwrap();
+    }
+}
+
+/// Positive control (mirrors JE's paired `Convert_*` cases): the SAME
+/// incompatible field-type change succeeds once a class-level Converter is
+/// registered to transform the old `u32 ff` into the new `String ff`.
+#[test]
+fn evolve_incompatible_field_type_change_succeeds_with_converter() {
+    use incompatible_field_type_change::*;
+
+    let td = TempDir::new().unwrap();
+    let path = td.path().to_path_buf();
+
+    // Phase 1: write V0.
+    {
+        let env = env_for(&path);
+        let cfg = StoreConfig::new("s").with_allow_create(true);
+        let mut store = EntityStore::open(&env, cfg).unwrap();
+        let idx: PrimaryIndex<u64, V0> = store.get_primary_index().unwrap();
+        idx.put(None, &S0, &V0 { key: 99, ff: 88 }).unwrap();
+        store.close().unwrap();
+        env.close().unwrap();
+    }
+
+    // Phase 2: reopen with V1 + a class Converter that renders the u32 as
+    // its decimal string (JE's "88" (int) -> "88" (String)).
+    {
+        let env = env_for(&path);
+        let mut mutations = Mutations::new();
+        mutations.add_converter(Converter::for_class(
+            "DisallowNonKeyField_PrimitiveToObject",
+            0,
+            |old: &[u8]| {
+                // old: [u64 key][u32 ff] -> new: [u64 key][u32 len][utf8 ff]
+                let key = &old[0..8];
+                let ff = u32::from_be_bytes(old[8..12].try_into().ok()?);
+                let s = ff.to_string();
+                let sb = s.as_bytes();
+                let mut out = Vec::new();
+                out.extend_from_slice(key);
+                out.extend_from_slice(&(sb.len() as u32).to_be_bytes());
+                out.extend_from_slice(sb);
+                Some(out)
+            },
+        ));
+        let cfg = StoreConfig::new("s")
+            .with_allow_create(true)
+            .with_mutations(mutations);
+        let mut store = EntityStore::open(&env, cfg).unwrap();
+        let idx: PrimaryIndex<u64, V1> = store.get_primary_index().unwrap();
+        let got = idx.get(None, &S1, &99).unwrap().unwrap();
+        assert_eq!(got, V1 { key: 99, ff: "88".to_string() });
+        store.close().unwrap();
+        env.close().unwrap();
+    }
+}
