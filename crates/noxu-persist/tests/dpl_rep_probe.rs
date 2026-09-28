@@ -44,8 +44,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use noxu_db::{
-    AckWaitError, Durability, Environment, EnvironmentConfig, ReplicaAckPolicy,
-    ReplicaAckCoordinator, ReplicaAckPolicyKind, SyncPolicy, TransactionConfig,
+    AckWaitError, Durability, Environment, EnvironmentConfig,
+    ReplicaAckCoordinator, ReplicaAckPolicy, ReplicaAckPolicyKind, SyncPolicy,
+    TransactionConfig,
 };
 use noxu_persist::{
     Entity, EntitySerializer, EntityStore, PersistError, PrimaryIndex,
@@ -84,7 +85,9 @@ impl EntitySerializer<Widget> for WidgetSerializer {
     }
     fn deserialize(&self, bytes: &[u8]) -> noxu_persist::Result<Widget> {
         if bytes.len() < 12 {
-            return Err(PersistError::SerializationError("short widget".into()));
+            return Err(PersistError::SerializationError(
+                "short widget".into(),
+            ));
         }
         let id = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
         let n = u32::from_be_bytes(bytes[8..12].try_into().unwrap()) as usize;
@@ -152,9 +155,13 @@ fn dpl_write_routes_through_replica_ack_coordinator() {
     let coord = Arc::new(CountingCoord::new());
     env.set_replica_coordinator(coord.clone());
 
-    let mut store =
-        EntityStore::open(&env, StoreConfig::new("wstore").with_allow_create(true).with_transactional(true))
-            .unwrap();
+    let mut store = EntityStore::open(
+        &env,
+        StoreConfig::new("wstore")
+            .with_allow_create(true)
+            .with_transactional(true),
+    )
+    .unwrap();
     let primary: PrimaryIndex<u64, Widget> = store.get_primary_index().unwrap();
     let ser = WidgetSerializer;
 
@@ -185,7 +192,6 @@ fn dpl_write_routes_through_replica_ack_coordinator() {
     // And the entity is visible locally (master serves its own DPL reads).
     let got = primary.get(None, &ser, &1u64).unwrap();
     assert_eq!(got, Some(w));
-
 }
 
 // ─── PROBE 2: coordinator is NOT consulted without one installed ──────────
@@ -201,9 +207,13 @@ fn dpl_write_without_coordinator_is_local_only() {
     // prove it is never touched, then never install it.
     let coord = CountingCoord::new();
 
-    let mut store =
-        EntityStore::open(&env, StoreConfig::new("wstore").with_allow_create(true).with_transactional(true))
-            .unwrap();
+    let mut store = EntityStore::open(
+        &env,
+        StoreConfig::new("wstore")
+            .with_allow_create(true)
+            .with_transactional(true),
+    )
+    .unwrap();
     let primary: PrimaryIndex<u64, Widget> = store.get_primary_index().unwrap();
     let ser = WidgetSerializer;
 
@@ -225,7 +235,6 @@ fn dpl_write_without_coordinator_is_local_only() {
         0,
         "with no coordinator installed the DPL commit must be local-only"
     );
-
 }
 
 // ─── PROBE 3: auto-commit DPL write bypasses the coordinator ──────────────
@@ -242,16 +251,18 @@ fn dpl_auto_commit_write_bypasses_coordinator() {
     let coord = Arc::new(CountingCoord::new());
     env.set_replica_coordinator(coord.clone());
 
-    let mut store =
-        EntityStore::open(&env, StoreConfig::new("wstore").with_allow_create(true).with_transactional(true))
-            .unwrap();
+    let mut store = EntityStore::open(
+        &env,
+        StoreConfig::new("wstore")
+            .with_allow_create(true)
+            .with_transactional(true),
+    )
+    .unwrap();
     let primary: PrimaryIndex<u64, Widget> = store.get_primary_index().unwrap();
     let ser = WidgetSerializer;
 
     // Auto-commit (txn = None): synthetic auto-txn, no coordinator wiring.
-    primary
-        .put(None, &ser, &Widget { id: 3, label: "gamma".into() })
-        .unwrap();
+    primary.put(None, &ser, &Widget { id: 3, label: "gamma".into() }).unwrap();
 
     assert_eq!(
         coord.calls(),
@@ -259,5 +270,4 @@ fn dpl_auto_commit_write_bypasses_coordinator() {
         "auto-commit DPL writes bypass Environment::begin_transaction and so \
          do NOT consult the replica-ack coordinator (documented edge)"
     );
-
 }
