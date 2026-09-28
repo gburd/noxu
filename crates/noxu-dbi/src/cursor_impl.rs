@@ -611,15 +611,35 @@ impl CursorImpl {
     ///
     /// Returns `(None, NULL_LSN)` if the key does not exist (new insert).
     fn get_slot_before_image(&self, key: &[u8]) -> (Option<Vec<u8>>, u64) {
-        let db = self.db_impl.read();
-        if let Some(tree) = db.get_real_tree() {
-            match Self::get_data_from_tree(&tree, key) {
-                Some((data, lsn)) => (Some(data), lsn),
+        let (data, lsn) = {
+            let db = self.db_impl.read();
+            match db.get_real_tree() {
+                Some(tree) => match Self::get_data_from_tree(&tree, key) {
+                    Some((data, lsn)) => (Some(data), lsn),
+                    None => (None, noxu_util::NULL_LSN.as_u64()),
+                },
                 None => (None, noxu_util::NULL_LSN.as_u64()),
             }
-        } else {
-            (None, noxu_util::NULL_LSN.as_u64())
+        };
+        // JE `IN.fetchTarget` / `CursorImpl.LockStanding.prepareForUpdate`:
+        // the before-image captured for abort undo must be the record's
+        // *actual* prior value.  When the evictor stripped this slot's LN
+        // (`data == None`, surfaced here as an empty vec by
+        // `get_data_from_tree`) the resident bytes are gone but the slot still
+        // carries a valid `lsn` -- the value is recoverable from the log.  We
+        // must re-fetch it here, exactly as the read path does, otherwise the
+        // undo record stores an EMPTY before-image and an abort durably
+        // restores a 0-byte record over the caller's original (see the
+        // NEW-EVOLVE-ABORT-ROLLBACK regression: an aborted DPL evolution left
+        // 0-byte records that panicked a later read).
+        if lsn != noxu_util::NULL_LSN.as_u64()
+            && data.as_ref().map(|d| d.is_empty()).unwrap_or(false)
+            && let Some(fetched) = self.fetch_ln_data_from_log(lsn)
+            && !fetched.is_empty()
+        {
+            return (Some(fetched.to_vec()), lsn);
         }
+        (data, lsn)
     }
 
     /// Returns true if `key` exists in the committed tree.
