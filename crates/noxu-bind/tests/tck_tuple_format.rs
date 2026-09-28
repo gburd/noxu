@@ -15,6 +15,22 @@
 //!   omitted; the round-trip and ordering invariants are preserved.
 //! - JE supports a "null string" marker.  Noxu's API takes `&str` and
 //!   does not, so JE's `testNullString` is omitted.
+//! - JE `writeBigInteger`/`writeBigDecimal`/`writeSortedBigDecimal` are
+//!   backed by `java.math.BigInteger`/`BigDecimal`.  Rust has no built-in
+//!   arbitrary-precision numeric type and Noxu's `TupleInput`/`TupleOutput`
+//!   expose no bignum API, so `testBigInteger`, `testBigDecimal`, and
+//!   `testSortedBigDecimal` (in both `TupleFormatTest` and
+//!   `TupleOrderingTest`) are N/A — genuine platform deviation, not a
+//!   correctness gap.
+//! - JE's `TupleBindingTest.testBufferSize` asserts the binding's
+//!   `getTupleOutput()` hands back a `TupleOutput` whose
+//!   `getBufferBytes().length` equals `FastOutputStream.DEFAULT_INIT_SIZE`
+//!   (or a configured `setTupleBufferSize`).  Those are JE-internal
+//!   buffer-capacity knobs; Noxu's `TupleOutput` is a growable `Vec<u8>`
+//!   with no capacity-introspection API on the binding, so `testBufferSize`
+//!   is N/A.  The reuse behavior of `testBufferOverride` IS portable and
+//!   is covered by `tck_tuple_binding_test_buffer_override`
+//!   (`with_capacity` + `reset`).
 //! - JE `writeFloat` / `writeDouble` use the *non-sorted* IEEE-754
 //!   ordering, in which only non-negative values are ordered; noxu's
 //!   `write_float` / `write_double` match that contract.  Sortable
@@ -1365,4 +1381,131 @@ fn tck_tuple_binding_test_tuple_tuple_marshalled_binding() {
     assert_eq!("index1", got.index_key1);
     assert_eq!("index2", got.index_key2);
     assert_eq!(val, got);
+}
+
+// ---------------------------------------------------------------------------
+// Gap ports (test-parity remediation): fixed-length string + buffer reuse.
+// ---------------------------------------------------------------------------
+
+/// Port of `TupleFormatTest.testFixedString`.
+///
+/// JE `writeString(char[])` writes the chars with NO null terminator
+/// (fixed-length framing), and `readString(int len)` reads exactly `len`
+/// units.  The JE test operates on single-byte chars only
+/// (`assertEquals(val.length, out.size())` "assume 1 byte chars").
+///
+/// Noxu has no fixed-length *string* API — `write_string` is always
+/// null-terminated (documented deviation) — but the underlying invariant
+/// ("write N raw units without a terminator, read exactly N back, with the
+/// caller tracking the length") is exactly `write_bytes` / `read_bytes(len)`.
+/// So we port the fixed-length round-trip against those, which is the
+/// faithful Noxu analogue of JE's fixed-string framing.
+#[test]
+fn tck_tuple_format_test_fixed_string() {
+    fn fixed_string_test(val: &[u8]) {
+        let mut out = TupleOutput::new();
+        out.write_bytes(val);
+        // JE: assertEquals(val.length, out.size()) — no terminator.
+        assert_eq!(val.len(), out.len());
+        let mut input = TupleInput::new(out.as_bytes());
+        let got = input.read_bytes(val.len()).unwrap();
+        assert_eq!(val, got.as_slice());
+        assert_eq!(0, input.available());
+    }
+
+    fixed_string_test(b"");
+    fixed_string_test(b"a");
+    fixed_string_test(b"abc");
+
+    // Multiple fixed-length writes concatenate with no delimiter; the
+    // reader consumes each by its known length.  JE writes "abc" + "defg"
+    // (size 7) then reads readString(3) + readString(4).
+    let mut out = TupleOutput::new();
+    out.write_bytes(b"abc");
+    out.write_bytes(b"defg");
+    assert_eq!(7, out.len());
+    let mut input = TupleInput::new(out.as_bytes());
+    assert_eq!(b"abc", input.read_bytes(3).unwrap().as_slice());
+    assert_eq!(b"defg", input.read_bytes(4).unwrap().as_slice());
+    assert_eq!(0, input.available());
+
+    // Three writes: "abc" + "defg" + "hijkl" (size 12).
+    let mut out = TupleOutput::new();
+    out.write_bytes(b"abc");
+    out.write_bytes(b"defg");
+    out.write_bytes(b"hijkl");
+    assert_eq!(12, out.len());
+    let mut input = TupleInput::new(out.as_bytes());
+    assert_eq!(b"abc", input.read_bytes(3).unwrap().as_slice());
+    assert_eq!(b"defg", input.read_bytes(4).unwrap().as_slice());
+    assert_eq!(b"hijkl", input.read_bytes(5).unwrap().as_slice());
+    assert_eq!(0, input.available());
+}
+
+/// Port of `TupleOrderingTest.testFixedString`.
+///
+/// JE writes fixed-length single-byte char arrays (no terminator) and
+/// asserts each successive encoding sorts strictly after the previous one
+/// in unsigned-byte order:
+///   {}, {'a'}, {'a','b'}, {'b'}, {'b','b'}, {0x7F}, {0xFF}
+///
+/// Noxu's faithful analogue is `write_bytes` (fixed-length, no terminator),
+/// which for raw bytes is just identity — so the encoded order IS the
+/// input byte order.  This is the fixed-length counterpart to the
+/// null-terminated `testString` ordering (which is covered separately by
+/// `tck_tuple_ordering_test_string`).
+#[test]
+fn tck_tuple_ordering_test_fixed_string() {
+    let data: &[&[u8]] = &[b"", b"a", b"ab", b"b", b"bb", &[0x7F], &[0xFF]];
+    let mut prev: Option<Vec<u8>> = None;
+    for (i, &v) in data.iter().enumerate() {
+        let mut out = TupleOutput::new();
+        out.write_bytes(v);
+        let next = out.as_bytes().to_vec();
+        if let Some(prev) = &prev {
+            assert_lt_bytes(prev, &next, i);
+        }
+        prev = Some(next);
+    }
+}
+
+/// Port of `TupleBindingTest.testBufferOverride`.
+///
+/// JE's `CachedOutputBinding` overrides `getTupleOutput()` to hand back a
+/// single cached `TupleOutput` (calling `out.reset()` first) instead of
+/// allocating a fresh one per `objectToEntry`.  It then encodes short then
+/// long ("aaaa...") then short values through the SAME reused buffer and
+/// asserts each round-trips.  This exercises buffer reuse + growth across
+/// calls.
+///
+/// Noxu's `TupleBinding`/`TupleOutput` don't expose a `getTupleOutput()`
+/// template-method hook (the `getBufferBytes()`/`setTupleBufferSize()`
+/// capacity-introspection API is a JE-internal detail — see the
+/// `testBufferSize` N/A record), but the *behavior under test* — reusing
+/// one `TupleOutput`, resetting it between values, and having it grow to
+/// hold a larger payload then shrink back to a short one — is fully
+/// portable via `TupleOutput::with_capacity(n)` + `reset()`.  We drive the
+/// exact JE value sequence through one reused buffer.
+#[test]
+fn tck_tuple_binding_test_buffer_override() {
+    // JE seeds the cached output with `new TupleOutput(new byte[10])`,
+    // i.e. an initial capacity of 10.
+    let mut out = TupleOutput::with_capacity(10);
+
+    fn round_trip_reused(out: &mut TupleOutput, s: &str) {
+        // Mirror CachedOutputBinding.getTupleOutput(): reset then reuse.
+        out.reset();
+        out.write_string(s);
+        // entryToObject equivalent: read the string back from the bytes.
+        let mut input = TupleInput::new(out.as_bytes());
+        assert_eq!(s, input.read_string().unwrap());
+        assert_eq!(0, input.available());
+    }
+
+    // Short value (fits initial capacity).
+    round_trip_reused(&mut out, "x");
+    // Long value forces the reused buffer to grow past its initial 10 bytes.
+    round_trip_reused(&mut out, "aaaaaaaaaaaaaaaaaaaaaa");
+    // Short value again through the same (now larger) reused buffer.
+    round_trip_reused(&mut out, "x");
 }
