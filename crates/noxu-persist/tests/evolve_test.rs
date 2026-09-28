@@ -1613,10 +1613,10 @@ fn evolve_incompatible_field_type_change_is_rejected_without_converter() {
         let mut store = EntityStore::open(&env, cfg).unwrap();
         let idx: PrimaryIndex<u64, V1> = store.get_primary_index().unwrap();
 
-        let err = idx
-            .get(None, &S1, &99)
-            .expect_err("expected the incompatible field-type change to be \
-                 rejected, but the read succeeded");
+        let err = idx.get(None, &S1, &99).expect_err(
+            "expected the incompatible field-type change to be \
+                 rejected, but the read succeeded",
+        );
         assert!(
             matches!(err, PersistError::SerializationError(_)),
             "expected PersistError::SerializationError (IncompatibleClass \
