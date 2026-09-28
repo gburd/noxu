@@ -16,6 +16,8 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+## [7.11.0] - 2026-09-28
+
 ### Added
 - `noxu-util` gains a faithful reference port of JE's `LatencyStat` (latency histogram
   with percentile/average/rollup, including JE's `[#21763]` percentile fix). A reference
