@@ -496,11 +496,18 @@ fn do_test_reuse_slot_partial_key(run_recovery: bool) {
         assert_eq!(k.data_opt().unwrap(), e2(0, 1).data_opt().unwrap());
     }
     txn.abort().unwrap();
+    // Release the aborted txn handle: `Transaction` holds an
+    // `Arc<EnvironmentImpl>`, and the env lock file is not released until the
+    // last such handle drops.  Without this the reopen below fails with
+    // "Environment is locked".
+    drop(txn);
 
     let (_env, db) = if run_recovery {
         db.close().unwrap();
         env.close().unwrap();
-        // Drop by scope: reopen fresh.
+        // Release BOTH handles before reopening the same path — the env lock
+        // file is held until the last live Environment/Database handle drops.
+        drop(db);
         drop(env);
         open(false)
     } else {
@@ -538,28 +545,30 @@ fn do_test_reuse_slot_partial_key(run_recovery: bool) {
 
 // JE: DatabaseComparatorsTest.testReuseSlotAbortPartialKey
 //
-// ENGINE-BUG CANDIDATE (NEW-REUSESLOT-1) — DATA LOSS: aborting a
-// partial-comparator slot reuse LOSES the original committed record.
+// NEW-REUSESLOT-1 — DATA LOSS (FIXED): aborting a partial-comparator slot
+// reuse used to LOSE the original committed record.
 //
-// Runtime-probed with a control (2026-05): the sequence
+// The sequence
 //   put {0,0}/{0} (commit) ; txn{ delete {0,1} (== {0,0} under the partial
 //   comparator, so it targets the existing slot) ; insert {0,1}/{1} (reuses
 //   that slot) } ; ABORT
-// leaves the database EMPTY (count == 0, getFirst == NotFound) — the original
-// {0,0}/{0} is gone.  DURABLE: a point-get of the original committed key {0,0}
-// returns NotFound after the abort AND still after a close+reopen (recovery) —
-// the committed record is permanently lost, not merely mis-counted.  Expected
-// (JE): abort rolls the slot back to {0,0}/{0} (count == 1).  Control: the SAME
-// sequence with the DEFAULT byte comparator
-// (where {0,0} and {0,1} are DISTINCT keys, so no slot reuse occurs) correctly
-// leaves count == 1 after abort — isolating the fault to the slot-reuse path
-// under a partial (compares-equal) comparator, not the abort machinery itself.
-// JE reference: DatabaseComparatorsTest / [#15704] (slot reuse must restore the
-// pre-reuse LSN on abort).  Kept #[ignore]d — faithful repro, must not be
-// weakened; escalated for a dedicated fix worker.  Severity: DATA LOSS but
-// NARROW (requires a partial/compares-equal btree comparator + abort).
+// left the database EMPTY (count == 0, getFirst == NotFound) — the original
+// {0,0}/{0} was gone, durably (also after a close+reopen).  Root cause: the
+// abort before-image capture (`CursorImpl::get_data_from_tree`) looked up the
+// slot with a raw BYTE match instead of the configured comparator, so under a
+// compares-equal comparator the delete recorded an EMPTY before-image
+// (abort_data=None, known_deleted=true) and abort restored zero bytes; and the
+// cursor recorded the SEARCH key rather than the STORED slot key as its
+// position, so the restore used the wrong key.  Fixed in
+// noxu-dbi/src/cursor_impl.rs: `get_data_from_tree` now uses `find_entry_cmp`
+// when a comparator is present, and `search` positions on the stored slot key.
+// Expected (JE [#15704]): abort rolls the slot back to {0,0}/{0} (count == 1),
+// restoring both the original key bytes and data.  Control: the SAME sequence
+// with the DEFAULT byte comparator (where {0,0} and {0,1} are DISTINCT keys, so
+// no slot reuse occurs) also keeps count == 1 after abort — isolating the
+// former fault to the slot-reuse path under a partial (compares-equal)
+// comparator, not the abort machinery itself.
 #[test]
-#[ignore = "NEW-REUSESLOT-1: abort after partial-comparator slot reuse LOSES the original record (count 0); control with distinct keys keeps count 1"]
 fn reuse_slot_abort_partial_key() {
     do_test_reuse_slot_partial_key(false);
 }
@@ -567,7 +576,62 @@ fn reuse_slot_abort_partial_key() {
 // JE: DatabaseComparatorsTest.testReuseSlotRecoverPartialKey
 // Same DATA-LOSS finding as reuse_slot_abort_partial_key, after recovery.
 #[test]
-#[ignore = "NEW-REUSESLOT-1: see reuse_slot_abort_partial_key (data loss on abort of partial-comparator slot reuse)"]
 fn reuse_slot_recover_partial_key() {
     do_test_reuse_slot_partial_key(true);
+}
+
+// NEW-REUSESLOT-1 CONTROL: the SAME delete+insert+abort sequence with the
+// DEFAULT byte comparator.  {0,0} and {0,1} are DISTINCT keys, so no slot reuse
+// happens: the delete of {0,1} finds nothing, the insert of {0,1} is a fresh
+// second key, and the abort must leave ONLY the original committed {0,0}/{0}
+// (count == 1).  This isolates the fault the sibling tests exercise to the
+// slot-reuse-under-a-compares-equal-comparator path, not the abort machinery.
+#[test]
+fn reuse_slot_abort_default_comparator_control() {
+    use noxu_db::{DatabaseConfig, EnvironmentConfig, Get, OperationStatus};
+    let dir = TempDir::new().unwrap();
+    let env = noxu_db::Environment::open(
+        EnvironmentConfig::new(dir.path().to_path_buf())
+            .with_allow_create(true)
+            .with_transactional(true),
+    )
+    .unwrap();
+    let db = env
+        .open_database(
+            None,
+            "ctrl",
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true),
+        )
+        .unwrap();
+
+    db.put(e2(0, 0), e1(0)).unwrap();
+
+    let txn = env.begin_transaction(None).unwrap();
+    // {0,1} is a DISTINCT key under the default comparator, so this delete
+    // finds nothing and the insert is a brand-new second record.
+    assert!(!db.delete_in(&txn, e2(0, 1)).unwrap());
+    db.put_in(&txn, e2(0, 1), e1(1)).unwrap();
+    txn.abort().unwrap();
+    drop(txn);
+
+    // Abort rolls back only the new {0,1} insert; the committed {0,0}/{0}
+    // remains (count == 1).
+    assert_eq!(
+        db.count().unwrap(),
+        1,
+        "control: abort must keep the original committed record"
+    );
+    let mut c = db.open_cursor(None).unwrap();
+    let mut k = e2(9, 9);
+    let mut d = e1(9);
+    assert_eq!(
+        c.get(&mut k, &mut d, Get::First, None).unwrap(),
+        OperationStatus::Success
+    );
+    assert_eq!(k.data_opt().unwrap(), e2(0, 0).data_opt().unwrap());
+    assert_eq!(d.data_opt().unwrap(), e1(0).data_opt().unwrap());
+    drop(c);
+    db.close().unwrap();
 }
