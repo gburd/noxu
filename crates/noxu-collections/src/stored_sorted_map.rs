@@ -547,4 +547,512 @@ mod tests {
         assert_eq!(map.keys_snapshot(None).unwrap().count(), 5);
         assert_eq!(map.values_snapshot(None).unwrap().count(), 5);
     }
+
+    // ───────────────────────────────────────────────────────────────────
+    // JE parity: com.sleepycat.collections.KeyRangeTest
+    //
+    // JE's KeyRangeTest exercises com.sleepycat.util.keyrange.KeyRange —
+    // the bounded key-range abstraction underpinning StoredSortedMap's
+    // subMap(from,to)/headMap(to)/tailMap(from): a begin-key + end-key
+    // pair with begin-inclusive / end-inclusive flags, key containment
+    // (is K in [begin,end]?), sub-range intersection (subRange), and
+    // unsigned-byte comparator ordering.
+    //
+    // Noxu's collections layer has no `KeyRange` *class* (a JE-internal
+    // shape) and its StoredSortedMap exposes bounded scans only as an
+    // inclusive lower bound (`iter_from`) plus full-range / reverse
+    // scans — it does not expose a begin+end inclusive/exclusive bounded
+    // subMap collection view.  The *portable* content of KeyRangeTest is
+    // the range CONTAINMENT + inclusive/exclusive BOUND arithmetic + the
+    // subRange intersection-validation algorithm and the comparator
+    // ordering.  Those we port faithfully:
+    //
+    //  * `KeyRange` below is a faithful, test-local port of JE's
+    //    KeyRange.check / checkBegin / checkEnd / subRange (same
+    //    algorithm, same names), over raw `Vec<u8>` keys.
+    //  * `testScan` / `testScanComparator`'s begin/end × inclusive/
+    //    exclusive matrix over the exact JE KEYS[] array is asserted
+    //    against that containment predicate (this is precisely what JE's
+    //    `checkRange` proves via cursor navigation: which keys of KEYS[]
+    //    fall in each range) — plus the DB-observable inclusive-begin
+    //    subset is verified against a real StoredSortedMap.
+    //  * The reverse comparator is exercised both at the KeyRange
+    //    predicate level and end-to-end against a real DB opened with a
+    //    reverse btree comparator.
+    //
+    // The full JE DataCursor forward+reverse navigation matrix over a
+    // begin+end bounded cursor is N/A at the collections layer (Noxu has
+    // no begin+end bounded StoredSortedMap view); the underlying
+    // comparator-ordered cursor scan itself is covered by noxu-db's
+    // dbi14_comparator_test.  See report tp-collections-top.md.
+
+    /// Unsigned-byte comparison, JE `KeyRange.compareBytes`: the default
+    /// JE/DB ordering.  `Vec<u8>`'s natural `Ord` already compares
+    /// lexicographically over `u8` (unsigned), so this is the identity of
+    /// `a.cmp(b)` — spelled out to match the JE algorithm name/intent.
+    fn compare_bytes(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+        a.cmp(b)
+    }
+
+    /// Faithful test-local port of `com.sleepycat.util.keyrange.KeyRange`
+    /// (JE: KeyRange.java) — begin/end bounds with inclusive/exclusive
+    /// flags, containment (`check`), and sub-range intersection
+    /// (`sub_range`).  Comparator is an optional key ordering (JE's
+    /// `Comparator<byte[]>`); `None` means default unsigned-byte order.
+    #[derive(Clone, Debug)]
+    struct KeyRange {
+        comparator: Option<fn(&[u8], &[u8]) -> std::cmp::Ordering>,
+        begin_key: Option<Vec<u8>>,
+        end_key: Option<Vec<u8>>,
+        begin_inclusive: bool,
+        end_inclusive: bool,
+    }
+
+    /// JE: KeyRangeException — a requested sub-range is not contained in
+    /// the parent range.
+    #[derive(Debug, PartialEq, Eq)]
+    struct KeyRangeException(&'static str);
+
+    impl KeyRange {
+        /// JE: `KeyRange(Comparator)` — an unconstrained range.
+        fn new(
+            comparator: Option<fn(&[u8], &[u8]) -> std::cmp::Ordering>,
+        ) -> Self {
+            KeyRange {
+                comparator,
+                begin_key: None,
+                end_key: None,
+                begin_inclusive: false,
+                end_inclusive: false,
+            }
+        }
+
+        /// JE: `KeyRange.compare` — user comparator if present, else
+        /// unsigned-byte order.
+        fn compare(&self, k1: &[u8], k2: &[u8]) -> std::cmp::Ordering {
+            match self.comparator {
+                Some(c) => c(k1, k2),
+                None => compare_bytes(k1, k2),
+            }
+        }
+
+        /// JE: `KeyRange.checkBegin`.  `inclusive=true` when checking a key
+        /// read from the database (must be within range); `inclusive=false`
+        /// when checking a new exclusive sub-range bound (allowed to equal
+        /// beginKey).
+        fn check_begin(&self, key: &[u8], inclusive: bool) -> bool {
+            match &self.begin_key {
+                None => true,
+                Some(bk) => {
+                    if !self.begin_inclusive && inclusive {
+                        self.compare(key, bk) == std::cmp::Ordering::Greater
+                    } else {
+                        self.compare(key, bk) != std::cmp::Ordering::Less
+                    }
+                }
+            }
+        }
+
+        /// JE: `KeyRange.checkEnd`.
+        fn check_end(&self, key: &[u8], inclusive: bool) -> bool {
+            match &self.end_key {
+                None => true,
+                Some(ek) => {
+                    if !self.end_inclusive && inclusive {
+                        self.compare(key, ek) == std::cmp::Ordering::Less
+                    } else {
+                        self.compare(key, ek) != std::cmp::Ordering::Greater
+                    }
+                }
+            }
+        }
+
+        /// JE: `KeyRange.check(key)` — is `key` within range (as a DB key)?
+        fn check(&self, key: &[u8]) -> bool {
+            self.check_begin(key, true) && self.check_end(key, true)
+        }
+
+        /// JE: `KeyRange.subRange(begin, beginInclusive, end, endInclusive)`
+        /// — the intersection of this range with the given bounds.  A new
+        /// bound outside the parent range raises KeyRangeException.
+        fn sub_range(
+            &self,
+            begin_key: &[u8],
+            begin_inclusive: bool,
+            end_key: &[u8],
+            end_inclusive: bool,
+        ) -> std::result::Result<KeyRange, KeyRangeException> {
+            if !self.check_begin(begin_key, begin_inclusive) {
+                return Err(KeyRangeException("beginKey out of range"));
+            }
+            if !self.check_end(end_key, end_inclusive) {
+                return Err(KeyRangeException("endKey out of range"));
+            }
+            Ok(KeyRange {
+                comparator: self.comparator,
+                begin_key: Some(begin_key.to_vec()),
+                end_key: Some(end_key.to_vec()),
+                begin_inclusive,
+                end_inclusive,
+            })
+        }
+    }
+
+    const FF: u8 = 0xFF;
+
+    /// JE: KeyRangeTest.KEYS — the ordered key set used by testScan.
+    fn keys() -> Vec<Vec<u8>> {
+        vec![
+            vec![1],            // 0
+            vec![FF],           // 1
+            vec![FF, 0],        // 2
+            vec![FF, 0x7F],     // 3
+            vec![FF, FF],       // 4
+            vec![FF, FF, 0],    // 5
+            vec![FF, FF, 0x7F], // 6
+            vec![FF, FF, FF],   // 7
+        ]
+    }
+
+    /// Collect the indices of KEYS[] that a range containing begin[i..] /
+    /// end[..=j] (with the given inclusive/exclusive flags) admits, using
+    /// KeyRange::check — the observable "which keys are in range" that JE's
+    /// `checkRange`/`expectRange` proves via cursor navigation.
+    fn keys_in_range(range: &KeyRange, ks: &[Vec<u8>]) -> Vec<usize> {
+        ks.iter()
+            .enumerate()
+            .filter(|(_, k)| range.check(k))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// JE: KeyRangeTest.testScan (containment subset).
+    ///
+    /// JE's testScan opens a DB, inserts KEYS[0..=7], then for every
+    /// (begin, beginInclusive, end, endInclusive) combination walks a
+    /// bounded cursor forwards and backwards and asserts exactly
+    /// KEYS[i..=j] (adjusted for exclusivity) is returned.  We assert the
+    /// same admitted-index set via KeyRange::check over the exact KEYS[]
+    /// array — the bound arithmetic JE proves.  The inclusive-begin subset
+    /// is additionally verified against a real StoredSortedMap below.
+    #[test]
+    fn key_range_scan_containment() {
+        let ks = keys();
+        let end = ks.len() - 1; // 7
+        let base = KeyRange::new(None); // unconstrained
+
+        // Empty range: all keys.
+        assert_eq!(keys_in_range(&base, &ks), (0..=end).collect::<Vec<_>>());
+
+        // Begin key only, inclusive → KEYS[i..=end].
+        for i in 0..=end {
+            let r = base
+                .sub_range(&ks[i], true, &ks[end], true)
+                .expect("inclusive begin within base");
+            assert_eq!(
+                keys_in_range(&r, &ks),
+                (i..=end).collect::<Vec<_>>(),
+                "begin inclusive i={i}",
+            );
+        }
+
+        // Begin key only, exclusive → KEYS[(i+1)..=end].
+        for i in 0..=end {
+            let r = base
+                .sub_range(&ks[i], false, &ks[end], true)
+                .expect("exclusive begin within base");
+            assert_eq!(
+                keys_in_range(&r, &ks),
+                ((i + 1)..=end).collect::<Vec<_>>(),
+                "begin exclusive i={i}",
+            );
+        }
+
+        // End key only, inclusive → KEYS[0..=i].
+        for i in 0..=end {
+            let r = base
+                .sub_range(&ks[0], true, &ks[i], true)
+                .expect("inclusive end within base");
+            assert_eq!(
+                keys_in_range(&r, &ks),
+                (0..=i).collect::<Vec<_>>(),
+                "end inclusive i={i}",
+            );
+        }
+
+        // End key only, exclusive → KEYS[0..=(i-1)] (empty when i==0).
+        for i in 0..=end {
+            let r = base
+                .sub_range(&ks[0], true, &ks[i], false)
+                .expect("exclusive end within base");
+            let expect: Vec<usize> =
+                if i == 0 { vec![] } else { (0..=(i - 1)).collect() };
+            assert_eq!(keys_in_range(&r, &ks), expect, "end exclusive i={i}");
+        }
+
+        // Begin and end, all four inclusive/exclusive combinations.
+        for i in 0..=end {
+            for j in i..=end {
+                // begin inclusive, end inclusive → [i, j]
+                let r = base.sub_range(&ks[i], true, &ks[j], true).unwrap();
+                assert_eq!(
+                    keys_in_range(&r, &ks),
+                    (i..=j).collect::<Vec<_>>(),
+                    "incl/incl i={i} j={j}",
+                );
+                // begin inclusive, end exclusive → [i, j-1] (empty if j<=i)
+                let r = base.sub_range(&ks[i], true, &ks[j], false).unwrap();
+                let expect: Vec<usize> =
+                    if j > i { (i..j).collect() } else { vec![] };
+                assert_eq!(
+                    keys_in_range(&r, &ks),
+                    expect,
+                    "incl/excl i={i} j={j}",
+                );
+                // begin exclusive, end inclusive → [i+1, j]
+                let r = base.sub_range(&ks[i], false, &ks[j], true).unwrap();
+                let expect: Vec<usize> =
+                    if j > i { ((i + 1)..=j).collect() } else { vec![] };
+                assert_eq!(
+                    keys_in_range(&r, &ks),
+                    expect,
+                    "excl/incl i={i} j={j}",
+                );
+                // begin exclusive, end exclusive → [i+1, j-1]
+                let r = base.sub_range(&ks[i], false, &ks[j], false).unwrap();
+                let expect: Vec<usize> =
+                    if j > i + 1 { ((i + 1)..j).collect() } else { vec![] };
+                assert_eq!(
+                    keys_in_range(&r, &ks),
+                    expect,
+                    "excl/excl i={i} j={j}",
+                );
+            }
+        }
+    }
+
+    /// JE: KeyRangeTest.testScan (DB-observable inclusive-begin subset).
+    ///
+    /// The one bounded shape Noxu's StoredSortedMap exposes is an
+    /// inclusive lower bound (`iter_from`).  Insert KEYS[] into a real DB
+    /// and assert `iter_from(KEYS[i])` yields exactly KEYS[i..=end] — the
+    /// same inclusive-begin bound the containment test proves, now against
+    /// the engine.  (Vec<u8> keys sort by unsigned byte order, matching
+    /// JE's default DB order for these keys.)
+    #[test]
+    fn key_range_scan_iter_from_matches_db() {
+        let (_td, _env, db) = setup();
+        let map: StoredSortedMap<'_, Vec<u8>, Vec<u8>, _, _> =
+            StoredSortedMap::new(
+                &db,
+                noxu_bind::ByteArrayBinding,
+                noxu_bind::ByteArrayBinding,
+            );
+        let ks = keys();
+        for k in &ks {
+            map.put(None, k, k).unwrap();
+        }
+        let end = ks.len() - 1;
+        for i in 0..=end {
+            let got: Vec<Vec<u8>> = map
+                .iter_from(None, &ks[i])
+                .unwrap()
+                .map(|r| r.unwrap().0)
+                .collect();
+            let expect: Vec<Vec<u8>> = ks[i..=end].to_vec();
+            assert_eq!(got, expect, "iter_from KEYS[{i}]");
+        }
+        // Lower extreme (before any key) yields all.
+        let all: Vec<Vec<u8>> = map
+            .iter_from(None, &vec![0u8])
+            .unwrap()
+            .map(|r| r.unwrap().0)
+            .collect();
+        assert_eq!(all, ks, "iter_from lower-extreme yields all");
+    }
+
+    /// JE: KeyRangeTest.testScanComparator (containment subset).
+    ///
+    /// JE re-runs testScan with a ReverseComparator (descending byte
+    /// order).  Under a reverse comparator, the KEYS[] array — which is in
+    /// ascending order — is *descending* per the comparator, so a range
+    /// bounded by begin=KEYS[i], end=KEYS[j] (i<=j ascending) is empty
+    /// unless i==j: begin > end under the reverse order.  Assert the
+    /// containment predicate honours the comparator: a single-key range
+    /// admits exactly that key, and check() flips with the ordering.
+    #[test]
+    fn key_range_scan_comparator_containment() {
+        fn reverse(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+            compare_bytes(b, a)
+        }
+        let ks = keys();
+        let base = KeyRange::new(Some(reverse));
+
+        // Single-key range [k, k] admits exactly that key under either
+        // ordering.
+        for i in 0..ks.len() {
+            let r = base.sub_range(&ks[i], true, &ks[i], true).unwrap();
+            assert_eq!(keys_in_range(&r, &ks), vec![i], "single-key i={i}");
+        }
+
+        // Under the reverse comparator KEYS[0] (=[1]) is the reverse-order
+        // MAXIMUM (byte-smallest) and KEYS[7] (=[FF,FF,FF]) is the
+        // reverse-order MINIMUM (byte-largest).
+        //
+        // begin=KEYS[7] (the reverse-order minimum), inclusive, no end →
+        // every key is >= the minimum under the reverse ordering, so all
+        // keys are admitted.
+        let full = KeyRange {
+            comparator: Some(reverse),
+            begin_key: Some(ks[7].clone()),
+            end_key: None,
+            begin_inclusive: true,
+            end_inclusive: false,
+        };
+        assert_eq!(
+            keys_in_range(&full, &ks),
+            (0..ks.len()).collect::<Vec<_>>(),
+            "reverse begin=KEYS[7] (reverse-min) admits all",
+        );
+
+        // begin=KEYS[0] (the reverse-order MAXIMUM), inclusive, no end →
+        // only the key equal to the maximum qualifies (nothing is greater
+        // under the reverse ordering), so only KEYS[0].
+        let r = KeyRange {
+            comparator: Some(reverse),
+            begin_key: Some(ks[0].clone()),
+            end_key: None,
+            begin_inclusive: true,
+            end_inclusive: false,
+        };
+        assert_eq!(
+            keys_in_range(&r, &ks),
+            vec![0],
+            "reverse begin=KEYS[0] (reverse-max) admits only KEYS[0]",
+        );
+
+        // Discriminating control: the SAME begin=KEYS[0] under the DEFAULT
+        // (unsigned-byte) order admits ALL keys — [1] is the byte-smallest,
+        // so every key is >= it.  The default admits {0..7} where reverse
+        // admits {0}: the comparator, not raw byte order, drives
+        // containment.
+        let default_begin0 = KeyRange {
+            comparator: None,
+            begin_key: Some(ks[0].clone()),
+            end_key: None,
+            begin_inclusive: true,
+            end_inclusive: false,
+        };
+        assert_eq!(
+            keys_in_range(&default_begin0, &ks),
+            (0..ks.len()).collect::<Vec<_>>(),
+            "default begin=KEYS[0] admits all (byte order)",
+        );
+    }
+
+    /// JE: KeyRangeTest.testScanComparator (DB-observable, real reverse
+    /// btree comparator).
+    ///
+    /// Open a real DB with a reverse btree comparator and assert the
+    /// cursor walk (via StoredSortedMap::iter) yields KEYS[] in DESCENDING
+    /// order — the comparator drives DB sort order end to end.  This is the
+    /// engine-level counterpart of JE's ReverseComparator scan.
+    #[test]
+    fn key_range_scan_comparator_orders_db() {
+        use noxu_db::{
+            Comparator, DatabaseConfig, Environment, EnvironmentConfig,
+        };
+        let td = tempfile::TempDir::new().unwrap();
+        let env = Environment::open(
+            EnvironmentConfig::new(td.path().to_path_buf())
+                .with_allow_create(true)
+                .with_transactional(true),
+        )
+        .unwrap();
+        let cmp =
+            Comparator::new("keyrange-reverse", |a: &[u8], b: &[u8]| b.cmp(a));
+        let db = env
+            .open_database(
+                None,
+                "rev",
+                &DatabaseConfig::new()
+                    .with_allow_create(true)
+                    .with_transactional(true)
+                    .with_btree_comparator(cmp),
+            )
+            .unwrap();
+        let map: StoredSortedMap<'_, Vec<u8>, Vec<u8>, _, _> =
+            StoredSortedMap::new(
+                &db,
+                noxu_bind::ByteArrayBinding,
+                noxu_bind::ByteArrayBinding,
+            );
+        let ks = keys();
+        for k in &ks {
+            map.put(None, k, k).unwrap();
+        }
+        // Forward iteration under a reverse comparator = descending byte
+        // order = KEYS[] reversed.
+        let got: Vec<Vec<u8>> =
+            map.iter(None).unwrap().map(|r| r.unwrap().0).collect();
+        let mut expect = ks.clone();
+        expect.reverse();
+        assert_eq!(got, expect, "reverse comparator yields descending walk");
+        // first_key / last_key must honour the comparator too.
+        assert_eq!(map.first_key(None).unwrap(), Some(ks[7].clone()));
+        assert_eq!(map.last_key(None).unwrap(), Some(ks[0].clone()));
+    }
+
+    /// JE: KeyRangeTest.testSubRanges — faithful port.
+    ///
+    /// Base range [1, 2] (both inclusive).  A sub-range is valid iff both
+    /// its new bounds fall within the parent range; otherwise subRange
+    /// raises KeyRangeException.  The exact JE cases and expected
+    /// valid/invalid outcomes are reproduced.
+    #[test]
+    fn key_range_sub_ranges() {
+        // Base range [1, 2] (both inclusive).
+        let base = KeyRange {
+            comparator: None,
+            begin_key: Some(vec![1]),
+            end_key: Some(vec![2]),
+            begin_inclusive: true,
+            end_inclusive: true,
+        };
+
+        // Subrange (0, 1] is invalid: begin 0 < parent begin 1.
+        assert_eq!(
+            base.sub_range(&[0], false, &[1], true).unwrap_err(),
+            KeyRangeException("beginKey out of range"),
+        );
+
+        // Subrange [1, 3) is invalid: end 3 > parent end 2.
+        assert_eq!(
+            base.sub_range(&[1], true, &[3], false).unwrap_err(),
+            KeyRangeException("endKey out of range"),
+        );
+
+        // Subrange [2, 2] is valid.
+        assert!(base.sub_range(&[2], true, &[2], true).is_ok());
+
+        // Subrange [0, 1] is invalid: begin 0 < parent begin 1.
+        assert_eq!(
+            base.sub_range(&[0], true, &[1], true).unwrap_err(),
+            KeyRangeException("beginKey out of range"),
+        );
+
+        // Subrange (0, 3] is invalid: begin 0 < parent begin 1.
+        assert_eq!(
+            base.sub_range(&[0], false, &[3], true).unwrap_err(),
+            KeyRangeException("beginKey out of range"),
+        );
+
+        // Subrange [3, 3) is invalid: begin 3 (>= parent begin 1) passes,
+        // but end 3 > parent end 2 fails.  JE checks begin first, then
+        // end, so this reports endKey (not beginKey) out of range.
+        assert_eq!(
+            base.sub_range(&[3], true, &[3], false).unwrap_err(),
+            KeyRangeException("endKey out of range"),
+        );
+    }
 }
