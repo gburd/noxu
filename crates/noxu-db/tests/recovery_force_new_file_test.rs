@@ -100,8 +100,7 @@ fn reopen_write_one(dir: &Path, force_new_file: bool) -> u32 {
     );
 
     // The write that must go to a fresh file when the flag is set.
-    db.put(b"post_recovery".to_vec(), b"post_value".to_vec())
-        .unwrap();
+    db.put(b"post_recovery", b"post_value").unwrap();
 
     let n = max_log_file_num(dir);
     drop(db);
