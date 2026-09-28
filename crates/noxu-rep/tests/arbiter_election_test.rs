@@ -65,6 +65,11 @@ fn make_group() -> RepGroup {
 /// quorum (Arbiter promises count), but the candidate value is the best
 /// Electable proposal, so `node1` wins (it is a tied Electable, with
 /// proposer's self-vote breaking the tie via Phase 2 quorum).
+/// JE: ArbiterTest.testMasterDown / ArbiterTest.testFlipMaster /
+/// ArbiterTest.testQuadElection (arbiter-provides-quorum half): an arbiter
+/// contributes to the election quorum so a real electable node (not the
+/// arbiter) becomes master. The arbiter's Phase-1 promise counts toward
+/// quorum while the arbiter itself never wins.
 #[test]
 fn f22_arbiter_with_highest_vlsn_does_not_win() {
     let group = make_group();
@@ -155,6 +160,9 @@ fn f22_unknown_node_refuses_to_propose() {
 /// DTVLSN 100; the arbiter answers Phase 1 with a counter-proposal carrying
 /// DTVLSN 200 (it remembers a more-durable commit from the departed master).
 /// `run_election_with_phi_dtvlsn` must return `None` (no master this round).
+/// JE: ArbiterTest.testOneMaster / ArbiterTest.testQuad (arbiter-prevents-
+/// stale-master half): "the Arbiter prevents a node from becoming Master due
+/// to its VLSN lower than the Arbiter's". Same RF=2 veto, driven end-to-end.
 #[test]
 fn arbiter_veto_blocks_election_when_sole_node_lags_dtvlsn() {
     let mut group = RepGroup::new("rf2".into(), 1);
@@ -247,6 +255,9 @@ fn arbiter_veto_blocks_election_when_sole_node_lags_dtvlsn() {
 /// arbiter's DTVLSN, the veto does NOT fire and the node is elected. Proves
 /// the veto is specific to the lagging case, not a blanket arbiter-present
 /// refusal.
+/// JE: ArbiterTest.testOneMaster (control) — once the surviving node is
+/// caught up to (or ahead of) the arbiter's durable point it IS elected;
+/// the veto is specific to the lagging case, not a blanket arbiter block.
 #[test]
 fn arbiter_veto_does_not_fire_when_node_leads_dtvlsn() {
     let mut group = RepGroup::new("rf2b".into(), 1);
