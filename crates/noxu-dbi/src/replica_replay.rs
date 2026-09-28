@@ -366,6 +366,12 @@ mod tests {
 
     /// HEADLINE (A): a transactional LN is NOT visible until its commit
     /// streams in, then it IS visible (provisional-apply resolved at commit).
+    ///
+    /// JE: `ReplayTest.testResumedTransaction` (portable core) — an op that is
+    /// still provisional stays invisible until its own commit streams in
+    /// (`Replay.replayEntry` LOG_TXN_COMMIT -> `repTxn.commit`). The
+    /// resumed-across-reopen variant is ported in
+    /// `noxu-rep/tests/je_replay_node_tck.rs`.
     #[test]
     fn test_txn_ln_invisible_until_commit() {
         let (env, db_id, tree) = open_env_with_db();
@@ -391,6 +397,9 @@ mod tests {
     }
 
     /// An aborted txn's LNs are never applied.
+    ///
+    /// JE: `Replay.replayEntry` LOG_TXN_ABORT -> `repTxn.abort` (the abort
+    /// half of the `ReplayTest` replay contract).
     #[test]
     fn test_txn_abort_discards_lns() {
         let (env, db_id, tree) = open_env_with_db();
@@ -423,6 +432,12 @@ mod tests {
     }
 
     /// Multiple LNs in one txn all become visible atomically at commit.
+    ///
+    /// JE: `ReplayTest.testBasicDatabaseOperations` (portable core) — the
+    /// replica converges to the master's state after replaying a committed
+    /// multi-op transaction. Full LN insert/update/delete convergence +
+    /// VLSN-order + the DDL-catalog deviation are in
+    /// `noxu-rep/tests/je_replay_node_tck.rs`.
     #[test]
     fn test_multi_ln_txn_commit() {
         let (env, db_id, tree) = open_env_with_db();
