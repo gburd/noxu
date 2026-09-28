@@ -39,6 +39,7 @@ listed in [References](#references).
 ### Fixed
 
 
+- **Removing or truncating a database now reclaims its space under the ordinary cleaner** (`NEW-CLEANER-DBOBSOLETE`): `remove_database` and auto-commit `truncate_database` did not mark the database’s log footprint obsolete, so the default (non-forced) cleaner never reclaimed those files (only `clean_log_forced` did). They now count the footprint obsolete (JE `countObsoleteDb`); transactional `truncate` is excluded because it already counts each record obsolete via its eager per-record drain (no double-count). Known residual (pre-existing, unrelated to this change): a hard crash before the first checkpoint after a remove/truncate rolls the whole DDL back — Noxu lacks JE’s deleted-MapLN recovery replay; tracked as a follow-up.
 - **Cursor writes now maintain secondary indexes** (`NEW-CURSOR-SEC-MAINT`): `Cursor::put` (all variants) and `Cursor::delete` on a primary with registered secondaries previously maintained no secondaries — a cursor write left the secondary stale (missed lookups, a dangling old key after a replace, a `SecondaryIntegrityException` on cursor delete). Cursor writes now fan out to secondaries under the cursor’s own transaction (JE `Cursor.putInternal`/`deleteInternal`), atomically with commit/abort, matching the `Database`-level write path.
 - **`ENV_RECOVERY_FORCE_NEW_FILE` is now honored** (`NEW-UTIL-1`): the parameter was registered and plumbed but consumed nowhere — a silent no-op. When set, recovery now starts a fresh log file for the first post-recovery write instead of appending to the last recovered file (JE `RecoveryManager`/`FileManager.forceNewLogFile`), protecting a restored backup’s last file. Fires exactly once, under the log-write latch; the default (unset) append behavior is unchanged.
 - **Aborting a slot reuse under a partial (compares-equal) B-tree comparator lost the original committed record** (`NEW-REUSESLOT-1`, JE #15704) — durable data loss. When a custom comparator treats distinct key bytes as equal, a transaction that deleted-then-reinserted such a key (reusing the existing slot) and then aborted left the slot rolled back to an *empty*/wrong-keyed record, destroying the original committed value (and it stayed lost across recovery). The abort before-image now resolves the slot with the configured comparator (not a raw byte match), and the undo key is captured from the slot re-resolved *by key under the record lock* (JE `LockStanding.prepareForUpdate`), so the abort restores the original key, data, and LSN.
@@ -351,8 +352,9 @@ listed in [References](#references).
   (`split_propagation_recovers`). The cleaner now fetches an LN's value from the log
   during migration when the BIN slot holds only an LSN pointer, so migrating a large
   value no longer risks writing an empty record. Old-format logs remain readable
-  (no log-version bump). Removing or truncating a database does not yet reclaim its
-  freed space under non-forced cleaning (tracked as NEW-CLEANER-DBOBSOLETE).
+  (no log-version bump). Removing or truncating a database did not reclaim its
+  freed space under non-forced cleaning (NEW-CLEANER-DBOBSOLETE) — now fixed in Unreleased
+  (see `### Fixed`).
 - **Known limitation (fixed in Unreleased — see `### Changed`):** an empty B-tree leaf
   (BIN) left behind by committed deletes was not reclaimed by compression
   (NEW-INCOMP-EMPTY-BIN). Records were correctly gone and all lookups/scans remained
