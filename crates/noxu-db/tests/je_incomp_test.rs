@@ -814,11 +814,8 @@ fn empty_db_stays_writable_after_prune_by_id() {
 
     // WRITABILITY (the real gate): a put after emptying the DB must SUCCEED.
     // Before the guard this panics SplitRequired after 64 retries.
-    db.put(
-        DatabaseEntry::from_bytes(&[42]),
-        DatabaseEntry::from_bytes(&[7]),
-    )
-    .unwrap();
+    db.put(DatabaseEntry::from_bytes(&[42]), DatabaseEntry::from_bytes(&[7]))
+        .unwrap();
 
     // ...and round-trips.
     let got = db.get([42]).unwrap();
