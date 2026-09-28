@@ -7554,6 +7554,20 @@ impl Tree {
                         TreeNode::Internal(_) => return false,
                     }
                 }
+                // Last-child guard (JE Tree.searchDeletableSubTree,
+                // Tree.java:790-793): return null / no-op when
+                // `nodeLadder.get(0).parent.getNEntries() <= 1`.  Noxu always
+                // builds IN(root)->BIN, so pruning the tree's ONLY BIN would
+                // leave the parent (the root IN) childless (n_bins=0,
+                // n_ins=1) -- verify() is blind to it but the next put()
+                // panics SplitRequired and the DB is permanently un-writable.
+                // Same corruption as the by-id path; same fix.  Leave the
+                // empty BIN in place, like JE ("Root compression is no longer
+                // supported") and the base engine.
+                if p.entries.len() <= 1 {
+                    return false;
+                }
+
                 // Safe to prune: remove the BIN's slot from the parent IN.
                 // Mirrors the parent-slot removal `Tree.delete` performs for
                 // an empty BIN (Tree.java deleteEntry under the branch latch).
@@ -7687,6 +7701,21 @@ impl Tree {
                         TreeNode::Internal(_) => return false,
                     }
                 }
+                // Last-child guard (JE Tree.searchDeletableSubTree,
+                // Tree.java:790-793): return null / no-op when
+                // `nodeLadder.get(0).parent.getNEntries() <= 1`.  Noxu always
+                // builds IN(root)->BIN, so pruning the tree's ONLY BIN would
+                // leave the parent (the root IN) childless (n_bins=0,
+                // n_ins=1) -- verify() is blind to it but the next put()
+                // panics SplitRequired and the DB is permanently un-writable.
+                // Refuse to prune the parent's last child: leave the empty
+                // BIN in place, exactly like JE ("Root compression is no
+                // longer supported") and the base engine (never prunes the
+                // last BIN).
+                if p.entries.len() <= 1 {
+                    return false;
+                }
+
                 // Safe to prune: remove the BIN's slot from the parent IN.
                 // T-4: remove_entry shifts the node-level child array too.
                 let removed = p.remove_entry(child_index);
@@ -13023,6 +13052,85 @@ mod tests {
                 i
             );
         }
+    }
+
+    /// NEW-INCOMP-EMPTY-BIN last-child guard (BY-KEY path, prune_empty_bin).
+    ///
+    /// Noxu always builds IN(root)->BIN, so a DB emptied down to its sole BIN
+    /// has a parent (the root IN) with exactly ONE child.  Pruning that last
+    /// child via the by-key path (prune_empty_bin, reached from Step 3 case
+    /// (a): a BIN whose known_deleted slots Step 2 drained to empty) would
+    /// leave a CHILDLESS root IN (n_bins=0, n_ins=1) and the next insert
+    /// returns Err(SplitRequired) forever -- the DB is permanently
+    /// un-writable (at the public-API layer this surfaces as the SplitRequired
+    /// panic after 64 retries).
+    ///
+    /// JE Tree.searchDeletableSubTree (Tree.java:790-793): returns null when
+    /// nodeLadder.get(0).parent.getNEntries() <= 1, and Tree.delete is then a
+    /// no-op ("Root compression is no longer supported").
+    ///
+    /// The guard makes prune_empty_bin a NO-OP when the parent has <= 1 entry.
+    /// This test asserts WRITABILITY (a subsequent insert must SUCCEED, i.e.
+    /// NOT return SplitRequired) -- verify()/structure checks are blind to a
+    /// childless root, so the insert-after-empty is the real gate.
+    ///
+    /// FAILS if the guard is removed (insert returns Err(SplitRequired));
+    /// PASSES with the guard.
+    #[test]
+    fn test_prune_empty_bin_last_child_guard_keeps_tree_writable() {
+        let tree = Tree::new(1, 4);
+        // Two keys, both in the sole BIN -> tree shape is IN(root)->BIN.
+        tree.insert(b"k0".to_vec(), vec![0], Lsn::new(1, 0)).unwrap();
+        tree.insert(b"k1".to_vec(), vec![1], Lsn::new(1, 1)).unwrap();
+        // Exactly one BIN (the tree's only child of the root IN).
+        assert_eq!(
+            tree.collect_stats().n_bins,
+            1,
+            "setup: tree must be IN(root)->single BIN"
+        );
+
+        // Empty the sole BIN (committed deletes physically remove the slots).
+        assert!(tree.delete(b"k0"));
+        assert!(tree.delete(b"k1"));
+
+        // Locate the (now empty) sole BIN and an id_key that routes to it.
+        let empty_bin = first_empty_non_root_bin(&tree)
+            .expect("the emptied sole BIN must still be attached to the root");
+        let id_key = b"k0".to_vec(); // routes to the sole BIN
+
+        let bins_before = tree.collect_stats().n_bins;
+
+        // Prune the LAST child by key: the guard must make this a NO-OP.
+        let pruned = tree.prune_empty_bin(&id_key);
+        assert!(
+            !pruned,
+            "last-child guard: prune_empty_bin must no-op on the parent's \
+             only child (JE Tree.java:790-793)"
+        );
+
+        // The empty BIN must still be attached (bin_count unchanged).
+        assert_eq!(
+            tree.collect_stats().n_bins,
+            bins_before,
+            "last-child guard: the sole empty BIN must remain attached"
+        );
+        // ...and it must be the SAME node (not detached / replaced).
+        {
+            let g = empty_bin.read();
+            assert!(
+                matches!(&*g, TreeNode::Bottom(b) if b.entries.is_empty()),
+                "the sole BIN must still be present and empty"
+            );
+        }
+
+        // WRITABILITY GATE: a subsequent insert must SUCCEED.  Without the
+        // guard the root IN is childless and this returns Err(SplitRequired).
+        tree.insert(b"k2".to_vec(), vec![2], Lsn::new(1, 2))
+            .expect("insert after empty must succeed (not SplitRequired)");
+        assert!(
+            tree.search(b"k2").is_some_and(|s| s.exact_parent_found),
+            "the reinserted key must be findable"
+        );
     }
 
     // ========================================================================

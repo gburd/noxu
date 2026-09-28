@@ -762,3 +762,77 @@ fn empty_bin_left_by_committed_deletes_is_never_pruned() {
     db.close().unwrap();
     env.close().unwrap();
 }
+
+// ===========================================================================
+// NEW-INCOMP-EMPTY-BIN last-child guard (BY-ID path, prune_empty_bin_by_id).
+//
+// Emptying a DB of ALL keys then env.compress() drives the tree's LAST BIN
+// through the already-empty (case b) prune path (prune_empty_bin_by_id):
+// committed deletes physically remove the slots leaving no tombstone, so the
+// BIN is empty on entry to Step 3.  Noxu always builds IN(root)->BIN, so
+// pruning the sole BIN would leave a CHILDLESS root IN (n_bins=0, n_ins=1).
+//
+// verify() is BLIND to a childless root (tracked separately as
+// NEW-VERIFY-CHILDLESS-ROOT), so this test asserts WRITABILITY — a put after
+// the empty must SUCCEED (before the guard it panics SplitRequired after 64
+// retries and the DB is permanently un-writable).  It also asserts
+// verify()==0 (which passed even on the corrupt tree — hence the writability
+// check is the real gate).
+//
+// JE analog: Tree.searchDeletableSubTree (Tree.java:790-793) returns null
+// when nodeLadder.get(0).parent.getNEntries() <= 1, and Tree.delete is then
+// a no-op ("Root compression is no longer supported").
+//
+// FAIL on faa1762c (before the guard: SplitRequired panic); PASS after.
+#[test]
+fn empty_db_stays_writable_after_prune_by_id() {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(dir.path(), false);
+    let db = open_db(&env, false);
+
+    // Fill past one BIN so the tree splits: keys 0..8 (NODE_MAX=4 => >=2 BINs).
+    for i in 0u8..8 {
+        db.put(
+            DatabaseEntry::from_bytes(&[i]),
+            DatabaseEntry::from_bytes(&[0]),
+        )
+        .unwrap();
+    }
+    assert!(bin_count(&db) >= 2, "setup: need >=2 BINs");
+
+    // Delete ALL keys (committed deletes physically remove the slots -> no
+    // known_deleted tombstone -> the empty BINs route through the by-id
+    // prune path).
+    for i in 0u8..8 {
+        assert!(db.delete([i]).unwrap(), "delete of {i} must succeed");
+    }
+
+    // Reclaim: this prunes empty BINs, INCLUDING the tree's last BIN.  The
+    // guard must refuse to prune the parent's last child so an empty root BIN
+    // remains and the DB stays writable.
+    env.compress().unwrap();
+
+    // WRITABILITY (the real gate): a put after emptying the DB must SUCCEED.
+    // Before the guard this panics SplitRequired after 64 retries.
+    db.put(
+        DatabaseEntry::from_bytes(&[42]),
+        DatabaseEntry::from_bytes(&[7]),
+    )
+    .unwrap();
+
+    // ...and round-trips.
+    let got = db.get([42]).unwrap();
+    assert_eq!(
+        got.as_deref(),
+        Some(&[7u8][..]),
+        "put after empty must round-trip"
+    );
+
+    // verify() reports 0 (it is blind to the childless root; kept as a
+    // secondary assertion, NOT the primary gate).
+    let vresult = env.verify(&noxu_db::VerifyConfig::new()).unwrap();
+    assert_eq!(vresult.error_count(), 0, "verify: {vresult}");
+
+    db.close().unwrap();
+    env.close().unwrap();
+}
