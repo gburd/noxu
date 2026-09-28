@@ -5,6 +5,29 @@
 //! `com.sleepycat.bind.tuple.test.TupleOrderingTest` onto Noxu's
 //! `TupleInput` / `TupleOutput`.
 //!
+//! ## JE: BindingSpeedTest.runTest — COVERED-CITED (tuple round-trip) + N/A (timing)
+//!
+//! `com.sleepycat.bind.test.BindingSpeedTest.runTest` is a parameterized
+//! micro-benchmark (7 params: java-unshared/shared/externalizable, xml-sax,
+//! tuple, reflectMethod, reflectField).  With `VERBOSE = false` its only
+//! surviving correctness assertion is `assertTrue("data size too big",
+//! size < 250)` on the marshalled byte count; the write/read loop discards
+//! the decoded object (no round-trip *equality* assertion).  Its purpose is
+//! timing marshalling throughput.
+//!
+//! - The *timing benchmark* has no `#[test]` analogue: Noxu measures binding
+//!   throughput with criterion in `crates/noxu-bind/benches/bind_bench.rs`
+//!   (TupleOutput write / TupleInput read / round-trips).  This half is N/A.
+//! - The incidental *tuple correctness* the loop exercises (`Data.writeTuple`
+//!   / `readTuple`: String, String, i32, i32, String) is COVERED-CITED here
+//!   by `tck_tuple_format_test_string` and `tck_tuple_format_test_int`
+//!   (round-trip + size), and the serial-shared path
+//!   (`runSerialShared`/`SerialOutput`/`SerialInput`) by
+//!   `tck_serial_primitive_bindings` in `tck_serial_binding.rs`.
+//! - The five Java-only formats (java.io.Serializable un/shared/externalizable,
+//!   SAX XML, java.lang.reflect method/field access) have no Rust analogue
+//!   and are N/A (platform deviation).
+//!
 //! Notes on adaptation
 //!
 //! - JE `writeString` writes UTF-8 followed by a single 0x00 terminator.
