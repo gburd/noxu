@@ -1150,23 +1150,46 @@ impl Environment {
                 env_impl.truncate_database(name).map_err(map_dbi_err(name))
             }
             Some(txn) => {
-                // Validate + read the count now (JE returns it synchronously),
-                // defer the tree replacement to commit.  Capture `db_id` so
-                // the deferred truncate binds to the validated identity
-                // (F-DDL-1), not the name.
-                let (count, db_id) = {
+                // NEW-TRUNCATE-1 (data-loss fix): do the truncate EAGERLY under
+                // `txn`, not via a deferred commit callback.  The old code
+                // registered a commit callback that swapped in a fresh empty
+                // tree AFTER `Transaction::commit` had already written the
+                // txn's data-log — so any same-txn insert issued *after* the
+                // truncate went into the still-live old tree and was wiped by
+                // the callback on commit (silent data loss; the count was a
+                // correct but stale up-front value).
+                //
+                // JE `DbTree.doTruncateDb` (`DbTree.java:1273`) installs a
+                // fresh empty tree with a NEW `DatabaseId` at truncate time, so
+                // subsequent same-txn inserts land in the post-truncate tree
+                // and survive commit; abort rolls back the truncate and the
+                // inserts.  Noxu keeps the `DatabaseId` stable, so the faithful
+                // same-`DatabaseId` equivalent is to delete every record
+                // transactionally right now: the `DeleteLN`s are logged under
+                // `txn` (ordered BEFORE any later same-txn insert, which
+                // recovery's in-log-order redo requires) and the txn's own undo
+                // pass restores every before-image on abort.
+                //
+                // The up-front count (JE `returnCount`) is read first, WHILE no
+                // handle is open (so the not-in-use check passes), then the DB
+                // is opened under `txn`, drained, and closed.  F-DDL-1: the
+                // count read validates existence; the delete then runs under
+                // the same lock ecosystem so a concurrent recreate cannot slip
+                // between validation and drain.
+                let count = {
                     let env_impl = self.env_impl.lock();
-                    env_impl
+                    let (count, _db_id) = env_impl
                         .count_for_truncate(name)
-                        .map_err(map_dbi_err(name))?
+                        .map_err(map_dbi_err(name))?;
+                    count
                 };
-                let env_impl_arc = Arc::clone(&self.env_impl);
-                let name_owned = name.to_string();
-                txn.register_commit_callback(move || {
-                    let _ = env_impl_arc
-                        .lock()
-                        .truncate_database_if_id(&name_owned, db_id);
-                });
+                let dbcfg = DatabaseConfig::new().with_transactional(true);
+                let db = self.open_database(Some(txn), name, &dbcfg)?;
+                let res = db.delete_all_under_txn(txn);
+                // Always drop the internal handle so the reference count
+                // returns to zero regardless of the delete outcome.
+                let _ = db.close();
+                res?;
                 Ok(count)
             }
         }

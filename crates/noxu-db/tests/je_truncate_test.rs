@@ -332,7 +332,6 @@ fn do_truncate_and_add(
 // dedicated fix worker.  Severity: DATA LOSS, but NARROW (only the same-txn
 // truncate-then-insert path; the common auto-commit truncate path is safe).
 #[test]
-#[ignore = "NEW-TRUNCATE-1: same-txn truncate-then-insert loses inserts on commit (deferred truncate ordered after inserts)"]
 fn env_truncate_commit() {
     do_truncate_and_add(true, 256, false, 150, false, 150);
 }
@@ -359,7 +358,6 @@ fn env_truncate_autocommit() {
 // truncate are wiped by the deferred truncate callback on commit.  Kept
 // #[ignore]d.
 #[test]
-#[ignore = "NEW-TRUNCATE-1: same-txn truncate-then-insert loses inserts on commit (deferred truncate ordered after inserts)"]
 fn env_truncate_no_first_insert() {
     do_truncate_and_add(true, 0, false, 150, false, 150);
 }
@@ -440,4 +438,172 @@ fn do_truncate_autocommit_clears_records() {
 
     let db = open_db(&env, DB_NAME);
     assert_eq!(db.count().unwrap(), 0);
+}
+
+
+// ──────────────────────────────────────────────────────────────────────────────
+// NEW-TRUNCATE-1 fix-level rigor: same-txn truncate -> insert -> COMMIT.
+//
+// Beyond the record-count check in `do_truncate_and_add`, assert the actual
+// contents after commit: the NEW inserts are present (point-get returns the
+// inserted value) and the OLD-only keys (present pre-truncate, not re-inserted)
+// are GONE.  Then reopen (recovery) and re-assert.  Directly exercises the data
+// loss the fix repairs (pre-fix the inserts were wiped by the deferred truncate
+// callback on commit).
+// ──────────────────────────────────────────────────────────────────────────────
+#[test]
+fn env_truncate_commit_keeps_new_inserts_drops_old_and_survives_recovery() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().to_path_buf();
+    let cfg = |create: bool| {
+        EnvironmentConfig::new(path.clone())
+            .with_allow_create(create)
+            .with_transactional(true)
+            .with_node_max_entries(6)
+    };
+    let dbcfg =
+        || DatabaseConfig::new().with_allow_create(true).with_transactional(true);
+
+    {
+        let env = noxu_db::Environment::open(cfg(true)).unwrap();
+        let db = env.open_database(None, DB_NAME, &dbcfg()).unwrap();
+        // Pre-populate keys 0..200 (auto-commit, so the truncate below sees a
+        // committed pre-image).
+        let pre = env.begin_transaction(None).unwrap();
+        for i in 0..200u32 {
+            db.put_in(&pre, ikey(i), ikey(i)).unwrap();
+        }
+        pre.commit().unwrap();
+        db.close().unwrap();
+
+        // Same txn: truncate, then insert keys 0..50 with a DISTINCT value.
+        let txn = env.begin_transaction(None).unwrap();
+        let n = env.truncate_database(Some(&txn), DB_NAME).unwrap();
+        assert_eq!(n, 200, "truncate reports the pre-truncate count");
+        let db = env.open_database(Some(&txn), DB_NAME, &dbcfg()).unwrap();
+        for i in 0..50u32 {
+            // Value = key + 1_000_000 so we can tell a survived insert from a
+            // resurrected pre-truncate record.
+            db.put_in(&txn, ikey(i), ikey(i + 1_000_000)).unwrap();
+        }
+        db.close().unwrap();
+        txn.commit().unwrap();
+
+        // The 50 new inserts must be present with the NEW value; the old-only
+        // keys 50..200 must be gone.
+        let db = env.open_database(None, DB_NAME, &dbcfg()).unwrap();
+        assert_eq!(db.count().unwrap(), 50, "only the new inserts remain");
+        for i in 0..50u32 {
+            let got = db.get(ikey(i)).unwrap();
+            assert_eq!(
+                got.as_deref(),
+                Some(&i.wrapping_add(1_000_000).to_be_bytes()[..]),
+                "post-truncate insert {i} must survive commit with its value"
+            );
+        }
+        for i in 50..200u32 {
+            assert!(
+                db.get(ikey(i)).unwrap().is_none(),
+                "old-only key {i} must be gone after the committed truncate"
+            );
+        }
+        db.close().unwrap();
+    }
+
+    // Reopen (recovery): same assertions must hold.
+    let env = noxu_db::Environment::open(cfg(false)).unwrap();
+    let db = env.open_database(None, DB_NAME, &dbcfg()).unwrap();
+    assert_eq!(db.count().unwrap(), 50, "count survives reopen/recovery");
+    for i in 0..50u32 {
+        assert_eq!(
+            db.get(ikey(i)).unwrap().as_deref(),
+            Some(&i.wrapping_add(1_000_000).to_be_bytes()[..]),
+            "post-truncate insert {i} must survive recovery"
+        );
+    }
+    for i in 50..200u32 {
+        assert!(
+            db.get(ikey(i)).unwrap().is_none(),
+            "old-only key {i} must stay gone after recovery"
+        );
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// NEW-TRUNCATE-1 fix-level rigor: same-txn truncate -> insert -> ABORT.
+//
+// Aborting a transactional truncate must roll BOTH the truncate and the
+// post-truncate inserts back: the ORIGINAL pre-truncate data must be intact
+// (point-get returns the original value), and the post-truncate inserts must
+// NOT be present.  Then reopen (recovery) and re-assert — the abort must be
+// durable (a clean close+reopen must not resurrect the truncate).
+// ──────────────────────────────────────────────────────────────────────────────
+#[test]
+fn env_truncate_abort_restores_original_data_and_survives_recovery() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().to_path_buf();
+    let cfg = |create: bool| {
+        EnvironmentConfig::new(path.clone())
+            .with_allow_create(create)
+            .with_transactional(true)
+            .with_node_max_entries(6)
+    };
+    let dbcfg =
+        || DatabaseConfig::new().with_allow_create(true).with_transactional(true);
+
+    {
+        let env = noxu_db::Environment::open(cfg(true)).unwrap();
+        let db = env.open_database(None, DB_NAME, &dbcfg()).unwrap();
+        // Original data: keys 0..120 with value == key.
+        let pre = env.begin_transaction(None).unwrap();
+        for i in 0..120u32 {
+            db.put_in(&pre, ikey(i), ikey(i)).unwrap();
+        }
+        pre.commit().unwrap();
+        db.close().unwrap();
+
+        // Same txn: truncate, insert keys 0..30 with a distinct value, ABORT.
+        let txn = env.begin_transaction(None).unwrap();
+        let n = env.truncate_database(Some(&txn), DB_NAME).unwrap();
+        assert_eq!(n, 120);
+        let db = env.open_database(Some(&txn), DB_NAME, &dbcfg()).unwrap();
+        for i in 0..30u32 {
+            db.put_in(&txn, ikey(i), ikey(i + 1_000_000)).unwrap();
+        }
+        db.close().unwrap();
+        txn.abort().unwrap();
+
+        // Original data must be intact; the aborted inserts must be absent
+        // (values must be the ORIGINAL key, not the +1_000_000 insert value).
+        let db = env.open_database(None, DB_NAME, &dbcfg()).unwrap();
+        assert_eq!(
+            db.count().unwrap(),
+            120,
+            "aborted truncate leaves all original records"
+        );
+        for i in 0..120u32 {
+            assert_eq!(
+                db.get(ikey(i)).unwrap().as_deref(),
+                Some(&i.to_be_bytes()[..]),
+                "original record {i} must be restored with its ORIGINAL value"
+            );
+        }
+        db.close().unwrap();
+    }
+
+    // Reopen (recovery): the abort must be durable — original data intact.
+    let env = noxu_db::Environment::open(cfg(false)).unwrap();
+    let db = env.open_database(None, DB_NAME, &dbcfg()).unwrap();
+    assert_eq!(
+        db.count().unwrap(),
+        120,
+        "aborted truncate stays rolled back after recovery"
+    );
+    for i in 0..120u32 {
+        assert_eq!(
+            db.get(ikey(i)).unwrap().as_deref(),
+            Some(&i.to_be_bytes()[..]),
+            "original record {i} must survive recovery after the aborted truncate"
+        );
+    }
 }

@@ -1293,6 +1293,52 @@ impl Database {
         Ok(deleted_any)
     }
 
+    /// Deletes every record in the database under `txn`, hook-free.
+    ///
+    /// NEW-TRUNCATE-1: the transactional `Environment::truncate_database`
+    /// implementation.  JE `DbTree.doTruncateDb` (`DbTree.java:1273`) swaps in
+    /// a fresh empty tree with a NEW `DatabaseId` at truncate time, so
+    /// same-transaction inserts land in the post-truncate tree and survive
+    /// commit; abort rolls back both the truncate and the inserts.  Noxu keeps
+    /// the `DatabaseId` stable (no per-truncate tree-id), so the faithful
+    /// same-`DatabaseId` equivalent is to delete every existing record
+    /// *transactionally right now* — the `DeleteLN`s are logged under `txn`
+    /// (and thus ordered BEFORE any subsequent same-txn insert `LN`s, which is
+    /// required for recovery: the redo pass applies LNs in log order, so a
+    /// later insert must not be preceded in the log by a delete of the same
+    /// key), and the txn's own undo pass restores the before-images on abort.
+    ///
+    /// This is hook-free (it bypasses the secondary / FK / trigger fan-out of
+    /// [`Self::delete_bytes`]) to match JE, whose wholesale tree swap runs no
+    /// per-record delete triggers.  Callers that truncate a primary with
+    /// secondaries must truncate the secondaries separately, exactly as under
+    /// JE.
+    pub(crate) fn delete_all_under_txn(
+        &self,
+        txn: &Transaction,
+    ) -> Result<()> {
+        self.check_open()?;
+        self.check_writable()?;
+        let mut cursor = self.make_cursor_for_txn(txn);
+        // Re-position at First after every delete: `get_first` rescans from the
+        // tree start, so the loop naturally follows the shrinking tree and
+        // terminates when the tree is empty (NotFound).  Each `delete` logs a
+        // transactional `DeleteLN` and records an abort before-image via the
+        // cursor's `finalize_write_lock`, so abort restores every record.
+        loop {
+            let status = cursor
+                .get_first()
+                .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
+            if status != noxu_dbi::OperationStatus::Success {
+                break;
+            }
+            cursor
+                .delete()
+                .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
+        }
+        Ok(())
+    }
+
     /// Opens an auto-commit cursor for iterating over database records
     /// (review P0-1: returns `Cursor<'_>`; review P0-2: auto-commit is the
     /// unadorned form, the transactional form is [`Self::open_cursor_in`]).
