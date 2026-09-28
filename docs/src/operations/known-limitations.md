@@ -254,23 +254,39 @@ what won't be done and why.
   column counts / ordering / value-preservation, so they exercise a tool Noxu
   genuinely lacks and are therefore **N/A by design**.
 
-- **NEW-DPL-REP-COMPOSITION — DPL entity persistence on a replicated node:**
-  The Direct Persistence Layer (`noxu-persist`) cannot currently be used on a
-  replicated node. JE routinely opens an `EntityStore` on a
-  `ReplicatedEnvironment` (its `je.rep.persist` tests exercise DPL metadata
-  refresh and class evolution across master and replica); Noxu does not expose
-  an equivalent path. `noxu-persist` does not depend on `noxu-rep`, `noxu-rep`
-  does not reference `EntityStore`, and no API opens a DPL store on a replica.
-  The two subsystems each work independently — DPL class evolution
-  (rename / add-field / delete / convert via `Mutations`, `Renamer`,
-  `Deleter`, `Converter`, and envelope versioning) and master-replica
-  replication (log/VLSN streaming with opaque payloads) are both implemented and
-  tested in isolation — but they are not composed. This is an unimplemented
-  composition gap (the pieces exist but are not wired together), not a
-  deliberate single-node-only DPL design. The nine `je.rep.persist.test`
-  `@Test` methods (`SimpleTest` 2 + `UpgradeTest` 7), which all require a DPL
-  store running on a replicated node, are therefore **N/A** pending this
-  composition. Tracked as NEW-DPL-REP-COMPOSITION.
+- **NEW-DPL-REP-COMPOSITION — DPL entity persistence on a replicated node
+  (partial: master-side composes; replica-side view missing):**
+  The Direct Persistence Layer (`noxu-persist`) is only *partially* composable
+  with replication. **What works today (empirically verified):** on the
+  *master*, a DPL entity write committed under an explicit transaction routes
+  through the ordinary replicated-durability path — a `PrimaryIndex::put`
+  under a `SimpleMajority` transaction is acknowledged through the same
+  replica-ack coordinator as any other write, because DPL entity databases are
+  ordinary `noxu-db` databases and their commits are ordinary replicated
+  commits. So DPL data *does* replicate to a streaming replica, with **no**
+  `noxu-persist`→`noxu-rep` dependency (probes:
+  `crates/noxu-persist/tests/dpl_rep_probe.rs` —
+  `dpl_write_routes_through_replica_ack_coordinator` confirms the coordinator
+  is consulted; a control confirms it is *not* consulted without a coordinator
+  installed; a third documents that an **auto-commit** DPL write bypasses the
+  coordinator, i.e. use an explicit transaction for replicated durability).
+  **What is still missing:** the *replica-side view* — opening a **read-only**
+  `EntityStore` against a streaming replica so an application can query the
+  replicated entities through the DPL API. That requires exposing the
+  replica's `Arc<EnvironmentImpl>` across the crate boundary (a
+  `noxu_rep::with_environment`-style accessor) plus replica-side catalog
+  materialization — a cross-crate API + feature, deliberately deferred rather
+  than rushed. JE gets this for free because its `ReplicatedEnvironment`
+  *extends* `Environment`; Noxu's layering (Environment on top, replication
+  underneath via `set_replica_coordinator`) makes the replica-side
+  `EntityStore` an explicit feature. DPL class evolution (rename / add-field /
+  delete / convert via `Mutations`, `Renamer`, `Deleter`, `Converter`, and
+  envelope versioning) and master-replica replication are each implemented and
+  tested; the master half now demonstrably composes, and only the replica-side
+  `EntityStore` view is unbuilt. The nine `je.rep.persist.test` `@Test`
+  methods (`SimpleTest` 2 + `UpgradeTest` 7), which run a DPL store *on the
+  replica*, remain **N/A** pending the replica-side view. Tracked as
+  NEW-DPL-REP-COMPOSITION (feature).
 
 (Implemented in 7.1 and moved out of this list: **L-3** debug-build
 latch-ordering assertion, **`exception_listener`**, **stats-file dump**
