@@ -3,6 +3,24 @@
 //! Provides a bounded, thread-safe queue for outbound replication messages.
 //! The `OutputQueue` decouples message production (by the feeder or
 //! replication logic) from message consumption (by the network I/O thread).
+//!
+//! JE: FeederWriteQueueTest ([#18882]) exercises the feeder-side write
+//! queue that buffers log entries destined for a replica when they cannot
+//! go straight to disk (they may live in a log buffer, in the write queue,
+//! or on disk). The load-bearing invariant that test depends on is that
+//! the write queue neither drops nor reorders buffered entries — so a
+//! feeder reading a growing log observes every entry exactly once, in
+//! order. `OutputQueue` is Noxu's write queue; the tests below pin that
+//! FIFO / no-drop / backpressure contract.
+//!
+//! Deviation (documented, N/A for direct port): the specific bug
+//! FeederWriteQueueTest reproduces is a JE `FeederReader$SwitchWindow`
+//! file-transition defect (the reader deduced end-of-file from on-disk
+//! size and jumped to a not-yet-created next file when data was only in
+//! the write queue). Noxu's feeder read path (`EnvironmentLogScanner` /
+//! `SyncupLogView`) does not use JE's offset-window FeederReader, so that
+//! exact transition bug has no Noxu analogue; the portable half — the
+//! write queue's ordering/no-drop guarantee — is what is covered here.
 
 use noxu_sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -232,6 +250,56 @@ mod tests {
         let total: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
         assert_eq!(q.len(), total);
         assert!(total <= 400);
+    }
+
+    /// JE: FeederWriteQueueTest.testDataInWriteQueue ([#18882]). The JE
+    /// test drives concurrent inserts/deletes so the feeder must read
+    /// entries that are still only in the write queue (not yet on disk),
+    /// and asserts the replica ends up byte-identical to the master (no
+    /// entry lost or reordered in the transition). The load-bearing
+    /// invariant is the write queue's FIFO / no-drop contract: here we
+    /// queue a burst larger than one drain batch (simulating a log growing
+    /// faster than it flushes) and drain it batch-by-batch, asserting every
+    /// entry is returned exactly once, in enqueue order, none dropped.
+    #[test]
+    fn test_queued_entries_drain_in_order_without_loss() {
+        let q = OutputQueue::new(1000);
+        // Each entry is tagged with its sequence number so reordering or
+        // loss is detectable.
+        let total = 500usize;
+        for i in 0..total {
+            assert!(
+                q.enqueue((i as u32).to_le_bytes().to_vec()),
+                "enqueue must accept entry {i} (queue not full)"
+            );
+        }
+        assert_eq!(q.len(), total);
+
+        // Drain in small batches (as a network I/O thread would), which is
+        // the moment the JE bug struck: entries only in the queue must not
+        // be skipped.
+        let mut drained = Vec::new();
+        loop {
+            let batch = q.dequeue_batch(37);
+            if batch.is_empty() {
+                break;
+            }
+            drained.extend(batch);
+        }
+
+        assert_eq!(
+            drained.len(),
+            total,
+            "every queued entry must be drained exactly once (none lost)"
+        );
+        for (i, entry) in drained.iter().enumerate() {
+            assert_eq!(
+                entry.as_slice(),
+                (i as u32).to_le_bytes(),
+                "entry {i} out of order — the queue must preserve FIFO"
+            );
+        }
+        assert!(q.is_empty(), "queue fully drained");
     }
 
     #[test]

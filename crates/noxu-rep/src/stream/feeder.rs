@@ -1152,4 +1152,198 @@ mod tests {
         // No file exists at this LSN — next_entry returns None.
         assert!(scanner.next_entry(0).is_none());
     }
+
+    // -----------------------------------------------------------------------
+    // FeederReaderTest (JE) — forward VLSN scan over a real log
+    // -----------------------------------------------------------------------
+    //
+    // JE FeederReaderTest exercises com.sleepycat.je.rep.stream.FeederReader:
+    // forward scans from each VLSN (testForwardScans), waiting for an
+    // upcoming VLSN (testWait), reading not-yet-flushed entries
+    // (testNonFlushedFetch), and switching between the log buffer and the file
+    // (testSwitchFetch); plus backward scans and syncable-entry finding
+    // (testBackwardScans / testFindSyncableentries) via FeederSyncupReader /
+    // ReplicaSyncupReader.
+    //
+    // Portable core (covered here + in syncup_reader.rs): the FORWARD scan
+    // returns every replicated log entry, in VLSN order, starting at a given
+    // VLSN, and skips non-replicated entries. The BACKWARD scan + syncable
+    // matchpoint finding is the ReplicaSyncupReader behaviour proven in
+    // stream::syncup_reader::tests (find_matchpoint / prev_sync / is_sync) and
+    // the ReplicaSyncupReaderTest ports there.
+    //
+    // Deviation (documented, N/A for direct port): the JE-internal reader
+    // MECHANICS — VLSN-index repositioning counts (getNReposition/getNScanned),
+    // log-buffer-vs-disk fetch, the offset SwitchWindow, and reading entries
+    // still in the log buffer before they are flushed — are specific to JE's
+    // FeederReader design. Noxu's `EnvironmentLogScanner` is a linear on-disk
+    // file scan with no index repositioning and no log-buffer fetch, so those
+    // counters and the buffer/file-switch cases have no Noxu analogue.
+
+    use noxu_log::{LogEntryHeader, LogEntryType, Provisional};
+
+    /// Append one entry (header + payload) to file 0 at `offset`, returning the
+    /// offset past it. `vlsn = Some(_)` marks it replicated (JE MASTER); `None`
+    /// marks it non-replicated (NO_REPLICATE) so the forward scan skips it.
+    fn feeder_append_entry(
+        fm: &FileManager,
+        offset: u64,
+        entry_type: LogEntryType,
+        vlsn: Option<noxu_util::Vlsn>,
+        payload: &[u8],
+    ) -> u64 {
+        let mut header = LogEntryHeader::new(
+            entry_type,
+            payload.len() as u32,
+            Provisional::No,
+            vlsn.is_some(),
+            vlsn,
+        );
+        let mut buf = Vec::new();
+        header.write_to_log(&mut buf).unwrap();
+        buf.extend_from_slice(payload);
+        let checksum = crc32fast::hash(&buf[4..]);
+        header.add_post_marshalling_info(&mut buf, 0, vlsn, checksum).unwrap();
+        fm.write_buffer_to_file(0, &buf, offset).unwrap();
+        offset + buf.len() as u64
+    }
+
+    /// JE: FeederReaderTest.testForwardScans / testBackwardScans (forward half).
+    /// Write a log of replicated entries (VLSN 1..=5) interleaved with a
+    /// non-replicated entry, then scan forward from each start VLSN and assert
+    /// exactly the replicated entries at/after the start come back, in order,
+    /// with the non-replicated one always skipped.
+    #[test]
+    fn test_feeder_forward_scan_returns_replicated_entries_in_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let header_size = file_header_on_disk_size(LOG_FILE_VERSION) as u64;
+
+        // Write the fixture with a writable FileManager over the env dir.
+        {
+            let fm = FileManager::new(dir.path(), false, 256 * 1024 * 1024, 32)
+                .expect("writable FileManager");
+            let mut off = header_size;
+            // VLSN 1, 2 replicated (Trace payloads).
+            off = feeder_append_entry(
+                &fm,
+                off,
+                LogEntryType::Trace,
+                Some(noxu_util::Vlsn::new(1)),
+                b"e1",
+            );
+            off = feeder_append_entry(
+                &fm,
+                off,
+                LogEntryType::Trace,
+                Some(noxu_util::Vlsn::new(2)),
+                b"e2",
+            );
+            // A non-replicated entry (no VLSN) — must be skipped by the scan.
+            off = feeder_append_entry(
+                &fm,
+                off,
+                LogEntryType::Trace,
+                None,
+                b"local-only",
+            );
+            // VLSN 3, 4, 5 replicated.
+            for v in 3..=5u64 {
+                off = feeder_append_entry(
+                    &fm,
+                    off,
+                    LogEntryType::Trace,
+                    Some(noxu_util::Vlsn::new(v as i64)),
+                    format!("e{v}").as_bytes(),
+                );
+            }
+            let _ = off;
+        }
+
+        let env = EnvironmentImpl::new(dir.path(), false, true)
+            .expect("EnvironmentImpl::new");
+
+        // For each start VLSN, a fresh scanner must return exactly the
+        // replicated entries at/after it, in ascending VLSN order.
+        for start in 1..=5u64 {
+            let mut scanner = EnvironmentLogScanner::new(&env, None)
+                .expect("scanner construction");
+            let mut got = Vec::new();
+            while let Some((vlsn, _ty, payload)) = scanner.next_entry(start) {
+                got.push((vlsn, payload));
+            }
+            let expected: Vec<(u64, Vec<u8>)> = (start..=5)
+                .map(|v| (v, format!("e{v}").into_bytes()))
+                .collect();
+            assert_eq!(
+                got, expected,
+                "forward scan from VLSN {start} must return replicated \
+                 entries {start}..=5 in order, skipping the non-replicated one"
+            );
+        }
+    }
+
+    /// JE: FeederReaderTest.testWait. When the feeder scans past the last
+    /// written VLSN, the reader returns "nothing yet" (JE: times out and
+    /// returns null) rather than erroring or skipping to a nonexistent file —
+    /// the caller waits and retries as the log grows. Noxu's scanner returns
+    /// `None` at end-of-log; a later call after more entries are written must
+    /// then return them.
+    #[test]
+    fn test_feeder_forward_scan_waits_for_log_growth() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let header_size = file_header_on_disk_size(LOG_FILE_VERSION) as u64;
+
+        // Write VLSN 1 with a writable FileManager, then drop it so the
+        // exclusive env lock is free.
+        let off = {
+            let fm = FileManager::new(dir.path(), false, 256 * 1024 * 1024, 32)
+                .expect("writable FileManager");
+            feeder_append_entry(
+                &fm,
+                header_size,
+                LogEntryType::Trace,
+                Some(noxu_util::Vlsn::new(1)),
+                b"e1",
+            )
+        };
+
+        // Build the scanner (it opens its OWN read-only FileManager over the
+        // env home), then drop the env so a later writer can reopen the dir —
+        // the scanner does not depend on the env staying alive.
+        let mut scanner = {
+            let env = EnvironmentImpl::new(dir.path(), false, true)
+                .expect("EnvironmentImpl::new");
+            EnvironmentLogScanner::new(&env, None).expect("scanner")
+        };
+
+        // First entry is available.
+        assert_eq!(
+            scanner.next_entry(1).map(|(v, _, p)| (v, p)),
+            Some((1, b"e1".to_vec()))
+        );
+        // Asking for the next VLSN before it exists returns None (JE: the
+        // scan times out and the feeder waits), NOT an error or a jump to a
+        // nonexistent next file.
+        assert_eq!(scanner.next_entry(2), None, "must wait, not error");
+
+        // The log grows: VLSN 2 is written (fresh writable FileManager).
+        {
+            let fm = FileManager::new(dir.path(), false, 256 * 1024 * 1024, 32)
+                .expect("writable FileManager");
+            feeder_append_entry(
+                &fm,
+                off,
+                LogEntryType::Trace,
+                Some(noxu_util::Vlsn::new(2)),
+                b"e2",
+            );
+        }
+
+        // A subsequent scan now returns the new entry.
+        assert_eq!(
+            scanner.next_entry(2).map(|(v, _, p)| (v, p)),
+            Some((2, b"e2".to_vec())),
+            "the reader must pick up the entry that appeared after the wait"
+        );
+    }
 }
