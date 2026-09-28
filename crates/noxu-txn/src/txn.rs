@@ -677,6 +677,14 @@ impl Txn {
             return Err(e);
         }
 
+        // Real txn-end (commit-success path): this path drains read + write
+        // locks INLINE (Fix 3a splits the write-lock release across the fsync
+        // barrier) and never calls `release_all_locks`, so the preempted flag
+        // must be cleared here too.  (Abort and every commit ERROR path route
+        // through `release_all_locks`, which clears it there.)  JE `Locker`
+        // close -> preemptedCause reset; without this a committed victim on a
+        // steal-heavy replica would leak its flag and a reused id inherit it.
+        self.lock_manager.clear_preempted(self.id);
         self.state = TxnState::Committed;
         Ok(assigned_lsn)
     }
@@ -2077,10 +2085,13 @@ mod tests {
 
     /// BLOCKER 1 probe (clear-at-end, COMMIT): a locker whose lock is stolen
     /// (importunate HA-replay steal marks it preempted) has its preempted flag
-    /// CLEARED by the real txn-end path — `Txn::commit` -> `release_all_locks`,
-    /// NOT `release_all_for_locker`.  Before this fix the flag leaked forever.
+    /// CLEARED by the real txn-end path.  `Txn::commit` ->
+    /// `commit_with_durability` drains its locks INLINE (Fix 3a) rather than
+    /// via `release_all_locks`, so the clear fires at the commit-success
+    /// terminal — NOT via `release_all_for_locker`, which the commit path never
+    /// calls.  Before this fix the flag leaked forever.
     #[test]
-    fn preempted_flag_cleared_after_commit_via_release_all_locks() {
+    fn preempted_flag_cleared_after_commit() {
         let lm = Arc::new(LockManager::new());
         let mut txn = Txn::new(7, lm.clone());
 
