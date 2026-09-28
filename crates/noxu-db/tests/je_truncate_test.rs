@@ -440,7 +440,6 @@ fn do_truncate_autocommit_clears_records() {
     assert_eq!(db.count().unwrap(), 0);
 }
 
-
 // ──────────────────────────────────────────────────────────────────────────────
 // NEW-TRUNCATE-1 fix-level rigor: same-txn truncate -> insert -> COMMIT.
 //
@@ -461,8 +460,9 @@ fn env_truncate_commit_keeps_new_inserts_drops_old_and_survives_recovery() {
             .with_transactional(true)
             .with_node_max_entries(6)
     };
-    let dbcfg =
-        || DatabaseConfig::new().with_allow_create(true).with_transactional(true);
+    let dbcfg = || {
+        DatabaseConfig::new().with_allow_create(true).with_transactional(true)
+    };
 
     {
         let env = noxu_db::Environment::open(cfg(true)).unwrap();
@@ -548,8 +548,9 @@ fn env_truncate_abort_restores_original_data_and_survives_recovery() {
             .with_transactional(true)
             .with_node_max_entries(6)
     };
-    let dbcfg =
-        || DatabaseConfig::new().with_allow_create(true).with_transactional(true);
+    let dbcfg = || {
+        DatabaseConfig::new().with_allow_create(true).with_transactional(true)
+    };
 
     {
         let env = noxu_db::Environment::open(cfg(true)).unwrap();

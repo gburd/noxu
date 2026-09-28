@@ -1313,10 +1313,7 @@ impl Database {
     /// per-record delete triggers.  Callers that truncate a primary with
     /// secondaries must truncate the secondaries separately, exactly as under
     /// JE.
-    pub(crate) fn delete_all_under_txn(
-        &self,
-        txn: &Transaction,
-    ) -> Result<()> {
+    pub(crate) fn delete_all_under_txn(&self, txn: &Transaction) -> Result<()> {
         self.check_open()?;
         self.check_writable()?;
         let mut cursor = self.make_cursor_for_txn(txn);
