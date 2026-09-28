@@ -138,6 +138,15 @@ fn mtls_pair(
 // Part (A): Channel::peer_identity()
 // ═════════════════════════════════════════════════════════════════════════
 
+/// JE: SSLChannelTest.testPeerPatternAuthentication -- JE's ServerTask
+/// reads `channel.isTrusted()` after the handshake to learn whether the
+/// peer's cert was authenticated. Noxu's analogue is the S1 identity
+/// binding: `Channel::peer_identity()` surfaces the TLS-VERIFIED client
+/// cert subject names on the accepted side (the security core of S1).
+/// MECHANISM DEVIATION: JE exposes a boolean isTrusted() + isSecure();
+/// Noxu exposes the verified NAMES (Some == authenticated, None ==
+/// unauthenticated) so authorization decisions bind to a cryptographically
+/// verified identity, not a self-reported one.
 /// (A) The server-accepted side of an mTLS channel reports the *client's*
 /// verified cert subject names.  The client-connected side reports `None`.
 ///
