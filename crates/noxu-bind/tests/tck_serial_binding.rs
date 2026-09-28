@@ -56,12 +56,75 @@
 //!   `test_foreign_key_delete_cascade_pattern` and noxu-db
 //!   `secondary_decisions_test.rs`.  The Java-serial VALUE mechanism is N/A.
 
+//! ## `bind.serial.test` package (`SerialBindingTest`): N/A / COVERED-CITED map
+//!
+//! `SerialBindingTest` has **7** `@Test` methods, all sitting on top of JE's
+//! `SerialBinding` = `java.io.ObjectOutputStream`/`ObjectInputStream` over a
+//! `Serializable` object graph, deduped by a `StoredClassCatalog` keyed on
+//! `ObjectStreamClass` descriptors.  The Java-object-serialization MECHANISM
+//! (`ObjectOutputStream`, `StoredClassCatalog`, `serialVersionUID`,
+//! `FastOutputStream` buffer tuning, classloader override) is a documented
+//! intentional deviation with no Rust analog -- see `tp-je-serializecompat.md`
+//! (`SerializeReadObjectsTest` = all-N/A, `serialVersionUID`/`ObjectInputStream`
+//! deviation) and `tp-collections-serial.md` (`StoredClassCatalog` structurally
+//! absent).  The general binding PURPOSE (bind a value type to bytes, round-trip,
+//! null/absent value, key+value entity binding, tuple-key + value entity binding)
+//! IS portable and is covered on noxu's `SerdeBinding`/`TupleSerdeBinding`:
+//!
+//! - `SerialBindingTest.testPrimitiveBindings` -> **COVERED-CITED**: value
+//!   round-trip for each primitive (String, char, bool, i8/i16/i32/i64, f32/f64)
+//!   in `tck_serial_primitive_bindings`.  JE's wrong-class `IllegalArgumentException`
+//!   sub-check is **N/A**: in Rust the base type is a compile-time generic
+//!   parameter `T`, so feeding a wrong-typed value is a *compile* error, not a
+//!   runtime `IllegalArgumentException` -- there is no runtime type mismatch to test.
+//! - `SerialBindingTest.testNullObjects` -> **COVERED-CITED**: the "null value"
+//!   PURPOSE maps to `Option<T>::None`; encoding None yields a non-empty entry
+//!   that round-trips to None in `tck_serial_null_objects`.  (JE's `SerialBinding`
+//!   with a `null` base class serialising a Java `null` reference is the
+//!   `ObjectOutputStream` mechanism; the value-absence purpose is what ports.)
+//! - `SerialBindingTest.testSerialSerialBinding` -> **COVERED-CITED**: the
+//!   key-binding + value-binding entity pair PURPOSE, in
+//!   `tck_serial_serial_binding_pair_round_trip`.  (`SerialSerialBinding` itself
+//!   -- two `SerialBinding`s -- is the serialization mechanism; the two-binding
+//!   entity round-trip is what ports.)
+//! - `SerialBindingTest.testTupleSerialMarshalledBinding` -> **COVERED-CITED**:
+//!   tuple-encoded key + serde-encoded value entity binding = `TupleSerdeBinding`,
+//!   round-trip in `tck_tuple_serial_marshalled_binding_round_trip`, which also
+//!   asserts the deterministic key-length invariant (JE:
+//!   `MarshalledObject.expectedKeyLength() == primaryKey.length() + 1`; noxu's
+//!   sort-preserving tuple string terminator is two bytes, so `len + 2` -- the
+//!   one-vs-two-byte terminator is the documented tuple-format deviation recorded
+//!   in `tck_tuple_format.rs`).
+//! - `SerialBindingTest.testBufferSize` -> **N/A (Java-serialization mechanism)**
+//!   for the buffer-tuning surface (`FastOutputStream.DEFAULT_INIT_SIZE`,
+//!   `setSerialBufferSize`, `getSerialOutput`) -- noxu's encoder owns its own
+//!   `Vec` growth and exposes no binding-level buffer size.  The portable residue
+//!   (fixed constant-size header overhead + deterministic encoding) is asserted in
+//!   `tck_serial_buffer_overhead_is_constant` / `tck_serial_encoding_is_deterministic`.
+//! - `SerialBindingTest.testBufferOverride` -> **N/A (Java-serialization
+//!   mechanism)**: overriding `getSerialOutput` to supply a cached
+//!   `FastOutputStream` is `ObjectOutputStream`-plumbing with no noxu analog.
+//!   Covered residue: same deterministic-encoding invariant above.
+//! - `SerialBindingTest.testClassloaderOverride` -> **N/A (Java reflection /
+//!   classloading mechanism)**: overriding `SerialBinding.getClassLoader` so
+//!   `ObjectInputStream.resolveClass` uses a custom `ClassLoader` is pure JVM
+//!   class resolution.  Rust monomorphises `T`; there is no classloader.  The
+//!   analogous "fail fast on a payload that cannot be decoded by this binding"
+//!   guarantee is the magic+version header, asserted in
+//!   `tck_serde_version_header_*`.
+//!
+//! Count: JE @Test in `SerialBindingTest` = 7; COVERED-CITED = 4
+//! (`testPrimitiveBindings`, `testNullObjects`, `testSerialSerialBinding`,
+//! `testTupleSerialMarshalledBinding`); N/A = 3 (`testBufferSize`,
+//! `testBufferOverride`, `testClassloaderOverride`).  4 + 3 = 7.
+
 use noxu_bind::{EntityBinding, EntryBinding, SerdeBinding, TupleSerdeBinding};
 use noxu_db::DatabaseEntry;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
-// Primitive bindings round-trip — port of SerialBindingTest.testPrimitiveBindings
+// JE: SerialBindingTest.testPrimitiveBindings — COVERED-CITED (value round-trip).
+// Primitive bindings round-trip.
 // ---------------------------------------------------------------------------
 
 fn primitive_round_trip<T>(val: T)
@@ -99,7 +162,8 @@ fn tck_serial_primitive_bindings() {
 }
 
 // ---------------------------------------------------------------------------
-// "Null object" handling — port of SerialBindingTest.testNullObjects
+// JE: SerialBindingTest.testNullObjects — COVERED-CITED (Option::None value absence).
+// "Null object" handling.
 // ---------------------------------------------------------------------------
 //
 // In Java, `SerialBinding(null-class)` permits `objectToEntry(null, buffer)`
@@ -121,7 +185,8 @@ fn tck_serial_null_objects() {
 }
 
 // ---------------------------------------------------------------------------
-// SerialSerialBinding analogue — port of testSerialSerialBinding
+// JE: SerialBindingTest.testSerialSerialBinding — COVERED-CITED (key+value entity pair).
+// SerialSerialBinding analogue.
 // ---------------------------------------------------------------------------
 //
 // JE's SerialSerialBinding pairs a key SerialBinding with a value
@@ -149,7 +214,8 @@ fn tck_serial_serial_binding_pair_round_trip() {
 }
 
 // ---------------------------------------------------------------------------
-// TupleSerial(Marshalled)Binding — port of testTupleSerialMarshalledBinding
+// JE: SerialBindingTest.testTupleSerialMarshalledBinding — COVERED-CITED (tuple key + serde value).
+// TupleSerial(Marshalled)Binding.
 // ---------------------------------------------------------------------------
 //
 // JE's TupleSerialMarshalledBinding extracts a tuple-encoded key from
@@ -172,20 +238,39 @@ fn tck_tuple_serial_marshalled_binding_round_trip() {
         |_k, v| v,
     );
 
-    let original = Person { name: "Alice".to_string(), age: 30 };
+    // JE `MarshalledObject.expectedKeyLength()` returns `primaryKey.length() + 1`
+    // (JE `TupleOutput.writeString` appends a single 0x00 terminator).  Noxu's
+    // sort-preserving tuple string terminator is two bytes (`[0x00, 0x00]`, for
+    // null-escaping / correct byte-order comparison — the documented tuple-format
+    // deviation recorded in `tck_tuple_format.rs`), so the faithful analogue of
+    // JE's `assertEquals(val.expectedKeyLength(), keyBuffer.getSize())` is
+    // `key.len() + 2` for a primary key with no embedded 0x00 bytes.
+    let name = "Alice".to_string();
+    let original = Person { name: name.clone(), age: 30 };
     let mut key_buf = DatabaseEntry::new();
     let mut data_buf = DatabaseEntry::new();
     binding.object_to_key(&original, &mut key_buf).unwrap();
     binding.object_to_data(&original, &mut data_buf).unwrap();
     assert!(!key_buf.data().is_empty());
     assert!(!data_buf.data().is_empty());
+    // Deterministic key length: UTF-8 payload + 2-byte terminator (noxu deviation
+    // from JE's 1-byte terminator).  De-vacuums the round-trip: a regression in
+    // the tuple key encoding (dropped/extra terminator) would fail here.
+    assert_eq!(
+        key_buf.data().len(),
+        name.len() + 2,
+        "tuple string key = UTF-8 payload + 2-byte terminator"
+    );
 
     let decoded = binding.entry_to_object(&key_buf, &data_buf).unwrap();
     assert_eq!(original, decoded);
 }
 
 // ---------------------------------------------------------------------------
-// Buffer size / overhead — port of testBufferSize / testBufferOverride
+// JE: SerialBindingTest.testBufferSize / testBufferOverride — buffer-tuning MECHANISM is
+// N/A (FastOutputStream / setSerialBufferSize; noxu encoder owns its Vec growth);
+// the portable residue (constant-size header overhead + deterministic encoding).
+// Buffer size / overhead.
 // ---------------------------------------------------------------------------
 //
 // JE asserts that the *initial* buffer size used by SerialBinding is a
@@ -234,7 +319,9 @@ fn tck_serial_encoding_is_deterministic() {
 }
 
 // ---------------------------------------------------------------------------
-// Version-header guard — equivalent of "testClassloaderOverride" guarantees
+// JE: SerialBindingTest.testClassloaderOverride — classloader/reflection MECHANISM is
+// N/A (no JVM ClassLoader in Rust; T is monomorphised); the analogous
+// "fail fast on an undecodable payload" guarantee is the magic+version header.
 // ---------------------------------------------------------------------------
 //
 // JE's classloader override prevents accidentally deserialising a
