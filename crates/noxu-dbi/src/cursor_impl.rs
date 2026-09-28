@@ -1349,7 +1349,15 @@ impl CursorImpl {
                             return Ok(OperationStatus::NotFound);
                         }
                     }
-                    self.current_key = Some(key.to_vec());
+                    // NEW-REUSESLOT-1 [JE #15704]: position on the STORED
+                    // slot key, not the search argument.  They differ under a
+                    // partial/compares-equal comparator; recording the search
+                    // key here corrupted the abort_key of a subsequent
+                    // delete/put(Current) and made `get` return the wrong key.
+                    self.current_key = Some(
+                        Self::stored_full_key(&bin_arc, slot_index)
+                            .unwrap_or_else(|| key.to_vec()),
+                    );
                     self.current_data = final_data;
                     self.current_lsn = slot_lsn;
                     // Use the actual BIN slot index from search_with_data so
@@ -1411,7 +1419,13 @@ impl CursorImpl {
                         }
                         none => none,
                     };
-                    self.current_key = Some(key.to_vec());
+                    // NEW-REUSESLOT-1 [JE #15704]: position on the STORED
+                    // slot key (see the Set branch); differs under a partial
+                    // comparator.
+                    self.current_key = Some(
+                        Self::stored_full_key(&bin_arc, slot_index)
+                            .unwrap_or_else(|| key.to_vec()),
+                    );
                     self.current_data = final_data;
                     self.current_lsn = slot_lsn;
                     // Use the actual BIN slot index (same rationale as Set branch).
@@ -1839,6 +1853,33 @@ impl CursorImpl {
         }
     }
 
+    /// Reads the FULL stored key of `slot_index` from the pinned BIN.
+    ///
+    /// NEW-REUSESLOT-1 [JE #15704]: under a PARTIAL / compares-equal btree
+    /// comparator the search argument and the stored slot key differ (e.g.
+    /// search `{0,1}` matches stored `{0,0}`).  The cursor must record the
+    /// STORED key as its position, not the search argument, so that a later
+    /// `delete`/`put(Current)` captures the correct abort_key and a `get`
+    /// returns the true stored key.  Mirrors JE `CursorImpl`, whose position
+    /// reflects the found record's key (`BIN.getKey(index)`), never the
+    /// search argument.  Returns `None` if the slot is gone (fall back to the
+    /// search key, byte-equal in the no-comparator case).
+    fn stored_full_key(
+        bin_arc: &std::sync::Arc<
+            noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>,
+        >,
+        slot_index: usize,
+    ) -> Option<Vec<u8>> {
+        use noxu_tree::tree::TreeNode;
+        let guard = bin_arc.read();
+        match &*guard {
+            TreeNode::Bottom(bin) if slot_index < bin.entries.len() => {
+                bin.get_full_key(slot_index)
+            }
+            _ => None,
+        }
+    }
+
     fn lock_ln(&self, lsn: u64) -> Result<bool, DbiError> {
         if lsn == noxu_util::NULL_LSN.as_u64() {
             return Ok(false);
@@ -2110,7 +2151,19 @@ impl CursorImpl {
                 {
                     return None;
                 }
-                let (idx, found) = bin.find_entry_compressed(key);
+                // NEW-REUSESLOT-1 [JE #15704]: use the configured btree
+                // comparator (not a raw byte match) for the slot lookup, so a
+                // before-image capture on a PARTIAL / compares-equal comparator
+                // finds the compares-equal slot.  With a byte-only match the
+                // delete side of a slot-reuse recorded an EMPTY before-image
+                // (abort_data=None, known_deleted=true), so abort restored zero
+                // bytes and the original committed record was lost.  Mirrors
+                // the read fast-path `search_with_data`, which already selects
+                // `find_entry_cmp` when a comparator is present.
+                let (idx, found) = match tree.get_comparator() {
+                    Some(cmp) => bin.find_entry_cmp(key, cmp.as_ref()),
+                    None => bin.find_entry_compressed(key),
+                };
                 if found {
                     Some((
                         bin.entries[idx]
