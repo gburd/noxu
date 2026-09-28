@@ -23,8 +23,11 @@
 //!   * an arbiter's **ack must count toward the RF=2 write quorum** and an
 //!     `ALL`-durability commit must FAIL when only the arbiter (not a data
 //!     replica) is available (`testReplicaDown`, `testGroupAckAndReJoin`).
-//!     Noxu currently does NOT count arbiter acks — these ports are ENGINE
-//!     BUG CANDIDATES, kept `#[ignore]`d with a control below.
+//!     This was BUG-ARB-01 (Noxu excluded arbiter acks from the RF=2 write
+//!     quorum, so a replica-down commit required 0 witnesses). Fixed on
+//!     `fix/bug-arb-01`; these ports are now un-ignored and passing. The
+//!     runtime ack-satisfaction half is proven end-to-end in
+//!     `replica_ack_policy_test.rs::bug_arb_01_*`.
 //!
 //! Non-portable ArbiterTest methods (live Arbiter process, Java platform,
 //! active-primary state machine) are recorded as N/A in the package report
@@ -55,22 +58,16 @@ fn arbiter(name: &str, id: u32) -> RepNode {
     )
 }
 
-/// The Noxu durability quorum's OWN electable-count derivation, extracted so a
-/// port can exercise the exact rule the engine applies in
-/// `ReplicatedEnvironment::await_replica_acks` (count `NodeType::Electable`
-/// peers, arbiters excluded, then `+ 1` for the master). This is the engine's
-/// real accounting — not a re-derivation invented by the test — so a test
-/// that drives it is non-vacuous w.r.t. the arbiter-ack behavior.
-fn engine_durability_electable_count(group: &RepGroup) -> u32 {
-    let electable_peers = group
-        .get_nodes()
-        .iter()
-        .filter(|n| n.node_type() == NodeType::Electable)
-        .count() as u32;
-    // The master is implicit (not registered as a peer); +1 mirrors the engine.
-    // Here the group already includes the master node explicitly, so we count
-    // it directly instead — the point is only that ARBITERS ARE EXCLUDED.
-    electable_peers
+/// The engine's OWN durability ack-group-size rule (JE
+/// `RepGroupImpl.getAckGroupSize` + `DurabilityQuorum` arbiter accounting),
+/// exposed as `RepGroup::ack_group_size`. This is the exact accounting
+/// `ReplicatedEnvironment::await_replica_acks` applies (the master derives the
+/// ack group from this method, differing only by the implicit-master `+1`
+/// that these explicit-master groups already include). Driving it makes the
+/// port non-vacuous w.r.t. the arbiter-ack behavior: neuter the arbiter
+/// accounting in `ack_group_size` and these tests fail again.
+fn engine_ack_group_size(group: &RepGroup) -> u32 {
+    group.ack_group_size()
 }
 
 // ---------------------------------------------------------------------------
@@ -194,14 +191,14 @@ fn arbiter_provides_election_quorum_two_node_group() {
 
 // ---------------------------------------------------------------------------
 // Arbiter ack contributes to the RF=2 write quorum (testReplicaDown /
-// testGroupAckAndReJoin).  ENGINE BUG CANDIDATE — see report.
+// testGroupAckAndReJoin).  Was BUG-ARB-01 — fixed on `fix/bug-arb-01`.
 //
 // These two ports drive the ENGINE'S OWN durability accounting via
-// `engine_durability_electable_count` (which mirrors
-// `ReplicatedEnvironment::await_replica_acks` exactly: `NodeType::Electable`
-// only) feeding the real `ReplicaAckPolicy::required_acks`. They assert the
-// JE-CORRECT contract, so they FAIL against the current engine (which excludes
-// arbiters) and are #[ignore]d as bug candidates — not weakened to pass.
+// `engine_ack_group_size` (`RepGroup::ack_group_size`, the exact rule
+// `ReplicatedEnvironment::await_replica_acks` applies) feeding the real
+// `RepGroup::required_acks` / `ReplicaAckPolicy::required_acks`. They assert
+// the JE-CORRECT contract and now PASS; neutering the arbiter accounting in
+// `ack_group_size` makes them fail again (non-vacuity).
 // ---------------------------------------------------------------------------
 
 /// JE: `ArbiterTest.testReplicaDown` (SIMPLE_MAJORITY half) +
@@ -215,34 +212,41 @@ fn arbiter_provides_election_quorum_two_node_group() {
 /// the active arbiter feeder), and `ArbiterAcker` *persistently tracks the
 /// high VLSN it acknowledges* — so the commit is durable against one witness.
 ///
-/// Noxu does NOT count arbiter acks toward the write quorum:
-/// `await_replica_acks` derives `electable_count` from `NodeType::Electable`
-/// peers only (arbiters excluded), and `count_ack_feeders_ge` counts only
-/// `NodeType::Electable` feeders; `become_master` creates NO feeder for an
-/// arbiter. So in the replica-down RF=2 case the master's electable set
-/// collapses to {master} → `required_acks(SIMPLE_MAJORITY, 1) == 0` → the
-/// commit is "durable" with NO remote witness, where JE waits for and records
-/// the arbiter's durable ack. This is a durability-safety divergence.
+/// BUG-ARB-01 (now fixed): Noxu had excluded arbiter acks from the write
+/// quorum — `await_replica_acks` derived the ack group from data-only
+/// electable peers and `count_ack_feeders_ge` counted only data feeders, so a
+/// replica-down RF=2 group collapsed to {master} and
+/// `required_acks(SIMPLE_MAJORITY) == 0` (durable with NO witness). The fix
+/// counts the arbiter as the RF=2 data slot for the ack-group SIZE (JE
+/// `getAckGroupSize` keeps the down replica registered → 2) and counts the
+/// arbiter feeder's ack as the SIMPLE_MAJORITY witness (JE `useArbiter`).
 ///
-/// This test exercises the engine's OWN electable-count rule against a
-/// {master, arbiter} group and asserts the JE-correct required-ack count of 1.
-/// It FAILS today (engine yields 0) and is #[ignore]d as a BUG CANDIDATE.
+/// This test exercises the engine's OWN ack-group-size rule
+/// (`RepGroup::ack_group_size`) against a {master, arbiter} group and asserts
+/// the JE-correct required-ack count of 1.
 #[test]
-#[ignore = "ENGINE BUG CANDIDATE: Noxu excludes arbiter acks from the RF=2 \
-            write quorum; a replica-down SIMPLE_MAJORITY commit requires 0 \
-            witnesses instead of the arbiter's durable ack. JE: \
-            ArbiterTest.testReplicaDown / DurabilityQuorum \
-            (includeArbiters = !ALL). See tp-je-rep-arb.md."]
 fn arbiter_ack_counts_toward_rf2_simple_majority_quorum() {
     // RF=2 group, data replica DOWN: only {master, arbiter} remain.
     let mut group = RepGroup::new("rf2".into(), 1);
     group.add_node(electable("master", 1));
     group.add_node(arbiter("arb", 2));
 
-    // The engine's OWN durability accounting: only NodeType::Electable count.
-    let engine_count = engine_durability_electable_count(&group);
+    // The engine's OWN durability accounting (JE getAckGroupSize + arbiter):
+    // the arbiter stands in for the missing RF=2 data replica, so the ack
+    // group size is 2.
+    let engine_count = engine_ack_group_size(&group);
+    assert_eq!(
+        engine_count, 2,
+        "RF=2 with the replica down: the arbiter fills the second ack-group \
+         slot (JE keeps the down replica registered => getAckGroupSize == 2)"
+    );
     let engine_needed =
         ReplicaAckPolicy::SimpleMajority.required_acks(engine_count);
+    // And via the same rule the engine applies (RepGroup::required_acks):
+    assert_eq!(
+        group.required_acks(ReplicaAckPolicy::SimpleMajority),
+        engine_needed
+    );
 
     // JE-correct contract: the arbiter is a SIMPLE_MAJORITY acker, so the
     // effective RF=2 ack group is {master, arbiter} == 2 and the master needs
@@ -250,8 +254,7 @@ fn arbiter_ack_counts_toward_rf2_simple_majority_quorum() {
     assert_eq!(
         engine_needed, 1,
         "RF=2 SIMPLE_MAJORITY with the replica down must still require the \
-         arbiter's ack (JE minAckNodes(2)-1 == 1). Engine yielded {engine_needed} \
-         because it excludes the arbiter from the electable/ack set — the BUG."
+         arbiter's ack (JE minAckNodes(2)-1 == 1). Engine yielded {engine_needed}."
     );
 }
 
@@ -264,42 +267,49 @@ fn arbiter_ack_counts_toward_rf2_simple_majority_quorum() {
 ///
 /// This is the CONTROL for the SIMPLE_MAJORITY case above: it proves the JE
 /// behavior is not "arbiter always satisfies durability" but "arbiter counts
-/// for SIMPLE_MAJORITY, never for ALL". It is ALSO a bug in Noxu but in the
-/// opposite direction: because Noxu drops the arbiter from `electable_count`,
-/// the count collapses to {master} == 1 and `required_acks(All, 1) == 0`, so
-/// an ALL commit succeeds with NO witness — directly contradicting the JE
-/// assertion. `#[ignore]`d as a BUG CANDIDATE.
+/// for SIMPLE_MAJORITY, never for ALL". Before BUG-ARB-01 was fixed Noxu
+/// dropped the arbiter from the ack group, collapsing the count to
+/// {master} == 1 and `required_acks(All, 1) == 0`, so an ALL commit succeeded
+/// with NO witness — contradicting the JE assertion. The required COUNT is
+/// now 1 (ack-group-size 2), and the ALL guarantee is enforced on the
+/// satisfaction side: NO arbiter ack qualifies for ALL, so with the data
+/// replica down an ALL commit cannot be satisfied and fails (proven
+/// end-to-end by `replica_ack_policy_test.rs::
+/// bug_arb_01_all_durability_is_not_satisfied_by_arbiter`).
 #[test]
-#[ignore = "ENGINE BUG CANDIDATE: an ALL-durability commit in an RF=2 group \
-            with the data replica down must FAIL (JE ArbiterTest.testReplicaDown \
-            'ALL should have failed'), but Noxu requires 0 acks because it \
-            drops the arbiter from electable_count. See tp-je-rep-arb.md."]
 fn arbiter_all_durability_requires_the_data_replica_rf2() {
-    // The ALL ack group is the electable DATA replica set (arbiter NEVER
-    // counts for ALL): {master, replica} == 2, so ALL needs 1 remote ack —
-    // the replica's. With the replica down that ack is unavailable and the
-    // commit must fail.
+    // The ALL ack group is the RF=2 electable data set: {master, replica} == 2,
+    // so ALL needs 1 remote ack — the replica's. With the replica down that
+    // ack is unavailable and the commit must fail. The arbiter cannot supply
+    // it: the arbiter ack qualifies only under SIMPLE_MAJORITY (JE
+    // `useArbiter`), never under ALL.
     let all_needed = ReplicaAckPolicy::All.required_acks(2);
     assert_eq!(
         all_needed, 1,
         "ALL over {{master, replica}} needs the replica's ack; arbiter cannot \
-         substitute (JE includeArbiters = !ALL)"
+         substitute (JE useArbiter is SIMPLE_MAJORITY only)"
     );
 
     // The engine, given the replica-down {master, arbiter} group, must STILL
-    // require the data replica for ALL (i.e. the ALL ack group is the data
-    // replica set, not the collapsed electable set). Noxu instead computes
-    // its electable count from live electable nodes {master} == 1 and yields
-    // required_acks(All, 1) == 0 — so the ALL commit wrongly succeeds.
+    // require one ack for ALL (ack-group-size 2 => minAckNodes(2) - 1 == 1).
+    // The required COUNT is identical to SIMPLE_MAJORITY (JE
+    // getCurrentRequiredAckCount is policy-independent); what differs is that
+    // NO arbiter ack qualifies under ALL, so the down data replica's absent
+    // ack cannot be substituted and the commit fails ("ALL should have
+    // failed"). Before the fix Noxu collapsed the group to {master} == 1 and
+    // yielded required_acks(All, 1) == 0, silently committing with no witness.
     let mut group = RepGroup::new("rf2".into(), 1);
     group.add_node(electable("master", 1));
     group.add_node(arbiter("arb", 2));
-    let engine_count = engine_durability_electable_count(&group);
+    let engine_count = engine_ack_group_size(&group);
     let engine_all_needed = ReplicaAckPolicy::All.required_acks(engine_count);
     assert_eq!(
         engine_all_needed, all_needed,
         "engine ALL required-acks with the replica down must still be {all_needed} \
-         (the data replica), but Noxu yielded {engine_all_needed} — dropping \
-         the ALL guarantee. The BUG: ALL silently commits with no witness."
+         (a data-replica ack), but Noxu yielded {engine_all_needed}. The ALL \
+         guarantee: the arbiter never satisfies ALL (JE useArbiter is \
+         SIMPLE_MAJORITY only), so with the data replica down ALL fails."
     );
+    // Same rule via the engine's RepGroup::required_acks accessor.
+    assert_eq!(group.required_acks(ReplicaAckPolicy::All), all_needed);
 }

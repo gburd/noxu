@@ -50,6 +50,16 @@ impl NodeType {
         matches!(self, NodeType::Electable | NodeType::Secondary)
     }
 
+    /// Returns `true` if this is the [`Arbiter`](NodeType::Arbiter) type
+    /// (JE `NodeType.isArbiter()`). An arbiter is electable (participates in
+    /// elections) but holds no data, so it is excluded from the durability
+    /// ack *group size* (JE `RepGroupImpl.ACK_PREDICATE = isElectable() &&
+    /// !isArbiter()`) while its ack still counts as a SIMPLE_MAJORITY witness
+    /// at RF=2 (JE `useArbiter`).
+    pub fn is_arbiter(&self) -> bool {
+        matches!(self, NodeType::Arbiter)
+    }
+
     /// Returns `true` if this node type can become master.
     ///
     /// Only electable nodes can become master.

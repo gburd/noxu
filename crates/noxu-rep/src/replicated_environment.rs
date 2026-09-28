@@ -1839,10 +1839,14 @@ impl ReplicatedEnvironment {
         // F9: if we are the current master, immediately register a
         // `Feeder` tracker for the new peer so AckTracker bookkeeping
         // and downstream pull-based streaming work without a forced
-        // re-election.
+        // re-election. BUG-ARB-01: an ARBITER gets a Feeder tracker too so
+        // its ack can advance a feeder high-water and be counted as the RF=2
+        // SIMPLE_MAJORITY witness (JE `FeederManager` tracks the arbiter
+        // feeder); only MONITOR is excluded.
         if self.is_master()
             && (node.node_type == crate::node_type::NodeType::Electable
-                || node.node_type == crate::node_type::NodeType::Secondary)
+                || node.node_type == crate::node_type::NodeType::Secondary
+                || node.node_type == crate::node_type::NodeType::Arbiter)
         {
             let mut feeders = self.feeders.write();
             if !feeders.iter().any(|f| f.get_replica_name() == node.name) {
@@ -2794,10 +2798,17 @@ impl ReplicatedEnvironment {
                 }
                 if peer.node_type != crate::node_type::NodeType::Electable
                     && peer.node_type != crate::node_type::NodeType::Secondary
+                    && peer.node_type != crate::node_type::NodeType::Arbiter
                 {
-                    // Arbiters do not receive log entries.
+                    // Monitors never receive a feeder.
                     continue;
                 }
+                // BUG-ARB-01: an ARBITER gets a Feeder tracker too, so its
+                // ack advances a feeder high-water that `count_ack_feeders_ge`
+                // can count as the RF=2 SIMPLE_MAJORITY witness (JE
+                // `FeederManager` tracks the arbiter feeder; the arbiter
+                // acks commit VLSNs it does not store as data). It receives
+                // no *log entries* (it holds no data), only the ack channel.
                 feeders.push(Feeder::new(peer.name.clone()));
                 log::debug!(
                     "Node '{}' (master, term={}): registered Feeder for \
@@ -4159,6 +4170,38 @@ impl ReplicatedEnvironment {
         self.update_dtvlsn(vlsn);
     }
 
+    /// BUG-ARB-01: is this master in an RF=2 arbiter config where the
+    /// arbiter's ack substitutes for the missing data replica under
+    /// SIMPLE_MAJORITY (JE `RepImpl.useArbiter`: `getAckGroupSize() == 2 &&
+    /// activeAckArbiterCount() > 0`)?
+    ///
+    /// Computed over the runtime group view, which excludes the *implicit*
+    /// master, so the master (a data node) is added back with `+ 1` — exactly
+    /// as `await_replica_acks` derives the ack group size. The arbiter fills
+    /// the RF=2 second data slot only up to the RF=2 boundary
+    /// (`data_total < 2`), so the ack group size is 2 and the arbiter qualifies
+    /// as the SIMPLE_MAJORITY witness.
+    fn arbiter_substitutes_at_rf2(&self) -> bool {
+        let group = self.get_rep_group();
+        let data_peers = group
+            .get_nodes()
+            .iter()
+            .filter(|n| n.node_type == crate::node_type::NodeType::Electable)
+            .count() as u32;
+        let arbiter_peers = group
+            .get_nodes()
+            .iter()
+            .filter(|n| n.node_type == crate::node_type::NodeType::Arbiter)
+            .count() as u32;
+        let data_total = data_peers + 1; // +1: the implicit master (data node)
+        let ack_group_size = if arbiter_peers > 0 && data_total < 2 {
+            data_total + 1
+        } else {
+            data_total
+        };
+        arbiter_peers > 0 && ack_group_size == 2
+    }
+
     /// Master-side DTVLSN computation (D7, JE FeederManager.updateDTVLSN):
     /// across the *qualifying* (electable) feeders whose replica-txn-end VLSN
     /// exceeds the current DTVLSN, take the minimum; once a SIMPLE_MAJORITY
@@ -4170,19 +4213,39 @@ impl ReplicatedEnvironment {
         }
         let curr = self.get_dtvlsn();
 
-        // SIMPLE_MAJORITY required-ack-count over the electable group,
-        // computed the same way as await_replica_acks.
+        // SIMPLE_MAJORITY required-ack-count over the ack group, computed
+        // the JE-exact way (JE `FeederManager.updateDTVLSN` always uses
+        // `getCurrentRequiredAckCount(SIMPLE_MAJORITY)`). BUG-ARB-01: the ack
+        // group size counts the RF=2 arbiter as the missing data slot
+        // (matching `await_replica_acks`), and the arbiter's ack qualifies as
+        // a SIMPLE_MAJORITY durable witness (JE `useArbiter`). DTVLSN is a
+        // SIMPLE_MAJORITY concept, so the arbiter is a valid witness here.
         let group = self.get_rep_group();
-        let electable_peers: u32 = group
+        let data_peers: u32 = group
             .get_nodes()
             .iter()
             .filter(|n| n.node_type == crate::node_type::NodeType::Electable)
             .count() as u32;
-        let electable_count = electable_peers + 1; // +1 for self/master
-        // required electable acks for SIMPLE_MAJORITY = floor(n/2) replicas
-        // (the master self-acks; a majority is reached when this many peers
-        // also hold the VLSN).
-        let durable_ack_count = electable_count / 2;
+        let arbiter_peers: u32 = group
+            .get_nodes()
+            .iter()
+            .filter(|n| n.node_type == crate::node_type::NodeType::Arbiter)
+            .count() as u32;
+        let data_total = data_peers + 1; // +1 for self/master (a data node)
+        let ack_group_size = if arbiter_peers > 0 && data_total < 2 {
+            data_total + 1
+        } else {
+            data_total
+        };
+        // required SIMPLE_MAJORITY acks = floor(n/2) replicas (the master
+        // self-acks; a majority is reached when this many peers also hold the
+        // VLSN). Equivalent to `minAckNodes(n) - 1`.
+        let durable_ack_count = ack_group_size / 2;
+        // Under an RF=2 arbiter config the arbiter's ack is a valid
+        // SIMPLE_MAJORITY witness for DTVLSN advance (JE `useArbiter`).
+        // `arbiter_substitutes_at_rf2` accounts for the implicit master the
+        // runtime group view omits.
+        let arbiter_qualifies = self.arbiter_substitutes_at_rf2();
         if durable_ack_count == 0 {
             // Single-node (or majority is self alone): the master's own log is
             // immediately durable up to its latest VLSN.
@@ -4193,11 +4256,17 @@ impl ReplicatedEnvironment {
         let mut min = u64::MAX;
         let mut ack_count: u32 = 0;
         for feeder in self.feeders.read().iter() {
-            // replicaAcksQualify: only electable feeders count (D6).
-            let qualifies = group
+            // replicaAcksQualify (D6): data (electable non-arbiter) feeders
+            // always qualify; an arbiter feeder qualifies only in the RF=2
+            // arbiter config (JE `useArbiter`, SIMPLE_MAJORITY only).
+            let qualifies = match group
                 .get_node(&feeder.get_replica_name())
-                .map(|n| n.node_type == crate::node_type::NodeType::Electable)
-                .unwrap_or(false);
+                .map(|n| n.node_type)
+            {
+                Some(crate::node_type::NodeType::Electable) => true,
+                Some(crate::node_type::NodeType::Arbiter) => arbiter_qualifies,
+                _ => false,
+            };
             if !qualifies {
                 continue;
             }
@@ -4218,20 +4287,49 @@ impl ReplicatedEnvironment {
         // DTVLSN unchanged.
     }
 
-    /// REP-9: count qualifying (electable) feeders whose acked high-water VLSN
-    /// is `>= commit_vlsn`.  This is the Rust equivalent of JE
+    /// REP-9: count qualifying feeders whose acked high-water VLSN is
+    /// `>= commit_vlsn`.  This is the Rust equivalent of JE
     /// `FeederManager.getNumCurrentAckFeeders(commitVLSN)` — the durability
     /// quorum is satisfied when this count reaches the required ack count.
-    /// Only Electable replicas qualify (D6, JE
-    /// `DurabilityQuorum.replicaAcksQualify`).
-    fn count_ack_feeders_ge(&self, commit_vlsn: u64) -> u32 {
+    ///
+    /// BUG-ARB-01 (JE `DurabilityQuorum.replicaAcksQualify` returns
+    /// `isElectable()`, and `RepImpl.useArbiter`): a feeder's ack qualifies as
+    /// a durable witness when its replica is ELECTABLE. In JE an ARBITER
+    /// `isElectable()`, so its ack counts, but `useArbiter` only lets it
+    /// substitute for a missing data replica under SIMPLE_MAJORITY at RF=2,
+    /// never under ALL (ALL always requires the actual data replica).
+    /// Concretely:
+    ///
+    /// - data-replica (ELECTABLE, non-arbiter) feeder acks always qualify;
+    /// - arbiter feeder acks qualify only when `policy == SimpleMajority` and
+    ///   the group is an RF=2 arbiter config (`ack_group_size() == 2`), which
+    ///   matches JE `useArbiter`.
+    ///
+    /// This is what makes `testReplicaDown` correct: with the data replica
+    /// down, a SIMPLE_MAJORITY commit is satisfied by the arbiter's ack, but
+    /// an ALL commit is not (only the down data replica would qualify), so
+    /// ALL times out / fails ("ALL should have failed").
+    fn count_ack_feeders_ge(
+        &self,
+        commit_vlsn: u64,
+        policy: ReplicaAckPolicyKind,
+    ) -> u32 {
         let group = self.get_rep_group();
+        // JE useArbiter: arbiter acks substitute only under SIMPLE_MAJORITY
+        // at RF=2 (getAckGroupSize() == 2). `arbiter_substitutes_at_rf2`
+        // accounts for the implicit master the runtime group view omits.
+        let arbiter_qualifies =
+            matches!(policy, ReplicaAckPolicyKind::SimpleMajority)
+                && self.arbiter_substitutes_at_rf2();
         let mut count = 0u32;
         for feeder in self.feeders.read().iter() {
-            let qualifies = group
-                .get_node(&feeder.get_replica_name())
-                .map(|n| n.node_type == crate::node_type::NodeType::Electable)
-                .unwrap_or(false);
+            let node_type =
+                group.get_node(&feeder.get_replica_name()).map(|n| n.node_type);
+            let qualifies = match node_type {
+                Some(crate::node_type::NodeType::Electable) => true,
+                Some(crate::node_type::NodeType::Arbiter) => arbiter_qualifies,
+                _ => false,
+            };
             // A feeder counts only if it has acked a *real* VLSN at or above
             // the commit VLSN.  `acked_vlsn == 0` is the NULL sentinel (no ack
             // yet) and must never satisfy a commit, even when `commit_vlsn`
@@ -4593,15 +4691,44 @@ impl ReplicaAckCoordinator for ReplicatedEnvironment {
         // *implicit*: it is not registered in `group_service` (only
         // peers are), so we add 1 to obtain the total electable
         // count expected by `ReplicaAckPolicyKind::required_acks`.
+        //
+        // BUG-ARB-01 (JE `RepGroupImpl.getAckGroupSize` +
+        // `DurabilityQuorum.getCurrentRequiredAckCount` +
+        // `RepImpl.useArbiter`): the durability ack-group size is the count
+        // of ELECTABLE *data* nodes (JE `ACK_PREDICATE = isElectable() &&
+        // !isArbiter()`). JE keeps a down data replica *registered*, so an
+        // RF=2 group keeps `getAckGroupSize() == 2` and a required ack count
+        // of `minAckNodes(2) - 1 == 1` while the replica is offline; the
+        // arbiter is what lets that one ack still be obtained under
+        // SIMPLE_MAJORITY. Noxu models a down replica as absent from the
+        // group view, so a present arbiter is counted as occupying the RF=2
+        // data slot the down replica would fill (JE `useArbiter` is gated on
+        // `getAckGroupSize() == 2`). The arbiter is only counted up to the
+        // RF=2 boundary (`data_total < 2`), so it never inflates a group with
+        // two live data replicas past JE's size. The master is a data node
+        // and implicit, hence `+ 1`.
         let group = self.get_rep_group();
-        let electable_peers: u32 = group
+        let data_peers: u32 = group
             .get_nodes()
             .iter()
             .filter(|n| n.node_type == crate::node_type::NodeType::Electable)
             .count() as u32;
-        let electable_count: u32 = electable_peers + 1; // +1 for self/master
+        let arbiter_peers: u32 = group
+            .get_nodes()
+            .iter()
+            .filter(|n| n.node_type == crate::node_type::NodeType::Arbiter)
+            .count() as u32;
+        let data_total: u32 = data_peers + 1; // +1: the implicit master (data)
+        // JE getAckGroupSize(): the arbiter stands in for the missing RF=2
+        // data replica, capped at the RF=2 boundary (JE useArbiter requires
+        // getAckGroupSize() == 2).
+        let ack_group_size: u32 = if arbiter_peers > 0 && data_total < 2 {
+            data_total + 1
+        } else {
+            data_total
+        };
 
-        let needed = policy.required_acks(electable_count);
+        let needed = policy.required_acks(ack_group_size);
         if needed == 0 {
             // Single-node group, or All with only the master itself.
             return Ok(0);
@@ -4638,7 +4765,7 @@ impl ReplicaAckCoordinator for ReplicatedEnvironment {
         // equivalent). record_ack notifies us as acks arrive.
         let satisfied = self.ack_tracker.wait_for_predicate(
             timeout,
-            || self.count_ack_feeders_ge(commit_vlsn) >= needed,
+            || self.count_ack_feeders_ge(commit_vlsn, policy) >= needed,
             || self.is_shutdown(),
         );
         if satisfied {
@@ -4656,7 +4783,7 @@ impl ReplicaAckCoordinator for ReplicatedEnvironment {
         // Timed out: report the partial ack count (qualifying electable
         // feeders holding the commit VLSN) so the caller can surface
         // InsufficientReplicas.
-        let received = self.count_ack_feeders_ge(commit_vlsn);
+        let received = self.count_ack_feeders_ge(commit_vlsn, policy);
         self.ack_tracker.cleanup_through(commit_vlsn);
         Err(AckWaitError { kind: AckWaitErrorKind::Timeout, needed, received })
     }

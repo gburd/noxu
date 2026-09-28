@@ -349,3 +349,123 @@ fn f1_empty_commit_returns_ok_without_acks() {
     let _ = env.close();
     let _ = rep_env.close();
 }
+
+// ---------------------------------------------------------------------------
+// BUG-ARB-01: an ARBITER's ack is a valid durable witness for SIMPLE_MAJORITY
+// at RF=2, but NEVER for ALL (JE ArbiterTest.testReplicaDown; JE
+// DurabilityQuorum + RepImpl.useArbiter). These runtime tests drive the ack
+// *satisfaction* side end-to-end through `await_replica_acks` + `record_ack`.
+// ---------------------------------------------------------------------------
+
+/// Add a single arbiter peer to the group (the RF=2 witness).
+fn add_arbiter(env: &ReplicatedEnvironment, name: &str, id: u32) {
+    let arb = RepNode::new(
+        name.into(),
+        NodeType::Arbiter,
+        "127.0.0.1".into(),
+        7_000 + id as u16,
+        100 + id,
+    );
+    env.add_peer(arb).unwrap();
+}
+
+/// JE: ArbiterTest.testReplicaDown (SIMPLE_MAJORITY half) — with the data
+/// replica down, an RF=2 SIMPLE_MAJORITY commit is still made durable by the
+/// arbiter's ack. Here the group is {master, arbiter} (the data replica is
+/// down/absent); the arbiter acks and the commit reaches quorum via the
+/// arbiter — required=1, satisfied by the arbiter feeder's ack (JE useArbiter,
+/// getNumCurrentAckFeeders counts the arbiter because isElectable()).
+///
+/// Before BUG-ARB-01 fix the master's ack group collapsed to {master} and
+/// required 0 acks (durable with no witness). Now it requires 1 and the
+/// arbiter supplies it.
+#[test]
+fn bug_arb_01_simple_majority_reaches_quorum_via_arbiter_ack() {
+    let env = build_master_env("master_arb_sm");
+    env.become_master(1).unwrap();
+    // RF=2 arbiter config: one arbiter, no live data replica.
+    add_arbiter(&env, "arb1", 1);
+
+    // Required acks under SIMPLE_MAJORITY must be exactly 1 (the arbiter),
+    // NOT 0 — the durability-safety guarantee.
+    let env_for_ack = Arc::clone(&env);
+    let ack_thread = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(20));
+        // The arbiter acks the commit VLSN (>= 0). This is the witness.
+        env_for_ack.record_ack(1, "arb1");
+    });
+
+    let started = Instant::now();
+    let res = env.await_replica_acks(
+        ReplicaAckPolicyKind::SimpleMajority,
+        Duration::from_secs(2),
+    );
+    let elapsed = started.elapsed();
+    ack_thread.join().unwrap();
+
+    assert!(
+        res.is_ok(),
+        "RF=2 SIMPLE_MAJORITY must reach quorum via the arbiter's ack; got {:?}",
+        res
+    );
+    // needed==1 proves it did NOT collapse to a zero-witness commit.
+    assert_eq!(res.unwrap(), 1, "the arbiter's ack is the required witness");
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "should return promptly after the arbiter ack; waited {:?}",
+        elapsed
+    );
+
+    let _ = env.close();
+}
+
+/// JE: ArbiterTest.testReplicaDown (ALL half) — "Insertion with ACK durability
+/// of ALL should have failed." With the data replica down in an RF=2 arbiter
+/// group, an ALL commit must NOT be satisfiable by the arbiter: the arbiter's
+/// ack does not qualify for ALL (JE useArbiter is SIMPLE_MAJORITY only), so
+/// only the (down) data replica could satisfy it. The commit must time out
+/// (fail), never silently succeed.
+///
+/// Before BUG-ARB-01 fix the master required 0 acks for ALL and returned Ok
+/// with no witness — the durability violation. Now it requires 1 and, since
+/// the arbiter cannot satisfy ALL, it times out.
+#[test]
+fn bug_arb_01_all_durability_is_not_satisfied_by_arbiter() {
+    let env = build_master_env("master_arb_all");
+    env.become_master(1).unwrap();
+    add_arbiter(&env, "arb1", 1);
+
+    // The arbiter acks — but it must NOT satisfy ALL.
+    let env_for_ack = Arc::clone(&env);
+    let ack_thread = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(20));
+        env_for_ack.record_ack(1, "arb1");
+    });
+
+    let timeout = Duration::from_millis(300);
+    let started = Instant::now();
+    let res = env.await_replica_acks(ReplicaAckPolicyKind::All, timeout);
+    let elapsed = started.elapsed();
+    ack_thread.join().unwrap();
+
+    let err = res.expect_err(
+        "ALL must FAIL when only the arbiter is up (JE testReplicaDown: \
+         'ALL should have failed'); it must not silently succeed",
+    );
+    assert_eq!(err.kind, AckWaitErrorKind::Timeout);
+    // needed==1 proves ALL required a witness (not the buggy 0); received==0
+    // proves the arbiter's ack did NOT count for ALL.
+    assert_eq!(err.needed, 1, "ALL over the RF=2 group needs one data ack");
+    assert_eq!(
+        err.received, 0,
+        "the arbiter ack must NOT count toward ALL (JE useArbiter is \
+         SIMPLE_MAJORITY only)"
+    );
+    assert!(
+        elapsed >= timeout,
+        "ALL must block the full timeout, not short-circuit; waited {:?}",
+        elapsed
+    );
+
+    let _ = env.close();
+}
