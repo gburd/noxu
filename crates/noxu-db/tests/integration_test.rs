@@ -359,6 +359,11 @@ fn dbentry_get_data_respects_offset_and_size() {
 
 /// is_partial() / set_partial() round-trip.
 /// Mirrors the partial flag checks in testPartial().
+// JE: DatabaseEntryTest.testPartial / testPartialCursorPuts (partial-flag API
+// surface: setPartial/setPartialOffset/setPartialLength round-trip).  NOTE: the
+// full JE partial-PUT byte-assembly (grafting data at an offset into a
+// zero-filled record) differs in Noxu on a non-existent record; that
+// data-assembly detail is documented in the package report, not asserted here.
 #[test]
 fn dbentry_partial_flag_round_trip() {
     let mut entry = noxu_db::DatabaseEntry::new();

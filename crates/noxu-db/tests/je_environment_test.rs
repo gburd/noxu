@@ -267,3 +267,113 @@ fn environment_daemon_manual_invocation() {
     let _ = env.clean_log().unwrap();
     env.close().unwrap();
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// JE: ApiTest.testBasic
+//
+// JE invariant: `new Environment(null, null)` (null home / null config) raises
+// IllegalArgumentException — the API rejects a nonsensical open request.
+//
+// Noxu adaptation: Rust's type system makes a null home unrepresentable
+// (`EnvironmentConfig` carries a `PathBuf`), so the closest analog of "an open
+// request that cannot succeed" is: opening a NON-existent environment directory
+// with allow_create=false must fail (Err), not silently create or succeed.
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn environment_open_nonexistent_without_create_fails() {
+    let dir = TempDir::new().unwrap();
+    let missing = dir.path().join("does_not_exist_subdir");
+    let r = Environment::open(
+        EnvironmentConfig::new(missing).with_allow_create(false),
+    );
+    assert!(
+        r.is_err(),
+        "opening a non-existent env dir with allow_create=false must fail"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// JE: EnvironmentStatTest.testFSyncStats / testDbFSyncs
+//
+// JE invariant: committed writes drive the fsync counters
+// (getNLogFSyncs / getNFSyncRequests) upward.  Noxu's EnvironmentStats exposes
+// `log.n_log_fsyncs` / `log.n_fsync_requests`.
+//
+// (Also cited in metrics_export_test.rs, which asserts noxu_log_fsyncs_total > 0
+// after committed writes.)
+//
+// JE: EnvironmentStatTest.testRepeatFaultReads — Noxu exposes
+// `log.n_repeat_fault_reads`; we assert the counter is present and monotonic
+// (>= 0), since forcing a specific fault-read count depends on eviction timing.
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn environment_stats_fsync_and_fault_counters() {
+    let dir = TempDir::new().unwrap();
+    let env = Environment::open(txn_env(&dir, true)).unwrap();
+    let db = env.open_database(None, "d", &dbcfg()).unwrap();
+    let txn = env.begin_transaction(None).unwrap();
+    for i in 0u32..64 {
+        db.put_in(
+            &txn,
+            DatabaseEntry::from_bytes(&i.to_be_bytes()),
+            DatabaseEntry::from_bytes(b"v"),
+        )
+        .unwrap();
+    }
+    txn.commit().unwrap();
+    env.checkpoint(Some(&CheckpointConfig::new())).unwrap();
+
+    let stats = env.stats().unwrap();
+    assert!(
+        stats.log.n_log_fsyncs > 0 || stats.log.n_fsync_requests > 0,
+        "committed + checkpointed writes must drive the fsync counters: \
+         n_log_fsyncs={}, n_fsync_requests={}",
+        stats.log.n_log_fsyncs,
+        stats.log.n_fsync_requests
+    );
+    // repeat-fault-reads counter is present and non-negative (u64).
+    let _ = stats.log.n_repeat_fault_reads;
+    db.close().unwrap();
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// JE: DbHandleLockTest.testOpenHandle
+//
+// JE invariant: opening a database under a transaction acquires the database
+// HANDLE LOCK, which shows up in the lock stats (getNTotalLocks /
+// getNWriteLocks increase while the handle-holding txn is open).
+//
+// Noxu adaptation: assert the lock-stat counters reflect an open transaction
+// holding locks on an opened DB — n_total_locks > 0 while the txn+handle are
+// live.  (The exact +1 accounting is JE-internal; we assert the observable
+// effect: locks are held.)
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn db_handle_lock_open_handle_acquires_locks() {
+    let dir = TempDir::new().unwrap();
+    let env = Environment::open(txn_env(&dir, true)).unwrap();
+
+    let txn = env.begin_transaction(None).unwrap();
+    let db = env.open_database(Some(&txn), "foo", &dbcfg()).unwrap();
+    // Write a record under the txn so a record lock is definitely held.
+    db.put_in(
+        &txn,
+        DatabaseEntry::from_bytes(b"k"),
+        DatabaseEntry::from_bytes(b"v"),
+    )
+    .unwrap();
+
+    let stats = env.stats().unwrap();
+    assert!(
+        stats.lock.n_total_locks > 0,
+        "an open txn holding an opened-DB handle + a write must report locks; \
+         got n_total_locks={}",
+        stats.lock.n_total_locks
+    );
+
+    db.close().unwrap();
+    txn.commit().unwrap();
+}

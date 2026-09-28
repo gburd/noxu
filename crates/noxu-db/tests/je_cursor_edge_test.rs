@@ -40,6 +40,7 @@ fn key(i: u8) -> DatabaseEntry {
 
 // ──────────────────────────────────────────────────────────────────────────────
 // CursorEdgeTest.testSearchOnDuplicatesWithDeletions
+// JE: CursorEdgeTest.testSearchOnDuplicatesWithDeletions
 //
 // JE invariant: with sorted-duplicates and a partially-deleted dup chain
 // (compressor disabled — i.e. tombstones still in the BIN), Search/SearchGte/
@@ -159,6 +160,7 @@ fn cursor_edge_search_on_duplicates_with_deletions() {
 
 // ──────────────────────────────────────────────────────────────────────────────
 // CursorEdgeTest.testSearchBothWithOneDuplicate (JE SR #9248)
+// JE: CursorEdgeTest.testSearchBothWithOneDuplicate
 //
 // JE invariant: on a sorted-dup database with exactly one entry under a key,
 // SearchBothRange(k, data-1) lands on (k, data) — i.e. the dup-range search
@@ -190,6 +192,7 @@ fn cursor_edge_search_both_with_one_duplicate() {
 
 // ──────────────────────────────────────────────────────────────────────────────
 // CursorEdgeTest.testGetPrevNoDupWithEmptyTree (JE bug #11700)
+// JE: CursorEdgeTest.testGetPrevNoDupWithEmptyTree
 //
 // JE invariant: after deleting every record (and compressing) a cursor that
 // calls getPrevNoDup on the now-empty tree returns NotFound rather than
@@ -246,6 +249,7 @@ fn cursor_edge_prev_no_dup_with_empty_tree() {
 
 // ──────────────────────────────────────────────────────────────────────────────
 // CursorEdgeTest.testReadDeletedUncommitted
+// JE: CursorEdgeTest.testReadDeletedUncommitted
 //
 // JE invariant:
 //   1. T1 deletes record k=1 and stays open.
@@ -320,6 +324,7 @@ fn cursor_edge_read_deleted_uncommitted() {
 
 // ──────────────────────────────────────────────────────────────────────────────
 // CursorEdgeTest.testNonTxnalCursorNoUpdates (spirit port)
+// JE: CursorEdgeTest.testNonTxnalCursorNoUpdates
 //
 // JE invariant: a non-transactional cursor opened against a transactional
 // database must NOT permit update operations (put/delete) — those must fail
@@ -340,6 +345,7 @@ fn cursor_edge_non_txnal_cursor_no_updates() {
 
 // ──────────────────────────────────────────────────────────────────────────────
 // CursorEdgeTest.testNoWaitLatchRelease  (wave 9-C port)
+// JE: CursorEdgeTest.testNoWaitLatchRelease
 //
 // JE invariant: when a cursor under a no-wait transaction encounters a
 // LockNotAvailableException — for example, T1 holds a record lock and
@@ -408,6 +414,7 @@ fn cursor_edge_no_wait_latch_release() {
 
 // ──────────────────────────────────────────────────────────────────────────────
 // CursorEdgeTest.testGetCurrentDuringDupTreeCreation (spirit port)
+// JE: CursorEdgeTest.testGetCurrentDuringDupTreeCreation
 //
 // JE invariant [SR #11195]: when T1 has a singleton record and another
 // transaction is positioned on it, T1 inserting a second duplicate

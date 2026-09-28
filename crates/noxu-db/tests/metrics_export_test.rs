@@ -108,6 +108,8 @@ fn metrics_export_emits_je_stat_set() {
         m["noxu_txn_begins_total"]
     );
 
+    // JE: EnvironmentStatTest.testFSyncStats / testDbFSyncs (fsync counters
+    // increase after committed writes) / testCacheStats (cache stats present).
     // Log (JE FSYNCMGR/FILEMGR): fsyncs > 0 and bytes written > 0.
     assert!(
         m["noxu_log_fsyncs_total"] > 0.0,
