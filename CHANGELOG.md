@@ -291,6 +291,11 @@ listed in [References](#references).
   hooks are reserved and not currently invoked (NEW-TRIGGER-LIFECYCLE).** Noxu fires
   only the data-operation (`put`/`delete`) and transaction (`commit`/`abort`) trigger
   methods; database-lifecycle trigger events are not yet wired. The trait docs
+- **Documented that the `Monitor` node type's group/master-change notifications are
+  not yet implemented (NEW-MONITOR-DOC).** `NodeType::Monitor` previously implied a
+  Monitor receives group-membership and master-change notifications; there is no
+  observer subsystem yet, so the doc now marks it a reserved non-electable/non-data
+  node type.
   previously implied the lifecycle hooks fire.
 - **VLSN index lookups are range-gated (je.rep.vlsn parity).** `VlsnIndex::get_lsn`
   now returns `None` for a VLSN outside the current VLSN range, enforcing JE's
