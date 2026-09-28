@@ -605,3 +605,145 @@ fn phantom_dup_delete_get_prev_abort() {
         do_commit: false,
     });
 }
+
+// ── DIAGNOSTIC PROBE (NEW-PHANTOM-ABORT-1): point-get CONTESTS, getNext SKIPS ──
+// Bounded so a block cannot hang the harness.  Prints the observation; asserts
+// the block-vs-skip disparity that IS the bug.
+use std::sync::atomic::AtomicBool;
+
+fn seed_env() -> (TempDir, Arc<Environment>, Arc<noxu_db::Database>) {
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let db = open_db(&env, false);
+    let txn = env.begin_transaction(None).unwrap();
+    for k in DATA_STRINGS {
+        db.put_in(
+            &txn,
+            DatabaseEntry::from_bytes(k),
+            DatabaseEntry::from_bytes(&[0u8; 10]),
+        )
+        .unwrap();
+    }
+    txn.commit().unwrap();
+    (dir, env, db)
+}
+
+#[test]
+#[ignore = "diagnostic probe: run with --ignored to observe block-vs-skip"]
+fn diag_pointget_contests() {
+    let (_dir, env, db) = seed_env();
+    let seq = Arc::new(AtomicU32::new(0));
+    let contended = Arc::new(AtomicBool::new(false));
+    // Deleter holds F's write lock for 2000ms, then aborts.
+    let del = {
+        let env = Arc::clone(&env);
+        let db = Arc::clone(&db);
+        let seq = Arc::clone(&seq);
+        thread::spawn(move || {
+            let txn = env.begin_transaction(None).unwrap();
+            db.delete_in(&txn, DatabaseEntry::from_bytes(b"F")).unwrap();
+            seq.store(1, Ordering::SeqCst);
+            while seq.load(Ordering::SeqCst) < 2 {
+                thread::yield_now();
+            }
+            thread::sleep(Duration::from_millis(2000));
+            txn.abort().unwrap();
+        })
+    };
+    while seq.load(Ordering::SeqCst) < 1 {
+        thread::yield_now();
+    }
+    let reader = {
+        let env = Arc::clone(&env);
+        let db = Arc::clone(&db);
+        let seq = Arc::clone(&seq);
+        let contended = Arc::clone(&contended);
+        thread::spawn(move || {
+            let txn = env.begin_transaction(None).unwrap();
+            let mut c = db.open_cursor_in(&txn, None).unwrap();
+            seq.store(2, Ordering::SeqCst);
+            let t0 = std::time::Instant::now();
+            let mut k = DatabaseEntry::from_bytes(b"F");
+            let mut d = DatabaseEntry::new();
+            let s = c.get(&mut k, &mut d, Get::Search, None);
+            let el = t0.elapsed();
+            // A point-get on the write-locked deleted slot must CONTEST: it
+            // either blocks (>= a few hundred ms) or errors with a lock
+            // timeout/conflict.  Returning Success in ~0ms would be a skip.
+            let c_ended = el >= Duration::from_millis(200) || s.is_err();
+            contended.store(c_ended, Ordering::SeqCst);
+            println!(
+                "PROBE point-get(F) -> {:?} after {:?} (contended={})",
+                s, el, c_ended
+            );
+            drop(c);
+            let _ = txn.commit();
+        })
+    };
+    del.join().unwrap();
+    reader.join().unwrap();
+    assert!(
+        contended.load(Ordering::SeqCst),
+        "point-get must CONTEST (block/error on) the write-locked deleted slot, not skip"
+    );
+}
+
+#[test]
+#[ignore = "diagnostic probe: run with --ignored to observe block-vs-skip"]
+fn diag_getnext_skips() {
+    let (_dir, env, db) = seed_env();
+    let seq = Arc::new(AtomicU32::new(0));
+    let del = {
+        let env = Arc::clone(&env);
+        let db = Arc::clone(&db);
+        let seq = Arc::clone(&seq);
+        thread::spawn(move || {
+            let txn = env.begin_transaction(None).unwrap();
+            db.delete_in(&txn, DatabaseEntry::from_bytes(b"F")).unwrap();
+            seq.store(1, Ordering::SeqCst);
+            while seq.load(Ordering::SeqCst) < 2 {
+                thread::yield_now();
+            }
+            thread::sleep(Duration::from_millis(2000));
+            txn.abort().unwrap();
+        })
+    };
+    while seq.load(Ordering::SeqCst) < 1 {
+        thread::yield_now();
+    }
+    let txn = env.begin_transaction(None).unwrap();
+    txn.set_lock_timeout(30_000);
+    let mut c = db.open_cursor_in(&txn, None).unwrap();
+    let mut k = DatabaseEntry::from_bytes(b"C");
+    let mut d = DatabaseEntry::new();
+    assert_eq!(
+        c.get(&mut k, &mut d, Get::Search, None).unwrap(),
+        OperationStatus::Success
+    );
+    seq.store(2, Ordering::SeqCst);
+    thread::sleep(Duration::from_millis(50)); // let deleter settle into its sleep
+    let t0 = std::time::Instant::now();
+    let mut nk = DatabaseEntry::new();
+    let mut nd = DatabaseEntry::new();
+    let s = c.get(&mut nk, &mut nd, Get::Next, None).unwrap();
+    let el = t0.elapsed();
+    println!(
+        "PROBE getNext from C -> {:?} key={:?} in {:?}",
+        s,
+        nk.data_opt(),
+        el
+    );
+    drop(c);
+    let _ = txn.commit();
+    del.join().unwrap();
+    assert_eq!(
+        nk.data_opt().unwrap(),
+        b"G",
+        "getNext landed on G (skip past deleted F)"
+    );
+    assert!(
+        el < Duration::from_millis(500),
+        "getNext did not block ({:?})",
+        el
+    );
+}
