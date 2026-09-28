@@ -301,20 +301,36 @@ fn do_truncate_and_add(
 
 // JE: TruncateTest.testEnvTruncateCommit
 //
-// ENGINE-BUG CANDIDATE (NEW-TRUNCATE-1): a transactional truncate followed by
-// inserts in the SAME transaction, then commit, LOSES the inserts.  Noxu
-// defers the physical tree replacement to a commit callback
+// ENGINE-BUG CANDIDATE (NEW-TRUNCATE-1) — DATA LOSS: a transactional truncate
+// followed by inserts in the SAME transaction, then commit, LOSES the inserts.
+//
+// Runtime-probed on this code (2026-05): truncate returns the correct up-front
+// count (256), but after commit the final count is 0 AND point-gets for the
+// inserted keys return NotFound — i.e. durable loss of committed inserts, not
+// just a stale count.  Control: auto-committing the truncate BEFORE the inserts
+// yields 150 (correct), isolating the fault to the same-txn
+// truncate-then-insert-then-commit ordering.
+//
+// Root cause: Noxu defers the physical tree replacement to a commit callback
 // (`Environment::truncate_database` -> `register_commit_callback` ->
 // `truncate_database_if_id`), and `Transaction::commit` runs that callback
-// AFTER the transaction's own data-log writes are committed
-// (`transaction.rs` commit path: commit data, THEN run commit callbacks).
-// So the 150 inserts are committed into the pre-truncate tree and then wiped
-// by the deferred truncate.  Expected (JE): the truncate installs a fresh
-// empty tree immediately and the 150 inserts land in it -> final count 150.
-// Control: `env_truncate_autocommit` (same records, but the truncate is
-// auto-committed BEFORE the inserts) passes with 150, isolating the fault to
-// the same-txn truncate-then-insert ordering.  Kept #[ignore]d — a faithful
-// port that must not be weakened.
+// AFTER the transaction's own data-log writes are committed (`transaction.rs`
+// commit path: set Committed + flush data, THEN run commit callbacks).  So the
+// 150 inserts are committed into the pre-truncate tree and then overwritten by
+// the deferred whole-tree swap.
+//
+// JE-faithful fix pointer: JE `DbTree.doTruncateDb` clones the DB with a NEW
+// DatabaseId + a fresh empty `Tree` and repoints the NameLN IMMEDIATELY at
+// operation time, then uses `markDeleteAtTxnEnd(oldDb, /*deleteAtCommit=*/true)`
+// / `markDeleteAtTxnEnd(newDb, /*deleteAtCommit=*/false)` so ONLY the physical
+// old-tree cleanup is deferred.  Same-txn inserts therefore land in the new
+// tree.  The fix is to install the fresh empty tree at truncate time (identity
+// bound to the new DatabaseId) rather than swapping the whole tree in a
+// post-commit callback.
+//
+// Kept #[ignore]d — a faithful port that must not be weakened; escalated for a
+// dedicated fix worker.  Severity: DATA LOSS, but NARROW (only the same-txn
+// truncate-then-insert path; the common auto-commit truncate path is safe).
 #[test]
 #[ignore = "NEW-TRUNCATE-1: same-txn truncate-then-insert loses inserts on commit (deferred truncate ordered after inserts)"]
 fn env_truncate_commit() {

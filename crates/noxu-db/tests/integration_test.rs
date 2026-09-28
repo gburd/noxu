@@ -955,6 +955,9 @@ fn db_put_no_overwrite_after_delete_succeeds() {
 /// the full record set without interfering with each other.
 /// Mirrors the multi-cursor open + scan pattern from DatabaseTest.testCursor()
 /// and CursorTest.insertMultiDb().
+// JE: CursorTest.testBasic (insertMultiDb(1)) / CursorTest.testMulti
+// (insertMultiDb(4)) — open cursor(s) over one/several DBs, insert NUM_RECS,
+// scan forward/back and verify the full record set is traversable.
 #[test]
 fn db_multiple_concurrent_cursors_scan_same_records() {
     let dir = tempfile::TempDir::new().unwrap();

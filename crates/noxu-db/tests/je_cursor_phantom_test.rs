@@ -24,26 +24,38 @@
 //! short sleep.  Each thread opens its own transaction from the shared env, as
 //! in JE.
 
-// ── ENGINE-BUG CANDIDATE (NEW-PHANTOM-ABORT-1) ───────────────────────────────
+// ── ENGINE-BUG CANDIDATE (NEW-PHANTOM-ABORT-1) — DIRTY READ VIA CURSOR SKIP ──
 //
 // The eight *abort* configurations below are #[ignore]d faithful ports.  They
-// fail because a concurrent RepeatableRead cursor's getNext / getPrev does NOT
-// block on thread1's UNCOMMITTED write on the adjacent record: it reads the
-// uncommitted state (a phantom insert appears, a phantom delete is skipped)
-// and never re-resolves when thread1 ABORTS.  Concretely, each abort test
-// returns the value that would be correct only if thread1 had COMMITTED.
+// are a REAL, two-thread test (each thread has its own transaction; thread1
+// genuinely holds the write lock on the contended record while thread2 reads)
+// — NOT a single-thread simulation.
 //
-// Control: the eight *commit* siblings (identical setup, thread1 commits
-// instead of aborts) all PASS — the read observes the committed effect.  The
-// only variable between a passing test and its failing sibling is
-// commit-vs-abort, which isolates the fault to "the blocked navigation does
-// not wait for the writer to resolve; it dirty-reads the pending write".
+// Disambiguating runtime probe (2026-05, clearest case = delete + getNext):
+//   * thread1 deletes F (uncommitted) and HOLDS F's write lock;
+//   * a POINT get (`Get::Search`) on F from thread2 BLOCKS ~2000ms until
+//     thread1 resolves — so record-level locking IS enforced for direct reads;
+//   * but `getNext` from C in thread2 returns G in 0ms — it SKIPS the
+//     write-locked, uncommitted-deleted slot F WITHOUT blocking or raising a
+//     lock conflict.  That is a DIRTY READ of thread1's uncommitted delete.
 //
-// Expected (JE `CursorTest.phantomWorker` / `phantomDupWorker`): thread2's
-// getNext/getPrev BLOCKS on thread1's write lock until thread1 ends, then
-// returns the COMMITTED-or-reverted key.  See CursorTest.java.
+// Because thread2 never blocked, when thread1 ABORTS (F restored) thread2 has
+// already returned the wrong answer (G).  This is why all eight abort configs
+// fail while their commit siblings pass: on commit the skip is coincidentally
+// correct; on abort it is exposed as a dirty read.  (The commit siblings do
+// NOT independently prove blocking — a dirty read followed by a commit is
+// coincidentally right; the abort configs are the real evidence.)
 //
-// Kept #[ignore]d — faithful ports, must not be weakened.
+// Root cause (candidate): Noxu's cursor next/prev "skip defunct slot" path does
+// not acquire the record lock before skipping a deleted-but-uncommitted slot,
+// so it reads through another txn's pending write.  JE's
+// `CursorImpl.getNext` -> `lockLNAndCheckDefunct` locks the LN it lands on
+// (even a defunct slot) with the read lock BEFORE deciding to skip it, so a
+// write-locked slot blocks the reader until the writer resolves.
+//
+// Verdict: REAL engine isolation bug (lock-based model requires block-or-
+// conflict, not skip), escalated.  Kept #[ignore]d — faithful ports, must not
+// be weakened.
 // ─────────────────────────────────────────────────────────────────────────────
 
 use noxu_db::{
