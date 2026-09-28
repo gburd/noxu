@@ -1351,11 +1351,14 @@ impl CursorImpl {
                     }
                     // NEW-REUSESLOT-1 [JE #15704]: position on the STORED
                     // slot key, not the search argument.  They differ under a
-                    // partial/compares-equal comparator; recording the search
-                    // key here corrupted the abort_key of a subsequent
-                    // delete/put(Current) and made `get` return the wrong key.
+                    // partial/compares-equal comparator, so a `get` must return
+                    // the true stored key.  Re-resolve BY KEY under the latch
+                    // (never a pre-lock slot index -- a stale index reads the
+                    // wrong slot after a concurrent split/merge).  The abort
+                    // key of a later delete/put(Current) is captured separately
+                    // UNDER the LN write lock, not from this read-path value.
                     self.current_key = Some(
-                        Self::stored_full_key(&bin_arc, slot_index)
+                        self.stored_full_key(key)
                             .unwrap_or_else(|| key.to_vec()),
                     );
                     self.current_data = final_data;
@@ -1421,9 +1424,9 @@ impl CursorImpl {
                     };
                     // NEW-REUSESLOT-1 [JE #15704]: position on the STORED
                     // slot key (see the Set branch); differs under a partial
-                    // comparator.
+                    // comparator.  Re-resolved BY KEY under the latch.
                     self.current_key = Some(
-                        Self::stored_full_key(&bin_arc, slot_index)
+                        self.stored_full_key(key)
                             .unwrap_or_else(|| key.to_vec()),
                     );
                     self.current_data = final_data;
@@ -1853,28 +1856,37 @@ impl CursorImpl {
         }
     }
 
-    /// Reads the FULL stored key of `slot_index` from the pinned BIN.
+    /// Re-resolves the FULL stored key of the slot matching `key`, BY KEY
+    /// under the BIN latch (never by a pre-lock search index).
     ///
     /// NEW-REUSESLOT-1 [JE #15704]: under a PARTIAL / compares-equal btree
     /// comparator the search argument and the stored slot key differ (e.g.
-    /// search `{0,1}` matches stored `{0,0}`).  The cursor must record the
-    /// STORED key as its position, not the search argument, so that a later
-    /// `delete`/`put(Current)` captures the correct abort_key and a `get`
-    /// returns the true stored key.  Mirrors JE `CursorImpl`, whose position
-    /// reflects the found record's key (`BIN.getKey(index)`), never the
-    /// search argument.  Returns `None` if the slot is gone (fall back to the
-    /// search key, byte-equal in the no-comparator case).
-    fn stored_full_key(
-        bin_arc: &std::sync::Arc<
-            noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>,
-        >,
-        slot_index: usize,
-    ) -> Option<Vec<u8>> {
+    /// search `{0,1}` matches stored `{0,0}`).  A `get` must return the true
+    /// STORED key, not the search argument.  This descends and matches the
+    /// slot with the configured comparator (mirroring `get_data_from_tree`),
+    /// so the returned key is the current stored key regardless of any
+    /// concurrent structural change — a stale search-time slot index could
+    /// otherwise point at a different slot after a split/merge (concurrency
+    /// regression fixed here).  Returns `None` if the slot is gone (callers
+    /// fall back to the search key, byte-equal in the no-comparator case).
+    fn stored_full_key(&self, key: &[u8]) -> Option<Vec<u8>> {
         use noxu_tree::tree::TreeNode;
+        let db = self.db_impl.read();
+        let tree = db.get_real_tree()?;
+        let bin_arc = Self::find_bin_for_key(&tree, key)?;
         let guard = bin_arc.read();
         match &*guard {
-            TreeNode::Bottom(bin) if slot_index < bin.entries.len() => {
-                bin.get_full_key(slot_index)
+            TreeNode::Bottom(bin) => {
+                if !bin.key_prefix.is_empty()
+                    && !key.starts_with(bin.key_prefix.as_slice())
+                {
+                    return None;
+                }
+                let (idx, found) = match tree.get_comparator() {
+                    Some(cmp) => bin.find_entry_cmp(key, cmp.as_ref()),
+                    None => bin.find_entry_compressed(key),
+                };
+                if found { bin.get_full_key(idx) } else { None }
             }
             _ => None,
         }
@@ -3689,13 +3701,22 @@ impl CursorImpl {
                 if self.is_current_slot_deleted() {
                     return Ok(OperationStatus::KeyEmpty);
                 }
-                let current_key = self
+                let mut current_key = self
                     .current_key
                     .clone()
                     .ok_or(DbiError::CursorNotInitialized)?;
                 let (old_data, old_lsn) =
                     self.get_slot_before_image(&current_key);
                 self.lock_write_before_log(old_lsn, &current_key)?;
+                // NEW-REUSESLOT-1 [JE #15704]: capture the STORED slot key
+                // as the abort_key from the slot re-resolved BY KEY under
+                // the LN write lock (mirrors the delete path).  Under a
+                // partial/compares-equal comparator the stored key differs
+                // from the search argument; the undo before-image must
+                // carry the ORIGINAL stored key so abort restores it.
+                if let Some(stored) = self.stored_full_key(&current_key) {
+                    current_key = stored;
+                }
                 let new_lsn = self.log_ln_write(
                     &current_key,
                     Some(data),
@@ -4245,7 +4266,7 @@ impl CursorImpl {
         // For sorted-dup databases, current_key IS the two-part composite key
         // stored in the tree.  For non-dup databases it is the plain key.
         // In both cases current_key is the correct tree-delete key.
-        if let Some(tree_key) = self.current_key.clone() {
+        if let Some(mut tree_key) = self.current_key.clone() {
             let (old_data, old_lsn) = self.get_slot_before_image(&tree_key);
             self.lock_write_before_log(old_lsn, &tree_key)?;
             // NEW-DEL-RACE-1: revalidate-after-lock (JE
@@ -4292,6 +4313,21 @@ impl CursorImpl {
             };
             if record_gone {
                 return Ok(OperationStatus::KeyEmpty);
+            }
+            // NEW-REUSESLOT-1 [JE #15704]: capture the STORED slot key as
+            // the abort_key HERE, under the LN write lock, from the slot
+            // re-resolved BY KEY (never a pre-lock search index).  Under a
+            // PARTIAL / compares-equal comparator the search argument and
+            // the stored key differ ({0,1} vs {0,0}); the undo before-image
+            // must carry the ORIGINAL stored key so abort restores it, not
+            // the search argument.  This mirrors JE `LockStanding`, which
+            // reads the key identity from the LOCKED slot
+            // (`CursorImpl.getCurrentLN` / `LockStanding.prepareForUpdate`),
+            // never from a pre-lock cursor position -- keeping the abort key
+            // cleanly separated from the read-path `search` value and thus
+            // from any stale-index concurrency hazard.
+            if let Some(stored) = self.stored_full_key(&tree_key) {
+                tree_key = stored;
             }
             // Wave 5: also hold a synthetic-key write lock for the
             // duration of the txn so concurrent readers that probe the
