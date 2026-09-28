@@ -322,3 +322,36 @@ Consequently, BDB-JE's serialize-compatibility test surface
 (`je.serializecompatibility`, 2 tests: `test_4_0_0`, `test_4_1_0`, which
 deserialize golden `.out` files and assert no `InvalidClassException`) is
 **N/A by design** — there is no `serialVersionUID` surface in Noxu to test.
+
+## Cursor scan does not block on an adjacent uncommitted delete (NEW-PHANTOM-ABORT-1)
+
+Under `RepeatableRead`/`Serializable` isolation, a **point lookup** of a record
+that another transaction has deleted-but-not-yet-committed correctly **blocks**
+until that transaction resolves (Noxu contests the deleter's lock). A **cursor
+scan** (`Cursor::get` with `Get::Next`/`Get::Prev`), however, currently **skips**
+the physically-removed slot without contesting that lock, so the scan can step
+past an adjacent uncommitted delete and, if the deleting transaction later
+aborts, will not have observed the record it skipped.
+
+**Why:** Noxu removes a B-tree leaf slot **physically at delete-execute time**
+while the deleter holds a write lock on the deleted key's *synthetic* lock id.
+The point-get miss path contests that synthetic lock (and blocks); the scan,
+having no physical slot and no way to name the removed key, skips the gap using
+in-memory liveness only. BDB-JE instead keeps a lockable *pending-deleted*
+tombstone slot until commit, so its scan lands on the slot and
+`CursorImpl.lockLNAndCheckDefunct` blocks on the lock before skipping — only a
+*committed* deletion is skipped without locking.
+
+**Scope:** this affects the visibility of a *concurrent, uncommitted, adjacent*
+delete during a scan; it does not affect single-threaded correctness, committed
+data, durability, or point lookups. Faithful `#[ignore]`d regression repros for
+the eight affected scan/abort configurations are kept in
+`crates/noxu-db/tests/je_cursor_phantom_test.rs` (plus two bounded diagnostic
+probes documenting the block-vs-skip disambiguation), and will be un-ignored
+when the fix lands.
+
+**Fix status:** the JE-faithful correction is a delete-protocol change (retain
+an uncommitted delete as a pending-deleted tombstone until commit; the scan
+locks such a slot before skipping it), tracked as a dedicated follow-up with a
+model-checked (shuttle) acceptance target rather than a point patch, because it
+touches the delete/commit/abort protocol shared with several other subsystems.
