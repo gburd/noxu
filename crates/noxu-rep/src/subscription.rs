@@ -13,6 +13,117 @@ use noxu_sync::Mutex;
 
 use crate::error::{RepError, Result};
 
+use crate::node_type::NodeType;
+use crate::vlsn::VlsnRange;
+
+/// The stream mode requested when a subscriber starts consuming the
+/// replication stream from a given VLSN.
+///
+/// Port of `BaseProtocol.EntryRequestType` (JE
+/// `com.sleepycat.je.rep.stream.BaseProtocol.EntryRequestType`). It governs
+/// how the feeder resolves a requested start VLSN (`RV`) against the VLSN
+/// range `[LOW, HIGH]` it currently holds:
+///
+/// ```text
+/// -------------------------------------------------------------------
+///     MODE      | RV < LOW  |   RV in [LOW, HIGH] | RV > HIGH
+/// -------------------------------------------------------------------
+///  DEFAULT      | NOT_FOUND |   REQUESTED ENTRY   | ALT MATCH POINT (lastSync)
+///  AVAILABLE    |   LOW     |   REQUESTED ENTRY   | HIGH
+///  NOW          |   HIGH    |   HIGH              | HIGH
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EntryRequestType {
+    /// Below-range requests fail (`EntryNotFound` / `InsufficientLog`);
+    /// above-range requests get the feeder's `lastSync` as an alternate
+    /// matchpoint. This is the mode ordinary replicas use.
+    Default,
+    /// Clamp to what the feeder holds: below-range → `LOW`, above-range →
+    /// `HIGH`. Never fails as long as the range is non-empty.
+    Available,
+    /// Always start at `HIGH` (the current tail), regardless of the request.
+    Now,
+}
+
+/// Outcome of resolving a requested start VLSN against a feeder's VLSN range
+/// under a given [`EntryRequestType`].
+///
+/// Mirrors the messages `FeederReplicaSyncup.makeResponseToEntryRequest`
+/// returns: an `Entry` at a resolved VLSN, an `AlternateMatchpoint` (the
+/// feeder's `lastSync`), or `EntryNotFound`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartResolution {
+    /// The stream will start at this VLSN (JE `Entry`).
+    Start(u64),
+    /// The requested VLSN is above the range; the feeder counters with its
+    /// `lastSync` entry as an alternate matchpoint (JE `AlternateMatchpoint`).
+    AlternateMatchpoint(u64),
+    /// The requested VLSN is below the range and cannot be served
+    /// (JE `EntryNotFound`, surfaced to the subscriber as
+    /// `InsufficientLogException`).
+    NotFound,
+}
+
+impl EntryRequestType {
+    /// All three modes, in declaration order — the equivalent of JE's
+    /// `EntryRequestType.values()`.
+    pub const fn values() -> [EntryRequestType; 3] {
+        [
+            EntryRequestType::Default,
+            EntryRequestType::Available,
+            EntryRequestType::Now,
+        ]
+    }
+
+    /// Resolve a requested start VLSN `req` against the feeder's `range`
+    /// under this mode.
+    ///
+    /// Port of `FeederReplicaSyncup.makeResponseToEntryRequest` (the pure
+    /// request-type arm of it). `range.get_first()`/`get_last()` are the
+    /// inclusive `[LOW, HIGH]` bounds; `range.get_last_sync()` is the
+    /// `lastSync` alternate. A `0` sync VLSN means "no syncable entry"
+    /// (JE `VLSN.NULL_VLSN`), which yields `NotFound` in `Default` mode.
+    pub fn resolve(self, req: u64, range: &VlsnRange) -> StartResolution {
+        let low = range.get_first();
+        let high = range.get_last();
+
+        // NOW: always the high end regardless of the requested VLSN.
+        if self == EntryRequestType::Now {
+            return StartResolution::Start(high);
+        }
+
+        if req < low {
+            // Below the range.
+            return match self {
+                EntryRequestType::Available => StartResolution::Start(low),
+                // Default mode: EntryNotFound.
+                _ => StartResolution::NotFound,
+            };
+        }
+
+        if req > high {
+            // Above the range.
+            return match self {
+                EntryRequestType::Available => StartResolution::Start(high),
+                _ => {
+                    // Default mode: counter with lastSync (alternate
+                    // matchpoint). A 0 sync VLSN means no syncable entry ->
+                    // NotFound (network restore in JE).
+                    let last_sync = range.get_last_sync();
+                    if last_sync == 0 {
+                        StartResolution::NotFound
+                    } else {
+                        StartResolution::AlternateMatchpoint(last_sync)
+                    }
+                }
+            };
+        }
+
+        // In range: serve the requested entry.
+        StartResolution::Start(req)
+    }
+}
+
 /// Configuration for a replication subscription.
 ///
 /// Specifies the subscriber
@@ -30,6 +141,132 @@ pub struct SubscriptionConfig {
     pub feeder_port: u16,
     /// VLSN to start streaming from.
     pub start_vlsn: u64,
+    /// Subscriber home directory (JE `SubscriptionConfig.subHome`). A
+    /// mandatory, non-empty parameter in JE's `verifyParameters`.
+    pub subscriber_home: String,
+    /// Node type this subscriber presents to the feeder. JE only permits
+    /// `SECONDARY` or `EXTERNAL`; Noxu has no `EXTERNAL` variant, so a
+    /// subscription node is `Secondary` (see [`SubscriptionConfig::new`]).
+    pub node_type: NodeType,
+    /// Optional replication-group UUID. When set, the feeder must belong to
+    /// the same group or subscription is rejected (JE `groupUUID`).
+    pub group_uuid: Option<String>,
+    /// Stream mode governing start-VLSN resolution (JE `streamMode`,
+    /// default `DEFAULT`).
+    pub stream_mode: EntryRequestType,
+    /// Channel (replica) timeout in milliseconds (JE `getChannelTimeout`).
+    pub channel_timeout_ms: u64,
+    /// Pre-heartbeat timeout in milliseconds (JE `getPreHeartbeatTimeout`).
+    pub pre_heartbeat_timeout_ms: u64,
+    /// Stream-open timeout in milliseconds (JE `getStreamOpenTimeout`).
+    pub stream_open_timeout_ms: u64,
+    /// Heartbeat interval in milliseconds (JE `getHeartbeatIntervalMs`).
+    pub heartbeat_interval_ms: u32,
+    /// Input message queue size (JE `getInputMessageQueueSize`).
+    pub input_message_queue_size: u32,
+    /// Output message queue size (JE `getOutputMessageQueueSize`).
+    pub output_message_queue_size: u32,
+    /// Socket receive buffer size (JE `getReceiveBufferSize`).
+    pub receive_buffer_size: u32,
+}
+
+impl Default for SubscriptionConfig {
+    fn default() -> Self {
+        SubscriptionConfig {
+            subscriber_name: String::new(),
+            group_name: String::new(),
+            feeder_host: String::new(),
+            feeder_port: 0,
+            start_vlsn: 0,
+            subscriber_home: ".".into(),
+            node_type: NodeType::Secondary,
+            group_uuid: None,
+            stream_mode: EntryRequestType::Default,
+            channel_timeout_ms: 0,
+            pre_heartbeat_timeout_ms: 0,
+            stream_open_timeout_ms: 0,
+            heartbeat_interval_ms: 0,
+            input_message_queue_size: 0,
+            output_message_queue_size: 0,
+            receive_buffer_size: 0,
+        }
+    }
+}
+
+impl SubscriptionConfig {
+    /// Construct a validated subscription config, mirroring JE's
+    /// `SubscriptionConfig` constructor + `verifyParameters`.
+    ///
+    /// JE rejects (with `IllegalArgumentException`) a missing subscriber
+    /// name, home, subscriber host/port, feeder host/port, or group name, and
+    /// a node type that is neither `SECONDARY` nor `EXTERNAL`. Noxu surfaces
+    /// these as `RepError::ConfigError`. Noxu has no `EXTERNAL` node type, so
+    /// only `Secondary` is accepted here (see AGENTS.md: node roles are a
+    /// closed enum; `EXTERNAL` is a JE-only external-consumer role).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        subscriber_name: &str,
+        subscriber_home: &str,
+        feeder_host: &str,
+        feeder_port: u16,
+        group_name: &str,
+        group_uuid: Option<String>,
+        node_type: NodeType,
+    ) -> Result<Self> {
+        if subscriber_name.is_empty() {
+            return Err(RepError::ConfigError(
+                "subscriber node name cannot be empty".into(),
+            ));
+        }
+        if subscriber_home.is_empty() {
+            return Err(RepError::ConfigError(
+                "subscription home directory cannot be empty".into(),
+            ));
+        }
+        if feeder_host.is_empty() {
+            return Err(RepError::ConfigError(
+                "feeder host name cannot be empty".into(),
+            ));
+        }
+        if feeder_port == 0 {
+            return Err(RepError::ConfigError(
+                "feeder host port cannot be zero".into(),
+            ));
+        }
+        if group_name.is_empty() {
+            return Err(RepError::ConfigError(
+                "replication group name cannot be empty".into(),
+            ));
+        }
+        // JE: only SECONDARY or EXTERNAL are legal subscription node types.
+        // Noxu has only SECONDARY of that pair.
+        if !node_type.is_secondary() {
+            return Err(RepError::ConfigError(format!(
+                "subscription node type must be SECONDARY, found: {}",
+                node_type
+            )));
+        }
+        Ok(SubscriptionConfig {
+            subscriber_name: subscriber_name.to_string(),
+            group_name: group_name.to_string(),
+            feeder_host: feeder_host.to_string(),
+            feeder_port,
+            subscriber_home: subscriber_home.to_string(),
+            node_type,
+            group_uuid,
+            ..Default::default()
+        })
+    }
+
+    /// Set the stream mode (JE `setStreamMode`).
+    pub fn set_stream_mode(&mut self, mode: EntryRequestType) {
+        self.stream_mode = mode;
+    }
+
+    /// Get the stream mode (JE `getStreamMode`).
+    pub fn get_stream_mode(&self) -> EntryRequestType {
+        self.stream_mode
+    }
 }
 
 /// Callback for receiving replicated entries.
@@ -174,6 +411,24 @@ impl Subscription {
         }
     }
 
+    /// Start the subscription streaming from an explicit VLSN.
+    ///
+    /// Port of JE `Subscription.start(VLSN)`: a NULL start VLSN is rejected
+    /// with `IllegalArgumentException`. In Noxu the VLSN is a `u64` where `0`
+    /// denotes NULL_VLSN (VLSNs are 1-based; `FIRST_VLSN == 1`), so a `0`
+    /// argument is rejected with `RepError::ConfigError`. On a valid VLSN the
+    /// start VLSN is recorded and the connection proceeds exactly as
+    /// [`Subscription::start`].
+    pub fn start_from_vlsn(&self, vlsn: u64) -> Result<()> {
+        if vlsn == 0 {
+            return Err(RepError::ConfigError(
+                "start VLSN cannot be null".into(),
+            ));
+        }
+        *self.current_vlsn.lock() = vlsn;
+        self.start()
+    }
+
     /// Get the live TCP connection to the feeder, if connected.
     ///
     /// Returns a cloned handle to the underlying `TcpStream`. Callers use
@@ -244,6 +499,7 @@ mod tests {
             feeder_host: "127.0.0.1".into(),
             feeder_port: 1, // nothing listening here
             start_vlsn: 0,
+            ..Default::default()
         }
     }
 
@@ -258,6 +514,7 @@ mod tests {
             feeder_host: "127.0.0.1".into(),
             feeder_port: port,
             start_vlsn: 0,
+            ..Default::default()
         };
         (config, listener)
     }
@@ -434,5 +691,419 @@ mod tests {
         assert_eq!(sub.get_state(), SubscriptionState::Shutdown);
         assert!(sub.is_shutdown());
         assert!(sub.get_connection().is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // Ported from je.rep.subscription.EntryRequestTypeTest
+    //
+    // JE's EntryRequestTypeTest spins up a live 1-node replication group,
+    // populates data, optionally forces log cleaning to advance the VLSN
+    // range past 1, then starts a real subscription in each stream mode and
+    // asserts the FIRST VLSN the callback receives equals the mode's expected
+    // resolution of the requested start VLSN against the feeder's VLSN range.
+    // The live multi-thread feeder stream + cleaner are N/A here (Noxu has no
+    // in-process feeder delivery); the PORTABLE, correctness-critical core is
+    // the resolution table itself
+    // (BaseProtocol.EntryRequestType x FeederReplicaSyncup.makeResponseTo
+    // EntryRequest), ported as EntryRequestType::resolve and exercised here
+    // exactly as the JE test's testLow/testInRange/testHigh expectations.
+    // ------------------------------------------------------------------
+
+    use crate::vlsn::VlsnRange;
+
+    /// Build a range with an explicit lastSync (the DEFAULT-above-range
+    /// alternate matchpoint). commit/first/last per JE VLSNRange.
+    fn range(first: u64, last: u64, last_sync: u64) -> VlsnRange {
+        let mut r = VlsnRange::with_range(first, last);
+        // VlsnRange::extend advances last & sync; set sync directly via the
+        // sync setter if present, else rebuild through record_sync.
+        r.update_sync(last_sync);
+        r
+    }
+
+    /// JE: EntryRequestTypeTest.testNoCleaning
+    ///
+    /// Without any cleaning the range starts at FIRST_VLSN (1). For every
+    /// mode, a low (=1), in-range (=mid) and high (=MAX) request must resolve
+    /// per the DEFAULT/AVAILABLE/NOW table, and none of them fails.
+    #[test]
+    fn test_entry_request_no_cleaning() {
+        // Range [1, 100], lastSync = 90 (a sync point below the tail).
+        let r = range(1, 100, 90);
+        let low = 1u64; // FIRST_VLSN
+        let mid = 50u64; // (1 + 100) / 2, in-range
+        let high = u64::MAX; // above range
+
+        for mode in EntryRequestType::values() {
+            // testLow
+            let exp_low = match mode {
+                EntryRequestType::Default => StartResolution::Start(low),
+                EntryRequestType::Available => {
+                    StartResolution::Start(r.get_first())
+                }
+                EntryRequestType::Now => StartResolution::Start(r.get_last()),
+            };
+            assert_eq!(mode.resolve(low, &r), exp_low, "low, mode {:?}", mode);
+
+            // testInRange
+            let exp_mid = match mode {
+                EntryRequestType::Default => StartResolution::Start(mid),
+                EntryRequestType::Available => StartResolution::Start(mid),
+                EntryRequestType::Now => StartResolution::Start(r.get_last()),
+            };
+            assert_eq!(mode.resolve(mid, &r), exp_mid, "mid, mode {:?}", mode);
+
+            // testHigh
+            let exp_high = match mode {
+                // DEFAULT above-range counters with lastSync (alt matchpoint).
+                EntryRequestType::Default => {
+                    StartResolution::AlternateMatchpoint(r.get_last_sync())
+                }
+                EntryRequestType::Available => {
+                    StartResolution::Start(r.get_last())
+                }
+                EntryRequestType::Now => StartResolution::Start(r.get_last()),
+            };
+            assert_eq!(
+                mode.resolve(high, &r),
+                exp_high,
+                "high, mode {:?}",
+                mode
+            );
+        }
+    }
+
+    /// JE: EntryRequestTypeTest.testCleaning
+    ///
+    /// After cleaning, the range's first VLSN has advanced past 1 (here the
+    /// range is [10, 100]). NOW and AVAILABLE succeed for low/in/high. DEFAULT
+    /// succeeds in-range and high (via alt matchpoint) but a below-range (low)
+    /// request FAILS — JE raises InsufficientLogException; Noxu's resolve
+    /// returns NotFound (the EntryNotFound the feeder would send, which the
+    /// subscriber surfaces as insufficient-log).
+    #[test]
+    fn test_entry_request_cleaning() {
+        // Cleaned range: first advanced to 10.
+        let r = range(10, 100, 90);
+        assert!(r.get_first() > 1, "expect log cleaned (first > FIRST_VLSN)");
+
+        let low = 1u64; // below the cleaned range
+        let mid = 55u64; // (10 + 100) / 2
+        let high = u64::MAX;
+
+        // NOW and AVAILABLE always succeed.
+        for mode in [EntryRequestType::Now, EntryRequestType::Available] {
+            let exp_low = match mode {
+                EntryRequestType::Available => {
+                    StartResolution::Start(r.get_first())
+                }
+                _ => StartResolution::Start(r.get_last()), // NOW
+            };
+            assert_eq!(mode.resolve(low, &r), exp_low, "clean low {:?}", mode);
+
+            let exp_mid = match mode {
+                EntryRequestType::Available => StartResolution::Start(mid),
+                _ => StartResolution::Start(r.get_last()),
+            };
+            assert_eq!(mode.resolve(mid, &r), exp_mid, "clean mid {:?}", mode);
+
+            // both clamp above-range to last
+            assert_eq!(
+                mode.resolve(high, &r),
+                StartResolution::Start(r.get_last()),
+                "clean high {:?}",
+                mode
+            );
+        }
+
+        // DEFAULT: in-range and high are good.
+        assert_eq!(
+            EntryRequestType::Default.resolve(mid, &r),
+            StartResolution::Start(mid)
+        );
+        assert_eq!(
+            EntryRequestType::Default.resolve(high, &r),
+            StartResolution::AlternateMatchpoint(r.get_last_sync())
+        );
+        // DEFAULT low: must fail (JE InsufficientLogException == NotFound).
+        assert_eq!(
+            EntryRequestType::Default.resolve(low, &r),
+            StartResolution::NotFound,
+            "DEFAULT below-range must be NotFound (ILE)"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Ported from je.rep.subscription.SubscriptionConfigTest
+    // ------------------------------------------------------------------
+
+    /// JE: SubscriptionConfigTest.testInitialziedParameters
+    ///
+    /// A freshly-built config exposes the subscriber name/home/host/port,
+    /// feeder host/port, group name/UUID, a SECONDARY node type, and a
+    /// DEFAULT stream mode.
+    #[test]
+    fn test_config_initialized_parameters() {
+        let uuid = "cb675927-433a-4ed6-8382-0403e9861619".to_string();
+        let config = SubscriptionConfig::new(
+            "test-subscriber",
+            "./test/subscription/",
+            "localhost",
+            6000,
+            "rg1",
+            Some(uuid.clone()),
+            NodeType::Secondary,
+        )
+        .unwrap();
+
+        assert_eq!(config.subscriber_home, "./test/subscription/");
+        assert_eq!(config.subscriber_name, "test-subscriber");
+        assert_eq!(config.feeder_host, "localhost");
+        assert_eq!(config.feeder_port, 6000);
+        assert_eq!(config.group_name, "rg1");
+        assert_eq!(config.group_uuid.as_deref(), Some(uuid.as_str()));
+        assert_eq!(config.node_type, NodeType::Secondary);
+        assert_eq!(config.get_stream_mode(), EntryRequestType::Default);
+    }
+
+    /// JE: SubscriptionConfigTest.testNodeType
+    ///
+    /// JE allows SECONDARY and EXTERNAL and rejects ARBITER/ELECTABLE/MONITOR
+    /// with IllegalArgumentException. Noxu has no EXTERNAL variant, so only
+    /// SECONDARY is accepted; ELECTABLE/MONITOR/ARBITER are rejected with
+    /// RepError::ConfigError.
+    #[test]
+    fn test_config_node_type() {
+        // SECONDARY is accepted.
+        let ok = SubscriptionConfig::new(
+            "s",
+            "./",
+            "localhost",
+            6000,
+            "rg1",
+            None,
+            NodeType::Secondary,
+        );
+        assert!(ok.is_ok());
+
+        // The non-supported node types are rejected.
+        for bad in [NodeType::Arbiter, NodeType::Electable, NodeType::Monitor] {
+            let r = SubscriptionConfig::new(
+                "s",
+                "./",
+                "localhost",
+                6000,
+                "rg1",
+                None,
+                bad,
+            );
+            assert!(r.is_err(), "node type {:?} must be rejected", bad);
+        }
+    }
+
+    /// JE: SubscriptionConfigTest.testSetParameters
+    ///
+    /// The timeout/interval/queue-size/buffer-size knobs round-trip through
+    /// their setters/getters. Noxu stores them as plain config fields.
+    #[test]
+    fn test_config_set_parameters() {
+        let mut config = SubscriptionConfig::new(
+            "s",
+            "./",
+            "localhost",
+            6000,
+            "rg1",
+            None,
+            NodeType::Secondary,
+        )
+        .unwrap();
+
+        let timeout = 10_000u64;
+        config.channel_timeout_ms = timeout;
+        assert_eq!(config.channel_timeout_ms, timeout);
+        config.pre_heartbeat_timeout_ms = 2 * timeout;
+        assert_eq!(config.pre_heartbeat_timeout_ms, 2 * timeout);
+        config.stream_open_timeout_ms = 3 * timeout;
+        assert_eq!(config.stream_open_timeout_ms, 3 * timeout);
+
+        let interval = 2000u32;
+        config.heartbeat_interval_ms = interval;
+        assert_eq!(config.heartbeat_interval_ms, interval);
+
+        let sz = 10_240u32;
+        config.input_message_queue_size = sz;
+        assert_eq!(config.input_message_queue_size, sz);
+        config.output_message_queue_size = 2 * sz;
+        assert_eq!(config.output_message_queue_size, 2 * sz);
+        config.receive_buffer_size = 3 * sz;
+        assert_eq!(config.receive_buffer_size, 3 * sz);
+    }
+
+    /// JE: SubscriptionConfigTest.testMissingParameters
+    ///
+    /// A config with any missing mandatory parameter (subscriber name, home,
+    /// subscriber host/port, feeder host/port, or group name) is rejected. JE
+    /// throws IllegalArgumentException; Noxu returns RepError::ConfigError.
+    /// (JE's subscriber-host-port and feeder-host-port are one string in Noxu
+    /// modeled as host + numeric port; a missing host or a zero port stand in
+    /// for the null host/port pair.)
+    #[test]
+    fn test_config_missing_parameters() {
+        // Missing subscriber node name.
+        assert!(
+            SubscriptionConfig::new(
+                "",
+                "./",
+                "localhost",
+                6000,
+                "rg1",
+                None,
+                NodeType::Secondary
+            )
+            .is_err()
+        );
+        // Missing home.
+        assert!(
+            SubscriptionConfig::new(
+                "s",
+                "",
+                "localhost",
+                6000,
+                "rg1",
+                None,
+                NodeType::Secondary
+            )
+            .is_err()
+        );
+        // Missing feeder host.
+        assert!(
+            SubscriptionConfig::new(
+                "s",
+                "./",
+                "",
+                6000,
+                "rg1",
+                None,
+                NodeType::Secondary
+            )
+            .is_err()
+        );
+        // Missing feeder port (0 == null port pair).
+        assert!(
+            SubscriptionConfig::new(
+                "s",
+                "./",
+                "localhost",
+                0,
+                "rg1",
+                None,
+                NodeType::Secondary
+            )
+            .is_err()
+        );
+        // Missing group name.
+        assert!(
+            SubscriptionConfig::new(
+                "s",
+                "./",
+                "localhost",
+                6000,
+                "",
+                None,
+                NodeType::Secondary
+            )
+            .is_err()
+        );
+        // The all-present control must succeed (guards vacuity).
+        assert!(
+            SubscriptionConfig::new(
+                "s",
+                "./",
+                "localhost",
+                6000,
+                "rg1",
+                None,
+                NodeType::Secondary
+            )
+            .is_ok()
+        );
+    }
+
+    /// JE: SubscriptionConfigTest.testStreamMode
+    ///
+    /// Every EntryRequestType round-trips through set/get on the config.
+    #[test]
+    fn test_config_stream_mode() {
+        let mut config = SubscriptionConfig::new(
+            "s",
+            "./",
+            "localhost",
+            6000,
+            "rg1",
+            None,
+            NodeType::Secondary,
+        )
+        .unwrap();
+        for mode in EntryRequestType::values() {
+            config.set_stream_mode(mode);
+            assert_eq!(config.get_stream_mode(), mode);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Ported from je.rep.subscription.SubscriptionTest
+    // ------------------------------------------------------------------
+
+    /// JE: SubscriptionTest.testInvalidStartVLSN
+    ///
+    /// Starting a subscription from a NULL start VLSN is rejected. JE throws
+    /// IllegalArgumentException from Subscription.start(VLSN); Noxu's
+    /// start_from_vlsn(0) (0 == NULL_VLSN in the u64 encoding) returns
+    /// RepError::ConfigError and does NOT connect.
+    #[test]
+    fn test_subscription_invalid_start_vlsn() {
+        let sub = Subscription::new(test_config_no_connect());
+        let r = sub.start_from_vlsn(0);
+        assert!(r.is_err(), "null start VLSN must be rejected");
+        // Must not have transitioned out of Idle (no connect attempted).
+        assert_eq!(sub.get_state(), SubscriptionState::Idle);
+    }
+
+    /// JE: SubscriptionTest.testSubscriptionFromVLSN (VLSN-positioning half)
+    ///
+    /// JE subscribes from an explicit start VLSN and asserts the first VLSN
+    /// the callback receives, and the subscription statistics' startVLSN, both
+    /// equal the requested VLSN. Noxu has no live feeder delivery, so the
+    /// portable half is that start_from_vlsn(v) records v as the current
+    /// (start) VLSN before/through connection. The live-stream first-VLSN
+    /// assertion is N/A (multi-JVM feeder).
+    #[test]
+    fn test_subscription_from_vlsn_positioning() {
+        let (config, _listener) = test_config_with_listener();
+        let sub = Subscription::new(config);
+        let start = 100u64;
+        sub.start_from_vlsn(start).unwrap();
+        // The recorded start position is the requested VLSN.
+        assert_eq!(sub.get_current_vlsn(), start);
+        assert_eq!(sub.get_state(), SubscriptionState::Active);
+    }
+
+    /// JE: SubscriptionTest.testSubscriptionUnavailableVLSN
+    ///
+    /// If the requested start VLSN has been cleaned and is below the feeder's
+    /// range, subscription fails (JE InsufficientLogException in sync-up).
+    /// Noxu models the feeder-side decision as EntryRequestType::Default
+    /// resolving a below-range VLSN to NotFound (the EntryNotFound the feeder
+    /// returns, surfaced as insufficient-log). The live sync-up is N/A; the
+    /// resolution that drives the failure is the portable core.
+    #[test]
+    fn test_subscription_unavailable_vlsn() {
+        // Range advanced past zero (cleaned): [50, 200].
+        let r = range(50, 200, 180);
+        // A start at VLSN 1 (below range) in DEFAULT mode is not serviceable.
+        assert_eq!(
+            EntryRequestType::Default.resolve(1, &r),
+            StartResolution::NotFound
+        );
     }
 }

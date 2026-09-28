@@ -49,6 +49,14 @@ impl NodeType {
     pub fn can_be_master(&self) -> bool {
         matches!(self, NodeType::Electable)
     }
+
+    /// Returns `true` if this is a secondary node (JE `NodeType.isSecondary`).
+    ///
+    /// Subscription config accepts only secondary (JE also permits its
+    /// `EXTERNAL` type, which Noxu does not model).
+    pub fn is_secondary(&self) -> bool {
+        matches!(self, NodeType::Secondary)
+    }
 }
 
 impl std::fmt::Display for NodeType {
