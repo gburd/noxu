@@ -879,6 +879,25 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // JE: PackedIntegerTest.runTest (com/sleepycat/util/test/PackedIntegerTest)
+    //
+    // Faithful port of JE's testIntRange / testLongRange helpers. For each
+    // size tier JE writes every value in a boundary range, asserts the encoded
+    // length equals the expected byte count, asserts getWriteIntLength /
+    // getWriteLongLength agrees, then reads each value back asserting the
+    // read length (getReadIntLength/getReadLongLength) and the decoded value.
+    // The test_je_int_range_tierN / test_je_long_range_tierN cases below cover
+    // the SAME value ranges (V119, MAX_1..MAX_7, Integer/Long MIN/MAX +/- 99).
+    // check_i32_range / check_i64_range assert: written length == expected,
+    // size() == expected, and read-back round-trips (read length is verified
+    // via cursor-position delta, equivalent to JE's getRead*Length check).
+    //
+    // N/A (JE-only): PackedInteger.writeReverseInt / readReverseInt (JE's
+    // testReverseIntRange, inside the `<!-- begin/end JE only -->` markers).
+    // Reverse-packed encoding is a JE-internal representation not present in
+    // noxu-util (the packed format is the compact LSN/VLSN encoding; sorted
+    // encoding is the order-preserving one). No Noxu code path uses it.
+    //
     // Per-tier range tests: for each size tier, verify:
     //   1. write_packed produces exactly `expected_bytes` bytes for every value
     //      in the range.
