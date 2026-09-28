@@ -38,6 +38,8 @@ listed in [References](#references).
 
 ### Fixed
 
+
+- **Data loss on abort of an update to a non-resident record** (`NEW-EVOLVE-ABORT-ROLLBACK`): when a record's leaf node (LN) had been stripped from the cache by the evictor (or was freshly materialized after reopen — valid on-disk LSN but no resident bytes), the abort-undo *before-image* was captured empty, so aborting a transaction that had updated such a record durably overwrote the original with a 0-byte value. The before-image now re-fetches the LN from the log when the resident bytes are absent (matching the read path, JE `IN.fetchTarget`), guarded so a genuinely-empty stored value is never mis-restored. Surfaced via an aborted DPL schema evolution that panicked a later read with "record too short … 0 bytes."
 - **Disk-limit recovery treadmill + inert `TREE_MAX_EMBEDDED_LN`
   (REG-CLEANER-DISKLIMIT), fixed together as a bounded on-disk-format change.**
   Found by the external JE-fidelity audit; reproduced on a release build and
