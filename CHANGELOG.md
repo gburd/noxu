@@ -283,6 +283,12 @@ listed in [References](#references).
   non-electable, empty, and non-member targets up-front and treats a self-target as
   an immediate success (matching JE `RepNode.transferMaster`). Found by a faithful
   port of JE's `MasterTransferTest`.
+- **Arbiter acks now count toward the two-node (RF=2) write quorum (BUG-ARB-01).**
+  When the data replica was down, leaving a master and an arbiter, commits succeeded
+  with zero durable witnesses — an acknowledged transaction could be lost on a master
+  crash. The arbiter's ack now satisfies a `SIMPLE_MAJORITY` durability quorum at RF=2
+  (never `ALL`, which still requires the data replica), matching JE. Found by a
+  faithful port of JE's `ArbiterTest.testReplicaDown`.
 - **Two-node (RF=2) elections no longer elect a node that lags the arbiter
   (NEW-ELECT-ARBITER-VETO, `[#25311]`).** When the sole surviving electable node
   lagged the arbiter's durable VLSN, the election could make it master below the
