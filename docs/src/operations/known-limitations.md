@@ -239,6 +239,21 @@ what won't be done and why.
   `LDiffServiceTest`, `LDiffTest`, `WindowTest`, and the ldiff `ProtocolTest`,
   plus two empty JUnit placeholders) is **N/A by design**.
 
+- **DBFILTERSTATS — offline stats-CSV projection / filter CLI
+  (`je.util.dbfilterstats`):** Noxu captures periodic environment statistics to
+  a rotating CSV log (`noxu.stat.<N>.csv`, header `time_ms,...`; see
+  `noxu-db/src/stats_file.rs`, exercised by `stats_file_test.rs`), but it does
+  **not** ship a JE-style `DbFilterStats` offline tool that reads those CSVs and
+  projects / filters a subset of columns via `-p "<cols>"` / `-f <file>`
+  (JE's `Splitter` tokenizer, `StatFile.sumItUp` column summing, prefix column
+  matching). `noxu_admin` offers only `dump` / `load` / `print-log` — no
+  `filter-stats` subcommand. Richer consumption of statistics is instead handled
+  by the observability layer (`noxu-observe`, optional `tracing` / `metrics` /
+  OpenTelemetry export). The six `DbFilterStatsTest` `@Test` methods all invoke
+  the projection CLI (`new DbFilterStats().execute(args)`) and assert projected
+  column counts / ordering / value-preservation, so they exercise a tool Noxu
+  genuinely lacks and are therefore **N/A by design**.
+
 - **NEW-DPL-REP-COMPOSITION — DPL entity persistence on a replicated node:**
   The Direct Persistence Layer (`noxu-persist`) cannot currently be used on a
   replicated node. JE routinely opens an `EntityStore` on a
