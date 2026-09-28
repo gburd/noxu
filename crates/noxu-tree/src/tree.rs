@@ -14992,9 +14992,36 @@ mod tests {
     }
 
     // ========================================================================
-    // Tests: INCompressorTest / EmptyBINTest ports
-    //   INCompressorTest (compress_bin semantics, prefix recompute, live-slot preservation)
-    //   EmptyBINTest     (empty-BIN scan, all-deleted compress, search returns NotFound)
+    // Tests: INCompressorTest / EmptyBINTest ports (unit level, against
+    // compress_bin / compress_bin_with_lock_check / prune_empty_bin /
+    // maybe_compress_bin_and_parent). The public-API integration ports live in
+    // crates/noxu-db/tests/je_incomp_test.rs.
+    //
+    // JE method -> citing unit test (the known_deleted-tombstone reclamation
+    // path that env.compress()/the noxu-in-compressor daemon actually drive;
+    // an ordinary committed delete in Noxu removes the slot physically and
+    // leaves no tombstone, so these unit tests construct the KD slots directly
+    // -- the deviation is documented in je_incomp_test.rs and tp-je-incomp.md):
+    //   INCompressorTest.testRemoveEmptyBIN / testLazyPruning
+    //       -> test_incompressor_empty_bin_pruned_from_parent (KD BIN pruned)
+    //   INCompressorTest.testDeleteTransactional / testDeleteNonTransactional
+    //       -> test_incompressor_live_slots_preserved_after_compress
+    //          (live slots kept, defunct slot removed)
+    //   INCompressorTest.testDeleteTransactionalWithBinDeltas et al.
+    //       -> test_incompressor_maybe_compress_skips_bin_delta
+    //          (isBINDelta short-circuit)
+    //   INCompressorTest.testNodeNotEmpty (re-insert cancels the prune)
+    //       -> test_incompressor_node_not_empty_prevents_prune,
+    //          test_ic1_prune_empty_bin_aborts_when_repopulated
+    //   INCompressorTest cursor-blocks-compression / lock re-check
+    //       -> test_ic1_prune_empty_bin_aborts_with_cursor,
+    //          test_ic3_compress_skips_write_locked_slot
+    //   INCompressorTest defunct-slot (KD + pending) reclamation
+    //       -> test_incompressor_known_and_pending_deleted_removed
+    //   EmptyBINTest.testScan* (search/scan correct across an empty BIN)
+    //       -> test_emptybin_search_after_all_deleted_returns_not_found,
+    //          test_emptybin_forward_scan_skips_empty_bin (public-API scan
+    //          variants ported in je_incomp_test.rs::empty_bin_scan_*)
     // ========================================================================
 
     ///
