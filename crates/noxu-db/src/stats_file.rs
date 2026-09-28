@@ -266,6 +266,20 @@ mod tests {
         );
     }
 
+    /// JE: StatLoggerTest.testBasic (shared rotation behavior)
+    ///
+    /// JE's `StatLogger` rotates the active `.stat` file once it reaches
+    /// `rowcount` rows and retains at most `filecount` files (pruning the
+    /// oldest).  Noxu's `RotatingWriter` implements the same rotate-on-
+    /// row-count + bounded-file-set behavior; this asserts the shared intent.
+    ///
+    /// Intentional deviation from `StatLogger`'s exact algorithm: JE rotates
+    /// by renaming `filename.[n].ext` (the active file is always the
+    /// unnumbered `filename.ext`) and re-rotates whenever `setHeader` sees a
+    /// changed header; Noxu instead advances a monotonically increasing file
+    /// index and opens a fresh file (`noxu.stat.<n>.csv`) per rotation, with a
+    /// fixed CSV header written per file.  The `setHeader`-triggered rotation
+    /// and rename scheme are not modelled (Noxu writes a fixed schema).
     #[test]
     fn rotates_after_row_count_and_prunes() {
         let tmp = TempDir::new().unwrap();
@@ -294,6 +308,15 @@ mod tests {
         );
     }
 
+    /// JE: StatLoggerTest.testBasic / testDelta (reboot-preserves-history
+    /// half).  JE re-opens the existing active `.stat` file on restart and
+    /// continues counting rows into it (its `getLastRow` seeds
+    /// `currentRowCount`); Noxu preserves the same *intent* — a restart must
+    /// not clobber prior stats history — via a different mechanism: it seeds
+    /// the file index past the highest existing file so new rows go to a fresh
+    /// file rather than appending to the previous active one.  The
+    /// append-to-existing-file-across-restart mechanism itself is an
+    /// intentional design deviation.
     #[test]
     fn seed_next_index_resumes_past_existing() {
         let tmp = TempDir::new().unwrap();
