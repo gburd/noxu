@@ -283,4 +283,47 @@ mod tests {
         assert_eq!(catalog_db_name("foo"), "__noxu_persist_catalog__foo");
         assert_ne!(catalog_db_name("foo"), "foo_User");
     }
+
+    // JE: CatalogCornerCaseTest.testReadOnlyEmptyCatalog
+    //
+    // JE opens a StoredClassCatalog on a read-only, empty database and
+    // expects the constructor to throw: a class catalog needs to write its
+    // initial "next class ID" bookkeeping record, which cannot happen on a
+    // read-only store.  JE's catalog is Java-Object-Serialization-specific
+    // (it stores `ObjectStreamClass` descriptors so serialized object graphs
+    // don't repeat class metadata); Noxu has no such catalog because the
+    // serde binding carries the type as a generic parameter (see
+    // noxu-bind/tests/tck_serial_binding.rs header).  What *is* portable is
+    // the corner-case PURPOSE: a read-only catalog with no on-disk backing
+    // cannot be written.  Noxu surfaces this as a typed error on the write
+    // path rather than an exception at open time (Result vs. exception is an
+    // allowed language-idiom deviation): opening a read-only catalog for a
+    // store that has no catalog database yields an empty shim, and any `put`
+    // through it is rejected.  This is the de-vacuumed equivalent of JE's
+    // "you can't initialize a class catalog you can't write to".
+    #[test]
+    fn read_only_empty_catalog_rejects_writes() {
+        let (_td, env) = temp_env();
+
+        // No catalog database was ever created for this store, and we open
+        // it read-only: the analogue of JE's read-only empty catalog DB.
+        let cat = ClassCatalog::open(&env, "never_created", false, true, false)
+            .unwrap();
+        // Read-only-absent surfaces as an empty in-memory shim ...
+        assert!(cat.db.is_none());
+        // ... reads see nothing ...
+        assert!(cat.get(None, "User").unwrap().is_none());
+        // ... and, crucially (the JE assertion), writes are refused because
+        // the catalog cannot be initialized on a read-only/absent store.
+        let err = cat.put(None, "User", 1).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                PersistError::DatabaseError(
+                    noxu_db::NoxuError::OperationNotAllowed(_)
+                )
+            ),
+            "expected write rejection on read-only empty catalog, got: {err:?}"
+        );
+    }
 }
