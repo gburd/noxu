@@ -102,9 +102,96 @@ impl RepGroup {
     }
 
     /// Returns the number of electable nodes in the group.
+    ///
+    /// This counts ELECTABLE and ARBITER nodes (JE
+    /// `RepGroupImpl.getElectableGroupSize()`, `ELECTABLE_PREDICATE =
+    /// isElectable()`), which is the set that participates in *elections*.
+    /// For the *durability* ack group, use
+    /// [`ack_group_size`](Self::ack_group_size).
     pub fn electable_count(&self) -> u32 {
         self.nodes.values().filter(|n| n.node_type().is_electable()).count()
             as u32
+    }
+
+    /// Returns the number of data (ELECTABLE, non-ARBITER) nodes in the group.
+    ///
+    /// This is JE `RepGroupImpl.getAckGroupSize()`'s base predicate
+    /// (`ACK_PREDICATE = isElectable() && !isArbiter()`): the set of nodes
+    /// that hold a copy of the data and can therefore acknowledge a commit as
+    /// a full data witness. Arbiters are excluded here — they hold no data.
+    pub fn data_node_count(&self) -> u32 {
+        self.nodes
+            .values()
+            .filter(|n| {
+                n.node_type().is_electable() && !n.node_type().is_arbiter()
+            })
+            .count() as u32
+    }
+
+    /// Returns the number of ARBITER nodes registered in the group.
+    pub fn arbiter_count(&self) -> u32 {
+        self.nodes.values().filter(|n| n.node_type().is_arbiter()).count()
+            as u32
+    }
+
+    /// Returns the durability *ack group size* — the group size the master
+    /// uses to derive the required acknowledgment count for a commit
+    /// (JE `RepGroupImpl.getAckGroupSize()` +
+    /// `DurabilityQuorum.getCurrentRequiredAckCount`).
+    ///
+    /// JE's `getAckGroupSize()` is the count of ELECTABLE data nodes
+    /// (arbiters excluded). In JE, when a data replica is down it *stays a
+    /// registered group member*, so a replication-factor-2 (RF=2) group keeps
+    /// `getAckGroupSize() == 2` and thus a required ack count of
+    /// `minAckNodes(2) - 1 == 1` even while the replica is offline. The
+    /// arbiter is what lets that one required ack still be *obtained* under
+    /// `SIMPLE_MAJORITY` (JE `RepImpl.useArbiter` — gated on
+    /// `getAckGroupSize() == 2`).
+    ///
+    /// Noxu models a down data replica as *absent from the group view* rather
+    /// than a registered-but-inactive member. To reproduce JE's RF=2 group
+    /// size in that model, a present arbiter is counted as occupying the RF=2
+    /// data slot the down replica would otherwise fill — but only up to the
+    /// RF=2 boundary (`data_node_count() < 2`). This keeps the ack group size
+    /// identical to JE for every real composition:
+    ///
+    /// | Members | data | arb | ack_group_size | JE getAckGroupSize |
+    /// |---|---|---|---|---|
+    /// | {master}                | 1 | 0 | 1 | 1 |
+    /// | {master, replica}       | 2 | 0 | 2 | 2 |
+    /// | {master, arbiter}       | 1 | 1 | 2 | 2 (replica registered-down) |
+    /// | {master, replica, arb}  | 2 | 1 | 2 | 2 (arbiter never inflates) |
+    ///
+    /// The cap (`data < 2`) guarantees an arbiter never inflates the ack
+    /// group beyond the RF=2 that JE permits it in (JE `useArbiter` requires
+    /// `getAckGroupSize() == 2`), so a 3-data-node group with an arbiter
+    /// keeps `getAckGroupSize()` = 3 — the arbiter adds nothing there.
+    pub fn ack_group_size(&self) -> u32 {
+        let data = self.data_node_count();
+        if self.arbiter_count() > 0 && data < 2 {
+            // The arbiter fills the RF=2 second (data) slot for group-size
+            // purposes (JE keeps the down replica registered => size 2).
+            data + 1
+        } else {
+            data
+        }
+    }
+
+    /// Returns the number of remote acknowledgments the master must obtain to
+    /// satisfy `policy` for this group (JE
+    /// `DurabilityQuorum.getCurrentRequiredAckCount`:
+    /// `ackPolicy.minAckNodes(getAckGroupSize()) - 1`).
+    ///
+    /// The group size ([`ack_group_size`](Self::ack_group_size)) is
+    /// policy-independent, exactly as in JE — the *number* of acks required
+    /// under `SIMPLE_MAJORITY` and `ALL` is identical for an RF=2 group
+    /// (`minAckNodes(2) - 1 == 1`). What differs between the policies is
+    /// *which* nodes may supply that ack: under `SIMPLE_MAJORITY` an arbiter
+    /// ack qualifies (JE `useArbiter`), under `ALL` only a data replica does.
+    /// That distinction is enforced on the satisfaction side (the master's
+    /// ack-feeder counting), not here — this method returns only the count.
+    pub fn required_acks(&self, policy: crate::ReplicaAckPolicy) -> u32 {
+        policy.required_acks(self.ack_group_size())
     }
 
     /// Returns the Phase 1 (Prepare/Promise) quorum size under the current policy.
@@ -302,6 +389,69 @@ mod tests {
 
         group.add_node(make_arbiter("a1", 4));
         assert_eq!(group.electable_count(), 3);
+    }
+
+    /// BUG-ARB-01: the durability ack-group size (JE `getAckGroupSize` +
+    /// arbiter accounting) is JE-exact for every composition. Here the master
+    /// is an explicit ELECTABLE member of the group.
+    #[test]
+    fn test_ack_group_size_je_exact() {
+        use crate::ReplicaAckPolicy::{All, SimpleMajority};
+
+        // {master}: 1 data, no arbiter -> size 1, req 0 for both policies.
+        let mut g = RepGroup::new("g".into(), 1);
+        g.add_node(make_electable("master", 1));
+        assert_eq!(g.data_node_count(), 1);
+        assert_eq!(g.arbiter_count(), 0);
+        assert_eq!(g.ack_group_size(), 1);
+        assert_eq!(g.required_acks(SimpleMajority), 0);
+        assert_eq!(g.required_acks(All), 0);
+
+        // {master, replica}: 2 data -> size 2, req 1 for both.
+        let mut g = RepGroup::new("g".into(), 1);
+        g.add_node(make_electable("master", 1));
+        g.add_node(make_electable("replica", 2));
+        assert_eq!(g.ack_group_size(), 2);
+        assert_eq!(g.required_acks(SimpleMajority), 1);
+        assert_eq!(g.required_acks(All), 1);
+
+        // {master, arbiter}: 1 data + arbiter fills RF=2 slot -> size 2,
+        // req 1 for BOTH policies (the arbiter reconstitutes JE's registered
+        // down-replica group size). The SM/ALL *difference* is on the ack
+        // satisfaction side, not the required count.
+        let mut g = RepGroup::new("g".into(), 1);
+        g.add_node(make_electable("master", 1));
+        g.add_node(make_arbiter("arb", 2));
+        assert_eq!(g.data_node_count(), 1);
+        assert_eq!(g.arbiter_count(), 1);
+        assert_eq!(g.ack_group_size(), 2);
+        assert_eq!(g.required_acks(SimpleMajority), 1);
+        assert_eq!(g.required_acks(All), 1);
+
+        // {master, replica, arbiter}: 2 data -> arbiter must NOT inflate the
+        // group (JE `getAckGroupSize` == 2; useArbiter caps at 2). size 2.
+        let mut g = RepGroup::new("g".into(), 1);
+        g.add_node(make_electable("master", 1));
+        g.add_node(make_electable("replica", 2));
+        g.add_node(make_arbiter("arb", 3));
+        assert_eq!(g.data_node_count(), 2);
+        assert_eq!(g.arbiter_count(), 1);
+        assert_eq!(
+            g.ack_group_size(),
+            2,
+            "arbiter never inflates a 2-data-replica group past RF=2"
+        );
+        assert_eq!(g.required_acks(SimpleMajority), 1);
+        assert_eq!(g.required_acks(All), 1);
+
+        // {master, r1, r2}: 3 data, no arbiter -> size 3.
+        let mut g = RepGroup::new("g".into(), 1);
+        g.add_node(make_electable("master", 1));
+        g.add_node(make_electable("r1", 2));
+        g.add_node(make_electable("r2", 3));
+        assert_eq!(g.ack_group_size(), 3);
+        assert_eq!(g.required_acks(SimpleMajority), 1); // minAckNodes(3)-1
+        assert_eq!(g.required_acks(All), 2); // all 2 remote data replicas
     }
 
     #[test]

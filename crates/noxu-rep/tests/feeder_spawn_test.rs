@@ -72,7 +72,7 @@ fn add_peer_while_master_dispatches_feeder() {
 }
 
 #[test]
-fn add_peer_arbiter_is_not_fed() {
+fn add_peer_arbiter_gets_ack_tracker_but_is_not_fed() {
     let env = ReplicatedEnvironment::new(master_config("master_arb")).unwrap();
     env.become_master(1).unwrap();
 
@@ -85,8 +85,25 @@ fn add_peer_arbiter_is_not_fed() {
     ))
     .unwrap();
 
-    // Arbiters do not receive log entries, so no feeder should be dispatched.
-    assert_eq!(env.feeder_replica_names().len(), 0);
+    // BUG-ARB-01: an arbiter now gets a `Feeder` *ack tracker* so its ack can
+    // be counted toward the RF=2 SIMPLE_MAJORITY quorum (JE `FeederManager`
+    // tracks the arbiter feeder; the arbiter acks commit VLSNs it does not
+    // store). The tracker is present ...
+    assert_eq!(
+        env.feeder_replica_names(),
+        vec!["arbiter1".to_string()],
+        "arbiter must have a Feeder tracker for ack accounting (BUG-ARB-01)"
+    );
+
+    // ... but the arbiter is still NEVER fed *log entries* (it holds no
+    // data): no streaming FeederRunner is spawned for it. No channel was
+    // registered, so no runner exists and its runner-acked VLSN is 0 (the
+    // "no active runner" sentinel) — the arbiter tracker is ack-only.
+    assert_eq!(
+        env.active_feeder_runner_acked_vlsn("arbiter1"),
+        0,
+        "arbiter must not have a streaming FeederRunner (receives no log data)"
+    );
     env.close().unwrap();
 }
 
