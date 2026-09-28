@@ -220,3 +220,74 @@ fn tck_config_custom_int_param_bounds_enforced_directly() {
         Err(ConfigError::TypeMismatch { expected: ParamType::Int, .. }),
     ));
 }
+
+// ---------------------------------------------------------------------------
+// JE: EnvironmentParamsTest.testValidation -- `longParam` bounds
+//
+// JE's testValidation builds *both* an IntConfigParam and a LongConfigParam
+// (`longParam = LongConfigParam("param.long", 2, 10, 5, false, false)`) and
+// runs the same reject-"1"/reject-"11" checks against each.  The Int mirror
+// lives above (`tck_config_custom_int_param_bounds_enforced_directly`); this
+// is the Long mirror, faithful to JE's `longParam` set-up.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tck_config_custom_long_param_bounds_enforced_directly() {
+    // JE: LongConfigParam("param.long", 2, 10, 5, false, false)
+    let p = ConfigParam::long_param(
+        "noxu.test.tck.long",
+        Some(2),
+        Some(10),
+        5,
+        /* mutable */ false,
+        /* for_replication */ false,
+    );
+
+    // In-range values pass (min, default, max).
+    assert!(p.validate(&ParamValue::Long(2)).is_ok());
+    assert!(p.validate(&ParamValue::Long(5)).is_ok());
+    assert!(p.validate(&ParamValue::Long(10)).is_ok());
+
+    // JE checkValidateParam(longParam, "1") and "11": both out of range.
+    assert!(matches!(
+        p.validate(&ParamValue::Long(1)),
+        Err(ConfigError::OutOfRange { .. }),
+    ));
+    assert!(matches!(
+        p.validate(&ParamValue::Long(11)),
+        Err(ConfigError::OutOfRange { .. }),
+    ));
+
+    // Wrong type fails with TypeMismatch (mirrors JE NumberFormatException
+    // path in LongConfigParam.validateValue).
+    assert!(matches!(
+        p.validate(&ParamValue::Bool(true)),
+        Err(ConfigError::TypeMismatch { expected: ParamType::Long, .. }),
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// JE: EnvironmentParamsTest.testValidation -- N/A sub-behaviours
+//
+// JE's testValidation also asserts two things that are GENUINE
+// language/design deviations in noxu, not portable behaviour:
+//
+//   1. `mvParam.isMultiValueParam()` is true for a ".#"-suffixed name.
+//      noxu-config has NO multi-value-parameter concept: parameters are
+//      const-constructed `&'static str` entries in a fixed `params.rs`
+//      registry, not runtime-registered names whose ".#" suffix is stripped
+//      and flagged.  There is no `isMultiValueParam` on `ConfigParam`.
+//      => N/A: JE-internal ConfigParam class-shape (multi-value naming).
+//
+//   2. `new ConfigParam(null, ...)` throws (null / 0-length name rejected via
+//      `validateName`).  In noxu `ConfigParam.name: &'static str` is
+//      non-nullable at the type level -- a null name is UNREPRESENTABLE, so
+//      the guard cannot exist and cannot be exercised by a test.  This is the
+//      Rust `&'static str` vs Java nullable `String` deviation.
+//      => N/A: language/type-system deviation (name is non-nullable).
+//
+// The portable core of testValidation -- min/max bounds enforcement for Int
+// and Long params -- IS ported (the two `..._bounds_enforced_directly`
+// tests). This comment records the deliberately-omitted sub-behaviours so the
+// omission is auditable rather than silent.
+// ---------------------------------------------------------------------------
