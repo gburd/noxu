@@ -33,6 +33,7 @@ fn ikey(i: u32) -> DatabaseEntry {
 
 // ──────────────────────────────────────────────────────────────────────────────
 // DatabaseTest.testPutExisting
+// JE: DatabaseTest.testPutExisting
 //
 // JE invariant: `Put.OVERWRITE` on a non-existent key inserts (not an update);
 // repeated on the same (key,data) is an update; SearchBoth then returns the
@@ -73,6 +74,7 @@ fn database_put_existing_overwrite_round_trip() {
 
 // ──────────────────────────────────────────────────────────────────────────────
 // DatabaseTest.testZeroLengthData (spirit port)
+// JE: DatabaseTest.testZeroLengthData
 //
 // JE invariant: zero-length data round-trips correctly through put/get and
 // across env close/reopen (recovery).  We don't check the JE-internal
@@ -130,6 +132,7 @@ fn database_zero_length_data_round_trip_with_recovery() {
 
 // ──────────────────────────────────────────────────────────────────────────────
 // DatabaseTest.testDeleteNonDup
+// JE: DatabaseTest.testDeleteNonDup
 //
 // JE invariant: on a non-dup db, `delete` removes the record; a subsequent
 // `get` returns NotFound; a subsequent `delete` returns NotFound.
@@ -161,6 +164,7 @@ fn database_delete_non_dup() {
 
 // ──────────────────────────────────────────────────────────────────────────────
 // DatabaseTest.testDeleteDup
+// JE: DatabaseTest.testDeleteDup
 //
 // JE invariant: on a sorted-dup db, `delete` removes ALL dups under the key;
 // subsequent `get` returns NotFound; subsequent `delete` returns NotFound.
@@ -196,6 +200,7 @@ fn database_delete_with_dups_removes_all() {
 
 // ──────────────────────────────────────────────────────────────────────────────
 // DatabaseTest.testDeleteAbort
+// JE: DatabaseTest.testDeleteAbort
 //
 // JE invariant: a delete that is aborted does not remove the record.  We
 // verify that the record is still readable (by another no-wait txn after
@@ -234,6 +239,7 @@ fn database_delete_abort_restores_record() {
 
 // ──────────────────────────────────────────────────────────────────────────────
 // DatabaseTest.testPutDuplicate
+// JE: DatabaseTest.testPutDuplicate
 //
 // JE invariant: repeated `put` under the same key on a sorted-dup db creates
 // distinct dups; `count()` reflects the total number of physical records
@@ -264,6 +270,7 @@ fn database_put_duplicate_creates_distinct_dups() {
 
 // ──────────────────────────────────────────────────────────────────────────────
 // DatabaseTest.testPutNoDupData
+// JE: DatabaseTest.testPutNoDupData
 //
 // JE invariant: on a sorted-dup db, `Put::NoDupData` (cursor-only in Noxu)
 // inserts only when the exact (key,data) pair does not yet exist; a repeat
@@ -294,6 +301,7 @@ fn database_put_no_dup_data_rejects_exact_pair() {
 
 // ──────────────────────────────────────────────────────────────────────────────
 // DatabaseTest.testPutNoOverwriteInANoDupDb
+// JE: DatabaseTest.testPutNoOverwriteInANoDupDb
 //
 // JE invariant: on a non-dup db, `putNoOverwrite` succeeds the first time and
 // returns KeyExists on a repeat with the same key (regardless of data).
@@ -318,6 +326,7 @@ fn database_put_no_overwrite_no_dups() {
 
 // ──────────────────────────────────────────────────────────────────────────────
 // DatabaseTest.testDatabaseCount
+// JE: DatabaseTest.testDatabaseCount / testDeferredWriteDatabaseCount
 //
 // JE invariant: after inserting N records, db.count() == N.
 // ──────────────────────────────────────────────────────────────────────────────
@@ -338,6 +347,7 @@ fn database_count_returns_record_count() {
 
 // ──────────────────────────────────────────────────────────────────────────────
 // DatabaseConfigTest.testConfig (wave 9-C)
+// JE: DatabaseConfigTest.testConfig
 //
 // JE invariant: a Database keeps its own copy of the configuration; the
 // `getConfig()` accessor returns a snapshot, not the original object.
@@ -382,6 +392,7 @@ fn database_config_snapshot_after_open() {
 
 // ──────────────────────────────────────────────────────────────────────────────
 // DatabaseConfigTest.testIsTransactional (wave 9-C)
+// JE: DatabaseConfigTest.testIsTransactional
 //
 // JE invariant: a database opened with transactional=true reports
 // transactional=true; both implicit auto-commit (txn=null) and explicit
@@ -435,6 +446,7 @@ fn database_config_is_transactional() {
 
 // ──────────────────────────────────────────────────────────────────────────────
 // DatabaseConfigTest.testOpenReadOnly (wave 9-C, partial)
+// JE: DatabaseConfigTest.testOpenReadOnly
 //
 // JE invariant: opening a database with `read_only=true` rejects any
 // write attempt (put or cursor.delete) with UnsupportedOperationException;
@@ -560,6 +572,7 @@ fn multi_env_open_close_test_multi_open_close() {
 
 // ──────────────────────────────────────────────────────────────────────────────
 // DatabaseTest.testCursor
+// JE: DatabaseTest.testCursor
 //
 // JE invariant: opening a transactional cursor on a non-transactional
 // database must fail (IllegalArgumentException in JE).  The non-txnal db
@@ -597,6 +610,7 @@ fn database_txn_cursor_on_non_txn_db_rejected() {
 
 // ──────────────────────────────────────────────────────────────────────────────
 // DatabaseTest.testPutNoOverwriteInADupDbTxn
+// JE: DatabaseTest.testPutNoOverwriteInADupDbTxn
 //
 // JE invariant (sorted-dups, transactional): putNoOverwrite on a fresh key
 // returns SUCCESS, a second putNoOverwrite of the same (key, data) returns
@@ -636,6 +650,7 @@ fn database_put_no_overwrite_in_dup_db_txn() {
 
 // ──────────────────────────────────────────────────────────────────────────────
 // DatabaseTest.testPutNoOverwriteInADupDbNoTxn
+// JE: DatabaseTest.testPutNoOverwriteInADupDbNoTxn
 //
 // Same invariant, autocommit (no explicit transaction).  See sibling test
 // for the Noxu bug TODO.
@@ -667,6 +682,7 @@ fn database_put_no_overwrite_in_dup_db_no_txn() {
 // ──────────────────────────────────────────────────────────────────────────────
 // DatabaseTest.testDatabaseCountEmptyDB / testDatabaseCount /
 // testDatabaseCountWithDeletedEntries / testDatabaseCountDups
+// JE: DatabaseTest.testDatabaseCountEmptyDB / testDatabaseCountWithDeletedEntries / testDatabaseCountDups / testDeferredWriteDatabaseCountDups
 //
 // JE invariant: count() on an empty DB returns 0; after N inserts it returns
 // N; after deleting K it returns N - K; for sorted-dups, count() returns the
@@ -715,6 +731,7 @@ fn database_count_dups_counts_each_dup() {
 
 // ──────────────────────────────────────────────────────────────────────────────
 // DatabaseTest.testDbCloseUnopenedDb (spirit port)
+// JE: DatabaseTest.testDbCloseUnopenedDb
 //
 // JE invariant: a Database handle that was never `open`-ed can be closed
 // without throwing.  Noxu has no `new Database(env)` constructor —
@@ -735,6 +752,7 @@ fn database_close_idempotent() {
 
 // ──────────────────────────────────────────────────────────────────────────────
 // EnvironmentTest.testReadOnlyDbNameOps
+// JE: EnvironmentTest.testReadOnlyDbNameOps / DatabaseConfigTest.testOpenReadOnly
 //
 // JE invariant: on a read-only env, `truncateDatabase`, `removeDatabase`,
 // `renameDatabase` all raise `UnsupportedOperationException`; the data is
@@ -790,6 +808,7 @@ fn environment_read_only_rejects_db_name_ops() {
 
 // ──────────────────────────────────────────────────────────────────────────────
 // EnvironmentTest.testFlushLog (spirit port)
+// JE: EnvironmentTest.testFlushLog
 //
 // JE invariant: a write under COMMIT_NO_SYNC is in-memory only until
 // `env.flushLog(false)` (or sync=true) is called; after a flush, the data
@@ -899,6 +918,7 @@ fn environment_checkpoint_after_commit_loses_data() {
 
 // ──────────────────────────────────────────────────────────────────────────────
 // EnvironmentTest.testNoCreateReservedNameDB (spirit port)
+// JE: EnvironmentTest.testNoCreateReservedNameDB
 //
 // JE invariant: opening a database whose name matches a JE-internal
 // reserved name must fail.  Noxu uses different internal names; this test
@@ -920,5 +940,62 @@ fn environment_open_reserved_name_db_rejected() {
     assert!(
         result.is_err(),
         "opening a database with an empty / reserved name must fail; got Ok"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// DatabaseTest.testOpenCursor
+//
+// JE: DatabaseTest.testOpenCursor
+// JE invariant: opening a cursor on a database whose handle has been closed
+// must fail (IllegalStateException in JE; Err in Noxu).
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn database_open_cursor_on_closed_db_fails() {
+    let dir = TempDir::new().unwrap();
+    let (_env, db) = open_env_db(&dir, "open_cursor_closed", false);
+    db.close().unwrap();
+    let r = db.open_cursor(None);
+    assert!(r.is_err(), "open_cursor on a closed database must fail; got Ok");
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// DatabaseTest.testBufferOverflowingPut
+//
+// JE: DatabaseTest.testBufferOverflowingPut
+// JE invariant: a put of a value far larger than the log buffer must succeed
+// (the log layer handles a value that overflows the in-memory buffer, rather
+// than throwing).  JE uses a 10 MB value; we use 1 MB to keep runtime bounded
+// while still exceeding the default buffer.  The value must round-trip exactly.
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn database_buffer_overflowing_put_round_trips() {
+    let dir = TempDir::new().unwrap();
+    let (_env, db) = open_env_db(&dir, "big_put", true);
+    let big = vec![7u8; 1_000_000];
+    db.put(
+        DatabaseEntry::from_bytes(&10u32.to_be_bytes()),
+        DatabaseEntry::from_bytes(&big),
+    )
+    .unwrap();
+    let mut out = DatabaseEntry::new();
+    let got = db
+        .get_into(
+            None,
+            DatabaseEntry::from_bytes(&10u32.to_be_bytes()),
+            &mut out,
+        )
+        .unwrap();
+    assert!(got, "the oversized value must be retrievable");
+    assert_eq!(
+        out.data_opt().unwrap().len(),
+        1_000_000,
+        "exact size round-trip"
+    );
+    assert!(
+        out.data_opt().unwrap().iter().all(|&b| b == 7),
+        "exact content round-trip"
     );
 }
