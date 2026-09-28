@@ -241,6 +241,9 @@ fn test_multiple_databases_isolated() {
     assert_eq!(out2.data(), b"from-db2");
 }
 
+// JE: JEMonitorTest.testOperations (jmx pkg) — the getDatabaseNames MBean
+// operation. JE asserts the operation returns the open DB names; Noxu
+// exposes the same via `Environment::database_names()` (no JMX MBean).
 /// get_database_names() reflects names registered via open_database.
 #[test]
 fn test_get_database_names() {

@@ -46,6 +46,13 @@ fn snapshot_values(
         .collect()
 }
 
+// JE: JEMonitorTest.testGetters / JEMonitorTest.testOperations (jmx pkg).
+// The JEMonitor MBean's read-side ATTRIBUTES (env stats/config) and its
+// getEnvironmentStats/getTxnStats OPERATIONS expose exactly this stat set;
+// Noxu exposes it via `Environment::stats()` + noxu-observe metrics export
+// (no javax.management/MBeanServer). Also exercises `checkpoint()`, the
+// behavior behind JEMonitor's checkpoint AND sync operations (JE
+// `Environment.sync()` is a forced checkpoint).
 #[test]
 fn metrics_export_emits_je_stat_set() {
     // 1. Install a real recorder (recorder-agnostic facade).
