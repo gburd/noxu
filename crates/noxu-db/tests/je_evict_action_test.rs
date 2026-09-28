@@ -168,6 +168,11 @@ fn test_no_need_to_evict() {
 #[test]
 fn test_set_cache_size() {
     // JE: EvictActionTest.testSetCacheSize
+    // Also covers JEMonitorTest.testSetters (jmx pkg): the JEMonitor MBean's
+    // cacheSize/cachePercent SETTER mutates the running env's cache size and
+    // the change takes effect. Noxu does this via `set_mutable_config` (no
+    // javax.management Attribute). The forced-eviction check that follows the
+    // shrink also covers JEMonitor's evictMemory operation (testOperations).
     let dir = TempDir::new().unwrap();
     let (mut env, db) = open_env(dir.path(), BIG_CACHE);
     insert_data(&env, &db, N_KEYS);
