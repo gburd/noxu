@@ -215,7 +215,10 @@ fn lock_preemption_victim_is_notified_on_next_lock() {
     let r = lm.lock(LSN_KEY1, 1, LockType::Read, true, false);
     match r {
         Err(TxnError::LockPreempted { lsn }) => {
-            assert_eq!(lsn, LSN_KEY1, "preemption is reported for the stolen LSN");
+            assert_eq!(
+                lsn, LSN_KEY1,
+                "preemption is reported for the stolen LSN"
+            );
             let msg = format!("{}", TxnError::LockPreempted { lsn });
             assert!(
                 msg.contains("preempt"),

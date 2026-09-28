@@ -1122,8 +1122,7 @@ impl LockManager {
         // stealLock: remove all preemptable owners, and mark each preempted
         // victim so its next lock request gets `LockPreempted` (JE
         // `LockImpl.stealLock` -> `Locker.setPreempted`, LockImpl.java:545/559).
-        let preempted =
-            lock.steal_lock_preemptable(locker_id, &preemptable_fn);
+        let preempted = lock.steal_lock_preemptable(locker_id, &preemptable_fn);
         self.mark_preempted(&preempted);
         // Re-attempt as a non-blocking, jump-ahead request.
         let result = lock.lock_with_sharing(
