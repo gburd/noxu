@@ -37,11 +37,15 @@ fn open_env(path: std::path::PathBuf) -> Environment {
 
 fn fill(env: &Environment, name: &str, n: u32) {
     let db = env
-        .open_database(None, name, &DatabaseConfig::new().with_allow_create(true))
+        .open_database(
+            None,
+            name,
+            &DatabaseConfig::new().with_allow_create(true),
+        )
         .unwrap();
     let value = vec![0x5Au8; 256];
     for i in 0..n {
-        db.put(&i.to_be_bytes(), &value).unwrap();
+        db.put(i.to_be_bytes(), &value).unwrap();
     }
     db.close().unwrap();
 }
@@ -122,12 +126,11 @@ fn aborted_remove_does_not_count_obsolete_or_reclaim() {
         env.database_names().unwrap().contains(&"survivor".to_string()),
         "aborted remove: database must survive"
     );
-    let db = env
-        .open_database(None, "survivor", &DatabaseConfig::new())
-        .unwrap();
+    let db =
+        env.open_database(None, "survivor", &DatabaseConfig::new()).unwrap();
     for i in 0..200u32 {
         assert!(
-            db.get(&i.to_be_bytes()).unwrap().is_some(),
+            db.get(i.to_be_bytes()).unwrap().is_some(),
             "aborted remove: record {i} must survive"
         );
     }
