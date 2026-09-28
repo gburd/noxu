@@ -497,7 +497,7 @@ fn do_test_reuse_slot_partial_key(run_recovery: bool) {
     }
     txn.abort().unwrap();
 
-    let (env, db) = if run_recovery {
+    let (_env, db) = if run_recovery {
         db.close().unwrap();
         env.close().unwrap();
         // Drop by scope: reopen fresh.
