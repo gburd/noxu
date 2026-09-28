@@ -9,8 +9,142 @@ use crate::operation_status::OperationStatus;
 use crate::put::Put;
 use crate::transaction::Transaction;
 use bytes::Bytes;
-use noxu_dbi::{CursorImpl, DbiError, GetMode, PutMode, SearchMode};
-use std::marker::PhantomData;
+use crate::secondary_database::SecondaryHook;
+use noxu_dbi::{
+    CursorImpl, DatabaseImpl, DbiError, GetMode, PutMode, SearchMode,
+};
+use noxu_log::LogManager;
+use noxu_txn::LockManager;
+use noxu_util::dst_sync_pl::RwLock;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+
+/// Secondary-index maintenance context threaded into a writable cursor so
+/// that `Cursor::put` / `Cursor::delete` maintain every registered secondary
+/// exactly as `Database::put` / `Database::delete` do (NEW-CURSOR-SEC-MAINT).
+///
+/// JE parity: `Cursor.putInternal` / `Cursor.deleteInternal` run the same
+/// `SecondaryTrigger` (associate) maintenance for cursor writes that
+/// `Database.put` / `Database.delete` run — the cursor is not a bypass of
+/// secondary maintenance.  Before this context existed, a cursor write on a
+/// primary with secondaries silently left the secondary index stale.
+///
+/// Holds only cheap `Arc` clones of the primary's shared handles (never the
+/// `Database`'s `open` flag, so dropping a cursor never closes the primary).
+/// A read-only cursor and a secondary-index inner cursor carry `None`.
+pub(crate) struct CursorSecMaint {
+    /// The primary's live secondary-hook registry (shared `Arc`, so a
+    /// secondary registered after the cursor was opened is still seen).
+    secondaries: Arc<
+        RwLock<Vec<std::sync::Weak<dyn SecondaryHook + Send + Sync>>>,
+    >,
+    /// Shared handles to build a throwaway probe cursor for the old-value
+    /// fetch (the delete-then-insert of a REPLACE needs the pre-write data
+    /// so the OLD secondary key can be removed).  Mirrors the handles
+    /// `Database::make_cursor_with_locker` wires in.
+    db_impl: Arc<RwLock<DatabaseImpl>>,
+    lock_manager: Arc<LockManager>,
+    log_manager: Option<Arc<LogManager>>,
+    env_invalid: Arc<AtomicBool>,
+}
+
+impl CursorSecMaint {
+    /// Builds the maintenance context from the primary's shared handles.
+    /// Called by `Database::open_cursor_internal` for a writable cursor.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        secondaries: Arc<
+            RwLock<Vec<std::sync::Weak<dyn SecondaryHook + Send + Sync>>>,
+        >,
+        db_impl: Arc<RwLock<DatabaseImpl>>,
+        lock_manager: Arc<LockManager>,
+        log_manager: Option<Arc<LogManager>>,
+        env_invalid: Arc<AtomicBool>,
+    ) -> Self {
+        Self { secondaries, db_impl, lock_manager, log_manager, env_invalid }
+    }
+
+    /// Live secondary hooks (upgrades the `Weak`s, dropping any dangling).
+    fn live(
+        &self,
+    ) -> Vec<Arc<dyn SecondaryHook + Send + Sync>> {
+        self.secondaries.read().iter().filter_map(|w| w.upgrade()).collect()
+    }
+
+    /// Fetch the current value stored under `key` (the pre-write data), or
+    /// `None` if the key is absent.  Reuses the same handle set
+    /// `Database::make_cursor_with_locker` wires in and reads under the
+    /// cursor's own transaction (same locker, so no self-conflict) exactly
+    /// as `Database::put_bytes` reads old data before an overwrite.
+    fn fetch_old(
+        &self,
+        txn: Option<&Transaction>,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>> {
+        let locker_id = txn.map(|t| t.id() as i64).unwrap_or(0);
+        let mut probe = match &self.log_manager {
+            Some(lm) => CursorImpl::with_log_manager(
+                Arc::clone(&self.db_impl),
+                locker_id,
+                Arc::clone(lm),
+            )
+            .with_env_invalid(Arc::clone(&self.env_invalid))
+            .with_lock_manager(Arc::clone(&self.lock_manager)),
+            None => CursorImpl::new(Arc::clone(&self.db_impl), locker_id)
+                .with_env_invalid(Arc::clone(&self.env_invalid))
+                .with_lock_manager(Arc::clone(&self.lock_manager)),
+        };
+        if let Some(t) = txn
+            && let Some(inner) = t.get_inner_txn()
+        {
+            probe = probe.with_txn(inner);
+        }
+        match probe.search(key, None, SearchMode::Set).map_err(map_cursor_err)?
+        {
+            noxu_dbi::OperationStatus::Success => {
+                let (_, value) =
+                    probe.get_current().map_err(map_cursor_err)?;
+                Ok(Some(value.to_vec()))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Fan out a primary write to every registered secondary under `txn`,
+    /// exactly as `Database::put_bytes` / `Database::delete_bytes` do:
+    /// `old`/`new` drive the delete-then-insert of the secondary key.
+    /// A no-op when no secondaries are registered.
+    fn maintain(
+        &self,
+        txn: Option<&Transaction>,
+        key: &[u8],
+        old: Option<&[u8]>,
+        new: Option<&[u8]>,
+    ) -> Result<()> {
+        let secondaries = self.live();
+        if secondaries.is_empty() {
+            return Ok(());
+        }
+        let key_entry = DatabaseEntry::from_bytes(key);
+        let old_entry = old.map(DatabaseEntry::from_bytes);
+        let new_entry = new.map(DatabaseEntry::from_bytes);
+        for hook in secondaries {
+            hook.maintain(
+                txn,
+                &key_entry,
+                old_entry.as_ref(),
+                new_entry.as_ref(),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// True when at least one secondary is registered — lets the cursor skip
+    /// the pre-write old-value fetch entirely on the common no-secondary path.
+    fn has_secondaries(&self) -> bool {
+        self.secondaries.read().iter().any(|w| w.strong_count() > 0)
+    }
+}
 
 /// Map a `DbiError` from a cursor inner operation to the appropriate
 /// public `NoxuError`.
@@ -89,23 +223,51 @@ pub struct Cursor<'txn> {
     state: CursorState,
     /// Whether this cursor is read-only.
     read_only: bool,
-    /// Ties the cursor to the transaction it was opened under so that
-    /// committing/aborting that txn while the cursor is alive is a
+    /// The transaction the cursor was opened under (`None` for an
+    /// auto-commit cursor).  Retained — not just borrowed as `PhantomData`
+    /// — so a cursor put/delete can drive secondary maintenance under the
+    /// SAME txn as the primary write, exactly as `Database::put` does
+    /// (NEW-CURSOR-SEC-MAINT).  Still ties the cursor to the txn's lifetime
+    /// so committing/aborting the txn while the cursor is alive is a
     /// compile error (review P0-1).
-    _txn: PhantomData<&'txn Transaction>,
+    txn: Option<&'txn Transaction>,
+    /// Secondary-index maintenance context (`None` on a read-only cursor or
+    /// a cursor whose primary has no secondaries wired at open).  A cursor
+    /// put/delete fans out to every registered secondary through this
+    /// (NEW-CURSOR-SEC-MAINT; JE `Cursor.putInternal`/`deleteInternal`).
+    sec_maint: Option<CursorSecMaint>,
 }
 
 impl<'txn> Cursor<'txn> {
     /// Creates a Cursor wrapping a `CursorImpl`.
     ///
-    /// Called by `Database::open_cursor`.
+    /// Test-only helper (secondary maintenance uses
+    /// [`Self::from_impl_with_maint`]); retained for the cursor unit tests
+    /// that construct a cursor directly without a primary's secondary
+    /// registry.
+    #[cfg(test)]
     pub(crate) fn from_impl(inner: CursorImpl, read_only: bool) -> Self {
         Self {
             inner,
             state: CursorState::NotInitialized,
             read_only,
-            _txn: PhantomData,
+            txn: None,
+            sec_maint: None,
         }
+    }
+
+    /// Creates a Cursor wired for secondary-index maintenance
+    /// (NEW-CURSOR-SEC-MAINT).  Called by `Database::open_cursor_internal`
+    /// for a writable cursor; `txn` is the caller's transaction (or `None`
+    /// for auto-commit) and `sec_maint` fans a cursor put/delete out to
+    /// every registered secondary exactly as `Database::put`/`delete` do.
+    pub(crate) fn from_impl_with_maint(
+        inner: CursorImpl,
+        read_only: bool,
+        txn: Option<&'txn Transaction>,
+        sec_maint: Option<CursorSecMaint>,
+    ) -> Self {
+        Self { inner, state: CursorState::NotInitialized, read_only, txn, sec_maint }
     }
 
     /// Advances the cursor to the next record and returns it, or `None`
@@ -436,23 +598,72 @@ impl<'txn> Cursor<'txn> {
             }
         };
 
-        match self
+        // NEW-CURSOR-SEC-MAINT (JE `Cursor.putInternal`): a cursor put on a
+        // primary with registered secondaries must maintain those
+        // secondaries exactly as `Database::put` does — including the
+        // pre-write old-value fetch so a REPLACE / putCurrent updates the
+        // secondary key old->new (delete old, insert new).  Capture the
+        // old value (and, for putCurrent, the actual primary key of the
+        // current record) BEFORE the write, mirroring `Database::put_bytes`.
+        let maintain_secondaries =
+            self.sec_maint.as_ref().is_some_and(|m| m.has_secondaries());
+        let (sec_key, old_for_sec): (Vec<u8>, Option<Vec<u8>>) =
+            if maintain_secondaries {
+                let sm = self.sec_maint.as_ref().unwrap();
+                match put_type {
+                    // putCurrent replaces the data at the current position:
+                    // the primary key is the current record's key, and the
+                    // old data is its current value.
+                    Put::Current => {
+                        let (k, v) =
+                            self.inner.get_current().map_err(map_cursor_err)?;
+                        (k, Some(v.to_vec()))
+                    }
+                    // Keyed put: fetch the current value for `key` (None if
+                    // this is a fresh insert), same as Database::put_bytes.
+                    _ => (
+                        key_bytes.to_vec(),
+                        sm.fetch_old(self.txn, key_bytes)?,
+                    ),
+                }
+            } else {
+                (key_bytes.to_vec(), None)
+            };
+
+        let status = match self
             .inner
             .put(key_bytes, data_bytes, put_mode)
             .map_err(map_cursor_err)?
         {
             noxu_dbi::OperationStatus::KeyExist => {
-                Ok(OperationStatus::KeyExists)
+                // No write applied (NoOverwrite/NoDupData rejected): the
+                // secondary is already correct, so no maintenance.
+                return Ok(OperationStatus::KeyExists);
             }
             noxu_dbi::OperationStatus::KeyEmpty => {
-                // D4: putCurrent on a defunct slot (JE KEYEMPTY).
-                Ok(OperationStatus::KeyEmpty)
+                // D4: putCurrent on a defunct slot (JE KEYEMPTY).  No write
+                // applied, so no secondary maintenance.
+                return Ok(OperationStatus::KeyEmpty);
             }
             _ => {
                 self.state = CursorState::Initialized;
-                Ok(OperationStatus::Success)
+                OperationStatus::Success
             }
+        };
+
+        // Fan out the applied write to every registered secondary under the
+        // cursor's own txn (NEW-CURSOR-SEC-MAINT).  new_data is the bytes
+        // just written; old_for_sec is the pre-write value (None on insert).
+        if maintain_secondaries {
+            self.sec_maint.as_ref().unwrap().maintain(
+                self.txn,
+                &sec_key,
+                old_for_sec.as_deref(),
+                Some(data_bytes),
+            )?;
         }
+
+        Ok(status)
     }
 
     /// Delete the record at the current cursor position.
@@ -470,12 +681,42 @@ impl<'txn> Cursor<'txn> {
             ));
         }
 
+        // NEW-CURSOR-SEC-MAINT (JE `Cursor.deleteInternal`): a cursor
+        // delete on a primary with registered secondaries must remove the
+        // record's secondary entries, exactly as `Database::delete` does.
+        // Capture the current record's primary key + data BEFORE the delete
+        // so the secondary key can be recomputed and removed.
+        let maintain_secondaries =
+            self.sec_maint.as_ref().is_some_and(|m| m.has_secondaries());
+        let del_pre: Option<(Vec<u8>, Vec<u8>)> = if maintain_secondaries {
+            match self.inner.get_current() {
+                Ok((k, v)) => Some((k, v.to_vec())),
+                // Already defunct / not positioned: nothing to maintain.
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
         let inner_status = self.inner.delete().map_err(map_cursor_err)?;
         // D3: inner returns KeyEmpty when the slot was concurrently deleted.
         if inner_status == noxu_dbi::OperationStatus::KeyEmpty {
             // Stay in current state (still positioned on defunct slot).
             return Ok(OperationStatus::KeyEmpty);
         }
+
+        // The primary delete applied: fan out to every secondary
+        // (old = the deleted record's data, new = None) under the cursor's
+        // txn so the primary delete and secondary cleanup resolve together.
+        if let Some((k, v)) = del_pre {
+            self.sec_maint.as_ref().unwrap().maintain(
+                self.txn,
+                &k,
+                Some(&v),
+                None,
+            )?;
+        }
+
         // JE CursorImpl.deleteCurrentRecord(): keep position at the gap so
         // Next/Prev yields the successor/predecessor (D1 fix).
         // Ref: CursorImpl.java deleteCurrentRecord() + getNext() PD check.
