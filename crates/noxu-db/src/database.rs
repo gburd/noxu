@@ -1415,7 +1415,25 @@ impl Database {
             }
         };
 
-        Ok(Cursor::from_impl(cursor_impl, read_only))
+        // NEW-CURSOR-SEC-MAINT: give a writable cursor the same
+        // secondary-index maintenance fan-out that `Database::put` /
+        // `Database::delete` use, so a cursor put/delete on a primary with
+        // registered secondaries maintains those secondaries (JE
+        // `Cursor.putInternal` / `deleteInternal` run the same associate
+        // maintenance for cursor writes).  Read-only cursors carry `None`.
+        let sec_maint = if read_only {
+            None
+        } else {
+            Some(crate::cursor::CursorSecMaint::new(
+                Arc::clone(&self.secondaries),
+                Arc::clone(&self.db_impl),
+                Arc::clone(&self.lock_manager),
+                self.log_manager.clone(),
+                Arc::clone(&self.env_invalid),
+            ))
+        };
+
+        Ok(Cursor::from_impl_with_maint(cursor_impl, read_only, txn, sec_maint))
     }
 
     /// Returns a lazy forward iterator over all records in the database.
