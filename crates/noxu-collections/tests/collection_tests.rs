@@ -742,6 +742,12 @@ fn test_foreign_key_delete_abort_pattern() {
 }
 
 // JE: ForeignKeyTest.runTest (CASCADE delete action at the map view layer; engine FK enforcement COVERED-CITED in noxu-db/tests/secondary_decisions_test.rs).
+// JE: TupleSerialFactoryTest.runTest (the factory test's writeAndRead() body is
+// two stores + a foreign-key CASCADE from store2 -> store1's primary key; the
+// FK-CASCADE map-layer behavior it exercises is what this port covers. The
+// tuple-key + value binding half is COVERED-CITED in
+// noxu-bind tuple_serde_binding.rs; the Java-serial value MECHANISM is N/A --
+// see noxu-bind/tests/tck_serial_binding.rs header).
 #[test]
 fn test_foreign_key_delete_cascade_pattern() {
     let (_td, _env, db1) = setup_env_and_db();

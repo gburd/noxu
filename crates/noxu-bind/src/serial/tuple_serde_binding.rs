@@ -219,6 +219,14 @@ mod tests {
         department: String,
     }
 
+    // JE: TupleSerialFactoryTest.runTest (tuple-key + value binding produced by
+    // the factory; the JE value half uses Java Object Serialization, which Noxu
+    // replaces with serde -- so this asserts the portable factory PURPOSE:
+    // tuple-encoded key + payload round-trips through one composite binding).
+    // The secondary-index / foreign-key-CASCADE half of that JE test is
+    // COVERED-CITED at the collection layer (noxu-collections
+    // collection_tests.rs test_foreign_key_delete_cascade_pattern) and at the
+    // engine layer (noxu-db secondary_decisions_test.rs).
     #[test]
     fn test_tuple_serde_binding_round_trip() {
         let binding = TupleSerdeBinding::<u64, Employee>::new(
@@ -242,6 +250,9 @@ mod tests {
         assert_eq!(decoded, emp);
     }
 
+    // JE: TupleSerialFactoryTest.runTest (factory.getKeyCreator: the secondary
+    // key is extracted from the entity value -- here via the key_extractor,
+    // the serde analogue of MarshalledTupleKeyEntity.marshalSecondaryKey).
     #[test]
     fn test_tuple_serde_binding_key_extraction() {
         let binding = TupleSerdeBinding::<u64, Employee>::new(

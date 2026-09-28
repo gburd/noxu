@@ -19,6 +19,42 @@
 //! The 2-byte header (see `SerdeBinding`'s module docs) is what guards
 //! against decoding a payload written with a different wire format.
 //! See `tck_serde_version_header` below.
+//!
+//! ## `collections.test.serial` package: N/A / COVERED-CITED map
+//!
+//! The four JE `@Test` methods in
+//! `com.sleepycat.collections.test.serial` all sit on top of Java Object
+//! Serialization + `StoredClassCatalog`, which is a documented intentional
+//! deviation (Noxu is serde-based; there is no `ObjectOutputStream`, no
+//! `ObjectStreamClass`, no external class-descriptor catalog).  The split of
+//! Java-serialization MECHANISM (N/A) vs. catalog/factory PURPOSE
+//! (COVERED-CITED) is:
+//!
+//! - `StoredClassCatalogTestInit.runTest` -> **N/A (Java serialization
+//!   mechanism)**: serializes a `java.io.Serializable` `TestSerial` graph
+//!   through `SerialBinding` and asserts the `StoredClassCatalog` stored the
+//!   `ObjectStreamClass` so records reference it by numeric class ID.  Noxu's
+//!   serde binding compiles the type in as a generic parameter, so this
+//!   compression catalog is structurally absent.  (Noxu-persist's
+//!   `ClassCatalog` stores *class versions keyed by name* for schema
+//!   evolution -- a different purpose, not the serialization-metadata dedup
+//!   catalog JE tests here.)
+//! - `StoredClassCatalogTest.runTest` -> **N/A (Java serialization
+//!   mechanism)**: reads objects written with the *old* class format and
+//!   writes with the *new* format across a `serialVersionUID` change, and
+//!   calls `catalog.getClassID(ObjectStreamClass)`.  This is Java's
+//!   serialization class-evolution machinery; Noxu has no `serialVersionUID`
+//!   / `ObjectStreamClass`.
+//! - `CatalogCornerCaseTest.testReadOnlyEmptyCatalog` -> **COVERED-CITED**:
+//!   the portable corner-case PURPOSE (a read-only catalog with no on-disk
+//!   backing cannot be written) is exercised in noxu-persist
+//!   `evolve::catalog` test `read_only_empty_catalog_rejects_writes`.
+//! - `TupleSerialFactoryTest.runTest` -> **COVERED-CITED**: the tuple-key
+//!   plus value binding produced by the factory is `TupleSerdeBinding`
+//!   (round-trip and key extraction in `tuple_serde_binding.rs`), and the
+//!   factory test's foreign-key CASCADE body is covered by noxu-collections
+//!   `test_foreign_key_delete_cascade_pattern` and noxu-db
+//!   `secondary_decisions_test.rs`.  The Java-serial VALUE mechanism is N/A.
 
 use noxu_bind::{EntityBinding, EntryBinding, SerdeBinding, TupleSerdeBinding};
 use noxu_db::DatabaseEntry;
