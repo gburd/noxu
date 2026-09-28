@@ -254,8 +254,7 @@ fn do_truncate_and_add(
         }
 
         // Step 3: truncate; the returned count must equal step1.
-        let truncate_count =
-            env.truncate_database(txn.as_ref(), name).unwrap();
+        let truncate_count = env.truncate_database(txn.as_ref(), name).unwrap();
         assert_eq!(
             truncate_count as u32, step1,
             "truncate must report the pre-truncate record count"
