@@ -17,6 +17,9 @@ listed in [References](#references).
 ## [Unreleased]
 
 ### Added
+- `noxu-util` gains a faithful reference port of JE's `LatencyStat` (latency histogram
+  with percentile/average/rollup, including JE's `[#21763]` percentile fix). A reference
+  primitive for test parity; not yet wired into a subsystem.
 - `noxu-latch` exposes read-only `n_waiters()` on the exclusive and shared latches
   and `is_owner()` on the shared latch (matching JE `Latch.getNWaiters` /
   `SharedLatch.isOwner`), surfacing the existing waiter counter for observability.
