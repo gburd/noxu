@@ -17,6 +17,11 @@ listed in [References](#references).
 ## [Unreleased]
 
 ### Added
+- Subscription API gains `EntryRequestType` (with a JE-faithful start-VLSN resolution
+  table), a validating `SubscriptionConfig::new`, and `Subscription::start_from_vlsn`,
+  completing the subscription config/positioning primitives (matching JE
+  `FeederReplicaSyncup.makeResponseToEntryRequest`). Live entry delivery is not yet
+  implemented.
 - `CommitToken::try_compare` orders two commit tokens by VLSN when they share a
   replication group, returning `None` for tokens from different groups (matching JE
   `CommitToken.compareTo`).
