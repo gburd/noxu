@@ -42,6 +42,7 @@ fn seed_db(env: &Environment, name: &str, key: &[u8], val: &[u8]) {
 // remove_database
 // ---------------------------------------------------------------------------
 
+// JE: EnvironmentTest.testDbRemoveAbort (remove under txn, abort -> DB survives).
 #[test]
 fn remove_database_under_txn_is_rolled_back_on_abort() {
     let dir = TempDir::new().unwrap();
@@ -69,6 +70,7 @@ fn remove_database_under_txn_is_rolled_back_on_abort() {
     assert_eq!(db.get(b"k").unwrap().as_deref(), Some(b"v".as_ref()));
 }
 
+// JE: EnvironmentTest.testDbRemove / testDbRemoveNonTxnl (auto-commit remove).
 #[test]
 fn remove_database_auto_commit_still_works() {
     let dir = TempDir::new().unwrap();
@@ -79,6 +81,7 @@ fn remove_database_auto_commit_still_works() {
     assert!(!env.database_names().unwrap().contains(&"gone".to_string()));
 }
 
+// JE: EnvironmentTest.testDbRemoveCommit (remove under txn, commit -> gone).
 #[test]
 fn remove_database_under_txn_commits() {
     let dir = TempDir::new().unwrap();
@@ -96,6 +99,7 @@ fn remove_database_under_txn_commits() {
 // rename_database
 // ---------------------------------------------------------------------------
 
+// JE: EnvironmentTest.testDbRenameAbort (rename under txn, abort -> old name).
 #[test]
 fn rename_database_under_txn_is_rolled_back_on_abort() {
     let dir = TempDir::new().unwrap();
@@ -125,6 +129,7 @@ fn rename_database_under_txn_is_rolled_back_on_abort() {
     assert_eq!(db.get(b"k").unwrap().as_deref(), Some(b"v".as_ref()));
 }
 
+// JE: EnvironmentTest.testDbRename (auto-commit rename).
 #[test]
 fn rename_database_auto_commit_still_works() {
     let dir = TempDir::new().unwrap();
@@ -137,6 +142,7 @@ fn rename_database_auto_commit_still_works() {
     assert!(names.contains(&"after".to_string()));
 }
 
+// JE: EnvironmentTest.testDbRenameCommit (rename under txn, commit -> new name).
 #[test]
 fn rename_database_under_txn_commits() {
     let dir = TempDir::new().unwrap();
@@ -158,6 +164,8 @@ fn rename_database_under_txn_commits() {
 
 // JE: TxnEndTest.testTruncateDeleteDB -- truncate+remove of a DB under one txn
 // is rolled back on abort (DB survives) and applied on commit.
+// JE: TruncateTest.testTruncateAbort (transactional truncate + abort ->
+// records survive).
 #[test]
 fn truncate_database_under_txn_is_rolled_back_on_abort() {
     let dir = TempDir::new().unwrap();
@@ -185,6 +193,7 @@ fn truncate_database_under_txn_is_rolled_back_on_abort() {
     assert_eq!(db.count().unwrap(), 1);
 }
 
+// JE: TruncateTest.testTruncateCommitAutoTxn (auto-commit truncate clears).
 #[test]
 fn truncate_database_auto_commit_still_works() {
     let dir = TempDir::new().unwrap();
@@ -204,6 +213,7 @@ fn truncate_database_auto_commit_still_works() {
     assert_eq!(db.count().unwrap(), 0);
 }
 
+// JE: TruncateTest.testTruncateCommit (transactional truncate + commit -> 0).
 #[test]
 fn truncate_database_under_txn_commits() {
     let dir = TempDir::new().unwrap();
