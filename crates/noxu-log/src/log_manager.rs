@@ -296,7 +296,15 @@ impl LogManager {
 
         let flipped = {
             let file_offset = next_lsn.file_offset() as u64;
-            file_offset + entry_size as u64 > self.file_manager.max_file_size()
+            // JE `FileManager.shouldFlipFile`: forceNewFile || (offset+size) >
+            // maxFileSize.  `take_force_new_file` reads-and-clears the
+            // restore-from-backup force flag (ENV_RECOVERY_FORCE_NEW_FILE) so
+            // the flip happens exactly once on the first post-recovery write.
+            // Consumed here under the LWL (single-threaded) so the clear cannot
+            // race a concurrent slot assignment.
+            self.file_manager.take_force_new_file()
+                || file_offset + entry_size as u64
+                    > self.file_manager.max_file_size()
         };
 
         let (current_lsn, file_num) = if flipped {

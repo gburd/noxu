@@ -19,7 +19,7 @@ use std::io::Write;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 /// File extension for noxu database log files.
 pub const LOG_FILE_EXTENSION: &str = ".ndb";
@@ -90,6 +90,15 @@ pub struct FileManager {
     next_available_lsn: AtomicU64,
     /// Last LSN that was used in the current file.
     last_used_lsn: AtomicU64,
+    /// Force a new log file on the next write.
+    ///
+    /// JE `FileManager.forceNewFile` ("Force new file on next write").  Set by
+    /// `force_new_log_file()` after a restore-from-backup recovery when
+    /// `ENV_RECOVERY_FORCE_NEW_FILE` is enabled, so the restored backup's last
+    /// log file is never appended to (a fresh file is started instead),
+    /// protecting it from being written past its backed-up length [#22834].
+    /// Consumed (reset to false) by the flip decision on the next write.
+    force_new_file: AtomicBool,
     /// Map of file number to last LSN used in that file (for file headers).
     per_file_last_lsn: RwLock<HashMap<u32, Lsn>>,
     /// Latch protecting file creation and file number advancement.
@@ -161,6 +170,7 @@ impl FileManager {
                 Lsn::new(0, first_log_entry_offset()).as_u64(),
             ),
             last_used_lsn: AtomicU64::new(noxu_util::lsn::NULL_LSN.as_u64()),
+            force_new_file: AtomicBool::new(false),
             per_file_last_lsn: RwLock::new(HashMap::new()),
             file_latch: ExclusiveLatch::named("file_manager"),
             lock_file: RwLock::new(None),
@@ -326,6 +336,29 @@ impl FileManager {
     /// Returns the next available LSN for writing.
     pub fn get_next_available_lsn(&self) -> Lsn {
         Lsn::from_u64(self.next_available_lsn.load(Ordering::Acquire))
+    }
+
+    /// Sets the flag that causes a new file to be written before the next
+    /// write.
+    ///
+    /// JE `FileManager.forceNewLogFile()`.  Called by the recovery/environment
+    /// layer after a restore-from-backup recovery when
+    /// `ENV_RECOVERY_FORCE_NEW_FILE` is enabled, so the restored backup's last
+    /// log file is not appended to (a fresh file is started on the next write)
+    /// [#22834].  The flag is consumed once by the flip decision in
+    /// `LogManager::assign_slot` via [`take_force_new_file`](Self::take_force_new_file).
+    pub fn force_new_log_file(&self) {
+        self.force_new_file.store(true, Ordering::Release);
+    }
+
+    /// Atomically reads and clears the force-new-file flag.
+    ///
+    /// Returns whether a file flip was requested via
+    /// [`force_new_log_file`](Self::force_new_log_file), resetting it so the
+    /// flip happens exactly once.  Mirrors JE where `shouldFlipFile` observes
+    /// `forceNewFile` and `advanceLsn` resets it to `false`.
+    pub fn take_force_new_file(&self) -> bool {
+        self.force_new_file.swap(false, Ordering::AcqRel)
     }
 
     /// Returns the last used LSN.
