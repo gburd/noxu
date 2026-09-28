@@ -539,6 +539,11 @@ impl ServiceHandler for EService {
     }
 }
 
+/// JE: `HandshakeTest.testBasicConfig` (je.rep.utilint) — the no-auth service
+/// handshake succeeds and routes to the service. The same no-auth
+/// "handshake completes, service runs" assertion is also ported
+/// standalone as `je_rep_utilint_tck::handshake_basic_no_auth_service_succeeds`.
+///
 /// JE: `ServiceDispatcherTest.testExecuteBasic`.
 ///
 /// JE registers `numServices` ExecutingServices (each writes its own service

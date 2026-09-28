@@ -107,6 +107,13 @@ const RECV_TIMEOUT: Duration = Duration::from_secs(5);
 // analogue: an allowlisted mTLS peer connects and exchanges data (the JE
 // keystore/string-property config path is N/A — Noxu uses a structured
 // rustls TlsConfig; see the ReplicationNetworkConfigTest N/A note).
+// JE: HandshakeTest.testPwAuth / HandshakeTest.testSubscriptionAuthSucc
+// (je.rep.utilint) — the ADMIT-AUTHORIZED half of the handshake auth
+// tests. JE authenticates with a good password / good subscription token
+// and expects doServiceHandshake to succeed. Noxu authenticates at the
+// mTLS layer: an allowlisted peer completes the handshake and exchanges
+// data. The in-band password/token mechanism itself is a documented
+// deviation (see je_rep_utilint_tck.rs header + tp-je-rep-utilint.md).
 /// A peer whose cert CN/SAN is in the allowlist connects and exchanges data.
 #[test]
 fn admitted_peer_connects_and_exchanges_data() {
@@ -143,6 +150,15 @@ fn admitted_peer_connects_and_exchanges_data() {
     server_thread.join().expect("server thread panicked");
 }
 
+// JE: HandshakeTest.testNoAuthProvided / testNoCommonAuth / testfailedAuth
+// / testSubscriptionAuthFail (je.rep.utilint) — the REJECT-UNAUTHORIZED
+// half of the handshake auth tests. JE hands the dispatcher a client with
+// no auth / no common mechanism / a wrong password / a bad token and
+// expects doServiceHandshake to throw ServiceConnectFailedException. Noxu
+// rejects at the mTLS layer: a peer whose verified cert name is not in the
+// allowlist is rejected at the handshake and delivers no service data.
+// Also pinned in-process by
+// je_rep_utilint_tck::handshake_unauthenticated_peer_is_rejected_at_handshake.
 /// A peer whose cert CN/SAN is NOT in the allowlist is rejected at the TLS
 /// handshake — the connection fails before any data is exchanged.
 #[test]
