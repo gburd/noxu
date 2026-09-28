@@ -330,6 +330,17 @@ listed in [References](#references).
   crash. The arbiter's ack now satisfies a `SIMPLE_MAJORITY` durability quorum at RF=2
   (never `ALL`, which still requires the data replica), matching JE. Found by a
   faithful port of JE's `ArbiterTest.testReplicaDown`.
+- **Log cleaner honors `TREE_MAX_EMBEDDED_LN` and no longer force-cleans (REG-CLEANER).**
+  `clean_log()` now uses JE's non-forced cleaning (fixing a migration treadmill that
+  stalled the disk-limit resume), and LN values larger than the embedded-LN threshold
+  are stored as an LSN pointer in the BIN slot rather than embedded. Superseded
+  embedded LNs are counted obsolete at write time. A never-logged split-created upper
+  IN now records a NULL prior-version LSN, fixing a checkpoint obsolete double-count
+  (`split_propagation_recovers`). The cleaner now fetches an LN's value from the log
+  during migration when the BIN slot holds only an LSN pointer, so migrating a large
+  value no longer risks writing an empty record. Old-format logs remain readable
+  (no log-version bump). Removing or truncating a database does not yet reclaim its
+  freed space under non-forced cleaning (tracked as NEW-CLEANER-DBOBSOLETE).
 - **Two-node (RF=2) elections no longer elect a node that lags the arbiter
   (NEW-ELECT-ARBITER-VETO, `[#25311]`).** When the sole surviving electable node
   lagged the arbiter's durable VLSN, the election could make it master below the
