@@ -44,6 +44,7 @@ pub mod daemon;
 pub mod dst_invariants;
 pub mod dst_sync;
 pub mod dst_sync_pl;
+pub mod latency_stat;
 pub mod long_diff;
 pub mod lsn;
 pub mod moving_avg;
