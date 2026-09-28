@@ -1273,6 +1273,29 @@ mod tests {
         listener.exception_event(&evt);
     }
 
+    /// JE: ExceptionWrapperTest.testIOWrapper / testRuntimeWrapper
+    /// (com/sleepycat/util/test/ExceptionWrapperTest)
+    ///
+    /// JE's ExceptionWrapperTest wraps a cause in an IOExceptionWrapper /
+    /// RuntimeExceptionWrapper, then unwraps it via ExceptionUnwrapper.unwrap /
+    /// unwrapAny and asserts the recovered exception is the original cause with
+    /// the original message. Noxu uses thiserror; the analog of "wrap a cause
+    /// and expose it for unwrapping" is `#[source]` +
+    /// `std::error::Error::source()`. NoxuError::OperationFailed wraps a
+    /// sub-crate error and re-exposes it via `source()` (the getCause analog),
+    /// while its Display text stays equal to the wrapped error's (the "same
+    /// message" analog). This test asserts wrap -> source() recovers the
+    /// original cause with an unchanged message -- the same intent as JE's
+    /// unwrap assertions.
+    ///
+    /// N/A (Java-platform-specific, NOT ported):
+    ///   * testErrorWrapper: JE distinguishes java.lang.Error from
+    ///     java.lang.Exception (unwrap rethrows an Error, unwrapAny returns it).
+    ///     Rust has no Error-vs-Exception type split; `?`/source() treat all
+    ///     `dyn std::error::Error` uniformly. No analog.
+    ///   * testStackTrace: asserts the JVM prints "Caused by:" in a
+    ///     Throwable.printStackTrace() dump. Rust has no equivalent runtime
+    ///     stack-trace-with-cause formatting contract. No analog.
     #[test]
     fn test_operation_failed_preserves_source_chain() {
         use std::error::Error;

@@ -701,6 +701,56 @@ mod tests {
         assert_eq!(out.len(), 11);
     }
 
+    /// JE: FastOutputStreamTest.testBufferSizing
+    /// (com/sleepycat/util/test/FastOutputStreamTest)
+    ///
+    /// JE verifies FastOutputStream's doubling grow policy: the backing array
+    /// starts at DEFAULT_INIT_SIZE, and after writing X+1 bytes it is exactly
+    /// 2X+1, then 4X+3 (2*(2X+1)+1).
+    ///
+    /// Noxu's growable output buffer is `TupleOutput`, backed by a Rust
+    /// `Vec<u8>` (documented deviation: Rust-native containers, not a
+    /// hand-rolled FastOutputStream).
+    ///
+    /// N/A (Java-impl-internal, NOT ported): the exact 2X+1 / 4X+3
+    /// *backing-array capacity* assertions. `Vec` growth is unspecified by the
+    /// Rust standard library and carries no contract, so asserting a specific
+    /// capacity would be testing an implementation detail, not behavior.
+    ///
+    /// Ported (the observable contract): repeated writes grow the logical
+    /// length monotonically, previously written bytes survive each grow, and
+    /// `reset()` empties the buffer while leaving it reusable.
+    #[test]
+    fn test_buffer_sizing_grow_and_reset() {
+        const CHUNK: usize = 100;
+
+        let mut out = TupleOutput::new();
+        assert_eq!(out.len(), 0);
+        assert!(out.is_empty());
+
+        // First write: a known, distinguishable pattern.
+        let first: Vec<u8> = (0..CHUNK).map(|i| (i % 251) as u8).collect();
+        out.write_bytes(&first);
+        assert_eq!(out.len(), CHUNK, "length grows by bytes written");
+        assert_eq!(out.to_vec(), first, "contents match after first write");
+
+        // Second write forces a grow; earlier bytes must be preserved.
+        let second: Vec<u8> =
+            (0..CHUNK).map(|i| ((i + 7) % 251) as u8).collect();
+        out.write_bytes(&second);
+        assert_eq!(out.len(), 2 * CHUNK, "length is the running total");
+        let all = out.to_vec();
+        assert_eq!(&all[..CHUNK], &first[..], "first chunk survived the grow");
+        assert_eq!(&all[CHUNK..], &second[..], "second chunk appended intact");
+
+        // reset() empties it and leaves it reusable.
+        out.reset();
+        assert_eq!(out.len(), 0);
+        assert!(out.is_empty());
+        out.write_bytes(&first);
+        assert_eq!(out.to_vec(), first, "buffer is reusable after reset");
+    }
+
     /// TupleFormatTest: three booleans accumulate correctly.
     #[test]
     fn test_format_multi_bool_size() {

@@ -668,6 +668,121 @@ mod tests {
         assert_eq!(input.read_string().unwrap(), "world");
     }
 
+    /// JE: UtfTest.testMultibyte (com/sleepycat/util/test/UtfTest)
+    ///
+    /// JE sweeps every Java `char` (0x0000..=0xFFFF) and compares UtfOps'
+    /// Modified-UTF-8 encoding, byte for byte, against the platform reference
+    /// encoder (`DataOutputStream.writeUTF`), then round-trips each char.
+    ///
+    /// Noxu uses Rust-native STANDARD UTF-8 over `str` (documented deviation:
+    /// Rust-native format, not Java `char[]` Modified UTF-8). The faithful,
+    /// CORE analog is: for every Unicode scalar value, the tuple string encoder
+    /// (a) round-trips through `write_string`/`read_string`, and (b) its on-wire
+    /// payload -- after stripping Noxu's null-escape framing -- is byte-identical
+    /// to Rust's reference `str::as_bytes()` UTF-8 encoder (the analog of JE's
+    /// byte-for-byte comparison against the platform encoder).
+    ///
+    /// N/A (Java-platform / documented deviation, NOT ported):
+    ///   * Modified-UTF-8: JE encodes U+0000 as the 2-byte sequence 0xC0 0x80
+    ///     ("FF reserved for null" check). Rust encodes U+0000 as a single 0x00
+    ///     byte; Noxu escapes it in-band as [0x00, 0x01]. Different framing by
+    ///     design.
+    ///   * Surrogate code units 0xD800..=0xDFFF: JE (`char`-oriented) encodes
+    ///     each unpaired surrogate as 3 bytes. Rust `char`/`str` cannot hold an
+    ///     unpaired surrogate at all, so this range is unrepresentable here and
+    ///     is skipped (language/type difference).
+    ///   * UtfOps.getByteLength(char[]) / getCharLength(byte[]) / bytesToChars
+    ///     char-array APIs: no char[] equivalent in Rust; covered implicitly by
+    ///     the round-trip below.
+    #[test]
+    fn test_utf_multibyte_full_unicode_sweep() {
+        // Reference encoder = Rust stdlib UTF-8 (str::as_bytes), the analog of
+        // JE's DataOutputStream reference.
+        let mut checked_1byte = 0usize;
+        let mut checked_2byte = 0usize;
+        let mut checked_3byte = 0usize;
+        let mut checked_4byte = 0usize;
+
+        for cp in 0u32..=0x10_FFFF {
+            let c = match char::from_u32(cp) {
+                Some(c) => c,
+                // Surrogate range 0xD800..=0xDFFF is not a valid Rust scalar
+                // value -- N/A (see doc comment). Skip.
+                None => continue,
+            };
+
+            let s = c.to_string();
+            let ref_bytes = s.as_bytes(); // stdlib reference UTF-8
+            match ref_bytes.len() {
+                1 => checked_1byte += 1,
+                2 => checked_2byte += 1,
+                3 => checked_3byte += 1,
+                4 => checked_4byte += 1,
+                other => panic!("unexpected UTF-8 len {other} for U+{cp:04X}"),
+            }
+
+            // (a) Round-trip through the tuple string codec.
+            let mut out = TupleOutput::new();
+            out.write_string(&s);
+            let framed = out.to_vec();
+            let mut input = TupleInput::new(&framed);
+            let decoded = input.read_string().unwrap();
+            assert_eq!(decoded, s, "round-trip failed for U+{cp:04X}");
+
+            // (b) On-wire payload byte-parity with the reference encoder,
+            // after stripping Noxu's null-escape framing. write_string maps
+            // 0x00 -> [0x00, 0x01] and terminates with [0x00, 0x00]. The only
+            // scalar whose UTF-8 contains 0x00 is U+0000 itself.
+            assert!(
+                framed.ends_with(&[0x00, 0x00]),
+                "missing [0,0] terminator for U+{cp:04X}"
+            );
+            let body = &framed[..framed.len() - 2];
+            let mut unescaped: Vec<u8> = Vec::with_capacity(body.len());
+            let mut i = 0usize;
+            while i < body.len() {
+                if body[i] == 0x00 {
+                    // must be an escaped null [0x00, 0x01]
+                    assert_eq!(
+                        body[i + 1],
+                        0x01,
+                        "unescaped 0x00 in body for U+{cp:04X}"
+                    );
+                    unescaped.push(0x00);
+                    i += 2;
+                } else {
+                    unescaped.push(body[i]);
+                    i += 1;
+                }
+            }
+            assert_eq!(
+                unescaped, ref_bytes,
+                "encoded bytes for U+{cp:04X} differ from stdlib UTF-8 reference"
+            );
+        }
+
+        // Guard against a vacuous sweep: every UTF-8 length tier must be hit.
+        assert!(checked_1byte > 0, "no 1-byte chars swept");
+        assert!(checked_2byte > 0, "no 2-byte chars swept");
+        assert!(checked_3byte > 0, "no 3-byte chars swept");
+        assert!(checked_4byte > 0, "no 4-byte chars swept");
+    }
+
+    /// JE: UtfTest.testMultibyte (empty-string boundary)
+    ///
+    /// JE's UtfOps.stringToBytes("") returns EMPTY_BYTES and bytesToString of
+    /// length 0 returns EMPTY_STRING. Noxu's empty string encodes to just the
+    /// [0x00, 0x00] terminator and round-trips to "".
+    #[test]
+    fn test_utf_empty_string() {
+        let mut out = TupleOutput::new();
+        out.write_string("");
+        let framed = out.to_vec();
+        assert_eq!(framed, vec![0x00, 0x00], "empty string is just terminator");
+        let mut input = TupleInput::new(&framed);
+        assert_eq!(input.read_string().unwrap(), "");
+    }
+
     #[test]
     fn test_bytes_round_trip() {
         let mut out = TupleOutput::new();
