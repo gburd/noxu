@@ -283,3 +283,27 @@ EnvironmentConfig::new(path)
     // Lock / txn timeouts to detect deadlocks quickly
     // (set via EnvironmentMutableConfig after open)
 ```
+
+## No Java object serialization (`serialVersionUID`) — versioned binary formats instead
+
+Noxu does not use Java object serialization (`java.io.Serializable` /
+`ObjectOutputStream` / `serialVersionUID`). Errors are `thiserror` enums
+(`NoxuError`) rather than serialized exception classes, and cross-version
+compatibility is handled by explicit, versioned binary formats rather than a
+JVM object serializer:
+
+- **On-disk log**: the `.ndb` format carries an explicit `LOG_VERSION`
+  (`noxu-log`), with `MIN_LOG_VERSION` / `FIRST_LOG_VERSION` governing which
+  older files remain readable.
+- **Replication**: the wire protocol negotiates an explicit protocol version
+  (`ReplicaProtocolVersion` / `FeederProtocolVersion` in `noxu-rep`).
+
+`noxu-bind`'s `simple_serial` is a compact, data-only binary encoding (it
+replaces `java.io.Serializable` for value marshalling) and deliberately
+carries no `serialVersionUID`-style version stamp; versioning is the
+responsibility of the formats above.
+
+Consequently, BDB-JE's serialize-compatibility test surface
+(`je.serializecompatibility`, 2 tests: `test_4_0_0`, `test_4_1_0`, which
+deserialize golden `.out` files and assert no `InvalidClassException`) is
+**N/A by design** — there is no `serialVersionUID` surface in Noxu to test.
