@@ -1113,6 +1113,22 @@ impl LockManager {
         self.preempted_nonempty.store(!p.is_empty(), Ordering::Relaxed);
     }
 
+    /// Test-only probe: whether `locker_id` currently carries the preempted
+    /// flag.  Used by the clear-at-end probes to observe that
+    /// `Txn::release_all_locks` (the real txn-end path) drops the flag on both
+    /// commit and abort.
+    #[cfg(test)]
+    pub(crate) fn is_preempted(&self, locker_id: i64) -> bool {
+        self.preempted.read().unwrap().contains(&locker_id)
+    }
+
+    /// Test-only probe for the hot-path gate: the value of the
+    /// `preempted_nonempty` fast-path atomic.
+    #[cfg(test)]
+    pub(crate) fn preempted_nonempty_flag(&self) -> bool {
+        self.preempted_nonempty.load(Ordering::Relaxed)
+    }
+
     /// Steals a lock for the given locker.
     ///
     /// Used by the HA replayer to forcibly acquire locks, removing all other

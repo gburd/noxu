@@ -2075,6 +2075,62 @@ mod tests {
         Txn::new(1, lock_manager)
     }
 
+    /// BLOCKER 1 probe (clear-at-end, COMMIT): a locker whose lock is stolen
+    /// (importunate HA-replay steal marks it preempted) has its preempted flag
+    /// CLEARED by the real txn-end path — `Txn::commit` -> `release_all_locks`,
+    /// NOT `release_all_for_locker`.  Before this fix the flag leaked forever.
+    #[test]
+    fn preempted_flag_cleared_after_commit_via_release_all_locks() {
+        let lm = Arc::new(LockManager::new());
+        let mut txn = Txn::new(7, lm.clone());
+
+        // txn 7 holds a read lock; an importunate stealer (txn 8) steals it,
+        // marking txn 7 preempted (the real production steal path).
+        txn.lock(500, LockType::Read, false).unwrap();
+        lm.lock_importunate_with_timeout(500, 8, LockType::Write, false, 200)
+            .expect("steal");
+        assert!(
+            lm.is_preempted(7),
+            "steal must mark the victim locker preempted"
+        );
+
+        // Real txn-end (commit) drains locks then clears the flag.
+        txn.commit().unwrap();
+        assert!(
+            !lm.is_preempted(7),
+            "commit via Txn::release_all_locks must clear the preempted flag"
+        );
+        // Last entry gone -> hot-path gate atomic goes back to false.
+        assert!(
+            !lm.preempted_nonempty_flag(),
+            "clearing the last preempted entry must reset preempted_nonempty"
+        );
+    }
+
+    /// BLOCKER 1 probe (clear-at-end, ABORT): same as above but the txn ABORTS.
+    /// `Txn::abort` also routes through `release_all_locks`, so the flag is
+    /// cleared on the abort path too.
+    #[test]
+    fn preempted_flag_cleared_after_abort_via_release_all_locks() {
+        let lm = Arc::new(LockManager::new());
+        let mut txn = Txn::new(9, lm.clone());
+
+        txn.lock(600, LockType::Read, false).unwrap();
+        lm.lock_importunate_with_timeout(600, 10, LockType::Write, false, 200)
+            .expect("steal");
+        assert!(lm.is_preempted(9), "steal must mark the victim preempted");
+
+        txn.abort().unwrap();
+        assert!(
+            !lm.is_preempted(9),
+            "abort via Txn::release_all_locks must clear the preempted flag"
+        );
+        assert!(
+            !lm.preempted_nonempty_flag(),
+            "clearing the last preempted entry must reset preempted_nonempty"
+        );
+    }
+
     #[test]
     fn test_create_txn() {
         let txn = create_test_txn();

@@ -213,8 +213,10 @@ fn lock_preemption_not_signalled_when_no_new_lock_taken() {
 ///
 /// Noxu now mirrors this with a lock-manager-level per-locker preempted flag
 /// (`LockManager::mark_preempted`, set by the steal; checked in the single lock
-/// funnel `lock_with_timeout_and_txn`; cleared at txn-end
-/// `release_all_for_locker`). The steal MECHANISM (master write wins) is
+/// funnel `lock_with_timeout_and_txn` behind a `preempted_nonempty` fast-path
+/// atomic; cleared at the real txn-end path `Txn::release_all_locks` ->
+/// `LockManager::clear_preempted`, on both commit and abort). The steal
+/// MECHANISM (master write wins) is
 /// unchanged — see `lock_preemption_master_write_wins_over_replica_reader`.
 #[test]
 fn lock_preemption_victim_is_notified_on_next_lock() {
