@@ -214,3 +214,159 @@ fn search_both_range_does_not_cross_key_boundary() {
     drop(c);
     txn.commit().unwrap();
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// GetSearchBothRangeTest.testSearchBeforeDups
+//
+// JE invariant: with sorted-dups, insert (1,1) and (1,2); `getSearchBothRange`
+// for (key=1, data=0) — a data value BEFORE all existing dups — must return
+// SUCCESS positioned at the FIRST dup (1,1), i.e. the smallest dup >= 0.
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn search_both_range_dup_data_before_all_dups_finds_first() {
+    let dir = TempDir::new().unwrap();
+    let (env, db) = open_env_db(&dir, "sbr_before_dups", true);
+    put(&env, &db, 1, 1);
+    put(&env, &db, 1, 2);
+
+    let txn = env.begin_transaction(None).unwrap();
+    let mut c = db.open_cursor_in(&txn, None).unwrap();
+    let mut k = ikey(1);
+    let mut d = ikey(0);
+    let s = c.get(&mut k, &mut d, Get::SearchBothRange, None).unwrap();
+    assert_eq!(s, OperationStatus::Success);
+    assert_eq!(val_u32(&k), 1);
+    assert_eq!(val_u32(&d), 1, "must land on the first dup >= 0");
+    drop(c);
+    txn.commit().unwrap();
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// GetSearchBothRangeTest.testSearchAfterDups
+//
+// JE invariant: with sorted-dups, insert (1,0),(1,1),(2,0),(2,1);
+// `getSearchBothRange(key=1, data=2)` — a data value PAST all dups of key 1 —
+// must return NotFound.  The data search must NOT cross the key boundary into
+// key 2 (whose dups also start at 0), which is the whole point of the test.
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn search_both_range_dup_data_after_all_dups_does_not_cross_key() {
+    let dir = TempDir::new().unwrap();
+    let (env, db) = open_env_db(&dir, "sbr_after_dups", true);
+    put(&env, &db, 1, 0);
+    put(&env, &db, 1, 1);
+    put(&env, &db, 2, 0);
+    put(&env, &db, 2, 1);
+
+    let txn = env.begin_transaction(None).unwrap();
+    let mut c = db.open_cursor_in(&txn, None).unwrap();
+    let mut k = ikey(1);
+    let mut d = ikey(2);
+    let s = c.get(&mut k, &mut d, Get::SearchBothRange, None).unwrap();
+    assert_eq!(
+        s,
+        OperationStatus::NotFound,
+        "data=2 is past all dups of key=1; must NOT cross into key=2"
+    );
+    drop(c);
+    txn.commit().unwrap();
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// GetSearchBothRangeTest.testSearchAfterDupsWithComparator
+//
+// JE invariant: same as testSearchAfterDups, but with a custom (identity-order)
+// btree comparator installed.  The "does not cross the key boundary" invariant
+// must hold regardless of the comparator.  JE uses `NormalComparator` (the
+// natural integer order); Noxu installs a big-endian-u32 comparator with a
+// stable identity, then asserts the same NotFound.
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn search_both_range_dup_after_dups_with_comparator_does_not_cross_key() {
+    use noxu_db::Comparator;
+    let dir = TempDir::new().unwrap();
+    let env_cfg = EnvironmentConfig::new(dir.path().to_path_buf())
+        .with_allow_create(true)
+        .with_transactional(true);
+    let env = noxu_db::Environment::open(env_cfg).unwrap();
+    let cmp = Comparator::new("be_u32_normal", |a: &[u8], b: &[u8]| a.cmp(b));
+    let db_cfg = DatabaseConfig::new()
+        .with_allow_create(true)
+        .with_transactional(true)
+        .with_sorted_duplicates(true)
+        .with_btree_comparator(cmp);
+    let db = env.open_database(None, "sbr_after_cmp", &db_cfg).unwrap();
+
+    put(&env, &db, 1, 0);
+    put(&env, &db, 1, 1);
+    put(&env, &db, 2, 0);
+    put(&env, &db, 2, 1);
+
+    let txn = env.begin_transaction(None).unwrap();
+    let mut c = db.open_cursor_in(&txn, None).unwrap();
+    let mut k = ikey(1);
+    let mut d = ikey(2);
+    let s = c.get(&mut k, &mut d, Get::SearchBothRange, None).unwrap();
+    assert_eq!(
+        s,
+        OperationStatus::NotFound,
+        "with a custom comparator, data=2 must still not cross key=1 -> key=2"
+    );
+    drop(c);
+    txn.commit().unwrap();
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// GetSearchBothRangeTest.testSearchAfterDeletedDup
+//
+// JE invariant: with sorted-dups, insert (1,1),(1,2),(1,3); delete (1,3) via
+// a cursor positioned by getSearchBothRange, then compress; a subsequent
+// getSearchBothRange(1,3) must return NotFound (the deleted dup slot must not
+// resurrect).  The initial getSearchBothRange(1,3) must SUCCEED (positioning
+// for the delete), proving the delete/compress — not a missing key — is what
+// makes the re-search fail.
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn search_both_range_dup_after_delete_and_compress_returns_not_found() {
+    let dir = TempDir::new().unwrap();
+    let (env, db) = open_env_db(&dir, "sbr_deleted_dup", true);
+    put(&env, &db, 1, 1);
+    put(&env, &db, 1, 2);
+    put(&env, &db, 1, 3);
+
+    // JE keeps ONE txn: position by getSearchBothRange, delete, compress,
+    // then re-search on the SAME txn (the cursor sees its own uncommitted
+    // delete). compress() is JE's dup-tree cleanup call; it is best-effort
+    // here (the delete is still uncommitted) and must not change the result.
+    let txn = env.begin_transaction(None).unwrap();
+    {
+        let mut c = db.open_cursor_in(&txn, None).unwrap();
+        let mut k = ikey(1);
+        let mut d = ikey(3);
+        let s = c.get(&mut k, &mut d, Get::SearchBothRange, None).unwrap();
+        assert_eq!(s, OperationStatus::Success, "the dup (1,3) exists");
+        assert_eq!(val_u32(&d), 3);
+        assert_eq!(
+            c.delete().unwrap(),
+            OperationStatus::Success,
+            "delete of the positioned dup succeeds"
+        );
+    }
+    let _ = env.compress();
+
+    let mut c = db.open_cursor_in(&txn, None).unwrap();
+    let mut k = ikey(1);
+    let mut d = ikey(3);
+    let s = c.get(&mut k, &mut d, Get::SearchBothRange, None).unwrap();
+    assert_eq!(
+        s,
+        OperationStatus::NotFound,
+        "re-searching for the deleted dup (1,3) must return NotFound"
+    );
+    drop(c);
+    txn.commit().unwrap();
+}
