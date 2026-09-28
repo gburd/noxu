@@ -7292,15 +7292,19 @@ impl Tree {
         is_locked: Option<&dyn Fn(u64) -> bool>,
     ) -> bool {
         // ---- Step 1: collect metadata without holding the write lock ----
-        let (is_delta, n_entries, id_key) = {
+        let (is_delta, n_entries, id_key, bin_node_id) = {
             {
                 let g = bin_arc.read();
                 match &*g {
                     TreeNode::Bottom(b) => {
                         // Identifier key = first full key in the BIN
-                        // (the: bin.getIdentifierKey()).
+                        // (the: bin.getIdentifierKey()).  For a BIN already
+                        // empty on entry (emptied by committed deletes,
+                        // NEW-INCOMP-EMPTY-BIN) there is no entry 0, so this
+                        // is `None` and the prune must locate the BIN by
+                        // its node_id instead of by key (see Step 3).
                         let id_key = b.get_full_key(0);
-                        (b.is_delta, b.entries.len(), id_key)
+                        (b.is_delta, b.entries.len(), id_key, b.node_id)
                     }
                     _ => return false, // not a BIN
                 }
@@ -7408,13 +7412,31 @@ impl Tree {
             // parent (branch) latch.  `prune_empty_bin` reproduces exactly
             // that re-validation.  See `prune_empty_bin` below.
             //
-            // Note: we only attempt the prune if n_entries was > 0 before
-            // compression (an already-empty BIN we never populated is left
-            // alone, matching the pre-existing guard).
-            if let Some(key) = id_key
-                && n_entries > 0
-            {
-                self.prune_empty_bin(&key);
+            // NEW-INCOMP-EMPTY-BIN: there are two ways a BIN reaches Step 3
+            // empty:
+            //
+            //   (a) it had `known_deleted` slots that Step 2 removed
+            //       (`n_entries > 0` on entry, `id_key` available) -- the
+            //       historical JE PendingDeleted path: prune by key via
+            //       `prune_empty_bin`, which re-descends by `id_key`.
+            //
+            //   (b) it was ALREADY empty on entry (`n_entries == 0`,
+            //       `id_key == None`) because committed deletes physically
+            //       removed every slot and left no tombstone.  There is no
+            //       entry-0 key to descend by, so we prune by node_id via
+            //       `prune_empty_bin_by_id`, which locates the specific BIN
+            //       and re-validates it under the parent write latch exactly
+            //       like `prune_empty_bin`.  This is the case JE's
+            //       INCompressor covers with its PendingDeleted queue and
+            //       Noxu previously never reached.
+            match id_key {
+                Some(key) if n_entries > 0 => {
+                    self.prune_empty_bin(&key);
+                }
+                _ => {
+                    // Already-empty BIN: prune by identity, not by key.
+                    self.prune_empty_bin_by_id(bin_node_id);
+                }
             }
             return true;
         }
@@ -7532,6 +7554,20 @@ impl Tree {
                         TreeNode::Internal(_) => return false,
                     }
                 }
+                // Last-child guard (JE Tree.searchDeletableSubTree,
+                // Tree.java:790-793): return null / no-op when
+                // `nodeLadder.get(0).parent.getNEntries() <= 1`.  Noxu always
+                // builds IN(root)->BIN, so pruning the tree's ONLY BIN would
+                // leave the parent (the root IN) childless (n_bins=0,
+                // n_ins=1) -- verify() is blind to it but the next put()
+                // panics SplitRequired and the DB is permanently un-writable.
+                // Same corruption as the by-id path; same fix.  Leave the
+                // empty BIN in place, like JE ("Root compression is no longer
+                // supported") and the base engine.
+                if p.entries.len() <= 1 {
+                    return false;
+                }
+
                 // Safe to prune: remove the BIN's slot from the parent IN.
                 // Mirrors the parent-slot removal `Tree.delete` performs for
                 // an empty BIN (Tree.java deleteEntry under the branch latch).
@@ -7552,6 +7588,151 @@ impl Tree {
         // (IN.updateMemorySize(-delta) → MemoryBudget.updateTreeMemoryUsage).
         // The pruned slot's key plus the fixed per-entry overhead matches the
         // `delete` accounting (key.len() + BIN_ENTRY_OVERHEAD).
+        if let Some(counter) = &self.memory_counter {
+            let delta = (removed_key_len + BIN_ENTRY_OVERHEAD) as i64;
+            counter.fetch_sub(delta, Ordering::Relaxed);
+        }
+
+        true
+    }
+
+    /// Prune an ALREADY-EMPTY BIN, locating it by `node_id` rather than by
+    /// key, and removing its parent-IN child slot ONLY IF the BIN is still
+    /// safe to prune.
+    ///
+    /// NEW-INCOMP-EMPTY-BIN: a BIN emptied by committed deletes has no
+    /// entry-0 key to descend by (`get_full_key(0) == None`), so the
+    /// key-descent `prune_empty_bin` cannot reach it.  This variant is the
+    /// same JE `Tree.delete(idKey)` / `Tree.searchDeletableSubTree`
+    /// (Tree.java ~line 755-800) re-validation invoked by
+    /// `INCompressor.pruneBIN` (INCompressor.java ~line 502-510), but it
+    /// finds the specific empty BIN by identity via
+    /// `find_parent_of_node_id` and applies the SAME abort conditions under
+    /// the **parent IN write latch**:
+    ///
+    /// * `bin.getNEntries() != 0`  -> NODE_NOT_EMPTY (a concurrent insert
+    ///   repopulated the BIN -- IC-1: never delete a live entry).
+    /// * `bin.isBINDelta()`        -> unexpectedState (deltas are never
+    ///   pruned; the collector already excludes deltas, this is defensive).
+    /// * `bin.nCursors() > 0`      -> CURSORS_EXIST (a cursor is parked on
+    ///   the empty BIN; leave it for a later pass rather than orphan the
+    ///   cursor).
+    ///
+    /// Locating the parent and removing the slot both happen while holding
+    /// the parent write latch, so no descender (they take `parent.read()`
+    /// hand-over-hand) can repopulate the BIN between the re-check and the
+    /// removal -- the IC-1 TOCTOU window is closed.
+    ///
+    /// A single-BIN tree (the root IS the BIN) has no parent IN, so
+    /// `find_parent_of_node_id` returns `None` and nothing is removed --
+    /// the tree stays valid with its (empty) root BIN, matching JE's
+    /// searchDeletableSubTree returning null for "the entire tree is
+    /// empty".
+    ///
+    /// Returns `true` iff a parent-IN slot was removed, `false` otherwise
+    /// (BIN repopulated, has a cursor, is a delta, is the root, or vanished
+    /// -- in every `false` case NOTHING is removed).
+    pub fn prune_empty_bin_by_id(&self, bin_node_id: u64) -> bool {
+        let root = match self.get_root() {
+            Some(r) => r,
+            None => return false,
+        };
+
+        // If the root itself is the (empty) BIN there is no parent IN to
+        // remove a slot from -- keep the root BIN, exactly like
+        // `prune_empty_bin` and JE's searchDeletableSubTree.
+        {
+            let g = root.read();
+            let root_is_target = match &*g {
+                TreeNode::Bottom(b) => b.node_id == bin_node_id,
+                TreeNode::Internal(_) => false,
+            };
+            if root_is_target {
+                return false;
+            }
+        }
+
+        // Locate the parent IN and the child slot index by identity.
+        let (parent_arc, child_index) =
+            match Self::find_parent_of_node_id(&root, bin_node_id) {
+                Some(p) => p,
+                None => return false, // already detached / not found
+            };
+
+        // ---- Re-validate and remove the slot UNDER THE PARENT WRITE LATCH ----
+        // Holding parent.write() excludes all descenders (they need
+        // parent.read()), so the BIN cannot be repopulated between the
+        // re-check and the slot removal.
+        let mut parent_guard = parent_arc.write();
+        let pruned_bin_id;
+        let removed_key_len = match &mut *parent_guard {
+            TreeNode::Internal(p) => {
+                let child = match p.get_child(child_index) {
+                    Some(c) => c,
+                    None => return false, // slot already vacated / invalid
+                };
+                // Re-validate the child BIN under the parent latch.
+                {
+                    let cg = child.read();
+                    match &*cg {
+                        TreeNode::Bottom(b) => {
+                            // A concurrent split could have replaced the
+                            // child at this slot with a DIFFERENT BIN; only
+                            // prune the exact BIN we set out to prune.
+                            if b.node_id != bin_node_id {
+                                return false;
+                            }
+                            // JE: bin.getNEntries() != 0 -> NODE_NOT_EMPTY.
+                            if !b.entries.is_empty() {
+                                return false;
+                            }
+                            // JE: bin.isBINDelta() -> unexpectedState.
+                            if b.is_delta {
+                                return false;
+                            }
+                            // JE: bin.nCursors() > 0 -> CURSORS_EXIST.
+                            if b.cursor_count > 0 {
+                                return false;
+                            }
+                            pruned_bin_id = b.node_id;
+                        }
+                        // A split could have replaced the child with an IN;
+                        // never prune in that case.
+                        TreeNode::Internal(_) => return false,
+                    }
+                }
+                // Last-child guard (JE Tree.searchDeletableSubTree,
+                // Tree.java:790-793): return null / no-op when
+                // `nodeLadder.get(0).parent.getNEntries() <= 1`.  Noxu always
+                // builds IN(root)->BIN, so pruning the tree's ONLY BIN would
+                // leave the parent (the root IN) childless (n_bins=0,
+                // n_ins=1) -- verify() is blind to it but the next put()
+                // panics SplitRequired and the DB is permanently un-writable.
+                // Refuse to prune the parent's last child: leave the empty
+                // BIN in place, exactly like JE ("Root compression is no
+                // longer supported") and the base engine (never prunes the
+                // last BIN).
+                if p.entries.len() <= 1 {
+                    return false;
+                }
+
+                // Safe to prune: remove the BIN's slot from the parent IN.
+                // T-4: remove_entry shifts the node-level child array too.
+                let removed = p.remove_entry(child_index);
+                p.dirty = true;
+                removed.key.len()
+            }
+            TreeNode::Bottom(_) => return false,
+        };
+        drop(parent_guard);
+
+        // JE: removing the BIN slot detaches the BIN from the tree; the
+        // evictor must drop it from its LRU lists (Evictor.remove).
+        self.note_removed(pruned_bin_id);
+
+        // Preserve the memory-counter bookkeeping that `self.delete`
+        // performed (IN.updateMemorySize(-delta)).  The pruned slot's key
+        // plus the fixed per-entry overhead matches the `delete` accounting.
         if let Some(counter) = &self.memory_counter {
             let delta = (removed_key_len + BIN_ENTRY_OVERHEAD) as i64;
             counter.fetch_sub(delta, Ordering::Relaxed);
@@ -9275,11 +9456,26 @@ impl Tree {
         }
     }
 
-    /// Collect all BINs that have at least one `known_deleted` slot.
+    /// Collect all BINs the compressor should visit: those with at least one
+    /// `known_deleted` slot, AND those that are *entirely empty*.
     ///
-    /// INCompressor queue-drain scan in the: the daemon iterates
-    /// the in-memory IN list and identifies BINs that still hold zombie deleted
-    /// slots.  Each returned `Arc` can be passed directly to `compress_bin()`.
+    /// INCompressor queue-drain scan: the daemon iterates the in-memory IN
+    /// list and identifies BINs that still hold zombie deleted slots.  Each
+    /// returned `Arc` can be passed directly to `compress_bin()`.
+    ///
+    /// NEW-INCOMP-EMPTY-BIN: Noxu is lock-based / single-phase, so a committed
+    /// delete PHYSICALLY removes the slot immediately and leaves NO
+    /// `known_deleted` tombstone behind.  A BIN emptied by all-committed
+    /// deletes therefore has zero `known_deleted` slots and was previously
+    /// skipped here, so its (now-empty) index space was never reclaimed --
+    /// `prune_empty_bin` was effectively dead in production for that case.
+    /// JE's INCompressor prunes an empty BIN from its parent during
+    /// compression regardless of how it became empty
+    /// (`INCompressor.pruneBIN` -> `Tree.delete(idKey)`); we match that by
+    /// also surfacing `entries.is_empty()` BINs to the compressor, which then
+    /// routes them through the same `prune_empty_bin` re-validation.  A
+    /// single-BIN-tree root that is empty is safely a no-op inside
+    /// `prune_empty_bin` (there is no parent IN to prune from).
     pub fn collect_bins_with_known_deleted(
         &self,
     ) -> Vec<Arc<RwLock<TreeNode>>> {
@@ -9297,7 +9493,15 @@ impl Tree {
         let guard = node_arc.read();
         match &*guard {
             TreeNode::Bottom(b) => {
-                if b.entries.iter().any(|e| e.known_deleted) {
+                // Collect a BIN that either carries a `known_deleted`
+                // tombstone (the historical JE PendingDeleted path) OR has
+                // been emptied by committed deletes (NEW-INCOMP-EMPTY-BIN).
+                // A BIN-delta is never surfaced: it is not a full BIN and
+                // cannot be pruned (compress_bin/prune_empty_bin reject it).
+                if !b.is_delta
+                    && (b.entries.is_empty()
+                        || b.entries.iter().any(|e| e.known_deleted))
+                {
                     out.push(Arc::clone(node_arc));
                 }
             }
@@ -12848,6 +13052,85 @@ mod tests {
                 i
             );
         }
+    }
+
+    /// NEW-INCOMP-EMPTY-BIN last-child guard (BY-KEY path, prune_empty_bin).
+    ///
+    /// Noxu always builds IN(root)->BIN, so a DB emptied down to its sole BIN
+    /// has a parent (the root IN) with exactly ONE child.  Pruning that last
+    /// child via the by-key path (prune_empty_bin, reached from Step 3 case
+    /// (a): a BIN whose known_deleted slots Step 2 drained to empty) would
+    /// leave a CHILDLESS root IN (n_bins=0, n_ins=1) and the next insert
+    /// returns Err(SplitRequired) forever -- the DB is permanently
+    /// un-writable (at the public-API layer this surfaces as the SplitRequired
+    /// panic after 64 retries).
+    ///
+    /// JE Tree.searchDeletableSubTree (Tree.java:790-793): returns null when
+    /// nodeLadder.get(0).parent.getNEntries() <= 1, and Tree.delete is then a
+    /// no-op ("Root compression is no longer supported").
+    ///
+    /// The guard makes prune_empty_bin a NO-OP when the parent has <= 1 entry.
+    /// This test asserts WRITABILITY (a subsequent insert must SUCCEED, i.e.
+    /// NOT return SplitRequired) -- verify()/structure checks are blind to a
+    /// childless root, so the insert-after-empty is the real gate.
+    ///
+    /// FAILS if the guard is removed (insert returns Err(SplitRequired));
+    /// PASSES with the guard.
+    #[test]
+    fn test_prune_empty_bin_last_child_guard_keeps_tree_writable() {
+        let tree = Tree::new(1, 4);
+        // Two keys, both in the sole BIN -> tree shape is IN(root)->BIN.
+        tree.insert(b"k0".to_vec(), vec![0], Lsn::new(1, 0)).unwrap();
+        tree.insert(b"k1".to_vec(), vec![1], Lsn::new(1, 1)).unwrap();
+        // Exactly one BIN (the tree's only child of the root IN).
+        assert_eq!(
+            tree.collect_stats().n_bins,
+            1,
+            "setup: tree must be IN(root)->single BIN"
+        );
+
+        // Empty the sole BIN (committed deletes physically remove the slots).
+        assert!(tree.delete(b"k0"));
+        assert!(tree.delete(b"k1"));
+
+        // Locate the (now empty) sole BIN and an id_key that routes to it.
+        let empty_bin = first_empty_non_root_bin(&tree)
+            .expect("the emptied sole BIN must still be attached to the root");
+        let id_key = b"k0".to_vec(); // routes to the sole BIN
+
+        let bins_before = tree.collect_stats().n_bins;
+
+        // Prune the LAST child by key: the guard must make this a NO-OP.
+        let pruned = tree.prune_empty_bin(&id_key);
+        assert!(
+            !pruned,
+            "last-child guard: prune_empty_bin must no-op on the parent's \
+             only child (JE Tree.java:790-793)"
+        );
+
+        // The empty BIN must still be attached (bin_count unchanged).
+        assert_eq!(
+            tree.collect_stats().n_bins,
+            bins_before,
+            "last-child guard: the sole empty BIN must remain attached"
+        );
+        // ...and it must be the SAME node (not detached / replaced).
+        {
+            let g = empty_bin.read();
+            assert!(
+                matches!(&*g, TreeNode::Bottom(b) if b.entries.is_empty()),
+                "the sole BIN must still be present and empty"
+            );
+        }
+
+        // WRITABILITY GATE: a subsequent insert must SUCCEED.  Without the
+        // guard the root IN is childless and this returns Err(SplitRequired).
+        tree.insert(b"k2".to_vec(), vec![2], Lsn::new(1, 2))
+            .expect("insert after empty must succeed (not SplitRequired)");
+        assert!(
+            tree.search(b"k2").is_some_and(|s| s.exact_parent_found),
+            "the reinserted key must be findable"
+        );
     }
 
     // ========================================================================
