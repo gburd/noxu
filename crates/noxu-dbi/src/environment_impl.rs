@@ -2825,6 +2825,27 @@ impl EnvironmentImpl {
         Ok((db_guard.entry_count(), db_id))
     }
 
+    /// NEW-CLEANER-DBOBSOLETE: count a removed/truncated database's entire log
+    /// footprint (its LNs + INs) obsolete in the shared `UtilizationTracker`,
+    /// so the ORDINARY (force=false) cleaner reclaims those files.
+    ///
+    /// JE `DatabaseImpl.finishDeleteProcessing` -> `LogManager.countObsoleteDb`
+    /// -> `BaseUtilizationTracker.countObsoleteDb` (`DatabaseImpl.java:1624`):
+    /// at remove/truncate commit the whole DB is counted obsolete via its
+    /// per-DB `dbFileSummaries` (active = total - already-obsolete), so the
+    /// cleaner sees the freed space without a tree walk.  Noxu keeps the
+    /// per-DB summaries on the tracker itself (CLN-9), so this is a single
+    /// [`UtilizationTracker::count_obsolete_db`] call keyed by `db_id`.
+    ///
+    /// Idempotent: `count_obsolete_db` drops the DB's per-DB summaries after
+    /// counting, so a second call for the same `db_id` is a no-op (it also
+    /// avoids double-counting if the same removal is applied twice).
+    fn count_database_obsolete(&self, db_id: DatabaseId) {
+        if let Some(tracker) = &self.utilization_tracker {
+            tracker.lock().count_obsolete_db(db_id.id() as u32);
+        }
+    }
+
     /// Removes (deletes) a database by name.
     ///
     /// Returns an error if any open
@@ -2863,6 +2884,14 @@ impl EnvironmentImpl {
             db.write().start_delete();
             db.write().finish_delete();
         }
+        // NEW-CLEANER-DBOBSOLETE: the removed DB's LNs/INs are now dead log
+        // bytes.  Count the whole footprint obsolete so the force=false
+        // cleaner reclaims those files (JE finishDeleteProcessing ->
+        // countObsoleteDb).  Runs on the apply path only: for a deferred
+        // (transactional) remove this is reached from the commit callback via
+        // `remove_database_if_id`, and never on abort (the callback is simply
+        // not invoked), so a rolled-back removal leaves the space live.
+        self.count_database_obsolete(db_id);
         // DBEVICT-1: drop any stashed eviction state for this name too, or a
         // FUTURE database created under the same name would be reconstructed
         // with this deleted database's root_lsn/entry_count (silent
@@ -3058,6 +3087,20 @@ impl EnvironmentImpl {
             }
             old_count
         };
+
+        // NEW-CLEANER-DBOBSOLETE: this is the AUTO-COMMIT truncate (txn=None):
+        // the old records' LNs/INs are dead log bytes, but the per-record
+        // `DeleteLN`s above were logged non-transactionally with no `db_id`
+        // and no obsolete count, so nothing marked the original footprint
+        // obsolete.  Count the whole DB obsolete so the force=false cleaner
+        // reclaims it (JE finishDeleteProcessing -> countObsoleteDb).
+        //
+        // The TRANSACTIONAL truncate path (NEW-TRUNCATE-1) does NOT reach here:
+        // it drains the DB record-by-record through `Database::delete_all_
+        // under_txn` (cursor deletes), so every deleted LN is already counted
+        // obsolete at commit via the cursor's abort-LSN accounting.  Whole-DB
+        // counting there would double-count.
+        self.count_database_obsolete(db_id);
 
         Ok(count)
     }
