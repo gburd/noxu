@@ -344,6 +344,10 @@ listed in [References](#references).
   value no longer risks writing an empty record. Old-format logs remain readable
   (no log-version bump). Removing or truncating a database does not yet reclaim its
   freed space under non-forced cleaning (tracked as NEW-CLEANER-DBOBSOLETE).
+- **Known limitation:** an empty B-tree leaf (BIN) left behind by committed deletes is
+  not yet reclaimed by compression (NEW-INCOMP-EMPTY-BIN). Records are correctly gone and
+  all lookups/scans remain correct — this is a space-reclamation gap only, tracked for a
+  fix.
 - **Two-node (RF=2) elections no longer elect a node that lags the arbiter
   (NEW-ELECT-ARBITER-VETO, `[#25311]`).** When the sole surviving electable node
   lagged the arbiter's durable VLSN, the election could make it master below the
