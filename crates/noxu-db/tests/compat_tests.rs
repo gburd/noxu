@@ -889,6 +889,12 @@ fn cursor_search_gte_edge_cases() {
 // ---------------------------------------------------------------------------
 
 /// : ReadCommittedTest.testWithTransactionConfig
+/// JE: ReadCommittedTest.testWithLockMode / testWithCursorConfig /
+/// testNonCloningWithTransactionConfig / testNonCloningWithCursorConfig — all
+/// four exercise the SAME read-committed property (read locks are released as
+/// the cursor moves off a record) via different config entry points; Noxu
+/// selects read-committed via TransactionConfig / LockMode (CursorConfig no
+/// longer carries read_committed), and has no nonSticky cursor variant.
 /// Under read-committed, a second read in the same transaction may see a value
 /// committed by another transaction between the two reads.
 ///

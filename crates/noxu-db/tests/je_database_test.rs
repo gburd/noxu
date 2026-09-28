@@ -999,3 +999,63 @@ fn database_buffer_overflowing_put_round_trips() {
         "exact content round-trip"
     );
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// DatabaseConfigTest.testConfigConflict
+//
+// JE: DatabaseConfigTest.testConfigConflict
+// JE invariant: once a database has been created with sortedDuplicates=true,
+// re-opening the SAME name with sortedDuplicates=false must be rejected (a
+// persistent-config conflict); after removing it, it can be recreated with the
+// opposite setting.
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn database_config_conflict_dups_mismatch_rejected() {
+    let dir = TempDir::new().unwrap();
+    let env_cfg = EnvironmentConfig::new(dir.path().to_path_buf())
+        .with_allow_create(true)
+        .with_transactional(true);
+    let env = noxu_db::Environment::open(env_cfg).unwrap();
+
+    // Create with sorted_duplicates=true.
+    let d1 = env
+        .open_database(
+            None,
+            "fooDups",
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_sorted_duplicates(true)
+                .with_transactional(true),
+        )
+        .unwrap();
+
+    // Re-open the SAME name with sorted_duplicates=false -> conflict.
+    let r = env.open_database(
+        None,
+        "fooDups",
+        &DatabaseConfig::new()
+            .with_sorted_duplicates(false)
+            .with_transactional(true),
+    );
+    assert!(
+        r.is_err(),
+        "reopening a dup db with sorted_duplicates=false must be rejected"
+    );
+
+    // After removing it, it may be recreated with the opposite setting.
+    d1.close().unwrap();
+    env.remove_database(None, "fooDups").unwrap();
+    let d2 = env
+        .open_database(
+            None,
+            "fooDups",
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_sorted_duplicates(false)
+                .with_transactional(true),
+        )
+        .unwrap();
+    assert!(!d2.config().sorted_duplicates);
+    d2.close().unwrap();
+}

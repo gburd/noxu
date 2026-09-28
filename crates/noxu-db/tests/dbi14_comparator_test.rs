@@ -46,6 +46,9 @@ fn cursor_keys(db: &noxu_db::Database) -> Vec<Vec<u8>> {
 
 /// Reverse (descending byte) order.  Cursor walk must yield keys in DESCENDING
 /// order, the exact opposite of the default unsigned-byte ascending walk.
+// JE: DatabaseComparatorsTest.testSR12517 / testSR16816ReverseComparator —
+// a custom (reverse) Btree comparator drives the stored sort order and the
+// cursor walk order.
 #[test]
 fn headline1_reverse_btree_comparator_orders_cursor_walk() {
     let dir = TempDir::new().unwrap();
@@ -159,6 +162,9 @@ fn headline2_reopen_without_matching_comparator_fails() {
 // JE parity: RecoveryTest.testBasicRecoveryWithBtreeComparator — a DB
 // opened with a custom Btree comparator keeps its comparator order across
 // a close+reopen (recovery); the persisted comparator identity is honoured.
+// JE: DatabaseConfigTest.testPersistentAndMutableConfigs (Btree-comparator
+// persistence branch) — a persisted comparator identity is honoured across a
+// close+reopen when a matching comparator is re-supplied.
 #[test]
 fn headline2_reopen_with_matching_identity_succeeds() {
     let dir = TempDir::new().unwrap();
@@ -219,6 +225,9 @@ fn headline2_reopen_with_wrong_identity_fails() {
     assert!(res.is_err(), "mismatched comparator identity must fail open");
 }
 
+// JE: DatabaseConfigTest.testConfigOverrideUpdateSR15743 —
+// setOverrideBtreeComparator(true) lets a subsequent open replace the
+// persisted comparator instead of failing the mismatch check.
 #[test]
 fn headline2_override_allows_replacing_persisted_comparator() {
     let dir = TempDir::new().unwrap();
@@ -252,6 +261,10 @@ fn headline2_override_allows_replacing_persisted_comparator() {
 // HEADLINE TEST 3 — duplicate comparator orders dup data.
 // ───────────────────────────────────────────────────────────────────────────
 
+// JE: DatabaseComparatorsTest.testSR16816ReverseComparator (dup-comparator
+// branch) / DatabaseConfigTest.testPersistentAndMutableConfigs
+// (Duplicate-comparator persistence branch) — a custom duplicate comparator
+// orders dup data.
 #[test]
 fn headline3_duplicate_comparator_orders_dup_data() {
     let dir = TempDir::new().unwrap();

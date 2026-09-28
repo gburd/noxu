@@ -207,3 +207,47 @@ fn test_local_write_is_a_no_op_on_non_replicated_environment() {
     assert_eq!(db.get_in(&txn, b"k").unwrap().as_deref(), Some(&b"v"[..]));
     txn.commit().unwrap();
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// ReadCommittedTest.testIllegalConfig  (INTENTIONAL DEVIATION, documented)
+//
+// JE: ReadCommittedTest.testIllegalConfig raises IllegalArgumentException when
+// a TransactionConfig sets BOTH readCommitted and readUncommitted (or
+// readCommitted and serializableIsolation), and when a CursorConfig sets both
+// readCommitted and readUncommitted.
+//
+// Noxu deviation: `TransactionConfig` enforces the readCommitted/
+// readUncommitted mutual exclusion BY CONSTRUCTION — `set_read_committed(true)`
+// clears `read_uncommitted` and vice-versa (last-setter-wins) — rather than
+// raising at `begin_transaction`.  The invariant JE protects (the two cannot be
+// simultaneously in effect) still holds; only the enforcement point differs.
+// (The readCommitted+serializable combo is likewise not validated at begin —
+// serializable isolation is a separate flag that controls read-lock retention;
+// this is a documented deviation, not a covered assertion.)  This test pins the
+// by-construction mutual exclusion so a regression that let both flags be set
+// simultaneously would fail here.
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn read_committed_and_read_uncommitted_are_mutually_exclusive_by_construction()
+{
+    use noxu_db::TransactionConfig;
+
+    let mut c = TransactionConfig::new();
+    c.set_read_committed(true);
+    assert!(c.read_committed && !c.read_uncommitted);
+
+    // Setting read_uncommitted clears read_committed.
+    c.set_read_uncommitted(true);
+    assert!(
+        c.read_uncommitted && !c.read_committed,
+        "set_read_uncommitted must clear read_committed (mutual exclusion)"
+    );
+
+    // ...and back the other way.
+    c.set_read_committed(true);
+    assert!(
+        c.read_committed && !c.read_uncommitted,
+        "set_read_committed must clear read_uncommitted (mutual exclusion)"
+    );
+}
