@@ -7,9 +7,9 @@ use crate::get::Get;
 use crate::lock_mode::LockMode;
 use crate::operation_status::OperationStatus;
 use crate::put::Put;
+use crate::secondary_database::SecondaryHook;
 use crate::transaction::Transaction;
 use bytes::Bytes;
-use crate::secondary_database::SecondaryHook;
 use noxu_dbi::{
     CursorImpl, DatabaseImpl, DbiError, GetMode, PutMode, SearchMode,
 };
@@ -35,9 +35,8 @@ use std::sync::atomic::AtomicBool;
 pub(crate) struct CursorSecMaint {
     /// The primary's live secondary-hook registry (shared `Arc`, so a
     /// secondary registered after the cursor was opened is still seen).
-    secondaries: Arc<
-        RwLock<Vec<std::sync::Weak<dyn SecondaryHook + Send + Sync>>>,
-    >,
+    secondaries:
+        Arc<RwLock<Vec<std::sync::Weak<dyn SecondaryHook + Send + Sync>>>>,
     /// Shared handles to build a throwaway probe cursor for the old-value
     /// fetch (the delete-then-insert of a REPLACE needs the pre-write data
     /// so the OLD secondary key can be removed).  Mirrors the handles
@@ -65,9 +64,7 @@ impl CursorSecMaint {
     }
 
     /// Live secondary hooks (upgrades the `Weak`s, dropping any dangling).
-    fn live(
-        &self,
-    ) -> Vec<Arc<dyn SecondaryHook + Send + Sync>> {
+    fn live(&self) -> Vec<Arc<dyn SecondaryHook + Send + Sync>> {
         self.secondaries.read().iter().filter_map(|w| w.upgrade()).collect()
     }
 
@@ -99,11 +96,12 @@ impl CursorSecMaint {
         {
             probe = probe.with_txn(inner);
         }
-        match probe.search(key, None, SearchMode::Set).map_err(map_cursor_err)?
+        match probe
+            .search(key, None, SearchMode::Set)
+            .map_err(map_cursor_err)?
         {
             noxu_dbi::OperationStatus::Success => {
-                let (_, value) =
-                    probe.get_current().map_err(map_cursor_err)?;
+                let (_, value) = probe.get_current().map_err(map_cursor_err)?;
                 Ok(Some(value.to_vec()))
             }
             _ => Ok(None),
@@ -267,7 +265,13 @@ impl<'txn> Cursor<'txn> {
         txn: Option<&'txn Transaction>,
         sec_maint: Option<CursorSecMaint>,
     ) -> Self {
-        Self { inner, state: CursorState::NotInitialized, read_only, txn, sec_maint }
+        Self {
+            inner,
+            state: CursorState::NotInitialized,
+            read_only,
+            txn,
+            sec_maint,
+        }
     }
 
     /// Advances the cursor to the next record and returns it, or `None`
@@ -621,10 +625,9 @@ impl<'txn> Cursor<'txn> {
                     }
                     // Keyed put: fetch the current value for `key` (None if
                     // this is a fresh insert), same as Database::put_bytes.
-                    _ => (
-                        key_bytes.to_vec(),
-                        sm.fetch_old(self.txn, key_bytes)?,
-                    ),
+                    _ => {
+                        (key_bytes.to_vec(), sm.fetch_old(self.txn, key_bytes)?)
+                    }
                 }
             } else {
                 (key_bytes.to_vec(), None)

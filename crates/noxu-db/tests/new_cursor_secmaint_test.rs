@@ -220,9 +220,7 @@ fn cursor_put_current_maintains_secondary() {
         // Position on the key, then replace its data via put_current.
         let mut k = DatabaseEntry::from_bytes(b"k");
         let mut v = DatabaseEntry::new();
-        let st = cur
-            .get(&mut k, &mut v, noxu_db::Get::Search, None)
-            .unwrap();
+        let st = cur.get(&mut k, &mut v, noxu_db::Get::Search, None).unwrap();
         assert_eq!(st, noxu_db::OperationStatus::Success);
         cur.put(
             &DatabaseEntry::from_bytes(b"k"),
@@ -265,9 +263,7 @@ fn cursor_delete_maintains_secondary() {
         let mut cur = pri.open_cursor(None).unwrap();
         let mut k = DatabaseEntry::from_bytes(b"k");
         let mut v = DatabaseEntry::new();
-        let st = cur
-            .get(&mut k, &mut v, noxu_db::Get::Search, None)
-            .unwrap();
+        let st = cur.get(&mut k, &mut v, noxu_db::Get::Search, None).unwrap();
         assert_eq!(st, noxu_db::OperationStatus::Success);
         cur.delete().unwrap();
         cur.close().unwrap();
@@ -303,7 +299,11 @@ fn cursor_put_under_txn_maintains_secondary_and_aborts_together() {
         cur.close().unwrap();
         txn.commit().unwrap();
     }
-    assert_eq!(lookup(&sec, 105), Some(vec![5]), "committed cursor put maps 105->5");
+    assert_eq!(
+        lookup(&sec, 105),
+        Some(vec![5]),
+        "committed cursor put maps 105->5"
+    );
 
     // Abort path: neither primary nor secondary sees the write.
     {
