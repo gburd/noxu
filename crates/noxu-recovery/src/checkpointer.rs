@@ -3480,4 +3480,98 @@ mod tests {
              LN's file -> LogFileNotFound); obsolete set = {obs:?}"
         );
     }
+
+    /// Lock order (JE DirtyINMap.java:57-61): IN latches first, then the
+    /// dirty-map monitor.  The evictor calls `get_eviction_provisional` while
+    /// it holds the BIN latch (evictor.rs `flush_dirty_node_to_log`:
+    /// `try_write` then the coordination call).  If the checkpointer holds
+    /// `checkpoint_flush_levels` while it read-latches tree nodes
+    /// (`collect_dirty_upper_ins`), the two deadlock (ABBA).  The test holds
+    /// a BIN latch, lets the checkpointer reach that BIN, then makes the
+    /// evictor's coordination call.  Both must finish within the timeout.
+    ///
+    /// R-FLUSHLVL (BUG-CKPT-FLUSHLEVELS-ABBA): port of 776ed8eb; the fix is in
+    /// 08fb42f6 (flush levels computed with no mutex held, then published).
+    #[test]
+    fn test_flush_levels_mutex_not_held_across_in_latch() {
+        use noxu_log::FileManager;
+        use noxu_tree::tree::{BIN_LEVEL, Tree};
+        use noxu_util::lsn::Lsn;
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let fm = Arc::new(
+            FileManager::new(dir.path(), false, 64 * 1024 * 1024, 100).unwrap(),
+        );
+        let lm =
+            Arc::new(LogManager::new(Arc::clone(&fm), 3, 1024 * 1024, 65536));
+        // Fanout 4 + 20 inserts: 3-level tree with dirty upper INs.
+        let tree = Tree::new(1, 4);
+        for i in 0u32..20 {
+            let key = format!("key{:04}", i).into_bytes();
+            tree.insert(key, b"d".to_vec(), Lsn::new(1, 100 + i)).unwrap();
+        }
+        let bin = tree.first_bin_arc().expect("tree has a BIN");
+        let tree_arc = Arc::new(RwLock::new(tree));
+        let cp = Arc::new(
+            Checkpointer::new(CheckpointConfig::default())
+                .with_log_manager(Arc::clone(&lm))
+                .with_tree(Arc::clone(&tree_arc), 1),
+        );
+        cp.checkpoint_in_progress.store(true, Ordering::Release);
+
+        let (latched_tx, latched_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let (ev_tx, ev_rx) = mpsc::channel();
+        let cp_ev = Arc::clone(&cp);
+        // "Evictor": BIN latch held across the coordination call.
+        std::thread::spawn(move || {
+            let bin_guard = bin.write();
+            latched_tx.send(()).unwrap();
+            go_rx.recv().unwrap();
+            // Wait until the checkpointer holds the flush-levels mutex (it
+            // then blocks on this BIN), or 1 s if it never takes it before
+            // latching (it is then blocked on this BIN without the mutex).
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while Instant::now() < deadline
+                && cp_ev.checkpoint_flush_levels.try_lock().is_ok()
+            {
+                std::thread::yield_now();
+            }
+            let p = cp_ev.get_eviction_provisional(1, BIN_LEVEL);
+            drop(bin_guard);
+            let _ = ev_tx.send(p);
+        });
+        latched_rx.recv().unwrap();
+
+        let (ck_tx, ck_rx) = mpsc::channel();
+        let cp_ck = Arc::clone(&cp);
+        std::thread::spawn(move || {
+            let _ = ck_tx.send(cp_ck.flush_upper_ins_internal().is_ok());
+        });
+        go_tx.send(()).unwrap();
+
+        let p = ev_rx.recv_timeout(Duration::from_secs(10)).expect(
+            "evictor blocked on checkpoint_flush_levels while holding a BIN \
+             latch the checkpointer is waiting for (ABBA deadlock; JE \
+             DirtyINMap.java:57-61 orders IN latch before the map)",
+        );
+        // Levels are not yet published while the checkpointer computes them,
+        // so the evictor logs Provisional::No, as it does during the BIN pass.
+        assert_eq!(p, Provisional::No);
+        assert!(
+            ck_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("checkpointer must finish once the BIN latch is free"),
+            "flush_upper_ins_internal failed"
+        );
+        // Coordination is preserved: once published, a BIN below the flush
+        // level is logged provisionally.
+        assert_eq!(cp.get_eviction_provisional(1, BIN_LEVEL), Provisional::Yes);
+
+        cp.checkpoint_in_progress.store(false, Ordering::Release);
+        cp.checkpoint_flush_levels.lock().unwrap().clear();
+    }
 }
