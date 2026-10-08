@@ -1586,12 +1586,18 @@ impl Checkpointer {
         // first WAL write.  The evictor acquires the same Mutex to read it
         // (Mutex provides the necessary happens-before).  The RAII guard in
         // do_checkpoint clears the map via CheckpointGuard::drop.
+        //
+        // Lock order: IN latches first, then the map mutex (JE
+        // DirtyINMap.java:57-61).  The evictor calls get_eviction_provisional
+        // while holding a BIN latch, so the levels are computed here with NO
+        // mutex held (the walk read-latches every resident node) and only
+        // published under the mutex -- JE DirtyINMap.java:279-316 calls
+        // DbTree.getHighestLevel unsynchronized and then fills
+        // highestFlushLevels under `synchronized (this)`.  Until publication
+        // the map is empty, so an eviction in that window logs
+        // Provisional::No exactly as during the BIN pass above.
         {
-            let mut levels = self
-                .checkpoint_flush_levels
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            levels.clear();
+            let mut computed: HashMap<u64, i32> = HashMap::new();
             for (db_id, tree_arc) in &trees_to_flush {
                 // REC-AA: the recorded highest flush level is
                 // `max(dirty-upper-IN-level) + 1`, bounded by the root level
@@ -1618,9 +1624,15 @@ impl Checkpointer {
                 if let Some(level) = flush_level
                     && level > 0
                 {
-                    levels.insert(*db_id, level);
+                    computed.insert(*db_id, level);
                 }
             }
+            let mut levels = self
+                .checkpoint_flush_levels
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            levels.clear();
+            levels.extend(computed);
         }
 
         for (db_id, tree_arc) in trees_to_flush {
