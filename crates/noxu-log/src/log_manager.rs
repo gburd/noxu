@@ -2646,6 +2646,14 @@ mod tests {
         use std::sync::Arc;
         use std::thread;
 
+        // This stress test does real reads/writes with NO faultdisk, so it
+        // must not run WHILE another test has the process-global faultdisk
+        // installed — a stray injected corruption/fault would otherwise bleed
+        // into its writes and surface as a spurious checksum error.  Take the
+        // same FAULT_LOCK the faultdisk tests take so they are mutually
+        // exclusive (seen under the default parallel runner, 1/20).
+        let _fault_lock = FAULT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
         let dir = TempDir::new().unwrap();
         let fm = Arc::new(
             FileManager::new(dir.path(), false, 500_000_000, 10).unwrap(),
