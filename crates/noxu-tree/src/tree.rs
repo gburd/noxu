@@ -9601,6 +9601,13 @@ pub struct TreeStats {
     /// `PreloadStats::lns_loaded`), and including routing entries inflated
     /// both by roughly `n_ins`.
     pub n_leaf_entries: u64,
+    /// Number of known-deleted LN slots retained but not yet compacted
+    /// (JE `getDeletedLNCount()`).  A transactional delete keeps the slot
+    /// KNOWN-DELETED until commit + compressor; these slots are hidden from
+    /// every read path but still occupy a BIN entry, so they are counted
+    /// here, separate from the live record count in `n_leaf_entries` (JE
+    /// `getLNCount()`).
+    pub n_deleted_leaf_entries: u64,
     /// Height of the tree (1 = root is a BIN, 2 = one level above BINs, …).
     pub height: u32,
 }
@@ -9633,7 +9640,24 @@ impl Tree {
         match &*guard {
             TreeNode::Bottom(b) => {
                 stats.n_bins += 1;
-                stats.n_leaf_entries += b.entries.len() as u64;
+                // JE `getLNCount()` is the LIVE record count; a retained
+                // known-deleted slot (KD-slot retention) is reported
+                // separately by `getDeletedLNCount()`.  Counting KD slots in
+                // `n_leaf_entries` would inflate the documented
+                // "approximate record count" (`DatabaseStats::leaf_node_count`)
+                // by the number of not-yet-compacted tombstones.
+                let (live, kd) = b
+                    .entries
+                    .iter()
+                    .fold((0u64, 0u64), |(l, d), e| {
+                        if e.known_deleted {
+                            (l, d + 1)
+                        } else {
+                            (l + 1, d)
+                        }
+                    });
+                stats.n_leaf_entries += live;
+                stats.n_deleted_leaf_entries += kd;
             }
             TreeNode::Internal(n) => {
                 stats.n_ins += 1;

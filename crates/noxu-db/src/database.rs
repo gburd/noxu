@@ -2023,7 +2023,7 @@ impl Database {
             match guard.collect_btree_stats() {
                 Some(ts) => BtreeStats {
                     leaf_node_count: ts.n_leaf_entries,
-                    deleted_leaf_node_count: 0,
+                    deleted_leaf_node_count: ts.n_deleted_leaf_entries,
                     bottom_internal_node_count: ts.n_bins,
                     internal_node_count: ts.n_ins,
                     main_tree_max_depth: ts.height,
