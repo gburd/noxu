@@ -583,3 +583,76 @@ fn dos_producer_queue_timeout_config_flows_and_scan_succeeds() {
          still return every record"
     );
 }
+
+// -----------------------------------------------------------------------------
+// A2 (v7.11.1 backport, entry point: DISK-ORDERED SCANNER)
+// -----------------------------------------------------------------------------
+//
+// A future-version log file that appears AFTER the environment was opened (so
+// the open-time preflight never saw it) must make the disk-ordered scan FAIL
+// CLOSED — surface the version error through `next()` — rather than silently
+// skip the file and return a partial result as if nothing were wrong.
+#[test]
+fn disk_ordered_scan_fails_closed_on_future_version_file() {
+    use noxu_log::file_header::LOG_VERSION;
+    let dir = TempDir::new().unwrap();
+    let env = open_env(&dir);
+    let db = open_db(&env, "dos_future");
+
+    for i in 0..200 {
+        put(
+            &db,
+            format!("key-{i:05}").as_bytes(),
+            format!("value-{i}").as_bytes(),
+        );
+    }
+    env.checkpoint(None).unwrap();
+
+    // Find the highest existing .ndb file number, then plant a CRC-valid
+    // future-version file strictly above it.
+    let mut highest = 0u32;
+    for e in std::fs::read_dir(dir.path()).unwrap() {
+        let p = e.unwrap().path();
+        if p.extension().and_then(|x| x.to_str()) == Some("ndb") {
+            let name = p.file_stem().unwrap().to_str().unwrap();
+            if let Ok(n) = name.parse::<u32>() {
+                highest = highest.max(n);
+            }
+        }
+    }
+    let future_num = highest + 1;
+    let mut bytes = vec![
+        78u8, 79, 88, 85, 68, 66, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    bytes[8..12].copy_from_slice(&(LOG_VERSION + 1).to_be_bytes());
+    bytes[24..28].copy_from_slice(&future_num.to_be_bytes());
+    let crc =
+        noxu_log::checksum::ChecksumValidator::compute_range(&bytes, 0, 32);
+    bytes[32..36].copy_from_slice(&crc.to_be_bytes());
+    bytes.extend_from_slice(&[0xAB; 64]); // nonzero record tail
+    std::fs::write(dir.path().join(format!("{future_num:08}.ndb")), &bytes)
+        .unwrap();
+
+    // The scan must surface an error, not silently skip the future file.
+    let mut cursor =
+        db.open_disk_ordered_cursor(DiskOrderedCursorConfig::new()).unwrap();
+    let mut k = DatabaseEntry::new();
+    let mut v = DatabaseEntry::new();
+    let mut saw_error = false;
+    loop {
+        match cursor.next(&mut k, &mut v) {
+            Ok(OperationStatus::Success) => continue,
+            Ok(_) => break, // clean end
+            Err(_) => {
+                saw_error = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        saw_error,
+        "disk-ordered scan must fail closed on a future-version log file, \
+         not silently skip it",
+    );
+}

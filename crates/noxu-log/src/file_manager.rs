@@ -186,6 +186,30 @@ impl FileManager {
         // Lock the environment
         manager.lock_environment()?;
 
+        // A2 (v7.11.1): validate EVERY existing file header before any later
+        // step can truncate, delete, or recover a file. `get_file_handle`
+        // routes through `read_and_validate_header` -> `FileHeader::validate`,
+        // which rejects a version outside `[MIN_LOG_VERSION, LOG_VERSION]`
+        // with `LogError::VersionMismatch`. Doing this here — on BOTH
+        // writable and read-only opens, and BEFORE `find_end_of_log`'s
+        // orphan-truncate path — closes the holes where `mmap_file` / the
+        // scanner would otherwise accept a CRC-valid future-version file and
+        // ignore its records, return stale data, or delete a header-only
+        // future file as an orphan. A future highest-numbered file must never
+        // be mistaken for a torn-tail orphan.
+        for file_num in manager.list_file_numbers()? {
+            // A 0-length file carries no header and no version claim (a
+            // just-created file before its header is written, or an empty
+            // decoy). The scanner already skips these (`if file_len == 0 {
+            // continue }`); the preflight must too, or it would reject a
+            // benign empty file. A file with ANY bytes must present a header
+            // whose version is in-window.
+            if manager.get_file_length(file_num)? == 0 {
+                continue;
+            }
+            manager.get_file_handle(file_num)?;
+        }
+
         Ok(manager)
     }
 
@@ -926,6 +950,12 @@ impl FileManager {
     /// while other processes write to the file.  During recovery, log files
     /// are read-only, making this safe.
     pub fn mmap_file(&self, file_num: u32) -> Result<Mmap> {
+        // A2 (v7.11.1): validate the header before mapping. A future-version
+        // file created AFTER this FileManager was opened (so the open-time
+        // preflight never saw it) must be refused the moment it is mapped,
+        // not mapped blindly and its records ignored. `get_file_handle`
+        // surfaces `LogError::VersionMismatch` for an out-of-window version.
+        self.get_file_handle(file_num)?;
         // Never mmap the current write file. It can be appended to
         // concurrently (pwrite64 on the log-writer thread) while a
         // disk-ordered cursor reads it; `memmap2` requires that a mapped file

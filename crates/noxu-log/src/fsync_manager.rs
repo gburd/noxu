@@ -1447,10 +1447,18 @@ mod tests {
                     // returns — the durable watermark this committer observes.
                     let fl2 = Arc::clone(&fl);
                     let sl2 = Arc::clone(&sl);
-                    let durable = mgr2
+                    let fl_synced = Arc::clone(&fl);
+                    // Model the production caller (log_manager.rs:1143): pass
+                    // the committer's own LSN as `target_lsn` and the global
+                    // durable watermark as `synced_watermark`, so the manager's
+                    // LSN-coverage short-circuits apply to THIS committer.
+                    let _durable = mgr2
                         .flush_and_sync(
-                            0,
-                            || 0,
+                            my_lsn,
+                            move || {
+                                fl_synced
+                                    .load(std::sync::atomic::Ordering::Acquire)
+                            },
                             move || {
                                 let covered = sl2
                                     .load(std::sync::atomic::Ordering::SeqCst);
@@ -1471,11 +1479,22 @@ mod tests {
                             },
                         )
                         .unwrap();
+                    // The real durability watermark the committer observes is
+                    // the GLOBAL flushed_lsn (as the production caller returns
+                    // `last_synced_lsn`, not the raw per-call eol), CAS-maxed by
+                    // every completed fsync.  The per-call return value of a
+                    // piggybacking waiter is the leader's recorded eol and is
+                    // intentionally not asserted on here.
+                    let durable = Lsn::from_u64(
+                        fl.load(std::sync::atomic::Ordering::Acquire),
+                    );
 
-                    // Post-condition: the durable watermark returned to this
-                    // committer (leader's own eol, or the leader's recorded
-                    // result for a piggybacking waiter) must cover my_lsn, and
-                    // the global flushed_lsn must be ≥ my_lsn.
+                    // Post-condition (fsync-before-commit): once
+                    // flush_and_sync has returned, this committer's bytes are
+                    // durable, i.e. the global durable watermark covers my_lsn.
+                    // This is exactly the guarantee the production caller
+                    // (log_manager.rs) relies on when it returns
+                    // `last_synced_lsn` after a successful fsync.
                     let fl_now = fl.load(std::sync::atomic::Ordering::SeqCst);
                     assert!(
                         durable.as_u64() >= my_lsn,

@@ -13,7 +13,7 @@ use noxu_log::faultdisk::{self, FaultController, FaultKind};
 use noxu_log::{
     FileManager, LogEntryType, LogFileReader, LogManager, Provisional,
 };
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 struct FaultReset;
@@ -29,9 +29,16 @@ fn manager(dir: &tempfile::TempDir) -> Arc<LogManager> {
     Arc::new(LogManager::new(fm, 3, 256, 4096))
 }
 
-// Run this executable with --test-threads=1: faultdisk is process-global.
+// faultdisk is process-global and these controls also share the real
+// per-file write latch and the LogManager I/O-invalid flag; every test in
+// this executable takes FAULT_LOCK so the suite is correct under the
+// default parallel runner, not only `--test-threads=1`.  Same pattern as
+// crates/noxu-dbi/tests/wal_obsolete_retry_test.rs.
+static FAULT_LOCK: Mutex<()> = Mutex::new(());
+
 #[test]
 fn disk_full_retry_must_not_leave_a_gap_before_acknowledged_entries() {
+    let _fault_lock = FAULT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _reset = FaultReset;
     faultdisk::uninstall();
     let dir = tempfile::tempdir().unwrap();
@@ -82,6 +89,7 @@ fn disk_full_retry_must_not_leave_a_gap_before_acknowledged_entries() {
 
 #[test]
 fn sync_must_not_cover_an_unwritten_oversized_reservation() {
+    let _fault_lock = FAULT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let lm = manager(&dir);
     lm.log(LogEntryType::Trace, b"old", Provisional::No, true, true).unwrap();
@@ -162,9 +170,10 @@ fn sync_must_not_cover_an_unwritten_oversized_reservation() {
 // independent control, join both threads, and assert the FINAL durable
 // watermark never covers un-pwritten bytes.
 //
-// Run with --test-threads=1 (faultdisk-free, but shares the process file latch).
+// Shares the process file latch and I/O-invalid flag; serialised via FAULT_LOCK.
 #[test]
 fn no_sync_drain_must_not_let_sync_publish_a_false_durable_watermark() {
+    let _fault_lock = FAULT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let lm = manager(&dir);
     // First, a flushed record so the log FILE physically exists on disk (its
@@ -248,6 +257,7 @@ fn no_sync_drain_must_not_let_sync_publish_a_false_durable_watermark() {
 #[cfg(target_os = "linux")]
 #[test]
 fn partial_write_error_requires_fail_stop_or_complete_rollback() {
+    let _fault_lock = FAULT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // Isolate the process's soft file-size limit and ignored SIGXFSZ. No unsafe
     // code or production injection hooks; the kernel performs the short write.
     if std::env::var_os("NOXU_PARTIAL_APPEND_CHILD").is_none() {
@@ -332,6 +342,7 @@ impl noxu_log::LogWriteObserver for PanicObserver {
 
 #[test]
 fn buffered_observer_panic_must_not_leak_a_pin() {
+    let _fault_lock = FAULT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let fm =
         Arc::new(FileManager::new(dir.path(), false, 1_000_000, 100).unwrap());

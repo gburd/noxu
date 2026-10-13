@@ -973,38 +973,47 @@ impl EnvironmentImpl {
             // Read-only environment: run a read-only scan to recover both
             // the name map and the trees so that open_database() can find
             // registered databases and their committed data.
-            if let Ok(fm) = FileManager::new(
+            //
+            // A2 (v7.11.1): these two steps used to be `if let Ok(..)`, which
+            // SWALLOWED every error — including a `LogError::VersionMismatch`
+            // for a future-version file — leaving the env half-recovered and
+            // silently serving stale data. Propagate instead: a read-only open
+            // of an unreadable log must fail loudly, exactly like the writable
+            // path. `FileManager::new`'s preflight already rejects a future
+            // version, so this just surfaces it.
+            let fm = FileManager::new(
                 &env_home, true, // read_only
                 0,    // default log file size
                 0,    // default cache size
-            ) {
-                let fm_arc = Arc::new(fm);
-                let mut scanner =
-                    FileManagerLogScanner::new(Arc::clone(&fm_arc));
-                let mut rmgr = noxu_recovery::RecoveryManager::new();
-                let mut recovery_trees: HashMap<u64, noxu_tree::Tree> =
-                    HashMap::new();
-                recovery_trees.insert(1u64, noxu_tree::Tree::new(1, 256));
-                if let Ok(info) =
-                    rmgr.recover_all(&mut scanner, &mut recovery_trees, true)
-                {
-                    for (name, db_id) in info.recovered_db_names {
-                        recovered_names
-                            .insert(name, DatabaseId::new(db_id as i64));
-                    }
-                    // DBI-14: capture persisted comparator identities
-                    // (read-only reopen path).
-                    for (name, ids) in info.recovered_db_comparators {
-                        recovered_comparators.insert(name, ids);
-                    }
-                    // NEW-5: capture persisted per-DB fanouts (read-only).
-                    for (name, fanout) in info.recovered_db_fanouts {
-                        recovered_fanouts.insert(name, fanout);
-                    }
-                }
-                for (db_id, tree) in recovery_trees {
-                    recovered.insert(db_id, tree);
-                }
+            )
+            .map_err(|e| DbiError::EnvironmentFailure {
+                reason: format!("failed to init read-only FileManager: {e}"),
+            })?;
+            let fm_arc = Arc::new(fm);
+            let mut scanner = FileManagerLogScanner::new(Arc::clone(&fm_arc));
+            let mut rmgr = noxu_recovery::RecoveryManager::new();
+            let mut recovery_trees: HashMap<u64, noxu_tree::Tree> =
+                HashMap::new();
+            recovery_trees.insert(1u64, noxu_tree::Tree::new(1, 256));
+            let info = rmgr
+                .recover_all(&mut scanner, &mut recovery_trees, true)
+                .map_err(|e| DbiError::RecoveryFailure {
+                    reason: format!("read-only recovery failed: {e}"),
+                })?;
+            for (name, db_id) in info.recovered_db_names {
+                recovered_names.insert(name, DatabaseId::new(db_id as i64));
+            }
+            // DBI-14: capture persisted comparator identities
+            // (read-only reopen path).
+            for (name, ids) in info.recovered_db_comparators {
+                recovered_comparators.insert(name, ids);
+            }
+            // NEW-5: capture persisted per-DB fanouts (read-only).
+            for (name, fanout) in info.recovered_db_fanouts {
+                recovered_fanouts.insert(name, fanout);
+            }
+            for (db_id, tree) in recovery_trees {
+                recovered.insert(db_id, tree);
             }
             None
         };

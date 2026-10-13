@@ -409,6 +409,18 @@ fn produce(
         if cancel.load(Ordering::Acquire) {
             return;
         }
+        // A2 (v7.11.1): validate this file's header before scanning it. A
+        // future-version file that appeared after the env was opened (so the
+        // open-time preflight never saw it) is a hard error on this scan path,
+        // not a silently skipped file. `get_file_handle` surfaces
+        // `LogError::VersionMismatch`; the scanner's own `scan_forward`
+        // returns a bare `Vec` with no error channel, so we must gate here.
+        if let Err(e) = log_manager.file_manager().get_file_handle(file_num) {
+            let _ = tx.send(Err(DbiError::OperationFailed(format!(
+                "disk-ordered scan: refusing log file {file_num}: {e}"
+            ))));
+            return;
+        }
         let start = noxu_util::Lsn::new(file_num, 0);
         let end = noxu_util::Lsn::new(file_num.saturating_add(1), 0);
         let entries: Vec<PositionedEntry> = scanner.scan_forward(start, end);
