@@ -137,8 +137,10 @@ fn rc_get_first_never_sees_uncommitted() {
     let (torn, iters) = torn_under(|cur| {
         let mut k = DatabaseEntry::new();
         let mut d = DatabaseEntry::new();
-        matches!(cur.get(&mut k, &mut d, Get::First, None), Ok(OperationStatus::Success))
-            && saw_bvalue(&d)
+        matches!(
+            cur.get(&mut k, &mut d, Get::First, None),
+            Ok(OperationStatus::Success)
+        ) && saw_bvalue(&d)
     });
     assert!(!torn, "RC get_first observed uncommitted value. iters={iters}");
 }
@@ -151,8 +153,10 @@ fn rc_get_last_never_sees_uncommitted() {
     let (torn, iters) = torn_under(|cur| {
         let mut k = DatabaseEntry::new();
         let mut d = DatabaseEntry::new();
-        matches!(cur.get(&mut k, &mut d, Get::Last, None), Ok(OperationStatus::Success))
-            && saw_bvalue(&d)
+        matches!(
+            cur.get(&mut k, &mut d, Get::Last, None),
+            Ok(OperationStatus::Success)
+        ) && saw_bvalue(&d)
     });
     assert!(!torn, "RC get_last observed uncommitted value. iters={iters}");
 }

@@ -1015,8 +1015,11 @@ impl SecondaryDatabase {
         // handle Mutex deadlocks a concurrent writer that holds the Mutex and
         // waits for the sec-index write lock.  JE reads the primary through a
         // handle reference with no monitor held.
-        let pri_found =
-            self.state.primary_handle.get_into(txn, pri_key_entry.data(), data)?;
+        let pri_found = self.state.primary_handle.get_into(
+            txn,
+            pri_key_entry.data(),
+            data,
+        )?;
         if !pri_found {
             // Secondary refers to a missing primary — integrity issue.
             return Err(NoxuError::SecondaryIntegrityException(format!(

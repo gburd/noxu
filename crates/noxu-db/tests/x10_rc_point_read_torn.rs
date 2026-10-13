@@ -27,8 +27,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 
 use noxu_db::{
-    Database, DatabaseConfig, Environment, EnvironmentConfig,
-    TransactionConfig,
+    Database, DatabaseConfig, Environment, EnvironmentConfig, TransactionConfig,
 };
 use tempfile::TempDir;
 

@@ -9916,7 +9916,8 @@ impl Tree {
                 }
             }
             LogEntryType::BINDelta => {
-                let Some(e) = Self::parse_delta_entries(&entry.node_data) else {
+                let Some(e) = Self::parse_delta_entries(&entry.node_data)
+                else {
                     return LoggedChildLookup::Undecidable;
                 };
                 match e.into_iter().next() {

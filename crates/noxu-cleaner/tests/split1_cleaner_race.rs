@@ -22,10 +22,10 @@ use std::sync::Arc;
 use noxu_cleaner::{InLookupResult, RealTreeLookup, TreeLookup};
 use noxu_log::entry::in_log_entry::InLogEntry;
 use noxu_log::{FileManager, LogEntryType, LogManager, Provisional};
-use std::sync::RwLock;
 use noxu_tree::{Tree, TreeNode};
 use noxu_txn::LockManager;
 use noxu_util::{Lsn, NULL_LSN};
+use std::sync::RwLock;
 
 #[test]
 fn detached_live_bin_is_not_counted_obsolete() {
@@ -84,7 +84,8 @@ fn detached_live_bin_is_not_counted_obsolete() {
 
     // The cleaner now processes the file holding bin_lsn.  The live image MUST
     // be recognised as live (Found) and re-faulted, never counted obsolete.
-    let lookup = RealTreeLookup::new(Arc::clone(&tree), Arc::new(LockManager::new()));
+    let lookup =
+        RealTreeLookup::new(Arc::clone(&tree), Arc::new(LockManager::new()));
     let verdict = lookup.lookup_in(db_id as i64, bin_id as i64, bin_lsn);
     assert_eq!(
         verdict,
@@ -94,7 +95,6 @@ fn detached_live_bin_is_not_counted_obsolete() {
          under a live reference"
     );
 }
-
 
 #[test]
 fn superseded_image_is_counted_obsolete() {

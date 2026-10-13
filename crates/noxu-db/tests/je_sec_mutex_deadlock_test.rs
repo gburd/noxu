@@ -152,7 +152,11 @@ fn is_retriable(e: &noxu_db::NoxuError) -> bool {
 
 /// Spawn a watchdog that aborts the process if `done` is not set within
 /// `secs`.  This turns the pre-fix undetectable hang into a hard failure.
-fn watchdog(done: Arc<AtomicBool>, secs: u64, msg: &'static str) -> thread::JoinHandle<()> {
+fn watchdog(
+    done: Arc<AtomicBool>,
+    secs: u64,
+    msg: &'static str,
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(secs);
         while Instant::now() < deadline {
@@ -251,7 +255,8 @@ fn sec_read_vs_primary_delete_makes_progress() {
     }
     let key = b"20".to_vec();
     let done = Arc::new(AtomicBool::new(false));
-    let wd = watchdog(Arc::clone(&done), 30, "sec read vs primary delete wedged");
+    let wd =
+        watchdog(Arc::clone(&done), 30, "sec read vs primary delete wedged");
     let barrier = Arc::new(Barrier::new(2));
 
     let deleter = {

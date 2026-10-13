@@ -564,7 +564,8 @@ impl Database {
         // clone is an independent handle: its own open flag means its
         // close/drop only decrements the shared DatabaseImpl reference count,
         // leaving the user's handle open.
-        let own_open = Arc::new(AtomicBool::new(self.open.load(Ordering::Acquire)));
+        let own_open =
+            Arc::new(AtomicBool::new(self.open.load(Ordering::Acquire)));
         Database {
             name: self.name.clone(),
             id: self.id,
@@ -3385,7 +3386,10 @@ mod tests {
         let txn = env.begin_transaction(None).unwrap();
         clone.put_in(&txn, b"kc", b"vc").unwrap();
         txn.abort().unwrap();
-        assert!(db.get(b"kc").unwrap().is_none(), "aborted clone write must not persist");
+        assert!(
+            db.get(b"kc").unwrap().is_none(),
+            "aborted clone write must not persist"
+        );
 
         // Closing the clone must NOT tear the DatabaseImpl down while `db` is
         // still open: the original keeps working and the refcount drops by one.
