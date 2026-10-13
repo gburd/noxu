@@ -664,7 +664,15 @@ impl LockManager {
         // zero/negative wait, it simply times out (LockManager.java:298-306 /
         // 729-738).
         if txn_timeout_remaining_ms == Some(0) {
-            self.flush_and_clear_waiter(table_idx, lsn, locker_id);
+            // Honor the grant/timeout race (JE validateOwnership): a concurrent
+            // release() may have granted us between Phase 1 (shard released)
+            // and here.  If so, keep the lock as a successful grant rather
+            // than flushing + erroring (which would leak a ghost owner).
+            if self.validate_ownership_or_flush(
+                table_idx, lsn, locker_id, lock_type,
+            ) {
+                return self.granted_wait_grant(initial_grant, lock_type);
+            }
             self.stats.lock_timeouts.fetch_add(1, Ordering::Relaxed);
             return Err(self.txn_timeout_error(locker_id));
         }
@@ -691,7 +699,7 @@ impl LockManager {
             .check_deadlock_for_waiter(lsn, locker_id, lock_type, &owner_ids)
         {
             // We are the chosen victim.  Flush from waiter list and throw.
-            // H-2: use flush_and_clear_waiter to acquire shard before
+            // H-2: use validate_ownership_or_flush to acquire shard before
             // waiter_graph (canonical lock ordering).
             //
             // TXN-F4 (design point, intentionally NOT changed): JE
@@ -703,7 +711,18 @@ impl LockManager {
             // victim-consistency conclusion on its next check slice (≤50 ms),
             // which holds because all checks read the same `waiter_graph`
             // snapshot and use the same deterministic victim selection.
-            self.flush_and_clear_waiter(table_idx, lsn, locker_id);
+            //
+            // Grant/timeout race (JE validateOwnership, checkAndHandleDeadlock
+            // -> dlr.isOwner, LockManager.java:572): a concurrent release()
+            // may have granted us between Phase 1 and this check.  A granted
+            // locker is never a deadlock victim — keep the lock as a success
+            // rather than flushing + erroring (which would leak a ghost owner
+            // and stall every later waiter on this LSN).
+            if self.validate_ownership_or_flush(
+                table_idx, lsn, locker_id, lock_type,
+            ) {
+                return self.granted_wait_grant(initial_grant, lock_type);
+            }
             return Err(deadlock_err);
         }
 
@@ -729,6 +748,7 @@ impl LockManager {
                 // We were woken by the releasing thread which set our flag and
                 // called notify_all.  Ownership was already transferred to us
                 // inside release() -> try_lock().
+                drop(granted_guard);
                 break;
             }
 
@@ -741,7 +761,13 @@ impl LockManager {
             // tie resolves to TransactionTimeout.
             if txn_expired(elapsed_ms) {
                 drop(granted_guard);
-                self.flush_and_clear_waiter(table_idx, lsn, locker_id);
+                if self.validate_ownership_or_flush(
+                    table_idx, lsn, locker_id, lock_type,
+                ) {
+                    // Granted during the timeout window (JE isOwner check):
+                    // keep the lock, treat as a successful grant.
+                    break;
+                }
                 self.stats.lock_timeouts.fetch_add(1, Ordering::Relaxed);
                 return Err(self.txn_timeout_error(locker_id));
             }
@@ -753,7 +779,11 @@ impl LockManager {
                 // Already past the lock deadline before we slept this iteration.
                 drop(granted_guard);
                 // H-2: shard before waiter_graph.
-                self.flush_and_clear_waiter(table_idx, lsn, locker_id);
+                if self.validate_ownership_or_flush(
+                    table_idx, lsn, locker_id, lock_type,
+                ) {
+                    break;
+                }
                 self.stats.lock_timeouts.fetch_add(1, Ordering::Relaxed);
                 return Err(TxnError::LockTimeout {
                     timeout_ms,
@@ -802,6 +832,7 @@ impl LockManager {
 
             if *granted_guard {
                 // Granted while we were sleeping.
+                drop(granted_guard);
                 break;
             }
 
@@ -822,14 +853,22 @@ impl LockManager {
                     lock_type,
                     &cur_owner_ids,
                 ) {
-                    // H-2: shard before waiter_graph.
-                    self.flush_and_clear_waiter(table_idx, lsn, locker_id);
+                    // H-2: shard before waiter_graph.  JE checks isOwner
+                    // before declaring a deadlock victim
+                    // (checkAndHandleDeadlock -> dlr.isOwner, :572): a lock
+                    // granted during the detection window is not a victim.
+                    if self.validate_ownership_or_flush(
+                        table_idx, lsn, locker_id, lock_type,
+                    ) {
+                        break;
+                    }
                     return Err(deadlock_err);
                 }
             }
             granted_guard = mutex.lock();
 
             if *granted_guard {
+                drop(granted_guard);
                 break;
             }
 
@@ -839,7 +878,11 @@ impl LockManager {
                 // F22/C6: txn-level deadline wins the tie (checked first).
                 if txn_expired(elapsed_ms) {
                     drop(granted_guard);
-                    self.flush_and_clear_waiter(table_idx, lsn, locker_id);
+                    if self.validate_ownership_or_flush(
+                        table_idx, lsn, locker_id, lock_type,
+                    ) {
+                        break;
+                    }
                     self.stats.lock_timeouts.fetch_add(1, Ordering::Relaxed);
                     return Err(self.txn_timeout_error(locker_id));
                 }
@@ -847,7 +890,11 @@ impl LockManager {
                 if timeout_ms > 0 && elapsed_ms >= timeout_ms {
                     drop(granted_guard);
                     // H-2: shard before waiter_graph.
-                    self.flush_and_clear_waiter(table_idx, lsn, locker_id);
+                    if self.validate_ownership_or_flush(
+                        table_idx, lsn, locker_id, lock_type,
+                    ) {
+                        break;
+                    }
                     self.stats.lock_timeouts.fetch_add(1, Ordering::Relaxed);
                     return Err(TxnError::LockTimeout {
                         timeout_ms,
@@ -865,33 +912,37 @@ impl LockManager {
             // Spurious wakeup or slice expired without timeout; loop.
         }
 
-        drop(granted_guard);
         self.clear_wait(locker_id);
 
-        // Determine which grant type to report.  On wakeup the lock type we
-        // actually hold is exactly what we requested (or a promotion of it).
-        // Reconstruct the grant type from context.
-        //
-        // WaitRestart: the waiter's lock_type was changed to Restart in
-        // lock_impl::lock(), so the lock was never added to the owner set.
-        // Returning RangeRestart tells the caller (lock_ln / put) to abort
-        // the current scan and restart — mirroring JE's RangeRestartException.
-        let grant = match initial_grant {
-            LockGrantType::WaitNew => LockGrantType::New,
-            LockGrantType::WaitPromotion => LockGrantType::Promotion,
-            LockGrantType::WaitRestart => {
-                return Err(TxnError::RangeRestart);
-            }
-            LockGrantType::IllegalUpgrade => {
-                return Err(TxnError::IllegalUpgrade {
-                    held: LockType::None,
-                    requested: lock_type,
-                });
-            }
-            other => other,
-        };
+        self.granted_wait_grant(initial_grant, lock_type)
+    }
 
-        Ok(grant)
+    /// Reconstruct the grant type to report after a wait exits via a GRANT
+    /// (either a normal wakeup or an ownership race detected on a timeout /
+    /// deadlock-victim exit).  On wakeup the lock type we actually hold is
+    /// exactly what we requested (or a promotion of it); JE's
+    /// `waitForLock`/`finishLock` returns `result.lockGrant` for the granted
+    /// request (LockManager.java:615-616).
+    ///
+    /// WaitRestart: the waiter's lock_type was changed to Restart in
+    /// lock_impl::lock(), so the lock was never added to the owner set.
+    /// Returning RangeRestart tells the caller (lock_ln / put) to abort the
+    /// current scan and restart — mirroring JE's RangeRestartException.
+    fn granted_wait_grant(
+        &self,
+        initial_grant: LockGrantType,
+        lock_type: LockType,
+    ) -> Result<LockGrantType, TxnError> {
+        match initial_grant {
+            LockGrantType::WaitNew => Ok(LockGrantType::New),
+            LockGrantType::WaitPromotion => Ok(LockGrantType::Promotion),
+            LockGrantType::WaitRestart => Err(TxnError::RangeRestart),
+            LockGrantType::IllegalUpgrade => Err(TxnError::IllegalUpgrade {
+                held: LockType::None,
+                requested: lock_type,
+            }),
+            other => Ok(other),
+        }
     }
 
     /// Builds a [`TxnError::TransactionTimeout`] for `locker_id`.
@@ -1480,32 +1531,92 @@ impl LockManager {
     }
 
     /// Removes `locker_id` from the on-shard waiter list and from the
-    /// incremental waiter graph, in canonical lock order (shard first).
+    /// incremental waiter graph, in canonical lock order (shard first) — see
+    /// [`Self::validate_ownership_or_flush`], which performs the flush and the
+    /// ownership-race check that every wait-exit path uses.
     ///
     /// H-2 (2026 audit F-6.2): all victim-cleanup paths must
     /// acquire the shard mutex BEFORE (or without) the waiter_graph mutex.
-    /// This helper enforces the ordering: it locks the shard, flushes the
-    /// waiter entry, drops the shard guard, then calls `clear_wait()` to
-    /// remove from the waiter_graph.  Never call `clear_wait()` before this.
-    fn flush_and_clear_waiter(
+    /// `validate_ownership_or_flush` enforces the ordering: it locks the
+    /// shard, (checks ownership /) flushes the waiter entry, drops the shard
+    /// guard, then calls `clear_wait()` to remove from the waiter_graph.
+    ///
+    /// JE `LockManager.validateOwnershipInternal` (LockManager.java:1547).
+    ///
+    /// Called on every timeout / deadlock-victim exit from the wait loop,
+    /// under the shard mutex, to close the grant/timeout race:
+    ///
+    /// ```text
+    ///    waiter                              releaser
+    ///    wait_for() times out
+    ///                                        release(): grant waiter -> OWNER
+    ///                                                   (shard lock held)
+    ///    *granted_guard still observed false
+    ///    (checked under the per-waiter notify mutex,
+    ///     BEFORE release set the flag)
+    ///    -> about to flush + throw LockTimeout
+    /// ```
+    ///
+    /// The grant moves the waiter to the OWNER set under the shard mutex; the
+    /// `granted` notify flag is set in the same critical section but the
+    /// waiter may have already read it as `false` before `release` ran.  If we
+    /// then merely `flush_waiter` (a no-op, since the locker is no longer a
+    /// waiter) and return a timeout error, the lock is OWNED by a locker whose
+    /// `Txn::lock` returned `Err` — so it was never recorded in the txn's
+    /// `write_locks` and is never released: a permanently leaked lock that
+    /// stalls every later waiter until their own timeout (the `stress_nondup`
+    /// hot-key stall).
+    ///
+    /// JE guards against this by checking `isOwnerInternal` FIRST and skipping
+    /// the flush when the locker already owns the lock; the caller then treats
+    /// the wait as a successful grant (LockManager.java:544/581/1555-1557).
+    ///
+    /// Returns `true` when `locker_id` already owns `lsn` with a lock that
+    /// satisfies the requested `lock_type` (granted during the timeout
+    /// window); in that case the waiter is NOT flushed and the caller must
+    /// treat the request as granted.  Returns `false` when the locker does not
+    /// own the requested lock, in which case the waiter entry is flushed
+    /// (JE `flushFromWaiters = true`) and the caller proceeds to throw the
+    /// timeout / deadlock error.
+    ///
+    /// The `lock_type` match is essential: a Read→Write **upgrade** waiter
+    /// still OWNS its original Read lock while it waits for the Write
+    /// promotion, so an any-ownership test would wrongly treat a promotion
+    /// deadlock victim as "already granted".  JE checks `isOwner(locker,
+    /// type)` for the REQUESTED type (LockManager.java:1556, Lock.isOwner).
+    fn validate_ownership_or_flush(
         &self,
         table_idx: usize,
         lsn: u64,
         locker_id: i64,
-    ) {
+        lock_type: LockType,
+    ) -> bool {
         // Shard first (canonical ordering).
-        {
+        let is_owner = {
             let mut table = self.lock_tables[table_idx].lock();
             if let Some(lock) = table.get_mut(&lsn) {
-                lock.flush_waiter(locker_id);
-                if lock.n_owners() == 0 && lock.n_waiters() == 0 {
-                    table.remove(&lsn);
-                    self.credit_lock_entry();
+                // JE: isOwnerInternal(lsn, locker, TYPE) checked BEFORE
+                // flushFromWaiters — ownership of the REQUESTED type, not any
+                // type (an upgrade waiter still owns the pre-upgrade lock).
+                if lock.is_owner(locker_id, lock_type) {
+                    true
+                } else {
+                    lock.flush_waiter(locker_id);
+                    if lock.n_owners() == 0 && lock.n_waiters() == 0 {
+                        table.remove(&lsn);
+                        self.credit_lock_entry();
+                    }
+                    false
                 }
+            } else {
+                false
             }
-        }
-        // Waiter_graph after shard is released.
+        };
+        // Waiter_graph after shard is released.  Always clear our wait edge:
+        // whether we timed out (flushed) or were granted during the race, we
+        // are no longer waiting on anyone.
         self.clear_wait(locker_id);
+        is_owner
     }
 
     /// aborted as the victim.
@@ -1546,6 +1657,25 @@ impl LockManager {
         // event), so the scan cost is amortized over the rare deadlock
         // event and is not on the common no-cycle path.
         let lock_counts = self.compute_lock_counts(&cycle);
+
+        // PHANTOM-DEADLOCK guard (JE DeadlockChecker reads the LIVE
+        // Lock.waiters/owners lists; our incremental `waiter_graph` can retain
+        // a stale edge).  A locker that currently owns ZERO locks cannot be a
+        // real member of a wait-for cycle: no one can be waiting on it, so any
+        // incoming graph edge pointing at it is stale (it was granted AND
+        // released since that edge was recorded, before its own `clear_wait`
+        // ran).  `compute_lock_counts` is a live, under-shard-mutex count, so a
+        // cycle member with count 0 proves the cycle is phantom.  Suppressing
+        // it keeps the waiter blocked (it is re-checked every <=50 ms slice
+        // against a fresh snapshot), exactly as if the stale edge were absent.
+        // Without this, the extra read-path lock-waits introduced in wave4
+        // (`restart_after_slot_change`) made this false positive abort ~0.6% of
+        // reads on a contended ycsb_a 50/50 workload (regression vs v7.11.0).
+        if cycle.iter().any(|id| lock_counts.get(id).copied().unwrap_or(0) == 0)
+        {
+            return None;
+        }
+
         let victim = DeadlockDetector::select_victim(&cycle, &lock_counts);
 
         if victim == locker_id {
@@ -1616,6 +1746,83 @@ mod tests {
         let stats = lm.get_stats();
         assert_eq!(stats.lock_requests, 0);
         assert_eq!(stats.lock_waits, 0);
+    }
+
+    /// Regression (PHANTOM-DEADLOCK): a stale `waiter_graph` edge must not
+    /// drive a false deadlock-victim decision against a locker that owns NO
+    /// locks.
+    ///
+    /// The incremental `waiter_graph` is cleared per-locker only when that
+    /// locker's own thread exits its wait (grant/timeout/deadlock). When a
+    /// concurrent `release()` promotes a waiter B to OWNER, there is a window
+    /// where B's old `B -> [A]` edge still sits in the graph while A, having
+    /// since been granted AND released (so A owns nothing), re-enters a wait on
+    /// a lock B now owns. The detector then sees A->B (fresh, from owner_ids)
+    /// and B->A (STALE, from the cached graph) and reports a 2-cycle, choosing
+    /// A (fewest locks = 0) as the victim.
+    ///
+    /// A locker that owns zero locks cannot be in a real deadlock cycle: no
+    /// one can be waiting on it. JE's DeadlockChecker walks the live
+    /// `Lock.waiters`/owners lists, so a stale edge never participates. This
+    /// test injects the exact stale edge and asserts no phantom victim.
+    #[test]
+    fn stale_waiter_edge_does_not_make_a_zero_lock_reader_a_victim() {
+        let lm = LockManager::new();
+        let lsn_y: u64 = 0xB000;
+        let a: i64 = 1_000;
+        let b: i64 = 2_000;
+
+        // B owns lsn_y (the lock A will request).
+        lm.lock(lsn_y, b, LockType::Write, false, false).unwrap();
+
+        // Inject the STALE edge: as if B once waited on A. A does NOT own any
+        // lock at all — this edge is obsolete.
+        lm.record_wait(b, &[a]);
+
+        // A now requests lsn_y, owned by B. owner_ids = [B].
+        // Fresh edge A->B + stale edge B->A would form a phantom 2-cycle with A
+        // (0 locks) as the chosen victim.
+        let verdict =
+            lm.check_deadlock_for_waiter(lsn_y, a, LockType::Write, &[b]);
+        assert!(
+            verdict.is_none(),
+            "a 0-lock locker on a stale back-edge must NOT be a deadlock victim; got {verdict:?}"
+        );
+    }
+
+    /// A GENUINE 2-cycle (both lockers own a lock the other waits on) must
+    /// still be detected — the phantom-cycle guard must not suppress real
+    /// deadlocks.
+    #[test]
+    fn genuine_two_cycle_is_still_detected() {
+        let lm = LockManager::new();
+        let lsn_x: u64 = 0xC000;
+        let lsn_y: u64 = 0xD000;
+        let a: i64 = 3_000;
+        let b: i64 = 4_000;
+
+        let lsn_z: u64 = 0xE000;
+        // A owns lsn_x (1 lock); B owns lsn_y AND lsn_z (2 locks). A is the
+        // fewest-locks member, so victim selection picks A — the requester —
+        // which is exactly what makes check_deadlock_for_waiter return Some for
+        // A's own call. (Both-own-1 ties pick the youngest=B instead, so A's
+        // call would correctly return None and leave B to detect it; to assert
+        // detection via A's call we make A the chosen victim.)
+        lm.lock(lsn_x, a, LockType::Write, false, false).unwrap();
+        lm.lock(lsn_y, b, LockType::Write, false, false).unwrap();
+        lm.lock(lsn_z, b, LockType::Write, false, false).unwrap();
+
+        // B waits on A for lsn_x (real edge: A owns lsn_x).
+        lm.record_wait(b, &[a]);
+
+        // A requests lsn_y, owned by B -> real cycle A->B->A; A owns 1 lock
+        // (fewest) so A is the victim.
+        let verdict =
+            lm.check_deadlock_for_waiter(lsn_y, a, LockType::Write, &[b]);
+        assert!(
+            verdict.is_some(),
+            "a genuine 2-cycle (both own a lock) must still be detected; got {verdict:?}"
+        );
     }
 
     #[test]
