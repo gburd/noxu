@@ -2268,15 +2268,36 @@ impl BinStub {
         };
         match found {
             Ok(idx) => {
-                // Key exists — update in place (key/suffix already correct).
+                // Key exists — update in place.  KD slot reuse (JE
+                // CursorImpl.insertRecordInternal isSlotReuse,
+                // CursorImpl.java:1373; IN.insertRecord clears KD/PD): the
+                // slot held no record, so report a NEW record for entry
+                // counting.
+                let was_kd =
+                    std::mem::take(&mut self.entries[idx].known_deleted);
+                // JE `IN.updateLNSlotKey` (IN.java:1338) replaces a
+                // comparator-equal but byte-different slot key [#15704] on
+                // slot reuse (CursorImpl.java:1487-1492 -> insertRecord
+                // :3639), update (updateRecord :3719), abort/recovery undo
+                // (recoverRecord :3901) and delta apply (applyDeltaSlot
+                // :3590).  JE gates it on `allowsKeyUpdates()` (a
+                // PartialComparator tag, IN.java:1367); Noxu has no such tag,
+                // and the only way a comparator-equal key can differ in bytes
+                // is a partial comparator, so it always replaces.  Abort of a
+                // delete+reinsert now restores the before-image over the
+                // retained (reused) slot, so it needs this to get the
+                // original key back.  The prefix-shrink above guarantees
+                // `full_key` shares the prefix.  Like `RecordSlot::install`,
+                // prohibit the next delta so a base image cannot resurrect
+                // the old key bytes.
+                if self.get_full_key(idx).as_deref() != Some(&full_key[..]) {
+                    let suffix = self.compress_key(&full_key);
+                    self.keys.set(idx, suffix);
+                    self.prohibit_next_delta = true;
+                }
                 self.set_lsn(idx, lsn); // T-3
                 self.entries[idx].data = data;
                 self.entries[idx].dirty = true;
-                // KD slot reuse (JE CursorImpl.insertRecordInternal isSlotReuse,
-                // CursorImpl.java:1373; IN.insertRecord clears KD/PD): the slot
-                // held no record, so report a NEW record for entry counting.
-                let was_kd =
-                    std::mem::take(&mut self.entries[idx].known_deleted);
                 (idx, was_kd)
             }
             Err(idx) => {
