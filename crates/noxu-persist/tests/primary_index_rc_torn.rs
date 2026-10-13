@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 
-use noxu_db::{Environment, EnvironmentConfig};
+use noxu_db::{Environment, EnvironmentConfig, TransactionConfig};
 use noxu_persist::{
     Entity, EntitySerializer, EntityStore, PrimaryIndex, Result, StoreConfig,
 };
@@ -54,12 +54,14 @@ impl EntitySerializer<Rec> for RecSer {
 #[test]
 fn primary_index_rc_read_never_sees_an_aborting_writers_value() {
     let td = TempDir::new().unwrap();
-    let env = Environment::open(
-        EnvironmentConfig::new(td.path().to_path_buf())
-            .with_allow_create(true)
-            .with_transactional(true),
-    )
-    .unwrap();
+    let env = Arc::new(
+        Environment::open(
+            EnvironmentConfig::new(td.path().to_path_buf())
+                .with_allow_create(true)
+                .with_transactional(true),
+        )
+        .unwrap(),
+    );
     let mut store = EntityStore::open(
         &env,
         StoreConfig::new("rectstore")
@@ -75,22 +77,25 @@ fn primary_index_rc_read_never_sees_an_aborting_writers_value() {
     let done = Arc::new(AtomicBool::new(false));
     let iters = Arc::new(AtomicU64::new(0));
 
-    // RC reader: get(7); must only ever see the committed tag b'A'.
+    // READ_COMMITTED reader (explicit txn -- the op_handle read path A14-min
+    // hardened): get(Some(rc_txn), 7) must only ever see the committed tag
+    // b'A'.  Mirrors secondary_decisions_test::test_x10.
     let r_idx: PrimaryIndex<u64, Rec> = store.get_primary_index().unwrap();
-    // The reader drives RC-style reads through `get(None)` (auto-commit:
-    // read-then-release), which exercises the same search(Set) + lock_ln path
-    // the op_handle read uses, so A14-min's torn-read guard applies.
+    let r_env = Arc::clone(&env);
     let r_torn = Arc::clone(&torn);
     let r_done = Arc::clone(&done);
     let r_it = Arc::clone(&iters);
     let reader = thread::spawn(move || {
         let ser = RecSer;
+        let rc = TransactionConfig::new().with_read_committed(true);
         while !r_done.load(Ordering::Relaxed) {
-            if let Ok(Some(rec)) = r_idx.get(None, &ser, &7u64)
+            let Ok(txn) = r_env.begin_transaction(Some(&rc)) else { continue };
+            if let Ok(Some(rec)) = r_idx.get(Some(&txn), &ser, &7u64)
                 && rec.tag != b'A'
             {
                 r_torn.store(true, Ordering::Relaxed);
             }
+            let _ = txn.commit();
             r_it.fetch_add(1, Ordering::Relaxed);
         }
     });
