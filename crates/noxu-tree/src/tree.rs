@@ -7609,11 +7609,18 @@ impl Tree {
                         }
                         // Recompute prefix after slot removal, since the
                         // remaining keys may share a longer common prefix.
-                        // After compress(), call recalcKeyPrefix().
-                        if b.entries.len() >= 2 {
+                        // JE IN.computeKeyPrefix returns null unless the DB
+                        // has key prefixing (IN.java:1625): a non-prefixing
+                        // BIN must keep an EMPTY prefix, because `insert_raw`
+                        // stores full keys verbatim; a learned prefix would
+                        // re-prefix later inserts ("AAAAB" -> "A"+"AAAAB")
+                        // and split updates into duplicate slots.  Clearing
+                        // must re-encode the suffixes, never just drop the
+                        // prefix bytes.
+                        if self.key_prefixing {
                             b.recompute_key_prefix();
-                        } else if b.entries.len() < 2 {
-                            b.key_prefix = Vec::new();
+                        } else if !b.key_prefix.is_empty() {
+                            b.apply_new_prefix(Vec::new());
                         }
                         b.entries.len() < before
                     }
@@ -11146,6 +11153,90 @@ pub fn seed_node_id_counter(last_node_id: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// BUG (a2ea0b725b): the compressor must keep a non-prefixing BIN's
+    /// `key_prefix` EMPTY.  KD-slot retention (A5) makes the compressor drain
+    /// KD slots over default (key_prefixing=false) databases; before the fix
+    /// `compress_bin_with_lock_check` recomputed a key prefix unconditionally,
+    /// so a non-prefixing BIN learned a prefix while `insert_raw` keeps storing
+    /// FULL keys verbatim — a later put of an existing key then missed its slot
+    /// and added a duplicate, dropping live keys from a forward scan.  JE
+    /// `IN.computeKeyPrefix` returns null unless the DB has key prefixing
+    /// (IN.java:1625).
+    #[test]
+    fn compress_keeps_non_prefixing_bin_prefix_empty() {
+        // Non-prefixing tree (default DB).  Keys share a long common prefix so
+        // a buggy unconditional recompute WOULD learn one.
+        // Tree::new defaults key_prefixing=false (JE KEY_PREFIXING_DEFAULT).
+        let tree = Tree::new(1, 256);
+        let keys: Vec<Vec<u8>> = (0..20u32)
+            .map(|i| format!("kkkkkkkk_{i:04}").into_bytes())
+            .collect();
+        for (i, k) in keys.iter().enumerate() {
+            tree.insert(k.clone(), vec![b'v'; 4], Lsn::new(1, i as u32 + 1))
+                .unwrap();
+        }
+        // Mark half the slots known-deleted (A5 KD retention), then compress.
+        for (i, k) in keys.iter().enumerate() {
+            if i % 2 == 1 {
+                assert!(tree.mark_deleted(k, Lsn::new(2, i as u32 + 1)));
+            }
+        }
+        let root = tree.get_root().expect("root");
+        // Descend to the (single) BIN and compress it.
+        let bin_arc = {
+            let g = root.read();
+            match &*g {
+                TreeNode::Bottom(_) => Arc::clone(&root),
+                TreeNode::Internal(n) => n.get_child(0).expect("child"),
+            }
+        };
+        tree.compress_bin(&bin_arc);
+
+        // The non-prefixing BIN must still carry an EMPTY prefix.
+        {
+            let g = bin_arc.read();
+            if let TreeNode::Bottom(b) = &*g {
+                assert!(
+                    b.key_prefix.is_empty(),
+                    "non-prefixing BIN learned a prefix on compress: {:?}",
+                    b.key_prefix
+                );
+                // Every surviving (live) key is still findable by FULL key.
+                for (i, k) in keys.iter().enumerate() {
+                    if i % 2 == 0 {
+                        let (_, exact) = b.find_entry_compressed(k);
+                        assert!(
+                            exact,
+                            "live key {i} unfindable after compress"
+                        );
+                    }
+                }
+            } else {
+                panic!("expected a BIN");
+            }
+        }
+
+        // Put an EXISTING live key via insert_raw: must UPDATE in place (not a
+        // new insert), and leave no duplicate.
+        {
+            let mut g = bin_arc.write();
+            if let TreeNode::Bottom(b) = &mut *g {
+                let before = b.entries.len();
+                let (_, is_new) = b.insert_raw(
+                    keys[0].clone(),
+                    Lsn::new(3, 1),
+                    Some(vec![b'x'; 4]),
+                );
+                assert!(!is_new, "put of an existing key must update in place");
+                assert_eq!(
+                    b.entries.len(),
+                    before,
+                    "put of an existing key must not add a duplicate slot"
+                );
+            }
+        }
+    }
 
     // ====================================================================
     // T-3: LsnRep packed-LSN encoding (IN.entryLsnByteArray / getLsn /
