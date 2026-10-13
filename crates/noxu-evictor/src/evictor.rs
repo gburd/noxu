@@ -1532,15 +1532,25 @@ impl Evictor {
         let mut buf = bytes::BytesMut::with_capacity(entry.log_size());
         entry.write_to_log(&mut buf);
 
-        // NEW-6: read the PRIOR slot LSN (the upper IN's current on-disk image
-        // as recorded by its parent) BEFORE we publish the fresh LSN, so the
+        // BUG-CLEANER-LN-FILE-RECLAIM: read the upper IN's OWN prior on-disk
+        // full version (`InNodeStub.last_full_lsn`, JE `IN.lastFullVersion` /
+        // `getLastFullLsn()`) BEFORE we publish the fresh LSN, so the
         // superseded image is counted obsolete for the cleaner's utilization
         // tracking.  JE `IN.logInternal` counts the prior version obsolete via
-        // `countObsoleteNode` (IN type, exact, size 0) whenever an IN is
-        // re-logged — the BIN path above does the same with `bin.last_full_lsn`;
-        // an upper IN carries no `last_full_lsn`, so the prior LSN lives in the
-        // parent slot (which `update_parent_slot_lsn` will overwrite below).
-        let prev_slot_lsn = Tree::get_parent_slot_lsn(node_arc);
+        // `countObsoleteNode(getLastFullVersion())` (IN type, exact, size 0)
+        // whenever an IN is re-logged — the BIN path above does the same with
+        // `bin.last_full_lsn`.
+        //
+        // The old code read `Tree::get_parent_slot_lsn(node_arc)` here, which
+        // could return a leaf LN's LSN (the parent resolved to a BIN, or a
+        // false node-id match), marking a LIVE LN's offset obsolete so the
+        // cleaner reclaimed a file a resident BIN still referenced ->
+        // `LogFileNotFound`.  An IN's own `last_full_lsn` is always an IN/BIN
+        // image LSN, never a leaf LN.
+        let prev_slot_lsn = match &*node_arc.read() {
+            TreeNode::Internal(n) => n.last_full_lsn,
+            TreeNode::Bottom(_) => NULL_LSN,
+        };
         let old_obsolete = if !prev_slot_lsn.is_null() {
             Some(noxu_log::ObsoleteLsn::exact(
                 prev_slot_lsn,
@@ -1568,6 +1578,13 @@ impl Evictor {
                 {
                     let mut g = node_arc.write();
                     g.set_dirty(false);
+                    // BUG-CLEANER-LN-FILE-RECLAIM: advance this IN's own
+                    // `last_full_lsn` to the freshly-logged LSN (JE
+                    // `IN.afterLogCommon` -> `setLastFullLsn(newLsn)`), so the
+                    // NEXT re-log counts THIS image obsolete.
+                    if let TreeNode::Internal(n) = &mut *g {
+                        n.last_full_lsn = logged_lsn;
+                    }
                 }
                 // JE `IN.detachNode(index, updateLsn=true, loggedLsn)` stamps
                 // the fresh LSN into the parent slot.  We do the equivalent

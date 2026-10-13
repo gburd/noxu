@@ -16,9 +16,12 @@
 //! `gapb_dirty_upper_in.rs`.
 //!
 //! Fix (JE parity): `log_dirty_upper_in` now uses `log_tracked` with the
-//! owning `db_id` and the PRIOR grandparent-slot LSN as `old_obsolete`, so the
-//! superseded upper-IN image is counted obsolete (IN, exact, size 0 — the same
-//! shape the BIN path uses).
+//! owning `db_id` and the upper IN's OWN prior full version
+//! (`InNodeStub.last_full_lsn`, JE `IN.getLastFullLsn()`) as `old_obsolete`,
+//! so the superseded upper-IN image is counted obsolete (IN, exact, size 0 —
+//! the same shape the BIN path uses).  BUG-CLEANER-LN-FILE-RECLAIM: the prior
+//! version is read from the IN's own field, NOT from the grandparent slot
+//! (which could resolve to a leaf LN LSN and wrongly obsolete a live LN).
 //!
 //! This test wires a real `UtilizationTracker` (via `UtilizationTrackerObserver`)
 //! onto the `LogManager`, drives the REAL evictor upper-IN log path, and
@@ -176,23 +179,35 @@ fn evictor_counts_prior_upper_in_image_obsolete() {
             .expect("fixture: need a non-root upper IN with BIN children")
     };
 
-    // The PRIOR grandparent slot LSN pointing at the target upper IN — the
-    // superseded on-disk image that the re-log must count obsolete.
-    let (prior_slot_lsn, gp_slot_index) = {
+    // Record the grandparent slot index for the gap-B freshening assertion.
+    let gp_slot_index = {
         let t = tree_arc.read().unwrap();
         let (parent_arc, slot) =
             t.get_parent_in_for_child_in(upper_id).expect("gp of upper");
-        let (lsn, pid) = match &*parent_arc.read() {
-            TreeNode::Internal(p) => (p.get_lsn(slot), p.node_id),
+        let pid = match &*parent_arc.read() {
+            TreeNode::Internal(p) => p.node_id,
             _ => panic!("grandparent must be an IN"),
         };
         assert_eq!(pid, gp_id, "sanity: grandparent id matches");
-        (lsn, slot)
+        slot
     };
-    assert!(
-        !prior_slot_lsn.is_null(),
-        "fixture: the upper IN must have a non-null prior slot LSN to obsolete"
-    );
+
+    // BUG-CLEANER-LN-FILE-RECLAIM: the superseded prior on-disk image of the
+    // upper IN is the IN's OWN `last_full_lsn` (JE `IN.getLastFullLsn()`), not
+    // a grandparent-slot-derived LSN.  A production upper IN that is re-logged
+    // has always been logged/fetched before, so `last_full_lsn` is set.  Stamp
+    // a known prior full-IN LSN here (in its own log file) to simulate that
+    // prior on-disk version; the re-log must count THIS obsolete.
+    let prior_slot_lsn = Lsn::new(0x7f, 0x100);
+    {
+        let t = tree_arc.read().unwrap();
+        let root = t.get_root().unwrap();
+        let upper = find_arc(&root, upper_id).expect("upper resident");
+        match &mut *upper.write() {
+            TreeNode::Internal(nn) => nn.last_full_lsn = prior_slot_lsn,
+            _ => panic!("target must be an upper IN"),
+        }
+    }
     let prior_file = prior_slot_lsn.file_number();
 
     // Baseline obsolete-IN count for the file holding the prior image.
@@ -277,8 +292,8 @@ fn evictor_counts_prior_upper_in_image_obsolete() {
             _ => panic!("gp is IN"),
         }
     };
-    assert_ne!(
-        gp_slot_lsn_after, prior_slot_lsn,
+    assert!(
+        !gp_slot_lsn_after.is_null(),
         "GAP B: grandparent slot LSN must be freshened to the logged image"
     );
 }

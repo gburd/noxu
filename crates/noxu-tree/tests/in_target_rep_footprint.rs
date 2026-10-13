@@ -41,6 +41,7 @@ fn empty_in(n: usize) -> InNodeStub {
         generation: 0,
         parent: None,
         lsn_rep: LsnRep::from_lsns(&lsns),
+        last_full_lsn: noxu_util::NULL_LSN,
     }
 }
 

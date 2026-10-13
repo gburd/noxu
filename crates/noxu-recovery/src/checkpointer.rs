@@ -1769,32 +1769,39 @@ impl Checkpointer {
 
                 node_guard.set_dirty(false);
                 result.full_ins_flushed += 1;
+
+                // BUG-CLEANER-LN-FILE-RECLAIM: an upper IN's prior on-disk full
+                // version is its OWN `last_full_lsn` (JE `IN.lastFullVersion` /
+                // `getLastFullLsn()`), NOT a value derived from the parent
+                // slot.  Capture it (for obsolete counting) and advance it to
+                // the just-logged LSN, both under the write latch, exactly as
+                // the BIN full-log path does with `b.last_full_lsn`
+                // (JE `IN.afterLogCommon` sets `oldLsn = getLastFullVersion()`
+                // then `setLastFullLsn(newLsn)`).
+                //
+                // The old code read `Tree::get_parent_slot_lsn(node_arc)` here,
+                // which could return a leaf LN's LSN (the parent resolved to a
+                // BIN, or a false node-id match in the parent's slots) and so
+                // marked a LIVE LN's offset obsolete -> the cleaner reclaimed a
+                // file a resident BIN still referenced -> `LogFileNotFound`.
+                let superseded_full_lsn = {
+                    let prev = match &*node_guard {
+                        TreeNode::Internal(n) => n.last_full_lsn,
+                        // Only upper INs reach this flush path; a BIN here
+                        // would be a routing bug, treat as no prior version.
+                        TreeNode::Bottom(_) => NULL_LSN,
+                    };
+                    if let TreeNode::Internal(n) = &mut *node_guard {
+                        n.last_full_lsn = logged_lsn;
+                    }
+                    prev
+                };
+
                 // Release the node write lock before touching its parent
-                // (parent-then-child lock order).  `get_parent_slot_lsn` /
-                // `get_root_lsn` below take read locks on the child+parent, so
+                // (parent-then-child lock order).  `update_parent_slot_lsn` /
+                // `note_root_logged` below take locks on the child+parent, so
                 // they must run AFTER releasing this write lock.
                 drop(node_guard);
-
-                // NEW-CLEANER-IN-OBSOLETE: an upper IN carries no
-                // `last_full_lsn` field (unlike a BIN — confirmed in tree.rs;
-                // see the merged NEW-6 note).  Its prior on-disk image LSN is
-                // the LSN currently recorded for it: the PARENT-SLOT LSN for a
-                // non-root, or the tree's `root_log_lsn` for the root.  Read it
-                // BEFORE `update_parent_slot_lsn` / `note_root_logged`
-                // overwrites it with the fresh LSN.  This is the prior full
-                // version (JE `getPrevFullLsn` / `getLastFullVersion`); a
-                // brand-new IN's first log has NULL here and no prior version
-                // to count (skip below, no double-count).
-                let superseded_full_lsn = if Some(this_node_id) == root_node_id
-                {
-                    tree_arc
-                        .read()
-                        .ok()
-                        .map(|g| g.get_root_lsn())
-                        .unwrap_or(NULL_LSN)
-                } else {
-                    Tree::get_parent_slot_lsn(node_arc)
-                };
 
                 // JE `IN.updateEntry`: stamp this IN's current on-disk LSN into
                 // its parent's slot (dirtying the parent), so the parent —
@@ -3362,5 +3369,103 @@ mod tests {
 
         cp.checkpoint_in_progress.store(false, Ordering::Release);
         cp.checkpoint_flush_levels.lock().unwrap().clear();
+    }
+    /// BUG-CLEANER-LN-FILE-RECLAIM (A3) — checkpointer path, deterministic.
+    ///
+    /// When the checkpointer re-logs an upper IN it must count the IN's OWN
+    /// prior on-disk full version (`InNodeStub.last_full_lsn`, JE
+    /// `IN.lastFullVersion` / `getLastFullLsn()`, IN.java:320-343 / 5197-5235)
+    /// obsolete — NOT a value derived from the parent slot
+    /// (`Tree::get_parent_slot_lsn`).  The parent-slot derivation could resolve
+    /// to a LEAF LN's LSN (a BIN slot, or a false node-id match), so the old
+    /// code marked a LIVE LN's offset obsolete; the cleaner then reclaimed a
+    /// file a resident BIN still referenced and a later read hit
+    /// `LogFileNotFound`, invalidating the env.
+    ///
+    /// This witness stamps the target upper IN's parent (grandparent) slot with
+    /// a leaf-LN-SHAPED LSN (a different file than the IN's own image) and sets
+    /// the IN's own `last_full_lsn` to a distinct IN-image LSN, then runs the
+    /// real `flush_one_tree_upper_ins`.  Fail-before (counts
+    /// `get_parent_slot_lsn`): the obsolete set contains the leaf-LN LSN and
+    /// NOT the IN image LSN.  Pass-after: it contains the IN's own
+    /// `last_full_lsn` and never the parent-slot leaf-LN LSN.
+    #[test]
+    fn a3_checkpointer_counts_in_own_last_full_lsn_not_parent_slot_leaf_ln() {
+        use noxu_log::FileManager;
+        use noxu_tree::tree::{Tree, TreeNode};
+        use noxu_util::lsn::Lsn;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let fm = Arc::new(
+            FileManager::new(dir.path(), false, 64 * 1024 * 1024, 100).unwrap(),
+        );
+        let lm =
+            Arc::new(LogManager::new(Arc::clone(&fm), 3, 1024 * 1024, 65536));
+
+        // Fanout 4 + 20 inserts → a 3-level tree with non-root upper INs.
+        let tree = Tree::new(1, 4);
+        for i in 0u32..20 {
+            tree.insert(
+                format!("key{i:04}").into_bytes(),
+                format!("data{i}").into_bytes(),
+                Lsn::new(1, 100 + i),
+            )
+            .unwrap();
+        }
+
+        // Pick a dirty NON-ROOT upper IN (one that has a grandparent slot).
+        let upper_arc = {
+            let dirty = tree.collect_dirty_upper_ins(1);
+            dirty
+                .into_iter()
+                .map(|(_, arc)| arc)
+                .find(|arc| {
+                    let id = arc.read().node_id();
+                    tree.get_parent_in_for_child_in(id).is_some()
+                })
+                .expect("fixture: need a non-root dirty upper IN")
+        };
+        let upper_id = upper_arc.read().node_id();
+
+        // Leaf-LN-SHAPED LSN planted in the grandparent slot (file 0x55); the
+        // IN's OWN prior full-IN image LSN (file 0x7f).  The re-log must count
+        // the IN image obsolete, never the leaf-LN LSN.
+        let parent_slot_leaf_ln = Lsn::new(0x55, 0x2000);
+        let in_own_image = Lsn::new(0x7f, 0x100);
+
+        // Stamp the grandparent slot that routes to `upper_id`.
+        {
+            let (gp_arc, gp_slot) =
+                tree.get_parent_in_for_child_in(upper_id).unwrap();
+            if let TreeNode::Internal(p) = &mut *gp_arc.write() {
+                p.set_lsn(gp_slot, parent_slot_leaf_ln);
+            }
+        }
+        // Set the upper IN's own last_full_lsn and keep it dirty so the flush
+        // re-logs it.
+        if let TreeNode::Internal(n) = &mut *upper_arc.write() {
+            n.last_full_lsn = in_own_image;
+            n.dirty = true;
+        }
+
+        let tree_arc = Arc::new(RwLock::new(tree));
+        let result =
+            Checkpointer::flush_one_tree_upper_ins(1, &tree_arc, &lm).unwrap();
+
+        let obs: Vec<Lsn> =
+            result.obsolete_full_lsns.iter().map(|&(l, _)| l).collect();
+
+        assert!(
+            obs.contains(&in_own_image),
+            "A3: re-log must count the IN's OWN last_full_lsn ({in_own_image:?}) \
+             obsolete; obsolete set = {obs:?}"
+        );
+        assert!(
+            !obs.contains(&parent_slot_leaf_ln),
+            "A3: re-log must NOT count the parent-slot leaf-LN LSN \
+             ({parent_slot_leaf_ln:?}) obsolete (that would reclaim a live \
+             LN's file -> LogFileNotFound); obsolete set = {obs:?}"
+        );
     }
 }

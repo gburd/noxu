@@ -1125,6 +1125,22 @@ pub struct InNodeStub {
     /// `u64`-per-slot `Long` rep only when a node's LSN range exceeds the
     /// compact form.  Access via `get_lsn(slot)` / `set_lsn(slot, lsn)`.
     pub lsn_rep: LsnRep,
+    /// BUG-CLEANER-LN-FILE-RECLAIM: this upper IN's own prior on-disk full
+    /// version LSN (JE `IN.lastFullVersion` / `getLastFullLsn()`, IN.java:
+    /// 320-343).  Set to the LSN this node was fetched from
+    /// (`fetch_node_from_log`, JE `IN.postFetchInit` -> `setLastFullLsn`,
+    /// IN.java:5200-5206) and to the fresh LSN each time the checkpointer logs
+    /// it.  The checkpointer counts THIS field obsolete when it re-logs the
+    /// node (JE `IN.afterLogCommon` `params.oldLsn = getLastFullVersion()`),
+    /// mirroring `BinStub.last_full_lsn`.
+    ///
+    /// Previously the checkpointer derived an upper IN's prior version from its
+    /// PARENT slot LSN (`Tree::get_parent_slot_lsn`); that derivation could
+    /// resolve to a leaf LN's LSN (a BIN slot, or a false node-id match),
+    /// marking a LIVE LN's offset obsolete so the cleaner reclaimed a file a
+    /// resident BIN still referenced -> `LogFileNotFound`.  An IN's own
+    /// `last_full_lsn` is always an IN/BIN image LSN, never a leaf LN.
+    pub last_full_lsn: Lsn,
 }
 
 /// Entry in an IN node.
@@ -4281,6 +4297,7 @@ impl Tree {
                         generation: 0,
                         parent: None,
                         lsn_rep: LsnRep::from_lsns(&[lsn]),
+                        last_full_lsn: NULL_LSN,
                     })));
 
                 // Wire the BIN's parent pointer back to the root IN.
@@ -4432,6 +4449,7 @@ impl Tree {
                         generation: 0,
                         parent: None,
                         lsn_rep: LsnRep::from_lsns(&[lsn]),
+                        last_full_lsn: NULL_LSN,
                     })));
 
                 {
@@ -4528,6 +4546,7 @@ impl Tree {
                 generation: 0,
                 parent: None,
                 lsn_rep: LsnRep::from_lsns(&[lsn]),
+                last_full_lsn: NULL_LSN,
             })));
 
         // Update the old root's parent pointer to the new root.
@@ -4899,6 +4918,7 @@ impl Tree {
                     parent: None, // set below
                     // T-3: the right half's per-slot LSNs.
                     lsn_rep: LsnRep::from_lsns(&rl),
+                    last_full_lsn: NULL_LSN,
                 };
                 // T-4: install the right half's resident children.
                 for (i, c) in rc.into_iter().enumerate() {
@@ -8706,6 +8726,16 @@ impl Tree {
                 })
             }
             LogEntryType::IN => Self::deserialize_upper_in(&in_entry.node_data)
+                .map(|mut n| {
+                    // BUG-CLEANER-LN-FILE-RECLAIM / JE `IN.postFetchInit`
+                    // (IN.java:5200-5206): a UIN read back from the log has
+                    // its `lastFullVersion` set to the LSN it was fetched
+                    // from.  The checkpointer counts THIS obsolete when it
+                    // re-logs the node, instead of deriving the prior version
+                    // from a parent slot (which could resolve to a leaf LN).
+                    n.last_full_lsn = log_lsn;
+                    n
+                })
                 .map(TreeNode::Internal),
             // A checkpoint-seeded parent slot may point at a BIN-delta LSN
             // (the most recent on-disk version of a BIN logged as a delta).
@@ -10475,7 +10505,8 @@ impl Tree {
             dirty: false,
             generation: 0,
             parent: None,
-            lsn_rep: LsnRep::from_lsns(&lsns), // T-3
+            lsn_rep: LsnRep::from_lsns(&lsns), // T-3,
+            last_full_lsn: NULL_LSN,
         })
     }
 
@@ -11451,6 +11482,7 @@ mod tests {
             generation: 0,
             parent: None,
             lsn_rep: LsnRep::Empty,
+            last_full_lsn: NULL_LSN,
         });
         assert!(!internal.is_bin());
         assert_eq!(internal.level(), MAIN_LEVEL + 2);
@@ -12134,6 +12166,7 @@ mod tests {
             generation: 0,
             parent: None,
             lsn_rep: LsnRep::Empty,
+            last_full_lsn: NULL_LSN,
         });
 
         // Exact match
@@ -12164,6 +12197,7 @@ mod tests {
             generation: 0,
             parent: None,
             lsn_rep: LsnRep::Empty,
+            last_full_lsn: NULL_LSN,
         });
 
         // Key below every separator floors to slot 0 (leftmost child).
@@ -12478,6 +12512,7 @@ mod tests {
             generation: 0,
             parent: None,
             lsn_rep: LsnRep::Empty,
+            last_full_lsn: NULL_LSN,
         });
         assert!(!in_node.is_dirty());
         in_node.set_dirty(true);
@@ -12520,6 +12555,7 @@ mod tests {
             generation: 0,
             parent: None,
             lsn_rep: LsnRep::Empty,
+            last_full_lsn: NULL_LSN,
         });
         in_node.set_generation(99);
         assert_eq!(in_node.get_generation(), 99);
@@ -12577,6 +12613,7 @@ mod tests {
             generation: 0,
             parent: None,
             lsn_rep: LsnRep::Empty,
+            last_full_lsn: NULL_LSN,
         });
         assert_eq!(in_node.log_size(), in_node.write_to_bytes().len());
     }
@@ -12700,6 +12737,7 @@ mod tests {
             generation: 0,
             parent: None,
             lsn_rep: LsnRep::Empty,
+            last_full_lsn: NULL_LSN,
         })));
 
         // Wire BIN's parent to root.
@@ -13530,6 +13568,7 @@ mod tests {
             generation: 0,
             parent: None,
             lsn_rep: LsnRep::Empty,
+            last_full_lsn: NULL_LSN,
         })));
 
         assert!(
@@ -13550,6 +13589,7 @@ mod tests {
             generation: 0,
             parent: None,
             lsn_rep: LsnRep::Empty,
+            last_full_lsn: NULL_LSN,
         })));
         let other_arc = Arc::new(RwLock::new(TreeNode::Bottom(BinStub {
             node_id: generate_node_id(),
@@ -13631,6 +13671,7 @@ mod tests {
             generation: 0,
             parent: None,
             lsn_rep: LsnRep::Empty,
+            last_full_lsn: NULL_LSN,
         })));
 
         assert!(
@@ -15145,6 +15186,7 @@ mod tests {
             generation: 0,
             parent: None,
             lsn_rep: LsnRep::Empty,
+            last_full_lsn: NULL_LSN,
         })));
         {
             let mut g = bin_arc.write();
@@ -15259,6 +15301,7 @@ mod tests {
             generation: 0,
             parent: None,
             lsn_rep: LsnRep::Empty,
+            last_full_lsn: NULL_LSN,
         })));
         {
             let mut g = bin_arc.write();
@@ -15360,6 +15403,7 @@ mod tests {
             generation: 0,
             parent: None,
             lsn_rep: LsnRep::Empty,
+            last_full_lsn: NULL_LSN,
         })));
         {
             let mut g = bin_arc.write();
@@ -15512,6 +15556,7 @@ mod tests {
             generation: 0,
             parent: None,
             lsn_rep: LsnRep::Empty,
+            last_full_lsn: NULL_LSN,
         })));
         {
             let mut g = bin_arc.write();
@@ -15760,6 +15805,7 @@ mod tests {
             generation: 0,
             parent: None,
             lsn_rep: LsnRep::Empty,
+            last_full_lsn: NULL_LSN,
         })));
         bin_arc.write().set_parent(Some(Arc::downgrade(&root_arc)));
         sibling_arc.write().set_parent(Some(Arc::downgrade(&root_arc)));
@@ -16031,6 +16077,7 @@ mod tests {
             generation: 0,
             parent: None,
             lsn_rep: LsnRep::Empty,
+            last_full_lsn: NULL_LSN,
         })));
         bin_arc.write().set_parent(Some(Arc::downgrade(&root_arc)));
         let tree = Tree::new(1, 128);
@@ -16240,6 +16287,7 @@ mod tests {
             generation: 0,
             parent: None,
             lsn_rep: LsnRep::Empty,
+            last_full_lsn: NULL_LSN,
         })));
         bin_arc.write().set_parent(Some(Arc::downgrade(&root_arc)));
         sibling_arc.write().set_parent(Some(Arc::downgrade(&root_arc)));
@@ -16351,6 +16399,7 @@ mod tests {
             generation: 0,
             parent: None,
             lsn_rep: LsnRep::Empty,
+            last_full_lsn: NULL_LSN,
         })));
         bin_arc.write().set_parent(Some(Arc::downgrade(&root_arc)));
 
@@ -17176,6 +17225,7 @@ mod tests {
             generation: 0,
             parent: None,
             lsn_rep: LsnRep::Empty,
+            last_full_lsn: NULL_LSN,
         })));
         let tree = Tree::new(1, 128);
         *tree.root.write() = Some(root_arc);
@@ -17493,6 +17543,7 @@ fn test_split_child_sibling_inherits_expiration_in_hours() {
         generation: 0,
         parent: None,
         lsn_rep: LsnRep::Empty,
+        last_full_lsn: NULL_LSN,
     })));
     {
         let mut b = bin.write();
@@ -17707,6 +17758,7 @@ mod in_redo_tests {
             generation: 0,
             parent: None,
             lsn_rep: LsnRep::Empty,
+            last_full_lsn: NULL_LSN,
         });
         let bytes = node.write_to_bytes();
         let restored =
