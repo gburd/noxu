@@ -694,9 +694,16 @@ impl CursorImpl {
         self.txn_ref = Some(txn);
     }
 
-    /// Gets the before-image (old_data, old_lsn) for `key` from the tree.
+    /// Gets the before-image `(old_data, old_lsn, exists)` for `key`.
     ///
-    /// Returns `(None, NULL_LSN)` if the key does not exist (new insert).
+    /// Returns `(None, NULL_LSN, false)` if the key does not exist (new insert).
+    ///
+    /// `exists` is JE `LockStanding.recordExists()` (CursorImpl.java:3295):
+    /// false for no slot AND for a known-deleted slot.  A KD slot (A5) still
+    /// reports its LSN (the DeleteLN), because JE locks and logs the slot LSN
+    /// as the abort LSN on slot reuse (`prepareForUpdate`, abortLsn = slot
+    /// LSN, abortKD = !recordExists(), CursorImpl.java:3318-3355).  Callers
+    /// must test `exists`, never `old_lsn != NULL`, for record existence.
     fn get_slot_before_image(
         &self,
         key: &[u8],
@@ -707,16 +714,24 @@ impl CursorImpl {
         // residency from a single descent:
         //   Some(Some(bytes)) -> resident; Some(None) -> found, non-resident;
         //   None -> no live slot (new insert).
-        // Minimal relock variant: stack-v1 has no KD-slot LSN reuse
-        // (`slot_lsn_any`, A5), so a no-live-slot key is a brand-new insert
-        // (`exists = false`, `lsn = NULL`), exactly as the pre-relock path did.
+        // A5: a no-live-slot key may still have a KD slot whose DeleteLN LSN is
+        // reused as the abort LSN on the next insert (`slot_lsn_any`); that
+        // reports (None, kd_lsn, exists = false).
         let (data, lsn) = {
             let db = self.db_impl.read();
             match db.get_real_tree() {
                 Some(tree) => match Self::get_data_from_tree(&tree, key) {
                     Some((data, lsn)) => (Some(data), lsn),
                     None => {
-                        return Ok((None, noxu_util::NULL_LSN.as_u64(), false));
+                        // A5: no live slot, but a known-deleted slot still
+                        // carries its DeleteLN LSN, reused as the abort LSN on
+                        // the next insert (JE prepareForUpdate slot reuse).
+                        return match tree.slot_lsn_any(key) {
+                            Some((lsn, true)) => {
+                                Ok((None, lsn.as_u64(), false))
+                            }
+                            _ => Ok((None, noxu_util::NULL_LSN.as_u64(), false)),
+                        };
                     }
                 },
                 None => return Ok((None, noxu_util::NULL_LSN.as_u64(), false)),
@@ -836,12 +851,28 @@ impl CursorImpl {
     /// When the tree confirms the key was actually removed (`deleted == true`),
     /// decrements the per-database entry count (.
     /// counter).
-    fn apply_tree_delete(&self, key: Vec<u8>, _del_lsn: Lsn) {
+    ///
+    /// A transactional delete (explicit txn or synthetic auto-txn) with a
+    /// logged DeleteLN KEEPS the slot as known-deleted with the DeleteLN LSN
+    /// (JE `CursorImpl.deleteCurrentRecord` -> `IN.deleteRecord`,
+    /// CursorImpl.java:973, IN.java:3765-3798), so a checkpoint taken before
+    /// the txn ends logs a slot recovery undo can match
+    /// (RecoveryManager.java:1912-1963).  The INCompressor removes it once
+    /// the LSN lock is uncontended (BIN.compress, BIN.java:1170).  A
+    /// non-transactional or unlogged (deferred-write) delete still removes
+    /// the slot: its locks end with the operation, so no checkpoint can
+    /// capture it uncommitted.
+    fn apply_tree_delete(&self, key: Vec<u8>, del_lsn: Lsn) {
         let db = self.db_impl.read();
-        if let Some(tree) = db.get_real_tree()
-            && tree.delete(&key)
-        {
-            db.decrement_entry_count();
+        if let Some(tree) = db.get_real_tree() {
+            let removed = if self.txn_ref.is_some() && !del_lsn.is_null() {
+                tree.mark_deleted(&key, del_lsn)
+            } else {
+                tree.delete(&key)
+            };
+            if removed {
+                db.decrement_entry_count();
+            }
         }
     }
 
@@ -2603,7 +2634,11 @@ impl CursorImpl {
                     Some(cmp) => bin.find_entry_cmp(key, cmp.as_ref()),
                     None => bin.find_entry_compressed(key),
                 };
-                if found { bin.get_full_key(idx) } else { None }
+                if found && !bin.entries[idx].known_deleted {
+                    bin.get_full_key(idx)
+                } else {
+                    None
+                }
             }
             _ => None,
         }
@@ -3387,10 +3422,12 @@ impl CursorImpl {
                     Some(cmp) => bin.find_entry_cmp(key, cmp.as_ref()),
                     None => bin.find_entry_compressed(key),
                 };
-                if found {
-                    // D1: preserve residency.  `None` here means the LN was
-                    // stripped (non-resident); the caller refetches at the
-                    // returned LSN rather than flattening to an empty value.
+                // A known-deleted slot holds no record (JE IN.findEntry
+                // exact returns -1 for KD, IN.java:3197).  D1: preserve
+                // residency -- `None` means the LN was stripped
+                // (non-resident); the caller refetches at the returned LSN
+                // rather than flattening to an empty value.
+                if found && !bin.entries[idx].known_deleted {
                     Some((
                         bin.entries[idx].data.clone(),
                         bin.get_lsn(idx).as_u64(),
@@ -5629,34 +5666,54 @@ impl CursorImpl {
             Some(d) => self.db_impl.read().should_embed_ln(d.len()),
             None => false,
         };
-        let curr_embedded_ln = if old_lsn != noxu_util::NULL_LSN.as_u64() {
-            let (prior_data, _, _) = self.get_slot_before_image(key)?;
-            match prior_data {
-                Some(pd) => self.db_impl.read().should_embed_ln(pd.len()),
-                None => false,
-            }
-        } else {
-            false
-        };
+        // `prior_exists`: the slot holds a record (not absent, not
+        // known-deleted).  Reuse of a KD slot is an insertion: JE passes
+        // `isInsertion` and never counts the defunct version obsolete here
+        // (LN.java:685, CursorImpl.java:1427-1438).
+        let (curr_embedded_ln, prior_exists) =
+            if old_lsn != noxu_util::NULL_LSN.as_u64() {
+                let (prior_data, _, exists) = self.get_slot_before_image(key)?;
+                let embedded = match prior_data {
+                    Some(pd) => self.db_impl.read().should_embed_ln(pd.len()),
+                    None => false,
+                };
+                (embedded, exists)
+            } else {
+                (false, false)
+            };
 
         // JE LN.logInternal (LN.java:645): a transactional LN logs the
-        // WriteLockInfo abortLsn -- the slot LSN before the txn FIRST write
-        // to the record (CursorImpl.LockStanding.prepareForUpdate,
+        // WriteLockInfo's abortLsn — the slot LSN before the txn's FIRST
+        // write to the record (CursorImpl.LockStanding.prepareForUpdate,
         // CursorImpl.java:3343), kept across later writes by the same txn.
         // `old_lsn` is the slot LSN now; if this txn already logged the
         // record, its recorded abort LSN wins.  Never `self.current_lsn`:
-        // that is the cursor previous position (possibly another key), and
-        // recovery undo would revert/delete to the wrong version.
+        // that is the cursor's previous position (possibly another key),
+        // and recovery undo would revert/delete to the wrong version.  The
+        // non-txn LN form carries no abort LSN (write_to_log omits it).
         let abort_lsn = self
             .txn_ref
             .as_ref()
             .and_then(|t| t.lock().ok()?.recorded_abort_lsn(old_lsn))
             .unwrap_or(old_lsn);
+        // JE LN.logInternal logs `writeLockInfo.getAbortKnownDeleted()`
+        // (LN.java:646): the txn's recorded abortKD, else `!recordExists()`
+        // for a first write over a slot (prepareForUpdate,
+        // CursorImpl.java:3321).  A NULL abort LSN (pure insertion) logs
+        // false, as JE's prepareForInsert WriteLockInfo does.
+        let abort_known_deleted = abort_lsn != noxu_util::NULL_LSN.as_u64()
+            && self
+                .txn_ref
+                .as_ref()
+                .and_then(|t| {
+                    t.lock().ok()?.recorded_abort_known_deleted(old_lsn)
+                })
+                .unwrap_or(!prior_exists);
         let entry = LnLogEntry::new(
             db_id,
             txn_id_opt,
             Lsn::from_u64(abort_lsn),
-            false,           // abort_known_deleted
+            abort_known_deleted,
             None,            // abort_key
             None,            // abort_data
             NULL_VLSN,       // abort_vlsn
@@ -5699,7 +5756,7 @@ impl CursorImpl {
         // write within the same txn already holds a write lock at currLsn, so
         // currLsn != abortLsn and Rc is counted obsolete now.
         let db_id_u32 = db_id as u32;
-        let has_prior = old_lsn != noxu_util::NULL_LSN.as_u64();
+        let has_prior = prior_exists;
         let is_immediately_obsolete_db =
             self.db_impl.read().is_ln_immediately_obsolete();
         let curr_ne_abort = match &self.txn_ref {
@@ -5817,7 +5874,7 @@ impl CursorImpl {
         // stored in the tree.  For non-dup databases it is the plain key.
         // In both cases current_key is the correct tree-delete key.
         if let Some(mut tree_key) = self.current_key.clone() {
-            let (old_data, old_lsn, _) =
+            let (old_data, old_lsn, old_exists) =
                 self.get_slot_before_image(&tree_key)?;
             self.lock_write_before_log(old_lsn, &tree_key)?;
             // NEW-DEL-RACE-1: revalidate-after-lock (JE
@@ -5856,10 +5913,14 @@ impl CursorImpl {
             //     (A NULL slot LSN is legitimate for an unlogged live record,
             //     so an LSN==NULL test here would wrongly reject every such
             //     delete — see `test_delete_removes_from_tree`.)
-            let record_gone = if old_lsn != noxu_util::NULL_LSN.as_u64() {
-                let (_, current_lsn, _) =
+            let record_gone = if !old_exists {
+                true
+            } else if old_lsn != noxu_util::NULL_LSN.as_u64() {
+                // A known-deleted slot keeps the deleter's LSN, so the LSN
+                // test alone no longer proves existence (JE recordExists).
+                let (_, current_lsn, current_exists) =
                     self.get_slot_before_image(&tree_key)?;
-                current_lsn != old_lsn
+                !current_exists || current_lsn != old_lsn
             } else {
                 !self.key_exists_in_view(&tree_key)
             };
@@ -5894,7 +5955,7 @@ impl CursorImpl {
                 })?;
             self.finalize_write_lock(
                 old_lsn,
-                old_lsn != noxu_util::NULL_LSN.as_u64(),
+                old_exists,
                 del_lsn,
                 Some(tree_key.clone()),
                 old_data,

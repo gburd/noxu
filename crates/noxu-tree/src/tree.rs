@@ -1892,7 +1892,12 @@ impl BinStub {
                 // Mark slot dirty: this slot changed since the last full BIN log.
                 // `IN.setDirtyEntry(idx)`.
                 self.entries[idx].dirty = true;
-                (idx, false)
+                // KD slot reuse (JE CursorImpl.insertRecordInternal isSlotReuse,
+                // CursorImpl.java:1373; IN.insertRecord clears KD/PD): the slot
+                // held no record, so report a NEW record for entry counting.
+                let was_kd =
+                    std::mem::take(&mut self.entries[idx].known_deleted);
+                (idx, was_kd)
             }
             Err(idx) => {
                 // New key — insert in sorted position.
@@ -1965,7 +1970,12 @@ impl BinStub {
                 self.set_lsn(idx, lsn); // T-3
                 self.entries[idx].data = data.map(Bytes::copy_from_slice);
                 self.entries[idx].dirty = true;
-                (idx, false)
+                // KD slot reuse (JE CursorImpl.insertRecordInternal isSlotReuse,
+                // CursorImpl.java:1373; IN.insertRecord clears KD/PD): the slot
+                // held no record, so report a NEW record for entry counting.
+                let was_kd =
+                    std::mem::take(&mut self.entries[idx].known_deleted);
+                (idx, was_kd)
             }
             Err(idx) => {
                 self.insert_slot(
@@ -2163,7 +2173,12 @@ impl BinStub {
                 self.set_lsn(idx, lsn); // T-3
                 self.entries[idx].data = data;
                 self.entries[idx].dirty = true;
-                (idx, false)
+                // KD slot reuse (JE CursorImpl.insertRecordInternal isSlotReuse,
+                // CursorImpl.java:1373; IN.insertRecord clears KD/PD): the slot
+                // held no record, so report a NEW record for entry counting.
+                let was_kd =
+                    std::mem::take(&mut self.entries[idx].known_deleted);
+                (idx, was_kd)
             }
             Err(idx) => {
                 self.insert_slot(idx, full_key, lsn, data);
@@ -2257,7 +2272,12 @@ impl BinStub {
                 self.set_lsn(idx, lsn); // T-3
                 self.entries[idx].data = data;
                 self.entries[idx].dirty = true;
-                (idx, false)
+                // KD slot reuse (JE CursorImpl.insertRecordInternal isSlotReuse,
+                // CursorImpl.java:1373; IN.insertRecord clears KD/PD): the slot
+                // held no record, so report a NEW record for entry counting.
+                let was_kd =
+                    std::mem::take(&mut self.entries[idx].known_deleted);
+                (idx, was_kd)
             }
             Err(idx) => {
                 // New key — store the prefix-stripped SUFFIX at the
@@ -2290,7 +2310,9 @@ impl BinStub {
 
     /// Comparator-aware delete: removes `full_key` from the BIN using `cmp`.
     ///
-    /// Returns `true` if the entry was found and removed.
+    /// Returns `true` if a LIVE entry was found and removed.  A known-deleted
+    /// slot is removed too but reports `false` (it was already accounted for
+    /// by `Tree::mark_deleted`).
     pub fn delete_cmp(
         &mut self,
         full_key: &[u8],
@@ -2309,8 +2331,9 @@ impl BinStub {
         };
         match result {
             Ok(idx) => {
+                let live = !self.entries[idx].known_deleted;
                 self.remove_slot(idx);
-                true
+                live
             }
             Err(_) => false,
         }
@@ -6133,8 +6156,12 @@ impl Tree {
                         let suffix = bin.compress_key(key);
                         match bin.key_binary_search(suffix.as_slice()) {
                             Ok(idx) => {
+                                // A known-deleted slot was already counted
+                                // and credited by `mark_deleted`: remove it
+                                // but report no live removal.
+                                let live = !bin.entries[idx].known_deleted;
                                 bin.remove_slot(idx);
-                                true
+                                live
                             }
                             Err(_) => false,
                         }
@@ -9987,6 +10014,87 @@ impl Tree {
             }
         }
         None
+    }
+
+    /// `IN.deleteRecord` (IN.java:3765-3798) for a transactional delete: keep
+    /// the slot, set its LSN to the deletion logrec (`setLsn(idx, newLSN)`),
+    /// set the deleted flag (`setPendingDeleted`; Noxu has one KD bit) and
+    /// mark the slot/BIN dirty, so a checkpoint taken before the txn ends logs
+    /// a slot carrying the DeleteLN LSN and recovery undo can match it
+    /// (RecoveryManager.java:1912-1963).  The slot's data is dropped (JE
+    /// evicts the LN: "as long as the PD flag is on, the record's data will
+    /// never be accessed", CursorImpl.java:983-1001).  The compressor removes
+    /// the slot once its LSN lock is uncontended (BIN.compress, BIN.java:1170).
+    ///
+    /// Tag-native port of integrate 984fbabc's `mark_deleted`.  984fbabc built
+    /// it on the v4 `with_existing_record_slot` helper, which does not exist at
+    /// v7.11.0; this keeps the SAME algorithm on the tag's descent primitive
+    /// `get_parent_bin_for_child_ln` (hand-over-hand coupled descent to the
+    /// key's BIN) plus a BIN write latch and the tag's own slot finders
+    /// (`find_entry_cmp` / `find_entry_compressed`) — the same pair the tag's
+    /// `search_with_data` and `delete_recursive` use.
+    ///
+    /// ponytail: the memory counter is credited here exactly as
+    /// [`Self::delete`] credits it (key + data + slot overhead), so a later
+    /// physical removal of the KD slot (compressor, `delete`) credits nothing
+    /// and a KD-slot reuse (`insert` reports `is_new`) re-charges it.  The KD
+    /// slot's key bytes stay resident until compression; charge them to the
+    /// slot instead if that residue ever matters for budget accuracy.
+    ///
+    /// Returns `true` iff a LIVE slot was found and marked.
+    pub fn mark_deleted(&self, key: &[u8], del_lsn: Lsn) -> bool {
+        let Some(bin_arc) = self.get_parent_bin_for_child_ln(key) else {
+            return false;
+        };
+        let mut g = bin_arc.write();
+        let TreeNode::Bottom(bin) = &mut *g else {
+            return false;
+        };
+        let (idx, exact) = match &self.key_comparator {
+            Some(cmp) => bin.find_entry_cmp(key, cmp.as_ref()),
+            None => bin.find_entry_compressed(key),
+        };
+        if !exact || bin.entries[idx].known_deleted {
+            return false;
+        }
+        bin.set_lsn(idx, del_lsn);
+        let e = &mut bin.entries[idx];
+        e.known_deleted = true;
+        e.dirty = true;
+        let data_len = e.data.take().map_or(0, |d| d.len());
+        bin.dirty = true;
+        drop(g);
+        if let Some(counter) = &self.memory_counter {
+            let delta = (key.len() + data_len + BIN_ENTRY_OVERHEAD) as i64;
+            counter.fetch_sub(delta, Ordering::Relaxed);
+        }
+        true
+    }
+
+    /// `(slot LSN, known_deleted)` of the slot for `key`, INCLUDING a
+    /// known-deleted slot (JE `getParentBINForChildLN` returns KD slots; the
+    /// read-path `findEntry` hides them, IN.java:3197).  Used where JE
+    /// inspects a slot regardless of KD: recovery redo/undo
+    /// (RecoveryManager.java:1912-1963, 2520-2600).  `None` when no slot
+    /// exists (or the descent failed).
+    ///
+    /// Tag-native port of integrate 984fbabc's `slot_lsn_any`, on the tag's
+    /// `get_parent_bin_for_child_ln` descent + slot finders (see
+    /// `mark_deleted`).
+    pub fn slot_lsn_any(&self, key: &[u8]) -> Option<(Lsn, bool)> {
+        let bin_arc = self.get_parent_bin_for_child_ln(key)?;
+        let g = bin_arc.read();
+        let TreeNode::Bottom(bin) = &*g else {
+            return None;
+        };
+        let (idx, exact) = match &self.key_comparator {
+            Some(cmp) => bin.find_entry_cmp(key, cmp.as_ref()),
+            None => bin.find_entry_compressed(key),
+        };
+        if !exact {
+            return None;
+        }
+        Some((bin.get_lsn(idx), bin.entries[idx].known_deleted))
     }
 
     /// Returns the BIN where `key` should be inserted.

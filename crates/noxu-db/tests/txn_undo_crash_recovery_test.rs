@@ -161,37 +161,31 @@ fn cursor_search_delete(db: &Database, t: &Transaction) {
 // ---- txn still open at the crash (no abort record) ----
 
 #[test]
-#[ignore = "P0: KD slot retention not implemented (JE IN.java:3765-3798, RecoveryManager.java:1912-1963)"]
 fn in_flight_update2_delete_reinsert_db_api() {
     assert_restored("u2-del-ins/db", run(false, u2_del_ins_db));
 }
 
 #[test]
-#[ignore = "P0: KD slot retention not implemented (JE IN.java:3765-3798, RecoveryManager.java:1912-1963)"]
 fn in_flight_update2_delete_reinsert_cursor() {
     assert_restored("u2-del-ins/cursor", run(false, u2_del_ins_cursor));
 }
 
 #[test]
-#[ignore = "P0: KD slot retention not implemented (JE IN.java:3765-3798, RecoveryManager.java:1912-1963)"]
 fn in_flight_delete_only() {
     assert_restored("del-only", run(false, del_only));
 }
 
 #[test]
-#[ignore = "P0: KD slot retention not implemented (JE IN.java:3765-3798, RecoveryManager.java:1912-1963)"]
 fn in_flight_delete_reinsert() {
     assert_restored("del-reins", run(false, del_reins));
 }
 
 #[test]
-#[ignore = "P0: KD slot retention not implemented (JE IN.java:3765-3798, RecoveryManager.java:1912-1963)"]
 fn in_flight_update2_delete() {
     assert_restored("u2-del", run(false, u2_del));
 }
 
 #[test]
-#[ignore = "P0: KD slot retention not implemented (JE IN.java:3765-3798, RecoveryManager.java:1912-1963)"]
 fn in_flight_cursor_search_delete() {
     assert_restored("cursor-search-delete", run(false, cursor_search_delete));
 }
@@ -244,13 +238,11 @@ fn aborted_after_ckpt_update3_large_and_small() {
 
 /// Delete then abort after the checkpoint: both root causes at once.
 #[test]
-#[ignore = "P0: KD slot retention not implemented (JE IN.java:3765-3798, RecoveryManager.java:1912-1963)"]
 fn aborted_after_ckpt_delete_only() {
     assert_restored("del-only/aborted", run(true, del_only));
 }
 
 #[test]
-#[ignore = "P0: KD slot retention not implemented (JE IN.java:3765-3798, RecoveryManager.java:1912-1963)"]
 fn aborted_after_ckpt_update2_delete_reinsert() {
     assert_restored("u2-del-ins/aborted", run(true, u2_del_ins_db));
 }

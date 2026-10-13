@@ -376,10 +376,18 @@ pub fn apply_redo_ln(tree: &mut noxu_tree::Tree, rec: &LnRecord, lsn: Lsn) {
             }
         }
         LnOperation::Delete => {
-            // Bin.deleteEntry(index) / slot KD-flag set.
-            // Our tree's delete() is a no-op when the key is absent, so
-            // this is always safe.
-            tree.delete(&rec.key);
+            // JE RecoveryManager.redo (RecoveryManager.java:2520-2560): a
+            // replayed deletion over a non-KD slot whose LSN is <= the logrec
+            // leaves the slot KNOWN-DELETED carrying the logrec LSN
+            // (`recoverRecord(.., redoKD, ..)`) and queues it for the
+            // compressor; a KD slot or an absent key is left alone.  Keeping
+            // the slot lets undo of a later uncommitted write to the key match
+            // it by LSN (RecoveryManager.java:1912-1963).
+            if let Some((slot_lsn, false)) = tree.slot_lsn_any(&rec.key)
+                && (slot_lsn.is_null() || lsn >= slot_lsn)
+            {
+                tree.mark_deleted(&rec.key, lsn);
+            }
         }
     }
 }
@@ -2979,15 +2987,18 @@ impl RecoveryManager {
     /// Skipping (b) is the critical fix: without it, an aborted txn's
     /// before-image overwrites a subsequently-committed write of the same key,
     /// silently losing committed data on recovery.
+    ///
+    /// The lookup INCLUDES known-deleted slots: JE undo finds the slot with
+    /// `getParentBINForChildLN` (which returns KD/PD slots) and compares its
+    /// LSN (RecoveryManager.java:1909-1950), so an in-flight DeleteLN kept as
+    /// a KD slot by the checkpoint is matched and reverted.  A NULL-LSN slot
+    /// never matches (JE queues it for deletion, :1919-1937).
     fn undo_slot_is_current(
         tree: &noxu_tree::Tree,
         key: &[u8],
         log_lsn: Lsn,
     ) -> bool {
-        match tree.search_with_data(key) {
-            Some(sf) if sf.found => sf.lsn == log_lsn.as_u64(),
-            _ => false,
-        }
+        matches!(tree.slot_lsn_any(key), Some((lsn, _)) if lsn == log_lsn)
     }
 
     // ====================================================================

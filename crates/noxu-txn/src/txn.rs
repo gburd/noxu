@@ -1795,6 +1795,15 @@ impl Txn {
             .map(|w| w.abort_lsn)
     }
 
+    /// The abortKD recorded with [`Self::recorded_abort_lsn`] (JE
+    /// `WriteLockInfo.getAbortKnownDeleted`, logged by LN.java:646).
+    pub fn recorded_abort_known_deleted(&self, lsn: u64) -> Option<bool> {
+        self.write_locks
+            .get(&lsn)
+            .filter(|w| !w.never_locked)
+            .map(|w| w.abort_known_deleted)
+    }
+
     /// Returns the number of read locks held.
     pub fn n_read_locks(&self) -> usize {
         self.read_locks.len()
