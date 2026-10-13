@@ -492,79 +492,40 @@ impl TreeLookup for RealTreeLookup {
             Err(_) => return InLookupResult::Obsolete,
         };
 
-        // Try to find via parent-of-node search first (non-root nodes).
-        if let Some((parent_arc, slot_idx)) =
-            tree_guard.get_parent_in_for_child_in(node_id_u64)
-        {
-            // Step 2a — get the LSN stored in the parent's slot for this child.
-            let parent_guard = parent_arc.read();
-            let slot_lsn = match &*parent_guard {
-                TreeNode::Internal(n) => {
-                    // The parent slot's LSN tracks the last logged position
-                    // for the child — used directly for upper INs
-                    // INEntryInfo.prevFullLsn read from the log entry).
-                    n.entries.get(slot_idx).map(|_| n.get_lsn(slot_idx))
-                }
-                _ => None,
-            };
-            drop(parent_guard);
-
-            // Get the child arc from the parent to inspect the node's own
-            // `last_full_lsn` (BIN) or dirty flag (Internal).
-            let child_arc = {
-                let parent_guard = parent_arc.read();
-                match &*parent_guard {
-                    TreeNode::Internal(n) => n.get_child(slot_idx),
-                    _ => None,
-                }
-            };
-
-            let child_arc = match child_arc {
-                Some(a) => a,
-                None => return InLookupResult::Obsolete,
-            };
-
-            // Step 2b — get the node's own LSN (BIN uses last_full_lsn).
-            let node_lsn = {
-                let child_guard = child_arc.read();
-                match &*child_guard {
-                    TreeNode::Bottom(b) => b.last_full_lsn,
-                    // For upper INs we don't have a per-node last_full_lsn;
-                    // use NULL_LSN to indicate "use parent slot LSN".
-                    TreeNode::Internal(_) => {
-                        // For upper INs, the parent slot LSN (InEntry.lsn) is
-                        // the last logged position for this node. The slot LSN
-                        // from the log entry header determines currency.
-                        match slot_lsn {
-                            Some(lsn) => lsn,
-                            None => return InLookupResult::Obsolete,
-                        }
-                    }
-                }
-            };
-
-            // Step 3 — compare LSNs.
-            if node_lsn == noxu_util::NULL_LSN {
-                // Never logged (deferred-write) → log entry is obsolete.
-                return InLookupResult::Obsolete;
+        // Step 1 — decide liveness of this logged BIN/IN image against the
+        // live tree, race-free against the evictor.
+        //
+        // SPLIT-1 (cache↔cleaner ordering): the pre-fix code located the
+        // parent slot, then re-read the resident child in a SEPARATE
+        // read-latch acquisition.  If the evictor detached the BIN in that
+        // window `get_child(idx)` was `None`, so the cleaner counted the live
+        // on-disk image dead and deleted the log file holding its only image;
+        // the next re-fault then dangled ("Log file not found").
+        // `verify_logged_child_live` does the whole decision (route, re-fault
+        // the detached child, compare, dirty for migration) under the parent
+        // WRITE latch, so the child cannot be detached between the route and
+        // the verdict (JE FileProcessor.findINInTree via
+        // getParentINForChildIN(doFetch=true), held EX-latched through
+        // IN.setDirty, FileProcessor.java:1723-1835).
+        //
+        // Three-valued: Routed == live (dirtied, Found); Undecidable == a
+        // failed re-fault / moved slot, which MUST retain the file (fail
+        // closed → Found, re-decided next pass); NotFound falls through to the
+        // root check below (the node may still be the tree ROOT) and is
+        // otherwise obsolete.
+        match tree_guard.verify_logged_child_live(node_id_u64, log_lsn) {
+            noxu_tree::LoggedChildLookup::Routed(_, _) => {
+                return InLookupResult::Found;
             }
-
-            if node_lsn != log_lsn {
-                // The tree has a newer (or different) version.
-                return InLookupResult::Obsolete;
+            noxu_tree::LoggedChildLookup::Undecidable => {
+                // Fail closed: retain the file so a later pass can re-decide.
+                return InLookupResult::Found;
             }
-
-            // Step 4 — tree_lsn == log_lsn: mark dirty.
-            // `inInTree.setDirty(true); inInTree.setProhibitNextDelta(true)`.
-            drop(tree_guard);
-            {
-                let mut child_write = child_arc.write();
-                child_write.set_dirty(true);
-            }
-            return InLookupResult::Found;
+            noxu_tree::LoggedChildLookup::NotFound => {}
         }
 
-        // No parent found — check if the node is the tree root.
+        // No parent found (or decided obsolete) — check if the node is the
+        // tree root.
         // Clone the Arc so we can drop the tree_guard before taking a write lock.
         let root_arc_opt = tree_guard.get_root();
         drop(tree_guard);

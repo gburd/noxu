@@ -83,7 +83,8 @@ pub use versioned_ln::make_versioned_ln;
 // Tree types
 pub use tree::{
     BinEntry, BinStub, ChildArc, InEntry, InNodeStub, InRedoResult,
-    KeyComparatorFn, KeyRep, LsnRep, SlotFetch, TargetRep, Tree, TreeNode,
+    KeyComparatorFn, KeyRep, LoggedChildLookup, LsnRep, SlotFetch, TargetRep,
+    Tree, TreeNode,
     TreeStats, generate_node_id, peek_next_node_id_counter,
     seed_node_id_counter,
 };

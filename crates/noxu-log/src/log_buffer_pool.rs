@@ -27,6 +27,7 @@
 //! - JE `LogBufferPool.writeBufferToFile` (calls `fileManager.writeLogBuffer`)
 //! - JE `FileManager.writeLogBuffer` (pwrite via `writeToFile`)
 
+use crate::entry_header::{MAX_HEADER_SIZE, MIN_HEADER_SIZE};
 use crate::error::{LogError, Result};
 use crate::file_manager::FileManager;
 use crate::log_buffer::LogBuffer;
@@ -382,6 +383,103 @@ impl LogBufferPool {
     ///
     /// Returns the buffer that contains the given LSN location, latched and ready
     /// to read, or returns None.
+    /// Return the raw entry bytes for `lsn` if it is still in a write buffer,
+    /// copied out while the buffer's outer mutex and `read_latch` are held in
+    /// the natural nested order (outer mutex outer, `read_latch` inner), both
+    /// released before return.  The pool lock (held by the caller) is likewise
+    /// released by the caller immediately after this returns.
+    ///
+    /// BUG-LOGBUF-LATCH-1 fix: the previous path returned the buffer `Arc`
+    /// with its `read_latch` STILL HELD and dropped the outer mutex; the
+    /// caller (`LogManager::read_entry`) then RE-ACQUIRED the outer mutex to
+    /// copy out -- i.e. it took `read_latch` THEN the outer mutex, the reverse
+    /// of the flusher's `fill_flush_pending` (outer mutex THEN `read_latch`
+    /// via `wait_for_zero_and_latch`).  That ABBA wedged the WAL flush against
+    /// the LN re-read path (EvictActionTest.testThreadedCacheSizeChanges hang;
+    /// gdb fix-cache-logbuffer-deadlock).  JE copies out under the single
+    /// `readLatch` with the pool latch already released
+    /// (LogBufferPool.getReadBufferByLsn + LogManager.getLogSource/
+    /// getLogEntryFromLogSource, LogManager.java:1192-1270); Noxu's two-lock
+    /// (outer mutex + `read_latch`) buffer acquires+releases both in ONE
+    /// consistently-ordered frame here.
+    ///
+    /// Returns the bytes of the entry (header + payload) starting at
+    /// `lsn.file_offset()`; the caller parses them WITHOUT holding any buffer
+    /// or pool lock.
+    pub fn get_read_buffer_bytes_by_lsn(
+        &mut self,
+        lsn: Lsn,
+    ) -> Result<Option<Vec<u8>>> {
+        self.n_not_resident += 1;
+
+        // Avoid latching if the LSN is known not to be in the pool
+        if lsn.as_u64() < self.min_buffer_lsn.load(Ordering::Acquire) {
+            self.n_cache_miss += 1;
+            return Ok(None);
+        }
+
+        // Latch and check the buffer pool
+        let _guard = self
+            .buffer_pool_latch
+            .acquire()
+            .map_err(|e| LogError::LatchTimeout(e.to_string()))?;
+
+        // Check SETTLED buffers before the active one (they have a zero pin
+        // count, so `contains_lsn`'s `wait_for_zero_and_latch` never parks).
+        let active = self.current_write_buffer_index;
+        let order = (0..self.buffers.len())
+            .filter(|&i| i != active)
+            .chain(std::iter::once(active));
+        for i in order {
+            let buffer_arc = &self.buffers[i];
+            // Natural nested order: outer mutex, then (via contains_lsn)
+            // read_latch.  Identical to the flusher's order in
+            // fill_flush_pending, so no ABBA with it.
+            let buffer = buffer_arc.lock();
+            if buffer.contains_lsn(lsn) {
+                // `contains_lsn` left the read_latch HELD.  Copy out NOW,
+                // under both locks, then release read_latch (inner) and the
+                // outer mutex (outer) -- inner-first -- before returning.  The
+                // caller releases the pool lock right after.
+                //
+                // Copy ONLY the entry's own bytes (header + payload), NOT the
+                // whole buffer tail: a copy from the LSN offset to
+                // `content_len()` (up to the full multi-MB buffer) while
+                // holding the pool lock + outer mutex + read_latch blocks
+                // writers (who need the pool lock to append) long enough to
+                // time out concurrent record read-locks (EvictActionTest
+                // LockTimeout).  Parse the header here to bound the copy to
+                // `entry_size`.
+                let slice = buffer.get_bytes(lsn.file_offset());
+                let bytes = if slice.len() >= MIN_HEADER_SIZE {
+                    let item_size = u32::from_le_bytes([
+                        slice[10], slice[11], slice[12], slice[13],
+                    ]) as usize;
+                    let flags = slice[5];
+                    let vlsn_present =
+                        (flags & 0x08) != 0 || (flags & 0x20) != 0;
+                    let header_size = if vlsn_present {
+                        MAX_HEADER_SIZE
+                    } else {
+                        MIN_HEADER_SIZE
+                    };
+                    let entry_size = header_size + item_size;
+                    let end = entry_size.min(slice.len());
+                    slice[..end].to_vec()
+                } else {
+                    slice.to_vec()
+                };
+                buffer.release(); // drop read_latch (inner)
+                drop(buffer); // drop outer mutex (outer)
+                return Ok(Some(bytes));
+            }
+            drop(buffer);
+        }
+
+        self.n_cache_miss += 1;
+        Ok(None)
+    }
+
     pub fn get_read_buffer_by_lsn(
         &mut self,
         lsn: Lsn,

@@ -2922,6 +2922,30 @@ enum SplitHint {
     AllRight,
 }
 
+/// Three-valued verdict for the cleaner's "is this logged child image still
+/// live?" question, computed race-free against the evictor by
+/// [`Tree::verify_logged_child_live`].
+///
+/// JE `FileProcessor.findINInTree` returns the parent EX-latched with the
+/// child resident and either migrates it (live) or counts it dead; a fetch
+/// failure throws and the file is retained.  We model that as:
+#[derive(Debug)]
+pub enum LoggedChildLookup {
+    /// The logged image is the live, current version.  The child has been
+    /// re-faulted (if it was detached) and marked dirty + prohibit-next-delta
+    /// under the parent WRITE latch, so the next checkpoint re-logs a full
+    /// image that retires the cleaned file's copy.  Carries the live child
+    /// `Arc` and its parent slot index.
+    Routed(Arc<RwLock<TreeNode>>, usize),
+    /// The logged image is superseded or genuinely absent (a decided
+    /// OBSOLETE).  Safe to count dead.
+    NotFound,
+    /// The verdict cannot be decided this pass (the child could not be
+    /// re-faulted, or the slot moved under a concurrent split/prune).  The
+    /// cleaner MUST retain the file (fail closed) and re-decide next pass.
+    Undecidable,
+}
+
 impl Tree {
     /// Creates a new empty tree.
     ///
@@ -9843,6 +9867,274 @@ impl Tree {
     ) -> Option<(Arc<RwLock<TreeNode>>, usize)> {
         let root = self.get_root()?;
         Self::find_parent_of_node_id(&root, child_node_id)
+    }
+
+    /// Locate the parent IN slot of a logged (possibly DETACHED) BIN/IN image
+    /// by ROUTING on a key the logged node covers — the only way to find the
+    /// parent of a non-resident child (the resident DFS
+    /// [`Self::get_parent_in_for_child_in`] cannot see a detached child).
+    ///
+    /// JE `Tree.getParentINForChildIN` routes by the logged node's identifier
+    /// key and FETCHES non-resident ancestors (doFetch=true,
+    /// FileProcessor.java:1727-1729).  Three-valued (R46-1): an unreadable
+    /// image / a failed fetch is `Undecidable` (retain the file; never
+    /// obsolete); an empty image with no key to route by is `Undecidable`; a
+    /// decided miss is `NotFound`.
+    pub fn get_parent_in_for_logged_child(
+        &self,
+        node_id: u64,
+        log_lsn: Lsn,
+    ) -> LoggedChildLookup {
+        use noxu_log::LogEntryType;
+        // No log manager configured — routing cannot be attempted (a test /
+        // deferred-write tree).  A genuinely absent node is NotFound.
+        let Some(lm) = self.log_manager.as_ref() else {
+            return LoggedChildLookup::NotFound;
+        };
+        let Ok((kind, payload)) = lm.read_entry(log_lsn) else {
+            return LoggedChildLookup::Undecidable;
+        };
+        let Ok(entry) =
+            noxu_log::entry::in_log_entry::InLogEntry::read_from_log(&payload)
+        else {
+            return LoggedChildLookup::Undecidable;
+        };
+        if entry.db_id != self.database_id {
+            return LoggedChildLookup::NotFound;
+        }
+        // JE IN.getIdentifierKey: any key the node covers routes to it.  Noxu
+        // does not persist the identifier key, so an EMPTY image carries no
+        // key: it is UNDECIDABLE, never obsolete (R46-1).
+        let (level, key) = match kind {
+            LogEntryType::BIN => {
+                let Some(b) = Self::deserialize_bin(&entry.node_data) else {
+                    return LoggedChildLookup::Undecidable;
+                };
+                match b.get_full_key(0) {
+                    Some(k) => (BIN_LEVEL, k),
+                    None => return LoggedChildLookup::Undecidable,
+                }
+            }
+            LogEntryType::BINDelta => {
+                let Some(e) = Self::parse_delta_entries(&entry.node_data) else {
+                    return LoggedChildLookup::Undecidable;
+                };
+                match e.into_iter().next() {
+                    Some(first) => (BIN_LEVEL, first.0),
+                    None => return LoggedChildLookup::Undecidable,
+                }
+            }
+            LogEntryType::IN => {
+                let Some(n) = Self::deserialize_upper_in(&entry.node_data)
+                else {
+                    return LoggedChildLookup::Undecidable;
+                };
+                // Slot 0 of an upper IN may hold the virtual (-inf) key;
+                // every later slot key lies inside the node's range.
+                match n.entries.get(1).or_else(|| n.entries.first()) {
+                    Some(e) => (n.level, e.key.clone()),
+                    None => return LoggedChildLookup::Undecidable,
+                }
+            }
+            _ => return LoggedChildLookup::NotFound,
+        };
+        let Some(mut parent) = self.get_root() else {
+            return LoggedChildLookup::NotFound;
+        };
+        loop {
+            let (idx, parent_level) = {
+                let g = parent.read();
+                let TreeNode::Internal(n) = &*g else {
+                    return LoggedChildLookup::NotFound;
+                };
+                if n.entries.is_empty() {
+                    return LoggedChildLookup::NotFound;
+                }
+                (self.upper_in_floor_index(&n.entries, &key), n.level)
+            };
+            if parent_level <= level {
+                return LoggedChildLookup::NotFound;
+            }
+            // A fetch failure is UNDECIDABLE (JE throws and the file is
+            // retained); an empty slot is a decided NotFound.  v7.11.0
+            // `child_at_or_fetch` returns None on both a null slot and a
+            // failed log read; we fail closed (Undecidable) so a transient
+            // read error never deletes a file under a live reference.
+            let Some(child) = self.child_at_or_fetch(&parent, idx) else {
+                return LoggedChildLookup::Undecidable;
+            };
+            if parent_level == level + 1 {
+                return if child.read().node_id() == node_id {
+                    LoggedChildLookup::Routed(parent, idx)
+                } else {
+                    LoggedChildLookup::NotFound
+                };
+            }
+            parent = child;
+        }
+    }
+
+    /// Cleaner liveness check for a logged BIN/IN image, JE-faithful and
+    /// race-free against the evictor (SPLIT-1 / cache↔cleaner ordering).
+    ///
+    /// The pre-fix cleaner located the parent slot, then re-read the resident
+    /// child in a SEPARATE latch acquisition: if the evictor detached the BIN
+    /// in that window `get_child(idx)` was `None` and the cleaner counted the
+    /// live on-disk image dead — then deleted the log file holding the
+    /// detached BIN's only image.  The next re-fault dangled ("Log file not
+    /// found": SplitRequired forever / lost insert).
+    ///
+    /// JE `FileProcessor.findINInTree` calls
+    /// `Tree.getParentINForChildIN(doFetch=true)`, which returns the parent
+    /// EX-latched with the child resident, then compares `getLastFullLsn` /
+    /// slot LSN and `IN.setDirty(true)` — all with the parent latch held
+    /// (FileProcessor.java:1723-1835, IN.java:1801-1835).  We mirror that: the
+    /// whole decision (re-fault the detached child, compare the logged image,
+    /// dirty it for migration) runs under the parent WRITE latch, so the
+    /// evictor cannot detach the child between the route and the verdict.
+    ///
+    /// Three-valued: `Routed` (live, dirtied), `NotFound` (superseded or
+    /// genuinely absent → obsolete), `Undecidable` (fetch failed / slot moved
+    /// → retain the file, fail closed).
+    pub fn verify_logged_child_live(
+        &self,
+        node_id: u64,
+        log_lsn: Lsn,
+    ) -> LoggedChildLookup {
+        // Locate the parent slot.  Prefer the fast resident DFS; a DETACHED
+        // (evicted) child is NOT resident, so it is invisible to that DFS —
+        // fall back to the by-key routed descent, which faults non-resident
+        // ancestors in and finds the parent slot of a detached logged image.
+        // (That routed descent is the half of JE
+        // getParentINForChildIN(doFetch=true) that makes a detached-but-live
+        // BIN routable at all.)
+        let parent_slot = match self.get_parent_in_for_child_in(node_id) {
+            Some(ps) => ps,
+            None => match self.get_parent_in_for_logged_child(node_id, log_lsn)
+            {
+                LoggedChildLookup::Routed(p, i) => (p, i),
+                other => return other, // NotFound / Undecidable propagate
+            },
+        };
+        let (parent_arc, slot_idx) = parent_slot;
+
+        // Hold the parent WRITE latch across re-fault + compare + dirty so the
+        // evictor cannot detach the child in the window (JE holds the parent
+        // EX-latch from getParentINForChildIN through setDirty).
+        let mut parent_guard = parent_arc.write();
+        let TreeNode::Internal(n) = &mut *parent_guard else {
+            return LoggedChildLookup::NotFound;
+        };
+        if slot_idx >= n.entries.len() {
+            // The slot moved (concurrent prune/split); re-route next pass.
+            return LoggedChildLookup::Undecidable;
+        }
+        let slot_lsn = n.get_lsn(slot_idx);
+
+        // Re-fault the child if it was (re-)detached.  A fetch failure is
+        // UNDECIDABLE (JE throws and the file is retained); never obsolete.
+        if n.get_child(slot_idx).is_none() {
+            match self.try_fetch_child_locked(&parent_arc, n, slot_idx) {
+                Ok(Some(_)) => {} // now resident
+                Ok(None) => {
+                    // Null slot LSN (never-logged) == genuinely absent image.
+                    return LoggedChildLookup::NotFound;
+                }
+                Err(_) => return LoggedChildLookup::Undecidable,
+            }
+        }
+        let Some(child_arc) = n.get_child(slot_idx) else {
+            return LoggedChildLookup::Undecidable;
+        };
+
+        // Compare the logged image against the live node.
+        let mut child_guard = child_arc.write();
+        let live = match &mut *child_guard {
+            TreeNode::Bottom(b) => {
+                // The full base and every delta up to the current one are
+                // live (mirrors JE processBINDelta: any chain element up to
+                // the current version is required).
+                let full = b.last_full_lsn;
+                let is_live = full != NULL_LSN
+                    && (log_lsn == full
+                        || (b.last_delta_lsn != NULL_LSN
+                            && log_lsn > full
+                            && log_lsn <= b.last_delta_lsn));
+                if is_live {
+                    // Dirty + prohibit next delta so the checkpoint re-logs a
+                    // FULL BIN that retires the cleaned file's copy.
+                    b.dirty = true;
+                    b.prohibit_next_delta = true;
+                }
+                is_live
+            }
+            TreeNode::Internal(_) => {
+                // Upper IN: the parent slot LSN is its current logged
+                // position.  Live iff the slot still points at log_lsn.
+                if slot_lsn != NULL_LSN && slot_lsn == log_lsn {
+                    child_guard.set_dirty(true);
+                    true
+                } else {
+                    false
+                }
+            }
+        };
+        drop(child_guard);
+        if live {
+            LoggedChildLookup::Routed(Arc::clone(&child_arc), slot_idx)
+        } else {
+            LoggedChildLookup::NotFound
+        }
+    }
+
+    /// Fetch the child at `idx` from its slot LSN and install it, with the
+    /// parent `n` ALREADY WRITE-latched by the caller (the locked analogue of
+    /// [`Self::child_at_or_fetch`]'s slow path).  Used by
+    /// [`Self::verify_logged_child_live`] so the re-fault happens under the
+    /// same parent latch that guards the subsequent compare + dirty.
+    ///
+    /// Returns `Ok(None)` when the slot has no logged image (null slot LSN /
+    /// out of range) — a genuinely-absent image — and `Err` when the log read
+    /// failed (undecidable; retain the file).
+    fn try_fetch_child_locked(
+        &self,
+        parent_arc: &Arc<RwLock<TreeNode>>,
+        n: &mut InNodeStub,
+        idx: usize,
+    ) -> crate::error::TreeResult<Option<ChildArc>> {
+        if idx >= n.entries.len() {
+            return Ok(None);
+        }
+        let child_lsn = n.get_lsn(idx);
+        if child_lsn == NULL_LSN {
+            return Ok(None);
+        }
+        let Some(node) = self.fetch_node_from_log(child_lsn) else {
+            // v7.11.0 `fetch_node_from_log` returns Option (it swallows the
+            // typed log error); a None here means the image could not be read
+            // back — undecidable, so the cleaner retains the file.
+            return Err(TreeError::LogError(format!(
+                "re-fault of child slot {idx} at {child_lsn:?} failed"
+            )));
+        };
+        let node_id = node.node_id();
+        let (is_bin, is_delta) = match &node {
+            TreeNode::Bottom(b) => (true, b.is_delta),
+            TreeNode::Internal(_) => (false, false),
+        };
+        self.note_fetch_miss(is_bin, is_delta);
+        if let Some(counter) = &self.memory_counter {
+            let sz = node.budgeted_memory_size();
+            counter.fetch_add(sz as i64, Ordering::Relaxed);
+        }
+        let arc: ChildArc = Arc::new(RwLock::new(node));
+        {
+            let mut cg = arc.write();
+            cg.set_parent(Some(Arc::downgrade(parent_arc)));
+        }
+        n.set_child(idx, Some(arc.clone()));
+        self.note_added(node_id);
+        Ok(Some(arc))
     }
 
     /// Read the LSN currently stored in the slot of `child_arc`'s parent IN
