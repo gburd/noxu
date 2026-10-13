@@ -127,6 +127,21 @@ pub enum RepError {
     #[error("network restore error: {0}")]
     NetworkRestoreError(String),
 
+    /// A log file the feeder still needs is gone (cleaned/deleted/unreadable)
+    /// at an offset BELOW the end of the log — it will never reappear, so the
+    /// replica cannot be fed sequentially and must perform a network restore.
+    ///
+    /// JE `FileReader.readNextEntry` turns a `FileNotFoundException` into
+    /// `EnvironmentFailureException(LOG_FILE_NOT_FOUND)` rather than skipping
+    /// the file (FileReader.java:243-251); the feeder surfaces that so the
+    /// replica is told it needs a restore (JE `InsufficientLogException` /
+    /// the "VLSN not available" feeder path). Distinct from a tail wait
+    /// (`next_entry` → `None` with no error), which is transient and retried.
+    #[error(
+        "log file {file:08x} needed by the feeder is gone below the end of          log at offset {offset:#x} (vlsn >= {from_vlsn}); replica needs a          network restore"
+    )]
+    LogFileGone { file: u32, offset: u64, from_vlsn: u64 },
+
     /// The environment has been closed.
     #[error("environment closed")]
     EnvironmentClosed,

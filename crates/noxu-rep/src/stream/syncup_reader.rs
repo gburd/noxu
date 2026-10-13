@@ -145,13 +145,41 @@ impl SyncupLogView {
                 as u64;
             let file_len = match fm.get_file_length(file_num) {
                 Ok(len) => len,
-                Err(_) => continue,
+                // The file is gone (concurrently cleaned). In production the
+                // syncup `ProtectedFileRange` keeps the master's VLSNIndex
+                // range alive for the duration of the scan (JE
+                // FileProtector.java:94-110), so a missing file means its
+                // VLSNs are genuinely unavailable and the replica needs a
+                // network restore. Log it so the gap is observable rather than
+                // a silently shorter view. REP-FEEDER-SKIP.
+                Err(e) => {
+                    log::warn!(
+                        "SyncupLogView: log file {file_num:08x} is gone                          mid-scan ({e}); its VLSNs are omitted from the                          matchpoint view (the replica may need a network                          restore)"
+                    );
+                    continue;
+                }
             };
             let mut offset = header_size;
             while offset < file_len {
                 match read_raw_entry(fm, file_num, offset) {
-                    None => break, // end of written data in this file
-                    Some((entry_size, vlsn_opt, type_byte, payload)) => {
+                    // Genuine zero-fill tail: no further entry in this file.
+                    SyncupRawRead::CleanEof => break,
+                    // Unreadable BELOW file_len (short read / cleaned / torn):
+                    // NOT a clean end. Do not silently accept a truncated
+                    // file. Log and stop this file's scan — a snapshot cannot
+                    // wait, but the hole is now observable. REP-FEEDER-SKIP.
+                    SyncupRawRead::NotYet => {
+                        log::warn!(
+                            "SyncupLogView: unreadable entry in file                              {file_num:08x} at offset {offset:#x} (len                              {file_len}); truncating this file's view (the                              replica may need a network restore)"
+                        );
+                        break;
+                    }
+                    SyncupRawRead::Entry(
+                        entry_size,
+                        vlsn_opt,
+                        type_byte,
+                        payload,
+                    ) => {
                         offset += entry_size as u64;
                         // A checkpoint-end (JE `LOG_CKPT_END`) is not
                         // replicated and carries no VLSN, so it would be
@@ -408,18 +436,36 @@ fn ckpt_end_cleaned_files(payload: &[u8]) -> bool {
 /// at end-of-data / corruption. Same VLSN-tagged header parse as
 /// `EnvironmentLogScanner::read_raw_entry` (feeder.rs); kept as a free
 /// function here so the backward view does not depend on the feeder type.
+/// Outcome of a raw read in the syncup snapshot scan. Mirrors the feeder's
+/// `RawRead` (feeder.rs): a successful entry, a genuine zero-fill EOF, or a
+/// position that is unreadable but NOT EOF (short read / cleaned file /
+/// implausible size). The last must be distinguished so the scan does not
+/// silently treat a torn or cleaned mid-file region as "end of this file".
+/// JE's ReplicaSyncupReader re-reads the log and relies on the syncup
+/// `ProtectedFileRange` to keep the files alive during the scan
+/// (FileProtector.java:94-110); a hole therefore signals the replica needs a
+/// network restore, not a shorter view silently.
+enum SyncupRawRead {
+    Entry(usize, Option<u64>, u8, Vec<u8>),
+    CleanEof,
+    NotYet,
+}
+
 fn read_raw_entry(
     fm: &FileManager,
     file_num: u32,
     offset: u64,
-) -> Option<(usize, Option<u64>, u8, Vec<u8>)> {
+) -> SyncupRawRead {
     let mut hdr = [0u8; MIN_HEADER_SIZE];
-    let n = fm.read_from_file(file_num, offset, &mut hdr).ok()?;
+    let n = match fm.read_from_file(file_num, offset, &mut hdr) {
+        Ok(n) => n,
+        Err(_) => return SyncupRawRead::NotYet,
+    };
     if n < MIN_HEADER_SIZE {
-        return None;
+        return SyncupRawRead::NotYet;
     }
     if hdr[4] == 0 {
-        return None; // zero-fill past last entry
+        return SyncupRawRead::CleanEof; // zero-fill past last entry
     }
     // Skip entries whose invisible bit (flags mask 0x10) is set: a rolled-back
     // entry made invisible by Replay.rollback (STEP 4) is not a valid
@@ -434,17 +480,22 @@ fn read_raw_entry(
     let header_size =
         if vlsn_present { MAX_HEADER_SIZE } else { MIN_HEADER_SIZE };
     if item_size > MAX_ITEM_SIZE {
-        return None;
+        return SyncupRawRead::NotYet;
     }
     let entry_size = header_size + item_size;
     let mut full = vec![0u8; entry_size];
-    let n = fm.read_from_file(file_num, offset, &mut full).ok()?;
+    let n = match fm.read_from_file(file_num, offset, &mut full) {
+        Ok(n) => n,
+        Err(_) => return SyncupRawRead::NotYet,
+    };
     if n < entry_size {
-        return None;
+        return SyncupRawRead::NotYet;
     }
     let vlsn_opt = if vlsn_present && full.len() >= MAX_HEADER_SIZE {
         let raw = i64::from_le_bytes(
-            full[MIN_HEADER_SIZE..MAX_HEADER_SIZE].try_into().ok()?,
+            full[MIN_HEADER_SIZE..MAX_HEADER_SIZE]
+                .try_into()
+                .expect("invariant: 8-byte VLSN header slice"),
         );
         if raw > 0 { Some(raw as u64) } else { None }
     } else {
@@ -455,7 +506,7 @@ fn read_raw_entry(
     // entries (their VLSN is suppressed so the matchpoint search ignores
     // them). Returning a None VLSN keeps the scan moving past them.
     let vlsn_opt = if invisible { None } else { vlsn_opt };
-    Some((entry_size, vlsn_opt, entry_type_byte, payload))
+    SyncupRawRead::Entry(entry_size, vlsn_opt, entry_type_byte, payload)
 }
 
 #[cfg(test)]
