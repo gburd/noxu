@@ -53,6 +53,11 @@ pub use cursor_impl::{clear_cursor_fail_flag, set_cursor_fail_after};
 pub use database_config::{ConfigComparator, DatabaseConfig};
 pub use database_id::DatabaseId;
 pub use database_impl::{DatabaseImpl, DatabaseTree};
+// BUG-VERIFY-TRACKER-LATCH-ABBA (A25) witness seam: re-export the tree node
+// lock types so noxu-db's #[doc(hidden)] test accessor can hand a real tree
+// write latch to the ABBA witness without a direct noxu-tree dependency.
+pub use noxu_tree::{NodeRwLock, TreeNode};
+
 pub use db_backup::DbBackup;
 pub use db_tree::DbTree;
 pub use db_type::DbType;

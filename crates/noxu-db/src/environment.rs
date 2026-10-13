@@ -2041,19 +2041,106 @@ impl Environment {
         &self,
         config: &noxu_engine::VerifyConfig,
     ) -> Result<noxu_engine::VerifyResult> {
+        self.verify_inner(config, None)
+    }
+
+    /// Test seam for **BUG-VERIFY-TRACKER-LATCH-ABBA**: run [`verify`] but
+    /// invoke `prewalk_hook` once at the per-DB race window — the point where
+    /// pre-fix code held the `UtilizationTracker` leaf lock while it was about
+    /// to latch tree nodes.  The witness installs a hook here that blocks
+    /// until a concurrent thread (holding a BIN latch, then taking the tracker,
+    /// the checkpointer's legal order) makes progress.  With the ABBA bug the
+    /// tracker is held across this point, so that thread cannot acquire it and
+    /// both wedge; with the fix the tracker is not held here, so the thread
+    /// completes and verify proceeds.
+    ///
+    /// [`verify`]: Self::verify
+    #[doc(hidden)]
+    pub fn verify_with_prewalk_hook_for_test(
+        &self,
+        config: &noxu_engine::VerifyConfig,
+        prewalk_hook: &dyn Fn(),
+    ) -> Result<noxu_engine::VerifyResult> {
+        self.verify_inner(config, Some(prewalk_hook))
+    }
+
+    /// Test seam for **BUG-VERIFY-TRACKER-LATCH-ABBA**: clone the live
+    /// `UtilizationTracker` Arc so the witness thread can reproduce the
+    /// checkpointer's legal lock order (BIN write latch -> tracker lock).
+    /// `None` on a read-only / memory-only env (no tracker).
+    #[doc(hidden)]
+    pub fn utilization_tracker_for_test(
+        &self,
+    ) -> Option<
+        std::sync::Arc<noxu_sync::Mutex<noxu_cleaner::UtilizationTracker>>,
+    > {
+        self.env_impl.lock().get_utilization_tracker().cloned()
+    }
+
+    /// Test seam for **BUG-VERIFY-TRACKER-LATCH-ABBA**: return the root tree
+    /// node of a named database so the witness thread can take a real tree
+    /// write latch (the "BIN latch" leg of the ABBA cycle).  `None` if the DB
+    /// is absent or has no resident root.
+    #[doc(hidden)]
+    pub fn root_tree_node_for_test(
+        &self,
+        db_name: &str,
+    ) -> Option<std::sync::Arc<noxu_dbi::NodeRwLock<noxu_dbi::TreeNode>>> {
+        let env_impl = self.env_impl.lock();
+        // v7.11.1 has no by-name DatabaseImpl lookup; scan the open set.
+        for db_arc in env_impl.get_all_database_impls() {
+            let guard = db_arc.read();
+            if guard.get_name() == db_name {
+                return guard.get_real_tree()?.get_root();
+            }
+        }
+        None
+    }
+
+    /// Test seam for **BUG-VERIFY-TRACKER-LATCH-ABBA** (daemon path): clone
+    /// the shared `EnvironmentImpl` Arc so a witness can drive
+    /// `verify_daemon::run_once_with_prewalk_hook_for_test` against the same
+    /// environment the real daemon walks.
+    #[doc(hidden)]
+    pub fn env_impl_arc_for_test(
+        &self,
+    ) -> Arc<Mutex<noxu_dbi::EnvironmentImpl>> {
+        Arc::clone(&self.env_impl)
+    }
+
+    fn verify_inner(
+        &self,
+        config: &noxu_engine::VerifyConfig,
+        prewalk_hook: Option<&dyn Fn()>,
+    ) -> Result<noxu_engine::VerifyResult> {
         self.check_open()?;
         let env_impl = self.env_impl.lock();
         let all_dbs = env_impl.get_all_database_impls();
-        // Lock the live utilization tracker for the checkLsns half
-        // (VerifyUtils.checkLsns): live tree LSNs must be DISJOINT from the
-        // obsolete LSNs recorded in the UtilizationProfile/tracker. Held
-        // across the loop (no clone); read-only envs have no tracker.
-        let tracker_guard =
-            env_impl.get_utilization_tracker().map(|t| t.lock());
+        // The live utilization tracker (used for the checkLsns half, below).
+        // It is a LEAF lock: the log-write observer takes it while holding a
+        // BIN latch (LogManager::notify_observer ->
+        // UtilizationTrackerObserver::count_new_entry), so the legal direction
+        // is tree-latch -> tracker.  We must therefore NEVER hold the tracker
+        // across the latching tree walk; doing so is the ABBA inversion
+        // BUG-VERIFY-TRACKER-LATCH-ABBA (a checkpoint flushing BINs would block
+        // on the tracker while verify blocks on the BIN latch).  Faithful to
+        // JE VerifyUtils.checkLsns (VerifyUtils.java:70-160): gather the live
+        // tree LSNs FIRST with no utilization state held, then take the
+        // tracker briefly to read the obsolete offsets.  read-only envs have
+        // no tracker.
+        let tracker = env_impl.get_utilization_tracker().cloned();
 
         let mut merged = noxu_engine::VerifyResult::new();
         for db_arc in &all_dbs {
+            // Race window for the ABBA witness: pre-fix the tracker leaf lock
+            // was already held here (acquired before the loop) while we are
+            // about to latch tree nodes; post-fix only an Arc clone is held.
+            if let Some(hook) = prewalk_hook {
+                hook();
+            }
             let guard = db_arc.read();
+            // Phase 1 (NO tracker lock held): structural verify + gather the
+            // live tree LSNs.  Both read-latch tree nodes.
             let result = noxu_engine::verify_database_impl(&guard, config);
             merged.databases_verified += result.databases_verified;
             merged.records_verified += result.records_verified;
@@ -2067,9 +2154,24 @@ impl Environment {
                 merged.add_warning(w);
             }
             // CLN-2 / VerifyUtils.checkLsns: assert live-tree LSNs are
-            // disjoint from the obsolete set.
-            if let Some(ref t) = tracker_guard {
-                noxu_engine::check_lsns_against_tracker(&guard, t, &mut merged);
+            // disjoint from the obsolete set.  Gather the live LSNs with NO
+            // tracker lock held (the latching walk), THEN lock the tracker for
+            // the brief disjointness comparison only.
+            if let Some(ref t) = tracker {
+                let live = noxu_engine::gather_db_live_lsns(&guard);
+                let db_name = guard.get_name().to_string();
+                // Drop the DB read guard before taking the leaf tracker lock —
+                // no latch is held across the tracker acquisition.
+                drop(guard);
+                {
+                    let tg = t.lock();
+                    noxu_engine::check_lsns_against_tracker(
+                        &db_name,
+                        &live,
+                        &tg,
+                        &mut merged,
+                    );
+                }
                 if merged.error_count() >= config.max_errors as usize {
                     return Ok(merged);
                 }

@@ -99,7 +99,7 @@ pub use env_stats::EnvironmentStats;
 pub use error::{EngineError, Result};
 pub use verify::{
     VerifyConfig, VerifyError, VerifyResult, check_lsns_against_tracker,
-    gather_tree_lsns, verify_database_impl, verify_tree,
+    gather_db_live_lsns, gather_tree_lsns, verify_database_impl, verify_tree,
 };
 
 #[cfg(test)]

@@ -529,24 +529,54 @@ fn gather_node_lsns(node_arc: &Arc<RwLock<TreeNode>>, lsns: &mut HashSet<Lsn>) {
 /// `LOG_INTEGRITY` `EnvironmentFailureException`). The disjointness test
 /// itself lives in `noxu_cleaner::check_lsns`; this function bridges the
 /// engine-side tree walk to it.
+/// Gather the live LSN set of a `DatabaseImpl`'s tree (JE
+/// `VerifyUtils.checkLsns`'s `SortedLSNTreeWalker` + `GatherLSNs` phase).
+///
+/// This walk read-latches tree nodes.  It MUST run with **no**
+/// `UtilizationTracker` lock held: the tracker is a leaf lock, and the
+/// log-write observer takes the tracker while a BIN latch is held
+/// (`LogManager::notify_observer` ->
+/// `UtilizationTrackerObserver::count_new_entry`), so acquiring any tree latch
+/// while holding the tracker is the ABBA inversion
+/// **BUG-VERIFY-TRACKER-LATCH-ABBA**.  JE gathers the LSNs first
+/// (`VerifyUtils.java:70-85`, `walker.walk()`) and only then reads the
+/// utilization profile's obsolete offsets — it never holds utilization state
+/// across the tree walk.  Returns an empty set for a DB with no real tree.
+pub fn gather_db_live_lsns(db_impl: &DatabaseImpl) -> HashSet<Lsn> {
+    match db_impl.get_real_tree() {
+        Some(tree) => gather_tree_lsns(&tree),
+        None => HashSet::new(),
+    }
+}
+
+/// Compare a database's pre-gathered live LSNs against the obsolete set
+/// recorded in the `UtilizationTracker`, adding a `DataInconsistency` error
+/// for each live LSN wrongly recorded as obsolete.
+///
+/// Faithful port of `VerifyUtils.checkLsns()`: a live tree LSN must NOT be in
+/// the obsolete set (JE: "Obsolete LSN set contains valid LSN" ->
+/// `LOG_INTEGRITY` `EnvironmentFailureException`). The disjointness test
+/// itself lives in `noxu_cleaner::check_lsns`.
+///
+/// **Lock discipline (BUG-VERIFY-TRACKER-LATCH-ABBA):** the live LSN set must
+/// already have been gathered by [`gather_db_live_lsns`] with **no** tracker
+/// lock held.  This function does the obsolete-set disjointness test only, so
+/// the caller holds the tracker lock for the brief comparison — never across
+/// the latching tree walk.  This matches JE: gather first (no utilization
+/// state held), then read the obsolete offsets (`VerifyUtils.java:111-160`).
 pub fn check_lsns_against_tracker(
-    db_impl: &DatabaseImpl,
+    db_name: &str,
+    live_lsns: &HashSet<Lsn>,
     tracker: &noxu_cleaner::UtilizationTracker,
     result: &mut VerifyResult,
 ) {
-    let tree = match db_impl.get_real_tree() {
-        Some(t) => t,
-        None => return,
-    };
-    let live = gather_tree_lsns(&tree);
-    let check = noxu_cleaner::check_lsns(live, tracker);
+    let check = noxu_cleaner::check_lsns(live_lsns.iter().copied(), tracker);
     for lsn in check.obsolete_contains_live {
         result.add_error(VerifyError::DataInconsistency {
             description: format!(
                 "Obsolete LSN set contains valid LSN {} in database '{}' \
                  (VerifyUtils.checkLsns: live tree LSN recorded obsolete)",
-                lsn,
-                db_impl.get_name()
+                lsn, db_name,
             ),
         });
     }

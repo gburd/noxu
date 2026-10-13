@@ -126,17 +126,53 @@ fn should_run_now(
 /// the SAME public `noxu_engine` verification functions against the same
 /// `EnvironmentImpl` — WITHOUT touching `Environment::verify`'s internals.
 fn run_once(env_impl: &Arc<Mutex<EnvironmentImpl>>, config: &VerifyConfig) {
+    run_once_inner(env_impl, config, None);
+}
+
+/// Test seam for **BUG-VERIFY-TRACKER-LATCH-ABBA** (daemon path): drive
+/// [`run_once`] but invoke `prewalk_hook` once at the per-DB race window — the
+/// point where pre-fix code held the `UtilizationTracker` leaf lock while it
+/// was about to latch tree nodes.  Same shape as
+/// `Environment::verify_with_prewalk_hook_for_test`.
+#[doc(hidden)]
+pub fn run_once_with_prewalk_hook_for_test(
+    env_impl: &Arc<Mutex<EnvironmentImpl>>,
+    config: &VerifyConfig,
+    prewalk_hook: &dyn Fn(),
+) {
+    run_once_inner(env_impl, config, Some(prewalk_hook));
+}
+
+fn run_once_inner(
+    env_impl: &Arc<Mutex<EnvironmentImpl>>,
+    config: &VerifyConfig,
+    prewalk_hook: Option<&dyn Fn()>,
+) {
     // Skip a contended tick rather than block a user operation.
     let guard = match env_impl.try_lock() {
         Some(g) => g,
         None => return,
     };
     let all_dbs = guard.get_all_database_impls();
-    let tracker_guard = guard.get_utilization_tracker().map(|t| t.lock());
+    // LEAF lock discipline (BUG-VERIFY-TRACKER-LATCH-ABBA): the tracker must
+    // never be held across the latching tree walk.  The log-write observer
+    // takes the tracker under a BIN latch, so holding it here while verify
+    // latches tree nodes is an ABBA inversion that deadlocks a concurrent
+    // checkpoint/cleaner.  Faithful to JE VerifyUtils.checkLsns
+    // (VerifyUtils.java:70-160): gather first, read the obsolete offsets after.
+    // Clone the Arc (not the guard); lock only for the brief disjointness check.
+    let tracker = guard.get_utilization_tracker().cloned();
 
     let mut merged = noxu_engine::VerifyResult::new();
     for db_arc in &all_dbs {
+        // Race window for the ABBA witness: pre-fix the tracker leaf lock was
+        // already held here while we are about to latch tree nodes.
+        if let Some(hook) = prewalk_hook {
+            hook();
+        }
         let db_guard = db_arc.read();
+        // Phase 1 (NO tracker lock held): structural verify, which latches
+        // tree nodes.
         let result = noxu_engine::verify_database_impl(&db_guard, config);
         merged.databases_verified += result.databases_verified;
         merged.records_verified += result.records_verified;
@@ -146,8 +182,19 @@ fn run_once(env_impl: &Arc<Mutex<EnvironmentImpl>>, config: &VerifyConfig) {
                 break;
             }
         }
-        if let Some(ref t) = tracker_guard {
-            noxu_engine::check_lsns_against_tracker(&db_guard, t, &mut merged);
+        if let Some(ref t) = tracker {
+            // Gather the live LSNs (latching walk) with NO tracker held, THEN
+            // lock the tracker only for the brief disjointness comparison.
+            let live = noxu_engine::gather_db_live_lsns(&db_guard);
+            let db_name = db_guard.get_name().to_string();
+            drop(db_guard);
+            let tg = t.lock();
+            noxu_engine::check_lsns_against_tracker(
+                &db_name,
+                &live,
+                &tg,
+                &mut merged,
+            );
         }
         if merged.error_count() >= config.max_errors as usize {
             break;
