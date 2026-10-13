@@ -35,6 +35,13 @@ parking_lot = { workspace = true }
 [target.'cfg(noxu_shuttle)'.dev-dependencies]
 shuttle = { workspace = true }
 
+# Loom wave (rwlock lost-wake model, 2026-10): only in the graph under
+# `--cfg loom`. tests/loom_rwlock_lost_wake.rs is gated behind
+# `#![cfg(loom)]`, so this dev-dep only matters under that cfg. Default
+# builds never pull loom in.
+[target.'cfg(loom)'.dev-dependencies]
+loom = { workspace = true }
+
 [[bench]]
 name = "sync_vs_parking_lot"
 harness = false

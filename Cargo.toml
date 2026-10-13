@@ -177,6 +177,12 @@ crc32c = "0.6"
 # Dev/test-only — pulled into the graph ONLY under `--cfg noxu_shuttle`
 # (see crates/*/Cargo.toml `[target.'cfg(noxu_shuttle)'.dependencies]`).
 shuttle = "0.9"
+# Loom: C++11-memory-model concurrency model checker. Dev/test-only,
+# pulled into the graph ONLY under `--cfg loom` (see noxu-sync Cargo.toml
+# `[target.'cfg(loom)'.dev-dependencies]`). Used by
+# crates/noxu-sync/tests/loom_rwlock_lost_wake.rs to model-check the rwlock
+# reader-park/writer-release lost-wake fix under weak memory ordering.
+loom = "0.7"
 byteorder = "1"
 memmap2 = "0.9"
 fs2 = "0.4"
@@ -193,6 +199,11 @@ unsafe_op_in_unsafe_fn = "deny"
 # warn about the `#[cfg(noxu_shuttle)]` seams in dst_sync.
 unexpected_cfgs = { level = "warn", check-cfg = [
     'cfg(noxu_shuttle)',
+    # loom concurrency model checker (set via RUSTFLAGS for the loom gate
+    # only); `lost_wake_bug` selects the non-vacuity (must-fail) variant
+    # of the rwlock loom test. Both are off in every default build.
+    'cfg(loom)',
+    'cfg(lost_wake_bug)',
 ] }
 
 [workspace.lints.clippy]

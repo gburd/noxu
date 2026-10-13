@@ -7,13 +7,78 @@
 //!
 //! # State encoding (single `AtomicU32`)
 //!
-//!   bits 0-29: reader count  (`ONE_READER` = 1, max ~1 billion concurrent readers)
+//!   bits 0-28: reader count  (`ONE_READER` = 1, max ~536 million concurrent readers)
+//!   bit  29:   `WRITERS_PARKED` — **writer wake gate**: set by a writer in
+//!              `lock_exclusive_slow` before it commits to
+//!              `futex_wait(&write_futex, …)`, and read-then-cleared by any
+//!              release that could let a parked writer proceed. Same purpose
+//!              as `READERS_PARKED` but for the writer population (which parks
+//!              on `write_futex`, not `state`): it lets a release decide
+//!              whether to issue the targeted `write_futex` wake from the
+//!              same `state` snapshot that cleared `WRITE_LOCKED`, so the
+//!              uncontended path makes NO syscall. See "The lost-wake fix".
 //!   bit  30:   `WRITE_LOCKED` — **reservation-or-hold**, disambiguated by the
 //!              reader count: `WRITE_LOCKED != 0 && READERS_MASK == 0` means a
 //!              writer holds the lock; `WRITE_LOCKED != 0 && READERS_MASK > 0`
 //!              means a writer has reserved it and is waiting for the
-//!              in-flight readers to drain. Bit 31 is unused (formerly
-//!              `WRITE_WAITING`; see "What changed" below).
+//!              in-flight readers to drain.
+//!   bit  31:   `READERS_PARKED` — **reader wake gate**: set by a reader in
+//!              `lock_shared_slow` immediately before it commits to
+//!              `futex_wait(&state, …)`, and cleared by any release that
+//!              re-opens reader admission (clears `WRITE_LOCKED`). It lives
+//!              in `state` ON PURPOSE: the writer's "should I wake parked
+//!              readers?" decision is made from the SAME word the reader
+//!              parks on (the value returned by the clearing RMW), so there
+//!              is no store→load race between two different atomics. See
+//!              "The lost-wake fix" below. (This bit was formerly the
+//!              advisory `WRITE_WAITING`; see "What changed".)
+//!
+//! # The lost-wake fix (2026-10): wake decisions gated on `state`, not on a
+//! separate counter
+//!
+//! The shipped design gated BOTH wake populations on the auxiliary waiter
+//! COUNTERS (`read_waiters`/`write_waiters`), loaded `Relaxed`, right after a
+//! `Release` store to `state`. That is a Dekker / store-buffer (StoreLoad)
+//! pattern across two DIFFERENT atomics:
+//!
+//!   reader park:    read_waiters.fetch_add(1, …) then load(state) [via futex_wait]
+//!   writer release: fetch_and(state, …)          then load(read_waiters)
+//!
+//! Each side stores one location and then loads the other. Without a
+//! StoreLoad barrier on BOTH sides, the writer can load `read_waiters == 0`
+//! (the reader's increment not yet visible) while the reader's futex re-check
+//! still sees `WRITE_LOCKED` set (the writer's clear not yet visible): the
+//! writer skips the wake and the reader sleeps forever on a lock that is
+//! actually free. On x86 every `LOCK`-prefixed RMW is a full barrier so the
+//! race is unobservable; on aarch64 the LSE `ldclrl`/`ldadd` Release/Relaxed
+//! forms are NOT StoreLoad barriers, so it is reachable — reproduced at a ~5%
+//! hang rate against the engine's handle map (`db_map`), and shown reachable
+//! by a loom model of the exact pattern.
+//!
+//! The fix follows `raw_mutex`'s proven shape: gate every wake on the SAME
+//! atomic word the sleeper waits on. Readers park on `state`; the
+//! `READERS_PARKED` bit (bit 31) records "≥1 reader parked" IN `state`, so the
+//! releasing writer's clearing RMW returns a snapshot that already tells it
+//! whether to wake — no second atomic, no StoreLoad race. Writers park on
+//! `write_futex` (with the generation-counter idiom that closes the
+//! park-window), but "≥1 writer parked" is likewise recorded IN `state` as
+//! `WRITERS_PARKED` (bit 29): a release reads that bit from the same snapshot
+//! that cleared `WRITE_LOCKED` and only then issues the targeted `write_futex`
+//! wake. This matters for more than correctness: gating the writer wake on
+//! the word (rather than the old racy `write_waiters > 0`, OR an
+//! unconditional wake) is what keeps the UNCONTENDED last-reader/writer
+//! unlock free of any `futex_wake` syscall — critical on this (root) latch,
+//! where an unconditional wake measured ~1 syscall per operation. The
+//! `read_waiters` / `write_waiters` counters are RETAINED but are now purely
+//! advisory (`get_n_waiters`): they no longer gate any wake, so their
+//! `Relaxed` ordering can no longer cost a wakeup.
+//!
+//! This shape is provable under loom (Release/Acquire on one location),
+//! unlike a SeqCst-on-the-counter fix: loom 0.7 under-models SeqCst's
+//! StoreLoad guarantee (it reports the store-buffer litmus `r1==r2==0` even
+//! under SeqCst), so a counter-based fix could not have been model-checked
+//! here even if it were correct. Gating on `state` is also robust on every
+//! memory model, not only where a correctly-placed SeqCst fence would suffice.
 //!
 //! This is the table's four states projected onto the word: `free` (0),
 //! `read_held(n)` (`READERS_MASK == n`, `WRITE_LOCKED` clear),
@@ -100,6 +165,40 @@ use std::time::{Duration, Instant};
 /// module doc comment's "State encoding" section for how the reader count
 /// disambiguates which of the two it is.
 pub(crate) const WRITE_LOCKED: u32 = 1 << 30;
+/// State bit meaning "at least one reader is parked in `futex_wait(&state)`".
+///
+/// Set by `lock_shared_slow` immediately before it commits to parking, and
+/// cleared by any release that re-opens reader admission (`unlock_exclusive`
+/// on `write_held -> free`, and `try_give_up_reservation` on
+/// `reserved_draining -> read_held`). It is the rwlock analogue of
+/// `raw_mutex`'s `LOCKED_CONTENDED`: a wake-gate that lives in the SAME word
+/// the sleeper parks on, so the waker decides whether to wake from the
+/// snapshot its own clearing RMW returns — never from a separate counter that
+/// could be stale under a relaxed store→load (the lost-wake bug this fixes;
+/// see the module doc comment's "The lost-wake fix" section).
+///
+/// Occupies bit 31, reclaimed from the deleted advisory `WRITE_WAITING`.
+const READERS_PARKED: u32 = 1 << 31;
+/// State bit meaning "at least one writer is parked on `write_futex`".
+///
+/// The writer-side analogue of `READERS_PARKED`: set by a writer in
+/// `lock_exclusive_slow` before it commits to `futex_wait(&write_futex)`, and
+/// read (then cleared) by any release that could let a parked writer proceed
+/// (`unlock_exclusive`, `try_give_up_reservation`, and `unlock_shared`'s
+/// `read_held(1) -> free`). It makes the writer wake a SAME-WORD gate too:
+/// without it, those releases would have to either read the racy
+/// `write_waiters` counter (the lost-wake bug) or wake `write_futex`
+/// UNCONDITIONALLY — and the latter costs a `futex_wake` SYSCALL on every
+/// uncontended last-reader/writer unlock of this (root) latch, measured at
+/// ~1 syscall/op. Gating on this bit restores the zero-syscall uncontended
+/// path while keeping the wake race-free: the release reads the bit from the
+/// same RMW snapshot that cleared `WRITE_LOCKED`, and only then issues the
+/// targeted `write_futex` wake.
+///
+/// Occupies bit 29, shrinking `READERS_MASK` to bits 0-28 (max ~536 million
+/// concurrent readers — see `READERS_MASK`'s overflow `debug_assert` in
+/// `try_lock_shared_fast`).
+const WRITERS_PARKED: u32 = 1 << 29;
 /// Spin attempts a writer makes for a genuinely FREE lock before committing
 /// to a reservation.
 ///
@@ -163,14 +262,15 @@ const DRAIN_SPIN_RELAX_ATTEMPTS: u32 = 3;
 const DRAIN_SPIN_YIELD_ATTEMPTS: u32 = 7;
 /// Each reader increments the state by this amount.
 const ONE_READER: u32 = 1;
-/// Mask for extracting the reader count (bits 0-29).
-const READERS_MASK: u32 = WRITE_LOCKED - 1;
+/// Mask for extracting the reader count (bits 0-28).
+const READERS_MASK: u32 = WRITERS_PARKED - 1;
 
 /// Futex-based raw reader-writer lock.
 ///
 /// Implements `lock_api::RawRwLock` and `lock_api::RawRwLockTimed`.
 pub struct NoxuRawRwLock {
-    /// Combined state: reader count (bits 0-29) | `WRITE_LOCKED` (bit 30).
+    /// Combined state: reader count (bits 0-28) | `WRITERS_PARKED` (bit 29) |
+    /// `WRITE_LOCKED` (bit 30) | `READERS_PARKED` (bit 31).
     /// See the module doc comment for the full state encoding.
     pub(crate) state: AtomicU32,
     /// Dedicated futex word for writers that have not yet reserved
@@ -198,10 +298,16 @@ pub struct NoxuRawRwLock {
     /// BEFORE waking, and the reserving writer samples it BEFORE checking
     /// `state`, so a hand-off landing in the gap cannot be missed.
     drain_futex: AtomicU32,
-    /// Number of reader threads sleeping in futex_wait.
+    /// Number of reader threads sleeping in futex_wait. **Advisory only**
+    /// (`get_n_waiters`): the decision to wake parked readers is gated on the
+    /// `READERS_PARKED` bit in `state`, never on this counter — see the module
+    /// doc comment's "The lost-wake fix" section.
     read_waiters: AtomicUsize,
     /// Number of writer threads sleeping in futex_wait that have NOT YET
-    /// reserved `WRITE_LOCKED`. See the field's own note above the struct.
+    /// reserved `WRITE_LOCKED`. **Advisory only** (`get_n_waiters`): writer
+    /// wakes are now unconditional (the `write_futex` generation idiom is the
+    /// gate), never conditioned on this counter — see the module doc comment's
+    /// "The lost-wake fix" section.
     write_waiters: AtomicUsize,
     /// Thread ID hash of the exclusive owner (0 if not write-locked). Set
     /// only once `write_held` is reached, never while merely reserved.
@@ -213,8 +319,10 @@ pub struct NoxuRawRwLock {
 // access between shared holders, so that `lock_api` may hand out `&mut T` to an
 // exclusive holder and `&T` to shared holders.
 //
-// That holds here: `state` packs a reader count (low bits, `READERS_MASK`) with
-// a `WRITE_LOCKED` bit (1 << 30). Every transition that sets `WRITE_LOCKED` is a
+// That holds here: `state` packs a reader count (low bits, `READERS_MASK` =
+// bits 0-28) with a `WRITE_LOCKED` bit (1 << 30) and two wake-gate bits,
+// `WRITERS_PARKED` (1 << 29) and `READERS_PARKED` (1 << 31).
+// Every transition that sets `WRITE_LOCKED` is a
 // `compare_exchange`/`compare_exchange_weak` conditioned on the bit being clear
 // beforehand (never a blind `fetch_or`), so at most one writer ever holds it —
 // this excludes every other writer immediately upon reservation, not just upon
@@ -224,6 +332,11 @@ pub struct NoxuRawRwLock {
 // reserved OR holds the lock. All transitions are compare-exchange or
 // fetch_sub/fetch_and on a single atomic word with Acquire on acquisition and
 // Release on release, giving the happens-before edges `lock_api` relies on.
+// `READERS_PARKED`/`WRITERS_PARKED` affect neither exclusion nor the reader
+// count (`READERS_MASK` is bits 0-28, disjoint from bits 29 and 31); they are
+// pure wake-gates (module doc, "The lost-wake fix"), set/cleared alongside
+// those transitions
+// and never read as part of granting access.
 //
 // The exclusive-vs-reserved distinction that new bit meaning introduces is
 // confined to `is_locked_exclusive`/`is_write_locked` and the internal
@@ -287,9 +400,16 @@ unsafe impl lock_api::RawRwLock for NoxuRawRwLock {
                 // waiting and notice you're done," which is the entire fix
                 // for the tail-latency problem this module exists to close.
                 self.notify_drain();
-            } else if self.write_waiters.load(Ordering::Relaxed) > 0 {
-                // read_held(1) -> free, with a writer queued but not yet
-                // reserved: hand off to ONE such writer.
+            } else if prev & WRITERS_PARKED != 0 {
+                // read_held(1) -> free with a writer parked on `write_futex`
+                // (it set WRITERS_PARKED before parking). Same-word gate: we
+                // learned a writer is waiting from our OWN fetch_sub snapshot
+                // (`prev`), not from the racy `write_waiters` counter. Clear
+                // the hint so a subsequent uncontended release does not
+                // re-wake, then hand off to ONE writer. The common
+                // uncontended case (`prev & WRITERS_PARKED == 0`) skips both
+                // the clear and the `futex_wake` syscall entirely.
+                self.state.fetch_and(!WRITERS_PARKED, Ordering::Relaxed);
                 self.notify_one_writer();
             }
         }
@@ -345,23 +465,41 @@ unsafe impl lock_api::RawRwLock for NoxuRawRwLock {
     #[inline]
     unsafe fn unlock_exclusive(&self) {
         self.exclusive_owner.store(0, Ordering::Relaxed);
-        // We are the sole possible mutator here: while WRITE_LOCKED is set
-        // AND the reader count is zero (write_held), readers refuse
-        // admission (gated on WRITE_LOCKED) and other writers' reserve-CAS
-        // fails (also gated on WRITE_LOCKED), so nothing else can touch
-        // `state` until this clears the bit. A plain fetch_and is therefore
-        // sufficient -- no CAS/retry needed, and there are no reader bits to
-        // preserve since the count is provably 0 here.
-        self.state.fetch_and(!WRITE_LOCKED, Ordering::Release);
+        // We are the sole possible mutator of the WRITE_LOCKED / reader-count
+        // bits here: while WRITE_LOCKED is set AND the reader count is zero
+        // (write_held), readers refuse admission (gated on WRITE_LOCKED) and
+        // other writers' reserve-CAS fails (also gated on WRITE_LOCKED), so
+        // nothing else can change those bits until this clears WRITE_LOCKED.
+        // The two bits a concurrent thread CAN still flip are the two
+        // wake-gate bits: READERS_PARKED (bit 31), set by a reader that
+        // arrived while we held the lock, and WRITERS_PARKED (bit 29), set by
+        // another writer parked on `write_futex`. We clear WRITE_LOCKED and
+        // BOTH gate bits together in a single Release RMW and read the PRIOR
+        // value, so each wake decision below is made from the same word the
+        // sleeper's gate lives in -- no store->load race against a separate
+        // counter (the lost-wake bug; see the module doc comment). The reader
+        // count is provably 0, so there are no reader bits to preserve.
+        let prev = self.state.fetch_and(
+            !(WRITE_LOCKED | READERS_PARKED | WRITERS_PARKED),
+            Ordering::Release,
+        );
 
-        // Wake BOTH populations unconditionally -- state table, "write_held
-        // -- writer release" row, and failure mode 4's fix: an `else if`
-        // here is exactly the bug that starved readers whenever a writer
-        // happened to be queued.
-        if self.write_waiters.load(Ordering::Relaxed) > 0 {
+        // Wake ONE writer IFF the snapshot we just cleared had WRITERS_PARKED
+        // set -- the same-word gate (state table, "write_held -- writer
+        // release" row; failure mode 4's fix requires waking BOTH populations
+        // when both are present, which the two independent `if`s below do).
+        // Gating on the bit (not an unconditional wake, not the racy
+        // `write_waiters` load) is what keeps the UNCONTENDED write unlock
+        // free of any `futex_wake` syscall. `notify_one_writer` bumps the
+        // `write_futex` generation then wakes one.
+        if prev & WRITERS_PARKED != 0 {
             self.notify_one_writer();
         }
-        if self.read_waiters.load(Ordering::Relaxed) > 0 {
+        // Wake ALL parked readers IFF the snapshot had READERS_PARKED set.
+        // If it was clear, no reader was parked (or the last one is about to
+        // re-set it and re-check against the now-cleared WRITE_LOCKED, so it
+        // will not park).
+        if prev & READERS_PARKED != 0 {
             // i32::MAX as u32 — kernel nr_wake is signed; u32::MAX wraps to -1.
             futex_wake(&self.state, i32::MAX as u32);
         }
@@ -369,7 +507,14 @@ unsafe impl lock_api::RawRwLock for NoxuRawRwLock {
 
     #[inline]
     fn is_locked(&self) -> bool {
-        self.state.load(Ordering::Relaxed) != 0
+        // "Locked" means a reader or writer actually HOLDS/reserves the lock:
+        // reader count > 0 or WRITE_LOCKED set. The two wake-gate bits
+        // (WRITERS_PARKED/READERS_PARKED) are explicitly masked out so a
+        // transient "parked-bit set, nothing held" word (which can appear for
+        // an instant in `unlock_shared`'s read_held(1)->free path, between
+        // the reader-count decrement and clearing the gate bit) does not
+        // report the lock as held.
+        self.state.load(Ordering::Relaxed) & (READERS_MASK | WRITE_LOCKED) != 0
     }
 
     #[inline]
@@ -464,7 +609,16 @@ impl NoxuRawRwLock {
         if state & WRITE_LOCKED != 0 {
             return false;
         }
-        // No overflow check: WRITE_LOCKED bit acts as sentinel.
+        // Reader-count overflow guard. The count is bits 0-28 (`READERS_MASK`,
+        // ~536 million); the next bit up is `WRITERS_PARKED`, so an overflow
+        // would corrupt the wake-gate rather than hit a `WRITE_LOCKED`
+        // sentinel (as it did before bit 29 was taken). ~536M concurrent
+        // readers is far beyond any real thread count, so this is a
+        // debug_assert, not a runtime branch on the hot path.
+        debug_assert!(
+            state & READERS_MASK != READERS_MASK,
+            "reader count overflow: {state:#x} would spill into WRITERS_PARKED"
+        );
         self.state
             .compare_exchange(
                 state,
@@ -482,6 +636,17 @@ impl NoxuRawRwLock {
 
             // Same admission rule as the fast path.
             if state & WRITE_LOCKED == 0 {
+                // Admit: bump the reader count. Preserve the gate bits
+                // (READERS_PARKED, and WRITERS_PARKED if a writer is queued):
+                // `state + ONE_READER` only touches the low count bits, and
+                // they are cleared by the next writer release. Same overflow
+                // guard as the fast path (count is bits 0-28; overflow would
+                // spill into WRITERS_PARKED).
+                debug_assert!(
+                    state & READERS_MASK != READERS_MASK,
+                    "reader count overflow: {state:#x} would spill into \
+                     WRITERS_PARKED"
+                );
                 if self
                     .state
                     .compare_exchange_weak(
@@ -498,7 +663,36 @@ impl NoxuRawRwLock {
                 continue;
             }
 
-            // A writer has reserved or holds the lock — park until released.
+            // A writer has reserved or holds the lock -- we must park. Record
+            // "a reader is parked" IN `state` (bit 31) BEFORE parking, so the
+            // releasing writer decides whether to wake us from the snapshot
+            // its own clearing RMW returns -- the same-word gate that closes
+            // the lost-wake race (module doc, "The lost-wake fix"). If the
+            // CAS to set the bit fails, `state` changed underneath us; loop
+            // and re-evaluate from the fresh value (it may now be
+            // admittable, or already have the bit set).
+            if state & READERS_PARKED == 0
+                && self
+                    .state
+                    .compare_exchange_weak(
+                        state,
+                        state | READERS_PARKED,
+                        // Relaxed is sufficient: this CAS publishes nothing
+                        // the writer needs ordered against data; the writer
+                        // reads this bit via its own Release RMW's return
+                        // value, and our subsequent futex_wait re-checks
+                        // `state` under the kernel's own barrier.
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    )
+                    .is_err()
+            {
+                continue;
+            }
+            // From here the value we must observe unchanged in order to sleep
+            // is `state` WITH READERS_PARKED set.
+            let parked_state = state | READERS_PARKED;
+
             let timeout = match deadline {
                 Some(dl) => {
                     let now = Instant::now();
@@ -510,8 +704,14 @@ impl NoxuRawRwLock {
                 None => None,
             };
 
+            // Advisory counter for get_n_waiters only -- NOT a wake gate.
             self.read_waiters.fetch_add(1, Ordering::Relaxed);
-            futex_wait(&self.state, state, timeout);
+            // futex_wait parks ONLY if *state == parked_state; if the writer
+            // already cleared WRITE_LOCKED/READERS_PARKED (its Release RMW
+            // happens-before this load inside the syscall), the value differs
+            // and we return immediately rather than sleeping through the
+            // wake.
+            futex_wait(&self.state, parked_state, timeout);
             let did_timeout =
                 deadline.map(|dl| Instant::now() >= dl).unwrap_or(false);
             self.read_waiters.fetch_sub(1, Ordering::Relaxed);
@@ -563,20 +763,26 @@ impl NoxuRawRwLock {
                 .state
                 .compare_exchange_weak(
                     state,
-                    state & !WRITE_LOCKED,
+                    state & !(WRITE_LOCKED | READERS_PARKED | WRITERS_PARKED),
                     Ordering::Release,
                     Ordering::Relaxed,
                 )
                 .is_ok()
             {
-                // Wake BOTH populations unconditionally -- same Bug-4
-                // reasoning as `unlock_exclusive`: a queued writer and
-                // queued readers can legitimately coexist, and both deserve
-                // a chance to race for the lock this give-up just freed.
-                if self.write_waiters.load(Ordering::Relaxed) > 0 {
+                // Wake ONE writer IFF this give-up's own CAS cleared a set
+                // WRITERS_PARKED bit, and ALL readers IFF it cleared a set
+                // READERS_PARKED bit -- the same-word gate as
+                // `unlock_exclusive`. Both populations can legitimately
+                // coexist behind the reservation (Bug-4 reasoning), and both
+                // deserve a chance to race for the lock this give-up just
+                // freed. Each gate reads `state` (the CAS's own expected
+                // value), never a separate counter, so there is no
+                // store->load race (module doc, "The lost-wake fix"), and the
+                // uncontended give-up (neither bit set) makes no syscall.
+                if state & WRITERS_PARKED != 0 {
                     self.notify_one_writer();
                 }
-                if self.read_waiters.load(Ordering::Relaxed) > 0 {
+                if state & READERS_PARKED != 0 {
                     futex_wake(&self.state, i32::MAX as u32);
                 }
                 return true;
@@ -717,11 +923,20 @@ impl NoxuRawRwLock {
         while iterations_spent < WRITE_SPIN_ATTEMPTS {
             let state = self.state.load(Ordering::Relaxed);
             if state & (READERS_MASK | WRITE_LOCKED) == 0 {
+                // No readers and no writer -- acquire. Use `state |
+                // WRITE_LOCKED` rather than a bare `WRITE_LOCKED` so that if a
+                // gate bit (WRITERS_PARKED/READERS_PARKED) is somehow set on
+                // an otherwise-free word, this acquire PRESERVES it rather
+                // than dropping it (which would strand that parked thread).
+                // By the gate-bit invariant (a gate bit implies WRITE_LOCKED
+                // set) this is normally a no-op difference, but keeping it
+                // makes the acquire robust to any transient and matches the
+                // reserve CAS below.
                 if self
                     .state
                     .compare_exchange_weak(
                         state,
-                        WRITE_LOCKED,
+                        state | WRITE_LOCKED,
                         Ordering::Acquire,
                         Ordering::Relaxed,
                     )
@@ -760,9 +975,28 @@ impl NoxuRawRwLock {
             let state = self.state.load(Ordering::Relaxed);
 
             if state & WRITE_LOCKED == 0 {
+                // Acquire-to-contended: set WRITE_LOCKED *and keep*
+                // WRITERS_PARKED. We reach this loop only after the barging
+                // spin failed, i.e. this writer is genuinely contending, and
+                // other writers may be parked on `write_futex` behind us.
+                // `notify_one_writer` wakes exactly ONE, and the release that
+                // woke THIS writer cleared the shared WRITERS_PARKED bit
+                // (there is only one bit for the whole writer population).
+                // If we re-acquired with the bit CLEAR, our own release would
+                // see no WRITERS_PARKED and fail to wake the next parked
+                // writer -- the wake chain would break and every writer
+                // behind us would strand (the v2 bug). Mirroring
+                // `raw_mutex`'s LOCKED_CONTENDED discipline, a slow-path
+                // acquire conservatively RE-ESTABLISHES the contended marker,
+                // so each writer's release hands off to the next. The marker
+                // self-heals: once the backlog drains, the lock reaches a
+                // genuinely free `0` and the next writer takes the
+                // uncontended `lock_exclusive` fast path (CAS `0 ->
+                // WRITE_LOCKED`, no marker), after at most one trailing
+                // spurious wake.
                 match self.state.compare_exchange_weak(
                     state,
-                    state | WRITE_LOCKED,
+                    state | WRITE_LOCKED | WRITERS_PARKED,
                     Ordering::Acquire,
                     Ordering::Relaxed,
                 ) {
@@ -773,10 +1007,12 @@ impl NoxuRawRwLock {
                         // must NOT keep inflating write_waiters).
                         self.write_waiters.fetch_sub(1, Ordering::Relaxed);
 
-                        // The OR only touched bit 30, so the reader bits in
-                        // `state` (the CAS's expected/old value) are exactly
-                        // the reader count of the new state too -- no reload
-                        // needed to determine whether a drain is required.
+                        // We only set bits 30 (WRITE_LOCKED) and 29
+                        // (WRITERS_PARKED), so the reader bits in `state` (the
+                        // CAS's expected/old value, masked by READERS_MASK)
+                        // are exactly the reader count of the new state too --
+                        // no reload needed to determine whether a drain is
+                        // required.
                         let readers_now = state & READERS_MASK;
                         if readers_now == 0 {
                             // The lock was actually free at the moment of
@@ -796,7 +1032,29 @@ impl NoxuRawRwLock {
             }
 
             // Another writer already reserved or holds WRITE_LOCKED -- park
-            // on write_futex until it might have cleared.
+            // on write_futex until it might have cleared. Record "a writer is
+            // parked" IN `state` (WRITERS_PARKED) BEFORE parking, so the
+            // releasing thread decides whether to issue the targeted
+            // write_futex wake from the same snapshot its own clearing RMW
+            // returns -- the same-word gate that keeps the uncontended
+            // release syscall-free while staying race-free. If the CAS to set
+            // the bit fails, `state` changed underneath us (most likely
+            // WRITE_LOCKED cleared); loop and re-evaluate from the fresh
+            // value, which may now be acquirable.
+            if state & WRITERS_PARKED == 0
+                && self
+                    .state
+                    .compare_exchange_weak(
+                        state,
+                        state | WRITERS_PARKED,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    )
+                    .is_err()
+            {
+                continue;
+            }
+
             let timeout = match deadline {
                 Some(dl) => {
                     let now = Instant::now();
@@ -809,6 +1067,13 @@ impl NoxuRawRwLock {
                 None => None,
             };
 
+            // Park on write_futex expecting `seen_gen` (sampled at the top of
+            // this loop iteration, BEFORE the WRITERS_PARKED CAS and the state
+            // check). A release that read our just-set WRITERS_PARKED bit
+            // calls `notify_one_writer`, which bumps the generation BEFORE
+            // waking -- so if it lands between here and the park, the value
+            // differs from `seen_gen` and `futex_wait` returns immediately
+            // instead of sleeping through the wake.
             futex_wait(&self.write_futex, seen_gen, timeout);
 
             if deadline.map(|dl| Instant::now() >= dl).unwrap_or(false) {
@@ -1051,5 +1316,280 @@ mod tests {
         // SAFETY: `try_lock_exclusive_until` returned `true`, so this thread
         // holds the write lock and may release it.
         unsafe { raw.unlock_exclusive() };
+    }
+
+    // ---------------------------------------------------------------------
+    // Wake-gate bit edge cases (READERS_PARKED bit 31, WRITERS_PARKED bit 29)
+    // ---------------------------------------------------------------------
+
+    /// `is_locked()` must mask out the wake-gate bits: a word with ONLY a
+    /// gate bit set (the transient that appears for an instant in
+    /// `unlock_shared`'s read_held(1)->free path, between the count
+    /// decrement and clearing the gate bit) is NOT "locked".
+    #[test]
+    fn is_locked_ignores_lone_gate_bits() {
+        let raw = NoxuRawRwLock::INIT;
+        // Simulate the transient: READERS_PARKED alone, nothing held.
+        raw.state.store(READERS_PARKED, Ordering::Relaxed);
+        assert!(!raw.is_locked(), "a lone READERS_PARKED bit is not 'locked'");
+        assert!(!raw.is_locked_exclusive());
+        assert_eq!(
+            raw.reader_count(),
+            0,
+            "gate bit must not count as a reader"
+        );
+        // WRITERS_PARKED alone, likewise.
+        raw.state.store(WRITERS_PARKED, Ordering::Relaxed);
+        assert!(!raw.is_locked(), "a lone WRITERS_PARKED bit is not 'locked'");
+        assert_eq!(raw.reader_count(), 0);
+        // Clean up so Drop/debug asserts see a sane word.
+        raw.state.store(0, Ordering::Relaxed);
+    }
+
+    /// A writer must acquire a lock that is logically FREE even if a gate bit
+    /// is set in the word (the slow-path spin CAS preserves the bit rather
+    /// than dropping it, and never stalls). Exercises the
+    /// `state | WRITE_LOCKED` acquire in `lock_exclusive_slow`.
+    #[test]
+    fn writer_acquires_free_lock_with_a_gate_bit_set() {
+        let raw = NoxuRawRwLock::INIT;
+        // Free lock, but READERS_PARKED stuck set (e.g. a timed-out reader
+        // left it). A writer must still acquire, and the fast-path CAS(0,..)
+        // will miss, so this drives the slow path.
+        raw.state.store(READERS_PARKED, Ordering::Relaxed);
+        assert!(
+            !raw.is_locked(),
+            "precondition: logically free despite the stuck gate bit"
+        );
+        // try_lock_exclusive uses CAS(0, WRITE_LOCKED) which (correctly)
+        // fails here; the blocking lock_exclusive drives the slow path.
+        assert!(!raw.try_lock_exclusive(), "fast CAS(0,..) misses by design");
+        raw.lock_exclusive();
+        assert!(raw.is_write_locked(), "slow path must acquire the free lock");
+        // SAFETY: this thread acquired the write lock via `lock_exclusive`.
+        unsafe { raw.unlock_exclusive() };
+        assert!(!raw.is_locked());
+    }
+
+    /// End-to-end: a reader that parks (setting READERS_PARKED) behind a
+    /// writer is woken when the writer releases, and the lock is clean
+    /// afterwards (both gate bits cleared). Repeated to exercise the
+    /// park/set-bit/wake/clear cycle many times.
+    #[test]
+    fn reader_parks_sets_bit_and_is_woken_repeatedly() {
+        use std::sync::atomic::AtomicBool;
+        for _ in 0..50 {
+            let raw = Arc::new(NoxuRawRwLock::INIT);
+            raw.lock_exclusive();
+            let raw2 = Arc::clone(&raw);
+            let got = Arc::new(AtomicBool::new(false));
+            let got2 = Arc::clone(&got);
+            let reader = std::thread::spawn(move || {
+                raw2.lock_shared(); // parks behind the writer, sets the bit
+                got2.store(true, Ordering::SeqCst);
+                // SAFETY: lock_shared above acquired a shared hold.
+                unsafe { raw2.unlock_shared() };
+            });
+            // Let the reader reach the park and publish READERS_PARKED.
+            std::thread::sleep(Duration::from_millis(5));
+            assert!(!got.load(Ordering::SeqCst), "reader must still be parked");
+            // SAFETY: this thread holds the write lock; releasing wakes the
+            // parked reader via the READERS_PARKED gate.
+            unsafe { raw.unlock_exclusive() };
+            reader.join().unwrap();
+            assert!(got.load(Ordering::SeqCst), "reader must have been woken");
+            // After everyone leaves, the word is fully clean (no stuck bit).
+            assert_eq!(
+                raw.state.load(Ordering::Relaxed),
+                0,
+                "both gate bits and WRITE_LOCKED must be clear after release"
+            );
+        }
+    }
+
+    /// A reader that TIMES OUT after setting READERS_PARKED leaves the lock
+    /// usable: the bit may linger (a later release does a harmless spurious
+    /// wake), but there is no lost wake and a fresh acquirer still works.
+    #[test]
+    fn reader_timeout_after_setting_parked_bit_leaves_lock_usable() {
+        let raw = Arc::new(NoxuRawRwLock::INIT);
+        assert!(raw.try_lock_exclusive());
+        let raw2 = Arc::clone(&raw);
+        // Reader times out while parked behind the writer (sets the bit, then
+        // gives up).
+        let timed_out = std::thread::spawn(move || {
+            !raw2.try_lock_shared_for(Duration::from_millis(30))
+        })
+        .join()
+        .unwrap();
+        assert!(timed_out, "reader must time out while the writer holds");
+        assert_eq!(
+            raw.get_n_waiters(),
+            0,
+            "advisory waiter count must be back to zero after the timeout"
+        );
+        // Release the writer. If READERS_PARKED lingered, this does a
+        // spurious wake of an empty queue -- harmless.
+        // SAFETY: this thread holds the write lock from try_lock_exclusive.
+        unsafe { raw.unlock_exclusive() };
+        // The lock must be fully usable: a fresh writer and reader both work.
+        assert!(raw.try_lock_exclusive());
+        // SAFETY: just acquired above.
+        unsafe { raw.unlock_exclusive() };
+        assert!(raw.try_lock_shared());
+        // SAFETY: just acquired a shared hold above.
+        unsafe { raw.unlock_shared() };
+        assert!(!raw.is_locked());
+    }
+
+    /// MANY writers contending on one lock must ALL eventually acquire and
+    /// release -- the writer wake-CHAIN. The `WRITERS_PARKED` wake-gate is a
+    /// single shared bit; a release that wakes ONE writer clears it, so the
+    /// woken writer must RE-ESTABLISH the bit on its slow-path acquire
+    /// (acquire-to-contended) or every writer queued behind it strands with
+    /// no wake coming. Without that re-establishment this test hangs; the
+    /// watchdog turns the hang into a fast, explicit failure instead of a CI
+    /// timeout. (Regression test for the v2 chain-break: 19 writers parked
+    /// forever in `lock_exclusive_slow` on a free lock.)
+    #[test]
+    fn many_writers_all_acquire_no_chain_break() {
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        let raw = Arc::new(NoxuRawRwLock::INIT);
+        let n_writers = 16usize;
+        let per = 200u64;
+        let completed = Arc::new(AtomicU64::new(0));
+        let target = n_writers as u64 * per;
+
+        // Watchdog: if the completed count stops advancing for 10s while the
+        // lock is observed free, writers are stranded (chain break).
+        let done = Arc::new(AtomicBool::new(false));
+        let wd = {
+            let completed = Arc::clone(&completed);
+            let done = Arc::clone(&done);
+            let raw = Arc::clone(&raw);
+            std::thread::spawn(move || {
+                let mut last = 0u64;
+                let mut stalls = 0;
+                while !done.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(500));
+                    let now = completed.load(Ordering::Relaxed);
+                    if now == last && now < target {
+                        stalls += 1;
+                        if stalls >= 20 {
+                            // 10s with no progress.
+                            let st = raw.state.load(Ordering::Relaxed);
+                            panic!(
+                                "WRITER CHAIN BREAK: writers stranded at \
+                                 {now}/{target}, state={st:#x} \
+                                 (write_locked={}, readers={})",
+                                st & WRITE_LOCKED != 0,
+                                st & READERS_MASK
+                            );
+                        }
+                    } else {
+                        stalls = 0;
+                        last = now;
+                    }
+                }
+            })
+        };
+
+        let mut hs = Vec::new();
+        for _ in 0..n_writers {
+            let raw = Arc::clone(&raw);
+            let completed = Arc::clone(&completed);
+            hs.push(std::thread::spawn(move || {
+                for _ in 0..per {
+                    raw.lock_exclusive();
+                    // Hold briefly so contending writers exhaust their spin
+                    // budget and genuinely futex-PARK (the chain-break only
+                    // strands futex-parked writers; a pure spin never reaches
+                    // the park path). ~a few microseconds is enough.
+                    for _ in 0..2000 {
+                        std::hint::spin_loop();
+                    }
+                    // SAFETY: just acquired the write lock above.
+                    unsafe { raw.unlock_exclusive() };
+                    completed.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+        for h in hs {
+            h.join().unwrap();
+        }
+        done.store(true, Ordering::Relaxed);
+        wd.join().unwrap();
+        assert_eq!(completed.load(Ordering::Relaxed), target);
+        assert!(!raw.is_locked(), "lock must be free after all writers leave");
+    }
+
+    /// Mixed readers + writers contending: every thread must make progress
+    /// (exercises both the READERS_PARKED and WRITERS_PARKED wake chains and
+    /// their interaction) with a watchdog guarding against any lost wake.
+    #[test]
+    fn mixed_readers_writers_all_make_progress() {
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        let raw = Arc::new(NoxuRawRwLock::INIT);
+        let n = 8usize;
+        let per = 300u64;
+        let completed = Arc::new(AtomicU64::new(0));
+        let target = (2 * n) as u64 * per;
+        let done = Arc::new(AtomicBool::new(false));
+        let wd = {
+            let completed = Arc::clone(&completed);
+            let done = Arc::clone(&done);
+            let raw = Arc::clone(&raw);
+            std::thread::spawn(move || {
+                let mut last = 0u64;
+                let mut stalls = 0;
+                while !done.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(500));
+                    let now = completed.load(Ordering::Relaxed);
+                    if now == last && now < target {
+                        stalls += 1;
+                        if stalls >= 20 {
+                            let st = raw.state.load(Ordering::Relaxed);
+                            panic!(
+                                "LOST WAKE: mixed workload stranded at \
+                                 {now}/{target}, state={st:#x}"
+                            );
+                        }
+                    } else {
+                        stalls = 0;
+                        last = now;
+                    }
+                }
+            })
+        };
+        let mut hs = Vec::new();
+        for _ in 0..n {
+            let raw_w = Arc::clone(&raw);
+            let completed_w = Arc::clone(&completed);
+            hs.push(std::thread::spawn(move || {
+                for _ in 0..per {
+                    raw_w.lock_exclusive();
+                    // SAFETY: acquired on the line above.
+                    unsafe { raw_w.unlock_exclusive() };
+                    completed_w.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+            let raw_r = Arc::clone(&raw);
+            let completed_r = Arc::clone(&completed);
+            hs.push(std::thread::spawn(move || {
+                for _ in 0..per {
+                    raw_r.lock_shared();
+                    // SAFETY: acquired a shared hold on the line above.
+                    unsafe { raw_r.unlock_shared() };
+                    completed_r.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+        for h in hs {
+            h.join().unwrap();
+        }
+        done.store(true, Ordering::Relaxed);
+        wd.join().unwrap();
+        assert_eq!(completed.load(Ordering::Relaxed), target);
+        assert!(!raw.is_locked());
     }
 }
