@@ -217,8 +217,20 @@ impl FileManagerLogScanner {
                     _ => LnOperation::Delete,
                 };
                 let key = payload.slice(subslice_range(raw, r.key));
-                let data =
-                    r.data.map(|s| payload.slice(subslice_range(raw, s)));
+                // The LN body writes length 0 for both a deletion and an
+                // empty value (every sorted-dup LN: the data lives in the
+                // two-part key), and `parse_from_slice` maps 0 to `None`.
+                // Only the entry type tells them apart (JE LN.writeToLog
+                // writes -1 for a deleted LN, LN.java:940-945).  An empty
+                // non-deleted LN must surface as `Some(empty)`: recovery undo
+                // restores a before-image only when it has data, so `None`
+                // deleted every committed dup an in-flight txn had deleted.
+                let data = match op {
+                    LnOperation::Delete => None,
+                    _ => Some(r.data.map_or_else(Bytes::new, |s| {
+                        payload.slice(subslice_range(raw, s))
+                    })),
+                };
                 let mut rec = LnRecord::new(
                     r.db_id,
                     r.txn_id.map(|id| id as u64),
