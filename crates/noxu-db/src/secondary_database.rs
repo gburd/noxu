@@ -147,6 +147,17 @@ pub(crate) struct SecondaryHookState {
     pub(crate) inner: Database,
     /// The primary database this index is associated with.
     pub(crate) primary: Arc<Mutex<Database>>,
+    /// A lock-free handle onto the SAME primary `DatabaseImpl`, cloned from
+    /// `primary` at open time (`Database::handle_clone`).  BUG-SEC-MUTEX-DEADLOCK:
+    /// the secondary read / maintenance path reads and modifies the primary
+    /// RECORD through this handle so it never holds the `primary` handle
+    /// `Mutex` guard across the blocking record-lock acquisition.  Mirrors JE
+    /// reading the primary through the `Database` reference returned by
+    /// `SecondaryDatabase.getPrimary` with no monitor held
+    /// (SecondaryCursor.readPrimaryAfterGet, SecondaryCursor.java:1717-1748).
+    /// The `Mutex`-guarded `primary` is still used for handle-lifecycle access
+    /// (register / unregister / config), which never spans a record-lock wait.
+    pub(crate) primary_handle: Database,
     /// The secondary configuration (holds key creator callback, etc.).
     pub(crate) config: SecondaryConfig,
     /// Whether this secondary is fully populated (not in incremental mode).
@@ -786,9 +797,14 @@ impl SecondaryDatabase {
             ));
         }
 
+        // BUG-SEC-MUTEX-DEADLOCK: a lock-free primary handle for the record
+        // read/maintenance path (see field doc).  Cloned from the user's
+        // primary handle before it is moved into the state.
+        let primary_handle = primary.lock().handle_clone();
         let state = Arc::new(SecondaryHookState {
             inner: secondary_db,
             primary,
+            primary_handle,
             config,
             is_fully_populated: AtomicBool::new(true),
         });
@@ -993,9 +1009,14 @@ impl SecondaryDatabase {
             p_key.set_data(pk);
         }
 
-        // Now fetch the primary record.
-        let primary = self.state.primary.lock();
-        let pri_found = primary.get_into(txn, pri_key_entry.data(), data)?;
+        // Now fetch the primary record WITHOUT holding the primary handle
+        // Mutex (BUG-SEC-MUTEX-DEADLOCK): a sec-index read lock is held here,
+        // and blocking on the primary record lock while also holding the
+        // handle Mutex deadlocks a concurrent writer that holds the Mutex and
+        // waits for the sec-index write lock.  JE reads the primary through a
+        // handle reference with no monitor held.
+        let pri_found =
+            self.state.primary_handle.get_into(txn, pri_key_entry.data(), data)?;
         if !pri_found {
             // Secondary refers to a missing primary — integrity issue.
             return Err(NoxuError::SecondaryIntegrityException(format!(
@@ -1073,7 +1094,11 @@ impl SecondaryDatabase {
             // Do NOT call delete_all_for_primary first — that would cause D7
             // (double-delete: auto-hook tries to remove entries already gone).
             {
-                let primary = self.state.primary.lock();
+                // Lock-free primary handle (BUG-SEC-MUTEX-DEADLOCK): the open
+                // `sec_cursor` holds a sec-index lock, so blocking on the
+                // primary record lock while also holding the primary handle
+                // Mutex would deadlock a concurrent reader/writer.
+                let primary = &self.state.primary_handle;
                 match txn {
                     Some(t) => {
                         let _ = primary.delete_in(t, pri_key_entry.data())?;
@@ -1245,8 +1270,23 @@ impl SecondaryDatabase {
     }
 
     /// Returns a reference to the primary `Database` (via the mutex).
+    ///
+    /// Handle-lifecycle access only; the record read/maintenance path now goes
+    /// through [`Self::primary_handle`] (BUG-SEC-MUTEX-DEADLOCK), so no caller
+    /// takes this `Mutex` across a record-lock wait.  Retained (dead for now)
+    /// for the handle-lifecycle surface rather than removed, to keep this a
+    /// minimal patch.
+    #[allow(dead_code)]
     pub(crate) fn primary_db(&self) -> &Arc<Mutex<Database>> {
         &self.state.primary
+    }
+
+    /// Returns the lock-free primary handle used by the record read /
+    /// maintenance path (BUG-SEC-MUTEX-DEADLOCK).  Unlike [`Self::primary_db`]
+    /// this never requires holding a `Mutex` guard across a blocking record
+    /// lock acquisition.
+    pub(crate) fn primary_handle(&self) -> &Database {
+        &self.state.primary_handle
     }
 
     // ------------------------------------------------------------------
