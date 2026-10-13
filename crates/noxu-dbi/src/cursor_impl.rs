@@ -1317,18 +1317,16 @@ impl CursorImpl {
                     // a READ_COMMITTED secondary cursor observe an aborting
                     // writer's uncommitted primary data.)
                     let contended = self.lock_ln(slot_lsn)?;
+                    // X-10: if the slot's LSN moved (or our lock had to wait),
+                    // the pre-fetched bytes may be a concurrent writer's
+                    // UNCOMMITTED in-place mutation.  Re-read under a lock on
+                    // the slot's CURRENT lsn so we block out the writer's txn
+                    // instead of returning its uncommitted value.
                     let final_data = if contended
                         || Self::slot_lsn_changed(
                             &bin_arc, slot_index, slot_lsn,
                         ) {
-                        let db = self.db_impl.read();
-                        db.get_real_tree()
-                            .and_then(|tree| {
-                                Self::get_data_from_tree(&tree, key)
-                            })
-                            .map(|(d, _)| Bytes::from(d))
-                            .map(Some)
-                            .unwrap_or(slot_data)
+                        self.reread_data_locking_current_lsn(key, slot_lsn)?
                     } else {
                         slot_data
                     };
@@ -1407,18 +1405,14 @@ impl CursorImpl {
                     let slot_index = slot.slot_index;
                     let bin_arc = slot.bin_arc;
                     let contended = self.lock_ln(slot_lsn)?;
+                    // X-10: re-read under a lock on the slot's CURRENT lsn (see
+                    // the Set/Both branch) so a moved slot never returns a
+                    // concurrent writer's uncommitted bytes.
                     let final_data = if contended
                         || Self::slot_lsn_changed(
                             &bin_arc, slot_index, slot_lsn,
                         ) {
-                        let db = self.db_impl.read();
-                        db.get_real_tree()
-                            .and_then(|tree| {
-                                Self::get_data_from_tree(&tree, key)
-                            })
-                            .map(|(d, _)| Bytes::from(d))
-                            .map(Some)
-                            .unwrap_or(slot_data)
+                        self.reread_data_locking_current_lsn(key, slot_lsn)?
                     } else {
                         slot_data
                     };
@@ -2162,10 +2156,82 @@ impl CursorImpl {
         }
     }
 
+    /// A14-min / X-10 (READ_COMMITTED torn read): re-read a point `Set` /
+    /// `SetRange` slot whose LSN moved under a concurrent writer, under a lock
+    /// on the slot's CURRENT lsn, so the read NEVER returns the writer's
+    /// uncommitted in-place slot bytes.
+    ///
+    /// JE `CursorImpl.lockLN` re-examines the slot under a lock on its current
+    /// LSN after the LSN changes / the lock had to wait: it reloads the slot's
+    /// `lsn`, and if it moved while waiting it releases the lock it just took
+    /// (`revertLock`) and re-locks the new LSN, looping until the LSN it holds
+    /// a lock on is the slot's current one (CursorImpl.java:3539-3689, the
+    /// `while (true) { ... if (lsn != lockResult.getLsn()) continue; ... }`
+    /// re-lock loop around `lockInternal` / `revertLock`).  We mirror exactly
+    /// that: lock `known_lsn`, re-read the slot's `(data, lsn)` by key under
+    /// the BIN latch, and if the lsn moved, re-lock the new one and retry.
+    ///
+    /// TERMINATION: once we HOLD a Read lock on `known_lsn`, a writer cannot
+    /// move the slot off `known_lsn` without first acquiring the WRITE lock on
+    /// it, which conflicts with our held Read lock -- so a NEW mutation blocks
+    /// until we release (RC releases immediately after the read, but the
+    /// re-read below runs while the lock is held).  The only way `cur_lsn !=
+    /// known_lsn` after our lock is granted is a writer that committed/aborted
+    /// a version transition we observed on the way in; each retry advances to a
+    /// strictly newer committed LSN, so under any finite number of concurrent
+    /// writers the loop converges.  `MAX_RELOCK` caps pathological unbounded
+    /// churn (then falls back to the current locked read); normally ONE re-read
+    /// after the lock suffices.
+    ///
+    /// This is the minimal record-level torn-read guard the secondary read
+    /// path needs once it drops the handle `Mutex` (A7 / BUG-SEC-MUTEX-DEADLOCK):
+    /// at v7.11.0 the bare `get_data_from_tree` re-read on an LSN change
+    /// returned the live (possibly uncommitted) slot bytes without re-locking
+    /// the moved LSN.  (Partial A14: the Set/SetRange torn-read guard only; the
+    /// TTL-owner half of A14 is for batch D.)
+    fn reread_data_locking_current_lsn(
+        &self,
+        key: &[u8],
+        mut known_lsn: u64,
+    ) -> Result<Option<Bytes>, DbiError> {
+        const MAX_RELOCK: usize = 64;
+        for _ in 0..MAX_RELOCK {
+            // Lock the slot's CURRENT lsn.  For a Read lock this BLOCKS on a
+            // concurrent writer's WRITE lock until that writer commits/aborts;
+            // RC releases immediately after (lock_ln handles the isolation
+            // level and the own-txn / read-uncommitted cases).
+            let _waited = self.lock_ln(known_lsn)?;
+            // Re-read the slot's current (data, lsn) by key under the BIN
+            // latch now that any in-flight writer on `known_lsn` has ended.
+            let cur = {
+                let db = self.db_impl.read();
+                db.get_real_tree()
+                    .and_then(|tree| Self::get_data_from_tree(&tree, key))
+            };
+            match cur {
+                Some((data, cur_lsn)) => {
+                    if cur_lsn == known_lsn {
+                        // Stable under our lock: this is the committed value.
+                        return Ok(Some(Bytes::from(data)));
+                    }
+                    // The slot moved again (the writer committed a new version,
+                    // or a fresh writer re-mutated it): re-lock the new lsn.
+                    known_lsn = cur_lsn;
+                }
+                None => return Ok(None), // key gone (committed delete)
+            }
+        }
+        // Degenerate hot-slot churn: fall back to the current (locked) read.
+        let db = self.db_impl.read();
+        Ok(db
+            .get_real_tree()
+            .and_then(|tree| Self::get_data_from_tree(&tree, key))
+            .map(|(d, _)| Bytes::from(d)))
+    }
+
     /// Fetches the data associated with `key` from a tree (BIN-level lookup).
     ///
     /// Returns `(data, slot_lsn)` so the caller can acquire a read lock.
-    ///
     /// Data-read path in `CursorImpl.lockAndGetCurrent()`.
     fn get_data_from_tree(tree: &Tree, key: &[u8]) -> Option<(Vec<u8>, u64)> {
         use noxu_tree::tree::TreeNode;
