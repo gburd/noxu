@@ -3956,8 +3956,10 @@ impl Tree {
     /// Returns the key and data of the first BIN entry at or after `key`.
     ///
     /// Descends with the tree's key comparator (same path as `search()`), then
-    /// within the BIN finds the first slot whose stored key >= `key` using the
-    /// comparator.  Returns `None` if every entry in the tree is < `key`.
+    /// within the BIN finds the first live slot whose stored key >= `key`
+    /// using the comparator, moving on to the following BINs when the floor
+    /// BIN has none.  Returns `None` if every live entry in the tree is
+    /// < `key`.
     ///
     /// Used by sorted-duplicate cursor `search(Set)` to position at the first
     /// (key, data) pair whose two-part key >= `lower_bound(primary_key)`.
@@ -4010,7 +4012,13 @@ impl Tree {
                     }
                     _ => None,
                 };
-                return result;
+                if result.is_some() {
+                    return result;
+                }
+                drop(guard);
+                return self
+                    .first_live_slot_after_bin(key)
+                    .map(|(k, d, _, lsn, _)| (k, d, lsn));
             }
 
             // Upper IN: same descent as search().
@@ -4036,6 +4044,62 @@ impl Tree {
             drop(guard);
             let child = self.child_at_or_fetch(&parent_arc, next_idx)?;
             guard = child.read_arc();
+        }
+    }
+
+    /// The first live slot after the BIN `key` routes to, for a range seek
+    /// whose floor BIN holds no live slot >= `key`.  A seek key above the
+    /// floor BIN's last key but below the next BIN's identifier key (e.g. a
+    /// sorted-dup `lower_bound(pk)` whose first dup starts the next BIN) is
+    /// routed to the floor BIN.  JE `Cursor.searchRange` then advances with
+    /// `searchRangeAdvanceAndCheckKey` -> `CursorImpl.getNext`
+    /// (Cursor.java:4288-4293, :4523-4550), skipping defunct slots
+    /// (CursorImpl.java:2062-2064) across BINs.  The caller must hold no
+    /// latch.  The returned BIN is not pinned (as on the floor-BIN path).
+    fn first_live_slot_after_bin(
+        &self,
+        key: &[u8],
+    ) -> Option<(
+        Vec<u8>,
+        Vec<u8>,
+        usize,
+        u64,
+        std::sync::Arc<crate::NodeRwLock<TreeNode>>,
+    )> {
+        let mut anchor = key.to_vec();
+        loop {
+            // The pin keeps the evictor off the BIN while we read it.
+            let (_, arc) = self.get_next_bin_pinned(&anchor)?;
+            let step = match &*arc.read() {
+                TreeNode::Bottom(bin) => {
+                    match (0..bin.entries.len()).find(|&i| bin.slot_is_live(i))
+                    {
+                        Some(i) => Ok((
+                            bin.get_full_key(i).unwrap_or_default(),
+                            bin.entries[i]
+                                .data
+                                .as_ref()
+                                .map(|d| d.to_vec())
+                                .unwrap_or_default(),
+                            i,
+                            bin.get_lsn(i).as_u64(),
+                        )),
+                        // No live slot: continue past this BIN's last key.
+                        None => Err(bin
+                            .entries
+                            .len()
+                            .checked_sub(1)
+                            .and_then(|i| bin.get_full_key(i))),
+                    }
+                }
+                // Restructured under us: re-descend from the same anchor.
+                TreeNode::Internal(_) => Err(Some(anchor.clone())),
+            };
+            Self::unpin_bin(&arc);
+            match step {
+                Ok((k, d, i, lsn)) => return Some((k, d, i, lsn, arc)),
+                Err(next) => anchor = next?,
+            }
         }
     }
 
@@ -4110,7 +4174,8 @@ impl Tree {
                         let bin_arc = NodeArcReadGuard::rwlock(&guard).clone();
                         return Some((full_key, data, idx, lsn, bin_arc));
                     } else {
-                        return None;
+                        drop(guard);
+                        return self.first_live_slot_after_bin(key);
                     }
                 }
                 return None;
