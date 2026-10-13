@@ -2097,6 +2097,23 @@ impl Environment {
         None
     }
 
+    /// Test seam (BUG-VERIFY-TRACKER-LATCH-ABBA remedy teeth): the live LSN
+    /// set of a named database's tree, so an inverse-teeth test can plant one
+    /// into the tracker's obsolete set and confirm `verify` still reports it.
+    #[doc(hidden)]
+    pub fn live_lsns_for_test(&self, db_name: &str) -> Vec<noxu_util::Lsn> {
+        let env_impl = self.env_impl.lock();
+        for db_arc in env_impl.get_all_database_impls() {
+            let guard = db_arc.read();
+            if guard.get_name() == db_name {
+                return noxu_engine::gather_db_live_lsns(&guard)
+                    .into_iter()
+                    .collect();
+            }
+        }
+        Vec::new()
+    }
+
     /// Test seam for **BUG-VERIFY-TRACKER-LATCH-ABBA** (daemon path): clone
     /// the shared `EnvironmentImpl` Arc so a witness can drive
     /// `verify_daemon::run_once_with_prewalk_hook_for_test` against the same
@@ -2158,20 +2175,27 @@ impl Environment {
             // tracker lock held (the latching walk), THEN lock the tracker for
             // the brief disjointness comparison only.
             if let Some(ref t) = tracker {
+                // BUG-VERIFY-TRACKER-LATCH-ABBA remedy (JE-faithful): take the
+                // tracker leaf lock ONLY to snapshot the obsolete LSN set
+                // (JE ObsoleteOffsetsCache), then DROP it before the latching
+                // walk.  The walk that gathers the live LSNs holds NO leaf
+                // lock (deadlock fix) and checks each CURRENT slot LSN against
+                // the earlier snapshot: an LSN that goes obsolete after the
+                // snapshot is absent from it (no false positive), an obsolete
+                // LSN never becomes live again (a hit is real corruption).
+                let obsolete_snapshot = {
+                    let tg = t.lock();
+                    noxu_cleaner::obsolete_lsn_set(&tg)
+                };
                 let live = noxu_engine::gather_db_live_lsns(&guard);
                 let db_name = guard.get_name().to_string();
-                // Drop the DB read guard before taking the leaf tracker lock —
-                // no latch is held across the tracker acquisition.
                 drop(guard);
-                {
-                    let tg = t.lock();
-                    noxu_engine::check_lsns_against_tracker(
-                        &db_name,
-                        &live,
-                        &tg,
-                        &mut merged,
-                    );
-                }
+                noxu_engine::check_lsns_against_tracker(
+                    &db_name,
+                    &live,
+                    &obsolete_snapshot,
+                    &mut merged,
+                );
                 if merged.error_count() >= config.max_errors as usize {
                     return Ok(merged);
                 }
@@ -3642,19 +3666,25 @@ mod tests {
             .with_allow_create(true)
             .with_transactional(true);
         let db = env.open_database(None, "cln2db", &db_config).unwrap();
+        // Values > max_embedded_ln (16) so the LNs are NON-embedded and
+        // their slot LSNs are checked by checkLsns.  JE
+        // BtreeVerifier.verifyObsoleteRecords (BtreeVerifier.java:960-965)
+        // exempts EMBEDDED LNs (their logrec is immediately obsolete), so a
+        // 1-byte embedded value would not be checked (and must not be).
+        let big = [b'x'; 32];
         db.put(
             DatabaseEntry::from_bytes(b"alpha"),
-            DatabaseEntry::from_bytes(b"1"),
+            DatabaseEntry::from_bytes(&big),
         )
         .unwrap();
         db.put(
             DatabaseEntry::from_bytes(b"beta"),
-            DatabaseEntry::from_bytes(b"2"),
+            DatabaseEntry::from_bytes(&big),
         )
         .unwrap();
         db.put(
             DatabaseEntry::from_bytes(b"gamma"),
-            DatabaseEntry::from_bytes(b"3"),
+            DatabaseEntry::from_bytes(&big),
         )
         .unwrap();
 
@@ -3671,13 +3701,10 @@ mod tests {
         // Grab a real live LSN from the db's tree.
         let live_lsn = {
             let guard = db.db_impl.read();
-            let tree = guard
-                .get_real_tree()
-                .expect("invariant: populated db has a real tree");
-            noxu_engine::gather_tree_lsns(&tree)
+            noxu_engine::gather_db_live_lsns(&guard)
                 .into_iter()
                 .next()
-                .expect("invariant: at least one live LSN")
+                .expect("invariant: at least one non-embedded live LSN")
         };
 
         // Seed the bug: record that exact live LSN as obsolete in the live

@@ -183,16 +183,22 @@ fn run_once_inner(
             }
         }
         if let Some(ref t) = tracker {
-            // Gather the live LSNs (latching walk) with NO tracker held, THEN
-            // lock the tracker only for the brief disjointness comparison.
+            // BUG-VERIFY-TRACKER-LATCH-ABBA remedy (JE-faithful): snapshot the
+            // obsolete LSN set under the tracker leaf lock, DROP the lock,
+            // then gather the live LSNs with NO leaf held and check each
+            // current slot LSN against the snapshot (JE ObsoleteOffsetsCache,
+            // BtreeVerifier.java:1005-1012).
+            let obsolete_snapshot = {
+                let tg = t.lock();
+                noxu_cleaner::obsolete_lsn_set(&tg)
+            };
             let live = noxu_engine::gather_db_live_lsns(&db_guard);
             let db_name = db_guard.get_name().to_string();
             drop(db_guard);
-            let tg = t.lock();
             noxu_engine::check_lsns_against_tracker(
                 &db_name,
                 &live,
-                &tg,
+                &obsolete_snapshot,
                 &mut merged,
             );
         }

@@ -543,9 +543,54 @@ fn gather_node_lsns(node_arc: &Arc<RwLock<TreeNode>>, lsns: &mut HashSet<Lsn>) {
 /// utilization profile's obsolete offsets — it never holds utilization state
 /// across the tree walk.  Returns an empty set for a DB with no real tree.
 pub fn gather_db_live_lsns(db_impl: &DatabaseImpl) -> HashSet<Lsn> {
-    match db_impl.get_real_tree() {
-        Some(tree) => gather_tree_lsns(&tree),
-        None => HashSet::new(),
+    // JE BtreeVerifier.verifyObsoleteRecords (BtreeVerifier.java:960-965)
+    // skips the obsolete-records check for a duplicate DB or a DB whose LNs
+    // are immediately obsolete: those LNs are legitimately in the obsolete
+    // set while still reachable, so checking them would false-positive.
+    if db_impl.get_sorted_duplicates() || db_impl.is_ln_immediately_obsolete() {
+        return HashSet::new();
+    }
+    // NB: checkLsns-specific gather that additionally skips embedded LN
+    // slots (JE verifyObsoleteRecords, BtreeVerifier.java:960-965).  v7.11.0
+    // has no per-slot embedded flag; a slot is embedded iff it holds resident
+    // data no longer than max_embedded_ln (JE CursorImpl.shouldEmbedLN).  The
+    // shared `gather_tree_lsns` (GatherLSNs) is left intact for its other
+    // callers; only this check applies the exemption.
+    let mut lsns = HashSet::new();
+    if let Some(tree) = db_impl.get_real_tree()
+        && let Some(root) = tree.get_root()
+    {
+        gather_live_lsns_for_check_node(&root, &mut lsns);
+    }
+    lsns
+}
+
+/// Recursive walk for [`gather_db_live_lsns`]: like [`gather_node_lsns`] but
+/// skips embedded LN slots (JE `BtreeVerifier.verifyObsoleteRecords`
+/// `isEmbeddedLN` exemption, BtreeVerifier.java:960-965).  v7.11.0 detects
+/// embedded by resident data length vs `max_embedded_ln`.
+fn gather_live_lsns_for_check_node(
+    node_arc: &Arc<RwLock<TreeNode>>,
+    lsns: &mut HashSet<Lsn>,
+) {
+    let guard = node_arc.read();
+    match &*guard {
+        TreeNode::Internal(in_node) => {
+            for child in in_node.resident_children() {
+                gather_live_lsns_for_check_node(&child, lsns);
+            }
+        }
+        TreeNode::Bottom(bin) => {
+            for (i, entry) in bin.entries.iter().enumerate() {
+                let embedded = entry.data.as_ref().is_some_and(|d| {
+                    d.len() as i64 <= bin.max_embedded_ln as i64
+                });
+                let lsn = bin.get_lsn(i);
+                if !entry.known_deleted && !embedded && lsn != NULL_LSN {
+                    lsns.insert(lsn);
+                }
+            }
+        }
     }
 }
 
@@ -567,18 +612,29 @@ pub fn gather_db_live_lsns(db_impl: &DatabaseImpl) -> HashSet<Lsn> {
 pub fn check_lsns_against_tracker(
     db_name: &str,
     live_lsns: &HashSet<Lsn>,
-    tracker: &noxu_cleaner::UtilizationTracker,
+    obsolete_snapshot: &HashSet<Lsn>,
     result: &mut VerifyResult,
 ) {
-    let check = noxu_cleaner::check_lsns(live_lsns.iter().copied(), tracker);
-    for lsn in check.obsolete_contains_live {
-        result.add_error(VerifyError::DataInconsistency {
-            description: format!(
-                "Obsolete LSN set contains valid LSN {} in database '{}' \
-                 (VerifyUtils.checkLsns: live tree LSN recorded obsolete)",
-                lsn, db_name,
-            ),
-        });
+    // BUG-VERIFY-TRACKER-LATCH-ABBA remedy: `obsolete_snapshot` was taken
+    // under the tracker lock BEFORE the (no-leaf) tree walk that produced
+    // `live_lsns`.  JE BtreeVerifier snapshots the obsolete offsets per file
+    // first (ObsoleteOffsetsCache, BtreeVerifier.java:1005-1012) and checks
+    // each slot's current LSN against that snapshot: an LSN that becomes
+    // obsolete AFTER the snapshot is absent from it (no false positive), and
+    // an obsolete LSN never becomes live again (a hit is real corruption).
+    for lsn in live_lsns {
+        if *lsn == NULL_LSN {
+            continue;
+        }
+        if obsolete_snapshot.contains(lsn) {
+            result.add_error(VerifyError::DataInconsistency {
+                description: format!(
+                    "Obsolete LSN set contains valid LSN {} in database '{}' \
+                     (VerifyUtils.checkLsns: live tree LSN recorded obsolete)",
+                    lsn, db_name,
+                ),
+            });
+        }
     }
 }
 
@@ -594,6 +650,41 @@ mod tests {
         assert_eq!(result.warnings.len(), 0);
         assert_eq!(result.databases_verified, 0);
         assert_eq!(result.records_verified, 0);
+    }
+
+    // BUG-VERIFY-TRACKER-LATCH-ABBA remedy teeth: a live LSN that IS in the
+    // obsolete snapshot is STILL reported (an obsolete LSN never becomes
+    // live again, so this is real corruption).  The remedy must not blind
+    // the check.
+    #[test]
+    fn test_check_lsns_against_tracker_still_reports_genuine_obsolete() {
+        let mut live = HashSet::new();
+        live.insert(Lsn::new(1, 300));
+        live.insert(Lsn::new(1, 400));
+        let mut obsolete = HashSet::new();
+        obsolete.insert(Lsn::new(1, 300)); // genuinely obsolete, yet live
+        let mut result = VerifyResult::new();
+        check_lsns_against_tracker("db", &live, &obsolete, &mut result);
+        assert!(
+            !result.passed,
+            "a live LSN present in the obsolete snapshot must be reported"
+        );
+        assert_eq!(result.errors.len(), 1);
+    }
+
+    // Remedy false-positive closure: an LSN that is live but NOT in the
+    // (earlier) obsolete snapshot is not reported, even though it may have
+    // gone obsolete after the snapshot (the TOCTOU window the remedy closes).
+    #[test]
+    fn test_check_lsns_against_tracker_no_false_positive_outside_snapshot() {
+        let mut live = HashSet::new();
+        live.insert(Lsn::new(1, 300));
+        live.insert(Lsn::new(1, 400));
+        let obsolete = HashSet::new(); // snapshot taken earlier: empty
+        let mut result = VerifyResult::new();
+        check_lsns_against_tracker("db", &live, &obsolete, &mut result);
+        assert!(result.passed, "no live LSN is in the obsolete snapshot");
+        assert_eq!(result.errors.len(), 0);
     }
 
     #[test]
