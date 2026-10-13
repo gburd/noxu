@@ -262,10 +262,24 @@ fn dst_same_seed_reproduces_exactly() {
         // never at fault.
         //
         // The previous budget was a hard-coded 600 ms followed by a silent
-        // `child.kill()`, which is exactly that failure mode -- and this test's
-        // reported flakiness (it has never reproduced in ~1,000 isolated
-        // attempts, only ever under full-workspace load) fits a scheduling
-        // artifact far better than a real non-determinism bug.
+        // `child.kill()`, which is exactly that failure mode. The generous
+        // budget here removes that artifact, but it is NOT the whole story.
+        //
+        // ROOT CAUSE of the "same seed => different recovered state" flake
+        // (fixed in crash_worker.rs; see item A27): the fault layer fires at a
+        // *write index* counted over EVERY posio write from EVERY thread
+        // (`faultdisk::WRITE_COUNT` is one global atomic). With the background
+        // daemons running (checkpointer / cleaner / evictor / IN-compressor /
+        // verifier), those daemons inject log writes CONCURRENTLY with the
+        // worker's foreground commits, so which write lands at the seed's
+        // target index -- and how many committed transactions it batches --
+        // depends on thread scheduling, not on the seed. The same seed could
+        // then tear after 40 committed txns in one run and 42 in another:
+        // genuine input non-determinism, reproducible under I/O load WITHOUT
+        // any kill. The fix makes the DST worker disable those daemons when a
+        // seed is set, so the write stream (and therefore the crash point and
+        // the recovered state) is deterministic per seed. The assertion below
+        // is unchanged: it is a true property once the input is deterministic.
         const WORKER_BUDGET: Duration = Duration::from_secs(30);
         let mut waited = Duration::ZERO;
         let mut had_to_kill = false;

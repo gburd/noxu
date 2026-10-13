@@ -42,16 +42,46 @@ fn main() {
     // or injects ENOSPC / corruption — a byte-precise, reproducible power
     // loss the SIGKILL sweep cannot do.  Absent NOXU_DST_SEED the fault layer
     // stays inactive and the worker behaves exactly as before.
-    if let Ok(seed_str) = env::var("NOXU_DST_SEED") {
-        let seed: u64 = seed_str
-            .parse()
-            .unwrap_or_else(|_| panic!("NOXU_DST_SEED must be a u64"));
+    let dst_seed = env::var("NOXU_DST_SEED").ok().map(|s| {
+        s.parse::<u64>()
+            .unwrap_or_else(|_| panic!("NOXU_DST_SEED must be a u64"))
+    });
+    if let Some(seed) = dst_seed {
         noxu_log::faultdisk::install_seed(seed);
     }
 
-    let env_config = EnvironmentConfig::new(dir.clone())
+    // Build the env config.  Under DST (a seed is set) the fault layer fires
+    // at a *write index* (`FaultController::target_write`) counted over EVERY
+    // posio write from EVERY thread (`faultdisk::WRITE_COUNT` is one global
+    // atomic).  The background daemons (checkpointer / cleaner / evictor /
+    // IN-compressor / verifier) issue log writes CONCURRENTLY with this
+    // worker's foreground commits, so with daemons running the write that
+    // lands at `target_write` -- and how many committed transactions it
+    // batches -- depends on thread scheduling, NOT on the seed.  That makes
+    // the torn / dropped-fsync point (and therefore the recovered state)
+    // nondeterministic for a fixed seed: the same seed can tear after 40
+    // commits in one run and 42 in another, breaking the DST headline property
+    // "same seed => same recovered state" (dst_crash_sweep::
+    // dst_same_seed_reproduces_exactly).
+    //
+    // DST requires a deterministic input, so under a seed we disable the
+    // daemons the fault harness cannot control.  The crash sweep still
+    // exercises the full recovery path (undo/redo over the WAL); tests that
+    // specifically need a checkpoint force one explicitly via
+    // `env.checkpoint(..with_force(true))`.  Without a seed the worker is
+    // unchanged (all daemons default-on), so non-DST crash tests keep their
+    // original behaviour.
+    let mut env_config = EnvironmentConfig::new(dir.clone())
         .with_allow_create(true)
         .with_transactional(true);
+    if dst_seed.is_some() {
+        env_config = env_config
+            .with_run_checkpointer(false)
+            .with_run_cleaner(false)
+            .with_run_evictor(false)
+            .with_run_in_compressor(false)
+            .with_run_verifier(false);
+    }
     let env = noxu_db::Environment::open(env_config).expect("open env");
     let db_config =
         DatabaseConfig::new().with_allow_create(true).with_transactional(true);
