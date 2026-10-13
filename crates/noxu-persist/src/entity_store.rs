@@ -67,6 +67,18 @@ pub struct EntityStore<'env> {
     /// writes through that handle).  Mirrors JE's `Store.priIndexMap` where
     /// each primary is a `Database` the secondaries associate with.
     databases: HashMap<String, Arc<Mutex<Database>>>,
+    /// One lock-free `Database` handle per primary (`Database::handle_clone`
+    /// of the matching `databases` entry), handed to each `PrimaryIndex` for
+    /// its record read/write hot path.
+    ///
+    /// BUG-PERSIST-RANGELAST-HANG: the DPL record path must NOT hold the
+    /// `Mutex<Database>` handle guard across a blocking `Database` call, or a
+    /// concurrent reader deadlocks on that `Mutex` (same class as
+    /// BUG-SEC-MUTEX-DEADLOCK).  The store owns the single lock-free handle so
+    /// it can `close()` it in `EntityStore::close` BEFORE removing a temporary
+    /// database (a temp DB is removed only when its last open handle closes;
+    /// `Environment::remove_database` rejects an in-use DB).
+    op_handles: HashMap<String, Arc<Database>>,
     /// Opened secondary index databases, keyed by their full DB name.
     /// Kept as strong `Arc`s so the secondaries stay **registered** with
     /// their primary (the primary holds only a `Weak`).  Mirrors JE's
@@ -136,6 +148,7 @@ impl<'env> EntityStore<'env> {
             env,
             config,
             databases: HashMap::new(),
+            op_handles: HashMap::new(),
             secondaries: HashMap::new(),
             catalog: None,
             mutations,
@@ -252,8 +265,23 @@ impl<'env> EntityStore<'env> {
             .get(&db_name)
             .ok_or_else(|| PersistError::IndexNotAvailable(db_name.clone()))?;
 
-        Ok(PrimaryIndex::with_mutations(
+        // BUG-PERSIST-RANGELAST-HANG: create the single lock-free hot-path
+        // handle for this primary once (reused across repeat
+        // `get_primary_index` calls), so `EntityStore::close` can close it
+        // before a temporary-DB removal.  Shares the same `DatabaseImpl` as
+        // the `databases` entry, so secondary fan-out on put/delete fires.
+        if !self.op_handles.contains_key(&db_name) {
+            let op_handle = Arc::new(db.lock().handle_clone());
+            self.op_handles.insert(db_name.clone(), op_handle);
+        }
+        let op_handle =
+            Arc::clone(self.op_handles.get(&db_name).ok_or_else(|| {
+                PersistError::IndexNotAvailable(db_name.clone())
+            })?);
+
+        Ok(PrimaryIndex::with_op_handle(
             Arc::clone(db),
+            op_handle,
             Arc::clone(&self.mutations),
         ))
     }
@@ -631,6 +659,24 @@ impl<'env> EntityStore<'env> {
         for (name, sec) in self.secondaries.drain() {
             if let Err(e) = sec.close() {
                 close_errors.push(format!("{}: {}", name, e));
+            }
+        }
+        // BUG-PERSIST-RANGELAST-HANG: close the lock-free hot-path handles the
+        // store handed to the PrimaryIndexes BEFORE closing the user handles
+        // and before removing any temporary database, so the `DatabaseImpl`
+        // reference count can reach zero.  A PrimaryIndex may still be alive in
+        // the caller; after this close its hot-path ops observe a closed
+        // handle and error cleanly, exactly as JE does when a Database is used
+        // after its store is closed.  `Database::close` returns DatabaseClosed
+        // once already closed, so the eventual `Arc<Database>` drop does not
+        // double-decrement.
+        for (name, op) in self.op_handles.drain() {
+            match op.close() {
+                Ok(()) => {}
+                Err(noxu_db::NoxuError::DatabaseClosed) => {}
+                Err(e) => {
+                    close_errors.push(format!("{} (op handle): {}", name, e))
+                }
             }
         }
         for (name, db) in self.databases.drain() {
