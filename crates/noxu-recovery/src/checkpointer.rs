@@ -1697,78 +1697,91 @@ impl Checkpointer {
         // `BIN.shouldLogDelta` (count-based + configurable percent).
 
         for (_node_db_id, bin_arc) in dirty_bins {
-            // BUG-CLEANER-LIVE-LN-RECLAIM (JE Checkpointer.flushIN, Checkpointer
-            // .java:1198-1256 `getParentINForChildIN` + `!exactParentFound`
-            // -> skip; the IN `inListResident` invariant, IN.java:4936-4960):
-            // between `collect_dirty_bins` (under the tree read latch) and here,
-            // the evictor may have DETACHED this BIN and a fresh instance may
-            // have been re-faulted into the slot.  Flushing the detached
-            // (zombie) instance would publish its STALE pre-migration image and
-            // stamp that LSN into the parent, resurrecting an LN LSN into a log
-            // file the cleaner has since reclaimed -> a committed value served
-            // empty / a fatal LOG_FILE_NOT_FOUND.  Re-verify (parent-then-child
-            // lock order, before latching the child) that this Arc is still the
-            // resident child of its parent slot; a zombie is skipped (its
-            // post-detach state must never be published — JE never flushes a
-            // non-resident IN).
-            // Acquire the child write latch, then re-verify this BIN is STILL
-            // the resident child of its parent (JE Checkpointer.flushIN
-            // `getParentINForChildIN` + `exactParentFound`, Checkpointer.java:
-            // 1198-1256; the `inListResident` invariant, IN.java:4936-4960)
-            // before flushing — between `collect_dirty_bins` and here the
-            // evictor may have DETACHED this BIN (BUG-CLEANER-LIVE-LN-RECLAIM:
-            // flushing the detached zombie would publish its stale image).
+            // RECONCILE A4 (BUG-SPLIT-LOST-INSERT-1) x R-LNRECLAIM B1
+            // (BUG-CLEANER-LIVE-LN-RECLAIM) to the single JE shape of
+            // Checkpointer.flushIN + logDirtyIN (Checkpointer.java:1214-1486)
+            // and Tree.getParentINForChildIN:
             //
-            // CORRECTNESS (checkpoint durability): a checkpoint must NEVER drop
-            // a RESIDENT dirty BIN — skipping it then writing CkptEnd would
-            // lose its committed changes on recovery.  So we skip ONLY on a
-            // definitive `No` (genuinely detached — the evictor logged it
-            // before detaching, so its image is already durable + published).
-            // `Busy` (a detach is in flight on THIS parent, momentarily holding
-            // `parent.write()`) is NOT a skip: release the child latch so the
-            // detach can finish, yield, and retry — the parent latch is held
-            // only briefly, so this converges to `Yes` (still resident, flush
-            // it) or `No` (it was the one being detached, already durable).
-            // The check is non-blocking (`try_read` on the parent) and reads
-            // the parent Weak from the guard we hold (never re-latching the
-            // child — the futex RwLock is not reentrant), so it cannot deadlock
-            // against detach's parent-then-child order.
-            let mut bin_guard;
-            let mut resident;
-            let mut spins = 0usize;
-            loop {
-                bin_guard = bin_arc.write();
-                let parent_weak = match &*bin_guard {
-                    TreeNode::Bottom(b) => b.parent.clone(),
-                    TreeNode::Internal(n) => n.parent.clone(),
-                };
-                resident = Tree::child_resident_state(&parent_weak, &bin_arc);
-                if resident != noxu_tree::tree::ChildResident::Busy {
-                    break;
+            //   JE latches the PARENT exclusively first (getParentINForChildIN),
+            //   confirms the child is still in the slot by identity
+            //   (`!exactParentFound -> skip`, Checkpointer.java:1198-1256; and
+            //   for the target, `targetRef.lsn != parent.getLsn(index)` /
+            //   `parent.getTarget(index) != target` -> return,
+            //   Checkpointer.java:1309-1321), latches the child, logs it
+            //   (logDirtyIN), then calls `parent.updateEntry(index, newLsn)`
+            //   with the parent latch STILL HELD, releasing it only in the
+            //   outer finally (Checkpointer.java:1486, 1382).
+            //
+            // So: take A4's PARENT-write-latch-FIRST order and HOLD it across
+            // the child log + the parent-slot stamp (A4), and perform
+            // R-LNRECLAIM's single-instance identity re-check UNDER that held
+            // parent latch (B1).  Because we hold `parent.write()` exclusively,
+            // a concurrent evictor detach (which needs the same parent write
+            // latch, parent-then-child) CANNOT be in flight: there is NO `Busy`
+            // case and NO retry.  The check is a pure `Arc::ptr_eq` of this BIN
+            // against the parent's resident child slots -- it never latches
+            // the child (no futex-reentrancy risk) and never takes any lock
+            // beyond the parent latch we already hold, so it does not perturb
+            // the lock order checked against checkpoint_flush_levels
+            // (R-FLUSHLVL: that mutex is only taken in short scopes in
+            // flush_one_tree / sync_database, never across these IN latches)
+            // or checkpoint_serial (A13: an outer lock taken before any tree
+            // latch).  A detached (zombie) or non-matching instance is SKIPPED
+            // -- the evictor already logged and published it (at log time, via
+            // update_parent_slot_lsn) BEFORE detaching, so its on-disk image is
+            // durable and the parent slot is current; JE never flushes a
+            // non-resident IN.  This preserves R-LNRECLAIM's guarantee that the
+            // checkpointer NEVER skips a RESIDENT dirty BIN: a resident BIN is
+            // ptr_eq to one of its parent's slots and is flushed; only a
+            // genuinely detached instance (ptr_eq to none) is skipped.
+            //
+            // The parent-slot LSN is stamped exactly ONCE, under this held
+            // parent guard, by `stamp_parent_slot_under_guard` in the tail
+            // below (A4).  R-LNRECLAIM's log-time `update_parent_slot_lsn`
+            // publication in THIS checkpointer BIN path is dropped to avoid a
+            // double stamp -- the under-the-parent-latch stamp is the single
+            // canonical publication here (the evictor path keeps its own
+            // log-time `update_parent_slot_lsn`, which is a different code path
+            // and not a double-stamp).
+            //
+            // Resolve the parent via the BIN's `parent` back-pointer under a
+            // brief read latch (never child-then-parent), then take the parent
+            // write latch.  `None` => the BIN is the tree root (single-level
+            // tree): no parent slot exists, so it is resident by definition and
+            // seeded via `note_root_logged` below.
+            let parent_arc =
+                noxu_tree::tree::Tree::parent_arc_of_child(&bin_arc);
+            let mut parent_guard = parent_arc.as_ref().map(|p| p.write());
+            // Acquire the BIN write lock to serialize + clear dirty flags
+            // (parent-then-child lock order; the parent latch is already held).
+            let mut bin_guard = bin_arc.write();
+
+            // R-LNRECLAIM B1 identity re-check UNDER the held parent latch:
+            // this exact Arc must still be the resident child of one of its
+            // parent's slots (Arc::ptr_eq, JE `parent.getTarget(index)`
+            // identity).  A root BIN (no parent) is resident by definition.
+            // `Arc::ptr_eq` compares pointers only -- it does NOT latch the
+            // child, so there is no futex-reentrancy against the `bin_guard` we
+            // hold.
+            let child_resident = match parent_guard.as_deref() {
+                None => true, // root BIN: no parent slot, resident by definition
+                Some(TreeNode::Internal(p)) => {
+                    (0..p.entries.len()).any(|slot| {
+                        p.child_ref(slot)
+                            .map(|c| Arc::ptr_eq(c, &bin_arc))
+                            .unwrap_or(false)
+                    })
                 }
-                // Busy: drop the child latch so the in-flight detach (blocked
-                // on it) can complete, then retry.  Bounded spin with a yield;
-                // detach holds the parent latch only for the duration of a slot
-                // update, so this resolves quickly.
-                drop(bin_guard);
-                spins += 1;
-                if spins > 10_000 {
-                    // Pathological: fall back to a blocking re-check via the
-                    // child's parent to avoid an unbounded spin.  Still never
-                    // skip a resident node — treat an unresolved Busy as Yes
-                    // (flush it; a stale flush is prevented by the identity
-                    // match in `update_parent_slot_lsn`).
-                    bin_guard = bin_arc.write();
-                    resident = noxu_tree::tree::ChildResident::Yes;
-                    break;
-                }
-                std::thread::yield_now();
-            }
-            if resident == noxu_tree::tree::ChildResident::No {
-                // Genuinely detached: the evictor already logged + published it
-                // before detaching, so its on-disk image is durable and the
-                // parent slot is current — safe to skip (JE never flushes a
-                // non-resident IN).
+                // Parent resolved but is not an IN (defensive): it cannot own
+                // this BIN as a slot child -> treat as detached, skip.
+                Some(_) => false,
+            };
+            if !child_resident {
+                // Genuinely detached / replaced (zombie): the evictor logged +
+                // published it before detaching, so its on-disk image is
+                // durable and the parent slot is current -- safe to skip (JE
+                // never flushes a non-resident IN).  Releasing the guards here
+                // drops the parent and child latches.
                 continue;
             }
 
@@ -1776,13 +1789,12 @@ impl Checkpointer {
                 TreeNode::Bottom(b) => b,
                 _ => continue, // not a BIN (defensive)
             };
-            // DEBUG invariant: the retry loop above only breaks with
-            // `resident == Yes` (or the pathological fall-through), so a
-            // genuinely detached BIN is never flushed here
-            // (BUG-CLEANER-LIVE-LN-RECLAIM).
-            debug_assert_ne!(
-                resident,
-                noxu_tree::tree::ChildResident::No,
+            // DEBUG invariant (BUG-CLEANER-LIVE-LN-RECLAIM): we only get here
+            // after the `child_resident` identity check above returned true (we
+            // `continue`d otherwise) and we HOLD the parent write latch, so a
+            // genuinely detached (zombie) BIN is never flushed here.
+            debug_assert!(
+                child_resident,
                 "checkpointer must not flush a detached (zombie) BIN"
             );
 
@@ -1948,26 +1960,39 @@ impl Checkpointer {
                 seed_full_lsn = logged_lsn;
             }
 
-            // Release the BIN write lock BEFORE touching the parent (the
-            // canonical lock order elsewhere is parent-then-child, so we must
-            // not hold the child while taking the parent write lock).
+            // Release the BIN (child) write lock while STILL holding the
+            // parent latch (JE `logDirtyIN` releases the child latch inside the
+            // held parent latch, Checkpointer.java:1466), so the stamp below is
+            // published atomically with the just-logged image.
             drop(bin_guard);
 
             if seed_full_lsn != NULL_LSN {
-                // JE `IN.updateEntry`: stamp the child's current on-disk LSN
-                // into the parent IN's slot so the parent, logged next in this
-                // checkpoint, carries a pointer recovery can follow to lazily
-                // re-fetch this BIN (`child_at_or_fetch`).
-                Tree::update_parent_slot_lsn(&bin_arc, seed_full_lsn);
-
-                // Single-level tree: this BIN IS the root — seed recovery from
-                // its full LSN directly (it has no parent IN slot to stamp).
-                if Some(this_node_id) == root_node_id
-                    && let Ok(g) = tree_arc.read()
-                {
-                    g.note_root_logged(seed_full_lsn);
+                // JE `parent.updateEntry(index, newLsn)` under the held parent
+                // latch (Checkpointer.java:1486): stamp the child's current
+                // on-disk LSN into the parent IN's slot so the parent, logged
+                // next in this checkpoint, carries a pointer recovery can
+                // follow to lazily re-fetch this BIN (`child_at_or_fetch`).
+                // Done UNDER the parent latch we already hold — never a
+                // re-acquire — so there is no drop->stamp window a concurrent
+                // re-insert or evictor detach could exploit.
+                if let Some(parent_guard) = &mut parent_guard {
+                    Tree::stamp_parent_slot_under_guard(
+                        parent_guard,
+                        this_node_id,
+                        seed_full_lsn,
+                    );
+                } else if Some(this_node_id) == root_node_id {
+                    // Single-level tree: this BIN IS the root — seed recovery
+                    // from its full LSN directly (it has no parent IN slot).
+                    if let Ok(g) = tree_arc.read() {
+                        g.note_root_logged(seed_full_lsn);
+                    }
                 }
             }
+            // Release the parent latch (JE releases it after updateEntry at the
+            // end of logDirtyIN).  Explicit drop documents the latch lifetime.
+            drop(parent_guard);
+            drop(parent_arc);
         }
 
         Ok(result)
@@ -3362,37 +3387,21 @@ mod tests {
         );
     }
 
-    /// NEW-CLEANER-IN-OBSOLETE (delta->full transition): when the checkpointer
-    /// logs a FULL BIN that supersedes BOTH a prior full image AND an
-    /// intervening delta (a full->delta->full sequence, reached in normal
-    /// operation when a delta is logged and then `prohibit_next_delta` /
-    /// `allow_bin_deltas=false` forces the next checkpoint to a full), it must
-    /// count BOTH the prior full LSN (JE `getPrevFullLsn`) AND the intervening
-    /// delta LSN (JE `getPrevDeltaLsn` / `auxOldLsn`) obsolete.
-    ///
-    /// FAIL-PRE (branch tip b1829b905): the full-BIN path counted only the
-    /// prior full obsolete and reset `last_delta_lsn = NULL_LSN` WITHOUT
-    /// counting it — the intervening delta LEAKED (obsolete_in_count == 0 for
-    /// the delta's file), utilization over-reported, cleaner under-reclaimed.
-    ///
-    /// PASS-POST: both the prior full's file (2) AND the delta's file (3) show
-    /// one obsolete IN each, with the offsets tracked.
-    ///
-    /// JE: INLogEntry.java:150-151 (prevFullLsn + prevDeltaLsn both set even
-    /// for a FULL entry) + IN.java:5493-5497/5518-5519 (afterLogCommon counts
-    /// BOTH oldLsn = getPrevFullLsn() AND auxOldLsn = getPrevDeltaLsn()).
     /// Condition-2 witness (BUG-CLEANER-LIVE-LN-RECLAIM): a checkpoint must
-    /// NEVER skip a RESIDENT dirty BIN just because its parent IN is briefly
-    /// latched (the `child_resident_state` `try_read` returns `Busy`).  With a
-    /// skip-on-Busy checkpointer the dirty BIN is dropped and `CkptEnd` is
-    /// written without it -> committed changes lost on recovery.  With the
-    /// retry-on-Busy fix the checkpointer waits out the brief parent latch and
-    /// flushes the BIN.
+    /// NEVER skip a RESIDENT dirty BIN just because its parent IN is contended.
+    /// Skipping it then writing `CkptEnd` loses its committed changes on
+    /// recovery.
     ///
-    /// Here we hold the parent IN's READ latch for a bounded window on another
-    /// thread while the checkpointer runs; `try_read` on the parent SUCCEEDS
-    /// under a read latch, so to force `Busy` we take the parent WRITE latch
-    /// briefly.  The checkpointer must still end with the BIN flushed.
+    /// Reconciled design (A4 x R-LNRECLAIM B1, JE Checkpointer.flushIN /
+    /// logDirtyIN shape): the checkpointer takes the PARENT write latch FIRST
+    /// (blocking, parent-then-child), checks `Arc::ptr_eq` residency UNDER the
+    /// held parent latch, then logs + stamps. There is NO `try_read` / `Busy` /
+    /// retry: a concurrent evictor detach needs the SAME parent write latch, so
+    /// it cannot race the checkpointer. An agitator thread holds the parent IN's
+    /// WRITE latch in bounded bursts while the checkpointer runs; the
+    /// checkpointer must simply WAIT OUT each burst, acquire the parent latch,
+    /// find the BIN resident (ptr_eq), and flush it. RED if a resident dirty BIN
+    /// is ever skipped (flushed == 0); GREEN when it is flushed exactly once.
     #[test]
     fn test_checkpoint_does_not_skip_resident_dirty_bin_under_busy_parent() {
         use noxu_log::FileManager;

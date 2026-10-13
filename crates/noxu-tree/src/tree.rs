@@ -10717,6 +10717,71 @@ impl Tree {
         let _ = child_id;
     }
 
+    /// Resolve the resident parent IN of `child_arc` via its `parent`
+    /// back-pointer, if any.  `None` when the child is the tree root (no
+    /// parent slot) or its parent `Weak` is dead.
+    ///
+    /// Used by the checkpointer BIN flush to acquire the PARENT write latch
+    /// BEFORE the child latch (canonical parent-then-child order) so the child
+    /// log and the parent slot stamp are published atomically under the parent
+    /// latch — the JE `Checkpointer.flushIN` / `logDirtyIN` contract
+    /// (Checkpointer.java:1214-1486: the parent latch is held across
+    /// `child.log(...)` + `parent.updateEntry(index, newLsn)`).
+    pub fn parent_arc_of_child(
+        child_arc: &Arc<RwLock<TreeNode>>,
+    ) -> Option<Arc<RwLock<TreeNode>>> {
+        let parent_weak = {
+            let g = child_arc.read();
+            match &*g {
+                TreeNode::Bottom(b) => b.parent.clone(),
+                TreeNode::Internal(n) => n.parent.clone(),
+            }
+        }?;
+        parent_weak.upgrade()
+    }
+
+    /// Stamp `new_lsn` into the slot of `parent_guard` that currently points
+    /// at the child with id `child_id`, while the caller ALREADY HOLDS the
+    /// parent write latch.
+    ///
+    /// This is the latch-held variant of [`Self::update_parent_slot_lsn`]: the
+    /// checkpointer BIN flush takes the parent write latch first, logs the
+    /// child under it (so no descender can reach the child between the log and
+    /// the stamp), then stamps via this helper — never re-acquiring the parent
+    /// latch and never leaving a window where a concurrent re-insert's
+    /// KD-clear (or a concurrent evictor detach that already published a newer
+    /// slot LSN) can be clobbered by a stale stamp.  Mirrors JE
+    /// `parent.updateEntry(index, newLsn, ...)` executed under the held parent
+    /// latch (Checkpointer.logDirtyIN, Checkpointer.java:1486).
+    ///
+    /// Returns `true` iff a matching slot was found and stamped.  A `false`
+    /// return means the child is no longer a slot of this parent (a concurrent
+    /// split re-parented it); the caller leaves the stamp to whoever now owns
+    /// the slot, exactly as JE's search-for-parent re-validation does.
+    pub fn stamp_parent_slot_under_guard(
+        parent_guard: &mut TreeNode,
+        child_id: u64,
+        new_lsn: Lsn,
+    ) -> bool {
+        if new_lsn == NULL_LSN {
+            return false;
+        }
+        if let TreeNode::Internal(p) = parent_guard {
+            for slot in 0..p.entries.len() {
+                let matches = p
+                    .child_ref(slot)
+                    .map(|c| c.read().node_id() == child_id)
+                    .unwrap_or(false);
+                if matches {
+                    p.set_lsn(slot, new_lsn);
+                    p.dirty = true;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Recursive DFS helper for `get_parent_in_for_child_in`.
     ///
     /// Scans every entry in each Internal node.  When a child's node_id
