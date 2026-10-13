@@ -15,9 +15,7 @@
 //! exist at the dbi layer at v7.11.0; see the commit message).
 #![cfg(not(noxu_shuttle))]
 
-use noxu_db::{
-    DatabaseConfig, Durability, Environment, EnvironmentConfig,
-};
+use noxu_db::{DatabaseConfig, Durability, Environment, EnvironmentConfig};
 use std::path::Path;
 
 fn env_cfg(p: &Path) -> EnvironmentConfig {

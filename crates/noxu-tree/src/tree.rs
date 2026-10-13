@@ -9684,15 +9684,9 @@ impl Tree {
                 // `n_leaf_entries` would inflate the documented
                 // "approximate record count" (`DatabaseStats::leaf_node_count`)
                 // by the number of not-yet-compacted tombstones.
-                let (live, kd) = b
-                    .entries
-                    .iter()
-                    .fold((0u64, 0u64), |(l, d), e| {
-                        if e.known_deleted {
-                            (l, d + 1)
-                        } else {
-                            (l + 1, d)
-                        }
+                let (live, kd) =
+                    b.entries.iter().fold((0u64, 0u64), |(l, d), e| {
+                        if e.known_deleted { (l, d + 1) } else { (l + 1, d) }
                     });
                 stats.n_leaf_entries += live;
                 stats.n_deleted_leaf_entries += kd;
