@@ -163,10 +163,15 @@ fn je_file_manager_get_handle_rejects_truncated_header() {
     f.set_len(truncated_len).unwrap();
     drop(f);
 
-    // Re-open FileManager and try to get the handle.
-    let fm = make_fm(&dir);
-    let result = fm.get_file_handle(0);
-    assert!(result.is_err(), "get_file_handle on truncated header must fail",);
+    // Re-open FileManager: with A2 (v7.11.1) the open preflight validates
+    // every non-empty file's header, so a truncated header is rejected at
+    // `new()` -- earlier than, and strictly implying, the old lazy
+    // `get_file_handle` failure.
+    let result = FileManager::new(dir.path(), false, FILE_SIZE, CACHE_SIZE);
+    assert!(
+        result.is_err(),
+        "opening a FileManager over a truncated header must fail"
+    );
 }
 
 // -----------------------------------------------------------------------------
@@ -293,8 +298,13 @@ fn je_file_manager_get_handle_rejects_corrupt_header() {
         f.flush().unwrap();
     }
 
-    // Re-open and try to get the handle: must fail (JE ChecksumException).
-    let fm = make_fm(&dir);
-    let result = fm.get_file_handle(0);
-    assert!(result.is_err(), "get_file_handle on a corrupt header must fail");
+    // Re-open: with A2 (v7.11.1) the FileManager now validates EVERY header
+    // in `new()` (the fail-closed open preflight), so a corrupt header is
+    // rejected at open rather than lazily at the first `get_file_handle`.
+    // Either layer catches it; assert the stronger, earlier guarantee.
+    let result = FileManager::new(dir.path(), false, FILE_SIZE, CACHE_SIZE);
+    assert!(
+        result.is_err(),
+        "opening a FileManager over a corrupt header must fail"
+    );
 }

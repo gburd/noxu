@@ -104,6 +104,20 @@ impl DbBackup {
             }
         })?;
 
+        // A2 (v7.11.1): validate every file header before snapshotting it
+        // into the backup set. A backup copy that includes a file whose
+        // `log_version` the engine cannot read is a backup recovery cannot
+        // mount; refuse the backup up front with the typed
+        // `LogError::VersionMismatch` (via `get_file_handle`) rather than
+        // silently copying an unreadable future-version file.
+        for &f in &files {
+            file_manager.get_file_handle(f).map_err(|e| {
+                DbiError::EnvironmentFailure {
+                    reason: format!("backup: refusing log file {f}: {e}"),
+                }
+            })?;
+        }
+
         // Protect every file first, so that between listing and returning the
         // cleaner cannot delete one out from under us.
         for &f in &files {
@@ -268,5 +282,47 @@ mod tests {
         // The cursor's pin survives.
         assert!(protector.is_protected(0));
         assert_eq!(protector.get_protection_count(0), 1);
+    }
+
+    /// A2 (v7.11.1 backport, entry point: BACKUP): if a future-version log
+    /// file appears AFTER the FileManager was opened, `start_backup` must
+    /// refuse it rather than silently snapshot it into the backup set. A
+    /// backup copy that includes a header the engine cannot read is a backup
+    /// recovery cannot mount.
+    #[test]
+    fn start_backup_rejects_future_version_file() {
+        use noxu_log::file_header::LOG_VERSION;
+        let dir = tempdir().unwrap();
+        let file_manager = fm(dir.path());
+        // One valid v3 file.
+        file_manager.create_file(0).unwrap();
+
+        // Plant a CRC-valid future-version file 1 that the open-time preflight
+        // never saw.
+        let mut bytes = vec![
+            78u8, 79, 88, 85, 68, 66, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        bytes[8..12].copy_from_slice(&(LOG_VERSION + 1).to_be_bytes());
+        bytes[24..28].copy_from_slice(&1u32.to_be_bytes());
+        let crc =
+            noxu_log::checksum::ChecksumValidator::compute_range(&bytes, 0, 32);
+        bytes[32..36].copy_from_slice(&crc.to_be_bytes());
+        std::fs::write(dir.path().join("00000001.ndb"), &bytes).unwrap();
+
+        let protector = Arc::new(FileProtector::new());
+        let res = DbBackup::start_backup(
+            Arc::clone(&protector),
+            Arc::clone(&file_manager),
+        );
+        assert!(
+            res.is_err(),
+            "start_backup must refuse a future-version file in the set",
+        );
+        // The future file must be untouched by the refusal.
+        assert_eq!(
+            std::fs::read(dir.path().join("00000001.ndb")).unwrap(),
+            bytes
+        );
     }
 }

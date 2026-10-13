@@ -184,7 +184,8 @@ impl FileHeader {
     ///
     /// Returns [`LogError::InvalidHeader`] if the magic bytes are wrong or
     /// if the byte-order marker is not big-endian.
-    /// Returns [`LogError::VersionMismatch`] if `log_version < MIN_LOG_VERSION`.
+    /// Returns [`LogError::VersionMismatch`] if `log_version` is outside the
+    /// supported window `[MIN_LOG_VERSION, LOG_VERSION]` (A2, v7.11.1).
     pub fn read_from<R: Read>(reader: &mut R) -> Result<Self> {
         // --- Magic (8 bytes) ---
         let mut magic = [0u8; 8];
@@ -199,8 +200,20 @@ impl FileHeader {
         }
 
         // --- Version (4 bytes) ---
+        //
+        // A2 (v7.11.1): the version-admission gate lives here, at the single
+        // read point EVERY open/scan path funnels through, so a file whose
+        // `log_version` is outside the supported window `[MIN_LOG_VERSION,
+        // LOG_VERSION]` is refused before any records are parsed, any header
+        // size is resolved, or any truncation/orphan-deletion runs. Earlier
+        // this check only rejected `< MIN_LOG_VERSION`; a CRC-valid *future*
+        // version (`> LOG_VERSION`) slipped through `read_from` and was only
+        // caught by `validate()`, which several paths (mmap, read-only open,
+        // scanner) never reached. JE rejects both bounds in
+        // `FileManager.readAndValidateFileHeader` /
+        // `FileHeader.readLogVersion` (`VersionMismatchException`).
         let log_version = reader.read_u32::<BigEndian>()?;
-        if log_version < MIN_LOG_VERSION {
+        if !(MIN_LOG_VERSION..=LOG_VERSION).contains(&log_version) {
             return Err(LogError::VersionMismatch {
                 expected: LOG_VERSION,
                 found: log_version,
@@ -628,18 +641,16 @@ mod tests {
     /// JE: LogHeaderVersionTest.testGreaterVersionNotAllowed
     ///
     /// JE loads `maxversion.jdb` (header version = Integer.MAX_VALUE) and
-    /// expects `VersionMismatchException` when the environment is opened. In
-    /// JE the version is READ by `FileHeader.readFromLog` and REJECTED by
-    /// `FileHeader.validate` (`logVersion > LogEntryType.LOG_VERSION` ->
-    /// `VersionMismatchException`). The open path is read-then-validate.
+    /// expects `VersionMismatchException` when the environment is opened.
     ///
-    /// Noxu mirrors that exact layering: `read_from` treats any
-    /// `log_version >= LOG_VERSION` as the current (v3) shape and verifies the
-    /// CRC -- it does NOT itself reject a future version -- and `validate()`
-    /// is the gate that rejects `log_version > LOG_VERSION` with
-    /// `LogError::VersionMismatch`. This test ports the JE open path:
-    /// read_from succeeds, validate rejects. (Data loss avoided: a
-    /// newer-format file can never be silently opened by an older engine.)
+    /// A2 (v7.11.1): the version-admission gate moved UP to `read_from` so a
+    /// future version is refused at the single read point EVERY open/scan
+    /// path funnels through -- not only in `validate()`, which several paths
+    /// (mmap, read-only open, scanner) never reached. A CRC-valid future
+    /// header must therefore be rejected by `read_from` itself with
+    /// `LogError::VersionMismatch`, before any caller can act on the parsed
+    /// header. (`validate()` keeps the same rejection as belt-and-braces --
+    /// see `test_greater_version_rejected_by_validate`.)
     #[test]
     fn test_greater_version_not_allowed() {
         // Build a 36-byte v3-shaped header but stamp a version above
@@ -659,19 +670,10 @@ mod tests {
         buf.extend_from_slice(&covered);
         buf.extend_from_slice(&crc32fast::hash(&covered).to_be_bytes());
 
-        // Step 1 (JE readFromLog): the version is read, not rejected here.
+        // `read_from` itself REJECTS the future version with VersionMismatch
+        // (the gate no longer waits for `validate()`).
         let mut cursor = Cursor::new(buf);
-        let header = FileHeader::read_from(&mut cursor)
-            .expect("read_from reads the version without rejecting it");
-        assert_eq!(
-            header.log_version, future_version,
-            "read_from recovers the (future) version verbatim"
-        );
-
-        // Step 2 (JE FileHeader.validate at env-open): the future version is
-        // REJECTED with VersionMismatch -- the parity assertion.
-        match header
-            .validate(header.file_number)
+        match FileHeader::read_from(&mut cursor)
             .expect_err("a header newer than LOG_VERSION must be rejected")
         {
             LogError::VersionMismatch { expected, found, .. } => {
