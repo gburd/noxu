@@ -1035,8 +1035,22 @@ impl FileManager {
     /// Closes the file manager, releasing all resources.
     pub fn close(&self) -> Result<()> {
         self.clear_cache();
+        self.release_env_lock();
+        Ok(())
+    }
 
-        // Release the lock file
+    /// Release ONLY the on-disk environment lock (the `flock` on the lock
+    /// file), WITHOUT clearing the file cache.
+    ///
+    /// This is the drop-path analogue of [`Self::close`]: `EnvironmentImpl`'s
+    /// `Drop` calls it so a dropped-without-`close()` environment releases its
+    /// lock synchronously (an immediate reopen does not race the lock
+    /// release), while a `LogManager`/`FileManager` reference that legitimately
+    /// outlives the dropped `EnvironmentImpl` (e.g. a test that extracts the
+    /// `Arc<LogManager>`) stays usable for I/O.  `close()` additionally clears
+    /// the cache; `Drop` must not, or it would break such an outstanding
+    /// reference.
+    pub fn release_env_lock(&self) {
         if let Some(lock_file) = self.lock_file.write().take() {
             {
                 #[allow(unused_imports)]
@@ -1045,8 +1059,6 @@ impl FileManager {
             }
             drop(lock_file);
         }
-
-        Ok(())
     }
 }
 

@@ -4154,6 +4154,29 @@ impl Drop for EnvironmentImpl {
                 }
             }
         }
+
+        // Release the on-disk env lock SYNCHRONOUSLY on drop.  Breaking the
+        // Tree/evictor `Arc<LogManager>` chains above is not sufficient on its
+        // own: the struct's own `log_manager` field, a closed `Database`, or a
+        // recovered tree may still hold an `Arc<LogManager>` whose
+        // `FileManager` outlives this `drop`, so the `flock` would otherwise
+        // linger until the last `Arc` happens to drop.  That left an immediate
+        // reopen (recovery / no-close tests that simulate a crash) racing the
+        // lock release and failing intermittently with "Environment is locked
+        // by another process" under load (observed on aarch64 metal in
+        // embedded_ln_threshold_lower::control_redo_32_32).
+        //
+        // Use `release_env_lock()` (the drop-path analogue of `close()`),
+        // which releases ONLY the lock and does NOT clear the FileManager's
+        // cache -- a `LogManager`/`FileManager` reference that legitimately
+        // outlives the dropped `EnvironmentImpl` stays usable for I/O.  (JE
+        // `EnvironmentImpl.close -> fileManager.close`,
+        // EnvironmentImpl.java:1926-1936, releases the lock regardless of
+        // outstanding references; on an abandoned handle we release the lock
+        // but keep any still-referenced manager alive.)
+        if let Some(lm) = &self.log_manager {
+            lm.file_manager().release_env_lock();
+        }
     }
 }
 
@@ -4166,6 +4189,44 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let env = EnvironmentImpl::new(dir.path(), read_only, true).unwrap();
         (dir, env)
+    }
+
+    /// Dropping an `EnvironmentImpl` must release the on-disk env `flock`
+    /// synchronously, even when another `Arc<LogManager>` clone is still
+    /// alive, so an immediate reopen does not race the lock release.
+    ///
+    /// Regression for the `embedded_ln_threshold_lower::control_redo_32_32`
+    /// flake ("Environment is locked by another process") seen on aarch64
+    /// metal under load: that test drops `env` without `close()` to simulate a
+    /// crash and reopens at once.  Before the fix, `Drop` only broke the
+    /// Tree/evictor `Arc<LogManager>` chains and relied on the refcount
+    /// reaching zero, so a lingering clone (here held deliberately) kept the
+    /// `FileManager` -- and its `flock` -- alive past `drop(env)`.  `Drop` now
+    /// calls `FileManager::release_env_lock()`, force-releasing the lock
+    /// regardless of outstanding references.
+    #[test]
+    fn drop_releases_env_lock_with_a_lingering_log_manager_clone() {
+        let dir = TempDir::new().unwrap();
+        {
+            let env = EnvironmentImpl::new(dir.path(), false, true).unwrap();
+            // Deliberately hold an Arc<LogManager> clone that outlives `env`,
+            // reproducing the engine condition the metal flake hit by chance.
+            let _lingering = env.get_log_manager().unwrap();
+            // No close(): simulate a crash, exactly like control_redo_32_32.
+            drop(env);
+            // Reopen immediately. Before the fix this raced the lock release
+            // and failed deterministically here because `_lingering` keeps the
+            // FileManager alive.
+            let reopened = EnvironmentImpl::new(dir.path(), false, true);
+            assert!(
+                reopened.is_ok(),
+                "reopen after drop(env) must succeed; env lock not released \
+                 synchronously: {:?}",
+                reopened.err()
+            );
+            drop(reopened);
+            drop(_lingering);
+        }
     }
 
     #[test]
