@@ -205,10 +205,15 @@ pub struct SlotFetch {
     /// search); Noxu's `search_with_data` filters expiry inline, so it surfaces
     /// the expired slot here instead for the cursor to resolve.
     //
-    // v7.11.1 tag-native deviation: the integrate base also carried a `kd_lsn:
-    // Option<u64>` field here (A5 KD-slot lineage, NOT in stack-v1); it is
-    // dropped so only the A14 `expired_slot` field is added.
+    // v7.11.1: the A14 expired_slot field (batch D) and the A4/A5
+    // kd_lsn field (C1b) coexist on this struct; both additive.
     pub expired_slot: Option<(u64, usize, u32, bool)>,
+    /// LSN of an exact-match slot that is known-deleted (`found` is then
+    /// `false`).  A `search(Set/Both)` uses it to re-examine the slot's
+    /// CURRENT resident instance once before concluding NOTFOUND (JE
+    /// searchExact -> lockLNAndCheckDefunct, CursorImpl.java:1937-1980) --
+    /// the BUG-SPLIT-LOST-INSERT-1 stale-resident-instance window.
+    pub kd_lsn: Option<u64>,
 }
 
 /// The B+tree.
@@ -3836,12 +3841,16 @@ impl Tree {
                 }
 
                 let mut expired_slot: Option<(u64, usize, u32, bool)> = None;
+                let mut kd_lsn = None;
                 let (found, data, lsn, slot_index) = match &*guard {
                     TreeNode::Bottom(bin) => {
                         let (idx, exact) = match &self.key_comparator {
                             Some(cmp) => bin.find_entry_cmp(key, cmp.as_ref()),
                             None => bin.find_entry_compressed(key),
                         };
+                        if exact && bin.entries[idx].known_deleted {
+                            kd_lsn = Some(bin.get_lsn(idx).as_u64());
+                        }
                         if exact {
                             // TREE-F1: a slot is reported as found only when
                             // live (not known_deleted, not TTL-expired) — the
@@ -3890,6 +3899,7 @@ impl Tree {
                     slot_index,
                     bin_arc,
                     expired_slot,
+                    kd_lsn,
                 });
             }
 

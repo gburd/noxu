@@ -1775,7 +1775,23 @@ impl CursorImpl {
         //   3. `find_bin_for_key(root, key)` — re-descended for BIN pinning.
         // `search_with_data` folds all three into one descent and uses binary
         // search (`find_entry_compressed`) at the BIN level.
-        let slot = {
+        //
+        // BUG-SPLIT-LOST-INSERT-1 part 2/2 (tag-native): on an exact match that
+        // is KNOWN-DELETED, re-descend ONCE from the root and re-examine the
+        // slot on the CURRENT resident instance before concluding the key is
+        // absent.  JE `searchExact` locks a defunct exact match and re-reads
+        // the slot's current state before NOTFOUND (CursorImpl.java:1937-1980):
+        // a concurrent evictor detach+refault can swap a stale (prior-round KD)
+        // BIN instance under the latch-free `read_arc()` descent, so the first
+        // descent may observe a committed-live record as KD.  One bounded extra
+        // descent catches that window; a genuinely-deleted key re-descends
+        // still-KD and terminates at NOTFOUND after exactly one extra descent.
+        // This is the re-examination 49467d83 performs, WITHOUT the deferred
+        // run_with_defunct_restart machinery (absent at v7.11.0): the bound is
+        // a local loop with no cursor state that outlives the call, and it only
+        // fires on an exact KD match (never on a plain absent key — a miss
+        // stays one descent).
+        let mut slot = {
             let db = self.db_impl.read();
             if let Some(tree) = db.get_real_tree() {
                 tree.search_with_data(key)
@@ -1783,6 +1799,31 @@ impl CursorImpl {
                 None
             }
         };
+        //
+        // Fire ONLY on an exact KNOWN-DELETED match (JE searchExact scope,
+        // CursorImpl.java:1937-1980): a reachable slot that is simply ABSENT
+        // (`Some` with `found == false` and no `kd_lsn`), or a `None` descent,
+        // is NOT re-descended, so an ordinary key miss still costs exactly one
+        // descent.  A detached-descent `None` is NOT retried here: under this
+        // base it is BUG-EVICT-REFAULT-DATALOSS (the BIN is durably gone, a
+        // separate release-blocker), which a cursor re-descent cannot paper
+        // over.
+        for _redescend in 0..1usize {
+            let kd_miss =
+                slot.as_ref().is_some_and(|s| !s.found && s.kd_lsn.is_some());
+            if !kd_miss {
+                break;
+            }
+            // Re-descend once on the current resident instance.
+            slot = {
+                let db = self.db_impl.read();
+                if let Some(tree) = db.get_real_tree() {
+                    tree.search_with_data(key)
+                } else {
+                    None
+                }
+            };
+        }
         let found = slot.as_ref().is_some_and(|s| s.found);
 
         // Non-dup path: JE Cursor.search() converts BOTH_RANGE to BOTH (exact
