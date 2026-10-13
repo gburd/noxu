@@ -1344,21 +1344,29 @@ impl RecoveryManager {
     /// `key` to the version it names. Mirrors JE `RecoveryManager.rollbackUndo`
     /// -> `undo(... revertLsn, revertKD, revertPD, revertKey, revertData ...)`.
     ///
+    /// The revert applies only while the slot -- known-deleted included --
+    /// still holds the rolled-back logrec (`logLsn == slotLsn`,
+    /// RecoveryManager.java:1909-1963); a slot rewritten later is left alone.
+    ///
     /// - `revert_kd` (revert-to-known-deleted): the rolled-back logrec was the
-    ///   first write of the slot; delete the slot.
+    ///   first write of the slot; the slot becomes deleted.
     /// - `revert_pd` (revert-to-pending-deleted): the previous version is
-    ///   itself a delete; delete the slot.
+    ///   itself a delete; the slot becomes deleted.
     /// - otherwise restore the previous version's data (embedded
     ///   `revert_data`, or read from the log at `revert_lsn`).
     fn apply_revert_info(
         tree: &mut noxu_tree::Tree,
         scanner: &dyn LogScanner,
         rec: &LnRecord,
+        log_lsn: Lsn,
         ri: &crate::RevertInfo,
-    ) {
+    ) -> Result<()> {
+        if !Self::undo_slot_is_current(tree, &rec.key, log_lsn) {
+            return Ok(());
+        }
         if ri.revert_kd || ri.revert_pd {
-            tree.delete(&rec.key);
-            return;
+            Self::revert_to_deleted(tree, &rec.key, ri.revert_lsn);
+            return Ok(());
         }
         if let Some(data) = &ri.revert_data {
             let key = ri
@@ -1374,12 +1382,12 @@ impl RecoveryManager {
                     rec.db_id,
                 );
             }
-            return;
+            return Ok(());
         }
         // Non-embedded previous version: read the before-image from the log.
         if ri.revert_lsn == NULL_LSN {
             tree.delete(&rec.key);
-            return;
+            return Ok(());
         }
         match scanner.read_at_lsn(ri.revert_lsn) {
             Some(LogEntry::Ln(prev)) => {
@@ -1400,12 +1408,43 @@ impl RecoveryManager {
                         );
                     }
                 } else {
-                    tree.delete(&rec.key);
+                    Self::revert_to_deleted(tree, &rec.key, ri.revert_lsn);
                 }
             }
             _ => {
                 tree.delete(&rec.key);
             }
+        }
+        Ok(())
+    }
+
+    /// `IN.recoverRecord` with KD/PD set (IN.java:3854-3921): a NULL revert
+    /// LSN empties the slot (KD + NULL LSN + `queueSlotDeletion`), so remove
+    /// it; otherwise the slot stays deleted carrying the reverted-to LSN, so
+    /// a later undo of that version can still match it.
+    /// The caller has checked that the slot exists (`undo_slot_is_current`).
+    /// A slot that is already KD keeps its LSN: no rolled-back DeleteLN can
+    /// revert to a deleted version, because deleting a deleted record is
+    /// never logged.
+    fn revert_to_deleted(tree: &noxu_tree::Tree, key: &[u8], revert_lsn: Lsn) {
+        if revert_lsn.is_null() {
+            tree.delete(key);
+        } else {
+            tree.mark_deleted(key, revert_lsn);
+        }
+    }
+
+    // A required before-image is never equivalent to an intentional delete.
+    // The legacy scanner cannot expose the underlying I/O cause yet.
+    fn required_before_image(
+        scanner: &dyn LogScanner,
+        lsn: Lsn,
+    ) -> Result<LnRecord> {
+        match scanner.read_at_lsn(lsn) {
+            Some(LogEntry::Ln(record)) => Ok(record),
+            _ => Err(crate::error::RecoveryError::RecoveryFailed(format!(
+                "missing or invalid required LN before-image at {lsn:?}"
+            ))),
         }
     }
 
@@ -1478,7 +1517,7 @@ impl RecoveryManager {
                         && let Some(ri) = chain.pop()
                         && let Some(t) = trees.get_mut(&rec.db_id)
                     {
-                        Self::apply_revert_info(t, scanner, rec, &ri);
+                        Self::apply_revert_info(t, scanner, rec, pe.lsn, &ri)?;
                         self.stats.lns_undone += 1;
                         // REC-Z: this LN version was rolled back (logically
                         // truncated); count it obsolete.  JE
@@ -2776,7 +2815,7 @@ impl RecoveryManager {
                         && let Some(t) = tree.as_deref_mut()
                         && t.get_database_id() == rec.db_id
                     {
-                        Self::apply_revert_info(t, scanner, rec, &ri);
+                        Self::apply_revert_info(t, scanner, rec, pe.lsn, &ri)?;
                         self.stats.lns_undone += 1;
                         // REC-Z: this rolled-back LN version is now obsolete.
                         rolled_back_obsolete.push(pe.lsn);
@@ -4390,6 +4429,205 @@ mod tests {
             mgr.invisible_lsns_to_mark().is_empty(),
             "a complete rollback period must NOT be re-marked invisible"
         );
+    }
+
+    /// Rollback undo currency (JE `RecoveryManager.rollbackUndo` -> `undo`,
+    /// RecoveryManager.java:1869-1963): a rolled-back logrec is reverted only
+    /// while the slot still holds it (`logLsn == slotLsn`).  A write COMMITTED
+    /// after the rollback (v9 @400) must survive a later crash recovery; a
+    /// currency-blind revert put the pre-rollback v0 back over it.
+    #[test]
+    fn test_rollback_revert_skips_slot_rewritten_after_rollback() {
+        let ln = |txn, op, data: Option<&'static [u8]>, abort| {
+            LogEntry::Ln(LnRecord::new(
+                1,
+                Some(txn),
+                op,
+                Bytes::from_static(b"K"),
+                data.map(Bytes::from_static),
+                abort,
+                abort == NULL_LSN,
+            ))
+        };
+        let commit = |txn_id, at| {
+            LogEntry::TxnCommit(TxnCommitRecord {
+                txn_id,
+                lsn: at,
+                dtvlsn: None,
+            })
+        };
+        let mut scanner = InMemoryLogScanner::new();
+        scanner.push(
+            lsn(0, 100),
+            ln(5, LnOperation::Insert, Some(b"v0"), NULL_LSN),
+        );
+        scanner.push(lsn(0, 110), commit(5, lsn(0, 110)));
+        // In-window update by the rolled-back txn 7.
+        scanner.push(
+            lsn(0, 200),
+            ln(7, LnOperation::Update, Some(b"v1"), lsn(0, 100)),
+        );
+        scanner.push(
+            lsn(0, 300),
+            LogEntry::RollbackStart(RollbackStartRecord {
+                matchpoint_vlsn: noxu_util::NULL_VLSN,
+                matchpoint_lsn: lsn(0, 150),
+                lsn: lsn(0, 300),
+                active_txn_ids: vec![7],
+            }),
+        );
+        scanner.push(
+            lsn(0, 350),
+            LogEntry::RollbackEnd(RollbackEndRecord {
+                matchpoint_lsn: lsn(0, 150),
+                lsn: lsn(0, 350),
+            }),
+        );
+        // Post-rollback committed write of the same key.
+        scanner.push(
+            lsn(0, 400),
+            ln(9, LnOperation::Update, Some(b"v9"), lsn(0, 100)),
+        );
+        scanner.push(lsn(0, 410), commit(9, lsn(0, 410)));
+
+        let mut tree = make_tree();
+        let mut mgr = RecoveryManager::new();
+        mgr.recover(&mut scanner, Some(&mut tree), false).unwrap();
+        let f = tree.search_with_data(b"K").expect("slot fetch");
+        assert_eq!(
+            f.data.as_deref(),
+            Some(&b"v9"[..]),
+            "rollback undo must not revert a slot rewritten after the rollback"
+        );
+    }
+
+    /// Rollback revert to a version that is itself a deletion (revertPD) keeps
+    /// the slot, deleted, carrying the deletion LSN (JE `IN.recoverRecord`,
+    /// IN.java:3898-3921: `setLsn(revertLsn)` + `setPendingDeleted`), so the
+    /// txn's preserved pre-matchpoint DeleteLN (@140) stays matchable by LSN.
+    /// Removing the slot drops that link to the committed v0 behind it.
+    #[test]
+    fn test_rollback_revert_to_pending_deleted_keeps_kd_slot() {
+        let ln = |txn, op, data: Option<&'static [u8]>, abort| {
+            LogEntry::Ln(LnRecord::new(
+                1,
+                Some(txn),
+                op,
+                Bytes::from_static(b"K"),
+                data.map(Bytes::from_static),
+                abort,
+                abort == NULL_LSN,
+            ))
+        };
+        let mut scanner = InMemoryLogScanner::new();
+        scanner.push(
+            lsn(0, 100),
+            ln(5, LnOperation::Insert, Some(b"v0"), NULL_LSN),
+        );
+        scanner.push(
+            lsn(0, 110),
+            LogEntry::TxnCommit(TxnCommitRecord {
+                txn_id: 5,
+                lsn: lsn(0, 110),
+                dtvlsn: None,
+            }),
+        );
+        // Txn 7: delete (pre-matchpoint, preserved), reinsert (rolled back).
+        scanner
+            .push(lsn(0, 140), ln(7, LnOperation::Delete, None, lsn(0, 100)));
+        scanner.push(
+            lsn(0, 200),
+            ln(7, LnOperation::Insert, Some(b"v2"), lsn(0, 100)),
+        );
+        scanner.push(
+            lsn(0, 300),
+            LogEntry::RollbackStart(RollbackStartRecord {
+                matchpoint_vlsn: noxu_util::NULL_VLSN,
+                matchpoint_lsn: lsn(0, 150),
+                lsn: lsn(0, 300),
+                active_txn_ids: vec![7],
+            }),
+        );
+        scanner.push(
+            lsn(0, 350),
+            LogEntry::RollbackEnd(RollbackEndRecord {
+                matchpoint_lsn: lsn(0, 150),
+                lsn: lsn(0, 350),
+            }),
+        );
+
+        // Crash state: a checkpoint after @200 captured the reinsert.
+        let mut tree = make_tree();
+        tree.insert(b"K".to_vec(), b"v2".to_vec(), lsn(0, 200)).unwrap();
+        let mut mgr = RecoveryManager::new();
+        mgr.recover(&mut scanner, Some(&mut tree), false).unwrap();
+        assert_eq!(
+            tree.slot_lsn_any(b"K"),
+            Some((lsn(0, 140), true)),
+            "revert to a deleted version must keep a KD slot at its LSN"
+        );
+        assert!(
+            !tree.search(b"K").map(|r| r.exact_parent_found).unwrap_or(false),
+            "the reverted-to deletion hides the record"
+        );
+    }
+
+    /// The rollback currency check sees a known-deleted slot: an in-window
+    /// DeleteLN captured by a checkpoint as a KD slot is matched by LSN and
+    /// reverted to the committed before-image (RecoveryManager.java:1909-1963).
+    #[test]
+    fn test_rollback_revert_matches_kd_slot_of_in_window_delete() {
+        let mut scanner = InMemoryLogScanner::new();
+        scanner.push(
+            lsn(0, 100),
+            LogEntry::Ln(make_insert(1, Some(5), b"K", NULL_LSN)),
+        );
+        scanner.push(
+            lsn(0, 110),
+            LogEntry::TxnCommit(TxnCommitRecord {
+                txn_id: 5,
+                lsn: lsn(0, 110),
+                dtvlsn: None,
+            }),
+        );
+        scanner.push(
+            lsn(0, 200),
+            LogEntry::Ln(LnRecord::new(
+                1,
+                Some(7),
+                LnOperation::Delete,
+                Bytes::from_static(b"K"),
+                None,
+                lsn(0, 100),
+                false,
+            )),
+        );
+        scanner.push(
+            lsn(0, 300),
+            LogEntry::RollbackStart(RollbackStartRecord {
+                matchpoint_vlsn: noxu_util::NULL_VLSN,
+                matchpoint_lsn: lsn(0, 150),
+                lsn: lsn(0, 300),
+                active_txn_ids: vec![7],
+            }),
+        );
+        scanner.push(
+            lsn(0, 350),
+            LogEntry::RollbackEnd(RollbackEndRecord {
+                matchpoint_lsn: lsn(0, 150),
+                lsn: lsn(0, 350),
+            }),
+        );
+
+        // Crash state: the checkpoint logged the delete as a KD slot @200.
+        let mut tree = make_tree();
+        tree.insert(b"K".to_vec(), b"value".to_vec(), lsn(0, 100)).unwrap();
+        assert!(tree.mark_deleted(b"K", lsn(0, 200)));
+        let mut mgr = RecoveryManager::new();
+        mgr.recover(&mut scanner, Some(&mut tree), false).unwrap();
+        let f = tree.search_with_data(b"K").expect("slot fetch");
+        assert_eq!(f.data.as_deref(), Some(&b"value"[..]));
+        assert_eq!(tree.slot_lsn_any(b"K"), Some((lsn(0, 100), false)));
     }
 
     /// Committed delete: the redo phase removes a key from the tree.
