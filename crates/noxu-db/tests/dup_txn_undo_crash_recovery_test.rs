@@ -119,7 +119,6 @@ fn assert_dups_recovered(img: &Path, n: u32) {
 /// (e) txn deletes whole keys (both dups each) via `Database::delete_in`,
 /// checkpoint in flight, crash -> every dup restored.
 #[test]
-#[ignore = "A5: dup/secondary delete-all over retained KD slots needs the sorted-dup search KD-skip (integrate f5e310a1 lineage: bbb0ccc0ec/6ea0a5e289/cc5facc649/f5e310a1), deferred from this patch batch; Database::delete_in on a dup key re-finds its own just-KD-marked dup and reports no removal. The scanner fix (this commit) is still required for KD correctness and closes the empty-value and single-dup-cursor cases."]
 fn dup_db_txn_delete_whole_keys_crash_restores_all_dups() {
     let dir = tempfile::tempdir().unwrap();
     let n = 20u32;
@@ -237,7 +236,7 @@ fn sec_count(sec: &SecondaryDatabase) -> u32 {
 /// same txn), checkpoint, crash while the txn is open -> primary AND
 /// secondary both restored.
 #[test]
-#[ignore = "A5: dup/secondary delete-all over retained KD slots needs the sorted-dup search KD-skip (integrate f5e310a1 lineage: bbb0ccc0ec/6ea0a5e289/cc5facc649/f5e310a1), deferred from this patch batch; Database::delete_in on a dup key re-finds its own just-KD-marked dup and reports no removal. The scanner fix (this commit) is still required for KD correctness and closes the empty-value and single-dup-cursor cases."]
+#[ignore = "pre-existing data loss at v7.11.0; needs bde3b613 cleaner IN liveness (batch C2/A6)"]
 fn secondary_txn_delete_crash_restores_primary_and_secondary() {
     let dir = tempfile::tempdir().unwrap();
     let n = 40u32;
