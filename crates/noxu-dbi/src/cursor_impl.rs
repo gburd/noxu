@@ -3568,9 +3568,11 @@ impl CursorImpl {
                         // is >= `key` under the comparator.
                         (0..bin.entries.len())
                             .find(|&i| {
-                                bin.get_full_key(i).is_some_and(|fk| {
-                                    cmp(&fk, key) != std::cmp::Ordering::Less
-                                })
+                                bin.slot_is_live(i)
+                                    && bin.get_full_key(i).is_some_and(|fk| {
+                                        cmp(&fk, key)
+                                            != std::cmp::Ordering::Less
+                                    })
                             })
                             .and_then(|i| {
                                 bin.get_full_key(i).map(|fk| {
@@ -3596,20 +3598,24 @@ impl CursorImpl {
                             // Decide by lex-comparing seed against key_prefix;
                             // never call compress_key (which requires `starts_with`).
                             if key < bin.key_prefix.as_slice() {
-                                // Every key in this BIN is > seed.
-                                bin.entries.first().and_then(|e| {
-                                    bin.get_full_key(0).map(|fk| {
-                                        (
-                                            fk,
-                                            e.data
-                                                .as_ref()
-                                                .map(|d| d.to_vec())
-                                                .unwrap_or_default(),
-                                            bin.get_lsn(0).as_u64(),
-                                            0usize,
-                                        )
+                                // Every key in this BIN is > seed: the first
+                                // LIVE slot.
+                                (0..bin.entries.len())
+                                    .find(|&i| bin.slot_is_live(i))
+                                    .and_then(|i| {
+                                        bin.get_full_key(i).map(|fk| {
+                                            (
+                                                fk,
+                                                bin.entries[i]
+                                                    .data
+                                                    .as_ref()
+                                                    .map(|d| d.to_vec())
+                                                    .unwrap_or_default(),
+                                                bin.get_lsn(i).as_u64(),
+                                                i,
+                                            )
+                                        })
                                     })
-                                })
                             } else {
                                 // Every key in this BIN is < seed; let step 2
                                 // handle it.
@@ -3619,7 +3625,10 @@ impl CursorImpl {
                             // Cheap path: suffix comparison.
                             let suffix = &key[plen..];
                             (0..bin.entries.len())
-                                .find(|&i| bin.get_key(i) >= suffix)
+                                .find(|&i| {
+                                    bin.slot_is_live(i)
+                                        && bin.get_key(i) >= suffix
+                                })
                                 .and_then(|i| {
                                     bin.get_full_key(i).map(|fk| {
                                         (
@@ -3646,18 +3655,28 @@ impl CursorImpl {
             return Some(r);
         }
 
-        // Step 2: chosen BIN had nothing >= key.  By B+tree invariants the
-        // first entry of the next BIN is strictly > key, which satisfies
-        // SearchGte.  No iteration: one call, one answer.
-        // The first entry of the next BIN is at slot index 0.
-        let next = tree.get_next_bin(key)?;
-        let (e, lsn, full_key) = next.into_iter().next()?;
-        Some((
-            full_key,
-            e.data.as_ref().map(|d| d.to_vec()).unwrap_or_default(),
-            lsn.as_u64(),
-            0,
-        ))
+        // Step 2: chosen BIN had no LIVE slot >= key.  By B+tree invariants
+        // every entry of the next BIN is strictly > key, which satisfies
+        // SearchGte: take its first live slot, crossing further BINs while a
+        // BIN holds only known-deleted slots.  JE searchRange lands on the
+        // slot and `lockAndGetCurrent` returns null for a KD slot, so the
+        // caller steps past it (CursorImpl.java:2062-2064); a retained KD
+        // slot of a txnal delete must never be returned as a record.
+        let mut anchor = key.to_vec();
+        loop {
+            let next = tree.get_next_bin(&anchor)?;
+            if let Some((i, (e, lsn, full_key))) =
+                next.iter().enumerate().find(|(_, (e, _, _))| !e.known_deleted)
+            {
+                return Some((
+                    full_key.clone(),
+                    e.data.as_ref().map(|d| d.to_vec()).unwrap_or_default(),
+                    lsn.as_u64(),
+                    i,
+                ));
+            }
+            anchor = next.last()?.2.clone();
+        }
     }
 
     /// Positions the cursor at the first (smallest) record in the database.
