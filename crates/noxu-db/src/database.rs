@@ -1495,7 +1495,13 @@ impl Database {
             ))
         };
 
-        Ok(Cursor::from_impl_with_maint(cursor_impl, read_only, txn, sec_maint))
+        Ok(Cursor::from_impl_with_maint(
+            cursor_impl,
+            read_only,
+            txn,
+            sec_maint,
+            Arc::clone(&self.open),
+        ))
     }
 
     /// Returns a lazy forward iterator over all records in the database.

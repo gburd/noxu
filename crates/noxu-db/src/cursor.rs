@@ -234,6 +234,13 @@ pub struct Cursor<'txn> {
     /// put/delete fans out to every registered secondary through this
     /// (NEW-CURSOR-SEC-MAINT; JE `Cursor.putInternal`/`deleteInternal`).
     sec_maint: Option<CursorSecMaint>,
+    /// The owning `Database`'s shared open flag (`None` only for cursors
+    /// built directly in unit tests).  JE `Cursor.checkOpen` ->
+    /// `dbHandle.checkOpen()` (Cursor.java:5390-5395, Database.java:2367):
+    /// every operation on a cursor whose database (or, since
+    /// `Environment::close` requires every database closed first, whose
+    /// environment) was closed must fail (RO env-lock R1).
+    db_open: Option<Arc<AtomicBool>>,
 }
 
 impl<'txn> Cursor<'txn> {
@@ -251,6 +258,7 @@ impl<'txn> Cursor<'txn> {
             read_only,
             txn: None,
             sec_maint: None,
+            db_open: None,
         }
     }
 
@@ -264,6 +272,7 @@ impl<'txn> Cursor<'txn> {
         read_only: bool,
         txn: Option<&'txn Transaction>,
         sec_maint: Option<CursorSecMaint>,
+        db_open: Arc<AtomicBool>,
     ) -> Self {
         Self {
             inner,
@@ -271,6 +280,7 @@ impl<'txn> Cursor<'txn> {
             read_only,
             txn,
             sec_maint,
+            db_open: Some(db_open),
         }
     }
 
@@ -814,15 +824,28 @@ impl<'txn> Cursor<'txn> {
         self.read_only
     }
 
-    /// Check that the cursor is not closed.
+    /// Check that the cursor and its database are open.
+    ///
+    /// JE `Cursor.checkOpenAndState` (Cursor.java:5381-5395): the
+    /// environment validity check (`checkEnv`) is done by the inner
+    /// `CursorImpl::check_state`; the database handle check is done here.
+    /// A database closed under a retained cursor -- including by
+    /// `Environment::close`, which requires every database closed -- yields
+    /// `DatabaseClosed` (JE IllegalStateException "Database was closed.").
     fn check_open(&self) -> Result<()> {
         if self.state == CursorState::Closed {
-            Err(NoxuError::OperationNotAllowed(
+            return Err(NoxuError::OperationNotAllowed(
                 "Cursor has been closed".to_string(),
-            ))
-        } else {
-            Ok(())
+            ));
         }
+        if self
+            .db_open
+            .as_ref()
+            .is_some_and(|o| !o.load(std::sync::atomic::Ordering::Acquire))
+        {
+            return Err(NoxuError::DatabaseClosed);
+        }
+        Ok(())
     }
 
     /// Check that the cursor is initialized (positioned on a record).

@@ -464,7 +464,7 @@ impl CursorImpl {
         self.current_lsn = lsn;
         self.current_index = idx;
         self.state = CursorState::Initialized;
-        self.rehydrate_current_data();
+        self.rehydrate_current_data()?;
         // Install the already-pinned BIN (pin-next-before-unpin-current).
         self.update_bin_pin_prepinned(pin_guard.into_arc());
         Ok(OperationStatus::Success)
@@ -610,7 +610,10 @@ impl CursorImpl {
     /// Gets the before-image (old_data, old_lsn) for `key` from the tree.
     ///
     /// Returns `(None, NULL_LSN)` if the key does not exist (new insert).
-    fn get_slot_before_image(&self, key: &[u8]) -> (Option<Vec<u8>>, u64) {
+    fn get_slot_before_image(
+        &self,
+        key: &[u8],
+    ) -> Result<(Option<Vec<u8>>, u64), DbiError> {
         let (data, lsn) = {
             let db = self.db_impl.read();
             match db.get_real_tree() {
@@ -634,12 +637,12 @@ impl CursorImpl {
         // 0-byte records that panicked a later read).
         if lsn != noxu_util::NULL_LSN.as_u64()
             && data.as_ref().map(|d| d.is_empty()).unwrap_or(false)
-            && let Some(fetched) = self.fetch_ln_data_from_log(lsn)
+            && let Some(fetched) = self.fetch_ln_data_from_log(lsn)?
             && !fetched.is_empty()
         {
-            return (Some(fetched.to_vec()), lsn);
+            return Ok((Some(fetched.to_vec()), lsn));
         }
-        (data, lsn)
+        Ok((data, lsn))
     }
 
     /// Returns true if `key` exists in the committed tree.
@@ -1160,35 +1163,54 @@ impl CursorImpl {
     /// When a `get` finds such a slot (`data == None`) we must read the LN
     /// back from the log at its `lsn` rather than return empty data. Without
     /// this, a read of an evicted record silently returns no data.
-    fn fetch_ln_data_from_log(&self, lsn: u64) -> Option<Bytes> {
+    ///
+    /// A read refused because the environment's FileManager is closed is an
+    /// error (`EnvironmentNotOpen`), never "no data": a cursor retained past
+    /// `Environment::close` must not report `Success` with an empty value
+    /// (RO env-lock R1).  Other read failures still yield `None`.
+    fn fetch_ln_data_from_log(
+        &self,
+        lsn: u64,
+    ) -> Result<Option<Bytes>, DbiError> {
         use noxu_log::entry::LnLogEntry;
-        let lm = self.log_manager.as_ref()?;
+        let Some(lm) = self.log_manager.as_ref() else {
+            return Ok(None);
+        };
         let lsn = noxu_util::Lsn::from_u64(lsn);
-        let (entry_type, bytes) = lm.read_entry(lsn).ok()?;
+        let (entry_type, bytes) = match lm.read_entry(lsn) {
+            Ok(r) => r,
+            Err(_) if lm.file_manager().is_closed() => {
+                return Err(DbiError::EnvironmentNotOpen);
+            }
+            Err(_) => return Ok(None),
+        };
         if !entry_type.is_ln_type() {
-            return None;
+            return Ok(None);
         }
         let is_txnal = entry_type.is_transactional();
-        let ln = LnLogEntry::parse_from_slice(&bytes, is_txnal).ok()?;
+        let Ok(ln) = LnLogEntry::parse_from_slice(&bytes, is_txnal) else {
+            return Ok(None);
+        };
         // `ln.data` borrows from `bytes` (the log read buffer), so we must
         // copy it into an owned Bytes here — this is the cold evictor-restripe
         // path (LN was stripped from cache), not the resident-slot hot read.
-        ln.data.map(Bytes::copy_from_slice)
+        Ok(ln.data.map(Bytes::copy_from_slice))
     }
 
     /// If `current_data` is empty/None but `current_lsn` is valid, the LN was
     /// stripped by the evictor — re-fetch it from the log (JE
     /// `IN.fetchTarget`). Idempotent; cheap when data is resident.
-    fn rehydrate_current_data(&mut self) {
+    fn rehydrate_current_data(&mut self) -> Result<(), DbiError> {
         let needs =
             self.current_data.as_ref().map(|d| d.is_empty()).unwrap_or(true);
         if needs
             && self.current_lsn != 0
-            && let Some(d) = self.fetch_ln_data_from_log(self.current_lsn)
+            && let Some(d) = self.fetch_ln_data_from_log(self.current_lsn)?
             && !d.is_empty()
         {
             self.current_data = Some(d);
         }
+        Ok(())
     }
 
     fn check_initialized(&self) -> Result<(), DbiError> {
@@ -1339,7 +1361,8 @@ impl CursorImpl {
                     let final_data = match final_data {
                         Some(d) => Some(d),
                         None if slot_lsn != 0 => {
-                            let fetched = self.fetch_ln_data_from_log(slot_lsn);
+                            let fetched =
+                                self.fetch_ln_data_from_log(slot_lsn)?;
                             if let Some(d) = &fetched {
                                 let db = self.db_impl.read();
                                 if let Some(tree) = db.get_real_tree() {
@@ -1423,7 +1446,8 @@ impl CursorImpl {
                     let final_data = match final_data {
                         Some(d) => Some(d),
                         None if slot_lsn != 0 => {
-                            let fetched = self.fetch_ln_data_from_log(slot_lsn);
+                            let fetched =
+                                self.fetch_ln_data_from_log(slot_lsn)?;
                             if let Some(d) = &fetched {
                                 let db = self.db_impl.read();
                                 if let Some(tree) = db.get_real_tree() {
@@ -1495,7 +1519,7 @@ impl CursorImpl {
                             self.current_key = Some(final_key);
                             self.current_data = Some(final_data);
                             self.current_lsn = final_lsn;
-                            self.rehydrate_current_data();
+                            self.rehydrate_current_data()?;
                             self.current_index = slot_idx as i32;
                             self.state = CursorState::Initialized;
                             self.update_bin_pin(bin_arc);
@@ -1593,7 +1617,7 @@ impl CursorImpl {
                     self.current_lsn = final_lsn;
                     // If the slot was stripped by the evictor, re-hydrate from
                     // the log now (get_current is &self and cannot fetch).
-                    self.rehydrate_current_data();
+                    self.rehydrate_current_data()?;
                     // Wave 11-N Bug 2 fix: store the actual BIN index, not
                     // a hard-coded 0.  Pre-fix the cursor reported
                     // current_index = 0 after every dup search, which made
@@ -2614,7 +2638,7 @@ impl CursorImpl {
                 self.current_lsn = lsn;
                 self.current_index = idx;
                 self.state = CursorState::Initialized;
-                self.rehydrate_current_data();
+                self.rehydrate_current_data()?;
                 self.update_bin_pin(Some(bin_arc));
                 Ok(OperationStatus::Success)
             }
@@ -2782,7 +2806,7 @@ impl CursorImpl {
                 self.current_lsn = lsn;
                 self.current_index = idx;
                 self.state = CursorState::Initialized;
-                self.rehydrate_current_data();
+                self.rehydrate_current_data()?;
                 self.update_bin_pin(Some(bin_arc));
                 Ok(OperationStatus::Success)
             }
@@ -3309,7 +3333,7 @@ impl CursorImpl {
             self.current_key = Some(key);
             self.current_data = Some(data);
             self.current_lsn = lsn;
-            self.rehydrate_current_data();
+            self.rehydrate_current_data()?;
             self.current_index = idx;
             return Ok(OperationStatus::Success);
         }
@@ -3484,7 +3508,7 @@ impl CursorImpl {
             self.current_key = Some(raw_key);
             self.current_data = Some(raw_data);
             self.current_lsn = lsn;
-            self.rehydrate_current_data();
+            self.rehydrate_current_data()?;
             self.current_index = idx;
             // Install the already-pinned BIN: `into_arc()` disarms the guard
             // (the pin is NOT released here — it is handed off), and
@@ -3548,7 +3572,7 @@ impl CursorImpl {
         self.current_key = Some(raw_key);
         self.current_data = Some(raw_data);
         self.current_lsn = lsn;
-        self.rehydrate_current_data();
+        self.rehydrate_current_data()?;
         self.current_index = idx;
         self.update_bin_pin(bin_arc);
         Ok(())
@@ -3792,7 +3816,7 @@ impl CursorImpl {
                     .clone()
                     .ok_or(DbiError::CursorNotInitialized)?;
                 let (old_data, old_lsn) =
-                    self.get_slot_before_image(&current_key);
+                    self.get_slot_before_image(&current_key)?;
                 self.lock_write_before_log(old_lsn, &current_key)?;
                 // NEW-REUSESLOT-1 [JE #15704]: capture the STORED slot key
                 // as the abort_key from the slot re-resolved BY KEY under
@@ -3829,7 +3853,7 @@ impl CursorImpl {
                 // a concurrent thread inserted between our
                 // `key_exists_in_view` check above and our
                 // `get_slot_before_image` call here.
-                let (old_data, old_lsn) = self.get_slot_before_image(key);
+                let (old_data, old_lsn) = self.get_slot_before_image(key)?;
                 // T-F2: acquire RangeInsert on the successor key's LSN so
                 // concurrent SERIALIZABLE scanners that have already passed
                 // this key's position are blocked until we commit.  No-op
@@ -3881,7 +3905,7 @@ impl CursorImpl {
                     .into(),
             )),
             PutMode::Overwrite => {
-                let (old_data, old_lsn) = self.get_slot_before_image(key);
+                let (old_data, old_lsn) = self.get_slot_before_image(key)?;
                 // T-F2: acquire RangeInsert if this is a brand-new key
                 // (old_lsn == NULL_LSN).  For existing-key updates the
                 // Write lock on old_lsn already conflicts with RangeRead.
@@ -4179,7 +4203,7 @@ impl CursorImpl {
             None => false,
         };
         let curr_embedded_ln = if old_lsn != noxu_util::NULL_LSN.as_u64() {
-            let (prior_data, _) = self.get_slot_before_image(key);
+            let (prior_data, _) = self.get_slot_before_image(key)?;
             match prior_data {
                 Some(pd) => self.db_impl.read().should_embed_ln(pd.len()),
                 None => false,
@@ -4353,7 +4377,7 @@ impl CursorImpl {
         // stored in the tree.  For non-dup databases it is the plain key.
         // In both cases current_key is the correct tree-delete key.
         if let Some(mut tree_key) = self.current_key.clone() {
-            let (old_data, old_lsn) = self.get_slot_before_image(&tree_key);
+            let (old_data, old_lsn) = self.get_slot_before_image(&tree_key)?;
             self.lock_write_before_log(old_lsn, &tree_key)?;
             // NEW-DEL-RACE-1: revalidate-after-lock (JE
             // `CursorImpl.deleteCurrentRecord`'s post-`lockLN`
@@ -4392,7 +4416,7 @@ impl CursorImpl {
             //     so an LSN==NULL test here would wrongly reject every such
             //     delete — see `test_delete_removes_from_tree`.)
             let record_gone = if old_lsn != noxu_util::NULL_LSN.as_u64() {
-                let (_, current_lsn) = self.get_slot_before_image(&tree_key);
+                let (_, current_lsn) = self.get_slot_before_image(&tree_key)?;
                 current_lsn != old_lsn
             } else {
                 !self.key_exists_in_view(&tree_key)

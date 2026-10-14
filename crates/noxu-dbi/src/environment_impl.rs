@@ -3941,9 +3941,18 @@ impl EnvironmentImpl {
         }
 
         // Flush and fsync the WAL so no buffered data is lost on close.
+        // Then close the FileManager (JE `EnvironmentImpl.close()`, after
+        // `shutdownDaemons()` has joined every daemon: `logManager.flushSync()`
+        // :1919 -> `fileManager.clear()` :1927 -> `fileManager.close()` :1933,
+        // EnvironmentImpl.java).  All daemon threads are joined above, so none
+        // can call into the FileManager after this point.  Closing the
+        // FileManager marks it closed and clears the handle cache so any read
+        // through a cursor retained past `Environment::close` fails rather than
+        // reopening the file and handing back stale data (RO env-lock R1).
         if let Some(lm) = &self.log_manager {
             // Best-effort: ignore flush errors on close (env is shutting down).
             let _ = lm.flush_sync();
+            let _ = lm.file_manager().close();
         }
 
         // Shut down the extended-fork background services.

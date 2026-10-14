@@ -99,6 +99,10 @@ pub struct FileManager {
     /// protecting it from being written past its backed-up length [#22834].
     /// Consumed (reset to false) by the flip decision on the next write.
     force_new_file: AtomicBool,
+    /// True once [`Self::close`] has run (environment closed).  A read
+    /// through a closed FileManager must fail rather than hand back stale
+    /// data (RO env-lock R1).
+    closed: AtomicBool,
     /// Map of file number to last LSN used in that file (for file headers).
     per_file_last_lsn: RwLock<HashMap<u32, Lsn>>,
     /// Latch protecting file creation and file number advancement.
@@ -171,6 +175,7 @@ impl FileManager {
             ),
             last_used_lsn: AtomicU64::new(noxu_util::lsn::NULL_LSN.as_u64()),
             force_new_file: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
             per_file_last_lsn: RwLock::new(HashMap::new()),
             file_latch: ExclusiveLatch::named("file_manager"),
             lock_file: RwLock::new(None),
@@ -418,6 +423,15 @@ impl FileManager {
     /// `Mutex` lock, eliminating any TOCTOU race between a cache miss and the
     /// subsequent insert.
     pub fn get_file_handle(&self, file_num: u32) -> Result<Arc<FileHandle>> {
+        // RO env-lock R1: a read through a closed FileManager must fail
+        // (JE: once the environment is closed, log reads throw).  close()
+        // clears the handle cache, so a post-close read reaches the reopen
+        // path here; reject it instead of silently reopening the file.
+        if self.closed.load(Ordering::Acquire) {
+            return Err(LogError::Internal(
+                "FileManager is closed".to_string(),
+            ));
+        }
         let mut cache = self.file_cache.lock();
 
         // Fast path: cache hit — LruCache::get() promotes the entry to MRU.
@@ -1063,7 +1077,13 @@ impl FileManager {
     }
 
     /// Closes the file manager, releasing all resources.
+    /// True once [`Self::close`] has run (environment closed).
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
     pub fn close(&self) -> Result<()> {
+        self.closed.store(true, Ordering::Release);
         self.clear_cache();
         self.release_env_lock();
         Ok(())
