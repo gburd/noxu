@@ -43,7 +43,40 @@ pub struct PrimaryIndex<K: PrimaryKey, E: Entity<PrimaryKey = K>> {
     /// `delete` performed here.  Owning (rather than borrowing) the `Arc`
     /// keeps the index independent of the `EntityStore`'s borrow, so a
     /// secondary can be opened while the primary index is alive.
+    ///
+    /// This handle is used ONLY for cheap, non-blocking metadata access and
+    /// for `EntityStore::open_secondary_index` to associate a secondary
+    /// against the same `DatabaseImpl`.  The record read/write hot path goes
+    /// through [`Self::op`] (a lock-free `Database` handle) instead.
     db: Arc<Mutex<Database>>,
+    /// A lock-free `Database` handle for the record read/write hot path
+    /// (`get` / `put` / `delete` / `contains` / `count` / cursor opens).
+    ///
+    /// BUG-PERSIST-RANGELAST-HANG (same class as BUG-SEC-MUTEX-DEADLOCK): the
+    /// hot-path methods USED to hold the `Mutex<Database>` guard across the
+    /// entire blocking `Database::{get,put,delete}` call (which descends into
+    /// `Tree::insert`, the log buffer, and -- on commit -- `Txn::commit ->
+    /// cleaner::count_obsolete`).  A concurrent reader (e.g. a `count` /
+    /// cursor scan, or `range_last` on later revisions) could then never
+    /// acquire that same `Mutex`: its `self.db.lock()` blocked forever in
+    /// `futex_wait` while the writer spun through the tree/commit path still
+    /// holding the guard.  That `Mutex` <-> record/latch cycle is invisible to
+    /// the txn deadlock detector (the handle `Mutex` is not a txn lock), so it
+    /// hangs with no per-op timeout.
+    ///
+    /// The fix mirrors JE and secabba's `Database::handle_clone`: `Database`
+    /// is itself `Send + Sync` with internally-synchronised `&self` methods,
+    /// so the DPL layer must NOT serialise its ops behind a handle monitor --
+    /// JE's `PrimaryIndex` calls `db.get/put/delete` directly on the
+    /// `Database` field with no `synchronized` wrapper (the only
+    /// `synchronized` method is the lazy `sortedMap()` cache,
+    /// PrimaryIndex.java:726).  This handle is a lock-free clone of `db`
+    /// (`Database::handle_clone`) sharing the SAME `DatabaseImpl` (and
+    /// registered-secondaries list), so writes through it still fan out to
+    /// every secondary.  Taken once at construction so there is no per-op
+    /// clone / ref-count churn, exactly like secabba's
+    /// `SecondaryHookState.primary_handle`.
+    op_handle: Arc<Database>,
     /// Schema-evolution mutations.
     ///
     /// Plumbed in from `EntityStore` via [`PrimaryIndex::with_mutations`].
@@ -78,7 +111,49 @@ where
         db: Arc<Mutex<Database>>,
         mutations: Arc<Mutations>,
     ) -> Self {
-        Self { db, mutations, _phantom: PhantomData }
+        // BUG-PERSIST-RANGELAST-HANG: take a lock-free `Database` handle for
+        // the hot path NOW, so no record op ever holds the `Mutex<Database>`
+        // guard across a blocking tree/commit descent (mirrors JE's direct
+        // `db.get/put/delete` and secabba's `Database::handle_clone`).  Scoped
+        // so the `db.lock()` guard is released immediately after the clone.
+        //
+        // This path (used by `PrimaryIndex::new` and unit tests) owns its own
+        // `op_handle`; the `EntityStore` path uses `with_op_handle` so the
+        // store can close the single shared handle at store-close time (temp
+        // databases are removed only when the last handle closes, so the
+        // store must not leave this handle open past `EntityStore::close`).
+        let op_handle = Arc::new(db.lock().handle_clone());
+        Self { db, op_handle, mutations, _phantom: PhantomData }
+    }
+
+    /// Creates a `PrimaryIndex` over `db`, using the caller-supplied
+    /// lock-free `op_handle` for the record hot path.
+    ///
+    /// BUG-PERSIST-RANGELAST-HANG: the `EntityStore` owns one lock-free
+    /// `Database` handle per primary and hands a clone of its `Arc` here, so
+    /// `EntityStore::close` can close that single handle (dropping the
+    /// `DatabaseImpl` reference) BEFORE it removes a temporary database -- JE
+    /// / Noxu remove a temporary DB only when its last open handle closes
+    /// (`DatabaseImpl.handleClosed`; `remove_database` rejects an in-use DB).
+    /// `op_handle` must be a `handle_clone` of `db` (same `DatabaseImpl`).
+    pub(crate) fn with_op_handle(
+        db: Arc<Mutex<Database>>,
+        op_handle: Arc<Database>,
+        mutations: Arc<Mutations>,
+    ) -> Self {
+        Self { db, op_handle, mutations, _phantom: PhantomData }
+    }
+
+    /// The lock-free `Database` handle for the record read/write hot path.
+    ///
+    /// All of `get` / `put` / `delete` / `contains` / `count` / cursor opens
+    /// go through this instead of `self.db.lock()`, so no DPL record op holds
+    /// the `Mutex<Database>` handle guard across a blocking `Database` call
+    /// (BUG-PERSIST-RANGELAST-HANG).  Shares the same `DatabaseImpl` as
+    /// `self.db`, so secondary-index fan-out on `put` / `delete` still fires.
+    #[inline]
+    fn op(&self) -> &Database {
+        &self.op_handle
     }
 
     /// Returns a clone of the registered mutations Arc.
@@ -121,7 +196,7 @@ where
         key: &K,
     ) -> Result<Option<E>> {
         let key_bytes = key.to_bytes();
-        let db = self.db.lock();
+        let db = self.op();
         let found = match txn {
             Some(t) => db.get_in(t, &key_bytes)?,
             None => db.get(&key_bytes)?,
@@ -209,7 +284,7 @@ where
 
         // The Database::put fan-out drives every registered SecondaryDatabase
         // under the same `txn`, so secondaries are atomic with the primary.
-        let db = self.db.lock();
+        let db = self.op();
         match txn {
             Some(t) => db.put_in(t, &key_bytes, &envelope_bytes)?,
             None => db.put(&key_bytes, &envelope_bytes)?,
@@ -239,7 +314,7 @@ where
         let envelope_bytes =
             envelope::encode(E::class_version(), E::entity_name(), &payload)?;
 
-        let db = self.db.lock();
+        let db = self.op();
         let inserted = match txn {
             Some(t) => {
                 db.put_no_overwrite_in(t, &key_bytes, &envelope_bytes)?
@@ -269,7 +344,7 @@ where
     /// Returns an error if the database operation fails.
     pub fn delete(&self, txn: Option<&Transaction>, key: &K) -> Result<bool> {
         let key_bytes = key.to_bytes();
-        let db = self.db.lock();
+        let db = self.op();
         let deleted = match txn {
             Some(t) => db.delete_in(t, &key_bytes)?,
             None => db.delete(&key_bytes)?,
@@ -313,7 +388,7 @@ where
     /// Returns an error if the database operation fails.
     pub fn contains(&self, txn: Option<&Transaction>, key: &K) -> Result<bool> {
         let key_bytes = key.to_bytes();
-        let db = self.db.lock();
+        let db = self.op();
         let found = match txn {
             Some(t) => db.get_in(t, &key_bytes)?,
             None => db.get(&key_bytes)?,
@@ -328,7 +403,7 @@ where
     /// # Errors
     /// Returns an error if the database operation fails.
     pub fn count(&self) -> Result<u64> {
-        Ok(self.db.lock().count()?)
+        Ok(self.op().count()?)
     }
 
     // -----------------------------------------------------------------------
@@ -348,7 +423,7 @@ where
         serializer: &'a S,
     ) -> Result<EntityIterator<'a, K, E, S>> {
         let cursor = {
-            let db = self.db.lock();
+            let db = self.op();
             match txn {
                 Some(t) => db.open_cursor_in(t, None)?,
                 None => db.open_cursor(None)?,
@@ -376,7 +451,7 @@ where
         txn: Option<&'a Transaction>,
     ) -> Result<KeyIterator<'a, K>> {
         let cursor = {
-            let db = self.db.lock();
+            let db = self.op();
             match txn {
                 Some(t) => db.open_cursor_in(t, None)?,
                 None => db.open_cursor(None)?,

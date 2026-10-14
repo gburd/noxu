@@ -176,10 +176,11 @@ impl<'a> SecondaryCursor<'a> {
         // by a delete in the same txn) and so cross-txn isolation is
         // honoured.
         let mut pri_data = DatabaseEntry::new();
-        let pri_found = {
-            let primary = self.secondary_db.primary_db().lock();
-            primary.get_into(self.txn, &pri_key, &mut pri_data)?
-        };
+        let pri_found = self.secondary_db.primary_handle().get_into(
+            self.txn,
+            &pri_key,
+            &mut pri_data,
+        )?;
 
         if pri_found {
             // primary.delete() auto-maintains secondary entries via the hook.
@@ -187,12 +188,11 @@ impl<'a> SecondaryCursor<'a> {
         }
 
         // Delete the primary; the auto-hook removes all secondary entries.
-        let deleted = {
-            let primary = self.secondary_db.primary_db().lock();
-            match self.txn {
-                Some(t) => primary.delete_in(t, &pri_key)?,
-                None => primary.delete(&pri_key)?,
-            }
+        // Lock-free primary handle (BUG-SEC-MUTEX-DEADLOCK).
+        let primary = self.secondary_db.primary_handle();
+        let deleted = match self.txn {
+            Some(t) => primary.delete_in(t, &pri_key)?,
+            None => primary.delete(&pri_key)?,
         };
 
         Ok(if deleted {
@@ -335,8 +335,13 @@ impl<'a> SecondaryCursor<'a> {
         // observes the caller's uncommitted writes and honours cross-txn
         // isolation (Wave 1B).
         let pri_key_entry = DatabaseEntry::from_bytes(&pri_key_bytes);
-        let primary = self.secondary_db.primary_db().lock();
-        let pri_found = primary.get_into(self.txn, &pri_key_entry, data)?;
+        // Lock-free primary handle (BUG-SEC-MUTEX-DEADLOCK): never hold the
+        // primary handle Mutex while blocking on the primary record lock.
+        let pri_found = self.secondary_db.primary_handle().get_into(
+            self.txn,
+            &pri_key_entry,
+            data,
+        )?;
         if !pri_found {
             // D8: if running in dirty-read (read-uncommitted) mode, skip
             // the record rather than raising SecondaryIntegrityException.
@@ -385,8 +390,13 @@ impl<'a> SecondaryCursor<'a> {
         p_key.set_data(&pri_key_bytes);
 
         let pri_key_entry = DatabaseEntry::from_bytes(&pri_key_bytes);
-        let primary = self.secondary_db.primary_db().lock();
-        let pri_found = primary.get_into(self.txn, &pri_key_entry, data)?;
+        // Lock-free primary handle (BUG-SEC-MUTEX-DEADLOCK): never hold the
+        // primary handle Mutex while blocking on the primary record lock.
+        let pri_found = self.secondary_db.primary_handle().get_into(
+            self.txn,
+            &pri_key_entry,
+            data,
+        )?;
         if !pri_found {
             // D8: dirty-read skip (see get_search_key site for full comment).
             if self.read_uncommitted {
@@ -591,8 +601,13 @@ impl<'a> SecondaryCursor<'a> {
         // Step 3: look up the primary record under the cursor's txn so
         // the lookup honours the caller's transaction (Wave 1B).
         let pri_key_entry = DatabaseEntry::from_bytes(&pri_key_bytes);
-        let primary = self.secondary_db.primary_db().lock();
-        let pri_found = primary.get_into(self.txn, &pri_key_entry, data)?;
+        // Lock-free primary handle (BUG-SEC-MUTEX-DEADLOCK): never hold the
+        // primary handle Mutex while blocking on the primary record lock.
+        let pri_found = self.secondary_db.primary_handle().get_into(
+            self.txn,
+            &pri_key_entry,
+            data,
+        )?;
 
         if !pri_found {
             // D8: dirty-read (read-uncommitted) mode — skip the record

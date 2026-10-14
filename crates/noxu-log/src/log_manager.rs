@@ -1404,46 +1404,52 @@ impl LogManager {
             // ------------------------------------------------------------------
             // Hot path: check whether the entry is still in a write buffer.
             // ------------------------------------------------------------------
-            let mut pool = self.buffer_pool.lock();
-            if let Some(buf_arc) = pool.get_read_buffer_by_lsn(lsn)? {
-                let buf = buf_arc.lock();
-                // get_bytes returns a slice starting at lsn.file_offset()
-                let slice = buf.get_bytes(lsn.file_offset());
+            // BUG-LOGBUF-LATCH-1: copy the raw bytes out INSIDE
+            // get_read_buffer_bytes_by_lsn (under the buffer's outer mutex +
+            // read_latch, acquired and released in one consistently-ordered
+            // frame), then DROP the pool lock BEFORE parsing.  Previously this
+            // block held the pool lock across a re-acquisition of the buffer
+            // outer mutex WHILE the read_latch was already held (contains_lsn
+            // left it latched) -- the read_latch-then-outer-mutex inversion
+            // that ABBA-wedged the WAL flusher (fill_flush_pending holds the
+            // outer mutex then waits for the read_latch via
+            // wait_for_zero_and_latch).  JE copies out under the single
+            // readLatch with the pool latch already released
+            // (LogManager.getLogSource / getLogEntryFromLogSource).
+            let slice_opt = {
+                let mut pool = self.buffer_pool.lock();
+                let bytes = pool.get_read_buffer_bytes_by_lsn(lsn)?;
+                drop(pool); // release the pool lock BEFORE parsing (JE order)
+                bytes
+            };
+            if let Some(slice) = slice_opt
+                && slice.len() >= MIN_HEADER_SIZE
+            {
+                // Parse enough to know the total entry size.
+                let item_size = u32::from_le_bytes([
+                    slice[10], slice[11], slice[12], slice[13],
+                ]) as usize;
+                let flags = slice[5];
+                let vlsn_present = (flags & 0x08) != 0 || (flags & 0x20) != 0; // VLSN_PRESENT | REPLICATED
+                let header_size = if vlsn_present {
+                    MAX_HEADER_SIZE
+                } else {
+                    MIN_HEADER_SIZE
+                };
+                let entry_size = header_size + item_size;
 
-                if slice.len() >= MIN_HEADER_SIZE {
-                    // Parse enough to know the total entry size.
-                    let item_size = u32::from_le_bytes([
-                        slice[10], slice[11], slice[12], slice[13],
-                    ]) as usize;
-                    let flags = slice[5];
-                    let vlsn_present =
-                        (flags & 0x08) != 0 || (flags & 0x20) != 0; // VLSN_PRESENT | REPLICATED
-                    let header_size = if vlsn_present {
-                        MAX_HEADER_SIZE
-                    } else {
-                        MIN_HEADER_SIZE
-                    };
-                    let entry_size = header_size + item_size;
-
-                    if slice.len() >= entry_size {
-                        let entry_type_num = slice[4];
-                        let payload = slice[header_size..entry_size].to_vec();
-                        buf.release();
-                        drop(buf);
-
-                        let entry_type =
-                            LogEntryType::from_type_num(entry_type_num).ok_or(
-                                NoxuLogError::InvalidEntryType {
-                                    type_num: entry_type_num,
-                                    lsn,
-                                },
-                            )?;
-                        return Ok((entry_type, payload));
-                    }
+                if slice.len() >= entry_size {
+                    let entry_type_num = slice[4];
+                    let payload = slice[header_size..entry_size].to_vec();
+                    let entry_type =
+                        LogEntryType::from_type_num(entry_type_num).ok_or(
+                            NoxuLogError::InvalidEntryType {
+                                type_num: entry_type_num,
+                                lsn,
+                            },
+                        )?;
+                    return Ok((entry_type, payload));
                 }
-
-                buf.release();
-                drop(buf);
             }
         }
 
@@ -1744,6 +1750,178 @@ mod tests {
 
         assert!(lm.flush_no_sync().is_ok());
         assert!(lm.flush_sync().is_ok());
+    }
+
+    /// BUG-LOGBUF-LATCH-1: the WAL flush path and the in-buffer LN re-read
+    /// path must not deadlock.  Before the fix, `read_entry` copied out while
+    /// holding the pool lock AND re-acquired the buffer's outer mutex WHILE
+    /// `contains_lsn` already held the buffer's `read_latch` (read_latch ->
+    /// outer-mutex), the reverse of the flusher's `fill_flush_pending`
+    /// (outer-mutex -> read_latch via `wait_for_zero_and_latch`).  That ABBA
+    /// hung EvictActionTest.testThreadedCacheSizeChanges on an unlucky run.
+    ///
+    /// This hammers both paths concurrently on the SAME in-buffer LSNs and
+    /// fails (via a watchdog) if they wedge.  JE LogBuffer.java:37-54 +
+    /// LogBufferPool.getReadBufferByLsn.
+    #[test]
+    fn logbuf_flush_vs_read_no_deadlock() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::time::{Duration, Instant};
+
+        // Serialise against the process-global faultdisk tests: this test does
+        // heavy concurrent writes that would route through faultdisk's active
+        // on_write (misdirecting a concurrent fault test's aim).  FAULT_LOCK
+        // keeps it from overlapping any faultdisk test.
+        let _fault_lock = FAULT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let dir = TempDir::new().unwrap();
+        let fm = Arc::new(
+            FileManager::new(dir.path(), false, 10_000_000, 100).unwrap(),
+        );
+        let lm = Arc::new(LogManager::new(fm, 3, 4 * 1024 * 1024, 1024 * 1024));
+
+        let mut lsns = Vec::new();
+        for i in 0..64u8 {
+            let lsn = lm
+                .log(
+                    LogEntryType::Trace,
+                    &[i; 32],
+                    Provisional::No,
+                    false,
+                    false,
+                )
+                .unwrap();
+            lsns.push((lsn, i));
+        }
+        let lsns = Arc::new(lsns);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let reads = Arc::new(AtomicU64::new(0));
+        let flushes = Arc::new(AtomicU64::new(0));
+        let corrupt = Arc::new(AtomicU64::new(0));
+        let mut handles = Vec::new();
+
+        for _ in 0..2 {
+            let lm = Arc::clone(&lm);
+            let stop = Arc::clone(&stop);
+            let flushes = Arc::clone(&flushes);
+            handles.push(std::thread::spawn(move || {
+                let mut j = 0u8;
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = lm.log(
+                        LogEntryType::Trace,
+                        &[j; 48],
+                        Provisional::No,
+                        false,
+                        false,
+                    );
+                    let _ = lm.flush_sync();
+                    flushes.fetch_add(1, Ordering::Relaxed);
+                    j = j.wrapping_add(1);
+                }
+            }));
+        }
+        for _ in 0..4 {
+            let lm = Arc::clone(&lm);
+            let stop = Arc::clone(&stop);
+            let reads = Arc::clone(&reads);
+            let corrupt = Arc::clone(&corrupt);
+            let lsns = Arc::clone(&lsns);
+            handles.push(std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    for &(lsn, want) in lsns.iter() {
+                        // These LSNs are seeded (immutable) entries; read_entry
+                        // must return their exact payload whether the entry is
+                        // served from a buffer or disk.  A wrong payload is a
+                        // copy-out correctness bug (BUG-LOGBUF-LATCH-1 fix must
+                        // not corrupt reads under concurrent flush).
+                        if let Ok((_, got)) = lm.read_entry(lsn)
+                            && (got.len() != 32
+                                || got.iter().any(|&b| b != want))
+                        {
+                            corrupt.fetch_add(1, Ordering::Relaxed);
+                        }
+                        reads.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }));
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut last = (0u64, 0u64);
+        let mut stalls = 0;
+        loop {
+            std::thread::sleep(Duration::from_millis(500));
+            let now = (
+                reads.load(Ordering::Relaxed),
+                flushes.load(Ordering::Relaxed),
+            );
+            if now == last {
+                stalls += 1;
+            } else {
+                stalls = 0;
+            }
+            last = now;
+            assert!(
+                stalls < 4,
+                "BUG-LOGBUF-LATCH-1: flush/read progress stalled (reads={}, \
+                 flushes={}) -- LogBuffer latch-order deadlock",
+                now.0,
+                now.1
+            );
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert!(reads.load(Ordering::Relaxed) > 0);
+        assert!(flushes.load(Ordering::Relaxed) > 0);
+        assert_eq!(
+            corrupt.load(Ordering::Relaxed),
+            0,
+            "read_entry returned a corrupt payload for a seeded immutable LSN \
+             under concurrent flush (BUG-LOGBUF-LATCH-1 copy-out race)"
+        );
+    }
+
+    /// BUG-LOGBUF-LATCH-1 correctness guard: read_entry of an in-buffer LSN
+    /// must return the byte-identical payload that was logged.  Guards the
+    /// get_read_buffer_bytes_by_lsn copy-out against a wrong-buffer /
+    /// off-by-one / wrong-length regression.
+    #[test]
+    fn logbuf_read_entry_matches_logged_bytes() {
+        let _fault_lock = FAULT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = TempDir::new().unwrap();
+        let fm = Arc::new(
+            FileManager::new(dir.path(), false, 10_000_000, 100).unwrap(),
+        );
+        let lm = Arc::new(LogManager::new(fm, 3, 4 * 1024 * 1024, 1024 * 1024));
+        let mut expected = Vec::new();
+        for i in 0..200u32 {
+            let payload: Vec<u8> =
+                (0..37u8).map(|b| b.wrapping_add(i as u8)).collect();
+            let lsn = lm
+                .log(
+                    LogEntryType::Trace,
+                    &payload,
+                    Provisional::No,
+                    false,
+                    false,
+                )
+                .unwrap();
+            expected.push((lsn, payload));
+        }
+        for (lsn, payload) in &expected {
+            let (kind, got) = lm.read_entry(*lsn).unwrap();
+            assert_eq!(kind, LogEntryType::Trace, "entry type at {lsn:?}");
+            assert_eq!(
+                &got, payload,
+                "read_entry returned wrong payload for in-buffer {lsn:?}"
+            );
+        }
     }
 
     #[test]

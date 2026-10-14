@@ -527,6 +527,68 @@ impl Database {
         }
     }
 
+    /// Clones this handle into an additional, independent `Database` handle
+    /// onto the SAME underlying `DatabaseImpl`.
+    ///
+    /// This mirrors JE handing out a `Database` object reference (JE
+    /// `SecondaryDatabase.getPrimary` returns the primary `Database` handle;
+    /// `SecondaryCursor.readPrimaryAfterGet` then reads the primary through
+    /// that handle WITHOUT holding any monitor over the SecondaryDatabase --
+    /// SecondaryCursor.java:1717-1748).  Every field is an `Arc` / `Copy` /
+    /// cheap owned value, so this is a cheap handle clone, not a deep copy.
+    ///
+    /// The new handle participates in the shared open-handle reference count
+    /// (`DatabaseImpl.increment_reference_count`), balanced by this handle's
+    /// `Drop` -> `close()` -> `close_database` -> `decrement_reference_count`,
+    /// so the DatabaseImpl is torn down only when the LAST handle closes.
+    ///
+    /// BUG-SEC-MUTEX-DEADLOCK: used so the secondary read/maintenance path can
+    /// read/modify the primary record WITHOUT holding the `Mutex<Database>`
+    /// handle guard across the blocking record-lock acquisition.  Holding that
+    /// guard across the wait created a `Mutex` <-> record-lock cycle invisible
+    /// to the txn deadlock detector (the `Mutex` is not a txn lock), hanging a
+    /// secondary reader + a concurrent writer for the full lock timeout.
+    ///
+    /// NOTE (v7.11.1 backport, patch-safe API): `noxu-db` is a stable-tier
+    /// crate, so this is `#[doc(hidden)] pub` rather than part of the
+    /// documented public surface -- it is internal plumbing that the sibling
+    /// crate `noxu-persist` (A8, BUG-PERSIST-RANGELAST-HANG) must also reach,
+    /// which `pub(crate)` would not allow.  Hidden from docs; not a committed
+    /// public API.
+    #[doc(hidden)]
+    pub fn handle_clone(&self) -> Database {
+        self.db_impl.read().increment_reference_count();
+        // OWN open flag (seeded from the current state), NOT the shared one:
+        // a shared flag would let the clone's Drop -> close() flip the user's
+        // STILL-OPEN primary handle closed (both would share the Arc).  The
+        // clone is an independent handle: its own open flag means its
+        // close/drop only decrements the shared DatabaseImpl reference count,
+        // leaving the user's handle open.
+        let own_open =
+            Arc::new(AtomicBool::new(self.open.load(Ordering::Acquire)));
+        Database {
+            name: self.name.clone(),
+            id: self.id,
+            config: self.config.clone(),
+            db_impl: Arc::clone(&self.db_impl),
+            env_impl: Arc::clone(&self.env_impl),
+            open: own_open,
+            throughput: Arc::clone(&self.throughput),
+            lock_manager: Arc::clone(&self.lock_manager),
+            log_manager: self.log_manager.clone(),
+            disk_limit: self.disk_limit.clone(),
+            env_invalid: Arc::clone(&self.env_invalid),
+            cleaner_throttle: self.cleaner_throttle.clone(),
+            file_protector: self.file_protector.clone(),
+            txn_manager: Arc::clone(&self.txn_manager),
+            evictor: Arc::clone(&self.evictor),
+            no_sync: self.no_sync,
+            write_no_sync: self.write_no_sync,
+            secondaries: Arc::clone(&self.secondaries),
+            fk_referrers: Arc::clone(&self.fk_referrers),
+        }
+    }
+
     /// Retrieves a record by key, auto-committing the read.
     ///
     /// Idiomatic Rust lookup: `Some(value)` if found, `None` if the key
@@ -3282,5 +3344,65 @@ mod tests {
             db.count(),
             Err(NoxuError::EnvironmentFailure { .. })
         ));
+    }
+
+    /// `handle_clone` returns an independent `Database` handle onto the SAME
+    /// `DatabaseImpl`: it shares storage (writes through one are visible via
+    /// the other), is txn-aware (an explicit txn on the clone commits/aborts
+    /// atomically), bumps the shared open-handle reference count, and closing
+    /// the clone does NOT tear down the DatabaseImpl while the original is
+    /// still open.  (A7 / BUG-SEC-MUTEX-DEADLOCK: the secondary read path uses
+    /// this lock-free clone so it never holds the handle Mutex across a
+    /// blocking record-lock wait.)
+    #[test]
+    fn handle_clone_shares_the_same_database_impl_and_refcounts() {
+        let (_tmp, env, db) = temp_env_and_db();
+
+        let before = db.db_impl.read().reference_count();
+        let clone = db.handle_clone();
+        // Same underlying DatabaseImpl (Arc shared, not a deep copy).
+        assert!(
+            Arc::ptr_eq(&db.db_impl, &clone.db_impl),
+            "handle_clone must share the same DatabaseImpl Arc"
+        );
+        assert_eq!(db.id, clone.id);
+        assert_eq!(db.name(), clone.name());
+        // Open-handle refcount incremented by the clone.
+        assert_eq!(
+            clone.db_impl.read().reference_count(),
+            before + 1,
+            "handle_clone must increment the shared open-handle reference count"
+        );
+
+        // Storage is shared: a write through the original is visible via the
+        // clone, and vice versa.
+        db.put(b"ka", b"va").unwrap();
+        assert_eq!(clone.get(b"ka").unwrap().as_deref(), Some(&b"va"[..]));
+        clone.put(b"kb", b"vb").unwrap();
+        assert_eq!(db.get(b"kb").unwrap().as_deref(), Some(&b"vb"[..]));
+
+        // Txn-aware through the clone: an aborted txn on the clone leaves no
+        // trace visible through the original (same lock manager + txn manager).
+        let txn = env.begin_transaction(None).unwrap();
+        clone.put_in(&txn, b"kc", b"vc").unwrap();
+        txn.abort().unwrap();
+        assert!(
+            db.get(b"kc").unwrap().is_none(),
+            "aborted clone write must not persist"
+        );
+
+        // Closing the clone must NOT tear the DatabaseImpl down while `db` is
+        // still open: the original keeps working and the refcount drops by one.
+        clone.close().unwrap();
+        assert_eq!(
+            db.db_impl.read().reference_count(),
+            before,
+            "closing the clone must decrement the shared reference count"
+        );
+        assert_eq!(
+            db.get(b"ka").unwrap().as_deref(),
+            Some(&b"va"[..]),
+            "the original handle must stay usable after the clone closes"
+        );
     }
 }
