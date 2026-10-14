@@ -1317,7 +1317,19 @@ impl RecoveryManager {
 
         // Fast path: no uncommitted transactions AND no rollback work → skip
         // the entire backward scan.
-        if !analysis.has_active_txns() && rollback_chains.is_empty() {
+        // BUG-EVICT-REFAULT-DATALOSS companion / JE undoLNs
+        // (RecoveryManager.java:1596-1619) undoes every LN whose txn is neither
+        // committed nor prepared -- ABORTED txns included.  An in-memory abort
+        // restores the slot, but a checkpoint taken BEFORE the abort may have
+        // logged the BIN with the aborted/uncommitted version; only undo (gated
+        // by logLsn == slotLsn) puts the before-image back.  Skip the scan only
+        // when NO txn in the interval failed to commit, or a checkpointed
+        // uncommitted/aborted BIN image stays visible after recovery (the
+        // SIGKILL-mid-txn case A28 exposes via the cleaner forced full re-log).
+        if !analysis.has_active_txns()
+            && analysis.aborted_count() == 0
+            && rollback_chains.is_empty()
+        {
             return Ok(());
         }
         let stop = if first_active == NULL_LSN {
@@ -2567,7 +2579,10 @@ impl RecoveryManager {
             );
         }
 
-        if !analysis.has_active_txns() && rollback_chains.is_empty() {
+        if !analysis.has_active_txns()
+            && analysis.aborted_count() == 0
+            && rollback_chains.is_empty()
+        {
             return Ok(());
         }
 
