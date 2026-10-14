@@ -198,6 +198,21 @@ pub struct CursorImpl {
     /// successful advance sets `current_key`).
     last_deleted_key: Option<Vec<u8>>,
 
+    /// Per-operation READ_UNCOMMITTED override (BUG-PHANTOM-1b).
+    ///
+    /// JE passes the caller's `LockMode` into every positioning method and
+    /// `getLockType` returns `LockType.NONE` whenever the mode is
+    /// READ_UNCOMMITTED / READ_UNCOMMITTED_ALL, *regardless of the txn's
+    /// isolation* (`Cursor.getLockType`, Cursor.java:5277;
+    /// `isReadUncommittedMode`, :5293-5300).  So a per-op
+    /// `LockMode.READ_UNCOMMITTED` on a serializable txn's read suppresses the
+    /// range lock entirely (no phantom protection for that read).  Noxu plumbs
+    /// this as a transient flag set by the public `Cursor::get` before the
+    /// inner op and consulted by `lock_ln` / `lock_eof_for_scan`.  Reset to
+    /// `false` before every op that is not explicitly read-uncommitted (JE
+    /// re-derives it per call).
+    op_read_uncommitted: bool,
+
     /// The BIN Arc the cursor is currently pinned to, if any.
     ///
     /// Increments `BinStub.cursor_count` via `Tree::pin_bin()` so the
@@ -447,7 +462,10 @@ impl CursorImpl {
 
         // `lock_ln` may Err (deadlock / RangeRestart); the guard drops and
         // releases the descent pin so the evictor is not wedged.
-        self.lock_ln(lsn)?;
+        // BUG-PHANTOM-1: getFirst (forward) range-locks the edge slot
+        // (advance = RANGE_READ); getLast (reverse) takes the plain READ
+        // anchor lock, its EOF already range-locked by get_last.
+        self.lock_ln_mode(lsn, forward)?;
         // READ_COMMITTED revalidation (C1/V1): re-derive from the pinned slot
         // if its LSN moved during the prefetch->lock window.  The BIN is
         // pinned, so the evictor cannot have detached/re-faulted it under us.
@@ -492,6 +510,7 @@ impl CursorImpl {
             current_lsn: noxu_util::NULL_LSN.as_u64(),
             current_index: -1,
             last_deleted_key: None,
+            op_read_uncommitted: false,
             current_bin_arc: None,
             log_manager: None,
             env_invalid: None,
@@ -524,6 +543,7 @@ impl CursorImpl {
             current_lsn: noxu_util::NULL_LSN.as_u64(),
             current_index: -1,
             last_deleted_key: None,
+            op_read_uncommitted: false,
             current_bin_arc: None,
             log_manager: Some(log_manager),
             env_invalid: None,
@@ -1037,6 +1057,19 @@ impl CursorImpl {
         self.state == CursorState::Initialized
     }
 
+    /// Sets the per-operation READ_UNCOMMITTED override (BUG-PHANTOM-1b).
+    ///
+    /// The public `Cursor::get` calls this before each read op with `true`
+    /// when the caller passed `LockMode::ReadUncommitted` /
+    /// `ReadUncommittedAll`, and `false` otherwise.  JE derives the same per
+    /// call from the `LockMode` argument to each positioning method
+    /// (`Cursor.getLockType` / `isReadUncommittedMode`, Cursor.java:5273-5300):
+    /// a per-op READ_UNCOMMITTED suppresses the serializable txn's range lock,
+    /// so the read takes `LockType.NONE` and provides no phantom protection.
+    pub fn set_op_read_uncommitted(&mut self, v: bool) {
+        self.op_read_uncommitted = v;
+    }
+
     /// Returns true if the cursor is closed.
     pub fn is_closed(&self) -> bool {
         self.state == CursorState::Closed
@@ -1316,7 +1349,12 @@ impl CursorImpl {
                     // the LSN is unchanged.  (X-10 regression: this window let
                     // a READ_COMMITTED secondary cursor observe an aborting
                     // writer's uncommitted primary data.)
-                    let contended = self.lock_ln(slot_lsn)?;
+                    // BUG-PHANTOM-1: an exact SET/BOTH match is the search
+                    // ANCHOR; JE locks it with searchLockType = READ (not a
+                    // range lock) and does not advance, so an insert outside
+                    // the matched key is not blocked (Cursor.java:4031,
+                    // 4426-4435 exactKeyMatch branch).
+                    let contended = self.lock_ln_mode(slot_lsn, false)?;
                     // X-10: if the slot's LSN moved (or our lock had to wait),
                     // the pre-fetched bytes may be a concurrent writer's
                     // UNCOMMITTED in-place mutation.  Re-read under a lock on
@@ -1394,6 +1432,12 @@ impl CursorImpl {
                     // missing slot to detect uncommitted deletes.  See
                     // `lock_synthetic_key_for_delete`.
                     self.contest_synthetic_key_for_missing_read(key)?;
+                    // BUG-PHANTOM-2: a serializable exact SET/BOTH search that
+                    // misses still advances to the next key and RANGE_READs it
+                    // (or the EOF sentinel), so an insert of the missed key is
+                    // blocked (JE searchRangeSerializable checkForExactKey,
+                    // Cursor.java:4438-4452 + lockEof :4506-4511).
+                    self.lock_next_key_or_eof_for_missed_search(key)?;
                     Ok(OperationStatus::NotFound)
                 }
             }
@@ -1404,7 +1448,13 @@ impl CursorImpl {
                     let slot_lsn = slot.lsn;
                     let slot_index = slot.slot_index;
                     let bin_arc = slot.bin_arc;
-                    let contended = self.lock_ln(slot_lsn)?;
+                    // BUG-PHANTOM-1: a range search whose key EXACTLY matches a
+                    // slot is the search ANCHOR (JE searchRangeSerializable
+                    // exactKeyMatch -> searchLockType = READ,
+                    // Cursor.java:4426-4435).  The advance-to-next-slot case
+                    // (search key absent) is handled in the `else` arm below
+                    // with the RANGE_READ advance lock.
+                    let contended = self.lock_ln_mode(slot_lsn, false)?;
                     // X-10: re-read under a lock on the slot's CURRENT lsn (see
                     // the Set/Both branch) so a moved slot never returns a
                     // concurrent writer's uncommitted bytes.
@@ -1501,7 +1551,17 @@ impl CursorImpl {
                             self.update_bin_pin(bin_arc);
                             Ok(OperationStatus::Success)
                         }
-                        None => Ok(OperationStatus::NotFound),
+                        None => {
+                            // BUG-PHANTOM-2: a serializable range search
+                            // (SearchGte / SearchBothRange) that finds no key
+                            // at-or-after the search key range-locks the EOF
+                            // sentinel so an insert of a key past the current
+                            // maximum is blocked (JE searchRangeSerializable
+                            // mustLockEOF -> lockEof(RANGE_READ),
+                            // Cursor.java:4506-4511).
+                            self.lock_eof_for_scan()?;
+                            Ok(OperationStatus::NotFound)
+                        }
                     }
                 }
             }
@@ -1568,7 +1628,19 @@ impl CursorImpl {
                     }
                 };
                 if matches {
-                    self.lock_ln(slot_lsn)?;
+                    // BUG-PHANTOM-1/3: pick the dup anchor lock type.  An
+                    // EXACT getSearchBoth(k,d) match is the search ANCHOR and
+                    // takes a plain READ (JE searchRangeSerializable
+                    // exactKeyMatch -> searchLockType = READ,
+                    // Cursor.java:4426-4435), so an insert outside the matched
+                    // two-part key is not blocked.  A getSearchKey /
+                    // getSearchKeyRange / getSearchBothRange that lands on the
+                    // first dup at-or-after the key is an ADVANCE result and
+                    // range-locks the dup set / next key (RANGE_READ)
+                    // (BUG-PHANTOM-3).
+                    let exact_both = matches!(search_mode, SearchMode::Both)
+                        && raw_key == search_two_part_key;
+                    self.lock_ln_mode(slot_lsn, !exact_both)?;
                     // READ_COMMITTED revalidation (C1/V1): `raw_key`/`idx` were
                     // captured BEFORE `lock_ln`; if a writer moved this slot's
                     // LSN inside the prefetch->lock window, re-derive the
@@ -1610,10 +1682,26 @@ impl CursorImpl {
                     self.update_bin_pin(Some(bin_arc));
                     Ok(OperationStatus::Success)
                 } else {
+                    // BUG-PHANTOM-2/3: a serializable dup search whose found
+                    // entry's primary key (or data, for BothRange) does not
+                    // match range-locks the next key / EOF, so an insert of
+                    // the missed (key,data) is blocked (JE dup searchNoDups ->
+                    // searchRangeSerializable advance / lockEof).
+                    self.lock_next_key_or_eof_for_missed_search(
+                        &search_two_part_key,
+                    )?;
                     Ok(OperationStatus::NotFound)
                 }
             }
-            None => Ok(OperationStatus::NotFound),
+            None => {
+                // BUG-PHANTOM-2/3: no dup at-or-after the search key -> the
+                // search key sorts after every record; range-lock the EOF
+                // sentinel so an insert past the maximum is blocked.
+                self.lock_next_key_or_eof_for_missed_search(
+                    &search_two_part_key,
+                )?;
+                Ok(OperationStatus::NotFound)
+            }
         }
     }
 
@@ -1906,29 +1994,66 @@ impl CursorImpl {
         }
     }
 
+    /// JE `CursorImpl.lockLN(lockType)` with `lockType = getLockType(mode,
+    /// true)` — the ADVANCE lock type.  See [`Self::lock_ln_mode`].  Kept as
+    /// the default entry point for forward-scan / advance call sites, which
+    /// JE range-locks (`RANGE_READ` under serializable).
     fn lock_ln(&self, lsn: u64) -> Result<bool, DbiError> {
+        self.lock_ln_mode(lsn, true)
+    }
+
+    /// JE `CursorImpl.lockLN(lockType)` where `lockType` is
+    /// `Cursor.getLockType(lockMode, range_lock)` (Cursor.java:5273-5290):
+    ///
+    /// * a per-op or default READ_UNCOMMITTED read -> `LockType.NONE`
+    ///   (BUG-PHANTOM-1b: `self.op_read_uncommitted` is the per-op override
+    ///   JE derives from the caller's `LockMode`, honoured even on a
+    ///   serializable txn);
+    /// * otherwise, under serializable isolation, `range_lock ? RANGE_READ :
+    ///   READ` — the ANCHOR of a search/getLast/getPrev takes `READ`
+    ///   (`range_lock == false`), while a forward ADVANCE / getFirst / getNext
+    ///   takes `RANGE_READ` (`range_lock == true`), exactly as JE's
+    ///   `searchLockType`/`advanceLockType` split (Cursor.java:4026-4032)
+    ///   (BUG-PHANTOM-1: Noxu previously range-locked EVERY serializable read,
+    ///   over-locking the anchor and wrongly blocking inserts outside the
+    ///   scanned gap);
+    /// * all non-serializable isolation levels take `READ` regardless of
+    ///   `range_lock` (JE `getLockType` only range-locks under serializable —
+    ///   non-serializable callers never pass `rangeLock = true`).
+    fn lock_ln_mode(
+        &self,
+        lsn: u64,
+        range_lock: bool,
+    ) -> Result<bool, DbiError> {
         if lsn == noxu_util::NULL_LSN.as_u64() {
             return Ok(false);
         }
         if let Some(txn) = &self.txn_ref {
             let mut guard = txn.lock().unwrap();
-            // F2: read-uncommitted txns skip read-lock acquisition
-            // entirely.  But we still call lock(NONE) to run check_state /
-            // check_preempted so an Aborted/MustAbort txn is caught here
-            // rather than silently returning dirty data.
+            // F2 / BUG-PHANTOM-1b: a read-uncommitted read (txn default OR a
+            // per-op READ_UNCOMMITTED LockMode) skips read-lock acquisition
+            // entirely -> JE getLockType returns LockType.NONE regardless of
+            // the txn's isolation (Cursor.java:5277).  We still call
+            // lock(NONE) to run check_state / check_preempted so an
+            // Aborted/MustAbort txn is caught here rather than silently
+            // returning dirty data.
             // TXN-4 fix (2026-06-16): mirrors JE CursorImpl.lockLN which
             // calls locker.lock(lsn, LockType.NONE, ...) even for dirty reads;
             // NONE returns NoneNeeded immediately from the lock manager but
             // first runs checkState/checkPreempted.
-            if guard.is_read_uncommitted_default() {
+            if self.op_read_uncommitted || guard.is_read_uncommitted_default() {
                 guard
                     .lock(lsn, LockType::None, false)
                     .map_err(DbiError::TxnError)?;
                 return Ok(false);
             }
-            // T-F2: SERIALIZABLE cursors acquire RangeRead to protect against
-            // phantom inserts.  All other isolation levels use Read.
-            let lock_type = if guard.is_serializable_isolation() {
+            // T-F2 / BUG-PHANTOM-1: under SERIALIZABLE isolation acquire a
+            // RANGE_READ only when `range_lock` (JE's advance step / forward
+            // scan / getFirst) and a plain READ for the search ANCHOR
+            // (`range_lock == false`: searchExact's found slot, getLast's
+            // found slot, a reverse-scan landing).  All other isolation
+            // levels use READ.
+            let lock_type = if range_lock && guard.is_serializable_isolation() {
                 LockType::RangeRead
             } else {
                 LockType::Read
@@ -2130,7 +2255,10 @@ impl CursorImpl {
             None => return Ok(()),
         };
         let mut guard = txn.lock().unwrap();
-        if !guard.is_serializable_isolation() {
+        // BUG-PHANTOM-1b: a per-op READ_UNCOMMITTED read takes no range lock
+        // (JE getLockType -> NONE), hence no EOF lock either, even on a
+        // serializable txn.
+        if self.op_read_uncommitted || !guard.is_serializable_isolation() {
             return Ok(());
         }
         let eof_lsn = {
@@ -2153,6 +2281,128 @@ impl CursorImpl {
                 Ok(())
             }
             Err(e) => Err(DbiError::TxnError(e)),
+        }
+    }
+
+    /// JE `Cursor.rangeLockCurrentPosition` (Cursor.java:3586-3637): for a
+    /// serializable REVERSE scan (`getPrev` / `getPrevNoDup` / `getPrevDup`),
+    /// upgrade to a RANGE_READ at the CURRENT position before stepping back,
+    /// so the gap between the current record and its predecessor is
+    /// range-locked (a concurrent insert into that gap takes RANGE_INSERT on
+    /// the current record's slot and is blocked / restarted).  The subsequent
+    /// backward step then locks the predecessor with a plain READ anchor
+    /// (`getLockType(mode, false)`), NOT a range lock — the range coverage
+    /// comes from here, not from the landing slot (BUG-PHANTOM-1 reverse:
+    /// Noxu previously range-locked the LANDING slot, which guards the wrong
+    /// gap and wrongly blocks an insert AFTER the reverse-scan anchor).
+    ///
+    /// If the current position holds no record (an empty/defunct slot), JE
+    /// range-locks the next record or, failing that, the EOF node.  Noxu's
+    /// equivalent: RANGE_READ the current record's LSN when it is live;
+    /// otherwise fall back to the EOF sentinel so the gap past the key space
+    /// is still guarded.
+    ///
+    /// No-op unless the cursor is backed by a SERIALIZABLE txn and the op is
+    /// not a per-op READ_UNCOMMITTED read.
+    fn range_lock_current_position(
+        &self,
+        mode: GetMode,
+    ) -> Result<(), DbiError> {
+        let txn = match &self.txn_ref {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+        {
+            let guard = txn.lock().unwrap();
+            if self.op_read_uncommitted || !guard.is_serializable_isolation() {
+                return Ok(());
+            }
+        }
+        // BUG-PHANTOM-3 (reverse dup): JE's dupsGetPrevNoDup repositions to the
+        // FIRST duplicate of the current key and then steps back, so
+        // rangeLockCurrentPosition RANGE_READs the first dup (guarding the gap
+        // between the previous key and this key's first dup, Cursor.java:
+        // 3416-3443).  For PrevNoDup on a sorted-dup DB, lock that first dup
+        // instead of the exact current slot.  Prev / PrevDup walk within the
+        // current position's dup set, so the exact current slot is correct.
+        let cur_lsn =
+            if matches!(mode, GetMode::PrevNoDup) && self.is_sorted_dup() {
+                self.first_dup_lsn_of_current_key().unwrap_or(self.current_lsn)
+            } else {
+                self.current_lsn
+            };
+        if cur_lsn != noxu_util::NULL_LSN.as_u64() {
+            // RANGE_READ on the current record (JE lockAndGetCurrent with
+            // RANGE_READ at the current position).  `lock_ln_mode(.., true)`
+            // acquires RANGE_READ under serializable and is held to commit.
+            self.lock_ln_mode(cur_lsn, true)?;
+            return Ok(());
+        }
+        // No live record at the current position: range-lock the EOF sentinel
+        // (JE falls through to lockEof(RANGE_READ) when getNext finds nothing).
+        self.lock_eof_for_scan()
+    }
+
+    /// LSN of the FIRST duplicate (smallest two-part key) sharing the current
+    /// position's primary key, used by the reverse dup next-key locking.
+    /// Returns `None` if the cursor is not positioned or the key is absent.
+    fn first_dup_lsn_of_current_key(&self) -> Option<u64> {
+        let cur = self.current_key.as_deref()?;
+        let pk = dup_key_data::get_key(cur)?;
+        let lb = dup_key_data::lower_bound(&pk);
+        let db = self.db_impl.read();
+        let tree = db.get_real_tree()?;
+        tree.first_entry_at_or_after(&lb).and_then(|(k, _v, lsn)| {
+            // Only if the found entry really is a dup of this primary key.
+            if dup_key_data::matches_key(&k, &pk) { Some(lsn) } else { None }
+        })
+    }
+
+    /// BUG-PHANTOM-2: a serializable exact/range search that ends in NOTFOUND
+    /// must still RANGE_READ-lock the NEXT key after the search key (or the
+    /// EOF sentinel if none follows), so a concurrent insert of the missed key
+    /// is blocked.  JE `searchRangeSerializable` with `checkForExactKey`
+    /// advances to the next slot and RANGE_READ-locks it even when returning
+    /// NOTFOUND, and `lockEof(RANGE_READ)` guards the EOF gap
+    /// (Cursor.java:4438-4452, 4506-4511).
+    ///
+    /// `key` is the (two-part, for dups) search key.  Finds the first live
+    /// key at-or-after `key` and RANGE_READ-locks it; if the search key sorts
+    /// after every key, locks the EOF sentinel.  No-op unless the cursor is
+    /// backed by a SERIALIZABLE txn and the op is not a per-op
+    /// READ_UNCOMMITTED read.
+    fn lock_next_key_or_eof_for_missed_search(
+        &self,
+        key: &[u8],
+    ) -> Result<(), DbiError> {
+        {
+            let txn = match &self.txn_ref {
+                Some(t) => t,
+                None => return Ok(()),
+            };
+            let guard = txn.lock().unwrap();
+            if self.op_read_uncommitted || !guard.is_serializable_isolation() {
+                return Ok(());
+            }
+        }
+        // First live key at-or-after the search key = the slot JE advances to.
+        let next_lsn: Option<u64> = {
+            let db = self.db_impl.read();
+            match db.get_real_tree() {
+                Some(tree) => {
+                    tree.first_entry_at_or_after(key).map(|(_k, _v, lsn)| lsn)
+                }
+                None => None,
+            }
+        };
+        match next_lsn {
+            // RANGE_READ the next slot (JE advanceLockType = RANGE_READ).
+            Some(lsn) => {
+                self.lock_ln_mode(lsn, true)?;
+                Ok(())
+            }
+            // Nothing follows the search key: lock the EOF gap.
+            None => self.lock_eof_for_scan(),
         }
     }
 
@@ -2593,7 +2843,10 @@ impl CursorImpl {
                     self.update_bin_pin(Some(bin_arc));
                     return self.retrieve_next(GetMode::Next);
                 }
-                self.lock_ln(lsn)?;
+                // BUG-PHANTOM-1: getFirst (forward) range-locks the edge slot
+                // (advance = RANGE_READ, JE positionNoDups getFirst passes
+                // rangeLock = true, Cursor.java:3177/3189).
+                self.lock_ln_mode(lsn, true)?;
                 // READ_COMMITTED revalidation (C1/V1): key/data/lsn were read
                 // from the BIN BEFORE lock_ln, so a writer that mutated slot
                 // `idx` inside the prefetch->lock window would leave them stale.
@@ -2765,7 +3018,13 @@ impl CursorImpl {
                     self.update_bin_pin(Some(bin_arc));
                     return self.retrieve_next(GetMode::Prev);
                 }
-                self.lock_ln(lsn)?;
+                // BUG-PHANTOM-1: getLast locks the found (last) record with a
+                // plain READ anchor (JE positionNoDups getLast uses
+                // rangeLock = false, Cursor.java:3238); the forward phantom
+                // gap past the last key is already range-locked by the
+                // lock_eof_for_scan() at the top of get_last
+                // (lockEof(RANGE_READ) before positioning).
+                self.lock_ln_mode(lsn, false)?;
                 // READ_COMMITTED revalidation (C1/V1): re-derive from the pinned
                 // slot if its LSN moved during the prefetch->lock window (see
                 // get_first / JE CursorImpl.lockLN, CursorImpl.java:3641-3680).
@@ -2948,6 +3207,14 @@ impl CursorImpl {
         };
 
         let forward = mode.is_forward();
+        // BUG-PHANTOM-1 (reverse): for a serializable backward scan, range-lock
+        // the CURRENT position first (JE Cursor.rangeLockCurrentPosition,
+        // Cursor.java:3539-3541) so the gap below the current key is guarded;
+        // the landing (predecessor) slot is then locked with a plain READ
+        // anchor below.  No-op for forward scans and non-serializable txns.
+        if !forward {
+            self.range_lock_current_position(mode)?;
+        }
         // JE CursorImpl.deleteCurrentRecord(): the slot is physically removed
         // so current_index is already the gap (= next slot after deletion).
         // For Next we start from that gap index directly; for Prev we back up
@@ -3290,7 +3557,10 @@ impl CursorImpl {
                 )?;
                 return Ok(s);
             }
-            self.lock_ln(lsn)?;
+            // BUG-PHANTOM-1: forward advance = RANGE_READ, reverse = READ
+            // anchor (the gap below the current key is already range-locked by
+            // range_lock_current_position at the top of retrieve_next).
+            self.lock_ln_mode(lsn, forward)?;
             // READ_COMMITTED revalidation (C1/V1): `key`/`data` were read from
             // the pinned BIN slot BEFORE lock_ln, so a writer that mutated slot
             // `idx` in the prefetch->lock window would leave them stale.  The
@@ -3460,7 +3730,9 @@ impl CursorImpl {
             // RangeRestart / lock-manager error).  On that `?`, `pin_guard`
             // drops and releases the descent pin (`cursor_count -= 1`) — the
             // BIN is NOT left permanently pinned/wedged for the evictor.
-            self.lock_ln(lsn)?;
+            // BUG-PHANTOM-1: forward advance = RANGE_READ, reverse = READ
+            // anchor (gap already range-locked by range_lock_current_position).
+            self.lock_ln_mode(lsn, forward)?;
             // Crossed into a new BIN.  The BIN is ALREADY pinned by the
             // descent (NEW-9), so revalidate against THAT pinned arc — no
             // second descent, no unpinned window.
@@ -3536,8 +3808,13 @@ impl CursorImpl {
         raw_data: Bytes,
         idx: i32,
         lsn: u64,
+        forward: bool,
     ) -> Result<(), DbiError> {
-        self.lock_ln(lsn)?;
+        // BUG-PHANTOM-1/3: a forward dup step range-locks the landed slot
+        // (advance = RANGE_READ); a reverse dup step takes the plain READ
+        // anchor (the gap below the previous position is already range-locked
+        // by range_lock_current_position in retrieve_next).
+        self.lock_ln_mode(lsn, forward)?;
         let bin_arc = self.find_bin_arc_for_key(&raw_key);
         let (raw_key, raw_data, lsn) = match bin_arc.as_ref().and_then(|arc| {
             Self::revalidate_locked_slot(arc, idx as usize, lsn)
@@ -3574,9 +3851,23 @@ impl CursorImpl {
                         _ => false,
                     };
                     if same {
-                        self.install_dup_accept(raw_key, raw_data, idx, lsn)?;
+                        self.install_dup_accept(
+                            raw_key, raw_data, idx, lsn, forward,
+                        )?;
                         return Ok(OperationStatus::Success);
                     } else {
+                        // BUG-PHANTOM-3: the dup set ended but the underlying
+                        // physical scan still LANDED on this slot and JE locks
+                        // it (dupsGetNextOrPrevDup -> retrieveNextNoDups locks
+                        // the slot, then the prefix rangeConstraint rejects the
+                        // result, Cursor.java:3353-3372).  For a forward step
+                        // RANGE_READ the first slot past the dup set so an
+                        // insert into the tail of the dup set is blocked; the
+                        // reverse gap is already covered by
+                        // range_lock_current_position.
+                        if forward {
+                            self.lock_ln_mode(lsn, true)?;
+                        }
                         return Ok(OperationStatus::NotFound);
                     }
                 }
@@ -3587,7 +3878,9 @@ impl CursorImpl {
                         _ => false,
                     };
                     if !same {
-                        self.install_dup_accept(raw_key, raw_data, idx, lsn)?;
+                        self.install_dup_accept(
+                            raw_key, raw_data, idx, lsn, forward,
+                        )?;
                         return Ok(OperationStatus::Success);
                     }
                     // Need to advance further.
@@ -3692,14 +3985,25 @@ impl CursorImpl {
                                     lsn = l;
                                     // Loop continues.
                                 }
-                                _ => return Ok(OperationStatus::NotFound),
+                                _ => {
+                                    // BUG-PHANTOM-2/3: a forward NextNoDup that
+                                    // runs off the end range-locks the EOF
+                                    // sentinel (JE retrieveNextNoDups ->
+                                    // lockEof(RANGE_READ), Cursor.java:3557).
+                                    if forward {
+                                        self.lock_eof_for_scan()?;
+                                    }
+                                    return Ok(OperationStatus::NotFound);
+                                }
                             }
                         }
                     }
                 }
                 // Next / Prev: accept any entry.
                 GetMode::Next | GetMode::Prev => {
-                    self.install_dup_accept(raw_key, raw_data, idx, lsn)?;
+                    self.install_dup_accept(
+                        raw_key, raw_data, idx, lsn, forward,
+                    )?;
                     return Ok(OperationStatus::Success);
                 }
             }
@@ -4108,6 +4412,15 @@ impl CursorImpl {
         // lock manager so abort-undo can roll back the new dup.
         // old_lsn is NULL_LSN: the existence check confirmed the pair is absent.
         let old_lsn = noxu_util::NULL_LSN.as_u64();
+        // BUG-PHANTOM-3 (inserter side): a brand-new dup (two-part key) must
+        // next-key-lock its successor so a concurrent SERIALIZABLE scanner that
+        // range-locked the dup set / next key (RANGE_READ) blocks or restarts
+        // this insert.  Mirror of the non-dup NoOverwrite/NoDupData path
+        // (lock_range_insert(key, old_lsn)): the dup variant keys on the
+        // full TWO-PART key so the successor is the next two-part slot (the
+        // next dup of this key, the first dup of the next key, or the EOF
+        // sentinel).  Skipped for updates (old_lsn != NULL) and auto-commit.
+        self.lock_range_insert(&two_part_key, old_lsn)?;
         self.lock_write_before_log(old_lsn, &two_part_key)?;
         let new_lsn = self.log_ln_write(
             &two_part_key,

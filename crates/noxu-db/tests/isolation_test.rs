@@ -1006,23 +1006,28 @@ fn test_serializable_prevents_phantom_insert() {
         txn.commit().unwrap();
     }
 
-    // T1: SERIALIZABLE scanner reads "a" and "c" (acquires RangeRead on
-    // each key's LSN).  After this scan, T1 holds RangeRead on "c"'s LSN.
+    // T1: SERIALIZABLE scanner range-scans the gap between "a" and "c".
+    // A range operation (getSearchKeyRange / getNext) is what acquires the
+    // forward RANGE_READ in JE (searchLockType=READ for an exact anchor,
+    // advanceLockType=RANGE_READ for the advance step, Cursor.java:4026-4032).
+    // Here getSearchKeyRange("b") finds no exact "b" and ADVANCES to "c",
+    // RANGE_READ-locking "c" — exactly JE PhantomTest.testGetSearchKeyRange.
+    // (A plain exact getSearchKey("c") would take only a READ anchor and must
+    // NOT block an insert before "c" — see je_phantom_test
+    // testGetSearchKey_Success, where inserts of 1 AND 3 around an exact
+    // read of 2 are never blocked.)
     let ser_cfg = TransactionConfig::new().with_serializable_isolation(true);
     let t1 = env.begin_transaction(Some(&ser_cfg)).unwrap();
-    let mut out = DatabaseEntry::new();
-    // Read "a"
-    assert!(
-        db.get_into(Some(&t1), DatabaseEntry::from_bytes(b"a"), &mut out)
-            .unwrap(),
-        "T1 should read 'a'"
+    let mut c1 = db.open_cursor_in(&t1, None).unwrap();
+    let mut k = DatabaseEntry::from_bytes(b"b");
+    let mut v = DatabaseEntry::new();
+    assert_eq!(
+        c1.get(&mut k, &mut v, noxu_db::Get::SearchGte, None).unwrap(),
+        OperationStatus::Success,
+        "T1 range scan from 'b' should land on 'c'"
     );
-    // Read "c" -- this acquires RangeRead on "c"'s LSN
-    assert!(
-        db.get_into(Some(&t1), DatabaseEntry::from_bytes(b"c"), &mut out)
-            .unwrap(),
-        "T1 should read 'c'"
-    );
+    assert_eq!(k.data(), b"c", "T1 range scan should position on 'c'");
+    drop(c1);
 
     // T2: no_wait inserter tries to insert "bb" (between "a" and "c").
     // lock_range_insert will find "c" as the successor and try RangeInsert

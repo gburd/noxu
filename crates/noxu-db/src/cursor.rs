@@ -156,7 +156,19 @@ impl CursorSecMaint {
 #[inline]
 fn map_cursor_err(e: DbiError) -> NoxuError {
     match e {
-        DbiError::EnvironmentFailure { .. } => NoxuError::from(e),
+        // BUG-PHANTOM-1/3: a no-wait serializable inserter that is blocked by a
+        // scanner's RANGE_READ (or any record-lock conflict / range restart)
+        // must surface the TYPED lock error, not a stringy `OperationFailed`,
+        // so callers can `matches!(.., NoxuError::LockNotAvailable)` and retry
+        // (JE throws the typed `LockConflictException` subclass).  Route txn /
+        // lock-conflict errors through the `From<DbiError>` mapping
+        // (error.rs:825-878), which yields `NoxuError::LockNotAvailable` /
+        // `LockTimeout` / `LockConflict` etc.  Mirrors parity/integrate
+        // `map_cursor_err` (ef07ef0e) minus the integrate-only `LnFetchFailure`
+        // variant, which does not exist at v7.11.0.
+        DbiError::EnvironmentFailure { .. }
+        | DbiError::TxnError(_)
+        | DbiError::LockConflict(_) => NoxuError::from(e),
         // NEW-DBI-DUPPUTCUR: surface a rejected putCurrent (moving a dup to
         // a new sort position) as the typed DuplicateDataException so
         // callers can match on it, mirroring JE Cursor.putCurrent.
@@ -367,6 +379,18 @@ impl<'txn> Cursor<'txn> {
         if matches!(get_type, Get::Current) {
             self.check_initialized()?;
         }
+
+        // BUG-PHANTOM-1b: a per-op READ_UNCOMMITTED LockMode suppresses the
+        // serializable txn's range lock for THIS read (JE Cursor.getLockType
+        // -> LockType.NONE for a read-uncommitted mode regardless of the txn's
+        // isolation, Cursor.java:5277, :5293-5300).  Set the inner cursor's
+        // per-op override so `lock_ln` / `lock_eof_for_scan` skip range
+        // locking; reset to the default for every other mode (JE re-derives
+        // it per call from the LockMode argument).
+        self.inner.set_op_read_uncommitted(matches!(
+            lock_mode,
+            Some(LockMode::ReadUncommitted)
+        ));
 
         let status = match get_type {
             Get::Search => {

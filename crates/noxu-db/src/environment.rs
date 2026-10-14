@@ -1341,6 +1341,23 @@ impl Environment {
             ));
         }
 
+        // JE `Environment.checkTxnConfig` (Environment.java:1501): at most one
+        // of SerializableIsolation, ReadCommitted or ReadUncommitted may be
+        // set on a TransactionConfig; any pair is an IllegalArgumentException.
+        // (BUG-PHANTOM-1b / PhantomTest.testIllegalTransactionConfig.)
+        if let Some(c) = config {
+            let ser_ru = c.serializable_isolation && c.read_uncommitted;
+            let ser_rc = c.serializable_isolation && c.read_committed;
+            let ru_rc = c.read_uncommitted && c.read_committed;
+            if ser_ru || ser_rc || ru_rc {
+                return Err(NoxuError::IllegalArgument(
+                    "Only one may be specified: SerializableIsolation, \
+                     ReadCommitted or ReadUncommitted"
+                        .to_string(),
+                ));
+            }
+        }
+
         let txn_id = self.next_txn_id.fetch_add(1, Ordering::Relaxed);
         // F3: when the caller does not supply a TransactionConfig, the
         // environment-level `Durability` default (`EnvironmentConfig::durability`,
@@ -1378,6 +1395,16 @@ impl Environment {
             };
             if let Some(d) = derived {
                 txn_config = txn_config.with_durability(d);
+            }
+            // JE `Environment.beginTransactionInternal` uses the env's
+            // `defaultTxnConfig` verbatim when the caller passes a null
+            // TransactionConfig (Environment.java:1430).  So an env opened with
+            // `EnvironmentConfig.setTxnSerializableIsolation(true)` makes
+            // `begin_transaction(None)` serializable.  A caller-supplied config
+            // (the `Some` arm above) is used as-is and does NOT inherit the env
+            // default.  (A15 / PhantomTest.testEnvironmentConfig.)
+            if self.config.txn_serializable_isolation {
+                txn_config = txn_config.with_serializable_isolation(true);
             }
         }
 
