@@ -366,6 +366,12 @@ pub struct EnvironmentImpl {
         >,
     >,
 
+    /// BUG-DW-SYNC-1: db_ids of currently-open deferred-write databases, shared
+    /// (same `Arc`) with the evictor and checkpointer so each applies JE's
+    /// per-DB `logDirtyLN` force rule.  Populated in `open_database_inner` and
+    /// cleared on remove.
+    deferred_write_dbs: Arc<std::sync::Mutex<std::collections::HashSet<u64>>>,
+
     /// The log-file garbage collector.
     ///
     /// Created in `new()` for writable environments via
@@ -1310,6 +1316,13 @@ impl EnvironmentImpl {
             >,
         > = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
+        // BUG-DW-SYNC-1: env-wide set of deferred-write db_ids, shared with the
+        // evictor and checkpointer so each applies JE's per-DB logDirtyLN force
+        // rule (log every never-logged slot of a DW DB, embedded or not).
+        let deferred_write_dbs: Arc<
+            std::sync::Mutex<std::collections::HashSet<u64>>,
+        > = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+
         // EVICTOR-RECLAIM-1: wire the SAME registry into the evictor so its
         // node lookups (strip/flush/detach/evict_root) search every database
         // tree, not just the primary slot.  JE's evictor walks one env-wide
@@ -1327,6 +1340,7 @@ impl EnvironmentImpl {
         // trees.  For a private env, behaviour is unchanged.
         if shared_evictor_handle.is_none() {
             evictor.set_db_trees_registry(Arc::clone(&db_trees_registry));
+            evictor.set_deferred_write_dbs(Arc::clone(&deferred_write_dbs));
         } else if let Some(h) = &shared_evictor_handle {
             // Mirror the primary tree into the shared LRU immediately so
             // pre-open-database resident nodes are evictable across envs.
@@ -1491,7 +1505,8 @@ impl EnvironmentImpl {
             // ALL open user-database dirty BINs, not just the primary tree.
             // JE processINList walks a single env-wide INList covering all
             // databases; this achieves the same effect.
-            .with_db_trees_registry(Arc::clone(&db_trees_registry));
+            .with_db_trees_registry(Arc::clone(&db_trees_registry))
+            .with_deferred_write_dbs(Arc::clone(&deferred_write_dbs));
             // X-5: wire the cleaner so do_checkpoint calls after_checkpoint()
             // and activates the three-state deletion barrier.
             if let Some(ref c) = cleaner {
@@ -1878,6 +1893,7 @@ impl EnvironmentImpl {
             recovery_rollback_matchpoint,
             primary_tree,
             db_trees_registry,
+            deferred_write_dbs,
             cleaner,
             checkpointer,
             checkpointer_handle: Mutex::new(checkpointer_thread),
@@ -2318,6 +2334,13 @@ impl EnvironmentImpl {
             if let Ok(mut reg) = self.db_trees_registry.lock() {
                 reg.insert(db_id.id(), Arc::clone(&tree_arc));
             }
+            // BUG-DW-SYNC-1: record a deferred-write DB's id so the evictor and
+            // checkpointer apply JE's per-DB logDirtyLN force rule to its BINs.
+            if db.read().is_deferred_write()
+                && let Ok(mut dw) = self.deferred_write_dbs.lock()
+            {
+                dw.insert(db_id.id() as u64);
+            }
 
             // F1: feed this database tree's node add/access/remove events to
             // the evictor's LRU lists, and point the evictor's eviction walk
@@ -2718,6 +2741,9 @@ impl EnvironmentImpl {
         if let Ok(mut reg) = self.db_trees_registry.lock() {
             reg.remove(&db_id.id());
         }
+        if let Ok(mut dw) = self.deferred_write_dbs.lock() {
+            dw.remove(&(db_id.id() as u64));
+        }
     }
 
     /// DBEVICT-1: sweep every closed database (`reference_count() <= 0`) and
@@ -2904,6 +2930,10 @@ impl EnvironmentImpl {
         if let Some(db) = self.db_map.write().remove(&db_id) {
             db.write().start_delete();
             db.write().finish_delete();
+        }
+        // BUG-DW-SYNC-1: a removed DB is no longer deferred-write.
+        if let Ok(mut dw) = self.deferred_write_dbs.lock() {
+            dw.remove(&(db_id.id() as u64));
         }
         // NEW-CLEANER-DBOBSOLETE: the removed DB's LNs/INs are now dead log
         // bytes.  Count the whole footprint obsolete so the force=false
@@ -3549,6 +3579,30 @@ impl EnvironmentImpl {
                     DbiError::EnvironmentFailure { reason: e.to_string() }
                 })
             }
+        }
+    }
+
+    /// JE `Checkpointer.syncDatabase` via `Database.sync()`: flush ONE
+    /// database's dirty tree bottom-up and fsync, without a full checkpoint.
+    /// Used by `Database::sync()` for a durable deferred-write DB so its
+    /// in-memory tree becomes crash-durable (BUG-DW-SYNC-1).
+    pub fn sync_database(&self, db_id: u64) -> Result<(), DbiError> {
+        match &self.checkpointer {
+            None => Ok(()),
+            Some(ckpt) => {
+                ckpt.sync_database(db_id, true).map(|_| ()).map_err(|e| {
+                    DbiError::EnvironmentFailure { reason: e.to_string() }
+                })
+            }
+        }
+    }
+
+    pub fn sync_database_count(&self, db_id: u64) -> Result<u64, DbiError> {
+        match &self.checkpointer {
+            None => Ok(0),
+            Some(ckpt) => ckpt.sync_database(db_id, true).map_err(|e| {
+                DbiError::EnvironmentFailure { reason: e.to_string() }
+            }),
         }
     }
 

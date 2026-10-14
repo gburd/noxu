@@ -1906,6 +1906,20 @@ impl Database {
     /// log-manager flush fails.
     pub fn sync(&self) -> Result<()> {
         self.check_open()?;
+        // BUG-DW-SYNC-1 fix: a DEFERRED-WRITE DB defers LOGGING of its tree, so
+        // flushing the log buffer alone makes nothing durable — the dirty
+        // BINs/INs were never logged.  JE `Database.sync()` ->
+        // `DatabaseImpl.sync(true)` -> `Checkpointer.syncDatabase(dbImpl)`
+        // (Checkpointer.java:950-988) flushes THIS db's dirty tree bottom-up
+        // (ckptStart=NULL) then flushSync.  Route a deferred-write sync through
+        // the per-DB checkpointer path so synced records survive a crash.
+        if self.db_impl.read().is_deferred_write() {
+            let env_impl = self.env_impl.lock();
+            env_impl
+                .sync_database(self.id)
+                .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
+            return Ok(());
+        }
         if let Some(lm) = &self.log_manager {
             lm.flush_sync()
                 .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;

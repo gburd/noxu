@@ -138,6 +138,120 @@ impl CheckpointResult {
     }
 }
 
+/// Log every resident, live, never-logged, NON-EMBEDDED LN in `bin` to the WAL
+/// before the BIN image itself is written, stamping each slot with the real LSN
+/// of its LN logrec.
+///
+/// This is the Noxu port of JE `BIN.logDirtyLN` / `IN.logDirtyChildren`
+/// (BIN.java:1626-1680, IN.java:5290-5320).  A deferred-write DB defers LN
+/// *logging*: a put stores the value in the BIN slot with a NULL/transient slot
+/// LSN and never writes an LN logrec.  JE forces such an LN to be logged
+/// whenever the BIN is flushed (checkpoint, `syncDatabase`, or eviction):
+/// `force = isDeferredWriteMode() && DbLsn.isTransientOrNull(currLsn)`, then
+/// `ln.log(...)` + `updateEntry(idx, logItem.lsn, size)`.
+///
+/// Scope.  `dw_mode` reflects JE's `force = isDeferredWriteMode() &&
+/// isTransientOrNull(currLsn)` guard:
+///  - `dw_mode == true` (the BIN belongs to a deferred-write DB being synced /
+///    checkpointed): log EVERY never-logged live slot — embedded or not — so it
+///    gets a real LSN (JE logs embedded DW LNs too; `DeferredWriteTest.
+///    testTransientLsn` asserts an embedded DW slot's LSN is NOT transient
+///    after `db.sync()`).
+///  - `dw_mode == false` (a non-deferred-write DB during a full-env checkpoint
+///    or eviction): log only NON-embedded never-logged slots.  A non-embedded
+///    slot in an ordinary DB always already holds a logged (put-time) LSN, so
+///    this is a no-op; an EMBEDDED NULL-LSN slot is a legitimate Noxu state
+///    (the embedded data is self-contained in the BIN image; its separate LN
+///    logrec is immediately obsolete and may be cleaned —
+///    `delta_cleaner_deletion_test` relies on no user LN surviving in the WAL),
+///    so it must NOT be re-logged.
+///
+/// The logged LN is non-transactional and `NO_REPLICATE` (DW DBs are
+/// non-transactional and never part of the replication stream — JE comment at
+/// BIN.java:1643-1650), with no abort info.
+///
+/// Returns `Ok(())`.  A never-logged slot (currLsn == NULL) has no prior logged
+/// version to count obsolete.
+pub fn log_dirty_lns_in_bin(
+    db_id: u64,
+    bin: &mut noxu_tree::tree::BinStub,
+    lm: &LogManager,
+    dw_mode: bool,
+) -> Result<()> {
+    use noxu_log::entry::ln_log_entry::LnLogEntry;
+    use noxu_util::vlsn::NULL_VLSN;
+
+    for idx in 0..bin.entries.len() {
+        // JE force rule.  A never-logged slot (NULL slot LSN) must be logged
+        // now when it has no durable copy: always for a deferred-write BIN
+        // (`dw_mode`), and — for any DB — whenever the data is NOT embedded in
+        // the BIN image (a NULL-LSN non-embedded slot has no durable copy).
+        // An embedded NULL-LSN slot in a non-DW DB is self-contained in the
+        // BIN image and is skipped.  A deletion carries no data.
+        let currlsn = bin.get_lsn(idx);
+        // v7.11-tag-native: no per-slot embedded bool on this base; the
+        // embedded flag is reconstructed from data.len() vs max_embedded_ln
+        // (BinStub::is_embedded, same predicate as serialize_full).
+        let embedded = bin.is_embedded(idx);
+        if currlsn != NULL_LSN
+            || bin.entries[idx].known_deleted
+            || (embedded && !dw_mode)
+        {
+            continue;
+        }
+        let Some(data) = bin.entries[idx].data.clone() else {
+            continue; // no resident value — nothing to log (stripped/absent)
+        };
+        let key = bin.get_full_key(idx).unwrap_or_default();
+        let expiration = bin.entries[idx].expiration_time as i32;
+
+        // JE `ln.log(..., null locker, null writeLockInfo, embedded, key,
+        // expiration, hours, embedded, currLsn, size, false insertion, bg IO,
+        // NO_REPLICATE)`.  DW is non-transactional: no txn id, no abort info.
+        // The `embedded_ln` flag is preserved so recovery restores the slot's
+        // embedded state (JE logs the LN with its real embedded flag).
+        let entry = LnLogEntry::new(
+            db_id,
+            None,                // txn_id — non-transactional
+            NULL_LSN,            // abort_lsn — DW LN carries none
+            false,               // abort_known_deleted
+            None,                // abort_key
+            None,                // abort_data
+            NULL_VLSN,           // abort_vlsn
+            0,                   // abort_expiration
+            embedded,            // embedded_ln (JE logs the real embedded flag)
+            key,                 // key
+            Some(data.to_vec()), // data
+            expiration,          // expiration
+            NULL_VLSN,           // vlsn
+        );
+        let mut buf = bytes::BytesMut::with_capacity(entry.log_size());
+        entry.write_to_log(&mut buf);
+        let logged_lsn = lm
+            .log(
+                LogEntryType::InsertLN,
+                &buf,
+                Provisional::No,
+                false, // flush_required
+                false, // fsync_required — the BIN flush fsyncs at the end
+            )
+            .map_err(|e| {
+                RecoveryError::CheckpointError(format!(
+                    "deferred-write LN WAL write failed: {e}"
+                ))
+            })?;
+
+        // JE `updateEntry(idx, logItem.lsn, ...)` — stamp the real LSN into the
+        // slot so the BIN image serialised next carries a valid pointer and
+        // `shouldUpdateLsn` never sees a null slot again.  The data stays
+        // resident (JE evicts the LN only when immediately obsolete or
+        // embedded; the subsequent BIN serialisation embeds an embedded slot,
+        // and a non-embedded slot is strippable now that it has a real LSN).
+        bin.set_lsn(idx, logged_lsn);
+    }
+    Ok(())
+}
+
 /// The Checkpointer flushes dirty IN nodes to the log.
 ///
 ///
@@ -177,6 +291,16 @@ pub struct Checkpointer {
     last_checkpoint_end: Mutex<Lsn>,
     /// Whether a checkpoint is in progress
     checkpoint_in_progress: AtomicBool,
+    /// Serializes `do_checkpoint` and per-DB `sync_database` callers against
+    /// each other (F-D, 93b37bff).  JE `Checkpointer.doCheckpoint` and
+    /// `syncDatabase` are both `synchronized`, so a caller BLOCKS (waits)
+    /// while another pass runs instead of erroring or skipping — a
+    /// `Database::sync()` must never silently skip its flush just because a
+    /// background checkpoint happens to be running (that would drop the
+    /// durability guarantee BUG-DW-SYNC-1 restores).  Both paths also mutate
+    /// the shared `checkpoint_flush_levels` map, so this lock also protects
+    /// that from concurrent clear+repopulate.
+    checkpoint_serial: std::sync::Mutex<()>,
     /// Per-database highest IN-level being flushed in the current checkpoint.
     ///
     /// Maps `db_id → highest dirty upper-IN level` for every tree that has
@@ -224,6 +348,14 @@ pub struct Checkpointer {
     /// full environment).
     db_trees_registry:
         Option<Arc<std::sync::Mutex<HashMap<i64, Arc<RwLock<Tree>>>>>>,
+    /// Set of db_ids whose database is in DEFERRED-WRITE mode, shared with the
+    /// `EnvironmentImpl`.  Used to key JE's `logDirtyLN` force rule per-DB
+    /// (`force = getDatabase().isDeferredWriteMode() && isTransientOrNull`): a
+    /// DW DB's BIN flush (checkpoint OR sync) logs every never-logged slot,
+    /// embedded or not; a non-DW DB logs only non-embedded never-logged slots.
+    /// `None` for unit tests without a full environment (treated as non-DW).
+    deferred_write_dbs:
+        Option<Arc<std::sync::Mutex<std::collections::HashSet<u64>>>>,
     /// Bytes written to the log since the last checkpoint.
     ///
     /// Incremented by `wakeup_after_write()`. When this exceeds
@@ -325,6 +457,7 @@ impl Checkpointer {
             last_checkpoint_start: Mutex::new(noxu_util::NULL_LSN),
             last_checkpoint_end: Mutex::new(noxu_util::NULL_LSN),
             checkpoint_in_progress: AtomicBool::new(false),
+            checkpoint_serial: std::sync::Mutex::new(()),
             checkpoint_flush_levels: std::sync::Mutex::new(HashMap::new()),
             shutdown: AtomicBool::new(false),
             shutdown_condvar: Condvar::new(),
@@ -334,6 +467,7 @@ impl Checkpointer {
             tree: None,
             db_id: 0,
             db_trees_registry: None,
+            deferred_write_dbs: None,
             bytes_since_checkpoint: AtomicU64::new(0),
             checkpoint_bytes_interval: 10 * 1024 * 1024, // 10 MiB default
             checkpoint_time_interval_ms: 0, // time-based disabled by default
@@ -394,6 +528,27 @@ impl Checkpointer {
     ) -> Self {
         self.db_trees_registry = Some(registry);
         self
+    }
+
+    /// Wire the env-wide set of deferred-write db_ids so the checkpointer can
+    /// apply JE's per-DB `logDirtyLN` force rule (log every never-logged slot,
+    /// embedded or not, for a DW DB) during a full checkpoint, exactly as
+    /// `sync_database` does for a synced DW DB.
+    pub fn with_deferred_write_dbs(
+        mut self,
+        dw: Arc<std::sync::Mutex<std::collections::HashSet<u64>>>,
+    ) -> Self {
+        self.deferred_write_dbs = Some(dw);
+        self
+    }
+
+    /// Whether `db_id` is a deferred-write database (JE
+    /// `DatabaseImpl.isDeferredWriteMode`).  Unknown / no registry => false.
+    fn is_deferred_write_db(&self, db_id: u64) -> bool {
+        self.deferred_write_dbs
+            .as_ref()
+            .and_then(|s| s.lock().ok().map(|g| g.contains(&db_id)))
+            .unwrap_or(false)
     }
 
     /// Attach a UtilizationTracker so that `persist_file_summaries()` writes
@@ -483,8 +638,17 @@ impl Checkpointer {
             // Reset counter *before* triggering so parallel callers don't
             // all pile in at once — best-effort, not strictly once.
             self.bytes_since_checkpoint.store(0, Ordering::Relaxed);
-            // Ignore errors: a concurrent checkpoint may be in progress.
-            let _ = self.do_checkpoint("wakeup_after_write");
+            // A pass already running covers these bytes; SKIP rather than
+            // call the (now blocking on `checkpoint_serial`) do_checkpoint.
+            // This preserves the pre-F-D "ignore if a concurrent checkpoint
+            // is in progress" contract AND avoids a self-deadlock if a
+            // checkpoint's own WAL writes ever reached this path (they do
+            // not in production — the write-path wake is the async
+            // `wakeup_after_no_writes` condvar notify — but the guard keeps
+            // the invariant local and robust).
+            if !self.checkpoint_in_progress.load(Ordering::Acquire) {
+                let _ = self.do_checkpoint("wakeup_after_write");
+            }
         }
     }
 
@@ -679,6 +843,13 @@ impl Checkpointer {
                 "Checkpointer has been shut down".to_string(),
             ));
         }
+
+        // F-D (93b37bff): serialize against a concurrent full checkpoint or a
+        // per-DB `sync_database` by WAITING on the serial lock (JE
+        // `Checkpointer.doCheckpoint` is `synchronized`), not erroring.  The
+        // `checkpoint_in_progress` CAS below is then an invariant assert.
+        let _serial =
+            self.checkpoint_serial.lock().unwrap_or_else(|e| e.into_inner());
 
         // Check if already in progress
         if self
@@ -1202,6 +1373,163 @@ impl Checkpointer {
     /// durable.
     ///
     /// `Checkpointer.processINList()` + `Checkpointer.logIN()`.
+    /// JE `Checkpointer.syncDatabase` (Checkpointer.java:950-988): flush the
+    /// dirty INs of a SINGLE database bottom-up (its dirty BINs, then its upper
+    /// INs), then `flushSync`.  Unlike `do_checkpoint` this writes NO
+    /// CheckpointStart/End — it is `Database.sync()` for a durable
+    /// deferred-write DB, making that DB's in-memory tree durable without a
+    /// full env checkpoint.  `ckptStart` is NULL (JE passes `DbLsn.NULL_LSN`),
+    /// so the per-DB flush-level computation drives the provisional decision
+    /// exactly as the full checkpoint's BIN pass does for this one tree.
+    ///
+    /// Returns the number of nodes flushed.  `flush_log` fsyncs the log at the
+    /// end (JE `syncDatabase` always flushes; a caller that batches may pass
+    /// false).
+    pub fn sync_database(&self, db_id: u64, flush_log: bool) -> Result<u64> {
+        // F-D (93b37bff) + review constraint R-FLUSHLVL #2: serialize a
+        // per-DB sync against a concurrent full checkpoint (and another sync)
+        // by WAITING on the SAME `checkpoint_serial` lock `do_checkpoint`
+        // takes — JE `Database.sync()` -> `DatabaseImpl.sync()` ->
+        // `Checkpointer.syncDatabase` which, like `doCheckpoint`, is
+        // `synchronized`, so a caller BLOCKS until the running pass finishes
+        // and THEN runs its own flush.  A sync must NEVER skip its flush just
+        // because a checkpoint is running: that checkpoint may have already
+        // passed this tree before the sync's writes were made, so skipping
+        // would silently drop the durability guarantee BUG-DW-SYNC-1
+        // restores.  Holding this lock across the pass also protects the
+        // shared `checkpoint_flush_levels` clear+repopulate below.
+        let _serial =
+            self.checkpoint_serial.lock().unwrap_or_else(|e| e.into_inner());
+        // Publish `checkpoint_in_progress` for the evictor's
+        // get_eviction_provisional coordination during this pass; the serial
+        // lock guarantees no other pass is running, so the CAS cannot fail.
+        self.checkpoint_in_progress.store(true, Ordering::Release);
+        let _ckpt_guard = CheckpointGuard {
+            flag: &self.checkpoint_in_progress,
+            flush_levels: &self.checkpoint_flush_levels,
+        };
+        let mut result = FlushResult::default();
+        let lm = match &self.log_manager {
+            Some(lm) => lm,
+            None => return Ok(0),
+        };
+
+        // Resolve the ONE tree for `db_id` (registry first, then the wired
+        // primary tree).  JE selects dirty INs for exactly `dbImpl`.
+        let tree_arc: Option<Arc<RwLock<Tree>>> = {
+            let mut found = None;
+            if let Some(reg) = &self.db_trees_registry
+                && let Ok(guard) = reg.lock()
+                && let Some(t) = guard.get(&(db_id as i64))
+            {
+                found = Some(Arc::clone(t));
+            }
+            if found.is_none()
+                && let Some(t) = &self.tree
+                && self.db_id == db_id
+            {
+                found = Some(Arc::clone(t));
+            }
+            found
+        };
+        let Some(tree_arc) = tree_arc else {
+            // Unknown db_id: nothing to sync.
+            return Ok(0);
+        };
+
+        // Compute this tree's highest flush level so its lower upper-IN levels
+        // are logged Provisional::Yes and the root Provisional::No — the SAME
+        // rule the full checkpoint applies, scoped to this one DB.
+        {
+            let flush_level = tree_arc.read().ok().and_then(|guard| {
+                let dirty_ins = guard.collect_dirty_upper_ins(db_id);
+                let max_dirty = dirty_ins.iter().map(|(lvl, _)| *lvl).max()?;
+                let root_level = guard
+                    .get_root()
+                    .map(|r| r.read().level())
+                    .unwrap_or(max_dirty);
+                Some((max_dirty + 1).min(root_level))
+            });
+            let mut levels = self
+                .checkpoint_flush_levels
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            levels.clear();
+            if let Some(level) = flush_level
+                && level > 0
+            {
+                levels.insert(db_id, level);
+            }
+        }
+
+        // Flush the dirty BINs, then the upper INs bottom-up (JE
+        // flushDirtyNodes orders levels low->high).  `sync_database` is only
+        // reached for a DEFERRED-WRITE DB (Database::sync routes DW there), so
+        // dw_mode = true: every never-logged slot (embedded or not) is logged
+        // (JE force = isDeferredWriteMode() && isTransientOrNull).
+        let b = Self::flush_one_tree_bins(
+            db_id,
+            &tree_arc,
+            lm,
+            self.config.bin_delta_percent,
+            self.config.allow_bin_deltas,
+            true, // dw_mode
+        )?;
+        result.full_bins_flushed += b.full_bins_flushed;
+        result.delta_ins_flushed += b.delta_ins_flushed;
+        result.obsolete_full_lsns.extend(b.obsolete_full_lsns);
+
+        let u = Self::flush_one_tree_upper_ins(db_id, &tree_arc, lm, true)?;
+        result.full_ins_flushed += u.full_ins_flushed;
+        result.obsolete_full_lsns.extend(u.obsolete_full_lsns);
+
+        // Count superseded prior full IN/BIN images obsolete (same path the
+        // full checkpoint uses) and persist file summaries so the sync's
+        // utilization accounting survives a restart.
+        if !result.obsolete_full_lsns.is_empty()
+            && let Some(tracker_lock) = &self.utilization_tracker
+        {
+            let mut tracker = tracker_lock.lock();
+            for (lsn, odb) in &result.obsolete_full_lsns {
+                if tracker.is_obsolete_offset_tracked(
+                    lsn.file_number(),
+                    lsn.file_offset(),
+                ) {
+                    continue;
+                }
+                tracker.count_obsolete_node_dups_allowed(
+                    lsn.file_number(),
+                    lsn.file_offset(),
+                    0,
+                    false,
+                    Some(*odb),
+                );
+            }
+        }
+        self.persist_file_summaries()?;
+
+        // Clear the per-DB flush levels we published.
+        {
+            let mut levels = self
+                .checkpoint_flush_levels
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            levels.clear();
+        }
+
+        // fsync so the flushed nodes are durable (JE syncDatabase -> flushSync).
+        if flush_log {
+            lm.flush_sync().map_err(|e| {
+                RecoveryError::CheckpointError(format!(
+                    "sync_database flush_sync failed: {e}"
+                ))
+            })?;
+        }
+        Ok(result.full_bins_flushed
+            + result.delta_ins_flushed
+            + result.full_ins_flushed)
+    }
+
     pub(crate) fn flush_dirty_bins_internal(&self) -> Result<FlushResult> {
         let mut result = FlushResult::default();
 
@@ -1243,6 +1571,13 @@ impl Checkpointer {
                 lm,
                 self.config.bin_delta_percent,
                 self.config.allow_bin_deltas,
+                // JE per-DB force rule (logDirtyLN force =
+                // getDatabase().isDeferredWriteMode() && isTransientOrNull): a
+                // DW DB's full checkpoint logs EVERY never-logged slot
+                // (embedded or not), so a DW DB checkpointed-but-not-synced
+                // does not keep NULL embedded slots whose only copy is the BIN
+                // image.  Non-DW DBs log only non-embedded never-logged slots.
+                self.is_deferred_write_db(db_id),
             )?;
             result.full_bins_flushed += r.full_bins_flushed;
             result.delta_ins_flushed += r.delta_ins_flushed;
@@ -1321,12 +1656,18 @@ impl Checkpointer {
     /// Extracted so both `flush_dirty_bins_internal` (primary tree) and the
     /// per-user-database loop can share the same logic without duplicating the
     /// TREE_BIN_DELTA decision or the X-8 early-exit guard.
+    ///
+    /// `dw_mode` is forwarded to `log_dirty_lns_in_bin`: `true` when this tree
+    /// is a deferred-write DB being synced/checkpointed (log every never-logged
+    /// slot, embedded or not), `false` for an ordinary-DB checkpoint pass (log
+    /// only non-embedded never-logged slots).
     fn flush_one_tree_bins(
         db_id: u64,
         tree_arc: &Arc<RwLock<Tree>>,
         lm: &Arc<LogManager>,
         bin_delta_percent: i32,
         allow_bin_deltas: bool,
+        dw_mode: bool,
     ) -> Result<FlushResult> {
         let mut result = FlushResult::default();
 
@@ -1378,6 +1719,14 @@ impl Checkpointer {
             // used to (a) stamp the parent IN's child slot and (b) seed a
             // single-level tree's root.  Set in each log path below.
             let seed_full_lsn: Lsn;
+
+            // BUG-DW-SYNC-1 (JE BIN.logDirtyLN / IN.logDirtyChildren): log any
+            // never-logged deferred-write LN resident in this BIN BEFORE
+            // serialising the BIN image, so every live slot carries a real LSN
+            // (the BIN image then points at durable LN logrecs instead of
+            // NULL).  A non-deferred-write slot already has a logged LSN, so
+            // this is a no-op for ordinary DBs.
+            log_dirty_lns_in_bin(db_id, b, lm, dw_mode)?;
 
             // TREE_BIN_DELTA decision — faithful JE `BIN.shouldLogDelta`
             // (BIN.java:1892): COUNT-based (numDeltas = dirty slots) against the
@@ -1636,7 +1985,12 @@ impl Checkpointer {
         }
 
         for (db_id, tree_arc) in trees_to_flush {
-            let r = Self::flush_one_tree_upper_ins(db_id, &tree_arc, lm)?;
+            let r = Self::flush_one_tree_upper_ins(
+                db_id,
+                &tree_arc,
+                lm,
+                self.is_deferred_write_db(db_id),
+            )?;
             result.full_ins_flushed += r.full_ins_flushed;
             result.obsolete_full_lsns.extend(r.obsolete_full_lsns);
         }
@@ -1694,10 +2048,80 @@ impl Checkpointer {
     /// so that `Tree::get_root_lsn` — read into `CheckpointEnd.per_db_roots`
     /// — reflects the checkpointed root.  JE keeps this invariant via the
     /// root `ChildReference`'s LSN being updated when the root is logged.
+    /// Log, provisionally as JE's split does, every resident child whose
+    /// slot in `n` is still NULL_LSN (deepest first) and stamp the slot.
+    fn log_null_lsn_children(
+        db_id: u64,
+        n: &mut noxu_tree::tree::InNodeStub,
+        lm: &Arc<LogManager>,
+        result: &mut FlushResult,
+        dw_mode: bool,
+    ) -> Result<()> {
+        for idx in 0..n.entries.len() {
+            let Some(child) = n.get_child(idx) else {
+                continue;
+            };
+            let mut g = child.write();
+            // A split after the BIN pass leaves the new sibling NULL and the
+            // left half dirty under its PRE-split slot LSN (whose image still
+            // holds the moved keys). JE logs both halves at split and stamps
+            // both slots (IN.java:4320-4360): log any NULL or dirty child.
+            if n.get_lsn(idx) != NULL_LSN && !g.is_dirty() {
+                continue;
+            }
+            if let TreeNode::Internal(c) = &mut *g {
+                Self::log_null_lsn_children(db_id, c, lm, result, dw_mode)?;
+            }
+            // BUG-DW-SYNC-1: before serialising a child BIN, log its
+            // never-logged deferred-write LNs so the BIN image carries real
+            // slot LSNs (JE BIN.logDirtyLN / IN.logDirtyChildren).
+            if let TreeNode::Bottom(b) = &mut *g {
+                log_dirty_lns_in_bin(db_id, b, lm, dw_mode)?;
+            }
+            let (kind, prev, data) = match &*g {
+                TreeNode::Bottom(b) => {
+                    (LogEntryType::BIN, b.last_full_lsn, b.serialize_full())
+                }
+                TreeNode::Internal(_) => {
+                    (LogEntryType::IN, NULL_LSN, g.write_to_bytes())
+                }
+            };
+            let entry = InLogEntry::new(db_id, prev, NULL_LSN, data);
+            let mut buf = bytes::BytesMut::with_capacity(entry.log_size());
+            entry.write_to_log(&mut buf);
+            let lsn = lm
+                .log(kind, &buf, Provisional::Yes, false, false)
+                .map_err(|e| {
+                    RecoveryError::CheckpointError(format!(
+                        "split child WAL write failed: {e}"
+                    ))
+                })?;
+            match &mut *g {
+                TreeNode::Bottom(b) => {
+                    for old in [b.last_full_lsn, b.last_delta_lsn] {
+                        if old != NULL_LSN {
+                            result.obsolete_full_lsns.push((old, db_id as u32));
+                        }
+                    }
+                    b.last_delta_lsn = NULL_LSN;
+                    b.clear_dirty_after_full_log(lsn);
+                    result.full_bins_flushed += 1;
+                }
+                TreeNode::Internal(c) => {
+                    c.dirty = false;
+                    result.full_ins_flushed += 1;
+                }
+            }
+            n.set_lsn(idx, lsn);
+        }
+        Ok(())
+    }
+
     fn flush_one_tree_upper_ins(
         db_id: u64,
         tree_arc: &Arc<RwLock<Tree>>,
         lm: &Arc<LogManager>,
+        dw_mode: bool,
     ) -> Result<FlushResult> {
         let mut result = FlushResult::default();
 
@@ -1748,6 +2172,32 @@ impl Checkpointer {
                 }
 
                 let this_node_id = node_guard.node_id();
+
+                // JE logs a split's new sibling before installing it in the
+                // parent (IN.java:4320-4323, :4348-4360) and never logs an
+                // upper IN with a NULL child (IN.java:5880/:5930). Noxu
+                // defers sibling logging, so a split after the BIN pass
+                // leaves a NULL slot here: log those children first.
+                if let TreeNode::Internal(n) = &mut *node_guard {
+                    Self::log_null_lsn_children(
+                        db_id,
+                        n,
+                        lm,
+                        &mut result,
+                        dw_mode,
+                    )?;
+                    // v7.11.1 tag-native: the integrate base stamped a v4
+                    // upper-IN is-root bit here (n.is_root) so recovery could
+                    // install an upper-IN root WITHOUT a CheckpointEnd. This
+                    // base has no InNodeStub::is_root field / v4 is-root
+                    // serialization (an integrate-only prerequisite); it marks
+                    // is-root at recovery time via recover_in_redo's is_root
+                    // parameter + root_log_lsn / per_db_roots. The DW-relevant
+                    // part (logging never-logged child LNs before the BIN
+                    // image) is log_null_lsn_children above; the is-root stamp
+                    // is dropped. let _ = (this_node_id, root_node_id);
+                    let _ = (this_node_id, root_node_id);
+                }
 
                 // Serialize the upper IN using the existing `write_to_bytes()`.
                 let node_bytes = node_guard.write_to_bytes();
@@ -1941,6 +2391,79 @@ mod tests {
         };
         assert_eq!(result.checkpoint_id, 42);
         assert_eq!(result.total_nodes_flushed(), 35);
+    }
+
+    /// F-D / R-FLUSHLVL #2 / BUG-DW-SYNC-1: `sync_database` must WAIT for a
+    /// concurrent checkpoint (holding `checkpoint_serial`), NOT skip its
+    /// flush or error.  A sync that skipped would silently drop its records'
+    /// durability whenever the background checkpointer happened to be running
+    /// — the exact bug BUG-DW-SYNC-1 fixes.  Here we hold the serial lock on
+    /// a holder thread (standing in for an in-progress checkpoint), start a
+    /// `sync_database`, assert it has NOT returned while the lock is held,
+    /// then release and assert it returns Ok.
+    #[test]
+    fn sync_database_waits_for_checkpoint_not_skips() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering as O};
+        use std::time::Duration;
+
+        let cp = Arc::new(Checkpointer::new(CheckpointConfig::default()));
+
+        // Hold `checkpoint_serial` as a running checkpoint would.
+        let held = Arc::new(AtomicBool::new(true));
+        let release = Arc::new(AtomicBool::new(false));
+        let holder = {
+            let cp = Arc::clone(&cp);
+            let held = Arc::clone(&held);
+            let release = Arc::clone(&release);
+            std::thread::spawn(move || {
+                let _g = cp
+                    .checkpoint_serial
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                held.store(true, O::Release);
+                while !release.load(O::Acquire) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            })
+        };
+        // Wait until the holder owns the lock.
+        while !held.load(O::Acquire) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+
+        // Start the sync; it must BLOCK on `checkpoint_serial`.
+        let done = Arc::new(AtomicBool::new(false));
+        let syncer = {
+            let cp = Arc::clone(&cp);
+            let done = Arc::clone(&done);
+            std::thread::spawn(move || {
+                // db_id with no tree + no log_manager returns Ok(0) AFTER the
+                // serial lock is acquired — the point is it does not return
+                // (and does not error/skip) until the lock is free.
+                let r = cp.sync_database(42, true);
+                done.store(true, O::Release);
+                r
+            })
+        };
+        // While the serial lock is held, the sync must not have returned.
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(
+            !done.load(O::Acquire),
+            "sync_database returned while a checkpoint held checkpoint_serial — \
+             it skipped/errored instead of WAITING (durability regression)"
+        );
+
+        // Release the holder; the sync must now complete with Ok.
+        release.store(true, O::Release);
+        holder.join().unwrap();
+        let r = syncer.join().unwrap();
+        assert!(
+            r.is_ok(),
+            "sync_database must return Ok after waiting out the checkpoint, got {r:?}"
+        );
+        assert!(done.load(O::Acquire));
     }
 
     #[test]
@@ -3463,7 +3986,9 @@ mod tests {
 
         let tree_arc = Arc::new(RwLock::new(tree));
         let result =
-            Checkpointer::flush_one_tree_upper_ins(1, &tree_arc, &lm).unwrap();
+            // dw_mode=false: this is a non-deferred-write checkpoint test.
+            Checkpointer::flush_one_tree_upper_ins(1, &tree_arc, &lm, false)
+                .unwrap();
 
         let obs: Vec<Lsn> =
             result.obsolete_full_lsns.iter().map(|&(l, _)| l).collect();

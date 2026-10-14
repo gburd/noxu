@@ -412,8 +412,25 @@ fn verify_bin_stub(
 
     // Check each slot.
     for (i, entry) in bin.entries.iter().enumerate() {
-        // Non-deleted entries must have a valid LSN.
-        if !entry.known_deleted && bin.get_lsn(i) == NULL_LSN {
+        // A live (non-deleted) slot must have a durable copy.  A NON-embedded
+        // slot keeps its data in a separate LN logrec, so its slot LSN must be
+        // a real (logged) LSN — a NULL LSN there means the value has no durable
+        // copy (the deferred-write data-loss case, BUG-DW-SYNC-1, now fixed by
+        // logging DW LNs before the BIN).  An EMBEDDED slot carries its data
+        // INSIDE the BIN image, so a NULL slot LSN is legitimate (the separate
+        // LN logrec is immediately obsolete and may be cleaned); flagging it
+        // would wrongly reject a regular DB whose BIN was reconstituted from a
+        // checkpointed image after its LN file was cleaned
+        // (delta_cleaner_deletion_test).  JE IN.shouldUpdateLsn (IN.java:
+        // 1961-1988) governs the non-embedded invariant.
+        //
+        // v7.11.1 tag-native: `!entry.embedded` on integrate becomes
+        // `!bin.is_embedded(i)` (this base has no per-slot embedded bool;
+        // embedding is data.len() <= max_embedded_ln).
+        if !entry.known_deleted
+            && !bin.is_embedded(i)
+            && bin.get_lsn(i) == NULL_LSN
+        {
             result.add_error(VerifyError::BtreeError {
                 db_name: db_name.to_string(),
                 description: format!(
@@ -1097,9 +1114,17 @@ mod tests {
                 1,
                 Arc::clone(&lm),
             );
-            cursor.put(b"alpha", b"1", PutMode::Overwrite).unwrap();
-            cursor.put(b"beta", b"2", PutMode::Overwrite).unwrap();
-            cursor.put(b"gamma", b"3", PutMode::Overwrite).unwrap();
+            // BUG-DW-SYNC-1 / verify: the NULL-LSN-slot error now fires only
+            // for a NON-embedded live slot (an embedded slot carries its data
+            // IN the BIN image, so a NULL slot LSN there is legitimate).  Use
+            // values LARGER than max_embedded_ln (16) so the slots are stored
+            // as separate LN logrecs (non-embedded) and a corrupted NULL slot
+            // LSN is a genuine missing-durable-copy error the verifier must
+            // still catch.
+            let big = vec![b'x'; 64];
+            cursor.put(b"alpha", &big, PutMode::Overwrite).unwrap();
+            cursor.put(b"beta", &big, PutMode::Overwrite).unwrap();
+            cursor.put(b"gamma", &big, PutMode::Overwrite).unwrap();
         }
 
         let guard = db.read();

@@ -414,6 +414,130 @@ fn main() {
             }
         }
 
+        // ----------------------------------------------------------------
+        // deferred_write_nosync: JE DeferredWriteTest.testRecoverNoSync /
+        // testCloseOpenNoSync.  A deferred-write DB's records are DURABLE only
+        // after an explicit sync(); records written after the last sync are
+        // LOST on an abnormal (crash) close.
+        //
+        // Phase 1 (synced): write keys 0..50, then db.sync() -> durable.
+        // Phase 2 (unsynced): write keys 1000..1050, NO sync -> volatile.
+        // Parent SIGKILLs after `dw_unsynced_started`.
+        //
+        // After recovery: keys 0..50 present ("synced"); keys 1000..1050 gone.
+        //
+        // `_evict` variant: before phase 2, write a large filler batch and
+        // force eviction so the synced BINs are flushed from cache; the
+        // recovery path must still restore exactly the synced set.
+        // root_split_sync: build a MULTI-LEVEL deferred-write tree (a root
+        // split) with distinct keys, db.sync() to make it durable, then write
+        // an unsynced batch and loop until SIGKILL.  Validates that a split
+        // root (upper IN) logged by syncDatabase recovers WITHOUT a CkptEnd.
+        "root_split_sync" => {
+            let dw_cfg = DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_deferred_write(true);
+            let dw =
+                env.open_database(None, "dw", &dw_cfg).expect("open dw db");
+            // Enough keys with sizeable values to force several BINs under an
+            // upper-IN root.
+            let val = vec![7u8; 512];
+            for i in 0u32..300 {
+                dw.put(
+                    DatabaseEntry::from_bytes(&i.to_be_bytes()),
+                    DatabaseEntry::from_bytes(&val),
+                )
+                .expect("put synced");
+            }
+            dw.sync().expect("sync split tree");
+            flag(&dir, "dw_phase1_synced");
+            for i in 1000u32..1050 {
+                dw.put(
+                    DatabaseEntry::from_bytes(&i.to_be_bytes()),
+                    DatabaseEntry::from_bytes(b"unsynced"),
+                )
+                .expect("put unsynced");
+            }
+            flag(&dir, "dw_unsynced_started");
+            loop {
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        "deferred_write_nosync" | "deferred_write_nosync_evict" => {
+            let evict = mode == "deferred_write_nosync_evict";
+            let dw_cfg = DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_deferred_write(true);
+            let dw =
+                env.open_database(None, "dw", &dw_cfg).expect("open dw db");
+
+            // Phase 1: synced batch.
+            for i in 0u32..50 {
+                let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
+                let val = DatabaseEntry::from_bytes(b"synced");
+                dw.put(&key, &val).expect("put synced");
+            }
+            dw.sync().expect("sync phase 1");
+            if evict {
+                // Force cache pressure: a filler batch + a checkpoint-free
+                // eviction nudge.  (The synced phase-1 data is already on disk;
+                // the filler is itself synced so recovery has a clean base.)
+                for i in 100_000u32..101_000 {
+                    let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
+                    let val = DatabaseEntry::from_bytes(b"filler");
+                    dw.put(&key, &val).expect("put filler");
+                }
+                dw.sync().expect("sync filler");
+            }
+            flag(&dir, "dw_phase1_synced");
+
+            // Phase 2: unsynced batch — parent kills us here.
+            for i in 1000u32..1050 {
+                let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
+                let val = DatabaseEntry::from_bytes(b"unsynced");
+                dw.put(&key, &val).expect("put unsynced");
+            }
+            flag(&dir, "dw_unsynced_started");
+            loop {
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        "dw_sync_then_remove" => {
+            // Task-3 recovery-correctness witness: a database created and made
+            // durable with db.sync(), then REMOVED, then crashed, must stay
+            // REMOVED after recovery — the "instantiate a tree for every db in
+            // dirty_ins" rule (BUG-DW-SYNC-1) must NOT resurrect a removed DB.
+            // JE skips a removed DB's stale logged INs because
+            // `dbMapTree.getDb(dbId)` returns null (RecoveryManager.java:1091).
+            let dw_cfg = DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_deferred_write(true);
+            let dw =
+                env.open_database(None, "dw", &dw_cfg).expect("open dw db");
+            for i in 0u32..50 {
+                dw.put(
+                    DatabaseEntry::from_bytes(&i.to_be_bytes()),
+                    DatabaseEntry::from_bytes(b"synced"),
+                )
+                .expect("put");
+            }
+            // sync() logs the DW tree's BINs/INs -> db_id lands in dirty_ins.
+            dw.sync().expect("sync dw");
+            dw.close().expect("close dw");
+            // Remove the DB inside a transaction and COMMIT (the commit flushes
+            // the NameLN-delete durably, so the removal survives the crash).
+            let txn = env.begin_transaction(None).expect("begin txn");
+            env.remove_database(Some(&txn), "dw").expect("remove dw");
+            txn.commit().expect("commit remove");
+            flag(&dir, "dw_phase1_synced");
+            flag(&dir, "dw_unsynced_started");
+            loop {
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+
         other => panic!("Unknown NOXU_CRASH_MODE: {other}"),
     }
 }

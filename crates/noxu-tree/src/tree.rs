@@ -1454,6 +1454,27 @@ impl BinStub {
     /// reconstitution until the compressor reclaims them; the maintenance
     /// paths (compressor / recovery undo) iterate them on purpose and do NOT
     /// use this predicate.
+    /// True iff slot `idx`'s LN data is embedded directly in the BIN image
+    /// rather than stored as a separate LN logrec (`data.len() <=
+    /// max_embedded_ln`).  This is the SAME predicate `serialize_full` /
+    /// `serialize_delta` use to decide `has_data`, so an embedded slot is
+    /// self-contained in the BIN image and a NULL slot LSN there is
+    /// legitimate (JE `CursorImpl.shouldEmbedLN`).  A slot with no cached
+    /// data (deletion tombstone / stripped) is treated as NOT embedded.
+    ///
+    /// v7.11.1 tag-native: the integrate base tracked embeddedness in a
+    /// per-slot `BinEntry.embedded` bool; this base has no such field and
+    /// decides embedding dynamically from the data length vs the BIN's
+    /// `max_embedded_ln` threshold (REG-CLEANER-DISKLIMIT), so this helper
+    /// reconstructs the same flag the serializer applies.
+    #[inline]
+    pub fn is_embedded(&self, idx: usize) -> bool {
+        match self.entries.get(idx).and_then(|e| e.data.as_ref()) {
+            Some(d) => (d.len() as i64) <= self.max_embedded_ln as i64,
+            None => false,
+        }
+    }
+
     #[inline]
     pub fn slot_is_live(&self, idx: usize) -> bool {
         match self.entries.get(idx) {

@@ -280,6 +280,14 @@ pub struct Evictor {
     /// full environment fall back to the single `tree` slot).
     db_trees_registry:
         RwLock<Option<Arc<std::sync::Mutex<HashMap<i64, Arc<RwLock<Tree>>>>>>>,
+    /// Env-wide set of deferred-write db_ids (the SAME `Arc` the checkpointer
+    /// holds).  Used to apply JE's per-DB `logDirtyLN` force rule when logging
+    /// an evicted DW BIN (BIN.evictLNInternal -> logDirtyLN,
+    /// `force = getDatabase().isDeferredWriteMode() && isTransientOrNull`): a
+    /// DW DB's evicted BIN logs every never-logged slot, embedded or not.
+    /// `None` for unit tests without a full environment (treated as non-DW).
+    deferred_write_dbs:
+        RwLock<Option<Arc<std::sync::Mutex<std::collections::HashSet<u64>>>>>,
     off_heap: Option<Arc<OffHeapCache>>,
     /// Optional checkpointer reference for CC-4: provisional-flag coordination.
     ///
@@ -353,6 +361,7 @@ impl Evictor {
             tree: RwLock::new(None),
             db_id: AtomicU64::new(0),
             db_trees_registry: RwLock::new(None),
+            deferred_write_dbs: RwLock::new(None),
             off_heap: None,
             checkpointer: RwLock::new(None),
         }
@@ -440,6 +449,32 @@ impl Evictor {
             .db_trees_registry
             .write()
             .expect("evictor registry lock poisoned") = Some(registry);
+    }
+
+    /// Wire the env-wide set of deferred-write db_ids (the SAME `Arc` the
+    /// checkpointer holds) so eviction applies JE's per-DB `logDirtyLN` force
+    /// rule to a DW DB's evicted BIN.
+    pub fn set_deferred_write_dbs(
+        &self,
+        dw: Arc<std::sync::Mutex<std::collections::HashSet<u64>>>,
+    ) {
+        *self
+            .deferred_write_dbs
+            .write()
+            .expect("evictor dw-set lock poisoned") = Some(dw);
+    }
+
+    /// Whether `db_id` is a deferred-write database (JE
+    /// `DatabaseImpl.isDeferredWriteMode`).  Unknown / no set => false.
+    fn is_deferred_write_db(&self, db_id: u64) -> bool {
+        self.deferred_write_dbs
+            .read()
+            .ok()
+            .and_then(|g| {
+                g.as_ref()
+                    .and_then(|s| s.lock().ok().map(|set| set.contains(&db_id)))
+            })
+            .unwrap_or(false)
     }
 
     /// Collect every candidate tree to search, in priority order: the primary
@@ -1425,6 +1460,32 @@ impl Evictor {
             .and_then(|w| w.upgrade())
             .map(|c| c.get_eviction_provisional(db_id, bin.level))
             .unwrap_or(Provisional::No);
+
+        // BUG-DW-EVICT-NULLLSN / BUG-DW-SYNC-1 (JE BIN.evictLNInternal ->
+        // logDirtyLN, BIN.java:1593): before logging a dirty BIN image during
+        // eviction, log the never-logged LNs resident in it so the image
+        // carries real slot LSNs instead of NULL (otherwise the parent-slot
+        // stamp below publishes a null child LSN and the next flush asserts,
+        // log_buffer.rs:296).  JE per-DB force rule
+        // (force = getDatabase().isDeferredWriteMode() && isTransientOrNull):
+        // a DW DB's evicted BIN logs EVERY never-logged slot (embedded or not)
+        // so a DW DB checkpointed-but-not-synced keeps no NULL embedded slot
+        // whose only copy is this BIN image; a non-DW DB logs only non-embedded
+        // never-logged slots (embedded data is self-contained in the BIN image
+        // this evict logs).  A no-op for ordinary DBs (their non-embedded slots
+        // already hold logged LSNs).
+        if let Err(e) = noxu_recovery::checkpointer::log_dirty_lns_in_bin(
+            db_id,
+            bin,
+            &lm,
+            self.is_deferred_write_db(db_id),
+        ) {
+            log::error!(
+                "evictor: logging deferred-write LNs before BIN flush failed: \
+                 {e}; putting the BIN back"
+            );
+            return false; // could not make the BIN durable — put it back
+        }
 
         let full_bytes = bin.serialize_full();
         let entry =
