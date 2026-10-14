@@ -640,6 +640,9 @@ impl CursorImpl {
         // panicked a later read).  A resident 0-byte value is NOT refetched.
         if lsn != noxu_util::NULL_LSN.as_u64()
             && matches!(data, Some(None))
+            // JE IN.fetchLN never fetches an immediately-obsolete dup-DB LN
+            // (IN.java:2780-2783): dup data lives in the two-part key.
+            && !self.is_sorted_dup()
             && let Some(fetched) = self.fetch_ln_data_from_log(lsn)?
             && !fetched.is_empty()
         {
@@ -1135,6 +1138,16 @@ impl CursorImpl {
         if tick_fail() {
             return Err(DbiError::CursorClosed);
         }
+        self.check_env()?;
+        match self.state {
+            CursorState::Closed => Err(DbiError::CursorClosed),
+            _ => Ok(()),
+        }
+    }
+
+    /// JE `CursorImpl.checkEnv` (CursorImpl.java:3874): fail if the env is
+    /// invalid.
+    fn check_env(&self) -> Result<(), DbiError> {
         // X-13: check environment validity before cursor state.
         // Both the explicit invalidation flag and the I/O-failure flag
         // (io_invalid) are tested so that reads on a failed environment
@@ -1155,10 +1168,7 @@ impl CursorImpl {
                     .into(),
             });
         }
-        match self.state {
-            CursorState::Closed => Err(DbiError::CursorClosed),
-            _ => Ok(()),
-        }
+        Ok(())
     }
 
     /// Checks the cursor is initialized.
@@ -1182,21 +1192,60 @@ impl CursorImpl {
         let Some(lm) = self.log_manager.as_ref() else {
             return Ok(None);
         };
+        use crate::EnvironmentFailureReason as R;
+        use noxu_log::NoxuLogError as L;
         let lsn = noxu_util::Lsn::from_u64(lsn);
+        // JE EnvironmentFailureException ctor (EnvironmentFailureException
+        // .java:159-166): an invalidating reason invalidates the env.
+        let fail = |reason: R, msg: String| {
+            if reason.invalidates_environment()
+                && let Some(f) = &self.env_invalid
+            {
+                f.store(true, Ordering::Release);
+            }
+            DbiError::LnFetchFailure {
+                reason,
+                msg: format!("LN fetch at {lsn:?}: {msg}"),
+            }
+        };
         let (entry_type, bytes) = match lm.read_entry(lsn) {
             Ok(r) => r,
             Err(_) if lm.file_manager().is_closed() => {
                 return Err(DbiError::EnvironmentNotOpen);
             }
-            Err(_) => return Ok(None),
+            Err(e) => {
+                let reason = match &e {
+                    // IN.java:2826-2833 / LogManager.java:957-960.
+                    L::FileNotFound(_) => R::LogFileNotFound,
+                    L::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
+                        R::LogFileNotFound
+                    }
+                    // LogManager.java:1055-1113 ChecksumException (incl.
+                    // short read) -> LOG_CHECKSUM (:927-939).
+                    L::Checksum { .. }
+                    | L::UnexpectedEof { .. }
+                    | L::InvalidEntrySize { .. }
+                    | L::InvalidHeader { .. }
+                    | L::HeaderChecksumMismatch { .. } => R::LogChecksum,
+                    L::InvalidEntryType { .. } => R::LogIntegrity,
+                    // Other IOException on read -> LOG_READ (LogManager.java
+                    // :1158).
+                    _ => R::LogRead,
+                };
+                return Err(fail(reason, e.to_string()));
+            }
         };
+        // Wrong entry type / parse failure: IN.java:2841-2843 LOG_INTEGRITY
+        // (does not invalidate, EnvironmentFailureReason.java:73-75).
         if !entry_type.is_ln_type() {
-            return Ok(None);
+            return Err(fail(
+                R::LogIntegrity,
+                format!("not an LN entry: {entry_type:?}"),
+            ));
         }
         let is_txnal = entry_type.is_transactional();
-        let Ok(ln) = LnLogEntry::parse_from_slice(&bytes, is_txnal) else {
-            return Ok(None);
-        };
+        let ln = LnLogEntry::parse_from_slice(&bytes, is_txnal)
+            .map_err(|e| fail(R::LogIntegrity, e.to_string()))?;
         // `ln.data` borrows from `bytes` (the log read buffer), so we must
         // copy it into an owned Bytes here — this is the cold evictor-restripe
         // path (LN was stripped from cache), not the resident-slot hot read.
@@ -1207,8 +1256,20 @@ impl CursorImpl {
     /// stripped by the evictor — re-fetch it from the log (JE
     /// `IN.fetchTarget`). Idempotent; cheap when data is resident.
     fn rehydrate_current_data(&mut self) -> Result<(), DbiError> {
-        let needs =
-            self.current_data.as_ref().map(|d| d.is_empty()).unwrap_or(true);
+        // JE IN.fetchLN never fetches an immediately-obsolete (dup DB) LN
+        // (IN.java:2780-2783): dup data lives in the two-part key.
+        if self.is_sorted_dup() {
+            return Ok(());
+        }
+        // Empty-value trap: an empty `current_data` is either a genuine
+        // 0-byte value (resident, `Some(empty)` in the slot) or a stripped LN
+        // (`None` in the slot) -- the positioning paths erase the difference.
+        // Decide by residency in the slot, never by emptiness.
+        let needs = match self.current_data.as_ref() {
+            None => true,
+            Some(d) if d.is_empty() => !self.current_slot_data_resident(),
+            Some(_) => false,
+        };
         if needs
             && self.current_lsn != 0
             && let Some(d) = self.fetch_ln_data_from_log(self.current_lsn)?
@@ -1217,6 +1278,38 @@ impl CursorImpl {
             self.current_data = Some(d);
         }
         Ok(())
+    }
+
+    /// True if the slot for `current_key` holds its data in memory
+    /// (`BinEntry::data.is_some()`: embedded or cached LN).
+    fn current_slot_data_resident(&self) -> bool {
+        let Some(key) = self.current_key.as_deref() else {
+            return false;
+        };
+        let db = self.db_impl.read();
+        db.get_real_tree().is_some_and(|tree| {
+            Self::slot_data_resident(&tree, key).unwrap_or(false)
+        })
+    }
+
+    /// `Some(resident)` for the slot matching `key`; `None` if no slot.
+    fn slot_data_resident(tree: &Tree, key: &[u8]) -> Option<bool> {
+        use noxu_tree::tree::TreeNode;
+        let bin_arc = Self::find_bin_for_key(tree, key)?;
+        let guard = bin_arc.read();
+        let TreeNode::Bottom(bin) = &*guard else {
+            return None;
+        };
+        if !bin.key_prefix.is_empty()
+            && !key.starts_with(bin.key_prefix.as_slice())
+        {
+            return None;
+        }
+        let (idx, found) = match tree.get_comparator() {
+            Some(cmp) => bin.find_entry_cmp(key, cmp.as_ref()),
+            None => bin.find_entry_compressed(key),
+        };
+        found.then(|| bin.entries[idx].data.is_some())
     }
 
     fn check_initialized(&self) -> Result<(), DbiError> {
@@ -2854,6 +2947,8 @@ impl CursorImpl {
     /// * `CursorNotInitialized` if the cursor is not positioned on a record
     /// * `CursorClosed` if the cursor has been closed
     pub fn get_current(&self) -> Result<(Vec<u8>, Bytes), DbiError> {
+        // JE Cursor.checkOpenAndState(true) -> checkEnv (Cursor.java:5381).
+        self.check_env()?;
         self.check_initialized()?;
 
         let raw_key =
@@ -4521,6 +4616,8 @@ impl CursorImpl {
     /// * `CursorNotInitialized` if cursor is not positioned
     /// * `CursorClosed` if cursor has been closed
     pub fn count(&self) -> Result<i64, DbiError> {
+        // JE Cursor.count -> checkOpenAndState(true) (Cursor.java:2136-2138).
+        self.check_env()?;
         // JE Cursor.countHandleDups / countNoDups count the dup set for the
         // CURRENT KEY regardless of whether the current record is deleted:
         // deleteCurrentRecord only PD-flags the slot, so getCurrentKey() still

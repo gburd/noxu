@@ -156,7 +156,10 @@ impl CursorSecMaint {
 #[inline]
 fn map_cursor_err(e: DbiError) -> NoxuError {
     match e {
-        DbiError::EnvironmentFailure { .. } => NoxuError::from(e),
+        // D1: an LN-fetch / env failure under a read keeps its typed JE
+        // reason instead of being flattened into OperationFailed.
+        DbiError::EnvironmentFailure { .. }
+        | DbiError::LnFetchFailure { .. } => NoxuError::from(e),
         // NEW-DBI-DUPPUTCUR: surface a rejected putCurrent (moving a dup to
         // a new sort position) as the typed DuplicateDataException so
         // callers can match on it, mirroring JE Cursor.putCurrent.

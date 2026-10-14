@@ -48,6 +48,9 @@ pub enum EnvironmentFailureReason {
     /// Mirrors `LOG_FILE_NOT_FOUND`.
     LogFileNotFound,
 
+    /// An I/O error occurred reading the log.  Mirrors `LOG_READ`.
+    LogRead,
+
     /// The log is incomplete or internally inconsistent.
     /// Mirrors `LOG_INTEGRITY`.
     LogIntegrity,
@@ -140,6 +143,8 @@ impl EnvironmentFailureReason {
             self,
             EnvironmentFailureReason::LogChecksum
                 | EnvironmentFailureReason::LogWrite
+                | EnvironmentFailureReason::LogFileNotFound
+                | EnvironmentFailureReason::LogRead
                 | EnvironmentFailureReason::LogIntegrity
                 | EnvironmentFailureReason::BtreeCorruption
                 | EnvironmentFailureReason::UnexpectedStateFatal
@@ -173,6 +178,7 @@ impl std::fmt::Display for EnvironmentFailureReason {
             EnvironmentFailureReason::LogFileNotFound => {
                 write!(f, "LOG_FILE_NOT_FOUND")
             }
+            EnvironmentFailureReason::LogRead => write!(f, "LOG_READ"),
             EnvironmentFailureReason::LogIntegrity => {
                 write!(f, "LOG_INTEGRITY")
             }
@@ -775,6 +781,24 @@ impl From<noxu_dbi::DbiError> for NoxuError {
                     reason: EnvironmentFailureReason::UnexpectedState,
                     msg: reason,
                 }
+            }
+            // D1: keep JE's specific LN-fetch reason (IN.java:2826-2843).
+            DbiError::LnFetchFailure { reason, msg } => {
+                use noxu_dbi::EnvironmentFailureReason as DbiR;
+                let reason = match reason {
+                    DbiR::LogFileNotFound => {
+                        EnvironmentFailureReason::LogFileNotFound
+                    }
+                    DbiR::LogChecksum => EnvironmentFailureReason::LogChecksum,
+                    DbiR::LogRead => EnvironmentFailureReason::LogRead,
+                    DbiR::LogIntegrity => {
+                        EnvironmentFailureReason::LogIntegrity
+                    }
+                    other => {
+                        EnvironmentFailureReason::Other(other.to_string())
+                    }
+                };
+                NoxuError::EnvironmentFailure { reason, msg }
             }
             // Wave 1C audit cleanup (transaction-env F22): map
             // recovery failures to a typed `EnvironmentFailure` whose

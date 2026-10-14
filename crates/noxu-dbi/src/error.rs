@@ -53,6 +53,18 @@ pub enum DbiError {
     #[error("environment failure: {reason}")]
     EnvironmentFailure { reason: String },
 
+    /// A non-resident LN could not be fetched from the log.  JE
+    /// `IN.fetchLN` throws `EnvironmentFailureException` with the specific
+    /// reason (IN.java:2826-2843); the reason is preserved for the public
+    /// error.  Invalidating reasons have already invalidated the env.
+    #[error("environment failure ({reason}): {msg}")]
+    LnFetchFailure {
+        /// JE `EnvironmentFailureReason`.
+        reason: crate::EnvironmentFailureReason,
+        /// Diagnostic.
+        msg: String,
+    },
+
     /// Recovery failed during environment open.
     ///
     /// Distinct from the more general `EnvironmentFailure` so callers
