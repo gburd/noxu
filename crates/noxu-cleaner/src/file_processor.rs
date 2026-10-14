@@ -115,15 +115,22 @@ fn write_migration_ln(
 fn fetch_migration_ln_data_from_log(
     lm: &LogManager,
     lsn: Lsn,
-) -> Option<Vec<u8>> {
+) -> Result<Vec<u8>, (bool, String)> {
     use noxu_log::entry::LnLogEntry;
-    let (entry_type, bytes) = lm.read_entry(lsn).ok()?;
+    let (entry_type, bytes) = lm.read_entry(lsn).map_err(|e| {
+        let invalidates =
+            !matches!(e, noxu_log::NoxuLogError::InvalidEntryType { .. });
+        (invalidates, format!("LN fetch at {lsn:?}: {e}"))
+    })?;
     if !entry_type.is_ln_type() {
-        return None;
+        return Err((false, format!("not an LN at {lsn:?}: {entry_type:?}")));
     }
     let is_txnal = entry_type.is_transactional();
-    let ln = LnLogEntry::parse_from_slice(&bytes, is_txnal).ok()?;
-    ln.data.map(|d| d.to_vec())
+    let ln = LnLogEntry::parse_from_slice(&bytes, is_txnal)
+        .map_err(|e| (false, format!("LN parse at {lsn:?}: {e}")))?;
+    ln.data
+        .map(|d| d.to_vec())
+        .ok_or_else(|| (false, format!("LN at {lsn:?} has no data")))
 }
 
 /// The number of LN log entries after which we process pending LNs.
@@ -384,8 +391,8 @@ impl TreeLookup for RealTreeLookup {
             None => match &self.log_manager {
                 Some(lm) => {
                     match fetch_migration_ln_data_from_log(lm, tree_lsn) {
-                        Some(d) => d,
-                        None => {
+                        Ok(d) => d,
+                        Err(_) => {
                             // Could not re-read the value; aborting migration is
                             // safe (the source file stays protected) — never
                             // migrate empty data for a non-embedded slot.
@@ -706,9 +713,18 @@ pub struct SharedTreeLookup {
     /// LNs are classified as live/obsolete against the correct tree, not
     /// the primary tree where their keys do not exist.
     extra_trees: HashMap<i64, Arc<RwLock<noxu_tree::Tree>>>,
+    /// D1 / F-3: the environment's invalidation flag, set when an LN fetch
+    /// fails with an env-invalidating reason.
+    env_invalid: Option<Arc<AtomicBool>>,
 }
 
 impl SharedTreeLookup {
+    /// Wires the environment's invalidation flag (D1 / F-3).
+    pub fn with_env_invalid(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.env_invalid = Some(flag);
+        self
+    }
+
     /// Creates a new `SharedTreeLookup` with a private `LockManager`.
     ///
     /// Used in tests or contexts where no shared environment LockManager is
@@ -719,7 +735,13 @@ impl SharedTreeLookup {
         log_manager: Arc<LogManager>,
     ) -> Self {
         let lock_manager = Arc::new(LockManager::new());
-        Self { tree, log_manager, lock_manager, extra_trees: HashMap::new() }
+        Self {
+            tree,
+            log_manager,
+            lock_manager,
+            extra_trees: HashMap::new(),
+            env_invalid: None,
+        }
     }
 
     /// Creates a new `SharedTreeLookup` with a wired `LockManager`.
@@ -731,7 +753,13 @@ impl SharedTreeLookup {
         log_manager: Arc<LogManager>,
         lock_manager: Arc<LockManager>,
     ) -> Self {
-        Self { tree, log_manager, lock_manager, extra_trees: HashMap::new() }
+        Self {
+            tree,
+            log_manager,
+            lock_manager,
+            extra_trees: HashMap::new(),
+            env_invalid: None,
+        }
     }
 
     /// Register per-database trees for secondary databases (X-7 fix).
@@ -885,11 +913,21 @@ impl TreeLookup for SharedTreeLookup {
                 &self.log_manager,
                 tree_lsn,
             ) {
-                Some(d) => d,
-                None => {
+                Ok(d) => d,
+                Err((invalidates, msg)) => {
                     // Could not re-read the value; abort the migration (source
                     // file stays protected).  Never migrate empty data for a
                     // non-embedded slot — that is the data-loss defect.
+                    // D1 / F-3: an env-invalidating read failure invalidates
+                    // the env (JE EFE ctor, EnvironmentFailureException.java:
+                    // 159-166), which stops cleaning and file deletion.  The
+                    // LN stays pending (Locked) so its file is retained.
+                    // ponytail: LOG_INTEGRITY (non-invalidating) stays a
+                    // silent pending retry; JE aborts the run loudly.
+                    log::error!("cleaner: {msg}");
+                    if invalidates && let Some(f) = &self.env_invalid {
+                        f.store(true, Ordering::Release);
+                    }
                     release_cleaner_lock(
                         &self.lock_manager,
                         lock_lsn,

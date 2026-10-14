@@ -3794,3 +3794,7 @@ mod tests {
         env.close().unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "cleaner_fetch_failclosed_probe.rs"]
+mod cleaner_fetch_failclosed_probe;

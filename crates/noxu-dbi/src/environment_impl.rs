@@ -1335,6 +1335,8 @@ impl EnvironmentImpl {
 
         // Cleaner initialization.
         // constructor (called after RecoveryManager.recover()).
+        // D1 / F-3: the env invalidation flag is shared with the cleaner.
+        let is_invalid = Arc::new(AtomicBool::new(false));
         let cleaner = log_manager.as_ref().map(|lm| {
             let fm = Arc::clone(lm.file_manager());
             // Pass the environment's shared LockManager so that cleaner-held
@@ -1353,7 +1355,9 @@ impl EnvironmentImpl {
             )
             // X-7: wire the shared db-tree registry so the cleaner
             // dispatches secondary-LN liveness checks to the correct tree.
-            .with_tree_registry(Arc::clone(&db_trees_registry));
+            .with_tree_registry(Arc::clone(&db_trees_registry))
+            // D1 / F-3: share the env invalidation flag with the cleaner.
+            .with_env_invalid(Arc::clone(&is_invalid));
             // CLN-F1: wire the minFileUtilization second-tier threshold so the
             // faithful getBestFile decision can clean a single below-threshold
             // file even when the aggregate gate passes.
@@ -1784,6 +1788,10 @@ impl EnvironmentImpl {
                             dispatcher_for_cleaner
                                 .dispatch("Cleaner", &e.to_string());
                         }
+                        // D1 / F-3: an invalid env stops the cleaner daemon.
+                        if c.is_env_invalid() {
+                            break;
+                        }
                         // JE: Cleaner.manageDiskUsage refreshes the cached disk
                         // usage stats after each pass so writes blocked by a
                         // disk-limit violation resume as soon as space frees.
@@ -1857,7 +1865,7 @@ impl EnvironmentImpl {
             evicted_db_state: Arc::new(RwLock::new(HashMap::new())),
             pending_names: RwLock::new(hashbrown::HashMap::new()),
             open_reconstruct_lock: Mutex::new(()),
-            is_invalid: Arc::new(AtomicBool::new(false)),
+            is_invalid,
             invalid_reason: RwLock::new(None),
             creation_time_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
