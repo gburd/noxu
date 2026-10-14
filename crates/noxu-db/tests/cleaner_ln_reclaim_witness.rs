@@ -76,7 +76,6 @@ fn fill_batched(env: &Environment, db: &Database, n: usize, val: &[u8]) {
 }
 
 #[test]
-#[ignore = "BUG-EVICT-REFAULT-DATALOSS (separate release-blocker, dedicated worker): under cache pressure the evictor/refault path PERMANENTLY drops contiguous ~127-key (one-BIN) ranges of committed records. Pre-existing at v7.11.0 (durable: survives clean close+reopen and a forced checkpoint; both arches, reliable on aarch64); FIXED on parity/integrate 7ebe202f (0 lost, 5/5). NOT in C1 scope (core evictor, independent of A3/A4/A5). A3 proof is carried by the deterministic noxu-recovery + noxu-evictor unit witnesses. Repro: run this test un-ignored on an idle aarch64 host. See /data/artifacts/evict-refault-datalosss-repro.md."]
 fn committed_key_stays_readable_under_concurrent_cleaning() {
     // Allow override via env for the N-times loop; defaults match the triage.
     let cache = std::env::var("RT_CACHE")
