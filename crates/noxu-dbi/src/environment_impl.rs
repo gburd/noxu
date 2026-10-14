@@ -1343,7 +1343,9 @@ impl EnvironmentImpl {
             let mut c = Cleaner::with_file_manager_tree_and_lock_manager(
                 cfg.cleaner_min_utilization as u32,
                 cfg.cleaner_min_file_count,
-                cfg.cleaner_min_age as u64,
+                // JE CLEANER_MIN_AGE min is 1 (EnvironmentParams.java:1366):
+                // minAge 0 would make the file being written cleanable.
+                cfg.cleaner_min_age.max(1) as u64,
                 fm,
                 Arc::clone(&primary_tree),
                 Arc::clone(lm),

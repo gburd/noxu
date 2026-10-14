@@ -37,6 +37,31 @@ fn open_env(dir: &Path) -> noxu_db::Environment {
     noxu_db::Environment::open(cfg).unwrap()
 }
 
+/// JE uses 1 KiB log files (SR10553Test.java:80, SR12885Test.java:137), so
+/// the records span many files and the older ones are cleanable.  Here they
+/// fit in file 0; overwrite one filler key (all but one version obsolete)
+/// so file 0 is older than the newest minAge (2) files and may be cleaned
+/// (JE UtilizationCalculator.java:224).
+fn advance_log(env: &noxu_db::Environment) {
+    let db = env
+        .open_database(
+            None,
+            "filler",
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true),
+        )
+        .unwrap();
+    for _ in 0..40 {
+        db.put(
+            DatabaseEntry::from_bytes(b"f"),
+            DatabaseEntry::from_bytes(&[0u8; 1024]),
+        )
+        .unwrap();
+    }
+    db.close().unwrap();
+}
+
 /// JE `TestUtils.getTestArray(i)`: a deterministic 4-byte big-endian key/value.
 fn test_array(i: u32) -> Vec<u8> {
     i.to_be_bytes().to_vec()
@@ -100,6 +125,7 @@ fn sr10553_clean_then_scan_deleted_does_not_fail() {
     // Checkpoint and clean.
     env.checkpoint(Some(&noxu_db::CheckpointConfig::new().with_force(true)))
         .unwrap();
+    advance_log(&env);
     let cleaned = env.clean_log().unwrap();
     assert!(cleaned > 0, "expected the log to be cleaned, cleaned={cleaned}");
 
@@ -189,6 +215,7 @@ fn sr12885_pending_ln_migration_with_slot_reuse_abort_keeps_data() {
     // is unlocked, so it is not yet put on the pending list).
     env.checkpoint(Some(&noxu_db::CheckpointConfig::new().with_force(true)))
         .unwrap();
+    advance_log(&env);
     let cleaned = env.clean_log().unwrap();
     assert!(cleaned > 0, "expected the log to be cleaned, cleaned={cleaned}");
 
