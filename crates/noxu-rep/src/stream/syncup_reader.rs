@@ -253,8 +253,55 @@ impl SyncupLogView {
             }
         }
 
-        let first =
-            entries.keys().next().map(|&v| Vlsn::new(v)).unwrap_or(NULL_VLSN);
+        // VLSN-CONTINUITY (REP-FEEDER-SKIP, syncup side). Noxu's replicable
+        // VLSNs are dense (every txn LN + TxnCommit consumes the next VLSN;
+        // TxnAbort consumes none), so the scanned VLSNs must be contiguous. A
+        // HOLE means a file (or VLSN range) that held replicable entries was
+        // cleaned out from under the syncup scan. In production the syncup
+        // `ProtectedFileRange` pins the whole VLSNIndex range for the duration
+        // of the scan (JE FileProtector.java:94-110), so a hole genuinely
+        // signals the replica needs a network restore.
+        //
+        // The matchpoint search must not be allowed to compute a matchpoint
+        // ACROSS such a hole: `find_matchpoint` scans the replica's sync
+        // points backward only down to `first` (JE
+        // `ReplicaFeederSyncup.scanMatchpointEntries` stops at
+        // `VLSNRange.getFirst`). We therefore set `first` to the lowest VLSN
+        // of the TOP contiguous run (the newest unbroken suffix). A candidate
+        // below the hole then falls below `first`, so the search correctly
+        // dead-ends to `Matchpoint::None` -> NetworkRestore rather than
+        // matching across missing VLSNs. (A missing feeder VLSN could never
+        // have produced a WRONG match -- `feeder.entry(v)` returns `None` for
+        // it, which only pushes the matchpoint lower -- but pinning `first`
+        // makes the "needs restore" outcome explicit and observable.)
+        let mut first_seq: i64 = 0;
+        let mut gap_detected = false;
+        {
+            let mut iter = entries.keys().rev().copied();
+            if let Some(top) = iter.next() {
+                let mut run_low = top;
+                for v in iter {
+                    if v == run_low - 1 {
+                        run_low = v;
+                    } else {
+                        // v < run_low - 1: a hole between v and run_low.
+                        gap_detected = true;
+                        break;
+                    }
+                }
+                first_seq = run_low;
+            }
+        }
+        if gap_detected {
+            log::warn!(
+                "SyncupLogView: a replicable VLSN gap was detected in the                  scan (contiguous suffix starts at vlsn={first_seq}); a file                  or VLSN range the syncup needs is gone. The matchpoint                  search is confined to the contiguous suffix so it cannot                  match across the gap; the replica may need a network                  restore. REP-FEEDER-SKIP."
+            );
+        }
+        let first = if first_seq > 0 {
+            Vlsn::new(first_seq)
+        } else {
+            entries.keys().next().map(|&v| Vlsn::new(v)).unwrap_or(NULL_VLSN)
+        };
 
         Self {
             entries,
