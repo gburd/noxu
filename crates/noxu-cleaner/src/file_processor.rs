@@ -962,8 +962,13 @@ impl TreeLookup for SharedTreeLookup {
         node_id: i64,
         log_lsn: Lsn,
     ) -> InLookupResult {
+        // BUG-EVICT-REFAULT-DATALOSS (X-7 dispatch, as for LN liveness): the
+        // IN/BIN belongs to db_id's tree, NOT the primary tree.  Searching the
+        // primary tree classifies every live USER-database BIN and BIN-delta
+        // dead, so the cleaner deletes a file holding a live BIN image and a
+        // reader faulting that BIN reads committed keys as Ok(None).
         let delegate = RealTreeLookup::new(
-            Arc::clone(&self.tree),
+            Arc::clone(self.resolve_tree(db_id)),
             Arc::clone(&self.lock_manager),
         );
         delegate.lookup_in(db_id, node_id, log_lsn)
