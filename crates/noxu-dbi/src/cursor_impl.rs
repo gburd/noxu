@@ -4488,18 +4488,23 @@ impl CursorImpl {
                         ));
                     }
                 }
+                // Before-image for both LNs is the slot being replaced (the
+                // cursor is positioned on it); JE logs it as the abortLsn
+                // (44f832e8).
+                let (_, old_slot_lsn, _) =
+                    self.get_slot_before_image(&old_key)?;
                 let del_lsn = self.log_ln_write(
                     &old_key,
                     None,
                     self.locker_id,
-                    noxu_util::NULL_LSN.as_u64(),
+                    old_slot_lsn,
                 )?;
                 self.apply_tree_delete(old_key, del_lsn);
                 let new_lsn = self.log_ln_write(
                     &two_part_key,
                     Some(b""),
                     self.locker_id,
-                    noxu_util::NULL_LSN.as_u64(),
+                    old_slot_lsn,
                 )?;
                 self.apply_tree_insert(two_part_key.clone(), vec![], new_lsn);
                 self.current_key = Some(two_part_key);
@@ -4749,15 +4754,28 @@ impl CursorImpl {
             false
         };
 
+        // JE LN.logInternal (LN.java:645): a transactional LN logs the
+        // WriteLockInfo abortLsn -- the slot LSN before the txn FIRST write
+        // to the record (CursorImpl.LockStanding.prepareForUpdate,
+        // CursorImpl.java:3343), kept across later writes by the same txn.
+        // `old_lsn` is the slot LSN now; if this txn already logged the
+        // record, its recorded abort LSN wins.  Never `self.current_lsn`:
+        // that is the cursor previous position (possibly another key), and
+        // recovery undo would revert/delete to the wrong version.
+        let abort_lsn = self
+            .txn_ref
+            .as_ref()
+            .and_then(|t| t.lock().ok()?.recorded_abort_lsn(old_lsn))
+            .unwrap_or(old_lsn);
         let entry = LnLogEntry::new(
             db_id,
             txn_id_opt,
-            Lsn::from_u64(self.current_lsn), // abort_lsn: before-image LSN (current slot LSN before this write)
-            false,                           // abort_known_deleted
-            None,                            // abort_key
-            None,                            // abort_data
-            NULL_VLSN,                       // abort_vlsn
-            0,                               // abort_expiration
+            Lsn::from_u64(abort_lsn),
+            false,           // abort_known_deleted
+            None,            // abort_key
+            None,            // abort_data
+            NULL_VLSN,       // abort_vlsn
+            0,               // abort_expiration
             new_embedded_ln, // embedded_ln (1A: true iff embedded)
             key.to_vec(),
             data.map(|d| d.to_vec()),

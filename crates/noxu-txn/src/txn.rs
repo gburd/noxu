@@ -1791,6 +1791,17 @@ impl Txn {
         self.write_locks.get(&lsn).map(|w| !w.never_locked).unwrap_or(false)
     }
 
+    /// Returns the abort LSN already recorded for the write lock at `lsn`,
+    /// or `None` if this txn has not yet logged the record (no lock at
+    /// `lsn`, or `never_locked`).  JE `WriteLockInfo.getAbortLsn` as read by
+    /// `LN.logInternal` (LN.java:645) for a SUBSEQUENT write by the txn.
+    pub fn recorded_abort_lsn(&self, lsn: u64) -> Option<u64> {
+        self.write_locks
+            .get(&lsn)
+            .filter(|w| !w.never_locked)
+            .map(|w| w.abort_lsn)
+    }
+
     /// Returns the number of read locks held.
     pub fn n_read_locks(&self) -> usize {
         self.read_locks.len()
