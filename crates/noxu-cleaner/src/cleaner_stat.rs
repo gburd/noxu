@@ -39,6 +39,7 @@ pub struct CleanerStats {
 
     /// Accumulated number of INs migrated.
     pub ins_migrated: AtomicU64,
+    pub ins_undecided: AtomicU64,
 
     /// Accumulated number of INs obsolete.
     pub ins_obsolete: AtomicU64,
@@ -138,6 +139,7 @@ impl CleanerStats {
             ins_cleaned: AtomicU64::new(0),
             ins_dead: AtomicU64::new(0),
             ins_migrated: AtomicU64::new(0),
+            ins_undecided: AtomicU64::new(0),
             ins_obsolete: AtomicU64::new(0),
             lns_cleaned: AtomicU64::new(0),
             lns_dead: AtomicU64::new(0),
@@ -178,6 +180,7 @@ impl CleanerStats {
         self.ins_cleaned.store(0, Ordering::Relaxed);
         self.ins_dead.store(0, Ordering::Relaxed);
         self.ins_migrated.store(0, Ordering::Relaxed);
+        self.ins_undecided.store(0, Ordering::Relaxed);
         self.ins_obsolete.store(0, Ordering::Relaxed);
         self.lns_cleaned.store(0, Ordering::Relaxed);
         self.lns_dead.store(0, Ordering::Relaxed);
@@ -218,6 +221,7 @@ impl CleanerStats {
             ins_cleaned: self.ins_cleaned.load(Ordering::Relaxed),
             ins_dead: self.ins_dead.load(Ordering::Relaxed),
             ins_migrated: self.ins_migrated.load(Ordering::Relaxed),
+            ins_undecided: self.ins_undecided.load(Ordering::Relaxed),
             ins_obsolete: self.ins_obsolete.load(Ordering::Relaxed),
             lns_cleaned: self.lns_cleaned.load(Ordering::Relaxed),
             lns_dead: self.lns_dead.load(Ordering::Relaxed),
@@ -282,6 +286,7 @@ pub struct CleanerStatsSnapshot {
     pub ins_cleaned: u64,
     pub ins_dead: u64,
     pub ins_migrated: u64,
+    pub ins_undecided: u64,
     pub ins_obsolete: u64,
     pub lns_cleaned: u64,
     pub lns_dead: u64,

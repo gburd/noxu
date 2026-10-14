@@ -1063,6 +1063,16 @@ pub enum InLookupResult {
     ///
     /// Corresponds to `nINsDeadThisRun++`.
     Obsolete,
+
+    /// BUG-EVICT-REFAULT-DATALOSS fail-safe: liveness could NOT be decided
+    /// because the routed fault-in of a non-resident node hit a transient
+    /// error (a log read / fetch failure, e.g. EMFILE), NOT a genuine
+    /// not-found.  The caller must NOT count the image dead and must leave
+    /// the file UNCLEANED this pass (JE `FileProcessor.findINInTree` throws
+    /// and aborts the file's cleaning on a fetch failure, FileProcessor.java
+    /// :1723-1796; we fail closed by deferring instead of deleting).  Retried
+    /// on the next cleaner pass.
+    Unknown,
 }
 
 // ─── Log entry types for process_file ────────────────────────────────────────
@@ -1796,6 +1806,20 @@ impl FileProcessor {
             InLookupResult::Obsolete => {
                 result.ins_dead += 1;
                 self.stats.ins_dead.fetch_add(1, Ordering::Relaxed);
+            }
+            InLookupResult::Unknown => {
+                // BUG-EVICT-REFAULT-DATALOSS fail-safe: a fetch failure while
+                // routing to a non-resident node left liveness UNDECIDED.
+                // Do NOT count the image dead and leave the file UNCLEANED
+                // this pass (`completed = false` blocks safe-to-delete in
+                // Cleaner::process; the file is retried next pass) so we can
+                // NEVER delete a file holding a possibly-live image.
+                log::error!(
+                    "cleaner: liveness UNDECIDED for node {node_id} at {log_lsn:?} \
+                     (fetch failure); deferring file deletion (fail-safe)"
+                );
+                self.stats.ins_undecided.fetch_add(1, Ordering::Relaxed);
+                result.completed = false;
             }
         }
     }

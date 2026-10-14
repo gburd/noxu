@@ -126,6 +126,7 @@ impl Default for EnvironmentStats {
                 ins_cleaned: 0,
                 ins_dead: 0,
                 ins_migrated: 0,
+                ins_undecided: 0,
                 ins_obsolete: 0,
                 lns_cleaned: 0,
                 lns_dead: 0,
