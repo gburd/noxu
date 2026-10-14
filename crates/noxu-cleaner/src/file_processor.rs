@@ -133,6 +133,52 @@ fn fetch_migration_ln_data_from_log(
         .ok_or_else(|| (false, format!("LN at {lsn:?} has no data")))
 }
 
+/// JE `FileProcessor.processFoundLN` (FileProcessor.java:1343-1376,
+/// 1448-1468): with the parent BIN latched and the cleaner's non-blocking
+/// READ on `tree_lsn` held by the caller, re-verify that the slot still
+/// references the LN being cleaned (`treeLsn == logLsn`), then log the
+/// migrated LN and update the slot LSN before the latch is released.  A
+/// changed or deleted slot is Obsolete and nothing is logged.
+///
+/// ponytail: no `lockAfterLsnChange` owner transfer (CursorImpl.java:
+/// 3704-3733); any other owner/waiter on `tree_lsn` defers (Locked ->
+/// pending retry) so no foreign lock loses its record.  Add transfer to
+/// restore JE migration concurrency for long-lived readers.
+fn publish_migration_latched(
+    tree: &noxu_tree::Tree,
+    lock_manager: &LockManager,
+    key: &[u8],
+    log_lsn: Lsn,
+    tree_lsn: Lsn,
+    captured: Vec<u8>,
+    log: impl FnOnce(&[u8], bool) -> Option<Lsn>,
+) -> MigrationOutcome {
+    if tree_lsn != log_lsn {
+        return MigrationOutcome::Obsolete;
+    }
+    tree.with_latched_ln_slot(key, |bin, idx| {
+        if bin.entries[idx].known_deleted || bin.get_lsn(idx) != log_lsn {
+            return MigrationOutcome::Obsolete;
+        }
+        if lock_manager.get_lock_info(log_lsn.as_u64()) != (1, 0) {
+            return MigrationOutcome::Locked;
+        }
+        let data = match &bin.entries[idx].data {
+            Some(d) => d.to_vec(),
+            None => captured,
+        };
+        let embedded_ln = (data.len() as i64) <= bin.max_embedded_ln as i64;
+        let Some(new_lsn) = log(&data, embedded_ln) else {
+            return MigrationOutcome::Locked;
+        };
+        bin.set_lsn(idx, new_lsn);
+        bin.entries[idx].dirty = true;
+        bin.dirty = true;
+        MigrationOutcome::Migrated
+    })
+    .unwrap_or(MigrationOutcome::Obsolete)
+}
+
 /// The number of LN log entries after which we process pending LNs.
 ///
 /// Ported from `FileProcessor.PROCESS_PENDING_EVERY_N_LNS`.
@@ -378,7 +424,7 @@ impl TreeLookup for RealTreeLookup {
             let max_embedded_ln = tree.max_embedded_ln;
             (slot_data, max_embedded_ln)
         };
-        let (slot_data, max_embedded_ln) = data;
+        let (slot_data, _max_embedded_ln) = data;
 
         // 1A DATA-LOSS FIX: a slot whose data length is > max_embedded_ln is
         // stored as an LSN-pointer only (`data = None`) after a restart or an
@@ -420,35 +466,33 @@ impl TreeLookup for RealTreeLookup {
         // 1A: honor TREE_MAX_EMBEDDED_LN — a >16B LN is re-logged embedded=false
         // (authoritative copy is the standalone log entry, matching
         // serialize_full and JE's newEmbeddedLN=false for migrations).
-        let embedded_ln = (data.len() as i64) <= max_embedded_ln as i64;
         let db_id_u64 = _db_id.unsigned_abs();
-        let new_lsn = if let Some(lm) = &self.log_manager {
-            // RealTreeLookup is test-only (SharedTreeLookup is production).
-            // Fall back to log_lsn only in this test path; production path
-            // uses SharedTreeLookup which enforces R-7 abort-on-failure.
-            write_migration_ln(lm, db_id_u64, key, &data, log_lsn, embedded_ln)
-                .unwrap_or(log_lsn)
-        } else {
-            log_lsn
-        };
-
-        let outcome = {
-            let tree = match self.tree.read() {
-                Ok(g) => g,
-                Err(_) => {
-                    release_cleaner_lock(
-                        &self.lock_manager,
-                        lock_lsn,
-                        locker_id,
-                        "RealTreeLookup::migrate_ln_slot:tree_poisoned_insert",
-                    );
-                    return MigrationOutcome::Obsolete;
-                }
-            };
-            match tree.insert(key.to_vec(), data, new_lsn) {
-                Ok(_) => MigrationOutcome::Migrated,
-                Err(_) => MigrationOutcome::Obsolete,
-            }
+        // Same latched recheck + append + slot update as SharedTreeLookup.
+        // RealTreeLookup is test-only; it keeps its no-WAL/log_lsn fallback.
+        let outcome = match self.tree.read() {
+            Ok(tree) => publish_migration_latched(
+                &tree,
+                &self.lock_manager,
+                key,
+                log_lsn,
+                tree_lsn,
+                data,
+                |data, embedded_ln| match &self.log_manager {
+                    Some(lm) => Some(
+                        write_migration_ln(
+                            lm,
+                            db_id_u64,
+                            key,
+                            data,
+                            log_lsn,
+                            embedded_ln,
+                        )
+                        .unwrap_or(log_lsn),
+                    ),
+                    None => Some(log_lsn),
+                },
+            ),
+            Err(_) => MigrationOutcome::Obsolete,
         };
 
         // H-4: release lock.
@@ -899,7 +943,7 @@ impl TreeLookup for SharedTreeLookup {
             let max_embedded_ln = tree.max_embedded_ln;
             (slot_data, max_embedded_ln)
         };
-        let (slot_data, max_embedded_ln) = data;
+        let (slot_data, _max_embedded_ln) = data;
 
         // 1A DATA-LOSS FIX: a >max_embedded_ln slot is an LSN-pointer only
         // (`data = None`) after a restart / evictor strip.  Fetch the value
@@ -940,55 +984,40 @@ impl TreeLookup for SharedTreeLookup {
         };
 
         let db_id_u64 = db_id.unsigned_abs();
-        // 1A: honor TREE_MAX_EMBEDDED_LN — re-log a >16B migrated LN with
-        // embedded_ln=false (its authoritative copy is the standalone log
-        // entry; embedded=true would reintroduce the 1A inconsistency and,
-        // under B2a, mark the re-logged large LN immediately obsolete).
-        let embedded_ln = (data.len() as i64) <= max_embedded_ln as i64;
-        // R-7 (Keith re-audit): if write_migration_ln() fails, do NOT fall back
-        // to the original log_lsn.  That stale LSN points to the file being
-        // cleaned; once the cleaner deletes it, recovery cannot find the data.
-        // Abort this migration (return Locked so the entry is retried later)
-        // and leave the source file protected until a successful WAL write.
-        let new_lsn = match write_migration_ln(
-            &self.log_manager,
-            db_id_u64,
-            key,
-            &data,
-            log_lsn,
-            embedded_ln,
-        ) {
-            Some(lsn) => lsn,
-            None => {
-                // WAL write failed (e.g. io_invalid set, disk full).
-                // Release the cleaner lock and abort the migration for this
-                // slot.  The cleaner will retry on the next pass; the source
-                // file is kept protected by the X-5 checkpoint barrier.
-                release_cleaner_lock(
-                    &self.lock_manager,
-                    lock_lsn,
-                    locker_id,
-                    "SharedTreeLookup::migrate_ln_slot:wal_write_failed",
-                );
-                return MigrationOutcome::Locked;
-            }
+        // Recheck, append and slot update all under the latched BIN while the
+        // cleaner READ is held.  R-7: failed WAL write -> Locked (retry,
+        // source file stays protected).  1A: >max_embedded_ln re-logged with
+        // embedded_ln=false.
+        let outcome = match tree_arc.read() {
+            Ok(tree) => publish_migration_latched(
+                &tree,
+                &self.lock_manager,
+                key,
+                log_lsn,
+                tree_lsn,
+                data,
+                |data, embedded_ln| {
+                    write_migration_ln(
+                        &self.log_manager,
+                        db_id_u64,
+                        key,
+                        data,
+                        log_lsn,
+                        embedded_ln,
+                    )
+                },
+            ),
+            Err(_) => MigrationOutcome::Locked,
         };
 
-        let result =
-            tree_arc.read().map(|t| t.insert(key.to_vec(), data, new_lsn));
-
-        // H-4: release lock.
+        // H-4: release lock (after the latched publication).
         release_cleaner_lock(
             &self.lock_manager,
             lock_lsn,
             locker_id,
             "SharedTreeLookup::migrate_ln_slot:done",
         );
-
-        match result {
-            Ok(Ok(_)) => MigrationOutcome::Migrated,
-            _ => MigrationOutcome::Obsolete,
-        }
+        outcome
     }
 
     /// Look up an IN node by `node_id` and mark it dirty if its LSN matches.
@@ -3360,12 +3389,13 @@ mod tests {
             Arc::new(LockManager::new()),
         );
 
-        let new_lsn = Lsn::new(3, 400);
-        let outcome = lookup.migrate_ln_slot(1, key, new_lsn, lsn);
+        // JE FileProcessor.java:1370-1376: migrate only when logLsn ==
+        // treeLsn (the slot still references the log entry being cleaned).
+        let outcome = lookup.migrate_ln_slot(1, key, lsn, lsn);
         assert_eq!(
             outcome,
             MigrationOutcome::Migrated,
-            "slot LSN matches tree_lsn so migration should succeed"
+            "slot LSN matches log_lsn == tree_lsn so migration should succeed"
         );
     }
 
