@@ -502,24 +502,28 @@ impl TreeLookup for RealTreeLookup {
         // on-disk image dead and deleted the log file holding its only image;
         // the next re-fault then dangled ("Log file not found").
         // `verify_logged_child_live` does the whole decision (route, re-fault
-        // the detached child, compare, dirty for migration) under the parent
-        // WRITE latch, so the child cannot be detached between the route and
-        // the verdict (JE FileProcessor.findINInTree via
-        // getParentINForChildIN(doFetch=true), held EX-latched through
-        // IN.setDirty, FileProcessor.java:1723-1835).
+        // the detached child, compare — using the full+delta-chain liveness
+        // test in its BIN arm; BUG-EVICT-REFAULT-DATALOSS 1/3 / 13520f31 —
+        // dirty for migration) under the parent WRITE latch, so the child
+        // cannot be detached between the route and the verdict (JE
+        // FileProcessor.findINInTree via getParentINForChildIN(doFetch=true),
+        // held EX-latched through IN.setDirty, FileProcessor.java:1723-1835).
         //
         // Three-valued: Routed == live (dirtied, Found); Undecidable == a
-        // failed re-fault / moved slot, which MUST retain the file (fail
-        // closed → Found, re-decided next pass); NotFound falls through to the
-        // root check below (the node may still be the tree ROOT) and is
-        // otherwise obsolete.
+        // failed re-fault / moved slot / transient fetch failure, mapped to
+        // InLookupResult::Unknown so process_in defers the whole file
+        // (completed=false, re-decided next pass) and NEVER deletes it
+        // (BUG-EVICT-REFAULT-DATALOSS fail-safe, == JE throw-aborts-the-file,
+        // 26ff2eb6); NotFound falls through to the root check below (the node
+        // may still be the tree ROOT) and is otherwise obsolete.
         match tree_guard.verify_logged_child_live(node_id_u64, log_lsn) {
             noxu_tree::LoggedChildLookup::Routed(_, _) => {
                 return InLookupResult::Found;
             }
             noxu_tree::LoggedChildLookup::Undecidable => {
-                // Fail closed: retain the file so a later pass can re-decide.
-                return InLookupResult::Found;
+                // Fail safe: liveness could not be decided this pass (failed
+                // re-fault / moved slot).  NEVER delete the file — defer it.
+                return InLookupResult::Unknown;
             }
             noxu_tree::LoggedChildLookup::NotFound => {}
         }
@@ -539,29 +543,43 @@ impl TreeLookup for RealTreeLookup {
             };
 
             if root_node_id == node_id_u64 {
-                let root_lsn = {
-                    let g = root.read();
-                    match &*g {
-                        TreeNode::Bottom(b) => b.last_full_lsn,
-                        TreeNode::Internal(_) => {
-                            return InLookupResult::Obsolete;
-                        }
-                    }
-                };
-
-                if root_lsn == noxu_util::NULL_LSN || root_lsn != log_lsn {
-                    return InLookupResult::Obsolete;
-                }
-
+                // BUG-EVICT-REFAULT-DATALOSS: a BIN root image is live when
+                // log_lsn is its full base or a reachable delta (same chain
+                // test as the non-root BIN arm above).
+                let g = root.read();
+                if let TreeNode::Bottom(b) = &*g
+                    && bin_image_is_live(b, log_lsn)
                 {
-                    let mut w = root.write();
-                    w.set_dirty(true);
+                    drop(g);
+                    mark_bin_for_full_relog(&root);
+                    return InLookupResult::Found;
                 }
-                return InLookupResult::Found;
+                return InLookupResult::Obsolete;
             }
         }
 
         InLookupResult::Obsolete
+    }
+}
+
+/// True when log_lsn is the BIN's full base or a delta still reachable from
+/// its current delta (full < lsn <= last delta).  BUG-EVICT-REFAULT-DATALOSS /
+/// JE FileProcessor.processBINDelta + findINInTree (1557-1835).
+fn bin_image_is_live(b: &noxu_tree::BinStub, log_lsn: Lsn) -> bool {
+    let full = b.last_full_lsn;
+    full != noxu_util::NULL_LSN
+        && (log_lsn == full
+            || (b.last_delta_lsn != noxu_util::NULL_LSN
+                && log_lsn > full
+                && log_lsn <= b.last_delta_lsn))
+}
+
+/// JE processIN: setDirty(true); setProhibitNextDelta(true) — keep the live
+/// BIN image's file by migrating it (full re-log retires the delta chain).
+fn mark_bin_for_full_relog(arc: &noxu_tree::ChildArc) {
+    if let noxu_tree::TreeNode::Bottom(b) = &mut *arc.write() {
+        b.dirty = true;
+        b.prohibit_next_delta = true;
     }
 }
 
