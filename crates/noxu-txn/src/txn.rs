@@ -1666,35 +1666,29 @@ impl Txn {
     /// Moves the write lock from `old_lsn` to `new_lsn`.
     ///
     /// Called after logging a new LN entry for an existing record:
-    /// 1. Releases the old LSN lock at the `LockManager` level.
-    /// 2. Acquires a write lock on `new_lsn` at the `LockManager` level.
-    /// 3. Atomically moves the `WriteLockInfo` entry from
-    ///    `write_locks[old_lsn]` to `write_locks[new_lsn]`.
+    /// 1. Acquires a write lock on `new_lsn` at the `LockManager` level.
+    /// 2. Moves the `WriteLockInfo` (abort image) from `write_locks[old_lsn]`
+    ///    to `write_locks[new_lsn]`.
+    /// 3. RETAINS the `old_lsn` WRITE lock until commit/abort, as a
+    ///    protection-only entry (default WLI: no abort info, so undo and
+    ///    obsolete counting skip it).
+    ///
+    /// JE: only `HandleLocker` may release old-LSN locks after an LSN change
+    /// (`HandleLocker.java:117-120`); `Locker.allowReleaseLockAfterLsnChange`
+    /// is false for every other locker including `Txn` (`Locker.java:775`,
+    /// `CursorImpl.lockAfterLsnChange` `CursorImpl.java:3704-3733`), and
+    /// `LN.log` locks the new LSN without releasing the old
+    /// (`LN.java:742-758`).  Releasing old here let the cleaner see the
+    /// still-current slot at `old_lsn` unlocked between this call and the
+    /// writer's slot update and migrate the stale version past `new_lsn`.
     ///
     /// Returns `Ok(())` if the txn held no write lock on `old_lsn`
     /// (a no-op).
     ///
     /// # Errors
     ///
-    /// Either the `release(old_lsn)` or the `lock(new_lsn)` step can
-    /// fail. The `WriteLockInfo` (which holds the abort image used
-    /// by `abort()` to undo the write) is NEVER dropped on the error
-    /// path — losing it would silently break rollback for the row:
-    ///
-    ///   - `release(old_lsn)` failure: WLI is still at `old_lsn`,
-    ///     and the lock_manager still holds the old lock. A
-    ///     subsequent `abort()` re-attempts `release(old_lsn)`,
-    ///     which is logged again but does not corrupt state.
-    ///   - `lock(new_lsn)` failure (after release succeeded): WLI
-    ///     remains at `old_lsn` even though the lock_manager
-    ///     released old_lsn. `abort()` will iterate `write_locks`,
-    ///     generate the undo record, then attempt `release(old_lsn)`
-    ///     which logs (lock_manager has nothing there) and
-    ///     continues.
-    ///
-    /// In both cases the error is surfaced so the caller can abort
-    /// the cursor operation rather than silently desynchronise the
-    /// per-txn and lock-manager views.
+    /// A `lock(new_lsn)` failure leaves the WLI and the lock at `old_lsn`
+    /// untouched (nothing is released), so `abort()` can still roll back.
     pub fn move_write_lock_to_new_lsn(
         &mut self,
         old_lsn: u64,
@@ -1704,18 +1698,6 @@ impl Txn {
         if !self.write_locks.contains_key(&old_lsn) {
             return Ok(());
         }
-        // Phase 1: release old. WLI stays in write_locks until both
-        // phases succeed, so an Err leaves abort info reachable.
-        if let Err(e) = self.lock_manager.release(old_lsn, self.id) {
-            log::error!(
-                "noxu-txn: lock_manager.release({old_lsn}, txn={}) failed \
-                 during move_write_lock_to_new_lsn (WLI preserved at \
-                 old_lsn so abort can roll back): {e}",
-                self.id
-            );
-            return Err(e);
-        }
-        // Phase 2: acquire new.
         if let Err(e) = self.lock_manager.lock(
             new_lsn,
             self.id,
@@ -1725,19 +1707,18 @@ impl Txn {
         ) {
             log::error!(
                 "noxu-txn: lock_manager.lock({new_lsn}, txn={}, Write) \
-                 failed during move_write_lock_to_new_lsn (WLI preserved \
-                 at old_lsn so abort can roll back; lock_manager no \
-                 longer holds old_lsn): {e}",
+                 failed during move_write_lock_to_new_lsn (WLI and lock \
+                 preserved at old_lsn so abort can roll back): {e}",
                 self.id
             );
             return Err(e);
         }
-        // Both phases succeeded — atomic move.
         let wli = self
             .write_locks
             .remove(&old_lsn)
             .expect("contains_key check above guarantees Some");
         self.write_locks.insert(new_lsn, wli);
+        self.write_locks.insert(old_lsn, WriteLockInfo::default());
         Ok(())
     }
 
@@ -2092,6 +2073,107 @@ mod tests {
     fn create_test_txn() -> Txn {
         let lock_manager = Arc::new(LockManager::new());
         Txn::new(1, lock_manager)
+    }
+
+    /// JE Locker.java:775 / LN.java:742-758: a Txn keeps every old-LSN WRITE
+    /// after an LSN change until commit/abort.  Two updates of one record
+    /// (L0 -> L1 -> L2) retain L0 and L1 as protection-only entries; the
+    /// single abort image (the FIRST before-image) moves with the current
+    /// version; abort undoes once and commit counts L0 obsolete once.
+    #[test]
+    fn move_write_lock_retains_old_versions_and_first_abort_image() {
+        let lm = Arc::new(LockManager::new());
+        let mut txn = Txn::new(7, Arc::clone(&lm));
+        txn.lock(10, LockType::Write, false).unwrap();
+        txn.set_write_lock_abort_info(
+            10,
+            5,
+            Some(b"k".to_vec()),
+            Some(b"d0".to_vec()),
+            false,
+            3,
+        );
+        txn.move_write_lock_to_new_lsn(10, 20).unwrap();
+        txn.set_write_lock_abort_info(
+            20,
+            10,
+            Some(b"k".to_vec()),
+            Some(b"d1".to_vec()),
+            false,
+            3,
+        );
+        txn.move_write_lock_to_new_lsn(20, 30).unwrap();
+        for lsn in [10, 20, 30] {
+            assert!(
+                lm.is_owned_write_lock(lsn, 7),
+                "WRITE({lsn}) must be retained"
+            );
+            assert!(lm.lock(lsn, 8, LockType::Read, true, false).is_err());
+        }
+        assert_eq!(txn.n_write_locks(), 3);
+        assert_eq!(lm.n_total_locks(), 3);
+        let obsolete = txn.collect_obsolete_abort_lsns();
+        assert!(obsolete.is_empty(), "no log manager: nothing collected");
+        let undo = txn.abort_collect_undo().unwrap();
+        assert_eq!(
+            undo.len(),
+            1,
+            "one undo record per logical record: {undo:?}"
+        );
+        assert_eq!(undo[0].current_lsn, 30);
+        assert_eq!(undo[0].abort_lsn, 5);
+        assert_eq!(undo[0].abort_data.as_deref(), Some(&b"d0"[..]));
+        // Protection survives undo collection; released only at the end.
+        assert_eq!(lm.n_total_locks(), 3);
+        txn.release_all_locks();
+        assert_eq!(lm.n_total_locks(), 0);
+    }
+
+    /// A failed acquire of the new LSN releases nothing: WLI and WRITE(old)
+    /// stay put so abort can still roll back.
+    #[test]
+    fn move_write_lock_failed_new_lock_keeps_old() {
+        let lm = Arc::new(LockManager::new());
+        lm.set_lock_timeout(20);
+        let mut txn = Txn::new(7, Arc::clone(&lm));
+        txn.lock(10, LockType::Write, false).unwrap();
+        lm.lock(20, 9, LockType::Write, false, false).unwrap();
+        assert!(txn.move_write_lock_to_new_lsn(10, 20).is_err());
+        assert!(lm.is_owned_write_lock(10, 7));
+        assert!(txn.owns_write_lock(10));
+        assert!(!txn.owns_write_lock(20));
+        lm.release(20, 9).unwrap();
+        txn.release_all_locks();
+        assert_eq!(lm.n_total_locks(), 0);
+    }
+
+    /// Commit with a log manager counts the abort LSN obsolete exactly once
+    /// even though intermediate versions are retained as protection-only
+    /// entries (their WLI has no abort LSN).
+    #[test]
+    fn commit_counts_first_abort_lsn_once_with_retained_versions() {
+        let lock_manager = Arc::new(LockManager::new());
+        let (lm, _dir) = make_log_manager_in_tempdir();
+        let mut txn = Txn::with_log_manager(42, Arc::clone(&lock_manager), lm);
+        txn.lock(100, LockType::Write, false).unwrap();
+        txn.set_write_lock_abort_info(
+            100,
+            50,
+            None,
+            Some(b"x".to_vec()),
+            false,
+            1,
+        );
+        txn.note_log_entry(100);
+        txn.move_write_lock_to_new_lsn(100, 200).unwrap();
+        txn.note_log_entry(200);
+        txn.move_write_lock_to_new_lsn(200, 300).unwrap();
+        txn.note_log_entry(300);
+        let obsolete = txn.collect_obsolete_abort_lsns();
+        assert_eq!(obsolete.len(), 1, "{obsolete:?}");
+        assert_eq!(obsolete[0].0, Lsn::from_u64(50));
+        txn.commit().unwrap();
+        assert_eq!(lock_manager.n_total_locks(), 0);
     }
 
     /// BLOCKER 1 probe (clear-at-end, COMMIT): a locker whose lock is stolen
