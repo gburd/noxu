@@ -29,8 +29,8 @@
 //! NOTE: probabilistic (race), but the window is hit within a few thousand
 //! iterations under normal scheduling; kept bounded so it is a usable gate.
 use noxu_db::*;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use tempfile::TempDir;
 

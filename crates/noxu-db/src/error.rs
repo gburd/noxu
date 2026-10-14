@@ -794,9 +794,7 @@ impl From<noxu_dbi::DbiError> for NoxuError {
                     DbiR::LogIntegrity => {
                         EnvironmentFailureReason::LogIntegrity
                     }
-                    other => {
-                        EnvironmentFailureReason::Other(other.to_string())
-                    }
+                    other => EnvironmentFailureReason::Other(other.to_string()),
                 };
                 NoxuError::EnvironmentFailure { reason, msg }
             }

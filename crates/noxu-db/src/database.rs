@@ -673,8 +673,7 @@ impl Database {
             .map_err(map_read_err)?
         {
             noxu_dbi::OperationStatus::Success => {
-                let (_, value) =
-                    cursor.get_current().map_err(map_read_err)?;
+                let (_, value) = cursor.get_current().map_err(map_read_err)?;
                 self.throughput.n_pri_searches.fetch_add(1, Ordering::Relaxed);
                 observe_timer_record!(_obs_timer, "noxu_db_operation_duration_seconds", "op" => "get");
                 Ok(Some(value))
@@ -720,8 +719,7 @@ impl Database {
             .map_err(map_read_err)?
         {
             noxu_dbi::OperationStatus::Success => {
-                let (_, value) =
-                    cursor.get_current().map_err(map_read_err)?;
+                let (_, value) = cursor.get_current().map_err(map_read_err)?;
                 // Partial get: return only the requested slice.
                 if data.is_partial() {
                     let off = data.partial_offset();
@@ -797,8 +795,7 @@ impl Database {
             .map_err(map_read_err)?
         {
             noxu_dbi::OperationStatus::Success => {
-                let (_, value) =
-                    cursor.get_current().map_err(map_read_err)?;
+                let (_, value) = cursor.get_current().map_err(map_read_err)?;
                 // JE LockMode.RMW (Cursor.java:5281): an RMW read takes a WRITE
                 // lock on the record so a later update in the same txn cannot
                 // deadlock and a concurrent writer blocks at read time.

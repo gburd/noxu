@@ -36,8 +36,8 @@
 //! ORACLE: the insert must be KeyExists, and the committed (k, v) must survive
 //! both aborts, in process and after reopen. On the defect: Success + final=None.
 use noxu_db::*;
-use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
 use tempfile::TempDir;
 

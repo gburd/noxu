@@ -628,7 +628,9 @@ impl CursorImpl {
             match db.get_real_tree() {
                 Some(tree) => match Self::get_data_from_tree(&tree, key) {
                     Some((data, lsn)) => (Some(data), lsn),
-                    None => return Ok((None, noxu_util::NULL_LSN.as_u64(), false)),
+                    None => {
+                        return Ok((None, noxu_util::NULL_LSN.as_u64(), false));
+                    }
                 },
                 None => return Ok((None, noxu_util::NULL_LSN.as_u64(), false)),
             }
@@ -926,11 +928,7 @@ impl CursorImpl {
     /// (`Promotion`/`WaitPromotion`), and leave a lock the locker already held
     /// (`Existing`/`NoneNeeded`) in place so a txn's pre-existing footprint is
     /// preserved.
-    fn revert_slot_write_lock(
-        &self,
-        lsn: u64,
-        grant: noxu_txn::LockGrantType,
-    ) {
+    fn revert_slot_write_lock(&self, lsn: u64, grant: noxu_txn::LockGrantType) {
         use noxu_txn::LockGrantType::*;
         match grant {
             New | WaitNew => {
@@ -4932,7 +4930,8 @@ impl CursorImpl {
         // stored in the tree.  For non-dup databases it is the plain key.
         // In both cases current_key is the correct tree-delete key.
         if let Some(mut tree_key) = self.current_key.clone() {
-            let (old_data, old_lsn, _) = self.get_slot_before_image(&tree_key)?;
+            let (old_data, old_lsn, _) =
+                self.get_slot_before_image(&tree_key)?;
             self.lock_write_before_log(old_lsn, &tree_key)?;
             // NEW-DEL-RACE-1: revalidate-after-lock (JE
             // `CursorImpl.deleteCurrentRecord`'s post-`lockLN`
@@ -4971,7 +4970,8 @@ impl CursorImpl {
             //     so an LSN==NULL test here would wrongly reject every such
             //     delete — see `test_delete_removes_from_tree`.)
             let record_gone = if old_lsn != noxu_util::NULL_LSN.as_u64() {
-                let (_, current_lsn, _) = self.get_slot_before_image(&tree_key)?;
+                let (_, current_lsn, _) =
+                    self.get_slot_before_image(&tree_key)?;
                 current_lsn != old_lsn
             } else {
                 !self.key_exists_in_view(&tree_key)

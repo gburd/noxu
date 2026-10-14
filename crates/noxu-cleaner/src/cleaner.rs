@@ -610,7 +610,7 @@ impl Cleaner {
     fn check_env_valid(&self) -> Result<(), String> {
         if self.is_env_invalid() {
             return Err(
-                "cleaner: environment is invalid; cleaning stopped".to_string(),
+                "cleaner: environment is invalid; cleaning stopped".to_string()
             );
         }
         Ok(())
