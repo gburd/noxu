@@ -725,6 +725,52 @@ impl RecoveryManager {
             }
         }
 
+        // BUG-DW-SYNC-1: also instantiate a tree for every db_id whose INs/BINs
+        // were logged (seen in analysis.dirty_ins), not only those with LN
+        // redos.  A deferred-write DB made durable via `Database.sync()` /
+        // `Checkpointer.syncDatabase` logs its dirty BINs/INs (including the
+        // is-root node) but NO committed LN records, so it never appears in
+        // `per_db_redo_count`.  Without a tree in the recovery set, its logged
+        // is-root IN is never applied and the synced data is lost.  JE recovers
+        // such a DB because `buildINs(false)` resolves each logged IN's DB via
+        // the mapping tree (`dbMapTree.getDb(dbId)`) regardless of CkptEnd
+        // (RecoveryManager.java:1091-1121).  Starting an empty tree lets the
+        // logged is-root INs install the root (recover_root_bin/upper_in).
+        //
+        // CRITICAL (recovery correctness): only instantiate a tree for a db_id
+        // that is STILL A LIVE DATABASE.  JE's `dbMapTree.getDb(dbId)` returns
+        // null for a database removed/truncated after the checkpoint, so its
+        // stale logged INs are skipped and the DB is NOT resurrected
+        // (RecoveryManager.java:1091-1121).  `analysis.recovered_db_names`
+        // already had removed/truncated names dropped (NameLN `is_deleted`) and
+        // aborted creations dropped (mapping-tree undo); its values are exactly
+        // the live db_ids.  A db_id absent from it is either removed (skip) or
+        // a single-db-no-catalog DB, which always has LN redos and so was
+        // already created from `per_db_redo_count` above (its re-instantiation
+        // here is a no-op anyway).  Without this guard, a create+sync+remove+
+        // crash sequence would resurrect the removed DB from its stale
+        // `dirty_ins` entries.
+        let live_db_ids: std::collections::HashSet<u64> =
+            analysis.recovered_db_names.values().copied().collect();
+        for key in analysis.dirty_ins.keys() {
+            let db_id = key.db_id;
+            // Keep DBs that already have a recovery tree (LN redos / seeded
+            // roots) untouched; only gate the *new* dirty-ins-only trees on
+            // liveness so a removed DB is not resurrected.
+            if !trees.contains_key(&db_id) && !live_db_ids.contains(&db_id) {
+                continue;
+            }
+            // v7.11.1 tag-native: this base has no `new_recovery_tree(db_id,
+            // &cmps)` helper (integrate-only); use the same tree-creation
+            // idiom the per_db_redo_count loop above uses, `Tree::new(db_id,
+            // 256)`.  The default comparator is correct for recovery redo,
+            // which lays slots out in byte order (DBI-14 resort runs later
+            // under the configured comparator if one is set).
+            trees
+                .entry(db_id)
+                .or_insert_with(|| noxu_tree::Tree::new(db_id, 256));
+        }
+
         // ------------------------------------------------------------------
         // REC-P: seed each reconstructed tree from the checkpoint's per-DB
         // root LSN so that redo can lazily fetch pre-checkpoint BINs
