@@ -158,8 +158,14 @@ fn map_cursor_err(e: DbiError) -> NoxuError {
     match e {
         // D1: an LN-fetch / env failure under a read keeps its typed JE
         // reason instead of being flattened into OperationFailed.
+        // A11 Get::Current: a lock timeout / conflict from the re-read
+        // (relock_and_reread_current -> lock_ln) must surface as the typed
+        // NoxuError::LockTimeout / LockConflict (is_retryable), not be
+        // flattened into OperationFailed.
         DbiError::EnvironmentFailure { .. }
-        | DbiError::LnFetchFailure { .. } => NoxuError::from(e),
+        | DbiError::LnFetchFailure { .. }
+        | DbiError::TxnError(_)
+        | DbiError::LockConflict(_) => NoxuError::from(e),
         // NEW-DBI-DUPPUTCUR: surface a rejected putCurrent (moving a dup to
         // a new sort position) as the typed DuplicateDataException so
         // callers can match on it, mirroring JE Cursor.putCurrent.
@@ -476,9 +482,26 @@ impl<'txn> Cursor<'txn> {
                 // : re-check for deletion — Cursor.getCurrentLN() returns
                 // KEYEMPTY when the record at the cursor position was deleted
                 // after the cursor was positioned.
+                // F5: wait for an uncommitted deleter first (JE locks a
+                // slot that is not known-deleted, CursorImpl.java:2062-2081);
+                // if it aborted the record is back.
                 if self.inner.is_current_slot_deleted() {
-                    return Ok(OperationStatus::NotFound);
+                    self.inner
+                        .lock_current_deleted_slot()
+                        .map_err(map_cursor_err)?;
+                    if self.inner.is_current_slot_deleted() {
+                        return Ok(OperationStatus::NotFound);
+                    }
                 }
+                // Re-read the live slot under its record lock, per isolation
+                // (JE CursorImpl.lockAndGetCurrent / getCurrent): a DEFAULT/
+                // READ_COMMITTED/SERIALIZABLE reader blocks on a foreign
+                // uncommitted writer; a READ_UNCOMMITTED cursor sees the
+                // uncommitted value; the own txn sees its own value. Without
+                // this, Get::Current returned the cursor cached value.
+                self.inner
+                    .relock_and_reread_current()
+                    .map_err(map_cursor_err)?;
                 let (k, v) =
                     self.inner.get_current().map_err(map_cursor_err)?;
                 data.set_data(&v);

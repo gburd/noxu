@@ -3173,6 +3173,115 @@ impl CursorImpl {
         Ok((raw_key, raw_data))
     }
 
+    /// F5: before reporting the current slot as deleted, wait for the
+    /// deleter's lock.  Noxu removes a deleted slot physically and the
+    /// deleter holds the synthetic-key WRITE lock until it ends, so this
+    /// contests that lock (JE locks every slot that is not known-deleted
+    /// before calling it defunct, CursorImpl.java:2062-2081).  A deleter
+    /// that is this cursor's own txn, or a read-uncommitted cursor, does not
+    /// wait.
+    pub fn lock_current_deleted_slot(&self) -> Result<(), DbiError> {
+        match &self.current_key {
+            Some(k) => self.contest_synthetic_key_for_missing_read(k),
+            None => Ok(()),
+        }
+    }
+
+    /// JE `CursorImpl.lockAndGetCurrent` / `getCurrent` for a *live* slot
+    /// (CursorImpl.java:1983-2095, getCurrent :2230), reached from
+    /// `Cursor.getCurrentNoDups` (Cursor.java:3062-3092): re-latch the current
+    /// slot, lock it per the cursor isolation, and re-derive its key/data
+    /// from the slot -- never from a value cached when the cursor was
+    /// positioned.  Closes the `Get::Current` isolation divergence: the
+    /// previous code returned the cached key/data without re-reading or
+    /// locking, so a DEFAULT/READ_COMMITTED reader did not block on a foreign
+    /// uncommitted write-locked slot and a READ_UNCOMMITTED cursor did not see
+    /// the uncommitted new value.
+    ///
+    /// Behaviour by isolation (via [`Self::lock_ln`] / JE getLockType,
+    /// Cursor.java:4260-4276): READ_UNCOMMITTED -> NONE (no block, but the
+    /// slot IS re-read so a dirty update is visible); READ_COMMITTED /
+    /// repeatable-read -> READ (blocks on a foreign WRITE); SERIALIZABLE ->
+    /// RANGE_READ (likewise); the own txn already owns the WRITE lock, granted
+    /// immediately.  Call only on a NOT-known-deleted slot (the caller handles
+    /// the KD case first, JE isEntryKnownDeleted short-circuit).
+    pub fn relock_and_reread_current(&mut self) -> Result<(), DbiError> {
+        self.check_env()?;
+        self.check_initialized()?;
+        let Some(key) = self.current_key.clone() else {
+            return Ok(());
+        };
+        // Resolve the slot BY KEY under the BIN latch (never by the possibly
+        // stale `current_index`): a concurrent insert before this position
+        // shifts the record to a new index, and a split moves it to another
+        // BIN. `is_current_slot_deleted` already re-anchors this way (D5/CC-1).
+        let Some((pre_lsn, _, _, _)) = self.resolve_slot_by_key(&key) else {
+            // Key no longer in the tree: the caller KD recheck handles the
+            // defunct case; keep the cached value.
+            return Ok(());
+        };
+        // NULL_LSN (unlogged / deferred-write slot): no record lock to take.
+        if pre_lsn == noxu_util::NULL_LSN.as_u64() {
+            return Ok(());
+        }
+        // Lock the slot per isolation. For a foreign uncommitted writer this
+        // blocks (READ/RANGE_READ -> LockTimeout) or is a no-op (NONE); for our
+        // own txn the lock is already held and is granted immediately.
+        self.lock_ln(pre_lsn)?;
+        // Re-resolve BY KEY after the lock (the slot may have moved again while
+        // we waited) and install the authoritative key/data/lsn/index + re-pin.
+        if let Some((lsn, data, idx, bin_arc)) = self.resolve_slot_by_key(&key)
+        {
+            self.update_bin_pin(Some(bin_arc));
+            self.current_data = Some(data);
+            self.current_lsn = lsn;
+            self.current_index = idx;
+            self.rehydrate_current_data()?;
+        }
+        Ok(())
+    }
+
+    /// Re-resolve the live slot for `key` under the BIN latch, returning its
+    /// `(lsn, data, index, bin_arc)`. Matches with the configured comparator
+    /// (mirrors `stored_full_key` / `get_data_from_tree`), so an insert-shifted
+    /// or split-moved record is found at its current location. Returns `None`
+    /// when the key is absent or the matching slot is known-deleted.
+    #[allow(clippy::type_complexity)]
+    fn resolve_slot_by_key(
+        &self,
+        key: &[u8],
+    ) -> Option<(
+        u64,
+        Bytes,
+        i32,
+        std::sync::Arc<noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>>,
+    )> {
+        use noxu_tree::tree::TreeNode;
+        let db = self.db_impl.read();
+        let tree = db.get_real_tree()?;
+        let bin_arc = Self::find_bin_for_key(&tree, key)?;
+        let guard = bin_arc.read();
+        let TreeNode::Bottom(bin) = &*guard else {
+            return None;
+        };
+        if !bin.key_prefix.is_empty()
+            && !key.starts_with(bin.key_prefix.as_slice())
+        {
+            return None;
+        }
+        let (idx, found) = match tree.get_comparator() {
+            Some(cmp) => bin.find_entry_cmp(key, cmp.as_ref()),
+            None => bin.find_entry_compressed(key),
+        };
+        if !found || bin.entries[idx].known_deleted {
+            return None;
+        }
+        let lsn = bin.get_lsn(idx).as_u64();
+        let data = bin.entries[idx].data.clone().unwrap_or_default();
+        drop(guard);
+        Some((lsn, data, idx as i32, bin_arc))
+    }
+
     /// Returns true if the slot the cursor is positioned on has been deleted
     /// since the cursor was last positioned.
     ///
