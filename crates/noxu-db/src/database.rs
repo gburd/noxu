@@ -1814,19 +1814,24 @@ impl Database {
         self.fk_referrers.read().iter().filter_map(|w| w.upgrade()).collect()
     }
 
-    /// Returns an approximate count of records in the database.
+    /// Returns the count of LIVE records in the database.
     ///
-    /// reads the per-database `AtomicU64` entry
-    /// counter, giving O(1) performance analogous to an O(1) counter.
-    ///
-    /// The counter is incremented on every new insert and decremented on every
-    /// delete (including transaction aborts that undo inserts).
+    /// Walks the tree counting non-deleted, non-TTL-expired slots (JE
+    /// `Database.count`, whose BIN scan sees only live slots). This is NOT the
+    /// O(1) `entry_count` atomic: that running counter cannot track time-based
+    /// TTL expiry (an expiry has no decrement event), so a correct count must
+    /// scan. For TTL-free databases the two agree.
     ///
     /// # Errors
     /// Returns an error if the database is closed
     pub fn count(&self) -> Result<u64> {
         self.check_open()?;
-        Ok(self.db_impl.read().entry_count())
+        // Walk the tree counting LIVE slots so TTL-expired records are
+        // excluded (JE Database.count scans BINs, which see only live slots).
+        // The O(1) entry_count atomic cannot track time-based expiry (expiry
+        // has no decrement event), so count() must scan. BtreeStats fast
+        // stats still use the atomic for leaf_node_count.
+        Ok(self.db_impl.read().count_live())
     }
 
     /// Returns all records as `(key_bytes, data_bytes)` pairs in key order.

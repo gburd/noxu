@@ -383,6 +383,19 @@ impl DatabaseImpl {
     /// Returns the current entry count.
     ///
     /// In — reads an AtomicLong.
+    /// Counts LIVE records by walking the tree, filtering TTL-expired slots
+    /// (and known-deleted slots) via the shared Tree::count_entries /
+    /// slot_is_live predicate. Unlike entry_count (an O(1) running atomic that
+    /// cannot track time-based expiry), this reflects records visible to reads
+    /// NOW -- matching JE Database.count, whose BIN scan sees only live slots.
+    /// Falls back to the atomic if no tree is materialized.
+    pub fn count_live(&self) -> u64 {
+        match self.get_real_tree() {
+            Some(tree) => tree.count_entries(),
+            None => self.entry_count(),
+        }
+    }
+
     pub fn entry_count(&self) -> u64 {
         self.entry_count.load(Ordering::Relaxed)
     }

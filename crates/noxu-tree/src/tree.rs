@@ -3455,9 +3455,15 @@ impl Tree {
         let guard = node_arc.read();
         match &*guard {
             TreeNode::Bottom(b) => {
-                // Count only live (non-known_deleted) entries.
-                *total += b.entries.iter().filter(|e| !e.known_deleted).count()
-                    as u64;
+                // Count only LIVE slots: not known-deleted AND not TTL-expired
+                // (when expiration is enabled). Reuses the shared slot_is_live
+                // predicate so count() filters expired records exactly as JE
+                // Database.count does (its BIN scan sees only live slots), and
+                // so the expiry semantics stay in ONE place (is_expired /
+                // slot_is_live) shared with the read path.
+                *total += (0..b.entries.len())
+                    .filter(|&i| b.slot_is_live(i))
+                    .count() as u64;
             }
             TreeNode::Internal(n) => {
                 let children: Vec<Arc<RwLock<TreeNode>>> =
