@@ -956,6 +956,7 @@ impl Database {
                     &key_entry,
                     old_entry.as_ref(),
                     Some(&new_entry),
+                    expiration,
                 )?;
             }
         }
@@ -1177,7 +1178,7 @@ impl Database {
                 let key_entry = DatabaseEntry::from_bytes(key_bytes);
                 let new_entry = DatabaseEntry::from_bytes(data_bytes);
                 for hook in secondaries {
-                    hook.maintain(txn, &key_entry, None, Some(&new_entry))?;
+                    hook.maintain(txn, &key_entry, None, Some(&new_entry), 0)?;
                 }
             }
 
@@ -1327,7 +1328,7 @@ impl Database {
             for old_bytes in &deleted_old_values {
                 let old_entry = DatabaseEntry::from_bytes(old_bytes);
                 for hook in &secondaries {
-                    hook.maintain(txn, &key, Some(&old_entry), None)?;
+                    hook.maintain(txn, &key, Some(&old_entry), None, 0)?;
                 }
             }
         }

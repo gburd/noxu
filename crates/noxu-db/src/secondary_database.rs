@@ -101,6 +101,7 @@ pub(crate) trait SecondaryHook {
         pri_key: &DatabaseEntry,
         old_data: Option<&DatabaseEntry>,
         new_data: Option<&DatabaseEntry>,
+        expiration: i32,
     ) -> Result<()>;
 
     /// Returns the secondary's database name (used in diagnostics).
@@ -176,6 +177,7 @@ impl SecondaryHookState {
         pri_key: &DatabaseEntry,
         old_data: Option<&DatabaseEntry>,
         new_data: Option<&DatabaseEntry>,
+        expiration: i32,
     ) -> Result<()> {
         let key_creator = &self.config.key_creator;
         let multi_key_creator = &self.config.multi_key_creator;
@@ -227,6 +229,7 @@ impl SecondaryHookState {
                     txn,
                     new_sec_key.as_ref().unwrap(),
                     pri_key,
+                    expiration,
                 )?;
             }
         } else if let Some(multi_creator) = multi_key_creator {
@@ -262,7 +265,7 @@ impl SecondaryHookState {
             }
             for new_key in &new_keys {
                 if !old_keys.contains(new_key) {
-                    self.insert_sec_key(txn, new_key, pri_key)?;
+                    self.insert_sec_key(txn, new_key, pri_key, expiration)?;
                 }
             }
         }
@@ -273,11 +276,17 @@ impl SecondaryHookState {
     /// Inserts a (sec_key, pri_key) duplicate.  See the
     /// [`SecondaryDatabase`] impl for the full doc-comment; this is the
     /// state-side implementation that the public method delegates to.
+    ///
+    /// `expiration` is the primary record's packed TTL expiration (0 = none);
+    /// it is stamped onto the secondary index entry so the secondary slot
+    /// expires with the primary (JE: primary `ExpirationInfo` flows into the
+    /// secondary LN).
     fn insert_sec_key(
         &self,
         txn: Option<&Transaction>,
         sec_key: &DatabaseEntry,
         pri_key: &DatabaseEntry,
+        expiration: i32,
     ) -> Result<()> {
         // F3 (JE SecondaryDatabase.insertKey): when a foreign-key database is
         // configured, the new secondary key MUST exist as a key in that foreign
@@ -308,10 +317,22 @@ impl SecondaryHookState {
             }
         }
         let mut cursor = self.make_inner_cursor(txn)?;
-        let status =
-            cursor
-                .put(sec_key, pri_key, crate::put::Put::NoDupData)
-                .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
+        // Propagate the primary record's TTL expiration onto the secondary
+        // index entry so the secondary slot expires together with the primary
+        // (JE: the primary ExpirationInfo flows into the secondary LN).
+        //
+        // v7.11.1 tag-native merge note: this replaces the stack-v1
+        // `cursor.put(..).map_err(|e| OperationNotAllowed(e.to_string()))`
+        // with `put_with_expiration(..)?`, whose internal `map_cursor_err`
+        // PRESERVES typed lock errors (NoxuError::LockNotAvailable) instead of
+        // flattening them to a stringy OperationNotAllowed - consistent with
+        // the A15 phantom typed-error direction already on stack-v1.
+        let status = cursor.put_with_expiration(
+            sec_key,
+            pri_key,
+            crate::put::Put::NoDupData,
+            expiration,
+        )?;
         match status {
             OperationStatus::Success => Ok(()),
             OperationStatus::KeyExists => {
@@ -396,8 +417,9 @@ impl SecondaryHook for SecondaryHookState {
         pri_key: &DatabaseEntry,
         old_data: Option<&DatabaseEntry>,
         new_data: Option<&DatabaseEntry>,
+        expiration: i32,
     ) -> Result<()> {
-        self.update_secondary(txn, pri_key, old_data, new_data)
+        self.update_secondary(txn, pri_key, old_data, new_data, expiration)
     }
 
     fn name(&self) -> String {
@@ -1294,8 +1316,10 @@ impl SecondaryDatabase {
     ) -> Result<()> {
         // Delegated to the state so the [`SecondaryHook`] trait impl can
         // share the same body when `Database::put` / `Database::delete`
-        // drives automatic maintenance (audit C3).
-        self.state.update_secondary(txn, pri_key, old_data, new_data)
+        // drives automatic maintenance (audit C3).  The public (manual /
+        // populate) entry point carries no TTL; the automatic put path
+        // threads the real primary expiration via `maintain`.
+        self.state.update_secondary(txn, pri_key, old_data, new_data, 0)
     }
 
     /// Removes all secondary index entries for the given primary key.
@@ -1310,7 +1334,7 @@ impl SecondaryDatabase {
         pri_key: &DatabaseEntry,
         old_data: Option<&DatabaseEntry>,
     ) -> Result<()> {
-        self.state.update_secondary(txn, pri_key, old_data, None)
+        self.state.update_secondary(txn, pri_key, old_data, None, 0)
     }
 
     /// Returns a reference to the inner index `Database`.
@@ -1341,21 +1365,6 @@ impl SecondaryDatabase {
     // ------------------------------------------------------------------
     // Private helpers
     // ------------------------------------------------------------------
-
-    /// Inserts a secondary index entry: (sec_key -> pri_key).
-    ///
-    /// v1.6 (Decision 1B / audit C4): the inner index DB is sorted-dup,
-    /// so multiple primary records that produce the same `sec_key` are
-    /// stored as duplicates of `sec_key`.  Delegates to the state-side
-    /// implementation so the [`SecondaryHook`] trait shares it.
-    fn insert_sec_key(
-        &self,
-        txn: Option<&Transaction>,
-        sec_key: &DatabaseEntry,
-        pri_key: &DatabaseEntry,
-    ) -> Result<()> {
-        self.state.insert_sec_key(txn, sec_key, pri_key)
-    }
 
     /// Deletes a secondary index entry: (sec_key -> pri_key).  Delegates
     /// to the state-side implementation.
@@ -1440,7 +1449,11 @@ impl SecondaryDatabase {
                     &pri_data,
                     &mut sec_key,
                 ) {
-                    self.insert_sec_key(None, &sec_key, &pri_key)?;
+                    // ponytail: populate with expiration 0 (never-expire index
+                    // entry); the live write path (update_secondary via
+                    // maintain) carries the real primary expiration. Revisit if
+                    // a populate-time TTL witness is needed.
+                    self.state.insert_sec_key(None, &sec_key, &pri_key, 0)?;
                 }
             } else if let Some(multi_creator) =
                 &self.state.config.multi_key_creator
@@ -1453,7 +1466,7 @@ impl SecondaryDatabase {
                     &mut sec_keys,
                 );
                 for sec_key in sec_keys {
-                    self.insert_sec_key(None, &sec_key, &pri_key)?;
+                    self.state.insert_sec_key(None, &sec_key, &pri_key, 0)?;
                 }
             }
 

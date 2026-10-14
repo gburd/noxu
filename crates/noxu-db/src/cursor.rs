@@ -118,6 +118,7 @@ impl CursorSecMaint {
         key: &[u8],
         old: Option<&[u8]>,
         new: Option<&[u8]>,
+        expiration: i32,
     ) -> Result<()> {
         let secondaries = self.live();
         if secondaries.is_empty() {
@@ -132,6 +133,7 @@ impl CursorSecMaint {
                 &key_entry,
                 old_entry.as_ref(),
                 new_entry.as_ref(),
+                expiration,
             )?;
         }
         Ok(())
@@ -687,10 +689,59 @@ impl<'txn> Cursor<'txn> {
                 &sec_key,
                 old_for_sec.as_deref(),
                 Some(data_bytes),
+                // A cursor put carries no public TTL today (the TTL write API
+                // is Database::put_with_options); 0 = never-expire index entry.
+                0,
             )?;
         }
 
         Ok(status)
+    }
+
+    /// Like [`Self::put`] but stamps the record with a packed TTL expiration
+    /// (hours since the Unix epoch; 0 = never expires).
+    ///
+    /// Used by secondary-index maintenance to propagate the primary record's
+    /// expiration onto the secondary index entry, so the secondary slot
+    /// expires together with the primary (JE stores the primary's expiration
+    /// in the secondary LN: `SecondaryDatabase.updateSecondary` passes the
+    /// primary `ExpirationInfo` to the index put).  This bypasses the
+    /// primary-secondary maintenance wrapper in [`Self::put`] because an index
+    /// cursor's database has no secondaries of its own.
+    pub(crate) fn put_with_expiration(
+        &mut self,
+        key: &DatabaseEntry,
+        data: &DatabaseEntry,
+        put_type: Put,
+        expiration: i32,
+    ) -> Result<OperationStatus> {
+        self.check_open()?;
+        if self.read_only {
+            return Err(NoxuError::OperationNotAllowed(
+                "Cannot write with a read-only cursor".to_string(),
+            ));
+        }
+        let key_bytes = key.data_opt().unwrap_or(&[]);
+        let data_bytes = data.data_opt().unwrap_or(&[]);
+        let put_mode = match put_type {
+            Put::Overwrite => PutMode::Overwrite,
+            Put::NoOverwrite => PutMode::NoOverwrite,
+            Put::NoDupData => PutMode::NoDupData,
+            Put::Current => {
+                self.check_initialized()?;
+                PutMode::Current
+            }
+        };
+        let status = self
+            .inner
+            .put_with_expiration(key_bytes, data_bytes, put_mode, expiration)
+            .map_err(map_cursor_err)?;
+        Ok(match status {
+            noxu_dbi::OperationStatus::KeyExist => OperationStatus::KeyExists,
+            noxu_dbi::OperationStatus::KeyEmpty => OperationStatus::KeyEmpty,
+            noxu_dbi::OperationStatus::NotFound => OperationStatus::NotFound,
+            _ => OperationStatus::Success,
+        })
     }
 
     /// Delete the record at the current cursor position.
@@ -741,6 +792,7 @@ impl<'txn> Cursor<'txn> {
                 &k,
                 Some(&v),
                 None,
+                0,
             )?;
         }
 
