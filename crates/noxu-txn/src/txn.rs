@@ -479,6 +479,18 @@ impl Txn {
             )
     }
 
+    /// True iff this txn already owns (or shares) any lock on `lsn`.
+    ///
+    /// JE `LockManager.ownsOrSharesLock(locker, lsn)` as used by
+    /// `CursorImpl.lockLN` (CursorImpl.java:3581) to decide
+    /// `wasLockedAndExpiresSoon`: a record that expires within
+    /// `TTL_MAX_TXN_TIME` is treated as NOT expired (repeatable read) only for
+    /// a locker that already holds a lock on the slot.  A read lock
+    /// (`read_locks`) or a write lock (`write_locks`) both count as ownership.
+    pub fn owns_lock(&self, lsn: u64) -> bool {
+        self.read_locks.contains(&lsn) || self.write_locks.contains_key(&lsn)
+    }
+
     /// Read-committed / read-uncommitted fast-path probe.
     ///
     /// A read-committed cursor read acquires a `Read` lock and releases it

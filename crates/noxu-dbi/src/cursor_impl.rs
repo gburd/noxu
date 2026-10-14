@@ -281,6 +281,14 @@ pub struct CursorImpl {
     /// JE's `ExpirationInfo` threaded from `WriteOptions` into the put
     /// operation (`CursorImpl.putInternal` / `LN.log`).
     pending_expiration: i32,
+    /// Maximum assumed lock-hold time (ms) for the TTL repeatable-read rule
+    /// (JE `ENV_TTL_MAX_TXN_TIME`, default 24h).  A record that
+    /// `expiresWithin(ttl_max_txn_time_ms)` is treated as NOT expired for a
+    /// locker that already owns a lock on its slot (JE `CursorImpl.lockLN`
+    /// `wasLockedAndExpiresSoon`, CursorImpl.java:3573-3587).  Defaults to the
+    /// JE 24h default; wired from the env config via
+    /// [`Self::with_ttl_max_txn_time`].
+    ttl_max_txn_time_ms: u64,
 }
 
 /// RAII pin-guard for a BIN `Arc` pinned by the cursor descent
@@ -520,6 +528,9 @@ impl CursorImpl {
             throughput,
             disk_limit: None,
             pending_expiration: 0,
+            // JE ENV_TTL_MAX_TXN_TIME default (24h); overridden via
+            // with_ttl_max_txn_time when the env config supplies a value.
+            ttl_max_txn_time_ms: 24 * 60 * 60 * 1000,
         }
     }
 
@@ -553,6 +564,9 @@ impl CursorImpl {
             throughput,
             disk_limit: None,
             pending_expiration: 0,
+            // JE ENV_TTL_MAX_TXN_TIME default (24h); overridden via
+            // with_ttl_max_txn_time when the env config supplies a value.
+            ttl_max_txn_time_ms: 24 * 60 * 60 * 1000,
         }
     }
 
@@ -575,6 +589,14 @@ impl CursorImpl {
     /// `DatabaseImpl.openCursor()`.  Returns `self` for builder-style chaining.
     pub fn with_lock_manager(mut self, lock_manager: Arc<LockManager>) -> Self {
         self.lock_manager = Some(lock_manager);
+        self
+    }
+
+    /// Sets the TTL repeatable-read window (ms) from the env config
+    /// (`ENV_TTL_MAX_TXN_TIME`).  Builder-style; defaults to the JE 24h
+    /// default when not called.  See [`Self::ttl_max_txn_time_ms`].
+    pub fn with_ttl_max_txn_time(mut self, ms: u64) -> Self {
+        self.ttl_max_txn_time_ms = ms;
         self
     }
 
@@ -1428,6 +1450,28 @@ impl CursorImpl {
                     self.update_bin_pin(Some(bin_arc));
                     Ok(OperationStatus::Success)
                 } else {
+                    // BUG-TTL-REPEATABLE-READ-1 / JE repeatable read: an exact
+                    // match that is TTL-expired but NOT known-deleted is still
+                    // visible to a txn that already owns a lock on the slot and
+                    // whose record expires within TTL_MAX_TXN_TIME (JE
+                    // CursorImpl.lockLN wasLockedAndExpiresSoon,
+                    // CursorImpl.java:3573-3587: defunct = isDeleted, not
+                    // isDefunct, for the lock owner).  A non-owner / autocommit
+                    // read, or a record expired beyond the window, still sees
+                    // it filtered.
+                    if let Some(hit) = self.try_repeatable_read_expired(
+                        key,
+                        slot.as_ref().and_then(|s| s.expired_slot),
+                        slot.as_ref().map(|s| s.bin_arc.clone()),
+                    )? {
+                        return Ok(hit);
+                    }
+                    // v7.11.1 tag-native deviation: the integrate side here also
+                    // locked known-deleted slots before NOTFOUND via
+                    // `slot.kd_lsn` / `lock_skipped_defunct_slots` (A5 KD-slot
+                    // lineage, NOT in stack-v1); that block is dropped. The
+                    // A14 `try_repeatable_read_expired` call above is the only
+                    // A14 addition to this arm.
                     // Wave 5: contest a synthetic-key read lock on the
                     // missing slot to detect uncommitted deletes.  See
                     // `lock_synthetic_key_for_delete`.
@@ -1998,6 +2042,106 @@ impl CursorImpl {
     /// true)` — the ADVANCE lock type.  See [`Self::lock_ln_mode`].  Kept as
     /// the default entry point for forward-scan / advance call sites, which
     /// JE range-locks (`RANGE_READ` under serializable).
+    fn try_repeatable_read_expired(
+        &mut self,
+        key: &[u8],
+        expired: Option<(u64, usize, u32, bool)>,
+        bin_arc: Option<Arc<noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>>>,
+    ) -> Result<Option<OperationStatus>, DbiError> {
+        // BUG-TTL-REPEATABLE-READ-1 / JE repeatable read on an expired record.
+        //
+        // An exact search positioned on a slot that is TTL-expired but NOT
+        // known-deleted (`expired` = (lsn, slot_index, expiration_time,
+        // expiration_in_hours) from `search_with_data`).  JE
+        // `CursorImpl.lockLN` (CursorImpl.java:3573-3587) treats such a record
+        // as NOT expired *only* when the locker already owns/shares a lock on
+        // the slot's LSN AND the record `expiresWithin(TTL_MAX_TXN_TIME)`:
+        //
+        //   if (envImpl.expiresWithin(prevExpiration, prevExpirationInHours,
+        //                             getTtlMaxTxnTime())) {
+        //       if (lockManager.ownsOrSharesLock(locker, lsn)) {
+        //           wasLockedAndExpiresSoon = true;
+        //       }
+        //   }
+        //   standing.defunct = wasLockedAndExpiresSoon
+        //       ? bin.isDeleted(index)    // expiry suppressed for the owner
+        //       : bin.isDefunct(index);   // deleted OR expired otherwise
+        //
+        // So a txn that already read (locked) a record keeps seeing it after
+        // it expires mid-txn (repeatable read); a NON-owner, an autocommit
+        // read, or a record expired beyond TTL_MAX_TXN_TIME still sees it
+        // filtered.  Returns Some(Success) after positioning on the (now
+        // un-suppressed) slot, or None to fall through to NOTFOUND handling.
+        let Some((lsn, slot_index, expiration_time, in_hours)) = expired else {
+            return Ok(None);
+        };
+        // Only a transactional cursor can "already own" a lock across reads;
+        // an autocommit read releases its lock after every op and is never the
+        // owner on a subsequent read.
+        let Some(txn) = &self.txn_ref else {
+            return Ok(None);
+        };
+        // JE: expiresWithin(.., getTtlMaxTxnTime()) must be true (the record is
+        // near its expiry, within the max assumed lock-hold window) AND the
+        // locker must already own/share a lock on the slot's LSN.
+        if !noxu_util::ttl::expires_within(
+            expiration_time,
+            in_hours,
+            self.ttl_max_txn_time_ms as i64,
+        ) {
+            return Ok(None);
+        }
+        if !txn.lock().unwrap().owns_lock(lsn) {
+            return Ok(None);
+        }
+        // The owner keeps seeing the record: re-lock the slot (idempotent for
+        // an owner, mirroring JE's lockLN before getCurrent) and position the
+        // cursor as a found exact match.
+        let contended = self.lock_ln_mode(lsn, false)?;
+        if contended {
+            // A concurrent writer changed the slot while we checked; fall back
+            // to normal miss handling (the record may now really be gone).
+            return Ok(None);
+        }
+        let Some(bin_arc) = bin_arc else {
+            return Ok(None);
+        };
+        // Re-read the slot's current data directly from the pinned BIN; if the
+        // LN data was evicted, fetch it from the log at `lsn`.
+        let data = {
+            use noxu_tree::tree::TreeNode;
+            let guard = bin_arc.read();
+            match &*guard {
+                TreeNode::Bottom(bin) => {
+                    if slot_index >= bin.entries.len()
+                        || bin.get_lsn(slot_index).as_u64() != lsn
+                    {
+                        // Slot moved/changed since the search; fall back.
+                        return Ok(None);
+                    }
+                    bin.entries[slot_index].data.clone()
+                }
+                _ => return Ok(None),
+            }
+        };
+        // v7.11.1 tag-native: on this base `fetch_ln_data_from_log` returns
+        // `Option<Bytes>` (not `Result<Option<Bytes>>` as on integrate), so no
+        // `?` — a failed cold fetch simply yields `None` (slot data absent).
+        let final_data = match data {
+            Some(d) => Some(d),
+            None if lsn != 0 => self.fetch_ln_data_from_log(lsn),
+            none => none,
+        };
+        self.current_key =
+            Some(self.stored_full_key(key).unwrap_or_else(|| key.to_vec()));
+        self.current_data = final_data;
+        self.current_lsn = lsn;
+        self.current_index = slot_index as i32;
+        self.state = CursorState::Initialized;
+        self.update_bin_pin(Some(bin_arc));
+        Ok(Some(OperationStatus::Success))
+    }
+
     fn lock_ln(&self, lsn: u64) -> Result<bool, DbiError> {
         self.lock_ln_mode(lsn, true)
     }

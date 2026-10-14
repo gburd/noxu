@@ -194,6 +194,21 @@ pub struct SlotFetch {
     /// Arc to the BIN that the descent reached.  Always `Some` when the
     /// tree has at least one node, regardless of whether `found` is `true`.
     pub bin_arc: Arc<RwLock<TreeNode>>,
+    /// An exact-match slot that is TTL-expired but NOT known-deleted (`found`
+    /// is then `false`).  Carries `(lsn, slot_index, expiration_time,
+    /// expiration_in_hours)` so the cursor can apply JE's repeatable-read
+    /// rule: a locker that already owns a lock on `lsn` and whose record
+    /// `expiresWithin(TTL_MAX_TXN_TIME)` treats the record as NOT expired
+    /// (JE CursorImpl.lockLN wasLockedAndExpiresSoon, CursorImpl.java:3573-3587).
+    /// JE's `searchExact` positions on an expired-but-undeleted slot via
+    /// `findEntry` (expiry is filtered only in `lockLN`, not in the tree
+    /// search); Noxu's `search_with_data` filters expiry inline, so it surfaces
+    /// the expired slot here instead for the cursor to resolve.
+    //
+    // v7.11.1 tag-native deviation: the integrate base also carried a `kd_lsn:
+    // Option<u64>` field here (A5 KD-slot lineage, NOT in stack-v1); it is
+    // dropped so only the A14 `expired_slot` field is added.
+    pub expired_slot: Option<(u64, usize, u32, bool)>,
 }
 
 /// The B+tree.
@@ -1450,6 +1465,31 @@ impl BinStub {
                             e.expiration_time,
                             self.expiration_in_hours,
                         )))
+            }
+            None => false,
+        }
+    }
+
+    /// True iff slot `idx` is TTL-expired but NOT known-deleted.
+    ///
+    /// The complement of `slot_is_live` for the expired-only case: a slot that
+    /// `slot_is_live` rejects *solely* because it has expired (not because it
+    /// is known-deleted).  Used by the cursor exact-search path to surface an
+    /// expired-but-undeleted slot so JE's repeatable-read rule can be applied
+    /// (a lock owner within `TTL_MAX_TXN_TIME` still sees it).  Mirrors JE's
+    /// split of `isDefunct` (deleted OR expired) vs `isDeleted` (deleted only)
+    /// in CursorImpl.lockLN (CursorImpl.java:3618/3627).
+    #[inline]
+    pub fn slot_expired_not_deleted(&self, idx: usize) -> bool {
+        match self.entries.get(idx) {
+            Some(e) => {
+                !e.known_deleted
+                    && self.expiration_enabled
+                    && e.expiration_time != 0
+                    && noxu_util::ttl::is_expired(
+                        e.expiration_time,
+                        self.expiration_in_hours,
+                    )
             }
             None => false,
         }
@@ -3709,6 +3749,7 @@ impl Tree {
                     self.note_bin_access(bin.is_delta);
                 }
 
+                let mut expired_slot: Option<(u64, usize, u32, bool)> = None;
                 let (found, data, lsn, slot_index) = match &*guard {
                     TreeNode::Bottom(bin) => {
                         let (idx, exact) = match &self.key_comparator {
@@ -3730,6 +3771,21 @@ impl Tree {
                                 // per-read `Vec<u8>` deep copy, tree.rs R2).
                                 (true, e.data.clone(), lsn.as_u64(), idx)
                             } else {
+                                // JE searchExact positions on an expired (but
+                                // not deleted) slot via findEntry; expiry is
+                                // decided in lockLN, not the tree search.  Noxu
+                                // filters expiry here, so surface the expired
+                                // slot (lsn, index, expiration, units) for the
+                                // cursor to apply the repeatable-read rule
+                                // (CursorImpl.lockLN:3573-3587).
+                                if bin.slot_expired_not_deleted(idx) {
+                                    expired_slot = Some((
+                                        bin.get_lsn(idx).as_u64(),
+                                        idx,
+                                        bin.entries[idx].expiration_time,
+                                        bin.expiration_in_hours,
+                                    ));
+                                }
                                 (false, None, 0u64, 0)
                             }
                         } else {
@@ -3747,6 +3803,7 @@ impl Tree {
                     lsn,
                     slot_index,
                     bin_arc,
+                    expired_slot,
                 });
             }
 
