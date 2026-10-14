@@ -2,12 +2,65 @@
 //!
 //! TTL (time-to-live) utility functions for record expiration.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::clock::Clock;
 
 /// Number of seconds in one hour.
 pub const SECS_PER_HOUR: u64 = 3600;
+
+/// Process-global test override for the TTL system clock, in milliseconds
+/// since the Unix epoch.
+///
+/// Faithful analog of JE's static `TTL.timeTestHook` / `fixedSystemTime`
+/// (TTL.java:124-162): all TTL time reads flow through
+/// [`current_system_time_ms`] (JE `TTL.currentSystemTime`), which consults
+/// this override when it is set.  A value of 0 means "not set — use the real
+/// wall clock", exactly as `timeTestHook == null` does in JE.  Because `0` is
+/// also a (long-past) legal epoch time, 0 is reserved as the sentinel; tests
+/// use a time well after the epoch (e.g. 2016), so this is never a problem in
+/// practice and matches JE where `fixedSystemTime == 0` is the cleared state.
+///
+/// This is a **test-only hook**: production never calls
+/// [`set_test_time_ms`], so `TEST_TIME_MS` stays 0 and
+/// [`current_system_time_ms`] delegates straight to `SystemTime::now`.
+static TEST_TIME_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Installs a fixed TTL system time (ms since the Unix epoch) for all TTL
+/// processing in this process, or clears it when `ms == 0`.
+///
+/// Faithful analog of JE `TTL.setTimeTestHook` (TTL.java:153): once set, every
+/// TTL expiry decision behaves as if the system clock reads `ms`, so a record
+/// can be aged past its expiration deterministically (JE `TTLTest`
+/// `setFixedTimeHook` / `fixedSystemTime`).  Pass 0 to restore the real clock
+/// (JE `TTL.setTimeTestHook(null)`).
+///
+/// Intended for tests only; production code never calls it.
+#[doc(hidden)] // test-only hook; not committed public API (v7.11.1 patch-safe)
+pub fn set_test_time_ms(ms: u64) {
+    TEST_TIME_MS.store(ms, Ordering::SeqCst);
+}
+
+/// Advances the fixed TTL system time by `delta_ms` milliseconds.
+///
+/// Must be called only while a fixed time is installed (JE's tests only mutate
+/// `fixedSystemTime` after `setFixedTimeHook`); advancing from the cleared
+/// state (0) is a no-op guard so a stray advance cannot silently install a
+/// near-epoch fixed clock in production.
+#[doc(hidden)] // test-only hook; not committed public API (v7.11.1 patch-safe)
+pub fn advance_test_time_ms(delta_ms: u64) {
+    let cur = TEST_TIME_MS.load(Ordering::SeqCst);
+    if cur != 0 {
+        TEST_TIME_MS.store(cur.saturating_add(delta_ms), Ordering::SeqCst);
+    }
+}
+
+/// Returns the currently installed fixed TTL system time, or 0 if none.
+#[doc(hidden)] // test-only hook; not committed public API (v7.11.1 patch-safe)
+pub fn test_time_ms() -> u64 {
+    TEST_TIME_MS.load(Ordering::SeqCst)
+}
 
 /// Milliseconds in one hour (JE `TTL.MILLIS_PER_HOUR`).
 pub const MILLIS_PER_HOUR: u64 = 1000 * 60 * 60;
@@ -30,18 +83,24 @@ pub enum TtlUnit {
 }
 
 /// Returns the current time as packed hours since epoch (for hour-resolution TTL).
+///
+/// Reads "now" via [`current_system_time_ms`] so a test clock installed with
+/// [`set_test_time_ms`] is honored (JE `TTL.currentSystemTime` is the single
+/// time source for all TTL math).
 pub fn current_time_hours() -> u32 {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    (secs / SECS_PER_HOUR) as u32
+    (current_system_time_ms() / 1000 / SECS_PER_HOUR) as u32
 }
 
 /// Returns the current wall-clock time in milliseconds since the Unix epoch.
 ///
-/// JE `TTL.currentSystemTime` (System.currentTimeMillis).
+/// JE `TTL.currentSystemTime` (TTL.java:157-163): returns the fixed test time
+/// when one is installed via [`set_test_time_ms`] (JE `timeTestHook`),
+/// otherwise `System.currentTimeMillis`.
 pub fn current_system_time_ms() -> u64 {
+    let fixed = TEST_TIME_MS.load(Ordering::SeqCst);
+    if fixed != 0 {
+        return fixed;
+    }
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis()
         as u64
 }
@@ -79,9 +138,11 @@ pub fn ttl_to_expiration(ttl: u32, unit: TtlUnit) -> u32 {
 }
 
 /// Returns the current time as seconds since epoch (for second-resolution TTL).
+///
+/// Reads "now" via [`current_system_time_ms`] so a test clock installed with
+/// [`set_test_time_ms`] is honored.
 pub fn current_time_secs() -> u32 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
-        as u32
+    (current_system_time_ms() / 1000) as u32
 }
 
 /// Clock-aware variant of [`is_expired`] for the DST control-flow path.
@@ -191,6 +252,34 @@ pub fn ttl_secs_to_expiration(ttl_secs: u64) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_time_hook_overrides_the_clock() {
+        // Faithful analog of JE TTLTest.setFixedTimeHook / fixedSystemTime:
+        // installing a fixed time makes every TTL time read return it, so a
+        // record can be aged past its expiration deterministically.
+        // 2016-02-03 in ms (matches JE TTLTest BASE_CAL year) — well after
+        // the epoch, so 0 stays a safe "cleared" sentinel.
+        let base_ms: u64 = 1_454_472_306_000; // ~2016-02-03 04:05:06 UTC
+        set_test_time_ms(base_ms);
+        assert_eq!(current_system_time_ms(), base_ms);
+        let base_hours = (base_ms / 1000 / SECS_PER_HOUR) as u32;
+        assert_eq!(current_time_hours(), base_hours);
+        assert_eq!(current_time_secs(), (base_ms / 1000) as u32);
+
+        // A record expiring exactly one hour out is not yet expired...
+        let exp = base_hours + 1;
+        assert!(!is_expired(exp, true));
+        // ...but advancing the fixed clock two hours makes it expired, with
+        // no real wall-clock wait (JE: fixedSystemTime += MILLIS_PER_HOUR).
+        advance_test_time_ms(2 * MILLIS_PER_HOUR);
+        assert!(is_expired(exp, true));
+
+        // Clearing the hook restores the real clock (JE setTimeTestHook(null)).
+        set_test_time_ms(0);
+        assert_eq!(test_time_ms(), 0);
+        assert!(current_system_time_ms() > base_ms); // real clock, now > 2016
+    }
 
     #[test]
     fn never_expires_when_zero() {

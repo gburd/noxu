@@ -60,8 +60,9 @@ pub use lsn::{Lsn, NULL_LSN};
 pub use prng::Prng;
 pub use ttl::{
     MILLIS_PER_DAY, MILLIS_PER_HOUR, SECS_PER_HOUR, TtlUnit,
-    current_system_time_ms, current_time_hours, current_time_secs,
-    expires_within, is_expired, is_expired_with, ttl_hours_to_expiration,
+    advance_test_time_ms, current_system_time_ms, current_time_hours,
+    current_time_secs, expires_within, is_expired, is_expired_with,
+    set_test_time_ms, test_time_ms, ttl_hours_to_expiration,
     ttl_secs_to_expiration, ttl_to_expiration,
 };
 pub use vlsn::{
