@@ -191,18 +191,40 @@ fn committed_key_stays_readable_under_concurrent_cleaning() {
                         // NOT the bug — it is a retryable LockConflict /
                         // DeadlockDetected / LockTimeout. Only a FATAL env
                         // failure (the LogFileNotFound -> invalidated-env
-                        // cleaner<->LN-fetch reclaim violation) is the teeth.
+                        // cleaner<->LN-fetch reclaim violation) and a lost
+                        // read (Ok(None), above) are the teeth.
+                        //
+                        // The non-transactional `db.get()` auto-txn read path
+                        // collapses a retryable lock error into
+                        // `OperationNotAllowed(e.to_string())` /
+                        // `TransactionError(..)` (database.rs ~444), so the
+                        // typed-variant match alone misses a benign
+                        // reader<->writer lock timeout and reports a FALSE
+                        // violation. Classify as transient when the typed
+                        // error is retryable OR the message names a lock
+                        // timeout / deadlock / lock conflict AND the env is
+                        // still valid (an invalidated env is always the bug).
                         use noxu_db::NoxuError as NE;
-                        let transient = matches!(
+                        let msg = e.to_string().to_ascii_lowercase();
+                        let msg_is_lock = msg.contains("lock timeout")
+                            || msg.contains("deadlock")
+                            || msg.contains("lock conflict")
+                            || msg.contains("lock not available")
+                            || msg.contains("transaction timeout");
+                        let typed_transient = matches!(
                             e,
                             NE::LockConflict(_)
                                 | NE::DeadlockDetected
                                 | NE::LockTimeout { .. }
+                                | NE::LockNotAvailable
+                                | NE::TransactionTimeout { .. }
+                                | NE::LockPreempted
                         );
-                        if transient {
+                        if (typed_transient || msg_is_lock) && env.is_valid() {
                             continue;
                         }
-                        // This is the LogFileNotFound -> invalidated env bug.
+                        // This is the LogFileNotFound -> invalidated env bug
+                        // (or any non-lock error on a committed key).
                         let mut g = first_err.lock().unwrap();
                         if g.is_none() {
                             *g = Some(format!(
