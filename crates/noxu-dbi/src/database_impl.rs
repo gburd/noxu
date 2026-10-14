@@ -569,6 +569,21 @@ impl DatabaseImpl {
         }
     }
 
+    /// Install the compress-before-split in-flight write-lock predicate onto
+    /// the real tree (one-way wiring, mirrors `set_memory_counter`).  The
+    /// predicate closes over the environment `LockManager` so the synchronous
+    /// pre-split compression never drains a `known_deleted` slot a live txn
+    /// still write-locks (an uncommitted delete).  JE `BIN.compress`
+    /// `isLockUncontended` (BIN.java:1141-1172) reached via
+    /// `Tree.java:1818-1830` `lazyCompress`.
+    pub fn set_is_locked_hook(&mut self, hook: noxu_tree::IsLockedFn) {
+        if let Some(tree_arc) = self.real_tree.as_ref()
+            && let Ok(mut tree) = tree_arc.write()
+        {
+            tree.set_is_locked_hook(hook);
+        }
+    }
+
     /// T-5: thread `TREE_COMPACT_MAX_KEY_LENGTH` into the real tree so the BIN
     /// compact-key rep (`INKeyRep.MaxKeySize`) uses the configured threshold
     /// (`IN.getCompactMaxKeyLength`).

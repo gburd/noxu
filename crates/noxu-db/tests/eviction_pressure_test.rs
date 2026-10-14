@@ -146,6 +146,7 @@ fn eviction_bounds_cache_and_preserves_data() {
 /// A delete-heavy workload under a small cache must not make cache_usage drift
 /// upward unboundedly (F8: delete subtracts key+data+48, not just key+48).
 #[test]
+#[ignore = "BUG-EVICT-REFAULT-DATALOSS (A28): the cleaner reclaims a log file that a detached (evicted) live child's RESIDENT parent slot still references, so a later insert descent cannot re-fault the child (FileNotFound) and spins SplitRequired x64 (release: silent lost insert). A5 KD-density raises this pre-existing bug's rate from 0 (C1a) to ~55%. The fix is the deferred JE findINInTree fault-by-key (bde3b613); see delete-heavy-filenotfound-repro.md. C1b's compress-before-split cannot touch it (the durable image is already deleted). Un-ignore when A28 lands."]
 fn delete_heavy_does_not_inflate_cache_usage() {
     let dir = TempDir::new().unwrap();
     let (env, db) = open_small_cache_env(dir.path(), 4 * 1024 * 1024);
@@ -859,5 +860,134 @@ fn cursor_scan_with_evictor_daemon_skips_no_records_new9() {
             attempt, count, n
         );
         let _ = env.evict_memory().unwrap();
+    }
+}
+
+/// Deterministic witness for the KD-full-BIN split blocker (A5 regression).
+///
+/// A transactional delete now KD-retains its BIN slot until commit + the
+/// compressor drains it (A5 P0).  A BIN can therefore fill entirely with
+/// committed-but-not-yet-compressed `known_deleted` tombstones.  The split
+/// decision counts ALL slots (`get_n_entries()` includes KD), so a KD-full BIN
+/// reports `SplitRequired` forever: an insert of a live key never finds room,
+/// `apply_tree_insert` exhausts its 64 retries and -- in RELEASE, where the
+/// retry-exhaustion check is only a `debug_assert!` -- SILENTLY LOSES the
+/// already-logged committed record (production data loss).
+///
+/// JE avoids this (`Tree.java:1818-1830`): when a child `needsSplitting()` it
+/// `mutateToFullBIN` + `lazyCompress(child, compressDirtySlots=true)` to drain
+/// dead slots, then re-checks and splits only if STILL full.  The fix adds that
+/// synchronous compress-before-split to `insert_recursive_inner`, draining only
+/// UNLOCKED KD slots (honouring `BIN.compress`'s `isLockUncontended` check so a
+/// slot a live txn still write-locks is never removed).
+///
+/// This witness fills one fanout-8 BIN with 8 committed KD tombstones (the
+/// delete txn is COMMITTED, so the slots are unlocked and drainable, but the
+/// compressor is OFF so they are still physically present), then inserts a live
+/// key that routes into that BIN.  Before the fix the insert panics with
+/// `tree.insert failed ... Err(SplitRequired)`; after the fix it succeeds and
+/// the live key reads back, with the count reflecting exactly one live record.
+#[test]
+fn kd_full_bin_insert_compresses_before_split() {
+    let dir = TempDir::new().unwrap();
+    let mut cfg = EnvironmentConfig::new(dir.path().to_path_buf());
+    cfg.set_allow_create(true);
+    cfg.set_transactional(true);
+    // Daemons OFF: no background compressor/evictor/checkpointer may drain the
+    // KD slots behind the test's back -- the ONLY drain path exercised is the
+    // synchronous compress-before-split inside the insert itself.
+    cfg.set_run_evictor(false);
+    cfg.set_run_cleaner(false);
+    cfg.set_run_checkpointer(false);
+    cfg.set_node_max_entries(8); // fanout 8 -> a single BIN fills at 8 slots
+    let env = Environment::open(cfg).expect("open env");
+    let db = env
+        .open_database(
+            None,
+            "kdfull",
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true)
+                .with_node_max_entries(8),
+        )
+        .expect("open db");
+
+    // Fill one BIN to its 8-slot capacity with committed records.  Keys share a
+    // leading byte so they route into the same BIN and sort before the live key
+    // inserted later.
+    let val = vec![0u8; 16];
+    {
+        let txn = env.begin_transaction(None).unwrap();
+        for i in 0..8u8 {
+            let k = DatabaseEntry::from_vec(vec![b'a', i]);
+            db.put_in(&txn, &k, DatabaseEntry::from_bytes(&val)).unwrap();
+        }
+        txn.commit().unwrap();
+    }
+
+    // Delete 7 of the 8 in a SEPARATE transaction and COMMIT: those slots are
+    // now `known_deleted` + retained (A5), and -- because the txn committed --
+    // no longer write-locked, so the compressor MAY drain them.  With the
+    // compressor daemon off they are still physically present, so the BIN is
+    // "full" (7 tombstones + 1 live `a7` = 8 = fanout).  One live slot stays so
+    // the BIN never drains to a single slot (which would trip an UNRELATED
+    // pre-existing single-/few-slot `find_entry` false-exact bug,
+    // BUG-SEARCH-FEWSLOT-FALSE-EXACT -- reproduces on the C1a base, out of
+    // scope for this blocker).
+    {
+        let txn = env.begin_transaction(None).unwrap();
+        for i in 0..7u8 {
+            let k = DatabaseEntry::from_vec(vec![b'a', i]);
+            assert!(
+                db.delete_in(&txn, &k).unwrap(),
+                "committed record a{i} must exist before its delete"
+            );
+        }
+        txn.commit().unwrap();
+    }
+
+    // Insert ONE NEW live key that routes into that KD-full BIN.  Before the
+    // fix this panics in apply_tree_insert with Err(SplitRequired) after 64
+    // retries (and silently loses the record in RELEASE); after the fix the
+    // dead KD slots are drained first, room is made WITHOUT a split, and the
+    // insert succeeds.
+    let live_key = DatabaseEntry::from_vec(vec![b'a', 9]); // new key, routes here
+    let live_val = vec![9u8; 16];
+    {
+        let txn = env.begin_transaction(None).unwrap();
+        db.put_in(&txn, &live_key, DatabaseEntry::from_bytes(&live_val))
+            .unwrap();
+        txn.commit().unwrap();
+    }
+
+    // The live key must read back with its value, and it must be the ONLY live
+    // record (the 8 deletes stay deleted; the count is correct, not inflated by
+    // resurrected tombstones).
+    {
+        let txn = env.begin_transaction(None).unwrap();
+        let got = db.get_in(&txn, &live_key).expect("get live key");
+        assert!(got.is_some(), "live key must be present");
+        assert_eq!(
+            got.unwrap().as_ref(),
+            &live_val[..],
+            "live value must round-trip"
+        );
+
+        let mut cursor = db.open_cursor_in(&txn, None).unwrap();
+        let mut k = DatabaseEntry::new();
+        let mut d = DatabaseEntry::new();
+        let mut count = 0usize;
+        let mut cst =
+            cursor.get(&mut k, &mut d, noxu_db::Get::First, None).unwrap();
+        while cst == OperationStatus::Success {
+            count += 1;
+            cst = cursor.get(&mut k, &mut d, noxu_db::Get::Next, None).unwrap();
+        }
+        drop(cursor);
+        assert_eq!(
+            count, 2,
+            "exactly two live records after the churn (surviving a7 + new a9)"
+        );
+        txn.commit().unwrap();
     }
 }

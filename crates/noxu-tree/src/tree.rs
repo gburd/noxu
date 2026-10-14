@@ -166,6 +166,21 @@ pub const IN_ENTRY_OVERHEAD: usize = std::mem::size_of::<InEntry>();
 pub type KeyComparatorFn =
     Arc<dyn Fn(&[u8], &[u8]) -> std::cmp::Ordering + Send + Sync>;
 
+/// Predicate that reports whether a slot LSN is still write-locked by an
+/// in-flight transaction.
+///
+/// Supplied one-way by the dbi layer (closing over the `LockManager`), the
+/// same wiring as `in_list_listener` / `memory_counter`, because `noxu-tree`
+/// cannot depend on `noxu-txn`/`noxu-dbi`.  Consulted by the
+/// compress-before-split step (JE `Tree.java:1818-1830` `lazyCompress`) so a
+/// synchronous pre-split compression never physically removes a
+/// `known_deleted` slot whose delete is not yet committed (its LSN is still
+/// write-locked).  Mirrors JE `BIN.compress`'s `isLockUncontended` check
+/// (BIN.java:1141-1172).  `None` (recovery / unit tests with no lock manager)
+/// means every `known_deleted` slot is drainable, matching the historical
+/// safe-by-invariant path.
+pub type IsLockedFn = Arc<dyn Fn(u64) -> bool + Send + Sync>;
+
 /// Combined search result carrying slot data and the BIN arc, returned by
 /// [`Tree::search_with_data`].
 ///
@@ -292,6 +307,12 @@ pub struct Tree {
     /// JE reference: `IN.fetchTarget`/split/`rebuildINList` → `addBack`,
     /// access → `moveBack`, removal → `remove`.
     pub in_list_listener: Option<Arc<dyn InListListener>>,
+
+    /// Optional predicate reporting whether a slot LSN is still write-locked
+    /// by an in-flight txn (see [`IsLockedFn`]).  Installed one-way by the dbi
+    /// layer at database open.  Consulted ONLY by the compress-before-split
+    /// step so a KD slot whose delete has not committed is never drained.
+    pub is_locked_hook: Option<IsLockedFn>,
 
     /// Optional log manager so an evicted root IN can be re-materialized from
     /// its persisted `root_log_lsn` on the next access (EV-14, piece B).
@@ -2671,8 +2692,19 @@ impl BinStub {
         }
         self.last_full_lsn = logged_at;
         self.dirty = false;
-        // A full BIN captures all current state, so the delta-chain bound is
-        // cleared: the next log may once again be a delta.
+        // A full BIN captures all current state, so the delta chain is reset:
+        // the next log may once again be a delta, chained on THIS full image.
+        // Leaving a stale `last_delta_lsn` here (as the evictor full-BIN flush
+        // path did) lets a subsequent delta record `prev_delta_lsn` pointing at
+        // a delta built over an OLDER full base; on reconstitution that chain
+        // can re-apply a stale per-slot `known_deleted` state (from before a
+        // committed re-insert) over the live slot -- the BUG-SPLIT-KD-RESURRECT
+        // tombstone-resurrection window.  JE `IN.afterLogCommon` clears the
+        // delta bound on every full log (a full image subsumes every prior
+        // delta); the checkpointer full path reset it explicitly but the
+        // evictor full path (this shared site) did not -- reset it here so BOTH
+        // full-log paths reset the chain.  (integrate 407fbff2db)
+        self.last_delta_lsn = NULL_LSN;
         // JE `IN.afterLog` clears the prohibit flag after a full log
         // (IN.java:5557 `bin.setProhibitNextDelta(false)`).
         self.prohibit_next_delta = false;
@@ -3103,6 +3135,7 @@ impl Tree {
             key_comparator: None,
             memory_counter: None,
             in_list_listener: None,
+            is_locked_hook: None,
             log_manager: None,
             redo_capacity_hint: 0,
             key_prefixing: false, // JE default: KEY_PREFIXING_DEFAULT = false
@@ -3125,6 +3158,13 @@ impl Tree {
     /// `Evictor.addBack`/`moveBack`/`remove`.
     pub fn set_in_list_listener(&mut self, listener: Arc<dyn InListListener>) {
         self.in_list_listener = Some(listener);
+    }
+
+    /// Install the in-flight write-lock predicate consulted by the
+    /// compress-before-split step (JE `Tree.java:1818-1830` `lazyCompress`).
+    /// One-way wiring from the dbi layer, mirroring `set_in_list_listener`.
+    pub fn set_is_locked_hook(&mut self, hook: IsLockedFn) {
+        self.is_locked_hook = Some(hook);
     }
 
     /// Installs the [`noxu_log::LogManager`] so an evicted root IN can be
@@ -3260,6 +3300,7 @@ impl Tree {
             key_comparator: Some(comparator),
             memory_counter: None,
             in_list_listener: None,
+            is_locked_hook: None,
             log_manager: None,
             redo_capacity_hint: 0,
             key_prefixing: false,
@@ -4812,6 +4853,33 @@ impl Tree {
         // crates/noxu-db/tests/concurrent_commits_stress.rs.
         let mut parent_write_guard = parent.write();
 
+        // Revalidate the child slot against the ACTUAL insert key, under the
+        // parent write latch, rather than trusting the caller's `child_index`
+        // (integrate f4101092f0 "revalidate cold routing").  The caller
+        // computed `child_index` under a parent READ latch, then dropped it
+        // (the split needs the WRITE latch); between the two a prior split can
+        // add a sibling and shift the slot that covers `insert_key`.  Splitting
+        // the stale slot would split the WRONG (possibly already-split) child
+        // and never make room for `insert_key`, so the caller's re-descent
+        // keeps re-finding a full child and the insert spins to SplitRequired
+        // exhaustion — the KD-density split loop A5 exposes.  Re-derive the
+        // covering slot here: `p.entries[1..].partition_point(key >= entry)`
+        // gives the index of the last separator <= key (slot 0 is the virtual
+        // -infinity key).  An empty `insert_key` (root-init split) keeps the
+        // caller's index.
+        let child_index = if insert_key.is_empty() {
+            child_index
+        } else if let TreeNode::Internal(p) = &*parent_write_guard {
+            p.entries[1..].partition_point(|entry| {
+                (match key_comparator {
+                    Some(cmp) => cmp(&entry.key, insert_key),
+                    None => entry.key.as_slice().cmp(insert_key),
+                }) != std::cmp::Ordering::Greater
+            })
+        } else {
+            return Err(TreeError::SplitRequired);
+        };
+
         // Extract the child Arc from the parent slot.
         let child_arc = match &*parent_write_guard {
             TreeNode::Internal(p) => {
@@ -5433,19 +5501,83 @@ impl Tree {
             };
 
             if child_full {
-                // Build the splitSpecial hint from the accumulated flags.
-                // JE `Tree.forceSplit` ~line 2010:
-                //   if (allLeftSideDescent || allRightSideDescent)
-                //       child.splitSpecial(parent, index, grandParent,
-                //           maxTreeEntriesPerNode, key, allLeftSideDescent)
+                // Compress-before-split (JE `Tree.java:1818-1830`):
+                //
+                //   if (child.needsSplitting()) {
+                //       child.mutateToFullBIN(false);
+                //       database.getEnv().lazyCompress(child, true);
+                //       if (child.needsSplitting()) { ... forceSplit ... }
+                //   }
+                //
+                // A BIN can report "full" purely because A5 KD-retention left
+                // a run of `known_deleted` tombstones in it (a committed delete
+                // now keeps its slot until the compressor drains it).
+                // `get_n_entries` counts those tombstones, so without this step
+                // a KD-dense BIN reports SplitRequired forever and an insert of
+                // a live key never finds room (`apply_tree_insert`'s retry loop
+                // exhausts -> silent data loss in RELEASE where the
+                // retry-exhaustion check is only a `debug_assert!`).  JE drains
+                // dead slots BEFORE deciding the split is real: `lazyCompress(
+                // child, true)` compresses dirty (KD) slots, honouring
+                // `BIN.compress`'s per-slot `isLockUncontended` check so a slot
+                // a live txn still write-locks (an uncommitted delete) is never
+                // removed.
+                //
+                // We must DROP `parent_guard` (this IN's read latch) before
+                // compressing: `compress_bin_with_lock_check` may prune an
+                // emptied BIN, which re-descends and takes the parent IN's WRITE
+                // latch — taking it while still holding our READ latch on the
+                // same IN would self-deadlock.  JE likewise releases the parent
+                // latch around `lazyCompress`/`forceSplit`.  After compressing
+                // we re-descend from the top on a fresh, correct view (the same
+                // re-enter pattern as the post-split path below), so the
+                // re-check of `needsSplitting()` happens on re-descent.
+                //
+                // `drain_known_deleted_for_split` takes the child's exclusive
+                // latch, consults `is_locked_hook` per slot (Noxu's
+                // `isLockUncontended` equivalent), removes only UNLOCKED KD
+                // slots, and `remove_slot` sets `prohibit_next_delta` so the
+                // next log of this BIN is a full image (JE `mutateToFullBIN` —
+                // a full image is needed for a split anyway).  It does NOT prune
+                // an emptied BIN (that needs the parent write latch and would
+                // discard the node we are inserting into); the INCompressor
+                // daemon prunes empties separately.  A non-BIN child (an upper
+                // IN) returns `false` (no-op).
+                let drained = tree.drain_known_deleted_for_split(
+                    &child_arc,
+                    tree.is_locked_hook
+                        .as_deref()
+                        .map(|h| h as &dyn Fn(u64) -> bool),
+                );
+                drop(parent_guard);
+                if drained {
+                    // Compression made room (or pruned the BIN): re-descend on
+                    // a fresh view and let the top-of-function re-check decide
+                    // whether a split is still needed.
+                    return Self::insert_recursive_inner(
+                        node_arc,
+                        key,
+                        data,
+                        lsn,
+                        max_entries,
+                        key_comparator,
+                        key_prefixing,
+                        all_left_so_far,
+                        all_right_so_far,
+                        listener,
+                        tree,
+                    );
+                }
+                // Nothing was drainable — no dead KD slots, or every KD slot is
+                // still write-locked by an in-flight txn.  The BIN is genuinely
+                // full of live/locked slots, so fall through to a real split
+                // (JE's second `needsSplitting()` test still true).  Re-acquire
+                // the hint from the accumulated descent flags and split.
                 let hint = match (all_left, all_right) {
                     (true, _) => SplitHint::AllLeft,
                     (_, true) => SplitHint::AllRight,
                     _ => SplitHint::Normal,
                 };
-                // split_child(parent, …) needs parent.write(); we must
-                // drop our parent read lock before calling it.
-                drop(parent_guard);
                 Self::split_child(
                     node_arc,
                     child_index,
@@ -5457,11 +5589,6 @@ impl Tree {
                     key_prefixing,
                     listener,
                 )?;
-
-                // After the split, re-find which child now covers key.
-                // Re-enter at the top of the inner function; carry the
-                // flags (the new topology doesn't invalidate them — we
-                // still know the overall descent direction).
                 return Self::insert_recursive_inner(
                     node_arc,
                     key,
@@ -7499,6 +7626,67 @@ impl Tree {
     ///
     /// `true` if compression made progress (slots were removed or the BIN was
     /// pruned), `false` if the BIN was skipped (delta, no cursors issue, etc.).
+    /// Drain UNLOCKED `known_deleted` slots from a BIN WITHOUT pruning it,
+    /// for the compress-before-split path (JE `Tree.java:1818-1830`
+    /// `lazyCompress(child, compressDirtySlots=true)`).
+    ///
+    /// This is Step 2 of [`compress_bin_with_lock_check`] (remove dead slots,
+    /// recompute prefix) WITHOUT its Step 3 (prune the emptied BIN from its
+    /// parent).  The split path is mid-descent into THIS BIN to insert a live
+    /// key, so the BIN must stay attached even if every slot drained; removing
+    /// it from the parent here would require the parent write latch (deadlock
+    /// against the descent's parent read latch) and would discard the node we
+    /// are about to insert into.  Pruning an empty BIN is the INCompressor
+    /// daemon's job (`compress_bin_with_lock_check`), reached separately.
+    ///
+    /// Honours `is_locked` exactly as `compress_bin_with_lock_check` does (JE
+    /// `BIN.compress` `isLockUncontended`, BIN.java:1141-1172): a `known_deleted`
+    /// slot whose non-null LSN is still write-locked by an in-flight txn (an
+    /// uncommitted delete) is left in place.  `remove_slot` sets
+    /// `prohibit_next_delta`, forcing the next log of this BIN to be a full
+    /// image (JE `mutateToFullBIN` — a full image is needed for the split
+    /// anyway).  Returns `true` iff at least one slot was removed.
+    pub fn drain_known_deleted_for_split(
+        &self,
+        bin_arc: &Arc<RwLock<TreeNode>>,
+        is_locked: Option<&dyn Fn(u64) -> bool>,
+    ) -> bool {
+        let mut g = bin_arc.write();
+        let TreeNode::Bottom(b) = &mut *g else {
+            return false; // not a BIN (upper IN) — nothing to drain
+        };
+        // BIN-deltas carry no removable dirty slots (JE skips them).
+        if b.is_delta {
+            return false;
+        }
+        let before = b.entries.len();
+        // Walk backwards so index removal does not disturb lower indices.
+        let mut j = b.entries.len();
+        while j > 0 {
+            j -= 1;
+            if b.entries[j].known_deleted {
+                // IC-3 lock check (JE BIN.compress).  A NULL_LSN slot is
+                // always discardable without locking; otherwise consult the
+                // predicate and skip a slot a live txn still write-locks.
+                if let Some(is_locked) = is_locked {
+                    let slot_lsn = b.get_lsn(j);
+                    if !slot_lsn.is_null() && is_locked(slot_lsn.as_u64()) {
+                        continue;
+                    }
+                }
+                b.remove_slot(j);
+            }
+        }
+        // Recompute prefix after removal (same rule as the compressor): a
+        // non-prefixing BIN must keep an EMPTY prefix (full keys verbatim).
+        if self.key_prefixing {
+            b.recompute_key_prefix();
+        } else if !b.key_prefix.is_empty() {
+            b.apply_new_prefix(Vec::new());
+        }
+        b.entries.len() < before
+    }
+
     pub fn compress_bin(&self, bin_arc: &Arc<RwLock<TreeNode>>) -> bool {
         self.compress_bin_with_lock_check(bin_arc, None)
     }
@@ -18700,6 +18888,79 @@ mod split_special_tests {
     /// the compressor reclaims them.  We reach that state directly here by
     /// marking a slot known_deleted in the BIN arc, then assert the
     /// user-facing read/scan paths do not surface it.
+    /// Compress-before-split (JE `Tree.java:1818-1830`) at the tree level:
+    /// a BIN FULL of `known_deleted` tombstones must not keep returning
+    /// `SplitRequired` -- the insert path drains the dead slots first and makes
+    /// room without a split, and WITHOUT looping.  `is_locked_hook` is `None`
+    /// here (no lock manager), so every tombstone is drainable.
+    #[test]
+    fn kd_full_bin_insert_drains_before_split_tree_level() {
+        let tree = Tree::new(1, 8);
+        // Fill the (single) BIN to its 8-slot capacity.
+        for i in 0..8u32 {
+            let key = format!("k{i:04}").into_bytes();
+            tree.insert(key, vec![i as u8], Lsn::new(1, i)).unwrap();
+        }
+        // Mark every slot known_deleted directly (models committed, unlocked
+        // tombstones the compressor has not yet reclaimed): the BIN is now
+        // FULL (8 = max_entries) of nothing but dead slots.
+        {
+            let root = tree.get_root().expect("root");
+            let bin_arc = find_bin_arc_for_key(&root, b"k0000").expect("bin");
+            let mut g = bin_arc.write();
+            if let TreeNode::Bottom(b) = &mut *g {
+                for e in b.entries.iter_mut() {
+                    e.known_deleted = true;
+                }
+            } else {
+                panic!("expected BIN");
+            }
+        }
+        // Insert a NEW live key routing into that KD-full BIN.  Before the fix
+        // this returns Err(SplitRequired) forever (apply_tree_insert retries
+        // exhaust -> silent data loss in RELEASE); after the fix the dead slots
+        // are drained first, room is made WITHOUT a split, and the insert
+        // succeeds -- with no SplitRequired loop or hang.
+        tree.insert(b"k0009".to_vec(), vec![99u8], Lsn::new(1, 9))
+            .expect("insert into KD-full BIN must succeed, not SplitRequired");
+
+        // Verify the BIN physically holds exactly the one LIVE slot (the new
+        // k0009): the 8 drained tombstones are gone, room was made WITHOUT a
+        // split, and nothing was resurrected.  (We inspect the BIN directly;
+        // `Tree::search` returns Some whenever a BIN is reached, so presence is
+        // read from `SearchResult::is_exact_match`, which we cross-check.)
+        {
+            let root = tree.get_root().expect("root");
+            let bin_arc = find_bin_arc_for_key(&root, b"k0009").expect("bin");
+            let g = bin_arc.read();
+            if let TreeNode::Bottom(b) = &*g {
+                let live: Vec<Vec<u8>> = (0..b.entries.len())
+                    .filter(|&i| !b.entries[i].known_deleted)
+                    .filter_map(|i| b.get_full_key(i))
+                    .collect();
+                assert_eq!(
+                    live,
+                    vec![b"k0009".to_vec()],
+                    "only the new live key k0009 remains after draining 8 KD"
+                );
+            } else {
+                panic!("expected BIN");
+            }
+        }
+        // And via the public search API (checking is_exact_match, NOT is_some):
+        assert!(
+            tree.search(b"k0009").is_some_and(|r| r.is_exact_match()),
+            "new live key k0009 must be an exact match"
+        );
+        for i in 0..8u32 {
+            let key = format!("k{i:04}").into_bytes();
+            assert!(
+                tree.search(&key).is_some_and(|r| !r.is_exact_match()),
+                "k{i:04} must NOT be an exact match (stays deleted)"
+            );
+        }
+    }
+
     #[test]
     fn test_tree_f1_known_deleted_slot_is_absent_and_skipped() {
         let tree = Tree::new(1, 8);

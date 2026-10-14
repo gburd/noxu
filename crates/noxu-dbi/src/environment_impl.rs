@@ -2268,6 +2268,19 @@ impl EnvironmentImpl {
         // tree so that BIN insertions/deletions are visible to the Arbiter
         // (MemoryBudget.updateTreeMemoryUsage path).
         db_impl.set_memory_counter(Arc::clone(&self.cache_usage));
+        // Wire the in-flight write-lock predicate so the compress-before-split
+        // step (JE `Tree.java:1818-1830` `lazyCompress`) can drain dead KD
+        // slots to make room for an insert WITHOUT ever removing a slot a live
+        // txn still write-locks (an uncommitted delete).  Closes over the env
+        // `LockManager`; a slot LSN is "locked" iff it has any owners/waiters
+        // (JE `BIN.compress` `isLockUncontended`, BIN.java:1141-1172).  Same
+        // predicate shape as `compress_all` / the INCompressor daemon.
+        {
+            let lm = Arc::clone(&self.lock_manager);
+            let hook: noxu_tree::IsLockedFn =
+                Arc::new(move |lsn: u64| lm.get_lock_info(lsn) != (0, 0));
+            db_impl.set_is_locked_hook(hook);
+        }
         // T-5: thread TREE_COMPACT_MAX_KEY_LENGTH into the tree so the BIN
         // compact-key rep uses the configured threshold
         // (IN.getCompactMaxKeyLength).
