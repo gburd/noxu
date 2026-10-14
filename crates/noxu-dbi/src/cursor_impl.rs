@@ -614,6 +614,9 @@ impl CursorImpl {
         &self,
         key: &[u8],
     ) -> Result<(Option<Vec<u8>>, u64), DbiError> {
+        // `data` keeps the slot's residency from a single descent:
+        //   Some(Some(bytes)) -> resident; Some(None) -> found, non-resident;
+        //   None -> key not present (new insert).
         let (data, lsn) = {
             let db = self.db_impl.read();
             match db.get_real_tree() {
@@ -627,22 +630,25 @@ impl CursorImpl {
         // JE `IN.fetchTarget` / `CursorImpl.LockStanding.prepareForUpdate`:
         // the before-image captured for abort undo must be the record's
         // *actual* prior value.  When the evictor stripped this slot's LN
-        // (`data == None`, surfaced here as an empty vec by
-        // `get_data_from_tree`) the resident bytes are gone but the slot still
-        // carries a valid `lsn` -- the value is recoverable from the log.  We
-        // must re-fetch it here, exactly as the read path does, otherwise the
-        // undo record stores an EMPTY before-image and an abort durably
-        // restores a 0-byte record over the caller's original (see the
-        // NEW-EVOLVE-ABORT-ROLLBACK regression: an aborted DPL evolution left
-        // 0-byte records that panicked a later read).
+        // (`data == Some(None)`, decided by the same descent that read the
+        // LSN) the resident bytes are gone but the slot still carries a valid
+        // `lsn` -- the value is recoverable from the log (D1).  Fetch it here,
+        // exactly as the read path does, otherwise the undo record stores an
+        // EMPTY before-image and an abort durably restores a 0-byte record
+        // over the caller's original (see the NEW-EVOLVE-ABORT-ROLLBACK
+        // regression: an aborted DPL evolution left 0-byte records that
+        // panicked a later read).  A resident 0-byte value is NOT refetched.
         if lsn != noxu_util::NULL_LSN.as_u64()
-            && data.as_ref().map(|d| d.is_empty()).unwrap_or(false)
+            && matches!(data, Some(None))
             && let Some(fetched) = self.fetch_ln_data_from_log(lsn)?
             && !fetched.is_empty()
         {
             return Ok((Some(fetched.to_vec()), lsn));
         }
-        Ok((data, lsn))
+        // Flatten to the caller's `(Option<Vec<u8>>, u64)` contract: a
+        // non-resident slot that could not be refetched collapses to an empty
+        // vec (unchanged from the pre-D1 behaviour for that corner).
+        Ok((data.map(|d| d.map(|d| d.to_vec()).unwrap_or_default()), lsn))
     }
 
     /// Returns true if `key` exists in the committed tree.
@@ -1339,18 +1345,22 @@ impl CursorImpl {
                     // a READ_COMMITTED secondary cursor observe an aborting
                     // writer's uncommitted primary data.)
                     let contended = self.lock_ln(slot_lsn)?;
-                    // X-10: if the slot's LSN moved (or our lock had to wait),
-                    // the pre-fetched bytes may be a concurrent writer's
-                    // UNCOMMITTED in-place mutation.  Re-read under a lock on
-                    // the slot's CURRENT lsn so we block out the writer's txn
-                    // instead of returning its uncommitted value.
-                    let final_data = if contended
+                    // X-10 + D1: if the slot's LSN moved (or our lock had to
+                    // wait), the pre-fetched bytes may be a concurrent writer's
+                    // UNCOMMITTED in-place mutation.  Re-read under a lock on the
+                    // slot's CURRENT lsn so we block out the writer's txn
+                    // instead of returning its uncommitted value.  The re-read
+                    // keeps the slot's residency (Option<Bytes>) and returns the
+                    // stable current lsn, so a non-resident LN is fetched below
+                    // at the lsn it was re-read with (D1: never flattened to an
+                    // empty value).
+                    let (final_data, slot_lsn) = if contended
                         || Self::slot_lsn_changed(
                             &bin_arc, slot_index, slot_lsn,
                         ) {
                         self.reread_data_locking_current_lsn(key, slot_lsn)?
                     } else {
-                        slot_data
+                        (slot_data, slot_lsn)
                     };
                     // JE IN.fetchTarget: a found slot whose in-memory data was
                     // stripped by the evictor (data == None) must be
@@ -1428,16 +1438,18 @@ impl CursorImpl {
                     let slot_index = slot.slot_index;
                     let bin_arc = slot.bin_arc;
                     let contended = self.lock_ln(slot_lsn)?;
-                    // X-10: re-read under a lock on the slot's CURRENT lsn (see
-                    // the Set/Both branch) so a moved slot never returns a
-                    // concurrent writer's uncommitted bytes.
-                    let final_data = if contended
+                    // X-10 + D1: re-read under a lock on the slot's CURRENT lsn
+                    // (see the Set/Both branch) so a moved slot never returns a
+                    // concurrent writer's uncommitted bytes; the re-read keeps
+                    // residency and returns the stable current lsn so a
+                    // non-resident LN is fetched below at that lsn (D1).
+                    let (final_data, slot_lsn) = if contended
                         || Self::slot_lsn_changed(
                             &bin_arc, slot_index, slot_lsn,
                         ) {
                         self.reread_data_locking_current_lsn(key, slot_lsn)?
                     } else {
-                        slot_data
+                        (slot_data, slot_lsn)
                     };
                     // JE IN.fetchTarget: a found slot whose in-memory data was
                     // stripped by the evictor (data == None) must be
@@ -2217,7 +2229,7 @@ impl CursorImpl {
         &self,
         key: &[u8],
         mut known_lsn: u64,
-    ) -> Result<Option<Bytes>, DbiError> {
+    ) -> Result<(Option<Bytes>, u64), DbiError> {
         const MAX_RELOCK: usize = 64;
         for _ in 0..MAX_RELOCK {
             // Lock the slot's CURRENT lsn.  For a Read lock this BLOCKS on a
@@ -2236,13 +2248,21 @@ impl CursorImpl {
                 Some((data, cur_lsn)) => {
                     if cur_lsn == known_lsn {
                         // Stable under our lock: this is the committed value.
-                        return Ok(Some(Bytes::from(data)));
+                        // D1: keep residency.  `data == None` means the LN was
+                        // stripped (non-resident); the caller refetches it from
+                        // the log at `cur_lsn`, never flattens it to an empty
+                        // value.
+                        return Ok((data, cur_lsn));
                     }
                     // The slot moved again (the writer committed a new version,
                     // or a fresh writer re-mutated it): re-lock the new lsn.
                     known_lsn = cur_lsn;
                 }
-                None => return Ok(None), // key gone (committed delete)
+                // key gone (committed delete): no slot.  Return lsn 0 so
+                // the caller's `slot_lsn != 0` guard disables the non-resident
+                // refetch (0 is the invalid-lsn sentinel these cursor data
+                // paths use, matching `rehydrate_current_data`).
+                None => return Ok((None, 0)),
             }
         }
         // Degenerate hot-slot churn: fall back to the current (locked) read.
@@ -2250,14 +2270,22 @@ impl CursorImpl {
         Ok(db
             .get_real_tree()
             .and_then(|tree| Self::get_data_from_tree(&tree, key))
-            .map(|(d, _)| Bytes::from(d)))
+            .unwrap_or((None, 0)))
     }
 
     /// Fetches the data associated with `key` from a tree (BIN-level lookup).
     ///
     /// Returns `(data, slot_lsn)` so the caller can acquire a read lock.
+    /// `data` is `None` when the slot's LN is not resident (a >16 B LN after
+    /// reopen or an evictor strip): the caller must fetch it from the log at
+    /// `slot_lsn` (JE `IN.fetchLN`, IN.java:2767-2768), never treat it as an
+    /// empty value (D1).
+    ///
     /// Data-read path in `CursorImpl.lockAndGetCurrent()`.
-    fn get_data_from_tree(tree: &Tree, key: &[u8]) -> Option<(Vec<u8>, u64)> {
+    fn get_data_from_tree(
+        tree: &Tree,
+        key: &[u8],
+    ) -> Option<(Option<Bytes>, u64)> {
         use noxu_tree::tree::TreeNode;
         // Descend to the BIN that should contain `key` (not always the
         // leftmost), re-faulting an evicted interior child (NEW-8).
@@ -2287,12 +2315,11 @@ impl CursorImpl {
                     None => bin.find_entry_compressed(key),
                 };
                 if found {
+                    // D1: preserve residency.  `None` here means the LN was
+                    // stripped (non-resident); the caller refetches at the
+                    // returned LSN rather than flattening to an empty value.
                     Some((
-                        bin.entries[idx]
-                            .data
-                            .as_ref()
-                            .map(|d| d.to_vec())
-                            .unwrap_or_default(),
+                        bin.entries[idx].data.clone(),
                         bin.get_lsn(idx).as_u64(),
                     ))
                 } else {
