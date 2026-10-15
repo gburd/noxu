@@ -145,8 +145,7 @@ pub struct NodeStateMachine {
     /// `test-harness` feature; absent from any released build.
     #[cfg(any(test, feature = "test-harness"))]
     #[allow(clippy::type_complexity)]
-    mid_transition_hook:
-        RwLock<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
+    mid_transition_hook: RwLock<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl NodeStateMachine {
@@ -290,18 +289,14 @@ impl NodeStateMachine {
             // `MASTER -> MASTER` flake.
             s if s == target => Ok(old_state),
 
-            NodeState::Shutdown => {
-                Err(crate::error::RepError::StateError(
-                    "Node is shut down".to_string(),
-                ))
-            }
+            NodeState::Shutdown => Err(crate::error::RepError::StateError(
+                "Node is shut down".to_string(),
+            )),
 
             // From Detached/Master/Replica we must pass through Unknown
             // first (Detached -> Unknown, or role -> Unknown), then reach
             // the target. All under this one write lock.
-            NodeState::Detached
-            | NodeState::Master
-            | NodeState::Replica => {
+            NodeState::Detached | NodeState::Master | NodeState::Replica => {
                 self.apply_transition_locked(&mut state, NodeState::Unknown)?;
                 self.fire_mid_transition_hook();
                 self.apply_transition_locked(&mut state, target)?;
@@ -350,14 +345,10 @@ impl NodeStateMachine {
         let old_state = *state;
         match old_state {
             NodeState::Unknown => Ok(old_state),
-            NodeState::Shutdown => {
-                Err(crate::error::RepError::StateError(
-                    "Node is shut down".to_string(),
-                ))
-            }
-            NodeState::Detached
-            | NodeState::Master
-            | NodeState::Replica => {
+            NodeState::Shutdown => Err(crate::error::RepError::StateError(
+                "Node is shut down".to_string(),
+            )),
+            NodeState::Detached | NodeState::Master | NodeState::Replica => {
                 self.apply_transition_locked(&mut state, NodeState::Unknown)?;
                 Ok(old_state)
             }
