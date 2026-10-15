@@ -562,7 +562,10 @@ impl RepTestBase {
         self.next_term.set(term + 1);
 
         let target_env = self.nodes[replica_idx].get_env();
-        target_env.ensure_unknown_state()?;
+        // `become_master` is now atomic (BUG-REP-STATE-TOCTOU): it routes
+        // through Unknown internally under one state write lock, so an
+        // explicit `ensure_unknown_state()` pre-call here would only
+        // re-introduce a harness-level two-step.
         target_env.become_master(term)?;
 
         let new_master_name = self.nodes[replica_idx].config.node_name.clone();
@@ -580,7 +583,7 @@ impl RepTestBase {
             if matches!(s, NodeState::Detached | NodeState::Shutdown) {
                 continue;
             }
-            env.ensure_unknown_state()?;
+            // `become_replica` is atomic and routes through Unknown itself.
             env.become_replica(&new_master_name)?;
         }
         Ok(())

@@ -1617,6 +1617,15 @@ impl ReplicatedEnvironment {
         self.node_state.get_state()
     }
 
+    /// Test-only accessor for the node state machine, used by the
+    /// BUG-REP-STATE-TOCTOU deterministic witness to install a
+    /// mid-transition hook. Compiled only for tests / the `test-harness`
+    /// feature; absent from any released build.
+    #[cfg(any(test, feature = "test-harness"))]
+    pub fn node_state_machine_for_test(&self) -> &NodeStateMachine {
+        &self.node_state
+    }
+
     /// Check if this node is the master.
     ///
     /// Returns true if the node's current state is Master.
@@ -2701,24 +2710,18 @@ impl ReplicatedEnvironment {
     /// Ensure the node state machine is in Unknown state, transitioning
     /// from Detached if necessary. This is needed because the state machine
     /// only allows Detached -> Unknown -> Master/Replica.
+    ///
+    /// Atomic (BUG-REP-STATE-TOCTOU / R-REPSTATE): the read of the current
+    /// state and the transition to `Unknown` happen under a SINGLE state
+    /// write lock inside [`NodeStateMachine::ensure_unknown`], so a concurrent
+    /// actor (the election-driver daemon driving `become_master` /
+    /// `become_replica`) cannot interleave between the check and the
+    /// transition and provoke a spurious `UNKNOWN -> UNKNOWN`. Already being
+    /// `Unknown` is an idempotent no-op success (JE `RepNode.run()`: "Avoid
+    /// unnecessary state changes").
     pub fn ensure_unknown_state(&self) -> Result<()> {
-        let current = self.node_state.get_state();
-        match current {
-            NodeState::Unknown => Ok(()),
-            NodeState::Detached => {
-                self.node_state.transition_to(NodeState::Unknown)?;
-                Ok(())
-            }
-            // Master and Replica must transition through Unknown before
-            // joining a new group or reconnecting.
-            NodeState::Master | NodeState::Replica => {
-                self.node_state.transition_to(NodeState::Unknown)?;
-                Ok(())
-            }
-            NodeState::Shutdown => {
-                Err(RepError::StateError("Node is shut down".to_string()))
-            }
-        }
+        self.node_state.ensure_unknown()?;
+        Ok(())
     }
 
     /// Transition to master state.
@@ -2766,11 +2769,19 @@ impl ReplicatedEnvironment {
             )));
         }
 
-        // Ensure we can reach Master state (may need Detached -> Unknown first)
-        self.ensure_unknown_state()?;
-
-        let old_state = self.node_state.get_state();
-        self.node_state.transition_to(NodeState::Master)?;
+        // Ensure we can reach Master state (may need Detached -> Unknown
+        // first), atomically. BUG-REP-STATE-TOCTOU / R-REPSTATE: the former
+        // `ensure_unknown_state()?; transition_to(Master)?` two-step took the
+        // state write lock twice, letting the election-driver daemon (which
+        // also calls `become_master`) interleave and provoke a spurious
+        // `UNKNOWN -> UNKNOWN` or `MASTER -> MASTER` InvalidStateTransition.
+        // `transition_via_unknown` performs the whole check + intermediate
+        // Unknown hop + final Master hop under ONE write lock, and treats
+        // "already Master" as an idempotent no-op success (JE: re-asserting
+        // the held role is benign). `old_state` is the state observed on
+        // entry, for the listener event fired below (outside the state lock).
+        let old_state =
+            self.node_state.transition_via_unknown(NodeState::Master)?;
         self.master_tracker.set_master(self.config.node_name.as_str(), term);
 
         // --- F9: spawn Feeder trackers for each known replica -------------
@@ -2889,8 +2900,14 @@ impl ReplicatedEnvironment {
 
         // -------------------------------------------------------------------
 
-        // Notify listeners
-        self.notify_listeners(old_state, NodeState::Master);
+        // Notify listeners (outside the state lock; F21 lock-order).
+        // Only fire when the role actually changed — an idempotent
+        // re-assertion of Master (old_state == Master) must not emit a
+        // spurious MASTER -> MASTER state-change event (JE "avoid
+        // unnecessary state changes").
+        if old_state != NodeState::Master {
+            self.notify_listeners(old_state, NodeState::Master);
+        }
 
         Ok(())
     }
@@ -2913,11 +2930,18 @@ impl ReplicatedEnvironment {
             ));
         }
 
-        // Ensure we can reach Replica state (may need Detached -> Unknown first)
-        self.ensure_unknown_state()?;
-
-        let old_state = self.node_state.get_state();
-        self.node_state.transition_to(NodeState::Replica)?;
+        // Ensure we can reach Replica state (may need Detached -> Unknown
+        // first), atomically. BUG-REP-STATE-TOCTOU / R-REPSTATE: same race as
+        // `become_master` — the election-driver daemon also calls
+        // `become_replica`. `transition_via_unknown` does the check +
+        // intermediate Unknown hop + final Replica hop under ONE write lock,
+        // and treats "already Replica" as an idempotent no-op success. The
+        // latter is exactly the mid-stream failover shape the HA-Gap-B guard
+        // below handles: a second `become_replica` naming a NEW master must
+        // update the master and let the running thread re-sync, not error on
+        // a REPLICA -> REPLICA self-transition.
+        let old_state =
+            self.node_state.transition_via_unknown(NodeState::Replica)?;
         self.master_tracker.set_master(master_name, 0);
         self.replica_stream.set_master(master_name);
         self.replica_stream.set_state(
@@ -2971,7 +2995,12 @@ impl ReplicatedEnvironment {
                         self.config.node_name.as_str(),
                         master_name,
                     );
-                    self.notify_listeners(old_state, NodeState::Replica);
+                    // Only fire a state-change event when the role actually
+                    // changed; an idempotent re-point to a new master while
+                    // already Replica must not emit REPLICA -> REPLICA.
+                    if old_state != NodeState::Replica {
+                        self.notify_listeners(old_state, NodeState::Replica);
+                    }
                     log::info!(
                         "Node '{}' became replica of master '{}'",
                         self.config.node_name.as_str(),
@@ -3453,8 +3482,11 @@ impl ReplicatedEnvironment {
         }
         // -------------------------------------------------------------------
 
-        // Notify listeners
-        self.notify_listeners(old_state, NodeState::Replica);
+        // Notify listeners (outside the state lock; F21 lock-order). Only
+        // when the role actually changed — see the early-return path above.
+        if old_state != NodeState::Replica {
+            self.notify_listeners(old_state, NodeState::Replica);
+        }
 
         log::info!(
             "Node '{}' became replica of master '{}'",
@@ -4390,11 +4422,15 @@ impl ReplicatedEnvironment {
             return Ok(());
         }
 
-        let old_state = self.node_state.get_state();
-
-        // Transition to Shutdown state. The state machine allows this from
-        // any non-Shutdown state.
-        let _ = self.node_state.transition_to(NodeState::Shutdown);
+        // Transition to Shutdown state atomically. The state machine allows
+        // this from any non-Shutdown state; `transition_to_shutdown` reads
+        // the old state and transitions under ONE write lock so the
+        // `old_state` reported to listeners cannot be stale relative to the
+        // transition that produced it (BUG-REP-STATE-TOCTOU hygiene). The
+        // `shutdown.swap(true)` CAS above already guarantees a single caller
+        // reaches here, but keeping the read+transition atomic matches the
+        // other role changes.
+        let old_state = self.node_state.transition_to_shutdown();
 
         // Notify listeners of the shutdown
         self.notify_listeners(old_state, NodeState::Shutdown);
