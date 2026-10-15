@@ -249,6 +249,13 @@ fn dst_same_seed_reproduces_exactly() {
             .env("NOXU_CRASH_DIR", &dir_path)
             .env("NOXU_CRASH_MODE", "committed_then_uncommitted")
             .env("NOXU_DST_SEED", s.to_string())
+            // Determinism REQUIRES a byte-stable input: silence the background
+            // daemons the fault harness cannot control (checkpointer et al.),
+            // so the same seed tears at the same write every run.  The sweep
+            // tests deliberately do NOT set this -- they assert the recovery
+            // invariants (which hold under any crash point) and keep daemons on
+            // for realistic concurrency.  See crash_worker.rs for the mechanism.
+            .env("NOXU_DST_QUIET", "1")
             .spawn()
             .expect("spawn");
         // Wait for the worker, which self-exits when it hits the torn write.
@@ -262,10 +269,26 @@ fn dst_same_seed_reproduces_exactly() {
         // never at fault.
         //
         // The previous budget was a hard-coded 600 ms followed by a silent
-        // `child.kill()`, which is exactly that failure mode -- and this test's
-        // reported flakiness (it has never reproduced in ~1,000 isolated
-        // attempts, only ever under full-workspace load) fits a scheduling
-        // artifact far better than a real non-determinism bug.
+        // `child.kill()`, which is exactly that failure mode. The generous
+        // budget here removes that artifact, but it is NOT the whole story.
+        //
+        // ROOT CAUSE of the "same seed => different recovered state" flake
+        // (fixed in crash_worker.rs; see item A27): the fault layer fires at a
+        // *write index* counted over EVERY posio write from EVERY thread
+        // (`faultdisk::WRITE_COUNT` is one global atomic). A background daemon
+        // (in practice the checkpointer) can inject a log write CONCURRENTLY
+        // with the worker's foreground commits, so which write lands at the
+        // seed's target index -- and how many committed transactions it batches
+        // -- can depend on thread scheduling, not on the seed. The same seed
+        // could then tear after 40 committed txns in one run and 42 in another:
+        // genuine input non-determinism, reproducible under I/O load WITHOUT
+        // any kill. This test sets NOXU_DST_QUIET=1 so the DST worker disables
+        // those uncontrolled daemons, making the write stream (and therefore
+        // the crash point and the recovered state) deterministic per seed. The
+        // SWEEP tests leave the daemons on (NOXU_DST_QUIET unset): they assert
+        // only the recovery invariants, which hold under any crash point, so
+        // they keep realistic concurrency. The assertion below is unchanged:
+        // it is a true property once the input is deterministic.
         const WORKER_BUDGET: Duration = Duration::from_secs(30);
         let mut waited = Duration::ZERO;
         let mut had_to_kill = false;
