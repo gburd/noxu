@@ -805,10 +805,11 @@ impl CursorImpl {
     /// STALE LSN that no longer protects the live slot, records a STALE
     /// `exists`/`abort_lsn`, and on abort destroys the committed record the
     /// writer restored (`tree.delete` on the shared slot).  JE closes this by
-    /// re-reading the slot LSN under the BIN latch after the lock and reverting
-    /// + re-locking if it moved, so the existence decision and before-image
-    /// (JE `prepareForUpdate`: `abortLsn = lockStanding.lsn`,
-    /// `abortKD = !recordExists()`) always come from the LOCKED, current slot.
+    /// re-reading the slot LSN under the BIN latch after the lock, then
+    /// reverting and re-locking if it moved, so the existence decision and
+    /// before-image always come from the LOCKED, current slot (JE
+    /// `prepareForUpdate`: `abortLsn = lockStanding.lsn`,
+    /// `abortKD = !recordExists()`).
     ///
     /// Revert semantics mirror JE `revertLock` (CursorImpl.java:3848-3859):
     /// release a lock only if it was NEWLY acquired (grant `New`/`WaitNew`);
