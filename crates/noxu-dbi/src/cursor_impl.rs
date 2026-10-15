@@ -75,6 +75,18 @@ thread_local! {
         std::cell::RefCell::new(None);
 }
 
+// BUG-RC-SCAN-TORN-READ review-only knob: when non-zero, caps the RC re-read
+// loop (`reread_data_locking_current_lsn`) at this many iterations so the
+// loop's exhaustion/termination behaviour is exercised DETERMINISTICALLY in
+// BOTH profiles (the production loop is unbounded / lock-timeout bounded, so
+// the chase otherwise only surfaces under RELEASE timing).  On exhaustion the
+// FIX returns a LockConflict ERROR -- never dirty data; the pre-fix base
+// returns its unlocked fallback (the torn read).  Zero in default builds.
+#[cfg(feature = "testing")]
+thread_local! {
+    pub static RELOCK_TEST_CAP: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 /// Cursor states.
 ///
 /// `PendingDeleted` is the JE post-delete position: the cursor's current slot
@@ -2649,7 +2661,29 @@ impl CursorImpl {
         key: &[u8],
         mut known_lsn: u64,
     ) -> Result<(Option<Bytes>, u64), DbiError> {
+        #[cfg(feature = "testing")]
+        let test_cap = RELOCK_TEST_CAP.with(|c| c.get());
+        #[cfg(feature = "testing")]
+        let mut iters: u32 = 0;
         loop {
+            // Review-only: a deterministic iteration cap for the torn-read
+            // livelock witness.  Hitting it returns a lock-conflict ERROR, the
+            // same NEVER-return-dirty-data contract as the real lock-timeout
+            // bound; the pre-fix base returns its unlocked fallback instead.
+            #[cfg(feature = "testing")]
+            {
+                if test_cap != 0 {
+                    iters += 1;
+                    if iters > test_cap {
+                        return Err(DbiError::LockConflict(format!(
+                            "reread_data_locking_current_lsn: slot LSN moved \
+                             {test_cap} times under the record lock (test \
+                             cap); a perpetually write-locked slot -- \
+                             surfaced as a lock conflict, never dirty data"
+                        )));
+                    }
+                }
+            }
             // Acquire a Read lock on the slot's CURRENT lsn and HOLD it across
             // the re-read.  For a foreign writer this BLOCKS until that writer
             // commits/aborts (bounded by the per-lock / txn timeout, which

@@ -204,3 +204,74 @@ fn rc_reader_never_sees_published_uncommitted_slot() {
     // Final committed state is the restored Avalue.
     assert_eq!(db.get(KEY).unwrap().unwrap().as_ref(), b"Avalue");
 }
+
+/// DEDICATED LIVELOCK WITNESS (primary red/green, deterministic in BOTH
+/// profiles via the `RELOCK_TEST_CAP` knob).
+///
+/// An abort-cycling writer keeps `KEY` PERPETUALLY write-locked: it repeatedly
+/// writes an uncommitted `Bvalue` (a fresh LSN, WRITE held) and aborts, so the
+/// slot is at every instant either the committed `Avalue` or an uncommitted
+/// `Bvalue` whose WRITE lock is held.  A READ_COMMITTED reader whose record
+/// re-read loop is capped (simulating a slot that moves faster than the loop
+/// converges) MUST NOT return the uncommitted `Bvalue`.
+///
+/// At the pre-fix base the capped loop exhausts into the UNLOCKED fallback and
+/// returns the live (uncommitted) slot bytes — RED.  With the fix the capped
+/// loop returns a `LockConflict` ERROR (never dirty data); the reader surfaces
+/// a lock error rather than `Bvalue` — GREEN.  The cap makes the exhaustion
+/// deterministic in DEBUG as well as RELEASE.
+#[test]
+fn rc_scan_livelock_never_returns_uncommitted_under_capped_relock() {
+    use noxu_dbi::cursor_impl::RELOCK_TEST_CAP;
+
+    let (_temp, env, db, _lm) = setup();
+
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let torn = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // Abort-cycling writer: keep KEY perpetually write-locked with uncommitted
+    // Bvalue, never committing it.
+    let (wenv, wdb, wdone) = (env.clone(), db.clone(), done.clone());
+    let writer = std::thread::spawn(move || {
+        while !wdone.load(std::sync::atomic::Ordering::Relaxed) {
+            let Ok(txn) = wenv.begin_transaction(None) else { continue };
+            let _ = wdb.put_in(&txn, KEY, b"Bvalue");
+            let _ = txn.abort();
+        }
+    });
+
+    // Reader: READ_COMMITTED scan with a low re-read cap, so the loop's
+    // termination path (fallback at base / lock-error at fix) fires fast and
+    // deterministically.  Run many rounds so a RED base is caught reliably.
+    let rc = TransactionConfig::new().with_read_committed(true);
+    for _ in 0..2000 {
+        RELOCK_TEST_CAP.with(|c| c.set(4));
+        let Ok(txn) = env.begin_transaction(Some(&rc)) else { continue };
+        if let Ok(mut cur) = db.open_cursor_in(&txn, None) {
+            let mut k = DatabaseEntry::new();
+            let mut d = DatabaseEntry::new();
+            if let Ok(OperationStatus::Success) =
+                cur.get(&mut k, &mut d, crate::Get::First, None)
+                && d.data_opt() == Some(b"Bvalue".as_slice())
+            {
+                torn.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            drop(cur);
+        }
+        let _ = txn.commit();
+        RELOCK_TEST_CAP.with(|c| c.set(0));
+        if torn.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+    }
+
+    done.store(true, std::sync::atomic::Ordering::Relaxed);
+    writer.join().unwrap();
+
+    assert!(
+        !torn.load(std::sync::atomic::Ordering::Relaxed),
+        "RC scan returned the writer's UNCOMMITTED value under a capped re-read \
+         loop: the loop fell back to an unlocked read instead of surfacing a \
+         lock-conflict error (BUG-RC-SCAN-TORN-READ livelock fallback)."
+    );
+}
