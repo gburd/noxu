@@ -622,6 +622,22 @@ impl FileManager {
     /// Deletes a log file.
     ///
     /// Used by the cleaner to remove old log files.
+    ///
+    /// Defense-in-depth (BUG-CLEANER-LIVE-FILE-DELETE): refuses to unlink the
+    /// current write file (or any file numbered at or above it).  The log is
+    /// still appending to `current_file_num`, and on a single-file environment
+    /// that file also holds the NameDB mapping; unlinking it leaves the
+    /// `LogManager` writing to a re-created file at the old (stale) offset,
+    /// which produces a zero-filled hole that in-tree slots still point into
+    /// (reads surface `InvalidEntryType`), and on a clean reopen the database
+    /// disappears entirely.  JE never deletes the current file: the cleaner's
+    /// selector excludes files `>= firstActiveFile`
+    /// (`UtilizationCalculator.getBestFile`, UtilizationCalculator.java:339),
+    /// and `FileManager` treats `currentFileNum` as a special, never-deleted
+    /// file (`FileManager.java:504 getCurrentFileNum`, `:519-526 isFileValid`).
+    /// This guard enforces that invariant at the one place every deletion must
+    /// pass through, so a selector regression can never again silently destroy
+    /// a live file.
     pub fn delete_file(&self, file_num: u32) -> Result<()> {
         if self.read_only {
             return Err(LogError::WriteFailed(
@@ -629,6 +645,35 @@ impl FileManager {
             ));
         }
 
+        // Never unlink the file the log is still appending to (or a higher,
+        // not-yet-created number).  Only strictly-older files are reclaimable.
+        let current = self.get_current_file_num();
+        if file_num >= current {
+            log::error!(
+                "refusing to delete log file {:#010x}: it is at or above the \
+                 current write file {:#010x} (deleting the live file would \
+                 corrupt the log and lose the database)",
+                file_num,
+                current,
+            );
+            return Err(LogError::WriteFailed(format!(
+                "refusing to delete current/live log file {file_num} \
+                 (current write file is {current})"
+            )));
+        }
+
+        self.delete_file_unchecked(file_num)
+    }
+
+    /// Physically unlink a log file WITHOUT the current-write-file guard.
+    ///
+    /// Internal.  Only recovery-time log truncation (`truncate_log`, JE
+    /// `FileManager.truncateLog`) may legitimately remove the current file
+    /// and files above it — it is rolling the log back to a torn-tail point,
+    /// not reclaiming obsolete space, and it has already repositioned the
+    /// write head.  Every OTHER deletion must go through the guarded
+    /// [`Self::delete_file`].
+    fn delete_file_unchecked(&self, file_num: u32) -> Result<()> {
         // Remove from cache.
         self.file_cache.lock().pop(&file_num);
 
@@ -787,7 +832,7 @@ impl FileManager {
                         continue;
                     }
                 }
-                self.delete_file(fnum)?;
+                self.delete_file_unchecked(fnum)?;
             }
             i -= 1;
         }
@@ -1307,6 +1352,9 @@ mod tests {
         manager.create_file(0).unwrap();
         assert!(manager.file_path(0).exists());
 
+        // A file is only deletable once it is no longer the current write
+        // file (BUG-CLEANER-LIVE-FILE-DELETE guard): advance past file 0.
+        manager.set_last_position(Lsn::new(3, 1024), Lsn::new(3, 512));
         manager.delete_file(0).unwrap();
         assert!(!manager.file_path(0).exists());
         assert_eq!(manager.list_file_numbers().unwrap(), Vec::<u32>::new());
@@ -1318,8 +1366,49 @@ mod tests {
         let manager =
             FileManager::new(temp_dir.path(), false, 10_000_000, 100).unwrap();
 
-        // Deleting a file that does not exist should not return an error.
+        // Deleting an old file that does not exist should not return an error.
+        // (Advance past file 42 so the current-file guard is not the thing
+        // under test here.)
+        manager.set_last_position(Lsn::new(100, 0), Lsn::new(99, 512));
         assert!(manager.delete_file(42).is_ok());
+    }
+
+    /// BUG-CLEANER-LIVE-FILE-DELETE defense-in-depth: `delete_file` must
+    /// refuse to unlink the current write file (or any higher number), and
+    /// must leave the file on disk.  RED before the guard (the live file was
+    /// happily removed); GREEN after.
+    #[test]
+    fn test_delete_current_write_file_is_refused() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager =
+            FileManager::new(temp_dir.path(), false, 10_000_000, 100).unwrap();
+
+        // File 0 is the current write file (current_file_num == 0 at init).
+        manager.create_file(0).unwrap();
+        assert!(manager.file_path(0).exists());
+        assert_eq!(manager.get_current_file_num(), 0);
+
+        // Deleting the live file must fail and must NOT remove it.
+        let err = manager.delete_file(0);
+        assert!(
+            err.is_err(),
+            "delete_file(current) must be refused, got {err:?}"
+        );
+        assert!(
+            manager.file_path(0).exists(),
+            "the refused live file must still exist on disk"
+        );
+
+        // A strictly-older file (now that we have advanced) is deletable.
+        manager.set_last_position(Lsn::new(2, 1024), Lsn::new(2, 512));
+        assert_eq!(manager.get_current_file_num(), 2);
+        // File 0 is now old -> deletable.
+        manager.delete_file(0).unwrap();
+        assert!(!manager.file_path(0).exists());
+        // File 2 (current) is still refused even if it existed.
+        manager.create_file(2).unwrap();
+        assert!(manager.delete_file(2).is_err());
+        assert!(manager.file_path(2).exists());
     }
 
     #[test]
