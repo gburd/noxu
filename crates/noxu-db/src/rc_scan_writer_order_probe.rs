@@ -31,7 +31,9 @@
 //! false (Locker.java:775): the writer keeps WRITE(new) until commit/abort.
 
 use super::*;
-use crate::{DatabaseConfig, DatabaseEntry, OperationStatus, TransactionConfig};
+use crate::{
+    DatabaseConfig, DatabaseEntry, OperationStatus, TransactionConfig,
+};
 use noxu_dbi::cursor_impl::SLOT_PUBLISHED_PROBE;
 use noxu_util::Lsn;
 use std::sync::mpsc::channel;
@@ -41,7 +43,12 @@ const KEY: &[u8] = b"K00";
 
 /// Open a transactional env+db, seed `KEY` with the committed value `Avalue`,
 /// and return the pieces the witnesses need.
-fn setup() -> (tempfile::TempDir, Arc<Environment>, Arc<crate::Database>, Arc<noxu_txn::LockManager>) {
+fn setup() -> (
+    tempfile::TempDir,
+    Arc<Environment>,
+    Arc<crate::Database>,
+    Arc<noxu_txn::LockManager>,
+) {
     let temp = tempfile::TempDir::new().unwrap();
     let mut cfg = EnvironmentConfig::new(temp.path().to_path_buf())
         .with_allow_create(true)

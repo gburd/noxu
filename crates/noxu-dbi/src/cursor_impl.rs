@@ -2795,9 +2795,7 @@ impl CursorImpl {
             // Whether the lock is a NEW acquisition (so we release it on RC) or
             // one the txn already held (leave it in place -- RR/SR footprint).
             let already_held = guard.owns_any_lock(lsn);
-            guard
-                .lock(lsn, lock_type, false)
-                .map_err(DbiError::TxnError)?;
+            guard.lock(lsn, lock_type, false).map_err(DbiError::TxnError)?;
             // RR/SR keep the read lock to commit; only RC/own-new release.
             if guard.is_read_committed_isolation() && !already_held {
                 Ok(LockHeld::TxnRead)
