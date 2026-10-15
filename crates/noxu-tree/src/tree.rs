@@ -3119,6 +3119,42 @@ pub enum LoggedChildLookup {
     Undecidable,
 }
 
+/// BUG-SPLIT-KD-RESURRECT probe: a thread-local one-shot hook fired inside
+/// [`Tree::verify_logged_child_live`] immediately AFTER the latch-free route
+/// returns `(parent_arc, slot_idx)` and immediately BEFORE the parent WRITE
+/// latch is taken.  A test arms it to deterministically force the exact
+/// concurrent window the cleaner races against: a split/merge/eviction that
+/// relocates or REUSES `slot_idx` to point at a DIFFERENT (reused) BIN before
+/// the cleaner re-latches the parent.  Without a recheck of the resident
+/// child's `node_id` under the write latch (JE `Tree.getParentINForChildIN`
+/// validates `child.getNodeId() == targetNodeId`, Tree.java:1361), the cleaner
+/// would compare the logged image's LSN against the WRONG node and could
+/// validate a reused BIN as live — resurrecting a committed-deleted
+/// (known-deleted) slot.  Compiled away entirely in non-test builds (no
+/// symbols, no cost).
+#[cfg(test)]
+mod verify_route_probe {
+    use std::cell::RefCell;
+    thread_local! {
+        static AFTER_ROUTE: RefCell<Option<Box<dyn FnOnce()>>> =
+            const { RefCell::new(None) };
+    }
+    /// Arm a one-shot callback fired after the route, before the write latch.
+    pub fn arm(hook: Box<dyn FnOnce()>) {
+        AFTER_ROUTE.with(|h| *h.borrow_mut() = Some(hook));
+    }
+    /// Fire (and consume) the armed callback, if any.
+    pub(super) fn after_route() {
+        let hook = AFTER_ROUTE.with(|h| h.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
+#[cfg(test)]
+pub use verify_route_probe::arm as arm_verify_route_probe;
+
 impl Tree {
     /// Creates a new empty tree.
     ///
@@ -10828,6 +10864,13 @@ impl Tree {
         };
         let (parent_arc, slot_idx) = parent_slot;
 
+        // Test-only: fire the one-shot route probe here — after the latch-free
+        // route resolved `(parent_arc, slot_idx)`, before the parent WRITE
+        // latch is taken.  A witness arms it to splice a concurrent
+        // split/reuse into this exact window (BUG-SPLIT-KD-RESURRECT).
+        #[cfg(test)]
+        verify_route_probe::after_route();
+
         // Hold the parent WRITE latch across re-fault + compare + dirty so the
         // evictor cannot detach the child in the window (JE holds the parent
         // EX-latch from getParentINForChildIN through setDirty).
@@ -10856,6 +10899,24 @@ impl Tree {
         let Some(child_arc) = n.get_child(slot_idx) else {
             return LoggedChildLookup::Undecidable;
         };
+
+        // BUG-SPLIT-KD-RESURRECT: the route above ran latch-free, so a
+        // concurrent split/merge/eviction could have relocated or REUSED
+        // `slot_idx` to point at a DIFFERENT node before we took the parent
+        // WRITE latch, and the re-fault above may have installed that reused
+        // node from the (split-restamped) slot LSN.  Re-validate the resident
+        // child's identity under the latch, exactly as JE
+        // `Tree.getParentINForChildIN` checks `child.getNodeId() ==
+        // targetNodeId` (Tree.java:1361) and `find_parent_of_node_id` matches
+        // the slot's node_id before returning the parent.  If the slot no
+        // longer holds `node_id` we must NOT compare the logged image against
+        // the reused node: validating a reused BIN as "live" can migrate/retain
+        // a stale known-deleted image over a committed-live slot — resurrecting
+        // a committed delete.  Fail CLOSED (Undecidable: retain the file,
+        // re-route next pass); never a false Routed/NotFound.
+        if child_arc.read().node_id() != node_id {
+            return LoggedChildLookup::Undecidable;
+        }
 
         // Compare the logged image against the live node.
         let mut child_guard = child_arc.write();
@@ -11736,6 +11797,180 @@ pub fn seed_node_id_counter(last_node_id: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// BUG-SPLIT-KD-RESURRECT regression (deterministic witness).
+    ///
+    /// A committed-deleted (known-deleted) record was observed to reappear
+    /// after a concurrent split + eviction + cleaner cycle (measured 6/60
+    /// RELEASE runs of `delete_heavy_does_not_inflate_cache_usage`).  The
+    /// mechanism: the cleaner's `verify_logged_child_live` ROUTES to the
+    /// child's parent slot LATCH-FREE, then takes the parent WRITE latch and
+    /// compares the logged image's LSN against whatever node now sits at that
+    /// slot.  In the window between the route and the write latch, a
+    /// concurrent split/merge/eviction can RELOCATE or REUSE the slot so it
+    /// points at a DIFFERENT (reused) BIN.  If that reused BIN's full/delta
+    /// LSN range happens to contain `log_lsn`, the cleaner wrongly validates
+    /// the logged image as live and migrates/retains a STALE known-deleted
+    /// BIN image over the committed-live slot — resurrecting the delete.
+    ///
+    /// JE never has this bug: `Tree.getParentINForChildIN` re-checks
+    /// `child.getNodeId() == targetNodeId` under the parent latch
+    /// (Tree.java:1361) before declaring the parent found; a stale route that
+    /// lands on a reused node is rejected.  This lineage's
+    /// `find_parent_of_node_id` matches a slot by node_id when routing, but
+    /// `verify_logged_child_live` re-faults/compares under a SEPARATELY taken
+    /// write latch and (pre-fix) never re-validated the resident child's
+    /// identity in that window.
+    ///
+    /// This witness forces the EXACT interleave deterministically: it arms
+    /// the one-shot `verify_route_probe` to run AFTER the latch-free route and
+    /// BEFORE the parent WRITE latch, and in that window it REPLACES the
+    /// routed slot's child with a different BIN (reused node_id) whose
+    /// `last_full_lsn == log_lsn`.  Fail-before (no recheck): the compare runs
+    /// against the reused BIN and returns `Routed` (live).  Pass-after (node_id
+    /// recheck): the slot no longer holds `node_id`, so the result is
+    /// `Undecidable` (fail closed — retain the file, re-route next pass),
+    /// never a false Routed that would resurrect the tombstone.
+    ///
+    /// Descend to the first BIN leaf and return `(parent_in, slot_idx,
+    /// bin_node_id)`, whatever the tree depth is after the splits.
+    fn find_bin_leaf_and_parent(
+        node: &Arc<RwLock<TreeNode>>,
+    ) -> Option<(Arc<RwLock<TreeNode>>, usize, u64)> {
+        let g = node.read();
+        let TreeNode::Internal(n) = &*g else {
+            return None; // a BIN has no IN parent chain below it
+        };
+        for idx in 0..n.entries.len() {
+            let Some(child) = n.get_child(idx) else {
+                continue;
+            };
+            let is_bin = matches!(&*child.read(), TreeNode::Bottom(_));
+            if is_bin {
+                let id = child.read().node_id();
+                return Some((Arc::clone(node), idx, id));
+            }
+            if let Some(found) = find_bin_leaf_and_parent(&child) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn verify_logged_child_live_rejects_reused_slot_after_split() {
+        // Build a tree that has split, so there is an IN parenting BIN leaves.
+        let tree = Tree::new(7, 4);
+        for i in 0u8..12 {
+            tree.insert(
+                vec![b'a' + i],
+                vec![i; 8],
+                Lsn::new(1, u32::from(i) + 1),
+            )
+            .unwrap();
+        }
+
+        // Pick a BIN leaf and the IN that directly parents it, whatever the
+        // tree depth is after the splits.  Give that BIN a known full-log LSN
+        // so a cleaner would route to it as live.
+        let log_lsn = Lsn::new(2, 500);
+        let root = tree.get_root().expect("tree must have a root");
+        let (parent_arc, slot_idx, orig_node_id) =
+            find_bin_leaf_and_parent(&root)
+                .expect("tree must have a BIN leaf under an IN");
+        {
+            let pg = parent_arc.read();
+            let TreeNode::Internal(n) = &*pg else { unreachable!() };
+            let c = n.get_child(slot_idx).expect("resident BIN child");
+            // Stamp the BIN's full-log LSN so the normal (unraced) path would
+            // validate it live.
+            if let TreeNode::Bottom(b) = &mut *c.write() {
+                b.last_full_lsn = log_lsn;
+            }
+        }
+
+        // Sanity: without any race, the image IS live (Routed).
+        assert!(
+            matches!(
+                tree.verify_logged_child_live(orig_node_id, log_lsn),
+                LoggedChildLookup::Routed(_, _)
+            ),
+            "precondition: an unraced route to the live BIN is Routed"
+        );
+
+        // Re-stamp (the Routed call dirtied/prohibited the slot but left the
+        // full LSN); ensure it is still live for the raced call.
+        {
+            let pg = parent_arc.read();
+            let TreeNode::Internal(n) = &*pg else { unreachable!() };
+            if let Some(c) = n.get_child(slot_idx)
+                && let TreeNode::Bottom(b) = &mut *c.write()
+            {
+                b.last_full_lsn = log_lsn;
+            }
+        }
+
+        // Build a REUSED BIN: a DIFFERENT node_id whose full-log LSN happens
+        // to equal `log_lsn` (as a split-restamped reused slot could).  This
+        // is what the concurrent split leaves behind at `slot_idx`.
+        let reused_node_id = orig_node_id ^ 0xDEAD_BEEF; // guaranteed != orig
+        let reused_bin = {
+            let mut b = intest_empty_bin();
+            b.node_id = reused_node_id;
+            b.last_full_lsn = log_lsn; // same file region a split could reuse
+            // One live (NOT known-deleted) slot — the "committed-live" record
+            // that must NOT be overwritten by a resurrected tombstone.
+            b.entries.push(BinEntry {
+                data: Some(Bytes::from(vec![9u8])),
+                known_deleted: false,
+                dirty: false,
+                expiration_time: 0,
+            });
+            b.keys = KeyRep::from_keys(vec![b"z".to_vec()]);
+            b.lsn_rep = LsnRep::from_lsns(&[log_lsn]);
+            Arc::new(RwLock::new(TreeNode::Bottom(b)))
+        };
+        let parent_for_probe = Arc::clone(&parent_arc);
+        let reused_for_probe = Arc::clone(&reused_bin);
+
+        // Arm the probe: splice the reused BIN into the routed slot in the
+        // window after the latch-free route, before the WRITE latch.
+        arm_verify_route_probe(Box::new(move || {
+            let mut g = parent_for_probe.write();
+            if let TreeNode::Internal(n) = &mut *g {
+                n.set_child(slot_idx, Some(reused_for_probe));
+            }
+        }));
+
+        // Route to the ORIGINAL node_id; the probe swaps in the reused BIN.
+        let verdict = tree.verify_logged_child_live(orig_node_id, log_lsn);
+
+        assert!(
+            matches!(verdict, LoggedChildLookup::Undecidable),
+            "BUG-SPLIT-KD-RESURRECT: a slot reused by a concurrent split must \
+             NOT be validated against the original node's logged image; \
+             expected Undecidable (fail closed), got {verdict:?}"
+        );
+
+        // And the reused BIN's live slot must be untouched (not dirtied for a
+        // migration that would re-log a stale image over it).
+        {
+            let pg = parent_arc.read();
+            let TreeNode::Internal(n) = &*pg else { unreachable!() };
+            let c = n.get_child(slot_idx).expect("reused child resident");
+            let g = c.read();
+            if let TreeNode::Bottom(b) = &*g {
+                assert_eq!(
+                    b.node_id, reused_node_id,
+                    "the reused BIN must still be the resident child"
+                );
+                assert!(
+                    !b.dirty,
+                    "the reused BIN must not be dirtied by a mis-routed verify"
+                );
+            }
+        }
+    }
 
     /// BUG (a2ea0b725b): the compressor must keep a non-prefixing BIN's
     /// `key_prefix` EMPTY.  KD-slot retention (A5) makes the compressor drain
