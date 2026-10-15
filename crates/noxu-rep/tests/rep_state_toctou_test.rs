@@ -28,13 +28,13 @@
 //! "test-harness"))`, absent from released builds) fires *at the exact
 //! mid-point of the compound transition* — the window a second actor would
 //! have interleaved into. Thread A begins `become_master`; its hook releases
-//! thread B, which runs its own `become_master`, then A pauses briefly to
-//! give B time to reach the state lock.
+//! thread B, which runs its own transition, then A pauses briefly to give B
+//! time to reach the state lock.
 //!
 //! * **GREEN (fixed code):** `transition_via_unknown` holds the state write
 //!   lock across the *entire* compound transition, so B must block on the
-//!   lock until A completes; B then observes the node already `Master` and
-//!   returns an idempotent no-op success. Both calls return `Ok`.
+//!   lock until A completes; B then observes the node already in the target
+//!   role and returns an idempotent no-op success. Both calls return `Ok`.
 //!
 //! * **RED (stack-v1 code):** with the two-step released between hops, B
 //!   interleaves, sets `Master`, and A's trailing `transition_to(Master)`
@@ -44,9 +44,54 @@
 //! The env is built with `ReplicatedEnvironment::new` (NOT `open`) so no
 //! election-driver thread runs: the only contenders are this test's two
 //! threads, making the witness fully deterministic.
+//!
+//! ## Why this witness can never *hang* (v2 — R-REPSTATE hang fix)
+//!
+//! The original witness coordinated thread A and thread B with a bare
+//! `std::sync::Barrier::new(2)` whose two parties were (1) A's mid-transition
+//! hook and (2) B's pre-transition wait, backed by the **process-global**
+//! one-shot `MID_TRANSITION_HOOK`. That hand-off deadlocks whenever the hook
+//! fires a number of times other than exactly once:
+//!
+//! * **Hook fires zero times** (A takes a path that skips the mid-point —
+//!   e.g. the idempotent "already in target" arm): B's pre-transition
+//!   `Barrier::wait()` never gets its second party and blocks forever
+//!   (observed field shape 2: thread B parked at its own barrier wait, thread
+//!   A already returned without firing).
+//! * **Hook fires twice** (the still-installed global hook is re-entered by
+//!   B's *own* transition before the one-shot clear is visible): the extra
+//!   `wait()` opens a fresh barrier generation that never completes, so B
+//!   parks *inside* the hook with no partner (observed field shape 1: thread
+//!   B parked in `fire_mid_transition_hook` with no partner).
+//!
+//! A hung witness is worse than a failing one: a CI gate built on it would
+//! hang too. This v2 witness removes every unbounded wait and makes the hook
+//! fire *exactly once*:
+//!
+//! * **Bounded hand-offs.** Every cross-thread rendezvous is an
+//!   `mpsc::sync_channel` `send`/`recv_timeout` with a finite deadline. A
+//!   missing partner surfaces as a `RecvTimeoutError` that fails the test
+//!   (RED) — it can never park forever.
+//! * **One-shot, self-clearing hook.** The hook body is guarded by an
+//!   `AtomicBool` so it runs its rendezvous *at most once* even if a later
+//!   transition re-enters it; a second entry is a cheap no-op that performs
+//!   no wait. The hook is also cleared from the global slot the moment it
+//!   runs. A stale or double hook therefore cannot deadlock.
+//! * **Watchdog.** Each test arms a watchdog thread that `panic!`s (failing
+//!   the test, never hanging the process) if the body does not finish within
+//!   a generous budget. This is the backstop that guarantees the witness can
+//!   only ever go GREEN or RED, never hang.
+//! * **Explicit precondition + hygienic global reset.** Each test asserts the
+//!   freshly built node is `Detached` and resets the process-global hook to
+//!   `None` on entry, so a hook leaked by an earlier test (or an earlier
+//!   failed run in the same binary) cannot contaminate it.
+//!
+//! None of this changes what the witness *proves*: the atomicity assertions
+//! (`errors == 0`, well-defined final role) are unchanged and never weakened.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{RecvTimeoutError, SyncSender};
 use std::time::Duration;
 
 use noxu_rep::node_state::NodeState;
@@ -56,11 +101,83 @@ use noxu_rep::{RepConfig, ReplicatedEnvironment};
 /// this file must not install hooks concurrently. Serialize them.
 static WITNESS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Upper bound on any single cross-thread hand-off. Generous (CI under heavy
+/// parallel load) yet finite: if a rendezvous partner never arrives the test
+/// fails with `RecvTimeoutError` instead of parking forever.
+const HANDOFF_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Upper bound on a whole test body. The watchdog `panic!`s past this, turning
+/// any residual deadlock into a RED failure rather than a process hang.
+const WATCHDOG_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// How long thread A dwells at the compound-transition mid-point so thread B
+/// is guaranteed to reach (and, under the fix, block on) the state write lock
+/// during the window the old two-step left open.
+const A_DWELL: Duration = Duration::from_millis(50);
+
 fn single_node_cfg(dir: &std::path::Path) -> RepConfig {
     RepConfig::builder("toctou_grp", "n1", "127.0.0.1")
         .node_port(0)
         .env_home(dir.to_path_buf())
         .build()
+}
+
+/// Arm a watchdog that aborts the test (via `panic!`, which the harness turns
+/// into a RED failure) if `done` is not signalled within [`WATCHDOG_TIMEOUT`].
+/// Returns the sender; dropping it (on the normal path, after the body
+/// completes) cancels the watchdog.
+fn arm_watchdog(name: &'static str) -> SyncSender<()> {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
+    std::thread::Builder::new()
+        .name(format!("watchdog-{name}"))
+        .spawn(move || match rx.recv_timeout(WATCHDOG_TIMEOUT) {
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => {
+                // Body finished (or sender dropped) — stand down.
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                panic!(
+                    "R-REPSTATE witness '{name}' did not complete within \
+                     {WATCHDOG_TIMEOUT:?}: the hand-off deadlocked. This is a \
+                     witness defect, not a pass — fail loudly rather than hang."
+                );
+            }
+        })
+        .expect("spawn watchdog");
+    tx
+}
+
+/// Install the one-shot, self-clearing mid-transition hook on the shared
+/// (process-global) slot. When the hook first runs it (a) signals thread B via
+/// `release_b`, (b) dwells [`A_DWELL`] so B races into the state lock, and (c)
+/// clears itself from the global slot. A `fired` guard makes any *second* entry
+/// (e.g. B's own transition re-entering before the clear is visible) a no-op
+/// with no wait — so the hook can never park a thread with no partner.
+fn install_oneshot_hook(
+    env: &Arc<ReplicatedEnvironment>,
+    release_b: SyncSender<()>,
+) {
+    let env2 = Arc::clone(env);
+    let fired = Arc::new(AtomicBool::new(false));
+    env.node_state_machine_for_test().set_mid_transition_hook(Some(Arc::new(
+        move || {
+            // One-shot: only the FIRST entry performs the rendezvous. A second
+            // entry (B's own transition, were the clear not yet visible) must
+            // not block.
+            if fired.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            // Clear the global slot immediately so no later transition fires
+            // this hook again. We are inside the state write lock here.
+            env2.node_state_machine_for_test().set_mid_transition_hook(None);
+            // Release B. `send` on a rendezvous channel never blocks longer
+            // than the receiver takes; the receiver uses `recv_timeout`.
+            let _ = release_b.send(());
+            // Dwell so B reaches the state lock during the window the old
+            // two-step left open. (The fix holds the lock across this dwell;
+            // the bug released it here.)
+            std::thread::sleep(A_DWELL);
+        },
+    )));
 }
 
 /// Two threads race `become_master` with a deterministic interleave forced at
@@ -70,6 +187,8 @@ fn single_node_cfg(dir: &std::path::Path) -> RepConfig {
 #[test]
 fn become_master_contended_mid_transition_is_atomic() {
     let _serial = WITNESS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _wd = arm_watchdog("become_master_contended");
+
     let tmp = tempfile::TempDir::new().expect("tempdir");
     // `new` (not `open`): no election-driver thread, so the only state
     // contenders are the two threads below.
@@ -77,36 +196,23 @@ fn become_master_contended_mid_transition_is_atomic() {
         ReplicatedEnvironment::new(single_node_cfg(tmp.path()))
             .expect("ReplicatedEnvironment::new"),
     );
+    // Precondition: the only state writers are this test's threads, and the
+    // node starts Detached. Make the assumption explicit and defensively
+    // clear any hook leaked by an earlier test/run.
+    env.node_state_machine_for_test().set_mid_transition_hook(None);
+    assert_eq!(
+        env.get_state(),
+        NodeState::Detached,
+        "witness precondition: a freshly `new`-built node must be Detached \
+         (no third actor may have transitioned it)"
+    );
 
-    // Count InvalidStateTransition (or any) failures across both threads.
     let errors = Arc::new(AtomicUsize::new(0));
 
-    // Hand-off: thread A's mid-transition hook releases thread B, which runs
-    // its own become_master, then A waits briefly so B is guaranteed to reach
-    // (and, under the fix, block on) the state lock while A still holds it.
-    let b_release = Arc::new(std::sync::Barrier::new(2));
-
-    {
-        let env2 = Arc::clone(&env);
-        let b_release_hook = Arc::clone(&b_release);
-        // Install the hook on the SAME state machine both threads share.
-        env.node_state_machine_for_test().set_mid_transition_hook(Some(
-            Arc::new(move || {
-                // Fired by thread A while it holds the state write lock, at
-                // the compound-transition mid-point. Release B, then dwell so
-                // B races into the lock during the window the old two-step
-                // left open.
-                b_release_hook.wait();
-                std::thread::sleep(Duration::from_millis(50));
-                // One-shot: a reentrant/second fire (e.g. B's own transition,
-                // were it ever to run the Unknown->Master arm) must not
-                // re-block. Clearing here keeps the witness to a single forced
-                // interleave.
-                env2.node_state_machine_for_test()
-                    .set_mid_transition_hook(None);
-            }),
-        ));
-    }
+    // Bounded hand-off: A's hook releases B exactly once. `recv_timeout` on
+    // B's side turns a missing release into a RED failure, never a hang.
+    let (release_b_tx, release_b_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    install_oneshot_hook(&env, release_b_tx);
 
     let thread_a = {
         let env = Arc::clone(&env);
@@ -121,10 +227,21 @@ fn become_master_contended_mid_transition_is_atomic() {
     let thread_b = {
         let env = Arc::clone(&env);
         let errors = Arc::clone(&errors);
-        let b_release = Arc::clone(&b_release);
         std::thread::spawn(move || {
-            // Wait until A is mid-transition, then contend.
-            b_release.wait();
+            // Wait until A is mid-transition, then contend. Bounded: if A
+            // never fires the hook the test fails here (RED) rather than
+            // parking forever.
+            match release_b_rx.recv_timeout(HANDOFF_TIMEOUT) {
+                Ok(()) => {}
+                Err(e) => {
+                    eprintln!(
+                        "thread B: A never reached the mid-transition hook \
+                         ({e:?}); the witness hand-off failed"
+                    );
+                    errors.fetch_add(1, Ordering::SeqCst);
+                    return;
+                }
+            }
             if env.become_master(1).is_err() {
                 errors.fetch_add(1, Ordering::SeqCst);
             }
@@ -154,27 +271,25 @@ fn become_master_contended_mid_transition_is_atomic() {
 #[test]
 fn become_master_vs_become_replica_contended_is_atomic() {
     let _serial = WITNESS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _wd = arm_watchdog("become_master_vs_become_replica");
+
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let env = Arc::new(
         ReplicatedEnvironment::new(single_node_cfg(tmp.path()))
             .expect("ReplicatedEnvironment::new"),
     );
+    env.node_state_machine_for_test().set_mid_transition_hook(None);
+    assert_eq!(
+        env.get_state(),
+        NodeState::Detached,
+        "witness precondition: a freshly `new`-built node must be Detached \
+         (no third actor may have transitioned it)"
+    );
 
     let errors = Arc::new(AtomicUsize::new(0));
-    let b_release = Arc::new(std::sync::Barrier::new(2));
 
-    {
-        let env2 = Arc::clone(&env);
-        let b_release_hook = Arc::clone(&b_release);
-        env.node_state_machine_for_test().set_mid_transition_hook(Some(
-            Arc::new(move || {
-                b_release_hook.wait();
-                std::thread::sleep(Duration::from_millis(50));
-                env2.node_state_machine_for_test()
-                    .set_mid_transition_hook(None);
-            }),
-        ));
-    }
+    let (release_b_tx, release_b_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    install_oneshot_hook(&env, release_b_tx);
 
     let thread_a = {
         let env = Arc::clone(&env);
@@ -189,9 +304,18 @@ fn become_master_vs_become_replica_contended_is_atomic() {
     let thread_b = {
         let env = Arc::clone(&env);
         let errors = Arc::clone(&errors);
-        let b_release = Arc::clone(&b_release);
         std::thread::spawn(move || {
-            b_release.wait();
+            match release_b_rx.recv_timeout(HANDOFF_TIMEOUT) {
+                Ok(()) => {}
+                Err(e) => {
+                    eprintln!(
+                        "thread B: A never reached the mid-transition hook \
+                         ({e:?}); the witness hand-off failed"
+                    );
+                    errors.fetch_add(1, Ordering::SeqCst);
+                    return;
+                }
+            }
             // B contends with become_replica. With the fix B blocks on the
             // state lock until A finishes, then runs its own atomic
             // Master->Unknown->Replica compound transition. Neither errors.
