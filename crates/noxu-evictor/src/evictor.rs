@@ -1336,6 +1336,29 @@ impl Evictor {
             None => return false, // node busy — put back
         };
 
+        // BUG-CLEANER-LIVE-LN-RECLAIM (JE `inListResident` / Evictor.processTarget
+        // `target != parent.getTarget(index)` skip, Evictor.java:2617): once the
+        // child is latched (which blocks `detach_node_by_id`), re-verify it is
+        // still the resident child of its parent.  A detached/zombie instance
+        // resolved via `find_node_arc_nonblocking` before another thread
+        // detached it must NOT be logged (its stale image would be published
+        // and stamped).  `Busy` (detach in flight) is also skipped — put back.
+        // Read the parent Weak from the guard we ALREADY hold (never re-latch
+        // `node_arc` — the futex RwLock is not reentrant: re-reading it here is
+        // the Fix-C self-deadlock).  `child_resident_state` only `try_read`s
+        // the PARENT.
+        let parent_weak = match &*node_guard {
+            TreeNode::Bottom(b) => b.parent.clone(),
+            TreeNode::Internal(n) => n.parent.clone(),
+        };
+        match noxu_tree::tree::Tree::child_resident_state(
+            &parent_weak,
+            &node_arc,
+        ) {
+            noxu_tree::tree::ChildResident::Yes => {}
+            _ => return false,
+        }
+
         // CC-6: re-validate pin count under the lock.  Between the metadata
         // snapshot taken by node_info_fn and acquiring the write latch a
         // cursor may have pinned the BIN.  Mirrors JE `isPinned()` re-check.
@@ -1426,6 +1449,22 @@ impl Evictor {
             .map(|c| c.get_eviction_provisional(db_id, bin.level))
             .unwrap_or(Provisional::No);
 
+        // DEBUG invariant (BUG-CLEANER-LIVE-LN-RECLAIM): we only reach the
+        // serialize after the resident-identity check above returned `Yes`, so
+        // a non-resident (zombie) instance must never be flushed here.  Re-read
+        // the parent Weak from the held guard (never re-latch the child) and
+        // assert residency in debug builds.
+        #[cfg(debug_assertions)]
+        {
+            // Read the parent Weak from the BIN we hold (`bin` is the borrow of
+            // `node_guard`); never re-latch the child.
+            let pw = bin.parent.clone();
+            debug_assert_ne!(
+                noxu_tree::tree::Tree::child_resident_state(&pw, &node_arc),
+                noxu_tree::tree::ChildResident::No,
+                "evictor must not flush a detached (zombie) BIN"
+            );
+        }
         let full_bytes = bin.serialize_full();
         let entry =
             InLogEntry::new(db_id, bin.last_full_lsn, NULL_LSN, full_bytes);
@@ -1465,6 +1504,19 @@ impl Evictor {
         };
         bin.clear_dirty_after_full_log(logged_lsn);
         self.stats.increment(&self.stats.dirty_nodes_evicted);
+        // BUG-CLEANER-LIVE-LN-RECLAIM: publish the freshly-logged LSN into the
+        // parent slot AT LOG TIME (JE `Evictor.evict` -> `parent.updateEntry(
+        // index, newLsn)` immediately after `target.log`, Evictor.java:
+        // 3009-3035; IN.updateEntry).  The checkpointer and the evictor's
+        // upper-IN path already do this; the evictor's dirty-BIN path
+        // previously did NOT, relying on `detach_node_by_id` to retroactively
+        // stamp `last_full_lsn` later — which republished a STALE instance's
+        // LSN (the zombie-reclaim defect).  Stamping here, exactly once, under
+        // the parent latch via the child's parent Weak (the canonical
+        // publication point) lets the detach-stamp be removed.  Drop the child
+        // latch first (parent-then-child order).
+        drop(node_guard);
+        noxu_tree::tree::Tree::update_parent_slot_lsn(&node_arc, logged_lsn);
         true
     }
 
