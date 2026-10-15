@@ -1708,6 +1708,46 @@ impl CursorImpl {
                     } else {
                         (slot_data, slot_lsn)
                     };
+                    // BUG-SEC-DIRTYREAD-DELETED-PRIMARY: the slot was live at
+                    // the pre-lock descent but the re-read-under-lock found it
+                    // GONE -- a concurrent writer committed a delete inside the
+                    // prefetch->lock window.  `reread_data_locking_current_lsn`
+                    // signals this with `(None, 0)` (lsn 0 = the invalid-lsn
+                    // sentinel; a live resident-empty slot keeps a real lsn, a
+                    // non-resident slot keeps a real lsn).  JE
+                    // `CursorImpl.fetchCurrent` / `lockLNAndCheckDefunct` return
+                    // KEYEMPTY (null) for a defunct slot under a dirty read
+                    // (CursorImpl.java:2060-2095, 2150-2175), so the caller gets
+                    // NOTFOUND and a scan SKIPS the record -- it must NEVER be
+                    // returned Success with an empty 0-byte datum (that is the
+                    // 0cd8b502 D1 residual a concurrent delete exposes: a
+                    // READ_UNCOMMITTED secondary scan then hands back a 0-byte
+                    // primary datum instead of skipping the deleted record).
+                    // Return-value contract of `reread_data_locking_current_lsn`
+                    // this guard depends on:
+                    //   * `Err(..)`  -> propagated by `?` ABOVE; a lock timeout
+                    //     (R-RCSCAN 13e656c9) can NEVER reach this guard and is
+                    //     NEVER mapped to NOTFOUND.
+                    //   * `(Some(_), lsn)` -> found, resident value.
+                    //   * `(None, lsn)` with `lsn != 0` -> found, non-resident
+                    //     LN (refetched from the log below) -- NOT gone.
+                    //   * `(None, 0)` -> the key is GONE: `get_data_from_tree`
+                    //     returned `None` (no live slot for `key`), i.e. the
+                    //     slot was KD / the LN deleted under the latch.  A live
+                    //     slot always carries a non-zero lsn, so `lsn == 0` is
+                    //     the unambiguous "gone" sentinel.
+                    // Only the GONE case returns NOTFOUND (JE KEYEMPTY).
+                    if slot_lsn == 0 && final_data.is_none() {
+                        // Mirror the missing-key arm's phantom protection
+                        // convention on this base (C2 tip): contest the
+                        // synthetic key so a serializable reader detects the
+                        // uncommitted/committed delete.  (D's additional
+                        // next-key/EOF range lock for a missed search is not on
+                        // this base and is applied by the Set/Both miss arm
+                        // only where it exists.)
+                        self.contest_synthetic_key_for_missing_read(key)?;
+                        return Ok(OperationStatus::NotFound);
+                    }
                     // JE IN.fetchTarget: a found slot whose in-memory data was
                     // stripped by the evictor (data == None) must be
                     // re-fetched from the log at its LSN, not returned empty.
@@ -1797,6 +1837,46 @@ impl CursorImpl {
                     } else {
                         (slot_data, slot_lsn)
                     };
+                    // BUG-SEC-DIRTYREAD-DELETED-PRIMARY: the slot was live at
+                    // the pre-lock descent but the re-read-under-lock found it
+                    // GONE -- a concurrent writer committed a delete inside the
+                    // prefetch->lock window.  `reread_data_locking_current_lsn`
+                    // signals this with `(None, 0)` (lsn 0 = the invalid-lsn
+                    // sentinel; a live resident-empty slot keeps a real lsn, a
+                    // non-resident slot keeps a real lsn).  JE
+                    // `CursorImpl.fetchCurrent` / `lockLNAndCheckDefunct` return
+                    // KEYEMPTY (null) for a defunct slot under a dirty read
+                    // (CursorImpl.java:2060-2095, 2150-2175), so the caller gets
+                    // NOTFOUND and a scan SKIPS the record -- it must NEVER be
+                    // returned Success with an empty 0-byte datum (that is the
+                    // 0cd8b502 D1 residual a concurrent delete exposes: a
+                    // READ_UNCOMMITTED secondary scan then hands back a 0-byte
+                    // primary datum instead of skipping the deleted record).
+                    // Return-value contract of `reread_data_locking_current_lsn`
+                    // this guard depends on:
+                    //   * `Err(..)`  -> propagated by `?` ABOVE; a lock timeout
+                    //     (R-RCSCAN 13e656c9) can NEVER reach this guard and is
+                    //     NEVER mapped to NOTFOUND.
+                    //   * `(Some(_), lsn)` -> found, resident value.
+                    //   * `(None, lsn)` with `lsn != 0` -> found, non-resident
+                    //     LN (refetched from the log below) -- NOT gone.
+                    //   * `(None, 0)` -> the key is GONE: `get_data_from_tree`
+                    //     returned `None` (no live slot for `key`), i.e. the
+                    //     slot was KD / the LN deleted under the latch.  A live
+                    //     slot always carries a non-zero lsn, so `lsn == 0` is
+                    //     the unambiguous "gone" sentinel.
+                    // Only the GONE case returns NOTFOUND (JE KEYEMPTY).
+                    if slot_lsn == 0 && final_data.is_none() {
+                        // Mirror the missing-key arm's phantom protection
+                        // convention on this base (C2 tip): contest the
+                        // synthetic key so a serializable reader detects the
+                        // uncommitted/committed delete.  (D's additional
+                        // next-key/EOF range lock for a missed search is not on
+                        // this base and is applied by the Set/Both miss arm
+                        // only where it exists.)
+                        self.contest_synthetic_key_for_missing_read(key)?;
+                        return Ok(OperationStatus::NotFound);
+                    }
                     // JE IN.fetchTarget: a found slot whose in-memory data was
                     // stripped by the evictor (data == None) must be
                     // re-fetched from the log at its LSN, not returned empty.

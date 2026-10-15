@@ -992,36 +992,82 @@ impl SecondaryDatabase {
         p_key: &mut DatabaseEntry,
         data: &mut DatabaseEntry,
     ) -> Result<bool> {
+        self.get_into_with_options(
+            txn,
+            key,
+            p_key,
+            data,
+            &crate::read_options::ReadOptions::new(),
+        )
+    }
+
+    /// Lock-mode-aware keyed secondary read (JE
+    /// `SecondaryDatabase.get(txn, key, pKey, data, lockMode)`).
+    ///
+    /// BUG-SEC-KEYED-DIRTYREAD-1 fix: under `LockMode::ReadUncommitted` a
+    /// secondary record whose primary has been concurrently deleted (or had
+    /// its secondary key removed by an update) returns NOTFOUND instead of
+    /// raising `SecondaryIntegrityException` — mirroring the scan-path D8 fix
+    /// (SecondaryCursor dirty-read missing-primary skip) and JE
+    /// `SecondaryDatabase.readPrimaryAfterGet` which treats a dirty-read
+    /// missing primary as "not found", not corruption (bug #22603).  Under any
+    /// locking read mode a missing primary is still a real integrity error.
+    ///
+    /// v7.11.1 tag-native deviation from integrate 9079292d: the primary
+    /// record is fetched through `primary_handle` with NO primary-handle Mutex
+    /// held (BUG-SEC-MUTEX-DEADLOCK, already on stack-v1), not via
+    /// `self.state.primary.lock()` as on integrate — the lock-mode tolerance
+    /// is layered on top of the stack-v1 no-mutex read path.
+    pub fn get_into_with_options(
+        &self,
+        txn: Option<&Transaction>,
+        key: impl AsRef<[u8]>,
+        p_key: &mut DatabaseEntry,
+        data: &mut DatabaseEntry,
+        opts: &crate::read_options::ReadOptions,
+    ) -> Result<bool> {
         self.check_open()?;
         self.check_readable()?;
 
-        // Look up the secondary key in the index to get the primary key.
-        let mut pri_key_entry = DatabaseEntry::new();
-        let found =
-            self.state.inner.get_into(txn, key.as_ref(), &mut pri_key_entry)?;
+        let dirty_read =
+            opts.lock_mode == crate::lock_mode::LockMode::ReadUncommitted;
 
-        if !found {
-            return Ok(false);
-        }
+        // Look up the secondary key in the index to get the primary key,
+        // honouring the caller's lock mode (a dirty read must not block on a
+        // concurrent writer of the index entry).
+        let pri_key_bytes =
+            match self.state.inner.get_with_options(txn, key.as_ref(), opts)? {
+                Some(b) => b,
+                None => return Ok(false),
+            };
 
         // Store the primary key in the output parameter.
-        if let Some(pk) = pri_key_entry.data_opt() {
-            p_key.set_data(pk);
-        }
+        p_key.set_data(&pri_key_bytes);
 
-        // Now fetch the primary record WITHOUT holding the primary handle
-        // Mutex (BUG-SEC-MUTEX-DEADLOCK): a sec-index read lock is held here,
-        // and blocking on the primary record lock while also holding the
-        // handle Mutex deadlocks a concurrent writer that holds the Mutex and
-        // waits for the sec-index write lock.  JE reads the primary through a
-        // handle reference with no monitor held.
-        let pri_found = self.state.primary_handle.get_into(
+        // Now fetch the primary record under the same lock mode, WITHOUT
+        // holding the primary handle Mutex (BUG-SEC-MUTEX-DEADLOCK): a
+        // sec-index read lock is held here, and blocking on the primary record
+        // lock while also holding the handle Mutex deadlocks a concurrent
+        // writer that holds the Mutex and waits for the sec-index write lock.
+        // JE reads the primary through a handle reference with no monitor held.
+        let pri_found = match self.state.primary_handle.get_with_options(
             txn,
-            pri_key_entry.data(),
-            data,
-        )?;
+            &pri_key_bytes,
+            opts,
+        )? {
+            Some(pri_data) => {
+                data.set_data(&pri_data);
+                true
+            }
+            None => false,
+        };
         if !pri_found {
-            // Secondary refers to a missing primary — integrity issue.
+            // D8 / bug #22603: under dirty read a transiently-missing primary
+            // (concurrent delete / secondary-key update) is NOTFOUND, not a
+            // corruption.  Under a locking read it is a real integrity error.
+            if dirty_read {
+                return Ok(false);
+            }
             return Err(NoxuError::SecondaryIntegrityException(format!(
                 "Secondary '{}' refers to missing primary key",
                 self.name()
