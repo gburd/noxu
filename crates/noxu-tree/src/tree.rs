@@ -9920,6 +9920,66 @@ impl Tree {
         }
     }
 
+    /// Cleaner LN migration latch (JE `FileProcessor.processLN`,
+    /// FileProcessor.java:1139-1214): descend hand-over-hand with shared
+    /// latches, then latch the key's BIN exclusively while still holding its
+    /// parent's shared latch -- the same order as the public write path
+    /// (`insert_recursive_inner`: parent read, then BIN write), so no split
+    /// (`split_child` needs `parent.write()`) can move the slot while `f`
+    /// runs.  `f` gets the exact-match slot index.  Returns `None` if the
+    /// tree is empty or the key has no slot (JE `!parentFound`).
+    pub fn with_latched_ln_slot<R>(
+        &self,
+        key: &[u8],
+        f: impl FnOnce(&mut BinStub, usize) -> R,
+    ) -> Option<R> {
+        'restart: for _ in 0..8 {
+            let mut guard: NodeArcReadGuard = self.get_root()?.read_arc();
+            loop {
+                let (idx, child) = match &*guard {
+                    TreeNode::Internal(n) if !n.entries.is_empty() => {
+                        let idx = self.upper_in_floor_index(&n.entries, key);
+                        (idx, n.get_child(idx))
+                    }
+                    _ => return None,
+                };
+                let Some(child) = child else {
+                    // Non-resident child: fault it in, then re-descend.
+                    let parent_arc = NodeArcReadGuard::rwlock(&guard).clone();
+                    drop(guard);
+                    self.child_at_or_fetch(&parent_arc, idx)?;
+                    continue 'restart;
+                };
+                // Node level is immutable, so this probe is stable.
+                if !child.read().is_bin() {
+                    let next = child.read_arc();
+                    guard = next;
+                    continue;
+                }
+                let mut bin_guard = child.write();
+                let TreeNode::Bottom(bin) = &mut *bin_guard else {
+                    return None;
+                };
+                self.note_bin_access(bin.is_delta);
+                let (slot, found) = match &self.key_comparator {
+                    Some(cmp) => bin.find_entry_cmp(key, cmp.as_ref()),
+                    None if self.key_prefixing => {
+                        bin.find_entry_compressed(key)
+                    }
+                    None => match bin.key_binary_search(key) {
+                        Ok(i) => (i, true),
+                        Err(i) => (i, false),
+                    },
+                };
+                let out = found.then(|| f(bin, slot));
+                drop(bin_guard);
+                drop(guard);
+                return out;
+            }
+        }
+        None
+    }
+
     /// Returns the BIN where `key` should be inserted.
     ///
     /// .  Semantically identical to

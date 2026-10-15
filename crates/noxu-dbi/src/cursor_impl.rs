@@ -55,6 +55,13 @@ use crate::{
     database_impl::DatabaseImpl,
 };
 
+// Review-only seam after real lock transfer; never changes lock ownership.
+#[cfg(feature = "testing")]
+thread_local! {
+    pub static PUBLICATION_PROBE: std::cell::RefCell<Option<Box<dyn FnOnce(u64, Lsn)>>> =
+        std::cell::RefCell::new(None);
+}
+
 /// Cursor states.
 ///
 /// `PendingDeleted` is the JE post-delete position: the cursor's current slot
@@ -490,7 +497,7 @@ impl CursorImpl {
         self.current_lsn = lsn;
         self.current_index = idx;
         self.state = CursorState::Initialized;
-        self.rehydrate_current_data();
+        self.rehydrate_current_data()?;
         // Install the already-pinned BIN (pin-next-before-unpin-current).
         self.update_bin_pin_prepinned(pin_guard.into_arc());
         Ok(OperationStatus::Success)
@@ -652,36 +659,57 @@ impl CursorImpl {
     /// Gets the before-image (old_data, old_lsn) for `key` from the tree.
     ///
     /// Returns `(None, NULL_LSN)` if the key does not exist (new insert).
-    fn get_slot_before_image(&self, key: &[u8]) -> (Option<Vec<u8>>, u64) {
+    fn get_slot_before_image(
+        &self,
+        key: &[u8],
+    ) -> Result<(Option<Vec<u8>>, u64, bool), DbiError> {
+        // Returns `(data, lsn, exists)`.  `exists` is true iff a LIVE slot was
+        // found (JE `CursorImpl.LockStanding.recordExists`); the before-image
+        // `abort_known_deleted` is `!exists`.  `data` keeps the slot's
+        // residency from a single descent:
+        //   Some(Some(bytes)) -> resident; Some(None) -> found, non-resident;
+        //   None -> no live slot (new insert).
+        // Minimal relock variant: stack-v1 has no KD-slot LSN reuse
+        // (`slot_lsn_any`, A5), so a no-live-slot key is a brand-new insert
+        // (`exists = false`, `lsn = NULL`), exactly as the pre-relock path did.
         let (data, lsn) = {
             let db = self.db_impl.read();
             match db.get_real_tree() {
                 Some(tree) => match Self::get_data_from_tree(&tree, key) {
                     Some((data, lsn)) => (Some(data), lsn),
-                    None => (None, noxu_util::NULL_LSN.as_u64()),
+                    None => {
+                        return Ok((None, noxu_util::NULL_LSN.as_u64(), false));
+                    }
                 },
-                None => (None, noxu_util::NULL_LSN.as_u64()),
+                None => return Ok((None, noxu_util::NULL_LSN.as_u64(), false)),
             }
         };
         // JE `IN.fetchTarget` / `CursorImpl.LockStanding.prepareForUpdate`:
         // the before-image captured for abort undo must be the record's
         // *actual* prior value.  When the evictor stripped this slot's LN
-        // (`data == None`, surfaced here as an empty vec by
-        // `get_data_from_tree`) the resident bytes are gone but the slot still
-        // carries a valid `lsn` -- the value is recoverable from the log.  We
-        // must re-fetch it here, exactly as the read path does, otherwise the
-        // undo record stores an EMPTY before-image and an abort durably
-        // restores a 0-byte record over the caller's original (see the
-        // NEW-EVOLVE-ABORT-ROLLBACK regression: an aborted DPL evolution left
-        // 0-byte records that panicked a later read).
+        // (`data == Some(None)`, decided by the same descent that read the
+        // LSN) the resident bytes are gone but the slot still carries a valid
+        // `lsn` -- the value is recoverable from the log (D1).  Fetch it here,
+        // exactly as the read path does, otherwise the undo record stores an
+        // EMPTY before-image and an abort durably restores a 0-byte record
+        // over the caller's original (see the NEW-EVOLVE-ABORT-ROLLBACK
+        // regression: an aborted DPL evolution left 0-byte records that
+        // panicked a later read).  A resident 0-byte value is NOT refetched.
         if lsn != noxu_util::NULL_LSN.as_u64()
-            && data.as_ref().map(|d| d.is_empty()).unwrap_or(false)
-            && let Some(fetched) = self.fetch_ln_data_from_log(lsn)
+            && matches!(data, Some(None))
+            // JE IN.fetchLN never fetches an immediately-obsolete dup-DB LN
+            // (IN.java:2780-2783): dup data lives in the two-part key.
+            && !self.is_sorted_dup()
+            && let Some(fetched) = self.fetch_ln_data_from_log(lsn)?
             && !fetched.is_empty()
         {
-            return (Some(fetched.to_vec()), lsn);
+            return Ok((Some(fetched.to_vec()), lsn, true));
         }
-        (data, lsn)
+        // A live slot was found above (absent keys returned early with
+        // `exists = false`), so `exists = true`.  Flatten the residency to the
+        // caller's `Option<Vec<u8>>`: a non-resident slot that could not be
+        // refetched collapses to an empty vec (unchanged pre-D1 corner).
+        Ok((data.map(|d| d.map(|d| d.to_vec()).unwrap_or_default()), lsn, true))
     }
 
     /// Returns true if `key` exists in the committed tree.
@@ -812,6 +840,167 @@ impl CursorImpl {
     /// locker for deadlock-detector reasoning.  Database::put / delete on
     /// `txn = None` always wraps in a synthetic auto-txn, so this fallback
     /// is exercised only by the legacy direct-CursorImpl construction.
+    /// Locks the slot's CURRENT LSN for `key` under a re-read-under-lock loop
+    /// and returns the before-image `(data, lsn, exists)` derived from the
+    /// LOCKED slot state, mirroring JE `CursorImpl.lockLN`
+    /// (CursorImpl.java:3641-3680): request a blocking WRITE lock on the slot's
+    /// LSN, then re-read the slot; if the LSN changed while we waited, revert
+    /// the just-acquired lock and retry on the new LSN.
+    ///
+    /// Why this exists (SLOT-RELOCK P0): `get_slot_before_image` reads the slot
+    /// LSN and then `lock_write_before_log` locks THAT LSN in two non-atomic
+    /// steps.  A concurrent writer can abort + re-delete in the window, moving
+    /// the slot to a new DeleteLN LSN; the reader then holds a WRITE lock on a
+    /// STALE LSN that no longer protects the live slot, records a STALE
+    /// `exists`/`abort_lsn`, and on abort destroys the committed record the
+    /// writer restored (`tree.delete` on the shared slot).  JE closes this by
+    /// re-reading the slot LSN under the BIN latch after the lock, then
+    /// reverting and re-locking if it moved, so the existence decision and
+    /// before-image always come from the LOCKED, current slot (JE
+    /// `prepareForUpdate`: `abortLsn = lockStanding.lsn`,
+    /// `abortKD = !recordExists()`).
+    ///
+    /// Revert semantics mirror JE `revertLock` (CursorImpl.java:3848-3859):
+    /// release a lock only if it was NEWLY acquired (grant `New`/`WaitNew`);
+    /// demote a promoted lock (`Promotion`/`WaitPromotion`); leave a lock the
+    /// txn already held (`Existing`) untouched.  This keeps the JE lock
+    /// footprint unchanged under contention.
+    ///
+    /// NULL-LSN inserts (no slot) take the synthetic key-coordination lock just
+    /// as `lock_write_before_log` does; a NULL LSN cannot "change" (the loop
+    /// returns immediately), so a brand-new insert takes exactly one lock.
+    ///
+    /// Returns the locked `(data, lsn, exists)` on success; the caller passes
+    /// this `lsn`/`exists` to `log_ln_write`/`finalize_write_lock` so the
+    /// abort before-image reflects the locked slot.  On a non-txn (lock
+    /// manager only) cursor the lock is released by the caller via
+    /// `release_bare_write_locks` after the slot update, exactly as before.
+    fn lock_slot_current_lsn(
+        &self,
+        key: &[u8],
+    ) -> Result<(Option<Vec<u8>>, u64, bool), DbiError> {
+        let null = noxu_util::NULL_LSN.as_u64();
+        // Bounded: a slot that keeps moving under us is a livelock signal, not
+        // normal contention (JE loops unbounded under the BIN latch; here each
+        // iteration is one lock round-trip, so we cap to surface a stuck slot).
+        const MAX_RELOCK: u32 = 64;
+        let mut last_locked: Option<u64> = None;
+        for _ in 0..MAX_RELOCK {
+            // 1. Read the slot's current before-image (NOT yet under the lock).
+            let (data, lsn, exists) = self.get_slot_before_image(key)?;
+            // The LSN we must lock (synthetic key id for a brand-new insert).
+            let lsn_to_lock = if lsn == null {
+                let db_id = self.db_impl.read().get_id().id() as u64;
+                Lsn::synthetic_key_lock_id(db_id, key)
+            } else {
+                lsn
+            };
+            // If a prior iteration already locked exactly this LSN, we are
+            // stable: no need to re-lock, just return the fresh before-image.
+            if last_locked == Some(lsn_to_lock) {
+                return Ok((data, lsn, exists));
+            }
+            // 2. Acquire the WRITE lock on `lsn_to_lock`, remembering the grant
+            //    so we can revert it (release/demote) if the slot moved.
+            let grant = self.acquire_slot_write_lock(lsn_to_lock, key)?;
+            // 3. Re-read the slot under the lock.
+            let (data2, lsn2, exists2) = self.get_slot_before_image(key)?;
+            let lsn2_to_lock = if lsn2 == null {
+                let db_id = self.db_impl.read().get_id().id() as u64;
+                Lsn::synthetic_key_lock_id(db_id, key)
+            } else {
+                lsn2
+            };
+            if lsn2_to_lock == lsn_to_lock {
+                // LSN unchanged under the lock: this is the authoritative
+                // locked before-image (JE lockLN returns `standing`).
+                return Ok((data2, lsn2, exists2));
+            }
+            // 4. The LSN moved while we waited.  Revert the just-acquired lock
+            //    (JE revertLock) and retry on the new LSN.  A txn-held lock
+            //    (grant `Existing`) is left in place.
+            self.revert_slot_write_lock(lsn_to_lock, grant);
+            last_locked = None;
+            // Loop re-reads and locks `lsn2`.
+            let _ = data2;
+            let _ = exists2;
+        }
+        Err(DbiError::LockConflict(format!(
+            "lock_slot_current_lsn: slot LSN moved {MAX_RELOCK} times while \
+             acquiring the write lock; retry the operation"
+        )))
+    }
+
+    /// Acquires a WRITE lock on `lsn_to_lock` for the slot-relock loop and
+    /// returns the grant type so the caller can revert it (release/demote) if
+    /// the slot LSN changed.  Txn cursors go through `Txn::lock` (held until
+    /// commit/abort unless reverted); no-txn cursors use the cursor id as the
+    /// locker.  Mirrors the lock acquisition in `lock_write_before_log` but
+    /// surfaces the `LockGrantType`.
+    fn acquire_slot_write_lock(
+        &self,
+        lsn_to_lock: u64,
+        key: &[u8],
+    ) -> Result<noxu_txn::LockGrantType, DbiError> {
+        if let Some(txn) = &self.txn_ref {
+            let mut guard = txn.lock().unwrap();
+            // Same RangeInsert->Write co-location release as lock_write_before_log.
+            guard.release_range_insert_for_write(lsn_to_lock);
+            let res = guard
+                .lock(lsn_to_lock, LockType::Write, false)
+                .map_err(DbiError::TxnError)?;
+            Ok(res.grant)
+        } else if let Some(lm) = &self.lock_manager {
+            let grant = lm
+                .lock(lsn_to_lock, self.id, LockType::Write, false, false)
+                .map_err(DbiError::TxnError)?;
+            // Legacy auto-commit NULL-LSN inserts release immediately, exactly
+            // like `lock_write_before_log`; a real-LSN lock is released by
+            // `release_bare_write_locks` after the slot update.
+            let null = noxu_util::NULL_LSN.as_u64();
+            let db_id = self.db_impl.read().get_id().id() as u64;
+            if lsn_to_lock == Lsn::synthetic_key_lock_id(db_id, key)
+                && lsn_to_lock != null
+            {
+                // Brand-new synthetic key lock on a no-txn cursor: release it
+                // now (matches lock_write_before_log's old_lsn==null branch).
+                let _ = lm.release(lsn_to_lock, self.id);
+            }
+            Ok(grant)
+        } else {
+            Ok(noxu_txn::LockGrantType::NoneNeeded)
+        }
+    }
+
+    /// Reverts a lock taken by `acquire_slot_write_lock` when the slot LSN
+    /// moved (JE `revertLock`, CursorImpl.java:3848-3859): release a freshly
+    /// acquired lock (`New`/`WaitNew`), demote a promoted one
+    /// (`Promotion`/`WaitPromotion`), and leave a lock the locker already held
+    /// (`Existing`/`NoneNeeded`) in place so a txn's pre-existing footprint is
+    /// preserved.
+    fn revert_slot_write_lock(&self, lsn: u64, grant: noxu_txn::LockGrantType) {
+        use noxu_txn::LockGrantType::*;
+        match grant {
+            New | WaitNew => {
+                if let Some(txn) = &self.txn_ref {
+                    let _ = txn.lock().unwrap().release_lock(lsn);
+                } else if let Some(lm) = &self.lock_manager {
+                    let _ = lm.release(lsn, self.id);
+                }
+            }
+            Promotion | WaitPromotion => {
+                if let Some(txn) = &self.txn_ref {
+                    let _ = txn.lock().unwrap().demote_lock(lsn);
+                } else if let Some(lm) = &self.lock_manager {
+                    let _ = lm.demote(lsn, self.id);
+                }
+            }
+            // Existing / NoneNeeded / WaitRestart / Denied / IllegalUpgrade:
+            // nothing was newly granted to revert.
+            _ => {}
+        }
+    }
+
     fn lock_write_before_log(
         &self,
         old_lsn: u64,
@@ -1039,6 +1228,7 @@ impl CursorImpl {
     fn finalize_write_lock(
         &self,
         old_lsn: u64,
+        old_exists: bool,
         new_lsn: Lsn,
         abort_key: Option<Vec<u8>>,
         abort_data: Option<Vec<u8>>,
@@ -1063,7 +1253,9 @@ impl CursorImpl {
                     .lock(new_lsn_u64, LockType::Write, false)
                     .map_err(DbiError::TxnError)?;
             }
-            let abort_known_deleted = old_lsn == noxu_util::NULL_LSN.as_u64();
+            // JE prepareForUpdate: abortKD = !recordExists()
+            // (CursorImpl.java:3321): no slot, or a known-deleted slot.
+            let abort_known_deleted = !old_exists;
             guard.set_write_lock_abort_info(
                 new_lsn_u64,
                 old_lsn,
@@ -1082,15 +1274,47 @@ impl CursorImpl {
                 tm.update_first_lsn(txn_id, new_lsn_u64);
             }
         } else if let Some(lm) = &self.lock_manager {
-            // Auto-commit: acquire write lock, then release immediately.
+            // No txn (BasicLocker-equivalent): hold WRITE(old) and WRITE(new)
+            // until the caller's slot update; `release_bare_write_locks` drops
+            // both after it (JE Locker.allowReleaseLockAfterLsnChange false,
+            // Locker.java:775 -- only HandleLocker releases old after an LSN
+            // change, HandleLocker.java:117-120; BasicLocker releases at
+            // operationEnd, BasicLocker.java:198-248).  Releasing old here let
+            // the cleaner see the still-current slot at old_lsn unlocked
+            // between this call and the slot update and migrate the stale
+            // version past new_lsn.
             lm.lock(new_lsn_u64, self.id, LockType::Write, false, false)
                 .map_err(DbiError::TxnError)?;
-            if old_lsn != noxu_util::NULL_LSN.as_u64() {
-                let _ = lm.release(old_lsn, self.id);
-            }
-            let _ = lm.release(new_lsn_u64, self.id);
         }
+        #[cfg(feature = "testing")]
+        PUBLICATION_PROBE.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook(old_lsn, new_lsn);
+            }
+        });
         Ok(())
+    }
+
+    /// Releases a no-txn cursor's WRITE locks on `old_lsn` and `new_lsn`
+    /// AFTER the tree slot update (JE BasicLocker releases at operation end;
+    /// old-LSN locks are never released after an LSN change before then,
+    /// Locker.java:775).  No-op for txn cursors (released at commit/abort).
+    /// Also called on every early return (Err, KeyExist, KeyEmpty) after
+    /// `lock_write_before_log`, with `new_lsn = NULL_LSN`, so a failed
+    /// operation does not leak WRITE(old) (JE BasicLocker.operationEnd
+    /// releases regardless of outcome, BasicLocker.java:241-248).
+    fn release_bare_write_locks(&self, old_lsn: u64, new_lsn: Lsn) {
+        if self.txn_ref.is_some() {
+            return;
+        }
+        if let Some(lm) = &self.lock_manager {
+            let null = noxu_util::NULL_LSN.as_u64();
+            for lsn in [old_lsn, new_lsn.as_u64()] {
+                if lsn != null {
+                    let _ = lm.release(lsn, self.id);
+                }
+            }
+        }
     }
 
     /// Returns true if the underlying database uses sorted duplicates.
@@ -1226,6 +1450,16 @@ impl CursorImpl {
         if tick_fail() {
             return Err(DbiError::CursorClosed);
         }
+        self.check_env()?;
+        match self.state {
+            CursorState::Closed => Err(DbiError::CursorClosed),
+            _ => Ok(()),
+        }
+    }
+
+    /// JE `CursorImpl.checkEnv` (CursorImpl.java:3874): fail if the env is
+    /// invalid.
+    fn check_env(&self) -> Result<(), DbiError> {
         // X-13: check environment validity before cursor state.
         // Both the explicit invalidation flag and the I/O-failure flag
         // (io_invalid) are tested so that reads on a failed environment
@@ -1246,10 +1480,7 @@ impl CursorImpl {
                     .into(),
             });
         }
-        match self.state {
-            CursorState::Closed => Err(DbiError::CursorClosed),
-            _ => Ok(()),
-        }
+        Ok(())
     }
 
     /// Checks the cursor is initialized.
@@ -1260,35 +1491,137 @@ impl CursorImpl {
     /// When a `get` finds such a slot (`data == None`) we must read the LN
     /// back from the log at its `lsn` rather than return empty data. Without
     /// this, a read of an evicted record silently returns no data.
-    fn fetch_ln_data_from_log(&self, lsn: u64) -> Option<Bytes> {
+    ///
+    /// A read refused because the environment's FileManager is closed is an
+    /// error (`EnvironmentNotOpen`), never "no data": a cursor retained past
+    /// `Environment::close` must not report `Success` with an empty value
+    /// (RO env-lock R1).  Other read failures still yield `None`.
+    fn fetch_ln_data_from_log(
+        &self,
+        lsn: u64,
+    ) -> Result<Option<Bytes>, DbiError> {
         use noxu_log::entry::LnLogEntry;
-        let lm = self.log_manager.as_ref()?;
+        let Some(lm) = self.log_manager.as_ref() else {
+            return Ok(None);
+        };
+        use crate::EnvironmentFailureReason as R;
+        use noxu_log::NoxuLogError as L;
         let lsn = noxu_util::Lsn::from_u64(lsn);
-        let (entry_type, bytes) = lm.read_entry(lsn).ok()?;
+        // JE EnvironmentFailureException ctor (EnvironmentFailureException
+        // .java:159-166): an invalidating reason invalidates the env.
+        let fail = |reason: R, msg: String| {
+            if reason.invalidates_environment()
+                && let Some(f) = &self.env_invalid
+            {
+                f.store(true, Ordering::Release);
+            }
+            DbiError::LnFetchFailure {
+                reason,
+                msg: format!("LN fetch at {lsn:?}: {msg}"),
+            }
+        };
+        let (entry_type, bytes) = match lm.read_entry(lsn) {
+            Ok(r) => r,
+            Err(_) if lm.file_manager().is_closed() => {
+                return Err(DbiError::EnvironmentNotOpen);
+            }
+            Err(e) => {
+                let reason = match &e {
+                    // IN.java:2826-2833 / LogManager.java:957-960.
+                    L::FileNotFound(_) => R::LogFileNotFound,
+                    L::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
+                        R::LogFileNotFound
+                    }
+                    // LogManager.java:1055-1113 ChecksumException (incl.
+                    // short read) -> LOG_CHECKSUM (:927-939).
+                    L::Checksum { .. }
+                    | L::UnexpectedEof { .. }
+                    | L::InvalidEntrySize { .. }
+                    | L::InvalidHeader { .. }
+                    | L::HeaderChecksumMismatch { .. } => R::LogChecksum,
+                    L::InvalidEntryType { .. } => R::LogIntegrity,
+                    // Other IOException on read -> LOG_READ (LogManager.java
+                    // :1158).
+                    _ => R::LogRead,
+                };
+                return Err(fail(reason, e.to_string()));
+            }
+        };
+        // Wrong entry type / parse failure: IN.java:2841-2843 LOG_INTEGRITY
+        // (does not invalidate, EnvironmentFailureReason.java:73-75).
         if !entry_type.is_ln_type() {
-            return None;
+            return Err(fail(
+                R::LogIntegrity,
+                format!("not an LN entry: {entry_type:?}"),
+            ));
         }
         let is_txnal = entry_type.is_transactional();
-        let ln = LnLogEntry::parse_from_slice(&bytes, is_txnal).ok()?;
+        let ln = LnLogEntry::parse_from_slice(&bytes, is_txnal)
+            .map_err(|e| fail(R::LogIntegrity, e.to_string()))?;
         // `ln.data` borrows from `bytes` (the log read buffer), so we must
         // copy it into an owned Bytes here — this is the cold evictor-restripe
         // path (LN was stripped from cache), not the resident-slot hot read.
-        ln.data.map(Bytes::copy_from_slice)
+        Ok(ln.data.map(Bytes::copy_from_slice))
     }
 
     /// If `current_data` is empty/None but `current_lsn` is valid, the LN was
     /// stripped by the evictor — re-fetch it from the log (JE
     /// `IN.fetchTarget`). Idempotent; cheap when data is resident.
-    fn rehydrate_current_data(&mut self) {
-        let needs =
-            self.current_data.as_ref().map(|d| d.is_empty()).unwrap_or(true);
+    fn rehydrate_current_data(&mut self) -> Result<(), DbiError> {
+        // JE IN.fetchLN never fetches an immediately-obsolete (dup DB) LN
+        // (IN.java:2780-2783): dup data lives in the two-part key.
+        if self.is_sorted_dup() {
+            return Ok(());
+        }
+        // Empty-value trap: an empty `current_data` is either a genuine
+        // 0-byte value (resident, `Some(empty)` in the slot) or a stripped LN
+        // (`None` in the slot) -- the positioning paths erase the difference.
+        // Decide by residency in the slot, never by emptiness.
+        let needs = match self.current_data.as_ref() {
+            None => true,
+            Some(d) if d.is_empty() => !self.current_slot_data_resident(),
+            Some(_) => false,
+        };
         if needs
             && self.current_lsn != 0
-            && let Some(d) = self.fetch_ln_data_from_log(self.current_lsn)
+            && let Some(d) = self.fetch_ln_data_from_log(self.current_lsn)?
             && !d.is_empty()
         {
             self.current_data = Some(d);
         }
+        Ok(())
+    }
+
+    /// True if the slot for `current_key` holds its data in memory
+    /// (`BinEntry::data.is_some()`: embedded or cached LN).
+    fn current_slot_data_resident(&self) -> bool {
+        let Some(key) = self.current_key.as_deref() else {
+            return false;
+        };
+        let db = self.db_impl.read();
+        db.get_real_tree().is_some_and(|tree| {
+            Self::slot_data_resident(&tree, key).unwrap_or(false)
+        })
+    }
+
+    /// `Some(resident)` for the slot matching `key`; `None` if no slot.
+    fn slot_data_resident(tree: &Tree, key: &[u8]) -> Option<bool> {
+        use noxu_tree::tree::TreeNode;
+        let bin_arc = Self::find_bin_for_key(tree, key)?;
+        let guard = bin_arc.read();
+        let TreeNode::Bottom(bin) = &*guard else {
+            return None;
+        };
+        if !bin.key_prefix.is_empty()
+            && !key.starts_with(bin.key_prefix.as_slice())
+        {
+            return None;
+        }
+        let (idx, found) = match tree.get_comparator() {
+            Some(cmp) => bin.find_entry_cmp(key, cmp.as_ref()),
+            None => bin.find_entry_compressed(key),
+        };
+        found.then(|| bin.entries[idx].data.is_some())
     }
 
     fn check_initialized(&self) -> Result<(), DbiError> {
@@ -1416,24 +1749,28 @@ impl CursorImpl {
                     // the LSN is unchanged.  (X-10 regression: this window let
                     // a READ_COMMITTED secondary cursor observe an aborting
                     // writer's uncommitted primary data.)
-                    // BUG-PHANTOM-1: an exact SET/BOTH match is the search
+                    // BUG-PHANTOM-1 (D): an exact SET/BOTH match is the search
                     // ANCHOR; JE locks it with searchLockType = READ (not a
                     // range lock) and does not advance, so an insert outside
                     // the matched key is not blocked (Cursor.java:4031,
-                    // 4426-4435 exactKeyMatch branch).
+                    // 4426-4435 exactKeyMatch branch).  Anchor READ via
+                    // lock_ln_mode(.., false) (A15), NOT the forward RANGE_READ.
                     let contended = self.lock_ln_mode(slot_lsn, false)?;
-                    // X-10: if the slot's LSN moved (or our lock had to wait),
-                    // the pre-fetched bytes may be a concurrent writer's
-                    // UNCOMMITTED in-place mutation.  Re-read under a lock on
-                    // the slot's CURRENT lsn so we block out the writer's txn
-                    // instead of returning its uncommitted value.
-                    let final_data = if contended
+                    // X-10 + D1 (C2): if the slot LSN moved (or our lock had to
+                    // wait), the pre-fetched bytes may be a concurrent writer's
+                    // UNCOMMITTED in-place mutation.  Re-read under a lock on the
+                    // slot's CURRENT lsn so we block out the writer's txn
+                    // instead of returning its uncommitted value.  The re-read
+                    // keeps the slot's residency (Option<Bytes>) and returns the
+                    // stable current lsn (C2 tuple), so a non-resident LN is
+                    // fetched below at the lsn it was re-read with (D1).
+                    let (final_data, slot_lsn) = if contended
                         || Self::slot_lsn_changed(
                             &bin_arc, slot_index, slot_lsn,
                         ) {
                         self.reread_data_locking_current_lsn(key, slot_lsn)?
                     } else {
-                        slot_data
+                        (slot_data, slot_lsn)
                     };
                     // JE IN.fetchTarget: a found slot whose in-memory data was
                     // stripped by the evictor (data == None) must be
@@ -1444,7 +1781,8 @@ impl CursorImpl {
                     let final_data = match final_data {
                         Some(d) => Some(d),
                         None if slot_lsn != 0 => {
-                            let fetched = self.fetch_ln_data_from_log(slot_lsn);
+                            let fetched =
+                                self.fetch_ln_data_from_log(slot_lsn)?;
                             if let Some(d) = &fetched {
                                 let db = self.db_impl.read();
                                 if let Some(tree) = db.get_real_tree() {
@@ -1537,23 +1875,26 @@ impl CursorImpl {
                     let slot_lsn = slot.lsn;
                     let slot_index = slot.slot_index;
                     let bin_arc = slot.bin_arc;
-                    // BUG-PHANTOM-1: a range search whose key EXACTLY matches a
-                    // slot is the search ANCHOR (JE searchRangeSerializable
+                    // BUG-PHANTOM-1 (D): a range search whose key EXACTLY matches
+                    // a slot is the search ANCHOR (JE searchRangeSerializable
                     // exactKeyMatch -> searchLockType = READ,
                     // Cursor.java:4426-4435).  The advance-to-next-slot case
-                    // (search key absent) is handled in the `else` arm below
-                    // with the RANGE_READ advance lock.
+                    // (search key absent) is handled in the else arm below
+                    // with the RANGE_READ advance lock.  Anchor READ via
+                    // lock_ln_mode(.., false) (A15), NOT the forward RANGE_READ.
                     let contended = self.lock_ln_mode(slot_lsn, false)?;
-                    // X-10: re-read under a lock on the slot's CURRENT lsn (see
-                    // the Set/Both branch) so a moved slot never returns a
-                    // concurrent writer's uncommitted bytes.
-                    let final_data = if contended
+                    // X-10 + D1 (C2): re-read under a lock on the slot's CURRENT
+                    // lsn (see the Set/Both branch) so a moved slot never returns
+                    // a concurrent writer's uncommitted bytes; the re-read keeps
+                    // residency and returns the stable current lsn so a
+                    // non-resident LN is fetched below at that lsn (D1).
+                    let (final_data, slot_lsn) = if contended
                         || Self::slot_lsn_changed(
                             &bin_arc, slot_index, slot_lsn,
                         ) {
                         self.reread_data_locking_current_lsn(key, slot_lsn)?
                     } else {
-                        slot_data
+                        (slot_data, slot_lsn)
                     };
                     // JE IN.fetchTarget: a found slot whose in-memory data was
                     // stripped by the evictor (data == None) must be
@@ -1562,7 +1903,8 @@ impl CursorImpl {
                     let final_data = match final_data {
                         Some(d) => Some(d),
                         None if slot_lsn != 0 => {
-                            let fetched = self.fetch_ln_data_from_log(slot_lsn);
+                            let fetched =
+                                self.fetch_ln_data_from_log(slot_lsn)?;
                             if let Some(d) = &fetched {
                                 let db = self.db_impl.read();
                                 if let Some(tree) = db.get_real_tree() {
@@ -1634,7 +1976,7 @@ impl CursorImpl {
                             self.current_key = Some(final_key);
                             self.current_data = Some(final_data);
                             self.current_lsn = final_lsn;
-                            self.rehydrate_current_data();
+                            self.rehydrate_current_data()?;
                             self.current_index = slot_idx as i32;
                             self.state = CursorState::Initialized;
                             self.update_bin_pin(bin_arc);
@@ -1754,7 +2096,7 @@ impl CursorImpl {
                     self.current_lsn = final_lsn;
                     // If the slot was stripped by the evictor, re-hydrate from
                     // the log now (get_current is &self and cannot fetch).
-                    self.rehydrate_current_data();
+                    self.rehydrate_current_data()?;
                     // Wave 11-N Bug 2 fix: store the actual BIN index, not
                     // a hard-coded 0.  Pre-fix the cursor reported
                     // current_index = 0 after every dup search, which made
@@ -2169,12 +2511,13 @@ impl CursorImpl {
                 _ => return Ok(None),
             }
         };
-        // v7.11.1 tag-native: on this base `fetch_ln_data_from_log` returns
-        // `Option<Bytes>` (not `Result<Option<Bytes>>` as on integrate), so no
-        // `?` — a failed cold fetch simply yields `None` (slot data absent).
+        // merge-prep/d: C2 A6 made `fetch_ln_data_from_log` fail CLOSED
+        // (Result<Option<Bytes>>), so a cold-fetch failure now propagates via
+        // `?` (an env-fatal fetch error must not be swallowed into a stale/empty
+        // repeatable read).  On D standalone this returned Option<Bytes> (no ?).
         let final_data = match data {
             Some(d) => Some(d),
-            None if lsn != 0 => self.fetch_ln_data_from_log(lsn),
+            None if lsn != 0 => self.fetch_ln_data_from_log(lsn)?,
             none => none,
         };
         self.current_key =
@@ -2377,10 +2720,19 @@ impl CursorImpl {
     fn lock_range_insert(
         &self,
         key: &[u8],
-        old_lsn: u64,
+        old_exists: bool,
     ) -> Result<(), DbiError> {
-        // Only needed for genuinely new inserts.
-        if old_lsn != noxu_util::NULL_LSN.as_u64() {
+        // Only needed for genuinely new inserts (including reuse of a
+        // known-deleted slot, which holds no record).
+        //
+        // Known-deleted slots between `key` and the successor are skipped
+        // without a lock.  JE locks each with RANGE_INSERT and reverts it
+        // (lockNextKeyForInsert -> getNext -> lockLNAndCheckDefunct,
+        // CursorImpl.java:3204-3275, :2147-2172), but RANGE_INSERT is
+        // granted against a deleter's WRITE (LockType.java:76-80) and no
+        // RANGE_READ survives on a defunct slot (readers revert it), so that
+        // lock never waits and is never kept: skipping is equivalent.
+        if old_exists {
             return Ok(());
         }
         let txn = match &self.txn_ref {
@@ -2632,7 +2984,7 @@ impl CursorImpl {
         &self,
         key: &[u8],
         mut known_lsn: u64,
-    ) -> Result<Option<Bytes>, DbiError> {
+    ) -> Result<(Option<Bytes>, u64), DbiError> {
         const MAX_RELOCK: usize = 64;
         for _ in 0..MAX_RELOCK {
             // Lock the slot's CURRENT lsn.  For a Read lock this BLOCKS on a
@@ -2651,13 +3003,21 @@ impl CursorImpl {
                 Some((data, cur_lsn)) => {
                     if cur_lsn == known_lsn {
                         // Stable under our lock: this is the committed value.
-                        return Ok(Some(Bytes::from(data)));
+                        // D1: keep residency.  `data == None` means the LN was
+                        // stripped (non-resident); the caller refetches it from
+                        // the log at `cur_lsn`, never flattens it to an empty
+                        // value.
+                        return Ok((data, cur_lsn));
                     }
                     // The slot moved again (the writer committed a new version,
                     // or a fresh writer re-mutated it): re-lock the new lsn.
                     known_lsn = cur_lsn;
                 }
-                None => return Ok(None), // key gone (committed delete)
+                // key gone (committed delete): no slot.  Return lsn 0 so
+                // the caller's `slot_lsn != 0` guard disables the non-resident
+                // refetch (0 is the invalid-lsn sentinel these cursor data
+                // paths use, matching `rehydrate_current_data`).
+                None => return Ok((None, 0)),
             }
         }
         // Degenerate hot-slot churn: fall back to the current (locked) read.
@@ -2665,14 +3025,22 @@ impl CursorImpl {
         Ok(db
             .get_real_tree()
             .and_then(|tree| Self::get_data_from_tree(&tree, key))
-            .map(|(d, _)| Bytes::from(d)))
+            .unwrap_or((None, 0)))
     }
 
     /// Fetches the data associated with `key` from a tree (BIN-level lookup).
     ///
     /// Returns `(data, slot_lsn)` so the caller can acquire a read lock.
+    /// `data` is `None` when the slot's LN is not resident (a >16 B LN after
+    /// reopen or an evictor strip): the caller must fetch it from the log at
+    /// `slot_lsn` (JE `IN.fetchLN`, IN.java:2767-2768), never treat it as an
+    /// empty value (D1).
+    ///
     /// Data-read path in `CursorImpl.lockAndGetCurrent()`.
-    fn get_data_from_tree(tree: &Tree, key: &[u8]) -> Option<(Vec<u8>, u64)> {
+    fn get_data_from_tree(
+        tree: &Tree,
+        key: &[u8],
+    ) -> Option<(Option<Bytes>, u64)> {
         use noxu_tree::tree::TreeNode;
         // Descend to the BIN that should contain `key` (not always the
         // leftmost), re-faulting an evicted interior child (NEW-8).
@@ -2702,12 +3070,11 @@ impl CursorImpl {
                     None => bin.find_entry_compressed(key),
                 };
                 if found {
+                    // D1: preserve residency.  `None` here means the LN was
+                    // stripped (non-resident); the caller refetches at the
+                    // returned LSN rather than flattening to an empty value.
                     Some((
-                        bin.entries[idx]
-                            .data
-                            .as_ref()
-                            .map(|d| d.to_vec())
-                            .unwrap_or_default(),
+                        bin.entries[idx].data.clone(),
                         bin.get_lsn(idx).as_u64(),
                     ))
                 } else {
@@ -3056,7 +3423,7 @@ impl CursorImpl {
                 self.current_lsn = lsn;
                 self.current_index = idx;
                 self.state = CursorState::Initialized;
-                self.rehydrate_current_data();
+                self.rehydrate_current_data()?;
                 self.update_bin_pin(Some(bin_arc));
                 Ok(OperationStatus::Success)
             }
@@ -3230,7 +3597,7 @@ impl CursorImpl {
                 self.current_lsn = lsn;
                 self.current_index = idx;
                 self.state = CursorState::Initialized;
-                self.rehydrate_current_data();
+                self.rehydrate_current_data()?;
                 self.update_bin_pin(Some(bin_arc));
                 Ok(OperationStatus::Success)
             }
@@ -3251,6 +3618,8 @@ impl CursorImpl {
     /// * `CursorNotInitialized` if the cursor is not positioned on a record
     /// * `CursorClosed` if the cursor has been closed
     pub fn get_current(&self) -> Result<(Vec<u8>, Bytes), DbiError> {
+        // JE Cursor.checkOpenAndState(true) -> checkEnv (Cursor.java:5381).
+        self.check_env()?;
         self.check_initialized()?;
 
         let raw_key =
@@ -3268,6 +3637,115 @@ impl CursorImpl {
             return Ok((pk, Bytes::from(data)));
         }
         Ok((raw_key, raw_data))
+    }
+
+    /// F5: before reporting the current slot as deleted, wait for the
+    /// deleter's lock.  Noxu removes a deleted slot physically and the
+    /// deleter holds the synthetic-key WRITE lock until it ends, so this
+    /// contests that lock (JE locks every slot that is not known-deleted
+    /// before calling it defunct, CursorImpl.java:2062-2081).  A deleter
+    /// that is this cursor's own txn, or a read-uncommitted cursor, does not
+    /// wait.
+    pub fn lock_current_deleted_slot(&self) -> Result<(), DbiError> {
+        match &self.current_key {
+            Some(k) => self.contest_synthetic_key_for_missing_read(k),
+            None => Ok(()),
+        }
+    }
+
+    /// JE `CursorImpl.lockAndGetCurrent` / `getCurrent` for a *live* slot
+    /// (CursorImpl.java:1983-2095, getCurrent :2230), reached from
+    /// `Cursor.getCurrentNoDups` (Cursor.java:3062-3092): re-latch the current
+    /// slot, lock it per the cursor isolation, and re-derive its key/data
+    /// from the slot -- never from a value cached when the cursor was
+    /// positioned.  Closes the `Get::Current` isolation divergence: the
+    /// previous code returned the cached key/data without re-reading or
+    /// locking, so a DEFAULT/READ_COMMITTED reader did not block on a foreign
+    /// uncommitted write-locked slot and a READ_UNCOMMITTED cursor did not see
+    /// the uncommitted new value.
+    ///
+    /// Behaviour by isolation (via [`Self::lock_ln`] / JE getLockType,
+    /// Cursor.java:4260-4276): READ_UNCOMMITTED -> NONE (no block, but the
+    /// slot IS re-read so a dirty update is visible); READ_COMMITTED /
+    /// repeatable-read -> READ (blocks on a foreign WRITE); SERIALIZABLE ->
+    /// RANGE_READ (likewise); the own txn already owns the WRITE lock, granted
+    /// immediately.  Call only on a NOT-known-deleted slot (the caller handles
+    /// the KD case first, JE isEntryKnownDeleted short-circuit).
+    pub fn relock_and_reread_current(&mut self) -> Result<(), DbiError> {
+        self.check_env()?;
+        self.check_initialized()?;
+        let Some(key) = self.current_key.clone() else {
+            return Ok(());
+        };
+        // Resolve the slot BY KEY under the BIN latch (never by the possibly
+        // stale `current_index`): a concurrent insert before this position
+        // shifts the record to a new index, and a split moves it to another
+        // BIN. `is_current_slot_deleted` already re-anchors this way (D5/CC-1).
+        let Some((pre_lsn, _, _, _)) = self.resolve_slot_by_key(&key) else {
+            // Key no longer in the tree: the caller KD recheck handles the
+            // defunct case; keep the cached value.
+            return Ok(());
+        };
+        // NULL_LSN (unlogged / deferred-write slot): no record lock to take.
+        if pre_lsn == noxu_util::NULL_LSN.as_u64() {
+            return Ok(());
+        }
+        // Lock the slot per isolation. For a foreign uncommitted writer this
+        // blocks (READ/RANGE_READ -> LockTimeout) or is a no-op (NONE); for our
+        // own txn the lock is already held and is granted immediately.
+        self.lock_ln(pre_lsn)?;
+        // Re-resolve BY KEY after the lock (the slot may have moved again while
+        // we waited) and install the authoritative key/data/lsn/index + re-pin.
+        if let Some((lsn, data, idx, bin_arc)) = self.resolve_slot_by_key(&key)
+        {
+            self.update_bin_pin(Some(bin_arc));
+            self.current_data = Some(data);
+            self.current_lsn = lsn;
+            self.current_index = idx;
+            self.rehydrate_current_data()?;
+        }
+        Ok(())
+    }
+
+    /// Re-resolve the live slot for `key` under the BIN latch, returning its
+    /// `(lsn, data, index, bin_arc)`. Matches with the configured comparator
+    /// (mirrors `stored_full_key` / `get_data_from_tree`), so an insert-shifted
+    /// or split-moved record is found at its current location. Returns `None`
+    /// when the key is absent or the matching slot is known-deleted.
+    #[allow(clippy::type_complexity)]
+    fn resolve_slot_by_key(
+        &self,
+        key: &[u8],
+    ) -> Option<(
+        u64,
+        Bytes,
+        i32,
+        std::sync::Arc<noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>>,
+    )> {
+        use noxu_tree::tree::TreeNode;
+        let db = self.db_impl.read();
+        let tree = db.get_real_tree()?;
+        let bin_arc = Self::find_bin_for_key(&tree, key)?;
+        let guard = bin_arc.read();
+        let TreeNode::Bottom(bin) = &*guard else {
+            return None;
+        };
+        if !bin.key_prefix.is_empty()
+            && !key.starts_with(bin.key_prefix.as_slice())
+        {
+            return None;
+        }
+        let (idx, found) = match tree.get_comparator() {
+            Some(cmp) => bin.find_entry_cmp(key, cmp.as_ref()),
+            None => bin.find_entry_compressed(key),
+        };
+        if !found || bin.entries[idx].known_deleted {
+            return None;
+        }
+        let lsn = bin.get_lsn(idx).as_u64();
+        let data = bin.entries[idx].data.clone().unwrap_or_default();
+        drop(guard);
+        Some((lsn, data, idx as i32, bin_arc))
     }
 
     /// Returns true if the slot the cursor is positioned on has been deleted
@@ -3768,7 +4246,7 @@ impl CursorImpl {
             self.current_key = Some(key);
             self.current_data = Some(data);
             self.current_lsn = lsn;
-            self.rehydrate_current_data();
+            self.rehydrate_current_data()?;
             self.current_index = idx;
             return Ok(OperationStatus::Success);
         }
@@ -3945,7 +4423,7 @@ impl CursorImpl {
             self.current_key = Some(raw_key);
             self.current_data = Some(raw_data);
             self.current_lsn = lsn;
-            self.rehydrate_current_data();
+            self.rehydrate_current_data()?;
             self.current_index = idx;
             // Install the already-pinned BIN: `into_arc()` disarms the guard
             // (the pin is NOT released here — it is handed off), and
@@ -4014,7 +4492,7 @@ impl CursorImpl {
         self.current_key = Some(raw_key);
         self.current_data = Some(raw_data);
         self.current_lsn = lsn;
-        self.rehydrate_current_data();
+        self.rehydrate_current_data()?;
         self.current_index = idx;
         self.update_bin_pin(bin_arc);
         Ok(())
@@ -4284,9 +4762,13 @@ impl CursorImpl {
                     .current_key
                     .clone()
                     .ok_or(DbiError::CursorNotInitialized)?;
-                let (old_data, old_lsn) =
-                    self.get_slot_before_image(&current_key);
-                self.lock_write_before_log(old_lsn, &current_key)?;
+                // SLOT-RELOCK (JE lockLN, CursorImpl.java:3641-3680): lock
+                // the slot's CURRENT LSN under the re-read loop so the undo
+                // before-image (old_lsn/old_exists -> abort_lsn/abort_known_
+                // deleted) reflects the LOCKED slot, closing the stale-grant
+                // TOCTOU that destroys a committed record on abort.
+                let (old_data, old_lsn, old_exists) =
+                    self.lock_slot_current_lsn(&current_key)?;
                 // NEW-REUSESLOT-1 [JE #15704]: capture the STORED slot key
                 // as the abort_key from the slot re-resolved BY KEY under
                 // the LN write lock (mirrors the delete path).  Under a
@@ -4296,19 +4778,31 @@ impl CursorImpl {
                 if let Some(stored) = self.stored_full_key(&current_key) {
                     current_key = stored;
                 }
-                let new_lsn = self.log_ln_write(
-                    &current_key,
-                    Some(data),
-                    self.locker_id,
-                    old_lsn,
-                )?;
+                let new_lsn = self
+                    .log_ln_write(
+                        &current_key,
+                        Some(data),
+                        self.locker_id,
+                        old_lsn,
+                    )
+                    .inspect_err(|_| {
+                        self.release_bare_write_locks(
+                            old_lsn,
+                            noxu_util::NULL_LSN,
+                        )
+                    })?;
                 self.finalize_write_lock(
                     old_lsn,
+                    old_exists,
                     new_lsn,
                     Some(current_key.clone()),
                     old_data,
-                )?;
+                )
+                .inspect_err(|_| {
+                    self.release_bare_write_locks(old_lsn, noxu_util::NULL_LSN)
+                })?;
                 self.apply_tree_insert(current_key, data.to_vec(), new_lsn);
+                self.release_bare_write_locks(old_lsn, new_lsn);
                 self.current_data = Some(Bytes::copy_from_slice(data));
                 self.current_lsn = new_lsn.as_u64();
                 Ok(OperationStatus::Success)
@@ -4322,13 +4816,28 @@ impl CursorImpl {
                 // a concurrent thread inserted between our
                 // `key_exists_in_view` check above and our
                 // `get_slot_before_image` call here.
-                let (old_data, old_lsn) = self.get_slot_before_image(key);
+                // SLOT-RELOCK (JE lockLN): lock the slot's CURRENT LSN
+                // atomically with the read via the re-read-under-lock loop.
+                // stress_nondup confirmed the TOCTOU here: a reader reads a
+                // stale KD del-LSN, waits, the writer aborts (restoring the
+                // committed record live at its original LSN) and grants the
+                // reader the STALE del-LSN; if the writer then re-deletes, the
+                // post-lock recheck sees KD and inserts with abort_known_
+                // deleted=true on the stale LSN -> abort tree.delete destroys
+                // the committed record. Re-reading under the lock makes
+                // old_lsn/old_exists the LOCKED current slot (JE prepareForUpdate).
+                let (old_data, old_lsn, old_exists) =
+                    self.lock_slot_current_lsn(key)?;
+                // SLOT-RELOCK: deterministic post-grant window (non-dup
+                // NoOverwrite). Fires AFTER the slot lock settled and BEFORE
+                // the existence recheck (nodup_dataloss_relock_test).
+                #[cfg(any(test, feature = "testing"))]
+                nodup_recheck_hook::after_slot_locked();
                 // T-F2: acquire RangeInsert on the successor key's LSN so
                 // concurrent SERIALIZABLE scanners that have already passed
                 // this key's position are blocked until we commit.  No-op
                 // for non-serializable txns or updates (old_lsn != NULL).
-                self.lock_range_insert(key, old_lsn)?;
-                self.lock_write_before_log(old_lsn, key)?;
+                self.lock_range_insert(key, old_exists)?;
                 // Re-check `key_exists_in_view` AFTER acquiring the
                 // synthetic-key / per-LSN write lock.  A concurrent
                 // inserter for the same brand-new key may have
@@ -4341,21 +4850,29 @@ impl CursorImpl {
                 // replacing an existing record.  Closes the first
                 // F12 residual end-to-end.
                 if self.key_exists_in_view(key) {
+                    self.release_bare_write_locks(old_lsn, noxu_util::NULL_LSN);
                     return Ok(OperationStatus::KeyExist);
                 }
-                let new_lsn = self.log_ln_write(
-                    key,
-                    Some(data),
-                    self.locker_id,
-                    old_lsn,
-                )?;
+                let new_lsn = self
+                    .log_ln_write(key, Some(data), self.locker_id, old_lsn)
+                    .inspect_err(|_| {
+                        self.release_bare_write_locks(
+                            old_lsn,
+                            noxu_util::NULL_LSN,
+                        )
+                    })?;
                 self.finalize_write_lock(
                     old_lsn,
+                    old_exists,
                     new_lsn,
                     Some(key.to_vec()),
                     old_data,
-                )?;
+                )
+                .inspect_err(|_| {
+                    self.release_bare_write_locks(old_lsn, noxu_util::NULL_LSN)
+                })?;
                 self.apply_tree_insert(key.to_vec(), data.to_vec(), new_lsn);
+                self.release_bare_write_locks(old_lsn, new_lsn);
                 self.current_key = Some(key.to_vec());
                 self.current_data = Some(Bytes::copy_from_slice(data));
                 self.current_lsn = new_lsn.as_u64();
@@ -4374,25 +4891,34 @@ impl CursorImpl {
                     .into(),
             )),
             PutMode::Overwrite => {
-                let (old_data, old_lsn) = self.get_slot_before_image(key);
+                // SLOT-RELOCK (JE lockLN): lock the slot's CURRENT LSN
+                // under the re-read-under-lock loop.
+                let (old_data, old_lsn, old_exists) =
+                    self.lock_slot_current_lsn(key)?;
                 // T-F2: acquire RangeInsert if this is a brand-new key
                 // (old_lsn == NULL_LSN).  For existing-key updates the
                 // Write lock on old_lsn already conflicts with RangeRead.
-                self.lock_range_insert(key, old_lsn)?;
-                self.lock_write_before_log(old_lsn, key)?;
-                let new_lsn = self.log_ln_write(
-                    key,
-                    Some(data),
-                    self.locker_id,
-                    old_lsn,
-                )?;
+                self.lock_range_insert(key, old_exists)?;
+                let new_lsn = self
+                    .log_ln_write(key, Some(data), self.locker_id, old_lsn)
+                    .inspect_err(|_| {
+                        self.release_bare_write_locks(
+                            old_lsn,
+                            noxu_util::NULL_LSN,
+                        )
+                    })?;
                 self.finalize_write_lock(
                     old_lsn,
+                    old_exists,
                     new_lsn,
                     Some(key.to_vec()),
                     old_data,
-                )?;
+                )
+                .inspect_err(|_| {
+                    self.release_bare_write_locks(old_lsn, noxu_util::NULL_LSN)
+                })?;
                 self.apply_tree_insert(key.to_vec(), data.to_vec(), new_lsn);
+                self.release_bare_write_locks(old_lsn, new_lsn);
                 self.current_key = Some(key.to_vec());
                 self.current_data = Some(Bytes::copy_from_slice(data));
                 self.current_lsn = new_lsn.as_u64();
@@ -4495,18 +5021,23 @@ impl CursorImpl {
                         ));
                     }
                 }
+                // Before-image for both LNs is the slot being replaced (the
+                // cursor is positioned on it); JE logs it as the abortLsn
+                // (44f832e8).
+                let (_, old_slot_lsn, _) =
+                    self.get_slot_before_image(&old_key)?;
                 let del_lsn = self.log_ln_write(
                     &old_key,
                     None,
                     self.locker_id,
-                    noxu_util::NULL_LSN.as_u64(),
+                    old_slot_lsn,
                 )?;
                 self.apply_tree_delete(old_key, del_lsn);
                 let new_lsn = self.log_ln_write(
                     &two_part_key,
                     Some(b""),
                     self.locker_id,
-                    noxu_util::NULL_LSN.as_u64(),
+                    old_slot_lsn,
                 )?;
                 self.apply_tree_insert(two_part_key.clone(), vec![], new_lsn);
                 self.current_key = Some(two_part_key);
@@ -4522,29 +5053,41 @@ impl CursorImpl {
                 // the (key, data) pair already exists, this is a no-op for
                 // the counter and the slot LSN moves; if the pair is new,
                 // the abort-undo deletes the slot.
-                let exists_old_lsn: u64 = {
-                    let db = self.db_impl.read();
-                    db.get_real_tree()
-                        .and_then(|tree| {
-                            Self::get_data_from_tree(&tree, &two_part_key)
-                        })
-                        .map(|(_, lsn)| lsn)
-                        .unwrap_or(noxu_util::NULL_LSN.as_u64())
-                };
-                self.lock_write_before_log(exists_old_lsn, &two_part_key)?;
-                let new_lsn = self.log_ln_write(
-                    &two_part_key,
-                    Some(b""),
-                    self.locker_id,
-                    exists_old_lsn,
-                )?;
+                // A known-deleted slot is reused: its LSN is the abort LSN and
+                // abortKD is set (JE prepareForUpdate, CursorImpl.java:3318).
+                // SLOT-RELOCK: lock the slot's CURRENT LSN under the
+                // re-read loop (JE lockLN) so exists_old_lsn/old_exists are the
+                // LOCKED before-image, not a value captured before the lock.
+                let (_, exists_old_lsn, old_exists) =
+                    self.lock_slot_current_lsn(&two_part_key)?;
+                let new_lsn = self
+                    .log_ln_write(
+                        &two_part_key,
+                        Some(b""),
+                        self.locker_id,
+                        exists_old_lsn,
+                    )
+                    .inspect_err(|_| {
+                        self.release_bare_write_locks(
+                            exists_old_lsn,
+                            noxu_util::NULL_LSN,
+                        )
+                    })?;
                 self.finalize_write_lock(
                     exists_old_lsn,
+                    old_exists,
                     new_lsn,
                     Some(two_part_key.clone()),
                     None,
-                )?;
+                )
+                .inspect_err(|_| {
+                    self.release_bare_write_locks(
+                        exists_old_lsn,
+                        noxu_util::NULL_LSN,
+                    )
+                })?;
                 self.apply_tree_insert(two_part_key.clone(), vec![], new_lsn);
+                self.release_bare_write_locks(exists_old_lsn, new_lsn);
                 self.current_key = Some(two_part_key);
                 self.current_data = None;
                 self.current_lsn = new_lsn.as_u64();
@@ -4608,32 +5151,108 @@ impl CursorImpl {
         // v1.6 (Wave 2A): register the insert with the cursor's txn /
         // lock manager so abort-undo can roll back the new dup.
         // old_lsn is NULL_LSN: the existence check confirmed the pair is absent.
-        let old_lsn = noxu_util::NULL_LSN.as_u64();
-        // BUG-PHANTOM-3 (inserter side): a brand-new dup (two-part key) must
+        // A known-deleted slot for the pair is reused with its LSN as the
+        // abort LSN (JE insertRecordInternal slot reuse, CursorImpl.java:1373
+        // -> prepareForUpdate); otherwise this is NULL_LSN.
+        // WAVE4 NODUP FIX: deterministic hook window. A test may fire a
+        // concurrent writer's delete->abort here, exactly between the
+        // existence check above and the slot read below, to force the
+        // check-then-act race every run (see nodup_recheck_hook).
+        #[cfg(any(test, feature = "testing"))]
+        nodup_recheck_hook::before_common_insert();
+
+        // SLOT-RELOCK FIX (JE CursorImpl.lockLN, CursorImpl.java:3641-3680):
+        // take the WRITE lock on the slot's CURRENT LSN atomically with the
+        // read via a re-read-under-lock loop, so the before-image
+        // (`old_lsn`/`old_exists`) reflects the LOCKED slot -- not a value
+        // captured before the lock that a concurrent writer's abort+re-delete
+        // could have invalidated (the committed-data-loss TOCTOU: a stale
+        // `old_lsn` + `abort_known_deleted` whose abort `tree.delete`s a shared
+        // committed slot).  Replaces the former non-atomic
+        // `get_slot_before_image` + `lock_write_before_log` pair.
+        let (_, old_lsn, old_exists) =
+            self.lock_slot_current_lsn(&two_part_key)?;
+
+        // SLOT-RELOCK: deterministic post-lock window. A test may fire a
+        // concurrent writer's lock+re-delete here, AFTER this reader took the
+        // WRITE lock on the slot's current LSN and BEFORE the existence
+        // recheck, to drive the committed-data-loss schedule (see
+        // nodup_recheck_hook::after_slot_locked / nodup_dataloss_relock_test.rs).
+        // With the re-read-under-lock loop above the lock already covers the
+        // current slot, so this window can no longer leave the reader on a
+        // stale LSN.
+        #[cfg(any(test, feature = "testing"))]
+        nodup_recheck_hook::after_slot_locked();
+
+        // WAVE4 NODUP FIX (check-then-act): the existence check above and this
+        // insert are NOT atomic -- a concurrent writer txn can hold the slot
+        // known-deleted (uncommitted) when the check runs and then ABORT,
+        // restoring the committed (key, data) pair live, before we reach here.
+        // Without a recheck the common path inserts a SPURIOUS duplicate over
+        // a committed-present record (the stress_dup composition blocker: a
+        // wrong Success return where the API contract is KeyExist). JE
+        // `insertRecordInternal` takes the WRITE lock THEN re-examines the slot
+        // under that lock before deciding insert vs. KEYEXIST
+        // (CursorImpl.java:1364-1391, 3565-3570). We now hold the WRITE lock on
+        // the slot LSN (`lock_write_before_log`), so any concurrent writer's
+        // commit/abort has already resolved and the tree reflects the final
+        // committed-or-locked state; re-read existence under that lock. If the
+        // relevant record is now live, release the just-acquired BARE lock (no
+        // persistent lock is retained on the KeyExist outcome) and report
+        // KEYEXIST. NoDupData keys on the exact (key, data) pair; NoOverwrite
+        // keys on any live (key, *) dup.
+        let now_present = match put_mode {
+            PutMode::NoDupData => self.key_exists_in_view(&two_part_key),
+            PutMode::NoOverwrite => {
+                let db = self.db_impl.read();
+                db.get_real_tree()
+                    .and_then(|tree| {
+                        let lb = dup_key_data::lower_bound(key);
+                        tree.first_entry_at_or_after_with_index(&lb)
+                    })
+                    .filter(|(fk, _, _, _, _)| {
+                        dup_key_data::matches_key(fk, key)
+                    })
+                    .is_some()
+            }
+            // Current/Overwrite return early above; never reach here.
+            _ => false,
+        };
+        if now_present {
+            self.release_bare_write_locks(old_lsn, noxu_util::NULL_LSN);
+            return Ok(OperationStatus::KeyExist);
+        }
+
+        // BUG-PHANTOM-3 (D, inserter side): a brand-new dup (two-part key) must
         // next-key-lock its successor so a concurrent SERIALIZABLE scanner that
         // range-locked the dup set / next key (RANGE_READ) blocks or restarts
         // this insert.  Mirror of the non-dup NoOverwrite/NoDupData path
-        // (lock_range_insert(key, old_lsn)): the dup variant keys on the
-        // full TWO-PART key so the successor is the next two-part slot (the
-        // next dup of this key, the first dup of the next key, or the EOF
-        // sentinel).  Skipped for updates (old_lsn != NULL) and auto-commit.
-        self.lock_range_insert(&two_part_key, old_lsn)?;
-        self.lock_write_before_log(old_lsn, &two_part_key)?;
-        let new_lsn = self.log_ln_write(
-            &two_part_key,
-            Some(b""),
-            self.locker_id,
-            old_lsn,
-        )?;
+        // (lock_range_insert(key, old_exists)): the dup variant keys on the full
+        // TWO-PART key so the successor is the next two-part slot.  Taken AFTER
+        // the C2 slot-relock + KeyExist recheck (so we lock the successor only
+        // on the real-insert path), BEFORE logging.  Skipped for updates
+        // (old_lsn != NULL) and auto-commit inside lock_range_insert.
+        self.lock_range_insert(&two_part_key, old_exists)?;
+        let new_lsn = self
+            .log_ln_write(&two_part_key, Some(b""), self.locker_id, old_lsn)
+            .inspect_err(|_| {
+                self.release_bare_write_locks(old_lsn, noxu_util::NULL_LSN)
+            })?;
+
         self.finalize_write_lock(
             old_lsn,
+            old_exists,
             new_lsn,
             Some(two_part_key.clone()),
             None,
-        )?;
+        )
+        .inspect_err(|_| {
+            self.release_bare_write_locks(old_lsn, noxu_util::NULL_LSN)
+        })?;
         // Use apply_tree_insert so the per-database entry counter is bumped
         // on a new (key, data) pair — `Database::count()` reads this counter.
         self.apply_tree_insert(two_part_key.clone(), vec![], new_lsn);
+        self.release_bare_write_locks(old_lsn, new_lsn);
         self.current_key = Some(two_part_key);
         self.current_data = None;
         self.current_lsn = new_lsn.as_u64();
@@ -4689,7 +5308,7 @@ impl CursorImpl {
             None => false,
         };
         let curr_embedded_ln = if old_lsn != noxu_util::NULL_LSN.as_u64() {
-            let (prior_data, _) = self.get_slot_before_image(key);
+            let (prior_data, _, _) = self.get_slot_before_image(key)?;
             match prior_data {
                 Some(pd) => self.db_impl.read().should_embed_ln(pd.len()),
                 None => false,
@@ -4698,15 +5317,28 @@ impl CursorImpl {
             false
         };
 
+        // JE LN.logInternal (LN.java:645): a transactional LN logs the
+        // WriteLockInfo abortLsn -- the slot LSN before the txn FIRST write
+        // to the record (CursorImpl.LockStanding.prepareForUpdate,
+        // CursorImpl.java:3343), kept across later writes by the same txn.
+        // `old_lsn` is the slot LSN now; if this txn already logged the
+        // record, its recorded abort LSN wins.  Never `self.current_lsn`:
+        // that is the cursor previous position (possibly another key), and
+        // recovery undo would revert/delete to the wrong version.
+        let abort_lsn = self
+            .txn_ref
+            .as_ref()
+            .and_then(|t| t.lock().ok()?.recorded_abort_lsn(old_lsn))
+            .unwrap_or(old_lsn);
         let entry = LnLogEntry::new(
             db_id,
             txn_id_opt,
-            Lsn::from_u64(self.current_lsn), // abort_lsn: before-image LSN (current slot LSN before this write)
-            false,                           // abort_known_deleted
-            None,                            // abort_key
-            None,                            // abort_data
-            NULL_VLSN,                       // abort_vlsn
-            0,                               // abort_expiration
+            Lsn::from_u64(abort_lsn),
+            false,           // abort_known_deleted
+            None,            // abort_key
+            None,            // abort_data
+            NULL_VLSN,       // abort_vlsn
+            0,               // abort_expiration
             new_embedded_ln, // embedded_ln (1A: true iff embedded)
             key.to_vec(),
             data.map(|d| d.to_vec()),
@@ -4863,7 +5495,8 @@ impl CursorImpl {
         // stored in the tree.  For non-dup databases it is the plain key.
         // In both cases current_key is the correct tree-delete key.
         if let Some(mut tree_key) = self.current_key.clone() {
-            let (old_data, old_lsn) = self.get_slot_before_image(&tree_key);
+            let (old_data, old_lsn, _) =
+                self.get_slot_before_image(&tree_key)?;
             self.lock_write_before_log(old_lsn, &tree_key)?;
             // NEW-DEL-RACE-1: revalidate-after-lock (JE
             // `CursorImpl.deleteCurrentRecord`'s post-`lockLN`
@@ -4902,12 +5535,14 @@ impl CursorImpl {
             //     so an LSN==NULL test here would wrongly reject every such
             //     delete — see `test_delete_removes_from_tree`.)
             let record_gone = if old_lsn != noxu_util::NULL_LSN.as_u64() {
-                let (_, current_lsn) = self.get_slot_before_image(&tree_key);
+                let (_, current_lsn, _) =
+                    self.get_slot_before_image(&tree_key)?;
                 current_lsn != old_lsn
             } else {
                 !self.key_exists_in_view(&tree_key)
             };
             if record_gone {
+                self.release_bare_write_locks(old_lsn, noxu_util::NULL_LSN);
                 return Ok(OperationStatus::KeyEmpty);
             }
             // NEW-REUSESLOT-1 [JE #15704]: capture the STORED slot key as
@@ -4930,15 +5565,23 @@ impl CursorImpl {
             // BIN post-physical-removal can detect contention via
             // `contest_synthetic_key_for_missing_read`.
             self.lock_synthetic_key_for_delete(&tree_key)?;
-            let del_lsn =
-                self.log_ln_write(&tree_key, None, self.locker_id, old_lsn)?;
+            let del_lsn = self
+                .log_ln_write(&tree_key, None, self.locker_id, old_lsn)
+                .inspect_err(|_| {
+                    self.release_bare_write_locks(old_lsn, noxu_util::NULL_LSN)
+                })?;
             self.finalize_write_lock(
                 old_lsn,
+                old_lsn != noxu_util::NULL_LSN.as_u64(),
                 del_lsn,
                 Some(tree_key.clone()),
                 old_data,
-            )?;
+            )
+            .inspect_err(|_| {
+                self.release_bare_write_locks(old_lsn, noxu_util::NULL_LSN)
+            })?;
             self.apply_tree_delete(tree_key, del_lsn);
+            self.release_bare_write_locks(old_lsn, del_lsn);
         }
 
         // JE CursorImpl.deleteCurrentRecord(): keep cursor positioned at the
@@ -4980,6 +5623,8 @@ impl CursorImpl {
     /// * `CursorNotInitialized` if cursor is not positioned
     /// * `CursorClosed` if cursor has been closed
     pub fn count(&self) -> Result<i64, DbiError> {
+        // JE Cursor.count -> checkOpenAndState(true) (Cursor.java:2136-2138).
+        self.check_env()?;
         // JE Cursor.countHandleDups / countNoDups count the dup set for the
         // CURRENT KEY regardless of whether the current record is deleted:
         // deleteCurrentRecord only PD-flags the slot, so getCurrentKey() still
@@ -5205,6 +5850,63 @@ impl Drop for CursorImpl {
     fn drop(&mut self) {
         if self.state != CursorState::Closed {
             let _ = self.close();
+        }
+    }
+}
+
+/// WAVE4 NODUP FIX — deterministic race hook (TEST ONLY).
+///
+/// `put_dup`'s common insert path can race a concurrent writer txn whose
+/// uncommitted delete->abort restores a committed `(key, data)` pair live in
+/// the window between the NoDupData/NoOverwrite existence check and the
+/// insert. The stress reproduction hits this probabilistically; this hook
+/// makes it deterministic. A test installs a one-shot closure that is invoked
+/// exactly at that window (`before_common_insert`), typically running the
+/// writer's delete->abort there, so every run exercises the exact
+/// interleaving. Mirrors the tree's `range_seek_emptied_bin::after_pin`
+/// pattern. Compiled only under `#[cfg(any(test, feature = "testing"))]`; the
+/// production call site is identically gated, so release builds contain
+/// neither the hook nor the call.
+#[cfg(any(test, feature = "testing"))]
+pub mod nodup_recheck_hook {
+    use std::cell::RefCell;
+    thread_local! {
+        static BEFORE_COMMON_INSERT: RefCell<Option<Box<dyn FnOnce()>>> =
+            const { RefCell::new(None) };
+        static AFTER_SLOT_LOCKED: RefCell<Option<Box<dyn FnOnce()>>> =
+            const { RefCell::new(None) };
+    }
+    /// Install a one-shot closure to run at the common-insert race window.
+    pub fn arm(hook: Box<dyn FnOnce()>) {
+        BEFORE_COMMON_INSERT.with(|h| *h.borrow_mut() = Some(hook));
+    }
+    /// Install a one-shot closure to run at the post-lock window: AFTER the
+    /// common insert path has taken the WRITE lock on the (possibly stale)
+    /// slot LSN and BEFORE it re-examines existence. A test drives the
+    /// slot-relock data-loss schedule here (a concurrent writer re-deletes
+    /// under a fresh LSN while this reader holds a lock on the prior,
+    /// now-stale LSN) so the loss is deterministic. See
+    /// `nodup_dataloss_relock_test.rs`.
+    pub fn arm_after_slot_locked(hook: Box<dyn FnOnce()>) {
+        AFTER_SLOT_LOCKED.with(|h| *h.borrow_mut() = Some(hook));
+    }
+    /// Clear any armed closure (idempotent).
+    pub fn clear() {
+        BEFORE_COMMON_INSERT.with(|h| *h.borrow_mut() = None);
+        AFTER_SLOT_LOCKED.with(|h| *h.borrow_mut() = None);
+    }
+    /// Fired by `put_dup` just before the common insert path's slot read.
+    pub(crate) fn before_common_insert() {
+        if let Some(hook) = BEFORE_COMMON_INSERT.with(|h| h.borrow_mut().take())
+        {
+            hook();
+        }
+    }
+    /// Fired by `put_dup` just after the common insert path takes the slot
+    /// WRITE lock and before it re-examines existence (`now_present`).
+    pub(crate) fn after_slot_locked() {
+        if let Some(hook) = AFTER_SLOT_LOCKED.with(|h| h.borrow_mut().take()) {
+            hook();
         }
     }
 }

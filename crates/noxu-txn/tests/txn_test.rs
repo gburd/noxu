@@ -481,10 +481,15 @@ fn move_write_lock_migrates_lock_to_new_lsn() {
     let mut txn = noxu_txn::Txn::new(1, lm);
     txn.lock(50, LockType::Write, false).unwrap();
     txn.move_write_lock_to_new_lsn(50, 99).unwrap();
-    // Old lsn should no longer be locked; new lsn should be.
+    // JE: a Txn keeps its old-LSN lock after an LSN change until commit or
+    // abort (Locker.allowReleaseLockAfterLsnChange false, Locker.java:775;
+    // only HandleLocker releases, HandleLocker.java:117-120; Txn releases at
+    // commit, Txn.java:795/867-875).
     assert!(lm2.is_owned_write_lock(99, 1), "new lsn should be write-locked");
-    assert!(!lm2.is_owned_write_lock(50, 1), "old lsn should be released");
+    assert!(lm2.is_owned_write_lock(50, 1), "old lsn retained until commit");
     txn.commit().unwrap();
+    assert!(!lm2.is_owned_write_lock(50, 1), "commit releases old lsn");
+    assert!(!lm2.is_owned_write_lock(99, 1), "commit releases new lsn");
 }
 
 #[test]

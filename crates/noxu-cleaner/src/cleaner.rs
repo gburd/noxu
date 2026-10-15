@@ -56,6 +56,7 @@ struct ProcessPendingCtx {
         Arc<std::sync::Mutex<HashMap<i64, Arc<RwLock<noxu_tree::Tree>>>>>,
     stats: Arc<CleanerStats>,
     shutdown: Arc<AtomicBool>,
+    env_invalid: Arc<AtomicBool>,
 }
 
 impl ProcessPendingCtx {
@@ -80,7 +81,8 @@ impl ProcessPendingCtx {
             .with_extra_trees(
                 self.extra_trees.lock().map(|g| g.clone()).unwrap_or_default(),
             )
-        };
+        }
+        .with_env_invalid(Arc::clone(&self.env_invalid));
 
         let processor = FileProcessor::new(
             Arc::clone(&self.stats),
@@ -88,7 +90,11 @@ impl ProcessPendingCtx {
         );
 
         for (log_lsn, ln_info) in pending {
-            if self.shutdown.load(Ordering::Relaxed) {
+            // JE Cleaner.processPending stops once the env is invalid
+            // (Cleaner.java:1250-1252).
+            if self.shutdown.load(Ordering::Relaxed)
+                || self.env_invalid.load(Ordering::Acquire)
+            {
                 break;
             }
             let bin_result = tree_lookup.lookup_parent_bin(
@@ -344,6 +350,11 @@ pub struct Cleaner {
     ///
     /// JE: `EnvironmentImpl.getUtilizationTracker()` (env wiring).
     utilization_tracker: Option<Arc<Mutex<UtilizationTracker>>>,
+
+    /// D1 / F-3: the environment's invalidation flag (a private flag until
+    /// `with_env_invalid` wires the env's).  Set by an env-invalidating LN
+    /// fetch failure; once set the cleaner neither cleans nor deletes files.
+    env_invalid: Arc<AtomicBool>,
 }
 
 /// Result of a cleaning operation.
@@ -401,6 +412,7 @@ impl Cleaner {
                 Mutex::new(UtilizationProfile::new()),
             ),
             utilization_tracker: None,
+            env_invalid: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -447,6 +459,7 @@ impl Cleaner {
                 Mutex::new(UtilizationProfile::new()),
             ),
             utilization_tracker: None,
+            env_invalid: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -503,6 +516,7 @@ impl Cleaner {
                 Mutex::new(UtilizationProfile::new()),
             ),
             utilization_tracker: None,
+            env_invalid: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -554,6 +568,7 @@ impl Cleaner {
                 Mutex::new(UtilizationProfile::new()),
             ),
             utilization_tracker: None,
+            env_invalid: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -604,6 +619,26 @@ impl Cleaner {
     pub fn with_min_file_utilization(mut self, pct: u32) -> Self {
         self.min_file_utilization = pct.min(50);
         self
+    }
+
+    /// Wires the environment's invalidation flag (D1 / F-3).
+    pub fn with_env_invalid(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.env_invalid = flag;
+        self
+    }
+
+    /// `true` once the wired environment has been invalidated.
+    pub fn is_env_invalid(&self) -> bool {
+        self.env_invalid.load(Ordering::Acquire)
+    }
+
+    fn check_env_valid(&self) -> Result<(), String> {
+        if self.is_env_invalid() {
+            return Err(
+                "cleaner: environment is invalid; cleaning stopped".to_string()
+            );
+        }
+        Ok(())
     }
 
     pub fn with_txn_manager(mut self, txn_manager: Arc<TxnManager>) -> Self {
@@ -852,6 +887,9 @@ impl Cleaner {
         if self.shutdown.load(Ordering::Relaxed) {
             return Err("Cleaner is shut down".to_string());
         }
+        // D1 / F-3: fail loudly on an invalid env (JE manageDiskUsage ->
+        // checkIfInvalid, Cleaner.java:758-759).
+        self.check_env_valid()?;
 
         // Increment run counter
         self.n_runs.fetch_add(1, Ordering::Relaxed);
@@ -1022,6 +1060,20 @@ impl Cleaner {
             // Unprotect after processing.
             self.file_protector.unprotect_file(file_number);
 
+            // D1 / F-3: an LN fetch failure invalidated the env: stop, keep
+            // the file (JE FileProcessor.doClean finally ->
+            // putBackFileForCleaning, FileProcessor.java:590-593).
+            if self.env_invalid.load(Ordering::Acquire) {
+                self.file_selector
+                    .lock()
+                    .put_back_file_for_cleaning(file_number);
+                fatal_error = Some(format!(
+                    "cleaner: environment invalidated while cleaning file \
+                     {file_number:#x}; cleaning stopped"
+                ));
+                break;
+            }
+
             match result {
                 Err(e @ FileCleaningError::Unsupported { .. }) => {
                     log::warn!("{e}");
@@ -1076,6 +1128,9 @@ impl Cleaner {
         if let Some(error) = fatal_error {
             return Err(error);
         }
+        // D1 / F-3: process_pending may have invalidated the env (a pending
+        // LN fetch failed): report it, delete nothing.
+        self.check_env_valid()?;
 
         // X-5: only delete files that have passed the two-checkpoint barrier.
         let files_deleted = self.delete_safe_files();
@@ -1341,6 +1396,7 @@ impl Cleaner {
                     extra_trees: Arc::clone(&self.extra_trees),
                     stats: Arc::clone(&self.stats),
                     shutdown: Arc::clone(&self.shutdown),
+                    env_invalid: Arc::clone(&self.env_invalid),
                 });
                 Some(Arc::new(move || ctx.call()))
             } else {
@@ -1407,7 +1463,8 @@ impl Cleaner {
                             .map(|g| g.clone())
                             .unwrap_or_default(),
                     )
-            };
+            }
+            .with_env_invalid(Arc::clone(&self.env_invalid));
             return processor
                 .process_file(
                     file_number,
@@ -1668,6 +1725,10 @@ impl Cleaner {
     ///
     /// Returns the number of files successfully deleted.
     fn delete_pending_files(&self) -> u32 {
+        // D1 / F-3: never delete on an invalid env (Cleaner.java:758-759).
+        if self.env_invalid.load(Ordering::Acquire) {
+            return 0;
+        }
         let mut pending = self.pending_deletions.lock();
         let mut deleted = 0u32;
 
@@ -1803,6 +1864,7 @@ impl Cleaner {
                 extra_trees: Arc::clone(&self.extra_trees),
                 stats: Arc::clone(&self.stats),
                 shutdown: Arc::clone(&self.shutdown),
+                env_invalid: Arc::clone(&self.env_invalid),
             };
             ctx.call();
         }
@@ -1816,6 +1878,10 @@ impl Cleaner {
     /// a checkpoint.  Now only files returned by
     /// `FileSelector::get_safe_to_delete()` are eligible.
     pub fn delete_safe_files(&self) -> u32 {
+        // D1 / F-3: never delete on an invalid env (Cleaner.java:758-759).
+        if self.env_invalid.load(Ordering::Acquire) {
+            return 0;
+        }
         let files_to_delete = {
             let mut selector = self.file_selector.lock();
             let to_delete = selector.get_safe_to_delete();

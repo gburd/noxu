@@ -1856,6 +1856,9 @@ impl Environment {
     pub fn is_valid(&self) -> bool {
         self.open.load(Ordering::Acquire)
             && self.env_valid.load(Ordering::Acquire)
+            // D1: a cursor-detected LN fetch failure sets the shared
+            // EnvironmentImpl invalid flag; surface it on the public handle.
+            && self.env_impl.lock().is_valid()
             // A-prime public fail-stop: a critical WAL write/drain/rotation/
             // sync failure poisons the shared LogManager `io_invalid` flag.
             // Surface it here so `Environment::is_valid` reports fail-stop for
@@ -3864,3 +3867,11 @@ mod tests {
         env.close().unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "cleaner_fetch_failclosed_probe.rs"]
+mod cleaner_fetch_failclosed_probe;
+
+#[cfg(test)]
+#[path = "writer_oldlsn_probe.rs"]
+mod writer_oldlsn_probe;

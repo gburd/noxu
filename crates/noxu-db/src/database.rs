@@ -178,6 +178,16 @@ pub enum DbState {
     Invalid,
 }
 
+/// D1: an LN fetch / env failure under a read keeps its typed JE reason;
+/// other cursor errors keep the historical `OperationNotAllowed` mapping.
+fn map_read_err(e: noxu_dbi::DbiError) -> NoxuError {
+    match e {
+        noxu_dbi::DbiError::LnFetchFailure { .. }
+        | noxu_dbi::DbiError::EnvironmentFailure { .. } => NoxuError::from(e),
+        e => NoxuError::OperationNotAllowed(e.to_string()),
+    }
+}
+
 impl Database {
     /// Creates a CursorImpl, wired to the WAL and lock manager when the
     /// environment has them.
@@ -660,12 +670,10 @@ impl Database {
         };
         match cursor
             .search(key_bytes, None, SearchMode::Set)
-            .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
+            .map_err(map_read_err)?
         {
             noxu_dbi::OperationStatus::Success => {
-                let (_, value) = cursor.get_current().map_err(|e| {
-                    NoxuError::OperationNotAllowed(e.to_string())
-                })?;
+                let (_, value) = cursor.get_current().map_err(map_read_err)?;
                 self.throughput.n_pri_searches.fetch_add(1, Ordering::Relaxed);
                 observe_timer_record!(_obs_timer, "noxu_db_operation_duration_seconds", "op" => "get");
                 Ok(Some(value))
@@ -708,12 +716,10 @@ impl Database {
         };
         match cursor
             .search(key_bytes, None, SearchMode::Set)
-            .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
+            .map_err(map_read_err)?
         {
             noxu_dbi::OperationStatus::Success => {
-                let (_, value) = cursor.get_current().map_err(|e| {
-                    NoxuError::OperationNotAllowed(e.to_string())
-                })?;
+                let (_, value) = cursor.get_current().map_err(map_read_err)?;
                 // Partial get: return only the requested slice.
                 if data.is_partial() {
                     let off = data.partial_offset();
@@ -786,19 +792,17 @@ impl Database {
 
         match cursor
             .search(key_bytes, None, SearchMode::Set)
-            .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
+            .map_err(map_read_err)?
         {
             noxu_dbi::OperationStatus::Success => {
-                let (_, value) = cursor.get_current().map_err(|e| {
-                    NoxuError::OperationNotAllowed(e.to_string())
-                })?;
+                let (_, value) = cursor.get_current().map_err(map_read_err)?;
                 // JE LockMode.RMW (Cursor.java:5281): an RMW read takes a WRITE
                 // lock on the record so a later update in the same txn cannot
                 // deadlock and a concurrent writer blocks at read time.
                 if matches!(opts.lock_mode, LockMode::Rmw) {
-                    cursor.upgrade_current_to_write_lock().map_err(|e| {
-                        NoxuError::OperationNotAllowed(e.to_string())
-                    })?;
+                    cursor
+                        .upgrade_current_to_write_lock()
+                        .map_err(map_read_err)?;
                 }
                 self.throughput.n_pri_searches.fetch_add(1, Ordering::Relaxed);
                 observe_timer_record!(
@@ -1496,7 +1500,13 @@ impl Database {
             ))
         };
 
-        Ok(Cursor::from_impl_with_maint(cursor_impl, read_only, txn, sec_maint))
+        Ok(Cursor::from_impl_with_maint(
+            cursor_impl,
+            read_only,
+            txn,
+            sec_maint,
+            Arc::clone(&self.open),
+        ))
     }
 
     /// Returns a lazy forward iterator over all records in the database.

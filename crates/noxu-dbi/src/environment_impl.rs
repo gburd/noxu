@@ -1349,6 +1349,8 @@ impl EnvironmentImpl {
 
         // Cleaner initialization.
         // constructor (called after RecoveryManager.recover()).
+        // D1 / F-3: the env invalidation flag is shared with the cleaner.
+        let is_invalid = Arc::new(AtomicBool::new(false));
         let cleaner = log_manager.as_ref().map(|lm| {
             let fm = Arc::clone(lm.file_manager());
             // Pass the environment's shared LockManager so that cleaner-held
@@ -1357,7 +1359,9 @@ impl EnvironmentImpl {
             let mut c = Cleaner::with_file_manager_tree_and_lock_manager(
                 cfg.cleaner_min_utilization as u32,
                 cfg.cleaner_min_file_count,
-                cfg.cleaner_min_age as u64,
+                // JE CLEANER_MIN_AGE min is 1 (EnvironmentParams.java:1366):
+                // minAge 0 would make the file being written cleanable.
+                cfg.cleaner_min_age.max(1) as u64,
                 fm,
                 Arc::clone(&primary_tree),
                 Arc::clone(lm),
@@ -1365,7 +1369,9 @@ impl EnvironmentImpl {
             )
             // X-7: wire the shared db-tree registry so the cleaner
             // dispatches secondary-LN liveness checks to the correct tree.
-            .with_tree_registry(Arc::clone(&db_trees_registry));
+            .with_tree_registry(Arc::clone(&db_trees_registry))
+            // D1 / F-3: share the env invalidation flag with the cleaner.
+            .with_env_invalid(Arc::clone(&is_invalid));
             // CLN-F1: wire the minFileUtilization second-tier threshold so the
             // faithful getBestFile decision can clean a single below-threshold
             // file even when the aggregate gate passes.
@@ -1797,6 +1803,10 @@ impl EnvironmentImpl {
                             dispatcher_for_cleaner
                                 .dispatch("Cleaner", &e.to_string());
                         }
+                        // D1 / F-3: an invalid env stops the cleaner daemon.
+                        if c.is_env_invalid() {
+                            break;
+                        }
                         // JE: Cleaner.manageDiskUsage refreshes the cached disk
                         // usage stats after each pass so writes blocked by a
                         // disk-limit violation resume as soon as space frees.
@@ -1870,7 +1880,7 @@ impl EnvironmentImpl {
             evicted_db_state: Arc::new(RwLock::new(HashMap::new())),
             pending_names: RwLock::new(hashbrown::HashMap::new()),
             open_reconstruct_lock: Mutex::new(()),
-            is_invalid: Arc::new(AtomicBool::new(false)),
+            is_invalid,
             invalid_reason: RwLock::new(None),
             creation_time_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -4206,9 +4216,18 @@ impl EnvironmentImpl {
         }
 
         // Flush and fsync the WAL so no buffered data is lost on close.
+        // Then close the FileManager (JE `EnvironmentImpl.close()`, after
+        // `shutdownDaemons()` has joined every daemon: `logManager.flushSync()`
+        // :1919 -> `fileManager.clear()` :1927 -> `fileManager.close()` :1933,
+        // EnvironmentImpl.java).  All daemon threads are joined above, so none
+        // can call into the FileManager after this point.  Closing the
+        // FileManager marks it closed and clears the handle cache so any read
+        // through a cursor retained past `Environment::close` fails rather than
+        // reopening the file and handing back stale data (RO env-lock R1).
         if let Some(lm) = &self.log_manager {
             // Best-effort: ignore flush errors on close (env is shutting down).
             let _ = lm.flush_sync();
+            let _ = lm.file_manager().close();
         }
 
         // Shut down the extended-fork background services.

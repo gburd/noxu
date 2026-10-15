@@ -158,17 +158,18 @@ impl CursorSecMaint {
 #[inline]
 fn map_cursor_err(e: DbiError) -> NoxuError {
     match e {
-        // BUG-PHANTOM-1/3: a no-wait serializable inserter that is blocked by a
-        // scanner's RANGE_READ (or any record-lock conflict / range restart)
-        // must surface the TYPED lock error, not a stringy `OperationFailed`,
-        // so callers can `matches!(.., NoxuError::LockNotAvailable)` and retry
-        // (JE throws the typed `LockConflictException` subclass).  Route txn /
-        // lock-conflict errors through the `From<DbiError>` mapping
-        // (error.rs:825-878), which yields `NoxuError::LockNotAvailable` /
-        // `LockTimeout` / `LockConflict` etc.  Mirrors parity/integrate
-        // `map_cursor_err` (ef07ef0e) minus the integrate-only `LnFetchFailure`
-        // variant, which does not exist at v7.11.0.
+        // BUG-PHANTOM-1/3 (D): a no-wait serializable inserter blocked by a
+        // scanner RANGE_READ (or any record-lock conflict / range restart)
+        // must surface the TYPED lock error, not a stringy OperationFailed,
+        // so callers can matches!(.., NoxuError::LockNotAvailable) and retry
+        // (JE throws the typed LockConflictException subclass).
+        // D1 / A6 (C2): an LN-fetch / env failure under a read keeps its typed
+        // JE reason instead of being flattened into OperationFailed.
+        // A11 Get::Current (C2): a lock timeout / conflict from the re-read
+        // (relock_and_reread_current -> lock_ln) surfaces as typed
+        // NoxuError::LockTimeout / LockConflict (is_retryable).
         DbiError::EnvironmentFailure { .. }
+        | DbiError::LnFetchFailure { .. }
         | DbiError::TxnError(_)
         | DbiError::LockConflict(_) => NoxuError::from(e),
         // NEW-DBI-DUPPUTCUR: surface a rejected putCurrent (moving a dup to
@@ -248,6 +249,13 @@ pub struct Cursor<'txn> {
     /// put/delete fans out to every registered secondary through this
     /// (NEW-CURSOR-SEC-MAINT; JE `Cursor.putInternal`/`deleteInternal`).
     sec_maint: Option<CursorSecMaint>,
+    /// The owning `Database`'s shared open flag (`None` only for cursors
+    /// built directly in unit tests).  JE `Cursor.checkOpen` ->
+    /// `dbHandle.checkOpen()` (Cursor.java:5390-5395, Database.java:2367):
+    /// every operation on a cursor whose database (or, since
+    /// `Environment::close` requires every database closed first, whose
+    /// environment) was closed must fail (RO env-lock R1).
+    db_open: Option<Arc<AtomicBool>>,
 }
 
 impl<'txn> Cursor<'txn> {
@@ -265,6 +273,7 @@ impl<'txn> Cursor<'txn> {
             read_only,
             txn: None,
             sec_maint: None,
+            db_open: None,
         }
     }
 
@@ -278,6 +287,7 @@ impl<'txn> Cursor<'txn> {
         read_only: bool,
         txn: Option<&'txn Transaction>,
         sec_maint: Option<CursorSecMaint>,
+        db_open: Arc<AtomicBool>,
     ) -> Self {
         Self {
             inner,
@@ -285,6 +295,7 @@ impl<'txn> Cursor<'txn> {
             read_only,
             txn,
             sec_maint,
+            db_open: Some(db_open),
         }
     }
 
@@ -489,9 +500,26 @@ impl<'txn> Cursor<'txn> {
                 // : re-check for deletion — Cursor.getCurrentLN() returns
                 // KEYEMPTY when the record at the cursor position was deleted
                 // after the cursor was positioned.
+                // F5: wait for an uncommitted deleter first (JE locks a
+                // slot that is not known-deleted, CursorImpl.java:2062-2081);
+                // if it aborted the record is back.
                 if self.inner.is_current_slot_deleted() {
-                    return Ok(OperationStatus::NotFound);
+                    self.inner
+                        .lock_current_deleted_slot()
+                        .map_err(map_cursor_err)?;
+                    if self.inner.is_current_slot_deleted() {
+                        return Ok(OperationStatus::NotFound);
+                    }
                 }
+                // Re-read the live slot under its record lock, per isolation
+                // (JE CursorImpl.lockAndGetCurrent / getCurrent): a DEFAULT/
+                // READ_COMMITTED/SERIALIZABLE reader blocks on a foreign
+                // uncommitted writer; a READ_UNCOMMITTED cursor sees the
+                // uncommitted value; the own txn sees its own value. Without
+                // this, Get::Current returned the cursor cached value.
+                self.inner
+                    .relock_and_reread_current()
+                    .map_err(map_cursor_err)?;
                 let (k, v) =
                     self.inner.get_current().map_err(map_cursor_err)?;
                 data.set_data(&v);
@@ -890,15 +918,28 @@ impl<'txn> Cursor<'txn> {
         self.read_only
     }
 
-    /// Check that the cursor is not closed.
+    /// Check that the cursor and its database are open.
+    ///
+    /// JE `Cursor.checkOpenAndState` (Cursor.java:5381-5395): the
+    /// environment validity check (`checkEnv`) is done by the inner
+    /// `CursorImpl::check_state`; the database handle check is done here.
+    /// A database closed under a retained cursor -- including by
+    /// `Environment::close`, which requires every database closed -- yields
+    /// `DatabaseClosed` (JE IllegalStateException "Database was closed.").
     fn check_open(&self) -> Result<()> {
         if self.state == CursorState::Closed {
-            Err(NoxuError::OperationNotAllowed(
+            return Err(NoxuError::OperationNotAllowed(
                 "Cursor has been closed".to_string(),
-            ))
-        } else {
-            Ok(())
+            ));
         }
+        if self
+            .db_open
+            .as_ref()
+            .is_some_and(|o| !o.load(std::sync::atomic::Ordering::Acquire))
+        {
+            return Err(NoxuError::DatabaseClosed);
+        }
+        Ok(())
     }
 
     /// Check that the cursor is initialized (positioned on a record).

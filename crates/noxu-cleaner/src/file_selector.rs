@@ -478,8 +478,10 @@ impl FileSelector {
 
         // lastFileToClean = firstActiveFile - minAge
         // Any file with file_number > last_file_to_clean is too young to clean.
-        // Use saturating_sub so that if min_age > newest_file we get 0.
-        let last_file_to_clean = effective_newest.saturating_sub(min_age);
+        // JE computes this signed (UtilizationCalculator.java:224): when
+        // minAge exceeds firstActiveFile no file is old enough.  A
+        // saturating 0 here made the live file 0 cleanable and deletable.
+        let last_file_to_clean = effective_newest.checked_sub(min_age)?;
 
         // Collect all in-progress file numbers (not eligible for re-selection).
         let in_progress: HashSet<u32> =

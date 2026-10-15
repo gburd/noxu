@@ -869,6 +869,21 @@ fn sr10597_dup_delete_compress_readd_clean() {
     db.put(&key, ikey(0)).unwrap();
 
     env.checkpoint(Some(&force())).unwrap();
+    // JE fills 1 KiB files; these records fit in the live file 0, which is
+    // never cleanable (JE UtilizationCalculator.java:224).  Advance the log.
+    let filler = env
+        .open_database(
+            None,
+            "filler",
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true),
+        )
+        .unwrap();
+    for _ in 0..40 {
+        filler.put(b"f", [0u8; 1024]).unwrap();
+    }
+    filler.close().unwrap();
     let cleaned = env.clean_log().unwrap();
     assert!(cleaned > 0, "expected cleaning, got {cleaned}");
 
