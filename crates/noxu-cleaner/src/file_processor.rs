@@ -14,6 +14,13 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, RwLock};
 
+// Review-only seam after READ + data capture, before migration WAL.
+#[cfg(feature = "testing")]
+thread_local! {
+    pub static MIGRATION_PROBE: std::cell::RefCell<Option<Box<dyn FnOnce(Lsn, &[u8])>>> =
+        std::cell::RefCell::new(None);
+}
+
 /// Release a cleaner read-lock and log any failure.
 ///
 /// The cleaner is best-effort by design: failing to release a
@@ -984,6 +991,13 @@ impl TreeLookup for SharedTreeLookup {
         };
 
         let db_id_u64 = db_id.unsigned_abs();
+        // Review-only seam after READ + data capture, before migration WAL.
+        #[cfg(feature = "testing")]
+        MIGRATION_PROBE.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook(tree_lsn, &data);
+            }
+        });
         // Recheck, append and slot update all under the latched BIN while the
         // cleaner READ is held.  R-7: failed WAL write -> Locked (retry,
         // source file stays protected).  1A: >max_embedded_ln re-logged with

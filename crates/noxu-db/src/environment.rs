@@ -3798,3 +3798,7 @@ mod tests {
 #[cfg(test)]
 #[path = "cleaner_fetch_failclosed_probe.rs"]
 mod cleaner_fetch_failclosed_probe;
+
+#[cfg(test)]
+#[path = "writer_oldlsn_probe.rs"]
+mod writer_oldlsn_probe;

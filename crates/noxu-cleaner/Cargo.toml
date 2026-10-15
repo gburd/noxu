@@ -28,3 +28,7 @@ tempfile = "3"
 
 [lints]
 workspace = true
+
+[features]
+# Review-only scheduling, never enable in production.
+testing = []

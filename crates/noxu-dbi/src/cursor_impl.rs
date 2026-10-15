@@ -55,6 +55,13 @@ use crate::{
     database_impl::DatabaseImpl,
 };
 
+// Review-only seam after real lock transfer; never changes lock ownership.
+#[cfg(feature = "testing")]
+thread_local! {
+    pub static PUBLICATION_PROBE: std::cell::RefCell<Option<Box<dyn FnOnce(u64, Lsn)>>> =
+        std::cell::RefCell::new(None);
+}
+
 /// Cursor states.
 ///
 /// `PendingDeleted` is the JE post-delete position: the cursor's current slot
@@ -1180,14 +1187,24 @@ impl CursorImpl {
                 tm.update_first_lsn(txn_id, new_lsn_u64);
             }
         } else if let Some(lm) = &self.lock_manager {
-            // Auto-commit: acquire write lock, then release immediately.
+            // No txn (BasicLocker-equivalent): hold WRITE(old) and WRITE(new)
+            // until the caller's slot update; `release_bare_write_locks` drops
+            // both after it (JE Locker.allowReleaseLockAfterLsnChange false,
+            // Locker.java:775 -- only HandleLocker releases old after an LSN
+            // change, HandleLocker.java:117-120; BasicLocker releases at
+            // operationEnd, BasicLocker.java:198-248).  Releasing old here let
+            // the cleaner see the still-current slot at old_lsn unlocked
+            // between this call and the slot update and migrate the stale
+            // version past new_lsn.
             lm.lock(new_lsn_u64, self.id, LockType::Write, false, false)
                 .map_err(DbiError::TxnError)?;
-            if old_lsn != noxu_util::NULL_LSN.as_u64() {
-                let _ = lm.release(old_lsn, self.id);
-            }
-            let _ = lm.release(new_lsn_u64, self.id);
         }
+        #[cfg(feature = "testing")]
+        PUBLICATION_PROBE.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook(old_lsn, new_lsn);
+            }
+        });
         Ok(())
     }
 
@@ -4266,20 +4283,31 @@ impl CursorImpl {
                 if let Some(stored) = self.stored_full_key(&current_key) {
                     current_key = stored;
                 }
-                let new_lsn = self.log_ln_write(
-                    &current_key,
-                    Some(data),
-                    self.locker_id,
-                    old_lsn,
-                )?;
+                let new_lsn = self
+                    .log_ln_write(
+                        &current_key,
+                        Some(data),
+                        self.locker_id,
+                        old_lsn,
+                    )
+                    .inspect_err(|_| {
+                        self.release_bare_write_locks(
+                            old_lsn,
+                            noxu_util::NULL_LSN,
+                        )
+                    })?;
                 self.finalize_write_lock(
                     old_lsn,
                     old_exists,
                     new_lsn,
                     Some(current_key.clone()),
                     old_data,
-                )?;
+                )
+                .inspect_err(|_| {
+                    self.release_bare_write_locks(old_lsn, noxu_util::NULL_LSN)
+                })?;
                 self.apply_tree_insert(current_key, data.to_vec(), new_lsn);
+                self.release_bare_write_locks(old_lsn, new_lsn);
                 self.current_data = Some(Bytes::copy_from_slice(data));
                 self.current_lsn = new_lsn.as_u64();
                 Ok(OperationStatus::Success)
@@ -4327,22 +4355,29 @@ impl CursorImpl {
                 // replacing an existing record.  Closes the first
                 // F12 residual end-to-end.
                 if self.key_exists_in_view(key) {
+                    self.release_bare_write_locks(old_lsn, noxu_util::NULL_LSN);
                     return Ok(OperationStatus::KeyExist);
                 }
-                let new_lsn = self.log_ln_write(
-                    key,
-                    Some(data),
-                    self.locker_id,
-                    old_lsn,
-                )?;
+                let new_lsn = self
+                    .log_ln_write(key, Some(data), self.locker_id, old_lsn)
+                    .inspect_err(|_| {
+                        self.release_bare_write_locks(
+                            old_lsn,
+                            noxu_util::NULL_LSN,
+                        )
+                    })?;
                 self.finalize_write_lock(
                     old_lsn,
                     old_exists,
                     new_lsn,
                     Some(key.to_vec()),
                     old_data,
-                )?;
+                )
+                .inspect_err(|_| {
+                    self.release_bare_write_locks(old_lsn, noxu_util::NULL_LSN)
+                })?;
                 self.apply_tree_insert(key.to_vec(), data.to_vec(), new_lsn);
+                self.release_bare_write_locks(old_lsn, new_lsn);
                 self.current_key = Some(key.to_vec());
                 self.current_data = Some(Bytes::copy_from_slice(data));
                 self.current_lsn = new_lsn.as_u64();
@@ -4383,8 +4418,12 @@ impl CursorImpl {
                     new_lsn,
                     Some(key.to_vec()),
                     old_data,
-                )?;
+                )
+                .inspect_err(|_| {
+                    self.release_bare_write_locks(old_lsn, noxu_util::NULL_LSN)
+                })?;
                 self.apply_tree_insert(key.to_vec(), data.to_vec(), new_lsn);
+                self.release_bare_write_locks(old_lsn, new_lsn);
                 self.current_key = Some(key.to_vec());
                 self.current_data = Some(Bytes::copy_from_slice(data));
                 self.current_lsn = new_lsn.as_u64();
@@ -4545,8 +4584,15 @@ impl CursorImpl {
                     new_lsn,
                     Some(two_part_key.clone()),
                     None,
-                )?;
+                )
+                .inspect_err(|_| {
+                    self.release_bare_write_locks(
+                        exists_old_lsn,
+                        noxu_util::NULL_LSN,
+                    )
+                })?;
                 self.apply_tree_insert(two_part_key.clone(), vec![], new_lsn);
+                self.release_bare_write_locks(exists_old_lsn, new_lsn);
                 self.current_key = Some(two_part_key);
                 self.current_data = None;
                 self.current_lsn = new_lsn.as_u64();
@@ -4685,10 +4731,14 @@ impl CursorImpl {
             new_lsn,
             Some(two_part_key.clone()),
             None,
-        )?;
+        )
+        .inspect_err(|_| {
+            self.release_bare_write_locks(old_lsn, noxu_util::NULL_LSN)
+        })?;
         // Use apply_tree_insert so the per-database entry counter is bumped
         // on a new (key, data) pair — `Database::count()` reads this counter.
         self.apply_tree_insert(two_part_key.clone(), vec![], new_lsn);
+        self.release_bare_write_locks(old_lsn, new_lsn);
         self.current_key = Some(two_part_key);
         self.current_data = None;
         self.current_lsn = new_lsn.as_u64();
@@ -4978,6 +5028,7 @@ impl CursorImpl {
                 !self.key_exists_in_view(&tree_key)
             };
             if record_gone {
+                self.release_bare_write_locks(old_lsn, noxu_util::NULL_LSN);
                 return Ok(OperationStatus::KeyEmpty);
             }
             // NEW-REUSESLOT-1 [JE #15704]: capture the STORED slot key as
@@ -5000,16 +5051,23 @@ impl CursorImpl {
             // BIN post-physical-removal can detect contention via
             // `contest_synthetic_key_for_missing_read`.
             self.lock_synthetic_key_for_delete(&tree_key)?;
-            let del_lsn =
-                self.log_ln_write(&tree_key, None, self.locker_id, old_lsn)?;
+            let del_lsn = self
+                .log_ln_write(&tree_key, None, self.locker_id, old_lsn)
+                .inspect_err(|_| {
+                    self.release_bare_write_locks(old_lsn, noxu_util::NULL_LSN)
+                })?;
             self.finalize_write_lock(
                 old_lsn,
                 old_lsn != noxu_util::NULL_LSN.as_u64(),
                 del_lsn,
                 Some(tree_key.clone()),
                 old_data,
-            )?;
+            )
+            .inspect_err(|_| {
+                self.release_bare_write_locks(old_lsn, noxu_util::NULL_LSN)
+            })?;
             self.apply_tree_delete(tree_key, del_lsn);
+            self.release_bare_write_locks(old_lsn, del_lsn);
         }
 
         // JE CursorImpl.deleteCurrentRecord(): keep cursor positioned at the
