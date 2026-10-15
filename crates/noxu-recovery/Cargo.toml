@@ -10,6 +10,11 @@ categories.workspace = true
 readme = "../../README.md"
 description = "Checkpoint-based crash recovery for Noxu DB"
 
+[features]
+# rv-recon: expose the checkpointer per-BIN flush loop to integration-test
+# witnesses (zombie-parent). Off by default; internal-tier crate, no semver impact.
+testing = []
+
 [dependencies]
 hashbrown = { workspace = true }
 noxu-util = { workspace = true }

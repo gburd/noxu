@@ -1669,7 +1669,7 @@ impl Checkpointer {
         allow_bin_deltas: bool,
         dw_mode: bool,
     ) -> Result<FlushResult> {
-        let mut result = FlushResult::default();
+        let result = FlushResult::default();
 
         // Collect dirty BINs under a read lock on the tree.
         let dirty_bins = {
@@ -1696,6 +1696,38 @@ impl Checkpointer {
         // `BinStub::should_log_delta(bin_delta_percent)` below — faithful JE
         // `BIN.shouldLogDelta` (count-based + configurable percent).
 
+        // ZOMBIE-PARENT FIX (rv-recon): delegate the per-BIN flush to
+        // flush_bins_list so a test seam can drive the exact same loop with a
+        // caller-supplied dirty-BIN set (no production-logic divergence).
+        Self::flush_bins_list(
+            db_id,
+            tree_arc,
+            lm,
+            bin_delta_percent,
+            allow_bin_deltas,
+            dw_mode,
+            dirty_bins,
+            root_node_id,
+            result,
+        )
+    }
+
+    /// Per-BIN flush loop extracted from `flush_one_tree_bins` so a
+    /// `#[cfg(any(test, feature = "testing"))]` seam can drive the EXACT same
+    /// loop body with a caller-supplied dirty-BIN set.  No production logic
+    /// differs between the two callers.
+    #[allow(clippy::too_many_arguments)]
+    fn flush_bins_list(
+        db_id: u64,
+        tree_arc: &Arc<RwLock<Tree>>,
+        lm: &Arc<LogManager>,
+        bin_delta_percent: i32,
+        allow_bin_deltas: bool,
+        dw_mode: bool,
+        dirty_bins: Vec<(u64, Arc<NodeRwLock<TreeNode>>)>,
+        root_node_id: Option<u64>,
+        mut result: FlushResult,
+    ) -> Result<FlushResult> {
         for (_node_db_id, bin_arc) in dirty_bins {
             // RECONCILE A4 (BUG-SPLIT-LOST-INSERT-1) x R-LNRECLAIM B1
             // (BUG-CLEANER-LIVE-LN-RECLAIM) to the single JE shape of
@@ -1744,27 +1776,52 @@ impl Checkpointer {
             // log-time `update_parent_slot_lsn`, which is a different code path
             // and not a double-stamp).
             //
-            // Resolve the parent via the BIN's `parent` back-pointer under a
-            // brief read latch (never child-then-parent), then take the parent
-            // write latch.  `None` => the BIN is the tree root (single-level
-            // tree): no parent slot exists, so it is resident by definition and
-            // seeded via `note_root_logged` below.
-            let parent_arc =
-                noxu_tree::tree::Tree::parent_arc_of_child(&bin_arc);
+            // ZOMBIE-PARENT FIX (rv-recon review Q1): resolve the parent by a
+            // ROOT-DOWN search (JE `Tree.getParentINForChildIN` ->
+            // `searchSubTree` by node_id + identifier key, Tree.java:1168+),
+            // NOT via the BIN's `parent` back-pointer.  A back-pointer resolve
+            // (`parent_arc_of_child`) reaches a DETACHED-but-Arc-alive parent
+            // instance (an evictor upper-IN detach that left this BIN resident,
+            // or a replaced parent) and the ptr_eq identity check then PASSES
+            // on that zombie -- the checkpointer would log this BIN at a NEW
+            // LSN and stamp the zombie, and recovery redo (`recover_in_redo`,
+            // newer-LSN-wins) can resurrect that stale image over the committed
+            // value.  A root-down search only ever returns a parent that is
+            // itself reachable from the live root, so a zombie parent is never
+            // found (`!exactParentFound -> skip`, JE Checkpointer.java:1198-1256)
+            // -- JE is zombie-proof precisely BECAUSE it searches top-down.
+            //
+            // `get_parent_in_for_child_in(bin_id)` returns `Some((parent_arc,
+            // slot))` for a BIN still attached under the live root, or `None`
+            // for the tree root (single-level) OR a genuinely detached/orphaned
+            // BIN.  We take the resolved parent's write latch FIRST (A4
+            // parent-then-child order), then the child BIN latch, and HOLD the
+            // parent latch across the child log + the slot stamp.
+            let bin_id = bin_arc.read().node_id();
+            let parent_slot = tree_arc
+                .read()
+                .ok()
+                .and_then(|g| g.get_parent_in_for_child_in(bin_id));
+            let parent_arc = parent_slot.as_ref().map(|(p, _)| Arc::clone(p));
             let mut parent_guard = parent_arc.as_ref().map(|p| p.write());
             // Acquire the BIN write lock to serialize + clear dirty flags
             // (parent-then-child lock order; the parent latch is already held).
             let mut bin_guard = bin_arc.write();
 
-            // R-LNRECLAIM B1 identity re-check UNDER the held parent latch:
-            // this exact Arc must still be the resident child of one of its
-            // parent's slots (Arc::ptr_eq, JE `parent.getTarget(index)`
-            // identity).  A root BIN (no parent) is resident by definition.
-            // `Arc::ptr_eq` compares pointers only -- it does NOT latch the
-            // child, so there is no futex-reentrancy against the `bin_guard` we
-            // hold.
+            // Identity re-check UNDER the held parent latch (JE
+            // `parent.getTarget(index) == child`, Checkpointer.java:1309-1321):
+            // between the root-down resolve (which released its latches) and
+            // taking `parent.write()`, a concurrent split could have moved the
+            // slot.  Confirm this exact Arc is STILL a resident child of the
+            // resolved parent.  `Arc::ptr_eq` compares pointers only -- it does
+            // NOT latch the child, so there is no futex-reentrancy against the
+            // `bin_guard` we hold.
             let child_resident = match parent_guard.as_deref() {
-                None => true, // root BIN: no parent slot, resident by definition
+                // No live-tree parent.  Either the tree root (single-level
+                // tree: flush as root, seeded via `note_root_logged`) or a
+                // genuinely detached/orphaned BIN (skip -- never flush a
+                // non-resident IN; JE `!exactParentFound -> return`).
+                None => Some(bin_id) == root_node_id,
                 Some(TreeNode::Internal(p)) => {
                     (0..p.entries.len()).any(|slot| {
                         p.child_ref(slot)
@@ -1777,11 +1834,11 @@ impl Checkpointer {
                 Some(_) => false,
             };
             if !child_resident {
-                // Genuinely detached / replaced (zombie): the evictor logged +
-                // published it before detaching, so its on-disk image is
-                // durable and the parent slot is current -- safe to skip (JE
-                // never flushes a non-resident IN).  Releasing the guards here
-                // drops the parent and child latches.
+                // Detached / orphaned (zombie) OR a non-root BIN with no
+                // live-tree parent: its durable image + parent slot are already
+                // current via the evictor's log-time publish -- safe to skip
+                // (JE never flushes a non-resident IN).  Dropping the guards
+                // here releases the parent and child latches.
                 continue;
             }
 
@@ -1996,6 +2053,41 @@ impl Checkpointer {
         }
 
         Ok(result)
+    }
+
+    /// Test seam (rv-recon zombie-parent witness): run the real per-BIN flush
+    /// loop over a caller-supplied dirty-BIN set.  Not compiled into release
+    /// library builds without the `testing` feature.
+    #[cfg(any(test, feature = "testing"))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn flush_bins_list_for_test(
+        &self,
+        db_id: u64,
+        tree_arc: &Arc<RwLock<Tree>>,
+        dirty_bins: Vec<(u64, Arc<NodeRwLock<TreeNode>>)>,
+    ) -> Result<()> {
+        let lm = self
+            .log_manager
+            .as_ref()
+            .expect("flush_bins_list_for_test needs a wired LogManager");
+        let root_node_id: Option<u64> = tree_arc
+            .read()
+            .ok()
+            .and_then(|g| g.get_root())
+            .filter(|r| r.read().is_bin())
+            .map(|r| r.read().node_id());
+        Self::flush_bins_list(
+            db_id,
+            tree_arc,
+            lm,
+            self.config.bin_delta_percent,
+            self.config.allow_bin_deltas,
+            false, // ordinary-DB flush path for the test seam
+            dirty_bins,
+            root_node_id,
+            FlushResult::default(),
+        )
+        .map(|_| ())
     }
 
     /// Flush all dirty upper INs (level ≥ 2) bottom-up to the WAL.
@@ -2381,7 +2473,12 @@ impl Checkpointer {
                         g.note_root_logged(logged_lsn);
                     }
                 } else {
-                    Tree::update_parent_slot_lsn(node_arc, logged_lsn);
+                    // ZOMBIE-PARENT FIX (rv-recon item2): publish ROOT-DOWN into
+                    // the live-tree parent slot, never via the node's
+                    // back-pointer (which could name a detached zombie parent).
+                    if let Ok(g) = tree_arc.read() {
+                        g.update_parent_slot_lsn_rootdown(node_arc, logged_lsn);
+                    }
                 }
 
                 // NEW-CLEANER-IN-OBSOLETE: record the superseded prior full

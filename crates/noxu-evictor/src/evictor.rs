@@ -1339,8 +1339,16 @@ impl Evictor {
         if trees.is_empty() {
             return true; // no tree — nothing to flush
         }
-        let (owning_db_id, node_arc): (u64, Arc<NodeRwLock<TreeNode>>) = {
-            let mut found: Option<(u64, Arc<NodeRwLock<TreeNode>>)> = None;
+        let (owning_db_id, node_arc, owning_tree_arc): (
+            u64,
+            Arc<NodeRwLock<TreeNode>>,
+            Arc<std::sync::RwLock<noxu_tree::tree::Tree>>,
+        ) = {
+            let mut found: Option<(
+                u64,
+                Arc<NodeRwLock<TreeNode>>,
+                Arc<std::sync::RwLock<noxu_tree::tree::Tree>>,
+            )> = None;
             for (db_id, tree_arc) in &trees {
                 let tree_guard = match tree_arc.read() {
                     Ok(g) => g,
@@ -1350,7 +1358,7 @@ impl Evictor {
                 // path is write-locked by another thread, treat as busy.
                 match find_node_arc_nonblocking(&tree_guard, node_id) {
                     Ok(Some(a)) => {
-                        found = Some((*db_id, a));
+                        found = Some((*db_id, a, Arc::clone(tree_arc)));
                         break;
                     }
                     Ok(None) => continue, // not in this tree; try the next
@@ -1358,7 +1366,7 @@ impl Evictor {
                 }
             }
             match found {
-                Some(pair) => pair,
+                Some(triple) => triple,
                 None => return true, // not in any tree; allow eviction
             }
         };
@@ -1378,20 +1386,25 @@ impl Evictor {
         // resolved via `find_node_arc_nonblocking` before another thread
         // detached it must NOT be logged (its stale image would be published
         // and stamped).  `Busy` (detach in flight) is also skipped — put back.
-        // Read the parent Weak from the guard we ALREADY hold (never re-latch
-        // `node_arc` — the futex RwLock is not reentrant: re-reading it here is
-        // the Fix-C self-deadlock).  `child_resident_state` only `try_read`s
-        // the PARENT.
-        let parent_weak = match &*node_guard {
-            TreeNode::Bottom(b) => b.parent.clone(),
-            TreeNode::Internal(n) => n.parent.clone(),
-        };
-        match noxu_tree::tree::Tree::child_resident_state(
-            &parent_weak,
-            &node_arc,
-        ) {
-            noxu_tree::tree::ChildResident::Yes => {}
-            _ => return false,
+        // ZOMBIE-PARENT FIX (rv-recon review Q1/item2): resolve residency by a
+        // ROOT-DOWN non-blocking descent, NOT via the child's `parent`
+        // back-pointer.  A back-pointer resolve reaches a DETACHED-but-Arc-alive
+        // zombie parent and would let the evictor LOG + PUBLISH a stale image
+        // into the zombie slot (recovery redo can then resurrect it).  A
+        // root-down search only finds a parent reachable from the live root, so
+        // a zombie is reported `No` and skipped (JE `getParentINForChildIN`
+        // `!exactParentFound`).  Any contended latch on the path yields `Busy`
+        // -> put back, preserving the evictor's non-blocking skip-on-Busy
+        // semantics.  Uses `try_read` on the owning Tree struct lock so the
+        // evictor never blocks here.
+        {
+            let Ok(tg) = owning_tree_arc.try_read() else {
+                return false; // tree busy -> put back
+            };
+            match tg.child_resident_state_rootdown(node_id, &node_arc) {
+                noxu_tree::tree::ChildResident::Yes => {}
+                _ => return false, // detached (zombie) / not found / busy -> put back
+            }
         }
 
         // CC-6: re-validate pin count under the lock.  Between the metadata
@@ -1440,6 +1453,7 @@ impl Evictor {
                     owning_db_id,
                     &node_arc,
                     node_bytes,
+                    &owning_tree_arc,
                 );
             }
         };
@@ -1517,14 +1531,16 @@ impl Evictor {
         // assert residency in debug builds.
         #[cfg(debug_assertions)]
         {
-            // Read the parent Weak from the BIN we hold (`bin` is the borrow of
-            // `node_guard`); never re-latch the child.
-            let pw = bin.parent.clone();
-            debug_assert_ne!(
-                noxu_tree::tree::Tree::child_resident_state(&pw, &node_arc),
-                noxu_tree::tree::ChildResident::No,
-                "evictor must not flush a detached (zombie) BIN"
-            );
+            // ZOMBIE-PARENT FIX: re-assert residency ROOT-DOWN (not via the
+            // back-pointer).  `bin` is the borrow of `node_guard`; the
+            // root-down check uses `try_read` and never re-latches the child.
+            if let Ok(tg) = owning_tree_arc.try_read() {
+                debug_assert_ne!(
+                    tg.child_resident_state_rootdown(node_id, &node_arc),
+                    noxu_tree::tree::ChildResident::No,
+                    "evictor must not flush a detached (zombie) BIN"
+                );
+            }
         }
         let full_bytes = bin.serialize_full();
         let entry =
@@ -1577,7 +1593,14 @@ impl Evictor {
         // publication point) lets the detach-stamp be removed.  Drop the child
         // latch first (parent-then-child order).
         drop(node_guard);
-        noxu_tree::tree::Tree::update_parent_slot_lsn(&node_arc, logged_lsn);
+        // ZOMBIE-PARENT FIX: publish the logged LSN into the LIVE-tree parent
+        // slot (root-down), never into a zombie slot reached via the child's
+        // back-pointer.  If the node is no longer under the live root
+        // (detached between the residency check and here), there is nothing to
+        // publish — the detach path will handle the (now durable) image.
+        if let Ok(tg) = owning_tree_arc.try_read() {
+            tg.update_parent_slot_lsn_rootdown(&node_arc, logged_lsn);
+        }
         true
     }
 
@@ -1616,6 +1639,7 @@ impl Evictor {
         db_id: u64,
         node_arc: &Arc<NodeRwLock<TreeNode>>,
         node_bytes: Vec<u8>,
+        owning_tree_arc: &Arc<std::sync::RwLock<noxu_tree::tree::Tree>>,
     ) -> bool {
         let lm = match self
             .log_manager
@@ -1705,7 +1729,12 @@ impl Evictor {
                 // the child by node_id under the parent latch and marks the
                 // parent dirty), so `detach_node_by_id` then keeps this fresh
                 // slot LSN for the Internal child instead of a stale one.
-                Tree::update_parent_slot_lsn(node_arc, logged_lsn);
+                // ZOMBIE-PARENT FIX (rv-recon item2): publish ROOT-DOWN into
+                // the live-tree parent slot, never via the node's back-pointer
+                // (which could name a detached zombie parent).
+                if let Ok(tg) = owning_tree_arc.try_read() {
+                    tg.update_parent_slot_lsn_rootdown(node_arc, logged_lsn);
+                }
                 self.stats.increment(&self.stats.dirty_nodes_evicted);
                 true
             }
