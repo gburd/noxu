@@ -3413,17 +3413,30 @@ impl CursorImpl {
         if pre_lsn == noxu_util::NULL_LSN.as_u64() {
             return Ok(());
         }
-        // Lock the slot per isolation. For a foreign uncommitted writer this
-        // blocks (READ/RANGE_READ -> LockTimeout) or is a no-op (NONE); for our
-        // own txn the lock is already held and is granted immediately.
-        self.lock_ln(pre_lsn)?;
-        // Re-resolve BY KEY after the lock (the slot may have moved again while
-        // we waited) and install the authoritative key/data/lsn/index + re-pin.
-        if let Some((lsn, data, idx, bin_arc)) = self.resolve_slot_by_key(&key)
+        // BUG-RC-SCAN-TORN-READ: re-read the committed value under a HELD lock
+        // on the slot's current LSN, looping if it moves (JE CursorImpl.lockLN
+        // re-lock loop).  The prior single `lock_ln` + re-resolve installed the
+        // re-resolved slot WITHOUT re-locking its (possibly new, uncommitted)
+        // LSN -- a Get::Current torn read when a writer moved the slot during
+        // the lock wait.  `reread_data_locking_current_lsn` holds the Read lock
+        // across the by-key re-read and NEVER returns dirty data (a perpetually
+        // write-locked slot ends in a LockTimeout/LockConflict error).
+        let (committed_data, committed_lsn) =
+            self.reread_data_locking_current_lsn(&key, pre_lsn)?;
+        // Re-resolve BY KEY to recover the current slot index + BIN pin (the
+        // committed data/lsn come from the locked re-read above).  A committed
+        // delete observed under the lock yields `committed_lsn == 0`; keep the
+        // cached value and let the caller KD recheck handle the defunct case.
+        if committed_lsn != 0
+            && let Some((_, resolved_data, idx, bin_arc)) =
+                self.resolve_slot_by_key(&key)
         {
             self.update_bin_pin(Some(bin_arc));
-            self.current_data = Some(data);
-            self.current_lsn = lsn;
+            // Prefer the committed re-read data; fall back to the resolved
+            // slot's residency only when the LN was stripped (committed_data
+            // is None for a non-resident slot -- rehydrate refills it below).
+            self.current_data = Some(committed_data.unwrap_or(resolved_data));
+            self.current_lsn = committed_lsn;
             self.current_index = idx;
             self.rehydrate_current_data()?;
         }
