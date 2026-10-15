@@ -62,6 +62,19 @@ thread_local! {
         std::cell::RefCell::new(None);
 }
 
+// BUG-RC-SCAN-TORN-READ review-only seam: fires on the writer thread right
+// AFTER the tree slot update (`apply_tree_insert`) publishes `new_lsn` into the
+// BIN slot, while the writer still holds WRITE(new) (a Txn holds it until
+// commit/abort).  Used by the writer-order invariant witness (assert WRITE(new)
+// is held once the slot shows it) and the deterministic RC torn-read witness
+// (a reader that observes the published new_lsn must block on WRITE(new), never
+// return the uncommitted bytes).  Compiles to nothing in default builds.
+#[cfg(feature = "testing")]
+thread_local! {
+    pub static SLOT_PUBLISHED_PROBE: std::cell::RefCell<Option<Box<dyn FnOnce(u64, Lsn)>>> =
+        std::cell::RefCell::new(None);
+}
+
 /// Cursor states.
 ///
 /// `PendingDeleted` is the JE post-delete position: the cursor's current slot
@@ -4618,6 +4631,14 @@ impl CursorImpl {
                     self.release_bare_write_locks(old_lsn, noxu_util::NULL_LSN)
                 })?;
                 self.apply_tree_insert(key.to_vec(), data.to_vec(), new_lsn);
+                // BUG-RC-SCAN-TORN-READ review-only seam: slot now shows
+                // new_lsn and WRITE(new) is held (txn until commit/abort).
+                #[cfg(feature = "testing")]
+                SLOT_PUBLISHED_PROBE.with(|hook| {
+                    if let Some(hook) = hook.borrow_mut().take() {
+                        hook(old_lsn, new_lsn);
+                    }
+                });
                 self.release_bare_write_locks(old_lsn, new_lsn);
                 self.current_key = Some(key.to_vec());
                 self.current_data = Some(Bytes::copy_from_slice(data));

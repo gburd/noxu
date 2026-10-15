@@ -3802,3 +3802,7 @@ mod cleaner_fetch_failclosed_probe;
 #[cfg(test)]
 #[path = "writer_oldlsn_probe.rs"]
 mod writer_oldlsn_probe;
+
+#[cfg(test)]
+#[path = "rc_scan_writer_order_probe.rs"]
+mod rc_scan_writer_order_probe;
