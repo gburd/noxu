@@ -11073,6 +11073,102 @@ impl Tree {
         }
     }
 
+    /// ROOT-DOWN, NON-BLOCKING residency check (rv-recon zombie-parent fix).
+    ///
+    /// Unlike [`Self::child_resident_state`] (which resolves the parent via the
+    /// child's `parent` BACK-POINTER and so can reach a DETACHED-but-Arc-alive
+    /// zombie parent), this walks from the LIVE ROOT by `node_id` using
+    /// `try_read` latches and reports whether `child_arc` is the resident child
+    /// of a slot reached top-down.  A zombie parent is never on a root-down
+    /// path, so a detached child is reported `No` (JE `getParentINForChildIN`
+    /// `!exactParentFound`).  Any contended latch on the path yields `Busy`
+    /// (the evictor puts the victim back), preserving the evictor's
+    /// non-blocking skip-on-Busy semantics.
+    pub fn child_resident_state_rootdown(
+        &self,
+        _child_id: u64,
+        child_arc: &Arc<RwLock<TreeNode>>,
+    ) -> ChildResident {
+        let Some(root) = self.get_root() else {
+            return ChildResident::No;
+        };
+        // The root itself has no parent slot; if the child IS the root it is
+        // resident by definition.
+        if Arc::ptr_eq(&root, child_arc) {
+            return ChildResident::Yes;
+        }
+        Self::rootdown_resident(&root, child_arc)
+    }
+
+    fn rootdown_resident(
+        node: &Arc<RwLock<TreeNode>>,
+        child_arc: &Arc<RwLock<TreeNode>>,
+    ) -> ChildResident {
+        let Some(g) = node.try_read() else {
+            return ChildResident::Busy; // contended -> undecidable, skip
+        };
+        let TreeNode::Internal(n) = &*g else {
+            return ChildResident::No; // BIN: no IN children
+        };
+        // Is child_arc a direct resident child of this node (by identity)?
+        for slot in 0..n.entries.len() {
+            if n.child_ref(slot).is_some_and(|c| Arc::ptr_eq(c, child_arc)) {
+                return ChildResident::Yes;
+            }
+        }
+        // Recurse into resident IN children toward child_arc.
+        let children: Vec<Arc<RwLock<TreeNode>>> = n.resident_children();
+        drop(g);
+        let mut saw_busy = false;
+        for c in children {
+            // Only descend into upper INs (a BIN cannot be child_arc's parent).
+            match Self::rootdown_resident(&c, child_arc) {
+                ChildResident::Yes => return ChildResident::Yes,
+                ChildResident::Busy => saw_busy = true,
+                ChildResident::No => {}
+            }
+        }
+        if saw_busy { ChildResident::Busy } else { ChildResident::No }
+    }
+
+    /// ROOT-DOWN publish of a freshly-logged LSN into the LIVE-tree parent slot
+    /// of `child_arc` (rv-recon zombie-parent fix for the evictor's log-time
+    /// publication).  Resolves the parent by a root-down `try_read` descent, so
+    /// a detached (zombie) parent is never stamped; a resident child's live
+    /// parent slot is updated by `node_id` identity.  Returns `true` iff a live
+    /// parent slot was found and stamped (a `false` return means the child is
+    /// not under the live root — detached — so there is nothing to publish).
+    pub fn update_parent_slot_lsn_rootdown(
+        &self,
+        child_arc: &Arc<RwLock<TreeNode>>,
+        new_lsn: Lsn,
+    ) -> bool {
+        if new_lsn == NULL_LSN {
+            return false;
+        }
+        let Some((parent_arc, _slot)) = ({
+            let child_id = child_arc.read().node_id();
+            self.get_parent_in_for_child_in(child_id)
+        }) else {
+            return false; // not under the live root -> detached -> do not stamp
+        };
+        let mut pg = parent_arc.write();
+        if let TreeNode::Internal(p) = &mut *pg {
+            for slot in 0..p.entries.len() {
+                let matches = p
+                    .child_ref(slot)
+                    .map(|c| Arc::ptr_eq(c, child_arc))
+                    .unwrap_or(false);
+                if matches {
+                    p.set_lsn(slot, new_lsn);
+                    p.dirty = true;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     pub fn update_parent_slot_lsn(
         child_arc: &Arc<RwLock<TreeNode>>,
         new_lsn: Lsn,
