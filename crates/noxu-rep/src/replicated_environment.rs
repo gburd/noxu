@@ -4463,8 +4463,9 @@ impl ReplicatedEnvironment {
         // `stop()` only flipped the `running` flag, which the thread — then
         // parked in a blocking `accept()` — never observed, leaking the thread,
         // its listener fd, and the bound port on every close/drop. The accept
-        // loop is now non-blocking and polls the flag; `stop_and_join` clears
-        // it and waits (bounded) for the thread to exit before returning.
+        // loop still blocks in `accept()`; `stop_and_join` clears the flag,
+        // wakes the blocked `accept()` with a self-connect, and waits (bounded)
+        // for the thread to exit before returning.
         //
         // Lock order: we hold no env lock here (the `io_threads` join above
         // completed in its own scope), and the accept thread's handlers take

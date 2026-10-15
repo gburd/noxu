@@ -469,12 +469,16 @@ fn wake_accept_via_self_connect(addr: SocketAddr) {
 
 /// Join `handle` but give up after `timeout` (BUG-REP-DISPATCHER-LEAK).
 ///
-/// The accept thread only polls an atomic flag every [`ACCEPT_POLL_INTERVAL`],
-/// so it exits within one interval of the flag being cleared; `timeout` is a
-/// generous backstop so a close/drop can never block indefinitely (e.g. if the
-/// thread is briefly inside a handler spawn). On timeout the handle is dropped
-/// (detaching the thread, which still exits on its own at the next poll) and a
-/// warning is logged — we never block the caller forever.
+/// The accept thread blocks in `TcpListener::accept()`; `stop_and_join` wakes
+/// it with a self-connect so it observes `running == false` and exits
+/// promptly. `timeout` is a generous backstop so a close/drop can never block
+/// indefinitely if that wakeup does not land (e.g. a firewalled loopback or a
+/// non-local / NATed bind address the host cannot self-connect to). On timeout
+/// the handle is dropped, which detaches the join; note the accept thread then
+/// stays parked in its blocking `accept()` (there is no poll loop to catch the
+/// flag), so a failed wakeup leaves the thread, its listener fd, and the bound
+/// port leaked until the process exits. A warning is logged — we never block
+/// the caller forever.
 fn join_with_timeout(
     handle: thread::JoinHandle<()>,
     timeout: Duration,
@@ -494,8 +498,10 @@ fn join_with_timeout(
             Err(_) => {
                 log::warn!(
                     "service dispatcher accept thread '{name}' did not exit \
-                     within {timeout:?}; detaching (it will still exit on its \
-                     next poll)"
+                     within {timeout:?}; the self-connect wakeup did not land \
+                     (firewalled loopback or non-local bind address?). \
+                     Detaching: the thread stays blocked in accept() and its \
+                     listener fd / bound port leak until process exit"
                 );
             }
         },
