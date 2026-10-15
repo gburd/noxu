@@ -52,6 +52,10 @@ use std::time::Duration;
 use noxu_rep::node_state::NodeState;
 use noxu_rep::{RepConfig, ReplicatedEnvironment};
 
+/// The mid-transition witness hook is process-global, so the two witnesses in
+/// this file must not install hooks concurrently. Serialize them.
+static WITNESS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn single_node_cfg(dir: &std::path::Path) -> RepConfig {
     RepConfig::builder("toctou_grp", "n1", "127.0.0.1")
         .node_port(0)
@@ -65,6 +69,7 @@ fn single_node_cfg(dir: &std::path::Path) -> RepConfig {
 /// `InvalidStateTransition`.
 #[test]
 fn become_master_contended_mid_transition_is_atomic() {
+    let _serial = WITNESS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::TempDir::new().expect("tempdir");
     // `new` (not `open`): no election-driver thread, so the only state
     // contenders are the two threads below.
@@ -148,6 +153,7 @@ fn become_master_contended_mid_transition_is_atomic() {
 /// *different* active roles. Exactly one role wins; neither call errors.
 #[test]
 fn become_master_vs_become_replica_contended_is_atomic() {
+    let _serial = WITNESS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let env = Arc::new(
         ReplicatedEnvironment::new(single_node_cfg(tmp.path()))

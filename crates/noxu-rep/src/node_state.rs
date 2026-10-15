@@ -131,22 +131,31 @@ pub struct NodeStateMachine {
     state_change_time: RwLock<Instant>,
     /// Total number of state transitions that have occurred.
     transition_count: RwLock<u64>,
-    /// Test-only deterministic witness hook (BUG-REP-STATE-TOCTOU).
-    ///
-    /// When set, [`Self::transition_via_unknown`] invokes this callback
-    /// *while holding the state write lock*, at the exact mid-point between
-    /// the intermediate `Unknown` hop and the final target hop — i.e. the
-    /// window a second actor would have interleaved into under the former
-    /// two-lock-acquisition `ensure_unknown_state(); transition_to(target)`
-    /// code. A witness installs a hook that unblocks and briefly waits on a
-    /// second thread running `become_master`; because the fix holds the lock
-    /// across the whole compound transition, that second thread must block,
-    /// proving no interleave is possible. Compiled only for tests / the
-    /// `test-harness` feature; absent from any released build.
-    #[cfg(any(test, feature = "test-harness"))]
-    #[allow(clippy::type_complexity)]
-    mid_transition_hook: RwLock<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
 }
+
+/// Test-only deterministic witness hook (BUG-REP-STATE-TOCTOU).
+///
+/// When set, [`NodeStateMachine::transition_via_unknown`] invokes this
+/// callback *while holding the state write lock*, at the exact mid-point
+/// between the intermediate `Unknown` hop and the final target hop — i.e. the
+/// window a second actor would have interleaved into under the former
+/// two-lock-acquisition `ensure_unknown_state(); transition_to(target)` code.
+/// A witness installs a hook that unblocks and briefly waits on a second
+/// thread running `become_master`; because the fix holds the lock across the
+/// whole compound transition, that second thread must block, proving no
+/// interleave is possible.
+///
+/// Stored in a module-level static (NOT a field on `NodeStateMachine`) so the
+/// struct's layout — and therefore its auto-trait impls (`UnwindSafe` etc.)
+/// and its entire public API surface — are byte-identical in every build
+/// configuration, including when the `test-harness` feature is unified in by
+/// a workspace dev-dependency. Compiled only for tests / the `test-harness`
+/// feature; absent from any released build.
+#[cfg(any(test, feature = "test-harness"))]
+#[allow(clippy::type_complexity)]
+static MID_TRANSITION_HOOK: std::sync::RwLock<
+    Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+> = std::sync::RwLock::new(None);
 
 impl NodeStateMachine {
     /// Create a new state machine starting in the Detached state.
@@ -155,21 +164,18 @@ impl NodeStateMachine {
             state: RwLock::new(NodeState::Detached),
             state_change_time: RwLock::new(Instant::now()),
             transition_count: RwLock::new(0),
-            #[cfg(any(test, feature = "test-harness"))]
-            mid_transition_hook: RwLock::new(None),
         }
     }
 
-    /// Install a test-only mid-transition hook (BUG-REP-STATE-TOCTOU witness).
-    ///
-    /// See the field docs on [`NodeStateMachine`]. Returns no value; call with
-    /// `None` to clear.
+    /// Install the test-only mid-transition hook (BUG-REP-STATE-TOCTOU
+    /// witness). Process-global; call with `None` to clear. See
+    /// [`MID_TRANSITION_HOOK`].
     #[cfg(any(test, feature = "test-harness"))]
     pub fn set_mid_transition_hook(
         &self,
         hook: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     ) {
-        *self.mid_transition_hook.write() = hook;
+        *MID_TRANSITION_HOOK.write().expect("hook lock") = hook;
     }
 
     /// Get the current state.
@@ -316,7 +322,7 @@ impl NodeStateMachine {
     /// the state write lock is held. No-op (and zero-cost) in release builds.
     #[cfg(any(test, feature = "test-harness"))]
     fn fire_mid_transition_hook(&self) {
-        let hook = self.mid_transition_hook.read().clone();
+        let hook = MID_TRANSITION_HOOK.read().expect("hook lock").clone();
         if let Some(hook) = hook {
             hook();
         }
