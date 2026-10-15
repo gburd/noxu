@@ -969,18 +969,47 @@ impl RecoveryManager {
             .keys()
             .filter(|name| {
                 // A name is undone only if it has a txn_id AND that txn
-                // did not commit.
-                analysis
-                    .recovered_db_txn_ids
-                    .get(*name)
-                    .map(|&tid| !analysis.committed_txns.contains_key(&tid))
-                    .unwrap_or(false)
+                // did not commit.  BUG-DDL-DURABILITY-1: txn ids RESTART
+                // from 1 each env session, so a cumulative recovery scan
+                // can see the SAME id both committed (earlier session) and
+                // aborted (later).  Disambiguate by LSN: the creating txn
+                // counts as committed ONLY if its TxnCommit LSN is AFTER
+                // this NameLN's LSN (the commit resolved THIS instance of
+                // the reused id).  A commit recorded at an LSN BEFORE the
+                // NameLN belongs to an earlier session's txn with the same
+                // id and does NOT commit this NameLN -> undo it.
+                match analysis.recovered_db_txn_ids.get(*name) {
+                    None => false, // non-transactional / legacy: committed
+                    Some(&tid) => {
+                        let name_lsn =
+                            analysis.recovered_db_name_lsns.get(*name).copied();
+                        match (analysis.committed_txns.get(&tid), name_lsn) {
+                            // No commit record for the id -> its creating
+                            // txn aborted / crashed -> undo.
+                            (None, _) => true,
+                            // Commit AND NameLN LSN both known: the id may
+                            // be REUSED across env sessions, so this
+                            // instance committed only if its TxnCommit LSN
+                            // is at/after this NameLN's LSN. A commit LSN
+                            // BEFORE the NameLN is an earlier session's txn
+                            // with the same id -> undo.
+                            (Some(&clsn), Some(nlsn)) => {
+                                clsn.as_u64() < nlsn.as_u64()
+                            }
+                            // Commit known but no NameLN LSN recorded (unit
+                            // tests / non-forward-scan analysis): fall back
+                            // to set membership -> committed id -> keep.
+                            (Some(_), None) => false,
+                        }
+                    }
+                }
             })
             .cloned()
             .collect();
         for name in &aborted_names {
             analysis.recovered_db_names.remove(name);
             analysis.recovered_db_txn_ids.remove(name);
+            analysis.recovered_db_name_lsns.remove(name);
             analysis.recovered_db_comparators.remove(name);
             log::debug!(
                 "recovery[mapping-tree-undo]: removed aborted database \
@@ -988,6 +1017,36 @@ impl RecoveryManager {
                 name
             );
         }
+        // BUG-DDL-DURABILITY-1: resolve pending TRANSACTIONAL NameLN deletes.
+        // A deferred delete takes effect (removes the name) ONLY if its txn
+        // committed; otherwise the delete is undone and the database survives
+        // (JE: the NameLN delete follows its txn's commit/abort via
+        // `Txn.deletedDatabases`).  A later (re)create of the same name has
+        // already cleared the pending entry during the forward scan, so a
+        // committed delete here never removes a resurrected database.
+        let committed_deletes: Vec<String> = analysis
+            .pending_name_deletes
+            .iter()
+            .filter(|(_, tid)| analysis.committed_txns.contains_key(*tid))
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in &committed_deletes {
+            analysis.recovered_db_names.remove(name);
+            analysis.recovered_db_txn_ids.remove(name);
+            analysis.recovered_db_comparators.remove(name);
+            analysis.recovered_db_fanouts.remove(name);
+            // v7.11.1 tag-native: base AnalysisResult has no
+            // recovered_db_sorted_dups field (integrate-only); the
+            // sorted-dups flag is not tracked in the recovered-names catalog.
+            log::debug!(
+                "recovery[mapping-tree-undo]: applied committed transactional \
+                 delete of database '{}'",
+                name
+            );
+        }
+        // An aborted/crashed transactional delete leaves the name in place:
+        // nothing to do (the create's catalog entry was never removed).
+        analysis.pending_name_deletes.clear();
         // Copy the surviving catalog into our own map so redo can assert
         // that every data-LN db_id was actually registered.
         self.mapping_tree_db_names = analysis
@@ -1921,11 +1980,35 @@ impl RecoveryManager {
                 // ----------------------------------------------------------
                 LogEntry::NameLn(rec) => {
                     if rec.is_deleted {
-                        result_ref.recovered_db_names.remove(&rec.name);
-                        result_ref.recovered_db_txn_ids.remove(&rec.name);
-                        result_ref.recovered_db_comparators.remove(&rec.name);
-                        result_ref.recovered_db_fanouts.remove(&rec.name);
+                        // BUG-DDL-DURABILITY-1: a TRANSACTIONAL delete
+                        // (txn_id=Some) must only take effect if its txn
+                        // commits.  Defer it to the mapping-tree undo pass:
+                        // record the pending delete and leave the catalog
+                        // untouched for now (the create still wins unless the
+                        // delete's txn is confirmed committed).  A
+                        // non-transactional delete (txn_id=None, auto-commit
+                        // or legacy) is applied immediately as before.
+                        if let Some(tid) = rec.txn_id {
+                            // MOVE rec.name (clippy -D redundant_clone, b0ddb682):
+                            // this is its last use in the `if` branch.
+                            result_ref
+                                .pending_name_deletes
+                                .insert(rec.name, tid);
+                        } else {
+                            result_ref.recovered_db_names.remove(&rec.name);
+                            result_ref.recovered_db_txn_ids.remove(&rec.name);
+                            result_ref.recovered_db_name_lsns.remove(&rec.name);
+                            result_ref
+                                .recovered_db_comparators
+                                .remove(&rec.name);
+                            result_ref.recovered_db_fanouts.remove(&rec.name);
+                            // v7.11.1 tag-native: no recovered_db_sorted_dups
+                            // field on this base (integrate-only).
+                        }
                     } else {
+                        // Latest-wins: a (re)create of this name supersedes
+                        // any earlier pending transactional delete.
+                        result_ref.pending_name_deletes.remove(&rec.name);
                         result_ref
                             .recovered_db_names
                             .insert(rec.name.clone(), rec.db_id);
@@ -1947,11 +2030,21 @@ impl RecoveryManager {
                         }
                         // C-6: record the creating txn_id so that
                         // run_mapping_tree_undo_pass can undo NameLNs whose
-                        // transaction aborted.
+                        // transaction aborted.  BUG-DDL-DURABILITY-1: also
+                        // record this NameLN's LSN so an id reused across
+                        // env sessions is disambiguated by LSN ordering.
                         if let Some(tid) = rec.txn_id {
+                            result_ref
+                                .recovered_db_name_lsns
+                                .insert(rec.name.clone(), entry_lsn);
                             result_ref
                                 .recovered_db_txn_ids
                                 .insert(rec.name, tid);
+                        } else {
+                            // Non-transactional (re)create: clear any stale
+                            // txn-scoped classification for this name.
+                            result_ref.recovered_db_txn_ids.remove(&rec.name);
+                            result_ref.recovered_db_name_lsns.remove(&rec.name);
                         }
                     }
                 }

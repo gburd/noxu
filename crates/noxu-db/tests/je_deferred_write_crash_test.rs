@@ -224,18 +224,11 @@ fn je_deferred_write_test_root_split_sync_then_crash() {
 /// recovery.  The "instantiate a tree for every db in dirty_ins" rule must not
 /// resurrect a removed database.  JE skips a removed DB's stale logged INs
 /// because `dbMapTree.getDb(dbId)` returns null (RecoveryManager.java:1091-1121).
-// Depends on BUG-DDL-DURABILITY-1 (A12): a DB removal committed in a txn must
-// be fsynced so recovery sees the NameLN-delete; otherwise the removed DB is
-// resurrected and this A13 dirty_ins tree-instantiation revives it.  At this
-// base a remove-only txn's commit skips the fsync (has_logged_data()==false),
-// so the removal is lost on crash and the DB reopens.  The A13 recovery guard
-// (gate dirty_ins on recovered_db_names) is in place and correct, but it can
-// only drop a removed DB once the removal is durable.  Un-ignored by A12's
-// DDL-durability fsync (4a449d51 STOPGAP / e57b92ea DDL part).
+// A13 recovery guard + A12 BUG-DDL-DURABILITY-1: a DB removal committed in a txn
+// logs its NameLN delete under the user txn and the commit's SYNC fsyncs it, so
+// recovery sees the delete, the A13 dirty_ins guard drops the removed db_id, and
+// the DB stays removed. (Un-ignored by A12's DDL-durability fix 9770aab0.)
 #[test]
-#[ignore = "needs BUG-DDL-DURABILITY-1 (A12): remove-only txn commit must \
-            fsync the NameLN-delete or recovery resurrects the removed DB; \
-            A13 recovery guard is in place, un-ignore after A12"]
 fn je_deferred_write_test_sync_then_remove_stays_removed() {
     let dir = TempDir::new().unwrap();
     let dir_path = dir.path().to_path_buf();

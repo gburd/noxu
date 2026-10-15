@@ -538,6 +538,93 @@ fn main() {
             }
         }
 
+        // ----------------------------------------------------------------
+        // BUG-DDL-DURABILITY-1 txnal DDL durability witnesses.
+        //
+        // Each mode performs a TRANSACTIONAL remove/rename/truncate, then
+        // either COMMITs or ABORTs, then signals `ddl_done` and loops.  NO
+        // db.sync() and NO checkpoint: the ONLY path to durability is the
+        // commit's own SYNC fsync (JE Txn.logCommitEntry, Txn.java:983-986).
+        // The parent SIGKILLs after `ddl_done`.  The committed DDL op must be
+        // durable across the crash; the aborted one must leave the db intact.
+        //
+        // JE: the NameLN delete/rename is logged as an ordinary transactional
+        // LN inside the user txn (DbTree.doRemoveDb, DbTree.java:1182-1206);
+        // the physical MapLN cleanup is deferred to Txn.deletedDatabases
+        // (Txn.java:1485-1489) and runs post-commit only.
+        // ----------------------------------------------------------------
+        "txnal_remove_commit" | "txnal_remove_abort" => {
+            let commit = mode == "txnal_remove_commit";
+            // Seed one committed record so the db really exists on disk.
+            db.put(
+                DatabaseEntry::from_bytes(&[0u8; 10]),
+                DatabaseEntry::from_bytes(b"rec"),
+            )
+            .expect("seed put");
+            db.close().expect("close before remove");
+            let txn = env.begin_transaction(None).expect("begin");
+            env.remove_database(Some(&txn), "test").expect("remove under txn");
+            if commit {
+                txn.commit().expect("commit remove");
+            } else {
+                txn.abort().expect("abort remove");
+            }
+            flag(&dir, "ddl_done");
+            loop {
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        "txnal_rename_commit" | "txnal_rename_abort" => {
+            let commit = mode == "txnal_rename_commit";
+            db.put(
+                DatabaseEntry::from_bytes(&[0u8; 10]),
+                DatabaseEntry::from_bytes(b"rec"),
+            )
+            .expect("seed put");
+            db.close().expect("close before rename");
+            let txn = env.begin_transaction(None).expect("begin");
+            env.rename_database(Some(&txn), "test", "renamed")
+                .expect("rename under txn");
+            if commit {
+                txn.commit().expect("commit rename");
+            } else {
+                txn.abort().expect("abort rename");
+            }
+            flag(&dir, "ddl_done");
+            loop {
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        "txnal_truncate_commit" | "txnal_truncate_abort" => {
+            let commit = mode == "txnal_truncate_commit";
+            // Seed several committed records so a surviving truncate is
+            // observably empty and a surviving abort keeps all records.
+            for i in 0u32..20 {
+                db.put(
+                    DatabaseEntry::from_bytes(&i.to_be_bytes()),
+                    DatabaseEntry::from_bytes(b"rec"),
+                )
+                .expect("seed put");
+            }
+            db.close().expect("close before truncate");
+            let txn = env.begin_transaction(None).expect("begin");
+            let n = env
+                .truncate_database(Some(&txn), "test")
+                .expect("truncate under txn");
+            assert_eq!(n, 20, "truncate returnCount");
+            if commit {
+                txn.commit().expect("commit truncate");
+            } else {
+                txn.abort().expect("abort truncate");
+            }
+            flag(&dir, "ddl_done");
+            loop {
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+
         other => panic!("Unknown NOXU_CRASH_MODE: {other}"),
     }
 }

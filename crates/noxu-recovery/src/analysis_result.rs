@@ -205,6 +205,16 @@ pub struct AnalysisResult {
     /// transaction aborted.
     pub recovered_db_txn_ids: hashbrown::HashMap<String, u64>,
 
+    /// Database name -> the LSN of the NameLN(Txn) that (re)created it under
+    /// `recovered_db_txn_ids[name]`.  BUG-DDL-DURABILITY-1 fix: txn ids
+    /// RESTART from 1 each env session, so a cumulative recovery scan can
+    /// see the SAME id both committed (an earlier session) and aborted (a
+    /// later session).  `run_mapping_tree_undo_pass` disambiguates by LSN:
+    /// the name's creating txn counts as committed only if its TxnCommit
+    /// LSN is AFTER this NameLN's LSN (i.e. the commit resolved THIS
+    /// instance of the reused id, not an earlier one).
+    pub recovered_db_name_lsns: hashbrown::HashMap<String, Lsn>,
+
     /// Database name → persisted comparator identities `(btree, dup)` from
     /// NameLN data (DBI-14).  `None` entries mean byte-ordered.  Consumed by
     /// `open_database` to enforce JE's comparator mismatch semantics on open.
@@ -232,6 +242,19 @@ pub struct AnalysisResult {
     /// Moved into `RecoveryInfo` after analysis to seed the cleaner's profile.
     /// JE: UtilizationProfile.populateCache / RecoveryUtilizationTracker.
     pub rebuilt_file_summaries: HashMap<u32, RebuiltFileSummary>,
+
+    /// BUG-DDL-DURABILITY-1: pending TRANSACTIONAL NameLN deletes (`NameLNTxn`
+    /// with data=None, carrying the deleting txn's id).  A transactional
+    /// delete must only take effect if its txn COMMITS; if it aborted (or
+    /// crashed before commit) the name must survive.  So the delete is NOT
+    /// applied to `recovered_db_names` during the forward scan — it is
+    /// recorded here (name -> deleting txn_id) and resolved in
+    /// `run_mapping_tree_undo_pass` once commit status is known.  A later
+    /// (non-deleted) NameLN for the same name supersedes the pending delete
+    /// (latest-wins) and clears the entry.  JE: the NameLN delete is a normal
+    /// transactional LN whose visibility follows its txn's commit/abort
+    /// (`DbTree.doRemoveDb`, `Txn.deletedDatabases`).
+    pub pending_name_deletes: hashbrown::HashMap<String, u64>,
 }
 
 impl AnalysisResult {
@@ -254,10 +277,12 @@ impl AnalysisResult {
             per_db_roots: Vec::new(),
             recovered_db_names: hashbrown::HashMap::new(),
             recovered_db_txn_ids: hashbrown::HashMap::new(),
+            recovered_db_name_lsns: hashbrown::HashMap::new(),
             recovered_db_comparators: hashbrown::HashMap::new(),
             recovered_db_fanouts: hashbrown::HashMap::new(),
             txncommit_vlsns: Vec::new(),
             rebuilt_file_summaries: HashMap::new(),
+            pending_name_deletes: hashbrown::HashMap::new(),
         }
     }
 

@@ -1093,13 +1093,38 @@ impl Environment {
                 Ok(())
             }
             Some(txn) => {
-                // Defer the destructive op to commit (JE
-                // markDeleteAtTxnEnd, deleteAtCommit=true).  Abort simply
-                // never runs the callback -> the database survives.
+                // BUG-DDL-DURABILITY-1: log the NameLN-delete tombstone as an
+                // ordinary TRANSACTIONAL LN inside the user txn BEFORE commit
+                // (JE DbTree.doRemoveDb deletes the NameLN through a cursor
+                // under the user txn, DbTree.java:1182-1206), and record its
+                // LSN on the inner Txn.  That makes has_logged_data() true, so
+                // commit_with_durability writes a durable TxnCommit (SYNC =
+                // flush+fsync, Txn.java:983-986) that covers the tombstone —
+                // the removal survives a crash with no special per-op fsync.
+                // The PHYSICAL cleanup (map removal, obsolete counting) stays
+                // deferred to the commit callback (JE Txn.deletedDatabases,
+                // Txn.java:1485-1489).  Abort writes TxnAbort and never runs
+                // the callback, and recovery's mapping-tree undo pass restores
+                // the name because the deleting txn did not commit -> the
+                // database survives.
+                //
                 // F-DDL-1: bind to the validated `db_id`, not the name, so a
                 // concurrent same-name recreate committed before us is not
                 // silently destroyed (JE binds to the `DatabaseImpl`
                 // identity, DbTree.java:1214 / Txn.java:1481).
+                {
+                    let env_impl = self.env_impl.lock();
+                    if let Some(lsn) = env_impl
+                        .log_remove_name_ln_txn(name, txn.id())
+                        .map_err(map_dbi_err(name))?
+                        && let Some(inner) = txn.get_inner_txn()
+                    {
+                        inner
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .note_log_entry(lsn.as_u64());
+                    }
+                }
                 let env_impl_arc = Arc::clone(&self.env_impl);
                 let databases_arc = Arc::clone(&self.databases);
                 let name_owned = name.to_string();
@@ -1258,6 +1283,27 @@ impl Environment {
                 Ok(())
             }
             Some(txn) => {
+                // BUG-DDL-DURABILITY-1: log the rename's NameLN entries
+                // (delete old + create new) as ordinary TRANSACTIONAL LNs
+                // inside the user txn BEFORE commit (JE DbTree.dbRename re-logs
+                // the NameLN under the txn), and record the LSN on the inner
+                // Txn so has_logged_data() is true and the commit's SYNC makes
+                // the rename durable.  Only the in-memory name-map swap stays
+                // in the commit callback; abort leaves the original name in
+                // place and recovery's mapping-tree undo pass restores it.
+                {
+                    let env_impl = self.env_impl.lock();
+                    if let Some(lsn) = env_impl
+                        .log_rename_name_ln_txn(old_name, new_name, txn.id())
+                        .map_err(map_rename_err(old_name, new_name))?
+                        && let Some(inner) = txn.get_inner_txn()
+                    {
+                        inner
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .note_log_entry(lsn.as_u64());
+                    }
+                }
                 let env_impl_arc = Arc::clone(&self.env_impl);
                 let databases_arc = Arc::clone(&self.databases);
                 let old_owned = old_name.to_string();

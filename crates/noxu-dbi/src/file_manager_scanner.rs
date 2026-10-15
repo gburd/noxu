@@ -370,11 +370,19 @@ impl FileManagerLogScanner {
                 } else {
                     // Deletion: data is None.
                     // db_id 0 is a sentinel (unused for deletions).
+                    // BUG-DDL-DURABILITY-1: propagate txn_id for a
+                    // TRANSACTIONAL delete tombstone (NameLNTxn, written inside
+                    // the user txn by `log_name_ln_delete_txn`) so the
+                    // mapping-tree undo pass can UNDO the delete if the txn
+                    // aborted (restore the name).  A non-transactional NameLN
+                    // delete (auto-commit path) carries no txn_id and is
+                    // treated as committed, as before.
+                    let txn_id = r.txn_id.map(|id| id.unsigned_abs());
                     Some(LogEntry::NameLn(noxu_recovery::NameLnRecord {
                         name,
                         db_id: 0,
                         is_deleted: true,
-                        txn_id: None,
+                        txn_id,
                         btree_comparator_id: None,
                         dup_comparator_id: None,
                         fanout: None,

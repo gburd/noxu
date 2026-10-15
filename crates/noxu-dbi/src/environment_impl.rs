@@ -2898,6 +2898,29 @@ impl EnvironmentImpl {
     /// Returns an error if any open
     /// handles exist for the database (reference_count > 0).
     pub fn remove_database(&self, name: &str) -> Result<(), DbiError> {
+        // Auto-commit path: log the non-transactional tombstone here.
+        self.remove_database_impl(name, /*log_tombstone=*/ true)
+    }
+
+    /// BUG-DDL-DURABILITY-1: apply a DEFERRED (transactional) remove at commit
+    /// time.  The transactional NameLN-delete tombstone was ALREADY logged
+    /// under the user txn at operation time (`log_remove_name_ln_txn`), so the
+    /// commit callback must NOT re-log it — it only performs the physical
+    /// cleanup (map removal, obsolete counting, evicted/DW state).  Mirrors JE
+    /// `Txn.deletedDatabases` running `DatabaseImpl.finishDeleteProcessing`
+    /// post-commit (`Txn.java:1485-1489`).
+    fn apply_deferred_remove_database(
+        &self,
+        name: &str,
+    ) -> Result<(), DbiError> {
+        self.remove_database_impl(name, /*log_tombstone=*/ false)
+    }
+
+    fn remove_database_impl(
+        &self,
+        name: &str,
+        log_tombstone: bool,
+    ) -> Result<(), DbiError> {
         self.check_open()?;
 
         let db_id = self
@@ -2919,7 +2942,12 @@ impl EnvironmentImpl {
         // NameLN-wins scan would resurrect the database from its still-present
         // create NameLN.  Written before the map mutation so a failure leaves
         // the maps consistent with the (un-)logged state.
-        if let Some(lm) = &self.log_manager {
+        //
+        // BUG-DDL-DURABILITY-1: for a TRANSACTIONAL remove the tombstone was
+        // already logged under the user txn (NameLNTxn, before commit), so
+        // `log_tombstone` is false here and the commit's own SYNC made it
+        // durable — no stopgap per-op fsync.
+        if log_tombstone && let Some(lm) = &self.log_manager {
             let _ = Self::log_name_ln_delete(lm, name);
         }
         self.name_map.write().remove(name);
@@ -2960,6 +2988,29 @@ impl EnvironmentImpl {
         &self,
         old_name: &str,
         new_name: &str,
+    ) -> Result<(), DbiError> {
+        // Auto-commit path: log the non-transactional NameLN entries here.
+        self.rename_database_impl(old_name, new_name, /*log_names=*/ true)
+    }
+
+    /// BUG-DDL-DURABILITY-1: apply a DEFERRED (transactional) rename at commit
+    /// time.  The transactional delete(old)+create(new) NameLN entries were
+    /// ALREADY logged under the user txn at operation time
+    /// (`log_rename_name_ln_txn`), so the commit callback only performs the
+    /// in-memory name-map swap and metadata carry-over — it must NOT re-log.
+    fn apply_deferred_rename_database(
+        &self,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<(), DbiError> {
+        self.rename_database_impl(old_name, new_name, /*log_names=*/ false)
+    }
+
+    fn rename_database_impl(
+        &self,
+        old_name: &str,
+        new_name: &str,
+        log_names: bool,
     ) -> Result<(), DbiError> {
         self.check_open()?;
 
@@ -3009,7 +3060,12 @@ impl EnvironmentImpl {
         // Without this the rename is invisible after reopen — recovery would
         // resurrect old_name from its create NameLN and never learn new_name.
         // JE: `DbTree.dbRename` re-logs the NameLN under the new name.
-        if let Some(lm) = &self.log_manager {
+        //
+        // BUG-DDL-DURABILITY-1: for a TRANSACTIONAL rename these two entries
+        // were already logged under the user txn before commit
+        // (`log_rename_name_ln_txn`), so `log_names` is false here and the
+        // commit's own SYNC made them durable.
+        if log_names && let Some(lm) = &self.log_manager {
             let _ = Self::log_name_ln_delete(lm, old_name);
             let _ = Self::log_name_ln(
                 lm,
@@ -3179,8 +3235,34 @@ impl EnvironmentImpl {
             // the validated target is already gone/replaced -> no-op.
             _ => return Ok(false),
         }
-        self.remove_database(name)?;
+        // BUG-DDL-DURABILITY-1: the NameLN-delete tombstone was already logged
+        // transactionally at operation time; the commit callback only does the
+        // physical cleanup.
+        self.apply_deferred_remove_database(name)?;
         Ok(true)
+    }
+
+    /// BUG-DDL-DURABILITY-1: log a TRANSACTIONAL NameLN-delete tombstone for a
+    /// deferred remove under the user's transaction, returning the assigned
+    /// LSN (so the caller records it on the `Txn` via `note_log_entry`).  The
+    /// tombstone is written BEFORE commit so the commit's normal SYNC makes it
+    /// durable; the physical cleanup happens in the commit callback via
+    /// [`Self::remove_database_if_id`].  No in-memory map mutation here — a
+    /// concurrent reader must still see the DB as live until the delete
+    /// commits (JE `DbTree.doRemoveDb` logs under the txn; the name stays
+    /// visible to other lockers until commit).
+    pub fn log_remove_name_ln_txn(
+        &self,
+        name: &str,
+        txn_id: u64,
+    ) -> Result<Option<noxu_util::Lsn>, DbiError> {
+        self.check_open()?;
+        match &self.log_manager {
+            Some(lm) => {
+                Self::log_name_ln_delete_txn(lm, name, txn_id).map(Some)
+            }
+            None => Ok(None),
+        }
     }
 
     /// Identity-guarded rename for deferred (transactional) DDL.
@@ -3200,8 +3282,76 @@ impl EnvironmentImpl {
             Some(id) if id == expected_id => {}
             _ => return Ok(false),
         }
-        self.rename_database(old_name, new_name)?;
+        // BUG-DDL-DURABILITY-1: the NameLN delete(old)+create(new) entries were
+        // already logged transactionally at operation time; the commit callback
+        // only swaps the in-memory maps.
+        self.apply_deferred_rename_database(old_name, new_name)?;
         Ok(true)
+    }
+
+    /// BUG-DDL-DURABILITY-1: log the TRANSACTIONAL NameLN entries for a
+    /// deferred rename under the user's transaction — a delete tombstone for
+    /// `old_name` and a create NameLNTxn for `new_name` (same db_id, same
+    /// persisted metadata) — returning the LSN of the LAST entry so the caller
+    /// records it on the `Txn`.  Written BEFORE commit so the commit's SYNC
+    /// makes the rename durable; the in-memory swap happens in the commit
+    /// callback via [`Self::rename_database_if_id`].  Mirrors JE
+    /// `DbTree.dbRename` logging the NameLN under the txn.
+    pub fn log_rename_name_ln_txn(
+        &self,
+        old_name: &str,
+        new_name: &str,
+        txn_id: u64,
+    ) -> Result<Option<noxu_util::Lsn>, DbiError> {
+        self.check_open()?;
+        let lm = match &self.log_manager {
+            Some(lm) => lm,
+            None => return Ok(None),
+        };
+        let db_id =
+            self.name_map.read().get(old_name).copied().ok_or_else(|| {
+                DbiError::DatabaseNotFound(old_name.to_string())
+            })?;
+        // Resolve the DB's persisted comparator identities / fanout /
+        // sorted-dups so the new-name create carries the same metadata
+        // (mirrors the auto-commit `rename_database` resolution).
+        let (btree_id, dup_id): (Option<String>, Option<String>) =
+            if let Some(db) = self.db_map.read().get(&db_id) {
+                let g = db.read();
+                (
+                    g.btree_comparator_id().map(|x| x.to_string()),
+                    g.duplicate_comparator_id().map(|x| x.to_string()),
+                )
+            } else if let Some(ids) =
+                self.recovered_comparators.read().get(old_name)
+            {
+                ids.clone()
+            } else {
+                (None, None)
+            };
+        let fanout: Option<i32> =
+            if let Some(db) = self.db_map.read().get(&db_id) {
+                Some(db.read().max_tree_entries_per_node())
+            } else {
+                self.recovered_fanouts.read().get(old_name).copied()
+            };
+        // v7.11.1 tag-native: this base's `log_name_ln_txn` does not persist a
+        // sorted-duplicates flag in the NameLN catalog (no
+        // `recovered_sorted_dups` field / no 8th arg); the sorted-dups config
+        // is restored from the DB's own metadata on reopen, not the NameLN.
+        // Delete the old name (transactional tombstone) then create the new
+        // name (transactional NameLNTxn), both under the user txn.
+        let _ = Self::log_name_ln_delete_txn(lm, old_name, txn_id)?;
+        let last = Self::log_name_ln_txn(
+            lm,
+            new_name,
+            db_id.id() as u64,
+            txn_id,
+            btree_id.as_deref(),
+            dup_id.as_deref(),
+            fanout,
+        )?;
+        Ok(Some(last))
     }
 
     /// Identity-guarded truncate for deferred (transactional) DDL.
@@ -3282,9 +3432,62 @@ impl EnvironmentImpl {
         );
         let mut buf = BytesMut::with_capacity(entry.log_size());
         entry.write_to_log(&mut buf);
-        lm.log(LogEntryType::NameLN, &buf, Provisional::No, false, false)
+        // AUTO-COMMIT durability: this non-transactional tombstone is the
+        // auto-commit (txn=None) remove/rename path.  JE runs auto-commit DDL
+        // under an implicit SYNC auto-commit txn, so flush+fsync the tombstone
+        // here to match that durability.  (The TRANSACTIONAL path no longer
+        // reaches this method: it logs a NameLNTxn delete under the user txn
+        // via `log_name_ln_delete_txn` before commit and relies on the
+        // commit's own SYNC — BUG-DDL-DURABILITY-1.)
+        lm.log(LogEntryType::NameLN, &buf, Provisional::No, true, true)
             .map(|_| ())
             .map_err(DbiError::from)
+    }
+
+    /// BUG-DDL-DURABILITY-1: write a TRANSACTIONAL NameLN-delete tombstone
+    /// inside the user's transaction (`Provisional::Yes`, `txn_id=Some`),
+    /// mirroring JE `DbTree.doRemoveDb` (`DbTree.java:1182-1206`), which
+    /// deletes the NameLN through a cursor under the user's txn as an ordinary
+    /// transactional LN.  Returns the assigned LSN so the caller can record it
+    /// on the creating `Txn` (`note_log_entry`) — that makes
+    /// `has_logged_entries()` true, so the normal SYNC commit
+    /// (`Txn.logCommitEntry`, `Txn.java:983-986`) writes a durable TxnCommit
+    /// that flushes+fsyncs this tombstone.  Lazy (flush=false, fsync=false):
+    /// durability comes from the commit, not from a special per-op fsync
+    /// (unlike the retired `log_name_ln_delete` stopgap).  On abort/crash the
+    /// mapping-tree undo pass restores the name because the deleting txn did
+    /// not commit.
+    fn log_name_ln_delete_txn(
+        lm: &Arc<LogManager>,
+        name: &str,
+        txn_id: u64,
+    ) -> Result<noxu_util::Lsn, DbiError> {
+        use noxu_util::vlsn::NULL_VLSN;
+        let entry = LnLogEntry::new(
+            0,                   // db_id header field (unused for NameLN)
+            Some(txn_id as i64), // txn_id: deleting transaction
+            NULL_LSN,
+            false,
+            None,
+            None,
+            NULL_VLSN,
+            0,
+            false,
+            name.as_bytes().to_vec(),
+            None, // data = None -> deletion NameLN (is_deleted on recovery)
+            0,
+            NULL_VLSN,
+        );
+        let mut buf = BytesMut::with_capacity(entry.log_size());
+        entry.write_to_log(&mut buf);
+        lm.log(
+            LogEntryType::NameLNTxn,
+            &buf,
+            Provisional::Yes,
+            false, // flush: lazy — the TxnCommit SYNC flushes/fsyncs
+            false, // fsync: lazy
+        )
+        .map_err(DbiError::from)
     }
 
     /// Returns the list of committed database names.
