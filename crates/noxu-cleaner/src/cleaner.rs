@@ -1682,6 +1682,17 @@ impl Cleaner {
 
         pending.retain(|&file_number| {
             if !self.file_protector.is_protected(file_number) {
+                // Defense-in-depth (BUG-CLEANER-LIVE-FILE-DELETE): never try
+                // to delete the current write file (or a higher number).  The
+                // selector should never have queued it, but if it did, keep it
+                // in pending and skip quietly — it is not deletable until it is
+                // no longer the live file, and attempting it would hit the
+                // FileManager::delete_file guard and log an error every pass.
+                if let Some(fm) = &self.file_manager
+                    && file_number >= fm.get_current_file_num()
+                {
+                    return true; // keep in pending; retry once it is old
+                }
                 // Perform the actual on-disk deletion when wired to a
                 // FileManager.  Ignore errors (e.g. file already gone) so
                 // that a single failed delete doesn't stall the cleaner.
@@ -1844,6 +1855,19 @@ impl Cleaner {
 
         let mut deleted = 0u32;
         for file_number in files_to_delete {
+            // Defense-in-depth (BUG-CLEANER-LIVE-FILE-DELETE): never delete the
+            // current write file (or a higher number).  The selector should
+            // never surface it, but if it does, hold it on the pending list
+            // (so the two-checkpoint barrier is preserved) and skip quietly
+            // rather than call delete_file — which would hit the FileManager
+            // guard and log an error on every pass.  It becomes deletable once
+            // the log has rolled past it.
+            if let Some(fm) = &self.file_manager
+                && file_number >= fm.get_current_file_num()
+            {
+                self.pending_deletions.lock().push(file_number);
+                continue;
+            }
             if !self.file_protector.is_protected(file_number) {
                 if let Some(fm) = &self.file_manager
                     && let Err(e) = fm.delete_file(file_number)
@@ -2379,6 +2403,11 @@ mod tests {
     fn test_delete_pending_files_removes_file_on_disk() {
         let dir = tempfile::TempDir::new().unwrap();
         let fm = make_fm_with_entries(dir.path());
+        // Roll the log forward so file 0 is no longer the current write file
+        // (BUG-CLEANER-LIVE-FILE-DELETE guard: only non-current files are
+        // deletable).  In production the log always rolls before a file
+        // becomes garbage.
+        fm.flip_file().unwrap();
 
         // Confirm file 0 exists on disk before deletion.
         let file_path = dir.path().join("00000000.ndb");
@@ -2396,6 +2425,77 @@ mod tests {
         );
         // Pending list must be empty.
         assert!(cleaner.pending_deletions.lock().is_empty());
+    }
+
+    /// BUG-CLEANER-LIVE-FILE-DELETE (cleaner side): a delete request for the
+    /// current write file must be SKIPPED, not deleted and not counted, and
+    /// must be kept (not dropped) so it is deleted once the log rolls past it.
+    /// Retrying must stay quiet (no FileManager::delete_file call, so no
+    /// error-level log, no env invalidation, no spin).
+    #[test]
+    fn delete_requests_for_the_current_file_are_skipped_not_counted() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let fm = make_fm_with_entries(dir.path());
+        // File 0 is the current write file (no flip): current_file_num == 0.
+        assert_eq!(fm.get_current_file_num(), 0);
+        let file_path = dir.path().join("00000000.ndb");
+        assert!(file_path.exists());
+
+        let cleaner = Cleaner::with_file_manager(50, 0, 0, Arc::clone(&fm));
+        cleaner.request_delete_files(&[0]);
+
+        // Several passes: each must skip quietly, delete nothing, count
+        // nothing, keep the request on the pending list, and leave the file.
+        for _ in 0..5 {
+            let deleted = cleaner.delete_pending_files();
+            assert_eq!(deleted, 0, "the live file must not be deleted");
+            assert!(file_path.exists(), "the live file must stay on disk");
+            assert_eq!(
+                cleaner.get_stats().snapshot().deletions,
+                0,
+                "a skipped live-file deletion must not be counted"
+            );
+            assert!(
+                cleaner.pending_deletions.lock().contains(&0),
+                "the request must be retained for retry after the log rolls"
+            );
+        }
+
+        // Roll the log so file 0 is no longer current; now it is deletable.
+        fm.flip_file().unwrap();
+        let deleted = cleaner.delete_pending_files();
+        assert_eq!(deleted, 1, "file 0 is deletable once it is no longer live");
+        assert!(!file_path.exists());
+        assert!(cleaner.pending_deletions.lock().is_empty());
+    }
+
+    /// Same invariant through `delete_safe_files`: a safe-to-delete entry for
+    /// the current file is held on the pending list, not unlinked, not
+    /// counted, and does not spin the selector.
+    #[test]
+    fn safe_delete_of_the_current_file_is_held_not_unlinked() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let fm = make_fm_with_entries(dir.path());
+        assert_eq!(fm.get_current_file_num(), 0);
+        let file_path = dir.path().join("00000000.ndb");
+
+        let cleaner = Cleaner::with_file_manager(50, 0, 0, Arc::clone(&fm));
+        cleaner.get_file_selector().lock().add_safe_to_delete_back(0);
+
+        let deleted = cleaner.delete_safe_files();
+        assert_eq!(deleted, 0, "the live file must not be deleted");
+        assert!(file_path.exists(), "the live file must stay on disk");
+        assert_eq!(cleaner.get_stats().snapshot().deletions, 0);
+        assert!(
+            cleaner.pending_deletions.lock().contains(&0),
+            "the current file is held on pending for retry after a roll"
+        );
+
+        // After a roll it becomes deletable via the pending path.
+        fm.flip_file().unwrap();
+        let deleted = cleaner.delete_pending_files();
+        assert_eq!(deleted, 1);
+        assert!(!file_path.exists());
     }
 
     /// Protected files are not deleted even when a FileManager is present.
@@ -2441,6 +2541,8 @@ mod tests {
     fn test_do_clean_end_to_end_with_real_fm() {
         let dir = tempfile::TempDir::new().unwrap();
         let fm = make_fm_with_entries(dir.path());
+        // Roll past file 0 so, once cleaned, it is deletable (not current).
+        fm.flip_file().unwrap();
 
         let file_path = dir.path().join("00000000.ndb");
         assert!(file_path.exists(), "log file must exist before do_clean");
@@ -2640,6 +2742,8 @@ mod tests {
     fn deletion_retires_accounting_only_after_success() {
         let dir = tempfile::TempDir::new().unwrap();
         let (fm, _lm) = make_fm_and_lm_with_entries(dir.path());
+        // Roll past file 0 so it is deletable (not the current write file).
+        fm.flip_file().unwrap();
         let tracker = Arc::new(Mutex::new(UtilizationTracker::new(true)));
         tracker.lock().count_new_log_entry(0, 100, true, false);
         tracker.lock().count_new_log_entry(1, 200, true, false);
@@ -2839,6 +2943,8 @@ mod tests {
     fn test_do_clean_with_tree_no_ln_entries() {
         let dir = tempfile::TempDir::new().unwrap();
         let (fm, lm) = make_fm_and_lm_with_entries(dir.path());
+        // Roll past file 0 so, once cleaned, it is deletable (not current).
+        fm.flip_file().unwrap();
 
         let tree = Arc::new(RwLock::new(noxu_tree::Tree::new(1, 128)));
         let file_path = dir.path().join("00000000.ndb");
