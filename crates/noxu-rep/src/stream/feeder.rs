@@ -44,6 +44,34 @@ pub trait LogScanner: Send {
     /// Return the next available entry with VLSN >= `from_vlsn`, or `None` if
     /// no new entry is available at this moment.
     fn next_entry(&mut self, from_vlsn: u64) -> Option<(u64, u8, Vec<u8>)>;
+
+    /// Take any fatal scan error raised by the most recent `next_entry` that
+    /// returned `None`.
+    ///
+    /// A `None` from `next_entry` is normally a *transient* "no more entries
+    /// yet" (the tail of the log — the caller waits and retries). But if the
+    /// scanner found a log file it still needs *gone* below the end of the log
+    /// (cleaned/deleted/unreadable), that `None` is NOT transient: the file
+    /// will never reappear and the replica cannot be fed sequentially. The
+    /// scanner records a [`RepError::NetworkRestoreError`] which the feeder loop takes
+    /// here and surfaces, so the replica is told it needs a network restore
+    /// (JE `FileReader.readNextEntry` → `LOG_FILE_NOT_FOUND`; the feeder's
+    /// InsufficientLog path) rather than spinning on a file that is gone.
+    ///
+    /// The default returns `None` (in-memory / peer scanners never hit this).
+    ///
+    /// PATCH-SAFE (v7.11.1): `#[doc(hidden)]` so this new defaulted trait
+    /// method is not part of the documented stable API surface of a patch
+    /// release. Adding a defaulted method is minor-compatible per
+    /// `cargo-semver-checks`, but the backport contract requires any new
+    /// helper in a stable crate to be hidden; a downstream impl of
+    /// `LogScanner` is unaffected (the default applies). The only theoretical
+    /// hazard is a downstream type with a same-named INHERENT method, which
+    /// would shadow this at the call site — acceptable and noted.
+    #[doc(hidden)]
+    fn take_scan_error(&mut self) -> Option<crate::error::RepError> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -67,6 +95,37 @@ pub struct EnvironmentLogScanner {
     cursor_offset: u64,
     /// Highest VLSN returned so far (to avoid duplicates on re-entrant calls).
     last_returned_vlsn: u64,
+    /// Set when the most recent `next_entry` returned `None` because a needed
+    /// log file is gone BELOW the end of the log (not a tail wait). Taken by
+    /// `take_scan_error`; the feeder surfaces it as a restore trigger.
+    scan_error: Option<crate::error::RepError>,
+}
+
+/// Outcome of a single raw read at a `(file, offset)` cursor position.
+///
+/// Mirrors the three ways JE's `FileReader.readNextEntryAllowExceptions`
+/// terminates a read: a successful entry, a genuine in-file EOF
+/// (`EOFException`), or a condition that is explicitly NOT EOF (short read,
+/// I/O error, `FileNotFoundException`). The last must never be collapsed into
+/// "advance to the next file", or committed VLSNs in — or behind — a
+/// momentarily-unreadable file would be silently skipped and never shipped to
+/// a replica (lost committed transactions). See `read_raw_entry`.
+enum RawRead {
+    /// A valid entry was read: `(entry_size, vlsn_opt, entry_type_byte,
+    /// payload)`.
+    Entry {
+        entry_size: usize,
+        vlsn_opt: Option<u64>,
+        entry_type_byte: u8,
+        payload: Vec<u8>,
+    },
+    /// Sealed-file zero-fill tail: no further entry in THIS file. The scan may
+    /// advance to the following file (JE `EOFException` → `eof = true`).
+    CleanEof,
+    /// The entry at this offset is not readable right now (short read, I/O
+    /// error, cleaned/deleted file, implausible size). This is NOT EOF: the
+    /// cursor must stay put and the scanner returns "nothing yet".
+    NotYet,
 }
 
 impl EnvironmentLogScanner {
@@ -116,29 +175,55 @@ impl EnvironmentLogScanner {
             cursor_file,
             cursor_offset,
             last_returned_vlsn: 0,
+            scan_error: None,
         })
     }
 
     /// Read the raw header+payload at `(file_num, offset)`.
     ///
-    /// Returns `(entry_size_bytes, vlsn_opt, entry_type_byte, payload)` or
-    /// `None` if the bytes don't form a valid entry (zero fill, truncation).
-    fn read_raw_entry(
-        &self,
-        file_num: u32,
-        offset: u64,
-    ) -> Option<(usize, Option<u64>, u8, Vec<u8>)> {
+    /// Distinguishes JE's two end conditions (JE `FileReader.readNextEntry` /
+    /// `readNextEntryAllowExceptions`, FileReader.java:243-390):
+    ///
+    /// * [`RawRead::Entry`] — a valid entry was read.
+    /// * [`RawRead::CleanEof`] — the bytes at `offset` are the sealed-file
+    ///   zero-fill tail (`hdr[4] == 0`), i.e. there is no further entry in
+    ///   this file. JE throws `EOFException`, which sets `eof` and lets the
+    ///   scan advance to the following file.
+    /// * [`RawRead::NotYet`] — a header or body could not be fully read, the
+    ///   read errored (e.g. the file was concurrently cleaned/deleted →
+    ///   `FileNotFound`), or `item_size` is implausible. This is NOT
+    ///   end-of-file: there may be more durable bytes at this very offset that
+    ///   are momentarily unreadable (a short read racing a flush, a
+    ///   file-handle eviction, a cleaned file). JE never treats these as EOF —
+    ///   `readNextEntry` turns a `FileNotFoundException` into a hard
+    ///   `EnvironmentFailureException(LOG_FILE_NOT_FOUND)` (FileReader.java:
+    ///   243-251) rather than silently skipping the file. The scanner MUST
+    ///   NOT advance its cursor past `NotYet`; it returns "nothing yet" so the
+    ///   feeder re-polls, exactly as JE's FeederReader waits for the log
+    ///   (FeederReader.java:198 `WaitTimeOutException` → return null).
+    fn read_raw_entry(&self, file_num: u32, offset: u64) -> RawRead {
         let mut hdr = [0u8; MIN_HEADER_SIZE];
-        let n = self
+        let n = match self
             .file_manager
             .read_from_file(file_num, offset, &mut hdr)
-            .ok()?;
+        {
+            Ok(n) => n,
+            // A read error mid-log (e.g. the file was concurrently cleaned /
+            // its handle evicted → FileNotFound) is NOT end-of-file. Do not
+            // skip the file: surface "nothing yet" and keep the cursor put.
+            Err(_) => return RawRead::NotYet,
+        };
         if n < MIN_HEADER_SIZE {
-            return None;
+            // Fewer bytes than a header: either the sealed-file zero-fill tail
+            // or a torn/short read. The caller already checked
+            // `offset < file_len` before calling us, so there ARE bytes here
+            // we failed to read in full — treat as "not yet", never EOF.
+            return RawRead::NotYet;
         }
-        // Zero-fill region past last written entry.
+        // Zero-fill region past last written entry: this is a genuine
+        // in-file EOF (JE EOFException), so the scan may advance.
         if hdr[4] == 0 {
-            return None;
+            return RawRead::CleanEof;
         }
 
         let entry_type_byte = hdr[4];
@@ -152,25 +237,35 @@ impl EnvironmentLogScanner {
 
         // Sanity cap: same shared MAX_ITEM_SIZE used by every log reader
         // so that an attacker who flips item_size cannot cause a 100 MiB
-        // allocation here while passing other readers' bounds.
+        // allocation here while passing other readers' bounds. An implausible
+        // size means we cannot trust this offset as a frame boundary; wait
+        // rather than skip (do not advance the cursor).
         if item_size > MAX_ITEM_SIZE {
-            return None;
+            return RawRead::NotYet;
         }
 
         let entry_size = header_size + item_size;
         let mut full = vec![0u8; entry_size];
-        let n = self
-            .file_manager
-            .read_from_file(file_num, offset, &mut full)
-            .ok()?;
+        let n =
+            match self.file_manager.read_from_file(file_num, offset, &mut full)
+            {
+                Ok(n) => n,
+                Err(_) => return RawRead::NotYet,
+            };
         if n < entry_size {
-            return None;
+            // The full entry is not readable here yet (torn tail / short read
+            // racing a flush). Not EOF — wait for the rest.
+            return RawRead::NotYet;
         }
 
         // Extract VLSN from the header extension if present (8-byte LE i64).
         let vlsn_opt = if vlsn_present && full.len() >= MAX_HEADER_SIZE {
+            // Exactly 8 bytes (MIN..MAX = 14..22): the slice length is a
+            // compile-time-fixed 8, so the conversion cannot fail.
             let raw = i64::from_le_bytes(
-                full[MIN_HEADER_SIZE..MAX_HEADER_SIZE].try_into().ok()?,
+                full[MIN_HEADER_SIZE..MAX_HEADER_SIZE]
+                    .try_into()
+                    .expect("invariant: 8-byte VLSN header slice"),
             );
             if raw > 0 {
                 Some(raw as u64)
@@ -194,7 +289,80 @@ impl EnvironmentLogScanner {
         };
 
         let payload = full[header_size..].to_vec();
-        Some((entry_size, vlsn_opt, entry_type_byte, payload))
+        RawRead::Entry { entry_size, vlsn_opt, entry_type_byte, payload }
+    }
+
+    /// Is `(file, offset)` strictly below the current end of the log — i.e.
+    /// should there be a durable entry here that we failed to read?
+    ///
+    /// The "tail" of the log is only the highest-numbered file on disk, at or
+    /// beyond its current length (that is where the next bytes will be
+    /// appended). Anything else — a LOWER-numbered file, or a position below
+    /// the last file's length — names bytes that must already be durable; if
+    /// we cannot read an entry there, the file is *gone* (cleaned/deleted),
+    /// never a tail wait.
+    ///
+    /// Derived from the live file listing + the last file's length (not from
+    /// `next_available_lsn`, which a read-only reader FM may not have had set
+    /// by recovery). `get_next_available_lsn` is folded in as a lower bound so
+    /// a live writer's reserved-but-not-yet-listed tail still counts as the
+    /// tail.
+    fn below_end_of_log(&self, file: u32, _offset: u64) -> bool {
+        // The "tail" of the log is the HIGHEST-numbered file on disk: that is
+        // where the log writer appends, so a short/unreadable entry there is a
+        // transient in-progress flush (a torn tail), NOT a gone file. Only a
+        // position on a LOWER-numbered file than the current highest names
+        // bytes that must already be durable in a file that is now gone
+        // (cleaned/deleted). Comparing by FILE NUMBER (not byte offset in the
+        // last file) avoids a false "gone" on a torn tail of the last file.
+        // The dense VLSN-continuity invariant in `next_entry` is the primary
+        // data-loss guard; this is the secondary tail-vs-gone signal for a
+        // NotYet / missing-file read where we have no concrete higher VLSN.
+        let highest = match self.file_manager.list_file_numbers() {
+            Ok(nums) => nums.last().copied(),
+            Err(_) => None,
+        };
+        let nal_file = {
+            let nal = self.file_manager.get_next_available_lsn();
+            if nal == NULL_LSN { None } else { Some(nal.file_number()) }
+        };
+        let tail_file = match (highest, nal_file) {
+            (Some(h), Some(n)) => h.max(n),
+            (Some(h), None) => h,
+            (None, Some(n)) => n,
+            (None, None) => return false,
+        };
+        file < tail_file
+    }
+
+    /// Record a fatal "log file gone" scan error if `(file, offset)` is below
+    /// the end of the log. Returns `true` if the error was set (the caller
+    /// must return `None` and let the feeder surface the error → restore),
+    /// `false` if this is a benign tail wait (the caller waits).
+    fn note_gone_if_below_eol(
+        &mut self,
+        file: u32,
+        offset: u64,
+        from_vlsn: u64,
+    ) -> bool {
+        if self.below_end_of_log(file, offset) {
+            // PATCH-SAFE (v7.11.1): carry the "log file gone, replica must
+            // network-restore" condition in the EXISTING `NetworkRestoreError`
+            // variant rather than adding a new public `RepError` variant.
+            // `RepError` is NOT `#[non_exhaustive]` at v7.11.0, so adding a
+            // variant is a MAJOR break (cargo-semver-checks:
+            // enum_variant_added) and cannot ship in a patch. The structured
+            // facts (file/offset/from_vlsn) are formatted into the message.
+            // Integrate (v8.0.0) uses the typed `RepError::LogFileGone`.
+            self.scan_error = Some(
+                crate::error::RepError::NetworkRestoreError(format!(
+                    "log file {file:08x} needed by the feeder is gone below                      the end of log at offset {offset:#x} (vlsn >=                      {from_vlsn}); replica needs a network restore"
+                )),
+            );
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -205,16 +373,54 @@ impl LogScanner for EnvironmentLogScanner {
     /// reaches the end of the currently-written log.  The feeder will sleep
     /// briefly and call again.
     fn next_entry(&mut self, from_vlsn: u64) -> Option<(u64, u8, Vec<u8>)> {
+        self.scan_error = None;
         // Collect file numbers once per call; cheap (directory listing).
         let file_nums = self.file_manager.list_file_numbers().ok()?;
         if file_nums.is_empty() {
             return None;
         }
 
+        // The lowest log file currently on disk. A cursor sitting on a file
+        // below this that no longer exists means either (a) the feeder is
+        // starting up behind the log head (files legitimately cleaned long
+        // ago, before the replica's position — a header-offset cursor that has
+        // returned nothing from the missing file) or (b) a file we were
+        // actively reading was deleted out from under us mid-stream. Only (a)
+        // may skip forward; (b) must wait, never skip, or the deleted file's
+        // committed VLSNs are lost (JE FileReader.readNextEntry treats a
+        // missing file as LOG_FILE_NOT_FOUND, not EOF; FileReader.java:243).
+        let lowest_file = file_nums.first().copied();
+
         loop {
-            // Skip files before the current cursor file.
+            // Handle a cursor pointing at a file that is not on disk.
             if !file_nums.contains(&self.cursor_file) {
-                // Advance to the next known file.
+                let at_header_start = self.cursor_offset
+                    <= self
+                        .file_manager
+                        .file_header_size_for(self.cursor_file)
+                        .unwrap_or_else(|_| {
+                            file_header_on_disk_size(LOG_FILE_VERSION)
+                        }) as u64;
+                let below_log_head =
+                    lowest_file.is_some_and(|lo| self.cursor_file < lo);
+                if !(at_header_start && below_log_head) {
+                    // We were part-way through a file that has vanished (it was
+                    // cleaned/deleted while we read it): do NOT jump to a later
+                    // file, or every VLSN still owed from the vanished file is
+                    // skipped and shipped as a gap to the replica
+                    // (REP-FEEDER-SKIP). A file missing BELOW the end of log
+                    // will never reappear → surface LogFileGone so the feeder
+                    // triggers a network restore (JE LOG_FILE_NOT_FOUND); only
+                    // a genuine tail position waits.
+                    self.note_gone_if_below_eol(
+                        self.cursor_file,
+                        self.cursor_offset,
+                        from_vlsn,
+                    );
+                    return None;
+                }
+                // Legitimate start-behind-the-head: advance to the first file
+                // that actually exists.
                 let next =
                     file_nums.iter().find(|&&n| n > self.cursor_file).copied();
                 match next {
@@ -232,7 +438,21 @@ impl LogScanner for EnvironmentLogScanner {
             }
 
             let file_len =
-                self.file_manager.get_file_length(self.cursor_file).ok()?;
+                match self.file_manager.get_file_length(self.cursor_file) {
+                    Ok(len) => len,
+                    // The file is gone (concurrently cleaned). Not EOF: never skip
+                    // its still-owed VLSNs (REP-FEEDER-SKIP). If it is gone below
+                    // the end of log it will never return → LogFileGone (restore);
+                    // otherwise this is the tail → wait.
+                    Err(_) => {
+                        self.note_gone_if_below_eol(
+                            self.cursor_file,
+                            self.cursor_offset,
+                            from_vlsn,
+                        );
+                        return None;
+                    }
+                };
 
             if self.cursor_offset >= file_len {
                 // End of current file: move to next file.
@@ -254,8 +474,9 @@ impl LogScanner for EnvironmentLogScanner {
             }
 
             match self.read_raw_entry(self.cursor_file, self.cursor_offset) {
-                None => {
-                    // End of written data in this file; move to next.
+                RawRead::CleanEof => {
+                    // Sealed-file zero-fill tail (JE EOFException): this file
+                    // holds no further entry, so advance to the next one.
                     let next = file_nums
                         .iter()
                         .find(|&&n| n > self.cursor_file)
@@ -275,13 +496,76 @@ impl LogScanner for EnvironmentLogScanner {
                         None => return None,
                     }
                 }
-                Some((entry_size, vlsn_opt, entry_type_byte, payload)) => {
+                RawRead::NotYet => {
+                    // The entry at `cursor_offset` is not readable right now
+                    // even though `cursor_offset < file_len` (short read, a
+                    // concurrently-cleaned file → FileNotFound, a handle
+                    // eviction, or an implausible size). This is NOT the end
+                    // of the file. JE never advances past it (that would drop
+                    // every committed VLSN remaining in this file — a gap
+                    // shipped to the replica; REP-FEEDER-SKIP). Leave the
+                    // cursor put. If the position is BELOW the end of log the
+                    // bytes should be there and are not → the file is gone, so
+                    // surface LogFileGone and let the feeder trigger a restore
+                    // (JE FileReader.readNextEntry → LOG_FILE_NOT_FOUND). If it
+                    // is at the tail (a short read racing a flush), this is a
+                    // transient wait: the feeder re-polls.
+                    self.note_gone_if_below_eol(
+                        self.cursor_file,
+                        self.cursor_offset,
+                        from_vlsn,
+                    );
+                    return None;
+                }
+                RawRead::Entry {
+                    entry_size,
+                    vlsn_opt,
+                    entry_type_byte,
+                    payload,
+                } => {
                     self.cursor_offset += entry_size as u64;
 
                     if let Some(vlsn) = vlsn_opt
                         && vlsn >= from_vlsn
                         && vlsn > self.last_returned_vlsn
                     {
+                        // VLSN-CONTINUITY INVARIANT (REP-FEEDER-SKIP). Noxu's
+                        // replicable VLSNs are dense (every txn LN + TxnCommit
+                        // consumes the next VLSN; TxnAbort consumes none), so
+                        // the next VLSN in a sequential feed MUST be exactly
+                        // last_returned_vlsn + 1. JE's FeederReader positions
+                        // by VLSN through the VLSNIndex and skips FILE gaps
+                        // safely only because the index preserves VLSN
+                        // continuity (FeederReader.java:96,186-189,197). Noxu
+                        // walks raw files by file-number adjacency, so a file
+                        // (or VLSN range) cleaned AHEAD of the cursor is jumped
+                        // over by the "move to next file" logic and its VLSNs
+                        // would be silently dropped. Guard both the cursor-file
+                        // and the ahead-of-cursor cases with one invariant. A
+                        // BARREN file gap (no replicable entries; JE
+                        // FileProtector.java:80,84) does not trip it: the next
+                        // replicable VLSN is still `expected`.
+                        let expected = self.last_returned_vlsn + 1;
+                        if from_vlsn <= expected && vlsn > expected {
+                            // VLSNs [expected ..= vlsn-1] were skipped and are
+                            // below the end of log (we hold a higher vlsn) =>
+                            // gone, replica must network-restore. PATCH-SAFE:
+                            // existing NetworkRestoreError variant.
+                            self.scan_error = Some(
+                                crate::error::RepError::NetworkRestoreError(
+                                    format!(
+                                        "replicable VLSN gap: expected vlsn \
+                                         {expected} but next on disk is \
+                                         {vlsn} (file {:08x}); VLSNs \
+                                         [{expected}..={}] are gone, replica \
+                                         needs a network restore",
+                                        self.cursor_file,
+                                        vlsn - 1,
+                                    ),
+                                ),
+                            );
+                            return None;
+                        }
                         self.last_returned_vlsn = vlsn;
                         return Some((vlsn, entry_type_byte, payload));
                     }
@@ -290,6 +574,10 @@ impl LogScanner for EnvironmentLogScanner {
                 }
             }
         }
+    }
+
+    fn take_scan_error(&mut self) -> Option<crate::error::RepError> {
+        self.scan_error.take()
     }
 }
 
@@ -412,6 +700,18 @@ impl FeederRunner {
             {
                 self.send_entry(vlsn, entry_type, &payload)?;
                 next_vlsn = vlsn + 1;
+            }
+
+            // A `None` from the scanner is normally a transient tail wait, but
+            // if a log file we still need is GONE below the end of the log the
+            // scanner records a fatal `LogFileGone`. Surface it: the replica
+            // cannot be fed sequentially past a cleaned file and must perform a
+            // network restore (JE `FileReader.readNextEntry` →
+            // `LOG_FILE_NOT_FOUND`; the feeder's InsufficientLog path). Return
+            // the error rather than spinning forever on a file that will never
+            // reappear. REP-FEEDER-SKIP.
+            if let Some(err) = log_scanner.take_scan_error() {
+                return Err(err);
             }
 
             // ----------------------------------------------------------------
@@ -1206,6 +1506,480 @@ mod tests {
         header.add_post_marshalling_info(&mut buf, 0, vlsn, checksum).unwrap();
         fm.write_buffer_to_file(0, &buf, offset).unwrap();
         offset + buf.len() as u64
+    }
+
+    /// Like [`feeder_append_entry`] but writes into an explicit `file_num`
+    /// (auto-created with its header on first write). Returns the new offset.
+    fn feeder_append_entry_to_file(
+        fm: &FileManager,
+        file_num: u32,
+        offset: u64,
+        entry_type: LogEntryType,
+        vlsn: Option<noxu_util::Vlsn>,
+        payload: &[u8],
+    ) -> u64 {
+        let mut header = LogEntryHeader::new(
+            entry_type,
+            payload.len() as u32,
+            Provisional::No,
+            vlsn.is_some(),
+            vlsn,
+        );
+        let mut buf = Vec::new();
+        header.write_to_log(&mut buf).unwrap();
+        buf.extend_from_slice(payload);
+        let checksum = crc32fast::hash(&buf[4..]);
+        header.add_post_marshalling_info(&mut buf, 0, vlsn, checksum).unwrap();
+        fm.write_buffer_to_file(file_num, &buf, offset).unwrap();
+        offset + buf.len() as u64
+    }
+
+    /// REP-FEEDER-SKIP witness. A master feeder scanning the WAL must NEVER
+    /// silently skip over a log file that becomes unreadable in the MIDDLE of
+    /// a scan (a file cleaned/deleted out from under it, a file-handle
+    /// eviction, a short read racing a flush). Doing so drops every committed
+    /// VLSN owed from that file and ships a gap to the replica — a lost
+    /// committed transaction on the replica.
+    ///
+    /// JE never does this: `FileReader.readNextEntry` turns a
+    /// `FileNotFoundException` into a hard `LOG_FILE_NOT_FOUND` failure
+    /// (FileReader.java:243-251) and only an `EOFException` sets `eof`
+    /// (FileReader.java:383); its FeederReader waits for the log
+    /// (FeederReader.java:198) rather than skipping. Noxu's production
+    /// FileProtector keeps a feeder's files alive, so in practice this is a
+    /// transient read failure the feeder must re-poll through — never a skip.
+    ///
+    /// FAIL-before: the pre-fix scanner mapped any `read_raw_entry → None`
+    /// (and any missing cursor file) to "advance to the next file", so after
+    /// VLSN 1 it jumped from the deleted file 0 to file 1 and returned VLSN 2,
+    /// silently losing nothing-from-file-0-after-1 and reporting success.
+    #[test]
+    fn test_feeder_scan_does_not_skip_a_mid_log_cleaned_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Two replicated entries per file across files 0,1,2. Tiny max size is
+        // irrelevant — we place files explicitly.
+        {
+            let fm = FileManager::new(dir.path(), false, 256 * 1024 * 1024, 32)
+                .expect("writable FileManager");
+            let mut vlsn = 1i64;
+            for file_num in 0..3u32 {
+                let hdr =
+                    fm.file_header_size_for(file_num).unwrap_or_else(|_| {
+                        file_header_on_disk_size(LOG_FILE_VERSION)
+                    }) as u64;
+                let mut off = hdr;
+                for _ in 0..2 {
+                    off = feeder_append_entry_to_file(
+                        &fm,
+                        file_num,
+                        off,
+                        LogEntryType::Trace,
+                        Some(noxu_util::Vlsn::new(vlsn)),
+                        format!("e{vlsn}").as_bytes(),
+                    );
+                    vlsn += 1;
+                }
+            }
+        }
+
+        let env = EnvironmentImpl::new(dir.path(), false, true)
+            .expect("EnvironmentImpl::new");
+        let mut scanner =
+            EnvironmentLogScanner::new(&env, None).expect("scanner");
+
+        // Read the first entry from file 0 (VLSN 1). The cursor is now
+        // part-way through file 0.
+        assert_eq!(
+            scanner.next_entry(1).map(|(v, _, _)| v),
+            Some(1),
+            "VLSN 1 must come from file 0"
+        );
+
+        // The log cleaner deletes file 0 out from under the live feeder,
+        // mid-scan (exactly what manage_disk_usage → delete_safe_files does).
+        let file0 = dir.path().join("00000000.ndb");
+        assert!(file0.exists(), "file 0 must exist before the delete");
+        std::fs::remove_file(&file0).expect("delete file 0");
+
+        // The scanner MUST NOT now return VLSN 2 from file 1: that would be
+        // silently skipping the rest of the deleted file 0 (and any file
+        // behind it) — a lost committed transaction on the replica.
+        let next = scanner.next_entry(2);
+        assert_eq!(
+            next, None,
+            "after a mid-scan file deletion the feeder must NOT skip forward              to a later file's VLSN (got {next:?}) — that is a lost committed              transaction on the replica"
+        );
+
+        // File 0 is gone BELOW the end of the log (the tail is in file 1/2),
+        // so this is NOT a transient wait: it will never reappear. The scanner
+        // must raise a NetworkRestoreError so the feeder triggers a network
+        // restore (JE FileReader.readNextEntry → LOG_FILE_NOT_FOUND) rather
+        // than spinning forever. No stall, no skip.
+        match scanner.take_scan_error() {
+            Some(crate::error::RepError::NetworkRestoreError(msg)) => {
+                assert!(
+                    msg.contains("00000000"),
+                    "the gone file must be file 0; msg={msg}"
+                );
+            }
+            other => panic!(
+                "a mid-log file deleted below the end of log must surface a                  NetworkRestoreError (so the replica is told to restore), got                  {other:?}"
+            ),
+        }
+    }
+
+    /// A `None` at the genuine TAIL of the log must NOT be mistaken for a gone
+    /// file: `take_scan_error` must stay empty so the feeder waits and retries
+    /// (JE FeederReader waits for the log, FeederReader.java:198) rather than
+    /// forcing a needless network restore.
+    #[test]
+    fn test_feeder_scan_tail_wait_is_not_a_gone_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let off = {
+            let fm = FileManager::new(dir.path(), false, 256 * 1024 * 1024, 32)
+                .expect("writable FileManager");
+            let hdr = fm
+                .file_header_size_for(0)
+                .unwrap_or_else(|_| file_header_on_disk_size(LOG_FILE_VERSION))
+                as u64;
+            feeder_append_entry_to_file(
+                &fm,
+                0,
+                hdr,
+                LogEntryType::Trace,
+                Some(noxu_util::Vlsn::new(1)),
+                b"e1",
+            )
+        };
+        let _ = off;
+
+        let env = EnvironmentImpl::new(dir.path(), false, true)
+            .expect("EnvironmentImpl::new");
+        let mut scanner =
+            EnvironmentLogScanner::new(&env, None).expect("scanner");
+
+        assert_eq!(scanner.next_entry(1).map(|(v, _, _)| v), Some(1));
+        // VLSN 2 does not exist yet: tail wait, not a gone file.
+        assert_eq!(scanner.next_entry(2), None, "tail must return None");
+        assert!(
+            scanner.take_scan_error().is_none(),
+            "a tail wait must NOT raise LogFileGone — that would force a              needless network restore instead of waiting for the log to grow"
+        );
+    }
+
+    /// REP-FEEDER-SKIP witness (ahead-of-cursor): a committed log file cleaned
+    /// AHEAD of the feeder cursor must NOT be silently skipped. FAIL-before
+    /// (file-number-adjacency fix only): files 0..3 (VLSN 1..8), delete file 2
+    /// (VLSN 5,6) ahead of the cursor -> scanner returns [1,2,3,4,7,8], no
+    /// error. PASS-after (VLSN continuity): stops at the gap and raises a
+    /// NetworkRestoreError.
+    #[test]
+    fn test_feeder_scan_does_not_skip_a_file_cleaned_ahead_of_cursor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        {
+            let fm = FileManager::new(dir.path(), false, 256 * 1024 * 1024, 32)
+                .expect("writable FileManager");
+            let mut vlsn = 1i64;
+            for file_num in 0..4u32 {
+                let hdr =
+                    fm.file_header_size_for(file_num).unwrap_or_else(|_| {
+                        file_header_on_disk_size(LOG_FILE_VERSION)
+                    }) as u64;
+                let mut off = hdr;
+                for _ in 0..2 {
+                    off = feeder_append_entry_to_file(
+                        &fm,
+                        file_num,
+                        off,
+                        LogEntryType::Trace,
+                        Some(noxu_util::Vlsn::new(vlsn)),
+                        format!("e{vlsn}").as_bytes(),
+                    );
+                    vlsn += 1;
+                }
+            }
+        }
+        std::fs::remove_file(dir.path().join("00000002.ndb")).expect("rm f2");
+
+        let env = EnvironmentImpl::new(dir.path(), false, true)
+            .expect("EnvironmentImpl::new");
+        let mut scanner =
+            EnvironmentLogScanner::new(&env, None).expect("scanner");
+        let mut got = Vec::new();
+        let mut from = 1u64;
+        for _ in 0..50 {
+            match scanner.next_entry(from) {
+                Some((v, _, _)) => {
+                    got.push(v);
+                    from = v + 1;
+                }
+                None => break,
+            }
+        }
+        assert!(
+            !got.iter().any(|&v| v >= 7),
+            "SILENT GAP: scanner returned {got:?}, skipping deleted file 2              (VLSN 5,6) — a lost committed transaction"
+        );
+        assert_eq!(got, vec![1, 2, 3, 4], "clean prefix must be 1..=4");
+        match scanner.take_scan_error() {
+            Some(crate::error::RepError::NetworkRestoreError(msg)) => {
+                assert!(
+                    msg.contains("gap") || msg.contains("gone"),
+                    "msg should describe the gap/gone condition: {msg}"
+                );
+            }
+            other => panic!(
+                "an ahead-of-cursor cleaned file must raise NetworkRestoreError,                  got {other:?}"
+            ),
+        }
+    }
+
+    /// REP-FEEDER-SKIP barren-gap guard: a deleted file with NO replicable
+    /// entries between two VLSN-bearing files must NOT raise an error (JE
+    /// FileProtector.java:80,84). file0->VLSN 1,2; barren file1; file2->3,4;
+    /// delete barren file1; scan must return 1,2,3,4 with no error.
+    #[test]
+    fn test_feeder_scan_barren_file_gap_is_not_a_gone_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        {
+            let fm = FileManager::new(dir.path(), false, 256 * 1024 * 1024, 32)
+                .expect("writable FileManager");
+            let hdr0 = fm
+                .file_header_size_for(0)
+                .unwrap_or_else(|_| file_header_on_disk_size(LOG_FILE_VERSION))
+                as u64;
+            let mut off = hdr0;
+            for vlsn in 1..=2i64 {
+                off = feeder_append_entry_to_file(
+                    &fm,
+                    0,
+                    off,
+                    LogEntryType::Trace,
+                    Some(noxu_util::Vlsn::new(vlsn)),
+                    format!("e{vlsn}").as_bytes(),
+                );
+            }
+            let hdr1 = fm
+                .file_header_size_for(1)
+                .unwrap_or_else(|_| file_header_on_disk_size(LOG_FILE_VERSION))
+                as u64;
+            feeder_append_entry_to_file(
+                &fm,
+                1,
+                hdr1,
+                LogEntryType::Trace,
+                None,
+                b"barren",
+            );
+            let hdr2 = fm
+                .file_header_size_for(2)
+                .unwrap_or_else(|_| file_header_on_disk_size(LOG_FILE_VERSION))
+                as u64;
+            let mut off2 = hdr2;
+            for vlsn in 3..=4i64 {
+                off2 = feeder_append_entry_to_file(
+                    &fm,
+                    2,
+                    off2,
+                    LogEntryType::Trace,
+                    Some(noxu_util::Vlsn::new(vlsn)),
+                    format!("e{vlsn}").as_bytes(),
+                );
+            }
+        }
+        std::fs::remove_file(dir.path().join("00000001.ndb")).expect("rm f1");
+
+        let env = EnvironmentImpl::new(dir.path(), false, true)
+            .expect("EnvironmentImpl::new");
+        let mut scanner =
+            EnvironmentLogScanner::new(&env, None).expect("scanner");
+        let mut got = Vec::new();
+        let mut from = 1u64;
+        for _ in 0..50 {
+            match scanner.next_entry(from) {
+                Some((v, _, _)) => {
+                    got.push(v);
+                    from = v + 1;
+                }
+                None => break,
+            }
+        }
+        assert_eq!(got, vec![1, 2, 3, 4], "barren gap must drop no VLSN");
+        assert!(
+            scanner.take_scan_error().is_none(),
+            "a barren-file gap must NOT raise a restore error"
+        );
+    }
+
+    /// REVIEWER race test (task 3): a scanner at the TAIL while a writer
+    /// concurrently flushes must never raise a false restore error. Writer
+    /// uses a writable FileManager; the scanner reads via a separate READ-ONLY
+    /// FileManager on the same dir (read-only skips the env lock). Nothing is
+    /// deleted (files only grow/roll): 0 false gone over 10k iterations.
+    #[test]
+    fn test_feeder_scan_tail_race_no_false_gone() {
+        use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let per_file_entries = 24u32;
+        let max_vlsn: i64 = 4000;
+        let stop = Arc::new(AtomicBool::new(false));
+        let flushed_vlsn = Arc::new(AtomicI64::new(0));
+
+        let w_stop = Arc::clone(&stop);
+        let w_flushed = Arc::clone(&flushed_vlsn);
+        let w_dir = dir.path().to_path_buf();
+        let writer = std::thread::spawn(move || {
+            let fm = FileManager::new(&w_dir, false, 256 * 1024 * 1024, 32)
+                .expect("writer FileManager");
+            let mut file_num = 0u32;
+            let mut in_file = 0u32;
+            let mut off = fm
+                .file_header_size_for(file_num)
+                .unwrap_or_else(|_| file_header_on_disk_size(LOG_FILE_VERSION))
+                as u64;
+            let mut vlsn = 1i64;
+            while !w_stop.load(Ordering::SeqCst) && vlsn <= max_vlsn {
+                if in_file >= per_file_entries {
+                    file_num += 1;
+                    in_file = 0;
+                    off =
+                        fm.file_header_size_for(file_num).unwrap_or_else(|_| {
+                            file_header_on_disk_size(LOG_FILE_VERSION)
+                        }) as u64;
+                }
+                off = feeder_append_entry_to_file(
+                    &fm,
+                    file_num,
+                    off,
+                    LogEntryType::Trace,
+                    Some(noxu_util::Vlsn::new(vlsn)),
+                    format!("e{vlsn}").as_bytes(),
+                );
+                in_file += 1;
+                w_flushed.store(vlsn, Ordering::SeqCst);
+                vlsn += 1;
+                std::thread::yield_now();
+            }
+        });
+
+        while flushed_vlsn.load(Ordering::SeqCst) < 1 {
+            std::thread::yield_now();
+        }
+        // Read-only FileManager over the same dir (no env lock conflict).
+        let ro_fm = Arc::new(
+            FileManager::new(dir.path(), true, 256 * 1024 * 1024, 32)
+                .expect("ro FileManager"),
+        );
+        let hdr = ro_fm
+            .file_header_size_for(0)
+            .unwrap_or_else(|_| file_header_on_disk_size(LOG_FILE_VERSION))
+            as u64;
+        let mut scanner = EnvironmentLogScanner {
+            file_manager: Arc::clone(&ro_fm),
+            cursor_file: 0,
+            cursor_offset: hdr,
+            last_returned_vlsn: 0,
+            scan_error: None,
+        };
+        let mut from = 1u64;
+        let mut false_gone = 0u64;
+        let mut iters = 0u64;
+        while iters < 10_000 {
+            iters += 1;
+            match scanner.next_entry(from) {
+                Some((v, _, _)) => from = v + 1,
+                None => {
+                    if scanner.take_scan_error().is_some() {
+                        false_gone += 1;
+                    }
+                    std::thread::yield_now();
+                }
+            }
+        }
+        stop.store(true, Ordering::SeqCst);
+        writer.join().expect("writer join");
+        assert_eq!(
+            false_gone, 0,
+            "a tail scan racing a concurrent flush must never raise a false              restore error (got {false_gone} over 10000 iterations)"
+        );
+    }
+
+    /// REVIEWER torn-tail guard (task 3): a torn/short entry at the physical
+    /// tail of the LAST file must be a transient wait (None, no error), not a
+    /// restore error. Uses a read-only FileManager so the torn bytes survive.
+    #[test]
+    fn test_feeder_scan_torn_tail_is_a_wait_not_a_gone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        {
+            let fm = FileManager::new(dir.path(), false, 256 * 1024 * 1024, 32)
+                .expect("writable FileManager");
+            let hdr = fm
+                .file_header_size_for(0)
+                .unwrap_or_else(|_| file_header_on_disk_size(LOG_FILE_VERSION))
+                as u64;
+            feeder_append_entry_to_file(
+                &fm,
+                0,
+                hdr,
+                LogEntryType::Trace,
+                Some(noxu_util::Vlsn::new(1)),
+                b"e1",
+            );
+        }
+        let torn: Vec<u8> = {
+            let mut header = LogEntryHeader::new(
+                LogEntryType::Trace,
+                64,
+                Provisional::No,
+                true,
+                Some(noxu_util::Vlsn::new(2)),
+            );
+            let mut buf = Vec::new();
+            header.write_to_log(&mut buf).unwrap();
+            header
+                .add_post_marshalling_info(
+                    &mut buf,
+                    0,
+                    Some(noxu_util::Vlsn::new(2)),
+                    0,
+                )
+                .unwrap();
+            buf
+        };
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(dir.path().join("00000000.ndb"))
+                .expect("open file 0");
+            f.write_all(&torn).expect("torn append");
+            f.flush().unwrap();
+        }
+        let ro_fm = Arc::new(
+            FileManager::new(dir.path(), true, 256 * 1024 * 1024, 32)
+                .expect("ro FileManager"),
+        );
+        let hdr = ro_fm
+            .file_header_size_for(0)
+            .unwrap_or_else(|_| file_header_on_disk_size(LOG_FILE_VERSION))
+            as u64;
+        let mut scanner = EnvironmentLogScanner {
+            file_manager: Arc::clone(&ro_fm),
+            cursor_file: 0,
+            cursor_offset: hdr,
+            last_returned_vlsn: 0,
+            scan_error: None,
+        };
+        assert_eq!(scanner.next_entry(1).map(|(v, _, _)| v), Some(1));
+        let next = scanner.next_entry(2);
+        let err = scanner.take_scan_error();
+        assert_eq!(next, None, "torn tail must return None (wait)");
+        assert!(
+            err.is_none(),
+            "a torn/short entry at the physical tail of the LAST file must              NOT raise a restore error; got {err:?}"
+        );
     }
 
     /// JE: FeederReaderTest.testForwardScans / testBackwardScans (forward half).
