@@ -41,45 +41,67 @@ fn detach_publishes_full_image_over_missing_or_older_slot() {
         let bin = tree.search_with_data(&[0]).unwrap().bin_arc;
         let id = bin.read().node_id();
         let (parent, slot) = tree.get_parent_in_for_child_in(id).unwrap();
-        let log_full = || {
-            let mut guard = bin.write();
-            let TreeNode::Bottom(b) = &mut *guard else { panic!("BIN") };
-            let entry = InLogEntry::new(
-                1,
-                b.last_full_lsn,
-                NULL_LSN,
-                b.serialize_full(),
-            );
-            let mut buf = bytes::BytesMut::new();
-            entry.write_to_log(&mut buf);
-            let lsn = lm
-                .log(LogEntryType::BIN, &buf, Provisional::No, true, false)
-                .unwrap();
-            b.clear_dirty_after_full_log(lsn);
+        // R-LNRECLAIM: publication of a logged BIN's LSN into its parent slot
+        // now happens AT LOG TIME (JE `parent.updateEntry` after `IN.log`),
+        // mirrored by `Tree::update_parent_slot_lsn`.  The old
+        // `detach_node_by_id` re-stamp (the BUG-CLEANER-LIVE-LN-RECLAIM vector)
+        // was removed, so this test logs-then-publishes exactly as the real
+        // evictor/checkpointer do, and detach keeps the already-published slot.
+        let log_full = |publish: bool| -> Lsn {
+            let lsn = {
+                let mut guard = bin.write();
+                let TreeNode::Bottom(b) = &mut *guard else { panic!("BIN") };
+                let entry = InLogEntry::new(
+                    1,
+                    b.last_full_lsn,
+                    NULL_LSN,
+                    b.serialize_full(),
+                );
+                let mut buf = bytes::BytesMut::new();
+                entry.write_to_log(&mut buf);
+                let lsn = lm
+                    .log(LogEntryType::BIN, &buf, Provisional::No, true, false)
+                    .unwrap();
+                b.clear_dirty_after_full_log(lsn);
+                lsn
+            };
+            if publish {
+                Tree::update_parent_slot_lsn(&bin, lsn);
+            }
             lsn
         };
-        let old = log_full();
+        // Seed a durable BIN image WITHOUT publishing it, then install the
+        // `missing`/older/placeholder slot state we want to recover from.
+        let old = log_full(false);
         if let TreeNode::Internal(p) = &mut *parent.write() {
             if let Some(missing) = missing {
                 p.set_lsn(slot, missing);
             } else {
-                // This is the real LN placeholder installed by Tree::insert,
-                // not a manufactured earlier BIN image.
+                // The real LN placeholder installed by `Tree::insert` (not a
+                // manufactured earlier BIN image).
                 assert_eq!(
                     lm.read_entry(p.get_lsn(slot)).unwrap().0,
                     LogEntryType::InsertLN
                 );
             }
         }
+        // Mutate, then LOG-AND-PUBLISH the current full image (the real model:
+        // the slot now points at the fresh image regardless of its prior
+        // missing/older/placeholder value).
         tree.insert(vec![0], b"new full".to_vec(), NULL_LSN).unwrap();
         assert!(tree.delete(&[1]));
-        let new = log_full();
+        let new = log_full(true);
         assert!(new > old);
+        // Detach keeps the already-published slot (no re-stamp).
         drop(bin);
         assert!(tree.detach_node_by_id(id) > 0);
         if let TreeNode::Internal(p) = &*parent.read() {
             assert!(p.child_is_none(slot));
-            assert_eq!(p.get_lsn(slot), new);
+            assert_eq!(
+                p.get_lsn(slot),
+                new,
+                "parent slot must hold the LSN published at log time"
+            );
         }
         let fetched = tree.search_with_data(&[0]).unwrap();
         assert_eq!(fetched.data.as_deref(), Some(b"new full".as_slice()));
