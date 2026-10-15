@@ -131,6 +131,22 @@ pub struct NodeStateMachine {
     state_change_time: RwLock<Instant>,
     /// Total number of state transitions that have occurred.
     transition_count: RwLock<u64>,
+    /// Test-only deterministic witness hook (BUG-REP-STATE-TOCTOU).
+    ///
+    /// When set, [`Self::transition_via_unknown`] invokes this callback
+    /// *while holding the state write lock*, at the exact mid-point between
+    /// the intermediate `Unknown` hop and the final target hop — i.e. the
+    /// window a second actor would have interleaved into under the former
+    /// two-lock-acquisition `ensure_unknown_state(); transition_to(target)`
+    /// code. A witness installs a hook that unblocks and briefly waits on a
+    /// second thread running `become_master`; because the fix holds the lock
+    /// across the whole compound transition, that second thread must block,
+    /// proving no interleave is possible. Compiled only for tests / the
+    /// `test-harness` feature; absent from any released build.
+    #[cfg(any(test, feature = "test-harness"))]
+    #[allow(clippy::type_complexity)]
+    mid_transition_hook:
+        RwLock<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl NodeStateMachine {
@@ -140,7 +156,21 @@ impl NodeStateMachine {
             state: RwLock::new(NodeState::Detached),
             state_change_time: RwLock::new(Instant::now()),
             transition_count: RwLock::new(0),
+            #[cfg(any(test, feature = "test-harness"))]
+            mid_transition_hook: RwLock::new(None),
         }
+    }
+
+    /// Install a test-only mid-transition hook (BUG-REP-STATE-TOCTOU witness).
+    ///
+    /// See the field docs on [`NodeStateMachine`]. Returns no value; call with
+    /// `None` to clear.
+    #[cfg(any(test, feature = "test-harness"))]
+    pub fn set_mid_transition_hook(
+        &self,
+        hook: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        *self.mid_transition_hook.write() = hook;
     }
 
     /// Get the current state.
@@ -171,6 +201,29 @@ impl NodeStateMachine {
         new_state: NodeState,
     ) -> crate::error::Result<NodeState> {
         let mut state = self.state.write();
+        self.apply_transition_locked(&mut state, new_state)
+    }
+
+    /// Apply a single validated transition while the state write lock is
+    /// already held, returning the previous state on success.
+    ///
+    /// This is the shared body of [`Self::transition_to`] and the atomic
+    /// compound transitions ([`Self::transition_via_unknown`],
+    /// [`Self::ensure_unknown`], [`Self::transition_to_shutdown`]). Factoring
+    /// it out lets a compound transition perform *all* of its intermediate and
+    /// final steps under ONE write-lock acquisition, closing the
+    /// check-then-act window (BUG-REP-STATE-TOCTOU / R-REPSTATE) that existed
+    /// when a compound change released the lock between a read and the
+    /// subsequent `transition_to`.
+    ///
+    /// The state lock must remain a leaf: no listener firing, master-tracker
+    /// call, or network I/O may occur under it. This method only mutates the
+    /// three state fields and logs, so it keeps that invariant.
+    fn apply_transition_locked(
+        &self,
+        state: &mut NodeState,
+        new_state: NodeState,
+    ) -> crate::error::Result<NodeState> {
         let old_state = *state;
 
         if !old_state.can_transition_to(new_state) {
@@ -186,6 +239,149 @@ impl NodeStateMachine {
         log::info!("Node state change from {} to {}", old_state, new_state);
 
         Ok(old_state)
+    }
+
+    /// Atomically route the node to `target`, passing through `Unknown` first
+    /// when the current state requires it, under a SINGLE state write lock.
+    ///
+    /// This is the atomic replacement for the former
+    /// `ensure_unknown_state(); transition_to(target)` two-step, whose
+    /// separate lock acquisitions let a second actor (the election-driver
+    /// daemon, which also drives `become_master` / `become_replica`)
+    /// interleave and provoke a spurious `UNKNOWN -> UNKNOWN` or
+    /// `MASTER -> MASTER` `InvalidStateTransition` (BUG-REP-STATE-TOCTOU).
+    ///
+    /// `target` must be `Master` or `Replica` — the two active roles reached
+    /// via `Unknown`.
+    ///
+    /// Returns the state observed on entry (the "old state" for a listener
+    /// event the caller fires *after* releasing the lock).
+    ///
+    /// Idempotence (modelled on JE: `RepNode.run()` guards its re-entry to
+    /// `UNKNOWN` with `if (nodeState.getRepEnvState() != UNKNOWN)` —
+    /// "Avoid unnecessary state changes" — and `NodeState.changeAndNotify`
+    /// never rejects a transition): if the node is **already** in `target`,
+    /// this is a no-op success returning `target`, NOT an
+    /// `InvalidStateTransition`. Re-asserting the role the node already holds
+    /// (e.g. the app calls `become_master` for the term it already won from
+    /// the election driver) must not fail.
+    ///
+    /// # Errors
+    ///
+    /// Returns `RepError::StateError` if the node is `Shutdown`, and
+    /// `RepError::InvalidStateTransition` if `target` is not an active role
+    /// or the (post-Unknown) step is otherwise illegal.
+    pub fn transition_via_unknown(
+        &self,
+        target: NodeState,
+    ) -> crate::error::Result<NodeState> {
+        debug_assert!(
+            matches!(target, NodeState::Master | NodeState::Replica),
+            "transition_via_unknown target must be an active role"
+        );
+
+        let mut state = self.state.write();
+        let old_state = *state;
+
+        match old_state {
+            // Already in the requested role: idempotent no-op success. JE
+            // treats re-asserting the current role as benign; the former
+            // code's self-transition rejection is exactly the
+            // `MASTER -> MASTER` flake.
+            s if s == target => Ok(old_state),
+
+            NodeState::Shutdown => {
+                Err(crate::error::RepError::StateError(
+                    "Node is shut down".to_string(),
+                ))
+            }
+
+            // From Detached/Master/Replica we must pass through Unknown
+            // first (Detached -> Unknown, or role -> Unknown), then reach
+            // the target. All under this one write lock.
+            NodeState::Detached
+            | NodeState::Master
+            | NodeState::Replica => {
+                self.apply_transition_locked(&mut state, NodeState::Unknown)?;
+                self.fire_mid_transition_hook();
+                self.apply_transition_locked(&mut state, target)?;
+                Ok(old_state)
+            }
+
+            // Already Unknown: single hop to the target.
+            NodeState::Unknown => {
+                self.fire_mid_transition_hook();
+                self.apply_transition_locked(&mut state, target)?;
+                Ok(old_state)
+            }
+        }
+    }
+
+    /// Invoke the test-only mid-transition witness hook, if installed, while
+    /// the state write lock is held. No-op (and zero-cost) in release builds.
+    #[cfg(any(test, feature = "test-harness"))]
+    fn fire_mid_transition_hook(&self) {
+        let hook = self.mid_transition_hook.read().clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// No-op in builds without the test harness.
+    #[cfg(not(any(test, feature = "test-harness")))]
+    #[inline(always)]
+    fn fire_mid_transition_hook(&self) {}
+
+    /// Atomically ensure the node is in `Unknown`, transitioning from
+    /// `Detached` / `Master` / `Replica` if necessary, under a SINGLE state
+    /// write lock.
+    ///
+    /// Idempotent: if the node is already `Unknown` this is a no-op success
+    /// (JE `RepNode.run()`: "Avoid unnecessary state changes"). `Shutdown`
+    /// is an error.
+    ///
+    /// Returns the state observed on entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns `RepError::StateError` if the node is `Shutdown`.
+    pub fn ensure_unknown(&self) -> crate::error::Result<NodeState> {
+        let mut state = self.state.write();
+        let old_state = *state;
+        match old_state {
+            NodeState::Unknown => Ok(old_state),
+            NodeState::Shutdown => {
+                Err(crate::error::RepError::StateError(
+                    "Node is shut down".to_string(),
+                ))
+            }
+            NodeState::Detached
+            | NodeState::Master
+            | NodeState::Replica => {
+                self.apply_transition_locked(&mut state, NodeState::Unknown)?;
+                Ok(old_state)
+            }
+        }
+    }
+
+    /// Atomically transition to `Shutdown` from any non-`Shutdown` state,
+    /// returning the state observed on entry.
+    ///
+    /// `Shutdown` is reachable from every live state, so this never fails on
+    /// a first call; a second call (already `Shutdown`) is a no-op returning
+    /// `Shutdown`. Reads the old state and transitions under ONE write lock so
+    /// the `old_state` reported to listeners cannot be stale relative to the
+    /// transition that produced it.
+    pub fn transition_to_shutdown(&self) -> NodeState {
+        let mut state = self.state.write();
+        let old_state = *state;
+        if old_state == NodeState::Shutdown {
+            return old_state;
+        }
+        // Shutdown is valid from every non-Shutdown state; the result is
+        // therefore always Ok here.
+        let _ = self.apply_transition_locked(&mut state, NodeState::Shutdown);
+        old_state
     }
 
     /// Check if a transition to the given state is valid from the current state.
@@ -546,6 +742,167 @@ mod tests {
         assert!(!sm.get_state().is_active());
 
         assert_eq!(sm.get_transition_count(), 6);
+    }
+
+    // --- Atomic compound transition tests (BUG-REP-STATE-TOCTOU) ---
+
+    #[test]
+    fn test_transition_via_unknown_from_detached() {
+        let sm = NodeStateMachine::new();
+        // Detached -> (Unknown) -> Master, atomic.
+        let old = sm.transition_via_unknown(NodeState::Master).unwrap();
+        assert_eq!(old, NodeState::Detached);
+        assert_eq!(sm.get_state(), NodeState::Master);
+        // Two real hops happened (Detached->Unknown, Unknown->Master).
+        assert_eq!(sm.get_transition_count(), 2);
+    }
+
+    #[test]
+    fn test_transition_via_unknown_from_unknown() {
+        let sm = NodeStateMachine::new();
+        sm.transition_to(NodeState::Unknown).unwrap();
+        let old = sm.transition_via_unknown(NodeState::Replica).unwrap();
+        assert_eq!(old, NodeState::Unknown);
+        assert_eq!(sm.get_state(), NodeState::Replica);
+        // One hop: Unknown->Replica (plus the setup Detached->Unknown).
+        assert_eq!(sm.get_transition_count(), 2);
+    }
+
+    #[test]
+    fn test_transition_via_unknown_role_change() {
+        let sm = NodeStateMachine::new();
+        sm.transition_via_unknown(NodeState::Master).unwrap();
+        // Master -> (Unknown) -> Replica.
+        let old = sm.transition_via_unknown(NodeState::Replica).unwrap();
+        assert_eq!(old, NodeState::Master);
+        assert_eq!(sm.get_state(), NodeState::Replica);
+    }
+
+    #[test]
+    fn test_transition_via_unknown_idempotent_master() {
+        // The exact BUG-REP-STATE-TOCTOU shape: re-asserting Master while
+        // already Master must be a no-op SUCCESS, never MASTER -> MASTER.
+        let sm = NodeStateMachine::new();
+        sm.transition_via_unknown(NodeState::Master).unwrap();
+        let count_before = sm.get_transition_count();
+        let old = sm.transition_via_unknown(NodeState::Master).unwrap();
+        assert_eq!(old, NodeState::Master);
+        assert_eq!(sm.get_state(), NodeState::Master);
+        // No-op: no extra transition recorded.
+        assert_eq!(sm.get_transition_count(), count_before);
+    }
+
+    #[test]
+    fn test_transition_via_unknown_idempotent_replica() {
+        let sm = NodeStateMachine::new();
+        sm.transition_via_unknown(NodeState::Replica).unwrap();
+        let count_before = sm.get_transition_count();
+        let old = sm.transition_via_unknown(NodeState::Replica).unwrap();
+        assert_eq!(old, NodeState::Replica);
+        assert_eq!(sm.get_state(), NodeState::Replica);
+        assert_eq!(sm.get_transition_count(), count_before);
+    }
+
+    #[test]
+    fn test_transition_via_unknown_rejected_from_shutdown() {
+        let sm = NodeStateMachine::new();
+        sm.transition_to(NodeState::Shutdown).unwrap();
+        assert!(sm.transition_via_unknown(NodeState::Master).is_err());
+        assert_eq!(sm.get_state(), NodeState::Shutdown);
+    }
+
+    #[test]
+    fn test_ensure_unknown_from_each_state() {
+        // From Detached.
+        let sm = NodeStateMachine::new();
+        let old = sm.ensure_unknown().unwrap();
+        assert_eq!(old, NodeState::Detached);
+        assert_eq!(sm.get_state(), NodeState::Unknown);
+
+        // Already Unknown: idempotent no-op.
+        let count_before = sm.get_transition_count();
+        let old = sm.ensure_unknown().unwrap();
+        assert_eq!(old, NodeState::Unknown);
+        assert_eq!(sm.get_state(), NodeState::Unknown);
+        assert_eq!(sm.get_transition_count(), count_before);
+
+        // From Master.
+        let sm = NodeStateMachine::new();
+        sm.transition_via_unknown(NodeState::Master).unwrap();
+        let old = sm.ensure_unknown().unwrap();
+        assert_eq!(old, NodeState::Master);
+        assert_eq!(sm.get_state(), NodeState::Unknown);
+
+        // From Replica.
+        let sm = NodeStateMachine::new();
+        sm.transition_via_unknown(NodeState::Replica).unwrap();
+        let old = sm.ensure_unknown().unwrap();
+        assert_eq!(old, NodeState::Replica);
+        assert_eq!(sm.get_state(), NodeState::Unknown);
+    }
+
+    #[test]
+    fn test_ensure_unknown_rejected_from_shutdown() {
+        let sm = NodeStateMachine::new();
+        sm.transition_to(NodeState::Shutdown).unwrap();
+        assert!(sm.ensure_unknown().is_err());
+        assert_eq!(sm.get_state(), NodeState::Shutdown);
+    }
+
+    #[test]
+    fn test_transition_to_shutdown_from_each_state() {
+        let sm = NodeStateMachine::new();
+        assert_eq!(sm.transition_to_shutdown(), NodeState::Detached);
+        assert_eq!(sm.get_state(), NodeState::Shutdown);
+        // Second call is an idempotent no-op returning Shutdown.
+        assert_eq!(sm.transition_to_shutdown(), NodeState::Shutdown);
+
+        let sm = NodeStateMachine::new();
+        sm.transition_via_unknown(NodeState::Master).unwrap();
+        assert_eq!(sm.transition_to_shutdown(), NodeState::Master);
+        assert_eq!(sm.get_state(), NodeState::Shutdown);
+    }
+
+    #[test]
+    fn test_compound_transition_contested_single_lock() {
+        // Two threads race the atomic compound transition on the same state
+        // machine, exactly as the election driver races an application
+        // become_master. With the atomic method, every call must either win
+        // (observe a non-target old state and move the machine) or observe
+        // the target already set and no-op; none may error.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::thread;
+
+        for _ in 0..200 {
+            let sm = Arc::new(NodeStateMachine::new());
+            let errors = Arc::new(AtomicUsize::new(0));
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let sm = Arc::clone(&sm);
+                    let errors = Arc::clone(&errors);
+                    let barrier = Arc::clone(&barrier);
+                    thread::spawn(move || {
+                        barrier.wait();
+                        if sm.transition_via_unknown(NodeState::Master).is_err()
+                        {
+                            errors.fetch_add(1, Ordering::SeqCst);
+                        }
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+            assert_eq!(
+                errors.load(Ordering::SeqCst),
+                0,
+                "atomic compound transition must never error under contention"
+            );
+            assert_eq!(sm.get_state(), NodeState::Master);
+        }
     }
 
     #[test]
