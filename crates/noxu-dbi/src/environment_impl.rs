@@ -3613,7 +3613,17 @@ impl EnvironmentImpl {
     /// cleaned files.
     ///
     /// Returns `Ok(CleanResult)` on success or `Err(String)` if the cleaner
-    /// is already running, is shut down, or this is a read-only environment.
+    /// is shut down or this is a read-only environment.
+    ///
+    /// If a cleaning pass (the background cleaner daemon, or another manual
+    /// `clean_log`) is already in progress this call WAITS for it to finish and
+    /// then runs its own pass — it does NOT return "Cleaner is already
+    /// running" (BUG-CLEANER-FORCE-HANG-1).  JE never rejects a manual clean
+    /// while the daemon is active; `Cleaner.doClean` runs a fresh
+    /// `FileProcessor` and the only cross-pass serialization is the
+    /// (synchronized) `FileSelector`.  Noxu uses a single shared `Cleaner`, so
+    /// `Cleaner::do_clean` serializes concurrent passes on an internal
+    /// `pass_lock` instead.
     ///
     /// / `Cleaner.doClean()`.
     pub fn run_cleaner(

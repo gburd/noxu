@@ -155,8 +155,29 @@ pub struct Cleaner {
     /// Cleaner statistics.
     stats: Arc<CleanerStats>,
 
-    /// Whether the cleaner is currently running.
+    /// Whether a cleaning pass is currently in progress (observable only).
+    ///
+    /// This is a diagnostic flag read by [`Cleaner::is_running`]; it is NOT a
+    /// mutual-exclusion gate.  Serialization of concurrent passes is done by
+    /// `pass_lock` below.
     running: AtomicBool,
+
+    /// Serializes concurrent `do_clean` passes (manual `clean_log` /
+    /// `clean_log_forced` vs. the background cleaner daemon).
+    ///
+    /// JE faithfulness: `Environment.cleanLog` -> `EnvironmentImpl.invokeCleaner`
+    /// -> `Cleaner.doClean` creates a FRESH `FileProcessor` (`createProcessor()`)
+    /// that runs independently of the daemon FileProcessor threads; JE never
+    /// rejects a manual clean because the daemon is active (there is no "busy"
+    /// flag).  Noxu uses a single shared `Cleaner` instead of per-processor
+    /// instances, so the closest faithful match is to WAIT for an in-progress
+    /// pass rather than erroring.  A daemon pass is bounded (it cleans at most
+    /// `current_n_files`), so the wait is short and forward progress is
+    /// guaranteed.  JE cross-processor serialization lives in the shared
+    /// `FileSelector` (`selectFileForCleaning` is `synchronized` and moves a
+    /// file to BEING_CLEANED), which Noxu already mirrors via
+    /// `file_selector: Arc<Mutex<FileSelector>>`.
+    pass_lock: Mutex<()>,
 
     /// Shutdown signal.
     shutdown: Arc<AtomicBool>,
@@ -355,6 +376,7 @@ impl Cleaner {
             file_protector: Arc::new(FileProtector::new()),
             stats: Arc::new(CleanerStats::new()),
             running: AtomicBool::new(false),
+            pass_lock: Mutex::new(()),
             shutdown: Arc::new(AtomicBool::new(false)),
             min_utilization: AtomicU32::new(min_utilization.min(100)),
             expiration_enabled: AtomicBool::new(true),
@@ -400,6 +422,7 @@ impl Cleaner {
             file_protector: Arc::new(FileProtector::new()),
             stats: Arc::new(CleanerStats::new()),
             running: AtomicBool::new(false),
+            pass_lock: Mutex::new(()),
             shutdown: Arc::new(AtomicBool::new(false)),
             min_utilization: AtomicU32::new(min_utilization.min(100)),
             expiration_enabled: AtomicBool::new(true),
@@ -455,6 +478,7 @@ impl Cleaner {
             file_protector: Arc::new(FileProtector::new()),
             stats: Arc::new(CleanerStats::new()),
             running: AtomicBool::new(false),
+            pass_lock: Mutex::new(()),
             shutdown: Arc::new(AtomicBool::new(false)),
             min_utilization: AtomicU32::new(min_utilization.min(100)),
             expiration_enabled: AtomicBool::new(true),
@@ -505,6 +529,7 @@ impl Cleaner {
             file_protector: Arc::new(FileProtector::new()),
             stats: Arc::new(CleanerStats::new()),
             running: AtomicBool::new(false),
+            pass_lock: Mutex::new(()),
             shutdown: Arc::new(AtomicBool::new(false)),
             min_utilization: AtomicU32::new(min_utilization.min(100)),
             expiration_enabled: AtomicBool::new(true),
@@ -809,16 +834,18 @@ impl Cleaner {
         n_files: u32,
         force: bool,
     ) -> Result<CleanResult, String> {
-        // Check if already running
-        if self
-            .running
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            return Err("Cleaner is already running".to_string());
-        }
+        // Serialize concurrent passes rather than rejecting them.  JE never
+        // errors when a manual `Environment.cleanLog` overlaps the background
+        // cleaner daemon -- `Cleaner.doClean` runs a fresh `FileProcessor` and
+        // the only cross-pass serialization is the (synchronized) `FileSelector`.
+        // Noxu shares a single `Cleaner`, so we WAIT on `pass_lock` for any
+        // in-progress pass (always short: a daemon pass is bounded) instead of
+        // returning "Cleaner is already running".  See `pass_lock` docs.
+        let _pass = self.pass_lock.lock();
 
-        // Ensure we reset running flag on exit
+        // Publish the observable "a pass is running" flag for `is_running()`;
+        // cleared on exit by the RAII guard.  (Not a gate -- `pass_lock` is.)
+        self.running.store(true, Ordering::Release);
         let _guard = RunningGuard::new(&self.running);
 
         // Check shutdown
@@ -882,6 +909,15 @@ impl Cleaner {
         let mut total_entries = 0u64;
         // file_summary_map is refreshed inside the loop (CLN-13).
         let mut current_summary_map = file_summary_map;
+        // Highest file number present at pass start (JE `nOriginalLogFiles`
+        // frame): files created DURING the pass are the cleaner's own
+        // migration output, ~100% utilized, and must not enter selection or
+        // inflate the predicted-utilization aggregate (which would stop a
+        // multi-file pass early). JE getBestFile's first-active-file clamp
+        // + nOriginalLogFiles bound have the same effect.
+        // (BUG-CLEANER-FORCE-HANG-1 prerequisite, a8d63234.)
+        let max_original_file =
+            current_summary_map.keys().copied().next_back().unwrap_or(0);
         let mut deferred = Vec::new();
         let mut unsupported_error = None;
         let mut fatal_error = None;
@@ -891,8 +927,18 @@ impl Cleaner {
         // leave those files in BEING_CLEANED until pass end so the existing
         // selector exclusion prevents reselection. They consume the scan
         // cap, not n_files, so even one-file daemon passes can make progress.
+        // BUG-CLEANER-FORCE-HANG-1: a FORCED pass (clean_log_forced ->
+        // do_clean(u32::MAX, true)) must terminate.  The hard bound is the
+        // `original_count` scan cap captured at pass start — exactly like JE
+        // `Cleaner.doClean`, which iterates the start-of-pass file set and
+        // stops when `getBestFile` returns no file.  Migration output appended
+        // during the pass is NOT re-scanned beyond the cap, so a forced pass
+        // can never spin on files it keeps creating.  The `n_files` guard uses
+        // `saturating_sub` so a run where more files were deferred than
+        // attempted (which should not happen, but must never underflow) still
+        // terminates rather than wrapping to a huge count.
         for attempt in 0..original_count.max(1) {
-            if attempt - deferred.len() >= n_files as usize {
+            if attempt.saturating_sub(deferred.len()) >= n_files as usize {
                 break;
             }
             // Check shutdown before each iteration.
@@ -921,6 +967,12 @@ impl Cleaner {
                             &UtilizationTracker::new(false),
                         )
                     };
+                // Drop files created during this pass (migration output):
+                // not part of the original candidate set (JE
+                // nOriginalLogFiles) and ~100% utilized, so they must not
+                // inflate the aggregate / be reselected and spin a forced
+                // pass (BUG-CLEANER-FORCE-HANG-1 prerequisite, a8d63234).
+                current_summary_map.retain(|&f, _| f <= max_original_file);
             }
 
             // JE ~line 393: fileSelector.selectFileForCleaning(
@@ -1909,20 +1961,46 @@ mod tests {
         assert_eq!(cleaner.get_run_count(), 2);
     }
 
+    /// Witness for BUG-CLEANER-FORCE-HANG-1 (classification (a)): concurrent
+    /// cleaning passes must SERIALIZE and all succeed, not error with
+    /// "Cleaner is already running".
+    ///
+    /// JE: `Environment.cleanLog` -> `Cleaner.doClean` runs a fresh
+    /// `FileProcessor` and never rejects a manual clean while the daemon is
+    /// active; cross-pass serialization is the shared `FileSelector`.  Before
+    /// the fix `do_clean` CAS'd a per-cleaner `running` flag and the loser got
+    /// `Err("Cleaner is already running")`; this test fails on that version
+    /// (at least one thread sees the error) and passes once passes serialize
+    /// on `pass_lock` instead.
     #[test]
-    fn test_concurrent_clean_rejected() {
+    fn test_concurrent_clean_serializes_not_rejects() {
         let cleaner = Arc::new(Cleaner::new(50, 0, 0));
-
-        // Simulate a long-running clean by holding the running flag
-        cleaner.running.store(true, Ordering::Relaxed);
-
-        // Second clean attempt should fail
-        let result = cleaner.do_clean(1, false);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("already running"));
-
-        // Clean up
-        cleaner.running.store(false, Ordering::Relaxed);
+        let errors = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let mut handles = Vec::new();
+        // Many threads hammer do_clean concurrently (empty selector -> each
+        // pass returns immediately, so the window is a pure race on the
+        // old CAS vs. the new pass_lock).
+        for _ in 0..16 {
+            let c = Arc::clone(&cleaner);
+            let errs = Arc::clone(&errors);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..200 {
+                    if let Err(e) = c.do_clean(1, false) {
+                        errs.lock().unwrap().push(e);
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let errs = errors.lock().unwrap();
+        assert!(
+            errs.is_empty(),
+            "concurrent do_clean must not error; got {} errors, first: {:?}",
+            errs.len(),
+            errs.first()
+        );
     }
 
     #[test]
