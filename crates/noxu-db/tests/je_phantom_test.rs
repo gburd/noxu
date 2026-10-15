@@ -48,7 +48,18 @@ fn open(dups: bool) -> (TempDir, Environment, noxu_db::Database) {
     let env = Environment::open(
         EnvironmentConfig::new(dir.path().to_path_buf())
             .with_allow_create(true)
-            .with_transactional(true),
+            .with_transactional(true)
+            // JE PhantomTest disables all four daemons so they do not
+            // interfere with the scan<->insert range-lock window
+            // (PhantomTest.java:183-190: ENV_RUN_EVICTOR / ENV_RUN_CLEANER /
+            // ENV_RUN_CHECKPOINTER / ENV_RUN_INCOMPRESSOR = false). In
+            // particular the IN compressor merging/removing a KD slot between
+            // positioning and the phantom insert changes the "next key" and
+            // makes the serializable range lock non-deterministic.
+            .with_run_evictor(false)
+            .with_run_cleaner(false)
+            .with_run_checkpointer(false)
+            .with_run_in_compressor(false),
     )
     .unwrap();
     let db = env
@@ -1112,7 +1123,12 @@ fn check_serializable_env(expect_serializable: bool) {
     let dir = TempDir::new().unwrap();
     let mut cfg = EnvironmentConfig::new(dir.path().to_path_buf())
         .with_allow_create(true)
-        .with_transactional(true);
+        .with_transactional(true)
+        // JE PhantomTest.java:183-190 disables all four daemons.
+        .with_run_evictor(false)
+        .with_run_cleaner(false)
+        .with_run_checkpointer(false)
+        .with_run_in_compressor(false);
     if expect_serializable {
         cfg = cfg.with_txn_serializable_isolation(true);
     }
@@ -1327,4 +1343,150 @@ fn je_phantom_test_test_next_after_dup_delete_bug() {
 #[ignore = "NA: asserts JE-internal EnvironmentStats.getNRequests()==1 lock-count accounting, not observable behaviour"]
 fn je_phantom_test_test_single_degree3_txn_optimization() {
     // Intentionally not asserted; see doc comment (NA).
+}
+
+// ===========================================================================
+// BUG-PHANTOM-REVERSE-GAP witness (daemons ON).
+//
+// The gated phantom tests disable all four daemons, faithfully to JE
+// PhantomTest.java:183-190.  With the daemons RUNNING (the pre-fidelity-fix
+// config), the serializable range lock is NON-DETERMINISTIC: a background
+// daemon (the IN compressor removing/merging a KD slot, chiefly) changes the
+// "next key" between a scan's positioning and a phantom insert, so the phantom
+// insert sometimes slips past the range lock (returns Ok instead of
+// LockNotAvailable) and, in the other direction, a "safe" insert sometimes
+// wrongly blocks.  Measured ~5-25% per case over 40x serial, both directions,
+// across prev/next/search/first — see a15-phantom-rangelock-flake.md.
+//
+// This witness runs the SAME serializable must-block / safe-must-not-block
+// assertions as `phantom_case`, but with the daemons ON, so the residual bug
+// stays witnessed.  It is `#[ignore]`d (PORTED-FAILING) until
+// BUG-PHANTOM-REVERSE-GAP is root-caused and fixed; its assertions are
+// IDENTICAL to the gated path (nothing weakened).
+// ===========================================================================
+
+/// Like [`open`] but leaves all four daemons RUNNING (the config that exposes
+/// BUG-PHANTOM-REVERSE-GAP).  Deliberately NOT the faithful JE config.
+fn open_daemons_on(dups: bool) -> (TempDir, Environment, noxu_db::Database) {
+    let dir = TempDir::new().unwrap();
+    let env = Environment::open(
+        EnvironmentConfig::new(dir.path().to_path_buf())
+            .with_allow_create(true)
+            .with_transactional(true),
+    )
+    .unwrap();
+    let db = env
+        .open_database(
+            None,
+            "PhantomTest",
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true)
+                .with_sorted_duplicates(dups),
+        )
+        .unwrap();
+    (dir, env, db)
+}
+
+/// One serializable must-block / safe-must-not-block scenario with daemons ON.
+/// Returns `Err` with a description iff an assertion would fail (phantom
+/// slipped past the range lock, or a safe insert wrongly blocked).  Identical
+/// logic to the gated `phantom_case` serializable half; only the env config
+/// (daemons running) differs.
+fn daemons_on_scenario(
+    dups: bool,
+    seeds: &[(i32, i32)],
+    pos: &[Step],
+    safe: &[(i32, i32)],
+    phantom: (i32, i32),
+) -> Result<(), String> {
+    let (_d, env, db) = open_daemons_on(dups);
+    for &(k, v) in seeds {
+        insert(&env, &db, dups, k, v);
+    }
+    let ser = TransactionConfig::new().with_serializable_isolation(true);
+    let reader = env.begin_transaction(Some(&ser)).unwrap();
+    let mut c = db.open_cursor_in(&reader, None).unwrap();
+    for &step in pos {
+        let _ = run_step(&mut c, step);
+    }
+    for &(k, v) in safe {
+        if try_insert(&env, &db, dups, k, v).is_err() {
+            return Err(format!("safe insert ({k},{v}) wrongly blocked"));
+        }
+    }
+    let r = try_insert(&env, &db, dups, phantom.0, phantom.1);
+    let ok = matches!(r, Err(NoxuError::LockNotAvailable));
+    drop(c);
+    reader.commit().unwrap();
+    if ok {
+        Ok(())
+    } else {
+        Err(format!("phantom insert {phantom:?} did NOT block; got {r:?}"))
+    }
+}
+
+#[test]
+#[ignore = "PORTED-FAILING BUG-PHANTOM-REVERSE-GAP: serializable range lock \
+            non-deterministic with daemons running; see \
+            a15-phantom-rangelock-flake.md"]
+fn je_phantom_daemons_on_residual() {
+    // Run the measured-flaky serializable cases (prev / next / search / first,
+    // dup and non-dup) with the daemons ON, repeated enough times to reliably
+    // surface the ~5-25%-per-case non-determinism.  Assertions are IDENTICAL
+    // to the gated path; only the env config (daemons running) differs, which
+    // is the whole point of the witness.  When BUG-PHANTOM-REVERSE-GAP is
+    // fixed this must pass every iteration and be un-ignored.
+    // (dups, seeds, positioning steps, safe-inserts, phantom-insert)
+    type PhantomScenario<'a> =
+        (bool, &'a [(i32, i32)], &'a [Step], &'a [(i32, i32)], (i32, i32));
+    let cases: &[PhantomScenario] = &[
+        // reverse / preceding-gap (worst measured)
+        (
+            true,
+            &[(1, 1), (1, 2), (2, 2), (2, 3)],
+            &[Step::SearchBoth(2, 2), Step::PrevDup],
+            &[(2, 4), (3, 0), (1, 0), (0, 0)],
+            (2, 1),
+        ),
+        (
+            false,
+            &[(1, 0), (2, 0), (3, 0)],
+            &[Step::Search(2), Step::Prev],
+            &[(0, 0), (3, 0)],
+            (1, 0),
+        ),
+        // forward
+        (
+            false,
+            &[(1, 0), (2, 0), (3, 0)],
+            &[Step::Search(2), Step::Next],
+            &[(0, 0), (1, 0)],
+            (2, 0),
+        ),
+        // first
+        (
+            false,
+            &[(1, 0), (2, 0), (3, 0)],
+            &[Step::First],
+            &[(2, 0), (3, 0)],
+            (1, 0),
+        ),
+    ];
+    let mut failures: Vec<String> = Vec::new();
+    for _ in 0..25 {
+        for &(dups, seeds, pos, safe, phantom) in cases {
+            if let Err(e) = daemons_on_scenario(dups, seeds, pos, safe, phantom)
+            {
+                failures.push(e);
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "serializable (daemons on) range lock non-deterministic \
+         (BUG-PHANTOM-REVERSE-GAP): {} failure(s), e.g. {:?}",
+        failures.len(),
+        failures.first()
+    );
 }
