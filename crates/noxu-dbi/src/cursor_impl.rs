@@ -2656,6 +2656,26 @@ impl CursorImpl {
     /// at v7.11.0 the bare `get_data_from_tree` re-read on an LSN change
     /// returned the live (possibly uncommitted) slot bytes without re-locking
     /// the moved LSN.
+    ///
+    /// # Return contract (keep these THREE outcomes distinct)
+    ///
+    /// Callers (and the composing `fix/sec-dirty-read-deleted-primary` work,
+    /// worker 854b2272) rely on these being unambiguous:
+    ///
+    /// * `Ok((Some(data), lsn))` with `lsn != 0` — the committed value, read
+    ///   under the held record lock.
+    /// * `Ok((None, lsn))` with `lsn != 0` — the committed value exists but its
+    ///   LN is non-resident (stripped); the caller refetches it from the log at
+    ///   `lsn` (D1), never treats it as an empty value.
+    /// * `Ok((None, 0))` — the slot is GONE (a committed delete observed under
+    ///   the lock).  `lsn == 0` is the sentinel the Set/SetRange arms map to
+    ///   `NotFound`; it is NEVER produced for a live value or a timeout.
+    /// * `Err(..)` — a lock-conflict / lock-timeout / transaction-timeout from
+    ///   the blocking record-lock acquire (a perpetually write-locked slot, JE
+    ///   `lockLN` lock-timeout).  This is DISTINCT from `Ok((None, 0))`: a
+    ///   timeout is an error, never the GONE sentinel, so "gone" and "could not
+    ///   lock" never collide.  The pre-fix unlocked fallback that returned the
+    ///   writer's uncommitted bytes on loop exhaustion is REMOVED.
     fn reread_data_locking_current_lsn(
         &self,
         key: &[u8],
