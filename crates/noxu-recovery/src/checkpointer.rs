@@ -2885,10 +2885,17 @@ mod tests {
         let lm =
             Arc::new(LogManager::new(Arc::clone(&fm), 3, 1024 * 1024, 65536));
 
-        // Small fanout -> a 2-level tree (upper IN parent over BINs).
+        // REVIEWER-PREP (R-LNRECLAIM): the previous version built a 3-level
+        // tree (fanout 4, 64 keys) and took `root.resident_children().next()`,
+        // which is an UPPER IN, not a BIN -- the `_ => return` then SILENTLY
+        // SKIPPED, so the witness was VACUOUS on both arches (it passed with
+        // skip-on-Busy restored, providing zero teeth).  Resolve a REAL BIN and
+        // its REAL parent IN via `first_bin_arc` + `get_parent_in_for_child_in`
+        // (the same helpers the R-FLUSHLVL witness uses) so the retry-on-Busy
+        // path is actually exercised.
         let tree = Tree::new(1, 4);
-        for i in 0u16..64 {
-            let key = format!("key{i:04}");
+        for i in 0u16..200 {
+            let key = format!("key{i:05}");
             tree.insert(
                 key.into_bytes(),
                 b"v".to_vec(),
@@ -2896,28 +2903,16 @@ mod tests {
             )
             .unwrap();
         }
+        let bin_arc = tree.first_bin_arc().expect("tree has a BIN");
+        let bin_id = bin_arc.read().node_id();
+        let (parent_arc, _slot) = tree
+            .get_parent_in_for_child_in(bin_id)
+            .expect("the BIN has a parent IN (multi-level tree)");
+        assert!(
+            !parent_arc.read().is_bin(),
+            "parent must be an upper IN, not a BIN"
+        );
         let tree_arc = Arc::new(RwLock::new(tree));
-
-        // Find a BIN and its parent IN.  Dirty the BIN.
-        let (bin_arc, parent_arc) = {
-            let g = tree_arc.read().unwrap();
-            let root = g.get_root().unwrap();
-            let parent = root.clone();
-            let child = {
-                let rg = root.read();
-                match &*rg {
-                    TreeNode::Internal(n) => {
-                        n.resident_children().into_iter().next()
-                    }
-                    TreeNode::Bottom(_) => None,
-                }
-            };
-            (child, parent)
-        };
-        let bin_arc = match bin_arc {
-            Some(b) if b.read().is_bin() => b,
-            _ => return, // single-level tree on this build; skip (not applicable)
-        };
         {
             let mut bg = bin_arc.write();
             if let TreeNode::Bottom(ref mut b) = *bg {
@@ -2927,48 +2922,58 @@ mod tests {
                 }
             }
         }
-        let bin_node_id = bin_arc.read().node_id();
+        let bin_node_id = bin_id;
 
-        // Hold the PARENT write latch in bursts while the checkpointer runs, so
-        // `child_resident_state` sees `Busy` and must retry (not skip).
+        // Hold the PARENT write latch in short bursts with gaps so
+        // `child_resident_state`'s `try_read` on the parent intermittently sees
+        // `Busy`.  The checkpointer must RETRY (not skip) and still flush.
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
         let agitator = std::thread::spawn(move || {
             while !stop2.load(Ordering::Relaxed) {
                 {
                     let _w = parent_arc.write();
-                    std::thread::sleep(std::time::Duration::from_micros(50));
+                    std::thread::sleep(std::time::Duration::from_micros(100));
                 }
-                std::thread::yield_now();
+                std::thread::sleep(std::time::Duration::from_micros(100));
             }
         });
+        std::thread::sleep(std::time::Duration::from_millis(2));
 
         let checkpointer = Checkpointer::new(CheckpointConfig::default())
             .with_log_manager(Arc::clone(&lm))
             .with_tree(Arc::clone(&tree_arc), 1);
-        let result = checkpointer
-            .flush_dirty_bins_internal()
-            .expect("flush_dirty_bins_internal failed");
+        // Re-dirty + flush repeatedly so a transiently-Busy parent is actually
+        // encountered.  A skip-on-Busy checkpointer drops the resident dirty
+        // BIN (flushed == 0) on at least one iteration; the retry-on-Busy fix
+        // flushes it every time.
+        let mut skipped = 0usize;
+        for _ in 0..200 {
+            {
+                let mut bg = bin_arc.write();
+                if let TreeNode::Bottom(ref mut b) = *bg {
+                    b.dirty = true;
+                    if let Some(e) = b.entries.first_mut() {
+                        e.dirty = true;
+                    }
+                }
+            }
+            let r = checkpointer
+                .flush_dirty_bins_internal()
+                .expect("flush_dirty_bins_internal failed");
+            if r.full_bins_flushed + r.delta_ins_flushed == 0 {
+                skipped += 1;
+            }
+        }
         stop.store(true, Ordering::Relaxed);
         agitator.join().unwrap();
 
-        // The dirty BIN must have been flushed (full or delta), never skipped.
-        let flushed = result.full_bins_flushed + result.delta_ins_flushed;
-        assert!(
-            flushed >= 1,
-            "checkpoint skipped a resident dirty BIN under a busy parent              (node {bin_node_id}): full={} delta={} -> committed data would be              lost after CkptEnd",
-            result.full_bins_flushed,
-            result.delta_ins_flushed,
+        assert_eq!(
+            skipped, 0,
+            "checkpoint skipped a resident dirty BIN under a busy parent \
+             (node {bin_node_id}) {skipped}/200 times -> committed data would \
+             be lost after CkptEnd",
         );
-        // And the BIN must now be clean (dirty cleared by the flush).
-        let still_dirty = {
-            let g = bin_arc.read();
-            match &*g {
-                TreeNode::Bottom(b) => b.dirty || b.dirty_count() > 0,
-                _ => false,
-            }
-        };
-        assert!(!still_dirty, "BIN still dirty after checkpoint (not flushed)");
     }
 
     #[test]
