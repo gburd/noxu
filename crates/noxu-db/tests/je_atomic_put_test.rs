@@ -104,6 +104,12 @@ fn je_atomic_put_overwrite_no_duplicates_concurrent() {
 // silently insert a duplicate.
 // ─────────────────────────────────────────────────────────────────────────────
 
+// BUG-ATOMICPUT-1 (FIXED): the dup-DB putNoOverwrite coordination lock keyed on
+// the (key,data) two-part key, so concurrent inserters of the same user key but
+// different data took DIFFERENT synthetic locks and did not serialise. Now the
+// dup-DB NoOverwrite path holds a synthetic lock on the BASE USER KEY across the
+// existence check + insert, so the second inserter blocks on the first and sees
+// its (key,*) dup → KEYEXIST (JE Cursor.dupsPutNoOverwrite, Cursor.java:2489).
 #[test]
 fn je_atomic_put_no_overwrite_with_duplicates_concurrent() {
     let dir = TempDir::new().unwrap();
@@ -153,14 +159,17 @@ fn je_atomic_put_no_overwrite_with_duplicates_concurrent() {
         h.join().unwrap();
     }
 
-    // Final invariant: the count of records with key=k is exactly the
-    // number of distinct data values that races could produce for that
-    // key.  Each key_val is touched twice (val=2k and val=2k+1) with
-    // data values 0 and 1 respectively, so a fully-populated key has
-    // either 1 or 2 distinct dups, never duplicates of the same data.
+    // JE invariant (runNoOverwriteWithDuplicates): for EVERY key, exactly
+    // one record exists.  JE asserts `cursor.count()==1` and
+    // `getNextDup()==NOTFOUND` after each insert, because putNoOverwrite must
+    // NEVER add a second duplicate to an already-present key (Bug #3: the old
+    // code inserted a dup after a NOTFOUND race).  key_val `k` is touched by
+    // val=2k (data 0) and val=2k+1 (data 1): the first putNoOverwrite wins,
+    // the second must return KEYEXIST and insert nothing — so count stays 1.
     use std::collections::BTreeMap;
     let mut by_key: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
-    let mut c = db.open_cursor(None).unwrap();
+    let txn = env.begin_transaction(None).unwrap();
+    let mut c = db.open_cursor_in(&txn, None).unwrap();
     let mut k = DatabaseEntry::new();
     let mut d = DatabaseEntry::new();
     let mut s = c
@@ -173,15 +182,37 @@ fn je_atomic_put_no_overwrite_with_duplicates_concurrent() {
             .unwrap_or(OperationStatus::NotFound);
     }
     drop(c);
+    txn.commit().unwrap();
 
     for (kv, dups) in &by_key {
-        let mut sorted = dups.clone();
-        sorted.sort();
-        sorted.dedup();
         assert_eq!(
-            sorted.len(),
             dups.len(),
-            "put_no_overwrite produced duplicate-of-duplicate under key {kv:?}: {dups:?}"
+            1,
+            "JE: putNoOverwrite must leave exactly ONE record per key \
+             (count==1); key {kv:?} has {} records: {dups:?}",
+            dups.len()
         );
     }
+
+    // Per-key count()==1 and getNextDup()==NOTFOUND, exactly as JE asserts
+    // inside its insert loop, re-verified for every populated key.
+    let txn2 = env.begin_transaction(None).unwrap();
+    for kv in by_key.keys() {
+        let mut c = db.open_cursor_in(&txn2, None).unwrap();
+        let mut sk = DatabaseEntry::from_bytes(kv);
+        let mut sd = DatabaseEntry::new();
+        assert_eq!(
+            c.get(&mut sk, &mut sd, noxu_db::Get::Search, None).unwrap(),
+            OperationStatus::Success,
+            "getSearchKey must find key {kv:?}"
+        );
+        assert_eq!(c.count().unwrap(), 1, "cursor.count()==1 for key {kv:?}");
+        assert_eq!(
+            c.get(&mut sk, &mut sd, noxu_db::Get::NextDup, None).unwrap(),
+            OperationStatus::NotFound,
+            "getNextDup()==NOTFOUND for key {kv:?}"
+        );
+        drop(c);
+    }
+    txn2.commit().unwrap();
 }

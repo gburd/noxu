@@ -897,6 +897,51 @@ impl CursorImpl {
         Ok(())
     }
 
+    /// BUG-ATOMICPUT-1: acquire a user-KEY-level synthetic write lock to make
+    /// a sorted-dup `putNoOverwrite` atomic across concurrent inserters of a
+    /// brand-new key.
+    ///
+    /// The common insert path coordinates brand-new inserts via a synthetic
+    /// lock on the FULL slot key — the two-part `(key, data)` for a dup DB.
+    /// Two `putNoOverwrite` inserters of the SAME user key but DIFFERENT data
+    /// therefore take DIFFERENT synthetic locks and do not serialise: each
+    /// passes its own existence recheck (the other's uncommitted insert is a
+    /// different two-part key) and both insert, leaving two dups for a key
+    /// that was absent when each checked (JE AtomicPutTest "Bug #3").
+    ///
+    /// JE's `Cursor.dupsPutNoOverwrite` reads the first `(key, *)` dup with an
+    /// RMW lock and holds it (Cursor.java:2489-2534): the second inserter
+    /// blocks on that lock until the first commits, then sees the live
+    /// `(key, *)` and returns KEYEXIST.  Noxu's equivalent is a WRITE lock on
+    /// the synthetic id of the BASE USER KEY, held until commit/abort: the
+    /// second inserter blocks until the first resolves, then its existence
+    /// recheck observes the committed dup and returns KEYEXIST (or, on abort,
+    /// correctly inserts).  Keyed on the base key (not the two-part key) so
+    /// every data value for a key contends on the SAME lock.
+    fn lock_user_key_for_dup_no_overwrite(
+        &self,
+        key: &[u8],
+    ) -> Result<(), DbiError> {
+        let db_id = self.db_impl.read().get_id().id() as u64;
+        let synthetic_lsn = Lsn::synthetic_key_lock_id(db_id, key);
+        if let Some(txn) = &self.txn_ref {
+            // Held until commit/abort — a concurrent inserter of the same user
+            // key blocks here until this txn finalises, then rechecks.
+            txn.lock()
+                .unwrap()
+                .lock(synthetic_lsn, LockType::Write, false)
+                .map_err(DbiError::TxnError)?;
+        } else if let Some(lm) = &self.lock_manager {
+            // No-txn direct-CursorImpl caller: acquire and immediately release
+            // (Database::put wraps in a synthetic auto-txn, which holds the
+            // lock across the op through the txn branch above).
+            lm.lock(synthetic_lsn, self.id, LockType::Write, false, false)
+                .map_err(DbiError::TxnError)?;
+            let _ = lm.release(synthetic_lsn, self.id);
+        }
+        Ok(())
+    }
+
     /// Probes the synthetic-key lock for `key` to detect uncommitted
     /// deletes after a `NotFound` BIN lookup.
     ///
@@ -4527,6 +4572,14 @@ impl CursorImpl {
             }
             // --- NoOverwrite: key-only uniqueness check (JE semantics) ---
             PutMode::NoOverwrite => {
+                // BUG-ATOMICPUT-1: serialise concurrent putNoOverwrite
+                // inserters of the SAME user key (any data) on a user-key-level
+                // synthetic lock held until commit, BEFORE the existence check.
+                // Without this the per-(key,data) slot lock lets two inserters
+                // of a brand-new key each insert a dup (JE AtomicPutTest
+                // "Bug #3"); JE's dupsPutNoOverwrite holds an RMW lock on the
+                // first (key,*) dup for the same effect (Cursor.java:2489-2534).
+                self.lock_user_key_for_dup_no_overwrite(key)?;
                 // JE invariant (DatabaseTest.testPutNoOverwriteInADupDb*):
                 // once ANY (key, *) pair exists for this key, a putNoOverwrite
                 // of the same key with ANY data value must return KEYEXIST.
