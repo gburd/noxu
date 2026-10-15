@@ -3877,5 +3877,9 @@ mod cleaner_fetch_failclosed_probe;
 mod writer_oldlsn_probe;
 
 #[cfg(test)]
+#[path = "del_race_probe.rs"]
+mod del_race_probe;
+
+#[cfg(test)]
 #[path = "rc_scan_writer_order_probe.rs"]
 mod rc_scan_writer_order_probe;
