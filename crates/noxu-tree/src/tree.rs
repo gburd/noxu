@@ -376,6 +376,21 @@ pub enum TreeNode {
 /// Type alias for a resident child pointer.
 pub type ChildArc = Arc<RwLock<TreeNode>>;
 
+/// Result of the `inListResident` / parent-slot-identity re-check used by the
+/// checkpointer and evictor flush paths before publishing a node's image
+/// (BUG-CLEANER-LIVE-LN-RECLAIM; JE `IN.getInListResident` / `flushIN`
+/// `exactParentFound`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildResident {
+    /// The exact `Arc` is the resident child of its parent slot.
+    Yes,
+    /// The `Arc` is NOT in its parent slot (detached / replaced zombie).
+    No,
+    /// The parent is write-latched (a detach is in flight); treat as unsafe to
+    /// publish and skip (the next checkpoint re-logs it).
+    Busy,
+}
+
 /// T-4: per-node representation of the resident-child-pointer array.
 ///
 /// Faithful to JE `INTargetRep` (`INTargetRep.java`), the abstract array of
@@ -8075,36 +8090,30 @@ impl Tree {
         // JE: long evictedBytes = target.getBudgetedMemorySize().
         let freed = child.read().budgeted_memory_size();
 
-        // JE Evictor.evict / IN.detachNode(index, logged, loggedLsn) keeps
-        // the existing slot when evicting a clean child. In particular, a
-        // checkpoint may have published a BINDelta newer than last_full_lsn:
-        // that full LSN is the delta's BASE, not the current image. Our
-        // evictor logs dirty BINs before calling detach, so install its new
-        // full image only if newer than the already-published slot.
+        // JE `IN.detachNode(index, updateLsn=FALSE, lsn)` for a clean child
+        // (Evictor.evict path, IN.java:4019-4027): a detached child's parent
+        // slot LSN is NOT rewritten here.  The authoritative publication of a
+        // node's on-disk LSN happens AT LOG TIME, under the parent latch, at
+        // every log site (checkpointer `flush_dirty_bins_internal` /
+        // `flush_one_tree_upper_ins`; evictor `flush_dirty_node_to_log` for
+        // BINs and `log_dirty_upper_in` for upper INs; `evict_root`), each via
+        // `Tree::update_parent_slot_lsn` / `note_root_logged`.  The parent slot
+        // therefore ALREADY points at this child's current on-disk image when
+        // we reach detach, so there is nothing to stamp.
         //
-        // For an Internal (upper IN) child the fresh logged LSN was already
-        // stamped into this parent slot by the evictor's `log_dirty_upper_in`
-        // -> `Tree::update_parent_slot_lsn` (GAP B fix), mirroring JE
-        // `IN.detachNode(idx, updateLsn=true, loggedLsn)` which does
-        // `setLsn(idx, newLsn)` for any target (IN.java:4019-4027).  So we
-        // force `child_full_lsn = NULL` for an Internal child and KEEP the
-        // already-published (fresh) `published_lsn`, rather than re-deriving an
-        // LSN the upper IN does not carry (`InNodeStub` has no last_full_lsn).
-        let child_full_lsn = match &*child.read() {
-            TreeNode::Bottom(b) => b.last_full_lsn,
-            TreeNode::Internal(_) => NULL_LSN,
-        };
-        let published_lsn = p.get_lsn(child_index);
-        if !child_full_lsn.is_transient_or_null()
-            && (published_lsn.is_transient_or_null()
-                || child_full_lsn > published_lsn)
-        {
-            p.set_lsn(child_index, child_full_lsn);
-        }
+        // BUG-CLEANER-LIVE-LN-RECLAIM: the former re-stamp here
+        // (`if child_full_lsn > published { set_lsn(child_full_lsn) }`,
+        // introduced by 35d703ac/2a3ff3ec before log-time publication existed
+        // on the evictor BIN path) republished a DETACHED/zombie instance's
+        // stale `last_full_lsn` into the parent slot, resurrecting an LN LSN
+        // into a reclaimed file.  It is removed now that every log site
+        // publishes at log time.  The EVICTOR-LOG-1 guard above already
+        // refuses to detach a never-logged (`last_full_lsn == NULL`) BIN, so
+        // the slot LSN is guaranteed valid for re-fetch.
 
         // Mark the parent dirty: the slot's in-memory target changed (JE
-        // detachNode sets dirty when updateLsn; we conservatively mark dirty
-        // so the parent is re-logged with the now-non-resident slot).
+        // detachNode sets dirty; we re-log the parent with the now-non-resident
+        // slot at the next checkpoint).
         p.dirty = true;
 
         // Drop the strong Arc explicitly so the node is freed now (the slot's
@@ -10437,6 +10446,72 @@ impl Tree {
     /// not a full-tree search.  A no-op when the child has no parent (it is
     /// the root — handled by `note_root_logged`), the parent Weak is dead, or
     /// the child is not found in the parent's slots.
+    /// JE `inListResident` / `flushIN` identity invariant
+    /// (Checkpointer.java:1198-1256, Evictor.java:2617): a node reached by a
+    /// path OTHER than a latch-coupled descent (the checkpointer's collected
+    /// dirty-BIN list, the evictor LRU) must be re-verified to still be the
+    /// resident child of its parent slot before it is flushed or has its LSN
+    /// stamped.  Returns `true` iff `child_arc` is the exact `Arc` installed in
+    /// its parent's slot (BUG-CLEANER-LIVE-LN-RECLAIM: a DETACHED/zombie
+    /// instance — detached by the evictor after the collection snapshot — would
+    /// otherwise be flushed, publishing its stale pre-migration image and
+    /// stamping it into the parent, resurrecting an LN LSN into a reclaimed
+    /// file).  A root (no parent) is always resident (JE evicts the root via a
+    /// separate path and never detaches it mid-checkpoint).
+    ///
+    /// Must be called WITHOUT holding `child_arc`'s latch (it takes the parent
+    /// read latch; canonical order is parent-then-child).
+    pub fn child_is_resident_in_parent(
+        child_arc: &Arc<RwLock<TreeNode>>,
+    ) -> bool {
+        // Caller does NOT hold the child latch, so reading it to get the parent
+        // Weak is safe here.
+        let parent_weak = {
+            let g = child_arc.read();
+            match &*g {
+                TreeNode::Bottom(b) => b.parent.clone(),
+                TreeNode::Internal(n) => n.parent.clone(),
+            }
+        };
+        Self::child_resident_state(&parent_weak, child_arc)
+            == ChildResident::Yes
+    }
+
+    /// `inListResident` / `flushIN` identity re-check for callers that ALREADY
+    /// hold `child_arc`'s latch (the checkpointer / evictor flush) — it NEVER
+    /// latches the child (the futex `RwLock` is not reentrant; re-reading the
+    /// held child was the Fix-C self-deadlock).  The caller passes the parent
+    /// `Weak` it read from the guard it holds.  Only the PARENT is latched,
+    /// with `try_read`, so it cannot deadlock against `detach_node_by_id`
+    /// (which holds `parent.write()` and blocks on our child latch): `Busy`
+    /// means a detach is in flight and the caller must skip (not publish).
+    pub fn child_resident_state(
+        parent_weak: &Option<Weak<RwLock<TreeNode>>>,
+        child_arc: &Arc<RwLock<TreeNode>>,
+    ) -> ChildResident {
+        let Some(parent_weak) = parent_weak else {
+            return ChildResident::Yes; // root / never-attached
+        };
+        let Some(parent_arc) = parent_weak.upgrade() else {
+            return ChildResident::No; // whole branch gone -> zombie
+        };
+        let Some(pg) = parent_arc.try_read() else {
+            return ChildResident::Busy; // detach in flight on this parent
+        };
+        let TreeNode::Internal(p) = &*pg else {
+            return ChildResident::No;
+        };
+        if (0..p.entries.len()).any(|slot| {
+            p.child_ref(slot)
+                .map(|c| Arc::ptr_eq(c, child_arc))
+                .unwrap_or(false)
+        }) {
+            ChildResident::Yes
+        } else {
+            ChildResident::No
+        }
+    }
+
     pub fn update_parent_slot_lsn(
         child_arc: &Arc<RwLock<TreeNode>>,
         new_lsn: Lsn,
@@ -10461,9 +10536,16 @@ impl Tree {
         let mut pg = parent_arc.write();
         if let TreeNode::Internal(p) = &mut *pg {
             for slot in 0..p.entries.len() {
+                // BUG-CLEANER-LIVE-LN-RECLAIM: match by exact Arc IDENTITY, not
+                // node_id.  A detached (zombie) instance shares its node_id with
+                // the re-faulted canonical child now in the slot; matching by
+                // node_id would let the zombie stamp its stale LSN over the
+                // canonical child's slot.  Identity match stamps only when THIS
+                // instance is the resident child (JE `IN.detachNode` /
+                // `flushIN` publish the LSN for the target that IS in the slot).
                 let matches = p
                     .child_ref(slot)
-                    .map(|c| c.read().node_id() == child_id)
+                    .map(|c| Arc::ptr_eq(c, child_arc))
                     .unwrap_or(false);
                 if matches {
                     p.set_lsn(slot, new_lsn);
@@ -10472,6 +10554,7 @@ impl Tree {
                 }
             }
         }
+        let _ = child_id;
     }
 
     /// Recursive DFS helper for `get_parent_in_for_child_in`.

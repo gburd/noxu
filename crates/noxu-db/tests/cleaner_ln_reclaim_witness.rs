@@ -122,7 +122,19 @@ fn committed_key_stays_readable_under_concurrent_cleaning() {
     for i in 0..records {
         let k = format!("{i:010}");
         let got = db.get(k.as_bytes()).expect("preflight get must not Err");
-        assert!(got.is_some(), "preflight: committed key {i} must be present");
+        // VALUE CORRECTNESS: the committed value must be returned intact, not
+        // merely present.  A fail-open LN fetch (reclaimed file -> Ok(None) ->
+        // served as empty) would pass a bare `is_some()` while silently losing
+        // the committed bytes (BUG-CLEANER-LIVE-LN-RECLAIM).
+        match got {
+            Some(v) => assert!(
+                v.as_ref() == val.as_slice(),
+                "preflight: committed key {i} came back with the WRONG value                  (len {} vs expected {}): silent data loss",
+                v.len(),
+                val.len(),
+            ),
+            None => panic!("preflight: committed key {i} must be present"),
+        }
     }
 
     let env = Arc::new(env);
@@ -163,6 +175,7 @@ fn committed_key_stays_readable_under_concurrent_cleaning() {
         let first_err = Arc::clone(&first_err);
         let wrong_none = Arc::clone(&wrong_none);
         let barrier = Arc::clone(&barrier);
+        let val = val.clone(); // expected committed bytes for value-equality
         handles.push(std::thread::spawn(move || {
             barrier.wait();
             let mut key = t;
@@ -173,7 +186,26 @@ fn committed_key_stays_readable_under_concurrent_cleaning() {
                 key = (key + 2_654_435_761).wrapping_rem(records);
                 let k = format!("{key:010}");
                 match db.get(k.as_bytes()) {
-                    Ok(Some(_)) => {}
+                    // VALUE CORRECTNESS: a committed key must come back with
+                    // its exact committed bytes.  A bare `Ok(Some(_))` accepts
+                    // an empty/truncated value served by a fail-open LN fetch
+                    // over a reclaimed file -- the silent form of this very
+                    // data-loss bug.  Require byte equality with the value we
+                    // wrote (every key was written with the same `val`).
+                    Ok(Some(v)) if v.as_ref() == val.as_slice() => {}
+                    Ok(Some(v)) => {
+                        // Present but WRONG bytes: silent reclaim data loss.
+                        let mut g = first_err.lock().unwrap();
+                        if g.is_none() {
+                            *g = Some(format!(
+                                "committed key {key} came back with the WRONG                                  value (len {} vs expected {}): silent                                  cleaner<->LN-fetch reclaim data loss",
+                                v.len(),
+                                val.len(),
+                            ));
+                        }
+                        stop.store(true, Ordering::Relaxed);
+                        break;
+                    }
                     Ok(None) => {
                         // A committed key reported NotFound: lost read.
                         wrong_none.fetch_add(1, Ordering::Relaxed);

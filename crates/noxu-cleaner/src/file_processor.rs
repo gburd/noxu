@@ -851,21 +851,18 @@ impl TreeLookup for SharedTreeLookup {
             Ok(g) => g,
             Err(_) => return BinLookupResult::NotFound,
         };
-        match tree.search(key) {
-            None => BinLookupResult::NotFound,
-            Some(result) if !result.exact_parent_found => {
-                BinLookupResult::NotFound
+        // BUG-CLEANER-LIVE-LN-RECLAIM (B2): resolve the slot LSN with the
+        // RE-FAULTING, comparator-/prefix-aware descent (`search_with_data`),
+        // not the hand-rolled `get_slot_lsn_from_root` (which returned `None`
+        // for a key whose path crosses a non-resident interior IN and used a
+        // raw key compare).  A false `None` here makes a live LN look
+        // NotFound -> Dead -> its file reclaimed while a live slot references
+        // it (JE `Tree.getParentBINForChildLN` fetches on the descent).
+        match tree.search_with_data(key) {
+            Some(sf) if sf.found => {
+                BinLookupResult::Found { tree_lsn: Lsn::from_u64(sf.lsn) }
             }
-            Some(_) => {
-                let slot_lsn = RealTreeLookup::get_slot_lsn_from_root(
-                    tree.get_root(),
-                    key,
-                );
-                match slot_lsn {
-                    Some(lsn) => BinLookupResult::Found { tree_lsn: lsn },
-                    None => BinLookupResult::NotFound,
-                }
-            }
+            _ => BinLookupResult::NotFound,
         }
     }
 
@@ -899,6 +896,22 @@ impl TreeLookup for SharedTreeLookup {
         }
 
         // Post-lock re-check.
+        //
+        // BUG-CLEANER-LIVE-LN-RECLAIM (B2): use the tree's REAL descent
+        // (`search_with_data`), which RE-FAULTS evicted interior children and
+        // is comparator-/prefix-aware, exactly like the read path and JE's
+        // `Tree.getParentBINForChildLN` -> `IN.fetchTarget`.  The former
+        // `get_slot_lsn_from_root` -> `find_bin_entry_lsn` hand-rolled descent
+        // returned `None` for a key whose path crossed a NON-RESIDENT interior
+        // IN (it used `n.get_child(idx)?` with no re-fault, and a raw
+        // `entry.key <= key` compare).  Under cache pressure (interior INs
+        // evicted) that `None` made a LIVE LN (whose slot still equals
+        // `tree_lsn == log_lsn`) look slot-mismatched -> Obsolete -> Dead, so
+        // the cleaner reclaimed the LN's file while a live BIN slot still
+        // referenced it: a committed value served empty / a fatal
+        // LOG_FILE_NOT_FOUND.  (The authoritative latched recheck inside
+        // `publish_migration_latched` already re-faults correctly via
+        // `with_latched_ln_slot`; this pre-publish recheck must not be weaker.)
         let current_lsn = {
             let tree = match tree_arc.read() {
                 Ok(g) => g,
@@ -912,7 +925,9 @@ impl TreeLookup for SharedTreeLookup {
                     return MigrationOutcome::Obsolete;
                 }
             };
-            RealTreeLookup::get_slot_lsn_from_root(tree.get_root(), key)
+            tree.search_with_data(key)
+                .filter(|sf| sf.found)
+                .map(|sf| Lsn::from_u64(sf.lsn))
         };
         let slot_matches = match current_lsn {
             Some(lsn) => lsn == tree_lsn,

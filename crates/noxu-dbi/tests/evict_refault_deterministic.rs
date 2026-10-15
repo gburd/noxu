@@ -198,7 +198,16 @@ fn run_deterministic(
                 "preflight key {:?}",
                 String::from_utf8_lossy(k)
             );
-            assert!(c.get_current_data().is_some());
+            // VALUE CORRECTNESS: the committed value (0xAA x VAL_LEN) must come
+            // back intact, not merely present -- a fail-open refetch over a
+            // reclaimed/missing file would pass a bare `is_some()` while
+            // silently losing the bytes.
+            assert_eq!(
+                c.get_current_data(),
+                Some([0xAAu8; VAL_LEN].as_slice()),
+                "preflight key {:?} came back with the WRONG value",
+                String::from_utf8_lossy(k)
+            );
         }
         c.close().unwrap();
     }
@@ -277,8 +286,12 @@ fn run_deterministic(
             cursor.search(k, None, SearchMode::Set)
         }));
         match r {
+            // VALUE CORRECTNESS: require the exact committed bytes, not just
+            // presence; an empty/wrong value served by a fail-open refetch is
+            // the silent form of the data-loss this witness guards.
             Ok(Ok(OperationStatus::Success))
-                if cursor.get_current_data().is_some() => {}
+                if cursor.get_current_data()
+                    == Some([0xAAu8; VAL_LEN].as_slice()) => {}
             _ => missing += 1,
         }
     }
