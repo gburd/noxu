@@ -45,13 +45,45 @@ fn lsn_ordering_by_file(tc: hegel::TestCase) {
 /// Within the same file, ordering is by offset.
 #[hegel::test]
 fn lsn_ordering_by_offset(tc: hegel::TestCase) {
-    let file_number = tc.draw(generators::integers::<u32>());
+    // `offset_b = offset_a + 1` can reach `u32::MAX`, so when `file_number`
+    // is also `u32::MAX` the pair `(u32::MAX, u32::MAX)` IS `NULL_LSN`
+    // (`Lsn(u64::MAX)`), and `Lsn::cmp` panics on a NULL operand. Exclude
+    // `file_number == u32::MAX` exactly as the sibling `lsn_non_null` does:
+    // with `file_number <= u32::MAX - 1`, `lsn_b` is never `NULL_LSN` for any
+    // offset (only `(u32::MAX, u32::MAX)` is null), so the comparison is valid.
+    let file_number =
+        tc.draw(generators::integers::<u32>().max_value(u32::MAX - 1));
     let offset_a =
         tc.draw(generators::integers::<u32>().max_value(u32::MAX - 1));
     let offset_b = offset_a + 1;
     let lsn_a = Lsn::new(file_number, offset_a);
     let lsn_b = Lsn::new(file_number, offset_b);
     assert!(lsn_a < lsn_b);
+}
+
+/// Deterministic witness for the `lsn_ordering_by_offset` NULL_LSN edge
+/// (TRIAGE flake, first diagnosed by the stack-v1 census and reproduced when
+/// the Hegel corpus persisted the file_number == u32::MAX draw).
+///
+/// Before the generator fix the unconstrained `file_number` could draw
+/// `u32::MAX` with `offset_a == u32::MAX - 1`, build
+/// `lsn_b == Lsn::new(u32::MAX, u32::MAX) == NULL_LSN`, and panic in
+/// `Lsn::cmp`. This pins the two invariants the fix relies on so a regression
+/// of either the NULL_LSN encoding or the generator bound fails deterministically
+/// rather than roughly one run in four billion.
+#[test]
+fn lsn_ordering_by_offset_null_edge_is_excluded() {
+    // The ONLY (file, offset) pair that aliases NULL_LSN is (MAX, MAX).
+    assert!(Lsn::new(u32::MAX, u32::MAX).is_null());
+    // The largest offset the generator can produce for lsn_b is u32::MAX; with
+    // file_number capped at u32::MAX - 1 that pair is NOT null and compares
+    // fine against its predecessor, so the property must hold at this boundary.
+    let a = Lsn::new(u32::MAX - 1, u32::MAX - 1);
+    let b = Lsn::new(u32::MAX - 1, u32::MAX);
+    assert!(!b.is_null(), "boundary lsn_b must not be NULL_LSN");
+    assert!(a < b, "within a file, larger offset must order greater");
+    // And at the smallest file, too.
+    assert!(Lsn::new(0, 0) < Lsn::new(0, 1));
 }
 
 /// NULL_LSN is always detected as null.
