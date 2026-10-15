@@ -1356,13 +1356,94 @@ impl Checkpointer {
         // `BIN.shouldLogDelta` (count-based + configurable percent).
 
         for (_node_db_id, bin_arc) in dirty_bins {
-            // Acquire write lock to serialize + clear dirty flags.
-            let mut bin_guard = bin_arc.write();
+            // BUG-CLEANER-LIVE-LN-RECLAIM (JE Checkpointer.flushIN, Checkpointer
+            // .java:1198-1256 `getParentINForChildIN` + `!exactParentFound`
+            // -> skip; the IN `inListResident` invariant, IN.java:4936-4960):
+            // between `collect_dirty_bins` (under the tree read latch) and here,
+            // the evictor may have DETACHED this BIN and a fresh instance may
+            // have been re-faulted into the slot.  Flushing the detached
+            // (zombie) instance would publish its STALE pre-migration image and
+            // stamp that LSN into the parent, resurrecting an LN LSN into a log
+            // file the cleaner has since reclaimed -> a committed value served
+            // empty / a fatal LOG_FILE_NOT_FOUND.  Re-verify (parent-then-child
+            // lock order, before latching the child) that this Arc is still the
+            // resident child of its parent slot; a zombie is skipped (its
+            // post-detach state must never be published — JE never flushes a
+            // non-resident IN).
+            // Acquire the child write latch, then re-verify this BIN is STILL
+            // the resident child of its parent (JE Checkpointer.flushIN
+            // `getParentINForChildIN` + `exactParentFound`, Checkpointer.java:
+            // 1198-1256; the `inListResident` invariant, IN.java:4936-4960)
+            // before flushing — between `collect_dirty_bins` and here the
+            // evictor may have DETACHED this BIN (BUG-CLEANER-LIVE-LN-RECLAIM:
+            // flushing the detached zombie would publish its stale image).
+            //
+            // CORRECTNESS (checkpoint durability): a checkpoint must NEVER drop
+            // a RESIDENT dirty BIN — skipping it then writing CkptEnd would
+            // lose its committed changes on recovery.  So we skip ONLY on a
+            // definitive `No` (genuinely detached — the evictor logged it
+            // before detaching, so its image is already durable + published).
+            // `Busy` (a detach is in flight on THIS parent, momentarily holding
+            // `parent.write()`) is NOT a skip: release the child latch so the
+            // detach can finish, yield, and retry — the parent latch is held
+            // only briefly, so this converges to `Yes` (still resident, flush
+            // it) or `No` (it was the one being detached, already durable).
+            // The check is non-blocking (`try_read` on the parent) and reads
+            // the parent Weak from the guard we hold (never re-latching the
+            // child — the futex RwLock is not reentrant), so it cannot deadlock
+            // against detach's parent-then-child order.
+            let mut bin_guard;
+            let mut resident;
+            let mut spins = 0usize;
+            loop {
+                bin_guard = bin_arc.write();
+                let parent_weak = match &*bin_guard {
+                    TreeNode::Bottom(b) => b.parent.clone(),
+                    TreeNode::Internal(n) => n.parent.clone(),
+                };
+                resident = Tree::child_resident_state(&parent_weak, &bin_arc);
+                if resident != noxu_tree::tree::ChildResident::Busy {
+                    break;
+                }
+                // Busy: drop the child latch so the in-flight detach (blocked
+                // on it) can complete, then retry.  Bounded spin with a yield;
+                // detach holds the parent latch only for the duration of a slot
+                // update, so this resolves quickly.
+                drop(bin_guard);
+                spins += 1;
+                if spins > 10_000 {
+                    // Pathological: fall back to a blocking re-check via the
+                    // child's parent to avoid an unbounded spin.  Still never
+                    // skip a resident node — treat an unresolved Busy as Yes
+                    // (flush it; a stale flush is prevented by the identity
+                    // match in `update_parent_slot_lsn`).
+                    bin_guard = bin_arc.write();
+                    resident = noxu_tree::tree::ChildResident::Yes;
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            if resident == noxu_tree::tree::ChildResident::No {
+                // Genuinely detached: the evictor already logged + published it
+                // before detaching, so its on-disk image is durable and the
+                // parent slot is current — safe to skip (JE never flushes a
+                // non-resident IN).
+                continue;
+            }
 
             let b = match &mut *bin_guard {
                 TreeNode::Bottom(b) => b,
                 _ => continue, // not a BIN (defensive)
             };
+            // DEBUG invariant: the retry loop above only breaks with
+            // `resident == Yes` (or the pathological fall-through), so a
+            // genuinely detached BIN is never flushed here
+            // (BUG-CLEANER-LIVE-LN-RECLAIM).
+            debug_assert_ne!(
+                resident,
+                noxu_tree::tree::ChildResident::No,
+                "checkpointer must not flush a detached (zombie) BIN"
+            );
 
             let this_node_id = b.node_id;
             let dirty = b.dirty_count();
@@ -2777,6 +2858,119 @@ mod tests {
     /// JE: INLogEntry.java:150-151 (prevFullLsn + prevDeltaLsn both set even
     /// for a FULL entry) + IN.java:5493-5497/5518-5519 (afterLogCommon counts
     /// BOTH oldLsn = getPrevFullLsn() AND auxOldLsn = getPrevDeltaLsn()).
+    /// Condition-2 witness (BUG-CLEANER-LIVE-LN-RECLAIM): a checkpoint must
+    /// NEVER skip a RESIDENT dirty BIN just because its parent IN is briefly
+    /// latched (the `child_resident_state` `try_read` returns `Busy`).  With a
+    /// skip-on-Busy checkpointer the dirty BIN is dropped and `CkptEnd` is
+    /// written without it -> committed changes lost on recovery.  With the
+    /// retry-on-Busy fix the checkpointer waits out the brief parent latch and
+    /// flushes the BIN.
+    ///
+    /// Here we hold the parent IN's READ latch for a bounded window on another
+    /// thread while the checkpointer runs; `try_read` on the parent SUCCEEDS
+    /// under a read latch, so to force `Busy` we take the parent WRITE latch
+    /// briefly.  The checkpointer must still end with the BIN flushed.
+    #[test]
+    fn test_checkpoint_does_not_skip_resident_dirty_bin_under_busy_parent() {
+        use noxu_log::FileManager;
+        use noxu_tree::tree::{Tree, TreeNode};
+        use noxu_util::lsn::Lsn;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let fm = Arc::new(
+            FileManager::new(dir.path(), false, 64 * 1024 * 1024, 100).unwrap(),
+        );
+        let lm =
+            Arc::new(LogManager::new(Arc::clone(&fm), 3, 1024 * 1024, 65536));
+
+        // Small fanout -> a 2-level tree (upper IN parent over BINs).
+        let tree = Tree::new(1, 4);
+        for i in 0u16..64 {
+            let key = format!("key{i:04}");
+            tree.insert(
+                key.into_bytes(),
+                b"v".to_vec(),
+                Lsn::new(1, i as u32 + 1),
+            )
+            .unwrap();
+        }
+        let tree_arc = Arc::new(RwLock::new(tree));
+
+        // Find a BIN and its parent IN.  Dirty the BIN.
+        let (bin_arc, parent_arc) = {
+            let g = tree_arc.read().unwrap();
+            let root = g.get_root().unwrap();
+            let parent = root.clone();
+            let child = {
+                let rg = root.read();
+                match &*rg {
+                    TreeNode::Internal(n) => {
+                        n.resident_children().into_iter().next()
+                    }
+                    TreeNode::Bottom(_) => None,
+                }
+            };
+            (child, parent)
+        };
+        let bin_arc = match bin_arc {
+            Some(b) if b.read().is_bin() => b,
+            _ => return, // single-level tree on this build; skip (not applicable)
+        };
+        {
+            let mut bg = bin_arc.write();
+            if let TreeNode::Bottom(ref mut b) = *bg {
+                b.dirty = true;
+                if let Some(e) = b.entries.first_mut() {
+                    e.dirty = true;
+                }
+            }
+        }
+        let bin_node_id = bin_arc.read().node_id();
+
+        // Hold the PARENT write latch in bursts while the checkpointer runs, so
+        // `child_resident_state` sees `Busy` and must retry (not skip).
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let agitator = std::thread::spawn(move || {
+            while !stop2.load(Ordering::Relaxed) {
+                {
+                    let _w = parent_arc.write();
+                    std::thread::sleep(std::time::Duration::from_micros(50));
+                }
+                std::thread::yield_now();
+            }
+        });
+
+        let checkpointer = Checkpointer::new(CheckpointConfig::default())
+            .with_log_manager(Arc::clone(&lm))
+            .with_tree(Arc::clone(&tree_arc), 1);
+        let result = checkpointer
+            .flush_dirty_bins_internal()
+            .expect("flush_dirty_bins_internal failed");
+        stop.store(true, Ordering::Relaxed);
+        agitator.join().unwrap();
+
+        // The dirty BIN must have been flushed (full or delta), never skipped.
+        let flushed = result.full_bins_flushed + result.delta_ins_flushed;
+        assert!(
+            flushed >= 1,
+            "checkpoint skipped a resident dirty BIN under a busy parent              (node {bin_node_id}): full={} delta={} -> committed data would be              lost after CkptEnd",
+            result.full_bins_flushed,
+            result.delta_ins_flushed,
+        );
+        // And the BIN must now be clean (dirty cleared by the flush).
+        let still_dirty = {
+            let g = bin_arc.read();
+            match &*g {
+                TreeNode::Bottom(b) => b.dirty || b.dirty_count() > 0,
+                _ => false,
+            }
+        };
+        assert!(!still_dirty, "BIN still dirty after checkpoint (not flushed)");
+    }
+
     #[test]
     fn test_full_bin_counts_intervening_delta_obsolete_on_delta_to_full() {
         use noxu_cleaner::UtilizationTracker;
