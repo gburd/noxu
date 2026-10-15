@@ -730,7 +730,9 @@ impl CursorImpl {
                             Some((lsn, true)) => {
                                 Ok((None, lsn.as_u64(), false))
                             }
-                            _ => Ok((None, noxu_util::NULL_LSN.as_u64(), false)),
+                            _ => {
+                                Ok((None, noxu_util::NULL_LSN.as_u64(), false))
+                            }
                         };
                     }
                 },
@@ -5730,17 +5732,18 @@ impl CursorImpl {
         // known-deleted).  Reuse of a KD slot is an insertion: JE passes
         // `isInsertion` and never counts the defunct version obsolete here
         // (LN.java:685, CursorImpl.java:1427-1438).
-        let (curr_embedded_ln, prior_exists) =
-            if old_lsn != noxu_util::NULL_LSN.as_u64() {
-                let (prior_data, _, exists) = self.get_slot_before_image(key)?;
-                let embedded = match prior_data {
-                    Some(pd) => self.db_impl.read().should_embed_ln(pd.len()),
-                    None => false,
-                };
-                (embedded, exists)
-            } else {
-                (false, false)
+        let (curr_embedded_ln, prior_exists) = if old_lsn
+            != noxu_util::NULL_LSN.as_u64()
+        {
+            let (prior_data, _, exists) = self.get_slot_before_image(key)?;
+            let embedded = match prior_data {
+                Some(pd) => self.db_impl.read().should_embed_ln(pd.len()),
+                None => false,
             };
+            (embedded, exists)
+        } else {
+            (false, false)
+        };
 
         // JE LN.logInternal (LN.java:645): a transactional LN logs the
         // WriteLockInfo's abortLsn — the slot LSN before the txn's FIRST
