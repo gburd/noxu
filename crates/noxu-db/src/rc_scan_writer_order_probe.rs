@@ -84,8 +84,11 @@ fn writer_holds_write_new_once_slot_shows_it() {
 
     let (at_tx, at_rx) = channel::<(u64, u64)>();
     let (go_tx, go_rx) = channel::<()>();
-    let (wenv, wdb) = (env.clone(), db.clone());
+    // `env` is not used after the spawn (only `db`/`lm` are), so move it into
+    // the writer; `db` is asserted on at the end, so clone it.
+    let wdb = Arc::clone(&db);
     let writer = std::thread::spawn(move || {
+        let wenv = env;
         SLOT_PUBLISHED_PROBE.with(|hook| {
             *hook.borrow_mut() = Some(Box::new(move |old, new: Lsn| {
                 at_tx.send((old, new.as_u64())).unwrap();
@@ -140,7 +143,7 @@ fn rc_reader_never_sees_published_uncommitted_slot() {
 
     let (at_tx, at_rx) = channel::<u64>();
     let (go_tx, go_rx) = channel::<()>();
-    let (wenv, wdb) = (env.clone(), db.clone());
+    let (wenv, wdb) = (Arc::clone(&env), Arc::clone(&db));
     let writer = std::thread::spawn(move || {
         SLOT_PUBLISHED_PROBE.with(|hook| {
             *hook.borrow_mut() = Some(Box::new(move |_old, new: Lsn| {
@@ -168,9 +171,12 @@ fn rc_reader_never_sees_published_uncommitted_slot() {
     // At the base this returns the published uncommitted Bvalue immediately
     // (dirty re-read / unlocked fallback). With the fix it blocks on WRITE(new)
     // until the writer below aborts, then returns the restored committed value.
-    let (renv, rdb) = (env.clone(), db.clone());
+    // `env` is not used after the reader spawn (only `db` is, at the end), so
+    // move it into the reader; clone `db`.
+    let rdb = Arc::clone(&db);
     let (res_tx, res_rx) = channel::<Vec<u8>>();
     let reader = std::thread::spawn(move || {
+        let renv = env;
         let rc = TransactionConfig::new().with_read_committed(true);
         let txn = renv.begin_transaction(Some(&rc)).unwrap();
         let mut cur = rdb.open_cursor_in(&txn, None).unwrap();
@@ -238,7 +244,8 @@ fn rc_scan_livelock_never_returns_uncommitted_under_capped_relock() {
 
     // Abort-cycling writer: keep KEY perpetually write-locked with uncommitted
     // Bvalue, never committing it.
-    let (wenv, wdb, wdone) = (env.clone(), db.clone(), done.clone());
+    let (wenv, wdb, wdone) =
+        (Arc::clone(&env), Arc::clone(&db), Arc::clone(&done));
     let writer = std::thread::spawn(move || {
         while !wdone.load(std::sync::atomic::Ordering::Relaxed) {
             let Ok(txn) = wenv.begin_transaction(None) else { continue };
