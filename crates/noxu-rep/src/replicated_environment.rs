@@ -4491,9 +4491,25 @@ impl ReplicatedEnvironment {
             );
         }
 
-        // Stop the service dispatcher (the: serviceDispatcher.shutdown()).
+        // Stop the service dispatcher and JOIN its accept thread
+        // (BUG-REP-DISPATCHER-LEAK; the: serviceDispatcher.shutdown()).
+        //
+        // JE `ServiceDispatcher.shutdown()` closes the server socket and joins
+        // the accept thread so "the port is freed up upon return". The former
+        // `stop()` only flipped the `running` flag, which the thread — then
+        // parked in a blocking `accept()` — never observed, leaking the thread,
+        // its listener fd, and the bound port on every close/drop. The accept
+        // loop still blocks in `accept()`; `stop_and_join` clears the flag,
+        // wakes the blocked `accept()` with a self-connect, and waits (bounded)
+        // for the thread to exit before returning.
+        //
+        // Lock order: we hold no env lock here (the `io_threads` join above
+        // completed in its own scope), and the accept thread's handlers take
+        // only the dispatcher-local `services` map — never an env lock — so this
+        // join cannot deadlock against anything `close()` holds. The inner
+        // dispatcher's `Drop` is the backstop for a plain `drop(env)`.
         if let Some(ref dispatcher) = self.tcp_dispatcher {
-            dispatcher.stop();
+            dispatcher.stop_and_join();
             let kind = if dispatcher.is_tls() { "TLS" } else { "TCP" };
             log::debug!(
                 "Node '{}' {} service dispatcher stopped",

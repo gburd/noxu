@@ -36,6 +36,14 @@ use std::time::Duration;
 
 use noxu_sync::Mutex;
 
+/// Upper bound on how long `stop_and_join` waits for the accept thread to
+/// observe the shutdown flag and exit before giving up (and leaving it
+/// detached). Generous yet finite, so a close/drop can never block
+/// indefinitely. JE escalates a slow soft shutdown to `interrupt()`; here the
+/// bounded join simply returns and the thread exits on its own once its
+/// blocking `accept()` is woken by the self-connect.
+const ACCEPT_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+
 use super::channel::{Channel, TcpChannel};
 use crate::error::{RepError, Result};
 
@@ -211,6 +219,16 @@ pub struct TcpServiceDispatcher {
     /// Wall-clock bound on the service-name handshake read (F14). Defaults to
     /// [`HANDSHAKE_READ_TIMEOUT`]; overridable for tests.
     handshake_timeout: Duration,
+    /// Join handle for the spawned accept thread (BUG-REP-DISPATCHER-LEAK).
+    /// Stored so `stop_and_join` / `Drop` can join it after signalling
+    /// shutdown, instead of leaking a detached thread (and its listener
+    /// socket / bound port) on every env close/drop.
+    accept_handle: Mutex<Option<thread::JoinHandle<()>>>,
+    /// The actual bound address (resolved from `addr`, which may be port 0),
+    /// recorded by `start`. Used by `stop_and_join` to self-connect and wake
+    /// the blocked `accept()` so the thread exits promptly
+    /// (BUG-REP-DISPATCHER-LEAK).
+    bound_addr: Mutex<Option<SocketAddr>>,
 }
 
 impl TcpServiceDispatcher {
@@ -235,6 +253,8 @@ impl TcpServiceDispatcher {
             active_connections: Arc::new(AtomicUsize::new(0)),
             max_connections: max_connections.max(1),
             handshake_timeout: HANDSHAKE_READ_TIMEOUT,
+            accept_handle: Mutex::new(None),
+            bound_addr: Mutex::new(None),
         })
     }
 
@@ -271,9 +291,46 @@ impl TcpServiceDispatcher {
         self.running.load(Ordering::SeqCst)
     }
 
-    /// Stop the accept loop.
+    /// Stop the accept loop (signal only).
+    ///
+    /// Sets the `running` flag to `false`. The accept thread observes it after
+    /// its next `accept()` returns; a blocked `accept()` is not woken by this
+    /// call alone. Use [`Self::stop_and_join`] (or drop the dispatcher) to
+    /// also wake the blocked accept (via a self-connect) and *wait* for the
+    /// thread to exit, reclaiming its listener socket / bound port.
     pub fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
+    }
+
+    /// Signal shutdown, wake the blocked `accept()`, and join the accept
+    /// thread with a bounded timeout (BUG-REP-DISPATCHER-LEAK).
+    ///
+    /// JE `ServiceDispatcher.shutdown()` wakes the blocked selector
+    /// (`initiateSoftShutdown` -> `selector.wakeup()`), closes the server
+    /// socket ("the port is freed up upon return"), and joins the accept
+    /// thread. The accept thread here blocks in `TcpListener::accept()`; this
+    /// method sets `running = false` and then performs a throwaway
+    /// *self-connect* to the bound address, which wakes the blocked
+    /// `accept()`. The loop re-checks `running`, sees `false`, and exits,
+    /// dropping its listener (freeing the fd and the bound port) before this
+    /// method's join returns. Self-connect is a safe-std, portable wakeup (no
+    /// new `unsafe`, no fd surgery across threads).
+    ///
+    /// Idempotent: a second call (e.g. explicit `close()` then `Drop`) finds
+    /// no handle and returns immediately. The caller must NOT hold any lock a
+    /// service handler takes; the accept thread only touches the
+    /// dispatcher-local `services` map, so the join is deadlock-free.
+    pub fn stop_and_join(&self) {
+        self.running.store(false, Ordering::SeqCst);
+        let handle = self.accept_handle.lock().take();
+        if let Some(handle) = handle {
+            // Wake the blocked accept() with a brief self-connect so the loop
+            // observes `running == false` immediately instead of parking.
+            if let Some(addr) = *self.bound_addr.lock() {
+                wake_accept_via_self_connect(addr);
+            }
+            join_with_timeout(handle, ACCEPT_JOIN_TIMEOUT, "noxu-tcp-accept");
+        }
     }
 
     /// Start the TCP accept loop in a background thread.
@@ -291,6 +348,9 @@ impl TcpServiceDispatcher {
         let bound_addr = listener
             .local_addr()
             .map_err(|e| RepError::NetworkError(e.to_string()))?;
+        // Record the bound address so `stop_and_join` can self-connect to it
+        // to wake the blocked `accept()` (BUG-REP-DISPATCHER-LEAK).
+        *self.bound_addr.lock() = Some(bound_addr);
 
         let services = Arc::clone(&self.services);
         let running = Arc::clone(&self.running);
@@ -299,48 +359,69 @@ impl TcpServiceDispatcher {
         let handshake_timeout = self.handshake_timeout;
         running.store(true, Ordering::SeqCst);
 
-        thread::spawn(move || {
-            while running.load(Ordering::SeqCst) {
-                match listener.accept() {
-                    Ok((stream, peer_addr)) => {
-                        // Connection-count limit (F15): refuse to spawn beyond
-                        // `max_connections` in-flight handlers. Drop the newest
-                        // connection (closing its socket) rather than let a
-                        // connect-burst exhaust threads/fds.
-                        if active_connections.load(Ordering::Acquire)
-                            >= max_connections
-                        {
-                            log::warn!(
-                                "TcpServiceDispatcher: at connection limit \
-                                 ({max_connections}); dropping {peer_addr}"
-                            );
-                            drop(stream);
-                            continue;
+        let handle = thread::Builder::new()
+            .name("noxu-tcp-accept".to_string())
+            .spawn(move || {
+                while running.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((stream, peer_addr)) => {
+                            // Re-check the shutdown flag: a wakeup self-connect
+                            // from `stop_and_join` lands here, and we must not
+                            // spawn a handler for it (BUG-REP-DISPATCHER-LEAK).
+                            if !running.load(Ordering::SeqCst) {
+                                drop(stream);
+                                break;
+                            }
+                            // Connection-count limit (F15): refuse to spawn
+                            // beyond `max_connections` in-flight handlers.
+                            // Drop the newest connection (closing its socket)
+                            // rather than let a connect-burst exhaust
+                            // threads/fds.
+                            if active_connections.load(Ordering::Acquire)
+                                >= max_connections
+                            {
+                                log::warn!(
+                                    "TcpServiceDispatcher: at connection limit \
+                                     ({max_connections}); dropping {peer_addr}"
+                                );
+                                drop(stream);
+                                continue;
+                            }
+                            active_connections.fetch_add(1, Ordering::AcqRel);
+                            let services_clone = Arc::clone(&services);
+                            let active_clone = Arc::clone(&active_connections);
+                            thread::spawn(move || {
+                                // Decrement the in-flight counter no matter how
+                                // `handle_incoming` returns (RAII guard).
+                                let _guard = ConnectionGuard(&active_clone);
+                                handle_incoming(
+                                    stream,
+                                    services_clone,
+                                    handshake_timeout,
+                                );
+                            });
                         }
-                        active_connections.fetch_add(1, Ordering::AcqRel);
-                        let services_clone = Arc::clone(&services);
-                        let active_clone = Arc::clone(&active_connections);
-                        thread::spawn(move || {
-                            // Decrement the in-flight counter no matter how
-                            // `handle_incoming` returns (RAII guard).
-                            let _guard = ConnectionGuard(&active_clone);
-                            handle_incoming(
-                                stream,
-                                services_clone,
-                                handshake_timeout,
-                            );
-                        });
-                    }
-                    Err(_) => {
-                        // Accept error — stop the loop.
-                        break;
+                        Err(_) => {
+                            // Accept error — stop the loop.
+                            break;
+                        }
                     }
                 }
-            }
-            running.store(false, Ordering::SeqCst);
-        });
+                running.store(false, Ordering::SeqCst);
+            })
+            .map_err(|e| RepError::NetworkError(e.to_string()))?;
+        *self.accept_handle.lock() = Some(handle);
 
         Ok(bound_addr)
+    }
+}
+
+impl Drop for TcpServiceDispatcher {
+    /// Backstop for BUG-REP-DISPATCHER-LEAK: joining the accept thread on drop
+    /// guarantees the listener socket / bound port are released even when the
+    /// owner forgot to call `close()` (e.g. a plain `drop(env)`).
+    fn drop(&mut self) {
+        self.stop_and_join();
     }
 }
 
@@ -351,6 +432,83 @@ struct ConnectionGuard<'a>(&'a AtomicUsize);
 impl Drop for ConnectionGuard<'_> {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Wake a blocked `TcpListener::accept()` by making a throwaway connection to
+/// the dispatcher's own bound address (BUG-REP-DISPATCHER-LEAK).
+///
+/// The accept thread sets `running = false` before this is called, so when it
+/// returns from the woken `accept()` it immediately re-checks the flag and
+/// exits without routing the dummy connection. Best-effort: a failed connect
+/// (e.g. the listener already closed) is harmless — the bounded join is the
+/// backstop. The connection is closed immediately via drop. Portable, safe
+/// std; mirrors JE's `selector.wakeup()` role in `ServiceDispatcher.shutdown`.
+fn wake_accept_via_self_connect(addr: SocketAddr) {
+    use std::net::TcpStream;
+    // Normalize a wildcard/unspecified bind address to loopback so the
+    // self-connect reaches our own listener.
+    let target = if addr.ip().is_unspecified() {
+        match addr {
+            SocketAddr::V4(_) => {
+                SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, addr.port()))
+            }
+            SocketAddr::V6(_) => {
+                SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, addr.port()))
+            }
+        }
+    } else {
+        addr
+    };
+    if let Ok(stream) =
+        TcpStream::connect_timeout(&target, Duration::from_millis(500))
+    {
+        drop(stream);
+    }
+}
+
+/// Join `handle` but give up after `timeout` (BUG-REP-DISPATCHER-LEAK).
+///
+/// The accept thread blocks in `TcpListener::accept()`; `stop_and_join` wakes
+/// it with a self-connect so it observes `running == false` and exits
+/// promptly. `timeout` is a generous backstop so a close/drop can never block
+/// indefinitely if that wakeup does not land (e.g. a firewalled loopback or a
+/// non-local / NATed bind address the host cannot self-connect to). On timeout
+/// the handle is dropped, which detaches the join; note the accept thread then
+/// stays parked in its blocking `accept()` (there is no poll loop to catch the
+/// flag), so a failed wakeup leaves the thread, its listener fd, and the bound
+/// port leaked until the process exits. A warning is logged — we never block
+/// the caller forever.
+fn join_with_timeout(
+    handle: thread::JoinHandle<()>,
+    timeout: Duration,
+    name: &str,
+) {
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    // A tiny reaper thread performs the (potentially blocking) join and signals
+    // completion; the caller waits only up to `timeout` on the channel.
+    let reaper =
+        thread::Builder::new().name(format!("{name}-join")).spawn(move || {
+            let _ = handle.join();
+            let _ = tx.send(());
+        });
+    match reaper {
+        Ok(_) => match rx.recv_timeout(timeout) {
+            Ok(()) => {}
+            Err(_) => {
+                log::warn!(
+                    "service dispatcher accept thread '{name}' did not exit \
+                     within {timeout:?}; the self-connect wakeup did not land \
+                     (firewalled loopback or non-local bind address?). \
+                     Detaching: the thread stays blocked in accept() and its \
+                     listener fd / bound port leak until process exit"
+                );
+            }
+        },
+        Err(e) => {
+            // Could not spawn the reaper; fall back to a direct blocking join.
+            log::debug!("join reaper spawn failed for '{name}': {e}");
+        }
     }
 }
 
@@ -531,6 +689,8 @@ pub struct TlsTcpServiceDispatcher {
     listener: Arc<super::channel::TlsTcpChannelListener>,
     /// Whether the accept loop is running.
     running: Arc<AtomicBool>,
+    /// Join handle for the spawned accept thread (BUG-REP-DISPATCHER-LEAK).
+    accept_handle: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 #[cfg(feature = "tls-rustls")]
@@ -560,6 +720,7 @@ impl TlsTcpServiceDispatcher {
             bound_addr,
             listener: Arc::new(listener),
             running: Arc::new(AtomicBool::new(false)),
+            accept_handle: Mutex::new(None),
         })
     }
 
@@ -582,9 +743,26 @@ impl TlsTcpServiceDispatcher {
         self.running.load(Ordering::SeqCst)
     }
 
-    /// Stop the accept loop.
+    /// Stop the accept loop (signal only). See
+    /// [`TcpServiceDispatcher::stop`].
     pub fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
+    }
+
+    /// Signal shutdown, wake the blocked accept, and join the accept thread
+    /// with a bounded timeout (BUG-REP-DISPATCHER-LEAK). See
+    /// [`TcpServiceDispatcher::stop_and_join`].
+    pub fn stop_and_join(&self) {
+        self.running.store(false, Ordering::SeqCst);
+        let handle = self.accept_handle.lock().take();
+        if let Some(handle) = handle {
+            // Wake the blocked accept() with a throwaway self-connect; the
+            // loop then observes `running == false` and exits. (The dummy
+            // connection presents no TLS, so any handshake attempt fails
+            // harmlessly — but the loop breaks before routing it.)
+            wake_accept_via_self_connect(self.bound_addr);
+            join_with_timeout(handle, ACCEPT_JOIN_TIMEOUT, "noxu-tls-accept");
+        }
     }
 
     /// Start the TLS accept loop in a background thread.
@@ -599,35 +777,54 @@ impl TlsTcpServiceDispatcher {
         running.store(true, Ordering::SeqCst);
         let bound = self.bound_addr;
 
-        thread::spawn(move || {
-            while running.load(Ordering::SeqCst) {
-                match listener.accept() {
-                    Ok(channel) => {
-                        let svcs = Arc::clone(&services);
-                        thread::spawn(move || {
-                            handle_tls_incoming(channel, svcs);
-                        });
-                    }
-                    Err(e) => {
-                        // An error while running is likely a transient
-                        // handshake failure (rejected peer) — log and
-                        // continue.  Stop only on accept-loop termination
-                        // (i.e. when `running` is cleared).
-                        if running.load(Ordering::SeqCst) {
-                            log::debug!(
-                                "TlsTcpServiceDispatcher: accept error \
-                                 (continuing): {e}"
-                            );
-                        } else {
-                            break;
+        let handle = thread::Builder::new()
+            .name("noxu-tls-accept".to_string())
+            .spawn(move || {
+                while running.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok(channel) => {
+                            // Re-check the shutdown flag: a wakeup self-connect
+                            // from `stop_and_join` lands here and must not be
+                            // routed (BUG-REP-DISPATCHER-LEAK).
+                            if !running.load(Ordering::SeqCst) {
+                                drop(channel);
+                                break;
+                            }
+                            let svcs = Arc::clone(&services);
+                            thread::spawn(move || {
+                                handle_tls_incoming(channel, svcs);
+                            });
+                        }
+                        Err(e) => {
+                            // An error while running is likely a transient
+                            // handshake failure (rejected peer, or the
+                            // shutdown self-connect presenting no TLS) — log
+                            // and continue. Stop only when `running` is
+                            // cleared.
+                            if running.load(Ordering::SeqCst) {
+                                log::debug!(
+                                    "TlsTcpServiceDispatcher: accept error \
+                                     (continuing): {e}"
+                                );
+                            } else {
+                                break;
+                            }
                         }
                     }
                 }
-            }
-            running.store(false, Ordering::SeqCst);
-        });
+                running.store(false, Ordering::SeqCst);
+            })
+            .map_err(|e| RepError::NetworkError(e.to_string()))?;
+        *self.accept_handle.lock() = Some(handle);
 
         Ok(bound)
+    }
+}
+
+#[cfg(feature = "tls-rustls")]
+impl Drop for TlsTcpServiceDispatcher {
+    fn drop(&mut self) {
+        self.stop_and_join();
     }
 }
 
@@ -729,12 +926,28 @@ impl AnyServiceDispatcher {
         }
     }
 
-    /// Stop the accept loop.
+    /// Stop the accept loop (signal only).
+    ///
+    // Retained for API symmetry with the inner dispatchers; `close()` uses
+    // `stop_and_join` (which also waits for the thread to exit).
+    #[allow(dead_code)]
     pub fn stop(&self) {
         match self {
             Self::Plain(d) => d.stop(),
             #[cfg(feature = "tls-rustls")]
             Self::Tls(d) => d.stop(),
+        }
+    }
+
+    /// Signal shutdown and join the accept thread with a bounded timeout
+    /// (BUG-REP-DISPATCHER-LEAK). Called from `ReplicatedEnvironment::close`
+    /// so the listener socket / bound port are released before close returns;
+    /// the inner dispatcher's `Drop` is the backstop for a plain `drop(env)`.
+    pub fn stop_and_join(&self) {
+        match self {
+            Self::Plain(d) => d.stop_and_join(),
+            #[cfg(feature = "tls-rustls")]
+            Self::Tls(d) => d.stop_and_join(),
         }
     }
 
@@ -987,6 +1200,19 @@ mod tests {
     /// released after the handshake read timeout, not pinned forever. We
     /// observe this through the dispatcher's in-flight connection counter,
     /// which the `ConnectionGuard` decrements when the handler returns.
+    ///
+    /// F-C hardening: the earlier version slept a FIXED 50 ms and then
+    /// asserted `active_connections() == 1`. Under the full parallel suite on
+    /// a loaded 96-core host the handler thread had not always been scheduled
+    /// by the 50 ms mark, so the count was still 0 and the test flaked
+    /// (observed 2/50 on aarch64). The fix is NOT to retry — it is to replace
+    /// both fixed observation windows with bounded poll-until loops and to
+    /// keep (indeed strengthen) the invariant: the silent connection must go
+    /// in-flight, and it must be dropped *after* the handshake timeout, not
+    /// before. We prove "not before" by measuring the connect→drop interval
+    /// and asserting it is at least the handshake timeout (minus a small
+    /// slack for the gap between accept and the handler installing its read
+    /// timeout) — a stronger claim than the old single 50 ms sample.
     #[test]
     fn slow_loris_client_is_dropped_after_handshake_timeout() {
         use std::net::TcpStream;
@@ -994,37 +1220,67 @@ mod tests {
         let mut sd =
             TcpServiceDispatcher::new("127.0.0.1:0".parse().unwrap()).unwrap();
         sd.register("echo", Arc::new(EchoHandler { name: "echo".into() }));
-        // Short handshake timeout so the test is fast; production is 10s.
-        sd.set_handshake_timeout(Duration::from_millis(150));
+        // Handshake timeout long enough to be unambiguously distinguishable
+        // from scheduling jitter under a loaded parallel suite, yet short
+        // enough to keep the test fast; production is 10 s.
+        let handshake = Duration::from_millis(600);
+        sd.set_handshake_timeout(handshake);
         let bound_addr = sd.start().unwrap();
-        std::thread::sleep(Duration::from_millis(20));
 
-        // Connect and send nothing. Hold the socket open.
+        // Connect and send nothing. Hold the socket open. Timestamp the
+        // connect so we can prove the drop happens AFTER the timeout.
+        let connected_at = std::time::Instant::now();
         let _silent = TcpStream::connect(bound_addr).unwrap();
 
-        // The handler thread should have started and be blocked in the
-        // handshake read.
-        std::thread::sleep(Duration::from_millis(50));
-        assert_eq!(
-            sd.active_connections(),
-            1,
-            "the silent connection should be in-flight before the timeout"
-        );
+        // Bounded poll-until the silent connection is in-flight (handler
+        // spawned, blocked in the handshake read). Replaces the fixed 50 ms
+        // sleep; strictly stronger than the old assert because it *waits* for
+        // the handler instead of sampling once and hoping it has started.
+        let inflight_deadline =
+            std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if sd.active_connections() == 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < inflight_deadline,
+                "the silent connection never became in-flight within the \
+                 bound — the handshake handler was not spawned (count={})",
+                sd.active_connections()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
 
         // After the handshake timeout elapses, the read fails and the handler
-        // returns, dropping the ConnectionGuard back to zero.
-        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        // returns, dropping the ConnectionGuard back to zero. Bounded
+        // poll-until it drops; the bound comfortably exceeds the timeout.
+        let drop_deadline =
+            std::time::Instant::now() + handshake + Duration::from_secs(3);
         loop {
             if sd.active_connections() == 0 {
                 break;
             }
             assert!(
-                std::time::Instant::now() < deadline,
+                std::time::Instant::now() < drop_deadline,
                 "slow-loris connection was not released after the handshake \
                  timeout — the F14 read timeout is not effective"
             );
-            std::thread::sleep(Duration::from_millis(25));
+            std::thread::sleep(Duration::from_millis(5));
         }
+        let dropped_after = connected_at.elapsed();
+
+        // The invariant the old test only approximated: the connection is
+        // dropped AFTER the handshake timeout, not before. Slack covers the
+        // small gap between accept() returning and the handler installing its
+        // read timeout; it is far below `handshake`, so this still proves the
+        // read timeout (not a premature close) is what released the client.
+        let slack = Duration::from_millis(150);
+        assert!(
+            dropped_after + slack >= handshake,
+            "slow-loris connection was dropped TOO EARLY ({dropped_after:?} \
+             after connect, handshake timeout {handshake:?}) — it must be \
+             released by the handshake read timeout, not before"
+        );
 
         // A legitimate client can still be served afterwards.
         let client = connect_to_service(bound_addr, "echo").unwrap();
@@ -1039,6 +1295,14 @@ mod tests {
     /// F15 regression: with `max_connections == 1`, a second concurrent
     /// connection is dropped by the accept loop (no handler thread spawned)
     /// while the first is still in-flight.
+    ///
+    /// F-C hardening: as with F14, the two fixed observation windows (80 ms
+    /// then 120 ms) are a scheduling race under a loaded parallel suite.
+    /// Replace the first with a bounded poll-until the slot is filled, and
+    /// the second with a bounded *window* over which the count must stay
+    /// EXACTLY 1 — never 0 (the capped slot must stay occupied) and never >= 2
+    /// (the excess connection must not spawn a handler). Sampling across a
+    /// window is strictly stronger than the old single 120 ms sample.
     #[test]
     fn connection_count_limit_drops_excess_connections() {
         use std::net::TcpStream;
@@ -1053,26 +1317,41 @@ mod tests {
         // in-flight while we test the cap.
         sd.set_handshake_timeout(Duration::from_secs(30));
         let bound_addr = sd.start().unwrap();
-        std::thread::sleep(Duration::from_millis(20));
 
-        // First silent connection: occupies the single slot.
+        // First silent connection: occupies the single slot. Bounded
+        // poll-until it is in-flight (replaces the fixed 80 ms sleep).
         let _c1 = TcpStream::connect(bound_addr).unwrap();
-        std::thread::sleep(Duration::from_millis(80));
-        assert_eq!(
-            sd.active_connections(),
-            1,
-            "first connection fills the cap"
-        );
+        let fill_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if sd.active_connections() == 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < fill_deadline,
+                "first connection never filled the cap within the bound \
+                 (count={})",
+                sd.active_connections()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
 
         // Second connection: accepted at TCP level but dropped by the loop
-        // (no handler thread), so the in-flight count stays at 1.
+        // (no handler thread). Observe over a bounded window that the
+        // in-flight count stays EXACTLY 1 — c1 must remain in-flight and c2
+        // must never spawn a handler (count must never reach 2).
         let _c2 = TcpStream::connect(bound_addr).unwrap();
-        std::thread::sleep(Duration::from_millis(120));
-        assert_eq!(
-            sd.active_connections(),
-            1,
-            "a connection beyond the limit must not spawn a handler thread"
-        );
+        let observe_until =
+            std::time::Instant::now() + Duration::from_millis(500);
+        while std::time::Instant::now() < observe_until {
+            let n = sd.active_connections();
+            assert_eq!(
+                n, 1,
+                "with max_connections=1, exactly one handler may be in-flight: \
+                 c1 must stay (count must not drop to 0) and c2 must not spawn \
+                 a handler (count must not reach 2); observed {n}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
 
         drop(_c1);
         drop(_c2);
