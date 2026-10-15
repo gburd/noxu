@@ -110,6 +110,19 @@ impl ProcessPendingCtx {
                         .fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
+                // BUG-CLEANER-LIVE-LN-RECLAIM follow-up: an interior IN on
+                // the descent was unreadable (undecidable).  lookup_parent_bin
+                // already invalidated the env (A6 F-3).  Do NOT remove the
+                // pending LN (that would let its file be reclaimed) and do NOT
+                // mark it Dead: keep it pending and continue; the loop's top
+                // `env_invalid` check breaks out next iteration, retaining the
+                // file.  JE IN.fetchTarget throws LOG_FILE_NOT_FOUND here.
+                BinLookupResult::FetchFailed => {
+                    self.stats
+                        .pending_lns_locked
+                        .fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
                 BinLookupResult::Found { tree_lsn } => processor
                     .process_found_ln(
                         &ln_info,

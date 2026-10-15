@@ -204,7 +204,7 @@ pub const PROCESS_PENDING_EVERY_N_LNS_PUB: usize = PROCESS_PENDING_EVERY_N_LNS;
 ///
 /// Ported from `TreeLocation` / the result returned by
 /// `Tree.getParentBINForChildLN()`.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BinLookupResult {
     /// No parent BIN found for the key — the LN has been deleted from the
     /// tree entirely.
@@ -220,6 +220,17 @@ pub enum BinLookupResult {
         /// LSN of the slot in the BIN (may equal, precede, or follow `log_lsn`).
         tree_lsn: Lsn,
     },
+
+    /// The slot-currency descent could not read an interior IN's log image
+    /// (`search_with_data_checked` returned `Err`): the file holding that IN
+    /// was unreadable/reclaimed under a potentially-live LN below it.  This is
+    /// UNDECIDABLE, NOT "the LN is absent": returning `NotFound`/`Dead` here
+    /// would let the cleaner reclaim MORE files below a live node (a cascading
+    /// loss).  The caller must RETAIN the file (never delete) and fail closed
+    /// via the A6 F-3 env-invalidation path, mirroring JE `IN.fetchTarget`
+    /// throwing LOG_FILE_NOT_FOUND (IN.java:2825-2834).  No new NoxuError
+    /// variant is introduced; the existing env-invalidation flag carries it.
+    FetchFailed,
 }
 
 /// Outcome of a migration attempt for a single LN slot.
@@ -858,11 +869,27 @@ impl TreeLookup for SharedTreeLookup {
         // raw key compare).  A false `None` here makes a live LN look
         // NotFound -> Dead -> its file reclaimed while a live slot references
         // it (JE `Tree.getParentBINForChildLN` fetches on the descent).
-        match tree.search_with_data(key) {
-            Some(sf) if sf.found => {
+        // BUG-CLEANER-LIVE-LN-RECLAIM follow-up: use the FETCH-FAILURE-AWARE
+        // descent.  An interior IN whose own log file is unreadable must NOT be
+        // conflated with "key absent" (which `search_with_data`'s `.ok()?`/`?`
+        // swallow does) -- that would mark a live LN Dead and reclaim its file,
+        // a cascading loss.  `Err` => fetch failure: invalidate the env (A6
+        // F-3) and report FetchFailed so the caller retains the file (JE
+        // `IN.fetchTarget` throws LOG_FILE_NOT_FOUND, IN.java:2825-2834).
+        match tree.search_with_data_checked(key) {
+            Ok(Some(sf)) if sf.found => {
                 BinLookupResult::Found { tree_lsn: Lsn::from_u64(sf.lsn) }
             }
-            _ => BinLookupResult::NotFound,
+            Ok(_) => BinLookupResult::NotFound,
+            Err(e) => {
+                log::error!(
+                    "cleaner: IN fetch failed during slot-currency lookup for                      a live LN (db {db_id}): {e}; retaining file + invalidating                      env (A6 F-3)"
+                );
+                if let Some(f) = &self.env_invalid {
+                    f.store(true, Ordering::Release);
+                }
+                BinLookupResult::FetchFailed
+            }
         }
     }
 
@@ -925,9 +952,30 @@ impl TreeLookup for SharedTreeLookup {
                     return MigrationOutcome::Obsolete;
                 }
             };
-            tree.search_with_data(key)
-                .filter(|sf| sf.found)
-                .map(|sf| Lsn::from_u64(sf.lsn))
+            match tree.search_with_data_checked(key) {
+                Ok(opt) => {
+                    opt.filter(|sf| sf.found).map(|sf| Lsn::from_u64(sf.lsn))
+                }
+                // Fetch failure during the re-fault: undecidable.  Invalidate
+                // the env (A6 F-3) and keep the LN pending (Locked) so its file
+                // is retained -- NEVER migrate-or-dead on an unreadable interior
+                // IN (JE IN.fetchTarget LOG_FILE_NOT_FOUND).
+                Err(e) => {
+                    log::error!(
+                        "cleaner: IN fetch failed during migrate_ln_slot recheck                          (db {db_id}): {e}; retaining file + invalidating env (A6 F-3)"
+                    );
+                    if let Some(f) = &self.env_invalid {
+                        f.store(true, Ordering::Release);
+                    }
+                    release_cleaner_lock(
+                        &self.lock_manager,
+                        lock_lsn,
+                        locker_id,
+                        "SharedTreeLookup::migrate_ln_slot:in_fetch_failed",
+                    );
+                    return MigrationOutcome::Locked;
+                }
+            }
         };
         let slot_matches = match current_lsn {
             Some(lsn) => lsn == tree_lsn,
@@ -1768,6 +1816,20 @@ impl FileProcessor {
             BinLookupResult::NotFound => {
                 result.lns_dead += 1;
                 self.stats.lns_dead.fetch_add(1, Ordering::Relaxed);
+            }
+
+            // BUG-CLEANER-LIVE-LN-RECLAIM follow-up: an interior IN on the
+            // descent to this LN was unreadable (its file was reclaimed /
+            // corrupt).  This is UNDECIDABLE -- the LN may well be LIVE below
+            // the missing IN.  NEVER mark it Dead (that would reclaim its file
+            // too, a cascading loss).  Treat exactly like Locked: count it
+            // pending and RETAIN the file so a later pass (or an operator after
+            // the env was invalidated by lookup_parent_bin, A6 F-3) can resolve
+            // it.  JE `IN.fetchTarget` throws LOG_FILE_NOT_FOUND here.
+            BinLookupResult::FetchFailed => {
+                result.lns_locked += 1;
+                self.stats.lns_locked.fetch_add(1, Ordering::Relaxed);
+                result.locked_lns.push((log_lsn, info));
             }
 
             // Step 3b — slot is known-deleted → LN is obsolete.
@@ -3597,6 +3659,102 @@ mod tests {
             slot_lsn,
             Some(log_lsn),
             "R-7: tree slot must retain original log_lsn after aborted migration"
+        );
+    }
+
+    /// BUG-CLEANER-LIVE-LN-RECLAIM follow-up (coordinator input #2): an IN
+    /// FETCH FAILURE in the cleaner's slot-currency descent must be treated as
+    /// UNDECIDABLE (Unknown / retain + A6 F-3 env invalidation), NEVER as "key
+    /// absent -> Obsolete -> Dead".
+    ///
+    /// `fetch_node_from_log` swallows the typed log read error with `.ok()?`,
+    /// so a descent that crosses an interior IN whose own log file is
+    /// unreadable used to return `None` -> `NotFound` -> `Dead` and the cleaner
+    /// would then reclaim the LN's file too (a cascading loss). The checked
+    /// descent `search_with_data_checked` surfaces the fetch failure as `Err`,
+    /// which `lookup_parent_bin` maps to `BinLookupResult::FetchFailed` + sets
+    /// the env-invalid flag (JE `IN.fetchTarget` throws LOG_FILE_NOT_FOUND,
+    /// IN.java:2825-2834).
+    ///
+    /// Setup: a multi-level tree, then an interior slot is made NON-RESIDENT
+    /// (`set_child(idx, None)`) with its slot LSN pointed at an UNREADABLE file
+    /// (a file number that was never written), so the descent to a key below it
+    /// must fetch and fail. The lookup must report `FetchFailed` (not
+    /// NotFound), and the env-invalid flag must be set.
+    ///
+    /// RED before the fix (old `search_with_data` `.ok()?`/`?`): returns
+    /// `NotFound` and never sets env-invalid -> the LN would be marked Dead and
+    /// its file reclaimed. GREEN after: `FetchFailed` + env invalidated.
+    #[test]
+    fn in_fetch_failure_in_cleaner_descent_is_unknown_not_dead() {
+        use noxu_log::{FileManager, LogManager};
+        use noxu_tree::tree::TreeNode;
+        use noxu_util::lsn::Lsn;
+        use std::sync::RwLock;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tempfile::TempDir;
+
+        // Multi-level tree: small fanout + many keys -> a root IN over BINs.
+        let tree = noxu_tree::Tree::new(1, 4);
+        for i in 0u16..200 {
+            let key = format!("key{i:05}");
+            tree.insert(
+                key.into_bytes(),
+                b"v".to_vec(),
+                Lsn::new(1, i as u32 + 1),
+            )
+            .unwrap();
+        }
+
+        // Pick an interior child slot of the root IN and the key that routes
+        // through it, then make that child NON-RESIDENT with an UNREADABLE slot
+        // LSN (file 999 was never written). A descent to a key under that slot
+        // must try to fetch the child and FAIL.
+        let probe_key: Vec<u8>;
+        {
+            let root = tree.get_root().expect("root");
+            let mut rg = root.write();
+            let TreeNode::Internal(n) = &mut *rg else {
+                panic!("root must be an upper IN (multi-level tree)");
+            };
+            assert!(n.entries.len() >= 2, "need >=2 interior slots");
+            // Use the LAST interior slot so its key range is well-defined and a
+            // key routed there exists; capture a key in that subtree before we
+            // evict it.
+            let idx = n.entries.len() - 1;
+            // The highest key we inserted ("key00199") routes to the rightmost
+            // subtree. Use it as the probe key.
+            probe_key = b"key00199".to_vec();
+            // Evict the child (non-resident) and point its slot at an
+            // unreadable file so re-fault fails.
+            n.set_child(idx, None);
+            n.set_lsn(idx, Lsn::new(999, 4096));
+        }
+        let tree_arc = Arc::new(RwLock::new(tree));
+
+        // Fresh (empty) LogManager: reads of file 999 fail (never written).
+        let dir = TempDir::new().unwrap();
+        let fm = Arc::new(
+            FileManager::new(dir.path(), false, 10_000_000, 100).unwrap(),
+        );
+        let lm = Arc::new(LogManager::new(fm, 3, 1024 * 1024, 4096));
+
+        let env_invalid = Arc::new(AtomicBool::new(false));
+        let lookup = SharedTreeLookup::new(Arc::clone(&tree_arc), lm)
+            .with_env_invalid(Arc::clone(&env_invalid));
+
+        let result = lookup.lookup_parent_bin(1, &probe_key, Lsn::new(1, 199));
+
+        assert_eq!(
+            result,
+            BinLookupResult::FetchFailed,
+            "an IN fetch failure in the cleaner descent must be FetchFailed \
+             (undecidable), NEVER NotFound/Dead (cascading reclaim). got {result:?}"
+        );
+        assert!(
+            env_invalid.load(Ordering::Acquire),
+            "a live-slot IN fetch failure must invalidate the env (A6 F-3), so \
+             the cleaner stops and the file holding the LN is NOT deleted"
         );
     }
 }

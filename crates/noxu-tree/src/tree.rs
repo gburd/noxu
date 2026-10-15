@@ -8680,6 +8680,215 @@ impl Tree {
         Some(arc)
     }
 
+    /// Fetch-failure-aware variant of [`Self::fetch_node_from_log`].
+    ///
+    /// `fetch_node_from_log` returns `Option<TreeNode>` and SWALLOWS a log read
+    /// / parse error with `.ok()?`, so its `None` conflates two very different
+    /// outcomes:
+    ///   * `log_lsn == NULL_LSN` — the slot genuinely has no logged image
+    ///     (never-flushed deferred-write / out-of-range) — a decidable ABSENT;
+    ///   * a non-NULL `log_lsn` whose log file could not be read or parsed — an
+    ///     UNDECIDABLE fetch failure (e.g. the file was reclaimed under a live
+    ///     node — the BUG-CLEANER-LIVE-LN-RECLAIM cascading-loss hazard).
+    ///
+    /// JE `IN.fetchTarget` THROWS `LOG_FILE_NOT_FOUND` (env-invalidating,
+    /// fail-closed) for the second case rather than treating the child as
+    /// absent (IN.java:2825-2834). This wrapper restores that distinction for
+    /// callers (the cleaner's slot-currency descent) that must NEVER turn a
+    /// fetch failure into a "node absent -> obsolete -> dead" reclaim decision:
+    ///   * `Ok(None)` — `log_lsn == NULL_LSN` (decidably absent);
+    ///   * `Ok(Some(node))` — fetched;
+    ///   * `Err(TreeError::LogError)` — non-NULL LSN that could not be
+    ///     materialised (undecidable fetch failure; the caller must retain the
+    ///     file and, for a live slot, fail closed).
+    fn fetch_node_from_log_checked(
+        &self,
+        log_lsn: Lsn,
+    ) -> crate::error::TreeResult<Option<TreeNode>> {
+        if log_lsn == NULL_LSN {
+            return Ok(None);
+        }
+        match self.fetch_node_from_log(log_lsn) {
+            Some(node) => Ok(Some(node)),
+            None => Err(crate::error::TreeError::LogError(format!(
+                "IN/BIN fetch at {log_lsn:?} failed (file unreadable or entry \
+                 unparsable): undecidable, must not be treated as absent \
+                 (JE IN.fetchTarget throws LOG_FILE_NOT_FOUND)"
+            ))),
+        }
+    }
+
+    /// Fetch-failure-aware variant of [`Self::child_at_or_fetch`].
+    ///
+    /// Returns `Ok(None)` when the slot is a BIN (no IN children) or the slot
+    /// LSN is `NULL_LSN` (decidably absent); `Ok(Some(child))` when the child
+    /// is resident or was fetched; `Err(TreeError::LogError)` when the child's
+    /// slot LSN is non-NULL but its log image could not be materialised (an
+    /// undecidable fetch failure — JE `IN.fetchTarget` LOG_FILE_NOT_FOUND).
+    /// Unlike `child_at_or_fetch` it never collapses a fetch failure to `None`.
+    fn child_at_or_fetch_checked(
+        &self,
+        parent_arc: &Arc<RwLock<TreeNode>>,
+        idx: usize,
+    ) -> crate::error::TreeResult<Option<ChildArc>> {
+        // Fast path: child already cached (read lock only).
+        {
+            let g = parent_arc.read();
+            if let TreeNode::Internal(n) = &*g {
+                if let Some(c) = n.get_child(idx) {
+                    return Ok(Some(c));
+                }
+            } else {
+                return Ok(None); // BINs have no IN children
+            }
+        }
+        // Slow path: fetch under the parent EX-latch.
+        let mut g = parent_arc.write();
+        let TreeNode::Internal(n) = &mut *g else {
+            return Ok(None);
+        };
+        if let Some(c) = n.get_child(idx) {
+            return Ok(Some(c));
+        }
+        if idx >= n.entries.len() {
+            return Ok(None);
+        }
+        let child_lsn = n.get_lsn(idx);
+        // The one difference from child_at_or_fetch: a non-NULL slot LSN whose
+        // image cannot be read is an Err (undecidable), never Ok(None).
+        let node = match self.fetch_node_from_log_checked(child_lsn)? {
+            Some(node) => node,
+            None => return Ok(None), // NULL_LSN slot: decidably absent
+        };
+        let node_id = node.node_id();
+        let (is_bin, is_delta) = match &node {
+            TreeNode::Bottom(b) => (true, b.is_delta),
+            TreeNode::Internal(_) => (false, false),
+        };
+        self.note_fetch_miss(is_bin, is_delta);
+        if let Some(counter) = &self.memory_counter {
+            let sz = node.budgeted_memory_size();
+            counter.fetch_add(sz as i64, Ordering::Relaxed);
+        }
+        let arc: ChildArc = Arc::new(RwLock::new(node));
+        {
+            let mut cg = arc.write();
+            cg.set_parent(Some(Arc::downgrade(parent_arc)));
+        }
+        n.set_child(idx, Some(arc.clone()));
+        self.note_added(node_id);
+        Ok(Some(arc))
+    }
+
+    /// Fetch-failure-aware variant of [`Self::search_with_data`] for the
+    /// cleaner's slot-currency descent (BUG-CLEANER-LIVE-LN-RECLAIM follow-up).
+    ///
+    /// Identical hand-over-hand descent, but a non-NULL interior-IN slot whose
+    /// log file is unreadable surfaces as `Err(TreeError::LogError)` instead of
+    /// being swallowed to `None` -> "key absent" -> `Obsolete`/`Dead` (which
+    /// would let the cleaner reclaim MORE files below a live node — a cascading
+    /// loss). `Ok(None)` means the key is genuinely absent (empty root / a
+    /// decidably-absent child slot); `Ok(Some(sf))` carries the found/not-found
+    /// slot result exactly as `search_with_data` does.
+    ///
+    /// JE `Tree.getParentBINForChildLN` -> `IN.fetchTarget` throws
+    /// LOG_FILE_NOT_FOUND on an unreadable interior IN; the cleaner's caller
+    /// maps this `Err` to the Unknown/retain fail-safe + the A6 F-3 env
+    /// invalidation for a live slot.
+    pub fn search_with_data_checked(
+        &self,
+        key: &[u8],
+    ) -> crate::error::TreeResult<Option<SlotFetch>> {
+        let Some(root) = self.get_root() else {
+            return Ok(None);
+        };
+        let mut guard: NodeArcReadGuard = root.read_arc();
+
+        loop {
+            if guard.is_bin() {
+                let bin_arc = NodeArcReadGuard::rwlock(&guard).clone();
+                if let TreeNode::Bottom(bin) = &*guard {
+                    self.note_accessed(bin.node_id);
+                    self.note_bin_access(bin.is_delta);
+                }
+                let mut expired_slot: Option<(u64, usize, u32, bool)> = None;
+                let mut kd_lsn = None;
+                let (found, data, lsn, slot_index) = match &*guard {
+                    TreeNode::Bottom(bin) => {
+                        let (idx, exact) = match &self.key_comparator {
+                            Some(cmp) => bin.find_entry_cmp(key, cmp.as_ref()),
+                            None => bin.find_entry_compressed(key),
+                        };
+                        if exact && bin.entries[idx].known_deleted {
+                            kd_lsn = Some(bin.get_lsn(idx).as_u64());
+                        }
+                        if exact {
+                            if bin.slot_is_live(idx) {
+                                let lsn = bin.get_lsn(idx);
+                                let e = &bin.entries[idx];
+                                (true, e.data.clone(), lsn.as_u64(), idx)
+                            } else {
+                                if bin.slot_expired_not_deleted(idx) {
+                                    expired_slot = Some((
+                                        bin.get_lsn(idx).as_u64(),
+                                        idx,
+                                        bin.entries[idx].expiration_time,
+                                        bin.expiration_in_hours,
+                                    ));
+                                }
+                                (false, None, 0u64, 0)
+                            }
+                        } else {
+                            (false, None, 0u64, 0)
+                        }
+                    }
+                    TreeNode::Internal(_) => unreachable!(),
+                };
+                // Release the BIN read guard before returning (match the
+                // non-checked search_with_data: callers may lock without a
+                // latch held).
+                drop(guard);
+                return Ok(Some(SlotFetch {
+                    found,
+                    data,
+                    lsn,
+                    slot_index,
+                    bin_arc,
+                    expired_slot,
+                    kd_lsn,
+                }));
+            }
+
+            // Upper IN: hand-over-hand descent, fetch-failure-aware.
+            let (parent_arc, next_idx) = match &*guard {
+                TreeNode::Internal(n) => {
+                    if n.entries.is_empty() {
+                        return Ok(None);
+                    }
+                    let idx = self.upper_in_floor_index(&n.entries, key);
+                    match n.get_child(idx) {
+                        Some(c) => {
+                            let next_guard = c.read_arc();
+                            drop(guard);
+                            guard = next_guard;
+                            continue;
+                        }
+                        None => (NodeArcReadGuard::rwlock(&guard).clone(), idx),
+                    }
+                }
+                TreeNode::Bottom(_) => unreachable!(),
+            };
+            drop(guard);
+            // The checked fetch: an unreadable interior IN is an Err, not None.
+            let child =
+                match self.child_at_or_fetch_checked(&parent_arc, next_idx)? {
+                    Some(c) => c,
+                    None => return Ok(None), // decidably-absent child slot
+                };
+            guard = child.read_arc();
+        }
+    }
+
     /// Check whether a BIN node is a candidate for slot compression and,
     /// if so, trigger `compress_bin`.
     ///
