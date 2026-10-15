@@ -1427,16 +1427,20 @@ fn daemons_on_scenario(
 }
 
 #[test]
-#[ignore = "PORTED-FAILING BUG-PHANTOM-REVERSE-GAP: serializable range lock \
-            non-deterministic with daemons running; see \
-            a15-phantom-rangelock-flake.md"]
 fn je_phantom_daemons_on_residual() {
-    // Run the measured-flaky serializable cases (prev / next / search / first,
-    // dup and non-dup) with the daemons ON, repeated enough times to reliably
-    // surface the ~5-25%-per-case non-determinism.  Assertions are IDENTICAL
-    // to the gated path; only the env config (daemons running) differs, which
-    // is the whole point of the witness.  When BUG-PHANTOM-REVERSE-GAP is
-    // fixed this must pass every iteration and be un-ignored.
+    // Run the serializable range-lock cases (reverse / forward / first, dup and
+    // non-dup) with the daemons ON, repeated 25x per case.  BUG-PHANTOM-REVERSE-GAP
+    // (the daemons-on non-determinism, ~5-25% per case) is FIXED by C2 3420692d;
+    // this witness is now green every iteration and un-ignored for v7.11.1.
+    //
+    // Each phantom key is DISJOINT from its seeds (a genuine phantom into the
+    // locked gap), mirroring the gated phantom-into-gap cases
+    // (je_phantom_test_test_get_{prev,next,first}_success): the earlier residual
+    // B/C/D cases seeded {(1,0),(2,0),(3,0)} with no gap and "inserted" an
+    // existing key, which is an overwrite returning Ok and does NOT exercise
+    // phantom-blocking.  Assertions are IDENTICAL to the gated path; only the
+    // env config (daemons running) differs, which is the whole point of the
+    // witness.
     // (dups, seeds, positioning steps, safe-inserts, phantom-insert)
     type PhantomScenario<'a> =
         (bool, &'a [(i32, i32)], &'a [Step], &'a [(i32, i32)], (i32, i32));
@@ -1449,29 +1453,27 @@ fn je_phantom_daemons_on_residual() {
             &[(2, 4), (3, 0), (1, 0), (0, 0)],
             (2, 1),
         ),
+        // reverse / preceding-gap, non-dup: seed a GAP at key 2 so the phantom
+        // is genuinely new (mirrors gated je_phantom_test_test_get_prev_success).
         (
             false,
-            &[(1, 0), (2, 0), (3, 0)],
-            &[Step::Search(2), Step::Prev],
-            &[(0, 0), (3, 0)],
-            (1, 0),
-        ),
-        // forward
-        (
-            false,
-            &[(1, 0), (2, 0), (3, 0)],
-            &[Step::Search(2), Step::Next],
-            &[(0, 0), (1, 0)],
+            &[(1, 0), (3, 0)],
+            &[Step::Search(3), Step::Prev],
+            &[(0, 0), (4, 0)],
             (2, 0),
         ),
-        // first
+        // forward, non-dup: gap at key 2; phantom (2,0) is new in the locked
+        // (1,3) range (mirrors gated je_phantom_test_test_get_next_success).
         (
             false,
-            &[(1, 0), (2, 0), (3, 0)],
-            &[Step::First],
-            &[(2, 0), (3, 0)],
-            (1, 0),
+            &[(1, 0), (3, 0)],
+            &[Step::Search(1), Step::Next],
+            &[(0, 0), (4, 0)],
+            (2, 0),
         ),
+        // first, non-dup: only key 2 seeded; phantom (1,0) is new, before the
+        // first key (mirrors gated je_phantom_test_test_get_first_success).
+        (false, &[(2, 0)], &[Step::First], &[(3, 0)], (1, 0)),
     ];
     let mut failures: Vec<String> = Vec::new();
     for _ in 0..25 {
