@@ -1200,6 +1200,19 @@ mod tests {
     /// released after the handshake read timeout, not pinned forever. We
     /// observe this through the dispatcher's in-flight connection counter,
     /// which the `ConnectionGuard` decrements when the handler returns.
+    ///
+    /// F-C hardening: the earlier version slept a FIXED 50 ms and then
+    /// asserted `active_connections() == 1`. Under the full parallel suite on
+    /// a loaded 96-core host the handler thread had not always been scheduled
+    /// by the 50 ms mark, so the count was still 0 and the test flaked
+    /// (observed 2/50 on aarch64). The fix is NOT to retry — it is to replace
+    /// both fixed observation windows with bounded poll-until loops and to
+    /// keep (indeed strengthen) the invariant: the silent connection must go
+    /// in-flight, and it must be dropped *after* the handshake timeout, not
+    /// before. We prove "not before" by measuring the connect→drop interval
+    /// and asserting it is at least the handshake timeout (minus a small
+    /// slack for the gap between accept and the handler installing its read
+    /// timeout) — a stronger claim than the old single 50 ms sample.
     #[test]
     fn slow_loris_client_is_dropped_after_handshake_timeout() {
         use std::net::TcpStream;
@@ -1207,37 +1220,67 @@ mod tests {
         let mut sd =
             TcpServiceDispatcher::new("127.0.0.1:0".parse().unwrap()).unwrap();
         sd.register("echo", Arc::new(EchoHandler { name: "echo".into() }));
-        // Short handshake timeout so the test is fast; production is 10s.
-        sd.set_handshake_timeout(Duration::from_millis(150));
+        // Handshake timeout long enough to be unambiguously distinguishable
+        // from scheduling jitter under a loaded parallel suite, yet short
+        // enough to keep the test fast; production is 10 s.
+        let handshake = Duration::from_millis(600);
+        sd.set_handshake_timeout(handshake);
         let bound_addr = sd.start().unwrap();
-        std::thread::sleep(Duration::from_millis(20));
 
-        // Connect and send nothing. Hold the socket open.
+        // Connect and send nothing. Hold the socket open. Timestamp the
+        // connect so we can prove the drop happens AFTER the timeout.
+        let connected_at = std::time::Instant::now();
         let _silent = TcpStream::connect(bound_addr).unwrap();
 
-        // The handler thread should have started and be blocked in the
-        // handshake read.
-        std::thread::sleep(Duration::from_millis(50));
-        assert_eq!(
-            sd.active_connections(),
-            1,
-            "the silent connection should be in-flight before the timeout"
-        );
+        // Bounded poll-until the silent connection is in-flight (handler
+        // spawned, blocked in the handshake read). Replaces the fixed 50 ms
+        // sleep; strictly stronger than the old assert because it *waits* for
+        // the handler instead of sampling once and hoping it has started.
+        let inflight_deadline =
+            std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if sd.active_connections() == 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < inflight_deadline,
+                "the silent connection never became in-flight within the \
+                 bound — the handshake handler was not spawned (count={})",
+                sd.active_connections()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
 
         // After the handshake timeout elapses, the read fails and the handler
-        // returns, dropping the ConnectionGuard back to zero.
-        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        // returns, dropping the ConnectionGuard back to zero. Bounded
+        // poll-until it drops; the bound comfortably exceeds the timeout.
+        let drop_deadline =
+            std::time::Instant::now() + handshake + Duration::from_secs(3);
         loop {
             if sd.active_connections() == 0 {
                 break;
             }
             assert!(
-                std::time::Instant::now() < deadline,
+                std::time::Instant::now() < drop_deadline,
                 "slow-loris connection was not released after the handshake \
                  timeout — the F14 read timeout is not effective"
             );
-            std::thread::sleep(Duration::from_millis(25));
+            std::thread::sleep(Duration::from_millis(5));
         }
+        let dropped_after = connected_at.elapsed();
+
+        // The invariant the old test only approximated: the connection is
+        // dropped AFTER the handshake timeout, not before. Slack covers the
+        // small gap between accept() returning and the handler installing its
+        // read timeout; it is far below `handshake`, so this still proves the
+        // read timeout (not a premature close) is what released the client.
+        let slack = Duration::from_millis(150);
+        assert!(
+            dropped_after + slack >= handshake,
+            "slow-loris connection was dropped TOO EARLY ({dropped_after:?} \
+             after connect, handshake timeout {handshake:?}) — it must be \
+             released by the handshake read timeout, not before"
+        );
 
         // A legitimate client can still be served afterwards.
         let client = connect_to_service(bound_addr, "echo").unwrap();
@@ -1252,6 +1295,14 @@ mod tests {
     /// F15 regression: with `max_connections == 1`, a second concurrent
     /// connection is dropped by the accept loop (no handler thread spawned)
     /// while the first is still in-flight.
+    ///
+    /// F-C hardening: as with F14, the two fixed observation windows (80 ms
+    /// then 120 ms) are a scheduling race under a loaded parallel suite.
+    /// Replace the first with a bounded poll-until the slot is filled, and
+    /// the second with a bounded *window* over which the count must stay
+    /// EXACTLY 1 — never 0 (the capped slot must stay occupied) and never >= 2
+    /// (the excess connection must not spawn a handler). Sampling across a
+    /// window is strictly stronger than the old single 120 ms sample.
     #[test]
     fn connection_count_limit_drops_excess_connections() {
         use std::net::TcpStream;
@@ -1266,26 +1317,41 @@ mod tests {
         // in-flight while we test the cap.
         sd.set_handshake_timeout(Duration::from_secs(30));
         let bound_addr = sd.start().unwrap();
-        std::thread::sleep(Duration::from_millis(20));
 
-        // First silent connection: occupies the single slot.
+        // First silent connection: occupies the single slot. Bounded
+        // poll-until it is in-flight (replaces the fixed 80 ms sleep).
         let _c1 = TcpStream::connect(bound_addr).unwrap();
-        std::thread::sleep(Duration::from_millis(80));
-        assert_eq!(
-            sd.active_connections(),
-            1,
-            "first connection fills the cap"
-        );
+        let fill_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if sd.active_connections() == 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < fill_deadline,
+                "first connection never filled the cap within the bound \
+                 (count={})",
+                sd.active_connections()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
 
         // Second connection: accepted at TCP level but dropped by the loop
-        // (no handler thread), so the in-flight count stays at 1.
+        // (no handler thread). Observe over a bounded window that the
+        // in-flight count stays EXACTLY 1 — c1 must remain in-flight and c2
+        // must never spawn a handler (count must never reach 2).
         let _c2 = TcpStream::connect(bound_addr).unwrap();
-        std::thread::sleep(Duration::from_millis(120));
-        assert_eq!(
-            sd.active_connections(),
-            1,
-            "a connection beyond the limit must not spawn a handler thread"
-        );
+        let observe_until =
+            std::time::Instant::now() + Duration::from_millis(500);
+        while std::time::Instant::now() < observe_until {
+            let n = sd.active_connections();
+            assert_eq!(
+                n, 1,
+                "with max_connections=1, exactly one handler may be in-flight: \
+                 c1 must stay (count must not drop to 0) and c2 must not spawn \
+                 a handler (count must not reach 2); observed {n}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
 
         drop(_c1);
         drop(_c2);
