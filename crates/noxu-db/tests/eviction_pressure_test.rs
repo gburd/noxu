@@ -145,8 +145,14 @@ fn eviction_bounds_cache_and_preserves_data() {
 
 /// A delete-heavy workload under a small cache must not make cache_usage drift
 /// upward unboundedly (F8: delete subtracts key+data+48, not just key+48).
+// Un-ignored on the C2+D base: R-EVICT (BUG-EVICT-REFAULT-DATALOSS / A28,
+// a193d43c..7116a190) fixes the cleaner-reclaims-a-live-file FileNotFound /
+// SplitRequired-x64 data-loss, and R-FLUSHLVL (BUG-CKPT-FLUSHLEVELS-ABBA,
+// bc9a9504 + ff89a3be) fixes the evictor-BIN-latch -> flush-levels-Mutex vs
+// checkpointer-Mutex -> node-latch deadlock that A5's KD-density otherwise
+// drove to ~15% hangs. Both are in stack-v1 under this base, so delete_heavy
+// is green again; C1b's compress-before-split keeps the KD-full BIN splitting.
 #[test]
-#[ignore = "BUG-EVICT-REFAULT-DATALOSS (A28): the cleaner reclaims a log file that a detached (evicted) live child's RESIDENT parent slot still references, so a later insert descent cannot re-fault the child (FileNotFound) and spins SplitRequired x64 (release: silent lost insert). A5 KD-density raises this pre-existing bug's rate from 0 (C1a) to ~55%. The fix is the deferred JE findINInTree fault-by-key (bde3b613); see delete-heavy-filenotfound-repro.md. C1b's compress-before-split cannot touch it (the durable image is already deleted). Un-ignore when A28 lands."]
 fn delete_heavy_does_not_inflate_cache_usage() {
     let dir = TempDir::new().unwrap();
     let (env, db) = open_small_cache_env(dir.path(), 4 * 1024 * 1024);
