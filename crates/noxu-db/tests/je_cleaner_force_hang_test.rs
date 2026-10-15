@@ -41,9 +41,10 @@ fn with_deadline(secs: u64, body: impl FnOnce() + Send + 'static) {
 }
 
 #[test]
-#[ignore = "BUG-CLEANER-CHURN-LOSS: pre-existing at stack-v1 (reproduces with \
-            non-forced clean_log and the daemon off; ~5 clean+checkpoint cycles \
-            lose live LNs); separate item"]
+// Un-ignored for v7.11.1 RC: BUG-CLEANER-CHURN-LOSS is fixed by C2 9a090720
+// (BUG-CLEANER-LIVE-FILE-DELETE: checked_sub(min_age) + cleaner_min_age.max(1))
+// plus the R-CHURN defense-in-depth guard; verified green 20x (DEBUG+RELEASE)
+// on this stack.
 fn forced_clean_terminates_under_migration_churn() {
     with_deadline(120, || {
         let dir = TempDir::new().unwrap();
