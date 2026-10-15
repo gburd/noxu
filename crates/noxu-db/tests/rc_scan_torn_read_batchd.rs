@@ -111,8 +111,6 @@ fn saw_bvalue(d: &DatabaseEntry) -> bool {
 
 /// RC forward scan (Get::First + Get::Next) must never see uncommitted data.
 #[test]
-#[ignore = "BUG-RC-SCAN-TORN-READ (A11-scan): fixed in batch D (A11 full); \
-            RED on v7.11.0 + batch B"]
 fn rc_scan_next_never_sees_uncommitted() {
     let (torn, iters) = torn_under(|cur| {
         let mut k = DatabaseEntry::new();
@@ -131,8 +129,6 @@ fn rc_scan_next_never_sees_uncommitted() {
 
 /// RC `get_first` must never return uncommitted data.
 #[test]
-#[ignore = "BUG-RC-SCAN-TORN-READ (A11-scan): fixed in batch D (A11 full); \
-            RED on v7.11.0 + batch B"]
 fn rc_get_first_never_sees_uncommitted() {
     let (torn, iters) = torn_under(|cur| {
         let mut k = DatabaseEntry::new();
@@ -147,8 +143,6 @@ fn rc_get_first_never_sees_uncommitted() {
 
 /// RC `get_last` must never return uncommitted data.
 #[test]
-#[ignore = "BUG-RC-SCAN-TORN-READ (A11-scan): fixed in batch D (A11 full); \
-            RED on v7.11.0 + batch B"]
 fn rc_get_last_never_sees_uncommitted() {
     let (torn, iters) = torn_under(|cur| {
         let mut k = DatabaseEntry::new();
