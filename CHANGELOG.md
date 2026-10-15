@@ -16,6 +16,247 @@ listed in [References](#references).
 
 ## [Unreleased]
 
+## [7.11.1] - unreleased (release candidate)
+
+v7.11.1 is a **patch release** from v7.11.0: bug fixes only, with no on-disk
+format change (`LOG_VERSION` stays 3), no new log entry type, and no public API
+change in the nine Stable / Stable-foundational crates (`noxu`, `noxu-db`,
+`noxu-bind`, `noxu-collections`, `noxu-persist`, `noxu-xa`, `noxu-rep`,
+`noxu-util`, `noxu-config`). See the SemVer policy in
+`docs/src/contributing/semver-policy.md`.
+
+**Upgrade strongly recommended.** This release closes several silent
+data-loss holes reachable with default settings on small or cache-pressured
+environments. See the advisories
+`advisory-cleaner-live-file.md` and `advisory-live-ln-reclaim.md` for
+user-facing scope, symptoms, and preconditions.
+
+### Fixed — data loss (UPGRADE STRONGLY RECOMMENDED)
+
+- **The background cleaner could delete the live log file and destroy the whole
+  database** (`BUG-CLEANER-LIVE-FILE-DELETE`): on a single-log-file environment
+  (every small or freshly created database), the cleaner could select, migrate,
+  and unlink the file that is still the active write target. Because the
+  database-mapping (NameDB) record lives in that file, the result is not a few
+  lost keys but the whole database: on reopen it reports *"Database '…' does not
+  exist"*. Triggerable by the **default background cleaner daemon alone**, with
+  no explicit `clean_log()` call. The same root cause also surfaced as a
+  read-modify-write that failed to block a concurrent writer, a duplicate
+  `cursor.delete()` returning `KeyEmpty`, and lost catalog (DDL) updates. Root
+  cause: the file selector computed `last_file_to_clean =
+  effective_newest.saturating_sub(min_age)`, flooring at 0 so the live file
+  became age-eligible, and `cleaner_min_age` was not clamped to ≥ 1. Fixed to
+  JE's signed arithmetic (`checked_sub(min_age)` returning *no file* on
+  underflow) and `cleaner_min_age.max(1)` (JE `UtilizationCalculator` /
+  `EnvironmentParams.CLEANER_MIN_AGE`), plus a defense-in-depth guard that never
+  unlinks the current write log file. Whole-database-loss witness added.
+
+- **A committed value could read back EMPTY or fail `LOG_FILE_NOT_FOUND` under
+  cache pressure while cleaning** (`BUG-CLEANER-LIVE-LN-RECLAIM`): under a
+  working-set-≫-cache workload with the cleaner, evictor, and checkpointer all
+  active, a point read of a *committed* key could return an empty value
+  (fail-open) or a fatal `LOG_FILE_NOT_FOUND` that invalidated the environment
+  (fail-closed). Two independent defects: (A) a contended re-read flattened a
+  non-resident BIN slot to an empty `Vec` instead of fetching the LN from the
+  log (fixed: the re-read now re-fetches a non-resident LN, JE `IN.fetchTarget`);
+  (B) more than one resident BIN object could exist for one node, so a stale
+  "zombie" instance was flushed and republished a pre-migration image into the
+  parent slot, resurrecting an LN LSN into a reclaimed file — and the cleaner's
+  slot-currency check used a non-re-faulting descent that judged a live LN
+  "Dead". Fixed with a single-resident-instance invariant (log-time parent-slot
+  publication at every IN/BIN log site, `Arc::ptr_eq` identity, removal of the
+  detach re-stamp) and a re-faulting `search_with_data` currency descent, plus
+  an IN-fetch-failure guard that treats an unreadable interior IN as Unknown
+  (fail-closed), never Dead.
+
+- **The evictor could evict an interior node with resident children, orphaning
+  live data (zombie parent)** (`BUG-EVICT-UIN-WITH-CHILDREN` /
+  zombie-parent flush, R-RECON): a detached parent IN (whose child was
+  relocated/reused by a concurrent split, or which was evicted with resident
+  children) could still pass the checkpointer's / evictor's flush identity
+  check, so a stale "zombie" BIN image was logged and stamped into the parent
+  slot; recovery redo (newer-LSN-wins) could then resurrect that stale image
+  over the committed value. Fixed by resolving the flush parent **root-down**
+  (JE `getParentINForChildIN`) rather than via the BIN back-pointer, in both the
+  checkpointer and the evictor dirty-BIN flush/publish paths, so a detached
+  parent is skipped (never flushed). End-to-end `zombie_e2e_witness` /
+  `zombie_parent_checkpoint_witness` added. (The underlying evict-of-an-upper-IN-
+  with-resident-children TOCTOU — vs JE's under-latch `hasCachedChildren`
+  re-check — is the root cause being closed on top of this defense.)
+
+- **Evicting then re-faulting a dirty BIN could lose committed data**
+  (`BUG-EVICT-REFAULT-DATALOSS`, R-EVICT): a dirty BIN stripped by the evictor
+  and later re-faulted could come back with a stale or empty image. Fixed in the
+  eviction re-fault path with deterministic value-correctness witnesses.
+
+- **A committed delete could be resurrected when the cleaner validated a reused
+  BIN slot after a concurrent split** (`BUG-SPLIT-KD-RESURRECT`, A5b): the
+  cleaner's liveness check routed to a parent slot latch-free and then compared
+  the logged image against whatever node sat at that slot after taking the latch
+  separately; a concurrent split/merge/eviction could relocate or reuse the slot
+  in that window, so a known-deleted (tombstone) slot could be resurrected over
+  a committed-live value. Fixed with a `node_id` recheck under the held parent
+  write latch (JE `FileProcessor`/`Tree.getParentINForChildIN`).
+
+- **`delete(k)` could leave duplicates behind** (`BUG-DUP-DELETEALL-SPAN`): a
+  non-cursor `delete` of a key with duplicates silently removed only part of the
+  duplicate set across a BIN span. Now deletes the whole duplicate set.
+
+- **An aborted transaction's records could reappear after a crash** (A5,
+  KD-slot retention / crash-recovery undo): recovery undo of an in-flight /
+  aborted transaction could lose a committed record or resurrect an aborted one,
+  because known-deleted (KD) slots were not retained for the recovery scanner to
+  follow. Fixed by keeping a KD slot on a transactional delete, currency-checked
+  rollback revert, and a recovery scanner that distinguishes an empty
+  non-deleted LN from a deletion.
+
+- **Deferred-write `sync()` was not durable** (`BUG-DW-SYNC-1` /
+  `BUG-DW-EVICT-NULLLSN`, A13): on a deferred-write database, `sync()` followed
+  by a crash lost the synced records, and evicting a deferred-write BIN with a
+  never-logged slot wrote a NULL-LSN image. Deferred-write LNs are now logged
+  before the BIN image, `sync()` waits on (never skips) a concurrent checkpoint,
+  and verify flags a live NULL-LSN slot only when it is non-embedded.
+
+- **Committed DDL (database create/remove/rename) could be lost on a crash**
+  (`BUG-DDL-DURABILITY-1`, A12): a committed transactional `remove`/`rename`
+  followed by a crash could resurrect the old name; an aborted one could leave
+  the new name. DDL is now logged under the user transaction with a synchronous
+  commit, and NameLN commit/abort is classified by LSN order so transaction-id
+  reuse across sessions is handled correctly.
+
+### Fixed — isolation
+
+- **Serializable phantom prevention under the cleaner** (`BUG-PHANTOM-REVERSE-GAP`,
+  A15): under serializable isolation a next-key/previous-key range lock was
+  non-deterministic with the cleaner/compressor running (a phantom insert could
+  slip the lock, or a safe insert could be over-locked), chiefly because the IN
+  compressor removed/merged a slot between scan positioning and the phantom
+  insert. Fixed so the serializable range lock is deterministic with daemons on;
+  the daemons-on witness is now green and un-ignored.
+
+- **Read-committed scan torn read** (`BUG-RC-SCAN-TORN-READ`): a read-committed
+  scan whose relock livelocked fell back to an unlocked read and could return an
+  uncommitted value mid-write. Fixed so the scan never returns an uncommitted
+  value under a capped relock.
+
+- **Read-modify-write did not block a concurrent writer** (RMW): an RMW read's
+  write lock could be dropped (via the live-file-delete bug) so a concurrent
+  writer was not blocked. Fixed with the cleaner live-file fix.
+
+- **Concurrent deletes of one record could both succeed** (`NEW-DEL-RACE-1`):
+  two deleters of the same record both committed a delete because the write lock
+  was released eagerly in the publish window. The write lock is now retained
+  until commit/abort (transactional) or until after the slot update (auto),
+  matching JE `Locker.allowReleaseLockAfterLsnChange() == false`; the second
+  deleter now sees `KeyEmpty`.
+
+- **Secondary keyed dirty-read of a deleted primary** (`BUG-SEC-KEYED-DIRTYREAD-1`,
+  A14): a keyed secondary read (READ_UNCOMMITTED) racing a primary delete raised
+  a `SecondaryIntegrityException`; it now returns a clean NOTFOUND, and an
+  expired primary read via its secondary expires the secondary entry with the
+  primary.
+
+- **TTL repeatable-read** (`BUG-TTL-REPEATABLE-READ-1`, A14): a second read of a
+  TTL-expired record in the same transaction that locked it is now visible
+  (repeatable read); non-owner / autocommit reads still see NOTFOUND. `count()`
+  now excludes TTL-expired records (A19).
+
+### Fixed — during this release cycle (not present in v7.11.0)
+
+Defects that were introduced and fixed *within* the v7.11.1 development cycle;
+they never shipped, so they are **not** in the v7.11.0 advisory, but are
+recorded here for completeness.
+
+- **A READ_UNCOMMITTED secondary scan/get of a deleted primary returned
+  Success-with-empty** (`BUG-SEC-DIRTYREAD-DELETED-PRIMARY`, R-SECGONE):
+  introduced mid-cycle by the C2 commit that gave the contended re-read its
+  residency contract (`0cd8b502`, "never flattens to empty [A6 D1]"): the Set/Both
+  search arms consumed its `(None, 0)` GONE result as a normal result and
+  returned `found = true` with a **zero-length datum**, so a READ_UNCOMMITTED
+  secondary scan racing a primary delete returned that record with a 0-byte
+  primary datum instead of skipping it. Fixed within the cycle: the GONE result
+  now returns NOTFOUND (JE `fetchCurrent`/`lockLNAndCheckDefunct` KEYEMPTY).
+  Confirmed NOT reachable at v7.11.0 (the A14 witness passes 20/20 cherry-picked
+  onto stack-v1, fails 20/20 onto the C2 tip; the only path-relevant delta is
+  `0cd8b502`).
+
+### Fixed — liveness / availability
+
+- **aarch64 read-write lock lost wake** (`BUG-SYNC-RWLOCK-LOST-WAKE`, A1): on
+  aarch64 the `NoxuRawRwLock` could lose a wakeup and leave a waiter parked
+  indefinitely. Fixed in `noxu-sync`.
+
+- **Verifier / checkpoint deadlock** (`BUG-VERIFY-TRACKER-LATCH-ABBA`, R-VERIFY):
+  the verifier's utilization tracker and the checkpointer could deadlock on an
+  ABBA latch order. Fixed.
+
+- **Checkpoint flush-levels ABBA** (`BUG-CKPT-FLUSHLEVELS-ABBA`, R-FLUSHLVL): the
+  evictor's BIN latch → flush-levels mutex order raced the checkpointer's
+  flush-levels mutex → node latch order. The flush-levels mutex is no longer held
+  across an IN latch.
+
+- **Log-buffer read/flush ABBA** (`BUG-LOGBUF-LATCH-1`, A9): a log-buffer latch
+  held across a flush could deadlock a concurrent reader. Fixed.
+
+- **Replication node-state race** (`BUG-REP-STATE-TOCTOU`, R-REPSTATE): a
+  contended `become_master`/`become_replica` could observe a stale state and
+  drive an invalid self-transition. The compound transition is now atomic under
+  a single state lock.
+
+- **Replication dispatcher leak and silent no-dispatcher on reopen**
+  (`BUG-REP-DISPATCHER-LEAK`, R-DISPATCH): the service-dispatcher accept thread,
+  its listener fd, and its bound port survived env drop/close and leaked until
+  process exit. The accept thread is now stopped and joined on close/drop.
+
+- **Spurious "Checkpoint already in progress" / "Cleaner is already running"**
+  (A12, A13): a manual `checkpoint()` or `clean_log()` overlapping the background
+  daemon returned an error instead of waiting. Both now serialize and wait (JE
+  `Checkpointer.doCheckpoint` / `FileProcessor.doClean` are synchronized).
+
+- **Feeder VLSN continuity** (`BUG-FEEDER-SCAN-SKIP`, R-FEEDER): the replication
+  feeder log scanner could silently skip a log file cleaned ahead of the cursor,
+  shipping a VLSN gap (a lost committed transaction) to the replica. The scanner
+  now enforces dense-VLSN continuity and signals a network restore instead of
+  skipping, carried in the existing `RepError::NetworkRestoreError` (no new
+  variant).
+
+- **Persist / secondary mutex deadlocks** (`BUG-SEC-MUTEX-DEADLOCK` A7,
+  persist two-txn deadlock A8, lock-manager ghost owner A10,
+  `EnvironmentImpl::drop` env-lock A21): several two-lock deadlocks on the
+  persistence, secondary-index, lock-manager, and environment-drop paths are
+  fixed.
+
+### Fixed — internal crates (no stability guarantee)
+
+The internal-tier crates (`noxu-cleaner`, `noxu-dbi`, `noxu-engine`,
+`noxu-recovery`, `noxu-tree`, `noxu-evictor`, `noxu-log`, `noxu-txn`,
+`noxu-sync`, `noxu-latch`, `noxu-observe`) carry the implementation of the
+fixes above and changed their internal APIs accordingly (new `pub` items on
+`noxu-tree`/`noxu-cleaner`/`noxu-recovery`, e.g. the fetch-failure-checked
+descent helpers, the single-resident-instance residency helpers, and the
+checkpoint-serial/flush-levels machinery). These crates carry **no stability
+guarantee** and may change in any release; the nine Stable /
+Stable-foundational crates are unchanged at the public-API level
+(`cargo-semver-checks`: 9/9 "no semver update required" vs v7.11.0).
+
+### Known issues / deferred to v8.0.0
+
+- **A17** sec→primary ABBA avoidance (feature; a progress guard shipped).
+- **A20** trigger lifecycle — needs `FEAT-TRIGGER-LIFECYCLE` (new public API).
+- **A22** reject an unregistered comparator at open — needs
+  `EnvironmentConfig::with_comparator` + `ComparatorRegistry` + a new error
+  variant.
+- **REP-BIND-FAIL-OPEN** — `ReplicatedEnvironment::new` still comes up with no
+  dispatcher (reports healthy) when the dispatcher cannot bind; a fail-closed
+  fix needs test-port migration and is a behaviour change.
+- **LATCH-RANK-TREE** — the debug latch-order checker does not yet cover tree
+  node latches, so a tree-latch ordering regression is not caught in debug.
+- **CLEANER-LOCK-TRANSFER**, **KD cursor lineage**, **membudget node-heap
+  accounting** (`MEMBUDGET-NODE-HEAP`), **NEW-PHANTOM-ABORT-1** (a blocked
+  getNext/getPrev dirty-reads a concurrent uncommitted write and does not
+  re-resolve on abort) remain tracked for v8.0.0.
+
+
 ## [7.11.0] - 2026-09-28
 
 ### Added
