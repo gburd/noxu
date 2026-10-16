@@ -17,7 +17,13 @@
 //! Witness (d) (a trigger sees the same txn as the primary write) is covered
 //! by `db_trig_test::auto_commit_put_fires_with_some_txn_and_commit` and the
 //! `kvops_auto` case.
-#![cfg(all(unix, not(noxu_shuttle)))]
+// Requires the `testing` feature: the witnesses re-exec this test binary as a
+// child and rely on `noxu-db`'s `optb_crash_hook` being LINKED into the lib,
+// which only happens under `feature = "testing"` for an integration test (the
+// hook is compiled out of production builds — see `noxu-db/src/lib.rs`).  With
+// the feature off this file compiles to nothing (so plain `cargo test` does not
+// try to run a witness whose hook is absent); run with `--features testing`.
+#![cfg(all(unix, not(noxu_shuttle), feature = "testing"))]
 
 use noxu_db::{
     CheckpointConfig, Database, DatabaseConfig, DatabaseEntry, Durability,

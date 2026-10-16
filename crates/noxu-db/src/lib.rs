@@ -38,8 +38,14 @@
 #[macro_use]
 mod observe;
 // WITNESS-ONLY (not a production feature): env-gated crash-injection hook
-// for the v7.11.1 single-locker auto-commit atomicity witnesses.  Inert
+// for the v7.11.1 single-locker auto-commit atomicity witnesses.  Gated
+// behind the `testing` feature (same discipline as the `noxu-dbi` probe
+// seams) so it is COMPILED OUT of every production build — `cfg(test)`
+// covers the in-crate unit tests, `feature = "testing"` covers the
+// `optb_single_locker_witness` integration test (which re-execs itself and
+// so needs the hook linked into the lib).  Inert even when compiled in,
 // unless `NOXU_OPTB_CRASH_{BEFORE,AFTER}_COMMIT` is set.
+#[cfg(any(test, feature = "testing"))]
 mod optb_crash_hook;
 pub mod unimplemented_params;
 

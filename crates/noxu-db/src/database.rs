@@ -382,14 +382,17 @@ impl Database {
 
             // Associations run under the SAME locker (one atomic unit).
             let op_result = op(Some(&txn), Some(&txn));
-            #[cfg(not(noxu_shuttle))]
+            #[cfg(all(not(noxu_shuttle), any(test, feature = "testing")))]
             if op_result.is_ok() {
                 crate::optb_crash_hook::maybe_crash_before_commit();
             }
             match op_result {
                 Ok(value) => {
                     txn.commit_with_durability(durability)?;
-                    #[cfg(not(noxu_shuttle))]
+                    #[cfg(all(
+                        not(noxu_shuttle),
+                        any(test, feature = "testing")
+                    ))]
                     crate::optb_crash_hook::maybe_crash_after_commit();
                     Ok(value)
                 }
@@ -443,14 +446,17 @@ impl Database {
             .with_env_impl(Arc::clone(&self.env_impl));
 
             let op_result = op(Some(&txn), None);
-            #[cfg(not(noxu_shuttle))]
+            #[cfg(all(not(noxu_shuttle), any(test, feature = "testing")))]
             if op_result.is_ok() {
                 crate::optb_crash_hook::maybe_crash_before_commit();
             }
             match op_result {
                 Ok(value) => {
                     txn.commit_with_durability(durability)?;
-                    #[cfg(not(noxu_shuttle))]
+                    #[cfg(all(
+                        not(noxu_shuttle),
+                        any(test, feature = "testing")
+                    ))]
                     crate::optb_crash_hook::maybe_crash_after_commit();
                     Ok(value)
                 }
@@ -1069,10 +1075,10 @@ impl Database {
             // non-transactional database runs the primary under an auto-`Txn`
             // for lock management and the secondaries auto-commit (`None`).
             None => {
-                #[cfg(not(noxu_shuttle))]
+                #[cfg(all(not(noxu_shuttle), any(test, feature = "testing")))]
                 crate::optb_crash_hook::set_current_key(key_bytes);
                 let r = self.with_auto_commit_transaction(do_put);
-                #[cfg(not(noxu_shuttle))]
+                #[cfg(all(not(noxu_shuttle), any(test, feature = "testing")))]
                 crate::optb_crash_hook::clear_current_key();
                 r?
             }
@@ -1496,10 +1502,10 @@ impl Database {
             // non-transactional database runs the primary under an auto-`Txn`
             // for lock management and the secondaries auto-commit (`None`).
             None => {
-                #[cfg(not(noxu_shuttle))]
+                #[cfg(all(not(noxu_shuttle), any(test, feature = "testing")))]
                 crate::optb_crash_hook::set_current_key(key_bytes);
                 let r = self.with_auto_commit_transaction(do_delete);
-                #[cfg(not(noxu_shuttle))]
+                #[cfg(all(not(noxu_shuttle), any(test, feature = "testing")))]
                 crate::optb_crash_hook::clear_current_key();
                 r?
             }
