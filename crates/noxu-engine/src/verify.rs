@@ -443,7 +443,12 @@ fn verify_bin_stub(
             }
         }
 
-        if !entry.known_deleted {
+        // FID-CURSOR-1 follow-up: a PENDING-deleted slot is not a live record
+        // (JE `BIN.isDeleted` = KD || PD); count records with `is_deleted()`
+        // so `verify` agrees with `Tree::count_entries` / `collect_stats`,
+        // which both exclude PD. (A transient PD slot would otherwise be
+        // counted here but not by `count()`.)
+        if !entry.is_deleted() {
             *records += 1;
         }
     }
