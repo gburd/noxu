@@ -306,26 +306,7 @@ impl NetworkRestore {
             let file_size = u64::from_le_bytes(size_buf);
 
             // Determine destination path.
-            // If `retain_log_files` is set and the file already exists,
-            // rename the existing file before writing the new one.
             let dest_path = log_dir.join(&filename);
-            if self.config.retain_log_files && dest_path.exists() {
-                // FID-NR-7 (JE NetworkBackup.disposeFile, NetworkBackup.java:751):
-                // a failed rename of the existing file to .bak must ERROR, not
-                // be swallowed and the retained file silently overwritten. JE
-                // throws EnvironmentFailureException.unexpectedState on a
-                // failed rename.
-                let backup = log_dir.join(format!("{}.bak", filename));
-                std::fs::rename(&dest_path, &backup).map_err(|e| {
-                    RepError::NetworkRestoreError(format!(
-                        "retaining existing log file: could not rename '{}' \
-                         to '{}': {}",
-                        dest_path.display(),
-                        backup.display(),
-                        e
-                    ))
-                })?;
-            }
 
             // FID-NR-2 (JE NetworkBackup.getFile, NetworkBackup.java:575):
             // write the incoming bytes to a `.tmp` file and atomically rename
@@ -408,6 +389,13 @@ impl NetworkRestore {
                 ))
             })?;
             drop(out);
+            // FID-NR-3 (JE NetworkBackup.getFile: disposeObsoleteFiles(file)
+            // before renameTo, NetworkBackup.java:720): dispose this file and
+            // all higher-numbered local log files, highest-first, so an
+            // interrupted multi-file replace leaves a consistent prefix.
+            if let Some(num) = Self::parse_restore_file_number(&filename) {
+                self.dispose_obsolete_files(&log_dir, num)?;
+            }
             std::fs::rename(&tmp_path, &dest_path).map_err(|e| {
                 RepError::NetworkRestoreError(format!(
                     "renaming '{}' -> '{}': {}",
@@ -615,23 +603,6 @@ impl NetworkRestore {
             }
 
             let dest_path = log_dir.join(&filename);
-            if self.config.retain_log_files && dest_path.exists() {
-                // FID-NR-7 (JE NetworkBackup.disposeFile, NetworkBackup.java:751):
-                // a failed rename of the existing file to .bak must ERROR, not
-                // be swallowed and the retained file silently overwritten. JE
-                // throws EnvironmentFailureException.unexpectedState on a
-                // failed rename.
-                let backup = log_dir.join(format!("{}.bak", filename));
-                std::fs::rename(&dest_path, &backup).map_err(|e| {
-                    RepError::NetworkRestoreError(format!(
-                        "retaining existing log file: could not rename '{}' \
-                         to '{}': {}",
-                        dest_path.display(),
-                        backup.display(),
-                        e
-                    ))
-                })?;
-            }
 
             // FID-NR-2 (JE NetworkBackup.getFile, NetworkBackup.java:575):
             // write to a `.tmp` file, fsync, then atomically rename onto the
@@ -675,6 +646,12 @@ impl NetworkRestore {
                     "simulated crash before rename (FID-NR-2 witness)"
                         .to_string(),
                 ));
+            }
+            // FID-NR-3 (JE NetworkBackup.getFile: disposeObsoleteFiles(file)
+            // before renameTo, NetworkBackup.java:720): dispose this file and
+            // all higher-numbered local log files, highest-first.
+            if let Some(num) = Self::parse_restore_file_number(&filename) {
+                self.dispose_obsolete_files(&log_dir, num)?;
             }
             std::fs::rename(&tmp_path, &dest_path).map_err(|e| {
                 RepError::NetworkRestoreError(format!(
@@ -749,6 +726,88 @@ impl NetworkRestore {
         let mut progress = self.progress.lock();
         progress.bytes_transferred = bytes;
         progress.files_transferred = files;
+    }
+
+    /// FID-NR-3 (JE `NetworkBackup.disposeObsoleteFiles`,
+    /// `NetworkBackup.java:720`): rename-to-`.bak` (or delete) this log file
+    /// and every higher-numbered local log file, **highest-numbered first**,
+    /// so the integrity of the log files in the directory is always preserved
+    /// even if the dispose is itself interrupted. An interrupted multi-file
+    /// replace then leaves a consistent lower prefix rather than a gap. The
+    /// restore marker is a non-`.ndb` file and is therefore never considered
+    /// (JE explicitly skips the marker so it survives until the whole restore
+    /// finishes).
+    ///
+    /// `start_file_num` is the lowest-numbered file that must be disposed (the
+    /// incoming file being placed). A failed rename/delete ERRORS
+    /// (JE EFE.unexpectedState; see FID-NR-7).
+    fn dispose_obsolete_files(
+        &self,
+        log_dir: &Path,
+        start_file_num: u32,
+    ) -> Result<()> {
+        // Collect existing local .ndb files with their numbers.
+        let mut nums: Vec<u32> = Vec::new();
+        let rd = std::fs::read_dir(log_dir).map_err(|e| {
+            RepError::NetworkRestoreError(format!(
+                "listing log dir {} for obsolete-file disposal: {}",
+                log_dir.display(),
+                e
+            ))
+        })?;
+        for entry in rd {
+            let entry = entry.map_err(|e| {
+                RepError::NetworkRestoreError(format!(
+                    "reading a directory entry in {}: {}",
+                    log_dir.display(),
+                    e
+                ))
+            })?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some(stem) = name.strip_suffix(".ndb")
+                && let Ok(num) = u32::from_str_radix(stem, 16)
+            {
+                nums.push(num);
+            }
+        }
+        // Highest-numbered first, down to start_file_num.
+        nums.sort_unstable();
+        for &num in nums.iter().rev() {
+            if num < start_file_num {
+                break;
+            }
+            let name = format!("{num:08x}.ndb");
+            let path = log_dir.join(&name);
+            if self.config.retain_log_files {
+                let backup = log_dir.join(format!("{name}.bak"));
+                // FID-NR-7: a failed rename must error, not be swallowed.
+                std::fs::rename(&path, &backup).map_err(|e| {
+                    RepError::NetworkRestoreError(format!(
+                        "disposing obsolete log file: could not rename '{}' \
+                         to '{}': {}",
+                        path.display(),
+                        backup.display(),
+                        e
+                    ))
+                })?;
+            } else {
+                std::fs::remove_file(&path).map_err(|e| {
+                    RepError::NetworkRestoreError(format!(
+                        "disposing obsolete log file: could not delete '{}': {}",
+                        path.display(),
+                        e
+                    ))
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Parse the `u32` log-file number from a `NNNNNNNN.ndb` basename.
+    fn parse_restore_file_number(filename: &str) -> Option<u32> {
+        let stem = filename.strip_suffix(".ndb")?;
+        u32::from_str_radix(stem, 16).ok()
     }
 
     /// Update the elapsed time for progress tracking.
@@ -1421,6 +1480,105 @@ mod tests {
         assert!(
             !noxu_log::marker_present(dir.path()),
             "a completed restore must remove the marker"
+        );
+    }
+
+    /// FID-NR-3 (S2, JE `NetworkBackup.disposeObsoleteFiles`,
+    /// `NetworkBackup.java:720`): obsolete files must be disposed
+    /// highest-numbered first, so if the dispose is interrupted the remaining
+    /// files form a consistent lower prefix (no gap). Files below the start
+    /// file are untouched.
+    ///
+    /// Witness: local files 2,3,4,5 exist; file 3 is made un-deletable (a
+    /// non-empty directory). Disposing from start=2 must remove 5 then 4
+    /// (highest-first), then FAIL on 3 — leaving {2,3} as a consistent prefix,
+    /// never a gap like {2,4} or {2,5}. RED at 81b2f048 (no
+    /// disposeObsoleteFiles / no ordering). GREEN after the fix.
+    #[cfg(unix)]
+    #[test]
+    fn dispose_obsolete_files_highest_first_leaves_prefix() {
+        let dir = tempfile::TempDir::new().unwrap();
+        for n in [2u32, 4, 5] {
+            std::fs::write(dir.path().join(format!("{n:08x}.ndb")), b"x")
+                .unwrap();
+        }
+        // File 3 is a non-empty directory so remove_file fails on it.
+        std::fs::create_dir(dir.path().join("00000003.ndb")).unwrap();
+        std::fs::write(dir.path().join("00000003.ndb").join("blk"), b"x")
+            .unwrap();
+
+        // Non-retain restore so dispose deletes.
+        let cfg = NetworkRestoreConfig {
+            source_node: "s".into(),
+            source_host: "127.0.0.1".into(),
+            source_port: 1,
+            retain_log_files: false,
+        };
+        let restore = NetworkRestore::new(cfg).with_local_dir(dir.path());
+
+        let res = restore.dispose_obsolete_files(dir.path(), 2);
+        assert!(res.is_err(), "dispose must fail on the un-deletable file 3");
+
+        // Highest-first: 5 and 4 are gone (disposed before 3 was reached);
+        // 3 (the failure) and 2 (below start, untouched) remain — a consistent
+        // lower prefix, never a gap.
+        assert!(
+            !dir.path().join("00000005.ndb").exists(),
+            "file 5 (highest) must be disposed first"
+        );
+        assert!(
+            !dir.path().join("00000004.ndb").exists(),
+            "file 4 must be disposed before 3"
+        );
+        assert!(
+            dir.path().join("00000003.ndb").exists(),
+            "the dispose failed at file 3; it must remain"
+        );
+        assert!(
+            dir.path().join("00000002.ndb").exists(),
+            "file 2 is below the start file and must be untouched"
+        );
+    }
+
+    /// FID-NR-3 integration: restoring a SHORTER set over a longer
+    /// pre-existing local log disposes the obsolete higher-numbered files.
+    #[test]
+    fn restore_disposes_obsolete_higher_local_files() {
+        // Server sends only file 0.
+        let body = b"fresh file zero";
+        let mut payload = 1u32.to_le_bytes().to_vec();
+        payload
+            .extend_from_slice(&(b"00000000.ndb".len() as u16).to_le_bytes());
+        payload.extend_from_slice(b"00000000.ndb");
+        payload.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        payload.extend_from_slice(body);
+        payload.extend_from_slice(&crc32fast::hash(body).to_le_bytes());
+
+        let (_disp, addr) = spawn_fixed_reply_restore_server(payload);
+        let dir = tempfile::TempDir::new().unwrap();
+        // Pre-populate with stale higher-numbered local files.
+        for n in [0u32, 1, 2] {
+            std::fs::write(dir.path().join(format!("{n:08x}.ndb")), b"stale")
+                .unwrap();
+        }
+
+        let restore = NetworkRestore::new(dispatcher_config(addr))
+            .with_local_dir(dir.path());
+        restore.execute_via_dispatcher().expect("restore");
+
+        // File 0 is the fresh restored copy.
+        assert_eq!(
+            std::fs::read(dir.path().join("00000000.ndb")).unwrap(),
+            body
+        );
+        // Stale higher files 1 and 2 were disposed (deleted, non-retain).
+        assert!(
+            !dir.path().join("00000001.ndb").exists(),
+            "obsolete file 1 must be disposed"
+        );
+        assert!(
+            !dir.path().join("00000002.ndb").exists(),
+            "obsolete file 2 must be disposed"
         );
     }
 }
