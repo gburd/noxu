@@ -402,12 +402,11 @@ impl LogScanner for EnvironmentLogScanner {
         let file_nums = match self.file_manager.list_file_numbers() {
             Ok(v) => v,
             Err(e) => {
-                self.scan_error = Some(
-                    crate::error::RepError::NetworkRestoreError(format!(
+                self.scan_error =
+                    Some(crate::error::RepError::NetworkRestoreError(format!(
                         "feeder source: listing log files failed ({e}); \
                          cannot scan the WAL (FID-FEEDSRC-2)"
-                    )),
-                );
+                    )));
                 return None;
             }
         };
@@ -2175,9 +2174,10 @@ mod tests {
         {
             let fm = FileManager::new(dir.path(), false, 64 * 1024 * 1024, 8)
                 .expect("fm");
-            let hdr = fm.file_header_size_for(0).unwrap_or_else(|_| {
-                file_header_on_disk_size(LOG_FILE_VERSION)
-            }) as u64;
+            let hdr = fm
+                .file_header_size_for(0)
+                .unwrap_or_else(|_| file_header_on_disk_size(LOG_FILE_VERSION))
+                as u64;
             feeder_append_entry_to_file(
                 &fm,
                 0,

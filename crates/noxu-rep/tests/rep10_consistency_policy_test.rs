@@ -142,12 +142,14 @@ fn test_commit_point_blocks_then_sees_data() {
         std::thread::sleep(Duration::from_millis(60));
         // Apply VLSNs 1..=5; the LN with the data lands at VLSN 5.
         for v in 1..=5u64 {
-            replay.apply_entry(
-                v,
-                insert_ln,
-                &payload,
-                Lsn::new(0, 100 + v as u32),
-            ).unwrap();
+            replay
+                .apply_entry(
+                    v,
+                    insert_ln,
+                    &payload,
+                    Lsn::new(0, 100 + v as u32),
+                )
+                .unwrap();
         }
         // Wake any reader parked on the tracker.
         replay

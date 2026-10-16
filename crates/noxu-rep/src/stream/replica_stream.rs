@@ -1028,8 +1028,7 @@ mod tests {
         let replica_side: Arc<dyn Channel> = Arc::new(pair.channel_b);
 
         // In-order VLSN=1, then a forward gap to VLSN=3 (skips 2).
-        let frames =
-            vec![make_frame(1, 10, b"a"), make_frame(3, 10, b"gap")];
+        let frames = vec![make_frame(1, 10, b"a"), make_frame(3, 10, b"gap")];
 
         let master_clone = Arc::clone(&master_side);
         let _send_handle = std::thread::spawn(move || {

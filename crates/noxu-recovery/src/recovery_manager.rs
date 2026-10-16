@@ -3803,8 +3803,10 @@ mod tests {
             lsn(0, 30),
             LogEntry::Ln(make_insert(1, Some(2), b"k2", NULL_LSN)),
         );
-        scanner
-            .push(lsn(0, 40), LogEntry::TxnAbort(TxnAbortRecord { txn_id: 2, dtvlsn: None }));
+        scanner.push(
+            lsn(0, 40),
+            LogEntry::TxnAbort(TxnAbortRecord { txn_id: 2, dtvlsn: None }),
+        );
 
         // txn 3 LN — no commit/abort (active at crash)
         scanner.push(

@@ -2211,9 +2211,7 @@ impl Database {
         // before any cursor work.  The cursor-level screen
         // (`check_local_write_allowed`) is kept as defense-in-depth for writers
         // that bypass this layer (a direct `EnvironmentImpl` cursor).
-        if self
-            .replica_write_screen
-            .load(std::sync::atomic::Ordering::Relaxed)
+        if self.replica_write_screen.load(std::sync::atomic::Ordering::Relaxed)
         {
             return Err(NoxuError::ReplicaWrite);
         }

@@ -318,7 +318,8 @@ impl ReplicaReplay {
     ///   stream down -- the EnvironmentFailureException-equivalent restart).
     /// - DTVLSNs are non-decreasing, EXCEPT the single post->pre-DTVLSN-stream
     ///   transition (a positive value -> UNINITIALIZED/0), which is allowed.
-    /// `dtvlsn == None` is the pre-DTVLSN (UNINITIALIZED) case: track 0,
+    ///
+    /// A `dtvlsn` of `None` is the pre-DTVLSN (UNINITIALIZED) case: track 0,
     /// never a violation.
     fn validate_and_track_dtvlsn(
         &mut self,
@@ -408,10 +409,7 @@ impl ReplicaReplay {
             self.active_txns
                 .insert(txn_id, ReplayTxnState { txn, ops: Vec::new() });
         }
-        let state = self
-            .active_txns
-            .get_mut(&txn_id)
-            .expect("inserted above");
+        let state = self.active_txns.get_mut(&txn_id).expect("inserted above");
         if let Err(e) = state.txn.lock(lock_id, LockType::Write, false) {
             // Importunate locks steal rather than wait, so a failure here is a
             // genuine fault (a different importunate/non-preemptable owner, or
@@ -442,17 +440,15 @@ impl ReplicaReplay {
                 let new_lock_id = lsn.as_u64();
                 if new_lock_id != old_lock_id
                     && new_lock_id != noxu_util::NULL_LSN.as_u64()
-                {
-                    if let Err(e) = state
+                    && let Err(e) = state
                         .txn
                         .move_write_lock_to_new_lsn(old_lock_id, new_lock_id)
-                    {
-                        log::error!(
-                            "replica-replay: move write lock \
-                             {old_lock_id:#x}->{new_lock_id:#x} for replay \
-                             txn {txn_id} failed: {e}"
-                        );
-                    }
+                {
+                    log::error!(
+                        "replica-replay: move write lock \
+                         {old_lock_id:#x}->{new_lock_id:#x} for replay \
+                         txn {txn_id} failed: {e}"
+                    );
                 }
             }
             // Commit the ReplayTxn: release every write lock it holds so local
@@ -700,12 +696,14 @@ mod tests {
 
         for (i, k) in [b"a", b"b", b"c"].iter().enumerate() {
             let p = ln_payload(db_id, Some(3), *k, Some(b"v"));
-            replay.apply_entry(
-                (i + 1) as u64,
-                insert_ln_txn(),
-                &p,
-                Lsn::new(0, 100 + i as u32),
-            ).unwrap();
+            replay
+                .apply_entry(
+                    (i + 1) as u64,
+                    insert_ln_txn(),
+                    &p,
+                    Lsn::new(0, 100 + i as u32),
+                )
+                .unwrap();
             // None visible until commit.
             assert!(tree.read().unwrap().search(*k).is_none());
         }
@@ -866,7 +864,9 @@ mod tests {
         let p1 = ln_payload(db_id, Some(1), b"a", Some(b"v"));
         replay.apply_entry(4, insert_ln_txn(), &p1, Lsn::new(0, 90)).unwrap();
         let c1 = txn_commit_payload_dtvlsn(1, 5);
-        replay.apply_entry(5, txn_commit_type(), &c1, Lsn::new(0, 100)).unwrap();
+        replay
+            .apply_entry(5, txn_commit_type(), &c1, Lsn::new(0, 100))
+            .unwrap();
 
         // Commit 2 @ vlsn=9 carries DTVLSN=3 (< last 5): must fail closed.
         let p2 = ln_payload(db_id, Some(2), b"b", Some(b"v"));

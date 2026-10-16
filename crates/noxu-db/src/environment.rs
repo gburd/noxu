@@ -3892,9 +3892,7 @@ mod tests {
 
         // Flip the replica-write screen on, exactly as become_replica does on
         // the shared EnvironmentImpl.
-        env.env_impl_arc_for_test()
-            .lock()
-            .set_replica_write_screen(true);
+        env.env_impl_arc_for_test().lock().set_replica_write_screen(true);
 
         // Now a user write is refused with ReplicaWrite (committed-stream only
         // mutates a replica).
@@ -3913,9 +3911,7 @@ mod tests {
         assert_eq!(db.get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
 
         // Clearing the screen (become_master) re-enables writes.
-        env.env_impl_arc_for_test()
-            .lock()
-            .set_replica_write_screen(false);
+        env.env_impl_arc_for_test().lock().set_replica_write_screen(false);
         db.put(b"k3", b"v3").unwrap();
         assert_eq!(db.get(b"k3").unwrap().as_deref(), Some(&b"v3"[..]));
 

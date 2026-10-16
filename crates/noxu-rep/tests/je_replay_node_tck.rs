@@ -228,34 +228,46 @@ fn replay_ln_stream_converges_replica_to_master_state() {
     let mut replay = ReplicaReplay::new(Arc::clone(&env));
 
     // Master txn 10: insert two keys, commit. Replica must see both.
-    replay.apply_entry(
-        1,
-        insert_txn(),
-        &ln_payload(db_id, Some(10), b"keep", Some(b"v1")),
-        Lsn::new(0, 100),
-    ).unwrap();
-    replay.apply_entry(
-        2,
-        insert_txn(),
-        &ln_payload(db_id, Some(10), b"gone", Some(b"v1")),
-        Lsn::new(0, 110),
-    ).unwrap();
-    replay.apply_entry(3, commit_type(), &commit_payload(10), Lsn::new(0, 120)).unwrap();
+    replay
+        .apply_entry(
+            1,
+            insert_txn(),
+            &ln_payload(db_id, Some(10), b"keep", Some(b"v1")),
+            Lsn::new(0, 100),
+        )
+        .unwrap();
+    replay
+        .apply_entry(
+            2,
+            insert_txn(),
+            &ln_payload(db_id, Some(10), b"gone", Some(b"v1")),
+            Lsn::new(0, 110),
+        )
+        .unwrap();
+    replay
+        .apply_entry(3, commit_type(), &commit_payload(10), Lsn::new(0, 120))
+        .unwrap();
 
     // Master txn 11: UPDATE "keep", DELETE "gone", commit.
-    replay.apply_entry(
-        4,
-        update_txn(),
-        &ln_payload(db_id, Some(11), b"keep", Some(b"v2")),
-        Lsn::new(0, 200),
-    ).unwrap();
-    replay.apply_entry(
-        5,
-        delete_txn(),
-        &ln_payload(db_id, Some(11), b"gone", None),
-        Lsn::new(0, 210),
-    ).unwrap();
-    replay.apply_entry(6, commit_type(), &commit_payload(11), Lsn::new(0, 220)).unwrap();
+    replay
+        .apply_entry(
+            4,
+            update_txn(),
+            &ln_payload(db_id, Some(11), b"keep", Some(b"v2")),
+            Lsn::new(0, 200),
+        )
+        .unwrap();
+    replay
+        .apply_entry(
+            5,
+            delete_txn(),
+            &ln_payload(db_id, Some(11), b"gone", None),
+            Lsn::new(0, 210),
+        )
+        .unwrap();
+    replay
+        .apply_entry(6, commit_type(), &commit_payload(11), Lsn::new(0, 220))
+        .unwrap();
 
     // checkNodeEquality (LN-data layer): the replica's tree == the master's
     // final state — "keep" holds the UPDATED value, "gone" is DELETED.
@@ -288,13 +300,17 @@ fn replay_advances_vlsn_in_stream_order() {
     let mut replay = ReplicaReplay::new(Arc::clone(&env));
 
     // A committed txn (12) then a still-open txn (13).
-    replay.apply_entry(
-        7,
-        insert_txn(),
-        &ln_payload(db_id, Some(12), b"early", Some(b"x")),
-        Lsn::new(0, 100),
-    ).unwrap();
-    replay.apply_entry(8, commit_type(), &commit_payload(12), Lsn::new(0, 110)).unwrap();
+    replay
+        .apply_entry(
+            7,
+            insert_txn(),
+            &ln_payload(db_id, Some(12), b"early", Some(b"x")),
+            Lsn::new(0, 100),
+        )
+        .unwrap();
+    replay
+        .apply_entry(8, commit_type(), &commit_payload(12), Lsn::new(0, 110))
+        .unwrap();
     assert_eq!(
         replay.last_applied_vlsn(),
         8,
@@ -303,12 +319,14 @@ fn replay_advances_vlsn_in_stream_order() {
 
     // A later, still-open txn's LN is buffered — the high-water does NOT
     // jump ahead of it, and its data is NOT yet visible.
-    replay.apply_entry(
-        9,
-        insert_txn(),
-        &ln_payload(db_id, Some(13), b"late", Some(b"y")),
-        Lsn::new(0, 200),
-    ).unwrap();
+    replay
+        .apply_entry(
+            9,
+            insert_txn(),
+            &ln_payload(db_id, Some(13), b"late", Some(b"y")),
+            Lsn::new(0, 200),
+        )
+        .unwrap();
     assert!(
         !present(&tree, b"late"),
         "a buffered (uncommitted) later txn must not be visible out of order"
