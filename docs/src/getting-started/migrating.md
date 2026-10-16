@@ -60,8 +60,11 @@ Impact on an existing HA deployment upgrading 7.5.3 → 7.5.4:
 - **`COMMIT_NO_SYNC`**: commits now wait for a **majority** of replicas to
   acknowledge (previously they waited for none). This restores the JE
   durability guarantee but adds commit latency and changes failure modes (a
-  commit can now block on `InsufficientReplicas`). This is the important one:
-  7.5.3's `COMMIT_NO_SYNC` was a silent durability *downgrade*.
+  commit can now block, and on an ack timeout returns
+  `NoxuError::InsufficientAcks` — the write IS committed+durable at the master
+  but too few replicas acknowledged; see the HA durability chapter). This is
+  the important one: 7.5.3's `COMMIT_NO_SYNC` was a silent durability
+  *downgrade*.
 - **Non-replicated (single-node) environments are unaffected**: `local_sync`
   was already correct in all three, and the ack-wait only engages when a
   replica coordinator is wired.

@@ -180,9 +180,9 @@ pub struct Environment {
     /// `Transaction` is wired to the coordinator and its
     /// `commit_with_durability` blocks until the configured
     /// `ReplicaAckPolicy` is satisfied (or the configured timeout
-    /// elapses, in which case `NoxuError::InsufficientReplicas` is
-    /// returned).  Closes finding F1 of
-    /// the 2026 review.
+    /// elapses, in which case `NoxuError::InsufficientAcks` is returned --
+    /// the txn IS committed+durable at the master; FID-DUR-1).  Closes
+    /// finding F1 of the 2026 review.
     replica_coordinator: Mutex<Option<noxu_dbi::SharedReplicaAckCoordinator>>,
     /// Per-commit timeout for replica acknowledgments.  Mirrors
     /// `noxu_rep::RepConfig::replica_ack_timeout`; defaults to 5s.
@@ -1595,7 +1595,8 @@ impl Environment {
     /// will consult the coordinator on `commit_with_durability` and
     /// block until the configured `ReplicaAckPolicy` is satisfied (or
     /// until `replica_ack_timeout` elapses, in which case
-    /// `NoxuError::InsufficientReplicas` is returned).
+    /// `NoxuError::InsufficientAcks` is returned -- the txn IS
+    /// committed+durable at the master; FID-DUR-1).
     ///
     /// `noxu_rep::ReplicatedEnvironment` implements
     /// `noxu_dbi::ReplicaAckCoordinator`; users typically wire it as:

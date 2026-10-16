@@ -112,8 +112,10 @@ impl std::error::Error for AckWaitError {}
 /// Implementations are typically `noxu_rep::ReplicatedEnvironment`. The
 /// `noxu-db::Environment` holds an `Option<Arc<dyn ReplicaAckCoordinator>>`;
 /// when present, `Transaction::commit_with_durability` calls
-/// [`Self::await_replica_acks`] after the local WAL fsync and propagates
-/// any error as `NoxuError::InsufficientReplicas`.
+/// [`Self::await_replica_acks`] after the local WAL fsync.  Because the
+/// TxnCommit is already durable at that point, an ack timeout is propagated
+/// as `NoxuError::InsufficientAcks` (committed-at-master; FID-DUR-1), not the
+/// pre-commit `NoxuError::InsufficientReplicas`.
 pub trait ReplicaAckCoordinator: Send + Sync {
     /// Block until at least `policy.required_acks(electable_count)`
     /// replicas have acknowledged the most-recent local commit, or
@@ -309,7 +311,8 @@ mod tests {
     }
 
     /// `AckWaitError`'s Display is what surfaces in a
-    /// `NoxuError::InsufficientReplicas`, so it must distinguish the three
+    /// `NoxuError::InsufficientAcks` (post-commit timeout; FID-DUR-1), so it
+    /// must distinguish the three
     /// failure kinds -- an operator cannot tell a timeout from a
     /// wrong-node commit otherwise -- and the timeout case must carry the
     /// counts that explain it.

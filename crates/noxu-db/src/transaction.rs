@@ -113,9 +113,9 @@ pub struct Transaction {
     /// `noxu_rep::ReplicatedEnvironment`).  When `Some`, a successful
     /// `commit_with_durability` blocks until the configured
     /// `ReplicaAckPolicy` is satisfied or the durability ack-timeout
-    /// elapses, in which case `NoxuError::InsufficientReplicas` is
-    /// returned.  Closes finding F1 of
-    /// the 2026 review.
+    /// elapses, in which case `NoxuError::InsufficientAcks` is returned
+    /// (the txn IS committed+durable at the master; too few replicas
+    /// acknowledged -- FID-DUR-1).  Closes finding F1 of the 2026 review.
     replica_coordinator: Option<SharedReplicaAckCoordinator>,
     /// Per-commit timeout for replica acknowledgments.  Default 5s; set
     /// from the environment's `replica_ack_timeout_ms` (see
@@ -301,8 +301,8 @@ impl Transaction {
     ///
     /// When set, a successful `commit_with_durability` blocks until the
     /// configured `ReplicaAckPolicy` is satisfied or `replica_ack_timeout`
-    /// elapses, in which case `NoxuError::InsufficientReplicas` is
-    /// returned.
+    /// elapses, in which case `NoxuError::InsufficientAcks` is returned
+    /// (the txn IS committed+durable at the master; FID-DUR-1).
     ///
     /// Closes finding F1 of the 2026 review.
     pub(crate) fn with_replica_coordinator(
@@ -504,8 +504,21 @@ impl Transaction {
                     AckWaitErrorKind::NotMaster => {
                         Some(NoxuError::ReplicaWrite)
                     }
+                    // FID-DUR-1: this wait runs AFTER the local WAL fsync of
+                    // the TxnCommit record (see write_txn_end above) -- the
+                    // transaction IS committed and durable at the master, and
+                    // its locks are released below.  An ack timeout here is JE
+                    // `InsufficientAcksException` ("the transaction has already
+                    // committed at the master"), NOT the pre-commit
+                    // `InsufficientReplicasException`.  Surface
+                    // `NoxuError::InsufficientAcks` so the caller can tell the
+                    // write is durable (`NoxuError::is_committed_at_master`)
+                    // and must NOT retry (which would double-commit).  The
+                    // pre-commit `InsufficientReplicas` is reserved for JE's
+                    // `ensureReplicasForCommit` fast-fail (GAP-DUR-2), which
+                    // fires before any logging.
                     AckWaitErrorKind::Timeout | AckWaitErrorKind::Shutdown => {
-                        Some(NoxuError::InsufficientReplicas {
+                        Some(NoxuError::InsufficientAcks {
                             required: e.needed,
                             available: e.received,
                         })

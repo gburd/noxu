@@ -35,8 +35,16 @@ RepConfig::builder("group", "node-1", "10.0.0.1")
     .build();
 ```
 
-Returns `RepError::InsufficientAcks { needed, received }` if the timeout
-expires before enough acks arrive.
+Returns `RepError::InsufficientAcks { needed, received }` from the coordinator
+if the timeout expires before enough acks arrive.  At the public API layer,
+`Transaction::commit_with_durability` surfaces this as
+`NoxuError::InsufficientAcks { required, available }` — and because the local
+`TxnCommit` is already fsynced and the txn's locks released before the ack wait,
+**the transaction IS committed and durable at the master**; too few replicas
+acknowledged within the timeout.  Check `NoxuError::is_committed_at_master()` to
+distinguish this from the pre-commit `NoxuError::InsufficientReplicas` (the
+write never happened).  This mirrors JE `InsufficientAcksException`
+("the transaction has already committed at the master").
 
 ## Local SyncPolicy
 

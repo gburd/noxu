@@ -542,6 +542,40 @@ pub enum NoxuError {
         available: u32,
     },
 
+    /// A commit on the master could not obtain enough replica
+    /// acknowledgments within the ack timeout -- but the transaction HAS
+    /// already committed and is durable at the master.
+    ///
+    /// This is distinct from [`NoxuError::InsufficientReplicas`], which is the
+    /// *pre-commit* check (JE `DurabilityQuorum.ensureReplicasForCommit`):
+    /// there the write did NOT happen and the txn is abort-only.
+    /// `InsufficientAcks` is the *post-commit* case (JE
+    /// `InsufficientAcksException`): the master already logged and fsynced the
+    /// `TxnCommit` record (recovery will replay it) and released the txn's
+    /// locks before the ack wait, so the write IS durable locally -- fewer
+    /// replicas acknowledged than the durability (ack) policy required within
+    /// the timeout.  The transaction may also have committed on one or more
+    /// replicas; the missing acks only mean that count could not be
+    /// established.  It is NOT abort-only and NOT auto-retryable
+    /// ([`NoxuError::is_retryable`] is `false`): retrying would double-apply
+    /// an already-committed transaction.  The caller can tell the txn is
+    /// committed via [`NoxuError::is_committed_at_master`].  Never produced
+    /// when the ack policy is `None`.
+    ///
+    /// Mirrors `com.sleepycat.je.rep.InsufficientAcksException`
+    /// (`InsufficientAcksException.java:21-35`), an
+    /// `OperationFailureException` with `abortOnly=false`.
+    #[error(
+        "insufficient acks: required {required}, available {available} \
+         (the transaction IS committed and durable at the master)"
+    )]
+    InsufficientAcks {
+        /// Acknowledgement quorum required by the durability policy.
+        required: u32,
+        /// Number of replica acknowledgments actually received.
+        available: u32,
+    },
+
     /// The transaction must be rolled back due to a replication state change.
     ///
 
@@ -708,6 +742,18 @@ impl NoxuError {
     /// Returns `true` if the named database was not found.
     pub fn is_database_not_found(&self) -> bool {
         matches!(self, NoxuError::DatabaseNotFound(_))
+    }
+
+    /// Returns `true` if the failed commit nevertheless committed durably at
+    /// the master (the write IS persisted; a durability policy was not met).
+    ///
+    /// Currently this is exactly [`NoxuError::InsufficientAcks`]
+    /// (JE `InsufficientAcksException`: "the transaction has already committed
+    /// at the master").  Lets a caller distinguish it from the pre-commit
+    /// [`NoxuError::InsufficientReplicas`] (abort-only; the write did not
+    /// happen) without matching the variant directly.
+    pub fn is_committed_at_master(&self) -> bool {
+        matches!(self, NoxuError::InsufficientAcks { .. })
     }
 
     /// Returns `true` for any `OperationFailureException`-equivalent.
@@ -1144,6 +1190,26 @@ mod tests {
         let e = NoxuError::InsufficientReplicas { required: 3, available: 1 };
         assert!(e.to_string().contains("required 3"));
         assert!(e.to_string().contains("available 1"));
+        assert!(
+            !e.is_committed_at_master(),
+            "pre-commit InsufficientReplicas is NOT committed-at-master"
+        );
+
+        // FID-DUR-1: InsufficientAcks is the post-commit (committed-at-master)
+        // analogue of JE InsufficientAcksException -- NOT abort-only, NOT
+        // auto-retryable.
+        let e = NoxuError::InsufficientAcks { required: 2, available: 0 };
+        assert!(e.to_string().contains("required 2"));
+        assert!(e.to_string().contains("available 0"));
+        assert!(e.to_string().contains("committed and durable at the master"));
+        assert!(
+            e.is_committed_at_master(),
+            "InsufficientAcks must report committed-at-master"
+        );
+        assert!(
+            !e.is_retryable(),
+            "a committed-at-master txn must not be auto-retryable"
+        );
 
         let e = NoxuError::RollbackRequired("ha failover".into());
         assert!(e.to_string().contains("rollback required"));

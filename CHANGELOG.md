@@ -19,11 +19,14 @@ listed in [References](#references).
 ## [7.11.1] - unreleased (release candidate)
 
 v7.11.1 is a **patch release** from v7.11.0: bug fixes only, with no on-disk
-format change (`LOG_VERSION` stays 3), no new log entry type, and no public API
-change in the nine Stable / Stable-foundational crates (`noxu`, `noxu-db`,
-`noxu-bind`, `noxu-collections`, `noxu-persist`, `noxu-xa`, `noxu-rep`,
-`noxu-util`, `noxu-config`). See the SemVer policy in
-`docs/src/contributing/semver-policy.md`.
+format change (`LOG_VERSION` stays 3), no new log entry type, and no *breaking*
+public API change in the nine Stable / Stable-foundational crates (`noxu`,
+`noxu-db`, `noxu-bind`, `noxu-collections`, `noxu-persist`, `noxu-xa`,
+`noxu-rep`, `noxu-util`, `noxu-config`).  One **additive** change is included: a
+new `NoxuError::InsufficientAcks` variant (see *API (additive)* below), which is
+patch-safe because `NoxuError` is `#[non_exhaustive]` (SemVer policy
+§"not breaking": *adding a non-exhaustive enum variant*).  See the SemVer policy
+in `docs/src/contributing/semver-policy.md`.
 
 **Upgrade strongly recommended.** This release closes several silent
 data-loss holes reachable with default settings on small or cache-pressured
@@ -160,6 +163,34 @@ user-facing scope, symptoms, and preconditions.
   TTL-expired record in the same transaction that locked it is now visible
   (repeatable read); non-owner / autocommit reads still see NOTFOUND. `count()`
   now excludes TTL-expired records (A19).
+
+- **A post-commit ack timeout reported the wrong, pre-commit error**
+  (`FID-DUR-1`): on a replicated master, when a committed transaction did not
+  collect enough replica acknowledgments within the ack timeout,
+  `Transaction::commit_with_durability` returned `NoxuError::InsufficientReplicas`
+  — the *pre-commit* error, which implies the write may never have happened. In
+  fact the `TxnCommit` record is already fsynced and the txn's locks released
+  before the ack wait: the write **is** committed and durable at the master.
+  Fixed to return the new `NoxuError::InsufficientAcks` (JE
+  `InsufficientAcksException`, "the transaction has already committed at the
+  master"); the caller can now tell the write is durable via
+  `NoxuError::is_committed_at_master()` and that it must not be auto-retried
+  (`is_retryable() == false`). JE `InsufficientAcksException.java:21-35`.
+
+### API (additive)
+
+- **New `NoxuError::InsufficientAcks { required, available }`** (`FID-DUR-1`):
+  the committed-at-master analogue of JE
+  `com.sleepycat.je.rep.InsufficientAcksException` — a replicated commit that is
+  durable at the master but obtained fewer replica acks than the durability
+  policy required within the timeout.  Distinct from the pre-commit
+  `NoxuError::InsufficientReplicas` (abort-only; the write did not happen).
+  Accompanied by a new classification helper
+  `NoxuError::is_committed_at_master()`.  Additive and patch-safe:
+  `NoxuError` is `#[non_exhaustive]`, so existing exhaustive `match`es already
+  carry a wildcard arm.  The post-commit ack-timeout path in
+  `Transaction::commit_with_durability` now returns this variant instead of
+  `InsufficientReplicas`.
 
 ### Fixed — during this release cycle (not present in v7.11.0)
 
