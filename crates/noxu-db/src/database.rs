@@ -491,14 +491,25 @@ impl Database {
     where
         F: FnOnce(Option<&Transaction>) -> Result<T>,
     {
-        // `with_auto_commit_transaction` passes (primary_txn, assoc_txn);
-        // for a `StoredContainer` the caller does ALL its work under the one
-        // primary locker (and any secondaries it maintains go through
-        // `Database::put`/`delete`, which open their own nested same-locker
-        // scope), so collapse to the primary txn.
-        self.with_auto_commit_transaction(|primary_txn, _assoc_txn| {
-            f(primary_txn)
-        })
+        if self.config.transactional {
+            // JE `beginAutoCommit` returns true: begin ONE auto-commit
+            // `Transaction`, pass it to `f`, commit once on `Ok` / abort once
+            // on `Err`.  Reuse `with_auto_commit_transaction`'s machinery; a
+            // transactional db's `assoc_txn == primary_txn == Some(&txn)`, so
+            // `f` gets the real auto txn to open its cursors under.
+            self.with_auto_commit_transaction(|_primary_txn, assoc_txn| {
+                f(assoc_txn)
+            })
+        } else {
+            // JE `beginAutoCommit` returns false on a non-transactional
+            // container: NO transaction is begun and the work runs with no
+            // txn (the DataCursor uses the thread's locker).  Call `f(None)`
+            // directly — do NOT fabricate a `Transaction`, because a
+            // `Transaction` cannot be opened on a non-transactional database
+            // (`open_cursor_in` would reject it), and `commitAutoCommit(false)`
+            // is a no-op.
+            f(None)
+        }
     }
 
     /// Durability of an auto-commit write (`txn = None`), from the
@@ -3351,6 +3362,82 @@ mod tests {
         db.put(b"k", b"v").unwrap();
         assert_eq!(db.get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
         assert!(db.delete(b"k").unwrap());
+    }
+
+    /// `run_in_auto_commit` on a TRANSACTIONAL database passes a real
+    /// auto-commit `Transaction` (`Some`) to the closure, under which a
+    /// cursor can be opened (JE `StoredContainer.beginAutoCommit` -> true).
+    #[test]
+    fn run_in_auto_commit_transactional_passes_some_txn() {
+        let dir = TempDir::new().unwrap();
+        let env = env_with(&dir, true);
+        let db = env
+            .open_database(
+                None,
+                "txnal",
+                &DatabaseConfig::new()
+                    .with_allow_create(true)
+                    .with_transactional(true),
+            )
+            .unwrap();
+        let saw = db
+            .run_in_auto_commit(|t| {
+                // A transactional container gets a real auto txn, and
+                // open_cursor_in(txn) must accept it (the bug was that a
+                // non-txnal db also got Some and rejected it).
+                assert!(t.is_some(), "transactional db must pass Some(txn)");
+                let tt = t.unwrap();
+                let mut c = db.open_cursor_in(tt, None)?;
+                c.put(
+                    &DatabaseEntry::from_bytes(b"k"),
+                    &DatabaseEntry::from_bytes(b"v"),
+                    crate::put::Put::Overwrite,
+                )?;
+                c.close()?;
+                Ok(true)
+            })
+            .unwrap();
+        assert!(saw);
+        // The single auto-commit scope committed the write.
+        assert_eq!(db.get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
+    }
+
+    /// `run_in_auto_commit` on a NON-transactional database passes `None`
+    /// (JE `StoredContainer.beginAutoCommit` -> false: no txn), so the
+    /// closure opens an auto-commit cursor (which a non-txnal db accepts).
+    /// Passing `Some` here was the contract bug: `open_cursor_in` rejects a
+    /// `Transaction` on a non-transactional database.
+    #[test]
+    fn run_in_auto_commit_non_transactional_passes_none() {
+        let dir = TempDir::new().unwrap();
+        let env = env_with(&dir, true);
+        let db = env
+            .open_database(
+                None,
+                "nontxnal",
+                &DatabaseConfig::new().with_allow_create(true),
+            )
+            .unwrap();
+        let saw = db
+            .run_in_auto_commit(|t| {
+                assert!(
+                    t.is_none(),
+                    "non-transactional db must pass None (JE ThreadLocker)"
+                );
+                // An auto-commit cursor (None) is accepted on a non-txnal db;
+                // open_cursor_in(Some(txn)) would have been rejected.
+                let mut c = db.open_cursor(None)?;
+                c.put(
+                    &DatabaseEntry::from_bytes(b"k"),
+                    &DatabaseEntry::from_bytes(b"v"),
+                    crate::put::Put::Overwrite,
+                )?;
+                c.close()?;
+                Ok(true)
+            })
+            .unwrap();
+        assert!(saw);
+        assert_eq!(db.get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
     }
 
     /// Every WRITE entry point must refuse a read-only handle. A write that

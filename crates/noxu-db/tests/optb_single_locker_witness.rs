@@ -182,7 +182,7 @@ fn child_put(home: &Path) -> ! {
     env.checkpoint(Some(&CheckpointConfig::new().with_force(true))).unwrap();
     std::fs::write(home.join("ready"), b"").unwrap();
     // Auto-commit put: the engine aborts at the armed hook.
-    pri.lock().put(b"zz-after".to_vec(), b"zzzzzzzzzz".to_vec()).unwrap();
+    pri.lock().put(b"zz-after", b"zzzzzzzzzz").unwrap();
     std::fs::write(home.join("NOHOOK"), b"").unwrap();
     env.close().unwrap();
     std::process::exit(0);
@@ -226,7 +226,7 @@ fn child_put2(home: &Path) -> ! {
     let (env, pri, _sec) = open_pri_sec(home);
     env.checkpoint(Some(&CheckpointConfig::new().with_force(true))).unwrap();
     std::fs::write(home.join("ready"), b"").unwrap();
-    pri.lock().put(b"zz-after".to_vec(), b"zzzzzzzzzz".to_vec()).unwrap();
+    pri.lock().put(b"zz-after", b"zzzzzzzzzz").unwrap();
     std::fs::write(home.join("NOHOOK"), b"").unwrap();
     env.close().unwrap();
     std::process::exit(0);
@@ -363,7 +363,7 @@ fn c_secondary_error_aborts_primary_write() {
     // Insert whose secondary key ("BADKEY-99") is NOT in the foreign db:
     // secondary maintenance must raise ForeignConstraintViolation, and the
     // single-locker auto-txn must abort -> the PRIMARY write is undone too.
-    let bad = pri.lock().put(b"p1".to_vec(), b"BADKEY-99ignored".to_vec());
+    let bad = pri.lock().put(b"p1", b"BADKEY-99ignored");
     eprintln!("OPTB-C: put result = {bad:?}");
     assert!(bad.is_err(), "FK-violating secondary insert must fail the put");
 
@@ -378,7 +378,7 @@ fn c_secondary_error_aborts_primary_write() {
          primary is still present: {p:?}"
     );
     // A good insert still works.
-    pri.lock().put(b"p2".to_vec(), b"GOODKEY-1ignored".to_vec()).unwrap();
+    pri.lock().put(b"p2", b"GOODKEY-1ignored").unwrap();
     assert!(pri.lock().get(b"p2").unwrap().is_some());
 
     sec.close().unwrap();
@@ -425,7 +425,7 @@ fn e_fsync_count_is_one_per_auto_commit_put_with_two_secondaries() {
     let n = 200u32;
     // Warm up (create files) before arming so file-creation flushes don't
     // skew the count.
-    pri.lock().put(b"warm".to_vec(), b"warmwarmwarm".to_vec()).unwrap();
+    pri.lock().put(b"warm", b"warmwarmwarm").unwrap();
     fsync_probe::arm(0);
     for i in 0..n {
         pri.lock()
