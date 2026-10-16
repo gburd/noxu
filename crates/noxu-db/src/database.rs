@@ -313,11 +313,11 @@ impl Database {
     /// LN (primary + secondaries) carries this txn's id, so after a crash
     /// recovery sees ALL of them (if the `TxnCommit` is durable) or NONE —
     /// closing the primary↔secondary atomicity gap.  For a non-transactional
-    /// database the synthetic `Transaction` wraps a `begin_auto_txn` `Txn`
-    /// (auto-flagged: no `TxnCommit`, LN logged in the `txn_id = 0` form) so
-    /// the primary write's lock is still managed/released, but there is no
-    /// atomic unit — exactly the old auto-commit behaviour and JE's
-    /// `ThreadLocker` semantics.
+    /// database the same `begin_txn` inner `Txn` manages/releases the primary
+    /// write's lock, and the OUTER `Transaction` honours the db's auto-commit
+    /// durability (so `COMMIT_NO_SYNC` does NOT fsync); but secondaries /
+    /// triggers run auto-commit (`assoc_txn = None`), so there is no atomic
+    /// unit — JE's `ThreadLocker` semantics.
     ///
     /// On any error `op` returns, the transaction aborts once, undoing the
     /// primary (and, for a transactional db, every secondary) write
@@ -335,17 +335,21 @@ impl Database {
         let transactional = self.config.transactional;
         let is_replicated = self.db_impl.read().is_replicated();
 
-        // Build the inner `Txn`:
-        //  * transactional   -> `begin_txn` (real Txn; outer Transaction owns
-        //                        the single TxnCommit + fsync),
-        //  * non-transactional -> `begin_auto_txn` (auto Txn; no TxnCommit,
-        //                        LN logged txn_id=0; just manages/releases the
-        //                        primary write lock — JE ThreadLocker).
-        let mut inner = if transactional {
+        // Build the inner `Txn` via `EnvironmentImpl::begin_txn` for BOTH the
+        // transactional and non-transactional cases.  `begin_txn` attaches
+        // the `LogManager` (when the env has a WAL) and sets
+        // `suppress_own_end_frame`, so the OUTER `Transaction` owns the
+        // single `TxnCommit` frame AND the single fsync with the correct
+        // durability — the inner `commit()` writes nothing and fsyncs
+        // nothing.  (A `begin_auto_txn` Txn, by contrast, ignores
+        // `suppress_own_end_frame` and would force a `CommitSync` fsync via
+        // the no-arg `Txn::commit` the outer calls, breaking
+        // `COMMIT_NO_SYNC`.)  A truly non-transactional ENV has no
+        // `LogManager`, so `begin_txn` yields a Txn without one and the
+        // commit neither logs nor fsyncs — only lock release happens.
+        let mut inner = {
             let env = self.env_impl.lock();
             env.begin_txn().map_err(NoxuError::from)?
-        } else {
-            self.txn_manager.begin_auto_txn(self.log_manager.clone())
         };
         // Local-write defaults to true on a non-replicated database (nothing
         // to replicate); on a replicated database it replicates normally —
