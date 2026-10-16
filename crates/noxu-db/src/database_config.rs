@@ -419,14 +419,22 @@ impl DatabaseConfig {
 
     /// Sets whether this database participates in replication.
     ///
-    /// Takes effect only when the owning environment is itself replicated
-    /// (`noxu-rep`): a non-replicated environment never marks a database
-    /// replicated regardless of this value.  In a replicated environment this
-    /// resolves `DatabaseImpl::is_replicated()`, which governs JE's
-    /// `allowReplicaWrite` / `mustGenerateVLSN` replica write-screening
-    /// (`DatabaseConfig.setReplicated(false)` is JE's way to keep a database
-    /// local in a replicated group; a replica MAY write to and create such a
-    /// database).  Defaults to `true`.
+    /// NOTE (7.11.x): in a replicated environment every user database is
+    /// treated as replicated for write-screening regardless of this flag --
+    /// `replicated = false` (a local DB in a replicated group) is NOT yet
+    /// supported, because it needs JE's NO_REPLICATE LN/commit path and the
+    /// separate negative local db-id space Noxu has not ported.  On a
+    /// non-replicated environment the flag has no observable effect.  See
+    /// `local-db-design.md` for the full-support plan.  Defaults to `true`.
+    #[deprecated(
+        note = "not yet supported in a replicated environment: `replicated = false` \
+                (a non-replicated DB in a replicated group) requires JE's \
+                NO_REPLICATE LN/commit path and separate local db-id space, \
+                which Noxu has not yet ported, so a replicated environment \
+                treats every user database as replicated.  See \
+                local-db-design.md.  On a non-replicated environment this \
+                setting has no observable effect either way"
+    )]
     pub fn set_replicated(&mut self, replicated: bool) -> &mut Self {
         self.replicated = replicated;
         self
@@ -434,6 +442,15 @@ impl DatabaseConfig {
 
     /// Builder-style method to set replicated.  See
     /// [`set_replicated`](Self::set_replicated).
+    #[deprecated(
+        note = "not yet supported in a replicated environment: `replicated = false` \
+                (a non-replicated DB in a replicated group) requires JE's \
+                NO_REPLICATE LN/commit path and separate local db-id space, \
+                which Noxu has not yet ported, so a replicated environment \
+                treats every user database as replicated.  See \
+                local-db-design.md.  On a non-replicated environment this \
+                setting has no observable effect either way"
+    )]
     pub fn with_replicated(mut self, replicated: bool) -> Self {
         self.replicated = replicated;
         self

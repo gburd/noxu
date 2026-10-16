@@ -1544,15 +1544,19 @@ impl CursorImpl {
         }
         // Step 2 -- replica screen (JE `ReadonlyTxn.lockInternal` takes a
         // write lock only through `disallowReplicaWrite` when
-        // `!database.allowReplicaWrite()`, ReadonlyTxn.java:81-85), gated on
-        // `allowReplicaWrite() == !isReplicated() || dbType == NAME`
-        // (DatabaseImpl.java:785).  A write to a NON-replicated (local) DB is
-        // allowed on a replica -- NOT unconditional.
+        // `!database.allowReplicaWrite()`, ReadonlyTxn.java:81-85).  The
+        // JE predicate is `allowReplicaWrite() == !isReplicated() || dbType
+        // == NAME` (DatabaseImpl.java:785), which would permit a local DB
+        // write.  7.11.x SAFETY GATE: use `allow_replica_write_7_11_x()`
+        // (internal DBs only) so a replica refuses EVERY user-DB write,
+        // including to a non-replicated user DB, until the full local-DB
+        // port lands (`local-db-design.md`).  The screen is armed only on a
+        // replica, so this is exactly "a replica originates no user write."
         if self
             .replica_write_screen
             .as_ref()
             .is_some_and(|f| f.load(Ordering::Relaxed))
-            && !self.db_impl.read().allow_replica_write()
+            && !self.db_impl.read().allow_replica_write_7_11_x()
         {
             return Err(DbiError::ReplicaWrite);
         }

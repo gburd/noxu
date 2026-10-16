@@ -2246,10 +2246,32 @@ impl EnvironmentImpl {
         // `open_database_inner`), and internal databases are created during
         // env open before any replica role is assumed, so this cannot screen
         // the replica's own replay or an internal DB.
-        let new_db_replicated = self.is_replicated() && config.replicated;
+        //
+        // JE screens the create via `DbTree.doCreateDb` ->
+        // `checkReplicaWrite(getOperationRepContext(CREATE))`, which throws
+        // only when the NEW DB `mustGenerateVLSN()` == `isReplicated()`
+        // (DbTree.java:577-583, 874-880).  JE therefore PERMITS creating a
+        // non-replicated DB on a replica.
+        //
+        // SAFETY GATE (7.11.x): Noxu lacks the machinery that makes a local
+        // DB on a replica safe -- JE's NO_REPLICATE LN/commit path (so a
+        // local DB takes no VLSN) and the SEPARATE negative local db-id
+        // space (`DbTree.getNextLocalDbId` positive vs
+        // `getNextReplicatedDbId` negative, DbTree.java:205-218,388-423).
+        // Noxu has ONE positive `next_db_id`, so a local DB created on a
+        // replica would be a master-invisible divergence that would collide
+        // on the single id space once DB-create replication is wired.  So
+        // until local DBs are fully ported (`local-db-design.md`) a replica
+        // refuses to CREATE ANY user DB: the create here is always a
+        // `DbType::User` (internal DBs are made at env open, before any
+        // replica role), so gate on `is_replicated()` (the env is a
+        // replicated group) rather than on the per-DB bit, which keeps the
+        // DB's own `is_replicated()` honest for `config.replicated=false`.
+        // This is the conservative 5f607fcf behaviour expressed through the
+        // JE create-screen point.
         if recovered_db_id.is_none()
             && self.is_replica_write_screened()
-            && new_db_replicated
+            && self.is_replicated()
         {
             return Err(DbiError::ReplicaWrite);
         }
@@ -2306,10 +2328,18 @@ impl EnvironmentImpl {
 
         let mut db_impl =
             DatabaseImpl::new(db_id, name.to_string(), DbType::User, config);
-        // The config's `replicated` (default `true`) only takes effect
-        // when the owning environment is itself replicated; a plain
-        // environment never marks a database replicated regardless of the
-        // config value.
+        // The config's `replicated` (default `true`) only takes effect when
+        // the owning environment is itself replicated; a plain environment
+        // never marks a database replicated regardless of the config value.
+        // The per-DB bit is kept HONEST here (a `config.replicated == false`
+        // DB reports `is_replicated() == false`) so the local-write / config
+        // -mismatch matrix at the cursor layer stays correct.  The 7.11.x
+        // safety gate -- a replica refuses writes/creates to a non-replicated
+        // user DB too, because Noxu cannot yet keep it local safely -- lives
+        // in the SCREEN sites (the create screen above gates on
+        // `is_replicated()`; the data/DDL screens treat a replicated env's
+        // user DBs as screened), NOT in this stored bit.  See
+        // `local-db-design.md`.
         if self.is_replicated() {
             db_impl.set_replicated(config.replicated);
         }
@@ -2897,27 +2927,36 @@ impl EnvironmentImpl {
     /// `lockNameLN` and then screens with
     /// `checkReplicaWrite(locker, dbImpl.getOperationRepContext(op))`, whose
     /// `mustGenerateVLSN()` is true iff `dbImpl.isReplicated()`
-    /// (DbTree.java:907-931, DatabaseImpl.getOperationRepContext).  So a DDL
-    /// op on a NON-replicated DB is permitted on a replica, exactly as a data
-    /// write is.
+    /// (DbTree.java:907-931, DatabaseImpl.getOperationRepContext).
+    ///
+    /// SAFETY GATE (7.11.x): a replicated environment marks EVERY user DB
+    /// replicated (`open_database_inner` forces `set_replicated(true)`),
+    /// because Noxu lacks JE's NO_REPLICATE path + separate negative local
+    /// db-id space that make a non-replicated DB on a replica safe.  So on a
+    /// replica EVERY user-DB DDL op is screened, not only those on a DB the
+    /// caller marked replicated.  Upgrade path: `local-db-design.md`.
     ///
     /// When the target `DatabaseImpl` is live in `db_map` we read its
-    /// `allow_replica_write()` directly.  When it is not resident (recovered
-    /// but not opened this session), the only writes a replica originates to
-    /// such a name are DDL ops on an existing user DB; a replicated env marks
-    /// its user DBs replicated (see `open_database_inner`), so we fall back to
-    /// `!is_replicated()` (env not replicated -> always writable; env
-    /// replicated -> screen a replicated user DB), which matches
-    /// `DatabaseImpl::allow_replica_write` for a resolved replicated user DB.
-    /// A name absent from `name_map` is a non-existent DB; it is not screened
-    /// here (the caller surfaces `DatabaseNotFound`).
+    /// `allow_replica_write()` directly (a replicated-env user DB returns
+    /// `false`).  When it is not resident (recovered but not opened this
+    /// session), fall back to `!is_replicated()` (env not replicated ->
+    /// always writable; env replicated -> screen it), which matches the
+    /// forced-replicated user DB.  A name absent from `name_map` is a
+    /// non-existent DB; it is not screened here (the caller surfaces
+    /// `DatabaseNotFound`).
     pub fn allow_replica_write_for_name(&self, name: &str) -> bool {
         let Some(db_id) = self.name_map.read().get(name).copied() else {
             return true;
         };
         if let Some(db) = self.db_map.read().get(&db_id) {
-            return db.read().allow_replica_write();
+            // 7.11.x safety gate: internal DBs only (see
+            // `DatabaseImpl::allow_replica_write_7_11_x`).
+            return db.read().allow_replica_write_7_11_x();
         }
+        // Not resident: a DDL op names an existing USER db (internal DBs are
+        // never remove/truncate/rename targets), so on a replicated env it
+        // is screened under the 7.11.x gate; on a non-replicated env nothing
+        // is screened.
         !self.is_replicated()
     }
 
@@ -4676,20 +4715,24 @@ mod tests {
     #[test]
     fn test_open_database_create_screened_on_replica() {
         let (_dir, env) = make_env(false);
-        // Model a replicated environment so a `replicated(true)` config
-        // actually yields a replicated DB (JE: replicated iff env
-        // replicated AND config requests it).
+        // Model a replicated environment.  7.11.x SAFETY GATE: a
+        // replicated env marks EVERY user DB replicated
+        // (`open_database_inner` forces `set_replicated(true)`), because
+        // Noxu lacks JE's NO_REPLICATE path + separate local db-id space.
+        // So a replica refuses to CREATE any user DB, and the
+        // caller's `set_replicated(false)` has no effect here.  Upgrade
+        // path: `local-db-design.md`.
         env.set_replicated(true);
-        let mut rep_cfg = DatabaseConfig::new();
-        rep_cfg.set_allow_create(true);
-        rep_cfg.set_replicated(true);
-        let mut local_cfg = DatabaseConfig::new();
-        local_cfg.set_allow_create(true);
-        local_cfg.set_replicated(false);
+        let mut cfg = DatabaseConfig::new();
+        cfg.set_allow_create(true);
+        let mut would_be_local = DatabaseConfig::new();
+        would_be_local.set_allow_create(true);
+        would_be_local.set_replicated(false);
 
-        // Create an existing replicated DB while unscreened (master).
-        let existing = env.open_database("existing", &rep_cfg).unwrap();
+        // Create an existing DB while unscreened (master).
+        let existing = env.open_database("existing", &cfg).unwrap();
         assert_eq!(existing.read().get_name(), "existing");
+        // In a replicated env a user DB is forced replicated.
         assert!(existing.read().is_replicated());
         drop(existing);
 
@@ -4697,9 +4740,8 @@ mod tests {
         env.set_replica_write_screen(true);
         assert!(env.is_replica_write_screened());
 
-        // Opening the EXISTING replicated DB on a replica must still
-        // succeed (a pure NameLN read).
-        let reopen = env.open_database("existing", &rep_cfg);
+        // Opening the EXISTING DB on a replica still succeeds (NameLN read).
+        let reopen = env.open_database("existing", &cfg);
         assert!(
             reopen.is_ok(),
             "opening an existing DB on a replica must succeed, got {:?}",
@@ -4707,57 +4749,37 @@ mod tests {
         );
         drop(reopen);
 
-        // Creating a NEW *replicated* DB on a replica must be refused with
-        // ReplicaWrite (JE DbTree.checkReplicaWrite -> mustGenerateVLSN).
-        let created = env.open_database("brand_new", &rep_cfg);
-        assert!(
-            matches!(created, Err(DbiError::ReplicaWrite)),
-            "creating a NEW replicated DB on a replica must return \
-             ReplicaWrite, got {:?}",
-            created.map(|_| "Ok(db)")
-        );
-        assert!(
-            !env.get_database_names().iter().any(|n| n == "brand_new"),
-            "a screened create must not register the name"
-        );
+        // Creating a NEW user DB on a replica is refused with ReplicaWrite
+        // (JE DbTree.checkReplicaWrite -> mustGenerateVLSN), both the
+        // plain and the would-be-local config, and both the plain and
+        // transactional create paths.
+        for (name, c, txn_id) in [
+            ("brand_new", &cfg, None),
+            ("brand_new_local", &would_be_local, None),
+            ("txn_new", &cfg, Some(42u64)),
+            ("txn_new_local", &would_be_local, Some(43u64)),
+        ] {
+            let created = match txn_id {
+                None => env.open_database(name, c).map(|_| ()),
+                Some(id) => {
+                    env.open_database_transactional(name, c, id).map(|_| ())
+                }
+            };
+            assert!(
+                matches!(created, Err(DbiError::ReplicaWrite)),
+                "creating a NEW user DB '{name}' on a replica must return \
+                 ReplicaWrite, got {:?}",
+                created.map(|_| "Ok(db)")
+            );
+            assert!(
+                !env.get_database_names().iter().any(|n| n == name),
+                "a screened create must not register '{name}'"
+            );
+        }
 
-        // The transactional create path is screened too (replicated DB).
-        let txn_create =
-            env.open_database_transactional("txn_new", &rep_cfg, 42);
-        assert!(
-            matches!(txn_create, Err(DbiError::ReplicaWrite)),
-            "transactional create of a NEW replicated DB on a replica must \
-             return ReplicaWrite, got {:?}",
-            txn_create.map(|_| "Ok(db)")
-        );
-        assert!(
-            !env.get_database_names().iter().any(|n| n == "txn_new"),
-            "a screened transactional create must not register the name"
-        );
-
-        // Creating a NEW *non-replicated* DB on a replica is ALLOWED (JE:
-        // the CREATE repContext does not generate a VLSN for a local DB).
-        let local_new = env.open_database("local_new", &local_cfg);
-        assert!(
-            local_new.is_ok(),
-            "creating a NON-replicated DB on a replica must be Ok, got {:?}",
-            local_new.err()
-        );
-        assert!(!local_new.unwrap().read().is_replicated());
-        // And its transactional-create variant too.
-        let local_txn =
-            env.open_database_transactional("local_txn", &local_cfg, 43);
-        assert!(
-            local_txn.is_ok(),
-            "transactional create of a NON-replicated DB on a replica must \
-             be Ok, got {:?}",
-            local_txn.err()
-        );
-
-        // Clearing the screen (become_master) re-enables replicated
-        // creation.
+        // Clearing the screen (become_master) re-enables creation.
         env.set_replica_write_screen(false);
-        let now_ok = env.open_database("brand_new", &rep_cfg);
+        let now_ok = env.open_database("brand_new", &cfg);
         assert!(
             now_ok.is_ok(),
             "after clearing the screen, creating the DB must succeed, got \

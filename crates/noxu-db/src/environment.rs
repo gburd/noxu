@@ -3899,11 +3899,11 @@ mod tests {
         env.close().unwrap();
     }
 
-    /// Test helper: a REPLICATED environment + the shared `EnvironmentImpl`
-    /// marked replicated, so `DatabaseConfig::with_replicated(true)` databases
-    /// are actually replicated (JE: a DB is replicated iff the env is
-    /// replicated AND the config requests it).  Arming the replica-write screen
-    /// on top then models a replica node.
+    /// Test helper: a REPLICATED environment with the screen initially off.
+    /// `env_impl.set_replicated(true)` makes `is_replicated()` true, so every
+    /// user DB opened here is treated as replicated for write-screening
+    /// (7.11.x safety gate; see `local-db-design.md`).  Arming the
+    /// replica-write screen on top then models a replica node.
     fn replicated_env() -> (TempDir, Environment) {
         let (tmp, config) = temp_env_config();
         let env = Environment::open(config).unwrap();
@@ -3911,272 +3911,189 @@ mod tests {
         (tmp, env)
     }
 
-    /// GAP-REPLAY-3 WITNESS (JE-exact): on a REPLICA, a user write to a
-    /// *replicated* database is refused with `NoxuError::ReplicaWrite` (JE
-    /// `ReadonlyTxn.lockInternal` -> `disallowReplicaWrite` ->
-    /// `ReplicaWriteException`, screened when `!database.allowReplicaWrite()`);
-    /// reads still succeed.  A write to a NON-replicated (local) database is
-    /// permitted on a replica (`allowReplicaWrite()` is true for a
-    /// non-replicated DB, DatabaseImpl.java:785) when the write uses a
-    /// local-write locker (JE auto-commit for a non-replicated DB uses a
-    /// local-write locker; `Database::with_auto_txn` sets `local_write =
-    /// !is_replicated`).
+    /// GAP-REPLAY-3 WITNESS: on a REPLICA, a user write to a user database is
+    /// refused with `NoxuError::ReplicaWrite` (JE
+    /// `ReadonlyTxn.lockInternal` -> `disallowReplicaWrite`); reads still
+    /// succeed; clearing the screen (become_master) re-enables writes.
     ///
-    /// RED at 5f607fcf (the previous tip): the screen fired *unconditionally*
-    /// when armed, so a write to a NON-replicated DB on a replica was wrongly
-    /// refused with ReplicaWrite (a deviation from JE).  GREEN after: only the
-    /// replicated-DB write is refused.
+    /// 7.11.x SAFETY GATE: in a replicated env every user DB is treated as
+    /// replicated (`!allow_replica_write()` is true for it), so a replica
+    /// refuses ALL local-origin user writes — including to a DB opened with
+    /// `with_replicated(false)` — because Noxu lacks the JE machinery
+    /// (NO_REPLICATE path, separate local db-id space) that makes a local DB
+    /// on a replica safe.  See `local-db-design.md`.
     #[test]
+    #[allow(deprecated)] // with_replicated: exercising the 7.11.x safety gate
     fn gap_replay_3_replica_screens_user_writes() {
         let (_tmp, env) = replicated_env();
-        let rep_cfg = DatabaseConfig::new()
+        let cfg = DatabaseConfig::new()
             .with_allow_create(true)
-            .with_transactional(true)
-            .with_replicated(true);
+            .with_transactional(true);
+        // A DB the caller TRIED to mark local; the replicated env still treats
+        // it as replicated (safety gate).
         let local_cfg = DatabaseConfig::new()
             .with_allow_create(true)
             .with_transactional(true)
             .with_replicated(false);
 
-        let repdb = env.open_database(None, "repdb", &rep_cfg).unwrap();
+        let db = env.open_database(None, "repdb", &cfg).unwrap();
         let localdb = env.open_database(None, "localdb", &local_cfg).unwrap();
 
-        // Writes while MASTER (screen off) succeed on both.
-        repdb.put(b"k", b"v").unwrap();
+        // Writes while MASTER (screen off) succeed.
+        db.put(b"k", b"v").unwrap();
         localdb.put(b"lk", b"lv").unwrap();
-        assert_eq!(repdb.get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
+        assert_eq!(db.get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
 
-        // Flip the replica-write screen on, exactly as become_replica does.
+        // Flip the replica-write screen on, as become_replica does.
         env.env_impl_arc_for_test().lock().set_replica_write_screen(true);
 
-        // A write to the REPLICATED DB is refused with ReplicaWrite.
-        let w = repdb.put(b"k2", b"v2");
+        // Every user write is refused with ReplicaWrite — including to the
+        // would-be-local DB (safety gate: a replica originates no user write).
+        let w = db.put(b"k2", b"v2");
         assert!(
             matches!(w, Err(NoxuError::ReplicaWrite)),
-            "a write to a replicated DB on a replica must return ReplicaWrite, \
-             got {w:?}"
+            "a write on a replica must return ReplicaWrite, got {w:?}"
         );
-        let d = repdb.delete(b"k");
+        let d = db.delete(b"k");
         assert!(
             matches!(d, Err(NoxuError::ReplicaWrite)),
-            "a delete on a replicated DB on a replica must return ReplicaWrite, \
-             got {d:?}"
+            "a delete on a replica must return ReplicaWrite, got {d:?}"
         );
-
-        // A write to the NON-replicated DB is ALLOWED on a replica (JE:
-        // allowReplicaWrite() is true for a local DB).  The auto-commit path
-        // uses a local-write locker for a non-replicated DB.
         let lw = localdb.put(b"lk2", b"lv2");
         assert!(
-            lw.is_ok(),
-            "a write to a NON-replicated DB on a replica must be Ok, got {lw:?}"
+            matches!(lw, Err(NoxuError::ReplicaWrite)),
+            "a write to a would-be-local DB on a replica must ALSO return \
+             ReplicaWrite under the 7.11.x safety gate, got {lw:?}"
         );
-        assert_eq!(localdb.get(b"lk2").unwrap().as_deref(), Some(&b"lv2"[..]));
-        assert!(localdb.delete(b"lk").is_ok());
 
-        // Reads on the replicated DB still work.
-        assert_eq!(repdb.get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
+        // Reads still work.
+        assert_eq!(db.get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
 
-        // Clearing the screen (become_master) re-enables replicated writes.
+        // Clearing the screen (become_master) re-enables writes.
         env.env_impl_arc_for_test().lock().set_replica_write_screen(false);
-        repdb.put(b"k3", b"v3").unwrap();
-        assert_eq!(repdb.get(b"k3").unwrap().as_deref(), Some(&b"v3"[..]));
+        db.put(b"k3", b"v3").unwrap();
+        assert_eq!(db.get(b"k3").unwrap().as_deref(), Some(&b"v3"[..]));
 
-        drop(repdb);
+        drop(db);
         drop(localdb);
         env.close().unwrap();
     }
 
-    /// GAP-REPLAY-3 WITNESS (JE-exact): a *local-write* txn touching a
-    /// *replicated* database on a replica is refused as a configuration
-    /// mismatch, NOT as a ReplicaWriteException.  JE: `Cursor.checkUpdatesAllowed`
-    /// -> `updatesProhibitedException` throws `UnsupportedOperationException`
-    /// ("the Database is replicated and Transaction is configured as
-    /// local-write") when `dbImpl.isReplicated() && locker.isLocalWrite()`
-    /// (Cursor.java:5357), and this check runs BEFORE the `lockInternal`
-    /// replica screen.  Noxu surfaces that mismatch as
-    /// `NoxuError::OperationNotAllowed` (via `DbiError::OperationFailed`), not
-    /// `ReplicaWrite`.
+    /// GAP-REPLAY-3 WITNESS: the screen is driven by the screen FLAG (armed
+    /// only on a replica by `become_replica`), not by anything a standalone
+    /// environment ever sets.  A standalone (never-replicated) env never arms
+    /// the screen, so a user write always succeeds -- the common no-
+    /// replication case is unaffected.  The predicate retains its JE shape
+    /// (`DatabaseImpl::allow_replica_write` = `!is_replicated() || dbType ==
+    /// NAME`); the 7.11.x gate narrows it to
+    /// `allow_replica_write_7_11_x` (internal DBs only) ONLY when the screen
+    /// is armed, which only a replica does.  This pins that the standalone
+    /// write path carries no replica screening.
     #[test]
-    fn gap_replay_3_local_write_txn_on_replicated_db_is_config_mismatch() {
-        let (_tmp, env) = replicated_env();
-        let rep_cfg = DatabaseConfig::new()
-            .with_allow_create(true)
-            .with_transactional(true)
-            .with_replicated(true);
-        let repdb = env.open_database(None, "repdb", &rep_cfg).unwrap();
-
-        env.env_impl_arc_for_test().lock().set_replica_write_screen(true);
-
-        // A local-write txn against a replicated DB: config mismatch, surfaced
-        // as OperationNotAllowed (JE UnsupportedOperationException), NOT
-        // ReplicaWrite.
-        let txn = env
-            .begin_transaction(Some(
-                &crate::TransactionConfig::new().with_local_write(true),
-            ))
-            .unwrap();
-        let w = repdb.put_in(&txn, b"k", b"v");
+    fn gap_replay_3_standalone_env_never_screens() {
+        let (_tmp, config) = temp_env_config(); // standalone (non-rep) env
+        let env = Environment::open(config).unwrap();
         assert!(
-            matches!(w, Err(NoxuError::OperationNotAllowed(_))),
-            "a local-write txn on a replicated DB must be a config mismatch \
-             (OperationNotAllowed), not ReplicaWrite, got {w:?}"
+            !env.env_impl_arc_for_test().lock().is_replicated(),
+            "a plain Environment is not replicated"
         );
-        let _ = txn.abort();
-
-        drop(repdb);
+        assert!(
+            !env.env_impl_arc_for_test().lock().is_replica_write_screened(),
+            "a standalone env never arms the replica-write screen"
+        );
+        let cfg = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
+        let db = env.open_database(None, "standalone", &cfg).unwrap();
+        // Writes and creates always succeed on a standalone env.
+        assert!(db.put(b"k", b"v").is_ok());
+        assert!(db.delete(b"k").is_ok());
+        drop(db);
+        assert!(env.truncate_database(None, "standalone").is_ok());
         env.close().unwrap();
     }
 
-    /// GAP-REPLAY-3 WITNESS (JE-exact): a *local-write* txn on a NON-replicated
-    /// database is allowed on a replica.  JE: `checkUpdatesAllowed` passes
-    /// (`!isReplicated() && isLocalWrite()` -> allowed) and the `lockInternal`
-    /// replica screen passes (`allowReplicaWrite()` is true for a local DB).
+    /// GAP-REPLAY-3 (merge-prep) WITNESS: DDL (truncate / remove / rename) of a
+    /// user database on a REPLICA is refused with `NoxuError::ReplicaWrite`.
+    /// JE screens the DDL NameLN path via `DbTree.lockNameLN` ->
+    /// `checkReplicaWrite(getOperationRepContext(op))` gated on the target DB's
+    /// replicated status; the 7.11.x safety gate treats every user DB as
+    /// replicated, so all user-DB DDL on a replica is refused.
     #[test]
-    fn gap_replay_3_local_write_txn_on_non_replicated_db_ok() {
-        let (_tmp, env) = replicated_env();
-        let local_cfg = DatabaseConfig::new()
-            .with_allow_create(true)
-            .with_transactional(true)
-            .with_replicated(false);
-        let localdb = env.open_database(None, "localdb", &local_cfg).unwrap();
-
-        env.env_impl_arc_for_test().lock().set_replica_write_screen(true);
-
-        let txn = env
-            .begin_transaction(Some(
-                &crate::TransactionConfig::new().with_local_write(true),
-            ))
-            .unwrap();
-        let w = localdb.put_in(&txn, b"k", b"v");
-        assert!(
-            w.is_ok(),
-            "a local-write txn on a NON-replicated DB on a replica must be Ok, \
-             got {w:?}"
-        );
-        txn.commit().unwrap();
-        assert_eq!(localdb.get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
-
-        drop(localdb);
-        env.close().unwrap();
-    }
-
-    /// GAP-REPLAY-3 (merge-prep) WITNESS (JE-exact): DDL (truncate / remove /
-    /// rename) of a *replicated* database on a REPLICA is refused with
-    /// `NoxuError::ReplicaWrite`, while DDL of a NON-replicated database is
-    /// allowed.  JE screens the DDL NameLN path via `DbTree.lockNameLN` ->
-    /// `checkReplicaWrite(locker, dbImpl.getOperationRepContext(op))`, whose
-    /// `mustGenerateVLSN()` is true iff the target DB `isReplicated()`
-    /// (DbTree.java:907-931).
-    ///
-    /// RED at 5f607fcf: the DDL screen fired unconditionally, so DDL of a
-    /// NON-replicated DB on a replica was wrongly refused.  GREEN after: only
-    /// the replicated-DB DDL is refused.
-    #[test]
+    #[allow(deprecated)]
     fn gap_replay_3_merge_prep_ddl_screened_on_replica() {
         let (_tmp, env) = replicated_env();
-        let rep_cfg = DatabaseConfig::new()
+        let cfg = DatabaseConfig::new()
             .with_allow_create(true)
-            .with_transactional(true)
-            .with_replicated(true);
+            .with_transactional(true);
+        let repdb = env.open_database(None, "ddldb", &cfg).unwrap();
+        repdb.put(b"k", b"v").unwrap();
+        drop(repdb);
+        // A would-be-local DB is still screened for DDL under the safety gate.
         let local_cfg = DatabaseConfig::new()
             .with_allow_create(true)
             .with_transactional(true)
             .with_replicated(false);
-        let repdb = env.open_database(None, "ddldb", &rep_cfg).unwrap();
-        repdb.put(b"k", b"v").unwrap();
-        drop(repdb);
         let localdb = env.open_database(None, "localddl", &local_cfg).unwrap();
         localdb.put(b"k", b"v").unwrap();
         drop(localdb);
 
-        // Arm the replica-write screen (as become_replica now does).
         env.env_impl_arc_for_test().lock().set_replica_write_screen(true);
 
-        // DDL on the REPLICATED DB must be refused with ReplicaWrite.
-        assert!(
-            matches!(
-                env.truncate_database(None, "ddldb"),
-                Err(NoxuError::ReplicaWrite)
+        for (op, res) in [
+            ("truncate", env.truncate_database(None, "ddldb").map(|_| ())),
+            ("rename", env.rename_database(None, "ddldb", "ddldb2")),
+            ("remove", env.remove_database(None, "ddldb")),
+            (
+                "truncate-local",
+                env.truncate_database(None, "localddl").map(|_| ()),
             ),
-            "truncate of a replicated DB on a replica must return ReplicaWrite"
-        );
-        assert!(
-            matches!(
-                env.rename_database(None, "ddldb", "ddldb2"),
-                Err(NoxuError::ReplicaWrite)
+            (
+                "rename-local",
+                env.rename_database(None, "localddl", "localddl2"),
             ),
-            "rename of a replicated DB on a replica must return ReplicaWrite"
-        );
-        assert!(
-            matches!(
-                env.remove_database(None, "ddldb"),
-                Err(NoxuError::ReplicaWrite)
-            ),
-            "remove of a replicated DB on a replica must return ReplicaWrite"
-        );
+            ("remove-local", env.remove_database(None, "localddl")),
+        ] {
+            assert!(
+                matches!(res, Err(NoxuError::ReplicaWrite)),
+                "{op} on a replica must return ReplicaWrite, got {res:?}"
+            );
+        }
 
-        // DDL on the NON-replicated DB is ALLOWED on a replica (JE: the target
-        // DB's getOperationRepContext does not generate a VLSN).
-        assert!(
-            env.truncate_database(None, "localddl").is_ok(),
-            "truncate of a NON-replicated DB on a replica must be Ok"
-        );
-        assert!(
-            env.rename_database(None, "localddl", "localddl2").is_ok(),
-            "rename of a NON-replicated DB on a replica must be Ok"
-        );
-        assert!(
-            env.remove_database(None, "localddl2").is_ok(),
-            "remove of a NON-replicated DB on a replica must be Ok"
-        );
-
-        // Clearing the screen (become_master) re-enables replicated DDL.
+        // Clearing the screen (become_master) re-enables DDL.
         env.env_impl_arc_for_test().lock().set_replica_write_screen(false);
         assert!(env.truncate_database(None, "ddldb").is_ok());
 
         let _ = env.close();
     }
 
-    /// GAP-REPLAY-3 (merge-prep follow-up) WITNESS (JE-exact): on a REPLICA,
-    /// `open_database(allow_create=true)` that would CREATE a *replicated*
-    /// database is refused with `NoxuError::ReplicaWrite`; creating a
-    /// NON-replicated database is allowed; opening an EXISTING database (either
-    /// kind) is allowed.
-    ///
-    /// JE: `DbTree.doCreateDb` -> `checkReplicaWrite(nameLocker,
-    /// newDb.getOperationRepContext(CREATE))` throws only when
-    /// `mustGenerateVLSN()`, i.e. only when the NEW DB is replicated
-    /// (DbTree.java:577-583, 874-880).  Opening an existing DB takes a read
-    /// lock on the NameLN -- no VLSN write -- so it is allowed.
-    ///
-    /// RED at 5f607fcf: the create screen fired unconditionally, so creating a
-    /// NON-replicated DB on a replica was wrongly refused.  GREEN after.
+    /// GAP-REPLAY-3 (merge-prep follow-up) WITNESS: on a REPLICA,
+    /// `open_database(allow_create=true)` that would CREATE a user database is
+    /// refused with `NoxuError::ReplicaWrite`; opening an EXISTING database is
+    /// allowed (a pure NameLN read).  7.11.x safety gate: every user DB in a
+    /// replicated env is treated as replicated, so all user-DB creation on a
+    /// replica is refused (JE `DbTree.doCreateDb` -> `checkReplicaWrite` ->
+    /// `mustGenerateVLSN`).
     #[test]
+    #[allow(deprecated)]
     fn gap_replay_3_merge_prep_open_database_create_screened_on_replica() {
         let (_tmp, env) = replicated_env();
-        let rep_cfg = DatabaseConfig::new()
+        let cfg = DatabaseConfig::new()
             .with_allow_create(true)
-            .with_transactional(true)
-            .with_replicated(true);
-        let local_cfg = DatabaseConfig::new()
-            .with_allow_create(true)
-            .with_transactional(true)
-            .with_replicated(false);
+            .with_transactional(true);
 
-        // Create an existing replicated database while still the master.
-        let db = env.open_database(None, "existing", &rep_cfg).unwrap();
+        // Create an existing database while still the master.
+        let db = env.open_database(None, "existing", &cfg).unwrap();
         db.put(b"k", b"v").unwrap();
         drop(db);
 
         env.env_impl_arc_for_test().lock().set_replica_write_screen(true);
 
-        // Opening the EXISTING (replicated) database on a replica still works.
-        let existing = env.open_database(None, "existing", &rep_cfg);
+        // Opening the EXISTING database on a replica still works (NameLN read).
+        let existing = env.open_database(None, "existing", &cfg);
         assert!(
             existing.is_ok(),
-            "opening an EXISTING replicated DB on a replica must succeed, got \
-             {:?}",
+            "opening an EXISTING DB on a replica must succeed, got {:?}",
             existing.err()
         );
         {
@@ -4185,40 +4102,41 @@ mod tests {
             drop(edb);
         }
 
-        // Creating a NEW *replicated* DB on a replica must be refused.
-        let created = env.open_database(None, "brand_new", &rep_cfg);
-        assert!(
-            matches!(created, Err(NoxuError::ReplicaWrite)),
-            "creating a NEW replicated DB on a replica must return \
-             ReplicaWrite, got {:?}",
-            created.map(|_| "Ok(db)")
-        );
-        assert!(
-            !env.env_impl_arc_for_test()
-                .lock()
-                .get_database_names()
-                .iter()
-                .any(|n| n == "brand_new"),
-            "a screened create must not register the name on the replica"
-        );
+        // Creating a NEW user DB on a replica is refused (safety gate), whether
+        // or not the caller tried to mark it local.
+        for (name, c) in [
+            ("brand_new", cfg.clone()),
+            (
+                "brand_new_local",
+                DatabaseConfig::new()
+                    .with_allow_create(true)
+                    .with_transactional(true)
+                    .with_replicated(false),
+            ),
+        ] {
+            let created = env.open_database(None, name, &c);
+            assert!(
+                matches!(created, Err(NoxuError::ReplicaWrite)),
+                "creating a NEW DB '{name}' on a replica must return \
+                 ReplicaWrite, got {:?}",
+                created.map(|_| "Ok(db)")
+            );
+            assert!(
+                !env.env_impl_arc_for_test()
+                    .lock()
+                    .get_database_names()
+                    .iter()
+                    .any(|n| n == name),
+                "a screened create must not register '{name}' on the replica"
+            );
+        }
 
-        // Creating a NEW *non-replicated* DB on a replica is ALLOWED (JE: the
-        // CREATE repContext does not generate a VLSN for a local DB).
-        let local_new = env.open_database(None, "local_new", &local_cfg);
-        assert!(
-            local_new.is_ok(),
-            "creating a NON-replicated DB on a replica must be Ok, got {:?}",
-            local_new.err()
-        );
-        drop(local_new);
-
-        // Clearing the screen re-enables replicated creation.
+        // Clearing the screen re-enables creation.
         env.env_impl_arc_for_test().lock().set_replica_write_screen(false);
-        let now_ok = env.open_database(None, "brand_new", &rep_cfg);
+        let now_ok = env.open_database(None, "brand_new", &cfg);
         assert!(
             now_ok.is_ok(),
-            "after clearing the screen, creating the replicated DB must \
-             succeed, got {:?}",
+            "after clearing the screen, creating the DB must succeed, got {:?}",
             now_ok.err()
         );
         drop(now_ok);
@@ -4226,46 +4144,26 @@ mod tests {
         let _ = env.close();
     }
 
-    /// GAP-REPLAY-3 (merge-prep follow-up) WITNESS (JE-exact): the
-    /// transactional create path is screened on a replica for a REPLICATED DB,
-    /// and permitted for a NON-replicated DB.
+    /// GAP-REPLAY-3 (merge-prep follow-up) WITNESS: the transactional create
+    /// path is screened on a replica too.
     #[test]
     fn gap_replay_3_merge_prep_open_database_txn_create_screened_on_replica() {
         let (_tmp, env) = replicated_env();
-        let rep_cfg = DatabaseConfig::new()
+        let cfg = DatabaseConfig::new()
             .with_allow_create(true)
-            .with_transactional(true)
-            .with_replicated(true);
-        let local_cfg = DatabaseConfig::new()
-            .with_allow_create(true)
-            .with_transactional(true)
-            .with_replicated(false);
+            .with_transactional(true);
 
         env.env_impl_arc_for_test().lock().set_replica_write_screen(true);
 
-        // Transactional create of a NEW replicated DB -> ReplicaWrite.
         let txn = env.begin_transaction(None).unwrap();
-        let created = env.open_database(Some(&txn), "txn_new", &rep_cfg);
+        let created = env.open_database(Some(&txn), "txn_new", &cfg);
         assert!(
             matches!(created, Err(NoxuError::ReplicaWrite)),
-            "transactional create of a NEW replicated DB on a replica must \
-             return ReplicaWrite, got {:?}",
+            "transactional create of a NEW DB on a replica must return \
+             ReplicaWrite, got {:?}",
             created.map(|_| "Ok(db)")
         );
         let _ = txn.abort();
-
-        // Transactional create of a NEW non-replicated DB -> Ok.
-        let txn2 = env.begin_transaction(None).unwrap();
-        let local_created =
-            env.open_database(Some(&txn2), "txn_local", &local_cfg);
-        assert!(
-            local_created.is_ok(),
-            "transactional create of a NON-replicated DB on a replica must be \
-             Ok, got {:?}",
-            local_created.err()
-        );
-        drop(local_created);
-        txn2.commit().unwrap();
 
         let _ = env.close();
     }
