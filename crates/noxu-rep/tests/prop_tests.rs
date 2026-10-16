@@ -264,13 +264,33 @@ fn prop_acceptor_promise_contract(tc: hegel::TestCase) {
     }
 }
 
-/// Paxos safety (JE Acceptor.process(Accept), Acceptor.java:210-215),
-/// FID-ELECT-1: `try_accept((t, p), m)` returns `true` IFF the current
-/// promise EXACTLY equals the Accept's proposal number `(t, p)` — the
-/// proposer identity is part of the key, so an Accept at the right term but
-/// the WRONG proposer is rejected (that is the split-brain guard).  Returning
-/// `false` MUST leave (accepted_term, accepted_master) AND the promise
-/// unchanged.
+/// Paxos safety (JE `Acceptor.process(Accept)`, `Acceptor.java:207-222`),
+/// FID-ELECT-1 — the EXACT accept contract.
+///
+/// `try_accept_proposal((t, p), m)` returns `true` IFF **both**:
+///
+///   1. the current promise EXACTLY equals the Accept's proposal number
+///      `(t, p)` — the proposer identity is part of the key, so an Accept at
+///      the right term but the WRONG proposer is rejected (JE
+///      `promisedProposal.compareTo(accept.getProposal()) == 0`,
+///      `Acceptor.java:210`); **and**
+///   2. the Noxu value guard passes — there is no value yet accepted at that
+///      EXACT term, OR the probe's value equals the value already accepted
+///      there (`acceptor_state.rs`: reject iff
+///      `accepted_term == t && accepted_master != Some(master)`).
+///      This guard is a Noxu-specific backstop with NO JE counterpart (JE
+///      overwrites `acceptedValue` unconditionally once the proposal matches,
+///      `Acceptor.java:217`); it is load-bearing because Noxu's downstream
+///      master bookkeeping keys on the bare `term` integer, not the full
+///      `(term, proposer)` number.
+///
+/// A re-accept of the SAME value at an already-accepted `(t, p)` passes the
+/// guard and succeeds (idempotent re-set), matching JE's unconditional
+/// `acceptedValue = accept.getValue()`.
+///
+/// The failure branch holds exactly when that iff is false — i.e. the promise
+/// is not equal, OR the value guard would fire.  On `false` the acceptor MUST
+/// leave `(accepted_term, accepted_master)` AND the promise unchanged.
 #[hegel::test(test_cases = 64)]
 fn prop_acceptor_accept_contract(tc: hegel::TestCase) {
     let msgs: Vec<AcceptorMsg> =
@@ -301,18 +321,50 @@ fn prop_acceptor_accept_contract(tc: hegel::TestCase) {
     let probe_proposer = proposer_name(probe_proposer_byte);
     let probe_master = format!("m{}", probe_master_byte);
 
+    let promised = (before_promised, before_proposer.as_deref());
+    let probe = (probe_term, Some(probe_proposer.as_str()));
+
+    // The EXACT contract, computed from the pre-state (independently of the
+    // call we are about to make):
+    //   (1) the promise equals the probe's proposal number, AND
+    //   (2) the value guard passes.
+    let promise_matches = promised == probe;
+    // Value guard fires (rejects) iff a value is ALREADY accepted at this
+    // exact term AND the probe carries a DIFFERENT value.  Note the guard is
+    // keyed on the bare `term`, mirroring `try_accept_proposal`.
+    let value_guard_fires = before_accepted == probe_term
+        && before_master.as_deref() != Some(probe_master.as_str());
+    let expected = promise_matches && !value_guard_fires;
+
     let result = acceptor.try_accept_proposal(
         probe_term,
         &probe_proposer,
         &probe_master,
     );
-    let promised = (before_promised, before_proposer.as_deref());
-    let probe = (probe_term, Some(probe_proposer.as_str()));
+
+    assert_eq!(
+        result, expected,
+        "accept({probe:?}, {probe_master:?}) returned {result} but the exact \
+         contract (promise_matches={promise_matches} && \
+         !value_guard_fires={}) requires {expected}; pre-state promised={promised:?}, \
+         accepted=({before_accepted}, {before_master:?})",
+        !value_guard_fires,
+    );
+
     if result {
+        // Success implies the promise equalled the probe (necessary
+        // condition) — assert it directly so a regression that let an accept
+        // through on a non-matching promise is still caught here.
         assert_eq!(
             promised, probe,
             "accept succeeds only when the promise equals the Accept's \
              proposal number (term, proposer)"
+        );
+        // ...and the value guard did not fire.
+        assert!(
+            !value_guard_fires,
+            "accept succeeded but a different value was already accepted at \
+             this term (value guard should have rejected it)"
         );
         assert_eq!(acceptor.accepted_term(), probe_term);
         assert_eq!(acceptor.accepted_master(), Some(probe_master));
@@ -320,7 +372,18 @@ fn prop_acceptor_accept_contract(tc: hegel::TestCase) {
         assert_eq!(acceptor.promised_term(), before_promised);
         assert_eq!(acceptor.promised_proposer(), before_proposer);
     } else {
-        assert_ne!(promised, probe);
+        // Failure holds exactly when the promise did not match OR the value
+        // guard fired.  The old assertion `assert_ne!(promised, probe)` was
+        // unsound: with the value guard, `promised == probe` is reachable on a
+        // rejected accept (promise (t,p); accept (t,p,m1) ok; accept (t,p,m2)
+        // with m2 != m1 rejected while promised still == probe).
+        assert!(
+            !promise_matches || value_guard_fires,
+            "accept was rejected but the promise matched AND the value guard \
+             did not fire — the acceptor should have accepted; \
+             promised={promised:?}, probe={probe:?}, accepted=({before_accepted}, \
+             {before_master:?})"
+        );
         assert_eq!(acceptor.accepted_term(), before_accepted);
         assert_eq!(acceptor.accepted_master(), before_master);
         assert_eq!(

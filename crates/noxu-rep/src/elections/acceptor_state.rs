@@ -791,6 +791,66 @@ mod tests {
     }
 
     #[test]
+    fn reaccept_same_value_is_idempotent_different_value_rejected() {
+        // FID-ELECT-1 value guard, and its interaction with JE's idempotent
+        // re-accept.  Fix the proposal number `(t, p)` and vary only the
+        // Accept value:
+        //
+        //   promise (t, p)          -> promise moves to (t, p)
+        //   accept  (t, p, m1)      -> OK  (first value at this term)
+        //   accept  (t, p, m2!=m1)  -> REJECTED by Noxu's value guard
+        //   accept  (t, p, m1)      -> OK  (re-accept of the SAME value)
+        //
+        // JE `Acceptor.process(Accept)` (Acceptor.java:211-217) has NO value
+        // guard: once `promisedProposal.compareTo(accept.getProposal()) == 0`
+        // it sets `acceptedValue = accept.getValue()` UNCONDITIONALLY and
+        // returns `Accepted` — so a JE acceptor is idempotent for a re-accept
+        // of the SAME proposal number and would *also* overwrite with a
+        // different value.  Noxu matches JE on the re-accept of the SAME value
+        // (idempotent re-set, `true`), and deviates — conservatively, rejecting
+        // rather than overwriting — only for a DIFFERENT value at the same bare
+        // term (the backstop that keeps Noxu's bare-`term` downstream
+        // bookkeeping split-brain-safe).
+        let s = PersistentAcceptorState::in_memory();
+        assert!(s.try_promise_proposal(7, "node-A"));
+
+        // First Accept at (7, node-A) with value m1: accepted.
+        assert!(
+            s.try_accept_proposal(7, "node-A", "m1"),
+            "first accept of a value at a promised proposal number must succeed"
+        );
+        assert_eq!(s.accepted_term(), 7);
+        assert_eq!(s.accepted_master().as_deref(), Some("m1"));
+
+        // Second Accept at the SAME (7, node-A) but a DIFFERENT value m2:
+        // rejected by the value guard, and the accepted value is untouched.
+        assert!(
+            !s.try_accept_proposal(7, "node-A", "m2"),
+            "a different value at an already-accepted term must be rejected \
+             (Noxu value guard; JE would overwrite — see Acceptor.java:217)"
+        );
+        assert_eq!(
+            s.accepted_master().as_deref(),
+            Some("m1"),
+            "rejected different-value accept must not mutate the accepted value"
+        );
+        assert_eq!(s.accepted_term(), 7);
+        // The promise is also untouched by the rejected accept.
+        assert_eq!(s.promised_term(), 7);
+        assert_eq!(s.promised_proposer().as_deref(), Some("node-A"));
+
+        // Re-accept of the SAME value m1 at the same (7, node-A): idempotent,
+        // succeeds (matches JE's unconditional re-set at Acceptor.java:217).
+        assert!(
+            s.try_accept_proposal(7, "node-A", "m1"),
+            "a re-accept of the SAME value at the same proposal number is \
+             idempotent and must succeed (JE Acceptor.java:211-217)"
+        );
+        assert_eq!(s.accepted_term(), 7);
+        assert_eq!(s.accepted_master().as_deref(), Some("m1"));
+    }
+
+    #[test]
     fn v1_file_is_read_and_upgraded_in_place() {
         // A v7.11.0 / RC acceptor.state (version 1, no promised_proposer)
         // must load with promised_proposer=None and keep its durable promise;
