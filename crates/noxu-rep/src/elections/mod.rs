@@ -22,6 +22,7 @@ pub mod master_tracker;
 pub mod paxos;
 pub mod phi_detector;
 pub mod proposal;
+pub(crate) mod proposal_generator;
 
 pub use acceptor_state::{AcceptorPersistError, PersistentAcceptorState};
 pub use election::{Election, ElectionOutcome, ElectionState};

@@ -648,8 +648,9 @@ pub fn run_acceptor(
 /// The Paxos invariant is that an acceptor never accepts a proposal at a
 /// term lower than its highest promise.  The legacy `run_acceptor` keeps
 /// the promise in a local stack variable, which is lost across process
-/// restarts.  This variant calls `state.try_promise(t)` and
-/// `state.try_accept(t, master)` so every state change is fsynced before
+/// restarts.  This variant calls `state.try_promise(t, proposer)` and
+/// `state.try_accept(t, proposer, master)` so every state change is fsynced
+/// before
 /// the response goes back to the proposer.
 #[allow(clippy::too_many_arguments)]
 pub fn run_acceptor_with_state(
@@ -683,7 +684,7 @@ pub fn run_acceptor_with_state(
         None => return Ok(None),
     };
 
-    let phase1_term = match phase1 {
+    let (phase1_term, phase1_proposer) = match phase1 {
         ProtocolMessage::ElectionProposal {
             node_name: proposer,
             vlsn: _vlsn,
@@ -695,7 +696,10 @@ pub fn run_acceptor_with_state(
             // TLS peer identity before trusting it.  A rejection here returns
             // before any freeze is installed, so no thaw is needed.
             check_election_identity(channel, &proposer)?;
-            if state.try_promise(term) {
+            // FID-ELECT-1: the Paxos proposal number is `(term, proposer)`,
+            // JE's `ms_time|machineId|uniqueId` analogue, so two proposers
+            // sharing a local term value are disambiguated by name.
+            if state.try_promise_proposal(term, &proposer) {
                 // Freeze commit-VLSN advancement for the duration of this
                 // round: the VLSN/DTVLSN we are about to advertise in the
                 // Promise must still describe this node when the proposer
@@ -717,7 +721,7 @@ pub fn run_acceptor_with_state(
                         dtvlsn: own_dtvlsn,
                     },
                 )?;
-                term
+                (term, proposer)
             } else {
                 send_message(
                     channel,
@@ -761,15 +765,26 @@ pub fn run_acceptor_with_state(
             // thing it does on an election result
             // (`MasterChangeListener.java:49`).
             thaw(term.max(phase1_term));
-            // Accept iff the result term EXACTLY equals the term we promised
-            // in phase 1 (JE Acceptor.process(Accept): reject unless
-            // promisedProposal.compareTo(accept.getProposal()) == 0). A
-            // proposer that switched to a higher term mid-round (got a
-            // phase-1 promise at T1, then sent a phase-2 Accept at T2 > T1
-            // without a fresh phase 1) MUST be rejected — accepting it admits
-            // two proposers reaching phase-2 quorum at different terms, the
-            // classic split-brain failure mode.
-            if term == phase1_term && state.try_accept(term, &master) {
+            // Accept iff the Accept's proposal number EXACTLY equals the
+            // one we promised in phase 1 (JE Acceptor.process(Accept):
+            // reject unless promisedProposal.compareTo(accept.getProposal())
+            // == 0).  The proposal number is `(term, proposer)`
+            // (FID-ELECT-1), and the proposer is the phase-1 candidate on
+            // THIS session (`phase1_proposer`) — the `master` field of the
+            // ElectionResult is the VALUE (JE MasterValue), which may name a
+            // different winner than the proposer, so it is NOT part of the
+            // key.  A proposer that switched to a higher term mid-round (got
+            // a phase-1 promise at T1, then sent a phase-2 Accept at T2 > T1
+            // without a fresh phase 1) is rejected because `(T2, proposer)`
+            // != the promised `(T1, proposer)`; the explicit `term ==
+            // phase1_term` guard short-circuits that case before taking the
+            // flush lock.  Two concurrent proposers A and B at the same term
+            // on a shared acceptor cannot both be accepted: whichever
+            // re-promised last owns the promise, and the other's Accept
+            // carries a stale `(term, proposer)` number.
+            if term == phase1_term
+                && state.try_accept_proposal(term, &phase1_proposer, &master)
+            {
                 send_message(
                     channel,
                     &ProtocolMessage::ElectionVote {

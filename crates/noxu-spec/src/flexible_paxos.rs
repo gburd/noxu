@@ -49,6 +49,25 @@ pub const MAX_TERM: u64 = 1;
 pub const Q1: usize = 2;
 pub const Q2: usize = 2;
 
+/// How the election "proposal number" is formed (FID-ELECT-1).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum ProposalScheme {
+    /// The buggy pre-FID-ELECT-1 scheme: the proposal number's ascending
+    /// component is a per-node-LOCAL `term` counter that every node starts at
+    /// 1, so DIFFERENT proposers reuse the same `term` value.  Modelled by
+    /// allowing two distinct leaders to `StartElection` at the SAME term.
+    /// Under the acceptor's JE-faithful "reject only a strictly-greater
+    /// promise" rule this is a split brain: a counterexample for
+    /// `ElectionSafety` where several leaders are elected at one term.
+    LocalCounter,
+    /// The fixed scheme (JE `TimebasedProposalGenerator`): the ascending
+    /// component is a globally monotone wall-clock time, so no two proposers
+    /// ever share it and a proposer's successive rounds strictly ascend.
+    /// Modelled by forbidding two distinct leaders from sharing a term — the
+    /// proposal number is globally UNIQUE.  `ElectionSafety` holds.
+    TimeBased,
+}
+
 /// Whether the acceptor's promise/accept state is persisted
 /// across crashes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -70,6 +89,12 @@ pub enum Variant {
 pub struct State {
     /// `promised_term[n]` — highest term node `n` has promised.
     pub promised_term: [u64; N_NODES],
+    /// `promised_leader[n]` — the second component of the proposal number
+    /// `(term, leader)` node `n` has promised, or `usize::MAX` for "no named
+    /// proposer" (fresh acceptor).  FID-ELECT-1: the real acceptor keys its
+    /// promise on the WHOLE `(term, proposer)` proposal number, not the bare
+    /// term, so the model tracks the leader component too.
+    pub promised_leader: [usize; N_NODES],
     /// `accepted_term[n]` — highest term node `n` has accepted at,
     /// or 0 if none.
     pub accepted_term: [u64; N_NODES],
@@ -126,15 +151,40 @@ pub enum Action {
 
 pub struct FlexiblePaxosModel {
     pub variant: Variant,
+    pub scheme: ProposalScheme,
 }
 
 impl FlexiblePaxosModel {
+    /// Fixed production protocol: persistent acceptor state + the JE
+    /// time-based (globally unique) proposal number.  `ElectionSafety` holds.
     pub fn persistent() -> Self {
-        Self { variant: Variant::PersistentAcceptor }
+        Self {
+            variant: Variant::PersistentAcceptor,
+            scheme: ProposalScheme::TimeBased,
+        }
     }
 
     pub fn ephemeral() -> Self {
-        Self { variant: Variant::EphemeralAcceptor }
+        // The F5/F31 crash-durability split-brain manifests as two leaders at
+        // the SAME term (an acceptor crashes, forgets its promise, re-votes).
+        // That requires terms to be reusable across proposers, i.e. the
+        // local-counter scheme; so this regression variant pairs the
+        // ephemeral acceptor with `LocalCounter`.
+        Self {
+            variant: Variant::EphemeralAcceptor,
+            scheme: ProposalScheme::LocalCounter,
+        }
+    }
+
+    /// FID-ELECT-1 regression bait: persistent acceptor state but the OLD
+    /// local-counter proposal number (terms reused across proposers).  A
+    /// Stateright run must find an `ElectionSafety` counterexample (two or
+    /// more masters elected at one term).
+    pub fn local_counter() -> Self {
+        Self {
+            variant: Variant::PersistentAcceptor,
+            scheme: ProposalScheme::LocalCounter,
+        }
     }
 }
 
@@ -152,6 +202,18 @@ fn votes_for_mut<'a>(
     list.iter_mut().find(|(k, _)| *k == key).map(|(_, v)| v)
 }
 
+/// The proposal-number ordering key for node `n`'s current promise, matching
+/// the real acceptor's `(term, Option<proposer>)` where `None` (no named
+/// proposer) orders LESS than any named proposer.  A `promised_term` of 0
+/// means "no promise", encoded as `(0, None)`.  FID-ELECT-1.
+fn promise_key(term: u64, leader: usize) -> (u64, Option<usize>) {
+    if term == 0 || leader == usize::MAX {
+        (term, None)
+    } else {
+        (term, Some(leader))
+    }
+}
+
 impl Model for FlexiblePaxosModel {
     type State = State;
     type Action = Action;
@@ -159,6 +221,7 @@ impl Model for FlexiblePaxosModel {
     fn init_states(&self) -> Vec<Self::State> {
         vec![State {
             promised_term: [0; N_NODES],
+            promised_leader: [usize::MAX; N_NODES],
             accepted_term: [0; N_NODES],
             accepted_leader: [usize::MAX; N_NODES],
             leaders_proposed: vec![],
@@ -178,9 +241,39 @@ impl Model for FlexiblePaxosModel {
                     out.push(Action::StartElection { leader, term });
                 }
                 if s.leaders_proposed.contains(&(term, leader)) {
-                    // Phase-1 votes
+                    // Phase-1 votes.  FID-ELECT-1: the promise gate differs by
+                    // proposal-number scheme (JE Acceptor.process(Propose):
+                    // reject only a STRICTLY-greater promise).
+                    //
+                    //  * `TimeBased` — the proposal number is globally unique
+                    //    and ascending (JE ms_time + unique proposer name), so
+                    //    two DIFFERENT leaders never share a comparable number
+                    //    at the same term: once an acceptor has promised ANY
+                    //    leader at `term`, a different leader at the same term
+                    //    is a strictly-lower (older-time) proposal and is
+                    //    rejected.  The gate is the strict scalar
+                    //    `promised_term[n] < term` (so a given term binds a
+                    //    single leader), which is how the fixed code behaves:
+                    //    a node's own later rounds carry a strictly-higher
+                    //    time term, and no two nodes share a term.
+                    //  * `LocalCounter` — terms are reused across proposers,
+                    //    so the acceptor compares the WHOLE `(term, leader)`
+                    //    pair and promises iff it is not strictly greater,
+                    //    which lets a node re-promise `(1, A) -> (1, B)` and
+                    //    split-brain.
                     for n in 0..N_NODES {
-                        if s.promised_term[n] < term {
+                        let may_promise = match self.scheme {
+                            ProposalScheme::TimeBased => {
+                                s.promised_term[n] < term
+                            }
+                            ProposalScheme::LocalCounter => {
+                                promise_key(
+                                    s.promised_term[n],
+                                    s.promised_leader[n],
+                                ) <= promise_key(term, leader)
+                            }
+                        };
+                        if may_promise {
                             if let Some(votes) =
                                 votes_for(&s.phase1_votes, (term, leader))
                             {
@@ -205,11 +298,32 @@ impl Model for FlexiblePaxosModel {
                     {
                         out.push(Action::StartPhase2 { leader, term });
                     }
-                    // Phase-2 votes
+                    // Phase-2 votes.  FID-ELECT-1: the real acceptor accepts
+                    // iff its promise EXACTLY equals the Accept's `(term,
+                    // leader)` proposal number (JE Acceptor.process(Accept):
+                    // grant only when promisedProposal.compareTo(accept) == 0).
                     if s.phase2_votes.iter().any(|(k, _)| *k == (term, leader))
                     {
                         for n in 0..N_NODES {
-                            if s.promised_term[n] <= term {
+                            // Accept iff the acceptor's promise equals this
+                            // Accept's proposal number (JE
+                            // Acceptor.process(Accept): grant only when
+                            // promisedProposal.compareTo(accept) == 0).
+                            let may_accept = match self.scheme {
+                                ProposalScheme::TimeBased => {
+                                    // Globally-unique numbers bind one leader
+                                    // per term, so term equality is the whole
+                                    // comparison.
+                                    s.promised_term[n] == term
+                                }
+                                ProposalScheme::LocalCounter => {
+                                    promise_key(
+                                        s.promised_term[n],
+                                        s.promised_leader[n],
+                                    ) == promise_key(term, leader)
+                                }
+                            };
+                            if may_accept {
                                 if let Some(votes) =
                                     votes_for(&s.phase2_votes, (term, leader))
                                 {
@@ -259,7 +373,10 @@ impl Model for FlexiblePaxosModel {
                 s.phase1_votes.push(((term, leader), vec![]));
             }
             Action::PromiseVote { acceptor, leader, term } => {
+                // FID-ELECT-1: move the promise to the WHOLE `(term, leader)`
+                // proposal number (JE: `promisedProposal = propose`).
                 s.promised_term[acceptor] = term;
+                s.promised_leader[acceptor] = leader;
                 if let Some(v) =
                     votes_for_mut(&mut s.phase1_votes, (term, leader))
                 {
@@ -275,10 +392,10 @@ impl Model for FlexiblePaxosModel {
             Action::AcceptVote { acceptor, leader, term } => {
                 s.accepted_term[acceptor] = term;
                 s.accepted_leader[acceptor] = leader;
-                // Implicit promise: accepting at t bumps promised to t.
-                if s.promised_term[acceptor] < term {
-                    s.promised_term[acceptor] = term;
-                }
+                // The accept gate requires the promise to already equal
+                // `(term, leader)`, so the promise is unchanged here — no
+                // implicit bump (the real `try_accept` does not move the
+                // promise; the equality gate guarantees it already matches).
                 if let Some(v) =
                     votes_for_mut(&mut s.phase2_votes, (term, leader))
                 {
@@ -308,6 +425,7 @@ impl Model for FlexiblePaxosModel {
                         // is lost. The node restarts as if it had
                         // never voted.
                         s.promised_term[node] = 0;
+                        s.promised_leader[node] = usize::MAX;
                         s.accepted_term[node] = 0;
                         s.accepted_leader[node] = usize::MAX;
                     }
@@ -408,6 +526,51 @@ mod tests {
                 Action::AcceptVote { acceptor: 1, leader: 2, term: 1 },
                 Action::AcceptVote { acceptor: 2, leader: 2, term: 1 },
                 Action::DeclareElected { leader: 2, term: 1 },
+            ],
+        );
+    }
+
+    /// FID-ELECT-1 regression bait: a PERSISTENT (crash-durable) acceptor is
+    /// still split-brained if the proposal number is the OLD per-node-local
+    /// `term` counter (terms reused across proposers), because the acceptor's
+    /// JE-faithful "reject only a strictly-greater promise" rule lets a node
+    /// that promised `(1, A)` be re-promised to `(1, B)` and `(1, C)` at the
+    /// SAME term and accept each in turn.  No crash is needed.  This is the
+    /// counterexample the time-based proposal number (`persistent()`) closes.
+    ///
+    /// The model keys the acceptor on `(term, leader)` exactly as the
+    /// production `PersistentAcceptorState` keys on `(term, proposer)`, so
+    /// this spec now CONSTRAINS the implementation: it fails for the
+    /// (term, proposer)-with-reusable-terms scheme and passes only for the
+    /// globally-unique time-based scheme.
+    #[ignore = "large BFS model check (~35s release, minutes in debug); run via \
+                `make spec`, which passes --include-ignored"]
+    #[test]
+    fn local_counter_proposal_allows_split_brain() {
+        let checker =
+            FlexiblePaxosModel::local_counter().checker().spawn_bfs().join();
+        checker.assert_discovery(
+            "ElectionSafety",
+            vec![
+                // Leader 0 wins at term 1 with quorum {0, 1}.
+                Action::StartElection { leader: 0, term: 1 },
+                Action::PromiseVote { acceptor: 0, leader: 0, term: 1 },
+                Action::PromiseVote { acceptor: 1, leader: 0, term: 1 },
+                Action::StartPhase2 { leader: 0, term: 1 },
+                Action::AcceptVote { acceptor: 0, leader: 0, term: 1 },
+                Action::AcceptVote { acceptor: 1, leader: 0, term: 1 },
+                Action::DeclareElected { leader: 0, term: 1 },
+                // Leader 1 reuses term 1 (local-counter: terms are not
+                // globally unique).  Acceptors 0 and 1 were promised (1, 0);
+                // (1, 1) > (1, 0) is not strictly less, so they RE-promise to
+                // (1, 1) and then accept leader 1 — a second master at term 1.
+                Action::StartElection { leader: 1, term: 1 },
+                Action::PromiseVote { acceptor: 0, leader: 1, term: 1 },
+                Action::PromiseVote { acceptor: 1, leader: 1, term: 1 },
+                Action::StartPhase2 { leader: 1, term: 1 },
+                Action::AcceptVote { acceptor: 0, leader: 1, term: 1 },
+                Action::AcceptVote { acceptor: 1, leader: 1, term: 1 },
+                Action::DeclareElected { leader: 1, term: 1 },
             ],
         );
     }
