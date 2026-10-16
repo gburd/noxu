@@ -3802,6 +3802,43 @@ impl EnvironmentImpl {
         &self.backup_registry
     }
 
+    /// Starts a *network-restore* backup: pins the active log-file set against
+    /// cleaner deletion, logs the immutable-file marker, and flips the log so
+    /// the last file in the set is sealed, returning a [`DbBackup`] the
+    /// restore SERVER holds while it streams the set.
+    ///
+    /// FID-NR-8 (JE `LogFileFeeder.sendFileList`, `LogFileFeeder.java:443`:
+    /// `dbBackup.setNetworkRestore(); dbBackup.startBackup();`). The restore
+    /// server must protect the files it is streaming so a concurrent cleaner
+    /// cannot delete or truncate a file mid-send.
+    ///
+    /// # Errors
+    /// Returns [`DbiError::EnvironmentFailure`] if the environment has no
+    /// cleaner/file-protector or no log manager, or (JE `LogOverwriteException`)
+    /// if a replication rollback currently prohibits backups.
+    pub fn start_network_restore_backup(
+        &self,
+    ) -> Result<crate::DbBackup, DbiError> {
+        let file_protector = self.get_file_protector().ok_or_else(|| {
+            DbiError::EnvironmentFailure {
+                reason: "network restore requires a running cleaner"
+                    .to_string(),
+            }
+        })?;
+        let log_manager = self.get_log_manager().ok_or_else(|| {
+            DbiError::EnvironmentFailure {
+                reason: "network restore requires a log manager".to_string(),
+            }
+        })?;
+        let file_manager = Arc::clone(log_manager.file_manager());
+        crate::DbBackup::start_network_restore_backup(
+            file_protector,
+            file_manager,
+            Some(log_manager),
+            Some(Arc::clone(&self.backup_registry)),
+        )
+    }
+
     /// Returns the checkpointer, if one was created.
     ///
     /// Returns `None` for read-only environments.

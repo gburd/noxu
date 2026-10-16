@@ -26,6 +26,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
+use noxu_dbi::{DbBackup, EnvironmentImpl};
+
 use crate::error::{RepError, Result};
 use crate::net::channel::Channel;
 use crate::net::service_dispatcher::ServiceHandler;
@@ -45,6 +47,21 @@ pub struct NetworkRestoreServer {
     env_home: PathBuf,
     /// Running flag; used to stop the accept loop.
     running: Arc<AtomicBool>,
+    /// FID-NR-8: the live environment, when this server backs a replicated
+    /// node. When present, the server protects the files it streams from the
+    /// cleaner by holding a network-restore `DbBackup` over the set for the
+    /// duration of the send (JE `LogFileFeeder` holds a `DbBackup`,
+    /// `LogFileFeeder.java:443`). When `None` (the standalone directory
+    /// server used in tests and tooling), the server serves a plain directory
+    /// listing with no protection, as before.
+    ///
+    /// Wrapped in `AssertUnwindSafe` so adding this field does not strip the
+    /// `UnwindSafe`/`RefUnwindSafe` auto-trait impls from the public
+    /// `NetworkRestoreServer` type (`Arc<EnvironmentImpl>` is not
+    /// `UnwindSafe`); that would be a semver-breaking change. The env handle
+    /// is only read internally to start a backup, never carried across an
+    /// unwind boundary, so asserting unwind-safety is sound here.
+    env: Option<std::panic::AssertUnwindSafe<Arc<EnvironmentImpl>>>,
 }
 
 impl NetworkRestoreServer {
@@ -53,6 +70,26 @@ impl NetworkRestoreServer {
         Self {
             env_home: env_home.into(),
             running: Arc::new(AtomicBool::new(false)),
+            env: None,
+        }
+    }
+
+    /// Wire the live environment so the server protects the files it streams
+    /// from the cleaner for the duration of each restore (FID-NR-8).
+    ///
+    /// JE: `LogFileFeeder` holds a `DbBackup` (`setNetworkRestore()` +
+    /// `startBackup()`) over the backup set and releases protection per file
+    /// as it completes (`LogFileFeeder.java:443`). `env_home` is taken from
+    /// the environment so the two can never disagree.
+    ///
+    /// `pub(crate)`: an internal wiring entry point only. The public surface
+    /// of `NetworkRestoreServer` is unchanged (semver-stable).
+    pub(crate) fn with_environment(env: Arc<EnvironmentImpl>) -> Self {
+        let env_home = env.get_env_home().to_path_buf();
+        Self {
+            env_home,
+            running: Arc::new(AtomicBool::new(false)),
+            env: Some(std::panic::AssertUnwindSafe(env)),
         }
     }
 
@@ -174,13 +211,72 @@ impl NetworkRestoreServer {
         Ok(files)
     }
 
+    /// Assemble the set of files to stream, together with an optional
+    /// `DbBackup` guard that protects them from the cleaner for the duration
+    /// of the send (FID-NR-8).
+    ///
+    /// When this server is wired to a live environment
+    /// ([`with_environment`](NetworkRestoreServer::with_environment)), it
+    /// starts a network-restore `DbBackup` (JE `setNetworkRestore()` +
+    /// `startBackup()`), so a concurrent cleaner cannot delete or truncate a
+    /// file between enumeration and transfer. The returned triples carry the
+    /// file number so the caller can release each file's protection as it
+    /// finishes (JE `removeFileProtection(prevFileName)`). The `DbBackup`
+    /// guard must be held until the send completes.
+    ///
+    /// When no environment is wired (the standalone directory server), the
+    /// set comes from a plain directory listing with no protection and a
+    /// file number of `None`.
+    #[allow(clippy::type_complexity)]
+    fn open_backup_set(
+        &self,
+    ) -> Result<(Vec<(String, PathBuf, Option<u32>)>, Option<DbBackup>)> {
+        match &self.env {
+            Some(env) => {
+                let backup =
+                    env.start_network_restore_backup().map_err(|e| {
+                        RepError::NetworkRestoreError(format!(
+                            "starting network-restore backup protection: {e}"
+                        ))
+                    })?;
+                let mut files: Vec<(String, PathBuf, Option<u32>)> = Vec::new();
+                for (path, num) in backup.backup_set_paths() {
+                    let name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .ok_or_else(|| {
+                            RepError::NetworkRestoreError(format!(
+                                "log file {} has a non-UTF-8 name",
+                                path.display()
+                            ))
+                        })?
+                        .to_string();
+                    files.push((name, path, Some(num)));
+                }
+                files.sort_by(|a, b| a.0.cmp(&b.0));
+                Ok((files, Some(backup)))
+            }
+            None => {
+                let files = self
+                    .list_ndb_files()?
+                    .into_iter()
+                    .map(|(name, path)| (name, path, None))
+                    .collect();
+                Ok((files, None))
+            }
+        }
+    }
+
     /// Core file-transfer logic: enumerate `.ndb` files, send count, then
     /// stream each file's name + size + bytes to `out`.
     ///
     /// Used by both `serve_raw` and the `ServiceHandler::handle` path.
     fn send_files_to<W: IoRead + IoWrite>(&self, out: &mut W) -> Result<()> {
-        // Enumerate all .ndb files in env_home, sorted by name.
-        let files = self.list_ndb_files()?;
+        // FID-NR-8: enumerate the files to send, protecting them from the
+        // cleaner (when wired to a live env) for the duration of this send.
+        // `_backup` holds the protection until the function returns; files
+        // are released individually as each completes.
+        let (files, backup) = self.open_backup_set()?;
 
         // Send file count.
         let count = files.len() as u32;
@@ -190,7 +286,7 @@ impl NetworkRestoreServer {
 
         let mut chunk = vec![0u8; 65536];
 
-        for (name, path) in &files {
+        for (name, path, file_num) in &files {
             // Verify name fits in a u16 length prefix.
             let name_bytes = name.as_bytes();
             if name_bytes.len() > u16::MAX as usize {
@@ -278,11 +374,34 @@ impl NetworkRestoreServer {
                 name,
                 file_size
             );
+
+            // FID-NR-8 (JE LogFileFeeder removeFileProtection, line 290):
+            // release this file's cleaner protection now that it is fully
+            // streamed, so the cleaner can reclaim it while the rest of the
+            // restore continues.
+            if let (Some(backup), Some(num)) = (&backup, file_num) {
+                backup.release_file_protection(*num);
+            }
         }
 
         out.flush().map_err(|e| {
             RepError::NetworkRestoreError(format!("flushing output: {}", e))
         })?;
+
+        // FID-NR-8: the backup set was streamed under cleaner protection; if a
+        // concurrent replication rollback invalidated it mid-send, fail rather
+        // than hand the replica a torn set (JE endBackup LogOverwriteException).
+        if let Some(backup) = backup {
+            if backup.is_invalidated() {
+                return Err(RepError::NetworkRestoreError(
+                    "a replication rollback invalidated the backup set during \
+                     the network restore; aborting the incomplete send"
+                        .to_string(),
+                ));
+            }
+            // Drop/end the backup, releasing any remaining protection.
+            let _ = backup.end_backup();
+        }
 
         Ok(())
     }
@@ -330,8 +449,11 @@ impl ServiceHandler for NetworkRestoreServer {
             )));
         }
 
-        // Build file list and send via the channel's framing.
-        let files = self.list_ndb_files()?;
+        // FID-NR-8: build the file list under cleaner protection (when wired
+        // to a live env) and send via the channel's framing. `backup` holds
+        // the protection until the payload is built; each file is released as
+        // it is appended.
+        let (files, backup) = self.open_backup_set()?;
 
         // Send a single framed message containing the entire restore payload.
         // The payload uses the same wire layout as the raw-TCP path so the
@@ -341,7 +463,7 @@ impl ServiceHandler for NetworkRestoreServer {
         payload.extend_from_slice(&count.to_le_bytes());
 
         let mut chunk = vec![0u8; 65536];
-        for (name, path) in &files {
+        for (name, path, file_num) in &files {
             let name_bytes = name.as_bytes();
             let name_len = name_bytes.len() as u16;
             payload.extend_from_slice(&name_len.to_le_bytes());
@@ -386,6 +508,23 @@ impl ServiceHandler for NetworkRestoreServer {
                 remaining -= n;
             }
             payload.extend_from_slice(&digest.finalize().to_le_bytes());
+
+            // FID-NR-8: release this file's protection now it is captured.
+            if let (Some(backup), Some(num)) = (&backup, file_num) {
+                backup.release_file_protection(*num);
+            }
+        }
+
+        // FID-NR-8: abort if a concurrent rollback invalidated the set.
+        if let Some(backup) = backup {
+            if backup.is_invalidated() {
+                return Err(RepError::NetworkRestoreError(
+                    "a replication rollback invalidated the backup set during \
+                     the network restore; aborting the incomplete send"
+                        .to_string(),
+                ));
+            }
+            let _ = backup.end_backup();
         }
 
         channel.send(&payload)?;
@@ -401,6 +540,94 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::network_restore::{NetworkRestore, NetworkRestoreConfig};
+
+    /// FID-NR-8 (JE `LogFileFeeder.sendFileList`, `LogFileFeeder.java:443`:
+    /// `dbBackup.setNetworkRestore(); dbBackup.startBackup()`): when the
+    /// restore server is wired to a live environment it must protect the
+    /// files it streams from the cleaner for the duration of the send. The
+    /// standalone server (`new`) walks the live directory with NO protection.
+    ///
+    /// Witness: a writer that, on the first write past the file-count prefix,
+    /// checks the environment's `FileProtector` and records whether the
+    /// backup-set log files are protected at that moment. With a server wired
+    /// `with_environment`, they must be protected mid-send; after the send
+    /// they are released. RED at 81b2f048 (no `with_environment`, no
+    /// protection) — see the base RED demonstration in the commit message.
+    #[test]
+    fn wired_server_protects_files_during_send() {
+        use noxu_dbi::EnvironmentImpl;
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        // A real read-write env with at least one log file.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let env = Arc::new(
+            EnvironmentImpl::new(dir.path(), false, true).expect("open env"),
+        );
+        let protector =
+            env.get_file_protector().expect("env has a file protector");
+
+        // Baseline protection count the env itself holds on file 0 (the first
+        // log file always exists). The backup adds exactly one pin on top.
+        let baseline0 = protector.get_protection_count(0);
+
+        let server = NetworkRestoreServer::with_environment(Arc::clone(&env));
+
+        // A writer that samples file 0's protection count on the first byte
+        // written AFTER the 4-byte file-count prefix (the backup is open and
+        // file 0 is being framed/streamed).
+        struct ProbeWriter {
+            protector: Arc<noxu_cleaner::FileProtector>,
+            written: usize,
+            // Max protection count on file 0 seen mid-send.
+            max_count0: Rc<Cell<u32>>,
+        }
+        impl std::io::Write for ProbeWriter {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.written += b.len();
+                if self.written > 4 {
+                    let c = self.protector.get_protection_count(0);
+                    if c > self.max_count0.get() {
+                        self.max_count0.set(c);
+                    }
+                }
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl std::io::Read for ProbeWriter {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Ok(0)
+            }
+        }
+
+        let max0 = Rc::new(Cell::new(0u32));
+        let mut probe = ProbeWriter {
+            protector: Arc::clone(&protector),
+            written: 0,
+            max_count0: Rc::clone(&max0),
+        };
+        server.send_files_to(&mut probe).expect("send");
+
+        // Mid-send, file 0 must have had the backup's extra pin on top of the
+        // env baseline (FID-NR-8 protects the streamed set from the cleaner).
+        assert!(
+            max0.get() > baseline0,
+            "FID-NR-8: the wired server must add cleaner protection to the \
+             backup-set files while streaming (saw count {}, baseline {})",
+            max0.get(),
+            baseline0
+        );
+        // After the send, the backup's extra pin on file 0 is released
+        // (per-file release + end_backup); the count returns to the baseline.
+        assert_eq!(
+            protector.get_protection_count(0),
+            baseline0,
+            "FID-NR-8: the backup's per-file + end release must drop its pins"
+        );
+    }
 
     /// FID-NR-9 (JE `LogFileFeeder`/`DbBackup` protected snapshot): a `.ndb`
     /// file whose name cannot be decoded (or a `read_dir` entry error) must

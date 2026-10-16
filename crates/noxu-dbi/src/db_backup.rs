@@ -178,6 +178,15 @@ pub struct DbBackup {
     /// The snapshot of protected file numbers, sorted ascending
     /// (JE `snapshotFiles`, a `NavigableSet<Long>`).
     snapshot_files: Vec<u32>,
+    /// Files whose protection is still held (not yet released individually via
+    /// [`release_file_protection`](DbBackup::release_file_protection) nor by a
+    /// final [`release`]). Interior-mutable so a `&self` per-file release and
+    /// the final `&mut self` release each unprotect every file exactly once
+    /// (the `FileProtector` is ref-counted; a double unprotect would corrupt
+    /// another consumer's count).
+    ///
+    /// [`release`]: DbBackup::release
+    protected: Mutex<hashbrown::HashSet<u32>>,
     /// Last file number in the backup set (JE `lastFileInBackup`).
     last_file_in_backup: u32,
     /// Whether protection is still held (JE `backupStarted`).
@@ -411,10 +420,12 @@ impl DbBackup {
         };
         files.retain(|&f| f <= last_file_in_backup);
 
+        let protected = files.iter().copied().collect();
         Ok(DbBackup {
             file_protector,
             file_manager,
             snapshot_files: files,
+            protected: Mutex::new(protected),
             last_file_in_backup,
             open: true,
             state: Some(state),
@@ -451,6 +462,43 @@ impl DbBackup {
     /// JE: `backupIsOpen` (`DbBackup.java:774`).
     pub fn is_open(&self) -> bool {
         self.open
+    }
+
+    /// Returns the (full-path, file-number) pairs for every log file in this
+    /// backup set, sorted ascending by file number.
+    ///
+    /// Used by the network-restore SERVER (FID-NR-8) to stream exactly the
+    /// protected snapshot and release each file's protection as it finishes.
+    pub fn backup_set_paths(&self) -> Vec<(PathBuf, u32)> {
+        self.snapshot_files
+            .iter()
+            .map(|&f| (self.file_manager.full_file_name(f), f))
+            .collect()
+    }
+
+    /// Releases the cleaner protection on a single file in the backup set
+    /// after it has been fully streamed, allowing the cleaner to reclaim it
+    /// while the rest of the restore continues.
+    ///
+    /// JE: `DbBackup.removeFileProtection(prevFileName)`
+    /// (`LogFileFeeder.java:290`). Dropping or ending the backup releases any
+    /// files not individually released here.
+    pub fn release_file_protection(&self, file_number: u32) {
+        if !self.open {
+            return;
+        }
+        // Only unprotect if still protected; the ref-counted FileProtector
+        // must not be unprotected twice for the same backup pin.
+        if self.protected.lock().remove(&file_number) {
+            self.file_protector.unprotect_file(file_number);
+        }
+    }
+
+    /// Returns `true` if a concurrent replication rollback has invalidated
+    /// this backup (JE `DbBackup.invalid`). The network-restore server checks
+    /// this after streaming so it does not hand a replica a torn set.
+    pub fn is_invalidated(&self) -> bool {
+        self.state.as_ref().is_some_and(|s| s.is_invalid())
     }
 
     /// Ends backup mode, re-enabling cleaner deletion of the pinned files.
@@ -490,7 +538,10 @@ impl DbBackup {
         if !self.open {
             return;
         }
-        for &f in &self.snapshot_files {
+        // Unprotect every file still protected (those not released
+        // individually via release_file_protection), each exactly once.
+        let remaining: Vec<u32> = self.protected.lock().drain().collect();
+        for f in remaining {
             self.file_protector.unprotect_file(f);
         }
         // JE `RepImpl.removeDbBackup(this)` (`RepImpl.java:1949`).

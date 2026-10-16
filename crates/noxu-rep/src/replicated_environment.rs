@@ -1491,17 +1491,22 @@ impl ReplicatedEnvironment {
         // DatabaseConfig::replicated correctly.
         env.set_replicated(true);
 
-        // Register RESTORE service lazily if not already done.
-        if !self.restore_registered.load(Ordering::SeqCst)
-            && let Some(ref dispatcher) = self.tcp_dispatcher
-        {
+        // FID-NR-8: (re)register the RESTORE service with a server WIRED to
+        // the live environment, so the files it streams are protected from
+        // the cleaner for the duration of each restore (JE LogFileFeeder
+        // holds a DbBackup, LogFileFeeder.java:443). This overwrites any
+        // unprotected server registered eagerly at construction time (before
+        // the env existed), so production restores always run under cleaner
+        // protection.
+        if let Some(ref dispatcher) = self.tcp_dispatcher {
             let env_home = env.get_env_home().to_path_buf();
-            let restore_server = NetworkRestoreServer::new(env_home.clone());
+            let restore_server =
+                NetworkRestoreServer::with_environment(Arc::clone(&env));
             dispatcher.register(RESTORE_SERVICE_NAME, Arc::new(restore_server));
             self.restore_registered.store(true, Ordering::SeqCst);
             log::debug!(
                 "Node '{}' RESTORE service registered via with_environment \
-                 (env_home={})",
+                 with cleaner protection (env_home={})",
                 self.config.node_name,
                 env_home.display(),
             );
