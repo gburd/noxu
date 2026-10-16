@@ -396,38 +396,37 @@ fn run_kvops(
     // trailing Commit event, returning the observed op txn id.  For the
     // explicit case the arg must equal `expect_txn`; for auto it must be a
     // non-null AutoTransaction id and a `Commit(id)` must follow it.
-    let check_put =
-        |old: Option<Vec<u8>>, new: &[u8]| {
-            let c = calls.lock().unwrap().clone();
-            match (auto, c.as_slice()) {
-                (false, [one]) => assert_eq!(
-                    *one,
-                    Call::Put {
-                        txn: expect_txn,
-                        key: b"k".to_vec(),
-                        old,
-                        new: new.to_vec(),
-                    }
-                ),
-                (
-                    true,
-                    [
-                        Call::Put { txn: Some(id), key, old: o, new: n },
-                        Call::Commit(cid),
-                    ],
-                ) => {
-                    assert_eq!(key, b"k");
-                    assert_eq!(*o, old);
-                    assert_eq!(n, new);
-                    assert_eq!(
-                        id, cid,
-                        "auto-commit put trigger + commit must share the \
-                         AutoTransaction id"
-                    );
+    let check_put = |old: Option<Vec<u8>>, new: &[u8]| {
+        let c = calls.lock().unwrap().clone();
+        match (auto, c.as_slice()) {
+            (false, [one]) => assert_eq!(
+                *one,
+                Call::Put {
+                    txn: expect_txn,
+                    key: b"k".to_vec(),
+                    old,
+                    new: new.to_vec(),
                 }
-                other => panic!("unexpected put trigger calls: {other:?}"),
+            ),
+            (
+                true,
+                [
+                    Call::Put { txn: Some(id), key, old: o, new: n },
+                    Call::Commit(cid),
+                ],
+            ) => {
+                assert_eq!(key, b"k");
+                assert_eq!(*o, old);
+                assert_eq!(n, new);
+                assert_eq!(
+                    id, cid,
+                    "auto-commit put trigger + commit must share the \
+                         AutoTransaction id"
+                );
             }
-        };
+            other => panic!("unexpected put trigger calls: {other:?}"),
+        }
+    };
     let check_delete = |old: &[u8]| {
         let c = calls.lock().unwrap().clone();
         match (auto, c.as_slice()) {

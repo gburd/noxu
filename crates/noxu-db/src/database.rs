@@ -990,10 +990,9 @@ impl Database {
             if !secondaries.is_empty() {
                 let key_entry = DatabaseEntry::from_bytes(key_bytes);
                 let new_entry = DatabaseEntry::from_bytes(data_bytes);
-                let old_entry: Option<DatabaseEntry> =
-                    old_data_for_secondaries
-                        .as_deref()
-                        .map(DatabaseEntry::from_bytes);
+                let old_entry: Option<DatabaseEntry> = old_data_for_secondaries
+                    .as_deref()
+                    .map(DatabaseEntry::from_bytes);
                 for hook in secondaries {
                     hook.maintain(
                         at,
@@ -1034,7 +1033,6 @@ impl Database {
                 r?
             }
         }
-
 
         // Apply cleaner write-path backpressure for auto-commit (no-txn) bulk
         // writes: sleep briefly ONLY when the cleaner has fallen behind (a real
@@ -1350,19 +1348,15 @@ impl Database {
             // skip FK entirely.
             let mut lock_cursor = self.make_cursor_opt(pt);
             let present = matches!(
-                lock_cursor
-                    .search(key_bytes, None, SearchMode::Set)
-                    .map_err(|e| NoxuError::OperationNotAllowed(
-                        e.to_string()
-                    ))?,
+                lock_cursor.search(key_bytes, None, SearchMode::Set).map_err(
+                    |e| NoxuError::OperationNotAllowed(e.to_string())
+                )?,
                 noxu_dbi::OperationStatus::Success
             );
             if present {
-                lock_cursor
-                    .upgrade_current_to_write_lock()
-                    .map_err(|e| NoxuError::OperationNotAllowed(
-                        e.to_string()
-                    ))?;
+                lock_cursor.upgrade_current_to_write_lock().map_err(|e| {
+                    NoxuError::OperationNotAllowed(e.to_string())
+                })?;
             }
             drop(lock_cursor);
             if !present {
@@ -1434,13 +1428,7 @@ impl Database {
                 for old_bytes in &deleted_old_values {
                     let old_entry = DatabaseEntry::from_bytes(old_bytes);
                     for hook in &secondaries {
-                        hook.maintain(
-                            at,
-                            &key,
-                            Some(&old_entry),
-                            None,
-                            0,
-                        )?;
+                        hook.maintain(at, &key, Some(&old_entry), None, 0)?;
                     }
                 }
             }

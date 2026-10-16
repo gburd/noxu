@@ -1182,8 +1182,7 @@ impl SecondaryDatabase {
             // We found at least one; iterate and delete all matching primary
             // records under the SAME locker.
             loop {
-                let pri_key_bytes =
-                    p_key.data_opt().unwrap_or(&[]).to_vec();
+                let pri_key_bytes = p_key.data_opt().unwrap_or(&[]).to_vec();
                 let pri_key_entry = DatabaseEntry::from_bytes(&pri_key_bytes);
 
                 // Delete the primary record.  The auto-hook registered with

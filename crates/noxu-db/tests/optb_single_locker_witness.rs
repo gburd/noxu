@@ -391,8 +391,7 @@ fn c_secondary_error_aborts_primary_write() {
 
 fn open_pri_two_sec(
     p: &Path,
-) -> (Environment, Arc<Mutex<Database>>, SecondaryDatabase, SecondaryDatabase)
-{
+) -> (Environment, Arc<Mutex<Database>>, SecondaryDatabase, SecondaryDatabase) {
     let env = Environment::open(env_cfg(p)).unwrap();
     let pri = Arc::new(Mutex::new(
         env.open_database(None, "pri", &db_cfg(false)).unwrap(),
