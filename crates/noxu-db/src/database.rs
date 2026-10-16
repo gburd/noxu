@@ -400,9 +400,26 @@ impl Database {
         // (`None`) — a `Transaction` cannot be opened on a non-txnal db.
         let assoc_txn = if transactional { Some(&txn) } else { None };
 
-        match op(Some(&txn), assoc_txn) {
+        let op_result = op(Some(&txn), assoc_txn);
+
+        // WITNESS-ONLY crash injection (inert unless the env var is set):
+        // `NOXU_OPTB_CRASH_BEFORE_COMMIT=<key>` aborts the process AFTER the
+        // primary write AND all secondary maintenance have been buffered but
+        // BEFORE the single `TxnCommit` fsync, proving the whole unit is
+        // atomic (after recovery NEITHER the primary NOR its secondary is
+        // present).  `NOXU_OPTB_CRASH_AFTER_COMMIT=<key>` aborts just AFTER
+        // the single commit, proving BOTH survive.  Keyed on the primary key
+        // so a witness can target one specific op.  Zero cost when unset.
+        #[cfg(not(noxu_shuttle))]
+        if op_result.is_ok() {
+            crate::optb_crash_hook::maybe_crash_before_commit();
+        }
+
+        match op_result {
             Ok(value) => {
                 txn.commit_with_durability(durability)?;
+                #[cfg(not(noxu_shuttle))]
+                crate::optb_crash_hook::maybe_crash_after_commit();
                 Ok(value)
             }
             Err(e) => {
@@ -1008,7 +1025,14 @@ impl Database {
             // sequence and commits once (JE `Txn.createAutoTxn`); a
             // non-transactional database runs the primary under an auto-`Txn`
             // for lock management and the secondaries auto-commit (`None`).
-            None => self.with_auto_commit_transaction(do_put)?,
+            None => {
+                #[cfg(not(noxu_shuttle))]
+                crate::optb_crash_hook::set_current_key(key_bytes);
+                let r = self.with_auto_commit_transaction(do_put);
+                #[cfg(not(noxu_shuttle))]
+                crate::optb_crash_hook::clear_current_key();
+                r?
+            }
         }
 
 
@@ -1439,7 +1463,14 @@ impl Database {
             // sequence and commits once (JE `Txn.createAutoTxn`); a
             // non-transactional database runs the primary under an auto-`Txn`
             // for lock management and the secondaries auto-commit (`None`).
-            None => self.with_auto_commit_transaction(do_delete)?,
+            None => {
+                #[cfg(not(noxu_shuttle))]
+                crate::optb_crash_hook::set_current_key(key_bytes);
+                let r = self.with_auto_commit_transaction(do_delete);
+                #[cfg(not(noxu_shuttle))]
+                crate::optb_crash_hook::clear_current_key();
+                r?
+            }
         };
 
         let status = if deleted_any {

@@ -37,6 +37,10 @@
 
 #[macro_use]
 mod observe;
+// WITNESS-ONLY (not a production feature): env-gated crash-injection hook
+// for the v7.11.1 single-locker auto-commit atomicity witnesses.  Inert
+// unless `NOXU_OPTB_CRASH_{BEFORE,AFTER}_COMMIT` is set.
+mod optb_crash_hook;
 pub mod unimplemented_params;
 
 /// Re-export of the observability crate when the `observability` feature is enabled.
