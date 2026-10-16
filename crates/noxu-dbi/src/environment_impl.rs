@@ -2217,18 +2217,25 @@ impl EnvironmentImpl {
             return Err(DbiError::DatabaseNotFound(name.to_string()));
         }
 
-        // GAP-REPLAY-3 (merge-prep follow-up): screen DB *creation* on a
+        // GAP-REPLAY-3: screen the CREATION of a *replicated* database on a
         // replica.  Reaching this point with `recovered_db_id.is_none()`
         // means the name exists in neither `db_map`, `name_map`, nor
         // `pending_names`, and `allow_create` is true -- so this call is about
-        // to allocate a fresh `DatabaseId` and log a new NameLN (a NameLN /
-        // catalog write).  JE guards exactly this point: `DbTree.doCreateDb`
-        // calls `checkReplicaWrite(nameLocker, repContext)` immediately before
-        // inserting the NameLN, which calls `locker.disallowReplicaWrite()`
-        // (-> `ReplicaWriteException`) when the create would assign a new VLSN
-        // (DbTree.java:577-582, 874-880).  A user cannot create a database on
-        // a replica -- it would diverge the replica's name catalog from the
-        // master.
+        // to allocate a fresh `DatabaseId` and log a new NameLN.  JE guards
+        // exactly this point: `DbTree.doCreateDb` calls
+        // `checkReplicaWrite(nameLocker, newDb.getOperationRepContext(CREATE))`
+        // immediately before inserting the NameLN (DbTree.java:577-583), and
+        // `checkReplicaWrite` throws `ReplicaWriteException` only when
+        // `repContext.mustGenerateVLSN()` -- i.e. only when the NEW database is
+        // replicated (DbTree.java:874-880, DatabaseImpl.getOperationRepContext
+        // builds `DbOpReplicationContext(isReplicated(), CREATE)`).  Creating a
+        // NON-replicated (local) DB on a replica is therefore allowed, exactly
+        // as JE allows it -- the screen is gated on the new DB's replicated
+        // status, NOT unconditional.
+        //
+        // The new DB is replicated iff the env is replicated AND the config
+        // requests it -- the same resolution applied by `set_replicated`
+        // below (a non-replicated env never marks a DB replicated).
         //
         // The screen fires ONLY on the create path: opening an EXISTING
         // database (`recovered_db_id.is_some()`, or a live `db_map` hit
@@ -2239,15 +2246,11 @@ impl EnvironmentImpl {
         // `open_database_inner`), and internal databases are created during
         // env open before any replica role is assumed, so this cannot screen
         // the replica's own replay or an internal DB.
-        //
-        // NB: like the data-path screen (`Database::check_writable`) and the
-        // DDL screen (`Environment::check_writable`), this fires
-        // unconditionally when the screen is armed, not only for replicated
-        // databases.  JE's `allowReplicaWrite()`/`mustGenerateVLSN()` would
-        // permit creating a *non-replicated* DB on a replica; Noxu's accepted
-        // GAP-REPLAY-3 convention is the stricter "a replica originates no
-        // user write."  See `ddl-screen.md` for the deliberate deviation.
-        if recovered_db_id.is_none() && self.is_replica_write_screened() {
+        let new_db_replicated = self.is_replicated() && config.replicated;
+        if recovered_db_id.is_none()
+            && self.is_replica_write_screened()
+            && new_db_replicated
+        {
             return Err(DbiError::ReplicaWrite);
         }
 
@@ -2885,6 +2888,39 @@ impl EnvironmentImpl {
     /// mirroring JE binding `markDeleteAtTxnEnd` to the `DatabaseImpl` object
     /// (`DbTree.java:1214`, `Txn.java:1481`) rather than to the name.  See
     /// [`Self::remove_database_if_id`].
+    /// Whether a DDL/data write to the database named `name` is permitted
+    /// on a replica node -- the by-name analogue of
+    /// [`DatabaseImpl::allow_replica_write`], used by the environment-level
+    /// DDL screen (remove/truncate/rename).
+    ///
+    /// JE resolves the target `DatabaseImpl` via `DbTree.getDb` inside
+    /// `lockNameLN` and then screens with
+    /// `checkReplicaWrite(locker, dbImpl.getOperationRepContext(op))`, whose
+    /// `mustGenerateVLSN()` is true iff `dbImpl.isReplicated()`
+    /// (DbTree.java:907-931, DatabaseImpl.getOperationRepContext).  So a DDL
+    /// op on a NON-replicated DB is permitted on a replica, exactly as a data
+    /// write is.
+    ///
+    /// When the target `DatabaseImpl` is live in `db_map` we read its
+    /// `allow_replica_write()` directly.  When it is not resident (recovered
+    /// but not opened this session), the only writes a replica originates to
+    /// such a name are DDL ops on an existing user DB; a replicated env marks
+    /// its user DBs replicated (see `open_database_inner`), so we fall back to
+    /// `!is_replicated()` (env not replicated -> always writable; env
+    /// replicated -> screen a replicated user DB), which matches
+    /// `DatabaseImpl::allow_replica_write` for a resolved replicated user DB.
+    /// A name absent from `name_map` is a non-existent DB; it is not screened
+    /// here (the caller surfaces `DatabaseNotFound`).
+    pub fn allow_replica_write_for_name(&self, name: &str) -> bool {
+        let Some(db_id) = self.name_map.read().get(name).copied() else {
+            return true;
+        };
+        if let Some(db) = self.db_map.read().get(&db_id) {
+            return db.read().allow_replica_write();
+        }
+        !self.is_replicated()
+    }
+
     pub fn can_remove_database(
         &self,
         name: &str,
@@ -4640,20 +4676,30 @@ mod tests {
     #[test]
     fn test_open_database_create_screened_on_replica() {
         let (_dir, env) = make_env(false);
-        let mut config = DatabaseConfig::new();
-        config.set_allow_create(true);
+        // Model a replicated environment so a `replicated(true)` config
+        // actually yields a replicated DB (JE: replicated iff env
+        // replicated AND config requests it).
+        env.set_replicated(true);
+        let mut rep_cfg = DatabaseConfig::new();
+        rep_cfg.set_allow_create(true);
+        rep_cfg.set_replicated(true);
+        let mut local_cfg = DatabaseConfig::new();
+        local_cfg.set_allow_create(true);
+        local_cfg.set_replicated(false);
 
-        // Create an existing DB while unscreened (master).
-        let existing = env.open_database("existing", &config).unwrap();
+        // Create an existing replicated DB while unscreened (master).
+        let existing = env.open_database("existing", &rep_cfg).unwrap();
         assert_eq!(existing.read().get_name(), "existing");
+        assert!(existing.read().is_replicated());
         drop(existing);
 
         // Arm the screen (node becomes a replica).
         env.set_replica_write_screen(true);
         assert!(env.is_replica_write_screened());
 
-        // Opening the EXISTING DB on a replica must still succeed.
-        let reopen = env.open_database("existing", &config);
+        // Opening the EXISTING replicated DB on a replica must still
+        // succeed (a pure NameLN read).
+        let reopen = env.open_database("existing", &rep_cfg);
         assert!(
             reopen.is_ok(),
             "opening an existing DB on a replica must succeed, got {:?}",
@@ -4661,27 +4707,27 @@ mod tests {
         );
         drop(reopen);
 
-        // Creating a NEW DB on a replica must be refused with ReplicaWrite.
-        let created = env.open_database("brand_new", &config);
+        // Creating a NEW *replicated* DB on a replica must be refused with
+        // ReplicaWrite (JE DbTree.checkReplicaWrite -> mustGenerateVLSN).
+        let created = env.open_database("brand_new", &rep_cfg);
         assert!(
             matches!(created, Err(DbiError::ReplicaWrite)),
-            "creating a NEW DB on a replica must return ReplicaWrite, got \
-             {:?}",
+            "creating a NEW replicated DB on a replica must return \
+             ReplicaWrite, got {:?}",
             created.map(|_| "Ok(db)")
         );
-        // The screened create must not leak the name into the catalog.
         assert!(
             !env.get_database_names().iter().any(|n| n == "brand_new"),
             "a screened create must not register the name"
         );
 
-        // The transactional create path is screened too.
+        // The transactional create path is screened too (replicated DB).
         let txn_create =
-            env.open_database_transactional("txn_new", &config, 42);
+            env.open_database_transactional("txn_new", &rep_cfg, 42);
         assert!(
             matches!(txn_create, Err(DbiError::ReplicaWrite)),
-            "transactional create of a NEW DB on a replica must return \
-             ReplicaWrite, got {:?}",
+            "transactional create of a NEW replicated DB on a replica must \
+             return ReplicaWrite, got {:?}",
             txn_create.map(|_| "Ok(db)")
         );
         assert!(
@@ -4689,9 +4735,29 @@ mod tests {
             "a screened transactional create must not register the name"
         );
 
-        // Clearing the screen (become_master) re-enables creation.
+        // Creating a NEW *non-replicated* DB on a replica is ALLOWED (JE:
+        // the CREATE repContext does not generate a VLSN for a local DB).
+        let local_new = env.open_database("local_new", &local_cfg);
+        assert!(
+            local_new.is_ok(),
+            "creating a NON-replicated DB on a replica must be Ok, got {:?}",
+            local_new.err()
+        );
+        assert!(!local_new.unwrap().read().is_replicated());
+        // And its transactional-create variant too.
+        let local_txn =
+            env.open_database_transactional("local_txn", &local_cfg, 43);
+        assert!(
+            local_txn.is_ok(),
+            "transactional create of a NON-replicated DB on a replica must \
+             be Ok, got {:?}",
+            local_txn.err()
+        );
+
+        // Clearing the screen (become_master) re-enables replicated
+        // creation.
         env.set_replica_write_screen(false);
-        let now_ok = env.open_database("brand_new", &config);
+        let now_ok = env.open_database("brand_new", &rep_cfg);
         assert!(
             now_ok.is_ok(),
             "after clearing the screen, creating the DB must succeed, got \

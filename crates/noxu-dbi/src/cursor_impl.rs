@@ -1513,35 +1513,48 @@ impl CursorImpl {
     /// which is never a mismatch, so the check never fires there.
     #[inline]
     fn check_local_write_allowed(&self) -> Result<(), DbiError> {
-        // GAP-REPLAY-3: a REPLICA refuses every local user write (JE
-        // ReadonlyTxn.disallowReplicaWrite -> ReplicaWriteException).  Checked
-        // first, before the replicated/local-write-mismatch rule below, so the
-        // replica screen takes precedence and reports the right error.
+        // JE write-eligibility order (Cursor.java): `checkUpdatesAllowed`
+        // (the config-mismatch rule) runs FIRST, at the start of every write
+        // op, and only then does `putNotify`/`deleteNotify` take the write
+        // lock through `ReadonlyTxn.lockInternal` (the replica screen).  We
+        // mirror that order exactly so the observable error matches JE for
+        // every (db replicated?, txn local-write?) combination.
+        //
+        // Step 1 -- config mismatch (JE `Cursor.updateOperationsProhibited`
+        // = `dbImpl.isReplicated() == locker.isLocalWrite()`, Cursor.java:338
+        // / :5357-5361), throwing `UnsupportedOperationException`.  Noxu
+        // surfaces it as `OperationFailed`.  This takes precedence over the
+        // replica screen, so a local-write txn on a replicated DB reports the
+        // config mismatch (not `ReplicaWrite`), exactly as JE does.
+        if let Some(txn) = self.txn_ref.as_ref() {
+            let is_replicated = self.db_impl.read().is_replicated();
+            let is_local_write = txn.lock().unwrap().is_local_write();
+            if is_replicated == is_local_write {
+                return Err(DbiError::OperationFailed(format!(
+                    "Write operation is not allowed because {}",
+                    if is_replicated {
+                        "the Database is replicated and the transaction is \
+                         configured as local-write"
+                    } else {
+                        "the Database is not replicated and the transaction \
+                         is not configured as local-write"
+                    }
+                )));
+            }
+        }
+        // Step 2 -- replica screen (JE `ReadonlyTxn.lockInternal` takes a
+        // write lock only through `disallowReplicaWrite` when
+        // `!database.allowReplicaWrite()`, ReadonlyTxn.java:81-85), gated on
+        // `allowReplicaWrite() == !isReplicated() || dbType == NAME`
+        // (DatabaseImpl.java:785).  A write to a NON-replicated (local) DB is
+        // allowed on a replica -- NOT unconditional.
         if self
             .replica_write_screen
             .as_ref()
             .is_some_and(|f| f.load(Ordering::Relaxed))
+            && !self.db_impl.read().allow_replica_write()
         {
             return Err(DbiError::ReplicaWrite);
-        }
-        let Some(txn) = self.txn_ref.as_ref() else {
-            // No locker attached (should not happen for a live write
-            // cursor); nothing to check against.
-            return Ok(());
-        };
-        let is_replicated = self.db_impl.read().is_replicated();
-        let is_local_write = txn.lock().unwrap().is_local_write();
-        if is_replicated == is_local_write {
-            return Err(DbiError::OperationFailed(format!(
-                "Write operation is not allowed because {}",
-                if is_replicated {
-                    "the Database is replicated and the transaction is \
-                     configured as local-write"
-                } else {
-                    "the Database is not replicated and the transaction is \
-                     not configured as local-write"
-                }
-            )));
         }
         Ok(())
     }

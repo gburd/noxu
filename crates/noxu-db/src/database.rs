@@ -1319,9 +1319,15 @@ impl Database {
                 // duplicates, and the winner physically removed the raced slot
                 // so the next `search` makes progress (finds a different pair
                 // or `NotFound`) — never a livelock.
-                match cursor.delete().map_err(|e| {
-                    NoxuError::OperationNotAllowed(e.to_string())
-                })? {
+                // Preserve the typed `DbiError` (notably `ReplicaWrite` from
+                // the replica screen and `OperationFailed` from the
+                // replicated/local-write config-mismatch rule) via the
+                // `From<DbiError>` conversion, instead of flattening every
+                // cursor error to a stringy `OperationNotAllowed`.  JE
+                // surfaces `ReplicaWriteException` from a replica delete; the
+                // data path must report `NoxuError::ReplicaWrite`, not an
+                // untyped message.
+                match cursor.delete().map_err(NoxuError::from)? {
                     noxu_dbi::OperationStatus::Success => {
                         deleted_any = true;
                     }
@@ -2204,17 +2210,18 @@ impl Database {
         if self.config.read_only {
             return Err(NoxuError::ReadOnly);
         }
-        // GAP-REPLAY-3: refuse every user write while this node is a REPLICA
-        // (JE ReadonlyTxn.disallowReplicaWrite -> ReplicaWriteException).  This
-        // is the single pre-flight all write paths (put/delete/putNoOverwrite/
-        // putNoDupData) route through, so one typed `ReplicaWrite` is returned
-        // before any cursor work.  The cursor-level screen
-        // (`check_local_write_allowed`) is kept as defense-in-depth for writers
-        // that bypass this layer (a direct `EnvironmentImpl` cursor).
-        if self.replica_write_screen.load(std::sync::atomic::Ordering::Relaxed)
-        {
-            return Err(NoxuError::ReplicaWrite);
-        }
+        // GAP-REPLAY-3 (JE-exact ordering): the replica-write screen and the
+        // replicated/local-write config-mismatch rule are BOTH enforced in
+        // `CursorImpl::check_local_write_allowed`, in JE's order
+        // (`Cursor.checkUpdatesAllowed` config check first, then the
+        // `ReadonlyTxn.lockInternal` replica screen).  That is the only site
+        // with both the target DB's `is_replicated()` and the locker's
+        // `is_local_write()`, so it alone can reproduce JE's exact observable
+        // error for every combination (e.g. a local-write txn on a replicated
+        // DB must report the config mismatch, NOT `ReplicaWrite`).  This
+        // pre-flight therefore screens only `read_only`; every write path
+        // (put/delete/putNoOverwrite/putNoDupData) opens a cursor carrying the
+        // replica-write screen, so the JE-ordered check always runs.
         Ok(())
     }
 

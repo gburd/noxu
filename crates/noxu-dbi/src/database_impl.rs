@@ -328,6 +328,20 @@ impl DatabaseImpl {
     pub fn is_replicated(&self) -> bool {
         self.flags & IS_REPLICATED_BIT != 0
     }
+
+    /// Whether a write to this database is permitted on a replica node.
+    ///
+    /// Faithful port of JE `DatabaseImpl.allowReplicaWrite`
+    /// (DatabaseImpl.java:785): `return !isReplicated() || getDbType() ==
+    /// DbType.NAME;`.  Writes on a replica are refused to any *replicated*
+    /// DB, with one exception -- the naming DB, which holds a mixture of
+    /// replicated and non-replicated NameLNs, so JE allows all writes to it
+    /// and relies on `DbTree.checkReplicaWrite` to stop a replicated-DB
+    /// naming op on a replica (DbTree.java:874-880).  A non-replicated
+    /// (local) DB is always writable on a replica.  [#20543]
+    pub fn allow_replica_write(&self) -> bool {
+        !self.is_replicated() || self.db_type == DbType::Name
+    }
     /// Called by the environment's database-open path once it has
     /// determined whether this database should be marked replicated. Sets
     /// exactly one of the two underlying bits (never both, which would be a
