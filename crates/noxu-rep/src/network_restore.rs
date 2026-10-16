@@ -20,6 +20,14 @@ use crate::error::{RepError, Result};
 /// 4-byte little-endian value: `0x4E52_5354` ('N','R','S','T').
 const RESTORE_MAGIC: u32 = 0x4E52_5354;
 
+/// FID-NR-2 test hook: when set on a `NetworkRestore`, `execute_via_dispatcher`
+/// simulates a crash AFTER writing the `.tmp` file but BEFORE the atomic
+/// rename, so a witness can prove the final `.ndb` is never a torn/partial
+/// file. Per-instance (not a global) so parallel tests do not interfere.
+/// Compiled only in test builds; absent from production.
+#[cfg(test)]
+use std::sync::atomic::AtomicBool as TestCrashFlag;
+
 /// Configuration for a network restore operation.
 ///
 /// Specifies the source node
@@ -77,6 +85,9 @@ pub struct NetworkRestore {
     ///
     /// If `None`, files are written to the process's current directory.
     local_log_dir: Option<PathBuf>,
+    /// FID-NR-2 per-instance crash hook (test builds only).
+    #[cfg(test)]
+    crash_before_rename: TestCrashFlag,
 }
 
 /// Validate a server-supplied filename before it is joined with the local
@@ -144,7 +155,17 @@ impl NetworkRestore {
                 elapsed: Duration::ZERO,
             }),
             local_log_dir: None,
+            #[cfg(test)]
+            crash_before_rename: TestCrashFlag::new(false),
         }
+    }
+
+    /// FID-NR-2 test hook setter: arm the simulated crash before the atomic
+    /// rename (test builds only).
+    #[cfg(test)]
+    pub(crate) fn arm_crash_before_rename(&self) {
+        self.crash_before_rename
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Set the local directory where restored `.ndb` files will be written.
@@ -283,11 +304,28 @@ impl NetworkRestore {
                 let _ = std::fs::rename(&dest_path, &backup);
             }
 
-            // Stream file bytes directly to disk in 64 KiB chunks.
-            let mut out = std::fs::File::create(&dest_path).map_err(|e| {
+            // FID-NR-2 (JE NetworkBackup.getFile, NetworkBackup.java:575):
+            // write the incoming bytes to a `.tmp` file and atomically rename
+            // it onto the final name ONLY after the digest verifies. A crash
+            // mid-write then leaves a `.tmp` file, never a truncated/garbage
+            // live `.ndb` log file that recovery would read.
+            let tmp_path = log_dir.join(format!("{}.tmp", filename));
+            // Delete a stale tmp if one exists (JE deletes N.jdb.tmp first).
+            if tmp_path.exists() {
+                std::fs::remove_file(&tmp_path).map_err(|e| {
+                    RepError::NetworkRestoreError(format!(
+                        "deleting stale tmp '{}': {}",
+                        tmp_path.display(),
+                        e
+                    ))
+                })?;
+            }
+
+            // Stream file bytes to the tmp file in 64 KiB chunks.
+            let mut out = std::fs::File::create(&tmp_path).map_err(|e| {
                 RepError::NetworkRestoreError(format!(
                     "creating '{}': {}",
-                    dest_path.display(),
+                    tmp_path.display(),
                     e
                 ))
             })?;
@@ -310,7 +348,7 @@ impl NetworkRestore {
                 out.write_all(&chunk[..to_read]).map_err(|e| {
                     RepError::NetworkRestoreError(format!(
                         "writing '{}': {}",
-                        dest_path.display(),
+                        tmp_path.display(),
                         e
                     ))
                 })?;
@@ -328,12 +366,33 @@ impl NetworkRestore {
             let want = u32::from_le_bytes(crc_buf);
             let got = digest.finalize();
             if want != got {
-                let _ = std::fs::remove_file(&dest_path);
+                let _ = std::fs::remove_file(&tmp_path);
                 return Err(RepError::NetworkRestoreError(format!(
                     "digest mismatch for '{}': expected {:#010x}, got {:#010x}                      (file corrupted or truncated in transit)",
                     filename, want, got
                 )));
             }
+
+            // FID-NR-2: fsync the tmp file, then atomically rename it onto the
+            // final name. The rename is the single commit point; before it the
+            // final `.ndb` does not exist (or still holds the previous
+            // contents), so a crash can never leave a torn live log file.
+            out.sync_all().map_err(|e| {
+                RepError::NetworkRestoreError(format!(
+                    "fsync '{}': {}",
+                    tmp_path.display(),
+                    e
+                ))
+            })?;
+            drop(out);
+            std::fs::rename(&tmp_path, &dest_path).map_err(|e| {
+                RepError::NetworkRestoreError(format!(
+                    "renaming '{}' -> '{}': {}",
+                    tmp_path.display(),
+                    dest_path.display(),
+                    e
+                ))
+            })?;
 
             files_done += 1;
             self.update_progress(total_bytes, files_done);
@@ -526,9 +585,53 @@ impl NetworkRestore {
                 let _ = std::fs::rename(&dest_path, &backup);
             }
 
-            std::fs::write(&dest_path, body).map_err(|e| {
+            // FID-NR-2 (JE NetworkBackup.getFile, NetworkBackup.java:575):
+            // write to a `.tmp` file, fsync, then atomically rename onto the
+            // final name, so a crash can never leave a torn live `.ndb`.
+            // (The CRC was already verified in RAM above; the tmp+rename adds
+            // the on-disk atomicity.)
+            let tmp_path = log_dir.join(format!("{}.tmp", filename));
+            {
+                use std::io::Write as _;
+                let mut f = std::fs::File::create(&tmp_path).map_err(|e| {
+                    RepError::NetworkRestoreError(format!(
+                        "creating '{}': {}",
+                        tmp_path.display(),
+                        e
+                    ))
+                })?;
+                f.write_all(body).map_err(|e| {
+                    RepError::NetworkRestoreError(format!(
+                        "writing '{}': {}",
+                        tmp_path.display(),
+                        e
+                    ))
+                })?;
+                f.sync_all().map_err(|e| {
+                    RepError::NetworkRestoreError(format!(
+                        "fsync '{}': {}",
+                        tmp_path.display(),
+                        e
+                    ))
+                })?;
+            }
+            // FID-NR-2 crash witness: simulate a crash after the tmp file is
+            // durable but before the atomic rename. The final `.ndb` must not
+            // exist (or be left torn); only the `.tmp` is on disk.
+            #[cfg(test)]
+            if self
+                .crash_before_rename
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(RepError::NetworkRestoreError(
+                    "simulated crash before rename (FID-NR-2 witness)"
+                        .to_string(),
+                ));
+            }
+            std::fs::rename(&tmp_path, &dest_path).map_err(|e| {
                 RepError::NetworkRestoreError(format!(
-                    "writing '{}': {}",
+                    "renaming '{}' -> '{}': {}",
+                    tmp_path.display(),
                     dest_path.display(),
                     e
                 ))
@@ -1026,6 +1129,59 @@ mod tests {
         restore.execute_via_dispatcher().expect("valid digest must succeed");
         let written = std::fs::read(dir.path().join("00000002.ndb")).unwrap();
         assert_eq!(written, body);
+        // FID-NR-2: no leftover tmp file after a successful restore.
+        assert!(
+            !dir.path().join("00000002.ndb.tmp").exists(),
+            "the tmp file must be renamed away on success"
+        );
+    }
+
+    /// FID-NR-2 (S1, JE `NetworkBackup.getFile`, `NetworkBackup.java:575`):
+    /// a restore must write to a `.tmp` file and atomically rename it onto
+    /// the final name only after the digest verifies. A crash mid-write (here
+    /// simulated by the CRASH_BEFORE_RENAME hook firing after the tmp is
+    /// durable but before the rename) must leave the final `.ndb` UNCHANGED
+    /// (its prior intact contents, or absent) — never a torn/partial live log
+    /// file.
+    ///
+    /// Witness: RED at 81b2f048 (the base writes `std::fs::write(dest_path,
+    /// body)` directly, so a crash mid-write overwrites/truncates the live
+    /// `.ndb`). GREEN after the fix (the destination is only ever replaced by
+    /// an atomic rename, so a pre-rename crash leaves the old file intact and
+    /// only a `.tmp` behind).
+    #[test]
+    fn execute_via_dispatcher_crash_before_rename_leaves_final_intact() {
+        let filename = b"00000007.ndb";
+        let new_body = b"NEW restore bytes that must not land torn";
+        let old_body = b"OLD intact log file contents";
+        let mut payload = 1u32.to_le_bytes().to_vec();
+        payload.extend_from_slice(&(filename.len() as u16).to_le_bytes());
+        payload.extend_from_slice(filename);
+        payload.extend_from_slice(&(new_body.len() as u64).to_le_bytes());
+        payload.extend_from_slice(new_body);
+        payload.extend_from_slice(&crc32fast::hash(new_body).to_le_bytes());
+
+        let (_disp, addr) = spawn_fixed_reply_restore_server(payload);
+        let dir = tempfile::TempDir::new().unwrap();
+        // Pre-populate the destination with an intact prior log file.
+        std::fs::write(dir.path().join("00000007.ndb"), old_body).unwrap();
+
+        let restore = NetworkRestore::new(dispatcher_config(addr))
+            .with_local_dir(dir.path());
+
+        // Arm the per-instance crash hook, then run.
+        restore.arm_crash_before_rename();
+        let res = restore.execute_via_dispatcher();
+
+        assert!(res.is_err(), "the simulated crash must surface as an error");
+        // The live `.ndb` must still hold the OLD intact contents, never a
+        // partial copy of the new body.
+        let on_disk = std::fs::read(dir.path().join("00000007.ndb")).unwrap();
+        assert_eq!(
+            on_disk, old_body,
+            "FID-NR-2: a crash before the atomic rename must leave the live \
+             log file intact, not torn/overwritten"
+        );
     }
 
     /// `execute_via_dispatcher` called a second time (state already
