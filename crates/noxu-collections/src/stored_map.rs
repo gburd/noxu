@@ -142,6 +142,11 @@ where
     /// Returns the previous value associated with `key`, or `None`
     /// if the key was not present.  This is the `Map.put(...)`
     /// semantic from `java.util.Map`, matching BDB-JE.
+    ///
+    /// The get-old and the write are a single read-modify-write under one
+    /// cursor and one transaction (auto-commit when `txn` is `None`), so
+    /// the returned old value is exactly the value overwritten -- there is
+    /// no TOCTOU window (FID-DPL-28; JE `StoredContainer.putKeyValue`).
     pub fn put(
         &self,
         txn: Option<&Transaction>,
@@ -152,25 +157,37 @@ where
             return Err(CollectionError::ReadOnly);
         }
 
-        // Read-then-write under the user's txn so the read+write are
-        // serialisable as a single unit; if `txn` is `None` each call
-        // is its own auto-txn and the pair is observably non-atomic
-        // (acceptable v1.6 documented caveat — the same trade-off
-        // applies to BDB-JE's auto-commit `StoredMap.put`).
+        // FID-DPL-28: get-old + overwrite is ONE RMW cursor in ONE
+        // auto-commit transaction (JE `StoredContainer.putKeyValue`,
+        // StoredContainer.java:322).  The returned old value is exactly
+        // the value overwritten and no concurrent writer can interleave.
+        // `None` -> run under one auto-commit txn via the engine's
+        // `run_in_auto_commit` (JE beginAutoCommit/commitAutoCommit,
+        // which yields a real auto-txn for a transactional db and no txn
+        // for a non-transactional one); `Some(t)` -> RMW directly under
+        // the user's txn.
         let key_entry = encode_key(&self.key_binding, key)?;
         let value_entry = encode_value(&self.value_binding, value)?;
 
-        let old_value = match crate::internal::db_get(self.db, txn, &key_entry)?
-        {
-            Some(bytes) => {
-                let data_entry = noxu_db::DatabaseEntry::from_bytes(&bytes);
-                Some(decode_value(&self.value_binding, &data_entry)?)
-            }
-            None => None,
+        let old_bytes = match txn {
+            Some(_) => crate::internal::put_rmw(
+                self.db,
+                txn,
+                &key_entry,
+                &value_entry,
+            )?,
+            None => self.db.run_in_auto_commit(|t| {
+                crate::internal::put_rmw(self.db, t, &key_entry, &value_entry)
+            })?,
         };
 
-        crate::internal::db_put(self.db, txn, &key_entry, &value_entry)?;
-        Ok(old_value)
+        match old_bytes {
+            Some(bytes) => {
+                let data_entry = noxu_db::DatabaseEntry::from_bytes(&bytes);
+                Ok(Some(decode_value(&self.value_binding, &data_entry)?))
+            }
+            None => Ok(None),
+        }
     }
 
     /// Removes the entry for `key` and returns the previous value, or
@@ -184,21 +201,25 @@ where
             return Err(CollectionError::ReadOnly);
         }
 
+        // FID-DPL-28: get-old + delete is ONE RMW cursor in ONE
+        // auto-commit transaction (JE `StoredContainer.removeKey`,
+        // StoredContainer.java:339).
         let key_entry = encode_key(&self.key_binding, key)?;
 
-        let old_value = match crate::internal::db_get(self.db, txn, &key_entry)?
-        {
-            Some(bytes) => {
-                let data_entry = noxu_db::DatabaseEntry::from_bytes(&bytes);
-                Some(decode_value(&self.value_binding, &data_entry)?)
-            }
-            None => None,
+        let old_bytes = match txn {
+            Some(_) => crate::internal::remove_rmw(self.db, txn, &key_entry)?,
+            None => self.db.run_in_auto_commit(|t| {
+                crate::internal::remove_rmw(self.db, t, &key_entry)
+            })?,
         };
 
-        if old_value.is_some() {
-            crate::internal::db_delete(self.db, txn, &key_entry)?;
+        match old_bytes {
+            Some(bytes) => {
+                let data_entry = noxu_db::DatabaseEntry::from_bytes(&bytes);
+                Ok(Some(decode_value(&self.value_binding, &data_entry)?))
+            }
+            None => Ok(None),
         }
-        Ok(old_value)
     }
 
     /// Returns whether `key` is present in the database.
