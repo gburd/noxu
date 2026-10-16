@@ -935,6 +935,15 @@ impl Environment {
                             name
                         ))
                     }
+                    // GAP-REPLAY-3 (merge-prep follow-up): a create on a
+                    // replica is screened in `open_database_inner` (JE
+                    // `DbTree.doCreateDb` -> `checkReplicaWrite` ->
+                    // `disallowReplicaWrite`).  Surface the typed
+                    // `ReplicaWrite` here rather than flattening it to a
+                    // stringy `environment(...)`, matching the data path.
+                    noxu_dbi::DbiError::ReplicaWrite => {
+                        NoxuError::ReplicaWrite
+                    }
                     _ => NoxuError::environment(e.to_string()),
                 }
             })?
@@ -3980,6 +3989,119 @@ mod tests {
         // Clearing the screen (become_master) re-enables DDL.
         env.env_impl_arc_for_test().lock().set_replica_write_screen(false);
         assert!(env.truncate_database(None, "ddldb").is_ok());
+
+        let _ = env.close();
+    }
+
+    /// GAP-REPLAY-3 (merge-prep follow-up) WITNESS: on a REPLICA,
+    /// `open_database(allow_create=true)` of a NEW name (one that does not yet
+    /// exist) must be refused with `NoxuError::ReplicaWrite`, because creating
+    /// a database is a NameLN write that would diverge the replica from the
+    /// master.  Opening an EXISTING database (whether or not `allow_create` is
+    /// set) must still succeed, because that is a pure read -- no NameLN write.
+    ///
+    /// JE: `DbTree.doCreateDb` runs `checkReplicaWrite(nameLocker, repContext)`
+    /// before inserting the NameLN; `checkReplicaWrite` calls
+    /// `locker.disallowReplicaWrite()` (-> `ReplicaWriteException`) when the
+    /// create would assign a new VLSN (DbTree.java:577-582, 874-880).  Opening
+    /// an existing DB takes a read lock on the NameLN only -- no VLSN-
+    /// generating write -- so it is allowed on a replica (ReadonlyTxn allows
+    /// read locks; DatabaseImpl.allowReplicaWrite, DatabaseImpl.java:785).
+    ///
+    /// RED before the follow-up fix: `open_database` with `allow_create` of a
+    /// NEW name returned `Ok` on a replica (silent divergence -- the exact
+    /// residual the review flagged).  GREEN after: a NEW-name create returns
+    /// `ReplicaWrite`; an EXISTING-name open still returns `Ok`.
+    #[test]
+    fn gap_replay_3_merge_prep_open_database_create_screened_on_replica() {
+        let (_tmp, config) = temp_env_config();
+        let env = Environment::open(config).unwrap();
+        let db_config = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
+
+        // Create an existing database while still the master.
+        let db = env.open_database(None, "existing", &db_config).unwrap();
+        db.put(b"k", b"v").unwrap();
+        drop(db);
+
+        // Arm the replica-write screen (as become_replica now does).
+        env.env_impl_arc_for_test().lock().set_replica_write_screen(true);
+
+        // Opening the EXISTING database on a replica must still succeed: it is
+        // a read of the NameLN, not a write.  allow_create=true is fine here
+        // because the name already exists, so no NameLN is logged (JE: opening
+        // an existing DB with allow_create takes only a read lock).
+        let existing = env.open_database(None, "existing", &db_config);
+        assert!(
+            existing.is_ok(),
+            "opening an EXISTING database on a replica must succeed, got {:?}",
+            existing.err()
+        );
+        // And its data is still readable.
+        {
+            let edb = existing.unwrap();
+            assert_eq!(edb.get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
+            drop(edb);
+        }
+
+        // Creating a NEW database on a replica must be refused with
+        // ReplicaWrite -- this is the NameLN write JE screens via
+        // DbTree.checkReplicaWrite -> disallowReplicaWrite.
+        let created = env.open_database(None, "brand_new", &db_config);
+        assert!(
+            matches!(created, Err(NoxuError::ReplicaWrite)),
+            "open_database(allow_create) of a NEW name on a replica must \
+             return ReplicaWrite, got {:?}",
+            created.map(|_| "Ok(db)")
+        );
+        // The failed create must NOT have leaked the name into the catalog.
+        assert!(
+            !env.env_impl_arc_for_test()
+                .lock()
+                .get_database_names()
+                .iter()
+                .any(|n| n == "brand_new"),
+            "a screened create must not register the name on the replica"
+        );
+
+        // Clearing the screen (become_master) re-enables creation.
+        env.env_impl_arc_for_test().lock().set_replica_write_screen(false);
+        let now_ok = env.open_database(None, "brand_new", &db_config);
+        assert!(
+            now_ok.is_ok(),
+            "after clearing the screen, creating the DB must succeed, got {:?}",
+            now_ok.err()
+        );
+        drop(now_ok);
+
+        let _ = env.close();
+    }
+
+    /// GAP-REPLAY-3 (merge-prep follow-up) WITNESS: the transactional create
+    /// path (`open_database(Some(txn), allow_create)`) is screened on a replica
+    /// too.  This routes through `open_database_transactional` ->
+    /// `open_database_inner` with a `creating_txn_id`, the same create point
+    /// JE guards with `checkReplicaWrite` inside `DbTree.doCreateDb`.
+    #[test]
+    fn gap_replay_3_merge_prep_open_database_txn_create_screened_on_replica() {
+        let (_tmp, config) = temp_env_config();
+        let env = Environment::open(config).unwrap();
+        let db_config = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
+
+        env.env_impl_arc_for_test().lock().set_replica_write_screen(true);
+
+        let txn = env.begin_transaction(None).unwrap();
+        let created = env.open_database(Some(&txn), "txn_new", &db_config);
+        assert!(
+            matches!(created, Err(NoxuError::ReplicaWrite)),
+            "transactional open_database(allow_create) of a NEW name on a \
+             replica must return ReplicaWrite, got {:?}",
+            created.map(|_| "Ok(db)")
+        );
+        let _ = txn.abort();
 
         let _ = env.close();
     }
