@@ -226,6 +226,24 @@ recorded here for completeness.
   persistence, secondary-index, lock-manager, and environment-drop paths are
   fixed.
 
+- **Election value ranking dropped a non-JE `term` tiebreak** (`FID-ELECT-1`
+  follow-up): the `Proposal` ordering that selects the Phase-2 election value
+  (`choose_phase2_value`, JE `RankingProposer.choosePhase2Value`) ranked
+  candidates by `(dtvlsn, vlsn, priority, term, node_name)`. JE's value ranking
+  is only `(dtvlsn, vlsn)` (`Acceptor.SuggestionGenerator.Ranking.compareTo`,
+  `Acceptor.java:305-311`) plus the `RankingProposer` priority and socket-address
+  tiebreaks (`RankingProposer.java:105-128`) — it has **no term component**.
+  The extra `term` tiebreak let each concurrent proposer's own live round term
+  out-rank a peer's equally-good suggestion (which carries the peer's stale
+  acceptor term), so two tied candidates each picked THEMSELVES: a
+  value-selection duel. The interim `(term, proposer)` acceptor keying and value
+  guard already prevented this from becoming two masters, but it was a
+  convergence/liveness risk and a fidelity deviation (owner directive: Noxu
+  leader election mirrors JE in all ways except quoracle). The `term` tiebreak
+  is removed; the ranking is now exactly JE's `(dtvlsn, vlsn, priority, name)`,
+  where the node name stands in for JE's socket-address tiebreak (a stable,
+  per-group-unique identity). No on-disk, wire, or public-API change.
+
 ### Fixed — internal crates (no stability guarantee)
 
 The internal-tier crates (`noxu-cleaner`, `noxu-dbi`, `noxu-engine`,

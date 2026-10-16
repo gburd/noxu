@@ -17,9 +17,14 @@
 //!    preferred so that no committed transactions are lost.
 //! 2. **Higher priority wins**  -  allows operators to steer mastership towards
 //!    specific nodes (e.g. nodes with faster storage).
-//! 3. **Higher term wins**  -  more recent elections take precedence.
-//! 4. **Lexicographic node name**  -  deterministic tiebreaker when all else is
-//!    equal.
+//! 3. **Lexicographic node name**  -  deterministic tiebreaker when all else is
+//!    equal (JE's socket-address tiebreak role).
+//!
+//! There is deliberately **no term / proposal-number component** in this
+//! VALUE ranking: JE's `Ranking.compareTo` is only `(dtvlsn, vlsn)` and the
+//! Paxos round identity is a separate concern (the `(term, proposer)` promise
+//! key handled by the acceptor).  The round a candidate runs in must never
+//! change which node is the best master.
 
 use std::cmp::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -89,20 +94,35 @@ impl Proposal {
 
 impl Ord for Proposal {
     fn cmp(&self, other: &Self) -> Ordering {
-        // JE Ranking(major=dtvlsn, minor=vlsn), then priority / term / name.
-        // 1. Higher DTVLSN wins (the most-durable node). When both DTVLSNs are
-        //    0 (UNINITIALIZED / pre-DTVLSN), this is a tie and the comparison
-        //    falls through to VLSN — exactly JE getRanking's pre-DTVLSN
-        //    fallback `Ranking(vlsn, 0)`.
+        // JE election VALUE ranking (`Acceptor.SuggestionGenerator.Ranking`):
+        // major = dtvlsn, minor = vlsn (`Ranking.compareTo`, Acceptor.java:
+        // 305-311; value built by MasterSuggestionGenerator.getRanking =
+        // `new Ranking(dtvlsn, vlsn)`, MasterSuggestionGenerator.java:81),
+        // then the `RankingProposer.choosePhase2Value` priority tiebreak and
+        // finally the socket-address tiebreak (RankingProposer.java:116-123,
+        // "Use socket address to choose in case of a tie, so we always have a
+        // consistent ordering").  Noxu uses the node name — a stable
+        // per-group-unique identity — in the socket-address role.
+        //
+        // JE's ranking has NO term component: the election ROUND identity is
+        // the separate Paxos `(term, proposer)` promise key, which must never
+        // bias WHICH node is the best master.  (FID-ELECT-1: this ordering
+        // previously carried a `term` tiebreak, a Noxu invention that let a
+        // proposer's own live round term out-rank a peer's equally-good
+        // suggestion carrying a stale acceptor term — so two tied candidates
+        // each picked THEMSELVES, a value-selection duel; removed to match JE.)
+        //
+        // 1. Higher DTVLSN wins (the most-durable node).  When both DTVLSNs
+        //    are 0 (UNINITIALIZED / pre-DTVLSN), this is a tie and the
+        //    comparison falls through to VLSN — exactly JE getRanking's
+        //    pre-DTVLSN fallback `Ranking(vlsn, 0)`.
         self.dtvlsn
             .cmp(&other.dtvlsn)
             // 2. Higher VLSN wins.
             .then_with(|| self.vlsn.cmp(&other.vlsn))
             // 3. Higher priority wins.
             .then_with(|| self.priority.cmp(&other.priority))
-            // 4. Higher term wins.
-            .then_with(|| self.term.cmp(&other.term))
-            // 5. Lexicographic node name tiebreaker.
+            // 4. Lexicographic node name tiebreaker (JE socket-address role).
             .then_with(|| self.node_name.cmp(&other.node_name))
     }
 }
@@ -203,14 +223,22 @@ mod tests {
         assert!(!b.is_better_than(&a));
     }
 
-    // --- Term ordering (same VLSN, same priority) ---
+    // --- Term is NOT a ranking key (JE Ranking has no term) ---
 
     #[test]
-    fn test_higher_term_wins_same_vlsn_priority() {
+    fn test_term_is_not_a_ranking_key() {
+        // JE's election VALUE ranking is (dtvlsn, vlsn, priority, name) — the
+        // Paxos round term/number must NOT bias which node is the best master.
+        // Same vlsn+priority but different term: the term is ignored and the
+        // node NAME breaks the tie (node2 > node1), regardless of term.  Here
+        // node1 carries the HIGHER term (3) yet still loses to node2 (term 1).
         let a = Proposal::with_timestamp("node1".into(), 100, 5, 3, 0);
         let b = Proposal::with_timestamp("node2".into(), 100, 5, 1, 0);
-        assert!(a.is_better_than(&b));
-        assert!(!b.is_better_than(&a));
+        assert!(
+            b.is_better_than(&a),
+            "term must be ignored; name decides (node2 > node1)"
+        );
+        assert!(!a.is_better_than(&b));
     }
 
     // --- Name tiebreaker ---
