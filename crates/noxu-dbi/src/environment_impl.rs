@@ -678,6 +678,50 @@ impl EnvironmentImpl {
             })?;
         }
 
+        // FID-NR-1 (JE RestoreMarker + EnvironmentImpl open-time check): if a
+        // RestoreRequired marker is present, a prior network restore (or other
+        // curative action) left the log incoherent and did not complete. JE's
+        // recovery reads the <MAXINT>.jdb marker first and throws, refusing to
+        // open. Noxu checks for the marker up front and refuses with the
+        // existing RecoveryFailure variant, carrying the recorded failure type
+        // and diagnostics so the operator knows to (re)run the restore.
+        if let Some(rr) =
+            noxu_log::read_marker_file(&env_home).map_err(|e| {
+                DbiError::RecoveryFailure {
+                    reason: format!(
+                        "environment requires restore but the marker could \
+                         not be read: {e}"
+                    ),
+                }
+            })?
+        {
+            let mut detail = String::new();
+            let mut keys: Vec<&String> = rr.properties.keys().collect();
+            keys.sort();
+            for k in keys {
+                if let Some(v) = rr.properties.get(k) {
+                    detail.push_str(&format!(" {k}={v}"));
+                }
+            }
+            return Err(DbiError::RecoveryFailure {
+                reason: format!(
+                    "environment requires restore ({}): a prior {} did not \
+                     complete; the log is incoherent. Re-run the restore to \
+                     completion, then reopen.{}",
+                    rr.failure_type.as_str(),
+                    match rr.failure_type {
+                        noxu_log::entry::restore_required::FailureType::NetworkRestore =>
+                            "network restore",
+                        noxu_log::entry::restore_required::FailureType::LogChecksum =>
+                            "log-checksum repair",
+                        noxu_log::entry::restore_required::FailureType::BtreeCorruption =>
+                            "b-tree repair",
+                    },
+                    detail,
+                ),
+            });
+        }
+
         // Trees recovered from the log, keyed by database ID.
         // Populated during the recovery pass below (writable envs only).
         let mut recovered: HashMap<u64, noxu_tree::Tree> = HashMap::new();

@@ -8,9 +8,12 @@
 
 use std::io::{Read as IoRead, Write as IoWrite};
 use std::net::TcpStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use noxu_log::create_marker_file;
+use noxu_log::entry::restore_required::FailureType;
+use noxu_log::remove_marker_file;
 use noxu_sync::Mutex;
 
 use crate::error::{RepError, Result};
@@ -259,6 +262,13 @@ impl NetworkRestore {
         let mut total_bytes: u64 = 0;
         let mut files_done: u32 = 0;
 
+        // FID-NR-1: fence the environment BEFORE mutating any local log file.
+        // A crash from here until the marker is removed (after the full set
+        // transfers) leaves the marker in place, so reopening the env refuses.
+        if file_count > 0 {
+            self.write_restore_marker(&log_dir)?;
+        }
+
         for _ in 0..file_count {
             // Read filename length + name.
             let mut name_len_buf = [0u8; 2];
@@ -418,6 +428,13 @@ impl NetworkRestore {
             );
         }
 
+        // FID-NR-1: the full set transferred coherently — remove the marker so
+        // the environment is openable again (JE removeMarkerFile after the
+        // whole backup finishes).
+        if file_count > 0 {
+            self.remove_restore_marker(&log_dir)?;
+        }
+
         self.update_elapsed(started_at.elapsed());
         self.complete()?;
 
@@ -538,6 +555,11 @@ impl NetworkRestore {
         let mut files_done: u32 = 0;
         let mut buf2 = [0u8; 2];
         let mut buf8 = [0u8; 8];
+
+        // FID-NR-1: fence the environment BEFORE mutating any local log file.
+        if file_count > 0 {
+            self.write_restore_marker(&log_dir)?;
+        }
 
         for _ in 0..file_count {
             if off + 2 > payload.len() {
@@ -669,6 +691,11 @@ impl NetworkRestore {
             self.update_elapsed(started_at.elapsed());
         }
 
+        // FID-NR-1: the full set transferred coherently — remove the marker.
+        if file_count > 0 {
+            self.remove_restore_marker(&log_dir)?;
+        }
+
         self.update_elapsed(started_at.elapsed());
         self.complete()?;
 
@@ -728,6 +755,45 @@ impl NetworkRestore {
     pub fn update_elapsed(&self, elapsed: Duration) {
         let mut progress = self.progress.lock();
         progress.elapsed = elapsed;
+    }
+
+    /// FID-NR-1 (JE `NetworkBackup.getFile` -> `RestoreMarker.createMarkerFile`,
+    /// `NetworkBackup.java:683`): create the `RestoreRequired(NETWORK_RESTORE)`
+    /// marker in `log_dir` BEFORE any local log file is mutated, so a crash
+    /// mid-restore fences the environment — reopening it refuses (or forces a
+    /// restore) rather than mounting a half-restored, incoherent file set.
+    /// Idempotent (JE: "can be safely called multiple times").
+    fn write_restore_marker(&self, log_dir: &Path) -> Result<()> {
+        let mut props: hashbrown::HashMap<String, String> =
+            hashbrown::HashMap::new();
+        props
+            .insert("source_node".to_string(), self.config.source_node.clone());
+        props.insert(
+            "source".to_string(),
+            format!("{}:{}", self.config.source_host, self.config.source_port),
+        );
+        create_marker_file(log_dir, FailureType::NetworkRestore, props).map_err(
+            |e| {
+                RepError::NetworkRestoreError(format!(
+                    "creating restore marker in {}: {}",
+                    log_dir.display(),
+                    e
+                ))
+            },
+        )
+    }
+
+    /// FID-NR-1 (JE `NetworkBackup.getFiles` -> `restoreMarker.removeMarkerFile`,
+    /// `NetworkBackup.java:496`): remove the marker only after the ENTIRE set
+    /// has been transferred, so the environment is coherent again.
+    fn remove_restore_marker(&self, log_dir: &Path) -> Result<()> {
+        remove_marker_file(log_dir).map_err(|e| {
+            RepError::NetworkRestoreError(format!(
+                "removing restore marker in {}: {}",
+                log_dir.display(),
+                e
+            ))
+        })
     }
 
     /// Mark the restore as completed successfully.
@@ -1273,6 +1339,88 @@ mod tests {
         assert!(
             res.unwrap_err().to_string().contains("rename"),
             "error must describe the failed rename"
+        );
+    }
+
+    /// FID-NR-1 (S2, JE `NetworkBackup.getFile` -> `RestoreMarker`,
+    /// `NetworkBackup.java:683`; `EnvironmentImpl` open-time check): the client
+    /// must create the `RestoreRequired(NETWORK_RESTORE)` marker BEFORE
+    /// mutating any local log file, and a present marker must refuse the
+    /// environment on open. A crash mid-restore then fences the half-restored
+    /// env instead of letting it reopen as a usable-but-incoherent log.
+    ///
+    /// Witness: a two-file restore crashed (CRASH_BEFORE_RENAME) during the
+    /// first file. The marker must be present, and opening an
+    /// `EnvironmentImpl` on the dir must fail with a restore-required error.
+    /// RED at 81b2f048 (no marker is ever written; the env opens a partial
+    /// set). GREEN after the fix.
+    #[test]
+    fn crash_mid_restore_writes_marker_and_env_open_refuses() {
+        use noxu_dbi::EnvironmentImpl;
+
+        // Two-file payload so the crash lands after the marker is written and
+        // before the set is complete.
+        let mut payload = 2u32.to_le_bytes().to_vec();
+        for (name, body) in [
+            (b"00000000.ndb".as_slice(), b"file zero body".as_slice()),
+            (b"00000001.ndb".as_slice(), b"file one body".as_slice()),
+        ] {
+            payload.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            payload.extend_from_slice(name);
+            payload.extend_from_slice(&(body.len() as u64).to_le_bytes());
+            payload.extend_from_slice(body);
+            payload.extend_from_slice(&crc32fast::hash(body).to_le_bytes());
+        }
+
+        let (_disp, addr) = spawn_fixed_reply_restore_server(payload);
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let restore = NetworkRestore::new(dispatcher_config(addr))
+            .with_local_dir(dir.path());
+        restore.arm_crash_before_rename();
+        let res = restore.execute_via_dispatcher();
+        assert!(res.is_err(), "the simulated crash must surface as an error");
+
+        // FID-NR-1: the marker must be present after a crashed restore.
+        assert!(
+            noxu_log::marker_present(dir.path()),
+            "a crashed restore must leave the RestoreRequired marker"
+        );
+
+        // FID-NR-1: opening the environment on this incoherent dir must refuse.
+        let open = EnvironmentImpl::new(dir.path(), false, true);
+        let err =
+            open.err().expect("opening a marked (half-restored) env must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("requires restore") || msg.contains("NETWORK_RESTORE"),
+            "refusal must mention the restore requirement, got: {msg}"
+        );
+    }
+
+    /// FID-NR-1: a COMPLETE restore removes the marker, so the environment is
+    /// not spuriously fenced.
+    #[test]
+    fn complete_restore_removes_marker() {
+        let filename = b"00000000.ndb";
+        let body = b"complete file";
+        let mut payload = 1u32.to_le_bytes().to_vec();
+        payload.extend_from_slice(&(filename.len() as u16).to_le_bytes());
+        payload.extend_from_slice(filename);
+        payload.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        payload.extend_from_slice(body);
+        payload.extend_from_slice(&crc32fast::hash(body).to_le_bytes());
+
+        let (_disp, addr) = spawn_fixed_reply_restore_server(payload);
+        let dir = tempfile::TempDir::new().unwrap();
+        let restore = NetworkRestore::new(dispatcher_config(addr))
+            .with_local_dir(dir.path());
+        restore.execute_via_dispatcher().expect("restore must succeed");
+
+        // Marker removed on success — the env is not fenced by a stale marker.
+        assert!(
+            !noxu_log::marker_present(dir.path()),
+            "a completed restore must remove the marker"
         );
     }
 }

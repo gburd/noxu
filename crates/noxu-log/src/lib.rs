@@ -56,6 +56,7 @@ pub mod file_manager;
 pub mod fsync_manager;
 pub mod log_source;
 pub(crate) mod posio;
+pub mod restore_marker;
 
 // Buffer and log management
 pub mod log_buffer;
@@ -105,5 +106,9 @@ pub use log_file_reader::LogFileReader;
 pub use log_manager::{LogManager, LogManagerStats};
 pub use loggable::Loggable;
 pub use provisional::Provisional;
+pub use restore_marker::{
+    MARKER_FILE_NAME, create_marker_file, marker_present, read_marker_file,
+    remove_marker_file,
+};
 pub use write_observer::LogWriteObserver;
 pub use write_observer::{ObsoleteKind, ObsoleteLsn};
