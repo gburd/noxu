@@ -303,15 +303,18 @@ fn headline5_no_trigger_unchanged_behaviour() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Extra — auto-commit (non-transactional) put fires put with txn=None and
-// no commit trigger (no explicit txn handle to note).  JE: trigger txn arg is
-// null when non-transactional; auto-commit commits immediately.
+// Extra — auto-commit (txn=None) put on a TRANSACTIONAL db fires put with a
+// NON-null AutoTransaction txn and a Commit trigger, exactly as JE does.
+// JE `Database.put` auto-commit uses `Txn.createAutoTxn` (a real `Txn`);
+// `TriggerManager.runTriggers` derives the trigger Transaction from
+// `((Txn)locker).getTransaction()` which returns `new AutoTransaction(this)`
+// (Txn.java:getTransaction), and calls `noteTriggerDb`, so the commit trigger
+// fires when the auto-txn commits.  (Before the v7.11.1 single-locker fix,
+// Noxu ran the trigger OUTSIDE the primary's txn scope and reported txn=None
+// with no commit — a divergence from JE this fix corrects.  Witness (d).)
 // ───────────────────────────────────────────────────────────────────────────
-
-// JE: InvokeTest.testKVOpsAuto (partial) — put fires with a null/None txn
-// arg under auto-commit (KVOps(null)).
 #[test]
-fn auto_commit_put_fires_with_none_txn() {
+fn auto_commit_put_fires_with_some_txn_and_commit() {
     let dir = TempDir::new().unwrap();
     let e = env(&dir);
     let (trig, calls) = Recorder::new("rec");
@@ -324,15 +327,23 @@ fn auto_commit_put_fires_with_none_txn() {
     db.put(ent(b"k"), ent(b"v")).unwrap();
 
     let c = calls.lock().unwrap().clone();
-    assert_eq!(
-        c,
-        vec![Call::Put {
-            txn: None,
-            key: b"k".to_vec(),
-            old: None,
-            new: b"v".to_vec(),
-        }]
-    );
+    match c.as_slice() {
+        [
+            Call::Put { txn: Some(id), key, old: None, new },
+            Call::Commit(cid),
+        ] => {
+            assert_eq!(key, b"k");
+            assert_eq!(new, b"v");
+            assert_eq!(
+                id, cid,
+                "the put trigger must see the SAME txn that commits \
+                 (JE AutoTransaction); witness (d)"
+            );
+        }
+        other => panic!(
+            "auto-commit put must fire Put(Some(txn)) + Commit; got {other:?}"
+        ),
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -352,13 +363,21 @@ fn auto_commit_put_fires_with_none_txn() {
 /// Run the JE KVOps step sequence against `db` under the given (optional)
 /// transaction, asserting the per-step put/delete trigger arguments exactly as
 /// JE verifyPut / verifyDelete do.  `txn` is the Noxu handle (None = auto-commit,
-/// i.e. JE KVOps(null)); `expect_txn` is the id the trigger should observe.
+/// i.e. JE KVOps(null)); `expect_txn` is the id the trigger should observe
+/// for the EXPLICIT-txn case.  For the auto-commit case (`txn == None`),
+/// `expect_txn` must be `None` and the trigger observes a NON-null, per-op
+/// `AutoTransaction` id followed by a `Commit` event — JE `Txn.getTransaction`
+/// returns `new AutoTransaction(this)` for an auto `Txn`, and
+/// `TriggerManager.runTriggers` calls `noteTriggerDb`, so the commit trigger
+/// fires when the auto-txn commits (TriggerManager.java:runTriggers +
+/// Txn.java:getTransaction / createAutoTxn).
 fn run_kvops(
     db: &noxu_db::Database,
     calls: &Arc<Mutex<Vec<Call>>>,
     txn: Option<&noxu_db::Transaction>,
     expect_txn: Option<u64>,
 ) {
+    let auto = txn.is_none();
     let put = |db: &noxu_db::Database, k: &[u8], v: &[u8]| match txn {
         Some(t) => db.put_in(t, ent(k), ent(v)).unwrap(),
         None => {
@@ -373,45 +392,88 @@ fn run_kvops(
     };
     let reset = || calls.lock().unwrap().clear();
 
+    // Assert the recorded put/delete arg and, for the auto-commit case, the
+    // trailing Commit event, returning the observed op txn id.  For the
+    // explicit case the arg must equal `expect_txn`; for auto it must be a
+    // non-null AutoTransaction id and a `Commit(id)` must follow it.
+    let check_put =
+        |old: Option<Vec<u8>>, new: &[u8]| {
+            let c = calls.lock().unwrap().clone();
+            match (auto, c.as_slice()) {
+                (false, [one]) => assert_eq!(
+                    *one,
+                    Call::Put {
+                        txn: expect_txn,
+                        key: b"k".to_vec(),
+                        old,
+                        new: new.to_vec(),
+                    }
+                ),
+                (
+                    true,
+                    [
+                        Call::Put { txn: Some(id), key, old: o, new: n },
+                        Call::Commit(cid),
+                    ],
+                ) => {
+                    assert_eq!(key, b"k");
+                    assert_eq!(*o, old);
+                    assert_eq!(n, new);
+                    assert_eq!(
+                        id, cid,
+                        "auto-commit put trigger + commit must share the \
+                         AutoTransaction id"
+                    );
+                }
+                other => panic!("unexpected put trigger calls: {other:?}"),
+            }
+        };
+    let check_delete = |old: &[u8]| {
+        let c = calls.lock().unwrap().clone();
+        match (auto, c.as_slice()) {
+            (false, [one]) => assert_eq!(
+                *one,
+                Call::Delete {
+                    txn: expect_txn,
+                    key: b"k".to_vec(),
+                    old: old.to_vec(),
+                }
+            ),
+            (
+                true,
+                [
+                    Call::Delete { txn: Some(id), key, old: o },
+                    Call::Commit(cid),
+                ],
+            ) => {
+                assert_eq!(key, b"k");
+                assert_eq!(o, old);
+                assert_eq!(
+                    id, cid,
+                    "auto-commit delete trigger + commit must share the \
+                     AutoTransaction id"
+                );
+            }
+            other => panic!("unexpected delete trigger calls: {other:?}"),
+        }
+    };
+
     // Nothing fired yet.  JE verifyPut(0, null, null, null).
     assert!(calls.lock().unwrap().is_empty());
 
     // Insert: oldData = None.  JE verifyPut(1, key, data1, null).
     put(db, b"k", b"\x02");
-    assert_eq!(
-        *calls.lock().unwrap(),
-        vec![Call::Put {
-            txn: expect_txn,
-            key: b"k".to_vec(),
-            old: None,
-            new: b"\x02".to_vec(),
-        }]
-    );
+    check_put(None, b"\x02");
     reset();
 
     // Update: oldData = Some(data1).  JE verifyPut(1, key, data2, data1).
     put(db, b"k", b"\x03");
-    assert_eq!(
-        *calls.lock().unwrap(),
-        vec![Call::Put {
-            txn: expect_txn,
-            key: b"k".to_vec(),
-            old: Some(b"\x02".to_vec()),
-            new: b"\x03".to_vec(),
-        }]
-    );
+    check_put(Some(b"\x02".to_vec()), b"\x03");
     reset();
 
     // Delete SUCCESS: oldData = Some(data2).  JE verifyDelete(1, key, data2).
     assert!(del(db, b"k"), "first delete must succeed");
-    assert_eq!(
-        *calls.lock().unwrap(),
-        vec![Call::Delete {
-            txn: expect_txn,
-            key: b"k".to_vec(),
-            old: b"\x03".to_vec(),
-        }]
-    );
+    check_delete(b"\x03");
     reset();
 
     // Delete NOTFOUND: no record removed => NO delete trigger fires.
@@ -452,7 +514,9 @@ fn kvops_auto() {
         .with_trigger(trig);
     let db = e.open_database(None, "kv_a", &cfg).unwrap();
 
-    // JE KVOps(null): auto-commit, trigger observes a null (None) txn arg.
+    // JE KVOps(null): auto-commit on a transactional db uses an
+    // AutoTransaction, so each op's trigger observes a non-null, per-op txn id
+    // and a Commit fires (see run_kvops auto handling).
     run_kvops(&db, &calls, None, None);
 }
 

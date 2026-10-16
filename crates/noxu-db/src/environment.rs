@@ -1404,7 +1404,20 @@ impl Environment {
             }
         }
 
-        let txn_id = self.next_txn_id.fetch_add(1, Ordering::Relaxed);
+        // JE uses ONE transaction-id allocator (`TxnManager`) for every
+        // transaction, explicit and auto-commit alike, so a transaction's id
+        // in the WAL (LN `txn_id` + `TxnCommit`) is globally unique within a
+        // recovery window.  Noxu historically had a SEPARATE
+        // `Environment::next_txn_id` counter for the explicit-txn outer id,
+        // which was only safe while auto-commit logged its LNs in the
+        // `txn_id = 0` form.  The v7.11.1 single-locker fix makes auto-commit
+        // write real-id LNs + a `TxnCommit` (drawn from `TxnManager`), so the
+        // explicit outer id MUST come from the same allocator or the two id
+        // spaces collide and recovery mis-resolves one as the other.  The
+        // outer id is derived from the inner `Txn` below (allocated by
+        // `TxnManager`, which recovery seeds via `set_last_txn_id`); this
+        // standalone counter is only the fallback for a WAL-less env.
+        let fallback_txn_id = self.next_txn_id.fetch_add(1, Ordering::Relaxed);
         // F3: when the caller does not supply a TransactionConfig, the
         // environment-level `Durability` default (`EnvironmentConfig::durability`,
         // settable via `EnvironmentConfig::with_durability`) must be
@@ -1453,15 +1466,6 @@ impl Environment {
                 txn_config = txn_config.with_serializable_isolation(true);
             }
         }
-
-        let txn_state = Arc::new(TransactionState {
-            id: txn_id,
-            config: txn_config.clone(),
-            committed: AtomicBool::new(false),
-            aborted: AtomicBool::new(false),
-        });
-
-        self.active_txns.insert(txn_id, txn_state);
 
         // Wire the transaction to the WAL so commit/abort write log entries.
         // Also create an inner Txn for per-record lock management.
@@ -1512,6 +1516,23 @@ impl Environment {
                 Arc::new(std::sync::Mutex::new(t))
             })
             .ok();
+        // Derive the outer transaction id from the inner `Txn` (TxnManager
+        // allocator) so the explicit-txn and auto-commit id spaces are one
+        // and the same (see the `fallback_txn_id` comment above).  A WAL-less
+        // env has no inner `Txn`; use the standalone counter there.
+        let txn_id = inner_txn
+            .as_ref()
+            .map(|it| it.lock().unwrap().id_as_locker() as u64)
+            .unwrap_or(fallback_txn_id);
+
+        let txn_state = Arc::new(TransactionState {
+            id: txn_id,
+            config: txn_config.clone(),
+            committed: AtomicBool::new(false),
+            aborted: AtomicBool::new(false),
+        });
+        self.active_txns.insert(txn_id, txn_state);
+
         // TXN-2 (JE TxnManager.registerTxn `nActiveSerializable` path):
         // Increment the serializable counter exactly once per serializable
         // explicit txn.  The counterpart decrement is in

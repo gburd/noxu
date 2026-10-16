@@ -31,7 +31,7 @@ use noxu_sync::Mutex;
 // types matching under `--cfg noxu_shuttle`, `Database`'s RwLock-typed fields
 // use the same seam. Under the default cfg `dst_sync_pl::RwLock` *is*
 // `noxu_sync::RwLock` (transparent re-export), so production is byte-identical.
-use noxu_txn::{Durability, LockManager, TxnManager, UndoRecord};
+use noxu_txn::{Durability, LockManager, TxnManager};
 use noxu_util::dst_sync_pl::RwLock;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -272,151 +272,168 @@ impl Database {
         }
     }
 
-    /// Allocates a synthetic auto-commit `Txn` and runs `op` under it.
+    /// Builds a cursor for an optional transaction: under `txn` when present
+    /// (`make_cursor_for_txn`), or an auto-commit cursor (`make_cursor`,
+    /// locker_id = 0) when `None`.  The `None` case is the JE `ThreadLocker`
+    /// path for a non-transactional database.
+    fn make_cursor_opt(&self, txn: Option<&Transaction>) -> CursorImpl {
+        match txn {
+            Some(t) => self.make_cursor_for_txn(t),
+            None => self.make_cursor(),
+        }
+    }
+
+    /// Runs `op` under a single synthetic auto-commit `Transaction` that
+    /// spans the primary write AND all secondary-index maintenance, FK
+    /// actions and triggers, then commits once with the database's
+    /// auto-commit durability (JE Option B: one `Locker`, one commit).
     ///
-    /// `op` receives an auto-commit-wired [`CursorImpl`] (locker_id = 0
-    /// so the LN is logged with the auto-commit `InsertLN` / `DeleteLN`
-    /// form, txn_ref set so the lock manager sees the synthetic auto-txn
-    /// as the owner).
+    /// This is the auto-commit counterpart of
+    /// [`crate::Environment::begin_transaction`] but is NOT registered in
+    /// the environment's `active_txns` registry (an auto-commit op has no
+    /// user handle and finalises within this call, exactly like JE's
+    /// `Txn.createAutoTxn`, which `LockerFactory.getWritableLocker` ends in
+    /// the enclosing `finally` via `locker.operationEnd`).
     ///
-    /// On `Ok(value)`:
-    ///   * Drops the cursor (closing it).
-    ///   * Calls [`Txn::commit_with_durability`] on the synthetic auto-txn
-    ///     with a [`Durability`] derived from the database's
-    ///     `no_sync` / `write_no_sync` config; this releases all locks
-    ///     and (for `CommitSync`) fsyncs up to the LN's LSN via
-    ///     `LogManager::flush_sync_if_needed` for many-to-one fsync
-    ///     coalescing under concurrent write load.
-    ///   * Records the commit in the txn manager statistics and removes
-    ///     the diagnostic locker label.
+    /// `op` receives two `Option<&Transaction>` arguments:
+    /// * `primary_txn` — ALWAYS `Some`, the locker the primary write runs
+    ///   under (so its write lock is held until the single commit and is
+    ///   released by `commit`/`abort`); and
+    /// * `assoc_txn` — the locker to thread into secondary maintenance, FK
+    ///   actions and triggers: `Some(primary_txn)` for a TRANSACTIONAL
+    ///   database (single atomic locker), or `None` for a NON-transactional
+    ///   database (JE `ThreadLocker`: the secondary cursors are auto-commit,
+    ///   NOT part of an atomic txn, and a `Transaction` cannot be opened on a
+    ///   non-transactional database anyway).
     ///
-    /// On `Err(e)`:
-    ///   * Drops the cursor.
-    ///   * Calls [`Txn::abort_collect_undo`] to harvest before-image undo
-    ///     records WITHOUT releasing the held write locks (so a reader
-    ///     blocked on a write lock cannot observe the in-flight value
-    ///     before we restore the before-image).
-    ///   * Applies the undo records to the in-memory B-tree.
-    ///   * Calls [`Txn::release_all_locks`] to drain the held locks.
-    ///   * Records the abort in the txn manager statistics and removes
-    ///     the diagnostic locker label.
-    ///   * Returns `Err(e)`.
+    /// For a transactional database the synthetic `Transaction` wraps an
+    /// inner `Txn` from `EnvironmentImpl::begin_txn` (LogManager attached,
+    /// `suppress_own_end_frame` set), so the OUTER `Transaction` writes the
+    /// single `TxnCommit` frame and fsyncs ONCE for the whole batch.  Every
+    /// LN (primary + secondaries) carries this txn's id, so after a crash
+    /// recovery sees ALL of them (if the `TxnCommit` is durable) or NONE —
+    /// closing the primary↔secondary atomicity gap.  For a non-transactional
+    /// database the synthetic `Transaction` wraps a `begin_auto_txn` `Txn`
+    /// (auto-flagged: no `TxnCommit`, LN logged in the `txn_id = 0` form) so
+    /// the primary write's lock is still managed/released, but there is no
+    /// atomic unit — exactly the old auto-commit behaviour and JE's
+    /// `ThreadLocker` semantics.
     ///
-    /// Closes the first F12 residual: an auto-commit op now goes through
-    /// the same lock-tracking and abort-undo machinery as an explicit
-    /// transaction, so two concurrent inserts of the same brand-new key
-    /// serialise through the lock manager and a forced mid-write failure
-    /// rolls back the in-memory tree mutation.
-    fn with_auto_txn<F, T>(&self, op: F) -> Result<T>
+    /// On any error `op` returns, the transaction aborts once, undoing the
+    /// primary (and, for a transactional db, every secondary) write
+    /// (`Transaction::abort` collects undo with the write locks still held,
+    /// then releases them).
+    ///
+    /// JE: `Database.put` (Database.java:1593-1607)
+    /// `LockerFactory.getWritableLocker` → `cursor.putInternal` →
+    /// `locker.operationEnd`; `Cursor.putNotify` (Cursor.java:2779) runs
+    /// `secDb.updateSecondary(locker, …)` under the SAME `locker`.
+    fn with_auto_commit_transaction<F, T>(&self, op: F) -> Result<T>
     where
-        F: FnOnce(&mut CursorImpl) -> Result<T>,
+        F: FnOnce(Option<&Transaction>, Option<&Transaction>) -> Result<T>,
     {
-        let mut auto_txn =
-            self.txn_manager.begin_auto_txn(self.log_manager.clone());
-        // An auto-commit locker on a non-replicated database defaults to
-        // local-write=true (writes are local since there's nothing to
-        // replicate); on a replicated database it is local-write=false so
-        // the write replicates normally, matching how an explicit
-        // transaction on a replicated database behaves by default.
-        auto_txn.set_local_write(!self.db_impl.read().is_replicated());
-        let synthetic_id = auto_txn.id_as_locker();
-        let auto_txn_arc = Arc::new(std::sync::Mutex::new(auto_txn));
+        let transactional = self.config.transactional;
+        let is_replicated = self.db_impl.read().is_replicated();
 
-        let mut cursor = self.make_cursor();
-        cursor.attach_txn(Arc::clone(&auto_txn_arc));
-
-        let result = op(&mut cursor);
-        // Drop the cursor handle (un-pins BIN, drops Arc<Mutex<Txn>> ref).
-        drop(cursor);
-
-        // Reclaim sole ownership of the synthetic auto-txn so we can
-        // finalise it.  All cursors and their Arcs were dropped above.
-        let mut auto_txn = match Arc::try_unwrap(auto_txn_arc) {
-            Ok(m) => m.into_inner().unwrap_or_else(|p| p.into_inner()),
-            Err(_arc) => {
-                // A cursor escaped the closure with a clone of the txn
-                // Arc.  This is a caller-side bug — leak the auto-txn
-                // (its Drop calls `close()` which aborts) and surface a
-                // typed error.  No undo applied because we cannot
-                // safely take the Txn out of the shared Arc.
-                return Err(NoxuError::OperationNotAllowed(
-                    "with_auto_txn: synthetic auto-txn outlived cursor scope"
-                        .to_string(),
-                ));
-            }
+        // Build the inner `Txn`:
+        //  * transactional   -> `begin_txn` (real Txn; outer Transaction owns
+        //                        the single TxnCommit + fsync),
+        //  * non-transactional -> `begin_auto_txn` (auto Txn; no TxnCommit,
+        //                        LN logged txn_id=0; just manages/releases the
+        //                        primary write lock — JE ThreadLocker).
+        let mut inner = if transactional {
+            let env = self.env_impl.lock();
+            env.begin_txn().map_err(NoxuError::from)?
+        } else {
+            self.txn_manager.begin_auto_txn(self.log_manager.clone())
         };
-        let txn_manager = Arc::clone(&self.txn_manager);
+        // Local-write defaults to true on a non-replicated database (nothing
+        // to replicate); on a replicated database it replicates normally —
+        // matching `begin_transaction`.
+        inner.set_local_write(!is_replicated);
+        // Use the inner `Txn`'s recovery-seeded locker id (from
+        // `TxnManager::next_txn_id`, which recovery restores via
+        // `set_last_txn_id`) as the OUTER `Transaction` id so the LN txn_id
+        // and the `TxnCommit` frame id match and are unique across restarts,
+        // and share the one id space with explicit transactions (see
+        // `Environment::begin_transaction`).
+        let txn_id = inner.id_as_locker() as u64;
 
-        match result {
+        // The outer `Transaction` config / commit take the `noxu-db`
+        // `Durability` struct (SyncPolicy triple), derived from the same
+        // `no_sync` / `write_no_sync` flags that `auto_commit_durability`
+        // maps to the `noxu_txn::Durability` enum used by the raw-`Txn`
+        // path.  Keep the two in lock-step.
+        let durability = if self.no_sync {
+            crate::durability::Durability::COMMIT_NO_SYNC
+        } else if self.write_no_sync {
+            crate::durability::Durability::COMMIT_WRITE_NO_SYNC
+        } else {
+            crate::durability::Durability::COMMIT_SYNC
+        };
+        let txn_config =
+            crate::transaction_config::TransactionConfig::default()
+                .with_durability(durability);
+
+        // Mirror `Environment::begin_transaction`'s wiring, minus the
+        // active-txns registry (auto-commit ops are not registered) and the
+        // replica-ack coordinator (reachable only from the `Environment`
+        // handle, not from a `Database`; the prior auto-commit path likewise
+        // never waited for replica acks).
+        let txn = match &self.log_manager {
+            Some(lm) => Transaction::with_log_manager(
+                txn_id,
+                txn_config,
+                Arc::clone(lm),
+            ),
+            None => Transaction::new(txn_id, txn_config),
+        }
+        .with_inner_txn(Arc::new(std::sync::Mutex::new(inner)))
+        .with_env_impl(Arc::clone(&self.env_impl));
+
+        // Secondaries/triggers run under the SAME locker for a transactional
+        // database; for a non-transactional database they must run auto-commit
+        // (`None`) — a `Transaction` cannot be opened on a non-txnal db.
+        let assoc_txn = if transactional { Some(&txn) } else { None };
+
+        match op(Some(&txn), assoc_txn) {
             Ok(value) => {
-                let durability = self.auto_commit_durability();
-                if let Err(e) = auto_txn.commit_with_durability(durability) {
-                    // Commit failed (e.g. log fsync error).  Undo the
-                    // in-memory tree write so we are not left in an
-                    // inconsistent state, then surface the error.
-                    let undo_records =
-                        auto_txn.abort_collect_undo().unwrap_or_default();
-                    self.apply_auto_txn_undo(undo_records);
-                    auto_txn.release_all_locks();
-                    txn_manager.abort_txn(synthetic_id);
-                    return Err(NoxuError::OperationNotAllowed(format!(
-                        "auto-commit fsync failed: {e}"
-                    )));
-                }
-                txn_manager.commit_txn(synthetic_id);
+                txn.commit_with_durability(durability)?;
                 Ok(value)
             }
             Err(e) => {
-                // Phase 1: collect undo without releasing write locks.
-                let undo_records =
-                    auto_txn.abort_collect_undo().unwrap_or_default();
-                // Phase 2: apply undo while write locks are still held
-                // so any concurrent reader blocked on a write lock
-                // cannot observe the in-flight value.
-                self.apply_auto_txn_undo(undo_records);
-                // Phase 3: drain locks.
-                auto_txn.release_all_locks();
-                txn_manager.abort_txn(synthetic_id);
+                // Undo the primary AND (for a txnal db) every secondary write,
+                // release locks.  Preserve the original error even if the
+                // abort itself fails (a failed abort is logged inside `abort`).
+                let _ = txn.abort();
                 Err(e)
             }
         }
     }
 
-    /// Applies undo records collected from a synthetic auto-txn to the
-    /// in-memory B-tree of `self`.  Mirrors the per-`undo_record` block
-    /// in `Transaction::abort()` but specialised for the
-    /// single-database `with_auto_txn` case so we do not need to thread
-    /// the env-impl in.
-    fn apply_auto_txn_undo(&self, mut undo_records: Vec<UndoRecord>) {
-        // Apply newest-LSN first so multi-step writes (delete + reinsert)
-        // unwind in reverse-operation order.  See the matching sort in
-        // `Transaction::abort()`.
-        undo_records.sort_by_key(|r| std::cmp::Reverse(r.current_lsn));
-        let db_id_match = self.id;
-        let db_guard = self.db_impl.read();
-        let Some(tree) = db_guard.get_real_tree() else { return };
-        for undo in undo_records {
-            // The synthetic auto-txn touches only this database, but be
-            // defensive in case future changes broaden the contract.
-            if undo.database_id != db_id_match {
-                continue;
-            }
-            let Some(abort_key) = undo.abort_key else { continue };
-            if undo.abort_known_deleted {
-                if tree.delete(&abort_key) {
-                    db_guard.decrement_entry_count();
-                }
-            } else if let Some(abort_data) = undo.abort_data {
-                let lsn = noxu_util::Lsn::from_u64(undo.abort_lsn);
-                if let Ok(is_new) = tree.insert(abort_key, abort_data, lsn)
-                    && is_new
-                {
-                    // Restoring a slot that the aborted txn had deleted:
-                    // re-bump the counter that the in-memory delete
-                    // already decremented.
-                    db_guard.increment_entry_count();
-                }
-            }
+    /// Runs `op` under a single auto-commit `Transaction` scope when
+    /// `txn == None`, or under the caller's `txn` otherwise.  Lets sibling
+    /// handles (e.g. `SecondaryDatabase::delete`, JE
+    /// `SecondaryDatabase.delete` :715-812) span several primary writes with
+    /// ONE locker + ONE commit, exactly like a single `Database::delete`.
+    /// `op` receives `(primary_txn, assoc_txn)` as in
+    /// [`Self::with_auto_commit_transaction`].
+    ///
+    /// **Internal** — `Transaction` wiring detail; not part of the public
+    /// surface.
+    pub(crate) fn in_auto_commit_scope<F, T>(
+        &self,
+        txn: Option<&Transaction>,
+        op: F,
+    ) -> Result<T>
+    where
+        F: FnOnce(Option<&Transaction>, Option<&Transaction>) -> Result<T>,
+    {
+        match txn {
+            // Caller's explicit txn is the locker for both the primary and the
+            // associations.
+            Some(t) => op(Some(t), Some(t)),
+            None => self.with_auto_commit_transaction(op),
         }
     }
 
@@ -860,81 +877,93 @@ impl Database {
         // the overwrite so we can pass it as `old_data` to the
         // secondary key creator below.  When the put is a fresh
         // insert the read returns NotFound and `old_data_for_secondaries`
-        // remains `None`.  We re-read here using the caller's txn for
-        // the read so isolation is honoured.
+        // remains `None`.
         let secondaries_pre = self.live_secondaries();
         let need_old_data =
             !secondaries_pre.is_empty() || self.has_user_triggers();
-        let old_data_for_secondaries: Option<Vec<u8>> = if !need_old_data {
-            None
-        } else {
-            self.get_bytes(txn, key_bytes)?.map(|b| b.to_vec())
+
+        // JE Option B: the primary put, old-data read, secondary maintenance
+        // and triggers ALL run under one `Locker` (`Cursor.putNotify`,
+        // Cursor.java:2779-2805: `secDb.updateSecondary(locker, …)` then
+        // `TriggerManager.runPutTriggers(locker, …)` under the SAME locker).
+        // Both the explicit-txn and auto-commit paths funnel through this one
+        // closure with a non-null `Transaction`, so they are literally the
+        // same code — exactly as `Database.put` is in JE.
+        let do_put = |pt: Option<&Transaction>,
+                      at: Option<&Transaction>|
+         -> Result<()> {
+            // Read old data under the association locker (`at`): the SAME
+            // locker for a transactional db (so a reader cannot see the
+            // primary without its matching secondary at RC / RR — JE reads
+            // old data inside `putNoNotify` under the write locker), or `None`
+            // for a non-transactional db (the public `get_bytes` rejects a
+            // `Transaction` on a non-txnal database; JE ThreadLocker reads
+            // without a txn there).  `get_bytes(at, …)` self-locks on `at`,
+            // so no self-conflict with the primary write under `pt`.
+            let old_data_for_secondaries: Option<Vec<u8>> = if !need_old_data {
+                None
+            } else {
+                self.get_bytes(at, key_bytes)?.map(|b| b.to_vec())
+            };
+
+            // Primary put under the primary locker.
+            let mut cursor = self.make_cursor_opt(pt);
+            cursor
+                .put_with_expiration(
+                    key_bytes,
+                    data_bytes,
+                    PutMode::Overwrite,
+                    expiration,
+                )
+                .map_err(NoxuError::from)?;
+            drop(cursor);
+
+            // Secondaries BEFORE triggers (JE `Cursor.putNotify` order:
+            // `updateSecondary` at :2789, then `runPutTriggers` at :2803),
+            // under the association locker (same as primary for a txnal db,
+            // `None` for a non-txnal db).
+            let secondaries = self.live_secondaries();
+            if !secondaries.is_empty() {
+                let key_entry = DatabaseEntry::from_bytes(key_bytes);
+                let new_entry = DatabaseEntry::from_bytes(data_bytes);
+                let old_entry: Option<DatabaseEntry> =
+                    old_data_for_secondaries
+                        .as_deref()
+                        .map(DatabaseEntry::from_bytes);
+                for hook in secondaries {
+                    hook.maintain(
+                        at,
+                        &key_entry,
+                        old_entry.as_ref(),
+                        Some(&new_entry),
+                        expiration,
+                    )?;
+                }
+            }
+
+            // DB-TRIG: fire Trigger.put within the transaction, after the
+            // change is applied and after secondary maintenance.  oldData =
+            // None for an insert, Some(prev) for an update.  JE
+            // `TriggerManager.runPutTriggers(locker, dbImpl, key, oldData,
+            // newData)`.
+            self.fire_put_triggers(
+                at,
+                key_bytes,
+                old_data_for_secondaries.as_deref(),
+                data_bytes,
+            );
+            Ok(())
         };
 
         match txn {
-            Some(t) => {
-                let mut cursor = self.make_cursor_for_txn(t);
-                cursor
-                    .put_with_expiration(
-                        key_bytes,
-                        data_bytes,
-                        PutMode::Overwrite,
-                        expiration,
-                    )
-                    .map_err(NoxuError::from)?;
-            }
-            None => {
-                // Wrap the write in a synthetic auto-commit `Txn` so the
-                // lock manager sees a typed locker id ("auto-txn:<id>")
-                // and any error rolls back the in-memory tree write
-                // through `Txn::abort_collect_undo`.
-                self.with_auto_txn(|cursor| {
-                    cursor
-                        .put_with_expiration(
-                            key_bytes,
-                            data_bytes,
-                            PutMode::Overwrite,
-                            expiration,
-                        )
-                        .map_err(NoxuError::from)?;
-                    Ok(())
-                })?;
-            }
+            Some(t) => do_put(Some(t), Some(t))?,
+            // Auto-commit: one synthetic `Transaction` spans the whole
+            // sequence and commits once (JE `Txn.createAutoTxn`); a
+            // non-transactional database runs the primary under an auto-`Txn`
+            // for lock management and the secondaries auto-commit (`None`).
+            None => self.with_auto_commit_transaction(do_put)?,
         }
 
-        // DB-TRIG: fire Trigger.put within the transaction, after the change
-        // is applied.  oldData = None for an insert, Some(prev) for an update;
-        // newData is the bytes just written.  JE
-        // `TriggerManager.runPutTriggers(locker, dbImpl, key, oldData,
-        // newData)`.
-        self.fire_put_triggers(
-            txn,
-            key_bytes,
-            old_data_for_secondaries.as_deref(),
-            data_bytes,
-        );
-
-        // v1.6 (audit C3 — the associate()-style hook): drive every
-        // registered secondary index under the same caller-supplied
-        // txn so the primary record and its secondary entries commit /
-        // abort together.
-        let secondaries = self.live_secondaries();
-        if !secondaries.is_empty() {
-            let key_entry = DatabaseEntry::from_bytes(key_bytes);
-            let new_entry = DatabaseEntry::from_bytes(data_bytes);
-            let old_entry: Option<DatabaseEntry> = old_data_for_secondaries
-                .as_deref()
-                .map(DatabaseEntry::from_bytes);
-            for hook in secondaries {
-                hook.maintain(
-                    txn,
-                    &key_entry,
-                    old_entry.as_ref(),
-                    Some(&new_entry),
-                    expiration,
-                )?;
-            }
-        }
 
         // Apply cleaner write-path backpressure for auto-commit (no-txn) bulk
         // writes: sleep briefly ONLY when the cleaner has fallen behind (a real
@@ -1115,48 +1144,52 @@ impl Database {
         self.reject_txn_on_non_txnal_db(txn.is_some())?;
         self.check_writable()?;
 
-        let inserted = match txn {
-            Some(t) => {
-                let mut cursor = self.make_cursor_for_txn(t);
-                !matches!(
-                    cursor
-                        .put(key_bytes, data_bytes, PutMode::NoOverwrite)
-                        .map_err(NoxuError::from)?,
-                    noxu_dbi::OperationStatus::KeyExist
-                )
-            }
-            None => self.with_auto_txn(|cursor| {
-                cursor
+        // JE Option B: the primary insert, secondary maintenance and
+        // triggers all run under ONE `Locker` (JE `Database.putNoOverwrite`
+        // drives the same `Cursor.putNotify` path as `put`).  Both the
+        // explicit-txn and auto-commit paths funnel through this one closure
+        // with a non-null `Transaction`.
+        let do_put_no = |pt: Option<&Transaction>,
+                         at: Option<&Transaction>|
+         -> Result<bool> {
+            let inserted = !matches!(
+                self.make_cursor_opt(pt)
                     .put(key_bytes, data_bytes, PutMode::NoOverwrite)
-                    .map_err(NoxuError::from)
-                    .map(|s| !matches!(s, noxu_dbi::OperationStatus::KeyExist))
-            })?,
+                    .map_err(NoxuError::from)?,
+                noxu_dbi::OperationStatus::KeyExist
+            );
+            if inserted {
+                // NEW-PNO-SEC-1: a successful no-overwrite insert must
+                // maintain every registered secondary index, exactly like
+                // `put_bytes`.  A no-overwrite insert always writes a
+                // brand-new key, so `old` is always None.  Secondaries BEFORE
+                // triggers (JE `Cursor.putNotify` order).
+                let secondaries = self.live_secondaries();
+                if !secondaries.is_empty() {
+                    let key_entry = DatabaseEntry::from_bytes(key_bytes);
+                    let new_entry = DatabaseEntry::from_bytes(data_bytes);
+                    for hook in secondaries {
+                        hook.maintain(
+                            at,
+                            &key_entry,
+                            None,
+                            Some(&new_entry),
+                            0,
+                        )?;
+                    }
+                }
+                // DB-TRIG: a successful no-overwrite put is always an insert,
+                // so oldData is None.  JE `TriggerManager.runPutTriggers`.
+                self.fire_put_triggers(at, key_bytes, None, data_bytes);
+            }
+            Ok(inserted)
+        };
+
+        let inserted = match txn {
+            Some(t) => do_put_no(Some(t), Some(t))?,
+            None => self.with_auto_commit_transaction(do_put_no)?,
         };
         if inserted {
-            // DB-TRIG: a successful no-overwrite put is always an insert, so
-            // oldData is None.  JE `TriggerManager.runPutTriggers`.
-            self.fire_put_triggers(txn, key_bytes, None, data_bytes);
-
-            // NEW-PNO-SEC-1 (secondary data-integrity): a successful
-            // no-overwrite insert must maintain every registered secondary
-            // index, exactly like `put_bytes` does.  JE `Database.putNoOverwrite`
-            // drives the same trigger/secondary path as `put`; omitting this
-            // left secondary queries silently missing records inserted via
-            // `put_no_overwrite`.  A no-overwrite insert always writes a
-            // brand-new key (a KeyExist failure takes the `else` branch and does
-            // NOT maintain), so `old` is always None.  We fan out under the
-            // caller's txn so the primary record and its secondary entries
-            // commit / abort together, mirroring `put_bytes` (sibling of
-            // NEW-SEC-CLOSE-1).
-            let secondaries = self.live_secondaries();
-            if !secondaries.is_empty() {
-                let key_entry = DatabaseEntry::from_bytes(key_bytes);
-                let new_entry = DatabaseEntry::from_bytes(data_bytes);
-                for hook in secondaries {
-                    hook.maintain(txn, &key_entry, None, Some(&new_entry), 0)?;
-                }
-            }
-
             self.throughput.n_pri_inserts.fetch_add(1, Ordering::Relaxed);
         } else {
             self.throughput.n_pri_insert_fails.fetch_add(1, Ordering::Relaxed);
@@ -1219,33 +1252,68 @@ impl Database {
         // v1.6 (audit C3): if any secondaries are registered we must
         // capture the pre-delete primary data on each iteration so the
         // secondary key creator can recompute every (sec_key, pri_key)
-        // pair to remove.  Collected outside the cursor closure so
-        // the auto-commit and explicit-txn paths share one buffer.
+        // pair to remove.
         let secondaries = self.live_secondaries();
+        let fk_referrers = self.live_fk_referrers();
         let track_old_data =
             !secondaries.is_empty() || self.has_user_triggers();
-        let mut deleted_old_values: Vec<Bytes> = Vec::new();
 
-        // v1.6 (audit C2 / Decision 2C — step 8): consult any FK
-        // referrers BEFORE the delete is applied.  An Abort action
-        // raises a typed error and prevents the foreign delete from
-        // happening at all (matching JE's `ForeignConstraintException`
-        // semantics).  Cascade / Nullify (steps 9 / 10) mutate child
-        // records under the same caller-supplied txn so the foreign
-        // delete and its consequences commit / abort together.
-        let fk_referrers = self.live_fk_referrers();
-        if !fk_referrers.is_empty() {
-            for referrer in &fk_referrers {
-                referrer.on_foreign_key_deleted(txn, &key)?;
+        // JE Option B / order (Cursor.deleteNotify, Cursor.java:2263-2305):
+        // ONE `Locker` spans the RMW-read of the primary, the FK enforcement,
+        // the delete, secondary maintenance and triggers — all commit / abort
+        // together.  Both the explicit-txn and auto-commit paths funnel
+        // through this one closure with a non-null `Transaction`, so they are
+        // literally the same code — exactly as `Database.delete` is in JE.
+        let do_delete = |pt: Option<&Transaction>,
+                         at: Option<&Transaction>|
+         -> Result<bool> {
+            let mut deleted_old_values: Vec<Bytes> = Vec::new();
+
+            // JE Cursor.java:2263-2275: "Even if the old data is not needed,
+            // if there are associations we must lock the record with RMW
+            // before calling onForeignKeyDelete."  Position on the primary
+            // and take the WRITE lock FIRST, so FK ABORT is applied against a
+            // pinned record and a concurrent writer cannot change it between
+            // the FK check and the delete.  If the key is absent the delete
+            // is a no-op (JE: `readResult == null` → return null), and we
+            // skip FK entirely.
+            let mut lock_cursor = self.make_cursor_opt(pt);
+            let present = matches!(
+                lock_cursor
+                    .search(key_bytes, None, SearchMode::Set)
+                    .map_err(|e| NoxuError::OperationNotAllowed(
+                        e.to_string()
+                    ))?,
+                noxu_dbi::OperationStatus::Success
+            );
+            if present {
+                lock_cursor
+                    .upgrade_current_to_write_lock()
+                    .map_err(|e| NoxuError::OperationNotAllowed(
+                        e.to_string()
+                    ))?;
             }
-        }
+            drop(lock_cursor);
+            if !present {
+                return Ok(false);
+            }
 
-        // Inner closure shared between the explicit-txn and synthetic
-        // auto-txn paths: scans + deletes every duplicate of `key_bytes`
-        // through the supplied `cursor`.  See comment in pre-Wave-1A
-        // delete for the dup-loop rationale (BDB-JE
-        // `Database.delete(key)` semantics).
-        let mut run_delete = |cursor: &mut CursorImpl| -> Result<bool> {
+            // v1.6 (audit C2 / Decision 2C — step 8): enforce FK constraints
+            // FIRST, so that ForeignKeyDeleteAction.ABORT is applied before
+            // any deletion (JE Cursor.java:2287-2290).  Cascade / Nullify
+            // mutate child records under the SAME locker `t` so the foreign
+            // delete and its consequences commit / abort together.
+            if !fk_referrers.is_empty() {
+                for referrer in &fk_referrers {
+                    referrer.on_foreign_key_deleted(at, &key)?;
+                }
+            }
+
+            // The actual deletion: scan + delete every duplicate of
+            // `key_bytes` through a cursor on the SAME primary locker.  See
+            // the NEW-DEL-RACE-1 comment below for the dup-loop rationale
+            // (BDB-JE `Database.delete(key)` semantics).
+            let mut cursor = self.make_cursor_opt(pt);
             let mut deleted_any = false;
             while let noxu_dbi::OperationStatus::Success = cursor
                 .search(key_bytes, None, SearchMode::Set)
@@ -1278,44 +1346,54 @@ impl Database {
                         deleted_any = true;
                     }
                     _ => {
-                        // Fall through to the `while` re-search (below).
                         if track_old_data {
                             deleted_old_values.pop();
                         }
                     }
                 }
             }
+            drop(cursor);
+
+            // Update secondaries AFTER the deletion (JE Cursor.java:2302-2317:
+            // "Update secondaries after actual deletion, so that replica
+            // replay will lock the primary before the secondaries").  Fan out
+            // under the SAME locker `t` so the primary delete and every
+            // secondary tombstone commit / abort together.
+            if deleted_any && !secondaries.is_empty() {
+                for old_bytes in &deleted_old_values {
+                    let old_entry = DatabaseEntry::from_bytes(old_bytes);
+                    for hook in &secondaries {
+                        hook.maintain(
+                            at,
+                            &key,
+                            Some(&old_entry),
+                            None,
+                            0,
+                        )?;
+                    }
+                }
+            }
+
+            // DB-TRIG: fire Trigger.delete AFTER the deletion for each removed
+            // (key, data) pair (JE `TriggerManager.runDeleteTriggers`,
+            // Cursor.java:2321).
+            if deleted_any && self.has_user_triggers() {
+                for old_bytes in &deleted_old_values {
+                    self.fire_delete_triggers(at, key_bytes, old_bytes);
+                }
+            }
+
             Ok(deleted_any)
         };
 
         let deleted_any = match txn {
-            Some(t) => {
-                let mut cursor = self.make_cursor_for_txn(t);
-                run_delete(&mut cursor)?
-            }
-            None => self.with_auto_txn(&mut run_delete)?,
+            Some(t) => do_delete(Some(t), Some(t))?,
+            // Auto-commit: one synthetic `Transaction` spans the whole
+            // sequence and commits once (JE `Txn.createAutoTxn`); a
+            // non-transactional database runs the primary under an auto-`Txn`
+            // for lock management and the secondaries auto-commit (`None`).
+            None => self.with_auto_commit_transaction(do_delete)?,
         };
-
-        // v1.6 (audit C3): fan out the secondary cleanup under the
-        // caller's txn so the primary delete and every secondary
-        // tombstone commit / abort together.
-        if deleted_any && !secondaries.is_empty() {
-            for old_bytes in &deleted_old_values {
-                let old_entry = DatabaseEntry::from_bytes(old_bytes);
-                for hook in &secondaries {
-                    hook.maintain(txn, &key, Some(&old_entry), None, 0)?;
-                }
-            }
-        }
-
-        // DB-TRIG: fire Trigger.delete within the transaction for each
-        // removed (key, data) pair, after the change is applied.  JE
-        // `TriggerManager.runDeleteTriggers(locker, dbImpl, key, oldData)`.
-        if deleted_any && self.has_user_triggers() {
-            for old_bytes in &deleted_old_values {
-                self.fire_delete_triggers(txn, key_bytes, old_bytes);
-            }
-        }
 
         let status = if deleted_any {
             OperationStatus::Success
