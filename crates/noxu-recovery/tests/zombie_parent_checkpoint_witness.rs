@@ -107,7 +107,17 @@ fn checkpointer_must_not_flush_a_zombie_parented_bin() {
     // resident in P and B.parent still names P.
     let p_strong = Tree::parent_arc_of_child(&b_arc).expect("B.parent -> P");
     assert_eq!(p_strong.read().node_id(), p_id);
-    let freed = tree_arc.read().unwrap().detach_node_by_id(p_id);
+    // BUG-EVICT-UIN-WITH-CHILDREN: the production `detach_node_by_id` now
+    // REFUSES to detach a UIN with a resident child, so the zombie this
+    // witness needs can no longer be manufactured through the real path.
+    // Use the test-only forcing seam (bypasses ONLY the new UIN re-check)
+    // to create the detached-but-Arc-alive parent and exercise the
+    // checkpointer's root-down flush skip (defense in depth) against a
+    // state production can no longer reach.
+    let freed = tree_arc
+        .read()
+        .unwrap()
+        .detach_node_by_id_bypassing_uin_guard_for_test(p_id);
     assert!(
         freed > 0,
         "fixture: the evictor path must detach P (UIN w/ resident child)"

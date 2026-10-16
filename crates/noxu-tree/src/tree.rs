@@ -8267,6 +8267,41 @@ impl Tree {
     /// Returns `0` if the node is not a resident child of any IN (e.g. it is
     /// the root, already detached, or was pinned and could not be latched).
     pub fn detach_node_by_id(&self, node_id: u64) -> u64 {
+        self.detach_node_by_id_impl(node_id, false)
+    }
+
+    /// Test-only variant of [`Self::detach_node_by_id`] that BYPASSES the
+    /// BUG-EVICT-UIN-WITH-CHILDREN upper-IN-childlessness re-check only
+    /// (every other guard -- never-logged BIN, pinned/re-dirtied BIN --
+    /// still applies).  It exists SOLELY so the checkpointer's
+    /// zombie-parent *defense* witness (`zombie_parent_checkpoint_witness`)
+    /// can still MANUFACTURE a detached-but-Arc-alive zombie parent and
+    /// exercise the root-down flush skip (defense in depth): the
+    /// production `detach_node_by_id` now REFUSES to detach a UIN with a
+    /// resident child (the fix), so that zombie state can no longer be
+    /// reached through the real path.  NEVER call this from production
+    /// code -- detaching a UIN with a resident child orphans the child
+    /// under a zombie parent (the very data-loss this fix prevents).
+    /// Gated `#[cfg(any(test, feature = "testing"))]` + `#[doc(hidden)]`
+    /// so it emits ZERO symbols in a default release build.
+    #[cfg(any(test, feature = "testing"))]
+    #[doc(hidden)]
+    pub fn detach_node_by_id_bypassing_uin_guard_for_test(
+        &self,
+        node_id: u64,
+    ) -> u64 {
+        self.detach_node_by_id_impl(node_id, true)
+    }
+
+    /// Shared implementation of [`Self::detach_node_by_id`].
+    /// `allow_uin_with_children` is `true` ONLY on the test-only forcing
+    /// seam above; on the production path it is `false`, so a UIN that has
+    /// re-acquired a resident child is refused.
+    fn detach_node_by_id_impl(
+        &self,
+        node_id: u64,
+        allow_uin_with_children: bool,
+    ) -> u64 {
         let root = match self.get_root() {
             Some(r) => r,
             None => return 0,
@@ -8367,6 +8402,50 @@ impl Tree {
             && (b.cursor_count > 0 || b.dirty || b.dirty_count() > 0)
         {
             return 0; // re-dirtied / pinned BIN since flush -- keep resident
+        }
+        // BUG-EVICT-UIN-WITH-CHILDREN: re-check UNDER THE PARENT WRITE LATCH
+        // that the target upper IN still has NO resident (cached) children
+        // before detaching it.  JE's invariant "a UIN with resident children
+        // is never evicted" is enforced by `Evictor.processTarget`
+        // (Evictor.java:2645-2656), which under the target's EX latch skips
+        // `target.isUpperIN() && target.hasCachedChildrenFlag()` with the
+        // comment: "a childless UIN may be selected for eviction and then
+        // acquire cached children in the time after its removal from its
+        // LRUSet and before it is EX-latched by the evicting thread."
+        //
+        // Noxu's evictor decides eviction from a PRE-latch `find_node_full`
+        // residency snapshot (`decide_eviction` reads `has_cached_children`
+        // under a tree READ latch in `do_evict`'s `node_info_fn`), then calls
+        // this method to detach.  In the gap between that snapshot and this
+        // detach a descent can fault a child in under the selected UIN
+        // (`child_at_or_fetch` installs the child under the parent latch).
+        // Without this re-check we would `take_child` the UIN out of its
+        // parent slot WHILE it still points at a resident BIN -- orphaning the
+        // live (possibly dirty) child under a detached ZOMBIE parent: its
+        // later writes/flushes/stamps route nowhere (lost from the tree) and
+        // recovery redo can resurrect a stale image.  Reading the child under
+        // the parent WRITE latch (parent -> child latch order, same as the
+        // BIN guards above) excludes every descender -- they take the parent
+        // READ latch hand-over-hand -- so the childlessness we observe here
+        // holds through the `take_child` below.  Refuse (keep the UIN
+        // resident); the evictor's `node_size_fn` puts the candidate back and
+        // counts `nodes_put_back`.  Mechanism (a) of JE -- dropping a UIN from
+        // the LRU the moment it gains a cached child in `IN.setTarget`
+        // (Evictor.java:380-401) -- is a performance optimisation that keeps
+        // childless-UIN churn out of the LRU; this under-latch re-check is the
+        // load-bearing correctness piece and closes the data-loss hole on its
+        // own.  (ceiling: without (a) a UIN that re-acquires a child after
+        // selection is still OFFERED to the evictor and refused here, costing
+        // one wasted selection; the LRU add/remove pair that (a) needs spans
+        // every target-mutation site -- splits/merges/fault-in -- and would
+        // itself have to re-add a UIN on last-child loss or leak it from the
+        // LRU, so it is deliberately not attempted in this patch-safe fix.)
+        if !allow_uin_with_children
+            && let Some(c) = p.child_ref(child_index)
+            && let TreeNode::Internal(n) = &*c.read()
+            && !n.targets.is_empty()
+        {
+            return 0; // UIN re-acquired a resident child -- keep it attached
         }
         // T-4: detach the cached child via the node-level INTargetRep, leaving
         // the slot's key/LSN intact for re-fetch (JE IN.setTarget(idx, null)).
@@ -12891,29 +12970,58 @@ mod tests {
             .unwrap();
         }
 
-        // Find a BIN child of the root IN (the eviction target) + its parent.
+        // Find a LEAF BIN (the eviction target) and its immediate parent IN.
+        // The input above builds a 3-level tree, so the root's first child is
+        // itself a UIN; detaching a UIN with resident children is refused by
+        // the BUG-EVICT-UIN-WITH-CHILDREN guard, so descend to a true BIN
+        // whose parent is the lowest UIN (JE: the evictor's BIN target).
         let root = tree.get_root().expect("tree must have a root");
-        let (parent_arc, child_idx, bin_id, expected_bytes) = {
-            let rg = root.read();
-            let TreeNode::Internal(n) = &*rg else {
-                panic!("root must be an IN after split");
-            };
-            // Pick the first slot whose child is a resident BIN.
-            let (idx, child) = n
-                .first_resident_child()
-                .expect("root must have a resident child");
-            let (id, bytes) = {
-                let cg = child.read();
-                (
+        fn find_bin_and_parent(
+            arc: &Arc<RwLock<TreeNode>>,
+        ) -> Option<(Arc<RwLock<TreeNode>>, usize, u64, u64)> {
+            let g = arc.read();
+            let TreeNode::Internal(n) = &*g else { return None };
+            for i in 0..n.entries.len() {
+                if let Some(c) = n.child_ref(i) {
+                    let cg = c.read();
                     match &*cg {
-                        TreeNode::Bottom(b) => b.node_id,
-                        TreeNode::Internal(n2) => n2.node_id,
-                    },
-                    cg.budgeted_memory_size(),
-                )
-            };
-            (Arc::clone(&root), idx, id, bytes)
-        };
+                        TreeNode::Bottom(b) => {
+                            return Some((
+                                Arc::clone(arc),
+                                i,
+                                b.node_id,
+                                cg.budgeted_memory_size(),
+                            ));
+                        }
+                        TreeNode::Internal(_) => {
+                            drop(cg);
+                            if let Some(found) = find_bin_and_parent(c) {
+                                return Some(found);
+                            }
+                        }
+                    }
+                }
+            }
+            None
+        }
+        let (parent_arc, child_idx, bin_id, expected_bytes) =
+            find_bin_and_parent(&root).expect("tree must have a leaf BIN");
+
+        // The target BIN must have a durable image for detach to be allowed
+        // (EVICTOR-LOG-1 refuses a never-logged BIN).  These unit tests have no
+        // LogManager, so stamp a non-null last_full_lsn as a log write would.
+        {
+            let pg = parent_arc.read();
+            let TreeNode::Internal(n) = &*pg else { unreachable!() };
+            if let Some(c) = n.child_ref(child_idx)
+                && let TreeNode::Bottom(b) = &mut *c.write()
+            {
+                // Clean + logged (clears dirty flags and sets last_full_lsn),
+                // so the EVICTOR-LOG-1 and GAP-A dirty/pin guards permit detach
+                // — as a real flush would leave it.
+                b.clear_dirty_after_full_log(Lsn::new(1, 4096));
+            }
+        }
 
         // Hold an external strong reference to the child so we can observe its
         // strong_count drop when detach releases the parent's reference.
@@ -12979,21 +13087,45 @@ mod tests {
         }
         let before = counter.load(Ordering::Relaxed);
 
-        // Grab a BIN child id.
+        // Grab a LEAF BIN id (descend past interior UINs — detaching a UIN
+        // with resident children is refused by the BUG-EVICT-UIN-WITH-CHILDREN
+        // guard, so target a true leaf BIN as the evictor would).
         let root = tree.get_root().unwrap();
-        let bin_id = {
-            let rg = root.read();
-            let TreeNode::Internal(n) = &*rg else { unreachable!() };
-            let child = n
-                .resident_children()
-                .into_iter()
-                .next()
-                .expect("resident child");
-            match &*child.read() {
-                TreeNode::Bottom(b) => b.node_id,
-                TreeNode::Internal(n2) => n2.node_id,
+        fn first_leaf_bin(arc: &Arc<RwLock<TreeNode>>) -> Option<u64> {
+            let g = arc.read();
+            match &*g {
+                TreeNode::Bottom(b) => Some(b.node_id),
+                TreeNode::Internal(n) => {
+                    for c in n.resident_children() {
+                        if let Some(id) = first_leaf_bin(&c) {
+                            return Some(id);
+                        }
+                    }
+                    None
+                }
             }
-        };
+        }
+        let bin_id = first_leaf_bin(&root).expect("resident leaf BIN");
+
+        // Stamp a durable last_full_lsn so detach is allowed (EVICTOR-LOG-1
+        // refuses a never-logged BIN; these unit tests have no LogManager).
+        fn stamp_bin(arc: &Arc<RwLock<TreeNode>>, id: u64) -> bool {
+            let mut g = arc.write();
+            match &mut *g {
+                TreeNode::Bottom(b) if b.node_id == id => {
+                    // Clean + logged so the detach guards permit it.
+                    b.clear_dirty_after_full_log(Lsn::new(1, 4096));
+                    true
+                }
+                TreeNode::Bottom(_) => false,
+                TreeNode::Internal(n) => {
+                    let kids = n.resident_children();
+                    drop(g);
+                    kids.iter().any(|c| stamp_bin(c, id))
+                }
+            }
+        }
+        assert!(stamp_bin(&root, bin_id), "target BIN must be stampable");
 
         let freed = tree.detach_node_by_id(bin_id);
         assert!(freed > 0, "detach must free a resident child");

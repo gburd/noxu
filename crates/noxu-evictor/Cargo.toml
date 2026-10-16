@@ -31,6 +31,10 @@ lru = "0.18"
 # not part of the default surface or the default eviction/cleaner/checkpoint
 # interaction test matrix.  See docs/src/reference/eviction-policies.md.
 experimental-eviction-policies = []
+# BUG-EVICT-UIN-WITH-CHILDREN: expose the test-only pre-detach hook
+# (`set_pre_detach_hook_for_test`) to the real-evictor TOCTOU witness.
+# Off by default; emits ZERO symbols in a default release build.
+testing = ["noxu-tree/testing"]
 
 [dev-dependencies]
 tempfile = "3"
