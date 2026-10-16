@@ -14,17 +14,28 @@
 //! `StoredList.remove(int index)` contract and `Vec::remove`'s
 //! semantics.
 //!
-//! Cost: `O(N - idx)` database operations per remove.  All shifts are
-//! issued under the supplied `txn`; if `txn` is `None`, each shift is
-//! its own auto-txn and a crash mid-shift can leave the list with
-//! partial compaction.  Pass `Some(&txn)` (e.g. via
-//! [`crate::TransactionRunner`]) to make the whole compaction atomic.
+//! Cost: `O(N - idx)` database operations per remove.  The whole
+//! compaction runs under ONE transaction (an auto-commit transaction
+//! when `txn` is `None`), so a crash mid-compaction rolls the entire
+//! renumber back -- the list is never left partially compacted
+//! (FID-DPL-18; JE RECNO renumber within the operation txn).
+//!
+//! # Index assignment
+//!
+//! Indices are persistent, engine-derived record numbers: `push` reads
+//! the current last key under the operation transaction and appends at
+//! `last + 1` with `putNoOverwrite` (FID-DPL-17; JE `DataView.append` /
+//! `StoredList` RECNO append).  There is no process-local counter, so two
+//! handles on the same database -- or a fresh handle on an existing one
+//! -- always agree on the next index and never overwrite an existing
+//! element.
 
 use std::marker::PhantomData;
-use std::sync::Mutex;
 
 use noxu_bind::EntryBinding;
-use noxu_db::{Database, DatabaseEntry, Get, OperationStatus, Transaction};
+use noxu_db::{
+    Database, DatabaseEntry, Get, LockMode, OperationStatus, Transaction,
+};
 
 use crate::error::{CollectionError, Result};
 use crate::internal::{decode_value, encode_value};
@@ -39,17 +50,18 @@ use crate::internal::{decode_value, encode_value};
 ///
 /// # Concurrency
 ///
-/// `next_index` is process-local state guarded by a `Mutex`.  A list
-/// opened twice in the same process behaves correctly; multiple
-/// processes pushing to the same list will race on the counter and
-/// must coordinate externally.  This is unchanged from v1.5.
+/// The next index is derived from the persistent last key under the
+/// operation transaction (FID-DPL-17), not a process-local counter, so
+/// multiple handles -- in the same process or across processes -- always
+/// agree.  Concurrent `push(None, ..)` calls serialise through the
+/// auto-commit transaction's write lock on the tail, so each gets a
+/// distinct record number (`putNoOverwrite` rejects a collision).
 pub struct StoredList<'db, V, VB>
 where
     VB: EntryBinding<V>,
 {
     db: &'db Database,
     value_binding: VB,
-    next_index: Mutex<usize>,
     read_only: bool,
     _marker: PhantomData<fn() -> V>,
 }
@@ -60,18 +72,13 @@ where
 {
     /// Creates a new list view of the given database.
     ///
-    /// **Does not recover the next-index counter.**  This constructor
-    /// is the fast path for brand-new (or known-empty) databases:
-    /// `next_index` starts at 0.  When reopening a database that may
-    /// already contain records, use [`StoredList::open`] instead.
+    /// The next index is always derived from the persistent last key
+    /// (FID-DPL-17), so this view sees existing records correctly whether
+    /// the database is empty or already populated; [`StoredList::open`]
+    /// is retained as an explicit alias that also validates the key
+    /// width.
     pub fn new(db: &'db Database, value_binding: VB) -> Self {
-        StoredList {
-            db,
-            value_binding,
-            next_index: Mutex::new(0),
-            read_only: false,
-            _marker: PhantomData,
-        }
+        StoredList { db, value_binding, read_only: false, _marker: PhantomData }
     }
 
     /// Opens a list view over an existing database, recovering the
@@ -122,10 +129,14 @@ where
             _ => 0,
         };
         cursor.close()?;
+        // `next` is validated above purely to reject a non-StoredList
+        // database (non-8-byte key); the authoritative next index is
+        // always re-derived from the persistent last key per operation
+        // (FID-DPL-17), so it is not cached here.
+        let _ = next;
         Ok(StoredList {
             db,
             value_binding,
-            next_index: Mutex::new(next),
             read_only: false,
             _marker: PhantomData,
         })
@@ -159,8 +170,100 @@ where
     }
 
     /// Returns the next index that would be used by `push`.
+    ///
+    /// Derived from the persistent last key (FID-DPL-17): `last + 1`, or
+    /// `0` when the list is empty.  Auto-commit read.
     pub fn next_index(&self) -> usize {
-        *self.next_index.lock().unwrap()
+        self.persistent_end(None).unwrap_or(0)
+    }
+
+    /// The persistent end-of-list index (`last key + 1`, or `0` when
+    /// empty), read under `txn` via a single `Get::Last` cursor.  This is
+    /// the authoritative, engine-derived high-water mark (FID-DPL-17) --
+    /// there is no process-local counter.
+    ///
+    /// Positions with a write lock (`LockMode::Rmw`) when `txn` is the
+    /// operation's own transaction so a concurrent appender cannot read
+    /// the same tail and collide; a plain read (`None` lock mode) is used
+    /// for the auto-commit `next_index()` / `len()` query.
+    fn persistent_end(&self, txn: Option<&Transaction>) -> Result<usize> {
+        self.persistent_end_locked(txn, false)
+    }
+
+    fn persistent_end_locked(
+        &self,
+        txn: Option<&Transaction>,
+        write_lock: bool,
+    ) -> Result<usize> {
+        let mut cursor = crate::internal::open_cursor(self.db, txn, None)?;
+        let mut key = DatabaseEntry::new();
+        let mut data = DatabaseEntry::new();
+        let lock = if write_lock { Some(LockMode::Rmw) } else { None };
+        let end = match cursor.get(&mut key, &mut data, Get::Last, lock)? {
+            OperationStatus::Success => {
+                let bytes = key.data_opt().unwrap_or(&[]);
+                if bytes.len() != 8 {
+                    let _ = cursor.close();
+                    return Err(CollectionError::IllegalState(format!(
+                        "StoredList: largest key is {} bytes; expected an \
+                         8-byte big-endian index",
+                        bytes.len()
+                    )));
+                }
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(bytes);
+                u64::from_be_bytes(buf).saturating_add(1) as usize
+            }
+            _ => 0,
+        };
+        cursor.close()?;
+        Ok(end)
+    }
+
+    /// Run `op` under ONE transaction: the caller's `txn` when `Some`, or
+    /// a fresh auto-commit transaction (via
+    /// [`noxu_db::Database::run_in_auto_commit`]) when `None`.  This is the
+    /// JE `beginAutoCommit` / `commitAutoCommit` boundary: on a
+    /// transactional database the auto-commit path gets a real auto-txn
+    /// (`Some`), on a non-transactional one it runs with no txn (`None`),
+    /// and the op commits on `Ok` / aborts on `Err`.
+    ///
+    /// A non-database [`CollectionError`] produced inside the auto-commit
+    /// path (a decode failure, a `putNoOverwrite` collision) is stashed
+    /// and restored verbatim after the engine aborts the auto-txn, so the
+    /// caller sees the exact error (not a lossy string).
+    fn in_txn<T, F>(&self, txn: Option<&Transaction>, op: F) -> Result<T>
+    where
+        F: FnOnce(&Database, Option<&Transaction>) -> Result<T>,
+    {
+        match txn {
+            Some(_) => op(self.db, txn),
+            None => {
+                let mut stash: Option<CollectionError> = None;
+                let mut op = Some(op);
+                let res = self.db.run_in_auto_commit(|t| {
+                    let op = op.take().expect("invariant: op run once");
+                    match op(self.db, t) {
+                        Ok(v) => Ok(v),
+                        // A DB error flows through unchanged so the engine
+                        // aborts with the real NoxuError.
+                        Err(CollectionError::DatabaseError(e)) => Err(e),
+                        // A non-DB collection error: stash it, trigger the
+                        // abort with a sentinel, restore it below.
+                        Err(other) => {
+                            stash = Some(other);
+                            Err(noxu_db::NoxuError::OperationNotAllowed(
+                                "StoredList auto-commit op failed".to_string(),
+                            ))
+                        }
+                    }
+                });
+                match res {
+                    Ok(v) => Ok(v),
+                    Err(e) => Err(stash.unwrap_or_else(|| e.into())),
+                }
+            }
+        }
     }
 
     /// Appends `value` to the end of the list and returns the
@@ -169,14 +272,31 @@ where
         if self.read_only {
             return Err(CollectionError::ReadOnly);
         }
-        let mut next = self.next_index.lock().unwrap();
-        let index = *next;
-        let key_bytes = Self::index_to_key(index);
-        let key_entry = DatabaseEntry::from_bytes(&key_bytes);
         let value_entry = encode_value(&self.value_binding, value)?;
-        crate::internal::db_put(self.db, txn, &key_entry, &value_entry)?;
-        *next = index + 1;
-        Ok(index)
+        // FID-DPL-17: derive the index from the PERSISTENT last key under
+        // the operation transaction (write-locking the tail so a
+        // concurrent appender cannot pick the same index), then append
+        // with putNoOverwrite -- a stale index can never silently
+        // overwrite an existing element (JE DataView.append).  The whole
+        // read-end + append is one transaction.
+        self.in_txn(txn, |db, t| {
+            let index = self.persistent_end_locked(t, true)?;
+            let key_bytes = Self::index_to_key(index);
+            let key_entry = DatabaseEntry::from_bytes(&key_bytes);
+            let inserted = crate::internal::db_put_no_overwrite(
+                db,
+                t,
+                &key_entry,
+                &value_entry,
+            )?;
+            if !inserted {
+                // The tail write lock makes this unreachable in practice;
+                // surface it rather than silently overwrite (JE's
+                // putNoOverwrite contract).
+                return Err(CollectionError::ConcurrentModification);
+            }
+            Ok(index)
+        })
     }
 
     /// Retrieves the value at `index`, or `None` if the slot is empty
@@ -204,27 +324,28 @@ where
         if self.read_only {
             return Err(CollectionError::ReadOnly);
         }
-        let mut next = self.next_index.lock().unwrap();
-        if *next == 0 {
-            return Ok(None);
-        }
-        let index = *next - 1;
-        let key_bytes = Self::index_to_key(index);
-        let key_entry = DatabaseEntry::from_bytes(&key_bytes);
-
-        // Read the old value so we can return it.
-        let val = match crate::internal::db_get(self.db, txn, &key_entry)? {
-            Some(bytes) => {
-                let data_entry = DatabaseEntry::from_bytes(&bytes);
-                Some(decode_value(&self.value_binding, &data_entry)?)
+        // Read-end + read-last + delete-last is one transaction so pop is
+        // atomic and sees the persistent tail (FID-DPL-17/18).
+        self.in_txn(txn, |db, t| {
+            let end = self.persistent_end_locked(t, true)?;
+            if end == 0 {
+                return Ok(None);
             }
-            None => None,
-        };
-        if val.is_some() {
-            crate::internal::db_delete(self.db, txn, &key_entry)?;
-            *next = index;
-        }
-        Ok(val)
+            let index = end - 1;
+            let key_bytes = Self::index_to_key(index);
+            let key_entry = DatabaseEntry::from_bytes(&key_bytes);
+            let val = match crate::internal::db_get(db, t, &key_entry)? {
+                Some(bytes) => {
+                    let data_entry = DatabaseEntry::from_bytes(&bytes);
+                    Some(decode_value(&self.value_binding, &data_entry)?)
+                }
+                None => None,
+            };
+            if val.is_some() {
+                crate::internal::db_delete(db, t, &key_entry)?;
+            }
+            Ok(val)
+        })
     }
 
     /// Removes the value at `index` with shift-down compaction.
@@ -236,12 +357,11 @@ where
     ///
     /// # Atomicity
     ///
-    /// The whole compaction is issued under `txn`.  When `txn` is
-    /// `Some(&t)`, the entire operation is atomic on the user's
-    /// commit/abort.  When `txn` is `None`, each individual shift
-    /// is its own auto-txn — a crash mid-compaction can leave the
-    /// list with duplicate entries and an inconsistent
-    /// `next_index`.  Pass a real txn for crash-atomic semantics.
+    /// The whole compaction runs under ONE transaction -- the caller's
+    /// `txn` when `Some`, or a single auto-commit transaction when `None`
+    /// (FID-DPL-18).  A crash or error mid-compaction rolls the entire
+    /// renumber back, so the list is never left with duplicate or missing
+    /// elements (JE RECNO renumber within the operation txn).
     pub fn remove(
         &self,
         txn: Option<&Transaction>,
@@ -250,75 +370,62 @@ where
         if self.read_only {
             return Err(CollectionError::ReadOnly);
         }
-        let mut next = self.next_index.lock().unwrap();
-        if index >= *next {
-            return Ok(None);
-        }
-
-        // Snapshot the removed value so we can return it.
-        let target_key_bytes = Self::index_to_key(index);
-        let target_key = DatabaseEntry::from_bytes(&target_key_bytes);
-        let removed = match crate::internal::db_get(self.db, txn, &target_key)?
-        {
-            Some(bytes) => {
-                let target_data = DatabaseEntry::from_bytes(&bytes);
-                Some(decode_value(&self.value_binding, &target_data)?)
+        // FID-DPL-18: the whole read-target + shift-down renumber runs in
+        // ONE transaction (an auto-commit txn when `txn` is `None`), so a
+        // crash or error mid-compaction rolls the entire renumber back --
+        // never a duplicated or missing element (JE RECNO renumber within
+        // the operation txn).
+        self.in_txn(txn, |db, t| {
+            // Write-lock the tail and read the persistent end.
+            let high = self.persistent_end_locked(t, true)?;
+            if index >= high {
+                return Ok(None);
             }
-            None => None,
-        };
 
-        // Shift every subsequent record down by one slot.  We read
-        // the source slot, write its bytes at the destination slot,
-        // and delete the source.
-        let high = *next; // exclusive upper bound
-        for src in (index + 1)..high {
-            let dst = src - 1;
-            let src_key_bytes = Self::index_to_key(src);
-            let dst_key_bytes = Self::index_to_key(dst);
-            let src_key = DatabaseEntry::from_bytes(&src_key_bytes);
-            let dst_key = DatabaseEntry::from_bytes(&dst_key_bytes);
-
-            match crate::internal::db_get(self.db, txn, &src_key)? {
+            // Snapshot the removed value so we can return it.
+            let target_key_bytes = Self::index_to_key(index);
+            let target_key = DatabaseEntry::from_bytes(&target_key_bytes);
+            let removed = match crate::internal::db_get(db, t, &target_key)? {
                 Some(bytes) => {
-                    let dst_value = DatabaseEntry::from_vec(bytes);
-                    crate::internal::db_put(
-                        self.db, txn, &dst_key, &dst_value,
-                    )?;
-                    crate::internal::db_delete(self.db, txn, &src_key)?;
+                    let target_data = DatabaseEntry::from_bytes(&bytes);
+                    Some(decode_value(&self.value_binding, &target_data)?)
                 }
-                None => {
-                    // Source slot is empty — remove the destination
-                    // slot too so the list stays dense.  This handles
-                    // the case where a concurrent writer or a
-                    // previous crashed remove left a hole.
-                    crate::internal::db_delete(self.db, txn, &dst_key)?;
+                None => None,
+            };
+
+            // Shift every subsequent record down by one slot.
+            for src in (index + 1)..high {
+                let dst = src - 1;
+                let src_key_bytes = Self::index_to_key(src);
+                let dst_key_bytes = Self::index_to_key(dst);
+                let src_key = DatabaseEntry::from_bytes(&src_key_bytes);
+                let dst_key = DatabaseEntry::from_bytes(&dst_key_bytes);
+
+                match crate::internal::db_get(db, t, &src_key)? {
+                    Some(bytes) => {
+                        let dst_value = DatabaseEntry::from_vec(bytes);
+                        crate::internal::db_put(db, t, &dst_key, &dst_value)?;
+                        crate::internal::db_delete(db, t, &src_key)?;
+                    }
+                    None => {
+                        crate::internal::db_delete(db, t, &dst_key)?;
+                    }
                 }
             }
-        }
 
-        // Either way, the slot at `high - 1` no longer exists.  If
-        // we never entered the loop (index == high - 1), delete the
-        // target slot itself.
-        if index == high.saturating_sub(1) && removed.is_some() {
-            crate::internal::db_delete(self.db, txn, &target_key)?;
-        }
-
-        // Decrement next_index by 1 if anything was actually removed.
-        if removed.is_some() {
-            *next = high - 1;
-        }
-        Ok(removed)
+            // If we never entered the loop (index == high - 1), delete the
+            // target slot itself.
+            if index == high.saturating_sub(1) && removed.is_some() {
+                crate::internal::db_delete(db, t, &target_key)?;
+            }
+            Ok(removed)
+        })
     }
 
-    /// Returns the number of elements.
-    ///
-    /// Implemented in terms of `next_index()` rather than
-    /// `Database::count()` because the list contract tracks the
-    /// high-water mark, not the live record count.  After
-    /// compaction these are equal; before crashed-mid-shift they
-    /// would diverge.
-    pub fn len(&self, _txn: Option<&Transaction>) -> Result<usize> {
-        Ok(*self.next_index.lock().unwrap())
+    /// Returns the number of elements (the persistent high-water mark,
+    /// `last key + 1`), read under `txn` (FID-DPL-17).
+    pub fn len(&self, txn: Option<&Transaction>) -> Result<usize> {
+        self.persistent_end(txn)
     }
 
     /// Returns whether the list is empty.
@@ -357,16 +464,14 @@ where
         if self.read_only {
             return Err(CollectionError::ReadOnly);
         }
-        let mut cursor = crate::internal::open_cursor(self.db, txn, None)?;
-        let mut key = DatabaseEntry::new();
-        let mut data = DatabaseEntry::new();
-        while let OperationStatus::Success =
-            cursor.get(&mut key, &mut data, Get::First, None)?
-        {
-            cursor.delete()?;
+        // One transaction for the whole clear (FID-DPL-15/18 shape); the
+        // persistent high-water mark drops to 0 because every key is gone.
+        match txn {
+            Some(_) => crate::internal::clear_all(self.db, txn)?,
+            None => self.db.run_in_auto_commit(|t| {
+                crate::internal::clear_all(self.db, t)
+            })?,
         }
-        cursor.close()?;
-        *self.next_index.lock().unwrap() = 0;
         Ok(())
     }
 }

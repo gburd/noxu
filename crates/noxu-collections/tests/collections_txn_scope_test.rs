@@ -5,7 +5,7 @@
 //! `StoredContainer` / RECNO `StoredList` semantics.
 
 use noxu_bind::IntBinding;
-use noxu_collections::StoredMap;
+use noxu_collections::{StoredList, StoredMap};
 use noxu_db::{DatabaseConfig, Environment, EnvironmentConfig};
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -219,4 +219,88 @@ fn fid_dpl_15_clear_is_single_transaction() {
          enclosing transaction (the base).",
         c1 - c0,
     );
+}
+
+/// FID-DPL-17 (S2): `StoredList` index assignment must be persistent,
+/// engine-derived record numbers, not a process-local in-memory counter --
+/// and `push` must use `putNoOverwrite` so a stale counter cannot silently
+/// overwrite an existing element (JE `DataView.append` / `StoredList.java`).
+///
+/// Open a list, push three elements, DROP the handle, open a FRESH handle on
+/// the SAME database, and push three more.  With persistent engine-derived
+/// indices the second handle continues from 3 (indices 0..6, six distinct
+/// elements).  RED on 81b2f048 (per-handle `Mutex<usize>` starting at 0 +
+/// OVERWRITE put): the second handle restarts at 0 and overwrites 0,1,2.
+#[test]
+fn fid_dpl_17_storedlist_indices_are_persistent_across_handles() {
+    let (_td, _env, db) = env_db("dpl17_list");
+
+    {
+        let list: StoredList<'_, i32, _> = StoredList::new(&db, IntBinding);
+        list.push(None, &10).unwrap();
+        list.push(None, &11).unwrap();
+        list.push(None, &12).unwrap();
+        assert_eq!(list.len(None).unwrap(), 3);
+    }
+    // Fresh handle on the same database.
+    let list2: StoredList<'_, i32, _> = StoredList::new(&db, IntBinding);
+    list2.push(None, &13).unwrap();
+    list2.push(None, &14).unwrap();
+    list2.push(None, &15).unwrap();
+
+    assert_eq!(
+        list2.len(None).unwrap(),
+        6,
+        "FID-DPL-17: a fresh StoredList handle restarted its index at 0 and \
+         overwrote existing elements -- indices must be persistent, \
+         engine-derived record numbers (JE RECNO append / putNoOverwrite)"
+    );
+    let all: Vec<i32> = list2.iter(None).unwrap().map(Result::unwrap).collect();
+    assert_eq!(all, vec![10, 11, 12, 13, 14, 15]);
+}
+
+/// FID-DPL-18 (S2): `StoredList::remove(None, index)` renumbering must be
+/// ONE atomic transaction (JE RECNO renumber within the operation txn), so
+/// a crash or error mid-compaction never leaves a duplicated or missing
+/// element.  Observable discriminator: the whole shift-down renumber
+/// commits EXACTLY ONCE regardless of how many elements shift.
+///
+/// RED on 81b2f048: each shift's put + delete ran on its own per-op
+/// auto-commit cursor, so removing index 2 from a 20-element list produced
+/// ~34 independent commits (non-atomic -- a crash mid-shift leaves
+/// duplicates / a wrong high-water mark).  GREEN after FID-DPL-18:
+/// exactly 1.  The post-condition (contiguous, duplicate-free elements) is
+/// also asserted and holds under both.
+#[test]
+fn fid_dpl_18_storedlist_remove_renumber_atomic() {
+    let (_td, env, db) = env_db("dpl18_list");
+    let list: StoredList<'_, i32, _> = StoredList::new(&db, IntBinding);
+    for v in 0..20i32 {
+        list.push(None, &v).unwrap();
+    }
+
+    let c0 = env.stats().unwrap().txn.n_commits;
+    let removed = list.remove(None, 2).unwrap();
+    let c1 = env.stats().unwrap().txn.n_commits;
+    assert_eq!(removed, Some(2));
+
+    assert_eq!(
+        c1 - c0,
+        1,
+        "FID-DPL-18: remove(None, index) committed {} transaction(s); the \
+         whole shift-down renumber must be ONE atomic transaction (JE RECNO \
+         renumber within the operation txn). >1 means each shift \
+         auto-committed independently (the base), so a crash mid-shift \
+         could leave duplicates.",
+        c1 - c0,
+    );
+
+    let all: Vec<i32> = list.iter(None).unwrap().map(Result::unwrap).collect();
+    assert_eq!(
+        all,
+        vec![0, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
+        "FID-DPL-18: remove(index) must leave contiguous, duplicate-free \
+         elements (atomic renumber)"
+    );
+    assert_eq!(list.len(None).unwrap(), 19);
 }
