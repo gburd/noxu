@@ -142,6 +142,12 @@ pub fn flush_to_disk(index: &VlsnIndex, env_home: &Path) -> Result<u32> {
     drop(f);
 
     std::fs::rename(&tmp, &final_path)?;
+    // F-ELECT8-E (same defect class as acceptor.state): the file is
+    // `sync_all`'d above, but the rename's directory entry is not durable
+    // until the parent directory is fsynced. A crash just after the rename
+    // can revert `vlsn.idx` to its previous content. Reuse `noxu_log::sync_dir`
+    // (Unix dir fsync; best-effort on Windows) for the same guarantee.
+    noxu_log::sync_dir(env_home)?;
 
     Ok(entries.len() as u32)
 }
@@ -229,6 +235,12 @@ pub fn flush_to_disk_capped(
     drop(f);
 
     std::fs::rename(&tmp, &final_path)?;
+    // F-ELECT8-E (same defect class as acceptor.state): the file is
+    // `sync_all`'d above, but the rename's directory entry is not durable
+    // until the parent directory is fsynced. A crash just after the rename
+    // can revert `vlsn.idx` to its previous content. Reuse `noxu_log::sync_dir`
+    // (Unix dir fsync; best-effort on Windows) for the same guarantee.
+    noxu_log::sync_dir(env_home)?;
 
     Ok(capped.len() as u32)
 }

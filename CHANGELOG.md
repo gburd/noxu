@@ -124,6 +124,27 @@ user-facing scope, symptoms, and preconditions.
   commit, and NameLN commit/abort is classified by LSN order so transaction-id
   reuse across sessions is handled correctly.
 
+- **A crash after a Paxos acceptor persisted a promise/accept could revert it,
+  allowing two masters** (`F-ELECT8-E`, since v7.11.0): the acceptor wrote
+  `acceptor.state` with write + `sync_all` + `rename`, but never fsynced the
+  parent directory, so the rename's directory entry was not durable. After a
+  crash just after the rename, the directory could revert to the OLD
+  `acceptor.state`, losing a promise or accept the acceptor had already
+  acknowledged to a proposer. The restarted acceptor could then promise or
+  accept a strictly LOWER proposal, letting a stale proposer win a second
+  majority and become a second master at the same effective term — a Paxos
+  safety violation (split-brain), which can diverge and lose committed data.
+  JE never persists the acceptor promise at all (`Acceptor.promisedProposal` is
+  an in-memory field, `Acceptor.java:46`) and makes no restart guarantee; Noxu
+  deliberately persists it for crash safety, so the missing directory fsync
+  made that guarantee false. Fixed by fsyncing the parent directory after the
+  rename (reusing `noxu-log`'s `sync_dir` helper, same Unix/Windows semantics
+  the log manager uses). The identical missing-dir-fsync in the VLSN-index
+  persister (`vlsn.idx`, both the full and checkpoint-capped write paths) is
+  fixed the same way. Witnessed by a deterministic RED/GREEN unit test and, on
+  Linux where `strace` is present, a syscall-level crash-consistency assertion
+  that an `fsync` of the parent directory follows the `rename`.
+
 ### Fixed — isolation
 
 - **Serializable phantom prevention under the cleaner** (`BUG-PHANTOM-REVERSE-GAP`,

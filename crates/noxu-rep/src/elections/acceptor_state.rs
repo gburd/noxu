@@ -103,6 +103,52 @@ const MIN_LEN: usize = 4 + 2 + 8 + 8 + 2 + 4;
 pub const ACCEPTOR_STATE_FILE: &str = "acceptor.state";
 const ACCEPTOR_STATE_TMP: &str = "acceptor.state.tmp";
 
+/// Testing seam that records the parent-directory fsync performed after the
+/// `write+rename` in [`PersistentAcceptorState::flush_locked`].
+///
+/// Exists only under `cfg(test)` or the `test-harness` feature (same gate as
+/// the rest of the in-memory rep test harness), so it is absent from every
+/// production build and from the released API surface -- `#[doc(hidden)]`
+/// keeps it off the public docs. A witness test checks that, after a
+/// `try_promise`/`try_accept` that persists, [`dir_sync_witness::last_dir_sync`]
+/// returns the state file's parent: RED if the dir-fsync is missing (the
+/// F-ELECT8-E defect), GREEN once `flush_locked` fsyncs the directory after
+/// the rename.
+#[cfg(any(test, feature = "test-harness"))]
+#[doc(hidden)]
+pub mod dir_sync_witness {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    thread_local! {
+        static LAST: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+        static COUNT: RefCell<u64> = const { RefCell::new(0) };
+    }
+
+    /// Record that `dir` was fsynced after a rename (called by `flush_locked`).
+    pub(crate) fn note(dir: &Path) {
+        LAST.with(|l| *l.borrow_mut() = Some(dir.to_path_buf()));
+        COUNT.with(|c| *c.borrow_mut() += 1);
+    }
+
+    /// The last directory fsynced on this thread after a `flush_locked`
+    /// rename, or `None` if no dir-fsync has run (the RED state).
+    pub fn last_dir_sync() -> Option<PathBuf> {
+        LAST.with(|l| l.borrow().clone())
+    }
+
+    /// Number of dir-fsyncs recorded on this thread since [`reset`].
+    pub fn dir_sync_count() -> u64 {
+        COUNT.with(|c| *c.borrow())
+    }
+
+    /// Clear the recorder (call at the start of a witness test).
+    pub fn reset() {
+        LAST.with(|l| *l.borrow_mut() = None);
+        COUNT.with(|c| *c.borrow_mut() = 0);
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AcceptorPersistError {
     #[error("I/O error: {0}")]
@@ -502,6 +548,30 @@ impl PersistentAcceptorState {
         drop(f);
 
         std::fs::rename(&tmp, path)?;
+
+        // F-ELECT8-E: the file is `sync_all`'d above, but the directory ENTRY
+        // created by the rename is NOT durable until the parent directory is
+        // itself fsynced (POSIX). Without this, a crash just after the rename
+        // can leave the directory pointing at the OLD `acceptor.state`, losing
+        // a promise/accept this acceptor already ACKed to a proposer -- the
+        // acceptor could then promise/accept a LOWER proposal and a second
+        // master could be elected at the same effective term (a Paxos safety
+        // violation). JE never persists the promise at all (Acceptor.java:46,
+        // `promisedProposal` is a plain in-memory field) and makes no restart
+        // guarantee; Noxu's design deliberately persists it for crash safety,
+        // so the fsync must cover the rename for that guarantee to hold.
+        //
+        // Reuses `noxu_log::sync_dir` (same cross-platform semantics the log
+        // manager uses for its own directory-entry durability).
+        noxu_log::sync_dir(env_home)?;
+
+        // Testing seam: record that the dir-fsync ran after the rename, so a
+        // witness can prove the ordering (RED without the fsync, GREEN with
+        // it). Compiled only under `cfg(test)` / the `test-harness` feature;
+        // absent from every production build and from the released surface.
+        #[cfg(any(test, feature = "test-harness"))]
+        dir_sync_witness::note(env_home);
+
         Ok(())
     }
 }
@@ -612,6 +682,47 @@ fn load_from_disk(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    // === F-ELECT8-E witness ===================================================
+    // The acceptor persists its promise with write + `sync_all` + `rename`, but
+    // the rename's directory ENTRY is only durable after the PARENT DIRECTORY
+    // is fsynced. The `dir_sync_witness` seam records every dir-fsync done by
+    // `flush_locked` after its rename.
+    //
+    // RED  (defect present): `flush_locked` ends at `rename` with no dir-fsync,
+    //       so `last_dir_sync()` stays `None` -> this test FAILS.
+    // GREEN (fixed): `flush_locked` calls `noxu_log::sync_dir(env_home)` after
+    //       the rename, so the witness records the state file's parent.
+    #[test]
+    fn promise_dir_fsync_follows_rename_witness() {
+        dir_sync_witness::reset();
+        let dir = TempDir::new().unwrap();
+        let s = PersistentAcceptorState::load_or_default(dir.path());
+
+        // A promise persists (write+rename) -> must be followed by a dir fsync.
+        assert!(s.try_promise_proposal(5, "node-a"));
+        assert_eq!(
+            dir_sync_witness::last_dir_sync().as_deref(),
+            Some(dir.path()),
+            "F-ELECT8-E: parent directory must be fsynced after the acceptor.state \
+             rename so the promise survives a crash"
+        );
+        let after_promise = dir_sync_witness::dir_sync_count();
+        assert!(
+            after_promise >= 1,
+            "expected >=1 dir fsync after the promise rename, got {after_promise}"
+        );
+
+        // An accept persists again -> another dir fsync must follow its rename.
+        assert!(s.try_accept_proposal(5, "node-a", "node-a"));
+        assert!(
+            dir_sync_witness::dir_sync_count() > after_promise,
+            "F-ELECT8-E: the accept's acceptor.state rename must also be followed \
+             by a parent-directory fsync (count did not advance: \
+             promise={after_promise}, now={})",
+            dir_sync_witness::dir_sync_count()
+        );
+    }
 
     #[test]
     fn in_memory_state_round_trips() {
