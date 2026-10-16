@@ -1388,12 +1388,17 @@ pub struct BinEntry {
     /// deleter's lock is uncontended (committed/aborted), or cleared on abort
     /// when the before-image is restored.
     ///
-    /// IN-MEMORY ONLY: never persisted as a distinct bit.  The v3 `.ndb` slot
-    /// encoding writes one deleted byte (`is_deleted()`); a slot read back
-    /// fresh from the log carries no active txn, so it deserialises as
-    /// `known_deleted = true, pending_deleted = false` (JE: a persisted
-    /// deletion is "known" at recovery time; recovery undo reverts it if the
-    /// txn had not committed).  This keeps the on-disk format byte-identical.
+    /// PERSISTED as a distinct bit within the single v3 `.ndb` slot "deleted"
+    /// byte (`deleted_state_byte` writes 0x08 for PD, 0x01 for KD;
+    /// `decode_deleted_state_byte` restores both).  JE persists both bits
+    /// (`IN.writeToLog` writes `entryStates & CLEAR_TRANSIENT_BITS`;
+    /// `materialize` restores them), so a BIN logged by the evictor/checkpointer
+    /// while a slot is PENDING-deleted reads back as PD, keeping an evict+re-fault
+    /// of an in-flight delete locked (not skipped) by a scan, and letting crash
+    /// recovery UNDO the uncommitted delete (the deleting txn never committed).
+    /// The byte stays a single `u8`, so the on-disk layout is unchanged
+    /// (LOG_VERSION 3); a v7.11.0 reader using `byte != 0` degrades a persisted
+    /// PD to KD (its pre-PD behaviour) — compatible, no corruption.
     pub pending_deleted: bool,
     /// True when this slot has been modified since the last full BIN log write.
     ///
@@ -11024,9 +11029,11 @@ impl Tree {
     /// (RecoveryManager.java:1912-1963, 2520-2600) and the cursor abort-LSN
     /// reuse path.  The bool is `is_deleted()` (KD || PD; FID-CURSOR-1): a
     /// deleted slot carries the DeleteLN LSN that a slot-reuse insert reuses
-    /// as its abort LSN.  During recovery all deleted slots are KD (a slot
-    /// read fresh from the log is never PD), so recovery behaviour is
-    /// unchanged.  `None` when no slot exists (or the descent failed).
+    /// as its abort LSN.  A slot read fresh from the log is usually KD, but a
+    /// checkpoint-durable *uncommitted* delete persists as PD (byte 0x08) and
+    /// re-faults as PD; recovery undo then reverts it because the deleting txn
+    /// never committed.  Either way `is_deleted()` is the right predicate here.
+    /// `None` when no slot exists (or the descent failed).
     ///
     /// Tag-native port of integrate 984fbabc's `slot_lsn_any`, on the tag's
     /// `get_parent_bin_for_child_ln` descent + slot finders (see
