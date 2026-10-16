@@ -437,6 +437,49 @@ impl Database {
         }
     }
 
+    /// Runs `f` inside a single auto-commit transaction scope, mirroring JE
+    /// `StoredContainer.beginAutoCommit` / `commitAutoCommit`
+    /// (StoredContainer.java:437-456) used by `StoredMap::put` / `remove` /
+    /// `clear` and `StoredList::remove`.
+    ///
+    /// * **Transactional database** — begins ONE synthetic auto-commit
+    ///   `Transaction` (JE `currentTxn.beginTransaction(null)`), passes it to
+    ///   `f` as `Some(&txn)`, and commits it once on `Ok` / aborts it once on
+    ///   `Err` (JE `commitAutoCommit(true)` / `handleException`).  All work
+    ///   `f` performs under that `Transaction` — the primary write and every
+    ///   secondary / FK / trigger maintenance it drives — is one atomic,
+    ///   single-fsync unit.
+    /// * **Non-transactional database** — JE `beginAutoCommit` returns
+    ///   `false`, so there is NO transaction: `f` is called with `None` and
+    ///   nothing is committed (JE `commitAutoCommit(false)` is a no-op).
+    ///   A `Transaction` cannot be opened on a non-transactional database, so
+    ///   `Some` is never passed in that case.
+    ///
+    /// This is the public, `#[doc(hidden)]` wrapper over
+    /// [`Self::with_auto_commit_transaction`] for the `noxu-collections`
+    /// `StoredContainer` views.  `Option<&Transaction>` is the faithful
+    /// signature: JE runs the work with a real auto-txn on a transactional
+    /// container and with no txn on a non-transactional one, which a bare
+    /// `&Transaction` could not express without fabricating a (rejected)
+    /// transaction on the non-txnal path.
+    ///
+    /// **Internal** — `#[doc(hidden)]`; a cross-crate wiring point for
+    /// `noxu-collections`, not part of the stable public surface.
+    #[doc(hidden)]
+    pub fn run_in_auto_commit<F, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(Option<&Transaction>) -> Result<T>,
+    {
+        // `with_auto_commit_transaction` passes (primary_txn, assoc_txn);
+        // for a `StoredContainer` the caller does ALL its work under the one
+        // primary locker (and any secondaries it maintains go through
+        // `Database::put`/`delete`, which open their own nested same-locker
+        // scope), so collapse to the primary txn.
+        self.with_auto_commit_transaction(|primary_txn, _assoc_txn| {
+            f(primary_txn)
+        })
+    }
+
     /// Durability of an auto-commit write (`txn = None`), from the
     /// database's `no_sync` / `write_no_sync` config.  Shared by
     /// [`Self::with_auto_txn`] and auto-commit cursors so `db.put` and
