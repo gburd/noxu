@@ -571,7 +571,27 @@ impl Transaction {
         // and `Txn::release_all_locks` in noxu-txn for the
         // implementation of this guarantee.
         let inner_err = if let Some(inner) = &self.inner_txn {
-            match inner.lock().unwrap().commit() {
+            // Pass the caller's durability to the inner `Txn` so a
+            // non-suppressed inner (an auto-commit `ThreadLocker`-equivalent
+            // `begin_auto_txn` Txn, used by a NON-transactional db's
+            // auto-commit write) honours NO_SYNC / WRITE_NO_SYNC / SYNC
+            // instead of being forced to `CommitSync` by the no-arg
+            // `Txn::commit`.  An inner with `suppress_own_end_frame` (every
+            // explicit / transactional-auto-commit txn) resolves to
+            // `PendingSync::None` regardless, so this is a no-op there.
+            let inner_durability = match durability.local_sync {
+                crate::durability::SyncPolicy::Sync => {
+                    noxu_txn::Durability::CommitSync
+                }
+                crate::durability::SyncPolicy::WriteNoSync => {
+                    noxu_txn::Durability::CommitWriteNoSync
+                }
+                crate::durability::SyncPolicy::NoSync => {
+                    noxu_txn::Durability::CommitNoSync
+                }
+            };
+            match inner.lock().unwrap().commit_with_durability(inner_durability)
+            {
                 Ok(_) => None,
                 Err(e) => {
                     log::error!(

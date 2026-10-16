@@ -332,102 +332,128 @@ impl Database {
     where
         F: FnOnce(Option<&Transaction>, Option<&Transaction>) -> Result<T>,
     {
-        let transactional = self.config.transactional;
         let is_replicated = self.db_impl.read().is_replicated();
 
-        // Build the inner `Txn` via `EnvironmentImpl::begin_txn` for BOTH the
-        // transactional and non-transactional cases.  `begin_txn` attaches
-        // the `LogManager` (when the env has a WAL) and sets
-        // `suppress_own_end_frame`, so the OUTER `Transaction` owns the
-        // single `TxnCommit` frame AND the single fsync with the correct
-        // durability — the inner `commit()` writes nothing and fsyncs
-        // nothing.  (A `begin_auto_txn` Txn, by contrast, ignores
-        // `suppress_own_end_frame` and would force a `CommitSync` fsync via
-        // the no-arg `Txn::commit` the outer calls, breaking
-        // `COMMIT_NO_SYNC`.)  A truly non-transactional ENV has no
-        // `LogManager`, so `begin_txn` yields a Txn without one and the
-        // commit neither logs nor fsyncs — only lock release happens.
-        let mut inner = {
-            let env = self.env_impl.lock();
-            env.begin_txn().map_err(NoxuError::from)?
-        };
-        // Local-write defaults to true on a non-replicated database (nothing
-        // to replicate); on a replicated database it replicates normally —
-        // matching `begin_transaction`.
-        inner.set_local_write(!is_replicated);
-        // Use the inner `Txn`'s recovery-seeded locker id (from
-        // `TxnManager::next_txn_id`, which recovery restores via
-        // `set_last_txn_id`) as the OUTER `Transaction` id so the LN txn_id
-        // and the `TxnCommit` frame id match and are unique across restarts,
-        // and share the one id space with explicit transactions (see
-        // `Environment::begin_transaction`).
-        let txn_id = inner.id_as_locker() as u64;
-
-        // The outer `Transaction` config / commit take the `noxu-db`
-        // `Durability` struct (SyncPolicy triple), derived from the same
-        // `no_sync` / `write_no_sync` flags that `auto_commit_durability`
-        // maps to the `noxu_txn::Durability` enum used by the raw-`Txn`
-        // path.  Keep the two in lock-step.
-        let durability = if self.no_sync {
-            crate::durability::Durability::COMMIT_NO_SYNC
-        } else if self.write_no_sync {
-            crate::durability::Durability::COMMIT_WRITE_NO_SYNC
-        } else {
-            crate::durability::Durability::COMMIT_SYNC
-        };
-        let txn_config =
-            crate::transaction_config::TransactionConfig::default()
-                .with_durability(durability);
-
-        // Mirror `Environment::begin_transaction`'s wiring, minus the
-        // active-txns registry (auto-commit ops are not registered) and the
-        // replica-ack coordinator (reachable only from the `Environment`
-        // handle, not from a `Database`; the prior auto-commit path likewise
-        // never waited for replica acks).
-        let txn = match &self.log_manager {
-            Some(lm) => Transaction::with_log_manager(
-                txn_id,
-                txn_config,
-                Arc::clone(lm),
-            ),
-            None => Transaction::new(txn_id, txn_config),
-        }
-        .with_inner_txn(Arc::new(std::sync::Mutex::new(inner)))
-        .with_env_impl(Arc::clone(&self.env_impl));
-
-        // Secondaries/triggers run under the SAME locker for a transactional
-        // database; for a non-transactional database they must run auto-commit
-        // (`None`) — a `Transaction` cannot be opened on a non-txnal db.
-        let assoc_txn = if transactional { Some(&txn) } else { None };
-
-        let op_result = op(Some(&txn), assoc_txn);
-
-        // WITNESS-ONLY crash injection (inert unless the env var is set):
-        // `NOXU_OPTB_CRASH_BEFORE_COMMIT=<key>` aborts the process AFTER the
-        // primary write AND all secondary maintenance have been buffered but
-        // BEFORE the single `TxnCommit` fsync, proving the whole unit is
-        // atomic (after recovery NEITHER the primary NOR its secondary is
-        // present).  `NOXU_OPTB_CRASH_AFTER_COMMIT=<key>` aborts just AFTER
-        // the single commit, proving BOTH survive.  Keyed on the primary key
-        // so a witness can target one specific op.  Zero cost when unset.
-        #[cfg(not(noxu_shuttle))]
-        if op_result.is_ok() {
-            crate::optb_crash_hook::maybe_crash_before_commit();
-        }
-
-        match op_result {
-            Ok(value) => {
-                txn.commit_with_durability(durability)?;
-                #[cfg(not(noxu_shuttle))]
-                crate::optb_crash_hook::maybe_crash_after_commit();
-                Ok(value)
+        if self.config.transactional {
+            // JE `LockerFactory.getWritableLocker`: `dbIsTransactional &&
+            // userTxn == null` -> `Txn.createAutoTxn`.  Build ONE synthetic
+            // `Transaction` wrapping an inner `Txn` from
+            // `EnvironmentImpl::begin_txn` (LogManager attached,
+            // `suppress_own_end_frame` set), so the OUTER `Transaction` owns
+            // the single `TxnCommit` frame AND the single fsync; LNs are
+            // logged transactionally (`InsertLNTxn`) and recovery sees ALL or
+            // NONE.
+            let mut inner = {
+                let env = self.env_impl.lock();
+                env.begin_txn().map_err(NoxuError::from)?
+            };
+            inner.set_local_write(!is_replicated);
+            // Outer id = inner id (TxnManager allocator, recovery-seeded via
+            // `set_last_txn_id`) so the LN txn_id and `TxnCommit` id match,
+            // are unique across restarts, and share the one id space with
+            // explicit transactions (see `Environment::begin_transaction`).
+            let txn_id = inner.id_as_locker() as u64;
+            let durability = if self.no_sync {
+                crate::durability::Durability::COMMIT_NO_SYNC
+            } else if self.write_no_sync {
+                crate::durability::Durability::COMMIT_WRITE_NO_SYNC
+            } else {
+                crate::durability::Durability::COMMIT_SYNC
+            };
+            let txn_config =
+                crate::transaction_config::TransactionConfig::default()
+                    .with_durability(durability);
+            let txn = match &self.log_manager {
+                Some(lm) => Transaction::with_log_manager(
+                    txn_id,
+                    txn_config,
+                    Arc::clone(lm),
+                ),
+                None => Transaction::new(txn_id, txn_config),
             }
-            Err(e) => {
-                // Undo the primary AND (for a txnal db) every secondary write,
-                // release locks.  Preserve the original error even if the
-                // abort itself fails (a failed abort is logged inside `abort`).
-                let _ = txn.abort();
-                Err(e)
+            .with_inner_txn(Arc::new(std::sync::Mutex::new(inner)))
+            .with_env_impl(Arc::clone(&self.env_impl));
+
+            // Associations run under the SAME locker (one atomic unit).
+            let op_result = op(Some(&txn), Some(&txn));
+            #[cfg(not(noxu_shuttle))]
+            if op_result.is_ok() {
+                crate::optb_crash_hook::maybe_crash_before_commit();
+            }
+            match op_result {
+                Ok(value) => {
+                    txn.commit_with_durability(durability)?;
+                    #[cfg(not(noxu_shuttle))]
+                    crate::optb_crash_hook::maybe_crash_after_commit();
+                    Ok(value)
+                }
+                Err(e) => {
+                    // Undo the primary AND every secondary write; one abort.
+                    let _ = txn.abort();
+                    Err(e)
+                }
+            }
+        } else {
+            // JE `LockerFactory.getWritableLocker`: a NON-transactional db
+            // (`userTxn == null`, `!dbIsTransactional`) uses
+            // `ThreadLocker.createThreadLocker` — NOT a `Txn`.  A ThreadLocker
+            // writes NO `TxnCommit`, logs the LN in the NON-transactional form
+            // (`InsertLN` / `DeleteLN`, txn_id 0), and `BasicLocker.
+            // operationEnd` (BasicLocker.java:241) only releases locks — the
+            // LN's durability is whatever the `LN.log` call already applied
+            // per the env's durability (NO_SYNC -> no fsync).
+            //
+            // Noxu's `begin_auto_txn` `Txn` is that ThreadLocker equivalent:
+            // auto-form LN (the cursor uses locker_id 0, see below), NO
+            // `TxnCommit`, write locks tracked for in-memory abort/undo.  We
+            // wrap it in a `Transaction` ONLY as a cursor-wiring vehicle:
+            //   * id = 0  -> `make_cursor_for_txn` uses locker_id 0, so the LN
+            //     is logged NON-transactionally (`InsertLN`, txn_id 0);
+            //   * NO `LogManager` on the wrapper -> `commit_with_durability`
+            //     writes NO `TxnCommit` frame;
+            //   * the inner auto-`Txn` carries the `LogManager`, and the
+            //     wrapper's `commit_with_durability(db_durability)` now passes
+            //     that durability through to the inner (NO_SYNC -> no fsync;
+            //     SYNC -> flush the LN) — the inner is NOT suppressed, so it
+            //     honours it via the auto-txn arm of `commit_append_phase`.
+            // Secondaries / triggers get `None` (each its own ThreadLocker
+            // auto-commit), never a `Transaction`.
+            let mut auto_txn =
+                self.txn_manager.begin_auto_txn(self.log_manager.clone());
+            auto_txn.set_local_write(!is_replicated);
+            let durability = if self.no_sync {
+                crate::durability::Durability::COMMIT_NO_SYNC
+            } else if self.write_no_sync {
+                crate::durability::Durability::COMMIT_WRITE_NO_SYNC
+            } else {
+                crate::durability::Durability::COMMIT_SYNC
+            };
+            let txn = Transaction::new(
+                0,
+                crate::transaction_config::TransactionConfig::default()
+                    .with_durability(durability),
+            )
+            .with_inner_txn(Arc::new(std::sync::Mutex::new(auto_txn)))
+            .with_env_impl(Arc::clone(&self.env_impl));
+
+            let op_result = op(Some(&txn), None);
+            #[cfg(not(noxu_shuttle))]
+            if op_result.is_ok() {
+                crate::optb_crash_hook::maybe_crash_before_commit();
+            }
+            match op_result {
+                Ok(value) => {
+                    txn.commit_with_durability(durability)?;
+                    #[cfg(not(noxu_shuttle))]
+                    crate::optb_crash_hook::maybe_crash_after_commit();
+                    Ok(value)
+                }
+                Err(e) => {
+                    // Undo the in-memory primary write and release locks (one
+                    // abort; the wrapper's `abort` applies undo via env_impl).
+                    let _ = txn.abort();
+                    Err(e)
+                }
             }
         }
     }
@@ -514,7 +540,8 @@ impl Database {
 
     /// Durability of an auto-commit write (`txn = None`), from the
     /// database's `no_sync` / `write_no_sync` config.  Shared by
-    /// [`Self::with_auto_txn`] and auto-commit cursors so `db.put` and
+    /// [`Self::with_auto_commit_transaction`]'s non-transactional
+    /// (ThreadLocker) path and auto-commit cursors so `db.put` and
     /// `cursor.put` honour the same policy.
     fn auto_commit_durability(&self) -> Durability {
         if self.no_sync {

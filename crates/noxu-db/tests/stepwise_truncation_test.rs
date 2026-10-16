@@ -200,95 +200,38 @@ fn walk_entries(file_bytes: &[u8], file_num: u32) -> Vec<EntryBoundary> {
 /// the way JE's `updateExpectedSet` builds it incrementally.
 ///
 /// We only track keys in our known namespace (`key_*`) so internal MapLN /
-/// NameLN / FileSummaryLN entries are ignored.
-///
-/// v7.11.1 single-locker: an auto-commit `put` is now a real `Txn`
-/// (`Txn.createAutoTxn`), so each write is logged as a TRANSACTIONAL LN
-/// (`InsertLNTxn` / `DeleteLNTxn`) followed by a `TxnCommit`.  Model it like
-/// JE's `CheckBase` TxnalEntry / CommitEntry: buffer a transaction's LN
-/// writes keyed by txn id and apply them to the expected set ONLY when the
-/// matching `TxnCommit` entry survives the truncation boundary; drop them on
-/// a surviving `TxnAbort` or if the commit does not survive.  A genuinely
-/// non-transactional LN (`InsertLN` / `DeleteLN`, txn_id = 0) still becomes
-/// visible the moment its entry survives (JE `NonTxnalEntry`).
+/// NameLN / FileSummaryLN entries are ignored. Non-transactional LNs become
+/// visible the moment their entry survives (JE `NonTxnalEntry`).
 fn replay_expected(
     all_files: &[(u32, Vec<EntryBoundary>)],
     truncate_file: u32,
     truncate_offset: u64,
 ) -> BTreeMap<Vec<u8>, Vec<u8>> {
     let mut expected: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
-    // Per-txn buffered writes (txn_id -> ordered (key, Option<value>) ops;
-    // None value = delete), applied on the surviving TxnCommit.
-    let mut pending: std::collections::HashMap<
-        i64,
-        Vec<(Vec<u8>, Option<Vec<u8>>)>,
-    > = std::collections::HashMap::new();
-    'outer: for (fnum, entries) in all_files {
+    for (fnum, entries) in all_files {
         for e in entries {
             // Stop once we pass the truncation boundary in the last file.
             if *fnum == truncate_file && e.end > truncate_offset {
-                break 'outer;
+                break;
             }
-            apply_entry(&mut expected, &mut pending, e);
+            apply_entry(&mut expected, e);
         }
         if *fnum == truncate_file {
             break;
         }
     }
-    // Any still-pending (uncommitted) txn is dropped: its TxnCommit did not
-    // survive the boundary, so recovery would undo it.
     expected
 }
 
-fn apply_entry(
-    expected: &mut BTreeMap<Vec<u8>, Vec<u8>>,
-    pending: &mut std::collections::HashMap<
-        i64,
-        Vec<(Vec<u8>, Option<Vec<u8>>)>,
-    >,
-    e: &EntryBoundary,
-) {
+fn apply_entry(expected: &mut BTreeMap<Vec<u8>, Vec<u8>>, e: &EntryBoundary) {
     use noxu_log::entry::LnLogEntry;
-    // A surviving TxnCommit applies the txn's buffered writes; a TxnAbort
-    // discards them (JE CommitEntry / the undo of an unresolved txn).
-    match e.entry_type {
-        LogEntryType::TxnCommit => {
-            if let Ok(end) =
-                noxu_log::entry::TxnEndEntry::read_from_log(&e.payload)
-            {
-                if let Some(ops) = pending.remove(&end.txn_id) {
-                    for (key, val) in ops {
-                        match val {
-                            Some(v) => {
-                                expected.insert(key, v);
-                            }
-                            None => {
-                                expected.remove(&key);
-                            }
-                        }
-                    }
-                }
-            }
-            return;
-        }
-        LogEntryType::TxnAbort => {
-            if let Ok(end) =
-                noxu_log::entry::TxnEndEntry::read_from_log(&e.payload)
-            {
-                pending.remove(&end.txn_id);
-            }
-            return;
-        }
-        _ => {}
-    }
-
     let is_txn = e.entry_type.is_transactional();
     let (insert, delete) = match e.entry_type {
-        LogEntryType::InsertLN
-        | LogEntryType::UpdateLN
-        | LogEntryType::InsertLNTxn
-        | LogEntryType::UpdateLNTxn => (true, false),
-        LogEntryType::DeleteLN | LogEntryType::DeleteLNTxn => (false, true),
+        LogEntryType::InsertLN | LogEntryType::UpdateLN => (true, false),
+        LogEntryType::DeleteLN => (false, true),
+        // Transactional variants: our C2 workload is non-transactional, so
+        // we don't expect these. (A txnal workload would require buffering
+        // until the matching TxnCommit — JE TxnalEntry/CommitEntry.)
         _ => return,
     };
     let parsed = match LnLogEntry::parse_from_slice(&e.payload, is_txn) {
@@ -299,25 +242,13 @@ fn apply_entry(
     if !parsed.key.starts_with(b"key_") {
         return;
     }
-    let key = parsed.key.to_vec();
-    let val = if insert {
-        Some(parsed.data.map(|d| d.to_vec()).unwrap_or_default())
-    } else {
-        None
-    };
-    match (is_txn, parsed.txn_id) {
-        // Transactional LN: buffer under its txn id until the TxnCommit.
-        (true, Some(txn_id)) => {
-            pending.entry(txn_id).or_default().push((key, val));
-        }
-        // Non-transactional LN (auto-form, txn_id = 0): apply immediately.
-        _ => {
-            if let Some(v) = val {
-                expected.insert(key, v);
-            } else {
-                expected.remove(&key);
-            }
-        }
+    if insert {
+        expected.insert(
+            parsed.key.to_vec(),
+            parsed.data.map(|d| d.to_vec()).unwrap_or_default(),
+        );
+    } else if delete {
+        expected.remove(parsed.key);
     }
 }
 
@@ -383,29 +314,19 @@ fn stepwise_truncation_basic_insert() {
         all_files.push((file_num, entries));
     }
 
-    // Total number of user-key LN inserts across the whole log == 21.
-    // v7.11.1 single-locker: auto-commit puts are now TRANSACTIONAL LNs
-    // (`InsertLNTxn` / `UpdateLNTxn`, each followed by a `TxnCommit`), so
-    // count those forms and parse them as transactional.  (The auto-form
-    // `InsertLN` / `UpdateLN` is accepted too for robustness.)
+    // Total number of LN inserts we should see across the whole log == 21.
     let total_inserts: usize = all_files
         .iter()
         .flat_map(|(_, es)| es.iter())
         .filter(|e| {
             matches!(
                 e.entry_type,
-                LogEntryType::InsertLN
-                    | LogEntryType::UpdateLN
-                    | LogEntryType::InsertLNTxn
-                    | LogEntryType::UpdateLNTxn
+                LogEntryType::InsertLN | LogEntryType::UpdateLN
             ) && {
                 use noxu_log::entry::LnLogEntry;
-                LnLogEntry::parse_from_slice(
-                    &e.payload,
-                    e.entry_type.is_transactional(),
-                )
-                .map(|p| p.key.starts_with(b"key_"))
-                .unwrap_or(false)
+                LnLogEntry::parse_from_slice(&e.payload, false)
+                    .map(|p| p.key.starts_with(b"key_"))
+                    .unwrap_or(false)
             }
         })
         .count();
