@@ -180,3 +180,43 @@ fn fid_dpl_28_remove_rmw_is_atomic_no_lost_update() {
          a single RMW cursor in one auto-commit txn."
     );
 }
+
+/// FID-DPL-15 (S2): `StoredMap::clear(None)` must delete every record under
+/// ONE auto-commit transaction (JE `StoredContainer.clear` ->
+/// `DataView.clear`, StoredContainer.java:293), so a crash or error
+/// mid-clear leaves the map fully cleared or untouched, never partially
+/// cleared.
+///
+/// Observable discriminator: a single-transaction clear commits EXACTLY
+/// ONCE regardless of record count.  We clear a 500-record map and assert
+/// the environment's committed-transaction counter advanced by exactly 1.
+/// RED on 81b2f048: each `cursor.delete()` ran on its own per-op
+/// auto-commit cursor (no single wrapping transaction), so the clear was
+/// not one atomic unit (the tracked commit delta is 0 -- there was no
+/// enclosing transaction at all).  GREEN after FID-DPL-15: exactly 1.
+#[test]
+fn fid_dpl_15_clear_is_single_transaction() {
+    let (_td, env, db) = env_db("dpl15_clear");
+    let full = 500usize;
+    let map: StoredMap<'_, i32, i32, _, _> =
+        StoredMap::new(&db, IntBinding, IntBinding);
+    for i in 0..full as i32 {
+        map.put(None, &i, &i).unwrap();
+    }
+
+    let c0 = env.stats().unwrap().txn.n_commits;
+    map.clear(None).unwrap();
+    let c1 = env.stats().unwrap().txn.n_commits;
+
+    assert_eq!(map.len(None).unwrap(), 0, "clear must empty the map");
+    assert_eq!(
+        c1 - c0,
+        1,
+        "FID-DPL-15: clear(None) of {full} records committed {} \
+         transaction(s); it must be EXACTLY ONE auto-commit transaction \
+         (JE StoredContainer.clear -> one beginAutoCommit/commitAutoCommit). \
+         A delta of 0 means each delete auto-committed per-op with no \
+         enclosing transaction (the base).",
+        c1 - c0,
+    );
+}

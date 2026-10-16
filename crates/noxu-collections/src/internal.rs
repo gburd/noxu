@@ -185,6 +185,31 @@ pub(crate) fn remove_rmw(
     Ok(old)
 }
 
+/// Delete every record under a single cursor and `txn` (FID-DPL-15).
+/// Mirrors JE `StoredContainer.clear` -> `DataView.clear`
+/// (`StoredContainer.java:293`): the whole multi-record delete runs inside
+/// ONE auto-commit transaction, so a crash or error mid-clear rolls the
+/// entire clear back (the map is fully cleared or untouched, never
+/// partially cleared).
+pub(crate) fn clear_all(
+    db: &Database,
+    txn: Option<&Transaction>,
+) -> std::result::Result<(), noxu_db::NoxuError> {
+    let mut cursor = match txn {
+        Some(t) => db.open_cursor_in(t, None)?,
+        None => db.open_cursor(None)?,
+    };
+    let mut key = DatabaseEntry::new();
+    let mut data = DatabaseEntry::new();
+    while let OperationStatus::Success =
+        cursor.get(&mut key, &mut data, Get::First, None)?
+    {
+        cursor.delete()?;
+    }
+    cursor.close()?;
+    Ok(())
+}
+
 /// Encodes a typed key into a fresh [`DatabaseEntry`].
 pub(crate) fn encode_key<K, KB: EntryBinding<K>>(
     binding: &KB,

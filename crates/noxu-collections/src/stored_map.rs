@@ -13,7 +13,7 @@
 use std::marker::PhantomData;
 
 use noxu_bind::EntryBinding;
-use noxu_db::{Database, Get, OperationStatus, Transaction};
+use noxu_db::{Database, Transaction};
 
 use crate::error::{CollectionError, Result};
 use crate::internal::{
@@ -395,17 +395,17 @@ where
             return Err(CollectionError::ReadOnly);
         }
 
-        let mut cursor = crate::internal::open_cursor(self.db, txn, None)?;
-        let mut key = noxu_db::DatabaseEntry::new();
-        let mut data = noxu_db::DatabaseEntry::new();
-
-        while let OperationStatus::Success =
-            cursor.get(&mut key, &mut data, Get::First, None)?
-        {
-            cursor.delete()?;
+        // FID-DPL-15: the whole multi-record delete runs in ONE
+        // auto-commit transaction (JE `StoredContainer.clear` ->
+        // `DataView.clear`, StoredContainer.java:293), so a crash or error
+        // mid-clear rolls the entire clear back -- the map is fully
+        // cleared or untouched, never partially cleared.
+        match txn {
+            Some(_) => crate::internal::clear_all(self.db, txn)?,
+            None => self.db.run_in_auto_commit(|t| {
+                crate::internal::clear_all(self.db, t)
+            })?,
         }
-
-        cursor.close()?;
         Ok(())
     }
 }
