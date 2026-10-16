@@ -300,8 +300,21 @@ impl NetworkRestore {
             // rename the existing file before writing the new one.
             let dest_path = log_dir.join(&filename);
             if self.config.retain_log_files && dest_path.exists() {
+                // FID-NR-7 (JE NetworkBackup.disposeFile, NetworkBackup.java:751):
+                // a failed rename of the existing file to .bak must ERROR, not
+                // be swallowed and the retained file silently overwritten. JE
+                // throws EnvironmentFailureException.unexpectedState on a
+                // failed rename.
                 let backup = log_dir.join(format!("{}.bak", filename));
-                let _ = std::fs::rename(&dest_path, &backup);
+                std::fs::rename(&dest_path, &backup).map_err(|e| {
+                    RepError::NetworkRestoreError(format!(
+                        "retaining existing log file: could not rename '{}' \
+                         to '{}': {}",
+                        dest_path.display(),
+                        backup.display(),
+                        e
+                    ))
+                })?;
             }
 
             // FID-NR-2 (JE NetworkBackup.getFile, NetworkBackup.java:575):
@@ -581,8 +594,21 @@ impl NetworkRestore {
 
             let dest_path = log_dir.join(&filename);
             if self.config.retain_log_files && dest_path.exists() {
+                // FID-NR-7 (JE NetworkBackup.disposeFile, NetworkBackup.java:751):
+                // a failed rename of the existing file to .bak must ERROR, not
+                // be swallowed and the retained file silently overwritten. JE
+                // throws EnvironmentFailureException.unexpectedState on a
+                // failed rename.
                 let backup = log_dir.join(format!("{}.bak", filename));
-                let _ = std::fs::rename(&dest_path, &backup);
+                std::fs::rename(&dest_path, &backup).map_err(|e| {
+                    RepError::NetworkRestoreError(format!(
+                        "retaining existing log file: could not rename '{}' \
+                         to '{}': {}",
+                        dest_path.display(),
+                        backup.display(),
+                        e
+                    ))
+                })?;
             }
 
             // FID-NR-2 (JE NetworkBackup.getFile, NetworkBackup.java:575):
@@ -1200,6 +1226,53 @@ mod tests {
         assert!(
             err.to_string().contains("wrong state"),
             "unexpected error: {err}"
+        );
+    }
+
+    /// FID-NR-7 (S2, JE `NetworkBackup.disposeFile`, `NetworkBackup.java:751`):
+    /// on `retain_log_files`, a failed rename of the existing file to `.bak`
+    /// must ERROR, not be swallowed and the retained file silently
+    /// overwritten. JE throws `EnvironmentFailureException.unexpectedState`.
+    ///
+    /// Witness: `retain_log_files = true`, with `<name>.bak` pre-created as a
+    /// directory so `rename(file, dir)` fails. RED at 81b2f048 (`let _ =
+    /// std::fs::rename(..)` swallows it; the restore proceeds and the
+    /// retained copy is lost). GREEN after the fix (the error propagates).
+    #[cfg(unix)]
+    #[test]
+    fn execute_via_dispatcher_bak_rename_failure_errors() {
+        let filename = b"00000009.ndb";
+        let body = b"incoming restore bytes";
+        let mut payload = 1u32.to_le_bytes().to_vec();
+        payload.extend_from_slice(&(filename.len() as u16).to_le_bytes());
+        payload.extend_from_slice(filename);
+        payload.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        payload.extend_from_slice(body);
+        payload.extend_from_slice(&crc32fast::hash(body).to_le_bytes());
+
+        let (_disp, addr) = spawn_fixed_reply_restore_server(payload);
+        let dir = tempfile::TempDir::new().unwrap();
+        // An existing log file to retain.
+        std::fs::write(dir.path().join("00000009.ndb"), b"old").unwrap();
+        // Make the `.bak` target a directory so renaming a file onto it fails.
+        std::fs::create_dir(dir.path().join("00000009.ndb.bak")).unwrap();
+        std::fs::write(
+            dir.path().join("00000009.ndb.bak").join("blocker"),
+            b"x",
+        )
+        .unwrap();
+
+        let mut cfg = dispatcher_config(addr);
+        cfg.retain_log_files = true;
+        let restore = NetworkRestore::new(cfg).with_local_dir(dir.path());
+        let res = restore.execute_via_dispatcher();
+        assert!(
+            res.is_err(),
+            "a failed .bak rename must surface as an error (FID-NR-7)"
+        );
+        assert!(
+            res.unwrap_err().to_string().contains("rename"),
+            "error must describe the failed rename"
         );
     }
 }
