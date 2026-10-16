@@ -376,23 +376,48 @@ impl PersistentAcceptorState {
     ///
     /// # Why the "already accepted a different value at this term" guard
     ///
-    /// JE's acceptor, on a legitimate re-promise to a strictly-higher
-    /// proposal, is allowed to accept a NEW value at the same decree, because
-    /// JE's proposer adopts the highest previously-accepted value it saw in
-    /// phase 1 (`Proposer.tallyPhase1Results` tracks `acceptedValue`), so the
-    /// new value equals the old one — no split brain.  Noxu's `RankingProposer`
-    /// chooses the phase-2 value from the Promise *suggestions* (VLSN
-    /// ranking), NOT from the acceptor's previously-accepted value, so it does
-    /// NOT perform that adoption.  Without value adoption the only safe rule
-    /// for a value-less acceptor is: once a value is ACCEPTED at a term,
-    /// refuse to accept a DIFFERENT value at that SAME term.  With the
-    /// time-based proposal number (`TimebasedProposalGenerator`) a term is
-    /// never reused by two proposers, so this guard never fires in normal
-    /// operation; it is the belt-and-suspenders that makes a single acceptor
-    /// split-brain-proof even if a term were somehow reused, and it is what
-    /// makes the FID-ELECT-1 witness (two masters at one term) go green at
-    /// the acceptor level.  It can only REJECT more than JE, never accept
-    /// more, so it is sound.
+    /// This guard is a Noxu-specific safety backstop with NO direct JE
+    /// counterpart: JE `Acceptor.process(Accept)` (Acceptor.java:209-215) has
+    /// no "different value at this term" check — it accepts iff the promise
+    /// equals the Accept's proposal and then overwrites `acceptedValue`
+    /// unconditionally.  Note that JE's `RankingProposer.choosePhase2Value`
+    /// (RankingProposer.java:56-130) also does NOT adopt a previously-accepted
+    /// value — it ranks the Promise *suggestions* (VLSN/dtvlsn), exactly as
+    /// Noxu's `choose_phase2_value` does; `Proposer.Phase1Result.acceptedValue`
+    /// is tracked but `@SuppressWarnings("unused")` in the ranking proposer.
+    /// So this guard is NOT compensating for a value-adoption difference
+    /// between Noxu and JE (there is none).
+    ///
+    /// The real reason the guard is needed is a different Noxu deviation: JE
+    /// keys EVERY stage on the whole globally-unique proposal number
+    /// (`ms_time|machineId|uniqueId`), including the Learner's
+    /// highest-proposal rule (`Learner.processResult`, Learner.java:139-150),
+    /// so "two proposers at the same wall-clock ms" are still distinct
+    /// proposals and the group converges on the highest.  Noxu's DOWNSTREAM
+    /// master bookkeeping — `master_tracker.update_master` (rejects
+    /// `term < current_term`), DTVLSN, and `transfer_master`
+    /// (`new_term = get_term()+1`) — keys on the BARE `term` integer, not the
+    /// full `(term, proposer)` number.  So if two proposers ever shared one
+    /// `term` integer, Noxu could not distinguish them downstream.  This guard
+    /// restores the per-term single-value invariant for the acceptor: once a
+    /// value is ACCEPTED at a term, refuse a DIFFERENT value at that SAME
+    /// term.  With the time-based proposal number
+    /// (`TimebasedProposalGenerator`) terms do not collide across proposers in
+    /// normal operation, so the guard never fires there; it makes the acceptor
+    /// split-brain-proof even under an adversarial term-integer collision
+    /// (modelled by the `flexible_paxos` spec, which is only safe for the real
+    /// `(term, proposer)` gate WITH this guard), and it is what makes the
+    /// FID-ELECT-1 witness go green at the acceptor level.
+    ///
+    /// Trade-off (reviewed, accepted as a conservative backstop): because the
+    /// guard keys on the bare term integer, a legitimately-HIGHER proposer
+    /// `(t, Z)` that re-promised an acceptor which already accepted `(t, A)`
+    /// with a different value at the SAME integer `t` is REJECTED here, where
+    /// JE would accept it and let the Learner keep the highest proposal.  With
+    /// ms_time terms this collision does not arise in normal re-elections
+    /// (`observe` + `next` make a re-election's term strictly greater), so no
+    /// legitimate election is blocked; the guard can only REJECT more than JE,
+    /// never accept more, so it cannot cause split-brain.
     #[doc(hidden)]
     pub fn try_accept_proposal(
         &self,
