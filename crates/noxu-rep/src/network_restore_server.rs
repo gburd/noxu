@@ -124,33 +124,63 @@ impl NetworkRestoreServer {
         self.send_files_to(&mut stream)
     }
 
+    /// Enumerate every `.ndb` file in `env_home`, sorted by name.
+    ///
+    /// FID-NR-9 (JE `LogFileFeeder`/`DbBackup` protected snapshot): a
+    /// `read_dir` entry error must ABORT the enumeration, not be silently
+    /// dropped. The former `entry.ok()?` in a `filter_map` swallowed a
+    /// per-entry I/O error, so a transient directory-read failure would omit
+    /// that file from the sent set and the restoring node would receive an
+    /// incomplete log with no error reported. JE sends the exact protected
+    /// file set; a missing file is a hard failure, not a skipped entry.
+    fn list_ndb_files(&self) -> Result<Vec<(String, PathBuf)>> {
+        let read_dir = std::fs::read_dir(&self.env_home).map_err(|e| {
+            RepError::NetworkRestoreError(format!(
+                "cannot read env_home {}: {}",
+                self.env_home.display(),
+                e
+            ))
+        })?;
+        let mut files: Vec<(String, PathBuf)> = Vec::new();
+        for entry in read_dir {
+            // FID-NR-9: propagate the per-entry error instead of dropping it.
+            let entry = entry.map_err(|e| {
+                RepError::NetworkRestoreError(format!(
+                    "reading a directory entry in {}: {}",
+                    self.env_home.display(),
+                    e
+                ))
+            })?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("ndb") {
+                // FID-NR-9: a `.ndb` file whose name cannot be decoded is a
+                // hard inconsistency, not a file to silently omit from the
+                // sent set. JE sends the exact protected snapshot; a dropped
+                // file would restore a gap. Error rather than skip.
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or_else(|| {
+                        RepError::NetworkRestoreError(format!(
+                            "log file {} has a non-UTF-8 name; refusing to \
+                             send an incomplete set",
+                            path.display()
+                        ))
+                    })?;
+                files.push((name.to_string(), path.clone()));
+            }
+        }
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(files)
+    }
+
     /// Core file-transfer logic: enumerate `.ndb` files, send count, then
     /// stream each file's name + size + bytes to `out`.
     ///
     /// Used by both `serve_raw` and the `ServiceHandler::handle` path.
     fn send_files_to<W: IoRead + IoWrite>(&self, out: &mut W) -> Result<()> {
         // Enumerate all .ndb files in env_home, sorted by name.
-        let mut files: Vec<(String, PathBuf)> =
-            std::fs::read_dir(&self.env_home)
-                .map_err(|e| {
-                    RepError::NetworkRestoreError(format!(
-                        "cannot read env_home {}: {}",
-                        self.env_home.display(),
-                        e
-                    ))
-                })?
-                .filter_map(|entry| {
-                    let entry = entry.ok()?;
-                    let path = entry.path();
-                    if path.extension()?.to_str()? == "ndb" {
-                        let name = path.file_name()?.to_str()?.to_string();
-                        Some((name, path))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-        files.sort_by(|a, b| a.0.cmp(&b.0));
+        let files = self.list_ndb_files()?;
 
         // Send file count.
         let count = files.len() as u32;
@@ -301,27 +331,7 @@ impl ServiceHandler for NetworkRestoreServer {
         }
 
         // Build file list and send via the channel's framing.
-        let mut files: Vec<(String, PathBuf)> =
-            std::fs::read_dir(&self.env_home)
-                .map_err(|e| {
-                    RepError::NetworkRestoreError(format!(
-                        "read_dir {}: {}",
-                        self.env_home.display(),
-                        e
-                    ))
-                })?
-                .filter_map(|entry| {
-                    let entry = entry.ok()?;
-                    let path = entry.path();
-                    if path.extension()?.to_str()? == "ndb" {
-                        let name = path.file_name()?.to_str()?.to_string();
-                        Some((name, path))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-        files.sort_by(|a, b| a.0.cmp(&b.0));
+        let files = self.list_ndb_files()?;
 
         // Send a single framed message containing the entire restore payload.
         // The payload uses the same wire layout as the raw-TCP path so the
@@ -391,6 +401,36 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::network_restore::{NetworkRestore, NetworkRestoreConfig};
+
+    /// FID-NR-9 (JE `LogFileFeeder`/`DbBackup` protected snapshot): a `.ndb`
+    /// file whose name cannot be decoded (or a `read_dir` entry error) must
+    /// ABORT the send, not be silently dropped from the set. At base,
+    /// `entry.ok()?` + `name.to_str()?` in a `filter_map` silently omitted
+    /// such a file, so the restoring node received an incomplete log with no
+    /// error.
+    ///
+    /// Witness: a `.ndb` file with a non-UTF-8 name. RED at base (silently
+    /// skipped: the enumeration succeeds and omits it). GREEN after the fix
+    /// (`list_ndb_files` returns `Err`).
+    #[cfg(unix)]
+    #[test]
+    fn send_errors_on_non_utf8_ndb_name_not_silently_dropped() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().expect("temp dir");
+        // A valid .ndb plus a .ndb whose name has an invalid UTF-8 byte.
+        std::fs::write(dir.path().join("00000000.ndb"), b"ok").unwrap();
+        let bad = std::ffi::OsStr::from_bytes(b"\xff\xfe.ndb");
+        std::fs::write(dir.path().join(bad), b"bad").unwrap();
+
+        let server = NetworkRestoreServer::new(dir.path());
+        let mut buf = std::io::Cursor::new(Vec::new());
+        let res = server.send_files_to(&mut buf);
+        assert!(
+            res.is_err(),
+            "a non-UTF-8 .ndb name must abort the send, not be silently \
+             dropped (FID-NR-9)"
+        );
+    }
 
     /// Create a temp env_home with some synthetic .ndb files.
     fn make_env_home(files: &[(&str, &[u8])]) -> TempDir {
