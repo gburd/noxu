@@ -3762,13 +3762,20 @@ impl EnvironmentImpl {
                     .to_string(),
             }
         })?;
-        let file_manager = self
-            .get_log_manager()
-            .map(|lm| Arc::clone(lm.file_manager()))
-            .ok_or_else(|| DbiError::EnvironmentFailure {
+        let log_manager = self.get_log_manager().ok_or_else(|| {
+            DbiError::EnvironmentFailure {
                 reason: "backup requires a log manager".to_string(),
-            })?;
-        crate::DbBackup::start_backup(file_protector, file_manager)
+            }
+        })?;
+        let file_manager = Arc::clone(log_manager.file_manager());
+        // FID-BACKUP-1: pass the log manager so start_backup can log the
+        // immutable-file marker and flip the log, sealing the last file in
+        // the backup set (JE DbBackup.startBackup, DbBackup.java:534).
+        crate::DbBackup::start_backup(
+            file_protector,
+            file_manager,
+            Some(log_manager),
+        )
     }
 
     /// Returns the checkpointer, if one was created.
