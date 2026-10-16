@@ -192,6 +192,24 @@ user-facing scope, symptoms, and preconditions.
   `Transaction::commit_with_durability` now returns this variant instead of
   `InsufficientReplicas`.
 
+### Replication (JE fidelity)
+
+- **Replica reads now take read locks and a replica refuses local user
+  writes** (`GAP-REPLAY-3`, `FID-REPLAY-1`): to match JE, where every replica
+  read goes through a `ReadonlyTxn` that acquires real read locks and screens
+  writes (`ReadonlyTxn.disallowReplicaWrite` -> `ReplicaWriteException`), a
+  node that is a **replica** now refuses local user writes with
+  `NoxuError::ReplicaWrite`, and the replica-replay path holds an **importunate
+  write lock** on each record it applies for the whole stream->commit window.
+  A replica read that overlaps an in-flight replayed transaction therefore
+  blocks briefly behind the replay (or, if it already held the record lock, is
+  preempted — `NoxuError::LockPreempted`), so it observes a replayed
+  transaction all-or-nothing instead of a torn, partially-applied state. This
+  is a behaviour change on the replica read/write path (previously replica
+  reads were lock-free and local replica writes were silently accepted); it
+  restores the JE isolation contract and is enabled by default. JE
+  `ReadonlyTxn.java:72-110`, `ReplayTxn.java:113`, `Replay.applyLN`.
+
 ### Fixed — during this release cycle (not present in v7.11.0)
 
 Defects that were introduced and fixed *within* the v7.11.1 development cycle;

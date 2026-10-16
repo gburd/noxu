@@ -3867,6 +3867,61 @@ mod tests {
         );
         env.close().unwrap();
     }
+
+    /// GAP-REPLAY-3 WITNESS: a user WRITE on a node that is a REPLICA is
+    /// refused with `NoxuError::ReplicaWrite` (JE
+    /// `ReadonlyTxn.disallowReplicaWrite` -> `ReplicaWriteException`); reads
+    /// still succeed.  The replica-write screen is the mechanism
+    /// `ReplicatedEnvironment::become_replica` flips on.
+    ///
+    /// RED at 81b2f048: there was no replica-write screen, so a local write on
+    /// a replica node was accepted (returned Ok), silently diverging the
+    /// replica from the master.
+    #[test]
+    fn gap_replay_3_replica_screens_user_writes() {
+        let (_tmp, config) = temp_env_config();
+        let env = Environment::open(config).unwrap();
+        let db_config = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
+        let db = env.open_database(None, "repdb", &db_config).unwrap();
+
+        // A write while the node is MASTER / standalone (screen off) succeeds.
+        db.put(b"k", b"v").unwrap();
+        assert_eq!(db.get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
+
+        // Flip the replica-write screen on, exactly as become_replica does on
+        // the shared EnvironmentImpl.
+        env.env_impl_arc_for_test()
+            .lock()
+            .set_replica_write_screen(true);
+
+        // Now a user write is refused with ReplicaWrite (committed-stream only
+        // mutates a replica).
+        let w = db.put(b"k2", b"v2");
+        assert!(
+            matches!(w, Err(NoxuError::ReplicaWrite)),
+            "a write on a replica must return ReplicaWrite, got {w:?}"
+        );
+        // A delete is screened too.
+        let d = db.delete(b"k");
+        assert!(
+            matches!(d, Err(NoxuError::ReplicaWrite)),
+            "a delete on a replica must return ReplicaWrite, got {d:?}"
+        );
+        // Reads still work (the committed value from before the demotion).
+        assert_eq!(db.get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
+
+        // Clearing the screen (become_master) re-enables writes.
+        env.env_impl_arc_for_test()
+            .lock()
+            .set_replica_write_screen(false);
+        db.put(b"k3", b"v3").unwrap();
+        assert_eq!(db.get(b"k3").unwrap().as_deref(), Some(&b"v3"[..]));
+
+        drop(db);
+        env.close().unwrap();
+    }
 }
 
 #[cfg(test)]

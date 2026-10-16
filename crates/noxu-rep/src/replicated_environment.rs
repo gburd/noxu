@@ -2784,6 +2784,13 @@ impl ReplicatedEnvironment {
             self.node_state.transition_via_unknown(NodeState::Master)?;
         self.master_tracker.set_master(self.config.node_name.as_str(), term);
 
+        // GAP-REPLAY-3: this node is now the MASTER — local user writes are
+        // allowed again (clear the replica-write screen).  JE: the master
+        // issues ordinary writable txns, not ReadonlyTxns.
+        if let Some(env) = self.env_impl.lock().unwrap().clone() {
+            env.set_replica_write_screen(false);
+        }
+
         // --- F9: spawn Feeder trackers for each known replica -------------
         //
         // Closes finding F9 of the 2026 review.
@@ -2958,6 +2965,14 @@ impl ReplicatedEnvironment {
         // the floor. Placed before any early return below so every demotion
         // path releases it.
         self.update_cleaner_replica_protection();
+
+        // GAP-REPLAY-3: this node is now a REPLICA — screen local user writes
+        // so they fail with ReplicaWriteException (JE: a replica hands out
+        // ReadonlyTxns via ReadonlyTxn.disallowReplicaWrite).  Only the
+        // replication replay stream mutates a replica's databases.
+        if let Some(env) = self.env_impl.lock().unwrap().clone() {
+            env.set_replica_write_screen(true);
+        }
 
         // --- G19: start replica receive loop --------------------------------
         //

@@ -263,6 +263,12 @@ pub struct CursorImpl {
     /// so `check_state()` can detect a failed environment without locking.
     /// `None` for cursors constructed outside a real environment (unit tests).
     env_invalid: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// GAP-REPLAY-3: cached replica-write screen flag.  When `Some(true)`,
+    /// this node is a REPLICA and a local user write must be refused with
+    /// `DbiError::ReplicaWrite` (JE `ReadonlyTxn.disallowReplicaWrite` ->
+    /// `ReplicaWriteException`).  `None` outside a real env (unit tests) /
+    /// `Some(false)` on a master or standalone env.
+    replica_write_screen: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Lock manager for per-record read/write locking.
     /// None for cursors created outside a real env (e.g., unit tests).
     ///
@@ -567,6 +573,7 @@ impl CursorImpl {
             current_bin_arc: None,
             log_manager: None,
             env_invalid: None,
+            replica_write_screen: None,
             lock_manager: None,
             txn_ref: None,
             txn_manager: None,
@@ -603,6 +610,7 @@ impl CursorImpl {
             current_bin_arc: None,
             log_manager: Some(log_manager),
             env_invalid: None,
+            replica_write_screen: None,
             lock_manager: None,
             txn_ref: None,
             txn_manager: None,
@@ -625,6 +633,17 @@ impl CursorImpl {
         flag: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         self.env_invalid = Some(flag);
+        self
+    }
+
+    /// GAP-REPLAY-3: wires the replica-write screen so a local user write on a
+    /// replica node is refused with `DbiError::ReplicaWrite`
+    /// (JE `ReadonlyTxn.disallowReplicaWrite`).
+    pub fn with_replica_write_screen(
+        mut self,
+        flag: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        self.replica_write_screen = Some(flag);
         self
     }
 
@@ -1494,6 +1513,17 @@ impl CursorImpl {
     /// which is never a mismatch, so the check never fires there.
     #[inline]
     fn check_local_write_allowed(&self) -> Result<(), DbiError> {
+        // GAP-REPLAY-3: a REPLICA refuses every local user write (JE
+        // ReadonlyTxn.disallowReplicaWrite -> ReplicaWriteException).  Checked
+        // first, before the replicated/local-write-mismatch rule below, so the
+        // replica screen takes precedence and reports the right error.
+        if self
+            .replica_write_screen
+            .as_ref()
+            .is_some_and(|f| f.load(Ordering::Relaxed))
+        {
+            return Err(DbiError::ReplicaWrite);
+        }
         let Some(txn) = self.txn_ref.as_ref() else {
             // No locker attached (should not happen for a live write
             // cursor); nothing to check against.

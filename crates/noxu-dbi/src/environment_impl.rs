@@ -241,6 +241,17 @@ pub struct EnvironmentImpl {
     /// can cache a cheap clone and check validity on every hot-path
     /// operation without acquiring `env_impl.lock()`.
     is_invalid: Arc<AtomicBool>,
+    /// GAP-REPLAY-3: whether local user WRITES must be refused because this
+    /// node is currently a REPLICA.
+    ///
+    /// Stored as `Arc<AtomicBool>` so `Database`/`CursorImpl` share the live
+    /// value (mirrors `is_invalid`): `noxu-rep`'s
+    /// `ReplicatedEnvironment::become_replica` sets it `true` and
+    /// `become_master` sets it `false`.  A plain (non-`noxu-rep`)
+    /// `EnvironmentImpl` leaves it `false`, so standalone writes are never
+    /// screened.  Port of JE: a replica hands out `ReadonlyTxn`s whose
+    /// `disallowReplicaWrite` throws `ReplicaWriteException`.
+    replica_write_screen: Arc<AtomicBool>,
     /// If invalidated, the reason.
     invalid_reason: RwLock<Option<EnvironmentFailureReason>>,
 
@@ -1881,6 +1892,7 @@ impl EnvironmentImpl {
             pending_names: RwLock::new(hashbrown::HashMap::new()),
             open_reconstruct_lock: Mutex::new(()),
             is_invalid,
+            replica_write_screen: Arc::new(AtomicBool::new(false)),
             invalid_reason: RwLock::new(None),
             creation_time_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2012,6 +2024,27 @@ impl EnvironmentImpl {
     pub fn set_replicated(&self, replicated: bool) {
         self.is_replicated
             .store(replicated, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// GAP-REPLAY-3: shared handle to the replica-write screen flag, so a
+    /// `Database`/`CursorImpl` can read the live value without locking.
+    pub fn replica_write_screen_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.replica_write_screen)
+    }
+
+    /// GAP-REPLAY-3: whether local user writes are currently screened (this
+    /// node is a replica).
+    pub fn is_replica_write_screened(&self) -> bool {
+        self.replica_write_screen.load(Ordering::Relaxed)
+    }
+
+    /// GAP-REPLAY-3: set the replica-write screen.  Called by
+    /// `noxu-rep`'s `ReplicatedEnvironment::become_replica` (true) and
+    /// `become_master` (false).  JE: a replica issues `ReadonlyTxn`s that
+    /// refuse writes with `ReplicaWriteException`; the master issues ordinary
+    /// writable txns.
+    pub fn set_replica_write_screen(&self, screened: bool) {
+        self.replica_write_screen.store(screened, Ordering::Relaxed);
     }
     pub fn get_creation_time(&self) -> u64 {
         self.creation_time_ms

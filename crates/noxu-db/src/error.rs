@@ -818,6 +818,9 @@ impl From<noxu_dbi::DbiError> for NoxuError {
         use noxu_dbi::DbiError;
         match e {
             DbiError::DatabaseNotFound(s) => NoxuError::DatabaseNotFound(s),
+            // GAP-REPLAY-3: a replica write screen (ReadonlyTxn.
+            // disallowReplicaWrite -> ReplicaWriteException).
+            DbiError::ReplicaWrite => NoxuError::ReplicaWrite,
             DbiError::DatabaseAlreadyExists(s)
             | DbiError::DatabaseExists(s) => {
                 NoxuError::DatabaseAlreadyExists(s)
