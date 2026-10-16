@@ -682,12 +682,38 @@ impl Checkpointer {
         if self.needs_checkpoint_for_cleaned_files() {
             return true;
         }
-        let bytes_since = self.bytes_since_checkpoint.load(Ordering::Relaxed);
         if self.checkpoint_bytes_interval != 0 {
-            // Bytes interval takes precedence (JE getWakeupPeriod): when it is
-            // non-zero the time branch is never consulted.
+            // FID-REC-1 (JE Checkpointer.isRunnable, Checkpointer.java:639-646):
+            // the byte interval takes precedence (JE getWakeupPeriod), and JE
+            // measures growth from the LIVE next-LSN --
+            //   getNoCleaningDistance(getFileManager().getNextLsn(),
+            //                         lastCheckpointStart, logFileMax)
+            //       >= logSizeBytesInterval
+            // -- NOT from a separately-maintained accumulator.  The Noxu
+            // `bytes_since_checkpoint` accumulator was never fed by the
+            // production write path (its only writer, `wakeup_after_write`,
+            // is called from tests only), so on a write-heavy, no-cleaning
+            // workload `is_runnable` returned `0 >= interval` = false on
+            // every daemon wake and the recovery log was never truncated on
+            // write volume.  Compute the distance from the live next-LSN,
+            // exactly as JE does, when a log manager is wired.
+            if let Some(lm) = &self.log_manager {
+                let fm = lm.file_manager();
+                let next_lsn = fm.get_next_available_lsn();
+                let log_file_max = fm.max_file_size();
+                let last_ckpt_start = *self.last_checkpoint_start.lock();
+                let distance = next_lsn
+                    .no_cleaning_distance(last_ckpt_start, log_file_max);
+                return distance >= self.checkpoint_bytes_interval;
+            }
+            // No log manager (unit tests without a full environment): fall
+            // back to the test-fed accumulator so the existing
+            // `wakeup_after_write` unit tests still exercise the interval.
+            let bytes_since =
+                self.bytes_since_checkpoint.load(Ordering::Relaxed);
             return bytes_since >= self.checkpoint_bytes_interval;
         }
+        let bytes_since = self.bytes_since_checkpoint.load(Ordering::Relaxed);
         // Time-cadence branch (only reached when the byte interval is 0): the
         // caller (the daemon) only invokes this once per wakeup interval, so
         // reaching here means the time interval has elapsed. JE's idle-guard
