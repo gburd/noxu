@@ -47,7 +47,9 @@ fn env_db(name: &str) -> (TempDir, Arc<Environment>, Arc<noxu_db::Database>) {
 /// -- a TOCTOU violation.
 ///
 /// RED on 81b2f048 (get-old in one auto-txn, then a SEPARATE write auto-txn):
-/// reliably >1000 duplicate old-values over 2x2000 overwrites.
+/// reliably tens-to-hundreds of duplicate old-values over 2x800 overwrites
+/// (R-FID28SLOW measurement: RED 10/10 on both x86_64 and aarch64 at n=200,
+/// the min reliably-RED count on the harder arch; n=800 is 4x that margin).
 /// GREEN after FID-DPL-28: exactly 0.
 #[test]
 fn fid_dpl_28_put_rmw_is_atomic_no_lost_update() {
@@ -58,7 +60,14 @@ fn fid_dpl_28_put_rmw_is_atomic_no_lost_update() {
         map.put(None, &0, &-1).unwrap();
     }
 
-    let n = 2000usize;
+    // R-FID28SLOW: 2 threads x 2 x n RMW ops under CommitSync (1 fdatasync per
+    // auto-commit op). n=800 = 4x the minimum op count that is RED in 10/10
+    // runs on BOTH arches on the pre-fix code (measured min = 200, the harder
+    // arch being aarch64's remove witness); it keeps a wide RED margin while
+    // cutting the per-run fsync volume ~2.5x (was n=2000 ~= 8000 fdatasyncs /
+    // ~90s/test; now ~3200 / ~37s on x86, ~9-54s on arm). CommitSync and the
+    // dups==0 assertion are UNCHANGED — only the op count is reduced.
+    let n = 800usize;
     let barrier = Arc::new(std::sync::Barrier::new(2));
     let mut handles = vec![];
     for t in 0i32..2 {
@@ -125,7 +134,14 @@ fn fid_dpl_28_put_rmw_is_atomic_no_lost_update() {
 #[test]
 fn fid_dpl_28_remove_rmw_is_atomic_no_lost_update() {
     let (_td, _env, db) = env_db("dpl28_remove");
-    let n = 2000usize;
+    // R-FID28SLOW: 2 threads x 2 x n RMW ops under CommitSync (1 fdatasync per
+    // auto-commit op). n=800 = 4x the minimum op count that is RED in 10/10
+    // runs on BOTH arches on the pre-fix code (measured min = 200, the harder
+    // arch being aarch64's remove witness); it keeps a wide RED margin while
+    // cutting the per-run fsync volume ~2.5x (was n=2000 ~= 8000 fdatasyncs /
+    // ~90s/test; now ~3200 / ~37s on x86, ~9-54s on arm). CommitSync and the
+    // dups==0 assertion are UNCHANGED — only the op count is reduced.
+    let n = 800usize;
     let barrier = Arc::new(std::sync::Barrier::new(2));
     let mut handles = vec![];
     for t in 0i32..2 {
