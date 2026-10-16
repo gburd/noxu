@@ -353,6 +353,12 @@ impl Database {
             // are unique across restarts, and share the one id space with
             // explicit transactions (see `Environment::begin_transaction`).
             let txn_id = inner.id_as_locker() as u64;
+            // Re-label the diagnostic locker id as an auto-commit txn.
+            // `begin_txn` registered it as `"txn:<id>"`; this IS an
+            // auto-commit op (JE `Txn.createAutoTxn`), so render deadlock /
+            // lock-timeout messages as `"auto-txn:<id>"` to distinguish it
+            // from a user's explicit transaction.
+            self.lock_manager.register_locker_label(txn_id as i64, "auto-txn");
             let durability = if self.no_sync {
                 crate::durability::Durability::COMMIT_NO_SYNC
             } else if self.write_no_sync {
