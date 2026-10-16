@@ -314,6 +314,17 @@ pub struct Evictor {
     ///
     /// JE ref: `Checkpointer.coordinateEvictionWithCheckpoint` (CC-4 fix).
     checkpointer: RwLock<Option<std::sync::Weak<Checkpointer>>>,
+
+    /// BUG-EVICT-UIN-WITH-CHILDREN: test-only hook fired in the detach
+    /// callback (`node_size_fn`) with the candidate `node_id` IMMEDIATELY
+    /// BEFORE `Tree::detach_node_by_id`.  It lets a witness reproduce the
+    /// evictor's selection->detach TOCTOU deterministically: the hook
+    /// faults a child in under the just-selected (childless) UIN, exactly
+    /// the race JE closes with the `hasCachedChildren` re-check in
+    /// `Evictor.processTarget`.  Empty in production; gated so it emits no
+    /// symbols in a default release build.
+    #[cfg(any(test, feature = "testing"))]
+    pre_detach_hook: RwLock<Option<Box<dyn Fn(u64) + Send + Sync>>>,
 }
 
 impl Evictor {
@@ -364,7 +375,19 @@ impl Evictor {
             deferred_write_dbs: RwLock::new(None),
             off_heap: None,
             checkpointer: RwLock::new(None),
+            #[cfg(any(test, feature = "testing"))]
+            pre_detach_hook: RwLock::new(None),
         }
+    }
+
+    /// Install the test-only pre-detach hook (see `pre_detach_hook`).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn set_pre_detach_hook_for_test(
+        &self,
+        hook: Box<dyn Fn(u64) + Send + Sync>,
+    ) {
+        *self.pre_detach_hook.write().expect("pre_detach_hook lock") =
+            Some(hook);
     }
 
     // -----------------------------------------------------------------------
@@ -1249,6 +1272,16 @@ impl Evictor {
                 // Drain the cached size first so the RefCell never leaks the
                 // entry even when detach short-circuits.
                 sc.borrow_mut().remove(&node_id);
+                // BUG-EVICT-UIN-WITH-CHILDREN: fire the test-only
+                // pre-detach hook (empty in production) so a witness can
+                // race a child in under the selected UIN between the
+                // pre-latch residency snapshot and this detach.
+                #[cfg(any(test, feature = "testing"))]
+                if let Ok(h) = self.pre_detach_hook.read()
+                    && let Some(hook) = h.as_ref()
+                {
+                    hook(node_id);
+                }
                 let mut freed = 0u64;
                 for tree_arc in &trees_detach {
                     if let Ok(t) = tree_arc.read() {

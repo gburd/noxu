@@ -13,7 +13,10 @@ description = "Checkpoint-based crash recovery for Noxu DB"
 [features]
 # rv-recon: expose the checkpointer per-BIN flush loop to integration-test
 # witnesses (zombie-parent). Off by default; internal-tier crate, no semver impact.
-testing = []
+# BUG-EVICT-UIN-WITH-CHILDREN: forward to noxu-tree/testing so the defense
+# witness can reach the forcing seam that manufactures a zombie parent
+# (the production detach path now refuses it).
+testing = ["noxu-tree/testing"]
 
 [dependencies]
 hashbrown = { workspace = true }

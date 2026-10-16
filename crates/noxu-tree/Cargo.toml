@@ -22,6 +22,14 @@ thiserror = { workspace = true }
 byteorder = { workspace = true }
 bytes = { workspace = true }
 
+[features]
+# BUG-EVICT-UIN-WITH-CHILDREN: expose the test-only
+# `detach_node_by_id_bypassing_uin_guard_for_test` seam to cross-crate
+# integration witnesses (noxu-recovery's zombie-parent defense witness).
+# Off by default; internal-tier crate, no semver impact; emits ZERO extra
+# symbols in a default release build.
+testing = []
+
 [dev-dependencies]
 hegeltest = { workspace = true }
 tempfile = "3"
