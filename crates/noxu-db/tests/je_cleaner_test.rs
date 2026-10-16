@@ -774,15 +774,39 @@ fn file_selection_reclaims_low_utilization_files() {
 #[test]
 fn file_selection_truncate_database_obsoletes_entries() {
     let dir = TempDir::new().unwrap();
-    let env = open_cleaner_env(dir.path(), 8192);
+    let file_size = 8192u64;
+    let env = open_cleaner_env(dir.path(), file_size);
     let db = open_db(&env, false);
 
+    // Count log files (`*.ndb`) at a given moment — how we derive the real
+    // number of files the database's LNs occupy, rather than a hand-tuned
+    // constant.
+    let count_log_files = || -> u64 {
+        std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path().extension().and_then(|x| x.to_str()) == Some("ndb")
+            })
+            .count() as u64
+    };
+
+    let files_before_writes = count_log_files();
     const N: u32 = 200;
     let value = vec![0x44u8; 120];
     for i in 0..N {
         db.put(ikey(i), &value).unwrap();
     }
     env.checkpoint(Some(&force())).unwrap();
+    // The log files the database's N LNs added (the forced pass should
+    // reclaim all but at most one of these — JE
+    // FileSelectionTest.testTruncateDatabase asserts
+    // `nCleaned >= INITIAL_FILES - 1`, tolerating exactly one straggler).
+    let db_log_files = count_log_files().saturating_sub(files_before_writes);
+    // On-disk LN size (lower bound) = the value we stored; an 8 KiB file
+    // therefore holds at most `file_size / value_len` LNs, so tolerating one
+    // straggler file means tolerating at most that many un-reclaimed LNs.
+    let one_file_lns = file_size / value.len() as u64;
 
     db.close().unwrap();
     let count = env.truncate_database(None, "foo").unwrap();
@@ -790,30 +814,38 @@ fn file_selection_truncate_database_obsoletes_entries() {
 
     env.checkpoint(Some(&force())).unwrap();
     let cleaned_before = env.stats().unwrap().cleaner.lns_cleaned;
-    let cleaned = env.clean_log_forced().unwrap();
-    assert!(cleaned > 0, "truncated-away files must be cleanable");
+    let cleaned_files = env.clean_log_forced().unwrap() as u64;
+    assert!(cleaned_files > 0, "truncated-away files must be cleanable");
     let cleaned_after = env.stats().unwrap().cleaner.lns_cleaned;
     // Truncate obsoletes every one of the database's LNs, so the files that
     // hold ONLY those LNs drop below `min_utilization` (80) and the forced
-    // pass reclaims the bulk of them.  A small tail of the dead LNs can share
-    // a log file with LIVE metadata (the post-truncate NameLN, the new empty
-    // database's NameLN and the checkpoint records); that file stays ABOVE
-    // 80% live and is correctly NOT selected — cleaning a 95%-live file to
-    // recover a dozen dead LNs is exactly what `min_utilization` exists to
-    // avoid, and JE's FileSelectionTest likewise only asserts that files
-    // become cleanable, never an exact per-LN count.  (v7.11.1 single-locker:
-    // each auto-commit put now also logs a TxnCommit frame — JE's
-    // one-commit-record-per-auto-txn — so the 200 LNs pack one file denser
-    // than the pre-fix auto-form log and a ~1-file tail co-locates with the
-    // live metadata; pre-fix the LNs happened to pack so the forced pass took
-    // all 200.)  Assert the forced pass reclaims all but at most one log
-    // file's worth of LNs (an 8 KiB file holds ~60 of the 120-byte LNs).
-    let one_file_lns = 8192u64 / 120; // generous upper bound on a file's LNs
+    // pass reclaims them.  A small tail of the dead LNs can share a log file
+    // with LIVE metadata (the post-truncate NameLN, the new empty database's
+    // NameLN and the checkpoint records); that file stays ABOVE 80% live and
+    // is correctly NOT selected — cleaning a 95%-live file to recover a
+    // dozen dead LNs is exactly what `min_utilization` exists to avoid.
+    // (v7.11.1 single-locker: each auto-commit put now also logs a TxnCommit
+    // frame — JE's one-commit-record-per-auto-txn — so the 200 LNs pack one
+    // file denser than the pre-fix auto-form log and a ~1-file tail co-locates
+    // with the live metadata; pre-fix the LNs happened to pack so the forced
+    // pass took all 200.)
+    //
+    // JE FileSelectionTest.testTruncateDatabase asserts
+    // `nCleaned >= INITIAL_FILES - 1` (file count, exactly one straggler file
+    // tolerated).  Assert the same here on files, AND keep the per-LN teeth:
+    // all but at most one file's worth of LNs reclaimed.
+    assert!(
+        cleaned_files >= db_log_files.saturating_sub(1),
+        "truncate must make all but at most one of the database's {db_log_files} \
+         log files cleanable (JE nCleaned >= INITIAL_FILES - 1); \
+         cleaned_files={cleaned_files}"
+    );
     assert!(
         cleaned_after >= cleaned_before + N as u64 - one_file_lns,
         "truncate must make (nearly) all {N} of the database's LNs reclaimable \
          by the cleaner; at most one straggler file co-located with live \
-         metadata may remain: lns_cleaned {cleaned_before} -> {cleaned_after}"
+         metadata ({one_file_lns} LNs) may remain: \
+         lns_cleaned {cleaned_before} -> {cleaned_after}"
     );
 
     env.close().unwrap();
