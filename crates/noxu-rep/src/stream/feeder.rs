@@ -150,9 +150,27 @@ impl EnvironmentLogScanner {
         // The master feeder reads the log files
         // directly, starting at the replica's current VLSN position.
         let env_home = env.get_env_home().to_path_buf();
-        let fm = Arc::new(
-            FileManager::new(&env_home, true, 256 * 1024 * 1024, 32).ok()?,
-        );
+        // FID-FEEDSRC-2: do NOT silently swallow a FileManager open error into
+        // `None` (which the caller cannot distinguish from "no WAL source" and
+        // wrongly falls back to the in-memory queue).  JE surfaces a
+        // FileManager/FileReader open failure as LOG_FILE_NOT_FOUND/IOException
+        // (fatal, FileReader.java:243).  We cannot change this constructor's
+        // `Option` return without a signature ripple, so at minimum log the
+        // real error loudly before returning `None` so an operator sees the
+        // open failure rather than a silent, permanently-empty feeder source.
+        let fm = match FileManager::new(&env_home, true, 256 * 1024 * 1024, 32)
+        {
+            Ok(fm) => Arc::new(fm),
+            Err(e) => {
+                log::error!(
+                    "EnvironmentLogScanner: FileManager open FAILED at {} \
+                     ({e}); this feeder source cannot read the WAL and will \
+                     not produce entries (FID-FEEDSRC-2; JE LOG_FILE_NOT_FOUND)",
+                    env_home.display(),
+                );
+                return None;
+            }
+        };
 
         let (cursor_file, cursor_offset) = match start_lsn {
             Some(lsn) if lsn != NULL_LSN => {
@@ -375,7 +393,24 @@ impl LogScanner for EnvironmentLogScanner {
     fn next_entry(&mut self, from_vlsn: u64) -> Option<(u64, u8, Vec<u8>)> {
         self.scan_error = None;
         // Collect file numbers once per call; cheap (directory listing).
-        let file_nums = self.file_manager.list_file_numbers().ok()?;
+        // FID-FEEDSRC-2: a directory-listing IO error is NOT end-of-log -- JE
+        // FileReader.readNextEntry surfaces an IOException (fatal), it does not
+        // treat it as EOF.  Record it as a surfaced scan error so
+        // `FeederRunner::run` returns it (and the feeder stops / the replica
+        // network-restores) rather than swallowing it to `None`, which looks
+        // like a transient tail wait and makes the feeder sleep/retry forever.
+        let file_nums = match self.file_manager.list_file_numbers() {
+            Ok(v) => v,
+            Err(e) => {
+                self.scan_error = Some(
+                    crate::error::RepError::NetworkRestoreError(format!(
+                        "feeder source: listing log files failed ({e}); \
+                         cannot scan the WAL (FID-FEEDSRC-2)"
+                    )),
+                );
+                return None;
+            }
+        };
         if file_nums.is_empty() {
             return None;
         }
@@ -2119,5 +2154,76 @@ mod tests {
             Some((2, b"e2".to_vec())),
             "the reader must pick up the entry that appeared after the wait"
         );
+    }
+
+    /// FID-FEEDSRC-2 WITNESS: a directory-listing IO error mid-scan is a
+    /// surfaced error, NOT end-of-log.  JE FileReader.readNextEntry raises an
+    /// IOException (fatal), it never treats a listing failure as EOF.  Before
+    /// the fix `list_file_numbers().ok()?` swallowed the error into `None`, so
+    /// the feeder saw a (false) tail wait and slept/retried forever instead of
+    /// surfacing the fault.
+    ///
+    /// We force the listing error by making the env directory unreadable mid
+    /// scan (chmod 000), then assert `next_entry` returns `None` AND
+    /// `take_scan_error` yields the surfaced error.
+    #[cfg(unix)]
+    #[test]
+    fn test_feeder_scan_listing_io_error_is_surfaced_not_eol() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        {
+            let fm = FileManager::new(dir.path(), false, 64 * 1024 * 1024, 8)
+                .expect("fm");
+            let hdr = fm.file_header_size_for(0).unwrap_or_else(|_| {
+                file_header_on_disk_size(LOG_FILE_VERSION)
+            }) as u64;
+            feeder_append_entry_to_file(
+                &fm,
+                0,
+                hdr,
+                LogEntryType::Trace,
+                Some(noxu_util::Vlsn::new(1)),
+                b"e1",
+            );
+        }
+
+        let env = EnvironmentImpl::new(dir.path(), false, true)
+            .expect("EnvironmentImpl::new");
+        let mut scanner =
+            EnvironmentLogScanner::new(&env, None).expect("scanner");
+
+        // First read works.
+        assert_eq!(scanner.next_entry(1).map(|(v, _, _)| v), Some(1));
+
+        // Make the env directory unlistable, forcing read_dir to error.
+        let orig = std::fs::metadata(dir.path()).unwrap().permissions();
+        std::fs::set_permissions(
+            dir.path(),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .expect("chmod 000");
+
+        let next = scanner.next_entry(2);
+        // Restore permissions before any assertion can early-return (so the
+        // TempDir drop can clean up).
+        std::fs::set_permissions(dir.path(), orig).expect("restore perms");
+
+        assert_eq!(
+            next, None,
+            "a listing IO error must not yield a (fake) entry"
+        );
+        match scanner.take_scan_error() {
+            Some(crate::error::RepError::NetworkRestoreError(msg)) => {
+                assert!(
+                    msg.contains("listing log files failed"),
+                    "the surfaced error must name the listing failure; msg={msg}"
+                );
+            }
+            other => panic!(
+                "a listing IO error must surface a scan error (FID-FEEDSRC-2), \
+                 got {other:?}"
+            ),
+        }
     }
 }
