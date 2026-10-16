@@ -321,18 +321,33 @@ impl SecondaryHookState {
         // index entry so the secondary slot expires together with the primary
         // (JE: the primary ExpirationInfo flows into the secondary LN).
         //
-        // v7.11.1 tag-native merge note: this replaces the stack-v1
-        // `cursor.put(..).map_err(|e| OperationNotAllowed(e.to_string()))`
-        // with `put_with_expiration(..)?`, whose internal `map_cursor_err`
-        // PRESERVES typed lock errors (NoxuError::LockNotAvailable) instead of
-        // flattening them to a stringy OperationNotAllowed - consistent with
-        // the A15 phantom typed-error direction already on stack-v1.
-        let status = cursor.put_with_expiration(
-            sec_key,
-            pri_key,
-            crate::put::Put::NoDupData,
-            expiration,
-        )?;
+        // v7.11.1 tag-native merge note: both branches go through
+        // `map_cursor_err`, which PRESERVES typed lock errors
+        // (NoxuError::LockNotAvailable) instead of flattening them to a
+        // stringy OperationNotAllowed - consistent with the A15 phantom
+        // typed-error direction already on stack-v1.
+        //
+        // BUG-SEC-TXN-DELETE-CRASH-LOSS: only thread an explicit expiration
+        // through when there IS one; a 0 (no-TTL) secondary insert MUST take
+        // the plain `cursor.put` path, because `put` honours the auto-commit
+        // durability of this inner (auto-commit, txn=None) cursor and flushes
+        // the secondary LN before returning (fe94c7a50d), whereas
+        // `put_with_expiration` does not sync -- so under auto-commit the
+        // committed secondary insert would be left only in the unflushed log
+        // buffer and lost on a crash, while its primary record (synced by
+        // `Database::put`'s auto-txn) survived.  `put_with_expiration(.., 0)`
+        // is NOT identical to `put()` in the secondary redo path -- it
+        // perturbs crash recovery of the index (integrate parity).
+        let status = if expiration != 0 {
+            cursor.put_with_expiration(
+                sec_key,
+                pri_key,
+                crate::put::Put::NoDupData,
+                expiration,
+            )?
+        } else {
+            cursor.put(sec_key, pri_key, crate::put::Put::NoDupData)?
+        };
         match status {
             OperationStatus::Success => Ok(()),
             OperationStatus::KeyExists => {

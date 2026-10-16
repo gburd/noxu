@@ -256,6 +256,12 @@ pub struct Cursor<'txn> {
     /// `Environment::close` requires every database closed first, whose
     /// environment) was closed must fail (RO env-lock R1).
     db_open: Option<Arc<AtomicBool>>,
+    /// Auto-commit durability for a writable `open_cursor(None)` cursor: the
+    /// log and the database's auto-commit durability.  Each successful
+    /// put/delete flushes per this policy before returning, exactly as
+    /// `Database::put`'s auto-txn commit does.  `None` for txn-bound,
+    /// read-only, and unlogged cursors (an explicit txn syncs at commit).
+    auto_sync: Option<(Arc<LogManager>, noxu_txn::Durability)>,
 }
 
 impl<'txn> Cursor<'txn> {
@@ -274,6 +280,7 @@ impl<'txn> Cursor<'txn> {
             txn: None,
             sec_maint: None,
             db_open: None,
+            auto_sync: None,
         }
     }
 
@@ -288,6 +295,7 @@ impl<'txn> Cursor<'txn> {
         txn: Option<&'txn Transaction>,
         sec_maint: Option<CursorSecMaint>,
         db_open: Arc<AtomicBool>,
+        auto_sync: Option<(Arc<LogManager>, noxu_txn::Durability)>,
     ) -> Self {
         Self {
             inner,
@@ -296,7 +304,34 @@ impl<'txn> Cursor<'txn> {
             txn,
             sec_maint,
             db_open: Some(db_open),
+            auto_sync,
         }
+    }
+
+    /// Makes an auto-commit write durable per the database's auto-commit
+    /// policy before the write returns (the `open_cursor` contract).
+    /// `lsn` is the write's LSN; `NULL_LSN` (a delete) always flushes.
+    /// `flush_sync_if_needed` keeps many:1 fsync coalescing.  No-op for a
+    /// txn-bound cursor or a deferred-write database (nothing logged).
+    fn auto_commit_sync(&self, lsn: u64) -> Result<()> {
+        let Some((lm, durability)) = &self.auto_sync else {
+            return Ok(());
+        };
+        if self.inner.get_database().read().is_deferred_write() {
+            return Ok(());
+        }
+        let flushed = match durability {
+            noxu_txn::Durability::CommitSync => {
+                lm.flush_sync_if_needed(noxu_util::Lsn::from_u64(lsn))
+            }
+            noxu_txn::Durability::CommitWriteNoSync => lm.flush_no_sync(),
+            noxu_txn::Durability::CommitNoSync => return Ok(()),
+        };
+        flushed.map(drop).map_err(|e| {
+            NoxuError::OperationNotAllowed(format!(
+                "auto-commit fsync failed: {e}"
+            ))
+        })
     }
 
     /// Advances the cursor to the next record and returns it, or `None`
@@ -707,6 +742,7 @@ impl<'txn> Cursor<'txn> {
                 OperationStatus::Success
             }
         };
+        self.auto_commit_sync(self.inner.get_current_lsn())?;
 
         // Fan out the applied write to every registered secondary under the
         // cursor's own txn (NEW-CURSOR-SEC-MAINT).  new_data is the bytes
@@ -810,6 +846,7 @@ impl<'txn> Cursor<'txn> {
             // Stay in current state (still positioned on defunct slot).
             return Ok(OperationStatus::KeyEmpty);
         }
+        self.auto_commit_sync(noxu_util::NULL_LSN.as_u64())?;
 
         // The primary delete applied: fan out to every secondary
         // (old = the deleted record's data, new = None) under the cursor's

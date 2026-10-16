@@ -33,7 +33,6 @@ use noxu_sync::Mutex;
 // `noxu_sync::RwLock` (transparent re-export), so production is byte-identical.
 use noxu_txn::{Durability, LockManager, TxnManager, UndoRecord};
 use noxu_util::dst_sync_pl::RwLock;
-use noxu_util::lsn::Lsn;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -350,13 +349,7 @@ impl Database {
 
         match result {
             Ok(value) => {
-                let durability = if self.no_sync {
-                    Durability::CommitNoSync
-                } else if self.write_no_sync {
-                    Durability::CommitWriteNoSync
-                } else {
-                    Durability::CommitSync
-                };
+                let durability = self.auto_commit_durability();
                 if let Err(e) = auto_txn.commit_with_durability(durability) {
                     // Commit failed (e.g. log fsync error).  Undo the
                     // in-memory tree write so we are not left in an
@@ -427,40 +420,18 @@ impl Database {
         }
     }
 
-    /// Auto-commit flush: when `txn` is `None` (auto-commit mode), flush and
-    /// fsync the log before returning to the caller.
-    ///
-    /// `write_lsn` is the LSN assigned to the write operation just performed.
-    /// Port of`LogManager.flushTo(lsn)`: if a concurrent committer already
-    /// flushed past `write_lsn`, the fdatasync is skipped entirely, giving
-    /// natural many:1 fsync coalescing under concurrent write load with no
-    /// explicit group-commit configuration required.
-    #[allow(dead_code)] // unwired helper kept for the documented coalescing path
-    fn auto_commit_sync(
-        &self,
-        txn: Option<&Transaction>,
-        write_lsn: Lsn,
-    ) -> Result<()> {
-        if txn.is_some() {
-            return Ok(()); // explicit txn handles its own commit/fsync
-        }
+    /// Durability of an auto-commit write (`txn = None`), from the
+    /// database's `no_sync` / `write_no_sync` config.  Shared by
+    /// [`Self::with_auto_txn`] and auto-commit cursors so `db.put` and
+    /// `cursor.put` honour the same policy.
+    fn auto_commit_durability(&self) -> Durability {
         if self.no_sync {
-            return Ok(()); // : TXN_NO_SYNC — skip log flush entirely
+            Durability::CommitNoSync
+        } else if self.write_no_sync {
+            Durability::CommitWriteNoSync
+        } else {
+            Durability::CommitSync
         }
-        if let Some(lm) = &self.log_manager {
-            if self.write_no_sync {
-                // : TXN_WRITE_NO_SYNC — flush to OS buffer, no fdatasync
-                lm.flush_no_sync().map_err(|e| {
-                    NoxuError::OperationNotAllowed(e.to_string())
-                })?;
-            } else {
-                // : flushTo(lsn) — skip if already covered by another flush.
-                lm.flush_sync_if_needed(write_lsn).map_err(|e| {
-                    NoxuError::OperationNotAllowed(e.to_string())
-                })?;
-            }
-        }
-        Ok(())
     }
 
     /// Creates a new database handle.
@@ -1500,12 +1471,21 @@ impl Database {
             ))
         };
 
+        // An auto-commit cursor write must be durable before it returns,
+        // like `Database::put` (with_auto_txn's commit_with_durability).
+        let auto_sync = match (&self.log_manager, txn, read_only) {
+            (Some(lm), None, false) => {
+                Some((Arc::clone(lm), self.auto_commit_durability()))
+            }
+            _ => None,
+        };
         Ok(Cursor::from_impl_with_maint(
             cursor_impl,
             read_only,
             txn,
             sec_maint,
             Arc::clone(&self.open),
+            auto_sync,
         ))
     }
 
