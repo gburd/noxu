@@ -1165,6 +1165,11 @@ impl EnvironmentImpl {
             None => Arc::new(AtomicI64::new(0)),
         };
 
+        // FID-TREE-1 / D1 / F-3: the env invalidation flag, created early so
+        // it can be wired into every tree (so an undecidable IN/BIN fetch
+        // failure fails the environment closed, JE LOG_FILE_NOT_FOUND) as well
+        // as shared with the cleaner below.
+        let is_invalid = Arc::new(AtomicBool::new(false));
         let mut primary_tree_inner = noxu_tree::Tree::new(1, 256);
         primary_tree_inner.set_memory_counter(Arc::clone(&cache_usage));
         // EV-14: wire the log manager so an evicted root IN can be re-fetched
@@ -1172,6 +1177,10 @@ impl EnvironmentImpl {
         if let Some(ref lm) = log_manager {
             primary_tree_inner.set_log_manager(Arc::clone(lm));
         }
+        // FID-TREE-1: wire the env-invalid flag so an undecidable interior
+        // IN/BIN fetch failure fails the environment closed instead of
+        // reporting a committed key as absent.
+        primary_tree_inner.set_env_invalid_flag(Arc::clone(&is_invalid));
         let primary_tree: Arc<std::sync::RwLock<noxu_tree::Tree>> =
             Arc::new(std::sync::RwLock::new(primary_tree_inner));
 
@@ -1350,7 +1359,7 @@ impl EnvironmentImpl {
         // Cleaner initialization.
         // constructor (called after RecoveryManager.recover()).
         // D1 / F-3: the env invalidation flag is shared with the cleaner.
-        let is_invalid = Arc::new(AtomicBool::new(false));
+        // (Created earlier for FID-TREE-1 tree wiring; reused here.)
         let cleaner = log_manager.as_ref().map(|lm| {
             let fm = Arc::clone(lm.file_manager());
             // Pass the environment's shared LockManager so that cleaner-held
@@ -2331,6 +2340,8 @@ impl EnvironmentImpl {
                     && let Ok(mut tree) = tree_arc.write()
                 {
                     tree.set_log_manager(Arc::clone(lm));
+                    // FID-TREE-1: wire the env-invalid flag on a rewired tree.
+                    tree.set_env_invalid_flag(self.is_invalid_flag());
                     tree.set_root_lsn(evicted.root_lsn);
                 }
                 db_impl.set_entry_count(evicted.entry_count);
@@ -2389,6 +2400,8 @@ impl EnvironmentImpl {
                 // be re-fetched from its persisted LSN on next access.
                 if let Some(ref lm) = self.log_manager {
                     tree_guard.set_log_manager(Arc::clone(lm));
+                    // FID-TREE-1: wire the env-invalid flag (fail-closed fetch).
+                    tree_guard.set_env_invalid_flag(self.is_invalid_flag());
                 }
             }
             // SHARED_CACHE: a shared evictor's primary slot must NOT be

@@ -328,6 +328,18 @@ pub struct Tree {
     /// is never made non-resident in that configuration.
     pub log_manager: Option<Arc<noxu_log::LogManager>>,
 
+    /// FID-TREE-1: the environment's "is-invalid" flag (a clone of
+    /// `EnvironmentImpl::is_invalid_flag()`), set when an UNDECIDABLE interior
+    /// IN/BIN fetch fails — a non-NULL slot LSN whose log image cannot be read
+    /// or parsed.  JE `IN.fetchTarget` / `fetchIN` throw
+    /// `EnvironmentFailureException(LOG_FILE_NOT_FOUND)` here, which
+    /// invalidates the environment (fail-closed), rather than treating the
+    /// child as absent and reporting a committed key as not-found.  Setting
+    /// this flag makes EVERY descent path (read, write/insert, scan, delete)
+    /// fail closed: a later operation observes the invalid env instead of a
+    /// silently-wrong result.  `None` in unit tests with no environment.
+    pub env_invalid: Option<Arc<std::sync::atomic::AtomicBool>>,
+
     /// Capacity hint for the recovery redo path.
     ///
     /// When non-zero, the first BIN created by `redo_insert` (the first-key
@@ -3377,6 +3389,7 @@ impl Tree {
             in_list_listener: None,
             is_locked_hook: None,
             log_manager: None,
+            env_invalid: None,
             redo_capacity_hint: 0,
             key_prefixing: false, // JE default: KEY_PREFIXING_DEFAULT = false
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH, // T-5
@@ -3414,6 +3427,18 @@ impl Tree {
     /// for `ChildReference.fetchTarget`.  Noxu installs it directly.
     pub fn set_log_manager(&mut self, lm: Arc<noxu_log::LogManager>) {
         self.log_manager = Some(lm);
+    }
+
+    /// FID-TREE-1: wire the environment's "is-invalid" flag so an undecidable
+    /// interior IN/BIN fetch failure can fail the environment closed (JE
+    /// `IN.fetchTarget` throws `EnvironmentFailureException(LOG_FILE_NOT_FOUND)`
+    /// which invalidates the env).  Set from `EnvironmentImpl::is_invalid_flag()`
+    /// alongside `set_log_manager`.
+    pub fn set_env_invalid_flag(
+        &mut self,
+        flag: Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        self.env_invalid = Some(flag);
     }
 
     /// Drops this tree's `Arc<LogManager>` reference (EV-14 teardown).
@@ -3542,6 +3567,7 @@ impl Tree {
             in_list_listener: None,
             is_locked_hook: None,
             log_manager: None,
+            env_invalid: None,
             redo_capacity_hint: 0,
             key_prefixing: false,
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH, // T-5
@@ -8897,7 +8923,18 @@ impl Tree {
             return Some(r.clone());
         }
         let log_lsn = *self.root_log_lsn.read();
-        let node = self.fetch_node_from_log(log_lsn)?;
+        // FID-TREE-1: re-faulting the root through its authoritative current
+        // LSN (held under the root write lock) is JE `IN.fetchTarget`; a
+        // non-NULL LSN that fails to materialise invalidates the environment.
+        let node = match self.fetch_node_from_log(log_lsn) {
+            Some(node) => node,
+            None => {
+                if log_lsn != NULL_LSN {
+                    self.note_undecidable_fetch_failure();
+                }
+                return None;
+            }
+        };
         let node_id = node.node_id();
         // Cache MISS: the root was re-read from the log (JE fetch `isMiss`).
         // A tiny tree's root can itself be a BIN, so record by node kind.
@@ -8973,7 +9010,22 @@ impl Tree {
             return None;
         }
         let child_lsn = n.get_lsn(idx);
-        let node = self.fetch_node_from_log(child_lsn)?;
+        // FID-TREE-1: `child_lsn` is read HERE under the parent write latch
+        // `g`, so this is a fetch through the CURRENT slot — JE
+        // `IN.fetchTarget`.  A non-NULL LSN that fails to materialise is an
+        // UNDECIDABLE fetch failure: fail the environment closed (JE throws
+        // `LOG_FILE_NOT_FOUND`) so no read/insert/scan/delete descent silently
+        // treats the child as absent.  (The cleaner's STALE-snapshot checked
+        // path does NOT come through here — see `fetch_node_from_log`.)
+        let node = match self.fetch_node_from_log(child_lsn) {
+            Some(node) => node,
+            None => {
+                if child_lsn != NULL_LSN {
+                    self.note_undecidable_fetch_failure();
+                }
+                return None;
+            }
+        };
         let node_id = node.node_id();
         // Cache MISS: the child was not resident and had to be read from the
         // log (JE `IN.fetchINWithNoLatch` sets `isMiss=true` on the log-read
@@ -9593,6 +9645,25 @@ impl Tree {
         delta.dirty = true;
     }
 
+    /// FID-TREE-1: mark the environment invalid after an UNDECIDABLE interior
+    /// IN/BIN fetch failure (a non-NULL slot LSN whose log image could not be
+    /// read or parsed).  JE `IN.fetchTarget` / `fetchIN` throw
+    /// `EnvironmentFailureException(LOG_FILE_NOT_FOUND)` for this case, which
+    /// invalidates the environment — a fetch failure must NEVER be silently
+    /// turned into "node absent".  A no-op when no env flag is wired (unit
+    /// tests with no environment).
+    #[inline]
+    fn note_undecidable_fetch_failure(&self) {
+        if let Some(flag) = &self.env_invalid {
+            flag.store(true, std::sync::atomic::Ordering::Release);
+        }
+        log::error!(
+            "noxu-tree: undecidable IN/BIN fetch failure (log file unreadable \
+             under a live node); environment invalidated (JE \
+             LOG_FILE_NOT_FOUND fail-closed)"
+        );
+    }
+
     /// Read an IN/BIN log entry at `log_lsn` and deserialise it into a
     /// `TreeNode`, ready to be installed as a (re-fetched) resident node.
     ///
@@ -9613,6 +9684,17 @@ impl Tree {
             return None;
         }
         let lm = self.log_manager.as_ref()?;
+        // FID-TREE-1: this low-level helper keeps its pure `Option` return and
+        // does NOT invalidate the environment on a failed read.  Whether a
+        // non-NULL unreadable LSN is a fatal, env-invalidating condition
+        // depends on the CALLER: a descent through the CURRENT slot under the
+        // parent latch (`child_at_or_fetch`, `fetch_root_from_log`) is JE
+        // `IN.fetchTarget` and MUST fail the env closed; but the cleaner's
+        // checked path reads a possibly-STALE / snapshot LSN (not under the
+        // live parent latch) where an unreadable file is EXPECTED (the file
+        // was cleaned after the slot moved on) and must only RETAIN, never
+        // invalidate.  So the invalidation lives in the latch-holding callers,
+        // not here (JE invalidates only for a fetch through the current slot).
         let (entry_type, payload) = lm.read_entry(log_lsn).ok()?;
         // The on-disk payload is an `InLogEntry` body (db_id | prev_full_lsn
         // | prev_delta_lsn | len | node_data).  The recovery scanner strips

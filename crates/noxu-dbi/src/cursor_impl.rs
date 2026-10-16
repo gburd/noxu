@@ -1674,6 +1674,60 @@ impl CursorImpl {
         Ok(ln.data.map(Bytes::copy_from_slice))
     }
 
+    /// FID-TREE-1: the fail-closed point-read descent.  Runs the tree's
+    /// fetch-failure-aware `search_with_data_checked`, which surfaces an
+    /// UNDECIDABLE interior-IN fetch failure (a non-NULL slot LSN whose log
+    /// image could not be read) as `Err(TreeError::LogError)` instead of
+    /// swallowing it to `None` -> "key absent".  JE `IN.fetchTarget` /
+    /// `fetchIN` throw `LOG_FILE_NOT_FOUND` here (env-invalidating,
+    /// fail-closed, IN.java:2825-2834) rather than reporting the committed key
+    /// as not-found.
+    ///
+    /// Maps that failure to the SAME A6 D1 fail-closed path
+    /// `fetch_ln_data_from_log` uses: a `DbiError::LnFetchFailure` with an
+    /// env-invalidating reason (`LOG_FILE_NOT_FOUND`), setting the shared
+    /// `env_invalid` flag.  NO new public error variant.  `Ok(None)` /
+    /// `Ok(Some(..))` carry the genuine absent / found slot result exactly as
+    /// the unchecked `search_with_data` did, so every existing caller that
+    /// treats `None` as absent stays correct for the DECIDABLE cases.
+    fn search_with_data_fail_closed(
+        &self,
+        key: &[u8],
+    ) -> Result<Option<noxu_tree::tree::SlotFetch>, DbiError> {
+        let db = self.db_impl.read();
+        let Some(tree) = db.get_real_tree() else {
+            return Ok(None);
+        };
+        match tree.search_with_data_checked(key) {
+            Ok(slot) => Ok(slot),
+            Err(noxu_tree::TreeError::LogError(msg)) => {
+                use crate::EnvironmentFailureReason as R;
+                // JE IN.fetchTarget throws LOG_FILE_NOT_FOUND, which
+                // invalidates the environment (fail closed).
+                let reason = R::LogFileNotFound;
+                if reason.invalidates_environment()
+                    && let Some(f) = &self.env_invalid
+                {
+                    f.store(true, Ordering::Release);
+                }
+                Err(DbiError::LnFetchFailure {
+                    reason,
+                    msg: format!(
+                        "interior IN fetch failed during read of a committed \
+                         key (must not be reported as absent): {msg}"
+                    ),
+                })
+            }
+            // No other TreeError kind is produced by search_with_data_checked;
+            // map defensively to the same fail-closed error rather than
+            // swallowing.
+            Err(e) => Err(DbiError::LnFetchFailure {
+                reason: crate::EnvironmentFailureReason::LogIntegrity,
+                msg: format!("interior IN fetch failed during read: {e:?}"),
+            }),
+        }
+    }
+
     /// If `current_data` is empty/None but `current_lsn` is valid, the LN was
     /// stripped by the evictor — re-fetch it from the log (JE
     /// `IN.fetchTarget`). Idempotent; cheap when data is resident.
@@ -1832,14 +1886,13 @@ impl CursorImpl {
         // a local loop with no cursor state that outlives the call, and it only
         // fires on an exact KD match (never on a plain absent key — a miss
         // stays one descent).
-        let mut slot = {
-            let db = self.db_impl.read();
-            if let Some(tree) = db.get_real_tree() {
-                tree.search_with_data(key)
-            } else {
-                None
-            }
-        };
+        //
+        // FID-TREE-1: fail closed on an undecidable interior-IN fetch failure
+        // (a committed key under an unreadable log file must NOT read as
+        // absent).  `search_with_data_fail_closed` maps that to
+        // `DbiError::LnFetchFailure` + env invalidation; a genuine absent key
+        // still returns `Ok(None)`.
+        let mut slot = self.search_with_data_fail_closed(key)?;
         //
         // Fire ONLY on an exact KNOWN-DELETED match (JE searchExact scope,
         // CursorImpl.java:1937-1980): a reachable slot that is simply ABSENT
@@ -1856,14 +1909,7 @@ impl CursorImpl {
                 break;
             }
             // Re-descend once on the current resident instance.
-            slot = {
-                let db = self.db_impl.read();
-                if let Some(tree) = db.get_real_tree() {
-                    tree.search_with_data(key)
-                } else {
-                    None
-                }
-            };
+            slot = self.search_with_data_fail_closed(key)?;
         }
         let found = slot.as_ref().is_some_and(|s| s.found);
 
@@ -4382,6 +4428,14 @@ impl CursorImpl {
                 //   (b) a concurrent insert shifted this cursor's slot.
                 // Search the tree to distinguish the two cases.
                 // We must drop the guard before calling into the tree.
+                // FID-TREE-1 note: this is a cursor-position disambiguation
+                // (deleted vs insert-shifted), not a user READ result; a fetch
+                // failure here degrades to "treat as deleted -> re-anchor on
+                // the next traversal", which is self-correcting (the caller
+                // re-validates), so the unchecked `search_with_data` is
+                // acceptable here.  The user-visible point read
+                // (`search_with_data_fail_closed`) and the insert descent fail
+                // closed instead.
                 drop(guard);
                 let db = self.db_impl.read();
                 if let Some(tree) = db.get_real_tree()
