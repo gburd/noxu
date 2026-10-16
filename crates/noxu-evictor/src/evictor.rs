@@ -1528,7 +1528,13 @@ impl Evictor {
             .expect("evictor ckpt lock poisoned")
             .as_ref()
             .and_then(|w| w.upgrade())
-            .map(|c| c.get_eviction_provisional(db_id, bin.level))
+            .map(|c| {
+                c.get_eviction_provisional(
+                    db_id,
+                    bin.level,
+                    self.is_deferred_write_db(db_id),
+                )
+            })
             .unwrap_or(Provisional::No);
 
         // BUG-DW-EVICT-NULLLSN / BUG-DW-SYNC-1 (JE BIN.evictLNInternal ->
@@ -1695,7 +1701,13 @@ impl Evictor {
             .expect("evictor ckpt lock poisoned")
             .as_ref()
             .and_then(|w| w.upgrade())
-            .map(|c| c.get_eviction_provisional(db_id, level))
+            .map(|c| {
+                c.get_eviction_provisional(
+                    db_id,
+                    level,
+                    self.is_deferred_write_db(db_id),
+                )
+            })
             .unwrap_or(Provisional::No);
 
         let entry = InLogEntry::new(db_id, NULL_LSN, NULL_LSN, node_bytes);
@@ -4259,7 +4271,7 @@ mod tests {
         // NONE).  This also proves the read site now routes through the wired
         // checkpointer rather than the unconditional default.
         assert_eq!(
-            ckpt.get_eviction_provisional(1, 1),
+            ckpt.get_eviction_provisional(1, 1, false),
             Provisional::No,
             "F13: no checkpoint in progress => Provisional::No"
         );

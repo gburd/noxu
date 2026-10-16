@@ -10,6 +10,7 @@
 //!
 //!   - `testRecoverNoSync` / `testCloseOpenNoSync` — mode `deferred_write_nosync`.
 //!   - `testRecoverNoSyncEvict` — mode `deferred_write_nosync_evict`.
+//!   - FID-REC-3 regression guard — mode `deferred_write_nosync_evict_unsynced`.
 //!   - `testPreloadNoSync` — mode `deferred_write_nosync` then preload on reopen.
 
 use noxu_db::{DatabaseConfig, DatabaseEntry, EnvironmentConfig};
@@ -65,6 +66,10 @@ fn run_dw_crash(mode: &str, preload: bool) {
     child.wait().expect("wait for killed worker");
 
     // Reopen -> crash recovery.
+    if let Ok(d) = std::fs::read_to_string(dir.path().join("DIAG.txt")) {
+        eprintln!("WITNESS DIAG: {d}");
+    }
+
     let env = noxu_db::Environment::open(
         EnvironmentConfig::new(dir_path)
             .with_allow_create(true)
@@ -115,6 +120,108 @@ fn run_dw_crash(mode: &str, preload: bool) {
     );
 
     // Structural integrity after recovery (JE CheckBase.recoverAndLoadData).
+    let vr =
+        env.verify(&noxu_db::VerifyConfig::new()).expect("verify after crash");
+    assert_eq!(
+        vr.error_count(),
+        0,
+        "post-crash structural verify errors: {:?}",
+        vr.errors
+    );
+}
+
+/// FID-REC-3 (S2) end-to-end regression guard: a deferred-write DB whose
+/// dirty BINs are OVERWRITTEN and then EVICTED (logged to the WAL) with no
+/// `sync()` and no checkpoint must recover cleanly after a crash, keeping
+/// the last SYNCED value for every key and passing structural verify.
+///
+/// The deterministic RED/GREEN discriminator for FID-REC-3 is the UNIT
+/// witness `fid_rec_3_dw_db_evicted_node_is_provisional_without_checkpoint`
+/// in `noxu-recovery`, which pins the production decision
+/// `Checkpointer::get_eviction_provisional(..) == Provisional::Yes` for a
+/// deferred-write DB (JE DirtyINMap case 1).  That is the exact byte the
+/// fix changes, and it is RED on 81b2f048 (returns `No`).
+///
+/// This crash test exercises the SAME decision through the real evictor +
+/// recovery path (verified: on 81b2f048 every evicted DW BIN here is
+/// logged `Provisional::No`; with the fix every one is `Provisional::Yes`).
+/// It is kept as a regression guard rather than the primary witness
+/// because the *record-survival* outcome is masked: on reopen the DW tree
+/// is seeded lazily from its root LSN, so `Tree::recover_child_bin` cannot
+/// locate the evicted child BIN by node id (`NotInTree`) and drops it
+/// regardless of the provisional flag.  The invariant asserted here
+/// (synced data intact, structure verifies) must hold under BOTH the
+/// provisional and non-provisional flag, so it is a stability guard, not
+/// the discriminator.
+#[test]
+fn fid_rec_3_dw_evicted_unsynced_records_recover_cleanly() {
+    let dir = TempDir::new().unwrap();
+    let dir_path = dir.path().to_path_buf();
+
+    let mut child = std::process::Command::new(crash_worker_exe())
+        .env("NOXU_CRASH_DIR", &dir_path)
+        .env("NOXU_CRASH_MODE", "deferred_write_nosync_evict_unsynced")
+        .spawn()
+        .expect("spawn crash_worker");
+
+    assert!(
+        wait_for_flag(&dir_path, "dw_phase1_synced", Duration::from_secs(60)),
+        "worker never finished the synced phase"
+    );
+    assert!(
+        wait_for_flag(
+            &dir_path,
+            "dw_unsynced_started",
+            Duration::from_secs(60)
+        ),
+        "worker never reached the post-eviction crash point"
+    );
+
+    // SIGKILL after the overwritten DW BINs have been evicted (logged to
+    // the WAL) but never sync()'d and with no checkpoint written.
+    child.kill().expect("SIGKILL worker");
+    child.wait().expect("wait for killed worker");
+
+    let env = noxu_db::Environment::open(
+        EnvironmentConfig::new(dir_path)
+            .with_allow_create(true)
+            .with_transactional(true),
+    )
+    .expect("reopen env after crash");
+    let dw = env
+        .open_database(
+            None,
+            "dw",
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_deferred_write(true),
+        )
+        .expect("reopen dw db after crash");
+
+    // Every key 0..2000 must survive with its last SYNCED value; the
+    // un-sync()'d overwrite must never win.
+    let mut leaked_unsynced = 0u32;
+    let mut missing = 0u32;
+    for i in 0u32..2000 {
+        let mut v = DatabaseEntry::new();
+        if dw.get_into(None, i.to_be_bytes(), &mut v).unwrap() {
+            if v.data() == b"unsynced" {
+                leaked_unsynced += 1;
+            }
+        } else {
+            missing += 1;
+        }
+    }
+    assert_eq!(
+        missing, 0,
+        "{missing} SYNCED deferred-write records lost after crash"
+    );
+    assert_eq!(
+        leaked_unsynced, 0,
+        "{leaked_unsynced} UNSYNCED (overwritten) deferred-write records \
+         survived crash -- a DW DB must keep only what sync() made durable"
+    );
+
     let vr =
         env.verify(&noxu_db::VerifyConfig::new()).expect("verify after crash");
     assert_eq!(
