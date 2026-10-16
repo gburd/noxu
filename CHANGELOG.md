@@ -126,6 +126,44 @@ user-facing scope, symptoms, and preconditions.
 
 ### Fixed — isolation
 
+- **Cursor scans dirty-read an uncommitted delete / insert-abort**
+  (`FID-CURSOR-1`, `FID-CURSOR-7`): a `getNext`/`getPrev` scan skipped a
+  deleted-but-uncommitted slot WITHOUT taking the record lock, so it dirty-read
+  another transaction's pending delete (and, on the insert-abort half, returned
+  a now-gone record instead of re-resolving). Root cause: the two JE slot states
+  PENDING_DELETED (maybe-uncommitted) and KNOWN_DELETED (committed) were
+  collapsed into one `known_deleted` bit set at delete time. Fixed by restoring
+  JE's two-state machine: a transactional delete sets PENDING_DELETED; a scan
+  skips only KNOWN_DELETED without a lock and LOCKS a PENDING_DELETED slot
+  (blocking on the deleter), then re-resolves — returning the restored record on
+  abort and the correct neighbour on commit (JE `CursorImpl.lockAndGetCurrent` /
+  `lockLNAndCheckDefunct` / `getNext`). KNOWN_DELETED is set only at
+  commit-via-compressor / recovery, never at delete time. The eight
+  NEW-PHANTOM-ABORT-1 cursor-phantom tests are now green and un-ignored.
+
+  **On-disk (format-neutral, LOG_VERSION 3, no layout change):** the single v3
+  BIN-slot "deleted" byte now distinguishes PENDING_DELETED (`0x08`) from
+  KNOWN_DELETED (`0x01`), bit-exact to JE `EntryStates`. A v7.11.0 reader
+  decodes this byte with `byte != 0`, so it treats either value as deleted —
+  reads and recovers v7.11.1 logs without error. **Downgrade caveat:** if you
+  downgrade to v7.11.0 and recover a crash image in which an *uncommitted*
+  delete was made durable by a checkpoint (slot persisted PENDING, `0x08`),
+  v7.11.0 — having no PENDING_DELETED concept — treats that delete as committed
+  and does NOT roll it back, so the record stays deleted (v7.11.1 would restore
+  it). This is not corruption and affects only the downgrade + crash +
+  uncommitted-delete combination; forward reads of v7.11.0 logs by v7.11.1, and
+  v7.11.1 reads of its own logs, are fully correct.
+
+- **Interior IN/BIN re-fault swallowed a read error** (`FID-TREE-1`): a point
+  read whose descent had to re-fault a non-resident interior IN from an
+  unreadable log file returned `NotFound` for a committed key (a silent wrong
+  result) instead of failing closed. Fixed so the read surfaces a typed
+  `LnFetchFailure`/`LOG_FILE_NOT_FOUND` and invalidates the environment, matching
+  JE `IN.fetchTarget` (which throws `EnvironmentFailureException`). Invalidation
+  is scoped to a fetch through the current slot under the parent latch; the
+  cleaner's stale-snapshot checked path still retains the file without
+  over-invalidating.
+
 - **Serializable phantom prevention under the cleaner** (`BUG-PHANTOM-REVERSE-GAP`,
   A15): under serializable isolation a next-key/previous-key range lock was
   non-deterministic with the cleaner/compressor running (a phantom insert could
