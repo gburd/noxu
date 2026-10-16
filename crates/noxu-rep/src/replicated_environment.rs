@@ -2152,9 +2152,27 @@ impl ReplicatedEnvironment {
                     // backward re-read (JE flushNoSync in initScan).
                     let _ = lm.flush_sync();
                 }
-                crate::stream::syncup_reader::SyncupLogView::scan(
+                // FID-PONY-3: `scan` now returns the real error on a
+                // FileManager open OR a log-listing failure.  A listing
+                // error must NOT silently fall back to the in-memory index
+                // view (which, lacking the on-disk fingerprints, can agree a
+                // too-low matchpoint and force a spurious restore / unsafe
+                // truncate).  Log the error and treat the log view as
+                // unavailable only on a clean open failure; a listing error
+                // is surfaced loudly so the operator sees the fault.
+                match crate::stream::syncup_reader::SyncupLogView::scan(
                     env.get_env_home(),
-                )
+                ) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        log::error!(
+                            "syncup: could not build the on-disk log view \
+                             ({e}); falling back to the in-memory VLSN index \
+                             view (FID-PONY-3)"
+                        );
+                        None
+                    }
+                }
             });
         let index_view = VlsnIndexView::from_index(&self.vlsn_index);
         let replica_view: &dyn crate::stream::syncup::SyncupView =

@@ -147,7 +147,7 @@ fn test_commit_point_blocks_then_sees_data() {
                 insert_ln,
                 &payload,
                 Lsn::new(0, 100 + v as u32),
-            );
+            ).unwrap();
         }
         // Wake any reader parked on the tracker.
         replay
@@ -210,7 +210,7 @@ fn test_time_consistency_blocks_lagging_replica() {
     let bg = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(50));
         for v in 1..=920u64 {
-            replay.apply_entry(v, insert_ln, &payload, Lsn::new(0, 1));
+            replay.apply_entry(v, insert_ln, &payload, Lsn::new(0, 1)).unwrap();
         }
         replay
     });
