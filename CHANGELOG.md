@@ -240,9 +240,12 @@ recorded here for completeness.
   guard already prevented this from becoming two masters, but it was a
   convergence/liveness risk and a fidelity deviation (owner directive: Noxu
   leader election mirrors JE in all ways except quoracle). The `term` tiebreak
-  is removed; the ranking is now exactly JE's `(dtvlsn, vlsn, priority, name)`,
-  where the node name stands in for JE's socket-address tiebreak (a stable,
-  per-group-unique identity). No on-disk, wire, or public-API change.
+  is removed; the ranking is now exactly JE's `(dtvlsn, vlsn, priority, <final
+  tiebreak>)`. On v7.11.1 the final tiebreak remains the lexicographic
+  `node_name` (a stable, per-group-unique identity); JE's exact final tiebreak
+  is the socket address, deferred to v8.0.0 — see *Known issues*
+  (`FID-ELECT-RANK-ADDR`, `FID-ELECT-LEARNER`). No on-disk, wire, or public-API
+  change.
 
 ### Fixed — internal crates (no stability guarantee)
 
@@ -273,6 +276,27 @@ Stable-foundational crates are unchanged at the public-API level
   accounting** (`MEMBUDGET-NODE-HEAP`), **NEW-PHANTOM-ABORT-1** (a blocked
   getNext/getPrev dirty-reads a concurrent uncommitted write and does not
   re-resolve on abort) remain tracked for v8.0.0.
+- **FID-ELECT-RANK-ADDR** — the election VALUE-ranking final tiebreak (on an
+  exact `(dtvlsn, vlsn, priority)` tie) is the lexicographic `node_name`, not
+  JE's socket address (`RankingProposer.java:110-131`, `me.target.toString()`
+  keep-greatest). Both are deterministic, consistent total orders — no
+  split-brain — but on an exact tie they can select a different master than JE
+  when node-name order ≠ socket-address order. Switching to the address is a
+  purely-local change (the proposer resolves the dialed address from its own
+  group view; no wire/`Proposal`/persisted change), but on v7.11.1 it would
+  reintroduce a liveness stall (see `FID-ELECT-LEARNER`), so it is deferred to
+  v8.0.0, where the exact JE `InetSocketAddress.toString()` key is applied.
+- **FID-ELECT-LEARNER** — Noxu has no JE Learner broadcast
+  (`Elections.informLearners` → `Learner.processResult` →
+  `MasterChangeListener`, `Learner.java:141,496`). The election driver acts
+  only when `winner == self`, so a chosen Phase-2 value that is NOT the
+  proposing node (e.g. the proposer defers to a higher-priority or
+  higher-address peer) never activates as master — the election stalls. JE
+  makes the chosen node master on every node via the learner broadcast,
+  regardless of who proposed. Adding a Result/learner wire message is not
+  patch-safe (a new protocol message), so the Learner protocol lands in
+  v8.0.0. A ready `#[ignore]`d witness is committed
+  (`tests/fid_elect_learner_stall.rs`).
 
 
 ## [7.11.0] - 2026-09-28
