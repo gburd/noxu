@@ -340,15 +340,16 @@ impl ReplicaReceiver {
     /// NULL sentinel (an entry carrying no VLSN; never framed by a real
     /// feeder) is exempt and does not advance the high-water.
     ///
-    /// # Entry-type validation (LOG-10)
+    /// # Entry-type validation, fail-closed (FID-REPLAY-5)
     ///
-    /// The wire-format entry-type byte is also validated against the set
-    /// of known [`LogEntryType`] variants before forwarding to
-    /// `log_writer`.  An unknown byte indicates either a protocol-version
-    /// skew or an attacker who flipped a header bit, and is logged at
-    /// `error` level then skipped (the connection is kept open so the
-    /// stream can recover from a single bad frame; a repeated stream of
-    /// unknowns will surface via the operator alerting on the error log).
+    /// The wire-format entry-type byte is validated against the set of known
+    /// [`LogEntryType`] variants before forwarding to `log_writer`.  An
+    /// unknown byte indicates a protocol-version skew or a flipped header
+    /// bit; the frame cannot be decoded.  JE never silently drops a
+    /// replication frame (`Replay.replayEntry`, Replay.java:468-611, has no
+    /// skip path), so an unknown type is FATAL: it returns
+    /// [`RepError::ProtocolError`] and tears the stream down rather than
+    /// dropping that VLSN from the replica log.
     pub fn run(&self, log_writer: &mut dyn LogWriter) -> Result<()> {
         self.run_until(log_writer, None)
     }
@@ -503,20 +504,31 @@ impl ReplicaReceiver {
                 )));
             }
             // ----------------------------------------------------------------
-            // LOG-10: validate the entry-type byte against the catalog
-            // before forwarding to the log writer.  An unknown type is
-            // logged and the frame is skipped -- but the connection stays
-            // open so a single corrupt frame does not stall replication.
+            // FID-REPLAY-5: an unknown / undecodable entry type is FATAL.
+            //
+            // JE `Replay.replayEntry` (Replay.java:468-611) has no silent-skip
+            // path: a record whose log-entry type is not in the catalog cannot
+            // even be decoded into a `LogEntry` (the decode throws), and the
+            // final `else` branch asserts the record is a data LN
+            // (`assert wireRecord.getLogEntry() instanceof LNLogEntry`).  An
+            // unknown or undecodable entry therefore propagates as an
+            // `EnvironmentFailureException` -- the replica NEVER drops a
+            // replication frame.
+            //
+            // The old behaviour (log::error! + `continue`) silently dropped the
+            // frame: it did not advance the high-water and did not ack, so that
+            // VLSN went missing from the replica log while the stream carried on
+            // -- a divergence the replica could never detect.  Fail closed
+            // instead: a `ProtocolError` the reconnect loop surfaces and tears
+            // the stream down (the EnvironmentFailureException-equivalent
+            // restart path), so the hole is never written.
             // ----------------------------------------------------------------
             if LogEntryType::from_type_num(entry_type).is_none() {
-                log::error!(
+                return Err(RepError::ProtocolError(format!(
                     "replica: unknown entry_type byte {entry_type} on frame \
-                     vlsn={vlsn}; skipping (LOG-10)"
-                );
-                // Skip this frame: do not advance high-water, do not ack.
-                // The master will retransmit if the replica disconnects;
-                // for now we just continue to the next frame.
-                continue;
+                     vlsn={vlsn}; replication stream cannot be decoded \
+                     (fail-closed, FID-REPLAY-5)"
+                )));
             }
 
             // ----------------------------------------------------------------
@@ -1043,6 +1055,66 @@ mod tests {
         // Only the in-order VLSN=1 was applied; the gap frame MUST NOT be.
         assert_eq!(writer.entries.len(), 1);
         assert_eq!(writer.entries[0].0, 1);
+    }
+
+    /// FID-REPLAY-5 WITNESS: an unknown / undecodable entry-type byte must
+    /// FAIL CLOSED, exactly as JE `Replay.replayEntry` (Replay.java:468-611),
+    /// which has no silent-skip path -- an undecodable record propagates as
+    /// EnvironmentFailureException and the final `else` branch asserts the
+    /// record is a data LN.  The replica NEVER drops a replication frame.
+    ///
+    /// RED at 81b2f048 (the old `test_replica_skips_unknown_entry_type`
+    /// ASSERTED the bug: the bogus frame was skipped and streaming continued).
+    /// GREEN after: the receiver returns a ProtocolError and writes nothing.
+    #[test]
+    fn test_replica_fails_closed_on_unknown_entry_type() {
+        let pair = LocalChannelPair::new();
+        let master_side: Arc<dyn Channel> = Arc::new(pair.channel_a);
+        let replica_side: Arc<dyn Channel> = Arc::new(pair.channel_b);
+
+        // VLSN=1: bogus entry_type=200 (no LogEntryType::from_type_num).
+        // VLSN=2: a valid InsertLN (10) that MUST NOT be reached, because the
+        // bogus frame is fatal.
+        let frames =
+            vec![make_frame(1, 200, b"bogus"), make_frame(2, 10, b"good")];
+
+        let master_clone = Arc::clone(&master_side);
+        let _send_handle = std::thread::spawn(move || {
+            for f in &frames {
+                let _ = master_clone.send(f);
+            }
+            // Drain any acks, then close so that on the BUGGY (base) behaviour
+            // the receiver returns Ok after skipping the bogus frame and
+            // applying VLSN=2, giving a clean RED assertion (never a hang).
+            for _ in 0..2 {
+                let _ = master_clone.receive(Duration::from_secs(1));
+            }
+            let _ = master_clone.close();
+        });
+
+        let receiver = ReplicaReceiver::new(replica_side);
+        let mut writer = RecordingWriter::new();
+        let res = receiver.run(&mut writer);
+
+        match res {
+            Err(RepError::ProtocolError(msg)) => {
+                assert!(
+                    msg.contains("unknown entry_type"),
+                    "expected unknown-entry-type protocol error, got: {msg}"
+                );
+            }
+            other => panic!(
+                "expected ProtocolError on an unknown entry type, got {other:?}"
+            ),
+        }
+
+        // The bogus frame is fatal: nothing was written, not even a later
+        // valid frame (the stream is torn down before it is reached).
+        assert_eq!(
+            writer.entries.len(),
+            0,
+            "an unknown entry type must be fatal, not skipped"
+        );
     }
 
     // -----------------------------------------------------------------------
