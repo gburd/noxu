@@ -169,8 +169,15 @@ impl FileManagerLogScanner {
             }
             LogEntryType::TxnAbort => {
                 let e = TxnEndEntry::read_from_log(&payload).ok()?;
+                // GAP-REPLAY-7: carry the abort's DTVLSN so a replica can
+                // validate + track it (JE Replay.updateDTVLSN runs on abort
+                // too).  0 == UNINITIALIZED (pre-DTVLSN stream) -> None.
+                let dtvlsn_seq = e.dtvlsn.sequence();
+                let dtvlsn =
+                    if dtvlsn_seq > 0 { Some(dtvlsn_seq as u64) } else { None };
                 Some(LogEntry::TxnAbort(TxnAbortRecord {
                     txn_id: e.txn_id as u64,
+                    dtvlsn,
                 }))
             }
             LogEntryType::TxnPrepare => {

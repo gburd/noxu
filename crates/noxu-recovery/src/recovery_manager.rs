@@ -3472,7 +3472,7 @@ mod tests {
         );
         scanner.push(
             lsn(0, 200),
-            LogEntry::TxnAbort(TxnAbortRecord { txn_id: 1 }),
+            LogEntry::TxnAbort(TxnAbortRecord { txn_id: 1, dtvlsn: None }),
         );
 
         let mut mgr = RecoveryManager::new();
@@ -3566,7 +3566,7 @@ mod tests {
         );
         scanner.push(
             lsn(0, 200),
-            LogEntry::TxnAbort(TxnAbortRecord { txn_id: 7 }),
+            LogEntry::TxnAbort(TxnAbortRecord { txn_id: 7, dtvlsn: None }),
         );
 
         let mut mgr = RecoveryManager::new();
@@ -3804,7 +3804,7 @@ mod tests {
             LogEntry::Ln(make_insert(1, Some(2), b"k2", NULL_LSN)),
         );
         scanner
-            .push(lsn(0, 40), LogEntry::TxnAbort(TxnAbortRecord { txn_id: 2 }));
+            .push(lsn(0, 40), LogEntry::TxnAbort(TxnAbortRecord { txn_id: 2, dtvlsn: None }));
 
         // txn 3 LN — no commit/abort (active at crash)
         scanner.push(
@@ -5004,7 +5004,7 @@ mod tests {
         );
         scanner.push(
             lsn(0, 200),
-            LogEntry::TxnAbort(TxnAbortRecord { txn_id: 42 }),
+            LogEntry::TxnAbort(TxnAbortRecord { txn_id: 42, dtvlsn: None }),
         );
 
         let mut mgr = RecoveryManager::new();
@@ -5107,6 +5107,7 @@ mod tests {
             lsn(0, 30),
             LogEntry::TxnAbort(crate::log_scanner::TxnAbortRecord {
                 txn_id: 55,
+                dtvlsn: None,
             }),
         );
 

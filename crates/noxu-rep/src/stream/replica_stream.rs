@@ -269,7 +269,17 @@ impl LogWriter for EnvironmentLogWriter {
         // Port of JE: the replica writes the entry to its log, then
         // `Replay.replayEntry` applies it to the tree.
         if let Some(replay) = self.replay.as_mut() {
-            replay.apply_entry(vlsn, entry_type, payload, lsn);
+            // GAP-REPLAY-7: a DTVLSN validation failure is fatal -- surface it
+            // as a RepError so the replica reconnect loop tears the stream
+            // down (the EnvironmentFailureException-equivalent restart path),
+            // exactly like a VLSN-continuity or unknown-entry violation.
+            replay.apply_entry(vlsn, entry_type, payload, lsn).map_err(
+                |e| {
+                    crate::error::RepError::DatabaseError(format!(
+                        "replica replay-apply failed: {e}"
+                    ))
+                },
+            )?;
         }
 
         log::trace!(

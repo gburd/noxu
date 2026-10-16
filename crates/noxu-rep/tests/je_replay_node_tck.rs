@@ -156,14 +156,14 @@ fn replay_resumed_txn_provisional_until_its_own_commit() {
 
     // mt1 (txn 1): the "left open" transaction — stream its LN, provisional.
     let mt1 = ln_payload(db_id, Some(1), b"mt1key", Some(b"mt1val"));
-    replay.apply_entry(1, insert_txn(), &mt1, Lsn::new(0, 100));
+    replay.apply_entry(1, insert_txn(), &mt1, Lsn::new(0, 100)).unwrap();
 
     // mt2 (txn 2): a LATER transaction that the replica syncs to. Its commit
     // is the sync-point (the CommitToken ct2 in JE). It must NOT resolve mt1.
     let mt2 = ln_payload(db_id, Some(2), b"mt2key", Some(b"mt2val"));
-    replay.apply_entry(2, insert_txn(), &mt2, Lsn::new(0, 200));
+    replay.apply_entry(2, insert_txn(), &mt2, Lsn::new(0, 200)).unwrap();
     let c2 = commit_payload(2);
-    replay.apply_entry(3, commit_type(), &c2, Lsn::new(0, 300));
+    replay.apply_entry(3, commit_type(), &c2, Lsn::new(0, 300)).unwrap();
 
     // Replica is now synced to ct2. mt2's data IS visible; mt1's is NOT
     // (mt1 is still open — the resumed-transaction precondition).
@@ -185,7 +185,7 @@ fn replay_resumed_txn_provisional_until_its_own_commit() {
 
     // mt1 finally commits (ct1). NOW its effect must appear on the replica.
     let c1 = commit_payload(1);
-    replay.apply_entry(4, commit_type(), &c1, Lsn::new(0, 400));
+    replay.apply_entry(4, commit_type(), &c1, Lsn::new(0, 400)).unwrap();
     assert!(
         present(&tree, b"mt1key"),
         "the resumed txn (mt1) must become visible once ITS OWN commit \
@@ -233,14 +233,14 @@ fn replay_ln_stream_converges_replica_to_master_state() {
         insert_txn(),
         &ln_payload(db_id, Some(10), b"keep", Some(b"v1")),
         Lsn::new(0, 100),
-    );
+    ).unwrap();
     replay.apply_entry(
         2,
         insert_txn(),
         &ln_payload(db_id, Some(10), b"gone", Some(b"v1")),
         Lsn::new(0, 110),
-    );
-    replay.apply_entry(3, commit_type(), &commit_payload(10), Lsn::new(0, 120));
+    ).unwrap();
+    replay.apply_entry(3, commit_type(), &commit_payload(10), Lsn::new(0, 120)).unwrap();
 
     // Master txn 11: UPDATE "keep", DELETE "gone", commit.
     replay.apply_entry(
@@ -248,14 +248,14 @@ fn replay_ln_stream_converges_replica_to_master_state() {
         update_txn(),
         &ln_payload(db_id, Some(11), b"keep", Some(b"v2")),
         Lsn::new(0, 200),
-    );
+    ).unwrap();
     replay.apply_entry(
         5,
         delete_txn(),
         &ln_payload(db_id, Some(11), b"gone", None),
         Lsn::new(0, 210),
-    );
-    replay.apply_entry(6, commit_type(), &commit_payload(11), Lsn::new(0, 220));
+    ).unwrap();
+    replay.apply_entry(6, commit_type(), &commit_payload(11), Lsn::new(0, 220)).unwrap();
 
     // checkNodeEquality (LN-data layer): the replica's tree == the master's
     // final state — "keep" holds the UPDATED value, "gone" is DELETED.
@@ -293,8 +293,8 @@ fn replay_advances_vlsn_in_stream_order() {
         insert_txn(),
         &ln_payload(db_id, Some(12), b"early", Some(b"x")),
         Lsn::new(0, 100),
-    );
-    replay.apply_entry(8, commit_type(), &commit_payload(12), Lsn::new(0, 110));
+    ).unwrap();
+    replay.apply_entry(8, commit_type(), &commit_payload(12), Lsn::new(0, 110)).unwrap();
     assert_eq!(
         replay.last_applied_vlsn(),
         8,
@@ -308,7 +308,7 @@ fn replay_advances_vlsn_in_stream_order() {
         insert_txn(),
         &ln_payload(db_id, Some(13), b"late", Some(b"y")),
         Lsn::new(0, 200),
-    );
+    ).unwrap();
     assert!(
         !present(&tree, b"late"),
         "a buffered (uncommitted) later txn must not be visible out of order"

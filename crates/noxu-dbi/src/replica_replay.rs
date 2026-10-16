@@ -105,6 +105,7 @@ use noxu_txn::{LockManager, LockType, Locker, Txn};
 use noxu_util::Lsn;
 
 use crate::environment_impl::EnvironmentImpl;
+use crate::error::DbiError;
 use crate::file_manager_scanner::FileManagerLogScanner;
 
 /// Locker-id base for replay transactions.
@@ -174,6 +175,14 @@ pub struct ReplicaReplay {
     /// `Arc<AtomicU64>` so a reader thread can observe it without locking the
     /// replay driver.
     last_applied_vlsn: Arc<AtomicU64>,
+
+    /// GAP-REPLAY-7: the replica's in-memory Durable-Txn VLSN, extracted from
+    /// each replayed commit/abort TxnEnd record.  Port of JE
+    /// `Replay.updateDTVLSN` + `ReplayTxn.validateDTVLSN`
+    /// (Replay.java:629-651, ReplayTxn.java:166-190): DTVLSNs are
+    /// non-decreasing (except the one post->pre-DTVLSN-stream transition to
+    /// UNINITIALIZED) and `DTVLSN(vlsn) <= vlsn`.  Starts UNINITIALIZED (0).
+    last_replayed_dtvlsn: i64,
 }
 
 impl ReplicaReplay {
@@ -186,6 +195,7 @@ impl ReplicaReplay {
             active_txns: HashMap::new(),
             ephemeral_locker: AtomicI64::new(REPLAY_LOCKER_BASE / 2),
             last_applied_vlsn: Arc::new(AtomicU64::new(0)),
+            last_replayed_dtvlsn: 0,
         }
     }
 
@@ -242,7 +252,7 @@ impl ReplicaReplay {
         entry_type: u8,
         payload: &[u8],
         lsn: Lsn,
-    ) {
+    ) -> Result<(), DbiError> {
         let decoded = FileManagerLogScanner::parse_payload(
             entry_type,
             Bytes::copy_from_slice(payload),
@@ -253,11 +263,15 @@ impl ReplicaReplay {
         match decoded {
             // Replay.replayEntry: LOG_TXN_COMMIT branch (repTxn.commit).
             Some(LogEntry::TxnCommit(rec)) => {
+                // GAP-REPLAY-7: validate + track the DTVLSN before applying
+                // (JE updateDTVLSN runs before repTxn.commit).
+                self.validate_and_track_dtvlsn(rec.dtvlsn, vlsn)?;
                 self.commit_txn(rec.txn_id);
                 self.advance_vlsn(vlsn);
             }
             // Replay.replayEntry: LOG_TXN_ABORT branch (repTxn.abort).
             Some(LogEntry::TxnAbort(rec)) => {
+                self.validate_and_track_dtvlsn(rec.dtvlsn, vlsn)?;
                 self.abort_txn(rec.txn_id);
                 self.advance_vlsn(vlsn);
             }
@@ -291,6 +305,54 @@ impl ReplicaReplay {
                 self.advance_vlsn(vlsn);
             }
         }
+        Ok(())
+    }
+
+    /// GAP-REPLAY-7: validate + track the DTVLSN from a replayed commit/abort.
+    ///
+    /// Port of JE `Replay.updateDTVLSN` + `ReplayTxn.validateDTVLSN`
+    /// (Replay.java:629-651, ReplayTxn.java:166-190):
+    /// - `DTVLSN(vlsn) <= vlsn` MUST hold (a durable VLSN can never exceed the
+    ///   commit's own VLSN); a violation is fatal (`IllegalStateException` ->
+    ///   here a `DbiError` the replica receive loop surfaces, tearing the
+    ///   stream down -- the EnvironmentFailureException-equivalent restart).
+    /// - DTVLSNs are non-decreasing, EXCEPT the single post->pre-DTVLSN-stream
+    ///   transition (a positive value -> UNINITIALIZED/0), which is allowed.
+    /// `dtvlsn == None` is the pre-DTVLSN (UNINITIALIZED) case: track 0,
+    /// never a violation.
+    fn validate_and_track_dtvlsn(
+        &mut self,
+        dtvlsn: Option<u64>,
+        vlsn: u64,
+    ) -> Result<(), DbiError> {
+        let Some(dtvlsn) = dtvlsn else {
+            // Pre-DTVLSN stream (UNINITIALIZED): JE sets the in-memory DTVLSN
+            // to UNINITIALIZED; a post->pre transition is the one allowed
+            // decrease.
+            self.last_replayed_dtvlsn = 0;
+            return Ok(());
+        };
+        // DTVLSN(vlsn) <= vlsn (ReplayTxn.validateDTVLSN).
+        if vlsn > 0 && dtvlsn > vlsn {
+            return Err(DbiError::EnvironmentFailure {
+                reason: format!(
+                    "GAP-REPLAY-7: replayed DTVLSN({dtvlsn}) > its own                      VLSN({vlsn}); the replication stream is corrupt                      (fail-closed)"
+                ),
+            });
+        }
+        // Non-decreasing (post->post): a decrease to a smaller positive value
+        // is a corrupt stream (JE: DTVLSNs should not decrease; the only
+        // allowed decrease is the post->pre transition handled above).
+        let prev = self.last_replayed_dtvlsn;
+        if prev > 0 && (dtvlsn as i64) < prev {
+            return Err(DbiError::EnvironmentFailure {
+                reason: format!(
+                    "GAP-REPLAY-7: replayed DTVLSN({dtvlsn}) decreased below                      the last replayed DTVLSN({prev}); the replication stream                      is corrupt (fail-closed)"
+                ),
+            });
+        }
+        self.last_replayed_dtvlsn = dtvlsn as i64;
+        Ok(())
     }
 
     /// Stable per-master-txn replay locker id (disjoint from local txn ids).
@@ -572,7 +634,7 @@ mod tests {
 
         // Stream a transactional insert (txn 7) — buffered, not visible.
         let p = ln_payload(db_id, Some(7), b"k1", Some(b"v1"));
-        replay.apply_entry(1, insert_ln_txn(), &p, Lsn::new(0, 100));
+        replay.apply_entry(1, insert_ln_txn(), &p, Lsn::new(0, 100)).unwrap();
         assert!(
             tree.read().unwrap().search(b"k1").is_none(),
             "uncommitted txn LN must NOT be visible before commit"
@@ -581,7 +643,7 @@ mod tests {
 
         // Stream the commit — now visible.
         let c = txn_commit_payload(7);
-        replay.apply_entry(2, txn_commit_type(), &c, Lsn::new(0, 200));
+        replay.apply_entry(2, txn_commit_type(), &c, Lsn::new(0, 200)).unwrap();
         assert!(
             tree.read().unwrap().search(b"k1").is_some(),
             "committed txn LN must be visible after commit"
@@ -599,9 +661,9 @@ mod tests {
         let mut replay = ReplicaReplay::new(Arc::clone(&env));
 
         let p = ln_payload(db_id, Some(9), b"gone", Some(b"x"));
-        replay.apply_entry(1, insert_ln_txn(), &p, Lsn::new(0, 100));
+        replay.apply_entry(1, insert_ln_txn(), &p, Lsn::new(0, 100)).unwrap();
         let a = txn_abort_payload(9);
-        replay.apply_entry(2, txn_abort_type(), &a, Lsn::new(0, 200));
+        replay.apply_entry(2, txn_abort_type(), &a, Lsn::new(0, 200)).unwrap();
 
         assert!(
             tree.read().unwrap().search(b"gone").is_none(),
@@ -616,7 +678,7 @@ mod tests {
         let mut replay = ReplicaReplay::new(Arc::clone(&env));
 
         let p = ln_payload(db_id, None, b"now", Some(b"here"));
-        replay.apply_entry(1, insert_ln(), &p, Lsn::new(0, 100));
+        replay.apply_entry(1, insert_ln(), &p, Lsn::new(0, 100)).unwrap();
         assert!(
             tree.read().unwrap().search(b"now").is_some(),
             "non-txn LN must be visible immediately"
@@ -643,12 +705,12 @@ mod tests {
                 insert_ln_txn(),
                 &p,
                 Lsn::new(0, 100 + i as u32),
-            );
+            ).unwrap();
             // None visible until commit.
             assert!(tree.read().unwrap().search(*k).is_none());
         }
         let c = txn_commit_payload(3);
-        replay.apply_entry(4, txn_commit_type(), &c, Lsn::new(0, 200));
+        replay.apply_entry(4, txn_commit_type(), &c, Lsn::new(0, 200)).unwrap();
         for k in [b"a", b"b", b"c"].iter() {
             assert!(
                 tree.read().unwrap().search(*k).is_some(),
@@ -683,7 +745,7 @@ mod tests {
 
         // Stream a transactional insert (txn 7) -- buffered + write-locked.
         let p = ln_payload(db_id, Some(7), key, Some(b"v1"));
-        replay.apply_entry(1, insert_ln_txn(), &p, Lsn::new(0, 100));
+        replay.apply_entry(1, insert_ln_txn(), &p, Lsn::new(0, 100)).unwrap();
 
         // A reader taking a NON-BLOCKING read lock on the record must be
         // DENIED (the importunate replay write lock holds it).
@@ -695,7 +757,7 @@ mod tests {
 
         // Stream the commit -- releases the replay txn locks.
         let c = txn_commit_payload(7);
-        replay.apply_entry(2, txn_commit_type(), &c, Lsn::new(0, 200));
+        replay.apply_entry(2, txn_commit_type(), &c, Lsn::new(0, 200)).unwrap();
 
         // Now the reader's read lock is granted (the record is committed and
         // the replay txn released its locks).  Note the committed slot moved
@@ -737,7 +799,7 @@ mod tests {
         // The importunate replay now applies a txnal write to the same key:
         // it STEALS the lock (importunate), preempting the reader.
         let p = ln_payload(db_id, Some(8), key, Some(b"v"));
-        replay.apply_entry(1, insert_ln_txn(), &p, Lsn::new(0, 100));
+        replay.apply_entry(1, insert_ln_txn(), &p, Lsn::new(0, 100)).unwrap();
 
         // The reader's NEXT lock op surfaces LockPreempted (JE
         // checkPreempted). We probe with another read-lock request.
@@ -749,6 +811,71 @@ mod tests {
 
         // Clean up: abort the replay txn (releases its stolen lock).
         let a = txn_abort_payload(8);
-        replay.apply_entry(2, txn_abort_type(), &a, Lsn::new(0, 200));
+        replay.apply_entry(2, txn_abort_type(), &a, Lsn::new(0, 200)).unwrap();
+    }
+
+    fn txn_commit_payload_dtvlsn(txn_id: i64, dtvlsn: u64) -> Vec<u8> {
+        use bytes::BytesMut;
+        use noxu_log::entry::TxnEndEntry;
+        let e = TxnEndEntry::new_commit(
+            txn_id,
+            NULL_LSN,
+            0,
+            0,
+            noxu_util::Vlsn::new(dtvlsn as i64),
+        );
+        let mut buf = BytesMut::new();
+        e.write_to_log(&mut buf);
+        buf.to_vec()
+    }
+
+    /// GAP-REPLAY-7 WITNESS: a replayed commit whose DTVLSN exceeds its own
+    /// VLSN is FATAL (JE `ReplayTxn.validateDTVLSN`: `DTVLSN(vlsn) <= vlsn`,
+    /// else IllegalStateException).  Noxu returns a `DbiError::EnvironmentFailure`
+    /// the replica receive loop surfaces, tearing the stream down.
+    ///
+    /// RED at 81b2f048: ReplicaReplay discarded the DTVLSN on replay entirely
+    /// (no extraction, no validation), so a bad DTVLSN was accepted silently.
+    #[test]
+    fn test_replay_rejects_dtvlsn_greater_than_vlsn() {
+        let (env, db_id, _tree) = open_env_with_db();
+        let mut replay = ReplicaReplay::new(Arc::clone(&env));
+
+        // Buffer a txnal insert at vlsn=1.
+        let p = ln_payload(db_id, Some(7), b"k", Some(b"v"));
+        replay.apply_entry(1, insert_ln_txn(), &p, Lsn::new(0, 100)).unwrap();
+
+        // Commit at vlsn=2 carrying DTVLSN=99 (> 2): must fail closed.
+        let c = txn_commit_payload_dtvlsn(7, 99);
+        let r = replay.apply_entry(2, txn_commit_type(), &c, Lsn::new(0, 200));
+        assert!(
+            matches!(r, Err(DbiError::EnvironmentFailure { .. })),
+            "DTVLSN > VLSN on a replayed commit must be fatal, got {r:?}"
+        );
+    }
+
+    /// GAP-REPLAY-7 WITNESS (non-decreasing): a replayed DTVLSN that decreases
+    /// below the last replayed positive DTVLSN is fatal (JE: DTVLSNs should
+    /// not decrease; the only allowed decrease is post->pre-DTVLSN-stream).
+    #[test]
+    fn test_replay_rejects_decreasing_dtvlsn() {
+        let (env, db_id, _tree) = open_env_with_db();
+        let mut replay = ReplicaReplay::new(Arc::clone(&env));
+
+        // Commit 1 @ vlsn=5 carries DTVLSN=5 (valid: 5 <= 5).
+        let p1 = ln_payload(db_id, Some(1), b"a", Some(b"v"));
+        replay.apply_entry(4, insert_ln_txn(), &p1, Lsn::new(0, 90)).unwrap();
+        let c1 = txn_commit_payload_dtvlsn(1, 5);
+        replay.apply_entry(5, txn_commit_type(), &c1, Lsn::new(0, 100)).unwrap();
+
+        // Commit 2 @ vlsn=9 carries DTVLSN=3 (< last 5): must fail closed.
+        let p2 = ln_payload(db_id, Some(2), b"b", Some(b"v"));
+        replay.apply_entry(8, insert_ln_txn(), &p2, Lsn::new(0, 190)).unwrap();
+        let c2 = txn_commit_payload_dtvlsn(2, 3);
+        let r = replay.apply_entry(9, txn_commit_type(), &c2, Lsn::new(0, 200));
+        assert!(
+            matches!(r, Err(DbiError::EnvironmentFailure { .. })),
+            "a decreasing DTVLSN must be fatal, got {r:?}"
+        );
     }
 }

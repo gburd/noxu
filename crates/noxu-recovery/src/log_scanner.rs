@@ -211,6 +211,11 @@ pub struct TxnCommitRecord {
 pub struct TxnAbortRecord {
     /// The aborting transaction ID.
     pub txn_id: u64,
+    /// GAP-REPLAY-7: the Durable-Txn VLSN carried by the abort's TxnEnd
+    /// record, so a replica can validate + track it (JE `Replay.updateDTVLSN`
+    /// is driven from abort as well as commit).  `None` for a pre-DTVLSN
+    /// stream (`UNINITIALIZED_VLSN_SEQUENCE`).
+    pub dtvlsn: Option<u64>,
 }
 
 /// A transaction-prepare record (XA two-phase commit, wave 3-2).
@@ -678,11 +683,11 @@ mod tests {
         let mut scanner = InMemoryLogScanner::new();
         scanner.push(
             lsn(0, 100),
-            LogEntry::TxnAbort(TxnAbortRecord { txn_id: 1 }),
+            LogEntry::TxnAbort(TxnAbortRecord { txn_id: 1, dtvlsn: None }),
         );
         scanner.push(
             lsn(0, 200),
-            LogEntry::TxnAbort(TxnAbortRecord { txn_id: 2 }),
+            LogEntry::TxnAbort(TxnAbortRecord { txn_id: 2, dtvlsn: None }),
         );
 
         // NULL_LSN bounds = no filter
