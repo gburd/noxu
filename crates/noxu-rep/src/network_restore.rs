@@ -261,6 +261,10 @@ impl NetworkRestore {
 
         let mut total_bytes: u64 = 0;
         let mut files_done: u32 = 0;
+        // FID-NR-4: track the restored file names so residual local files not
+        // in the set can be disposed after the transfer.
+        let mut restored_set: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
 
         // FID-NR-1: fence the environment BEFORE mutating any local log file.
         // A crash from here until the marker is removed (after the full set
@@ -406,6 +410,7 @@ impl NetworkRestore {
             })?;
 
             files_done += 1;
+            restored_set.insert(filename.clone());
             self.update_progress(total_bytes, files_done);
             self.update_elapsed(started_at.elapsed());
 
@@ -414,6 +419,13 @@ impl NetworkRestore {
                 filename,
                 file_size
             );
+        }
+
+        // FID-NR-4: dispose any residual local .ndb file not in the restored
+        // set, then verify the set is complete (JE cleanup, before
+        // removeMarkerFile).
+        if file_count > 0 {
+            self.cleanup_residual_files(&log_dir, &restored_set)?;
         }
 
         // FID-NR-1: the full set transferred coherently — remove the marker so
@@ -543,6 +555,9 @@ impl NetworkRestore {
         let mut files_done: u32 = 0;
         let mut buf2 = [0u8; 2];
         let mut buf8 = [0u8; 8];
+        // FID-NR-4: track restored file names for residual cleanup.
+        let mut restored_set: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
 
         // FID-NR-1: fence the environment BEFORE mutating any local log file.
         if file_count > 0 {
@@ -664,8 +679,14 @@ impl NetworkRestore {
             off += file_size + 4;
             total_bytes += file_size as u64;
             files_done += 1;
+            restored_set.insert(filename.clone());
             self.update_progress(total_bytes, files_done);
             self.update_elapsed(started_at.elapsed());
+        }
+
+        // FID-NR-4: dispose residual local .ndb files not in the restored set.
+        if file_count > 0 {
+            self.cleanup_residual_files(&log_dir, &restored_set)?;
         }
 
         // FID-NR-1: the full set transferred coherently — remove the marker.
@@ -808,6 +829,75 @@ impl NetworkRestore {
     fn parse_restore_file_number(filename: &str) -> Option<u32> {
         let stem = filename.strip_suffix(".ndb")?;
         u32::from_str_radix(stem, 16).ok()
+    }
+
+    /// FID-NR-4 (JE `NetworkBackup.cleanup`, `NetworkBackup.java:429`): after
+    /// the full set has been transferred, dispose any residual local `.ndb`
+    /// file that is NOT part of the restored set, then verify every file in
+    /// the set is present. A stale local file left over from the node's old
+    /// (divergent) log would otherwise confuse recovery. The marker is a
+    /// non-`.ndb` file and is never considered here (JE excludes it; it is
+    /// removed explicitly once the restore finishes).
+    fn cleanup_residual_files(
+        &self,
+        log_dir: &Path,
+        restored: &std::collections::HashSet<String>,
+    ) -> Result<()> {
+        let rd = std::fs::read_dir(log_dir).map_err(|e| {
+            RepError::NetworkRestoreError(format!(
+                "listing log dir {} for residual cleanup: {}",
+                log_dir.display(),
+                e
+            ))
+        })?;
+        for entry in rd {
+            let entry = entry.map_err(|e| {
+                RepError::NetworkRestoreError(format!(
+                    "reading a directory entry in {}: {}",
+                    log_dir.display(),
+                    e
+                ))
+            })?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy().to_string();
+            // Only consider real .ndb log files; leave the marker, .tmp, .bak
+            // and any non-log files alone.
+            if name.ends_with(".ndb")
+                && Self::parse_restore_file_number(&name).is_some()
+                && !restored.contains(&name)
+            {
+                let path = log_dir.join(&name);
+                if self.config.retain_log_files {
+                    let backup = log_dir.join(format!("{name}.bak"));
+                    std::fs::rename(&path, &backup).map_err(|e| {
+                        RepError::NetworkRestoreError(format!(
+                            "residual cleanup: could not rename '{}' to \
+                             '{}': {}",
+                            path.display(),
+                            backup.display(),
+                            e
+                        ))
+                    })?;
+                } else {
+                    std::fs::remove_file(&path).map_err(|e| {
+                        RepError::NetworkRestoreError(format!(
+                            "residual cleanup: could not delete '{}': {}",
+                            path.display(),
+                            e
+                        ))
+                    })?;
+                }
+            }
+        }
+        // JE verifies every file in the set exists after cleanup.
+        for name in restored {
+            if !log_dir.join(name).exists() {
+                return Err(RepError::NetworkRestoreError(format!(
+                    "restored file missing after cleanup: {name}"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Update the elapsed time for progress tracking.
@@ -1579,6 +1669,49 @@ mod tests {
         assert!(
             !dir.path().join("00000002.ndb").exists(),
             "obsolete file 2 must be disposed"
+        );
+    }
+
+    /// FID-NR-4 (S3, JE `NetworkBackup.cleanup`, `NetworkBackup.java:429`):
+    /// after the full restore, a residual local `.ndb` file that is NOT part
+    /// of the restored set must be disposed, so a stale file from the node's
+    /// old divergent log cannot confuse recovery. This is distinct from
+    /// FID-NR-3 (which disposes files >= each placed file during placement):
+    /// here the residual file is LOWER than the restored file, so only the
+    /// post-transfer cleanup catches it.
+    ///
+    /// Witness: restore set {5}; pre-existing local {3} (lower, not in set).
+    /// After the restore, file 3 must be gone and file 5 present. RED at
+    /// 81b2f048 (no cleanup: file 3 remains). GREEN after the fix.
+    #[test]
+    fn restore_cleans_up_residual_file_not_in_set() {
+        let body = b"restored file five";
+        let mut payload = 1u32.to_le_bytes().to_vec();
+        payload
+            .extend_from_slice(&(b"00000005.ndb".len() as u16).to_le_bytes());
+        payload.extend_from_slice(b"00000005.ndb");
+        payload.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        payload.extend_from_slice(body);
+        payload.extend_from_slice(&crc32fast::hash(body).to_le_bytes());
+
+        let (_disp, addr) = spawn_fixed_reply_restore_server(payload);
+        let dir = tempfile::TempDir::new().unwrap();
+        // A stale LOWER-numbered local file not in the restored set.
+        std::fs::write(dir.path().join("00000003.ndb"), b"stale").unwrap();
+
+        let restore = NetworkRestore::new(dispatcher_config(addr))
+            .with_local_dir(dir.path());
+        restore.execute_via_dispatcher().expect("restore");
+
+        assert_eq!(
+            std::fs::read(dir.path().join("00000005.ndb")).unwrap(),
+            body,
+            "the restored file must be present"
+        );
+        assert!(
+            !dir.path().join("00000003.ndb").exists(),
+            "a residual file not in the restored set must be cleaned up \
+             (FID-NR-4)"
         );
     }
 }
