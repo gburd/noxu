@@ -2965,6 +2965,18 @@ impl ReplicatedEnvironment {
         // below handles: a second `become_replica` naming a NEW master must
         // update the master and let the running thread re-sync, not error on
         // a REPLICA -> REPLICA self-transition.
+        // GAP-REPLAY-3 (merge-prep): arm the replica-write screen BEFORE the
+        // state transition to Replica, so there is never a window in which the
+        // node already reports `Replica` but still accepts local user writes
+        // (which would silently diverge it from the master).  Arming early is
+        // conservative: a stray write in the brief pre-transition window is
+        // refused with `ReplicaWrite`, never wrongly accepted.  (become_master
+        // clears the screen AFTER its transition for the symmetric reason — a
+        // write in that window gets a transient, safe `ReplicaWrite`.)
+        if let Some(env) = self.env_impl.lock().unwrap().clone() {
+            env.set_replica_write_screen(true);
+        }
+
         let old_state =
             self.node_state.transition_via_unknown(NodeState::Replica)?;
         self.master_tracker.set_master(master_name, 0);
@@ -2984,13 +2996,10 @@ impl ReplicatedEnvironment {
         // path releases it.
         self.update_cleaner_replica_protection();
 
-        // GAP-REPLAY-3: this node is now a REPLICA — screen local user writes
-        // so they fail with ReplicaWriteException (JE: a replica hands out
-        // ReadonlyTxns via ReadonlyTxn.disallowReplicaWrite).  Only the
-        // replication replay stream mutates a replica's databases.
-        if let Some(env) = self.env_impl.lock().unwrap().clone() {
-            env.set_replica_write_screen(true);
-        }
+        // GAP-REPLAY-3 (merge-prep): the replica-write screen was already armed
+        // ABOVE, before the state transition, to avoid a Replica-but-unscreened
+        // window.  (Only the replication replay stream mutates a replica's
+        // databases.)
 
         // --- G19: start replica receive loop --------------------------------
         //
