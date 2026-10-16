@@ -2527,6 +2527,17 @@ impl Environment {
                 "{what}: environment is read-only",
             )));
         }
+        // GAP-REPLAY-3 (merge-prep): a DDL write (remove/truncate/rename
+        // database, DB/catalog creation) is a NameLN write that JE screens on
+        // a replica via `ReadonlyTxn.preLogWithoutLock` -> `disallowReplicaWrite`
+        // -> `ReplicaWriteException` (ReadonlyTxn.java:93-99).  The data-path
+        // `Database::check_writable` already screens put/delete, but this
+        // environment-level DDL path only checked `read_only`, so a user could
+        // truncate/remove/rename a database on a replica and silently diverge
+        // it from the master.  Screen it the same way the data path does.
+        if self.env_impl.lock().is_replica_write_screened() {
+            return Err(NoxuError::ReplicaWrite);
+        }
         Ok(())
     }
 }
@@ -3917,6 +3928,60 @@ mod tests {
 
         drop(db);
         env.close().unwrap();
+    }
+
+    /// GAP-REPLAY-3 (merge-prep) WITNESS: a DDL write (truncate / remove /
+    /// rename a database) on a node that is a REPLICA is refused with
+    /// `NoxuError::ReplicaWrite`, exactly like a data write.  JE screens the
+    /// NameLN/DDL path on a replica via `ReadonlyTxn.preLogWithoutLock` ->
+    /// `disallowReplicaWrite` -> `ReplicaWriteException`.
+    ///
+    /// RED before the merge-prep fix: `Environment::check_writable(what)` only
+    /// checked `read_only`, so `truncate_database`/`remove_database` returned
+    /// Ok on a replica (silent divergence).  GREEN after: both return
+    /// `ReplicaWrite`.
+    #[test]
+    fn gap_replay_3_merge_prep_ddl_screened_on_replica() {
+        let (_tmp, config) = temp_env_config();
+        let env = Environment::open(config).unwrap();
+        let db_config = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
+        let db = env.open_database(None, "ddldb", &db_config).unwrap();
+        db.put(b"k", b"v").unwrap();
+        drop(db);
+
+        // Arm the replica-write screen (as become_replica now does).
+        env.env_impl_arc_for_test().lock().set_replica_write_screen(true);
+
+        // DDL on a replica must be refused with ReplicaWrite.
+        assert!(
+            matches!(
+                env.truncate_database(None, "ddldb"),
+                Err(NoxuError::ReplicaWrite)
+            ),
+            "truncate_database on a replica must return ReplicaWrite"
+        );
+        assert!(
+            matches!(
+                env.rename_database(None, "ddldb", "ddldb2"),
+                Err(NoxuError::ReplicaWrite)
+            ),
+            "rename_database on a replica must return ReplicaWrite"
+        );
+        assert!(
+            matches!(
+                env.remove_database(None, "ddldb"),
+                Err(NoxuError::ReplicaWrite)
+            ),
+            "remove_database on a replica must return ReplicaWrite"
+        );
+
+        // Clearing the screen (become_master) re-enables DDL.
+        env.env_impl_arc_for_test().lock().set_replica_write_screen(false);
+        assert!(env.truncate_database(None, "ddldb").is_ok());
+
+        let _ = env.close();
     }
 }
 
