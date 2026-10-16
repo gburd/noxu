@@ -38,12 +38,14 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use noxu_cleaner::FileProtector;
 use noxu_log::{
     FileManager, LogEntryType, LogManager, Provisional,
     entry::ImmutableFileEntry,
 };
+use noxu_sync::Mutex;
 
 use crate::error::DbiError;
 
@@ -51,6 +53,114 @@ use crate::error::DbiError;
 ///
 /// JE: `FileProtector.BACKUP_NAME` (`FileProtector.java`).
 const BACKUP_PROTECTION_NAME: &str = "Backup";
+
+/// Per-backup invalidation state shared between a live [`DbBackup`] handle and
+/// the environment's [`DbBackupRegistry`].
+///
+/// JE keeps `DbBackup.invalid` + `rollbackStartedFileNumber` as fields on each
+/// `DbBackup`; `RepImpl.invalidateBackups(fileNumber)` iterates every open
+/// backup and flips them (`RepImpl.java:1957`, called from
+/// `Replay.rollback()`). This Arc is the shared cell the registry flips while
+/// the backup is open.
+#[derive(Debug)]
+pub(crate) struct DbBackupState {
+    /// `true` once a concurrent replication rollback has overwritten log files
+    /// from `rollback_file` onward (JE `DbBackup.invalid`).
+    invalid: AtomicBool,
+    /// The file number at which the rollback started (JE
+    /// `DbBackup.rollbackStartedFileNumber`).
+    rollback_file: AtomicU32,
+}
+
+impl DbBackupState {
+    fn new() -> Arc<Self> {
+        Arc::new(DbBackupState {
+            invalid: AtomicBool::new(false),
+            rollback_file: AtomicU32::new(0),
+        })
+    }
+
+    /// JE: `DbBackup.invalidate(fileNumber)` (`DbBackup.java:779`).
+    fn invalidate(&self, file_number: u32) {
+        self.rollback_file.store(file_number, Ordering::SeqCst);
+        self.invalid.store(true, Ordering::SeqCst);
+    }
+
+    fn is_invalid(&self) -> bool {
+        self.invalid.load(Ordering::SeqCst)
+    }
+
+    fn rollback_file(&self) -> u32 {
+        self.rollback_file.load(Ordering::SeqCst)
+    }
+}
+
+/// Environment-side registry of open backups, mirroring JE's
+/// `RepImpl.backups` set + `backupProhibited` flag.
+///
+/// A standalone (non-replicated) environment never prohibits or invalidates
+/// backups, matching JE's base `EnvironmentImpl.addDbBackup` which simply
+/// returns `true`. A replicated environment's rollback path
+/// (`execute_rollback`) calls [`set_backup_prohibited`] /
+/// [`invalidate_backups`] exactly as JE's `Replay.rollback()` calls
+/// `setBackupProhibited` / `invalidateBackups`.
+#[derive(Debug, Default)]
+pub struct DbBackupRegistry {
+    inner: Mutex<DbBackupRegistryInner>,
+}
+
+#[derive(Debug, Default)]
+struct DbBackupRegistryInner {
+    /// Open backups (JE `RepImpl.backups`).
+    backups: Vec<Arc<DbBackupState>>,
+    /// Whether new backups are refused because a rollback is in progress
+    /// (JE `RepImpl.backupProhibited`).
+    prohibited: bool,
+}
+
+impl DbBackupRegistry {
+    /// Register a new backup. Returns `false` if backups are currently
+    /// prohibited (a replication rollback is in progress), in which case the
+    /// caller must refuse to start the backup.
+    ///
+    /// JE: `RepImpl.addDbBackup(backup)` (`RepImpl.java:1935`).
+    fn add(&self, state: &Arc<DbBackupState>) -> bool {
+        let mut inner = self.inner.lock();
+        if inner.prohibited {
+            return false;
+        }
+        inner.backups.push(Arc::clone(state));
+        true
+    }
+
+    /// Deregister a backup on `end_backup`/drop.
+    ///
+    /// JE: `RepImpl.removeDbBackup(backup)` (`RepImpl.java:1949`).
+    fn remove(&self, state: &Arc<DbBackupState>) {
+        let mut inner = self.inner.lock();
+        inner.backups.retain(|b| !Arc::ptr_eq(b, state));
+    }
+
+    /// Invalidate every open backup because a replication rollback has
+    /// overwritten log files from `file_number` onward.
+    ///
+    /// JE: `RepImpl.invalidateBackups(fileNumber)` (`RepImpl.java:1957`),
+    /// called from `Replay.rollback()`.
+    pub fn invalidate_backups(&self, file_number: u32) {
+        let inner = self.inner.lock();
+        for backup in &inner.backups {
+            backup.invalidate(file_number);
+        }
+    }
+
+    /// Set the backup-prohibited status so that new `start_backup` calls are
+    /// refused for the duration of a replication rollback.
+    ///
+    /// JE: `RepImpl.setBackupProhibited(boolean)` (`RepImpl.java:1967`).
+    pub fn set_backup_prohibited(&self, prohibited: bool) {
+        self.inner.lock().prohibited = prohibited;
+    }
+}
 
 /// A JE `DbBackup`-equivalent hot-backup handle.
 ///
@@ -72,6 +182,15 @@ pub struct DbBackup {
     last_file_in_backup: u32,
     /// Whether protection is still held (JE `backupStarted`).
     open: bool,
+    /// Shared invalidation state (JE `DbBackup.invalid`), registered with the
+    /// environment registry for the lifetime of the backup. `None` for a
+    /// standalone backup with no registry (invalidation is a replication-only
+    /// concept; JE's base `addDbBackup` always succeeds and never
+    /// invalidates).
+    state: Option<Arc<DbBackupState>>,
+    /// The environment registry to deregister from on end/drop (JE
+    /// `RepImpl.removeDbBackup`).
+    registry: Option<Arc<DbBackupRegistry>>,
 }
 
 /// Protection reason recorded in the [`FileProtector`] for a network-restore
@@ -92,16 +211,20 @@ impl DbBackup {
     /// checkpoint and tolerates a trailing file that grew after the copy.
     ///
     /// # Errors
-    /// Returns [`DbiError`] if the log files cannot be enumerated.
+    /// Returns [`DbiError`] if the log files cannot be enumerated, or
+    /// [`DbiError::EnvironmentFailure`] (JE `LogOverwriteException`) if a
+    /// replication rollback currently prohibits backups.
     pub(crate) fn start_backup(
         file_protector: Arc<FileProtector>,
         file_manager: Arc<FileManager>,
         log_manager: Option<Arc<LogManager>>,
+        registry: Option<Arc<DbBackupRegistry>>,
     ) -> Result<Self, DbiError> {
         Self::start_backup_inner(
             file_protector,
             file_manager,
             log_manager,
+            registry,
             false,
         )
     }
@@ -122,11 +245,13 @@ impl DbBackup {
         file_protector: Arc<FileProtector>,
         file_manager: Arc<FileManager>,
         log_manager: Option<Arc<LogManager>>,
+        registry: Option<Arc<DbBackupRegistry>>,
     ) -> Result<Self, DbiError> {
         Self::start_backup_inner(
             file_protector,
             file_manager,
             log_manager,
+            registry,
             true,
         )
     }
@@ -135,7 +260,55 @@ impl DbBackup {
         file_protector: Arc<FileProtector>,
         file_manager: Arc<FileManager>,
         log_manager: Option<Arc<LogManager>>,
+        registry: Option<Arc<DbBackupRegistry>>,
         network_restore: bool,
+    ) -> Result<Self, DbiError> {
+        // FID-BACKUP-2 (JE DbBackup.startBackup, DbBackup.java:488): register
+        // this backup with the environment FIRST. If a replication rollback
+        // currently prohibits backups, `add` returns false and JE throws
+        // LogOverwriteException ("A replication operation is overwriting log
+        // files. The backup can not proceed..."). We surface it as an
+        // EnvironmentFailure, the existing variant used for backup refusals.
+        let state = DbBackupState::new();
+        if let Some(reg) = &registry
+            && !reg.add(&state)
+        {
+            return Err(DbiError::EnvironmentFailure {
+                reason: "a replication operation is overwriting log files; \
+                         the backup can not proceed because files may be \
+                         invalid. The backup may be attempted at a later time"
+                    .to_string(),
+            });
+        }
+        // From here on, if we fail before returning the handle we must
+        // deregister so a later rollback does not try to flip a dead state.
+        // The guard removes the state from the registry on drop unless the
+        // handle is successfully built (then it is disarmed).
+        let mut guard = DeregisterGuard {
+            registry: registry.clone(),
+            state: Arc::clone(&state),
+            armed: true,
+        };
+        let backup = Self::build_backup_set(
+            file_protector,
+            file_manager,
+            log_manager,
+            network_restore,
+            state,
+            registry,
+        )?;
+        guard.armed = false;
+        Ok(backup)
+    }
+
+    /// The fallible body of [`start_backup_inner`].
+    fn build_backup_set(
+        file_protector: Arc<FileProtector>,
+        file_manager: Arc<FileManager>,
+        log_manager: Option<Arc<LogManager>>,
+        network_restore: bool,
+        state: Arc<DbBackupState>,
+        registry: Option<Arc<DbBackupRegistry>>,
     ) -> Result<Self, DbiError> {
         // FID-BACKUP-1 (JE DbBackup.startBackup, DbBackup.java:534-549): for a
         // read-write environment, write an "immutable file" marker into the
@@ -244,6 +417,8 @@ impl DbBackup {
             snapshot_files: files,
             last_file_in_backup,
             open: true,
+            state: Some(state),
+            registry,
         })
     }
 
@@ -282,12 +457,34 @@ impl DbBackup {
     ///
     /// Idempotent: calling it more than once (or after a drop-release) is a
     /// no-op.  JE: `endBackup` (`DbBackup.java:588`).
+    ///
+    /// # Errors
+    /// FID-BACKUP-2 (JE `DbBackup.endBackup`, `DbBackup.java:606`): if a
+    /// concurrent replication rollback invalidated this backup, returns a
+    /// [`DbiError::EnvironmentFailure`] (JE `LogOverwriteException`): "A
+    /// replication operation has overwritten log files ... Any copied files
+    /// should be considered invalid and discarded."
     pub fn end_backup(mut self) -> Result<(), DbiError> {
         self.release();
+        if let Some(state) = &self.state
+            && state.is_invalid()
+        {
+            // Mirror JE: clear the flag so a second end_backup is a no-op.
+            return Err(DbiError::EnvironmentFailure {
+                reason: format!(
+                    "a replication operation has overwritten log files from \
+                     file {}. Any copied files should be considered invalid \
+                     and discarded. The backup may be attempted at a later \
+                     time",
+                    state.rollback_file()
+                ),
+            });
+        }
         Ok(())
     }
 
-    /// Releases all protection held by this backup. Shared by
+    /// Releases all protection held by this backup, and deregisters it from
+    /// the environment registry. Shared by
     /// [`end_backup`](DbBackup::end_backup) and [`Drop`].
     fn release(&mut self) {
         if !self.open {
@@ -296,7 +493,31 @@ impl DbBackup {
         for &f in &self.snapshot_files {
             self.file_protector.unprotect_file(f);
         }
+        // JE `RepImpl.removeDbBackup(this)` (`RepImpl.java:1949`).
+        if let (Some(reg), Some(state)) = (&self.registry, &self.state) {
+            reg.remove(state);
+        }
         self.open = false;
+    }
+}
+
+/// Removes a registered [`DbBackupState`] from the registry on drop unless
+/// disarmed. Used by `start_backup_inner` so that a failure between
+/// registration and a successfully returned handle does not leave a dangling
+/// registration a later rollback would flip.
+struct DeregisterGuard {
+    registry: Option<Arc<DbBackupRegistry>>,
+    state: Arc<DbBackupState>,
+    armed: bool,
+}
+
+impl Drop for DeregisterGuard {
+    fn drop(&mut self) {
+        if self.armed
+            && let Some(reg) = &self.registry
+        {
+            reg.remove(&self.state);
+        }
     }
 }
 
@@ -336,6 +557,7 @@ mod tests {
             Arc::clone(&protector),
             Arc::clone(&file_manager),
             None,
+            None,
         )
         .unwrap();
 
@@ -367,6 +589,7 @@ mod tests {
                 Arc::clone(&protector),
                 Arc::clone(&file_manager),
                 None,
+                None,
             )
             .unwrap();
             assert!(protector.is_protected(0));
@@ -388,6 +611,7 @@ mod tests {
         let backup = DbBackup::start_backup(
             Arc::clone(&protector),
             Arc::clone(&file_manager),
+            None,
             None,
         )
         .unwrap();
@@ -430,6 +654,7 @@ mod tests {
             Arc::clone(&protector),
             Arc::clone(&file_manager),
             None,
+            None,
         );
         assert!(
             res.is_err(),
@@ -469,6 +694,7 @@ mod tests {
             Arc::clone(&protector),
             Arc::clone(&file_manager),
             Some(Arc::clone(&log_manager)),
+            None,
         )
         .unwrap();
 
@@ -500,5 +726,105 @@ mod tests {
         );
 
         backup.end_backup().unwrap();
+    }
+
+    /// FID-BACKUP-2 (JE `DbBackup`, `DbBackup.java:488/606`,
+    /// `RepImpl.invalidateBackups`): a concurrent replication rollback that
+    /// overwrites log files in the backup set must invalidate the backup, so
+    /// `end_backup` fails with a `LogOverwriteException` equivalent and the
+    /// copied files are discarded.
+    ///
+    /// Witness: RED at 81b2f048 (no invalidation concept: `end_backup`
+    /// returns `Ok` regardless of a concurrent rollback). GREEN after the fix
+    /// (`invalidate_backups` flips the registered state, `end_backup`
+    /// returns `Err`).
+    #[test]
+    fn concurrent_rollback_invalidates_backup() {
+        let dir = tempdir().unwrap();
+        let file_manager = fm(dir.path());
+        file_manager.create_file(0).unwrap();
+        let protector = Arc::new(FileProtector::new());
+        let registry = Arc::new(DbBackupRegistry::default());
+
+        let backup = DbBackup::start_backup(
+            Arc::clone(&protector),
+            Arc::clone(&file_manager),
+            None,
+            Some(Arc::clone(&registry)),
+        )
+        .unwrap();
+
+        // A replication rollback overwrites log files from file 0 onward
+        // (JE Replay.rollback -> RepImpl.invalidateBackups(fileNumber)).
+        registry.invalidate_backups(0);
+
+        let res = backup.end_backup();
+        assert!(
+            res.is_err(),
+            "end_backup must fail after a concurrent rollback invalidated \
+             the backup set (JE LogOverwriteException)"
+        );
+        assert!(
+            res.unwrap_err().to_string().contains("overwritten log files"),
+            "error must describe the overwrite"
+        );
+    }
+
+    /// FID-BACKUP-2: while a rollback is in progress (`backup_prohibited`),
+    /// starting a new backup must be refused (JE `RepImpl.addDbBackup`
+    /// returns false -> `startBackup` throws `LogOverwriteException`).
+    #[test]
+    fn prohibited_backup_is_refused() {
+        let dir = tempdir().unwrap();
+        let file_manager = fm(dir.path());
+        file_manager.create_file(0).unwrap();
+        let protector = Arc::new(FileProtector::new());
+        let registry = Arc::new(DbBackupRegistry::default());
+
+        registry.set_backup_prohibited(true);
+        let res = DbBackup::start_backup(
+            Arc::clone(&protector),
+            Arc::clone(&file_manager),
+            None,
+            Some(Arc::clone(&registry)),
+        );
+        assert!(
+            res.is_err(),
+            "start_backup must be refused while a rollback prohibits backups"
+        );
+
+        // Once the rollback finishes and un-prohibits, a backup succeeds.
+        registry.set_backup_prohibited(false);
+        let backup = DbBackup::start_backup(
+            Arc::clone(&protector),
+            Arc::clone(&file_manager),
+            None,
+            Some(Arc::clone(&registry)),
+        )
+        .unwrap();
+        backup.end_backup().unwrap();
+    }
+
+    /// A clean backup (no rollback) with a registry must end successfully and
+    /// deregister, so a later rollback does not flip a dead state.
+    #[test]
+    fn clean_backup_with_registry_ends_ok_and_deregisters() {
+        let dir = tempdir().unwrap();
+        let file_manager = fm(dir.path());
+        file_manager.create_file(0).unwrap();
+        let protector = Arc::new(FileProtector::new());
+        let registry = Arc::new(DbBackupRegistry::default());
+
+        let backup = DbBackup::start_backup(
+            Arc::clone(&protector),
+            Arc::clone(&file_manager),
+            None,
+            Some(Arc::clone(&registry)),
+        )
+        .unwrap();
+        backup.end_backup().unwrap();
+
+        // After end_backup, a rollback must not affect anything (deregistered).
+        registry.invalidate_backups(0);
     }
 }

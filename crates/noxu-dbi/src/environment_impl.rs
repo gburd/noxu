@@ -459,6 +459,14 @@ pub struct EnvironmentImpl {
     /// (extended fork).
     extinction_scanner: Mutex<noxu_cleaner::ExtinctionScanner>,
 
+    /// FID-BACKUP-2: registry of open DbBackups + a backup-prohibited
+    /// flag, mirroring JE `RepImpl.backups` / `backupProhibited`. A
+    /// replication rollback (`execute_rollback`) calls
+    /// `invalidate_backups` / `set_backup_prohibited` so a backup whose
+    /// file set was overwritten fails `end_backup`
+    /// (JE `LogOverwriteException`).
+    backup_registry: Arc<crate::db_backup::DbBackupRegistry>,
+
     /// Automatic backup manager.
     ///
     /// Per-file utilization tracker shared between the LogManager write path
@@ -1919,6 +1927,9 @@ impl EnvironmentImpl {
             data_eraser: Mutex::new(noxu_cleaner::DataEraser::new()),
             extinction_scanner: Mutex::new(
                 noxu_cleaner::ExtinctionScanner::new(),
+            ),
+            backup_registry: Arc::new(
+                crate::db_backup::DbBackupRegistry::default(),
             ),
             utilization_tracker,
             cache_usage,
@@ -3771,11 +3782,24 @@ impl EnvironmentImpl {
         // FID-BACKUP-1: pass the log manager so start_backup can log the
         // immutable-file marker and flip the log, sealing the last file in
         // the backup set (JE DbBackup.startBackup, DbBackup.java:534).
+        // FID-BACKUP-2: pass the backup registry so a concurrent
+        // replication rollback can invalidate this backup
+        // (JE RepImpl.addDbBackup / invalidateBackups).
         crate::DbBackup::start_backup(
             file_protector,
             file_manager,
             Some(log_manager),
+            Some(Arc::clone(&self.backup_registry)),
         )
+    }
+
+    /// Returns the backup registry (JE `RepImpl.backups`). The
+    /// replication rollback path uses it to invalidate open backups and
+    /// prohibit new ones for the duration of a rollback.
+    ///
+    /// JE: `RepImpl.invalidateBackups` / `setBackupProhibited`.
+    pub fn backup_registry(&self) -> &Arc<crate::db_backup::DbBackupRegistry> {
+        &self.backup_registry
     }
 
     /// Returns the checkpointer, if one was created.
