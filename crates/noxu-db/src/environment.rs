@@ -4157,6 +4157,84 @@ mod tests {
         env2.close().unwrap();
     }
 
+    /// BUG-REP-SCREEN-RACE (per-lock re-check fidelity): JE re-reads the role
+    /// on EVERY post-begin write-lock acquisition, not just at commit --
+    /// `MasterTxn.lockInternal` (MasterTxn.java:261-287) reads
+    /// `((RepImpl)envImpl).getState()` and `throwNotMaster` (ReplicaWrite /
+    /// UnknownMaster) if the node is no longer the Master, and
+    /// `preLogWithoutLock` (MasterTxn.java:293-302) does the same for the
+    /// log-before-lock case.  A long transaction that keeps WRITING after the
+    /// node is demoted must therefore be refused at the NEXT write op, not
+    /// deferred to commit.
+    ///
+    /// In Noxu the per-op write pre-flight is the dual of JE's per-lock gate:
+    /// every user write op re-reads the replica-write screen
+    /// (`Database::check_writable` / `CursorImpl::check_local_write_allowed`),
+    /// taken as part of the write op exactly as JE acquires the write lock as
+    /// part of the op.  This witness pins that equivalence so a future refactor
+    /// cannot silently drop the per-op re-check and leave only the commit-time
+    /// guard (`gap_replay_3_in_flight_write_refused_at_commit_after_demotion`),
+    /// which would reintroduce the JE-divergence the coordinator asked about: a
+    /// write issued after demotion that is only caught at commit.
+    ///
+    /// Scenario: write #1 while Master (op allowed); demote (screen armed);
+    /// write #2 on the SAME open txn -> refused AT THE OP with `ReplicaWrite`
+    /// (JE `MasterTxn.lockInternal` -> `throwNotMaster`); the txn then aborts
+    /// with nothing durable (neither key present after abort + reopen).
+    ///
+    /// RED if the per-op screen is removed from the write path (write #2 would
+    /// be accepted and only the commit guard would fire); GREEN with the per-op
+    /// screen in place.
+    #[test]
+    fn gap_replay_3_write_after_demotion_refused_at_op_not_deferred_to_commit()
+    {
+        let (tmp, env) = replicated_env();
+        let cfg = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
+        let db = env.open_database(None, "repdb", &cfg).unwrap();
+
+        let txn = env.begin_transaction(None).unwrap();
+        // Write #1 WHILE MASTER (screen clear): the op is allowed.
+        db.put_in(&txn, b"first", b"1").unwrap();
+
+        // The node steps down between write #1 and write #2 (screen armed).
+        env.env_impl_arc_for_test().lock().set_replica_write_screen(true);
+
+        // Write #2 on the SAME open txn, AFTER demotion, must be refused AT THE
+        // OP -- JE `MasterTxn.lockInternal` re-checks the role on this lock and
+        // throws before the LN is logged; it is NOT deferred to commit.
+        let r = db.put_in(&txn, b"second", b"2");
+        assert!(
+            matches!(r, Err(NoxuError::ReplicaWrite)),
+            "a write issued AFTER demotion must be refused at the OP (JE \
+             MasterTxn.lockInternal -> throwNotMaster), not deferred to \
+             commit, got {r:?}"
+        );
+
+        // The txn aborts; nothing durable from either write.
+        txn.abort().expect("abort after refused op");
+        env.env_impl_arc_for_test().lock().set_replica_write_screen(false);
+        assert_eq!(db.get(b"first").unwrap(), None, "write #1 rolled back");
+        assert_eq!(db.get(b"second").unwrap(), None, "write #2 never applied");
+        drop(db);
+        env.close().unwrap();
+
+        let reopen_cfg = EnvironmentConfig::new(tmp.path().to_path_buf())
+            .with_allow_create(true)
+            .with_transactional(true);
+        let env2 = Environment::open(reopen_cfg).unwrap();
+        let db2 = env2.open_database(None, "repdb", &cfg).unwrap();
+        assert_eq!(
+            db2.get(b"first").unwrap(),
+            None,
+            "the aborted txn must leave nothing durable after reopen"
+        );
+        assert_eq!(db2.get(b"second").unwrap(), None);
+        drop(db2);
+        env2.close().unwrap();
+    }
+
     /// GAP-REPLAY-3 WITNESS: the screen is driven by the screen FLAG (armed
     /// only on a replica by `become_replica`), not by anything a standalone
     /// environment ever sets.  A standalone (never-replicated) env never arms
