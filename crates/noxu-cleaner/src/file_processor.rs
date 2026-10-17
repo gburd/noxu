@@ -11,7 +11,7 @@ use noxu_log::LogManager;
 use noxu_txn::{LockManager, LockType, TxnError};
 use noxu_util::Lsn;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 // Review-only seam after READ + data capture, before migration WAL.
@@ -261,12 +261,16 @@ pub enum MigrationOutcome {
 /// or with transaction IDs (transaction IDs come from a different counter
 /// in `TxnManager`).  The range is negative to ensure no collision with
 /// positive transaction IDs.
-static CLEANER_LOCKER_NEXT: AtomicI64 = AtomicI64::new(-1);
+// BUG-LOCKER-ID-COLLISION: the cleaner's migration-probe locker id used to
+// start at -1 (== `NULL_TXN_ID`) and count down, so its first id aliased the
+// null-txn sentinel and later ids could reach JE's reserved replicated band.
+// It now draws from the shared non-txn locker allocator, whose ids are
+// unique, deeply negative, and disjoint from txn ids and the reserved band.
 
 /// Allocates a fresh ephemeral locker ID for a single non-blocking lock
 /// attempt.
 fn next_cleaner_locker_id() -> i64 {
-    CLEANER_LOCKER_NEXT.fetch_sub(1, Ordering::Relaxed)
+    noxu_txn::next_non_txn_locker_id()
 }
 
 /// Real `TreeLookup` implementation backed by a shared `noxu_tree::Tree`.

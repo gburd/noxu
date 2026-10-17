@@ -23,7 +23,7 @@
 use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::Ordering;
 
 use bytes::{Bytes, BytesMut};
 use noxu_log::{LogEntryType, LogManager, Provisional, entry::LnLogEntry};
@@ -116,7 +116,18 @@ pub const EXACT_KEY: u32 = 0x2;
 pub const FOUND_LAST: u32 = 0x4;
 
 /// Unique cursor ID generator.
-static NEXT_CURSOR_ID: AtomicI64 = AtomicI64::new(1);
+///
+/// BUG-LOCKER-ID-COLLISION: a cursor's `id` is also its lock-manager locker
+/// id on the auto-commit path (`lm.lock(lsn, self.id, ..)`), so it MUST be
+/// disjoint from the transaction id space.  It is sourced from the shared
+/// non-txn locker allocator (`noxu_txn::next_non_txn_locker_id`), which
+/// hands out unique deeply-negative ids that can never equal a positive txn
+/// id.  The old `AtomicI64::new(1)` counted up from 1 and collided with txn
+/// ids (both allocators start at 1).
+#[inline]
+fn next_cursor_id() -> i64 {
+    noxu_txn::next_non_txn_locker_id()
+}
 
 // Test-only hook: countdown to forced cursor failure.
 //
@@ -590,7 +601,7 @@ impl CursorImpl {
     pub fn new(db_impl: Arc<RwLock<DatabaseImpl>>, locker_id: i64) -> Self {
         let throughput = db_impl.read().throughput.clone();
         CursorImpl {
-            id: NEXT_CURSOR_ID.fetch_add(1, Ordering::Relaxed),
+            id: next_cursor_id(),
             db_impl,
             locker_id,
             state: CursorState::NotInitialized,
@@ -627,7 +638,7 @@ impl CursorImpl {
     ) -> Self {
         let throughput = db_impl.read().throughput.clone();
         CursorImpl {
-            id: NEXT_CURSOR_ID.fetch_add(1, Ordering::Relaxed),
+            id: next_cursor_id(),
             db_impl,
             locker_id,
             state: CursorState::NotInitialized,
@@ -6863,6 +6874,51 @@ mod tests {
             &config,
         );
         Arc::new(RwLock::new(db_impl))
+    }
+
+    /// Witness for BUG-LOCKER-ID-COLLISION (RED/GREEN gate).
+    ///
+    /// A cursor's `id` doubles as its lock-manager locker id on the
+    /// auto-commit path (`lm.lock(lsn, self.id, ..)`), so it MUST be disjoint
+    /// from the transaction id space.  `TxnManager` allocates positive txn ids
+    /// (`1, 2, 3, ...`); before the fix auto-commit cursor ids ALSO started at
+    /// `1` and counted up, so a cursor id routinely equalled a live txn id and
+    /// the lock manager (which keys solely on the `i64`) conflated them into
+    /// one owner -- an isolation violation and the proximate cause of the
+    /// originally-observed spurious `DeadlockDetected`.
+    ///
+    /// After the fix, cursor ids come from the shared non-txn locker allocator
+    /// and are deeply negative, so no cursor id can ever equal a (positive)
+    /// txn id.  RED before (ids collide / are positive), GREEN after.
+    ///
+    /// Non-vacuity: if `next_cursor_id()` is reverted to a positive counter,
+    /// the `< 0` assertion fails on the very first cursor.
+    #[test]
+    fn cursor_lock_ids_are_in_the_negative_non_txn_band() {
+        // Transaction ids are positive and start at 1.  A cursor id must never
+        // land in that space.  We check the structural invariant directly:
+        // every freshly-allocated cursor id is strictly negative (hence
+        // disjoint from every positive txn id) and in the reserved non-txn
+        // band (<= FIRST_NON_TXN_LOCKER_ID), and successive ids are unique.
+        let db = create_test_database();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1024 {
+            let c = CursorImpl::new(Arc::clone(&db), 0);
+            let id = c.get_id();
+            assert!(
+                id < 0,
+                "BUG-LOCKER-ID-COLLISION: cursor lock id {id} is not negative; \
+                 it can collide with a positive transaction id and conflate \
+                 the cursor and that txn into one lock owner"
+            );
+            assert!(
+                id <= noxu_txn::FIRST_NON_TXN_LOCKER_ID,
+                "cursor lock id {id} is outside the reserved non-txn band \
+                 (<= {})",
+                noxu_txn::FIRST_NON_TXN_LOCKER_ID
+            );
+            assert!(seen.insert(id), "duplicate cursor lock id {id}");
+        }
     }
 
     /// Read the `cursor_count` (descent pin count) directly off a BIN arc.
