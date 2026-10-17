@@ -49,7 +49,7 @@
 //! | `collections` | yes | [`collections`] module — `StoredMap`, `StoredSet`, `StoredList` |
 //! | `persist` | yes | [`persist`] module — `#[derive(Entity)]`, `PrimaryIndex`, `EntityStore` |
 //! | `xa` | yes | [`xa`] module — XA two-phase-commit (`XaEnvironment`) |
-//! | `replication` | no | `replication` module — master-replica HA, elections |
+//! | `replication` | no | `replication` module — master-replica HA, elections (⚠️ user-write replication non-functional in 7.11.x; see the `replication` module docs / R-REPUSER) |
 //! | `replication-tls-rustls` | no | TLS for replication via pure-Rust `rustls` |
 //! | `replication-tls-native` | no | TLS for replication via OS/OpenSSL |
 //! | `observability` | no | `observe` module — `tracing` + `metrics` glue |
@@ -151,6 +151,16 @@ pub mod xa {
 }
 
 /// Master-replica high-availability replication.
+///
+/// **⚠️ v7.11.x: replication does NOT replicate ordinary user writes.**
+/// A committed `db.put`/`delete` on a replicated master is never streamed to
+/// any replica (R-REPUSER / `BUG-REP-USER-WRITES-NOT-REPLICATED`, S1). As of
+/// v7.11.1 the engine fails closed: a data-logging commit on an `Environment`
+/// that has a `ReplicatedEnvironment` installed as its replica-ack coordinator
+/// is refused with `NoxuError::ReplicationNotSupported`, so no application is
+/// silently misled. Elections, group membership, and master transfer work;
+/// only the shipping of user data writes does not. The complete fix lands in
+/// v8.0.0. Do not rely on replication to carry data in 7.11.x.
 #[cfg(feature = "replication")]
 pub mod replication {
     pub use noxu_rep::*;

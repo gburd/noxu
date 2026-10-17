@@ -3,6 +3,22 @@
 > **v2.0 status - GA.** All ten noxu-rep GA blockers identified in
 > the May 2026 audit are closed (Waves 3-3 and 4-A).  The design
 > below now matches the production binary.
+>
+> **⚠️ v7.11.x — replication of ordinary user writes is NOT functional.**
+> Through the public API, a committed `db.put`/`delete` on a replicated master
+> is **never streamed to any replica** (R-REPUSER /
+> `BUG-REP-USER-WRITES-NOT-REPLICATED`, an S1 "replication doesn't replicate"
+> defect present since replication was first written). As of v7.11.1 the engine
+> **fails closed**: a data-logging commit on an `Environment` that has a
+> `ReplicatedEnvironment` installed as its replica-ack coordinator is refused
+> (before the local commit record) with `NoxuError::ReplicationNotSupported`,
+> so no application is silently misled into believing its write was replicated.
+> **Elections, group membership, and master transfer work**; only the shipping
+> of user data writes does not. The complete JE-faithful fix (one write path, a
+> replication context on every log call, per-txn commit VLSN, and DDL replay)
+> lands in **v8.0.0**. Do not rely on replication to carry data in 7.11.x: use a
+> single node, or wait for v8.0.0. See
+> [known limitations](../operations/known-limitations.md).
 
 ## Overview
 
@@ -378,15 +394,29 @@ heartbeats.
 
 **Log shipping architecture:**
 
+> **R-REPUSER caveat (v7.11.x).** The WAL-scanner auto-feed below ships only
+> VLSN-tagged WAL entries, and those are written only by
+> `EnvironmentImpl::log_txn_commit`, which has **no production caller**: the
+> ordinary user commit path (`noxu-db::Transaction::write_txn_end`) logs
+> `TxnCommit` with `NULL_VLSN`, so a `db.put` + commit is **never** auto-fed to
+> any replica. The machinery described here is reachable only by tests that
+> call `log_txn_commit` / `replicate_entry` by hand. 7.11.1 therefore
+> **refuses** a data-logging commit on a replicated master
+> (`NoxuError::ReplicationNotSupported`) rather than let it silently drop. The
+> real wire-up (fold VLSN assignment into the one user write path) is v8.0.0.
+> See the chapter banner and
+> [known limitations](../operations/known-limitations.md).
+
 - **Active push path + WAL-scanner auto-feed (v3.2.0+, completed v4.0.0)**:
   Call `register_feeder_channel(replica_name, channel)` and
   `with_environment(env_impl)` before `become_master`. A `FeederRunner`
   background thread is spawned per channel. When `with_environment` has
   been called the thread uses an `EnvironmentLogScanner` that reads
-  VLSN-tagged WAL entries written by `log_txn_commit` directly—no
-  `replicate_entry` call needed. Without a wired `EnvironmentImpl` the
-  thread falls back to reading from the in-memory queue populated by
-  `replicate_entry` / `apply_entry`.
+  VLSN-tagged WAL entries. **Those entries are produced only by
+  `log_txn_commit` (zero production callers in 7.11.x) — a real `db.put` +
+  commit logs `NULL_VLSN` and is skipped, so it is NOT auto-fed** (R-REPUSER).
+  Without a wired `EnvironmentImpl` the thread falls back to reading from the
+  in-memory queue populated by `replicate_entry` / `apply_entry`.
 - **Pull path (default)**: Replicas connect to the master's `PEER_FEEDER`
   service (registered on the `TcpServiceDispatcher`) and pull entries from
   the shared `PeerLogScanner` queue (populated by `replicate_entry`).  The
@@ -416,11 +446,15 @@ heartbeats.
   the master's commit-durability quorum (see
   [known limitations](../operations/known-limitations.md)).  Default is off;
   with it off all replicas stream from the master directly.
-- **EnvironmentLogScanner** (active, v4.0.0): Scans master WAL files
+- **EnvironmentLogScanner** (v4.0.0): Scans master WAL files
   directly for VLSN-tagged entries (`REPLICATED_MASK | VLSN_PRESENT_MASK`).
   Entries are produced by `LogManager::log_with_vlsn` called from
   `EnvironmentImpl::log_txn_commit` when a VLSN counter is installed via
-  `ReplicatedEnvironment::with_environment`. C-C2b qualification closed.
+  `ReplicatedEnvironment::with_environment`. **R-REPUSER: `log_txn_commit` has
+  no production caller, so no VLSN-tagged entry is ever written for an ordinary
+  user commit — the scanner finds nothing to ship for a `db.put`.** C-C2b
+  qualified the scanner mechanics against hand-tagged entries only; it did not
+  qualify the public write path.
 - **EnvironmentLogWriter** (replica side): Receives log entries from the
   `ReplicaStream` and writes them into the replica's local log, advancing the
   local VLSN as entries are durably written.

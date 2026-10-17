@@ -820,6 +820,30 @@ impl Environment {
             ));
         }
 
+        // R-REPUSER (BUG-REP-USER-WRITES-NOT-REPLICATED, S1): refuse DDL that
+        // CREATES a new database on a master-wired env.  A create logs a
+        // NameLN/MapLN that is NOT shipped to replicas in 7.11.x (DDL replay is
+        // missing), so creating a database here would silently diverge the
+        // group.  Scope the refusal to an actual create (allow_create AND the
+        // name is not already a committed database) so re-OPENING an existing
+        // database (a read) still works -- tests open databases BEFORE wiring
+        // the coordinator; only a create AFTER wiring is refused.  JE screens
+        // the NameLN write at the operation (`DbTree.doCreateDb` ->
+        // `checkReplicaWrite`).
+        if config.allow_create {
+            let env_impl = self.env_impl.lock();
+            if let Some(reason) = env_impl.refuse_user_writes_reason() {
+                let already =
+                    env_impl.get_database_names().iter().any(|n| n == name);
+                drop(env_impl);
+                if !already {
+                    return Err(NoxuError::ReplicationNotSupported {
+                        reason: reason.to_string(),
+                    });
+                }
+            }
+        }
+
         // NEW-TXN-1: reject a closed / non-open transaction, mirroring the
         // data path.  JE rejects ANY operation on a closed Locker/Transaction
         // (TxnEndTest.testClose: `env.openDatabase(closedTxn, ...)` throws).
@@ -1637,11 +1661,39 @@ impl Environment {
     /// rep_env.with_environment(env_impl);
     /// ```
     ///
+    /// **R-REPUSER (v7.11.x): fail-closed.** Installing a
+    /// `noxu_rep::ReplicatedEnvironment` here does NOT make ordinary user
+    /// writes replicate — the user write path never assigns a VLSN, so the
+    /// feeder skips every user write (`BUG-REP-USER-WRITES-NOT-REPLICATED`,
+    /// S1). To avoid silently misleading an application, EVERY subsequent
+    /// public user write on this environment — auto-commit `put`/`delete`, an
+    /// explicit transaction's `put_in`, cursor writes, non-transactional
+    /// writes, and DDL (create/remove/rename/truncate) — is **refused at the
+    /// operation, before anything is logged**, with
+    /// [`NoxuError::ReplicationNotSupported`]. Elections, group membership,
+    /// and master transfer still work on the `ReplicatedEnvironment` itself;
+    /// only the shipping of user writes does not. The complete fix lands in
+    /// v8.0.0. See `docs/src/operations/known-limitations.md`.
+    ///
     /// Closes finding F1 of the 2026 review.
     pub fn set_replica_coordinator(
         &self,
         coord: noxu_dbi::SharedReplicaAckCoordinator,
     ) {
+        // R-REPUSER (BUG-REP-USER-WRITES-NOT-REPLICATED, S1): if the installed
+        // coordinator reports it CANNOT replicate ordinary user writes in this
+        // release (the real `noxu_rep::ReplicatedEnvironment` does in 7.11.x),
+        // arm the env-level fail-closed flag so EVERY public user-write path --
+        // explicit-txn commit, auto-commit `db.put`/`delete`, cursor writes,
+        // non-transactional writes, DDL, sequences, DPL, collections, XA --
+        // refuses the write BEFORE any LN is logged, not just the explicit-txn
+        // commit path.  A test-double / honest coordinator returns `None` and
+        // nothing is armed.  See `EnvironmentImpl::refuse_user_writes_reason`.
+        if let Some(reason) = coord.refuse_user_write_commit() {
+            self.env_impl.lock().set_refuse_user_writes(reason);
+        } else {
+            self.env_impl.lock().clear_refuse_user_writes();
+        }
         *self.replica_coordinator.lock() = Some(coord);
     }
 
@@ -1650,6 +1702,9 @@ impl Environment {
     /// Subsequent `commit_with_durability` calls revert to local-only
     /// durability semantics.
     pub fn clear_replica_coordinator(&self) {
+        // R-REPUSER: dropping the coordinator also disarms the fail-closed
+        // user-write refusal (back to local-only durability).
+        self.env_impl.lock().clear_refuse_user_writes();
         *self.replica_coordinator.lock() = None;
     }
 
@@ -2557,20 +2612,20 @@ impl Environment {
                 "{what}: environment is read-only",
             )));
         }
-        // GAP-REPLAY-3: a DDL write (remove/truncate/rename a database) is a
-        // NameLN write.  JE screens it on a replica via `DbTree.lockNameLN` ->
-        // `checkReplicaWrite(locker, dbImpl.getOperationRepContext(op))`,
-        // whose `mustGenerateVLSN()` is true iff the TARGET DB `isReplicated()`
-        // (DbTree.java:907-931).  Equivalently, `ReadonlyTxn.preLogWithoutLock`
-        // screens only when `!database.allowReplicaWrite()` =
-        // `isReplicated() && dbType != NAME` (ReadonlyTxn.java:93-99,
-        // DatabaseImpl.java:785).  So a DDL op on a NON-replicated (local) DB
-        // is permitted on a replica -- the screen is gated on the target DB's
-        // `allow_replica_write`, matching JE exactly, NOT unconditional.
-        // Resolve both facts under a SINGLE lock acquisition: `env_impl` is a
-        // non-reentrant `noxu_sync::Mutex`, so taking it twice in one `&&`
-        // expression would risk holding the first guard across the second
-        // `lock()`.  One guard, both reads.
+        // R-REPUSER (BUG-REP-USER-WRITES-NOT-REPLICATED, S1): on a MASTER-wired
+        // env, DDL (remove / truncate / rename) logs a NameLN / MapLN that is
+        // NOT shipped to replicas in 7.11.x (DDL replay is missing), so refuse
+        // it fail-closed FIRST, same as data writes.
+        if let Some(reason) = self.env_impl.lock().refuse_user_writes_reason() {
+            return Err(NoxuError::ReplicationNotSupported {
+                reason: reason.to_string(),
+            });
+        }
+        // GAP-REPLAY-3: a DDL write is a NameLN write.  JE screens it on a
+        // replica via `DbTree.lockNameLN` -> `checkReplicaWrite`, gated on the
+        // TARGET DB's `allow_replica_write` (`isReplicated() && dbType != NAME`),
+        // so a DDL op on a NON-replicated (local) DB is permitted on a replica.
+        // One guard, both reads (`env_impl` is a non-reentrant Mutex).
         {
             let ei = self.env_impl.lock();
             if ei.is_replica_write_screened()

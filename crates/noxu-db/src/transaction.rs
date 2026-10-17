@@ -454,6 +454,25 @@ impl Transaction {
         // txn without re-locking the inner Txn.
         let logged_data = self.has_logged_data();
 
+        // R-REPUSER (BUG-REP-USER-WRITES-NOT-REPLICATED, S1): belt-and-braces
+        // commit-path refusal.  The primary refusal is at the write op
+        // (`Database::check_writable` / cursor pre-flight), so a data-logging
+        // txn on a master-wired env is normally refused before anything is
+        // logged.  This guards the residual case where a txn somehow logged
+        // data on a refusing env (e.g. a write path that bypassed the op-level
+        // check): refuse the commit BEFORE the TxnCommit frame so the local
+        // write is not durably committed (rolled back on abort).  Empty /
+        // read-only txns (`!logged_data`) are unaffected.
+        if !self.read_only
+            && logged_data
+            && let Some(env) = self.env_impl.as_ref()
+            && let Some(reason) = env.lock().refuse_user_writes_reason()
+        {
+            return Err(NoxuError::ReplicationNotSupported {
+                reason: reason.to_string(),
+            });
+        }
+
         // Write TxnCommit to the WAL before marking committed.
         // Durability controls whether we fsync, flush, or just buffer.
         //

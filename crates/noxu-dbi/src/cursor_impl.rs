@@ -309,6 +309,18 @@ pub struct CursorImpl {
     /// `dbImpl.getDbType().isInternal()`).
     disk_limit: Option<Arc<crate::disk_limit::DiskLimitTracker>>,
 
+    /// R-REPUSER (`BUG-REP-USER-WRITES-NOT-REPLICATED`, S1): cached fail-closed
+    /// flag.  When `Some(true)`, this data env is wired to a coordinator that
+    /// cannot replicate ordinary user writes, so a user write through this
+    /// cursor is refused with `DbiError::ReplicationNotSupported` BEFORE
+    /// anything is logged -- the backstop for cursor-level auto-commit writes
+    /// that do not pass through `Database::check_writable`.  Cloned from
+    /// `EnvironmentImpl::refuse_user_writes_flag()` at open (same pattern as
+    /// `env_invalid` / `disk_limit`).  `None` outside a real env (unit tests)
+    /// and for internal databases, which are exempt (they must keep writing to
+    /// serve the engine).
+    refuse_user_writes: Option<Arc<std::sync::atomic::AtomicBool>>,
+
     /// Per-operation record expiration (packed hours since the Unix epoch,
     /// 0 = never expires) for the NEXT `put`.
     ///
@@ -609,6 +621,7 @@ impl CursorImpl {
             txn_manager: None,
             throughput,
             disk_limit: None,
+            refuse_user_writes: None,
             pending_expiration: 0,
             // JE ENV_TTL_MAX_TXN_TIME default (24h); overridden via
             // with_ttl_max_txn_time when the env config supplies a value.
@@ -646,6 +659,7 @@ impl CursorImpl {
             txn_manager: None,
             throughput,
             disk_limit: None,
+            refuse_user_writes: None,
             pending_expiration: 0,
             // JE ENV_TTL_MAX_TXN_TIME default (24h); overridden via
             // with_ttl_max_txn_time when the env config supplies a value.
@@ -733,6 +747,18 @@ impl CursorImpl {
         disk_limit: Arc<crate::disk_limit::DiskLimitTracker>,
     ) -> Self {
         self.disk_limit = Some(disk_limit);
+        self
+    }
+
+    /// R-REPUSER: wires the cached user-write refusal flag so a user write on a
+    /// master-wired data env is refused before anything is logged.  The caller
+    /// must NOT wire this for internal databases (same exemption as
+    /// `with_disk_limit`): the engine's own writes must never be refused.
+    pub fn with_refuse_user_writes(
+        mut self,
+        flag: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        self.refuse_user_writes = Some(flag);
         self
     }
 
@@ -1530,6 +1556,31 @@ impl CursorImpl {
             return Err(DbiError::DiskLimitExceeded {
                 used: dl.last_total_log_size(),
                 limit: dl.effective_limit(),
+            });
+        }
+        Ok(())
+    }
+
+    /// R-REPUSER: refuses a user write on a master-wired data env that cannot
+    /// replicate user writes in this release.  A single cached atomic load on
+    /// the fast (allowed) path; refuses BEFORE anything is logged, mirroring JE
+    /// `Cursor.checkUpdatesAllowed`.  Internal databases never wire the flag,
+    /// so engine writes are never refused.  Backstop for cursor-level
+    /// auto-commit writes that bypass `Database::check_writable`.
+    #[inline]
+    fn check_user_writes_allowed(&self) -> Result<(), DbiError> {
+        if let Some(flag) = self.refuse_user_writes.as_ref()
+            && flag.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(DbiError::ReplicationNotSupported {
+                reason: "replication of ordinary user writes is not functional \
+                         in 7.11.x (R-REPUSER / \
+                         BUG-REP-USER-WRITES-NOT-REPLICATED); a committed write \
+                         would not be streamed to any replica. Use a single \
+                         node or wait for the v8.0.0 fix. See \
+                         docs/src/operations/known-limitations.md and the \
+                         replication chapter."
+                    .to_string(),
             });
         }
         Ok(())
@@ -5641,6 +5692,7 @@ impl CursorImpl {
         // anything is logged or the tree is mutated, and before delegating to
         // put_dup so the sorted-dup path is gated too.
         self.check_disk_limit()?;
+        self.check_user_writes_allowed()?;
         self.check_local_write_allowed()?;
 
         // For sorted-dup databases: encode (key, data) as a two-part composite
@@ -6412,6 +6464,7 @@ impl CursorImpl {
         // like put (JE: Cursor.checkUpdatesAllowed gates delete too). The
         // cleaner reclaims the space later. (JE: DiskLimitException.)
         self.check_disk_limit()?;
+        self.check_user_writes_allowed()?;
         self.check_local_write_allowed()?;
 
         // D3: if the slot has already been deleted by a concurrent operation,

@@ -118,6 +118,24 @@ impl CountingCoord {
     }
 }
 
+/// R-REPUSER: a coordinator that reports it CANNOT replicate user writes in
+/// this release (what the real `noxu_rep::ReplicatedEnvironment` does in
+/// 7.11.x). A DPL write under this coordinator must be refused fail-closed.
+struct RefusingCoord;
+
+impl ReplicaAckCoordinator for RefusingCoord {
+    fn await_replica_acks(
+        &self,
+        _policy: ReplicaAckPolicyKind,
+        _timeout: Duration,
+    ) -> std::result::Result<u32, AckWaitError> {
+        Ok(0)
+    }
+    fn refuse_user_write_commit(&self) -> Option<&'static str> {
+        Some("R-REPUSER: user writes not replicated in 7.11.x (test)")
+    }
+}
+
 impl ReplicaAckCoordinator for CountingCoord {
     fn await_replica_acks(
         &self,
@@ -270,4 +288,57 @@ fn dpl_auto_commit_write_bypasses_coordinator() {
         "auto-commit DPL writes bypass Environment::begin_transaction and so \
          do NOT consult the replica-ack coordinator (documented edge)"
     );
+}
+
+// ─── R-REPUSER: a DPL write under a REFUSING coordinator is refused ───────
+
+/// R-REPUSER (BUG-REP-USER-WRITES-NOT-REPLICATED, S1): a DPL `PrimaryIndex::put`
+/// on a data env wired to a coordinator that cannot replicate user writes is
+/// refused fail-closed (`NoxuError::ReplicationNotSupported`), proving the DPL
+/// path funnels through the same env-level write pre-flight as any other
+/// write. This closes the auto-commit/explicit gap for the persistence layer.
+#[test]
+fn dpl_write_under_refusing_coordinator_is_refused() {
+    use noxu_db::error::NoxuError;
+    let (_td, env) = temp_env();
+
+    // Open the entity store (which creates its catalog databases) BEFORE
+    // wiring the coordinator — a real app sets up its stores, then enters
+    // replicated mode.  Creating databases AFTER a refusing coordinator is
+    // installed is itself refused (DDL NameLN is not shipped), covered by the
+    // DDL witnesses in `rep_user_write_paths_probe.rs`.
+    let mut store = EntityStore::open(
+        &env,
+        StoreConfig::new("rstore")
+            .with_allow_create(true)
+            .with_transactional(true),
+    )
+    .unwrap();
+    let primary: PrimaryIndex<u64, Widget> = store.get_primary_index().unwrap();
+    let ser = WidgetSerializer;
+
+    let coord = Arc::new(RefusingCoord);
+    env.set_replica_coordinator(coord);
+
+    let dur = Durability::new(
+        SyncPolicy::NoSync,
+        SyncPolicy::NoSync,
+        ReplicaAckPolicy::SimpleMajority,
+    );
+    let txn = env
+        .begin_transaction(Some(&TransactionConfig::new().with_durability(dur)))
+        .unwrap();
+    let w = Widget { id: 7, label: "refused".into() };
+    // The DPL put routes through Database::put_in -> check_writable, which
+    // refuses before any LN is logged.
+    let res = primary.put(Some(&txn), &ser, &w);
+    match res {
+        Err(PersistError::DatabaseError(
+            NoxuError::ReplicationNotSupported { reason },
+        )) => assert!(!reason.is_empty(), "refusal must carry a reason"),
+        other => panic!(
+            "expected ReplicationNotSupported (R-REPUSER), got {other:?}"
+        ),
+    }
+    let _ = txn.abort();
 }

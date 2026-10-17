@@ -135,6 +135,38 @@ pub trait ReplicaAckCoordinator: Send + Sync {
         timeout: Duration,
     ) -> std::result::Result<u32, AckWaitError>;
 
+    /// Fail-closed guard for R-REPUSER (`BUG-REP-USER-WRITES-NOT-REPLICATED`).
+    ///
+    /// Returns `Some(reason)` when this coordinator represents a replication
+    /// subsystem that **cannot actually replicate ordinary user writes** in
+    /// the current release, so `Transaction::commit_with_durability` must
+    /// REFUSE a data-logging commit (before writing the `TxnCommit` frame)
+    /// rather than silently accept-and-drop it.  Returns `None` (the default)
+    /// for any coordinator whose commit path is honest -- a test double, a
+    /// local-only durability stub, or (in a future release) a coordinator that
+    /// genuinely ships user writes.
+    ///
+    /// Background: in 7.11.x the ordinary user commit path
+    /// (`noxu-db::Transaction::write_txn_end`) logs `TxnCommit` with
+    /// `NULL_VLSN` and never routes through the VLSN-assigning path, so the
+    /// feeder (which ships only VLSN-tagged entries) skips every user commit --
+    /// the write is NEVER streamed to any replica even though a
+    /// `ReplicatedEnvironment` is installed.  Under ack policy `None` the
+    /// commit would "succeed" locally (silent data divergence); under
+    /// `SimpleMajority`/`All` it would block the full ack timeout and return
+    /// `InsufficientReplicas` (a misleading error -- nothing was ever sent).
+    /// Both are the S1 "replication doesn't replicate" defect.  The complete
+    /// JE-faithful fix (one write path, a `ReplicationContext` on every log
+    /// call, per-txn commit VLSN, DDL replay) is a v8.0.0 feature; 7.11.x
+    /// ships fail-closed so no application is silently misled.
+    ///
+    /// `#[doc(hidden)]`: additive, defaulted, internal cross-crate wiring --
+    /// not part of the stable surface.
+    #[doc(hidden)]
+    fn refuse_user_write_commit(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Allocate the next commit VLSN and register `lsn` in the VLSN index.
     ///
     /// Called by `Environment::write_txn_commit_for_recovered` after

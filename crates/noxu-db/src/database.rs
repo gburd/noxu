@@ -95,6 +95,11 @@ pub struct Database {
     /// Wired into each user cursor so the write path can refuse writes while a
     /// disk limit is violated without locking `env_impl`.
     disk_limit: Option<Arc<noxu_dbi::disk_limit::DiskLimitTracker>>,
+    /// R-REPUSER: cached fail-closed flag, cloned from
+    /// `EnvironmentImpl::refuse_user_writes_flag()` at open (None for internal
+    /// DBs, like `disk_limit`).  Handed to each user cursor so a cursor-level
+    /// auto-commit write is refused before anything is logged.
+    refuse_user_writes: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Cached environment-invalidity flag (X-13).
     ///
     /// Cloned from `EnvironmentImpl::is_invalid_flag()` at `Database::new()`
@@ -231,6 +236,10 @@ impl Database {
                 // Gate user writes on the disk limit (None for internal DBs).
                 if let Some(dl) = &self.disk_limit {
                     c = c.with_disk_limit(Arc::clone(dl));
+                }
+                // R-REPUSER: gate user writes fail-closed (None for internal DBs).
+                if let Some(flag) = &self.refuse_user_writes {
+                    c = c.with_refuse_user_writes(Arc::clone(flag));
                 }
                 c
             }
@@ -633,6 +642,13 @@ impl Database {
         } else {
             Some(env_impl.lock().get_disk_limit())
         };
+        // R-REPUSER: same internal-DB exemption as disk_limit -- the engine's
+        // own internal-DB writes must never be refused.
+        let refuse_user_writes = if db_impl.read().get_db_type().is_internal() {
+            None
+        } else {
+            Some(env_impl.lock().refuse_user_writes_flag())
+        };
         Database {
             name,
             id,
@@ -644,6 +660,7 @@ impl Database {
             lock_manager,
             log_manager,
             disk_limit,
+            refuse_user_writes,
             env_invalid,
             replica_write_screen,
             cleaner_throttle,
@@ -707,6 +724,7 @@ impl Database {
             lock_manager: Arc::clone(&self.lock_manager),
             log_manager: self.log_manager.clone(),
             disk_limit: self.disk_limit.clone(),
+            refuse_user_writes: self.refuse_user_writes.clone(),
             env_invalid: Arc::clone(&self.env_invalid),
             replica_write_screen: Arc::clone(&self.replica_write_screen),
             cleaner_throttle: self.cleaner_throttle.clone(),
@@ -2384,18 +2402,22 @@ impl Database {
         if self.config.read_only {
             return Err(NoxuError::ReadOnly);
         }
-        // GAP-REPLAY-3 (JE-exact ordering): the replica-write screen and the
-        // replicated/local-write config-mismatch rule are BOTH enforced in
-        // `CursorImpl::check_local_write_allowed`, in JE's order
-        // (`Cursor.checkUpdatesAllowed` config check first, then the
-        // `ReadonlyTxn.lockInternal` replica screen).  That is the only site
-        // with both the target DB's `is_replicated()` and the locker's
-        // `is_local_write()`, so it alone can reproduce JE's exact observable
-        // error for every combination (e.g. a local-write txn on a replicated
-        // DB must report the config mismatch, NOT `ReplicaWrite`).  This
-        // pre-flight therefore screens only `read_only`; every write path
-        // (put/delete/putNoOverwrite/putNoDupData) opens a cursor carrying the
-        // replica-write screen, so the JE-ordered check always runs.
+        // R-REPUSER (BUG-REP-USER-WRITES-NOT-REPLICATED, S1): refuse a user
+        // write on a MASTER-wired data env, BEFORE any LN is logged.  Covers
+        // every `Database` write (put / put_in / put_no_overwrite* /
+        // put_partial / delete* / delete_in) and the auto-commit path.  JE
+        // refuses at the operation (`Cursor.checkUpdatesAllowed` /
+        // `RepImpl.checkIfMaster`), not at commit.
+        if let Some(reason) = self.env_impl.lock().refuse_user_writes_reason() {
+            return Err(NoxuError::ReplicationNotSupported {
+                reason: reason.to_string(),
+            });
+        }
+        // GAP-REPLAY-3: the REPLICA-side write screen and the replicated/
+        // local-write config-mismatch rule are enforced in
+        // `CursorImpl::check_local_write_allowed` (JE's order); every write
+        // path opens a cursor carrying that screen, so it always runs on a
+        // replica.
         Ok(())
     }
 

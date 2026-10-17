@@ -4794,6 +4794,30 @@ impl ReplicatedEnvironment {
 //
 // Closes finding F1 of the 2026 review.
 impl ReplicaAckCoordinator for ReplicatedEnvironment {
+    /// R-REPUSER (`BUG-REP-USER-WRITES-NOT-REPLICATED`, S1): fail closed.
+    ///
+    /// A `ReplicatedEnvironment` installed as a data env's replica-ack
+    /// coordinator cannot actually replicate ordinary user writes in 7.11.x --
+    /// the user commit path logs `TxnCommit` with `NULL_VLSN`, so the feeder
+    /// (which ships only VLSN-tagged entries) skips every user commit and the
+    /// write is NEVER streamed to any replica.  Report that so
+    /// `Transaction::commit_with_durability` refuses a data-logging commit
+    /// (before the local commit record) instead of silently accept-and-dropping
+    /// it or blocking the full ack timeout with a misleading
+    /// `InsufficientReplicas`.  The complete JE-faithful fix lands in v8.0.0;
+    /// elections, group membership, master transfer, and the feeder/ack
+    /// machinery (exercised directly by the rep-layer tests) are unaffected.
+    fn refuse_user_write_commit(&self) -> Option<&'static str> {
+        Some(
+            "replication of ordinary user writes is not functional in 7.11.x \
+             (R-REPUSER / BUG-REP-USER-WRITES-NOT-REPLICATED); a committed \
+             write would not be streamed to any replica. Use a single node or \
+             wait for the v8.0.0 fix. See \
+             docs/src/operations/known-limitations.md and the replication \
+             chapter.",
+        )
+    }
+
     fn await_replica_acks(
         &self,
         policy: ReplicaAckPolicyKind,

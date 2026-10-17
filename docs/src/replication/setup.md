@@ -4,6 +4,22 @@
 > May 2026 audit are closed in v2.0 (Waves 3-3 and 4-A). See
 > Wave 4-A report for
 > per-finding resolution notes.
+>
+> **⚠️ v7.11.x — replication of ordinary user writes is NOT functional.**
+> Through the public API, a committed `db.put`/`delete` on a replicated master
+> is **never streamed to any replica** (R-REPUSER /
+> `BUG-REP-USER-WRITES-NOT-REPLICATED`, an S1 "replication doesn't replicate"
+> defect present since replication was first written). As of v7.11.1 the engine
+> **fails closed**: a data-logging commit on an `Environment` that has a
+> `ReplicatedEnvironment` installed as its replica-ack coordinator is refused
+> (before the local commit record) with `NoxuError::ReplicationNotSupported`,
+> so no application is silently misled into believing its write was replicated.
+> **Elections, group membership, and master transfer work**; only the shipping
+> of user data writes does not. The complete JE-faithful fix (one write path, a
+> replication context on every log call, per-txn commit VLSN, and DDL replay)
+> lands in **v8.0.0**. Do not rely on replication to carry data in 7.11.x: use a
+> single node, or wait for v8.0.0. See
+> [known limitations](../operations/known-limitations.md).
 
 This page covers how to configure and start a Noxu DB replicated environment.
 
