@@ -5,6 +5,8 @@
 
 use noxu_sync::RwLock;
 use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// The possible states of a replication node.
@@ -131,6 +133,29 @@ pub struct NodeStateMachine {
     state_change_time: RwLock<Instant>,
     /// Total number of state transitions that have occurred.
     transition_count: RwLock<u64>,
+    /// GAP-REPLAY-3 / BUG-REP-SCREEN-RACE: the shared replica-write screen,
+    /// wired once the live `EnvironmentImpl` is attached
+    /// ([`ReplicatedEnvironment::with_environment`]).
+    ///
+    /// The screen is a pure FUNCTION of the role: armed iff the node is a
+    /// `Replica` (the dual of JE deriving the write-allow decision from
+    /// `RepImpl.isMaster()` at locker-creation time, `createRepUserTxn`:
+    /// `isMaster() ? MasterTxn : ReadonlyTxn`), rather than carried in a
+    /// separately-mutable flag.  We honour that invariant by flipping the
+    /// screen INSIDE the single state write lock that performs the role
+    /// transition (see [`Self::apply_transition_locked`]), so the (role,
+    /// screen) pair is updated atomically.  Before this field existed,
+    /// `become_master` / `become_replica` stored the screen OUTSIDE the state
+    /// lock in opposite orders, so a concurrent transition (election-driver
+    /// daemon + a master-transfer handler + an application thread are all
+    /// real callers) could leave `role == Replica` with the screen CLEARED
+    /// -- the S2 silent-divergence hole (a replica accepting a local user
+    /// write) and the `gap_replay_3_write_screen_test` flake.
+    ///
+    /// `None` until an env is wired (standalone / pre-wiring); the write path
+    /// gates the screen on `is_replicated()` anyway, so a `None` here never
+    /// weakens a standalone env.
+    write_screen: RwLock<Option<Arc<AtomicBool>>>,
 }
 
 /// Test-only deterministic witness hook (BUG-REP-STATE-TOCTOU).
@@ -164,7 +189,69 @@ impl NodeStateMachine {
             state: RwLock::new(NodeState::Detached),
             state_change_time: RwLock::new(Instant::now()),
             transition_count: RwLock::new(0),
+            write_screen: RwLock::new(None),
         }
+    }
+
+    /// The replica-write screen value implied by `state`.
+    ///
+    /// Armed (`true`) iff the node is a `Replica`.  This is exactly the
+    /// arm/clear semantics the former out-of-lock stores implemented
+    /// (`become_replica` armed, `become_master` cleared); the ONLY change here
+    /// is that the value is now derived from the role and stored INSIDE the
+    /// single state write lock, so the (role, screen) pair is updated
+    /// atomically and a concurrent transition can never leave a `Replica`
+    /// unscreened.  (Unknown / Detached keep the screen cleared, preserving
+    /// the "a fresh env must not screen writes" and standalone-env contracts;
+    /// the write path independently gates the screen on `is_replicated()`.)
+    ///
+    /// JE derives the write-allow decision from `RepImpl.isMaster()` at
+    /// locker-creation time (`createRepUserTxn`: `isMaster() ? MasterTxn :
+    /// ReadonlyTxn`); here the screen is the dual of that one role read,
+    /// captured atomically with the transition rather than in a free-floating
+    /// flag another thread can overwrite.
+    #[inline]
+    fn screen_for(state: NodeState) -> bool {
+        matches!(state, NodeState::Replica)
+    }
+
+    /// Wire the shared replica-write screen handle (GAP-REPLAY-3 /
+    /// BUG-REP-SCREEN-RACE).
+    ///
+    /// Called from [`ReplicatedEnvironment::with_environment`] once the live
+    /// `EnvironmentImpl` exists.  Takes the state read lock so the screen is
+    /// seeded to the value implied by the CURRENT role atomically with any
+    /// concurrent transition: if the node is already a Replica when the env is
+    /// wired, the screen comes up armed; if already Master, cleared.
+    pub fn set_write_screen(&self, handle: Arc<AtomicBool>) {
+        // Order: take the state lock first, then publish the handle, so a
+        // transition that races `set_write_screen` either (a) runs before us
+        // and leaves `state` final -- we then seed the correct value -- or
+        // (b) runs after us and sees the published handle and flips it under
+        // its own state-lock critical section.  Either way the pair ends
+        // consistent.
+        let state = self.state.read();
+        handle.store(Self::screen_for(*state), Ordering::SeqCst);
+        *self.write_screen.write() = Some(handle);
+    }
+
+    /// Read the `(role, screen)` pair ATOMICALLY, under the state read lock.
+    ///
+    /// Returns the current [`NodeState`] and the screen value (`None` if no
+    /// screen handle has been wired).  Because the screen is now flipped only
+    /// inside the state write lock ([`Self::apply_transition_locked`]),
+    /// sampling both under the state read lock yields a consistent pair: no
+    /// transition can be mid-flight.  This is the sound observation point for
+    /// the `gap_replay_3` composite-invariant witness (role == Replica =>
+    /// screen armed; role == Master => screen cleared).
+    pub fn role_and_screen(&self) -> (NodeState, Option<bool>) {
+        let state = self.state.read();
+        let screen = self
+            .write_screen
+            .read()
+            .as_ref()
+            .map(|h| h.load(Ordering::Relaxed));
+        (*state, screen)
     }
 
     /// Install the test-only mid-transition hook (BUG-REP-STATE-TOCTOU
@@ -240,6 +327,20 @@ impl NodeStateMachine {
         *state = new_state;
         *self.state_change_time.write() = Instant::now();
         *self.transition_count.write() += 1;
+
+        // GAP-REPLAY-3 / BUG-REP-SCREEN-RACE: flip the replica-write screen to
+        // match the new role, INSIDE this one state write lock, so the (role,
+        // screen) pair is always consistent to any observer.  Armed iff the
+        // node is not writable (not Master) -- JE derives the same decision
+        // from `isMaster()` at locker-creation time (`createRepUserTxn`).
+        // This replaces the former out-of-lock stores in `become_master` /
+        // `become_replica`, which could be overwritten by a concurrent
+        // transition and leave a Replica unscreened (S2).  No listener firing,
+        // network I/O, or env call happens here -- a `Relaxed` atomic store
+        // through the already-held `Arc` keeps the state lock a leaf.
+        if let Some(handle) = self.write_screen.read().as_ref() {
+            handle.store(Self::screen_for(new_state), Ordering::Relaxed);
+        }
 
         log::info!("Node state change from {} to {}", old_state, new_state);
 
