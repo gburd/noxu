@@ -454,6 +454,19 @@ impl XaResource for XaEnvironment {
                     .into(),
             ));
         }
+        // R-REPUSER (BUG-REP-USER-WRITES-NOT-REPLICATED, S1): refuse committing
+        // a recovered prepared branch on a master-wired env BEFORE applying its
+        // LNs or forgetting the branch, so the branch stays fully in-doubt and
+        // nothing becomes visible/durable.  In a working replicated system this
+        // commit would itself be a replicated commit (JE routes a recovered
+        // prepared txn through `Txn.commit` -> `preLogCommitHook`); Noxu cannot
+        // ship it in 7.11.x, so fail closed.  Consults the SAME env-level gate
+        // every other user-write path uses, via the public predicate.
+        if let Some(reason) = self.env.user_writes_refused() {
+            return Err(XaError::Db(
+                noxu_db::NoxuError::ReplicationNotSupported { reason },
+            ));
+        }
         let mut recovered = self.recovered_branches.lock().unwrap();
         let recovered_branch =
             recovered.remove(xid).ok_or(XaError::NotFound)?;

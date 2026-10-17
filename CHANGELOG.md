@@ -443,9 +443,13 @@ recorded here for completeness.
   `Database::put`/`put_no_overwrite`/`delete`, an explicit transaction's
   `put_in`/`delete_in`, auto-commit cursor `put`/`delete`, non-transactional
   writes, DDL (`open_database` create / `remove_database` / `rename_database` /
-  `truncate_database`), and the DPL / collections layers that build on them —
-  is now **refused at the write operation, before any log record is written**,
-  with the new `NoxuError::ReplicationNotSupported` error. Previously only an
+  `truncate_database`), sequences (`Database::open_sequence` create /
+  `Sequence::get` persist), the DPL and collections layers (`StoredMap` /
+  `StoredList` / `StoredSortedMap`, `run_in_auto_commit`, `TransactionRunner`),
+  and the XA layer (a `put` under an XA branch, and committing a recovered
+  prepared branch via `write_txn_commit_for_recovered`) — is now **refused at
+  the write operation, before any log record is written**, with the new
+  `NoxuError::ReplicationNotSupported` error. Previously only an
   explicit transaction's `commit` was gated, so the most common write (a plain
   auto-commit `db.put`) **silently "succeeded" and was never streamed to any
   replica** (ack policy `None`), or an explicit commit blocked the full ack

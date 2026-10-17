@@ -20,7 +20,10 @@ use std::sync::Arc;
 
 use noxu_db::durability::{Durability, ReplicaAckPolicy, SyncPolicy};
 use noxu_db::error::NoxuError;
-use noxu_db::{DatabaseConfig, Environment, EnvironmentConfig, Put};
+use noxu_db::{
+    DatabaseConfig, DatabaseEntry, Environment, EnvironmentConfig, Put,
+    SequenceConfig,
+};
 use noxu_rep::{NodeType, RepConfig, ReplicatedEnvironment};
 use tempfile::TempDir;
 
@@ -231,6 +234,82 @@ fn explicit_txn_put_commit_is_refused() {
     let _ = env.close();
     let _ = rep.close();
     assert_absent_after_reopen(&tmp, b"k");
+}
+
+// ── (8) Sequence: open_sequence(allow_create) + Sequence::get both write ──
+//
+// A sequence persists its counter via `Database::put_no_overwrite` (initial
+// record, in `Sequence::open`) and `Database::put`/`put_in` (on `get`), both of
+// which funnel through `Database::check_writable`. On a master-wired env the
+// sequence create is refused; and even a pre-existing sequence's `get` (which
+// must persist the advanced window) is refused.
+#[test]
+fn sequence_create_and_get_are_refused() {
+    let tmp = TempDir::new().unwrap();
+    // Open env + a plain DB and PRE-CREATE a sequence BEFORE wiring, so we can
+    // also exercise `get` on an existing sequence under the refusing coord.
+    let env_cfg = EnvironmentConfig::new(PathBuf::from(tmp.path()))
+        .with_allow_create(true)
+        .with_transactional(true);
+    let env = Environment::open(env_cfg).unwrap();
+    let db = env
+        .open_database(
+            None,
+            "d",
+            &DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_transactional(true),
+        )
+        .unwrap();
+    let seq_key = DatabaseEntry::from_bytes(b"seq1");
+    {
+        // Pre-create + advance once, standalone (no coordinator yet).
+        let seq = db
+            .open_sequence(
+                &seq_key,
+                SequenceConfig::new().with_allow_create(true),
+            )
+            .unwrap();
+        let _ = seq.get(None, 1).unwrap();
+    }
+
+    // Now wire the refusing coordinator.
+    let rep = master_env("paths_master_seq");
+    env.set_replica_coordinator(rep.clone());
+
+    // (a) opening a NEW sequence that must create its initial record -> refused.
+    let new_key = DatabaseEntry::from_bytes(b"seq_new");
+    let res_create = db
+        .open_sequence(&new_key, SequenceConfig::new().with_allow_create(true));
+    assert_refused(res_create.map(|_| "seq"), "Sequence open create");
+
+    // (b) `get` on the EXISTING sequence that must persist an advanced window
+    //     -> refused when it needs to write (cache exhausted). Use a delta that
+    //     forces a persist (cache_size default is small; request past it).
+    let seq = db
+        .open_sequence(&seq_key, SequenceConfig::new().with_allow_create(false))
+        .expect("opening an existing sequence (a read) must still work");
+    // Drain the cache window so the next get must persist a new window.
+    let mut refused = false;
+    for _ in 0..10_000 {
+        match seq.get(None, 1) {
+            Ok(_) => continue,
+            Err(NoxuError::ReplicationNotSupported { .. }) => {
+                refused = true;
+                break;
+            }
+            Err(other) => panic!("Sequence::get: unexpected {other:?}"),
+        }
+    }
+    assert!(
+        refused,
+        "Sequence::get must be refused once it needs to persist a new window"
+    );
+
+    let _ = db.close();
+    let _ = env.close();
+    let _ = rep.close();
+    assert_absent_after_reopen(&tmp, b"seq_new");
 }
 
 // ── control: standalone env (no coordinator) — every path unaffected ──

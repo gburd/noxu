@@ -2067,11 +2067,42 @@ impl Environment {
     /// [`Self::take_recovered_prepared_lns`] and applied them.
     ///
     /// See `noxu_xa` for XA two-phase commit.
+    /// R-REPUSER: `Some(reason)` when ordinary user writes (and recovered-XA
+    /// commits) must be refused on this environment because the installed
+    /// replica-ack coordinator cannot replicate user writes in this release;
+    /// `None` otherwise.  The public view of
+    /// `EnvironmentImpl::refuse_user_writes_reason`, so a higher layer (XA)
+    /// can consult the SAME env-level gate BEFORE it applies recovered LNs,
+    /// rather than only at the final durable `TxnCommit` write.
+    ///
+    /// `#[doc(hidden)]`: internal cross-crate wiring for `noxu-xa`, not part of
+    /// the stable surface.
+    #[doc(hidden)]
+    pub fn user_writes_refused(&self) -> Option<String> {
+        self.env_impl.lock().refuse_user_writes_reason().map(|r| r.to_string())
+    }
+
     pub fn write_txn_commit_for_recovered(&self, txn_id: u64) -> Result<()> {
         let lm = match &self.log_manager {
             Some(lm) => lm,
             None => return Ok(()), // Non-transactional env (shouldn't happen).
         };
+        // R-REPUSER (BUG-REP-USER-WRITES-NOT-REPLICATED, S1): committing a
+        // recovered prepared (XA) branch writes a `TxnCommit` WAL frame that,
+        // in a working replicated system, is itself a REPLICATED commit (JE
+        // routes a recovered prepared txn through `Txn.commit` ->
+        // `preLogCommitHook` -> the master ack hook, so it ships and waits for
+        // acks like any other master commit; XAEnvironment.commit ->
+        // Txn.commit(xid), Txn.java:730-765).  Noxu cannot ship it in 7.11.x,
+        // so refuse fail-closed on a master-wired env rather than silently
+        // committing a prepared branch whose resolution would never reach a
+        // replica.  A standalone (non-wired) env resolves it normally.  This is
+        // the same env-level predicate every other user-write path consults.
+        if let Some(reason) = self.env_impl.lock().refuse_user_writes_reason() {
+            return Err(NoxuError::ReplicationNotSupported {
+                reason: reason.to_string(),
+            });
+        }
         // R-3: pre-allocate the VLSN BEFORE writing the WAL entry so the
         // TxnCommit record carries it.  On a second crash, the X-14 VLSN
         // rebuild scans TxnCommit records with non-NULL dtvlsn and includes
