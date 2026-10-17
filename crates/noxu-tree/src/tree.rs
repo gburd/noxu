@@ -4487,8 +4487,10 @@ impl Tree {
                         if idx < bin.entries.len() {
                             let full_key =
                                 bin.get_full_key(idx).unwrap_or_default();
-                            // ponytail: range-seek path, not point-get hot
-                            // path — materialise owned Vec for Vec<u8> return.
+                            // Range-seek path (not the point-get hot path):
+                            // materialise an owned Vec for the Vec<u8> return.
+                            // Returning Bytes here instead would avoid the copy
+                            // if range reads ever become a measured bottleneck.
                             let data = bin.entries[idx]
                                 .data
                                 .as_ref()
@@ -4649,10 +4651,10 @@ impl Tree {
                     if idx < bin.entries.len() {
                         let full_key =
                             bin.get_full_key(idx).unwrap_or_default();
-                        // ponytail: range-seek path (SetRange), not the point-get
-                        // hot path — materialise an owned Vec for the Vec<u8>-typed
+                        // Range-seek path (SetRange), not the point-get hot
+                        // path: materialise an owned Vec for the Vec<u8>-typed
                         // return.  Make this return Bytes too if range reads
-                        // become a measured bottleneck.
+                        // ever become a measured bottleneck.
                         let data = bin.entries[idx]
                             .data
                             .as_ref()
@@ -10970,12 +10972,13 @@ impl Tree {
     ///     time, so the deletion is "known" (committed) and the slot is
     ///     KNOWN-deleted and may be skipped by a later scan without a lock.
     ///
-    /// ponytail: the memory counter is credited here exactly as
+    /// Memory accounting: the counter is credited here exactly as
     /// [`Self::delete`] credits it (key + data + slot overhead), so a later
     /// physical removal of the deleted slot (compressor, `delete`) credits
     /// nothing and a deleted-slot reuse (`insert` reports `is_new`) re-charges
-    /// it.  The slot's key bytes stay resident until compression; charge them
-    /// to the slot instead if that residue ever matters for budget accuracy.
+    /// it.  The slot's key bytes stay resident until compression; they could
+    /// be charged to the slot instead if that residue ever mattered for budget
+    /// accuracy.
     ///
     /// Returns `true` iff a LIVE slot was found and marked.
     pub fn mark_deleted(

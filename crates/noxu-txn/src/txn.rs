@@ -1127,12 +1127,14 @@ impl Txn {
     /// - skip `abort_counted_at_log_time` (already counted at logging);
     /// - de-duplicate by abort LSN (a txn may touch the same record twice).
     ///
-    /// ponytail: the JE `db.isLNImmediatelyObsolete()` filter (dup-DB LNs
-    /// already counted at logging) is omitted because the txn layer has no
-    /// `DatabaseImpl` handle — only a `database_id`.  For a dup DB this can
-    /// double-count the abort LSN obsolete, which only makes a file *more*
-    /// cleanable (never deletes live data); it is conservative.  Restore the
-    /// filter when the txn can resolve `database_id -> isLNImmediatelyObsolete`.
+    /// Deviation from JE: the `db.isLNImmediatelyObsolete()` filter (dup-DB
+    /// LNs already counted obsolete at logging time) is NOT applied here,
+    /// because the txn layer has no `DatabaseImpl` handle — only a
+    /// `database_id`.  For a duplicates database this can count an abort LSN
+    /// obsolete twice.  Double-counting is conservative: it only makes a file
+    /// *more* cleanable and never causes live data to be reclaimed.  To
+    /// restore exact parity, the txn would need to resolve `database_id ->
+    /// isLNImmediatelyObsolete`.
     ///
     /// Split from the actual merge (see [`Self::merge_obsolete_lsns`]) so the
     /// caller can collect while `self.write_locks` is still intact and defer

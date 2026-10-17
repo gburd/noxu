@@ -146,10 +146,11 @@ impl SyncupLogView {
         let mut passed_txns: BTreeMap<i64, PassedTxn> = BTreeMap::new();
         let mut passed_checkpoint_end = false;
 
-        // ponytail: one forward O(n) pass over the log collects every
-        // per-VLSN fact (lsn, fingerprint, sync-flag). JE scans backward and
-        // stops early at the matchpoint; a streaming backward reader is the
-        // upgrade path if syncup must run on logs too large to snapshot.
+        // Design note: one forward O(n) pass over the log collects every
+        // per-VLSN fact (lsn, fingerprint, sync-flag).  JE scans backward
+        // and stops early at the matchpoint; a streaming backward reader
+        // would be the upgrade path if syncup ever had to run on logs too
+        // large to snapshot.
         //
         // FID-PONY-3: a listing I/O error is NOT "no files".  Previously
         // `.unwrap_or_default()` swallowed it into an empty list, so the

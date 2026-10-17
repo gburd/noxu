@@ -5874,8 +5874,9 @@ bump — `LOG_VERSION` is unchanged.
   safe in the current design because the compressor only ever sees committed
   defunct slots (the dbi write path physically removes slots under the txn
   write lock; the only writer of `BinStub.known_deleted = true` is
-  BIN-delta/recovery replay of committed deletes). A `ponytail:` code comment
-  in `compress_bin` records the ceiling and upgrade path.
+  BIN-delta/recovery replay of committed deletes). The `compress_bin` /
+  `compress_bin_with_lock_check` doc comment records the ceiling and the
+  upgrade path.
 
 ### Fixed (replication — split-brain)
 

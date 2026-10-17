@@ -295,11 +295,12 @@ counted obsolete, anywhere:
    But in Noxu, `abort_data` is unconditionally populated with the real
    before-image bytes on **every** overwrite (`CursorImpl::finalize_write_lock`
    passes `old_data` from `get_slot_before_image`, used for in-memory undo
-   on abort) — not only when the LN is actually embedded. Noxu's own
-   `embedded_ln` field is hard-coded `true` for a separate, already-flagged
-   fidelity gap (see the `ponytail:` comment at `cursor_impl.rs` line ~3512),
-   so it cannot be used to gate this. The filter therefore fires on **every**
-   overwrite, and the prior version is never counted obsolete anywhere.
+   on abort) — not only when the LN is actually embedded. The log-write
+   path does now compute a true embedded flag (`new_embedded_ln` in
+   `cursor_impl.rs::log_ln_write`), but the commit-time filter above keys off
+   `abort_data.is_some()`, not that flag — and `abort_data` is populated on
+   **every** overwrite. The filter therefore fires on **every** overwrite,
+   and the prior version is never counted obsolete anywhere.
 
    A second, narrower instance of the same class of gap: `Checkpointer`'s
    full-BIN-flush path (`crates/noxu-recovery/src/checkpointer.rs

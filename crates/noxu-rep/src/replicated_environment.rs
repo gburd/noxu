@@ -4882,12 +4882,12 @@ impl ReplicaAckCoordinator for ReplicatedEnvironment {
         // counts feeders whose `getReplicaTxnEndVLSN() >= commitVLSN` (a
         // high-water `>=` test, NOT an exact-VLSN match).
         //
-        // ponytail: reads the global high-water VLSN, so a concurrent later
-        // commit can make this gate wait on a slightly higher VLSN than its
-        // own. That is strictly SAFE (waiting for >= a newer VLSN never
-        // returns early) and only marginally less precise; thread the
-        // per-txn VLSN through the trait if exact per-commit granularity is
-        // ever needed.
+        // Design note: this reads the global high-water VLSN, so a
+        // concurrent later commit can make the gate wait on a slightly
+        // higher VLSN than its own.  That is strictly safe (waiting for >= a
+        // newer VLSN never returns early) and only marginally less precise.
+        // Threading the per-txn VLSN through the trait would give exact
+        // per-commit granularity if it were ever needed.
         let commit_vlsn = self.wal_vlsn_counter.load(Ordering::Acquire);
 
         // Register on the AckTracker too: this is what `record_ack` notifies,

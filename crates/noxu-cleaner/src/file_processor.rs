@@ -147,10 +147,12 @@ fn fetch_migration_ln_data_from_log(
 /// migrated LN and update the slot LSN before the latch is released.  A
 /// changed or deleted slot is Obsolete and nothing is logged.
 ///
-/// ponytail: no `lockAfterLsnChange` owner transfer (CursorImpl.java:
-/// 3704-3733); any other owner/waiter on `tree_lsn` defers (Locked ->
-/// pending retry) so no foreign lock loses its record.  Add transfer to
-/// restore JE migration concurrency for long-lived readers.
+/// Deviation from JE: there is no `lockAfterLsnChange` owner transfer
+/// (CursorImpl.java:3704-3733).  Instead, if any other owner/waiter holds
+/// `tree_lsn`, this migration defers (Locked -> pending retry) rather than
+/// transferring the lock, so no foreign lock ever loses its record.  The
+/// cost is reduced migration concurrency for long-lived readers; adding the
+/// owner transfer would restore JE's behaviour there.
 fn publish_migration_latched(
     tree: &noxu_tree::Tree,
     lock_manager: &LockManager,
@@ -1036,8 +1038,11 @@ impl TreeLookup for SharedTreeLookup {
                     // the env (JE EFE ctor, EnvironmentFailureException.java:
                     // 159-166), which stops cleaning and file deletion.  The
                     // LN stays pending (Locked) so its file is retained.
-                    // ponytail: LOG_INTEGRITY (non-invalidating) stays a
-                    // silent pending retry; JE aborts the run loudly.
+                    // Deviation from JE: a LOG_INTEGRITY (non-invalidating)
+                    // read failure stays a silent pending retry here (the
+                    // source file is retained), whereas JE aborts the
+                    // cleaner run loudly.  Both are safe (no file is
+                    // deleted while the LN is unresolved); this one is quiet.
                     log::error!("cleaner: {msg}");
                     if invalidates && let Some(f) = &self.env_invalid {
                         f.store(true, Ordering::Release);
