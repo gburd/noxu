@@ -328,6 +328,42 @@ impl DatabaseImpl {
     pub fn is_replicated(&self) -> bool {
         self.flags & IS_REPLICATED_BIT != 0
     }
+
+    /// Whether a write to this database is permitted on a replica node.
+    ///
+    /// Faithful port of JE `DatabaseImpl.allowReplicaWrite`
+    /// (DatabaseImpl.java:785): `return !isReplicated() || getDbType() ==
+    /// DbType.NAME;`.  Writes on a replica are refused to any *replicated*
+    /// DB, with one exception -- the naming DB, which holds a mixture of
+    /// replicated and non-replicated NameLNs, so JE allows all writes to it
+    /// and relies on `DbTree.checkReplicaWrite` to stop a replicated-DB
+    /// naming op on a replica (DbTree.java:874-880).  A non-replicated
+    /// (local) DB is always writable on a replica.  [#20543]
+    pub fn allow_replica_write(&self) -> bool {
+        !self.is_replicated() || self.db_type == DbType::Name
+    }
+
+    /// 7.11.x safety-gated form of [`Self::allow_replica_write`].
+    ///
+    /// JE's `allowReplicaWrite()` permits a replica to write a NON-replicated
+    /// (local) database (DatabaseImpl.java:785), but only because JE has the
+    /// NO_REPLICATE LN/commit path and a separate negative local db-id space
+    /// that Noxu has not yet ported (see `local-db-design.md`).  Without that
+    /// machinery a local DB written/created on a replica is a master-invisible
+    /// divergence (and a future id collision), so the conservative 7.11.x
+    /// gate permits a replica write ONLY to an internal DB (the NAME/ID/
+    /// Utilization catalog DBs, which are the replica's own replay/engine
+    /// state, never user data).  Equivalently: a replica refuses every
+    /// user-DB write, whether that user DB is marked replicated or not.
+    ///
+    /// This is only ever consulted when the replica-write screen is armed,
+    /// which happens only on a node that is a replica in a replicated group
+    /// (`ReplicatedEnvironment::become_replica`), so gating on
+    /// `db_type.is_internal()` is exactly "a replica originates no user
+    /// write" without having to thread the env-replicated flag down here.
+    pub fn allow_replica_write_7_11_x(&self) -> bool {
+        self.db_type.is_internal()
+    }
     /// Called by the environment's database-open path once it has
     /// determined whether this database should be marked replicated. Sets
     /// exactly one of the two underlying bits (never both, which would be a

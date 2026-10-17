@@ -2172,9 +2172,27 @@ impl ReplicatedEnvironment {
                     // backward re-read (JE flushNoSync in initScan).
                     let _ = lm.flush_sync();
                 }
-                crate::stream::syncup_reader::SyncupLogView::scan(
+                // FID-PONY-3: `scan` now returns the real error on a
+                // FileManager open OR a log-listing failure.  A listing
+                // error must NOT silently fall back to the in-memory index
+                // view (which, lacking the on-disk fingerprints, can agree a
+                // too-low matchpoint and force a spurious restore / unsafe
+                // truncate).  Log the error and treat the log view as
+                // unavailable only on a clean open failure; a listing error
+                // is surfaced loudly so the operator sees the fault.
+                match crate::stream::syncup_reader::SyncupLogView::scan(
                     env.get_env_home(),
-                )
+                ) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        log::error!(
+                            "syncup: could not build the on-disk log view \
+                             ({e}); falling back to the in-memory VLSN index \
+                             view (FID-PONY-3)"
+                        );
+                        None
+                    }
+                }
             });
         let index_view = VlsnIndexView::from_index(&self.vlsn_index);
         let replica_view: &dyn crate::stream::syncup::SyncupView =
@@ -2827,6 +2845,13 @@ impl ReplicatedEnvironment {
             self.node_state.transition_via_unknown(NodeState::Master)?;
         self.master_tracker.set_master(self.config.node_name.as_str(), term);
 
+        // GAP-REPLAY-3: this node is now the MASTER — local user writes are
+        // allowed again (clear the replica-write screen).  JE: the master
+        // issues ordinary writable txns, not ReadonlyTxns.
+        if let Some(env) = self.env_impl.lock().unwrap().clone() {
+            env.set_replica_write_screen(false);
+        }
+
         // --- F9: spawn Feeder trackers for each known replica -------------
         //
         // Closes finding F9 of the 2026 review.
@@ -2983,6 +3008,18 @@ impl ReplicatedEnvironment {
         // below handles: a second `become_replica` naming a NEW master must
         // update the master and let the running thread re-sync, not error on
         // a REPLICA -> REPLICA self-transition.
+        // GAP-REPLAY-3 (merge-prep): arm the replica-write screen BEFORE the
+        // state transition to Replica, so there is never a window in which the
+        // node already reports `Replica` but still accepts local user writes
+        // (which would silently diverge it from the master).  Arming early is
+        // conservative: a stray write in the brief pre-transition window is
+        // refused with `ReplicaWrite`, never wrongly accepted.  (become_master
+        // clears the screen AFTER its transition for the symmetric reason — a
+        // write in that window gets a transient, safe `ReplicaWrite`.)
+        if let Some(env) = self.env_impl.lock().unwrap().clone() {
+            env.set_replica_write_screen(true);
+        }
+
         let old_state =
             self.node_state.transition_via_unknown(NodeState::Replica)?;
         self.master_tracker.set_master(master_name, 0);
@@ -3001,6 +3038,11 @@ impl ReplicatedEnvironment {
         // the floor. Placed before any early return below so every demotion
         // path releases it.
         self.update_cleaner_replica_protection();
+
+        // GAP-REPLAY-3 (merge-prep): the replica-write screen was already armed
+        // ABOVE, before the state transition, to avoid a Replica-but-unscreened
+        // window.  (Only the replication replay stream mutates a replica's
+        // databases.)
 
         // --- G19: start replica receive loop --------------------------------
         //

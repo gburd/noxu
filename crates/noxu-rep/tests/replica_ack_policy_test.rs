@@ -203,18 +203,22 @@ fn f1_acks_within_timeout_succeed() {
 /// End-to-end: install the rep coordinator on a real `noxu_db::Environment`
 /// and verify that `Transaction::commit_with_durability` actually
 /// blocks on replica acks. Without F1 the commit returned `Ok(())`
-/// silently; with F1 it returns `NoxuError::InsufficientReplicas`.
+/// silently; with F1 it blocks and, on an ack timeout, returns
+/// `NoxuError::InsufficientAcks` -- the txn IS committed+durable at the master
+/// but too few replicas acknowledged (FID-DUR-1; JE InsufficientAcksException).
 ///
 // JE: ReplicatedTransactionTest.testReplicaCommitDurability — a replicated
 // commit blocks until the durability (ack) policy is satisfied and fails
-// cleanly (InsufficientReplicasException) when it cannot be, rather than
-// returning success without the required acks.
+// cleanly when it cannot be, rather than returning success without the
+// required acks.  Because the ack wait runs AFTER the local TxnCommit fsync,
+// the failure is the POST-commit InsufficientAcksException (committed at the
+// master), not the pre-commit InsufficientReplicasException (FID-DUR-1).
 //
 // JE: ReplicatedTransactionTest.testTxnCommitException — commit(SYNC_SYNC_ALL)
-// with a replica missing throws InsufficientReplicasException from the
-// pre/post-log-commit hook. This end-to-end test is exactly that: commit
-// with ReplicaAckPolicy::All and non-acking peers returns
-// NoxuError::InsufficientReplicas (Noxu's InsufficientReplicasException).
+// with a replica missing. This end-to-end test is exactly that: commit with
+// ReplicaAckPolicy::All and non-acking peers returns NoxuError::InsufficientAcks
+// (Noxu's InsufficientAcksException): the write is committed+durable at the
+// master but too few replicas acknowledged.
 ///
 /// This test now writes data (a `put`) before committing so the txn is a
 /// real ack-requiring commit.  An EMPTY / read-only txn correctly returns
@@ -252,7 +256,7 @@ fn f1_commit_blocks_on_replica_acks() {
 
     // Install coordinator. With ReplicaAckPolicy::All and 2 peers,
     // the commit needs 2 acks. Nobody acks → it must time out and
-    // return InsufficientReplicas.
+    // return InsufficientAcks (committed at master; FID-DUR-1).
     env.set_replica_coordinator(rep_env.clone());
     env.set_replica_ack_timeout(Duration::from_millis(200));
 
@@ -270,13 +274,28 @@ fn f1_commit_blocks_on_replica_acks() {
     let res = txn.commit_with_durability(durability);
     let elapsed = started.elapsed();
 
+    // FID-DUR-1: the ack wait runs AFTER the local TxnCommit fsync, so the
+    // txn IS committed and durable at the master.  An ack timeout is JE
+    // InsufficientAcksException ("already committed at the master"), NOT the
+    // pre-commit InsufficientReplicasException.  RED at 81b2f048: this returned
+    // NoxuError::InsufficientReplicas (which implies the write may not have
+    // happened).  GREEN after: NoxuError::InsufficientAcks, and
+    // is_committed_at_master() == true so the caller knows the write is durable.
     match res {
-        Err(NoxuError::InsufficientReplicas { required, available }) => {
+        Err(ref e @ NoxuError::InsufficientAcks { required, available }) => {
             assert!(required >= 1, "required acks must be > 0");
             assert_eq!(available, 0);
+            assert!(
+                e.is_committed_at_master(),
+                "InsufficientAcks must report the txn committed at the master"
+            );
+            assert!(
+                !e.is_retryable(),
+                "a committed-at-master txn must not be auto-retryable"
+            );
         }
         other => panic!(
-            "expected InsufficientReplicas, got {:?} after {:?}",
+            "expected InsufficientAcks (committed at master), got {:?} after {:?}",
             other, elapsed
         ),
     }

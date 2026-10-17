@@ -20,6 +20,8 @@
 //! `EnvironmentLogScanner` already uses.
 
 use std::collections::BTreeMap;
+
+use crate::error::RepError;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -110,20 +112,31 @@ impl SyncupLogView {
     /// Build a view by scanning the log under `env_home`.
     ///
     /// Reads every entry once (forward over files for simplicity), recording
-    /// the per-VLSN fingerprint/sync-flag the matchpoint search needs. Returns
-    /// `None` only if a `FileManager` cannot be opened for `env_home`.
-    pub fn scan(env_home: &Path) -> Option<Self> {
+    /// the per-VLSN fingerprint/sync-flag the matchpoint search needs.
+    ///
+    /// FID-PONY-3: returns `Err` if the `FileManager` cannot be opened OR if
+    /// listing the log files fails -- a listing I/O error must NOT be
+    /// conflated with "no log files" (an empty view), which would make the
+    /// matchpoint search find nothing and force a spurious network restore.
+    pub fn scan(env_home: &Path) -> Result<Self, RepError> {
         // Read-only FileManager over the env's log, same construction the
         // feeder's EnvironmentLogScanner uses.
         let fm = Arc::new(
-            FileManager::new(env_home, true, 256 * 1024 * 1024, 32).ok()?,
+            FileManager::new(env_home, true, 256 * 1024 * 1024, 32).map_err(
+                |e| {
+                    RepError::DatabaseError(format!(
+                        "syncup: cannot open log at {} ({e})",
+                        env_home.display()
+                    ))
+                },
+            )?,
         );
-        Some(Self::scan_with_manager(&fm))
+        Self::scan_with_manager(&fm)
     }
 
     /// Build a view from an already-open [`FileManager`] (used by the live
     /// syncup driver, which already holds one, and by tests).
-    pub fn scan_with_manager(fm: &FileManager) -> Self {
+    pub fn scan_with_manager(fm: &FileManager) -> Result<Self, RepError> {
         let mut entries: BTreeMap<i64, VlsnEntry> = BTreeMap::new();
         let mut entry_types: BTreeMap<i64, u8> = BTreeMap::new();
         let mut txn_end_vlsns: std::collections::BTreeSet<i64> =
@@ -137,7 +150,19 @@ impl SyncupLogView {
         // per-VLSN fact (lsn, fingerprint, sync-flag). JE scans backward and
         // stops early at the matchpoint; a streaming backward reader is the
         // upgrade path if syncup must run on logs too large to snapshot.
-        let file_nums = fm.list_file_numbers().unwrap_or_default();
+        //
+        // FID-PONY-3: a listing I/O error is NOT "no files".  Previously
+        // `.unwrap_or_default()` swallowed it into an empty list, so the
+        // matchpoint search found nothing and the replica was told to do a
+        // spurious network restore.  Surface the error so the syncup caller
+        // fails cleanly (JE FileProtector keeps the range alive and treats a
+        // listing failure as a real fault, not an empty view).
+        let file_nums = fm.list_file_numbers().map_err(|e| {
+            RepError::DatabaseError(format!(
+                "syncup: listing log files failed ({e}); cannot build the \
+                 matchpoint view (FID-PONY-3)"
+            ))
+        })?;
         for file_num in file_nums {
             let header_size = fm
                 .file_header_size_for(file_num)
@@ -303,7 +328,7 @@ impl SyncupLogView {
             entries.keys().next().map(|&v| Vlsn::new(v)).unwrap_or(NULL_VLSN)
         };
 
-        Self {
+        Ok(Self {
             entries,
             txn_end_vlsns,
             entry_types,
@@ -312,7 +337,7 @@ impl SyncupLogView {
             last_sync,
             last_txn_end,
             first,
-        }
+        })
     }
 
     /// The log entry type of every VLSN strictly above `matchpoint`, in
@@ -780,7 +805,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let fm = FileManager::new(dir.path(), false, 256 * 1024 * 1024, 32)
             .expect("FileManager must open an empty, writable env dir");
-        let view = SyncupLogView::scan_with_manager(&fm);
+        let view = SyncupLogView::scan_with_manager(&fm).unwrap();
         assert_eq!(view.first_vlsn(), NULL_VLSN);
         assert_eq!(view.last_sync(), NULL_VLSN);
         assert_eq!(view.last_txn_end(), NULL_VLSN);
@@ -936,7 +961,7 @@ mod tests {
             &commit_payload(20),
         );
 
-        let view = SyncupLogView::scan_with_manager(&fm);
+        let view = SyncupLogView::scan_with_manager(&fm).unwrap();
 
         // Only the replicated commit is counted (matchpoint at the bottom).
         assert_eq!(
@@ -998,7 +1023,7 @@ mod tests {
             &ckpt_end_payload(false),
         );
 
-        let view = SyncupLogView::scan_with_manager(&fm);
+        let view = SyncupLogView::scan_with_manager(&fm).unwrap();
 
         assert_eq!(
             view.num_passed_commits(NULL_VLSN),
@@ -1048,8 +1073,58 @@ mod tests {
             &commit_payload(300),
         );
 
-        let view = SyncupLogView::scan_with_manager(&fm);
+        let view = SyncupLogView::scan_with_manager(&fm).unwrap();
         assert_eq!(view.num_passed_commits(NULL_VLSN), 1);
         assert_eq!(view.earliest_passed_txn(NULL_VLSN).unwrap().id, 200);
+    }
+
+    /// FID-PONY-3 WITNESS: a log-listing I/O error during the syncup scan is a
+    /// surfaced error, NOT an empty view.  Before the fix
+    /// `list_file_numbers().unwrap_or_default()` swallowed it into an empty
+    /// list, so the matchpoint search found nothing and the replica was told
+    /// to do a spurious network restore.  JE's FileProtector keeps the
+    /// VLSNIndex range alive for the scan and treats a listing failure as a
+    /// real fault.
+    #[cfg(unix)]
+    #[test]
+    fn scan_surfaces_a_listing_io_error_not_an_empty_view() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        // Open the FileManager while the directory is readable (so the OPEN
+        // path succeeds), THEN make the directory unlistable so the LISTING
+        // path inside scan_with_manager is what fails.  This exercises the
+        // precise FID-PONY-3 site (`list_file_numbers`), not the open path.
+        let fm = FileManager::new(dir.path(), true, 256 * 1024 * 1024, 32)
+            .expect("open fm");
+        let orig = std::fs::metadata(dir.path()).unwrap().permissions();
+        std::fs::set_permissions(
+            dir.path(),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .expect("chmod 000");
+
+        let res = SyncupLogView::scan_with_manager(&fm);
+
+        // Restore before asserting so TempDir cleanup works.
+        std::fs::set_permissions(dir.path(), orig).expect("restore perms");
+
+        match res {
+            Err(crate::error::RepError::DatabaseError(msg)) => {
+                assert!(
+                    msg.contains("listing log files failed"),
+                    "the surfaced error must name the listing failure; \
+                     msg={msg}"
+                );
+            }
+            Err(other) => panic!(
+                "expected a DatabaseError naming the listing failure, got \
+                 a different error: {other:?}"
+            ),
+            Ok(_) => panic!(
+                "a listing I/O error must surface as Err, not an empty view \
+                 (FID-PONY-3)"
+            ),
+        }
     }
 }

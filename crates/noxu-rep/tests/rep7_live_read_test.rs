@@ -189,7 +189,7 @@ fn test_replica_does_not_see_uncommitted_txn() {
 
     // Stream a transactional insert (txn 42) — buffered, NOT yet visible.
     let p = ln_payload(db_id, Some(42), b"tk", Some(b"tv"));
-    replay.apply_entry(1, insert_ln_txn, &p, Lsn::new(0, 100));
+    replay.apply_entry(1, insert_ln_txn, &p, Lsn::new(0, 100)).unwrap();
 
     let before = tree.read().unwrap().search_with_data(b"tk");
     assert!(
@@ -201,7 +201,7 @@ fn test_replica_does_not_see_uncommitted_txn() {
 
     // Stream the commit — now the record IS visible.
     let c = txn_commit_payload(42);
-    replay.apply_entry(2, txn_commit, &c, Lsn::new(0, 200));
+    replay.apply_entry(2, txn_commit, &c, Lsn::new(0, 200)).unwrap();
 
     let after = tree.read().unwrap().search_with_data(b"tk");
     let after = after.expect("committed txn record must be visible");

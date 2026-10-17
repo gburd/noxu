@@ -96,6 +96,14 @@ pub enum DbiError {
     #[error("operation status: {0}")]
     OperationFailed(String),
 
+    /// GAP-REPLAY-3: a write was attempted on a node that is currently a
+    /// REPLICA.  JE `ReadonlyTxn.disallowReplicaWrite` throws
+    /// `ReplicaWriteException` (a replica never accepts a local user write;
+    /// only the replication replay stream mutates it).  Maps to the public
+    /// `NoxuError::ReplicaWrite`.
+    #[error("write not allowed on a replica node")]
+    ReplicaWrite,
+
     /// NEW-DBI-DUPPUTCUR: a `putCurrent` on a sorted-duplicate database
     /// tried to replace the current duplicate with data that does not
     /// compare EQUAL to the existing data under the duplicate comparator.

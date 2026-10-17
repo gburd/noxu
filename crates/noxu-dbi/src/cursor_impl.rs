@@ -263,6 +263,12 @@ pub struct CursorImpl {
     /// so `check_state()` can detect a failed environment without locking.
     /// `None` for cursors constructed outside a real environment (unit tests).
     env_invalid: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// GAP-REPLAY-3: cached replica-write screen flag.  When `Some(true)`,
+    /// this node is a REPLICA and a local user write must be refused with
+    /// `DbiError::ReplicaWrite` (JE `ReadonlyTxn.disallowReplicaWrite` ->
+    /// `ReplicaWriteException`).  `None` outside a real env (unit tests) /
+    /// `Some(false)` on a master or standalone env.
+    replica_write_screen: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Lock manager for per-record read/write locking.
     /// None for cursors created outside a real env (e.g., unit tests).
     ///
@@ -597,6 +603,7 @@ impl CursorImpl {
             current_bin_arc: None,
             log_manager: None,
             env_invalid: None,
+            replica_write_screen: None,
             lock_manager: None,
             txn_ref: None,
             txn_manager: None,
@@ -633,6 +640,7 @@ impl CursorImpl {
             current_bin_arc: None,
             log_manager: Some(log_manager),
             env_invalid: None,
+            replica_write_screen: None,
             lock_manager: None,
             txn_ref: None,
             txn_manager: None,
@@ -655,6 +663,17 @@ impl CursorImpl {
         flag: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         self.env_invalid = Some(flag);
+        self
+    }
+
+    /// GAP-REPLAY-3: wires the replica-write screen so a local user write on a
+    /// replica node is refused with `DbiError::ReplicaWrite`
+    /// (JE `ReadonlyTxn.disallowReplicaWrite`).
+    pub fn with_replica_write_screen(
+        mut self,
+        flag: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        self.replica_write_screen = Some(flag);
         self
     }
 
@@ -1533,24 +1552,52 @@ impl CursorImpl {
     /// which is never a mismatch, so the check never fires there.
     #[inline]
     fn check_local_write_allowed(&self) -> Result<(), DbiError> {
-        let Some(txn) = self.txn_ref.as_ref() else {
-            // No locker attached (should not happen for a live write
-            // cursor); nothing to check against.
-            return Ok(());
-        };
-        let is_replicated = self.db_impl.read().is_replicated();
-        let is_local_write = txn.lock().unwrap().is_local_write();
-        if is_replicated == is_local_write {
-            return Err(DbiError::OperationFailed(format!(
-                "Write operation is not allowed because {}",
-                if is_replicated {
-                    "the Database is replicated and the transaction is \
-                     configured as local-write"
-                } else {
-                    "the Database is not replicated and the transaction is \
-                     not configured as local-write"
-                }
-            )));
+        // JE write-eligibility order (Cursor.java): `checkUpdatesAllowed`
+        // (the config-mismatch rule) runs FIRST, at the start of every write
+        // op, and only then does `putNotify`/`deleteNotify` take the write
+        // lock through `ReadonlyTxn.lockInternal` (the replica screen).  We
+        // mirror that order exactly so the observable error matches JE for
+        // every (db replicated?, txn local-write?) combination.
+        //
+        // Step 1 -- config mismatch (JE `Cursor.updateOperationsProhibited`
+        // = `dbImpl.isReplicated() == locker.isLocalWrite()`, Cursor.java:338
+        // / :5357-5361), throwing `UnsupportedOperationException`.  Noxu
+        // surfaces it as `OperationFailed`.  This takes precedence over the
+        // replica screen, so a local-write txn on a replicated DB reports the
+        // config mismatch (not `ReplicaWrite`), exactly as JE does.
+        if let Some(txn) = self.txn_ref.as_ref() {
+            let is_replicated = self.db_impl.read().is_replicated();
+            let is_local_write = txn.lock().unwrap().is_local_write();
+            if is_replicated == is_local_write {
+                return Err(DbiError::OperationFailed(format!(
+                    "Write operation is not allowed because {}",
+                    if is_replicated {
+                        "the Database is replicated and the transaction is \
+                         configured as local-write"
+                    } else {
+                        "the Database is not replicated and the transaction \
+                         is not configured as local-write"
+                    }
+                )));
+            }
+        }
+        // Step 2 -- replica screen (JE `ReadonlyTxn.lockInternal` takes a
+        // write lock only through `disallowReplicaWrite` when
+        // `!database.allowReplicaWrite()`, ReadonlyTxn.java:81-85).  The
+        // JE predicate is `allowReplicaWrite() == !isReplicated() || dbType
+        // == NAME` (DatabaseImpl.java:785), which would permit a local DB
+        // write.  7.11.x SAFETY GATE: use `allow_replica_write_7_11_x()`
+        // (internal DBs only) so a replica refuses EVERY user-DB write,
+        // including to a non-replicated user DB, until the full local-DB
+        // port lands (`local-db-design.md`).  The screen is armed only on a
+        // replica, so this is exactly "a replica originates no user write."
+        if self
+            .replica_write_screen
+            .as_ref()
+            .is_some_and(|f| f.load(Ordering::Relaxed))
+            && !self.db_impl.read().allow_replica_write_7_11_x()
+        {
+            return Err(DbiError::ReplicaWrite);
         }
         Ok(())
     }

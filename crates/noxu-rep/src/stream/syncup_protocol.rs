@@ -628,14 +628,10 @@ impl crate::net::service_dispatcher::ServiceHandler for SyncupService {
         // and syncup is rare (a replica join), so a cached view would risk
         // answering from a stale snapshot. JE likewise constructs a new
         // `FeederSyncupReader` per syncup.
+        // FID-PONY-3: `scan` now returns the real error (open OR listing
+        // failure), surfaced here instead of a swallowed empty view.
         let view =
-            crate::stream::syncup_reader::SyncupLogView::scan(&self.env_home)
-                .ok_or_else(|| {
-                RepError::DatabaseError(format!(
-                    "syncup service: cannot open log at {}",
-                    self.env_home.display()
-                ))
-            })?;
+            crate::stream::syncup_reader::SyncupLogView::scan(&self.env_home)?;
         feeder_syncup_handshake(channel.as_ref(), &view).map(|_| ())
     }
 }

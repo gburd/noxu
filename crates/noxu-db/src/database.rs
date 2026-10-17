@@ -101,6 +101,12 @@ pub struct Database {
     /// time so `check_open()` can detect a failed environment without
     /// acquiring `env_impl.lock()` on every read/write operation.
     env_invalid: Arc<std::sync::atomic::AtomicBool>,
+    /// GAP-REPLAY-3: cached replica-write screen flag (shared with
+    /// `EnvironmentImpl`).  `true` while this node is a REPLICA; a user write
+    /// then fails with `NoxuError::ReplicaWrite` (JE
+    /// `ReadonlyTxn.disallowReplicaWrite` -> `ReplicaWriteException`).  Threaded
+    /// only into write cursors (reads never screen).
+    replica_write_screen: Arc<std::sync::atomic::AtomicBool>,
     /// Cached cleaner throttle — acquired once at open, None when no cleaner.
     /// Used by put() for write-path backpressure without locking env_impl.
     cleaner_throttle: Option<Arc<noxu_cleaner::CleanerThrottle>>,
@@ -216,6 +222,10 @@ impl Database {
                     Arc::clone(lm),
                 )
                 .with_env_invalid(Arc::clone(&self.env_invalid))
+                // GAP-REPLAY-3: refuse user writes on a replica node.
+                .with_replica_write_screen(Arc::clone(
+                    &self.replica_write_screen,
+                ))
                 .with_lock_manager(Arc::clone(&self.lock_manager))
                 .with_txn_manager(Arc::clone(&self.txn_manager));
                 // Gate user writes on the disk limit (None for internal DBs).
@@ -226,6 +236,9 @@ impl Database {
             }
             None => CursorImpl::new(Arc::clone(&self.db_impl), locker_id)
                 .with_env_invalid(Arc::clone(&self.env_invalid))
+                .with_replica_write_screen(Arc::clone(
+                    &self.replica_write_screen,
+                ))
                 .with_lock_manager(Arc::clone(&self.lock_manager)),
         }
     }
@@ -594,6 +607,7 @@ impl Database {
             file_protector,
             txn_manager,
             env_invalid,
+            replica_write_screen,
             evictor,
         ) = {
             let env = env_impl.lock();
@@ -603,8 +617,11 @@ impl Database {
             let fp = env.get_file_protector();
             let txnm = Arc::clone(env.get_txn_manager());
             let inv = env.is_invalid_flag();
+            // GAP-REPLAY-3: share the replica-write screen so write cursors
+            // refuse user writes while this node is a replica.
+            let rws = env.replica_write_screen_handle();
             let ev = env.get_evictor();
-            (lm, logm, ct, fp, txnm, inv, ev)
+            (lm, logm, ct, fp, txnm, inv, rws, ev)
         };
         // Disk-limit tracker: wire it only for user databases (JE exempts
         // internal DBs in Cursor.checkUpdatesAllowed via
@@ -628,6 +645,7 @@ impl Database {
             log_manager,
             disk_limit,
             env_invalid,
+            replica_write_screen,
             cleaner_throttle,
             file_protector,
             txn_manager,
@@ -690,6 +708,7 @@ impl Database {
             log_manager: self.log_manager.clone(),
             disk_limit: self.disk_limit.clone(),
             env_invalid: Arc::clone(&self.env_invalid),
+            replica_write_screen: Arc::clone(&self.replica_write_screen),
             cleaner_throttle: self.cleaner_throttle.clone(),
             file_protector: self.file_protector.clone(),
             txn_manager: Arc::clone(&self.txn_manager),
@@ -1454,9 +1473,15 @@ impl Database {
                 // duplicates, and the winner physically removed the raced slot
                 // so the next `search` makes progress (finds a different pair
                 // or `NotFound`) — never a livelock.
-                match cursor.delete().map_err(|e| {
-                    NoxuError::OperationNotAllowed(e.to_string())
-                })? {
+                // Preserve the typed `DbiError` (notably `ReplicaWrite` from
+                // the replica screen and `OperationFailed` from the
+                // replicated/local-write config-mismatch rule) via the
+                // `From<DbiError>` conversion, instead of flattening every
+                // cursor error to a stringy `OperationNotAllowed`.  JE
+                // surfaces `ReplicaWriteException` from a replica delete; the
+                // data path must report `NoxuError::ReplicaWrite`, not an
+                // untyped message.
+                match cursor.delete().map_err(NoxuError::from)? {
                     noxu_dbi::OperationStatus::Success => {
                         deleted_any = true;
                     }
@@ -2359,6 +2384,18 @@ impl Database {
         if self.config.read_only {
             return Err(NoxuError::ReadOnly);
         }
+        // GAP-REPLAY-3 (JE-exact ordering): the replica-write screen and the
+        // replicated/local-write config-mismatch rule are BOTH enforced in
+        // `CursorImpl::check_local_write_allowed`, in JE's order
+        // (`Cursor.checkUpdatesAllowed` config check first, then the
+        // `ReadonlyTxn.lockInternal` replica screen).  That is the only site
+        // with both the target DB's `is_replicated()` and the locker's
+        // `is_local_write()`, so it alone can reproduce JE's exact observable
+        // error for every combination (e.g. a local-write txn on a replicated
+        // DB must report the config mismatch, NOT `ReplicaWrite`).  This
+        // pre-flight therefore screens only `read_only`; every write path
+        // (put/delete/putNoOverwrite/putNoDupData) opens a cursor carrying the
+        // replica-write screen, so the JE-ordered check always runs.
         Ok(())
     }
 

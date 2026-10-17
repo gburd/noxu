@@ -269,7 +269,17 @@ impl LogWriter for EnvironmentLogWriter {
         // Port of JE: the replica writes the entry to its log, then
         // `Replay.replayEntry` applies it to the tree.
         if let Some(replay) = self.replay.as_mut() {
-            replay.apply_entry(vlsn, entry_type, payload, lsn);
+            // GAP-REPLAY-7: a DTVLSN validation failure is fatal -- surface it
+            // as a RepError so the replica reconnect loop tears the stream
+            // down (the EnvironmentFailureException-equivalent restart path),
+            // exactly like a VLSN-continuity or unknown-entry violation.
+            replay.apply_entry(vlsn, entry_type, payload, lsn).map_err(
+                |e| {
+                    crate::error::RepError::DatabaseError(format!(
+                        "replica replay-apply failed: {e}"
+                    ))
+                },
+            )?;
         }
 
         log::trace!(
@@ -325,27 +335,31 @@ impl ReplicaReceiver {
     ///
     /// Equivalent to [`Self::run_until`] with no shutdown flag.
     ///
-    /// # Anti-replay / VLSN-ordering enforcement (LOG-7)
+    /// # Dense VLSN continuity, fail-closed (FID-REPLAY-4)
     ///
-    /// The replica MUST observe strictly-increasing VLSNs across the
-    /// connection.  Without this check the master could (accidentally
-    /// or maliciously) replay an old frame, causing the replica to ack a
-    /// VLSN it had already applied and silently overwrite a more-recent
-    /// committed value.  We track a `received_vlsn` high-water mark and
-    /// reject any incoming frame whose VLSN is `<= high-water` with a
-    /// [`RepError::ProtocolError`].  Gaps above the high-water mark are
-    /// allowed because the master is permitted to skip non-replicated
-    /// entries.
+    /// The replica MUST observe DENSE, strictly-increasing VLSNs: every
+    /// real (vlsn > 0) frame must be EXACTLY `high-water + 1`.  JE
+    /// `Replay.replayEntry` (Replay.java:482-487) requires every record to
+    /// `follows()` the last replayed VLSN (exact +1); a non-increasing VLSN
+    /// (replay / reuse) OR a forward gap (a skipped VLSN) is
+    /// `EnvironmentFailureException`, fail-closed.  Noxu's replicable VLSNs
+    /// are dense (the feeder's send-side continuity invariant,
+    /// feeder.rs:530-575), so the receive side is symmetric.  Any violation
+    /// returns [`RepError::ProtocolError`], which the replica reconnect loop
+    /// surfaces and tears the stream down (the restart path).  The vlsn=0
+    /// NULL sentinel (an entry carrying no VLSN; never framed by a real
+    /// feeder) is exempt and does not advance the high-water.
     ///
-    /// # Entry-type validation (LOG-10)
+    /// # Entry-type validation, fail-closed (FID-REPLAY-5)
     ///
-    /// The wire-format entry-type byte is also validated against the set
-    /// of known [`LogEntryType`] variants before forwarding to
-    /// `log_writer`.  An unknown byte indicates either a protocol-version
-    /// skew or an attacker who flipped a header bit, and is logged at
-    /// `error` level then skipped (the connection is kept open so the
-    /// stream can recover from a single bad frame; a repeated stream of
-    /// unknowns will surface via the operator alerting on the error log).
+    /// The wire-format entry-type byte is validated against the set of known
+    /// [`LogEntryType`] variants before forwarding to `log_writer`.  An
+    /// unknown byte indicates a protocol-version skew or a flipped header
+    /// bit; the frame cannot be decoded.  JE never silently drops a
+    /// replication frame (`Replay.replayEntry`, Replay.java:468-611, has no
+    /// skip path), so an unknown type is FATAL: it returns
+    /// [`RepError::ProtocolError`] and tears the stream down rather than
+    /// dropping that VLSN from the replica log.
     pub fn run(&self, log_writer: &mut dyn LogWriter) -> Result<()> {
         self.run_until(log_writer, None)
     }
@@ -466,38 +480,65 @@ impl ReplicaReceiver {
             }
 
             // ----------------------------------------------------------------
-            // LOG-7: enforce strictly-increasing VLSN order.
+            // FID-REPLAY-4: enforce EXACT dense VLSN continuity, fail-closed.
             //
-            // VLSN 0 from the master is the NULL VLSN sentinel and is not
-            // checked against the high-water mark (the feeder sends 0 for
-            // entries that do not carry a VLSN).  All non-zero VLSNs MUST
-            // strictly exceed the previous high-water; otherwise we have
-            // either a replayed frame or a master that re-used a sequence
-            // number — both are protocol-fatal.
-            // ----------------------------------------------------------------
-            if vlsn != 0 && vlsn <= received_vlsn_high_water {
+            // JE `Replay.replayEntry` (Replay.java:482-487) requires every
+            // replicated record to directly FOLLOW the last replayed VLSN
+            // (`wireRecord.getVLSN().follows(lastReplayedVLSN)` — `VLSN.follows`
+            // is `other.isNull() && seq==1 || other.seq == seq-1`, i.e. exact
+            // +1).  Anything else — a non-increasing VLSN (replay / reuse) OR a
+            // FORWARD GAP (a skipped VLSN) — is `EnvironmentFailureException`.
+            //
+            // Noxu's replicable VLSNs are DENSE: the feeder's send-side
+            // VLSN-continuity invariant (feeder.rs:530-575, REP-FEEDER-SKIP)
+            // only ever emits the exact next VLSN (`last_returned_vlsn + 1`) and
+            // NEVER frames vlsn=0.  So the receive side is symmetric: a real
+            // (vlsn > 0) frame MUST equal `received_vlsn_high_water + 1`.  A
+            // forward gap can only be corruption or a buggy/hostile peer, and
+            // writing it would leave a hole the VLSN index can never fill
+            // (FID-REPLAY-4) — so we fail closed with a `ProtocolError`, which
+            // the replica reconnect loop surfaces and tears the stream down
+            // (the EnvironmentFailureException-equivalent restart path).
+            //
+            // vlsn=0 is the NULL_VLSN sentinel for an entry that carries no
+            // VLSN (the writer's plain-`log()` fallback, replica_stream.rs:228);
+            // a real feeder never frames it, and it does not advance the
+            // high-water, so it is exempt from the continuity check — exactly
+            // as JE's stream, which only sequences records that carry a VLSN.
+            if vlsn != 0 && vlsn != received_vlsn_high_water + 1 {
                 return Err(RepError::ProtocolError(format!(
-                    "replica: VLSN ordering violation: incoming vlsn={vlsn} \
-                     <= received high-water {received_vlsn_high_water}; \
-                     possible replay attack or master clock-skew"
+                    "replica: VLSN continuity violation: incoming vlsn={vlsn} \
+                     is not received high-water {received_vlsn_high_water} + 1 \
+                     (a gap, a replay, or master clock-skew); \
+                     the replication stream is not dense"
                 )));
             }
-
             // ----------------------------------------------------------------
-            // LOG-10: validate the entry-type byte against the catalog
-            // before forwarding to the log writer.  An unknown type is
-            // logged and the frame is skipped — but the connection stays
-            // open so a single corrupt frame does not stall replication.
+            // FID-REPLAY-5: an unknown / undecodable entry type is FATAL.
+            //
+            // JE `Replay.replayEntry` (Replay.java:468-611) has no silent-skip
+            // path: a record whose log-entry type is not in the catalog cannot
+            // even be decoded into a `LogEntry` (the decode throws), and the
+            // final `else` branch asserts the record is a data LN
+            // (`assert wireRecord.getLogEntry() instanceof LNLogEntry`).  An
+            // unknown or undecodable entry therefore propagates as an
+            // `EnvironmentFailureException` -- the replica NEVER drops a
+            // replication frame.
+            //
+            // The old behaviour (log::error! + `continue`) silently dropped the
+            // frame: it did not advance the high-water and did not ack, so that
+            // VLSN went missing from the replica log while the stream carried on
+            // -- a divergence the replica could never detect.  Fail closed
+            // instead: a `ProtocolError` the reconnect loop surfaces and tears
+            // the stream down (the EnvironmentFailureException-equivalent
+            // restart path), so the hole is never written.
             // ----------------------------------------------------------------
             if LogEntryType::from_type_num(entry_type).is_none() {
-                log::error!(
+                return Err(RepError::ProtocolError(format!(
                     "replica: unknown entry_type byte {entry_type} on frame \
-                     vlsn={vlsn}; skipping (LOG-10)"
-                );
-                // Skip this frame: do not advance high-water, do not ack.
-                // The master will retransmit if the replica disconnects;
-                // for now we just continue to the next frame.
-                continue;
+                     vlsn={vlsn}; replication stream cannot be decoded \
+                     (fail-closed, FID-REPLAY-5)"
+                )));
             }
 
             // ----------------------------------------------------------------
@@ -886,28 +927,34 @@ mod tests {
         assert_eq!(last_acked, 5);
     }
 
-    /// LOG-7: a replayed (or out-of-order) frame whose VLSN is `<=` the
-    /// already-received high-water mark must be rejected with
-    /// [`RepError::ProtocolError`].  Without this check the master could
-    /// re-send a previously-acked frame and the replica would silently
-    /// overwrite a more-recent committed value.
+    /// FID-REPLAY-4: a replayed (out-of-order) frame whose VLSN is NOT the
+    /// exact next in the dense sequence must be rejected with
+    /// [`RepError::ProtocolError`].  Without this the master could re-send a
+    /// previously-acked frame and the replica would silently overwrite a
+    /// more-recent committed value.  Stream VLSNs 1, 2 (dense, accepted) then
+    /// replay VLSN=1 (already applied -> not high-water+1 -> rejected).
     #[test]
     fn test_replica_rejects_replayed_vlsn() {
         let pair = LocalChannelPair::new();
         let master_side: Arc<dyn Channel> = Arc::new(pair.channel_a);
         let replica_side: Arc<dyn Channel> = Arc::new(pair.channel_b);
 
-        // Send VLSN=5 then VLSN=3 (replay).  Entry-type 10 = InsertLN.
-        let frames =
-            vec![make_frame(5, 10, b"first"), make_frame(3, 10, b"replay")];
+        // Dense 1, 2 then a replay of VLSN=1.  Entry-type 10 = InsertLN.
+        let frames = vec![
+            make_frame(1, 10, b"first"),
+            make_frame(2, 10, b"second"),
+            make_frame(1, 10, b"replay"),
+        ];
 
         let master_clone = Arc::clone(&master_side);
         let _send_handle = std::thread::spawn(move || {
             for f in &frames {
                 let _ = master_clone.send(f);
             }
-            // Drain the ack for the first frame so the receiver can advance.
-            let _ = master_clone.receive(Duration::from_secs(2));
+            // Drain acks for the two in-order frames so the receiver advances.
+            for _ in 0..2 {
+                let _ = master_clone.receive(Duration::from_secs(2));
+            }
         });
 
         let receiver = ReplicaReceiver::new(replica_side);
@@ -917,8 +964,8 @@ mod tests {
         match res {
             Err(RepError::ProtocolError(msg)) => {
                 assert!(
-                    msg.contains("VLSN ordering violation"),
-                    "expected VLSN-ordering protocol error, got: {msg}"
+                    msg.contains("VLSN continuity violation"),
+                    "expected VLSN-continuity protocol error, got: {msg}"
                 );
             }
             other => {
@@ -926,21 +973,23 @@ mod tests {
             }
         }
 
-        // The first (in-order) frame should have been applied; the
-        // replayed one MUST NOT be.
-        assert_eq!(writer.entries.len(), 1);
-        assert_eq!(writer.entries[0].0, 5);
+        // The two in-order frames were applied; the replayed one MUST NOT be.
+        assert_eq!(writer.entries.len(), 2);
+        assert_eq!(writer.entries[0].0, 1);
+        assert_eq!(writer.entries[1].0, 2);
     }
 
-    /// LOG-7: equal VLSNs are also rejected (the rule is *strictly*
-    /// increasing).
+    /// FID-REPLAY-4: a duplicate VLSN is also rejected (the dense rule
+    /// requires each real VLSN to be exactly high-water+1, so an equal VLSN
+    /// is neither increasing nor dense).  Stream VLSN=1 (accepted) then a
+    /// duplicate VLSN=1.
     #[test]
     fn test_replica_rejects_duplicate_vlsn() {
         let pair = LocalChannelPair::new();
         let master_side: Arc<dyn Channel> = Arc::new(pair.channel_a);
         let replica_side: Arc<dyn Channel> = Arc::new(pair.channel_b);
 
-        let frames = vec![make_frame(7, 10, b"a"), make_frame(7, 10, b"b")];
+        let frames = vec![make_frame(1, 10, b"a"), make_frame(1, 10, b"b")];
 
         let master_clone = Arc::clone(&master_side);
         let _send_handle = std::thread::spawn(move || {
@@ -960,83 +1009,121 @@ mod tests {
         assert_eq!(writer.entries.len(), 1);
     }
 
-    /// LOG-7: a gap in the VLSN sequence (`vlsn > high-water + 1`) is
-    /// allowed — the master may legitimately skip VLSNs (non-replicated
-    /// entries reuse the same connection).
+    /// FID-REPLAY-4 WITNESS: a forward GAP in the VLSN sequence
+    /// (`vlsn > high-water + 1`) must FAIL CLOSED, exactly as JE
+    /// `Replay.replayEntry` (Replay.java:482-487) rejects any record that
+    /// does not `follows()` the last replayed VLSN with
+    /// `EnvironmentFailureException`.  Noxu's replicable VLSNs are dense
+    /// (feeder.rs:530-575), so the only way a receiver sees a gap is
+    /// corruption or a hostile peer: writing it would leave a hole the
+    /// VLSN index can never fill.
+    ///
+    /// RED at 81b2f048 (the old `test_replica_allows_vlsn_gap` ASSERTED the
+    /// bug: it accepted 1 -> 5 -> 100 and wrote all three).  GREEN after the
+    /// fix: the gap frame is rejected and NOT written.
     #[test]
-    fn test_replica_allows_vlsn_gap() {
+    fn test_replica_fails_closed_on_vlsn_gap() {
         let pair = LocalChannelPair::new();
         let master_side: Arc<dyn Channel> = Arc::new(pair.channel_a);
         let replica_side: Arc<dyn Channel> = Arc::new(pair.channel_b);
 
-        // VLSN gap: 1 → 5 → 100.
-        let frames = vec![
-            make_frame(1, 10, b"a"),
-            make_frame(5, 10, b"b"),
-            make_frame(100, 10, b"c"),
-        ];
+        // In-order VLSN=1, then a forward gap to VLSN=3 (skips 2).
+        let frames = vec![make_frame(1, 10, b"a"), make_frame(3, 10, b"gap")];
 
         let master_clone = Arc::clone(&master_side);
-        let send_handle = std::thread::spawn(move || {
+        let _send_handle = std::thread::spawn(move || {
             for f in &frames {
-                master_clone.send(f).unwrap();
+                let _ = master_clone.send(f);
             }
-            for _ in 0..3 {
-                let _ = master_clone.receive(Duration::from_secs(2));
+            // Drain the acks the receiver may send, then close so that on the
+            // BUGGY (base) behaviour the receiver returns Ok after writing the
+            // gap frame instead of blocking forever waiting for more frames
+            // (a clean RED assertion failure, never a hang / rc=124).
+            for _ in 0..2 {
+                let _ = master_clone.receive(Duration::from_secs(1));
             }
-            master_clone.close().unwrap();
+            let _ = master_clone.close();
         });
 
         let receiver = ReplicaReceiver::new(replica_side);
         let mut writer = RecordingWriter::new();
-        receiver.run(&mut writer).unwrap();
-        send_handle.join().unwrap();
+        let res = receiver.run(&mut writer);
 
-        assert_eq!(writer.entries.len(), 3);
+        match res {
+            Err(RepError::ProtocolError(msg)) => {
+                assert!(
+                    msg.contains("VLSN continuity violation"),
+                    "expected VLSN-continuity protocol error, got: {msg}"
+                );
+            }
+            other => panic!(
+                "expected ProtocolError on a forward VLSN gap, got {other:?}"
+            ),
+        }
+
+        // Only the in-order VLSN=1 was applied; the gap frame MUST NOT be.
+        assert_eq!(writer.entries.len(), 1);
         assert_eq!(writer.entries[0].0, 1);
-        assert_eq!(writer.entries[1].0, 5);
-        assert_eq!(writer.entries[2].0, 100);
     }
 
-    /// LOG-10: an unknown entry-type byte is logged and the frame is
-    /// skipped.  The connection stays open; subsequent valid frames are
-    /// applied normally.
+    /// FID-REPLAY-5 WITNESS: an unknown / undecodable entry-type byte must
+    /// FAIL CLOSED, exactly as JE `Replay.replayEntry` (Replay.java:468-611),
+    /// which has no silent-skip path -- an undecodable record propagates as
+    /// EnvironmentFailureException and the final `else` branch asserts the
+    /// record is a data LN.  The replica NEVER drops a replication frame.
+    ///
+    /// RED at 81b2f048 (the old `test_replica_skips_unknown_entry_type`
+    /// ASSERTED the bug: the bogus frame was skipped and streaming continued).
+    /// GREEN after: the receiver returns a ProtocolError and writes nothing.
     #[test]
-    fn test_replica_skips_unknown_entry_type() {
+    fn test_replica_fails_closed_on_unknown_entry_type() {
         let pair = LocalChannelPair::new();
         let master_side: Arc<dyn Channel> = Arc::new(pair.channel_a);
         let replica_side: Arc<dyn Channel> = Arc::new(pair.channel_b);
 
         // VLSN=1: bogus entry_type=200 (no LogEntryType::from_type_num).
-        // VLSN=2: valid InsertLN (10).  After my high-water bookkeeping,
-        // VLSN=2 must still be accepted because the bogus frame did NOT
-        // advance the high-water.
+        // VLSN=2: a valid InsertLN (10) that MUST NOT be reached, because the
+        // bogus frame is fatal.
         let frames =
             vec![make_frame(1, 200, b"bogus"), make_frame(2, 10, b"good")];
 
         let master_clone = Arc::clone(&master_side);
-        let send_handle = std::thread::spawn(move || {
+        let _send_handle = std::thread::spawn(move || {
             for f in &frames {
-                master_clone.send(f).unwrap();
+                let _ = master_clone.send(f);
             }
-            // Only the second (valid) frame produces an ack.
-            let ack = master_clone.receive(Duration::from_secs(2)).unwrap();
-            master_clone.close().unwrap();
-            ack
+            // Drain any acks, then close so that on the BUGGY (base) behaviour
+            // the receiver returns Ok after skipping the bogus frame and
+            // applying VLSN=2, giving a clean RED assertion (never a hang).
+            for _ in 0..2 {
+                let _ = master_clone.receive(Duration::from_secs(1));
+            }
+            let _ = master_clone.close();
         });
 
         let receiver = ReplicaReceiver::new(replica_side);
         let mut writer = RecordingWriter::new();
-        receiver.run(&mut writer).unwrap();
+        let res = receiver.run(&mut writer);
 
-        let ack = send_handle.join().unwrap();
-        let acked_vlsn =
-            u64::from_le_bytes(ack.unwrap()[..8].try_into().unwrap());
+        match res {
+            Err(RepError::ProtocolError(msg)) => {
+                assert!(
+                    msg.contains("unknown entry_type"),
+                    "expected unknown-entry-type protocol error, got: {msg}"
+                );
+            }
+            other => panic!(
+                "expected ProtocolError on an unknown entry type, got {other:?}"
+            ),
+        }
 
-        assert_eq!(writer.entries.len(), 1, "bogus frame must be skipped");
-        assert_eq!(writer.entries[0].0, 2);
-        assert_eq!(writer.entries[0].1, 10);
-        assert_eq!(acked_vlsn, 2);
+        // The bogus frame is fatal: nothing was written, not even a later
+        // valid frame (the stream is torn down before it is reached).
+        assert_eq!(
+            writer.entries.len(),
+            0,
+            "an unknown entry type must be fatal, not skipped"
+        );
     }
 
     // -----------------------------------------------------------------------
