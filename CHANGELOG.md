@@ -113,6 +113,8 @@ user-facing scope, symptoms, and preconditions.
   rollback revert, and a recovery scanner that distinguishes an empty
   non-deleted LN from a deletion.
 
+### Fixed — durability
+
 - **Deferred-write `sync()` was not durable** (`BUG-DW-SYNC-1` /
   `BUG-DW-EVICT-NULLLSN`, A13): on a deferred-write database, `sync()` followed
   by a crash lost the synced records, and evicting a deferred-write BIN with a
@@ -236,39 +238,6 @@ user-facing scope, symptoms, and preconditions.
   `NoxuError::is_committed_at_master()` and that it must not be auto-retried
   (`is_retryable() == false`). JE `InsufficientAcksException.java:21-35`.
 
-### API (additive)
-
-- **New `NoxuError::InsufficientAcks { required, available }`** (`FID-DUR-1`):
-  the committed-at-master analogue of JE
-  `com.sleepycat.je.rep.InsufficientAcksException` — a replicated commit that is
-  durable at the master but obtained fewer replica acks than the durability
-  policy required within the timeout.  Distinct from the pre-commit
-  `NoxuError::InsufficientReplicas` (abort-only; the write did not happen).
-  Accompanied by a new classification helper
-  `NoxuError::is_committed_at_master()`.  Additive and patch-safe:
-  `NoxuError` is `#[non_exhaustive]`, so existing exhaustive `match`es already
-  carry a wildcard arm.  The post-commit ack-timeout path in
-  `Transaction::commit_with_durability` now returns this variant instead of
-  `InsufficientReplicas`.
-
-### Replication (JE fidelity)
-
-- **Replica reads now take read locks and a replica refuses local user
-  writes** (`GAP-REPLAY-3`, `FID-REPLAY-1`): to match JE, where every replica
-  read goes through a `ReadonlyTxn` that acquires real read locks and screens
-  writes (`ReadonlyTxn.disallowReplicaWrite` -> `ReplicaWriteException`), a
-  node that is a **replica** now refuses local user writes with
-  `NoxuError::ReplicaWrite`, and the replica-replay path holds an **importunate
-  write lock** on each record it applies for the whole stream->commit window.
-  A replica read that overlaps an in-flight replayed transaction therefore
-  blocks briefly behind the replay (or, if it already held the record lock, is
-  preempted — `NoxuError::LockPreempted`), so it observes a replayed
-  transaction all-or-nothing instead of a torn, partially-applied state. This
-  is a behaviour change on the replica read/write path (previously replica
-  reads were lock-free and local replica writes were silently accepted); it
-  restores the JE isolation contract and is enabled by default. JE
-  `ReadonlyTxn.java:72-110`, `ReplayTxn.java:113`, `Replay.applyLN`.
-
 ### Fixed — during this release cycle (not present in v7.11.0)
 
 Defects that were introduced and fixed *within* the v7.11.1 development cycle;
@@ -288,7 +257,7 @@ recorded here for completeness.
   onto stack-v1, fails 20/20 onto the C2 tip; the only path-relevant delta is
   `0cd8b502`).
 
-### Fixed — liveness / availability
+### Fixed — availability
 
 - **aarch64 read-write lock lost wake** (`BUG-SYNC-RWLOCK-LOST-WAKE`, A1): on
   aarch64 the `NoxuRawRwLock` could lose a wakeup and leave a waiter parked
@@ -334,6 +303,48 @@ recorded here for completeness.
   persistence, secondary-index, lock-manager, and environment-drop paths are
   fixed.
 
+### Fixed — replication (JE fidelity)
+
+- **Replica reads now take read locks; a replica refuses all local user
+  writes, DDL, and database creates** (`GAP-REPLAY-3`, `FID-REPLAY-1`): to match
+  JE, where every replica
+  read goes through a `ReadonlyTxn` that acquires real read locks and screens
+  writes (`ReadonlyTxn.disallowReplicaWrite` -> `ReplicaWriteException`), a
+  node that is a **replica** now refuses local user writes with
+  `NoxuError::ReplicaWrite`, and the replica-replay path holds an **importunate
+  write lock** on each record it applies for the whole stream->commit window.
+  A replica read that overlaps an in-flight replayed transaction therefore
+  blocks briefly behind the replay (or, if it already held the record lock, is
+  preempted — `NoxuError::LockPreempted`), so it observes a replayed
+  transaction all-or-nothing instead of a torn, partially-applied state. This
+  is a behaviour change on the replica read/write path (previously replica
+  reads were lock-free and local replica writes were silently accepted); it
+  restores the JE isolation contract and is enabled by default. JE
+  `ReadonlyTxn.java:72-110`, `ReplayTxn.java:113`, `Replay.applyLN`.
+
+  **7.11.x safety gate (`GAP-REPLAY-3`):** JE's screen predicate
+  (`DatabaseImpl.allowReplicaWrite`, `DatabaseImpl.java:785`) permits a
+  *non-replicated* (local) database in a replicated group to be written and
+  created on a replica. JE makes that safe with machinery Noxu has not yet
+  ported (a `NO_REPLICATE` replication context that takes no VLSN, and a
+  separate negative db-id space). Until those land, a replicated environment
+  marks **every** user database replicated for screening, so in 7.11.x a
+  replica refuses **all** user writes, DDL (remove / truncate / rename), and
+  database creates with `NoxuError::ReplicaWrite` — the conservative behaviour
+  expressed through the JE-shaped predicate. Opening an existing database (a
+  pure NameLN read) is still allowed. `DatabaseConfig::{set,with}_replicated`
+  are re-deprecated with a note that `replicated=false` is not yet supported in
+  a replicated environment. Full local-database support is sized for v8.0.0
+  (the negative on-disk db-id space; a possible patch-safe NameLN-bit
+  alternative). JE `DatabaseImpl.allowReplicaWrite`, `DbTree.doCreateDb` /
+  `checkReplicaWrite`, `DbTree.lockNameLN`.
+
+- **The acceptor's / VLSN-index persister's missing directory fsync**
+  (`F-ELECT8-E`): see *Fixed — durability* — a crash just after the
+  `acceptor.state` (or `vlsn.idx`) rename could revert a persisted Paxos
+  promise/accept and allow two masters; fixed by fsyncing the parent directory
+  after the rename.
+
 - **Election value ranking dropped a non-JE `term` tiebreak** (`FID-ELECT-1`
   follow-up): the `Proposal` ordering that selects the Phase-2 election value
   (`choose_phase2_value`, JE `RankingProposer.choosePhase2Value`) ranked
@@ -354,6 +365,70 @@ recorded here for completeness.
   is the socket address, deferred to v8.0.0 — see *Known issues*
   (`FID-ELECT-RANK-ADDR`, `FID-ELECT-LEARNER`). No on-disk, wire, or public-API
   change.
+
+- **Network restore could leave a torn or silently-incomplete database**
+  (`FID-NR-1/2/3/4/7/8/9`): the client-side network-restore path and the
+  server-side feeder had several fidelity gaps vs JE `NetworkBackup` /
+  `LogFileFeeder` / `RestoreMarker`. Each transferred file is now written to a
+  `.tmp` name, `sync_all`ed, digest-verified, and only then renamed into place
+  (`NetworkBackup.getFile`, `NetworkBackup.java:575`); a restore writes a
+  **restore-required marker** up-front and refuses to open a
+  crashed-mid-restore environment until the restore completes
+  (`RestoreMarker`); obsolete files are disposed **highest-first** to keep the
+  log prefix always valid (`disposeObsoleteFiles`, `NetworkBackup.java:720`);
+  residual files not in the restored set are cleaned up and any missing set
+  member is reported (`cleanup`, `NetworkBackup.java:429`); a failed `.bak`
+  rename or delete raises a typed error instead of being swallowed
+  (`disposeFile`, `NetworkBackup.java:751`); and the feeder protects the exact
+  snapshot of files for the whole send, releasing protection per file and on
+  **every** exit path including a mid-send client disconnect (RAII `Drop`),
+  closing a cleaner/restore file-deletion race (`LogFileFeeder.java:443/290`).
+  No on-disk format change (`LOG_VERSION` stays 3; reuses the existing
+  `ImmutableFile = 70` and `RestoreRequired` log-entry types; the restore
+  marker is a distinctly-named non-`.ndb` file an old reader's enumeration
+  ignores). **Downgrade caveat (restore marker):** the restore-required marker
+  is a non-`.ndb` file (not JE's `MAXINT.jdb` log file), so a **7.11.0 binary**
+  reopening an environment that crashed *mid network restore* will NOT detect
+  the incomplete restore and will NOT refuse to open it (an old reader ignores
+  the non-`.ndb` marker). A 7.11.1+ binary always refuses correctly and re-runs
+  the restore. This is a downgrade-only corner (7.11.0 never had any restore
+  marker at all, so it is not a regression) and affects only the
+  downgrade + crash-mid-restore combination.
+
+- **`DbBackup` did not seal the backup's last file, and a rollback could
+  overwrite a backup's files** (`FID-BACKUP-1/2`): `start_backup` now writes an
+  immutable-file marker and flips the log so every file in the backup list is
+  immutable and later writes go to a strictly-higher file
+  (`DbBackup.startBackup`, `DbBackup.java:534-549`); a replica rollback marks
+  backups prohibited and invalidates any open backup for the overwritten log
+  range, re-enabling backups on both the success and error paths
+  (`RepImpl.addDbBackup`/`invalidateBackups`/`setBackupProhibited`,
+  `Replay.rollback`, `DbBackup.java:488/606`). An in-flight backup that races a
+  rollback now fails closed with `LogOverwriteException` instead of silently
+  capturing overwritten data.
+
+### Changed
+
+- **New `NoxuError::InsufficientAcks { required, available }`** (`FID-DUR-1`,
+  additive and patch-safe): the committed-at-master analogue of JE
+  `com.sleepycat.je.rep.InsufficientAcksException` — a replicated commit that is
+  durable at the master (the `TxnCommit` is already fsynced and the locks
+  released) but obtained fewer replica acks than the durability policy required
+  within the timeout.  Distinct from the pre-commit
+  `NoxuError::InsufficientReplicas` (abort-only; the write did not happen).
+  Accompanied by a new classification helper
+  `NoxuError::is_committed_at_master()`; the write is durable, so
+  `is_retryable()` is `false` (retrying would double-apply).  Additive and
+  patch-safe because `NoxuError` is `#[non_exhaustive]`, so existing exhaustive
+  `match`es already carry a wildcard arm.  The post-commit ack-timeout path in
+  `Transaction::commit_with_durability` now returns this variant instead of
+  `InsufficientReplicas`.
+
+- **Replica isolation / write-screen behaviour change** (`GAP-REPLAY-3`,
+  `FID-REPLAY-1`): replica reads now take read locks and a replica refuses all
+  user writes, DDL, and database creates — see *Fixed — replication* above for
+  the full description. Previously replica reads were lock-free and local
+  replica writes were silently accepted. Enabled by default.
 
 ### Fixed — internal crates (no stability guarantee)
 
@@ -405,6 +480,8 @@ Stable-foundational crates are unchanged at the public-API level
   patch-safe (a new protocol message), so the Learner protocol lands in
   v8.0.0. A ready `#[ignore]`d witness is committed
   (`tests/fid_elect_learner_stall.rs`).
+
+<!-- R-REPUSER: pending owner decision #9 -->
 
 
 ## [7.11.0] - 2026-09-28
