@@ -157,23 +157,14 @@ const FS_DATA_SIZE: usize = 140;
 const FS_FILE_SIZE: u64 = 4096 * 10;
 const FS_INITIAL_FILES: u64 = 5;
 
-/// Count the `*.ndb` log files currently on disk in `dir`.
-fn count_log_files(dir: &Path) -> u64 {
-    std::fs::read_dir(dir)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path().extension().and_then(|x| x.to_str()) == Some("ndb")
-        })
-        .count() as u64
-}
-
 /// Faithful port of JE `FileSelectionTest.writeData()` (non-dup, non-temp,
 /// non-deferred branch): write records inside ONE explicit transaction via a
-/// transactional cursor using `putNoOverwrite`, until `INITIAL_FILES` log
-/// files exist (JE loops `while (fileNum < INITIAL_FILES)`, which also leaves
-/// "one extra file" so the first active LSN is past the INITIAL_FILES files);
-/// then commit the single transaction and force a checkpoint.
+/// transactional cursor using `putNoOverwrite`, looping `while (fileNum <
+/// INITIAL_FILES)` exactly as JE does — tracking each put's LN log-file number
+/// via the cursor LSN (JE `getLsn(cursor)`), so the loop stops once an LN
+/// lands in file `INITIAL_FILES` (leaving "one extra file" past the
+/// INITIAL_FILES files, as JE guarantees).  Then commit the single
+/// transaction and force a checkpoint.
 ///
 /// The crucial fidelity point versus the old auto-commit port: ALL `N` LNs
 /// are written under one locker, so the log carries exactly ONE `TxnCommit`
@@ -181,19 +172,27 @@ fn count_log_files(dir: &Path) -> u64 {
 /// with per-put commit frames (v7.11.1 Option B), which is what forced the
 /// since-removed per-LN straggler relaxation.
 ///
-/// Returns the number of records written (JE's `existingKeys.size()`).
-fn write_data(env: &Environment, db: &noxu_db::Database, dir: &Path) -> u32 {
-    let first_file = count_log_files(dir);
+/// Returns `(existingKeys, firstKeysInFiles)`:
+/// * `existing_keys` — every key written, in order (JE `existingKeys`).
+/// * `first_keys_in_files` — `first_keys_in_files[f]` is the first key whose
+///   LN landed in log file `f` (JE `firstKeysInFiles`, indexed by file
+///   number).  Built from the per-put cursor LSN (JE `getLsn(cursor)` via
+///   `Cursor::current_lsn_for_test`).
+fn write_data(
+    env: &Environment,
+    db: &noxu_db::Database,
+) -> (Vec<u32>, Vec<u32>) {
     let value = vec![0u8; FS_DATA_SIZE];
+    let mut existing_keys: Vec<u32> = Vec::new();
+    let mut first_keys_in_files: Vec<u32> = Vec::new();
 
     let txn = env.begin_transaction(None).unwrap();
-    let mut next_key: u32 = 0;
     {
         let mut cursor = db.open_cursor_in(&txn, None).unwrap();
-        // JE writes until an LN lands in file INITIAL_FILES; Noxu has no
-        // public cursor->LSN hook, so advance until that many files exist
-        // (plus the "one extra file" JE guarantees).
-        while count_log_files(dir) < FS_INITIAL_FILES + first_file + 1 {
+        // JE: int fileNum = -1; for (nextKey = 0; fileNum < INITIAL_FILES; ..)
+        let mut file_num: i64 = -1;
+        let mut next_key: u32 = 0;
+        while file_num < FS_INITIAL_FILES as i64 {
             let status = cursor
                 .put(
                     &DatabaseEntry::from_bytes(&ikey(next_key)),
@@ -206,6 +205,25 @@ fn write_data(env: &Environment, db: &noxu_db::Database, dir: &Path) -> u32 {
                 noxu_db::OperationStatus::Success,
                 "putNoOverwrite must insert a fresh key"
             );
+            existing_keys.push(next_key);
+
+            // JE: long lsn = getLsn(cursor);
+            //     if (DbLsn.getFileNumber(lsn) != fileNum) { .. record .. }
+            let put_file = cursor.current_lsn_for_test().file_number() as i64;
+            if put_file != file_num {
+                assert!(
+                    file_num < put_file,
+                    "log files must advance monotonically ({file_num} -> \
+                     {put_file})"
+                );
+                file_num = put_file;
+                assert_eq!(
+                    file_num as usize,
+                    first_keys_in_files.len(),
+                    "firstKeysInFiles index must equal the file number"
+                );
+                first_keys_in_files.push(next_key);
+            }
             next_key += 1;
         }
         cursor.close().unwrap();
@@ -213,12 +231,106 @@ fn write_data(env: &Environment, db: &noxu_db::Database, dir: &Path) -> u32 {
     txn.commit().unwrap();
     env.checkpoint(Some(&force())).unwrap();
 
-    let last_file = count_log_files(dir);
-    assert!(
-        last_file >= FS_INITIAL_FILES + first_file,
-        "writeData must create at least INITIAL_FILES files (got {last_file})"
-    );
-    next_key
+    (existing_keys, first_keys_in_files)
+}
+
+/// JE `FileSelectionTest.deleteData(firstKey, keyCount)`: delete `count` keys
+/// starting at `first_key`, inside ONE explicit transaction via a cursor
+/// (`getSearchKey` then `cursor.delete()`), updating `existing_keys`.
+fn delete_data(
+    env: &Environment,
+    db: &noxu_db::Database,
+    existing_keys: &mut Vec<u32>,
+    first_key: u32,
+    count: u32,
+) {
+    let txn = env.begin_transaction(None).unwrap();
+    {
+        let mut cursor = db.open_cursor_in(&txn, None).unwrap();
+        let mut data = DatabaseEntry::new();
+        for i in 0..count {
+            let next_key = first_key + i;
+            let mut key = DatabaseEntry::from_bytes(&ikey(next_key));
+            let status = cursor
+                .get(&mut key, &mut data, noxu_db::Get::Search, None)
+                .unwrap();
+            assert_eq!(
+                status,
+                noxu_db::OperationStatus::Success,
+                "deleteData: key {next_key} must exist"
+            );
+            cursor.delete().unwrap();
+            existing_keys.retain(|&k| k != next_key);
+        }
+        cursor.close().unwrap();
+    }
+    txn.commit().unwrap();
+}
+
+/// JE `FileSelectionTest.verifyData()`: every key in `existing_keys` is still
+/// present with a `DATA_SIZE`-byte value.
+fn verify_data(db: &noxu_db::Database, existing_keys: &[u32]) {
+    for &k in existing_keys {
+        let mut val = DatabaseEntry::new();
+        let found = db
+            .get_into(None, DatabaseEntry::from_bytes(&ikey(k)), &mut val)
+            .unwrap();
+        assert!(found, "verifyData: key {k} must survive");
+        assert_eq!(
+            val.data_opt().map(|d| d.len()),
+            Some(FS_DATA_SIZE),
+            "verifyData: key {k} value must be DATA_SIZE bytes"
+        );
+    }
+}
+
+/// JE `FileSelectionTest.verifyDeletedFiles(shouldNotExist)`: every log file
+/// from 0..=lastFileNum must exist on disk EXCEPT those whose number appears
+/// in `should_not_exist`.  File numbers are the 8-hex `*.ndb` stems
+/// (`FileManager::format_file_number`).
+///
+/// On a mismatch this fails with the observed-vs-expected file sets (JE's
+/// `fail(..)` message), so a genuine Noxu format difference is REPORTED, not
+/// hidden by a loosened bound.
+fn verify_deleted_files(dir: &Path, should_not_exist: &[u32]) {
+    let present: std::collections::BTreeSet<u32> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name();
+            let name = name.to_str()?;
+            let stem = name.strip_suffix(".ndb")?;
+            u32::from_str_radix(stem, 16).ok()
+        })
+        .collect();
+    let last = present.iter().copied().max().unwrap_or(0);
+    let should_not: std::collections::BTreeSet<u32> =
+        should_not_exist.iter().copied().collect();
+    for f in 0..=last {
+        let should_exist = !should_not.contains(&f);
+        let does_exist = present.contains(&f);
+        assert_eq!(
+            should_exist, does_exist,
+            "verifyDeletedFiles mismatch at file {f}: shouldExist={should_exist} \
+             doesExist={does_exist}; filesThatShouldNotExist={should_not_exist:?} \
+             filesThatDoExist={present:?}"
+        );
+    }
+}
+
+/// Non-forced `env.cleanLog()` that also crosses Noxu's two-checkpoint
+/// safe-to-delete barrier so any file the pass selected is physically deleted,
+/// matching JE's `env.cleanLog(); env.checkpoint(forceConfig)` observable
+/// (JE deletes during the single post-clean checkpoint; Noxu's X-5 barrier is
+/// `cleaned_files` -> ckpt -> `checkpointed` -> ckpt -> `safe_to_delete` ->
+/// next pass deletes).  Uses ONLY public API: the trailing `clean_log()` runs
+/// `delete_safe_files`; it selects no new file here because the only
+/// below-threshold file was already taken by the first pass.
+fn clean_log_and_reclaim(env: &Environment) {
+    env.clean_log().unwrap();
+    env.checkpoint(Some(&force())).unwrap();
+    env.checkpoint(Some(&force())).unwrap();
+    env.clean_log().unwrap();
 }
 
 // ===========================================================================
@@ -798,46 +910,191 @@ fn in_util_recovery_preserves_utilization() {
 // FileSelectionTest — least-utilized file selection
 // ===========================================================================
 
-/// JE `FileSelectionTest.testMinFileUtilization` / `testBasic` (portable
-/// core): the cleaner selects and reclaims the least-utilized files. Fill many
-/// files, delete a contiguous prefix to drive some files to low utilization,
-/// then clean and confirm the deleted data is gone, the surviving data is
-/// intact, and the cleaner reclaimed files. Exercises
-/// `UtilizationProfile.getBestFileForCleaning` / `file_selector` selection.
+/// Open a `FileSelectionTest`-style env: JE `FILE_SIZE`, daemons off, with an
+/// explicit `min_utilization` / `min_file_utilization` pair (JE
+/// `CLEANER_MIN_UTILIZATION` / `CLEANER_MIN_FILE_UTILIZATION`).
+fn open_file_selection_env(
+    dir: &Path,
+    min_utilization: u8,
+    min_file_utilization: u8,
+) -> Environment {
+    let mut cfg = EnvironmentConfig::new(dir.to_path_buf())
+        .with_allow_create(true)
+        .with_transactional(true)
+        .with_log_file_max_bytes(FS_FILE_SIZE)
+        .with_cleaner_min_utilization(min_utilization)
+        .with_cleaner_min_file_utilization(min_file_utilization);
+    cfg.set_run_cleaner(false);
+    cfg.set_run_evictor(false);
+    cfg.set_run_checkpointer(false);
+    cfg.set_run_in_compressor(false);
+    Environment::open(cfg).unwrap()
+}
+
+/// Faithful port of JE `FileSelectionTest.testBasic()` (non-dup, non-temp,
+/// non-deferred).  JE source (FileSelectionTest.java ~:281-334):
+///
+/// ```java
+/// openEnv();
+/// writeData();
+/// verifyDeletedFiles(null);
+/// // The first file should be the first to be cleaned because it has
+/// // relatively few LNs.
+/// forceCleanOne();
+/// verifyDeletedFiles(new int[] {0});
+/// verifyData();
+/// // Delete most of the LNs in two middle files.  They should be the next
+/// // two files cleaned.
+/// int fileNum = INITIAL_FILES / 2;
+/// int firstKey = firstKeysInFiles.get(fileNum);
+/// int nextKey  = firstKeysInFiles.get(fileNum + 1);
+/// int count    = nextKey - firstKey - 4;
+/// deleteData(firstKey, count);
+/// fileNum += 1;
+/// firstKey = firstKeysInFiles.get(fileNum);
+/// nextKey  = firstKeysInFiles.get(fileNum + 1);
+/// count    = nextKey - firstKey - 4;
+/// deleteData(firstKey, count);
+/// forceCleanOne();
+/// forceCleanOne();
+/// verifyDeletedFiles(new int[] {0, fileNum - 1, fileNum});
+/// verifyData();
+/// ```
+///
+/// Ported exactly, including JE's deterministic deleted-file sets.  If Noxu's
+/// file set diverges, `verify_deleted_files` fails with observed-vs-expected
+/// rather than loosening the bound.
 #[test]
-fn file_selection_reclaims_low_utilization_files() {
+fn file_selection_test_basic() {
     let dir = TempDir::new().unwrap();
-    let env = open_cleaner_env(dir.path(), 8192);
+    // JE openEnv(): default minUtilization=50, default minFileUtilization.
+    // forceCleanOne bypasses both (forced), so the exact values do not matter
+    // for this test; use JE's defaults (50, 5).
+    let env = open_file_selection_env(dir.path(), 50, 5);
     let db = open_db(&env, false);
 
-    const N: u32 = 400;
-    let value = vec![0xC3u8; 120];
-    for i in 0..N {
-        db.put(ikey(i), &value).unwrap();
-    }
-    // Delete the first half so early files become mostly obsolete.
-    for i in 0..(N / 2) {
-        assert!(db.delete(ikey(i)).unwrap());
-    }
-    env.checkpoint(Some(&force())).unwrap();
+    let (mut existing_keys, first_keys_in_files) = write_data(&env, &db);
+    verify_deleted_files(dir.path(), &[]);
 
-    let obsolete_before = env.stats().unwrap().cleaner.lns_obsolete;
-    let cleaned = env.clean_log().unwrap();
-    assert!(cleaned > 0, "cleaner must select the low-utilization files");
-    let obsolete_after = env.stats().unwrap().cleaner.lns_obsolete;
-    assert!(
-        obsolete_after > obsolete_before,
-        "cleaner must count the deleted-prefix LNs obsolete when it processes \
-         the low-utilization files: {obsolete_before} -> {obsolete_after}"
+    // The first file should be the first to be cleaned because it has
+    // relatively few LNs.
+    env.force_clean_one_for_test().unwrap();
+    verify_deleted_files(dir.path(), &[0]);
+    verify_data(&db, &existing_keys);
+
+    // Delete most of the LNs in two middle files.  They should be the next
+    // two files cleaned.
+    let mut file_num = (FS_INITIAL_FILES / 2) as usize;
+    let first_key = first_keys_in_files[file_num];
+    let next_key = first_keys_in_files[file_num + 1];
+    let count = next_key - first_key - 4;
+    delete_data(&env, &db, &mut existing_keys, first_key, count);
+
+    file_num += 1;
+    let first_key = first_keys_in_files[file_num];
+    let next_key = first_keys_in_files[file_num + 1];
+    let count = next_key - first_key - 4;
+    delete_data(&env, &db, &mut existing_keys, first_key, count);
+
+    env.force_clean_one_for_test().unwrap();
+    env.force_clean_one_for_test().unwrap();
+    verify_deleted_files(
+        dir.path(),
+        &[0, (file_num - 1) as u32, file_num as u32],
     );
+    verify_data(&db, &existing_keys);
 
-    // Surviving half is intact; deleted half is gone.
-    for i in (N / 2)..N {
-        assert!(exists(&db, &ikey(i)), "surviving key {i} lost");
-    }
-    for i in 0..(N / 2) {
-        assert!(!exists(&db, &ikey(i)), "deleted key {i} resurrected");
-    }
+    db.close().unwrap();
+    env.close().unwrap();
+}
+
+/// Faithful port of JE `FileSelectionTest.testMinFileUtilization()` (non-dup,
+/// non-temp, non-deferred).  JE source (FileSelectionTest.java ~:467-512):
+///
+/// ```java
+/// // Open with minUtilization=10 and minFileUtilization=0.
+/// EnvironmentConfig myConfig = initConfig();
+/// myConfig.setConfigParam(CLEANER_MIN_UTILIZATION, "10");
+/// myConfig.setConfigParam(CLEANER_MIN_FILE_UTILIZATION, "0");
+/// openEnv(myConfig);
+/// writeData();
+/// verifyDeletedFiles(null);
+/// int fileNum  = INITIAL_FILES / 2;
+/// int firstKey = firstKeysInFiles.get(fileNum);
+/// int nextKey  = firstKeysInFiles.get(fileNum + 1);
+/// int count    = ((nextKey - firstKey) * 2) / 3;
+/// deleteData(firstKey, count);
+/// // The file should not be deleted.
+/// env.cleanLog();
+/// env.checkpoint(forceConfig);
+/// verifyDeletedFiles(null);
+/// // Change minFileUtilization=50
+/// myConfig.setConfigParam(CLEANER_MIN_FILE_UTILIZATION, "50");
+/// env.setMutableConfig(myConfig);
+/// // The file should now be deleted.
+/// env.cleanLog();
+/// env.checkpoint(forceConfig);
+/// verifyDeletedFiles(new int[] {fileNum});
+/// verifyData();
+/// ```
+///
+/// ## Deviation (FID-CFG-MINFILEUTIL): runtime vs open-time threshold change
+///
+/// JE changes `CLEANER_MIN_FILE_UTILIZATION` at RUNTIME via
+/// `env.setMutableConfig` (the param is declared mutable:
+/// `EnvironmentParams.CLEANER_MIN_FILE_UTILIZATION = IntConfigParam(.., 0, 50,
+/// 5, true /*mutable*/, false)`, and `Cleaner.envConfigUpdate` re-reads it).
+/// Noxu's `set_mutable_config` does NOT push `cleaner_min_file_utilization` to
+/// the live cleaner (it is not even a field on `EnvironmentMutableConfig`) — a
+/// genuine engine fidelity bug, FID-CFG-MINFILEUTIL.  Fixing it means adding a
+/// public field to `EnvironmentMutableConfig`, which `cargo semver-checks`
+/// flags as `constructible_struct_adds_field` — a MAJOR change, not patch-safe
+/// for the 7.11.x line.  The runtime-mutation fix is therefore deferred to the
+/// v8 line; for 7.11.1 this test reproduces JE's behavior with the threshold
+/// change applied by CLOSING and REOPENING the same environment directory at
+/// the new `min_file_utilization` (an open-time config path that does reach
+/// the cleaner).  The engine behavior under test — a file at ~33% utilization
+/// is NOT cleaned at `minFileUtilization=0` but IS cleaned at
+/// `minFileUtilization=50` — is identical; only the moment the config is
+/// applied differs.
+#[test]
+fn file_selection_test_min_file_utilization() {
+    let dir = TempDir::new().unwrap();
+
+    // Phase 1: open with minUtilization=10, minFileUtilization=0.
+    let env = open_file_selection_env(dir.path(), 10, 0);
+    let db = open_db(&env, false);
+
+    let (mut existing_keys, first_keys_in_files) = write_data(&env, &db);
+    verify_deleted_files(dir.path(), &[]);
+
+    // Delete two thirds of the LNs in the middle file.
+    let file_num = (FS_INITIAL_FILES / 2) as usize;
+    let first_key = first_keys_in_files[file_num];
+    let next_key = first_keys_in_files[file_num + 1];
+    let count = ((next_key - first_key) * 2) / 3;
+    delete_data(&env, &db, &mut existing_keys, first_key, count);
+
+    // The file should NOT be deleted (minFileUtilization=0: no single-file
+    // second tier, and total util stays above minUtilization=10).  Even after
+    // crossing the deletion barrier, the cleaner never SELECTS the file, so
+    // nothing is deleted.
+    clean_log_and_reclaim(&env);
+    verify_deleted_files(dir.path(), &[]);
+
+    db.close().unwrap();
+    env.close().unwrap();
+
+    // Phase 2 (FID-CFG-MINFILEUTIL deviation): reopen the SAME directory with
+    // minFileUtilization=50 instead of JE's runtime setMutableConfig.
+    let env = open_file_selection_env(dir.path(), 10, 50);
+    let db = open_db(&env, false);
+
+    // The file should NOW be deleted (its ~33% util is below
+    // minFileUtilization=50, so the second tier selects it).
+    clean_log_and_reclaim(&env);
+    verify_deleted_files(dir.path(), &[file_num as u32]);
+    verify_data(&db, &existing_keys);
 
     db.close().unwrap();
     env.close().unwrap();
@@ -864,7 +1121,8 @@ fn file_selection_truncate_database_obsoletes_entries() {
 
     // JE: openEnv(); writeData();  (one explicit transaction, INITIAL_FILES+1
     // log files on disk afterward).
-    let n = write_data(&env, &db, dir.path());
+    let (existing_keys, _first_keys) = write_data(&env, &db);
+    let n = existing_keys.len() as u32;
 
     // JE: nCleaned = cleanRoutine(); assertEquals(0, nCleaned);
     // Nothing is obsolete yet, so a non-forced pass selects no file.
@@ -906,7 +1164,7 @@ fn file_selection_remove_database_obsoletes_entries() {
     let db = open_db(&env, false);
 
     // JE: openEnv(); writeData();
-    write_data(&env, &db, dir.path());
+    let _ = write_data(&env, &db);
 
     // JE: db.close();
     db.close().unwrap();
