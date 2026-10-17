@@ -137,19 +137,19 @@ pub struct NodeStateMachine {
     /// wired once the live `EnvironmentImpl` is attached
     /// ([`ReplicatedEnvironment::with_environment`]).
     ///
-    /// The screen is a pure FUNCTION of the role: armed iff the node is a
-    /// `Replica` (the dual of JE deriving the write-allow decision from
-    /// `RepImpl.isMaster()` at locker-creation time, `createRepUserTxn`:
-    /// `isMaster() ? MasterTxn : ReadonlyTxn`), rather than carried in a
-    /// separately-mutable flag.  We honour that invariant by flipping the
-    /// screen INSIDE the single state write lock that performs the role
-    /// transition (see [`Self::apply_transition_locked`]), so the (role,
+    /// The screen is a pure FUNCTION of the role: armed iff the node is **not**
+    /// the `Master` (the dual of JE `RepImpl.checkIfMaster`, which admits only
+    /// `MASTER` and throws for `REPLICA` / `UNKNOWN` / `DETACHED`, and of
+    /// `createRepUserTxn`: `isMaster() ? MasterTxn : ReadonlyTxn`), rather than
+    /// carried in a separately-mutable flag.  We honour that invariant by
+    /// flipping the screen INSIDE the single state write lock that performs the
+    /// role transition (see [`Self::apply_transition_locked`]), so the (role,
     /// screen) pair is updated atomically.  Before this field existed,
     /// `become_master` / `become_replica` stored the screen OUTSIDE the state
     /// lock in opposite orders, so a concurrent transition (election-driver
     /// daemon + a master-transfer handler + an application thread are all
-    /// real callers) could leave `role == Replica` with the screen CLEARED
-    /// -- the S2 silent-divergence hole (a replica accepting a local user
+    /// real callers) could leave a non-Master node with the screen CLEARED
+    /// -- the S2 silent-divergence hole (a non-master accepting a local user
     /// write) and the `gap_replay_3_write_screen_test` flake.
     ///
     /// `None` until an env is wired (standalone / pre-wiring); the write path
@@ -195,24 +195,37 @@ impl NodeStateMachine {
 
     /// The replica-write screen value implied by `state`.
     ///
-    /// Armed (`true`) iff the node is a `Replica`.  This is exactly the
-    /// arm/clear semantics the former out-of-lock stores implemented
-    /// (`become_replica` armed, `become_master` cleared); the ONLY change here
-    /// is that the value is now derived from the role and stored INSIDE the
-    /// single state write lock, so the (role, screen) pair is updated
-    /// atomically and a concurrent transition can never leave a `Replica`
-    /// unscreened.  (Unknown / Detached keep the screen cleared, preserving
-    /// the "a fresh env must not screen writes" and standalone-env contracts;
-    /// the write path independently gates the screen on `is_replicated()`.)
+    /// Armed (`true`) iff the node is **not** the `Master` -- i.e. a `Replica`,
+    /// `Unknown`, `Detached`, or `Shutdown`.  This is the dual of JE
+    /// `RepImpl.checkIfMaster` (RepImpl.java:1076-1098), whose role switch
+    /// admits only `MASTER`:
     ///
-    /// JE derives the write-allow decision from `RepImpl.isMaster()` at
-    /// locker-creation time (`createRepUserTxn`: `isMaster() ? MasterTxn :
-    /// ReadonlyTxn`); here the screen is the dual of that one role read,
-    /// captured atomically with the transition rather than in a free-floating
-    /// flag another thread can overwrite.
+    /// ```text
+    ///   case MASTER:   break;                                  // write allowed
+    ///   case REPLICA:  throw new ReplicaWriteException(..);     // screened
+    ///   case UNKNOWN:  throw new UnknownMasterException(..);    // screened
+    ///   case DETACHED: throw new UnknownMasterException(..);    // screened
+    /// ```
+    ///
+    /// and of `RepImpl.createRepUserTxn` (RepImpl.java:1138-1145), which hands
+    /// out a writable `MasterTxn` only when `isMaster()` and a read-only
+    /// `ReadonlyTxn` otherwise.  Arming for every non-Master role closes the
+    /// S2 hole that `matches!(state, Replica)` left open while a node passes
+    /// through `Unknown` during `transition_via_unknown` (Master -> Unknown ->
+    /// Replica), or sits in `Unknown` after losing its master -- in both of
+    /// which it would otherwise ACCEPT a local user write.
+    ///
+    /// Only matters for a replicated env: the screen handle is wired exclusively
+    /// by `ReplicatedEnvironment::with_environment`, and the write path gates
+    /// the screen on `is_replicated()`, so a standalone env (whose state
+    /// machine is never wired to a screen, and which is never `is_replicated()`)
+    /// is unaffected.  The value is derived from the role and stored INSIDE the
+    /// single state write lock, so the (role, screen) pair is always consistent
+    /// to any observer and a concurrent transition can never leave a non-Master
+    /// node unscreened.
     #[inline]
     fn screen_for(state: NodeState) -> bool {
-        matches!(state, NodeState::Replica)
+        !matches!(state, NodeState::Master)
     }
 
     /// Wire the shared replica-write screen handle (GAP-REPLAY-3 /

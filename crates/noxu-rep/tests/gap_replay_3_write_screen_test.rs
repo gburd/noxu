@@ -35,23 +35,30 @@ fn cfg(group: &str, name: &str, env_home: &std::path::Path) -> RepConfig {
 
 /// Assert the role->screen invariant, reading the pair ATOMICALLY under the
 /// state lock so a concurrent transition cannot make the two reads disagree.
+///
+/// Invariant (JE `RepImpl.checkIfMaster`: only MASTER may originate a write;
+/// REPLICA/UNKNOWN/DETACHED throw): the replica-write screen is armed iff the
+/// node is NOT the Master.  A non-Master-with-screen-cleared sample is the S2
+/// silent-divergence hole (a non-master accepting a local user write).
 fn assert_role_screen_invariant(rep_env: &ReplicatedEnvironment, ctx: &str) {
     let (role, screen) =
         rep_env.node_state_machine_for_test().role_and_screen();
     if let Some(armed) = screen {
-        match role {
-            NodeState::Replica => assert!(
-                armed,
-                "{ctx}: node reports Replica but the replica-write screen is \
-                 CLEARED -- a local user write would be accepted on a replica \
-                 (S2 silent divergence)"
-            ),
-            NodeState::Master => assert!(
+        if matches!(role, NodeState::Master) {
+            assert!(
                 !armed,
                 "{ctx}: node reports Master but the replica-write screen is \
                  ARMED -- a legitimate master write would be spuriously refused"
-            ),
-            _ => {}
+            );
+        } else {
+            assert!(
+                armed,
+                "{ctx}: node reports {role:?} (not Master) but the \
+                 replica-write screen is CLEARED -- a local user write would \
+                 be accepted on a non-master (S2 silent divergence); JE \
+                 RepImpl.checkIfMaster throws ReplicaWriteException / \
+                 UnknownMasterException for every non-Master role"
+            );
         }
     }
 }
@@ -69,20 +76,21 @@ fn become_replica_arms_write_screen_become_master_clears_it() {
         .expect("open");
     rep_env.with_environment(Arc::clone(&env_impl));
 
-    // Fresh node (Detached): screen off (writes allowed; the write path also
-    // gates on `is_replicated()`).
-    assert!(
-        !env_impl.is_replica_write_screened(),
-        "a fresh env must not screen writes"
-    );
+    // A wired replicated env that is NOT yet the Master (Detached / Unknown)
+    // screens writes -- JE `RepImpl.checkIfMaster` throws
+    // `UnknownMasterException` for UNKNOWN/DETACHED (RepImpl.java:1087-1091),
+    // so a node that has not become the master originates no user write.  We
+    // assert the role->screen INVARIANT (read atomically), not a fixed value,
+    // because this single-node group's own election driver may already have
+    // promoted the lone node to Master (quorum of 1).
+    assert_role_screen_invariant(&rep_env, "fresh wired env");
 
     // Become a replica.  The screen is armed ATOMICALLY with the Replica
-    // transition, so the invariant Replica <=> armed holds the instant
+    // transition, so the invariant (not Master => armed) holds the instant
     // `become_replica` returns.  (We assert the INVARIANT, not a bare "armed",
-    // because this single-node group's election driver may already have
-    // promoted the lone node to its own Master -- quorum of 1 -- in which case
-    // the node is a consistent Master-with-screen-cleared, not a torn pair.
-    // The former bare assertion raced that driver and flaked.)
+    // because the election driver may already have promoted the lone node to
+    // its own Master -- a consistent Master-with-screen-cleared, not a torn
+    // pair.  The former bare assertion raced that driver and flaked.)
     rep_env.become_replica("some_master").expect("become_replica");
     assert_role_screen_invariant(&rep_env, "after become_replica");
 
@@ -164,30 +172,28 @@ fn become_replica_become_master_keep_role_and_screen_consistent() {
     // Sampler: read the (role, screen) pair atomically and check the
     // invariant.  The screen is the sole S2 gate on the write path
     // (cursor_impl `check_local_write_allowed` / environment `check_writable`
-    // read ONLY the screen, never the role), so a Replica-with-screen-cleared
-    // sample is a live write-acceptance window.
+    // read ONLY the screen, never the role), so a non-Master-with-screen-
+    // cleared sample is a live write-acceptance window.  JE `checkIfMaster`
+    // admits only MASTER, so the invariant is: armed iff NOT Master.
     let sm = rep_env.node_state_machine_for_test();
     for _ in 0..rounds {
         let (role, screen) = sm.role_and_screen();
         if let Some(armed) = screen {
-            match role {
-                NodeState::Replica => assert!(
-                    armed,
-                    "S2 HOLE: node reports Replica but the replica-write \
-                     screen is CLEARED -- a local user write would be accepted \
-                     on a replica (silent divergence). (role, screen) = \
-                     ({role:?}, {armed})"
-                ),
-                NodeState::Master => assert!(
+            if matches!(role, NodeState::Master) {
+                assert!(
                     !armed,
                     "node reports Master but the replica-write screen is \
                      ARMED -- a legitimate master write would be spuriously \
                      refused. (role, screen) = ({role:?}, {armed})"
-                ),
-                // Unknown / Detached / Shutdown: the screen tracks "armed iff
-                // Replica", so it is cleared here; no invariant to assert
-                // beyond "not Replica" which the match already encodes.
-                _ => {}
+                );
+            } else {
+                assert!(
+                    armed,
+                    "S2 HOLE: node reports {role:?} (not Master) but the \
+                     replica-write screen is CLEARED -- a local user write \
+                     would be accepted on a non-master (silent divergence). \
+                     (role, screen) = ({role:?}, {armed})"
+                );
             }
         }
         std::thread::yield_now();
