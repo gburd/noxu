@@ -1,6 +1,10 @@
 # `env_fair_latches` — JE semantics and Noxu design
 
-## JE reference (read at `~/ws/je`, present in this environment)
+This note records the design of the `env_fair_latches` configuration
+parameter: what JE's `ENV_FAIR_LATCHES` means, what it actually does in the
+JE source, and the deliberate simplification Noxu makes.
+
+## JE reference
 
 - `EnvironmentConfig.java:1071-1094` — doc comment on `ENV_FAIR_LATCHES`
   (`je.env.fairLatches`): "If true, use latches instead of synchronized
@@ -23,20 +27,19 @@
 - `LatchFactory.java:32` and `:48-49` — **both call sites that construct a
   `SharedLatchImpl` hardcode `new SharedLatchImpl(false /*fair*/, context)`.**
   Neither reads `EnvironmentParams.ENV_FAIR_LATCHES` / the env config.
-- Exhaustive grep of `~/ws/je/src` and `~/ws/je/test` for
+- An exhaustive grep of the JE source and test trees for
   `ENV_FAIR_LATCHES|fairLatches|FairLatches|getFairLatches|isFairLatches`
   finds **only the two definition sites** (`EnvironmentConfig.java:1094`,
   `EnvironmentParams.java:276-277`). No `configManager.getBoolean(...)` call
   for this param anywhere, unlike its sibling `ENV_FORCED_YIELD`
   (`EnvironmentImpl.java:733`, which IS read).
 
-**Finding:** in the JE source tree available here, `ENV_FAIR_LATCHES` is
-itself settable-but-inert — it is documented as controlling latch fairness
-but is never threaded from config into any `SharedLatchImpl`/`LatchImpl`
-constructor. There is no "faithful JE runtime behaviour" to port; only the
-*class-shape intent* (a shared latch that would, if wired, become a fair
-`ReentrantReadWriteLock`) and Java's own documented semantics for what that
-would have meant.
+**Finding:** in the JE source, `ENV_FAIR_LATCHES` is settable-but-inert — it
+is documented as controlling latch fairness but is never threaded from config
+into any `SharedLatchImpl`/`LatchImpl` constructor. There is no "faithful JE
+runtime behaviour" to port; only the *class-shape intent* (a shared latch
+that would, if wired, become a fair `ReentrantReadWriteLock`) and Java's own
+documented semantics for what that would have meant.
 
 ## The two semantic questions, resolved
 
@@ -57,7 +60,7 @@ earlier-arrived waiter still in the queue. `ReentrantLock(true)` (relevant to
 a hypothetical fair `LatchImpl`, though JE never builds one) *is* strict FIFO
 via the AQS CLH queue.
 
-## Noxu design decision (deliberate simplification, documented)
+## Noxu design decision (deliberate simplification)
 
 Given there is no live JE behaviour to reproduce byte-for-byte, and given
 this repository's hard-won lesson from `raw_rwlock.rs` (seven
@@ -78,7 +81,7 @@ guarantee over the more complex batched-reader one:
 > ordering (tracking each queued waiter's kind and computing "front
 > contiguous-reader run") is exactly the class of extra state-machine
 > complexity that caused the `raw_rwlock.rs` incidents, for a property no
-> test in this task requires.
+> current requirement needs.
 
 ### Mechanism: FIFO wait queue (not a bare ticket counter)
 
@@ -99,8 +102,8 @@ permanent gap that strands every ticket behind it). Instead: an explicit
 - `leave(id)`: pop the front (must equal `id` — the caller is the current
   holder), `notify_all` so the new front (if any) re-checks and proceeds.
 
-This is ported into both `ExclusiveLatch` and `SharedLatch`, gated behind a
-new process-global `FAIR_LATCHES: AtomicBool` in `noxu_latch::config`
+This is wired into both `ExclusiveLatch` and `SharedLatch`, gated behind a
+process-global `FAIR_LATCHES: AtomicBool` in `noxu_latch::config`
 (mirrors `FORCED_YIELD`/`TIMEOUT_MS` exactly — same `configure()` extension
 pattern, same "single relaxed atomic load when off" zero-cost shape). The
 fair path wraps around the EXISTING inner `Mutex`/`RwLock` acquisition
@@ -110,11 +113,11 @@ eliminated while fair mode is on (only the front-of-queue thread ever tries
 it), and all existing timeout/latch-ordering/forced-yield/owner-tracking
 logic is unchanged.
 
-### Verification plan (per the raw_rwlock.rs lesson)
+### Verification (per the raw_rwlock.rs lesson)
 
 Even though this queue is far simpler than the rwlock reservation state
 machine, it gets the same treatment: a standalone shuttle model of exactly
 `enter`/`leave`/give-up-on-timeout over the `VecDeque` queue, checked for
 (1) no two threads ever hold concurrently, (2) FIFO grant order, (3) a
-give-up mid-queue does not strand later entries, before trusting the ported
+give-up mid-queue does not strand later entries, before trusting the
 version in `noxu-latch`.

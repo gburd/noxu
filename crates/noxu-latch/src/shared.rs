@@ -67,7 +67,7 @@ pub struct SharedLatch {
     /// field on `ExclusiveLatch` for the zero-cost-when-off argument; the
     /// per-JE-notes design here additionally means fair mode fully
     /// serializes readers (no contiguous-reader batching) -- see
-    /// `.agent/notes-fair-latches.md`. `try_acquire_exclusive()` never
+    /// `docs/src/maintainer/fair-latches.md`. `try_acquire_exclusive()` never
     /// consults it (barges, matching `tryLock()` semantics).
     queue: FairQueue,
     /// The current holder's fair-queue ticket id (0 if none). Because fair
@@ -226,7 +226,7 @@ impl SharedLatch {
             let timeout = self.context.timeout;
 
             // JE ENV_FAIR_LATCHES: join the FIFO admission queue before even
-            // attempting the real read lock. Per `.agent/notes-fair-latches.md`,
+            // attempting the real read lock. Per `docs/src/maintainer/fair-latches.md`,
             // fair mode fully serializes -- a reader admitted to the front
             // still excludes every other reader/writer until it leaves.
             let fair_ticket = if crate::config::fair_latches() {

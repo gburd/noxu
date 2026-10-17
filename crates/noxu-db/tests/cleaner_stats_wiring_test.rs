@@ -11,7 +11,7 @@
 //! no honest source exists: JE's own `getNCleanerProbeRuns()` is deprecated and
 //! always returns zero, and `repeat_iterator_reads` counts a buffer-regrow
 //! mechanism our exact-sized cleaner reader structurally cannot exhibit. See
-//! `.agent/notes-cleanerstats.md` for the per-field determination.
+//! `docs/src/maintainer/cleaner-stats.md` for the per-field determination.
 //!
 //! This test asserts the values are non-zero AND plausible. Asserting only
 //! "non-zero" would pass against a hardcoded 1, and asserting a `store`/`load`

@@ -296,7 +296,7 @@ fn shared_latch_exclusive_path_fair_mode_grants_in_fifo_order() {
 }
 
 /// Fair mode wired into `SharedLatch::acquire_shared()`: per
-/// `.agent/notes-fair-latches.md`, Noxu's fair mode fully serializes (no
+/// `docs/src/maintainer/fair-latches.md`, Noxu's fair mode fully serializes (no
 /// contiguous-reader batching), so shared acquirers queued behind a held
 /// exclusive latch are ALSO granted in strict FIFO order, one at a time.
 #[test]
@@ -346,7 +346,7 @@ fn shared_latch_shared_path_fair_mode_grants_in_fifo_order() {
             max_concurrent.load(Ordering::SeqCst),
             1,
             "Noxu's fair mode fully serializes -- no contiguous-reader batching \
-             (see .agent/notes-fair-latches.md)"
+             (see docs/src/maintainer/fair-latches.md)"
         );
         restore_defaults();
     });

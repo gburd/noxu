@@ -1098,7 +1098,7 @@ Stable-foundational crates are unchanged at the public-API level
   `acquire_shared` now join before contending for the real inner lock, and
   leave (from the RAII guard's `Drop`, exactly once) after releasing it.
   Zero cost when the flag is off: the acquire/release fast path pays
-  exactly one relaxed atomic load. Per `.agent/notes-fair-latches.md`, Noxu
+  exactly one relaxed atomic load. Per `docs/src/maintainer/fair-latches.md`, Noxu
   implements the strictly stronger full-FIFO guarantee (every acquisition
   serialized in arrival order, readers included) rather than JE's
   documented — and, per that investigation, never actually wired in JE's

@@ -1,10 +1,10 @@
-# CleanerStats dead-field determination (fix/cleaner-stats-wiring)
+# CleanerStats dead-field determination
 
 Six `CleanerStats` fields (`crates/noxu-cleaner/src/cleaner_stat.rs`) are
 never written by production code — only by `#[cfg(test)]` in that same file.
-This note records the per-field decision before wiring, per
-`docs/src/internal/space-amplification-2026-09.md` (which already flagged
-this gap) and cross-referencing `~/ws/je` (present, checked).
+This note records the per-field decision for wiring them, cross-referenced
+against JE and `docs/src/internal/space-amplification-2026-09.md` (which
+already flagged this gap).
 
 | Field | Doc meaning (our doc comment / JE) | Decision | Production source (if WIRED) |
 |---|---|---|---|
@@ -27,13 +27,11 @@ and should not be silently substituted for it — doing so would misrepresent
 what the gauge measures. Decision stands: remove `repeat_iterator_reads`
 from `CleanerStats` rather than repurpose an unrelated counter.
 
-## Status
+## Summary of decisions
 
-- [ ] `total_log_size` — wire
-- [ ] `active_log_size` — wire
-- [ ] `min_utilization` — wire
-- [ ] `max_utilization` — wire
-- [ ] `probe_runs` — remove
-- [ ] `repeat_iterator_reads` — remove
-
-Each will get its own commit per the task's incremental-commit requirement.
+- `total_log_size` — wire
+- `active_log_size` — wire
+- `min_utilization` — wire
+- `max_utilization` — wire
+- `probe_runs` — remove
+- `repeat_iterator_reads` — remove

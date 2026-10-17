@@ -357,7 +357,8 @@ mod tests {
     /// The BOUNDED scan (starting exactly at `matchpoint_lsn`, not
     /// `NULL_LSN`) must still find a preserved revert target that was
     /// written AT the matchpoint LSN itself — the off-by-one this bound
-    /// could otherwise introduce (flagged in `.agent/notes-gapa2.md`).
+    /// could otherwise introduce (see the live txn-chain reconstruction
+    /// note, `docs/src/maintainer/live-txn-chain.md`).
     #[test]
     fn test_bounded_scan_from_matchpoint_still_sees_preserved_target() {
         let dir = TempDir::new().unwrap();
