@@ -6769,10 +6769,45 @@ impl CursorImpl {
     /// # Returns
     ///
     ///  always (never fails).
+    /// Releases every non-transactional lock this cursor acquired on its own
+    /// behalf in the LockManager (JE `BasicLocker.releaseNonTxnLocks`,
+    /// BasicLocker.java:198, reached from `CursorImpl.close` ->
+    /// `nonTxnOperationEnd` -> `operationEnd`, CursorImpl.java:602).
+    ///
+    /// For a bare (auto-commit) cursor the locker IS the cursor: the only
+    /// cross-operation lock it can hold is the WRITE lock taken by an RMW read
+    /// (`upgrade_current_to_write_lock`), which charges the cursor's own `id`
+    /// as the owner directly in the manager.  Read locks are already acquired
+    /// and released within each operation, so this sweep retires exactly the
+    /// RMW write lock(s) the cursor still owns.
+    ///
+    /// When a transaction is attached (`txn_ref.is_some()`) the locks belong to
+    /// the `Txn`, not the cursor, and MUST survive cursor close until the txn
+    /// commits or aborts (JE: a transactional cursor retains its locks).  This
+    /// method is a no-op in that case.
+    fn release_non_txn_locks(&self) {
+        if self.txn_ref.is_some() {
+            return;
+        }
+        if let Some(lm) = &self.lock_manager {
+            lm.release_all_for_locker(self.id);
+        }
+    }
+
     pub fn close(&mut self) -> Result<(), DbiError> {
         if self.state == CursorState::Closed {
             return Ok(());
         }
+
+        // JE close() -> locker.nonTxnOperationEnd() -> operationEnd() ->
+        // BasicLocker.releaseNonTxnLocks() (CursorImpl.java:602,
+        // BasicLocker.java:198): a bare (non-txn) cursor releases ALL locks it
+        // holds in the LockManager when it closes -- in particular the WRITE
+        // lock taken by an RMW read (upgrade_current_to_write_lock), which
+        // otherwise leaks and blocks every later writer of that record until
+        // timeout.  No-op when a Txn is attached (those locks belong to the
+        // Txn and live until commit/abort).
+        self.release_non_txn_locks();
 
         // Release BIN pin — prevents evictor from seeing a stale cursor_count.
         self.update_bin_pin(None);
