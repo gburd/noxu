@@ -1830,20 +1830,22 @@ mod tests {
         // strictly above the deepest the replay ephemeral allocator can reach
         // from its start (it only decrements, so its shallowest id is its
         // start, i64::MIN/4; the band it can occupy is at or below that).
-        assert!(
+        // These three checks are over compile-time constants, so they are
+        // compile-time assertions (`const { assert!(..) }`) -- a regression in
+        // the band constants fails the BUILD, not just the test run.  (clippy
+        // flags a runtime `assert!` on a constant condition.)
+        const _: () = assert!(
             crate::FIRST_NON_TXN_LOCKER_ID < 0,
             "non-txn ids must be negative (disjoint from positive txn ids)"
         );
-        assert!(
+        const _: () = assert!(
             crate::locker_id::NON_TXN_LOCKER_FLOOR > REPLAY_EPHEMERAL_START,
-            "non-txn floor {} must stay ABOVE the replay ephemeral start {} \
-             so the bands are structurally disjoint",
-            crate::locker_id::NON_TXN_LOCKER_FLOOR,
-            REPLAY_EPHEMERAL_START
+            "non-txn floor must stay ABOVE the replay ephemeral start \
+             (i64::MIN/4) so the bands are structurally disjoint"
         );
-        assert!(
+        const _: () = assert!(
             crate::locker_id::NON_TXN_LOCKER_FLOOR > REPLAY_LOCKER_BASE,
-            "non-txn floor must stay above the ReplayTxn base"
+            "non-txn floor must stay above the ReplayTxn base (i64::MIN/2)"
         );
         // And a freshly-allocated id obeys the band in practice.
         let id = crate::next_non_txn_locker_id();
