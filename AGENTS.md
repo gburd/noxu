@@ -1,9 +1,7 @@
 # Noxu DB Agent Guide
 
-<!-- This file is the canonical agent instruction document for the Noxu DB
-     repo. It re-exports the content of .agent/AGENT.md and adds the
-     Documentation section below. Keep both files in sync when updating agent
-     instructions. -->
+<!-- This file is the canonical contributor/agent instruction document for
+     the Noxu DB repo. -->
 
 ## Project Overview
 
@@ -199,7 +197,9 @@ When implementing or modifying subsystem code:
 
 ### Auditing implementation completeness
 
-See `.agent/skills/design-audit.md` for the full process.
+See `docs/src/contributing/porting-guidelines.md` for the naming
+conventions and adaptation patterns used when auditing a subsystem against
+its reference source.
 
 ### Running the full CI suite locally
 
@@ -224,10 +224,6 @@ make docs-check
 Agent skill files are in `.agent/skills/`:
 
 - [hegel-pbt.md](/.agent/skills/hegel-pbt.md) — Property-based testing with Hegel
-- [git-workflow.md](/.agent/skills/git-workflow.md) — Git workflow conventions
-- [code-review.md](/.agent/skills/code-review.md) — Rust code review checklist
-- [design-audit.md](/.agent/skills/design-audit.md) — Design audit process
-- [testing.md](/.agent/skills/testing.md) — Testing guide for Noxu DB
 
 ---
 
@@ -301,4 +297,3 @@ docs/src/
 └── internal/               ← design reviews, audit reports, research
 ```
 
-See .agent-steering-domains.md for domain-specific steering (local).

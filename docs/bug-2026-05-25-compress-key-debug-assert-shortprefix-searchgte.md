@@ -164,7 +164,7 @@ Notes on reliable reproduction:
 ## 7. Logs, panic messages, stack traces
 
 ```
-thread 'main' panicked at /home/gburd/ws/lamdb/crates/noxu-tree/src/tree.rs:316:13:
+thread 'main' panicked at crates/noxu-tree/src/tree.rs:316:13:
 compress_key: key does not start with current prefix
 note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
 

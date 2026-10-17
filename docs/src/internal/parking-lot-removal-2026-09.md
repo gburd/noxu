@@ -136,9 +136,9 @@ present — so readers were never woken and parked forever. Waking both populati
 unconditionally fixed that specific issue but the watchdog test still hung, so at
 least one more interaction remains unidentified.
 
-Backed out again, leaving the tree green. Two independent attempts (one by a
-subagent, which produced nothing, and one hands-on) have now failed on this,
-which is itself the useful result: **reservation is not a local change to
+Backed out again, leaving the tree green. Two independent attempts have now
+failed on this, which is itself the useful result: **reservation is not a
+local change to
 `lock_exclusive_slow`.** It changes what `WRITE_LOCKED` MEANS, and every reader
 of that bit — both unlock paths, both predicates, the gate reconciliation, and
 the wake strategy for both populations — has to be re-derived together.

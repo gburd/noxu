@@ -1,9 +1,8 @@
 # BIN-delta base-invalidation CLASS sweep — investigation
 
-- Worktree: `/tmp/noxu-sweep`, branch `audit/base-invalidation-sweep`,
-  baseline `ff19ddd0` (carries all three fixes: physical-delete `remove_slot`
+- Baseline `ff19ddd0` (carries all three fixes: physical-delete `remove_slot`
   a1061397, split left half 1c817fbd, compress-merge BIN survivor d5dd2a25).
-- JE reference: v7.5.11 (`/home/gburd/src/je`, confirmed from README line 3).
+- JE reference: v7.5.11.
 - Goal: close the CLASS, not one instance. Root cause of the class: a bulk
   BIN entry-replacement that changes which keys a node holds, while leaving
   `last_full_lsn` on a PRE-change full image AND not setting
@@ -99,7 +98,7 @@ production (< line 8667) was enumerated:
 - `recompute_key_prefix`/`apply_new_prefix` are prefix-compression only
   (key-set preserving), not entry-set changes.
 
-## Verdict per the brief's three questions
+## Verdict
 
 For every remaining site: it is SAFE or TEST-GATED-ONLY. The three fixes
 (remove_slot / split left half / compress BIN survivor) plus the structural
