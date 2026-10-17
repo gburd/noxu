@@ -328,6 +328,18 @@ pub struct Tree {
     /// is never made non-resident in that configuration.
     pub log_manager: Option<Arc<noxu_log::LogManager>>,
 
+    /// FID-TREE-1: the environment's "is-invalid" flag (a clone of
+    /// `EnvironmentImpl::is_invalid_flag()`), set when an UNDECIDABLE interior
+    /// IN/BIN fetch fails — a non-NULL slot LSN whose log image cannot be read
+    /// or parsed.  JE `IN.fetchTarget` / `fetchIN` throw
+    /// `EnvironmentFailureException(LOG_FILE_NOT_FOUND)` here, which
+    /// invalidates the environment (fail-closed), rather than treating the
+    /// child as absent and reporting a committed key as not-found.  Setting
+    /// this flag makes EVERY descent path (read, write/insert, scan, delete)
+    /// fail closed: a later operation observes the invalid env instead of a
+    /// silently-wrong result.  `None` in unit tests with no environment.
+    pub env_invalid: Option<Arc<std::sync::atomic::AtomicBool>>,
+
     /// Capacity hint for the recovery redo path.
     ///
     /// When non-zero, the first BIN created by `redo_insert` (the first-key
@@ -1356,7 +1368,38 @@ pub struct BinEntry {
     /// True when this slot has been marked known-deleted (analogous to the
     /// KNOWN_DELETED_BIT in `IN.entryStates`).  The slot is eligible for
     /// removal by `compress_bin()`.
+    ///
+    /// FID-CURSOR-1: KNOWN_DELETED means "deleted for sure; if a transaction
+    /// did it, it has committed" (JE `IN.isEntryKnownDeleted`, IN.java:1104).
+    /// A KD slot is skipped by a scan WITHOUT taking a lock
+    /// (`CursorImpl.lockAndGetCurrent` KD-only skip, CursorImpl.java:2060).
     pub known_deleted: bool,
+    /// True when this slot holds an in-flight (not-yet-committed) transactional
+    /// delete (analogous to the PENDING_DELETED_BIT in `IN.entryStates`,
+    /// JE `IN.isEntryPendingDeleted`, IN.java:1073-1079: "deleted, although the
+    /// transaction that performed the deletion may not be committed").
+    ///
+    /// FID-CURSOR-1: distinct from `known_deleted`.  A PD slot is NOT skipped
+    /// by a scan without a lock — the scan must lock the slot's LSN (blocking
+    /// on the deleter's WRITE lock) and only then consult `is_deleted`
+    /// (JE `lockLNAndCheckDefunct` → `BIN.isDefunct`, CursorImpl.java:2148,
+    /// BIN.java:673-682).  Set by `mark_deleted(.., pending=true)` on the live
+    /// cursor delete path; converted to removal by the compressor once the
+    /// deleter's lock is uncontended (committed/aborted), or cleared on abort
+    /// when the before-image is restored.
+    ///
+    /// PERSISTED as a distinct bit within the single v3 `.ndb` slot "deleted"
+    /// byte (`deleted_state_byte` writes 0x08 for PD, 0x01 for KD;
+    /// `decode_deleted_state_byte` restores both).  JE persists both bits
+    /// (`IN.writeToLog` writes `entryStates & CLEAR_TRANSIENT_BITS`;
+    /// `materialize` restores them), so a BIN logged by the evictor/checkpointer
+    /// while a slot is PENDING-deleted reads back as PD, keeping an evict+re-fault
+    /// of an in-flight delete locked (not skipped) by a scan, and letting crash
+    /// recovery UNDO the uncommitted delete (the deleting txn never committed).
+    /// The byte stays a single `u8`, so the on-disk layout is unchanged
+    /// (LOG_VERSION 3); a v7.11.0 reader using `byte != 0` degrades a persisted
+    /// PD to KD (its pre-PD behaviour) — compatible, no corruption.
+    pub pending_deleted: bool,
     /// True when this slot has been modified since the last full BIN log write.
     ///
     /// `IN.entryStates[i] & IN_DIRTY_BIT`.  Used by the checkpoint
@@ -1370,6 +1413,69 @@ pub struct BinEntry {
     ///
     /// `IN.entryExpiration`.
     pub expiration_time: u32,
+}
+
+impl BinEntry {
+    /// JE `BIN.isDeleted(idx)` (BIN.java:680-682): `isEntryKnownDeleted ||
+    /// isEntryPendingDeleted`.  True for any slot that holds no live record,
+    /// whether the deletion is committed (KD) or still in-flight (PD).
+    ///
+    /// FID-CURSOR-1: this is the predicate for READ visibility and physical
+    /// reclamation (point reads, post-lock re-reads, the compressor,
+    /// split-drain, stats).  It is NOT the scan skip-without-lock predicate
+    /// — that is `known_deleted` alone (JE `lockAndGetCurrent`'s KD-only
+    /// skip, CursorImpl.java:2060), because a PD slot must be locked (blocking
+    /// on the deleter) before it can be treated as absent.
+    #[inline]
+    pub fn is_deleted(&self) -> bool {
+        self.known_deleted || self.pending_deleted
+    }
+
+    /// FID-CURSOR-1: encode this slot's deleted state into the single v3
+    /// `.ndb` slot "deleted" byte, persisting the KNOWN_DELETED vs
+    /// PENDING_DELETED distinction so a BIN logged (by the evictor or
+    /// checkpointer) while a slot is PENDING-deleted is read back as PD, NOT
+    /// as KD.  Without this, a non-crash evict+re-fault of an in-flight delete
+    /// would turn PD into KD in memory and a scan would then skip it WITHOUT a
+    /// lock — the FID-CURSOR-1 bug resurfacing via eviction.  JE persists both
+    /// bits: `IN.writeToLog` writes `entryStates[i] & CLEAR_TRANSIENT_BITS`
+    /// and `TRANSIENT_BITS` is the OFFHEAP bits only (EntryStates.java:36), so
+    /// KNOWN_DELETED (0x01) and PENDING_DELETED (0x08) are both durable; and
+    /// `materialize` (IN.java:6080) restores them.
+    ///
+    /// FORMAT-COMPATIBLE (LOG_VERSION stays 3, no layout change): the byte is
+    /// still a single `u8`.  Pre-FID-CURSOR-1 writers emitted only 0 (live) or
+    /// 1 (deleted), and the matching reader used `byte != 0`.  We now emit
+    /// 0x01 for KD and 0x08 for PD (bit-exact to JE's `EntryStates`), so an
+    /// OLD reader using `byte != 0` still sees a PD slot as "deleted"
+    /// (degrading to the pre-fix KD behaviour — no corruption), while a
+    /// FID-CURSOR-1 reader decodes the PD bit exactly.
+    #[inline]
+    pub fn deleted_state_byte(&self) -> u8 {
+        // JE EntryStates: KNOWN_DELETED_BIT = 0x1, PENDING_DELETED_BIT = 0x8.
+        (if self.known_deleted { 0x01u8 } else { 0 })
+            | (if self.pending_deleted { 0x08u8 } else { 0 })
+    }
+
+    /// FID-CURSOR-1: decode the v3 slot "deleted" byte written by
+    /// [`Self::deleted_state_byte`].  Back-compatible with the pre-FID-CURSOR-1
+    /// encoding (0 = live, 1 = deleted): `0x01` sets KD, `0x08` sets PD, and
+    /// any other non-zero legacy value is treated as KD (a persisted deletion
+    /// read fresh from the log with no finer information is "known").
+    #[inline]
+    pub fn decode_deleted_state_byte(byte: u8) -> (bool, bool) {
+        // JE EntryStates bit values; a persisted PD stays PD on read-back
+        // (JE `materialize`), so an evicted in-flight delete is still locked
+        // (not skipped) by a scan after re-fault.
+        let known_deleted = (byte & 0x01) != 0;
+        let pending_deleted = (byte & 0x08) != 0;
+        if !known_deleted && !pending_deleted && byte != 0 {
+            // Legacy / unknown non-zero "deleted" marker: treat as known.
+            (true, false)
+        } else {
+            (known_deleted, pending_deleted)
+        }
+    }
 }
 
 impl InNodeStub {
@@ -1520,13 +1626,74 @@ impl BinStub {
     pub fn slot_is_live(&self, idx: usize) -> bool {
         match self.entries.get(idx) {
             Some(e) => {
-                !(e.known_deleted
+                // FID-CURSOR-1: a slot is live for READS iff it is neither
+                // deleted (KD or PD — JE `BIN.isDeleted`) nor TTL-expired.
+                // PD is included here so a committed-delete slot observed
+                // under a held lock (`get_data_from_tree` /
+                // `reread_data_locking_current_lsn`) reads as absent.  The
+                // scan SKIP-without-lock predicate is `known_deleted` ALONE
+                // (see `slot_is_known_deleted`); a PD slot is NOT skipped by a
+                // scan — it is locked first (blocking on the deleter), then
+                // this predicate decides whether it is defunct.
+                !(e.is_deleted()
                     || (self.expiration_enabled
                         && e.expiration_time != 0
                         && noxu_util::ttl::is_expired(
                             e.expiration_time,
                             self.expiration_in_hours,
                         )))
+            }
+            None => false,
+        }
+    }
+
+    /// FID-CURSOR-1: the scan SKIP-without-lock predicate — `known_deleted`
+    /// ALONE (JE `CursorImpl.lockAndGetCurrent`'s `isEntryKnownDeleted` skip,
+    /// CursorImpl.java:2060-2064).  A KD slot is "deleted for sure" and may be
+    /// skipped by a scan with no lock; a PD (pending, maybe-uncommitted)
+    /// delete must NOT be skipped — the scan locks it and then consults
+    /// `slot_is_live` / `is_deleted` (JE `lockLNAndCheckDefunct`).
+    #[inline]
+    pub fn slot_is_known_deleted(&self, idx: usize) -> bool {
+        self.entries.get(idx).is_some_and(|e| e.known_deleted)
+    }
+
+    /// FID-CURSOR-1: true iff slot `idx` is a PENDING (maybe-uncommitted)
+    /// delete that is NOT yet known-deleted.  Used by the scan to force the
+    /// locking (slow) revalidation path even when the deleter has already
+    /// committed and released its lock, so the committed delete is observed
+    /// as absent rather than returned from the pre-lock prefetch.
+    #[inline]
+    pub fn slot_is_pending_deleted(&self, idx: usize) -> bool {
+        self.entries
+            .get(idx)
+            .is_some_and(|e| e.pending_deleted && !e.known_deleted)
+    }
+
+    /// FID-CURSOR-1: the scan-advance SKIP-WITHOUT-LOCK predicate — true iff a
+    /// scan may step past slot `idx` without taking a record lock.  This is
+    /// `known_deleted || TTL-expired`, i.e. everything the old `slot_is_live`
+    /// rejected EXCEPT `pending_deleted`.
+    ///
+    /// A PENDING-deleted slot is deliberately NOT skippable: the scan must
+    /// land on it and lock it (blocking on the deleter's WRITE lock), then
+    /// re-check `slot_is_live` under the lock — JE
+    /// `CursorImpl.lockAndGetCurrent` skips only `isEntryKnownDeleted`
+    /// (CursorImpl.java:2060-2064) and locks everything else via
+    /// `lockLNAndCheckDefunct`.  (TTL-expired slots keep their pre-existing
+    /// skip-without-lock behaviour; that is a separate TTL concern, unchanged
+    /// by FID-CURSOR-1.)
+    #[inline]
+    pub fn slot_scan_skippable(&self, idx: usize) -> bool {
+        match self.entries.get(idx) {
+            Some(e) => {
+                e.known_deleted
+                    || (self.expiration_enabled
+                        && e.expiration_time != 0
+                        && noxu_util::ttl::is_expired(
+                            e.expiration_time,
+                            self.expiration_in_hours,
+                        ))
             }
             None => false,
         }
@@ -1545,7 +1712,9 @@ impl BinStub {
     pub fn slot_expired_not_deleted(&self, idx: usize) -> bool {
         match self.entries.get(idx) {
             Some(e) => {
-                !e.known_deleted
+                // FID-CURSOR-1: a PD slot is deleted (JE `isDeleted`), so it
+                // is NOT "expired but undeleted"; use `is_deleted()`.
+                !e.is_deleted()
                     && self.expiration_enabled
                     && e.expiration_time != 0
                     && noxu_util::ttl::is_expired(
@@ -1646,6 +1815,7 @@ impl BinStub {
             BinEntry {
                 data,
                 known_deleted: false,
+                pending_deleted: false,
                 dirty: true,
                 expiration_time: 0,
             },
@@ -1921,8 +2091,15 @@ impl BinStub {
                 // KD slot reuse (JE CursorImpl.insertRecordInternal isSlotReuse,
                 // CursorImpl.java:1373; IN.insertRecord clears KD/PD): the slot
                 // held no record, so report a NEW record for entry counting.
-                let was_kd =
-                    std::mem::take(&mut self.entries[idx].known_deleted);
+                let was_kd = {
+                    let was_defunct = self.entries[idx].is_deleted();
+                    // FID-CURSOR-1: a reused slot is fully live -- clear BOTH
+                    // KD and PD (JE IN.insertRecord clears KD/PD; also the
+                    // abort-undo restore path re-inserts over a PD slot).
+                    self.entries[idx].known_deleted = false;
+                    self.entries[idx].pending_deleted = false;
+                    was_defunct
+                };
                 (idx, was_kd)
             }
             Err(idx) => {
@@ -1999,8 +2176,15 @@ impl BinStub {
                 // KD slot reuse (JE CursorImpl.insertRecordInternal isSlotReuse,
                 // CursorImpl.java:1373; IN.insertRecord clears KD/PD): the slot
                 // held no record, so report a NEW record for entry counting.
-                let was_kd =
-                    std::mem::take(&mut self.entries[idx].known_deleted);
+                let was_kd = {
+                    let was_defunct = self.entries[idx].is_deleted();
+                    // FID-CURSOR-1: a reused slot is fully live -- clear BOTH
+                    // KD and PD (JE IN.insertRecord clears KD/PD; also the
+                    // abort-undo restore path re-inserts over a PD slot).
+                    self.entries[idx].known_deleted = false;
+                    self.entries[idx].pending_deleted = false;
+                    was_defunct
+                };
                 (idx, was_kd)
             }
             Err(idx) => {
@@ -2202,8 +2386,15 @@ impl BinStub {
                 // KD slot reuse (JE CursorImpl.insertRecordInternal isSlotReuse,
                 // CursorImpl.java:1373; IN.insertRecord clears KD/PD): the slot
                 // held no record, so report a NEW record for entry counting.
-                let was_kd =
-                    std::mem::take(&mut self.entries[idx].known_deleted);
+                let was_kd = {
+                    let was_defunct = self.entries[idx].is_deleted();
+                    // FID-CURSOR-1: a reused slot is fully live -- clear BOTH
+                    // KD and PD (JE IN.insertRecord clears KD/PD; also the
+                    // abort-undo restore path re-inserts over a PD slot).
+                    self.entries[idx].known_deleted = false;
+                    self.entries[idx].pending_deleted = false;
+                    was_defunct
+                };
                 (idx, was_kd)
             }
             Err(idx) => {
@@ -2299,8 +2490,15 @@ impl BinStub {
                 // CursorImpl.java:1373; IN.insertRecord clears KD/PD): the
                 // slot held no record, so report a NEW record for entry
                 // counting.
-                let was_kd =
-                    std::mem::take(&mut self.entries[idx].known_deleted);
+                let was_kd = {
+                    let was_defunct = self.entries[idx].is_deleted();
+                    // FID-CURSOR-1: a reused slot is fully live -- clear BOTH
+                    // KD and PD (JE IN.insertRecord clears KD/PD; also the
+                    // abort-undo restore path re-inserts over a PD slot).
+                    self.entries[idx].known_deleted = false;
+                    self.entries[idx].pending_deleted = false;
+                    was_defunct
+                };
                 // JE `IN.updateLNSlotKey` (IN.java:1338) replaces a
                 // comparator-equal but byte-different slot key [#15704] on
                 // slot reuse (CursorImpl.java:1487-1492 -> insertRecord
@@ -2378,7 +2576,7 @@ impl BinStub {
         };
         match result {
             Ok(idx) => {
-                let live = !self.entries[idx].known_deleted;
+                let live = !self.entries[idx].is_deleted();
                 self.remove_slot(idx);
                 live
             }
@@ -2424,7 +2622,14 @@ impl BinStub {
                     buf.push(0u8);
                 }
             }
-            buf.push(e.known_deleted as u8);
+            // FID-CURSOR-1: persist the KD/PD deleted state (JE persists both
+            // bits; see `BinEntry::deleted_state_byte`).  A PD slot captured
+            // mid-txn by a checkpoint/evictor is written as PENDING and read
+            // back as PENDING (NOT known), so a non-crash evict+re-fault of an
+            // in-flight delete is still locked (not skipped) by a scan.  The
+            // byte stays a single u8 (LOG_VERSION 3, no layout change); old
+            // readers using `byte != 0` degrade to the pre-fix KD behaviour.
+            buf.push(e.deleted_state_byte());
         }
         buf
     }
@@ -2464,7 +2669,9 @@ impl BinStub {
                     buf.push(0u8);
                 }
             }
-            buf.push(e.known_deleted as u8);
+            // FID-CURSOR-1: persist the KD/PD deleted state (see
+            // `serialize_full` / `BinEntry::deleted_state_byte`).
+            buf.push(e.deleted_state_byte());
         }
         buf
     }
@@ -2533,11 +2740,20 @@ impl BinStub {
             if pos + 1 > bytes.len() {
                 return None;
             }
-            let known_deleted = bytes[pos] != 0;
+            // FID-CURSOR-1: decode the KD/PD deleted state so a BIN logged
+            // while a slot was PENDING-deleted is restored as PENDING (JE
+            // `materialize` restores both bits).  This keeps an in-flight
+            // delete locked (not skipped) by a scan after a non-crash
+            // evict+re-fault.  Recovery reconstructs/reverts via the undo
+            // chain exactly as before; the deleter's write lock on the slot
+            // LSN is what a concurrent scan blocks on.
+            let (known_deleted, pending_deleted) =
+                BinEntry::decode_deleted_state_byte(bytes[pos]);
             pos += 1;
             entries.push(BinEntry {
                 data,
                 known_deleted,
+                pending_deleted,
                 dirty: false, // freshly loaded from log — clean
                 expiration_time: 0,
             });
@@ -2655,7 +2871,10 @@ impl BinStub {
             if pos + 1 > delta_bytes.len() {
                 return None;
             }
-            let known_deleted = delta_bytes[pos] != 0;
+            // FID-CURSOR-1: decode the KD/PD deleted state (see
+            // `deserialize_full` / `BinEntry::deleted_state_byte`).
+            let (known_deleted, pending_deleted) =
+                BinEntry::decode_deleted_state_byte(delta_bytes[pos]);
             pos += 1;
 
             // Apply to base: update existing slot or insert new one.
@@ -2664,12 +2883,14 @@ impl BinStub {
                 base.set_lsn(slot_idx, lsn); // T-3
                 base.entries[slot_idx].data = data;
                 base.entries[slot_idx].known_deleted = known_deleted;
+                base.entries[slot_idx].pending_deleted = pending_deleted;
                 base.entries[slot_idx].dirty = false;
             } else {
                 // Slot index beyond current length — append.
                 base.entries.push(BinEntry {
                     data,
                     known_deleted,
+                    pending_deleted,
                     dirty: false,
                     expiration_time: 0,
                 });
@@ -3173,6 +3394,7 @@ impl Tree {
             in_list_listener: None,
             is_locked_hook: None,
             log_manager: None,
+            env_invalid: None,
             redo_capacity_hint: 0,
             key_prefixing: false, // JE default: KEY_PREFIXING_DEFAULT = false
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH, // T-5
@@ -3210,6 +3432,18 @@ impl Tree {
     /// for `ChildReference.fetchTarget`.  Noxu installs it directly.
     pub fn set_log_manager(&mut self, lm: Arc<noxu_log::LogManager>) {
         self.log_manager = Some(lm);
+    }
+
+    /// FID-TREE-1: wire the environment's "is-invalid" flag so an undecidable
+    /// interior IN/BIN fetch failure can fail the environment closed (JE
+    /// `IN.fetchTarget` throws `EnvironmentFailureException(LOG_FILE_NOT_FOUND)`
+    /// which invalidates the env).  Set from `EnvironmentImpl::is_invalid_flag()`
+    /// alongside `set_log_manager`.
+    pub fn set_env_invalid_flag(
+        &mut self,
+        flag: Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        self.env_invalid = Some(flag);
     }
 
     /// Drops this tree's `Arc<LogManager>` reference (EV-14 teardown).
@@ -3338,6 +3572,7 @@ impl Tree {
             in_list_listener: None,
             is_locked_hook: None,
             log_manager: None,
+            env_invalid: None,
             redo_capacity_hint: 0,
             key_prefixing: false,
             compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH, // T-5
@@ -3547,7 +3782,9 @@ impl Tree {
         match &*guard {
             TreeNode::Bottom(b) => {
                 for i in 0..b.entries.len() {
-                    if b.entries[i].known_deleted {
+                    // FID-CURSOR-1: skip any deleted slot (KD or PD) on a
+                    // full-tree READ collect (JE `BIN.isDeleted`).
+                    if b.entries[i].is_deleted() {
                         continue;
                     }
                     if let Some(fk) = b.get_full_key(i) {
@@ -3925,13 +4162,20 @@ impl Tree {
                             Some(cmp) => bin.find_entry_cmp(key, cmp.as_ref()),
                             None => bin.find_entry_compressed(key),
                         };
-                        if exact && bin.entries[idx].known_deleted {
+                        // FID-CURSOR-1: surface the DEFUNCT slot's LSN (KD or
+                        // PD) so the cursor miss arm re-descends once and
+                        // contests the synthetic-key lock the deleter holds
+                        // (blocking on an in-flight PD delete until it
+                        // commits/aborts; a committed KD delete re-descends
+                        // and reads absent).  Point reads are compensated via
+                        // the synthetic key regardless of KD vs PD.
+                        if exact && bin.entries[idx].is_deleted() {
                             kd_lsn = Some(bin.get_lsn(idx).as_u64());
                         }
                         if exact {
                             // TREE-F1: a slot is reported as found only when
-                            // live (not known_deleted, not TTL-expired) — the
-                            // same predicate used by Tree::search and the
+                            // live (not deleted, not TTL-expired) — the same
+                            // predicate used by Tree::search and the
                             // cursor scan.  Mirrors IN.findEntry (IN.java:3197)
                             // and CursorImpl.isProbablyExpired.
                             if bin.slot_is_live(idx) {
@@ -4490,6 +4734,7 @@ impl Tree {
                     entries: vec![BinEntry {
                         data: Some(Bytes::from(data)),
                         known_deleted: false,
+                        pending_deleted: false,
                         dirty: false,
                         expiration_time: 0,
                     }],
@@ -4642,6 +4887,7 @@ impl Tree {
                 initial_entries.push(BinEntry {
                     data: data_opt.map(Bytes::copy_from_slice),
                     known_deleted: false,
+                    pending_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 });
@@ -5026,6 +5272,7 @@ impl Tree {
                     .map(|i| BinEntry {
                         data: b.entries[i].data.clone(),
                         known_deleted: b.entries[i].known_deleted,
+                        pending_deleted: b.entries[i].pending_deleted,
                         dirty: b.entries[i].dirty,
                         expiration_time: b.entries[i].expiration_time,
                     })
@@ -6350,10 +6597,10 @@ impl Tree {
                         let suffix = bin.compress_key(key);
                         match bin.key_binary_search(suffix.as_slice()) {
                             Ok(idx) => {
-                                // A known-deleted slot was already counted
+                                // A deleted slot (KD or PD) was already counted
                                 // and credited by `mark_deleted`: remove it
                                 // but report no live removal.
-                                let live = !bin.entries[idx].known_deleted;
+                                let live = !bin.entries[idx].is_deleted();
                                 bin.remove_slot(idx);
                                 live
                             }
@@ -7125,7 +7372,13 @@ impl Tree {
             }
             return None;
         }
-        // Boundary record = first live slot (forward), at index `pos`.
+        // Boundary record = first slot that is NOT known-deleted (forward),
+        // at index `pos`.  FID-CURSOR-1: this is the scan SKIP-without-lock
+        // predicate — `known_deleted` ALONE (JE `lockAndGetCurrent` KD-only
+        // skip, CursorImpl.java:2060).  A PENDING-deleted slot is NOT skipped
+        // here; it is returned as the boundary so the cursor locks it
+        // (blocking on the deleter) and then re-checks `is_deleted` under the
+        // lock (JE `lockLNAndCheckDefunct`).
         let pos = entries.iter().position(|e| !e.0.known_deleted)?;
         let boundary_key = entries[pos].2.clone();
         let boundary_lsn = entries[pos].1.as_u64();
@@ -7347,6 +7600,8 @@ impl Tree {
                                         data: b.entries[j].data.clone(),
                                         known_deleted: b.entries[j]
                                             .known_deleted,
+                                        pending_deleted: b.entries[j]
+                                            .pending_deleted,
                                         dirty: b.entries[j].dirty,
                                         expiration_time: b.entries[j]
                                             .expiration_time,
@@ -7392,6 +7647,8 @@ impl Tree {
                                             data: rb.entries[j].data.clone(),
                                             known_deleted: rb.entries[j]
                                                 .known_deleted,
+                                            pending_deleted: rb.entries[j]
+                                                .pending_deleted,
                                             dirty: rb.entries[j].dirty,
                                             expiration_time: rb.entries[j]
                                                 .expiration_time,
@@ -7700,7 +7957,10 @@ impl Tree {
         let mut j = b.entries.len();
         while j > 0 {
             j -= 1;
-            if b.entries[j].known_deleted {
+            // FID-CURSOR-1: drain any deleted slot (KD or PD; JE
+            // `BIN.isDeleted`).  The IC-3 lock check below leaves an
+            // uncommitted (write-locked) PD slot in place.
+            if b.entries[j].is_deleted() {
                 // IC-3 lock check (JE BIN.compress).  A NULL_LSN slot is
                 // always discardable without locking; otherwise consult the
                 // predicate and skip a slot a live txn still write-locks.
@@ -7842,7 +8102,16 @@ impl Tree {
                         let mut j = b.entries.len();
                         while j > 0 {
                             j -= 1;
-                            if b.entries[j].known_deleted {
+                            // FID-CURSOR-1: compress any deleted slot (KD or
+                            // PD).  JE `BIN.compress` removes `isDeleted(i)`
+                            // (KD || PD) once the LSN lock is uncontended
+                            // (BIN.java:1136-1172) — a committed/aborted delete
+                            // released its WRITE lock, so the IC-3 lock check
+                            // passes; an uncommitted PD delete still holds the
+                            // lock and is left for a later pass.  This is why
+                            // NO commit-time PD→KD conversion is needed: the
+                            // lock-uncontended test IS the committed signal.
+                            if b.entries[j].is_deleted() {
                                 // IC-3 lock check (JE BIN.compress).  A
                                 // NULL_LSN slot is always discardable without
                                 // locking (JE: "Can discard a NULL_LSN entry
@@ -8659,7 +8928,18 @@ impl Tree {
             return Some(r.clone());
         }
         let log_lsn = *self.root_log_lsn.read();
-        let node = self.fetch_node_from_log(log_lsn)?;
+        // FID-TREE-1: re-faulting the root through its authoritative current
+        // LSN (held under the root write lock) is JE `IN.fetchTarget`; a
+        // non-NULL LSN that fails to materialise invalidates the environment.
+        let node = match self.fetch_node_from_log(log_lsn) {
+            Some(node) => node,
+            None => {
+                if log_lsn != NULL_LSN {
+                    self.note_undecidable_fetch_failure();
+                }
+                return None;
+            }
+        };
         let node_id = node.node_id();
         // Cache MISS: the root was re-read from the log (JE fetch `isMiss`).
         // A tiny tree's root can itself be a BIN, so record by node kind.
@@ -8735,7 +9015,22 @@ impl Tree {
             return None;
         }
         let child_lsn = n.get_lsn(idx);
-        let node = self.fetch_node_from_log(child_lsn)?;
+        // FID-TREE-1: `child_lsn` is read HERE under the parent write latch
+        // `g`, so this is a fetch through the CURRENT slot — JE
+        // `IN.fetchTarget`.  A non-NULL LSN that fails to materialise is an
+        // UNDECIDABLE fetch failure: fail the environment closed (JE throws
+        // `LOG_FILE_NOT_FOUND`) so no read/insert/scan/delete descent silently
+        // treats the child as absent.  (The cleaner's STALE-snapshot checked
+        // path does NOT come through here — see `fetch_node_from_log`.)
+        let node = match self.fetch_node_from_log(child_lsn) {
+            Some(node) => node,
+            None => {
+                if child_lsn != NULL_LSN {
+                    self.note_undecidable_fetch_failure();
+                }
+                return None;
+            }
+        };
         let node_id = node.node_id();
         // Cache MISS: the child was not resident and had to be read from the
         // log (JE `IN.fetchINWithNoLatch` sets `isMiss=true` on the log-read
@@ -8934,7 +9229,9 @@ impl Tree {
                             Some(cmp) => bin.find_entry_cmp(key, cmp.as_ref()),
                             None => bin.find_entry_compressed(key),
                         };
-                        if exact && bin.entries[idx].known_deleted {
+                        // FID-CURSOR-1: surface the DEFUNCT slot's LSN (KD or
+                        // PD) — see the primary `search_with_data` site.
+                        if exact && bin.entries[idx].is_deleted() {
                             kd_lsn = Some(bin.get_lsn(idx).as_u64());
                         }
                         if exact {
@@ -9033,11 +9330,13 @@ impl Tree {
                         if b.is_delta {
                             false
                         } else {
-                            // Check for any known-deleted slot
+                            // Check for any deleted slot (JE `isDefunct(i)` —
+                            // FID-CURSOR-1: KD or PD; here the expiry half is
+                            // handled by the caller's TTL path).
                             // (the: for (int i=0; i < bin.getNEntries(); i++) {
                             //        if (bin.isDefunct(i)) { ... break; }
                             //      }).
-                            b.entries.iter().any(|e| e.known_deleted)
+                            b.entries.iter().any(|e| e.is_deleted())
                         }
                     }
                     _ => false,
@@ -9205,13 +9504,22 @@ impl Tree {
     ///
     /// All delta entries are considered to be the most-recently-dirtied
     /// state, exactly as in where delta slots supersede full-BIN slots.
+    ///
+    /// FID-CURSOR-1: each delta entry carries its `(known_deleted,
+    /// pending_deleted)` state so a delta slot that was deleted (KD or PD)
+    /// keeps that state in the merged full BIN — a PENDING-deleted slot must
+    /// not silently become live (or known) through delta reconstitution.
     pub fn apply_delta_to_bin(
         bin: &mut BinStub,
-        delta_entries: Vec<(Vec<u8>, Lsn, Option<Vec<u8>>)>,
+        delta_entries: Vec<(Vec<u8>, Lsn, Option<Vec<u8>>, (bool, bool))>,
     ) {
-        for (full_key, lsn, data) in delta_entries {
+        for (full_key, lsn, data, (known_deleted, pending_deleted)) in
+            delta_entries
+        {
             // `full_key` is a full (uncompressed) key here.
-            bin.insert_with_prefix(full_key, lsn, data);
+            let (idx, _new) = bin.insert_with_prefix(full_key, lsn, data);
+            bin.entries[idx].known_deleted = known_deleted;
+            bin.entries[idx].pending_deleted = pending_deleted;
         }
         bin.dirty = true;
     }
@@ -9226,7 +9534,7 @@ impl Tree {
     /// for both updates and insertions.  Returns `None` on malformed input.
     pub fn parse_delta_entries(
         delta_bytes: &[u8],
-    ) -> Option<Vec<(Vec<u8>, Lsn, Option<Vec<u8>>, bool)>> {
+    ) -> Option<Vec<(Vec<u8>, Lsn, Option<Vec<u8>>, (bool, bool))>> {
         if delta_bytes.len() < 12 {
             return None;
         }
@@ -9285,9 +9593,11 @@ impl Tree {
             if pos + 1 > delta_bytes.len() {
                 return None;
             }
-            let known_deleted = delta_bytes[pos] != 0;
+            // FID-CURSOR-1: decode the KD/PD deleted state (see
+            // `deserialize_full`); a persisted PD stays PD on re-fault.
+            let kd_pd = BinEntry::decode_deleted_state_byte(delta_bytes[pos]);
             pos += 1;
-            out.push((key, lsn, data, known_deleted));
+            out.push((key, lsn, data, kd_pd));
         }
         Some(out)
     }
@@ -9307,8 +9617,12 @@ impl Tree {
     /// After this call `self` is a full BIN; `base` should be discarded.
     pub fn mutate_to_full_bin(delta: &mut BinStub, mut base: BinStub) {
         // Decompress delta entries to full keys before applying.
-        let delta_full_entries: Vec<(Vec<u8>, Lsn, Option<Vec<u8>>)> = (0
-            ..delta.entries.len())
+        let delta_full_entries: Vec<(
+            Vec<u8>,
+            Lsn,
+            Option<Vec<u8>>,
+            (bool, bool),
+        )> = (0..delta.entries.len())
             .map(|i| {
                 (
                     delta.get_full_key(i).unwrap_or_default(),
@@ -9317,6 +9631,12 @@ impl Tree {
                     // read path: materialise an owned Vec for the tuple that
                     // feeds `apply_delta_to_bin`.
                     delta.entries[i].data.as_ref().map(|d| d.to_vec()),
+                    // FID-CURSOR-1: carry the delta slot's deleted state so a
+                    // KD/PD slot keeps it in the merged full BIN.
+                    (
+                        delta.entries[i].known_deleted,
+                        delta.entries[i].pending_deleted,
+                    ),
                 )
             })
             .collect();
@@ -9328,6 +9648,25 @@ impl Tree {
         delta.key_prefix = base.key_prefix;
         delta.is_delta = false;
         delta.dirty = true;
+    }
+
+    /// FID-TREE-1: mark the environment invalid after an UNDECIDABLE interior
+    /// IN/BIN fetch failure (a non-NULL slot LSN whose log image could not be
+    /// read or parsed).  JE `IN.fetchTarget` / `fetchIN` throw
+    /// `EnvironmentFailureException(LOG_FILE_NOT_FOUND)` for this case, which
+    /// invalidates the environment — a fetch failure must NEVER be silently
+    /// turned into "node absent".  A no-op when no env flag is wired (unit
+    /// tests with no environment).
+    #[inline]
+    fn note_undecidable_fetch_failure(&self) {
+        if let Some(flag) = &self.env_invalid {
+            flag.store(true, std::sync::atomic::Ordering::Release);
+        }
+        log::error!(
+            "noxu-tree: undecidable IN/BIN fetch failure (log file unreadable \
+             under a live node); environment invalidated (JE \
+             LOG_FILE_NOT_FOUND fail-closed)"
+        );
     }
 
     /// Read an IN/BIN log entry at `log_lsn` and deserialise it into a
@@ -9350,6 +9689,17 @@ impl Tree {
             return None;
         }
         let lm = self.log_manager.as_ref()?;
+        // FID-TREE-1: this low-level helper keeps its pure `Option` return and
+        // does NOT invalidate the environment on a failed read.  Whether a
+        // non-NULL unreadable LSN is a fatal, env-invalidating condition
+        // depends on the CALLER: a descent through the CURRENT slot under the
+        // parent latch (`child_at_or_fetch`, `fetch_root_from_log`) is JE
+        // `IN.fetchTarget` and MUST fail the env closed; but the cleaner's
+        // checked path reads a possibly-STALE / snapshot LSN (not under the
+        // live parent latch) where an unreadable file is EXPECTED (the file
+        // was cleaned after the slot moved on) and must only RETAIN, never
+        // invalidate.  So the invalidation lives in the latch-holding callers,
+        // not here (JE invalidates only for a fetch through the current slot).
         let (entry_type, payload) = lm.read_entry(log_lsn).ok()?;
         // The on-disk payload is an `InLogEntry` body (db_id | prev_full_lsn
         // | prev_delta_lsn | len | node_data).  The recovery scanner strips
@@ -9498,7 +9848,13 @@ impl Tree {
                 }
                 for delta_bytes in deltas.iter().rev() {
                     let entries = Self::parse_delta_entries(delta_bytes)?;
-                    for (full_key, lsn, data, known_deleted) in entries {
+                    for (
+                        full_key,
+                        lsn,
+                        data,
+                        (known_deleted, pending_deleted),
+                    ) in entries
+                    {
                         // Reconstitute in the SAME order the live tree uses.
                         // A custom comparator lays slots out in comparator
                         // order (not byte order), and prefix compression is
@@ -9518,6 +9874,11 @@ impl Tree {
                             bin.insert_raw(full_key, lsn, data)
                         };
                         bin.entries[idx].known_deleted = known_deleted;
+                        // FID-CURSOR-1: a slot reconstructed from a persisted
+                        // BIN-delta keeps its PENDING/KNOWN deleted state so a
+                        // delta logged while a slot was PENDING-deleted does
+                        // not resurface as KNOWN after re-fault.
+                        bin.entries[idx].pending_deleted = pending_deleted;
                     }
                 }
                 bin.is_delta = false;
@@ -10070,6 +10431,7 @@ impl Tree {
                             BinEntry {
                                 data: b.entries[i].data.clone(),
                                 known_deleted: b.entries[i].known_deleted,
+                                pending_deleted: b.entries[i].pending_deleted,
                                 dirty: b.entries[i].dirty,
                                 expiration_time: b.entries[i].expiration_time,
                             },
@@ -10191,14 +10553,14 @@ impl Tree {
             TreeNode::Bottom(b) => {
                 stats.n_bins += 1;
                 // JE `getLNCount()` is the LIVE record count; a retained
-                // known-deleted slot (KD-slot retention) is reported
-                // separately by `getDeletedLNCount()`.  Counting KD slots in
+                // deleted slot (KD or PD; FID-CURSOR-1) is reported separately
+                // by `getDeletedLNCount()`.  Counting deleted slots in
                 // `n_leaf_entries` would inflate the documented
                 // "approximate record count" (`DatabaseStats::leaf_node_count`)
                 // by the number of not-yet-compacted tombstones.
                 let (live, kd) =
                     b.entries.iter().fold((0u64, 0u64), |(l, d), e| {
-                        if e.known_deleted { (l, d + 1) } else { (l + 1, d) }
+                        if e.is_deleted() { (l, d + 1) } else { (l + 1, d) }
                     });
                 stats.n_leaf_entries += live;
                 stats.n_deleted_leaf_entries += kd;
@@ -10300,14 +10662,14 @@ impl Tree {
         let guard = node_arc.read();
         match &*guard {
             TreeNode::Bottom(b) => {
-                // Collect a BIN that either carries a `known_deleted`
-                // tombstone (the historical JE PendingDeleted path) OR has
-                // been emptied by committed deletes (NEW-INCOMP-EMPTY-BIN).
+                // Collect a BIN that either carries a deleted slot (KD or PD;
+                // FID-CURSOR-1 — JE `isDefunct`) OR has been emptied by
+                // committed deletes (NEW-INCOMP-EMPTY-BIN).
                 // A BIN-delta is never surfaced: it is not a full BIN and
                 // cannot be pruned (compress_bin/prune_empty_bin reject it).
                 if !b.is_delta
                     && (b.entries.is_empty()
-                        || b.entries.iter().any(|e| e.known_deleted))
+                        || b.entries.iter().any(|e| e.is_deleted()))
                 {
                     out.push(Arc::clone(node_arc));
                 }
@@ -10586,31 +10948,42 @@ impl Tree {
 
     /// `IN.deleteRecord` (IN.java:3765-3798) for a transactional delete: keep
     /// the slot, set its LSN to the deletion logrec (`setLsn(idx, newLSN)`),
-    /// set the deleted flag (`setPendingDeleted`; Noxu has one KD bit) and
-    /// mark the slot/BIN dirty, so a checkpoint taken before the txn ends logs
-    /// a slot carrying the DeleteLN LSN and recovery undo can match it
-    /// (RecoveryManager.java:1912-1963).  The slot's data is dropped (JE
-    /// evicts the LN: "as long as the PD flag is on, the record's data will
-    /// never be accessed", CursorImpl.java:983-1001).  The compressor removes
-    /// the slot once its LSN lock is uncontended (BIN.compress, BIN.java:1170).
+    /// set the deleted flag and mark the slot/BIN dirty, so a checkpoint taken
+    /// before the txn ends logs a slot carrying the DeleteLN LSN and recovery
+    /// undo can match it (RecoveryManager.java:1912-1963).  The slot's data is
+    /// dropped (JE evicts the LN: "as long as the PD flag is on, the record's
+    /// data will never be accessed", CursorImpl.java:983-1001).  The
+    /// compressor removes the slot once its LSN lock is uncontended
+    /// (BIN.compress, BIN.java:1170).
     ///
-    /// Tag-native port of integrate 984fbabc's `mark_deleted`.  984fbabc built
-    /// it on the v4 `with_existing_record_slot` helper, which does not exist at
-    /// v7.11.0; this keeps the SAME algorithm on the tag's descent primitive
-    /// `get_parent_bin_for_child_ln` (hand-over-hand coupled descent to the
-    /// key's BIN) plus a BIN write latch and the tag's own slot finders
-    /// (`find_entry_cmp` / `find_entry_compressed`) — the same pair the tag's
-    /// `search_with_data` and `delete_recursive` use.
+    /// FID-CURSOR-1: `pending` selects WHICH deleted flag is set, restoring
+    /// JE's two-state machine:
+    ///   * `pending = true`  — the live cursor delete path
+    ///     (`CursorImpl.deleteCurrentRecord` → `IN.deleteRecord` →
+    ///     `setPendingDeleted`, IN.java:3797): the deletion may NOT be
+    ///     committed, so the slot is PENDING-deleted.  A concurrent scan must
+    ///     LOCK this slot (blocking on the deleter's WRITE lock) before it can
+    ///     treat it as absent; it is not skipped without a lock.
+    ///   * `pending = false` — the recovery redo / undo-revert paths
+    ///     (`IN.recoverRecord(.., knownDeleted=true, ..)`,
+    ///     RecoveryManager.java:2545-2555): no active txn exists at recovery
+    ///     time, so the deletion is "known" (committed) and the slot is
+    ///     KNOWN-deleted and may be skipped by a later scan without a lock.
     ///
     /// ponytail: the memory counter is credited here exactly as
     /// [`Self::delete`] credits it (key + data + slot overhead), so a later
-    /// physical removal of the KD slot (compressor, `delete`) credits nothing
-    /// and a KD-slot reuse (`insert` reports `is_new`) re-charges it.  The KD
-    /// slot's key bytes stay resident until compression; charge them to the
-    /// slot instead if that residue ever matters for budget accuracy.
+    /// physical removal of the deleted slot (compressor, `delete`) credits
+    /// nothing and a deleted-slot reuse (`insert` reports `is_new`) re-charges
+    /// it.  The slot's key bytes stay resident until compression; charge them
+    /// to the slot instead if that residue ever matters for budget accuracy.
     ///
     /// Returns `true` iff a LIVE slot was found and marked.
-    pub fn mark_deleted(&self, key: &[u8], del_lsn: Lsn) -> bool {
+    pub fn mark_deleted(
+        &self,
+        key: &[u8],
+        del_lsn: Lsn,
+        pending: bool,
+    ) -> bool {
         let Some(bin_arc) = self.get_parent_bin_for_child_ln(key) else {
             return false;
         };
@@ -10622,12 +10995,22 @@ impl Tree {
             Some(cmp) => bin.find_entry_cmp(key, cmp.as_ref()),
             None => bin.find_entry_compressed(key),
         };
-        if !exact || bin.entries[idx].known_deleted {
+        // JE `IN.deleteRecord` operates on a non-defunct slot; a slot that is
+        // already deleted (KD or PD) is not re-marked.
+        if !exact || bin.entries[idx].is_deleted() {
             return false;
         }
         bin.set_lsn(idx, del_lsn);
         let e = &mut bin.entries[idx];
-        e.known_deleted = true;
+        // FID-CURSOR-1: PD for an in-flight delete, KD for a
+        // committed/recovery deletion (JE two-state machine).
+        if pending {
+            e.pending_deleted = true;
+            e.known_deleted = false;
+        } else {
+            e.known_deleted = true;
+            e.pending_deleted = false;
+        }
         e.dirty = true;
         let data_len = e.data.take().map_or(0, |d| d.len());
         bin.dirty = true;
@@ -10639,12 +11022,18 @@ impl Tree {
         true
     }
 
-    /// `(slot LSN, known_deleted)` of the slot for `key`, INCLUDING a
-    /// known-deleted slot (JE `getParentBINForChildLN` returns KD slots; the
-    /// read-path `findEntry` hides them, IN.java:3197).  Used where JE
-    /// inspects a slot regardless of KD: recovery redo/undo
-    /// (RecoveryManager.java:1912-1963, 2520-2600).  `None` when no slot
-    /// exists (or the descent failed).
+    /// `(slot LSN, is_deleted)` of the slot for `key`, INCLUDING a deleted
+    /// slot (JE `getParentBINForChildLN` returns KD/PD slots; the read-path
+    /// `findEntry` hides them, IN.java:3197).  Used where JE inspects a slot
+    /// regardless of its deleted state: recovery redo/undo
+    /// (RecoveryManager.java:1912-1963, 2520-2600) and the cursor abort-LSN
+    /// reuse path.  The bool is `is_deleted()` (KD || PD; FID-CURSOR-1): a
+    /// deleted slot carries the DeleteLN LSN that a slot-reuse insert reuses
+    /// as its abort LSN.  A slot read fresh from the log is usually KD, but a
+    /// checkpoint-durable *uncommitted* delete persists as PD (byte 0x08) and
+    /// re-faults as PD; recovery undo then reverts it because the deleting txn
+    /// never committed.  Either way `is_deleted()` is the right predicate here.
+    /// `None` when no slot exists (or the descent failed).
     ///
     /// Tag-native port of integrate 984fbabc's `slot_lsn_any`, on the tag's
     /// `get_parent_bin_for_child_ln` descent + slot finders (see
@@ -10662,7 +11051,7 @@ impl Tree {
         if !exact {
             return None;
         }
-        Some((bin.get_lsn(idx), bin.entries[idx].known_deleted))
+        Some((bin.get_lsn(idx), bin.entries[idx].is_deleted()))
     }
 
     /// Returns the BIN where `key` should be inserted.
@@ -11936,6 +12325,125 @@ mod tests {
         None
     }
 
+    // ===================================================================
+    // FID-CURSOR-1 on-disk slot-state (KD/PD) encoding compatibility.
+    // ===================================================================
+
+    /// A fresh (live) slot encodes as 0, a KNOWN-deleted slot as 0x01, and a
+    /// PENDING-deleted slot as 0x08 — bit-exact to JE `EntryStates`
+    /// (KNOWN_DELETED_BIT=0x1, PENDING_DELETED_BIT=0x8).  v7.11.0 / the RC
+    /// wrote `known_deleted as u8` (only 0 or 1); 0x08 is a value those
+    /// writers never emitted, so there is no collision.
+    #[test]
+    fn fid_cursor1_deleted_state_byte_values() {
+        let mut e = BinEntry {
+            data: Some(Bytes::from_static(b"v")),
+            known_deleted: false,
+            pending_deleted: false,
+            dirty: false,
+            expiration_time: 0,
+        };
+        assert_eq!(e.deleted_state_byte(), 0x00, "live slot");
+        e.known_deleted = true;
+        e.pending_deleted = false;
+        assert_eq!(
+            e.deleted_state_byte(),
+            0x01,
+            "KD slot (JE KNOWN_DELETED_BIT)"
+        );
+        e.known_deleted = false;
+        e.pending_deleted = true;
+        assert_eq!(
+            e.deleted_state_byte(),
+            0x08,
+            "PD slot (JE PENDING_DELETED_BIT)"
+        );
+    }
+
+    /// The decoder is backward-compatible with the v7.11.0 / RC encoding,
+    /// which emitted ONLY 0 (live) or 1 (deleted) via `known_deleted as u8`:
+    ///   * 0x00 -> live;
+    ///   * 0x01 -> KNOWN-deleted (the only non-zero value a 7.11.0 writer
+    ///     could emit) — NEVER pending, never live;
+    ///   * 0x08 -> PENDING-deleted (new in FID-CURSOR-1);
+    ///   * 0x09 (KD|PD, should not occur) -> both bits set, treated as
+    ///     deleted;
+    ///   * any other legacy non-zero marker -> KNOWN-deleted (fail safe:
+    ///     a persisted deletion with no finer info is "known").
+    ///
+    /// Nothing a 7.11.0 writer produced (0 or 1) decodes as PD or as the wrong
+    /// liveness.
+    #[test]
+    fn fid_cursor1_decode_deleted_state_byte_back_compat() {
+        assert_eq!(BinEntry::decode_deleted_state_byte(0x00), (false, false));
+        // v7.11.0 "deleted" byte == 1 MUST decode to KNOWN-deleted.
+        assert_eq!(BinEntry::decode_deleted_state_byte(0x01), (true, false));
+        assert_eq!(BinEntry::decode_deleted_state_byte(0x08), (false, true));
+        assert_eq!(BinEntry::decode_deleted_state_byte(0x09), (true, true));
+        // Any other legacy non-zero marker is treated as known-deleted.
+        assert_eq!(BinEntry::decode_deleted_state_byte(0x02), (true, false));
+        assert_eq!(BinEntry::decode_deleted_state_byte(0xFF), (true, true));
+    }
+
+    /// A full-BIN image written by a v7.11.0 / RC writer (deleted byte == 1
+    /// for a KD slot) must deserialise to a KNOWN-deleted slot, never
+    /// PENDING-deleted (which would wrongly make a scan block forever on a
+    /// deleter that no longer exists).  Synthesised by hand-patching the
+    /// deleted byte of a serialised slot to the legacy value 1, exercising
+    /// `deserialize_full`'s decode path.
+    #[test]
+    fn fid_cursor1_reads_legacy_v7110_deleted_byte_as_known() {
+        fn empty_bin(node_id: u64) -> BinStub {
+            BinStub {
+                node_id,
+                level: BIN_LEVEL,
+                entries: Vec::new(),
+                key_prefix: Vec::new(),
+                dirty: false,
+                is_delta: false,
+                last_full_lsn: NULL_LSN,
+                last_delta_lsn: NULL_LSN,
+                generation: 0,
+                parent: None,
+                expiration_in_hours: true,
+                cursor_count: 0,
+                prohibit_next_delta: false,
+                lsn_rep: LsnRep::Empty,
+                keys: KeyRep::new(),
+                compact_max_key_length: INKeyRep_DEFAULT_MAX_KEY_LENGTH,
+                expiration_enabled: true,
+                max_embedded_ln: TREE_MAX_EMBEDDED_LN_DEFAULT,
+            }
+        }
+        // Build a one-slot BIN with a KNOWN-deleted slot the new way.
+        let mut bin = empty_bin(1);
+        bin.insert_raw(b"k".to_vec(), Lsn::new(1, 10), Some(b"v".to_vec()));
+        bin.entries[0].known_deleted = true;
+        bin.entries[0].pending_deleted = false;
+        let bytes = bin.serialize_full();
+        // New encoding writes 0x01 for a KD slot; a legacy 7.11.0 writer would
+        // have written exactly 0x01 too (known_deleted as u8), so this image
+        // is byte-identical to what 7.11.0 wrote for a KD slot.
+        let restored = BinStub::deserialize_full(&bytes).expect("deser");
+        assert_eq!(restored.entries.len(), 1);
+        assert!(restored.entries[0].known_deleted, "legacy 0x01 -> KD");
+        assert!(
+            !restored.entries[0].pending_deleted,
+            "legacy 0x01 must NOT decode as pending-deleted"
+        );
+
+        // And a PD slot round-trips as PD under the new encoding (the
+        // eviction/re-fault correctness this fix depends on).
+        let mut bin2 = empty_bin(2);
+        bin2.insert_raw(b"k".to_vec(), Lsn::new(1, 11), Some(b"v".to_vec()));
+        bin2.entries[0].known_deleted = false;
+        bin2.entries[0].pending_deleted = true;
+        let r2 = BinStub::deserialize_full(&bin2.serialize_full())
+            .expect("deser pd");
+        assert!(r2.entries[0].pending_deleted, "PD round-trips as PD");
+        assert!(!r2.entries[0].known_deleted);
+    }
+
     #[test]
     fn verify_logged_child_live_rejects_reused_slot_after_split() {
         // Build a tree that has split, so there is an IN parenting BIN leaves.
@@ -12002,6 +12510,7 @@ mod tests {
             b.entries.push(BinEntry {
                 data: Some(Bytes::from(vec![9u8])),
                 known_deleted: false,
+                pending_deleted: false,
                 dirty: false,
                 expiration_time: 0,
             });
@@ -12076,7 +12585,7 @@ mod tests {
         // Mark half the slots known-deleted (A5 KD retention), then compress.
         for (i, k) in keys.iter().enumerate() {
             if i % 2 == 1 {
-                assert!(tree.mark_deleted(k, Lsn::new(2, i as u32 + 1)));
+                assert!(tree.mark_deleted(k, Lsn::new(2, i as u32 + 1), false));
             }
         }
         let root = tree.get_root().expect("root");
@@ -12497,6 +13006,7 @@ mod tests {
             .map(|_| BinEntry {
                 data: Some(Bytes::from(vec![1u8])),
                 known_deleted: false,
+                pending_deleted: false,
                 dirty: false,
                 expiration_time: 0,
             })
@@ -12843,6 +13353,7 @@ mod tests {
             entries.push(BinEntry {
                 data: Some(Bytes::from(vec![])),
                 known_deleted: false,
+                pending_deleted: false,
                 dirty: false,
                 expiration_time: 0,
             });
@@ -13972,12 +14483,14 @@ mod tests {
                 BinEntry {
                     data: Some(Bytes::from(b"d1".to_vec())),
                     known_deleted: false,
+                    pending_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
                 BinEntry {
                     data: None,
                     known_deleted: false,
+                    pending_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
@@ -14078,6 +14591,7 @@ mod tests {
             entries: vec![BinEntry {
                 data: None,
                 known_deleted: false,
+                pending_deleted: false,
                 dirty: false,
                 expiration_time: 0,
             }],
@@ -15138,12 +15652,14 @@ mod tests {
                 BinEntry {
                     data: Some(Bytes::from(b"old_a".to_vec())),
                     known_deleted: false,
+                    pending_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
                 BinEntry {
                     data: Some(Bytes::from(b"old_c".to_vec())),
                     known_deleted: false,
+                    pending_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
@@ -15167,9 +15683,19 @@ mod tests {
 
         let delta_entries = vec![
             // Update existing key "a" with new data.
-            (b"a".to_vec(), Lsn::new(1, 10), Some(b"new_a".to_vec())),
+            (
+                b"a".to_vec(),
+                Lsn::new(1, 10),
+                Some(b"new_a".to_vec()),
+                (false, false),
+            ),
             // Insert new key "b".
-            (b"b".to_vec(), Lsn::new(1, 20), Some(b"new_b".to_vec())),
+            (
+                b"b".to_vec(),
+                Lsn::new(1, 20),
+                Some(b"new_b".to_vec()),
+                (false, false),
+            ),
         ];
 
         Tree::apply_delta_to_bin(&mut base, delta_entries);
@@ -15212,6 +15738,7 @@ mod tests {
             entries: vec![BinEntry {
                 data: None,
                 known_deleted: false,
+                pending_deleted: false,
                 dirty: false,
                 expiration_time: 0,
             }],
@@ -15255,12 +15782,14 @@ mod tests {
                 BinEntry {
                     data: Some(Bytes::from(b"base_aa".to_vec())),
                     known_deleted: false,
+                    pending_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
                 BinEntry {
                     data: Some(Bytes::from(b"base_cc".to_vec())),
                     known_deleted: false,
+                    pending_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
@@ -15290,12 +15819,14 @@ mod tests {
                 BinEntry {
                     data: Some(Bytes::from(b"delta_aa".to_vec())),
                     known_deleted: false,
+                    pending_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
                 BinEntry {
                     data: Some(Bytes::from(b"delta_bb".to_vec())),
                     known_deleted: false,
+                    pending_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
@@ -15399,6 +15930,7 @@ mod tests {
             entries: vec![BinEntry {
                 data: Some(Bytes::from(b"v1".to_vec())),
                 known_deleted: false,
+                pending_deleted: false,
                 dirty: false,
                 expiration_time: 0,
             }],
@@ -15446,6 +15978,7 @@ mod tests {
             entries: vec![BinEntry {
                 data: Some(Bytes::from(b"delta_a".to_vec())),
                 known_deleted: false,
+                pending_deleted: false,
                 dirty: true,
                 expiration_time: 0,
             }],
@@ -15500,12 +16033,14 @@ mod tests {
                 BinEntry {
                     data: Some(Bytes::from(b"base_val".to_vec())),
                     known_deleted: false,
+                    pending_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
                 BinEntry {
                     data: Some(Bytes::from(b"base_shared".to_vec())),
                     known_deleted: false,
+                    pending_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
@@ -15551,6 +16086,7 @@ mod tests {
                 BinEntry {
                     data: Some(Bytes::from(b"delta_shared".to_vec())),
                     known_deleted: false,
+                    pending_deleted: false,
                     dirty: true,
                     expiration_time: 0,
                 },
@@ -15558,6 +16094,7 @@ mod tests {
                 BinEntry {
                     data: Some(Bytes::from(b"delta_val".to_vec())),
                     known_deleted: false,
+                    pending_deleted: false,
                     dirty: true,
                     expiration_time: 0,
                 },
@@ -15644,18 +16181,21 @@ mod tests {
                 BinEntry {
                     data: None,
                     known_deleted: false,
+                    pending_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
                 BinEntry {
                     data: None,
                     known_deleted: false,
+                    pending_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
                 BinEntry {
                     data: None,
                     known_deleted: false,
+                    pending_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
@@ -15716,6 +16256,7 @@ mod tests {
             entries: vec![BinEntry {
                 data: None,
                 known_deleted: false,
+                pending_deleted: false,
                 dirty: false,
                 expiration_time: 0,
             }],
@@ -16532,24 +17073,28 @@ mod tests {
                 BinEntry {
                     data: Some(Bytes::from(b"live".to_vec())),
                     known_deleted: false,
+                    pending_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
                 BinEntry {
                     data: None,
                     known_deleted: true,
+                    pending_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
                 BinEntry {
                     data: Some(Bytes::from(b"live2".to_vec())),
                     known_deleted: false,
+                    pending_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
                 BinEntry {
                     data: None,
                     known_deleted: true,
+                    pending_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
@@ -16644,24 +17189,28 @@ mod tests {
                 BinEntry {
                     data: Some(Bytes::from(b"live".to_vec())),
                     known_deleted: false,
+                    pending_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
                 BinEntry {
                     data: None,
                     known_deleted: true, // write-locked tombstone -> KEEP
+                    pending_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
                 BinEntry {
                     data: Some(Bytes::from(b"live2".to_vec())),
                     known_deleted: false,
+                    pending_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
                 BinEntry {
                     data: None,
                     known_deleted: true, // committed tombstone -> REMOVE
+                    pending_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
@@ -16754,18 +17303,21 @@ mod tests {
                 BinEntry {
                     data: Some(Bytes::from(b"live".to_vec())),
                     known_deleted: false,
+                    pending_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
                 BinEntry {
                     data: None,
                     known_deleted: true,
+                    pending_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
                 BinEntry {
                     data: None,
                     known_deleted: true,
+                    pending_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
@@ -16837,6 +17389,7 @@ mod tests {
             entries: vec![BinEntry {
                 data: Some(Bytes::from(b"d".to_vec())),
                 known_deleted: false,
+                pending_deleted: false,
                 dirty: false,
                 expiration_time: 0,
             }],
@@ -16877,6 +17430,7 @@ mod tests {
             entries: vec![BinEntry {
                 data: None,
                 known_deleted: true,
+                pending_deleted: false,
                 dirty: false,
                 expiration_time: 0,
             }],
@@ -16927,6 +17481,7 @@ mod tests {
             entries: vec![BinEntry {
                 data: None,
                 known_deleted: true,
+                pending_deleted: false,
                 dirty: false,
                 expiration_time: 0,
             }],
@@ -16991,6 +17546,7 @@ mod tests {
             entries: vec![BinEntry {
                 data: Some(Bytes::from(b"v".to_vec())),
                 known_deleted: false,
+                pending_deleted: false,
                 dirty: false,
                 expiration_time: 0,
             }],
@@ -17033,12 +17589,14 @@ mod tests {
                 BinEntry {
                     data: Some(Bytes::from(b"v".to_vec())),
                     known_deleted: false,
+                    pending_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
                 BinEntry {
                     data: None,
                     known_deleted: true,
+                    pending_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
@@ -17126,18 +17684,21 @@ mod tests {
                 BinEntry {
                     data: Some(Bytes::from(b"d0".to_vec())),
                     known_deleted: false,
+                    pending_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
                 BinEntry {
                     data: Some(Bytes::from(b"d1".to_vec())),
                     known_deleted: false,
+                    pending_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
                 BinEntry {
                     data: None,
                     known_deleted: true,
+                    pending_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
@@ -17170,6 +17731,7 @@ mod tests {
             entries: vec![BinEntry {
                 data: Some(Bytes::from(b"s".to_vec())),
                 known_deleted: false,
+                pending_deleted: false,
                 dirty: false,
                 expiration_time: 0,
             }],
@@ -17310,6 +17872,7 @@ mod tests {
             entries: vec![BinEntry {
                 data: None,
                 known_deleted: true,
+                pending_deleted: false,
                 dirty: false,
                 expiration_time: 0,
             }],
@@ -17365,12 +17928,14 @@ mod tests {
                 BinEntry {
                     data: Some(Bytes::from(b"a".to_vec())),
                     known_deleted: false,
+                    pending_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
                 BinEntry {
                     data: Some(Bytes::from(b"b".to_vec())),
                     known_deleted: false,
+                    pending_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
@@ -17430,18 +17995,21 @@ mod tests {
                 BinEntry {
                     data: None,
                     known_deleted: true,
+                    pending_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
                 BinEntry {
                     data: Some(Bytes::from(b"B".to_vec())),
                     known_deleted: false,
+                    pending_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
                 BinEntry {
                     data: Some(Bytes::from(b"C".to_vec())),
                     known_deleted: false,
+                    pending_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
@@ -17619,12 +18187,14 @@ mod tests {
                 BinEntry {
                     data: None,
                     known_deleted: true,
+                    pending_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
                 BinEntry {
                     data: Some(Bytes::from(b"v".to_vec())),
                     known_deleted: false,
+                    pending_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
@@ -17652,6 +18222,7 @@ mod tests {
             entries: vec![BinEntry {
                 data: Some(Bytes::from(b"s".to_vec())),
                 known_deleted: false,
+                pending_deleted: false,
                 dirty: false,
                 expiration_time: 0,
             }],
@@ -17743,6 +18314,7 @@ mod tests {
                 BinEntry {
                     data: Some(Bytes::from(b"live".to_vec())),
                     known_deleted: false,
+                    pending_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
@@ -17750,6 +18322,7 @@ mod tests {
                 BinEntry {
                     data: None,
                     known_deleted: true,
+                    pending_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
@@ -17757,6 +18330,7 @@ mod tests {
                 BinEntry {
                     data: Some(Bytes::from(b"also-live".to_vec())),
                     known_deleted: false,
+                    pending_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
@@ -17764,6 +18338,7 @@ mod tests {
                 BinEntry {
                     data: None,
                     known_deleted: true,
+                    pending_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
@@ -17992,6 +18567,7 @@ mod tests {
             entries: vec![BinEntry {
                 data: Some(Bytes::from(b"old".to_vec())),
                 known_deleted: false,
+                pending_deleted: false,
                 dirty: false,
                 expiration_time: 0,
             }],
@@ -18029,12 +18605,14 @@ mod tests {
                 BinEntry {
                     data: Some(Bytes::from(b"d1".to_vec())),
                     known_deleted: false,
+                    pending_deleted: false,
                     dirty: true,
                     expiration_time: 0,
                 },
                 BinEntry {
                     data: None,
                     known_deleted: true,
+                    pending_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
@@ -18138,18 +18716,21 @@ mod tests {
                 BinEntry {
                     data: Some(Bytes::from(b"v1".to_vec())),
                     known_deleted: false,
+                    pending_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
                 BinEntry {
                     data: Some(Bytes::from(b"v2".to_vec())),
                     known_deleted: false,
+                    pending_deleted: false,
                     dirty: true,
                     expiration_time: 0,
                 },
                 BinEntry {
                     data: Some(Bytes::from(b"v3".to_vec())),
                     known_deleted: false,
+                    pending_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 },
@@ -18221,6 +18802,7 @@ mod tests {
                 .map(|(_key, _lsn, data)| BinEntry {
                     data: data.map(Bytes::from),
                     known_deleted: false,
+                    pending_deleted: false,
                     dirty: false,
                     expiration_time: 0,
                 })
@@ -18757,18 +19339,21 @@ mod tests {
         bin.entries.push(BinEntry {
             data: Some(Bytes::from(vec![0u8; 64])),
             known_deleted: false,
+            pending_deleted: false,
             dirty: false,
             expiration_time: 0,
         });
         bin.entries.push(BinEntry {
             data: Some(Bytes::from(vec![0u8; 32])),
             known_deleted: false,
+            pending_deleted: false,
             dirty: false,
             expiration_time: 0,
         });
         bin.entries.push(BinEntry {
             data: Some(Bytes::from(vec![0u8; 16])),
             known_deleted: false,
+            pending_deleted: false,
             dirty: true, // dirty BUT logged -> still strippable (EVICTOR-RECLAIM-1)
             expiration_time: 0,
         });
@@ -18906,6 +19491,7 @@ fn test_split_child_sibling_inherits_expiration_in_hours() {
         .map(|_k| BinEntry {
             data: Some(Bytes::from(vec![_k, _k])),
             known_deleted: false,
+            pending_deleted: false,
             dirty: true,
             expiration_time: future_exp, // hours-since-epoch, ~1000 h out
         })

@@ -38,6 +38,7 @@ fn make_bin_bytes(
         entries: vec![BinEntry {
             data: Some(bytes::Bytes::copy_from_slice(data)),
             known_deleted: false,
+            pending_deleted: false,
             dirty: false,
             expiration_time: 0,
         }],

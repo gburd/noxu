@@ -521,14 +521,44 @@ impl CursorImpl {
         // releases the descent pin so the evictor is not wedged.
         let rc_c = self.lock_ln_mode(lsn, forward)?;
         // BUG-RC-SCAN-TORN-READ (depends on C2 A23): re-lock+re-read
-        // committed bytes on contention or an LSN move.
+        // committed bytes on contention or an LSN move.  FID-CURSOR-1/7: the
+        // SCAN revalidation re-checks the record BY KEY (`raw_key`), so a
+        // concurrent commit/abort that removed/shifted the slot is detected
+        // (`Some(None)`) instead of silently returning the slot's new
+        // occupant.
         let revalidated = {
             let arc = pin_guard.arc().clone();
-            self.revalidate_locked_slot_rc(&arc, idx as usize, lsn, rc_c)?
+            self.revalidate_scanned_slot_rc(
+                &arc,
+                idx as usize,
+                &raw_key,
+                lsn,
+                rc_c,
+            )?
         };
         let (raw_key, raw_data, lsn) = match revalidated {
             Some(Some((rk, rd, rl))) => (rk, rd, rl),
-            _ => (raw_key, raw_data, lsn),
+            // FID-CURSOR-1 / FID-CURSOR-7: the edge slot was DEFUNCT under the
+            // lock (a concurrent delete committed, or a concurrent insert
+            // aborted).  JE re-resolves rather than returning the stale
+            // prefetch (CursorImpl.getNext/lockAndGetCurrent null → advance).
+            // Re-anchor on this slot's key and delegate to `retrieve_next`,
+            // which crosses to the next non-defunct neighbour (same shape as
+            // the all-known-deleted edge-BIN arm above).
+            Some(None) => {
+                drop(pin_guard);
+                self.current_key = Some(raw_key);
+                self.current_index = 0;
+                self.state = CursorState::PendingDeleted;
+                self.update_bin_pin(None);
+                return self.retrieve_next(if forward {
+                    GetMode::Next
+                } else {
+                    GetMode::Prev
+                });
+            }
+            // Prefetch authoritative (unchanged, uncontended, not PD).
+            None => (raw_key, raw_data, lsn),
         };
         self.current_key = Some(raw_key);
         self.current_data = Some(raw_data);
@@ -868,7 +898,16 @@ impl CursorImpl {
         let db = self.db_impl.read();
         if let Some(tree) = db.get_real_tree() {
             let removed = if self.txn_ref.is_some() && !del_lsn.is_null() {
-                tree.mark_deleted(&key, del_lsn)
+                // FID-CURSOR-1: a transactional delete is PENDING-deleted
+                // (`pending = true`): the delete is not yet committed, so a
+                // concurrent scan must LOCK this slot (blocking on this
+                // cursor's WRITE lock on `del_lsn`) before treating it as
+                // absent (JE `IN.deleteRecord` → `setPendingDeleted`,
+                // IN.java:3797; `CursorImpl.lockAndGetCurrent` skips KD-only,
+                // CursorImpl.java:2060).  A non-transactional / unlogged
+                // delete below physically removes the slot: its lock ends with
+                // the operation, so no scan can observe it uncommitted.
+                tree.mark_deleted(&key, del_lsn, true)
             } else {
                 tree.delete(&key)
             };
@@ -1635,6 +1674,60 @@ impl CursorImpl {
         Ok(ln.data.map(Bytes::copy_from_slice))
     }
 
+    /// FID-TREE-1: the fail-closed point-read descent.  Runs the tree's
+    /// fetch-failure-aware `search_with_data_checked`, which surfaces an
+    /// UNDECIDABLE interior-IN fetch failure (a non-NULL slot LSN whose log
+    /// image could not be read) as `Err(TreeError::LogError)` instead of
+    /// swallowing it to `None` -> "key absent".  JE `IN.fetchTarget` /
+    /// `fetchIN` throw `LOG_FILE_NOT_FOUND` here (env-invalidating,
+    /// fail-closed, IN.java:2825-2834) rather than reporting the committed key
+    /// as not-found.
+    ///
+    /// Maps that failure to the SAME A6 D1 fail-closed path
+    /// `fetch_ln_data_from_log` uses: a `DbiError::LnFetchFailure` with an
+    /// env-invalidating reason (`LOG_FILE_NOT_FOUND`), setting the shared
+    /// `env_invalid` flag.  NO new public error variant.  `Ok(None)` /
+    /// `Ok(Some(..))` carry the genuine absent / found slot result exactly as
+    /// the unchecked `search_with_data` did, so every existing caller that
+    /// treats `None` as absent stays correct for the DECIDABLE cases.
+    fn search_with_data_fail_closed(
+        &self,
+        key: &[u8],
+    ) -> Result<Option<noxu_tree::tree::SlotFetch>, DbiError> {
+        let db = self.db_impl.read();
+        let Some(tree) = db.get_real_tree() else {
+            return Ok(None);
+        };
+        match tree.search_with_data_checked(key) {
+            Ok(slot) => Ok(slot),
+            Err(noxu_tree::TreeError::LogError(msg)) => {
+                use crate::EnvironmentFailureReason as R;
+                // JE IN.fetchTarget throws LOG_FILE_NOT_FOUND, which
+                // invalidates the environment (fail closed).
+                let reason = R::LogFileNotFound;
+                if reason.invalidates_environment()
+                    && let Some(f) = &self.env_invalid
+                {
+                    f.store(true, Ordering::Release);
+                }
+                Err(DbiError::LnFetchFailure {
+                    reason,
+                    msg: format!(
+                        "interior IN fetch failed during read of a committed \
+                         key (must not be reported as absent): {msg}"
+                    ),
+                })
+            }
+            // No other TreeError kind is produced by search_with_data_checked;
+            // map defensively to the same fail-closed error rather than
+            // swallowing.
+            Err(e) => Err(DbiError::LnFetchFailure {
+                reason: crate::EnvironmentFailureReason::LogIntegrity,
+                msg: format!("interior IN fetch failed during read: {e:?}"),
+            }),
+        }
+    }
+
     /// If `current_data` is empty/None but `current_lsn` is valid, the LN was
     /// stripped by the evictor — re-fetch it from the log (JE
     /// `IN.fetchTarget`). Idempotent; cheap when data is resident.
@@ -1793,14 +1886,13 @@ impl CursorImpl {
         // a local loop with no cursor state that outlives the call, and it only
         // fires on an exact KD match (never on a plain absent key — a miss
         // stays one descent).
-        let mut slot = {
-            let db = self.db_impl.read();
-            if let Some(tree) = db.get_real_tree() {
-                tree.search_with_data(key)
-            } else {
-                None
-            }
-        };
+        //
+        // FID-TREE-1: fail closed on an undecidable interior-IN fetch failure
+        // (a committed key under an unreadable log file must NOT read as
+        // absent).  `search_with_data_fail_closed` maps that to
+        // `DbiError::LnFetchFailure` + env invalidation; a genuine absent key
+        // still returns `Ok(None)`.
+        let mut slot = self.search_with_data_fail_closed(key)?;
         //
         // Fire ONLY on an exact KNOWN-DELETED match (JE searchExact scope,
         // CursorImpl.java:1937-1980): a reachable slot that is simply ABSENT
@@ -1817,14 +1909,7 @@ impl CursorImpl {
                 break;
             }
             // Re-descend once on the current resident instance.
-            slot = {
-                let db = self.db_impl.read();
-                if let Some(tree) = db.get_real_tree() {
-                    tree.search_with_data(key)
-                } else {
-                    None
-                }
-            };
+            slot = self.search_with_data_fail_closed(key)?;
         }
         let found = slot.as_ref().is_some_and(|s| s.found);
 
@@ -2155,8 +2240,8 @@ impl CursorImpl {
                             let revalidated = match bin_arc.as_ref() {
                                 Some(arc) => {
                                     let arc = arc.clone();
-                                    self.revalidate_locked_slot_rc(
-                                        &arc, slot_idx, lsn, rc_c,
+                                    self.revalidate_scanned_slot_rc(
+                                        &arc, slot_idx, &k, lsn, rc_c,
                                     )?
                                 }
                                 None => None,
@@ -2164,7 +2249,22 @@ impl CursorImpl {
                             let (final_key, final_data, final_lsn) =
                                 match revalidated {
                                     Some(Some((rk, rd, rl))) => (rk, rd, rl),
-                                    _ => (k, Bytes::from(v), lsn),
+                                    // FID-CURSOR-1/7: the range-found slot was
+                                    // DEFUNCT (committed-PD / removed) under
+                                    // the lock.  Re-anchor on it and advance to
+                                    // the next NON-defunct key via retrieve_next
+                                    // rather than returning the stale prefetch
+                                    // (JE getSearchKeyRange falling into
+                                    // getNext's re-resolve).
+                                    Some(None) => {
+                                        self.current_key = Some(k);
+                                        self.current_index = slot_idx as i32;
+                                        self.state = CursorState::Initialized;
+                                        self.update_bin_pin(bin_arc);
+                                        return self
+                                            .retrieve_next(GetMode::Next);
+                                    }
+                                    None => (k, Bytes::from(v), lsn),
                                 };
                             self.current_key = Some(final_key);
                             self.current_data = Some(final_data);
@@ -2270,11 +2370,22 @@ impl CursorImpl {
                     // None here and is decoded lazily by get_current(), so we
                     // only need the authoritative key + LSN.
                     let (final_key, final_lsn) = match self
-                        .revalidate_locked_slot_rc(
-                            &bin_arc, idx, slot_lsn, rc_c_dup,
+                        .revalidate_scanned_slot_rc(
+                            &bin_arc, idx, &raw_key, slot_lsn, rc_c_dup,
                         )? {
                         Some(Some((rk, _rd, rl))) => (rk, rl),
-                        _ => (raw_key, slot_lsn),
+                        // FID-CURSOR-1/7: the positioned dup slot was DEFUNCT
+                        // (committed-PD / removed) under the lock — advance to
+                        // the next NON-defunct record via retrieve_next rather
+                        // than returning the stale two-part key.
+                        Some(None) => {
+                            self.current_key = Some(raw_key);
+                            self.current_index = idx as i32;
+                            self.state = CursorState::Initialized;
+                            self.update_bin_pin(Some(bin_arc));
+                            return self.retrieve_next(GetMode::Next);
+                        }
+                        None => (raw_key, slot_lsn),
                     };
                     // Store the raw two-part key; get_current() will decode it.
                     self.current_key = Some(final_key);
@@ -2575,7 +2686,30 @@ impl CursorImpl {
         use noxu_tree::tree::TreeNode;
         // Fast path: no contention AND the slot LSN is unchanged -> the
         // prefetch is authoritative (same O(1) check A14-min uses).
-        if !contended
+        //
+        // FID-CURSOR-1: a PENDING-deleted slot must NEVER take the fast path.
+        // The scan deliberately lands on a PD slot (its KD-only skip predicate
+        // does not skip PD), then locks it.  If the deleter already committed
+        // and released its WRITE lock, `lock_ln_mode` grants immediately
+        // (`contended == false`) and the slot LSN is unchanged, so the fast
+        // path would return the pre-lock (deleted) prefetch as if it were a
+        // live record — a dirty read of the committed delete.  Forcing the
+        // slow path makes the `slot_is_live` check below reject the PD slot
+        // (returning `Some(None)` → the scan advances), and on an ABORT the
+        // slot is no longer PD so it re-resolves to the restored record (JE
+        // `lockLNAndCheckDefunct` re-reads the slot after the blocking lock,
+        // CursorImpl.java:2148-2222).
+        let slot_is_pending_deleted = {
+            let guard = bin_arc.read();
+            match &*guard {
+                TreeNode::Bottom(bin) => {
+                    bin.slot_is_pending_deleted(slot_index)
+                }
+                _ => false,
+            }
+        };
+        if !slot_is_pending_deleted
+            && !contended
             && !Self::slot_lsn_changed(bin_arc, slot_index, pre_lock_lsn)
         {
             return Ok(None);
@@ -2607,6 +2741,68 @@ impl CursorImpl {
             (None, _) => Ok(Some(None)), // committed delete observed under lock
             (Some(committed), final_lsn) => {
                 Ok(Some(Some((key, committed, final_lsn))))
+            }
+        }
+    }
+
+    /// FID-CURSOR-1 / FID-CURSOR-7: the SCAN post-lock revalidation.
+    ///
+    /// A scan prefetched `(expected_key, pre_lock_lsn)` and then took the
+    /// record lock (blocking on any in-flight writer).  Unlike
+    /// `revalidate_locked_slot_rc` — which re-resolves the key currently at
+    /// `slot_index` (correct for a point read, where the slot index is stable
+    /// and an in-place update keeps the same key) — a scan must re-check the
+    /// SPECIFIC record it locked, BY KEY, because a concurrent commit/abort
+    /// may have physically removed or shifted the slot so `slot_index` now
+    /// names a DIFFERENT record (JE positions by the slot's record identity,
+    /// not its array index; `CursorImpl.getNext` re-resolves after
+    /// `lockLNAndCheckDefunct`).
+    ///
+    /// Returns `None` when the prefetch is still authoritative (uncontended,
+    /// not pending-deleted, and the slot LSN is unchanged), `Some(None)` when
+    /// the locked record is now DEFUNCT / gone (the caller re-anchors on
+    /// `expected_key` and advances), or `Some(Some((key, data, lsn)))` with
+    /// the committed re-read of `expected_key`.
+    #[allow(clippy::type_complexity)]
+    fn revalidate_scanned_slot_rc(
+        &mut self,
+        bin_arc: &std::sync::Arc<
+            noxu_tree::NodeRwLock<noxu_tree::tree::TreeNode>,
+        >,
+        slot_index: usize,
+        expected_key: &[u8],
+        pre_lock_lsn: u64,
+        contended: bool,
+    ) -> Result<Option<Option<(Vec<u8>, Bytes, u64)>>, DbiError> {
+        use noxu_tree::tree::TreeNode;
+        // A PENDING-deleted slot must never take the fast path (see
+        // `revalidate_locked_slot_rc` for the full rationale): a committed
+        // delete the deleter already released would otherwise be returned from
+        // the pre-lock prefetch.
+        let slot_is_pending_deleted = {
+            let guard = bin_arc.read();
+            match &*guard {
+                TreeNode::Bottom(bin) => {
+                    bin.slot_is_pending_deleted(slot_index)
+                }
+                _ => false,
+            }
+        };
+        if !slot_is_pending_deleted
+            && !contended
+            && !Self::slot_lsn_changed(bin_arc, slot_index, pre_lock_lsn)
+        {
+            return Ok(None);
+        }
+        // Re-read the SPECIFIC record we locked, BY KEY, under a lock on its
+        // current LSN.  `(None, _)` => the record is gone / a committed delete
+        // => defunct; the caller re-anchors on `expected_key` and advances.
+        match self
+            .reread_data_locking_current_lsn(expected_key, pre_lock_lsn)?
+        {
+            (None, _) => Ok(Some(None)),
+            (Some(committed), final_lsn) => {
+                Ok(Some(Some((expected_key.to_vec(), committed, final_lsn))))
             }
         }
     }
@@ -2677,7 +2873,7 @@ impl CursorImpl {
                     Some(cmp) => bin.find_entry_cmp(key, cmp.as_ref()),
                     None => bin.find_entry_compressed(key),
                 };
-                if found && !bin.entries[idx].known_deleted {
+                if found && !bin.entries[idx].is_deleted() {
                     bin.get_full_key(idx)
                 } else {
                     None
@@ -3470,7 +3666,7 @@ impl CursorImpl {
                 // residency -- `None` means the LN was stripped
                 // (non-resident); the caller refetches at the returned LSN
                 // rather than flattening to an empty value.
-                if found && !bin.entries[idx].known_deleted {
+                if found && !bin.entries[idx].is_deleted() {
                     Some((
                         bin.entries[idx].data.clone(),
                         bin.get_lsn(idx).as_u64(),
@@ -3570,7 +3766,7 @@ impl CursorImpl {
                         // is >= `key` under the comparator.
                         (0..bin.entries.len())
                             .find(|&i| {
-                                bin.slot_is_live(i)
+                                !bin.slot_scan_skippable(i)
                                     && bin.get_full_key(i).is_some_and(|fk| {
                                         cmp(&fk, key)
                                             != std::cmp::Ordering::Less
@@ -3603,7 +3799,7 @@ impl CursorImpl {
                                 // Every key in this BIN is > seed: the first
                                 // LIVE slot.
                                 (0..bin.entries.len())
-                                    .find(|&i| bin.slot_is_live(i))
+                                    .find(|&i| !bin.slot_scan_skippable(i))
                                     .and_then(|i| {
                                         bin.get_full_key(i).map(|fk| {
                                             (
@@ -3628,7 +3824,7 @@ impl CursorImpl {
                             let suffix = &key[plen..];
                             (0..bin.entries.len())
                                 .find(|&i| {
-                                    bin.slot_is_live(i)
+                                    !bin.slot_scan_skippable(i)
                                         && bin.get_key(i) >= suffix
                                 })
                                 .and_then(|i| {
@@ -3757,7 +3953,7 @@ impl CursorImpl {
                                     // known_deleted slots
                                     // (CursorImpl.java:2062-2064).
                                     let i = (0..bin.entries.len())
-                                        .find(|&i| bin.slot_is_live(i));
+                                        .find(|&i| !bin.slot_scan_skippable(i));
                                     let Some(i) = i else {
                                         // Edge BIN is entirely KD: anchor on
                                         // its last key so retrieve_next can
@@ -3817,14 +4013,31 @@ impl CursorImpl {
                     return self.retrieve_next(GetMode::Next);
                 }
                 let rc_c = self.lock_ln_mode(lsn, true)?;
-                let (key, data, lsn) = match self.revalidate_locked_slot_rc(
+                // FID-CURSOR-1/7: the first slot may be PENDING-deleted (a
+                // committed delete not yet compressed).  Use the SCAN
+                // revalidation (re-check BY KEY) and, if it is defunct under
+                // the lock (`Some(None)`), advance to the next NON-defunct
+                // slot via retrieve_next starting FROM this slot's index (so
+                // the within-BIN scan steps to idx+1 and finds a same-BIN live
+                // neighbour, e.g. getFirst skipping a committed-deleted key 1
+                // to reach key 2 in the same BIN) — never return the stale
+                // prefetch (JE getFirst falls into getNext's re-resolve).
+                let (key, data, lsn) = match self.revalidate_scanned_slot_rc(
                     &bin_arc,
                     idx as usize,
+                    &key,
                     lsn,
                     rc_c,
                 )? {
                     Some(Some((rk, rd, rl))) => (rk, rd, rl),
-                    _ => (key, data, lsn),
+                    Some(None) => {
+                        self.current_key = Some(key);
+                        self.current_index = idx;
+                        self.state = CursorState::Initialized;
+                        self.update_bin_pin(Some(bin_arc));
+                        return self.retrieve_next(GetMode::Next);
+                    }
+                    None => (key, data, lsn),
                 };
                 self.current_key = Some(key);
                 self.current_data = Some(data);
@@ -3926,7 +4139,7 @@ impl CursorImpl {
                                     // (CursorImpl.java:2062-2064).
                                     let i = (0..n)
                                         .rev()
-                                        .find(|&i| bin.slot_is_live(i));
+                                        .find(|&i| !bin.slot_scan_skippable(i));
                                     let Some(i) = i else {
                                         // Edge BIN entirely KD: anchor on its
                                         // first key so retrieve_next can cross
@@ -3983,14 +4196,26 @@ impl CursorImpl {
                     return self.retrieve_next(GetMode::Prev);
                 }
                 let rc_c = self.lock_ln_mode(lsn, false)?;
-                let (key, data, lsn) = match self.revalidate_locked_slot_rc(
+                // FID-CURSOR-1/7 (symmetric to get_first): SCAN revalidation
+                // by key; a defunct (PENDING-deleted / removed) last slot
+                // re-anchors and delegates to retrieve_next(Prev) rather than
+                // returning the stale prefetch.
+                let (key, data, lsn) = match self.revalidate_scanned_slot_rc(
                     &bin_arc,
                     idx as usize,
+                    &key,
                     lsn,
                     rc_c,
                 )? {
                     Some(Some((rk, rd, rl))) => (rk, rd, rl),
-                    _ => (key, data, lsn),
+                    Some(None) => {
+                        self.current_key = Some(key);
+                        self.current_index = idx;
+                        self.state = CursorState::Initialized;
+                        self.update_bin_pin(Some(bin_arc));
+                        return self.retrieve_next(GetMode::Prev);
+                    }
+                    None => (key, data, lsn),
                 };
                 self.current_key = Some(key);
                 self.current_data = Some(data);
@@ -4152,7 +4377,7 @@ impl CursorImpl {
             Some(cmp) => bin.find_entry_cmp(key, cmp.as_ref()),
             None => bin.find_entry_compressed(key),
         };
-        if !found || bin.entries[idx].known_deleted {
+        if !found || bin.entries[idx].is_deleted() {
             return None;
         }
         let lsn = bin.get_lsn(idx).as_u64();
@@ -4203,6 +4428,14 @@ impl CursorImpl {
                 //   (b) a concurrent insert shifted this cursor's slot.
                 // Search the tree to distinguish the two cases.
                 // We must drop the guard before calling into the tree.
+                // FID-TREE-1 note: this is a cursor-position disambiguation
+                // (deleted vs insert-shifted), not a user READ result; a fetch
+                // failure here degrades to "treat as deleted -> re-anchor on
+                // the next traversal", which is self-correcting (the caller
+                // re-validates), so the unchecked `search_with_data` is
+                // acceptable here.  The user-visible point read
+                // (`search_with_data_fail_closed`) and the insert descent fail
+                // closed instead.
                 drop(guard);
                 let db = self.db_impl.read();
                 if let Some(tree) = db.get_real_tree()
@@ -4217,7 +4450,7 @@ impl CursorImpl {
                 }
                 return true; // key gone = deleted
             }
-            bin.entries[idx].known_deleted
+            bin.entries[idx].is_deleted()
         } else {
             false
         }
@@ -4480,7 +4713,7 @@ impl CursorImpl {
                         let mut scan = retry_next;
                         while scan >= 0 && scan < bin.entries.len() as i32 {
                             let idx = scan as usize;
-                            if !bin.slot_is_live(idx) {
+                            if bin.slot_scan_skippable(idx) {
                                 scan += if forward { 1 } else { -1 };
                                 continue;
                             }
@@ -4522,7 +4755,7 @@ impl CursorImpl {
                         let mut scan = next_index;
                         while scan >= 0 && scan < bin.entries.len() as i32 {
                             let idx = scan as usize;
-                            if !bin.slot_is_live(idx) {
+                            if bin.slot_scan_skippable(idx) {
                                 scan += if forward { 1 } else { -1 };
                                 continue;
                             }
@@ -4575,7 +4808,7 @@ impl CursorImpl {
                                     && scan < bin.entries.len() as i32
                                 {
                                     let idx = scan as usize;
-                                    if !bin.slot_is_live(idx) {
+                                    if bin.slot_scan_skippable(idx) {
                                         scan += if forward { 1 } else { -1 };
                                         continue;
                                     }
@@ -4640,24 +4873,50 @@ impl CursorImpl {
             let rc_c = self.lock_ln_mode(lsn, forward)?;
             let cur_arc = self.current_bin_arc.clone();
             let revalidated = match &cur_arc {
-                Some(arc) => self.revalidate_locked_slot_rc(
+                Some(arc) => self.revalidate_scanned_slot_rc(
                     arc,
                     idx as usize,
+                    &key,
                     lsn,
                     rc_c,
                 )?,
                 None => None,
             };
-            let (key, data, lsn) = match revalidated {
-                Some(Some((rk, rd, rl))) => (rk, rd, rl),
-                _ => (key, data, lsn),
-            };
-            self.current_key = Some(key);
-            self.current_data = Some(data);
-            self.current_lsn = lsn;
-            self.rehydrate_current_data()?;
-            self.current_index = idx;
-            return Ok(OperationStatus::Success);
+            match revalidated {
+                Some(Some((rk, rd, rl))) => {
+                    self.current_key = Some(rk);
+                    self.current_data = Some(rd);
+                    self.current_lsn = rl;
+                    self.rehydrate_current_data()?;
+                    self.current_index = idx;
+                    return Ok(OperationStatus::Success);
+                }
+                // FID-CURSOR-1 / FID-CURSOR-7: the candidate slot was DEFUNCT
+                // under the lock (a concurrent delete committed, or a
+                // concurrent insert aborted / removed the slot).  JE
+                // `CursorImpl.getNext` re-resolves rather than returning the
+                // stale prefetch (CursorImpl.java:2578-2604).  Advance to the
+                // NEXT slot in THIS BIN (`current_index = idx`, so the
+                // recursive step re-scans the pinned BIN from idx+/-1) and
+                // re-resolve — so a same-BIN live neighbour past a run of
+                // committed-deleted slots is found before crossing to the
+                // adjacent BIN.
+                Some(None) => {
+                    self.current_key = Some(key);
+                    self.current_index = idx;
+                    self.state = CursorState::Initialized;
+                    return self.retrieve_next(mode);
+                }
+                // Prefetch authoritative (unchanged, uncontended, not PD).
+                None => {
+                    self.current_key = Some(key);
+                    self.current_data = Some(data);
+                    self.current_lsn = lsn;
+                    self.rehydrate_current_data()?;
+                    self.current_index = idx;
+                    return Ok(OperationStatus::Success);
+                }
+            }
         }
 
         // Current BIN exhausted — cross to adjacent BIN.
@@ -4750,16 +5009,16 @@ impl CursorImpl {
             // the guard and hand the still-pinned arc to the install.
             let pin_guard = PinnedBinGuard::new(pinned_arc);
 
-            // Pick the first (forward) / last (backward) LIVE slot; the slot
-            // index equals the position in the returned vec because
-            // descend_to_edge_bin returns slots verbatim.
+            // Pick the first (forward) / last (backward) non-known-deleted
+            // slot; the slot index equals the position in the returned vec
+            // because descend_to_edge_bin returns slots verbatim.
             let live_pos = if forward {
                 entries.iter().position(|e| !e.0.known_deleted)
             } else {
                 entries.iter().rposition(|e| !e.0.known_deleted)
             };
 
-            let Some(pos) = live_pos else {
+            let Some(first_pos) = live_pos else {
                 // This BIN is entirely known_deleted — re-anchor on its edge
                 // key and continue crossing to the next BIN.  Release the pin
                 // on this BIN first (we are not staying on it): dropping the
@@ -4779,71 +5038,106 @@ impl CursorImpl {
                 }
             };
 
-            let idx = pos as i32;
-            let (e, e_lsn, e_key) = &entries[pos];
-            let raw_key = e_key.clone();
-            let raw_data = e.data.clone().unwrap_or_default();
-            let lsn = e_lsn.as_u64();
+            // FID-CURSOR-1 / FID-CURSOR-7: iterate over the non-known-deleted
+            // candidate slots WITHIN this pinned BIN.  A candidate that is
+            // DEFUNCT under the lock (a committed delete, or an aborted/removed
+            // insert) is NOT returned (JE `CursorImpl.getNext` continues the
+            // scan when `lockAndGetCurrent` returns null); the scan advances to
+            // the NEXT non-KD slot in THIS BIN before crossing to the adjacent
+            // one — so a same-BIN live neighbour (e.g. getNext from C skipping
+            // a committed-deleted F to reach G in the same BIN) is never
+            // skipped.  `last_in_bin` is the edge key used to re-cross if every
+            // remaining candidate in this BIN turns out defunct.
+            let mut pos = first_pos as i32;
+            let last_in_bin = if forward {
+                entries.last().map(|e| e.2.clone())
+            } else {
+                entries.first().map(|e| e.2.clone())
+            };
+            while pos >= 0 && (pos as usize) < entries.len() {
+                let p = pos as usize;
+                if entries[p].0.known_deleted {
+                    pos += if forward { 1 } else { -1 };
+                    continue;
+                }
+                let idx = pos;
+                let (e, e_lsn, e_key) = &entries[p];
+                let raw_key = e_key.clone();
+                let raw_data = e.data.clone().unwrap_or_default();
+                let lsn = e_lsn.as_u64();
 
-            if is_dup {
-                // The sorted-dup path re-pins the accept BIN itself via
-                // `install_dup_accept` (`find_bin_arc_for_key`), so release the
-                // descent pin before handing off (avoids a leaked pin):
-                // dropping the guard unpins it.
-                drop(pin_guard);
-                let s = self.apply_dup_filter(
-                    raw_key,
-                    raw_data,
-                    idx,
-                    lsn,
-                    mode,
-                    current_primary_key.as_deref(),
-                    forward,
-                )?;
-                return Ok(s);
+                if is_dup {
+                    // The sorted-dup path re-pins the accept BIN itself via
+                    // `install_dup_accept` (`find_bin_arc_for_key`), so release
+                    // the descent pin before handing off (avoids a leaked
+                    // pin): dropping the guard unpins it.
+                    drop(pin_guard);
+                    let s = self.apply_dup_filter(
+                        raw_key,
+                        raw_data,
+                        idx,
+                        lsn,
+                        mode,
+                        current_primary_key.as_deref(),
+                        forward,
+                    )?;
+                    return Ok(s);
+                }
+                // NEW-9 (leak fix): `lock_ln` can return Err (deadlock /
+                // RangeRestart / lock-manager error).  On that `?`,
+                // `pin_guard` drops and releases the descent pin
+                // (`cursor_count -= 1`) — the BIN is NOT left permanently
+                // pinned/wedged for the evictor.
+                let rc_c_xbin = self.lock_ln_mode(lsn, forward)?;
+                // The BIN is ALREADY pinned by the descent (NEW-9), so
+                // revalidate against THAT pinned arc — no second descent, no
+                // unpinned window.  SCAN revalidation re-checks BY KEY
+                // (`raw_key`), so a concurrent commit/abort that
+                // removed/shifted the slot is detected (`Some(None)`).
+                let revalidated = {
+                    let arc = pin_guard.arc().clone();
+                    self.revalidate_scanned_slot_rc(
+                        &arc,
+                        idx as usize,
+                        &raw_key,
+                        lsn,
+                        rc_c_xbin,
+                    )?
+                };
+                let (raw_key, raw_data, lsn) = match revalidated {
+                    Some(Some((rk, rd, rl))) => (rk, rd, rl),
+                    // Candidate DEFUNCT under the lock — advance to the next
+                    // non-KD slot in THIS BIN (JE getNext re-resolve).
+                    Some(None) => {
+                        pos += if forward { 1 } else { -1 };
+                        continue;
+                    }
+                    // Prefetch authoritative (unchanged, uncontended, not PD).
+                    None => (raw_key, raw_data, lsn),
+                };
+                self.current_key = Some(raw_key);
+                self.current_data = Some(raw_data);
+                self.current_lsn = lsn;
+                self.rehydrate_current_data()?;
+                self.current_index = idx;
+                // Install the already-pinned BIN: `into_arc()` disarms the
+                // guard (the pin is handed off, NOT released), and
+                // `update_bin_pin_prepinned` unpins the OLD BIN only after
+                // adopting this one (pin-next-before-unpin).
+                self.update_bin_pin_prepinned(pin_guard.into_arc());
+                return Ok(OperationStatus::Success);
             }
-            // NEW-9 (leak fix): `lock_ln` can return Err (deadlock /
-            // RangeRestart / lock-manager error).  On that `?`, `pin_guard`
-            // drops and releases the descent pin (`cursor_count -= 1`) — the
-            // BIN is NOT left permanently pinned/wedged for the evictor.
-            let rc_c_xbin = self.lock_ln_mode(lsn, forward)?;
-            // Crossed into a new BIN.  The BIN is ALREADY pinned by the
-            // descent (NEW-9), so revalidate against THAT pinned arc — no
-            // second descent, no unpinned window.
-            // READ_COMMITTED revalidation (C1/V1): `raw_key`/`raw_data` were
-            // snapshotted before lock_ln, so a writer that mutated the slot in
-            // the prefetch->lock window leaves them stale.  Re-derive from the
-            // pinned slot if its LSN moved.  JE CursorImpl.lockLN re-reads
-            // bin.getLsn(index) post-lock (CursorImpl.java:3641-3680);
-            // getCurrent/fetchLN(index) returns current-slot data
-            // (CursorImpl.java:2230/2294).  Because the BIN is pinned, the
-            // evictor cannot have detached/re-faulted it under us, so `idx`
-            // still names the boundary record's slot.
-            let revalidated = {
-                let arc = pin_guard.arc().clone();
-                self.revalidate_locked_slot_rc(
-                    &arc,
-                    idx as usize,
-                    lsn,
-                    rc_c_xbin,
-                )?
-            };
-            let (raw_key, raw_data, lsn) = match revalidated {
-                Some(Some((rk, rd, rl))) => (rk, rd, rl),
-                _ => (raw_key, raw_data, lsn),
-            };
-            self.current_key = Some(raw_key);
-            self.current_data = Some(raw_data);
-            self.current_lsn = lsn;
-            self.rehydrate_current_data()?;
-            self.current_index = idx;
-            // Install the already-pinned BIN: `into_arc()` disarms the guard
-            // (the pin is NOT released here — it is handed off), and
-            // `update_bin_pin_prepinned` unpins the OLD BIN only after adopting
-            // this one, so the cursor is registered on the next BIN before the
-            // current one is released (pin-next-before-unpin).
-            self.update_bin_pin_prepinned(pin_guard.into_arc());
-            return Ok(OperationStatus::Success);
+            // Every candidate in this BIN was defunct under the lock — release
+            // the pin, re-anchor on this BIN's edge key, and cross to the
+            // adjacent BIN.
+            drop(pin_guard);
+            match last_in_bin {
+                Some(k) => {
+                    anchor_key = k;
+                    continue;
+                }
+                None => return Ok(OperationStatus::NotFound),
+            }
         }
         // Crossing budget exhausted (pathological all-KD key space).
         if forward {
@@ -4881,6 +5175,13 @@ impl CursorImpl {
     /// current-slot data (CursorImpl.java:2230/2294): after `lock_ln`, pin the
     /// BIN for `raw_key` and re-derive the authoritative key+data+lsn from the
     /// pinned slot if its LSN moved; otherwise keep the prefetch.
+    /// Returns `Ok(true)` when the slot was accepted and the cursor was
+    /// positioned on it, or `Ok(false)` when the slot was found DEFUNCT under
+    /// the record lock (FID-CURSOR-1 / FID-CURSOR-7: a concurrent delete
+    /// committed or a concurrent insert aborted).  On `false` the caller must
+    /// advance to the next slot and retry, mirroring JE `CursorImpl.getNext`'s
+    /// re-resolve when `lockAndGetCurrent` returns null
+    /// (CursorImpl.java:2578-2604); it must NOT return the stale prefetch.
     fn install_dup_accept(
         &mut self,
         raw_key: Vec<u8>,
@@ -4888,19 +5189,28 @@ impl CursorImpl {
         idx: i32,
         lsn: u64,
         forward: bool,
-    ) -> Result<(), DbiError> {
+    ) -> Result<bool, DbiError> {
         let rc_c = self.lock_ln_mode(lsn, forward)?;
         let bin_arc = self.find_bin_arc_for_key(&raw_key);
         let revalidated = match bin_arc.as_ref() {
             Some(arc) => {
                 let arc = arc.clone();
-                self.revalidate_locked_slot_rc(&arc, idx as usize, lsn, rc_c)?
+                self.revalidate_scanned_slot_rc(
+                    &arc,
+                    idx as usize,
+                    &raw_key,
+                    lsn,
+                    rc_c,
+                )?
             }
             None => None,
         };
         let (raw_key, raw_data, lsn) = match revalidated {
             Some(Some((rk, rd, rl))) => (rk, rd, rl),
-            _ => (raw_key, raw_data, lsn),
+            // Slot defunct under the lock — signal the caller to advance.
+            Some(None) => return Ok(false),
+            // Prefetch authoritative.
+            None => (raw_key, raw_data, lsn),
         };
         self.current_key = Some(raw_key);
         self.current_data = Some(raw_data);
@@ -4908,7 +5218,86 @@ impl CursorImpl {
         self.rehydrate_current_data()?;
         self.current_index = idx;
         self.update_bin_pin(bin_arc);
-        Ok(())
+        Ok(true)
+    }
+
+    /// FID-CURSOR-1 / FID-CURSOR-7 (dup path): advance one physical slot from
+    /// `(raw_key, idx)` in scan direction `forward`, crossing to the adjacent
+    /// BIN when the current BIN is exhausted.  Returns the next candidate
+    /// `(key, data, idx, lsn)` or `None` at the end of the key space.  Mirrors
+    /// the inline advance in `apply_dup_filter`'s NextNoDup arm; used when a
+    /// dup accept found the slot defunct under the lock and must re-resolve.
+    fn dup_advance_one_slot(
+        &self,
+        raw_key: &[u8],
+        idx: i32,
+        forward: bool,
+    ) -> Option<(Vec<u8>, Bytes, i32, u64)> {
+        use noxu_tree::tree::TreeNode;
+        let next_idx = if forward { idx + 1 } else { idx - 1 };
+        let in_bin = {
+            let db = self.db_impl.read();
+            let tree = db.get_real_tree()?;
+            if tree.is_empty() {
+                None
+            } else {
+                Self::find_bin_for_key(&tree, raw_key).and_then(|bin_arc| {
+                    let g = bin_arc.read();
+                    match &*g {
+                        TreeNode::Bottom(bin) => {
+                            if next_idx < 0
+                                || next_idx >= bin.entries.len() as i32
+                            {
+                                None
+                            } else {
+                                let i = next_idx as usize;
+                                Some((
+                                    bin.get_full_key(i).unwrap_or_default(),
+                                    bin.entries[i]
+                                        .data
+                                        .clone()
+                                        .unwrap_or_default(),
+                                    next_idx,
+                                    bin.get_lsn(i).as_u64(),
+                                ))
+                            }
+                        }
+                        _ => None,
+                    }
+                })
+            }
+        };
+        if in_bin.is_some() {
+            return in_bin;
+        }
+        // BIN exhausted — cross to the adjacent BIN.
+        let adj: Option<Vec<(BinEntry, Lsn, Vec<u8>)>> = {
+            let db = self.db_impl.read();
+            let tree = db.get_real_tree()?;
+            if forward {
+                tree.get_next_bin(raw_key)
+            } else {
+                tree.get_prev_bin(raw_key)
+            }
+        };
+        match adj {
+            Some(entries) if !entries.is_empty() => {
+                if forward {
+                    let (e, e_lsn, e_key) = entries.into_iter().next().unwrap();
+                    Some((e_key, e.data.unwrap_or_default(), 0, e_lsn.as_u64()))
+                } else {
+                    let li = (entries.len() - 1) as i32;
+                    let (e, e_lsn, e_key) = entries.into_iter().last().unwrap();
+                    Some((
+                        e_key,
+                        e.data.unwrap_or_default(),
+                        li,
+                        e_lsn.as_u64(),
+                    ))
+                }
+            }
+            _ => None,
+        }
     }
 
     fn apply_dup_filter(
@@ -4931,10 +5320,33 @@ impl CursorImpl {
                         _ => false,
                     };
                     if same {
-                        self.install_dup_accept(
-                            raw_key, raw_data, idx, lsn, forward,
-                        )?;
-                        return Ok(OperationStatus::Success);
+                        if self.install_dup_accept(
+                            raw_key.clone(),
+                            raw_data.clone(),
+                            idx,
+                            lsn,
+                            forward,
+                        )? {
+                            return Ok(OperationStatus::Success);
+                        }
+                        // FID-CURSOR-1/7: slot defunct under the lock —
+                        // advance and re-resolve (JE getNext re-resolve).
+                        match self.dup_advance_one_slot(&raw_key, idx, forward)
+                        {
+                            Some((k, d, i, l)) => {
+                                raw_key = k;
+                                raw_data = d;
+                                idx = i;
+                                lsn = l;
+                                continue;
+                            }
+                            None => {
+                                if forward {
+                                    self.lock_eof_for_scan()?;
+                                }
+                                return Ok(OperationStatus::NotFound);
+                            }
+                        }
                     } else {
                         // BUG-PHANTOM-3: the dup set ended but the underlying
                         // physical scan still LANDED on this slot and JE locks
@@ -4957,12 +5369,20 @@ impl CursorImpl {
                         (Some(npk), Some(ppk)) => npk.as_slice() == ppk,
                         _ => false,
                     };
-                    if !same {
-                        self.install_dup_accept(
-                            raw_key, raw_data, idx, lsn, forward,
-                        )?;
+                    if !same
+                        && self.install_dup_accept(
+                            raw_key.clone(),
+                            raw_data.clone(),
+                            idx,
+                            lsn,
+                            forward,
+                        )?
+                    {
                         return Ok(OperationStatus::Success);
                     }
+                    // FID-CURSOR-1/7: when `!same` but the slot was defunct
+                    // under the lock (install returned false), or when `same`,
+                    // fall through to the advance logic below to re-resolve.
                     // Need to advance further.
                     // Increment/decrement idx and try to read from the tree.
                     if forward {
@@ -5081,10 +5501,32 @@ impl CursorImpl {
                 }
                 // Next / Prev: accept any entry.
                 GetMode::Next | GetMode::Prev => {
-                    self.install_dup_accept(
-                        raw_key, raw_data, idx, lsn, forward,
-                    )?;
-                    return Ok(OperationStatus::Success);
+                    if self.install_dup_accept(
+                        raw_key.clone(),
+                        raw_data.clone(),
+                        idx,
+                        lsn,
+                        forward,
+                    )? {
+                        return Ok(OperationStatus::Success);
+                    }
+                    // FID-CURSOR-1/7: slot defunct under the lock — advance
+                    // and re-resolve (JE getNext re-resolve).
+                    match self.dup_advance_one_slot(&raw_key, idx, forward) {
+                        Some((k, d, i, l)) => {
+                            raw_key = k;
+                            raw_data = d;
+                            idx = i;
+                            lsn = l;
+                            continue;
+                        }
+                        None => {
+                            if forward {
+                                self.lock_eof_for_scan()?;
+                            }
+                            return Ok(OperationStatus::NotFound);
+                        }
+                    }
                 }
             }
         }

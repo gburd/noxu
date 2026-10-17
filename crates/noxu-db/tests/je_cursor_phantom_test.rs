@@ -24,10 +24,12 @@
 //! short sleep.  Each thread opens its own transaction from the shared env, as
 //! in JE.
 
-// ── ENGINE-BUG CANDIDATE (NEW-PHANTOM-ABORT-1) — DIRTY READ VIA CURSOR SKIP ──
+// ── FIXED: FID-CURSOR-1 / FID-CURSOR-7 (was NEW-PHANTOM-ABORT-1) ────────────
 //
-// The eight *abort* configurations below are #[ignore]d faithful ports.  They
-// are a REAL, two-thread test (each thread has its own transaction; thread1
+// The eight *abort* configurations below WERE #[ignore]d faithful ports that
+// demonstrated an isolation defect.  They are now UN-IGNORED and PASS after
+// the FID-CURSOR-1 / FID-CURSOR-7 fix.  Assertions are UNCHANGED.  They remain
+// a REAL, two-thread test (each thread has its own transaction; thread1
 // genuinely holds the write lock on the contended record while thread2 reads)
 // — NOT a single-thread simulation.
 //
@@ -46,16 +48,19 @@
 // NOT independently prove blocking — a dirty read followed by a commit is
 // coincidentally right; the abort configs are the real evidence.)
 //
-// Root cause (candidate): Noxu's cursor next/prev "skip defunct slot" path does
-// not acquire the record lock before skipping a deleted-but-uncommitted slot,
-// so it reads through another txn's pending write.  JE's
-// `CursorImpl.getNext` -> `lockLNAndCheckDefunct` locks the LN it lands on
-// (even a defunct slot) with the read lock BEFORE deciding to skip it, so a
-// write-locked slot blocks the reader until the writer resolves.
+// Root cause: Noxu collapsed JE's PENDING_DELETED / KNOWN_DELETED two-state
+// machine into one `known_deleted` bit set at delete-OP time, and the cursor
+// next/prev "skip defunct slot" path skipped it WITHOUT acquiring the record
+// lock.  JE's `CursorImpl.lockAndGetCurrent` skips WITHOUT a lock only a
+// KNOWN-deleted (committed) slot (CursorImpl.java:2060-2064); a PENDING-deleted
+// slot falls through to `lockLNAndCheckDefunct`, which LOCKS the LN (blocking
+// on the uncommitted deleter) and only then checks `isDefunct`.
 //
-// Verdict: REAL engine isolation bug (lock-based model requires block-or-
-// conflict, not skip), escalated.  Kept #[ignore]d — faithful ports, must not
-// be weakened.
+// Fix (FID-CURSOR-1 / FID-CURSOR-7): restore the two-state machine — a
+// transactional delete sets PENDING_DELETED (not KNOWN_DELETED); the scan
+// skips KD without a lock but LOCKS a PD slot and re-checks it under the lock,
+// re-resolving to the correct neighbour on commit (skip) or abort (restored
+// record).  The commit siblings continue to pass unchanged.
 // ─────────────────────────────────────────────────────────────────────────────
 
 use noxu_db::{
@@ -388,7 +393,6 @@ fn phantom_insert_get_next_commit() {
 
 // JE: CursorTest.testPhantomInsertGetNextAbort
 #[test]
-#[ignore = "NEW-PHANTOM-ABORT-1: blocked getNext/getPrev dirty-reads a concurrent uncommitted write and does not re-resolve on abort"]
 fn phantom_insert_get_next_abort() {
     phantom_worker(PhantomConfig {
         t1_lock: b"F",
@@ -417,7 +421,6 @@ fn phantom_insert_get_prev_commit() {
 
 // JE: CursorTest.testPhantomInsertGetPrevAbort
 #[test]
-#[ignore = "NEW-PHANTOM-ABORT-1: blocked getNext/getPrev dirty-reads a concurrent uncommitted write and does not re-resolve on abort"]
 fn phantom_insert_get_prev_abort() {
     phantom_worker(PhantomConfig {
         t1_lock: b"C",
@@ -446,7 +449,6 @@ fn phantom_delete_get_next_commit() {
 
 // JE: CursorTest.testPhantomDeleteGetNextAbort
 #[test]
-#[ignore = "NEW-PHANTOM-ABORT-1: blocked getNext/getPrev dirty-reads a concurrent uncommitted write and does not re-resolve on abort"]
 fn phantom_delete_get_next_abort() {
     phantom_worker(PhantomConfig {
         t1_lock: b"F",
@@ -475,7 +477,6 @@ fn phantom_delete_get_prev_commit() {
 
 // JE: CursorTest.testPhantomDeleteGetPrevAbort
 #[test]
-#[ignore = "NEW-PHANTOM-ABORT-1: blocked getNext/getPrev dirty-reads a concurrent uncommitted write and does not re-resolve on abort"]
 fn phantom_delete_get_prev_abort() {
     phantom_worker(PhantomConfig {
         t1_lock: b"F",
@@ -506,7 +507,6 @@ fn phantom_dup_insert_get_next_commit() {
 
 // JE: CursorTest.testPhantomDupInsertGetNextAbort
 #[test]
-#[ignore = "NEW-PHANTOM-ABORT-1: blocked getNext/getPrev dirty-reads a concurrent uncommitted write and does not re-resolve on abort"]
 fn phantom_dup_insert_get_next_abort() {
     phantom_dup_worker(PhantomConfig {
         t1_lock: b"F",
@@ -535,7 +535,6 @@ fn phantom_dup_insert_get_prev_commit() {
 
 // JE: CursorTest.testPhantomDupInsertGetPrevAbort
 #[test]
-#[ignore = "NEW-PHANTOM-ABORT-1: blocked getNext/getPrev dirty-reads a concurrent uncommitted write and does not re-resolve on abort"]
 fn phantom_dup_insert_get_prev_abort() {
     phantom_dup_worker(PhantomConfig {
         t1_lock: b"C",
@@ -564,7 +563,6 @@ fn phantom_dup_delete_get_next_commit() {
 
 // JE: CursorTest.testPhantomDupDeleteGetNextAbort
 #[test]
-#[ignore = "NEW-PHANTOM-ABORT-1: blocked getNext/getPrev dirty-reads a concurrent uncommitted write and does not re-resolve on abort"]
 fn phantom_dup_delete_get_next_abort() {
     phantom_dup_worker(PhantomConfig {
         t1_lock: b"F",
@@ -593,7 +591,6 @@ fn phantom_dup_delete_get_prev_commit() {
 
 // JE: CursorTest.testPhantomDupDeleteGetPrevAbort
 #[test]
-#[ignore = "NEW-PHANTOM-ABORT-1: blocked getNext/getPrev dirty-reads a concurrent uncommitted write and does not re-resolve on abort"]
 fn phantom_dup_delete_get_prev_abort() {
     phantom_dup_worker(PhantomConfig {
         t1_lock: b"F",
@@ -689,7 +686,7 @@ fn diag_pointget_contests() {
 }
 
 #[test]
-#[ignore = "diagnostic probe: run with --ignored to observe block-vs-skip"]
+#[ignore = "diagnostic probe: run with --ignored to observe getNext block-then-resolve"]
 fn diag_getnext_skips() {
     let (_dir, env, db) = seed_env();
     let seq = Arc::new(AtomicU32::new(0));
@@ -704,7 +701,7 @@ fn diag_getnext_skips() {
             while seq.load(Ordering::SeqCst) < 2 {
                 thread::yield_now();
             }
-            thread::sleep(Duration::from_millis(2000));
+            thread::sleep(Duration::from_millis(250));
             txn.abort().unwrap();
         })
     };
@@ -736,14 +733,19 @@ fn diag_getnext_skips() {
     drop(c);
     let _ = txn.commit();
     del.join().unwrap();
+    // FID-CURSOR-1 (FIXED): getNext from C must BLOCK on F's uncommitted-delete
+    // write lock (so `el` is ~2000ms, the deleter's hold) and, because the
+    // deleter ABORTED (F restored), return F — NOT skip to G.  (Pre-fix this
+    // probe asserted the bug: returned G in <500ms without blocking.)
     assert_eq!(
         nk.data_opt().unwrap(),
-        b"G",
-        "getNext landed on G (skip past deleted F)"
+        b"F",
+        "getNext must block on the uncommitted delete and return the restored \
+         F on abort, not skip to G"
     );
     assert!(
-        el < Duration::from_millis(500),
-        "getNext did not block ({:?})",
+        el >= Duration::from_millis(150),
+        "getNext must have blocked on F's write lock (waited {:?})",
         el
     );
 }

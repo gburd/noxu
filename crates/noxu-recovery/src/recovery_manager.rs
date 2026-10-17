@@ -386,7 +386,12 @@ pub fn apply_redo_ln(tree: &mut noxu_tree::Tree, rec: &LnRecord, lsn: Lsn) {
             if let Some((slot_lsn, false)) = tree.slot_lsn_any(&rec.key)
                 && (slot_lsn.is_null() || lsn >= slot_lsn)
             {
-                tree.mark_deleted(&rec.key, lsn);
+                // FID-CURSOR-1: recovery redo of a committed deletion marks
+                // the slot KNOWN-deleted (JE `recoverRecord(.., redoKD=true,
+                // ..)`, RecoveryManager.java:2545-2555) — no active txn exists
+                // at recovery time, so the deletion is "known" (`pending =
+                // false`), skippable by a later scan without a lock.
+                tree.mark_deleted(&rec.key, lsn, false);
             }
         }
     }
@@ -1430,7 +1435,9 @@ impl RecoveryManager {
         if revert_lsn.is_null() {
             tree.delete(key);
         } else {
-            tree.mark_deleted(key, revert_lsn);
+            // FID-CURSOR-1: recovery undo reverts to an earlier committed
+            // deletion — KNOWN-deleted (`pending = false`), no active txn.
+            tree.mark_deleted(key, revert_lsn, false);
         }
     }
 
@@ -4622,7 +4629,7 @@ mod tests {
         // Crash state: the checkpoint logged the delete as a KD slot @200.
         let mut tree = make_tree();
         tree.insert(b"K".to_vec(), b"value".to_vec(), lsn(0, 100)).unwrap();
-        assert!(tree.mark_deleted(b"K", lsn(0, 200)));
+        assert!(tree.mark_deleted(b"K", lsn(0, 200), false));
         let mut mgr = RecoveryManager::new();
         mgr.recover(&mut scanner, Some(&mut tree), false).unwrap();
         let f = tree.search_with_data(b"K").expect("slot fetch");
