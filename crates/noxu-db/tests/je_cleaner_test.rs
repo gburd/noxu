@@ -41,7 +41,7 @@
 
 use noxu_db::{
     CheckpointConfig, DatabaseConfig, DatabaseEntry, Environment,
-    EnvironmentConfig,
+    EnvironmentConfig, Put,
 };
 use std::path::Path;
 use tempfile::TempDir;
@@ -137,6 +137,88 @@ fn total_obsolete_ins(env: &Environment) -> i64 {
 fn exists(db: &noxu_db::Database, key: &[u8]) -> bool {
     let mut val = DatabaseEntry::new();
     db.get_into(None, DatabaseEntry::from_bytes(key), &mut val).unwrap()
+}
+
+// ---------------------------------------------------------------------------
+// JE FileSelectionTest.writeData faithful port
+// ---------------------------------------------------------------------------
+
+/// JE `FileSelectionTest` constants (the non-dup, non-temp, non-deferred
+/// case these ports exercise).
+///
+/// JE: `DATA_SIZE = 140`, `FILE_SIZE = 4096 * 10 = 40960`, `INITIAL_FILES = 5`.
+/// Noxu uses JE's values *verbatim*: `with_log_file_max_bytes` is the raw
+/// (validation-bypassed) setter — the same hook the other cleaner helpers use
+/// for tiny files — so there is no minimum-file-size floor to scale against
+/// (the configured minimum `noxu.log.fileMax` is 1_000_000, but it is not
+/// enforced on this path, mirroring JE `DbInternal.disableParameterValidation`).
+/// JE's `FILE_SIZE / DATA_SIZE` ratio is therefore preserved exactly.
+const FS_DATA_SIZE: usize = 140;
+const FS_FILE_SIZE: u64 = 4096 * 10;
+const FS_INITIAL_FILES: u64 = 5;
+
+/// Count the `*.ndb` log files currently on disk in `dir`.
+fn count_log_files(dir: &Path) -> u64 {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.path().extension().and_then(|x| x.to_str()) == Some("ndb")
+        })
+        .count() as u64
+}
+
+/// Faithful port of JE `FileSelectionTest.writeData()` (non-dup, non-temp,
+/// non-deferred branch): write records inside ONE explicit transaction via a
+/// transactional cursor using `putNoOverwrite`, until `INITIAL_FILES` log
+/// files exist (JE loops `while (fileNum < INITIAL_FILES)`, which also leaves
+/// "one extra file" so the first active LSN is past the INITIAL_FILES files);
+/// then commit the single transaction and force a checkpoint.
+///
+/// The crucial fidelity point versus the old auto-commit port: ALL `N` LNs
+/// are written under one locker, so the log carries exactly ONE `TxnCommit`
+/// frame, not `N` of them. The old 200-auto-commit setup densified the log
+/// with per-put commit frames (v7.11.1 Option B), which is what forced the
+/// since-removed per-LN straggler relaxation.
+///
+/// Returns the number of records written (JE's `existingKeys.size()`).
+fn write_data(env: &Environment, db: &noxu_db::Database, dir: &Path) -> u32 {
+    let first_file = count_log_files(dir);
+    let value = vec![0u8; FS_DATA_SIZE];
+
+    let txn = env.begin_transaction(None).unwrap();
+    let mut next_key: u32 = 0;
+    {
+        let mut cursor = db.open_cursor_in(&txn, None).unwrap();
+        // JE writes until an LN lands in file INITIAL_FILES; Noxu has no
+        // public cursor->LSN hook, so advance until that many files exist
+        // (plus the "one extra file" JE guarantees).
+        while count_log_files(dir) < FS_INITIAL_FILES + first_file + 1 {
+            let status = cursor
+                .put(
+                    &DatabaseEntry::from_bytes(&ikey(next_key)),
+                    &DatabaseEntry::from_bytes(&value),
+                    Put::NoOverwrite,
+                )
+                .unwrap();
+            assert_eq!(
+                status,
+                noxu_db::OperationStatus::Success,
+                "putNoOverwrite must insert a fresh key"
+            );
+            next_key += 1;
+        }
+        cursor.close().unwrap();
+    }
+    txn.commit().unwrap();
+    env.checkpoint(Some(&force())).unwrap();
+
+    let last_file = count_log_files(dir);
+    assert!(
+        last_file >= FS_INITIAL_FILES + first_file,
+        "writeData must create at least INITIAL_FILES files (got {last_file})"
+    );
+    next_key
 }
 
 // ===========================================================================
@@ -765,87 +847,45 @@ fn file_selection_reclaims_low_utilization_files() {
 /// `TruncateAndRemoveTest.testTruncate`: truncating a database makes its
 /// entries reclaimable so the files holding them become cleanable.
 ///
-/// Noxu reclaims a truncated database's entries through the cleaner's
-/// dead-LN path (the whole database is gone, so the cleaner's tree lookup
-/// finds every LN dead), so we assert on `lns_cleaned` rising across the pass
-/// (the cleaner read and reclaimed the truncated LNs) and that files are
-/// reclaimed — the same space-reclamation invariant JE proves via
-/// `countObsoleteDb`.
+/// Faithful port of JE's `testTruncateDatabase` (non-temp): write all records
+/// in ONE explicit transaction via `write_data` (JE `writeData()`), confirm an
+/// unmodified log cleans nothing (`cleanRoutine() == 0`), close the database,
+/// truncate it, then clean again and assert JE's verbatim file-count bound
+/// `nCleaned >= INITIAL_FILES - 1`. The per-LN straggler relaxation that the
+/// old 200-auto-commit setup required (`cleaned_after >= cleaned_before + N -
+/// one_file_lns`) is REMOVED: it was a symptom of the unfaithful setup, not of
+/// the engine. With JE's one-transaction `writeData`, JE's own file bound
+/// holds directly.
 #[test]
 fn file_selection_truncate_database_obsoletes_entries() {
     let dir = TempDir::new().unwrap();
-    let file_size = 8192u64;
-    let env = open_cleaner_env(dir.path(), file_size);
+    let env = open_cleaner_env(dir.path(), FS_FILE_SIZE);
     let db = open_db(&env, false);
 
-    // Count log files (`*.ndb`) at a given moment — how we derive the real
-    // number of files the database's LNs occupy, rather than a hand-tuned
-    // constant.
-    let count_log_files = || -> u64 {
-        std::fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.path().extension().and_then(|x| x.to_str()) == Some("ndb")
-            })
-            .count() as u64
-    };
+    // JE: openEnv(); writeData();  (one explicit transaction, INITIAL_FILES+1
+    // log files on disk afterward).
+    let n = write_data(&env, &db, dir.path());
 
-    let files_before_writes = count_log_files();
-    const N: u32 = 200;
-    let value = vec![0x44u8; 120];
-    for i in 0..N {
-        db.put(ikey(i), &value).unwrap();
-    }
-    env.checkpoint(Some(&force())).unwrap();
-    // The log files the database's N LNs added (the forced pass should
-    // reclaim all but at most one of these — JE
-    // FileSelectionTest.testTruncateDatabase asserts
-    // `nCleaned >= INITIAL_FILES - 1`, tolerating exactly one straggler).
-    let db_log_files = count_log_files().saturating_sub(files_before_writes);
-    // On-disk LN size (lower bound) = the value we stored; an 8 KiB file
-    // therefore holds at most `file_size / value_len` LNs, so tolerating one
-    // straggler file means tolerating at most that many un-reclaimed LNs.
-    let one_file_lns = file_size / value.len() as u64;
+    // JE: nCleaned = cleanRoutine(); assertEquals(0, nCleaned);
+    // Nothing is obsolete yet, so a non-forced pass selects no file.
+    let n_cleaned = env.clean_log().unwrap();
+    assert_eq!(n_cleaned, 0, "an unmodified log must clean nothing");
 
+    // JE: db.close(); env.truncateDatabase(null, DBNAME, false);
     db.close().unwrap();
     let count = env.truncate_database(None, "foo").unwrap();
-    assert_eq!(count, N as u64, "truncate returns the record count");
-
+    assert_eq!(count, n as u64, "truncate returns the record count");
     env.checkpoint(Some(&force())).unwrap();
-    let cleaned_before = env.stats().unwrap().cleaner.lns_cleaned;
-    let cleaned_files = env.clean_log_forced().unwrap() as u64;
-    assert!(cleaned_files > 0, "truncated-away files must be cleanable");
-    let cleaned_after = env.stats().unwrap().cleaner.lns_cleaned;
+
+    // JE: nCleaned = cleanRoutine(); assertTrue(nCleaned >= INITIAL_FILES - 1);
     // Truncate obsoletes every one of the database's LNs, so the files that
-    // hold ONLY those LNs drop below `min_utilization` (80) and the forced
-    // pass reclaims them.  A small tail of the dead LNs can share a log file
-    // with LIVE metadata (the post-truncate NameLN, the new empty database's
-    // NameLN and the checkpoint records); that file stays ABOVE 80% live and
-    // is correctly NOT selected — cleaning a 95%-live file to recover a
-    // dozen dead LNs is exactly what `min_utilization` exists to avoid.
-    // (v7.11.1 single-locker: each auto-commit put now also logs a TxnCommit
-    // frame — JE's one-commit-record-per-auto-txn — so the 200 LNs pack one
-    // file denser than the pre-fix auto-form log and a ~1-file tail co-locates
-    // with the live metadata; pre-fix the LNs happened to pack so the forced
-    // pass took all 200.)
-    //
-    // JE FileSelectionTest.testTruncateDatabase asserts
-    // `nCleaned >= INITIAL_FILES - 1` (file count, exactly one straggler file
-    // tolerated).  Assert the same here on files, AND keep the per-LN teeth:
-    // all but at most one file's worth of LNs reclaimed.
+    // held them drop below `min_utilization` and the non-forced pass reclaims
+    // all but at most one (JE tolerates exactly one straggler file).
+    let n_cleaned = env.clean_log().unwrap() as u64;
     assert!(
-        cleaned_files >= db_log_files.saturating_sub(1),
-        "truncate must make all but at most one of the database's {db_log_files} \
-         log files cleanable (JE nCleaned >= INITIAL_FILES - 1); \
-         cleaned_files={cleaned_files}"
-    );
-    assert!(
-        cleaned_after >= cleaned_before + N as u64 - one_file_lns,
-        "truncate must make (nearly) all {N} of the database's LNs reclaimable \
-         by the cleaner; at most one straggler file co-located with live \
-         metadata ({one_file_lns} LNs) may remain: \
-         lns_cleaned {cleaned_before} -> {cleaned_after}"
+        n_cleaned >= FS_INITIAL_FILES - 1,
+        "truncate must make at least INITIAL_FILES - 1 files cleanable \
+         (JE nCleaned >= INITIAL_FILES - 1); nCleaned={n_cleaned}"
     );
 
     env.close().unwrap();
@@ -854,31 +894,37 @@ fn file_selection_truncate_database_obsoletes_entries() {
 /// JE `FileSelectionTest.testRemoveDatabase` /
 /// `TruncateAndRemoveTest.testRemove`: removing a database makes its entries
 /// reclaimable (same dead-LN reclamation path as truncate above).
+///
+/// Faithful port of JE's `testRemoveDatabase` (non-temp): write all records in
+/// ONE explicit transaction via `write_data` (JE `writeData()`), close the
+/// database, confirm an unmodified log cleans nothing, remove the database,
+/// then clean and assert JE's verbatim bound `nCleaned >= INITIAL_FILES - 1`.
 #[test]
 fn file_selection_remove_database_obsoletes_entries() {
     let dir = TempDir::new().unwrap();
-    let env = open_cleaner_env(dir.path(), 8192);
+    let env = open_cleaner_env(dir.path(), FS_FILE_SIZE);
     let db = open_db(&env, false);
 
-    const N: u32 = 200;
-    let value = vec![0x55u8; 120];
-    for i in 0..N {
-        db.put(ikey(i), &value).unwrap();
-    }
-    env.checkpoint(Some(&force())).unwrap();
+    // JE: openEnv(); writeData();
+    write_data(&env, &db, dir.path());
 
+    // JE: db.close();
     db.close().unwrap();
+
+    // JE: nCleaned = cleanRoutine(); assertEquals(0, nCleaned);
+    let n_cleaned = env.clean_log().unwrap();
+    assert_eq!(n_cleaned, 0, "an unmodified log must clean nothing");
+
+    // JE: env.removeDatabase(null, dbName);
     env.remove_database(None, "foo").unwrap();
     env.checkpoint(Some(&force())).unwrap();
 
-    let cleaned_before = env.stats().unwrap().cleaner.lns_cleaned;
-    let cleaned = env.clean_log_forced().unwrap();
-    assert!(cleaned > 0, "removed-database files must be cleanable");
-    let cleaned_after = env.stats().unwrap().cleaner.lns_cleaned;
+    // JE: nCleaned = cleanRoutine(); assertTrue(nCleaned >= INITIAL_FILES - 1);
+    let n_cleaned = env.clean_log().unwrap() as u64;
     assert!(
-        cleaned_after > cleaned_before,
-        "remove must make the database's LNs reclaimable by the cleaner: \
-         lns_cleaned {cleaned_before} -> {cleaned_after}"
+        n_cleaned >= FS_INITIAL_FILES - 1,
+        "remove must make at least INITIAL_FILES - 1 files cleanable \
+         (JE nCleaned >= INITIAL_FILES - 1); nCleaned={n_cleaned}"
     );
 
     env.close().unwrap();
