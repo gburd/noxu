@@ -251,10 +251,30 @@ pub fn ttl_secs_to_expiration(ttl_secs: u64) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
+
+    // R-TTL-CLOCK-RACE: the TTL tests share one process-global clock
+    // (`TEST_TIME_MS`).  `test_time_hook_overrides_the_clock` installs a fixed
+    // time (2016), advances it, then clears it, while the other tests read
+    // "now" via `current_time_hours()` / `current_system_time_ms()` on parallel
+    // threads.  Without serialisation a wall-clock-relative reader can observe
+    // the clock jump to 2016 (or back to the real clock) between its two "now"
+    // reads and fail (e.g. `expires_within_tolerance_extends_future_check`).
+    //
+    // Every test that READS "now" and asserts a value relative to it, and the
+    // one test that WRITES the clock, takes this guard, so the fixed-clock
+    // window runs entirely before or entirely after any wall-clock-relative
+    // reader, never interleaved.  Tests whose assertions hold for ANY "now"
+    // (zero sentinels, saturation, hour-1-is-past) do not take it.
+    static HOOK_GUARD: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_time_hook_overrides_the_clock() {
+        // R-TTL-CLOCK-RACE: the writer MUST hold the guard for its whole
+        // set/advance/clear window (see the module comment above).
+        let _g = HOOK_GUARD.lock().unwrap();
         // Faithful analog of JE TTLTest.setFixedTimeHook / fixedSystemTime:
         // installing a fixed time makes every TTL time read return it, so a
         // record can be aged past its expiration deterministically.
@@ -303,6 +323,7 @@ mod tests {
 
     #[test]
     fn not_expired_when_in_the_future_hours() {
+        let _g = HOOK_GUARD.lock().unwrap();
         // current_time_hours() + 24 (one day from now) is in the future.
         let future = current_time_hours().saturating_add(24);
         assert!(!is_expired(future, true));
@@ -310,6 +331,7 @@ mod tests {
 
     #[test]
     fn not_expired_when_in_the_future_seconds() {
+        let _g = HOOK_GUARD.lock().unwrap();
         // current_time_secs() + 86_400 is in the future.
         let future = current_time_secs().saturating_add(86_400);
         assert!(!is_expired(future, false));
@@ -317,6 +339,7 @@ mod tests {
 
     #[test]
     fn current_time_hours_is_nonzero_after_epoch() {
+        let _g = HOOK_GUARD.lock().unwrap();
         // Hours since epoch should be > 0 for any time after
         // 1970-01-01 01:00 UTC. The test is checking that the
         // function returns a sane (non-zero, non-overflowing) value
@@ -341,6 +364,7 @@ mod tests {
 
     #[test]
     fn ttl_hours_to_expiration_returns_future() {
+        let _g = HOOK_GUARD.lock().unwrap();
         let now = current_time_hours();
         let exp = ttl_hours_to_expiration(24);
         assert!(exp >= now + 24 - 1 && exp <= now + 24 + 1);
@@ -360,6 +384,7 @@ mod tests {
 
     #[test]
     fn ttl_secs_to_expiration_30_seconds_in_30_seconds() {
+        let _g = HOOK_GUARD.lock().unwrap();
         // Adding 30 seconds to current_time_secs() yields a value
         // 30 ahead — exact down to the second-resolution.
         let now = current_time_secs();
@@ -374,6 +399,7 @@ mod tests {
 
     #[test]
     fn ttl_secs_to_expiration_two_hours_uses_seconds() {
+        let _g = HOOK_GUARD.lock().unwrap();
         // 7200 seconds == 2 hours. The expiration must be ~7200s in
         // the future, NOT 2s — that would be the legacy buggy
         // behaviour where the function divided by SECS_PER_HOUR.
@@ -408,6 +434,7 @@ mod tests {
 
     #[test]
     fn ttl_to_expiration_hours_rounds_up_and_adds() {
+        let _g = HOOK_GUARD.lock().unwrap();
         // JE ttlToExpiration: ceil(now/hour) + ttl.  With a 1-hour TTL the
         // result must be within [now_hours+1, now_hours+2] (rounding up the
         // current partial hour).
@@ -423,6 +450,7 @@ mod tests {
 
     #[test]
     fn ttl_to_expiration_days_stored_as_hours_on_day_boundary() {
+        let _g = HOOK_GUARD.lock().unwrap();
         // A day-granular expiration is stored as hours-since-epoch and must
         // land exactly on a 24-hour boundary (JE stores days*24).
         let exp = ttl_to_expiration(1, TtlUnit::Days);
@@ -450,6 +478,9 @@ mod tests {
     fn expires_within_tolerance_extends_future_check() {
         // A record expiring exactly one hour from now is NOT expired with a
         // zero grace window, but IS "expires within" a 2-hour grace window.
+        // R-TTL-CLOCK-RACE: serialised against the clock writer so the global
+        // override cannot move "now" out from under this relative assertion.
+        let _g = HOOK_GUARD.lock().unwrap();
         let one_hour_out = current_time_hours() + 1;
         assert!(!expires_within(one_hour_out, true, 0));
         assert!(expires_within(one_hour_out, true, 3 * MILLIS_PER_HOUR as i64));
