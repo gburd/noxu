@@ -130,18 +130,24 @@ fn fid_dur_1_ack_timeout_is_committed_at_master_not_retryable() {
     // Under +replay-v2 the RC assembler swaps this arm to `InsufficientAcks`
     // and adds `assert!(e.is_committed_at_master())` (see repuser-failclosed.md).
     match &res {
-        Err(e @ NoxuError::InsufficientReplicas { required, available }) => {
+        // COMPOSED-TREE ARM (+replay-v2 / FID-DUR-1): InsufficientAcks +
+        // is_committed_at_master(). (RC-assembler swap of the base
+        // InsufficientReplicas arm.)
+        Err(e @ NoxuError::InsufficientAcks { required, available }) => {
             assert!(*required >= 1, "required acks must be > 0");
             assert_eq!(*available, 0, "no replica acked");
+            assert!(
+                e.is_committed_at_master(),
+                "InsufficientAcks must report the txn committed at the master"
+            );
             assert!(
                 !e.is_retryable(),
                 "a committed-at-master ack timeout must NOT be auto-retryable"
             );
         }
         other => panic!(
-            "expected a committed-at-master ack-timeout error \
-             (InsufficientReplicas on this base; InsufficientAcks under \
-             replay-v2), got {other:?} after {elapsed:?}"
+            "expected InsufficientAcks (committed at master; FID-DUR-1), \
+             got {other:?} after {elapsed:?}"
         ),
     }
 
