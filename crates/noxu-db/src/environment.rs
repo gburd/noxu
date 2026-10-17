@@ -4086,6 +4086,77 @@ mod tests {
         env.close().unwrap();
     }
 
+    /// BUG-REP-SCREEN-RACE (in-flight write across a demotion): a transaction
+    /// that logged its writes while this node was the MASTER, and only reaches
+    /// `commit()` AFTER the node stepped down (the replica-write screen armed),
+    /// must be REFUSED at commit with `ReplicaWrite` and leave nothing durable.
+    ///
+    /// The op-level screen (`check_writable`) runs when each write op executes;
+    /// here the `put_in` runs while the screen is clear (Master), so it is
+    /// correctly allowed. Only the commit-time re-check catches the demotion.
+    /// JE re-checks at exactly this point: `MasterTxn.preLogCommitHook` ->
+    /// `RepImpl.preLogCommitHook` (RepImpl.java:1257) -> `checkIfMaster`
+    /// (RepImpl.java:1076-1098), which throws before logging the commit entry;
+    /// `MasterTxn.lockInternal` (MasterTxn.java:261-287) likewise re-reads the
+    /// role on every post-begin lock. The armed screen stands in for the
+    /// non-Master role; the refused commit aborts the txn with nothing durable.
+    ///
+    /// RED before this commit (the commit path only checked the R-REPUSER
+    /// refuse-flag, not the screen, so the stepped-down write committed
+    /// durably); GREEN after.
+    #[test]
+    fn gap_replay_3_in_flight_write_refused_at_commit_after_demotion() {
+        let (tmp, env) = replicated_env();
+        let cfg = DatabaseConfig::new()
+            .with_allow_create(true)
+            .with_transactional(true);
+        let db = env.open_database(None, "repdb", &cfg).unwrap();
+
+        // Begin a txn and write WHILE MASTER (screen clear): the op is allowed.
+        let txn = env.begin_transaction(None).unwrap();
+        db.put_in(&txn, b"inflight", b"v").unwrap();
+
+        // The node steps down to a non-Master role between the write and the
+        // commit: `become_replica` / loss-of-master arms the screen.
+        env.env_impl_arc_for_test().lock().set_replica_write_screen(true);
+
+        // Commit must be refused BEFORE the TxnCommit frame (JE checkIfMaster).
+        let c = txn.commit();
+        assert!(
+            matches!(c, Err(NoxuError::ReplicaWrite)),
+            "an in-flight write committed after demotion must be refused with \
+             ReplicaWrite (JE RepImpl.preLogCommitHook -> checkIfMaster), got \
+             {c:?}"
+        );
+        // A refused commit leaves the txn for the caller to abort (JE's
+        // throwPreCommitException runs the abort path); abort releases the
+        // write lock and rolls back the buffered write.
+        txn.abort().expect("abort after refused commit");
+
+        // Nothing durable: the key is absent now, and absent after reopen.
+        env.env_impl_arc_for_test().lock().set_replica_write_screen(false);
+        assert_eq!(
+            db.get(b"inflight").unwrap(),
+            None,
+            "the refused in-flight commit must not be visible"
+        );
+        drop(db);
+        env.close().unwrap();
+
+        let reopen_cfg = EnvironmentConfig::new(tmp.path().to_path_buf())
+            .with_allow_create(true)
+            .with_transactional(true);
+        let env2 = Environment::open(reopen_cfg).unwrap();
+        let db2 = env2.open_database(None, "repdb", &cfg).unwrap();
+        assert_eq!(
+            db2.get(b"inflight").unwrap(),
+            None,
+            "the refused in-flight commit must not be durable after reopen"
+        );
+        drop(db2);
+        env2.close().unwrap();
+    }
+
     /// GAP-REPLAY-3 WITNESS: the screen is driven by the screen FLAG (armed
     /// only on a replica by `become_replica`), not by anything a standalone
     /// environment ever sets.  A standalone (never-replicated) env never arms

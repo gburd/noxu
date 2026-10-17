@@ -473,6 +473,53 @@ impl Transaction {
             });
         }
 
+        // BUG-REP-SCREEN-RACE (in-flight write across a demotion): re-check the
+        // replica-write screen at COMMIT, before the TxnCommit frame.  The
+        // op-level screen (`Database::check_writable` / `CursorImpl::
+        // check_local_write_allowed`) is evaluated when each write op runs; a
+        // txn that logged its writes while this node was the Master and only
+        // reaches commit AFTER the node stepped down (to Replica, or to Unknown
+        // having lost its master) was never re-screened, so without this it
+        // would durably commit a write this node is no longer entitled to
+        // originate -- the same S2 silent-divergence class.
+        //
+        // JE re-checks at exactly this point: `MasterTxn.preLogCommitHook` ->
+        // `RepImpl.preLogCommitHook(txn)` (RepImpl.java:1257) calls
+        // `checkIfMaster(txn)` (RepImpl.java:1076-1098) BEFORE logging the
+        // commit entry; its role switch admits only MASTER and throws
+        // `ReplicaWriteException` (now a Replica) or `UnknownMasterException`
+        // (Unknown/Detached).  `MasterTxn.lockInternal` (MasterTxn.java:261-287)
+        // likewise re-reads the role on every post-begin lock op.  Refusing
+        // here (before `write_txn_end`) aborts the txn with nothing durable,
+        // matching JE's pre-commit throw.
+        //
+        // The replica-write screen is Noxu's single role-derived predicate
+        // (`NodeStateMachine::screen_for`: armed iff NOT Master), armed only on
+        // a replicated env, so this gate collapses JE's two exceptions into one
+        // `ReplicaWrite`: the screen is a single bit and the write path already
+        // returns `ReplicaWrite` for every non-Master state.  (Distinguishing
+        // the Unknown case as an `UnknownMaster`-equivalent is a v8.0.0
+        // refinement; no new RepError variant is added in 7.11.x.)
+        //
+        // 7.11.x reachability: a `ReplicatedEnvironment`-wired data env refuses
+        // user writes at the op via R-REPUSER above, so on that env this gate
+        // is belt-and-braces.  It is the ACTIVE S2 guard on the paths R-REPUSER
+        // does NOT refuse -- an env wired with an internal or test-double
+        // `ReplicaAckCoordinator` whose `refuse_user_write_commit()` is `None`
+        // (e.g. the `fid_dur_1_ack_timeout_probe` double, the replica-screen
+        // tests) -- and in v8.0.0, where R-REPUSER is lifted and ordinary user
+        // writes stream, this is the primary commit-time demotion guard.
+        if !self.read_only
+            && logged_data
+            && let Some(env) = self.env_impl.as_ref()
+        {
+            let guard = env.lock();
+            if guard.is_replicated() && guard.is_replica_write_screened() {
+                drop(guard);
+                return Err(NoxuError::ReplicaWrite);
+            }
+        }
+
         // Write TxnCommit to the WAL before marking committed.
         // Durability controls whether we fsync, flush, or just buffer.
         //
