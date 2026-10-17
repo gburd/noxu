@@ -269,8 +269,13 @@ fn stored_list_open_recovers_next_index_after_reopen() {
     }
 }
 
+// FID-DPL-17: StoredList indices are persistent, engine-derived record
+// numbers, so a fresh `new()` handle on an existing database recovers the
+// high-water mark and appends after the last element -- it never restarts
+// at 0 and clobbers index 0 (the pre-fix behaviour this test used to
+// assert).
 #[test]
-fn stored_list_new_does_not_recover_and_overwrites_on_reopen() {
+fn stored_list_new_recovers_persistent_index_on_reopen() {
     let (_td, path) = fresh_env_dir();
 
     {
@@ -287,10 +292,14 @@ fn stored_list_new_does_not_recover_and_overwrites_on_reopen() {
         let db = open_db(&env, "list_new_reopen");
         let list: StoredList<'_, String, _> =
             StoredList::new(&db, StringBinding);
-        assert_eq!(list.next_index(), 0);
-        let idx = list.push(None, &"clobber".to_string()).unwrap();
-        assert_eq!(idx, 0);
-        assert_eq!(list.get(None, 0).unwrap(), Some("clobber".to_string()));
+        // Persistent index: new() sees the two existing elements.
+        assert_eq!(list.next_index(), 2);
+        // push appends at index 2 -- it does NOT overwrite index 0.
+        let idx = list.push(None, &"third".to_string()).unwrap();
+        assert_eq!(idx, 2);
+        assert_eq!(list.get(None, 0).unwrap(), Some("first".to_string()));
+        assert_eq!(list.get(None, 1).unwrap(), Some("second".to_string()));
+        assert_eq!(list.get(None, 2).unwrap(), Some("third".to_string()));
     }
 }
 

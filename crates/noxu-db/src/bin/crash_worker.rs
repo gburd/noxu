@@ -89,6 +89,18 @@ fn main() {
             .with_run_in_compressor(false)
             .with_run_verifier(false);
     }
+    // FID-REC-3 witness: force deterministic eviction of a dirty
+    // deferred-write BIN with NO checkpoint running.  A tiny cache plus
+    // an explicit `evict_memory()` call (below) makes the evictor log the
+    // unsynced DW BIN; the checkpointer is OFF so
+    // `get_eviction_provisional` sees no checkpoint in progress -- exactly
+    // the case the DW branch (JE DirtyINMap case 1) must still make
+    // provisional.
+    if mode == "deferred_write_nosync_evict_unsynced" {
+        env_config = env_config
+            .with_cache_size(1024 * 1024)
+            .with_run_checkpointer(false);
+    }
     let env = noxu_db::Environment::open(env_config).expect("open env");
     let db_config =
         DatabaseConfig::new().with_allow_create(true).with_transactional(true);
@@ -494,6 +506,55 @@ fn main() {
                     DatabaseEntry::from_bytes(b"unsynced"),
                 )
                 .expect("put unsynced");
+            }
+            flag(&dir, "dw_unsynced_started");
+            loop {
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        "deferred_write_nosync_evict_unsynced" => {
+            // FID-REC-3 (S2): a deferred-write DB only guarantees what was
+            // made durable by an explicit sync().  We make a tree durable
+            // (root + upper INs + BINs on disk), then OVERWRITE every key
+            // without sync() and without a checkpoint, and force eviction
+            // of those now-dirty BINs.  Because the tree path is already
+            // durable, recovery can REACH the evicted BINs via their
+            // parent slots.  On 81b2f048 the evicted BINs were logged
+            // Provisional::No, so recovery redid the newer (unsynced)
+            // image and the overwrite survived (RED).  With the DW branch
+            // (JE DirtyINMap case 1) they are logged Provisional::Yes and
+            // recovery skips them, so every key keeps its last SYNCED
+            // value.
+            let dw_cfg = DatabaseConfig::new()
+                .with_allow_create(true)
+                .with_deferred_write(true);
+            let dw =
+                env.open_database(None, "dw", &dw_cfg).expect("open dw db");
+
+            // Phase 1: write keys 0..2000 = "synced", then sync() so the
+            // whole tree (multi-level: root + upper INs + many BINs) is
+            // durable on disk.
+            for i in 0u32..2000 {
+                let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
+                let val = DatabaseEntry::from_bytes(b"synced");
+                dw.put(&key, &val).expect("put synced");
+            }
+            dw.sync().expect("sync phase 1 (make tree durable)");
+            flag(&dir, "dw_phase1_synced");
+
+            // Phase 2 (UNSYNCED): OVERWRITE every key with "unsynced".
+            // No sync(), no checkpoint.
+            for i in 0u32..2000 {
+                let key = DatabaseEntry::from_bytes(&i.to_be_bytes());
+                let val = DatabaseEntry::from_bytes(b"unsynced");
+                dw.put(&key, &val).expect("put unsynced overwrite");
+            }
+            // Force eviction so the dirty (overwritten) BINs are logged to
+            // the WAL (JE: the evictor logs each dirty BIN; for a DW DB with
+            // the FID-REC-3 fix each is logged Provisional::Yes).
+            for _ in 0..8 {
+                let _ = env.evict_memory();
             }
             flag(&dir, "dw_unsynced_started");
             loop {

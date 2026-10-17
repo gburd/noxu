@@ -236,7 +236,6 @@ fn sec_count(sec: &SecondaryDatabase) -> u32 {
 /// same txn), checkpoint, crash while the txn is open -> primary AND
 /// secondary both restored.
 #[test]
-#[ignore = "pre-existing data loss at v7.11.0; needs bde3b613 cleaner IN liveness (batch C2/A6)"]
 fn secondary_txn_delete_crash_restores_primary_and_secondary() {
     let dir = tempfile::tempdir().unwrap();
     let n = 40u32;
@@ -277,6 +276,130 @@ fn secondary_txn_delete_crash_restores_primary_and_secondary() {
         );
         assert_eq!(pk.data_opt(), Some(k(i).as_slice()), "sec -> pri {i}");
     }
+    verify_clean(&env, "recovered");
+    sec.close().unwrap();
+    pri.lock().close().unwrap();
+    env.close().unwrap();
+}
+
+/// (d-nockpt) Same as `secondary_txn_delete_crash_restores_primary_and_secondary`
+/// but WITHOUT a checkpoint before the crash.  With no checkpoint, recovery
+/// replays every logged LN from the start of the log, so the committed
+/// `zz-after` secondary insert is restored only if its LN was actually made
+/// durable (flushed) by the auto-commit secondary maintenance -- the exact
+/// BUG-SEC-TXN-DELETE-CRASH-LOSS failure mode, isolated from the
+/// checkpoint-seeded redo gate.
+#[test]
+fn secondary_txn_delete_crash_no_checkpoint_restores_primary_and_secondary() {
+    let dir = tempfile::tempdir().unwrap();
+    let n = 40u32;
+    let img;
+    {
+        let (env, pri, sec) = open_pri_sec(dir.path());
+        for i in 0..n {
+            pri.lock().put(k(i), v(i)).unwrap();
+        }
+        assert_eq!(sec_count(&sec), n);
+        let txn = env.begin_transaction(None).unwrap();
+        for i in (0..n).step_by(2) {
+            assert!(pri.lock().delete_in(&txn, k(i)).unwrap());
+        }
+        // No checkpoint here -- crash with the whole log live.
+        pri.lock().put(b"zz-after", b"zzzzzzzzzz").unwrap();
+        img = image(dir.path());
+        txn.abort().unwrap();
+        assert_eq!(sec_count(&sec), n + 1, "live secondary after abort");
+        sec.close().unwrap();
+        pri.lock().close().unwrap();
+        env.close().unwrap();
+    }
+    let (env, pri, sec) = open_pri_sec(img.path());
+    for i in 0..n {
+        assert_eq!(
+            pri.lock().get(k(i)).unwrap().as_deref(),
+            Some(v(i).as_slice()),
+            "primary {i}"
+        );
+    }
+    assert_eq!(sec_count(&sec), n + 1, "secondary entries after recovery");
+    for i in 0..n {
+        let (mut pk, mut d) = (DatabaseEntry::new(), DatabaseEntry::new());
+        assert!(
+            sec.get_into(None, &v(i)[..9], &mut pk, &mut d).unwrap(),
+            "sec lookup {i}"
+        );
+        assert_eq!(pk.data_opt(), Some(k(i).as_slice()), "sec -> pri {i}");
+    }
+    verify_clean(&env, "recovered");
+    sec.close().unwrap();
+    pri.lock().close().unwrap();
+    env.close().unwrap();
+}
+
+/// (d-abort) The txn is explicitly ABORTED before the crash image is taken,
+/// then a committed `zz-after` record is inserted, a checkpoint runs, and the
+/// crash image is captured.  After recovery every primary and secondary entry
+/// -- the 40 originals (whose deletes were already undone by the abort) plus
+/// the committed `zz-after` -- must be present.  This proves (a) the aborted
+/// deletes leave no secondary tombstones behind and (b) the committed
+/// post-abort secondary insert is durable (BUG-SEC-TXN-DELETE-CRASH-LOSS).
+#[test]
+fn secondary_txn_delete_aborted_before_crash_restores_primary_and_secondary() {
+    let dir = tempfile::tempdir().unwrap();
+    let n = 40u32;
+    let img;
+    {
+        let (env, pri, sec) = open_pri_sec(dir.path());
+        for i in 0..n {
+            pri.lock().put(k(i), v(i)).unwrap();
+        }
+        assert_eq!(sec_count(&sec), n);
+        let txn = env.begin_transaction(None).unwrap();
+        for i in (0..n).step_by(2) {
+            assert!(pri.lock().delete_in(&txn, k(i)).unwrap());
+        }
+        txn.abort().unwrap();
+        assert_eq!(sec_count(&sec), n, "live secondary after abort");
+        // Checkpoint first so the committed insert below lands AFTER the last
+        // checkpoint: its secondary LN is then NOT covered by any flushed BIN
+        // image and must survive on the strength of the auto-commit LN flush
+        // alone (BUG-SEC-TXN-DELETE-CRASH-LOSS).
+        force_ckpt(&env);
+        pri.lock().put(b"zz-after", b"zzzzzzzzzz").unwrap();
+        img = image(dir.path());
+        assert_eq!(sec_count(&sec), n + 1, "live secondary before crash");
+        sec.close().unwrap();
+        pri.lock().close().unwrap();
+        env.close().unwrap();
+    }
+    let (env, pri, sec) = open_pri_sec(img.path());
+    for i in 0..n {
+        assert_eq!(
+            pri.lock().get(k(i)).unwrap().as_deref(),
+            Some(v(i).as_slice()),
+            "primary {i}"
+        );
+    }
+    assert_eq!(
+        pri.lock().get(b"zz-after").unwrap().as_deref(),
+        Some(&b"zzzzzzzzzz"[..]),
+        "committed zz-after primary after recovery"
+    );
+    assert_eq!(sec_count(&sec), n + 1, "secondary entries after recovery");
+    for i in 0..n {
+        let (mut pk, mut d) = (DatabaseEntry::new(), DatabaseEntry::new());
+        assert!(
+            sec.get_into(None, &v(i)[..9], &mut pk, &mut d).unwrap(),
+            "sec lookup {i}"
+        );
+        assert_eq!(pk.data_opt(), Some(k(i).as_slice()), "sec -> pri {i}");
+    }
+    let (mut pk, mut d) = (DatabaseEntry::new(), DatabaseEntry::new());
+    assert!(
+        sec.get_into(None, b"zzzzzzzzz", &mut pk, &mut d).unwrap(),
+        "committed zz-after secondary after recovery"
+    );
+    assert_eq!(pk.data_opt(), Some(&b"zz-after"[..]), "zz-after sec -> pri");
     verify_clean(&env, "recovered");
     sec.close().unwrap();
     pri.lock().close().unwrap();

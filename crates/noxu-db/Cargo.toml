@@ -12,6 +12,11 @@ description = "Noxu DB - An embedded transactional database engine"
 
 [features]
 default = []
+# Compiles in test-only seams used by integration-test crates and by this
+# crate's own witnesses: the `optb_crash_hook` crash-injection points on the
+# single-locker auto-commit path.  COMPILED OUT of every production build
+# (never in `default`).  Mirror of `noxu-dbi/testing`.
+testing = []
 observability = ["dep:noxu-observe", "dep:tracing", "dep:metrics", "noxu-observe/export"]
 # Experimental, non-default eviction policies (CLOCK/LIRS/ARC/CAR/CoolHot).
 # Off by default; passthrough to noxu-dbi (which propagates to noxu-evictor).
@@ -47,6 +52,13 @@ all-features = true
 targets = ["x86_64-unknown-linux-gnu"]
 
 [dev-dependencies]
+# Self dev-dependency to turn on the `testing` feature for THIS crate's own
+# test / bench targets (incl. the integration test `optb_single_locker_witness`
+# and the binary it re-execs via `current_exe`), so the `optb_crash_hook`
+# crash-injection seam is compiled into the lib those targets link.  A
+# dev-dependency's features never leak into a normal `cargo build`, so the
+# production lib and every downstream consumer stay free of the hook (R-OBHOOK).
+noxu-db = { path = ".", features = ["testing"] }
 noxu-cleaner = { workspace = true, features = ["testing"] }
 criterion = { workspace = true }
 hegeltest = { workspace = true }

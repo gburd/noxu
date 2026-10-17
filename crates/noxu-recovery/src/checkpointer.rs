@@ -682,12 +682,38 @@ impl Checkpointer {
         if self.needs_checkpoint_for_cleaned_files() {
             return true;
         }
-        let bytes_since = self.bytes_since_checkpoint.load(Ordering::Relaxed);
         if self.checkpoint_bytes_interval != 0 {
-            // Bytes interval takes precedence (JE getWakeupPeriod): when it is
-            // non-zero the time branch is never consulted.
+            // FID-REC-1 (JE Checkpointer.isRunnable, Checkpointer.java:639-646):
+            // the byte interval takes precedence (JE getWakeupPeriod), and JE
+            // measures growth from the LIVE next-LSN --
+            //   getNoCleaningDistance(getFileManager().getNextLsn(),
+            //                         lastCheckpointStart, logFileMax)
+            //       >= logSizeBytesInterval
+            // -- NOT from a separately-maintained accumulator.  The Noxu
+            // `bytes_since_checkpoint` accumulator was never fed by the
+            // production write path (its only writer, `wakeup_after_write`,
+            // is called from tests only), so on a write-heavy, no-cleaning
+            // workload `is_runnable` returned `0 >= interval` = false on
+            // every daemon wake and the recovery log was never truncated on
+            // write volume.  Compute the distance from the live next-LSN,
+            // exactly as JE does, when a log manager is wired.
+            if let Some(lm) = &self.log_manager {
+                let fm = lm.file_manager();
+                let next_lsn = fm.get_next_available_lsn();
+                let log_file_max = fm.max_file_size();
+                let last_ckpt_start = *self.last_checkpoint_start.lock();
+                let distance = next_lsn
+                    .no_cleaning_distance(last_ckpt_start, log_file_max);
+                return distance >= self.checkpoint_bytes_interval;
+            }
+            // No log manager (unit tests without a full environment): fall
+            // back to the test-fed accumulator so the existing
+            // `wakeup_after_write` unit tests still exercise the interval.
+            let bytes_since =
+                self.bytes_since_checkpoint.load(Ordering::Relaxed);
             return bytes_since >= self.checkpoint_bytes_interval;
         }
+        let bytes_since = self.bytes_since_checkpoint.load(Ordering::Relaxed);
         // Time-cadence branch (only reached when the byte interval is 0): the
         // caller (the daemon) only invokes this once per wakeup interval, so
         // reaching here means the time interval has elapsed. JE's idle-guard
@@ -1130,7 +1156,11 @@ impl Checkpointer {
 
     /// Choose the [`Provisional`] flag for a node being evicted by the evictor.
     ///
-    /// Returns `Provisional::Yes` when a checkpoint is in progress **and** the
+    /// Returns `Provisional::Yes` unconditionally when `is_deferred_write`
+    /// is true (FID-REC-3 / JE DirtyINMap case 1: a deferred-write
+    /// database's evicted dirty node must be logged provisionally so an
+    /// un-`sync()`'d image does not survive a crash).  Otherwise returns
+    /// `Provisional::Yes` when a checkpoint is in progress **and** the
     /// node's level is strictly below the **tree-specific** highest flush level
     /// for `db_id` (meaning the checkpoint will write a non-provisional ancestor
     /// for that tree that subsumes this entry).  Returns `Provisional::No` if
@@ -1163,7 +1193,21 @@ impl Checkpointer {
         &self,
         db_id: u64,
         node_level: i32,
+        is_deferred_write: bool,
     ) -> Provisional {
+        // FID-REC-3 (JE DirtyINMap.coordinateEvictionWithCheckpoint case
+        // 1, DirtyINMap.java:134-139): "The eviction target is part of a
+        // deferred write database."  A deferred-write database only
+        // guarantees what was made durable by an explicit `sync()`; a
+        // dirty BIN evicted under cache pressure before `sync()` must
+        // therefore be logged PROVISIONALLY so recovery drops it after a
+        // crash -- regardless of whether a checkpoint is in progress.
+        // Without this, un-`sync()`'d deferred-write data is logged
+        // `Provisional::No`, recovery redoes it, and the DW durability
+        // contract is violated.
+        if is_deferred_write {
+            return Provisional::Yes;
+        }
         if !self.checkpoint_in_progress.load(Ordering::Acquire) {
             return Provisional::No;
         }
@@ -3815,6 +3859,54 @@ mod tests {
     // CC-4: get_eviction_provisional tests (per-tree after residual fix)
     // -----------------------------------------------------------------------
 
+    /// FID-REC-3 witness (S2): a deferred-write database's evicted dirty
+    /// node must be logged `Provisional::Yes` even when NO checkpoint is in
+    /// progress, so a crash without `sync()` drops it.
+    ///
+    /// JE `DirtyINMap.coordinateEvictionWithCheckpoint` case 1
+    /// (DirtyINMap.java:134-139): `if (db.isDeferredWriteMode()) return
+    /// Provisional.YES;` — checked before any checkpoint-state logic.
+    ///
+    /// RED on 81b2f048: `get_eviction_provisional` took no deferred-write
+    /// input and returned `Provisional::No` with no checkpoint in progress,
+    /// so an un-`sync()`'d deferred-write BIN survived a crash.
+    #[test]
+    fn fid_rec_3_dw_db_evicted_node_is_provisional_without_checkpoint() {
+        let ckpt = Checkpointer::new(CheckpointConfig::default());
+        // No checkpoint in progress.
+        assert!(!ckpt.checkpoint_in_progress.load(Ordering::Acquire));
+        // A deferred-write DB's evicted BIN (level 1) must be provisional.
+        assert_eq!(
+            ckpt.get_eviction_provisional(
+                7, 1, /*is_deferred_write=*/ true
+            ),
+            Provisional::Yes,
+            "a deferred-write DB's evicted node must be logged \
+             provisionally (JE DirtyINMap case 1)"
+        );
+        // An upper IN of the same DW DB is also provisional.
+        assert_eq!(
+            ckpt.get_eviction_provisional(7, 2, true),
+            Provisional::Yes,
+            "a deferred-write DB's evicted upper IN must be provisional too"
+        );
+    }
+
+    /// FID-REC-3 negative control: a NON-deferred-write database with no
+    /// checkpoint in progress still logs `Provisional::No` (unchanged JE
+    /// behaviour — only DW databases flip to provisional on eviction).
+    #[test]
+    fn fid_rec_3_non_dw_db_eviction_is_non_provisional_without_checkpoint() {
+        let ckpt = Checkpointer::new(CheckpointConfig::default());
+        assert_eq!(
+            ckpt.get_eviction_provisional(
+                7, 1, /*is_deferred_write=*/ false
+            ),
+            Provisional::No,
+            "a non-DW DB with no checkpoint must remain Provisional::No"
+        );
+    }
+
     /// CC-4 acceptance test 1: Provisional::No when no checkpoint is in
     /// progress, regardless of db_id or node level.
     ///
@@ -3824,11 +3916,11 @@ mod tests {
     fn test_cc4_no_checkpoint_in_progress_yields_provisional_no() {
         let ckpt = Checkpointer::new(CheckpointConfig::default());
         assert_eq!(
-            ckpt.get_eviction_provisional(1, 1),
+            ckpt.get_eviction_provisional(1, 1, false),
             Provisional::No,
             "CC-4: no checkpoint in progress must yield Provisional::No"
         );
-        assert_eq!(ckpt.get_eviction_provisional(1, 2), Provisional::No);
+        assert_eq!(ckpt.get_eviction_provisional(1, 2, false), Provisional::No);
     }
 
     /// CC-4 acceptance test 2: Provisional::Yes when a checkpoint is in
@@ -3843,7 +3935,7 @@ mod tests {
         ckpt.checkpoint_flush_levels.lock().unwrap().insert(42u64, 2i32);
 
         assert_eq!(
-            ckpt.get_eviction_provisional(42, 1),
+            ckpt.get_eviction_provisional(42, 1, false),
             Provisional::Yes,
             "CC-4: BIN below tree's max_flush_level must yield Provisional::Yes"
         );
@@ -3864,12 +3956,12 @@ mod tests {
         ckpt.checkpoint_flush_levels.lock().unwrap().insert(42u64, 2i32);
 
         assert_eq!(
-            ckpt.get_eviction_provisional(42, 2),
+            ckpt.get_eviction_provisional(42, 2, false),
             Provisional::No,
             "CC-4: node at max_flush_level must yield Provisional::No"
         );
         assert_eq!(
-            ckpt.get_eviction_provisional(42, 3),
+            ckpt.get_eviction_provisional(42, 3, false),
             Provisional::No,
             "CC-4: node above max_flush_level must yield Provisional::No"
         );
@@ -3883,7 +3975,7 @@ mod tests {
     /// at a higher level.  This is the exact scenario that caused data loss
     /// with the old global `AtomicI32`.
     ///
-    /// Fail-pre: on `origin/main` (global level) `get_eviction_provisional(DB_A, 1)`
+    /// Fail-pre: on `origin/main` (global level) `get_eviction_provisional(DB_A, 1, false)`
     /// returned `Provisional::Yes` — a lie, no covering ancestor was written for
     /// tree A.  Pass-post: per-tree lookup returns `Provisional::No` for tree A.
     ///
@@ -3902,7 +3994,7 @@ mod tests {
 
         // Tree A's BIN (level 1) must be non-provisional: no covering ancestor.
         assert_eq!(
-            ckpt.get_eviction_provisional(DB_A, 1),
+            ckpt.get_eviction_provisional(DB_A, 1, false),
             Provisional::No,
             "CC-4 residual: tree A has no dirty upper INs; BIN must be \
              Provisional::No (not covered by any ancestor in this checkpoint)"
@@ -3911,7 +4003,7 @@ mod tests {
         // Tree B's BIN (level 1) may be provisional: its level-2 ancestor will
         // be written non-provisionally.
         assert_eq!(
-            ckpt.get_eviction_provisional(DB_B, 1),
+            ckpt.get_eviction_provisional(DB_B, 1, false),
             Provisional::Yes,
             "CC-4: tree B has a dirty upper IN at level 2; BIN must be Provisional::Yes"
         );
@@ -4202,7 +4294,7 @@ mod tests {
             "BIN_LEVEL ({BIN_LEVEL}) must be < recorded flush level ({recorded})"
         );
         assert_eq!(
-            cp.get_eviction_provisional(1, BIN_LEVEL),
+            cp.get_eviction_provisional(1, BIN_LEVEL, false),
             Provisional::Yes,
             "REC-AA: a BIN below the flush level must be Provisional::Yes"
         );
@@ -4370,7 +4462,7 @@ mod tests {
             {
                 std::thread::yield_now();
             }
-            let p = cp_ev.get_eviction_provisional(1, BIN_LEVEL);
+            let p = cp_ev.get_eviction_provisional(1, BIN_LEVEL, false);
             drop(bin_guard);
             let _ = ev_tx.send(p);
         });
@@ -4399,7 +4491,10 @@ mod tests {
         );
         // Coordination is preserved: once published, a BIN below the flush
         // level is logged provisionally.
-        assert_eq!(cp.get_eviction_provisional(1, BIN_LEVEL), Provisional::Yes);
+        assert_eq!(
+            cp.get_eviction_provisional(1, BIN_LEVEL, false),
+            Provisional::Yes
+        );
 
         cp.checkpoint_in_progress.store(false, Ordering::Release);
         cp.checkpoint_flush_levels.lock().unwrap().clear();

@@ -321,18 +321,33 @@ impl SecondaryHookState {
         // index entry so the secondary slot expires together with the primary
         // (JE: the primary ExpirationInfo flows into the secondary LN).
         //
-        // v7.11.1 tag-native merge note: this replaces the stack-v1
-        // `cursor.put(..).map_err(|e| OperationNotAllowed(e.to_string()))`
-        // with `put_with_expiration(..)?`, whose internal `map_cursor_err`
-        // PRESERVES typed lock errors (NoxuError::LockNotAvailable) instead of
-        // flattening them to a stringy OperationNotAllowed - consistent with
-        // the A15 phantom typed-error direction already on stack-v1.
-        let status = cursor.put_with_expiration(
-            sec_key,
-            pri_key,
-            crate::put::Put::NoDupData,
-            expiration,
-        )?;
+        // v7.11.1 tag-native merge note: both branches go through
+        // `map_cursor_err`, which PRESERVES typed lock errors
+        // (NoxuError::LockNotAvailable) instead of flattening them to a
+        // stringy OperationNotAllowed - consistent with the A15 phantom
+        // typed-error direction already on stack-v1.
+        //
+        // BUG-SEC-TXN-DELETE-CRASH-LOSS: only thread an explicit expiration
+        // through when there IS one; a 0 (no-TTL) secondary insert MUST take
+        // the plain `cursor.put` path, because `put` honours the auto-commit
+        // durability of this inner (auto-commit, txn=None) cursor and flushes
+        // the secondary LN before returning (fe94c7a50d), whereas
+        // `put_with_expiration` does not sync -- so under auto-commit the
+        // committed secondary insert would be left only in the unflushed log
+        // buffer and lost on a crash, while its primary record (synced by
+        // `Database::put`'s auto-txn) survived.  `put_with_expiration(.., 0)`
+        // is NOT identical to `put()` in the secondary redo path -- it
+        // perturbs crash recovery of the index (integrate parity).
+        let status = if expiration != 0 {
+            cursor.put_with_expiration(
+                sec_key,
+                pri_key,
+                crate::put::Put::NoDupData,
+                expiration,
+            )?
+        } else {
+            cursor.put(sec_key, pri_key, crate::put::Put::NoDupData)?
+        };
         match status {
             OperationStatus::Success => Ok(()),
             OperationStatus::KeyExists => {
@@ -1140,59 +1155,69 @@ impl SecondaryDatabase {
         self.check_open()?;
         let key = DatabaseEntry::from_bytes(key_bytes);
 
-        // Use a secondary cursor (under the caller's txn so the scan
-        // participates in the user's transaction) to iterate all
-        // duplicates of the secondary key.
-        let mut sec_cursor = self.open_cursor_internal(txn)?;
-        let mut p_key = DatabaseEntry::new();
-        let mut data = DatabaseEntry::new();
+        // JE `SecondaryDatabase.delete` (SecondaryDatabase.java:715-812): one
+        // writable locker spans ALL the per-duplicate primary deletes, which
+        // then commit / abort together (`operationEnd` once).  Route the whole
+        // scan+delete loop through ONE auto-commit `Transaction` scope (or the
+        // caller's `txn`), so a crash mid-loop cannot leave some primaries
+        // deleted and others not.  Each `primary.delete_in(&t, …)` reuses the
+        // same locker instead of starting a fresh auto-commit per duplicate.
+        self.state.primary_handle.in_auto_commit_scope(txn, |_pt, at| {
+            // Use a secondary cursor (under the single association locker so
+            // the scan participates in the same transaction) to iterate all
+            // duplicates of the secondary key.  `at` is `None` only for a
+            // non-transactional primary (JE ThreadLocker).
+            let mut sec_cursor = self.open_cursor_internal(at)?;
+            let mut p_key = DatabaseEntry::new();
+            let mut data = DatabaseEntry::new();
 
-        // Position to the first record with this secondary key.
-        let status = sec_cursor.get_search_key(&key, &mut p_key, &mut data)?;
+            // Position to the first record with this secondary key.
+            let status =
+                sec_cursor.get_search_key(&key, &mut p_key, &mut data)?;
 
-        if status != OperationStatus::Success {
-            return Ok(false);
-        }
+            if status != OperationStatus::Success {
+                return Ok(false);
+            }
 
-        // We found at least one; iterate and delete all matching primary records.
-        loop {
-            let pri_key_bytes = p_key.data_opt().unwrap_or(&[]).to_vec();
-            let pri_key_entry = DatabaseEntry::from_bytes(&pri_key_bytes);
+            // We found at least one; iterate and delete all matching primary
+            // records under the SAME locker.
+            loop {
+                let pri_key_bytes = p_key.data_opt().unwrap_or(&[]).to_vec();
+                let pri_key_entry = DatabaseEntry::from_bytes(&pri_key_bytes);
 
-            // Delete the primary record.  The auto-hook registered with the
-            // primary will remove all secondary index entries for this primary
-            // (including the current secondary key entry we found) atomically.
-            // Do NOT call delete_all_for_primary first — that would cause D7
-            // (double-delete: auto-hook tries to remove entries already gone).
-            {
+                // Delete the primary record.  The auto-hook registered with
+                // the primary removes all secondary index entries for this
+                // primary (including the current secondary key entry we
+                // found) under the same locker.  Do NOT call
+                // delete_all_for_primary first — that would cause D7
+                // (double-delete: auto-hook tries to remove entries already
+                // gone).
+                //
                 // Lock-free primary handle (BUG-SEC-MUTEX-DEADLOCK): the open
                 // `sec_cursor` holds a sec-index lock, so blocking on the
                 // primary record lock while also holding the primary handle
                 // Mutex would deadlock a concurrent reader/writer.
                 let primary = &self.state.primary_handle;
-                match txn {
-                    Some(t) => {
-                        let _ = primary.delete_in(t, pri_key_entry.data())?;
-                    }
-                    None => {
-                        let _ = primary.delete(pri_key_entry.data())?;
-                    }
+                let _ = match at {
+                    Some(t) => primary.delete_in(t, pri_key_entry.data())?,
+                    None => primary.delete(pri_key_entry.data())?,
+                };
+
+                // Re-search for the key to find any remaining duplicates.
+                // Since primary.delete() cleaned up secondary entries via the
+                // auto-hook, this returns NotFound when no more duplicates
+                // exist.
+                p_key = DatabaseEntry::new();
+                data = DatabaseEntry::new();
+                let next_status =
+                    sec_cursor.get_search_key(&key, &mut p_key, &mut data)?;
+                if next_status != OperationStatus::Success {
+                    break;
                 }
             }
 
-            // Re-search for the key to find any remaining duplicates.
-            // Since primary.delete() cleaned up secondary entries via auto-hook,
-            // this should return NotFound when no more duplicates exist.
-            p_key = DatabaseEntry::new();
-            data = DatabaseEntry::new();
-            let next_status =
-                sec_cursor.get_search_key(&key, &mut p_key, &mut data)?;
-            if next_status != OperationStatus::Success {
-                break;
-            }
-        }
-
-        Ok(true)
+            Ok(true)
+        })
     }
 
     /// Opens a cursor on the secondary database.

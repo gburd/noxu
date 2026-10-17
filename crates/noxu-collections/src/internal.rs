@@ -14,8 +14,8 @@ use std::marker::PhantomData;
 use noxu_bind::ByteArrayBinding;
 use noxu_bind::EntryBinding;
 use noxu_db::{
-    Cursor, CursorConfig, Database, DatabaseEntry, Get, OperationStatus,
-    Transaction,
+    Cursor, CursorConfig, Database, DatabaseEntry, Get, LockMode,
+    OperationStatus, Put, Transaction,
 };
 
 use crate::error::{CollectionError, Result};
@@ -102,6 +102,112 @@ pub(crate) fn db_delete(
         None => db.delete(k)?,
     };
     Ok(deleted)
+}
+
+/// Atomic read-old-then-overwrite under a single cursor and `txn`
+/// (FID-DPL-28).  Mirrors JE `StoredContainer.putKeyValue`
+/// (`StoredContainer.java:322`): one `DataCursor` performs the RMW
+/// (`cursor.put(key, value, oldValue, false)`) inside ONE auto-commit
+/// transaction, so the returned old value is exactly the value that was
+/// overwritten and no concurrent writer can interleave between the read
+/// and the write.  Returns the previous value bytes, or `None` if the key
+/// was absent.
+///
+/// The caller passes the auto-commit `txn` (`run_in_auto_commit` yields
+/// `Some(auto_txn)` for a transactional database and `None` for a
+/// non-transactional one) or the user's explicit `txn`.  Errors are
+/// surfaced as [`noxu_db::NoxuError`] so this composes directly inside
+/// [`noxu_db::Database::run_in_auto_commit`], whose closure returns
+/// `noxu_db::Result`.
+pub(crate) fn put_rmw(
+    db: &Database,
+    txn: Option<&Transaction>,
+    key: &DatabaseEntry,
+    value: &DatabaseEntry,
+) -> std::result::Result<Option<Vec<u8>>, noxu_db::NoxuError> {
+    let mut cursor = match txn {
+        Some(t) => db.open_cursor_in(t, None)?,
+        None => db.open_cursor(None)?,
+    };
+    // JE DataCursor.put: position on the key with a write lock (RMW) and
+    // capture the old value before overwriting.
+    let mut found_key =
+        DatabaseEntry::from_bytes(key.data_opt().unwrap_or(&[]));
+    let mut old_data = DatabaseEntry::new();
+    let old = match cursor.get(
+        &mut found_key,
+        &mut old_data,
+        Get::Search,
+        Some(LockMode::Rmw),
+    )? {
+        OperationStatus::Success => {
+            Some(old_data.data_opt().unwrap_or(&[]).to_vec())
+        }
+        _ => None,
+    };
+    cursor.put(key, value, Put::Overwrite)?;
+    cursor.close()?;
+    Ok(old)
+}
+
+/// Atomic read-old-then-delete under a single cursor and `txn`
+/// (FID-DPL-28).  Mirrors JE `StoredContainer.removeKey`
+/// (`StoredContainer.java:339`): one `DataCursor` positions on the key
+/// (RMW), captures the old value, and deletes, inside ONE auto-commit
+/// transaction.  Returns the previous value bytes, or `None` if the key
+/// was absent (no delete performed).
+pub(crate) fn remove_rmw(
+    db: &Database,
+    txn: Option<&Transaction>,
+    key: &DatabaseEntry,
+) -> std::result::Result<Option<Vec<u8>>, noxu_db::NoxuError> {
+    let mut cursor = match txn {
+        Some(t) => db.open_cursor_in(t, None)?,
+        None => db.open_cursor(None)?,
+    };
+    let mut found_key =
+        DatabaseEntry::from_bytes(key.data_opt().unwrap_or(&[]));
+    let mut old_data = DatabaseEntry::new();
+    let old = match cursor.get(
+        &mut found_key,
+        &mut old_data,
+        Get::Search,
+        Some(LockMode::Rmw),
+    )? {
+        OperationStatus::Success => {
+            let old = old_data.data_opt().unwrap_or(&[]).to_vec();
+            cursor.delete()?;
+            Some(old)
+        }
+        _ => None,
+    };
+    cursor.close()?;
+    Ok(old)
+}
+
+/// Delete every record under a single cursor and `txn` (FID-DPL-15).
+/// Mirrors JE `StoredContainer.clear` -> `DataView.clear`
+/// (`StoredContainer.java:293`): the whole multi-record delete runs inside
+/// ONE auto-commit transaction, so a crash or error mid-clear rolls the
+/// entire clear back (the map is fully cleared or untouched, never
+/// partially cleared).
+pub(crate) fn clear_all(
+    db: &Database,
+    txn: Option<&Transaction>,
+) -> std::result::Result<(), noxu_db::NoxuError> {
+    let mut cursor = match txn {
+        Some(t) => db.open_cursor_in(t, None)?,
+        None => db.open_cursor(None)?,
+    };
+    let mut key = DatabaseEntry::new();
+    let mut data = DatabaseEntry::new();
+    while let OperationStatus::Success =
+        cursor.get(&mut key, &mut data, Get::First, None)?
+    {
+        cursor.delete()?;
+    }
+    cursor.close()?;
+    Ok(())
 }
 
 /// Encodes a typed key into a fresh [`DatabaseEntry`].
