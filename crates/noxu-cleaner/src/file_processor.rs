@@ -252,20 +252,17 @@ pub enum MigrationOutcome {
 
 // ─── RealTreeLookup ──────────────────────────────────────────────────────────
 
-/// A monotonically increasing counter used to generate unique ephemeral
-/// locker IDs for non-transactional cleaner locks.
-///
-/// uses `BasicLocker.createBasicLocker(envImpl)` which allocates from
-/// the environment's locker-ID generator.  We approximate that with a
-/// process-local atomic so cleaner locks never collide with each other
-/// or with transaction IDs (transaction IDs come from a different counter
-/// in `TxnManager`).  The range is negative to ensure no collision with
-/// positive transaction IDs.
-// BUG-LOCKER-ID-COLLISION: the cleaner's migration-probe locker id used to
-// start at -1 (== `NULL_TXN_ID`) and count down, so its first id aliased the
-// null-txn sentinel and later ids could reach JE's reserved replicated band.
-// It now draws from the shared non-txn locker allocator, whose ids are
-// unique, deeply negative, and disjoint from txn ids and the reserved band.
+// Allocates unique ephemeral locker IDs for non-transactional cleaner locks.
+//
+// BUG-LOCKER-ID-COLLISION: the cleaner used to keep a `static
+// CLEANER_LOCKER_NEXT: AtomicI64 = AtomicI64::new(-1)` and count down.  JE
+// uses `BasicLocker.createBasicLocker(envImpl)`, allocating from the
+// environment locker-ID generator; a process-local atomic approximated that,
+// but its first id (-1) aliased `NULL_TXN_ID` and later ids could reach JE's
+// reserved replicated band.  It now draws from the shared non-txn locker
+// allocator, whose ids are unique, deeply negative, and disjoint from txn ids
+// and the reserved band (cleaner locks never collide with each other or with
+// transaction IDs, which come from a different counter in `TxnManager`).
 
 /// Allocates a fresh ephemeral locker ID for a single non-blocking lock
 /// attempt.
