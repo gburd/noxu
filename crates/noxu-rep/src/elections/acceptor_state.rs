@@ -9,9 +9,39 @@
 //! the basis of a higher promise) can then win a fresh majority and
 //! become a second master at the same effective term — split-brain.
 //!
-//! This module persists `(promised_term, accepted_term, accepted_master)`
-//! to a small file `<env_home>/acceptor.state` and reloads it on
-//! startup.  Every state change is atomic (write+rename) and CRC32-protected.
+//! This module persists `(promised_term, promised_proposer, accepted_term,
+//! accepted_master)` to a small file `<env_home>/acceptor.state` and reloads
+//! it on startup.  Every state change is atomic (write+rename) and
+//! CRC32-protected.
+//!
+//! # FID-ELECT-1: the proposal number is `(term, proposer)`, not a bare term
+//!
+//! JE's Paxos acceptor is safe because every proposal carries a **globally
+//! unique** proposal number — `TimebasedProposalGenerator` produces
+//! `ms_time | machineId | uniqueId` where `machineId` is the host IP XORed
+//! with a `SecureRandom`, distinct per machine
+//! (`TimebasedProposalGenerator.java:28-43,118-182`).  The acceptor compares
+//! the **whole** number: `process(Propose)` rejects only when
+//! `promisedProposal.compareTo(propose) > 0` (strictly greater) and
+//! `process(Accept)` grants only when `promisedProposal.compareTo(accept)
+//! == 0` (exact equality) — `Acceptor.java:177-185,210-215`.  Because the
+//! number is globally unique, those two rules force at most one proposer to
+//! hold the promise on any acceptor, so a second proposer at the same
+//! `ms_time` differs in `machineId` and is either rejected or overwrites the
+//! first (whose later Accept, carrying the now-stale number, then fails the
+//! `== 0` test).
+//!
+//! Noxu's election term is a per-node-local `u64` counter that every node's
+//! driver starts at `1`, so the term **alone** is not unique across
+//! proposers.  To stay JE-faithful we form the proposal number from
+//! `(term, proposer)`, where `proposer` is the self-reported candidate name
+//! already carried in the phase-1 `ElectionProposal` (the analogue of JE's
+//! `machineId` segment) and the term plays the role of the ascending
+//! `ms_time`.  `try_promise`/`try_accept` key on the whole `(term, proposer)`
+//! pair with JE's two comparison rules, so two proposers that happen to use
+//! the same term value differ in `proposer` and an acceptor that promised
+//! `(1, A)` rejects `(1, B)`'s Accept — restoring JE's one-winner-per-term
+//! guarantee and closing the split-brain hole.
 //!
 //! ## Property tests
 //!
@@ -22,17 +52,31 @@
 //!
 //! # On-disk format
 //!
+//! ## On-disk format (version 2)
+//!
 //! ```text
 //!   bytes  field
 //!   ---------------------------------------------------------
 //!   0..4   magic            = b"PXST"
-//!   4..6   version          = u16, currently 1
+//!   4..6   version          = u16, currently 2
 //!   6..14  promised_term    = u64
 //!  14..22  accepted_term    = u64
 //!  22..24  master_len       = u16  (0 if no accepted master yet)
 //!  24..    master_bytes     = [u8; master_len]  (UTF-8)
+//!  +2     proposer_len     = u16  (0 if no promise recorded yet) [v2+]
+//!  ...    proposer_bytes   = [u8; proposer_len] (UTF-8)         [v2+]
 //!  ...end  crc32            = u32 over all preceding bytes
 //! ```
+//!
+//! Version 1 files (written by v7.11.0 / the v7.11.1 RC) have no
+//! `proposer_len`/`proposer_bytes` fields; they are read back with
+//! `promised_proposer = None` so a node upgraded in place keeps its durable
+//! `(promised_term, accepted_term, accepted_master)` promise.  A `None`
+//! promised proposer compares LESS than any named proposer, so the first
+//! post-upgrade Propose at `promised_term` re-promises to the named
+//! `(term, proposer)` without ever regressing the term — the F5/F31
+//! restart-preserves-promise invariant is unchanged.  Writes always use the
+//! v2 layout.
 
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
@@ -49,12 +93,61 @@ use noxu_util::dst_sync::Mutex;
 use noxu_util::dst_sync::atomic::{AtomicU64, Ordering};
 
 const MAGIC: &[u8; 4] = b"PXST";
-const VERSION: u16 = 1;
-const MIN_LEN: usize = 4 + 2 + 8 + 8 + 2 + 4; // header + crc
+/// Current on-disk version.  Version 1 omitted `promised_proposer`
+/// (FID-ELECT-1 added it); v1 files are still read, see `load_from_disk`.
+const VERSION: u16 = 2;
+/// The smallest valid v1 file (no `promised_proposer`): header + crc.
+const MIN_LEN: usize = 4 + 2 + 8 + 8 + 2 + 4;
 
 /// File name used inside env_home.
 pub const ACCEPTOR_STATE_FILE: &str = "acceptor.state";
 const ACCEPTOR_STATE_TMP: &str = "acceptor.state.tmp";
+
+/// Testing seam that records the parent-directory fsync performed after the
+/// `write+rename` in [`PersistentAcceptorState::flush_locked`].
+///
+/// Exists only under `cfg(test)` or the `test-harness` feature (same gate as
+/// the rest of the in-memory rep test harness), so it is absent from every
+/// production build and from the released API surface -- `#[doc(hidden)]`
+/// keeps it off the public docs. A witness test checks that, after a
+/// `try_promise`/`try_accept` that persists, [`dir_sync_witness::last_dir_sync`]
+/// returns the state file's parent: RED if the dir-fsync is missing (the
+/// F-ELECT8-E defect), GREEN once `flush_locked` fsyncs the directory after
+/// the rename.
+#[cfg(any(test, feature = "test-harness"))]
+#[doc(hidden)]
+pub mod dir_sync_witness {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    thread_local! {
+        static LAST: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+        static COUNT: RefCell<u64> = const { RefCell::new(0) };
+    }
+
+    /// Record that `dir` was fsynced after a rename (called by `flush_locked`).
+    pub(crate) fn note(dir: &Path) {
+        LAST.with(|l| *l.borrow_mut() = Some(dir.to_path_buf()));
+        COUNT.with(|c| *c.borrow_mut() += 1);
+    }
+
+    /// The last directory fsynced on this thread after a `flush_locked`
+    /// rename, or `None` if no dir-fsync has run (the RED state).
+    pub fn last_dir_sync() -> Option<PathBuf> {
+        LAST.with(|l| l.borrow().clone())
+    }
+
+    /// Number of dir-fsyncs recorded on this thread since [`reset`].
+    pub fn dir_sync_count() -> u64 {
+        COUNT.with(|c| *c.borrow())
+    }
+
+    /// Clear the recorder (call at the start of a witness test).
+    pub fn reset() {
+        LAST.with(|l| *l.borrow_mut() = None);
+        COUNT.with(|c| *c.borrow_mut() = 0);
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum AcceptorPersistError {
@@ -87,6 +180,36 @@ fn tmp_path(env_home: &Path) -> PathBuf {
     env_home.join(ACCEPTOR_STATE_TMP)
 }
 
+/// A Paxos proposal number: `(term, proposer)`.
+/// The Paxos proposal number is `(term, proposer)`.
+///
+/// JE-faithful analogue of `TimebasedProposalGenerator`'s
+/// `ms_time | machineId | uniqueId`.  The `term` is the ascending component
+/// (JE's `ms_time`); the `proposer` name is the per-node unique
+/// disambiguator (JE's `machineId`).  The acceptor compares the whole pair
+/// (`term` first, then `proposer` lexicographically) — exactly JE
+/// `StringProposal.compareTo`, which compares the full concatenated string.
+///
+/// Two proposers that happen to use the same local `term` value differ in
+/// `proposer`, so the pair is unique across proposers in a group (member
+/// names are unique by `RepGroup` invariant), which is what makes the
+/// acceptor's one-winner-per-term guarantee hold.  The pair is stored inline
+/// in `PersistentAcceptorState` as `(promised_term, promised_proposer)`.
+///
+/// The sentinel proposer used by the backward-compatible public
+/// `try_promise(t)` / `try_accept(t, master)` entry points (FID-ELECT-1).
+///
+/// Those two methods keep their original 1-/2-parameter signatures (a patch
+/// release must not change the public API), so they have no proposer name to
+/// key on.  They route through the proposer-aware core with this fixed
+/// sentinel, which keeps the old "promise at term t, then accept value m at
+/// term t" sequence working exactly as before.  Even two concurrent old-API
+/// callers at the same term — both keyed on `(t, SENTINEL)` — are kept
+/// split-brain-safe by the "no different value at an accepted term" guard in
+/// `try_accept_proposal`.  The production election path never uses the
+/// sentinel: it calls the `*_proposal` methods with the real proposer name.
+pub(crate) const COMPAT_PROPOSER: &str = "";
+
 /// Persistent acceptor state.
 ///
 /// Holds the highest term we have promised, the highest term whose
@@ -99,6 +222,12 @@ fn tmp_path(env_home: &Path) -> PathBuf {
 /// callers obtain a path via `load_or_default(env_home)`.
 pub struct PersistentAcceptorState {
     promised_term: AtomicU64,
+    /// The proposer name of the current promise (FID-ELECT-1): the second
+    /// component of the `(term, proposer)` proposal number.  `None` means no
+    /// named proposer has been promised yet (fresh acceptor, or a v1 file
+    /// upgraded in place).  Always read/written under `flush_lock` together
+    /// with `promised_term` so the pair is consistent.
+    promised_proposer: Mutex<Option<String>>,
     accepted_term: AtomicU64,
     accepted_master: Mutex<Option<String>>,
     persist_path: Option<PathBuf>,
@@ -112,6 +241,7 @@ impl PersistentAcceptorState {
     pub fn in_memory() -> Self {
         Self {
             promised_term: AtomicU64::new(0),
+            promised_proposer: Mutex::new(None),
             accepted_term: AtomicU64::new(0),
             accepted_master: Mutex::new(None),
             persist_path: None,
@@ -128,20 +258,23 @@ impl PersistentAcceptorState {
         let path = state_path(env_home);
         let st = Self {
             promised_term: AtomicU64::new(0),
+            promised_proposer: Mutex::new(None),
             accepted_term: AtomicU64::new(0),
             accepted_master: Mutex::new(None),
             persist_path: Some(path.clone()),
             flush_lock: Mutex::new(()),
         };
         match load_from_disk(&path) {
-            Ok(Some((p, a, m))) => {
+            Ok(Some((p, pp, a, m))) => {
                 st.promised_term.store(p, Ordering::SeqCst);
+                *st.promised_proposer.lock().unwrap() = pp;
                 st.accepted_term.store(a, Ordering::SeqCst);
                 *st.accepted_master.lock().unwrap() = m;
                 log::info!(
-                    "Loaded acceptor.state from {}: promised={}, accepted={}, master={:?}",
+                    "Loaded acceptor.state from {}: promised={} (proposer={:?}), accepted={}, master={:?}",
                     path.display(),
                     p,
+                    st.promised_proposer.lock().unwrap(),
                     a,
                     st.accepted_master.lock().unwrap(),
                 );
@@ -178,6 +311,15 @@ impl PersistentAcceptorState {
         self.promised_term.load(Ordering::SeqCst)
     }
 
+    /// The proposer name of the current promise, if any (FID-ELECT-1).
+    ///
+    /// Together with [`Self::promised_term`] this is the full `(term,
+    /// proposer)` proposal number the acceptor has promised.
+    #[doc(hidden)]
+    pub fn promised_proposer(&self) -> Option<String> {
+        self.promised_proposer.lock().unwrap().clone()
+    }
+
     /// Highest accepted term.
     pub fn accepted_term(&self) -> u64 {
         self.accepted_term.load(Ordering::SeqCst)
@@ -188,26 +330,59 @@ impl PersistentAcceptorState {
         self.accepted_master.lock().unwrap().clone()
     }
 
-    /// Try to promise term `t`.
+    /// Backward-compatible public promise entry point (FID-ELECT-1).
     ///
-    /// Returns `true` (with the new state flushed to disk) iff
-    /// `t >= self.promised_term()`.  Otherwise the state is unchanged
-    /// and the caller must reject the proposer.
+    /// Keeps its original single-`term` signature so the public API is
+    /// unchanged in this patch release.  Routes through the proposer-aware
+    /// core with the [`COMPAT_PROPOSER`] sentinel.  The production election
+    /// path does NOT use this method; it calls [`Self::try_promise_proposal`]
+    /// with the real proposer name.
     pub fn try_promise(&self, t: u64) -> bool {
+        self.try_promise_proposal(t, COMPAT_PROPOSER)
+    }
+
+    /// Try to promise the proposal number `(t, proposer)`.
+    ///
+    /// Returns `true` (with the new state flushed to disk) iff the current
+    /// promise is NOT strictly greater than `(t, proposer)`.  Otherwise the
+    /// state is unchanged and the caller must reject the proposer.
+    ///
+    /// JE `Acceptor.process(Propose)` (`Acceptor.java:177-185`) rejects only
+    /// when `promisedProposal.compareTo(propose) > 0` (strictly greater) and
+    /// otherwise moves the promise to the incoming proposal.  We compare the
+    /// whole `(term, proposer)` proposal number — JE compares the whole
+    /// `ms_time|machineId|uniqueId` string — so two proposers that share a
+    /// `term` value are disambiguated by `proposer` (FID-ELECT-1).  A `None`
+    /// recorded proposer (fresh acceptor, or a v1 file upgraded in place)
+    /// compares LESS than any named proposer at the same term, so the first
+    /// post-upgrade Propose at `promised_term` re-promises without regressing
+    /// the term.
+    #[doc(hidden)]
+    pub fn try_promise_proposal(&self, t: u64, proposer: &str) -> bool {
         // Coarse-lock under flush_lock so we serialize the
         // load-modify-flush cycle across acceptor threads.
         let _guard = self.flush_lock.lock().unwrap();
-        let cur = self.promised_term.load(Ordering::SeqCst);
-        if t < cur {
+        let cur_term = self.promised_term.load(Ordering::SeqCst);
+        let cur_proposer = self.promised_proposer.lock().unwrap().clone();
+        // JE: reject iff promised proposal is STRICTLY greater than the
+        // incoming one.  `(cur_term, cur_proposer)` vs `(t, Some(proposer))`;
+        // `Option<String>` orders `None < Some(_)`, which is exactly the
+        // v1-upgrade re-promise rule documented above.
+        let incoming = (t, Some(proposer.to_string()));
+        let promised = (cur_term, cur_proposer.clone());
+        if promised > incoming {
             return false;
         }
         self.promised_term.store(t, Ordering::SeqCst);
+        *self.promised_proposer.lock().unwrap() = Some(proposer.to_string());
         if let Err(e) = self.flush_locked() {
             // Roll back to avoid lying about persistence.
-            self.promised_term.store(cur, Ordering::SeqCst);
+            self.promised_term.store(cur_term, Ordering::SeqCst);
+            *self.promised_proposer.lock().unwrap() = cur_proposer;
             log::warn!(
-                "acceptor.state: failed to persist promise(t={}): {}",
+                "acceptor.state: failed to persist promise(t={}, proposer={}): {}",
                 t,
+                proposer,
                 e
             );
             return false;
@@ -215,36 +390,113 @@ impl PersistentAcceptorState {
         true
     }
 
-    /// Try to accept that `master` won at term `t`.
+    /// Backward-compatible public accept entry point (FID-ELECT-1).
     ///
-    /// Returns `true` (with the new state flushed to disk) iff `t` EXACTLY
-    /// equals `self.promised_term()`.  JE Acceptor.process(Accept) rejects
-    /// unless the Accept's proposal equals the promised proposal
-    /// (`promisedProposal.compareTo(accept.getProposal()) == 0`) — an Accept
-    /// at a higher term that was never promised in phase 1 must be rejected
-    /// to preserve the Paxos invariant that the phase-2 value is fixed to the
-    /// specific phase-1 round (split-brain otherwise). Persists the new
-    /// (accepted_term, accepted_master) on success.
+    /// Keeps its original `(term, master)` signature so the public API is
+    /// unchanged in this patch release.  Routes through the proposer-aware
+    /// core with the [`COMPAT_PROPOSER`] sentinel as the proposal number's
+    /// proposer component and `master` as the value.  The "no different value
+    /// at an accepted term" guard still protects two concurrent old-API
+    /// callers at the same term.  The production election path does NOT use
+    /// this method; it calls [`Self::try_accept_proposal`] with the real
+    /// proposer name.
     pub fn try_accept(&self, t: u64, master: &str) -> bool {
+        self.try_accept_proposal(t, COMPAT_PROPOSER, master)
+    }
+
+    /// Try to accept that `master` won at the proposal number `(t, proposer)`.
+    ///
+    /// Returns `true` (with the new state flushed to disk) iff the current
+    /// promise EXACTLY equals `(t, proposer)`.
+    ///
+    /// JE `Acceptor.process(Accept)` (`Acceptor.java:210-215`) grants only
+    /// when `promisedProposal.compareTo(accept.getProposal()) == 0` — the
+    /// Accept must carry the exact proposal number that was promised in
+    /// phase 1.  We compare the whole `(term, proposer)` number, so a second
+    /// proposer `B` that re-promised the acceptor at `(1, B)` after it had
+    /// promised `(1, A)` makes `A`'s later Accept at `(1, A)` fail the
+    /// equality test.  The accepted VALUE is `master`, which (as in JE's
+    /// `MasterValue`) is independent of the proposal number: a proposer may
+    /// propose a different winner than itself, so `master` need not equal
+    /// `proposer`.  Persists `(accepted_term, accepted_master)` on success.
+    ///
+    /// # Why the "already accepted a different value at this term" guard
+    ///
+    /// This guard is a Noxu-specific safety backstop with NO direct JE
+    /// counterpart: JE `Acceptor.process(Accept)` (Acceptor.java:209-215) has
+    /// no "different value at this term" check — it accepts iff the promise
+    /// equals the Accept's proposal and then overwrites `acceptedValue`
+    /// unconditionally.  Note that JE's `RankingProposer.choosePhase2Value`
+    /// (RankingProposer.java:56-130) also does NOT adopt a previously-accepted
+    /// value — it ranks the Promise *suggestions* (VLSN/dtvlsn), exactly as
+    /// Noxu's `choose_phase2_value` does; `Proposer.Phase1Result.acceptedValue`
+    /// is tracked but `@SuppressWarnings("unused")` in the ranking proposer.
+    /// So this guard is NOT compensating for a value-adoption difference
+    /// between Noxu and JE (there is none).
+    ///
+    /// The real reason the guard is needed is a different Noxu deviation: JE
+    /// keys EVERY stage on the whole globally-unique proposal number
+    /// (`ms_time|machineId|uniqueId`), including the Learner's
+    /// highest-proposal rule (`Learner.processResult`, Learner.java:139-150),
+    /// so "two proposers at the same wall-clock ms" are still distinct
+    /// proposals and the group converges on the highest.  Noxu's DOWNSTREAM
+    /// master bookkeeping — `master_tracker.update_master` (rejects
+    /// `term < current_term`), DTVLSN, and `transfer_master`
+    /// (`new_term = get_term()+1`) — keys on the BARE `term` integer, not the
+    /// full `(term, proposer)` number.  So if two proposers ever shared one
+    /// `term` integer, Noxu could not distinguish them downstream.  This guard
+    /// restores the per-term single-value invariant for the acceptor: once a
+    /// value is ACCEPTED at a term, refuse a DIFFERENT value at that SAME
+    /// term.  With the time-based proposal number
+    /// (`TimebasedProposalGenerator`) terms do not collide across proposers in
+    /// normal operation, so the guard never fires there; it makes the acceptor
+    /// split-brain-proof even under an adversarial term-integer collision
+    /// (modelled by the `flexible_paxos` spec, which is only safe for the real
+    /// `(term, proposer)` gate WITH this guard), and it is what makes the
+    /// FID-ELECT-1 witness go green at the acceptor level.
+    ///
+    /// Trade-off (reviewed, accepted as a conservative backstop): because the
+    /// guard keys on the bare term integer, a legitimately-HIGHER proposer
+    /// `(t, Z)` that re-promised an acceptor which already accepted `(t, A)`
+    /// with a different value at the SAME integer `t` is REJECTED here, where
+    /// JE would accept it and let the Learner keep the highest proposal.  With
+    /// ms_time terms this collision does not arise in normal re-elections
+    /// (`observe` + `next` make a re-election's term strictly greater), so no
+    /// legitimate election is blocked; the guard can only REJECT more than JE,
+    /// never accept more, so it cannot cause split-brain.
+    #[doc(hidden)]
+    pub fn try_accept_proposal(
+        &self,
+        t: u64,
+        proposer: &str,
+        master: &str,
+    ) -> bool {
         let _guard = self.flush_lock.lock().unwrap();
-        let promised = self.promised_term.load(Ordering::SeqCst);
-        if t != promised {
+        let cur_term = self.promised_term.load(Ordering::SeqCst);
+        let cur_proposer = self.promised_proposer.lock().unwrap().clone();
+        // JE: accept iff the promised proposal equals the accept's proposal.
+        if (cur_term, cur_proposer.as_deref()) != (t, Some(proposer)) {
             return false;
         }
         let prev_accepted_term = self.accepted_term.load(Ordering::SeqCst);
         let prev_accepted_master = self.accepted_master.lock().unwrap().clone();
-        // Update the acceptance.  Also implicitly bump promised_term
-        // to t so subsequent promises at term < t are rejected.
-        self.promised_term.store(t, Ordering::SeqCst);
+        // FID-ELECT-1: refuse to accept a DIFFERENT value at a term already
+        // accepted (no value adoption in Noxu's RankingProposer — see above).
+        if prev_accepted_term == t
+            && prev_accepted_master.as_deref() != Some(master)
+        {
+            return false;
+        }
+        // The promise already equals (t, proposer); record the acceptance.
         self.accepted_term.store(t, Ordering::SeqCst);
         *self.accepted_master.lock().unwrap() = Some(master.to_string());
         if let Err(e) = self.flush_locked() {
-            self.promised_term.store(promised, Ordering::SeqCst);
             self.accepted_term.store(prev_accepted_term, Ordering::SeqCst);
             *self.accepted_master.lock().unwrap() = prev_accepted_master;
             log::warn!(
-                "acceptor.state: failed to persist accept(t={}, master={}): {}",
+                "acceptor.state: failed to persist accept(t={}, proposer={}, master={}): {}",
                 t,
+                proposer,
                 master,
                 e
             );
@@ -259,6 +511,7 @@ impl PersistentAcceptorState {
             return Ok(());
         };
         let promised = self.promised_term.load(Ordering::SeqCst);
+        let promised_proposer = self.promised_proposer.lock().unwrap().clone();
         let accepted = self.accepted_term.load(Ordering::SeqCst);
         let master = self.accepted_master.lock().unwrap().clone();
 
@@ -276,6 +529,11 @@ impl PersistentAcceptorState {
         let m_len: u16 = m_bytes.len().try_into().unwrap_or(u16::MAX);
         buf.extend_from_slice(&m_len.to_le_bytes());
         buf.extend_from_slice(&m_bytes[..m_len as usize]);
+        // v2: promised_proposer (FID-ELECT-1). Length 0 = None.
+        let p_bytes = promised_proposer.as_deref().unwrap_or("").as_bytes();
+        let p_len: u16 = p_bytes.len().try_into().unwrap_or(u16::MAX);
+        buf.extend_from_slice(&p_len.to_le_bytes());
+        buf.extend_from_slice(&p_bytes[..p_len as usize]);
 
         let crc = crc32fast::hash(&buf);
         buf.extend_from_slice(&crc.to_le_bytes());
@@ -290,11 +548,37 @@ impl PersistentAcceptorState {
         drop(f);
 
         std::fs::rename(&tmp, path)?;
+
+        // F-ELECT8-E: the file is `sync_all`'d above, but the directory ENTRY
+        // created by the rename is NOT durable until the parent directory is
+        // itself fsynced (POSIX). Without this, a crash just after the rename
+        // can leave the directory pointing at the OLD `acceptor.state`, losing
+        // a promise/accept this acceptor already ACKed to a proposer -- the
+        // acceptor could then promise/accept a LOWER proposal and a second
+        // master could be elected at the same effective term (a Paxos safety
+        // violation). JE never persists the promise at all (Acceptor.java:46,
+        // `promisedProposal` is a plain in-memory field) and makes no restart
+        // guarantee; Noxu's design deliberately persists it for crash safety,
+        // so the fsync must cover the rename for that guarantee to hold.
+        //
+        // Reuses `noxu_log::sync_dir` (same cross-platform semantics the log
+        // manager uses for its own directory-entry durability).
+        noxu_log::sync_dir(env_home)?;
+
+        // Testing seam: record that the dir-fsync ran after the rename, so a
+        // witness can prove the ordering (RED without the fsync, GREEN with
+        // it). Compiled only under `cfg(test)` / the `test-harness` feature;
+        // absent from every production build and from the released surface.
+        #[cfg(any(test, feature = "test-harness"))]
+        dir_sync_witness::note(env_home);
+
         Ok(())
     }
 }
 
-fn load_from_disk(path: &Path) -> Result<Option<(u64, u64, Option<String>)>> {
+fn load_from_disk(
+    path: &Path,
+) -> Result<Option<(u64, Option<String>, u64, Option<String>)>> {
     let mut f = match std::fs::File::open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -330,7 +614,9 @@ fn load_from_disk(path: &Path) -> Result<Option<(u64, u64, Option<String>)>> {
     let mut buf2 = [0u8; 2];
     buf2.copy_from_slice(&bytes[4..6]);
     let version = u16::from_le_bytes(buf2);
-    if version != VERSION {
+    // v1 (no promised_proposer) and v2 are both readable; v1 is upgraded in
+    // place on the next flush (FID-ELECT-1).
+    if version != 1 && version != VERSION {
         return Err(AcceptorPersistError::BadVersion(version));
     }
 
@@ -357,7 +643,39 @@ fn load_from_disk(path: &Path) -> Result<Option<(u64, u64, Option<String>)>> {
         Some(s.to_string())
     };
 
-    Ok(Some((promised, accepted, master)))
+    // v2: promised_proposer follows the master bytes.  v1 files have none
+    // (`None`), which compares LESS than any named proposer so the first
+    // post-upgrade Propose re-promises without regressing the term.
+    let after_master = 24 + master_len;
+    let promised_proposer = if version >= 2 {
+        if bytes.len() < after_master + 2 + 4 {
+            return Err(AcceptorPersistError::Truncated {
+                expected: after_master + 2 + 4,
+                got: bytes.len(),
+            });
+        }
+        buf2.copy_from_slice(&bytes[after_master..after_master + 2]);
+        let proposer_len = u16::from_le_bytes(buf2) as usize;
+        let p_start = after_master + 2;
+        if bytes.len() < p_start + proposer_len + 4 {
+            return Err(AcceptorPersistError::Truncated {
+                expected: p_start + proposer_len + 4,
+                got: bytes.len(),
+            });
+        }
+        if proposer_len == 0 {
+            None
+        } else {
+            let s =
+                std::str::from_utf8(&bytes[p_start..p_start + proposer_len])
+                    .map_err(|_| AcceptorPersistError::BadMasterName)?;
+            Some(s.to_string())
+        }
+    } else {
+        None
+    };
+
+    Ok(Some((promised, promised_proposer, accepted, master)))
 }
 
 #[cfg(test)]
@@ -365,17 +683,59 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    // === F-ELECT8-E witness ===================================================
+    // The acceptor persists its promise with write + `sync_all` + `rename`, but
+    // the rename's directory ENTRY is only durable after the PARENT DIRECTORY
+    // is fsynced. The `dir_sync_witness` seam records every dir-fsync done by
+    // `flush_locked` after its rename.
+    //
+    // RED  (defect present): `flush_locked` ends at `rename` with no dir-fsync,
+    //       so `last_dir_sync()` stays `None` -> this test FAILS.
+    // GREEN (fixed): `flush_locked` calls `noxu_log::sync_dir(env_home)` after
+    //       the rename, so the witness records the state file's parent.
+    #[test]
+    fn promise_dir_fsync_follows_rename_witness() {
+        dir_sync_witness::reset();
+        let dir = TempDir::new().unwrap();
+        let s = PersistentAcceptorState::load_or_default(dir.path());
+
+        // A promise persists (write+rename) -> must be followed by a dir fsync.
+        assert!(s.try_promise_proposal(5, "node-a"));
+        assert_eq!(
+            dir_sync_witness::last_dir_sync().as_deref(),
+            Some(dir.path()),
+            "F-ELECT8-E: parent directory must be fsynced after the acceptor.state \
+             rename so the promise survives a crash"
+        );
+        let after_promise = dir_sync_witness::dir_sync_count();
+        assert!(
+            after_promise >= 1,
+            "expected >=1 dir fsync after the promise rename, got {after_promise}"
+        );
+
+        // An accept persists again -> another dir fsync must follow its rename.
+        assert!(s.try_accept_proposal(5, "node-a", "node-a"));
+        assert!(
+            dir_sync_witness::dir_sync_count() > after_promise,
+            "F-ELECT8-E: the accept's acceptor.state rename must also be followed \
+             by a parent-directory fsync (count did not advance: \
+             promise={after_promise}, now={})",
+            dir_sync_witness::dir_sync_count()
+        );
+    }
+
     #[test]
     fn in_memory_state_round_trips() {
         let s = PersistentAcceptorState::in_memory();
         assert_eq!(s.snapshot(), (0, 0, None));
-        assert!(s.try_promise(5));
+        assert!(s.try_promise_proposal(5, "a"));
         assert_eq!(s.promised_term(), 5);
-        // Stale promise rejected.
-        assert!(!s.try_promise(3));
+        // Stale promise (lower term) rejected regardless of proposer.
+        assert!(!s.try_promise_proposal(3, "a"));
+        assert!(!s.try_promise_proposal(3, "z"));
         assert_eq!(s.promised_term(), 5);
         // Higher promise accepted.
-        assert!(s.try_promise(7));
+        assert!(s.try_promise_proposal(7, "a"));
         assert_eq!(s.promised_term(), 7);
     }
 
@@ -383,14 +743,15 @@ mod tests {
     fn try_accept_persists() {
         let dir = TempDir::new().unwrap();
         let s = PersistentAcceptorState::load_or_default(dir.path());
-        assert!(s.try_promise(5));
-        assert!(s.try_accept(5, "node-a"));
+        assert!(s.try_promise_proposal(5, "node-a"));
+        assert!(s.try_accept_proposal(5, "node-a", "node-a"));
         assert_eq!(s.accepted_term(), 5);
         assert_eq!(s.accepted_master(), Some("node-a".into()));
 
-        // Reload from disk: state must persist.
+        // Reload from disk: state must persist (incl. the promised proposer).
         let s2 = PersistentAcceptorState::load_or_default(dir.path());
         assert_eq!(s2.promised_term(), 5);
+        assert_eq!(s2.promised_proposer(), Some("node-a".into()));
         assert_eq!(s2.accepted_term(), 5);
         assert_eq!(s2.accepted_master(), Some("node-a".into()));
     }
@@ -402,13 +763,13 @@ mod tests {
         let dir = TempDir::new().unwrap();
         {
             let s = PersistentAcceptorState::load_or_default(dir.path());
-            assert!(s.try_promise(10));
+            assert!(s.try_promise_proposal(10, "a"));
         }
         // Simulate restart by re-loading.
         let s2 = PersistentAcceptorState::load_or_default(dir.path());
         assert_eq!(s2.promised_term(), 10);
         assert!(
-            !s2.try_promise(7),
+            !s2.try_promise_proposal(7, "a"),
             "post-restart acceptor must reject term lower than persisted promise"
         );
     }
@@ -420,8 +781,8 @@ mod tests {
             let s = PersistentAcceptorState::load_or_default(dir.path());
             // Must promise before accepting at the same term (D1 faithful
             // semantics: accept only at the promised term).
-            assert!(s.try_promise(3));
-            assert!(s.try_accept(3, "x"));
+            assert!(s.try_promise_proposal(3, "x"));
+            assert!(s.try_accept_proposal(3, "x", "x"));
         }
         // Corrupt the file.
         let path = state_path(dir.path());
@@ -433,14 +794,15 @@ mod tests {
         // Reload: corrupt file is removed; state is fresh.
         let s = PersistentAcceptorState::load_or_default(dir.path());
         assert_eq!(s.snapshot(), (0, 0, None));
+        assert_eq!(s.promised_proposer(), None);
     }
 
     #[test]
     fn try_accept_below_promise_rejected() {
         let dir = TempDir::new().unwrap();
         let s = PersistentAcceptorState::load_or_default(dir.path());
-        assert!(s.try_promise(5));
-        assert!(!s.try_accept(3, "x"));
+        assert!(s.try_promise_proposal(5, "x"));
+        assert!(!s.try_accept_proposal(3, "x", "x"));
         assert_eq!(s.accepted_term(), 0);
     }
 
@@ -451,11 +813,14 @@ mod tests {
         // (here: no prior promise -> promised == 0) must be rejected.
         let dir = TempDir::new().unwrap();
         let s = PersistentAcceptorState::load_or_default(dir.path());
-        assert!(!s.try_accept(7, "winner"), "accept without matching promise");
+        assert!(
+            !s.try_accept_proposal(7, "winner", "winner"),
+            "accept without matching promise"
+        );
         assert_eq!(s.accepted_term(), 0);
         // After promising 7, accept at 7 succeeds.
-        assert!(s.try_promise(7));
-        assert!(s.try_accept(7, "winner"));
+        assert!(s.try_promise_proposal(7, "winner"));
+        assert!(s.try_accept_proposal(7, "winner", "winner"));
         assert_eq!(s.accepted_term(), 7);
     }
 
@@ -467,16 +832,170 @@ mod tests {
         // let two proposers at different terms both reach phase-2 quorum.
         let dir = TempDir::new().unwrap();
         let s = PersistentAcceptorState::load_or_default(dir.path());
-        assert!(s.try_promise(5));
+        assert!(s.try_promise_proposal(5, "legit"));
         assert!(
-            !s.try_accept(6, "intruder"),
+            !s.try_accept_proposal(6, "intruder", "intruder"),
             "D1: accept at term > promised must be rejected (split-brain)"
         );
         assert_eq!(s.accepted_term(), 0, "no acceptance recorded");
         // The promised term is unchanged, so the legitimate proposer at 5 can
         // still complete phase 2.
         assert_eq!(s.promised_term(), 5);
-        assert!(s.try_accept(5, "legit"));
+        assert!(s.try_accept_proposal(5, "legit", "legit"));
         assert_eq!(s.accepted_term(), 5);
+    }
+
+    // ---------------------------------------------------------------------
+    // FID-ELECT-1 regression tests: the proposal number is `(term, proposer)`.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn two_proposers_same_term_only_one_accepted() {
+        // The split-brain hole: two proposers A and B both drive term 1 on
+        // one acceptor.  JE rejects the second via the unique proposal
+        // number; we must too.
+        let s = PersistentAcceptorState::in_memory();
+        // A promises + accepts at (1, A).
+        assert!(s.try_promise_proposal(1, "node-A"));
+        assert!(s.try_accept_proposal(1, "node-A", "node-A"));
+        assert_eq!(s.accepted_master().as_deref(), Some("node-A"));
+        // B re-promises the acceptor at (1, B) ((1,B) > (1,A), not strictly
+        // less, so JE's Propose rule re-promises).
+        assert!(s.try_promise_proposal(1, "node-B"));
+        assert_eq!(s.promised_proposer().as_deref(), Some("node-B"));
+        // A's phase-2 Accept now carries the stale proposal (1, A) != the
+        // promised (1, B): rejected.
+        assert!(
+            !s.try_accept_proposal(1, "node-A", "node-A"),
+            "A's stale Accept at (1,A) must be rejected after B re-promised"
+        );
+        // The acceptance recorded for A is untouched.
+        assert_eq!(s.accepted_master().as_deref(), Some("node-A"));
+        assert_eq!(s.accepted_term(), 1);
+    }
+
+    #[test]
+    fn lower_proposer_cannot_overwrite_higher_promise_same_term() {
+        // Acceptor promised (1, node-B); a Propose (1, node-A) is strictly
+        // less, so it is rejected (JE Propose rule) and B's promise stands.
+        let s = PersistentAcceptorState::in_memory();
+        assert!(s.try_promise_proposal(1, "node-B"));
+        assert!(
+            !s.try_promise_proposal(1, "node-A"),
+            "(1,A) < (1,B) -> Propose rejected"
+        );
+        assert_eq!(s.promised_proposer().as_deref(), Some("node-B"));
+        // Only B can be accepted at term 1.
+        assert!(!s.try_accept_proposal(1, "node-A", "node-A"));
+        assert!(s.try_accept_proposal(1, "node-B", "node-B"));
+    }
+
+    #[test]
+    fn accept_value_may_differ_from_proposer() {
+        // JE's MasterValue is independent of the proposal number: a proposer
+        // may propose a different winner than itself.  The acceptor keys on
+        // (term, proposer) but records the master value as given.
+        let s = PersistentAcceptorState::in_memory();
+        assert!(s.try_promise_proposal(3, "proposer-X"));
+        assert!(s.try_accept_proposal(3, "proposer-X", "winner-Y"));
+        assert_eq!(s.accepted_master().as_deref(), Some("winner-Y"));
+    }
+
+    #[test]
+    fn reaccept_same_value_is_idempotent_different_value_rejected() {
+        // FID-ELECT-1 value guard, and its interaction with JE's idempotent
+        // re-accept.  Fix the proposal number `(t, p)` and vary only the
+        // Accept value:
+        //
+        //   promise (t, p)          -> promise moves to (t, p)
+        //   accept  (t, p, m1)      -> OK  (first value at this term)
+        //   accept  (t, p, m2!=m1)  -> REJECTED by Noxu's value guard
+        //   accept  (t, p, m1)      -> OK  (re-accept of the SAME value)
+        //
+        // JE `Acceptor.process(Accept)` (Acceptor.java:211-217) has NO value
+        // guard: once `promisedProposal.compareTo(accept.getProposal()) == 0`
+        // it sets `acceptedValue = accept.getValue()` UNCONDITIONALLY and
+        // returns `Accepted` — so a JE acceptor is idempotent for a re-accept
+        // of the SAME proposal number and would *also* overwrite with a
+        // different value.  Noxu matches JE on the re-accept of the SAME value
+        // (idempotent re-set, `true`), and deviates — conservatively, rejecting
+        // rather than overwriting — only for a DIFFERENT value at the same bare
+        // term (the backstop that keeps Noxu's bare-`term` downstream
+        // bookkeeping split-brain-safe).
+        let s = PersistentAcceptorState::in_memory();
+        assert!(s.try_promise_proposal(7, "node-A"));
+
+        // First Accept at (7, node-A) with value m1: accepted.
+        assert!(
+            s.try_accept_proposal(7, "node-A", "m1"),
+            "first accept of a value at a promised proposal number must succeed"
+        );
+        assert_eq!(s.accepted_term(), 7);
+        assert_eq!(s.accepted_master().as_deref(), Some("m1"));
+
+        // Second Accept at the SAME (7, node-A) but a DIFFERENT value m2:
+        // rejected by the value guard, and the accepted value is untouched.
+        assert!(
+            !s.try_accept_proposal(7, "node-A", "m2"),
+            "a different value at an already-accepted term must be rejected \
+             (Noxu value guard; JE would overwrite — see Acceptor.java:217)"
+        );
+        assert_eq!(
+            s.accepted_master().as_deref(),
+            Some("m1"),
+            "rejected different-value accept must not mutate the accepted value"
+        );
+        assert_eq!(s.accepted_term(), 7);
+        // The promise is also untouched by the rejected accept.
+        assert_eq!(s.promised_term(), 7);
+        assert_eq!(s.promised_proposer().as_deref(), Some("node-A"));
+
+        // Re-accept of the SAME value m1 at the same (7, node-A): idempotent,
+        // succeeds (matches JE's unconditional re-set at Acceptor.java:217).
+        assert!(
+            s.try_accept_proposal(7, "node-A", "m1"),
+            "a re-accept of the SAME value at the same proposal number is \
+             idempotent and must succeed (JE Acceptor.java:211-217)"
+        );
+        assert_eq!(s.accepted_term(), 7);
+        assert_eq!(s.accepted_master().as_deref(), Some("m1"));
+    }
+
+    #[test]
+    fn v1_file_is_read_and_upgraded_in_place() {
+        // A v7.11.0 / RC acceptor.state (version 1, no promised_proposer)
+        // must load with promised_proposer=None and keep its durable promise;
+        // the first post-upgrade Propose at the promised term re-promises to
+        // the named proposer without regressing the term.
+        let dir = TempDir::new().unwrap();
+        let path = state_path(dir.path());
+        // Hand-write a version-1 file: promised=9, accepted=9, master="old".
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(MAGIC);
+        buf.extend_from_slice(&1u16.to_le_bytes()); // version 1
+        buf.extend_from_slice(&9u64.to_le_bytes()); // promised_term
+        buf.extend_from_slice(&9u64.to_le_bytes()); // accepted_term
+        let m = b"old";
+        buf.extend_from_slice(&(m.len() as u16).to_le_bytes());
+        buf.extend_from_slice(m);
+        let crc = crc32fast::hash(&buf);
+        buf.extend_from_slice(&crc.to_le_bytes());
+        std::fs::write(&path, &buf).unwrap();
+
+        let s = PersistentAcceptorState::load_or_default(dir.path());
+        assert_eq!(s.promised_term(), 9);
+        assert_eq!(s.promised_proposer(), None, "v1 has no proposer");
+        assert_eq!(s.accepted_term(), 9);
+        assert_eq!(s.accepted_master().as_deref(), Some("old"));
+        // A stale term is still rejected (promise preserved).
+        assert!(!s.try_promise_proposal(8, "n"));
+        // The first Propose at the promised term re-promises (None < Some).
+        assert!(s.try_promise_proposal(9, "n"));
+        assert_eq!(s.promised_proposer().as_deref(), Some("n"));
+        assert_eq!(s.promised_term(), 9, "term must not regress on upgrade");
+
+        // Reload: it is now a v2 file with the proposer persisted.
+        let s2 = PersistentAcceptorState::load_or_default(dir.path());
+        assert_eq!(s2.promised_proposer().as_deref(), Some("n"));
     }
 }

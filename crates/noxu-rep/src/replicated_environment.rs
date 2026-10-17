@@ -1231,10 +1231,19 @@ impl ReplicatedEnvironment {
     /// by [`Self::start_election_driver`].
     fn run_election_loop(self: Arc<Self>) {
         use std::sync::atomic::Ordering;
-        // Maintain an internal monotonically increasing election term.
-        // Each successful or failed round bumps the term so retries do
-        // not collide with stale acceptor promises.
-        let mut term: u64 = 1;
+        // FID-ELECT-1: the election "term" is now the ASCENDING, globally
+        // ordered component of the Paxos proposal number (JE's `ms_time`),
+        // not a per-node-local counter that every node starts at 1.  A
+        // local-counter term is reused across nodes, so two proposers could
+        // collide at the same term and both be accepted (split-brain).  The
+        // time-based generator makes this node's terms strictly ascending and
+        // (combined with the proposer's unique `node_name`, JE's `machineId`
+        // role) globally unique, so an acceptor that promised one proposal
+        // rejects every lower-numbered one.  See
+        // `elections::proposal_generator::TimebasedProposalGenerator`.
+        let proposal_gen =
+            crate::elections::proposal_generator::TimebasedProposalGenerator::new();
+        let mut term: u64 = proposal_gen.next();
 
         loop {
             if self.io_shutdown.load(Ordering::SeqCst) {
@@ -1416,7 +1425,13 @@ impl ReplicatedEnvironment {
                 }
             }
 
-            term = term.saturating_add(1);
+            // FID-ELECT-1: draw the next ascending proposal number for the
+            // next round (JE calls `nextProposal()` once per round).  If this
+            // node observed a higher term from a peer, nudge the generator so
+            // our next round out-numbers it (keeps the group's proposal
+            // numbers globally ascending without a shared clock).
+            proposal_gen.observe(self.master_tracker.get_term());
+            term = proposal_gen.next();
             // Back off so we don't pin the loop on transient failures.
             std::thread::sleep(
                 self.config.election_timeout.min(Duration::from_millis(500)),

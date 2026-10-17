@@ -143,24 +143,33 @@ use noxu_rep::elections::PersistentAcceptorState;
 
 #[derive(Debug, Clone)]
 enum AcceptorMsg {
-    /// Proposer asks the acceptor to promise term `t`.
-    Promise(u64),
-    /// Proposer asks the acceptor to accept (term `t`, master `name`).
-    Accept(u64, u8),
+    /// Proposer `p` asks the acceptor to promise proposal `(t, p)`.
+    Promise(u64, u8),
+    /// Proposer `p` asks the acceptor to accept `(term t, proposer p,
+    /// master `name`)`.
+    Accept(u64, u8, u8),
+}
+
+/// Model-side proposal number `(term, proposer-name)`, mirroring the
+/// acceptor's `(term, proposer)` key.  Proposer bytes become `"p{n}"`.
+fn proposer_name(p: u8) -> String {
+    format!("p{}", p)
 }
 
 #[hegel::composite]
 fn acceptor_msg(tc: hegel::TestCase, max_term: u64) -> AcceptorMsg {
     tc.draw(hegel::one_of!(
-        generators::integers::<u64>()
-            .min_value(1)
-            .max_value(max_term)
-            .map(AcceptorMsg::Promise),
         generators::tuples!(
             generators::integers::<u64>().min_value(1).max_value(max_term),
             generators::integers::<u8>(),
         )
-        .map(|(t, n)| AcceptorMsg::Accept(t, n)),
+        .map(|(t, p)| AcceptorMsg::Promise(t, p)),
+        generators::tuples!(
+            generators::integers::<u64>().min_value(1).max_value(max_term),
+            generators::integers::<u8>(),
+            generators::integers::<u8>(),
+        )
+        .map(|(t, p, n)| AcceptorMsg::Accept(t, p, n)),
     ))
 }
 
@@ -175,12 +184,15 @@ fn prop_acceptor_promised_term_monotone(tc: hegel::TestCase) {
     let mut prev = acceptor.promised_term();
     for msg in &msgs {
         match msg {
-            AcceptorMsg::Promise(t) => {
-                let _ = acceptor.try_promise(*t);
+            AcceptorMsg::Promise(t, p) => {
+                let _ = acceptor.try_promise_proposal(*t, &proposer_name(*p));
             }
-            AcceptorMsg::Accept(t, n) => {
-                let name = format!("n{}", n);
-                let _ = acceptor.try_accept(*t, &name);
+            AcceptorMsg::Accept(t, p, n) => {
+                let _ = acceptor.try_accept_proposal(
+                    *t,
+                    &proposer_name(*p),
+                    &format!("m{}", n),
+                );
             }
         }
         let cur = acceptor.promised_term();
@@ -195,92 +207,183 @@ fn prop_acceptor_promised_term_monotone(tc: hegel::TestCase) {
     }
 }
 
-/// Paxos safety: a `try_promise(t)` returning `true` ALWAYS leaves the
-/// promised_term equal to max(prev, t).  A return of `false` MUST mean
-/// `t < prev_promised_term`.  Catches accidental write-on-reject bugs.
+/// Paxos safety (FID-ELECT-1): the acceptor keys on the whole proposal
+/// number `(term, proposer)`.  A `try_promise_proposal((t, p))` returns `true` IFF the
+/// current promise is NOT strictly greater than `(t, p)` (JE: reject only a
+/// strictly-greater promise); a `false` return leaves state unchanged.
 #[hegel::test(test_cases = 64)]
 fn prop_acceptor_promise_contract(tc: hegel::TestCase) {
     let msgs: Vec<AcceptorMsg> =
         tc.draw(generators::vecs(acceptor_msg(50)).max_size(15));
     let probe_term =
         tc.draw(generators::integers::<u64>().min_value(1).max_value(200));
+    let probe_proposer_byte = tc.draw(generators::integers::<u8>());
     let acceptor = PersistentAcceptorState::in_memory();
     for msg in &msgs {
         match msg {
-            AcceptorMsg::Promise(t) => {
-                let _ = acceptor.try_promise(*t);
+            AcceptorMsg::Promise(t, p) => {
+                let _ = acceptor.try_promise_proposal(*t, &proposer_name(*p));
             }
-            AcceptorMsg::Accept(t, n) => {
-                let name = format!("n{}", n);
-                let _ = acceptor.try_accept(*t, &name);
+            AcceptorMsg::Accept(t, p, n) => {
+                let _ = acceptor.try_accept_proposal(
+                    *t,
+                    &proposer_name(*p),
+                    &format!("m{}", n),
+                );
             }
         }
     }
-    let before = acceptor.promised_term();
-    let result = acceptor.try_promise(probe_term);
-    let after = acceptor.promised_term();
+    let before_term = acceptor.promised_term();
+    let before_proposer = acceptor.promised_proposer();
+    let probe_proposer = proposer_name(probe_proposer_byte);
+    // The acceptor's `(term, proposer)` ordering: `None` proposer < any name.
+    let promised = (before_term, before_proposer.clone());
+    let incoming = (probe_term, Some(probe_proposer.clone()));
+
+    let result = acceptor.try_promise_proposal(probe_term, &probe_proposer);
+    let after_term = acceptor.promised_term();
+    let after_proposer = acceptor.promised_proposer();
     if result {
         assert!(
-            probe_term >= before,
-            "try_promise({}) returned true but promised_term was {}",
-            probe_term,
-            before
+            promised <= incoming,
+            "try_promise({:?}) returned true but promised was {:?}",
+            incoming,
+            promised
         );
-        assert_eq!(after, probe_term.max(before));
+        assert_eq!(after_term, probe_term);
+        assert_eq!(after_proposer.as_deref(), Some(probe_proposer.as_str()));
     } else {
         assert!(
-            probe_term < before,
-            "try_promise({}) returned false but promised_term was {}",
-            probe_term,
-            before
+            promised > incoming,
+            "try_promise({:?}) returned false but promised was {:?}",
+            incoming,
+            promised
         );
-        assert_eq!(after, before, "rejected promise must not mutate state");
+        assert_eq!(after_term, before_term, "rejected promise must not mutate");
+        assert_eq!(after_proposer, before_proposer);
     }
 }
 
-/// Paxos safety (JE Acceptor.process(Accept), Acceptor.java:210-211):
-/// `try_accept(t, m)` returns `true` IFF `t == prev_promised_term` — an
-/// Accept is honoured only at the exact term that was promised in phase 1.
-/// An Accept at any other term (higher OR lower) is rejected; accepting at
-/// a higher-but-unpromised term would admit two proposers reaching phase-2
-/// quorum at different terms (split-brain). Returning `false` MUST leave
-/// (accepted_term, accepted_master) AND promised_term unchanged.
+/// Paxos safety (JE `Acceptor.process(Accept)`, `Acceptor.java:207-222`),
+/// FID-ELECT-1 — the EXACT accept contract.
+///
+/// `try_accept_proposal((t, p), m)` returns `true` IFF **both**:
+///
+///   1. the current promise EXACTLY equals the Accept's proposal number
+///      `(t, p)` — the proposer identity is part of the key, so an Accept at
+///      the right term but the WRONG proposer is rejected (JE
+///      `promisedProposal.compareTo(accept.getProposal()) == 0`,
+///      `Acceptor.java:210`); **and**
+///   2. the Noxu value guard passes — there is no value yet accepted at that
+///      EXACT term, OR the probe's value equals the value already accepted
+///      there (`acceptor_state.rs`: reject iff
+///      `accepted_term == t && accepted_master != Some(master)`).
+///      This guard is a Noxu-specific backstop with NO JE counterpart (JE
+///      overwrites `acceptedValue` unconditionally once the proposal matches,
+///      `Acceptor.java:217`); it is load-bearing because Noxu's downstream
+///      master bookkeeping keys on the bare `term` integer, not the full
+///      `(term, proposer)` number.
+///
+/// A re-accept of the SAME value at an already-accepted `(t, p)` passes the
+/// guard and succeeds (idempotent re-set), matching JE's unconditional
+/// `acceptedValue = accept.getValue()`.
+///
+/// The failure branch holds exactly when that iff is false — i.e. the promise
+/// is not equal, OR the value guard would fire.  On `false` the acceptor MUST
+/// leave `(accepted_term, accepted_master)` AND the promise unchanged.
 #[hegel::test(test_cases = 64)]
 fn prop_acceptor_accept_contract(tc: hegel::TestCase) {
     let msgs: Vec<AcceptorMsg> =
         tc.draw(generators::vecs(acceptor_msg(50)).max_size(15));
     let probe_term =
         tc.draw(generators::integers::<u64>().min_value(1).max_value(200));
+    let probe_proposer_byte = tc.draw(generators::integers::<u8>());
     let probe_master_byte = tc.draw(generators::integers::<u8>());
     let acceptor = PersistentAcceptorState::in_memory();
     for msg in &msgs {
         match msg {
-            AcceptorMsg::Promise(t) => {
-                let _ = acceptor.try_promise(*t);
+            AcceptorMsg::Promise(t, p) => {
+                let _ = acceptor.try_promise_proposal(*t, &proposer_name(*p));
             }
-            AcceptorMsg::Accept(t, n) => {
-                let name = format!("n{}", n);
-                let _ = acceptor.try_accept(*t, &name);
+            AcceptorMsg::Accept(t, p, n) => {
+                let _ = acceptor.try_accept_proposal(
+                    *t,
+                    &proposer_name(*p),
+                    &format!("m{}", n),
+                );
             }
         }
     }
     let before_promised = acceptor.promised_term();
+    let before_proposer = acceptor.promised_proposer();
     let before_accepted = acceptor.accepted_term();
     let before_master = acceptor.accepted_master();
+    let probe_proposer = proposer_name(probe_proposer_byte);
     let probe_master = format!("m{}", probe_master_byte);
 
-    let result = acceptor.try_accept(probe_term, &probe_master);
+    let promised = (before_promised, before_proposer.as_deref());
+    let probe = (probe_term, Some(probe_proposer.as_str()));
+
+    // The EXACT contract, computed from the pre-state (independently of the
+    // call we are about to make):
+    //   (1) the promise equals the probe's proposal number, AND
+    //   (2) the value guard passes.
+    let promise_matches = promised == probe;
+    // Value guard fires (rejects) iff a value is ALREADY accepted at this
+    // exact term AND the probe carries a DIFFERENT value.  Note the guard is
+    // keyed on the bare `term`, mirroring `try_accept_proposal`.
+    let value_guard_fires = before_accepted == probe_term
+        && before_master.as_deref() != Some(probe_master.as_str());
+    let expected = promise_matches && !value_guard_fires;
+
+    let result = acceptor.try_accept_proposal(
+        probe_term,
+        &probe_proposer,
+        &probe_master,
+    );
+
+    assert_eq!(
+        result, expected,
+        "accept({probe:?}, {probe_master:?}) returned {result} but the exact \
+         contract (promise_matches={promise_matches} && \
+         !value_guard_fires={}) requires {expected}; pre-state promised={promised:?}, \
+         accepted=({before_accepted}, {before_master:?})",
+        !value_guard_fires,
+    );
+
     if result {
+        // Success implies the promise equalled the probe (necessary
+        // condition) — assert it directly so a regression that let an accept
+        // through on a non-matching promise is still caught here.
         assert_eq!(
-            probe_term, before_promised,
-            "accept succeeds only at the exact promised term"
+            promised, probe,
+            "accept succeeds only when the promise equals the Accept's \
+             proposal number (term, proposer)"
+        );
+        // ...and the value guard did not fire.
+        assert!(
+            !value_guard_fires,
+            "accept succeeded but a different value was already accepted at \
+             this term (value guard should have rejected it)"
         );
         assert_eq!(acceptor.accepted_term(), probe_term);
         assert_eq!(acceptor.accepted_master(), Some(probe_master));
-        // promised_term is unchanged (already == probe_term).
+        // The promise is unchanged (already equals the probe).
         assert_eq!(acceptor.promised_term(), before_promised);
+        assert_eq!(acceptor.promised_proposer(), before_proposer);
     } else {
-        assert!(probe_term != before_promised);
+        // Failure holds exactly when the promise did not match OR the value
+        // guard fired.  The old assertion `assert_ne!(promised, probe)` was
+        // unsound: with the value guard, `promised == probe` is reachable on a
+        // rejected accept (promise (t,p); accept (t,p,m1) ok; accept (t,p,m2)
+        // with m2 != m1 rejected while promised still == probe).
+        assert!(
+            !promise_matches || value_guard_fires,
+            "accept was rejected but the promise matched AND the value guard \
+             did not fire — the acceptor should have accepted; \
+             promised={promised:?}, probe={probe:?}, accepted=({before_accepted}, \
+             {before_master:?})"
+        );
         assert_eq!(acceptor.accepted_term(), before_accepted);
         assert_eq!(acceptor.accepted_master(), before_master);
         assert_eq!(
@@ -288,6 +391,7 @@ fn prop_acceptor_accept_contract(tc: hegel::TestCase) {
             before_promised,
             "rejected accept must not mutate the promise"
         );
+        assert_eq!(acceptor.promised_proposer(), before_proposer);
     }
 }
 
@@ -306,12 +410,16 @@ fn prop_acceptor_persistence_restart_preserves_promise(tc: hegel::TestCase) {
         let acceptor = PersistentAcceptorState::load_or_default(dir.path());
         for msg in &msgs {
             match msg {
-                AcceptorMsg::Promise(t) => {
-                    let _ = acceptor.try_promise(*t);
+                AcceptorMsg::Promise(t, p) => {
+                    let _ =
+                        acceptor.try_promise_proposal(*t, &proposer_name(*p));
                 }
-                AcceptorMsg::Accept(t, n) => {
-                    let name = format!("n{}", n);
-                    let _ = acceptor.try_accept(*t, &name);
+                AcceptorMsg::Accept(t, p, n) => {
+                    let _ = acceptor.try_accept_proposal(
+                        *t,
+                        &proposer_name(*p),
+                        &format!("m{}", n),
+                    );
                 }
             }
         }
@@ -324,10 +432,10 @@ fn prop_acceptor_persistence_restart_preserves_promise(tc: hegel::TestCase) {
     assert_eq!(acceptor2.promised_term(), final_promised);
     assert_eq!(acceptor2.accepted_term(), final_accepted);
     assert_eq!(acceptor2.accepted_master(), final_master);
-    // After restart, no smaller term can promise.
+    // After restart, no smaller term can promise (regardless of proposer).
     if final_promised > 0 {
         assert!(
-            !acceptor2.try_promise(final_promised - 1),
+            !acceptor2.try_promise_proposal(final_promised - 1, "probe"),
             "restarted acceptor must reject promise below {}",
             final_promised
         );

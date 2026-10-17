@@ -5,16 +5,21 @@
 //! Ports the core invariants of
 //! `je/test/com/sleepycat/je/rep/elections/AcceptorTest.java::testAcceptor`,
 //! adapted to Noxu's `PersistentAcceptorState`.  JE's `Acceptor.process(Propose)`
-//! and `Acceptor.process(Accept)` map onto Noxu's `try_promise(t)` and
-//! `try_accept(t, master)`; PROMISE/ACCEPTED responses become `true`, REJECT
-//! responses become `false`.  The protocol invariants are identical.
+//! and `Acceptor.process(Accept)` map onto Noxu's `try_promise_proposal(t, proposer)`
+//! and `try_accept_proposal(t, proposer, master)`; PROMISE/ACCEPTED responses become
+//! `true`, REJECT responses become `false`.  The protocol invariants are
+//! identical.
 //!
 //! Mapping table (JE -> Noxu):
-//! - Proposal#compareTo is total-ordered  -> u64 term
-//! - PROMISE                               -> try_promise(t) == true
-//! - ACCEPTED                              -> try_accept(t, master) == true
+//! - Proposal#compareTo is total-ordered  -> (term, proposer) lexicographic
+//! - PROMISE                               -> try_promise_proposal(t, p) == true
+//! - ACCEPTED                              -> try_accept_proposal(t, p, master) == true
 //! - REJECT (Propose / Accept)             -> try_promise/try_accept == false
 //! - StringValue("VALUE")                  -> master string
+//!
+//! These single-proposer tests fix one proposer name `P`, so the proposal
+//! number varies only in its term component and the JE term ordering is
+//! preserved verbatim.
 
 use noxu_rep::elections::PersistentAcceptorState;
 use tempfile::TempDir;
@@ -45,56 +50,65 @@ fn test_acceptor_je_equivalent() {
     assert!(pn2 > pn1, "proposal numbers must be ascending");
 
     // Propose(pn1) -> PROMISE
-    assert!(acc.try_promise(pn1), "first promise at pn1 must succeed");
+    assert!(
+        acc.try_promise_proposal(pn1, "P"),
+        "first promise at pn1 must succeed"
+    );
 
     // Propose(pn0) -> REJECT (lower than promised)
     assert!(
-        !acc.try_promise(pn0),
+        !acc.try_promise_proposal(pn0, "P"),
         "promise at pn0 < promised(pn1) must be REJECTed"
     );
 
     // Accept(pn1, V) -> ACCEPTED
     assert!(
-        acc.try_accept(pn1, "VALUE"),
+        acc.try_accept_proposal(pn1, "P", "VALUE"),
         "accept at promised term must succeed"
     );
 
     // Propose(pn0) -> REJECT (still, after accept)
     assert!(
-        !acc.try_promise(pn0),
+        !acc.try_promise_proposal(pn0, "P"),
         "promise at pn0 must remain REJECTed after accept"
     );
 
     // Propose(pn2) -> PROMISE
-    assert!(acc.try_promise(pn2), "promise at pn2 (higher) must succeed");
+    assert!(
+        acc.try_promise_proposal(pn2, "P"),
+        "promise at pn2 (higher) must succeed"
+    );
 
     // Accept(pn2, V) -> ACCEPTED
     assert!(
-        acc.try_accept(pn2, "VALUE"),
+        acc.try_accept_proposal(pn2, "P", "VALUE"),
         "accept at pn2 (=promised) must succeed"
     );
 
     // Accept(pn0, V) -> REJECT
     assert!(
-        !acc.try_accept(pn0, "VALUE"),
+        !acc.try_accept_proposal(pn0, "P", "VALUE"),
         "accept at pn0 must be REJECTed after promise(pn2)"
     );
 
     // Accept(pn1, V) -> REJECT
     assert!(
-        !acc.try_accept(pn1, "VALUE"),
+        !acc.try_accept_proposal(pn1, "P", "VALUE"),
         "accept at pn1 must be REJECTed after promise(pn2)"
     );
 }
 
-/// JE invariant: a Promise at the same term as the previous promise
-/// must succeed (Paxos `>=` semantics for promises).
+/// JE invariant: a Promise at the same proposal as the previous promise
+/// must succeed (Paxos: reject only a STRICTLY greater promise).
 #[test]
 fn test_acceptor_repeated_promise_at_same_term() {
     let dir = TempDir::new().unwrap();
     let acc = PersistentAcceptorState::load_or_default(dir.path());
-    assert!(acc.try_promise(50));
-    assert!(acc.try_promise(50), "promise at == promised must still succeed");
+    assert!(acc.try_promise_proposal(50, "P"));
+    assert!(
+        acc.try_promise_proposal(50, "P"),
+        "re-promise of the SAME proposal must still succeed"
+    );
     assert_eq!(acc.promised_term(), 50);
 }
 
@@ -105,8 +119,8 @@ fn test_acceptor_persisted_promise_survives_reload() {
     let dir = TempDir::new().unwrap();
     {
         let acc = PersistentAcceptorState::load_or_default(dir.path());
-        assert!(acc.try_promise(42));
-        assert!(acc.try_accept(42, "winner"));
+        assert!(acc.try_promise_proposal(42, "P"));
+        assert!(acc.try_accept_proposal(42, "P", "winner"));
     }
     // "Re-open" the acceptor.
     let acc2 = PersistentAcceptorState::load_or_default(dir.path());
@@ -115,9 +129,9 @@ fn test_acceptor_persisted_promise_survives_reload() {
     assert_eq!(acc2.accepted_master().as_deref(), Some("winner"));
 
     // A stale Propose at term 41 must be REJECTed.
-    assert!(!acc2.try_promise(41));
+    assert!(!acc2.try_promise_proposal(41, "P"));
     // A stale Accept at term 41 must be REJECTed.
-    assert!(!acc2.try_accept(41, "loser"));
+    assert!(!acc2.try_accept_proposal(41, "P", "loser"));
 }
 
 /// JE Acceptor.process(Accept) (Acceptor.java:210-211): an Accept is rejected
@@ -133,16 +147,16 @@ fn test_acceptor_rejects_accept_at_unpromised_term() {
     let dir = TempDir::new().unwrap();
     let acc = PersistentAcceptorState::load_or_default(dir.path());
 
-    assert!(acc.try_promise(10));
+    assert!(acc.try_promise_proposal(10, "P"));
     // Accept at term 20 (> promised 10) must be REJECTED: 20 was never
     // promised in a phase 1, so the phase-2 value is not fixed to it.
     assert!(
-        !acc.try_accept(20, "n2"),
+        !acc.try_accept_proposal(20, "P", "n2"),
         "JE: accept at a term != promised must be rejected"
     );
     assert_eq!(acc.promised_term(), 10, "promise unchanged by rejected accept");
     assert_eq!(acc.accepted_term(), 0, "nothing accepted");
     // Accept at the promised term 10 succeeds.
-    assert!(acc.try_accept(10, "n2"));
+    assert!(acc.try_accept_proposal(10, "P", "n2"));
     assert_eq!(acc.accepted_term(), 10);
 }

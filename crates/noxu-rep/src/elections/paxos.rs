@@ -19,7 +19,8 @@
 //! If a majority accepts, the function returns `Some(winner_node_id)`.
 //!
 //! The winner is determined by [`Proposal`] ordering (highest VLSN, then
-//! priority, then term, then node name). The proposer collects the best
+//! priority, then node name — JE Ranking has no term). The proposer collects
+//! the best
 //! proposal seen in Phase 1 promises and proposes that value in Phase 2,
 //! matching approach.
 //!
@@ -161,7 +162,7 @@ pub enum Phase2Value {
 ///  * Arbiter promises are never chosen as the value, but their ranking is
 ///    remembered for the RF=2 veto.
 ///  * Among non-arbiter, non-zero-priority promises the highest ranking wins
-///    (Proposal `Ord`: dtvlsn, then vlsn, then priority, then term, name — the
+///    (Proposal `Ord`: dtvlsn, then vlsn, then priority, then name — the
 ///    same total order JE's `Ranking.compareTo` + priority + socket tie-break
 ///    imposes).
 ///  * RF=2 veto `[#25311]`: if there is at most one non-arbiter candidate and
@@ -221,6 +222,116 @@ pub fn choose_phase2_value(promises: &[PromiseRecord]) -> Phase2Value {
                 return Phase2Value::ArbiterVeto;
             }
             Phase2Value::Value(value)
+        }
+    }
+}
+
+/// Phase-2 value chooser used by the proposer, selected at compile time.
+///
+/// Production (and every non-test build) uses [`choose_phase2_value`], the
+/// JE-faithful ranking `(dtvlsn, vlsn, priority, node_name)`.  Under `cfg(test)`
+/// a thread-local switch (`force_v7110_ranking`) lets a single proposer thread
+/// rank with the pre-fix, term-inclusive order `(dtvlsn, vlsn, priority, term,
+/// node_name)` — the behaviour of a not-yet-upgraded v7.11.0 node — so a
+/// mixed-version election can be exercised.  Paxos safety is enforced by the
+/// acceptor (promise/accept keying + value guard), not by the proposer's value
+/// ranking, so a mixed group must still elect at most one master.
+#[cfg(not(any(test, feature = "test-harness")))]
+#[inline]
+fn choose_phase2_value_for_round(promises: &[PromiseRecord]) -> Phase2Value {
+    choose_phase2_value(promises)
+}
+
+#[cfg(any(test, feature = "test-harness"))]
+fn choose_phase2_value_for_round(promises: &[PromiseRecord]) -> Phase2Value {
+    if test_support::v7110_ranking_enabled() {
+        test_support::choose_phase2_value_v7110(promises)
+    } else {
+        choose_phase2_value(promises)
+    }
+}
+
+/// Test-only support for the mixed-version (v7.11.0 ranking vs v7.11.1
+/// ranking) election safety witness.  Gated on `cfg(any(test, feature =
+/// "test-harness"))` (the crate's test-only, non-released surface), so it is
+/// compiled only for `cargo test` / the `test-harness` feature and never into
+/// a shipping build.
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-harness"))]
+pub mod test_support {
+    use super::{Phase2Value, PromiseRecord};
+    use std::cell::Cell;
+    use std::cmp::Ordering;
+
+    thread_local! {
+        static USE_V7110_RANKING: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Make the CURRENT thread's proposer rank its Phase-2 value with the
+    /// pre-fix v7.11.0 order (term BEFORE node name).  Scope it to the
+    /// proposer thread spawned for a single "old" node.
+    pub fn set_v7110_ranking(on: bool) {
+        USE_V7110_RANKING.with(|c| c.set(on));
+    }
+
+    pub(super) fn v7110_ranking_enabled() -> bool {
+        USE_V7110_RANKING.with(|c| c.get())
+    }
+
+    /// The pre-fix (v7.11.0) phase-2 value ranking: identical to the current
+    /// [`super::choose_phase2_value`] EXCEPT that it compares the extra `term`
+    /// key between `priority` and `node_name` (the exact tiebreak this fix
+    /// removed).  Used only to model a not-yet-upgraded node.
+    pub(super) fn choose_phase2_value_v7110(
+        promises: &[PromiseRecord],
+    ) -> Phase2Value {
+        // Same structure as choose_phase2_value, but ranks with the old
+        // (dtvlsn, vlsn, priority, term, node_name) order.
+        let old_cmp = |a: &super::Proposal, b: &super::Proposal| -> Ordering {
+            a.dtvlsn
+                .cmp(&b.dtvlsn)
+                .then_with(|| a.vlsn.cmp(&b.vlsn))
+                .then_with(|| a.priority.cmp(&b.priority))
+                .then_with(|| a.term.cmp(&b.term))
+                .then_with(|| a.node_name.cmp(&b.node_name))
+        };
+        let old_better = |a: &super::Proposal, b: &super::Proposal| {
+            old_cmp(a, b) == Ordering::Greater
+        };
+
+        let mut chosen: Option<super::Proposal> = None;
+        let mut arb_best: Option<super::Proposal> = None;
+        let mut non_arb_count = 0usize;
+
+        for p in promises {
+            if p.proposal.priority == 0 {
+                continue;
+            }
+            if p.is_arbiter {
+                match arb_best {
+                    Some(ref cur) if !old_better(&p.proposal, cur) => {}
+                    _ => arb_best = Some(p.proposal.clone()),
+                }
+                continue;
+            }
+            non_arb_count += 1;
+            match chosen {
+                Some(ref cur) if !old_better(&p.proposal, cur) => {}
+                _ => chosen = Some(p.proposal.clone()),
+            }
+        }
+
+        match chosen {
+            None => Phase2Value::NoNonZeroPriority,
+            Some(value) => {
+                if non_arb_count <= 1
+                    && let Some(ref arb) = arb_best
+                    && old_better(arb, &value)
+                {
+                    return Phase2Value::ArbiterVeto;
+                }
+                Phase2Value::Value(value)
+            }
         }
     }
 }
@@ -410,7 +521,7 @@ pub fn run_election_with_phi_dtvlsn(
     // JE-faithful value selection (RankingProposer.choosePhase2Value). The
     // RF=2 arbiter veto and the no-non-zero-priority case both yield no value,
     // which aborts this round (no master elected).
-    let winner_name = match choose_phase2_value(&promise_records) {
+    let winner_name = match choose_phase2_value_for_round(&promise_records) {
         Phase2Value::Value(p) => p.node_name,
         Phase2Value::ArbiterVeto => {
             log::warn!(
@@ -648,8 +759,9 @@ pub fn run_acceptor(
 /// The Paxos invariant is that an acceptor never accepts a proposal at a
 /// term lower than its highest promise.  The legacy `run_acceptor` keeps
 /// the promise in a local stack variable, which is lost across process
-/// restarts.  This variant calls `state.try_promise(t)` and
-/// `state.try_accept(t, master)` so every state change is fsynced before
+/// restarts.  This variant calls `state.try_promise(t, proposer)` and
+/// `state.try_accept(t, proposer, master)` so every state change is fsynced
+/// before
 /// the response goes back to the proposer.
 #[allow(clippy::too_many_arguments)]
 pub fn run_acceptor_with_state(
@@ -683,7 +795,7 @@ pub fn run_acceptor_with_state(
         None => return Ok(None),
     };
 
-    let phase1_term = match phase1 {
+    let (phase1_term, phase1_proposer) = match phase1 {
         ProtocolMessage::ElectionProposal {
             node_name: proposer,
             vlsn: _vlsn,
@@ -695,7 +807,10 @@ pub fn run_acceptor_with_state(
             // TLS peer identity before trusting it.  A rejection here returns
             // before any freeze is installed, so no thaw is needed.
             check_election_identity(channel, &proposer)?;
-            if state.try_promise(term) {
+            // FID-ELECT-1: the Paxos proposal number is `(term, proposer)`,
+            // JE's `ms_time|machineId|uniqueId` analogue, so two proposers
+            // sharing a local term value are disambiguated by name.
+            if state.try_promise_proposal(term, &proposer) {
                 // Freeze commit-VLSN advancement for the duration of this
                 // round: the VLSN/DTVLSN we are about to advertise in the
                 // Promise must still describe this node when the proposer
@@ -717,7 +832,7 @@ pub fn run_acceptor_with_state(
                         dtvlsn: own_dtvlsn,
                     },
                 )?;
-                term
+                (term, proposer)
             } else {
                 send_message(
                     channel,
@@ -761,15 +876,26 @@ pub fn run_acceptor_with_state(
             // thing it does on an election result
             // (`MasterChangeListener.java:49`).
             thaw(term.max(phase1_term));
-            // Accept iff the result term EXACTLY equals the term we promised
-            // in phase 1 (JE Acceptor.process(Accept): reject unless
-            // promisedProposal.compareTo(accept.getProposal()) == 0). A
-            // proposer that switched to a higher term mid-round (got a
-            // phase-1 promise at T1, then sent a phase-2 Accept at T2 > T1
-            // without a fresh phase 1) MUST be rejected — accepting it admits
-            // two proposers reaching phase-2 quorum at different terms, the
-            // classic split-brain failure mode.
-            if term == phase1_term && state.try_accept(term, &master) {
+            // Accept iff the Accept's proposal number EXACTLY equals the
+            // one we promised in phase 1 (JE Acceptor.process(Accept):
+            // reject unless promisedProposal.compareTo(accept.getProposal())
+            // == 0).  The proposal number is `(term, proposer)`
+            // (FID-ELECT-1), and the proposer is the phase-1 candidate on
+            // THIS session (`phase1_proposer`) — the `master` field of the
+            // ElectionResult is the VALUE (JE MasterValue), which may name a
+            // different winner than the proposer, so it is NOT part of the
+            // key.  A proposer that switched to a higher term mid-round (got
+            // a phase-1 promise at T1, then sent a phase-2 Accept at T2 > T1
+            // without a fresh phase 1) is rejected because `(T2, proposer)`
+            // != the promised `(T1, proposer)`; the explicit `term ==
+            // phase1_term` guard short-circuits that case before taking the
+            // flush lock.  Two concurrent proposers A and B at the same term
+            // on a shared acceptor cannot both be accepted: whichever
+            // re-promised last owns the promise, and the other's Accept
+            // carries a stale `(term, proposer)` number.
+            if term == phase1_term
+                && state.try_accept_proposal(term, &phase1_proposer, &master)
+            {
                 send_message(
                     channel,
                     &ProtocolMessage::ElectionVote {
@@ -1071,5 +1197,52 @@ mod tests {
         assert!(accepted.is_some());
         // Winner should be node2 (id=2) since it has higher VLSN.
         assert_eq!(winner, Some(2), "node2 should win with higher VLSN");
+    }
+
+    // Non-vacuity for the mixed-version witness: the v7.11.0 ranking toggle
+    // MUST change which tied candidate is chosen as the Phase-2 value, i.e.
+    // the two rankings genuinely differ.  Two candidates tied on
+    // (dtvlsn, vlsn, priority) with p-A at the higher term but the lower name:
+    //   * fixed (v7.11.1) ranking -> name decides -> p-B;
+    //   * old   (v7.11.0) ranking -> term decides -> p-A.
+    #[test]
+    fn v7110_ranking_toggle_changes_the_chosen_value() {
+        let records = vec![
+            PromiseRecord {
+                proposal: Proposal::with_timestamp("p-A".into(), 100, 1, 9, 0),
+                is_arbiter: false,
+            },
+            PromiseRecord {
+                proposal: Proposal::with_timestamp("p-B".into(), 100, 1, 1, 0),
+                is_arbiter: false,
+            },
+        ];
+        let fixed = match choose_phase2_value(&records) {
+            Phase2Value::Value(p) => p.node_name,
+            other => panic!("fixed: expected a value, got {other:?}"),
+        };
+        let old = match test_support::choose_phase2_value_v7110(&records) {
+            Phase2Value::Value(p) => p.node_name,
+            other => panic!("old: expected a value, got {other:?}"),
+        };
+        assert_eq!(fixed, "p-B", "fixed ranking: name breaks the tie (p-B)");
+        assert_eq!(old, "p-A", "old ranking: higher term wins (p-A)");
+        assert_ne!(fixed, old, "the two rankings must genuinely differ");
+
+        // And the thread-local switch routes choose_phase2_value_for_round to
+        // each one.
+        test_support::set_v7110_ranking(false);
+        let via_shim_new = match choose_phase2_value_for_round(&records) {
+            Phase2Value::Value(p) => p.node_name,
+            other => panic!("shim new: {other:?}"),
+        };
+        test_support::set_v7110_ranking(true);
+        let via_shim_old = match choose_phase2_value_for_round(&records) {
+            Phase2Value::Value(p) => p.node_name,
+            other => panic!("shim old: {other:?}"),
+        };
+        test_support::set_v7110_ranking(false);
+        assert_eq!(via_shim_new, "p-B");
+        assert_eq!(via_shim_old, "p-A");
     }
 }

@@ -7,7 +7,8 @@
 //! - [`ElectionConfig`]  -  tunable election parameters (timeout, retries,
 //!   priority, designated-primary).
 //! - [`Proposal`]  -  a candidate's election proposal, with ordering that
-//!   determines the winner (highest VLSN, then priority, then term, then name).
+//!   determines the winner (highest VLSN, then priority, then name — JE
+//!   Ranking has no term component).
 //! - [`Election`]  -  the election state machine: start, collect votes, evaluate
 //!   competing proposals, check quorum, and complete.
 //! - [`MasterTracker`]  -  tracks the current known master and heartbeat
@@ -22,6 +23,7 @@ pub mod master_tracker;
 pub mod paxos;
 pub mod phi_detector;
 pub mod proposal;
+pub(crate) mod proposal_generator;
 
 pub use acceptor_state::{AcceptorPersistError, PersistentAcceptorState};
 pub use election::{Election, ElectionOutcome, ElectionState};

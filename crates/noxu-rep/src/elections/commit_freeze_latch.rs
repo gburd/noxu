@@ -233,11 +233,12 @@ impl CommitFreezeLatch {
 /// Only the round matters to the latch. JE's `Proposal` comes from a
 /// `TimebasedProposalGenerator`, so it is monotone in round order — which is
 /// what `freeze`/`vlsnEvent` compare. Noxu's [`Proposal`] `Ord` is instead the
-/// *election ranking* order (dtvlsn, then vlsn, then priority, term, name): a
-/// laggard node's later round would compare as "older" under that order, and an
-/// arriving result would then fail to lift the freeze. Encoding the term in
-/// every dominant ranking key with a constant node name makes the comparison
-/// the latch performs exactly "order by election round".
+/// *election ranking* order (dtvlsn, then vlsn, then priority, name — the value
+/// ranking has no term key): a laggard node's later round would compare as
+/// "older" under that order, and an arriving result would then fail to lift the
+/// freeze. Encoding the round number into every dominant ranking key (dtvlsn
+/// AND vlsn) with a constant node name makes the comparison the latch performs
+/// exactly "order by election round".
 pub fn round_proposal(term: u64) -> Proposal {
     Proposal::with_timestamp(String::new(), term, 0, term, 0).with_dtvlsn(term)
 }

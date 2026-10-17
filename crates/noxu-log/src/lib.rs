@@ -57,6 +57,21 @@ pub mod fsync_manager;
 pub mod log_source;
 pub(crate) mod posio;
 
+/// Fsync a directory so a `creat`/`rename` of an entry within it survives a
+/// crash (POSIX requires a directory fsync after the entry change).
+///
+/// This re-exports the crate-internal [`posio::sync_dir`] helper — same Unix
+/// (`File::open(dir).sync_all()`) and Windows (`FILE_FLAG_BACKUP_SEMANTICS`,
+/// best-effort on `PermissionDenied`/`Unsupported`) semantics the log manager
+/// uses for its own directory-entry durability. Exposed `#[doc(hidden)] pub`
+/// so sibling crates (e.g. `noxu-rep`'s acceptor-state / VLSN-index atomic
+/// `write+rename` persisters) can get the same guarantee without duplicating
+/// the cross-platform handling. Additive, internal-tier; not released API.
+#[doc(hidden)]
+pub fn sync_dir(path: &std::path::Path) -> std::io::Result<()> {
+    posio::sync_dir(path)
+}
+
 // Buffer and log management
 pub mod log_buffer;
 pub mod log_buffer_pool;

@@ -37,7 +37,7 @@ fn acceptor_state_file_is_created_on_open() {
     // The file is only created when we make a promise.  Force one via
     // PersistentAcceptorState directly.
     let state = PersistentAcceptorState::load_or_default(&env_home);
-    assert!(state.try_promise(7));
+    assert!(state.try_promise_proposal(7, "n1"));
 
     let file = env_home.join("acceptor.state");
     assert!(file.exists(), "acceptor.state must be written");
@@ -72,7 +72,7 @@ fn promise_survives_restart_and_rejects_stale_term() {
         // force a promise.  This mirrors what the acceptor side does
         // when an ELECTION proposer connects.
         let state = PersistentAcceptorState::load_or_default(&env_home);
-        assert!(state.try_promise(10));
+        assert!(state.try_promise_proposal(10, "n1"));
         env.close().unwrap();
     }
 
@@ -87,7 +87,7 @@ fn promise_survives_restart_and_rejects_stale_term() {
         assert_eq!(state.promised_term(), 10);
         // Stale proposer at term 7 must be rejected.
         assert!(
-            !state.try_promise(7),
+            !state.try_promise_proposal(7, "n1"),
             "post-restart acceptor must reject term lower than persisted promise"
         );
         env.close().unwrap();

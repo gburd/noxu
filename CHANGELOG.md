@@ -124,6 +124,27 @@ user-facing scope, symptoms, and preconditions.
   commit, and NameLN commit/abort is classified by LSN order so transaction-id
   reuse across sessions is handled correctly.
 
+- **A crash after a Paxos acceptor persisted a promise/accept could revert it,
+  allowing two masters** (`F-ELECT8-E`, since v7.11.0): the acceptor wrote
+  `acceptor.state` with write + `sync_all` + `rename`, but never fsynced the
+  parent directory, so the rename's directory entry was not durable. After a
+  crash just after the rename, the directory could revert to the OLD
+  `acceptor.state`, losing a promise or accept the acceptor had already
+  acknowledged to a proposer. The restarted acceptor could then promise or
+  accept a strictly LOWER proposal, letting a stale proposer win a second
+  majority and become a second master at the same effective term — a Paxos
+  safety violation (split-brain), which can diverge and lose committed data.
+  JE never persists the acceptor promise at all (`Acceptor.promisedProposal` is
+  an in-memory field, `Acceptor.java:46`) and makes no restart guarantee; Noxu
+  deliberately persists it for crash safety, so the missing directory fsync
+  made that guarantee false. Fixed by fsyncing the parent directory after the
+  rename (reusing `noxu-log`'s `sync_dir` helper, same Unix/Windows semantics
+  the log manager uses). The identical missing-dir-fsync in the VLSN-index
+  persister (`vlsn.idx`, both the full and checkpoint-capped write paths) is
+  fixed the same way. Witnessed by a deterministic RED/GREEN unit test and, on
+  Linux where `strace` is present, a syscall-level crash-consistency assertion
+  that an `fsync` of the parent directory follows the `rename`.
+
 ### Fixed — isolation
 
 - **Cursor scans dirty-read an uncommitted delete / insert-abort**
@@ -264,6 +285,27 @@ recorded here for completeness.
   persistence, secondary-index, lock-manager, and environment-drop paths are
   fixed.
 
+- **Election value ranking dropped a non-JE `term` tiebreak** (`FID-ELECT-1`
+  follow-up): the `Proposal` ordering that selects the Phase-2 election value
+  (`choose_phase2_value`, JE `RankingProposer.choosePhase2Value`) ranked
+  candidates by `(dtvlsn, vlsn, priority, term, node_name)`. JE's value ranking
+  is only `(dtvlsn, vlsn)` (`Acceptor.SuggestionGenerator.Ranking.compareTo`,
+  `Acceptor.java:305-311`) plus the `RankingProposer` priority and socket-address
+  tiebreaks (`RankingProposer.java:105-128`) — it has **no term component**.
+  The extra `term` tiebreak let each concurrent proposer's own live round term
+  out-rank a peer's equally-good suggestion (which carries the peer's stale
+  acceptor term), so two tied candidates each picked THEMSELVES: a
+  value-selection duel. The interim `(term, proposer)` acceptor keying and value
+  guard already prevented this from becoming two masters, but it was a
+  convergence/liveness risk and a fidelity deviation (owner directive: Noxu
+  leader election mirrors JE in all ways except quoracle). The `term` tiebreak
+  is removed; the ranking is now exactly JE's `(dtvlsn, vlsn, priority, <final
+  tiebreak>)`. On v7.11.1 the final tiebreak remains the lexicographic
+  `node_name` (a stable, per-group-unique identity); JE's exact final tiebreak
+  is the socket address, deferred to v8.0.0 — see *Known issues*
+  (`FID-ELECT-RANK-ADDR`, `FID-ELECT-LEARNER`). No on-disk, wire, or public-API
+  change.
+
 ### Fixed — internal crates (no stability guarantee)
 
 The internal-tier crates (`noxu-cleaner`, `noxu-dbi`, `noxu-engine`,
@@ -293,6 +335,27 @@ Stable-foundational crates are unchanged at the public-API level
   accounting** (`MEMBUDGET-NODE-HEAP`), **NEW-PHANTOM-ABORT-1** (a blocked
   getNext/getPrev dirty-reads a concurrent uncommitted write and does not
   re-resolve on abort) remain tracked for v8.0.0.
+- **FID-ELECT-RANK-ADDR** — the election VALUE-ranking final tiebreak (on an
+  exact `(dtvlsn, vlsn, priority)` tie) is the lexicographic `node_name`, not
+  JE's socket address (`RankingProposer.java:110-131`, `me.target.toString()`
+  keep-greatest). Both are deterministic, consistent total orders — no
+  split-brain — but on an exact tie they can select a different master than JE
+  when node-name order ≠ socket-address order. Switching to the address is a
+  purely-local change (the proposer resolves the dialed address from its own
+  group view; no wire/`Proposal`/persisted change), but on v7.11.1 it would
+  reintroduce a liveness stall (see `FID-ELECT-LEARNER`), so it is deferred to
+  v8.0.0, where the exact JE `InetSocketAddress.toString()` key is applied.
+- **FID-ELECT-LEARNER** — Noxu has no JE Learner broadcast
+  (`Elections.informLearners` → `Learner.processResult` →
+  `MasterChangeListener`, `Learner.java:141,496`). The election driver acts
+  only when `winner == self`, so a chosen Phase-2 value that is NOT the
+  proposing node (e.g. the proposer defers to a higher-priority or
+  higher-address peer) never activates as master — the election stalls. JE
+  makes the chosen node master on every node via the learner broadcast,
+  regardless of who proposed. Adding a Result/learner wire message is not
+  patch-safe (a new protocol message), so the Learner protocol lands in
+  v8.0.0. A ready `#[ignore]`d witness is committed
+  (`tests/fid_elect_learner_stall.rs`).
 
 
 ## [7.11.0] - 2026-09-28

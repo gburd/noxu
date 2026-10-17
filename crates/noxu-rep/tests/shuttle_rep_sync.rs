@@ -245,15 +245,13 @@ fn vlsn_concurrent_put_get_monotone() {
 /// accepted master (if any) matches the accepted term, and the accepted term
 /// never exceeds the promised term.
 ///
-/// NOTE: this test deliberately does NOT assert the single-acceptor
-/// "one-master-per-term" property, because `PersistentAcceptorState` tracks
-/// only the *term* (not the full Paxos proposal / ballot the way JE's
-/// `Acceptor.process` compares `promisedProposal.compareTo(...)`), and its
-/// `try_promise` uses `t >= promised` (permitting a same-term re-promise). A
-/// same-term-different-master race is therefore outside the protocol's valid
-/// executions (the spec rules it out structurally) and outside this model's
-/// tracked state. See `.agent/archived-audits/dst-rep-sync-acceptor-term-
-/// fidelity.md` for the fidelity note this gate surfaced.
+/// NOTE: with FID-ELECT-1 fixed, `PersistentAcceptorState` keys the
+/// promise/accept on the full `(term, proposer)` proposal number (JE's
+/// `Acceptor.process` compares the whole `promisedProposal`), so a
+/// same-term-different-proposer race can no longer accept two masters.  Each
+/// proposer below uses its own name as the proposer identity, so this model
+/// now also exercises (not just assumes) the one-master guard under the
+/// cooperative scheduler.
 #[test]
 fn acceptor_concurrent_vote_accept_once() {
     shuttle::check_random(
@@ -267,9 +265,11 @@ fn acceptor_concurrent_vote_accept_once() {
                 let acceptor = Arc::clone(&acceptor);
                 let outcomes = Arc::clone(&outcomes);
                 shuttle::thread::spawn(move || {
-                    let promised = acceptor.try_promise(term);
-                    let accepted =
-                        promised && acceptor.try_accept(term, master);
+                    // The proposer identity is the proposer's own name
+                    // (it proposes itself as master).
+                    let promised = acceptor.try_promise_proposal(term, master);
+                    let accepted = promised
+                        && acceptor.try_accept_proposal(term, master, master);
                     outcomes.lock().unwrap().push((term, master, accepted));
                 })
             };
@@ -340,6 +340,58 @@ fn acceptor_concurrent_vote_accept_once() {
     );
 }
 
+/// FID-ELECT-1 (concurrent split-brain witness): two DIFFERENT proposers that
+/// both drive the SAME term race one shared acceptor.  With the
+/// `(term, proposer)` proposal number the acceptor can accept AT MOST ONE of
+/// them — whichever re-promised last owns the promise, and the other's Accept
+/// carries a stale `(term, proposer)` that fails the equality gate.  Under the
+/// buggy bare-term key BOTH could be accepted (the auditor's L2).  This is the
+/// cooperative-scheduler analogue of the auditor's two-session witness.
+#[test]
+fn acceptor_same_term_two_proposers_at_most_one_accepted() {
+    shuttle::check_random(
+        || {
+            let acceptor = Arc::new(PersistentAcceptorState::in_memory());
+            let outcomes: Arc<Mutex<Vec<(&'static str, bool)>>> =
+                Arc::new(Mutex::new(Vec::new()));
+
+            // Both proposers use term 1 (as every node's driver once did),
+            // with distinct proposer identities.
+            let spawn = |proposer: &'static str| {
+                let acceptor = Arc::clone(&acceptor);
+                let outcomes = Arc::clone(&outcomes);
+                shuttle::thread::spawn(move || {
+                    let ok = acceptor.try_promise_proposal(1, proposer)
+                        && acceptor.try_accept_proposal(1, proposer, proposer);
+                    outcomes.lock().unwrap().push((proposer, ok));
+                })
+            };
+            let a = spawn("node-A");
+            let b = spawn("node-B");
+            a.join().unwrap();
+            b.join().unwrap();
+
+            let outs = outcomes.lock().unwrap();
+            let accepted: Vec<&str> =
+                outs.iter().filter(|(_, ok)| *ok).map(|(m, _)| *m).collect();
+            // At most one proposer may be accepted at term 1 (JE
+            // one-winner-per-proposal-number).  Never both -> no split brain.
+            assert!(
+                accepted.len() <= 1,
+                "FID-ELECT-1: two proposers both accepted at term 1: {accepted:?}"
+            );
+            // The acceptor's recorded master, if any, is the accepted one and
+            // the accepted term is 1.
+            let (_pterm, aterm, amaster) = acceptor.snapshot();
+            if let Some(m) = amaster.as_deref() {
+                assert_eq!(aterm, 1);
+                assert!(accepted.contains(&m));
+            }
+        },
+        ITERATIONS,
+    );
+}
+
 /// A stale proposer at a LOWER term racing a fresh proposer at a higher term.
 /// The acceptor must never let the stale proposer's promise/accept clobber the
 /// higher-term promise (promise-monotone + accept-implies-promise). This is the
@@ -355,8 +407,8 @@ fn acceptor_stale_proposer_never_regresses_promise() {
             let fresh = {
                 let acceptor = Arc::clone(&acceptor);
                 shuttle::thread::spawn(move || {
-                    if acceptor.try_promise(10) {
-                        acceptor.try_accept(10, "fresh");
+                    if acceptor.try_promise_proposal(10, "fresh") {
+                        acceptor.try_accept_proposal(10, "fresh", "fresh");
                     }
                 })
             };
@@ -364,8 +416,8 @@ fn acceptor_stale_proposer_never_regresses_promise() {
             let stale = {
                 let acceptor = Arc::clone(&acceptor);
                 shuttle::thread::spawn(move || {
-                    let _ = acceptor.try_promise(4);
-                    let _ = acceptor.try_accept(4, "stale");
+                    let _ = acceptor.try_promise_proposal(4, "stale");
+                    let _ = acceptor.try_accept_proposal(4, "stale", "stale");
                 })
             };
 
