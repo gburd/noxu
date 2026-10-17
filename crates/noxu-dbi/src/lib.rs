@@ -58,7 +58,7 @@ pub use database_impl::{DatabaseImpl, DatabaseTree};
 // write latch to the ABBA witness without a direct noxu-tree dependency.
 pub use noxu_tree::{NodeRwLock, TreeNode};
 
-pub use db_backup::DbBackup;
+pub use db_backup::{DbBackup, DbBackupRegistry};
 pub use db_tree::DbTree;
 pub use db_type::DbType;
 pub use dbi_config::DbiEnvConfig;

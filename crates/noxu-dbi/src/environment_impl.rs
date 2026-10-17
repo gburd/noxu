@@ -459,6 +459,14 @@ pub struct EnvironmentImpl {
     /// (extended fork).
     extinction_scanner: Mutex<noxu_cleaner::ExtinctionScanner>,
 
+    /// FID-BACKUP-2: registry of open DbBackups + a backup-prohibited
+    /// flag, mirroring JE `RepImpl.backups` / `backupProhibited`. A
+    /// replication rollback (`execute_rollback`) calls
+    /// `invalidate_backups` / `set_backup_prohibited` so a backup whose
+    /// file set was overwritten fails `end_backup`
+    /// (JE `LogOverwriteException`).
+    backup_registry: Arc<crate::db_backup::DbBackupRegistry>,
+
     /// Automatic backup manager.
     ///
     /// Per-file utilization tracker shared between the LogManager write path
@@ -668,6 +676,50 @@ impl EnvironmentImpl {
                     ),
                 }
             })?;
+        }
+
+        // FID-NR-1 (JE RestoreMarker + EnvironmentImpl open-time check): if a
+        // RestoreRequired marker is present, a prior network restore (or other
+        // curative action) left the log incoherent and did not complete. JE's
+        // recovery reads the <MAXINT>.jdb marker first and throws, refusing to
+        // open. Noxu checks for the marker up front and refuses with the
+        // existing RecoveryFailure variant, carrying the recorded failure type
+        // and diagnostics so the operator knows to (re)run the restore.
+        if let Some(rr) =
+            noxu_log::read_marker_file(&env_home).map_err(|e| {
+                DbiError::RecoveryFailure {
+                    reason: format!(
+                        "environment requires restore but the marker could \
+                         not be read: {e}"
+                    ),
+                }
+            })?
+        {
+            let mut detail = String::new();
+            let mut keys: Vec<&String> = rr.properties.keys().collect();
+            keys.sort();
+            for k in keys {
+                if let Some(v) = rr.properties.get(k) {
+                    detail.push_str(&format!(" {k}={v}"));
+                }
+            }
+            return Err(DbiError::RecoveryFailure {
+                reason: format!(
+                    "environment requires restore ({}): a prior {} did not \
+                     complete; the log is incoherent. Re-run the restore to \
+                     completion, then reopen.{}",
+                    rr.failure_type.as_str(),
+                    match rr.failure_type {
+                        noxu_log::entry::restore_required::FailureType::NetworkRestore =>
+                            "network restore",
+                        noxu_log::entry::restore_required::FailureType::LogChecksum =>
+                            "log-checksum repair",
+                        noxu_log::entry::restore_required::FailureType::BtreeCorruption =>
+                            "b-tree repair",
+                    },
+                    detail,
+                ),
+            });
         }
 
         // Trees recovered from the log, keyed by database ID.
@@ -1928,6 +1980,9 @@ impl EnvironmentImpl {
             data_eraser: Mutex::new(noxu_cleaner::DataEraser::new()),
             extinction_scanner: Mutex::new(
                 noxu_cleaner::ExtinctionScanner::new(),
+            ),
+            backup_registry: Arc::new(
+                crate::db_backup::DbBackupRegistry::default(),
             ),
             utilization_tracker,
             cache_usage,
@@ -3775,13 +3830,70 @@ impl EnvironmentImpl {
                     .to_string(),
             }
         })?;
-        let file_manager = self
-            .get_log_manager()
-            .map(|lm| Arc::clone(lm.file_manager()))
-            .ok_or_else(|| DbiError::EnvironmentFailure {
+        let log_manager = self.get_log_manager().ok_or_else(|| {
+            DbiError::EnvironmentFailure {
                 reason: "backup requires a log manager".to_string(),
-            })?;
-        crate::DbBackup::start_backup(file_protector, file_manager)
+            }
+        })?;
+        let file_manager = Arc::clone(log_manager.file_manager());
+        // FID-BACKUP-1: pass the log manager so start_backup can log the
+        // immutable-file marker and flip the log, sealing the last file in
+        // the backup set (JE DbBackup.startBackup, DbBackup.java:534).
+        // FID-BACKUP-2: pass the backup registry so a concurrent
+        // replication rollback can invalidate this backup
+        // (JE RepImpl.addDbBackup / invalidateBackups).
+        crate::DbBackup::start_backup(
+            file_protector,
+            file_manager,
+            Some(log_manager),
+            Some(Arc::clone(&self.backup_registry)),
+        )
+    }
+
+    /// Returns the backup registry (JE `RepImpl.backups`). The
+    /// replication rollback path uses it to invalidate open backups and
+    /// prohibit new ones for the duration of a rollback.
+    ///
+    /// JE: `RepImpl.invalidateBackups` / `setBackupProhibited`.
+    pub fn backup_registry(&self) -> &Arc<crate::db_backup::DbBackupRegistry> {
+        &self.backup_registry
+    }
+
+    /// Starts a *network-restore* backup: pins the active log-file set against
+    /// cleaner deletion, logs the immutable-file marker, and flips the log so
+    /// the last file in the set is sealed, returning a [`DbBackup`] the
+    /// restore SERVER holds while it streams the set.
+    ///
+    /// FID-NR-8 (JE `LogFileFeeder.sendFileList`, `LogFileFeeder.java:443`:
+    /// `dbBackup.setNetworkRestore(); dbBackup.startBackup();`). The restore
+    /// server must protect the files it is streaming so a concurrent cleaner
+    /// cannot delete or truncate a file mid-send.
+    ///
+    /// # Errors
+    /// Returns [`DbiError::EnvironmentFailure`] if the environment has no
+    /// cleaner/file-protector or no log manager, or (JE `LogOverwriteException`)
+    /// if a replication rollback currently prohibits backups.
+    pub fn start_network_restore_backup(
+        &self,
+    ) -> Result<crate::DbBackup, DbiError> {
+        let file_protector = self.get_file_protector().ok_or_else(|| {
+            DbiError::EnvironmentFailure {
+                reason: "network restore requires a running cleaner"
+                    .to_string(),
+            }
+        })?;
+        let log_manager = self.get_log_manager().ok_or_else(|| {
+            DbiError::EnvironmentFailure {
+                reason: "network restore requires a log manager".to_string(),
+            }
+        })?;
+        let file_manager = Arc::clone(log_manager.file_manager());
+        crate::DbBackup::start_network_restore_backup(
+            file_protector,
+            file_manager,
+            Some(log_manager),
+            Some(Arc::clone(&self.backup_registry)),
+        )
     }
 
     /// Returns the checkpointer, if one was created.

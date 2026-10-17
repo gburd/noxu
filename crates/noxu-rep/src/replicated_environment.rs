@@ -1506,17 +1506,22 @@ impl ReplicatedEnvironment {
         // DatabaseConfig::replicated correctly.
         env.set_replicated(true);
 
-        // Register RESTORE service lazily if not already done.
-        if !self.restore_registered.load(Ordering::SeqCst)
-            && let Some(ref dispatcher) = self.tcp_dispatcher
-        {
+        // FID-NR-8: (re)register the RESTORE service with a server WIRED to
+        // the live environment, so the files it streams are protected from
+        // the cleaner for the duration of each restore (JE LogFileFeeder
+        // holds a DbBackup, LogFileFeeder.java:443). This overwrites any
+        // unprotected server registered eagerly at construction time (before
+        // the env existed), so production restores always run under cleaner
+        // protection.
+        if let Some(ref dispatcher) = self.tcp_dispatcher {
             let env_home = env.get_env_home().to_path_buf();
-            let restore_server = NetworkRestoreServer::new(env_home.clone());
+            let restore_server =
+                NetworkRestoreServer::with_environment(Arc::clone(&env));
             dispatcher.register(RESTORE_SERVICE_NAME, Arc::new(restore_server));
             self.restore_registered.store(true, Ordering::SeqCst);
             log::debug!(
                 "Node '{}' RESTORE service registered via with_environment \
-                 (env_home={})",
+                 with cleaner protection (env_home={})",
                 self.config.node_name,
                 env_home.display(),
             );
@@ -2407,13 +2412,30 @@ impl ReplicatedEnvironment {
             && matchpoint_lsn != 0
         {
             let mp_lsn = noxu_util::Lsn::from_u64(matchpoint_lsn);
+
+            // FID-BACKUP-2 (JE Replay.rollback -> RepImpl.setBackupProhibited
+            // + invalidateBackups, RepImpl.java:1957/1967): a rollback is
+            // about to overwrite log files, so refuse any NEW backup for the
+            // duration and invalidate every OPEN backup whose file set this
+            // rollback overwrites. The rollback starts at the lowest file
+            // number touched (the matchpoint file / the first rolled-back
+            // LSN). JE passes DbLsn.getFileNumber(matchpointLsn).
+            let rollback_file = rollback_lsns
+                .iter()
+                .map(|l| l.file_number())
+                .min()
+                .unwrap_or_else(|| mp_lsn.file_number());
+            let registry = env.backup_registry();
+            registry.set_backup_prohibited(true);
+            registry.invalidate_backups(rollback_file);
+
             // active_txn_ids: the harness/VLSN-index model has no live txn
             // table here; the durable RollbackStart records an empty set, and
             // the per-txn gating (REP-1 STEP 2) applies during recovery when
             // the analysis pass rebuilds the active set. A future pass can
             // thread the live ReplayTxn ids through (JE
             // localActiveTxns.keySet()).
-            noxu_recovery::rollback(
+            let rb = noxu_recovery::rollback(
                 &log_mgr,
                 noxu_util::Vlsn::new(matchpoint_vlsn as i64),
                 mp_lsn,
@@ -2424,7 +2446,13 @@ impl ReplicatedEnvironment {
                 RepError::DatabaseError(format!(
                     "live rollback to matchpoint failed: {e}"
                 ))
-            })?;
+            });
+
+            // Re-enable backups once the rollback's log overwrites are done
+            // (JE setBackupProhibited(false)), whether the rollback succeeded
+            // or failed, before surfacing any error.
+            registry.set_backup_prohibited(false);
+            rb?;
         }
 
         // JE vlsnIndex.truncateFromTail(startVLSN, matchpointLSN): drop the

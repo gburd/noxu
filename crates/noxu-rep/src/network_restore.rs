@@ -8,9 +8,12 @@
 
 use std::io::{Read as IoRead, Write as IoWrite};
 use std::net::TcpStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use noxu_log::create_marker_file;
+use noxu_log::entry::restore_required::FailureType;
+use noxu_log::remove_marker_file;
 use noxu_sync::Mutex;
 
 use crate::error::{RepError, Result};
@@ -19,6 +22,14 @@ use crate::error::{RepError, Result};
 ///
 /// 4-byte little-endian value: `0x4E52_5354` ('N','R','S','T').
 const RESTORE_MAGIC: u32 = 0x4E52_5354;
+
+/// FID-NR-2 test hook: when set on a `NetworkRestore`, `execute_via_dispatcher`
+/// simulates a crash AFTER writing the `.tmp` file but BEFORE the atomic
+/// rename, so a witness can prove the final `.ndb` is never a torn/partial
+/// file. Per-instance (not a global) so parallel tests do not interfere.
+/// Compiled only in test builds; absent from production.
+#[cfg(test)]
+use std::sync::atomic::AtomicBool as TestCrashFlag;
 
 /// Configuration for a network restore operation.
 ///
@@ -77,6 +88,9 @@ pub struct NetworkRestore {
     ///
     /// If `None`, files are written to the process's current directory.
     local_log_dir: Option<PathBuf>,
+    /// FID-NR-2 per-instance crash hook (test builds only).
+    #[cfg(test)]
+    crash_before_rename: TestCrashFlag,
 }
 
 /// Validate a server-supplied filename before it is joined with the local
@@ -144,7 +158,17 @@ impl NetworkRestore {
                 elapsed: Duration::ZERO,
             }),
             local_log_dir: None,
+            #[cfg(test)]
+            crash_before_rename: TestCrashFlag::new(false),
         }
+    }
+
+    /// FID-NR-2 test hook setter: arm the simulated crash before the atomic
+    /// rename (test builds only).
+    #[cfg(test)]
+    pub(crate) fn arm_crash_before_rename(&self) {
+        self.crash_before_rename
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Set the local directory where restored `.ndb` files will be written.
@@ -237,6 +261,17 @@ impl NetworkRestore {
 
         let mut total_bytes: u64 = 0;
         let mut files_done: u32 = 0;
+        // FID-NR-4: track the restored file names so residual local files not
+        // in the set can be disposed after the transfer.
+        let mut restored_set: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
+        // FID-NR-1: fence the environment BEFORE mutating any local log file.
+        // A crash from here until the marker is removed (after the full set
+        // transfers) leaves the marker in place, so reopening the env refuses.
+        if file_count > 0 {
+            self.write_restore_marker(&log_dir)?;
+        }
 
         for _ in 0..file_count {
             // Read filename length + name.
@@ -275,19 +310,30 @@ impl NetworkRestore {
             let file_size = u64::from_le_bytes(size_buf);
 
             // Determine destination path.
-            // If `retain_log_files` is set and the file already exists,
-            // rename the existing file before writing the new one.
             let dest_path = log_dir.join(&filename);
-            if self.config.retain_log_files && dest_path.exists() {
-                let backup = log_dir.join(format!("{}.bak", filename));
-                let _ = std::fs::rename(&dest_path, &backup);
+
+            // FID-NR-2 (JE NetworkBackup.getFile, NetworkBackup.java:575):
+            // write the incoming bytes to a `.tmp` file and atomically rename
+            // it onto the final name ONLY after the digest verifies. A crash
+            // mid-write then leaves a `.tmp` file, never a truncated/garbage
+            // live `.ndb` log file that recovery would read.
+            let tmp_path = log_dir.join(format!("{}.tmp", filename));
+            // Delete a stale tmp if one exists (JE deletes N.jdb.tmp first).
+            if tmp_path.exists() {
+                std::fs::remove_file(&tmp_path).map_err(|e| {
+                    RepError::NetworkRestoreError(format!(
+                        "deleting stale tmp '{}': {}",
+                        tmp_path.display(),
+                        e
+                    ))
+                })?;
             }
 
-            // Stream file bytes directly to disk in 64 KiB chunks.
-            let mut out = std::fs::File::create(&dest_path).map_err(|e| {
+            // Stream file bytes to the tmp file in 64 KiB chunks.
+            let mut out = std::fs::File::create(&tmp_path).map_err(|e| {
                 RepError::NetworkRestoreError(format!(
                     "creating '{}': {}",
-                    dest_path.display(),
+                    tmp_path.display(),
                     e
                 ))
             })?;
@@ -310,7 +356,7 @@ impl NetworkRestore {
                 out.write_all(&chunk[..to_read]).map_err(|e| {
                     RepError::NetworkRestoreError(format!(
                         "writing '{}': {}",
-                        dest_path.display(),
+                        tmp_path.display(),
                         e
                     ))
                 })?;
@@ -328,14 +374,43 @@ impl NetworkRestore {
             let want = u32::from_le_bytes(crc_buf);
             let got = digest.finalize();
             if want != got {
-                let _ = std::fs::remove_file(&dest_path);
+                let _ = std::fs::remove_file(&tmp_path);
                 return Err(RepError::NetworkRestoreError(format!(
                     "digest mismatch for '{}': expected {:#010x}, got {:#010x}                      (file corrupted or truncated in transit)",
                     filename, want, got
                 )));
             }
 
+            // FID-NR-2: fsync the tmp file, then atomically rename it onto the
+            // final name. The rename is the single commit point; before it the
+            // final `.ndb` does not exist (or still holds the previous
+            // contents), so a crash can never leave a torn live log file.
+            out.sync_all().map_err(|e| {
+                RepError::NetworkRestoreError(format!(
+                    "fsync '{}': {}",
+                    tmp_path.display(),
+                    e
+                ))
+            })?;
+            drop(out);
+            // FID-NR-3 (JE NetworkBackup.getFile: disposeObsoleteFiles(file)
+            // before renameTo, NetworkBackup.java:720): dispose this file and
+            // all higher-numbered local log files, highest-first, so an
+            // interrupted multi-file replace leaves a consistent prefix.
+            if let Some(num) = Self::parse_restore_file_number(&filename) {
+                self.dispose_obsolete_files(&log_dir, num)?;
+            }
+            std::fs::rename(&tmp_path, &dest_path).map_err(|e| {
+                RepError::NetworkRestoreError(format!(
+                    "renaming '{}' -> '{}': {}",
+                    tmp_path.display(),
+                    dest_path.display(),
+                    e
+                ))
+            })?;
+
             files_done += 1;
+            restored_set.insert(filename.clone());
             self.update_progress(total_bytes, files_done);
             self.update_elapsed(started_at.elapsed());
 
@@ -344,6 +419,20 @@ impl NetworkRestore {
                 filename,
                 file_size
             );
+        }
+
+        // FID-NR-4: dispose any residual local .ndb file not in the restored
+        // set, then verify the set is complete (JE cleanup, before
+        // removeMarkerFile).
+        if file_count > 0 {
+            self.cleanup_residual_files(&log_dir, &restored_set)?;
+        }
+
+        // FID-NR-1: the full set transferred coherently — remove the marker so
+        // the environment is openable again (JE removeMarkerFile after the
+        // whole backup finishes).
+        if file_count > 0 {
+            self.remove_restore_marker(&log_dir)?;
         }
 
         self.update_elapsed(started_at.elapsed());
@@ -466,6 +555,14 @@ impl NetworkRestore {
         let mut files_done: u32 = 0;
         let mut buf2 = [0u8; 2];
         let mut buf8 = [0u8; 8];
+        // FID-NR-4: track restored file names for residual cleanup.
+        let mut restored_set: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
+        // FID-NR-1: fence the environment BEFORE mutating any local log file.
+        if file_count > 0 {
+            self.write_restore_marker(&log_dir)?;
+        }
 
         for _ in 0..file_count {
             if off + 2 > payload.len() {
@@ -521,14 +618,60 @@ impl NetworkRestore {
             }
 
             let dest_path = log_dir.join(&filename);
-            if self.config.retain_log_files && dest_path.exists() {
-                let backup = log_dir.join(format!("{}.bak", filename));
-                let _ = std::fs::rename(&dest_path, &backup);
-            }
 
-            std::fs::write(&dest_path, body).map_err(|e| {
+            // FID-NR-2 (JE NetworkBackup.getFile, NetworkBackup.java:575):
+            // write to a `.tmp` file, fsync, then atomically rename onto the
+            // final name, so a crash can never leave a torn live `.ndb`.
+            // (The CRC was already verified in RAM above; the tmp+rename adds
+            // the on-disk atomicity.)
+            let tmp_path = log_dir.join(format!("{}.tmp", filename));
+            {
+                use std::io::Write as _;
+                let mut f = std::fs::File::create(&tmp_path).map_err(|e| {
+                    RepError::NetworkRestoreError(format!(
+                        "creating '{}': {}",
+                        tmp_path.display(),
+                        e
+                    ))
+                })?;
+                f.write_all(body).map_err(|e| {
+                    RepError::NetworkRestoreError(format!(
+                        "writing '{}': {}",
+                        tmp_path.display(),
+                        e
+                    ))
+                })?;
+                f.sync_all().map_err(|e| {
+                    RepError::NetworkRestoreError(format!(
+                        "fsync '{}': {}",
+                        tmp_path.display(),
+                        e
+                    ))
+                })?;
+            }
+            // FID-NR-2 crash witness: simulate a crash after the tmp file is
+            // durable but before the atomic rename. The final `.ndb` must not
+            // exist (or be left torn); only the `.tmp` is on disk.
+            #[cfg(test)]
+            if self
+                .crash_before_rename
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(RepError::NetworkRestoreError(
+                    "simulated crash before rename (FID-NR-2 witness)"
+                        .to_string(),
+                ));
+            }
+            // FID-NR-3 (JE NetworkBackup.getFile: disposeObsoleteFiles(file)
+            // before renameTo, NetworkBackup.java:720): dispose this file and
+            // all higher-numbered local log files, highest-first.
+            if let Some(num) = Self::parse_restore_file_number(&filename) {
+                self.dispose_obsolete_files(&log_dir, num)?;
+            }
+            std::fs::rename(&tmp_path, &dest_path).map_err(|e| {
                 RepError::NetworkRestoreError(format!(
-                    "writing '{}': {}",
+                    "renaming '{}' -> '{}': {}",
+                    tmp_path.display(),
                     dest_path.display(),
                     e
                 ))
@@ -536,8 +679,19 @@ impl NetworkRestore {
             off += file_size + 4;
             total_bytes += file_size as u64;
             files_done += 1;
+            restored_set.insert(filename.clone());
             self.update_progress(total_bytes, files_done);
             self.update_elapsed(started_at.elapsed());
+        }
+
+        // FID-NR-4: dispose residual local .ndb files not in the restored set.
+        if file_count > 0 {
+            self.cleanup_residual_files(&log_dir, &restored_set)?;
+        }
+
+        // FID-NR-1: the full set transferred coherently — remove the marker.
+        if file_count > 0 {
+            self.remove_restore_marker(&log_dir)?;
         }
 
         self.update_elapsed(started_at.elapsed());
@@ -595,10 +749,200 @@ impl NetworkRestore {
         progress.files_transferred = files;
     }
 
+    /// FID-NR-3 (JE `NetworkBackup.disposeObsoleteFiles`,
+    /// `NetworkBackup.java:720`): rename-to-`.bak` (or delete) this log file
+    /// and every higher-numbered local log file, **highest-numbered first**,
+    /// so the integrity of the log files in the directory is always preserved
+    /// even if the dispose is itself interrupted. An interrupted multi-file
+    /// replace then leaves a consistent lower prefix rather than a gap. The
+    /// restore marker is a non-`.ndb` file and is therefore never considered
+    /// (JE explicitly skips the marker so it survives until the whole restore
+    /// finishes).
+    ///
+    /// `start_file_num` is the lowest-numbered file that must be disposed (the
+    /// incoming file being placed). A failed rename/delete ERRORS
+    /// (JE EFE.unexpectedState; see FID-NR-7).
+    fn dispose_obsolete_files(
+        &self,
+        log_dir: &Path,
+        start_file_num: u32,
+    ) -> Result<()> {
+        // Collect existing local .ndb files with their numbers.
+        let mut nums: Vec<u32> = Vec::new();
+        let rd = std::fs::read_dir(log_dir).map_err(|e| {
+            RepError::NetworkRestoreError(format!(
+                "listing log dir {} for obsolete-file disposal: {}",
+                log_dir.display(),
+                e
+            ))
+        })?;
+        for entry in rd {
+            let entry = entry.map_err(|e| {
+                RepError::NetworkRestoreError(format!(
+                    "reading a directory entry in {}: {}",
+                    log_dir.display(),
+                    e
+                ))
+            })?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some(stem) = name.strip_suffix(".ndb")
+                && let Ok(num) = u32::from_str_radix(stem, 16)
+            {
+                nums.push(num);
+            }
+        }
+        // Highest-numbered first, down to start_file_num.
+        nums.sort_unstable();
+        for &num in nums.iter().rev() {
+            if num < start_file_num {
+                break;
+            }
+            let name = format!("{num:08x}.ndb");
+            let path = log_dir.join(&name);
+            if self.config.retain_log_files {
+                let backup = log_dir.join(format!("{name}.bak"));
+                // FID-NR-7: a failed rename must error, not be swallowed.
+                std::fs::rename(&path, &backup).map_err(|e| {
+                    RepError::NetworkRestoreError(format!(
+                        "disposing obsolete log file: could not rename '{}' \
+                         to '{}': {}",
+                        path.display(),
+                        backup.display(),
+                        e
+                    ))
+                })?;
+            } else {
+                std::fs::remove_file(&path).map_err(|e| {
+                    RepError::NetworkRestoreError(format!(
+                        "disposing obsolete log file: could not delete '{}': {}",
+                        path.display(),
+                        e
+                    ))
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Parse the `u32` log-file number from a `NNNNNNNN.ndb` basename.
+    fn parse_restore_file_number(filename: &str) -> Option<u32> {
+        let stem = filename.strip_suffix(".ndb")?;
+        u32::from_str_radix(stem, 16).ok()
+    }
+
+    /// FID-NR-4 (JE `NetworkBackup.cleanup`, `NetworkBackup.java:429`): after
+    /// the full set has been transferred, dispose any residual local `.ndb`
+    /// file that is NOT part of the restored set, then verify every file in
+    /// the set is present. A stale local file left over from the node's old
+    /// (divergent) log would otherwise confuse recovery. The marker is a
+    /// non-`.ndb` file and is never considered here (JE excludes it; it is
+    /// removed explicitly once the restore finishes).
+    fn cleanup_residual_files(
+        &self,
+        log_dir: &Path,
+        restored: &std::collections::HashSet<String>,
+    ) -> Result<()> {
+        let rd = std::fs::read_dir(log_dir).map_err(|e| {
+            RepError::NetworkRestoreError(format!(
+                "listing log dir {} for residual cleanup: {}",
+                log_dir.display(),
+                e
+            ))
+        })?;
+        for entry in rd {
+            let entry = entry.map_err(|e| {
+                RepError::NetworkRestoreError(format!(
+                    "reading a directory entry in {}: {}",
+                    log_dir.display(),
+                    e
+                ))
+            })?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy().to_string();
+            // Only consider real .ndb log files; leave the marker, .tmp, .bak
+            // and any non-log files alone.
+            if name.ends_with(".ndb")
+                && Self::parse_restore_file_number(&name).is_some()
+                && !restored.contains(&name)
+            {
+                let path = log_dir.join(&name);
+                if self.config.retain_log_files {
+                    let backup = log_dir.join(format!("{name}.bak"));
+                    std::fs::rename(&path, &backup).map_err(|e| {
+                        RepError::NetworkRestoreError(format!(
+                            "residual cleanup: could not rename '{}' to \
+                             '{}': {}",
+                            path.display(),
+                            backup.display(),
+                            e
+                        ))
+                    })?;
+                } else {
+                    std::fs::remove_file(&path).map_err(|e| {
+                        RepError::NetworkRestoreError(format!(
+                            "residual cleanup: could not delete '{}': {}",
+                            path.display(),
+                            e
+                        ))
+                    })?;
+                }
+            }
+        }
+        // JE verifies every file in the set exists after cleanup.
+        for name in restored {
+            if !log_dir.join(name).exists() {
+                return Err(RepError::NetworkRestoreError(format!(
+                    "restored file missing after cleanup: {name}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Update the elapsed time for progress tracking.
     pub fn update_elapsed(&self, elapsed: Duration) {
         let mut progress = self.progress.lock();
         progress.elapsed = elapsed;
+    }
+
+    /// FID-NR-1 (JE `NetworkBackup.getFile` -> `RestoreMarker.createMarkerFile`,
+    /// `NetworkBackup.java:683`): create the `RestoreRequired(NETWORK_RESTORE)`
+    /// marker in `log_dir` BEFORE any local log file is mutated, so a crash
+    /// mid-restore fences the environment — reopening it refuses (or forces a
+    /// restore) rather than mounting a half-restored, incoherent file set.
+    /// Idempotent (JE: "can be safely called multiple times").
+    fn write_restore_marker(&self, log_dir: &Path) -> Result<()> {
+        let mut props: hashbrown::HashMap<String, String> =
+            hashbrown::HashMap::new();
+        props
+            .insert("source_node".to_string(), self.config.source_node.clone());
+        props.insert(
+            "source".to_string(),
+            format!("{}:{}", self.config.source_host, self.config.source_port),
+        );
+        create_marker_file(log_dir, FailureType::NetworkRestore, props).map_err(
+            |e| {
+                RepError::NetworkRestoreError(format!(
+                    "creating restore marker in {}: {}",
+                    log_dir.display(),
+                    e
+                ))
+            },
+        )
+    }
+
+    /// FID-NR-1 (JE `NetworkBackup.getFiles` -> `restoreMarker.removeMarkerFile`,
+    /// `NetworkBackup.java:496`): remove the marker only after the ENTIRE set
+    /// has been transferred, so the environment is coherent again.
+    fn remove_restore_marker(&self, log_dir: &Path) -> Result<()> {
+        remove_marker_file(log_dir).map_err(|e| {
+            RepError::NetworkRestoreError(format!(
+                "removing restore marker in {}: {}",
+                log_dir.display(),
+                e
+            ))
+        })
     }
 
     /// Mark the restore as completed successfully.
@@ -1026,6 +1370,59 @@ mod tests {
         restore.execute_via_dispatcher().expect("valid digest must succeed");
         let written = std::fs::read(dir.path().join("00000002.ndb")).unwrap();
         assert_eq!(written, body);
+        // FID-NR-2: no leftover tmp file after a successful restore.
+        assert!(
+            !dir.path().join("00000002.ndb.tmp").exists(),
+            "the tmp file must be renamed away on success"
+        );
+    }
+
+    /// FID-NR-2 (S1, JE `NetworkBackup.getFile`, `NetworkBackup.java:575`):
+    /// a restore must write to a `.tmp` file and atomically rename it onto
+    /// the final name only after the digest verifies. A crash mid-write (here
+    /// simulated by the CRASH_BEFORE_RENAME hook firing after the tmp is
+    /// durable but before the rename) must leave the final `.ndb` UNCHANGED
+    /// (its prior intact contents, or absent) — never a torn/partial live log
+    /// file.
+    ///
+    /// Witness: RED at 81b2f048 (the base writes `std::fs::write(dest_path,
+    /// body)` directly, so a crash mid-write overwrites/truncates the live
+    /// `.ndb`). GREEN after the fix (the destination is only ever replaced by
+    /// an atomic rename, so a pre-rename crash leaves the old file intact and
+    /// only a `.tmp` behind).
+    #[test]
+    fn execute_via_dispatcher_crash_before_rename_leaves_final_intact() {
+        let filename = b"00000007.ndb";
+        let new_body = b"NEW restore bytes that must not land torn";
+        let old_body = b"OLD intact log file contents";
+        let mut payload = 1u32.to_le_bytes().to_vec();
+        payload.extend_from_slice(&(filename.len() as u16).to_le_bytes());
+        payload.extend_from_slice(filename);
+        payload.extend_from_slice(&(new_body.len() as u64).to_le_bytes());
+        payload.extend_from_slice(new_body);
+        payload.extend_from_slice(&crc32fast::hash(new_body).to_le_bytes());
+
+        let (_disp, addr) = spawn_fixed_reply_restore_server(payload);
+        let dir = tempfile::TempDir::new().unwrap();
+        // Pre-populate the destination with an intact prior log file.
+        std::fs::write(dir.path().join("00000007.ndb"), old_body).unwrap();
+
+        let restore = NetworkRestore::new(dispatcher_config(addr))
+            .with_local_dir(dir.path());
+
+        // Arm the per-instance crash hook, then run.
+        restore.arm_crash_before_rename();
+        let res = restore.execute_via_dispatcher();
+
+        assert!(res.is_err(), "the simulated crash must surface as an error");
+        // The live `.ndb` must still hold the OLD intact contents, never a
+        // partial copy of the new body.
+        let on_disk = std::fs::read(dir.path().join("00000007.ndb")).unwrap();
+        assert_eq!(
+            on_disk, old_body,
+            "FID-NR-2: a crash before the atomic rename must leave the live \
+             log file intact, not torn/overwritten"
+        );
     }
 
     /// `execute_via_dispatcher` called a second time (state already
@@ -1044,6 +1441,277 @@ mod tests {
         assert!(
             err.to_string().contains("wrong state"),
             "unexpected error: {err}"
+        );
+    }
+
+    /// FID-NR-7 (S2, JE `NetworkBackup.disposeFile`, `NetworkBackup.java:751`):
+    /// on `retain_log_files`, a failed rename of the existing file to `.bak`
+    /// must ERROR, not be swallowed and the retained file silently
+    /// overwritten. JE throws `EnvironmentFailureException.unexpectedState`.
+    ///
+    /// Witness: `retain_log_files = true`, with `<name>.bak` pre-created as a
+    /// directory so `rename(file, dir)` fails. RED at 81b2f048 (`let _ =
+    /// std::fs::rename(..)` swallows it; the restore proceeds and the
+    /// retained copy is lost). GREEN after the fix (the error propagates).
+    #[cfg(unix)]
+    #[test]
+    fn execute_via_dispatcher_bak_rename_failure_errors() {
+        let filename = b"00000009.ndb";
+        let body = b"incoming restore bytes";
+        let mut payload = 1u32.to_le_bytes().to_vec();
+        payload.extend_from_slice(&(filename.len() as u16).to_le_bytes());
+        payload.extend_from_slice(filename);
+        payload.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        payload.extend_from_slice(body);
+        payload.extend_from_slice(&crc32fast::hash(body).to_le_bytes());
+
+        let (_disp, addr) = spawn_fixed_reply_restore_server(payload);
+        let dir = tempfile::TempDir::new().unwrap();
+        // An existing log file to retain.
+        std::fs::write(dir.path().join("00000009.ndb"), b"old").unwrap();
+        // Make the `.bak` target a directory so renaming a file onto it fails.
+        std::fs::create_dir(dir.path().join("00000009.ndb.bak")).unwrap();
+        std::fs::write(
+            dir.path().join("00000009.ndb.bak").join("blocker"),
+            b"x",
+        )
+        .unwrap();
+
+        let mut cfg = dispatcher_config(addr);
+        cfg.retain_log_files = true;
+        let restore = NetworkRestore::new(cfg).with_local_dir(dir.path());
+        let res = restore.execute_via_dispatcher();
+        assert!(
+            res.is_err(),
+            "a failed .bak rename must surface as an error (FID-NR-7)"
+        );
+        assert!(
+            res.unwrap_err().to_string().contains("rename"),
+            "error must describe the failed rename"
+        );
+    }
+
+    /// FID-NR-1 (S2, JE `NetworkBackup.getFile` -> `RestoreMarker`,
+    /// `NetworkBackup.java:683`; `EnvironmentImpl` open-time check): the client
+    /// must create the `RestoreRequired(NETWORK_RESTORE)` marker BEFORE
+    /// mutating any local log file, and a present marker must refuse the
+    /// environment on open. A crash mid-restore then fences the half-restored
+    /// env instead of letting it reopen as a usable-but-incoherent log.
+    ///
+    /// Witness: a two-file restore crashed (CRASH_BEFORE_RENAME) during the
+    /// first file. The marker must be present, and opening an
+    /// `EnvironmentImpl` on the dir must fail with a restore-required error.
+    /// RED at 81b2f048 (no marker is ever written; the env opens a partial
+    /// set). GREEN after the fix.
+    #[test]
+    fn crash_mid_restore_writes_marker_and_env_open_refuses() {
+        use noxu_dbi::EnvironmentImpl;
+
+        // Two-file payload so the crash lands after the marker is written and
+        // before the set is complete.
+        let mut payload = 2u32.to_le_bytes().to_vec();
+        for (name, body) in [
+            (b"00000000.ndb".as_slice(), b"file zero body".as_slice()),
+            (b"00000001.ndb".as_slice(), b"file one body".as_slice()),
+        ] {
+            payload.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            payload.extend_from_slice(name);
+            payload.extend_from_slice(&(body.len() as u64).to_le_bytes());
+            payload.extend_from_slice(body);
+            payload.extend_from_slice(&crc32fast::hash(body).to_le_bytes());
+        }
+
+        let (_disp, addr) = spawn_fixed_reply_restore_server(payload);
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let restore = NetworkRestore::new(dispatcher_config(addr))
+            .with_local_dir(dir.path());
+        restore.arm_crash_before_rename();
+        let res = restore.execute_via_dispatcher();
+        assert!(res.is_err(), "the simulated crash must surface as an error");
+
+        // FID-NR-1: the marker must be present after a crashed restore.
+        assert!(
+            noxu_log::marker_present(dir.path()),
+            "a crashed restore must leave the RestoreRequired marker"
+        );
+
+        // FID-NR-1: opening the environment on this incoherent dir must refuse.
+        let open = EnvironmentImpl::new(dir.path(), false, true);
+        let err =
+            open.err().expect("opening a marked (half-restored) env must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("requires restore") || msg.contains("NETWORK_RESTORE"),
+            "refusal must mention the restore requirement, got: {msg}"
+        );
+    }
+
+    /// FID-NR-1: a COMPLETE restore removes the marker, so the environment is
+    /// not spuriously fenced.
+    #[test]
+    fn complete_restore_removes_marker() {
+        let filename = b"00000000.ndb";
+        let body = b"complete file";
+        let mut payload = 1u32.to_le_bytes().to_vec();
+        payload.extend_from_slice(&(filename.len() as u16).to_le_bytes());
+        payload.extend_from_slice(filename);
+        payload.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        payload.extend_from_slice(body);
+        payload.extend_from_slice(&crc32fast::hash(body).to_le_bytes());
+
+        let (_disp, addr) = spawn_fixed_reply_restore_server(payload);
+        let dir = tempfile::TempDir::new().unwrap();
+        let restore = NetworkRestore::new(dispatcher_config(addr))
+            .with_local_dir(dir.path());
+        restore.execute_via_dispatcher().expect("restore must succeed");
+
+        // Marker removed on success — the env is not fenced by a stale marker.
+        assert!(
+            !noxu_log::marker_present(dir.path()),
+            "a completed restore must remove the marker"
+        );
+    }
+
+    /// FID-NR-3 (S2, JE `NetworkBackup.disposeObsoleteFiles`,
+    /// `NetworkBackup.java:720`): obsolete files must be disposed
+    /// highest-numbered first, so if the dispose is interrupted the remaining
+    /// files form a consistent lower prefix (no gap). Files below the start
+    /// file are untouched.
+    ///
+    /// Witness: local files 2,3,4,5 exist; file 3 is made un-deletable (a
+    /// non-empty directory). Disposing from start=2 must remove 5 then 4
+    /// (highest-first), then FAIL on 3 — leaving {2,3} as a consistent prefix,
+    /// never a gap like {2,4} or {2,5}. RED at 81b2f048 (no
+    /// disposeObsoleteFiles / no ordering). GREEN after the fix.
+    #[cfg(unix)]
+    #[test]
+    fn dispose_obsolete_files_highest_first_leaves_prefix() {
+        let dir = tempfile::TempDir::new().unwrap();
+        for n in [2u32, 4, 5] {
+            std::fs::write(dir.path().join(format!("{n:08x}.ndb")), b"x")
+                .unwrap();
+        }
+        // File 3 is a non-empty directory so remove_file fails on it.
+        std::fs::create_dir(dir.path().join("00000003.ndb")).unwrap();
+        std::fs::write(dir.path().join("00000003.ndb").join("blk"), b"x")
+            .unwrap();
+
+        // Non-retain restore so dispose deletes.
+        let cfg = NetworkRestoreConfig {
+            source_node: "s".into(),
+            source_host: "127.0.0.1".into(),
+            source_port: 1,
+            retain_log_files: false,
+        };
+        let restore = NetworkRestore::new(cfg).with_local_dir(dir.path());
+
+        let res = restore.dispose_obsolete_files(dir.path(), 2);
+        assert!(res.is_err(), "dispose must fail on the un-deletable file 3");
+
+        // Highest-first: 5 and 4 are gone (disposed before 3 was reached);
+        // 3 (the failure) and 2 (below start, untouched) remain — a consistent
+        // lower prefix, never a gap.
+        assert!(
+            !dir.path().join("00000005.ndb").exists(),
+            "file 5 (highest) must be disposed first"
+        );
+        assert!(
+            !dir.path().join("00000004.ndb").exists(),
+            "file 4 must be disposed before 3"
+        );
+        assert!(
+            dir.path().join("00000003.ndb").exists(),
+            "the dispose failed at file 3; it must remain"
+        );
+        assert!(
+            dir.path().join("00000002.ndb").exists(),
+            "file 2 is below the start file and must be untouched"
+        );
+    }
+
+    /// FID-NR-3 integration: restoring a SHORTER set over a longer
+    /// pre-existing local log disposes the obsolete higher-numbered files.
+    #[test]
+    fn restore_disposes_obsolete_higher_local_files() {
+        // Server sends only file 0.
+        let body = b"fresh file zero";
+        let mut payload = 1u32.to_le_bytes().to_vec();
+        payload
+            .extend_from_slice(&(b"00000000.ndb".len() as u16).to_le_bytes());
+        payload.extend_from_slice(b"00000000.ndb");
+        payload.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        payload.extend_from_slice(body);
+        payload.extend_from_slice(&crc32fast::hash(body).to_le_bytes());
+
+        let (_disp, addr) = spawn_fixed_reply_restore_server(payload);
+        let dir = tempfile::TempDir::new().unwrap();
+        // Pre-populate with stale higher-numbered local files.
+        for n in [0u32, 1, 2] {
+            std::fs::write(dir.path().join(format!("{n:08x}.ndb")), b"stale")
+                .unwrap();
+        }
+
+        let restore = NetworkRestore::new(dispatcher_config(addr))
+            .with_local_dir(dir.path());
+        restore.execute_via_dispatcher().expect("restore");
+
+        // File 0 is the fresh restored copy.
+        assert_eq!(
+            std::fs::read(dir.path().join("00000000.ndb")).unwrap(),
+            body
+        );
+        // Stale higher files 1 and 2 were disposed (deleted, non-retain).
+        assert!(
+            !dir.path().join("00000001.ndb").exists(),
+            "obsolete file 1 must be disposed"
+        );
+        assert!(
+            !dir.path().join("00000002.ndb").exists(),
+            "obsolete file 2 must be disposed"
+        );
+    }
+
+    /// FID-NR-4 (S3, JE `NetworkBackup.cleanup`, `NetworkBackup.java:429`):
+    /// after the full restore, a residual local `.ndb` file that is NOT part
+    /// of the restored set must be disposed, so a stale file from the node's
+    /// old divergent log cannot confuse recovery. This is distinct from
+    /// FID-NR-3 (which disposes files >= each placed file during placement):
+    /// here the residual file is LOWER than the restored file, so only the
+    /// post-transfer cleanup catches it.
+    ///
+    /// Witness: restore set {5}; pre-existing local {3} (lower, not in set).
+    /// After the restore, file 3 must be gone and file 5 present. RED at
+    /// 81b2f048 (no cleanup: file 3 remains). GREEN after the fix.
+    #[test]
+    fn restore_cleans_up_residual_file_not_in_set() {
+        let body = b"restored file five";
+        let mut payload = 1u32.to_le_bytes().to_vec();
+        payload
+            .extend_from_slice(&(b"00000005.ndb".len() as u16).to_le_bytes());
+        payload.extend_from_slice(b"00000005.ndb");
+        payload.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        payload.extend_from_slice(body);
+        payload.extend_from_slice(&crc32fast::hash(body).to_le_bytes());
+
+        let (_disp, addr) = spawn_fixed_reply_restore_server(payload);
+        let dir = tempfile::TempDir::new().unwrap();
+        // A stale LOWER-numbered local file not in the restored set.
+        std::fs::write(dir.path().join("00000003.ndb"), b"stale").unwrap();
+
+        let restore = NetworkRestore::new(dispatcher_config(addr))
+            .with_local_dir(dir.path());
+        restore.execute_via_dispatcher().expect("restore");
+
+        assert_eq!(
+            std::fs::read(dir.path().join("00000005.ndb")).unwrap(),
+            body,
+            "the restored file must be present"
+        );
+        assert!(
+            !dir.path().join("00000003.ndb").exists(),
+            "a residual file not in the restored set must be cleaned up \
+             (FID-NR-4)"
         );
     }
 }
