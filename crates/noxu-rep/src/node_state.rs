@@ -351,6 +351,12 @@ impl NodeStateMachine {
         // transition and leave a Replica unscreened (S2).  No listener firing,
         // network I/O, or env call happens here -- a `Relaxed` atomic store
         // through the already-held `Arc` keeps the state lock a leaf.
+        //
+        // Seeding invariant (maintenance note, review-screen-race-verdict #1):
+        // `set_write_screen` is race-free when seeding the handle under only the
+        // state READ lock *because* this read of `write_screen` happens under the
+        // state WRITE lock. A future refactor that moves this read out of the
+        // write lock must re-take the write lock in `set_write_screen`.
         if let Some(handle) = self.write_screen.read().as_ref() {
             handle.store(Self::screen_for(new_state), Ordering::Relaxed);
         }
