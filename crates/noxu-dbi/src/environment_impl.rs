@@ -1438,6 +1438,43 @@ impl EnvironmentImpl {
             h.register_tree(Arc::clone(&primary_tree));
         }
 
+        // Shared db_map / name_map Arcs.  Declared HERE (before the cleaner
+        // builder) so the R-UNOPENED-RECLAIM live-db oracle below can share
+        // them; they were previously declared further down (no use in between).
+        let db_map: Arc<
+            RwLock<HashMap<DatabaseId, Arc<RwLock<DatabaseImpl>>>>,
+        > = Arc::new(RwLock::new(HashMap::new()));
+
+        // REC-CAT (data-safety): the name→id catalog and the recovered
+        // comparator identities are shared via `Arc` so the checkpointer's
+        // catalog-relog callback (wired just below) can re-log the live
+        // catalog without touching the `Arc<Mutex<EnvironmentImpl>>`.
+        let name_map: Arc<RwLock<HashMap<String, DatabaseId>>> =
+            Arc::new(RwLock::new(recovered_names));
+
+        // R-UNOPENED-RECLAIM (D-ADDITIVE-SAFETY): the live-db oracle the
+        // cleaner uses to decide whether an unregistered db_id belongs to a
+        // LIVE (recovered, not deleted) database.  This is the Noxu analog of
+        // JE `DbTree.getDb(dbId) != null && !db.isDeleted()`
+        // (FileProcessor.java:856,864,1114,1117; DbTree.java:1609-1670): a
+        // db_id present in the name catalog (recovered NameLN, survives until a
+        // durable remove tombstone removes it) or already open is LIVE; its
+        // file is RETAINED by the cleaner even with no handle open.  A db_id
+        // absent from both (deleted / never existed) is obsolete, exactly as JE
+        // treats a `null`/deleted db.  Internal db ids (NameDB/IdDB) are never
+        // passed to the user-LN cleaner path, so they need no special case.
+        let live_db_oracle: noxu_cleaner::LiveDbOracle = {
+            let name_map = Arc::clone(&name_map);
+            let db_map = Arc::clone(&db_map);
+            Arc::new(move |db_id: i64| {
+                let id = DatabaseId::new(db_id);
+                if db_map.read().contains_key(&id) {
+                    return true;
+                }
+                name_map.read().values().any(|v| *v == id)
+            })
+        };
+
         // Cleaner initialization.
         // constructor (called after RecoveryManager.recover()).
         // D1 / F-3: the env invalidation flag is shared with the cleaner.
@@ -1461,6 +1498,9 @@ impl EnvironmentImpl {
             // X-7: wire the shared db-tree registry so the cleaner
             // dispatches secondary-LN liveness checks to the correct tree.
             .with_tree_registry(Arc::clone(&db_trees_registry))
+            // R-UNOPENED-RECLAIM (D-ADDITIVE-SAFETY): wire the live-db oracle
+            // so the cleaner never reclaims a recovered-but-unopened db's file.
+            .with_live_db_oracle(Arc::clone(&live_db_oracle))
             // D1 / F-3: share the env invalidation flag with the cleaner.
             .with_env_invalid(Arc::clone(&is_invalid));
             // CLN-F1: wire the minFileUtilization second-tier threshold so the
@@ -1759,16 +1799,6 @@ impl EnvironmentImpl {
 
         // Shared db_map Arc — also given to the INCompressor daemon so it can
         // iterate open databases without holding a reference to `self`.
-        let db_map: Arc<
-            RwLock<HashMap<DatabaseId, Arc<RwLock<DatabaseImpl>>>>,
-        > = Arc::new(RwLock::new(HashMap::new()));
-
-        // REC-CAT (data-safety): the name→id catalog and the recovered
-        // comparator identities are shared via `Arc` so the checkpointer's
-        // catalog-relog callback (wired just below) can re-log the live
-        // catalog without touching the `Arc<Mutex<EnvironmentImpl>>`.
-        let name_map: Arc<RwLock<HashMap<String, DatabaseId>>> =
-            Arc::new(RwLock::new(recovered_names));
         let recovered_comparators: Arc<
             RwLock<HashMap<String, (Option<String>, Option<String>)>>,
         > = Arc::new(RwLock::new(recovered_comparators));
