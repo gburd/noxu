@@ -573,3 +573,87 @@ fn txn_manager_set_last_txn_id_advances_next() {
     let t = mgr.begin_txn();
     assert!(t.id() > 1000);
 }
+
+// ─── R-FIRSTLSN: note_log_entry is the single first-active-LSN chokepoint ─────
+//
+// TxnManager::get_first_active_lsn() must reflect a txn's FIRST logged LSN no
+// matter which write recorded it — a NameLN DDL write or an XA prepare records
+// its LSN via Txn::note_log_entry alone (never TxnManager::update_first_lsn,
+// which only CursorImpl's user-LN path calls).  Before the fix, a txn whose
+// first log entry went only through note_log_entry left get_first_active_lsn()
+// at NULL_LSN, under-reporting the cleaner's first-active-txn-file clamp.
+//
+// JE: Txn.addLogInfo sets firstLoggedLsn under the log latch after EVERY
+// transactional LN (Txn.java:1443-1456); TxnManager.getFirstActiveLsn reads it
+// (TxnManager.java:355-366).  note_log_entry is Noxu's addLogInfo.
+
+#[test]
+fn first_active_lsn_tracks_note_log_entry_without_update_first_lsn() {
+    use noxu_util::lsn::NULL_LSN;
+    let mgr = TxnManager::new(lm());
+    let mut txn = mgr.begin_txn();
+
+    // No writes yet: NULL.
+    assert_eq!(
+        mgr.get_first_active_lsn(),
+        NULL_LSN.as_u64(),
+        "no logged entries => first-active LSN must be NULL"
+    );
+
+    // A DDL-style first write records ONLY through note_log_entry (the path a
+    // NameLN create/remove/rename and an XA prepare take).  We deliberately do
+    // NOT call mgr.update_first_lsn: that is exactly the CursorImpl-only path
+    // whose absence caused R-FIRSTLSN.
+    let first = noxu_util::lsn::Lsn::new(3, 1000).as_u64();
+    txn.note_log_entry(first);
+
+    assert_eq!(
+        mgr.get_first_active_lsn(),
+        first,
+        "note_log_entry alone must make the txn's first LSN visible to the \
+         TxnManager (R-FIRSTLSN); if this is NULL the cleaner's \
+         first-active-txn-file clamp under-reports and can delete a log file \
+         holding an open txn's first (e.g. NameLN) entry"
+    );
+
+    // A later write must not move the first-active LSN forward.
+    let later = noxu_util::lsn::Lsn::new(5, 2000).as_u64();
+    txn.note_log_entry(later);
+    assert_eq!(
+        mgr.get_first_active_lsn(),
+        first,
+        "first-active LSN must stay at the EARLIEST logged LSN"
+    );
+
+    // Committing clears it.
+    mgr.commit_txn(txn.id());
+    assert_eq!(
+        mgr.get_first_active_lsn(),
+        NULL_LSN.as_u64(),
+        "after commit the txn is gone => first-active LSN is NULL again"
+    );
+}
+
+#[test]
+fn first_active_lsn_min_across_ddl_and_user_txns() {
+    use noxu_util::lsn::Lsn;
+    let mgr = TxnManager::new(lm());
+
+    // Txn A: first write via note_log_entry only (DDL path) at an EARLY LSN.
+    let mut a = mgr.begin_txn();
+    a.note_log_entry(Lsn::new(2, 500).as_u64());
+
+    // Txn B: first write recorded via update_first_lsn (CursorImpl path) at a
+    // LATER LSN.  (note_log_entry is also what CursorImpl calls; here we drive
+    // update_first_lsn directly to show the two paths agree.)
+    let b = mgr.begin_txn();
+    mgr.update_first_lsn(b.id(), Lsn::new(4, 100).as_u64());
+
+    // The earliest across both must win — A's DDL write.
+    assert_eq!(
+        mgr.get_first_active_lsn(),
+        Lsn::new(2, 500).as_u64(),
+        "get_first_active_lsn must be the min across all active txns, \
+         including one whose first entry was a DDL write"
+    );
+}
