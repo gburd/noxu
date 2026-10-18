@@ -1147,6 +1147,14 @@ impl Environment {
                 // identity, DbTree.java:1214 / Txn.java:1481).
                 {
                     let env_impl = self.env_impl.lock();
+                    // R-RELOG (S1) TOCTOU-hardening (review merge-prep): mark the
+                    // pending remove FIRST, before relog-once/tombstone, so a
+                    // background checkpoint's lock-free relog_live_catalog (which
+                    // does NOT take env_impl.lock) can never observe the victim
+                    // UNMARKED between the tombstone write and the mark and thus
+                    // never re-logs a live NameLN past the tombstone.  db_id was
+                    // validated up front (can_remove_database).
+                    env_impl.mark_pending_ddl(name, db_id);
                     // R-RELOG (S1): re-log a known-LSN LIVE copy of the victim's
                     // committed NameLN BEFORE the tombstone, and anchor the
                     // first-active clamp there (note_log_entry, earliest-wins)
@@ -1173,12 +1181,6 @@ impl Environment {
                             .unwrap_or_else(|p| p.into_inner())
                             .note_log_entry(lsn.as_u64());
                     }
-                    // R-RELOG (S1): the committed NameLN is still in `name_map`
-                    // (physical removal is deferred to the commit callback), but
-                    // its delete tombstone is now logged.  Mark the name so the
-                    // checkpointer's relog callback does not re-log a fresh live
-                    // NameLN past the tombstone while this txn is open.
-                    env_impl.mark_pending_ddl(name, db_id);
                 }
                 let env_impl_arc = Arc::clone(&self.env_impl);
                 let databases_arc = Arc::clone(&self.databases);
@@ -1356,6 +1358,13 @@ impl Environment {
                 // place and recovery's mapping-tree undo pass restores it.
                 {
                     let env_impl = self.env_impl.lock();
+                    // R-RELOG (S1) TOCTOU-hardening (review merge-prep): mark the
+                    // pending rename-away of the OLD name FIRST, before relog-
+                    // once/tombstone, so a background lock-free relog can never
+                    // observe the old name UNMARKED between tombstone and mark.
+                    // (The NEW name is not yet in name_map, so relog never
+                    // touches it.)  db_id was validated up front.
+                    env_impl.mark_pending_ddl(old_name, db_id);
                     // R-RELOG (S1): re-log a known-LSN LIVE copy of the OLD
                     // name's committed NameLN BEFORE the rename tombstone, and
                     // anchor the first-active clamp there, so the file holding
@@ -1383,13 +1392,6 @@ impl Environment {
                             .unwrap_or_else(|p| p.into_inner())
                             .note_log_entry(lsn.as_u64());
                     }
-                    // R-RELOG (S1): the OLD name is still in `name_map` (the
-                    // swap is deferred to the commit callback) but its delete
-                    // tombstone is now logged.  Mark the old name so the relog
-                    // callback does not re-log a fresh live NameLN for it past
-                    // the tombstone while the txn is open.  (The NEW name is
-                    // not yet in `name_map`, so relog never touches it.)
-                    env_impl.mark_pending_ddl(old_name, db_id);
                 }
                 let env_impl_arc = Arc::clone(&self.env_impl);
                 let databases_arc = Arc::clone(&self.databases);
