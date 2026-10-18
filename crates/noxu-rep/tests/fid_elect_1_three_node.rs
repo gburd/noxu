@@ -1,23 +1,36 @@
-//! FID-ELECT-1: 3-node concurrent-election safety.
+//! FID-ELECT-1: 3-node concurrent-election safety (JE topology).
 //!
-//! Two proposer nodes run `run_election` CONCURRENTLY against the SAME three
-//! acceptor nodes, in a tied situation (identical VLSN / priority) AND at the
-//! SAME election term — exactly the collision that the per-node-local term
-//! counter produced (every node's driver started at term 1).  The fix must
-//! guarantee **at most one master per election**: with the `(term, proposer)`
-//! proposal number and the acceptor's "no different value at an accepted
-//! term" guard, two proposers sharing a term can never both reach a phase-2
-//! quorum on the shared acceptors.
+//! Three nodes {A, B, C}, each both a PROPOSER and an ACCEPTOR (JE: every
+//! electable member runs an Acceptor and the proposer dials
+//! `getAllAcceptorSockets()`, which includes self, RepGroupImpl.java:1296).
+//! Two proposers A and B run a full Paxos election CONCURRENTLY at the SAME
+//! term (1), SAME VLSN (100), SAME priority (1) — a dead tie — against the
+//! shared acceptors.  The fix must guarantee **at most one master per
+//! election**.
 //!
-//! This is run 200 times to shake out scheduler-dependent interleavings
-//! (the auditor's requirement), on top of the deterministic L1/L2 witnesses
-//! in `fid_elect_1_witness.rs`.
+//! ## Why the JE topology (FID-ELECT-1 split brain)
+//!
+//! rc2 keys the acceptor on `(term, proposer)` and carries a PER-ACCEPTOR
+//! value guard ("no different value at an accepted term").  But the proposer's
+//! own vote must NOT be a free synthetic `+1`: JE routes it through the node's
+//! own `Acceptor` (self is in `getAllAcceptorSockets`), so a concurrent higher
+//! proposal that bumped this node's own promise denies its self-vote.  Without
+//! that interlock, the per-acceptor guard cannot protect a node's own acceptor
+//! from a value the node itself never routed through it, and {A,B,C} split
+//! brain at one term (C accepts A, A's acceptor accepts B, A wins free-self+C,
+//! B wins free-self+A).  So each proposer here dials the other two electable
+//! peers AND routes its own vote through its own `PersistentAcceptorState`
+//! (`run_election_with_phi_dtvlsn_self(.., Some(self_state))`).
+//!
+//! Run 200 times to shake out scheduler-dependent interleavings (the auditor's
+//! requirement), on top of the deterministic witness in
+//! `fid_elect_1_split_brain_witness.rs`.
 
 use noxu_rep::elections::ElectionAcceptorState;
 use noxu_rep::elections::election_service::{
     ELECTION_SERVICE_NAME, ElectionService,
 };
-use noxu_rep::elections::paxos::run_election;
+use noxu_rep::elections::paxos::run_election_with_phi_dtvlsn_self;
 use noxu_rep::net::channel::Channel;
 use noxu_rep::net::service_dispatcher::{
     TcpServiceDispatcher, connect_to_service,
@@ -31,9 +44,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-/// Build a 5-member group view: three acceptor nodes (a1,a2,a3) plus the two
-/// proposer nodes (p-A, p-B), so each proposer's quorum is computed over a
-/// stable 5-node group.  phase1/phase2 quorum = 3.
+/// Build the 3-member electable group {A, B, C}; SimpleMajority quorum = 2.
 fn make_group(addrs: &[(String, u16)]) -> RepGroup {
     let mut g = RepGroup::new("fid-elect-1".into(), 1);
     for (idx, (name, port)) in addrs.iter().enumerate() {
@@ -53,65 +64,90 @@ fn fid_elect_1_three_node_concurrent_election_at_most_one_master() {
     const ITERS: usize = 200;
 
     for iter in 0..ITERS {
-        // Three acceptor nodes, each with its own persistent-backed state.
-        // Give each a DISTINCT lower VLSN so neither proposer is out-ranked
-        // by an acceptor's own suggestion (proposers tie at the top).
+        // Three electable nodes, each running a live ELECTION acceptor service
+        // with its own persistent-backed state (JE: every electable member is
+        // an Acceptor).  A and B are the two concurrent proposers; C is a plain
+        // acceptor.  Give each acceptor a DISTINCT lower VLSN so neither
+        // proposer is out-ranked by an acceptor's own suggestion.
+        let names = ["A", "B", "C"];
         let mut dispatchers = Vec::new();
-        let mut acc_addrs: Vec<(String, u16)> = Vec::new();
-        for i in 0..3 {
-            let name = format!("a{}", i + 1);
-            let st = Arc::new(ElectionAcceptorState::new(name.clone(), 1));
+        let mut states: Vec<Arc<ElectionAcceptorState>> = Vec::new();
+        let mut addrs: Vec<(String, u16)> = Vec::new();
+        for name in names {
+            let st = Arc::new(ElectionAcceptorState::new(name.to_string(), 1));
             st.set_vlsn(10); // below the proposers' 100
             st.set_term(1);
-            let svc = Arc::new(ElectionService::new(st));
+            let svc = Arc::new(ElectionService::new(Arc::clone(&st)));
             let sd = TcpServiceDispatcher::new("127.0.0.1:0".parse().unwrap())
                 .unwrap();
             sd.register(ELECTION_SERVICE_NAME, svc);
             let bound = sd.start().unwrap();
-            acc_addrs.push((name, bound.port()));
+            addrs.push((name.to_string(), bound.port()));
+            states.push(st);
             dispatchers.push((sd, bound));
         }
 
-        // The two proposers share the group view with the acceptors.
-        let mut group_specs = acc_addrs.clone();
-        group_specs.push(("p-A".into(), 60001));
-        group_specs.push(("p-B".into(), 60002));
-        let group = Arc::new(make_group(&group_specs));
+        let group = Arc::new(make_group(&addrs));
 
+        // Let every acceptor listener bind before the proposers dial.
         std::thread::sleep(Duration::from_millis(5));
 
-        let acc_addr_list: Vec<SocketAddr> =
-            dispatchers.iter().map(|(_, b)| *b).collect();
+        let addr_by_name: Vec<(String, SocketAddr)> = dispatchers
+            .iter()
+            .enumerate()
+            .map(|(i, (_, b))| (names[i].to_string(), *b))
+            .collect();
 
-        // Each proposer dials all three acceptors and runs an election at the
-        // SAME term (1), SAME VLSN (100), SAME priority (1) — a dead tie.
         let masters = Arc::new(AtomicUsize::new(0));
-        let run_proposer = |node_id: u32, name: &'static str| {
-            let group = Arc::clone(&group);
-            let addrs = acc_addr_list.clone();
-            let masters = Arc::clone(&masters);
-            std::thread::spawn(move || {
-                let mut channels: Vec<Arc<dyn Channel>> = Vec::new();
-                for a in &addrs {
-                    if let Ok(ch) =
-                        connect_to_service(*a, ELECTION_SERVICE_NAME)
-                    {
-                        channels.push(Arc::new(ch));
+        let run_proposer =
+            |node_id: u32,
+             name: &'static str,
+             self_state: Arc<ElectionAcceptorState>| {
+                let group = Arc::clone(&group);
+                let addr_by_name = addr_by_name.clone();
+                let masters = Arc::clone(&masters);
+                std::thread::spawn(move || {
+                    // Dial every electable peer EXCEPT self (self votes through its
+                    // own acceptor state, JE self-in-acceptor-sockets).
+                    let mut channels: Vec<Arc<dyn Channel>> = Vec::new();
+                    for (peer, a) in &addr_by_name {
+                        if peer == name {
+                            continue;
+                        }
+                        if let Ok(ch) =
+                            connect_to_service(*a, ELECTION_SERVICE_NAME)
+                        {
+                            channels.push(Arc::new(ch));
+                        }
                     }
-                }
-                // term=1 for BOTH proposers (the collision the fix must
-                // tolerate).  Winner is Some(id) iff this proposer reached a
-                // phase-2 quorum of accepts.
-                let winner =
-                    run_election(node_id, name, &group, &channels, 100, 1, 1);
-                if winner == Some(node_id) {
-                    masters.fetch_add(1, Ordering::SeqCst);
-                }
-            })
-        };
+                    // term=1 for BOTH proposers (the collision the fix must
+                    // tolerate).  The proposer's own vote routes through its OWN
+                    // acceptor state; a concurrent higher proposal that bumped this
+                    // node's own promise denies the self-vote.  Winner is Some(id)
+                    // iff this proposer reached a phase-2 quorum of REAL accepts
+                    // for its own id.
+                    let winner = run_election_with_phi_dtvlsn_self(
+                        node_id,
+                        name,
+                        &group,
+                        &channels,
+                        100,
+                        1,
+                        1,
+                        0,
+                        None,
+                        Duration::from_millis(500),
+                        Some(&self_state.persistent),
+                    );
+                    if winner == Some(node_id) {
+                        masters.fetch_add(1, Ordering::SeqCst);
+                    }
+                })
+            };
 
-        let ha = run_proposer(4, "p-A");
-        let hb = run_proposer(5, "p-B");
+        // states[0]=A (id 1), states[1]=B (id 2) are the two proposers.
+        let ha = run_proposer(1, "A", Arc::clone(&states[0]));
+        let hb = run_proposer(2, "B", Arc::clone(&states[1]));
         ha.join().unwrap();
         hb.join().unwrap();
 
