@@ -959,6 +959,22 @@ impl<'txn> Cursor<'txn> {
         self.read_only
     }
 
+    /// Test seam for the JE cleaner `FileSelectionTest` port: the LSN of the
+    /// record the cursor is currently positioned on, i.e. the location of the
+    /// LN just written by `put` or just read by `get`.
+    ///
+    /// This is the Noxu analogue of JE's `FileSelectionTest.getLsn(Cursor)`
+    /// (`DbTestProxy.dbcGetCursorImpl(cursor).getBIN().getLsn(index)`), which
+    /// `writeData()` uses to record the first key landing in each log file
+    /// (`firstKeysInFiles`).  Noxu exposes no public cursor->LSN mapping, so
+    /// this hidden seam surfaces the inner `CursorImpl`'s current LSN.
+    /// `#[doc(hidden)]` and `*_for_test`: additive, not part of the stable
+    /// surface (patch-safe).
+    #[doc(hidden)]
+    pub fn current_lsn_for_test(&self) -> noxu_util::Lsn {
+        noxu_util::Lsn::from_u64(self.inner.get_current_lsn())
+    }
+
     /// Check that the cursor and its database are open.
     ///
     /// JE `Cursor.checkOpenAndState` (Cursor.java:5381-5395): the

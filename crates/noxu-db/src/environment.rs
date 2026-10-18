@@ -2318,6 +2318,54 @@ impl Environment {
         Arc::clone(&self.env_impl)
     }
 
+    /// Test seam for the JE cleaner `FileSelectionTest` port: force-clean
+    /// EXACTLY ONE file and ensure that file is physically deleted, returning
+    /// the number of files cleaned (0 or 1).
+    ///
+    /// This is the Noxu analogue of JE's `FileSelectionTest.forceCleanOne()`
+    /// (`cleaner.doClean(false /*cleanMultipleFiles*/, true /*forceCleaning*/)`
+    /// followed by a forced checkpoint to delete the cleaned file).  The
+    /// public [`Self::clean_log`] / [`Self::clean_log_forced`] both clean ALL
+    /// eligible files (`n_files = u32::MAX`); this seam caps the pass at one
+    /// file via `run_cleaner(1, true)`.
+    ///
+    /// JE deletes a cleaned file during the single checkpoint that follows
+    /// cleaning.  Noxu uses a longer, two-checkpoint `FileSelector`
+    /// safe-to-delete barrier (X-5): a cleaned file goes `cleaned_files` ->
+    /// (checkpoint) `checkpointed` -> (checkpoint) `safe_to_delete`, and is
+    /// physically removed by the next cleaner pass's `delete_safe_files()`.
+    /// To reproduce JE `forceCleanOne`'s *observable* (one file cleaned AND
+    /// deleted) this seam crosses that barrier: clean one file, two forced
+    /// checkpoints, then a no-clean deletion pass (`run_cleaner(0, false)`,
+    /// which cleans nothing but runs `delete_safe_files`).  Only the single
+    /// forced file is cleaned; the deletion pass selects no new file.
+    /// `#[doc(hidden)]` and `*_for_test`: additive, not part of the stable
+    /// surface (patch-safe).
+    #[doc(hidden)]
+    pub fn force_clean_one_for_test(&self) -> Result<u32> {
+        self.check_open()?;
+        let files_cleaned = {
+            let env_impl = self.env_impl.lock();
+            env_impl
+                .run_cleaner(1, true)
+                .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?
+                .files_cleaned
+        };
+        // Cross Noxu's two-checkpoint safe-to-delete barrier so the
+        // just-cleaned file is actually removed from disk (JE forceCleanOne
+        // deletes during its single post-clean checkpoint).
+        let force = CheckpointConfig::new().with_force(true);
+        self.checkpoint(Some(&force))?;
+        self.checkpoint(Some(&force))?;
+        {
+            let env_impl = self.env_impl.lock();
+            env_impl
+                .run_cleaner(0, false)
+                .map_err(|e| NoxuError::OperationNotAllowed(e.to_string()))?;
+        }
+        Ok(files_cleaned)
+    }
+
     fn verify_inner(
         &self,
         config: &noxu_engine::VerifyConfig,
