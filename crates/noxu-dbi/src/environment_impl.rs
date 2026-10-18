@@ -1175,6 +1175,67 @@ impl EnvironmentImpl {
             if recovered_max_txn_id > 0 {
                 txn_manager.set_last_txn_id(recovered_max_txn_id as i64);
             }
+            // R-XAREC (S1): register every RECOVERED prepared transaction in
+            // the TxnManager with its FIRST logged LSN (the earliest of its
+            // first LN and its TxnPrepare frame), so the cleaner's first-
+            // active-txn-file clamp protects the files holding its unredone
+            // LNs for the whole unresolved window.  Dropped on resolution via
+            // `forget_recovered_prepared_txn` (-> `resolve_recovered_prepared`),
+            // called by both `xa_commit` and `xa_rollback`.  Mirrors JE, where
+            // a recovered prepared txn is a `PreparedTxn` in `allTxns` with its
+            // LNs re-locked and `addLogInfo(logLsn)` applied (RecoveryManager.
+            // java:2140/2230/2335), so `getFirstActiveLsn()` covers it.
+            for info in &recovered_prepared {
+                let first = {
+                    let ln_first = info.first_lsn.as_u64();
+                    let prep = info.prepare_lsn.as_u64();
+                    let null = noxu_util::NULL_LSN.as_u64();
+                    match (ln_first != null, prep != null) {
+                        (true, true) => ln_first.min(prep),
+                        (true, false) => ln_first,
+                        (false, true) => prep,
+                        (false, false) => null,
+                    }
+                };
+                if first != noxu_util::NULL_LSN.as_u64() {
+                    txn_manager
+                        .register_recovered_prepared(info.txn_id as i64, first);
+                }
+            }
+            // R-XAREC (S1): RELOCK each recovered prepared txn's redone LNs.
+            // The redo pass (noxu-recovery `eligible_for_redo`: a prepared
+            // txn's LNs are always eligible) has already installed the slots
+            // into the tree at their original LSNs.  Re-acquire the WRITE
+            // record lock the prepared txn held on each slot so a reader of an
+            // in-doubt key BLOCKS until `xa_commit` / `xa_rollback` resolves
+            // the branch — exactly as JE `RecoveryManager.relock` re-locks the
+            // resurrected `PreparedTxn`'s LNs (`nonBlockingLock(logLsn, WRITE)`,
+            // RecoveryManager.java:2328).  The lock is keyed on the slot LSN
+            // (the LN's original log LSN).  During recovery no other locker
+            // exists, so the non-blocking grant is immediate; a denial would
+            // indicate corruption and is logged (recovery continues — a missed
+            // relock weakens isolation of an in-doubt key but never loses
+            // committed data, which the redo already secured).
+            for (txn_id, lns) in &recovered_prepared_lns {
+                for ln in lns {
+                    if ln.original_lsn == noxu_util::NULL_LSN {
+                        continue;
+                    }
+                    if let Err(e) = txn_manager.relock_recovered_prepared(
+                        *txn_id as i64,
+                        ln.original_lsn.as_u64(),
+                    ) {
+                        log::warn!(
+                            "R-XAREC: relock of recovered prepared txn {} on \
+                             slot lsn {:?} denied: {e:?}; the in-doubt key is \
+                             not isolation-protected but its committed value is \
+                             safe (already redone into the tree)",
+                            txn_id,
+                            ln.original_lsn,
+                        );
+                    }
+                }
+            }
             // node-id: seed the env's NodeSequence and the single tree-wide
             // node-id counter (L-30) past the recovered max.
             if recovered_max_node_id > 0 {
@@ -4106,6 +4167,11 @@ impl EnvironmentImpl {
             .unwrap()
             .retain(|info| info.txn_id != txn_id);
         self.recovered_prepared_lns.lock().unwrap().remove(&txn_id);
+        // R-XAREC (S1): release the first-active-txn clamp for this recovered
+        // prepared txn now that it is resolved (commit or rollback).  Both
+        // `xa_commit` and `xa_rollback` call this after writing their durable
+        // TxnCommit / TxnAbort frame.
+        self.txn_manager.resolve_recovered_prepared(txn_id as i64);
     }
 
     /// Returns a clone of the shared Evictor.
@@ -5367,6 +5433,10 @@ mod tests {
                 operation: noxu_recovery::PreparedLnOperation::Insert,
                 key: b"k".to_vec(),
                 data: Some(b"v".to_vec()),
+                abort_lsn: noxu_util::NULL_LSN,
+                abort_known_deleted: true,
+                abort_data: None,
+                abort_key: None,
             }],
         );
 

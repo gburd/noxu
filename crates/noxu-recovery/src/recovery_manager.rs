@@ -2223,12 +2223,47 @@ impl RecoveryManager {
                 LnOperation::Update => PreparedLnOperation::Update,
                 LnOperation::Delete => PreparedLnOperation::Delete,
             };
+            // R-XAREC (S1): resolve the before-image for `xa_rollback`.  Modern
+            // logs EMBED the abort value in the LN entry; when they do not
+            // (`abort_data` is None but `abort_lsn` points at a prior LN and
+            // the slot was not known-deleted), read the before-image LN at
+            // `abort_lsn` from the log now, while we still hold the scanner —
+            // the recovered prepared txn has no in-memory `WriteLockInfo` to
+            // fall back on (JE's `relock` -> `setAbortInfo` snapshots the
+            // before-image at recovery time for exactly this reason).
+            let (abort_data, abort_key) = if rec.abort_data.is_some() {
+                (
+                    rec.abort_data.as_ref().map(|b| b.to_vec()),
+                    rec.abort_key.as_ref().map(|b| b.to_vec()),
+                )
+            } else if !rec.abort_known_deleted && rec.abort_lsn != NULL_LSN {
+                match scanner.read_at_lsn(rec.abort_lsn) {
+                    Some(LogEntry::Ln(before)) => (
+                        before.data.as_ref().map(|b| b.to_vec()),
+                        before
+                            .abort_key
+                            .as_ref()
+                            .map(|b| b.to_vec())
+                            .or_else(|| Some(before.key.to_vec())),
+                    ),
+                    _ => (None, None),
+                }
+            } else {
+                (None, None)
+            };
             by_txn.entry(txn_id).or_default().push(PreparedLnReplay {
                 db_id: rec.db_id,
                 original_lsn: pe.lsn,
                 operation: op,
                 key: rec.key.to_vec(),
                 data: rec.data.as_ref().map(|b| b.to_vec()),
+                // R-XAREC (S1): capture the before-image so a recovered
+                // prepared txn can be undone by `xa_rollback` (JE `relock`
+                // -> `setAbortInfo`).
+                abort_lsn: rec.abort_lsn,
+                abort_known_deleted: rec.abort_known_deleted,
+                abort_data,
+                abort_key,
             });
         };
         scanner.scan_forward_fn(scan_start, scan_end, &mut collect);
@@ -2705,7 +2740,25 @@ impl RecoveryManager {
                 if gate_active { RedoAction::Skip } else { RedoAction::Apply }
             }
             Some(txn_id) => {
-                if analysis.is_committed(txn_id) {
+                // R-XAREC (S1): an in-doubt PREPARED (XA 2PC) txn's LNs are
+                // redone into the tree during the FIRST recovery and relocked
+                // on the resurrected prepared txn, so the slots exist, get
+                // checkpointed, and are protected by the first-active clamp —
+                // exactly as JE routes a `PreparedTxn` through `redoOneLN` ->
+                // `relock` -> `redo()` regardless of `afterCheckpointStart`
+                // (RecoveryManager.eligibleForRedo: `preparedTxn != null ->
+                // RedoEligible(preparedTxn)`; redoLNs scans from firstActiveLsn,
+                // RecoveryManager.java:1998/2140/2208).  Without this redo the
+                // prepared LNs are never materialised into a BIN; a later
+                // checkpoint advances ckpt_start past them, and after
+                // `xa_commit` + a second crash the committed LN is skipped by
+                // the before-ckpt-start redo gate (committed but seeded) — the
+                // 8/8 -> 0/8 S1 data loss.  Prepared LNs are ALWAYS eligible,
+                // independent of the seeded/ckpt-start gate; the redo currency
+                // check keeps the install idempotent.
+                if analysis.is_prepared(txn_id) {
+                    RedoAction::Apply
+                } else if analysis.is_committed(txn_id) {
                     // Committed LN.  Skip when the seeded-root gate covers a
                     // pre-checkpoint-start LN; otherwise replay it (full-redo
                     // fallback).  Replay is idempotent via the redo currency

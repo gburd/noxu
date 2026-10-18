@@ -263,6 +263,89 @@ impl TxnManager {
         self.lock_manager.unregister_locker_label(txn_id);
     }
 
+    /// R-XAREC (S1): register a RECOVERED prepared transaction in `all_txns`
+    /// with its first logged LSN so the cleaner's first-active-txn-file clamp
+    /// ([`Self::get_first_active_lsn`]) protects the files holding its LNs and
+    /// its `TxnPrepare` frame for the whole unresolved window.
+    ///
+    /// A prepared XA transaction that survived a crash is resolved by
+    /// `write_txn_commit_for_recovered` / `apply_recovered_prepared_lns`
+    /// WITHOUT an in-memory sink-wired `Txn` (the crash destroyed it), so
+    /// before this fix it was invisible to the clamp and the cleaner could
+    /// reclaim the file holding its still-unredone LNs — leaving the slot that
+    /// `apply_recovered_prepared_lns` installs (keyed at `ln.original_lsn`)
+    /// dangling into a cleaned file after a second crash (S1 data loss).
+    ///
+    /// Mirrors JE, where a recovered prepared txn is a `PreparedTxn extends
+    /// Txn` registered in `allTxns` (constructor -> `TxnManager.registerTxn`)
+    /// and `RecoveryManager` re-locks its LNs and calls
+    /// `txn.addLogInfo(logLsn)` (RecoveryManager.java:2140/2230/2335), so
+    /// `getFirstActiveLsn()` covers it and the cleaner clamp protects its
+    /// files until `xa_commit` / `xa_rollback` resolves it.
+    ///
+    /// Idempotent, earliest-wins: a second call with an earlier LSN lowers the
+    /// recorded value; a later LSN never raises it.  Resolved by
+    /// [`Self::resolve_recovered_prepared`] on commit or rollback.
+    pub fn register_recovered_prepared(&self, txn_id: i64, first_lsn: u64) {
+        let mut guard = self.all_txns.write();
+        match guard.get_mut(&txn_id) {
+            Some(entry) => {
+                if *entry == NULL_LSN.as_u64() || first_lsn < *entry {
+                    *entry = first_lsn;
+                }
+            }
+            None => {
+                guard.insert(txn_id, first_lsn);
+            }
+        }
+    }
+
+    /// R-XAREC (S1): drop a recovered prepared transaction from `all_txns`
+    /// once it has been resolved (`xa_commit` / `xa_rollback`), releasing the
+    /// first-active-txn clamp on its files.  Also releases every record lock
+    /// the recovered prepared txn re-acquired via
+    /// [`Self::relock_recovered_prepared`] (JE commits/aborts the resurrected
+    /// `PreparedTxn`, which releases its write-lock set).  Idempotent (a no-op
+    /// if the id is absent).  Counterpart to
+    /// [`Self::register_recovered_prepared`].
+    pub fn resolve_recovered_prepared(&self, txn_id: i64) {
+        self.all_txns.write().remove(&txn_id);
+        self.lock_manager.release_all_for_locker(txn_id);
+        self.lock_manager.unregister_locker_label(txn_id);
+    }
+
+    /// R-XAREC (S1): re-acquire the WRITE record lock a recovered prepared
+    /// transaction held on a redone LN's slot, so the slot is **protected**
+    /// (a concurrent reader of the in-doubt key blocks until `xa_commit` /
+    /// `xa_rollback` resolves the branch) — the recovered-prepared equivalent
+    /// of normal record-level write locking.
+    ///
+    /// Mirrors JE `RecoveryManager.relock` (RecoveryManager.java:2328): the
+    /// resurrected `PreparedTxn` calls `nonBlockingLock(logLsn, WRITE)` (with
+    /// lock timeout 0 — there must be no conflict during recovery) so it ends
+    /// up holding the exact write-lock set it held before the crash.  `lsn` is
+    /// the slot LSN the LN was redone at (its original log LSN).
+    ///
+    /// Non-blocking + a 0 timeout: during recovery no other locker exists, so
+    /// the grant is immediate; a `DENIED`/`TIMEOUT` would indicate corruption
+    /// and is surfaced to the caller.
+    pub fn relock_recovered_prepared(
+        &self,
+        txn_id: i64,
+        lsn: u64,
+    ) -> Result<(), crate::error::TxnError> {
+        self.lock_manager.register_locker_label(txn_id, "recovered-prepared");
+        self.lock_manager
+            .lock(
+                lsn,
+                txn_id,
+                crate::lock_type::LockType::Write,
+                true,  /* non_blocking */
+                false, /* jump_ahead_of_waiters */
+            )
+            .map(|_| ())
+    }
+
     /// Updates the first-logged LSN for an active transaction.
     ///
     /// Historically this was the ONLY path that recorded a txn's first LSN,

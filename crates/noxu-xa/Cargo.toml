@@ -24,6 +24,7 @@ hashbrown = { workspace = true }
 [dev-dependencies]
 tempfile = "3"
 rand = { version = "0.8", features = ["small_rng"] }
+noxu-sync = { workspace = true }
 
 [lints]
 workspace = true
