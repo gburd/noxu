@@ -16,8 +16,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use noxu_db::{
-    CheckpointConfig, Database, DatabaseConfig, Environment,
-    EnvironmentConfig,
+    CheckpointConfig, Database, DatabaseConfig, Environment, EnvironmentConfig,
 };
 use noxu_xa::{XaEnvironment, XaFlags, XaResource, Xid};
 use std::path::Path;
