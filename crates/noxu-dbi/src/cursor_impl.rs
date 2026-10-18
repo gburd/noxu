@@ -1877,6 +1877,21 @@ impl CursorImpl {
                 .lock(lsn, LockType::Write, false)
                 .map_err(DbiError::TxnError)?;
         } else if let Some(lm) = &self.lock_manager {
+            // JE release-on-move (LockMode.java:84-86; Cursor.java:5108-5118):
+            // "releasing [non-txn locks] before the move prevents more than
+            // one lock from being held during a cursor move".  JE does this in
+            // beginMoveCursor -> CursorImpl.reset -> locker.releaseNonTxnLocks
+            // (CursorImpl.java:566/602), which releases ALL of the bare
+            // locker's locks with NO per-record LSN bookkeeping.  A bare
+            // cursor's read locks already release per operation, so the only
+            // cross-operation lock this retires is a prior RMW WRITE lock on a
+            // record the cursor has moved off; releasing it before acquiring
+            // the current record's WRITE lock makes a bare RMW scan hold AT
+            // MOST the lock on its current record.  No-op when a Txn is
+            // attached (release_non_txn_locks returns early) -- those locks
+            // belong to the Txn.  Idempotent when re-upgrading the same record
+            // (release-all then re-acquire the same owner's lock).
+            self.release_non_txn_locks();
             lm.lock(lsn, self.id, LockType::Write, false, false)
                 .map_err(DbiError::TxnError)?;
         }
